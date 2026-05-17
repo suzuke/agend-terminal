@@ -62,7 +62,8 @@ fn comm_tools() -> Vec<Value> {
                 "sequencing": {"type": "string", "enum": ["parallel", "sequential", "sequential-merge-only"], "description": "Task execution order constraint"},
                 "eta_minutes": {"type": "integer", "description": "Expected completion time in minutes"},
                 "reporting_cadence": {"type": "string", "enum": ["per-pr", "wave-end", "both"], "description": "When implementer should report back"},
-                "worktree_binding_required": {"type": "boolean", "description": "Whether target must bind to a worktree before starting"}
+                "worktree_binding_required": {"type": "boolean", "description": "Whether target must bind to a worktree before starting"},
+                "expect_reply_within_secs": {"type": "integer", "description": "Opt-in dispatch-idle watchdog (PR1). When set on a kind=task/query send, the daemon records a pending-dispatch sidecar and fires `dispatch_idle_threshold_exceeded` to the dispatcher's inbox if the matching kind=report (correlation_id-keyed) hasn't arrived within this many seconds. Default unset = no tracking (cross-team-safe). Fixup-team dispatches inherit a 10-min default automatically; other teams must opt in explicitly."}
             }, "required": ["message"]}}),
         json!({"name": "inbox", "description": "Check pending messages, OR look up a single message by ID, OR fetch a thread's messages. No params = drain pending. With message_id = describe message status (read/unread/expired/notfound). With thread_id = fetch all messages in thread ordered by timestamp.",
         "inputSchema": {"type": "object", "properties": {

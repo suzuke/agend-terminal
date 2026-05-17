@@ -243,6 +243,17 @@ fn run_loop(home: PathBuf, registry: AgentRegistry) {
     // conflict surface this module exists to eliminate. No new spawn
     // site — supervisor's per-tick loop hosts the scan.
     let mut auto_release_tracker = crate::daemon::auto_release::AutoReleaseTracker::default();
+    // PR1 watchdog L1: cross-team-safe dispatch-idle scan. Sibling
+    // pattern; TICKS_PER_SCAN=6 (~60s) because the threshold this
+    // gates (single-digit-minute orchestrator dispatches) demands
+    // sub-minute fire-time accuracy. No new spawn site — supervisor's
+    // per-tick loop hosts the scan.
+    let mut dispatch_idle_tracker = crate::daemon::dispatch_idle::DispatchIdleTracker::default();
+    // PR1 watchdog L2: fixup-team-specific auto-nudge on exceeded
+    // dispatches. Same cadence as L1; hard-coded for fixup until a
+    // second team requests its own policy (L2.1 schema bump).
+    let mut dispatch_idle_fixup_nudge_tracker =
+        crate::daemon::dispatch_idle::fixup_nudge::DispatchIdleFixupNudgeTracker::default();
     loop {
         thread::sleep(TICK);
         tick(&home, &registry, &mut notify_tracks);
@@ -257,6 +268,8 @@ fn run_loop(home: PathBuf, registry: AgentRegistry) {
         conflict_notify_tracker.maybe_scan(&home, &registry);
         canonical_drift_tracker.maybe_scan(&home);
         auto_release_tracker.maybe_scan(&home);
+        dispatch_idle_tracker.maybe_scan(&home);
+        dispatch_idle_fixup_nudge_tracker.maybe_scan(&home);
         // #836: reclaim expired (10-min TTL) entries from the
         // notification-dedup ledger so memory pressure stays bounded
         // on long-lived daemons.

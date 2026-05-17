@@ -329,6 +329,47 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
         }
     }
 
+    // PR1 watchdog hook — post-enqueue, mirror auto_release ordering
+    // (#870): dispatch tracking is defence-in-depth and must never
+    // block the dispatch primitive. Two-way wiring:
+    //   - Outbound `task` / `query` with a threshold (explicit OR
+    //     L2-defaulted for fixup) records a pending sidecar.
+    //   - Inbound `report` carrying a correlation_id resolves the
+    //     matching sidecar by correlation_id (NOT sender — multi-
+    //     pending-per-target requires correlation-keyed resolution).
+    let kind_str = msg.kind.as_deref().unwrap_or("");
+    if matches!(kind_str, "task" | "query") {
+        // Correlation source: `correlation_id` if the caller set one,
+        // else `task_id` (the kind=task convention — the task-board id
+        // is what the reporter will set as `correlation_id` on the
+        // matching kind=report). For kind=query with neither field
+        // set, sidecar records correlation_id=None and only fires on
+        // timeout (mark_resolved can never match — acceptable for an
+        // un-correlated dispatch).
+        let outbound_corr = msg.correlation_id.as_deref().or(msg.task_id.as_deref());
+        let explicit_threshold = params["expect_reply_within_secs"].as_i64();
+        if let Some(threshold) =
+            crate::daemon::dispatch_idle::fixup_nudge::resolve_threshold_for_dispatch(
+                ctx.home,
+                from,
+                explicit_threshold,
+            )
+        {
+            let _ = crate::daemon::dispatch_idle::record_dispatch(
+                ctx.home,
+                from,
+                target,
+                outbound_corr,
+                kind_str,
+                threshold,
+            );
+        }
+    } else if kind_str == "report" {
+        if let Some(corr) = msg.correlation_id.as_deref() {
+            let _ = crate::daemon::dispatch_idle::mark_resolved(ctx.home, corr);
+        }
+    }
+
     let mut resp = json!({"ok": true, "delivery_mode": delivery_mode});
     if let Some(branch) = branch_checked_out {
         resp["branch_checked_out"] = json!(branch);
@@ -1246,6 +1287,209 @@ mod tests {
         assert!(
             !err.contains("likely daemon refresh"),
             "error must use neutral wording (no causal claim): {err}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── PR1 watchdog hook integration tests (C2 GREEN) ──
+    //
+    // These exercise the handle_send → dispatch_idle hook wiring.
+    // The hook is post-enqueue (auto_release ordering precedent) so
+    // any failure here doesn't surface to the dispatch primitive.
+
+    fn write_fixup_fleet(home: &std::path::Path, members: &[&str]) {
+        let list = members
+            .iter()
+            .map(|m| format!("\"{m}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let orchestrator = members.first().copied().unwrap_or("fixup-lead");
+        let yaml = format!(
+            "schema_version: 1\n\
+             instances:\n\
+             {instances}\
+             teams:\n  fixup:\n    members: [{list}]\n    orchestrator: {orchestrator}\n",
+            instances = members
+                .iter()
+                .map(|m| format!("  {m}:\n    backend: claude\n"))
+                .collect::<String>(),
+        );
+        std::fs::write(crate::fleet::fleet_yaml_path(home), yaml).unwrap();
+    }
+
+    #[test]
+    fn hook_kind_report_resolves_pending_by_correlation_id() {
+        let home = tmp_home("hook-report-resolves");
+        write_fixup_fleet(&home, &["fixup-lead", "fixup-reviewer"]);
+        // Seed a pending sidecar (correlation_id = "t-hook").
+        let id = crate::daemon::dispatch_idle::record_dispatch(
+            &home,
+            "fixup-lead",
+            "fixup-reviewer",
+            Some("t-hook"),
+            "task",
+            600,
+        )
+        .expect("seed sidecar");
+        let ctx = test_ctx(&home);
+        // Reviewer sends report with the matching correlation_id.
+        let result = handle_send(
+            &json!({
+                "from": "fixup-reviewer",
+                "target": "fixup-lead",
+                "text": "VERIFIED",
+                "kind": "report",
+                "correlation_id": "t-hook",
+            }),
+            &ctx,
+        );
+        assert_eq!(result["ok"], true, "report send must succeed: {result}");
+        let pending = crate::daemon::dispatch_idle::list_pending(&home);
+        let entry = pending.iter().find(|p| p.dispatch_id == id).unwrap();
+        assert_eq!(
+            entry.status, "resolved",
+            "kind=report with matching correlation_id must resolve the sidecar"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn hook_kind_update_does_not_resolve_pending() {
+        // Load-bearing contract: BUSY / status updates must NOT
+        // suppress the watchdog. Spike challenge #1.
+        let home = tmp_home("hook-update-no-resolve");
+        write_fixup_fleet(&home, &["fixup-lead", "fixup-reviewer"]);
+        let id = crate::daemon::dispatch_idle::record_dispatch(
+            &home,
+            "fixup-lead",
+            "fixup-reviewer",
+            Some("t-update"),
+            "task",
+            600,
+        )
+        .expect("seed sidecar");
+        let ctx = test_ctx(&home);
+        let result = handle_send(
+            &json!({
+                "from": "fixup-reviewer",
+                "target": "fixup-lead",
+                "text": "BUSY working on the diff",
+                "kind": "update",
+                "correlation_id": "t-update",
+            }),
+            &ctx,
+        );
+        assert_eq!(result["ok"], true);
+        let pending = crate::daemon::dispatch_idle::list_pending(&home);
+        let entry = pending.iter().find(|p| p.dispatch_id == id).unwrap();
+        assert_eq!(
+            entry.status, "pending",
+            "kind=update must NOT flip status (watchdog stays armed)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn hook_fixup_team_dispatch_records_pending_via_default_threshold() {
+        // L2 fixup default-threshold injection: sender in fixup team,
+        // kind=task, no explicit expect_reply_within_secs → sidecar
+        // recorded with the 600s default.
+        let home = tmp_home("hook-fixup-default");
+        write_fixup_fleet(&home, &["fixup-lead", "fixup-reviewer"]);
+        let ctx = test_ctx(&home);
+        let result = handle_send(
+            &json!({
+                "from": "fixup-lead",
+                "target": "fixup-reviewer",
+                "text": "[task] do the thing",
+                "kind": "task",
+                "task_id": "t-fixup-default",
+            }),
+            &ctx,
+        );
+        assert_eq!(result["ok"], true, "dispatch must succeed: {result}");
+        let pending = crate::daemon::dispatch_idle::list_pending(&home);
+        let entry = pending
+            .iter()
+            .find(|p| p.correlation_id.as_deref() == Some("t-fixup-default"))
+            .expect("fixup-team dispatch must seed a sidecar via L2 default");
+        assert_eq!(entry.dispatcher, "fixup-lead");
+        assert_eq!(entry.target, "fixup-reviewer");
+        assert_eq!(
+            entry.threshold_secs, 600,
+            "L2 must inject the 600s fixup default"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn hook_non_fixup_dispatch_no_recording_without_explicit_threshold() {
+        // Cross-team-safe default-disabled invariant: non-fixup
+        // dispatcher with no explicit threshold → NO sidecar.
+        let home = tmp_home("hook-non-fixup-no-record");
+        // Distinct team that ISN'T fixup.
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "schema_version: 1\n\
+             instances:\n  research-lead:\n    backend: claude\n  research-dev:\n    backend: claude\n\
+             teams:\n  research:\n    members: [research-lead, research-dev]\n    orchestrator: research-lead\n",
+        )
+        .unwrap();
+        let ctx = test_ctx(&home);
+        let result = handle_send(
+            &json!({
+                "from": "research-lead",
+                "target": "research-dev",
+                "text": "[task] do the thing",
+                "kind": "task",
+                "task_id": "t-non-fixup",
+            }),
+            &ctx,
+        );
+        assert_eq!(result["ok"], true);
+        let pending = crate::daemon::dispatch_idle::list_pending(&home);
+        assert!(
+            pending
+                .iter()
+                .all(|p| p.correlation_id.as_deref() != Some("t-non-fixup")),
+            "non-fixup dispatch without explicit threshold must NOT record"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn hook_explicit_threshold_overrides_team_default() {
+        // Explicit expect_reply_within_secs wins for any team
+        // (including non-fixup). Other teams opt in this way.
+        let home = tmp_home("hook-explicit-threshold");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "schema_version: 1\n\
+             instances:\n  research-lead:\n    backend: claude\n  research-dev:\n    backend: claude\n\
+             teams:\n  research:\n    members: [research-lead, research-dev]\n    orchestrator: research-lead\n",
+        )
+        .unwrap();
+        let ctx = test_ctx(&home);
+        let result = handle_send(
+            &json!({
+                "from": "research-lead",
+                "target": "research-dev",
+                "text": "[task] research thing",
+                "kind": "task",
+                "task_id": "t-explicit",
+                "expect_reply_within_secs": 1200_i64,
+            }),
+            &ctx,
+        );
+        assert_eq!(result["ok"], true);
+        let pending = crate::daemon::dispatch_idle::list_pending(&home);
+        let entry = pending
+            .iter()
+            .find(|p| p.correlation_id.as_deref() == Some("t-explicit"))
+            .expect("explicit-threshold dispatch records sidecar");
+        assert_eq!(
+            entry.threshold_secs, 1200,
+            "explicit threshold must override team default / absent state"
         );
         std::fs::remove_dir_all(&home).ok();
     }

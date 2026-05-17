@@ -92,24 +92,81 @@ fn next_dispatch_id() -> String {
 /// best-effort (the message has already been delivered; watchdog
 /// coverage is a defence-in-depth layer that must never block the
 /// dispatch primitive).
-#[allow(dead_code)] // C1 RED stub — wired in C2
 pub(crate) fn record_dispatch(
-    _home: &Path,
-    _dispatcher: &str,
-    _target: &str,
-    _correlation_id: Option<&str>,
-    _expected_kind: &str,
-    _threshold_secs: i64,
+    home: &Path,
+    dispatcher: &str,
+    target: &str,
+    correlation_id: Option<&str>,
+    expected_kind: &str,
+    threshold_secs: i64,
 ) -> Option<String> {
-    // C1 RED: stub — return None so failing tests prove the impl gap.
-    None
+    if dispatcher.is_empty() || target.is_empty() || threshold_secs <= 0 {
+        return None;
+    }
+    if !matches!(expected_kind, "task" | "query") {
+        return None;
+    }
+    let dir = pending_dir(home);
+    if std::fs::create_dir_all(&dir).is_err() {
+        return None;
+    }
+    let dispatch_id = next_dispatch_id();
+    let payload = PendingDispatch {
+        schema_version: SCHEMA_VERSION,
+        dispatch_id: dispatch_id.clone(),
+        dispatcher: dispatcher.to_string(),
+        target: target.to_string(),
+        correlation_id: correlation_id.map(String::from),
+        expected_kind: expected_kind.to_string(),
+        threshold_secs,
+        issued_at: chrono::Utc::now().to_rfc3339(),
+        status: "pending".to_string(),
+        nudge_sent_at: None,
+    };
+    let body = match serde_json::to_string_pretty(&payload) {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+    if crate::store::atomic_write(&pending_path(home, &dispatch_id), body.as_bytes()).is_err() {
+        return None;
+    }
+    Some(dispatch_id)
 }
 
 /// Read all pending dispatch sidecars from disk. Forward-compat: skips
 /// any sidecar whose `schema_version` is unknown.
-#[allow(dead_code)] // C1 RED stub — wired in C2
-pub(crate) fn list_pending(_home: &Path) -> Vec<PendingDispatch> {
-    Vec::new()
+pub(crate) fn list_pending(home: &Path) -> Vec<PendingDispatch> {
+    let dir = pending_dir(home);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(d) = serde_json::from_str::<PendingDispatch>(&content) else {
+            continue;
+        };
+        if d.schema_version != SCHEMA_VERSION {
+            continue;
+        }
+        out.push(d);
+    }
+    out.sort_by(|a, b| a.issued_at.cmp(&b.issued_at));
+    out
+}
+
+fn write_dispatch(home: &Path, d: &PendingDispatch) -> bool {
+    let body = match serde_json::to_string_pretty(d) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    crate::store::atomic_write(&pending_path(home, &d.dispatch_id), body.as_bytes()).is_ok()
 }
 
 /// Resolve a pending dispatch by `correlation_id` (NOT by sender —
@@ -117,16 +174,108 @@ pub(crate) fn list_pending(_home: &Path) -> Vec<PendingDispatch> {
 /// single dispatcher can have multiple pending dispatches outstanding,
 /// each with a distinct correlation_id). Returns the resolved
 /// dispatch_id, or `None` if no matching pending entry exists.
-#[allow(dead_code)] // C1 RED stub — wired in C2
-pub(crate) fn mark_resolved(_home: &Path, _correlation_id: &str) -> Option<String> {
-    None
+pub(crate) fn mark_resolved(home: &Path, correlation_id: &str) -> Option<String> {
+    if correlation_id.is_empty() {
+        return None;
+    }
+    let matched = list_pending(home)
+        .into_iter()
+        .find(|d| d.status == "pending" && d.correlation_id.as_deref() == Some(correlation_id));
+    let mut d = matched?;
+    d.status = "resolved".to_string();
+    let id = d.dispatch_id.clone();
+    if write_dispatch(home, &d) {
+        Some(id)
+    } else {
+        None
+    }
 }
 
 /// Per-tick scan: flip eligible pending entries to `exceeded` and emit
 /// the inbox event to the dispatcher. Exposed `pub(crate)` for tests.
-#[allow(dead_code)] // C1 RED stub — wired in C2
-pub(crate) fn scan_and_emit(_home: &Path) {
-    // C1 RED: stub.
+pub(crate) fn scan_and_emit(home: &Path) {
+    let now = chrono::Utc::now();
+    for mut d in list_pending(home) {
+        if d.status != "pending" {
+            continue;
+        }
+        let issued = match chrono::DateTime::parse_from_rfc3339(&d.issued_at) {
+            Ok(t) => t.with_timezone(&chrono::Utc),
+            Err(_) => continue,
+        };
+        let elapsed_secs = now.signed_duration_since(issued).num_seconds();
+        if elapsed_secs <= d.threshold_secs {
+            continue;
+        }
+        emit_exceeded_event(home, &d, elapsed_secs);
+        d.status = "exceeded".to_string();
+        let _ = write_dispatch(home, &d);
+    }
+}
+
+fn emit_exceeded_event(home: &Path, d: &PendingDispatch, elapsed_secs: i64) {
+    let overshoot = elapsed_secs - d.threshold_secs;
+    let text = format!(
+        "[dispatch_idle_threshold_exceeded] dispatch {dispatch_id} from '{dispatcher}' → '{target}' \
+         (kind={expected_kind}, correlation_id={corr}) idle for {elapsed_secs}s \
+         (threshold {threshold_secs}s, exceeded by {overshoot}s).",
+        dispatch_id = d.dispatch_id,
+        dispatcher = d.dispatcher,
+        target = d.target,
+        expected_kind = d.expected_kind,
+        corr = d.correlation_id.as_deref().unwrap_or(""),
+        elapsed_secs = elapsed_secs,
+        threshold_secs = d.threshold_secs,
+        overshoot = overshoot,
+    );
+    let msg = crate::inbox::InboxMessage {
+        schema_version: 0,
+        id: None,
+        from: "system:dispatch_idle".to_string(),
+        text,
+        kind: Some("dispatch_idle_threshold_exceeded".to_string()),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        channel: None,
+        read_at: None,
+        thread_id: None,
+        parent_id: None,
+        delivery_mode: Some("inbox_fallback".to_string()),
+        task_id: d.correlation_id.clone(),
+        force_meta: None,
+        correlation_id: d.correlation_id.clone(),
+        reviewed_head: None,
+        attachments: Vec::new(),
+        in_reply_to_msg_id: None,
+        in_reply_to_excerpt: None,
+        superseded_by: None,
+        from_id: None,
+        broadcast_context: None,
+        sequencing: None,
+        eta_minutes: None,
+        reporting_cadence: None,
+        worktree_binding_required: None,
+    };
+    if let Err(e) = crate::inbox::enqueue(home, &d.dispatcher, msg) {
+        tracing::warn!(
+            error = %e,
+            dispatcher = %d.dispatcher,
+            dispatch_id = %d.dispatch_id,
+            "dispatch_idle: enqueue failed"
+        );
+    }
+    crate::event_log::log(
+        home,
+        "dispatch_idle_threshold_exceeded",
+        &d.dispatcher,
+        &format!(
+            "dispatch_id={} target={} corr={} elapsed_secs={} threshold_secs={}",
+            d.dispatch_id,
+            d.target,
+            d.correlation_id.as_deref().unwrap_or(""),
+            elapsed_secs,
+            d.threshold_secs,
+        ),
+    );
 }
 
 /// Per-loop scheduler state.
@@ -139,16 +288,23 @@ impl DispatchIdleTracker {
     /// Per-tick entry. Increments the counter; on the throttled
     /// boundary, fires `scan_and_emit` and returns `true`. Returns
     /// `false` for all pre-boundary ticks.
-    #[allow(dead_code)] // C1 RED stub — wired in C2
-    pub(crate) fn maybe_scan(&mut self, _home: &Path) -> bool {
-        // C1 RED: stub — never fires.
-        let _ = self.tick_count;
-        false
+    pub(crate) fn maybe_scan(&mut self, home: &Path) -> bool {
+        self.tick_count = self.tick_count.saturating_add(1);
+        if self.tick_count < TICKS_PER_SCAN {
+            return false;
+        }
+        self.tick_count = 0;
+        scan_and_emit(home);
+        true
     }
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::doc_lazy_continuation
+)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -229,15 +385,8 @@ mod tests {
     #[test]
     fn record_and_list_pending_dispatch() {
         let home = tmp_home("record");
-        let id = record_dispatch(
-            &home,
-            "lead",
-            "reviewer",
-            Some("t-abc"),
-            "task",
-            600,
-        )
-        .expect("record must return id");
+        let id = record_dispatch(&home, "lead", "reviewer", Some("t-abc"), "task", 600)
+            .expect("record must return id");
         let pending = list_pending(&home);
         assert_eq!(pending.len(), 1);
         let p = &pending[0];
@@ -257,21 +406,14 @@ mod tests {
     fn fires_on_threshold_exceeded() {
         let home = tmp_home("fires");
         let issued = chrono::Utc::now() - chrono::Duration::seconds(700);
-        let id = write_pending_at(
-            &home,
-            "alpha",
-            "beta",
-            Some("t-fires"),
-            "task",
-            600,
-            issued,
-        );
+        let id = write_pending_at(&home, "alpha", "beta", Some("t-fires"), "task", 600, issued);
         scan_and_emit(&home);
         let inbox = crate::inbox::drain(&home, "alpha");
         assert!(
-            inbox.iter().any(|m| m.kind.as_deref()
-                == Some("dispatch_idle_threshold_exceeded")
-                && m.correlation_id.as_deref() == Some("t-fires")),
+            inbox.iter().any(
+                |m| m.kind.as_deref() == Some("dispatch_idle_threshold_exceeded")
+                    && m.correlation_id.as_deref() == Some("t-fires")
+            ),
             "must emit dispatch_idle_threshold_exceeded event to dispatcher's inbox: {inbox:?}"
         );
         let pending = list_pending(&home);
@@ -288,12 +430,8 @@ mod tests {
     fn mark_resolved_keys_on_correlation_id_not_sender() {
         let home = tmp_home("resolve-by-corr");
         let now = chrono::Utc::now();
-        let id_a = write_pending_at(
-            &home, "lead", "dev-1", Some("t-aaa"), "task", 600, now,
-        );
-        let id_b = write_pending_at(
-            &home, "lead", "dev-2", Some("t-bbb"), "task", 600, now,
-        );
+        let id_a = write_pending_at(&home, "lead", "dev-1", Some("t-aaa"), "task", 600, now);
+        let id_b = write_pending_at(&home, "lead", "dev-2", Some("t-bbb"), "task", 600, now);
         let resolved = mark_resolved(&home, "t-aaa");
         assert_eq!(
             resolved.as_deref(),
@@ -347,24 +485,10 @@ mod tests {
         let home = tmp_home("parallel-iso");
         let stale = chrono::Utc::now() - chrono::Duration::seconds(700);
         let fresh = chrono::Utc::now() - chrono::Duration::seconds(60);
-        let id_stale = write_pending_at(
-            &home,
-            "lead",
-            "dev-1",
-            Some("t-stale"),
-            "task",
-            600,
-            stale,
-        );
-        let id_fresh = write_pending_at(
-            &home,
-            "lead",
-            "dev-2",
-            Some("t-fresh"),
-            "task",
-            600,
-            fresh,
-        );
+        let id_stale =
+            write_pending_at(&home, "lead", "dev-1", Some("t-stale"), "task", 600, stale);
+        let id_fresh =
+            write_pending_at(&home, "lead", "dev-2", Some("t-fresh"), "task", 600, fresh);
         scan_and_emit(&home);
         let inbox = crate::inbox::drain(&home, "lead");
         let exceeded_events: Vec<_> = inbox
@@ -405,8 +529,7 @@ mod tests {
     #[test]
     fn no_team_name_strings_in_l1() {
         let manifest = env!("CARGO_MANIFEST_DIR");
-        let l1_path =
-            std::path::PathBuf::from(manifest).join("src/daemon/dispatch_idle/mod.rs");
+        let l1_path = std::path::PathBuf::from(manifest).join("src/daemon/dispatch_idle/mod.rs");
         let body = std::fs::read_to_string(&l1_path)
             .expect("L1 file must be readable from CARGO_MANIFEST_DIR");
         let mut offenders: Vec<(usize, &str, String)> = Vec::new();

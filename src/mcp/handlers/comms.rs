@@ -92,7 +92,7 @@ pub(super) fn handle_send_to_instance(
         home,
         &json!({
             "method": crate::api::method::SEND,
-            "params": { "from": sender.as_str(), "target": target, "text": text, "kind": kind, "thread_id": thread_id, "parent_id": parent_id, "correlation_id": args["correlation_id"].as_str(), "sequencing": args["sequencing"].as_str(), "eta_minutes": args["eta_minutes"].as_u64(), "reporting_cadence": args["reporting_cadence"].as_str(), "worktree_binding_required": args["worktree_binding_required"].as_bool() }
+            "params": { "from": sender.as_str(), "target": target, "text": text, "kind": kind, "thread_id": thread_id, "parent_id": parent_id, "correlation_id": args["correlation_id"].as_str(), "sequencing": args["sequencing"].as_str(), "eta_minutes": args["eta_minutes"].as_u64(), "reporting_cadence": args["reporting_cadence"].as_str(), "worktree_binding_required": args["worktree_binding_required"].as_bool(), "expect_reply_within_secs": args["expect_reply_within_secs"].as_i64() }
         }),
     ) {
         Ok(resp) if resp["ok"].as_bool() == Some(true) => {
@@ -342,6 +342,7 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
                     "task": task,
                 },
                 "branch": args["branch"].as_str(),
+                "expect_reply_within_secs": args["expect_reply_within_secs"].as_i64(),
             }
         }),
     ) {

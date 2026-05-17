@@ -20,18 +20,17 @@
 
 use std::path::Path;
 
+use super::{list_pending, pending_path, PendingDispatch};
+
 /// Fixup team name as it appears in fleet.yaml. Single source of truth.
-#[allow(dead_code)] // C1 RED stub — wired in C2
 pub(crate) const FIXUP_TEAM_NAME: &str = "fixup";
 
 /// Default dispatch-idle threshold for fixup-team members when no
 /// explicit `expect_reply_within_secs` is set on the dispatch. 600s
 /// (10 min) per the original watchdog spec.
-#[allow(dead_code)] // C1 RED stub — wired in C2
 pub(crate) const FIXUP_DEFAULT_THRESHOLD_SECS: i64 = 600;
 
 /// Scan throttle: 6 ticks × 10s = ~60s — matches L1 cadence.
-#[allow(dead_code)] // C1 RED stub — wired in C2
 pub(crate) const TICKS_PER_SCAN: u64 = 6;
 
 /// Resolve the threshold the dispatcher's send should record against.
@@ -40,13 +39,22 @@ pub(crate) const TICKS_PER_SCAN: u64 = 6;
 /// - `Some(FIXUP_DEFAULT_THRESHOLD_SECS)` when no explicit value and
 ///   the dispatcher is a fixup-team member.
 /// - `None` otherwise (cross-team-safe default-disabled).
-#[allow(dead_code)] // C1 RED stub — wired in C2
 pub(crate) fn resolve_threshold_for_dispatch(
-    _home: &Path,
-    _dispatcher: &str,
-    _explicit_threshold_secs: Option<i64>,
+    home: &Path,
+    dispatcher: &str,
+    explicit_threshold_secs: Option<i64>,
 ) -> Option<i64> {
-    None
+    if let Some(explicit) = explicit_threshold_secs {
+        if explicit > 0 {
+            return Some(explicit);
+        }
+    }
+    let team = crate::teams::find_team_for(home, dispatcher)?;
+    if team.name == FIXUP_TEAM_NAME {
+        Some(FIXUP_DEFAULT_THRESHOLD_SECS)
+    } else {
+        None
+    }
 }
 
 /// Per-loop scheduler state for the auto-nudge tracker.
@@ -56,22 +64,116 @@ pub(crate) struct DispatchIdleFixupNudgeTracker {
 }
 
 impl DispatchIdleFixupNudgeTracker {
-    #[allow(dead_code)] // C1 RED stub — wired in C2
-    pub(crate) fn maybe_scan(&mut self, _home: &Path) -> bool {
-        let _ = self.tick_count;
-        false
+    pub(crate) fn maybe_scan(&mut self, home: &Path) -> bool {
+        self.tick_count = self.tick_count.saturating_add(1);
+        if self.tick_count < TICKS_PER_SCAN {
+            return false;
+        }
+        self.tick_count = 0;
+        scan_and_nudge(home);
+        true
+    }
+}
+
+fn is_fixup_member(home: &Path, agent: &str) -> bool {
+    crate::teams::find_team_for(home, agent)
+        .map(|t| t.name == FIXUP_TEAM_NAME)
+        .unwrap_or(false)
+}
+
+fn write_dispatch_sidecar(home: &Path, d: &PendingDispatch) -> bool {
+    let body = match serde_json::to_string_pretty(d) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    crate::store::atomic_write(&pending_path(home, &d.dispatch_id), body.as_bytes()).is_ok()
+}
+
+fn emit_nudge(home: &Path, d: &PendingDispatch) -> bool {
+    let elapsed = chrono::DateTime::parse_from_rfc3339(&d.issued_at)
+        .map(|t| {
+            chrono::Utc::now()
+                .signed_duration_since(t.with_timezone(&chrono::Utc))
+                .num_seconds()
+        })
+        .unwrap_or(0);
+    let text = format!(
+        "[fixup-watchdog] dispatched by '{dispatcher}' {elapsed}s ago \
+         (threshold {threshold_secs}s, correlation_id={corr}). \
+         Please status: BUSY / progress / VERIFIED-if-ready.",
+        dispatcher = d.dispatcher,
+        elapsed = elapsed,
+        threshold_secs = d.threshold_secs,
+        corr = d.correlation_id.as_deref().unwrap_or(""),
+    );
+    let msg = crate::inbox::InboxMessage {
+        schema_version: 0,
+        id: None,
+        from: "system:fixup-watchdog".to_string(),
+        text,
+        kind: Some("dispatch_idle_nudge".to_string()),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        channel: None,
+        read_at: None,
+        thread_id: None,
+        parent_id: None,
+        delivery_mode: Some("inbox_fallback".to_string()),
+        task_id: d.correlation_id.clone(),
+        force_meta: None,
+        correlation_id: d.correlation_id.clone(),
+        reviewed_head: None,
+        attachments: Vec::new(),
+        in_reply_to_msg_id: None,
+        in_reply_to_excerpt: None,
+        superseded_by: None,
+        from_id: None,
+        broadcast_context: None,
+        sequencing: None,
+        eta_minutes: None,
+        reporting_cadence: None,
+        worktree_binding_required: None,
+    };
+    match crate::inbox::enqueue(home, &d.target, msg) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                target = %d.target,
+                dispatch_id = %d.dispatch_id,
+                "fixup_nudge: enqueue failed"
+            );
+            false
+        }
     }
 }
 
 /// Scan exceeded sidecars and emit nudges. Exposed `pub(crate)` for
 /// tests.
-#[allow(dead_code)] // C1 RED stub — wired in C2
-pub(crate) fn scan_and_nudge(_home: &Path) {
-    // C1 RED: stub.
+pub(crate) fn scan_and_nudge(home: &Path) {
+    for mut d in list_pending(home) {
+        if d.status != "exceeded" {
+            continue;
+        }
+        if d.nudge_sent_at.is_some() {
+            continue;
+        }
+        if !is_fixup_member(home, &d.dispatcher) {
+            continue;
+        }
+        if !emit_nudge(home, &d) {
+            continue;
+        }
+        d.nudge_sent_at = Some(chrono::Utc::now().to_rfc3339());
+        let _ = write_dispatch_sidecar(home, &d);
+    }
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::doc_lazy_continuation
+)]
 mod tests {
     use super::*;
     use crate::daemon::dispatch_idle::{pending_dir, pending_path, PendingDispatch};
