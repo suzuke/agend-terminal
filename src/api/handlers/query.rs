@@ -19,6 +19,8 @@ pub(crate) fn handle_list(_params: &Value, ctx: &HandlerCtx) -> Value {
                     c.health.state.display_name().to_string(),
                 )
             };
+            let (dispatched_waiting_for, pending_response_to) =
+                crate::daemon::dispatch_idle::pending_for_instance(ctx.home, name);
             json!({
                 "name": name,
                 "backend": handle.backend_command,
@@ -26,20 +28,26 @@ pub(crate) fn handle_list(_params: &Value, ctx: &HandlerCtx) -> Value {
                 "inject_prefix": handle.inject_prefix,
                 "agent_state": agent_state,
                 "health_state": health_state,
-                "kind": "managed"
+                "kind": "managed",
+                "dispatched_waiting_for": dispatched_waiting_for,
+                "pending_response_to": pending_response_to,
             })
         })
         .collect();
     drop(reg);
     let ext = agent::lock_external(ctx.externals);
     for (name, handle) in ext.iter() {
+        let (dispatched_waiting_for, pending_response_to) =
+            crate::daemon::dispatch_idle::pending_for_instance(ctx.home, name);
         agents.push(json!({
             "name": name,
             "backend": handle.backend_command,
             "agent_state": "external",
             "health_state": "connected",
             "kind": "external",
-            "pid": handle.pid
+            "pid": handle.pid,
+            "dispatched_waiting_for": dispatched_waiting_for,
+            "pending_response_to": pending_response_to,
         }));
     }
     json!({"ok": true, "result": {"protocol_version": crate::framing::PROTOCOL_VERSION, "agents": agents}})

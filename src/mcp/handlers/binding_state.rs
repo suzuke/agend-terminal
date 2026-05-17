@@ -80,6 +80,14 @@ pub(crate) fn handle_binding_state(home: &Path, args: &Value, _sender: &Option<S
     let binding = crate::binding::read(home, agent);
     let bind_in_flight = crate::mcp::handlers::dispatch_hook::is_bind_in_flight(home, agent);
     let ci_watches = enumerate_ci_watches_for_agent(home, agent);
+    // PR2 L3 visibility: surface pending dispatch metadata alongside
+    // binding state so operators investigating a stuck binding can see
+    // in one tool call whether the agent owes a reply or is waiting
+    // for one. Empty arrays for agents with no pending sidecars
+    // (cross-team-safe: non-fixup teams without explicit thresholds
+    // never record sidecars, so this is a no-op for them).
+    let (dispatched_waiting_for, pending_response_to) =
+        crate::daemon::dispatch_idle::pending_for_instance(home, agent);
 
     if let Some(b) = binding {
         // Bound: enrich with on-disk reality checks so the operator
@@ -110,6 +118,8 @@ pub(crate) fn handle_binding_state(home: &Path, args: &Value, _sender: &Option<S
             "ci_watches": ci_watches,
             "bind_in_flight": bind_in_flight,
             "cross_branch_holders": cross_branch_holders,
+            "dispatched_waiting_for": dispatched_waiting_for,
+            "pending_response_to": pending_response_to,
         })
     } else {
         json!({
@@ -118,6 +128,8 @@ pub(crate) fn handle_binding_state(home: &Path, args: &Value, _sender: &Option<S
             "bind_in_flight": bind_in_flight,
             "ci_watches": ci_watches,
             "cross_branch_holders": Vec::<String>::new(),
+            "dispatched_waiting_for": dispatched_waiting_for,
+            "pending_response_to": pending_response_to,
         })
     }
 }
@@ -513,6 +525,73 @@ mod tests {
         assert!(
             entries.contains(&"owner/repo:feature/x"),
             "alpha's watch must surface as owner/repo:feature/x: {entries:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── PR2 L3 visibility: binding_state surfaces dispatch metadata ──
+
+    /// Both bound and unbound binding_state responses must surface the
+    /// new `dispatched_waiting_for` + `pending_response_to` fields read
+    /// from `<home>/pending-dispatches/*.json`. Operator investigating
+    /// a stuck binding can see in one call whether the agent owes a
+    /// reply or is waiting for one.
+    #[test]
+    fn binding_state_surfaces_pending_dispatch_metadata() {
+        let home = tmp_home("l3-binding");
+        // Seed a sidecar where "alpha" is the dispatcher waiting on
+        // "beta", and "alpha" is also the target of an inbound
+        // dispatch from "gamma" (covers both arrays in one shot).
+        crate::daemon::dispatch_idle::record_dispatch(
+            &home,
+            "alpha",
+            "beta",
+            Some("t-out"),
+            "task",
+            600,
+        )
+        .unwrap();
+        crate::daemon::dispatch_idle::record_dispatch(
+            &home,
+            "gamma",
+            "alpha",
+            Some("t-in"),
+            "task",
+            600,
+        )
+        .unwrap();
+        // Unbound alpha — exercises the unbound JSON shape.
+        let unbound = handle_binding_state(&home, &json!({"agent": "alpha"}), &None);
+        assert_eq!(unbound["bound"].as_bool(), Some(false));
+        let dw = unbound["dispatched_waiting_for"]
+            .as_array()
+            .expect("dispatched_waiting_for must be an array (unbound case)");
+        assert_eq!(dw.len(), 1);
+        assert_eq!(dw[0]["target"].as_str(), Some("beta"));
+        assert_eq!(dw[0]["correlation_id"].as_str(), Some("t-out"));
+        let pr = unbound["pending_response_to"]
+            .as_array()
+            .expect("pending_response_to must be an array (unbound case)");
+        assert_eq!(pr.len(), 1);
+        assert_eq!(pr[0]["dispatcher"].as_str(), Some("gamma"));
+        assert_eq!(pr[0]["correlation_id"].as_str(), Some("t-in"));
+        // Bound alpha — exercises the bound JSON shape carries the
+        // same L3 fields.
+        let wt = home.join("worktree-l3");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".agend-managed"), "agent=alpha\n").unwrap();
+        write_binding(&home, "alpha", "feature/l3", wt.to_str().unwrap());
+        let bound = handle_binding_state(&home, &json!({"agent": "alpha"}), &None);
+        assert_eq!(bound["bound"].as_bool(), Some(true));
+        assert_eq!(
+            bound["dispatched_waiting_for"].as_array().map(|a| a.len()),
+            Some(1),
+            "bound shape must include dispatched_waiting_for"
+        );
+        assert_eq!(
+            bound["pending_response_to"].as_array().map(|a| a.len()),
+            Some(1),
+            "bound shape must include pending_response_to"
         );
         std::fs::remove_dir_all(&home).ok();
     }

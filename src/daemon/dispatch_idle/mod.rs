@@ -191,6 +191,75 @@ pub(crate) fn mark_resolved(home: &Path, correlation_id: &str) -> Option<String>
     }
 }
 
+/// PR2 L3 visibility — per-instance dispatch metadata view.
+/// Pending sidecars where this instance is the **dispatcher**: outbound
+/// dispatches it's still waiting for replies on.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub(crate) struct DispatchedWaitingFor {
+    pub correlation_id: Option<String>,
+    pub target: String,
+    pub threshold_secs: i64,
+    pub elapsed_secs: i64,
+}
+
+/// PR2 L3 visibility — per-instance dispatch metadata view.
+/// Pending sidecars where this instance is the **target**: inbound
+/// dispatches it owes a reply on.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub(crate) struct PendingResponseTo {
+    pub correlation_id: Option<String>,
+    pub dispatcher: String,
+    pub threshold_secs: i64,
+    pub elapsed_secs: i64,
+}
+
+/// PR2 L3 helper: return the per-instance dispatch-idle metadata for
+/// `agent`, split into outbound (as dispatcher) and inbound (as target)
+/// views.
+///
+/// Only `status == "pending"` sidecars surface — `resolved`,
+/// `exceeded`, and `cancelled` entries are filtered out so the
+/// operator-facing view stays focused on live work.
+pub(crate) fn pending_for_instance(
+    home: &Path,
+    agent: &str,
+) -> (Vec<DispatchedWaitingFor>, Vec<PendingResponseTo>) {
+    let now = chrono::Utc::now();
+    let mut as_dispatcher = Vec::new();
+    let mut as_target = Vec::new();
+    if agent.is_empty() {
+        return (as_dispatcher, as_target);
+    }
+    for d in list_pending(home) {
+        if d.status != "pending" {
+            continue;
+        }
+        let elapsed_secs = chrono::DateTime::parse_from_rfc3339(&d.issued_at)
+            .map(|t| {
+                now.signed_duration_since(t.with_timezone(&chrono::Utc))
+                    .num_seconds()
+            })
+            .unwrap_or(0);
+        if d.dispatcher == agent {
+            as_dispatcher.push(DispatchedWaitingFor {
+                correlation_id: d.correlation_id.clone(),
+                target: d.target.clone(),
+                threshold_secs: d.threshold_secs,
+                elapsed_secs,
+            });
+        }
+        if d.target == agent {
+            as_target.push(PendingResponseTo {
+                correlation_id: d.correlation_id.clone(),
+                dispatcher: d.dispatcher.clone(),
+                threshold_secs: d.threshold_secs,
+                elapsed_secs,
+            });
+        }
+    }
+    (as_dispatcher, as_target)
+}
+
 /// Per-tick scan: flip eligible pending entries to `exceeded` and emit
 /// the inbox event to the dispatcher. Exposed `pub(crate)` for tests.
 pub(crate) fn scan_and_emit(home: &Path) {
@@ -591,6 +660,155 @@ mod tests {
         );
         // File preserved on disk so a v2 reader could pick it up later.
         assert!(pending_path(&home, "disp-future").exists());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── PR2 L3 visibility tests for pending_for_instance ──
+
+    /// Dispatcher view: pending sidecars where this agent is the
+    /// outbound dispatcher surface in `dispatched_waiting_for`.
+    #[test]
+    fn pending_for_instance_surfaces_dispatcher_view() {
+        let home = tmp_home("pfi-dispatcher");
+        let issued = chrono::Utc::now() - chrono::Duration::seconds(120);
+        write_pending_at(
+            &home,
+            "fixup-lead",
+            "fixup-reviewer",
+            Some("t-l3-disp"),
+            "task",
+            600,
+            issued,
+        );
+        let (as_dispatcher, as_target) = pending_for_instance(&home, "fixup-lead");
+        assert_eq!(as_dispatcher.len(), 1);
+        assert_eq!(as_dispatcher[0].target, "fixup-reviewer");
+        assert_eq!(
+            as_dispatcher[0].correlation_id.as_deref(),
+            Some("t-l3-disp")
+        );
+        assert_eq!(as_dispatcher[0].threshold_secs, 600);
+        assert!(
+            (110..=130).contains(&as_dispatcher[0].elapsed_secs),
+            "elapsed_secs within 10s window of expected 120: {}",
+            as_dispatcher[0].elapsed_secs
+        );
+        assert!(
+            as_target.is_empty(),
+            "dispatcher agent must NOT appear in its own target view"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Target view: pending sidecars where this agent owes a reply
+    /// surface in `pending_response_to`.
+    #[test]
+    fn pending_for_instance_surfaces_target_view() {
+        let home = tmp_home("pfi-target");
+        let issued = chrono::Utc::now() - chrono::Duration::seconds(120);
+        write_pending_at(
+            &home,
+            "fixup-lead",
+            "fixup-reviewer",
+            Some("t-l3-target"),
+            "task",
+            600,
+            issued,
+        );
+        let (_, as_target) = pending_for_instance(&home, "fixup-reviewer");
+        assert_eq!(as_target.len(), 1);
+        assert_eq!(as_target[0].dispatcher, "fixup-lead");
+        assert_eq!(as_target[0].correlation_id.as_deref(), Some("t-l3-target"));
+        assert_eq!(as_target[0].threshold_secs, 600);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Cross-team-safe: a non-fixup agent (and any agent not on a
+    /// sidecar) sees empty arrays. Non-fixup teams that haven't opted
+    /// in to the watchdog never record sidecars (see L2 default
+    /// threshold logic), so L3 is a no-op for them.
+    #[test]
+    fn pending_for_instance_empty_for_unaffected_agent() {
+        let home = tmp_home("pfi-unaffected");
+        let issued = chrono::Utc::now() - chrono::Duration::seconds(60);
+        write_pending_at(
+            &home,
+            "fixup-lead",
+            "fixup-reviewer",
+            Some("t-fixup"),
+            "task",
+            600,
+            issued,
+        );
+        let (as_dispatcher, as_target) = pending_for_instance(&home, "research-dev");
+        assert!(
+            as_dispatcher.is_empty() && as_target.is_empty(),
+            "unaffected agent surfaces empty arrays"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Stale filter: resolved / exceeded / cancelled sidecars do NOT
+    /// surface. Only `status == "pending"` reaches L3.
+    #[test]
+    fn pending_for_instance_filters_stale_sidecars() {
+        let home = tmp_home("pfi-stale-filter");
+        let issued = chrono::Utc::now() - chrono::Duration::seconds(60);
+        // One pending (must surface)
+        write_pending_at(&home, "lead", "dev", Some("t-pending"), "task", 600, issued);
+        // Three non-pending (must be filtered).
+        for (corr, status) in [
+            ("t-resolved", "resolved"),
+            ("t-exceeded", "exceeded"),
+            ("t-cancelled", "cancelled"),
+        ] {
+            let id = write_pending_at(&home, "lead", "dev", Some(corr), "task", 600, issued);
+            // Flip status on disk.
+            let path = pending_path(&home, &id);
+            let body = std::fs::read_to_string(&path).unwrap();
+            let mut v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            v["status"] = serde_json::Value::String(status.to_string());
+            std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+        }
+        let (as_dispatcher, _) = pending_for_instance(&home, "lead");
+        assert_eq!(
+            as_dispatcher.len(),
+            1,
+            "only status=pending sidecars surface"
+        );
+        assert_eq!(
+            as_dispatcher[0].correlation_id.as_deref(),
+            Some("t-pending"),
+            "non-pending entries must be filtered"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Wire shape: the serde-derived JSON for the L3 metadata uses
+    /// stable snake_case field names. Pins the operator-visible
+    /// schema so future renames are an intentional break, not a
+    /// silent regression.
+    #[test]
+    fn pending_for_instance_serializes_with_stable_field_names() {
+        let home = tmp_home("pfi-shape");
+        let issued = chrono::Utc::now() - chrono::Duration::seconds(60);
+        write_pending_at(&home, "lead", "dev", Some("t-shape"), "task", 600, issued);
+        let (as_dispatcher, as_target) = pending_for_instance(&home, "lead");
+        let j = serde_json::to_value(&as_dispatcher[0]).unwrap();
+        assert!(j.get("correlation_id").is_some());
+        assert!(j.get("target").is_some());
+        assert!(j.get("threshold_secs").is_some());
+        assert!(j.get("elapsed_secs").is_some());
+        assert!(
+            as_target.is_empty(),
+            "lead is dispatcher only — target view stays empty"
+        );
+        let (_, as_target_dev) = pending_for_instance(&home, "dev");
+        let j2 = serde_json::to_value(&as_target_dev[0]).unwrap();
+        assert!(j2.get("correlation_id").is_some());
+        assert!(j2.get("dispatcher").is_some());
+        assert!(j2.get("threshold_secs").is_some());
+        assert!(j2.get("elapsed_secs").is_some());
         std::fs::remove_dir_all(&home).ok();
     }
 }
