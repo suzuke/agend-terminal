@@ -66,6 +66,14 @@ fn main() {
     ) {
         Action::Passthrough => exec_real_git(&args, None),
         Action::ChdirPass(worktree) => exec_real_git(&args, Some(&worktree)),
+        Action::CleanupAndChdirPushPass(worktree) => {
+            // #883: best-effort pre-push cleanup of empty `init`
+            // heartbeat commits. Failure is logged + we still pass
+            // through to real `git push` — cleanup MUST NOT block
+            // real work from landing.
+            cleanup_init_pile_pre_push(&worktree);
+            exec_real_git(&args, Some(&worktree))
+        }
         Action::SilentExempt {
             target_branch,
             reason,
@@ -173,6 +181,18 @@ fn is_bound(binding: &Binding) -> bool {
 enum Action {
     Passthrough,
     ChdirPass(String),
+    /// #883: chdir into the bound worktree and run a pre-push
+    /// init-commit-pile cleanup BEFORE `exec`-ing real `git push`.
+    /// Backend session-checkpoint heartbeats (Claude / Codex / Kiro
+    /// etc.) periodically `commit --allow-empty -m "init"` inside the
+    /// bound worktree; without a pre-push gate these accumulate on
+    /// the PR branch and leak to origin (operator visible as "一堆
+    /// init" on the PR's mobile UI for #882). The cleanup is a
+    /// local-only soft-reset; it does NOT force-push or otherwise
+    /// rewrite remote history. On cleanup failure we log + still
+    /// chdir-pass to the real push (cleanup MUST NOT block real
+    /// work from landing).
+    CleanupAndChdirPushPass(String),
     /// Sprint 57 Wave 2 Track D: gh post-merge cleanup checkout
     /// recognized — exit 0 without invoking real git. E4.5 protection
     /// is preserved (no actual checkout to main happens) and the
@@ -292,9 +312,23 @@ fn classify(
         }
         // Config/help: always passthrough.
         "config" | "help" | "version" | "init" | "clone" => Action::Passthrough,
+        // #883: `push` factored out into its own arm so the pre-push
+        // init-commit-pile cleanup gets wired between bind check and
+        // the real `git push` exec. Other mutating commands keep the
+        // plain `ChdirPass`.
+        "push" => {
+            if !bound {
+                return Action::Deny("unbound — no active task assignment".into());
+            }
+            if let Some(ref wt) = binding.worktree {
+                Action::CleanupAndChdirPushPass(wt.clone())
+            } else {
+                Action::Deny("bound but no worktree path".into())
+            }
+        }
         // Mutating commands: deny when unbound.
-        "commit" | "push" | "pull" | "reset" | "revert" | "cherry-pick" | "stash" | "merge"
-        | "rebase" | "am" | "add" | "rm" | "mv" => {
+        "commit" | "pull" | "reset" | "revert" | "cherry-pick" | "stash" | "merge" | "rebase"
+        | "am" | "add" | "rm" | "mv" => {
             if !bound {
                 return Action::Deny("unbound — no active task assignment".into());
             }
@@ -503,6 +537,205 @@ fn parent_process_name() -> Option<String> {
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn parent_process_name() -> Option<String> {
     None
+}
+
+// ── #883 pre-push cleanup ───────────────────────────────────────────────
+
+/// #883: drop empty `init` heartbeat commits between `origin/main..HEAD`
+/// before the real `git push` fires. Targets the operator-visible case
+/// (PR #882 saw 16 inits before the real commit on mobile UI). The
+/// cleanup is a local soft-reset to `origin/main` ONLY when EVERY commit
+/// in the range is an empty init heartbeat — that's the common case the
+/// operator hit. The mixed-history case (real commits interleaved with
+/// inits) is left for the existing `repo action=cleanup_init_commits`
+/// MCP tool to handle via interactive rebase; we deliberately do not
+/// replicate that more-complex path in the shim to keep this function
+/// small + self-contained (the shim builds standalone without the
+/// library surface — see comment at line ~188).
+///
+/// **NEVER blocks `git push`.** Any subprocess failure is logged to
+/// stderr and the function returns; `main` then proceeds to
+/// `exec_real_git` as usual. Cleanup is a best-effort hygiene
+/// improvement, not a correctness gate.
+fn cleanup_init_pile_pre_push(worktree: &str) {
+    // List commits between origin/main..HEAD with hash + subject.
+    let log_out = match Command::new("git")
+        .args(["log", "origin/main..HEAD", "--format=%H %s"])
+        .current_dir(worktree)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => {
+            eprintln!(
+                "agend-git: #883 pre-push cleanup git log failed: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            return;
+        }
+        Err(e) => {
+            eprintln!("agend-git: #883 pre-push cleanup git log spawn failed: {e}");
+            return;
+        }
+    };
+    let log = String::from_utf8_lossy(&log_out.stdout);
+    if log.trim().is_empty() {
+        return;
+    }
+    // Classify each commit. Collect init-heartbeat hashes; anything
+    // that isn't a clean empty init is a real commit that must be
+    // preserved through the cleanup.
+    let mut empty_init_hashes: Vec<String> = Vec::new();
+    let mut total = 0usize;
+    for line in log.lines() {
+        total += 1;
+        let (hash, subject) = match line.split_once(' ') {
+            Some(p) => p,
+            None => continue,
+        };
+        if !is_heartbeat_subject_shim(subject) {
+            continue;
+        }
+        if !commit_is_empty_heartbeat(worktree, hash) {
+            continue;
+        }
+        empty_init_hashes.push(hash.to_string());
+    }
+    if empty_init_hashes.is_empty() {
+        return;
+    }
+    // All-init case: soft-reset is enough — drops every commit on the
+    // branch above origin/main, leaving working tree clean (since the
+    // dropped commits had no file changes).
+    if empty_init_hashes.len() == total {
+        let reset = Command::new("git")
+            .args(["reset", "--soft", "origin/main"])
+            .current_dir(worktree)
+            .env("AGEND_GIT_BYPASS", "1")
+            .status();
+        match reset {
+            Ok(s) if s.success() => {
+                eprintln!(
+                    "agend-git: #883 pre-push cleanup soft-reset {total} empty init commit(s)"
+                );
+            }
+            Ok(s) => {
+                eprintln!("agend-git: #883 pre-push cleanup soft-reset exited with status {s:?}");
+            }
+            Err(e) => {
+                eprintln!("agend-git: #883 pre-push cleanup soft-reset spawn failed: {e}");
+            }
+        }
+        return;
+    }
+    // Mixed-history case (operator's PR #882 scenario — 16 inits
+    // before the real commit): use interactive rebase with
+    // `GIT_SEQUENCE_EDITOR=sed` to rewrite "pick" → "drop" for each
+    // init hash. The rebase auto-completes non-interactively.
+    //
+    // Mirrors `src/mcp/handlers/dispatch_hook/mod.rs:862` mixed-case
+    // path. On any failure we run `git rebase --abort` to leave the
+    // worktree in a clean state, log to stderr, and let the real
+    // `git push` proceed with the pile still in place — better to
+    // ship the operator's work than block on cleanup.
+    let cleaned = empty_init_hashes.len();
+    let sed_parts: Vec<String> = empty_init_hashes
+        .iter()
+        .map(|h| {
+            let short = if h.len() >= 7 { &h[..7] } else { h.as_str() };
+            format!("s/^pick {short} /drop {short} /")
+        })
+        .collect();
+    let sed_script = sed_parts.join(";");
+    let rebase = Command::new("git")
+        .args(["-c", "core.abbrev=7", "rebase", "-i", "origin/main"])
+        .current_dir(worktree)
+        .env("AGEND_GIT_BYPASS", "1")
+        .env("GIT_SEQUENCE_EDITOR", format!("sed -i.bak '{sed_script}'"))
+        .status();
+    match rebase {
+        Ok(s) if s.success() => {
+            eprintln!(
+                "agend-git: #883 pre-push cleanup dropped {cleaned} empty init commit(s) via rebase"
+            );
+        }
+        _ => {
+            // Best-effort abort: leave the worktree in a clean state
+            // even if the rebase itself failed mid-flight. Failure
+            // to abort is logged but doesn't block push — the user's
+            // worst case is the pile-as-before that they had pre-fix.
+            let _abort = Command::new("git")
+                .args(["rebase", "--abort"])
+                .current_dir(worktree)
+                .env("AGEND_GIT_BYPASS", "1")
+                .status();
+            eprintln!(
+                "agend-git: #883 pre-push cleanup rebase failed; aborted to leave worktree clean. \
+                 Push proceeds with init pile intact ({cleaned} inits remain)."
+            );
+        }
+    }
+}
+
+/// Heartbeat-subject whitelist. Mirrors `HEARTBEAT_NAMES` in
+/// `src/mcp/handlers/dispatch_hook/mod.rs:951`. Inlined here because
+/// the shim is intentionally self-contained (no library imports).
+fn is_heartbeat_subject_shim(subject: &str) -> bool {
+    matches!(subject, "init" | "initial")
+}
+
+/// Verify the commit at `hash` is a true empty heartbeat: empty body
+/// (modulo `Agend-*` trailer keys from the prepare-commit-msg hook) AND
+/// zero file changes. Either check failing → not eligible for soft-
+/// reset cleanup.
+///
+/// Mirrors the gates in `src/mcp/handlers/dispatch_hook/mod.rs:802-811`
+/// plus `commit_body_is_empty` at line 1019. Inlined to keep the shim
+/// self-contained.
+fn commit_is_empty_heartbeat(worktree: &str, hash: &str) -> bool {
+    // Body check — must be empty (apart from the `prepare-commit-msg`
+    // hook's daemon trailers which are noise from this perspective).
+    let body_out = match Command::new("git")
+        .args(["log", "-1", "--format=%b", hash])
+        .current_dir(worktree)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return false,
+    };
+    let body = String::from_utf8_lossy(&body_out.stdout);
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Tolerate the four `Agend-*` trailer keys the prepare-commit-msg
+        // hook injects (`Agend-Agent`, `Agend-Task`, `Agend-Branch`,
+        // `Agend-Issued-At` — per `dispatch_hook/mod.rs:979`). Anything
+        // else means there's a real commit message body → not a
+        // heartbeat.
+        if trimmed.starts_with("Agend-Agent:")
+            || trimmed.starts_with("Agend-Task:")
+            || trimmed.starts_with("Agend-Branch:")
+            || trimmed.starts_with("Agend-Issued-At:")
+        {
+            continue;
+        }
+        return false;
+    }
+    // Diff check — must have zero file changes (otherwise it's a
+    // legitimate commit that happens to use the `init` subject).
+    let diff_out = match Command::new("git")
+        .args(["diff-tree", "--no-commit-id", "--name-only", "-r", hash])
+        .current_dir(worktree)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return false,
+    };
+    diff_out.stdout.trim_ascii().is_empty()
 }
 
 // ── Exec ────────────────────────────────────────────────────────────────
@@ -1316,5 +1549,300 @@ mod tests {
             "canonical worktree (`.git` FILE + gitdir: pointer to source \
              with origin) must still classify (pre-#852-residual contract)"
         );
+    }
+
+    // ── #883 pre-push cleanup tests ───────────────────────────────
+
+    /// Build a synthetic repo with a real `origin` remote pointing at
+    /// a sibling bare repo, then create N empty `init` heartbeat
+    /// commits on `feat/test` followed by one real commit. Returns
+    /// `(worktree_path, real_commit_sha)`. The fixture mirrors the
+    /// operator's PR #882 case (multiple init heartbeats before the
+    /// real commit) — exactly the scenario the shim cleanup must
+    /// handle.
+    fn setup_branch_with_init_pile(init_count: usize) -> (std::path::PathBuf, String) {
+        let id = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let base = std::env::temp_dir().join(format!("agend-883-fixture-{id}"));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let origin_bare = base.join("origin.git");
+        let worktree = base.join("worktree");
+        let git_env = [
+            ("AGEND_GIT_BYPASS", "1"),
+            ("GIT_AUTHOR_NAME", "test"),
+            ("GIT_AUTHOR_EMAIL", "test@test"),
+            ("GIT_COMMITTER_NAME", "test"),
+            ("GIT_COMMITTER_EMAIL", "test@test"),
+        ];
+        let git_run = |args: &[&str], dir: &std::path::Path| -> std::process::Output {
+            let mut cmd = Command::new("git");
+            cmd.args(args).current_dir(dir);
+            for (k, v) in git_env.iter() {
+                cmd.env(k, v);
+            }
+            cmd.output().expect("git spawn")
+        };
+
+        // Create a bare origin repo with one commit on main.
+        assert!(git_run(
+            &[
+                "init",
+                "--bare",
+                "-b",
+                "main",
+                origin_bare.to_str().unwrap()
+            ],
+            &base
+        )
+        .status
+        .success());
+        // Create the worktree by cloning the bare repo.
+        assert!(git_run(
+            &[
+                "clone",
+                origin_bare.to_str().unwrap(),
+                worktree.to_str().unwrap()
+            ],
+            &base
+        )
+        .status
+        .success());
+        // #883 r1: configure user identity + gpgsign in the LOCAL repo
+        // config so the production cleanup's `git rebase` (which spawns
+        // its own Command without inheriting test env vars) has the
+        // info it needs to materialize the cherry-picked real commit.
+        // macOS GH-Actions runners auto-derive user.name from
+        // /etc/passwd, but Ubuntu / Windows runners do not — that's
+        // why CI failed at 7fd4628. Local config takes precedence over
+        // global (which is /dev/null in `GIT_CONFIG_GLOBAL=/dev/null`
+        // pre-push baseline) AND over /etc/passwd derivation.
+        assert!(git_run(&["config", "user.name", "test"], &worktree)
+            .status
+            .success());
+        assert!(
+            git_run(&["config", "user.email", "test@test.local"], &worktree)
+                .status
+                .success()
+        );
+        // Belt-and-suspenders: disable commit signing in case the CI
+        // runner has `commit.gpgsign=true` baked in somewhere.
+        assert!(git_run(&["config", "commit.gpgsign", "false"], &worktree)
+            .status
+            .success());
+        // Seed origin/main with an initial real commit so origin/main..HEAD has a valid base.
+        std::fs::write(worktree.join("README.md"), "initial\n").unwrap();
+        assert!(git_run(&["add", "README.md"], &worktree).status.success());
+        assert!(git_run(&["commit", "-m", "initial real"], &worktree)
+            .status
+            .success());
+        assert!(git_run(&["push", "origin", "main"], &worktree)
+            .status
+            .success());
+
+        // Create the feature branch and pile N empty init heartbeats.
+        assert!(git_run(&["checkout", "-b", "feat/test"], &worktree)
+            .status
+            .success());
+        for _ in 0..init_count {
+            assert!(
+                git_run(&["commit", "--allow-empty", "-m", "init"], &worktree)
+                    .status
+                    .success()
+            );
+        }
+        // Add a real commit on top — the operator's PR #882 scenario.
+        std::fs::write(worktree.join("feature.txt"), "real work\n").unwrap();
+        assert!(git_run(&["add", "feature.txt"], &worktree).status.success());
+        assert!(git_run(&["commit", "-m", "feat: real work"], &worktree)
+            .status
+            .success());
+        let real_sha = String::from_utf8(git_run(&["rev-parse", "HEAD"], &worktree).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        (worktree, real_sha)
+    }
+
+    /// Count commits between `<base>..HEAD` in a worktree. Used to
+    /// assert how many commits survive the cleanup.
+    fn count_commits_above_base(worktree: &std::path::Path, base: &str) -> usize {
+        let output = Command::new("git")
+            .args(["log", &format!("{base}..HEAD"), "--format=%H"])
+            .current_dir(worktree)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git log spawn");
+        if !output.status.success() {
+            panic!(
+                "git log {base}..HEAD failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count()
+    }
+
+    /// Read the rev pointed at by a ref / HEAD.
+    fn rev_parse(worktree: &std::path::Path, refname: &str) -> String {
+        let output = Command::new("git")
+            .args(["rev-parse", refname])
+            .current_dir(worktree)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("rev-parse spawn");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// #883 RED→GREEN: the shim's pre-push cleanup must drop the
+    /// init pile before push so origin only sees the real commit.
+    /// Pre-fix the cleanup function doesn't exist (compile-fail RED).
+    /// Post-fix the mixed-history rebase path runs and the
+    /// `origin/main..HEAD` count drops from N+1 to 1.
+    ///
+    /// This test calls `cleanup_init_pile_pre_push` directly rather
+    /// than running the full `git push` (no need to wire a real
+    /// remote round-trip; the cleanup operates on local refs).
+    #[test]
+    fn shim_push_cleans_init_pile_before_push() {
+        let (worktree, real_sha) = setup_branch_with_init_pile(3);
+        // Pre-cleanup: 3 inits + 1 real = 4 commits above origin/main.
+        assert_eq!(
+            count_commits_above_base(&worktree, "origin/main"),
+            4,
+            "fixture must build 3 inits + 1 real commit above origin/main"
+        );
+
+        // Run the production cleanup function directly. This is what
+        // the shim's `Action::CleanupAndChdirPushPass` arm calls
+        // before `exec_real_git`.
+        cleanup_init_pile_pre_push(worktree.to_str().unwrap());
+
+        // Post-cleanup: only the real commit should remain above
+        // origin/main; the 3 inits must be dropped.
+        assert_eq!(
+            count_commits_above_base(&worktree, "origin/main"),
+            1,
+            "post-#883: shim cleanup must drop the 3 init heartbeats"
+        );
+
+        // The real commit's TREE must be preserved — rebase keeps
+        // identical content even if the SHA changes (rebase rewrites
+        // parent pointers). Assert by checking the file content.
+        let feature = std::fs::read_to_string(worktree.join("feature.txt")).unwrap();
+        assert_eq!(
+            feature.trim(),
+            "real work",
+            "real commit's tree must survive"
+        );
+
+        // The real commit's SHA may or may not change depending on
+        // whether interactive rebase rewrites parents. Both are
+        // valid; if the SHA stayed identical that's an even stronger
+        // signal (cherry-pick optimization), but either way the
+        // origin/main..HEAD count must be exactly 1.
+        let _ = real_sha; // intentionally not asserted equal
+
+        // Cleanup tempdir (best-effort).
+        let _ = std::fs::remove_dir_all(worktree.parent().unwrap());
+    }
+
+    /// Negative regression: no-op when origin/main..HEAD already has
+    /// only real commits. The cleanup must not mutate a clean branch.
+    #[test]
+    fn shim_push_cleanup_noop_when_no_inits() {
+        let id = format!(
+            "{}-noop-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let base = std::env::temp_dir().join(format!("agend-883-noop-{id}"));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let origin_bare = base.join("origin.git");
+        let worktree = base.join("worktree");
+        let env = [
+            ("AGEND_GIT_BYPASS", "1"),
+            ("GIT_AUTHOR_NAME", "t"),
+            ("GIT_AUTHOR_EMAIL", "t@t"),
+            ("GIT_COMMITTER_NAME", "t"),
+            ("GIT_COMMITTER_EMAIL", "t@t"),
+        ];
+        let run = |args: &[&str], dir: &std::path::Path| {
+            let mut c = Command::new("git");
+            c.args(args).current_dir(dir);
+            for (k, v) in env.iter() {
+                c.env(k, v);
+            }
+            c.output().expect("spawn")
+        };
+        assert!(run(
+            &[
+                "init",
+                "--bare",
+                "-b",
+                "main",
+                origin_bare.to_str().unwrap()
+            ],
+            &base
+        )
+        .status
+        .success());
+        assert!(run(
+            &[
+                "clone",
+                origin_bare.to_str().unwrap(),
+                worktree.to_str().unwrap()
+            ],
+            &base
+        )
+        .status
+        .success());
+        // #883 r1: configure local repo user identity + gpgsign so the
+        // production cleanup's `git rebase` doesn't fail on CI runners
+        // (Ubuntu / Windows) lacking global gitconfig. See
+        // `setup_branch_with_init_pile` for the full rationale.
+        assert!(run(&["config", "user.name", "test"], &worktree)
+            .status
+            .success());
+        assert!(run(&["config", "user.email", "test@test.local"], &worktree)
+            .status
+            .success());
+        assert!(run(&["config", "commit.gpgsign", "false"], &worktree)
+            .status
+            .success());
+        std::fs::write(worktree.join("R.md"), "x\n").unwrap();
+        assert!(run(&["add", "R.md"], &worktree).status.success());
+        assert!(run(&["commit", "-m", "initial"], &worktree)
+            .status
+            .success());
+        assert!(run(&["push", "origin", "main"], &worktree).status.success());
+        assert!(run(&["checkout", "-b", "feat/clean"], &worktree)
+            .status
+            .success());
+        std::fs::write(worktree.join("real.txt"), "work\n").unwrap();
+        assert!(run(&["add", "real.txt"], &worktree).status.success());
+        assert!(run(&["commit", "-m", "feat: real"], &worktree)
+            .status
+            .success());
+        let head_before = rev_parse(&worktree, "HEAD");
+
+        cleanup_init_pile_pre_push(worktree.to_str().unwrap());
+
+        let head_after = rev_parse(&worktree, "HEAD");
+        assert_eq!(head_before, head_after, "no-op on a clean branch");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
