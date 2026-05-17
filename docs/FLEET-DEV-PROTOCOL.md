@@ -183,6 +183,44 @@ If `repo action=checkout` fails (lease already held, branch unknown, worktree qu
 
 **Relationship to §3.19.** §3.19 says *what reviewers must not do in canonical*. §3.19.1 says *what every agent must do when the protocol gate fires* — abort and ask, not bypass and retry.
 
+### 3.20 Race-Condition PR Discipline
+
+Race-class PRs ship with hidden timing dependencies that pass CI + reviewer VERIFIED yet break production. Empirical motivation: #881 ("app mode never owns the daemon") shipped CI green + reviewer VERIFIED on 2026-05-17, then surfaced a spawn-and-attach race on the first cold-start with a slow filesystem flush. Operator reverted at 470c251; #882 reopen fix shipped at 0fd89e8 with a probe_api gate + `--foreground` mode + actionable error path. The lessons below apply to every spawn / async-coordination / multi-process-startup PR (the "race class"); same discipline framing as §3.19.1.
+
+**SOP 1 — Pre-r0 race-condition question.**
+
+Before dispatching r0 on a race-class PR, lead AND dev MUST answer in writing: *"Does this change have a race condition, and can I write a deterministic test that reproduces it without timing dependence?"* The answer goes in the spike report (or the dispatch message if no spike preceded).
+
+Race class includes — but is not limited to — `tokio::spawn` / `thread::spawn` sites, multi-process startup ordering, `Drop`-vs-`enqueue` lifecycle, lock-ordering across modules, signal-handler-vs-main-loop coordination, daemon-vs-bridge handshake gates. If the answer is "no deterministic test possible," the PR requires operator-smoke-gate (SOP 2) AND reviewer RED-protocol (SOP 3).
+
+**SOP 2 — Operator-smoke-gate for race-class PRs.**
+
+CI green + reviewer VERIFIED are INSUFFICIENT gates for race-class PRs. #881 cleared both gates and still broke prod. For race-class PRs:
+
+- PR body MUST include a **`REQUIRED post-merge operator smoke confirmation`** block stating what the operator must observe (e.g. "operator restarts daemon cold + watches inbox for `bridge_connected` within 5s").
+- The task entry stays in `claimed` status (NOT `done`) until the operator explicitly confirms post-rebuild behavior in the dispatching thread.
+- Lead handoff to operator is explicit: "@operator please smoke-test per PR body" — never implied by "merged".
+- If the smoke gate uncovers a regression, the recovery path is operator-driven revert (e.g. `git revert <merge-sha>`) — race regressions auto-escalate to P0 per §3.11(a) deferred-defense.
+
+**SOP 3 — Reviewer RED-protocol for race-class PRs.**
+
+For race-class PRs, the reviewer MUST execute the RED→GREEN protocol (not skim it):
+
+```
+# Reviewer's bound worktree (NOT canonical — §3.19):
+git checkout <pre-fix-base>     # revert commit OR last known good
+# Confirm RED: the new tests compile-fail, fail at runtime,
+# or fail with the expected error signature.
+git checkout <fix-head>
+# Confirm GREEN: tests pass without flakiness on three back-to-back runs.
+```
+
+The verdict body MUST explicitly state the protocol execution: "Checked out pre-fix base `<sha>` in this worktree. Verified target tests absent/failing there [by source grep / by cargo test exit code]. Reapplied fix HEAD; tests pass 3/3 runs." Fixup-reviewer's #882 verdict is the bar — it included verbatim: "Checked out pre-fix revert base 470c251 in this worktree. Verified target helper/tests are absent there by source grep."
+
+Reviewers who skip the protocol on a race-class PR get `RUBBER-STAMP — UNVERIFIED` per §3.16 substantive-consensus requirement. The PR returns to dev for explicit reviewer RED-protocol execution before re-dispatch.
+
+**Relationship to §3.19.1.** §3.19.1 says *what every agent must do when a protocol gate fires*. §3.20 says *what lead, dev, and reviewer must do BEFORE the gate could fire* on race-class PRs — a sanctioned discipline addition, not a replacement for any existing rule. Race-class triage at r0 dispatch is cheaper than the ship-then-revert cycle empirically observed on #881.
+
 ## §4. Daemon Enforcement Gates
 
 ### 4.1 Push-time Semantic Gate (Sprint 44)
