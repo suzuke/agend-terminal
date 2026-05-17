@@ -38,6 +38,8 @@ const EXPECTED_FIXTURES: &[&str] = &[
     "opencode-discussion-text.raw",
     "gemini-rate-limit-typical.raw",
     "gemini-discussion-text.raw",
+    "gemini-rate-limit-canonical-429.raw",
+    "gemini-rate-limit-prose-discussion.raw",
     "kiro-rate-limit-typical.raw",
     "kiro-usage-limit-typical.raw",
     "kiro-discussion-text.raw",
