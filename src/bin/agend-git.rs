@@ -1614,6 +1614,28 @@ mod tests {
         )
         .status
         .success());
+        // #883 r1: configure user identity + gpgsign in the LOCAL repo
+        // config so the production cleanup's `git rebase` (which spawns
+        // its own Command without inheriting test env vars) has the
+        // info it needs to materialize the cherry-picked real commit.
+        // macOS GH-Actions runners auto-derive user.name from
+        // /etc/passwd, but Ubuntu / Windows runners do not — that's
+        // why CI failed at 7fd4628. Local config takes precedence over
+        // global (which is /dev/null in `GIT_CONFIG_GLOBAL=/dev/null`
+        // pre-push baseline) AND over /etc/passwd derivation.
+        assert!(git_run(&["config", "user.name", "test"], &worktree)
+            .status
+            .success());
+        assert!(
+            git_run(&["config", "user.email", "test@test.local"], &worktree)
+                .status
+                .success()
+        );
+        // Belt-and-suspenders: disable commit signing in case the CI
+        // runner has `commit.gpgsign=true` baked in somewhere.
+        assert!(git_run(&["config", "commit.gpgsign", "false"], &worktree)
+            .status
+            .success());
         // Seed origin/main with an initial real commit so origin/main..HEAD has a valid base.
         std::fs::write(worktree.join("README.md"), "initial\n").unwrap();
         assert!(git_run(&["add", "README.md"], &worktree).status.success());
@@ -1788,6 +1810,19 @@ mod tests {
         )
         .status
         .success());
+        // #883 r1: configure local repo user identity + gpgsign so the
+        // production cleanup's `git rebase` doesn't fail on CI runners
+        // (Ubuntu / Windows) lacking global gitconfig. See
+        // `setup_branch_with_init_pile` for the full rationale.
+        assert!(run(&["config", "user.name", "test"], &worktree)
+            .status
+            .success());
+        assert!(run(&["config", "user.email", "test@test.local"], &worktree)
+            .status
+            .success());
+        assert!(run(&["config", "commit.gpgsign", "false"], &worktree)
+            .status
+            .success());
         std::fs::write(worktree.join("R.md"), "x\n").unwrap();
         assert!(run(&["add", "R.md"], &worktree).status.success());
         assert!(run(&["commit", "-m", "initial"], &worktree)
