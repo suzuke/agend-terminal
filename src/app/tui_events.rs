@@ -3,6 +3,15 @@
 //! The API server (hit via MCP or HTTP) signals agent/team lifecycle changes on
 //! a bounded crossbeam channel. The TUI event loop receives these and mutates
 //! the layout accordingly — auto-creating or removing tabs/panes.
+//!
+//! #879 — the in-process api::serve that produced these events is gone (app
+//! always attaches to a separately-spawned daemon). The enum, the event
+//! handler, and the helper functions all remain so the TUI event loop's
+//! select! arm compiles, and so the test coverage for layout-mutation
+//! helpers is preserved. The file-level `dead_code` allow covers the
+//! dead-construct-side of the pipeline until daemon → TUI event streaming is
+//! re-wired.
+#![allow(dead_code)]
 
 use crate::agent::{self, AgentRegistry};
 use crate::layout::{Layout, MovePlacement, SplitDir, Tab};

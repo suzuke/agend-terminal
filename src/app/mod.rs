@@ -2,6 +2,58 @@
 //!
 //! Uses agent::spawn_agent() for all panes (agents and shells), sharing the
 //! same PTY lifecycle as the daemon: auto-dismiss, state tracking, broadcast.
+//!
+//! ## App mode never owns the daemon (#879)
+//!
+//! Pre-#879 the TUI's `run` path treated `BootstrapOutcome::Owned` as "this
+//! process IS the daemon", running the in-process API server, supervisor, and
+//! Telegram polling inside the TUI's process. That meant `Ctrl+B d` (tmux
+//! detach) tore down the daemon + every agent's LLM context along with the
+//! TUI.
+//!
+//! Post-#879 the app always attaches as a client. When `prepare()` would have
+//! returned `Owned`, [`ensure_attached`] instead:
+//!
+//! 1. Drops the would-be `OwnedFleet` (releasing `.daemon.lock` so the
+//!    spawned child can acquire it).
+//! 2. Calls [`crate::bootstrap::daemon_spawn::spawn_detached`] to launch a
+//!    background daemon process. Per #879's REOPEN fix, `spawn_detached`
+//!    now blocks until the child is **fully ready** — run dir published
+//!    AND `api.port` listener bound (matches `try_attach`'s probe_api
+//!    gate).
+//! 3. Calls [`wait_for_attached`] to poll `prepare()` in a bounded 1s
+//!    loop until it returns `Attached` (defense-in-depth against any
+//!    sub-second post-spawn flush windows; bails with an actionable
+//!    error if no `Attached` is observed before the deadline).
+//!
+//! `BootstrapOutcome::Owned` + `OwnedFleet` remain intentionally for the
+//! foreground daemon path (`agend-terminal start --foreground`); only the
+//! app's would-be-Owned branch is removed.
+//!
+//! ### #879 REOPEN post-mortem
+//!
+//! PR #881 shipped CI green + reviewer VERIFIED but broke production:
+//! `ensure_attached`'s second `prepare()` call returned `Owned` again
+//! (the child hadn't yet bound its api.port), my bail-on-Owned fired,
+//! `run_app`'s `Err` arm silent-degraded to a noop_guard + `None`
+//! telegram state, and the bridge for every spawned agent returned
+//! `{tools: []}`. Operator reverted at `470c251`. The post-mortem
+//! identified TWO bugs:
+//!
+//! - **Bug A** — `spawn_detached`'s child cmd lacked `--foreground`, so
+//!   the child also entered the default-detach branch and recursed
+//!   indefinitely. Latent pre-existing bug, masked in production by
+//!   the launchd plist / systemd unit baking `start --foreground` into
+//!   the supervisor invocation. Surfaced by #879's app-side spawn.
+//! - **Bug B** — `spawn_detached`'s success criterion (run_dir presence
+//!   alone) was weaker than `try_attach`'s gate (run_dir + probe_api),
+//!   leaving a sub-second race window between run-dir publication and
+//!   listener-bind.
+//!
+//! r0-reopen (this iteration) fixes both at the source (in
+//! `src/bootstrap/daemon_spawn.rs`) AND replaces `run_app`'s silent-
+//! degrade with a propagated error carrying operator-actionable text.
+//! See `#851` for the supervisor-requirement framing.
 
 mod api_server;
 mod commands;
@@ -14,7 +66,7 @@ mod telegram_hooks;
 mod tui_events;
 
 pub use overlay::{BoardView, MenuItem, MenuItemKind, TaskBoardMode};
-pub(crate) use tui_events::{TuiEvent, TuiEventSender, TuiNotifier};
+pub(crate) use tui_events::TuiEvent;
 
 use crate::agent::{self, AgentRegistry};
 use crate::backend::Backend;
@@ -121,6 +173,109 @@ pub fn run(fleet_path_override: Option<&str>) -> Result<()> {
     result
 }
 
+/// #879: app-mode `PrepareOptions`. Centralised so the two `prepare()`
+/// call sites in [`ensure_attached`] and [`wait_for_attached`] stay in
+/// lockstep — divergent options were a foot-gun risk in the post-#881
+/// race window.
+fn app_prepare_opts() -> crate::bootstrap::PrepareOptions {
+    crate::bootstrap::PrepareOptions {
+        resolve_agents: false,
+        mutate_fleet_yaml: true,
+        init_telegram: true,
+    }
+}
+
+/// #879: ensure the app is connected to a running daemon as a client.
+///
+/// First-pass: call [`crate::bootstrap::prepare`] in app-mode.
+///
+/// - `Attached(client)` → return directly (warm path, daemon already up).
+/// - `Owned(owned)` → drop `owned` (releasing `.daemon.lock`) → invoke
+///   [`crate::bootstrap::daemon_spawn::spawn_detached`] (which per
+///   #879-reopen waits for BOTH run dir publication AND
+///   `api.port` listener bind via `probe_api` before returning) → invoke
+///   [`wait_for_attached`] to drain any sub-second residue. Bails with
+///   an actionable error if the spawned daemon never appears as
+///   `Attached` within the bounded poll window.
+/// - `Err(e)` → propagate.
+fn ensure_attached(home: &Path, fleet_path: &Path) -> Result<crate::bootstrap::AttachedFleet> {
+    match crate::bootstrap::prepare(home, fleet_path, app_prepare_opts())? {
+        crate::bootstrap::BootstrapOutcome::Attached(client) => Ok(client),
+        crate::bootstrap::BootstrapOutcome::Owned(owned) => {
+            tracing::info!(
+                "#879: no daemon detected; releasing would-be Owned lease, \
+                 spawning detached daemon, and re-attaching as client"
+            );
+            // Drop owned BEFORE spawn_detached so the child can acquire
+            // `.daemon.lock` — otherwise the child's `prepare()` would
+            // observe the lock as held by our process and stall.
+            drop(owned);
+            let fleet_arg = fleet_path.exists().then_some(fleet_path);
+            let handle = crate::bootstrap::daemon_spawn::spawn_detached(home, fleet_arg)
+                .map_err(|e| anyhow::anyhow!("spawn_detached failed: {e}"))?;
+            // #879-reopen defense-in-depth: spawn_detached already
+            // requires probe_api success before returning, but absorb
+            // any sub-second `prepare()`-side flush window with a
+            // bounded 1s poll. Bails loudly on timeout — the silent
+            // degrade in the original PR #881 is what made the
+            // regression invisible.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            wait_for_attached(home, fleet_path, deadline).map_err(|e| {
+                anyhow::anyhow!(
+                    "spawn-and-attach: child daemon spawned (pid={}, run_dir={}) but \
+                     bootstrap re-check kept observing Owned for 1s — see {} for child \
+                     startup errors: {e}",
+                    handle.pid,
+                    handle.run_dir.display(),
+                    handle.log_path.display()
+                )
+            })
+        }
+    }
+}
+
+/// #879: poll [`crate::bootstrap::prepare`] in a bounded loop until it
+/// returns `Attached`. Extracted from [`ensure_attached`] so unit tests
+/// can exercise the timeout-and-actionable-error contract without
+/// spawning a subprocess.
+///
+/// Returns `Ok(client)` on the first `Attached` observation. Returns
+/// `Err` with an actionable message if `deadline` passes while every
+/// `prepare()` call still returns `Owned` (or if a `prepare()` call
+/// itself errors — propagated).
+///
+/// Sleep granularity is 100ms — the typical post-publication flush
+/// window is sub-100ms on healthy fs, and `deadline` is normally 1s,
+/// giving ~10 chances to observe `Attached`.
+fn wait_for_attached(
+    home: &Path,
+    fleet_path: &Path,
+    deadline: std::time::Instant,
+) -> Result<crate::bootstrap::AttachedFleet> {
+    loop {
+        match crate::bootstrap::prepare(home, fleet_path, app_prepare_opts())? {
+            crate::bootstrap::BootstrapOutcome::Attached(client) => return Ok(client),
+            crate::bootstrap::BootstrapOutcome::Owned(owned) => {
+                // Drop owned IMMEDIATELY so the lock is released before
+                // we sleep — otherwise we'd block the real daemon from
+                // acquiring it on its own startup.
+                drop(owned);
+                if std::time::Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "wait_for_attached: daemon did not become attachable before deadline — \
+                         every prepare() call returned Owned, suggesting either no daemon was \
+                         ever spawned or the spawned daemon failed before binding api.port. \
+                         Run `agend-terminal service install` to enable supervised respawn, \
+                         or check `{}/daemon.log` for startup errors.",
+                        home.display()
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    }
+}
+
 /// Main event loop for the TUI app.
 ///
 /// M5 note: this function is 550+ lines with 15+ locals. Extraction to
@@ -137,7 +292,11 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         .unwrap_or_else(|| crate::fleet::fleet_yaml_path(&home));
 
     let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
-    let (tui_event_tx, tui_event_rx) = crossbeam_channel::bounded::<TuiEvent>(256);
+    // #879: the in-process api::serve sender is gone; this channel
+    // exists so the event-loop `select!` arm compiles. Future daemon →
+    // TUI event streaming will re-wire a sender via socket fan-out
+    // (mirror of `ci_watch`).
+    let (_tui_event_tx, tui_event_rx) = crossbeam_channel::bounded::<TuiEvent>(256);
 
     // Preflight via the shared bootstrap seam so `api.cookie` is issued before
     // `api::serve` starts — otherwise `inbox::notify_agent`'s `api::call(INJECT)`
@@ -147,50 +306,32 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // client (Stage 3.4). `attached_mode` gates every operation that would
     // conflict with the live daemon — session persistence, fleet.yaml sync,
     // supervisor spawn, and agent kill on exit.
-    let opts = crate::bootstrap::PrepareOptions {
-        resolve_agents: false, // app spawns via pane_factory from tabs
-        ..Default::default()
-    };
-    let mut attached_run_dir: Option<PathBuf> = None;
-    let (_api_guard, telegram_state, telegram_status) =
-        match crate::bootstrap::prepare(&home, &fleet_path, opts) {
-            Ok(crate::bootstrap::BootstrapOutcome::Owned(prepared)) => {
-                let telegram = prepared.telegram.clone();
-                let status = if telegram.is_some() {
-                    TelegramStatus::Connected
-                } else {
-                    telegram_hooks::telegram_status_from_config(&prepared.config)
-                };
-                let guard = api_server::start_api_server(prepared, &registry, tui_event_tx);
-                // SIGTERM-only handler: `agend-terminal stop` can cleanly exit
-                // the owned app. SIGINT stays with crossterm so Ctrl+C still
-                // reaches the focused pane's PTY as 0x03.
-                crate::bootstrap::signals::install_term_only();
-                (guard, telegram, status)
-            }
-            Ok(crate::bootstrap::BootstrapOutcome::Attached(attached)) => {
-                tracing::info!(
-                    pid = attached.daemon_pid,
-                    path = %attached.run_dir.display(),
-                    "attached to existing daemon, connecting as remote client"
-                );
-                attached_run_dir = Some(attached.run_dir.clone());
-                (
-                    api_server::noop_guard(),
-                    None,
-                    TelegramStatus::NotConfigured,
-                )
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "bootstrap failed, running TUI without in-process API");
-                (
-                    api_server::noop_guard(),
-                    None,
-                    TelegramStatus::NotConfigured,
-                )
-            }
-        };
+    // #879 (reopen): app always attaches as a client; spawn a detached
+    // daemon if none is running. Any failure here is fatal — bridging
+    // tools to agents requires the API, so silent-degrading to a TUI
+    // without it would surface as `{tools: []}` (the regression that
+    // operator reverted at 470c251). Propagate the error to `run`
+    // which prints + exits non-zero.
+    let attached = ensure_attached(&home, &fleet_path)?;
+    tracing::info!(
+        pid = attached.daemon_pid,
+        path = %attached.run_dir.display(),
+        "attached to daemon, connecting as remote client"
+    );
+    let attached_run_dir: Option<PathBuf> = Some(attached.run_dir.clone());
+    let (_api_guard, telegram_state, telegram_status) = (
+        api_server::noop_guard(),
+        None::<Arc<dyn crate::channel::Channel>>,
+        TelegramStatus::NotConfigured,
+    );
     let attached_mode = attached_run_dir.is_some();
+
+    // SIGTERM-only handler so `agend-terminal stop` (which sends SIGTERM)
+    // can cleanly exit the TUI. The daemon (now always a separate process
+    // post-#879) has its own SIGTERM handler installed by its own
+    // `bootstrap::signals::install`. SIGINT stays with crossterm so
+    // Ctrl+C still reaches the focused pane's PTY as 0x03.
+    crate::bootstrap::signals::install_term_only();
 
     // SIGINT / SIGHUP are left to their defaults: Ctrl+C must reach the
     // focused pane's PTY as 0x03 (crossterm reads it as a KeyEvent in raw
@@ -1157,5 +1298,51 @@ mod tests {
             "healthy",
             "fresh tracker should remain healthy after decay tick"
         );
+    }
+
+    /// #879-reopen RED test (Layer 1): `wait_for_attached` must surface
+    /// an actionable timeout error (not silent-degrade) when no daemon
+    /// becomes attachable within the deadline. Empty home → every
+    /// `prepare()` returns Owned → loop polls until deadline → bails
+    /// with operator-guidance text.
+    ///
+    /// Pre-fix (revert commit 470c251): this helper doesn't exist
+    /// (compile-fail RED). Post-fix: this test asserts the
+    /// bounded-timeout contract that prevents the silent regression
+    /// that broke production after PR #881.
+    #[test]
+    fn wait_for_attached_times_out_with_actionable_error_when_no_daemon() {
+        let home = tmp_home("879-no-daemon");
+        let fleet_path = home.join("fleet.yaml");
+        std::fs::write(
+            &fleet_path,
+            "defaults:\n  backend: claude\ninstances:\n  worker:\n    backend: claude\n",
+        )
+        .expect("write fleet");
+
+        let started = std::time::Instant::now();
+        let deadline = started + std::time::Duration::from_millis(500);
+        let result = wait_for_attached(&home, &fleet_path, deadline);
+        let elapsed = started.elapsed();
+
+        let err = match result {
+            Ok(_) => panic!("no daemon → wait_for_attached must error, got Ok"),
+            Err(e) => e,
+        };
+        assert!(
+            elapsed >= std::time::Duration::from_millis(450),
+            "must poll the full deadline budget (got {elapsed:?})"
+        );
+        let err_msg = format!("{err:#}");
+        assert!(
+            err_msg.contains("daemon did not become attachable"),
+            "error must name the timeout class for operator search: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("agend-terminal service install"),
+            "error must point operator at supervised-respawn remediation: {err_msg}"
+        );
+
+        std::fs::remove_dir_all(home).ok();
     }
 }
