@@ -3,15 +3,6 @@
 //! The API server (hit via MCP or HTTP) signals agent/team lifecycle changes on
 //! a bounded crossbeam channel. The TUI event loop receives these and mutates
 //! the layout accordingly — auto-creating or removing tabs/panes.
-//!
-//! #879 — the in-process api::serve that produced these events is gone (app
-//! always attaches to a separately-spawned daemon). The enum, the event
-//! handler, and the helper functions all remain so the TUI event loop's
-//! select! arm compiles, and so the test coverage for layout-mutation
-//! helpers is preserved. The file-level `dead_code` allow covers the
-//! dead-construct-side of the pipeline until daemon → TUI event streaming is
-//! re-wired (see `app/mod.rs`'s `_tui_event_tx` placeholder).
-#![allow(dead_code)]
 
 use crate::agent::{self, AgentRegistry};
 use crate::layout::{Layout, MovePlacement, SplitDir, Tab};
@@ -19,14 +10,6 @@ use crate::layout::{Layout, MovePlacement, SplitDir, Tab};
 /// Events sent from the API server to the TUI event loop when agents or teams
 /// are created/deleted via MCP tools. The TUI reacts by auto-creating or
 /// removing tabs/panes.
-///
-/// #879 — the in-process api::serve that constructed these events is gone
-/// (app always attaches to a separately-spawned daemon). The enum + handler
-/// path are retained for a future re-wiring (daemon → TUI event stream via
-/// socket / `ci_watch`-style fan-out) but have no live producer today;
-/// `#[allow(dead_code)]` is applied at the enum + variant level for the
-/// duration of this gap.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) enum TuiEvent {
     InstanceCreated {
@@ -68,7 +51,6 @@ pub(crate) enum TuiEvent {
     },
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) enum LayoutHint {
     #[default]
@@ -77,14 +59,10 @@ pub(crate) enum LayoutHint {
     SplitBelow,
 }
 
-#[allow(dead_code)]
 pub(crate) type TuiEventSender = crossbeam_channel::Sender<TuiEvent>;
 
 /// Adapter that converts [`crate::api::ApiEvent`] into [`TuiEvent`] and
 /// forwards it over the crossbeam channel to the TUI event loop.
-///
-/// #879 — kept for future re-wiring; no live caller today.
-#[allow(dead_code)]
 pub(crate) struct TuiNotifier {
     pub tx: TuiEventSender,
 }

@@ -1,31 +1,91 @@
-//! API-server guard + fleet auto-start hook.
+//! In-process API server lifecycle + fleet auto-start on cold boot.
 //!
-//! #879 — pre-fix this module hosted the in-process API server that the
-//! TUI ran when it was the daemon (`BootstrapOutcome::Owned` path).
-//! That path is gone: the app always attaches to a separately-spawned
-//! daemon via [`super::ensure_attached`], so the in-process server +
-//! its associated bridge (`TuiNotifier`) are no longer needed here.
-//!
-//! What remains: [`ApiGuard`] — a degenerate RAII no-op used by the
-//! event loop's existing `_api_guard` binding. The cleanup it used to
-//! do (`remove_dir_all` on the owned run_dir) is no longer applicable
-//! in attached mode; the daemon process owns its own run dir lifecycle.
-//! Kept (rather than deleted) so the call-site signature is stable
-//! across the #879 transition — a future PR can prune it once the
-//! call-site is touched for other reasons.
+//! `ApiGuard` is an RAII handle that cleans up the run-dir when the TUI exits
+//! and holds the [`crate::bootstrap::OwnedFleet`] — i.e. the `.daemon.lock`
+//! flock guard, `api.cookie` bytes, and Telegram polling state — for the full
+//! TUI lifetime. `auto_start_fleet` spawns every fleet.yaml instance as a new
+//! tab during first-time startup (no session.json present).
 
 use crate::agent::AgentRegistry;
 use crate::layout::{Layout, Tab};
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-pub(super) struct ApiGuard;
+use super::TuiEventSender;
+use super::TuiNotifier;
 
-/// Construct an ApiGuard that does nothing — used in attached mode,
-/// where the TUI must not touch the daemon process's run dir.
+pub(super) struct ApiGuard {
+    run_dir: Option<PathBuf>,
+    // Held for lifetime: keeps .daemon.lock flock, api.cookie, telegram
+    // polling state alive until the TUI exits.
+    _owned: Option<Box<crate::bootstrap::OwnedFleet>>,
+}
+
+impl Drop for ApiGuard {
+    fn drop(&mut self) {
+        if let Some(ref dir) = self.run_dir {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// Spawn the in-process API server using a fleet prepared by
+/// [`crate::bootstrap::prepare`]. The prepared fleet owns the run dir + cookie
+/// (issued by bootstrap, fixing the `api.cookie missing; aborting serve`
+/// regression that previously broke Telegram delivery in app mode) and is
+/// held inside the guard for the TUI's lifetime.
+pub(super) fn start_api_server(
+    prepared: Box<crate::bootstrap::OwnedFleet>,
+    registry: &AgentRegistry,
+    tui_tx: TuiEventSender,
+) -> ApiGuard {
+    let run_dir = prepared.run_dir.clone();
+    let api_home = prepared.home.clone();
+
+    let api_registry = Arc::clone(registry);
+    let configs: crate::api::ConfigRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let externals: crate::agent::ExternalRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let notifier: Arc<dyn crate::api::ApiNotifier> = Arc::new(TuiNotifier { tx: tui_tx });
+
+    // fire-and-forget: in-process API server thread bound to TUI process
+    // lifetime. `crate::api::serve` runs forever; on TUI quit the OS reaps
+    // the thread (parent main exits → all children die). No graceful join
+    // needed — Sprint 20.5 Track 7 cross-pass confirmed this is the
+    // intended pattern (no panic cascade across the named-thread
+    // isolation).
+    std::thread::Builder::new()
+        .name("app_api_server".into())
+        .spawn(move || {
+            crate::api::serve(
+                &api_home,
+                api_registry,
+                shutdown,
+                configs,
+                externals,
+                Some(notifier),
+            );
+        })
+        .ok();
+
+    tracing::info!(path = %run_dir.display(), "in-process API server started");
+    ApiGuard {
+        run_dir: Some(run_dir),
+        _owned: Some(prepared),
+    }
+}
+
+/// Construct an ApiGuard that does nothing — used when the current process
+/// attached to an existing daemon and therefore must not touch its run dir.
 pub(super) fn noop_guard() -> ApiGuard {
-    ApiGuard
+    ApiGuard {
+        run_dir: None,
+        _owned: None,
+    }
 }
 
 /// Auto-start all fleet instances as tabs. Returns true if any were spawned.
