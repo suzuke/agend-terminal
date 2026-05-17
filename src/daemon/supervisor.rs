@@ -177,14 +177,20 @@ pub(crate) fn dedup_decision(
 ///   a fresh cycle.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RecoveryNudgeTrack {
-    pub last_error_at: Option<Instant>,
-    pub recovered_at: Option<Instant>,
-    pub last_inject_at: Option<Instant>,
+    pub last_error_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub recovered_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_inject_at: Option<chrono::DateTime<chrono::Utc>>,
     pub fired_this_cycle: bool,
     /// Hourly-cap: start of the current rolling 1-hour window. `None`
     /// when no nudge has ever fired (or the previous window expired
     /// without rolling over).
-    pub hourly_window_start: Option<Instant>,
+    ///
+    /// Cross-platform note (r1 fix): uses `chrono::DateTime<Utc>` rather
+    /// than `std::time::Instant` because Windows' performance-counter
+    /// `Instant` baseline panics on subtraction of durations longer
+    /// than uptime (`time.rs:445`). Chrono's well-defined epoch-based
+    /// arithmetic never underflows.
+    pub hourly_window_start: Option<chrono::DateTime<chrono::Utc>>,
     /// Hourly-cap: nudges fired within the current rolling window.
     pub nudges_in_window: u32,
 }
@@ -255,7 +261,7 @@ pub(crate) fn decide_nudge(
     current_state: crate::state::AgentState,
     fast_retry_active: bool,
     config: &crate::fleet::RateLimitRecoveryConfig,
-    now: Instant,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> NudgeDecision {
     use crate::state::AgentState;
 
@@ -274,8 +280,9 @@ pub(crate) fn decide_nudge(
     // Error too stale (>1 hour past the observe window) — treat as no
     // longer relevant. Operator probably came back to a long-idle agent
     // that happens to have an old error in its track.
-    let stale_cap = Duration::from_secs(config.observe_after_secs.saturating_add(3600));
-    if now.duration_since(last_error_at) > stale_cap {
+    let stale_cap =
+        chrono::Duration::seconds(config.observe_after_secs.saturating_add(3600) as i64);
+    if now.signed_duration_since(last_error_at) > stale_cap {
         return NudgeDecision::Skip(NudgeSkipReason::NoRecentError);
     }
     if !matches!(current_state, AgentState::Ready | AgentState::Idle) {
@@ -284,20 +291,20 @@ pub(crate) fn decide_nudge(
     let Some(recovered_at) = track.recovered_at else {
         return NudgeDecision::Skip(NudgeSkipReason::NotIdle);
     };
-    let recovery_window = Duration::from_secs(config.recovery_after_secs);
-    if now.duration_since(recovered_at) < recovery_window {
+    let recovery_window = chrono::Duration::seconds(config.recovery_after_secs as i64);
+    if now.signed_duration_since(recovered_at) < recovery_window {
         return NudgeDecision::Skip(NudgeSkipReason::StillInRecoveryWindow);
     }
     if let Some(last_inject_at) = track.last_inject_at {
-        let cooldown = Duration::from_secs(config.cooldown_secs);
-        if now.duration_since(last_inject_at) < cooldown {
+        let cooldown = chrono::Duration::seconds(config.cooldown_secs as i64);
+        if now.signed_duration_since(last_inject_at) < cooldown {
             return NudgeDecision::Skip(NudgeSkipReason::Cooldown);
         }
     }
     // Hourly cap (Q3): if a window is active AND saturated, suppress.
     // Window rollover is the caller's job (decide_nudge stays pure).
     if let Some(window_start) = track.hourly_window_start {
-        let in_window = now.duration_since(window_start) < Duration::from_secs(3600);
+        let in_window = now.signed_duration_since(window_start) < chrono::Duration::hours(1);
         if in_window && track.nudges_in_window >= config.hourly_cap {
             return NudgeDecision::Skip(NudgeSkipReason::HourlyCapHit);
         }
@@ -327,7 +334,10 @@ pub(crate) fn process_rate_limit_recovery_nudges(
     fast_retry_tracks: &HashMap<String, RateLimitRetry>,
     nudge_tracks: &mut HashMap<String, RecoveryNudgeTrack>,
 ) {
-    let now = Instant::now();
+    // Cross-platform safe (r1 fix): chrono::Utc::now() instead of
+    // std::time::Instant::now() — Windows performance-counter Instant
+    // panics on subtraction beyond its baseline.
+    let now = chrono::Utc::now();
 
     // Phase 1: state observation + track update (registry lock held).
     let mut observed: Vec<(String, crate::state::AgentState)> = Vec::new();
@@ -404,7 +414,7 @@ pub(crate) fn process_rate_limit_recovery_nudges(
                 // else increment the counter inside the current window.
                 let rollover = match t.hourly_window_start {
                     None => true,
-                    Some(start) => now.duration_since(start) >= Duration::from_secs(3600),
+                    Some(start) => now.signed_duration_since(start) >= chrono::Duration::hours(1),
                 };
                 if rollover {
                     t.hourly_window_start = Some(now);
@@ -2294,10 +2304,13 @@ mod tests {
     use crate::fleet::RateLimitRecoveryConfig;
     use crate::state::AgentState;
 
+    /// All times use `chrono::DateTime<Utc>` (not `std::time::Instant`)
+    /// because Windows' performance-counter Instant panics on subtraction
+    /// of durations longer than process uptime (r1 fix — see PR #886).
     fn fresh_nudge_track(
-        now: Instant,
-        error_offset: Duration,
-        recovery_offset: Duration,
+        now: chrono::DateTime<chrono::Utc>,
+        error_offset: chrono::Duration,
+        recovery_offset: chrono::Duration,
     ) -> RecoveryNudgeTrack {
         RecoveryNudgeTrack {
             last_error_at: Some(now - error_offset),
@@ -2313,8 +2326,12 @@ mod tests {
     #[test]
     fn nudge_fires_when_all_conditions_met() {
         let cfg = RateLimitRecoveryConfig::default();
-        let now = Instant::now();
-        let track = fresh_nudge_track(now, Duration::from_secs(100), Duration::from_secs(70));
+        let now = chrono::Utc::now();
+        let track = fresh_nudge_track(
+            now,
+            chrono::Duration::seconds(100),
+            chrono::Duration::seconds(70),
+        );
         assert_eq!(
             decide_nudge(&track, AgentState::Idle, false, &cfg, now),
             NudgeDecision::Fire
@@ -2328,8 +2345,12 @@ mod tests {
             enabled: false,
             ..RateLimitRecoveryConfig::default()
         };
-        let now = Instant::now();
-        let track = fresh_nudge_track(now, Duration::from_secs(100), Duration::from_secs(70));
+        let now = chrono::Utc::now();
+        let track = fresh_nudge_track(
+            now,
+            chrono::Duration::seconds(100),
+            chrono::Duration::seconds(70),
+        );
         assert_eq!(
             decide_nudge(&track, AgentState::Idle, false, &cfg, now),
             NudgeDecision::Skip(NudgeSkipReason::Disabled)
@@ -2340,9 +2361,14 @@ mod tests {
     #[test]
     fn nudge_does_not_re_fire_within_cooldown() {
         let cfg = RateLimitRecoveryConfig::default();
-        let now = Instant::now();
-        let mut track = fresh_nudge_track(now, Duration::from_secs(100), Duration::from_secs(70));
-        track.last_inject_at = Some(now - Duration::from_secs(60)); // 60s ago, within 300s cooldown
+        let now = chrono::Utc::now();
+        let mut track = fresh_nudge_track(
+            now,
+            chrono::Duration::seconds(100),
+            chrono::Duration::seconds(70),
+        );
+        // 60s ago, within 300s cooldown.
+        track.last_inject_at = Some(now - chrono::Duration::seconds(60));
         assert_eq!(
             decide_nudge(&track, AgentState::Idle, false, &cfg, now),
             NudgeDecision::Skip(NudgeSkipReason::Cooldown)
@@ -2353,8 +2379,12 @@ mod tests {
     #[test]
     fn nudge_skipped_when_fast_retry_active() {
         let cfg = RateLimitRecoveryConfig::default();
-        let now = Instant::now();
-        let track = fresh_nudge_track(now, Duration::from_secs(100), Duration::from_secs(70));
+        let now = chrono::Utc::now();
+        let track = fresh_nudge_track(
+            now,
+            chrono::Duration::seconds(100),
+            chrono::Duration::seconds(70),
+        );
         assert_eq!(
             decide_nudge(&track, AgentState::Idle, true, &cfg, now),
             NudgeDecision::Skip(NudgeSkipReason::DeferToFastRetry)
@@ -2366,10 +2396,10 @@ mod tests {
     #[test]
     fn nudge_skipped_when_no_recent_error() {
         let cfg = RateLimitRecoveryConfig::default();
-        let now = Instant::now();
+        let now = chrono::Utc::now();
         let track = RecoveryNudgeTrack {
             last_error_at: None,
-            recovered_at: Some(now - Duration::from_secs(70)),
+            recovered_at: Some(now - chrono::Duration::seconds(70)),
             last_inject_at: None,
             fired_this_cycle: false,
             hourly_window_start: None,
@@ -2388,8 +2418,12 @@ mod tests {
     #[test]
     fn nudge_does_not_re_fire_when_fired_this_cycle_and_state_returns_to_ready() {
         let cfg = RateLimitRecoveryConfig::default();
-        let now = Instant::now();
-        let mut track = fresh_nudge_track(now, Duration::from_secs(100), Duration::from_secs(70));
+        let now = chrono::Utc::now();
+        let mut track = fresh_nudge_track(
+            now,
+            chrono::Duration::seconds(100),
+            chrono::Duration::seconds(70),
+        );
         track.fired_this_cycle = true;
         // Even with all other conditions met (Idle, no fast-retry, error fresh,
         // no cooldown), fired_this_cycle alone must suppress.
@@ -2411,8 +2445,12 @@ mod tests {
     #[test]
     fn nudge_skipped_when_in_permanent_error_state() {
         let cfg = RateLimitRecoveryConfig::default();
-        let now = Instant::now();
-        let track = fresh_nudge_track(now, Duration::from_secs(100), Duration::from_secs(70));
+        let now = chrono::Utc::now();
+        let track = fresh_nudge_track(
+            now,
+            chrono::Duration::seconds(100),
+            chrono::Duration::seconds(70),
+        );
         assert_eq!(
             decide_nudge(&track, AgentState::UsageLimit, false, &cfg, now),
             NudgeDecision::Skip(NudgeSkipReason::NotIdle)
@@ -2424,22 +2462,27 @@ mod tests {
     }
 
     /// (8) Q3 NEW hourly cap: 4th nudge in a 1-hour window is skipped
-    /// even if every other gate would let it fire.
+    /// even if every other gate would let it fire. Cross-platform
+    /// safe via chrono — r1 windows fix (was Instant in r0).
     #[test]
     fn nudge_hourly_cap_skips_4th_nudge_in_1h_window() {
         let cfg = RateLimitRecoveryConfig::default(); // hourly_cap=3
-        let now = Instant::now();
-        let mut track = fresh_nudge_track(now, Duration::from_secs(100), Duration::from_secs(70));
+        let now = chrono::Utc::now();
+        let mut track = fresh_nudge_track(
+            now,
+            chrono::Duration::seconds(100),
+            chrono::Duration::seconds(70),
+        );
         // Simulate 3 prior nudges within the current hour window.
-        track.hourly_window_start = Some(now - Duration::from_secs(1800)); // 30 min ago
+        track.hourly_window_start = Some(now - chrono::Duration::seconds(1800)); // 30 min ago
         track.nudges_in_window = 3;
         // last_inject_at outside cooldown so cooldown gate wouldn't suppress.
-        track.last_inject_at = Some(now - Duration::from_secs(600));
+        track.last_inject_at = Some(now - chrono::Duration::seconds(600));
         // fired_this_cycle reset (new cycle starting).
         track.fired_this_cycle = false;
         // recovered_at fresh so cycle is ready.
-        track.recovered_at = Some(now - Duration::from_secs(70));
-        track.last_error_at = Some(now - Duration::from_secs(80));
+        track.recovered_at = Some(now - chrono::Duration::seconds(70));
+        track.last_error_at = Some(now - chrono::Duration::seconds(80));
         assert_eq!(
             decide_nudge(&track, AgentState::Idle, false, &cfg, now),
             NudgeDecision::Skip(NudgeSkipReason::HourlyCapHit)
@@ -2447,15 +2490,20 @@ mod tests {
     }
 
     /// (9) Q3 NEW hourly cap: window expires after 1 hour; cap resets
-    /// and next nudge can fire.
+    /// and next nudge can fire. Cross-platform safe via chrono — was
+    /// the Windows Instant arithmetic underflow site in r0.
     #[test]
     fn nudge_hourly_cap_resets_after_window_elapses() {
         let cfg = RateLimitRecoveryConfig::default();
-        let now = Instant::now();
-        let mut track = fresh_nudge_track(now, Duration::from_secs(100), Duration::from_secs(70));
-        track.hourly_window_start = Some(now - Duration::from_secs(3700)); // 1h 1.7m ago
+        let now = chrono::Utc::now();
+        let mut track = fresh_nudge_track(
+            now,
+            chrono::Duration::seconds(100),
+            chrono::Duration::seconds(70),
+        );
+        track.hourly_window_start = Some(now - chrono::Duration::seconds(3700)); // 1h 1.7m ago
         track.nudges_in_window = 3;
-        track.last_inject_at = Some(now - Duration::from_secs(3700));
+        track.last_inject_at = Some(now - chrono::Duration::seconds(3700));
         // After window elapses, decide_nudge should NOT skip on cap —
         // it can Fire (other gates clear).
         assert_eq!(
