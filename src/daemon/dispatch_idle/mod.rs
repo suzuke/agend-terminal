@@ -1,0 +1,473 @@
+//! L1: cross-team-safe dispatch-idle watchdog.
+//!
+//! Tracks `send(kind=task|query)` calls that carry an explicit
+//! `expect_reply_within_secs` opt-in. When the expected reply hasn't
+//! arrived inside the threshold window, fires a
+//! `dispatch_idle_threshold_exceeded` event to the dispatcher's inbox.
+//!
+//! Cross-team contract: this file MUST stay team-name-free.
+//! `no_team_name_strings_in_l1` is the load-bearing invariant test —
+//! any L1 grep hit for "fixup" / "reviewer" / "lead" fails CI.
+//! Teams opt in by setting `expect_reply_within_secs` on their own
+//! dispatches; team-specific automation lives in sibling modules
+//! (see `fixup_nudge`).
+//!
+//! Pattern lineage: closest mirror is `decision_timeout` (threshold +
+//! resolve + sidecar lifecycle); hook-site precedent is #870 in
+//! `auto_release` (handle_send post-enqueue).
+
+pub(crate) mod fixup_nudge;
+
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+
+const PENDING_DIR: &str = "pending-dispatches";
+const SCHEMA_VERSION: u32 = 1;
+
+/// Scan throttle in supervisor ticks. 6 ≈ 60s at the 10s tick rate —
+/// faster than the 30-tick siblings because the threshold the watchdog
+/// is gating (single-digit minutes for orchestrator-class dispatches)
+/// demands ≤60s fire-time accuracy. Mirrors auto_release's
+/// responsiveness-critical cadence rationale.
+pub(crate) const TICKS_PER_SCAN: u64 = 6;
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct PendingDispatch {
+    #[serde(default)]
+    pub(crate) schema_version: u32,
+    #[serde(default)]
+    pub(crate) dispatch_id: String,
+    /// The `send.from` identity (who is waiting for a reply).
+    #[serde(default)]
+    pub(crate) dispatcher: String,
+    /// The `send.target` identity (who is expected to reply).
+    #[serde(default)]
+    pub(crate) target: String,
+    /// `task_id` / thread correlation id from the original dispatch.
+    #[serde(default)]
+    pub(crate) correlation_id: Option<String>,
+    /// Original dispatch kind: `"task"` or `"query"`.
+    #[serde(default)]
+    pub(crate) expected_kind: String,
+    #[serde(default)]
+    pub(crate) threshold_secs: i64,
+    #[serde(default)]
+    pub(crate) issued_at: String,
+    /// `pending` | `exceeded` | `resolved` | `cancelled`.
+    #[serde(default = "default_status")]
+    pub(crate) status: String,
+    /// L2-owned dedup field: timestamp of the last nudge emitted for
+    /// this dispatch. `None` = no nudge sent yet. L1 never reads this
+    /// field; it lives in the L1 schema to keep the sidecar a single
+    /// source of truth (avoids parallel L2 sidecar bookkeeping).
+    #[serde(default)]
+    pub(crate) nudge_sent_at: Option<String>,
+}
+
+fn default_status() -> String {
+    "pending".to_string()
+}
+
+pub(crate) fn pending_dir(home: &Path) -> PathBuf {
+    home.join(PENDING_DIR)
+}
+
+pub(crate) fn pending_path(home: &Path, dispatch_id: &str) -> PathBuf {
+    pending_dir(home).join(format!("{dispatch_id}.json"))
+}
+
+/// Generate a deterministic-format dispatch id (`disp-<unix_micros>-<seq>`).
+fn next_dispatch_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let ts = chrono::Utc::now().format("%Y%m%d%H%M%S%6f");
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("disp-{ts}-{seq}")
+}
+
+/// Record an outbound dispatch. Returns the new dispatch_id, or `None`
+/// if the inputs are invalid / the disk write failed.
+///
+/// Called from `handle_send` post-enqueue: any failure here is silently
+/// best-effort (the message has already been delivered; watchdog
+/// coverage is a defence-in-depth layer that must never block the
+/// dispatch primitive).
+#[allow(dead_code)] // C1 RED stub — wired in C2
+pub(crate) fn record_dispatch(
+    _home: &Path,
+    _dispatcher: &str,
+    _target: &str,
+    _correlation_id: Option<&str>,
+    _expected_kind: &str,
+    _threshold_secs: i64,
+) -> Option<String> {
+    // C1 RED: stub — return None so failing tests prove the impl gap.
+    None
+}
+
+/// Read all pending dispatch sidecars from disk. Forward-compat: skips
+/// any sidecar whose `schema_version` is unknown.
+#[allow(dead_code)] // C1 RED stub — wired in C2
+pub(crate) fn list_pending(_home: &Path) -> Vec<PendingDispatch> {
+    Vec::new()
+}
+
+/// Resolve a pending dispatch by `correlation_id` (NOT by sender —
+/// decision_timeout's sender-keyed semantic is wrong here because a
+/// single dispatcher can have multiple pending dispatches outstanding,
+/// each with a distinct correlation_id). Returns the resolved
+/// dispatch_id, or `None` if no matching pending entry exists.
+#[allow(dead_code)] // C1 RED stub — wired in C2
+pub(crate) fn mark_resolved(_home: &Path, _correlation_id: &str) -> Option<String> {
+    None
+}
+
+/// Per-tick scan: flip eligible pending entries to `exceeded` and emit
+/// the inbox event to the dispatcher. Exposed `pub(crate)` for tests.
+#[allow(dead_code)] // C1 RED stub — wired in C2
+pub(crate) fn scan_and_emit(_home: &Path) {
+    // C1 RED: stub.
+}
+
+/// Per-loop scheduler state.
+#[derive(Debug, Default)]
+pub(crate) struct DispatchIdleTracker {
+    tick_count: u64,
+}
+
+impl DispatchIdleTracker {
+    /// Per-tick entry. Increments the counter; on the throttled
+    /// boundary, fires `scan_and_emit` and returns `true`. Returns
+    /// `false` for all pre-boundary ticks.
+    #[allow(dead_code)] // C1 RED stub — wired in C2
+    pub(crate) fn maybe_scan(&mut self, _home: &Path) -> bool {
+        // C1 RED: stub — never fires.
+        let _ = self.tick_count;
+        false
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn tmp_home(tag: &str) -> PathBuf {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "agend-dispatch-idle-{}-{}-{}",
+            std::process::id(),
+            tag,
+            id
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    }
+
+    /// Write a backdated pending sidecar directly (bypasses
+    /// `record_dispatch`) so timeout scenarios don't require sleeping.
+    fn write_pending_at(
+        home: &Path,
+        dispatcher: &str,
+        target: &str,
+        correlation_id: Option<&str>,
+        expected_kind: &str,
+        threshold_secs: i64,
+        issued_at: chrono::DateTime<chrono::Utc>,
+    ) -> String {
+        let dir = pending_dir(home);
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = next_dispatch_id();
+        let payload = PendingDispatch {
+            schema_version: SCHEMA_VERSION,
+            dispatch_id: id.clone(),
+            dispatcher: dispatcher.to_string(),
+            target: target.to_string(),
+            correlation_id: correlation_id.map(String::from),
+            expected_kind: expected_kind.to_string(),
+            threshold_secs,
+            issued_at: issued_at.to_rfc3339(),
+            status: "pending".to_string(),
+            nudge_sent_at: None,
+        };
+        std::fs::write(
+            pending_path(home, &id),
+            serde_json::to_string_pretty(&payload).unwrap(),
+        )
+        .unwrap();
+        id
+    }
+
+    /// 1. Throttle contract — TICKS_PER_SCAN-1 calls return false, the
+    /// next fires (returns true), and the counter resets.
+    #[test]
+    fn tracker_throttles_to_tick_per_scan() {
+        let home = tmp_home("throttle");
+        let mut tracker = DispatchIdleTracker::default();
+        for i in 0..(TICKS_PER_SCAN - 1) {
+            assert!(
+                !tracker.maybe_scan(&home),
+                "tick {i} (pre-throttle) must return false"
+            );
+        }
+        assert!(
+            tracker.maybe_scan(&home),
+            "{}th tick must fire scan and return true",
+            TICKS_PER_SCAN
+        );
+        assert!(
+            !tracker.maybe_scan(&home),
+            "post-fire tick must reset counter and return false"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// 2. `record_dispatch` writes a sidecar that `list_pending` can
+    /// round-trip.
+    #[test]
+    fn record_and_list_pending_dispatch() {
+        let home = tmp_home("record");
+        let id = record_dispatch(
+            &home,
+            "lead",
+            "reviewer",
+            Some("t-abc"),
+            "task",
+            600,
+        )
+        .expect("record must return id");
+        let pending = list_pending(&home);
+        assert_eq!(pending.len(), 1);
+        let p = &pending[0];
+        assert_eq!(p.dispatch_id, id);
+        assert_eq!(p.dispatcher, "lead");
+        assert_eq!(p.target, "reviewer");
+        assert_eq!(p.correlation_id.as_deref(), Some("t-abc"));
+        assert_eq!(p.expected_kind, "task");
+        assert_eq!(p.threshold_secs, 600);
+        assert_eq!(p.status, "pending");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// 3. `scan_and_emit` flips exceeded entries and emits an inbox
+    /// event to the dispatcher.
+    #[test]
+    fn fires_on_threshold_exceeded() {
+        let home = tmp_home("fires");
+        let issued = chrono::Utc::now() - chrono::Duration::seconds(700);
+        let id = write_pending_at(
+            &home,
+            "alpha",
+            "beta",
+            Some("t-fires"),
+            "task",
+            600,
+            issued,
+        );
+        scan_and_emit(&home);
+        let inbox = crate::inbox::drain(&home, "alpha");
+        assert!(
+            inbox.iter().any(|m| m.kind.as_deref()
+                == Some("dispatch_idle_threshold_exceeded")
+                && m.correlation_id.as_deref() == Some("t-fires")),
+            "must emit dispatch_idle_threshold_exceeded event to dispatcher's inbox: {inbox:?}"
+        );
+        let pending = list_pending(&home);
+        let p = pending.iter().find(|p| p.dispatch_id == id).unwrap();
+        assert_eq!(p.status, "exceeded", "sidecar must flip pending→exceeded");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// 4. Load-bearing contract: `mark_resolved` keys on
+    /// `correlation_id`, NOT on `dispatcher`. Decision_timeout's
+    /// sender-keyed semantic would resolve the wrong sidecar when a
+    /// single dispatcher has multiple in-flight dispatches.
+    #[test]
+    fn mark_resolved_keys_on_correlation_id_not_sender() {
+        let home = tmp_home("resolve-by-corr");
+        let now = chrono::Utc::now();
+        let id_a = write_pending_at(
+            &home, "lead", "dev-1", Some("t-aaa"), "task", 600, now,
+        );
+        let id_b = write_pending_at(
+            &home, "lead", "dev-2", Some("t-bbb"), "task", 600, now,
+        );
+        let resolved = mark_resolved(&home, "t-aaa");
+        assert_eq!(
+            resolved.as_deref(),
+            Some(id_a.as_str()),
+            "must resolve the correlation_id-matching sidecar, not sender-matching"
+        );
+        let pending = list_pending(&home);
+        let p_a = pending.iter().find(|p| p.dispatch_id == id_a).unwrap();
+        let p_b = pending.iter().find(|p| p.dispatch_id == id_b).unwrap();
+        assert_eq!(p_a.status, "resolved", "matched sidecar must flip");
+        assert_eq!(
+            p_b.status, "pending",
+            "unmatched sidecar from same dispatcher must NOT flip"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// 5. After `mark_resolved`, the subsequent `scan_and_emit` does
+    /// NOT fire an event (status was resolved before threshold check).
+    #[test]
+    fn mark_resolved_suppresses_fire() {
+        let home = tmp_home("resolved-no-fire");
+        let issued = chrono::Utc::now() - chrono::Duration::seconds(700);
+        write_pending_at(
+            &home,
+            "alpha",
+            "beta",
+            Some("t-suppress"),
+            "task",
+            600,
+            issued,
+        );
+        let resolved = mark_resolved(&home, "t-suppress");
+        assert!(resolved.is_some(), "mark_resolved must locate sidecar");
+        scan_and_emit(&home);
+        let inbox = crate::inbox::drain(&home, "alpha");
+        assert!(
+            !inbox
+                .iter()
+                .any(|m| m.kind.as_deref() == Some("dispatch_idle_threshold_exceeded")),
+            "resolved dispatch must NOT fire timeout event: {inbox:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// 6. Load-bearing contract (parallel dev-1 + dev-2 configuration):
+    /// two sidecars, only the exceeded one fires; the fresh one stays
+    /// pending and does NOT pollute the exceeded one's event.
+    #[test]
+    fn parallel_dispatch_isolation() {
+        let home = tmp_home("parallel-iso");
+        let stale = chrono::Utc::now() - chrono::Duration::seconds(700);
+        let fresh = chrono::Utc::now() - chrono::Duration::seconds(60);
+        let id_stale = write_pending_at(
+            &home,
+            "lead",
+            "dev-1",
+            Some("t-stale"),
+            "task",
+            600,
+            stale,
+        );
+        let id_fresh = write_pending_at(
+            &home,
+            "lead",
+            "dev-2",
+            Some("t-fresh"),
+            "task",
+            600,
+            fresh,
+        );
+        scan_and_emit(&home);
+        let inbox = crate::inbox::drain(&home, "lead");
+        let exceeded_events: Vec<_> = inbox
+            .iter()
+            .filter(|m| m.kind.as_deref() == Some("dispatch_idle_threshold_exceeded"))
+            .collect();
+        assert_eq!(
+            exceeded_events.len(),
+            1,
+            "exactly one exceeded event for the stale dispatch"
+        );
+        assert_eq!(
+            exceeded_events[0].correlation_id.as_deref(),
+            Some("t-stale"),
+            "the event must reference the stale correlation_id"
+        );
+        let pending = list_pending(&home);
+        let p_stale = pending.iter().find(|p| p.dispatch_id == id_stale).unwrap();
+        let p_fresh = pending.iter().find(|p| p.dispatch_id == id_fresh).unwrap();
+        assert_eq!(p_stale.status, "exceeded");
+        assert_eq!(
+            p_fresh.status, "pending",
+            "fresh dispatch must remain pending"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// 7. Invariant: L1 file MUST stay team-name-free. Cross-team-safe
+    /// design contract. If this test ever fails, the L1 primitive has
+    /// leaked team-specific knowledge and a sibling module is the
+    /// right home for that code.
+    ///
+    /// Two structural allowances: comment lines (any `// …` prefix) and
+    /// the boilerplate `pub(crate) mod fixup_nudge;` declaration that
+    /// wires the L2 submodule into the dispatch_idle module tree.
+    /// Test-module contents are also exempt — placeholder names like
+    /// "lead" / "reviewer" / "dev-1" are legitimate test inputs.
+    #[test]
+    fn no_team_name_strings_in_l1() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let l1_path =
+            std::path::PathBuf::from(manifest).join("src/daemon/dispatch_idle/mod.rs");
+        let body = std::fs::read_to_string(&l1_path)
+            .expect("L1 file must be readable from CARGO_MANIFEST_DIR");
+        let mut offenders: Vec<(usize, &str, String)> = Vec::new();
+        let mut in_test_mod = false;
+        for (lineno, line) in body.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            if trimmed.starts_with("mod tests") {
+                in_test_mod = true;
+            }
+            if in_test_mod {
+                continue;
+            }
+            // Allowlist: the L2 submodule declaration is structural,
+            // not behavioral. Behaviour-side references stay forbidden.
+            if trimmed == "pub(crate) mod fixup_nudge;" {
+                continue;
+            }
+            for needle in ["fixup", "reviewer", "lead"] {
+                if line.contains(needle) {
+                    offenders.push((lineno + 1, needle, line.to_string()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "L1 file must stay team-name-free; offenders: {offenders:?}"
+        );
+    }
+
+    /// 8. Forward-compat: a future v2 sidecar must be left on disk and
+    /// skipped by the v1 list_pending. Sprint 58 Wave 1 PR-2 contract.
+    #[test]
+    fn forward_compat_serde() {
+        let home = tmp_home("forward-compat");
+        let dir = pending_dir(&home);
+        std::fs::create_dir_all(&dir).unwrap();
+        let payload = serde_json::json!({
+            "schema_version": SCHEMA_VERSION + 1,
+            "dispatch_id": "disp-future",
+            "dispatcher": "x",
+            "target": "y",
+            "expected_kind": "task",
+            "threshold_secs": 600,
+            "issued_at": "2026-05-09T00:00:00Z",
+            "status": "pending",
+        });
+        std::fs::write(
+            pending_path(&home, "disp-future"),
+            serde_json::to_string_pretty(&payload).unwrap(),
+        )
+        .unwrap();
+        let pending = list_pending(&home);
+        assert!(
+            pending.is_empty(),
+            "future-version sidecar must be skipped by v1 reader"
+        );
+        // File preserved on disk so a v2 reader could pick it up later.
+        assert!(pending_path(&home, "disp-future").exists());
+        std::fs::remove_dir_all(&home).ok();
+    }
+}
