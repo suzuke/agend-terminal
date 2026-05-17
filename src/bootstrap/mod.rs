@@ -56,6 +56,12 @@ pub struct OwnedFleet {
     pub home: PathBuf,
     #[allow(dead_code)]
     pub fleet_path: PathBuf,
+    /// #879 made the only app-side consumer of this field obsolete (the
+    /// TUI no longer derives its telegram status from the prepared
+    /// fleet). The daemon-process callers (`cli::start_with_fleet` →
+    /// `daemon::run_with_prepared`) read other fields and may grow new
+    /// readers here, so the field is retained with an explicit allow.
+    #[allow(dead_code)]
     pub config: crate::fleet::FleetConfig,
     pub agents: Vec<AgentDef>,
     pub run_dir: PathBuf,
