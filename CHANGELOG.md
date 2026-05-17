@@ -5,6 +5,15 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 ## [Unreleased]
 
+### Changed
+
+- **App mode never owns the daemon (#879, second iteration)** — re-lands the #879 behaviour change after the first iteration (PR #881, merged at `8b5d7db`, reverted at `470c251`) hit a production race that silently degraded fleet MCP tools to `{tools: []}`. The TUI now always attaches as a client; when no daemon is running, it spawns one via `bootstrap::daemon_spawn::spawn_detached` and re-attaches. **Operator-visible effect**: `Ctrl+B d` (tmux detach) preserves the daemon + every agent's LLM context — re-launching `agend-terminal` re-attaches.
+  - **Race RCA + fixes**:
+    - **Bug A (latent, pre-existing)** — `spawn_detached`'s child cmd lacked `--foreground`, so the child re-entered the default-detach branch and recursed indefinitely. Masked in production by the launchd plist / systemd unit baking `start --foreground` into the supervisor invocation. **Fix**: add `cmd.arg("--foreground")` so the child becomes the daemon.
+    - **Bug B (sub-second race)** — `spawn_detached`'s readiness gate accepted run-dir presence alone, but `bootstrap::try_attach` additionally requires `probe_api(&run_dir)` to succeed (TCP listener bound). **Fix**: tighten the poll loop to require both `find_active_run_dir.is_some()` AND `crate::ipc::probe_api(&run_dir)` before returning Ok.
+    - **Silent-degrade fix** — `run_app`'s `Err` arm now propagates the error to the operator (with `agend-terminal service install` remediation hint) instead of falling back to a no-op API guard. Previously the error was swallowed via `tracing::warn!` and the TUI ran without the in-process API — the regression that made #881 invisible.
+  - **CI is insufficient gate** — per #879-reopen lessons, this PR's CI green + reviewer VERIFIED is not enough. The merge protocol requires explicit operator smoke confirmation post-merge (rebuild → cold-start TUI → spawn agent → verify MCP tools non-empty → `Ctrl+B d` → re-launch → agents persist). See PR body for the verification checklist.
+
 ## [0.7.0] — 2026-05-16
 
 150+ commits since `0.6.1` over Sprint 55–65 (May 7 → May 16, 2026). Three themes dominate:
