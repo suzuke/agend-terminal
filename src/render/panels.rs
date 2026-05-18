@@ -52,6 +52,20 @@ fn filter_live_assignees<'a>(
     }
 }
 
+/// Format the "active:" footer. Pure function extracted so we can
+/// pin deterministic ordering in a unit test — `HashSet` iteration
+/// is non-deterministic, so a render path that joins it directly
+/// visibly flickers between frames when the iteration order
+/// reshuffles. The helper sorts before joining to lock a stable
+/// left-to-right order independent of hash-bucket layout.
+fn format_active_status(names: Vec<&str>) -> String {
+    if names.is_empty() {
+        "all idle".to_string()
+    } else {
+        format!("active: {}", names.join(", "))
+    }
+}
+
 pub fn render_decisions(frame: &mut Frame, items: &[crate::decisions::Decision], scroll: usize) {
     let count = items.len();
     let title = format!(" Decisions ({count}) | j/k scroll | q close ");
@@ -296,12 +310,7 @@ pub fn render_tasks(
             columns[2].iter().filter_map(|t| t.assignee.as_deref()),
             live.as_ref(),
         );
-        let status_text = if active_agents.is_empty() {
-            "all idle".to_string()
-        } else {
-            let names: Vec<&str> = active_agents.into_iter().collect();
-            format!("active: {}", names.join(", "))
-        };
+        let status_text = format_active_status(active_agents.into_iter().collect());
         let status_y = inner.y + inner.height.saturating_sub(1);
         let status_area = Rect::new(
             inner.x + 1,
@@ -577,6 +586,26 @@ mod tests {
         let live = make_live(&["alpha"]);
         let kept = filter_live_assignees(std::iter::empty::<&str>(), Some(&live));
         assert!(kept.is_empty(), "empty input must produce empty output");
+    }
+
+    /// RED: HashSet iteration order is non-deterministic, so a render
+    /// path that joins names straight from the set visibly flickers
+    /// between frames. Pin the contract: same input set → same output
+    /// string, regardless of caller's iteration order.
+    #[test]
+    fn format_active_status_sorts_names_alphabetically() {
+        let result = format_active_status(vec!["zebra", "alpha", "mike"]);
+        assert_eq!(
+            result, "active: alpha, mike, zebra",
+            "names must render in stable alphabetical order — otherwise the active-indicator flickers across frames"
+        );
+    }
+
+    /// Edge case: zero live names → "all idle" sentinel.
+    #[test]
+    fn format_active_status_returns_all_idle_for_empty() {
+        let result = format_active_status(vec![]);
+        assert_eq!(result, "all idle");
     }
 
     #[test]
