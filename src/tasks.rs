@@ -706,10 +706,7 @@ pub fn reconcile_orphan_owners(home: &Path) {
 /// Body factored out of `reconcile_orphan_owners`; this fn is the
 /// shared core used by both the boot path (empty live) and the
 /// periodic path (api-derived live). Strict/soft semantics unchanged.
-pub fn reconcile_orphan_owners_with_live(
-    home: &Path,
-    live: &std::collections::HashSet<String>,
-) {
+pub fn reconcile_orphan_owners_with_live(home: &Path, live: &std::collections::HashSet<String>) {
     let fleet_instances: std::collections::HashSet<String> =
         crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
             .ok()
