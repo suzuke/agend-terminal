@@ -2052,9 +2052,63 @@ Allow Trust All Tools mode?
     /// where the leader shell forks bun/mcp/acp grandchildren — the regression
     /// PR-U #158 fixed for explicit kill paths but missed for PTY-EOF crash
     /// detection.
+    ///
+    /// 2026-05-18 race-class anchor: the previous form of this test polled
+    /// `pid_file.exists()` then `read_to_string` — a write-vs-read race
+    /// because `echo $! > file` may create the file BEFORE flushing the
+    /// content. The fix lands in C2 (swap to `wait_for_nonempty_file`); C0
+    /// adds a concurrent stress runner that exposes the race under load.
     #[test]
     #[cfg(unix)]
     fn sweep_child_tree_kills_grandchild_via_process_group() {
+        let pid_file =
+            std::env::temp_dir().join(format!("agend-sweep-test-{}.pid", std::process::id()));
+        sweep_child_tree_body(&pid_file);
+    }
+
+    /// 2026-05-18 race-class C0 anchor (RED on main HEAD): concurrent
+    /// stress runner for the pid_file write-vs-read race. Spawns 8
+    /// threads, each running the body 6 times against unique pid_file
+    /// paths (8×6 = 48 PTY spawns). Pre-fix the `exists() + read_to_string`
+    /// pair races at least once across ~48 multi-threaded iterations
+    /// under scheduler contention. Post-fix (C2's `wait_for_nonempty_file`
+    /// swap) is deterministic — the helper polls for content, not just
+    /// existence.
+    ///
+    /// NOT `#[ignore]`: ~10-15s on CI ubuntu-latest (where the race
+    /// originally surfaced in PR #905). Local fast hardware may not
+    /// reproduce — the CI runner's slower scheduler is what exposes
+    /// the write/flush gap. Marked `#[cfg(unix)]` because the body
+    /// uses sh + sleep.
+    #[test]
+    #[cfg(unix)]
+    fn sweep_child_tree_kills_grandchild_concurrent_stress() {
+        let handles: Vec<_> = (0..8)
+            .map(|tid| {
+                std::thread::spawn(move || {
+                    for i in 0..6 {
+                        let path = std::env::temp_dir().join(format!(
+                            "agend-sweep-stress-{}-{tid}-{i}.pid",
+                            std::process::id()
+                        ));
+                        sweep_child_tree_body(&path);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("stress thread joined");
+        }
+    }
+
+    /// Test body factored out of
+    /// `sweep_child_tree_kills_grandchild_via_process_group` so the
+    /// concurrent stress runner can call it with unique pid_file paths.
+    /// Behaviour identical to the original test — same shell command,
+    /// same registry shape, same assertion set. Only the pid_file path
+    /// is parameterized.
+    #[cfg(unix)]
+    fn sweep_child_tree_body(pid_file: &std::path::Path) {
         use parking_lot::Mutex;
         use portable_pty::{native_pty_system, CommandBuilder, PtySize};
         use std::collections::HashMap;
@@ -2068,9 +2122,7 @@ Allow Trust All Tools mode?
                 pixel_height: 0,
             })
             .expect("openpty");
-        let pid_file =
-            std::env::temp_dir().join(format!("agend-sweep-test-{}.pid", std::process::id()));
-        let _ = std::fs::remove_file(&pid_file);
+        let _ = std::fs::remove_file(pid_file);
         // sh forks `sleep` into the background; sleep PID is recorded so the
         // test can verify it dies with the leader (group kill semantics).
         let cmd_str = format!("sleep 60 & echo $! > {} && wait", pid_file.display());
@@ -2093,9 +2145,10 @@ Allow Trust All Tools mode?
             state: StateTracker::new(None),
             health: HealthTracker::new(),
         }));
+        let agent_name = format!("sweep-test-{}", pid_file.display());
         let handle = AgentHandle {
             id: crate::types::InstanceId::default(),
-            name: "sweep-test".to_string(),
+            name: agent_name.clone(),
             backend_command: "sh".to_string(),
             pty_writer,
             pty_master,
@@ -2109,16 +2162,20 @@ Allow Trust All Tools mode?
             deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
-        registry.lock().insert("sweep-test".to_string(), handle);
+        registry.lock().insert(agent_name.clone(), handle);
 
-        // Wait for sleep grandchild to start and write its PID
+        // Wait for sleep grandchild to start and write its PID. This
+        // poll-on-`exists()` pair with `read_to_string` is the very race
+        // the C0 stress runner exposes — `echo $! > file` creates the
+        // file before flushing content; a read between create and flush
+        // returns empty. C2 will swap this block for `wait_for_nonempty_file`.
         for _ in 0..40 {
             if pid_file.exists() {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        let sleep_pid: u32 = std::fs::read_to_string(&pid_file)
+        let sleep_pid: u32 = std::fs::read_to_string(pid_file)
             .unwrap_or_default()
             .trim()
             .parse()
@@ -2133,14 +2190,14 @@ Allow Trust All Tools mode?
         );
 
         // Invoke the new helper. Should kill the entire process group.
-        sweep_child_tree("sweep-test", &registry);
+        sweep_child_tree(&agent_name, &registry);
 
         // Reap the shell child so kill(pid, 0) doesn't see it as a zombie.
         // Without wait(), the shell shows as "alive" even after SIGKILL
         // because we are its parent and never collected its exit status.
         {
             let reg = &registry.lock();
-            if let Some(h) = reg.get("sweep-test") {
+            if let Some(h) = reg.get(&agent_name) {
                 {
                     let mut c = h.child.lock();
                     let _ = c.wait();
@@ -2156,7 +2213,7 @@ Allow Trust All Tools mode?
             !crate::process::is_pid_alive(sleep_pid),
             "sleep grandchild must die with the group (kill_process_tree semantics)"
         );
-        let _ = std::fs::remove_file(&pid_file);
+        let _ = std::fs::remove_file(pid_file);
     }
 
     #[test]
