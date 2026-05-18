@@ -35,3 +35,170 @@ pub fn list_live_agents(home: &Path) -> Option<HashSet<String>> {
         })
     })
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// #910 PR1 of 4: list_agents_with_fallback foundation helper
+//
+// Per `/tmp/dialectic-910-synthesis.md` lead decision. Zero caller-site
+// changes in this PR; PR2-4 migrate the 5 existing .port-glob consume
+// sites (`src/app/session.rs:274`, `src/app/mod.rs:621`, `src/cli.rs:155`,
+// `src/main.rs:683`, `src/agent_ops.rs:339`) over to this helper in turn.
+// ──────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn tmp_home(suffix: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "agend-runtime-910-{}-{}-{}",
+            std::process::id(),
+            suffix,
+            id
+        ));
+        fs::create_dir_all(&dir).ok();
+        dir
+    }
+
+    fn pid_string() -> String {
+        std::process::id().to_string()
+    }
+
+    fn setup_run_dir(home: &Path) -> PathBuf {
+        let run = home.join("run").join(pid_string());
+        fs::create_dir_all(&run).expect("create run_dir");
+        fs::write(run.join(".daemon"), format!("{}:0", pid_string()))
+            .expect("write .daemon");
+        run
+    }
+
+    fn write_port_file(run: &Path, name: &str) {
+        fs::write(run.join(format!("{name}.port")), "12345").expect("write .port");
+    }
+
+    /// PR1 RED 1: daemon reachable → registry truth; stale `.port` ghosts
+    /// MUST NOT surface in the result.
+    #[test]
+    fn list_agents_with_fallback_prefers_daemon_registry_when_reachable() {
+        let home = tmp_home("prefers-registry");
+        let run = setup_run_dir(&home);
+        write_port_file(&run, "ghost-1"); // stale glob entry — must NOT surface
+
+        let mut live: HashSet<String> = HashSet::new();
+        live.insert("live-1".to_string());
+        live.insert("live-2".to_string());
+
+        let result = list_agents_with_fallback_using(&home, Some(live));
+
+        assert_eq!(
+            result,
+            vec!["live-1".to_string(), "live-2".to_string()],
+            "registry is truth-of-record when API reachable (alphabetical sort)"
+        );
+        assert!(
+            !result.contains(&"ghost-1".to_string()),
+            "stale .port file MUST NOT surface when daemon registry is the truth-of-record"
+        );
+
+        fs::remove_dir_all(&home).ok();
+    }
+
+    /// PR1 RED 2: API unreachable → fallback to filesystem `.port` glob.
+    /// Preserves pre-Option-F UX (cli doctor / cli list still work briefly
+    /// during daemon restart windows).
+    #[test]
+    fn list_agents_with_fallback_falls_back_to_glob_when_daemon_offline() {
+        let home = tmp_home("fallback-glob");
+        let run = setup_run_dir(&home);
+        write_port_file(&run, "fallback-1");
+        write_port_file(&run, "fallback-2");
+
+        let result = list_agents_with_fallback_using(&home, None);
+
+        assert_eq!(
+            result.iter().cloned().collect::<HashSet<_>>(),
+            ["fallback-1", "fallback-2"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<HashSet<_>>(),
+            "daemon offline → .port glob is the fallback truth"
+        );
+
+        fs::remove_dir_all(&home).ok();
+    }
+
+    /// PR1 RED 3: no daemon AND no run_dir → empty `Vec`, NO panic.
+    /// Cold-boot pre-bootstrap state must degrade gracefully.
+    #[test]
+    fn list_agents_with_fallback_empty_when_no_daemon_no_run_dir() {
+        let home = tmp_home("empty-cold");
+        // No run/ subdir created — pre-bootstrap state.
+
+        let result = list_agents_with_fallback_using(&home, None);
+
+        assert!(
+            result.is_empty(),
+            "no daemon + no run dir → empty Vec (graceful degrade, no panic)"
+        );
+
+        fs::remove_dir_all(&home).ok();
+    }
+
+    /// PR1 RED 4: API truth wins even when empty. Registry empty
+    /// (post-daemon-boot, pre-auto-start window) → empty Vec, NOT a
+    /// fallback to stale `.port` ghosts.
+    #[test]
+    fn list_agents_with_fallback_returns_empty_when_daemon_alive_but_registry_empty() {
+        let home = tmp_home("alive-empty");
+        let run = setup_run_dir(&home);
+        write_port_file(&run, "ghost-stale"); // stale glob — must NOT surface
+
+        let result = list_agents_with_fallback_using(&home, Some(HashSet::new()));
+
+        assert!(
+            result.is_empty(),
+            "API truth empty wins over filesystem glob (Some(empty) != None)"
+        );
+        assert!(
+            !result.contains(&"ghost-stale".to_string()),
+            "empty registry must NOT fall through to stale .port ghosts"
+        );
+
+        fs::remove_dir_all(&home).ok();
+    }
+
+    /// PR1 RED 5: api.port file present but TCP listener refuses (e.g.
+    /// daemon crashed mid-cycle, stale api.port lingers). Production
+    /// `list_live_agents` returns None on connect-refused → helper falls
+    /// back. This test exercises the FULL production
+    /// `list_agents_with_fallback` (not the factored `_using` variant) to
+    /// lock the connect-refused → None → fallback chain end-to-end.
+    #[test]
+    fn list_agents_with_fallback_falls_back_when_api_port_present_but_listener_refused() {
+        let home = tmp_home("listener-refused");
+        let run = setup_run_dir(&home);
+        // Plant a stale api.port pointing at a port nothing is listening
+        // on. Port 9 (Discard) is one of the legacy unassigned-in-userland
+        // ports — unlikely to have a listener but well-defined behavior
+        // (connect-refused) on Unix.
+        fs::write(run.join("api.port"), "9").expect("write fake api.port");
+
+        let result = list_agents_with_fallback(&home);
+
+        // Behavioral assertion: no panic + empty Vec when there are no
+        // `.port` files for actual agents (only the stale api.port we
+        // planted, which list_agent_ports filters out).
+        assert!(
+            result.is_empty(),
+            "connection-refused → treated as offline → fallback fires → empty agents (only stale api.port present, which is filtered)"
+        );
+
+        fs::remove_dir_all(&home).ok();
+    }
+}
