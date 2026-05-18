@@ -236,32 +236,37 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         std::collections::HashSet::new();
 
     if let Some(ref run_dir) = attached_run_dir {
-        // Attached: one tab per agent the daemon is serving. Tabs derive from
-        // the daemon's `*.port` files (the same list `agend-terminal list`
-        // reads), not from session.json — the daemon is the source of truth
-        // for which agents exist while it's alive. Connect failures are logged
-        // and the corresponding tab is dropped; the app still starts.
-        let mut names = crate::ipc::list_agent_ports(run_dir);
-        names.sort();
-        for name in &names {
-            match pane_factory::create_remote_pane(
-                name,
-                &home,
-                &fleet_path,
-                &mut layout,
-                pane_cols,
-                pane_rows,
-                &wakeup_tx,
-            ) {
-                Ok(pane) => {
-                    let tab_name = pane.agent_name.clone();
-                    known_remote_agents.insert(tab_name.clone());
-                    layout.add_tab(crate::layout::Tab::new(tab_name, pane));
-                }
-                Err(e) => tracing::warn!(agent = %name, error = %e, "remote pane attach failed"),
+        // Attached (#895 fix): tabs derive from the union of
+        //   (a) daemon's `*.port` files (live agent registry — source of truth
+        //       for WHICH agents exist while daemon is alive), and
+        //   (b) session.json (layout hint — source of truth for HOW the user
+        //       arranged those agents in the TUI).
+        //
+        // Pre-#895: tabs built solely from (a) in alphabetical order; custom
+        // splits/grouping were lost on every detach/reattach cycle.
+        //
+        // Post-#895: `restore_with_reconciliation_attached` walks session.json
+        // tabs, drops leaves whose agent is not in (a) (silent — daemon drift
+        // between attaches is normal), then appends agents in (a) that weren't
+        // placed in session as new tabs (Rule 3, team-grouped). Falls back to
+        // pre-#895 alphabetical-from-(a) when session.json is missing.
+        let started = session::restore_with_reconciliation_attached(
+            &home,
+            &fleet_path,
+            run_dir,
+            &mut layout,
+            &wakeup_tx,
+            pane_cols,
+            pane_rows,
+        );
+        // Populate the remote-agent roster from the placed tabs so the periodic
+        // sync (lines 615-665) tracks them correctly.
+        for tab in &layout.tabs {
+            for name in tab.root().agent_names() {
+                known_remote_agents.insert(name);
             }
         }
-        if layout.tabs.is_empty() {
+        if !started {
             tracing::warn!(
                 "attached to daemon but no agents are reachable; check `agend-terminal list`"
             );
@@ -667,16 +672,25 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         }
     }
 
-    // Attached mode: the daemon owns session state, fleet.yaml reconciliation,
-    // and every agent's PTY. Touching any of them on exit would clobber live
-    // daemon state — `sync_fleet_yaml` in particular would silently delete
-    // fleet entries whose remote connect happened to fail at startup.
+    // Attached mode: the daemon owns agent state + every agent's PTY.
+    // `sync_fleet_yaml` STAYS gated — in Attached mode, fleet entries whose
+    // remote connect happened to fail at startup would be silently deleted
+    // if we touched fleet.yaml. Agent kill also STAYS gated — daemon owns
+    // those PTYs.
+    //
+    // BUT `save_session` is now UNGATED (#895 fix). Layout state (tab
+    // grouping, splits, ratios) is presentation-layer client state and
+    // belongs to the app, NOT the daemon. Saving session.json in Attached
+    // mode lets the next attached relaunch restore custom layout via the
+    // same reconciliation path Owned mode uses (parameterized over agent
+    // source: fleet.yaml for Owned, `list_agent_ports` for Attached).
+    session::save_session(&home, &layout);
     if !attached_mode {
-        // Sync fleet.yaml to match current state, then save layout
+        // Sync fleet.yaml to match current state (Owned-only — daemon owns
+        // fleet.yaml in Attached).
         session::sync_fleet_yaml(&home, &layout);
-        session::save_session(&home, &layout);
 
-        // Cleanup: kill all agents
+        // Cleanup: kill all agents (Owned-only — daemon owns PTYs in Attached).
         for tab in &layout.tabs {
             for name in tab.root().agent_names() {
                 kill_agent(&home, &registry, &name);
