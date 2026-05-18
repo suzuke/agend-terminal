@@ -271,7 +271,15 @@ pub(super) fn restore_with_reconciliation_attached(
     cols: u16,
     rows: u16,
 ) -> bool {
-    let agent_source: HashSet<String> = crate::ipc::list_agent_ports(run_dir).into_iter().collect();
+    // #910 PR3 of 4: daemon-registry truth via runtime helper. Falls back
+    // to the `.port` glob when API unreachable (preserves the pre-#895
+    // Attached restore behavior). `run_dir` kept in scope for the
+    // existing tab-builder closures below — only the agent-name source
+    // is migrated here.
+    let _ = run_dir; // glob path now hidden inside the helper; argument retained for ABI stability
+    let agent_source: HashSet<String> = crate::runtime::list_agents_with_fallback(home)
+        .into_iter()
+        .collect();
 
     // Attached pane builder: agent → bridge client; shell → None (unsupported).
     let mut pane_builder = |sp: &SessionPane, layout: &mut Layout| -> Option<Pane> {

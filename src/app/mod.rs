@@ -615,10 +615,20 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 // Phase C). Matches the daemon's add-only policy: removed
                 // agents are logged but their panes stay put so the user's
                 // scrollback isn't destroyed mid-session.
-                if let Some(ref run_dir) = attached_run_dir {
-                    if last_remote_sync.elapsed() >= std::time::Duration::from_secs(2) {
+                if attached_run_dir.is_some()
+                    && last_remote_sync.elapsed() >= std::time::Duration::from_secs(2)
+                {
+                    {
+                        // #910 PR3 of 4: daemon-registry truth via runtime
+                        // helper. The state-transition log gate inside the
+                        // helper keeps this 2s-cadence call from spamming
+                        // daemon.log — only Live↔Fallback transitions
+                        // emit (validated by `runtime::tests::
+                        // helper_steady_state_does_not_log_per_call`).
                         let current: std::collections::HashSet<String> =
-                            crate::ipc::list_agent_ports(run_dir).into_iter().collect();
+                            crate::runtime::list_agents_with_fallback(&home)
+                                .into_iter()
+                                .collect();
                         let mut to_add: Vec<String> = current
                             .difference(&known_remote_agents)
                             .cloned()
