@@ -75,6 +75,7 @@ struct SessionPane {
 
 /// Sync fleet.yaml to match current pane state on detach.
 /// Removes fleet entries not present in any pane; adds panes with backend but missing from fleet.
+#[allow(dead_code)] // #879v3 C3: daemon owns fleet.yaml sync now
 pub(super) fn sync_fleet_yaml(home: &Path, layout: &Layout) {
     let fleet_path = crate::fleet::fleet_yaml_path(home);
     let fleet = fleet::FleetConfig::load(&fleet_path).ok();
@@ -157,6 +158,7 @@ fn save_node(node: &PaneNode) -> SessionNode {
 /// Restore with reconciliation (Owned mode): fleet.yaml is source of truth for agents,
 /// session.json is a layout hint. Returns true if anything was spawned.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // #879v3 C3: always-Attached uses restore_with_reconciliation_attached only
 pub(super) fn restore_with_reconciliation(
     home: &Path,
     fleet_path: &Path,

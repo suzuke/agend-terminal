@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 /// Spawn an agent/shell via spawn_agent and add as a new tab.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // #879v3 C3: caller was the Owned cold-start shell-tab fallback
 pub(super) fn spawn_pane_tab(
     layout: &mut Layout,
     registry: &AgentRegistry,

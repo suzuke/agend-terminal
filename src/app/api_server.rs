@@ -97,6 +97,7 @@ pub(super) fn noop_guard() -> ApiGuard {
 
 /// Auto-start all fleet instances as tabs. Returns true if any were spawned.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // #879v3 C3: caller was the Owned cold-start arm
 pub(super) fn auto_start_fleet(
     fleet_path: &Path,
     layout: &mut Layout,

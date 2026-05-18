@@ -164,31 +164,17 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     let _api_guard = api_server::noop_guard();
     let telegram_state: Option<std::sync::Arc<dyn crate::channel::Channel>> = None;
     let telegram_status = TelegramStatus::NotConfigured;
-    let attached_run_dir: Option<PathBuf> = Some(attached_run_dir);
-    let attached_mode = attached_run_dir.is_some();
 
     // SIGINT / SIGHUP are left to their defaults: Ctrl+C must reach the
     // focused pane's PTY as 0x03 (crossterm reads it as a KeyEvent in raw
     // mode), and SIGHUP's default "kill the process group" keeps shell-exit
-    // semantics intact. SIGTERM is the only signal the app intercepts, and
-    // only in the Owned branch — see `install_term_only` above.
+    // semantics intact. The daemon owns its own signal handling now; the
+    // TUI client just exits on Ctrl+C from outside any focused pane.
 
-    // Per-agent AwaitingOperator supervisor: watches for stdout silence during
-    // Starting (or recently-entered Ready — some backends like codex match
-    // ready_pattern against the startup banner that precedes the update menu)
-    // and pushes a vterm tail to the agent's Telegram topic. In Attached mode
-    // the daemon already runs its own supervisor against the real registry, so
-    // the app must not also poll a disjoint (empty) registry.
-    if !attached_mode {
-        crate::daemon::supervisor::spawn(home.clone(), Arc::clone(&registry));
-        crate::instance_monitor::spawn_monitor_tick(home.clone(), Arc::clone(&registry));
-        // Attached mode stays unwired: that process never owns the registry,
-        // and the Telegram bot (if any) runs under the other daemon which
-        // already did its own attach.
-        if let Some(tg) = telegram_state.as_ref() {
-            tg.attach_registry(Arc::clone(&registry));
-        }
-    }
+    // #879v3 C3: supervisor / instance_monitor / telegram-attach all run in
+    // the daemon process (daemon::run_with_prepared), not in this TUI
+    // client. The pre-PR2 `if !attached_mode { ... }` block that double-
+    // spawned them against an empty in-process registry is removed.
 
     let mut layout = Layout::new();
     let mut key_handler = KeyHandler::new();
@@ -210,73 +196,37 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     let mut known_remote_agents: std::collections::HashSet<String> =
         std::collections::HashSet::new();
 
-    if let Some(ref run_dir) = attached_run_dir {
-        // Attached (#895 fix): tabs derive from the union of
-        //   (a) daemon's `*.port` files (live agent registry — source of truth
-        //       for WHICH agents exist while daemon is alive), and
-        //   (b) session.json (layout hint — source of truth for HOW the user
-        //       arranged those agents in the TUI).
-        //
-        // Pre-#895: tabs built solely from (a) in alphabetical order; custom
-        // splits/grouping were lost on every detach/reattach cycle.
-        //
-        // Post-#895: `restore_with_reconciliation_attached` walks session.json
-        // tabs, drops leaves whose agent is not in (a) (silent — daemon drift
-        // between attaches is normal), then appends agents in (a) that weren't
-        // placed in session as new tabs (Rule 3, team-grouped). Falls back to
-        // pre-#895 alphabetical-from-(a) when session.json is missing.
-        let started = session::restore_with_reconciliation_attached(
-            &home,
-            &fleet_path,
-            run_dir,
-            &mut layout,
-            &wakeup_tx,
-            pane_cols,
-            pane_rows,
+    // #879v3 C3: always-Attached — tabs derive from the union of
+    //   (a) daemon's `*.port` files (live agent registry — source of truth
+    //       for WHICH agents exist while daemon is alive), and
+    //   (b) session.json (layout hint — source of truth for HOW the user
+    //       arranged those agents in the TUI).
+    // The pre-PR2 Owned branch (fleet.yaml + in-process spawn) is dropped;
+    // when no daemon was reachable we now auto-spawned one above and are
+    // guaranteed to be in the attached path. `name_counter` becomes dead
+    // here too — left as a `let _` to keep the binding-shape stable for
+    // future hot-reload Phase D fold-in.
+    let _ = name_counter;
+    let started = session::restore_with_reconciliation_attached(
+        &home,
+        &fleet_path,
+        &attached_run_dir,
+        &mut layout,
+        &wakeup_tx,
+        pane_cols,
+        pane_rows,
+    );
+    // Populate the remote-agent roster from the placed tabs so the periodic
+    // sync (lines below) tracks them correctly.
+    for tab in &layout.tabs {
+        for name in tab.root().agent_names() {
+            known_remote_agents.insert(name);
+        }
+    }
+    if !started {
+        tracing::warn!(
+            "attached to daemon but no agents are reachable; check `agend-terminal list`"
         );
-        // Populate the remote-agent roster from the placed tabs so the periodic
-        // sync (lines 615-665) tracks them correctly.
-        for tab in &layout.tabs {
-            for name in tab.root().agent_names() {
-                known_remote_agents.insert(name);
-            }
-        }
-        if !started {
-            tracing::warn!(
-                "attached to daemon but no agents are reachable; check `agend-terminal list`"
-            );
-        }
-    } else {
-        // Owned: reconcile fleet.yaml (agent definitions) with session.json
-        // (layout hint); fall back to a shell tab on cold start.
-        let started = session::restore_with_reconciliation(
-            &home,
-            &fleet_path,
-            &mut layout,
-            &registry,
-            &wakeup_tx,
-            &mut name_counter,
-            pane_cols,
-            pane_rows,
-        );
-        if !started {
-            pane_factory::spawn_pane_tab(
-                &mut layout,
-                &registry,
-                &home,
-                "shell",
-                &std::env::var("SHELL").unwrap_or_else(|_| crate::default_shell().to_string()),
-                &[],
-                crate::backend::SpawnMode::Fresh,
-                None,
-                &HashMap::new(),
-                "\r",
-                pane_cols,
-                pane_rows,
-                &wakeup_tx,
-                &mut name_counter,
-            )?;
-        }
     }
 
     // Flag to trigger resize pass after layout changes (split, close, zoom, tab switch).
@@ -301,28 +251,13 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         })
         .ok();
 
-    // Periodic maintenance tick (10s) — mirrors daemon tick cadence.
-    // Only active in owned (non-attached) mode; when attached, the daemon
-    // process handles schedules, CI watches, and health decay.
-    let tick_rx = if !attached_mode {
-        let (tx, rx) = crossbeam_channel::bounded(1);
-        std::thread::Builder::new()
-            .name("app_tick".into())
-            .spawn(move || loop {
-                std::thread::sleep(std::time::Duration::from_secs(10));
-                if tx.send(()).is_err() {
-                    break;
-                }
-            })
-            .ok();
-        Some(rx)
-    } else {
-        None
-    };
-    // Never-ready channel used when attached_mode — select! needs a
-    // concrete Receiver but this arm will never fire.
+    // #879v3 C3: in always-Attached the daemon process owns schedules, CI
+    // watches, and health-decay ticks. The TUI client used to run an
+    // `app_tick` thread when Owned; that's redundant work against an empty
+    // in-process registry now. `select!` keeps a never-ready receiver in
+    // the slot so the loop's match arms stay structurally stable.
     let never_rx = crossbeam_channel::never::<()>();
-    let tick_rx_ref = tick_rx.as_ref().unwrap_or(&never_rx);
+    let tick_rx_ref = &never_rx;
 
     loop {
         if crate::bootstrap::signals::term_requested() {
@@ -590,58 +525,53 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 // Phase C). Matches the daemon's add-only policy: removed
                 // agents are logged but their panes stay put so the user's
                 // scrollback isn't destroyed mid-session.
-                if let Some(ref run_dir) = attached_run_dir {
-                    if last_remote_sync.elapsed() >= std::time::Duration::from_secs(2) {
-                        let current: std::collections::HashSet<String> =
-                            crate::ipc::list_agent_ports(run_dir).into_iter().collect();
-                        let mut to_add: Vec<String> = current
-                            .difference(&known_remote_agents)
-                            .cloned()
-                            .collect();
-                        to_add.sort();
-                        for name in &to_add {
-                            let (dc, dr) = crossterm::terminal::size().unwrap_or((120, 40));
-                            match pane_factory::create_remote_pane(
-                                name,
-                                &home,
-                                &fleet_path,
-                                &mut layout,
-                                dc.saturating_sub(2),
-                                dr.saturating_sub(4),
-                                &wakeup_tx,
-                            ) {
-                                Ok(pane) => {
-                                    let tab_name = pane.agent_name.clone();
-                                    known_remote_agents.insert(tab_name.clone());
-                                    layout.push_tab_preserve_focus(
-                                        crate::layout::Tab::new(tab_name, pane),
-                                    );
-                                    needs_resize = true;
-                                    tracing::info!(
-                                        agent = %name,
-                                        "opened tab for newly-appeared remote agent"
-                                    );
-                                }
-                                Err(e) => tracing::warn!(
+                if last_remote_sync.elapsed() >= std::time::Duration::from_secs(2) {
+                    let run_dir = &attached_run_dir;
+                    let current: std::collections::HashSet<String> =
+                        crate::ipc::list_agent_ports(run_dir).into_iter().collect();
+                    let mut to_add: Vec<String> =
+                        current.difference(&known_remote_agents).cloned().collect();
+                    to_add.sort();
+                    for name in &to_add {
+                        let (dc, dr) = crossterm::terminal::size().unwrap_or((120, 40));
+                        match pane_factory::create_remote_pane(
+                            name,
+                            &home,
+                            &fleet_path,
+                            &mut layout,
+                            dc.saturating_sub(2),
+                            dr.saturating_sub(4),
+                            &wakeup_tx,
+                        ) {
+                            Ok(pane) => {
+                                let tab_name = pane.agent_name.clone();
+                                known_remote_agents.insert(tab_name.clone());
+                                layout.push_tab_preserve_focus(crate::layout::Tab::new(
+                                    tab_name, pane,
+                                ));
+                                needs_resize = true;
+                                tracing::info!(
                                     agent = %name,
-                                    error = %e,
-                                    "remote pane attach failed during sync",
-                                ),
+                                    "opened tab for newly-appeared remote agent"
+                                );
                             }
-                        }
-                        let gone: Vec<String> = known_remote_agents
-                            .difference(&current)
-                            .cloned()
-                            .collect();
-                        for name in &gone {
-                            tracing::warn!(
+                            Err(e) => tracing::warn!(
                                 agent = %name,
-                                "daemon-side agent gone; pane retained with stale output",
-                            );
-                            known_remote_agents.remove(name);
+                                error = %e,
+                                "remote pane attach failed during sync",
+                            ),
                         }
-                        last_remote_sync = std::time::Instant::now();
                     }
+                    let gone: Vec<String> =
+                        known_remote_agents.difference(&current).cloned().collect();
+                    for name in &gone {
+                        tracing::warn!(
+                            agent = %name,
+                            "daemon-side agent gone; pane retained with stale output",
+                        );
+                        known_remote_agents.remove(name);
+                    }
+                    last_remote_sync = std::time::Instant::now();
                 }
             }
         }
@@ -660,18 +590,9 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // same reconciliation path Owned mode uses (parameterized over agent
     // source: fleet.yaml for Owned, `list_agent_ports` for Attached).
     session::save_session(&home, &layout);
-    if !attached_mode {
-        // Sync fleet.yaml to match current state (Owned-only — daemon owns
-        // fleet.yaml in Attached).
-        session::sync_fleet_yaml(&home, &layout);
-
-        // Cleanup: kill all agents (Owned-only — daemon owns PTYs in Attached).
-        for tab in &layout.tabs {
-            for name in tab.root().agent_names() {
-                kill_agent(&home, &registry, &name);
-            }
-        }
-    }
+    // #879v3 C3: fleet.yaml sync + agent kill on exit run in the daemon,
+    // not in this TUI client. The pre-PR2 Owned-only branch here would
+    // double-act against the daemon's source of truth.
 
     Ok(())
 }

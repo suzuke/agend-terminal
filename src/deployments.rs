@@ -655,6 +655,7 @@ pub fn reconcile_after_close(home: &Path, removed_names: &[String]) -> Vec<Strin
 /// Option 3 (defensive) hook. Called once at daemon startup, before
 /// `auto_start_fleet`, so a stale deployment-store entry left by a
 /// previous unclean shutdown doesn't carry over.
+#[allow(dead_code)] // #879v3 C3 transition: caller (Owned app cold-start) is gone; daemon-startup hook remains TODO
 pub fn reconcile_orphans(home: &Path) -> Vec<String> {
     reconcile_orphan_deployments(home)
 }
