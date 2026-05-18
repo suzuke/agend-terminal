@@ -290,15 +290,45 @@ pub(super) fn create_pane_from_resolved(
         extra_instructions: extra_instructions.as_deref(),
     };
 
+    let mut working_dir = resolved.working_directory.clone();
+
+    // #888: Auto-create git worktree when working_directory is inside a repo
+    // AND the instance has an explicit `source_repo` or `git_branch`
+    // config (mirror logic in bootstrap/agent_resolve.rs).
+    let wants_worktree = resolved.worktree != Some(false)
+        && (resolved.source_repo.is_some() || resolved.git_branch.is_some());
+
+    if wants_worktree {
+        if let Some(ref base_dir) = working_dir {
+            if crate::worktree::is_git_repo(base_dir) {
+                let custom_branch = resolved.git_branch.as_deref();
+                if let Some(info) =
+                    crate::worktree::create(home, base_dir, fleet_name, custom_branch)
+                {
+                    working_dir = Some(info.path);
+                }
+            }
+        }
+    }
+
+    let mut args = resolved.args.clone();
+    if let Some(ref model) = resolved.model {
+        let model_val = Backend::from_command(&resolved.backend_command)
+            .map(|b| b.format_model_arg(model))
+            .unwrap_or_else(|| model.clone());
+        args.push("--model".to_string());
+        args.push(model_val);
+    }
+
     let mut pane = create_pane(
         layout,
         registry,
         home,
         fleet_name,
         &resolved.backend_command,
-        &resolved.args,
+        &args,
         spawn_mode,
-        resolved.working_directory.as_deref(),
+        working_dir.as_deref(),
         &resolved.env,
         &resolved.submit_key,
         cols,
