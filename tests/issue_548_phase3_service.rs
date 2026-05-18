@@ -49,7 +49,13 @@ fn assets_service_templates_exist() {
     assert!(launchd.contains("<plist"));
     assert!(launchd.contains("__EXECUTABLE__"));
     assert!(launchd.contains("__HOME__"));
-    assert!(launchd.contains("__LOG__"));
+    // #914: `__LOG__` placeholder removed — StandardOutPath /
+    // StandardErrorPath now hard-coded to /dev/null since the daemon's
+    // tracing-appender owns rotated log output. Pin the new shape so a
+    // future refactor that re-adds an OS-stdio capture has to explicitly
+    // update this assertion.
+    assert!(launchd.contains("/dev/null"));
+    assert!(!launchd.contains("__LOG__"));
     assert!(launchd.contains("__LABEL__"));
 
     let systemd = include_str!("../assets/service/systemd.service.template");
@@ -264,12 +270,21 @@ fn template_substitution_pin_each_placeholder() {
     // literal `__FOO__` in the rendered file — operator-visible
     // breakage. This pin catches it.
     let launchd = include_str!("../assets/service/launchd.plist.template");
-    for placeholder in &["__LABEL__", "__EXECUTABLE__", "__HOME__", "__LOG__"] {
+    // #914: `__LOG__` removed; StandardOutPath/StandardErrorPath hard-coded
+    // to /dev/null because the daemon's tracing-appender owns rotated
+    // log output. The remaining 3 placeholders still flow through
+    // `apply_substitutions` at install time.
+    for placeholder in &["__LABEL__", "__EXECUTABLE__", "__HOME__"] {
         assert!(
             launchd.contains(placeholder),
             "launchd template missing placeholder: {placeholder}"
         );
     }
+    assert!(
+        !launchd.contains("__LOG__"),
+        "launchd template MUST NOT carry __LOG__ post-#914; \
+         StandardOutPath/StandardErrorPath route to /dev/null."
+    );
     let systemd = include_str!("../assets/service/systemd.service.template");
     for placeholder in &["__EXECUTABLE__", "__HOME__"] {
         assert!(

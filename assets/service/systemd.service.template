@@ -5,6 +5,14 @@
 # Placeholders (substituted at install time by service::install):
 #   __EXECUTABLE__  = absolute path to the agend-terminal binary
 #   __HOME__        = absolute path to AGEND_HOME
+#
+# #914 journald BC note: pre-#914 the daemon wrote tracing to stderr,
+# which systemd routed into journald — `journalctl -u agend-terminal`
+# showed the full trace stream. Post-#914 tracing goes to the rotated
+# `$AGEND_HOME/daemon.log.<date>` files in-process; only panics +
+# migration-failure messages reach systemd's stdout/stderr capture.
+# Operators relying on `journalctl` must switch to
+# `tail -F $AGEND_HOME/daemon.log` (per release changelog).
 
 [Unit]
 Description=agend-terminal daemon (user-level)

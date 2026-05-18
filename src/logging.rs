@@ -92,6 +92,11 @@ pub fn setup_cli_tracing() {
 /// appender starts on a clean slate. Migration failure is logged via
 /// stderr passthrough + daemon startup continues with a fresh rolling
 /// appender (per lead's failure policy).
+///
+/// Also installs a panic hook so panics route through `tracing::error!`
+/// into the rolling file. Without this, panics print to stderr — which
+/// the post-#914 `spawn_detached` sends to `/dev/null` — and would be
+/// invisible to the operator.
 pub fn setup_daemon_tracing(home: &Path) -> anyhow::Result<WorkerGuard> {
     if let Err(e) = migrate_existing_daemon_log(home) {
         eprintln!(
@@ -120,7 +125,33 @@ pub fn setup_daemon_tracing(home: &Path) -> anyhow::Result<WorkerGuard> {
         .with_target(false)
         .init();
 
+    install_panic_to_tracing_hook();
+
     Ok(guard)
+}
+
+/// Install a `panic::set_hook` that forwards panics to `tracing::error!`
+/// so the rolling-file appender captures them. Chains the previous
+/// (default) hook after so panic messages still reach stderr-if-attached
+/// during foreground daemon runs (`agend-terminal start --foreground` in
+/// a terminal, not via `spawn_detached`'s `/dev/null` redirect).
+fn install_panic_to_tracing_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let location = panic_info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let payload = panic_info.payload();
+        let msg = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .map(str::to_string)
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic payload>".to_string());
+        tracing::error!(location = %location, message = %msg, "panic");
+        previous(panic_info);
+    }));
 }
 
 /// Parse `AGEND_LOG_MAX_BYTES` string into bytes. Accepts plain integers
