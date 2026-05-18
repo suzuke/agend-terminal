@@ -129,26 +129,6 @@ impl AgentState {
         matches!(self, Self::AwaitingOperator | Self::InteractivePrompt)
     }
 
-    /// Is this a transient error state that a `continue` recovery nudge
-    /// could plausibly resolve?
-    ///
-    /// True for `{ServerRateLimit, RateLimit, ApiError}` — the agent
-    /// is throttled / transient-failed and a nudge can re-kick the
-    /// pipeline once the throttle clears. False for `{UsageLimit,
-    /// AuthError}` — a "continue" nudge cannot resolve a hard quota
-    /// or invalid credentials, and injecting one would just thrash the
-    /// PTY without progress. Fail-closed by exclusion.
-    ///
-    /// Re-introduced via the rate-limit nudge re-introduction PR after
-    /// #848 narrowed the classifier so false-positive RateLimit/ApiError
-    /// states no longer trigger this gate.
-    pub fn is_transient_error(self) -> bool {
-        matches!(
-            self,
-            Self::ServerRateLimit | Self::RateLimit | Self::ApiError
-        )
-    }
-
     pub fn display_name(self) -> &'static str {
         match self {
             Self::Starting => "starting",
