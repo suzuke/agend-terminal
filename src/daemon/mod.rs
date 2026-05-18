@@ -449,16 +449,12 @@ fn run_core(
     // Shutdown flag — shared with agent reapers to distinguish crash from shutdown
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    tracing::info!(count = agents.len(), "starting agents");
-
-    for def in &agents {
-        spawn_and_register_agent(home, def, &registry, &configs, &crash_tx, &shutdown)?;
-        if agents.len() > 1 {
-            std::thread::sleep(spawn_stagger());
-        }
-    }
-
-    // API socket server
+    // #879v4 C1 ordering: start the API socket server BEFORE spawning agents.
+    // The agents' `agend-mcp-bridge` processes attempt to connect to
+    // `api.port` as soon as their MCP backend invokes `tools/list`; a
+    // legacy ordering that spawned agents first delayed `api.port`
+    // publication by ~N×spawn_stagger and surfaced as silent empty tool
+    // lists (see #879 RCA spike + tests/attached_path_mcp_invariants.rs).
     let api_reg = Arc::clone(&registry);
     let api_home = home.to_path_buf();
     let api_shutdown = Arc::clone(&shutdown);
@@ -481,6 +477,15 @@ fn run_core(
                 None,
             )
         })?;
+
+    tracing::info!(count = agents.len(), "starting agents");
+
+    for def in &agents {
+        spawn_and_register_agent(home, def, &registry, &configs, &crash_tx, &shutdown)?;
+        if agents.len() > 1 {
+            std::thread::sleep(spawn_stagger());
+        }
+    }
 
     // Shutdown wake channel — signal handler sends on this so the main loop's
     // select! wakes immediately instead of waiting up to 10s for the next tick.
