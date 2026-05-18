@@ -4,9 +4,13 @@
 //! fetch_live_agents` (#827), and `src/tasks.rs::fetch_live_agents`
 //! (#829). The fourth consumer arriving in `task action=health`
 //! (this PR) is the design-call threshold that justifies extraction.
+//!
+//! #910 PR1 (this PR) adds `list_agents_with_fallback`, the foundation
+//! helper that PR2-4 migrate the 5 `.port`-glob consume sites onto.
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 
 /// Fetch the daemon's live runtime agent registry via
 /// `api::call(LIST)`. Returns `Some(set)` on success (the set may
@@ -44,6 +48,111 @@ pub fn list_live_agents(home: &Path) -> Option<HashSet<String>> {
 // sites (`src/app/session.rs:274`, `src/app/mod.rs:621`, `src/cli.rs:155`,
 // `src/main.rs:683`, `src/agent_ops.rs:339`) over to this helper in turn.
 // ──────────────────────────────────────────────────────────────────────
+
+/// Source of truth for the most-recent agent list resolution: API
+/// or filesystem-glob fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentListMode {
+    Live,
+    Fallback,
+}
+
+/// Track the most-recent mode so we can log Live↔Fallback transitions
+/// instead of every single call. Important because some callers
+/// (e.g. `src/app/mod.rs:621` periodic sync) fire every 2 seconds —
+/// per-call logging would dump ~1800 lines/hr of redundant info.
+static LAST_MODE: OnceLock<Mutex<Option<AgentListMode>>> = OnceLock::new();
+
+fn note_mode_transition(new_mode: AgentListMode) {
+    let lock = LAST_MODE.get_or_init(|| Mutex::new(None));
+    let Ok(mut guard) = lock.lock() else {
+        return;
+    };
+    let prev = *guard;
+    *guard = Some(new_mode);
+    match (prev, new_mode) {
+        (Some(AgentListMode::Live), AgentListMode::Fallback) => {
+            tracing::info!(
+                "#910 list_agents_with_fallback: daemon offline → falling back to .port glob"
+            );
+        }
+        (Some(AgentListMode::Fallback), AgentListMode::Live) => {
+            tracing::info!(
+                "#910 list_agents_with_fallback: daemon reachable → registry is authoritative"
+            );
+        }
+        (None, mode) => {
+            // First call in process lifetime. One-time info-level entry
+            // so operators grepping daemon.log can confirm the helper
+            // initialized + observe the initial mode.
+            tracing::info!(?mode, "#910 list_agents_with_fallback: initial mode resolved");
+        }
+        // Steady-state (Live → Live or Fallback → Fallback): no log.
+        _ => {}
+    }
+}
+
+/// Resolve the live agent list with daemon-API-first + filesystem-glob
+/// fallback. **Use this in place of bare `ipc::list_agent_ports(run)`
+/// in operator-facing surfaces.** The daemon's in-memory registry is
+/// truth-of-record when reachable; the `.port` filesystem glob is the
+/// best-effort fallback when the API call fails (daemon offline /
+/// restarting / connect-refused).
+///
+/// Returns an alphabetically-sorted `Vec<String>`. Empty when neither
+/// path yields anything (no daemon AND no run dir, or daemon reachable
+/// but registry is empty).
+///
+/// **Why not just call `list_live_agents` directly?** Production CLI
+/// surfaces (`agend-terminal list`, `agend-terminal doctor`) historically
+/// scan `*.port` when the API is unresponsive — operators rely on that
+/// fallback during daemon restart windows. This helper preserves the
+/// behavior while making the daemon-registry path the default.
+///
+/// **Worst-case latency**: bounded by `api::call`'s connect attempt
+/// (~1s default Unix-socket timeout). When the daemon is offline,
+/// expect a predictable ~1s delay before fallback. Acceptable for the
+/// 2s app-sync cadence at `src/app/mod.rs:621` and one-shot CLI use
+/// cases; do NOT call from per-tick hot paths.
+///
+/// **Log cadence**: only Live↔Fallback transitions log at info level.
+/// Steady-state Live → Live (or Fallback → Fallback) calls are silent.
+///
+/// **State leak across tests**: the in-process `LAST_MODE` tracker is a
+/// `OnceLock<Mutex<Option<_>>>` singleton — tests that assert log
+/// content must run with `cargo test -- --test-threads=1` or accept
+/// log ordering uncertainty. The transition log is observability, not
+/// a tested contract; cf. tests in this module assert RESULT not LOG.
+///
+/// #910 PR1: foundation helper, zero caller-site changes. PR2-4
+/// migrate the 5 existing `.port`-glob consume sites.
+pub fn list_agents_with_fallback(home: &Path) -> Vec<String> {
+    let live = list_live_agents(home);
+    list_agents_with_fallback_using(home, live)
+}
+
+/// Factored variant of [`list_agents_with_fallback`] that accepts the
+/// `live` `Option<HashSet>` directly. Lets tests inject the
+/// daemon-registry result without spinning up an in-process API server.
+/// Production callers use the wrapper [`list_agents_with_fallback`].
+pub(crate) fn list_agents_with_fallback_using(
+    home: &Path,
+    live: Option<HashSet<String>>,
+) -> Vec<String> {
+    if let Some(live_set) = live {
+        note_mode_transition(AgentListMode::Live);
+        let mut v: Vec<String> = live_set.into_iter().collect();
+        v.sort();
+        return v;
+    }
+    note_mode_transition(AgentListMode::Fallback);
+    let Some(run) = crate::daemon::find_active_run_dir(home) else {
+        return Vec::new();
+    };
+    let mut v = crate::ipc::list_agent_ports(&run);
+    v.sort();
+    v
+}
 
 #[cfg(test)]
 mod tests {
