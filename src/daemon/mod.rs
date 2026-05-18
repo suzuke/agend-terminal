@@ -2003,6 +2003,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[allow(clippy::type_complexity)] // test scaffolding tuple; struct would be over-engineering
     fn make_test_registry() -> (
         AgentRegistry,
         Arc<Mutex<HashMap<String, AgentConfig>>>,
