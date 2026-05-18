@@ -19,12 +19,6 @@
 //! `main` calls when the child starts with `start --foreground`. CLI
 //! commands route through `[setup_cli_tracing]` and keep stderr.
 
-// `parse_size`, `cleanup_oversize_logs`, `update_daemon_log_symlink_unix`
-// land their wiring in C2 (per-tick handler). The blanket allow keeps
-// C1 clippy-clean without per-item attributes that would need stripping
-// later. C2's wiring removes the allow.
-#![allow(dead_code)]
-
 use std::path::Path;
 
 use tracing_appender::non_blocking::WorkerGuard;
@@ -93,18 +87,17 @@ pub fn setup_cli_tracing() {
 /// log files contain plain text that operator scripts can parse
 /// directly.
 ///
-/// Migration of any pre-existing `daemon.log` is C2's responsibility
-/// (called from this fn after C2 lands); this skeleton calls the
-/// stub which is a no-op. The rolling appender still opens its first
-/// rotated file regardless, so daemon startup never blocks on
-/// migration.
+/// Pre-existing `daemon.log` (from old binaries before this PR) is
+/// renamed up-front via [`migrate_existing_daemon_log`] so the rolling
+/// appender starts on a clean slate. Migration failure is logged via
+/// stderr passthrough + daemon startup continues with a fresh rolling
+/// appender (per lead's failure policy).
 pub fn setup_daemon_tracing(home: &Path) -> anyhow::Result<WorkerGuard> {
-    // C2 will replace the stub `migrate_existing_daemon_log` with the
-    // real rename; the call site here doesn't change. Failures from
-    // migration are logged but never abort startup (per lead's failure
-    // policy: stderr passthrough + continue).
     if let Err(e) = migrate_existing_daemon_log(home) {
-        eprintln!("agend-terminal: daemon.log migration failed: {e} (continuing with fresh rolling appender)");
+        eprintln!(
+            "agend-terminal: daemon.log migration failed: {e} \
+             (continuing with fresh rolling appender)"
+        );
     }
 
     let appender = tracing_appender::rolling::Builder::new()
@@ -134,9 +127,28 @@ pub fn setup_daemon_tracing(home: &Path) -> anyhow::Result<WorkerGuard> {
 /// (`2147483648`) and `K`/`M`/`G` suffixes (case-insensitive, e.g.
 /// `2G`, `500M`, `1024K`). Returns `None` for malformed input so callers
 /// can fall back to [`DEFAULT_MAX_BYTES`].
-pub fn parse_size(_s: &str) -> Option<u64> {
-    // STUB: real impl in next commit.
-    None
+pub fn parse_size(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (num_part, mult): (&str, u64) = if let Some(stripped) = s.strip_suffix(['G', 'g']) {
+        (stripped, 1024 * 1024 * 1024)
+    } else if let Some(stripped) = s.strip_suffix(['M', 'm']) {
+        (stripped, 1024 * 1024)
+    } else if let Some(stripped) = s.strip_suffix(['K', 'k']) {
+        (stripped, 1024)
+    } else {
+        (s, 1)
+    };
+    let num_part = num_part.trim();
+    if num_part.is_empty() || !num_part.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    num_part
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(mult))
 }
 
 /// Rename any existing `<home>/daemon.log` to
@@ -150,9 +162,49 @@ pub fn parse_size(_s: &str) -> Option<u64> {
 /// Returns the destination path on success. Caller policy on rename
 /// failure: per lead synth, log via stderr passthrough + continue
 /// daemon startup with rolling appender on the fresh path.
-pub fn migrate_existing_daemon_log(_home: &Path) -> std::io::Result<Option<std::path::PathBuf>> {
-    // STUB: real impl in next commit.
-    Ok(None)
+pub fn migrate_existing_daemon_log(home: &Path) -> std::io::Result<Option<std::path::PathBuf>> {
+    let src = home.join("daemon.log");
+    // `symlink_metadata` instead of `exists` so we observe the link itself
+    // rather than following it — the post-fix daemon writes a `daemon.log`
+    // symlink → newest rotated file and we must NOT treat that as a legacy
+    // file to migrate.
+    let meta = match std::fs::symlink_metadata(&src) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if meta.file_type().is_symlink() {
+        // Post-fix symlink — leave alone.
+        return Ok(None);
+    }
+    // Idempotence: any pre-existing migration marker means a prior daemon
+    // already migrated; leave the new daemon.log untouched (operator
+    // probably restarted the old binary post-fix). Whoever cleans up the
+    // orphan daemon.log later (cleanup-tick, operator) decides — we
+    // don't double-rotate.
+    let already_migrated = std::fs::read_dir(home)
+        .ok()
+        .map(|entries| {
+            entries.flatten().any(|e| {
+                let n = e.file_name();
+                let s = n.to_string_lossy();
+                s.starts_with("daemon.log.") && s.contains(MIGRATION_SUFFIX_PREFIX)
+            })
+        })
+        .unwrap_or(false);
+    if already_migrated {
+        return Ok(None);
+    }
+    let epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let target = home.join(format!(
+        "daemon.log.{prefix}{epoch}",
+        prefix = MIGRATION_SUFFIX_PREFIX
+    ));
+    std::fs::rename(&src, &target)?;
+    Ok(Some(target))
 }
 
 /// Hourly cleanup tick. Sums sizes of every `daemon.log.*` file in
@@ -160,9 +212,50 @@ pub fn migrate_existing_daemon_log(_home: &Path) -> std::io::Result<Option<std::
 /// total); when total > `max_bytes`, deletes oldest by mtime until
 /// total is under the cap. Returns the number of files removed for
 /// telemetry.
-pub fn cleanup_oversize_logs(_home: &Path, _max_bytes: u64) -> usize {
-    // STUB: real impl in next commit.
-    0
+pub fn cleanup_oversize_logs(home: &Path, max_bytes: u64) -> usize {
+    let entries_iter = match std::fs::read_dir(home) {
+        Ok(d) => d,
+        Err(_) => return 0,
+    };
+    let mut entries: Vec<(std::path::PathBuf, u64, std::time::SystemTime)> = entries_iter
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            // Match rotated (`daemon.log.<date>`) AND migration
+            // (`daemon.log.migration.<epoch>`) — both count toward budget.
+            // Exclude the symlink itself (we want the underlying files in
+            // the budget, not the link byte-count).
+            if !name_str.starts_with("daemon.log.") {
+                return None;
+            }
+            let meta = entry.metadata().ok()?;
+            if !meta.is_file() {
+                return None;
+            }
+            let mtime = meta.modified().ok()?;
+            Some((entry.path(), meta.len(), mtime))
+        })
+        .collect();
+    let total: u64 = entries.iter().map(|(_, s, _)| *s).sum();
+    if total <= max_bytes {
+        return 0;
+    }
+    // Oldest first — preserves the most recent N days of logs the
+    // operator is most likely investigating.
+    entries.sort_by_key(|(_, _, m)| *m);
+    let mut current = total;
+    let mut removed = 0;
+    for (path, size, _) in &entries {
+        if current <= max_bytes {
+            break;
+        }
+        if std::fs::remove_file(path).is_ok() {
+            current = current.saturating_sub(*size);
+            removed += 1;
+        }
+    }
+    removed
 }
 
 /// Maintain `<home>/daemon.log` symlink → newest `daemon.log.<date>`
@@ -170,8 +263,47 @@ pub fn cleanup_oversize_logs(_home: &Path, _max_bytes: u64) -> usize {
 /// active file across rotation boundaries. Unix-only. Windows operator
 /// must `glob daemon.log.*` per the lead-synthed BC note.
 #[cfg(unix)]
-pub fn update_daemon_log_symlink_unix(_home: &Path) {
-    // STUB: real impl in next commit.
+pub fn update_daemon_log_symlink_unix(home: &Path) {
+    use std::os::unix::fs as unix_fs;
+    let entries_iter = match std::fs::read_dir(home) {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    // Newest rotated file (`daemon.log.<date>`), excluding migration
+    // markers (those are static historic snapshots — never the active
+    // write target) and the symlink itself.
+    let newest = entries_iter
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy().to_string();
+            if !name_str.starts_with("daemon.log.") || name_str.contains(MIGRATION_SUFFIX_PREFIX) {
+                return None;
+            }
+            let ft = entry.file_type().ok()?;
+            if ft.is_symlink() {
+                return None;
+            }
+            let mtime = entry.metadata().ok().and_then(|m| m.modified().ok())?;
+            Some((entry.path(), mtime))
+        })
+        .max_by_key(|(_, mtime)| *mtime);
+    let Some((newest_path, _)) = newest else {
+        return;
+    };
+    let link = home.join("daemon.log");
+    // Remove existing link/file before re-creating; symlink() refuses an
+    // existing path. `remove_file` works for both regular files and
+    // symlinks (the symlink itself, not the target, on Unix).
+    if std::fs::symlink_metadata(&link).is_ok() {
+        let _ = std::fs::remove_file(&link);
+    }
+    // Relative target so operator can `mv $AGEND_HOME` without dangling.
+    let target_name = match newest_path.file_name() {
+        Some(n) => n.to_owned(),
+        None => return,
+    };
+    let _ = unix_fs::symlink(&target_name, &link);
 }
 
 #[cfg(not(unix))]
