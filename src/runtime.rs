@@ -51,7 +51,6 @@ pub fn list_live_agents(home: &Path) -> Option<HashSet<String>> {
 
 /// Source of truth for the most-recent agent list resolution: API
 /// or filesystem-glob fallback.
-#[allow(dead_code)] // PR1 of 4 foundation — consumed by PR2 caller migration
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AgentListMode {
     Live,
@@ -62,10 +61,8 @@ enum AgentListMode {
 /// instead of every single call. Important because some callers
 /// (e.g. `src/app/mod.rs:621` periodic sync) fire every 2 seconds —
 /// per-call logging would dump ~1800 lines/hr of redundant info.
-#[allow(dead_code)] // PR1 of 4 foundation
 static LAST_MODE: OnceLock<Mutex<Option<AgentListMode>>> = OnceLock::new();
 
-#[allow(dead_code)] // PR1 of 4 foundation
 fn note_mode_transition(new_mode: AgentListMode) {
     let lock = LAST_MODE.get_or_init(|| Mutex::new(None));
     let Ok(mut guard) = lock.lock() else {
@@ -130,9 +127,10 @@ fn note_mode_transition(new_mode: AgentListMode) {
 /// log ordering uncertainty. The transition log is observability, not
 /// a tested contract; cf. tests in this module assert RESULT not LOG.
 ///
-/// #910 PR1: foundation helper, zero caller-site changes. PR2-4
-/// migrate the 5 existing `.port`-glob consume sites.
-#[allow(dead_code)] // PR1 of 4 foundation — consumed by PR2 caller migration
+/// #910 PR2: now consumed by `agent_ops::list_agents`,
+/// `cli::run_doctor`, and `main::cmd_list` (the 3 CLI ingress sites
+/// from the synthesis). PR3 migrates the 2 app-mode sites; PR4
+/// audits test-side residual.
 pub fn list_agents_with_fallback(home: &Path) -> Vec<String> {
     let live = list_live_agents(home);
     list_agents_with_fallback_using(home, live)
@@ -142,7 +140,6 @@ pub fn list_agents_with_fallback(home: &Path) -> Vec<String> {
 /// `live` `Option<HashSet>` directly. Lets tests inject the
 /// daemon-registry result without spinning up an in-process API server.
 /// Production callers use the wrapper [`list_agents_with_fallback`].
-#[allow(dead_code)] // PR1 of 4 foundation
 pub(crate) fn list_agents_with_fallback_using(
     home: &Path,
     live: Option<HashSet<String>>,

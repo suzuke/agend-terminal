@@ -148,26 +148,26 @@ pub fn run_doctor(home: &Path) -> anyhow::Result<()> {
     }
 
     println!("\n  Active agents:");
-    let mut count = 0;
-    if let Some(run) = crate::daemon::find_active_run_dir(home) {
-        for entry in std::fs::read_dir(&run)?.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.ends_with(".port") && name != "api.port" {
-                let agent = &name[..name.len() - 5];
-                let ok = crate::ipc::probe_agent(&run, agent);
-                println!(
-                    "    {agent} {}",
-                    if ok {
-                        "✓ (port responsive)"
-                    } else {
-                        "✗ (port stale)"
-                    }
-                );
-                count += 1;
+    // #910 PR2 of 4: daemon-registry truth via runtime helper. Probe
+    // still needs find_active_run_dir for the per-agent socket check
+    // (returns false on no run dir, mirroring pre-PR2 behaviour).
+    let agents = crate::runtime::list_agents_with_fallback(home);
+    let run = crate::daemon::find_active_run_dir(home);
+    for agent in &agents {
+        let ok = run
+            .as_ref()
+            .map(|r| crate::ipc::probe_agent(r, agent))
+            .unwrap_or(false);
+        println!(
+            "    {agent} {}",
+            if ok {
+                "✓ (port responsive)"
+            } else {
+                "✗ (port stale)"
             }
-        }
+        );
     }
-    if count == 0 {
+    if agents.is_empty() {
         println!("    (none)");
     }
 
