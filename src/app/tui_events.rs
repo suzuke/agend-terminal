@@ -1,8 +1,12 @@
-//! TUI-side handling of events from the API server.
-//!
-//! The API server (hit via MCP or HTTP) signals agent/team lifecycle changes on
-//! a bounded crossbeam channel. The TUI event loop receives these and mutates
-//! the layout accordingly — auto-creating or removing tabs/panes.
+// TUI-side handling of events from the API server.
+//
+// #879v3 C2 transition: the always-Attached architecture moves the API
+// server into the detached daemon, leaving the TUI without an in-process
+// producer for `TuiEvent`. C3 will delete the event variants + `TuiNotifier`
+// + `TuiEventSender` entirely. The module-level `dead_code` allow below
+// is scoped to that transition window.
+
+#![allow(dead_code)]
 
 use crate::agent::{self, AgentRegistry};
 use crate::layout::{Layout, MovePlacement, SplitDir, Tab};

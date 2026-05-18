@@ -57,6 +57,10 @@ pub struct OwnedFleet {
     pub home: PathBuf,
     #[allow(dead_code)]
     pub fleet_path: PathBuf,
+    // #879v3 C2: only reader (app::run_app Owned arm via telegram_status_from_config)
+    // is gone; daemon::run_with_prepared doesn't consume this field. Removed
+    // in C3 cleanup once OwnedFleet is sized down to fields daemon actually uses.
+    #[allow(dead_code)]
     pub config: crate::fleet::FleetConfig,
     pub agents: Vec<AgentDef>,
     pub run_dir: PathBuf,

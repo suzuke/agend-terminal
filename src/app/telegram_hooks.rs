@@ -11,6 +11,11 @@ use std::path::Path;
 use std::sync::Arc;
 
 /// Derive Telegram status from an already-loaded FleetConfig (no disk I/O).
+///
+/// #879v3 C2: caller (the Owned bootstrap arm in `app::run_app`) is gone.
+/// Status now derives from the daemon-side Telegram init. C3 cleanup
+/// removes this helper.
+#[allow(dead_code)]
 pub(super) fn telegram_status_from_config(config: &crate::fleet::FleetConfig) -> TelegramStatus {
     match config.channel {
         Some(crate::fleet::ChannelConfig::Telegram {

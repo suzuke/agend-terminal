@@ -76,6 +76,7 @@ pub fn term_requested() -> bool {
 /// `CTRL_LOGOFF_EVENT`, `CTRL_SHUTDOWN_EVENT`. Returns `FALSE` for
 /// `CTRL_C_EVENT` / `CTRL_BREAK_EVENT` so ratatui's crossterm reader keeps
 /// seeing them as KeyEvents.
+#[allow(dead_code)] // #879v3 C3 removes — Owned bootstrap arm is gone; daemon owns its own signal handling
 pub fn install_term_only() {
     #[cfg(unix)]
     unsafe {
@@ -88,6 +89,7 @@ pub fn install_term_only() {
 }
 
 #[cfg(unix)]
+#[allow(dead_code)] // #879v3 C3 removes alongside install_term_only
 unsafe fn install_unix_sigterm() {
     extern "C" fn handler(_signum: libc::c_int) {
         // Signal-handler-safe: only atomic ops, no allocation, no tracing.

@@ -1,5 +1,11 @@
 //! In-process API server lifecycle + fleet auto-start on cold boot.
 //!
+//! #879v3 C2 transition note: `start_api_server` + `TuiNotifier` are no
+//! longer wired from `app::run` — the always-Attached architecture lets
+//! the detached daemon own the API server, and the TUI is a pure client.
+//! These items are slated for removal in the C3 cleanup commit; the
+//! `#[allow(dead_code)]` markers here are scoped to the items C3 drops.
+//!
 //! `ApiGuard` is an RAII handle that cleans up the run-dir when the TUI exits
 //! and holds the [`crate::bootstrap::OwnedFleet`] — i.e. the `.daemon.lock`
 //! flock guard, `api.cookie` bytes, and Telegram polling state — for the full
@@ -37,6 +43,7 @@ impl Drop for ApiGuard {
 /// (issued by bootstrap, fixing the `api.cookie missing; aborting serve`
 /// regression that previously broke Telegram delivery in app mode) and is
 /// held inside the guard for the TUI's lifetime.
+#[allow(dead_code)] // #879v3 C3 removes — daemon owns the API server in always-Attached
 pub(super) fn start_api_server(
     prepared: Box<crate::bootstrap::OwnedFleet>,
     registry: &AgentRegistry,

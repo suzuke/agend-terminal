@@ -138,68 +138,33 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
 
     let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
     let (tui_event_tx, tui_event_rx) = crossbeam_channel::bounded::<TuiEvent>(256);
+    // #879v3 C2: previously fed by `api_server::start_api_server`'s
+    // TuiNotifier; now the daemon owns the API + telegram outbox, so the
+    // TUI has no in-process event producer. The sender is retained for the
+    // future case of daemon→TUI push events landing here.
+    let _ = tui_event_tx.clone();
 
-    // Preflight via the shared bootstrap seam so `api.cookie` is issued before
-    // `api::serve` starts — otherwise `inbox::notify_agent`'s `api::call(INJECT)`
-    // from Telegram's router would silently fail.
+    // #879v3 C2: always-Attached architecture. The TUI no longer holds the
+    // daemon lock in-process; instead it requires a detached daemon to be
+    // reachable and connects as a client (so MCP, supervisor, telegram,
+    // session persistence all run in the daemon — single source of truth).
     //
-    // `Attached` means another daemon owns the fleet; the TUI connects as a
-    // client (Stage 3.4). `attached_mode` gates every operation that would
-    // conflict with the live daemon — session persistence, fleet.yaml sync,
-    // supervisor spawn, and agent kill on exit.
-    let opts = crate::bootstrap::PrepareOptions {
-        resolve_agents: false, // app spawns via pane_factory from tabs
-        ..Default::default()
-    };
-    let mut attached_run_dir: Option<PathBuf> = None;
-    let (_api_guard, telegram_state, telegram_status) =
-        match crate::bootstrap::prepare(&home, &fleet_path, opts) {
-            Ok(crate::bootstrap::BootstrapOutcome::Owned(prepared)) => {
-                let telegram = prepared.telegram.clone();
-                let status = if telegram.is_some() {
-                    TelegramStatus::Connected
-                } else {
-                    telegram_hooks::telegram_status_from_config(&prepared.config)
-                };
-                let guard = api_server::start_api_server(prepared, &registry, tui_event_tx);
-                // SIGTERM-only handler: `agend-terminal stop` can cleanly exit
-                // the owned app. SIGINT stays with crossterm so Ctrl+C still
-                // reaches the focused pane's PTY as 0x03.
-                crate::bootstrap::signals::install_term_only();
-                (guard, telegram, status)
-            }
-            Ok(crate::bootstrap::BootstrapOutcome::Attached(attached)) => {
-                tracing::info!(
-                    pid = attached.daemon_pid,
-                    path = %attached.run_dir.display(),
-                    "attached to existing daemon, connecting as remote client"
-                );
-                attached_run_dir = Some(attached.run_dir.clone());
-                (
-                    api_server::noop_guard(),
-                    None,
-                    TelegramStatus::NotConfigured,
-                )
-            }
-            Err(e) => {
-                // #879v3 C2.6: this arm previously logged a `warn!` and
-                // produced `noop_guard() / None / NotConfigured` — the TUI
-                // came up but with no in-process API server, so MCP tool
-                // calls registered against an empty surface ({tools:[]},
-                // the #881 symptom). Visible bail is the only correct
-                // response; silent degrade is what broke prod twice.
-                tracing::error!(
-                    error = %e,
-                    "bootstrap::prepare failed; refusing to run TUI in degraded mode (#879v3 C2.6)"
-                );
-                crate::bootstrap::daemon_spawn::cleanup_on_bail(None, None);
-                return Err(e).context(
-                    "bootstrap failed — TUI cannot run without an API server. \
-                     Check the error chain above; if the lock is held by another \
-                     daemon, attach via `agend-terminal list` to see what's running.",
-                );
-            }
-        };
+    // If no daemon is running on `home`, auto-spawn one via the same
+    // `bootstrap::daemon_spawn::canonical_spawn_daemon` topology the manual
+    // `agend-terminal start` uses; then poll `find_active_run_dir` AND
+    // `probe_api` until both pass (the dual gate that the #882 reattempt
+    // missed). On readiness-probe failure, `cleanup_on_bail` SIGTERMs the
+    // orphan + wipes the run_dir before propagating Err to the operator —
+    // closes the new orphan-daemon class that always-Attached introduces.
+    let attached_run_dir = ensure_daemon_running(&home, &fleet_path)?;
+    tracing::info!(
+        path = %attached_run_dir.display(),
+        "attached to daemon (auto-spawned if cold)"
+    );
+    let _api_guard = api_server::noop_guard();
+    let telegram_state: Option<std::sync::Arc<dyn crate::channel::Channel>> = None;
+    let telegram_status = TelegramStatus::NotConfigured;
+    let attached_run_dir: Option<PathBuf> = Some(attached_run_dir);
     let attached_mode = attached_run_dir.is_some();
 
     // SIGINT / SIGHUP are left to their defaults: Ctrl+C must reach the
@@ -709,6 +674,71 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     }
 
     Ok(())
+}
+
+/// Maximum time `ensure_daemon_running` polls for the auto-spawned daemon to
+/// become probe-API ready. Generous compared to `STARTUP_TIMEOUT` inside
+/// `spawn_detached` (5s) — the cold-start window covers flock acquire, cookie
+/// issue, fleet load, AND the api.port bind that `spawn_detached`'s 5s budget
+/// alone doesn't guarantee. The dual gate (`find_active_run_dir` AND
+/// `probe_api`) is the lesson #882 missed.
+const ENSURE_DAEMON_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Always-Attached entry point (#879v3 C2). Returns the run_dir of a live,
+/// probe-API-ready daemon under `home`, auto-spawning one via the canonical
+/// detached-daemon path if none is reachable.
+///
+/// Error paths invoke `cleanup_on_bail(Some(pid), Some(run_dir))` so an
+/// orphan daemon left behind by a spawn-then-fail-to-probe sequence is
+/// terminated + its rundir wiped — closes the new orphan-daemon class that
+/// always-Attached introduces (the spawned-but-unattached daemon would
+/// otherwise stick around and confuse the next launch).
+fn ensure_daemon_running(home: &Path, fleet_path: &Path) -> Result<PathBuf> {
+    // Fast path: already running and ready.
+    if let Some(rd) = crate::daemon::find_active_run_dir(home) {
+        if crate::ipc::probe_api(&rd) {
+            tracing::info!(path = %rd.display(), "daemon already running");
+            return Ok(rd);
+        }
+    }
+    // Cold path: auto-spawn detached + wait for ready.
+    tracing::info!("no live daemon on this AGEND_HOME; auto-spawning detached daemon");
+    let handle = crate::bootstrap::daemon_spawn::spawn_detached(
+        home,
+        fleet_path.exists().then_some(fleet_path),
+    )
+    .context(
+        "auto-spawn detached daemon failed — \
+         check daemon.log under AGEND_HOME for the underlying cause",
+    )?;
+    tracing::info!(
+        pid = handle.pid,
+        run_dir = %handle.run_dir.display(),
+        log = %handle.log_path.display(),
+        "daemon auto-spawned; waiting for API readiness"
+    );
+    // Dual gate: find_active_run_dir + probe_api. spawn_detached's internal
+    // wait only confirms the run dir is published; api.port bind happens
+    // moments later. #881 race was here.
+    if let Some(rd) =
+        crate::bootstrap::daemon_spawn::wait_until_ready(home, ENSURE_DAEMON_READY_TIMEOUT)
+    {
+        return Ok(rd);
+    }
+    tracing::error!(
+        pid = handle.pid,
+        run_dir = %handle.run_dir.display(),
+        timeout_secs = ENSURE_DAEMON_READY_TIMEOUT.as_secs(),
+        "auto-spawned daemon did not become probe-API ready within timeout; cleaning up"
+    );
+    crate::bootstrap::daemon_spawn::cleanup_on_bail(Some(handle.pid), Some(&handle.run_dir));
+    anyhow::bail!(
+        "auto-spawned daemon (pid={}) did not become API-ready within {}s — \
+         see {} for details. cleanup_on_bail SIGTERMed the daemon and removed the run dir.",
+        handle.pid,
+        ENSURE_DAEMON_READY_TIMEOUT.as_secs(),
+        handle.log_path.display(),
+    );
 }
 
 /// Build menu items for new-tab selection.
