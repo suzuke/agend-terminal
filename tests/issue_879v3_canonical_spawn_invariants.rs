@@ -6,13 +6,16 @@
 //! load-bearing rules:
 //!
 //! 1. Every self-spawn site funnels through
-//!    [`bootstrap::daemon_spawn::canonical_spawn_daemon`] — no caller may
-//!    build a `Command::new(exe).arg("start")` by hand and bypass the
-//!    `AGEND_SPAWN_DEPTH` increment + `--foreground` invariants.
+//!    [`bootstrap::spawn_depth::canonical_spawn_args`] — no caller may
+//!    hardcode `"--foreground"` by hand and bypass the
+//!    `AGEND_SPAWN_DEPTH` increment + args/env invariants. The SPEC
+//!    helper is import-clean for tray (per #548 Q7) and reused by
+//!    `bootstrap::daemon_spawn::spawn_detached` for the CLI Start + app
+//!    auto-spawn paths.
 //!
-//! 2. The canonical helper itself sets `AGEND_SPAWN_DEPTH` on its returned
-//!    [`Command`]'s env. If a future refactor removes the env set, this
-//!    test fails with a clear message naming the safeguard.
+//! 2. The canonical spec helper itself sets `AGEND_SPAWN_DEPTH` on the
+//!    returned spec's env. If a future refactor removes the env set,
+//!    this test fails with a clear message naming the safeguard.
 //!
 //! Why "scan the source tree" rather than "scan compiled artifacts": grep-
 //! at-test-time is the same technique `tests/issue_548_phase2_invariants.rs`
@@ -24,11 +27,13 @@ use std::fs;
 use std::path::Path;
 
 /// Files that LEGITIMATELY contain the canonical-spawn building blocks —
-/// the helper itself, plus its tests, plus the test fixture you're reading
-/// now. Every other source file must NOT call `Command::new(...).arg("start")`
-/// to spawn a daemon; they must use `canonical_spawn_daemon` instead.
+/// the spec helper itself, plus its tests, plus the test fixture you're
+/// reading now. Every other source file must source its args + env via
+/// `bootstrap::spawn_depth::canonical_spawn_args(...).apply_to(&mut cmd)`
+/// rather than hardcoding `"--foreground"` (or other invariant args)
+/// directly.
 const CANONICAL_SPAWN_OWNERS: &[&str] = &[
-    "src/bootstrap/daemon_spawn.rs",
+    "src/bootstrap/spawn_depth.rs",
     "tests/issue_879v3_canonical_spawn_invariants.rs",
 ];
 
@@ -93,20 +98,26 @@ fn new_spawn_entrypoint_without_depth_accounting_fails() {
         let text =
             fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
 
-        // Smoking-gun signature: `.arg("--foreground")` on a Command
-        // builder. The flag is unique to `agend-terminal start --foreground`
-        // — no external tool we spawn uses it — so its presence is a
-        // reliable marker for an agend-spawns-agend site. (We deliberately
-        // do NOT key on `.arg("start")` alone, because `Command::new("cmd")
-        // .arg("/c").arg("start")` is the Windows cmd.exe builtin used by
-        // `src/tray/terminal/windows.rs` to detach EXTERNAL terminals —
-        // unrelated to recursion guard.)
+        // Smoking-gun signature: any hardcoded `"--foreground"` string
+        // literal. After #879v3 PR2's SPEC refactor, the only legitimate
+        // place for that literal is inside `canonical_spawn_args` (in
+        // `bootstrap::spawn_depth.rs`). Every other self-spawn caller
+        // must source the args from the spec via `.apply_to(...)`, NOT
+        // hardcode `--foreground` (or `.arg("--foreground")`) inline.
+        // Catches both shapes: `.arg("--foreground")` (the old shape) and
+        // `["start", "--foreground", ...]` Vec literals (the new shape if
+        // someone re-introduces an inline build).
+        //
+        // We deliberately do NOT key on `"start"` alone, because
+        // `Command::new("cmd").arg("/c").arg("start")` is the Windows
+        // cmd.exe builtin used by `src/tray/terminal/windows.rs` to
+        // detach EXTERNAL terminals — unrelated to recursion guard.
         for (lineno, line) in text.lines().enumerate() {
             let trimmed = line.trim_start();
             if trimmed.starts_with("//") || trimmed.starts_with("///") {
                 continue;
             }
-            if trimmed.contains(".arg(\"--foreground\")") {
+            if trimmed.contains("\"--foreground\"") {
                 offenders.push(format!("{rel}:{}", lineno + 1));
             }
         }
@@ -123,28 +134,28 @@ fn new_spawn_entrypoint_without_depth_accounting_fails() {
     );
 }
 
-/// Pin the canonical helper's body so a future refactor can't accidentally
-/// remove the depth increment. If `canonical_spawn_daemon` ever stops
-/// calling `spawn_depth::set_on_child`, this test fails with a message
-/// that points at the safeguard.
+/// Pin the canonical spec helper's body so a future refactor can't
+/// accidentally remove the depth increment. If `canonical_spawn_args`
+/// ever stops setting the `AGEND_SPAWN_DEPTH` env entry on the returned
+/// spec, this test fails with a message that points at the safeguard.
 #[test]
-fn canonical_spawn_daemon_sets_depth_env_on_child() {
-    let text = read_text("src/bootstrap/daemon_spawn.rs");
+fn canonical_spawn_args_sets_depth_env_on_spec() {
+    let text = read_text("src/bootstrap/spawn_depth.rs");
     assert!(
-        text.contains("pub fn canonical_spawn_daemon("),
-        "src/bootstrap/daemon_spawn.rs must declare canonical_spawn_daemon"
+        text.contains("pub fn canonical_spawn_args("),
+        "src/bootstrap/spawn_depth.rs must declare canonical_spawn_args"
     );
     assert!(
-        text.contains("spawn_depth::set_on_child(&mut cmd"),
-        "canonical_spawn_daemon must call `spawn_depth::set_on_child` on \
-         its returned Command — otherwise children spawn at the parent's \
+        text.contains("ENV_KEY.to_string(), next_depth.to_string()"),
+        "canonical_spawn_args must push (ENV_KEY, next_depth.to_string()) \
+         into the spec's env — otherwise children spawn at the parent's \
          depth and the recursion guard fails to advance the counter"
     );
     assert!(
-        text.contains("spawn_depth::check()"),
-        "canonical_spawn_daemon must call `spawn_depth::check()` before \
-         building the Command — bailing before allocating OS resources \
-         is the whole point of the fork-bomb guard"
+        text.contains("let next_depth = check()?;"),
+        "canonical_spawn_args must call `check()?` first — bailing before \
+         allocating any further resources is the whole point of the \
+         fork-bomb guard"
     );
 }
 
