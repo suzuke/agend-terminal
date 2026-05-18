@@ -548,7 +548,8 @@ mod claude_session {
     /// (`custom-title`, `agent-name`, `pr-link`) before the first user
     /// message, and `claude --continue` cannot resume from those.
     pub fn has_resumable(working_dir: &Path, projects_root: &Path) -> bool {
-        let project_dir = projects_root.join(encode_project_dir(working_dir));
+        let canonical = canonicalize_for_encode(working_dir);
+        let project_dir = projects_root.join(encode_project_dir(&canonical));
         let Ok(entries) = std::fs::read_dir(&project_dir) else {
             return false;
         };
@@ -558,7 +559,25 @@ mod claude_session {
             .any(|e| jsonl_has_user_entry(&e.path()))
     }
 
+    /// Canonicalize `working_dir` so the encoded project-dir name matches what
+    /// claude CLI's Node `fs.realpathSync.native` produces before writing the
+    /// session jsonl. Falls back to the raw input on canonicalize Err so cold
+    /// spawns (working_dir not yet on disk) preserve the conservative-false
+    /// branch in [`has_resumable`].
+    ///
+    /// Uses `dunce::canonicalize` rather than `std::fs::canonicalize`: on
+    /// Windows the former strips `\\?\` UNC verbatim prefixes when safe,
+    /// matching node's behavior; on Unix the two are identical.
+    fn canonicalize_for_encode(working_dir: &Path) -> PathBuf {
+        dunce::canonicalize(working_dir).unwrap_or_else(|_| working_dir.to_path_buf())
+    }
+
     /// Encode an absolute path the way Claude names project dirs.
+    ///
+    // TODO: option B (--session-id) follow-up — see #893 spike artifacts for
+    // storage design (fixup-dev-2's metadata/<agent>.json proposal). Trigger:
+    // if a new encode-mismatch class appears that `--continue` newest-wins
+    // doesn't cover.
     fn encode_project_dir(path: &Path) -> String {
         path.to_string_lossy()
             .chars()
@@ -703,6 +722,120 @@ mod claude_session {
             // A `.txt` file with `"type":"user"` text must not count.
             std::fs::write(proj.join("note.txt"), "{\"type\":\"user\"}\n").unwrap();
             assert!(!has_resumable(work, &root));
+        }
+
+        /// Issue #893 regression fixture. On macOS, `/tmp` is a symlink to
+        /// `/private/tmp`, and claude CLI's Node `fs.realpathSync.native`
+        /// canonicalizes before encoding the project-dir name. Without
+        /// caller-side canonicalize, agend encodes the raw `/tmp/...` and
+        /// looks at `<root>/-tmp-...` while claude wrote to
+        /// `<root>/-private-tmp-...` → `read_dir` ENOENT → `has_resumable`
+        /// returns false → `--continue` never fires → context lost on
+        /// relaunch. Verified empirically by the #893 spike (filesystem
+        /// inspection of `~/.claude/projects/` after `claude -p` on a
+        /// `/tmp/...` cwd showed only `-private-tmp-...` entries).
+        ///
+        /// Pre-fix this test asserts the bug; post-fix `canonicalize_for_encode`
+        /// rewrites `/tmp/X` → `/private/tmp/X` so the lookup matches.
+        #[test]
+        #[cfg(target_os = "macos")]
+        fn has_resumable_handles_tmp_to_private_tmp_alias() {
+            let root = unique_tmp("tmp-alias");
+            let token = format!(
+                "tmp-alias-{}-{}",
+                std::process::id(),
+                root.file_name().and_then(|n| n.to_str()).unwrap_or("x")
+            );
+            let raw_work = PathBuf::from(format!("/tmp/{}/sub", token));
+            std::fs::create_dir_all(&raw_work).unwrap();
+            let canonical_work = std::fs::canonicalize(&raw_work).unwrap();
+            assert_ne!(
+                raw_work, canonical_work,
+                "macOS should canonicalize /tmp → /private/tmp; if this asserts the \
+                 host /tmp symlink is missing — investigate before treating the rest \
+                 of this test as a real failure"
+            );
+            // Pre-populate projects_root with a user-bearing jsonl under the
+            // CANONICAL encoding (what claude CLI would actually write).
+            let canonical_dir = root.join(encode_project_dir(&canonical_work));
+            std::fs::create_dir_all(&canonical_dir).unwrap();
+            std::fs::write(
+                canonical_dir.join("a.jsonl"),
+                "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+            )
+            .unwrap();
+            // Sanity: the raw-encoded dir does NOT exist on disk. If this
+            // asserts, the fix has accidentally normalized the encoded form
+            // too — adjust the fixture rather than relaxing this check.
+            let raw_encoded_dir = root.join(encode_project_dir(&raw_work));
+            assert!(
+                !raw_encoded_dir.exists(),
+                "raw-encoded dir should not exist; encoding scheme must preserve \
+                 the /tmp vs /private/tmp distinction"
+            );
+            assert!(
+                has_resumable(&raw_work, &root),
+                "has_resumable should canonicalize the raw /tmp path before encoding \
+                 and find the jsonl at the canonical encoding"
+            );
+            let _ = std::fs::remove_dir_all(format!("/tmp/{}", token));
+        }
+
+        /// Windows-only invariant: `canonicalize_for_encode` must NOT return
+        /// a path with the `\\?\` UNC verbatim-prefix that `std::fs::canonicalize`
+        /// produces, because Node's `fs.realpathSync.native` (which claude CLI
+        /// uses to derive the project-dir name) strips it. If we kept the
+        /// verbatim prefix, the encoded project-dir name would diverge from
+        /// claude's by the prefix characters → same class of bug as #893's
+        /// macOS `/tmp` → `/private/tmp` alias.
+        ///
+        /// Also exercises Windows path normalization: case-fold round-trip
+        /// via `has_resumable` (the real-world cwd casing claude inherits
+        /// matches what canonicalize returns).
+        #[test]
+        #[cfg(target_os = "windows")]
+        fn canonicalize_for_encode_strips_verbatim_prefix_on_windows() {
+            let root = unique_tmp("win-verbatim");
+            let work_root = unique_tmp("win-work");
+            let raw_work = work_root.join("sub");
+            std::fs::create_dir_all(&raw_work).unwrap();
+            let canonical = super::canonicalize_for_encode(&raw_work);
+            let canonical_str = canonical.to_string_lossy();
+            assert!(
+                !canonical_str.starts_with(r"\\?\"),
+                "canonicalize_for_encode must strip Windows `\\\\?\\` verbatim prefix \
+                 (got {canonical_str:?}); dunce::canonicalize handles this — fall through \
+                 to std::fs::canonicalize would re-introduce the prefix"
+            );
+            // End-to-end: pre-populate projects_root with a user-bearing jsonl
+            // under the canonical encoding; has_resumable should find it
+            // when called with the raw (pre-canonicalize) cwd.
+            let canonical_dir = root.join(encode_project_dir(&canonical));
+            std::fs::create_dir_all(&canonical_dir).unwrap();
+            std::fs::write(
+                canonical_dir.join("a.jsonl"),
+                "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+            )
+            .unwrap();
+            assert!(
+                has_resumable(&raw_work, &root),
+                "has_resumable should canonicalize the cwd and find the jsonl under \
+                 the same encoding claude CLI's fs.realpathSync.native produces"
+            );
+        }
+
+        /// Cold-spawn invariant: `working_dir` may not exist on disk yet
+        /// (first call before claude has created the project). Canonicalize
+        /// returns Err in that branch; the fallback to the raw path keeps
+        /// `has_resumable`'s conservative-false return intact.
+        #[test]
+        fn canonicalize_for_encode_falls_back_to_raw_on_err() {
+            let nonexistent = Path::new("/this/path/does/not/exist/anywhere");
+            let canonical = super::canonicalize_for_encode(nonexistent);
+            assert_eq!(canonical, nonexistent.to_path_buf());
+            // And has_resumable on a non-existent cwd stays false.
+            let root = unique_tmp("nonexistent-cwd");
+            assert!(!has_resumable(nonexistent, &root));
         }
     }
 }

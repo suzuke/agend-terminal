@@ -90,6 +90,11 @@ async-trait = "0.1"
 anyhow = "1"
 fs4 = "0.12"
 dirs = "6"
+# Issue #893: dunce::canonicalize strips Windows `\\?\` UNC verbatim prefix
+# when safe, so the path encoding matches what claude CLI's Node
+# `fs.realpathSync.native` produces. Used in claude_session::has_resumable
+# to canonicalize cwd before encoding the project-dir lookup name.
+dunce = "1"
 regex = "1"
 # Sprint 24 P0 PR2 — task_sweep forensic api_response_hash on PrSnapshot.
 # SHA-256 crypto-grade hash + hex encoding so reviewers can correlate an
