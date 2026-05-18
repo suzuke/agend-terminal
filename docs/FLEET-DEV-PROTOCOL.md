@@ -191,16 +191,27 @@ Race-class PRs ship with hidden timing dependencies that pass CI + reviewer VERI
 
 Before dispatching r0 on a race-class PR, lead AND dev MUST answer in writing: *"Does this change have a race condition, and can I write a deterministic test that reproduces it without timing dependence?"* The answer goes in the spike report (or the dispatch message if no spike preceded).
 
-Race class includes — but is not limited to — `tokio::spawn` / `thread::spawn` sites, multi-process startup ordering, `Drop`-vs-`enqueue` lifecycle, lock-ordering across modules, signal-handler-vs-main-loop coordination, daemon-vs-bridge handshake gates. If the answer is "no deterministic test possible," the PR requires operator-smoke-gate (SOP 2) AND reviewer RED-protocol (SOP 3).
+Race class includes — but is not limited to — `tokio::spawn` / `thread::spawn` sites, multi-process startup ordering, `Drop`-vs-`enqueue` lifecycle, lock-ordering across modules, signal-handler-vs-main-loop coordination, daemon-vs-bridge handshake gates. If the answer is "no deterministic test possible," the PR escalates reviewer RED-protocol scrutiny per SOP 3 and SOP 2 post-merge smoke becomes the primary empirical signal.
 
-**SOP 2 — Operator-smoke-gate for race-class PRs.**
+**SOP 2 — Post-merge operator smoke sanity check (NOT a merge gate).**
 
-CI green + reviewer VERIFIED are INSUFFICIENT gates for race-class PRs. #881 cleared both gates and still broke prod. For race-class PRs:
+Race-class PRs merge once SOP 1 (deterministic RED→GREEN tests) AND SOP 3 (reviewer RED-protocol) are both satisfied. SOP 2 is a **post-merge sanity check**, not a pre-merge gate.
 
-- PR body MUST include a **`REQUIRED post-merge operator smoke confirmation`** block stating what the operator must observe (e.g. "operator restarts daemon cold + watches inbox for `bridge_connected` within 5s").
-- The task entry stays in `claimed` status (NOT `done`) until the operator explicitly confirms post-rebuild behavior in the dispatching thread.
-- Lead handoff to operator is explicit: "@operator please smoke-test per PR body" — never implied by "merged".
-- If the smoke gate uncovers a regression, the recovery path is operator-driven revert (e.g. `git revert <merge-sha>`) — race regressions auto-escalate to P0 per §3.11(a) deferred-defense.
+Empirical motivation: a pre-merge smoke gate creates a chicken-and-egg problem. The operator's daily binary runs from main; to smoke an unmerged race-class PR they must (a) build from the branch manually and (b) point `$AGEND_HOME` away from their daily setup. The gate then blocks merge until smoke confirms — but smoke can't run without operator side-work that breaks the merge flow. PR #908 (2026-05-18 #896 fix) stalled exactly on this loop; operator directive at the time: "smoke gate會造成 chicken-and-egg的問題，要拿掉".
+
+**Post-merge smoke procedure**:
+
+- Operator (or lead on operator's behalf) reproduces the race scenario on a **fresh, isolated `$AGEND_HOME`** — e.g. `/tmp/smoke` or `$TMPDIR/agend-smoke-$$`. **NEVER use the operator's daily `~/.agend-terminal`**; smoke runs MUST be hermetic and disposable so a regression cannot leak into operator state.
+- PR body MAY include a suggested smoke script enumerating the race scenario the fix targets (e.g. "start daemon cold + watch inbox for `bridge_connected` within 5s"). Optional, not required for merge approval.
+- If post-merge smoke uncovers a regression: operator-driven revert (`git revert <merge-sha>`) — race regressions auto-escalate to P0 per §3.11(a) deferred-defense.
+
+**Gating layers (the actual merge gates)**:
+
+- **SOP 1** (deterministic RED→GREEN tests at unit/integration level) — the structural gate. Most race-class behaviour CAN be deterministically tested with proper mocking or DI; the bar is "is there a test that fails pre-fix and passes post-fix, on three back-to-back runs."
+- **SOP 3** (reviewer RED-protocol execution on the test surface) — the audit gate. Reviewer must independently observe the RED→GREEN transition.
+- SOP 2 post-merge smoke is supplementary empirical coverage, not a gate.
+
+If SOP 1 honestly says "no deterministic test possible" (rare — usually achievable with `tokio::test` + paused time, channel-based synchronization, or trait-injected clocks), SOP 3 still applies and merge proceeds. SOP 2 post-merge smoke then carries proportionally more weight as the only remaining empirical signal — the PR description should call this out so the operator runs the smoke promptly post-merge.
 
 **SOP 3 — Reviewer RED-protocol for race-class PRs.**
 
