@@ -111,6 +111,11 @@ clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "local-time"] }
+# #914: daily-rotating + max_log_files-bounded daemon.log via `rolling::Builder`.
+# Same-org as `tracing` / `tracing-subscriber`; transitive deps already in tree
+# (time, parking_lot, crossbeam-channel). Used only from the daemon path in
+# `crate::logging`; CLI commands keep stderr.
+tracing-appender = "0.2"
 arboard = "3.6.1"
 unicode-width = "0.2"
 which = "8"

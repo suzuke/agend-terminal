@@ -39,6 +39,7 @@ mod instructions;
 mod ipc;
 mod keybinds;
 mod layout;
+mod logging;
 mod mcp;
 mod mcp_config;
 mod mouse_forward;
