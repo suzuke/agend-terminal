@@ -676,4 +676,185 @@ mod tests {
         );
         std::fs::remove_dir_all(&home).ok();
     }
+
+    // ----- #900: env propagation through SPAWN RPC + fleet.yaml -----
+
+    /// Build a test `HandlerCtx` with an isolated home dir + empty
+    /// registries. Unlike `test_ctx_with_agent`, no pre-existing agent
+    /// is spawned — these env tests spawn the agent under test directly
+    /// so the registry is clean.
+    #[cfg(unix)]
+    fn env_test_ctx(test_name: &str) -> (HandlerCtx<'static>, std::path::PathBuf) {
+        let home =
+            std::env::temp_dir().join(format!("agend-900-{}-{}", test_name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("create home");
+
+        let registry: &'static agent::AgentRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let configs: &'static crate::api::ConfigRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let externals: &'static agent::ExternalRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let home_ref: &'static std::path::Path = Box::leak(home.clone().into_boxed_path());
+
+        let ctx = HandlerCtx {
+            registry,
+            configs,
+            externals,
+            notifier: None,
+            home: home_ref,
+        };
+        (ctx, home)
+    }
+
+    /// Write a tiny shell script that captures `$VAR_NAME` to `sentinel_path`
+    /// then sleeps so the agent stays alive long enough for cleanup_agent
+    /// to reap it. Returns the script path to pass as the agent's args.
+    #[cfg(unix)]
+    fn write_env_capture_script(
+        home: &std::path::Path,
+        var_name: &str,
+        sentinel_path: &std::path::Path,
+    ) -> std::path::PathBuf {
+        let script = home.join("env-capture.sh");
+        let body = format!(
+            "#!/bin/sh\nprintf '%s' \"${{{var}:-__UNSET__}}\" > '{sentinel}'\nsleep 30\n",
+            var = var_name,
+            sentinel = sentinel_path.display()
+        );
+        std::fs::write(&script, body).expect("write script");
+        script
+    }
+
+    /// Poll for the sentinel file to appear, then return its contents.
+    /// Returns `None` on timeout. Sentinel always materializes once the
+    /// shell launches (script writes unconditionally), so a `None` here
+    /// means the agent itself never ran.
+    #[cfg(unix)]
+    fn await_sentinel(sentinel_path: &std::path::Path) -> Option<String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if sentinel_path.exists() {
+                if let Ok(c) = std::fs::read_to_string(sentinel_path) {
+                    return Some(c);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        None
+    }
+
+    /// #900 ingress 1 — `handle_spawn` MUST extract `env` from `params`
+    /// and propagate it down `spawn_one` → `spawn_agent` → `build_command`
+    /// so the child process inherits the requested env vars. Pre-fix
+    /// `spawn_one` hard-codes `env: None` so any caller-supplied env
+    /// is silently dropped; this is the SPAWN-RPC half of the bug.
+    #[cfg(unix)]
+    #[test]
+    fn handle_spawn_propagates_params_env_to_spawned_process() {
+        let (ctx, home) = env_test_ctx("handle-spawn-params");
+        let sentinel = home.join("sentinel.txt");
+        let script = write_env_capture_script(&home, "MY_SPIKE_900_PARAMS_VAR", &sentinel);
+
+        let result = handle_spawn(
+            &json!({
+                "name": "env-params-test",
+                "backend": "/bin/sh",
+                "args": script.display().to_string(),
+                "env": {"MY_SPIKE_900_PARAMS_VAR": "value-from-params"},
+            }),
+            &ctx,
+        );
+        assert_eq!(result["ok"], true, "spawn must succeed: {result}");
+
+        let actual = await_sentinel(&sentinel);
+        cleanup_agent(&ctx, "env-params-test");
+        let _ = std::fs::remove_dir_all(&home);
+
+        assert_eq!(
+            actual.as_deref(),
+            Some("value-from-params"),
+            "params.env MUST propagate to the child process; the legacy \
+             behavior silently dropped it, leaving the var unset"
+        );
+    }
+
+    /// #900 ingress 2 — when SPAWN params omit `env`, `handle_spawn`
+    /// MUST fall back to `fleet.yaml`'s resolved env for the named
+    /// instance. This is the path that `deploy_template` (Phase 3
+    /// writes fleet entry, then issues SPAWN without env in the wire
+    /// payload) and operator-typed fleet.yaml entries both rely on.
+    #[cfg(unix)]
+    #[test]
+    fn handle_spawn_falls_back_to_fleet_yaml_env_when_params_missing() {
+        let (ctx, home) = env_test_ctx("handle-spawn-fleet-fallback");
+        let sentinel = home.join("sentinel.txt");
+        let script = write_env_capture_script(&home, "MY_SPIKE_900_FLEET_VAR", &sentinel);
+
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  env-fleet-test:\n    backend: shell\n    env:\n      MY_SPIKE_900_FLEET_VAR: value-from-fleet\n",
+        )
+        .expect("write fleet.yaml");
+
+        let result = handle_spawn(
+            &json!({
+                "name": "env-fleet-test",
+                "backend": "/bin/sh",
+                "args": script.display().to_string(),
+                // No "env" field — handler must resolve from fleet.yaml.
+            }),
+            &ctx,
+        );
+        assert_eq!(result["ok"], true, "spawn must succeed: {result}");
+
+        let actual = await_sentinel(&sentinel);
+        cleanup_agent(&ctx, "env-fleet-test");
+        let _ = std::fs::remove_dir_all(&home);
+
+        assert_eq!(
+            actual.as_deref(),
+            Some("value-from-fleet"),
+            "fleet.yaml env MUST propagate when SPAWN params omit env"
+        );
+    }
+
+    /// #900 precedence — params.env wins over fleet.yaml env. Operators
+    /// that pass an explicit `env` in their SPAWN call must always see
+    /// it honoured over whatever's in fleet.yaml for the same key.
+    #[cfg(unix)]
+    #[test]
+    fn handle_spawn_params_env_overrides_fleet_yaml_env() {
+        let (ctx, home) = env_test_ctx("handle-spawn-precedence");
+        let sentinel = home.join("sentinel.txt");
+        let script = write_env_capture_script(&home, "MY_SPIKE_900_PREC_VAR", &sentinel);
+
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  env-precedence-test:\n    backend: shell\n    env:\n      MY_SPIKE_900_PREC_VAR: from-fleet\n",
+        )
+        .expect("write fleet.yaml");
+
+        let result = handle_spawn(
+            &json!({
+                "name": "env-precedence-test",
+                "backend": "/bin/sh",
+                "args": script.display().to_string(),
+                "env": {"MY_SPIKE_900_PREC_VAR": "from-params-wins"},
+            }),
+            &ctx,
+        );
+        assert_eq!(result["ok"], true, "spawn must succeed: {result}");
+
+        let actual = await_sentinel(&sentinel);
+        cleanup_agent(&ctx, "env-precedence-test");
+        let _ = std::fs::remove_dir_all(&home);
+
+        assert_eq!(
+            actual.as_deref(),
+            Some("from-params-wins"),
+            "params.env MUST take precedence over fleet.yaml env for the same key"
+        );
+    }
 }
