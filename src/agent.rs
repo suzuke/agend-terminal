@@ -2216,6 +2216,100 @@ Allow Trust All Tools mode?
         let _ = std::fs::remove_file(pid_file);
     }
 
+    /// Poll `path` until `read_to_string(path).trim().is_empty() == false`
+    /// (i.e. file exists AND has non-empty content), or `timeout`
+    /// elapses. Closes the write-vs-read race that bare
+    /// `path.exists() + read_to_string` exhibits when the writer is a
+    /// subprocess that does open+truncate+write+close: between create
+    /// and content flush, an `exists()` poll returns true but the read
+    /// yields an empty string. Reading until non-empty waits for the
+    /// content commit explicitly.
+    ///
+    /// Returns `Ok(content)` (trimmed read) on success, `Err` with
+    /// `ErrorKind::TimedOut` when the timeout fires with no non-empty
+    /// content observed.
+    ///
+    /// Poll interval is 5ms (the OS scheduling quantum is the floor;
+    /// finer polling burns CPU without buying latency improvement).
+    #[allow(dead_code)] // first consumer lands in the C2 commit
+    fn wait_for_nonempty_file(
+        path: &std::path::Path,
+        timeout: std::time::Duration,
+    ) -> std::io::Result<String> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if !content.trim().is_empty() {
+                    return Ok(content);
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "file {} did not become non-empty within {:?}",
+                        path.display(),
+                        timeout
+                    ),
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// Helper unit test: simulates the race-class shape the helper
+    /// exists to close. A separate thread creates the file empty,
+    /// delays, then writes content. `wait_for_nonempty_file` must
+    /// NOT return until content is observable.
+    #[test]
+    #[cfg(unix)]
+    fn wait_for_nonempty_file_waits_until_content_is_committed() {
+        let path = std::env::temp_dir().join(format!(
+            "agend-wait-nonempty-test-{}.txt",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            // Phase 1: create empty file. A naïve `exists()` poll
+            // would see this and proceed to read empty content.
+            std::fs::write(&writer_path, "").expect("create empty");
+            // Phase 2: simulate the OS write buffer flush gap.
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            // Phase 3: commit the actual content.
+            std::fs::write(&writer_path, "12345\n").expect("commit content");
+        });
+
+        let result = wait_for_nonempty_file(&path, std::time::Duration::from_secs(2))
+            .expect("wait returned content within timeout");
+        writer.join().expect("writer thread joined");
+
+        assert_eq!(
+            result.trim(),
+            "12345",
+            "wait_for_nonempty_file must return the committed content, not the empty stub"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Helper unit test: timeout path. File never becomes non-empty.
+    #[test]
+    #[cfg(unix)]
+    fn wait_for_nonempty_file_returns_timeout_when_content_never_arrives() {
+        let path = std::env::temp_dir().join(format!(
+            "agend-wait-nonempty-timeout-test-{}.txt",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, "").expect("create empty");
+
+        let err = wait_for_nonempty_file(&path, std::time::Duration::from_millis(50))
+            .expect_err("must time out when content never commits");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn sweep_child_tree_unregistered_name_is_no_op() {
         // Sprint 21 F-NEW1: registry lookup miss must not panic. The PTY-EOF
