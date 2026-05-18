@@ -19,6 +19,7 @@ pub(crate) mod doctor;
 pub(crate) mod doctor_topics;
 mod fleet_normalize;
 pub mod signals;
+pub mod spawn_depth;
 mod telegram_init;
 
 pub use agent_resolve::AgentDef;

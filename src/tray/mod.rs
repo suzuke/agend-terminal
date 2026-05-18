@@ -139,23 +139,20 @@ fn check_daemon_state(home: &Path) -> StatusKind {
 /// immediately. Failures surface to stderr — the tray stays usable
 /// so the operator can retry / inspect / Quit.
 fn start_daemon_via_cli() {
-    let exe = match std::env::current_exe() {
-        Ok(p) => p,
+    // #879v3 C2.5: all self-spawn sites must route through
+    // `canonical_spawn_daemon` so `start --foreground` + the
+    // AGEND_SPAWN_DEPTH guard increment + detach flags cannot drift across
+    // callers. The `tests/879v3_canonical_spawn_invariants.rs` invariant
+    // pins this: tray must not build a `Command::new(exe).arg("start")`
+    // by hand.
+    let (mut cmd, exe) = match crate::bootstrap::daemon_spawn::canonical_spawn_daemon(None) {
+        Ok(pair) => pair,
         Err(e) => {
-            eprintln!("tray: failed to resolve current_exe for daemon start: {e}");
+            eprintln!("tray: failed to build canonical daemon spawn: {e}");
             return;
         }
     };
-    // P0 hotfix 2026-05-18 (followup to 800f1cc): same --foreground fork-bomb
-    // rule applies here. Without it, the child re-enters main.rs Start arm's
-    // default-detach branch and recurses via spawn_detached. tray-feature-only
-    // build path, which is why operator's earlier observation was that fork
-    // bomb only triggered with `--features tray`. Same RCA as #887.
-    let result = std::process::Command::new(&exe)
-        .arg("start")
-        .arg("--foreground")
-        .spawn();
-    match result {
+    match cmd.spawn() {
         Ok(_child) => {
             tracing::info!(
                 exe = %exe.display(),

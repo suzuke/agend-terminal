@@ -73,6 +73,7 @@ mod worktree_cleanup;
 #[allow(dead_code)]
 mod worktree_pool;
 
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -498,6 +499,13 @@ fn main() -> anyhow::Result<()> {
             fleet,
             agents,
         }) => {
+            // #879v3 C2.5: fork-bomb guard. If we entered the Start arm with
+            // AGEND_SPAWN_DEPTH already at threshold, this is the recursive-
+            // self-spawn signature (the #882 fork-bomb shape). Bail visibly
+            // before allocating any further OS resources. Foreground mode
+            // (the daemon-itself layer) is INCLUDED in the check — running
+            // a daemon at depth >= 2 is also the wrong shape.
+            bootstrap::spawn_depth::check().context("AGEND_SPAWN_DEPTH guard")?;
             // Sprint 57 Wave 3 PR-2 (#548 Q1): default-flip to detached
             // service mode. `--foreground` is the new opt-out flag.
             // `--agents` always implies foreground (no fleet.yaml path

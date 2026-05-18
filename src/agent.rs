@@ -98,6 +98,10 @@ const SENSITIVE_ENV_KEYS: &[&str] = &[
     "AGEND_ALLOWED_WORK_ROOTS",
     "AGEND_MCP_TOOLS_ALLOW",
     "AGEND_MCP_TOOLS_DENY",
+    // #879v3 C2.5: recursion-guard counter. Allowing fleet.yaml or the host
+    // env to override would let a hostile template silently disable the
+    // fork-bomb guard (set it to a value < THRESHOLD on every layer).
+    "AGEND_SPAWN_DEPTH",
 ];
 
 /// Returns true if the env-var name is on the spawn-time deny-list.

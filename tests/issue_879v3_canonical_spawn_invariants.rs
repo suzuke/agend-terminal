@@ -1,0 +1,163 @@
+//! #879v3 PR2 invariants — pin the canonical self-spawn topology so future
+//! regressions catch at test time, not at production-fork-bomb time.
+//!
+//! Reviewer pushback #2 (per dispatch): "new spawn entrypoint without depth
+//! accounting MUST fail". These tests scan the source tree and enforce two
+//! load-bearing rules:
+//!
+//! 1. Every self-spawn site funnels through
+//!    [`bootstrap::daemon_spawn::canonical_spawn_daemon`] — no caller may
+//!    build a `Command::new(exe).arg("start")` by hand and bypass the
+//!    `AGEND_SPAWN_DEPTH` increment + `--foreground` invariants.
+//!
+//! 2. The canonical helper itself sets `AGEND_SPAWN_DEPTH` on its returned
+//!    [`Command`]'s env. If a future refactor removes the env set, this
+//!    test fails with a clear message naming the safeguard.
+//!
+//! Why "scan the source tree" rather than "scan compiled artifacts": grep-
+//! at-test-time is the same technique `tests/issue_548_phase2_invariants.rs`
+//! uses for the post-#548 tray-spawn topology, and it catches both the
+//! "new call site forgets the rule" regression AND the "rule removed from
+//! the canonical helper" regression at zero runtime cost.
+
+use std::fs;
+use std::path::Path;
+
+/// Files that LEGITIMATELY contain the canonical-spawn building blocks —
+/// the helper itself, plus its tests, plus the test fixture you're reading
+/// now. Every other source file must NOT call `Command::new(...).arg("start")`
+/// to spawn a daemon; they must use `canonical_spawn_daemon` instead.
+const CANONICAL_SPAWN_OWNERS: &[&str] = &[
+    "src/bootstrap/daemon_spawn.rs",
+    "tests/issue_879v3_canonical_spawn_invariants.rs",
+];
+
+fn workspace_root() -> &'static Path {
+    // Cargo sets CARGO_MANIFEST_DIR to the package root at build time.
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn read_text(rel: &str) -> String {
+    let path = workspace_root().join(rel);
+    fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+}
+
+fn iter_rust_files(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let read = match fs::read_dir(dir) {
+        Ok(r) => r,
+        Err(_) => return out,
+    };
+    for entry in read.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            // Skip target/ — built artifacts contain stringified source.
+            if path.file_name().is_some_and(|n| n == "target") {
+                continue;
+            }
+            out.extend(iter_rust_files(&path));
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// Reviewer-required invariant (per dispatch pushback #2): if a new code
+/// path adds `Command::new(...).arg("start").arg("--foreground")` directly
+/// without routing through `canonical_spawn_daemon`, it would silently
+/// disable the `AGEND_SPAWN_DEPTH` increment for that path — same class as
+/// the bug that broke #882.
+///
+/// Pre-fix state (e.g. tray/mod.rs:154 pre-PR2): this test FAILS — tray
+/// builds its own Command with `.arg("start").arg("--foreground").spawn()`.
+/// Post-fix: tray funnels through `canonical_spawn_daemon`, no raw build.
+#[test]
+fn new_spawn_entrypoint_without_depth_accounting_fails() {
+    let workspace = workspace_root();
+    let src_dir = workspace.join("src");
+    let mut offenders = Vec::new();
+
+    for path in iter_rust_files(&src_dir) {
+        let rel = path
+            .strip_prefix(workspace)
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|_| path.display().to_string());
+
+        if CANONICAL_SPAWN_OWNERS.iter().any(|owner| rel == *owner) {
+            continue;
+        }
+        // Skip tests modules inside src — they may exercise spawn-shaped
+        // mocks. The actual invariant we care about is production code.
+        // Tests live under `tests/` and are handled separately.
+        let text =
+            fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+
+        // Smoking-gun signature: `.arg("--foreground")` on a Command
+        // builder. The flag is unique to `agend-terminal start --foreground`
+        // — no external tool we spawn uses it — so its presence is a
+        // reliable marker for an agend-spawns-agend site. (We deliberately
+        // do NOT key on `.arg("start")` alone, because `Command::new("cmd")
+        // .arg("/c").arg("start")` is the Windows cmd.exe builtin used by
+        // `src/tray/terminal/windows.rs` to detach EXTERNAL terminals —
+        // unrelated to recursion guard.)
+        for (lineno, line) in text.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                continue;
+            }
+            if trimmed.contains(".arg(\"--foreground\")") {
+                offenders.push(format!("{rel}:{}", lineno + 1));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "#879v3 invariant violation — these source locations call \
+         `Command::new(...).arg(\"start\")` directly instead of routing \
+         through `bootstrap::daemon_spawn::canonical_spawn_daemon`. \
+         Doing so silently disables the AGEND_SPAWN_DEPTH guard for that \
+         path (same bug class as #882's fork bomb). Refactor each to use \
+         the canonical helper.\n\nOffenders: {offenders:?}"
+    );
+}
+
+/// Pin the canonical helper's body so a future refactor can't accidentally
+/// remove the depth increment. If `canonical_spawn_daemon` ever stops
+/// calling `spawn_depth::set_on_child`, this test fails with a message
+/// that points at the safeguard.
+#[test]
+fn canonical_spawn_daemon_sets_depth_env_on_child() {
+    let text = read_text("src/bootstrap/daemon_spawn.rs");
+    assert!(
+        text.contains("pub fn canonical_spawn_daemon("),
+        "src/bootstrap/daemon_spawn.rs must declare canonical_spawn_daemon"
+    );
+    assert!(
+        text.contains("spawn_depth::set_on_child(&mut cmd"),
+        "canonical_spawn_daemon must call `spawn_depth::set_on_child` on \
+         its returned Command — otherwise children spawn at the parent's \
+         depth and the recursion guard fails to advance the counter"
+    );
+    assert!(
+        text.contains("spawn_depth::check()"),
+        "canonical_spawn_daemon must call `spawn_depth::check()` before \
+         building the Command — bailing before allocating OS resources \
+         is the whole point of the fork-bomb guard"
+    );
+}
+
+/// Pin the deny-list: `AGEND_SPAWN_DEPTH` must be a sensitive env key, so
+/// fleet.yaml templates and host env CANNOT override the depth value
+/// (would create a back door to disable the guard).
+#[test]
+fn agend_spawn_depth_is_on_sensitive_env_deny_list() {
+    let text = read_text("src/agent.rs");
+    assert!(
+        text.contains("\"AGEND_SPAWN_DEPTH\""),
+        "AGEND_SPAWN_DEPTH must appear in SENSITIVE_ENV_KEYS at \
+         src/agent.rs — fleet.yaml override would silently disable the \
+         #879v3 fork-bomb guard"
+    );
+}
