@@ -25,7 +25,7 @@ use crate::notification_queue;
 use crate::render;
 use overlay::{CloseTarget, Overlay, OverlayCtx};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyEventKind};
 use parking_lot::Mutex;
 use ratatui::DefaultTerminal;
@@ -182,12 +182,22 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 )
             }
             Err(e) => {
-                tracing::warn!(error = %e, "bootstrap failed, running TUI without in-process API");
-                (
-                    api_server::noop_guard(),
-                    None,
-                    TelegramStatus::NotConfigured,
-                )
+                // #879v3 C2.6: this arm previously logged a `warn!` and
+                // produced `noop_guard() / None / NotConfigured` — the TUI
+                // came up but with no in-process API server, so MCP tool
+                // calls registered against an empty surface ({tools:[]},
+                // the #881 symptom). Visible bail is the only correct
+                // response; silent degrade is what broke prod twice.
+                tracing::error!(
+                    error = %e,
+                    "bootstrap::prepare failed; refusing to run TUI in degraded mode (#879v3 C2.6)"
+                );
+                crate::bootstrap::daemon_spawn::cleanup_on_bail(None, None);
+                return Err(e).context(
+                    "bootstrap failed — TUI cannot run without an API server. \
+                     Check the error chain above; if the lock is held by another \
+                     daemon, attach via `agend-terminal list` to see what's running.",
+                );
             }
         };
     let attached_mode = attached_run_dir.is_some();

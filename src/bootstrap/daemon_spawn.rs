@@ -170,6 +170,51 @@ pub fn wait_until_ready(home: &Path, timeout: Duration) -> Option<PathBuf> {
     }
 }
 
+/// Best-effort cleanup when a bootstrap-attempting caller decides to bail
+/// before it can hold a daemon's run dir alive for the process lifetime.
+///
+/// Two failure shapes this addresses:
+///
+/// 1. **Auto-spawn → readiness probe fails** (#879v3 C2 path). We've already
+///    forked a child daemon (carrying a PID, having created its run dir,
+///    bound its API port), and now we're about to return `Err` from
+///    `app::run`. Without this helper the parent exits and the orphan
+///    daemon keeps running with no client attached — a new orphan class
+///    introduced by the always-Attached architecture.
+///
+/// 2. **Bootstrap `prepare` Err mid-way** (#879v3 C2.6 path). Some state may
+///    be on disk (run dir created but no cookie issued); the next boot's
+///    `sweep_stale_run_dirs` would handle it eventually, but proactive
+///    removal prevents the misleading "stale-but-recent" rundir from
+///    luring a subsequent attach.
+///
+/// Best-effort throughout: every individual cleanup step is wrapped so a
+/// permission error or already-gone path doesn't propagate. Logs at
+/// `tracing::warn!` on any per-step failure so post-mortem still has
+/// breadcrumbs.
+pub fn cleanup_on_bail(spawned_daemon_pid: Option<u32>, run_dir: Option<&Path>) {
+    if let Some(pid) = spawned_daemon_pid {
+        tracing::warn!(pid, "cleanup_on_bail: SIGTERM auto-spawned daemon");
+        crate::process::terminate(pid);
+    }
+    if let Some(dir) = run_dir {
+        // Remove api.port first (probe_api uses it as the liveness signal —
+        // its absence on a partial-bail rundir lets a future `try_attach`
+        // skip immediately rather than time out).
+        crate::ipc::remove_port(dir, crate::ipc::API_NAME);
+        // Then the rundir wholesale. Removed-but-already-gone is fine.
+        if let Err(e) = std::fs::remove_dir_all(dir) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    error = %e,
+                    path = %dir.display(),
+                    "cleanup_on_bail: remove_dir_all failed (continuing)"
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,5 +269,68 @@ mod tests {
             Some("1"),
             "canonical spawn must set AGEND_SPAWN_DEPTH=1 on child (test process is depth 0)"
         );
+    }
+
+    fn unique_tmp_rundir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "agend-cleanup-on-bail-test-{}-{}-{}",
+            std::process::id(),
+            label,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir tmp rundir");
+        dir
+    }
+
+    /// LOAD-BEARING per #879v3 C2.6: ensures the cleanup helper actually
+    /// removes the run-dir port file + the run-dir itself. Reviewer §3.20
+    /// SOP 3 RED protocol will revert the body to a no-op and observe
+    /// this test FAIL.
+    #[test]
+    fn cleanup_on_bail_removes_port_and_run_dir() {
+        let run_dir = unique_tmp_rundir("port-and-dir");
+        crate::ipc::write_port(&run_dir, crate::ipc::API_NAME, 12345).expect("seed api.port");
+        let port_file = run_dir.join(format!("{}.port", crate::ipc::API_NAME));
+        assert!(
+            port_file.exists(),
+            "fixture: api.port must exist pre-cleanup"
+        );
+
+        // No spawned daemon pid in this test — exercises the "pid=None"
+        // branch (bootstrap::prepare Err shape, not auto-spawn shape).
+        cleanup_on_bail(None, Some(&run_dir));
+
+        assert!(
+            !port_file.exists(),
+            "cleanup_on_bail must remove api.port — the absence is the \
+             signal probe_api uses to skip stale rundirs without timing out"
+        );
+        assert!(
+            !run_dir.exists(),
+            "cleanup_on_bail must remove the run_dir wholesale — \
+             leaving it behind would mislead future find_active_run_dir"
+        );
+    }
+
+    #[test]
+    fn cleanup_on_bail_is_idempotent_on_missing_paths() {
+        // Run-dir doesn't exist (already cleaned by a prior bail). Helper
+        // must not panic / return errors; absence is the expected state.
+        let phantom = std::env::temp_dir().join(format!(
+            "agend-cleanup-phantom-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        assert!(!phantom.exists(), "fixture: phantom path must not exist");
+        // Should not panic.
+        cleanup_on_bail(None, Some(&phantom));
+        cleanup_on_bail(None, None);
     }
 }

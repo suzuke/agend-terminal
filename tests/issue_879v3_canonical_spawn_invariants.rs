@@ -148,6 +148,80 @@ fn canonical_spawn_daemon_sets_depth_env_on_child() {
     );
 }
 
+/// #879v3 C2.6 invariant: no source file may build `api_server::noop_guard()`
+/// from inside an `Err(_) =>` (or `Err(e) =>`) match arm — that's the
+/// silent-degrade shape that produced the #881 `{tools:[]}` symptom.
+///
+/// Generalized framing per reviewer pushback #3: "any bootstrap Err path
+/// silently degrades MCP". The scanner is line-window based: any line that
+/// matches an `Err(...)` arm followed within a small window by `noop_guard()`
+/// counts as a violation.
+///
+/// `noop_guard()` itself remains legitimate for the OK-Attached arm (where
+/// the daemon owns the run dir). The signature we forbid is specifically
+/// "Err arm → noop_guard".
+#[test]
+fn invariant_no_noop_guard_in_err_arms() {
+    let workspace = workspace_root();
+    let src_dir = workspace.join("src");
+    let mut offenders = Vec::new();
+
+    for path in iter_rust_files(&src_dir) {
+        let rel = path
+            .strip_prefix(workspace)
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|_| path.display().to_string());
+        // The helper module that DEFINES noop_guard is naturally excluded
+        // — its body returns the noop, but that's not an Err arm.
+        if rel == "src/app/api_server.rs" {
+            continue;
+        }
+        let text =
+            fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let lines: Vec<&str> = text.lines().collect();
+        for (idx, line) in lines.iter().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                continue;
+            }
+            // Detect an `Err(...)` arm head: starts with `Err(` and ends
+            // with `=>` somewhere on the same line. Skip pattern matches
+            // in non-match contexts by also requiring an `=>`.
+            let is_err_arm_head = trimmed.starts_with("Err(") && trimmed.contains("=>");
+            if !is_err_arm_head {
+                continue;
+            }
+            // Scan the next ~30 lines (a generous arm body) for `noop_guard(`.
+            let end = (idx + 30).min(lines.len());
+            for body_line in &lines[idx + 1..end] {
+                let body_trim = body_line.trim_start();
+                if body_trim.starts_with("//") || body_trim.starts_with("///") {
+                    continue;
+                }
+                if body_trim.contains("noop_guard(") {
+                    offenders.push(format!("{rel}:{}", idx + 1));
+                    break;
+                }
+                // Heuristic stop: the closing `}` at top-of-line of the
+                // match block (the line is just `}` or `};`) ends the arm.
+                if body_trim == "}" || body_trim == "};" || body_trim == "}," {
+                    break;
+                }
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "#879v3 C2.6 invariant violation — `noop_guard()` appears inside an \
+         `Err(_) =>` match arm. This is the silent-degrade shape that produced \
+         the #881 `{{tools:[]}}` symptom: the TUI runs with no in-process API \
+         server, and MCP tool registration sees an empty surface. The correct \
+         response to a bootstrap Err is `cleanup_on_bail(...)` + `return Err(...)`. \
+         \n\nOffenders: {offenders:?}"
+    );
+}
+
 /// Pin the deny-list: `AGEND_SPAWN_DEPTH` must be a sensitive env key, so
 /// fleet.yaml templates and host env CANNOT override the depth value
 /// (would create a back door to disable the guard).
