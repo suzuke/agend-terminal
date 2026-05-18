@@ -70,10 +70,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
             "notifications/initialized" | "notifications/cancelled" => continue,
 
-            "tools/list" => match proxy_tools_list(&home, &mut conn) {
+            "tools/list" => match proxy_tools_list_with_retry(&home, &mut conn) {
                 Ok(r) => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": r}).to_string(),
-                Err(_) => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"tools": []}})
-                    .to_string(),
+                Err(e) => {
+                    // #879v4 C2 — Bug 2 fix: a `tools/list` failure surfaces
+                    // as a visible JSON-RPC error so operators see daemon
+                    // unavailability instead of an unexplained empty tool
+                    // list (the previous `{tools: []}` silent-degrade was
+                    // the same antipattern shape as #881 noop_guard).
+                    eprintln!("agend-mcp-bridge: tools/list failed after retry: {e}");
+                    serde_json::json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "error": {"code": -32603, "message": format!("daemon not ready: {e}")}
+                    })
+                    .to_string()
+                }
             },
 
             "tools/call" => {
@@ -136,16 +147,51 @@ fn proxy_tool_call(
     }
 }
 
-fn proxy_tools_list(
+/// Poll `mcp_tools_list` at a fixed cadence until it succeeds or the
+/// deadline expires. Covers the residual sub-millisecond race between
+/// `api::serve` thread start and the TCP `bind` + `api.port` write that
+/// remains even after the #879v4 C1 daemon reorder.
+///
+/// Retry is gated to TRANSPORT failures only (no run dir, connection
+/// refused, broken pipe, etc.). Application-level errors — the daemon
+/// answered with `ok:false` — propagate immediately so the caller sees
+/// the real diagnostic instead of looping on a deterministic failure.
+///
+/// Default budget 30 s — well above any observed startup time on a 9-agent
+/// fleet — overridable via `AGEND_BRIDGE_TOOLS_LIST_TIMEOUT_MS` for tests.
+/// On exhaustion the last transport error propagates; callers convert to a
+/// visible JSON-RPC error, never a silent empty tool list (Bug 2 contract).
+fn proxy_tools_list_with_retry(
     home: &Path,
     conn: &mut Option<(BufReader<TcpStream>, TcpStream)>,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let timeout_ms: u64 = std::env::var("AGEND_BRIDGE_TOOLS_LIST_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30_000);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let interval = std::time::Duration::from_millis(100);
     let envelope = serde_json::json!({"method": "mcp_tools_list", "params": {}});
-    let resp = proxy_request(home, conn, &envelope)?;
-    if resp["ok"].as_bool() == Some(true) {
-        Ok(resp["result"].clone())
-    } else {
-        Err("daemon error on tools_list".into())
+    loop {
+        match proxy_request(home, conn, &envelope) {
+            Ok(resp) => {
+                if resp["ok"].as_bool() == Some(true) {
+                    return Ok(resp["result"].clone());
+                }
+                let msg = resp["error"]
+                    .as_str()
+                    .unwrap_or("daemon error on tools_list");
+                return Err(msg.into());
+            }
+            Err(e) => {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return Err(e);
+                }
+                let remaining = deadline - now;
+                std::thread::sleep(interval.min(remaining));
+            }
+        }
     }
 }
 
