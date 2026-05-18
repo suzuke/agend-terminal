@@ -120,6 +120,21 @@ pub(crate) fn handle_delete(params: &Value, ctx: &HandlerCtx) -> Value {
     json!({"ok": true})
 }
 
+/// Parse the SPAWN-RPC `env` field into a `HashMap` of process env vars.
+/// Non-string values are dropped (the SPAWN schema accepts string-string
+/// only — this matches `agent::build_command`'s `cmd.env(k, v)` shape).
+/// `None` here is "no override" (caller will fall back to fleet); the
+/// caller distinguishes "no env field" from "explicit empty map" by
+/// checking the original `Value` shape if that semantic ever matters.
+fn parse_env_object(value: Option<&Value>) -> Option<std::collections::HashMap<String, String>> {
+    let obj = value?.as_object()?;
+    Some(
+        obj.iter()
+            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+            .collect(),
+    )
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
     let name = match params["name"].as_str() {
@@ -169,6 +184,22 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
         .filter(|s| !s.is_empty());
     super::prepare_instructions(ctx.home, name, command, &work_dir, explicit_role);
 
+    // #900 hybrid (b)+(c): env precedence is params.env > fleet.yaml
+    // resolved env > none. `params.env` lets the SPAWN caller pass an
+    // explicit override (MCP start_instance forwards the already-resolved
+    // env from its own fleet load; future explicit-env spawners do too);
+    // the fleet fallback covers deploy_template Phase 3 + operator
+    // hand-edited fleet.yaml entries where the wire payload omits env.
+    let env_from_params = parse_env_object(params.get("env"));
+    let env_from_fleet = if env_from_params.is_none() {
+        crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(ctx.home))
+            .ok()
+            .and_then(|f| f.resolve_instance(name).map(|r| r.env))
+    } else {
+        None
+    };
+    let env_for_spawn = env_from_params.as_ref().or(env_from_fleet.as_ref());
+
     match crate::api::spawn_one(
         ctx.home,
         ctx.registry,
@@ -178,6 +209,7 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
         spawn_mode,
         &work_dir,
         size,
+        env_for_spawn,
     ) {
         Ok(_spawn_mode) => {
             // Every API-level spawn gets a channel topic (no-op when
@@ -635,6 +667,7 @@ mod tests {
             crate::backend::SpawnMode::Fresh,
             &work_dir,
             size,
+            None,
         );
         assert!(result.is_ok(), "spawn_one must succeed: {result:?}");
 

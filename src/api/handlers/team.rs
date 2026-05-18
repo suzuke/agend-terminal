@@ -129,6 +129,19 @@ pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
     let size = crossterm::terminal::size().unwrap_or((120, 40));
     for (inst_name, backend, work_dir) in &planned {
         super::prepare_instructions(ctx.home, inst_name, backend, work_dir, None);
+        // #900: resolve the just-written fleet.yaml entry so any
+        // operator-supplied `env:` (or `defaults.env`) reaches the
+        // spawned process. The entry is in fleet.yaml at this point
+        // (Phase 1 above wrote it), so resolve_instance returns the
+        // merged defaults+instance map. CREATE_TEAM-time team members
+        // currently have env: None at write-time (line 110), but
+        // operator hand-edits and downstream replace_instance flows
+        // can populate env on the entry between the write and this
+        // re-read — we honour whatever the disk says.
+        let resolved_env =
+            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(ctx.home))
+                .ok()
+                .and_then(|f| f.resolve_instance(inst_name).map(|r| r.env));
         match crate::api::spawn_one(
             ctx.home,
             ctx.registry,
@@ -138,6 +151,7 @@ pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
             crate::backend::SpawnMode::Fresh,
             work_dir,
             size,
+            resolved_env.as_ref(),
         ) {
             Ok(_) => {
                 tracing::info!(team = team_name, member = %inst_name, backend = %backend, "CREATE_TEAM spawn ok");

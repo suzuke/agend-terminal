@@ -320,6 +320,15 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
                 params["args"] = serde_json::json!(args.join(" "));
             }
         }
+        // #900: forward the template's env directly so handle_spawn
+        // applies it without re-reading fleet.yaml for what we just
+        // wrote there. Skip empty maps so the fleet-fallback path in
+        // handle_spawn still wins for "no override" instances.
+        if let Some(ref env) = entry.env {
+            if !env.is_empty() {
+                params["env"] = serde_json::to_value(env).unwrap_or(serde_json::Value::Null);
+            }
+        }
         let _ = crate::api::call(
             home,
             &serde_json::json!({

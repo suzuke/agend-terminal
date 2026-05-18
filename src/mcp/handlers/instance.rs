@@ -169,12 +169,19 @@ pub(super) fn handle_start_instance(home: &Path, args: &Value) -> Value {
     match config.resolve_instance(name) {
         Some(resolved) => {
             let cmd_args = resolved.args.join(" ");
+            // #900: forward the resolved env explicitly so the daemon's
+            // SPAWN handler doesn't have to re-read fleet.yaml for what
+            // we already have in hand. params.env wins over the fleet
+            // fallback in handle_spawn, which keeps this RPC the
+            // single-source-of-truth for the instance start.
+            let env_json = serde_json::to_value(&resolved.env).unwrap_or(serde_json::Value::Null);
             match crate::api::call(
                 home,
                 &json!({"method": crate::api::method::SPAWN, "params": {
                     "name": name, "backend": resolved.backend_command, "args": cmd_args,
                     "mode": "resume",
                     "working_directory": resolved.working_directory.map(|p| p.display().to_string()),
+                    "env": env_json,
                 }}),
             ) {
                 Ok(resp) if resp["ok"].as_bool() == Some(true) => json!({"name": name}),
@@ -641,19 +648,38 @@ fn spawn_single_instance(home: &Path, instance_name: &str, args: &Value) -> Valu
         .get("backend")
         .and_then(|v| v.as_str())
         .map(String::from);
+    // #900: forward operator-supplied `env` through the SPAWN RPC AND
+    // record it on the fleet.yaml entry. The runtime payload lets the
+    // daemon's handle_spawn apply it directly (no second fleet.yaml
+    // read); the persisted entry covers replace_instance / restart
+    // flows that re-resolve from disk later. Non-string values are
+    // filtered out at the daemon side via `parse_env_object`.
+    let env_value: Option<Value> = args.get("env").filter(|v| v.is_object()).cloned();
+    let env_for_entry: Option<std::collections::HashMap<String, String>> =
+        env_value.as_ref().and_then(|v| {
+            v.as_object().map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, val)| val.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+        });
     let (layout, target_pane_owned) =
         resolve_team_layout(home, name, args.get("layout"), args.get("target_pane"));
     let target_pane = target_pane_owned.as_deref();
 
+    let mut spawn_params = json!({
+        "name": name, "backend": command, "args": &cmd_args,
+        "working_directory": work_dir,
+        "layout": layout, "spawner": instance_name,
+        "target_pane": target_pane,
+        "role": role,
+    });
+    if let Some(env) = env_value.as_ref() {
+        spawn_params["env"] = env.clone();
+    }
     match crate::api::call(
         home,
-        &json!({"method": crate::api::method::SPAWN, "params": {
-            "name": name, "backend": command, "args": &cmd_args,
-            "working_directory": work_dir,
-            "layout": layout, "spawner": instance_name,
-            "target_pane": target_pane,
-            "role": role,
-        }}),
+        &json!({"method": crate::api::method::SPAWN, "params": spawn_params}),
     ) {
         Ok(resp) if resp["ok"].as_bool() == Some(true) => {
             let entry = crate::fleet::InstanceYamlEntry {
@@ -678,7 +704,7 @@ fn spawn_single_instance(home: &Path, instance_name: &str, args: &Value) -> Valu
                 github_login: None,
                 args: None,
                 model: None,
-                env: None,
+                env: env_for_entry,
                 ready_pattern: None,
                 command: None,
                 worktree: None,

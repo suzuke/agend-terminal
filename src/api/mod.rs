@@ -482,6 +482,14 @@ fn spawn_peer_pid_watcher(pid: u32, stream: std::net::TcpStream) {
 
 /// Spawn a single agent, register it, and start its TUI socket thread.
 /// Shared by the SPAWN and CREATE_TEAM API handlers.
+///
+/// `env` carries the resolved process env to apply on top of inherited
+/// vars (post sensitive-env deny-list filter; see
+/// `agent::is_sensitive_env_key`). Callers are expected to resolve from
+/// `params.env` or `FleetConfig::resolve_instance(name).env` BEFORE
+/// invoking — `spawn_one` is a pure data consumer here, not a re-resolver,
+/// so a single canonical resolve site at the handler boundary stays
+/// authoritative (#900 hybrid (b)+(c) design).
 #[allow(clippy::too_many_arguments)]
 fn spawn_one(
     home: &Path,
@@ -492,6 +500,7 @@ fn spawn_one(
     spawn_mode: crate::backend::SpawnMode,
     work_dir: &Path,
     size: (u16, u16),
+    env: Option<&std::collections::HashMap<String, String>>,
 ) -> anyhow::Result<crate::backend::SpawnMode> {
     std::fs::create_dir_all(work_dir).ok();
     // Sprint 34: clear stale metadata from a previous instance with the
@@ -515,7 +524,7 @@ fn spawn_one(
             spawn_mode,
             cols: size.0,
             rows: size.1,
-            env: None,
+            env,
             working_dir: Some(work_dir),
             submit_key: preset_submit_key,
             home: Some(home),
