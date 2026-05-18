@@ -892,4 +892,152 @@ mod tests {
             "border_drag must be cleared on mouse-up"
         );
     }
+
+    // ----- #901: Down(Left) on mouse-forwarded pane must focus that pane -----
+
+    use serial_test::serial;
+
+    /// AGEND_HOME isolation for tests that call `handle()` and hit the
+    /// forward path (which writes a metadata file via
+    /// `notification_queue::record_input_activity`). `#[serial]` callers
+    /// guarantee env-var swaps don't race.
+    struct ScopedHome {
+        prev: Option<String>,
+        dir: std::path::PathBuf,
+    }
+    impl ScopedHome {
+        fn new(tag: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("agend-901-{}-{}", tag, std::process::id()));
+            std::fs::create_dir_all(&dir).ok();
+            let prev = std::env::var("AGEND_HOME").ok();
+            std::env::set_var("AGEND_HOME", &dir);
+            Self { prev, dir }
+        }
+    }
+    impl Drop for ScopedHome {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(p) => std::env::set_var("AGEND_HOME", p),
+                None => std::env::remove_var("AGEND_HOME"),
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn empty_registry() -> crate::agent::AgentRegistry {
+        std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    fn down_left_at(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::empty(),
+        }
+    }
+
+    /// Build a two-pane vertical split with left at id=1, right at id=2.
+    /// Pane 1 occupies columns 0..10, pane 2 occupies columns 10..20.
+    /// Both panes are 10 rows tall starting at row 1 (row 0 is the tab bar).
+    fn two_pane_layout(right_agent: &str) -> Layout {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("multi".to_string(), leaf(1, "left")));
+        layout.tabs[0].split_focused(SplitDir::Vertical, leaf(2, right_agent));
+        layout.active = 0;
+        layout.tabs[0].pane_rects.insert(1, (0, 1, 10, 10));
+        layout.tabs[0].pane_rects.insert(2, (10, 1, 10, 10));
+        layout
+    }
+
+    /// #901 contract: clicking the body of a mouse-forwarded pane (e.g.
+    /// OpenCode) MUST focus that pane, even though the click is forwarded
+    /// to the backend's PTY. Pre-fix, `mouse::handle` early-returned after
+    /// the SGR forward (lines 62-67) and never ran `handle_down`, leaving
+    /// `tab.focus_id` pointing at the previously-focused pane. The
+    /// operator workaround was to click the pane title bar instead.
+    ///
+    /// RED at parent SHA: focus stays on the left pane.
+    /// GREEN after the top-level pre-focus fix: focus moves to the pane
+    /// under the cursor BEFORE the forward early-return runs.
+    #[test]
+    #[serial]
+    fn pane_body_down_focuses_pane_even_when_mouse_forwarded() {
+        let _home = ScopedHome::new("focus-forwarded");
+
+        let mut layout = two_pane_layout("opencode");
+        layout.tabs[0].focus_id = 1;
+        enable_opencode_mouse(layout.tabs[0].root_mut().find_pane_mut(2).unwrap());
+
+        // Precondition: opencode pane IS the mouse-forward target — without
+        // this the test wouldn't be exercising the bug path.
+        let click = down_left_at(15, 5);
+        assert!(
+            super::pane_for_mouse_forward(&layout, &click).is_some(),
+            "test precondition: opencode pane under cursor must be the forward target"
+        );
+
+        let mut state = MouseState::default();
+        let fleet_path = std::path::Path::new("/nonexistent/fleet.yaml");
+        super::handle(
+            click,
+            &mut layout,
+            &mut state,
+            fleet_path,
+            &empty_registry(),
+        );
+
+        assert_eq!(
+            layout.tabs[0].focus_id, 2,
+            "Down(Left) on mouse-forwarded pane body MUST update focus_id \
+             (started at 1, expected 2 after fix); operator-visible symptom \
+             is clicking OpenCode pane body doesn't focus it"
+        );
+    }
+
+    /// #783/#700 invariant regression-guard: non-mouse panes
+    /// (claude/codex/kiro/gemini) must still route Down(Left) through the
+    /// local `handle_down` path so `handle_selection` updates both
+    /// `focus_id` AND `selecting_pane`. The top-level pre-focus block
+    /// only runs when `pane_for_mouse_forward` matches; for non-mouse
+    /// panes it is a no-op and the legacy local-dispatch path must
+    /// remain intact, including selection-cache state.
+    #[test]
+    #[serial]
+    fn pane_body_down_on_non_mouse_pane_still_updates_focus_via_local_path() {
+        let _home = ScopedHome::new("focus-local");
+
+        let mut layout = two_pane_layout("right");
+        layout.tabs[0].focus_id = 1;
+        // No `enable_opencode_mouse` — neither pane wants mouse.
+
+        let click = down_left_at(15, 5);
+        assert!(
+            super::pane_for_mouse_forward(&layout, &click).is_none(),
+            "test precondition: no pane wants mouse → forward returns None"
+        );
+
+        let mut state = MouseState::default();
+        let fleet_path = std::path::Path::new("/nonexistent/fleet.yaml");
+        super::handle(
+            click,
+            &mut layout,
+            &mut state,
+            fleet_path,
+            &empty_registry(),
+        );
+
+        assert_eq!(
+            layout.tabs[0].focus_id, 2,
+            "non-mouse pane body click must still update focus via \
+             handle_down → handle_selection (legacy path)"
+        );
+        assert_eq!(
+            layout.tabs[0].selecting_pane,
+            Some(2),
+            "handle_selection MUST cache selecting_pane on Down so drag \
+             continues against the same pane"
+        );
+    }
 }
