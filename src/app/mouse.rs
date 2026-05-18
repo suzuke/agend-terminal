@@ -50,6 +50,22 @@ pub(super) fn handle(
 ) -> MouseOutcome {
     let mut out = MouseOutcome::default();
 
+    // #901: pre-focus on Down(Left) BEFORE the forward decision below.
+    // Without this, a click on a mouse-forwarded pane's body (OpenCode
+    // and any future backend that enables SGR mouse) early-returns at
+    // the forward arm and never reaches `handle_down`/`handle_selection`,
+    // so `tab.focus_id` stays put — operator clicks pane body, focus
+    // doesn't move. Pre-focusing at the top is backend-agnostic and
+    // leaves the forward path itself untouched (Down still reaches the
+    // backend so OpenCode's internal buttons still work).
+    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        if let Some((pane_id, _, _)) = pane_for_mouse_forward(layout, &mouse) {
+            if let Some(tab) = layout.active_tab_mut() {
+                tab.focus_id = pane_id;
+            }
+        }
+    }
+
     // #700 + #783: If a pane's terminal wants mouse events AND shift is not
     // held, forward the event as SGR mouse report to the PTY instead of local
     // handling. The routing decision lives in `pane_for_mouse_forward` so it
