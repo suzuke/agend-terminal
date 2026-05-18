@@ -3455,4 +3455,144 @@ mod tests {
             "[1 photo attached]"
         );
     }
+
+    // ── #911 dedup-gate anchor (C0 RED) ─────────────────────────────────
+    //
+    // Locks the (A)+(B) hybrid gate contract that C1 lands at
+    // `compose_aware_inject`. Pre-C1 the predicate fn doesn't exist:
+    // these tests compile-fail at C0 = §3.10 RED anchor. C1 introduces
+    // `should_suppress_911_reinject_with_ledger` + gate-wires and the
+    // tests flip GREEN.
+    //
+    // Test names track the synthesis spec verbatim (lead-locked):
+    //   1. ledger-hit suppression
+    //   2. event-header pass-through
+    //   3. JSONL fallback on ledger MISS (closes H6 TTL eviction)
+    //   4. integration: enqueue → notify → drain → direct-inject → no PTY
+    //   5. predicate tightness: non-[AGEND-MSG] content with stray id=
+
+    #[test]
+    fn compose_aware_inject_suppressed_after_drain_for_same_msg_id_911() {
+        let home = tmp_home("911-ledger-hit");
+        let agent = "lead-911-ledger-hit";
+        let msg_id = "m-911-ledger-hit-UNIQ";
+
+        let ledger = crate::daemon::notification_dedup::Ledger::default();
+        ledger.record_inject(agent, msg_id);
+        ledger.mark_consumed(agent, msg_id);
+
+        let header = format!("[AGEND-MSG] from=test kind=task size=42 id={msg_id}");
+        let suppressed = should_suppress_911_reinject_with_ledger(&home, agent, &header, &ledger);
+
+        assert!(
+            suppressed,
+            "consumed ledger entry MUST suppress reinject (fast path B)"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn compose_aware_inject_event_header_not_gated_by_dedup_911() {
+        let home = tmp_home("911-event-pass");
+        let agent = "lead-911-event-pass";
+
+        let ledger = crate::daemon::notification_dedup::Ledger::default();
+        let event_header = format_event_header("interrupt", &[("reason", "operator stop")]);
+
+        let suppressed =
+            should_suppress_911_reinject_with_ledger(&home, agent, &event_header, &ledger);
+
+        assert!(
+            !suppressed,
+            "event headers (no id=) MUST NEVER be suppressed — not message-bound"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn compose_aware_inject_suppressed_via_jsonl_fallback_when_ledger_evicted_911() {
+        let home = tmp_home("911-jsonl-fallback");
+        let agent = "lead-911-jsonl-fallback";
+        let msg_id = "m-911-jsonl-fallback-UNIQ";
+
+        // Empty ledger — simulates H6 TTL eviction (entry was recorded
+        // + consumed 10+ min ago, sweep removed it).
+        let ledger = crate::daemon::notification_dedup::Ledger::default();
+
+        // Manually seed the inbox JSONL with a drained msg.
+        let mut msg = make_msg("dev-2", "fallback body");
+        msg.id = Some(msg_id.to_string());
+        msg.read_at = Some("2026-05-18T00:00:00Z".to_string());
+        enqueue(&home, agent, msg).unwrap();
+
+        let header = format!("[AGEND-MSG] from=dev-2 kind=task size=10 id={msg_id}");
+        let suppressed = should_suppress_911_reinject_with_ledger(&home, agent, &header, &ledger);
+
+        assert!(
+            suppressed,
+            "JSONL fallback MUST catch drained msg when ledger has no entry (closes H6 TTL race)"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn enqueue_notify_drain_then_direct_inject_no_pty_911() {
+        // Integration: real flow through enqueue + drain. The global
+        // ledger gets the `mark_consumed` callback as a side effect of
+        // `drain`. Unique agent + msg_id to avoid pollution from
+        // other tests running on the same process-singleton ledger.
+        let home = tmp_home("911-integration");
+        let agent = "lead-911-integration-UNIQ";
+        let msg_id = "m-911-integration-UNIQ";
+
+        let mut msg = make_msg("dev-2", "integration body");
+        msg.id = Some(msg_id.to_string());
+
+        enqueue(&home, agent, msg).unwrap();
+        crate::daemon::notification_dedup::global().record_inject(agent, msg_id);
+
+        let drained = drain(&home, agent);
+        assert_eq!(drained.len(), 1, "exactly one msg should drain");
+
+        let header = format_header(&drained[0]);
+
+        let suppressed = should_suppress_911_reinject_with_ledger(
+            &home,
+            agent,
+            &header,
+            crate::daemon::notification_dedup::global(),
+        );
+
+        assert!(
+            suppressed,
+            "after enqueue → record_inject → drain (which marks consumed in global ledger), \
+             a direct re-inject of the same msg's header MUST be suppressed"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn compose_aware_inject_non_agend_msg_header_pass_through_911() {
+        let home = tmp_home("911-predicate-tight");
+        let agent = "lead-911-predicate-tight";
+
+        let ledger = crate::daemon::notification_dedup::Ledger::default();
+
+        // Non-canonical prefix but contains literal `id=` substring.
+        // Could be free-form chat text quoting a msg_id. MUST NOT be gated.
+        let non_agend = "Some chat message that happens to contain id=m-fake-12345 inline.";
+
+        let suppressed = should_suppress_911_reinject_with_ledger(&home, agent, non_agend, &ledger);
+
+        assert!(
+            !suppressed,
+            "non-[AGEND-MSG] content MUST pass through gate even with stray id= substring"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
