@@ -53,13 +53,9 @@ pub static GUARD_FIRES: AtomicU64 = AtomicU64::new(0);
 /// Read the current guard-fire counter. Zero means the guard has not
 /// caught any recursive-spawn attempt since this process started.
 ///
-/// Exposed for soak-window monitoring (e.g. `agend-terminal doctor` could
-/// surface this alongside other health checks). Not yet wired to a CLI
-/// surface — the `tracing::error!` event with `spike_879v3_guard_fire`
-/// tag and the lead-inbox auto-notify are the primary observability
-/// channels during the 24-48hr soak. Marker preserved so a follow-up can
-/// land a `--detailed` field with one line.
-#[allow(dead_code)]
+/// Surfaced via `agend-terminal status` / `list` / `status --json` (under
+/// the `agend_spawn_depth_guard_fires` key) so soak-window monitoring
+/// scripts can grep / jq for the value without parsing daemon.log lines.
 pub fn fire_count() -> u64 {
     GUARD_FIRES.load(Ordering::Relaxed)
 }

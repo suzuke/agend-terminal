@@ -233,6 +233,40 @@ fn invariant_no_noop_guard_in_err_arms() {
     );
 }
 
+/// #879v3 safeguard 3 + 7 surface pin: the `agend-terminal status` /
+/// `list` output MUST include the `agend_spawn_depth_guard_fires` key
+/// (JSON shape) or the `AGEND_SPAWN_DEPTH guard fires:` line (plain
+/// shape) so soak-window monitoring scripts can read the counter
+/// without parsing daemon.log. Pre-fix (review at 821b27d): grep for
+/// `fire_count(` outside `src/bootstrap/spawn_depth.rs` returned ZERO
+/// hits, which is the gap reviewer flagged.
+///
+/// Post-fix: `src/main.rs`'s `Commands::List` arm reads
+/// `spawn_depth::fire_count()` and surfaces it in every output branch
+/// (json, detailed-text, plain-list, no-daemon).
+#[test]
+fn main_status_command_surfaces_guard_fire_counter() {
+    let text = read_text("src/main.rs");
+    assert!(
+        text.contains("spawn_depth::fire_count()"),
+        "src/main.rs must call `crate::bootstrap::spawn_depth::fire_count()` \
+         inside the Commands::List arm so `agend-terminal status` surfaces \
+         the AGEND_SPAWN_DEPTH guard counter for soak monitoring"
+    );
+    assert!(
+        text.contains("agend_spawn_depth_guard_fires"),
+        "src/main.rs must surface the guard counter under the \
+         `agend_spawn_depth_guard_fires` JSON key — soak scripts grep / jq \
+         for this exact name"
+    );
+    assert!(
+        text.contains("AGEND_SPAWN_DEPTH guard fires:"),
+        "src/main.rs must emit the `AGEND_SPAWN_DEPTH guard fires:` plain \
+         line so operators reading `agend-terminal status` (without --json) \
+         see the counter"
+    );
+}
+
 /// Pin the deny-list: `AGEND_SPAWN_DEPTH` must be a sensitive env key, so
 /// fleet.yaml templates and host env CANNOT override the depth value
 /// (would create a back door to disable the guard).

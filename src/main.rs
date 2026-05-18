@@ -673,28 +673,49 @@ fn main() -> anyhow::Result<()> {
             // even when the daemon API is briefly unresponsive (the
             // historical reason `list` and `status` were two commands).
             let want_detailed = detailed || json;
+            // #879v3 safeguard 3+7: surface AGEND_SPAWN_DEPTH guard fires so
+            // operators can grep `agend-terminal status --json | jq .agend_spawn_depth_guard_fires`
+            // during the 24-48hr soak. Any non-zero value triggers the
+            // documented revert criterion. The counter reads from the
+            // calling process — same-process visibility is sufficient
+            // because guard fires only happen at spawn sites, which all
+            // call into this binary.
+            let guard_fires = crate::bootstrap::spawn_depth::fire_count();
             if want_detailed {
                 match api::call(&home, &serde_json::json!({"method": api::method::LIST})) {
                     Ok(resp) => {
                         if json {
+                            // Surface guard_fires alongside the daemon's response so a
+                            // single `status --json` invocation captures everything an
+                            // operator needs for soak monitoring.
+                            let mut payload = resp["result"].clone();
+                            if let Some(obj) = payload.as_object_mut() {
+                                obj.insert(
+                                    "agend_spawn_depth_guard_fires".to_string(),
+                                    serde_json::Value::from(guard_fires),
+                                );
+                            }
                             println!(
                                 "{}",
-                                serde_json::to_string_pretty(&resp["result"]).unwrap_or_default()
+                                serde_json::to_string_pretty(&payload).unwrap_or_default()
                             );
-                        } else if let Some(agents) = resp["result"]["agents"].as_array() {
-                            if agents.is_empty() {
-                                println!("No agents running.");
-                            } else {
-                                for a in agents {
-                                    println!(
-                                        "  {}: state={} health={} cmd={}",
-                                        a["name"].as_str().unwrap_or("?"),
-                                        a["agent_state"].as_str().unwrap_or("?"),
-                                        a["health_state"].as_str().unwrap_or("?"),
-                                        a["backend"].as_str().unwrap_or("?")
-                                    );
+                        } else {
+                            if let Some(agents) = resp["result"]["agents"].as_array() {
+                                if agents.is_empty() {
+                                    println!("No agents running.");
+                                } else {
+                                    for a in agents {
+                                        println!(
+                                            "  {}: state={} health={} cmd={}",
+                                            a["name"].as_str().unwrap_or("?"),
+                                            a["agent_state"].as_str().unwrap_or("?"),
+                                            a["health_state"].as_str().unwrap_or("?"),
+                                            a["backend"].as_str().unwrap_or("?")
+                                        );
+                                    }
                                 }
                             }
+                            println!("AGEND_SPAWN_DEPTH guard fires: {guard_fires}");
                         }
                     }
                     Err(_) => daemon_not_running_hint(),
@@ -711,8 +732,13 @@ fn main() -> anyhow::Result<()> {
                 for a in &agents {
                     println!("  {a}");
                 }
+                // #879v3 safeguard 3+7: surface guard fires on the plain
+                // list output too — same soak-monitor signal regardless
+                // of which output shape the operator chose.
+                println!("AGEND_SPAWN_DEPTH guard fires: {guard_fires}");
             } else {
                 println!("No running daemon found.");
+                println!("AGEND_SPAWN_DEPTH guard fires: {guard_fires}");
             }
         }
         Some(Commands::Kill { name }) => {

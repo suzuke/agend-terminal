@@ -506,8 +506,18 @@ fn run_core(
     // Per-agent stall detector — see daemon::supervisor module-doc.
     // Pushes vterm tail to channel topic when an agent stalls pre-ready.
     // Fire-and-forget: detector tick loop runs for the daemon process lifetime.
-    // Unix-only (the supervisor itself is Unix-only).
-    #[cfg(unix)]
+    //
+    // #879v3 PR2: the `#[cfg(unix)]` gate that previously sat here is
+    // removed. Pre-PR2, the symbol was kept alive on Windows by the app-
+    // mode call site in `app::run_app`'s Owned branch (no cfg gate there).
+    // C3 removed that branch in the always-Attached refactor, which
+    // exposed the supervisor + its transitive dependents as dead-on-
+    // Windows (CI: 126 dead_code errors with `-D warnings`). The
+    // supervisor body itself contains no Unix-only syscalls (verified by
+    // grep for `libc::`, `nix::`, `process_group`); the Unix-only label
+    // was conservative. Running it on Windows is at worst a no-op tick
+    // loop scanning an empty registry — same behavior as the pre-PR2
+    // Owned-mode app spawn on Windows.
     supervisor::spawn(home.to_path_buf(), Arc::clone(&registry));
     router::spawn(home.to_path_buf(), Arc::clone(&registry));
     crate::instance_monitor::spawn_monitor_tick(home.to_path_buf(), Arc::clone(&registry));
