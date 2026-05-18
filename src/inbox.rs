@@ -1102,9 +1102,106 @@ pub fn notify_agent_with_attachments(
 /// the pre-#81 behavior of actually delivering Telegram / notify_agent
 /// traffic to backends that don't poll inbox on their own.
 pub fn compose_aware_inject(home: &Path, agent_name: &str, notification: &str) {
+    // #911 dedup gate: (A)+(B) hybrid against the canonical
+    // `[AGEND-MSG]` header. Returns early when the msg was already
+    // consumed by the recipient — closes the operator-observable
+    // "header arrives after inbox drain" symptom.
+    //
+    // Mitigation-first: this is symptom containment + observability,
+    // not root-cause attribution. The producer paths that fire stale
+    // notify_agent calls are not (yet) identified; daemon-side log
+    // instrumentation is filed as a separate follow-up.
+    if should_suppress_911_reinject_with_ledger(
+        home,
+        agent_name,
+        notification,
+        crate::daemon::notification_dedup::global(),
+    ) {
+        return;
+    }
     let _ = route_notification(home, agent_name, notification, |msg| {
         inject_with_submit(home, agent_name, msg)
     });
+}
+
+/// #911 dedup gate predicate. Hybrid (A)+(B) suppression check for
+/// a candidate PTY notification:
+///
+/// - **Fast path (B)** — `notification_dedup` ledger. If the
+///   `(agent, msg_id)` entry exists AND is flagged consumed AND
+///   within the 10-min TTL, suppress.
+/// - **Fallback path (A)** — when the ledger has no entry (TTL
+///   evicted at 10 min OR never recorded), read the agent's inbox
+///   JSONL for `msg_id` and check `read_at`. If `Some(_)`, the msg
+///   was drained — suppress.
+///
+/// Returns `true` to suppress, `false` to allow inject through.
+///
+/// Scope predicate: only canonical `[AGEND-MSG]` headers with an
+/// `id=` token. Free-form text and event-style headers (no `id=`)
+/// always return `false` — they aren't message-bound.
+///
+/// The two-path design closes H6 (cross-audit `m-20260518162253458320-159`):
+/// stale re-injects > 10 min post-drain miss the ledger but still get
+/// caught by the JSONL source-of-truth.
+///
+/// Production callers (compose_aware_inject) pass
+/// `notification_dedup::global()`. Tests construct local
+/// `Ledger::default()` instances for isolation.
+pub(crate) fn should_suppress_911_reinject_with_ledger(
+    home: &Path,
+    agent_name: &str,
+    notification: &str,
+    ledger: &crate::daemon::notification_dedup::Ledger,
+) -> bool {
+    // Reviewer condition C: only canonical `HEADER_PREFIX` headers
+    // gate (the ANSI-wrapped `[AGEND-MSG]` produced by `format_header`
+    // and `format_event_header`). Stray `id=` in free-form chat
+    // content with no ANSI prefix must NOT trigger.
+    if !notification.starts_with(HEADER_PREFIX) {
+        return false;
+    }
+    let Some(msg_id) = crate::daemon::notification_dedup::extract_msg_id_from_header(notification)
+    else {
+        return false;
+    };
+    // Fast path (B): in-memory ledger.
+    if ledger.should_suppress_reinject(agent_name, &msg_id) {
+        tracing::info!(
+            agent = %agent_name,
+            msg_id = %msg_id,
+            "#911 compose_aware_inject suppressed: dedup ledger hit"
+        );
+        return true;
+    }
+    // Fallback (A): JSONL read_at source-of-truth.
+    if msg_already_drained_in_jsonl(home, agent_name, &msg_id) {
+        tracing::info!(
+            agent = %agent_name,
+            msg_id = %msg_id,
+            "#911 compose_aware_inject suppressed: JSONL fallback (ledger MISS, read_at set)"
+        );
+        return true;
+    }
+    false
+}
+
+/// Read the agent's inbox JSONL and return `true` iff a message with
+/// the given `msg_id` exists AND has `read_at` set. Best-effort: any
+/// IO/parse error returns `false` so the caller defaults to allowing
+/// the inject through (better operator-visible spurious header than
+/// silently dropped legit retry).
+fn msg_already_drained_in_jsonl(home: &Path, agent_name: &str, msg_id: &str) -> bool {
+    let path = inbox_path(home, agent_name);
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    content.lines().any(|line| {
+        let Ok(msg) = serde_json::from_str::<InboxMessage>(line) else {
+            return false;
+        };
+        msg.id.as_deref() == Some(msg_id) && msg.read_at.is_some()
+    })
 }
 
 /// Compose-aware message delivery with auto-submit: checks `is_composing`
@@ -3481,7 +3578,9 @@ mod tests {
         ledger.record_inject(agent, msg_id);
         ledger.mark_consumed(agent, msg_id);
 
-        let header = format!("[AGEND-MSG] from=test kind=task size=42 id={msg_id}");
+        // Canonical [AGEND-MSG] header includes the HEADER_PREFIX
+        // ANSI wrapping — match production's `format_header` output.
+        let header = format!("{HEADER_PREFIX} from=test id={msg_id} kind=task size=42");
         let suppressed = should_suppress_911_reinject_with_ledger(&home, agent, &header, &ledger);
 
         assert!(
@@ -3527,7 +3626,7 @@ mod tests {
         msg.read_at = Some("2026-05-18T00:00:00Z".to_string());
         enqueue(&home, agent, msg).unwrap();
 
-        let header = format!("[AGEND-MSG] from=dev-2 kind=task size=10 id={msg_id}");
+        let header = format!("{HEADER_PREFIX} from=dev-2 id={msg_id} kind=task size=10");
         let suppressed = should_suppress_911_reinject_with_ledger(&home, agent, &header, &ledger);
 
         assert!(
