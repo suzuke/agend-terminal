@@ -56,6 +56,7 @@ impl TestDaemon {
         // Wave 1 CLI consolidation: the historical `daemon` subcommand was
         // removed; `start --agents <name:cmd ...>` is the canonical
         // replacement.
+        let expected_agents = agents.len();
         let mut args: Vec<&str> = vec!["start", "--agents"];
         args.extend(agents);
 
@@ -79,7 +80,26 @@ impl TestDaemon {
         }
         assert!(found, "daemon API port not published after 6s");
 
-        TestDaemon { child, home }
+        // #879v4 C1 — after the daemon-reorder fix, `api.port` is published
+        // BEFORE the agent spawn loop runs. Wait for the registry to settle
+        // so tests can call `list`/`kill`/`inject` against the expected
+        // agents without racing the staggered spawn loop.
+        let daemon = TestDaemon { child, home };
+        let registered = wait_until(
+            || {
+                let resp = daemon.api_call(&serde_json::json!({"method": "list"}));
+                resp["result"]["agents"]
+                    .as_array()
+                    .map(|a| a.len() == expected_agents)
+                    .unwrap_or(false)
+            },
+            Duration::from_secs(15),
+        );
+        assert!(
+            registered,
+            "agents not registered within 15s of api.port publish (expected {expected_agents})"
+        );
+        daemon
     }
 
     fn find_api_port(home: &Path) -> Option<u16> {
