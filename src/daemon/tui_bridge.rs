@@ -5,36 +5,86 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
-/// Start the TUI socket server for an agent (blocks the calling thread).
+/// Output of the synchronous TUI prep step. Carries the bound TCP
+/// listener and the auth cookie so the async accept loop can resume
+/// without re-reading either from disk.
 ///
-/// Binds a TCP loopback port, publishes it to `{run_dir}/{name}.port`, then
-/// accepts connections. Removes the port file when the listener exits.
-pub fn serve_agent_tui(name: &str, run_dir: &Path, registry: &AgentRegistry) {
-    // P1-10: load the per-daemon cookie once; every incoming TUI client must
-    // present it as the first 32 bytes on the wire. If the cookie file isn't
-    // there yet, the caller (daemon::run / verify::run) skipped its issuance
-    // step — fail closed rather than serve an unauthenticated TUI.
-    let cookie = match crate::auth_cookie::read_cookie(run_dir) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!(agent = name, error = %e, "api.cookie missing; TUI server aborted");
-            return;
-        }
-    };
+/// #896 Option D: separating "bind + publish .port" (sync, returnable
+/// failure) from "accept loop" (async, fire-and-forget) is what lets
+/// `spawn_and_register_agent` block on the publish step.
+pub(crate) struct TuiListenerMeta {
+    listener: std::net::TcpListener,
+    cookie: crate::auth_cookie::Cookie,
+}
 
-    let listener = match crate::ipc::bind_loopback() {
-        Ok(l) => l,
+/// Synchronously bind the agent's TUI loopback socket and publish
+/// `{run_dir}/{name}.port`. Returns the listener + cookie so a
+/// subsequent fire-and-forget accept loop (`serve_tui_accept_loop`)
+/// can take over without redoing the io::Result-bearing setup.
+///
+/// #896 Option D contract: callers that need rollback semantics (the
+/// daemon's startup loop via `spawn_and_register_agent`) MUST call
+/// this directly and propagate the Err. Callers that don't need
+/// rollback (CLI capture, agent shell-fallback, verify probe) can use
+/// `serve_agent_tui` which wraps prep + accept-loop into one
+/// best-effort entrypoint.
+pub(crate) fn prepare_tui_listener_and_publish_port(
+    name: &str,
+    run_dir: &Path,
+) -> std::io::Result<TuiListenerMeta> {
+    // P1-10: load the per-daemon cookie once; every incoming TUI
+    // client must present it as the first 32 bytes on the wire.
+    let cookie = crate::auth_cookie::read_cookie(run_dir).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("api.cookie unavailable: {e}"),
+        )
+    })?;
+    let listener = crate::ipc::bind_loopback()?;
+    let port = crate::ipc::local_port(&listener);
+    crate::ipc::write_port(run_dir, name, port)?;
+    tracing::info!(agent = name, port, "TUI socket ready");
+    Ok(TuiListenerMeta { listener, cookie })
+}
+
+/// All-in-one TUI server for callers that don't need rollback on
+/// prep failure (CLI `capture`, agent crash shell-fallback, verify
+/// probe). Internally runs the synchronous prep + the async accept
+/// loop on the calling thread. Prep failure degrades to a warn-log
+/// and early return, preserving the pre-#896 best-effort shape.
+///
+/// Blocks the calling thread on `incoming()` until the listener is
+/// dropped or the agent is removed from the registry. Callers wanting
+/// rollback semantics should call
+/// [`prepare_tui_listener_and_publish_port`] + [`serve_tui_accept_loop`]
+/// separately so they can react to prep failure.
+pub fn serve_agent_tui(name: &str, run_dir: &Path, registry: &AgentRegistry) {
+    let meta = match prepare_tui_listener_and_publish_port(name, run_dir) {
+        Ok(m) => m,
         Err(e) => {
-            tracing::warn!(agent = name, error = %e, "failed to bind TUI socket");
+            tracing::warn!(
+                agent = name,
+                error = %e,
+                "TUI listener prep failed; server aborted"
+            );
             return;
         }
     };
-    let port = crate::ipc::local_port(&listener);
-    if let Err(e) = crate::ipc::write_port(run_dir, name, port) {
-        tracing::warn!(agent = name, error = %e, "failed to publish TUI port");
-        return;
-    }
-    tracing::info!(agent = name, port, "TUI socket ready");
+    serve_tui_accept_loop(name, meta, registry);
+}
+
+/// Run the TUI accept loop with a pre-bound listener + cookie. Blocks
+/// the calling thread; intended to be spawned fire-and-forget after a
+/// successful synchronous `prepare_tui_listener_and_publish_port`
+/// step. Exits when the listener is dropped or accept errors
+/// terminally (e.g. agent removal via `delete_transaction` closes the
+/// underlying socket file).
+pub(crate) fn serve_tui_accept_loop(
+    name: &str,
+    meta: TuiListenerMeta,
+    registry: &AgentRegistry,
+) {
+    let TuiListenerMeta { listener, cookie } = meta;
 
     for stream in listener.incoming() {
         let mut stream = match stream {
