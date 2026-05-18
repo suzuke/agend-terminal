@@ -675,15 +675,12 @@ fn main() -> anyhow::Result<()> {
                     }
                     Err(_) => daemon_not_running_hint(),
                 }
-            } else if let Some(run) = daemon::find_active_run_dir(&home) {
-                let agents: Vec<String> = std::fs::read_dir(&run)?
-                    .flatten()
-                    .filter_map(|e| {
-                        let n = e.file_name().to_string_lossy().to_string();
-                        n.ends_with(".port").then(|| n[..n.len() - 5].to_string())
-                    })
-                    .filter(|n| n != "api")
-                    .collect();
+            } else if daemon::find_active_run_dir(&home).is_some() {
+                // #910 PR2 of 4: daemon-registry truth via runtime helper.
+                // run_dir presence preserved as the "is there a daemon at
+                // all?" gate so the "No running daemon found" hint at the
+                // bottom branch isn't masked by registry-empty cases.
+                let agents = crate::runtime::list_agents_with_fallback(&home);
                 for a in &agents {
                     println!("  {a}");
                 }

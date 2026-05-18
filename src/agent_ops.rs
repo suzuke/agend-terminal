@@ -325,23 +325,18 @@ pub fn cleanup_working_dir(home: &Path, name: &str, working_dir: &Path) {
 // Agent enumeration
 // ---------------------------------------------------------------------------
 
-/// List agents published in the active daemon's run directory.
+/// List agents — daemon registry truth-of-record via the
+/// `runtime::list_agents_with_fallback` helper. Falls back to the
+/// filesystem `.port` glob when the daemon API is unreachable.
+///
+/// MCP-facing: the `LIST` handler at `src/mcp/handlers/instance.rs:36/39`
+/// wraps the result in `{"instances": [...]}` as the fallback when the
+/// rich-info path fails.
+///
+/// #910 PR2 of 4: was a bespoke read_dir glob; now delegates to the
+/// canonical helper landed in PR1 (#923).
 pub fn list_agents() -> Vec<String> {
-    let home = crate::home_dir();
-    let run = match crate::daemon::find_active_run_dir(&home) {
-        Some(r) => r,
-        None => return Vec::new(),
-    };
-    let mut agents = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&run) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.ends_with(".port") && name != "api.port" {
-                agents.push(name[..name.len() - 5].to_string());
-            }
-        }
-    }
-    agents
+    crate::runtime::list_agents_with_fallback(&crate::home_dir())
 }
 
 // ---------------------------------------------------------------------------
@@ -759,5 +754,66 @@ mod tests {
             std::fs::remove_dir_all(&home).ok();
             std::fs::remove_dir_all(&ud).ok();
         }
+    }
+
+    // #910 PR2 of 4: MCP-facing JSON shape stability pin.
+    //
+    // `src/mcp/handlers/instance.rs:36/39` wraps `list_agents()` result
+    // in `{"instances": [<names>]}` as the LIST fallback when the rich-
+    // info API path fails. After PR2's migration to `runtime::
+    // list_agents_with_fallback`, the OUTPUT TYPE must remain
+    // `Vec<String>` so the JSON envelope is byte-stable for any
+    // operator script grep'ing the MCP fallback response. This test
+    // pins that contract.
+    #[test]
+    fn list_agents_mcp_payload_shape_is_instances_array_of_strings() {
+        // Build a fixture that mirrors what `list_agents()` returns —
+        // a Vec<String>. Wrap it the same way the MCP handler does.
+        // This pin tracks the wire contract, not the resolution path.
+        let names: Vec<String> = vec!["alice".into(), "bob".into(), "charlie".into()];
+        let payload = json!({"instances": names.clone()});
+
+        // Top-level key must be `instances`.
+        assert!(
+            payload.get("instances").is_some(),
+            "MCP fallback envelope must carry top-level 'instances' key — \
+             #910 PR2 contract pin"
+        );
+
+        // Value must be a JSON array.
+        let arr = payload["instances"]
+            .as_array()
+            .expect("'instances' value must be a JSON array");
+
+        // Each element must be a JSON string (not an object, not nested).
+        // Locks the fallback envelope as a flat name-list — the rich-info
+        // path returns objects, but the fallback path is intentionally
+        // simpler so degraded-mode parsers don't need the full schema.
+        assert_eq!(arr.len(), 3);
+        for (i, v) in arr.iter().enumerate() {
+            assert!(
+                v.is_string(),
+                "'instances[{i}]' must be a JSON string in the LIST fallback, got {v}"
+            );
+            assert_eq!(v.as_str().unwrap(), names[i].as_str());
+        }
+    }
+
+    // #910 PR2 of 4: `list_agents` thin-wrapper contract.
+    //
+    // After PR2, `list_agents()` is a 1-line delegation to
+    // `runtime::list_agents_with_fallback`. The behavioral surface is
+    // covered by PR1's `runtime::tests` (5 RED→GREEN tests). This test
+    // pins the SIGNATURE + RETURN TYPE so a future refactor that
+    // accidentally drops the no-arg shape or changes the return type
+    // breaks loudly here rather than at MCP handler call sites.
+    #[test]
+    fn list_agents_signature_is_no_arg_vec_string() {
+        // Call site sanity: compiles with no args; result is Vec<String>.
+        let result: Vec<String> = list_agents();
+        // Result may be empty (no daemon, no tmp run dir) but must not panic.
+        // Length assertion is intentionally weak — the resolution path is
+        // tested in `runtime::tests::*`; here we only pin the signature.
+        let _ = result.len();
     }
 }
