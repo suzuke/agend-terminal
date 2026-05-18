@@ -2223,6 +2223,12 @@ Allow Trust All Tools mode?
     ///
     /// Poll interval is 5ms (the OS scheduling quantum is the floor;
     /// finer polling burns CPU without buying latency improvement).
+    ///
+    /// `#[cfg(unix)]` matches the sole caller (`sweep_child_tree_body`,
+    /// which spawns `sh` + `sleep`) — Windows builds would see an
+    /// orphan helper and trip `-D dead-code` clippy. Drop the gate
+    /// when a Windows-side caller appears.
+    #[cfg(unix)]
     fn wait_for_nonempty_file(
         path: &std::path::Path,
         timeout: std::time::Duration,
