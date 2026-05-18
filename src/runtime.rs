@@ -51,6 +51,7 @@ pub fn list_live_agents(home: &Path) -> Option<HashSet<String>> {
 
 /// Source of truth for the most-recent agent list resolution: API
 /// or filesystem-glob fallback.
+#[allow(dead_code)] // PR1 of 4 foundation — consumed by PR2 caller migration
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AgentListMode {
     Live,
@@ -61,8 +62,10 @@ enum AgentListMode {
 /// instead of every single call. Important because some callers
 /// (e.g. `src/app/mod.rs:621` periodic sync) fire every 2 seconds —
 /// per-call logging would dump ~1800 lines/hr of redundant info.
+#[allow(dead_code)] // PR1 of 4 foundation
 static LAST_MODE: OnceLock<Mutex<Option<AgentListMode>>> = OnceLock::new();
 
+#[allow(dead_code)] // PR1 of 4 foundation
 fn note_mode_transition(new_mode: AgentListMode) {
     let lock = LAST_MODE.get_or_init(|| Mutex::new(None));
     let Ok(mut guard) = lock.lock() else {
@@ -85,7 +88,10 @@ fn note_mode_transition(new_mode: AgentListMode) {
             // First call in process lifetime. One-time info-level entry
             // so operators grepping daemon.log can confirm the helper
             // initialized + observe the initial mode.
-            tracing::info!(?mode, "#910 list_agents_with_fallback: initial mode resolved");
+            tracing::info!(
+                ?mode,
+                "#910 list_agents_with_fallback: initial mode resolved"
+            );
         }
         // Steady-state (Live → Live or Fallback → Fallback): no log.
         _ => {}
@@ -126,6 +132,7 @@ fn note_mode_transition(new_mode: AgentListMode) {
 ///
 /// #910 PR1: foundation helper, zero caller-site changes. PR2-4
 /// migrate the 5 existing `.port`-glob consume sites.
+#[allow(dead_code)] // PR1 of 4 foundation — consumed by PR2 caller migration
 pub fn list_agents_with_fallback(home: &Path) -> Vec<String> {
     let live = list_live_agents(home);
     list_agents_with_fallback_using(home, live)
@@ -135,6 +142,7 @@ pub fn list_agents_with_fallback(home: &Path) -> Vec<String> {
 /// `live` `Option<HashSet>` directly. Lets tests inject the
 /// daemon-registry result without spinning up an in-process API server.
 /// Production callers use the wrapper [`list_agents_with_fallback`].
+#[allow(dead_code)] // PR1 of 4 foundation
 pub(crate) fn list_agents_with_fallback_using(
     home: &Path,
     live: Option<HashSet<String>>,
@@ -182,8 +190,7 @@ mod tests {
     fn setup_run_dir(home: &Path) -> PathBuf {
         let run = home.join("run").join(pid_string());
         fs::create_dir_all(&run).expect("create run_dir");
-        fs::write(run.join(".daemon"), format!("{}:0", pid_string()))
-            .expect("write .daemon");
+        fs::write(run.join(".daemon"), format!("{}:0", pid_string())).expect("write .daemon");
         run
     }
 
