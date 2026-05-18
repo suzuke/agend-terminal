@@ -190,12 +190,10 @@ enum Commands {
         /// Run the daemon in the foreground (blocks the calling shell, stdio
         /// stays attached to the terminal).
         ///
-        /// Sprint 57 Wave 3 PR-2 (#548 Q1): `start` now defaults to detached
-        /// service mode. Pass `--foreground` to keep the legacy blocking
-        /// behaviour — useful for one-shot demos, debugging the daemon's
-        /// own logs, or running under a process supervisor (systemd / launchd
-        /// / Task Scheduler) that owns the lifecycle. Hard cut-over per Q5
-        /// — there is no `--legacy-foreground-default` opt-out.
+        /// `start` defaults to detached service mode. Pass `--foreground` to
+        /// keep the legacy blocking behaviour — useful for debugging the
+        /// daemon's own logs, or running under a process supervisor
+        /// (systemd / launchd / Task Scheduler) that owns the lifecycle.
         #[arg(long)]
         foreground: bool,
         /// Path to fleet.yaml (default: $AGEND_HOME/fleet.yaml).
@@ -289,12 +287,12 @@ enum Commands {
         #[arg(long)]
         quick: bool,
     },
-    /// Sprint 57 Wave 3 PR-3 (#548 Phase 3): cross-platform OS service
-    /// integration. `install` registers the daemon as a user-level
-    /// service (macOS launchd / Linux systemd user / Windows Task
-    /// Scheduler at-logon task). `uninstall` removes it. `status`
-    /// queries the platform service manager for running / stopped /
-    /// not_installed. No admin / root required on any platform.
+    /// Cross-platform OS service integration. `install` registers the
+    /// daemon as a user-level service (macOS launchd / Linux systemd
+    /// user / Windows Task Scheduler at-logon task). `uninstall`
+    /// removes it. `status` queries the platform service manager for
+    /// running / stopped / not_installed. No admin / root required on
+    /// any platform.
     Service {
         #[command(subcommand)]
         action: ServiceAction,
@@ -304,10 +302,10 @@ enum Commands {
         #[command(subcommand)]
         action: Option<DoctorAction>,
     },
-    /// Sprint 60 W2 PR-1 (#P1-1): manage shared skills used by all 5
-    /// backends (Claude Code / Codex / Gemini / OpenCode / Kiro CLI).
-    /// Skills live in `<home>/skills/<name>/` and are surfaced to each
-    /// agent via per-backend symlinks (or copies on Windows) at launch.
+    /// Manage shared skills used by all 5 backends (Claude Code /
+    /// Codex / Gemini / OpenCode / Kiro CLI). Skills live in
+    /// `<home>/skills/<name>/` and are surfaced to each agent via
+    /// per-backend symlinks (or copies on Windows) at launch.
     Skills {
         #[command(subcommand)]
         action: SkillsAction,
@@ -315,8 +313,6 @@ enum Commands {
     /// Menu-bar / system-tray resident app (requires `--features tray`).
     #[cfg(feature = "tray")]
     Tray,
-    /// Interactive demo — experience multi-agent orchestration in 30 seconds
-    Demo,
     /// Interactive setup — detect backends, configure Telegram, generate fleet.yaml
     Quickstart,
     /// Generate bug report with diagnostics, logs, and config
@@ -378,7 +374,7 @@ enum CaptureAction {
     },
 }
 
-/// Sprint 60 W2 PR-1 (#P1-1): subcommands for `agend-terminal skills`.
+/// Subcommands for `agend-terminal skills`.
 #[derive(Subcommand)]
 enum SkillsAction {
     /// Add a skill from a local directory or git URL. The skill name
@@ -417,12 +413,9 @@ enum SkillsAction {
     },
 }
 
-/// Sprint 57 Wave 3 PR-3 (#548 Phase 3) — `agend-terminal service`
-/// subcommand actions. Maps to `service::install / uninstall / status`.
-/// Sprint 59 Wave 2 PR-IMPL (F2 — γ): subcommands for `agend-terminal
-/// doctor`. Default (no subcommand) runs the existing fleet-wide
-/// health check; `topics` adds telegram topic state diagnostic +
-/// optional cleanup.
+/// Subcommands for `agend-terminal doctor`. Default (no subcommand)
+/// runs the existing fleet-wide health check; `topics` adds telegram
+/// topic state diagnostic + optional cleanup.
 #[derive(Subcommand)]
 enum DoctorAction {
     /// Diagnose telegram topic state (live / drift_fleet / stale_registry / orphan).
@@ -827,7 +820,6 @@ fn main() -> anyhow::Result<()> {
         },
         #[cfg(feature = "tray")]
         Some(Commands::Tray) => tray::run(&home)?,
-        Some(Commands::Demo) => cli::run_demo()?,
         Some(Commands::Quickstart) => quickstart::run(&home)?,
         Some(Commands::Bugreport) => bugreport::run(&home)?,
         Some(Commands::Completions { shell }) => {
