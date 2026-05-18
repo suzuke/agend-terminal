@@ -34,7 +34,7 @@
 //!   uncommitted changes (`git status --porcelain` non-empty), the
 //!   tracker **refuses** to release and emits a warn log — mirror of
 //!   the operator-WIP-protection philosophy from #852 PR-C's
-//!   `StashAndSwitchToDefault → WarnDirtyDetached` fall-back.
+//!   `StashAndSwitchToDefault → emit_dirty_detached_warning` fall-back.
 //!
 //! Manual `release_worktree` MCP still works; the auto-release is
 //! idempotent on an already-released binding.
@@ -79,8 +79,8 @@ pub(crate) enum ReleaseDecision {
     SkipNotBound,
     /// Binding present but worktree has uncommitted changes.
     /// **Operator WIP protection** — mirror of #852 PR-C's
-    /// `WarnDirtyDetached` fall-back; refuses to auto-release until
-    /// the operator commits / stashes / explicitly releases.
+    /// `emit_dirty_detached_warning` fall-back; refuses to auto-release
+    /// until the operator commits / stashes / explicitly releases.
     SkipDirtyWorktree,
 }
 

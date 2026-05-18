@@ -30,7 +30,7 @@
 //! reversible by definition — safer than letting reviewer pollution
 //! land with no recovery path. On stash failure (e.g. `.git/index.lock`
 //! held by another process, in-progress rebase/merge) the dispatch
-//! falls back to the `WarnDirtyDetached` warn log — no half-switch,
+//! falls back to `emit_dirty_detached_warning` — no half-switch,
 //! no mutation, operator's WIP preserved.
 
 /// The default branch the canonical-hygiene helper switches TO when
@@ -50,26 +50,13 @@ pub enum CanonicalAction {
     /// `git switch main` so subsequent operator commands land on the
     /// expected branch.
     SwitchToDefault,
-    /// HEAD is detached BUT the working tree has uncommitted changes.
-    /// Operator might be mid-bisect / mid-cherry-pick / have
-    /// legitimate WIP. Log a warning and leave alone.
-    ///
-    /// After #852 residual PR-C the decision table no longer routes
-    /// here — [`Self::StashAndSwitchToDefault`] handles dirty-detached
-    /// reversibly and its stash-failure fall-back calls into the
-    /// `WarnDirtyDetached` warn helper directly (via
-    /// `emit_dirty_detached_warning`) rather than reconstructing this
-    /// variant. The variant is retained for diagnostic / future
-    /// reactivation and tagged `#[allow(dead_code)]` accordingly.
-    #[allow(dead_code)]
-    WarnDirtyDetached,
     /// HEAD is detached AND the working tree is dirty: stash the WIP
     /// with a timestamped marker, switch to the default branch, and
     /// notify the operator about the stash ref so they can recover
     /// via `git stash pop`. Reversible by definition — safer than
     /// letting reviewer pollution land with no recovery path. On
-    /// stash failure, falls back to [`Self::WarnDirtyDetached`]
-    /// behaviour (warn log, no mutation).
+    /// stash failure, `apply_stash_and_switch` calls
+    /// `emit_dirty_detached_warning` directly (warn log, no mutation).
     StashAndSwitchToDefault,
 }
 
@@ -108,10 +95,9 @@ pub(crate) fn run_hygiene(config: &crate::fleet::FleetConfig) {
 /// [`decide_canonical_action`], and dispatches by variant: NoOp is
 /// silent, SwitchToDefault runs `git switch main` plus info log,
 /// StashAndSwitchToDefault attempts `git stash push -u` + `git switch
-/// main` + operator notify (on stash failure, falls back to
-/// WarnDirtyDetached's warn log), and WarnDirtyDetached is reached
-/// only as the stash-failure fall-back today (the decision table
-/// no longer routes there from clean inputs).
+/// main` + operator notify (on stash failure, calls
+/// `emit_dirty_detached_warning` directly — no half-switch, no
+/// mutation, operator's WIP preserved).
 ///
 /// Best-effort: subprocess failures log a debug line and return; the
 /// daemon boot continues regardless.
@@ -159,9 +145,6 @@ pub(crate) fn apply_to_canonical(canonical: &std::path::Path) {
                     );
                 }
             }
-        }
-        CanonicalAction::WarnDirtyDetached => {
-            emit_dirty_detached_warning(canonical);
         }
         CanonicalAction::StashAndSwitchToDefault => {
             apply_stash_and_switch(canonical);
@@ -230,10 +213,9 @@ fn apply_stash_and_switch(canonical: &std::path::Path) {
     }
 }
 
-/// Emit the dirty-detached warn log. Extracted so the
-/// `StashAndSwitchToDefault` fall-back can reuse the exact text the
-/// `WarnDirtyDetached` arm would emit, keeping operator-visible
-/// messaging consistent across the two reachable paths.
+/// Emit the dirty-detached warn log. Called by
+/// `apply_stash_and_switch` on stash failure when the detached HEAD
+/// + dirty tree state can't be auto-recovered.
 fn emit_dirty_detached_warning(canonical: &std::path::Path) {
     tracing::warn!(
         canonical = %canonical.display(),
@@ -427,13 +409,10 @@ mod tests {
     // ----------------------------------------------------------------
 
     /// PR-C contract: detached HEAD with dirty working tree must
-    /// resolve to [`CanonicalAction::StashAndSwitchToDefault`] (reversible
-    /// auto-recovery), not the obsolete `WarnDirtyDetached` (which
-    /// left the canonical permanently polluted for the operator).
-    ///
-    /// In C1 RED, [`decide_canonical_action`] still returns the old
-    /// `WarnDirtyDetached`, so this assertion fails. C2 GREEN updates
-    /// the decision table and this passes.
+    /// resolve to [`CanonicalAction::StashAndSwitchToDefault`] —
+    /// reversible auto-recovery via stash, with
+    /// `emit_dirty_detached_warning` as the warn-only fallback when
+    /// the stash itself fails.
     #[test]
     fn stash_and_switch_on_dirty_detached() {
         assert_eq!(
