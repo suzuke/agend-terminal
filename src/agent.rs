@@ -2052,9 +2052,63 @@ Allow Trust All Tools mode?
     /// where the leader shell forks bun/mcp/acp grandchildren — the regression
     /// PR-U #158 fixed for explicit kill paths but missed for PTY-EOF crash
     /// detection.
+    ///
+    /// 2026-05-18 race-class anchor: the previous form of this test polled
+    /// `pid_file.exists()` then `read_to_string` — a write-vs-read race
+    /// because `echo $! > file` may create the file BEFORE flushing the
+    /// content. The fix lands in C2 (swap to `wait_for_nonempty_file`); C0
+    /// adds a concurrent stress runner that exposes the race under load.
     #[test]
     #[cfg(unix)]
     fn sweep_child_tree_kills_grandchild_via_process_group() {
+        let pid_file =
+            std::env::temp_dir().join(format!("agend-sweep-test-{}.pid", std::process::id()));
+        sweep_child_tree_body(&pid_file);
+    }
+
+    /// 2026-05-18 race-class C0 anchor (RED on main HEAD): concurrent
+    /// stress runner for the pid_file write-vs-read race. Spawns 8
+    /// threads, each running the body 6 times against unique pid_file
+    /// paths (8×6 = 48 PTY spawns). Pre-fix the `exists() + read_to_string`
+    /// pair races at least once across ~48 multi-threaded iterations
+    /// under scheduler contention. Post-fix (C2's `wait_for_nonempty_file`
+    /// swap) is deterministic — the helper polls for content, not just
+    /// existence.
+    ///
+    /// NOT `#[ignore]`: ~10-15s on CI ubuntu-latest (where the race
+    /// originally surfaced in PR #905). Local fast hardware may not
+    /// reproduce — the CI runner's slower scheduler is what exposes
+    /// the write/flush gap. Marked `#[cfg(unix)]` because the body
+    /// uses sh + sleep.
+    #[test]
+    #[cfg(unix)]
+    fn sweep_child_tree_kills_grandchild_concurrent_stress() {
+        let handles: Vec<_> = (0..8)
+            .map(|tid| {
+                std::thread::spawn(move || {
+                    for i in 0..6 {
+                        let path = std::env::temp_dir().join(format!(
+                            "agend-sweep-stress-{}-{tid}-{i}.pid",
+                            std::process::id()
+                        ));
+                        sweep_child_tree_body(&path);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("stress thread joined");
+        }
+    }
+
+    /// Test body factored out of
+    /// `sweep_child_tree_kills_grandchild_via_process_group` so the
+    /// concurrent stress runner can call it with unique pid_file paths.
+    /// Behaviour identical to the original test — same shell command,
+    /// same registry shape, same assertion set. Only the pid_file path
+    /// is parameterized.
+    #[cfg(unix)]
+    fn sweep_child_tree_body(pid_file: &std::path::Path) {
         use parking_lot::Mutex;
         use portable_pty::{native_pty_system, CommandBuilder, PtySize};
         use std::collections::HashMap;
@@ -2068,9 +2122,7 @@ Allow Trust All Tools mode?
                 pixel_height: 0,
             })
             .expect("openpty");
-        let pid_file =
-            std::env::temp_dir().join(format!("agend-sweep-test-{}.pid", std::process::id()));
-        let _ = std::fs::remove_file(&pid_file);
+        let _ = std::fs::remove_file(pid_file);
         // sh forks `sleep` into the background; sleep PID is recorded so the
         // test can verify it dies with the leader (group kill semantics).
         let cmd_str = format!("sleep 60 & echo $! > {} && wait", pid_file.display());
@@ -2093,9 +2145,10 @@ Allow Trust All Tools mode?
             state: StateTracker::new(None),
             health: HealthTracker::new(),
         }));
+        let agent_name = format!("sweep-test-{}", pid_file.display());
         let handle = AgentHandle {
             id: crate::types::InstanceId::default(),
-            name: "sweep-test".to_string(),
+            name: agent_name.clone(),
             backend_command: "sh".to_string(),
             pty_writer,
             pty_master,
@@ -2109,20 +2162,16 @@ Allow Trust All Tools mode?
             deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
-        registry.lock().insert("sweep-test".to_string(), handle);
+        registry.lock().insert(agent_name.clone(), handle);
 
-        // Wait for sleep grandchild to start and write its PID
-        for _ in 0..40 {
-            if pid_file.exists() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        let sleep_pid: u32 = std::fs::read_to_string(&pid_file)
-            .unwrap_or_default()
-            .trim()
-            .parse()
-            .expect("parse sleep grandchild PID");
+        // Wait for the grandchild's PID to be observable in the file —
+        // `wait_for_nonempty_file` polls for content commit, not just
+        // file existence, closing the open+truncate+write race that
+        // the original for-loop + read_to_string pair exhibited (PR #905
+        // CI flake + PR #909 dev concurrent-load flake).
+        let content = wait_for_nonempty_file(pid_file, std::time::Duration::from_secs(2))
+            .expect("sleep grandchild pid_file did not become non-empty within 2s");
+        let sleep_pid: u32 = content.trim().parse().expect("parse sleep grandchild PID");
         assert!(
             crate::process::is_pid_alive(shell_pid),
             "shell leader must be alive before sweep"
@@ -2133,14 +2182,14 @@ Allow Trust All Tools mode?
         );
 
         // Invoke the new helper. Should kill the entire process group.
-        sweep_child_tree("sweep-test", &registry);
+        sweep_child_tree(&agent_name, &registry);
 
         // Reap the shell child so kill(pid, 0) doesn't see it as a zombie.
         // Without wait(), the shell shows as "alive" even after SIGKILL
         // because we are its parent and never collected its exit status.
         {
             let reg = &registry.lock();
-            if let Some(h) = reg.get("sweep-test") {
+            if let Some(h) = reg.get(&agent_name) {
                 {
                     let mut c = h.child.lock();
                     let _ = c.wait();
@@ -2156,7 +2205,106 @@ Allow Trust All Tools mode?
             !crate::process::is_pid_alive(sleep_pid),
             "sleep grandchild must die with the group (kill_process_tree semantics)"
         );
-        let _ = std::fs::remove_file(&pid_file);
+        let _ = std::fs::remove_file(pid_file);
+    }
+
+    /// Poll `path` until `read_to_string(path).trim().is_empty() == false`
+    /// (i.e. file exists AND has non-empty content), or `timeout`
+    /// elapses. Closes the write-vs-read race that bare
+    /// `path.exists() + read_to_string` exhibits when the writer is a
+    /// subprocess that does open+truncate+write+close: between create
+    /// and content flush, an `exists()` poll returns true but the read
+    /// yields an empty string. Reading until non-empty waits for the
+    /// content commit explicitly.
+    ///
+    /// Returns `Ok(content)` (trimmed read) on success, `Err` with
+    /// `ErrorKind::TimedOut` when the timeout fires with no non-empty
+    /// content observed.
+    ///
+    /// Poll interval is 5ms (the OS scheduling quantum is the floor;
+    /// finer polling burns CPU without buying latency improvement).
+    ///
+    /// `#[cfg(unix)]` matches the sole caller (`sweep_child_tree_body`,
+    /// which spawns `sh` + `sleep`) — Windows builds would see an
+    /// orphan helper and trip `-D dead-code` clippy. Drop the gate
+    /// when a Windows-side caller appears.
+    #[cfg(unix)]
+    fn wait_for_nonempty_file(
+        path: &std::path::Path,
+        timeout: std::time::Duration,
+    ) -> std::io::Result<String> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if !content.trim().is_empty() {
+                    return Ok(content);
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "file {} did not become non-empty within {:?}",
+                        path.display(),
+                        timeout
+                    ),
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// Helper unit test: simulates the race-class shape the helper
+    /// exists to close. A separate thread creates the file empty,
+    /// delays, then writes content. `wait_for_nonempty_file` must
+    /// NOT return until content is observable.
+    #[test]
+    #[cfg(unix)]
+    fn wait_for_nonempty_file_waits_until_content_is_committed() {
+        let path = std::env::temp_dir().join(format!(
+            "agend-wait-nonempty-test-{}.txt",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            // Phase 1: create empty file. A naïve `exists()` poll
+            // would see this and proceed to read empty content.
+            std::fs::write(&writer_path, "").expect("create empty");
+            // Phase 2: simulate the OS write buffer flush gap.
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            // Phase 3: commit the actual content.
+            std::fs::write(&writer_path, "12345\n").expect("commit content");
+        });
+
+        let result = wait_for_nonempty_file(&path, std::time::Duration::from_secs(2))
+            .expect("wait returned content within timeout");
+        writer.join().expect("writer thread joined");
+
+        assert_eq!(
+            result.trim(),
+            "12345",
+            "wait_for_nonempty_file must return the committed content, not the empty stub"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Helper unit test: timeout path. File never becomes non-empty.
+    #[test]
+    #[cfg(unix)]
+    fn wait_for_nonempty_file_returns_timeout_when_content_never_arrives() {
+        let path = std::env::temp_dir().join(format!(
+            "agend-wait-nonempty-timeout-test-{}.txt",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, "").expect("create empty");
+
+        let err = wait_for_nonempty_file(&path, std::time::Duration::from_millis(50))
+            .expect_err("must time out when content never commits");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
