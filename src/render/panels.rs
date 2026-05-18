@@ -58,10 +58,11 @@ fn filter_live_assignees<'a>(
 /// visibly flickers between frames when the iteration order
 /// reshuffles. The helper sorts before joining to lock a stable
 /// left-to-right order independent of hash-bucket layout.
-fn format_active_status(names: Vec<&str>) -> String {
+fn format_active_status(mut names: Vec<&str>) -> String {
     if names.is_empty() {
         "all idle".to_string()
     } else {
+        names.sort_unstable();
         format!("active: {}", names.join(", "))
     }
 }
