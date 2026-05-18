@@ -251,8 +251,14 @@ enum Commands {
         #[arg(last = true)]
         extra_args: Vec<String>,
     },
-    /// Launch terminal app — multi-tab/pane TUI with agent management
-    App {
+    /// Launch terminal TUI — multi-tab/pane interface with agent management.
+    ///
+    /// #879v3 C4: renamed from `app` to clarify the multi-pane TUI direction
+    /// (and to make room for the tray-as-future-primary framing). `app`
+    /// remains as a visible alias for one deprecation cycle; invoking it
+    /// emits a one-time stderr nudge.
+    #[command(visible_alias = "app")]
+    Tui {
         /// Path to fleet.yaml (default: $AGEND_HOME/fleet.yaml)
         #[arg(long)]
         fleet: Option<String>,
@@ -468,10 +474,10 @@ fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    // App mode redirects tracing to a log file (stderr is owned by ratatui).
+    // TUI mode redirects tracing to a log file (stderr is owned by ratatui).
     // All other commands use stderr.
-    let is_app = matches!(cli.command, Some(Commands::App { .. }));
-    if !is_app {
+    let is_tui = matches!(cli.command, Some(Commands::Tui { .. }));
+    if !is_tui {
         tracing_subscriber::fmt()
             .with_env_filter(
                 tracing_subscriber::EnvFilter::try_from_env("AGEND_LOG")
@@ -491,7 +497,17 @@ fn main() -> anyhow::Result<()> {
             Cli::command().print_help()?;
             println!();
         }
-        Some(Commands::App { fleet }) => {
+        Some(Commands::Tui { fleet }) => {
+            // #879v3 C4: deprecation nudge when invoked via the `app` alias.
+            // `std::env::args` reads the raw argv so we can distinguish
+            // `agend-terminal tui ...` from `agend-terminal app ...` even
+            // after clap normalizes them to the same `Commands::Tui` variant.
+            if std::env::args().nth(1).as_deref() == Some("app") {
+                eprintln!(
+                    "agend-terminal: `app` is a deprecated alias for `tui`; \
+                     please switch — the alias will be removed in a future release."
+                );
+            }
             app::run(fleet.as_deref())?;
         }
         Some(Commands::Start {
