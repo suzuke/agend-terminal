@@ -15,17 +15,20 @@
 //! - [`update_daemon_log_symlink_unix`] — points `daemon.log` symlink at
 //!   the newest rotated file so `tail -F daemon.log` keeps working post-rotation.
 //!
-//! Skeleton commit — function bodies are stubs that fail the RED tests in
-//! the companion mod. The next commit (#914 C2) replaces them with the
-//! real implementations.
+//! See `[setup_daemon_tracing]` for the daemon-path init entry that
+//! `main` calls when the child starts with `start --foreground`. CLI
+//! commands route through `[setup_cli_tracing]` and keep stderr.
 
-// Each item is `dead_code` in this RED-tests commit; the wiring lands
-// in C1/C2/C3. The blanket allow here keeps the test commit clippy-clean
-// without inserting per-item `#[allow]` noise that the impl commits
-// would then have to remove.
+// `parse_size`, `cleanup_oversize_logs`, `update_daemon_log_symlink_unix`
+// land their wiring in C2 (per-tick handler). The blanket allow keeps
+// C1 clippy-clean without per-item attributes that would need stripping
+// later. C2's wiring removes the allow.
 #![allow(dead_code)]
 
 use std::path::Path;
+
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::EnvFilter;
 
 /// Default daily retention when `AGEND_LOG_RETAIN_DAYS` is unset.
 /// 3 files × ~800 MB worst-case per file ≈ 2.4 GB ceiling; the
@@ -47,6 +50,85 @@ pub const LOG_FILENAME_SUFFIX: &str = "log";
 /// `<date>` suffix so cleanup-tick can track both patterns without
 /// collision when same-day boots happen.
 pub const MIGRATION_SUFFIX_PREFIX: &str = "migration.";
+
+/// Read `AGEND_LOG_RETAIN_DAYS` env var, fall back to
+/// [`DEFAULT_RETAIN_DAYS`]. Used as `max_log_files` on the rolling
+/// appender so the daemon never accumulates more than this many
+/// rotated files (orthogonal to the `AGEND_LOG_MAX_BYTES` hard cap
+/// enforced by the per-tick cleanup).
+fn retain_days_from_env() -> usize {
+    std::env::var("AGEND_LOG_RETAIN_DAYS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_RETAIN_DAYS)
+}
+
+/// Stderr-tracing init for CLI commands (`inject`, `list`, `kill`,
+/// `start` (parent of detach), every non-daemon command). Identical
+/// to the pre-#914 init — extracted here so `main` has one symmetric
+/// helper for the daemon vs CLI fork.
+pub fn setup_cli_tracing() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_env("AGEND_LOG")
+                .unwrap_or_else(|_| EnvFilter::new("agend_terminal=info")),
+        )
+        .with_timer(tracing_subscriber::fmt::time::LocalTime::rfc_3339())
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .init();
+}
+
+/// Daemon-path tracing init: rolling file appender writing to
+/// `<home>/daemon.log.<YYYY-MM-DD>` with `max_log_files` retention.
+/// Caller (`main`) MUST hold the returned [`WorkerGuard`] for the full
+/// daemon lifetime — dropping it shuts the background writer thread
+/// down and may drop the last batch of pending log records.
+///
+/// `with_ansi(false)`: the per-#914 lead synth flagged this as an
+/// intentional observable change. Pre-#914 the daemon's stderr was
+/// redirected to a file and tracing wrote ANSI color codes into it
+/// (rendered as `\x1b[...]` noise in `cat`/`grep`); now the rotated
+/// log files contain plain text that operator scripts can parse
+/// directly.
+///
+/// Migration of any pre-existing `daemon.log` is C2's responsibility
+/// (called from this fn after C2 lands); this skeleton calls the
+/// stub which is a no-op. The rolling appender still opens its first
+/// rotated file regardless, so daemon startup never blocks on
+/// migration.
+pub fn setup_daemon_tracing(home: &Path) -> anyhow::Result<WorkerGuard> {
+    // C2 will replace the stub `migrate_existing_daemon_log` with the
+    // real rename; the call site here doesn't change. Failures from
+    // migration are logged but never abort startup (per lead's failure
+    // policy: stderr passthrough + continue).
+    if let Err(e) = migrate_existing_daemon_log(home) {
+        eprintln!("agend-terminal: daemon.log migration failed: {e} (continuing with fresh rolling appender)");
+    }
+
+    let appender = tracing_appender::rolling::Builder::new()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .max_log_files(retain_days_from_env())
+        .filename_prefix(LOG_FILENAME_PREFIX)
+        .filename_suffix(LOG_FILENAME_SUFFIX)
+        .build(home)
+        .map_err(|e| anyhow::anyhow!("daemon log: RollingFileAppender::build failed: {e}"))?;
+    let (non_blocking, guard) = tracing_appender::non_blocking(appender);
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_env("AGEND_LOG")
+                .unwrap_or_else(|_| EnvFilter::new("agend_terminal=info")),
+        )
+        .with_timer(tracing_subscriber::fmt::time::LocalTime::rfc_3339())
+        .with_writer(non_blocking)
+        .with_ansi(false)
+        .with_target(false)
+        .init();
+
+    Ok(guard)
+}
 
 /// Parse `AGEND_LOG_MAX_BYTES` string into bytes. Accepts plain integers
 /// (`2147483648`) and `K`/`M`/`G` suffixes (case-insensitive, e.g.

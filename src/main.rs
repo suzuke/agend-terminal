@@ -469,21 +469,35 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // App mode redirects tracing to a log file (stderr is owned by ratatui).
-    // All other commands use stderr.
+    // The daemon child path (`start --foreground`, including the spawn_detached
+    // child after it re-execs with --foreground) routes through #914's
+    // rolling-file appender so daemon.log no longer grows unbounded. All
+    // other commands keep stderr (single-shot CLI invocations, no growth
+    // concern).
     let is_app = matches!(cli.command, Some(Commands::App { .. }));
-    if !is_app {
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_env("AGEND_LOG")
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("agend_terminal=info")),
-            )
-            .with_timer(tracing_subscriber::fmt::time::LocalTime::rfc_3339())
-            .with_writer(std::io::stderr)
-            .with_target(false)
-            .init();
-    }
+    let is_daemon_child = matches!(
+        cli.command,
+        Some(Commands::Start {
+            foreground: true,
+            ..
+        })
+    );
     let home = home_dir();
     std::fs::create_dir_all(&home)?;
+
+    // `_log_guard` must outlive any tracing call below. Drop = flush + close
+    // the rolling appender's worker thread, so we deliberately bind it in
+    // `main`'s scope rather than returning it from `setup_daemon_tracing`'s
+    // call site. CLI mode produces `None`; the binding is still required so
+    // the daemon-path `Some(guard)` lives until process exit.
+    let _log_guard = if is_app {
+        None
+    } else if is_daemon_child {
+        Some(crate::logging::setup_daemon_tracing(&home)?)
+    } else {
+        crate::logging::setup_cli_tracing();
+        None
+    };
 
     match cli.command {
         None => {
