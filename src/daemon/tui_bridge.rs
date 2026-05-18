@@ -79,11 +79,7 @@ pub fn serve_agent_tui(name: &str, run_dir: &Path, registry: &AgentRegistry) {
 /// step. Exits when the listener is dropped or accept errors
 /// terminally (e.g. agent removal via `delete_transaction` closes the
 /// underlying socket file).
-pub(crate) fn serve_tui_accept_loop(
-    name: &str,
-    meta: TuiListenerMeta,
-    registry: &AgentRegistry,
-) {
+pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry: &AgentRegistry) {
     let TuiListenerMeta { listener, cookie } = meta;
 
     for stream in listener.incoming() {
