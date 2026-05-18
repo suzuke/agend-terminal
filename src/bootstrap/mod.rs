@@ -194,12 +194,19 @@ pub fn prepare(home: &Path, fleet_path: &Path, opts: PrepareOptions) -> Result<B
     // beyond the single `git switch main` mutation when conditions
     // are right. Best-effort — boot continues regardless.
     canonical_hygiene::run_hygiene(&config);
-    // #829: boot-time orphan-owner sweep. Auto-applies for owners
-    // verifiably gone (∉ fleet.yaml ∧ ∉ live registry); dry-run +
-    // tracing::warn for the softer "∈ fleet.yaml ∧ ∉ live" case.
-    // Best-effort with tracing audit; skips entirely if
-    // `api::call(LIST)` fails (e.g. socket bind race during boot).
-    crate::tasks::reconcile_orphan_owners(home);
+    // #829 Fix A: boot-time orphan-owner sweep. We pass `live = ∅`
+    // explicitly because `api::serve` hasn't bound the Unix socket
+    // yet (that happens later in `daemon::run_with_prepared`) and no
+    // fleet agents have spawned (auto-start runs even later). The
+    // pre-Fix A call resolved `live` via `api::call(LIST)` here, which
+    // always returned None at this point in bootstrap → guaranteed
+    // no-op every boot → ghost owners accumulated until manual
+    // cleanup. Strict ghosts (∉ fleet.yaml ∧ ∉ live) are auto-cleared;
+    // Soft candidates (∈ fleet.yaml ∧ ∉ live) stay dry-run so the
+    // "agent not yet spawned" case isn't over-orphaned. Periodic
+    // post-boot callers should keep using `reconcile_orphan_owners`
+    // which still fetches `live` from the running daemon.
+    crate::tasks::reconcile_orphan_owners_with_live(home, &std::collections::HashSet::new());
 
     Ok(BootstrapOutcome::Owned(Box::new(OwnedFleet {
         home: home.to_path_buf(),

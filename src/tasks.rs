@@ -647,7 +647,7 @@ pub struct OrphanScanResult {
 /// configuration-time set. Caller responsibility to populate both;
 /// this fn is pure so it's testable without a daemon.
 ///
-/// #829: boot-time orphan-owner sweeper. Sibling to
+/// #829: orphan-owner sweeper. Sibling to
 /// `crate::binding::reconcile_orphans` + `crate::worktree_pool::
 /// reconcile_orphan_leases` in `src/bootstrap/mod.rs`. Best-effort,
 /// tracing-audited, no return value.
@@ -662,15 +662,54 @@ pub struct OrphanScanResult {
 /// operator judgment for the "agent hasn't booted yet" race that
 /// `auto_start_fleet` will resolve seconds after bootstrap returns.
 ///
-/// Skip-on-api-fail: if `api::call(LIST)` returns `None`, the
-/// orchestrator early-returns BEFORE touching any state. Better to
-/// leave residue for next boot than to over-orphan during a daemon
-/// startup race.
+/// Fix A note (#829 follow-up): this wrapper is the post-boot /
+/// periodic entrypoint that still resolves `live` via
+/// `api::call(LIST)`. The boot caller now uses
+/// [`reconcile_orphan_owners_with_live`] directly with an empty live
+/// set — see that fn for the bootstrap-time rationale. Keeping the
+/// `api::call` path here means a future periodic-sweep tick can reuse
+/// the same orchestrator without re-implementing live-set fetching.
+///
+/// Skip-on-api-fail: if `api::call(LIST)` returns `None`, the wrapper
+/// early-returns BEFORE touching any state. Better to leave residue
+/// for the next periodic tick than to over-orphan against a stale
+/// (empty) live picture in a post-boot context where agents are
+/// genuinely meant to be running.
+#[allow(dead_code)] // Fix A: reserved for periodic-sweep callers (no wired site today)
 pub fn reconcile_orphan_owners(home: &Path) {
     let Some(live) = crate::runtime::list_live_agents(home) else {
-        tracing::info!("#829: api::call(LIST) unavailable at boot — skipping orphan-owner sweep");
+        tracing::info!("#829: api::call(LIST) unavailable — skipping orphan-owner sweep");
         return;
     };
+    reconcile_orphan_owners_with_live(home, &live);
+}
+
+/// #829 Fix A: boot-path entrypoint that takes `live` explicitly.
+///
+/// Pre-Fix A, `reconcile_orphan_owners` ran from `bootstrap::prepare`
+/// BEFORE `api::serve` bound the Unix socket (the socket is opened
+/// later in `daemon::run_with_prepared`), so `api::call(LIST)` always
+/// returned `None` and the sweep early-exited every boot. Operator
+/// surfaced the symptom on 2026-05-18 (45 accumulated ghost owners).
+///
+/// At bootstrap time `live = ∅` is provably correct: no agents have
+/// spawned yet (auto-start runs later in `run_with_prepared`). The
+/// bootstrap caller now passes `HashSet::new()` directly, severing
+/// the broken `api::call` chain. The classifier still does the right
+/// thing in this context:
+///
+/// - Owner ∈ fleet.yaml → Soft (warn, don't kill — correctly defers
+///   the "agent not yet spawned" case).
+/// - Owner ∉ fleet.yaml → Strict (auto-apply — catches the ghost
+///   buildup on next daemon boot).
+///
+/// Body factored out of `reconcile_orphan_owners`; this fn is the
+/// shared core used by both the boot path (empty live) and the
+/// periodic path (api-derived live). Strict/soft semantics unchanged.
+pub fn reconcile_orphan_owners_with_live(
+    home: &Path,
+    live: &std::collections::HashSet<String>,
+) {
     let fleet_instances: std::collections::HashSet<String> =
         crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
             .ok()
@@ -681,15 +720,15 @@ pub fn reconcile_orphan_owners(home: &Path) {
         Err(e) => {
             tracing::warn!(
                 error = %e,
-                "#829: task_events replay failed at boot — skipping orphan-owner sweep"
+                "#829: task_events replay failed — skipping orphan-owner sweep"
             );
             return;
         }
     };
 
-    let result = scan_orphan_candidates(&state, &live, &fleet_instances);
+    let result = scan_orphan_candidates(&state, live, &fleet_instances);
     if result.strict.is_empty() && result.soft.is_empty() {
-        tracing::debug!("#829: boot orphan-owner sweep clean — no ghost owners detected");
+        tracing::debug!("#829: orphan-owner sweep clean — no ghost owners detected");
         return;
     }
 
@@ -700,12 +739,12 @@ pub fn reconcile_orphan_owners(home: &Path) {
                 owner = %owner,
                 tasks = task_ids.len(),
                 orphaned = n,
-                "#829: boot orphan-owner sweep applied (strict — owner fully gone)"
+                "#829: orphan-owner sweep applied (strict — owner fully gone)"
             ),
             Err(e) => tracing::warn!(
                 owner = %owner,
                 error = %e,
-                "#829: boot orphan-owner sweep failed for strict candidate"
+                "#829: orphan-owner sweep failed for strict candidate"
             ),
         }
     }
@@ -719,7 +758,7 @@ pub fn reconcile_orphan_owners(home: &Path) {
             .collect();
         tracing::warn!(
             ?soft_summary,
-            "#829: boot detected tasks owned by configured-but-not-live agents \
+            "#829: detected tasks owned by configured-but-not-live agents \
              (in fleet.yaml ∧ ∉ live registry); operator may run `task action=sweep` \
              to apply orphan cleanup"
         );
