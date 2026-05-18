@@ -2286,6 +2286,75 @@ mod tests {
         );
     }
 
+    /// #829 Fix A — C1 RED anchor.
+    ///
+    /// Locks the boot-path contract: with an explicit empty live set
+    /// (the verifiable state at `bootstrap::prepare` time — `api::serve`
+    /// has not yet bound the socket, no agents have been spawned), a
+    /// ghost-owned task (owner ∉ fleet.yaml ∧ ∉ live) MUST land as
+    /// Strict and have its owner cleared via `orphan_tasks_for_owner`.
+    ///
+    /// Pre-Fix A this symbol doesn't exist: compile-fail = RED. Post-Fix
+    /// A the wrapper factors out the body and the boot caller can pass
+    /// `HashSet::new()` directly, severing the broken `api::call` chain.
+    #[test]
+    fn reconcile_orphan_owners_with_live_empty_set_orphans_strict_ghost() {
+        use crate::task_events::{InstanceName, TaskEvent, TaskId};
+        let home = tmp_home("reconcile_with_live_empty_orphans_strict");
+        // No fleet.yaml written → FleetConfig::load Err → empty fleet
+        // instances → "dev-impl-1" classifies Strict.
+
+        let emitter = InstanceName::from("test:legacy_migration");
+        let tid = TaskId("t-ghost-1".into());
+        crate::task_events::append_batch(
+            &home,
+            &emitter,
+            vec![TaskEvent::Created {
+                task_id: tid.clone(),
+                title: "ghost-owned legacy task".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: Some(InstanceName::from("dev-impl-1")),
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: None,
+                bind: None,
+                eta_secs: None,
+            }],
+        )
+        .expect("seed Created event");
+
+        // Pre-condition: replay sees the ghost owner.
+        let pre = crate::task_events::replay(&home).expect("pre replay");
+        assert_eq!(
+            pre.tasks
+                .get(&tid)
+                .and_then(|r| r.owner.as_ref().map(|o| o.0.clone())),
+            Some("dev-impl-1".into()),
+            "pre-condition: ghost owner persisted to event log"
+        );
+
+        // Subject under test: boot-path entrypoint that the bootstrap
+        // call site uses. `live = ∅` is the verifiable state at boot
+        // (pre-auto-start, pre-api::serve bind). Does NOT touch the
+        // periodic `reconcile_orphan_owners(home)` path that fetches
+        // live via `api::call`.
+        reconcile_orphan_owners_with_live(&home, &std::collections::HashSet::new());
+
+        let post = crate::task_events::replay(&home).expect("post replay");
+        let owner_after = post
+            .tasks
+            .get(&tid)
+            .and_then(|r| r.owner.as_ref().map(|o| o.0.clone()));
+        assert!(
+            owner_after.is_none(),
+            "after boot sweep with empty live, Strict ghost's owner must be cleared (got {owner_after:?})"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     #[test]
     fn can_mutate_task_assignee_match() {
         let home = tmp_home("can_mutate_assignee");
