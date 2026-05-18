@@ -2164,22 +2164,14 @@ Allow Trust All Tools mode?
         let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
         registry.lock().insert(agent_name.clone(), handle);
 
-        // Wait for sleep grandchild to start and write its PID. This
-        // poll-on-`exists()` pair with `read_to_string` is the very race
-        // the C0 stress runner exposes — `echo $! > file` creates the
-        // file before flushing content; a read between create and flush
-        // returns empty. C2 will swap this block for `wait_for_nonempty_file`.
-        for _ in 0..40 {
-            if pid_file.exists() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        let sleep_pid: u32 = std::fs::read_to_string(pid_file)
-            .unwrap_or_default()
-            .trim()
-            .parse()
-            .expect("parse sleep grandchild PID");
+        // Wait for the grandchild's PID to be observable in the file —
+        // `wait_for_nonempty_file` polls for content commit, not just
+        // file existence, closing the open+truncate+write race that
+        // the original for-loop + read_to_string pair exhibited (PR #905
+        // CI flake + PR #909 dev concurrent-load flake).
+        let content = wait_for_nonempty_file(pid_file, std::time::Duration::from_secs(2))
+            .expect("sleep grandchild pid_file did not become non-empty within 2s");
+        let sleep_pid: u32 = content.trim().parse().expect("parse sleep grandchild PID");
         assert!(
             crate::process::is_pid_alive(shell_pid),
             "shell leader must be alive before sweep"
@@ -2231,7 +2223,6 @@ Allow Trust All Tools mode?
     ///
     /// Poll interval is 5ms (the OS scheduling quantum is the floor;
     /// finer polling burns CPU without buying latency improvement).
-    #[allow(dead_code)] // first consumer lands in the C2 commit
     fn wait_for_nonempty_file(
         path: &std::path::Path,
         timeout: std::time::Duration,
