@@ -3389,4 +3389,45 @@ instances:
         assert!(logs_contain("topic_id"), "tracing must carry field name");
         std::fs::remove_dir_all(&home).ok();
     }
+
+    /// #964 regression anchor — promoted from dev's bisect spike at
+    /// `/tmp/bisect-964-dev.md`. Documents the SILENT no-op contract:
+    /// when `update_instance_field` is called against a missing entry, it
+    /// MUST return `Ok(false)` and leave fleet.yaml unchanged. The #964
+    /// fix is caller-side (`spawn_single_instance` adds the entry BEFORE
+    /// SPAWN so the SPAWN-time `register_topic` chain finds it) — this
+    /// test pins the helper's intentional contract so a future
+    /// well-meaning refactor to "auto-insert on missing" doesn't silently
+    /// re-introduce the bootstrap-backfill ambiguity that masked #964 for
+    /// 27 days.
+    ///
+    /// Sibling: caller-side regression tests at
+    /// `src/mcp/handlers/instance.rs::tests_964::t1_create_instance_persists_topic_id_to_fleet_yaml`.
+    #[test]
+    fn repro_964_helper_silently_no_ops_on_empty_fleet_yaml() {
+        let home = tmp_home_962("repro-964");
+        // Plant fleet.yaml with explicitly NO entry for the target name.
+        std::fs::write(fleet_yaml_path(&home), "instances: {}\n").unwrap();
+
+        let result = update_instance_field(
+            &home,
+            "test-964-verify",
+            "topic_id",
+            serde_yaml_ng::Value::Number(serde_yaml_ng::Number::from(5198)),
+        );
+
+        assert!(
+            matches!(result, Ok(false)),
+            "#964 anchor: helper MUST silently no-op (Ok(false)) on \
+             missing entry; the fix lives in the caller. Got: {result:?}"
+        );
+
+        let cfg = FleetConfig::load(&fleet_yaml_path(&home)).expect("reload");
+        assert!(
+            cfg.instances.get("test-964-verify").is_none(),
+            "#964 anchor: helper MUST NOT auto-insert; got entry {:?}",
+            cfg.instances.get("test-964-verify")
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
