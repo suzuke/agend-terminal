@@ -236,6 +236,13 @@ enum Commands {
         /// (kept as an alias for backward compatibility).
         #[arg(long, short = 'd')]
         detailed: bool,
+        /// #938: emit the pre-#938 JSON shape (`result.agents` top-level
+        /// passthrough) instead of the new `{"mode", "agents"}` envelope.
+        /// One-release-cycle deprecation window for operator JSON parsers
+        /// that hard-code the old shape. Removed after operator migration
+        /// completes. Has no effect without `--json`.
+        #[arg(long)]
+        legacy_json: bool,
     },
     /// Connect a local agent to the running daemon
     Connect {
@@ -696,47 +703,113 @@ fn main() -> anyhow::Result<()> {
                 Err(_) => daemon_not_running_hint(),
             }
         }
-        Some(Commands::List { json, detailed }) => {
+        Some(Commands::List {
+            json,
+            detailed,
+            legacy_json,
+        }) => {
             // Wave 1 CLI consolidation: `--detailed/-d` (or `--json`) shows
             // state/health/cmd via the daemon API. Plain `list` falls
             // back to scanning `*.port` files in the run dir — works
             // even when the daemon API is briefly unresponsive (the
             // historical reason `list` and `status` were two commands).
+            //
+            // #938: plain output now surfaces a fallback-mode hint to
+            // stderr; JSON output gains a `mode` field. Operator JSON
+            // parsers pinning the pre-#938 shape can opt into
+            // `--legacy-json` for one release cycle.
             let want_detailed = detailed || json;
             if want_detailed {
-                match api::call(&home, &serde_json::json!({"method": api::method::LIST})) {
-                    Ok(resp) => {
-                        if json {
-                            println!(
-                                "{}",
-                                serde_json::to_string_pretty(&resp["result"]).unwrap_or_default()
-                            );
-                        } else if let Some(agents) = resp["result"]["agents"].as_array() {
+                let api_resp = api::call(&home, &serde_json::json!({"method": api::method::LIST}));
+                if json {
+                    // #938: unified JSON output. Prefer the rich API
+                    // response (state/health/backend fields) when daemon
+                    // reachable; fall through to the fallback helper for
+                    // offline / stuck-daemon coverage.
+                    let (fallback_agents, mode) =
+                        crate::runtime::list_agents_with_fallback_with_mode(&home);
+                    let agents_value: serde_json::Value = match (
+                        &api_resp,
+                        matches!(mode, crate::runtime::AgentListMode::Live),
+                    ) {
+                        (Ok(resp), true) => resp["result"]["agents"].clone(),
+                        _ => serde_json::Value::Array(
+                            fallback_agents
+                                .iter()
+                                .map(|n| serde_json::json!({"name": n}))
+                                .collect(),
+                        ),
+                    };
+                    if legacy_json {
+                        // Pre-#938 shape passthrough: print
+                        // `{"agents": [...], ...}` exactly as the API
+                        // returned. One-release-cycle deprecation window.
+                        let payload = match &api_resp {
+                            Ok(resp) => resp["result"].clone(),
+                            Err(_) => serde_json::json!({"agents": agents_value}),
+                        };
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&payload).unwrap_or_default()
+                        );
+                    } else {
+                        let envelope = serde_json::json!({
+                            "mode": mode.as_str(),
+                            "agents": agents_value,
+                        });
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&envelope).unwrap_or_default()
+                        );
+                    }
+                } else {
+                    // Detailed plain output: prefer rich API; fallback
+                    // to flat names + mode hint if daemon offline.
+                    match &api_resp {
+                        Ok(resp) => {
+                            if let Some(agents) = resp["result"]["agents"].as_array() {
+                                if agents.is_empty() {
+                                    println!("No agents running.");
+                                } else {
+                                    for a in agents {
+                                        println!(
+                                            "  {}: state={} health={} cmd={}",
+                                            a["name"].as_str().unwrap_or("?"),
+                                            a["agent_state"].as_str().unwrap_or("?"),
+                                            a["health_state"].as_str().unwrap_or("?"),
+                                            a["backend"].as_str().unwrap_or("?")
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            let (agents, mode) =
+                                crate::runtime::list_agents_with_fallback_with_mode(&home);
                             if agents.is_empty() {
-                                println!("No agents running.");
+                                daemon_not_running_hint();
                             } else {
-                                for a in agents {
-                                    println!(
-                                        "  {}: state={} health={} cmd={}",
-                                        a["name"].as_str().unwrap_or("?"),
-                                        a["agent_state"].as_str().unwrap_or("?"),
-                                        a["health_state"].as_str().unwrap_or("?"),
-                                        a["backend"].as_str().unwrap_or("?")
-                                    );
+                                for a in &agents {
+                                    println!("  {a}");
+                                }
+                                if let Some(h) = mode.hint() {
+                                    eprintln!("  {h}");
                                 }
                             }
                         }
                     }
-                    Err(_) => daemon_not_running_hint(),
                 }
             } else if daemon::find_active_run_dir(&home).is_some() {
-                // #910 PR2 of 4: daemon-registry truth via runtime helper.
-                // run_dir presence preserved as the "is there a daemon at
-                // all?" gate so the "No running daemon found" hint at the
-                // bottom branch isn't masked by registry-empty cases.
-                let agents = crate::runtime::list_agents_with_fallback(&home);
+                // #910 PR2 of 4 / #938 (C) bundle: daemon-registry truth
+                // via runtime helper. The mode discriminator surfaces
+                // a fallback hint to stderr so operator can tell live
+                // from stale-port-glob without reading daemon.log.
+                let (agents, mode) = crate::runtime::list_agents_with_fallback_with_mode(&home);
                 for a in &agents {
                     println!("  {a}");
+                }
+                if let Some(h) = mode.hint() {
+                    eprintln!("  {h}");
                 }
             } else {
                 println!("No running daemon found.");
