@@ -167,6 +167,10 @@ pub(crate) fn boot_sweep_impl(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    // `Command` is only used by the `#[cfg(unix)]` test helpers below
+    // (`spawn_sigterm_respecter` / `spawn_sigterm_ignorer`). Gating the
+    // import keeps Windows clippy `-D unused-imports` clean.
+    #[cfg(unix)]
     use std::process::Command;
 
     fn tmp_home(tag: &str) -> PathBuf {
@@ -190,7 +194,10 @@ mod tests {
 
     /// Same as [`plant_run_dir`] but writes a DIFFERENT PID into the
     /// `.daemon` body — simulates PID reuse where a recycled PID's dir
-    /// has stale identity from a prior daemon.
+    /// has stale identity from a prior daemon. Only the identity-guard
+    /// test (`#[cfg(unix)]`-gated, depends on a live-PID spawn) calls
+    /// this; gate prevents Windows clippy dead_code error.
+    #[cfg(unix)]
     fn plant_run_dir_with_mismatch(home: &Path, dir_pid: u32, recorded_pid: u32) -> PathBuf {
         let run = home.join("run").join(dir_pid.to_string());
         std::fs::create_dir_all(&run).unwrap();
