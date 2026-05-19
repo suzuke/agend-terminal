@@ -502,6 +502,23 @@ fn run_core(
         }
     }
 
+    // #922: write `<run_dir>/.ready` to signal daemon-init-complete —
+    // the 4th lifecycle file alongside `.daemon` / `api.cookie` / `api.port`
+    // (see CLAUDE.md "Daemon lifecycle files"). Distinct from `api.port`
+    // existence: `api.port` appears at #906 reorder time (before the
+    // spawn loop), so external probers seeing it cannot assume the
+    // registry is populated. `.ready` is the load-bearing "spawn loop
+    // completed, agent count is final" signal — log-and-continue means
+    // count may be < fleet.size, but no further changes from THIS boot
+    // sequence. Single boot-completion signal per lead synth — future
+    // sub-stage signals extend `.ready`'s content (JSON payload), not
+    // add new files. Cleanup is automatic via `remove_dir_all(run_dir)`
+    // at shutdown (no new code path).
+    let ready_path = run_dir(home).join(".ready");
+    if let Err(e) = std::fs::write(&ready_path, chrono::Utc::now().to_rfc3339()) {
+        tracing::warn!(path = %ready_path.display(), error = %e, "failed to write .ready marker");
+    }
+
     // Shutdown wake channel — signal handler sends on this so the main loop's
     // select! wakes immediately instead of waiting up to 10s for the next tick.
     let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
