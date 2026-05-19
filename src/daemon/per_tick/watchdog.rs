@@ -39,7 +39,10 @@ impl PerTickHandler for WatchdogHandler {
         // registry (L0) → per-agent core (L1). `&mut core.health` is a
         // field borrow through the already-held L1 MutexGuard, not a
         // separate Mutex re-acquisition — same shape as HangDetection.
-        let reg = agent::lock_registry(ctx.registry);
+        // #941: holder-tracking wrapper — pairs with HangDetection's
+        // migration so the ThreadDumpHandler can attribute either
+        // handler as the H1 suspect.
+        let reg = agent::lock_registry_tracked(ctx.registry, "watchdog");
         for (name, handle) in reg.iter() {
             let backend = match crate::backend::Backend::from_command(&handle.backend_command) {
                 Some(b) => b,

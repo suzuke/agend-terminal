@@ -611,6 +611,13 @@ fn run_core(
         // daemon.log.* dir size beyond what `max_log_files` enforces,
         // plus the Unix symlink-to-newest refresh.
         Box::new(per_tick::LogRotationHandler::new(360)),
+        // #941: periodic thread-state dump for incident-grade observability.
+        // Gated on `AGEND_DAEMON_THREAD_DUMP_SECS=N` (N >= 1 enable; default
+        // disabled). When disabled, ThreadDumpHandler.run() is a sub-µs
+        // no-op (one cached atomic load). See
+        // `daemon/per_tick/thread_dump.rs` for full design + the
+        // wrapper-only blind spot caveat.
+        Box::new(per_tick::ThreadDumpHandler::new()),
     ];
 
     // Periodic tick channel (every 10s for health/schedule/session maintenance)
@@ -674,7 +681,14 @@ fn run_core(
         // preserved verbatim by the Vec literal's element order; this
         // loop is the only call site.
         for handler in &handlers {
+            // #941: wrap each handler.run() in an Instant measurement so
+            // `HANDLER_TIMING` (per_tick/mod.rs) accumulates per-handler
+            // stats for the periodic ThreadDumpHandler. When thread-dump
+            // is disabled, `record_handler_timing` is a sub-µs no-op
+            // (one cached atomic load + early return).
+            let start = std::time::Instant::now();
             handler.run(&tick_ctx);
+            per_tick::record_handler_timing(handler.name(), start.elapsed());
         }
 
         // Handle exit event (if any)

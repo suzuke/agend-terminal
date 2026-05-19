@@ -203,6 +203,57 @@ pub fn lock_registry(
     reg.lock()
 }
 
+/// #941: registry-lock wrapper that records the holder for the periodic
+/// thread-dump observability handler. Use this in per_tick handler call
+/// sites where wedge-detection matters; bare [`lock_registry`] is
+/// retained for the ~30 other in-tree sites (wrapper-only blind spot —
+/// see PR body for caveat).
+///
+/// The `site` label is `&'static str` so the dump output can group
+/// holders by call-site without allocation overhead. Convention: snake
+/// case matching the handler name (`"hang_detection"`, `"watchdog"`,
+/// etc.) so operators grepping the dump output can match against the
+/// per-tick handler vec.
+///
+/// Zero overhead when `AGEND_DAEMON_THREAD_DUMP_SECS` is unset:
+/// `set_registry_holder` / `clear_registry_holder` early-return after
+/// one cached atomic load.
+pub fn lock_registry_tracked<'a>(reg: &'a AgentRegistry, site: &'static str) -> RegistryGuard<'a> {
+    crate::sync_audit::assert_lock_tier(1, "registry");
+    let inner = reg.lock();
+    crate::sync_audit::set_registry_holder(site);
+    RegistryGuard { inner }
+}
+
+/// RAII guard returned by [`lock_registry_tracked`]. Deref's to the
+/// underlying `HashMap<String, AgentHandle>`. On drop, clears
+/// `REGISTRY_HOLDER` then the inner `MutexGuard` releases the lock
+/// (field drop order). The brief slot-cleared-before-lock-released
+/// window is harmless — the next acquirer's own `set_registry_holder`
+/// fires immediately after their acquire.
+pub struct RegistryGuard<'a> {
+    inner: parking_lot::MutexGuard<'a, std::collections::HashMap<String, AgentHandle>>,
+}
+
+impl<'a> std::ops::Deref for RegistryGuard<'a> {
+    type Target = std::collections::HashMap<String, AgentHandle>;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<'a> std::ops::DerefMut for RegistryGuard<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl<'a> Drop for RegistryGuard<'a> {
+    fn drop(&mut self) {
+        crate::sync_audit::clear_registry_holder();
+    }
+}
+
 /// ANSI escape sequence stripper for dialog detection.
 /// Public ANSI strip for capture command.
 pub fn strip_ansi_pub(s: &str) -> String {

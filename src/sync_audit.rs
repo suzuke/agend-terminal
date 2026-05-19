@@ -7,8 +7,16 @@
 //! - `cargo test`: panics on violation (fails the test).
 //! - Release with `AGEND_LOCK_AUDIT=1`: logs error, no panic.
 //! - Default release: macros compile to `()` — zero overhead.
+//!
+//! #941: extended with a global `REGISTRY_HOLDER` slot for the
+//! [`crate::agent::lock_registry_tracked`] wrapper — feeds the
+//! periodic thread-dump observability handler. Gated by
+//! `AGEND_DAEMON_THREAD_DUMP_SECS` (parsed once via [`thread_dump_enabled`]
+//! into a `OnceLock<bool>`; cannot be live-toggled after daemon start).
 
 use std::cell::Cell;
+use std::sync::OnceLock;
+use std::time::Instant;
 
 thread_local! {
     /// Current highest lock tier held by this thread. 0 = no lock held.
@@ -93,6 +101,77 @@ macro_rules! lock_tier_assert {
         $crate::sync_audit::assert_lock_tier($tier, $name);
         $crate::sync_audit::lock_acquired($tier);
     };
+}
+
+// ── #941: registry-lock holder tracking for thread-dump observability ──
+//
+// `REGISTRY_HOLDER` is updated by [`crate::agent::lock_registry_tracked`]
+// on acquire and cleared by the returned `RegistryGuard`'s `Drop`. The
+// periodic thread-dump handler in `daemon::per_tick::thread_dump` reads
+// it via [`current_registry_holder`].
+//
+// **Wrapper-only blind spot** (documented in PR body): ~30 bare
+// `reg.lock()` call sites bypass this tracker. Operator interpreting
+// `registry_holder=None` in a dump MUST NOT conclude "no wedge" —
+// non-handler sites are not visible here. The dump's load-bearing value
+// is for the per-tick handler wedge case (#932 RCA H1 hypothesis).
+
+#[derive(Debug, Clone)]
+pub struct HolderInfo {
+    pub thread_name: String,
+    pub acquired_at: Instant,
+    pub site_label: &'static str,
+}
+
+static REGISTRY_HOLDER: parking_lot::Mutex<Option<HolderInfo>> = parking_lot::Mutex::new(None);
+
+/// Cached env-var check — parsed once on first call into a `OnceLock<bool>`.
+/// Operator must restart the daemon to change the gate; live toggling is
+/// explicitly not supported (cost: per-call atomic load only after init).
+pub fn thread_dump_enabled() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("AGEND_DAEMON_THREAD_DUMP_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|n| n > 0)
+            .unwrap_or(false)
+    })
+}
+
+/// Update `REGISTRY_HOLDER` with the current thread's identity + site
+/// label. Called by `lock_registry_tracked` immediately AFTER the
+/// `reg.lock()` returns. No-op when [`thread_dump_enabled`] returns
+/// false (default).
+pub fn set_registry_holder(site: &'static str) {
+    if !thread_dump_enabled() {
+        return;
+    }
+    let info = HolderInfo {
+        thread_name: std::thread::current()
+            .name()
+            .unwrap_or("unnamed")
+            .to_string(),
+        acquired_at: Instant::now(),
+        site_label: site,
+    };
+    *REGISTRY_HOLDER.lock() = Some(info);
+}
+
+/// Clear `REGISTRY_HOLDER`. Called by `RegistryGuard::drop` AFTER the
+/// underlying parking_lot MutexGuard is implicitly dropped (so the
+/// observability slot is freed strictly after the real lock is freed).
+pub fn clear_registry_holder() {
+    if !thread_dump_enabled() {
+        return;
+    }
+    *REGISTRY_HOLDER.lock() = None;
+}
+
+/// Snapshot the current holder for the periodic dump handler. Cloned
+/// because the dump handler runs on a different thread than the holder.
+pub fn current_registry_holder() -> Option<HolderInfo> {
+    REGISTRY_HOLDER.lock().clone()
 }
 
 #[cfg(test)]

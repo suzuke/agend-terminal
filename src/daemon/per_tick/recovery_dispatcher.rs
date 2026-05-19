@@ -209,7 +209,8 @@ impl PerTickHandler for RecoveryDispatcherHandler {
     }
 
     fn run(&self, ctx: &TickContext<'_>) {
-        let reg = agent::lock_registry(ctx.registry);
+        // #941: holder-tracking wrapper for thread-dump observability.
+        let reg = agent::lock_registry_tracked(ctx.registry, "recovery_dispatcher");
         let stage1_active = stage1_gate_active();
         let stage1_timeout = env_ms(STAGE1_TIMEOUT_ENV_VAR, STAGE1_TIMEOUT_DEFAULT_MS);
         let stage1_cooldown = env_ms(STAGE1_COOLDOWN_ENV_VAR, STAGE1_COOLDOWN_DEFAULT_MS);

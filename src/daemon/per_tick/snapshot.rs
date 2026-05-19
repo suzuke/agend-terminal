@@ -31,7 +31,8 @@ impl PerTickHandler for SnapshotRotationHandler {
         // top-down): registry (L0) → configs (L0) → per-agent core (L1,
         // briefly inside the map closure). Identical to the pre-extraction
         // inline block.
-        let reg = agent::lock_registry(ctx.registry);
+        // #941: holder-tracking wrapper for thread-dump observability.
+        let reg = agent::lock_registry_tracked(ctx.registry, "snapshot_rotation");
         let cfgs = ctx.configs.lock();
         let snapshots: Vec<_> = reg
             .iter()

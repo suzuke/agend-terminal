@@ -36,7 +36,11 @@ impl PerTickHandler for HangDetectionHandler {
         // Rule 3: the leaf lock is never held while acquiring another
         // lock — `snapshot_for` returns a copy and drops its pair guard
         // before `check_hang` runs.
-        let reg = agent::lock_registry(ctx.registry);
+        // #941: use the holder-tracking wrapper so the periodic
+        // ThreadDumpHandler can surface "hang_detection wedged" if this
+        // handler ever blocks the main loop (the H1 hypothesis from
+        // #932 RCA).
+        let reg = agent::lock_registry_tracked(ctx.registry, "hang_detection");
         for (name, handle) in reg.iter() {
             let mut core = handle.core.lock();
             core.health.maybe_decay();

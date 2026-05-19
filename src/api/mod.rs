@@ -228,7 +228,22 @@ pub fn serve(
         .unwrap_or(32);
     let active_conns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
+    // #941: signal listener entered the `accept()` blocking phase.
+    // ThreadDumpHandler reads LISTENER_PHASE to surface H7 evidence
+    // (whether the API listener is currently blocked on accept vs
+    // actively dispatching a connection).
+    LISTENER_PHASE.store(
+        LISTENER_PHASE_IN_ACCEPT,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+
     for stream in listener.incoming().flatten() {
+        // Phase flips to "processing" while we set up the per-session
+        // thread; flips back to in_accept at top of next iteration.
+        LISTENER_PHASE.store(
+            LISTENER_PHASE_PROCESSING,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let _ = stream.set_nodelay(true);
         // #680: atomic reserve-then-check (no race between check and increment)
         let prev = active_conns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -263,6 +278,7 @@ pub fn serve(
             .name("api_handler".into())
             .spawn(move || {
                 let _census = crate::thread_census::register("api_handler");
+                ACTIVE_API_SESSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 handle_session(
                     stream,
                     &reg,
@@ -273,6 +289,7 @@ pub fn serve(
                     ntf.as_deref(),
                     session_cookie,
                 );
+                ACTIVE_API_SESSIONS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 conn_counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             })
             .is_err()
@@ -280,8 +297,49 @@ pub fn serve(
             spawn_counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             tracing::warn!("failed to spawn API handler thread");
         }
+        // Back to accept-blocking phase before the next iteration's
+        // blocking incoming().next().
+        LISTENER_PHASE.store(
+            LISTENER_PHASE_IN_ACCEPT,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 }
+
+// ── #941: thread-dump observability surface (Dim 4) ────────────────────
+//
+// Two atomics exposed for `daemon::per_tick::thread_dump::ThreadDumpHandler`:
+//
+// - LISTENER_PHASE: which phase the API listener thread is in
+//   (0 = processing a connection, 1 = blocked in accept()). Helps
+//   diagnose H7 (signal handler thread starved by long-running blocking
+//   work) by showing whether the listener is in the expected resting
+//   state during a wedge.
+// - ACTIVE_API_SESSIONS: count of in-flight `handle_session` threads.
+//   Surrogate for "how many concurrent API requests are being processed";
+//   pairs with the registry-holder + handler-timing dimensions for a
+//   complete daemon-thread snapshot.
+//
+// Both use `Ordering::Relaxed` because exact serialization across cores
+// isn't needed for periodic dump observability (dump is wall-clock
+// sampled, not transaction-ordered). The counters are monotonically
+// incremented/decremented on the same thread per session, so no
+// inter-thread ordering matters for individual values.
+
+pub const LISTENER_PHASE_PROCESSING: u8 = 0;
+pub const LISTENER_PHASE_IN_ACCEPT: u8 = 1;
+
+/// Current API listener thread phase. Read by the periodic thread-dump
+/// handler. Zero (`LISTENER_PHASE_PROCESSING`) on initial daemon boot
+/// before `serve` runs; set to `LISTENER_PHASE_IN_ACCEPT` immediately
+/// before `listener.incoming()`.
+pub static LISTENER_PHASE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(LISTENER_PHASE_PROCESSING);
+
+/// Active API session count (per-connection `handle_session` threads
+/// in flight). Read by the periodic thread-dump handler.
+pub static ACTIVE_API_SESSIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 #[allow(clippy::too_many_arguments)]
 fn handle_session(
