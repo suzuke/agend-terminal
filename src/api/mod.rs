@@ -195,6 +195,10 @@ pub fn serve(
     externals: ExternalRegistry,
     notifier: Option<Arc<dyn ApiNotifier>>,
 ) {
+    // #945 Phase 0: time the bind+port-publish step directly (not the
+    // spawn of api::serve thread — that's sub-ms). Operators care about
+    // "when did api.port appear" for cold-start latency tracking.
+    let _api_port_bind_start = std::time::Instant::now();
     let listener: TcpListener = match crate::ipc::bind_loopback() {
         Ok(l) => l,
         Err(e) => {
@@ -208,6 +212,11 @@ pub fn serve(
         tracing::warn!(error = %e, "failed to publish API port");
         return;
     }
+    tracing::info!(
+        step = "api::serve::bind_and_publish_port",
+        elapsed_ms = _api_port_bind_start.elapsed().as_millis() as u64,
+        "bootstrap-step"
+    );
     // P1-10: Load the per-daemon auth cookie (already issued by
     // `daemon::run` / `verify::run` before any server thread spawned). If
     // it's missing we fail closed — running without auth would be worse

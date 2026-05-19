@@ -399,10 +399,12 @@ fn run_core(
     // GC sites added later would pass currently-resolved digests.
     // Best-effort: failures log + continue, never block boot.
     const SKILLS_STAGE_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
-    match crate::skills::cleanup_stale_stages(home, SKILLS_STAGE_RETENTION_SECS, &[]) {
-        Ok(report) => tracing::info!(?report, "skills-stage GC: daemon-init sweep complete"),
-        Err(e) => tracing::warn!(error = %e, "skills-stage GC: daemon-init sweep failed"),
-    }
+    crate::bootstrap::time_step("skills::cleanup_stale_stages", || {
+        match crate::skills::cleanup_stale_stages(home, SKILLS_STAGE_RETENTION_SECS, &[]) {
+            Ok(report) => tracing::info!(?report, "skills-stage GC: daemon-init sweep complete"),
+            Err(e) => tracing::warn!(error = %e, "skills-stage GC: daemon-init sweep failed"),
+        }
+    });
 
     // Sprint 63 W1 PR-2 (Sprint 58 P2 #5): sweep stale `*.tmp` /
     // `*.json.tmp` orphans under <home>/dedup-state/ left behind by
@@ -412,8 +414,9 @@ fn run_core(
     // Best-effort: failures log + continue (function returns
     // DedupStateGcReport directly, no Err path).
     const DEDUP_TMP_RETENTION_SECS: u64 = 24 * 60 * 60;
-    let dedup_report =
-        crate::daemon::dedup_state::cleanup_tmp_orphans(home, DEDUP_TMP_RETENTION_SECS);
+    let dedup_report = crate::bootstrap::time_step("dedup_state::cleanup_tmp_orphans", || {
+        crate::daemon::dedup_state::cleanup_tmp_orphans(home, DEDUP_TMP_RETENTION_SECS)
+    });
     tracing::info!(?dedup_report, "dedup-state GC: daemon-init sweep complete");
 
     // Sprint 24 P0 PR2 — bridge-phase legacy migration. Walks tasks.json
@@ -423,7 +426,11 @@ fn run_core(
     // tool registration / agent spawn so operators never observe a "list
     // empty" race. Fail-loud: any error aborts daemon startup so the
     // operator sees the failure rather than silently inconsistent state.
-    match crate::tasks::migrate_legacy_tasks_json_to_event_log(home) {
+    let legacy_migration =
+        crate::bootstrap::time_step("tasks::migrate_legacy_tasks_json_to_event_log", || {
+            crate::tasks::migrate_legacy_tasks_json_to_event_log(home)
+        });
+    match legacy_migration {
         Ok(rep) => tracing::info!(
             migrated = rep.migrated,
             skipped = rep.skipped,
@@ -488,27 +495,29 @@ fn run_core(
 
     tracing::info!(count = agents.len(), "starting agents");
 
-    for def in &agents {
-        // #896 Option D: spawn_and_register_agent now rolls back on
-        // synchronous TUI prep failure and returns Err. We log + skip
-        // the affected agent rather than aborting the entire daemon
-        // startup — operator sees `agend-terminal list` shorter than
-        // fleet.yaml expected + daemon log explains which agent failed
-        // and why. Daemon-as-a-whole stays up so the surviving agents
-        // are still usable while the operator investigates.
-        if let Err(e) =
-            spawn_and_register_agent(home, def, &registry, &configs, &crash_tx, &shutdown)
-        {
-            tracing::error!(
-                agent = %def.0,
-                error = %e,
-                "spawn_and_register_agent rolled back; agent NOT in fleet"
-            );
+    crate::bootstrap::time_step("agent_spawn_loop", || {
+        for def in &agents {
+            // #896 Option D: spawn_and_register_agent now rolls back on
+            // synchronous TUI prep failure and returns Err. We log + skip
+            // the affected agent rather than aborting the entire daemon
+            // startup — operator sees `agend-terminal list` shorter than
+            // fleet.yaml expected + daemon log explains which agent failed
+            // and why. Daemon-as-a-whole stays up so the surviving agents
+            // are still usable while the operator investigates.
+            if let Err(e) =
+                spawn_and_register_agent(home, def, &registry, &configs, &crash_tx, &shutdown)
+            {
+                tracing::error!(
+                    agent = %def.0,
+                    error = %e,
+                    "spawn_and_register_agent rolled back; agent NOT in fleet"
+                );
+            }
+            if agents.len() > 1 {
+                std::thread::sleep(spawn_stagger());
+            }
         }
-        if agents.len() > 1 {
-            std::thread::sleep(spawn_stagger());
-        }
-    }
+    });
 
     // #922: write `<run_dir>/.ready` to signal daemon-init-complete —
     // the 4th lifecycle file alongside `.daemon` / `api.cookie` / `api.port`
@@ -522,10 +531,12 @@ fn run_core(
     // sub-stage signals extend `.ready`'s content (JSON payload), not
     // add new files. Cleanup is automatic via `remove_dir_all(run_dir)`
     // at shutdown (no new code path).
-    let ready_path = run_dir(home).join(".ready");
-    if let Err(e) = std::fs::write(&ready_path, chrono::Utc::now().to_rfc3339()) {
-        tracing::warn!(path = %ready_path.display(), error = %e, "failed to write .ready marker");
-    }
+    crate::bootstrap::time_step("ready_marker_write", || {
+        let ready_path = run_dir(home).join(".ready");
+        if let Err(e) = std::fs::write(&ready_path, chrono::Utc::now().to_rfc3339()) {
+            tracing::warn!(path = %ready_path.display(), error = %e, "failed to write .ready marker");
+        }
+    });
 
     // Shutdown wake channel — signal handler sends on this so the main loop's
     // select! wakes immediately instead of waiting up to 10s for the next tick.

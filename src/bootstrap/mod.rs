@@ -27,6 +27,34 @@ use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// #945 Phase 0 — wrap a bootstrap step with `Instant::now()` + emit a
+/// `tracing::info!` line carrying `step` + `elapsed_ms`. Operator post-boot:
+///
+/// ```bash
+/// grep "bootstrap-step" $AGEND_HOME/daemon.log | \
+///   grep -oE 'step="[^"]+" elapsed_ms=[0-9]+' | \
+///   sort -t= -k2 -n -r | head -10
+/// ```
+///
+/// Surfaces hottest steps for Phase 1+ optimization candidate selection.
+/// Pure instrumentation: zero behavior change, single `tracing::info!` per
+/// step. Generic over the wrapped fn's return type so it composes with both
+/// statement-style sites (`()` return) and expression-style sites (e.g.
+/// `Option<AttachedFleet>` from `try_attach`).
+pub(crate) fn time_step<T>(name: &'static str, f: impl FnOnce() -> T) -> T {
+    let t0 = std::time::Instant::now();
+    let result = f();
+    // Use default target (crate module path) so `tracing_test::traced_test`
+    // captures the event. Operator-side filtering uses the "bootstrap-step"
+    // message string + structured `step=` field — both grep-friendly.
+    tracing::info!(
+        step = name,
+        elapsed_ms = t0.elapsed().as_millis() as u64,
+        "bootstrap-step"
+    );
+    result
+}
+
 /// RAII guard for the daemon-exclusive `.daemon.lock` flock.
 ///
 /// Dropping the struct releases the lock. Keep this alive for the entire
@@ -130,16 +158,22 @@ impl Default for PrepareOptions {
 pub fn prepare(home: &Path, fleet_path: &Path, opts: PrepareOptions) -> Result<BootstrapOutcome> {
     std::fs::create_dir_all(home).with_context(|| format!("create home {}", home.display()))?;
 
-    if let Some(attached) = try_attach(home, fleet_path)? {
+    // #945 Phase 0 instrumentation: every reconcile / sweep / migration
+    // step in `prepare` + `run_core` is wrapped with `time_step` so the
+    // operator can post-boot grep `bootstrap-step` log lines for an
+    // empirical timing distribution.
+    if let Some(attached) = time_step("try_attach (pre-lock)", || try_attach(home, fleet_path))? {
         return Ok(BootstrapOutcome::Attached(attached));
     }
 
-    let lock = acquire_daemon_lock(home)?;
+    let lock = time_step("acquire_daemon_lock", || acquire_daemon_lock(home))?;
 
     // Re-check after lock acquired: someone may have raced between the early
     // check and the lock grant. If so, release our lock (by dropping) and
     // return Attached — another daemon owns the truth.
-    if let Some(attached) = try_attach(home, fleet_path)? {
+    if let Some(attached) = time_step("try_attach (post-lock-TOCTOU)", || {
+        try_attach(home, fleet_path)
+    })? {
         drop(lock);
         return Ok(BootstrapOutcome::Attached(attached));
     }
@@ -150,17 +184,23 @@ pub fn prepare(home: &Path, fleet_path: &Path, opts: PrepareOptions) -> Result<B
     // one `find_active_run_dir` visits on a later app launch can lure that
     // process into attaching to a dead daemon (symptom: input lag from 2s
     // port-poll hitting closed sockets).
-    crate::daemon::sweep_stale_run_dirs(home);
+    time_step("sweep_stale_run_dirs", || {
+        crate::daemon::sweep_stale_run_dirs(home);
+    });
     // #933: alive-but-stale zombie sweep — complements the dead-PID sweep
     // above. Always-on telemetry log per candidate; destructive kill is
     // env-gated via AGEND_DAEMON_BOOT_SWEEP_AGE_DAYS=N. Reuses #927 PR-B
     // primitives (`admin::cleanup_zombies`).
-    let _ = crate::daemon::boot_sweep::boot_sweep_zombies(home);
+    time_step("boot_sweep_zombies", || {
+        crate::daemon::boot_sweep::boot_sweep_zombies(home);
+    });
     // #942/#943: rename legacy-format watch files (DefaultHasher+non-canonical)
     // to canonical+sha256 form. One-shot at boot; idempotent on repeated runs.
     // Active migration (option b from dev-2 cross-audit Pushback 3) prevents
     // the 72h duplicate-notification window across the hash-scheme transition.
-    let _ = crate::daemon::ci_watch::migration::migrate_legacy_watch_filenames(home);
+    time_step("migrate_legacy_watch_filenames", || {
+        crate::daemon::ci_watch::migration::migrate_legacy_watch_filenames(home);
+    });
 
     let run_dir = crate::daemon::run_dir(home);
     std::fs::create_dir_all(&run_dir)
@@ -180,30 +220,44 @@ pub fn prepare(home: &Path, fleet_path: &Path, opts: PrepareOptions) -> Result<B
 
     let agents = if opts.resolve_agents {
         let fleet_dir = fleet_path.parent().unwrap_or(home);
-        agent_resolve::resolve(&config, fleet_dir, home)
+        time_step("agent_resolve::resolve", || {
+            agent_resolve::resolve(&config, fleet_dir, home)
+        })
     } else {
         Vec::new()
     };
 
     let telegram = if opts.init_telegram {
-        telegram_init::init(&config, home)
+        time_step("telegram_init::init", || telegram_init::init(&config, home))
     } else {
         None
     };
 
     // agend-git-shim init (shared by daemon + app mode).
-    crate::protocol::extract_default(home);
-    crate::binding::reconcile_hooks(home);
-    crate::binding::symlink_shim(home);
-    crate::binding::reconcile_orphans(home);
-    crate::worktree_pool::reconcile_orphan_leases(home);
+    time_step("protocol::extract_default", || {
+        crate::protocol::extract_default(home);
+    });
+    time_step("binding::reconcile_hooks", || {
+        crate::binding::reconcile_hooks(home);
+    });
+    time_step("binding::symlink_shim", || {
+        crate::binding::symlink_shim(home);
+    });
+    time_step("binding::reconcile_orphans", || {
+        crate::binding::reconcile_orphans(home);
+    });
+    time_step("worktree_pool::reconcile_orphan_leases", || {
+        crate::worktree_pool::reconcile_orphan_leases(home);
+    });
     // #852 PR-C: canonical-repo hygiene. Scan distinct source_repo
     // values from fleet.yaml; for each canonical, auto-switch
     // detached HEAD back to main if the working tree is clean, or
     // warn-log if dirty (operator WIP protection). Pure observation
     // beyond the single `git switch main` mutation when conditions
     // are right. Best-effort — boot continues regardless.
-    canonical_hygiene::run_hygiene(&config);
+    time_step("canonical_hygiene::run_hygiene", || {
+        canonical_hygiene::run_hygiene(&config);
+    });
     // #829 Fix A: boot-time orphan-owner sweep. We pass `live = ∅`
     // explicitly because `api::serve` hasn't bound the Unix socket
     // yet (that happens later in `daemon::run_with_prepared`) and no
@@ -216,7 +270,9 @@ pub fn prepare(home: &Path, fleet_path: &Path, opts: PrepareOptions) -> Result<B
     // "agent not yet spawned" case isn't over-orphaned. Periodic
     // post-boot callers should keep using `reconcile_orphan_owners`
     // which still fetches `live` from the running daemon.
-    crate::tasks::reconcile_orphan_owners_with_live(home, &std::collections::HashSet::new());
+    time_step("tasks::reconcile_orphan_owners_with_live", || {
+        crate::tasks::reconcile_orphan_owners_with_live(home, &std::collections::HashSet::new());
+    });
 
     Ok(BootstrapOutcome::Owned(Box::new(OwnedFleet {
         home: home.to_path_buf(),
@@ -593,6 +649,88 @@ mod tests {
         assert_eq!(
             surviving, planted_cookie,
             "cookie bytes must be unchanged — try_attach must not have rewritten"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #945 Phase 0 instrumentation tests ──
+
+    /// Unit: `time_step` calls the wrapped fn exactly once and emits a
+    /// `bootstrap-step` log line carrying the expected `step` + `elapsed_ms`
+    /// fields.
+    #[tracing_test::traced_test]
+    #[test]
+    fn time_step_emits_log_with_step_name_and_elapsed_ms() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let counter = AtomicU32::new(0);
+        let result = time_step("test_step_name", || {
+            counter.fetch_add(1, Ordering::Relaxed);
+            42
+        });
+        assert_eq!(result, 42, "wrapped fn return value must pass through");
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            1,
+            "wrapped fn must be called exactly once"
+        );
+        assert!(
+            logs_contain("bootstrap-step"),
+            "log must include the bootstrap-step message"
+        );
+        assert!(
+            logs_contain("test_step_name"),
+            "log must include the step name field"
+        );
+        assert!(
+            logs_contain("elapsed_ms"),
+            "log must include the elapsed_ms field"
+        );
+    }
+
+    /// Integration: `prepare` emits at least 13 `bootstrap-step` log lines
+    /// covering the canonical reconcile / sweep / migration steps. We don't
+    /// pin the exact count (sites may grow over time) but assert every
+    /// step name we instrumented is present.
+    #[tracing_test::traced_test]
+    #[test]
+    fn prepare_emits_bootstrap_step_lines_for_every_instrumented_site() {
+        let home = tmp_home("945-bootstrap-steps");
+        let fleet = write_minimal_fleet(&home);
+        // resolve_agents=false keeps the test fast (no agent worktree
+        // creation) while still exercising every other step.
+        let opts = PrepareOptions {
+            mutate_fleet_yaml: false,
+            init_telegram: false,
+            resolve_agents: false,
+        };
+        let _ = prepare(&home, &fleet, opts).expect("prepare must succeed");
+
+        // Canonical step names instrumented in `prepare`. New sites added
+        // by future PRs should also appear here so the test catches
+        // regressions where someone strips the `time_step` wrapper.
+        let expected_steps = [
+            "try_attach (pre-lock)",
+            "acquire_daemon_lock",
+            "sweep_stale_run_dirs",
+            "boot_sweep_zombies",
+            "migrate_legacy_watch_filenames",
+            "protocol::extract_default",
+            "binding::reconcile_hooks",
+            "binding::symlink_shim",
+            "binding::reconcile_orphans",
+            "worktree_pool::reconcile_orphan_leases",
+            "canonical_hygiene::run_hygiene",
+            "tasks::reconcile_orphan_owners_with_live",
+        ];
+        for step in expected_steps {
+            assert!(
+                logs_contain(step),
+                "prepare must emit bootstrap-step for `{step}`"
+            );
+        }
+        assert!(
+            logs_contain("bootstrap-step"),
+            "logs must include the bootstrap-step message marker"
         );
         std::fs::remove_dir_all(&home).ok();
     }
