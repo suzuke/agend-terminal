@@ -778,6 +778,59 @@ mod tests {
         None
     }
 
+    /// #949 RED: synthetic reproduction of the `await_sentinel` write-vs-read race.
+    ///
+    /// A writer thread (mimics the shell script's `printf > sentinel`):
+    ///   Phase 1: creates the sentinel file EMPTY (open-truncate).
+    ///   Phase 2: sleeps to simulate the CI-contention write-flush gap.
+    ///   Phase 3: writes the actual content.
+    ///
+    /// Under the pre-#949 `await_sentinel` logic, the poll observes
+    /// `exists() + read_to_string == Ok("")` during Phase 1, takes the
+    /// `return Some(c)` early-return, and yields `Some("")` BEFORE
+    /// content commits. The fix (#949 GREEN) polls until non-empty.
+    ///
+    /// This test FAILS against the pre-fix logic deterministically
+    /// (Phase 1's empty window is engineered to overlap the 50ms poll
+    /// cadence). Post-fix it PASSES.
+    #[cfg(unix)]
+    #[test]
+    fn await_sentinel_waits_for_nonempty_content_949() {
+        let sentinel = std::env::temp_dir().join(format!(
+            "agend-949-await-test-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&sentinel);
+
+        let writer_path = sentinel.clone();
+        let writer = std::thread::spawn(move || {
+            // Phase 1: create empty (printf's open-truncate stage).
+            std::fs::write(&writer_path, "").expect("create empty");
+            // Phase 2: simulate CI-contention write-flush gap. 200ms
+            // is 4× the poll cadence (50ms) — guarantees the reader
+            // polls into the empty window at least once.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            // Phase 3: commit content.
+            std::fs::write(&writer_path, "value-from-params").expect("commit");
+        });
+
+        let result = await_sentinel(&sentinel);
+        writer.join().expect("writer joined");
+
+        assert_eq!(
+            result.as_deref(),
+            Some("value-from-params"),
+            "await_sentinel must wait for non-empty content commit, not \
+             early-return on the open-truncate empty window. Got {result:?}"
+        );
+
+        let _ = std::fs::remove_file(&sentinel);
+    }
+
     /// #900 ingress 1 — `handle_spawn` MUST extract `env` from `params`
     /// and propagate it down `spawn_one` → `spawn_agent` → `build_command`
     /// so the child process inherits the requested env vars. Pre-fix
