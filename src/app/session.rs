@@ -5,8 +5,10 @@
 //! source depends on bootstrap mode:
 //!
 //! - **Owned**: agent registry = `fleet.yaml` instance names. Panes spawn local PTYs.
-//! - **Attached** (#895): agent registry = daemon's `list_agent_ports(run_dir)`.
-//!   Panes attach to daemon-owned PTYs via `create_remote_pane`.
+//! - **Attached** (#895 / #910): agent registry = daemon's in-memory registry
+//!   via `runtime::list_agents_with_fallback` (falls back to `.port` glob if
+//!   the API is briefly unresponsive). Panes attach to daemon-owned PTYs via
+//!   `create_remote_pane`.
 //!
 //! On restore we reconcile session against the active registry:
 //! - Agents in registry but missing from session → new tabs (Rule 3, team-grouped).
@@ -255,9 +257,10 @@ pub(super) fn restore_with_reconciliation(
     false
 }
 
-/// Restore with reconciliation (Attached mode, #895): daemon's `list_agent_ports`
-/// is source of truth for agents; session.json is a layout hint. Returns true
-/// if any tab was created.
+/// Restore with reconciliation (Attached mode, #895 / #910): daemon's
+/// in-memory registry via `runtime::list_agents_with_fallback` is source of
+/// truth for agents; session.json is a layout hint. Returns true if any tab
+/// was created.
 ///
 /// Mirrors `restore_with_reconciliation` (Owned) but uses `create_remote_pane`
 /// for pane construction. Shell panes from a session.json saved in Owned mode

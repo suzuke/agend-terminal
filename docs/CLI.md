@@ -54,7 +54,9 @@ agend-terminal inject <name> <text...>
 ```
 
 ### `list` / `ls` / `status`
-List running agents. Plain `list` reads run-dir port files directly (works even when the daemon API is briefly unresponsive). Pass `--detailed`/`-d` (or `--json`, which implies detailed) for state / health / backend info via the daemon API.
+List running agents. Plain `list` queries the daemon's in-memory registry via `runtime::list_agents_with_fallback`; when the daemon API is briefly unresponsive (e.g. mid-restart) it falls back to scanning run-dir `.port` files so the command still returns a best-effort answer. Pass `--detailed`/`-d` (or `--json`, which implies detailed) for state / health / backend info via the daemon API (no fallback — `--detailed` requires the daemon to be reachable).
+
+The daemon's in-memory registry is the canonical source of truth for "which agents exist"; the `.port` files are TUI-bridge per-agent socket artifacts and only surface in the offline fallback. Operator scripts wanting authoritative output should pipe `--json` rather than parse plain `list`.
 
 ```
 agend-terminal list [--detailed] [--json]

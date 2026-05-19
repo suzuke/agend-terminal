@@ -2111,6 +2111,15 @@ mod tests {
         // entries than the loop has produced (TUI threads race). Post-fix,
         // every iteration's port is on disk by the time the next iteration
         // begins, so list_agent_ports == iteration_count holds at each step.
+        //
+        // #910 PR4 note: post-#910 the app's canonical discovery path is
+        // `runtime::list_agents_with_fallback`, NOT bare
+        // `ipc::list_agent_ports`. This test still uses the bare fn
+        // intentionally — it locks the FILESYSTEM contract (the .port
+        // file is present synchronously after spawn returns), which is
+        // the worst-case fallback path the helper would expose when the
+        // daemon API is briefly unresponsive. Testing the bare fn here
+        // covers the helper's degraded mode by construction.
         let home = tmp_home("attach_during_stagger");
         let run_dir = setup_run_dir_with_cookie(&home);
         let (registry, configs, crash_tx, _crash_rx, shutdown) = make_test_registry();

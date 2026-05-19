@@ -693,7 +693,8 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // belongs to the app, NOT the daemon. Saving session.json in Attached
     // mode lets the next attached relaunch restore custom layout via the
     // same reconciliation path Owned mode uses (parameterized over agent
-    // source: fleet.yaml for Owned, `list_agent_ports` for Attached).
+    // source: fleet.yaml for Owned, `runtime::list_agents_with_fallback`
+    // for Attached — see #910 for the registry-truth migration).
     session::save_session(&home, &layout);
     if !attached_mode {
         // Sync fleet.yaml to match current state (Owned-only — daemon owns
