@@ -24,16 +24,19 @@ pub(super) fn plist_path() -> Result<PathBuf, String> {
 
 pub(super) fn install(home: &Path, exe: &Path) -> Result<PathBuf, String> {
     let plist = plist_path()?;
-    let log_path = home.join("daemon.log");
     // Sprint 57 Wave 3 PR-3 r2 (Tier-2 Pass 2 fixup): XML-escape every
     // substituted value before splicing into the plist template.
     // Paths containing `&` (e.g. macOS network shares) or `<`, `>`,
     // `"`, `'` (rare but legal in user paths) would otherwise produce
     // malformed plist that `launchctl load -w` rejects with cryptic
     // errors. Pure entity-escape; safe even when no special chars.
+    //
+    // #914: the `__LOG__` placeholder is gone. The template hard-codes
+    // `/dev/null` for StandardOutPath/StandardErrorPath now that the
+    // daemon's tracing-appender owns log output; operators tail
+    // `$AGEND_HOME/daemon.log` (the symlink) instead.
     let exe_escaped = xml_escape(&exe.display().to_string());
     let home_escaped = xml_escape(&home.display().to_string());
-    let log_escaped = xml_escape(&log_path.display().to_string());
     let label_escaped = xml_escape(SERVICE_LABEL);
     let resolved = apply_substitutions(
         LAUNCHD_TEMPLATE,
@@ -41,7 +44,6 @@ pub(super) fn install(home: &Path, exe: &Path) -> Result<PathBuf, String> {
             ("__LABEL__", label_escaped.as_str()),
             ("__EXECUTABLE__", exe_escaped.as_str()),
             ("__HOME__", home_escaped.as_str()),
-            ("__LOG__", log_escaped.as_str()),
         ],
     );
     if let Some(parent) = plist.parent() {

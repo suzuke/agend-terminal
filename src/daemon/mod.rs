@@ -582,6 +582,10 @@ fn run_core(
         Box::new(per_tick::CiWatchPollHandler::new()),
         Box::new(per_tick::InboxMaintenanceHandler::new(60)),
         Box::new(per_tick::PollReminderHandler::new(30)),
+        // #914 hourly cleanup: 10s tick × 360 = 3600s. Hard backstop on
+        // daemon.log.* dir size beyond what `max_log_files` enforces,
+        // plus the Unix symlink-to-newest refresh.
+        Box::new(per_tick::LogRotationHandler::new(360)),
     ];
 
     // Periodic tick channel (every 10s for health/schedule/session maintenance)

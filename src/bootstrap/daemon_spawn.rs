@@ -36,15 +36,15 @@ pub fn spawn_detached(home: &Path, fleet_path: Option<&Path>) -> Result<DaemonHa
     let exe = std::env::current_exe().context("resolve current_exe for detach spawn")?;
 
     std::fs::create_dir_all(home).with_context(|| format!("create home {}", home.display()))?;
+    // #914: `log_path` is now the symlink the daemon child maintains
+    // (Unix) or the operator-tail target. We no longer redirect the
+    // child's stdio here — the child's in-process `tracing_appender::rolling`
+    // owns all log output. stdio → `/dev/null` so panics-before-tracing-init
+    // / third-party direct-stderr writes don't accumulate in an unbounded
+    // file. The bridged `panic::set_hook` (installed in
+    // `crate::logging::setup_daemon_tracing`) routes panics through tracing
+    // into the rotated log files.
     let log_path = home.join("daemon.log");
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .with_context(|| format!("open daemon log {}", log_path.display()))?;
-    let log_err = log
-        .try_clone()
-        .context("clone daemon log handle for stderr")?;
 
     let mut cmd = Command::new(&exe);
     cmd.arg("start");
@@ -63,8 +63,8 @@ pub fn spawn_detached(home: &Path, fleet_path: Option<&Path>) -> Result<DaemonHa
         cmd.arg("--fleet").arg(fp);
     }
     cmd.stdin(Stdio::null())
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(log_err));
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
 
     #[cfg(unix)]
     {

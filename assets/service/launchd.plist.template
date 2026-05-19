@@ -8,7 +8,13 @@ Placeholders (substituted at install time by service::install):
   __LABEL__       = "com.agend-terminal.daemon"
   __EXECUTABLE__  = absolute path to the agend-terminal binary
   __HOME__        = absolute path to AGEND_HOME
-  __LOG__         = absolute path to daemon stdout/stderr log
+
+  #914: StandardOutPath / StandardErrorPath were previously the daemon's
+  unbounded `$AGEND_HOME/daemon.log`. The daemon now writes via the
+  rotating tracing-appender in-process, so launchd's stdio capture is
+  routed to /dev/null to avoid a second (un-rotated) log file. Operators
+  tail the rotated `$AGEND_HOME/daemon.log` (Unix: symlink → newest
+  rotated file; Windows: `glob daemon.log.*`).
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -31,9 +37,9 @@ Placeholders (substituted at install time by service::install):
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>__LOG__</string>
+    <string>/dev/null</string>
     <key>StandardErrorPath</key>
-    <string>__LOG__</string>
+    <string>/dev/null</string>
     <key>ProcessType</key>
     <string>Background</string>
 </dict>

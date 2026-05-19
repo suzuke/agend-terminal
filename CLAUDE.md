@@ -57,6 +57,36 @@ when calling `mcp__agend-terminal__repo action=checkout`, pass a non-main
 `branch` argument (the daemon honours it verbatim and will not derive a fresh
 branch for you).
 
+## Daemon logging (#914)
+
+Daemon tracing writes to a daily-rotating file via `tracing_appender::rolling`
+at `$AGEND_HOME/daemon.log.<YYYY-MM-DD>`. Retention defaults:
+
+- `AGEND_LOG_RETAIN_DAYS=N` (default 3) — `max_log_files` cap
+- `AGEND_LOG_MAX_BYTES=2G` (or plain integer / `K`/`M`/`G` suffix) — hard
+  directory-size backstop; hourly tick prunes oldest if total exceeds
+
+Operator tail target stays `$AGEND_HOME/daemon.log` — on Unix it's a
+symlink to the newest rotated file (re-pointed by the same hourly tick);
+on Windows operators `glob daemon.log.*` (Developer Mode required for
+symlink support).
+
+**Accepted regressions vs pre-#914**:
+
+- ANSI color codes no longer in the log (`with_ansi(false)`) — operator
+  scripts grepping plain text now work without `sed 's/\x1b\[[0-9;]*m//g'`.
+- systemd / `journalctl -u agend-terminal` no longer carries the full
+  daemon trace; switch to `tail -F $AGEND_HOME/daemon.log`. (The unit
+  template's stdout/stderr now only capture panics + migration-failure
+  messages.)
+- macOS launchd plist's `StandardOutPath` / `StandardErrorPath` route to
+  `/dev/null`; same `tail` advice applies.
+
+On first boot after the #914 binary lands, any pre-existing `daemon.log`
+file (legacy unbounded) is renamed to `daemon.log.migration.<unix-epoch>`
+and the rolling appender takes over a fresh path. Migration is
+idempotent — re-running the old binary after the fix doesn't double-rotate.
+
 ## Release
 
 Tags matching `v*` trigger `.github/workflows/release.yml`, which builds 5
