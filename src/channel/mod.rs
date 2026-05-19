@@ -165,6 +165,52 @@ pub fn reset_active_channel_for_test() {
     channels_registry().write().clear();
 }
 
+/// #966: Outcome of [`ensure_topic_for`] — explicit enum (no
+/// `Option<String>`) so callers must handle each variant. Mirrors the
+/// #962 surface-failures discipline: silent `let _ = ...` patterns
+/// upgrade to explicit branches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TopicOutcome {
+    /// Topic created (or reused — idempotent via channel-side registry).
+    /// Inner string is the topic_id as channel-native format (telegram:
+    /// stringified i32; discord: stringified u64).
+    Created(String),
+    /// No channel registered at call-time. NOT an error — the instance
+    /// is operator-functional without a channel; just no telegram surface.
+    NoChannel,
+    /// Channel exists but `create_topic` returned `Err`. Caller should
+    /// `tracing::warn!` and surface to operator; the instance creation
+    /// should still proceed because topic creation is an enhancement,
+    /// not a hard precondition. (handle_spawn returns success even when
+    /// telegram is misconfigured — same contract.)
+    Failed(String),
+}
+
+/// #966 hub fn: look up the active channel AT CALL-TIME (not from a
+/// cached `Option<Arc<dyn Channel>>` snapshot) and ensure a topic
+/// exists for `name`. Replaces three replicated call sites:
+///
+/// - `src/api/handlers/instance.rs` (handle_spawn — MCP / deploy_template / api caller)
+/// - `src/api/handlers/team.rs` (team mode)
+/// - `src/app/tui_spawn.rs` (TUI Backend menu + command palette — #966 new)
+///
+/// **Why runtime lookup matters**: post-#945 Phase 1, telegram_init runs
+/// on a background thread. App startup-time snapshots of
+/// `Option<Arc<dyn Channel>>` are commonly `None`; the channel registers
+/// ~6s later via `register_active_channel`. Cached-snapshot callers
+/// silently no-op forever for that startup window's instances.
+/// `ensure_topic_for` queries `active_channel()` fresh on every call so
+/// the post-init channel is picked up automatically.
+pub fn ensure_topic_for(name: &str) -> TopicOutcome {
+    match active_channel() {
+        None => TopicOutcome::NoChannel,
+        Some(ch) => match ch.create_topic(name) {
+            Ok(topic) => TopicOutcome::Created(topic.id),
+            Err(e) => TopicOutcome::Failed(format!("{e}")),
+        },
+    }
+}
+
 /// Typed channel kind — replaces magic strings like `"telegram"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]

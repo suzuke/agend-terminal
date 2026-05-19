@@ -12,6 +12,7 @@ mod pane_factory;
 mod session;
 mod telegram_hooks;
 mod tui_events;
+mod tui_spawn;
 
 pub use overlay::{BoardView, MenuItem, MenuItemKind, TaskBoardMode};
 pub(crate) use tui_events::{TuiEvent, TuiEventSender, TuiNotifier};
