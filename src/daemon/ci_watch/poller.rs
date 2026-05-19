@@ -4067,6 +4067,32 @@ mod tests {
         );
     }
 
+    // Larger page size (POLL_RUNS_PAGE_SIZE=20) increases the chance that a
+    // single response contains runs for both the current head and prior
+    // shas (force-push, multiple pushes within poll interval). Verify that
+    // stale-sha runs never bleed into the current head's conclusion.
+    #[test]
+    fn aggregate_ignores_stale_sha_runs_in_response() {
+        let runs = vec![
+            // Current sha — all succeeded.
+            make_run(10, "current", Some("success")),
+            make_run(11, "current", Some("success")),
+            // Prior sha — failure must not leak into "current" conclusion.
+            make_run(8, "prior", Some("failure")),
+            make_run(9, "prior", Some("success")),
+        ];
+        assert_eq!(
+            aggregate_conclusion_for_sha(&runs, "current"),
+            Some("success"),
+            "stale-sha failure must not contaminate current head's aggregate"
+        );
+        assert_eq!(
+            aggregate_conclusion_for_sha(&runs, "prior"),
+            Some("failure"),
+            "prior-sha aggregate still computes independently"
+        );
+    }
+
     #[test]
     fn startup_sweep_preserves_valid_watches() {
         let home = tmp_dir("restart-persist");

@@ -2,6 +2,23 @@
 // Shared HTTP client for CI providers (Sprint 39 follow-up extraction)
 // ---------------------------------------------------------------------------
 
+/// Page size used by every provider's `poll_runs` query (GitHub
+/// `per_page`, GitLab `per_page`, Bitbucket `pagelen`). Caps how many of
+/// the most-recent runs on a branch we examine per poll.
+///
+/// The aggregator (`poller::aggregate_conclusion_for_sha`) groups runs
+/// by `head_sha` — only runs matching the current head contribute, the
+/// rest are filtered out, so a larger page costs ~one extra parse per
+/// stale entry and a few KB of bytes; rate-limit cost is unchanged (one
+/// call per poll regardless of page size).
+///
+/// Pre-bump value was 5. A push that fans out to ≥5 workflows would
+/// drop the oldest run from the response window, and the aggregator
+/// would silently report `success` from the surviving subset even if
+/// the dropped run failed. 20 gives 4× headroom over the present
+/// agend-terminal push fan-out and stays well under GitHub's 100-cap.
+pub(crate) const POLL_RUNS_PAGE_SIZE: u32 = 20;
+
 /// Auth scheme for CI provider HTTP requests.
 pub(crate) enum CiAuth {
     /// `Authorization: Bearer <token>` (GitHub)
@@ -268,7 +285,7 @@ impl CiProvider for GitHubCiProvider {
         let resp = self
             .http
             .get(&format!(
-                "repos/{repo}/actions/runs?branch={branch}&per_page=5"
+                "repos/{repo}/actions/runs?branch={branch}&per_page={POLL_RUNS_PAGE_SIZE}"
             ))
             .send()
             .await?;
@@ -570,7 +587,7 @@ impl CiProvider for GitLabCiProvider {
         let resp = self
             .http
             .get(&format!(
-                "projects/{project}/pipelines?ref={branch}&per_page=5"
+                "projects/{project}/pipelines?ref={branch}&per_page={POLL_RUNS_PAGE_SIZE}"
             ))
             .send()
             .await?;
@@ -786,7 +803,7 @@ impl CiProvider for BitbucketCiProvider {
         let resp = self
             .http
             .get(&format!(
-                "repositories/{repo}/pipelines/?target.branch={branch}&pagelen=5&sort=-created_on"
+                "repositories/{repo}/pipelines/?target.branch={branch}&pagelen={POLL_RUNS_PAGE_SIZE}&sort=-created_on"
             ))
             .send()
             .await?;
