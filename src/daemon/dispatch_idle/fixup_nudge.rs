@@ -120,7 +120,14 @@ fn emit_nudge(home: &Path, d: &PendingDispatch) -> bool {
         delivery_mode: Some("inbox_fallback".to_string()),
         task_id: d.correlation_id.clone(),
         force_meta: None,
-        correlation_id: d.correlation_id.clone(),
+        // #947: same fallback as emit_exceeded_event — see that site for
+        // design rationale (blend semantic acceptable due to `disp-`
+        // prefix convention).
+        correlation_id: Some(
+            d.correlation_id
+                .clone()
+                .unwrap_or_else(|| d.dispatch_id.clone()),
+        ),
         reviewed_head: None,
         attachments: Vec::new(),
         in_reply_to_msg_id: None,
