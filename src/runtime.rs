@@ -49,44 +49,121 @@ pub fn list_live_agents(home: &Path) -> Option<HashSet<String>> {
 // `src/main.rs:683`, `src/agent_ops.rs:339`) over to this helper in turn.
 // ──────────────────────────────────────────────────────────────────────
 
-/// Source of truth for the most-recent agent list resolution: API
-/// or filesystem-glob fallback.
+/// Source of truth for the most-recent agent list resolution.
+///
+/// #938 (Phase C): ternary refinement of the original binary
+/// `Live | Fallback` to distinguish two operationally-distinct fallback
+/// states for the CLI hint:
+/// - `FallbackDaemonStuck`: a daemon PID is alive (`is_pid_alive` true
+///   per `.daemon` file) but its API doesn't respond — transient
+///   condition (mid-restart / wedged main loop per #932 H1). Operator
+///   should wait or run `cleanup-zombies` if persistent.
+/// - `FallbackDaemonAbsent`: no `.daemon` file OR PID dead. Operator
+///   should boot a daemon.
+///
+/// Live remains "daemon API reachable, registry is truth-of-record".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AgentListMode {
+pub enum AgentListMode {
+    Live,
+    FallbackDaemonStuck,
+    FallbackDaemonAbsent,
+}
+
+impl AgentListMode {
+    /// Stable string identifier for JSON output / log fields. The string
+    /// values are part of the public contract surfaced by
+    /// `agend-terminal list --json` post-#938 and MUST NOT change
+    /// silently — any rename here is a JSON-shape break that operators
+    /// can pin via `--legacy-json`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AgentListMode::Live => "live",
+            AgentListMode::FallbackDaemonStuck => "fallback_daemon_stuck",
+            AgentListMode::FallbackDaemonAbsent => "fallback_daemon_absent",
+        }
+    }
+
+    /// Plain-output hint string surfaced to stderr alongside the agent
+    /// list. Includes transient-guidance phrasing so operators don't
+    /// panic on a single transient hit (per dev-2 cross-audit
+    /// sharpening #5).
+    pub fn hint(self) -> Option<&'static str> {
+        match self {
+            AgentListMode::Live => None,
+            AgentListMode::FallbackDaemonStuck => Some(
+                "(fallback — daemon API stuck. \
+                 May be transient (mid-restart); if persistent run `agend-terminal admin cleanup-zombies`)",
+            ),
+            AgentListMode::FallbackDaemonAbsent => Some(
+                "(fallback — no daemon detected. \
+                 If unexpected, start daemon via `agend-terminal app` or `agend-terminal daemon`)",
+            ),
+        }
+    }
+}
+
+/// Pre-#938 binary alias retained for internal `note_mode_transition`
+/// log-grouping. Maps the ternary down to "did we fall back at all?"
+/// so the transition-log cadence (only on Live↔Fallback flips, NEVER
+/// per-call) survives the refinement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModeKind {
     Live,
     Fallback,
 }
 
-/// Track the most-recent mode so we can log Live↔Fallback transitions
-/// instead of every single call. Important because some callers
-/// (e.g. `src/app/mod.rs:621` periodic sync) fire every 2 seconds —
-/// per-call logging would dump ~1800 lines/hr of redundant info.
-static LAST_MODE: OnceLock<Mutex<Option<AgentListMode>>> = OnceLock::new();
+impl From<AgentListMode> for ModeKind {
+    fn from(m: AgentListMode) -> Self {
+        match m {
+            AgentListMode::Live => ModeKind::Live,
+            AgentListMode::FallbackDaemonStuck | AgentListMode::FallbackDaemonAbsent => {
+                ModeKind::Fallback
+            }
+        }
+    }
+}
+
+/// Track the most-recent mode-kind so we can log Live↔Fallback
+/// transitions instead of every single call. Important because some
+/// callers (e.g. `src/app/mod.rs:621` periodic sync) fire every 2
+/// seconds — per-call logging would dump ~1800 lines/hr of redundant
+/// info.
+///
+/// #938: tracking key is `ModeKind` (binary) rather than the new
+/// ternary `AgentListMode` so that flipping between
+/// `FallbackDaemonStuck` ↔ `FallbackDaemonAbsent` (which CAN happen
+/// during a daemon restart cycle as the `.daemon` PID transiently
+/// dies) doesn't spam transition logs — the operator-visible state is
+/// "still in fallback", and the per-call kind is surfaced via the new
+/// `list_agents_with_fallback_with_mode()` return value instead of
+/// via log lines.
+static LAST_MODE: OnceLock<Mutex<Option<ModeKind>>> = OnceLock::new();
 
 fn note_mode_transition(new_mode: AgentListMode) {
+    let new_kind = ModeKind::from(new_mode);
     let lock = LAST_MODE.get_or_init(|| Mutex::new(None));
     let Ok(mut guard) = lock.lock() else {
         return;
     };
     let prev = *guard;
-    *guard = Some(new_mode);
-    match (prev, new_mode) {
-        (Some(AgentListMode::Live), AgentListMode::Fallback) => {
+    *guard = Some(new_kind);
+    match (prev, new_kind) {
+        (Some(ModeKind::Live), ModeKind::Fallback) => {
             tracing::info!(
                 "#910 list_agents_with_fallback: daemon offline → falling back to .port glob"
             );
         }
-        (Some(AgentListMode::Fallback), AgentListMode::Live) => {
+        (Some(ModeKind::Fallback), ModeKind::Live) => {
             tracing::info!(
                 "#910 list_agents_with_fallback: daemon reachable → registry is authoritative"
             );
         }
-        (None, mode) => {
+        (None, kind) => {
             // First call in process lifetime. One-time info-level entry
             // so operators grepping daemon.log can confirm the helper
             // initialized + observe the initial mode.
             tracing::info!(
-                ?mode,
+                ?kind,
                 "#910 list_agents_with_fallback: initial mode resolved"
             );
         }
@@ -132,31 +209,81 @@ fn note_mode_transition(new_mode: AgentListMode) {
 /// from the synthesis). PR3 migrates the 2 app-mode sites; PR4
 /// audits test-side residual.
 pub fn list_agents_with_fallback(home: &Path) -> Vec<String> {
+    list_agents_with_fallback_with_mode(home).0
+}
+
+/// #938: sibling of [`list_agents_with_fallback`] that ALSO returns the
+/// resolution mode so CLI surfaces can display a fallback hint.
+///
+/// Mode is ternary:
+/// - `Live` — daemon API reachable; registry is truth.
+/// - `FallbackDaemonStuck` — daemon PID alive but API non-responsive
+///   (mid-restart / wedged). Operator hint includes transient guidance.
+/// - `FallbackDaemonAbsent` — no daemon detected. Operator hint
+///   suggests starting one.
+///
+/// Returns `(sorted_agent_names, mode)`. The agent list is identical
+/// to what [`list_agents_with_fallback`] would return; this fn just
+/// exposes the mode that was previously internal-only.
+pub fn list_agents_with_fallback_with_mode(home: &Path) -> (Vec<String>, AgentListMode) {
     let live = list_live_agents(home);
-    list_agents_with_fallback_using(home, live)
+    list_agents_with_fallback_using_with_mode(home, live)
 }
 
 /// Factored variant of [`list_agents_with_fallback`] that accepts the
 /// `live` `Option<HashSet>` directly. Lets tests inject the
 /// daemon-registry result without spinning up an in-process API server.
 /// Production callers use the wrapper [`list_agents_with_fallback`].
+///
+/// #938: production no longer uses this directly — the new ternary
+/// `_with_mode` variant covers all production paths. Retained as a
+/// pre-#938-shape stable test seam (existing #910 tests call it).
+#[allow(dead_code)] // Test seam only — production routes through `_with_mode`.
 pub(crate) fn list_agents_with_fallback_using(
     home: &Path,
     live: Option<HashSet<String>>,
 ) -> Vec<String> {
+    list_agents_with_fallback_using_with_mode(home, live).0
+}
+
+/// #938: factored ternary-mode variant. Discriminates `FallbackDaemonStuck`
+/// from `FallbackDaemonAbsent` via the `.daemon` file's PID +
+/// `is_pid_alive`. The pid-alive check is cheap (`kill(pid, 0)`) and
+/// only runs on the fallback path.
+pub(crate) fn list_agents_with_fallback_using_with_mode(
+    home: &Path,
+    live: Option<HashSet<String>>,
+) -> (Vec<String>, AgentListMode) {
     if let Some(live_set) = live {
         note_mode_transition(AgentListMode::Live);
         let mut v: Vec<String> = live_set.into_iter().collect();
         v.sort();
-        return v;
+        return (v, AgentListMode::Live);
     }
-    note_mode_transition(AgentListMode::Fallback);
-    let Some(run) = crate::daemon::find_active_run_dir(home) else {
-        return Vec::new();
+    let run = crate::daemon::find_active_run_dir(home);
+    // Discriminate stuck-vs-absent BEFORE logging the transition so
+    // the chosen variant is in scope when `note_mode_transition` fires.
+    let mode = match run.as_ref() {
+        Some(run_dir) => {
+            // run_dir exists → .daemon file is the discriminator.
+            let pid_alive = crate::daemon::read_daemon_pid(run_dir)
+                .map(crate::process::is_pid_alive)
+                .unwrap_or(false);
+            if pid_alive {
+                AgentListMode::FallbackDaemonStuck
+            } else {
+                AgentListMode::FallbackDaemonAbsent
+            }
+        }
+        None => AgentListMode::FallbackDaemonAbsent,
+    };
+    note_mode_transition(mode);
+    let Some(run) = run else {
+        return (Vec::new(), mode);
     };
     let mut v = crate::ipc::list_agent_ports(&run);
     v.sort();
-    v
+    (v, mode)
 }
 
 #[cfg(test)]
@@ -372,5 +499,144 @@ mod tests {
         // first call, so 10 calls produce at most 1 line.
 
         fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #938 tests: ternary AgentListMode + with_mode sibling fn ──────
+
+    /// #938 mode/hint test: Live (`Some(non-empty)`) → no hint.
+    #[test]
+    fn mode_live_returns_no_hint() {
+        let home = tmp_home("938-live-no-hint");
+        let mut live = HashSet::new();
+        live.insert("agent-a".to_string());
+        let (agents, mode) = list_agents_with_fallback_using_with_mode(&home, Some(live));
+        assert_eq!(mode, AgentListMode::Live);
+        assert!(mode.hint().is_none(), "Live mode must have no hint");
+        assert_eq!(agents, vec!["agent-a".to_string()]);
+        fs::remove_dir_all(&home).ok();
+    }
+
+    /// #938: Live mode JSON identifier pin.
+    #[test]
+    fn mode_live_as_str_pin() {
+        assert_eq!(AgentListMode::Live.as_str(), "live");
+    }
+
+    /// #938 mode/hint test: FallbackDaemonAbsent (no .daemon file) →
+    /// hint references "start daemon".
+    #[test]
+    fn mode_fallback_daemon_absent_returns_hint() {
+        let home = tmp_home("938-absent");
+        // No run/ subdir → find_active_run_dir returns None.
+        let (_agents, mode) = list_agents_with_fallback_using_with_mode(&home, None);
+        assert_eq!(mode, AgentListMode::FallbackDaemonAbsent);
+        let hint = mode.hint().expect("Fallback must have a hint");
+        assert!(
+            hint.contains("no daemon"),
+            "absent-hint must mention no daemon; got: {hint}"
+        );
+        assert_eq!(mode.as_str(), "fallback_daemon_absent");
+        fs::remove_dir_all(&home).ok();
+    }
+
+    /// #938 mode/hint test: FallbackDaemonStuck (.daemon PID alive but
+    /// API doesn't respond) → hint mentions transient guidance +
+    /// cleanup-zombies suggestion.
+    ///
+    /// Uses dev-2 sharpening #3: spawn `true`, wait it to reap, then
+    /// use that PID — but we need a STILL-ALIVE PID to trigger Stuck.
+    /// Use std::process::id() (this test's PID) as a guaranteed-alive
+    /// stand-in for a stuck daemon.
+    #[test]
+    fn mode_fallback_daemon_stuck_returns_hint() {
+        let home = tmp_home("938-stuck");
+        // Plant a .daemon file with OUR PID (guaranteed alive during
+        // the test) but NO api.port → list_live_agents returns None,
+        // discriminator sees pid_alive=true → FallbackDaemonStuck.
+        let our_pid = std::process::id();
+        let run = home.join("run").join(our_pid.to_string());
+        fs::create_dir_all(&run).expect("create run_dir");
+        fs::write(run.join(".daemon"), format!("{our_pid}:0")).expect("write .daemon");
+
+        let (_agents, mode) = list_agents_with_fallback_using_with_mode(&home, None);
+        assert_eq!(
+            mode,
+            AgentListMode::FallbackDaemonStuck,
+            "alive .daemon PID + no API response → Stuck"
+        );
+        let hint = mode.hint().expect("Stuck must have a hint");
+        assert!(
+            hint.contains("stuck"),
+            "stuck-hint must mention stuck; got: {hint}"
+        );
+        assert!(
+            hint.contains("transient") || hint.contains("restart"),
+            "stuck-hint must include transient guidance; got: {hint}"
+        );
+        assert!(
+            hint.contains("cleanup-zombies"),
+            "stuck-hint must suggest cleanup-zombies; got: {hint}"
+        );
+        assert_eq!(mode.as_str(), "fallback_daemon_stuck");
+        fs::remove_dir_all(&home).ok();
+    }
+
+    /// #938: dev-2 sharpening #3 — spawn-reap-recycle PID test for the
+    /// discriminator. After we spawn+wait `true`, the PID is reaped.
+    /// is_pid_alive returns false → discriminator should classify as
+    /// FallbackDaemonAbsent (not Stuck).
+    ///
+    /// PID-recycling caveat: on busy systems the kernel can reassign
+    /// the PID to a new process within microseconds. Skip with clear
+    /// message on the (rare) recycle race instead of producing a false
+    /// negative (per #934 precedent — same fixture shape).
+    #[cfg(unix)]
+    #[test]
+    fn mode_discriminator_treats_dead_pid_as_absent() {
+        let home = tmp_home("938-dead-pid");
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn `true`");
+        let dead_pid = child.id();
+        let _ = child.wait();
+
+        if crate::process::is_pid_alive(dead_pid) {
+            eprintln!("test fixture: PID {dead_pid} recycled in wait()→is_alive() gap — skipping");
+            return;
+        }
+
+        let run = home.join("run").join(dead_pid.to_string());
+        fs::create_dir_all(&run).expect("create run_dir");
+        fs::write(run.join(".daemon"), format!("{dead_pid}:0")).expect("write .daemon");
+
+        // BUT: find_active_run_dir also runs is_pid_alive and cleans
+        // stale entries. So this test may surface either:
+        // - FallbackDaemonAbsent (find_active_run_dir cleaned the dir
+        //   before our discriminator ran)
+        // - FallbackDaemonAbsent (our discriminator's own pid-alive
+        //   check failed)
+        // Either way, the variant must be Absent, not Stuck.
+        let (_agents, mode) = list_agents_with_fallback_using_with_mode(&home, None);
+        assert_eq!(
+            mode,
+            AgentListMode::FallbackDaemonAbsent,
+            "dead PID must classify as Absent (find_active_run_dir or discriminator)"
+        );
+        fs::remove_dir_all(&home).ok();
+    }
+
+    /// #938: JSON schema contract — verify all 3 mode variants emit
+    /// stable string identifiers.
+    #[test]
+    fn mode_as_str_schema_contract() {
+        assert_eq!(AgentListMode::Live.as_str(), "live");
+        assert_eq!(
+            AgentListMode::FallbackDaemonStuck.as_str(),
+            "fallback_daemon_stuck"
+        );
+        assert_eq!(
+            AgentListMode::FallbackDaemonAbsent.as_str(),
+            "fallback_daemon_absent"
+        );
     }
 }
