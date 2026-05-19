@@ -1551,6 +1551,99 @@ instances:
         fs::remove_dir_all(&dir).ok();
     }
 
+    /// #965 T1 stress-guard: pure `crate::store::atomic_write` tmp-name
+    /// collision race. Both threads call atomic_write on the SAME path
+    /// with NO lock coordination. Pre-fix the helper used a deterministic
+    /// tmp filename `<path>.tmp` shared by every caller → byte-position
+    /// interleave at the syscall layer (T1 truncates, T2 truncates again,
+    /// writes interleave on the shared inode, final rename publishes
+    /// mixed content). Post-fix tmp names are per-call-unique.
+    ///
+    /// 500 iterations × barrier-sync per pair. Asserts both parse-success
+    /// AND content-equals-one-of-the-payloads. ANY divergence fails
+    /// the test (dev-2 cross-audit BLOCKING — pre-fix this was probabilistic
+    /// reporting; now it's a hard assertion).
+    ///
+    /// Race-class deterministic per §3.20 SOP 1: Barrier sync, no sleeps.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn repro_965_atomic_write_tmp_filename_collision() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let dir =
+            std::env::temp_dir().join(format!("agend-fleet-965-tmpcol-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let fleet_path = dir.join("fleet.yaml");
+
+        let mut parse_failures = 0;
+        let mut state_mixes = 0;
+        let iterations = 500;
+
+        let payload_a = "instances:\n  agent-A:\n    backend: claude\n";
+        let payload_b = "instances:\n  agent-B:\n    backend: codex\n";
+
+        for i in 0..iterations {
+            fs::write(&fleet_path, payload_a).unwrap();
+            let barrier = Arc::new(Barrier::new(2));
+
+            let b1 = Arc::clone(&barrier);
+            let p1 = fleet_path.clone();
+            // fire-and-forget: per-iteration race driver, joined immediately
+            // below — bounded lifetime.
+            let h1 = thread::spawn(move || {
+                b1.wait();
+                let _ = crate::store::atomic_write(&p1, payload_a.as_bytes());
+            });
+
+            let b2 = Arc::clone(&barrier);
+            let p2 = fleet_path.clone();
+            // fire-and-forget: per-iteration race driver, joined immediately
+            // below — bounded lifetime.
+            let h2 = thread::spawn(move || {
+                b2.wait();
+                let _ = crate::store::atomic_write(&p2, payload_b.as_bytes());
+            });
+
+            h1.join().unwrap();
+            h2.join().unwrap();
+
+            let content = fs::read_to_string(&fleet_path).unwrap_or_default();
+            if serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&content).is_err() {
+                parse_failures += 1;
+                eprintln!(
+                    "iter {i}: PARSE FAILURE\ncontent ({} bytes):\n{content}\n---",
+                    content.len()
+                );
+                continue;
+            }
+            if content != payload_a && content != payload_b {
+                state_mixes += 1;
+                if state_mixes <= 3 {
+                    eprintln!(
+                        "iter {i}: STATE MIX — content matches neither payload\n{content}\n---"
+                    );
+                }
+            }
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+
+        // dev-2 BLOCKING cross-audit: assert-fail rather than print. Pre-fix
+        // this fails (66/500 typical on macOS APFS); post-fix it passes (0/N).
+        assert_eq!(
+            parse_failures, 0,
+            "#965: atomic_write produced parse failures over {iterations} iter"
+        );
+        assert_eq!(
+            state_mixes, 0,
+            "#965: atomic_write produced content-mix over {iterations} iter \
+             (tmp-filename collision corrupted bytes via interleaved writes \
+             on the shared `.tmp` inode)"
+        );
+    }
+
     // ─── Sprint 56 Track A — supergroup migration self-heal ────────────
 
     fn channel_yaml(group_id: i64) -> String {
