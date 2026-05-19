@@ -48,17 +48,16 @@ pub(super) fn init(config: &FleetConfig, home: &Path) -> Option<Arc<dyn Channel>
         .collect();
     let config_clone = config.clone();
     let home_buf = home.to_path_buf();
+    // fire-and-forget: telegram_init does ~6s sequential HTTP (5-10
+    // forum-topic creates + fleet-binding resolve). Bootstrap blocks
+    // on this in production cold start. Daemon-ready is independent
+    // of telegram-ready: all callers tolerate >10s cadence. Init
+    // failure surfaced via tracing::error + topic_registry orphan
+    // sweep self-heals on next boot. NO JoinHandle needed — thread
+    // terminates on init completion; process exit cleans up.
     let spawn_result = std::thread::Builder::new()
         .name("telegram_init".into())
         .spawn(move || {
-            // fire-and-forget: telegram_init does ~6s sequential HTTP
-            // (5-10 forum-topic creates + fleet-binding resolve).
-            // Bootstrap blocks on this in production cold start.
-            // Daemon-ready is independent of telegram-ready: all 2
-            // callers tolerate >10s cadence. Init failure surfaced
-            // via tracing::error + topic_registry orphan sweep
-            // self-heals on next boot. NO JoinHandle needed — thread
-            // terminates on init completion; process exit cleans up.
             let _census = crate::thread_census::register("telegram_init");
             let Some(state) =
                 crate::channel::telegram::init_from_config(&config_clone, &home_buf, submit_keys)
