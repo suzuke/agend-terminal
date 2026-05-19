@@ -156,6 +156,113 @@ Callers that want a guarantee of complete enumeration should wait for
 `.ready` first; bare callers during the boot window may legitimately
 return a partial set as the spawn loop is in flight.
 
+## Bootstrap instrumentation (#945 Phase 0)
+
+`bootstrap::prepare` emits a `bootstrap-step` tracing line for every
+instrumented step with `step=<name>` + `elapsed_ms=<n>` fields. Operators
+can extract the cold-boot timing breakdown without instrumenting
+externally:
+
+```bash
+# Top 5 slowest bootstrap steps from the most recent boot
+grep "bootstrap-step" $AGEND_HOME/daemon.log \
+  | sort -t= -k3 -n -r \
+  | head -5
+
+# Full ordered timeline of a single boot
+grep "bootstrap-step" $AGEND_HOME/daemon.log
+```
+
+13+ steps are instrumented today (`load_fleet_yaml`,
+`stop_managed_agents`, `prune_stale_worktrees`, `bind_loopback`,
+`migrate_legacy_watch_filenames`, `start_telegram_init`, …). The Phase 0
+audit found `telegram_init` accounted for 92.5% of cold-boot wall time
+(~6.1 s of 6.6 s); Phase 1 backgrounded that step (see next subsection).
+
+## Telegram init backgrounded (#945 Phase 1)
+
+`bootstrap::telegram_init::init` now returns `None` immediately and
+spawns a fire-and-forget thread to do the actual init (5–10 sequential
+`bot.create_forum_topic` HTTP calls + fleet-binding resolve). Cold-boot
+wall time drops from ~6.6 s to ~0.5 s. Implications:
+
+- **`api.cookie` + `api.port` land within milliseconds.** External
+  probers / `agend-terminal list` race fewer seconds before seeing a
+  reachable daemon.
+- **`active_channel()` returns `None` until background init completes.**
+  Callers are all on the >10 s tick cadence, so the delayed channel is
+  invisible to them in practice. If you write a new caller that
+  requires the channel synchronously, query `active_channel()` in a
+  poll loop with a 30 s ceiling.
+- **Registry attachment uses a `PENDING_REGISTRY` bridge.**
+  `bootstrap::prepare` (caller) publishes the agent registry via
+  `crate::agent::set_pending_registry`; the background init thread
+  reads it after `register_active_channel` and calls `attach_registry`.
+  Bounded 30 s poll with a 100 ms cadence covers the rare race where
+  the bg thread finishes before the caller publishes.
+- **Failure surfaces via `tracing::error!`.** No panic, no aborted
+  boot. The `topic_registry` orphan sweep self-heals on the next boot.
+  Operator can `tail -F daemon.log | grep telegram_init` to spot
+  recurring failures.
+
+## State detection red anchor (#919 Phase A)
+
+State-detection patterns marked `HIGH_FP` (high false-positive risk —
+generic strings like `"Error"`, `"failed"`, etc.) now require a red SGR
+escape (`\x1b[31m` family) to appear in the captured byte stream
+within 200 bytes and 30 seconds of the match. The anchor closes the
+class of false transitions where a backend echoed an `Error: ...`
+string from a user prompt (no red color) and the daemon classified the
+agent as failed.
+
+`Backend::has_red_anchor()` (`src/backend.rs`) declares per-backend
+whether red SGR is reliably emitted on real errors. When `false`, the
+HIGH_FP gate **fails open** (pattern alone fires the transition) so
+backends without consistent color signaling aren't silently broken.
+
+Telemetry gate (Phase B, gated separately): the FP-rate sample is
+exported as Phase A ships; Phase B will tighten enforcement once
+operator telemetry confirms the gate is doing more good than harm.
+Until then, `HIGH_FP` matches without the red anchor log a debug line
+naming the pattern + the missing-anchor reason, useful for fixture
+collection.
+
+## Operator diagnostic recipes
+
+A consolidated set of `grep` recipes for the most common
+"is the daemon healthy?" / "where did time go?" questions. Each is
+self-contained — copy, paste, run.
+
+```bash
+# Zombie debugging — #932 closed via #941 observability;
+# verify a zombie isn't still attached to a stale $AGEND_HOME
+grep "shutting down (signal received)" $AGEND_HOME/daemon.log
+cat /proc/<zombie-pid>/environ | tr '\0' '\n' | grep AGEND_HOME
+
+# Bootstrap timing — top 5 slowest steps from the most recent boot (#945 Phase 0)
+grep "bootstrap-step" $AGEND_HOME/daemon.log \
+  | sort -t= -k3 -n -r \
+  | head -5
+
+# Live thread state dump — useful when the daemon appears wedged (#941)
+AGEND_DAEMON_THREAD_DUMP_SECS=60 ./agend-terminal start
+# Subsequent dumps appear in daemon.log every 60 s with
+# `thread-dump` line + per-thread state summary.
+
+# CI-watch correlation — find every notification for a given branch (#946)
+grep '"correlation_id":"owner/repo@branch"' $AGEND_HOME/inbox/*.jsonl
+
+# Dispatch-idle correlation fallback (#947) — find a watchdog firing
+# whose upstream had no correlation_id; the synthesized id has a
+# `disp-<unix_micros>-<seq>` shape
+grep '"correlation_id":"disp-' $AGEND_HOME/inbox/*.jsonl | head -5
+
+# Boot sweep dry-run preview before flipping the destructive mode (#933)
+AGEND_DAEMON_BOOT_SWEEP_DRY_RUN=1 AGEND_DAEMON_BOOT_SWEEP_AGE_DAYS=14 \
+  ./agend-terminal start
+grep "boot-sweep" $AGEND_HOME/daemon.log
+```
+
 ## Release
 
 Tags matching `v*` trigger `.github/workflows/release.yml`, which builds 5
