@@ -314,12 +314,21 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
             );
         } else {
             let repo_arg = args["repo"].as_str();
-            if let Err(e) = super::dispatch_hook::dispatch_auto_bind_lease(
+            // #931 Fix 2 (H5a): forward `next_after_ci` from the
+            // dispatcher's chain knowledge so the auto-armed ci-watch
+            // carries the handoff target. Pre-#931 this arg was dropped
+            // — operators had to issue a manual follow-up
+            // `ci action=watch next_after_ci=…`. Combined with the
+            // release-time subscriber sweep (#931 Fix 1), the missing
+            // chain target caused 4-in-a-row PR stalls overnight.
+            let next_after_ci_arg = args["next_after_ci"].as_str();
+            if let Err(e) = super::dispatch_hook::dispatch_auto_bind_lease_with_chain(
                 home,
                 target,
                 task_id_val,
                 branch,
                 repo_arg,
+                next_after_ci_arg,
             ) {
                 return json!({"ok": false, "error": format!("dispatch rejected: {e}")});
             }

@@ -196,6 +196,14 @@ pub(crate) fn clear_bind_in_flight(home: &Path, agent: &str) {
 /// - per-agent in-flight guard (EC11) to prevent concurrent binds for one agent
 /// - `repo: Option<String>` resolution chain: explicit caller arg →
 ///   InstanceConfig.repo override (EC4) → derive from source_repo origin
+// #931 Fix 2: production callers now route through
+// `dispatch_auto_bind_lease_with_chain` (comms.rs) or
+// `dispatch_auto_bind_lease_with_source` (worktree.rs). This bare entry
+// is kept as the canonical "no chain, no source override" convenience
+// for tests (`p0b_tests.rs` + `dispatch_hook/tests.rs` together call it
+// ~30 times); the cfg(test)-only callers don't get clippy-counted in
+// the non-test build.
+#[allow(dead_code)]
 pub(crate) fn dispatch_auto_bind_lease(
     home: &Path,
     target: &str,
@@ -203,7 +211,40 @@ pub(crate) fn dispatch_auto_bind_lease(
     branch: &str,
     repo: Option<&str>,
 ) -> Result<DispatchOutcome, DispatchError> {
-    dispatch_auto_bind_lease_with_source(home, target, task_id, branch, repo, None)
+    dispatch_auto_bind_lease_with_source_and_chain(home, target, task_id, branch, repo, None, None)
+}
+
+/// #931 Fix 2 (H5a): variant that propagates `next_after_ci` so the
+/// dispatch chain knowledge (e.g. lead → dev with `next_after_ci=reviewer`)
+/// lands on the auto-armed ci-watch and survives across bind cycles.
+///
+/// Pre-#931 the auto-watch path armed by `dispatch_auto_bind_lease` never
+/// set `next_after_ci`, so `[ci-ready-for-action]` only fired when a
+/// caller had explicitly called `ci action=watch ... next_after_ci=…`
+/// AFTER the auto-arm. The 4-in-a-row overnight stalls
+/// (#920/#925/#928/#929) were caused by this gap interacting with the
+/// release-time subscriber sweep — once the auto-armed watch was the
+/// sole subscription and got swept, the chain handoff vanished.
+///
+/// Callers: `comms.rs::handle_delegate_task` (kind=task dispatches that
+/// declare a workflow chain via `args["next_after_ci"]`).
+pub(crate) fn dispatch_auto_bind_lease_with_chain(
+    home: &Path,
+    target: &str,
+    task_id: &str,
+    branch: &str,
+    repo: Option<&str>,
+    next_after_ci: Option<&str>,
+) -> Result<DispatchOutcome, DispatchError> {
+    dispatch_auto_bind_lease_with_source_and_chain(
+        home,
+        target,
+        task_id,
+        branch,
+        repo,
+        None,
+        next_after_ci,
+    )
 }
 
 /// Sprint 55 P0-B: extended entry point that accepts an explicit
@@ -228,6 +269,31 @@ pub(crate) fn dispatch_auto_bind_lease_with_source(
     branch: &str,
     repo: Option<&str>,
     source_repo_override: Option<&Path>,
+) -> Result<DispatchOutcome, DispatchError> {
+    dispatch_auto_bind_lease_with_source_and_chain(
+        home,
+        target,
+        task_id,
+        branch,
+        repo,
+        source_repo_override,
+        None,
+    )
+}
+
+/// #931 Fix 2 (H5a): unified entry that accepts both `source_repo_override`
+/// (Sprint 55 P0-B) and `next_after_ci` (the workflow chain target).
+/// All four convenience entry points (`dispatch_auto_bind_lease`,
+/// `_with_source`, `_with_chain`, this one) route through here so the
+/// auto-watch arming logic has a single source of truth.
+pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
+    home: &Path,
+    target: &str,
+    task_id: &str,
+    branch: &str,
+    repo: Option<&str>,
+    source_repo_override: Option<&Path>,
+    next_after_ci: Option<&str>,
 ) -> Result<DispatchOutcome, DispatchError> {
     let _guard = BindGuard::try_acquire(home, target).map_err(|msg| DispatchError {
         message: msg,
@@ -358,9 +424,19 @@ pub(crate) fn dispatch_auto_bind_lease_with_source(
         })
         .or_else(|| derive_repo_from_remote(&source_repo));
     if let Some(r) = resolved_repo {
-        let watch_args = serde_json::json!({"repo": &r, "branch": branch});
+        // #931 Fix 2 (H5a): when the dispatcher declared a workflow chain
+        // via `next_after_ci` (e.g. lead → dev with reviewer as the next
+        // step), propagate it into the auto-armed watch so the daemon's
+        // poll loop fires `[ci-ready-for-action]` to the chain target on
+        // CI pass. Pre-#931 callers had to issue a follow-up
+        // `ci action=watch next_after_ci=…` manually — easily forgotten
+        // and one of the root causes of the 4-in-a-row PR stalls.
+        let mut watch_args = serde_json::json!({"repo": &r, "branch": branch});
+        if let Some(next) = next_after_ci.filter(|s| !s.is_empty()) {
+            watch_args["next_after_ci"] = serde_json::json!(next);
+        }
         crate::mcp::handlers::ci::handle_watch_ci(home, &watch_args, target);
-        tracing::info!(%target, repo = %r, %branch, "dispatch auto-watch_ci");
+        tracing::info!(%target, repo = %r, %branch, next_after_ci = ?next_after_ci, "dispatch auto-watch_ci");
     }
 
     Ok(DispatchOutcome {

@@ -1286,6 +1286,74 @@ fn dispatch_auto_bind_lease_auto_create_path_preserves_p0b_tail_ops() {
 }
 
 #[test]
+#[cfg(unix)]
+fn dispatch_auto_bind_lease_sets_next_after_ci_from_dispatch_hook_931() {
+    // #931 Fix 2 (H5a): the dispatch chain knows who the next agent in
+    // the workflow is (e.g. lead dispatches dev with
+    // `next_after_ci=reviewer`). Pre-#931, `dispatch_auto_bind_lease`
+    // armed the ci-watch via `handle_watch_ci(repo, branch)` with no
+    // `next_after_ci` arg, so the chain handoff `[ci-ready-for-action]`
+    // never fired unless someone explicitly re-called `ci action=watch`
+    // with the field set. Combined with the release-time subscriber
+    // sweep (#931 Fix 1), this caused 4-in-a-row PR stalls.
+    //
+    // Post-#931, the new `dispatch_auto_bind_lease_with_chain` wrapper
+    // propagates `next_after_ci` from the dispatcher down to the
+    // auto-armed watch JSON. Reviewer (the chain target) receives
+    // `[ci-ready-for-action]` on CI pass without any manual re-watch.
+    //
+    // REGRESSION-PROOF: revert Fix 2 (drop the next_after_ci wiring in
+    // `_with_source` → `handle_watch_ci`) → this test FAILS because
+    // `watch["next_after_ci"]` reads as `null` instead of `"reviewer"`.
+    let parent = std::env::temp_dir().join(format!(
+        "agend-931-h5a-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let (home, _canonical) = p781_canonical_with_team_source_repo(
+        &parent,
+        "feat/931-h5a-chain",
+        true,
+        "val",
+        &["val-dev"],
+    );
+
+    // Lead-style dispatch: dev is the implementer, reviewer is the chain target.
+    let r = super::dispatch_auto_bind_lease_with_chain(
+        &home,
+        "val-dev",
+        "T-931-h5a",
+        "feat/931-h5a-chain",
+        None,
+        Some("reviewer"),
+    );
+    assert!(
+        r.is_ok(),
+        "dispatch_auto_bind_lease_with_chain must succeed: {:?}",
+        r.err()
+    );
+
+    let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(
+        crate::daemon::ci_watch::watch_filename("owner/repo", "feat/931-h5a-chain"),
+    );
+    assert!(watch_path.exists(), "ci_watches armed by dispatch");
+
+    let watch: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&watch_path).expect("read watch"))
+            .expect("parse watch");
+    assert_eq!(
+        watch["next_after_ci"].as_str(),
+        Some("reviewer"),
+        "#931 Fix 2 (H5a) GREEN: dispatch chain MUST propagate next_after_ci into auto-armed watch JSON. Got: {watch}"
+    );
+
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+#[test]
 fn teams_json_migration_preserves_existing_fleet_yaml_source_repo() {
     // Test 9 (invariant guard, Piece 1): the migration must NOT
     // overwrite an existing fleet.yaml team entry — if operator hand-

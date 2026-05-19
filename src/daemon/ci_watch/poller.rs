@@ -1009,11 +1009,54 @@ async fn ci_check_repo(
                 if action_target_on_success.as_deref() == Some(sub.as_str()) {
                     continue;
                 }
-                let reg = agent::lock_registry(registry);
-                if let Some(handle) = reg.get(sub) {
-                    let _ = agent::inject_to_agent(handle, headline.as_bytes());
+                let in_registry = {
+                    let reg = agent::lock_registry(registry);
+                    if let Some(handle) = reg.get(sub) {
+                        let _ = agent::inject_to_agent(handle, headline.as_bytes());
+                        true
+                    } else {
+                        false
+                    }
+                };
+                // #931 Fix 3: gate inbox enqueue against zombie subscriber
+                // names. Pre-#931 inbox enqueue fired unconditionally for
+                // every name in `subscribers[]`, so an agent removed
+                // from the fleet (e.g. via `delete_instance` + manual
+                // cleanup) but still listed in some watch's subs
+                // accumulated jsonl bloat every poll cycle until the 72h
+                // TTL expired. The PTY inject already silently no-op'd
+                // for the same agent; bringing inbox into parity removes
+                // the bloat vector.
+                //
+                // Gate logic: skip enqueue only when the subscriber is
+                // BOTH absent from the live agent registry AND absent
+                // from the fleet.yaml roster. Either presence keeps
+                // delivery enabled:
+                //   - in registry → agent is currently alive
+                //   - in fleet roster → agent is a legitimate fleet
+                //     member who may be temporarily offline (PTY died,
+                //     restart in progress); their inbox is durable so
+                //     they'll see the message on next spawn.
+                //
+                // Fail-permissive: when fleet.yaml is unreadable
+                // (filesystem error, missing file in some test scaffolds,
+                // operator hand-edit transient state), default to
+                // delivering. Better to over-deliver than to silently
+                // drop a notification.
+                let fleet_known =
+                    crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+                        .ok()
+                        .map(|f| f.instances.contains_key(sub))
+                        .unwrap_or(true);
+                if !in_registry && !fleet_known {
+                    tracing::debug!(
+                        sub = %sub,
+                        repo = %repo,
+                        branch = %branch,
+                        "#931 Fix 3: skipping inbox enqueue for zombie subscriber (not in registry, not in fleet roster)"
+                    );
+                    continue;
                 }
-                drop(reg);
                 // M6: mark prior ci-watch messages for same repo+branch as superseded
                 crate::inbox::mark_ci_watch_superseded(
                     home,
