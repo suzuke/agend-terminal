@@ -4880,4 +4880,92 @@ mod tests {
         );
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    // ── #946 correlation_id population on system:ci inbox messages ──
+    //
+    // Pre-#946 all `system:ci` enqueues carried `correlation_id: None`,
+    // making it impossible for operators to grep inbox.jsonl for
+    // messages from a specific watch. Post-fix every site populates
+    // `Some(format!("{repo}@{branch}"))` so operators can trace a
+    // notification back to its watch in one grep.
+    //
+    // Stable across hash migrations (#943): the correlation_id value
+    // is the (canonical post-#942) `repo@branch` string, NOT the
+    // watch_filename hash. Future hash-scheme changes preserve the
+    // stable grep target.
+
+    #[test]
+    fn ci_pass_inbox_message_carries_repo_branch_correlation_id() {
+        let dir = tmp_dir("946-ci-pass-corr");
+        let provider = MockCiProvider::with_runs(vec![CiRun {
+            id: 100,
+            conclusion: Some("success".into()),
+            head_sha: "abc".into(),
+            url: "https://example.com/100".into(),
+        }]);
+        run_ci_check(&dir, &base_watch(), &provider).unwrap();
+        let inbox_path = dir.join("inbox").join("agent1.jsonl");
+        let content = std::fs::read_to_string(&inbox_path).unwrap();
+        // base_watch has repo="o/r", branch="feat"
+        let expected = r#""correlation_id":"o/r@feat""#;
+        assert!(
+            content.contains(expected),
+            "ci-pass message must carry correlation_id={expected}: {content}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ci_stale_inbox_message_carries_repo_branch_correlation_id() {
+        let dir = tmp_dir("946-ci-stale-corr");
+        // Two-run setup mirrors `mock_stale_sha_emits_ci_stale_inbox_message`
+        // — old-head run completes after new commit pushed; old run's
+        // notification is dropped + emits [ci-stale].
+        let provider = MockCiProvider::with_runs(vec![
+            CiRun {
+                id: 301,
+                conclusion: None,
+                head_sha: "newhead".into(),
+                url: "https://example.com/301".into(),
+            },
+            CiRun {
+                id: 300,
+                conclusion: Some("success".into()),
+                head_sha: "oldhead".into(),
+                url: "https://example.com/300".into(),
+            },
+        ]);
+        run_ci_check(&dir, &base_watch(), &provider).unwrap();
+        let inbox_path = dir.join("inbox").join("agent1.jsonl");
+        let content = std::fs::read_to_string(&inbox_path).unwrap();
+        assert!(
+            content.contains("[ci-stale]"),
+            "expected [ci-stale] inbox message: {content}"
+        );
+        let expected = r#""correlation_id":"o/r@feat""#;
+        assert!(
+            content.contains(expected),
+            "ci-stale message must carry correlation_id={expected}: {content}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ci_conflict_alert_inbox_message_carries_repo_branch_correlation_id() {
+        let dir = tmp_dir("946-ci-conflict-corr");
+        let subscribers = vec!["agent1".to_string()];
+        emit_ci_conflict_alert(&dir, "o/r", "feat", &subscribers, "watch-start");
+        let inbox_path = dir.join("inbox").join("agent1.jsonl");
+        let content = std::fs::read_to_string(&inbox_path).unwrap();
+        assert!(
+            content.contains("[ci-conflict-detected]"),
+            "expected ci-conflict alert: {content}"
+        );
+        let expected = r#""correlation_id":"o/r@feat""#;
+        assert!(
+            content.contains(expected),
+            "ci-conflict-detected message must carry correlation_id={expected}: {content}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

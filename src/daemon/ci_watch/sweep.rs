@@ -330,3 +330,70 @@ pub fn startup_sweep(home: &Path) {
         }
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "agend-946-sweep-{}-{}-{}",
+            tag,
+            std::process::id(),
+            id
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// #946 — sweep.rs `[ci-watch-stalled]` enqueue site (fan_out_health_event
+    /// at :161 via bump_consecutive_skips_and_maybe_notify) carries
+    /// `correlation_id = {repo}@{branch}`. Pre-fix: None.
+    #[test]
+    fn ci_stalled_inbox_message_carries_repo_branch_correlation_id() {
+        let dir = tmp_dir("946-stalled-corr");
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).unwrap();
+        // Plant a watch with consecutive_skips == STALL_THRESHOLD-1 so
+        // the next bump tips it over and fires the stall notification.
+        let watch_path = ci_dir.join("test-watch.json");
+        let watch = serde_json::json!({
+            "repo": "o/r",
+            "branch": "feat",
+            "consecutive_skips": STALL_THRESHOLD - 1,
+            "stalled_notified": false,
+            "subscribers": [{"instance": "agent1", "subscribed_at": "2026-05-19T00:00:00Z"}],
+        });
+        std::fs::write(&watch_path, serde_json::to_string_pretty(&watch).unwrap()).unwrap();
+
+        let subscribers = vec!["agent1".to_string()];
+        let reset_epoch = chrono::Utc::now().timestamp() as u64 + 3600;
+        bump_consecutive_skips_and_maybe_notify(
+            &dir,
+            &watch_path,
+            "o/r",
+            "feat",
+            &subscribers,
+            reset_epoch,
+            None,
+        );
+
+        let inbox_path = dir.join("inbox").join("agent1.jsonl");
+        let content = std::fs::read_to_string(&inbox_path).unwrap();
+        assert!(
+            content.contains("[ci-watch-stalled]"),
+            "expected [ci-watch-stalled] in inbox: {content}"
+        );
+        let expected = r#""correlation_id":"o/r@feat""#;
+        assert!(
+            content.contains(expected),
+            "ci-watch-stalled message must carry correlation_id={expected}: {content}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
