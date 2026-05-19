@@ -3424,7 +3424,7 @@ instances:
 
         let cfg = FleetConfig::load(&fleet_yaml_path(&home)).expect("reload");
         assert!(
-            cfg.instances.get("test-964-verify").is_none(),
+            !cfg.instances.contains_key("test-964-verify"),
             "#964 anchor: helper MUST NOT auto-insert; got entry {:?}",
             cfg.instances.get("test-964-verify")
         );

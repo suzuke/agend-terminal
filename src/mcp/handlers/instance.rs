@@ -682,6 +682,45 @@ fn spawn_single_instance_impl(
         resolve_team_layout(home, name, args.get("layout"), args.get("target_pane"));
     let target_pane = target_pane_owned.as_deref();
 
+    // #964 fix: build fleet.yaml entry + ADD FIRST, BEFORE the SPAWN RPC.
+    // Pre-fix ordering was SPAWN → add, which meant `handle_spawn`'s
+    // `register_topic` → `update_instance_field("topic_id")` ran while the
+    // fleet.yaml entry didn't yet exist — #962 Path 2 silent no-op fired
+    // and `topic_id` was never persisted. The 27-day-latent bug only
+    // surfaced when an instance was deleted before any daemon-restart-time
+    // self-heal (`channel/telegram/bootstrap.rs:126-150`) could backfill
+    // the missing field.
+    let entry = crate::fleet::InstanceYamlEntry {
+        backend: backend_str
+            .or_else(|| {
+                crate::backend::Backend::from_command(command).map(|b| b.name().to_string())
+            })
+            .or_else(|| Some(command.to_string())),
+        working_directory: Some(work_dir.clone()),
+        role: role.clone(),
+        instructions: None,
+        // Sprint 54 P1-B Bug 2 fix: gradient deployment per
+        // general's constraint — daemon auto-write leaves
+        // source_repo None; operator hand-edits fleet.yaml to
+        // opt agents in. Backward-compat preserved via
+        // dispatch_auto_bind_lease's working_directory fallback.
+        source_repo: None,
+        // Sprint 55 P0-B EC4: same gradient — daemon leaves
+        // `repo` override None; operator opts in for non-GitHub
+        // remote OR fork-vs-upstream disambiguation.
+        repo: None,
+        github_login: None,
+        args: None,
+        model: None,
+        env: env_for_entry,
+        ready_pattern: None,
+        command: None,
+        worktree: None,
+    };
+    if let Err(e) = crate::fleet::add_instance_to_yaml(home, name, &entry) {
+        return json!({"error": format!("failed to register instance in fleet.yaml: {e}")});
+    }
+
     let mut spawn_params = json!({
         "name": name, "backend": command, "args": &cmd_args,
         "working_directory": work_dir,
@@ -697,36 +736,6 @@ fn spawn_single_instance_impl(
         &json!({"method": crate::api::method::SPAWN, "params": spawn_params}),
     ) {
         Ok(resp) if resp["ok"].as_bool() == Some(true) => {
-            let entry = crate::fleet::InstanceYamlEntry {
-                backend: backend_str
-                    .or_else(|| {
-                        crate::backend::Backend::from_command(command).map(|b| b.name().to_string())
-                    })
-                    .or_else(|| Some(command.to_string())),
-                working_directory: Some(work_dir.clone()),
-                role,
-                instructions: None,
-                // Sprint 54 P1-B Bug 2 fix: gradient deployment per
-                // general's constraint — daemon auto-write leaves
-                // source_repo None; operator hand-edits fleet.yaml to
-                // opt agents in. Backward-compat preserved via
-                // dispatch_auto_bind_lease's working_directory fallback.
-                source_repo: None,
-                // Sprint 55 P0-B EC4: same gradient — daemon leaves
-                // `repo` override None; operator opts in for non-GitHub
-                // remote OR fork-vs-upstream disambiguation.
-                repo: None,
-                github_login: None,
-                args: None,
-                model: None,
-                env: env_for_entry,
-                ready_pattern: None,
-                command: None,
-                worktree: None,
-            };
-            if let Err(e) = crate::fleet::add_instance_to_yaml(home, name, &entry) {
-                tracing::warn!(error = %e, "failed to persist to fleet.yaml");
-            }
             let topic_id = resp["result"]["topic_id"].as_i64();
             if let Some(task_text) = task {
                 let h = home.to_path_buf();
@@ -749,8 +758,34 @@ fn spawn_single_instance_impl(
             }
             result
         }
-        Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("spawn failed")}),
-        Err(e) => json!({"error": format!("API unavailable: {e}")}),
+        Ok(resp) => {
+            // #964 rollback: SPAWN reported failure — undo the fleet.yaml
+            // entry we just added so create_instance is all-or-nothing.
+            // dev-2 cross-audit Pushback 1: surface rollback failure via
+            // `tracing::error!` (NOT `let _ = ...` — that would repeat the
+            // #962 antipattern). Operator gets an audit trail on the rare
+            // double-failure case.
+            if let Err(remove_err) = crate::fleet::remove_instance_from_yaml(home, name) {
+                tracing::error!(
+                    name = %name,
+                    error = %remove_err,
+                    "create_instance: SPAWN failed AND rollback failed — \
+                     fleet.yaml may have stale entry; operator may need manual cleanup"
+                );
+            }
+            json!({"error": resp["error"].as_str().unwrap_or("spawn failed")})
+        }
+        Err(e) => {
+            if let Err(remove_err) = crate::fleet::remove_instance_from_yaml(home, name) {
+                tracing::error!(
+                    name = %name,
+                    error = %remove_err,
+                    "create_instance: API unavailable AND rollback failed — \
+                     fleet.yaml may have stale entry; operator may need manual cleanup"
+                );
+            }
+            json!({"error": format!("API unavailable: {e}")})
+        }
     }
 }
 
@@ -780,19 +815,11 @@ mod tests_964 {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let id = SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "agend-964-{}-{}-{}",
-            slug,
-            std::process::id(),
-            id
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("agend-964-{}-{}-{}", slug, std::process::id(), id));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            crate::fleet::fleet_yaml_path(&dir),
-            "instances: {}\n",
-        )
-        .unwrap();
+        std::fs::write(crate::fleet::fleet_yaml_path(&dir), "instances: {}\n").unwrap();
         dir
     }
 
