@@ -1,22 +1,26 @@
-//! #914 daemon log rotation.
+//! #914 daemon log rotation + #927 PR-A app log parametrization.
 //!
 //! Provides:
-//! - [`setup_daemon_tracing`] — install panic hook + rolling-file tracing
-//!   subscriber. Called once from `main` when entering the daemon child path
-//!   (`start --foreground`).
-//! - [`migrate_existing_daemon_log`] — idempotent rename of any pre-rotation
-//!   `daemon.log` left by old binaries into `daemon.log.migration.<epoch>`
-//!   so the new rolling appender starts on a clean slate without losing
-//!   operator history.
+//! - [`setup_rolling_tracing`] — install panic hook + rolling-file tracing
+//!   subscriber. Parametrized over filename prefix + default filter +
+//!   migration policy so daemon AND app paths share one implementation.
+//!   Called from `main` (daemon child) and `app::run` (TUI process).
+//! - [`migrate_existing_log`] — idempotent rename of any pre-rotation
+//!   `<prefix>.log` left by old binaries. Behaviour gated by
+//!   [`MigrationPolicy`]: daemon path keeps history via
+//!   `<prefix>.log.migration.<epoch>` rename; app path drops the tiny
+//!   pre-rotation file outright (operator chose drop in synthesis —
+//!   `app.log` was ~12KB, no rescue value).
 //! - [`cleanup_oversize_logs`] — hard backstop. Pruning the oldest
 //!   `daemon.log.*` files until the directory's total log footprint is
 //!   under `AGEND_LOG_MAX_BYTES`. Wired into the per-tick handler so it
-//!   runs hourly regardless of `max_log_files`.
+//!   runs hourly regardless of `max_log_files`. Daemon-only today;
+//!   app's tighter `max_log_files=3` retention bounds disk use without
+//!   an app-side tick.
 //! - [`update_daemon_log_symlink_unix`] — points `daemon.log` symlink at
 //!   the newest rotated file so `tail -F daemon.log` keeps working post-rotation.
 //!
-//! See `[setup_daemon_tracing]` for the daemon-path init entry that
-//! `main` calls when the child starts with `start --foreground`. CLI
+//! See `[setup_rolling_tracing]` for the canonical entry. CLI
 //! commands route through `[setup_cli_tracing]` and keep stderr.
 
 use std::path::Path;
@@ -33,8 +37,12 @@ pub const DEFAULT_RETAIN_DAYS: usize = 3;
 /// oldest `daemon.log.*` until total under this cap.
 pub const DEFAULT_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
-/// File-name prefix for the rolling appender. Suffix is `<date>` (and
-/// `.migration.<epoch>` for one-shot migration rename).
+/// Legacy file-name prefix constant — kept for callers (per-tick
+/// cleanup, symlink update) that operate exclusively on the daemon
+/// `daemon.log.*` namespace. New callers should pass an explicit
+/// prefix string to [`setup_rolling_tracing`]; this constant is
+/// reserved for the daemon-side helpers.
+#[allow(dead_code)] // reserved for cleanup_oversize_logs / symlink helpers
 pub const LOG_FILENAME_PREFIX: &str = "daemon";
 /// File-name extension. Matches existing operator scripts that tail
 /// `daemon.log*`.
@@ -74,33 +82,60 @@ pub fn setup_cli_tracing() {
         .init();
 }
 
-/// Daemon-path tracing init: rolling file appender writing to
-/// `<home>/daemon.log.<YYYY-MM-DD>` with `max_log_files` retention.
-/// Caller (`main`) MUST hold the returned [`WorkerGuard`] for the full
-/// daemon lifetime — dropping it shuts the background writer thread
-/// down and may drop the last batch of pending log records.
+/// Per-process pre-rotation file migration policy. #927 PR-A added the
+/// app path which historically used `truncate(true)` on a tiny
+/// `app.log`; the synthesis decided to DROP that file on first boot of
+/// the rolling appender rather than preserve trivial history. The
+/// daemon path keeps the [`MigrationPolicy::Migrate`] behaviour from
+/// #914 so pre-rotation `daemon.log` (potentially MBs of operator
+/// history) is rescued via `.migration.<epoch>` rename.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationPolicy {
+    /// Rename pre-existing `<prefix>.log` → `<prefix>.log.migration.<epoch>`.
+    /// Idempotent: skipped when a prior migration marker already exists.
+    /// Used by the daemon path.
+    Migrate,
+    /// Delete pre-existing `<prefix>.log` outright. Used by the app
+    /// path where the pre-rotation file is tiny and not worth
+    /// preserving.
+    Drop,
+}
+
+/// Parametrized rolling-tracing init for both daemon and app paths.
+/// `filename_prefix` is the rotating filename stem (e.g. `"daemon"`
+/// produces `daemon.log.<YYYY-MM-DD>`). `default_filter` is the
+/// `EnvFilter` directive applied when `AGEND_LOG` is unset.
+/// `migration_policy` controls how pre-rotation `<prefix>.log` files
+/// from older binaries are handled (see [`MigrationPolicy`]).
 ///
-/// `with_ansi(false)`: the per-#914 lead synth flagged this as an
-/// intentional observable change. Pre-#914 the daemon's stderr was
-/// redirected to a file and tracing wrote ANSI color codes into it
-/// (rendered as `\x1b[...]` noise in `cat`/`grep`); now the rotated
-/// log files contain plain text that operator scripts can parse
-/// directly.
+/// Caller MUST hold the returned [`WorkerGuard`] for the full process
+/// lifetime — dropping it shuts the background writer thread down and
+/// may drop the last batch of pending log records.
 ///
-/// Pre-existing `daemon.log` (from old binaries before this PR) is
-/// renamed up-front via [`migrate_existing_daemon_log`] so the rolling
-/// appender starts on a clean slate. Migration failure is logged via
-/// stderr passthrough + daemon startup continues with a fresh rolling
-/// appender (per lead's failure policy).
+/// `with_ansi(false)`: per #914 lead synth, intentional observable
+/// change. Pre-#914 daemon stderr was redirected to a file and tracing
+/// wrote ANSI codes into it (visible as `\x1b[...]` noise in
+/// `cat`/`grep`); now rotated log files contain plain text.
 ///
 /// Also installs a panic hook so panics route through `tracing::error!`
 /// into the rolling file. Without this, panics print to stderr — which
 /// the post-#914 `spawn_detached` sends to `/dev/null` — and would be
 /// invisible to the operator.
-pub fn setup_daemon_tracing(home: &Path) -> anyhow::Result<WorkerGuard> {
-    if let Err(e) = migrate_existing_daemon_log(home) {
+///
+/// #927 PR-A: previously named `setup_daemon_tracing`; parametrized to
+/// let `app::run` (TUI process) share the rolling-appender + panic-hook
+/// machinery instead of bypassing it with a raw `OpenOptions::truncate`
+/// call on `app.log`.
+pub fn setup_rolling_tracing(
+    home: &Path,
+    filename_prefix: &str,
+    default_filter: &str,
+    migration_policy: MigrationPolicy,
+) -> anyhow::Result<WorkerGuard> {
+    let log_name = format!("{filename_prefix}.{LOG_FILENAME_SUFFIX}");
+    if let Err(e) = migrate_existing_log(home, &log_name, migration_policy) {
         eprintln!(
-            "agend-terminal: daemon.log migration failed: {e} \
+            "agend-terminal: {log_name} migration failed: {e} \
              (continuing with fresh rolling appender)"
         );
     }
@@ -108,22 +143,24 @@ pub fn setup_daemon_tracing(home: &Path) -> anyhow::Result<WorkerGuard> {
     let appender = tracing_appender::rolling::Builder::new()
         .rotation(tracing_appender::rolling::Rotation::DAILY)
         .max_log_files(retain_days_from_env())
-        .filename_prefix(LOG_FILENAME_PREFIX)
+        .filename_prefix(filename_prefix)
         .filename_suffix(LOG_FILENAME_SUFFIX)
         .build(home)
-        .map_err(|e| anyhow::anyhow!("daemon log: RollingFileAppender::build failed: {e}"))?;
+        .map_err(|e| {
+            anyhow::anyhow!("{filename_prefix} log: RollingFileAppender::build failed: {e}")
+        })?;
     let (non_blocking, guard) = tracing_appender::non_blocking(appender);
 
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_env("AGEND_LOG")
-                .unwrap_or_else(|_| EnvFilter::new("agend_terminal=info")),
+            EnvFilter::try_from_env("AGEND_LOG").unwrap_or_else(|_| EnvFilter::new(default_filter)),
         )
         .with_timer(tracing_subscriber::fmt::time::LocalTime::rfc_3339())
         .with_writer(non_blocking)
         .with_ansi(false)
         .with_target(false)
-        .init();
+        .try_init()
+        .ok(); // try_init: app::run may share a process with already-init subscriber in tests
 
     install_panic_to_tracing_hook();
 
@@ -182,23 +219,32 @@ pub fn parse_size(s: &str) -> Option<u64> {
         .and_then(|n| n.checked_mul(mult))
 }
 
-/// Rename any existing `<home>/daemon.log` to
-/// `<home>/daemon.log.migration.<unix-epoch-seconds>` so the rolling
-/// appender starts on a clean slate without losing operator history.
-/// No-op when `daemon.log` is absent. Idempotent: if a previous
-/// migration left a `daemon.log.migration.*` file behind AND `daemon.log`
-/// also exists (e.g., old binary started again post-fix), leaves
-/// `daemon.log` alone rather than double-rotating.
+/// Idempotent pre-rotation file migration. Behavior gated by
+/// [`MigrationPolicy`]:
 ///
-/// Returns the destination path on success. Caller policy on rename
-/// failure: per lead synth, log via stderr passthrough + continue
-/// daemon startup with rolling appender on the fresh path.
-pub fn migrate_existing_daemon_log(home: &Path) -> std::io::Result<Option<std::path::PathBuf>> {
-    let src = home.join("daemon.log");
-    // `symlink_metadata` instead of `exists` so we observe the link itself
-    // rather than following it — the post-fix daemon writes a `daemon.log`
-    // symlink → newest rotated file and we must NOT treat that as a legacy
-    // file to migrate.
+/// - [`MigrationPolicy::Migrate`]: rename `<home>/<filename>` to
+///   `<home>/<filename>.migration.<unix-epoch-seconds>` (preserves
+///   operator history). No-op when absent. Idempotent: if a prior
+///   `<filename>.migration.*` already exists AND `<filename>` also
+///   exists (e.g., old binary restarted post-fix), leaves the new
+///   `<filename>` alone rather than double-rotating.
+/// - [`MigrationPolicy::Drop`]: delete `<home>/<filename>` outright.
+///   No-op when absent. Used by the app path per synthesis (file is
+///   tiny, no rescue value).
+///
+/// Returns the destination path on `Migrate` success, `None` for noop /
+/// Drop. Caller policy on failure: per lead synth, stderr passthrough
+/// + continue startup with fresh rolling appender on the new path.
+///
+/// `symlink_metadata` (not `exists`) so we observe a post-#914
+/// `daemon.log` symlink as such and leave it alone instead of treating
+/// it as a legacy file to migrate.
+pub fn migrate_existing_log(
+    home: &Path,
+    filename: &str,
+    policy: MigrationPolicy,
+) -> std::io::Result<Option<std::path::PathBuf>> {
+    let src = home.join(filename);
     let meta = match std::fs::symlink_metadata(&src) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -208,34 +254,37 @@ pub fn migrate_existing_daemon_log(home: &Path) -> std::io::Result<Option<std::p
         // Post-fix symlink — leave alone.
         return Ok(None);
     }
-    // Idempotence: any pre-existing migration marker means a prior daemon
-    // already migrated; leave the new daemon.log untouched (operator
-    // probably restarted the old binary post-fix). Whoever cleans up the
-    // orphan daemon.log later (cleanup-tick, operator) decides — we
-    // don't double-rotate.
-    let already_migrated = std::fs::read_dir(home)
-        .ok()
-        .map(|entries| {
-            entries.flatten().any(|e| {
-                let n = e.file_name();
-                let s = n.to_string_lossy();
-                s.starts_with("daemon.log.") && s.contains(MIGRATION_SUFFIX_PREFIX)
-            })
-        })
-        .unwrap_or(false);
-    if already_migrated {
-        return Ok(None);
+    match policy {
+        MigrationPolicy::Drop => {
+            std::fs::remove_file(&src)?;
+            Ok(None)
+        }
+        MigrationPolicy::Migrate => {
+            // Idempotence: any pre-existing migration marker means a
+            // prior boot already migrated; leave the new file untouched.
+            let migration_prefix = format!("{filename}.{MIGRATION_SUFFIX_PREFIX}");
+            let already_migrated = std::fs::read_dir(home)
+                .ok()
+                .map(|entries| {
+                    entries.flatten().any(|e| {
+                        e.file_name()
+                            .to_string_lossy()
+                            .starts_with(&migration_prefix)
+                    })
+                })
+                .unwrap_or(false);
+            if already_migrated {
+                return Ok(None);
+            }
+            let epoch = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let target = home.join(format!("{filename}.{MIGRATION_SUFFIX_PREFIX}{epoch}"));
+            std::fs::rename(&src, &target)?;
+            Ok(Some(target))
+        }
     }
-    let epoch = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let target = home.join(format!(
-        "daemon.log.{prefix}{epoch}",
-        prefix = MIGRATION_SUFFIX_PREFIX
-    ));
-    std::fs::rename(&src, &target)?;
-    Ok(Some(target))
 }
 
 /// Hourly cleanup tick. Sums sizes of every `daemon.log.*` file in
@@ -384,14 +433,15 @@ mod tests {
         assert_eq!(parse_size("G500"), None);
     }
 
-    // ----- migrate_existing_daemon_log -----
+    // ----- migrate_existing_log -----
 
     #[test]
     fn migrate_renames_existing_daemon_log_to_epoch_suffix() {
         let home = tmp_home("mig-basic");
         std::fs::write(home.join("daemon.log"), b"legacy content").unwrap();
 
-        let result = migrate_existing_daemon_log(&home).expect("migrate ok");
+        let result = migrate_existing_log(&home, "daemon.log", MigrationPolicy::Migrate)
+            .expect("migrate ok");
         let target = result.expect("must return rename target when daemon.log existed");
 
         assert!(
@@ -418,7 +468,8 @@ mod tests {
     fn migrate_is_noop_when_no_daemon_log() {
         let home = tmp_home("mig-none");
 
-        let result = migrate_existing_daemon_log(&home).expect("ok on empty");
+        let result = migrate_existing_log(&home, "daemon.log", MigrationPolicy::Migrate)
+            .expect("ok on empty");
         assert!(
             result.is_none(),
             "no-op must return None when daemon.log absent"
@@ -442,7 +493,8 @@ mod tests {
         std::fs::write(home.join("daemon.log.migration.1000000000"), b"prior").unwrap();
         std::fs::write(home.join("daemon.log"), b"fresh from old binary").unwrap();
 
-        let result = migrate_existing_daemon_log(&home).expect("idempotent ok");
+        let result = migrate_existing_log(&home, "daemon.log", MigrationPolicy::Migrate)
+            .expect("idempotent ok");
         assert!(
             result.is_none(),
             "idempotent path must NOT rename when prior migration exists"
@@ -561,6 +613,100 @@ mod tests {
             target_str.ends_with("daemon.log.2026-05-12"),
             "symlink must point at newest (daemon.log.2026-05-12), got: {target_str}"
         );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ----- #927 PR-A: app-path migration policy + filename prefix -----
+
+    /// `MigrationPolicy::Drop` for app first-boot: pre-seed `app.log`,
+    /// invoke `migrate_existing_log`, assert the file is gone + no
+    /// migration sidecar created. Daemon path's `Migrate` policy is
+    /// unaffected and still covered by the daemon-path tests above.
+    #[test]
+    fn app_log_migration_drop_policy_removes_file() {
+        let home = tmp_home("app-mig-drop");
+        std::fs::write(home.join("app.log"), b"tiny app history (12KB)").unwrap();
+
+        let result =
+            migrate_existing_log(&home, "app.log", MigrationPolicy::Drop).expect("drop ok");
+
+        assert!(
+            result.is_none(),
+            "Drop policy MUST return None (no rename target)"
+        );
+        assert!(
+            !home.join("app.log").exists(),
+            "Drop policy MUST remove the pre-existing app.log"
+        );
+        // No migration sidecar should be created for Drop policy.
+        let any_migration = std::fs::read_dir(&home).unwrap().flatten().any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("app.log.migration.")
+        });
+        assert!(
+            !any_migration,
+            "Drop policy MUST NOT create any app.log.migration.* sidecar"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// `app.log` prefix must produce `app.log.*` rotated files —
+    /// distinct namespace from `daemon.log.*`. This test runs both
+    /// migrate calls + sanity-checks namespacing.
+    #[test]
+    fn app_log_migration_uses_app_prefix_namespace() {
+        let home = tmp_home("app-mig-prefix");
+        // Seed both pre-rotation files (daemon AND app) so we can verify
+        // the daemon path is unaffected by the app migration.
+        std::fs::write(home.join("daemon.log"), b"daemon legacy").unwrap();
+        std::fs::write(home.join("app.log"), b"app legacy").unwrap();
+
+        // App migration: Drop → app.log removed, no sidecar.
+        let app_result =
+            migrate_existing_log(&home, "app.log", MigrationPolicy::Drop).expect("app drop ok");
+        assert!(app_result.is_none());
+        assert!(!home.join("app.log").exists(), "app.log dropped");
+
+        // Daemon migration: Migrate → daemon.log renamed to sidecar.
+        let daemon_result = migrate_existing_log(&home, "daemon.log", MigrationPolicy::Migrate)
+            .expect("daemon migrate ok");
+        let daemon_target = daemon_result.expect("Migrate produces target");
+        assert!(daemon_target.exists());
+        let target_name = daemon_target
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            target_name.starts_with("daemon.log.migration."),
+            "daemon path uses daemon.log.migration.* namespace, got {target_name}"
+        );
+        assert!(
+            !target_name.starts_with("app.log."),
+            "app prefix namespace MUST NOT leak into daemon migration target"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Migration policy is policy-orthogonal across prefixes: Drop on a
+    /// `daemon.log` (hypothetical fresh-install scenario or operator-
+    /// driven cleanup) MUST work the same as Drop on app.log. Locks
+    /// the policy enum's behavior as filename-independent.
+    #[test]
+    fn migrate_drop_policy_is_filename_independent() {
+        let home = tmp_home("policy-orth");
+        std::fs::write(home.join("daemon.log"), b"unwanted").unwrap();
+        std::fs::write(home.join("app.log"), b"unwanted").unwrap();
+
+        for name in &["daemon.log", "app.log"] {
+            let r = migrate_existing_log(&home, name, MigrationPolicy::Drop).expect("ok");
+            assert!(r.is_none(), "{name}: Drop returns None");
+            assert!(!home.join(name).exists(), "{name}: removed");
+        }
 
         std::fs::remove_dir_all(&home).ok();
     }

@@ -42,21 +42,27 @@ pub fn run(fleet_path_override: Option<&str>) -> Result<()> {
     // Extract embedded fleet protocol to AGEND_HOME/protocol/.default/
     crate::protocol::extract_default(&home);
 
-    let log_path = home.join("app.log");
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&log_path)
-        .ok();
-    if let Some(file) = log_file {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter("agend_terminal=debug")
-            .with_writer(std::sync::Mutex::new(file))
-            .with_ansi(false)
-            .with_target(false)
-            .try_init();
-    }
+    // #927 PR-A: was a raw `OpenOptions::truncate(true)` write on
+    // `app.log` with hardcoded `debug` filter — long sessions hit
+    // unbounded growth (operator-observed). Now uses the parameterized
+    // rolling-appender shared with the daemon path:
+    //   - DAILY rotation, retain N days (env: AGEND_LOG_RETAIN_DAYS).
+    //   - Default filter `agend_terminal=info` (was `debug`); opt into
+    //     verbose via `AGEND_LOG=agend_terminal=debug`.
+    //   - First-boot pre-rotation `app.log` is dropped (synthesis policy:
+    //     tiny file, no rescue value).
+    //
+    // Guard lifetime: the `WorkerGuard` returned by setup_rolling_tracing
+    // must outlive the entire app session; drop = flush + close the
+    // worker thread. Bound here in `app::run`'s scope so it lives until
+    // the fn returns (the entire TUI loop lifetime).
+    let _app_log_guard = crate::logging::setup_rolling_tracing(
+        &home,
+        "app",
+        "agend_terminal=info",
+        crate::logging::MigrationPolicy::Drop,
+    )
+    .ok();
 
     let fleet_path = fleet_path_override.map(PathBuf::from);
 

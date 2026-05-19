@@ -487,13 +487,22 @@ fn main() -> anyhow::Result<()> {
 
     // `_log_guard` must outlive any tracing call below. Drop = flush + close
     // the rolling appender's worker thread, so we deliberately bind it in
-    // `main`'s scope rather than returning it from `setup_daemon_tracing`'s
+    // `main`'s scope rather than returning it from `setup_rolling_tracing`'s
     // call site. CLI mode produces `None`; the binding is still required so
     // the daemon-path `Some(guard)` lives until process exit.
+    //
+    // #927 PR-A: was `setup_daemon_tracing`; parametrized so the app path
+    // can share the same rolling-appender + panic-hook machinery. App's
+    // guard is owned by `app::run` itself (see `src/app/mod.rs`).
     let _log_guard = if is_app {
         None
     } else if is_daemon_child {
-        Some(crate::logging::setup_daemon_tracing(&home)?)
+        Some(crate::logging::setup_rolling_tracing(
+            &home,
+            "daemon",
+            "agend_terminal=info",
+            crate::logging::MigrationPolicy::Migrate,
+        )?)
     } else {
         crate::logging::setup_cli_tracing();
         None
