@@ -25,15 +25,24 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 /// Outcome of a single cleanup attempt against a daemon PID.
+///
+/// Platform-conditional variants carry `#[allow(dead_code)]` so the
+/// cross-platform CI lint passes regardless of which target compiles:
+/// `Graceful` + `ForceKilled` only fire on Unix (two-stage SIGTERM/
+/// SIGKILL path); `WindowsTerminated` only fires on Windows
+/// (`TerminateProcess` single-stage). `AlreadyExited` + `RefusedToDie`
+/// can be returned from either platform path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KillOutcome {
     /// PID was already gone before any kill signal was sent.
     AlreadyExited,
     /// SIGTERM caused graceful exit within the grace window. Carries the
     /// observed grace duration so operators can tune `--age` thresholds.
+    #[allow(dead_code)] // Unix-only constructed; Windows path goes through WindowsTerminated
     Graceful(Duration),
     /// SIGTERM was ignored; SIGKILL was sent and the PID died within
     /// the secondary grace window.
+    #[allow(dead_code)] // Unix-only constructed; Windows path goes through WindowsTerminated
     ForceKilled,
     /// Both SIGTERM and SIGKILL failed to reap the PID. Operator must
     /// investigate (kernel-stuck process, defunct, uninterruptible
@@ -256,6 +265,7 @@ pub fn parse_age(s: &str) -> Option<Duration> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     fn tmp_home(tag: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
         static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -323,6 +333,7 @@ mod tests {
     /// children of the cleanup-zombies CLI process (they're orphaned
     /// to PID 1 / launchd / init), so the kernel reaper handles them.
     /// Only test fixtures need this dance.
+    #[cfg(unix)]
     fn spawn_with_reaper(program: &str, args: &[&str]) -> (u32, std::thread::JoinHandle<()>) {
         let mut child = std::process::Command::new(program)
             .args(args)
