@@ -373,16 +373,30 @@ pub fn release_full(home: &Path, agent: &str, dry_run: bool) -> ReleaseOutcome {
     // right place to clear in-memory state too.
     crate::mcp::handlers::dispatch_hook::clear_bind_in_flight(home, agent);
 
-    // Sprint 57 Wave 2 Track B (#546 Item 2): unsubscribe `agent` from
-    // EVERY ci-watch they appear on, not just the binding-branch entry.
-    // The Sprint 55 P0-B EC7 helper was scoped to the exact
-    // `(released_repo, released_branch)` pair derived from binding.json
-    // — but agents may have added ad-hoc watches outside their
-    // binding-branch (e.g. `ci action=watch repo=… branch=main` to
-    // follow upstream during a closeout cycle). Those leaked across
-    // release until this enumerator landed. Best-effort: failures are
-    // logged but never abort release.
-    unsubscribe_all_ci_watches_for_agent(home, agent);
+    // #931 (Direction A.1 pure): release_full no longer mutates any
+    // ci-watch on the agent's behalf. Pre-#931 this site called
+    // `unsubscribe_all_ci_watches_for_agent(home, agent)` (Sprint 57
+    // Wave 2 Track B / #546 Item 2) which removed the released agent
+    // from every ci-watch and deleted the watch file in the sole-
+    // subscriber case — that cascade destroyed `next_after_ci` chains
+    // + polling state and caused 4-in-a-row PR stalls overnight
+    // (PRs #920, #925, #928, #929 — see #931 RCA).
+    //
+    // Operator's stated direction (#931 body): "Subscription persists
+    // across bind handoff unless explicitly `unwatch`ed." Hygiene is
+    // delegated to existing TTL paths:
+    //   - 72h absolute TTL (`expires_at`)
+    //   - 72h inactivity TTL (`last_terminal_seen_at`)
+    //   - PR-terminal auto-clear (`poller.rs::check_pr_terminal`)
+    //   - Explicit `ci action=unwatch` (operator-callable)
+    //
+    // Rollback criteria (PR #931 body): if dead-subscriber bloat
+    // (entries in `subscribers[]` referencing agents removed from the
+    // fleet) exceeds N writes/hour for Y consecutive days, revert by
+    // re-introducing a NARROW unsubscribe helper scoped to the binding-
+    // branch watch only (NOT the cross-branch broad sweep). The dead-
+    // sub bloat itself is harmless at notification time because both
+    // PTY inject and inbox enqueue (post-Fix 3) are registry-gated.
 
     // Issue #611: auto-cleanup merged local branch after release.
     // Read branch + source_repo from the binding we captured earlier.
@@ -431,6 +445,9 @@ pub fn release_full(home: &Path, agent: &str, dry_run: bool) -> ReleaseOutcome {
 /// the watch file entirely; otherwise rewrite it with the shrunk
 /// subscriber list. Best-effort: read/parse/write failures are
 /// logged but never abort release.
+#[allow(dead_code)] // #931: kept as the documented rollback target — see
+                    // the comment block at the former call site in `release_full`. Slated for
+                    // removal one Sprint after #931 lands assuming no rollback fires.
 fn unsubscribe_all_ci_watches_for_agent(home: &Path, agent: &str) {
     let ci_dir = crate::daemon::ci_watch::ci_watches_dir(home);
     let Ok(entries) = std::fs::read_dir(&ci_dir) else {

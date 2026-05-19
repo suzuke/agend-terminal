@@ -208,6 +208,12 @@ fn setup_git_repo_with_remote(home: &Path, agent: &str, origin_url: &str) -> std
     repo
 }
 
+// #931 INVERTED (was EC7 r1 binding-branch unsubscribe pin).
+//
+// Pre-#931: release_full would remove the released agent from the
+// binding-branch's subscriber list. Post-#931 (Direction A.1 pure):
+// release_full never mutates ci-watch state. Subscriptions persist
+// across release per operator intent in #931 body.
 #[test]
 fn ec7_release_full_unsubscribes_matching_branch() {
     let home = tmp_home("ec7-match");
@@ -219,7 +225,6 @@ fn ec7_release_full_unsubscribes_matching_branch() {
         "feat-ec7m",
         Some("o/r"),
     );
-    // Manually seed a watch entry with alpha + bob subscribers on this branch.
     let watch_path = write_ci_watch(&home, "o/r", "feat-ec7m", &["alpha", "bob"]);
     assert!(watch_path.exists());
 
@@ -228,18 +233,25 @@ fn ec7_release_full_unsubscribes_matching_branch() {
     let v: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();
     let subs = crate::daemon::ci_watch::parse_subscribers(&v);
-    assert_eq!(subs, vec!["bob".to_string()], "alpha removed, bob remains");
+    assert!(
+        subs.contains(&"alpha".to_string()),
+        "#931 GREEN: alpha persists on binding-branch watch across release — got {subs:?}"
+    );
+    assert!(
+        subs.contains(&"bob".to_string()),
+        "bob co-subscriber untouched — got {subs:?}"
+    );
     std::fs::remove_dir_all(&home).ok();
 }
 
-// Sprint 57 Wave 2 Track B (#546 Item 2) — release_full unsubscribes
-// the agent from EVERY watch they appear on, including ad-hoc cross-
-// branch watches. Replaces the EC7 r1 reviewer-driven pin that scoped
-// the unsubscribe to the binding-branch only; that scope let agents
-// leak orphan watches across release.
+// #931 INVERTED (was Sprint 57 Wave 2 Track B / #546 Item 2 cross-branch sweep pin).
+//
+// The Sprint 57 broad sweep was reverted in #931: ad-hoc cross-branch
+// watches the agent subscribed to MUST persist across release. Hygiene
+// is delegated to TTL + PR-terminal + explicit unwatch.
 #[test]
 fn release_full_unsubscribes_agent_from_cross_branch_watches_too() {
-    let home = tmp_home("ec7-cross-branch-now-unsubscribed");
+    let home = tmp_home("931-cross-branch-persists");
     setup_git_repo(&home, "alpha");
     let _ = super::dispatch_hook::dispatch_auto_bind_lease(
         &home,
@@ -248,30 +260,32 @@ fn release_full_unsubscribes_agent_from_cross_branch_watches_too() {
         "feat-ec7u",
         Some("o/r"),
     );
-    // Seed an ad-hoc cross-branch watch (e.g. agent followed `dev`
-    // for a sibling task). Pre-Sprint-57-Wave-2 this leaked across
-    // release; the new agent-keyed enumerator must clean it up.
     let other_path = write_ci_watch(&home, "o/r", "dev", &["alpha"]);
 
     crate::worktree_pool::release_full(&home, "alpha", false);
 
-    // alpha was the sole subscriber → file deleted entirely.
     assert!(
-        !other_path.exists(),
-        "cross-branch watch must be removed when releasing the sole subscriber agent"
+        other_path.exists(),
+        "#931 GREEN: ad-hoc cross-branch watch persists across release (TTL handles hygiene)"
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&other_path).unwrap()).unwrap();
+    let subs = crate::daemon::ci_watch::parse_subscribers(&v);
+    assert!(
+        subs.contains(&"alpha".to_string()),
+        "#931 GREEN: alpha persists on ad-hoc cross-branch watch — got {subs:?}"
     );
     std::fs::remove_dir_all(&home).ok();
 }
 
-// Sprint 57 Wave 2 Track B (#546 Item 2) — replaces the previous EC7 r1
-// pin (`ec7_release_full_does_not_unsubscribe_same_branch_different_repo`).
-// Agent names are unique within the fleet, so the cross-repo concern
-// the EC7 r1 reviewer raised does not apply to agent-keyed
-// unsubscribe: removing `alpha` from any watch where they appear is
-// always correct on release.
+// #931 INVERTED (was Sprint 57 Wave 2 Track B cross-repo broad sweep pin).
+//
+// The agent-keyed cross-repo unsubscribe was reverted in #931. Watches
+// on other repos that the agent subscribed to remain intact across
+// release — same persistence rule as cross-branch.
 #[test]
 fn release_full_unsubscribes_agent_from_cross_repo_watches_too() {
-    let home = tmp_home("ec7-cross-repo-now-unsubscribed");
+    let home = tmp_home("931-cross-repo-persists");
     setup_git_repo_with_remote(&home, "alpha", "https://github.com/o/repo-a.git");
     let _ = super::dispatch_hook::dispatch_auto_bind_lease(
         &home,
@@ -280,37 +294,35 @@ fn release_full_unsubscribes_agent_from_cross_repo_watches_too() {
         "feat-x",
         Some("o/repo-a"),
     );
-    // Same branch name on a DIFFERENT repo (e.g. agent watched
-    // upstream's feat-x for cross-repo coordination). Must shrink to
-    // remaining subscribers on release.
     let cross_repo_path = write_ci_watch(&home, "o/repo-b", "feat-x", &["alpha", "bob"]);
-    // alpha's own repo-a watch so we can confirm both shrink.
     let own_path = write_ci_watch(&home, "o/repo-a", "feat-x", &["alpha", "bob"]);
 
     crate::worktree_pool::release_full(&home, "alpha", false);
 
-    // BOTH watches shrink — agent-keyed unsubscribe doesn't care
-    // about repo/branch matching the binding.
     let cross: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&cross_repo_path).unwrap()).unwrap();
     let cross_subs = crate::daemon::ci_watch::parse_subscribers(&cross);
-    assert_eq!(
-        cross_subs,
-        vec!["bob".to_string()],
-        "same-branch different-repo watch must also shrink — agent name is unique fleet-wide"
+    assert!(
+        cross_subs.contains(&"alpha".to_string()),
+        "#931 GREEN: alpha persists on cross-repo watch — got {cross_subs:?}"
     );
 
     let own: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&own_path).unwrap()).unwrap();
     let own_subs = crate::daemon::ci_watch::parse_subscribers(&own);
-    assert_eq!(
-        own_subs,
-        vec!["bob".to_string()],
-        "alpha's bound (repo-a, feat-x) watch correctly shrunk"
+    assert!(
+        own_subs.contains(&"alpha".to_string()),
+        "#931 GREEN: alpha persists on own (binding) watch — got {own_subs:?}"
     );
     std::fs::remove_dir_all(&home).ok();
 }
 
+// #931 INVERTED (was EC7 r1 last-subscriber delete-on-empty pin).
+//
+// Pre-#931: when the released agent was the sole subscriber,
+// release_full deleted the watch file entirely. Post-#931: the file
+// persists across release. The file preserves `next_after_ci` chain +
+// polling state for any next agent who re-subscribes.
 #[test]
 fn ec7_release_full_removes_watch_file_when_last_subscriber() {
     let home = tmp_home("ec7-last");
@@ -328,8 +340,8 @@ fn ec7_release_full_removes_watch_file_when_last_subscriber() {
     crate::worktree_pool::release_full(&home, "alpha", false);
 
     assert!(
-        !watch_path.exists(),
-        "watch file removed when last subscriber unsubscribed"
+        watch_path.exists(),
+        "#931 GREEN: sole-subscriber watch file persists across release"
     );
     std::fs::remove_dir_all(&home).ok();
 }
