@@ -825,6 +825,106 @@ On spawn, the daemon sets `AGEND_INSTANCE_NAME=<name>` in the child's environmen
 
 ---
 
+## Cross-Cutting: CI Watch & Dispatch Chains
+
+### CI watch file identity (#942 / #943)
+
+Each `ci action=watch` subscription persists a JSON file at
+`<home>/ci-watches/<filename>.json`. The filename has been hardened
+twice in quick succession:
+
+- **#942 — `canonicalize_repo_slug`.** Operators (and the bridge)
+  refer to the same repo in seven divergent forms:
+  `git@github.com:owner/repo.git`, `https://github.com/owner/repo`,
+  `https://github.com/owner/repo.git`, `git+ssh://...`, raw
+  `owner/repo`, with `.git` suffix, with case variation. Pre-#942
+  each form computed its own watch filename → duplicate subscriptions
+  with divergent state → notifications fanned out N times. Post-#942
+  the slug is canonicalized to `owner/repo` (lowercase, no `.git`,
+  no scheme) before hashing.
+- **#943 — sha256 hash.** The pre-#943 filename used Rust's
+  `DefaultHasher` (SipHash-2-4 truncated to 64 bits → 16 hex chars).
+  Collision-grade is `~2^32` brute force — too thin for an identity
+  key the operator relies on. Replaced with sha256 (256-bit, 64 hex
+  chars). ~900 ns per call vs ~100 ns; at typical
+  ~100 subscriptions/agent/day the ~90 µs/day delta is negligible.
+
+The two changes ship together as a unit; the canonicalization
+narrows divergence at the *input* level while sha256 widens the
+hash *output* to remove the collision-grade concern at the same
+time.
+
+**Legacy migration (#942/#943 PR-B).** `bootstrap::prepare` runs
+`migrate_legacy_watch_filenames` synchronously at boot. The migration
+scans `<home>/ci-watches/*.json`, identifies non-canonical filenames
+(stem length ≠ 64), reads each body to recover `repo` + `branch`,
+canonicalizes the `repo` field, computes the new sha256 filename, and
+renames the file. Conflicts (two old files mapping to the same target)
+are logged with the FIRST one winning; the operator can hand-resolve.
+Idempotent — re-running on already-migrated state is a no-op. The
+synchronous-at-boot ordering means the poll loop never sees the old
+files, so operators don't observe duplicate 72 h notifications across
+the transition.
+
+### CI watch survives bind/release handoff (#931)
+
+The daemon's `release_worktree` path used to unsubscribe the releasing
+agent from every `ci-watch` they held. If that agent was the **sole**
+subscriber, the watch file's `next_after_ci` chain and polling state
+were destroyed, and the chained handoff (`ci pass → next_after_ci →
+[ci-ready-for-action] to reviewer`) never fired.
+
+Post-#931 the file is kept intact on the sole-subscriber release path:
+`next_after_ci`, `last_notified_head_sha`, and the polling state all
+survive. The next agent that binds the same branch (via
+`dispatch_auto_bind_lease`) inherits the chain and the handoff fires
+on the next CI green tick.
+
+The reviewer-dispatch chain `dev → ci → reviewer` is the canonical
+example; the same fix unblocks any multi-agent workflow where one
+agent's release precedes another's bind.
+
+### Correlation IDs on `system:ci` and dispatch_idle (#946 / #947)
+
+Two correlation_id sources flow into inbox routing:
+
+- **#946 — `system:ci` notifications.** Every `system:ci` enqueue
+  (pass, fail, stalled, conflict, etc.) now carries
+  `correlation_id = "{repo}@{branch}"` — a stable identifier per
+  watched branch. Pre-#946 these were `None`, leaving operators no
+  way to filter inbox dumps to a single branch. Greppable example:
+  `grep '"correlation_id":"owner/repo@feat/x"' $AGEND_HOME/inbox/*.jsonl`.
+- **#947 — dispatch_idle watchdog fallback.** When the watchdog fires
+  on a `kind=task`/`kind=query` send whose upstream had no
+  `correlation_id`, the synthesized fallback uses the canonical
+  dispatch id format `disp-<unix_micros>-<seq>`. Pre-#947 the
+  fallback was either `None` or a churning per-call ULID with no
+  cross-message tie. The new format is self-documenting via prefix
+  and stable across the dispatch + the eventual report.
+
+### Test infrastructure — deterministic primitives
+
+Two helpers extracted from in-test repetition (SOP 1 §3.20):
+
+- **`admin::cleanup_zombies::poll_until_dead(pid, timeout)`** (#934).
+  `pub(crate)` deterministic alternative to `thread::sleep(N)`
+  patterns. Polls `kill -0` (Unix) / `OpenProcess` (Windows) every
+  10 ms up to `timeout`. Returns `bool` (dead-on-time). Already
+  consumed by `agent.rs` shutdown path + `process.rs` reaper.
+- **`api::handlers::instance::await_sentinel_nonempty`** (#949). Polls
+  a sentinel file path until it has non-empty content or the timeout
+  elapses. Contract clarified by the rename: pre-#949 the helper was
+  named for the *file* existing, but `instance` codepaths needed the
+  *content* to be present (the file is created empty then written to).
+  Tests now use the helper at the four `instance.rs` boot-sentinel
+  sites; CI-side flake is gone.
+
+Both helpers are `pub(crate)` — call sites stay in-crate, and the
+helpers exist primarily to make tests deterministic without falling
+back to sleep tuning.
+
+---
+
 ## Data Flow Summary
 
 ### User sends message via Telegram

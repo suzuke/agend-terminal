@@ -230,6 +230,8 @@ See `docs/archived/MIGRATION-OUTBOUND-CAPS.md` for the full transition guide (Sp
 | `test [suite]` | Run built-in tests (mcp, attach, inbox, api, all) |
 | `capture` | Capture backend output (debugging) |
 | `completions <shell>` | Generate shell completions (bash, zsh, fish, powershell) |
+| `admin cleanup-branches [--yes]` | Delete local branches whose PRs were merged (dry-run by default) |
+| `admin cleanup-zombies [--age <D>] [--yes]` | Kill zombie daemons holding stale `run/<pid>/` (#927; default `--age 14d`) |
 
 ## TUI Keyboard Shortcuts
 

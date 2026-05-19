@@ -59,12 +59,63 @@ List running agents. Plain `list` queries the daemon's in-memory registry via `r
 The daemon's in-memory registry is the canonical source of truth for "which agents exist"; the `.port` files are TUI-bridge per-agent socket artifacts and only surface in the offline fallback. Operator scripts wanting authoritative output should pipe `--json` rather than parse plain `list`.
 
 ```
-agend-terminal list [--detailed] [--json]
-agend-terminal ls   [--detailed] [--json]   # alias
-agend-terminal status                       # alias of `list` (kept for back-compat; use --detailed for state/health/cmd)
+agend-terminal list [--detailed] [--json] [--legacy-json]
+agend-terminal ls   [--detailed] [--json] [--legacy-json]   # alias
+agend-terminal status                                       # alias of `list` (kept for back-compat; use --detailed for state/health/cmd)
 ```
 
 `status` is preserved as a clap alias for `list` post Wave 1 CLI consolidation; new code should prefer `list --detailed`.
+
+#### JSON shape (#938)
+
+`list --json` emits an envelope with a `mode` discriminator so operator scripts can distinguish authoritative output from offline-fallback output:
+
+```json
+{
+  "mode": "live" | "fallback_daemon_stuck" | "fallback_daemon_absent",
+  "agents": [ ... ]
+}
+```
+
+- `live` — daemon API answered; `agents` is the rich registry response (`state` / `health` / `backend` fields populated).
+- `fallback_daemon_stuck` — `.daemon` PID is alive but the API didn't respond (mid-restart, wedged main loop). `agents` carries `{name}`-only objects from the run-dir scan. May be transient; rerun before alerting. Persistent → `agend-terminal admin cleanup-zombies`.
+- `fallback_daemon_absent` — no `.daemon` file or PID dead. Boot a daemon with `agend-terminal app` / `agend-terminal start`.
+
+`--legacy-json` opts back into the pre-#938 shape (`{"agents": [...], ...}` passthrough of the API response, no `mode` field). One-release-cycle deprecation window for operator parsers that hard-code the old shape; remove after migration. Has no effect without `--json`.
+
+Plain (non-JSON) `list` adds a one-line stderr hint when `mode != live` so an operator running the command interactively sees the fallback state without re-running with `--json`.
+
+### `admin`
+
+Operator-side housekeeping subcommands. Destructive paths prompt `[y/N]` unless `--yes` is supplied (intended for scripted recovery jobs).
+
+```
+agend-terminal admin cleanup-branches [--yes]
+agend-terminal admin cleanup-zombies [--age <DURATION>] [--yes]
+```
+
+#### `admin cleanup-zombies` (#927)
+
+Kill long-running zombie daemon processes that still hold a `<home>/run/<pid>/` directory. Lists every `.daemon` whose mtime is older than `--age` (default `14d`), prints the candidate set, then asks for confirmation before signaling.
+
+- `--age <DURATION>` — accepts `14d`, `3h`, `30m` etc. Daemons younger than this are skipped.
+- `--yes` — non-interactive; skips the `[y/N]` prompt and emits a "non-interactive destructive mode" audit log line.
+
+Termination semantics are platform-asymmetric **by design** (#936 closed analysis):
+
+- **Unix** — `SIGTERM` → 5 s grace → `SIGKILL`. The 5 s window covers the daemon's own `SHUTDOWN_GRACE=2s` agent teardown plus ~3 s for cleanup hooks and log-worker flush.
+- **Windows** — `TerminateProcess` single-stage. The Win32 surface this CLI uses today has no SIGTERM equivalent. A future improvement may add a `CTRL_BREAK_EVENT` path for two-stage parity.
+
+Exit codes:
+
+- `0` — all candidates reaped (or none found).
+- non-zero — at least one process refused to die within the grace window (kernel-stuck / uninterruptible sleep / kernel module hold). Operator must investigate manually.
+
+`agend-terminal list` surfaces a `cleanup-zombies` hint in its fallback message when it detects a stuck daemon. The hint is intentionally cautious — the fallback can also fire transiently mid-restart, so wait one cycle before invoking `cleanup-zombies`.
+
+#### `admin cleanup-branches`
+
+Delete local branches whose PRs have been merged (squash-merge safe). Default is dry-run (preview only); `--yes` actually deletes. See `docs/RCA-*` notes for the squash-merge detection heuristic.
 
 ### `connect`
 Register an *already-running* local agent with the daemon (inbox-only — no PTY management). Useful in headless environments or to mix a manually-launched CLI into a running fleet.
@@ -159,9 +210,18 @@ agend-terminal completions <shell>
 | Variable | Purpose | Default |
 |----------|---------|---------|
 | `AGEND_HOME` | Data / config root | `~/.agend` (fallback: `~/.agend-terminal`) |
-| `AGEND_LOG` | `tracing-subscriber` env filter | `agend_terminal=info` |
+| `AGEND_LOG` | `tracing-subscriber` env filter | `agend_terminal=info` (see precedence note below) |
+| `AGEND_LOG_RETAIN_DAYS` | Daily rotation retain count (#914) | `3` |
+| `AGEND_LOG_MAX_BYTES` | Hard directory-size backstop (#914); supports `K`/`M`/`G` suffix | `2G` |
 | `AGEND_INSTANCE_NAME` | Identifies the instance to the MCP server | *(set by spawner)* |
+| `AGEND_DAEMON_BOOT_SWEEP_AGE_DAYS` | Boot-time stale-`run/<pid>/` GC, ages older than N days (#933). `0` / unset disables. Destructive — use with care. | *(disabled)* |
+| `AGEND_DAEMON_BOOT_SWEEP_DRY_RUN` | When `1`, the boot sweep logs the would-delete set instead of unlinking (#933). Pairs with `AGE_DAYS` for safe trials before enabling destructive mode. | *(disabled)* |
+| `AGEND_DAEMON_THREAD_DUMP_SECS` | Periodic in-process thread state dump, every N seconds (#941). `0` / unset disables; any positive integer enables. Output appears in `daemon.log`. Zero overhead when unset. | *(disabled)* |
 | Telegram env | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | *(optional; read from `.env` under `$AGEND_HOME`)* |
+
+**`AGEND_LOG` precedence (#927 PR-A)** — when the env var is set, it wins over the in-code default (`agend_terminal=info`). The default only applies when the var is unset or empty. This was previously documented as "default" but implementation occasionally overrode caller-set env values; the precedence is now explicit and tested.
+
+**Destructive env-var safety** — `AGEND_DAEMON_BOOT_SWEEP_AGE_DAYS` deletes `run/<pid>/` directories outright (no archive). Before flipping it on, run with `AGEND_DAEMON_BOOT_SWEEP_DRY_RUN=1` and `grep "boot-sweep" $AGEND_HOME/daemon.log` to validate the candidate set against expectations.
 
 ## On-disk Layout
 
@@ -178,11 +238,14 @@ $AGEND_HOME/
     event-log.jsonl               # event log
     workspace/<agent>/            # default working dir when none set
     run/<daemon-pid>/
-        .daemon                   # pid:start_time
-        api.port                  # daemon control API TCP port (loopback)
+        .daemon                   # pid:start_time — identity for liveness checks (early)
         api.cookie                # 32-byte auth cookie for api.port (0600 on Unix)
+        api.port                  # daemon control API TCP port (loopback)
+        .ready                    # boot-completion sentinel (#922); daemon-init-complete signal
         <agent>.port              # per-agent TUI bridge TCP port (loopback, cookie-auth)
 ```
+
+`.ready` exists ⟹ the daemon's agent spawn loop has finished and `list` / `/api/list` returns the final agent set for this boot. Single-signal policy — future sub-stage readiness MUST extend `.ready`'s content rather than introduce a new file. See `CLAUDE.md` "Daemon lifecycle files (#922)" for the full table and bare-poll caveats (residual `.ready` from a crashed daemon needs to be combined with a PID-liveness check; `agend-terminal doctor` is the recommended idiom).
 
 Everything under `$AGEND_HOME` (including `fleet.yaml`, `session.json`) is locked via `fs2::FileExt` during mutations — safe against concurrent daemon / CLI usage.
 

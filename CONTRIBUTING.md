@@ -50,6 +50,20 @@ CI mirrors these steps on Ubuntu + macOS + Windows (`.github/workflows/ci.yml`).
 - **New MCP tool** → unit-test the handler under `src/mcp/handlers/` and exercise the bridge wire path in `tests/mcp_bridge_client_handshake.rs` (handshake/framing) or `tests/mcp_proxy_parity.rs` (daemon-proxy parity). The legacy `agend-terminal mcp` subcommand was hard-removed in Sprint 56 Track I-Phase2c (#531); `agend-mcp-bridge` is the canonical wire entry point.
 - **New CLI flag** → cover it in `tests/integration.rs` or a focused unit test.
 - **Test fixtures** — use `std::env::temp_dir()` + `std::process::id()` for isolation, never hardcode `/tmp/...`. Tests that must clean up should `drop` the temp dir explicitly or use scope guards.
+- **Deterministic waits, not sleeps.** SOP 1 (§3.20) bans
+  `thread::sleep(N)` patterns in tests that wait for asynchronous state.
+  Use the existing `pub(crate)` primitives instead — they poll at a fast
+  cadence (10 ms) with a bounded timeout and return a `bool` /
+  `Option<T>` you can assert on:
+  - `admin::cleanup_zombies::poll_until_dead(pid, timeout) -> bool`
+    (#934) — wait for a child process to exit (kill -0 on Unix /
+    OpenProcess on Windows).
+  - `api::handlers::instance::await_sentinel_nonempty(path) -> Option<String>`
+    (#949) — wait until a sentinel file has non-empty content. Note the
+    rename: pre-#949 the helper was named for the file *existing*, but
+    instance-boot callers needed the *content* to be present.
+  - When adding a new fixture, check the existing primitives first
+    rather than rolling your own sleep loop.
 
 ## Style
 
