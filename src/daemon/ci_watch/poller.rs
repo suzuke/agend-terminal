@@ -157,7 +157,12 @@ pub fn emit_ci_conflict_alert(
                 parent_id: None,
                 task_id: None,
                 force_meta: None,
-                correlation_id: None,
+                // #946: stable grep target for operators tracing
+                // notifications back to a specific watch. Uses canonical
+                // (post-#942) `{repo}@{branch}` form — survives future
+                // hash-scheme migrations because it's the logical
+                // identity, not the storage filename hash.
+                correlation_id: Some(format!("{repo}@{branch}")),
                 reviewed_head: None,
                 from: "system:ci".to_string(),
                 text: body.clone(),
@@ -924,7 +929,8 @@ async fn ci_check_repo(
                         parent_id: None,
                         task_id: None,
                         force_meta: None,
-                        correlation_id: None,
+                        // #946: see emit_ci_conflict_alert for rationale.
+                        correlation_id: Some(format!("{repo}@{branch}")),
                         reviewed_head: None,
                         from: "system:ci".to_string(),
                         text: format!(
@@ -1075,7 +1081,9 @@ async fn ci_check_repo(
                         parent_id: None,
                         task_id: None,
                         force_meta: None,
-                        correlation_id: None,
+                        // #946: reuse repo_branch_key (line 977) — same
+                        // canonical `{repo}@{branch}` form.
+                        correlation_id: Some(repo_branch_key.clone()),
                         reviewed_head: None,
                         from: "system:ci".to_string(),
                         text: body.clone(),

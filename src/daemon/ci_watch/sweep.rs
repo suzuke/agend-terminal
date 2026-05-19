@@ -169,7 +169,10 @@ fn fan_out_health_event(
                 parent_id: None,
                 task_id: None,
                 force_meta: None,
-                correlation_id: None,
+                // #946: reuse repo_branch_key (line 157) — same canonical
+                // `{repo}@{branch}` form. Stable grep target across hash
+                // migrations because it's logical identity, not filename.
+                correlation_id: Some(repo_branch_key.clone()),
                 reviewed_head: None,
                 from: "system:ci".to_string(),
                 text: body.clone(),
