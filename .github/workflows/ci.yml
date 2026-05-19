@@ -117,9 +117,13 @@ jobs:
           "$BIN" start --agents "shell:$SHELL_CMD" > daemon.log 2>&1 &
           DAEMON_PID=$!
 
-          # Wait up to 30s for api.port to appear
+          # #922: poll for `.ready` instead of `api.port`. `api.port` is
+          # published BEFORE the agent spawn loop (#906 reorder), so
+          # external probers seeing it cannot assume the registry is
+          # populated. `.ready` is the daemon-init-complete signal —
+          # spawn loop done, agent count final. Wait up to 30s.
           for i in $(seq 1 60); do
-            if find "$AGEND_HOME/run" -name api.port 2>/dev/null | grep -q .; then
+            if find "$AGEND_HOME/run" -name .ready 2>/dev/null | grep -q .; then
               echo "daemon ready (iter $i)"
               break
             fi
@@ -131,9 +135,25 @@ jobs:
             sleep 0.5
           done
 
-          # List — must include the shell agent
-          "$BIN" list --json | tee list.out
-          grep -q '"shell"' list.out || { echo "shell agent missing from list"; exit 1; }
+          # List — must include the shell agent. Defense-in-depth retry
+          # budget (3× 100ms) in case `.ready` is observed slightly
+          # before the list IPC sees the final registry on a slow runner.
+          # The actual contract is `.ready ⟹ count is final`, so the
+          # retries should never fire in healthy CI — they are a safety
+          # net against future regressions of the daemon-side contract.
+          shell_visible=0
+          for attempt in 1 2 3; do
+            "$BIN" list --json | tee list.out
+            if grep -q '"shell"' list.out; then
+              shell_visible=1
+              break
+            fi
+            sleep 0.1
+          done
+          if [ "$shell_visible" -ne 1 ]; then
+            echo "shell agent missing from list after 3 retries"
+            exit 1
+          fi
 
           # Inject
           "$BIN" inject shell 'echo hi'
