@@ -440,4 +440,125 @@ mod tests {
 
         std::fs::remove_dir_all(&home).ok();
     }
+
+    // ── #934 direct poll_until_dead tests ─────────────────────────────────
+    //
+    // These exercise the primitive directly so a future regression that
+    // (e.g.) inverts the deadline check, drops the early-return on dead
+    // PID, or changes the poll cadence will fail visibly. The primitive
+    // is consumed by both cleanup_zombies (its original site) and #934's
+    // sweep_child_tree post-kill assertions; direct tests pin the
+    // contract once instead of relying on consumer-side coverage.
+    //
+    // §3.20 SOP 1 deterministic: each test uses a deadline + observable
+    // state. No sleep-based assertions. The "timeout on undying zombie"
+    // test uses python3 SIG_IGN (same pattern as
+    // `cleanup_zombie_daemon_sigterm_ignored_returns_force_killed`) so
+    // the unkillable behavior is forced, not racy.
+
+    #[cfg(unix)]
+    #[test]
+    fn poll_until_dead_returns_immediately_when_already_dead() {
+        // Use a PID that's guaranteed not to exist. PID 0 is reserved by
+        // the kernel and `kill(0, 0)` semantically means "the current
+        // process group" — would return success and bypass the dead-PID
+        // path. Use a high PID that the kernel hasn't allocated to a real
+        // process; u32::MAX is essentially never assigned (Linux caps PID
+        // at /proc/sys/kernel/pid_max which is typically 4 million).
+        let definitely_dead_pid: u32 = u32::MAX;
+        assert!(
+            !is_alive(definitely_dead_pid),
+            "u32::MAX must not be a live PID — test fixture invariant"
+        );
+
+        let start = std::time::Instant::now();
+        let result = poll_until_dead(definitely_dead_pid, Duration::from_secs(10));
+        let elapsed = start.elapsed();
+
+        assert!(
+            result,
+            "poll_until_dead must return true for already-dead PID"
+        );
+        // Returns BEFORE the first 100ms sleep tick (early-return path).
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "early-return path must not sleep; got {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn poll_until_dead_returns_after_kill_completes() {
+        // Spawn cooperative child (no SIG_IGN). SIGKILL it. Poll should
+        // observe death within the window.
+        let (pid, reaper) = spawn_with_reaper("sh", &["-c", "sleep 30"]);
+        assert!(is_alive(pid), "child must be alive pre-kill");
+
+        // SIGKILL — immediate kernel-side process exit.
+        unsafe {
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
+
+        let result = poll_until_dead(pid, Duration::from_secs(5));
+        let _ = reaper.join();
+
+        assert!(
+            result,
+            "poll_until_dead must observe child death within 5s after SIGKILL"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn poll_until_dead_returns_timeout_on_undying_zombie() {
+        // python3 SIG_IGN — process survives SIGTERM. We send SIGTERM
+        // (which is ignored), then poll with a short deadline. Since
+        // we DON'T escalate to SIGKILL here, the process stays alive
+        // and poll_until_dead must return false on timeout.
+        //
+        // Pattern matches `cleanup_zombie_daemon_sigterm_ignored_returns_force_killed`
+        // (line ~374) for SIG_IGN-disposition reliability across macOS +
+        // Linux. python3 is universally available on `#[cfg(unix)]`-gated
+        // CI runners.
+        let (pid, reaper) = spawn_with_reaper(
+            "python3",
+            &[
+                "-c",
+                "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)",
+            ],
+        );
+
+        // Give python3 ~300ms to install the SIG_IGN handler (otherwise
+        // SIGTERM lands during interpreter startup before the handler is
+        // in place; python's default SIGTERM disposition terminates,
+        // which would make poll_until_dead succeed prematurely).
+        std::thread::sleep(Duration::from_millis(300));
+
+        // Send SIGTERM — ignored by the child.
+        unsafe {
+            libc::kill(pid as i32, libc::SIGTERM);
+        }
+
+        // Poll for ONLY 500ms. SIG_IGN child stays alive → return false.
+        let start = std::time::Instant::now();
+        let result = poll_until_dead(pid, Duration::from_millis(500));
+        let elapsed = start.elapsed();
+
+        // Cleanup: SIGKILL the surviving child + reap.
+        unsafe {
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
+        let _ = reaper.join();
+
+        assert!(
+            !result,
+            "poll_until_dead must return false (timeout) for SIG_IGN-armed child"
+        );
+        // Timing: must have polled for AT LEAST the timeout window.
+        // We give 50ms tolerance for scheduler jitter.
+        assert!(
+            elapsed >= Duration::from_millis(450),
+            "must wait the full timeout; got {elapsed:?}"
+        );
+    }
 }

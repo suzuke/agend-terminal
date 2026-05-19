@@ -2197,13 +2197,47 @@ Allow Trust All Tools mode?
             }
         }
 
+        // #934: §3.20 SOP 1 — poll-with-deadline against post-condition.
+        //
+        // Pre-#934 these were bare `assert!(!is_pid_alive(_pid))`
+        // immediately after `sweep_child_tree` returned. Under CI
+        // scheduler contention (especially in the 48-PTY concurrent
+        // stress runner), the grandchild `sleep` could still appear
+        // alive at the assertion point even though SIGKILL had landed —
+        // it was a ZOMBIE awaiting reap by init / launchd (its new
+        // parent after the shell died).
+        //
+        // `is_pid_alive` uses `libc::kill(pid, 0)` which returns 0 for
+        // zombies (kernel still tracks the PID until reaped).
+        // Init / launchd reap latency is OS-scheduling-dependent —
+        // typically <1s on Linux, observed up to ~3s on macOS, worst
+        // case ~5-10s on heavily loaded CI runners. Bare assert at
+        // microsecond latency lost the race intermittently.
+        //
+        // Fix: poll with deadline. `poll_until_dead` (promoted to
+        // `pub(crate)` for this PR) returns true within the window or
+        // false on timeout. shell_pid uses a 5s deadline (we reap
+        // directly via `child.wait()` above so the gap is short).
+        // sleep_pid uses a 10s deadline for init / launchd reap-cycle
+        // worst case — see deadline doc in `cleanup_zombies::poll_until_dead`
+        // for OS-conditional rationale.
         assert!(
-            !crate::process::is_pid_alive(shell_pid),
-            "shell leader must be dead (reaped) after sweep"
+            crate::admin::cleanup_zombies::poll_until_dead(
+                shell_pid,
+                std::time::Duration::from_secs(5),
+            ),
+            "shell leader did not die within 5s post-sweep — we reap directly \
+             via child.wait() so the kernel-pid-cleanup gap is normally <1s; \
+             timing this slow indicates a deeper issue"
         );
         assert!(
-            !crate::process::is_pid_alive(sleep_pid),
-            "sleep grandchild must die with the group (kill_process_tree semantics)"
+            crate::admin::cleanup_zombies::poll_until_dead(
+                sleep_pid,
+                std::time::Duration::from_secs(10),
+            ),
+            "sleep grandchild did not die within 10s post-sweep — likely \
+             init / launchd reap latency under contention (10s covers macOS \
+             launchd's slowest observed cycle on loaded CI runners)"
         );
         let _ = std::fs::remove_file(pid_file);
     }

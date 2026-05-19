@@ -148,10 +148,28 @@ mod tests {
         kill_process_tree(shell_pid);
         let _ = child.wait();
 
-        assert!(!is_pid_alive(shell_pid), "shell must be dead after kill");
+        // #934 sibling-fix: same race shape as `sweep_child_tree_body` in
+        // src/agent.rs. After `kill_process_tree`, the grandchild `sleep`
+        // is re-parented to init / launchd and exists as a zombie until
+        // that new parent reaps it. `is_pid_alive` returns true for
+        // zombies (libc::kill(pid, 0) succeeds), so a bare assert can
+        // see "still alive" under CI scheduler contention. Replace with
+        // poll-with-deadline (§3.20 SOP 1). shell_pid: 5s deadline (we
+        // wait() directly); sleep_pid: 10s deadline (init reap window).
         assert!(
-            !is_pid_alive(sleep_pid),
-            "sleep child must also be dead after kill_process_tree (group kill)"
+            crate::admin::cleanup_zombies::poll_until_dead(
+                shell_pid,
+                std::time::Duration::from_secs(5),
+            ),
+            "shell must be dead within 5s after kill (we wait() directly)"
+        );
+        assert!(
+            crate::admin::cleanup_zombies::poll_until_dead(
+                sleep_pid,
+                std::time::Duration::from_secs(10),
+            ),
+            "sleep grandchild must die within 10s after kill_process_tree \
+             (group kill semantics; 10s covers init / launchd reap latency)"
         );
         let _ = std::fs::remove_file(&pid_file);
     }
