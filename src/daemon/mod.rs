@@ -442,7 +442,21 @@ fn run_core(
     }
 
     let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+    // #945 Phase 1: publish registry to the pending slot so the
+    // backgrounded telegram_init thread can attach it after
+    // `register_active_channel` lands (~6s after boot). The
+    // pre-#945 sync path `if let Some(tg) = telegram { ... }`
+    // doesn't fire anymore because `prepared.telegram` is always
+    // None post-backgrounding. The eager-attach path below
+    // covers the rare case where telegram_init completed BEFORE
+    // run_core reached this point (e.g. cached / mocked / fast).
+    crate::agent::set_pending_registry(Arc::clone(&registry));
     if let Some(tg) = telegram.as_ref() {
+        tg.attach_registry(Arc::clone(&registry));
+    } else if let Some(tg) = crate::channel::active_channel() {
+        // #945 Phase 1: eager-attach if telegram_init already
+        // completed before this site (rare but possible — e.g.
+        // a test with mocked-fast init or warm-cache scenario).
         tg.attach_registry(Arc::clone(&registry));
     }
 

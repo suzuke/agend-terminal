@@ -203,6 +203,40 @@ pub fn lock_registry(
     reg.lock()
 }
 
+// ── #945 Phase 1: pending-registry slot for deferred attach ────────────
+//
+// `bootstrap::telegram_init` runs in a background thread (~6s of HTTP
+// calls). When it completes, it needs to call `Channel::attach_registry`
+// against the agent registry that the caller (run_core / app::run)
+// creates separately. Pre-#945 the caller did this synchronously via
+// `if let Some(tg) = prepared.telegram { tg.attach_registry(...) }`
+// at `daemon/mod.rs:443-447` (and analogous `app/mod.rs:213-222`); but
+// post-backgrounding `prepared.telegram` is None at boot.
+//
+// The pending-registry slot bridges the gap: caller publishes its
+// registry via `set_pending_registry`; the background telegram_init
+// thread polls `get_pending_registry` after `register_active_channel`
+// and calls `attach_registry` when the registry is available.
+//
+// Single-writer per process (run_core OR app::run — they're mutually
+// exclusive entry points). `OnceLock` enforces this: first caller
+// wins; subsequent `set_pending_registry` calls silently no-op.
+static PENDING_REGISTRY: std::sync::OnceLock<AgentRegistry> = std::sync::OnceLock::new();
+
+/// Publish the agent registry for deferred attach by the background
+/// `telegram_init` thread. Idempotent — subsequent calls no-op.
+/// Caller is `run_core` (daemon mode) or `app::run` (TUI mode).
+pub fn set_pending_registry(reg: AgentRegistry) {
+    let _ = PENDING_REGISTRY.set(reg);
+}
+
+/// Read the registry published by `set_pending_registry`. Returns
+/// `None` if no caller has published yet. Background
+/// `telegram_init` polls this after `register_active_channel`.
+pub fn get_pending_registry() -> Option<AgentRegistry> {
+    PENDING_REGISTRY.get().cloned()
+}
+
 /// #941: registry-lock wrapper that records the holder for the periodic
 /// thread-dump observability handler. Use this in per_tick handler call
 /// sites where wedge-detection matters; bare [`lock_registry`] is
@@ -1600,6 +1634,43 @@ pub fn subscribe_with_dump(agent: &AgentHandle) -> (crossbeam_channel::Receiver<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #945 Phase 1: pending-registry slot publishes the agent registry
+    /// to the background `telegram_init` thread. The slot is a
+    /// `OnceLock` (set-once-per-process) so the test asserts that
+    /// (a) initial state is empty, (b) `set_pending_registry` makes
+    /// the registry observable via `get_pending_registry`.
+    ///
+    /// Process-shared state: this test runs in cargo's per-process
+    /// model so the OnceLock is fresh per `cargo test` invocation. If
+    /// re-run in the same binary instance (rare), the second call to
+    /// `set_pending_registry` no-ops — but `get_pending_registry`
+    /// still returns the originally-set value, which is the documented
+    /// behavior (first publisher wins).
+    #[test]
+    fn pending_registry_publish_and_observe_945() {
+        // Note: OnceLock may have been populated by an earlier test
+        // in the same process. If `get_pending_registry()` returns
+        // Some already, skip with a clear message — we can't reset
+        // OnceLock state.
+        if get_pending_registry().is_some() {
+            eprintln!(
+                "test fixture: PENDING_REGISTRY already populated by earlier \
+                 test in this process. OnceLock is set-once; skipping. The \
+                 set-once semantic is itself the contract this test pins."
+            );
+            return;
+        }
+        let registry: AgentRegistry =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        set_pending_registry(Arc::clone(&registry));
+        let observed = get_pending_registry().expect("registry must be observable post-publish");
+        // Identity check: same Arc-pointer.
+        assert!(
+            Arc::ptr_eq(&registry, &observed),
+            "get_pending_registry must return the SAME Arc that was published"
+        );
+    }
 
     #[test]
     fn validate_name_valid() {

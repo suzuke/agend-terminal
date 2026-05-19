@@ -216,7 +216,16 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         // Attached mode stays unwired: that process never owns the registry,
         // and the Telegram bot (if any) runs under the other daemon which
         // already did its own attach.
+        //
+        // #945 Phase 1: telegram_init is now backgrounded; `telegram_state`
+        // is always None at this point post-backgrounding. Publish registry
+        // to the pending slot so the background thread can attach when its
+        // ~6s HTTP init completes. The if-let path below covers the eager
+        // (fast/mocked init) case.
+        crate::agent::set_pending_registry(Arc::clone(&registry));
         if let Some(tg) = telegram_state.as_ref() {
+            tg.attach_registry(Arc::clone(&registry));
+        } else if let Some(tg) = crate::channel::active_channel() {
             tg.attach_registry(Arc::clone(&registry));
         }
     }
