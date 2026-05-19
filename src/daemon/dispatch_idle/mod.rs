@@ -811,4 +811,129 @@ mod tests {
         assert!(j2.get("elapsed_secs").is_some());
         std::fs::remove_dir_all(&home).ok();
     }
+
+    // ── #947 fallback contract: dispatch_idle nudge's correlation_id ──
+    //
+    // Pre-#947 behavior: `emit_exceeded_event` cloned `d.correlation_id`
+    // verbatim. When the original `send` omitted correlation_id, the
+    // outbound nudge inherited `None` — operators couldn't backtrack
+    // from the nudge to the source sidecar.
+    //
+    // Post-#947: when upstream correlation_id is None, fall back to
+    // `d.dispatch_id` (format `disp-{ts}-{seq}`, self-documenting via
+    // the `disp-` prefix). The schema field is reused; no new field.
+    //
+    // The blend (upstream-chain vs producer-record) is acceptable because
+    // the prefix conventions (`disp-`, `t-`, `m-`) make value class
+    // identifiable at grep time. If a future producer breaks the prefix
+    // convention, file a follow-up to add `source_record_id: Option<String>`
+    // for clean separation (option A from /tmp/dialectic-947-dev-primary.md).
+
+    /// #947 test 1 — when upstream correlation_id is present, it is
+    /// preserved (NOT replaced with dispatch_id). The fallback applies
+    /// only when upstream is None.
+    #[test]
+    fn dispatch_idle_emit_with_upstream_correlation_preserves_it() {
+        let home = tmp_home("947-upstream-preserved");
+        let issued = chrono::Utc::now() - chrono::Duration::seconds(700);
+        write_pending_at(
+            &home,
+            "alpha",
+            "beta",
+            Some("upstream-corr-abc"),
+            "task",
+            600,
+            issued,
+        );
+        scan_and_emit(&home);
+        let inbox = crate::inbox::drain(&home, "alpha");
+        let nudge = inbox
+            .iter()
+            .find(|m| m.kind.as_deref() == Some("dispatch_idle_threshold_exceeded"))
+            .expect("exceeded nudge must enqueue");
+        assert_eq!(
+            nudge.correlation_id.as_deref(),
+            Some("upstream-corr-abc"),
+            "upstream correlation_id must be preserved verbatim"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #947 test 2 — when upstream correlation_id is None, fall back to
+    /// `d.dispatch_id`. The nudge becomes traceable to its source sidecar.
+    #[test]
+    fn dispatch_idle_emit_without_upstream_falls_back_to_dispatch_id() {
+        let home = tmp_home("947-fallback-dispid");
+        let issued = chrono::Utc::now() - chrono::Duration::seconds(700);
+        let dispatch_id = write_pending_at(&home, "alpha", "beta", None, "task", 600, issued);
+        scan_and_emit(&home);
+        let inbox = crate::inbox::drain(&home, "alpha");
+        let nudge = inbox
+            .iter()
+            .find(|m| m.kind.as_deref() == Some("dispatch_idle_threshold_exceeded"))
+            .expect("exceeded nudge must enqueue");
+        assert_eq!(
+            nudge.correlation_id.as_deref(),
+            Some(dispatch_id.as_str()),
+            "missing upstream correlation_id must fall back to dispatch_id"
+        );
+        // Format check: dispatch_id starts with `disp-` (self-documenting prefix).
+        assert!(
+            dispatch_id.starts_with("disp-"),
+            "dispatch_id format must use `disp-` prefix: {dispatch_id}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #947 test 5 (e2e) — after the fix, dispatch_idle nudges ALWAYS
+    /// carry a non-empty correlation_id, regardless of upstream presence.
+    /// This is the load-bearing operator contract for reverse-lookup.
+    #[test]
+    fn dispatch_idle_nudge_correlation_id_always_non_empty() {
+        let home = tmp_home("947-always-non-empty");
+        let now = chrono::Utc::now();
+        // Two pending dispatches: one with upstream, one without.
+        write_pending_at(
+            &home,
+            "alpha",
+            "beta",
+            Some("with-chain"),
+            "task",
+            600,
+            now - chrono::Duration::seconds(700),
+        );
+        write_pending_at(
+            &home,
+            "gamma",
+            "delta",
+            None,
+            "task",
+            600,
+            now - chrono::Duration::seconds(800),
+        );
+        scan_and_emit(&home);
+        let alpha_inbox = crate::inbox::drain(&home, "alpha");
+        let gamma_inbox = crate::inbox::drain(&home, "gamma");
+        for m in alpha_inbox
+            .iter()
+            .filter(|m| m.kind.as_deref() == Some("dispatch_idle_threshold_exceeded"))
+        {
+            let c = m.correlation_id.as_deref().unwrap_or("");
+            assert!(
+                !c.is_empty(),
+                "alpha nudge correlation_id must be non-empty: {m:?}"
+            );
+        }
+        for m in gamma_inbox
+            .iter()
+            .filter(|m| m.kind.as_deref() == Some("dispatch_idle_threshold_exceeded"))
+        {
+            let c = m.correlation_id.as_deref().unwrap_or("");
+            assert!(
+                !c.is_empty(),
+                "gamma nudge correlation_id must be non-empty (fallback): {m:?}"
+            );
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
 }

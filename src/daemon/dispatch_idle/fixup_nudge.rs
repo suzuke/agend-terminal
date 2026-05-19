@@ -313,4 +313,100 @@ mod tests {
         );
         std::fs::remove_dir_all(&home).ok();
     }
+
+    // ── #947 fallback contract: fixup_nudge correlation_id ──
+    //
+    // Mirror of the `emit_exceeded_event` fallback semantic. When the
+    // upstream `send` omitted correlation_id, the fixup-watchdog nudge
+    // falls back to `d.dispatch_id`. See dispatch_idle/mod.rs #947 test
+    // block for the design rationale.
+
+    /// Helper to plant an exceeded sidecar with optional correlation_id
+    /// (the existing `write_exceeded_sidecar` always sets one — this
+    /// variant tests the absent case).
+    fn write_exceeded_sidecar_no_correlation(
+        home: &Path,
+        dispatcher: &str,
+        target: &str,
+        elapsed_secs: i64,
+    ) -> String {
+        let dir = pending_dir(home);
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = "disp-test-947-no-corr".to_string();
+        let issued = (chrono::Utc::now() - chrono::Duration::seconds(elapsed_secs)).to_rfc3339();
+        let payload = PendingDispatch {
+            schema_version: 1,
+            dispatch_id: id.clone(),
+            dispatcher: dispatcher.to_string(),
+            target: target.to_string(),
+            correlation_id: None,
+            expected_kind: "task".to_string(),
+            threshold_secs: 600,
+            issued_at: issued,
+            status: "exceeded".to_string(),
+            nudge_sent_at: None,
+        };
+        std::fs::write(
+            pending_path(home, &id),
+            serde_json::to_string_pretty(&payload).unwrap(),
+        )
+        .unwrap();
+        id
+    }
+
+    /// #947 test 3 — fixup_nudge with upstream correlation_id preserves it.
+    #[test]
+    fn fixup_nudge_with_upstream_correlation_preserves_it() {
+        let home = tmp_home("947-fixup-upstream");
+        write_fleet_with_fixup_member(&home, "fixup-lead");
+        write_exceeded_sidecar(
+            &home,
+            "fixup-lead",
+            "fixup-reviewer",
+            "upstream-corr-xyz",
+            700,
+        );
+        scan_and_nudge(&home);
+        let inbox = crate::inbox::drain(&home, "fixup-reviewer");
+        let nudge = inbox
+            .iter()
+            .find(|m| m.kind.as_deref() == Some("dispatch_idle_nudge"))
+            .expect("fixup-watchdog must enqueue nudge");
+        assert_eq!(
+            nudge.correlation_id.as_deref(),
+            Some("upstream-corr-xyz"),
+            "fixup_nudge must preserve upstream correlation_id"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #947 test 4 — fixup_nudge without upstream falls back to dispatch_id.
+    #[test]
+    fn fixup_nudge_without_upstream_falls_back_to_dispatch_id() {
+        let home = tmp_home("947-fixup-fallback");
+        write_fleet_with_fixup_member(&home, "fixup-lead");
+        let dispatch_id =
+            write_exceeded_sidecar_no_correlation(&home, "fixup-lead", "fixup-reviewer", 700);
+        scan_and_nudge(&home);
+        let inbox = crate::inbox::drain(&home, "fixup-reviewer");
+        let nudge = inbox
+            .iter()
+            .find(|m| m.kind.as_deref() == Some("dispatch_idle_nudge"))
+            .expect("fixup-watchdog must enqueue nudge");
+        assert_eq!(
+            nudge.correlation_id.as_deref(),
+            Some(dispatch_id.as_str()),
+            "fixup_nudge must fall back to dispatch_id when upstream missing"
+        );
+        // dispatch_id format check: `disp-` prefix self-documents the value class.
+        assert!(
+            nudge
+                .correlation_id
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("disp-"),
+            "dispatch_id fallback must carry `disp-` prefix"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
