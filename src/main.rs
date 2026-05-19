@@ -352,6 +352,36 @@ enum AdminCommands {
         #[arg(long)]
         yes: bool,
     },
+    /// #927: kill long-running zombie daemons holding `<home>/run/<pid>/`.
+    ///
+    /// Lists daemon processes whose `<run_dir>/.daemon` mtime is older
+    /// than `--age` (default `14d`). Prompts `[y/N]` before sending
+    /// signals unless `--yes` is supplied for scripted scenarios.
+    ///
+    /// Termination semantics (platform asymmetry):
+    ///   - **Unix**: SIGTERM → 5s grace → SIGKILL on timeout. Grace
+    ///     allows the daemon's own SHUTDOWN_GRACE=2s agent teardown +
+    ///     3s buffer for cleanup hooks and log-worker flush.
+    ///   - **Windows**: TerminateProcess single-stage (no SIGTERM
+    ///     equivalent in the Win32 API surface this CLI uses today).
+    ///     Future improvement: CTRL_BREAK_EVENT path for two-stage
+    ///     parity with Unix.
+    ///
+    /// Exit codes:
+    ///   - 0: all candidates reaped (or no candidates found).
+    ///   - non-zero: at least one candidate refused to die after the
+    ///     full grace window. Operator must investigate (kernel-stuck
+    ///     process / uninterruptible sleep / kernel module hold).
+    CleanupZombies {
+        /// Age threshold (e.g. `14d`, `3h`, `30m`). Daemons whose
+        /// `.daemon` file mtime is older than this are candidates.
+        #[arg(long, default_value = "14d")]
+        age: String,
+        /// Skip the interactive `[y/N]` prompt. Logs a
+        /// "non-interactive destructive mode" line for the audit trail.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 /// Issue #704: passive capture subcommands.
@@ -746,6 +776,101 @@ fn main() -> anyhow::Result<()> {
                         if dry_run { 0 } else { deleted },
                         skipped
                     );
+                }
+            }
+            AdminCommands::CleanupZombies { age, yes } => {
+                use admin::cleanup_zombies::{
+                    cleanup_zombie_daemon, find_zombie_candidates, log_zombie_state, parse_age,
+                    KillOutcome,
+                };
+                use std::io::Write;
+                let min_age = parse_age(&age).unwrap_or_else(|| {
+                    eprintln!(
+                        "agend-terminal: invalid --age {age:?} \
+                         (expected suffix d/h/m/s, e.g. 14d); using default 14d"
+                    );
+                    std::time::Duration::from_secs(14 * 86400)
+                });
+                let now = std::time::SystemTime::now();
+                let zombies = find_zombie_candidates(&home, min_age, now);
+                if zombies.is_empty() {
+                    println!(
+                        "No zombie daemons older than {age} found in {}",
+                        home.join("run").display()
+                    );
+                    return Ok(());
+                }
+                println!(
+                    "Found {} zombie daemon process(es) older than {age}:",
+                    zombies.len()
+                );
+                for z in &zombies {
+                    let age_h = z.age.as_secs() / 3600;
+                    let age_d = age_h / 24;
+                    let age_str = if age_d > 0 {
+                        format!("{age_d}d")
+                    } else {
+                        format!("{age_h}h")
+                    };
+                    println!(
+                        "  PID {pid}  age {age}  run_dir {dir}",
+                        pid = z.pid,
+                        age = age_str,
+                        dir = z.run_dir.display()
+                    );
+                }
+                println!();
+                let proceed = if yes {
+                    tracing::info!(
+                        "#927 cleanup-zombies: non-interactive destructive mode (--yes)"
+                    );
+                    println!("--yes supplied; proceeding without prompt.");
+                    true
+                } else {
+                    print!("Send SIGTERM (then SIGKILL after 5s)? [y/N] ");
+                    std::io::stdout().flush().ok();
+                    let mut input = String::new();
+                    std::io::stdin().read_line(&mut input).ok();
+                    matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+                };
+                if !proceed {
+                    println!("Aborted. No signals sent.");
+                    return Ok(());
+                }
+                let term_grace = std::time::Duration::from_secs(5);
+                let kill_grace = std::time::Duration::from_secs(2);
+                let mut refused = 0;
+                for z in &zombies {
+                    log_zombie_state(z.pid);
+                    let outcome = cleanup_zombie_daemon(z.pid, term_grace, kill_grace);
+                    match outcome {
+                        KillOutcome::Graceful(d) => {
+                            println!("  PID {} reaped gracefully ({}ms)", z.pid, d.as_millis());
+                        }
+                        KillOutcome::ForceKilled => {
+                            println!("  PID {} required SIGKILL (SIGTERM ignored)", z.pid);
+                        }
+                        KillOutcome::AlreadyExited => {
+                            println!("  PID {} already exited (race with sweep)", z.pid);
+                        }
+                        KillOutcome::WindowsTerminated => {
+                            println!("  PID {} terminated (Windows TerminateProcess)", z.pid);
+                        }
+                        KillOutcome::RefusedToDie => {
+                            eprintln!(
+                                "  PID {} REFUSED TO DIE after SIGTERM+SIGKILL — investigate",
+                                z.pid
+                            );
+                            refused += 1;
+                        }
+                    }
+                }
+                if refused > 0 {
+                    eprintln!(
+                        "\n{refused} zombie(s) refused to die; operator must investigate \
+                         (kernel-stuck / uninterruptible sleep)."
+                    );
+                    std::process::exit(2);
                 }
             }
         },

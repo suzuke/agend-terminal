@@ -1,5 +1,7 @@
 //! Admin utilities — manual maintenance commands.
 
+pub mod cleanup_zombies;
+
 use std::path::Path;
 
 /// Result of checking one local branch for cleanup eligibility.
