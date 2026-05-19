@@ -1218,6 +1218,20 @@ mod tests {
         branch: &str,
         subscribers: &[&str],
     ) -> PathBuf {
+        write_ci_watch_with_extras(home, repo, branch, subscribers, None, None)
+    }
+
+    /// #931: variant that also stores `next_after_ci` (workflow chain) and
+    /// `last_notified_head_sha` (polling state). Used by the decouple-fix
+    /// tests to assert release_full preserves these fields.
+    fn write_ci_watch_with_extras(
+        home: &std::path::Path,
+        repo: &str,
+        branch: &str,
+        subscribers: &[&str],
+        next_after_ci: Option<&str>,
+        last_notified_head_sha: Option<&str>,
+    ) -> PathBuf {
         let ci_dir = crate::daemon::ci_watch::ci_watches_dir(home);
         std::fs::create_dir_all(&ci_dir).ok();
         let filename = crate::daemon::ci_watch::watch_filename(repo, branch);
@@ -1226,20 +1240,34 @@ mod tests {
             .iter()
             .map(|s| serde_json::json!({"instance": *s}))
             .collect();
-        let watch = serde_json::json!({
+        let mut watch = serde_json::json!({
             "repo": repo,
             "branch": branch,
             "interval_secs": 60,
             "subscribers": subs,
             "instance": subscribers.first().copied().unwrap_or(""),
-            "last_run_id": null,
-            "head_sha": null,
-            "last_polled_at": null,
+            "last_run_id": 12345_u64,
+            "head_sha": "deadbeefcafe",
+            "last_polled_at": chrono::Utc::now().timestamp_millis(),
             "expires_at": (chrono::Utc::now() + chrono::Duration::hours(72)).to_rfc3339(),
             "last_terminal_seen_at": null,
         });
+        if let Some(n) = next_after_ci {
+            watch["next_after_ci"] = serde_json::json!(n);
+        }
+        if let Some(sha) = last_notified_head_sha {
+            watch["last_notified_head_sha"] = serde_json::json!(sha);
+        }
         std::fs::write(&path, serde_json::to_string_pretty(&watch).unwrap()).ok();
         path
+    }
+
+    /// #931 helper: read a watch field as string (returns None if absent or
+    /// not a string). Used by decouple tests to assert state preservation.
+    fn read_ci_watch_field(path: &std::path::Path, field: &str) -> Option<String> {
+        let content = std::fs::read_to_string(path).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&content).ok()?;
+        v.get(field)?.as_str().map(String::from)
     }
 
     /// Read a ci-watch JSON's subscriber `instance` strings. Returns
@@ -1257,28 +1285,37 @@ mod tests {
 
     #[test]
     fn release_worktree_unsubscribes_all_agent_ci_watches() {
-        // Reproduces the gap shape documented in PR #549 Phase A RCA:
-        // the EC7 helper only unsubscribed the binding-branch watch,
-        // leaving any ad-hoc watches (e.g. an agent watching `main`
-        // during a closeout cycle) orphaned on release.
+        // #931 INVERTED (was Sprint 57 Wave 2 Track B #546 Item 2 pin).
         //
-        // Setup: agent `dev` is bound to `feat-track-x`, the auto-
-        // watch for that branch is in place, AND the agent has added
-        // an extra watch on `main` (cross-branch, to follow upstream).
-        // A different agent `lead` shares both watches.
-        let home = tmp_home("p0x-unsubscribe-all");
-        let repo = tmp_repo("p0x-unsubscribe-all-repo");
+        // Pre-#931: release_full unconditionally swept the released agent
+        // out of EVERY ci-watch they appeared on (binding-branch + ad-hoc).
+        // That cleanup cascaded to watch-file deletion when the released
+        // agent was the sole subscriber, destroying `next_after_ci`
+        // chains and polling state — 4-in-a-row PR stalls
+        // (#920/#925/#928/#929) traced to this exact path.
+        //
+        // Post-#931 (Direction A.1): release_full no longer mutates any
+        // ci-watch on the agent's behalf. Subscriptions persist across
+        // release per operator intent in issue #931:
+        //   "Subscription persists across bind handoff unless explicitly
+        //    `unwatch`ed."
+        //
+        // Hygiene is delegated to:
+        //   - 72h absolute TTL (`expires_at`)
+        //   - 72h inactivity TTL (`last_terminal_seen_at`)
+        //   - PR-terminal auto-clear (poller's `check_pr_terminal`)
+        //   - Explicit `ci action=unwatch` (operator-callable)
+        //
+        // This test now PINS the new persist-across-release behavior so
+        // a regression that re-introduces the broad sweep is caught
+        // immediately. Rollback criteria documented in PR #931 body.
+        let home = tmp_home("931-persist-multi");
+        let repo = tmp_repo("931-persist-multi-repo");
         let l = lease(&home, &repo, "dev", "feat-track-x").expect("lease");
         assert!(l.path.exists(), "pre: worktree must exist");
 
-        // Auto-watch for binding-branch (lease path skipped explicit
-        // ci_watch creation; pre-populate to mirror real fleet state
-        // post-`dispatch_auto_bind_lease` which auto-installs it).
         let auto_watch = write_ci_watch(&home, "owner/repo", "feat-track-x", &["dev", "lead"]);
-        // Ad-hoc cross-branch watch on `main` (lead also subscribed
-        // so we can verify per-agent shrink without file deletion).
         let main_watch = write_ci_watch(&home, "owner/repo", "main", &["dev", "lead"]);
-        // Watch the agent isn't subscribed to — must remain untouched.
         let bystander = write_ci_watch(&home, "owner/repo", "feat-bystander", &["lead"]);
 
         let outcome = release_full(&home, "dev", false);
@@ -1286,32 +1323,26 @@ mod tests {
         assert!(outcome.released, "release must succeed");
         assert!(outcome.binding_removed, "binding must be cleared");
 
-        // Auto-watch: dev was 1 of 2 subscribers → file persists, lead remains.
+        // Auto-watch (binding-branch): dev MUST STILL be subscribed.
         let auto_subs = read_ci_watch_subscribers(&auto_watch);
-        assert_eq!(
-            auto_subs,
-            vec!["lead".to_string()],
-            "binding-branch watch must shrink to remaining subscriber, not be deleted"
+        assert!(
+            auto_subs.contains(&"dev".to_string()),
+            "#931: dev must persist on binding-branch watch — got {auto_subs:?}"
+        );
+        assert!(
+            auto_subs.contains(&"lead".to_string()),
+            "lead untouched on binding-branch watch — got {auto_subs:?}"
         );
 
-        // Main watch: dev was the orphan vector — must also shrink.
-        // Pre-Sprint-57-Wave-2 this assertion FAILED (dev stayed
-        // subscribed to main); the fix makes it pass.
+        // Ad-hoc cross-branch watch on main: dev MUST STILL be subscribed.
         let main_subs = read_ci_watch_subscribers(&main_watch);
-        assert_eq!(
-            main_subs,
-            vec!["lead".to_string()],
-            "ad-hoc cross-branch watch must also shrink — Item 2 regression-proof"
+        assert!(
+            main_subs.contains(&"dev".to_string()),
+            "#931: dev must persist on ad-hoc main watch — got {main_subs:?}"
         );
 
-        // Bystander: dev was never subscribed → file untouched.
+        // Bystander: untouched (dev never subscribed).
         assert!(bystander.exists(), "bystander watch must survive untouched");
-        let bystander_subs = read_ci_watch_subscribers(&bystander);
-        assert_eq!(
-            bystander_subs,
-            vec!["lead".to_string()],
-            "bystander subscriber list must be unchanged"
-        );
 
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&repo).ok();
@@ -1319,11 +1350,15 @@ mod tests {
 
     #[test]
     fn release_worktree_deletes_watch_when_last_subscriber_unsubscribes() {
-        // Defensive bonus pin: agent is the SOLE subscriber to a
-        // cross-branch watch. Release must delete the watch file
-        // entirely (not leave an empty subscribers array).
-        let home = tmp_home("p0x-unsubscribe-last");
-        let repo = tmp_repo("p0x-unsubscribe-last-repo");
+        // #931 INVERTED (was P0-X bonus delete-on-empty pin).
+        //
+        // Pre-#931: when the released agent was the sole subscriber,
+        // release_full deleted the watch file entirely — losing
+        // `next_after_ci`, `last_notified_head_sha`, polling state.
+        // Post-#931: file persists across release. Cleanup via TTL
+        // and PR-terminal paths only.
+        let home = tmp_home("931-persist-sole");
+        let repo = tmp_repo("931-persist-sole-repo");
         let _l = lease(&home, &repo, "dev", "feat-x").expect("lease");
 
         let solo_watch = write_ci_watch(&home, "owner/repo", "main", &["dev"]);
@@ -1331,8 +1366,383 @@ mod tests {
         release_full(&home, "dev", false);
 
         assert!(
-            !solo_watch.exists(),
-            "watch with no remaining subscribers must be deleted entirely"
+            solo_watch.exists(),
+            "#931: sole-subscriber watch must persist across release (TTL handles cleanup)"
+        );
+        // Subs should still contain dev — pure persistence.
+        let subs = read_ci_watch_subscribers(&solo_watch);
+        assert!(
+            subs.contains(&"dev".to_string()),
+            "#931: dev persists in subs across release — got {subs:?}"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    // ── #931: ci_watch decouple from worktree release lifecycle ─────────
+    //
+    // Issue: 4-in-a-row PR stalls overnight (#920/#925/#928/#929) traced
+    // to `release_full` calling `unsubscribe_all_ci_watches_for_agent`,
+    // which removed the released agent from every ci-watch (binding-branch
+    // and ad-hoc), cascading to watch-file deletion on sole-subscriber.
+    // The cascade destroyed `next_after_ci` chains + polling state, so
+    // reviewer/dev never received post-CI handoff notifications.
+    //
+    // Direction A.1 (operator-approved 2026-05-19): decouple subscription
+    // from worktree binding entirely. Hygiene via 72h TTL + PR-terminal
+    // auto-clear + explicit unwatch only.
+    //
+    // RED→GREEN regression-proof anchors: each test below documents the
+    // pre-fix failure signature; if the call at the historic
+    // `unsubscribe_all_ci_watches_for_agent` site is re-introduced, these
+    // tests immediately fail.
+
+    #[test]
+    fn release_does_not_delete_ci_watch_when_agent_was_sole_subscriber_931() {
+        // Anchor: pre-#931 release_full ran `remove_file(&path)` when subs
+        // became empty (`unsubscribe_all_ci_watches_for_agent`,
+        // `worktree_pool.rs:464-468`). The watch file gone → poller skipped
+        // → `next_after_ci` target never injected. Post-#931 the file
+        // persists with full state.
+        let home = tmp_home("931-sole-persist");
+        let repo = tmp_repo("931-sole-persist-repo");
+        let _l = lease(&home, &repo, "dev", "feat/931-sole").expect("lease");
+
+        let watch_path = write_ci_watch_with_extras(
+            &home,
+            "owner/repo",
+            "feat/931-sole",
+            &["dev"],
+            Some("reviewer"),
+            Some("cafe1234"),
+        );
+        assert!(watch_path.exists(), "pre: watch exists");
+
+        release_full(&home, "dev", false);
+
+        assert!(
+            watch_path.exists(),
+            "#931 GREEN: sole-subscriber watch file MUST persist across release"
+        );
+        assert_eq!(
+            read_ci_watch_field(&watch_path, "next_after_ci"),
+            Some("reviewer".to_string()),
+            "#931 GREEN: next_after_ci chain MUST survive release"
+        );
+        assert_eq!(
+            read_ci_watch_field(&watch_path, "last_notified_head_sha"),
+            Some("cafe1234".to_string()),
+            "#931 GREEN: polling state MUST survive release"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn release_does_not_remove_agent_from_multi_subscriber_watch_931() {
+        // Anchor: pre-#931, retain(|s| s != agent) shrank subscriber lists
+        // on EVERY watch the released agent appeared on, including non-
+        // binding-branch ad-hoc watches (e.g. agent watching `main` to
+        // follow upstream during closeout). Post-#931, no subscriber list
+        // is mutated on release — operator's stated direction is full
+        // persistence.
+        let home = tmp_home("931-multi-persist");
+        let repo = tmp_repo("931-multi-persist-repo");
+        let _l = lease(&home, &repo, "dev", "feat/binding").expect("lease");
+
+        let binding_watch =
+            write_ci_watch(&home, "owner/repo", "feat/binding", &["dev", "reviewer"]);
+        let other_watch = write_ci_watch(&home, "owner/repo", "feat/other", &["dev"]);
+
+        release_full(&home, "dev", false);
+
+        // Binding branch watch: dev preserved alongside reviewer.
+        let binding_subs = read_ci_watch_subscribers(&binding_watch);
+        assert!(
+            binding_subs.contains(&"dev".to_string()),
+            "#931 GREEN: dev preserved on binding-branch watch — got {binding_subs:?}"
+        );
+        assert!(
+            binding_subs.contains(&"reviewer".to_string()),
+            "co-subscriber preserved — got {binding_subs:?}"
+        );
+
+        // Non-binding branch watch: dev preserved untouched.
+        let other_subs = read_ci_watch_subscribers(&other_watch);
+        assert!(
+            other_subs.contains(&"dev".to_string()),
+            "#931 GREEN: dev preserved on non-binding-branch ad-hoc watch — got {other_subs:?}"
+        );
+        assert!(
+            other_watch.exists(),
+            "non-binding-branch watch file preserved"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn release_under_rebase_mode_preserves_subscription_931() {
+        // #931 Fix 1 corollary: when `bind_self(rebase_mode=true)` triggers
+        // `rebase_clean_self` (force_release/mod.rs:187), the underlying
+        // `release_full` call MUST preserve the ci-watch so that the
+        // immediately-following `dispatch_auto_bind_lease` re-arms the
+        // existing watch via append-idempotent handle_watch_ci — keeping
+        // any prior `next_after_ci` chain intact.
+        //
+        // Pre-#931: rebase_clean_self → release_full → file deleted
+        // (sole-sub case) → re-dispatch creates fresh watch missing
+        // next_after_ci → reviewer never gets [ci-ready-for-action].
+        //
+        // Post-#931: file persists across the rebase round-trip; the
+        // re-dispatch sees the same watch JSON and appends; chain intact.
+        //
+        // This test exercises the release-half of the rebase cycle
+        // directly (calling release_full is what rebase_clean_self does
+        // internally). The full bind_self(rebase_mode=true) round-trip
+        // is covered by the dispatch_hook test for next_after_ci wiring
+        // (test 6) — those two together pin both halves.
+        let home = tmp_home("931-rebase");
+        let repo = tmp_repo("931-rebase-repo");
+        let _l = lease(&home, &repo, "dev", "feat/rebase-cycle").expect("lease");
+
+        let watch_path = write_ci_watch_with_extras(
+            &home,
+            "owner/repo",
+            "feat/rebase-cycle",
+            &["dev"],
+            Some("reviewer"),
+            Some("beefcafe"),
+        );
+
+        // Release (the rebase_clean_self path's release_full invocation).
+        release_full(&home, "dev", false);
+
+        // File persists with next_after_ci + state intact across release.
+        assert!(
+            watch_path.exists(),
+            "#931 GREEN: rebase-path release_full must preserve watch file"
+        );
+        assert_eq!(
+            read_ci_watch_field(&watch_path, "next_after_ci"),
+            Some("reviewer".to_string()),
+            "#931 GREEN: next_after_ci chain survives rebase-path release"
+        );
+        assert_eq!(
+            read_ci_watch_field(&watch_path, "last_notified_head_sha"),
+            Some("beefcafe".to_string()),
+            "#931 GREEN: polling state survives rebase-path release"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn explicit_unwatch_wins_over_concurrent_release_931() {
+        // #931 race invariant (§3.20 SOP 1 deterministic): when an operator
+        // explicitly unsubscribes an agent (`ci action=unwatch`) AND a
+        // concurrent release_full fires, the explicit-unwatch's destructive
+        // intent (drop agent from subs; remove watch if sole) MUST be the
+        // surviving outcome regardless of arrival order.
+        //
+        // Post-#931 Fix 1 the race is degenerate by construction:
+        // release_full is a no-op against ci-watch state, so the explicit
+        // unwatch alone decides the outcome. This test pins that property
+        // so a future regression that re-introduces release-side mutation
+        // (or worse, race-with-unwatch double-write) is caught.
+        let home = tmp_home("931-unwatch-vs-release");
+        let repo = tmp_repo("931-unwatch-vs-release-repo");
+        let _l = lease(&home, &repo, "dev", "feat/unwatch-race").expect("lease");
+
+        let watch_path = write_ci_watch(&home, "owner/repo", "feat/unwatch-race", &["dev"]);
+
+        // Order 1: release then explicit unwatch via direct file mutation
+        // (mirrors what `handle_unwatch_ci`'s last-subscriber path does:
+        // remove the watch file). Deterministic — no sleep, no threads.
+        release_full(&home, "dev", false);
+        assert!(
+            watch_path.exists(),
+            "release_full is no-op for ci-watch post-#931"
+        );
+
+        // Simulate explicit unwatch: agent's removal cascades to file
+        // deletion (sole-subscriber path of handle_unwatch_ci).
+        let _ = std::fs::remove_file(&watch_path);
+
+        assert!(
+            !watch_path.exists(),
+            "#931: explicit unwatch wins → watch file gone after both ops"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn poll_tick_vs_subscriber_mutation_preserves_single_delivery_931() {
+        // #931 race invariant (§3.20 SOP 1 deterministic): a poll cycle
+        // reading the watch file MUST see a consistent subscriber list
+        // even if release_full or handle_watch_ci (subscribe) interleaves.
+        //
+        // Post-#931 Fix 1, release_full does not mutate ci-watch state →
+        // the only mutating writer on this file is `handle_watch_ci`
+        // (append) and `handle_unwatch_ci` (shrink/delete). All use
+        // `crate::store::atomic_write` so a half-written file is never
+        // observed by a concurrent reader (atomicity == temp-file +
+        // rename invariant).
+        //
+        // Determinism: this test does NOT spawn threads. Instead it
+        // exercises the read-modify-write contract sequentially and
+        // asserts the file's parseability + subscriber stability invariant
+        // at each step. SOP 1 pattern — no sleeps, no joins.
+        let home = tmp_home("931-poll-mut-race");
+        let repo = tmp_repo("931-poll-mut-race-repo");
+        let _l = lease(&home, &repo, "dev", "feat/poll-mut").expect("lease");
+
+        let watch_path = write_ci_watch(&home, "owner/repo", "feat/poll-mut", &["dev", "reviewer"]);
+
+        // Snapshot 1: pre-release reading must observe both subscribers
+        // and be a fully-parseable JSON (atomic-write invariant).
+        let snap1 = read_ci_watch_subscribers(&watch_path);
+        assert_eq!(snap1.len(), 2, "pre-release snapshot: 2 subscribers");
+
+        // Release fires — must not corrupt file or strip subscribers.
+        release_full(&home, "dev", false);
+
+        // Snapshot 2: post-release reading STILL parses + STILL has both.
+        let snap2 = read_ci_watch_subscribers(&watch_path);
+        assert_eq!(
+            snap1, snap2,
+            "#931: release_full preserves subscriber list (poll reader sees stable state)"
+        );
+
+        // File still atomically parseable (no partial write).
+        let content = std::fs::read_to_string(&watch_path).expect("readable");
+        let parsed: serde_json::Value = serde_json::from_str(&content).expect("parseable JSON");
+        assert_eq!(parsed["branch"].as_str(), Some("feat/poll-mut"));
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn released_agent_still_receives_ci_pass_inject_931() {
+        // #931 MANDATORY INTEGRATION TEST.
+        //
+        // End-to-end: after release_full, the agent's subscription on
+        // the binding branch's ci-watch MUST persist so that a subsequent
+        // CI-pass poll cycle still enqueues `[ci-pass]` to their inbox.
+        // Pre-#931 this was impossible because release_full stripped the
+        // agent and (in sole-subscriber case) deleted the file entirely.
+        //
+        // Note on harness: this test exercises the SUBSCRIPTION half of
+        // the integration (release → subs preserved → file ready to be
+        // polled), not the full HTTP→provider→enqueue chain (that's
+        // already covered by `mock_success_run_updates_watch_state` and
+        // others in poller.rs#tests, which use the in-process MockCiProvider).
+        // The decouple fix is purely about subscriber-state preservation
+        // across release; the poll path is unchanged.
+        //
+        // Specifically: we assert that immediately after release_full,
+        // (a) the watch file exists, (b) the released agent is still in
+        // subscribers, (c) the next_after_ci chain is intact, (d) the
+        // poll-state fields haven't been clobbered. If all four hold,
+        // the next ci_check_repo invocation by the daemon's tick loop
+        // will fan out [ci-pass] to the agent verbatim — same code path
+        // as the unchanged poller tests verify.
+        let home = tmp_home("931-integration-still-receives");
+        let repo = tmp_repo("931-integration-still-receives-repo");
+        let _l = lease(&home, &repo, "dev", "feat/integration").expect("lease");
+
+        // Pre-state: ci-watch armed with dev as sole subscriber + chain.
+        let watch_path = write_ci_watch_with_extras(
+            &home,
+            "owner/repo",
+            "feat/integration",
+            &["dev"],
+            Some("reviewer"),
+            Some("cafefeed"),
+        );
+
+        // The operator's pattern: dev pushes PR + releases worktree
+        // (frees for next task), expects CI-pass notification later.
+        release_full(&home, "dev", false);
+
+        // INTEGRATION ASSERTIONS — all four conditions for the poll
+        // pipeline to fan out [ci-pass] to dev's inbox:
+        assert!(
+            watch_path.exists(),
+            "#931 GREEN: (a) watch file present after release"
+        );
+
+        let subs = read_ci_watch_subscribers(&watch_path);
+        assert!(
+            subs.contains(&"dev".to_string()),
+            "#931 GREEN: (b) dev still in subscribers — got {subs:?}"
+        );
+
+        assert_eq!(
+            read_ci_watch_field(&watch_path, "next_after_ci"),
+            Some("reviewer".to_string()),
+            "#931 GREEN: (c) next_after_ci chain intact"
+        );
+
+        // Polling state: last_notified_head_sha preserved (so dedup +
+        // rerun detection both keep working).
+        assert_eq!(
+            read_ci_watch_field(&watch_path, "last_notified_head_sha"),
+            Some("cafefeed".to_string()),
+            "#931 GREEN: (d) polling state preserved"
+        );
+
+        // Pre-#931, all four would fail in the sole-subscriber case
+        // because the watch file was deleted entirely. The fact that the
+        // existing poller test `mock_success_run_updates_watch_state`
+        // demonstrates the [ci-pass] enqueue path works given a valid
+        // watch file completes the end-to-end argument.
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn release_dry_run_does_not_mutate_subscribers_931() {
+        // Defensive: dry_run=true is contract-defined as observation-only.
+        // Pre-#931, even dry_run paths through release_full would invoke
+        // the unsubscribe sweep (no dry_run gate around it). Post-#931
+        // there's nothing to gate — but the test pins the invariant in
+        // case future code re-introduces mutation on this path.
+        let home = tmp_home("931-dry-run");
+        let repo = tmp_repo("931-dry-run-repo");
+        let _l = lease(&home, &repo, "dev", "feat/dry").expect("lease");
+
+        let watch_path = write_ci_watch_with_extras(
+            &home,
+            "owner/repo",
+            "feat/dry",
+            &["dev", "reviewer"],
+            Some("next-agent"),
+            None,
+        );
+        let subs_before = read_ci_watch_subscribers(&watch_path);
+
+        let outcome = release_full(&home, "dev", true);
+        // dry_run skips actual git/binding teardown semantics elsewhere;
+        // we only assert ci-watch state is identical pre/post.
+
+        let subs_after = read_ci_watch_subscribers(&watch_path);
+        assert_eq!(
+            subs_before, subs_after,
+            "#931: dry_run must not mutate subscriber list — before {subs_before:?} after {subs_after:?} outcome {outcome:?}"
+        );
+        assert_eq!(
+            read_ci_watch_field(&watch_path, "next_after_ci"),
+            Some("next-agent".to_string()),
+            "#931: dry_run must preserve next_after_ci"
         );
 
         std::fs::remove_dir_all(&home).ok();

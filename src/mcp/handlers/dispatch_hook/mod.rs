@@ -206,6 +206,36 @@ pub(crate) fn dispatch_auto_bind_lease(
     dispatch_auto_bind_lease_with_source(home, target, task_id, branch, repo, None)
 }
 
+/// #931 Fix 2 (H5a): variant that propagates `next_after_ci` so the
+/// dispatch chain knowledge (e.g. lead → dev with `next_after_ci=reviewer`)
+/// lands on the auto-armed ci-watch and survives across bind cycles.
+///
+/// Pre-#931 the auto-watch path armed by `dispatch_auto_bind_lease` never
+/// set `next_after_ci`, so `[ci-ready-for-action]` only fired when a
+/// caller had explicitly called `ci action=watch ... next_after_ci=…`
+/// AFTER the auto-arm. The 4-in-a-row overnight stalls
+/// (#920/#925/#928/#929) were caused by this gap interacting with the
+/// release-time subscriber sweep — once the auto-armed watch was the
+/// sole subscription and got swept, the chain handoff vanished.
+///
+/// Callers: `comms.rs::handle_delegate_task` (kind=task dispatches that
+/// declare a workflow chain via `args["next_after_ci"]`).
+#[allow(dead_code)] // RED-phase stub: GREEN commit wires next_after_ci through.
+pub(crate) fn dispatch_auto_bind_lease_with_chain(
+    home: &Path,
+    target: &str,
+    task_id: &str,
+    branch: &str,
+    repo: Option<&str>,
+    next_after_ci: Option<&str>,
+) -> Result<DispatchOutcome, DispatchError> {
+    // RED STUB — ignores next_after_ci. The corresponding GREEN commit
+    // will thread the arg through `dispatch_auto_bind_lease_with_source`
+    // and onward to `handle_watch_ci`.
+    let _ = next_after_ci;
+    dispatch_auto_bind_lease_with_source(home, target, task_id, branch, repo, None)
+}
+
 /// Sprint 55 P0-B: extended entry point that accepts an explicit
 /// `source_repo_override`. Used by `handle_bind_self(source_repo=...)`;
 /// existing callers go through [`dispatch_auto_bind_lease`] which passes
