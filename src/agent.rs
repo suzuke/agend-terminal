@@ -900,6 +900,13 @@ fn pty_read_loop(
                 // won't defeat us (VTerm resolves the geometry). Cooldown: 10s.
                 let screen = {
                     let mut c = core.lock();
+                    // #919: push the raw PTY bytes (still containing
+                    // ANSI escapes) into the state tracker's anchor
+                    // ring BEFORE `vterm.process` consumes / strips
+                    // them. Used by the red-SGR anchor gate to
+                    // discriminate real backend errors from prose
+                    // copied via inject_to_agent (which strips ANSI).
+                    c.state.feed_raw(data);
                     c.vterm.process(data);
                     let rows = c.vterm.rows() as usize;
                     let screen = c.vterm.tail_lines(rows);

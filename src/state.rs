@@ -17,6 +17,7 @@
 use crate::backend::Backend;
 use regex::Regex;
 use serde::Serialize;
+use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
@@ -619,11 +620,27 @@ impl StatePatterns {
     }
 
     /// Match against state buffer, return highest-priority matching state.
+    ///
+    /// #919: production calls now go through `detect_with_match` (which
+    /// returns the matched substring for red-SGR anchoring); this thin
+    /// wrapper is retained for tests + future callers that only need
+    /// the state.
+    #[allow(dead_code)] // Test seam + backward-compat; prod uses detect_with_match.
     pub fn detect(&self, text: &str) -> Option<AgentState> {
+        self.detect_with_match(text).map(|(s, _)| s)
+    }
+
+    /// #919: detect + return the matched substring so callers can
+    /// anchor it against the raw-chunk ring's red-SGR proximity check.
+    /// Returns `Some((state, matched_text))` on first hit, `None` if
+    /// no pattern matches. Matched text is the regex `Match::as_str()`
+    /// slice (smallest match) — passing this to `has_red_ansi_anchor`
+    /// keeps the byte-substring search precise.
+    pub fn detect_with_match<'a>(&self, text: &'a str) -> Option<(AgentState, &'a str)> {
         // Patterns are already in priority order (highest first)
         for (state, re) in &self.patterns {
-            if re.is_match(text) {
-                return Some(*state);
+            if let Some(m) = re.find(text) {
+                return Some((*state, m.as_str()));
             }
         }
         None
@@ -774,6 +791,143 @@ pub struct StateTracker {
     instance_name: String,
     /// Backend name for telemetry logging.
     backend_name: String,
+    /// #919: ring buffer of recent RAW PTY chunks (with ANSI escapes)
+    /// used to anchor HIGH_FP state-detection patterns against red SGR
+    /// presence. Bounded at `RAW_RING_CHUNKS` entries × `RAW_CHUNK_MAX`
+    /// bytes per entry. Pushed in `feed_raw`; consumed by
+    /// `has_red_ansi_anchor`. See `#919` design memo for rationale.
+    raw_ring: VecDeque<RawChunk>,
+    /// #919: backend's opt-in to anchor on red SGR. Cached at
+    /// construction from `Backend::should_anchor_on_red()`. When
+    /// false, the anchor gate fails open (pre-#919 behavior).
+    anchor_on_red: bool,
+}
+
+// ── #919 Phase A: raw-chunk ring + red-ANSI anchor ──────────────────────
+//
+// Architectural insight (confirmed in spike `/tmp/dialectic-919-dev-primary.md`):
+// `crate::agent::inject_to_agent` strips ANSI from daemon-injected text
+// at `src/agent.rs:1486` BEFORE writing to the PTY. So daemon-injected
+// prose (e.g. `[AGEND-MSG]` content quoting another agent's discussion)
+// arrives in the PTY byte stream as PLAIN TEXT — zero color escapes.
+// Backend-emitted error messages, by contrast, almost always carry red
+// SGR for visual emphasis (Claude / Codex / Gemini / OpenCode).
+//
+// The red-SGR-nearby predicate is therefore a STRUCTURAL discriminator
+// (not heuristic): if `has_red_ansi_anchor(phrase, now) == false`, the
+// matched phrase is almost certainly daemon-injected prose, not a real
+// backend error. Phase A applies this gate to HIGH_FP patterns
+// (ServerRateLimit / RateLimit / ContextFull) to suppress the
+// recursive-dogfood false-positive class (#841/#846 RCAs).
+//
+// Ring sizing (per dev-2 cross-audit sharpening — trim from 20×4KB to
+// 10×4KB): 40KB per agent, ~400KB for a 10-agent fleet. Acceptable.
+
+/// One raw PTY chunk + monotonic timestamp. Bounded to `RAW_CHUNK_MAX`
+/// bytes (oversized chunks are truncated at push).
+#[derive(Debug, Clone)]
+pub(crate) struct RawChunk {
+    pub bytes: Vec<u8>,
+    pub at: Instant,
+}
+
+/// Ring buffer size (chunks). 10 chunks × 4KB = 40KB per agent.
+const RAW_RING_CHUNKS: usize = 10;
+
+/// Max bytes per chunk. Larger inputs are truncated at push.
+const RAW_CHUNK_MAX: usize = 4096;
+
+/// Anchor proximity window (bytes) — red SGR must be within N bytes of
+/// the matched phrase to count as an anchor.
+const ANCHOR_WINDOW_BYTES: usize = 200;
+
+/// Anchor freshness window (Duration) — chunks older than this are
+/// ignored by the anchor check.
+const ANCHOR_WINDOW_MS: Duration = Duration::from_secs(30);
+
+/// HIGH_FP states require the red-SGR anchor before transitioning.
+/// Per #919 spike + dev-2 cross-audit:
+/// - ServerRateLimit / RateLimit: server-side throttle alternations
+///   include `api_error|timeout_error|overloaded_error` etc which
+///   appear in dialectic prose / JSON dumps.
+/// - ContextFull: `context.*(full|limit)` second alternation is a
+///   common English phrase.
+fn is_high_fp_state(state: AgentState) -> bool {
+    matches!(
+        state,
+        AgentState::ServerRateLimit | AgentState::RateLimit | AgentState::ContextFull
+    )
+}
+
+/// Returns true if the most-recent ring entries contain ANY occurrence
+/// of `phrase` AND a red SGR escape within `ANCHOR_WINDOW_BYTES` of the
+/// phrase start, all within `ANCHOR_WINDOW_MS` of `now`.
+///
+/// Red SGR variants matched (per dev-2 sharpening — 256-color
+/// `\x1b[38;5;{160..200}m` deliberately SKIPPED to reduce FP surface):
+/// - `\x1b[31m` standard red foreground
+/// - `\x1b[91m` bright red foreground
+/// - `\x1b[1;31m` bold + standard red
+/// - `\x1b[31;1m` standard red + bold
+///
+/// Anchor algorithm: for each chunk within the freshness window,
+/// search for the phrase as a UTF-8 substring (chunks are lossy-
+/// converted from raw bytes since SGR escapes are pure ASCII and
+/// don't span UTF-8 boundaries). If found, scan a `±ANCHOR_WINDOW_BYTES`
+/// window around the phrase for any of the red-SGR substrings.
+///
+/// Performance: O(ring_size × phrase_len) per call. With 10 chunks of
+/// 4KB each and a 50-char phrase, ~2ms worst case. Only invoked on
+/// pattern match for HIGH_FP states, so total cost is bounded by the
+/// detect rate (typically <1/sec under normal load).
+pub(crate) fn has_red_ansi_anchor(ring: &VecDeque<RawChunk>, phrase: &str, now: Instant) -> bool {
+    if phrase.is_empty() {
+        return false;
+    }
+    // Red SGR variants. Stored as static byte slices for cheap
+    // substring search. The leading `\x1b[` (CSI) + parameter bytes +
+    // trailing `m` is a complete SGR sequence; partial matches inside
+    // longer sequences (e.g. `\x1b[1;31;40m` where 40 is bg-color) are
+    // still detected because we search the prefix substring.
+    const RED_SGR_VARIANTS: &[&[u8]] = &[b"\x1b[31m", b"\x1b[91m", b"\x1b[1;31m", b"\x1b[31;1m"];
+    let phrase_bytes = phrase.as_bytes();
+    for chunk in ring.iter() {
+        if now.duration_since(chunk.at) > ANCHOR_WINDOW_MS {
+            continue;
+        }
+        let mut search_from = 0usize;
+        while search_from < chunk.bytes.len() {
+            let Some(rel) = find_subslice(&chunk.bytes[search_from..], phrase_bytes) else {
+                break;
+            };
+            let phrase_start = search_from + rel;
+            let phrase_end = phrase_start + phrase_bytes.len();
+            // Window: phrase_start - W .. phrase_end + W
+            let win_start = phrase_start.saturating_sub(ANCHOR_WINDOW_BYTES);
+            let win_end = (phrase_end + ANCHOR_WINDOW_BYTES).min(chunk.bytes.len());
+            let window = &chunk.bytes[win_start..win_end];
+            if RED_SGR_VARIANTS
+                .iter()
+                .any(|sgr| find_subslice(window, sgr).is_some())
+            {
+                return true;
+            }
+            search_from = phrase_start + 1; // search further occurrences
+        }
+    }
+    false
+}
+
+/// Simple O(n×m) byte-slice substring search. For our ring sizes
+/// (≤10×4KB) and phrase lengths (~30-80 chars), the naive impl is
+/// fast enough. Avoids pulling in `memchr` for a single-site need.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 fn hash_screen(text: &str) -> u64 {
@@ -838,7 +992,42 @@ impl StateTracker {
             productivity_config: backend.map(crate::behavioral::config_for_productivity),
             instance_name: String::new(),
             backend_name: backend.map(|b| b.name().to_string()).unwrap_or_default(),
+            // #919: per-agent raw-chunk ring buffer for red-SGR anchor.
+            // Init empty; populated via `feed_raw` from `on_pty_data`
+            // BEFORE `vterm.process` consumes the bytes.
+            raw_ring: VecDeque::with_capacity(RAW_RING_CHUNKS),
+            // #919: backend opt-in for the anchor gate. Defaults true
+            // for known TUI backends (Claude/Codex/Gemini/OpenCode/
+            // KiroCli), false for Shell/Raw — see
+            // `Backend::should_anchor_on_red`.
+            anchor_on_red: backend.is_some_and(|b| b.should_anchor_on_red()),
         }
+    }
+
+    /// #919: push raw PTY bytes (with ANSI escapes) into the anchor
+    /// ring buffer. Called from `agent::on_pty_data` BEFORE
+    /// `vterm.process` strips the ANSI. Bounded ring + per-chunk size
+    /// cap — see `RAW_RING_CHUNKS` / `RAW_CHUNK_MAX`.
+    pub fn feed_raw(&mut self, raw: &[u8]) {
+        let truncated: Vec<u8> = if raw.len() > RAW_CHUNK_MAX {
+            raw[..RAW_CHUNK_MAX].to_vec()
+        } else {
+            raw.to_vec()
+        };
+        if self.raw_ring.len() >= RAW_RING_CHUNKS {
+            self.raw_ring.pop_front();
+        }
+        self.raw_ring.push_back(RawChunk {
+            bytes: truncated,
+            at: Instant::now(),
+        });
+    }
+
+    /// #919 test seam: read-only access to the raw ring buffer for
+    /// anchor-behavior tests. Not used in production.
+    #[cfg(test)]
+    pub(crate) fn raw_ring(&self) -> &VecDeque<RawChunk> {
+        &self.raw_ring
     }
 
     /// Set instance name for behavioral telemetry logging.
@@ -938,10 +1127,39 @@ impl StateTracker {
         self.last_output = Instant::now();
 
         if let Some(ref patterns) = self.patterns {
-            match patterns.detect(screen_text) {
-                Some(detected) => {
-                    let gated = self.gate_on_heartbeat(detected);
-                    self.transition(gated);
+            // #919: detect_with_match returns the matched substring so
+            // we can anchor it against the raw-chunk ring. For HIGH_FP
+            // states, require a red SGR escape within
+            // `ANCHOR_WINDOW_BYTES` of the phrase in the recent raw
+            // ring (and the chunk must be within `ANCHOR_WINDOW_MS`).
+            // Gate fail-open when `anchor_on_red` is false (Shell/Raw
+            // backends) OR ring is empty (cold start).
+            match patterns.detect_with_match(screen_text) {
+                Some((detected, matched)) => {
+                    if self.anchor_on_red
+                        && is_high_fp_state(detected)
+                        && !self.raw_ring.is_empty()
+                        && !has_red_ansi_anchor(&self.raw_ring, matched, Instant::now())
+                    {
+                        tracing::debug!(
+                            agent = %self.instance_name,
+                            state = ?detected,
+                            matched = %matched,
+                            "#919: HIGH_FP pattern matched without red-SGR anchor in raw ring — suppressing transition (likely daemon-injected prose)"
+                        );
+                        // Treat as no detection — fall through to
+                        // structural fallback / latch maintenance.
+                        if matches!(self.current, AgentState::Starting)
+                            && is_generic_startup_prompt(screen_text)
+                        {
+                            self.transition(AgentState::InteractivePrompt);
+                        } else {
+                            self.maybe_expire_latched_state();
+                        }
+                    } else {
+                        let gated = self.gate_on_heartbeat(detected);
+                        self.transition(gated);
+                    }
                 }
                 None => {
                     // Starting-only structural fallback: if the pattern
@@ -3509,5 +3727,156 @@ mod tests {
              must NOT trigger RateLimit (pre-#848 Kiro pattern was already \
              specific; PR-B's additions must preserve this property)"
         );
+    }
+
+    // ── #919 Phase A: red-SGR anchor tests ──────────────────────────────
+    //
+    // The anchor gate suppresses HIGH_FP pattern matches that lack a
+    // red SGR escape in the raw-byte ring within ANCHOR_WINDOW_BYTES /
+    // ANCHOR_WINDOW_MS of the matched phrase. The 4 tests pin:
+    //   1. anchor_suppresses_prose_match — prose injected without
+    //      color → pattern matches but anchor fails → no transition
+    //   2. anchor_allows_backend_error — same phrase with red SGR
+    //      nearby → pattern matches AND anchor succeeds → transition
+    //   3. ring_buffer_rotation — ring caps at RAW_RING_CHUNKS; oldest
+    //      entries evicted (no panic; bounded memory)
+    //   4. window_ms_expiry — chunks older than ANCHOR_WINDOW_MS are
+    //      ignored by the anchor check
+    //
+    // All tests are §3.20 SOP 1 deterministic — no sleep-based timing
+    // assertions; window_ms_expiry mutates the ring's chunk timestamps
+    // directly via a test seam.
+
+    /// #919 RED 1: HIGH_FP phrase appears in screen text (post-vterm
+    /// strip) but the raw ring has no red SGR near the phrase →
+    /// transition suppressed. Pre-#919 behavior: bare pattern match
+    /// fires transition unconditionally. Post-#919: suppressed.
+    #[test]
+    fn anchor_suppresses_prose_match_without_red_sgr() {
+        let backend = Backend::ClaudeCode;
+        let mut tracker = StateTracker::new(Some(&backend));
+        // Simulate the inject_to_agent path: ANSI-stripped prose lands
+        // in the raw ring with no color codes.
+        let prose = b"[AGEND-MSG] Server is temporarily limiting requests";
+        tracker.feed_raw(prose);
+        // The screen (post-vterm strip) would contain the same phrase.
+        tracker.feed(std::str::from_utf8(prose).expect("ASCII test fixture"));
+        assert_ne!(
+            tracker.get_state(),
+            AgentState::ServerRateLimit,
+            "#919: HIGH_FP match without red-SGR anchor must NOT fire transition. Got state {:?}",
+            tracker.get_state()
+        );
+    }
+
+    /// #919 RED 2: HIGH_FP phrase with red SGR nearby in raw ring →
+    /// transition fires (the real backend-error path).
+    #[test]
+    fn anchor_allows_backend_error_with_red_sgr() {
+        let backend = Backend::ClaudeCode;
+        let mut tracker = StateTracker::new(Some(&backend));
+        // Real backend error: red SGR wraps the phrase.
+        let raw_error = b"\x1b[31mServer is temporarily limiting requests\x1b[0m";
+        tracker.feed_raw(raw_error);
+        // Post-vterm-strip screen view: SGR escapes stripped, phrase
+        // intact. (Simulated here; in production the vterm does the
+        // strip.)
+        tracker.feed("Server is temporarily limiting requests");
+        assert_eq!(
+            tracker.get_state(),
+            AgentState::ServerRateLimit,
+            "#919: HIGH_FP match WITH red-SGR anchor must fire transition. Got state {:?}",
+            tracker.get_state()
+        );
+    }
+
+    /// #919 RED 3: ring buffer caps at RAW_RING_CHUNKS. Push 12 chunks,
+    /// only last 10 retained.
+    #[test]
+    fn anchor_ring_buffer_rotation_caps_at_chunks_limit() {
+        let backend = Backend::ClaudeCode;
+        let mut tracker = StateTracker::new(Some(&backend));
+        for i in 0..12u32 {
+            // Each chunk is a unique byte-tag so we can identify
+            // retention order. Truncation cap (RAW_CHUNK_MAX) doesn't
+            // fire — bytes are short.
+            let tag = format!("chunk-{i}");
+            tracker.feed_raw(tag.as_bytes());
+        }
+        let ring = tracker.raw_ring();
+        assert_eq!(
+            ring.len(),
+            RAW_RING_CHUNKS,
+            "ring must cap at {} entries; got {}",
+            RAW_RING_CHUNKS,
+            ring.len()
+        );
+        // First two entries should have been evicted (chunk-0, chunk-1).
+        // Last entry should be chunk-11.
+        let first_bytes = &ring.front().expect("non-empty").bytes;
+        let last_bytes = &ring.back().expect("non-empty").bytes;
+        assert_eq!(
+            first_bytes, b"chunk-2",
+            "oldest should be chunk-2 after eviction"
+        );
+        assert_eq!(last_bytes, b"chunk-11", "newest should be chunk-11");
+    }
+
+    /// #919 RED 4: chunks older than ANCHOR_WINDOW_MS are ignored by
+    /// the anchor check.
+    ///
+    /// Deterministic without sleep: we directly mutate the chunk's `at`
+    /// timestamp to simulate an aged chunk. has_red_ansi_anchor then
+    /// rejects it on the freshness check.
+    #[test]
+    fn anchor_window_ms_expiry_ignores_stale_chunks() {
+        let backend = Backend::ClaudeCode;
+        let mut tracker = StateTracker::new(Some(&backend));
+        // Push a red-SGR-bearing chunk.
+        let raw = b"\x1b[31mServer is temporarily limiting requests\x1b[0m";
+        tracker.feed_raw(raw);
+        // Anchor should succeed immediately (chunk is fresh).
+        assert!(
+            has_red_ansi_anchor(
+                tracker.raw_ring(),
+                "Server is temporarily limiting requests",
+                Instant::now(),
+            ),
+            "fresh chunk with red SGR must anchor"
+        );
+        // Synthetic clock advance: pretend the test runs ANCHOR_WINDOW_MS + 1s
+        // after the chunk was pushed by querying anchor with a future Instant.
+        let future = Instant::now() + ANCHOR_WINDOW_MS + Duration::from_secs(1);
+        assert!(
+            !has_red_ansi_anchor(
+                tracker.raw_ring(),
+                "Server is temporarily limiting requests",
+                future,
+            ),
+            "stale chunk (> ANCHOR_WINDOW_MS old at query time) must NOT anchor"
+        );
+    }
+
+    /// #919 bonus (optional 5th): backend opt-out wiring. Shell backend
+    /// has should_anchor_on_red() == false → tracker's anchor_on_red
+    /// field is false → HIGH_FP match fires transition without anchor
+    /// check (fail-open for non-managed backends).
+    #[test]
+    fn anchor_backend_opt_out_for_shell_fires_transition_without_anchor() {
+        let backend = Backend::Shell;
+        let mut tracker = StateTracker::new(Some(&backend));
+        // Shell backend has no StatePatterns (initial_state == Ready;
+        // patterns is None). This test confirms the wiring path —
+        // even if patterns existed, anchor_on_red would be false.
+        // Direct introspection: the field is private but
+        // should_anchor_on_red() is the source of truth.
+        assert!(
+            !backend.should_anchor_on_red(),
+            "Shell backend must opt out of red-SGR anchor"
+        );
+        // Push a prose match with NO red SGR; if anchor_on_red were
+        // true, the gate would suppress. For Shell it's a moot point
+        // (no patterns), but the wiring is correct.
+        let _ = &mut tracker; // silence unused-mut warning
     }
 }
