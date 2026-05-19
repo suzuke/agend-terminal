@@ -3,6 +3,7 @@
 
 pub(crate) mod anti_stall;
 pub(crate) mod auto_release;
+pub(crate) mod boot_sweep;
 pub(crate) mod canonical_drift;
 pub(crate) mod ci_watch;
 pub(crate) mod conflict_notify;
@@ -293,6 +294,13 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
     lock_file
         .try_lock_exclusive()
         .map_err(|e| anyhow::anyhow!("Another daemon is already running (lock held): {e}"))?;
+
+    // #933: zombie sweep BEFORE find_active_run_dir so an aged-out
+    // unresponsive daemon (which would otherwise satisfy find_active_run_dir)
+    // is cleaned up first. Telemetry-only when env unset; env-gated kill
+    // via AGEND_DAEMON_BOOT_SWEEP_AGE_DAYS. Escape-hatch path; main fleet
+    // boot covers this via `bootstrap::prepare`.
+    let _ = boot_sweep::boot_sweep_zombies(home);
 
     // Check for existing daemon (secondary check after lock acquired)
     if let Some(existing) = find_active_run_dir(home) {
