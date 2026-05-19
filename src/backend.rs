@@ -23,6 +23,28 @@ pub enum Backend {
 }
 
 impl Backend {
+    /// #919: should this backend's PTY output be checked against the
+    /// red-ANSI anchor for HIGH_FP state-detection patterns?
+    ///
+    /// True for backends that consistently emit red SGR escapes
+    /// (`\x1b[31m` / `\x1b[91m`) when rendering errors — ClaudeCode,
+    /// Codex, OpenCode, Gemini. False for Shell + Raw — generic
+    /// shells don't have a uniform color convention and arbitrary
+    /// commands may render errors uncolored.
+    ///
+    /// When false, the HIGH_FP gate falls back to fail-open: pattern
+    /// match → transition fires (pre-#919 behavior).
+    pub fn should_anchor_on_red(&self) -> bool {
+        match self {
+            Backend::ClaudeCode
+            | Backend::KiroCli
+            | Backend::Codex
+            | Backend::OpenCode
+            | Backend::Gemini => true,
+            Backend::Shell | Backend::Raw(_) => false,
+        }
+    }
+
     /// Parse a bare string form (yaml scalar or MCP tool argument).
     /// Known names → preset variants; shell aliases → [`Backend::Shell`];
     /// anything else becomes [`Backend::Raw`].
