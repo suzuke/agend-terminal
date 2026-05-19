@@ -252,13 +252,37 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
                 result["topic_id"] = json!(tid);
                 // Persist topic_id to fleet.yaml so daemon can route messages
                 // to this instance's topic on restart (#415).
+                //
+                // #962: consume the Result<bool> from update_instance_field so
+                // the MCP response carries `topic_persisted: false` (and
+                // optionally `topic_persist_error`) when the persist silently
+                // no-op'd or hit an IO error. Pre-#962 the `let _ = ...` swallow
+                // surfaced as demo-blocking "topic_id: null" fleet.yaml rows.
                 if let Ok(tid_num) = tid.parse::<i32>() {
-                    let _ = crate::fleet::update_instance_field(
+                    match crate::fleet::update_instance_field(
                         ctx.home,
                         name,
                         "topic_id",
                         serde_yaml_ng::Value::Number(serde_yaml_ng::Number::from(tid_num)),
-                    );
+                    ) {
+                        Ok(true) => { /* persisted — happy path stays minimal */ }
+                        Ok(false) => {
+                            // Silent no-op already warn-logged inside
+                            // update_instance_field. Surface to MCP caller so
+                            // automation (replace_instance, operator scripts)
+                            // can detect partial-success without daemon.log grep.
+                            result["topic_persisted"] = json!(false);
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                agent = name,
+                                error = %e,
+                                "update_instance_field failed — topic_id NOT persisted to fleet.yaml"
+                            );
+                            result["topic_persisted"] = json!(false);
+                            result["topic_persist_error"] = json!(format!("{e}"));
+                        }
+                    }
                 }
             }
             json!({"ok": true, "result": result})

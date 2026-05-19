@@ -1025,21 +1025,69 @@ pub fn update_channel_telegram_group_id(home: &Path, new_group_id: i64) -> Resul
 }
 
 /// Update a specific field of an instance in fleet.yaml. Uses file lock + atomic write.
+/// Update a single field on an instance entry in fleet.yaml. Returns
+/// `Ok(true)` when the mutation actually fired (entry found + writable),
+/// `Ok(false)` when the call silently no-ops (one of three documented
+/// paths: fleet.yaml missing / instance entry missing / entry not a
+/// mapping). Err only fires for lock contention, YAML parse failure,
+/// or atomic-write IO error.
+///
+/// #962: pre-fix every silent no-op returned `Ok(())` and callers
+/// could not distinguish "persisted" from "silently dropped on the
+/// floor". The empirical demo-blocking bug rooted in this exact gap:
+/// `deployments.rs:298-300` warn-and-continued past a Phase 2 fleet.yaml
+/// write failure, then `handle_spawn:256` called this function on an
+/// instance entry that didn't exist — silently no-op'd `topic_id`
+/// persistence for all 3 demo agents.
+///
+/// Post-fix `Result<bool>` lets callers detect partial-success. Internal
+/// `tracing::warn!` fires on every no-op path so even callers using
+/// `let _ = update_instance_field(...)` get an audit trail.
 pub fn update_instance_field(
     home: &Path,
     name: &str,
     field: &str,
     value: serde_yaml_ng::Value,
-) -> Result<()> {
+) -> Result<bool> {
+    let fleet_path = fleet_yaml_path(home);
+    if !fleet_path.exists() {
+        tracing::warn!(
+            instance = name,
+            field = field,
+            reason = "fleet_yaml_missing",
+            "update_instance_field skipped — silent no-op detected"
+        );
+        return Ok(false);
+    }
+    let mut persisted = false;
+    let mut skip_reason: Option<&'static str> = None;
     mutate_fleet_yaml(home, "", |doc| {
-        if let Some(instances) = doc.get_mut("instances").and_then(|v| v.as_mapping_mut()) {
-            let key = serde_yaml_ng::Value::String(name.to_string());
-            if let Some(inst) = instances.get_mut(&key).and_then(|v| v.as_mapping_mut()) {
-                inst.insert(serde_yaml_ng::Value::String(field.to_string()), value);
-            }
-        }
+        let Some(instances) = doc.get_mut("instances").and_then(|v| v.as_mapping_mut()) else {
+            skip_reason = Some("instances_section_missing");
+            return Ok(());
+        };
+        let key = serde_yaml_ng::Value::String(name.to_string());
+        let Some(inst_val) = instances.get_mut(&key) else {
+            skip_reason = Some("instance_entry_missing");
+            return Ok(());
+        };
+        let Some(inst) = inst_val.as_mapping_mut() else {
+            skip_reason = Some("instance_entry_not_mapping");
+            return Ok(());
+        };
+        inst.insert(serde_yaml_ng::Value::String(field.to_string()), value);
+        persisted = true;
         Ok(())
-    })
+    })?;
+    if !persisted {
+        tracing::warn!(
+            instance = name,
+            field = field,
+            reason = skip_reason.unwrap_or("unknown"),
+            "update_instance_field skipped — silent no-op detected"
+        );
+    }
+    Ok(persisted)
 }
 
 /// Sprint 54 fleet-yaml teams unification: serialize a `TeamConfig` to a
@@ -3203,5 +3251,142 @@ instances:
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── #962 silent-persist failure tests (Layer 1 internal tracing) ──
+    //
+    // Each test pins one of the 3 documented silent no-op paths inside
+    // `update_instance_field`. Pre-#962 all three returned `Ok(())` and
+    // callers had no way to distinguish persisted from silently-dropped.
+    // Post-#962 they return `Ok(false)` and emit `tracing::warn!` with
+    // a stable `reason` field.
+
+    fn tmp_home_962(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("agend-962-{}-{}-{}", tag, std::process::id(), id));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn update_instance_field_returns_false_when_fleet_yaml_absent() {
+        let home = tmp_home_962("absent");
+        // No fleet.yaml planted.
+        let result = update_instance_field(
+            &home,
+            "any-agent",
+            "topic_id",
+            serde_yaml_ng::Value::Number(serde_yaml_ng::Number::from(42)),
+        );
+        assert!(
+            matches!(result, Ok(false)),
+            "missing fleet.yaml must return Ok(false), got {result:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn update_instance_field_returns_false_when_instance_entry_missing() {
+        let home = tmp_home_962("entry-missing");
+        // fleet.yaml exists but has no entry for "ghost".
+        std::fs::write(
+            fleet_yaml_path(&home),
+            "instances:\n  alpha:\n    backend: claude\n",
+        )
+        .unwrap();
+        let result = update_instance_field(
+            &home,
+            "ghost",
+            "topic_id",
+            serde_yaml_ng::Value::Number(serde_yaml_ng::Number::from(42)),
+        );
+        assert!(
+            matches!(result, Ok(false)),
+            "missing instance entry must return Ok(false), got {result:?}"
+        );
+        // Confirm fleet.yaml unchanged.
+        let body = std::fs::read_to_string(fleet_yaml_path(&home)).unwrap();
+        assert!(!body.contains("ghost"), "ghost entry must NOT be inserted");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn update_instance_field_returns_false_when_not_mapping() {
+        let home = tmp_home_962("not-mapping");
+        // Instance entry exists but is a SCALAR (string), not a mapping.
+        std::fs::write(
+            fleet_yaml_path(&home),
+            "instances:\n  alpha: just-a-string\n",
+        )
+        .unwrap();
+        let result = update_instance_field(
+            &home,
+            "alpha",
+            "topic_id",
+            serde_yaml_ng::Value::Number(serde_yaml_ng::Number::from(42)),
+        );
+        assert!(
+            matches!(result, Ok(false)),
+            "non-mapping entry must return Ok(false), got {result:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn update_instance_field_returns_true_on_successful_persist() {
+        let home = tmp_home_962("happy");
+        std::fs::write(
+            fleet_yaml_path(&home),
+            "instances:\n  alpha:\n    backend: claude\n",
+        )
+        .unwrap();
+        let result = update_instance_field(
+            &home,
+            "alpha",
+            "topic_id",
+            serde_yaml_ng::Value::Number(serde_yaml_ng::Number::from(123)),
+        );
+        assert!(
+            matches!(result, Ok(true)),
+            "happy path must return Ok(true), got {result:?}"
+        );
+        let body = std::fs::read_to_string(fleet_yaml_path(&home)).unwrap();
+        assert!(
+            body.contains("topic_id: 123"),
+            "topic_id must be persisted; got:\n{body}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn update_instance_field_emits_warn_with_reason_on_each_no_op_path() {
+        // Path 2: instance entry missing.
+        let home = tmp_home_962("warn-entry-missing");
+        std::fs::write(
+            fleet_yaml_path(&home),
+            "instances:\n  alpha:\n    backend: claude\n",
+        )
+        .unwrap();
+        let _ = update_instance_field(
+            &home,
+            "ghost",
+            "topic_id",
+            serde_yaml_ng::Value::Number(serde_yaml_ng::Number::from(42)),
+        );
+        assert!(
+            logs_contain("update_instance_field skipped"),
+            "tracing::warn! must fire on silent no-op path"
+        );
+        assert!(
+            logs_contain("instance_entry_missing"),
+            "tracing reason must identify the specific no-op path"
+        );
+        assert!(logs_contain("ghost"), "tracing must carry instance name");
+        assert!(logs_contain("topic_id"), "tracing must carry field name");
+        std::fs::remove_dir_all(&home).ok();
     }
 }
