@@ -151,6 +151,11 @@ pub fn prepare(home: &Path, fleet_path: &Path, opts: PrepareOptions) -> Result<B
     // process into attaching to a dead daemon (symptom: input lag from 2s
     // port-poll hitting closed sockets).
     crate::daemon::sweep_stale_run_dirs(home);
+    // #933: alive-but-stale zombie sweep — complements the dead-PID sweep
+    // above. Always-on telemetry log per candidate; destructive kill is
+    // env-gated via AGEND_DAEMON_BOOT_SWEEP_AGE_DAYS=N. Reuses #927 PR-B
+    // primitives (`admin::cleanup_zombies`).
+    let _ = crate::daemon::boot_sweep::boot_sweep_zombies(home);
 
     let run_dir = crate::daemon::run_dir(home);
     std::fs::create_dir_all(&run_dir)

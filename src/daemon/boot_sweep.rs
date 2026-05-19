@@ -49,9 +49,32 @@ const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 /// Returns the count of zombies actually killed (0 in telemetry-only or
 /// dry-run modes). Callers (daemon boot path) should not depend on the
 /// return value beyond informational logging.
-pub fn boot_sweep_zombies(_home: &Path) -> usize {
-    // RED stub — replaced in GREEN commit.
-    unimplemented!("boot_sweep_zombies: RED stub awaiting GREEN impl")
+pub fn boot_sweep_zombies(home: &Path) -> usize {
+    let env_raw = std::env::var(ENV_AGE_DAYS).ok();
+    let parsed_days: Option<u64> = env_raw
+        .as_deref()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n: &u64| n >= 1);
+    if env_raw.is_some() && parsed_days.is_none() {
+        tracing::warn!(
+            env = ENV_AGE_DAYS,
+            value = ?env_raw,
+            "#933 boot-sweep: malformed env value (expected positive integer); treating as unset"
+        );
+    }
+    let destructive = parsed_days.is_some();
+    let dry_run = std::env::var(ENV_DRY_RUN).as_deref() == Ok("1");
+    let threshold_days = parsed_days.unwrap_or(DEFAULT_AGE_DAYS);
+    let min_age = Duration::from_secs(threshold_days * SECONDS_PER_DAY);
+    boot_sweep_impl(
+        home,
+        min_age,
+        destructive,
+        dry_run,
+        TERM_GRACE,
+        KILL_GRACE,
+        SystemTime::now(),
+    )
 }
 
 /// Test-accessible inner. Parametrized clock + grace windows so tests
@@ -59,33 +82,84 @@ pub fn boot_sweep_zombies(_home: &Path) -> usize {
 /// production globals.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn boot_sweep_impl(
-    _home: &Path,
-    _min_age: Duration,
-    _destructive: bool,
-    _dry_run: bool,
-    _term_grace: Duration,
-    _kill_grace: Duration,
-    _now: SystemTime,
+    home: &Path,
+    min_age: Duration,
+    destructive: bool,
+    dry_run: bool,
+    term_grace: Duration,
+    kill_grace: Duration,
+    now: SystemTime,
 ) -> usize {
-    // RED stub — replaced in GREEN commit.
-    unimplemented!("boot_sweep_impl: RED stub awaiting GREEN impl")
-}
-
-#[allow(dead_code)]
-fn _ref_unused_consts_for_red() {
-    // Avoid dead_code warnings on consts that the RED stub doesn't touch.
-    let _ = (TERM_GRACE, KILL_GRACE, DEFAULT_AGE_DAYS, SECONDS_PER_DAY);
-}
-
-#[allow(dead_code)]
-fn _ref_unused_imports_for_red() {
-    // Suppress unused-import warnings on the cleanup_zombies surface
-    // that the GREEN impl wires in. The references are pointer-only so
-    // monomorphization cost is zero.
-    let _f: fn(_, _, _) -> _ = cleanup_zombie_daemon;
-    let _g: fn(_, _, _) -> _ = find_zombie_candidates;
-    let _h: fn(_) = log_zombie_state;
-    let _k = std::mem::size_of::<KillOutcome>();
+    let candidates = find_zombie_candidates(home, min_age, now);
+    if candidates.is_empty() {
+        return 0;
+    }
+    let own_pid = std::process::id();
+    let mut killed = 0usize;
+    for z in &candidates {
+        // E6: never target our own PID — defensive. boot-sweep runs
+        // BEFORE `write_daemon_id` so our own .daemon shouldn't exist
+        // yet, but the guard protects against preflight ordering changes.
+        if z.pid == own_pid {
+            tracing::warn!(
+                pid = z.pid,
+                run_dir = %z.run_dir.display(),
+                "#933 boot-sweep: own-PID candidate filtered (defensive)"
+            );
+            continue;
+        }
+        // Identity guard: the dir name MUST match the .daemon file's
+        // recorded PID. Mismatch (PID reuse where a recycled PID landed
+        // in a different daemon's run dir) → skip with warn.
+        if let Some(recorded) = crate::daemon::read_daemon_pid(&z.run_dir) {
+            if recorded != z.pid {
+                tracing::warn!(
+                    dir_pid = z.pid,
+                    recorded_pid = recorded,
+                    run_dir = %z.run_dir.display(),
+                    "#933 boot-sweep: identity guard rejected — dir name != .daemon PID, skipping"
+                );
+                continue;
+            }
+        }
+        // Always-on telemetry: log state regardless of destructive flag.
+        log_zombie_state(z.pid);
+        if !destructive || dry_run {
+            tracing::warn!(
+                pid = z.pid,
+                age_days = z.age.as_secs() / SECONDS_PER_DAY,
+                run_dir = %z.run_dir.display(),
+                mode = if destructive { "dry-run" } else { "telemetry-only (env unset)" },
+                "#933 boot-sweep: zombie candidate — would kill"
+            );
+            continue;
+        }
+        let outcome = cleanup_zombie_daemon(z.pid, term_grace, kill_grace);
+        let real_kill = matches!(
+            outcome,
+            KillOutcome::Graceful(_) | KillOutcome::ForceKilled | KillOutcome::WindowsTerminated
+        );
+        match outcome {
+            KillOutcome::RefusedToDie => tracing::warn!(
+                pid = z.pid,
+                age_days = z.age.as_secs() / SECONDS_PER_DAY,
+                run_dir = %z.run_dir.display(),
+                "#933 boot-sweep: cleanup returned RefusedToDie — continuing boot"
+            ),
+            other => tracing::info!(
+                pid = z.pid,
+                age_days = z.age.as_secs() / SECONDS_PER_DAY,
+                outcome = ?other,
+                run_dir = %z.run_dir.display(),
+                "#933 boot-sweep: cleanup outcome"
+            ),
+        }
+        if real_kill {
+            let _ = std::fs::remove_dir_all(&z.run_dir);
+            killed += 1;
+        }
+    }
+    killed
 }
 
 #[cfg(test)]
