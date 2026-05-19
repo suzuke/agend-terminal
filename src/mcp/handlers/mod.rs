@@ -10,6 +10,7 @@ pub(crate) mod dispatch_hook;
 mod force_release;
 pub(crate) mod instance;
 pub(crate) mod instance_lifecycle;
+mod instance_spawn;
 mod restart;
 mod schedule;
 pub(crate) mod sha_gate;
@@ -123,3 +124,9 @@ mod tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod p0b_tests;
+
+// #964: MCP create_instance ordering regression tests live in sibling
+// file to keep instance.rs under the 750-LOC file_size_invariant.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod instance_964_tests;
