@@ -350,8 +350,28 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
     // neither path nor binding present (no silent cwd-derivation). EC15:
     // validate the binding's source_repo path still exists before reading.
     let derived_repo: Option<String>;
+    let canonical_repo: Option<String>;
     let repo: &str = match args["repo"].as_str().filter(|s| !s.is_empty()) {
-        Some(r) => r,
+        Some(r) => {
+            // #942: canonicalize on entry so the hash key + stored
+            // `repo` field both reflect the single canonical form.
+            // Rejects obviously-malformed input (non-GitHub URL, malformed
+            // slug) with operator-actionable error.
+            match crate::mcp::handlers::dispatch_hook::canonicalize_repo_slug(r) {
+                Some(c) => {
+                    canonical_repo = Some(c);
+                    canonical_repo.as_deref().unwrap_or("")
+                }
+                None => {
+                    return json!({
+                        "error": format!(
+                            "invalid 'repo' format: {r:?} — expected `owner/repo` or full GitHub URL"
+                        ),
+                        "code": "invalid_repo_format",
+                    });
+                }
+            }
+        }
         None => {
             let binding = home
                 .join("runtime")

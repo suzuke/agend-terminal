@@ -1,18 +1,159 @@
-//! #942 + #943 boot-time migration — RED STUB.
+//! #942 + #943 boot-time migration: rename old-format watch files to
+//! the canonical+sha256 form so operators don't see duplicate 72h
+//! notifications across the hash-scheme transition.
 //!
-//! GREEN commit replaces with real implementation: scan ci-watches dir,
-//! rename old-format files (DefaultHasher 16-hex + non-canonical repo)
-//! to new sha256+canonical form. Active migration (option b from
-//! dev-2 cross-audit Pushback 3) prevents 72h duplicate-notification
-//! window operators were seeing.
+//! Pre-#942/#943 filenames used `DefaultHasher` (SipHash-2-4 truncated
+//! to 64 bits) → 16 hex chars + `.json` (21 chars total) + a verbatim
+//! repo string (possibly `.git`-suffixed, cased differently).
+//!
+//! Post-fix filenames use sha256 (256-bit) → 64 hex chars + `.json` (69
+//! chars total) + canonicalized repo string.
+//!
+//! Migration logic:
+//! 1. Scan `<home>/ci-watches/*.json`
+//! 2. For each file: if filename stem length != 64 → old format
+//! 3. Read body, parse `repo` + `branch`
+//! 4. Canonicalize repo, compute new sha256 filename
+//! 5. Rewrite `repo` field in body to canonical form
+//! 6. Rename file; if target already exists, log conflict and skip
+//!
+//! Conflict resolution: when two old files map to the same canonical
+//! target (e.g., `owner/repo.git@feat/x` and `owner/repo@feat/x`),
+//! the FIRST one encountered wins; subsequent conflicts log a warning
+//! and are left in place. Operator can manually clean up via
+//! `rm <home>/ci-watches/<old-name>.json`. The hash-collision case is
+//! cryptographically impossible (sha256 collision-resistant).
+//!
+//! Idempotent: re-running the migration on already-migrated state is
+//! a no-op (all files have 64-hex stems).
 
 use std::path::Path;
 
 use super::registry::{ci_watches_dir, watch_filename};
 
-/// RED STUB — no-op. GREEN commit lands real impl.
-pub fn migrate_legacy_watch_filenames(_home: &Path) -> usize {
-    0
+const SHA256_HEX_LEN: usize = 64;
+
+/// Scan `<home>/ci-watches/` and rename any old-format (non-sha256)
+/// watch files to the canonical+sha256 form. Idempotent. Best-effort:
+/// errors are logged but never abort caller (daemon boot path).
+///
+/// Returns the count of files actually renamed (for logging /
+/// test assertions).
+pub fn migrate_legacy_watch_filenames(home: &Path) -> usize {
+    let ci_dir = ci_watches_dir(home);
+    let Ok(entries) = std::fs::read_dir(&ci_dir) else {
+        return 0;
+    };
+    let mut renamed = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let stem = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s,
+            None => continue,
+        };
+        // sha256 hex digests are 64 chars. Anything else is old format.
+        if stem.len() == SHA256_HEX_LEN && stem.chars().all(|c| c.is_ascii_hexdigit()) {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            tracing::warn!(
+                path = %path.display(),
+                "#942/#943 migration: failed to read old-format watch file"
+            );
+            continue;
+        };
+        let mut watch: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "#942/#943 migration: failed to parse old-format watch JSON"
+                );
+                continue;
+            }
+        };
+        let raw_repo = watch.get("repo").and_then(|v| v.as_str()).unwrap_or("");
+        let raw_branch = watch.get("branch").and_then(|v| v.as_str()).unwrap_or("");
+        if raw_repo.is_empty() || raw_branch.is_empty() {
+            tracing::warn!(
+                path = %path.display(),
+                "#942/#943 migration: old-format watch missing repo/branch fields"
+            );
+            continue;
+        }
+        let canonical_repo = match crate::mcp::handlers::dispatch_hook::canonicalize_repo_slug(
+            raw_repo,
+        ) {
+            Some(c) => c,
+            None => {
+                tracing::warn!(
+                    path = %path.display(),
+                    repo = %raw_repo,
+                    "#942/#943 migration: repo string cannot be canonicalized; leaving file in place"
+                );
+                continue;
+            }
+        };
+        let new_filename = watch_filename(&canonical_repo, raw_branch);
+        let new_path = ci_dir.join(&new_filename);
+        if new_path == path {
+            // Same filename — only possible if the OLD file already had
+            // canonical repo + sha256 stem somehow. Idempotent no-op.
+            continue;
+        }
+        if new_path.exists() {
+            tracing::warn!(
+                old = %path.display(),
+                new = %new_path.display(),
+                "#942/#943 migration: target already exists (likely two old files mapped to same canonical); skipping rename"
+            );
+            continue;
+        }
+        // Update body's `repo` field to canonical form before write.
+        watch["repo"] = serde_json::json!(canonical_repo);
+        let new_body = match serde_json::to_string_pretty(&watch) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "#942/#943 migration: failed to re-serialize watch JSON"
+                );
+                continue;
+            }
+        };
+        // Atomic-ish: write new file first, then remove old. Both safe to
+        // re-run if interrupted (idempotent on retry).
+        if let Err(e) = std::fs::write(&new_path, new_body) {
+            tracing::warn!(
+                path = %new_path.display(),
+                error = %e,
+                "#942/#943 migration: failed to write new-format file"
+            );
+            continue;
+        }
+        if let Err(e) = std::fs::remove_file(&path) {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "#942/#943 migration: wrote new file but failed to remove old; manual cleanup needed"
+            );
+            // Don't increment counter — partial migration.
+            continue;
+        }
+        tracing::info!(
+            old = %path.display(),
+            new = %new_path.display(),
+            canonical_repo = %canonical_repo,
+            "#942/#943 migration: renamed legacy watch file to canonical+sha256 form"
+        );
+        renamed += 1;
+    }
+    renamed
 }
 
 #[cfg(test)]

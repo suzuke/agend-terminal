@@ -63,16 +63,33 @@ pub fn remove_watch(
     );
 }
 
-/// Deterministic, collision-free filename for a CI watch entry.
+/// Deterministic, collision-resistant filename for a CI watch entry.
 /// Uses SHA-256 of `"{repo}:{branch}"` to avoid path traversal and
 /// collisions when repo names contain `/` (e.g. `owner/repo` vs
-/// `owner_repo`).
+/// `owner_repo`). Cryptographic — collision is computationally
+/// infeasible (no known sha256 collision attacks).
+///
+/// Pre-#943 this used `std::collections::hash_map::DefaultHasher`
+/// (SipHash-2-4 truncated to 64 bits) — birthday collision at
+/// ~2^32 entries and within-session adversarial collision findable
+/// at ~2^32 brute-force. The docstring already claimed sha256; this
+/// fix brings implementation into line. Filename grows from 16 hex
+/// (DefaultHasher) to 64 hex (sha256).
+///
+/// Old-format files are migrated at boot via
+/// [`super::migration::migrate_legacy_watch_filenames`] (#942/#943
+/// PR-B). Operators don't see duplicate 72h notifications because the
+/// migration runs synchronously before the poller loop starts.
+///
+/// Performance: ~900ns/call vs DefaultHasher's ~100ns. At typical
+/// per-watch subscription rate (~100/agent/day) the ~90µs/day delta
+/// is negligible (#942 dev-2 cross-audit Pushback 4).
 pub fn watch_filename(repo: &str, branch: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    format!("{repo}:{branch}").hash(&mut h);
-    format!("{:016x}.json", h.finish())
+    let composite = format!("{repo}:{branch}");
+    format!(
+        "{}.json",
+        crate::daemon::utils::sha256_hex(composite.as_bytes())
+    )
 }
 
 /// Persist updated tracking state (last_run_id + head_sha) to the watch file.
@@ -157,15 +174,22 @@ mod tests {
 
     #[test]
     fn watch_filename_distinguishes_delimiter_ambiguity() {
+        // `owner/repo` + `feat-x` must NOT collide with
+        // `owner` + `repo:feat-x` despite both producing the same raw
+        // composite under naive concatenation.
         let a = watch_filename("owner/repo", "feat-x");
         let b = watch_filename("owner", "repo:feat-x");
-        assert_ne!(a, b, "filename hash must distinguish (repo, branch) splits");
+        assert_ne!(
+            a, b,
+            "filename hash must distinguish (repo, branch) split — composite was `repo:branch` (concat ambiguous)"
+        );
     }
 
     #[test]
     fn watch_filename_differs_from_pre_943_defaulthasher_length() {
-        // Pre-#943 DefaultHasher: 16 hex + .json (21 chars).
-        // Post-#943 sha256: 64 hex + .json (69 chars).
+        // Pre-#943 DefaultHasher output: 16 hex + .json (21 chars total).
+        // Post-#943 sha256: 64 hex + .json (69 chars total).
+        // This guards against accidentally reverting to DefaultHasher.
         let f = watch_filename("owner/repo", "feat/x");
         assert!(
             f.len() > 21,

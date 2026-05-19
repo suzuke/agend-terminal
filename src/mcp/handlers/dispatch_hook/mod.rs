@@ -410,17 +410,19 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
     );
 
     // P0-2 + Sprint 55 P0-B EC4: auto-watch_ci. Resolution order:
-    //   1. caller-supplied `repo` arg
-    //   2. fleet.yaml `repo:` override (Sprint 55 EC4)
-    //   3. `derive_repo_from_remote(source_repo)` (existing Sprint 53 P0-2)
+    //   1. caller-supplied `repo` arg → canonicalize (#942)
+    //   2. fleet.yaml `repo:` override → canonicalize (#942)
+    //   3. `derive_repo_from_remote(source_repo)` (existing Sprint 53 P0-2;
+    //      already canonical via `parse_github_owner_repo` → `canonicalize_repo_slug`)
     let resolved_repo = repo
         .filter(|s| !s.is_empty())
-        .map(str::to_string)
+        .and_then(canonicalize_repo_slug)
         .or_else(|| {
             resolved
                 .as_ref()
                 .and_then(|r| r.repo.clone())
                 .filter(|s| !s.is_empty())
+                .and_then(|s| canonicalize_repo_slug(&s))
         })
         .or_else(|| derive_repo_from_remote(&source_repo));
     if let Some(r) = resolved_repo {
@@ -752,36 +754,64 @@ pub(crate) fn resolve_team_source_repo(home: &Path, agent: &str) -> Option<PathB
 /// - `http://github.com/owner/repo(.git)`
 /// - `git@github.com:owner/repo(.git)`
 ///
-/// #942 RED STUB — returns the trimmed input unchanged so tests compile.
-/// GREEN commit replaces with real canonicalization logic.
+/// #942 canonical form for GitHub `owner/repo` identity. Accepts both
+/// full URL forms AND bare slugs; collapses the 7 known divergence forms
+/// (`.git` suffix, casing, whitespace, full HTTPS URL, SSH URL, trailing
+/// slash, HTTP vs HTTPS) to a single canonical `owner/repo` lowercase
+/// string. GitHub itself treats repo identifiers case-insensitively for
+/// routing, so lowercasing here matches server semantics.
+///
+/// Single source of truth for repo identity used by:
+/// - `handle_watch_ci` (canonicalize on entry before hash)
+/// - `dispatch_auto_bind_lease` (tiers 1+2 caller-supplied + fleet.yaml)
+/// - `parse_github_owner_repo` (re-uses via delegate)
+/// - `migrate_legacy_watch_filenames` (#942/#943 boot migration)
+///
+/// Returns `None` for inputs that cannot be canonicalized:
+/// - Non-GitHub remotes (e.g. `https://gitlab.com/...`)
+/// - Malformed slugs (single component, too many components)
+/// - Empty input after trim
+///
+/// **Behavior shift from pre-#942 `parse_github_owner_repo`**: pre-fix
+/// accepted only URL forms (returned `None` for bare slugs like
+/// `owner/repo`). Post-fix accepts both. The only in-tree caller of
+/// the pre-fix shape is `derive_repo_from_remote` which always passes
+/// the output of `git remote get-url` (URL form); the lenient shift
+/// is theoretical for that path. Documented in #942 PR body.
 pub(crate) fn canonicalize_repo_slug(s: &str) -> Option<String> {
     let s = s.trim();
     if s.is_empty() {
-        None
-    } else {
-        Some(s.to_string())
+        return None;
     }
-}
-
-/// Returns `None` for non-GitHub remotes — `watch_ci` only knows how to poll
-/// GitHub Actions, so silently skipping non-GitHub repos is the right behavior
-/// (the alternative would be writing a stale watch entry the poller can't act on).
-fn parse_github_owner_repo(url: &str) -> Option<String> {
-    let url = url.trim();
-    let stripped = url
+    let stripped = s
         .strip_prefix("https://github.com/")
-        .or_else(|| url.strip_prefix("http://github.com/"))
-        .or_else(|| url.strip_prefix("git@github.com:"))
-        .or_else(|| url.strip_prefix("ssh://git@github.com/"))?;
+        .or_else(|| s.strip_prefix("http://github.com/"))
+        .or_else(|| s.strip_prefix("git@github.com:"))
+        .or_else(|| s.strip_prefix("ssh://git@github.com/"))
+        .unwrap_or(s);
     let slug = stripped.trim_end_matches('/').trim_end_matches(".git");
-    // Sanity: must look like `owner/repo` — exactly one '/' and both parts non-empty.
     let mut parts = slug.split('/');
     let owner = parts.next()?;
     let name = parts.next()?;
     if parts.next().is_some() || owner.is_empty() || name.is_empty() {
         return None;
     }
-    Some(format!("{owner}/{name}"))
+    Some(format!(
+        "{}/{}",
+        owner.to_ascii_lowercase(),
+        name.to_ascii_lowercase()
+    ))
+}
+
+/// Returns `None` for non-GitHub remotes — `watch_ci` only knows how to poll
+/// GitHub Actions, so silently skipping non-GitHub repos is the right behavior
+/// (the alternative would be writing a stale watch entry the poller can't act on).
+///
+/// Pre-#942 this was a separate stricter implementation; post-#942 it
+/// delegates to [`canonicalize_repo_slug`] so derived-from-remote URLs
+/// and operator-supplied slugs converge on identical canonical form.
+fn parse_github_owner_repo(url: &str) -> Option<String> {
+    canonicalize_repo_slug(url)
 }
 
 /// Sprint 55 P0-B: re-export `derive_repo_from_remote` as `pub(crate)` so

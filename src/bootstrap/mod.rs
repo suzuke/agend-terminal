@@ -156,6 +156,11 @@ pub fn prepare(home: &Path, fleet_path: &Path, opts: PrepareOptions) -> Result<B
     // env-gated via AGEND_DAEMON_BOOT_SWEEP_AGE_DAYS=N. Reuses #927 PR-B
     // primitives (`admin::cleanup_zombies`).
     let _ = crate::daemon::boot_sweep::boot_sweep_zombies(home);
+    // #942/#943: rename legacy-format watch files (DefaultHasher+non-canonical)
+    // to canonical+sha256 form. One-shot at boot; idempotent on repeated runs.
+    // Active migration (option b from dev-2 cross-audit Pushback 3) prevents
+    // the 72h duplicate-notification window across the hash-scheme transition.
+    let _ = crate::daemon::ci_watch::migration::migrate_legacy_watch_filenames(home);
 
     let run_dir = crate::daemon::run_dir(home);
     std::fs::create_dir_all(&run_dir)
