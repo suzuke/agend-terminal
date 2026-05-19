@@ -752,6 +752,17 @@ pub(crate) fn resolve_team_source_repo(home: &Path, agent: &str) -> Option<PathB
 /// - `http://github.com/owner/repo(.git)`
 /// - `git@github.com:owner/repo(.git)`
 ///
+/// #942 RED STUB — returns the trimmed input unchanged so tests compile.
+/// GREEN commit replaces with real canonicalization logic.
+pub(crate) fn canonicalize_repo_slug(s: &str) -> Option<String> {
+    let s = s.trim();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
 /// Returns `None` for non-GitHub remotes — `watch_ci` only knows how to poll
 /// GitHub Actions, so silently skipping non-GitHub repos is the right behavior
 /// (the alternative would be writing a stale watch entry the poller can't act on).

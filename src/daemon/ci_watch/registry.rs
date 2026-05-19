@@ -124,3 +124,52 @@ pub(super) fn update_watch_state_with_notify(
         }
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    // ── #943 sha256 contract for watch_filename ──
+
+    #[test]
+    fn watch_filename_uses_sha256_64_hex_chars_plus_json_extension() {
+        let f = watch_filename("owner/repo", "feat/x");
+        assert!(f.ends_with(".json"), "filename must end .json: {f}");
+        let stem = f.strip_suffix(".json").unwrap();
+        assert_eq!(
+            stem.len(),
+            64,
+            "sha256 hex digest is 64 chars (post-#943): {f}"
+        );
+        assert!(
+            stem.chars().all(|c| c.is_ascii_hexdigit()),
+            "filename stem must be pure ascii hex: {f}"
+        );
+    }
+
+    #[test]
+    fn watch_filename_deterministic_across_calls() {
+        let a = watch_filename("owner/repo", "feat/x");
+        let b = watch_filename("owner/repo", "feat/x");
+        assert_eq!(a, b, "watch_filename must be deterministic");
+    }
+
+    #[test]
+    fn watch_filename_distinguishes_delimiter_ambiguity() {
+        let a = watch_filename("owner/repo", "feat-x");
+        let b = watch_filename("owner", "repo:feat-x");
+        assert_ne!(a, b, "filename hash must distinguish (repo, branch) splits");
+    }
+
+    #[test]
+    fn watch_filename_differs_from_pre_943_defaulthasher_length() {
+        // Pre-#943 DefaultHasher: 16 hex + .json (21 chars).
+        // Post-#943 sha256: 64 hex + .json (69 chars).
+        let f = watch_filename("owner/repo", "feat/x");
+        assert!(
+            f.len() > 21,
+            "post-#943 filename length must exceed legacy DefaultHasher length (21): got {f}"
+        );
+    }
+}

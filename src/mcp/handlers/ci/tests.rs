@@ -1832,3 +1832,101 @@ fn cleanup_on_clean_worktree_is_noop_count_zero() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ── #942 explicit watch + auto-bind no-split end-to-end ──
+//
+// Pre-#942 bug: caller could pass `repo: "owner/repo.git"` to
+// `handle_watch_ci` and the auto-derived form (from
+// `derive_repo_from_remote`) would produce `owner/repo` → two
+// distinct watch files (different hashes), fragmented subscribers,
+// duplicate notifications.
+//
+// Post-fix: both paths converge on canonical `owner/repo` so the same
+// ci_watches file holds both subscribers.
+
+#[test]
+fn handle_watch_ci_canonicalizes_caller_supplied_repo_with_git_suffix() {
+    let home = p778_tmp_home("942-git-suffix");
+    let r = handle_watch_ci(
+        &home,
+        &serde_json::json!({"repo": "owner/repo.git", "branch": "feat/x"}),
+        "dev",
+    );
+    assert!(
+        r["watching"].as_bool().unwrap_or(false),
+        "watching must succeed for `.git` form: {r}"
+    );
+
+    // File must be at canonical sha256 path.
+    let ci_dir = crate::daemon::ci_watch::ci_watches_dir(&home);
+    let canonical_filename = crate::daemon::ci_watch::watch_filename("owner/repo", "feat/x");
+    let canonical_path = ci_dir.join(&canonical_filename);
+    assert!(
+        canonical_path.exists(),
+        "watch file must land at canonical sha256 path"
+    );
+
+    // Body's `repo` field is canonical (not `.git`-suffixed).
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&canonical_path).unwrap()).unwrap();
+    assert_eq!(v["repo"].as_str(), Some("owner/repo"));
+    assert_eq!(v["branch"].as_str(), Some("feat/x"));
+}
+
+#[test]
+fn handle_watch_ci_two_callers_with_different_forms_share_one_watch_file() {
+    let home = p778_tmp_home("942-converge");
+    let _ = handle_watch_ci(
+        &home,
+        &serde_json::json!({"repo": "owner/repo.git", "branch": "feat/x"}),
+        "agent-a",
+    );
+    let _ = handle_watch_ci(
+        &home,
+        &serde_json::json!({"repo": "Owner/Repo", "branch": "feat/x"}),
+        "agent-b",
+    );
+
+    // Single canonical file post-canonicalization.
+    let ci_dir = crate::daemon::ci_watch::ci_watches_dir(&home);
+    let files: Vec<_> = std::fs::read_dir(&ci_dir)
+        .unwrap()
+        .flatten()
+        .filter(|e| {
+            e.path().extension().and_then(|s| s.to_str()) == Some("json")
+                && e.path()
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|stem| stem.len() == 64)
+        })
+        .collect();
+    assert_eq!(
+        files.len(),
+        1,
+        "two callers with different repo forms must converge to ONE canonical file: {:?}",
+        files.iter().map(|f| f.path()).collect::<Vec<_>>()
+    );
+
+    // Both agents in subscribers.
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(files[0].path()).unwrap()).unwrap();
+    let subs = crate::daemon::ci_watch::parse_subscribers(&v);
+    assert!(subs.contains(&"agent-a".to_string()), "agent-a subscribed");
+    assert!(subs.contains(&"agent-b".to_string()), "agent-b subscribed");
+}
+
+#[test]
+fn handle_watch_ci_rejects_invalid_repo_format() {
+    let home = p778_tmp_home("942-invalid");
+    // Non-GitHub URL — canonicalize_repo_slug returns None
+    let r = handle_watch_ci(
+        &home,
+        &serde_json::json!({"repo": "https://gitlab.com/owner/repo", "branch": "feat/x"}),
+        "dev",
+    );
+    assert_eq!(
+        r["code"].as_str(),
+        Some("invalid_repo_format"),
+        "GitLab URL must be rejected as invalid_repo_format: {r}"
+    );
+}

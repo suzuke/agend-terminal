@@ -2070,3 +2070,67 @@ fn ensure_branch_exists_auto_create_from_main_path_unchanged() {
 
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ── #942 canonicalize_repo_slug matrix ──
+//
+// Single source of truth for repo identity. Covers all 7 divergence
+// forms enumerated in `/tmp/dialectic-942-dev-primary.md` §1, plus
+// edge cases (empty, malformed, non-GitHub URL).
+
+#[test]
+fn canonicalize_repo_slug_collapses_all_known_divergence_forms() {
+    let cases: &[(&str, Option<&str>)] = &[
+        // bare slug — already canonical
+        ("owner/repo", Some("owner/repo")),
+        // `.git` suffix
+        ("owner/repo.git", Some("owner/repo")),
+        // casing
+        ("Owner/Repo", Some("owner/repo")),
+        ("OWNER/REPO", Some("owner/repo")),
+        // whitespace (trim)
+        (" owner/repo ", Some("owner/repo")),
+        // trailing slash
+        ("owner/repo/", Some("owner/repo")),
+        // full HTTPS URL
+        ("https://github.com/owner/repo", Some("owner/repo")),
+        ("https://github.com/owner/repo.git", Some("owner/repo")),
+        ("https://github.com/Owner/Repo", Some("owner/repo")),
+        // HTTP vs HTTPS
+        ("http://github.com/owner/repo", Some("owner/repo")),
+        // SSH URL forms
+        ("git@github.com:owner/repo.git", Some("owner/repo")),
+        ("ssh://git@github.com/owner/repo", Some("owner/repo")),
+        // malformed: missing repo part
+        ("owner", None),
+        // malformed: too many components
+        ("owner/repo/extra", None),
+        // empty
+        ("", None),
+        ("   ", None),
+        // non-GitHub URL — must NOT canonicalize (returns None;
+        // ci_watch only knows GitHub Actions polling)
+        ("https://gitlab.com/owner/repo", None),
+        ("https://bitbucket.org/owner/repo", None),
+    ];
+    for (input, expected) in cases {
+        let got = super::canonicalize_repo_slug(input);
+        assert_eq!(
+            got.as_deref(),
+            *expected,
+            "canonicalize_repo_slug({input:?}) yielded {got:?}, expected {expected:?}"
+        );
+    }
+}
+
+#[test]
+fn canonicalize_repo_slug_lowercase_is_load_bearing_for_identity() {
+    // GitHub treats org/repo case-insensitively in routing. Two callers
+    // supplying different cases must produce same canonical identity
+    // for the watch_filename hash to converge.
+    let a = super::canonicalize_repo_slug("Owner/Repo").unwrap();
+    let b = super::canonicalize_repo_slug("owner/repo").unwrap();
+    let c = super::canonicalize_repo_slug("OWNER/REPO").unwrap();
+    assert_eq!(a, b);
+    assert_eq!(b, c);
+    assert_eq!(a, "owner/repo");
+}

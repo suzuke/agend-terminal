@@ -10,6 +10,7 @@
 //! - [`poller`] — poll loop + dedup helpers + `ci_check_repo` + tests
 //! - [`watcher`] — top-level entry point + provider factory
 
+pub(crate) mod migration;
 mod poller;
 mod provider;
 mod registry;
