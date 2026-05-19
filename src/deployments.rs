@@ -292,11 +292,34 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
     // handle_spawn can read this instance's role and the full peer list
     // when building the AgentContext for its agend.md. Single lock take
     // for the whole batch.
+    //
+    // #962 Layer 3: hard-fail if persist fails. Pre-#962 this was
+    // warn-and-continue, which let Phase 3 spawn instances NOT in
+    // fleet.yaml — `update_instance_field` then silently no-op'd
+    // topic_id persistence (the root cause of operator's demo bug:
+    // 3 demo agents with topic_id=null). Fail-fast here surfaces the
+    // upstream failure immediately and prevents the partial-success
+    // state where agents spawn but fleet.yaml is missing entries.
     if !yaml_entries.is_empty() {
         let refs: Vec<(&str, &crate::fleet::InstanceYamlEntry)> =
             yaml_entries.iter().map(|(n, e)| (n.as_str(), e)).collect();
         if let Err(e) = crate::fleet::add_instances_to_yaml(home, &refs) {
-            tracing::warn!(error = %e, "failed to persist deployment to fleet.yaml");
+            tracing::error!(
+                error = %e,
+                template = template,
+                deploy_name = deploy_name,
+                count = yaml_entries.len(),
+                "deploy_template: Phase 2 add_instances_to_yaml failed — aborting before Phase 3 spawn"
+            );
+            return serde_json::json!({
+                "error": format!(
+                    "deploy_template: failed to persist {} instance(s) to fleet.yaml: {e} \
+                     — Phase 3 spawn aborted to prevent partial-success state \
+                     (no agents spawned)",
+                    yaml_entries.len()
+                ),
+                "code": "deploy_yaml_persist_failed",
+            });
         }
     }
 
