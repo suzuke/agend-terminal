@@ -178,7 +178,34 @@ pub fn cleanup_zombie_daemon(pid: u32, term_grace: Duration, kill_grace: Duratio
 /// Poll `is_alive(pid)` every 100ms until it returns false or `timeout`
 /// elapses. Returns true if the PID died within the window. Used as the
 /// grace-loop primitive for both SIGTERM and SIGKILL stages.
-fn poll_until_dead(pid: u32, timeout: Duration) -> bool {
+///
+/// #934: promoted from `fn` to `pub(crate) fn` so consumers OUTSIDE
+/// `admin::cleanup_zombies` can reuse the deadline-poll idiom. Current
+/// in-crate consumers (added in the same PR):
+/// - `src/agent.rs::sweep_child_tree_body` test — replaces bare
+///   `assert!(!is_pid_alive(_pid))` post-kill assertions
+/// - `src/process.rs::test_kill_process_tree_kills_child_subprocess` —
+///   sibling test with identical race shape
+///
+/// ### Deadline guidance (OS-conditional)
+///
+/// Callers killing a process whose PID they CAN `waitpid` on (it's their
+/// own child) → typically <1s deadline; `wait()` reaps synchronously
+/// and `kill(pid, 0)` returns ESRCH immediately after.
+///
+/// Callers killing a process whose PID is re-parented to init / launchd
+/// upon parent death (orphaned grandchild scenario) → MUST use longer
+/// deadline because reap is asynchronous in the new parent:
+/// - **Linux init / systemd**: reaper runs on scheduler tick, typically
+///   reaps within <1s
+/// - **macOS launchd**: longer cycle observed; ~3s under nominal load,
+///   ~10s under heavily contended CI runners
+/// - **Heavily-loaded CI** (e.g. ubuntu-latest with parallel tests on
+///   2 vCPUs): 5-10s worst case for either platform
+///
+/// Recommend 5s for self-reaped children, 10s for orphaned grandchildren.
+/// The 100ms poll cadence balances responsiveness vs CPU waste.
+pub(crate) fn poll_until_dead(pid: u32, timeout: Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     loop {
         if !is_alive(pid) {
@@ -459,20 +486,40 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn poll_until_dead_returns_immediately_when_already_dead() {
-        // Use a PID that's guaranteed not to exist. PID 0 is reserved by
-        // the kernel and `kill(0, 0)` semantically means "the current
-        // process group" — would return success and bypass the dead-PID
-        // path. Use a high PID that the kernel hasn't allocated to a real
-        // process; u32::MAX is essentially never assigned (Linux caps PID
-        // at /proc/sys/kernel/pid_max which is typically 4 million).
-        let definitely_dead_pid: u32 = u32::MAX;
-        assert!(
-            !is_alive(definitely_dead_pid),
-            "u32::MAX must not be a live PID — test fixture invariant"
-        );
+        // Spawn `true` (exits instantly), `.wait()` to fully reap, then
+        // use that PID. Post-wait the kernel has cleared the entry so
+        // `kill(pid, 0)` returns ESRCH ("no such process") and
+        // `is_alive` returns false.
+        //
+        // (Naïve `u32::MAX` doesn't work: cast to i32 = -1, and
+        // `kill(-1, 0)` is the POSIX "send to every process you can
+        // signal" semantic — always succeeds, so `is_alive(u32::MAX)`
+        // returns true on Unix.)
+        //
+        // PID-recycling caveat: on busy systems the kernel can reassign
+        // the PID to a new process within microseconds. The test takes
+        // ~ms total wall-clock so recycling is statistically unlikely
+        // but not impossible. If observed flaky on real CI, gate via
+        // the same skip-on-recycle pattern below.
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn `true`");
+        let dead_pid = child.id();
+        let _ = child.wait();
+
+        // If the kernel recycled the PID between wait() and is_alive()
+        // (microsecond race on a busy host), skip rather than emit a
+        // misleading red. Production code never sees this race because
+        // `cleanup_zombie_daemon` calls `poll_until_dead` synchronously
+        // after `libc::kill(_, SIGKILL)` — the target PID is reaped by
+        // its real parent, not the cleanup process.
+        if is_alive(dead_pid) {
+            eprintln!("test fixture: PID {dead_pid} recycled in wait()→is_alive() gap — skipping");
+            return;
+        }
 
         let start = std::time::Instant::now();
-        let result = poll_until_dead(definitely_dead_pid, Duration::from_secs(10));
+        let result = poll_until_dead(dead_pid, Duration::from_secs(10));
         let elapsed = start.elapsed();
 
         assert!(
