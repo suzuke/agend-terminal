@@ -97,6 +97,14 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
         tracing::error!(name, error = %e, "full_delete_instance: task orphan failed");
     }
 
+    // #1018 (C): clear pending dispatch sidecars targeting the deleted
+    // instance. The agent can never deliver `kind=report` so every
+    // sidecar would otherwise fire `dispatch_idle_threshold_exceeded`
+    // noise indefinitely. Best-effort: count is logged inside the
+    // helper; failures are silently swallowed (matches the rest of
+    // this function's cleanup contract).
+    let _ = crate::daemon::dispatch_idle::cleanup_pending_for_instance(home, name);
+
     // Sprint 54 P1-B Bug 1 audit: enumerate every store that still holds
     // the name. If any do, surface a loud error instead of returning
     // success — `auto_start_fleet` revival of a half-deleted instance is

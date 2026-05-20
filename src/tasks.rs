@@ -1340,6 +1340,12 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                         let _ =
                             crate::mcp::handlers::dispatch_hook::clean_empty_init_commits(&wt).ok();
                     }
+                    // #1018 (B): eager cleanup of pending dispatch
+                    // sidecars whose correlation_id matches this
+                    // closed task. Prevents the watchdog from firing
+                    // `dispatch_idle_threshold_exceeded` later for
+                    // work the task board already confirmed done.
+                    let _ = crate::daemon::dispatch_idle::cleanup_pending_for_task_id(home, &id);
                     // #807 Item 1: see create arm note.
                     let task = read_task_record(home, &id).map(|r| record_to_task(&r));
                     serde_json::json!({
@@ -1560,6 +1566,16 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                     return serde_json::json!({
                         "error": format!("event log append_batch failed: {e}")
                     });
+                }
+                // #1018 (B): mirror the `done` arm's cleanup hook for
+                // the `update` arm's done/cancelled transitions.
+                // Done-via-update + cancelled-via-update both close
+                // the task and should clear pending sidecars.
+                if let Some(ref s) = new_status {
+                    if matches!(s.as_str(), "done" | "cancelled") {
+                        let _ =
+                            crate::daemon::dispatch_idle::cleanup_pending_for_task_id(home, &id);
+                    }
                 }
             }
             // #807 Item 1: see create arm note.
