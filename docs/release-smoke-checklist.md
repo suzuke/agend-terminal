@@ -57,6 +57,16 @@ Run one block per backend. Skip a block if the binary is not installed; note it 
 - [ ] **Tool use** — inject `list files in /tmp`; tool affordance fires
 - [ ] **Quit** — inject `/exit` + Enter; pane closes; no orphan `gemini` process
 
+### 1f. Antigravity CLI (`agy`, registered as backend `antigravity-cli`) — #987
+
+Gemini CLI's official successor (Gemini CLI sunsets 2026-06-18 for free / Pro / Ultra tiers). The binary command is `agy`; the fleet display name is `antigravity-cli` (#995).
+
+- [ ] **Spawn** — `agend start --agents agy-smoke:agy` — ready prompt (`Antigravity CLI` banner or `Type your message`) appears within **20 s**; workspace-trust dialog auto-dismissed (#995 dismiss_pattern)
+- [ ] **Echo** — inject `echo hello` + Enter; response visible
+- [ ] **Tool use** — inject `list files in /tmp`; tool affordance fires
+- [ ] **Quit** — inject `/exit` + Enter; pane closes; no orphan `agy` process
+- [ ] **Fleet MCP unsupported notice (#995 Bug 3)** — `app.log` MUST contain a `[fleet-mcp-unsupported]` `tracing::warn` line on this spawn; the spawned agy instance has NO `send` / `inbox` / `task` MCP tools (awaiting upstream `google-antigravity/antigravity-cli#60`). For multi-agent fleet work, prefer the `gemini` backend until upstream lands the fix.
+
 ---
 
 ## 2. Cross-cutting (≤ 5 min)
@@ -85,6 +95,7 @@ Backends tested (paste `<backend> --version` output for each):
 - codex:      <version>
 - opencode:   <version>
 - gemini:     <version>
+- agy:        <version>   # registered as backend `antigravity-cli` per #995
 
 Backends skipped (reason):
 -
@@ -93,4 +104,10 @@ Known deviations / new failures observed:
 -
 
 Overall verdict: [ ] PASS  [ ] PASS with caveats  [ ] FAIL
+```
+
+When all backends pass, the release PR body should also include the one-line confirmation:
+
+```
+Real-backend smoke: ✓ all 6 backends
 ```
