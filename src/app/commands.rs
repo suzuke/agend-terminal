@@ -40,7 +40,13 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
 
             // unique_fleet_name guarantees inst_name is not yet in fleet.yaml
             let inst_name = super::pane_factory::unique_fleet_name(ctx.home, base_name);
-            if let Err(e) = crate::fleet::add_instance_to_yaml(
+            // #966: palette spawn previously bypassed channel-topic creation
+            // (`maybe_create_telegram_topic` at the `Ok(pane)` arm below
+            // creates the BINDING via create_binding, NOT the topic_id-
+            // returning create_topic). Route through
+            // `tui_spawn::add_instance_with_topic` so the topic is created
+            // + topic_id persisted before the spawn proceeds.
+            if let Err(e) = super::tui_spawn::add_instance_with_topic(
                 ctx.home,
                 &inst_name,
                 &crate::fleet::InstanceYamlEntry {
