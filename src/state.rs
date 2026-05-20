@@ -276,15 +276,37 @@ impl StatePatterns {
                     AgentState::Thinking,
                     r"(?i)(Bloviating|Transmuting|Cogitating|Cooked|Brewed|Worked|Cogitated|Crunched|Brewing)|thought for [0-9]+s",
                 ),
-                // tool-name banners like `⏺ Write(...)` in 2.1.98. Previously
-                // only `●` (U+25CF) was in the class, so `⏺ Write(...)` lines
-                // never matched — see docs/archived/FOLLOWUP-tooluse-pattern-gaps.md.
-                // In-flight banners use -ing verbs (`⏺ Listing ...`,
-                // `⏺ Reading ...`) rather than the bare tool name shown on
-                // the completion banner — covered by the alternation below.
+                // #1005 Phase A1: ToolUse = active tool execution, NOT
+                // historical completion record. Pre-fix regex matched
+                // BOTH the braille spinner (`⠋ Listing`) AND the
+                // completion-banner glyphs (`✓ Bash`, `● Read`, `⏺ Write`).
+                // Latter caused priority oscillation against Idle/Ready:
+                // `✓ Bash` stays in scrollback indefinitely → detect()
+                // returns ToolUse → `LATCHED_STATE_EXPIRY` force-expire →
+                // `since=now` reset → next feed re-detects → oscillation.
+                // See issue #1005 + docs/HUNG-STATE-TRANSITIONS.md §F39.3.
+                //
+                // Fix splits the pattern into TWO alternations gated on
+                // glyph-source:
+                //   (a) braille spinner ⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ + any tool verb (bare
+                //       or -ing). The braille glyph is an animation tick —
+                //       only renders while the spinner is ACTIVE. Once the
+                //       tool completes, the spinner stops and braille is
+                //       cleared; no scrollback false-positive surface.
+                //   (b) completion glyphs ✓●⏺ + ONLY -ing verbs
+                //       (Listing|Reading|Writing|Searching|Editing). The
+                //       glyph itself can persist in scrollback, but the
+                //       -ing verb is the in-flight progress shape;
+                //       completion banners use bare verbs (`✓ Bash`,
+                //       `● Read`, `⏺ Write`) which (a) excludes by glyph
+                //       class and (b) excludes by verb shape.
+                //
+                // Real claude 2.1.98 renders `⠋ Listing 1 directory…`
+                // mid-flight; the bare `⏺ Read` form appears only AFTER
+                // tool completion.
                 (
                     AgentState::ToolUse,
-                    r"(?m)^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✓●⏺]\s+(Read|Bash|Edit|Write|Grep|Glob|Listing|Reading|Writing|Searching|Editing)\b",
+                    r"(?m)^(?:[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s+(?:Read|Bash|Edit|Write|Grep|Glob|Listing|Reading|Writing|Searching|Editing)|[✓●⏺]\s+(?:Listing|Reading|Writing|Searching|Editing))\b",
                 ),
                 // [measured] Prompt symbol in idle state
                 (AgentState::Idle, r"❯"),
@@ -335,20 +357,20 @@ impl StatePatterns {
                     AgentState::GitConflict,
                     r"Automatic merge failed; fix conflicts|CONFLICT \(content\)|Resolve all conflicts manually|Failed to merge submodule|Failed to merge in",
                 ),
-                // [measured] Kiro 2.0.1 renders tool banners as
-                // `● Read .`, `● Write <path>`, etc. — `●` (U+25CF BLACK
-                // CIRCLE) + space + capitalized tool verb. Observed in
-                // tests/fixtures/state-replay/kiro-tooluse.raw at byte
-                // ~40960. Placed above Thinking so the tool banner wins
-                // first-match when both a `●` banner and the `Thinking`
-                // spinner coexist on the same screen. The legacy internal
-                // tool-name alternation (`execute_bash` etc.) is retained
-                // for completeness — those strings appear in tool-output
-                // stack traces and may surface during errors.
-                (
-                    AgentState::ToolUse,
-                    r"●\s+(Read|Write|Edit|Bash|Grep|Glob|Task|List|Search)\b|execute_bash|fs_read|fs_write",
-                ),
+                // #1005 Phase A1: drop the `● <Verb>` alternation — `●`
+                // (U+25CF BLACK CIRCLE) is the COMPLETION banner per
+                // dev-2 fixture inspection of kiro-tooluse.raw; matching
+                // it caused the same priority oscillation class as the
+                // claude bug (#1005). Kiro's in-flight indicator is the
+                // `Kiro is working` spinner which fires Thinking (line
+                // below) — no replacement ToolUse pattern needed for the
+                // banner shape.
+                //
+                // Legacy internal tool-name alternation
+                // (`execute_bash|fs_read|fs_write`) preserved — those
+                // strings surface in stack traces and error output, not
+                // in completion banners.
+                (AgentState::ToolUse, r"execute_bash|fs_read|fs_write"),
                 // [measured] Kiro shows "Kiro is working" + "esc to cancel"
                 // during generation. Earlier "Thinking" pattern no longer
                 // matches current kiro-cli versions.
@@ -417,19 +439,21 @@ impl StatePatterns {
                 // [measured] Codex 0.120.0 renders tool-call blocks as a
                 // two-line region — a `•` title line (`• Explored`,
                 // `• Edited`, `• Ran`) followed by a `└` continuation
-                // line carrying the actual tool call (e.g.
-                // `  └ Read README.md`, `  └ Ran apply_patch`). Observed
-                // in codex-tooluse.raw at byte ~40960. Placed above
-                // Thinking so tool blocks win first-match against the
-                // `• Working (...)` spinner that renders concurrently.
-                // Bare `•` is intentionally NOT in the pattern — it also
-                // prefixes assistant narration lines (`• I'm reading
-                // ...`) and would cause false positives. The legacy
-                // `apply_patch` substring is retained for completeness.
-                (
-                    AgentState::ToolUse,
-                    r"└\s+(Read|Write|Edit|List|Bash|Search|Apply|Ran)\b|•\s+(Explored|Edited|Ran)\b|apply_patch",
-                ),
+                // #1005 Phase A1: drop the `└ <Verb>` continuation and
+                // `• <PastTense>` title-line alternations — both are
+                // COMPLETION render forms (the past-tense verbs
+                // `Explored|Edited|Ran` are unambiguously historical;
+                // the `└` continuation lines render under the title
+                // AFTER the tool finishes). Matching them caused the
+                // same priority oscillation class as the claude bug
+                // (#1005). Codex's in-flight indicator is the
+                // `• Working (...)` spinner which fires Thinking — no
+                // replacement ToolUse pattern needed.
+                //
+                // Legacy `apply_patch` substring preserved — that string
+                // surfaces in stack traces / tool-output errors, not in
+                // completion-banner shape.
+                (AgentState::ToolUse, r"apply_patch"),
                 // [measured] Codex shows "◦ Working (Ns • esc to interrupt)"
                 // during generation. Both "Working" and "esc to interrupt"
                 // are stable anchors.
@@ -481,16 +505,18 @@ impl StatePatterns {
                     AgentState::GitConflict,
                     r"Automatic merge failed; fix conflicts|CONFLICT \(content\)|Resolve all conflicts manually|Failed to merge submodule|Failed to merge in",
                 ),
-                // [measured] OpenCode 1.4.0 prefixes tool banners with
-                // `✱` (U+2731 HEAVY ASTERISK, in-flight) or `→` (U+2192,
-                // completed) followed by the tool name — e.g.
-                // `✱ Glob "README.md" (1 match)` and `→ Read README.md`.
-                // Observed in tests/fixtures/state-replay/opencode-tooluse.raw
-                // at byte ~30720 / ~61440. Priority above the Thinking
-                // pattern so active tool use outranks the generic spinner.
+                // #1005 Phase A1: drop the `→` (U+2192, COMPLETED) prefix
+                // from the alternation — keeping only `✱` (U+2731 HEAVY
+                // ASTERISK, in-flight). Pre-fix matched both, causing the
+                // same priority oscillation class as the claude bug
+                // (#1005). The `→ Read README.md` line stays in
+                // scrollback indefinitely after the tool completes —
+                // matching it as ToolUse re-triggers detection on every
+                // screen change, resetting `since` per oscillation bounce
+                // and preventing `LATCHED_STATE_EXPIRY` from ever firing.
                 (
                     AgentState::ToolUse,
-                    r"[✱→]\s+(Read|Write|Edit|Glob|Grep|Bash|List|Task)\b",
+                    r"✱\s+(Read|Write|Edit|Glob|Grep|Bash|List|Task)\b",
                 ),
                 // [measured] OpenCode draws `■⬝⬝⬝⬝⬝⬝⬝  esc interrupt` on
                 // its bottom status bar only while a request is in flight;
@@ -567,19 +593,31 @@ impl StatePatterns {
                     AgentState::GitConflict,
                     r"Automatic merge failed; fix conflicts|CONFLICT \(content\)|Resolve all conflicts manually|Failed to merge submodule|Failed to merge in",
                 ),
-                // [measured] Gemini 0.38.2 renders completed tool calls as
-                // `✓  ReadFile  Cargo.toml` — `✓` (U+2713 CHECK MARK) + a
-                // CamelCase tool name + target. Observed in
-                // tests/fixtures/state-replay/gemini-tooluse.raw at byte
-                // ~143360. Placed above Thinking so the tool banner wins
-                // first-match against the concurrent `⠦ Thinking... (esc
-                // to cancel)` spinner. The existing `tool.*call|MCP.*tool`
-                // alternation is retained for the end-of-session
-                // `Tool Calls: 1` summary and MCP-tool surfaces.
-                (
-                    AgentState::ToolUse,
-                    r"✓\s+(ReadFile|WriteFile|ReadManyFiles|Edit|Shell|WebFetch|Glob|GoogleSearch|MemoryTool|ReadFolder)\b|tool.*call|MCP.*tool",
-                ),
+                // #1005 Phase A1 (CRITICAL): the gemini ToolUse
+                // alternation was REMOVED. `✓` (U+2713 CHECK MARK) is
+                // gemini's COMPLETION marker — every prior match
+                // (`✓ ReadFile Cargo.toml`, etc.) was a historical
+                // completion record, never an active execution. The
+                // legacy `tool.*call|MCP.*tool` substrings (intended for
+                // end-of-session "Tool Calls: 1 ✓ 1" summary + MCP
+                // surfaces) ALSO matched post-completion — and were
+                // broad enough to false-positive on prose / docs / commit
+                // messages.
+                //
+                // Gemini's in-flight indicator is the `⠦ Thinking…
+                // (esc to cancel, Ns)` spinner which fires Thinking
+                // (line below). No replacement ToolUse pattern exists
+                // in gemini's current rendering vocabulary.
+                //
+                // FOLLOW-UP RISK (dev-2 cross-audit flag): the existing
+                // gemini-tooluse.raw fixture does NOT exercise an
+                // in-flight tool-call shape distinct from Thinking. If
+                // gemini 0.38.2+ adds a dedicated in-flight banner we
+                // can detect, capture a new fixture + re-introduce a
+                // narrow ToolUse pattern. Until then, gemini tool calls
+                // surface as Thinking — operationally equivalent for
+                // upstream consumers (active vs idle is the load-bearing
+                // distinction).
                 // [measured] Gemini's spinner line ("⠦ Thinking... (esc to
                 // cancel, Ns)") only renders while a request is in flight and
                 // is overwritten in place when streaming completes. Matching
@@ -1888,15 +1926,21 @@ mod tests {
     }
 
     #[test]
-    fn claude_tooluse_record_glyph_match() {
-        // Claude 2.1.98 prefixes completed-tool banners with `⏺` (U+23FA,
-        // RECORD) — distinct from `●` (U+25CF). Real-PTY recording
-        // claude-perm.raw exhibits `⏺ Write(/tmp/...)` after the user
-        // denies a write; both glyph and verb must be in the pattern for
-        // the state to fire.
+    fn claude_tooluse_record_glyph_completion_does_not_fire_per_1005() {
+        // #1005 Phase A1: `⏺ Write(...)` is the COMPLETED-tool banner
+        // (the test's own original comment said "after the user denies
+        // a write" — the action terminated, the banner is a record).
+        // Pre-fix this fired ToolUse, contributing to the priority
+        // oscillation bug. Re-pinned: bare-verb glyph banners must NOT
+        // fire ToolUse. In-flight uses the -ing form
+        // (`⏺ Writing src/...`) covered by `claude_tooluse_ing_verb_match`.
         let patterns = StatePatterns::for_backend(&Backend::ClaudeCode);
         let detected = patterns.detect("⏺ Write(/tmp/claude-perm-test.txt)");
-        assert_eq!(detected, Some(AgentState::ToolUse));
+        assert_ne!(
+            detected,
+            Some(AgentState::ToolUse),
+            "#1005: `⏺ Write` completion banner must NOT fire ToolUse"
+        );
     }
 
     #[test]
@@ -2321,12 +2365,18 @@ mod tests {
     }
 
     #[test]
-    fn gemini_tooluse_banner_match() {
-        // Gemini 0.38.2 renders completed tool calls as `✓ <ToolName>
-        // <target>`. Observed in gemini-tooluse.raw ~byte 143360.
-        // Byte-level replay cannot surface the transition (Thinking
-        // latches at ~16384 before the banner at ~143360, prio 6 >
-        // prio 5), but production elapsed time clears the min_hold.
+    fn gemini_tooluse_banner_does_not_fire_per_1005() {
+        // #1005 Phase A1: gemini's `✓ <ToolName> <target>` lines ARE
+        // completion records — the `✓` IS the completion marker.
+        // Matching them as ToolUse caused priority oscillation against
+        // Idle (same class as the claude `✓ Bash` bug). Re-pinned:
+        // completion lines must NOT fire ToolUse.
+        //
+        // Follow-up risk acknowledged: gemini-tooluse.raw fixture does
+        // not cover an in-flight tool-call shape distinct from
+        // Thinking. If gemini adds a dedicated in-flight banner we can
+        // detect, capture a new fixture + re-introduce a narrow
+        // ToolUse pattern.
         let patterns = StatePatterns::for_backend(&Backend::Gemini);
         for sample in [
             "   ✓  ReadFile  Cargo.toml",
@@ -2335,46 +2385,73 @@ mod tests {
             "   ✓  Shell  ls -la",
             "   ✓  WebFetch  https://example.com",
         ] {
-            assert_eq!(
+            assert_ne!(
                 patterns.detect(sample),
                 Some(AgentState::ToolUse),
-                "expected ToolUse for {sample:?}"
+                "#1005: gemini `✓` completion line must NOT fire ToolUse: {sample:?}"
             );
         }
     }
 
     #[test]
-    fn codex_tooluse_title_line_match() {
-        // Codex 0.120.0 emits `• Explored|Edited|Ran` as the title of a
-        // tool-output block. Observed in codex-tooluse.raw ~byte 40960.
+    fn codex_tooluse_past_tense_title_does_not_fire_per_1005() {
+        // #1005 Phase A1: `• Explored|Edited|Ran` are past-tense title
+        // lines — unambiguously completion-render. Matching them as
+        // ToolUse caused priority oscillation against Idle/Ready same
+        // as the claude `✓ Bash` bug. Re-pinned: past-tense titles must
+        // NOT fire ToolUse. Codex's in-flight indicator is the
+        // `• Working (...)` spinner which fires Thinking.
         let patterns = StatePatterns::for_backend(&Backend::Codex);
         for sample in ["• Explored", "• Edited", "• Ran"] {
-            assert_eq!(
+            assert_ne!(
                 patterns.detect(sample),
                 Some(AgentState::ToolUse),
-                "expected ToolUse for {sample:?}"
+                "#1005: codex past-tense title `{sample}` is completion record — must NOT fire ToolUse"
             );
         }
     }
 
     #[test]
-    fn codex_tooluse_continuation_line_match() {
-        // Continuation line under the title uses `└` (U+2514) + tool
-        // verb — `└ Read README.md`, `└ Write /tmp/x`, etc.
+    fn codex_tooluse_continuation_line_does_not_fire_per_1005() {
+        // #1005 Phase A1: `└ <Verb>` continuation lines render UNDER a
+        // tool-output block AFTER the tool finishes — completion record,
+        // not active execution. Re-pinned: continuation lines must NOT
+        // fire ToolUse.
+        //
+        // `└ Ran apply_patch` is excluded from the negative list because
+        // the `apply_patch` substring is matched by the LEGACY
+        // alternation (preserved per #1005 Phase A1 rationale: error /
+        // stack-trace surface). That overlap is acceptable — the legacy
+        // pattern is narrow enough (substring-only) that scrollback
+        // false-positive risk is low.
         let patterns = StatePatterns::for_backend(&Backend::Codex);
         for sample in [
             "  └ Read README.md",
             "  └ Write /tmp/out.txt",
             "  └ Edit Cargo.toml",
-            "  └ Ran apply_patch",
             "  └ List src/",
         ] {
-            assert_eq!(
+            assert_ne!(
                 patterns.detect(sample),
                 Some(AgentState::ToolUse),
-                "expected ToolUse for {sample:?}"
+                "#1005: codex `└` continuation `{sample}` is completion record — must NOT fire ToolUse"
             );
         }
+    }
+
+    #[test]
+    fn codex_tooluse_legacy_apply_patch_still_matches() {
+        // Preserve compat: `apply_patch` substring (stack-trace /
+        // tool-output error surface) continues to fire ToolUse. This
+        // legacy alternation was kept across the #1005 Phase A1 cleanup
+        // because the substring appears in error contexts where the
+        // tool DID actively execute and we want the active-state signal.
+        let patterns = StatePatterns::for_backend(&Backend::Codex);
+        assert_eq!(
+            patterns.detect("Error: apply_patch failed at /tmp/foo.txt"),
+            Some(AgentState::ToolUse),
+            "legacy apply_patch substring must still fire ToolUse"
+        );
     }
 
     #[test]
@@ -2454,12 +2531,14 @@ mod tests {
     }
 
     #[test]
-    fn kiro_tooluse_banner_match() {
-        // Kiro 2.0.1 renders tool banners as `● <Verb> <target>` — e.g.
-        // `● Read .`, `● Write /tmp/out`. Observed in kiro-tooluse.raw
-        // around byte 40960; byte-level replay cannot surface the
-        // transition (Thinking fires first at ~25088 and ToolUse prio
-        // is lower), but production elapsed time clears the min_hold.
+    fn kiro_tooluse_banner_does_not_fire_per_1005() {
+        // #1005 Phase A1: kiro's `● <Verb> <target>` banners are
+        // COMPLETION render (dev-2 fixture inspection HIGH-confirmed).
+        // Matching them as ToolUse caused priority oscillation against
+        // Idle, same class as the claude `✓ Bash` bug. Re-pinned:
+        // completion banners must NOT fire ToolUse. Kiro's in-flight
+        // indicator is the `Kiro is working` spinner which fires
+        // Thinking.
         let patterns = StatePatterns::for_backend(&Backend::KiroCli);
         for sample in [
             "● Read .",
@@ -2468,10 +2547,10 @@ mod tests {
             "● Bash ls -la",
             "● Grep TODO src/",
         ] {
-            assert_eq!(
+            assert_ne!(
                 patterns.detect(sample),
                 Some(AgentState::ToolUse),
-                "expected ToolUse for {sample:?}"
+                "#1005: kiro `●` completion banner must NOT fire ToolUse: {sample:?}"
             );
         }
     }
@@ -2645,24 +2724,42 @@ mod tests {
     }
 
     #[test]
-    fn opencode_tooluse_banner_match() {
-        // OpenCode 1.4.0 prefixes tool banners with `✱` (in-flight) or
-        // `→` (completed) followed by the capitalized tool name.
-        // Observed in tests/fixtures/state-replay/opencode-tooluse.raw
-        // at ~30720 and ~61440; byte-level replay cannot surface the
-        // transition (Thinking priority > ToolUse and the spinner fires
-        // first), but production elapsed time clears the min_hold.
+    fn opencode_tooluse_in_flight_banner_still_fires() {
+        // #1005 Phase A1: opencode's `✱ <Verb>` (U+2731 HEAVY ASTERISK,
+        // in-flight) banner KEPT in the ToolUse alternation — it
+        // represents active execution.
         let patterns = StatePatterns::for_backend(&Backend::OpenCode);
         for sample in [
             "   ✱ Glob \"README.md\" (1 match)",
-            "   → Read README.md",
             "   ✱ Write src/lib.rs",
-            "   → Edit Cargo.toml",
+            "   ✱ Read README.md",
+            "   ✱ Edit Cargo.toml",
         ] {
             assert_eq!(
                 patterns.detect(sample),
                 Some(AgentState::ToolUse),
-                "expected ToolUse for {sample:?}"
+                "in-flight banner `{sample}` must fire ToolUse"
+            );
+        }
+    }
+
+    #[test]
+    fn opencode_tooluse_completed_banner_does_not_fire_per_1005() {
+        // #1005 Phase A1: opencode's `→ <Verb>` (U+2192, COMPLETED)
+        // banner DROPPED from the ToolUse alternation. Pre-fix matched
+        // both `✱` and `→`; the `→ Read README.md` line stays in
+        // scrollback after the tool completes, causing the same
+        // priority oscillation class as the claude `✓ Bash` bug.
+        let patterns = StatePatterns::for_backend(&Backend::OpenCode);
+        for sample in [
+            "   → Read README.md",
+            "   → Edit Cargo.toml",
+            "   → Write src/lib.rs",
+        ] {
+            assert_ne!(
+                patterns.detect(sample),
+                Some(AgentState::ToolUse),
+                "#1005: opencode `→` completion banner must NOT fire ToolUse: {sample:?}"
             );
         }
     }
@@ -3251,21 +3348,31 @@ mod tests {
 
     #[test]
     fn claude_tool_banner_at_line_start_triggers_tooluse() {
+        // #1005 Phase A1: bare-verb banners (`⏺ Bash`, `⏺ Read`) are
+        // COMPLETION records, not active execution. They stay on screen
+        // after the tool finishes — matching them as ToolUse caused
+        // priority oscillation against Idle, preventing
+        // `LATCHED_STATE_EXPIRY` from firing. Re-pinned: bare-verb
+        // banners must NOT trigger ToolUse. `-ing` verb banners
+        // (`● Listing`, `⏺ Reading`, etc.) are the in-flight progress
+        // shape and DO still fire ToolUse via the post-#1005
+        // alternation `[✓●⏺]\s+(Listing|Reading|Writing|Searching|Editing)`.
         let patterns = StatePatterns::for_backend(&Backend::ClaudeCode);
-        assert_eq!(
+        assert_ne!(
             patterns.detect("⏺ Bash(echo hi)"),
             Some(AgentState::ToolUse),
-            "line-start tool banner must trigger ToolUse"
+            "#1005: completion banner `⏺ Bash` is historical, not active — must NOT fire ToolUse"
         );
-        assert_eq!(
+        assert_ne!(
             patterns.detect("⏺ Read(README.md)"),
             Some(AgentState::ToolUse),
-            "line-start Read banner must trigger ToolUse"
+            "#1005: completion banner `⏺ Read` is historical, not active — must NOT fire ToolUse"
         );
+        // Glyph + -ing verb = in-flight progress (still active).
         assert_eq!(
             patterns.detect("● Listing files..."),
             Some(AgentState::ToolUse),
-            "spinner + in-flight verb must trigger ToolUse"
+            "completion glyph + in-flight `-ing` verb = active progress, must fire ToolUse"
         );
     }
 

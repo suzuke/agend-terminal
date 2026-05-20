@@ -121,13 +121,19 @@ fixtures:
     # claude pattern that matches the actual 2.1.98 dialog wording
     # (`Esc to cancel · Tab to amend` footer plus `Do you want to …`
     # question). On the final frame the dialog has been dismissed and
-    # only the `⏺ Write(...)` rejection banner remains — detect()
-    # returns ToolUse, but the tracker retains PermissionPrompt (prio
-    # 8) via hysteresis because byte-level replay never crosses the
-    # 2s min_hold required to downgrade to ToolUse (prio 5).
+    # only the `⏺ Write(...)` rejection banner remains.
+    #
+    # #1005 Phase A1 shift: `⏺ Write(...)` is the COMPLETION-banner
+    # form (bare verb after `⏺`) which the post-#1005 ToolUse pattern
+    # explicitly excludes — only `⏺ Writing` (-ing verb) fires ToolUse
+    # for in-flight runs. Final detect() shifted from tool_use → idle
+    # because the `❯` prompt glyph also matches on the final screen.
+    # The tracker retains PermissionPrompt via hysteresis (byte-level
+    # replay never crosses the min_hold) — no behavioral change for
+    # consumers.
     expected_transitions: [starting, idle, permission]
     expected_final_state: permission
-    expected_final_detect: tool_use
+    expected_final_detect: idle
 
   - file: codex-perm.raw
     backend: codex
@@ -138,14 +144,19 @@ fixtures:
     # idle `›` prompt). Without the pattern, the `›` prompt fires Idle,
     # then Thinking from the working spinner, then PermissionPrompt from
     # the approval dialog. After the user cancels, the dialog disappears
-    # and the post-cancel frame shows `• Ran printf ...` / `└ (no output)`,
-    # which the Codex ToolUse pattern matches — hence detect()=tool_use on
-    # the final screen. The tracker retains PermissionPrompt via
-    # hysteresis (byte-level replay cannot cross the 2s/5s min_hold
-    # needed to downgrade from prio 8 to prio 5).
+    # and the post-cancel frame shows `• Ran printf ...` / `└ (no output)`.
+    #
+    # #1005 Phase A1 shift: codex ToolUse pattern narrowed to just
+    # `apply_patch` substring (dropped `└`, `•` past-tense, `└` cont.
+    # alternations — all are completion-render). The post-cancel frame
+    # contains `• Ran printf ...` (past-tense title) which post-#1005
+    # no longer fires ToolUse; the `›` idle prompt now matches first.
+    # Final detect() shifted from tool_use → idle. Tracker retains
+    # PermissionPrompt via hysteresis — no behavioral change for
+    # consumers.
     expected_transitions: [starting, idle, thinking, permission]
     expected_final_state: permission
-    expected_final_detect: tool_use
+    expected_final_detect: idle
 
   # ── Stage 2a ToolUse recordings (2026-04-20) ────────────────────────
   # Every recording below DID exercise a real tool call (verified by
@@ -195,20 +206,21 @@ fixtures:
     cli_version: "0.38.2"
     recorded_on: "2026-04-20"
     scenario: "--yolo mode; prompt 'read package.json' -> gemini reads + replies -> /quit (session summary shows `Tool Calls: 1 ✓ 1`)"
-    # Gemini 0.38.2 in-flight tool banner `✓ ReadFile Cargo.toml` is
-    # now covered by an expanded ToolUse alternation, verified by the
-    # gemini_tooluse_banner_match unit test. Transition sequence
-    # unchanged: the spinner line (`⠦ Thinking... esc to cancel`)
-    # fires at byte ~16384 — well before the first `✓ ReadFile`
-    # banner at ~143360; Thinking (prio 6) > ToolUse (prio 5) and
-    # byte-level replay never crosses the 2s min_hold. Production
-    # reads between PTY chunks clear the hold and the transition
-    # does surface. Final detect() shifted from null → tool_use
-    # because the `✓ ReadFile Cargo.toml` line is still above the
-    # exit summary box on the final 40-row grid.
+    # #1005 Phase A1 shift: gemini's ToolUse alternation was REMOVED
+    # entirely — `✓ <ToolName>` was the COMPLETION marker (every
+    # historical match was a completion record). Tool calls now
+    # surface as Thinking via the spinner (`⠦ Thinking... (esc to
+    # cancel, Ns)`). Final detect() shifted from tool_use → null:
+    # the final 40-row grid no longer matches any ToolUse pattern,
+    # and the visible `/quit` / summary text falls through to no-
+    # match. Transition sequence unchanged.
+    #
+    # FOLLOW-UP: if gemini 0.38.2+ adds a dedicated in-flight tool
+    # banner we can detect distinctly from Thinking, capture a new
+    # fixture + re-introduce a narrow ToolUse pattern.
     expected_transitions: [starting, ready, idle, thinking]
     expected_final_state: thinking
-    expected_final_detect: tool_use
+    expected_final_detect: null
 
   - file: kiro-tooluse.raw
     backend: kiro-cli
