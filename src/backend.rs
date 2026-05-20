@@ -246,8 +246,26 @@ impl Backend {
                 // drawing chars, `>` `)` `(` cursors, digit-bracket choice
                 // rows, etc.) and is length-capped at 8 chars so a long
                 // indent before alpha text cannot match the phrase.
+                // #996 Phase 1: keystroke changed from up+up+Enter to single
+                // Enter. Modern Claude (v2.1.145+) defaults cursor to "Yes,
+                // I trust this folder" (row 1, `❯` marker). The old
+                // up+up+Enter sequence was correct when the prompt
+                // defaulted to "No, exit" but is now actively harmful:
+                // - TRUE positive: navigates AWAY from default-Yes → may
+                //   confirm "No, exit" → Claude exits.
+                // - FALSE positive on operator-quoted content matching
+                //   the anchored regex: up+up+Enter re-submits prior
+                //   history message → message duplication loop (the #996
+                //   bug observed 37× today on fixup-lead pane).
+                // Single `\r` resolves both: true-positive confirms the
+                // default-Yes; false-positive adds a newline (no
+                // destructive blast). Same shape as Agy #995/#997 dismiss.
+                //
+                // `Yes, proceed` deliberately retained on old keystroke
+                // pending empirical verification at follow-up — modal +
+                // default-cursor for that prompt not yet captured.
                 dismiss_patterns: &[
-                    (r"(?m)^[^A-Za-z\n]{0,8}Yes, I trust", b"\x1b[A\x1b[A\r"),
+                    (r"(?m)^[^A-Za-z\n]{0,8}Yes, I trust", b"\r"),
                     (r"(?m)^[^A-Za-z\n]{0,8}Yes, proceed", b"\x1b[A\x1b[A\r"),
                 ],
                 fresh_args: None, // same as args (no resume in preset)
@@ -980,6 +998,34 @@ mod tests {
         assert!(agy.dismiss_patterns[0].0.contains("Yes, I trust"));
         assert_eq!(agy.dismiss_patterns[0].1, b"\r");
         assert_eq!(agy.instructions_path, "AGY.md");
+    }
+
+    /// #996 Phase 1: ClaudeCode `Yes, I trust` dismiss must send a single
+    /// Enter byte (`\r`), NEVER up-arrow sequences. Modern Claude prompts
+    /// (v2.1.145+) default the cursor to "Yes, I trust" — the historical
+    /// up+up+Enter is now actively harmful (navigates away from default,
+    /// or re-submits history on false-positive). Single Enter confirms the
+    /// default-Yes AND adds a non-destructive newline on false-positive.
+    #[test]
+    fn claude_trust_dismiss_uses_single_enter() {
+        let claude = Backend::ClaudeCode.preset();
+        let trust = claude
+            .dismiss_patterns
+            .iter()
+            .find(|(re, _)| re.contains("Yes, I trust"))
+            .expect("ClaudeCode must have a `Yes, I trust` dismiss pattern");
+
+        assert_eq!(
+            trust.1, b"\r",
+            "#996 Phase 1: trust-prompt keystroke must be single Enter"
+        );
+
+        // Negative pin: no ESC bytes allowed — historical up-arrow (\x1b[A)
+        // and any other CSI sequence in the keystroke is a regression.
+        assert!(
+            !trust.1.contains(&0x1b),
+            "#996: trust dismiss keystroke must not contain ESC (0x1b)"
+        );
     }
 
     #[test]

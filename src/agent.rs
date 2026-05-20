@@ -1843,6 +1843,11 @@ mod tests {
     /// Production dismiss regex for kiro-cli's "Trust All Tools" prompt
     /// (Issue #468 follow-up — radio-button cursor `)` was unmatched).
     const KIRO_TRUST_REGEX: &str = r"(?m)^[^A-Za-z\n]{0,8}No, exit";
+    /// Production dismiss regex for Claude's workspace-trust prompt (#996
+    /// Phase 1). Modern Claude (v2.1.145+) defaults cursor to "Yes, I trust",
+    /// so the keystroke shipped is single Enter `\r` — see
+    /// `Backend::ClaudeCode.preset().dismiss_patterns[0]`.
+    const CLAUDE_TRUST_REGEX: &str = r"(?m)^[^A-Za-z\n]{0,8}Yes, I trust";
 
     /// `(regex, keystrokes)` pair for `try_dismiss_dialog` — `Down` then
     /// `Enter` to dismiss kiro-cli's "Trust All Tools" prompt.
@@ -1922,6 +1927,59 @@ I see it in the docs but I'm not sure when Gemini shows it.
         assert!(
             try_dismiss_dialog("t", &screen, &test_writer(), &patterns),
             "VTerm-rendered Gemini dialog must match production regex. Screen:\n{screen}"
+        );
+    }
+
+    /// #996 Phase 1: true Claude workspace-trust prompt — vterm-rendered —
+    /// MUST still match the anchored regex so the dismiss fires. The fix
+    /// changes the keystroke (config-pinned in backend.rs tests) but the
+    /// regex is unchanged. Anti-regression for the dismiss path itself.
+    #[test]
+    fn claude_trust_dismiss_matches_real_modal() {
+        let mut vt = crate::vterm::VTerm::new(120, 30);
+        vt.process(b"\x1b[2J\x1b[H");
+        vt.process(" Accessing workspace:\r\n\r\n /private/tmp/claude-test\r\n\r\n".as_bytes());
+        vt.process(
+            " Quick safety check: Is this a project you created or one you trust?\r\n\r\n"
+                .as_bytes(),
+        );
+        vt.process(" ❯ 1. Yes, I trust this folder\r\n".as_bytes()); // marker on row 1 (default)
+        vt.process("   2. No, exit\r\n".as_bytes());
+        vt.process(" Enter to confirm · Esc to cancel\r\n".as_bytes());
+        let screen = vt.tail_lines(30);
+        // Production keystroke after #996 Phase 1: single Enter.
+        let patterns = vec![(CLAUDE_TRUST_REGEX.to_string(), b"\r".to_vec())];
+        assert!(
+            try_dismiss_dialog("t", &screen, &test_writer(), &patterns),
+            "real Claude trust modal (default-Yes cursor) must still match anchored regex. Screen:\n{screen}"
+        );
+    }
+
+    /// #996 Phase 1: operator-quoted content matching the anchored regex —
+    /// reproduces the exact false-positive class observed today on the
+    /// fixup-lead pane (37 events between 19:46:55-19:53:04 +08). The match
+    /// STILL fires (we don't change the regex), but the production keystroke
+    /// is now `\r` (non-destructive single Enter, pinned in backend.rs
+    /// tests) instead of the historical up+up+Enter (history-resubmit blast).
+    #[test]
+    fn claude_trust_false_positive_quoted_content_still_matches_regex() {
+        // Operator pastes (or daemon-routed message includes) the Agy
+        // trust-prompt example verbatim from issue #995. The leading `>` + ` `
+        // satisfies the `[^A-Za-z\n]{0,8}` anchor → regex matches even
+        // though this is normal conversation content, not a real modal.
+        let screen = "\
+[user] Filing #995 — agy bug. The trust prompt shows:
+> Yes, I trust this folder
+  No, exit
+Should we add a dismiss_pattern?
+[claude] checking the existing patterns now
+";
+        let patterns = vec![(CLAUDE_TRUST_REGEX.to_string(), b"\r".to_vec())];
+        assert!(
+            try_dismiss_dialog("t", screen, &test_writer(), &patterns),
+            "regex anchor (?m)^[^A-Za-z\\n]{{0,8}} matches `> Yes, I trust` mid-conversation — \
+             this is the surface that produced today's 37 false-positives on fixup-lead. \
+             The fix is the keystroke (`\\r`, non-destructive), pinned in backend tests."
         );
     }
 
