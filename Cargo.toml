@@ -127,7 +127,7 @@ iana-time-zone = "0.1.65"
 # Icon::from_rgba natively — do NOT pull the `image` crate. `toml` is
 # for `$AGEND_HOME/tray.toml`; dev-dependencies already list it, so the
 # runtime entry here only adds it to release graphs when `tray` is on.
-tray-icon = { version = "0.22", optional = true }
+tray-icon = { version = "0.24", optional = true }
 tao = { version = "0.35", optional = true }
 toml = { version = "0.8", optional = true }
 
