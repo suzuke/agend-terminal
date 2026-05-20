@@ -403,12 +403,33 @@ enum CaptureAction {
         #[arg(long, default_value = "15")]
         seconds: u64,
     },
-    /// Promote a passive capture to tests/fixtures/<backend>/<scenario>.cap
+    /// Promote a passive capture to tests/fixtures/state-replay/<scenario>.raw
+    /// AND append a v2 MANIFEST.yaml entry. Per #704 sub-task 1 Phase 1a.
     Promote {
         /// Path to a .cap file (produced by AGEND_CAPTURE_FIXTURES=1)
         capture_path: String,
-        /// Scenario name (becomes the file stem in tests/fixtures/)
+        /// Scenario name (becomes the file stem in tests/fixtures/state-replay/)
         scenario_name: String,
+        /// Required: F9 measurement classification per
+        /// docs/F685-FIXTURE-CORPUS.md §F685-CORPUS.6. Valid values:
+        /// `productive_marker_fire`, `productive_silence`,
+        /// `silent_stuck`, `hung`, `real_capture`.
+        #[arg(long)]
+        scenario_kind: String,
+        /// Optional: expected hung classification (e.g. `hung`,
+        /// `not_hung`). Used by --auto-replay for cross-validation.
+        #[arg(long)]
+        expected_hung: Option<String>,
+        /// Optional: one-line scenario description for the MANIFEST
+        /// `scenario` field. Defaults to a placeholder operator can
+        /// edit post-promote.
+        #[arg(long)]
+        scenario_description: Option<String>,
+        /// Optional: cross-check that the scenario_kind's implied
+        /// hung-class matches the operator-supplied --expected-hung.
+        /// WARN-only (promote not reverted).
+        #[arg(long, default_value = "false")]
+        auto_replay: bool,
     },
 }
 
@@ -963,8 +984,29 @@ fn main() -> anyhow::Result<()> {
             CaptureAction::Promote {
                 capture_path,
                 scenario_name,
+                scenario_kind,
+                expected_hung,
+                scenario_description,
+                auto_replay,
             } => {
-                capture::promote_capture(std::path::Path::new(&capture_path), &scenario_name)?;
+                let kind: capture::PromoteScenarioKind = scenario_kind.parse().map_err(|_| {
+                    anyhow::anyhow!(
+                        "invalid --scenario-kind {scenario_kind:?}; \
+                         valid values: productive_marker_fire, \
+                         productive_silence, silent_stuck, hung, real_capture"
+                    )
+                })?;
+                let opts = capture::PromoteOptions {
+                    scenario_kind: kind,
+                    expected_hung: expected_hung.as_deref(),
+                    scenario_description: scenario_description.as_deref(),
+                    auto_replay,
+                };
+                capture::promote_capture(
+                    std::path::Path::new(&capture_path),
+                    &scenario_name,
+                    &opts,
+                )?;
             }
         },
         Some(Commands::Verify {
