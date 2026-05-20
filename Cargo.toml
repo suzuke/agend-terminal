@@ -121,7 +121,7 @@ unicode-width = "0.2"
 which = "8"
 sysinfo = "0.39"
 # Crypto-grade random for API-connection cookie (P1-10)
-getrandom = "0.3"
+getrandom = "0.4"
 iana-time-zone = "0.1.65"
 # Menu-bar / system-tray (feature = "tray"). tray-icon loads PNG via
 # Icon::from_rgba natively — do NOT pull the `image` crate. `toml` is
