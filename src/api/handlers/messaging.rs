@@ -326,6 +326,45 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
                     "#870 auto_release: enqueue failed (verdict delivery unaffected)"
                 );
             }
+
+            // #972: ALSO record VERIFIED into pr_state aggregator. Best-
+            // effort; pr_state looks up task → branch and updates any
+            // matching pr_state file. If no file exists yet (CI hasn't
+            // fired on this branch), the verdict is dropped silently —
+            // auto_release still handles worktree release. v2 may
+            // persist orphan verdicts in a sidecar.
+            crate::daemon::pr_state::record_verdict(
+                ctx.home,
+                task_id,
+                from,
+                msg.reviewed_head.as_deref(),
+                crate::daemon::pr_state::VerdictKind::Verified,
+            );
+        }
+    }
+
+    // #972: REJECTED / UNVERIFIED verdicts also feed pr_state (no
+    // auto_release side effect — those keep the worktree bound for
+    // dev iteration). Tight predicates mirror is_verdict_message.
+    if msg.kind.as_deref() == Some("report") && msg.correlation_id.is_some() {
+        let text = msg.text.trim_start();
+        let task_id = msg.correlation_id.as_deref().unwrap_or("");
+        if text.starts_with("REJECTED") {
+            crate::daemon::pr_state::record_verdict(
+                ctx.home,
+                task_id,
+                from,
+                msg.reviewed_head.as_deref(),
+                crate::daemon::pr_state::VerdictKind::Rejected { reason: None },
+            );
+        } else if text.starts_with("UNVERIFIED") {
+            crate::daemon::pr_state::record_verdict(
+                ctx.home,
+                task_id,
+                from,
+                msg.reviewed_head.as_deref(),
+                crate::daemon::pr_state::VerdictKind::Unverified,
+            );
         }
     }
 

@@ -20,6 +20,7 @@ pub(crate) mod mcp_registry_watcher;
 pub(crate) mod notification_dedup;
 pub(crate) mod per_tick;
 pub(crate) mod poll_reminder;
+pub(crate) mod pr_state;
 pub(crate) mod restart;
 pub(crate) mod router;
 pub(crate) mod supervisor;
@@ -630,6 +631,14 @@ fn run_core(
         Box::new(per_tick::SnapshotRotationHandler::new()),
         Box::new(per_tick::CheckSchedulesHandler::new()),
         Box::new(per_tick::CiWatchPollHandler::new()),
+        // #972: pr_state scanner runs AFTER ci_watch_poll so any CI
+        // ingestion that fired this tick can be turned into emitted
+        // events in the same tick. Drains pr-state/*.json, emits
+        // [pr-ready-for-merge] / [pr-merged] / [pr-closed-unmerged]
+        // / [pr-state-invalidated] events to PR authors, sweeps
+        // terminal-state files. Cheap (file walk + json parse) when
+        // no PRs are in flight.
+        Box::new(per_tick::PrStateScanHandler::new()),
         Box::new(per_tick::InboxMaintenanceHandler::new(60)),
         Box::new(per_tick::PollReminderHandler::new(30)),
         // #914 hourly cleanup: 10s tick × 360 = 3600s. Hard backstop on

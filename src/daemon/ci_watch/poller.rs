@@ -1129,6 +1129,29 @@ async fn ci_check_repo(
                         drop(reg);
                     }
                 }
+
+                // #972: ALSO record the conclusion into pr_state aggregator.
+                // The legacy next_after_ci chain stays (dev→reviewer
+                // semantic); pr_state owns reviewer→author once VERIFIED
+                // also lands. Fire on every observed conclusion so
+                // pr_state's state machine sees Failed → NotReady too.
+                let last_conclusion = aggregate_conclusion_for_sha(&runs, current_sha);
+                let conclusion = match last_conclusion {
+                    Some("success") => crate::daemon::pr_state::CiConclusion::Green,
+                    Some(other) => {
+                        crate::daemon::pr_state::CiConclusion::Failed { conclusion: other }
+                    }
+                    None => crate::daemon::pr_state::CiConclusion::Pending,
+                };
+                let subscribers = crate::daemon::ci_watch::parse_subscribers(&watch);
+                crate::daemon::pr_state::record_ci_result(
+                    home,
+                    repo,
+                    branch,
+                    current_sha,
+                    conclusion,
+                    subscribers,
+                );
             }
         }
     }
