@@ -985,7 +985,13 @@ fn flush_idle_notifications(home: &Path, layout: &mut Layout) {
             };
             let agent_name = pane.agent_name.clone();
             flush_notifications_for_pane(home, pane, |text| {
-                crate::inbox::inject_notification(home, &agent_name, text)
+                // #982 RC: queue contents come from compose_aware_*
+                // which would have submit-injected on the immediate-
+                // idle path. The flush must preserve that contract or
+                // queued hints (e.g. `[AGEND-MSG-PENDING]`) land in
+                // the prompt buffer without the backend submit_key —
+                // codex one-shots silently drop the wake.
+                crate::inbox::inject_notification_with_submit(home, &agent_name, text)
             });
         }
     }
@@ -1102,6 +1108,52 @@ mod tests {
             selection: None,
             source: PaneSource::Local,
         }
+    }
+
+    /// #982 RC wiring-pin: assert `flush_idle_notifications` invokes
+    /// `inbox::inject_notification_with_submit` (NOT the raw
+    /// `inject_notification`) so queued hints get the backend
+    /// submit_key applied on flush.
+    ///
+    /// Tested via source inspection: the function's closure literal is
+    /// stable enough that asserting on its substring is a sound pin.
+    /// If a future refactor moves the closure body (e.g. abstracts the
+    /// injector), the test must be updated alongside to keep the pin
+    /// honest.
+    #[test]
+    fn flush_idle_notifications_wired_to_submit_aware_inject() {
+        let source = std::fs::read_to_string("src/app/mod.rs")
+            .or_else(|_| std::fs::read_to_string("agend-terminal/src/app/mod.rs"))
+            .expect("source file must be readable from test cwd");
+        assert!(
+            source.contains("inject_notification_with_submit"),
+            "flush_idle_notifications must wire the submit-aware injector \
+             (#982 reviewer #999 verdict) — searched for \
+             'inject_notification_with_submit' in src/app/mod.rs"
+        );
+        // Anti-regression: confirm the raw path is NOT used inside
+        // flush_idle_notifications. We look for the function name
+        // co-located in the same function body — the substring
+        // `flush_idle_notifications` + the next 800 chars should
+        // contain only the with_submit variant.
+        let needle = "fn flush_idle_notifications(";
+        let idx = source
+            .find(needle)
+            .expect("flush_idle_notifications definition must exist");
+        let body_end = source[idx..]
+            .find("}\n")
+            .map(|e| idx + e)
+            .unwrap_or(source.len());
+        let body = &source[idx..body_end];
+        assert!(
+            body.contains("inject_notification_with_submit"),
+            "flush_idle_notifications body must reference inject_notification_with_submit"
+        );
+        assert!(
+            !body.contains("inject_notification(home,"),
+            "flush_idle_notifications body must NOT call raw inject_notification \
+             (would strand composing-window hints without submit_key)"
+        );
     }
 
     #[test]
