@@ -510,18 +510,29 @@ impl StatePatterns {
                     AgentState::GitConflict,
                     r"Automatic merge failed; fix conflicts|CONFLICT \(content\)|Resolve all conflicts manually|Failed to merge submodule|Failed to merge in",
                 ),
-                // #1005 Phase A1: drop the `→` (U+2192, COMPLETED) prefix
-                // from the alternation — keeping only `✱` (U+2731 HEAVY
-                // ASTERISK, in-flight). Pre-fix matched both, causing the
-                // same priority oscillation class as the claude bug
-                // (#1005). The `→ Read README.md` line stays in
-                // scrollback indefinitely after the tool completes —
-                // matching it as ToolUse re-triggers detection on every
-                // screen change, resetting `since` per oscillation bounce
-                // and preventing `LATCHED_STATE_EXPIRY` from ever firing.
+                // OpenCode 1.4.0 tool-banner markers:
+                // - `✱` (U+2731 HEAVY ASTERISK, in-flight bare verb) —
+                //   e.g. `✱ Glob "README.md" (1 match)`. The `→` (U+2192,
+                //   COMPLETED) form was DROPPED by #1005 Phase A1 (#1009)
+                //   to close the priority-oscillation class (`→ Read
+                //   README.md` lingered in scrollback, kept re-firing
+                //   ToolUse on every screen change, blocked
+                //   `LATCHED_STATE_EXPIRY`).
+                // - `~` (TILDE, in-flight `-ing` verb form) — e.g.
+                //   `~ Reading file...`. Captured at byte ~30720 of
+                //   tests/fixtures/state-replay/opencode-tooluse.raw.
+                //   #1005 Phase A2 companion (this PR, dev-2): adds the
+                //   `~ -ing` alternation branch after fixture inspection
+                //   during the A1 cross-audit surfaced the false-negative
+                //   — pre-A2 `[✱→]\s+(Read|...)` (and post-A1 just `✱`)
+                //   missed sessions that sustained `~ Reading…` without
+                //   firing `✱`, so they never entered ToolUse.
+                //
+                // Priority above the Thinking pattern so active tool use
+                // outranks the generic spinner.
                 (
                     AgentState::ToolUse,
-                    r"✱\s+(Read|Write|Edit|Glob|Grep|Bash|List|Task)\b",
+                    r"✱\s+(Read|Write|Edit|Glob|Grep|Bash|List|Task)\b|~\s+(Reading|Writing|Editing|Searching|Listing|Globbing|Grepping)\b",
                 ),
                 // [measured] OpenCode draws `■⬝⬝⬝⬝⬝⬝⬝  esc interrupt` on
                 // its bottom status bar only while a request is in flight;
@@ -850,6 +861,20 @@ pub struct StateTracker {
     /// construction from `Backend::should_anchor_on_red()`. When
     /// false, the anchor gate fails open (pre-#919 behavior).
     anchor_on_red: bool,
+    /// #1005 Phase A2: most-recent priority-up transition target +
+    /// timestamp. Set on every successful priority-up in `transition()`.
+    /// Cleared (set to None) on explicit Ready / lower-priority drops
+    /// that complete the natural state cycle.
+    ///
+    /// The oscillation guard reads this to detect the
+    /// `Active(X) → Lower(Y) [<5s] → Active(X)` bounce pattern that
+    /// makes `LATCHED_STATE_EXPIRY` (30s) unreachable. When the same
+    /// active state is re-entered within `oscillation_guard_window()`
+    /// (default 30s, env-tunable) AND the lower state was held for
+    /// less than `OSCILLATION_LOWER_HOLD_THRESHOLD` (5s), the
+    /// transition is suppressed and the tracker stays in the lower
+    /// state — letting the natural latched-expiry path eventually fire.
+    last_priority_up_into: Option<(AgentState, Instant)>,
 }
 
 // ── #919 Phase A: raw-chunk ring + red-ANSI anchor ──────────────────────
@@ -893,6 +918,23 @@ const ANCHOR_WINDOW_BYTES: usize = 200;
 /// Anchor freshness window (Duration) — chunks older than this are
 /// ignored by the anchor check.
 const ANCHOR_WINDOW_MS: Duration = Duration::from_secs(30);
+
+/// #1005 Phase A2: window inside which a `Lower→Active(X)→Lower→Active(X)`
+/// bounce is treated as oscillation. Default 30s — matches
+/// `StateTracker::LATCHED_STATE_EXPIRY` so the guard's protection
+/// covers the same horizon as the latched-state expiry it backstops.
+///
+/// Operator-tunable via `AGEND_OSCILLATION_GUARD_WINDOW_SECS=<N>`.
+/// Set to `0` to effectively disable (no bounce ever falls within
+/// a zero-duration window).
+fn oscillation_guard_window() -> Duration {
+    const DEFAULT_SECS: u64 = 30;
+    let secs = std::env::var("AGEND_OSCILLATION_GUARD_WINDOW_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SECS);
+    Duration::from_secs(secs)
+}
 
 /// HIGH_FP states require the red-SGR anchor before transitioning.
 /// Per #919 spike + dev-2 cross-audit:
@@ -992,8 +1034,19 @@ impl StateTracker {
     ///
     /// F39: expiry effectiveness depends on `since` actually elapsing —
     /// Scenario C oscillation can keep `since` recent. See
-    /// `docs/HUNG-STATE-TRANSITIONS.md §F39.2`.
+    /// `docs/HUNG-STATE-TRANSITIONS.md §F39.2`. #1005 Phase A2 closes
+    /// this gap via the oscillation guard at `transition()`.
     const LATCHED_STATE_EXPIRY: Duration = Duration::from_secs(30);
+
+    /// #1005 Phase A2: minimum hold in the lower-priority state before
+    /// a priority-up back into the previous active state is allowed.
+    /// If the lower-state was held less than this, the priority-up is
+    /// treated as part of an oscillation cycle and suppressed.
+    ///
+    /// Chosen at 5s: matches `min_hold` for passive states (5s for
+    /// Idle/Ready), so legitimate "user briefly idle then activity"
+    /// transitions still go through.
+    const OSCILLATION_LOWER_HOLD_THRESHOLD: Duration = Duration::from_secs(5);
 
     /// Max time `InteractivePrompt` / `PermissionPrompt` may stay latched
     /// after its trigger pattern stops matching. Longer than
@@ -1050,6 +1103,10 @@ impl StateTracker {
             // KiroCli), false for Shell/Raw — see
             // `Backend::should_anchor_on_red`.
             anchor_on_red: backend.is_some_and(|b| b.should_anchor_on_red()),
+            // #1005 A2: oscillation guard starts unarmed — first
+            // legitimate priority-up records into it; subsequent
+            // priority-ups within the window check against it.
+            last_priority_up_into: None,
         }
     }
 
@@ -1388,8 +1445,50 @@ impl StateTracker {
 
             // Higher priority always transitions
             if new_state.priority() > self.current.priority() {
+                // #1005 Phase A2: oscillation guard. Suppress priority-up
+                // back into the SAME self-expiring latched state we just
+                // left briefly. This is the
+                // `ToolUse(2s) → Idle(2s) → ToolUse(2s)` bounce that
+                // keeps `since` recent and blocks `LATCHED_STATE_EXPIRY`
+                // (30s) from firing (Scenario C of §F39). Scoped to
+                // {Thinking, ToolUse} — the exact set
+                // `maybe_expire_latched_state` targets. Operator-driven
+                // dialogs (InteractivePrompt / PermissionPrompt) and
+                // error states are deliberately OUT of scope: those
+                // have legitimate re-entry semantics (operator dismiss
+                // then re-prompt) and their own recovery paths.
+                let now = Instant::now();
+                let guard_applies = matches!(new_state, AgentState::Thinking | AgentState::ToolUse);
+                if guard_applies {
+                    if let Some((prev_target, prev_at)) = self.last_priority_up_into {
+                        let bouncing_to_same = prev_target == new_state;
+                        let within_window = now
+                            .checked_duration_since(prev_at)
+                            .is_some_and(|d| d < oscillation_guard_window());
+                        let lower_held_briefly = held < Self::OSCILLATION_LOWER_HOLD_THRESHOLD;
+                        if bouncing_to_same && within_window && lower_held_briefly {
+                            tracing::debug!(
+                                target: "oscillation_guard",
+                                agent = %self.instance_name,
+                                backend = %self.backend_name,
+                                state = ?new_state,
+                                lower_held_ms = held.as_millis() as u64,
+                                window_age_ms = now
+                                    .duration_since(prev_at)
+                                    .as_millis() as u64,
+                                "#1005 priority-up suppressed: bounce pattern detected"
+                            );
+                            // Stay in current lower state. Do NOT update
+                            // `last_priority_up_into` — the entry that
+                            // armed the guard is still the canonical
+                            // record for this window.
+                            return;
+                        }
+                    }
+                    self.last_priority_up_into = Some((new_state, now));
+                }
                 self.current = new_state;
-                self.since = Instant::now();
+                self.since = now;
             } else if held >= min_hold {
                 // Lower priority only after min hold
                 self.current = new_state;
@@ -1633,6 +1732,202 @@ mod tests {
         let mut t = tracker_at(&backend, AgentState::Idle, 0);
         t.transition(AgentState::Thinking);
         assert_eq!(t.get_state(), AgentState::Thinking);
+    }
+
+    // ── #1005 Phase A2: oscillation guard ─────────────────────────────────
+    //
+    // All tests in this section read `oscillation_guard_window()` which
+    // peeks `AGEND_OSCILLATION_GUARD_WINDOW_SECS`. The env-disable test
+    // (oscillation_guard_window_env_disable) flips the var temporarily,
+    // so every other test in this section is marked `#[serial]` to
+    // prevent cross-test env-var bleed when cargo test runs them in
+    // parallel.
+
+    /// Phase A2 core invariant: when a priority-up to active state X is
+    /// followed within `OSCILLATION_LOWER_HOLD_THRESHOLD` (5s) by another
+    /// priority-up to the SAME X, the second one is SUPPRESSED. Without
+    /// the guard the cycle `ToolUse(2s) → Idle(2s) → ToolUse(2s)` keeps
+    /// `since` recent and `LATCHED_STATE_EXPIRY` (30s) never fires —
+    /// tracker stays stuck on ToolUse indefinitely (the #1005 surface).
+    #[test]
+    #[serial_test::serial]
+    fn oscillation_guard_suppresses_quick_bounce_to_same_active_state() {
+        let backend = Backend::ClaudeCode;
+
+        // Step 1: legitimate Idle → ToolUse priority-up (first entry,
+        // guard unarmed). Guard records `(ToolUse, t0)` on success.
+        let mut t = tracker_at(&backend, AgentState::Idle, 0);
+        t.transition(AgentState::ToolUse);
+        assert_eq!(t.get_state(), AgentState::ToolUse);
+        assert!(t.last_priority_up_into.is_some());
+
+        // Step 2: ToolUse held 3s (≥ 2s active min_hold). Pattern
+        // detects Idle (lower priority) — natural priority-down fires.
+        t.since = Instant::now() - Duration::from_secs(3);
+        t.transition(AgentState::Idle);
+        assert_eq!(t.get_state(), AgentState::Idle);
+
+        // Step 3: Idle held only 1s (< 5s OSCILLATION_LOWER_HOLD_THRESHOLD).
+        // ToolUse pattern matches again (scrollback `✓ Bash` banner).
+        // Guard MUST suppress the priority-up — operator sees tracker
+        // settle in Idle instead of bouncing back into ToolUse.
+        t.since = Instant::now() - Duration::from_secs(1);
+        t.transition(AgentState::ToolUse);
+        assert_eq!(
+            t.get_state(),
+            AgentState::Idle,
+            "#1005 A2: priority-up to ToolUse within 5s of Idle entry MUST be suppressed"
+        );
+    }
+
+    /// Phase A2 negative-pin: when the lower state was held for ≥ 5s,
+    /// the next priority-up is LEGITIMATE (operator was idle then
+    /// resumed real work) and MUST fire normally. Distinguishes the
+    /// bounce-cycle from natural activity gaps.
+    #[test]
+    #[serial_test::serial]
+    fn oscillation_guard_does_not_suppress_legitimate_re_entry() {
+        let backend = Backend::ClaudeCode;
+
+        let mut t = tracker_at(&backend, AgentState::Idle, 0);
+        t.transition(AgentState::ToolUse);
+        // Held 3s, then natural drop to Idle
+        t.since = Instant::now() - Duration::from_secs(3);
+        t.transition(AgentState::Idle);
+        // Held Idle for ≥ 5s — legitimate work pause
+        t.since = Instant::now() - Duration::from_secs(6);
+        t.transition(AgentState::ToolUse);
+        assert_eq!(
+            t.get_state(),
+            AgentState::ToolUse,
+            "#1005 A2: priority-up after ≥ 5s lower-state hold is legitimate, must fire"
+        );
+    }
+
+    /// Phase A2 window expiry: outside `oscillation_guard_window()`
+    /// (default 30s), the prior priority-up record is stale and the
+    /// guard no longer applies — the original problem space already
+    /// elapsed naturally.
+    #[test]
+    #[serial_test::serial]
+    fn oscillation_guard_does_not_suppress_after_window() {
+        let backend = Backend::ClaudeCode;
+
+        let mut t = tracker_at(&backend, AgentState::Idle, 0);
+        t.transition(AgentState::ToolUse);
+        // Manually age the priority-up record past the window
+        let stale = Instant::now() - Duration::from_secs(35);
+        t.last_priority_up_into = Some((AgentState::ToolUse, stale));
+        // Drop to Idle, hold briefly, try priority-up again
+        t.current = AgentState::Idle;
+        t.since = Instant::now() - Duration::from_secs(1);
+        t.transition(AgentState::ToolUse);
+        assert_eq!(
+            t.get_state(),
+            AgentState::ToolUse,
+            "#1005 A2: stale priority-up record (>30s old) must not suppress new re-entry"
+        );
+    }
+
+    /// Phase A2 cross-state independence: a priority-up to a DIFFERENT
+    /// active state isn't a bounce — bouncing between Thinking and
+    /// ToolUse is legitimate task progression, not oscillation.
+    #[test]
+    #[serial_test::serial]
+    fn oscillation_guard_does_not_suppress_different_active_state() {
+        let backend = Backend::ClaudeCode;
+
+        let mut t = tracker_at(&backend, AgentState::Idle, 0);
+        t.transition(AgentState::ToolUse);
+        t.since = Instant::now() - Duration::from_secs(3);
+        t.transition(AgentState::Idle);
+        t.since = Instant::now() - Duration::from_secs(1);
+        // Different active state — Thinking, not ToolUse
+        t.transition(AgentState::Thinking);
+        assert_eq!(
+            t.get_state(),
+            AgentState::Thinking,
+            "#1005 A2: priority-up to a DIFFERENT active state must not be suppressed"
+        );
+    }
+
+    /// Phase A2 multi-tick simulation: the #1005 issue's actual cycle
+    /// pattern. Without the guard, this loop sticks at ToolUse forever
+    /// (LATCHED_STATE_EXPIRY never reachable because `since` resets on
+    /// every bounce). With the guard, the second priority-up to
+    /// ToolUse is suppressed and the tracker settles in Idle.
+    #[test]
+    #[serial_test::serial]
+    fn oscillation_guard_multi_cycle_settles_in_idle() {
+        let backend = Backend::ClaudeCode;
+        let mut t = tracker_at(&backend, AgentState::Idle, 0);
+
+        // Cycle 1: Idle → ToolUse → Idle (each leg held briefly)
+        t.transition(AgentState::ToolUse);
+        t.since = Instant::now() - Duration::from_secs(2);
+        t.transition(AgentState::Idle);
+        t.since = Instant::now() - Duration::from_secs(2);
+
+        // Cycle 2: try to re-enter ToolUse (bounce) — must be suppressed
+        t.transition(AgentState::ToolUse);
+        assert_eq!(t.get_state(), AgentState::Idle, "cycle 2 bounce");
+
+        // Cycle 3: more attempts — still suppressed while within window
+        t.since = Instant::now() - Duration::from_secs(2);
+        t.transition(AgentState::ToolUse);
+        assert_eq!(t.get_state(), AgentState::Idle, "cycle 3 bounce");
+
+        // Cycle 4: still in window — still suppressed
+        t.since = Instant::now() - Duration::from_secs(2);
+        t.transition(AgentState::ToolUse);
+        assert_eq!(t.get_state(), AgentState::Idle, "cycle 4 bounce");
+    }
+
+    /// Phase A2 env tunable: `AGEND_OSCILLATION_GUARD_WINDOW_SECS=0`
+    /// effectively disables the guard. Operators who experience
+    /// false-suppression can opt out.
+    #[test]
+    #[serial_test::serial]
+    fn oscillation_guard_window_env_disable() {
+        // SAFETY: only set + remove the env var around this test.
+        // serial_test ensures no concurrent test races.
+        unsafe { std::env::set_var("AGEND_OSCILLATION_GUARD_WINDOW_SECS", "0") };
+        assert_eq!(oscillation_guard_window(), Duration::from_secs(0));
+
+        let backend = Backend::ClaudeCode;
+        let mut t = tracker_at(&backend, AgentState::Idle, 0);
+        t.transition(AgentState::ToolUse);
+        t.since = Instant::now() - Duration::from_secs(3);
+        t.transition(AgentState::Idle);
+        t.since = Instant::now() - Duration::from_secs(1);
+        // With window=0, no priority-up record falls within the window
+        // → guard cannot trigger → bounce goes through.
+        t.transition(AgentState::ToolUse);
+        assert_eq!(
+            t.get_state(),
+            AgentState::ToolUse,
+            "#1005 A2: window=0 must disable the guard"
+        );
+
+        unsafe { std::env::remove_var("AGEND_OSCILLATION_GUARD_WINDOW_SECS") };
+    }
+
+    /// Phase A2 companion (#1005 dev-2 fixture finding): opencode's
+    /// in-flight `~ Reading file...` banner must match ToolUse. Pre-A2
+    /// the alternation `[✱→]\s+(Read|...)` missed this form so a
+    /// session that sustained `~ Reading…` without firing `✱`/`→`
+    /// never entered ToolUse. Fixture: opencode-tooluse.raw byte ~30720.
+    #[test]
+    #[serial_test::serial]
+    fn opencode_tilde_dash_ing_matches_tooluse() {
+        let backend = Backend::OpenCode;
+        let mut t = tracker_at(&backend, AgentState::Ready, 6);
+        t.feed("~ Reading file...");
+        assert_eq!(
+            t.get_state(),
+            AgentState::ToolUse,
+            "#1005 A2: opencode in-flight `~ Reading…` banner must match ToolUse"
+        );
     }
 
     #[test]
