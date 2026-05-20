@@ -1,13 +1,23 @@
-//! agend-mcp-bridge — zero-state stdio↔TCP relay for MCP tool calls.
+//! agend-mcp-bridge — near-zero-state stdio↔TCP relay for MCP tool calls.
 //!
 //! Sprint 25 P0 Option F: this binary is spawned by agent backends as
-//! their MCP server. It holds NO state — every `tools/call` request is
-//! forwarded to the daemon API socket which dispatches via `handle_tool`
-//! in daemon process context (where ACTIVE_CHANNEL, heartbeat_pair,
-//! etc. are registered).
+//! their MCP server. Almost every `tools/call` request is forwarded to
+//! the daemon API socket which dispatches via `handle_tool` in daemon
+//! process context (where ACTIVE_CHANNEL, heartbeat_pair, etc. are
+//! registered).
 //!
 //! MCP protocol methods (initialize, ping, tools/list, notifications)
 //! are handled locally — they don't need daemon state.
+//!
+//! Bridge-side session state (#1000): a single `RecentCall` tracks the
+//! most recent `tools/call` per bridge process. When the LLM hallucinates
+//! a duplicate tool call in the same turn (same tool + identical args
+//! within 500 ms), the second call is dropped at the bridge with a
+//! success-with-`note` response. This is NOT a logical-request dedup
+//! (`src/api/request_dedup.rs` handles that via UUIDv4 `request_id`),
+//! it's a content-level guard for upstream LLM-side double-fire.
+//! Daemon's append-only inbox contract is preserved — the daemon never
+//! sees the second call.
 //!
 //! Protocol:
 //! - stdin/stdout: NDJSON JSON-RPC (MCP spec, one JSON object per line)
@@ -16,6 +26,38 @@
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+/// Window for bridge-side `tools/call` content-dedup (#1000). Empirically
+/// the LLM double-fire produces calls within ~84 ms of each other; 500 ms
+/// is a generous buffer that still excludes any human-paced retry.
+const CONTENT_DEDUP_WINDOW: Duration = Duration::from_millis(500);
+
+/// Most-recently-seen `tools/call` in the current bridge session.
+/// Used by `is_duplicate_call` to suppress LLM-side double-fire.
+#[derive(Debug, Clone)]
+struct RecentCall {
+    tool: String,
+    args: serde_json::Value,
+    at: Instant,
+}
+
+/// Returns `true` when the incoming `(tool, args, now)` is a duplicate
+/// of `last` within `window`. Pure-function design (no `Instant::now()`
+/// internally) so tests can inject deterministic timestamps.
+fn is_duplicate_call(
+    last: Option<&RecentCall>,
+    tool: &str,
+    args: &serde_json::Value,
+    now: Instant,
+    window: Duration,
+) -> bool {
+    last.is_some_and(|l| {
+        l.tool == tool
+            && &l.args == args
+            && now.checked_duration_since(l.at).is_some_and(|d| d < window)
+    })
+}
 
 fn main() {
     if let Err(e) = run() {
@@ -33,6 +75,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Lazy persistent TCP connection to daemon API.
     let mut conn: Option<(BufReader<TcpStream>, TcpStream)> = None;
+
+    // #1000: bridge-side content-dedup state. Single most-recent
+    // `tools/call` is enough — LLM double-fire shows up as consecutive
+    // identical calls within ms, not as a sliding-window pattern.
+    let mut last_call: Option<RecentCall> = None;
 
     loop {
         let body = match read_message(&mut reader)? {
@@ -90,21 +137,77 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "tools/call" => {
                 let tool = req["params"]["name"].as_str().unwrap_or("");
                 let args = &req["params"]["arguments"];
+                let now = Instant::now();
 
-                match proxy_tool_call(&home, &instance, tool, args, &mut conn) {
-                    Ok(result) => serde_json::json!({
+                // #1000: drop LLM-side double-fire BEFORE proxying to
+                // daemon. The dropped call gets a success-with-`note`
+                // response so the LLM's tool-call loop completes cleanly;
+                // operators see the drop via the eprintln warning.
+                if is_duplicate_call(last_call.as_ref(), tool, args, now, CONTENT_DEDUP_WINDOW) {
+                    eprintln!(
+                        "agend-mcp-bridge: dropped duplicate tool call '{tool}' within {}ms",
+                        CONTENT_DEDUP_WINDOW.as_millis()
+                    );
+                    let dropped = serde_json::json!({
                         "jsonrpc": "2.0", "id": id,
                         "result": {
-                            "content": [{"type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default()}],
-                            "isError": result.get("error").is_some()
+                            "content": [{
+                                "type": "text",
+                                "text": "{\"status\":\"ok\",\"note\":\"duplicate tool call dropped by bridge\"}"
+                            }],
+                            "isError": false
                         }
-                    }).to_string(),
+                    })
+                    .to_string();
+                    write_message(&mut stdout, &dropped)?;
+                    // Refresh the dedup-window anchor — successive
+                    // double-fires within the same turn keep getting
+                    // dropped instead of one slipping through after the
+                    // first window expires. Safe because the original
+                    // record was seeded from a confirmed-forwarded call
+                    // (see Ok branch below) — propagation of validity.
+                    last_call = Some(RecentCall {
+                        tool: tool.to_string(),
+                        args: args.clone(),
+                        at: now,
+                    });
+                    continue;
+                }
+
+                // RC1 (PR #1008 reviewer): record `last_call` ONLY after
+                // a successful forward. Pre-fix recorded unconditionally
+                // before `proxy_tool_call`, which meant a first call that
+                // FAILED at the daemon would still seed the dedup cache —
+                // a retry within 500 ms would then be wrongly dropped with
+                // a success-with-note while the daemon never saw it.
+                // Outcome contract: dedup only covers requests that
+                // actually reached the daemon's logical-execution path.
+                match proxy_tool_call(&home, &instance, tool, args, &mut conn) {
+                    Ok(result) => {
+                        last_call = Some(RecentCall {
+                            tool: tool.to_string(),
+                            args: args.clone(),
+                            at: now,
+                        });
+                        serde_json::json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "result": {
+                                "content": [{"type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default()}],
+                                "isError": result.get("error").is_some()
+                            }
+                        }).to_string()
+                    }
                     Err(e) => {
                         conn = None;
+                        // Deliberately NOT updating `last_call` — operator
+                        // can retry the identical call within 500 ms and
+                        // the second attempt MUST actually forward (the
+                        // first attempt never reached daemon execution).
                         serde_json::json!({
                             "jsonrpc": "2.0", "id": id,
                             "error": {"code": -32603, "message": format!("daemon proxy error: {e}")}
-                        }).to_string()
+                        })
+                        .to_string()
                     }
                 }
             }
@@ -475,5 +578,158 @@ mod tests {
         let a = envelope_with_request_id(&envelope);
         let b = envelope_with_request_id(&envelope);
         assert_ne!(a["request_id"], b["request_id"]);
+    }
+
+    // ── #1000 bridge-side content-dedup ─────────────────────────────────
+
+    fn args_send(target: &str, text: &str) -> serde_json::Value {
+        serde_json::json!({"target_instance": target, "message": text})
+    }
+
+    /// LLM double-fire: identical tool + args within the 500 ms window
+    /// MUST be flagged as duplicate. This is the load-bearing case for
+    /// #1000 — the cheerc snippet's canonical behaviour.
+    #[test]
+    fn is_duplicate_call_identical_within_window() {
+        let t0 = Instant::now();
+        let last = RecentCall {
+            tool: "send".to_string(),
+            args: args_send("lead", "hello"),
+            at: t0,
+        };
+        let now = t0 + Duration::from_millis(84); // matches issue body timing
+        assert!(is_duplicate_call(
+            Some(&last),
+            "send",
+            &args_send("lead", "hello"),
+            now,
+            CONTENT_DEDUP_WINDOW,
+        ));
+    }
+
+    /// Identical call AFTER the window must NOT be deduped — the LLM
+    /// might legitimately re-send the same content as a follow-up turn.
+    #[test]
+    fn is_duplicate_call_identical_after_window() {
+        let t0 = Instant::now();
+        let last = RecentCall {
+            tool: "send".to_string(),
+            args: args_send("lead", "hello"),
+            at: t0,
+        };
+        let now = t0 + Duration::from_millis(501); // just past 500 ms
+        assert!(!is_duplicate_call(
+            Some(&last),
+            "send",
+            &args_send("lead", "hello"),
+            now,
+            CONTENT_DEDUP_WINDOW,
+        ));
+    }
+
+    /// Same tool, DIFFERENT args within window MUST forward — two
+    /// distinct sends are two distinct messages even if they happen
+    /// fast. Dedup is content-keyed.
+    #[test]
+    fn is_duplicate_call_same_tool_different_args_within_window() {
+        let t0 = Instant::now();
+        let last = RecentCall {
+            tool: "send".to_string(),
+            args: args_send("lead", "hello"),
+            at: t0,
+        };
+        let now = t0 + Duration::from_millis(50);
+        assert!(!is_duplicate_call(
+            Some(&last),
+            "send",
+            &args_send("lead", "world"), // different message
+            now,
+            CONTENT_DEDUP_WINDOW,
+        ));
+    }
+
+    /// DIFFERENT tool, same args envelope shape within window MUST
+    /// forward — `send` and `reply` may legitimately fire in sequence.
+    #[test]
+    fn is_duplicate_call_different_tool_within_window() {
+        let t0 = Instant::now();
+        let last = RecentCall {
+            tool: "send".to_string(),
+            args: args_send("lead", "hello"),
+            at: t0,
+        };
+        let now = t0 + Duration::from_millis(50);
+        assert!(!is_duplicate_call(
+            Some(&last),
+            "reply", // different tool
+            &args_send("lead", "hello"),
+            now,
+            CONTENT_DEDUP_WINDOW,
+        ));
+    }
+
+    /// First call ever (no `last_call` recorded) MUST forward — cold
+    /// start has nothing to compare against.
+    #[test]
+    fn is_duplicate_call_no_prior_state() {
+        let now = Instant::now();
+        assert!(!is_duplicate_call(
+            None,
+            "send",
+            &args_send("lead", "hello"),
+            now,
+            CONTENT_DEDUP_WINDOW,
+        ));
+    }
+
+    /// RC1 (PR #1008 reviewer): a first proxy_tool_call ERROR must NOT
+    /// seed the dedup cache. Production invariant: `last_call` is only
+    /// assigned inside the `Ok(_)` branch of the proxy match. If the
+    /// first call fails (daemon unavailable, connection drop, etc.),
+    /// `last_call` stays at its pre-call value — so an identical retry
+    /// within 500 ms goes through the proxy normally instead of being
+    /// dropped with a success-with-note while the daemon never saw it.
+    ///
+    /// This test pins the predicate side of the invariant. The matching
+    /// production change in `run()`'s `tools/call` arm moved the
+    /// `last_call = Some(...)` assignment from BEFORE the proxy match
+    /// to INSIDE the `Ok(_)` branch.
+    #[test]
+    fn proxy_failure_does_not_seed_dedup() {
+        // State simulating "first proxy errored, last_call stayed as it
+        // was before that call". Production code path: the `Err(_)` arm
+        // does NOT touch `last_call`.
+        let last_call: Option<RecentCall> = None;
+        let now = Instant::now() + Duration::from_millis(84); // retry at same 84ms timing
+        assert!(
+            !is_duplicate_call(
+                last_call.as_ref(),
+                "send",
+                &args_send("lead", "hello"),
+                now,
+                CONTENT_DEDUP_WINDOW,
+            ),
+            "RC1 invariant: post-proxy-failure dedup state must NOT block an identical retry"
+        );
+    }
+
+    /// Window boundary — exactly `window` elapsed must NOT be a duplicate
+    /// (strict `<`, not `<=`). Pins the comparison operator.
+    #[test]
+    fn is_duplicate_call_window_boundary_exclusive() {
+        let t0 = Instant::now();
+        let last = RecentCall {
+            tool: "send".to_string(),
+            args: args_send("lead", "hello"),
+            at: t0,
+        };
+        let now = t0 + CONTENT_DEDUP_WINDOW; // exactly 500ms
+        assert!(!is_duplicate_call(
+            Some(&last),
+            "send",
+            &args_send("lead", "hello"),
+            now,
+            CONTENT_DEDUP_WINDOW,
+        ));
     }
 }
