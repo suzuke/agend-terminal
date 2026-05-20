@@ -140,7 +140,7 @@ fn emit_nudge(home: &Path, d: &PendingDispatch) -> bool {
         reporting_cadence: None,
         worktree_binding_required: None,
     };
-    match crate::inbox::enqueue(home, &d.target, msg) {
+    match crate::inbox::enqueue_with_idle_hint(home, &d.target, msg) {
         Ok(()) => true,
         Err(e) => {
             tracing::warn!(

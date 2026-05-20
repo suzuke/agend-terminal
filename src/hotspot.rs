@@ -150,7 +150,7 @@ pub fn hotspot_warn(home: &Path, agent: &str, file: &Path, last_toucher: &str, s
         reporting_cadence: None,
         worktree_binding_required: None,
     };
-    let _ = crate::inbox::enqueue(home, "lead", msg);
+    let _ = crate::inbox::enqueue_with_idle_hint(home, "lead", msg);
 }
 
 #[cfg(test)]

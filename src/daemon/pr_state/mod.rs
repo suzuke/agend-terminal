@@ -706,7 +706,7 @@ pub fn scan_and_emit_with(
             let author = resolve_author(&state);
             let body = format_ready_body(&state);
             let msg = build_event_message("pr-ready-for-merge", &author, &state, body);
-            if let Err(e) = crate::inbox::enqueue(home, &author, msg) {
+            if let Err(e) = crate::inbox::enqueue_with_idle_hint(home, &author, msg) {
                 tracing::warn!(
                     repo = %state.repo,
                     branch = %state.branch,
@@ -740,7 +740,7 @@ pub fn scan_and_emit_with(
                     &merge_commit[..8.min(merge_commit.len())],
                     merged_at,
                 );
-                let _ = crate::inbox::enqueue(
+                let _ = crate::inbox::enqueue_with_idle_hint(
                     home,
                     &author,
                     build_event_message("pr-merged", &author, &state, body),
@@ -754,7 +754,7 @@ pub fn scan_and_emit_with(
                     "[pr-closed-unmerged] {}@{} (closed_at {})",
                     state.repo, state.branch, closed_at
                 );
-                let _ = crate::inbox::enqueue(
+                let _ = crate::inbox::enqueue_with_idle_hint(
                     home,
                     &author,
                     build_event_message("pr-closed-unmerged", &author, &state, body),

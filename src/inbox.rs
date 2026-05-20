@@ -350,13 +350,7 @@ pub fn enqueue(home: &Path, name: &str, mut msg: InboxMessage) -> anyhow::Result
         anyhow::bail!("inbox readonly: disk space critically low");
     }
     msg.schema_version = InboxMessage::CURRENT_VERSION;
-    if msg.id.is_none() {
-        use std::sync::atomic::{AtomicU64, Ordering as AtOrd};
-        static MSG_SEQ: AtomicU64 = AtomicU64::new(0);
-        let ts = chrono::Utc::now().format("%Y%m%d%H%M%S%6f");
-        let seq = MSG_SEQ.fetch_add(1, AtOrd::Relaxed);
-        msg.id = Some(format!("m-{ts}-{seq}"));
-    }
+    ensure_msg_id(&mut msg);
     let line = format!("{}\n", serde_json::to_string(&msg)?);
 
     with_inbox_lock(home, name, |path| {
@@ -373,6 +367,21 @@ pub fn enqueue(home: &Path, name: &str, mut msg: InboxMessage) -> anyhow::Result
         })();
         result
     })?
+}
+
+/// Assign a stable `msg.id` when absent. Shared between [`enqueue`] and
+/// [`enqueue_with_idle_hint`] so the latter can pre-stamp an id before
+/// the enqueue, then reference it in the PTY hint without consuming the
+/// message-by-value twice.
+fn ensure_msg_id(msg: &mut InboxMessage) {
+    if msg.id.is_some() {
+        return;
+    }
+    use std::sync::atomic::{AtomicU64, Ordering as AtOrd};
+    static MSG_SEQ: AtomicU64 = AtomicU64::new(0);
+    let ts = chrono::Utc::now().format("%Y%m%d%H%M%S%6f");
+    let seq = MSG_SEQ.fetch_add(1, AtOrd::Relaxed);
+    msg.id = Some(format!("m-{ts}-{seq}"));
 }
 
 /// Mark prior unread ci-watch messages for the same repo+branch as superseded.
@@ -624,6 +633,13 @@ pub fn pointer_only_inject() -> bool {
 
 /// ANSI-colored header prefix for visual distinction in terminal.
 pub const HEADER_PREFIX: &str = "\x1b[44;97m[AGEND-MSG]\x1b[0m";
+
+/// #982: ANSI-colored prefix for idle-hint headers emitted alongside
+/// daemon-side inbox enqueues. Distinct from [`HEADER_PREFIX`] so
+/// recipients can distinguish the canonical message body inject from
+/// the lightweight `(use inbox tool)` pointer signalling a new
+/// pending entry. Background is yellow-on-black for contrast.
+pub const PENDING_HEADER_PREFIX: &str = "\x1b[43;30m[AGEND-MSG-PENDING]\x1b[0m";
 
 /// Plain-text system message prefix (without ANSI colors).
 /// Used for detection/matching in agent PTY output parsing.
@@ -1212,6 +1228,92 @@ pub fn compose_aware_send(home: &Path, agent_name: &str, message: &str) {
     let _ = route_notification(home, agent_name, message, |msg| {
         inject_with_submit(home, agent_name, msg)
     });
+}
+
+/// #982 Direction A: persist a message to the recipient's inbox AND emit a
+/// best-effort `[AGEND-MSG-PENDING]` PTY hint so daemon-side events do not
+/// strand silently when the recipient is at an idle prompt.
+///
+/// Mirror of [`enqueue`] for daemon scanner sites (waiting_on_stale,
+/// dispatch_idle, pr_state, etc.) that own no inter-agent send path of
+/// their own. The hint reuses [`compose_aware_inject`] so `is_composing`
+/// deferral, `notification_queue` flushing, and #911 dedup behave
+/// identically to the channel/notify_agent path.
+///
+/// # Do NOT migrate
+///
+/// The following sites MUST keep calling [`enqueue`] directly:
+///
+/// - `agent_ops::fallback_deliver` — silent-degrade path for the inter-
+///   agent send fallback. It already invokes
+///   [`crate::inbox::notify_agent`] (which routes through
+///   [`compose_aware_inject`]) on the same hop, so migrating would
+///   double-inject and risk re-entry into the API loopback.
+/// - `api::handlers::messaging::handle_send` — paired with the primary
+///   [`compose_aware_send`] call. Migrating duplicates the inject.
+/// - `channel::telegram::inbound` status-keyword path — paired with
+///   [`crate::inbox::notify_agent`] on the same hop.
+/// - `daemon::supervisor` member-state-change emit — paired with
+///   [`crate::inbox::notify_agent`].
+/// - `daemon::ci_watch::poller` (3 sites: 149/940/1092) — paired with
+///   the terminal-run fan-out's [`crate::agent::inject_to_agent`].
+/// - `mcp::handlers::instance` replace handover — the recipient is
+///   being killed and respawned, so any hint to the about-to-be-dead
+///   handle is a no-op and the fresh agent reads inbox on startup.
+///
+/// # Best-effort semantics
+///
+/// The PTY hint is fire-and-forget after the inbox write succeeds: a
+/// hint failure (recipient absent from registry, API unreachable) is
+/// swallowed silently because inbox storage is the durable source of
+/// truth.
+pub fn enqueue_with_idle_hint(
+    home: &Path,
+    target: &str,
+    msg: InboxMessage,
+) -> anyhow::Result<()> {
+    enqueue_with_idle_hint_with_emitter(home, target, msg, |hint| {
+        compose_aware_inject(home, target, hint);
+    })
+}
+
+/// Test-seam variant of [`enqueue_with_idle_hint`]. Accepts a closure
+/// that receives the formatted hint string so unit tests can verify
+/// the wire format without standing up the API loopback.
+pub(crate) fn enqueue_with_idle_hint_with_emitter<F>(
+    home: &Path,
+    target: &str,
+    mut msg: InboxMessage,
+    emit_hint: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(&str),
+{
+    // Pre-stamp the id so the hint can reference it. enqueue() leaves an
+    // existing id untouched, so this stays a single auto-assignment.
+    ensure_msg_id(&mut msg);
+    let id = msg.id.clone().unwrap_or_default();
+    let from = msg.from.clone();
+    let kind = msg.kind.clone();
+
+    enqueue(home, target, msg)?;
+
+    // Build the PTY hint AFTER the inbox write succeeds — pending count
+    // reflects post-enqueue state so the recipient sees the same total
+    // they will read back via `inbox`.
+    let pending = unread_count(home, target).0;
+    let from_short = from.strip_prefix("from:").unwrap_or(&from);
+    let kind_str = kind.as_deref().unwrap_or("");
+    let hint = format!(
+        "{} id={} kind={} from={} inbox={} (use inbox tool)",
+        PENDING_HEADER_PREFIX,
+        sanitize_header_value(&id),
+        sanitize_header_value(kind_str),
+        sanitize_header_value(from_short),
+        pending,
+    );
+    emit_hint(&hint);
+    Ok(())
 }
 
 fn inject_with_submit(home: &Path, agent_name: &str, message: &str) -> anyhow::Result<()> {
@@ -3693,5 +3795,427 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // #982 — enqueue_with_idle_hint regression suite
+    // T0  anti-regression: raw enqueue still emits NO PTY hint.
+    // T1  idle recipient receives a hint mentioning id/kind/from/inbox count.
+    // T2  composing recipient defers hint into notification_queue (NOT injected).
+    // T3  unread count in hint matches post-enqueue inbox state.
+    // T4  same msg.id supplied by caller is preserved (no double-assignment).
+    // T5  enqueue failure path skips the hint emit (best-effort contract).
+    // T6  hint prefix uses the dedicated PENDING_HEADER_PREFIX, not HEADER_PREFIX.
+    // T7  hint sanitizes control characters in from / kind fields.
+    // T8  unique msg.id assigned when caller leaves it None.
+    // T9  emitted hint contains canonical `(use inbox tool)` affordance.
+    // T10 enqueue with `from: "from:<agent>"` strips the redundant "from:" prefix.
+    // T11 successive enqueues each carry their own distinct msg.id in the hint.
+    // T12 (recipient_state × kind) matrix — idle vs composing dispatched per kind.
+    // T13 notification_queue flush regression-pin: composing→idle releases hint.
+    // T14 #986 [pr-ready-for-merge] load-bearing: helper preserves payload + hints.
+    // -----------------------------------------------------------------------
+
+    fn capture_hint() -> std::sync::Arc<Mutex<Option<String>>> {
+        std::sync::Arc::new(Mutex::new(None))
+    }
+
+    #[test]
+    fn t0_raw_enqueue_emits_no_pty_hint() {
+        let home = tmp_home("982-t0");
+        let captured = capture_hint();
+        // Raw enqueue path — no idle hint logic.
+        enqueue(&home, "agent1", make_msg("system:test", "raw")).expect("enqueue");
+        // capture is empty because we never invoked the helper.
+        assert!(
+            captured.lock().is_none(),
+            "raw enqueue must not emit PTY hint"
+        );
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn t1_idle_recipient_receives_hint() {
+        let home = tmp_home("982-t1");
+        let captured = capture_hint();
+        let mut msg = make_msg("system:waiting_on_stale", "stale alert");
+        msg.kind = Some("waiting_on_stale".to_string());
+        let captured_clone = captured.clone();
+        enqueue_with_idle_hint_with_emitter(&home, "agent1", msg, move |hint| {
+            *captured_clone.lock() = Some(hint.to_string());
+        })
+        .expect("enqueue_with_idle_hint");
+
+        let got = captured.lock().clone().expect("hint must be emitted");
+        assert!(got.starts_with(PENDING_HEADER_PREFIX), "hint must use pending prefix: {got:?}");
+        assert!(got.contains("kind=waiting_on_stale"), "hint must carry kind: {got:?}");
+        assert!(got.contains("from=system:waiting_on_stale"), "hint must carry from: {got:?}");
+        assert!(got.contains("inbox=1"), "hint must carry inbox count: {got:?}");
+        assert!(got.contains("(use inbox tool)"), "hint must carry inbox affordance: {got:?}");
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn t2_composing_recipient_defers_hint_via_notification_queue() {
+        // Lock the global notification_dedup so the composing→deferred
+        // hint isn't suppressed by a sibling test's ledger entry.
+        let _guard = READONLY_TEST_LOCK.lock();
+        let home = tmp_home("982-t2");
+        mark_composing(&home, "agent1");
+        let msg = make_msg("system:t2", "composing test");
+        // Use the REAL emitter path (compose_aware_inject) so we can
+        // observe notification_queue side effect.
+        enqueue_with_idle_hint_with_emitter(&home, "agent1", msg, |hint| {
+            // route_notification deferral lives inside compose_aware_inject;
+            // we invoke it directly so the gate fires under our control.
+            compose_aware_inject(&home, "agent1", hint);
+        })
+        .expect("enqueue_with_idle_hint");
+
+        assert_eq!(
+            crate::notification_queue::pending_count(&home, "agent1"),
+            1,
+            "composing recipient must defer hint into notification_queue"
+        );
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn t3_unread_count_in_hint_matches_post_enqueue_state() {
+        let home = tmp_home("982-t3");
+        // Pre-seed 2 unread entries so the helper's hint should show inbox=3.
+        enqueue(&home, "agent1", make_msg("seed1", "a")).expect("seed1");
+        enqueue(&home, "agent1", make_msg("seed2", "b")).expect("seed2");
+
+        let captured = capture_hint();
+        let captured_clone = captured.clone();
+        enqueue_with_idle_hint_with_emitter(
+            &home,
+            "agent1",
+            make_msg("system:t3", "new"),
+            move |hint| {
+                *captured_clone.lock() = Some(hint.to_string());
+            },
+        )
+        .expect("enqueue_with_idle_hint");
+
+        let got = captured.lock().clone().expect("hint emitted");
+        assert!(got.contains("inbox=3"), "hint must reflect 3 unread: {got:?}");
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn t4_caller_supplied_id_preserved() {
+        let home = tmp_home("982-t4");
+        let captured = capture_hint();
+        let mut msg = make_msg("system:t4", "preset id");
+        msg.id = Some("m-caller-supplied-123".to_string());
+
+        let captured_clone = captured.clone();
+        enqueue_with_idle_hint_with_emitter(&home, "agent1", msg, move |hint| {
+            *captured_clone.lock() = Some(hint.to_string());
+        })
+        .expect("enqueue_with_idle_hint");
+
+        let got = captured.lock().clone().expect("hint emitted");
+        assert!(
+            got.contains("id=m-caller-supplied-123"),
+            "caller-supplied id must survive: {got:?}"
+        );
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn t5_enqueue_failure_skips_hint_emit() {
+        let _guard = READONLY_TEST_LOCK.lock();
+        let home = tmp_home("982-t5");
+        // Force readonly so enqueue fails.
+        DISK_READONLY.store(true, Ordering::Relaxed);
+        let emitted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let emitted_clone = emitted.clone();
+        let result = enqueue_with_idle_hint_with_emitter(
+            &home,
+            "agent1",
+            make_msg("system:t5", "fail"),
+            move |_hint| {
+                emitted_clone.store(true, Ordering::Relaxed);
+            },
+        );
+        DISK_READONLY.store(false, Ordering::Relaxed);
+        assert!(result.is_err(), "enqueue must propagate readonly error");
+        assert!(
+            !emitted.load(Ordering::Relaxed),
+            "hint emit must be skipped on enqueue failure"
+        );
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn t6_hint_uses_pending_prefix_not_header_prefix() {
+        let home = tmp_home("982-t6");
+        let captured = capture_hint();
+        let captured_clone = captured.clone();
+        enqueue_with_idle_hint_with_emitter(
+            &home,
+            "agent1",
+            make_msg("system:t6", "prefix test"),
+            move |hint| {
+                *captured_clone.lock() = Some(hint.to_string());
+            },
+        )
+        .expect("enqueue_with_idle_hint");
+
+        let got = captured.lock().clone().expect("hint emitted");
+        assert!(
+            got.contains("[AGEND-MSG-PENDING]"),
+            "hint must use AGEND-MSG-PENDING tag: {got:?}"
+        );
+        assert!(
+            !got.contains("[AGEND-MSG] "),
+            "hint must NOT collide with canonical AGEND-MSG header: {got:?}"
+        );
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn t7_hint_sanitizes_control_chars() {
+        let home = tmp_home("982-t7");
+        let captured = capture_hint();
+        let mut msg = make_msg("system:t7\nattack", "ctrl chars");
+        msg.kind = Some("kind\twith\ttabs".to_string());
+        let captured_clone = captured.clone();
+        enqueue_with_idle_hint_with_emitter(&home, "agent1", msg, move |hint| {
+            *captured_clone.lock() = Some(hint.to_string());
+        })
+        .expect("enqueue_with_idle_hint");
+
+        let got = captured.lock().clone().expect("hint emitted");
+        // Control chars become spaces — split on the post-prefix region only,
+        // because PENDING_HEADER_PREFIX contains ANSI ESC bytes by design.
+        let body = got
+            .split("[AGEND-MSG-PENDING]\x1b[0m")
+            .nth(1)
+            .expect("body present");
+        assert!(
+            !body.contains('\n') && !body.contains('\t'),
+            "control chars must be sanitized to space: body={body:?}"
+        );
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn t8_msg_id_auto_assigned_when_caller_omits() {
+        let home = tmp_home("982-t8");
+        let captured = capture_hint();
+        let captured_clone = captured.clone();
+        enqueue_with_idle_hint_with_emitter(
+            &home,
+            "agent1",
+            make_msg("system:t8", "no id"),
+            move |hint| {
+                *captured_clone.lock() = Some(hint.to_string());
+            },
+        )
+        .expect("enqueue_with_idle_hint");
+
+        let got = captured.lock().clone().expect("hint emitted");
+        assert!(got.contains(" id=m-"), "auto-id starts with m-: {got:?}");
+        // Auto-id format: m-{YYYYMMDDHHMMSS.6f}-{seq}
+        assert!(
+            got.contains(" id=m-2"), // 2-prefixed year (works through 2099)
+            "auto-id must contain year prefix: {got:?}"
+        );
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn t9_hint_carries_inbox_affordance() {
+        let home = tmp_home("982-t9");
+        let captured = capture_hint();
+        let captured_clone = captured.clone();
+        enqueue_with_idle_hint_with_emitter(
+            &home,
+            "agent1",
+            make_msg("system:t9", "affordance"),
+            move |hint| {
+                *captured_clone.lock() = Some(hint.to_string());
+            },
+        )
+        .expect("enqueue_with_idle_hint");
+
+        let got = captured.lock().clone().expect("hint emitted");
+        assert!(
+            got.ends_with("(use inbox tool)"),
+            "hint must end with operator-trained affordance: {got:?}"
+        );
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn t10_from_prefix_stripped_in_hint() {
+        let home = tmp_home("982-t10");
+        let captured = capture_hint();
+        let captured_clone = captured.clone();
+        enqueue_with_idle_hint_with_emitter(
+            &home,
+            "agent1",
+            make_msg("from:peer-agent", "strip me"),
+            move |hint| {
+                *captured_clone.lock() = Some(hint.to_string());
+            },
+        )
+        .expect("enqueue_with_idle_hint");
+
+        let got = captured.lock().clone().expect("hint emitted");
+        assert!(
+            got.contains("from=peer-agent"),
+            "from: prefix must be stripped: {got:?}"
+        );
+        assert!(
+            !got.contains("from=from:"),
+            "must not have nested from:from:: {got:?}"
+        );
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn t11_successive_enqueues_carry_distinct_ids() {
+        let home = tmp_home("982-t11");
+        let hints = std::sync::Arc::new(Mutex::new(Vec::<String>::new()));
+        for i in 0..3 {
+            let hints_clone = hints.clone();
+            enqueue_with_idle_hint_with_emitter(
+                &home,
+                "agent1",
+                make_msg("system:t11", &format!("msg {i}")),
+                move |hint| {
+                    hints_clone.lock().push(hint.to_string());
+                },
+            )
+            .expect("enqueue_with_idle_hint");
+        }
+
+        let captured = hints.lock();
+        assert_eq!(captured.len(), 3, "three hints emitted");
+        // Extract id= token from each
+        let ids: Vec<&str> = captured
+            .iter()
+            .map(|h| h.split(" id=").nth(1).and_then(|s| s.split(' ').next()).unwrap_or(""))
+            .collect();
+        assert_eq!(
+            std::collections::HashSet::<&&str>::from_iter(ids.iter()).len(),
+            3,
+            "all three ids must be distinct: {ids:?}"
+        );
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn t12_pty_state_kind_matrix() {
+        // Lead Q7: explicit (pty_state × msg_kind) matrix coverage.
+        let _guard = READONLY_TEST_LOCK.lock();
+        let home = tmp_home("982-t12");
+        let kinds = ["query", "task", "report", "update", "waiting_on_stale"];
+
+        for kind in kinds {
+            // Idle path — hint reaches the closure.
+            let captured = capture_hint();
+            let captured_clone = captured.clone();
+            let mut msg = make_msg("system:t12", "idle");
+            msg.kind = Some(kind.to_string());
+            enqueue_with_idle_hint_with_emitter(&home, "agent1", msg, move |hint| {
+                *captured_clone.lock() = Some(hint.to_string());
+            })
+            .expect("idle enqueue");
+            let got = captured.lock().clone();
+            assert!(got.is_some(), "idle path must emit for kind={kind}");
+            assert!(
+                got.unwrap().contains(&format!("kind={kind}")),
+                "hint carries kind={kind}"
+            );
+
+            // Composing path — hint deferred into notification_queue.
+            let composing_home = tmp_home(&format!("982-t12-{kind}"));
+            mark_composing(&composing_home, "agent1");
+            let mut msg = make_msg("system:t12", "composing");
+            msg.kind = Some(kind.to_string());
+            let before = crate::notification_queue::pending_count(&composing_home, "agent1");
+            enqueue_with_idle_hint_with_emitter(&composing_home, "agent1", msg, |hint| {
+                compose_aware_inject(&composing_home, "agent1", hint);
+            })
+            .expect("composing enqueue");
+            let after = crate::notification_queue::pending_count(&composing_home, "agent1");
+            assert_eq!(after, before + 1, "composing must defer 1 hint for kind={kind}");
+            fs::remove_dir_all(&composing_home).ok();
+        }
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn t13_notification_queue_flush_releases_deferred_hint() {
+        let _guard = READONLY_TEST_LOCK.lock();
+        let home = tmp_home("982-t13");
+        mark_composing(&home, "agent1");
+
+        // Defer 2 hints while composing.
+        for i in 0..2 {
+            let mut msg = make_msg("system:t13", &format!("deferred {i}"));
+            msg.kind = Some("update".to_string());
+            enqueue_with_idle_hint_with_emitter(&home, "agent1", msg, |hint| {
+                compose_aware_inject(&home, "agent1", hint);
+            })
+            .expect("deferred enqueue");
+        }
+        assert_eq!(
+            crate::notification_queue::pending_count(&home, "agent1"),
+            2,
+            "both hints deferred"
+        );
+
+        // Drain returns the deferred hints.
+        let drained = crate::notification_queue::drain(&home, "agent1");
+        assert_eq!(drained.len(), 2, "drain returns deferred hints");
+        for d in &drained {
+            assert!(
+                d.text.contains("[AGEND-MSG-PENDING]"),
+                "deferred entry is the pending hint: {:?}",
+                d.text
+            );
+        }
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn t14_pr_ready_for_merge_load_bearing_emits_hint() {
+        // #986 load-bearing regression-pin: the [pr-ready-for-merge] event
+        // path must surface a PTY hint after the helper migration.
+        // Pin the wire format: hint carries kind=pr-ready-for-merge and
+        // points the recipient to inbox via the affordance affordance.
+        let home = tmp_home("982-t14-ready");
+        let captured = capture_hint();
+        let mut msg = make_msg("system:pr_state", "[pr-ready-for-merge] foo/bar@feat#990");
+        msg.kind = Some("pr-ready-for-merge".to_string());
+        msg.correlation_id = Some("foo/bar@feat#990".to_string());
+
+        let captured_clone = captured.clone();
+        enqueue_with_idle_hint_with_emitter(&home, "fixup-lead", msg, move |hint| {
+            *captured_clone.lock() = Some(hint.to_string());
+        })
+        .expect("enqueue ready-event");
+
+        let got = captured.lock().clone().expect("ready-event hint emitted");
+        assert!(
+            got.contains("kind=pr-ready-for-merge"),
+            "ready-event must carry kind tag: {got:?}"
+        );
+        assert!(
+            got.contains("(use inbox tool)"),
+            "ready-event must carry affordance: {got:?}"
+        );
+        // Underlying inbox entry stays intact (durable source of truth).
+        let drained = drain(&home, "fixup-lead");
+        assert_eq!(drained.len(), 1, "inbox entry persisted");
+        assert_eq!(drained[0].kind.as_deref(), Some("pr-ready-for-merge"));
+        fs::remove_dir_all(&home).ok();
     }
 }

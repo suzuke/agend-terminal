@@ -1225,7 +1225,7 @@ pub fn run_task_maintenance(home: &Path) {
             "dispatch stuck check: still working on task_id={tid} (dispatched {}min ago)?",
             crate::dispatch_tracking::DISPATCH_ASK_MINUTES
         );
-        let _ = crate::inbox::enqueue(
+        let _ = crate::inbox::enqueue_with_idle_hint(
             home,
             &a.to,
             crate::inbox::InboxMessage {
@@ -1298,7 +1298,7 @@ fn replay_missed_at_startup(home: &Path, registry: &AgentRegistry) {
             }
         } else {
             drop(reg);
-            let _ = crate::inbox::enqueue(
+            let _ = crate::inbox::enqueue_with_idle_hint(
                 home,
                 target,
                 crate::inbox::InboxMessage {

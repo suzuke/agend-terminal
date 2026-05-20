@@ -333,7 +333,7 @@ fn emit_exceeded_event(home: &Path, d: &PendingDispatch, elapsed_secs: i64) {
         reporting_cadence: None,
         worktree_binding_required: None,
     };
-    if let Err(e) = crate::inbox::enqueue(home, &d.dispatcher, msg) {
+    if let Err(e) = crate::inbox::enqueue_with_idle_hint(home, &d.dispatcher, msg) {
         tracing::warn!(
             error = %e,
             dispatcher = %d.dispatcher,
