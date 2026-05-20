@@ -24,6 +24,12 @@ fn main() {
     }
 }
 
+struct RecentCall {
+    tool: String,
+    args: serde_json::Value,
+    at: std::time::Instant,
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let home = home_dir();
     let instance = std::env::var("AGEND_INSTANCE_NAME").unwrap_or_default();
@@ -33,6 +39,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Lazy persistent TCP connection to daemon API.
     let mut conn: Option<(BufReader<TcpStream>, TcpStream)> = None;
+    let mut last_call: Option<RecentCall> = None;
 
     loop {
         let body = match read_message(&mut reader)? {
@@ -90,6 +97,31 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "tools/call" => {
                 let tool = req["params"]["name"].as_str().unwrap_or("");
                 let args = &req["params"]["arguments"];
+
+                // #1000 deduplication: Upstream LLMs (Claude/Gemini) sometimes double-fire
+                // the exact same tool_call within the same turn. The daemon relies on
+                // `request_id` (UUID) for idempotency, which we generate fresh per call,
+                // so the daemon executes both. We drop identical calls within a 500ms window.
+                if let Some(ref last) = last_call {
+                    if last.tool == tool && &last.args == args && last.at.elapsed() < std::time::Duration::from_millis(500) {
+                        eprintln!("agend-mcp-bridge: dropped duplicate tool call '{}' within 500ms", tool);
+                        let dropped_resp = serde_json::json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "result": {
+                                "content": [{"type": "text", "text": "{\"status\":\"ok\",\"note\":\"duplicate tool call dropped by bridge\"}"}],
+                                "isError": false
+                            }
+                        }).to_string();
+                        write_message(&mut stdout, &dropped_resp)?;
+                        continue;
+                    }
+                }
+
+                last_call = Some(RecentCall {
+                    tool: tool.to_string(),
+                    args: args.clone(),
+                    at: std::time::Instant::now(),
+                });
 
                 match proxy_tool_call(&home, &instance, tool, args, &mut conn) {
                     Ok(result) => serde_json::json!({
