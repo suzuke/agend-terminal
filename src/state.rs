@@ -819,6 +819,14 @@ pub struct StateTracker {
     /// for the dual-path Hung detection. See `docs/F9-PRODUCTIVE-OUTPUT-GATE.md`
     /// §F9.1 architecture and §F9.3 dual-path decision table.
     pub last_productive_output: Instant,
+    /// #685 PR-2: hash of the matched-marker substring on the most-recent
+    /// productive refresh. Used to suppress re-firing
+    /// `last_productive_output = now()` when the same marker text remains
+    /// visible across screen-change ticks (e.g. stale "Saved to /tmp/foo.txt"
+    /// stays in viewport while a spinner cycles below). Same defense-in-
+    /// depth class as #1005 ToolUse oscillation guard. Cleared on
+    /// non-matching feed so a genuine future Productive signal re-fires.
+    last_productive_marker_hash: Option<u64>,
     /// Hash of the last screen text fed to `feed()`. `None` before the first
     /// call. Used to skip re-detection when the screen hasn't changed —
     /// crucial for not resetting `last_output` on cursor-blink noise.
@@ -918,6 +926,28 @@ const ANCHOR_WINDOW_BYTES: usize = 200;
 /// Anchor freshness window (Duration) — chunks older than this are
 /// ignored by the anchor check.
 const ANCHOR_WINDOW_MS: Duration = Duration::from_secs(30);
+
+/// #685 PR-2: max number of rendered viewport lines that count as
+/// "fresh productive evidence" when scanning for markers. Values
+/// outside this window land in scrollback FP territory (per #1005
+/// same-class reviewer flag).
+///
+/// 5 lines is a compromise: tight enough to drop most scrollback
+/// false-positives (productive markers like `Saved to /tmp/foo.txt`
+/// from minutes-old runs no longer fire), loose enough to catch
+/// multi-line productive output (e.g. claude's `⏺ Reading file...`
+/// banner + tool output preview within the same render burst).
+const MARKER_SCAN_TAIL_LINES: usize = 5;
+
+/// #685 PR-2: extract the last `n` non-padding lines of a rendered
+/// screen for marker scanning. `screen_text` from `VTerm::tail_lines`
+/// is already trimmed of leading/trailing blanks — we just slice to
+/// the recent tail without re-trimming.
+fn recent_screen_tail(screen_text: &str, n: usize) -> String {
+    let lines: Vec<&str> = screen_text.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join("\n")
+}
 
 /// #1005 Phase A2: window inside which a `Lower→Active(X)→Lower→Active(X)`
 /// bounce is treated as oscillation. Default 30s — matches
@@ -1085,6 +1115,7 @@ impl StateTracker {
             since: Instant::now(),
             last_output: Instant::now(),
             last_productive_output: Instant::now(),
+            last_productive_marker_hash: None,
             last_screen_hash: None,
             patterns: backend.map(StatePatterns::for_backend),
             interactive_prompt_pending_notice: false,
@@ -1313,17 +1344,68 @@ impl StateTracker {
         // classification branch is gated on `AGEND_PRODUCTIVE_GATE=1` in
         // `check_hang` (shadow-mode default). See
         // `docs/F9-PRODUCTIVE-OUTPUT-GATE.md` §F9.5.
+        //
+        // #685 PR-2 (reviewer #1009 / #1005 same-class flag): scan ONLY
+        // the recent tail (last MARKER_SCAN_TAIL_LINES rows) — historical
+        // completion markers visible in scrollback (e.g. `Saved to /tmp/
+        // foo.txt` left at row 5 from a 5-min-old write) MUST NOT keep
+        // refreshing `last_productive_output` on every cursor-blink tick.
+        //
+        // #685 PR-2 RC1 (reviewer #1013 verdict): dedup hash scope
+        // narrowed from "entire recent tail" → "matched marker
+        // substring". Pre-RC1 a stale marker that stayed visible in
+        // the tail while an adjacent spinner ticked produced a
+        // DIFFERENT tail hash on every tick — the dedup-hash never
+        // matched, `last_productive_output` re-fired despite no new
+        // productive evidence. Hashing the matched substring directly
+        // captures evidence identity, not surrounding-context noise.
         if let Some(ref pconfig) = self.productivity_config {
             let heartbeat_age = self
                 .last_heartbeat
                 .map(|t| t.elapsed())
                 .unwrap_or_else(|| Duration::from_secs(u32::MAX as u64));
-            let signal = crate::behavioral::infer_productivity(pconfig, screen_text, heartbeat_age);
-            if matches!(
-                signal,
-                crate::behavioral::ProductivitySignal::Productive { .. }
-            ) {
-                self.last_productive_output = Instant::now();
+            let recent_tail = recent_screen_tail(screen_text, MARKER_SCAN_TAIL_LINES);
+            let (signal, matched_substr) = crate::behavioral::infer_productivity_with_match(
+                pconfig,
+                &recent_tail,
+                heartbeat_age,
+            );
+            match (&signal, matched_substr.as_deref()) {
+                (
+                    crate::behavioral::ProductivitySignal::Productive {
+                        source: crate::behavioral::ProductivitySource::Marker(_),
+                    },
+                    Some(matched),
+                ) => {
+                    // Marker source: dedup against the matched
+                    // substring text. Same substring across feeds =
+                    // same evidence, suppress refresh — even when
+                    // adjacent content (spinner ticks, status line
+                    // edits) changes around it.
+                    let marker_hash = hash_screen(matched);
+                    if self.last_productive_marker_hash != Some(marker_hash) {
+                        self.last_productive_output = Instant::now();
+                        self.last_productive_marker_hash = Some(marker_hash);
+                    }
+                }
+                (
+                    crate::behavioral::ProductivitySignal::Productive {
+                        source: crate::behavioral::ProductivitySource::Heartbeat,
+                    },
+                    _,
+                ) => {
+                    // Heartbeat source is timestamp-driven — each fresh
+                    // heartbeat IS new evidence. Always refresh; reset
+                    // marker-hash so a subsequent Marker re-fires.
+                    self.last_productive_output = Instant::now();
+                    self.last_productive_marker_hash = None;
+                }
+                _ => {
+                    // No marker visible in the recent tail → clear the
+                    // dedup hash so a fresh-after-silence marker
+                    // re-fires the refresh.
+                    self.last_productive_marker_hash = None;
+                }
             }
             crate::behavioral::log_productivity_telemetry(
                 &self.instance_name,
@@ -4301,5 +4383,183 @@ mod tests {
         // true, the gate would suppress. For Shell it's a moot point
         // (no patterns), but the wiring is correct.
         let _ = &mut tracker; // silence unused-mut warning
+    }
+
+    // ── #685 PR-2: F9 productive-marker freshness/dedup ─────────────────
+
+    /// Build a viewport-shaped screen text with a productive marker at
+    /// the indicated row. Helper for the freshness-dedup test trio.
+    fn screen_with_marker_at_row(marker: &str, marker_row: usize, total_rows: usize) -> String {
+        let mut lines: Vec<String> = Vec::with_capacity(total_rows);
+        for i in 0..total_rows {
+            if i == marker_row {
+                lines.push(marker.to_string());
+            } else {
+                lines.push(format!("placeholder content row {i}"));
+            }
+        }
+        lines.join("\n")
+    }
+
+    /// #685 PR-2 T1: a productive marker landing in the recent tail
+    /// (last MARKER_SCAN_TAIL_LINES rows) MUST refresh
+    /// `last_productive_output`. Anti-regression for the fix not over-
+    /// rotating into rejecting legit fresh markers.
+    #[test]
+    fn t1_685_pr2_active_marker_in_recent_tail_refreshes_productive_output() {
+        let mut tracker = StateTracker::new(Some(&Backend::Codex));
+        tracker.last_productive_output = Instant::now() - Duration::from_secs(10);
+        let before = tracker.last_productive_output;
+
+        // Place marker in the recent tail (last 5 rows). Codex
+        // productive markers include `apply_patch` (from sub-task 6).
+        let screen = screen_with_marker_at_row(
+            "apply_patch succeeded for /tmp/foo.txt",
+            38, // total_rows=40, MARKER_SCAN_TAIL_LINES=5 ⇒ rows 35-39 in tail
+            40,
+        );
+        tracker.feed(&screen);
+
+        assert!(
+            tracker.last_productive_output > before,
+            "fresh marker in recent tail must refresh last_productive_output"
+        );
+    }
+
+    /// #685 PR-2 T2: a stale productive marker at the TOP of the
+    /// viewport (outside the last MARKER_SCAN_TAIL_LINES) MUST NOT
+    /// refresh `last_productive_output`. The exact bug class the
+    /// reviewer flagged: scrollback completion markers masking grey-
+    /// failure detection.
+    #[test]
+    fn t2_685_pr2_stale_marker_outside_recent_tail_does_not_refresh() {
+        let mut tracker = StateTracker::new(Some(&Backend::Codex));
+        tracker.last_productive_output = Instant::now() - Duration::from_secs(60);
+        let before = tracker.last_productive_output;
+
+        // Marker at row 5 of a 40-row viewport — far outside the
+        // last-5 tail (rows 35-39). Pre-PR-2 this would refresh.
+        let screen = screen_with_marker_at_row("apply_patch succeeded for /tmp/foo.txt", 5, 40);
+        tracker.feed(&screen);
+
+        assert_eq!(
+            tracker.last_productive_output, before,
+            "#685 PR-2: stale marker in scrollback (row 5 of 40) must NOT refresh last_productive_output"
+        );
+    }
+
+    /// #685 PR-2 T3: grey-failure simulation. Marker once in the
+    /// recent tail then scrolled out of the tail by a long burst of
+    /// silence-producing content (e.g. spinner ticks) — second feed
+    /// MUST NOT refresh the timer. Combined effect: real stuck agent
+    /// (output trickling but no fresh productive evidence) becomes
+    /// detectable via the productive path.
+    #[test]
+    fn t3_685_pr2_grey_failure_trickle_does_not_refresh_after_marker_scrolled_out() {
+        let mut tracker = StateTracker::new(Some(&Backend::Codex));
+        tracker.last_productive_output = Instant::now() - Duration::from_secs(60);
+
+        // Feed 1: marker in recent tail (fresh) — DOES refresh.
+        let screen1 = screen_with_marker_at_row("apply_patch succeeded for /tmp/foo.txt", 38, 40);
+        tracker.feed(&screen1);
+        let after_fresh = tracker.last_productive_output;
+
+        // Feed 2 (grey-failure shape): marker scrolled to row 2 by a
+        // burst of spinner output below. Tail-5 = rows 35-39, no
+        // marker. MUST NOT refresh again.
+        let screen2 = screen_with_marker_at_row("apply_patch succeeded for /tmp/foo.txt", 2, 40);
+        tracker.feed(&screen2);
+
+        assert_eq!(
+            tracker.last_productive_output, after_fresh,
+            "#685 PR-2: scrolled-out marker must NOT re-refresh — grey-failure detection requires fresh evidence"
+        );
+    }
+
+    /// #685 PR-2 RC1 T5 (reviewer #1013 regression-pin): stale marker
+    /// stays at a fixed row in the tail across feeds while an ADJACENT
+    /// line (e.g. a spinner cycling through `⠋⠙⠹⠸`) changes around
+    /// it. Pre-RC1 the dedup hashed the entire tail → spinner tick
+    /// changed the hash → false refresh fired. Post-RC1 the dedup
+    /// hashes ONLY the matched marker substring → adjacent-line
+    /// changes don't break dedup → no refresh.
+    #[test]
+    fn t5_685_pr2_rc1_changing_adjacent_line_does_not_refresh() {
+        let mut tracker = StateTracker::new(Some(&Backend::Codex));
+        tracker.last_productive_output = Instant::now() - Duration::from_secs(60);
+
+        // Feed 1: stale marker in tail (row 36 of 40), spinner-A at
+        // row 38. Note marker is in last-5-rows window so it WILL
+        // match — but it's stale evidence (operator caused this in
+        // some past tool run that's still visible in viewport).
+        let lines1: Vec<String> = (0..40)
+            .map(|i| match i {
+                36 => "apply_patch succeeded for /tmp/foo.txt".to_string(),
+                38 => "⠋ Working...".to_string(),
+                _ => format!("background row {i}"),
+            })
+            .collect();
+        tracker.feed(&lines1.join("\n"));
+        let after_first = tracker.last_productive_output;
+
+        // Feed 2: SAME marker at SAME row 36, spinner-A → spinner-B
+        // (next braille tick) at row 38. Tail changes (spinner) but
+        // matched marker substring unchanged → dedup MUST suppress
+        // refresh.
+        let lines2: Vec<String> = (0..40)
+            .map(|i| match i {
+                36 => "apply_patch succeeded for /tmp/foo.txt".to_string(),
+                38 => "⠙ Working...".to_string(), // ← tick changed
+                _ => format!("background row {i}"),
+            })
+            .collect();
+        tracker.feed(&lines2.join("\n"));
+
+        assert_eq!(
+            tracker.last_productive_output, after_first,
+            "#685 PR-2 RC1: stale marker + adjacent spinner tick must NOT re-refresh — \
+             dedup hashes matched substring, not surrounding context"
+        );
+    }
+
+    /// #685 PR-2 T4: same-tail-content dedup. When the recent tail
+    /// stays identical across two feeds (some screen change OUTSIDE
+    /// the tail breaks the top-level hash-dedup gate), the productive
+    /// timer must not double-refresh — no fresh evidence.
+    #[test]
+    fn t4_685_pr2_identical_recent_tail_does_not_double_refresh() {
+        let mut tracker = StateTracker::new(Some(&Backend::Codex));
+        tracker.last_productive_output = Instant::now() - Duration::from_secs(60);
+
+        // Feed 1: marker in tail, plus arbitrary content above.
+        let mut screen1: Vec<String> = (0..35).map(|i| format!("scrollback row {i}")).collect();
+        screen1.push("apply_patch succeeded for /tmp/foo.txt".to_string());
+        screen1.push("(no other change)".to_string());
+        screen1.push("(no other change)".to_string());
+        screen1.push("(no other change)".to_string());
+        screen1.push("(no other change)".to_string());
+        let s1 = screen1.join("\n");
+        tracker.feed(&s1);
+        let after_first = tracker.last_productive_output;
+
+        // Feed 2: ABOVE-tail content changes (forces top-level hash to
+        // differ → feed() body runs) but the LAST 5 rows are
+        // identical to feed 1. Per #685 PR-2 dedup, refresh must NOT
+        // re-fire — same recent context, no new evidence.
+        let mut screen2: Vec<String> = (0..35)
+            .map(|i| format!("scrollback row {i} CHANGED"))
+            .collect();
+        screen2.push("apply_patch succeeded for /tmp/foo.txt".to_string());
+        screen2.push("(no other change)".to_string());
+        screen2.push("(no other change)".to_string());
+        screen2.push("(no other change)".to_string());
+        screen2.push("(no other change)".to_string());
+        let s2 = screen2.join("\n");
+        tracker.feed(&s2);
+
+        assert_eq!(
+            tracker.last_productive_output, after_first,
+            "#685 PR-2: identical recent tail across feeds must NOT double-refresh"
+        );
     }
 }
