@@ -97,18 +97,20 @@ Feature/fix PRs must be test-first: failing test commit BEFORE impl commit.
 - (d) Removing defensive code → 4-perspective counter-example challenge; 0 compelling = safe to delete
 
 ### 3.12 Verdict Externalization (was §3.5.13)
-Fleet-internal verdict MUST mirror to GH PR comment (`gh pr comment`). Self-merge gate: dual VERIFIED + CI green (independently verified via `gh pr checks`) + verdict mirror posted — all three required before merge.
+Fleet-internal verdict MUST mirror to GH PR comment (`gh pr comment`). Self-merge gate: dual VERIFIED + CI green (independently verified via `gh pr checks`) + verdict mirror posted — all three required before merge. Canonical merge command is `gh pr merge <N> --auto --squash --delete-branch` (§3.12.1 ACTIVE since 2026-05-20). Legacy form `gh pr merge <N> --squash --delete-branch` remains valid as escape-hatch for queue-contention recovery or admin-bypass scenarios (per #985/#988 deviation precedent).
 
-#### 3.12.1 `gh pr merge --auto` adoption (Sprint 65, #973)
+#### 3.12.1 `gh pr merge --auto` adoption (Sprint 65, #973) — ACTIVE since 2026-05-20
 
 The canonical self-merge invocation is `gh pr merge <N> --auto --squash --delete-branch` (requires `gh` CLI >= 2.31.0). `--auto` moves merge submission to GitHub's server-side queue, eliminating the "Base branch was modified" race observed in #971 close-loop (2026-05-20).
+
+**Activation status**: ACTIVE as of 2026-05-20 after #986 gh-poll integration shipped (PR #990, merge commit 4242c24). Prior to this date the canonical form was the legacy synchronous `gh pr merge <N> --squash --delete-branch` because `--auto`'s async-return discarded the synchronous merge confirmation. With #972 PR-state aggregator + #986 gh-poll integration both live, the `[pr-merged]` event now fires from real GitHub observation post-merge, restoring async-flow visibility and unlocking this default switch.
 
 **Prerequisites** (one-time per repo, enabled in #973):
 - `allow_auto_merge: true` at repo level (`gh api repos/<owner>/<repo> -X PATCH -F allow_auto_merge=true`)
 - Branch protection on `main` with `required_status_checks.strict=true` covering the full CI matrix (`Check (ubuntu-latest|macos-latest|windows-latest)`, `LOC overrun`, `audit`). Without `strict=true`, `--auto` invoked after all checks already reported merges IMMEDIATELY — silently skipping the §3.12 conjunction gate. With `strict=true`, GitHub re-checks against current main before merging.
 - Admin-permission note: enabling these settings requires repo admin rights. Delegated maintainers should request via operator.
 
-**Behavior**: `gh pr merge --auto` returns immediately (does NOT block on CI). Merge fires asynchronously when the protection-gate conjunction holds. Author MUST NOT poll manually; the `[pr-merged]` event (delivered by daemon PR-state aggregator, #972) is the close-loop confirmation source.
+**Behavior**: `gh pr merge --auto` returns immediately (does NOT block on CI). Merge fires asynchronously when the protection-gate conjunction holds. Author MUST NOT poll manually; the `[pr-merged]` event (delivered by daemon PR-state aggregator #972 + gh-poll observation #986) is the close-loop confirmation source.
 
 **Escape-hatch — stalled `--auto`**: if no `[pr-merged]` arrives within 30 min of CI green + verdict mirror posted, possible causes:
 1. Required check never reports (CI infrastructure issue)
@@ -122,9 +124,9 @@ Recovery, in order:
 - (d) Last resort — manual fallback: `gh pr merge <N> --squash --delete-branch` (synchronous; may hit base-modified race; retry 3s later if it does)
 - Notify lead via `send(kind=update)` if escape-hatch invoked, with case (a)/(b)/(c)/(d) identifier.
 
-**Bundle dependency on #972**: `--auto` returns immediately, so the synchronous "PR merged at SHA" terminal feedback is gone. The daemon PR-state aggregator (#972) emits `[pr-merged]` events to the PR author's inbox after observing the GitHub-side merge. Until #972 lands, manual `gh pr view <N> --json state` polling is the only close-loop confirmation; once #972 lands, the polling is replaced by the event.
+**Async confirmation pipeline (#972 + #986)**: `--auto` returns immediately, so the synchronous "PR merged at SHA" terminal feedback is gone. The daemon PR-state aggregator (#972, merged be23875) + gh-poll integration (#986, merged 4242c24) together emit `[pr-merged]` events to the PR author's inbox after observing the GitHub-side merge. Author waits for the event rather than polling.
 
-**Activation order**: #973 lands first (this PR; enables `--auto` infrastructure + docs). Lead dispatch templates and `active_poll_post_dispatch.md` memory continue to reference the legacy synchronous form until #972 lands. After #972 ships, a follow-up commit/PR switches defaults to `--auto`.
+**Activation history**: §3.12.1 was introduced in #973 (this rule's home PR) but kept INACTIVE until #972 + #986 both shipped. Activation switch landed 2026-05-20 as a docs-only follow-up (flips canonical form from legacy `gh pr merge ... --squash --delete-branch` to `gh pr merge ... --auto --squash --delete-branch`).
 
 ### 3.13 Log-level Changes (was §3.5.14)
 Must have inline rationale, otherwise `LEVEL-CHANGE-RATIONALE-ABSENT — UNVERIFIED`.
