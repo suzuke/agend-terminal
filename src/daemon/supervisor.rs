@@ -270,6 +270,15 @@ fn run_loop(home: PathBuf, registry: AgentRegistry) {
         auto_release_tracker.maybe_scan(&home);
         dispatch_idle_tracker.maybe_scan(&home);
         dispatch_idle_fixup_nudge_tracker.maybe_scan(&home);
+        // #1002 Phase 2: pr_state per-tick scan must run here so APP
+        // mode (`agend-terminal app`) drives the #972 aggregator + #986
+        // gh-poll integration the same way as daemon mode. Before this
+        // line, `PrStateScanHandler` was wired ONLY into `run_core`'s
+        // `PerTickHandler` vec (dual-entry-point divergence); APP-mode
+        // operators (the agent fleet) saw `last_gh_poll_at: null`
+        // indefinitely + no `[pr-ready-for-merge]` events.
+        // Source-pin: `pr_state_scan_wired_into_supervisor_loop`.
+        crate::daemon::pr_state::scan_and_emit(&home, &registry);
         // #836: reclaim expired (10-min TTL) entries from the
         // notification-dedup ledger so memory pressure stays bounded
         // on long-lived daemons.
@@ -2007,5 +2016,31 @@ mod tests {
         );
         std::env::remove_var("AGEND_PANE_INPUT_THRESHOLD_SECS");
         std::fs::remove_dir_all(home).ok();
+    }
+
+    /// #1002 Phase 2 source-pin: supervisor's per-tick loop MUST call
+    /// `crate::daemon::pr_state::scan_and_emit`. The #972 / #986
+    /// aggregator + gh-poll integration was previously wired only via
+    /// `run_core`'s `PerTickHandler` vec (daemon-only entry). In APP
+    /// mode (`agend-terminal app`), `run_core` is never called — the
+    /// supervisor loop is the canonical per-tick driver instead.
+    /// Without this wiring, `last_gh_poll_at: null` persists
+    /// indefinitely and `[pr-ready-for-merge]` events never emit.
+    ///
+    /// File-level positive pin (cross-platform-safe; same pattern as
+    /// `app::tests::flush_idle_notifications_wired_to_submit_aware_inject`
+    /// from #982 RC2). If a future refactor moves the call out of
+    /// the loop, update this assertion alongside.
+    #[test]
+    fn pr_state_scan_wired_into_supervisor_loop() {
+        let source = std::fs::read_to_string("src/daemon/supervisor.rs")
+            .or_else(|_| std::fs::read_to_string("agend-terminal/src/daemon/supervisor.rs"))
+            .expect("source file must be readable from test cwd");
+        assert!(
+            source.contains("pr_state::scan_and_emit"),
+            "supervisor per-tick loop must invoke pr_state::scan_and_emit \
+             (#1002 Phase 2 dual-entry-point fix). Without this, APP-mode \
+             daemons silently skip the #972 aggregator + #986 gh-poll path."
+        );
     }
 }
