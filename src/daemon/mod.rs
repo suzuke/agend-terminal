@@ -714,16 +714,17 @@ fn run_core(
         // `let handlers = …` above). The pre-collapse call order is
         // preserved verbatim by the Vec literal's element order; this
         // loop is the only call site.
-        for handler in &handlers {
-            // #941: wrap each handler.run() in an Instant measurement so
-            // `HANDLER_TIMING` (per_tick/mod.rs) accumulates per-handler
-            // stats for the periodic ThreadDumpHandler. When thread-dump
-            // is disabled, `record_handler_timing` is a sub-µs no-op
-            // (one cached atomic load + early return).
-            let start = std::time::Instant::now();
-            handler.run(&tick_ctx);
-            per_tick::record_handler_timing(handler.name(), start.elapsed());
-        }
+        //
+        // #1002 Phase 1: dispatch now goes through
+        // `per_tick::run_handlers_with_panic_guard`, which wraps each
+        // `handler.run()` in `catch_unwind`. A panic in handler N no
+        // longer aborts handlers N+1..end on the same tick — they all
+        // run, and the panic is logged with handler identity instead
+        // of vanishing. The wrapper folds in #941 per-handler timing
+        // (previously inline here). See
+        // `per_tick::tests::panicking_handler_does_not_skip_siblings`
+        // for the regression-pin.
+        per_tick::run_handlers_with_panic_guard(&handlers, &tick_ctx);
 
         // Handle exit event (if any)
         let exit_event = match exit_event {

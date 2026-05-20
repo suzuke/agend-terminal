@@ -563,26 +563,61 @@ pub fn record_verdict(
     reviewed_head: Option<&str>,
     kind: VerdictKind<'_>,
 ) {
+    // #1002 Phase 1: tracing on every silent gate (A-E) so the next
+    // #982-style "verdict_state stuck at None" bisect can identify
+    // which gate fired without code spelunking.
     let Some(reviewed_head) = reviewed_head else {
+        tracing::debug!(
+            task_id,
+            reviewer,
+            "#1002 record_verdict skipped (gate A) — reviewed_head is None; \
+             reviewer kind=report did not carry reviewed_head field"
+        );
         return;
     };
     // Look up task → branch via list_all (no per-id getter in v1).
     // Pre-filter by task id so we only iterate enough to find the match.
-    let branch = match crate::tasks::list_all(home)
+    let task = crate::tasks::list_all(home)
         .into_iter()
-        .find(|t| t.id == task_id)
-        .and_then(|t| t.branch)
-    {
+        .find(|t| t.id == task_id);
+    let Some(task) = task else {
+        tracing::debug!(
+            task_id,
+            reviewer,
+            "#1002 record_verdict skipped (gate B) — task not found in task board; \
+             correlation_id likely mismatched (e.g. used review-task id instead of impl-task id)"
+        );
+        return;
+    };
+    let branch = match task.branch {
         Some(b) if !b.is_empty() => b,
-        _ => return,
+        _ => {
+            tracing::debug!(
+                task_id,
+                reviewer,
+                "#1002 record_verdict skipped (gate C) — task.branch field empty; \
+                 task was created without a branch hint"
+            );
+            return;
+        }
     };
     // We don't always know the repo from the task. Walk the pr-state
     // directory and find the file whose branch matches. (Typically 1
     // pr per branch; ambiguity unlikely.)
     let dir = pr_state_dir(home);
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return;
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::debug!(
+                task_id,
+                dir = %dir.display(),
+                error = %e,
+                "#1002 record_verdict skipped (gate D) — pr-state dir read failed"
+            );
+            return;
+        }
     };
+    let mut matched_any = false;
     for entry in entries.flatten() {
         let path = entry.path();
         let Ok(content) = std::fs::read_to_string(&path) else {
@@ -594,6 +629,7 @@ pub fn record_verdict(
         if state.branch != branch {
             continue;
         }
+        matched_any = true;
         apply(
             &mut state,
             Event::VerdictObserved {
@@ -610,6 +646,15 @@ pub fn record_verdict(
                 "#972 pr_state: record_verdict save failed"
             );
         }
+    }
+    if !matched_any {
+        tracing::debug!(
+            task_id,
+            branch = %branch,
+            reviewer,
+            "#1002 record_verdict noop (gate E) — no pr-state file matched task branch; \
+             CI watch may not have created the file yet for this branch"
+        );
     }
 }
 
@@ -686,16 +731,40 @@ pub fn scan_and_emit_with(
     let dir = pr_state_dir(home);
     // #986: Phase 1 — batched gh-poll per repo for files due.
     apply_gh_poll(home, &dir, poller);
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return;
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::debug!(
+                dir = %dir.display(),
+                error = %e,
+                "#1002 pr_state: scan_and_emit_with read_dir failed — skipping tick"
+            );
+            return;
+        }
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            continue;
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(
+                    path = %path.display(),
+                    error = %e,
+                    "#1002 pr_state: scan_and_emit_with read_to_string failed — skipping file"
+                );
+                continue;
+            }
         };
-        let Ok(mut state): Result<PrState, _> = serde_json::from_str(&content) else {
-            continue;
+        let mut state: PrState = match serde_json::from_str(&content) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(
+                    path = %path.display(),
+                    error = %e,
+                    "#1002 pr_state: scan_and_emit_with json parse failed — skipping file"
+                );
+                continue;
+            }
         };
         let mut dirty = false;
 
@@ -792,19 +861,45 @@ pub fn scan_and_emit_with(
 fn apply_gh_poll(home: &Path, dir: &Path, poller: &dyn gh_poll::GhPoller) {
     use std::collections::HashMap;
 
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::debug!(
+                dir = %dir.display(),
+                error = %e,
+                "#1002 apply_gh_poll read_dir failed — gh-poll skipped this tick"
+            );
+            return;
+        }
     };
     let now = chrono::Utc::now().to_rfc3339();
     // Group files by repo + collect those due for refresh.
     let mut by_repo: HashMap<String, Vec<PrState>> = HashMap::new();
+    let mut skipped_terminal = 0u32;
+    let mut skipped_should_poll = 0u32;
     for entry in entries.flatten() {
         let path = entry.path();
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            continue;
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(
+                    path = %path.display(),
+                    error = %e,
+                    "#1002 apply_gh_poll read_to_string failed — skipping file"
+                );
+                continue;
+            }
         };
-        let Ok(state): Result<PrState, _> = serde_json::from_str(&content) else {
-            continue;
+        let state: PrState = match serde_json::from_str(&content) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(
+                    path = %path.display(),
+                    error = %e,
+                    "#1002 apply_gh_poll json parse failed — skipping file"
+                );
+                continue;
+            }
         };
         // Skip already-terminal states — they'll be swept by the
         // main scanner loop on this pass.
@@ -812,11 +907,22 @@ fn apply_gh_poll(home: &Path, dir: &Path, poller: &dyn gh_poll::GhPoller) {
             state.merge_state,
             MergeState::Merged { .. } | MergeState::ClosedUnmerged { .. }
         ) {
+            skipped_terminal = skipped_terminal.saturating_add(1);
             continue;
         }
         if gh_poll::should_poll(&state, &now) {
             by_repo.entry(state.repo.clone()).or_default().push(state);
+        } else {
+            skipped_should_poll = skipped_should_poll.saturating_add(1);
         }
+    }
+    if !by_repo.is_empty() || skipped_terminal > 0 || skipped_should_poll > 0 {
+        tracing::debug!(
+            repos_to_poll = by_repo.len(),
+            skipped_terminal,
+            skipped_should_poll_cadence = skipped_should_poll,
+            "#1002 apply_gh_poll grouping done"
+        );
     }
     for (repo, due_states) in by_repo {
         match poller.poll(&repo) {
@@ -1973,6 +2079,85 @@ mod tests {
         scan_and_emit_with(&home, &empty_registry(), &poller);
         let msgs2 = crate::inbox::drain(&home, "dev");
         assert_eq!(msgs2.len(), 0, "second scan: file swept, no re-emit");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    fn tmp_home_for_1002(tag: &str) -> std::path::PathBuf {
+        let home = std::env::temp_dir().join(format!("agend-1002-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").unwrap();
+        std::fs::create_dir_all(home.join("inbox")).ok();
+        home
+    }
+
+    /// #1002 Phase 1 observability pin: a malformed pr-state JSON
+    /// file MUST emit a tracing::debug! message identifying the path
+    /// and parse error, rather than silently continuing.
+    ///
+    /// Pre-fix code at `scan_and_emit_with` had:
+    ///   let Ok(state): Result<PrState, _> = serde_json::from_str(&content)
+    ///       else { continue; };
+    /// — the silent `continue` meant a corrupt file or a schema-skew
+    /// PrState was indistinguishable from "no files at all". This pin
+    /// catches the next regression where a silent skip masks a real
+    /// issue.
+    #[test]
+    #[tracing_test::traced_test]
+    fn t15_malformed_pr_state_file_emits_observability_trace() {
+        let home = tmp_home_for_1002("t15-malformed");
+        let dir = pr_state_dir(&home);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Write a deliberately malformed pr-state JSON file.
+        let bad_path = dir.join("malformed.json");
+        std::fs::write(&bad_path, "{this is not json").unwrap();
+
+        // MockGhPoller with no responses — apply_gh_poll's
+        // read_dir/parse layer is exercised first and emits its own
+        // trace; the scanner-loop layer also reads the same dir.
+        let poller = MockGhPoller::new(vec![]);
+        scan_and_emit_with(&home, &empty_registry(), &poller);
+
+        // The malformed file path appears in tracing output via the
+        // #1002 debug line. We don't pin the exact format (impl-detail)
+        // but require:
+        //   1. The new "#1002" tracing marker is present
+        //   2. The malformed file's name is referenced
+        assert!(
+            logs_contain("#1002"),
+            "scanner must emit a #1002-tagged observability trace on malformed file"
+        );
+        assert!(
+            logs_contain("malformed.json"),
+            "trace must identify the malformed file by name"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// #1002 Phase 1 observability pin: record_verdict's gate A
+    /// (reviewed_head is None) MUST emit a tracing::debug! identifying
+    /// the silent skip with the gate marker. Pre-fix, the early-return
+    /// at `let Some(reviewed_head) = reviewed_head else { return };`
+    /// silently swallowed the call; #982's verdict_state stuck at
+    /// None could not be bisected without code spelunking.
+    #[test]
+    #[tracing_test::traced_test]
+    fn t16_record_verdict_gate_a_emits_observability_trace() {
+        let home = tmp_home_for_1002("t16-gate-a");
+        // record_verdict with reviewed_head=None hits gate A
+        // immediately — no fleet or pr-state setup required.
+        record_verdict(
+            &home,
+            "t-fake-task-id",
+            "fixup-reviewer",
+            None,
+            VerdictKind::Verified,
+        );
+        assert!(
+            logs_contain("#1002"),
+            "record_verdict must emit a #1002 observability trace on gate A"
+        );
+        assert!(logs_contain("gate A"), "trace must identify gate A by name");
         let _ = std::fs::remove_dir_all(&home);
     }
 }
