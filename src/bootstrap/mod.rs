@@ -328,10 +328,11 @@ fn try_attach(home: &Path, fleet_path: &Path) -> Result<Option<AttachedFleet>> {
 }
 
 fn acquire_daemon_lock(home: &Path) -> Result<DaemonLock> {
-    use fs4::fs_std::FileExt;
     let path = home.join(".daemon.lock");
     let file = std::fs::File::create(&path).with_context(|| format!("open {}", path.display()))?;
-    file.try_lock_exclusive().map_err(|e| {
+    // Explicit trait method: Rust 1.89 stabilized inherent
+    // `File::try_lock` shadowing the trait method; current MSRV is 1.87.
+    fs4::FileExt::try_lock(&file).map_err(|e| {
         anyhow!("another agend-terminal daemon is already running (lock held): {e}")
     })?;
     Ok(DaemonLock { _file: file })

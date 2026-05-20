@@ -146,8 +146,11 @@ pub fn acquire_file_lock(lock_path: &Path) -> anyhow::Result<std::fs::File> {
         .create(true)
         .truncate(false)
         .open(lock_path)?;
-    use fs4::fs_std::FileExt;
-    f.lock_exclusive()
+    // Trait method explicit because Rust 1.89 stabilized inherent
+    // `File::lock` with the same name; without explicit trait syntax,
+    // the inherent method would be selected and clippy MSRV gate fires
+    // (current MSRV is 1.87 per `rust-version`).
+    fs4::FileExt::lock(&f)
         .map_err(|e| anyhow::anyhow!("flock failed on {}: {e}", lock_path.display()))?;
     Ok(f)
 }
@@ -420,9 +423,9 @@ mod tests {
 
     #[test]
     fn test_acquire_file_lock_is_exclusive_same_process() {
-        // On the same process, a second lock_exclusive on a different File
+        // On the same process, a second lock on a different File
         // handle for the same path blocks; try_lock should refuse.
-        use fs4::fs_std::FileExt;
+        // Explicit trait method (see comment in acquire_file_lock).
         let dir = tmp_dir("flock");
         let lock_path = dir.join("my.lock");
         let guard = acquire_file_lock(&lock_path).expect("first lock");
@@ -434,12 +437,12 @@ mod tests {
             .open(&lock_path)
             .expect("open");
         assert!(
-            second.try_lock_exclusive().is_err(),
+            fs4::FileExt::try_lock(&second).is_err(),
             "second exclusive lock must fail while first held"
         );
         drop(guard);
         // After drop, second can acquire.
-        assert!(second.try_lock_exclusive().is_ok());
+        assert!(fs4::FileExt::try_lock(&second).is_ok());
         fs::remove_dir_all(&dir).ok();
     }
 

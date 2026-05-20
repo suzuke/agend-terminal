@@ -291,9 +291,9 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
     std::fs::create_dir_all(home)?;
     let lock_path = home.join(".daemon.lock");
     let lock_file = std::fs::File::create(&lock_path)?;
-    use fs4::fs_std::FileExt;
-    lock_file
-        .try_lock_exclusive()
+    // Explicit trait method: Rust 1.89 stabilized inherent
+    // `File::try_lock`; current MSRV is 1.87.
+    fs4::FileExt::try_lock(&lock_file)
         .map_err(|e| anyhow::anyhow!("Another daemon is already running (lock held): {e}"))?;
 
     // #933: zombie sweep BEFORE find_active_run_dir so an aged-out
