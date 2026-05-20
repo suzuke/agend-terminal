@@ -25,6 +25,10 @@ pub const WATCH_TTL_HOURS: i64 = 72;
 // some items is via the trait object inside `watcher::check_ci_watches`.
 #[allow(unused_imports)]
 pub use poller::{emit_ci_conflict_alert, watch_start_check_mergeable};
+// #972: re-export only consumed by the in-crate pr_state tests; cfg(test)
+// gates the clippy unused-imports rule when building production binary.
+#[cfg(test)]
+pub(crate) use poller::parse_review_class;
 #[allow(unused_imports)]
 pub use provider::{
     detect_provider_from_remote, github_token_warning, github_token_warning_from_env,

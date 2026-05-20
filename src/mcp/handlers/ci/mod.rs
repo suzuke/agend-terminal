@@ -532,6 +532,18 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
     if let Some(next) = args["next_after_ci"].as_str().filter(|s| !s.is_empty()) {
         watch["next_after_ci"] = json!(next);
     }
+    // #972 reviewer-rejection fix: persist `review_class` so the
+    // pr_state aggregator can honor §3.5 dual-review at runtime. Accepted
+    // values: `"single"` (default — §3.6) or `"dual"` (§3.5). Other
+    // strings are tolerated and treated as Single at read time
+    // (see `daemon::ci_watch::poller::parse_review_class`). Without
+    // this field operator must currently `delete fleet.yaml` to
+    // remove the watch and re-arm with `--review-class dual` —
+    // documented as a workflow gap to close in a follow-up CLI/MCP
+    // exposure.
+    if let Some(rc) = args["review_class"].as_str().filter(|s| !s.is_empty()) {
+        watch["review_class"] = json!(rc);
+    }
 
     // #779 P2 Piece 3 site B: atomic_write failure (disk full,
     // permission, etc.) previously surfaced as `let _ = ...` silent

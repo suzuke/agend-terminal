@@ -538,6 +538,25 @@ pub(crate) fn dedupe_notifications_by_head_sha<'a>(
 /// Returns Some("failure") if any run failed.
 /// Returns Some("success") only if all runs succeeded.
 /// Returns None if no runs match.
+/// #972 reviewer-rejection fix: extract `review_class` from a ci-watch
+/// JSON value. `"dual"` (case-insensitive) → `ReviewClass::Dual`; any
+/// other value (including absent / null / unknown) → `ReviewClass::Single`.
+/// Source of the field: `mcp_watch_ci` MCP handler accepts a
+/// `review_class` argument and persists it into the watch file.
+pub(crate) fn parse_review_class(
+    watch: &serde_json::Value,
+) -> crate::daemon::pr_state::ReviewClass {
+    match watch
+        .get("review_class")
+        .and_then(|v| v.as_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("dual") => crate::daemon::pr_state::ReviewClass::Dual,
+        _ => crate::daemon::pr_state::ReviewClass::Single,
+    }
+}
+
 pub(crate) fn aggregate_conclusion_for_sha<'a>(runs: &'a [CiRun], sha: &str) -> Option<&'a str> {
     let matching: Vec<&CiRun> = runs.iter().filter(|r| r.head_sha == sha).collect();
     if matching.is_empty() {
@@ -1144,6 +1163,12 @@ async fn ci_check_repo(
                     None => crate::daemon::pr_state::CiConclusion::Pending,
                 };
                 let subscribers = crate::daemon::ci_watch::parse_subscribers(&watch);
+                // #972 reviewer-rejection fix: propagate the watch
+                // file's `review_class` field into pr_state so the
+                // dual-review (§3.5) threshold is honored at runtime.
+                // Pre-fix: PrState defaulted to Single → one VERIFIED
+                // opened the merge gate even for dual-review PRs.
+                let review_class = parse_review_class(&watch);
                 crate::daemon::pr_state::record_ci_result(
                     home,
                     repo,
@@ -1151,6 +1176,7 @@ async fn ci_check_repo(
                     current_sha,
                     conclusion,
                     subscribers,
+                    review_class,
                 );
             }
         }

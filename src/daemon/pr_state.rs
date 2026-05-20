@@ -445,7 +445,16 @@ pub fn remove(home: &Path, repo: &str, branch: &str) -> std::io::Result<()> {
 /// Build a fresh PrState for a newly-observed (repo, branch) pair.
 /// `pr_number` and `pr_author` default to placeholders; the per-tick
 /// scanner fills them in via `gh pr view` on next pass.
-pub fn new_for_branch(repo: &str, branch: &str, head_sha: &str) -> PrState {
+///
+/// `review_class` is the §3.5 / §3.6 threshold; sourced from the
+/// ci-watch file (operator-set via `ci action=watch review_class=…`).
+/// Default `ReviewClass::Single` when the watch file omits the field.
+pub fn new_for_branch(
+    repo: &str,
+    branch: &str,
+    head_sha: &str,
+    review_class: ReviewClass,
+) -> PrState {
     let now = chrono::Utc::now().to_rfc3339();
     PrState {
         repo: repo.to_string(),
@@ -458,7 +467,7 @@ pub fn new_for_branch(repo: &str, branch: &str, head_sha: &str) -> PrState {
         verdict_state: VerdictState::None,
         merge_state: MergeState::NotReady,
         draft_state: DraftState::Ready,
-        review_class: ReviewClass::Single,
+        review_class,
         ready_emitted_for_sha: None,
         auto_armed: false,
         auto_armed_for_sha: None,
@@ -473,6 +482,14 @@ pub fn new_for_branch(repo: &str, branch: &str, head_sha: &str) -> PrState {
 /// the pr_state file, applies the event, saves. Failures are
 /// `tracing::warn`-logged but never propagated (must not block CI
 /// poll — same discipline as #870 `auto_release::enqueue_intent`).
+///
+/// `review_class` is sourced from the ci-watch file's `review_class`
+/// field (see [`crate::daemon::ci_watch::poller::parse_review_class`]).
+/// Applied on FIRST observation (file creation); subsequent
+/// observations preserve the existing `review_class` to avoid
+/// flapping if the watch file mutates mid-PR. Operator who needs
+/// to change review_class mid-flight should `remove` the pr_state
+/// file before re-running `ci action=watch`.
 pub fn record_ci_result(
     home: &Path,
     repo: &str,
@@ -480,9 +497,10 @@ pub fn record_ci_result(
     head_sha: &str,
     conclusion: CiConclusion<'_>,
     subscribers: Vec<String>,
+    review_class: ReviewClass,
 ) {
-    let mut state =
-        load(home, repo, branch).unwrap_or_else(|| new_for_branch(repo, branch, head_sha));
+    let mut state = load(home, repo, branch)
+        .unwrap_or_else(|| new_for_branch(repo, branch, head_sha, review_class));
     if !subscribers.is_empty() && state.subscribers.is_empty() {
         state.subscribers = subscribers;
     }
@@ -1310,6 +1328,7 @@ mod tests {
             "sha-A",
             CiConclusion::Pending,
             vec!["dev".to_string()],
+            ReviewClass::Single,
         );
         let s = load(&dir, "owner/repo", "feat/x").expect("created");
         assert_eq!(s.head_sha, "sha-A");
@@ -1323,9 +1342,179 @@ mod tests {
             "sha-A",
             CiConclusion::Green,
             vec![],
+            ReviewClass::Single,
         );
         let s = load(&dir, "owner/repo", "feat/x").expect("reloaded");
         assert!(matches!(s.ci_state, CiState::Green { .. }));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T19 (reviewer-rejection fix coverage): `record_ci_result` honors
+    /// the `review_class` argument on FIRST observation, persists it to
+    /// the pr_state file. This is the production code path that was
+    /// missing pre-#972-rejection-fix — without it the pr_state file
+    /// always defaulted to Single regardless of ci-watch's
+    /// `review_class` field.
+    #[test]
+    fn t19_record_ci_result_propagates_review_class_dual() {
+        let dir = std::env::temp_dir().join(format!("agend-972-dual-prop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // First observation with Dual. File MUST have Dual.
+        record_ci_result(
+            &dir,
+            "owner/repo",
+            "feat/dual",
+            "sha-A",
+            CiConclusion::Pending,
+            vec!["dev".to_string()],
+            ReviewClass::Dual,
+        );
+        let s = load(&dir, "owner/repo", "feat/dual").expect("created");
+        assert_eq!(
+            s.review_class,
+            ReviewClass::Dual,
+            "first-observation review_class must propagate from ci-watch"
+        );
+
+        // Subsequent observation: existing review_class preserved (no
+        // mid-flight flapping if the watch file mutates).
+        record_ci_result(
+            &dir,
+            "owner/repo",
+            "feat/dual",
+            "sha-A",
+            CiConclusion::Green,
+            vec![],
+            ReviewClass::Single,
+        );
+        let s = load(&dir, "owner/repo", "feat/dual").expect("reloaded");
+        assert_eq!(
+            s.review_class,
+            ReviewClass::Dual,
+            "subsequent observation must NOT override the initial review_class"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T20 (reviewer-rejection fix end-to-end): full pipeline for a
+    /// dual-review PR. CI green + ONE VERIFIED → NotReady. Second
+    /// VERIFIED from a distinct reviewer at the same SHA → MergeReady.
+    /// scan_and_emit fires `[pr-ready-for-merge]` only on the second
+    /// verdict, not the first.
+    #[test]
+    fn t20_dual_review_does_not_merge_until_two_verdicts_e2e() {
+        use parking_lot::Mutex;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let dir = std::env::temp_dir().join(format!("agend-972-dual-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.join("inbox")).ok();
+
+        // First CI observation arms the file with Dual.
+        record_ci_result(
+            &dir,
+            "owner/repo",
+            "feat/dual-e2e",
+            "sha-A",
+            CiConclusion::Green,
+            vec!["dev".to_string()],
+            ReviewClass::Dual,
+        );
+
+        // ONE verdict arrives. State must NOT transition to MergeReady.
+        let mut s = load(&dir, "owner/repo", "feat/dual-e2e").unwrap();
+        apply(
+            &mut s,
+            Event::VerdictObserved {
+                reviewer: "rev-1",
+                reviewed_head: "sha-A",
+                kind: VerdictKind::Verified,
+            },
+        );
+        assert_eq!(
+            s.merge_state,
+            MergeState::NotReady,
+            "dual-review with one verdict must stay NotReady"
+        );
+        save(&dir, &s).unwrap();
+
+        // Scanner pass: NO event emitted because state is NotReady.
+        let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        scan_and_emit(&dir, &registry);
+        assert!(
+            crate::inbox::drain(&dir, "dev").is_empty(),
+            "no [pr-ready-for-merge] until second verdict"
+        );
+
+        // SECOND verdict from distinct reviewer. Now MergeReady.
+        let mut s = load(&dir, "owner/repo", "feat/dual-e2e").unwrap();
+        apply(
+            &mut s,
+            Event::VerdictObserved {
+                reviewer: "rev-2",
+                reviewed_head: "sha-A",
+                kind: VerdictKind::Verified,
+            },
+        );
+        assert_eq!(s.merge_state, MergeState::MergeReady);
+        save(&dir, &s).unwrap();
+
+        // Scanner now fires [pr-ready-for-merge].
+        scan_and_emit(&dir, &registry);
+        let msgs = crate::inbox::drain(&dir, "dev");
+        assert_eq!(msgs.len(), 1, "second verdict unlocks the merge gate");
+        assert_eq!(msgs[0].kind.as_deref(), Some("pr-ready-for-merge"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T21 (reviewer-rejection fix coverage): `parse_review_class` (in
+    /// `ci_watch::poller`) is the production source of the
+    /// `ReviewClass` value passed into `record_ci_result`. Pin the
+    /// parser contract: "dual" (case-insensitive) → Dual; everything
+    /// else (absent / null / unknown string / wrong type) → Single.
+    #[test]
+    fn t21_parse_review_class_contract() {
+        use crate::daemon::ci_watch::parse_review_class;
+        use serde_json::json;
+
+        assert_eq!(
+            parse_review_class(&json!({"review_class": "dual"})),
+            ReviewClass::Dual
+        );
+        assert_eq!(
+            parse_review_class(&json!({"review_class": "DUAL"})),
+            ReviewClass::Dual
+        );
+        assert_eq!(
+            parse_review_class(&json!({"review_class": "Dual"})),
+            ReviewClass::Dual
+        );
+        assert_eq!(
+            parse_review_class(&json!({"review_class": "single"})),
+            ReviewClass::Single
+        );
+        assert_eq!(
+            parse_review_class(&json!({"review_class": "unknown"})),
+            ReviewClass::Single,
+            "unknown strings default to Single (safe fallback)"
+        );
+        assert_eq!(
+            parse_review_class(&json!({"review_class": null})),
+            ReviewClass::Single
+        );
+        assert_eq!(
+            parse_review_class(&json!({})),
+            ReviewClass::Single,
+            "absent field defaults to Single"
+        );
+        assert_eq!(
+            parse_review_class(&json!({"review_class": 42})),
+            ReviewClass::Single,
+            "wrong type defaults to Single"
+        );
     }
 }

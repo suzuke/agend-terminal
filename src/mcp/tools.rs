@@ -228,7 +228,8 @@ fn ci_tools() -> Vec<Value> {
                 "repo": {"type": "string", "description": "GitHub repo (owner/repo). Required for watch/unwatch; optional filter for status."},
                 "branch": {"type": "string", "description": "Branch to watch (default: main); optional filter for status."},
                 "interval_secs": {"type": "number", "description": "Poll interval in seconds (default: 60)"},
-                "next_after_ci": {"type": "string", "description": "Instance to auto-notify when CI passes. Daemon sends [ci-ready-for-action] to this target."}
+                "next_after_ci": {"type": "string", "description": "Instance to auto-notify when CI passes. Daemon sends [ci-ready-for-action] to this target."},
+                "review_class": {"type": "string", "enum": ["single", "dual"], "description": "#972: review threshold for the daemon's PR-state aggregator. `single` (default) — §3.6 one VERIFIED unlocks the merge gate. `dual` — §3.5 two distinct VERIFIED required before `[pr-ready-for-merge]` fires."}
             }, "required": ["action"]}}),
     ]
 }
