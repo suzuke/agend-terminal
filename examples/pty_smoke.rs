@@ -71,7 +71,7 @@ fn main() -> anyhow::Result<()> {
     let _lock_guard = if variant_ge(&mode, "v7") {
         let p = std::env::temp_dir().join("pty_smoke_v7.lock");
         let f = std::fs::File::create(&p)?;
-        fs4::fs_std::FileExt::try_lock_exclusive(&f).ok();
+        fs4::FileExt::try_lock(&f).ok();
         Some(f)
     } else {
         None
