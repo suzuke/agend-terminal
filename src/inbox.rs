@@ -1202,6 +1202,40 @@ pub(crate) fn should_suppress_911_reinject_with_ledger(
     false
 }
 
+/// #982 B-narrow: scan `agent_name`'s inbox for a previously-drained
+/// dispatch (`kind ∈ {query, task}`, `read_at.is_some()`) that shares
+/// the given `correlation_id`. Used by `api::handlers::messaging` to
+/// override codex ack-absorption when an inbound `kind=report|update`
+/// is the reply to a blocking dispatch the recipient already consumed.
+///
+/// Tight predicate (positive override path):
+/// - kind matches `query` or `task` only — informational kinds never
+///   gate ack absorption
+/// - `read_at` must be set — an undrained dispatch means the recipient
+///   has not yet seen the parent so the inbound is not a blocking reply
+/// - `correlation_id` must match — same correlation chain
+///
+/// Best-effort: IO/parse failures default to `false` (preserve existing
+/// absorption behavior on file errors).
+pub fn has_drained_blocker_for_correlation(
+    home: &Path,
+    agent_name: &str,
+    correlation_id: &str,
+) -> bool {
+    let path = inbox_path_resolved(home, agent_name);
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    content.lines().any(|line| {
+        let Ok(msg) = serde_json::from_str::<InboxMessage>(line) else {
+            return false;
+        };
+        msg.correlation_id.as_deref() == Some(correlation_id)
+            && msg.read_at.is_some()
+            && matches!(msg.kind.as_deref(), Some("query") | Some("task"))
+    })
+}
+
 /// Read the agent's inbox JSONL and return `true` iff a message with
 /// the given `msg_id` exists AND has `read_at` set. Best-effort: any
 /// IO/parse error returns `false` so the caller defaults to allowing
