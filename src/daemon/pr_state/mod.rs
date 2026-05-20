@@ -565,9 +565,13 @@ pub fn record_verdict(
 ) {
     // #1002 Phase 1: tracing on every silent gate (A-E) so the next
     // #982-style "verdict_state stuck at None" bisect can identify
-    // which gate fired without code spelunking.
+    // which gate fired without code spelunking. Levels are chosen so
+    // default daemon filter (`agend_terminal=info`) surfaces every
+    // operator-actionable miss — debug-level would be invisible at
+    // default and re-create the silent-failure class #1002 was filed
+    // against.
     let Some(reviewed_head) = reviewed_head else {
-        tracing::debug!(
+        tracing::info!(
             task_id,
             reviewer,
             "#1002 record_verdict skipped (gate A) — reviewed_head is None; \
@@ -581,7 +585,7 @@ pub fn record_verdict(
         .into_iter()
         .find(|t| t.id == task_id);
     let Some(task) = task else {
-        tracing::debug!(
+        tracing::info!(
             task_id,
             reviewer,
             "#1002 record_verdict skipped (gate B) — task not found in task board; \
@@ -592,7 +596,7 @@ pub fn record_verdict(
     let branch = match task.branch {
         Some(b) if !b.is_empty() => b,
         _ => {
-            tracing::debug!(
+            tracing::info!(
                 task_id,
                 reviewer,
                 "#1002 record_verdict skipped (gate C) — task.branch field empty; \
@@ -608,7 +612,7 @@ pub fn record_verdict(
     let entries = match std::fs::read_dir(&dir) {
         Ok(e) => e,
         Err(e) => {
-            tracing::debug!(
+            tracing::warn!(
                 task_id,
                 dir = %dir.display(),
                 error = %e,
@@ -648,7 +652,7 @@ pub fn record_verdict(
         }
     }
     if !matched_any {
-        tracing::debug!(
+        tracing::info!(
             task_id,
             branch = %branch,
             reviewer,
@@ -734,7 +738,7 @@ pub fn scan_and_emit_with(
     let entries = match std::fs::read_dir(&dir) {
         Ok(e) => e,
         Err(e) => {
-            tracing::debug!(
+            tracing::warn!(
                 dir = %dir.display(),
                 error = %e,
                 "#1002 pr_state: scan_and_emit_with read_dir failed — skipping tick"
@@ -747,7 +751,7 @@ pub fn scan_and_emit_with(
         let content = match std::fs::read_to_string(&path) {
             Ok(c) => c,
             Err(e) => {
-                tracing::debug!(
+                tracing::warn!(
                     path = %path.display(),
                     error = %e,
                     "#1002 pr_state: scan_and_emit_with read_to_string failed — skipping file"
@@ -758,7 +762,7 @@ pub fn scan_and_emit_with(
         let mut state: PrState = match serde_json::from_str(&content) {
             Ok(s) => s,
             Err(e) => {
-                tracing::debug!(
+                tracing::warn!(
                     path = %path.display(),
                     error = %e,
                     "#1002 pr_state: scan_and_emit_with json parse failed — skipping file"
@@ -864,7 +868,7 @@ fn apply_gh_poll(home: &Path, dir: &Path, poller: &dyn gh_poll::GhPoller) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) => {
-            tracing::debug!(
+            tracing::warn!(
                 dir = %dir.display(),
                 error = %e,
                 "#1002 apply_gh_poll read_dir failed — gh-poll skipped this tick"
@@ -882,7 +886,7 @@ fn apply_gh_poll(home: &Path, dir: &Path, poller: &dyn gh_poll::GhPoller) {
         let content = match std::fs::read_to_string(&path) {
             Ok(c) => c,
             Err(e) => {
-                tracing::debug!(
+                tracing::warn!(
                     path = %path.display(),
                     error = %e,
                     "#1002 apply_gh_poll read_to_string failed — skipping file"
@@ -893,7 +897,7 @@ fn apply_gh_poll(home: &Path, dir: &Path, poller: &dyn gh_poll::GhPoller) {
         let state: PrState = match serde_json::from_str(&content) {
             Ok(s) => s,
             Err(e) => {
-                tracing::debug!(
+                tracing::warn!(
                     path = %path.display(),
                     error = %e,
                     "#1002 apply_gh_poll json parse failed — skipping file"
