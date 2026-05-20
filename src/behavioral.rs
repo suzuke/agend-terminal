@@ -499,6 +499,11 @@ pub fn config_for_productivity(backend: &Backend) -> ProductivityConfig {
 /// Pure function — no side effects, no state mutation. Parallels
 /// `infer_from_silence` shape so future signal types follow the same
 /// `(config, evidence) -> signal` pattern.
+// #685 PR-2 RC1: production callers switched to
+// [`infer_productivity_with_match`] for evidence-substring dedup.
+// `infer_productivity` retained as the simpler interface for tests +
+// future single-signal callers that don't need the matched text.
+#[allow(dead_code)]
 pub fn infer_productivity(
     config: &ProductivityConfig,
     screen_text: &str,
@@ -553,6 +558,73 @@ pub fn infer_productivity(
         }
     }
     ProductivitySignal::NoSignal
+}
+
+/// #685 PR-2 RC1: variant of [`infer_productivity`] that ALSO returns
+/// the matched marker substring when the signal source is `Marker`.
+/// Used by `state::feed()` for evidence-level dedup — hashing the
+/// matched marker text (not the surrounding tail) prevents a stale
+/// marker from re-refreshing `last_productive_output` when adjacent
+/// content (spinner ticks, status line edits) changes around it.
+///
+/// Heartbeat source returns `None` for the matched string — it's
+/// timestamp-driven, not text-driven. NoSignal returns `None` for
+/// the matched string and `ProductivitySignal::NoSignal`.
+///
+/// Matched substring scope: the FIRST cached regex match against
+/// `screen_text`. Matches `infer_productivity`'s first-match ordering
+/// so behaviour is consistent across both surfaces.
+pub fn infer_productivity_with_match(
+    config: &ProductivityConfig,
+    screen_text: &str,
+    heartbeat_age: Duration,
+) -> (ProductivitySignal, Option<String>) {
+    // Heartbeat path — same shortcut as infer_productivity, but no
+    // matched-text concept.
+    if config.use_heartbeat && heartbeat_age.as_millis() <= config.heartbeat_fresh_window_ms as u128
+    {
+        return (
+            ProductivitySignal::Productive {
+                source: ProductivitySource::Heartbeat,
+            },
+            None,
+        );
+    }
+    let cached_regexes: Option<&[regex::Regex]> = match config.cache_id {
+        Some(MarkerCacheId::Generic) => Some(&GENERIC_PRODUCTIVE_REGEXES),
+        Some(MarkerCacheId::Claude) => Some(&CLAUDE_PRODUCTIVE_REGEXES),
+        Some(MarkerCacheId::Kiro) => Some(&KIRO_PRODUCTIVE_REGEXES),
+        Some(MarkerCacheId::Codex) => Some(&CODEX_PRODUCTIVE_REGEXES),
+        Some(MarkerCacheId::Gemini) => Some(&GEMINI_PRODUCTIVE_REGEXES),
+        Some(MarkerCacheId::OpenCode) => Some(&OPENCODE_PRODUCTIVE_REGEXES),
+        None => None,
+    };
+    if let Some(regexes) = cached_regexes {
+        for (i, pattern) in config.markers.iter().enumerate() {
+            if let Some(m) = regexes[i].find(screen_text) {
+                return (
+                    ProductivitySignal::Productive {
+                        source: ProductivitySource::Marker(pattern),
+                    },
+                    Some(m.as_str().to_string()),
+                );
+            }
+        }
+    } else {
+        for pattern in config.markers {
+            if let Ok(re) = regex::Regex::new(&format!("(?m){pattern}")) {
+                if let Some(m) = re.find(screen_text) {
+                    return (
+                        ProductivitySignal::Productive {
+                            source: ProductivitySource::Marker(pattern),
+                        },
+                        Some(m.as_str().to_string()),
+                    );
+                }
+            }
+        }
+    }
+    (ProductivitySignal::NoSignal, None)
 }
 
 /// Shadow-mode telemetry for productive-output signals. Parallels

@@ -1350,43 +1350,57 @@ impl StateTracker {
         // completion markers visible in scrollback (e.g. `Saved to /tmp/
         // foo.txt` left at row 5 from a 5-min-old write) MUST NOT keep
         // refreshing `last_productive_output` on every cursor-blink tick.
-        // Pair with `last_productive_marker_hash` dedup for the case
-        // where the marker IS in the recent window but the screen
-        // changes around it (spinner cycling below) — same defense-in-
-        // depth class as the #1005 ToolUse oscillation guard.
+        //
+        // #685 PR-2 RC1 (reviewer #1013 verdict): dedup hash scope
+        // narrowed from "entire recent tail" → "matched marker
+        // substring". Pre-RC1 a stale marker that stayed visible in
+        // the tail while an adjacent spinner ticked produced a
+        // DIFFERENT tail hash on every tick — the dedup-hash never
+        // matched, `last_productive_output` re-fired despite no new
+        // productive evidence. Hashing the matched substring directly
+        // captures evidence identity, not surrounding-context noise.
         if let Some(ref pconfig) = self.productivity_config {
             let heartbeat_age = self
                 .last_heartbeat
                 .map(|t| t.elapsed())
                 .unwrap_or_else(|| Duration::from_secs(u32::MAX as u64));
             let recent_tail = recent_screen_tail(screen_text, MARKER_SCAN_TAIL_LINES);
-            let signal =
-                crate::behavioral::infer_productivity(pconfig, &recent_tail, heartbeat_age);
-            match &signal {
-                crate::behavioral::ProductivitySignal::Productive {
-                    source: crate::behavioral::ProductivitySource::Marker(_),
-                } => {
-                    // Marker source: dedup against last-refresh recent
-                    // tail. Hash equality across feeds means the
-                    // marker text (and surrounding context) is the
-                    // SAME content the previous refresh already
-                    // counted — no fresh evidence, suppress.
-                    let tail_hash = hash_screen(&recent_tail);
-                    if self.last_productive_marker_hash != Some(tail_hash) {
+            let (signal, matched_substr) = crate::behavioral::infer_productivity_with_match(
+                pconfig,
+                &recent_tail,
+                heartbeat_age,
+            );
+            match (&signal, matched_substr.as_deref()) {
+                (
+                    crate::behavioral::ProductivitySignal::Productive {
+                        source: crate::behavioral::ProductivitySource::Marker(_),
+                    },
+                    Some(matched),
+                ) => {
+                    // Marker source: dedup against the matched
+                    // substring text. Same substring across feeds =
+                    // same evidence, suppress refresh — even when
+                    // adjacent content (spinner ticks, status line
+                    // edits) changes around it.
+                    let marker_hash = hash_screen(matched);
+                    if self.last_productive_marker_hash != Some(marker_hash) {
                         self.last_productive_output = Instant::now();
-                        self.last_productive_marker_hash = Some(tail_hash);
+                        self.last_productive_marker_hash = Some(marker_hash);
                     }
                 }
-                crate::behavioral::ProductivitySignal::Productive {
-                    source: crate::behavioral::ProductivitySource::Heartbeat,
-                } => {
+                (
+                    crate::behavioral::ProductivitySignal::Productive {
+                        source: crate::behavioral::ProductivitySource::Heartbeat,
+                    },
+                    _,
+                ) => {
                     // Heartbeat source is timestamp-driven — each fresh
                     // heartbeat IS new evidence. Always refresh; reset
                     // marker-hash so a subsequent Marker re-fires.
                     self.last_productive_output = Instant::now();
                     self.last_productive_marker_hash = None;
                 }
-                crate::behavioral::ProductivitySignal::NoSignal => {
+                _ => {
                     // No marker visible in the recent tail → clear the
                     // dedup hash so a fresh-after-silence marker
                     // re-fires the refresh.
@@ -4459,6 +4473,52 @@ mod tests {
         assert_eq!(
             tracker.last_productive_output, after_fresh,
             "#685 PR-2: scrolled-out marker must NOT re-refresh — grey-failure detection requires fresh evidence"
+        );
+    }
+
+    /// #685 PR-2 RC1 T5 (reviewer #1013 regression-pin): stale marker
+    /// stays at a fixed row in the tail across feeds while an ADJACENT
+    /// line (e.g. a spinner cycling through `⠋⠙⠹⠸`) changes around
+    /// it. Pre-RC1 the dedup hashed the entire tail → spinner tick
+    /// changed the hash → false refresh fired. Post-RC1 the dedup
+    /// hashes ONLY the matched marker substring → adjacent-line
+    /// changes don't break dedup → no refresh.
+    #[test]
+    fn t5_685_pr2_rc1_changing_adjacent_line_does_not_refresh() {
+        let mut tracker = StateTracker::new(Some(&Backend::Codex));
+        tracker.last_productive_output = Instant::now() - Duration::from_secs(60);
+
+        // Feed 1: stale marker in tail (row 36 of 40), spinner-A at
+        // row 38. Note marker is in last-5-rows window so it WILL
+        // match — but it's stale evidence (operator caused this in
+        // some past tool run that's still visible in viewport).
+        let lines1: Vec<String> = (0..40)
+            .map(|i| match i {
+                36 => "apply_patch succeeded for /tmp/foo.txt".to_string(),
+                38 => "⠋ Working...".to_string(),
+                _ => format!("background row {i}"),
+            })
+            .collect();
+        tracker.feed(&lines1.join("\n"));
+        let after_first = tracker.last_productive_output;
+
+        // Feed 2: SAME marker at SAME row 36, spinner-A → spinner-B
+        // (next braille tick) at row 38. Tail changes (spinner) but
+        // matched marker substring unchanged → dedup MUST suppress
+        // refresh.
+        let lines2: Vec<String> = (0..40)
+            .map(|i| match i {
+                36 => "apply_patch succeeded for /tmp/foo.txt".to_string(),
+                38 => "⠙ Working...".to_string(), // ← tick changed
+                _ => format!("background row {i}"),
+            })
+            .collect();
+        tracker.feed(&lines2.join("\n"));
+
+        assert_eq!(
+            tracker.last_productive_output, after_first,
+            "#685 PR-2 RC1: stale marker + adjacent spinner tick must NOT re-refresh — \
+             dedup hashes matched substring, not surrounding context"
         );
     }
 
