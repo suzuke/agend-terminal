@@ -223,8 +223,22 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
         let is_orchestrator = crate::teams::find_team_for(ctx.home, target)
             .and_then(|t| t.orchestrator)
             .is_some_and(|orch| orch == target);
-        let skip_inject =
-            is_codex && matches!(kind, "update" | "report") && !is_cross_team && !is_orchestrator;
+        // #982 B-narrow: override codex ack-absorption when the inbound
+        // message replies to a blocking dispatch the recipient already
+        // drained. Without this override, lead → codex query/task replies
+        // strand silently while the codex one-shot waits for a wake.
+        let is_reply_to_drained_blocker = matches!(kind, "update" | "report")
+            && params["correlation_id"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .is_some_and(|corr| {
+                    crate::inbox::has_drained_blocker_for_correlation(ctx.home, target, corr)
+                });
+        let skip_inject = is_codex
+            && matches!(kind, "update" | "report")
+            && !is_cross_team
+            && !is_orchestrator
+            && !is_reply_to_drained_blocker;
         if skip_inject {
             crate::event_log::log(
                 ctx.home,
@@ -1530,6 +1544,346 @@ mod tests {
             entry.threshold_secs, 1200,
             "explicit threshold must override team default / absent state"
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // #982 B-narrow — codex ack-absorption override for replies to drained
+    // blocker dispatches. The empirical bisect found 8 ack_absorbed events
+    // today (all target=fixup-reviewer codex / from=fixup-lead kind=update|
+    // report), so the override predicate must distinguish:
+    //   B1+B2 positive: drained query/task with matching correlation_id
+    //                   → override absorption, PTY-surface the reply
+    //   B3    negative: undrained query/task with matching correlation_id
+    //                   → keep absorption (recipient hasn't read parent)
+    //   B4    negative: no matching correlation_id in inbox
+    //                   → keep absorption (no blocking context)
+    //   B5    negative: correlation_id absent from inbound entirely
+    //                   → keep absorption (cannot key the lookup)
+    //   B6    invariant: non-codex backend unaffected by override path
+    // -----------------------------------------------------------------------
+
+    fn make_codex_ctx(
+        home: &std::path::Path,
+        codex_agent: &str,
+        sender: &str,
+    ) -> (
+        &'static agent::AgentRegistry,
+        HandlerCtx<'static>,
+        std::path::PathBuf,
+    ) {
+        setup_team_env(
+            home,
+            &[codex_agent, sender],
+            &[("dev", &[codex_agent, sender])],
+        );
+        // Flip the codex_agent backend in fleet.yaml.
+        let yaml = std::fs::read_to_string(crate::fleet::fleet_yaml_path(home)).unwrap();
+        let yaml = yaml.replace(
+            &format!("  {codex_agent}:\n    backend: claude"),
+            &format!("  {codex_agent}:\n    backend: codex"),
+        );
+        std::fs::write(crate::fleet::fleet_yaml_path(home), yaml).ok();
+
+        let registry: &'static agent::AgentRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let spawn_cfg = crate::agent::SpawnConfig {
+            name: codex_agent,
+            backend_command: crate::default_shell(),
+            args: &[],
+            spawn_mode: crate::backend::SpawnMode::Fresh,
+            cols: 80,
+            rows: 24,
+            env: None,
+            working_dir: None,
+            submit_key: "\r",
+            home: None,
+            crash_tx: None,
+            shutdown: None,
+        };
+        crate::agent::spawn_agent(&spawn_cfg, registry).expect("spawn");
+        {
+            let mut reg = agent::lock_registry(registry);
+            if let Some(h) = reg.get_mut(codex_agent) {
+                h.backend_command = "codex".to_string();
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        let configs: &'static crate::api::ConfigRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let externals: &'static agent::ExternalRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let home_ref: &'static std::path::Path = Box::leak(Box::new(home.to_path_buf()));
+        let ctx = HandlerCtx {
+            registry,
+            configs,
+            externals,
+            notifier: None,
+            home: home_ref,
+        };
+        (registry, ctx, home.to_path_buf())
+    }
+
+    fn seed_drained_blocker(home: &std::path::Path, target: &str, kind: &str, corr: &str) {
+        let msg = crate::inbox::InboxMessage {
+            schema_version: 0,
+            id: Some(format!("m-blocker-{corr}")),
+            read_at: Some(chrono::Utc::now().to_rfc3339()),
+            thread_id: None,
+            parent_id: None,
+            task_id: None,
+            force_meta: None,
+            correlation_id: Some(corr.to_string()),
+            reviewed_head: None,
+            from: "from:fixup-lead".to_string(),
+            text: format!("seeded blocker {kind}"),
+            kind: Some(kind.to_string()),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            channel: None,
+            delivery_mode: None,
+            attachments: vec![],
+            in_reply_to_msg_id: None,
+            in_reply_to_excerpt: None,
+            superseded_by: None,
+            from_id: None,
+            broadcast_context: None,
+            sequencing: None,
+            eta_minutes: None,
+            reporting_cadence: None,
+            worktree_binding_required: None,
+        };
+        crate::inbox::enqueue(home, target, msg).expect("seed blocker");
+    }
+
+    fn cleanup_registry(registry: &agent::AgentRegistry, name: &str) {
+        let reg = agent::lock_registry(registry);
+        if let Some(h) = reg.get(name) {
+            let _ = h.child.lock().kill();
+        }
+    }
+
+    #[test]
+    fn b1_codex_report_overrides_absorption_when_query_drained() {
+        let home = tmp_home("982-b1");
+        let (registry, ctx, home_path) = make_codex_ctx(&home, "codex-agent", "sender");
+        seed_drained_blocker(&home_path, "codex-agent", "query", "corr-b1");
+
+        let result = handle_send(
+            &json!({
+                "from": "sender",
+                "target": "codex-agent",
+                "text": "reply to query",
+                "kind": "report",
+                "correlation_id": "corr-b1",
+            }),
+            &ctx,
+        );
+        assert_eq!(result["ok"], true);
+        assert_eq!(
+            result["delivery_mode"].as_str(),
+            Some("pty"),
+            "B-narrow: report to codex must PTY-surface when matching drained query: {result}"
+        );
+        cleanup_registry(registry, "codex-agent");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn b2_codex_update_overrides_absorption_when_task_drained() {
+        let home = tmp_home("982-b2");
+        let (registry, ctx, home_path) = make_codex_ctx(&home, "codex-agent", "sender");
+        seed_drained_blocker(&home_path, "codex-agent", "task", "corr-b2");
+
+        let result = handle_send(
+            &json!({
+                "from": "sender",
+                "target": "codex-agent",
+                "text": "phase-transition update",
+                "kind": "update",
+                "correlation_id": "corr-b2",
+            }),
+            &ctx,
+        );
+        assert_eq!(result["ok"], true);
+        assert_eq!(
+            result["delivery_mode"].as_str(),
+            Some("pty"),
+            "B-narrow: update to codex must PTY-surface when matching drained task: {result}"
+        );
+        cleanup_registry(registry, "codex-agent");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn b3_codex_report_keeps_absorption_when_blocker_undrained() {
+        let home = tmp_home("982-b3");
+        let (registry, ctx, home_path) = make_codex_ctx(&home, "codex-agent", "sender");
+        // Seed an UNDRAINED query.
+        let mut msg = crate::inbox::InboxMessage {
+            schema_version: 0,
+            id: Some("m-undrained".to_string()),
+            read_at: None, // ← key: not drained
+            thread_id: None,
+            parent_id: None,
+            task_id: None,
+            force_meta: None,
+            correlation_id: Some("corr-b3".to_string()),
+            reviewed_head: None,
+            from: "from:fixup-lead".to_string(),
+            text: "undrained query".to_string(),
+            kind: Some("query".to_string()),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            channel: None,
+            delivery_mode: None,
+            attachments: vec![],
+            in_reply_to_msg_id: None,
+            in_reply_to_excerpt: None,
+            superseded_by: None,
+            from_id: None,
+            broadcast_context: None,
+            sequencing: None,
+            eta_minutes: None,
+            reporting_cadence: None,
+            worktree_binding_required: None,
+        };
+        msg.read_at = None;
+        crate::inbox::enqueue(&home_path, "codex-agent", msg).expect("seed");
+
+        let result = handle_send(
+            &json!({
+                "from": "sender",
+                "target": "codex-agent",
+                "text": "premature reply",
+                "kind": "report",
+                "correlation_id": "corr-b3",
+            }),
+            &ctx,
+        );
+        assert_eq!(result["ok"], true);
+        assert_eq!(
+            result["delivery_mode"].as_str(),
+            Some("inbox_only"),
+            "B-narrow: undrained blocker leaves codex absorption intact: {result}"
+        );
+        cleanup_registry(registry, "codex-agent");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn b4_codex_report_keeps_absorption_when_no_correlation_match() {
+        let home = tmp_home("982-b4");
+        let (registry, ctx, home_path) = make_codex_ctx(&home, "codex-agent", "sender");
+        // Seed a drained query with a DIFFERENT correlation id.
+        seed_drained_blocker(&home_path, "codex-agent", "query", "corr-OTHER");
+
+        let result = handle_send(
+            &json!({
+                "from": "sender",
+                "target": "codex-agent",
+                "text": "stray report",
+                "kind": "report",
+                "correlation_id": "corr-b4",
+            }),
+            &ctx,
+        );
+        assert_eq!(result["ok"], true);
+        assert_eq!(
+            result["delivery_mode"].as_str(),
+            Some("inbox_only"),
+            "B-narrow: no correlation match keeps absorption: {result}"
+        );
+        cleanup_registry(registry, "codex-agent");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn b5_codex_report_keeps_absorption_when_correlation_id_absent() {
+        let home = tmp_home("982-b5");
+        let (registry, ctx, home_path) = make_codex_ctx(&home, "codex-agent", "sender");
+        seed_drained_blocker(&home_path, "codex-agent", "query", "corr-ANY");
+
+        // Inbound omits correlation_id entirely.
+        let result = handle_send(
+            &json!({
+                "from": "sender",
+                "target": "codex-agent",
+                "text": "manual update",
+                "kind": "update",
+            }),
+            &ctx,
+        );
+        assert_eq!(result["ok"], true);
+        assert_eq!(
+            result["delivery_mode"].as_str(),
+            Some("inbox_only"),
+            "B-narrow: no correlation_id on inbound keeps absorption: {result}"
+        );
+        cleanup_registry(registry, "codex-agent");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn b6_non_codex_backend_pty_path_unchanged_by_override() {
+        // Sanity invariant: non-codex backends always PTY today (no absorption);
+        // the override predicate must not redirect them through inbox_only.
+        let home = tmp_home("982-b6");
+        // Use the default claude-flavored spawn from setup_team_env.
+        setup_team_env(
+            &home,
+            &["claude-agent", "sender"],
+            &[("dev", &["claude-agent", "sender"])],
+        );
+        let registry: &'static agent::AgentRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let spawn_cfg = crate::agent::SpawnConfig {
+            name: "claude-agent",
+            backend_command: crate::default_shell(),
+            args: &[],
+            spawn_mode: crate::backend::SpawnMode::Fresh,
+            cols: 80,
+            rows: 24,
+            env: None,
+            working_dir: None,
+            submit_key: "\r",
+            home: None,
+            crash_tx: None,
+            shutdown: None,
+        };
+        crate::agent::spawn_agent(&spawn_cfg, registry).expect("spawn");
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        let configs: &'static crate::api::ConfigRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let externals: &'static agent::ExternalRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let home_ref: &'static std::path::Path = Box::leak(Box::new(home.clone()));
+        let ctx = HandlerCtx {
+            registry,
+            configs,
+            externals,
+            notifier: None,
+            home: home_ref,
+        };
+        seed_drained_blocker(&home, "claude-agent", "query", "corr-b6");
+
+        let result = handle_send(
+            &json!({
+                "from": "sender",
+                "target": "claude-agent",
+                "text": "reply for claude",
+                "kind": "report",
+                "correlation_id": "corr-b6",
+            }),
+            &ctx,
+        );
+        assert_eq!(result["ok"], true);
+        assert_eq!(
+            result["delivery_mode"].as_str(),
+            Some("pty"),
+            "non-codex backend always PTY regardless of correlation predicate: {result}"
+        );
+        cleanup_registry(registry, "claude-agent");
         std::fs::remove_dir_all(&home).ok();
     }
 }

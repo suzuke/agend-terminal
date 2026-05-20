@@ -168,7 +168,7 @@ fn emit_registry_stale_alert(home: &Path, daemon_exe: &Path) {
             reporting_cadence: None,
             worktree_binding_required: None,
         };
-        if let Err(e) = crate::inbox::enqueue(home, recipient, msg) {
+        if let Err(e) = crate::inbox::enqueue_with_idle_hint(home, recipient, msg) {
             tracing::warn!(
                 error = %e,
                 recipient,

@@ -158,7 +158,7 @@ fn fan_out_health_event(
     let supersede_token = format!("{kind}-{}", chrono::Utc::now().timestamp_millis());
     for sub in subscribers {
         crate::inbox::mark_ci_watch_superseded(home, sub, &repo_branch_key, &supersede_token);
-        let _ = crate::inbox::enqueue(
+        let _ = crate::inbox::enqueue_with_idle_hint(
             home,
             sub,
             crate::inbox::InboxMessage {

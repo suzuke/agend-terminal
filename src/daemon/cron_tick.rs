@@ -112,7 +112,7 @@ pub fn check_schedules(home: &Path, registry: &AgentRegistry) {
                 }
             }
         } else {
-            let _ = crate::inbox::enqueue(
+            let _ = crate::inbox::enqueue_with_idle_hint(
                 home,
                 target,
                 crate::inbox::InboxMessage {

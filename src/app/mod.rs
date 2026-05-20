@@ -985,7 +985,13 @@ fn flush_idle_notifications(home: &Path, layout: &mut Layout) {
             };
             let agent_name = pane.agent_name.clone();
             flush_notifications_for_pane(home, pane, |text| {
-                crate::inbox::inject_notification(home, &agent_name, text)
+                // #982 RC: queue contents come from compose_aware_*
+                // which would have submit-injected on the immediate-
+                // idle path. The flush must preserve that contract or
+                // queued hints (e.g. `[AGEND-MSG-PENDING]`) land in
+                // the prompt buffer without the backend submit_key —
+                // codex one-shots silently drop the wake.
+                crate::inbox::inject_notification_with_submit(home, &agent_name, text)
             });
         }
     }
@@ -1102,6 +1108,30 @@ mod tests {
             selection: None,
             source: PaneSource::Local,
         }
+    }
+
+    /// #982 RC wiring-pin: assert `flush_idle_notifications` invokes
+    /// the submit-aware injector (`inject_notification_with_submit`)
+    /// so queued hints get the backend `submit_key` applied on flush.
+    ///
+    /// Implemented as a file-level source pin — the raw
+    /// `inject_notification` was deleted in this PR, so the negative
+    /// half of the invariant is compile-time enforced. The positive
+    /// half (this assertion) is platform-agnostic and survives
+    /// rustfmt re-wrapping. Companion test:
+    /// `inbox::tests::t15_composing_flush_uses_submit_aware_inject`
+    /// pins the JSON payload contract end-to-end.
+    #[test]
+    fn flush_idle_notifications_wired_to_submit_aware_inject() {
+        let source = std::fs::read_to_string("src/app/mod.rs")
+            .or_else(|_| std::fs::read_to_string("agend-terminal/src/app/mod.rs"))
+            .expect("source file must be readable from test cwd");
+        assert!(
+            source.contains("inject_notification_with_submit"),
+            "flush_idle_notifications must wire the submit-aware injector \
+             (#982 reviewer #999 verdict) — searched for \
+             'inject_notification_with_submit' in src/app/mod.rs"
+        );
     }
 
     #[test]

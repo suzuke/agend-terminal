@@ -203,7 +203,7 @@ fn emit_stall(home: &Path, task: &Task, reason: &str) {
             reporting_cadence: None,
             worktree_binding_required: None,
         };
-        if let Err(e) = crate::inbox::enqueue(home, &recipient, msg) {
+        if let Err(e) = crate::inbox::enqueue_with_idle_hint(home, &recipient, msg) {
             tracing::warn!(
                 error = %e,
                 recipient = %recipient,
