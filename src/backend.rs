@@ -218,6 +218,23 @@ pub struct BackendPreset {
     /// Args to use when resuming is not possible (fresh start after crash).
     /// Falls back to `args` if None.
     pub fresh_args: Option<&'static [&'static str]>,
+    /// Whether the backend loads the `agend-mcp-bridge` server when spawned in
+    /// fleet mode. `false` means the backend's MCP discovery is incompatible
+    /// with `<workdir>/.<vendor-dir>/mcp_config.json` writes — the bridge is
+    /// configured on disk but the backend ignores it, leaving the spawned
+    /// instance without fleet `send` / `inbox` / `task` tools.
+    ///
+    /// Empirical: AGY (#987 #995 Bug 3) discovers project-local
+    /// `.antigravitycli/mcp_config.json` for project-ID storage but ignores
+    /// its `mcpServers` field — only HOME-level
+    /// `~/.gemini/antigravity-cli/mcp_config.json` loads. The fleet
+    /// scope rule (`src/mcp_config.rs:5-11`) forbids HOME-level writes,
+    /// so this backend ships with `fleet_mcp_supported: false` until
+    /// upstream supports project-local `mcpServers` loading.
+    ///
+    /// Daemon spawn path emits a `[fleet-mcp-unsupported]` warning when
+    /// this is `false` so operators are not surprised by missing tools.
+    pub fleet_mcp_supported: bool,
 }
 
 impl Backend {
@@ -269,6 +286,7 @@ impl Backend {
                     (r"(?m)^[^A-Za-z\n]{0,8}Yes, proceed", b"\x1b[A\x1b[A\r"),
                 ],
                 fresh_args: None, // same as args (no resume in preset)
+                fleet_mcp_supported: true,
             },
             Backend::KiroCli => BackendPreset {
                 command: "kiro-cli",
@@ -294,6 +312,7 @@ impl Backend {
                     (r"(?m)^[^A-Za-z\n]{0,8}No, exit", b"\x1b[B\r"),
                 ],
                 fresh_args: None, // same as args
+                fleet_mcp_supported: true,
             },
             Backend::Codex => BackendPreset {
                 command: "codex",
@@ -324,6 +343,7 @@ impl Backend {
                 ],
                 // Codex: "resume --last" → fresh start drops the resume subcommand
                 fresh_args: Some(&["--dangerously-bypass-approvals-and-sandbox"]),
+                fleet_mcp_supported: true,
             },
             Backend::OpenCode => BackendPreset {
                 command: "opencode",
@@ -346,6 +366,7 @@ impl Backend {
                     (r"(?m)^[^A-Za-z\n]{0,8}Please restart", b"\r"),
                 ],
                 fresh_args: None, // same as args (resume is in resume_mode, not args)
+                fleet_mcp_supported: true,
             },
             Backend::Gemini => BackendPreset {
                 command: "gemini",
@@ -375,6 +396,7 @@ impl Backend {
                     (r"(?m)^[^A-Za-z\n]{0,8}Allow execution of:", b"2\n"),
                 ],
                 fresh_args: None, // same as args (resume is in resume_mode, not args)
+                fleet_mcp_supported: true,
             },
             Backend::Agy => BackendPreset {
                 command: "agy",
@@ -406,6 +428,15 @@ impl Backend {
                 // "Do you trust" pattern with anchored regex per #468.
                 dismiss_patterns: &[(r"(?m)^[^A-Za-z\n]{0,8}Yes, I trust", b"\r")],
                 fresh_args: None,
+                // #995 Bug 3: AGY discovers `<workdir>/.antigravitycli/mcp_config.json`
+                // for project-ID storage but its `mcpServers` map is ignored —
+                // only HOME-level `~/.gemini/antigravity-cli/mcp_config.json`
+                // loads (empirically proven; see PR description). The fleet
+                // scope rule (src/mcp_config.rs:5-11) forbids HOME-level
+                // writes, so we ship the agy backend without the bridge until
+                // upstream supports project-local mcpServers. Daemon spawn
+                // path emits a warning so operators are not surprised.
+                fleet_mcp_supported: false,
             },
             // Shell and Raw have no preset behavior. `command` is `""` as a
             // sentinel — callers that need the actual spawn path should use
@@ -426,6 +457,11 @@ impl Backend {
                 ready_timeout_secs: 10,
                 dismiss_patterns: &[],
                 fresh_args: None,
+                // Shell / Raw: no MCP discovery; the bridge does not apply.
+                // `false` is the safe sentinel (no warning fires because
+                // these backends don't go through the dispatch warning path
+                // anyway — Backend::from_command returns None for raw paths).
+                fleet_mcp_supported: false,
             },
         }
     }
@@ -998,6 +1034,39 @@ mod tests {
         assert!(agy.dismiss_patterns[0].0.contains("Yes, I trust"));
         assert_eq!(agy.dismiss_patterns[0].1, b"\r");
         assert_eq!(agy.instructions_path, "AGY.md");
+    }
+
+    /// #995 Bug 3: `fleet_mcp_supported` flag pins which backends ship with
+    /// the `agend-mcp-bridge` working in fleet mode. Currently every
+    /// backend except Agy supports it; Agy is `false` because its MCP
+    /// discovery ignores `<workdir>/.antigravitycli/mcp_config.json`
+    /// mcpServers field (only HOME-level loads, which the scope rule
+    /// at `src/mcp_config.rs:5-11` forbids).
+    ///
+    /// Daemon spawn path (`src/agent.rs spawn_agent`) emits a
+    /// `[fleet-mcp-unsupported]` tracing::warn when this is `false` so
+    /// operators see the warning in app.log.
+    #[test]
+    fn fleet_mcp_supported_pins_per_backend() {
+        // Currently-supported backends — bridge loads via project-local config.
+        assert!(Backend::ClaudeCode.preset().fleet_mcp_supported);
+        assert!(Backend::KiroCli.preset().fleet_mcp_supported);
+        assert!(Backend::Codex.preset().fleet_mcp_supported);
+        assert!(Backend::OpenCode.preset().fleet_mcp_supported);
+        assert!(Backend::Gemini.preset().fleet_mcp_supported);
+        // Unsupported — see field docstring + Backend::Agy preset comment.
+        assert!(
+            !Backend::Agy.preset().fleet_mcp_supported,
+            "#995 Bug 3: Agy bridge currently doesn't load — flag pins the issue \
+             until upstream supports project-local mcpServers"
+        );
+        // Shell / Raw — no MCP discovery; sentinel `false`.
+        assert!(!Backend::Shell.preset().fleet_mcp_supported);
+        assert!(
+            !Backend::Raw("/opt/foo".to_string())
+                .preset()
+                .fleet_mcp_supported
+        );
     }
 
     /// #996 Phase 1: ClaudeCode `Yes, I trust` dismiss must send a single

@@ -582,6 +582,30 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
 
     let (cmd, detected_backend) = build_command(config)?;
 
+    // #995 Bug 3: emit a warning when spawning a backend whose MCP
+    // discovery is incompatible with fleet's `<workdir>/.<vendor>/mcp_config.json`
+    // writes. The `agend-mcp-bridge` will be configured on disk but the
+    // backend will ignore it — the spawned instance has no `send`/`inbox`/
+    // `task` MCP tools. Currently only Backend::Agy is affected (see
+    // BackendPreset::fleet_mcp_supported docstring for the empirical
+    // background + upstream tracking).
+    //
+    // Operator-visible via app.log. UI-banner injection would race the
+    // backend's own ready output and is deliberately not attempted here.
+    if let Some(backend) = detected_backend.as_ref() {
+        if !backend.preset().fleet_mcp_supported {
+            tracing::warn!(
+                target: "fleet_mcp_unsupported",
+                agent = %name,
+                backend = backend.as_str(),
+                "⚠️  [fleet-mcp-unsupported] this backend currently doesn't load \
+                 the agend-mcp-bridge — fleet `send`/`inbox`/`task` tools will be \
+                 unavailable in this instance. Awaiting upstream fix. Use this \
+                 instance for manual / non-fleet work only."
+            );
+        }
+    }
+
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {

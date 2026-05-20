@@ -254,47 +254,31 @@ fn configure_gemini(working_dir: &Path, instance_name: Option<&str>) -> Result<(
     Ok(())
 }
 
-/// AGY (Google Antigravity CLI): `<workdir>/.antigravitycli/mcp_config.json` —
-/// uses standard `{ "mcpServers": { ... } }` schema. #987.
+/// AGY (Google Antigravity CLI): **no-op since #995 Bug 3.**
 ///
-/// Operator-verified 2026-05-20 against agy 1.0.0: AGY accepts the standard
-/// stdio MCP schema; full handshake (initialize → notifications/initialized
-/// → tools/list → tools/call) completes. MCP protocol version compatibility
-/// confirmed (AGY 2025-11-25 accepts bridge's 2024-11-05 per MCP spec).
+/// #987 originally wrote `<workdir>/.antigravitycli/mcp_config.json` with
+/// the standard `{ "mcpServers": { ... } }` schema. Empirical testing
+/// (PR #1002 — dev-2 spike) proved that AGY discovers this file for
+/// project-ID storage but **ignores its `mcpServers` field**. Only
+/// HOME-level `~/.gemini/antigravity-cli/mcp_config.json` actually loads
+/// MCP servers. The fleet scope rule (top-of-file comment lines 5-11)
+/// forbids HOME-level writes, so we cannot make AGY load the bridge in
+/// the current AGY release.
 ///
-/// **Does NOT include `"trust": true`** — that's a Gemini-specific extension
-/// at `.gemini/settings.json`. AGY's project-local schema has no equivalent
-/// field; `--dangerously-skip-permissions` (set as a CLI flag in the preset
-/// at `src/backend.rs`) bypasses per-tool prompts including MCP server calls.
-fn configure_agy(working_dir: &Path, instance_name: Option<&str>) -> Result<()> {
-    let path = working_dir.join(".antigravitycli").join("mcp_config.json");
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let _lock = crate::store::acquire_file_lock(&config_lock_path(&path))?;
-
-    let mut config: serde_json::Value = if path.exists() {
-        let content = std::fs::read_to_string(&path)?;
-        serde_json::from_str(&content).unwrap_or(json!({}))
-    } else {
-        json!({})
-    };
-    if config.get("mcpServers").is_none() {
-        config["mcpServers"] = json!({});
-    }
-    let mut env = json!({ "AGEND_HOME": home_path() });
-    if let Some(name) = instance_name {
-        env["AGEND_INSTANCE_NAME"] = json!(name);
-    }
-    let (cmd, args) = bridge_binary_path();
-    config["mcpServers"]["agend-terminal"] = json!({
-        "command": cmd,
-        "args": args,
-        "env": env
-    });
-    let body = serde_json::to_string_pretty(&config)?;
-    crate::store::atomic_write(&path, body.as_bytes())?;
-    tracing::debug!(path = %path.display(), "configured AGY MCP");
+/// This function is retained as a discoverable no-op so the dispatch
+/// at `configure()` stays exhaustive for Backend variants. When upstream
+/// AGY (filed at google-antigravity/antigravity-cli) supports
+/// project-local `mcpServers`, this function should be restored.
+///
+/// `Backend::Agy.preset().fleet_mcp_supported` is set to `false`; the
+/// daemon spawn path (`src/agent.rs spawn_agent`) emits a
+/// `[fleet-mcp-unsupported]` warning so operators understand the
+/// instance lacks fleet MCP tools.
+fn configure_agy(_working_dir: &Path, _instance_name: Option<&str>) -> Result<()> {
+    tracing::debug!(
+        "configure_agy: no-op (fleet_mcp_supported=false; awaiting upstream \
+         AGY support for project-local mcpServers loading)"
+    );
     Ok(())
 }
 
@@ -855,25 +839,27 @@ mod tests {
     }
 
     /// #987: configure dispatches Backend::Agy to write the standard
-    /// `mcpServers` config under `.antigravitycli/mcp_config.json` (NOT
-    /// the Gemini-style `.gemini/settings.json`). Operator-verified
-    /// path 2026-05-20.
+    /// #995 Bug 3: configure_agy is a no-op since empirical proof showed
+    /// AGY ignores project-local `.antigravitycli/mcp_config.json` mcpServers
+    /// field. Dispatcher routes to the no-op without crashing; NO file is
+    /// written under the working_dir (operator's `~/.gemini/` is also
+    /// untouched per scope rule). When upstream supports project-local
+    /// mcpServers, this test's assertions should flip (require the file
+    /// to exist with the bridge entry).
     #[test]
-    fn configure_dispatches_agy() {
+    fn configure_dispatches_agy_noop() {
         let dir = tmp_dir("dispatch_agy");
         configure(&dir, "agy", None);
-        assert!(dir.join(".antigravitycli/mcp_config.json").exists());
-        // Sanity: must NOT have written Gemini's path under .gemini/.
-        assert!(!dir.join(".gemini").exists());
-        // Verify standard schema (no Gemini-only "trust" extension).
-        let content = std::fs::read_to_string(dir.join(".antigravitycli/mcp_config.json")).unwrap();
-        let cfg: serde_json::Value = serde_json::from_str(&content).unwrap();
-        let entry = &cfg["mcpServers"]["agend-terminal"];
-        assert!(entry.is_object(), "agend-terminal entry must exist");
+        // #995 Bug 3: NO project-local mcp_config.json is written (AGY
+        // ignores it anyway; previous write was dead code).
         assert!(
-            entry.get("trust").is_none(),
-            "AGY config must NOT carry Gemini-only `trust: true` extension"
+            !dir.join(".antigravitycli/mcp_config.json").exists(),
+            "#995 Bug 3: configure_agy must not write a project-local mcp_config"
         );
+        // Sanity: must NOT have touched Gemini's path under .gemini/.
+        assert!(!dir.join(".gemini").exists());
+        // Sanity: nothing else under .antigravitycli/ either.
+        assert!(!dir.join(".antigravitycli").exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 

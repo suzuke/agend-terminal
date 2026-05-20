@@ -73,7 +73,7 @@ For optional Telegram binding (remote control + outbound alerts), see [`docs/USA
 | Codex | `codex` | Tested |
 | OpenCode | `opencode` | Tested |
 | Gemini CLI | `gemini` | Tested (sunsets 2026-06-18 for free/Pro/Ultra; paid Code Assist Standard/Enterprise retain access) |
-| Antigravity CLI | `antigravity-cli` (binary `agy`) | Tested (#987 — Gemini CLI's official successor; #995 polish) |
+| Antigravity CLI | `antigravity-cli` (binary `agy`) | Tested (#987 — Gemini CLI's official successor; #995 polish). **Fleet MCP bridge unsupported in current AGY release** — agy instances spawn without `send`/`inbox`/`task` tools (operators see a `[fleet-mcp-unsupported]` warn in `app.log`). Use for manual work; await upstream fix at `google-antigravity/antigravity-cli`. |
 
 ## Learn More
 
