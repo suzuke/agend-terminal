@@ -1301,11 +1301,7 @@ pub fn compose_aware_send(home: &Path, agent_name: &str, message: &str) {
 /// hint failure (recipient absent from registry, API unreachable) is
 /// swallowed silently because inbox storage is the durable source of
 /// truth.
-pub fn enqueue_with_idle_hint(
-    home: &Path,
-    target: &str,
-    msg: InboxMessage,
-) -> anyhow::Result<()> {
+pub fn enqueue_with_idle_hint(home: &Path, target: &str, msg: InboxMessage) -> anyhow::Result<()> {
     enqueue_with_idle_hint_with_emitter(home, target, msg, |hint| {
         compose_aware_inject(home, target, hint);
     })
@@ -3881,11 +3877,26 @@ mod tests {
         .expect("enqueue_with_idle_hint");
 
         let got = captured.lock().clone().expect("hint must be emitted");
-        assert!(got.starts_with(PENDING_HEADER_PREFIX), "hint must use pending prefix: {got:?}");
-        assert!(got.contains("kind=waiting_on_stale"), "hint must carry kind: {got:?}");
-        assert!(got.contains("from=system:waiting_on_stale"), "hint must carry from: {got:?}");
-        assert!(got.contains("inbox=1"), "hint must carry inbox count: {got:?}");
-        assert!(got.contains("(use inbox tool)"), "hint must carry inbox affordance: {got:?}");
+        assert!(
+            got.starts_with(PENDING_HEADER_PREFIX),
+            "hint must use pending prefix: {got:?}"
+        );
+        assert!(
+            got.contains("kind=waiting_on_stale"),
+            "hint must carry kind: {got:?}"
+        );
+        assert!(
+            got.contains("from=system:waiting_on_stale"),
+            "hint must carry from: {got:?}"
+        );
+        assert!(
+            got.contains("inbox=1"),
+            "hint must carry inbox count: {got:?}"
+        );
+        assert!(
+            got.contains("(use inbox tool)"),
+            "hint must carry inbox affordance: {got:?}"
+        );
         fs::remove_dir_all(&home).ok();
     }
 
@@ -3934,7 +3945,10 @@ mod tests {
         .expect("enqueue_with_idle_hint");
 
         let got = captured.lock().clone().expect("hint emitted");
-        assert!(got.contains("inbox=3"), "hint must reflect 3 unread: {got:?}");
+        assert!(
+            got.contains("inbox=3"),
+            "hint must reflect 3 unread: {got:?}"
+        );
         fs::remove_dir_all(&home).ok();
     }
 
@@ -4134,7 +4148,12 @@ mod tests {
         // Extract id= token from each
         let ids: Vec<&str> = captured
             .iter()
-            .map(|h| h.split(" id=").nth(1).and_then(|s| s.split(' ').next()).unwrap_or(""))
+            .map(|h| {
+                h.split(" id=")
+                    .nth(1)
+                    .and_then(|s| s.split(' ').next())
+                    .unwrap_or("")
+            })
             .collect();
         assert_eq!(
             std::collections::HashSet::<&&str>::from_iter(ids.iter()).len(),
@@ -4179,7 +4198,11 @@ mod tests {
             })
             .expect("composing enqueue");
             let after = crate::notification_queue::pending_count(&composing_home, "agent1");
-            assert_eq!(after, before + 1, "composing must defer 1 hint for kind={kind}");
+            assert_eq!(
+                after,
+                before + 1,
+                "composing must defer 1 hint for kind={kind}"
+            );
             fs::remove_dir_all(&composing_home).ok();
         }
         fs::remove_dir_all(&home).ok();

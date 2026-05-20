@@ -1572,7 +1572,11 @@ mod tests {
         HandlerCtx<'static>,
         std::path::PathBuf,
     ) {
-        setup_team_env(home, &[codex_agent, sender], &[("dev", &[codex_agent, sender])]);
+        setup_team_env(
+            home,
+            &[codex_agent, sender],
+            &[("dev", &[codex_agent, sender])],
+        );
         // Flip the codex_agent backend in fleet.yaml.
         let yaml = std::fs::read_to_string(crate::fleet::fleet_yaml_path(home)).unwrap();
         let yaml = yaml.replace(
@@ -1825,7 +1829,11 @@ mod tests {
         // the override predicate must not redirect them through inbox_only.
         let home = tmp_home("982-b6");
         // Use the default claude-flavored spawn from setup_team_env.
-        setup_team_env(&home, &["claude-agent", "sender"], &[("dev", &["claude-agent", "sender"])]);
+        setup_team_env(
+            &home,
+            &["claude-agent", "sender"],
+            &[("dev", &["claude-agent", "sender"])],
+        );
         let registry: &'static agent::AgentRegistry =
             Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
         let spawn_cfg = crate::agent::SpawnConfig {
