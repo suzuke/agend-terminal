@@ -1939,7 +1939,10 @@ I see it in the docs but I'm not sure when Gemini shows it.
         let mut vt = crate::vterm::VTerm::new(120, 30);
         vt.process(b"\x1b[2J\x1b[H");
         vt.process(" Accessing workspace:\r\n\r\n /private/tmp/claude-test\r\n\r\n".as_bytes());
-        vt.process(" Quick safety check: Is this a project you created or one you trust?\r\n\r\n".as_bytes());
+        vt.process(
+            " Quick safety check: Is this a project you created or one you trust?\r\n\r\n"
+                .as_bytes(),
+        );
         vt.process(" ❯ 1. Yes, I trust this folder\r\n".as_bytes()); // marker on row 1 (default)
         vt.process("   2. No, exit\r\n".as_bytes());
         vt.process(" Enter to confirm · Esc to cancel\r\n".as_bytes());
