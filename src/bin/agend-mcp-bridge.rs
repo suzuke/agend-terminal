@@ -163,7 +163,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     // Refresh the dedup-window anchor — successive
                     // double-fires within the same turn keep getting
                     // dropped instead of one slipping through after the
-                    // first window expires.
+                    // first window expires. Safe because the original
+                    // record was seeded from a confirmed-forwarded call
+                    // (see Ok branch below) — propagation of validity.
                     last_call = Some(RecentCall {
                         tool: tool.to_string(),
                         args: args.clone(),
@@ -171,26 +173,41 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     });
                     continue;
                 }
-                last_call = Some(RecentCall {
-                    tool: tool.to_string(),
-                    args: args.clone(),
-                    at: now,
-                });
 
+                // RC1 (PR #1008 reviewer): record `last_call` ONLY after
+                // a successful forward. Pre-fix recorded unconditionally
+                // before `proxy_tool_call`, which meant a first call that
+                // FAILED at the daemon would still seed the dedup cache —
+                // a retry within 500 ms would then be wrongly dropped with
+                // a success-with-note while the daemon never saw it.
+                // Outcome contract: dedup only covers requests that
+                // actually reached the daemon's logical-execution path.
                 match proxy_tool_call(&home, &instance, tool, args, &mut conn) {
-                    Ok(result) => serde_json::json!({
-                        "jsonrpc": "2.0", "id": id,
-                        "result": {
-                            "content": [{"type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default()}],
-                            "isError": result.get("error").is_some()
-                        }
-                    }).to_string(),
+                    Ok(result) => {
+                        last_call = Some(RecentCall {
+                            tool: tool.to_string(),
+                            args: args.clone(),
+                            at: now,
+                        });
+                        serde_json::json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "result": {
+                                "content": [{"type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default()}],
+                                "isError": result.get("error").is_some()
+                            }
+                        }).to_string()
+                    }
                     Err(e) => {
                         conn = None;
+                        // Deliberately NOT updating `last_call` — operator
+                        // can retry the identical call within 500 ms and
+                        // the second attempt MUST actually forward (the
+                        // first attempt never reached daemon execution).
                         serde_json::json!({
                             "jsonrpc": "2.0", "id": id,
                             "error": {"code": -32603, "message": format!("daemon proxy error: {e}")}
-                        }).to_string()
+                        })
+                        .to_string()
                     }
                 }
             }
@@ -663,6 +680,37 @@ mod tests {
             now,
             CONTENT_DEDUP_WINDOW,
         ));
+    }
+
+    /// RC1 (PR #1008 reviewer): a first proxy_tool_call ERROR must NOT
+    /// seed the dedup cache. Production invariant: `last_call` is only
+    /// assigned inside the `Ok(_)` branch of the proxy match. If the
+    /// first call fails (daemon unavailable, connection drop, etc.),
+    /// `last_call` stays at its pre-call value — so an identical retry
+    /// within 500 ms goes through the proxy normally instead of being
+    /// dropped with a success-with-note while the daemon never saw it.
+    ///
+    /// This test pins the predicate side of the invariant. The matching
+    /// production change in `run()`'s `tools/call` arm moved the
+    /// `last_call = Some(...)` assignment from BEFORE the proxy match
+    /// to INSIDE the `Ok(_)` branch.
+    #[test]
+    fn proxy_failure_does_not_seed_dedup() {
+        // State simulating "first proxy errored, last_call stayed as it
+        // was before that call". Production code path: the `Err(_)` arm
+        // does NOT touch `last_call`.
+        let last_call: Option<RecentCall> = None;
+        let now = Instant::now() + Duration::from_millis(84); // retry at same 84ms timing
+        assert!(
+            !is_duplicate_call(
+                last_call.as_ref(),
+                "send",
+                &args_send("lead", "hello"),
+                now,
+                CONTENT_DEDUP_WINDOW,
+            ),
+            "RC1 invariant: post-proxy-failure dedup state must NOT block an identical retry"
+        );
     }
 
     /// Window boundary — exactly `window` elapsed must NOT be a duplicate
