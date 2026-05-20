@@ -210,6 +210,22 @@ If `repo action=checkout` fails (lease already held, branch unknown, worktree qu
 
 **Relationship to §3.19.** §3.19 says *what reviewers must not do in canonical*. §3.19.1 says *what every agent must do when the protocol gate fires* — abort and ask, not bypass and retry.
 
+### 3.19.2 Reviewer Base Workspace Branch Discipline
+
+§3.19 covers the canonical source repo. This section covers the reviewer agent's OWN base workspace dir (e.g. `~/.agend-terminal/workspace/fixup-reviewer/`).
+
+**Reviewers MUST NOT** do in-place `git checkout` of an impl branch into the agent's base workspace dir. The base workspace is daemon-bound to a specific branch (typically `main` or a long-lived review-housekeeping branch); checking out an impl branch in-place pollutes the base with stale-branch state that bleeds into future sessions.
+
+Use one of:
+- **(a) Dedicated review worktree**: `git worktree add -b review/<N>-r0 <path> origin/<impl-branch>` — read-only review in a fresh worktree separate from the agent base. Release with `release_worktree` when done.
+- **(b) GH-only review** (preferred for diff-only inspection): `gh pr diff <N>` + `gh pr view <N> --json files,reviews,statusCheckRollup`. No local checkout, no cleanup needed.
+
+**NEVER** in-place `git checkout` of an impl branch in the agent's base workspace dir.
+
+Rationale: incident 2026-05-20 — fixup-reviewer base dir was found stuck on `fix/900-spawn-env-propagation` with 492 deletion markers from a 2026-05-18 in-place checkout that was never reverted. Recovery cost session backend state (`.codex/.claude/.gemini/.kiro/.opencode/AGENTS.md` removed by `git clean -fd` because those dirs weren't in the fix/900-era `.gitignore`). The reflog showed the original Sprint discipline used `review/NNN-r0` per-PR worktrees correctly (2026-05-16 entries), then drifted to in-place checkouts.
+
+**Relationship to §3.19.** §3.19 forbids checkout in CANONICAL. §3.19.2 forbids in-place checkout in the agent's BASE WORKSPACE. Both protect against stale-branch pollution at different boundaries.
+
 ### 3.20 Race-Condition PR Discipline
 
 Race-class PRs ship with hidden timing dependencies that pass CI + reviewer VERIFIED yet break production. Empirical motivation: #881 ("app mode never owns the daemon") shipped CI green + reviewer VERIFIED on 2026-05-17, then surfaced a spawn-and-attach race on the first cold-start with a slow filesystem flush. Operator reverted at 470c251; #882 reopen fix shipped at 0fd89e8 with a probe_api gate + `--foreground` mode + actionable error path. The lessons below apply to every spawn / async-coordination / multi-process-startup PR (the "race class"); same discipline framing as §3.19.1.
