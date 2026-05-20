@@ -436,11 +436,8 @@ impl StatePatterns {
                     AgentState::GitConflict,
                     r"Automatic merge failed; fix conflicts|CONFLICT \(content\)|Resolve all conflicts manually|Failed to merge submodule|Failed to merge in",
                 ),
-                // [measured] Codex 0.120.0 renders tool-call blocks as a
-                // two-line region — a `•` title line (`• Explored`,
-                // `• Edited`, `• Ran`) followed by a `└` continuation
-                // #1005 Phase A1: drop the `└ <Verb>` continuation and
-                // `• <PastTense>` title-line alternations — both are
+                // #1005 Phase A1: dropped the `└ <Verb>` continuation
+                // and `• <PastTense>` title-line alternations — both are
                 // COMPLETION render forms (the past-tense verbs
                 // `Explored|Edited|Ran` are unambiguously historical;
                 // the `└` continuation lines render under the title
@@ -450,10 +447,18 @@ impl StatePatterns {
                 // `• Working (...)` spinner which fires Thinking — no
                 // replacement ToolUse pattern needed.
                 //
-                // Legacy `apply_patch` substring preserved — that string
-                // surfaces in stack traces / tool-output errors, not in
-                // completion-banner shape.
-                (AgentState::ToolUse, r"apply_patch"),
+                // #1005 Phase A1 RC1 (reviewer #1009 verdict): the
+                // legacy `r"apply_patch"` alternation was also REMOVED.
+                // Pre-RC1 it was preserved as "error / stack-trace
+                // surface" — but unanchored substring matched
+                // `└ Ran apply_patch` / `• Ran apply_patch` in
+                // completion-banner context, re-triggering the same
+                // priority oscillation class the rest of this audit
+                // closed. No fixture-backed active-only `apply_patch`
+                // shape exists distinct from the completion banner;
+                // until one surfaces, codex has no ToolUse pattern.
+                // Errors / stack-traces should classify under a
+                // dedicated state if needed (out of scope for #1005).
                 // [measured] Codex shows "◦ Working (Ns • esc to interrupt)"
                 // during generation. Both "Working" and "esc to interrupt"
                 // are stable anchors.
@@ -2418,18 +2423,19 @@ mod tests {
         // not active execution. Re-pinned: continuation lines must NOT
         // fire ToolUse.
         //
-        // `└ Ran apply_patch` is excluded from the negative list because
-        // the `apply_patch` substring is matched by the LEGACY
-        // alternation (preserved per #1005 Phase A1 rationale: error /
-        // stack-trace surface). That overlap is acceptable — the legacy
-        // pattern is narrow enough (substring-only) that scrollback
-        // false-positive risk is low.
+        // #1005 RC1 (reviewer #1009 verdict): `└ Ran apply_patch` is
+        // INCLUDED in the negative list — the pre-RC1 carveout kept
+        // the broad `apply_patch` substring pattern, which violated
+        // the A1 semantic by re-firing ToolUse on completion banners.
+        // Now the legacy alternation is gone and this test pins that
+        // removal.
         let patterns = StatePatterns::for_backend(&Backend::Codex);
         for sample in [
             "  └ Read README.md",
             "  └ Write /tmp/out.txt",
             "  └ Edit Cargo.toml",
             "  └ List src/",
+            "  └ Ran apply_patch",
         ] {
             assert_ne!(
                 patterns.detect(sample),
@@ -2440,18 +2446,25 @@ mod tests {
     }
 
     #[test]
-    fn codex_tooluse_legacy_apply_patch_still_matches() {
-        // Preserve compat: `apply_patch` substring (stack-trace /
-        // tool-output error surface) continues to fire ToolUse. This
-        // legacy alternation was kept across the #1005 Phase A1 cleanup
-        // because the substring appears in error contexts where the
-        // tool DID actively execute and we want the active-state signal.
+    fn codex_tooluse_apply_patch_completion_does_not_fire_per_1005_rc1() {
+        // #1005 RC1 (reviewer #1009 verdict): the broad legacy
+        // `r"apply_patch"` substring pattern was removed. Pre-RC1 it
+        // fired ToolUse on `• Ran apply_patch` / `└ Ran apply_patch`
+        // completion banners, re-triggering the priority oscillation
+        // class the rest of #1005 Phase A1 closed. Pin: completion
+        // banners containing `apply_patch` must NOT fire ToolUse.
         let patterns = StatePatterns::for_backend(&Backend::Codex);
-        assert_eq!(
-            patterns.detect("Error: apply_patch failed at /tmp/foo.txt"),
-            Some(AgentState::ToolUse),
-            "legacy apply_patch substring must still fire ToolUse"
-        );
+        for sample in [
+            "• Ran apply_patch",
+            "  └ Ran apply_patch",
+            "Error: apply_patch failed at /tmp/foo.txt",
+        ] {
+            assert_ne!(
+                patterns.detect(sample),
+                Some(AgentState::ToolUse),
+                "#1005 RC1: codex `apply_patch` completion / error surface must NOT fire ToolUse: {sample:?}"
+            );
+        }
     }
 
     #[test]
