@@ -88,6 +88,19 @@ fn notify_telegram_inner(
             let e: anyhow::Error = e.into();
             if let Some(stale_tid) = topic_id {
                 if is_topic_deleted_error(&e) {
+                    // #969 RC3: pin the topic-deleted detection event for
+                    // future-debugging visibility. Series-close defense-in-
+                    // depth — old topic is gone so no user-visible duplicate
+                    // today, but if a future retry path is added without the
+                    // same idempotency guarantee, this log is the breadcrumb
+                    // operator greps for to confirm the suspected retry-spam
+                    // class.
+                    tracing::info!(
+                        instance = %instance_owned,
+                        topic = stale_tid,
+                        error = %e,
+                        "#969 RC3: notify topic-deleted detected, recreating + retrying"
+                    );
                     if let Some(new_tid) =
                         invalidate_and_recreate_topic(&home_owned, &instance_owned, stale_tid)
                     {
