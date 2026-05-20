@@ -80,7 +80,11 @@ impl Backend {
             Backend::Codex => "codex",
             Backend::OpenCode => "opencode",
             Backend::Gemini => "gemini",
-            Backend::Agy => "agy",
+            // #995: display name is the product short form `antigravity-cli`,
+            // not the binary `agy`. Binary command remains `agy` (preset.command);
+            // parse_str still accepts the "agy" alias for backward-compat with
+            // any fleet.yaml entries written before #995.
+            Backend::Agy => "antigravity-cli",
             Backend::Shell => "shell",
             Backend::Raw(s) => s.as_str(),
         }
@@ -375,13 +379,14 @@ impl Backend {
                 instructions_shared: true,
                 inject_instructions_on_ready: false,
                 ready_timeout_secs: 20,
-                // #987: dismiss_patterns kept empty for r0. AGY runs with
-                // `--dangerously-skip-permissions` which auto-approves all
-                // tool permissions (per `agy --help`); no per-tool prompts
-                // expected. If a future agy version introduces prompts that
-                // bypass the skip-permissions flag, add anchored regexes
-                // here following the Gemini precedent above.
-                dismiss_patterns: &[],
+                // #995: --dangerously-skip-permissions auto-approves tool
+                // permission requests (per `agy --help`), but does NOT bypass
+                // the workspace-trust prompt that fires on every fresh spawn
+                // ("Do you trust the contents of this project?"). The prompt
+                // pre-selects "Yes, I trust this folder" (cursor `>` marker
+                // on first row), so Enter alone confirms. Mirrors Codex's
+                // "Do you trust" pattern with anchored regex per #468.
+                dismiss_patterns: &[(r"(?m)^[^A-Za-z\n]{0,8}Yes, I trust", b"\r")],
                 fresh_args: None,
             },
             // Shell and Raw have no preset behavior. `command` is `""` as a
@@ -964,13 +969,16 @@ mod tests {
         let gemini = Backend::Gemini.preset();
         assert!(gemini.args.contains(&"--yolo"));
 
-        // #987: agy mirrors the existing preset shape — verify command,
-        // args, and the dangerously-skip-permissions flag (auto-approves
-        // tool calls, so no dismiss_patterns needed for r0).
+        // #987 + #995: agy mirrors the existing preset shape — verify command,
+        // args, and the dangerously-skip-permissions flag. #995 added a
+        // workspace-trust dismiss_pattern after live-spawn proved the flag
+        // doesn't bypass the trust-folder prompt.
         let agy = Backend::Agy.preset();
         assert_eq!(agy.command, "agy");
         assert!(agy.args.contains(&"--dangerously-skip-permissions"));
-        assert!(agy.dismiss_patterns.is_empty());
+        assert_eq!(agy.dismiss_patterns.len(), 1, "#995 trust dismiss");
+        assert!(agy.dismiss_patterns[0].0.contains("Yes, I trust"));
+        assert_eq!(agy.dismiss_patterns[0].1, b"\r");
         assert_eq!(agy.instructions_path, "AGY.md");
     }
 
@@ -1007,7 +1015,10 @@ mod tests {
         assert_eq!(Backend::Codex.name(), "codex");
         assert_eq!(Backend::OpenCode.name(), "opencode");
         assert_eq!(Backend::Gemini.name(), "gemini");
-        assert_eq!(Backend::Agy.name(), "agy");
+        // #995: agy display name is the product short form, not the binary.
+        // The binary (`agy`) is exposed via preset().command instead.
+        assert_eq!(Backend::Agy.name(), "antigravity-cli");
+        assert_eq!(Backend::Agy.preset().command, "agy");
     }
 
     #[test]

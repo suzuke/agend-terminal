@@ -73,7 +73,7 @@ For optional Telegram binding (remote control + outbound alerts), see [`docs/USA
 | Codex | `codex` | Tested |
 | OpenCode | `opencode` | Tested |
 | Gemini CLI | `gemini` | Tested (sunsets 2026-06-18 for free/Pro/Ultra; paid Code Assist Standard/Enterprise retain access) |
-| Antigravity CLI | `agy` | Tested (#987 — Gemini CLI's official successor) |
+| Antigravity CLI | `antigravity-cli` (binary `agy`) | Tested (#987 — Gemini CLI's official successor; #995 polish) |
 
 ## Learn More
 
