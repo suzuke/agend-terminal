@@ -47,6 +47,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+pub mod gh_poll;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PrState {
     pub repo: String,
@@ -84,6 +86,21 @@ pub struct PrState {
     pub auto_armed_for_sha: Option<String>,
     #[serde(default)]
     pub auto_armed_at: Option<String>,
+    /// #986: last successful gh-poll observation (RFC3339). `None`
+    /// pre-first-poll. Drives tiered cadence — when `auto_armed=true`
+    /// we re-poll every 15s; otherwise every 60s.
+    #[serde(default)]
+    pub last_gh_poll_at: Option<String>,
+    /// #986: consecutive failed gh-poll attempts (rate-limit / CLI
+    /// absent / network error). Drives exponential backoff:
+    /// `2^failures × tick` capped at 300s. Cleared on first success.
+    #[serde(default)]
+    pub gh_poll_failures: u32,
+    /// #986: snapshot of the last gh-poll response for diff detection.
+    /// Drives transition observation (state transitions / isDraft
+    /// toggle / mergedAt landing). `None` pre-first-poll.
+    #[serde(default)]
+    pub last_gh_state: Option<gh_poll::GhPrMetadata>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -472,6 +489,11 @@ pub fn new_for_branch(
         auto_armed: false,
         auto_armed_for_sha: None,
         auto_armed_at: None,
+        // #986 gh-poll observation fields — populated on first
+        // scanner pass post-creation by gh_poll::CliGhPoller.
+        last_gh_poll_at: None,
+        gh_poll_failures: 0,
+        last_gh_state: None,
         created_at: now.clone(),
         updated_at: now,
     }
@@ -592,9 +614,10 @@ pub fn record_verdict(
 }
 
 /// Author resolution chain (reviewer cross-audit PRIMARY):
-/// 1. Stored `pr_author` field if non-empty (gh-poll already populated)
-/// 2. `subscribers[0]` from ci_watch (legacy fallback)
-/// 3. `"fixup-lead"` last-resort fallback so emission never silently drops
+/// 1. Stored `pr_author` field if non-empty (gh-poll already populated
+///    it via the 4-tier chain in [`gh_poll::resolve_author_with_gh`])
+/// 2. `subscribers[0]` from ci_watch (pre-gh-poll fallback)
+/// 3. `"fixup-lead"` last-resort fallback (with `tracing::warn`)
 pub fn resolve_author(state: &PrState) -> String {
     if !state.pr_author.is_empty() {
         return state.pr_author.clone();
@@ -602,6 +625,12 @@ pub fn resolve_author(state: &PrState) -> String {
     if let Some(first) = state.subscribers.first() {
         return first.clone();
     }
+    tracing::warn!(
+        repo = %state.repo,
+        branch = %state.branch,
+        "#986 resolve_author: no pr_author + no subscribers → \
+         fixup-lead fallback (gh-poll may not have run yet)"
+    );
     "fixup-lead".to_string()
 }
 
@@ -636,14 +665,27 @@ pub fn format_ready_body(state: &PrState) -> String {
     )
 }
 
+/// Production per-tick entry point — wraps [`scan_and_emit_with`]
+/// using [`gh_poll::CliGhPoller`]. Tests use `scan_and_emit_with` with
+/// a `MockGhPoller` to inject canned responses without spawning gh.
+pub fn scan_and_emit(home: &Path, registry: &crate::agent::AgentRegistry) {
+    scan_and_emit_with(home, registry, &gh_poll::CliGhPoller);
+}
+
 /// Per-tick scanner: walks `<home>/pr-state/*.json`, emits any newly-
 /// eligible `[pr-ready-for-merge]` events (debounced via
 /// `ready_emitted_for_sha`), and sweeps terminal-state files.
 ///
 /// gh-poll for pr_number/pr_author/draft/merge state is fired here
 /// (rate-limited — at most one gh call per scanner tick per file).
-pub fn scan_and_emit(home: &Path, registry: &crate::agent::AgentRegistry) {
+pub fn scan_and_emit_with(
+    home: &Path,
+    registry: &crate::agent::AgentRegistry,
+    poller: &dyn gh_poll::GhPoller,
+) {
     let dir = pr_state_dir(home);
+    // #986: Phase 1 — batched gh-poll per repo for files due.
+    apply_gh_poll(home, &dir, poller);
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return;
     };
@@ -737,6 +779,172 @@ pub fn scan_and_emit(home: &Path, registry: &crate::agent::AgentRegistry) {
     }
 }
 
+/// #986: batched gh-poll feeder. Groups PrState files by repo, issues
+/// ONE `gh pr list` per repo with at least one file due for refresh,
+/// then applies each PR's metadata back to its matching file by
+/// `head_ref → branch`. Tiered cadence (15s armed / 60s default) +
+/// exponential backoff on failures (`2^failures × tick` capped 300s).
+///
+/// Failures bump per-PrState `gh_poll_failures` (per-repo failures
+/// would over-suppress); success clears the counter. Idempotent:
+/// re-applying the same metadata is a no-op for the reducer if state
+/// already matches.
+fn apply_gh_poll(home: &Path, dir: &Path, poller: &dyn gh_poll::GhPoller) {
+    use std::collections::HashMap;
+
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    // Group files by repo + collect those due for refresh.
+    let mut by_repo: HashMap<String, Vec<PrState>> = HashMap::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(state): Result<PrState, _> = serde_json::from_str(&content) else {
+            continue;
+        };
+        // Skip already-terminal states — they'll be swept by the
+        // main scanner loop on this pass.
+        if matches!(
+            state.merge_state,
+            MergeState::Merged { .. } | MergeState::ClosedUnmerged { .. }
+        ) {
+            continue;
+        }
+        if gh_poll::should_poll(&state, &now) {
+            by_repo.entry(state.repo.clone()).or_default().push(state);
+        }
+    }
+    for (repo, due_states) in by_repo {
+        match poller.poll(&repo) {
+            Ok(prs) => {
+                for mut state in due_states {
+                    apply_gh_observations(home, &mut state, &prs, &now);
+                    state.gh_poll_failures = 0;
+                    state.last_gh_poll_at = Some(now.clone());
+                    if let Err(e) = save(home, &state) {
+                        tracing::warn!(
+                            repo = %state.repo,
+                            branch = %state.branch,
+                            error = %e,
+                            "#986 pr_state: post-gh-poll save failed"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(repo = %repo, error = %e, "#986 gh-poll failed");
+                for mut state in due_states {
+                    state.gh_poll_failures = state.gh_poll_failures.saturating_add(1);
+                    state.last_gh_poll_at = Some(now.clone());
+                    let _ = save(home, &state);
+                }
+            }
+        }
+    }
+}
+
+/// Apply gh-poll observations to a single PrState. Detects state
+/// transitions and dispatches the appropriate reducer events:
+/// - `state=MERGED + mergedAt!=None` → `MergedObserved`
+/// - `state=CLOSED + mergedAt=None` → `ClosedUnmergedObserved`
+/// - `isDraft` toggle → `DraftTransition`
+/// - First observation: populate `pr_number` + `pr_author` from the
+///   matching metadata (no Event needed; direct field assignment).
+fn apply_gh_observations(
+    home: &Path,
+    state: &mut PrState,
+    prs: &[gh_poll::GhPrMetadata],
+    now: &str,
+) {
+    let Some(meta) = prs.iter().find(|m| m.head_ref == state.branch) else {
+        return;
+    };
+
+    // First observation — populate identity fields.
+    if state.pr_author.is_empty() {
+        state.pr_number = meta.number;
+        state.pr_author = gh_poll::resolve_author_with_gh(home, Some(&meta.author_login), state);
+        tracing::info!(
+            repo = %state.repo,
+            branch = %state.branch,
+            pr_number = state.pr_number,
+            pr_author = %state.pr_author,
+            "#986 pr_state: first-observation populated PR identity"
+        );
+    }
+
+    // Draft transition.
+    let new_draft = meta.is_draft;
+    let old_draft = matches!(state.draft_state, DraftState::Draft);
+    if new_draft != old_draft {
+        apply(
+            state,
+            Event::DraftTransition {
+                is_draft: new_draft,
+            },
+        );
+    }
+
+    // Terminal state transitions.
+    if let Some(prev) = state.last_gh_state.as_ref() {
+        if prev.state != meta.state {
+            match (meta.state, meta.merged_at.as_deref()) {
+                (gh_poll::GhPrState::Merged, Some(merged_at)) => {
+                    apply(
+                        state,
+                        Event::MergedObserved {
+                            // gh CLI doesn't return the merge commit hash
+                            // in `pr list`; use head_sha as best-effort
+                            // identifier. Operator can `gh pr view` for
+                            // the real commit hash.
+                            merge_commit: &state.head_sha.clone(),
+                            merged_at: merged_at.to_string(),
+                        },
+                    );
+                }
+                (gh_poll::GhPrState::Closed, _) if meta.merged_at.is_none() => {
+                    apply(
+                        state,
+                        Event::ClosedUnmergedObserved {
+                            closed_at: now.to_string(),
+                        },
+                    );
+                }
+                _ => {}
+            }
+        }
+    } else {
+        // First observation — also catches case where PR was already
+        // merged before we started watching.
+        match (meta.state, meta.merged_at.as_deref()) {
+            (gh_poll::GhPrState::Merged, Some(merged_at)) => {
+                apply(
+                    state,
+                    Event::MergedObserved {
+                        merge_commit: &state.head_sha.clone(),
+                        merged_at: merged_at.to_string(),
+                    },
+                );
+            }
+            (gh_poll::GhPrState::Closed, _) if meta.merged_at.is_none() => {
+                apply(
+                    state,
+                    Event::ClosedUnmergedObserved {
+                        closed_at: now.to_string(),
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+
+    state.last_gh_state = Some(meta.clone());
+}
+
 fn build_event_message(
     kind: &str,
     _author: &str,
@@ -801,6 +1009,9 @@ mod tests {
             auto_armed: false,
             auto_armed_for_sha: None,
             auto_armed_at: None,
+            last_gh_poll_at: None,
+            gh_poll_failures: 0,
+            last_gh_state: None,
             created_at: now(),
             updated_at: now(),
         }
@@ -1516,5 +1727,169 @@ mod tests {
             ReviewClass::Single,
             "wrong type defaults to Single"
         );
+    }
+
+    // ─── #986 caller-path integration tests (T2/T4/T5/T6/T9/T10) ─────
+
+    use crate::daemon::pr_state::gh_poll::tests::MockGhPoller;
+    use crate::daemon::pr_state::gh_poll::{GhPrMetadata, GhPrState};
+
+    fn home_with_state(tag: &str, state: PrState) -> std::path::PathBuf {
+        let home =
+            std::env::temp_dir().join(format!("agend-986-int-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").unwrap();
+        std::fs::create_dir_all(home.join("inbox")).ok();
+        save(&home, &state).unwrap();
+        home
+    }
+
+    fn empty_registry() -> crate::agent::AgentRegistry {
+        use parking_lot::Mutex;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    fn gh_meta_open(number: u64, branch: &str, author: &str) -> GhPrMetadata {
+        GhPrMetadata {
+            number,
+            author_login: author.to_string(),
+            head_ref: branch.to_string(),
+            is_draft: false,
+            state: GhPrState::Open,
+            merged_at: None,
+        }
+    }
+
+    /// #986 T2 — first observation populates pr_number + pr_author.
+    /// Before scan: state.pr_number=0, pr_author="". After scan with
+    /// gh-poll returning the matching PR: both fields populated.
+    #[test]
+    fn t9_first_gh_observation_populates_pr_identity() {
+        let mut s = new_state("sha-A", ReviewClass::Single);
+        s.pr_author = String::new(); // simulate freshly-created state
+        s.pr_number = 0;
+        let home = home_with_state("first-obs", s);
+        let poller = MockGhPoller::new(vec![Ok(vec![gh_meta_open(970, "feat/test", "dev")])]);
+
+        scan_and_emit_with(&home, &empty_registry(), &poller);
+
+        let loaded = load(&home, "owner/repo", "feat/test").unwrap();
+        assert_eq!(loaded.pr_number, 970);
+        assert_eq!(loaded.pr_author, "dev"); // tier 2 direct name match (no fleet entries)
+        assert_eq!(loaded.gh_poll_failures, 0);
+        assert!(loaded.last_gh_poll_at.is_some());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// #986 T4 — `gh state=MERGED + mergedAt!=None` fires
+    /// MergedObserved → reducer transitions to Merged terminal state
+    /// → scanner emits `[pr-merged]` to author inbox + sweeps file.
+    #[test]
+    fn t10_merged_observation_fires_pr_merged_event() {
+        let mut s = new_state("sha-A", ReviewClass::Single);
+        s.pr_author = String::new();
+        let home = home_with_state("merged-obs", s);
+        let merged_meta = GhPrMetadata {
+            number: 970,
+            author_login: "dev".into(),
+            head_ref: "feat/test".into(),
+            is_draft: false,
+            state: GhPrState::Merged,
+            merged_at: Some("2026-05-20T04:17:09Z".to_string()),
+        };
+        let poller = MockGhPoller::new(vec![Ok(vec![merged_meta])]);
+
+        scan_and_emit_with(&home, &empty_registry(), &poller);
+
+        // File swept (Merged is terminal — gets removed).
+        assert!(
+            load(&home, "owner/repo", "feat/test").is_none(),
+            "Merged terminal → file swept"
+        );
+        // [pr-merged] in fixup-dev's inbox.
+        let msgs = crate::inbox::drain(&home, "dev");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].kind.as_deref(), Some("pr-merged"));
+        assert!(msgs[0].text.contains("pr-merged"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// #986 T5 — `gh state=CLOSED + mergedAt=None` fires
+    /// ClosedUnmergedObserved → reducer transitions → scanner emits
+    /// `[pr-closed-unmerged]`.
+    #[test]
+    fn t11_closed_unmerged_observation_fires_event() {
+        let mut s = new_state("sha-A", ReviewClass::Single);
+        s.pr_author = String::new();
+        let home = home_with_state("closed-obs", s);
+        let closed_meta = GhPrMetadata {
+            number: 970,
+            author_login: "dev".into(),
+            head_ref: "feat/test".into(),
+            is_draft: false,
+            state: GhPrState::Closed,
+            merged_at: None,
+        };
+        let poller = MockGhPoller::new(vec![Ok(vec![closed_meta])]);
+
+        scan_and_emit_with(&home, &empty_registry(), &poller);
+
+        assert!(load(&home, "owner/repo", "feat/test").is_none());
+        let msgs = crate::inbox::drain(&home, "dev");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].kind.as_deref(), Some("pr-closed-unmerged"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// #986 T7 — gh-poll failure increments `gh_poll_failures` and
+    /// updates `last_gh_poll_at` so backoff math kicks in next tick.
+    #[test]
+    fn t12_gh_poll_failure_increments_backoff_counter() {
+        let s = new_state("sha-A", ReviewClass::Single);
+        let home = home_with_state("backoff", s);
+        let poller = MockGhPoller::new(vec![Err(anyhow::anyhow!("simulated rate limit"))]);
+
+        scan_and_emit_with(&home, &empty_registry(), &poller);
+
+        let loaded = load(&home, "owner/repo", "feat/test").unwrap();
+        assert_eq!(loaded.gh_poll_failures, 1);
+        assert!(loaded.last_gh_poll_at.is_some());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// #986 T10 (reviewer MANDATORY idempotency) — same gh-poll output
+    /// applied twice does NOT double-emit / double-transition. Reducer
+    /// recomputes derived state; Merged terminal already swept on
+    /// first pass, so second pass has nothing to do.
+    #[test]
+    fn t13_idempotent_same_observation_no_double_emit() {
+        let mut s = new_state("sha-A", ReviewClass::Single);
+        s.pr_author = String::new();
+        let home = home_with_state("idempotent", s);
+        let merged_meta = GhPrMetadata {
+            number: 970,
+            author_login: "dev".into(),
+            head_ref: "feat/test".into(),
+            is_draft: false,
+            state: GhPrState::Merged,
+            merged_at: Some("2026-05-20T04:17:09Z".to_string()),
+        };
+        // Two consecutive polls return the same metadata.
+        let poller = MockGhPoller::new(vec![Ok(vec![merged_meta.clone()]), Ok(vec![merged_meta])]);
+
+        scan_and_emit_with(&home, &empty_registry(), &poller);
+        let msgs1 = crate::inbox::drain(&home, "dev");
+        assert_eq!(msgs1.len(), 1, "first scan emits [pr-merged]");
+
+        // Second scan — file already swept; no PrState files to poll.
+        // Even if a stale file existed, the terminal state would be
+        // sticky and the scanner wouldn't re-emit.
+        scan_and_emit_with(&home, &empty_registry(), &poller);
+        let msgs2 = crate::inbox::drain(&home, "dev");
+        assert_eq!(msgs2.len(), 0, "second scan: file swept, no re-emit");
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
