@@ -124,6 +124,22 @@ pub(super) fn try_telegram_reply_from(
         .instances
         .get(instance_name)
         .and_then(|inst| inst.topic_id);
+    // #969: catches the PTY-mirror + reply-tool race (RC2). The RC2
+    // root-cause fix (move mirror_skip set BEFORE send in
+    // handle_reply) closes the dominant window; this dedup catches
+    // any residual race and also any future RC2-shaped regression
+    // from new callers.
+    let dedup_key = crate::channel::dedup::DedupKey::new(
+        "telegram:reply",
+        instance_name,
+        topic_id.map(i64::from),
+        text,
+    );
+    if !crate::channel::dedup::global(home).record_and_check(dedup_key) {
+        // Synthesized success — caller proceeds; the actual original
+        // send already happened or is in flight.
+        return Ok((0, ch.group_id));
+    }
     match telegram_reply_send_inner(&ch, instance_name, topic_id, text) {
         Ok(msg_id) => Ok((msg_id, ch.group_id)),
         Err(e) => {

@@ -42,6 +42,21 @@ fn notify_telegram_inner(
         None => return,
     };
 
+    // #969: channel-wide dedup. If this (telegram, instance, topic,
+    // content) was just sent within TTL, suppress. Catches RC1 (dual
+    // app/daemon ci_watch poll) and any future regression that fans
+    // out the same notification through multiple paths. Cheap O(N)
+    // scan on a bounded VecDeque; non-blocking; instrumented.
+    let dedup_key = crate::channel::dedup::DedupKey::new(
+        "telegram:notify",
+        instance_name,
+        topic_id.map(i64::from),
+        text,
+    );
+    if !crate::channel::dedup::global(home).record_and_check(dedup_key) {
+        return;
+    }
+
     let text = text.to_string();
     let home_owned = home.to_path_buf();
     let instance_owned = instance_name.to_string();
