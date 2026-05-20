@@ -34,6 +34,7 @@ pub mod auth;
 pub mod binding;
 pub mod caps;
 pub mod contract;
+pub mod dedup;
 #[cfg(feature = "discord")]
 pub mod discord;
 pub mod event;

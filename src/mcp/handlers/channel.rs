@@ -69,15 +69,30 @@ pub(super) fn handle_reply(home: &Path, args: &Value, instance_name: &str) -> Va
             None => return json!({"error": "no active channel", "code": "no_active_channel"}),
         },
     };
+    // #969 RC2 fix: set mirror_skip BEFORE the send. Pre-fix this set
+    // ran in the Ok arm AFTER ch.send_from_agent returned; on the
+    // telegram path send_from_agent spawns a fire-and-forget task and
+    // returns Ok(0) immediately, but the PTY-mirror dispatcher
+    // (src/daemon/router.rs:try_dispatch_mirror) is on a different
+    // thread and could sample heartbeat_pair BEFORE this set fired —
+    // dispatching its own mirror of the same text. Moving the set
+    // earlier closes the dominant race window (channel-side dedup
+    // in src/channel/dedup.rs catches any residual collisions).
+    //
+    // Err path policy (dev-2 Pushback 4): leave mirror_skip set even
+    // when send fails. The flag's `_until_next_turn` semantics
+    // naturally expire on the next turn boundary, so we don't
+    // accidentally suppress a legitimate next-turn mirror. Flipping
+    // the flag back on Err would risk double-delivery if the actual
+    // send eventually lands while the mirror also fires.
+    crate::daemon::heartbeat_pair::update_with(instance_name, |p| {
+        p.mirror_skip_until_next_turn = true;
+    });
     match ch.send_from_agent(
         instance_name,
         crate::channel::AgentOutboundOp::Reply { text },
     ) {
         Ok(msg) => {
-            // Sprint 52: agent replied explicitly — skip mirror for this turn.
-            crate::daemon::heartbeat_pair::update_with(instance_name, |p| {
-                p.mirror_skip_until_next_turn = true;
-            });
             // Sprint 59 Wave 1 PR-4: surface the pending-decision /
             // resolved-decision IDs so caller observability is
             // complete (operator can reference IDs, agent can verify
