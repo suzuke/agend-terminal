@@ -169,19 +169,54 @@ fn corpus_count_report() {
         by_hung("hung"),
         by_hung("ambiguous"),
     );
-    // Sanity assertions on initial corpus shape — gentle gates that future
+    // Sanity assertions on corpus shape — gentle gates that future
     // corpus growth should preserve. Tighten once N grows.
+    //
+    // #685 PR-3 (corpus expansion via dev-2 cross-audit Pushback 2):
+    // bumped silent_stuck from ≥1 → ≥5 after relabelling 7 existing v1
+    // `*-thinking.raw` / `*-tooluse.raw` captures as F9 silent_stuck
+    // measurement fixtures. productive_marker_fire / productive_silence
+    // remain at ≥1 each — real-PTY-captured markers in the recent
+    // viewport scope (post-#1013 freshness fix) require operator-side
+    // capture work, filed as gap follow-up.
     assert!(
         by_scenario("productive_marker_fire") >= 1,
-        "initial corpus must include at least one productive_marker_fire fixture"
+        "corpus must include at least one productive_marker_fire fixture"
     );
     assert!(
         by_scenario("productive_silence") >= 1,
-        "initial corpus must include at least one productive_silence fixture"
+        "corpus must include at least one productive_silence fixture"
     );
     assert!(
-        by_scenario("silent_stuck") >= 1,
-        "initial corpus must include at least one silent_stuck fixture"
+        by_scenario("silent_stuck") >= 5,
+        "corpus must include at least 5 silent_stuck fixtures (got {} — see #685 PR-3)",
+        by_scenario("silent_stuck")
+    );
+    // Real-PTY-captured fixtures provide drift-detection beyond what
+    // synthetic fixtures can — encode current backend version output
+    // exactly. PR-3 raised this from 0 → 7. New real captures (gemini
+    // markers, opencode markers) should keep this growing.
+    assert!(
+        by_capture("real") >= 5,
+        "corpus must include at least 5 real-PTY-captured fixtures (got {} — see #685 PR-3)",
+        by_capture("real")
+    );
+    // Backend coverage: relabelled corpus must touch ≥4 distinct
+    // backends so per-backend marker behaviour is exercised.
+    let distinct_backends: std::collections::HashSet<&str> = v2
+        .iter()
+        .filter_map(|f| {
+            if f.scenario_kind.as_deref() == Some("silent_stuck") {
+                Some(f.backend.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert!(
+        distinct_backends.len() >= 4,
+        "silent_stuck fixtures must cover ≥4 distinct backends (got {} — see #685 PR-3)",
+        distinct_backends.len()
     );
 }
 

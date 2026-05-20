@@ -64,6 +64,16 @@ fixtures:
     # but Thinking remains latched — Phase 1c's LATCHED_STATE_EXPIRY
     # fallback (30s) would drop it back to Ready in production.
     expected_final_detect: null
+    # #685 PR-3 (corpus expansion via dev-2 cross-audit Pushback 2):
+    # final state is `thinking` with no productive markers visible in
+    # the rendered screen. Canonical F9 silent_stuck case — agent on
+    # spinner, no progress evidence. check_hang under productive-gate
+    # default-on would classify as Hung past 600s silence threshold.
+    scenario_kind: silent_stuck
+    expected_hung_classification: hung
+    capture_kind: real
+    provenance: "f685 PR-3 corpus relabel — existing v1 thinking capture promoted to F9 measurement"
+    schema_version: 2
 
   - file: agy-thinking.raw
     backend: agy
@@ -92,6 +102,14 @@ fixtures:
     # detect() sees Ready on the final screen but hysteresis blocks the
     # immediate downgrade (Thinking held < 2s min_hold at cut time).
     expected_final_detect: ready
+    # #685 PR-3 (corpus expansion): final=thinking, no kiro productive
+    # markers (`● Read|Write|...` / `[fs_*]` literals) in rendered
+    # output. F9 silent_stuck case for the kiro backend.
+    scenario_kind: silent_stuck
+    expected_hung_classification: hung
+    capture_kind: real
+    provenance: "f685 PR-3 corpus relabel — existing v1 thinking capture promoted to F9 measurement"
+    schema_version: 2
 
   - file: opencode-thinking.raw
     backend: opencode
@@ -101,6 +119,14 @@ fixtures:
     expected_transitions: [starting, idle, thinking]
     expected_final_state: thinking
     expected_final_detect: null
+    # #685 PR-3 (corpus expansion): final=thinking, no opencode
+    # productive markers (`→ Read|Write|...`) in rendered output.
+    # F9 silent_stuck case for the opencode backend.
+    scenario_kind: silent_stuck
+    expected_hung_classification: hung
+    capture_kind: real
+    provenance: "f685 PR-3 corpus relabel — existing v1 thinking capture promoted to F9 measurement"
+    schema_version: 2
 
   # ── Stage 2b PermissionPrompt recordings (2026-04-20) ───────────────
   # Both recordings verified a real permission dialog appearing — claude
@@ -184,6 +210,16 @@ fixtures:
     expected_transitions: [starting, idle, tool_use]
     expected_final_state: tool_use
     expected_final_detect: idle
+    # #685 PR-3 (corpus expansion): final=tool_use, no claude productive
+    # markers (`✓●⏺ Read|Write|...` -ing form vs Phase A1 alternation)
+    # in rendered output — the `⏺ Listing` token at byte ~9728 is the
+    # in-flight verb, not a Phase-A1-eligible completion marker. F9
+    # silent_stuck candidate for the claude backend in tool-use scope.
+    scenario_kind: silent_stuck
+    expected_hung_classification: hung
+    capture_kind: real
+    provenance: "f685 PR-3 corpus relabel — existing v1 tooluse capture promoted to F9 measurement"
+    schema_version: 2
 
   - file: codex-tooluse.raw
     backend: codex
@@ -200,6 +236,17 @@ fixtures:
     expected_transitions: [starting, idle, thinking]
     expected_final_state: thinking
     expected_final_detect: null
+    # #685 PR-3 (corpus expansion): final=thinking. `• Explored` appears
+    # in the raw byte stream but VTerm-rendered final screen no longer
+    # contains the marker (scrolled off into history; final viewport
+    # shows only `Token usage:` / `resume ...` summary lines per the
+    # original detect=null comment above). F9 silent_stuck case as
+    # evaluated by the rendered-screen path.
+    scenario_kind: silent_stuck
+    expected_hung_classification: hung
+    capture_kind: real
+    provenance: "f685 PR-3 corpus relabel — `• Explored` raw-byte marker is offscreen post-render"
+    schema_version: 2
 
   - file: gemini-tooluse.raw
     backend: gemini
@@ -221,6 +268,16 @@ fixtures:
     expected_transitions: [starting, ready, idle, thinking]
     expected_final_state: thinking
     expected_final_detect: null
+    # #685 PR-3 (corpus expansion): final=thinking, no gemini productive
+    # markers (`✓ ReadFile|WriteFile|...`) in rendered output. The
+    # `Tool Calls: 1 ✓ 1` summary line in scenario does NOT match the
+    # marker regex (`✓ <CamelCaseToolName>`). F9 silent_stuck case for
+    # the gemini backend in tool-use scope.
+    scenario_kind: silent_stuck
+    expected_hung_classification: hung
+    capture_kind: real
+    provenance: "f685 PR-3 corpus relabel — existing v1 tooluse capture promoted to F9 measurement"
+    schema_version: 2
 
   - file: kiro-tooluse.raw
     backend: kiro-cli
@@ -241,6 +298,16 @@ fixtures:
     expected_transitions: [starting, idle, thinking]
     expected_final_state: thinking
     expected_final_detect: ready
+    # #685 PR-3 (corpus expansion): final=thinking. `● Read` banner
+    # appears in the raw byte stream at ~40960 but is not in the
+    # final VTerm-rendered viewport — by the recording cut the trust-
+    # tools status line is the foreground (final_detect=ready). F9
+    # silent_stuck case as evaluated by the rendered-screen path.
+    scenario_kind: silent_stuck
+    expected_hung_classification: hung
+    capture_kind: real
+    provenance: "f685 PR-3 corpus relabel — `● Read` raw-byte marker is offscreen post-render"
+    schema_version: 2
 
   - file: opencode-tooluse.raw
     backend: opencode
@@ -260,6 +327,16 @@ fixtures:
     expected_transitions: [starting, idle, thinking]
     expected_final_state: thinking
     expected_final_detect: null
+    # #685 PR-3 (corpus expansion): final=thinking, no opencode
+    # productive markers (`→ Read|Write|...`) in rendered output —
+    # the `✱ Glob` in-flight marker at byte ~30720 isn't a Phase A1-
+    # eligible completion marker. F9 silent_stuck case for the
+    # opencode backend in tool-use scope.
+    scenario_kind: silent_stuck
+    expected_hung_classification: hung
+    capture_kind: real
+    provenance: "f685 PR-3 corpus relabel — existing v1 tooluse capture promoted to F9 measurement"
+    schema_version: 2
 
   # ---------------------------------------------------------------------
   # F685 sub-task 5 fixture corpus (decision d-20260514015214320625-1)
