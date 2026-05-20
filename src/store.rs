@@ -43,21 +43,73 @@ pub fn save<T: Serialize>(path: &Path, data: &T) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// #965 process-wide unique tmp suffix counter. Combined with `process::id`
+/// so cross-process concurrent atomic_write calls (CLI + daemon, or
+/// multiple agend-terminal CLIs) also receive distinct tmp paths.
+static ATOMIC_WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// #965 RAII guard that unlinks the temp file if [`atomic_write`] fails
+/// before the rename succeeds. Without this, every failed atomic_write
+/// (disk full, fsync error, permission denied between create and rename)
+/// would leak a unique-named tmp file in the destination directory.
+/// `disarm()` is called immediately before the rename: if the rename
+/// succeeds the tmp path no longer exists, so a Drop-side `remove_file`
+/// would be a no-op; if the rename fails we WANT the cleanup, which is
+/// exactly what staying armed achieves.
+struct TmpGuard<'a> {
+    path: &'a Path,
+    armed: bool,
+}
+
+impl<'a> TmpGuard<'a> {
+    fn new(path: &'a Path) -> Self {
+        Self { path, armed: true }
+    }
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TmpGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(self.path);
+        }
+    }
+}
+
 /// Write `bytes` to `path` via temp-file + fsync + rename so an observer
 /// never sees a half-written file and a power loss leaves either the old
 /// contents or the new — never truncated or partial.
+///
+/// #965: per-call unique tmp filename (`<path>.<pid>.<seq>.tmp`) eliminates
+/// the shared-tmp-inode race. Pre-#965 every caller wrote to the same
+/// `<path>.tmp`; concurrent invocations on the same destination raced on
+/// the shared inode (truncate-truncate-interleaved-writes-rename) and
+/// published corrupted bytes. With unique names each call owns its own
+/// tmp inode end-to-end; the final rename is the only contention point
+/// and POSIX `rename(2)` is atomic per destination directory entry.
+///
+/// Failure paths (Err between create and rename) are covered by a Drop
+/// guard that unlinks the orphan tmp file.
 ///
 /// Use this for any file whose readers expect a complete document on disk
 /// at all times (agent configs, decisions, snapshots, TOML configs).
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     use std::io::Write;
+    use std::sync::atomic::Ordering;
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension(match path.extension().and_then(|e| e.to_str()) {
-        Some(ext) => format!("{ext}.tmp"),
-        None => "tmp".to_string(),
-    });
+    let seq = ATOMIC_WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let tmp_suffix = match path.extension().and_then(|e| e.to_str()) {
+        Some(ext) => format!("{ext}.{pid}.{seq}.tmp"),
+        None => format!("{pid}.{seq}.tmp"),
+    };
+    let tmp = path.with_extension(tmp_suffix);
+    let mut guard = TmpGuard::new(&tmp);
     {
         let mut f = std::fs::OpenOptions::new()
             .create(true)
@@ -68,6 +120,7 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         f.sync_all()?;
     }
     std::fs::rename(&tmp, path)?;
+    guard.disarm();
     Ok(())
 }
 
@@ -279,14 +332,62 @@ mod tests {
         let path = dir.join("atomic.json");
         atomic_write(&path, b"{\"a\":1}").expect("write");
         assert!(path.exists());
-        // temp sibling must not linger
-        let tmp = path.with_extension("json.tmp");
+        // #965: post-success, NO *.tmp sibling may linger. Pre-#965 we
+        // only checked `<path>.tmp`; with unique tmp names this glob
+        // covers all per-call tmp paths.
+        let entries: Vec<_> = fs::read_dir(&dir)
+            .expect("read_dir")
+            .flatten()
+            .filter(|e| {
+                e.path()
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|n| n.contains(".tmp"))
+            })
+            .collect();
         assert!(
-            !tmp.exists(),
-            "temp must be renamed/removed, found: {}",
-            tmp.display()
+            entries.is_empty(),
+            "no *.tmp sibling may linger post-success, found: {entries:?}"
         );
         assert_eq!(fs::read(&path).expect("read"), b"{\"a\":1}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #965 T2 — Drop guard unlinks the tmp file when atomic_write fails
+    /// between tmp creation and rename. Simulated via a non-writable
+    /// destination directory (rename fails with EACCES on Unix) or a
+    /// destination path that's actually a directory (rename fails with
+    /// EISDIR). The latter is more portable.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_atomic_write_drop_guard_cleans_orphan_tmp_on_rename_failure() {
+        let dir = tmp_dir("atomic_drop_guard");
+        // Make `path` an existing DIRECTORY so rename(tmp, path) fails with
+        // EISDIR / EEXIST. The tmp file is created and written successfully
+        // first; the rename is what fails. Drop guard must clean up.
+        let path = dir.join("dest");
+        fs::create_dir_all(&path).unwrap();
+
+        let err = atomic_write(&path, b"hello").expect_err("rename onto a directory must fail");
+        // Don't assert error shape (OS-specific); just verify Err.
+        let _ = err;
+
+        // Sweep for orphan *.tmp siblings in the parent dir.
+        let entries: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.path()
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|n| n.contains(".tmp"))
+            })
+            .collect();
+        assert!(
+            entries.is_empty(),
+            "#965 Drop guard must unlink orphan tmp on rename failure, \
+             found: {entries:?}"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 

@@ -468,34 +468,87 @@ impl FleetConfig {
     /// Get all instance names.
     /// Sprint 46 P1: assign UUIDv4 IDs to instances that lack them.
     /// Writes back to fleet.yaml unless AGEND_FLEET_NO_AUTO_MIGRATE=1.
+    ///
+    /// #965 (B): the locked write path re-reads the on-disk doc under
+    /// `mutate_fleet_yaml`'s flock so concurrent peer mutations are
+    /// preserved. After the locked write, the assigned IDs are mirrored
+    /// back into `self.instances` so callers' in-memory FleetConfig
+    /// matches what's on disk (a separate `resolve_instance` thread
+    /// otherwise reads a different ID and self-send / identity checks
+    /// break).
     fn backfill_ids(&mut self, fleet_path: &std::path::Path) {
-        let mut changed = false;
         let template_names: std::collections::HashSet<String> = self
             .templates
             .as_ref()
             .map(|t| t.keys().cloned().collect())
             .unwrap_or_default();
 
-        for (name, inst) in &mut self.instances {
-            // Reserved-name warning: instance name collides with template name
+        // Reserved-name warnings (no write).
+        for name in self.instances.keys() {
             if template_names.contains(name) {
                 tracing::warn!(
                     name,
                     "instance name collides with template name — may cause routing ambiguity"
                 );
             }
-            // Backfill ID if absent
-            if inst.id.is_none() {
-                let id = crate::types::InstanceId::new();
-                inst.id = Some(id.full());
-                tracing::info!(name, id = %id.short(), "[fleet-migration] assigned instance ID");
-                changed = true;
-            }
         }
 
-        if changed && std::env::var("AGEND_FLEET_NO_AUTO_MIGRATE").as_deref() != Ok("1") {
-            if let Ok(content) = serde_yaml_ng::to_string(&*self) {
-                let _ = crate::store::atomic_write(fleet_path, content.as_bytes());
+        let needs_backfill = self.instances.values().any(|i| i.id.is_none());
+        if !needs_backfill || std::env::var("AGEND_FLEET_NO_AUTO_MIGRATE").as_deref() == Ok("1") {
+            return;
+        }
+
+        let home = match fleet_path.parent() {
+            Some(p) => p,
+            None => {
+                tracing::warn!("backfill_ids: fleet_path has no parent; skipping write");
+                return;
+            }
+        };
+
+        // Under the flock: re-read disk, assign missing IDs on the fresh
+        // view (preserves concurrent peer additions / deletions), write
+        // back. Capture the (name → id) assignments so we can mirror them
+        // into the in-memory self.
+        let mut assigned: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let assigned_ref = &mut assigned;
+        if let Err(e) = mutate_fleet_yaml(home, "", |doc| {
+            if let Some(instances) = doc.get_mut("instances").and_then(|v| v.as_mapping_mut()) {
+                for (name_value, inst_value) in instances.iter_mut() {
+                    let inst_map = match inst_value.as_mapping_mut() {
+                        Some(m) => m,
+                        None => continue,
+                    };
+                    let id_key = serde_yaml_ng::Value::String("id".to_string());
+                    let needs_id = inst_map.get(&id_key).map(|v| v.is_null()).unwrap_or(true);
+                    if needs_id {
+                        let id = crate::types::InstanceId::new();
+                        let name = name_value.as_str().unwrap_or("?").to_string();
+                        inst_map.insert(id_key, serde_yaml_ng::Value::String(id.full()));
+                        tracing::info!(
+                            name = %name,
+                            id = %id.short(),
+                            "[fleet-migration] assigned instance ID (under flock)"
+                        );
+                        assigned_ref.insert(name, id.full());
+                    }
+                }
+            }
+            Ok(())
+        }) {
+            tracing::warn!(error = %e, "backfill_ids: locked write failed");
+            return;
+        }
+
+        // Sync in-memory self.instances with the IDs we just persisted so
+        // a concurrent `resolve_instance` call returning a different
+        // FleetConfig instance still sees the same identity. Without
+        // this, the in-memory caller would carry a different (or absent)
+        // id than the one a sibling thread reads from disk.
+        for (name, id) in assigned {
+            if let Some(inst) = self.instances.get_mut(&name) {
+                inst.id = Some(id);
             }
         }
     }
@@ -1641,6 +1694,120 @@ instances:
             "#965: atomic_write produced content-mix over {iterations} iter \
              (tmp-filename collision corrupted bytes via interleaved writes \
              on the shared `.tmp` inode)"
+        );
+    }
+
+    /// #965 T4 — concurrent `mutate_fleet_yaml` (which holds the
+    /// fleet.yaml flock) and `FleetConfig::load` (which triggers
+    /// `backfill_ids`) must NOT silently overwrite each other. Pre-fix
+    /// (B) `backfill_ids` wrote via lock-less `atomic_write`; concurrent
+    /// peers were serialized only by the rename point — lost updates
+    /// were the typical outcome rather than corrupted bytes. Post-fix
+    /// (B) backfill goes through `mutate_fleet_yaml`'s flock so both
+    /// writers actually serialize.
+    ///
+    /// Test plants fleet.yaml with an instance lacking `id` (forces
+    /// backfill to fire on load). Two threads behind a Barrier:
+    ///   T1 — `add_instance_to_yaml("agent-from-mutate", ...)`
+    ///   T2 — `FleetConfig::load(...)` (triggers backfill_ids write)
+    ///
+    /// Post-state must contain BOTH mutations: backfill's id assignment
+    /// for `agent-baseline` AND the new `agent-from-mutate` entry.
+    /// Pre-fix one frequently overwrites the other (lost update).
+    /// Post-fix both serialize and both land.
+    ///
+    /// Race-class deterministic per §3.20 SOP 1: Barrier sync, no sleep.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn repro_965_t4_backfill_and_mutate_serialize_through_flock() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let dir = std::env::temp_dir().join(format!("agend-fleet-965-t4-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let fleet_path = dir.join("fleet.yaml");
+
+        let mut lost_updates = 0;
+        let iterations = 30;
+
+        for i in 0..iterations {
+            // Plant a fleet.yaml WHERE the existing instance lacks `id`
+            // so backfill_ids has work to do on load.
+            fs::write(
+                &fleet_path,
+                "instances:\n  agent-baseline:\n    backend: claude\n",
+            )
+            .unwrap();
+
+            let barrier = Arc::new(Barrier::new(2));
+
+            let b1 = Arc::clone(&barrier);
+            let d1 = dir.clone();
+            // fire-and-forget: per-iteration race driver, joined below.
+            let h1 = thread::spawn(move || {
+                b1.wait();
+                let entry = InstanceYamlEntry {
+                    backend: Some("claude".to_string()),
+                    working_directory: None,
+                    role: None,
+                    instructions: None,
+                    source_repo: None,
+                    repo: None,
+                    github_login: None,
+                    args: None,
+                    model: None,
+                    env: None,
+                    ready_pattern: None,
+                    command: None,
+                    worktree: None,
+                };
+                let _ = add_instance_to_yaml(&d1, "agent-from-mutate", &entry);
+            });
+
+            let b2 = Arc::clone(&barrier);
+            let p2 = fleet_path.clone();
+            // fire-and-forget: per-iteration race driver, joined below.
+            let h2 = thread::spawn(move || {
+                b2.wait();
+                // load() triggers backfill_ids which writes the
+                // id-assigned snapshot back via mutate_fleet_yaml
+                // (post-fix). Pre-fix it was a lock-less atomic_write.
+                let _ = FleetConfig::load(&p2);
+            });
+
+            h1.join().unwrap();
+            h2.join().unwrap();
+
+            // Final state must contain BOTH:
+            //   - agent-from-mutate (added by T1)
+            //   - agent-baseline with id assigned (assigned by T2's backfill)
+            // If either is missing, a lost-update happened.
+            let final_cfg = FleetConfig::load(&fleet_path).expect("final reload");
+            let has_mutate = final_cfg.instances.contains_key("agent-from-mutate");
+            let baseline_has_id = final_cfg
+                .instances
+                .get("agent-baseline")
+                .and_then(|i| i.id.as_ref())
+                .is_some();
+            if !has_mutate || !baseline_has_id {
+                lost_updates += 1;
+                if lost_updates <= 3 {
+                    eprintln!(
+                        "iter {i}: LOST UPDATE — has_mutate={has_mutate} \
+                         baseline_has_id={baseline_has_id}"
+                    );
+                }
+            }
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            lost_updates, 0,
+            "#965 (B): backfill_ids + mutate_fleet_yaml must serialize \
+             through the flock — found {lost_updates}/{iterations} \
+             iterations where one writer's mutation was lost"
         );
     }
 
