@@ -99,6 +99,33 @@ Feature/fix PRs must be test-first: failing test commit BEFORE impl commit.
 ### 3.12 Verdict Externalization (was §3.5.13)
 Fleet-internal verdict MUST mirror to GH PR comment (`gh pr comment`). Self-merge gate: dual VERIFIED + CI green (independently verified via `gh pr checks`) + verdict mirror posted — all three required before merge.
 
+#### 3.12.1 `gh pr merge --auto` adoption (Sprint 65, #973)
+
+The canonical self-merge invocation is `gh pr merge <N> --auto --squash --delete-branch` (requires `gh` CLI >= 2.31.0). `--auto` moves merge submission to GitHub's server-side queue, eliminating the "Base branch was modified" race observed in #971 close-loop (2026-05-20).
+
+**Prerequisites** (one-time per repo, enabled in #973):
+- `allow_auto_merge: true` at repo level (`gh api repos/<owner>/<repo> -X PATCH -F allow_auto_merge=true`)
+- Branch protection on `main` with `required_status_checks.strict=true` covering the full CI matrix (`Check (ubuntu-latest|macos-latest|windows-latest)`, `LOC overrun`, `audit`). Without `strict=true`, `--auto` invoked after all checks already reported merges IMMEDIATELY — silently skipping the §3.12 conjunction gate. With `strict=true`, GitHub re-checks against current main before merging.
+- Admin-permission note: enabling these settings requires repo admin rights. Delegated maintainers should request via operator.
+
+**Behavior**: `gh pr merge --auto` returns immediately (does NOT block on CI). Merge fires asynchronously when the protection-gate conjunction holds. Author MUST NOT poll manually; the `[pr-merged]` event (delivered by daemon PR-state aggregator, #972) is the close-loop confirmation source.
+
+**Escape-hatch — stalled `--auto`**: if no `[pr-merged]` arrives within 30 min of CI green + verdict mirror posted, possible causes:
+1. Required check never reports (CI infrastructure issue)
+2. Branch protection mis-configuration (status-check context name drift)
+3. Token / permission issue on the `--auto` arming agent
+
+Recovery, in order:
+- (a) Verify protection state: `gh api repos/<owner>/<repo>/branches/main/protection --jq '.required_status_checks'`
+- (b) Verify PR is mergeable: `gh pr view <N> --json mergeable,statusCheckRollup`
+- (c) Re-arm: `gh pr merge <N> --auto --squash --delete-branch` (idempotent — re-arming when already armed is a no-op)
+- (d) Last resort — manual fallback: `gh pr merge <N> --squash --delete-branch` (synchronous; may hit base-modified race; retry 3s later if it does)
+- Notify lead via `send(kind=update)` if escape-hatch invoked, with case (a)/(b)/(c)/(d) identifier.
+
+**Bundle dependency on #972**: `--auto` returns immediately, so the synchronous "PR merged at SHA" terminal feedback is gone. The daemon PR-state aggregator (#972) emits `[pr-merged]` events to the PR author's inbox after observing the GitHub-side merge. Until #972 lands, manual `gh pr view <N> --json state` polling is the only close-loop confirmation; once #972 lands, the polling is replaced by the event.
+
+**Activation order**: #973 lands first (this PR; enables `--auto` infrastructure + docs). Lead dispatch templates and `active_poll_post_dispatch.md` memory continue to reference the legacy synchronous form until #972 lands. After #972 ships, a follow-up commit/PR switches defaults to `--auto`.
+
 ### 3.13 Log-level Changes (was §3.5.14)
 Must have inline rationale, otherwise `LEVEL-CHANGE-RATIONALE-ABSENT — UNVERIFIED`.
 
