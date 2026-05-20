@@ -457,6 +457,112 @@ pub fn remove(home: &Path, repo: &str, branch: &str) -> std::io::Result<()> {
     }
 }
 
+/// Read the `AGEND_PR_STATE_REPLAY_AGE_HOURS` env var (default 1) and
+/// return as a `Duration`. Tunable upper bound for "stale terminal
+/// state" classification at daemon boot — see
+/// [`suppress_stale_terminal_replay`].
+fn replay_age_threshold() -> std::time::Duration {
+    const DEFAULT_HOURS: u64 = 1;
+    let hours = std::env::var("AGEND_PR_STATE_REPLAY_AGE_HOURS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_HOURS);
+    std::time::Duration::from_secs(hours.saturating_mul(3600))
+}
+
+/// #1017: at daemon boot, mark terminal-state pr-state files whose
+/// mtime is older than `AGEND_PR_STATE_REPLAY_AGE_HOURS` (default 1h)
+/// as already-emitted. Without this, a fresh daemon process replays
+/// the [pr-merged] / [pr-closed-unmerged] events for every stale
+/// Merged / ClosedUnmerged file on the first `scan_and_emit_with`
+/// tick — operator gets a flood of "PR merged" inbox events for
+/// merges that happened many hours / days ago.
+///
+/// Mechanism: load each file. If `merge_state in {Merged,
+/// ClosedUnmerged}` AND file mtime is older than the threshold,
+/// set `ready_emitted_for_sha = Some(head_sha)` and save. The
+/// terminal-state branch of [`scan_and_emit_with`] checks this
+/// gate and skips the event emit while still removing the file.
+///
+/// Idempotent: re-running over a tree where the gate is already set
+/// is a no-op. Fresh merges (mtime within the threshold) are left
+/// untouched so the legitimate post-restart event still fires.
+pub fn suppress_stale_terminal_replay(home: &Path) {
+    suppress_stale_terminal_replay_with(home, replay_age_threshold());
+}
+
+/// Inner implementation of [`suppress_stale_terminal_replay`] that
+/// takes an explicit threshold. Used by tests to bypass the env-var
+/// reader + run deterministically without needing a `filetime` /
+/// `utimensat` mtime-mutator dev-dependency. Production callers use
+/// the public wrapper above.
+pub fn suppress_stale_terminal_replay_with(home: &Path, threshold: std::time::Duration) {
+    let dir = pr_state_dir(home);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            tracing::warn!(
+                dir = %dir.display(),
+                error = %e,
+                "#1017 pr_state: suppress_stale_terminal_replay read_dir failed — skipping"
+            );
+            return;
+        }
+    };
+    let mut suppressed = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else { continue };
+        let Ok(mtime) = meta.modified() else { continue };
+        let Ok(age) = mtime.elapsed() else { continue };
+        if age < threshold {
+            continue; // fresh — let scan_and_emit fire the event
+        }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(mut state) = serde_json::from_str::<PrState>(&content) else {
+            continue;
+        };
+        if !matches!(
+            state.merge_state,
+            MergeState::Merged { .. } | MergeState::ClosedUnmerged { .. }
+        ) {
+            continue;
+        }
+        // Already-suppressed (idempotent re-runs land here).
+        if state.ready_emitted_for_sha.as_deref() == Some(state.head_sha.as_str()) {
+            continue;
+        }
+        state.ready_emitted_for_sha = Some(state.head_sha.clone());
+        if let Err(e) = save(home, &state) {
+            tracing::warn!(
+                repo = %state.repo,
+                branch = %state.branch,
+                error = %e,
+                "#1017 pr_state: suppress_stale save failed"
+            );
+            continue;
+        }
+        suppressed += 1;
+        tracing::debug!(
+            repo = %state.repo,
+            branch = %state.branch,
+            head = %state.head_sha,
+            age_hours = age.as_secs() / 3600,
+            "#1017 pr_state: stale terminal replay suppressed"
+        );
+    }
+    if suppressed > 0 {
+        tracing::info!(
+            count = suppressed,
+            threshold_hours = threshold.as_secs() / 3600,
+            "#1017 pr_state: suppressed stale terminal replays at boot"
+        );
+    }
+}
+
 // ─── ingestion + emission ──────────────────────────────────────────────
 
 /// Build a fresh PrState for a newly-observed (repo, branch) pair.
@@ -800,38 +906,66 @@ pub fn scan_and_emit_with(
         }
 
         // Terminal-state sweep.
+        //
+        // #1017: each terminal-state branch first checks the
+        // `ready_emitted_for_sha` debounce gate. The startup hook
+        // `suppress_stale_terminal_replay` sets this to `Some(head_sha)`
+        // for files older than the replay-age threshold so they are
+        // swept (file removed) without firing a stale event. Fresh
+        // terminal-state files have `ready_emitted_for_sha == None`
+        // and fire normally.
+        let already_emitted =
+            state.ready_emitted_for_sha.as_deref() == Some(state.head_sha.as_str());
         match &state.merge_state {
             MergeState::Merged {
                 merge_commit,
                 merged_at,
             } => {
-                let author = resolve_author(&state);
-                let body = format!(
-                    "[pr-merged] {}@{} (merge_commit {}, merged_at {})",
-                    state.repo,
-                    state.branch,
-                    &merge_commit[..8.min(merge_commit.len())],
-                    merged_at,
-                );
-                let _ = crate::inbox::enqueue_with_idle_hint(
-                    home,
-                    &author,
-                    build_event_message("pr-merged", &author, &state, body),
-                );
+                if !already_emitted {
+                    let author = resolve_author(&state);
+                    let body = format!(
+                        "[pr-merged] {}@{} (merge_commit {}, merged_at {})",
+                        state.repo,
+                        state.branch,
+                        &merge_commit[..8.min(merge_commit.len())],
+                        merged_at,
+                    );
+                    let _ = crate::inbox::enqueue_with_idle_hint(
+                        home,
+                        &author,
+                        build_event_message("pr-merged", &author, &state, body),
+                    );
+                } else {
+                    tracing::debug!(
+                        repo = %state.repo,
+                        branch = %state.branch,
+                        head = %state.head_sha,
+                        "#1017 pr_state: stale Merged replay suppressed at scan"
+                    );
+                }
                 let _ = remove(home, &state.repo, &state.branch);
                 continue;
             }
             MergeState::ClosedUnmerged { closed_at } => {
-                let author = resolve_author(&state);
-                let body = format!(
-                    "[pr-closed-unmerged] {}@{} (closed_at {})",
-                    state.repo, state.branch, closed_at
-                );
-                let _ = crate::inbox::enqueue_with_idle_hint(
-                    home,
-                    &author,
-                    build_event_message("pr-closed-unmerged", &author, &state, body),
-                );
+                if !already_emitted {
+                    let author = resolve_author(&state);
+                    let body = format!(
+                        "[pr-closed-unmerged] {}@{} (closed_at {})",
+                        state.repo, state.branch, closed_at
+                    );
+                    let _ = crate::inbox::enqueue_with_idle_hint(
+                        home,
+                        &author,
+                        build_event_message("pr-closed-unmerged", &author, &state, body),
+                    );
+                } else {
+                    tracing::debug!(
+                        repo = %state.repo,
+                        branch = %state.branch,
+                        head = %state.head_sha,
+                        "#1017 pr_state: stale ClosedUnmerged replay suppressed at scan"
+                    );
+                }
                 let _ = remove(home, &state.repo, &state.branch);
                 continue;
             }
@@ -2163,5 +2297,130 @@ mod tests {
         );
         assert!(logs_contain("gate A"), "trace must identify gate A by name");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // ─── #1017 startup-replay suppression ─────────────────────────────
+
+    /// #1017 T17: stale Merged terminal-state files (mtime older than
+    /// `AGEND_PR_STATE_REPLAY_AGE_HOURS`, default 1h) MUST be marked
+    /// as already-emitted by `suppress_stale_terminal_replay` at boot.
+    /// The next `scan_and_emit_with` tick then sweeps (removes) the
+    /// file without firing the [pr-merged] event — closing the
+    /// daemon-restart noise flood the operator hit on 2026-05-20.
+    #[test]
+    fn t17_1017_stale_merged_suppressed_then_swept_without_emit() {
+        let mut s = new_state("sha-A", ReviewClass::Single);
+        s.merge_state = MergeState::Merged {
+            merge_commit: "merge-sha-A".to_string(),
+            merged_at: "2026-05-20T04:00:00Z".to_string(),
+        };
+        let home = home_with_state("1017-stale-merged", s);
+
+        // Threshold ZERO simulates "any age counts as stale". Tests
+        // would otherwise need an mtime-mutator dev-dep (filetime crate)
+        // to age the file; using the test seam avoids that.
+        suppress_stale_terminal_replay_with(&home, std::time::Duration::ZERO);
+
+        // Verify the file body now has ready_emitted_for_sha == head.
+        let after_suppress = load(&home, "owner/repo", "feat/test")
+            .expect("file persists after suppress (only flag mutated)");
+        assert_eq!(
+            after_suppress.ready_emitted_for_sha.as_deref(),
+            Some("sha-A"),
+            "stale Merged must have ready_emitted_for_sha set by suppress hook"
+        );
+
+        // First scan after boot: file should be swept (removed) but
+        // NO [pr-merged] event emitted to the inbox.
+        let poller = MockGhPoller::new(vec![Ok(vec![])]);
+        scan_and_emit_with(&home, &empty_registry(), &poller);
+        assert!(
+            load(&home, "owner/repo", "feat/test").is_none(),
+            "stale Merged file MUST be swept post-scan"
+        );
+        let msgs = crate::inbox::drain(&home, "dev");
+        assert!(
+            msgs.iter().all(|m| m.kind.as_deref() != Some("pr-merged")),
+            "stale Merged MUST NOT emit [pr-merged] — got: {:?}",
+            msgs.iter().map(|m| &m.text).collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// #1017 T18: a FRESH Merged terminal-state file (mtime within
+    /// the replay-age threshold) is NOT touched by the suppress hook,
+    /// and the next `scan_and_emit_with` tick fires the [pr-merged]
+    /// event normally. Anti-regression: makes sure the suppression
+    /// doesn't over-rotate into masking legitimate post-restart
+    /// merges.
+    #[test]
+    fn t18_1017_fresh_merged_still_emits_normally() {
+        let mut s = new_state("sha-B", ReviewClass::Single);
+        s.merge_state = MergeState::Merged {
+            merge_commit: "merge-sha-B".to_string(),
+            merged_at: "2026-05-20T22:00:00Z".to_string(),
+        };
+        let home = home_with_state("1017-fresh-merged", s);
+
+        // Threshold u32::MAX simulates "nothing is stale" — pin that
+        // the suppress hook leaves fresh terminal files untouched.
+        suppress_stale_terminal_replay_with(&home, std::time::Duration::from_secs(u32::MAX as u64));
+        let after_suppress =
+            load(&home, "owner/repo", "feat/test").expect("file persists after suppress");
+        assert_eq!(
+            after_suppress.ready_emitted_for_sha, None,
+            "fresh Merged MUST NOT have ready_emitted_for_sha set by suppress hook"
+        );
+
+        // First scan emits normally.
+        let poller = MockGhPoller::new(vec![Ok(vec![])]);
+        scan_and_emit_with(&home, &empty_registry(), &poller);
+        assert!(
+            load(&home, "owner/repo", "feat/test").is_none(),
+            "fresh Merged file swept post-scan"
+        );
+        let msgs = crate::inbox::drain(&home, "dev");
+        assert_eq!(msgs.len(), 1, "fresh Merged MUST emit [pr-merged]");
+        assert_eq!(msgs[0].kind.as_deref(), Some("pr-merged"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// #1017 T19: ClosedUnmerged stale terminal state follows the
+    /// same suppression contract as Merged. Symmetry pin.
+    #[test]
+    fn t19_1017_stale_closed_unmerged_suppressed_without_emit() {
+        let mut s = new_state("sha-C", ReviewClass::Single);
+        s.merge_state = MergeState::ClosedUnmerged {
+            closed_at: "2026-05-20T05:00:00Z".to_string(),
+        };
+        let home = home_with_state("1017-stale-closed", s);
+
+        // Threshold ZERO = anything counts as stale (see T17 rationale).
+        suppress_stale_terminal_replay_with(&home, std::time::Duration::ZERO);
+        let poller = MockGhPoller::new(vec![Ok(vec![])]);
+        scan_and_emit_with(&home, &empty_registry(), &poller);
+        let msgs = crate::inbox::drain(&home, "dev");
+        assert!(
+            msgs.iter()
+                .all(|m| m.kind.as_deref() != Some("pr-closed-unmerged")),
+            "stale ClosedUnmerged MUST NOT emit [pr-closed-unmerged]"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// #1017 T20: `AGEND_PR_STATE_REPLAY_AGE_HOURS` env var overrides
+    /// the default 1h threshold. Operator-tunable.
+    #[test]
+    #[serial_test::serial]
+    fn t20_1017_replay_age_threshold_env_override() {
+        // SAFETY: set + remove around test; serial_test ensures no race.
+        unsafe { std::env::set_var("AGEND_PR_STATE_REPLAY_AGE_HOURS", "24") };
+        let got = replay_age_threshold();
+        assert_eq!(got, std::time::Duration::from_secs(24 * 3600));
+        unsafe { std::env::remove_var("AGEND_PR_STATE_REPLAY_AGE_HOURS") };
+
+        // Default fallback when unset.
+        let default = replay_age_threshold();
+        assert_eq!(default, std::time::Duration::from_secs(3600));
     }
 }
