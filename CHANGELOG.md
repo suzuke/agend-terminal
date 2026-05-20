@@ -22,6 +22,10 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 - **`bootstrap-step` instrumentation (#945 Phase 0)** — every step in `bootstrap::prepare` emits a `bootstrap-step` tracing line with `step=<name>` + `elapsed_ms=<n>`. Operators can extract the cold-boot timing breakdown via `grep "bootstrap-step" $AGEND_HOME/daemon.log | sort -t= -k3 -n -r`.
 - **State detection red SGR anchor for HIGH_FP patterns (#919 Phase A)** — patterns marked `HIGH_FP` (generic strings like `"Error"`, `"failed"`) now require a red SGR escape (`\x1b[31m` family) within 200 bytes / 30 s of the match. Closes the class of false transitions where a backend echoed an error string from a user prompt without color and the daemon misclassified the agent. `Backend::has_red_anchor()` opts in per-backend; the gate fails open when the backend doesn't emit consistent color signaling.
 
+### Added (#686 — maintainer-only)
+
+- **CI code coverage (cargo-llvm-cov + Codecov)** — `.github/workflows/ci.yml` adds a new `coverage` job that runs `cargo llvm-cov --workspace --tests --features tray` on Ubuntu and uploads an lcov report to Codecov. `fail_ci_if_error: false` keeps PRs mergeable when codecov.io is unreachable or unconfigured. `codecov.yml` configures a 2% project threshold + 80% patch target. **Zero end-user impact** — coverage is maintainer-side QA infrastructure; `cargo install agend-terminal` and operating the fleet do not touch codecov. Operator-side setup: link the GitHub repo to Codecov.io to surface the report (no token required for public repos; optional `CODECOV_TOKEN` secret tightens rate limits).
+
 ### Changed
 
 - **`agend-terminal list --json` envelope (#938)** — JSON output now wraps the agent array in a discriminated envelope: `{mode: "live" | "fallback_daemon_stuck" | "fallback_daemon_absent", agents: [...]}`. Operator scripts can distinguish authoritative output from offline fallbacks. Plain (non-JSON) output adds a one-line stderr hint when `mode != live`. `--legacy-json` opts back into the pre-#938 shape for one release cycle.

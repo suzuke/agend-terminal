@@ -1,0 +1,32 @@
+# #686 (F11): Codecov config — maintainer-side QA infrastructure only.
+#
+# Operator note: coverage report visibility requires the GitHub repo to be
+# linked to Codecov.io. Token (optional but stricter rate limits) goes in
+# the `CODECOV_TOKEN` GitHub secret. When unlinked / unconfigured, the CI
+# job still runs `cargo llvm-cov` and produces `coverage.lcov`; only the
+# upload step soft-fails (`fail_ci_if_error: false`).
+
+coverage:
+  # Use Codecov's adaptive thresholds rather than a hand-picked absolute %.
+  # Auto uses the previous build's coverage as the baseline.
+  status:
+    project:
+      default:
+        target: auto
+        # Allow up to a 2% drop without failing the project-level check.
+        # Larger drops surface as a red PR status — operator can decide
+        # whether to accept the regression or block the merge.
+        threshold: 2%
+    patch:
+      default:
+        # New code introduced in a PR should hit 80% coverage. Pure-config
+        # or pure-data PRs (.yml / .md changes) are exempt because llvm-cov
+        # produces no records for them — Codecov treats absence as PASS.
+        target: 80%
+
+# Suppress the auto-comment on PRs that touch only CI / docs — those have
+# no code coverage to report and the comment becomes noise.
+comment:
+  layout: "reach,diff,flags,files,footer"
+  behavior: default
+  require_changes: true

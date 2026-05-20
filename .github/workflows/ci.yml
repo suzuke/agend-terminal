@@ -209,3 +209,43 @@ jobs:
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  # #686 (F11): maintainer-side QA infrastructure. Runs cargo-llvm-cov on
+  # Ubuntu only (cross-platform consistency comes from `check` job; coverage
+  # of *what code is exercised* is platform-independent), uploads lcov report
+  # to Codecov. `fail_ci_if_error: false` keeps PR mergeable when codecov.io
+  # is unreachable or unconfigured — coverage is observation infra, not a
+  # blocking gate. Linux tray deps installed for parity with `check` job so
+  # the same `--features tray` compilation surface is measured.
+  #
+  # End-user impact: ZERO — coverage is maintainer-side QA. `cargo install
+  # agend-terminal` and running the fleet do not touch codecov.
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+      - name: Install Linux tray deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Run coverage
+        timeout-minutes: 35
+        env:
+          AGEND_LOCK_AUDIT: "1"
+        run: cargo llvm-cov --workspace --tests --features tray --lcov --output-path coverage.lcov
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.lcov
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}

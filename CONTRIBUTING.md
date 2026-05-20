@@ -18,6 +18,18 @@ cargo clippy -- -D warnings          # must be warning-free
 
 CI mirrors these steps on Ubuntu + macOS + Windows (`.github/workflows/ci.yml`).
 
+### Coverage (optional, local)
+
+The `coverage` CI job (#686) runs `cargo-llvm-cov` on Ubuntu and uploads an lcov report to Codecov. To measure locally:
+
+```bash
+cargo install cargo-llvm-cov                  # one-time
+cargo llvm-cov --workspace --tests            # text summary
+cargo llvm-cov --workspace --tests --html     # HTML report at target/llvm-cov/html/index.html
+```
+
+Coverage is observation-only — not a merge gate. PRs that drop project coverage by more than 2% surface as a red Codecov status; the merge decision stays with the reviewer. New code in a PR is expected to hit 80% coverage (configurable in `codecov.yml`).
+
 ## Workflow
 
 1. **Branch from `main`** — never modify `main` directly. Worktrees are preferred over in-place branch switching:
