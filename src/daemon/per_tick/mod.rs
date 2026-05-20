@@ -138,3 +138,151 @@ pub(crate) fn snapshot_handler_timings() -> HashMap<String, HandlerStats> {
         .map(|(k, v)| ((*k).to_string(), v.clone()))
         .collect()
 }
+
+/// #1002 Phase 1 — per-handler panic isolation for the main-loop
+/// dispatch.
+///
+/// Drives the per-tick handler iteration in two steps:
+/// 1. `std::panic::catch_unwind` wraps each `handler.run(...)` call so
+///    a panic in handler N does not abort the iteration before
+///    handlers N+1..end run on this tick.
+/// 2. On a caught panic, log handler identity + panic payload (best-
+///    effort `Debug`-formatting of `Box<dyn Any>`) so future
+///    `grep "panic"` over `app.log` surfaces the silent failure that
+///    #1002 was filed against.
+///
+/// The handler trait object itself is `Send + Sync`, but `tick_ctx`
+/// holds borrowed references — `AssertUnwindSafe` is required.
+/// Borrows are not invalidated by unwinding because the catch boundary
+/// is per-handler (no shared mutable state crosses the boundary).
+///
+/// Test seam: `handlers` accepts any `&[Box<dyn PerTickHandler>]`, so
+/// the unit test (`per_tick::tests::panicking_handler_does_not_skip_siblings`)
+/// constructs a fixture vec with a panicking handler in the middle and
+/// asserts the trailing handler runs.
+pub(crate) fn run_handlers_with_panic_guard(
+    handlers: &[Box<dyn PerTickHandler>],
+    ctx: &TickContext<'_>,
+) {
+    for handler in handlers {
+        let start = std::time::Instant::now();
+        let name = handler.name();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handler.run(ctx);
+        }));
+        record_handler_timing(name, start.elapsed());
+        if let Err(payload) = outcome {
+            // Best-effort payload Debug; tracing crate stringifies via Debug.
+            let payload_str = panic_payload_str(&payload);
+            tracing::error!(
+                handler = name,
+                payload = %payload_str,
+                "#1002 per_tick handler panicked — subsequent handlers \
+                 in this tick continue; next tick re-invokes this handler"
+            );
+        }
+    }
+}
+
+/// Reduce a panic payload (`Box<dyn Any + Send>`) to a printable
+/// string. Mirrors `std::panic::panic_any` conventions: `String` and
+/// `&'static str` are the only payloads `panic!()` produces by
+/// default; other payloads fall through to a placeholder.
+fn panic_payload_str(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use parking_lot::Mutex as PLMutex;
+    use std::sync::Arc;
+
+    /// Mock handler with arbitrary `run` behaviour: either records a
+    /// hit on a shared counter or panics with a fixed message.
+    struct MockHandler {
+        name_: &'static str,
+        on_run: Box<dyn Fn(&TickContext<'_>) + Send + Sync>,
+    }
+
+    impl PerTickHandler for MockHandler {
+        fn name(&self) -> &'static str {
+            self.name_
+        }
+        fn run(&self, ctx: &TickContext<'_>) {
+            (self.on_run)(ctx);
+        }
+    }
+
+    #[test]
+    fn panicking_handler_does_not_skip_siblings() {
+        // #1002 Phase 1 RED→GREEN pin: a panic in handler N MUST NOT
+        // abort handler N+1's invocation on this tick. Pre-fix, the
+        // panic propagated up the for-loop and silently killed the
+        // entire tick (the daemon's `run_core` had no `catch_unwind`
+        // around `handler.run(&tick_ctx)`).
+        let home = std::env::temp_dir().join(format!("agend-pertick-test-{}", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        let registry: AgentRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let externals: ExternalRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let configs: Arc<PLMutex<HashMap<String, crate::daemon::AgentConfig>>> =
+            Arc::new(PLMutex::new(HashMap::new()));
+        let ctx = TickContext {
+            home: &home,
+            registry: &registry,
+            externals: &externals,
+            configs: &configs,
+        };
+
+        let before_count = Arc::new(PLMutex::new(0u32));
+        let after_count = Arc::new(PLMutex::new(0u32));
+        let before_clone = before_count.clone();
+        let after_clone = after_count.clone();
+
+        let handlers: Vec<Box<dyn PerTickHandler>> = vec![
+            Box::new(MockHandler {
+                name_: "before",
+                on_run: Box::new(move |_| *before_clone.lock() += 1),
+            }),
+            Box::new(MockHandler {
+                name_: "panicker",
+                on_run: Box::new(|_| panic!("#1002 test panic")),
+            }),
+            Box::new(MockHandler {
+                name_: "after",
+                on_run: Box::new(move |_| *after_clone.lock() += 1),
+            }),
+        ];
+
+        run_handlers_with_panic_guard(&handlers, &ctx);
+
+        assert_eq!(*before_count.lock(), 1, "pre-panic handler ran");
+        assert_eq!(
+            *after_count.lock(),
+            1,
+            "post-panic handler MUST still run — catch_unwind isolates the panic"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn panic_payload_str_handles_common_panic_types() {
+        let string_payload: Box<dyn std::any::Any + Send> = Box::new(String::from("string panic"));
+        let static_payload: Box<dyn std::any::Any + Send> = Box::new("static str panic");
+        let other_payload: Box<dyn std::any::Any + Send> = Box::new(42u32);
+
+        assert_eq!(panic_payload_str(&string_payload), "string panic");
+        assert_eq!(panic_payload_str(&static_payload), "static str panic");
+        assert_eq!(
+            panic_payload_str(&other_payload),
+            "<non-string panic payload>"
+        );
+    }
+}
