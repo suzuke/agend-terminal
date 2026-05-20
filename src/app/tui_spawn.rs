@@ -32,7 +32,6 @@ use std::path::Path;
 /// Err) do NOT block instance creation — the instance is still
 /// operator-functional locally. The `Failed` outcome carries the error
 /// string so callers `tracing::warn!` and surface to operator.
-#[allow(dead_code)] // #966 C1 of 2: helper consumed by C2 wiring in Backend menu + palette
 pub(crate) fn add_instance_with_topic(
     home: &Path,
     name: &str,

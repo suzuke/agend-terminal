@@ -816,7 +816,12 @@ fn pane_from_menu_item(
         MenuItemKind::Backend(backend) => {
             let preset = backend.preset();
             let inst_name = pane_factory::unique_fleet_name(home, preset.command);
-            if let Err(e) = crate::fleet::add_instance_to_yaml(
+            // #966: TUI Backend menu (ctrl+b c) previously called
+            // `add_instance_to_yaml` directly, bypassing the topic-creation
+            // side effect that `handle_spawn` does. Now routes through
+            // `tui_spawn::add_instance_with_topic` so the channel topic is
+            // created + topic_id persisted to fleet.yaml at TUI-spawn time.
+            if let Err(e) = tui_spawn::add_instance_with_topic(
                 home,
                 &inst_name,
                 &crate::fleet::InstanceYamlEntry {

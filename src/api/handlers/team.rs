@@ -155,11 +155,24 @@ pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
         ) {
             Ok(_) => {
                 tracing::info!(team = team_name, member = %inst_name, backend = %backend, "CREATE_TEAM spawn ok");
-                // Every successful spawn gets a channel topic so
-                // deploy_template doesn't have to know about topics.
-                // No-op when no channel is configured.
-                if let Some(ch) = crate::channel::active_channel() {
-                    let _ = ch.create_topic(inst_name);
+                // #966: Every successful spawn gets a channel topic via
+                // the hub `ensure_topic_for`. NoChannel is the happy path
+                // when no channel is configured; Failed is surfaced via
+                // warn (Pushback B: prior `let _ = ch.create_topic()`
+                // swallowed errors, same antipattern as pre-#962 silent
+                // persist).
+                match crate::channel::ensure_topic_for(inst_name) {
+                    crate::channel::TopicOutcome::Created(_)
+                    | crate::channel::TopicOutcome::NoChannel => {}
+                    crate::channel::TopicOutcome::Failed(err) => {
+                        tracing::warn!(
+                            team = team_name,
+                            member = %inst_name,
+                            error = %err,
+                            "CREATE_TEAM: channel exists but create_topic failed; \
+                             member spawn proceeds without topic"
+                        );
+                    }
                 }
                 spawned.push((inst_name.clone(), backend.clone()));
             }
