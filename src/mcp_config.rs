@@ -254,6 +254,50 @@ fn configure_gemini(working_dir: &Path, instance_name: Option<&str>) -> Result<(
     Ok(())
 }
 
+/// AGY (Google Antigravity CLI): `<workdir>/.antigravitycli/mcp_config.json` —
+/// uses standard `{ "mcpServers": { ... } }` schema. #987.
+///
+/// Operator-verified 2026-05-20 against agy 1.0.0: AGY accepts the standard
+/// stdio MCP schema; full handshake (initialize → notifications/initialized
+/// → tools/list → tools/call) completes. MCP protocol version compatibility
+/// confirmed (AGY 2025-11-25 accepts bridge's 2024-11-05 per MCP spec).
+///
+/// **Does NOT include `"trust": true`** — that's a Gemini-specific extension
+/// at `.gemini/settings.json`. AGY's project-local schema has no equivalent
+/// field; `--dangerously-skip-permissions` (set as a CLI flag in the preset
+/// at `src/backend.rs`) bypasses per-tool prompts including MCP server calls.
+fn configure_agy(working_dir: &Path, instance_name: Option<&str>) -> Result<()> {
+    let path = working_dir.join(".antigravitycli").join("mcp_config.json");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _lock = crate::store::acquire_file_lock(&config_lock_path(&path))?;
+
+    let mut config: serde_json::Value = if path.exists() {
+        let content = std::fs::read_to_string(&path)?;
+        serde_json::from_str(&content).unwrap_or(json!({}))
+    } else {
+        json!({})
+    };
+    if config.get("mcpServers").is_none() {
+        config["mcpServers"] = json!({});
+    }
+    let mut env = json!({ "AGEND_HOME": home_path() });
+    if let Some(name) = instance_name {
+        env["AGEND_INSTANCE_NAME"] = json!(name);
+    }
+    let (cmd, args) = bridge_binary_path();
+    config["mcpServers"]["agend-terminal"] = json!({
+        "command": cmd,
+        "args": args,
+        "env": env
+    });
+    let body = serde_json::to_string_pretty(&config)?;
+    crate::store::atomic_write(&path, body.as_bytes())?;
+    tracing::debug!(path = %path.display(), "configured AGY MCP");
+    Ok(())
+}
+
 /// OpenCode: opencode.json — uses { "mcp": { ... } } with command as array.
 ///
 /// Also sets the `permission` block to "allow" for the actions an autonomous
@@ -471,6 +515,7 @@ pub fn configure(working_dir: &Path, command: &str, instance_name: Option<&str>)
         Some(crate::backend::Backend::ClaudeCode) => configure_claude(working_dir, instance_name),
         Some(crate::backend::Backend::KiroCli) => configure_kiro(working_dir, instance_name),
         Some(crate::backend::Backend::Gemini) => configure_gemini(working_dir, instance_name),
+        Some(crate::backend::Backend::Agy) => configure_agy(working_dir, instance_name),
         Some(crate::backend::Backend::OpenCode) => configure_opencode(working_dir, instance_name),
         Some(crate::backend::Backend::Codex) => configure_codex(working_dir, instance_name),
         // Non-preset backends (Shell, Raw) have no MCP wiring.
@@ -806,6 +851,29 @@ mod tests {
         let dir = tmp_dir("dispatch_gem");
         configure(&dir, "gemini", None);
         assert!(dir.join(".gemini/settings.json").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #987: configure dispatches Backend::Agy to write the standard
+    /// `mcpServers` config under `.antigravitycli/mcp_config.json` (NOT
+    /// the Gemini-style `.gemini/settings.json`). Operator-verified
+    /// path 2026-05-20.
+    #[test]
+    fn configure_dispatches_agy() {
+        let dir = tmp_dir("dispatch_agy");
+        configure(&dir, "agy", None);
+        assert!(dir.join(".antigravitycli/mcp_config.json").exists());
+        // Sanity: must NOT have written Gemini's path under .gemini/.
+        assert!(!dir.join(".gemini").exists());
+        // Verify standard schema (no Gemini-only "trust" extension).
+        let content = std::fs::read_to_string(dir.join(".antigravitycli/mcp_config.json")).unwrap();
+        let cfg: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let entry = &cfg["mcpServers"]["agend-terminal"];
+        assert!(entry.is_object(), "agend-terminal entry must exist");
+        assert!(
+            entry.get("trust").is_none(),
+            "AGY config must NOT carry Gemini-only `trust: true` extension"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

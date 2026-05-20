@@ -20,6 +20,8 @@ fn fixtures_are_real_pty_captures_with_ansi() {
         "codex-thinking.raw",
         "gemini-thinking.raw",
         "opencode-thinking.raw",
+        // #987: agy is gemini-cli's official successor (Google Antigravity CLI).
+        "agy-thinking.raw",
     ];
     for file in &fixtures {
         let data = std::fs::read(dir.join(file)).expect("read fixture");
@@ -32,12 +34,20 @@ fn fixtures_are_real_pty_captures_with_ansi() {
     }
 }
 
-/// M2: Verify MANIFEST covers all 5 backends.
+/// M2: Verify MANIFEST covers all 6 backends.
 #[test]
 fn manifest_covers_all_backends() {
     let manifest = std::fs::read_to_string("tests/fixtures/state-replay/MANIFEST.yaml")
         .expect("read MANIFEST");
-    for backend in &["claude-code", "kiro-cli", "codex", "gemini", "opencode"] {
+    // #987: bumped from 5 → 6 with agy (Backend::Agy in src/backend.rs).
+    for backend in &[
+        "claude-code",
+        "kiro-cli",
+        "codex",
+        "gemini",
+        "opencode",
+        "agy",
+    ] {
         assert!(
             manifest.contains(backend),
             "MANIFEST must reference {backend}"

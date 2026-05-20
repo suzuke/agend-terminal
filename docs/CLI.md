@@ -123,7 +123,7 @@ Register an *already-running* local agent with the daemon (inbox-only — no PTY
 ```
 agend-terminal connect <name> --backend <backend> [--working-dir <dir>] [-- <extra-args>...]
 ```
-- `--backend` — `claude`, `kiro-cli`, `codex`, `opencode`, `gemini`.
+- `--backend` — `claude`, `kiro-cli`, `codex`, `opencode`, `gemini`, `agy` (Google Antigravity CLI — gemini-cli's official successor; #987).
 - `--working-dir` — defaults to current directory.
 - Extra args after `--` are passed to the backend.
 

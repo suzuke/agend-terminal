@@ -1318,8 +1318,9 @@ mod tests {
     #[test]
     fn detect_backends_does_not_panic() {
         let backends = detect_backends();
-        // Should return 0 or more backends without panicking
-        assert!(backends.len() <= 5);
+        // Should return 0 or more backends without panicking.
+        // #987: bumped from 5 → 6 with Backend::Agy addition.
+        assert!(backends.len() <= 6);
     }
 
     /// Snapshot test: emitted YAML with Telegram channel includes

@@ -599,6 +599,12 @@ impl StatePatterns {
                 // [measured] Full ready prompt + YOLO mode
                 (AgentState::Ready, r"Type your message|YOLO"),
             ],
+            // #987: agy shares gemini-cli's agent engine + TUI structure;
+            // start with the same pattern set. Calibrate against
+            // `tests/fixtures/state-replay/agy-thinking.raw` in follow-up
+            // PR if AGY's TUI introduces divergent rate-limit / idle
+            // strings.
+            Backend::Agy => vec![(AgentState::Ready, r"Antigravity CLI|Type your message")],
             // Non-preset backends have no state-detection heuristics — pane
             // stays in whatever state the generic output pipeline sets. These
             // variants should never reach here in normal flow (state machine
@@ -2871,6 +2877,8 @@ mod tests {
             "codex" | "codex-cli" => Backend::Codex,
             "opencode" | "opencode-cli" => Backend::OpenCode,
             "gemini" | "gemini-cli" => Backend::Gemini,
+            // #987: agy / antigravity / antigravity-cli — Google's gemini-cli successor.
+            "agy" | "antigravity" | "antigravity-cli" => Backend::Agy,
             other => panic!("unknown backend name in manifest: {other}"),
         }
     }

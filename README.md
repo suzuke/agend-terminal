@@ -21,7 +21,7 @@ trailers, deny matrix, daemon-managed worktrees). Your own terminal is
 
 ## What It Does
 
-Spawns AI coding agents (Claude Code, Codex, Kiro, OpenCode, Gemini) as
+Spawns AI coding agents (Claude Code, Codex, Kiro, OpenCode, Gemini, Antigravity) as
 long-lived PTY processes, each in its own git worktree. A built-in MCP
 server lets agents talk to each other — delegate work, request info,
 broadcast updates — without glue code. Crashes are survived by auto-
@@ -72,7 +72,8 @@ For optional Telegram binding (remote control + outbound alerts), see [`docs/USA
 | Kiro CLI | `kiro-cli` | Tested |
 | Codex | `codex` | Tested |
 | OpenCode | `opencode` | Tested |
-| Gemini CLI | `gemini` | Tested |
+| Gemini CLI | `gemini` | Tested (sunsets 2026-06-18 for free/Pro/Ultra; paid Code Assist Standard/Enterprise retain access) |
+| Antigravity CLI | `agy` | Tested (#987 — Gemini CLI's official successor) |
 
 ## Learn More
 

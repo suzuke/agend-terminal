@@ -13,6 +13,13 @@ pub enum Backend {
     Codex,
     OpenCode,
     Gemini,
+    /// Google Antigravity CLI (`agy`). Gemini CLI's official successor —
+    /// Google announced gemini-cli sunset for AI Pro / AI Ultra / free-tier
+    /// consumers on 2026-06-18. Shares the same agent engine as the
+    /// Antigravity 2.0 desktop app. Standard `mcpServers` schema + project-
+    /// local config at `<workdir>/.antigravitycli/mcp_config.json`. Added in
+    /// #987.
+    Agy,
     /// Generic shell (bash/zsh/sh). No preset wiring — inject/ready/resume are
     /// all no-ops. Command defaults to `$SHELL` or the platform default
     /// (`/bin/bash` on Unix, `cmd.exe` on Windows).
@@ -40,7 +47,8 @@ impl Backend {
             | Backend::KiroCli
             | Backend::Codex
             | Backend::OpenCode
-            | Backend::Gemini => true,
+            | Backend::Gemini
+            | Backend::Agy => true,
             Backend::Shell | Backend::Raw(_) => false,
         }
     }
@@ -57,6 +65,7 @@ impl Backend {
             "codex" | "codex-cli" => Backend::Codex,
             "opencode" | "opencode-cli" => Backend::OpenCode,
             "gemini" | "gemini-cli" => Backend::Gemini,
+            "agy" | "antigravity" | "antigravity-cli" => Backend::Agy,
             "shell" | "bash" | "zsh" | "sh" => Backend::Shell,
             _ => Backend::Raw(trimmed.to_string()),
         }
@@ -71,6 +80,7 @@ impl Backend {
             Backend::Codex => "codex",
             Backend::OpenCode => "opencode",
             Backend::Gemini => "gemini",
+            Backend::Agy => "agy",
             Backend::Shell => "shell",
             Backend::Raw(s) => s.as_str(),
         }
@@ -87,7 +97,8 @@ impl Backend {
             | Backend::KiroCli
             | Backend::Codex
             | Backend::OpenCode
-            | Backend::Gemini => self.preset().command.to_string(),
+            | Backend::Gemini
+            | Backend::Agy => self.preset().command.to_string(),
             Backend::Shell => {
                 std::env::var("SHELL").unwrap_or_else(|_| crate::default_shell().to_string())
             }
@@ -343,6 +354,36 @@ impl Backend {
                 ],
                 fresh_args: None, // same as args (resume is in resume_mode, not args)
             },
+            Backend::Agy => BackendPreset {
+                command: "agy",
+                args: &["--dangerously-skip-permissions"],
+                // #987: agy's interactive TUI renders an "Antigravity CLI <ver>"
+                // banner on startup (calibrated against
+                // tests/fixtures/state-replay/agy-thinking.raw). The pipe-OR
+                // covers post-banner "Ready" state matchable variants in case
+                // future TUI iterations rename the banner.
+                ready_pattern: "Antigravity CLI|Type your message",
+                submit_key: "\r",
+                inject_prefix: "\r",
+                typed_inject: true,
+                // agy --continue is the documented resume path (matches the
+                // `ResumeMode::ContinueInCwd { flag }` shape used by claude /
+                // codex / kiro). Operator-verified in issue body.
+                resume_mode: ResumeMode::ContinueInCwd { flag: "--continue" },
+                quit_command: "/exit",
+                instructions_path: "AGY.md",
+                instructions_shared: true,
+                inject_instructions_on_ready: false,
+                ready_timeout_secs: 20,
+                // #987: dismiss_patterns kept empty for r0. AGY runs with
+                // `--dangerously-skip-permissions` which auto-approves all
+                // tool permissions (per `agy --help`); no per-tool prompts
+                // expected. If a future agy version introduces prompts that
+                // bypass the skip-permissions flag, add anchored regexes
+                // here following the Gemini precedent above.
+                dismiss_patterns: &[],
+                fresh_args: None,
+            },
             // Shell and Raw have no preset behavior. `command` is `""` as a
             // sentinel — callers that need the actual spawn path should use
             // [`Backend::command_string`], which resolves Shell to `$SHELL`
@@ -383,6 +424,13 @@ impl Backend {
             Some(Backend::OpenCode)
         } else if basename == "gemini" || basename.starts_with("gemini-") {
             Some(Backend::Gemini)
+        } else if basename == "agy" || basename.starts_with("antigravity") {
+            // #987: agy (binary name) + antigravity-cli (full product name).
+            // basename match handles `/usr/local/bin/agy`; prefix match
+            // handles future `antigravity-foo` variants. parse_str above
+            // covers the user-facing "antigravity" alias for hand-edited
+            // fleet.yaml entries.
+            Some(Backend::Agy)
         } else {
             None
         }
@@ -396,6 +444,10 @@ impl Backend {
             Backend::Codex,
             Backend::OpenCode,
             Backend::Gemini,
+            // #987: agy slots after gemini chronologically — they share
+            // Google's agent engine; gemini-cli sunsets 2026-06-18 and agy
+            // is its official successor.
+            Backend::Agy,
         ]
     }
 
@@ -536,6 +588,7 @@ impl Backend {
             Backend::Codex => "0.118.0",
             Backend::OpenCode => "1.4.0",
             Backend::Gemini => "0.37.1",
+            Backend::Agy => "1.0.0",
             Backend::Shell | Backend::Raw(_) => "n/a",
         }
     }
@@ -874,6 +927,7 @@ mod tests {
         assert_eq!(Backend::from_command("codex"), Some(Backend::Codex));
         assert_eq!(Backend::from_command("opencode"), Some(Backend::OpenCode));
         assert_eq!(Backend::from_command("gemini"), Some(Backend::Gemini));
+        assert_eq!(Backend::from_command("agy"), Some(Backend::Agy));
         // Case insensitive
         assert_eq!(Backend::from_command("Claude"), Some(Backend::ClaudeCode));
         assert_eq!(
@@ -909,6 +963,15 @@ mod tests {
 
         let gemini = Backend::Gemini.preset();
         assert!(gemini.args.contains(&"--yolo"));
+
+        // #987: agy mirrors the existing preset shape — verify command,
+        // args, and the dangerously-skip-permissions flag (auto-approves
+        // tool calls, so no dismiss_patterns needed for r0).
+        let agy = Backend::Agy.preset();
+        assert_eq!(agy.command, "agy");
+        assert!(agy.args.contains(&"--dangerously-skip-permissions"));
+        assert!(agy.dismiss_patterns.is_empty());
+        assert_eq!(agy.instructions_path, "AGY.md");
     }
 
     #[test]
@@ -930,6 +993,11 @@ mod tests {
             Backend::OpenCode.preset().resume_mode.args_for(),
             vec!["--continue"]
         );
+        // #987: agy uses `--continue` (same shape as claude/opencode/kiro).
+        assert_eq!(
+            Backend::Agy.preset().resume_mode.args_for(),
+            vec!["--continue"]
+        );
     }
 
     #[test]
@@ -939,11 +1007,14 @@ mod tests {
         assert_eq!(Backend::Codex.name(), "codex");
         assert_eq!(Backend::OpenCode.name(), "opencode");
         assert_eq!(Backend::Gemini.name(), "gemini");
+        assert_eq!(Backend::Agy.name(), "agy");
     }
 
     #[test]
-    fn all_backends_returns_five() {
-        assert_eq!(Backend::all().len(), 5);
+    fn all_backends_returns_six() {
+        // #987: bumped from 5 → 6 with Backend::Agy addition (Google
+        // Antigravity CLI as gemini-cli's official successor).
+        assert_eq!(Backend::all().len(), 6);
     }
 
     #[test]
@@ -955,8 +1026,13 @@ mod tests {
         assert_eq!(Backend::parse_str("codex"), Backend::Codex);
         assert_eq!(Backend::parse_str("opencode"), Backend::OpenCode);
         assert_eq!(Backend::parse_str("gemini"), Backend::Gemini);
+        // #987: agy + antigravity + antigravity-cli all resolve to Backend::Agy.
+        assert_eq!(Backend::parse_str("agy"), Backend::Agy);
+        assert_eq!(Backend::parse_str("antigravity"), Backend::Agy);
+        assert_eq!(Backend::parse_str("antigravity-cli"), Backend::Agy);
         // Case insensitive
         assert_eq!(Backend::parse_str("Claude"), Backend::ClaudeCode);
+        assert_eq!(Backend::parse_str("AGY"), Backend::Agy);
         // Whitespace trim
         assert_eq!(Backend::parse_str("  claude  "), Backend::ClaudeCode);
     }

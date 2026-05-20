@@ -65,6 +65,23 @@ fixtures:
     # fallback (30s) would drop it back to Ready in production.
     expected_final_detect: null
 
+  - file: agy-thinking.raw
+    backend: agy
+    cli_version: "1.0.0"
+    recorded_on: "2026-05-20"
+    scenario: |
+      #987 fixture for agy (Google Antigravity CLI) — gemini-cli's official
+      successor. Captures alt-screen init + "Antigravity CLI 1.0.0" banner +
+      account/model header. The "Antigravity CLI" banner string fires the
+      Ready transition immediately on boot (pattern at src/state.rs:606
+      matches `Antigravity CLI|Type your message`). Recording cut at /exit
+      before any prompt input — no Thinking transition expected.
+    expected_transitions: [starting, ready]
+    expected_final_state: ready
+    expected_final_detect: ready
+    capture_kind: real_pty
+    provenance: "#987 r0 fixture — agy 1.0.0 boot + sanitized account banner; calibrates Ready pattern"
+
   - file: kiro-thinking.raw
     backend: kiro-cli
     cli_version: "2.0.1"

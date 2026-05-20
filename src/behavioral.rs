@@ -92,6 +92,14 @@ pub fn config_for(backend: &Backend) -> BehavioralConfig {
             silence_idle_ms: 8000,
             supports_cursor_query: false,
         },
+        // #987: agy shares gemini-cli's agent engine + TUI; inherit gemini's
+        // calibrated thresholds as starting point. Tune in follow-up PR if
+        // empirical telemetry shows divergence.
+        Backend::Agy => BehavioralConfig {
+            silence_thinking_ms: 3000,
+            silence_idle_ms: 8000,
+            supports_cursor_query: false,
+        },
         Backend::Shell | Backend::Raw(_) => BehavioralConfig::default(),
     }
 }
@@ -466,6 +474,16 @@ pub fn config_for_productivity(backend: &Backend) -> ProductivityConfig {
             use_heartbeat: true,
             heartbeat_fresh_window_ms: 10_000,
             cache_id: Some(MarkerCacheId::OpenCode),
+        },
+        // #987: agy reuses Gemini's productivity markers + cache id.
+        // Both share the same Google agent engine; markers will diverge
+        // only if AGY's TUI introduces new productivity indicators not
+        // present in Gemini CLI. Telemetry-tune in follow-up PR.
+        Backend::Agy => ProductivityConfig {
+            markers: GEMINI_PRODUCTIVE_MARKERS,
+            use_heartbeat: true,
+            heartbeat_fresh_window_ms: 10_000,
+            cache_id: Some(MarkerCacheId::Gemini),
         },
         // Shell / Raw — no MCP, generic markers only.
         Backend::Shell | Backend::Raw(_) => ProductivityConfig {
