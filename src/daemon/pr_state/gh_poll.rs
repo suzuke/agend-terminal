@@ -483,16 +483,23 @@ pub(crate) mod tests {
     }
 
     /// T8-d / T11: tier 4 — fixup-lead final fallback + tracing::warn
-    /// observability hook. tracing::warn emission asserted indirectly
-    /// via the matched branch.
+    /// observability hook. Reviewer #990 BLOCKING #2: assert the
+    /// `tracing::warn` event actually fires (operator visibility into
+    /// fall-through), not just the return value.
     #[test]
-    fn t8d_fixup_lead_final_fallback() {
+    #[tracing_test::traced_test]
+    fn t8d_fixup_lead_final_fallback_emits_tracing_warn() {
         let home = tmp_home("auth-tier4");
         std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").unwrap();
         let mut state = fresh_state("br");
         state.subscribers.clear();
         let resolved = resolve_author_with_gh(&home, Some("nobody"), &state);
         assert_eq!(resolved, "fixup-lead");
+        assert!(
+            logs_contain("#986 author resolution fell through to fixup-lead"),
+            "tracing::warn MUST fire when chain falls through to tier 4 — \
+             operator needs visibility to fix fleet.yaml github_login"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 

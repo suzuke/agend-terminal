@@ -1860,6 +1860,89 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// #986 T-load-bearing (reviewer #990 BLOCKING #1) — the actual
+    /// regression path that motivated #986: PrState in MergeReady
+    /// state but `pr_author=""` / `pr_number=0` (placeholder values
+    /// from `new_for_branch` when ci_watch arms before any gh-poll).
+    /// After scan_and_emit_with applies gh-poll:
+    /// - pr_author populated via 4-tier resolution chain
+    /// - pr_number populated from gh metadata
+    /// - `[pr-ready-for-merge]` event enqueued to RESOLVED author with
+    ///   the gh-discovered PR number in the body
+    ///
+    /// Pre-#986: pre-poll state sat MergeReady forever, ready event
+    /// fired to subscribers[0] (fallback) with `repo@branch` body
+    /// instead of `repo#N`. Operator-visible: lead manual kick still
+    /// needed even with #972 aggregator merged.
+    #[test]
+    fn t14_gh_poll_promotes_unknown_author_to_ready_event() {
+        // Build a state ALREADY MergeReady (CI green + 1×VERIFIED at
+        // same sha) but with placeholder pr_author / pr_number.
+        let mut s = new_state("sha-A", ReviewClass::Single);
+        s.pr_author = String::new();
+        s.pr_number = 0;
+        s.ci_state = CiState::Green {
+            sha: "sha-A".to_string(),
+            observed_at: now(),
+        };
+        s.verdict_state = VerdictState::Verified {
+            reviewers: vec![("rev-1".to_string(), "sha-A".to_string())],
+        };
+        s.merge_state = MergeState::MergeReady;
+        // subscribers[0] is "dev" from fixture — but we want gh-poll
+        // to win via tier 2 name match. Set up a fleet.yaml with a
+        // "suzuke" instance that matches the gh author.login.
+        let home = home_with_state("ready-promote", s);
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  suzuke:\n    backend: claude\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(home.join("inbox")).ok();
+
+        // MockGhPoller returns metadata: PR #990, author "suzuke"
+        // (matches the fleet instance via tier 2 name match), state=OPEN.
+        let poller = MockGhPoller::new(vec![Ok(vec![gh_meta_open(990, "feat/test", "suzuke")])]);
+
+        scan_and_emit_with(&home, &empty_registry(), &poller);
+
+        // Post-scan state: pr_number/author populated, ready event swept
+        // (file persists because state is OPEN not Merged), ready event
+        // enqueued.
+        let loaded = load(&home, "owner/repo", "feat/test").expect("state persists post-scan");
+        assert_eq!(loaded.pr_number, 990, "pr_number populated from gh-poll");
+        assert_eq!(
+            loaded.pr_author, "suzuke",
+            "pr_author resolved via tier-2 name match against fleet.yaml"
+        );
+
+        // [pr-ready-for-merge] enqueued to the RESOLVED author (suzuke,
+        // NOT subscribers[0]'s "dev"). Body must include the gh-poll
+        // PR number (repo#990) NOT the placeholder repo@branch form.
+        let msgs = crate::inbox::drain(&home, "suzuke");
+        assert_eq!(
+            msgs.len(),
+            1,
+            "exactly one [pr-ready-for-merge] to resolved author"
+        );
+        assert_eq!(msgs[0].kind.as_deref(), Some("pr-ready-for-merge"));
+        assert!(
+            msgs[0].text.contains("owner/repo#990"),
+            "event body must use gh-discovered PR number, not @branch placeholder: {}",
+            msgs[0].text
+        );
+
+        // Subscriber["dev"] inbox should be empty — gh-poll's resolved
+        // author won over the legacy subscribers[0] fallback.
+        let dev_msgs = crate::inbox::drain(&home, "dev");
+        assert!(
+            dev_msgs.is_empty(),
+            "subscribers[0] fallback must NOT fire when gh-poll resolves a different author"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     /// #986 T10 (reviewer MANDATORY idempotency) — same gh-poll output
     /// applied twice does NOT double-emit / double-transition. Reducer
     /// recomputes derived state; Merged terminal already swept on
