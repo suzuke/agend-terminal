@@ -13,6 +13,7 @@
 //!   The current process is a client and should not touch run dir ownership.
 
 mod agent_resolve;
+mod attach_detect;
 pub(crate) mod canonical_hygiene;
 pub mod daemon_spawn;
 pub(crate) mod doctor;
@@ -305,7 +306,12 @@ pub fn prepare(home: &Path, fleet_path: &Path, opts: PrepareOptions) -> Result<B
 /// discovery semantics across PID-recycling, kill -9, and stale
 /// rundir scenarios.
 fn try_attach(home: &Path, fleet_path: &Path) -> Result<Option<AttachedFleet>> {
-    let Some(run_dir) = crate::daemon::find_active_run_dir(home) else {
+    // #969 RC1: bounded-backoff retry closes the App→Daemon race window
+    // where `find_active_run_dir` returns None because the daemon's
+    // `.daemon` file hasn't landed yet but the process is mid-bootstrap.
+    // 3×100ms total budget; on miss the App falls through to Owned mode
+    // (and the #984 dedup module catches any wire-layer duplicates).
+    let Some(run_dir) = attach_detect::find_active_run_dir_backoff(home) else {
         return Ok(None);
     };
     if !crate::ipc::probe_api(&run_dir) {
