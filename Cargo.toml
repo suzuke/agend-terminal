@@ -129,7 +129,7 @@ iana-time-zone = "0.1.65"
 # runtime entry here only adds it to release graphs when `tray` is on.
 tray-icon = { version = "0.24", optional = true }
 tao = { version = "0.35", optional = true }
-toml = { version = "0.8", optional = true }
+toml = { version = "1.1", optional = true }
 
 # Discord (feature = "discord"). Modular twilight crates — gateway for
 # WS shard lifecycle, http for REST, model for typed Discord API structs.
@@ -157,7 +157,7 @@ proptest = "1.4"
 serial_test = "3"
 # Used only for asserting that codex_trust_directory writes syntactically
 # valid TOML — the prod code appends raw text, it doesn't depend on this crate.
-toml = "0.8"
+toml = "1.1"
 # Sprint 54 P1-A — `tests/cargo_include_invariant.rs` matches resolved
 # `include_str!` paths against `[package].include` glob patterns
 # (e.g. `src/**/*.rs`, `assets/hooks/*`). Test-only.
