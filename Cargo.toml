@@ -88,7 +88,7 @@ teloxide = { version = "0.15", default-features = false, features = ["macros", "
 # Utilities
 async-trait = "0.1"
 anyhow = "1"
-fs4 = "0.12"
+fs4 = "1.1"
 dirs = "6"
 # Issue #893: dunce::canonicalize strips Windows `\\?\` UNC verbatim prefix
 # when safe, so the path encoding matches what claude CLI's Node
