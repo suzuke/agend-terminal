@@ -92,17 +92,8 @@ pub(super) fn handle_send_to_instance(
         home,
         &json!({
             "method": crate::api::method::SEND,
-            // #1024 (closes #1002 ROOT 2): include `reviewed_head` in
-            // the forwarded params. Pre-fix this field was silently
-            // dropped at the MCP boundary, causing the API SEND
-            // handler to receive `msg.reviewed_head: None`, which
-            // failed `auto_release::is_verdict_message`'s
-            // `reviewed_head.is_some()` predicate. Net:
-            // `record_verdict` never called for any MCP-send verdict;
-            // `verdict_state` stuck at None; autonomous self-merge
-            // flow broken. Mirrors `handle_report_result`'s existing
-            // forwarding pattern. See
-            // `/tmp/dialectic-1002-root2-spike-dev.md` for the spike.
+            // #1024 (closes #1002 ROOT 2): `reviewed_head` MUST be forwarded; see
+            // sibling `handle_report_result` + `auto_release::is_verdict_message`.
             "params": { "from": sender.as_str(), "target": target, "text": text, "kind": kind, "thread_id": thread_id, "parent_id": parent_id, "correlation_id": args["correlation_id"].as_str(), "reviewed_head": args["reviewed_head"].as_str(), "sequencing": args["sequencing"].as_str(), "eta_minutes": args["eta_minutes"].as_u64(), "reporting_cadence": args["reporting_cadence"].as_str(), "worktree_binding_required": args["worktree_binding_required"].as_bool(), "expect_reply_within_secs": args["expect_reply_within_secs"].as_i64() }
         }),
     ) {
