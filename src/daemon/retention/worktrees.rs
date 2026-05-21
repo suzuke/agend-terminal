@@ -59,6 +59,11 @@ fn unix_ts() -> u64 {
         .unwrap_or(0)
 }
 
+/// Recursive copy helper used by the `EXDEV` fallback in `try_archive`.
+/// Only reachable on Unix where `libc::EXDEV` is the cross-filesystem
+/// rename errno; gated to `cfg(unix)` so non-Unix targets don't see it
+/// as dead code under `-D dead_code`.
+#[cfg(unix)]
 fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
@@ -69,15 +74,8 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
         if ftype.is_dir() {
             copy_dir_recursive(&src_path, &dst_path)?;
         } else if ftype.is_symlink() {
-            #[cfg(unix)]
-            {
-                let target = std::fs::read_link(&src_path)?;
-                std::os::unix::fs::symlink(target, &dst_path)?;
-            }
-            #[cfg(not(unix))]
-            {
-                std::fs::copy(&src_path, &dst_path)?;
-            }
+            let target = std::fs::read_link(&src_path)?;
+            std::os::unix::fs::symlink(target, &dst_path)?;
         } else {
             std::fs::copy(&src_path, &dst_path)?;
         }
@@ -497,7 +495,10 @@ mod tests {
     /// T4 (#1058): cross-filesystem `EXDEV` fallback — recursive copy
     /// preserves files and subdirectories. The full `EXDEV` branch is hard
     /// to exercise without two filesystems, so this asserts the helper that
-    /// implements the fallback directly.
+    /// implements the fallback directly. Unix-only because the helper is
+    /// only compiled on Unix (the `EXDEV` errno match arm in `try_archive`
+    /// is `cfg(unix)`-gated).
+    #[cfg(unix)]
     #[test]
     fn copy_dir_recursive_preserves_files_and_subdirs() {
         let dir = tmp_home("t4-copy");
