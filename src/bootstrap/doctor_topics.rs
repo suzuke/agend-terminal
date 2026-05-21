@@ -104,15 +104,10 @@ impl TopicReport {
 pub fn classify(home: &Path) -> TopicReport {
     let registry = load_topic_registry(home);
     let fleet = FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok();
-    let fleet_topic_ids: HashMap<String, i32> = fleet
-        .as_ref()
-        .map(|c| {
-            c.instances
-                .iter()
-                .filter_map(|(n, i)| i.topic_id.map(|t| (n.clone(), t)))
-                .collect()
-        })
-        .unwrap_or_default();
+    let fleet_topic_ids: HashMap<String, i32> = {
+        let reg = load_topic_registry(home);
+        reg.into_iter().map(|(tid, name)| (name, tid)).collect()
+    };
     let fleet_instance_names: std::collections::HashSet<String> = fleet
         .as_ref()
         .map(|c| c.instances.keys().cloned().collect())
@@ -374,16 +369,15 @@ pub fn execute_cleanup(
                     }
                 }
                 DriftResolution::PreferRegistry => {
-                    // Update fleet.yaml to match topics.json.
-                    let _ = crate::fleet::update_instance_field(
-                        home,
-                        &entry.instance_name,
-                        "topic_id",
-                        serde_yaml_ng::Value::Number(serde_yaml_ng::Number::from(entry.topic_id)),
+                    tracing::info!(
+                        instance = %entry.instance_name,
+                        topic_id = entry.topic_id,
+                        "doctor: PreferRegistry is no-op post-refactor (topics.json is canonical)"
                     );
-                    actions.push(CleanupAction::UnregisteredOnly {
+                    actions.push(CleanupAction::SkippedNeedsResolution {
                         topic_id: entry.topic_id,
                         instance_name: entry.instance_name.clone(),
+                        reason: "prefer_registry: no-op (topics.json is already canonical source)",
                     });
                 }
                 DriftResolution::LeaveDrift => {
@@ -502,27 +496,32 @@ mod tests {
     }
 
     #[test]
-    fn classify_drift_fleet_when_registry_and_fleet_differ() {
-        let home = tmp_home("drift");
+    fn classify_live_even_when_fleet_yaml_differs() {
+        let home = tmp_home("drift-now-live");
         write_registry(&home, &[(42, "alpha")]);
         write_fleet(&home, &[("alpha", Some(99))]);
         let report = classify(&home);
         assert_eq!(report.entries.len(), 1);
-        assert_eq!(report.entries[0].class, TopicClass::DriftFleet);
-        assert_eq!(report.entries[0].topic_id, 42);
-        assert_eq!(report.entries[0].fleet_topic_id, Some(99));
+        assert_eq!(
+            report.entries[0].class,
+            TopicClass::Live,
+            "post-refactor: fleet_topic_ids reads topics.json, not fleet.yaml — always agrees with registry"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
-    fn classify_stale_registry_when_fleet_lacks_topic_id() {
-        let home = tmp_home("stale-registry");
+    fn classify_live_when_fleet_yaml_lacks_topic_id() {
+        let home = tmp_home("stale-now-live");
         write_registry(&home, &[(42, "alpha")]);
         write_fleet(&home, &[("alpha", None)]);
         let report = classify(&home);
         assert_eq!(report.entries.len(), 1);
-        assert_eq!(report.entries[0].class, TopicClass::StaleRegistry);
-        assert_eq!(report.entries[0].fleet_topic_id, None);
+        assert_eq!(
+            report.entries[0].class,
+            TopicClass::Live,
+            "post-refactor: topics.json is canonical — fleet.yaml topic_id irrelevant"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -601,13 +600,11 @@ mod tests {
         let mut report = classify(&home);
         report.can_manage_topics = Some(true);
         let out = render_human(&report);
+        // Post-refactor: fleet_topic_ids comes from topics.json (same source as registry),
+        // so both entries are Live — DriftFleet is unreachable from classify().
         assert!(
-            out.contains("1 live"),
+            out.contains("2 live"),
             "human output must show live count: {out}"
-        );
-        assert!(
-            out.contains("1 drift_fleet"),
-            "human output must show drift count: {out}"
         );
         assert!(
             out.contains("can_manage_topics: ✓"),
@@ -666,54 +663,59 @@ mod tests {
     }
 
     #[test]
-    fn execute_cleanup_stale_registry_surfaces_resolution_needed() {
+    fn execute_cleanup_former_stale_registry_now_live() {
+        // Post-refactor: fleet_topic_ids comes from topics.json, so a registry
+        // entry always matches itself → Live (StaleRegistry unreachable).
         let home = tmp_home("cleanup-stale");
         write_registry(&home, &[(42, "alpha")]);
         write_fleet(&home, &[("alpha", None)]);
         let mut report = classify(&home);
         report.can_manage_topics = Some(true);
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].class, TopicClass::Live);
         let actions = execute_cleanup(&home, &report, DriftResolution::PreferFleet);
-        assert_eq!(actions.len(), 1);
-        match &actions[0] {
-            CleanupAction::SkippedNeedsResolution { reason, .. } => {
-                assert!(reason.contains("stale_registry"));
-                assert!(reason.contains("manually verify"));
-            }
-            other => panic!("expected SkippedNeedsResolution, got {other:?}"),
-        }
+        assert!(
+            actions.is_empty(),
+            "Live entries produce no cleanup actions"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
-    fn execute_cleanup_drift_prefer_fleet_updates_registry() {
+    fn execute_cleanup_former_drift_now_live_prefer_fleet() {
+        // Post-refactor: fleet_topic_ids comes from topics.json, so registry
+        // entry always agrees with itself → Live (DriftFleet unreachable).
         let home = tmp_home("cleanup-drift-fleet");
         write_registry(&home, &[(42, "alpha")]);
         write_fleet(&home, &[("alpha", Some(99))]);
         let mut report = classify(&home);
         report.can_manage_topics = Some(true);
-        let _ = execute_cleanup(&home, &report, DriftResolution::PreferFleet);
-        // Registry should now reflect fleet.yaml's topic_id (99).
-        let reg = load_topic_registry(&home);
-        assert_eq!(reg.get(&99), Some(&"alpha".to_string()));
-        assert!(!reg.contains_key(&42));
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].class, TopicClass::Live);
+        let actions = execute_cleanup(&home, &report, DriftResolution::PreferFleet);
+        assert!(
+            actions.is_empty(),
+            "Live entries produce no cleanup actions"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
-    fn execute_cleanup_drift_leave_surfaces_unresolved() {
+    fn execute_cleanup_former_drift_now_live_leave() {
+        // Post-refactor: fleet_topic_ids comes from topics.json, so registry
+        // entry always agrees with itself → Live (DriftFleet unreachable).
         let home = tmp_home("cleanup-drift-leave");
         write_registry(&home, &[(42, "alpha")]);
         write_fleet(&home, &[("alpha", Some(99))]);
         let mut report = classify(&home);
         report.can_manage_topics = Some(true);
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].class, TopicClass::Live);
         let actions = execute_cleanup(&home, &report, DriftResolution::LeaveDrift);
-        assert_eq!(actions.len(), 1);
-        match &actions[0] {
-            CleanupAction::SkippedNeedsResolution { reason, .. } => {
-                assert!(reason.contains("drift_fleet"));
-            }
-            other => panic!("expected SkippedNeedsResolution, got {other:?}"),
-        }
+        assert!(
+            actions.is_empty(),
+            "Live entries produce no cleanup actions"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 

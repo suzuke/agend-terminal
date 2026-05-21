@@ -66,20 +66,7 @@ pub(super) fn resolve_topic(state: &mut TelegramState, topic_id: Option<i32>) ->
         if let Some(name) = state.topic_to_instance.get(&tid).cloned() {
             return name;
         }
-        // Unknown topic_id — reload from fleet.yaml
-        if let Ok(config) =
-            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&state.home))
-        {
-            for (inst_name, inst) in &config.instances {
-                if inst.topic_id == Some(tid) {
-                    state.topic_to_instance.insert(tid, inst_name.clone());
-                    state.instance_to_topic.insert(inst_name.clone(), tid);
-                    return inst_name.clone();
-                }
-            }
-        }
-        // Fix B: check topics.json as third source (runtime-created topics
-        // may exist there but not in fleet.yaml or in-memory state).
+        // topics.json is the canonical source for topic_id → instance mapping.
         let reg = load_topic_registry(&state.home);
         if let Some(inst_name) = reg.get(&tid) {
             state.topic_to_instance.insert(tid, inst_name.clone());

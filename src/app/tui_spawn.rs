@@ -43,50 +43,16 @@ pub(crate) fn add_instance_with_topic(
     let outcome = ensure_topic_for(name);
 
     if let TopicOutcome::Created(ref tid) = outcome {
-        if let Ok(tid_num) = tid.parse::<i32>() {
-            // Mirrors handle_spawn's #962-discipline match. Surface
-            // failures via tracing::warn rather than swallowing; the
-            // helper still returns Created because the topic WAS made
-            // (the channel-side registry recorded it). Operator-visible
-            // signal: warn-log entry with the fleet-yaml mismatch.
-            match crate::fleet::update_instance_field(
-                home,
-                name,
-                "topic_id",
-                serde_yaml_ng::Value::Number(serde_yaml_ng::Number::from(tid_num)),
-            ) {
-                Ok(true) => {
-                    tracing::info!(
-                        instance = name,
-                        topic_id = %tid,
-                        "TUI-spawn: created channel topic + persisted topic_id"
-                    );
-                }
-                Ok(false) => {
-                    tracing::warn!(
-                        instance = name,
-                        topic_id = %tid,
-                        "TUI-spawn: topic created but fleet.yaml entry unexpectedly \
-                         missing — topic_id NOT persisted"
-                    );
-                }
-                Err(e) => {
-                    tracing::error!(
-                        instance = name,
-                        topic_id = %tid,
-                        error = %e,
-                        "TUI-spawn: topic_id persist failed"
-                    );
-                }
+        if let Ok(topic_id) = tid.parse::<i32>() {
+            if let Err(e) = crate::channel::telegram::register_topic(home, topic_id, name) {
+                tracing::warn!(instance = name, error = %e, "TUI-spawn: failed to persist topic_id to topics.json");
             }
-        } else {
-            tracing::warn!(
-                instance = name,
-                topic_id = %tid,
-                "TUI-spawn: non-numeric topic_id; skipping fleet.yaml persist \
-                 (expected telegram i32 format)"
-            );
         }
+        tracing::info!(
+            instance = name,
+            topic_id = %tid,
+            "TUI-spawn: created channel topic (persisted to topics.json)"
+        );
     } else if let TopicOutcome::Failed(ref err) = outcome {
         tracing::warn!(
             instance = name,
@@ -236,11 +202,10 @@ mod tests {
             TopicOutcome::Created(ref tid) => assert_eq!(tid, "7001"),
             other => panic!("expected Created, got {other:?}"),
         }
-        let cfg = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
         assert_eq!(
-            cfg.instances.get("t1-agent").and_then(|i| i.topic_id),
+            crate::channel::telegram::lookup_topic_for_instance(&home, "t1-agent"),
             Some(7001),
-            "topic_id must be persisted to fleet.yaml"
+            "topic_id must be persisted to topics.json"
         );
         reset_active_channel_for_test();
         let _ = std::fs::remove_dir_all(&home);
@@ -322,11 +287,10 @@ mod tests {
             TopicOutcome::Created(ref tid) => assert_eq!(tid, "9100"),
             other => panic!("expected Created, got {other:?}"),
         }
-        let cfg = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
         assert_eq!(
-            cfg.instances.get("ctrlb-c-agent").and_then(|i| i.topic_id),
+            crate::channel::telegram::lookup_topic_for_instance(&home, "ctrlb-c-agent"),
             Some(9100),
-            "#966 Backend menu caller-path: topic_id must be persisted"
+            "#966 Backend menu caller-path: topic_id must be persisted to topics.json"
         );
         reset_active_channel_for_test();
         let _ = std::fs::remove_dir_all(&home);
@@ -369,11 +333,10 @@ mod tests {
             TopicOutcome::Created(ref tid) => assert_eq!(tid, "9200"),
             other => panic!("expected Created, got {other:?}"),
         }
-        let cfg = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
         assert_eq!(
-            cfg.instances.get("palette-agent").and_then(|i| i.topic_id),
+            crate::channel::telegram::lookup_topic_for_instance(&home, "palette-agent"),
             Some(9200),
-            "#966 palette caller-path: topic_id must be persisted"
+            "#966 palette caller-path: topic_id must be persisted to topics.json"
         );
         reset_active_channel_for_test();
         let _ = std::fs::remove_dir_all(&home);
@@ -446,11 +409,10 @@ mod tests {
             TopicOutcome::Created(ref tid) => assert_eq!(tid, "8500"),
             other => panic!("expected Created via runtime lookup, got {other:?}"),
         }
-        let cfg = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
         assert_eq!(
-            cfg.instances.get("late-agent").and_then(|i| i.topic_id),
+            crate::channel::telegram::lookup_topic_for_instance(&home, "late-agent"),
             Some(8500),
-            "late-arriving channel must persist topic_id for new instances"
+            "late-arriving channel must persist topic_id to topics.json"
         );
         reset_active_channel_for_test();
         let _ = std::fs::remove_dir_all(&home);

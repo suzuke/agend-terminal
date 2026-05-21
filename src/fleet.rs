@@ -45,6 +45,8 @@ pub struct FleetConfig {
     /// from Sprint 54 P2-6. Storage timestamps stay UTC unconditionally.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_timezone: Option<String>,
+    #[serde(skip)]
+    pub(crate) home: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -264,6 +266,7 @@ impl FleetConfig {
         let mut config: FleetConfig = serde_yaml_ng::from_str(&content)
             .with_context(|| format!("Failed to parse fleet config: {}", path.display()))?;
         config.normalize();
+        config.home = path.parent().map(|p| p.to_path_buf());
         // Sprint 46 P1: backfill instance IDs + reserved-name warnings
         config.backfill_ids(path);
         Ok(config)
@@ -459,7 +462,11 @@ impl FleetConfig {
             role: inst.role.clone(),
             cols,
             rows,
-            topic_id: inst.topic_id,
+            topic_id: self
+                .home
+                .as_ref()
+                .and_then(|h| crate::channel::telegram::lookup_topic_for_instance(h, name))
+                .or(inst.topic_id),
             git_branch: inst.git_branch.clone(),
             model,
             worktree: inst.worktree,
@@ -1110,6 +1117,7 @@ pub fn update_channel_telegram_group_id(home: &Path, new_group_id: i64) -> Resul
 /// Post-fix `Result<bool>` lets callers detect partial-success. Internal
 /// `tracing::warn!` fires on every no-op path so even callers using
 /// `let _ = update_instance_field(...)` get an audit trail.
+#[allow(dead_code)]
 pub fn update_instance_field(
     home: &Path,
     name: &str,
