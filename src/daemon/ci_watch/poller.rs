@@ -621,6 +621,46 @@ fn ci_notification_message(
     Some(msg)
 }
 
+/// Build the `[ci-ready-for-action]` inbox message handed to the
+/// `next_after_ci` chain target on CI pass (#1030). Single construction
+/// site so the production emit and the deterministic-hint test (T4)
+/// see identical bytes.
+pub(crate) fn make_ci_ready_for_action_msg(
+    repo: &str,
+    branch: &str,
+    repo_branch_key: &str,
+) -> crate::inbox::InboxMessage {
+    crate::inbox::InboxMessage {
+        schema_version: 0,
+        id: None,
+        read_at: None,
+        thread_id: None,
+        parent_id: None,
+        task_id: None,
+        force_meta: None,
+        // Same canonical `{repo}@{branch}` form used by the [ci-pass]
+        // subscriber enqueue so inbox readers can correlate the two.
+        correlation_id: Some(repo_branch_key.to_string()),
+        reviewed_head: None,
+        from: "system:ci".to_string(),
+        text: format!("[ci-ready-for-action] {repo}@{branch}: CI passed, your turn."),
+        kind: Some("ci-ready-for-action".to_string()),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        channel: None,
+        delivery_mode: None,
+        attachments: vec![],
+        in_reply_to_msg_id: None,
+        in_reply_to_excerpt: None,
+        superseded_by: None,
+        from_id: None,
+        broadcast_context: None,
+        sequencing: None,
+        eta_minutes: None,
+        reporting_cadence: None,
+        worktree_binding_required: None,
+    }
+}
+
 /// Fetch latest CI run and notify ALL subscribed agents on any
 /// terminal conclusion (success, failure, cancelled, timed_out, etc.).
 /// Also tracks `head_sha` — if the branch HEAD changes (e.g. force push),
@@ -3437,6 +3477,344 @@ mod tests {
                 "{sub} inbox payload mismatch: {body}"
             );
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ----------------------------------------------------------------------
+    // #1030 RED→GREEN — reviewer auto-wake on CI green.
+    //
+    // Two emit sites in `ci_check_repo` bypass the wake-aware
+    // `enqueue_with_idle_hint` path: site 2 (subscriber [ci-pass] enqueue,
+    // line ~1092) and site 3 (next_after_ci chain target, PTY-only inject
+    // ~lines 1142-1149). The empirical symptom (PRs #1028+#1029): reviewer
+    // sits idle 7 min after CI green until lead manually kicks.
+    //
+    // Tests below: T2/T5/T6 fail RED (chain target has no durable inbox
+    // entry today) and pass GREEN (site 3 swap lands a [ci-ready-for-action]
+    // inbox entry with idle-hint wake). T1/T3 anti-regress the subscriber
+    // fan-out + chain-target dedup. T4 stands alone via the
+    // `enqueue_with_idle_hint_with_emitter` test seam.
+    // ----------------------------------------------------------------------
+
+    /// Helper: a base watch JSON pre-populated with two subscribers + an
+    /// optional `next_after_ci` chain target. Matches the production
+    /// `repo action=checkout bind=true` + `send(kind=task, next_after_ci=...)`
+    /// flow that empirically produced the #1030 wake gap.
+    fn watch_with_chain(next_after_ci: Option<&str>) -> serde_json::Value {
+        let mut watch = serde_json::json!({
+            "repo": "o/r",
+            "branch": "feat",
+            "subscribers": [
+                {"instance": "lead", "subscribed_at": "2026-05-21T00:00:00Z"},
+                {"instance": "dev",  "subscribed_at": "2026-05-21T00:00:01Z"}
+            ],
+            "instance": "lead",
+            "interval_secs": 60,
+            "last_run_id": null,
+            "head_sha": null,
+            "last_polled_at": null,
+            "last_notified_head_sha": null,
+            "expires_at": (chrono::Utc::now() + chrono::Duration::hours(72)).to_rfc3339(),
+            "last_terminal_seen_at": null,
+        });
+        if let Some(n) = next_after_ci {
+            watch["next_after_ci"] = serde_json::json!(n);
+        }
+        watch
+    }
+
+    /// T1 (anti-regression for site 2 swap): with the [ci-pass]
+    /// subscriber enqueue moving from raw `enqueue` to `enqueue_with_idle_hint`,
+    /// every subscriber's durable JSONL inbox MUST still receive the
+    /// `[ci-pass]` line (existing wake-blind path is what survives).
+    #[test]
+    fn ci_pass_subscriber_inbox_anti_regression() {
+        let dir = tmp_dir("1030-t1-anti-regression");
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).ok();
+        let watch = watch_with_chain(None);
+        let watch_path = ci_dir.join(watch_filename("o/r", "feat"));
+        std::fs::write(&watch_path, serde_json::to_string_pretty(&watch).unwrap()).unwrap();
+        let provider = MockCiProvider::with_runs(vec![CiRun {
+            id: 1,
+            conclusion: Some("success".to_string()),
+            head_sha: "abc1234".to_string(),
+            url: "https://example/run/1".to_string(),
+        }]);
+        let registry: AgentRegistry =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(ci_check_repo(
+            &dir,
+            &watch_path,
+            "o/r",
+            "feat",
+            &["lead".to_string(), "dev".to_string()],
+            None,
+            None,
+            None,
+            None,
+            &registry,
+            &provider,
+        ))
+        .unwrap();
+        for sub in ["lead", "dev"] {
+            let messages = crate::inbox::drain(&dir, sub);
+            assert!(
+                messages.iter().any(|m| m.text.contains("[ci-pass]")),
+                "{sub} must still receive [ci-pass] after site 2 swap; got: {messages:?}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// T2 (RED→GREEN, primary signal for #1030): when `next_after_ci`
+    /// points at an agent, that agent MUST receive a durable
+    /// `[ci-ready-for-action]` inbox entry on CI pass. RED today —
+    /// site 3 is PTY-only with no inbox write, so the chain target's
+    /// JSONL stays empty. GREEN: site 3 swap lands an InboxMessage via
+    /// `enqueue_with_idle_hint`.
+    #[test]
+    fn ci_pass_chain_target_gets_durable_inbox_entry() {
+        let dir = tmp_dir("1030-t2-chain-target-inbox");
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).ok();
+        let watch = watch_with_chain(Some("reviewer"));
+        let watch_path = ci_dir.join(watch_filename("o/r", "feat"));
+        std::fs::write(&watch_path, serde_json::to_string_pretty(&watch).unwrap()).unwrap();
+        let provider = MockCiProvider::with_runs(vec![CiRun {
+            id: 2,
+            conclusion: Some("success".to_string()),
+            head_sha: "abc1234".to_string(),
+            url: "https://example/run/2".to_string(),
+        }]);
+        let registry: AgentRegistry =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(ci_check_repo(
+            &dir,
+            &watch_path,
+            "o/r",
+            "feat",
+            &["lead".to_string(), "dev".to_string()],
+            None,
+            None,
+            None,
+            None,
+            &registry,
+            &provider,
+        ))
+        .unwrap();
+        let messages = crate::inbox::drain(&dir, "reviewer");
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.text.contains("[ci-ready-for-action]")),
+            "reviewer must receive a durable [ci-ready-for-action] inbox entry; got: {messages:?}"
+        );
+    }
+
+    /// T3 (anti-regression for site 2's chain-target skip): the
+    /// subscriber [ci-pass] loop must continue to SKIP an agent whose
+    /// name appears in `next_after_ci`. Without this skip, the chain
+    /// target would receive both [ci-pass] (subscriber) AND
+    /// [ci-ready-for-action] (chain), and the dedup line at poller.rs:1034
+    /// is what keeps it to one. Test guards against accidental removal.
+    #[test]
+    fn ci_pass_chain_target_excluded_from_subscriber_loop() {
+        let dir = tmp_dir("1030-t3-chain-skip");
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).ok();
+        let watch = watch_with_chain(Some("reviewer"));
+        let watch_path = ci_dir.join(watch_filename("o/r", "feat"));
+        std::fs::write(&watch_path, serde_json::to_string_pretty(&watch).unwrap()).unwrap();
+        let provider = MockCiProvider::with_runs(vec![CiRun {
+            id: 3,
+            conclusion: Some("success".to_string()),
+            head_sha: "abc1234".to_string(),
+            url: "https://example/run/3".to_string(),
+        }]);
+        let registry: AgentRegistry =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // Reviewer NOT in subscribers; only in next_after_ci.
+        rt.block_on(ci_check_repo(
+            &dir,
+            &watch_path,
+            "o/r",
+            "feat",
+            &["lead".to_string(), "dev".to_string()],
+            None,
+            None,
+            None,
+            None,
+            &registry,
+            &provider,
+        ))
+        .unwrap();
+        let messages = crate::inbox::drain(&dir, "reviewer");
+        assert!(
+            !messages.iter().any(|m| m.text.contains("[ci-pass]")),
+            "reviewer must NOT receive a [ci-pass] subscriber entry; got: {messages:?}"
+        );
+    }
+
+    /// T4 (deterministic hint delivery via test seam):
+    /// `make_ci_ready_for_action_msg` produces an InboxMessage that,
+    /// when passed through `enqueue_with_idle_hint_with_emitter`,
+    /// generates the expected `[AGEND-MSG-PENDING]` hint string. Passes
+    /// in both RED and GREEN — invariant on the helper's wire output.
+    #[test]
+    fn ci_ready_for_action_hint_format_deterministic() {
+        let dir = tmp_dir("1030-t4-hint-format");
+        std::fs::create_dir_all(&dir).unwrap();
+        let msg = super::make_ci_ready_for_action_msg("o/r", "feat", "o/r@feat");
+        let captured: std::sync::Arc<parking_lot::Mutex<Option<String>>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(None));
+        let cap = captured.clone();
+        crate::inbox::enqueue_with_idle_hint_with_emitter(&dir, "reviewer", msg, move |hint| {
+            *cap.lock() = Some(hint.to_string());
+        })
+        .unwrap();
+        let hint = captured.lock().clone().expect("emitter must fire once");
+        assert!(
+            hint.contains("kind=ci-ready-for-action"),
+            "hint must carry kind for downstream filtering; got: {hint}"
+        );
+        assert!(
+            hint.contains("from=system:ci"),
+            "hint must carry from for routing; got: {hint}"
+        );
+        assert!(
+            hint.contains("inbox="),
+            "hint must carry pending count for recipient bookkeeping; got: {hint}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// T5 (RED→GREEN): the chain-target inbox entry's `kind` field
+    /// MUST be `"ci-ready-for-action"` so downstream agent filters can
+    /// distinguish it from the regular `ci-watch` fan-out. RED today —
+    /// no entry exists, so no kind to inspect. GREEN: kind matches.
+    #[test]
+    fn ci_pass_chain_target_inbox_kind_is_ready_for_action() {
+        let dir = tmp_dir("1030-t5-chain-target-kind");
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).ok();
+        let watch = watch_with_chain(Some("reviewer"));
+        let watch_path = ci_dir.join(watch_filename("o/r", "feat"));
+        std::fs::write(&watch_path, serde_json::to_string_pretty(&watch).unwrap()).unwrap();
+        let provider = MockCiProvider::with_runs(vec![CiRun {
+            id: 4,
+            conclusion: Some("success".to_string()),
+            head_sha: "abc1234".to_string(),
+            url: "https://example/run/4".to_string(),
+        }]);
+        let registry: AgentRegistry =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(ci_check_repo(
+            &dir,
+            &watch_path,
+            "o/r",
+            "feat",
+            &["lead".to_string(), "dev".to_string()],
+            None,
+            None,
+            None,
+            None,
+            &registry,
+            &provider,
+        ))
+        .unwrap();
+        let messages = crate::inbox::drain(&dir, "reviewer");
+        let action = messages
+            .iter()
+            .find(|m| m.text.contains("[ci-ready-for-action]"))
+            .expect("chain target must have a [ci-ready-for-action] entry");
+        assert_eq!(
+            action.kind.as_deref(),
+            Some("ci-ready-for-action"),
+            "kind field must let downstream filter the chain event"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// T6 (RED→GREEN): when the chain target ALSO appears in
+    /// `subscribers` (overlap — e.g. operator opts the reviewer into
+    /// the watch alongside the dispatch chain), the agent must receive
+    /// EXACTLY ONE inbox entry — the `[ci-ready-for-action]` form
+    /// because the line 1034 dedup skip routes them out of the
+    /// subscriber fan-out. Today RED: 0 entries (PTY-only at site 3,
+    /// subscriber path skipped them, so they get nothing durable).
+    /// GREEN: 1 entry (the chain target inbox emit lands; subscriber
+    /// path still skips them; no double-fire).
+    #[test]
+    fn ci_pass_chain_target_no_double_fire_on_overlap() {
+        let dir = tmp_dir("1030-t6-chain-overlap");
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).ok();
+        let watch = watch_with_chain(Some("reviewer"));
+        let watch_path = ci_dir.join(watch_filename("o/r", "feat"));
+        std::fs::write(&watch_path, serde_json::to_string_pretty(&watch).unwrap()).unwrap();
+        let provider = MockCiProvider::with_runs(vec![CiRun {
+            id: 5,
+            conclusion: Some("success".to_string()),
+            head_sha: "abc1234".to_string(),
+            url: "https://example/run/5".to_string(),
+        }]);
+        let registry: AgentRegistry =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // Reviewer is BOTH in subscribers AND next_after_ci.
+        rt.block_on(ci_check_repo(
+            &dir,
+            &watch_path,
+            "o/r",
+            "feat",
+            &[
+                "lead".to_string(),
+                "dev".to_string(),
+                "reviewer".to_string(),
+            ],
+            None,
+            None,
+            None,
+            None,
+            &registry,
+            &provider,
+        ))
+        .unwrap();
+        let messages = crate::inbox::drain(&dir, "reviewer");
+        let from_ci: Vec<_> = messages
+            .iter()
+            .filter(|m| m.from == "system:ci")
+            .collect();
+        assert_eq!(
+            from_ci.len(),
+            1,
+            "chain target overlap must yield exactly 1 inbox entry; got: {from_ci:?}"
+        );
+        assert!(
+            from_ci[0].text.contains("[ci-ready-for-action]"),
+            "the single entry must be the chain form, not subscriber [ci-pass]: {:?}",
+            from_ci[0]
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
