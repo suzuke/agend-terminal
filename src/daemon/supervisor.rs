@@ -169,7 +169,17 @@ fn parse_unlock_at(pane_text: &str) -> Option<String> {
 
 /// Spawn the supervisor thread. Idempotent per process is the caller's
 /// responsibility — in practice each entry point calls it exactly once.
-pub fn spawn(home: PathBuf, registry: AgentRegistry) {
+///
+/// `daemon_binary_stale` is the shared TUI status-bar flag the
+/// mcp_registry_watcher tracker flips when a post-startup binary
+/// refresh is detected (#1027). Callers without a TUI (headless daemon
+/// mode) pass a throwaway `Arc<AtomicBool>` — the flag still gets set
+/// but nothing is wired to surface it.
+pub fn spawn(
+    home: PathBuf,
+    registry: AgentRegistry,
+    daemon_binary_stale: crate::daemon::mcp_registry_watcher::DaemonBinaryStale,
+) {
     // fire-and-forget: supervisor tick loop runs for the process lifetime
     // (per module-doc rationale at lines 6-8 — "shutdown is implicit: when
     // the hosting process exits, this thread dies with it"). 10s tick
@@ -177,10 +187,14 @@ pub fn spawn(home: PathBuf, registry: AgentRegistry) {
     // (per-tick metadata read + occasional channel notify).
     let _ = thread::Builder::new()
         .name("supervisor".into())
-        .spawn(move || run_loop(home, registry));
+        .spawn(move || run_loop(home, registry, daemon_binary_stale));
 }
 
-fn run_loop(home: PathBuf, registry: AgentRegistry) {
+fn run_loop(
+    home: PathBuf,
+    registry: AgentRegistry,
+    daemon_binary_stale: crate::daemon::mcp_registry_watcher::DaemonBinaryStale,
+) {
     let mut notify_tracks: HashMap<String, NotifyTrack> = HashMap::new();
     // Sprint 57 Wave 2 Track C (#546 Item 5): hydrate dedup ledger
     // from `$AGEND_HOME/dedup-state/*.json` so a daemon restart
@@ -263,7 +277,7 @@ fn run_loop(home: PathBuf, registry: AgentRegistry) {
         idle_watchdog_tracker.maybe_scan(&home);
         decision_timeout_tracker.maybe_scan(&home);
         helper_staleness_tracker.maybe_scan(&home);
-        mcp_registry_tracker.maybe_scan(&home);
+        mcp_registry_tracker.maybe_scan(&daemon_binary_stale);
         waiting_on_stale_tracker.maybe_scan(&home);
         conflict_notify_tracker.maybe_scan(&home, &registry);
         canonical_drift_tracker.maybe_scan(&home);

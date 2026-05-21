@@ -447,11 +447,22 @@ pub(super) fn render_status_bar(
     telegram: TelegramStatus,
     binary_stale: bool,
 ) {
-    // RED stub for #1027: the `binary_stale` arg threads through but is
-    // not yet rendered as a warning span. The GREEN commit appends a
-    // " ⚠ daemon binary stale (restart) " span when this is true.
-    let _ = binary_stale;
     let mut spans = Vec::new();
+
+    // #1027: operator-facing indicator for "running daemon's binary is
+    // older than the on-disk binary; restart to pick up new code".
+    // Replaces the previous inbox-emit path (which routed to agents
+    // who cannot restart the daemon). Sticky-true until process
+    // restart — see mcp_registry_watcher module-doc.
+    if binary_stale {
+        spans.push(Span::styled(
+            " ! daemon binary stale (restart) ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
 
     let mut agent_count = 0;
     let mut total = 0;

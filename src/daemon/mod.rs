@@ -578,8 +578,21 @@ fn run_core(
     // Pushes vterm tail to channel topic when an agent stalls pre-ready.
     // Fire-and-forget: detector tick loop runs for the daemon process lifetime.
     // Unix-only (the supervisor itself is Unix-only).
+    //
+    // #1027: headless daemon has no TUI to surface the binary-stale
+    // flag, so pass a throwaway Arc. The flag still flips correctly;
+    // nothing reads it. Adding a richer surface (e.g. structured event
+    // file) is future scope if operators ask for headless visibility.
     #[cfg(unix)]
-    supervisor::spawn(home.to_path_buf(), Arc::clone(&registry));
+    {
+        let daemon_binary_stale: crate::daemon::mcp_registry_watcher::DaemonBinaryStale =
+            Arc::new(std::sync::atomic::AtomicBool::new(false));
+        supervisor::spawn(
+            home.to_path_buf(),
+            Arc::clone(&registry),
+            daemon_binary_stale,
+        );
+    }
     router::spawn(home.to_path_buf(), Arc::clone(&registry));
     crate::instance_monitor::spawn_monitor_tick(home.to_path_buf(), Arc::clone(&registry));
 

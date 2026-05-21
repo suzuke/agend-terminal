@@ -144,6 +144,12 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         .unwrap_or_else(|| crate::fleet::fleet_yaml_path(&home));
 
     let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+    // #1027: shared TUI status-bar flag. supervisor's mcp_registry_watcher
+    // flips it true on post-startup binary refresh; the render loop reads
+    // it every frame to surface a warning. Sticky-true — clears only on
+    // process restart (fresh tracker = fresh `started_at`).
+    let daemon_binary_stale: crate::daemon::mcp_registry_watcher::DaemonBinaryStale =
+        Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (tui_event_tx, tui_event_rx) = crossbeam_channel::bounded::<TuiEvent>(256);
 
     // Preflight via the shared bootstrap seam so `api.cookie` is issued before
@@ -212,7 +218,11 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // the daemon already runs its own supervisor against the real registry, so
     // the app must not also poll a disjoint (empty) registry.
     if !attached_mode {
-        crate::daemon::supervisor::spawn(home.clone(), Arc::clone(&registry));
+        crate::daemon::supervisor::spawn(
+            home.clone(),
+            Arc::clone(&registry),
+            Arc::clone(&daemon_binary_stale),
+        );
         crate::instance_monitor::spawn_monitor_tick(home.clone(), Arc::clone(&registry));
         // Attached mode stays unwired: that process never owns the registry,
         // and the Telegram bot (if any) runs under the other daemon which
@@ -412,16 +422,19 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         let repeat_mode = key_handler.in_repeat();
 
         terminal.draw(|frame| {
-            // #1027 RED stub: pass `false` until the GREEN commit wires
-            // the shared `Arc<AtomicBool>` daemon_binary_stale flag from
-            // supervisor through here.
+            // #1027: snapshot the shared daemon-binary-stale flag once
+            // per frame so the render path sees a consistent value.
+            // Relaxed is enough — single-bit flag, no fence vs other
+            // state needed; the supervisor's SeqCst store will always
+            // be visible to this load before the next paint tick.
+            let binary_stale = daemon_binary_stale.load(std::sync::atomic::Ordering::Relaxed);
             render::render(
                 frame,
                 &mut layout,
                 repeat_mode,
                 &registry,
                 telegram_status,
-                false,
+                binary_stale,
             );
             // &mut because ScratchShell needs to drain output and maybe
             // resize its pane's VTerm/PTY during render.
