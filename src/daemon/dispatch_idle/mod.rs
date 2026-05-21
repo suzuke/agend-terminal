@@ -341,6 +341,28 @@ pub(crate) fn mark_resolved(home: &Path, correlation_id: &str) -> Option<String>
     }
 }
 
+/// #1047: reset the timer on a pending sidecar when the dispatchee sends
+/// a non-report message (kind=update/query) with matching correlation_id.
+/// The sidecar stays live (future silence still fires), but the threshold
+/// clock restarts from now. Returns the refreshed dispatch_id, or `None`
+/// if no matching pending sidecar exists.
+pub(crate) fn refresh_issued_at(home: &Path, correlation_id: &str) -> Option<String> {
+    if correlation_id.is_empty() {
+        return None;
+    }
+    let matched = list_pending(home)
+        .into_iter()
+        .find(|d| d.status == "pending" && d.correlation_id.as_deref() == Some(correlation_id));
+    let mut d = matched?;
+    d.issued_at = chrono::Utc::now().to_rfc3339();
+    let id = d.dispatch_id.clone();
+    if write_dispatch(home, &d) {
+        Some(id)
+    } else {
+        None
+    }
+}
+
 /// PR2 L3 visibility — per-instance dispatch metadata view.
 /// Pending sidecars where this instance is the **dispatcher**: outbound
 /// dispatches it's still waiting for replies on.
@@ -1456,6 +1478,71 @@ mod tests {
             pending.iter().any(|p| p.dispatch_id == id_dispatcher_role),
             "dispatcher-role sidecar untouched"
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #1047: refresh_issued_at (kind=update/query timer reset) ──
+
+    /// #1047 T1: dispatchee sends kind=update within threshold → timer
+    /// resets → subsequent scan_and_emit does NOT fire at the original
+    /// threshold boundary.
+    #[test]
+    fn t1047_refresh_issued_at_prevents_false_positive() {
+        let home = tmp_home("1047-refresh");
+        let issued = chrono::Utc::now() - chrono::Duration::seconds(550);
+        write_pending_at(&home, "lead", "dev", Some("t-1047-a"), "task", 600, issued);
+        // Dispatchee sends update → timer resets.
+        let refreshed = refresh_issued_at(&home, "t-1047-a");
+        assert!(refreshed.is_some(), "refresh must locate sidecar");
+        // Now 600s hasn't elapsed from the refreshed issued_at.
+        scan_and_emit(&home);
+        let inbox = crate::inbox::drain(&home, "lead");
+        assert!(
+            !inbox
+                .iter()
+                .any(|m| m.kind.as_deref() == Some("dispatch_idle_threshold_exceeded")),
+            "#1047: refreshed sidecar must NOT fire: {inbox:?}"
+        );
+        let pending = list_pending(&home);
+        assert!(
+            pending.iter().any(|p| p.status == "pending"),
+            "sidecar must remain pending after refresh"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1047 T2: dispatchee silent past threshold → fire (regression preserved).
+    #[test]
+    fn t1047_silent_dispatchee_still_fires() {
+        let home = tmp_home("1047-silent");
+        let issued = chrono::Utc::now() - chrono::Duration::seconds(700);
+        write_pending_at(&home, "lead", "dev", Some("t-1047-b"), "task", 600, issued);
+        // No refresh — dispatchee is silent.
+        scan_and_emit(&home);
+        let inbox = crate::inbox::drain(&home, "lead");
+        assert!(
+            inbox
+                .iter()
+                .any(|m| m.kind.as_deref() == Some("dispatch_idle_threshold_exceeded")),
+            "#1047 regression: silent dispatchee must still fire: {inbox:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1047 T3: kind=report still fully closes sidecar (status=resolved).
+    #[test]
+    fn t1047_report_still_resolves() {
+        let home = tmp_home("1047-report");
+        let issued = chrono::Utc::now() - chrono::Duration::seconds(550);
+        write_pending_at(&home, "lead", "dev", Some("t-1047-c"), "task", 600, issued);
+        let resolved = mark_resolved(&home, "t-1047-c");
+        assert!(resolved.is_some(), "report must resolve sidecar");
+        let pending = list_pending(&home);
+        let d = pending
+            .iter()
+            .find(|p| p.correlation_id.as_deref() == Some("t-1047-c"))
+            .unwrap();
+        assert_eq!(d.status, "resolved", "kind=report must set status=resolved");
         std::fs::remove_dir_all(&home).ok();
     }
 }

@@ -422,6 +422,12 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
         if let Some(corr) = msg.correlation_id.as_deref() {
             let _ = crate::daemon::dispatch_idle::mark_resolved(ctx.home, corr);
         }
+    } else if matches!(kind_str, "update" | "query") {
+        // #1047: non-report messages from dispatchee signal liveness —
+        // reset the threshold timer without closing the sidecar.
+        if let Some(corr) = msg.correlation_id.as_deref() {
+            let _ = crate::daemon::dispatch_idle::refresh_issued_at(ctx.home, corr);
+        }
     }
 
     let mut resp = json!({"ok": true, "delivery_mode": delivery_mode});
