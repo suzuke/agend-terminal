@@ -492,13 +492,14 @@ pub(crate) fn dedupe_notifications_by_head_sha<'a>(
     }
     let mut result: Vec<_> = best
         .into_iter()
-        .filter(|(sha, (idx, _))| {
+        .filter(|(sha, (_idx, _))| {
             if last_notified_sha != Some(*sha) {
                 return true; // different sha → always pass
             }
-            // Same sha as last notified — #786: allow through only
-            // when conclusion changed (rerun / re-scheduled run).
-            runs[*idx].conclusion.as_deref() != last_notified_conclusion
+            // #1042: compare AGGREGATE conclusion (not individual run's)
+            // against last_notified_conclusion — the fan-out persists
+            // the aggregate, so dedup must match the same value.
+            aggregate_conclusion_for_sha(runs, sha) != last_notified_conclusion
         })
         .map(|(sha, (idx, id))| (idx, id, sha))
         .collect();
@@ -1867,7 +1868,6 @@ mod tests {
     /// every poll cycle → re-broadcast. Post-fix, the filter compares
     /// aggregates and correctly blocks.
     #[test]
-    #[ignore = "RED: fails without #1042 fix — remove ignore in GREEN commit"]
     fn test_1042_same_sha_same_aggregate_suppresses_rebroadcast() {
         let runs = vec![
             CiRun {
