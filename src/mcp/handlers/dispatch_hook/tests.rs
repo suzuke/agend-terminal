@@ -1354,6 +1354,178 @@ fn dispatch_auto_bind_lease_sets_next_after_ci_from_dispatch_hook_931() {
 }
 
 #[test]
+#[cfg(unix)]
+fn dispatch_auto_derives_next_after_ci_from_team_reviewer_convention_1037() {
+    // #1037 RED→GREEN: when the dispatcher does NOT explicitly pass
+    // `next_after_ci`, the daemon auto-derives the chain target from
+    // the target's team using the `<team>-reviewer` naming convention.
+    //
+    // Empirical motivation (lead 2026-05-21): the post-#1030 wake-aware
+    // fix never triggered on real fixup-team PRs because lead's
+    // send(kind=task) MCP calls never set `next_after_ci=fixup-reviewer`
+    // in the args. The wire path propagates the field correctly (per
+    // `dispatch_auto_bind_lease_sets_next_after_ci_from_dispatch_hook_931`)
+    // — the gap is the caller didn't know to set it. Auto-derive
+    // closes the loop without requiring a per-call burden.
+    //
+    // REGRESSION-PROOF: revert the auto-derive lookup → this test
+    // FAILS because `watch["next_after_ci"]` reads as `null` instead
+    // of `"val-reviewer"` (the team's reviewer-suffixed member).
+    let parent = std::env::temp_dir().join(format!(
+        "agend-1037-auto-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let (home, _canonical) = p781_canonical_with_team_source_repo(
+        &parent,
+        "feat/1037-auto-derive",
+        true,
+        "val",
+        // val-reviewer present in team → convention match.
+        &["val-dev", "val-reviewer"],
+    );
+
+    // Dispatch WITHOUT explicit next_after_ci. Pre-#1037 this leaves
+    // the sidecar with no next_after_ci field; post-#1037 the daemon
+    // scans val-dev's team members, finds "val-reviewer" by the
+    // `-reviewer` suffix convention, and propagates it.
+    let r = super::dispatch_auto_bind_lease_with_chain(
+        &home,
+        "val-dev",
+        "T-1037-auto",
+        "feat/1037-auto-derive",
+        None,
+        None, // ← no explicit next_after_ci — the field this test pins.
+    );
+    assert!(
+        r.is_ok(),
+        "dispatch_auto_bind_lease_with_chain must succeed: {:?}",
+        r.err()
+    );
+
+    let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(
+        crate::daemon::ci_watch::watch_filename("owner/repo", "feat/1037-auto-derive"),
+    );
+    assert!(watch_path.exists(), "ci_watches armed by dispatch");
+
+    let watch: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&watch_path).expect("read watch"))
+            .expect("parse watch");
+    assert_eq!(
+        watch["next_after_ci"].as_str(),
+        Some("val-reviewer"),
+        "#1037 GREEN: dispatch must auto-derive next_after_ci from \
+         `<team>-reviewer` convention when caller omits the arg. \
+         Got: {watch}"
+    );
+
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn dispatch_auto_derive_no_reviewer_in_team_leaves_next_after_ci_none_1037() {
+    // #1037 negative case: if the target's team has NO member matching
+    // the `<team>-reviewer` convention, auto-derive leaves
+    // next_after_ci as None. This preserves the pre-#1037 behavior for
+    // teams that don't follow the naming convention — no behavior
+    // regression for legacy / atypical team layouts.
+    let parent = std::env::temp_dir().join(format!(
+        "agend-1037-no-reviewer-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let (home, _canonical) = p781_canonical_with_team_source_repo(
+        &parent,
+        "feat/1037-no-reviewer",
+        true,
+        "val",
+        // No -reviewer member in team. Auto-derive should leave the
+        // field absent rather than picking a non-reviewer member.
+        &["val-dev", "val-lead"],
+    );
+
+    let r = super::dispatch_auto_bind_lease_with_chain(
+        &home,
+        "val-dev",
+        "T-1037-no-reviewer",
+        "feat/1037-no-reviewer",
+        None,
+        None,
+    );
+    assert!(r.is_ok(), "dispatch must succeed: {:?}", r.err());
+
+    let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(
+        crate::daemon::ci_watch::watch_filename("owner/repo", "feat/1037-no-reviewer"),
+    );
+    let watch: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&watch_path).expect("read watch"))
+            .expect("parse watch");
+    assert!(
+        watch["next_after_ci"].as_str().is_none(),
+        "#1037: team without `-reviewer` member must leave \
+         next_after_ci unset; got: {watch}"
+    );
+
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn dispatch_explicit_next_after_ci_overrides_auto_derive_1037() {
+    // #1037 precedence: when caller explicitly passes next_after_ci,
+    // that value wins over the auto-derive fallback. The auto-derive
+    // is a fallback for the "caller didn't bother" case, not a
+    // mandate that overrides explicit intent.
+    let parent = std::env::temp_dir().join(format!(
+        "agend-1037-override-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let (home, _canonical) = p781_canonical_with_team_source_repo(
+        &parent,
+        "feat/1037-override",
+        true,
+        "val",
+        &["val-dev", "val-reviewer"],
+    );
+
+    // Explicit arg differs from the convention-match. Explicit wins.
+    let r = super::dispatch_auto_bind_lease_with_chain(
+        &home,
+        "val-dev",
+        "T-1037-override",
+        "feat/1037-override",
+        None,
+        Some("val-lead"),
+    );
+    assert!(r.is_ok(), "dispatch must succeed: {:?}", r.err());
+
+    let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(
+        crate::daemon::ci_watch::watch_filename("owner/repo", "feat/1037-override"),
+    );
+    let watch: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&watch_path).expect("read watch"))
+            .expect("parse watch");
+    assert_eq!(
+        watch["next_after_ci"].as_str(),
+        Some("val-lead"),
+        "#1037: explicit next_after_ci arg must override auto-derive; got: {watch}"
+    );
+
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+#[test]
 fn teams_json_migration_preserves_existing_fleet_yaml_source_repo() {
     // Test 9 (invariant guard, Piece 1): the migration must NOT
     // overwrite an existing fleet.yaml team entry — if operator hand-
