@@ -139,49 +139,11 @@ pub fn emit_ci_conflict_alert(
     subscribers: &[String],
     source: &str,
 ) {
-    let body = format!(
-        "[ci-conflict-detected] {repo}@{branch}: PR is CONFLICTING with base. \
-         CI workflow trigger blocked until rebase. \
-         URL: https://github.com/{repo}/pulls?q=is%3Apr+head%3A{branch} \
-         (source: {source})"
-    );
+    // #1032: build the InboxMessage via the shared helper so the
+    // GREEN swap to enqueue_with_idle_hint is a single-LOC diff and
+    // tests + production see identical bytes.
     for sub in subscribers {
-        let _ = crate::inbox::enqueue(
-            home,
-            sub,
-            crate::inbox::InboxMessage {
-                schema_version: 0,
-                id: None,
-                read_at: None,
-                thread_id: None,
-                parent_id: None,
-                task_id: None,
-                force_meta: None,
-                // #946: stable grep target for operators tracing
-                // notifications back to a specific watch. Uses canonical
-                // (post-#942) `{repo}@{branch}` form — survives future
-                // hash-scheme migrations because it's the logical
-                // identity, not the storage filename hash.
-                correlation_id: Some(format!("{repo}@{branch}")),
-                reviewed_head: None,
-                from: "system:ci".to_string(),
-                text: body.clone(),
-                kind: Some("ci-watch".to_string()),
-                timestamp: chrono::Utc::now().to_rfc3339(),
-                channel: None,
-                delivery_mode: None,
-                attachments: vec![],
-                in_reply_to_msg_id: None,
-                in_reply_to_excerpt: None,
-                superseded_by: None,
-                from_id: None,
-                broadcast_context: None,
-                sequencing: None,
-                eta_minutes: None,
-                reporting_cadence: None,
-                worktree_binding_required: None,
-            },
-        );
+        let _ = crate::inbox::enqueue(home, sub, make_ci_conflict_alert_msg(repo, branch, source));
     }
 }
 
@@ -621,6 +583,91 @@ fn ci_notification_message(
     Some(msg)
 }
 
+/// Build the `[ci-conflict-detected]` inbox message produced by
+/// `emit_ci_conflict_alert` (#1032). Pulled out of the inline construct
+/// at the call site so the production emit and the deterministic-hint
+/// test see identical bytes — same pattern as
+/// [`make_ci_ready_for_action_msg`].
+pub(crate) fn make_ci_conflict_alert_msg(
+    repo: &str,
+    branch: &str,
+    source: &str,
+) -> crate::inbox::InboxMessage {
+    let body = format!(
+        "[ci-conflict-detected] {repo}@{branch}: PR is CONFLICTING with base. \
+         CI workflow trigger blocked until rebase. \
+         URL: https://github.com/{repo}/pulls?q=is%3Apr+head%3A{branch} \
+         (source: {source})"
+    );
+    crate::inbox::InboxMessage {
+        schema_version: 0,
+        id: None,
+        read_at: None,
+        thread_id: None,
+        parent_id: None,
+        task_id: None,
+        force_meta: None,
+        // #946: stable grep target — canonical `{repo}@{branch}` form.
+        correlation_id: Some(format!("{repo}@{branch}")),
+        reviewed_head: None,
+        from: "system:ci".to_string(),
+        text: body,
+        kind: Some("ci-watch".to_string()),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        channel: None,
+        delivery_mode: None,
+        attachments: vec![],
+        in_reply_to_msg_id: None,
+        in_reply_to_excerpt: None,
+        superseded_by: None,
+        from_id: None,
+        broadcast_context: None,
+        sequencing: None,
+        eta_minutes: None,
+        reporting_cadence: None,
+        worktree_binding_required: None,
+    }
+}
+
+/// Build the `[ci-stale]` inbox message emitted when a CI run's head
+/// SHA is no longer the branch's current head (#745 stale-SHA drop,
+/// migrated to wake-aware path in #1032).
+pub(crate) fn make_ci_stale_drop_msg(
+    repo: &str,
+    branch: &str,
+    stale_sha: &str,
+    current_sha: &str,
+) -> crate::inbox::InboxMessage {
+    crate::inbox::InboxMessage {
+        schema_version: 0,
+        id: None,
+        read_at: None,
+        thread_id: None,
+        parent_id: None,
+        task_id: None,
+        force_meta: None,
+        // #946: see emit_ci_conflict_alert for rationale.
+        correlation_id: Some(format!("{repo}@{branch}")),
+        reviewed_head: None,
+        from: "system:ci".to_string(),
+        text: format!("[ci-stale] {repo}@{branch} ({stale_sha}): superseded by {current_sha}"),
+        kind: Some("ci-stale".to_string()),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        channel: None,
+        delivery_mode: None,
+        attachments: vec![],
+        in_reply_to_msg_id: None,
+        in_reply_to_excerpt: None,
+        superseded_by: None,
+        from_id: None,
+        broadcast_context: None,
+        sequencing: None,
+        eta_minutes: None,
+        reporting_cadence: None,
+        worktree_binding_required: None,
+    }
+}
+
 /// Build the `[ci-ready-for-action]` inbox message handed to the
 /// `next_after_ci` chain target on CI pass (#1030). Single construction
 /// site so the production emit and the deterministic-hint test (T4)
@@ -976,40 +1023,14 @@ async fn ci_check_repo(
                 current_sha,
                 "dropping stale CI notification (newer commit on branch)"
             );
+            // #1032: build the InboxMessage via the shared helper so
+            // the GREEN swap to enqueue_with_idle_hint is a single-LOC
+            // diff and tests + production see identical bytes.
             for sub in subscribers {
                 let _ = crate::inbox::enqueue(
                     home,
                     sub,
-                    crate::inbox::InboxMessage {
-                        schema_version: 0,
-                        id: None,
-                        read_at: None,
-                        thread_id: None,
-                        parent_id: None,
-                        task_id: None,
-                        force_meta: None,
-                        // #946: see emit_ci_conflict_alert for rationale.
-                        correlation_id: Some(format!("{repo}@{branch}")),
-                        reviewed_head: None,
-                        from: "system:ci".to_string(),
-                        text: format!(
-                            "[ci-stale] {repo}@{branch} ({sha}): superseded by {current_sha}"
-                        ),
-                        kind: Some("ci-stale".to_string()),
-                        timestamp: chrono::Utc::now().to_rfc3339(),
-                        channel: None,
-                        delivery_mode: None,
-                        attachments: vec![],
-                        in_reply_to_msg_id: None,
-                        in_reply_to_excerpt: None,
-                        superseded_by: None,
-                        from_id: None,
-                        broadcast_context: None,
-                        sequencing: None,
-                        eta_minutes: None,
-                        reporting_cadence: None,
-                        worktree_binding_required: None,
-                    },
+                    make_ci_stale_drop_msg(repo, branch, sha, current_sha),
                 );
             }
             new_notified_sha = Some(sha.to_string());
@@ -3677,6 +3698,69 @@ mod tests {
             !messages.iter().any(|m| m.text.contains("[ci-pass]")),
             "reviewer must NOT receive a [ci-pass] subscriber entry; got: {messages:?}"
         );
+    }
+
+    /// #1032 T1: `make_ci_conflict_alert_msg` produces an InboxMessage
+    /// whose `enqueue_with_idle_hint_with_emitter` invocation yields a
+    /// canonical `[AGEND-MSG-PENDING]` hint. The GREEN swap at site 149
+    /// (`emit_ci_conflict_alert`) wires this helper through
+    /// `enqueue_with_idle_hint`, restoring the wake signal that bare
+    /// `enqueue` was silently dropping.
+    #[test]
+    fn ci_conflict_alert_hint_format_deterministic() {
+        let dir = tmp_dir("1032-t1-conflict-hint");
+        std::fs::create_dir_all(&dir).unwrap();
+        let msg = super::make_ci_conflict_alert_msg("o/r", "feat", "poll-transition");
+        assert_eq!(msg.kind.as_deref(), Some("ci-watch"));
+        assert!(msg.text.contains("[ci-conflict-detected]"));
+        let captured: std::sync::Arc<parking_lot::Mutex<Option<String>>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(None));
+        let cap = captured.clone();
+        crate::inbox::enqueue_with_idle_hint_with_emitter(&dir, "agent1", msg, move |hint| {
+            *cap.lock() = Some(hint.to_string());
+        })
+        .unwrap();
+        let hint = captured.lock().clone().expect("emitter must fire once");
+        assert!(
+            hint.contains("kind=ci-watch"),
+            "conflict hint must carry kind=ci-watch for downstream filtering; got: {hint}"
+        );
+        assert!(
+            hint.contains("from=system:ci"),
+            "conflict hint must carry from=system:ci for routing; got: {hint}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #1032 T2: `make_ci_stale_drop_msg` mirrors T1's invariant for
+    /// the stale-SHA drop path (#745, site 940). GREEN at site 980
+    /// wires this helper through `enqueue_with_idle_hint`.
+    #[test]
+    fn ci_stale_drop_hint_format_deterministic() {
+        let dir = tmp_dir("1032-t2-stale-hint");
+        std::fs::create_dir_all(&dir).unwrap();
+        let msg = super::make_ci_stale_drop_msg("o/r", "feat", "oldhead", "newhead");
+        assert_eq!(msg.kind.as_deref(), Some("ci-stale"));
+        assert!(msg.text.contains("[ci-stale]"));
+        assert!(msg.text.contains("oldhead"));
+        assert!(msg.text.contains("newhead"));
+        let captured: std::sync::Arc<parking_lot::Mutex<Option<String>>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(None));
+        let cap = captured.clone();
+        crate::inbox::enqueue_with_idle_hint_with_emitter(&dir, "agent1", msg, move |hint| {
+            *cap.lock() = Some(hint.to_string());
+        })
+        .unwrap();
+        let hint = captured.lock().clone().expect("emitter must fire once");
+        assert!(
+            hint.contains("kind=ci-stale"),
+            "stale-drop hint must carry kind=ci-stale; got: {hint}"
+        );
+        assert!(
+            hint.contains("from=system:ci"),
+            "stale-drop hint must carry from=system:ci; got: {hint}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// T4 (deterministic hint delivery via test seam):
