@@ -265,6 +265,21 @@ pub fn promote_capture(
     scenario_name: &str,
     opts: &PromoteOptions<'_>,
 ) -> anyhow::Result<()> {
+    promote_capture_into(capture_path, scenario_name, opts, None)
+}
+
+/// Test-seam variant that accepts an explicit `project_root` to scope
+/// the destination + manifest paths under. Production path
+/// (`promote_capture`) passes `None` to land at CWD-relative
+/// `tests/fixtures/state-replay/`. Tests pass a `tmp` root so per-
+/// test fs state is isolated without touching process CWD (which is
+/// not thread-safe on Windows when tests run concurrently).
+pub fn promote_capture_into(
+    capture_path: &Path,
+    scenario_name: &str,
+    opts: &PromoteOptions<'_>,
+    project_root: Option<&Path>,
+) -> anyhow::Result<()> {
     let meta_path = {
         let mut s = capture_path.to_path_buf().into_os_string();
         s.push(".meta.json");
@@ -275,10 +290,16 @@ pub fn promote_capture(
     let meta: CaptureMeta =
         serde_json::from_str(&meta_json).map_err(|e| anyhow::anyhow!("invalid meta JSON: {e}"))?;
 
-    let dest_dir = PathBuf::from(PROMOTE_DEST_DIR);
+    let dest_dir = project_root
+        .map(|r| r.join(PROMOTE_DEST_DIR))
+        .unwrap_or_else(|| PathBuf::from(PROMOTE_DEST_DIR));
     std::fs::create_dir_all(&dest_dir)?;
     let dest = dest_dir.join(format!("{scenario_name}.raw"));
     std::fs::copy(capture_path, &dest)?;
+
+    let manifest_path = project_root
+        .map(|r| r.join(PROMOTE_MANIFEST_PATH))
+        .unwrap_or_else(|| PathBuf::from(PROMOTE_MANIFEST_PATH));
 
     let recorded_on = meta
         .started_at
@@ -287,7 +308,7 @@ pub fn promote_capture(
         .unwrap_or(&meta.started_at)
         .to_string();
     let entry = format_manifest_entry(scenario_name, &meta.backend, &recorded_on, opts);
-    append_manifest_entry(Path::new(PROMOTE_MANIFEST_PATH), &entry)?;
+    append_manifest_entry(&manifest_path, &entry)?;
 
     println!(
         "promoted: {} → {}  ({} bytes, backend={}, scenario_kind={})",
@@ -297,7 +318,7 @@ pub fn promote_capture(
         meta.backend,
         opts.scenario_kind.as_manifest_str(),
     );
-    println!("manifest: appended entry to {PROMOTE_MANIFEST_PATH}");
+    println!("manifest: appended entry to {}", manifest_path.display());
 
     if opts.auto_replay {
         match auto_replay_warn_mismatch(&dest, opts) {
@@ -417,7 +438,14 @@ mod tests {
     use serial_test::serial;
 
     fn tmp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("agend-capture-unit-{tag}"));
+        // #704 PR1a: include pid + nanos so concurrent test threads
+        // never collide on the same tmp dir (Windows file-locking
+        // intolerant of cross-test reuse).
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let pid = std::process::id();
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("agend-capture-unit-{tag}-{pid}-{seq}"));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -527,11 +555,10 @@ mod tests {
         (cap, meta)
     }
 
-    /// Drive `promote_capture` from inside a tmp working directory so
-    /// the relative `tests/fixtures/state-replay/...` destination
-    /// resolves under the tmp dir (matching the production CWD-
-    /// relative contract). Returns the resolved `(dest_raw,
-    /// manifest_path)` for inspection.
+    /// Drive `promote_capture_into` against a tmp project root so each
+    /// test's filesystem state is isolated. Avoids set_current_dir
+    /// (not thread-safe on Windows when tests run in parallel).
+    /// Returns the resolved `(dest_raw, manifest_path)` for inspection.
     fn run_promote_in_tmp(
         tmp: &Path,
         backend: &str,
@@ -546,11 +573,7 @@ mod tests {
         let manifest_path = manifest_parent.join("MANIFEST.yaml");
         std::fs::write(&manifest_path, "fixtures:\n").unwrap();
 
-        let prev_cwd = std::env::current_dir().unwrap();
-        std::env::set_current_dir(tmp).unwrap();
-        let result = promote_capture(&cap, scenario_name, &opts);
-        std::env::set_current_dir(&prev_cwd).unwrap();
-        result.unwrap();
+        promote_capture_into(&cap, scenario_name, &opts, Some(tmp)).unwrap();
 
         let dest = tmp
             .join("tests/fixtures/state-replay")
