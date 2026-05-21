@@ -683,6 +683,69 @@ fn p778_setup_source_repo(parent: &Path, branch: &str) -> std::path::PathBuf {
 
 #[test]
 #[cfg(unix)]
+fn checkout_bind_true_auto_derives_next_after_ci_from_team_1040() {
+    // #1040 RED→GREEN: when `repo action=checkout bind=true` arms a
+    // ci-watch sidecar, the team's `<team>-reviewer` member should be
+    // auto-derived into `next_after_ci` — same convention as the
+    // #1037 dispatch-side auto-derive, applied at the checkout path.
+    //
+    // Empirical motivation (per /tmp/dialectic-1040-primary-dev.md):
+    // `handle_checkout_repo:158-162` calls `handle_watch_ci` directly
+    // with only `{repo, branch}` args, bypassing
+    // `dispatch_auto_bind_lease_with_source_and_chain` entirely. The
+    // #1037 auto-derive helper lives inside the bypassed wrapper, so
+    // every modern fixup-team PR (#1027 through #1031, all of which
+    // used `repo action=checkout bind=true` at task-claim time) armed
+    // sidecars with `next_after_ci=None`.
+    //
+    // REGRESSION-PROOF: revert the `derive_team_reviewer` call at
+    // handle_checkout_repo line 158 → this assertion FAILS because
+    // `watch["next_after_ci"]` reads as null instead of `"val-reviewer"`.
+    let home = p778_tmp_home("1040-derive");
+    let parent = p778_tmp_home("1040-derive-src");
+    let source = p778_setup_source_repo(&parent, "feat/1040-derive");
+    let agent = "val-dev";
+
+    // Seed fleet.yaml with team `val` containing `val-dev` + `val-reviewer`.
+    // The auto-derive scans the target's team for a `*-reviewer` member.
+    let yaml = format!(
+        "instances: {{}}\nteams:\n  val:\n    members:\n      - val-dev\n      - val-reviewer\n    source_repo: {}\n",
+        source.display()
+    );
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
+
+    let resp = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "source": source.display().to_string(),
+            "branch": "feat/1040-derive",
+            "bind": true,
+        }),
+        agent,
+    );
+    assert!(resp.get("error").is_none(), "checkout must succeed: {resp}");
+
+    let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(
+        crate::daemon::ci_watch::watch_filename("owner/repo", "feat/1040-derive"),
+    );
+    assert!(watch_path.exists(), "ci-watch sidecar must be armed");
+
+    let watch: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&watch_path).expect("read watch"))
+            .expect("parse watch");
+    assert_eq!(
+        watch["next_after_ci"].as_str(),
+        Some("val-reviewer"),
+        "#1040 GREEN: checkout-bound watch must auto-derive next_after_ci \
+         from team `<team>-reviewer` convention. Got: {watch}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+#[test]
+#[cfg(unix)]
 fn checkout_bind_true_writes_binding_marker_and_arms_watch() {
     // Empirical regression-proof anchor for #778 Option 1.
     let home = p778_tmp_home("ok");
