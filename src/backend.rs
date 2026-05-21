@@ -309,6 +309,22 @@ impl Backend {
                     // Down moves to "Yes, I accept", Enter confirms
                     // Keys sent with per-byte delay in try_dismiss_dialog
                     // Issue #468: anchored regex (see ClaudeCode comment above).
+                    //
+                    // #996 Phase 2a empirical verification (2026-05-21):
+                    // byte-level analysis of `tests/fixtures/state-replay/
+                    // kiro-tooluse.raw` confirms the modal opens with the
+                    // `❯` cursor marker + magenta SGR (\x1b[38;2;255;0;255m)
+                    // on "No, exit" (destructive default). State 2 in the
+                    // same fixture shows the marker shifted to "Yes, I
+                    // accept" after a Down-arrow press. The current
+                    // `\x1b[B\r` (Down + Enter) keystroke correctly walks
+                    // off the destructive default before confirming —
+                    // unlike ClaudeCode `Yes, I trust` (which Phase 1
+                    // #1001 fixed by changing to bare `\r` because that
+                    // backend's modern modal defaults the cursor on the
+                    // SAFE option). Do NOT collapse this to bare `\r` —
+                    // see `kiro_no_exit_dismiss_uses_down_then_enter` test
+                    // for the regression pin.
                     (r"(?m)^[^A-Za-z\n]{0,8}No, exit", b"\x1b[B\r"),
                 ],
                 fresh_args: None, // same as args
@@ -1094,6 +1110,56 @@ mod tests {
         assert!(
             !trust.1.contains(&0x1b),
             "#996: trust dismiss keystroke must not contain ESC (0x1b)"
+        );
+    }
+
+    /// #996 Phase 2a: KiroCli `No, exit` dismiss must send Down + Enter
+    /// (`\x1b[B\r`), NOT bare Enter. Empirical evidence from
+    /// `tests/fixtures/state-replay/kiro-tooluse.raw` (byte offsets 5900 +
+    /// 6691): the modal opens with the `❯` cursor marker on "No, exit"
+    /// (destructive default). Bare Enter would EXIT kiro. Down-arrow
+    /// walks the cursor to "Yes, I accept" before Enter confirms.
+    ///
+    /// This regression pin guards against a future "simplify to bare \r"
+    /// refactor (mirror of #1001 / ClaudeCode `Yes, I trust`) that would
+    /// be CORRECT for claude but WRONG for kiro — the empirical default
+    /// cursor on this backend is the destructive option, not the safe
+    /// one. See backend.rs comment block at the dismiss_patterns entry.
+    #[test]
+    fn kiro_no_exit_dismiss_uses_down_then_enter() {
+        let kiro = Backend::KiroCli.preset();
+        let entry = kiro
+            .dismiss_patterns
+            .iter()
+            .find(|(re, _)| re.contains("No, exit"))
+            .expect("KiroCli must have a `No, exit` dismiss pattern");
+
+        // Positive pin: exact keystroke shape Down + Enter
+        assert_eq!(
+            entry.1, b"\x1b[B\r",
+            "#996 Phase 2a: kiro trust-all-tools dismiss must walk off the \
+             destructive default (\\x1b[B = Down) before confirming (\\r). \
+             Empirical evidence: kiro-tooluse.raw byte offsets 5900 + 6691 \
+             show the modal opens with cursor on `No, exit`."
+        );
+
+        // Negative pin: must NOT collapse to bare Enter — that would EXIT kiro
+        // on the empirically-verified destructive default.
+        assert_ne!(
+            entry.1, b"\r",
+            "#996 Phase 2a regression guard: bare Enter would select kiro's \
+             destructive default (`No, exit`). Verify `kiro-tooluse.raw` \
+             fixture before changing the keystroke shape."
+        );
+
+        // Negative pin: must START with ESC + `[B` (Down arrow CSI), not
+        // some other CSI sequence. Defends against off-by-one keystroke
+        // typos like `\x1b[A` (Up — wrong direction).
+        assert!(
+            entry.1.starts_with(b"\x1b[B"),
+            "#996 Phase 2a: keystroke must start with Down-arrow CSI \
+             (\\x1b[B), got: {:?}",
+            entry.1
         );
     }
 
