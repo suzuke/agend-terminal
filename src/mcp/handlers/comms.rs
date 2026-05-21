@@ -262,9 +262,6 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
             msg.push_str(&format!("\n\n⚠️ FORCED (reason: {r})"));
         }
     }
-    if let Some(tid) = args["task_id"].as_str() {
-        msg.push_str(&format!(" (task id: {tid})"));
-    }
     if let Some(criteria) = args["success_criteria"].as_str() {
         msg.push_str(&format!("\n\nSuccess criteria: {criteria}"));
     }
@@ -283,15 +280,10 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
     } else {
         None
     };
-    let task_id_str = args["task_id"].as_str();
 
     // Sprint 53 P0-1+P0-2: lease + watch_ci gate BEFORE send (Q2 ordering fix).
-    // P0-2: auto-fires watch_ci inside dispatch_auto_bind_lease (replaces
-    // post-SEND Hotfix C #451). Sprint 55 P0-C: `bind: false` arg skips the
-    // auto-bind for read-only RCA/audit/design tasks; absence defaults to
-    // current auto-bind-on-branch behavior (50+ existing sites preserved).
     if let Some(branch) = args["branch"].as_str() {
-        let task_id_val = task_id_str.unwrap_or("");
+        let task_id_val = args["task_id"].as_str().unwrap_or("");
         if dispatch_should_skip_auto_bind(args) {
             tracing::info!(
                 %target, %branch, task_id = %task_id_val,
@@ -299,13 +291,6 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
             );
         } else {
             let repo_arg = args["repo"].as_str();
-            // #931 Fix 2 (H5a): forward `next_after_ci` from the
-            // dispatcher's chain knowledge so the auto-armed ci-watch
-            // carries the handoff target. Pre-#931 this arg was dropped
-            // — operators had to issue a manual follow-up
-            // `ci action=watch next_after_ci=…`. Combined with the
-            // release-time subscriber sweep (#931 Fix 1), the missing
-            // chain target caused 4-in-a-row PR stalls overnight.
             let next_after_ci_arg = args["next_after_ci"].as_str();
             if let Err(e) = super::dispatch_hook::dispatch_auto_bind_lease_with_chain(
                 home,
@@ -318,6 +303,46 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
                 return json!({"ok": false, "error": format!("dispatch rejected: {e}")});
             }
         }
+    }
+
+    // #1050: auto-create board task after ALL rejectable checks pass
+    // (validation, busy gate, lease/bind). Only for single-target with
+    // empty task_id and sender != target. Task creation is the
+    // dispatch-commit step — no orphan tasks on any rejection path.
+    let (effective_task_id, auto_created_task_id): (Option<String>, Option<String>) =
+        if args["task_id"].as_str().unwrap_or("").is_empty() && *sender != target {
+            let auto_title = args["message"]
+                .as_str()
+                .or_else(|| args["task"].as_str())
+                .unwrap_or("(untitled dispatch)")
+                .chars()
+                .take(80)
+                .collect::<String>();
+            let create_args = json!({
+                "action": "create",
+                "title": auto_title,
+                "assignee": target,
+                "branch": args["branch"].as_str(),
+                "priority": "normal",
+            });
+            let task_result = crate::tasks::handle(home, sender.as_str(), &create_args);
+            match task_result["id"].as_str() {
+                Some(id) => {
+                    crate::daemon::task_progress::touch(
+                        home,
+                        id,
+                        crate::daemon::task_progress::ProgressSource::Broadcast,
+                    );
+                    (Some(id.to_string()), Some(id.to_string()))
+                }
+                None => (None, None),
+            }
+        } else {
+            (args["task_id"].as_str().map(String::from), None)
+        };
+    let task_id_str = effective_task_id.as_deref();
+    if let Some(tid) = task_id_str {
+        msg.push_str(&format!(" (task id: {tid})"));
     }
 
     let result = match crate::api::call(
@@ -406,6 +431,11 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
                 "warning".into(),
                 json!("interrupt/reason fields deprecated, use force/force_reason; will be removed Sprint 11"),
             );
+        }
+    }
+    if let Some(tid) = auto_created_task_id {
+        if let Some(obj) = result.as_object_mut() {
+            obj.insert("auto_created_task_id".into(), json!(tid));
         }
     }
     result

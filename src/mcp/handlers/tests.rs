@@ -2640,7 +2640,7 @@ fn bandaid_removed_invariant() {
 // ─────────────────────────────────────────────────────────────────
 
 #[test]
-fn send_kind_task_without_task_id_rejects_with_clear_error() {
+fn send_kind_task_auto_create_puts_task_on_board() {
     let _g = fleet_test_guard();
     let (_rec, home) = setup_recorder("anti-stall-no-id");
 
@@ -2651,19 +2651,95 @@ fn send_kind_task_without_task_id_rejects_with_clear_error() {
             "task": "do the thing",
             "message": "do the thing",
             "request_kind": "task",
-            // task_id intentionally omitted
         }),
         "sender",
     );
-    let err = result["error"].as_str().unwrap_or("");
-    let code = result["code"].as_str().unwrap_or("");
     assert!(
-        err.contains("task_id"),
-        "rejection must mention task_id: {result}"
+        result.get("error").is_none(),
+        "#1050: must auto-create, not reject: {result}"
     );
-    assert_eq!(
-        code, "task_id_required",
-        "rejection must surface structured code: {result}"
+    let auto_tid = result["auto_created_task_id"].as_str().unwrap();
+    let board = handle_tool("task", &json!({"action": "list"}), "sender");
+    let tasks = board["tasks"].as_array().expect("task list");
+    assert!(
+        tasks.iter().any(|t| t["id"].as_str() == Some(auto_tid)),
+        "#1050: auto-created task must appear on board: {board}"
+    );
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn send_kind_task_missing_target_no_orphan_task() {
+    let _g = fleet_test_guard();
+    let (_rec, home) = setup_recorder("no-orphan-missing");
+
+    let result = handle_tool(
+        "send",
+        &json!({
+            "message": "do",
+            "request_kind": "task",
+        }),
+        "sender",
+    );
+    assert!(result.get("error").is_some(), "must error: {result}");
+    let board = handle_tool("task", &json!({"action": "list"}), "sender");
+    let empty = vec![];
+    let tasks = board["tasks"].as_array().unwrap_or(&empty);
+    assert!(
+        tasks.is_empty(),
+        "no orphan task on missing target: {board}"
+    );
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn send_kind_task_self_send_no_orphan_task() {
+    let _g = fleet_test_guard();
+    let (_rec, home) = setup_recorder("no-orphan-self");
+
+    let _result = handle_tool(
+        "send",
+        &json!({
+            "target_instance": "sender",
+            "message": "do",
+            "request_kind": "task",
+        }),
+        "sender",
+    );
+    let board = handle_tool("task", &json!({"action": "list"}), "sender");
+    let empty = vec![];
+    let tasks = board["tasks"].as_array().unwrap_or(&empty);
+    assert!(tasks.is_empty(), "no orphan task on self-send: {board}");
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn send_kind_task_invalid_target_no_orphan_task() {
+    let _g = fleet_test_guard();
+    let (_rec, home) = setup_recorder("no-orphan-invalid");
+
+    let result = handle_tool(
+        "send",
+        &json!({
+            "target_instance": "///bad-name///",
+            "message": "do",
+            "request_kind": "task",
+        }),
+        "sender",
+    );
+    assert!(result.get("error").is_some(), "must error: {result}");
+    let board = handle_tool("task", &json!({"action": "list"}), "sender");
+    let empty = vec![];
+    let tasks = board["tasks"].as_array().unwrap_or(&empty);
+    assert!(
+        tasks.is_empty(),
+        "no orphan task on invalid target: {board}"
     );
 
     std::env::remove_var("AGEND_HOME");
@@ -2814,10 +2890,9 @@ fn send_with_invalid_task_id_format_rejects() {
 }
 
 #[test]
-fn error_message_includes_actionable_hint_text() {
-    // UX pin: the rejection message must explicitly tell the operator
-    // *how to recover* — i.e. mention `task action=create`. Without
-    // this hint, the error is just blame; with it, it's a recipe.
+fn send_kind_task_without_task_id_auto_creates_board_task() {
+    // #1050: kind=task without task_id now auto-creates a board task
+    // instead of rejecting. The response carries auto_created_task_id.
     let _g = fleet_test_guard();
     let (_rec, home) = setup_recorder("anti-stall-hint");
 
@@ -2825,20 +2900,20 @@ fn error_message_includes_actionable_hint_text() {
         "send",
         &json!({
             "target_instance": "target",
-            "task": "do",
-            "message": "do",
+            "task": "do something important",
+            "message": "do something important",
             "request_kind": "task",
         }),
         "sender",
     );
-    let err = result["error"].as_str().unwrap_or("");
     assert!(
-        err.contains("task action=create"),
-        "rejection must guide caller to task action=create: {result}"
+        result.get("error").is_none(),
+        "#1050: missing task_id must auto-create, not reject: {result}"
     );
+    let auto_tid = result["auto_created_task_id"].as_str();
     assert!(
-        err.contains("t-"),
-        "rejection must reference the t-... id prefix shape: {result}"
+        auto_tid.is_some() && auto_tid.unwrap().starts_with("t-"),
+        "#1050: response must carry auto_created_task_id: {result}"
     );
 
     std::env::remove_var("AGEND_HOME");
@@ -2902,18 +2977,16 @@ fn send_default_kind_without_task_id_still_works() {
 }
 
 #[test]
-fn task_id_required_error_uses_stable_code_for_machine_consumption() {
-    // Defensive: agents may branch on `code: "task_id_required"`
-    // programmatically (e.g. retry with task action=create then
-    // re-dispatch). Pin the code string against accidental rename.
+fn task_id_required_stable_code_on_team_broadcast() {
+    // #1050: auto-create only fires for single-target sends.
+    // Broadcast (team field) still rejects with stable code.
     let _g = fleet_test_guard();
     let (_rec, home) = setup_recorder("anti-stall-stable-code");
 
     let result = handle_tool(
         "send",
         &json!({
-            "target_instance": "target",
-            "task": "do",
+            "team": "dev",
             "message": "do",
             "request_kind": "task",
         }),
@@ -2922,7 +2995,7 @@ fn task_id_required_error_uses_stable_code_for_machine_consumption() {
     assert_eq!(
         result["code"].as_str(),
         Some("task_id_required"),
-        "stable code surface for machine-readable retry logic: {result}"
+        "broadcast kind=task must still reject with stable code: {result}"
     );
 
     std::env::remove_var("AGEND_HOME");
