@@ -212,21 +212,23 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
         env_for_spawn,
     ) {
         Ok(_spawn_mode) => {
-            // #966: Every API-level spawn gets a channel topic via the
-            // hub `ensure_topic_for`. Replaces the prior inline
-            // `active_channel().and_then(create_topic).map(id)` chain —
-            // same semantics, consolidated with team mode + TUI helper.
-            let topic_id = match crate::channel::ensure_topic_for(name) {
-                crate::channel::TopicOutcome::Created(tid) => Some(tid),
-                crate::channel::TopicOutcome::NoChannel => None,
-                crate::channel::TopicOutcome::Failed(err) => {
-                    tracing::warn!(
-                        agent = name,
-                        error = %err,
-                        "SPAWN: channel exists but create_topic failed; \
-                         instance created without topic"
-                    );
-                    None
+            // #991: skip topic creation when caller opts out.
+            let topic_binding = params["topic_binding"].as_str().unwrap_or("auto");
+            let topic_id = if matches!(topic_binding, "skip" | "deferred") {
+                None
+            } else {
+                match crate::channel::ensure_topic_for(name) {
+                    crate::channel::TopicOutcome::Created(tid) => Some(tid),
+                    crate::channel::TopicOutcome::NoChannel => None,
+                    crate::channel::TopicOutcome::Failed(err) => {
+                        tracing::warn!(
+                            agent = name,
+                            error = %err,
+                            "SPAWN: channel exists but create_topic failed; \
+                             instance created without topic"
+                        );
+                        None
+                    }
                 }
             };
             if let Some(n) = ctx.notifier {

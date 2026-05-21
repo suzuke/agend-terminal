@@ -181,3 +181,125 @@ fn t2b_api_unavailable_rolls_back_fleet_yaml_entry() {
 
     let _ = std::fs::remove_dir_all(&home);
 }
+
+// ── #991 topic_binding tests ──────────────────────────────────────
+
+#[test]
+fn t3_topic_binding_skip_persists_to_fleet_yaml_and_spawn_params() {
+    let home = tmp_home("t3-tb");
+
+    let spawn_fn = |_h: &Path, req: &Value| -> anyhow::Result<Value> {
+        assert_eq!(
+            req["params"]["topic_binding"].as_str(),
+            Some("skip"),
+            "SPAWN RPC must carry topic_binding param"
+        );
+        Ok(json!({"ok": true, "result": {}}))
+    };
+
+    let result = spawn_single_instance_impl(
+        &home,
+        "test-spawner",
+        &json!({"name": "t3-skip", "backend": "claude", "topic_binding": "skip"}),
+        &spawn_fn,
+    );
+    assert!(result.get("error").is_none(), "must succeed: {result}");
+
+    let cfg = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+        .expect("reload fleet.yaml");
+    let inst = cfg.instances.get("t3-skip").expect("instance exists");
+    assert_eq!(
+        inst.topic_binding_mode.as_deref(),
+        Some("skip"),
+        "fleet.yaml must persist topic_binding_mode=skip"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn t4_topic_binding_omitted_defaults_to_auto() {
+    let home = tmp_home("t4-tb");
+
+    let spawn_fn = |_h: &Path, req: &Value| -> anyhow::Result<Value> {
+        assert!(
+            req["params"]["topic_binding"].is_null(),
+            "SPAWN params must NOT carry topic_binding when omitted"
+        );
+        Ok(json!({"ok": true, "result": {}}))
+    };
+
+    let result = spawn_single_instance_impl(
+        &home,
+        "test-spawner",
+        &json!({"name": "t4-auto", "backend": "claude"}),
+        &spawn_fn,
+    );
+    assert!(result.get("error").is_none(), "must succeed: {result}");
+
+    let cfg = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+        .expect("reload fleet.yaml");
+    let inst = cfg.instances.get("t4-auto").expect("instance exists");
+    assert!(
+        inst.topic_binding_mode.is_none(),
+        "fleet.yaml must NOT have topic_binding_mode when omitted (auto default)"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn t5_topic_binding_deferred_persists_and_forwards() {
+    let home = tmp_home("t5-tb");
+
+    let spawn_fn = |_h: &Path, req: &Value| -> anyhow::Result<Value> {
+        assert_eq!(
+            req["params"]["topic_binding"].as_str(),
+            Some("deferred"),
+            "SPAWN RPC must carry topic_binding=deferred"
+        );
+        Ok(json!({"ok": true, "result": {}}))
+    };
+
+    let result = spawn_single_instance_impl(
+        &home,
+        "test-spawner",
+        &json!({"name": "t5-deferred", "backend": "claude", "topic_binding": "deferred"}),
+        &spawn_fn,
+    );
+    assert!(result.get("error").is_none(), "must succeed: {result}");
+
+    let cfg = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+        .expect("reload fleet.yaml");
+    let inst = cfg.instances.get("t5-deferred").expect("instance exists");
+    assert_eq!(
+        inst.topic_binding_mode.as_deref(),
+        Some("deferred"),
+        "fleet.yaml must persist topic_binding_mode=deferred"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn t6_topic_binding_invalid_value_treated_as_auto() {
+    let home = tmp_home("t6-tb");
+
+    let spawn_fn = |_h: &Path, _req: &Value| -> anyhow::Result<Value> {
+        Ok(json!({"ok": true, "result": {}}))
+    };
+
+    let result = spawn_single_instance_impl(
+        &home,
+        "test-spawner",
+        &json!({"name": "t6-invalid", "backend": "claude", "topic_binding": "bogus"}),
+        &spawn_fn,
+    );
+    assert!(result.get("error").is_none(), "must succeed: {result}");
+
+    let cfg = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+        .expect("reload fleet.yaml");
+    let inst = cfg.instances.get("t6-invalid").expect("instance exists");
+    assert!(
+        inst.topic_binding_mode.is_none(),
+        "invalid topic_binding value must be treated as auto (not persisted)"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}

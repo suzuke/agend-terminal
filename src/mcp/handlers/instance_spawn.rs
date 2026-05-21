@@ -165,6 +165,11 @@ pub(super) fn spawn_single_instance_impl(
         ready_pattern: None,
         command: None,
         worktree: None,
+        topic_binding_mode: args
+            .get("topic_binding")
+            .and_then(|v| v.as_str())
+            .filter(|s| matches!(*s, "skip" | "deferred"))
+            .map(String::from),
     };
     if let Err(e) = crate::fleet::add_instance_to_yaml(home, name, &entry) {
         return json!({"error": format!("failed to register instance in fleet.yaml: {e}")});
@@ -179,6 +184,9 @@ pub(super) fn spawn_single_instance_impl(
     });
     if let Some(env) = env_value.as_ref() {
         spawn_params["env"] = env.clone();
+    }
+    if let Some(tb) = args.get("topic_binding").and_then(|v| v.as_str()) {
+        spawn_params["topic_binding"] = json!(tb);
     }
     match spawn_fn(
         home,

@@ -111,6 +111,7 @@ pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
                         ready_pattern: None,
                         command: None,
                         worktree: None,
+                        topic_binding_mode: None,
                     },
                 )
             })

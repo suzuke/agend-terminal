@@ -231,6 +231,12 @@ pub struct InstanceConfig {
     /// all skills (no per-backend dirs are populated).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skills: Option<Vec<String>>,
+    /// #991: topic binding mode — controls whether a Telegram topic is
+    /// created at spawn time. `None` or `Some("auto")` = current behavior.
+    /// `Some("skip")` = no topic ever. `Some("deferred")` = no topic at
+    /// spawn, operator can retrofit later via `bind_topic`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic_binding_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -643,6 +649,8 @@ pub struct InstanceYamlEntry {
     /// so the worktree pool skips creation. Defaults to auto-create
     /// when `None` or `Some(true)`.
     pub worktree: Option<bool>,
+    /// #991: topic binding mode. See [`InstanceConfig::topic_binding_mode`].
+    pub topic_binding_mode: Option<String>,
 }
 
 /// Atomically write a serde_yaml_ng::Value back to fleet.yaml using temp + fsync + rename.
@@ -961,6 +969,12 @@ fn build_instance_mapping(config: &InstanceYamlEntry) -> serde_yaml_ng::Mapping 
     }
     if let Some(worktree) = config.worktree {
         inst.insert("worktree".into(), serde_yaml_ng::Value::Bool(worktree));
+    }
+    if let Some(ref mode) = config.topic_binding_mode {
+        inst.insert(
+            "topic_binding_mode".into(),
+            serde_yaml_ng::Value::String(mode.clone()),
+        );
     }
     inst
 }
@@ -1517,6 +1531,7 @@ instances:
             ready_pattern: None,
             command: None,
             worktree: None,
+            topic_binding_mode: None,
         };
         add_instance_to_yaml(&dir, "new-agent", &entry).expect("add");
         let config = FleetConfig::load(&path).expect("load after add");
@@ -1572,6 +1587,7 @@ instances:
             ready_pattern: None,
             command: None,
             worktree: None,
+            topic_binding_mode: None,
         };
         add_instance_to_yaml(&dir, "first", &entry).expect("add to new");
         let config = FleetConfig::load(&dir.join("fleet.yaml")).expect("load");
@@ -1761,6 +1777,7 @@ instances:
                     ready_pattern: None,
                     command: None,
                     worktree: None,
+                    topic_binding_mode: None,
                 };
                 let _ = add_instance_to_yaml(&d1, "agent-from-mutate", &entry);
             });
@@ -2393,6 +2410,7 @@ instances:
             ready_pattern: None,
             command: None,
             worktree: None,
+            topic_binding_mode: None,
         };
         add_instance_to_yaml(&dir, "temp-agent", &entry).expect("add");
 
@@ -3111,6 +3129,7 @@ instances:
             ready_pattern: None,
             command: None,
             worktree: None,
+            topic_binding_mode: None,
         };
         add_instance_to_yaml(&dir, "rt-agent", &entry).expect("add");
         let content = std::fs::read_to_string(dir.join("fleet.yaml")).expect("read");
@@ -3126,6 +3145,45 @@ instances:
                 .as_deref()
                 .map(|p| p.to_str().unwrap_or("")),
             Some("/tmp/rt-source"),
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn topic_binding_mode_round_trips_through_fleet_yaml() {
+        let dir = std::env::temp_dir().join(format!("agend-fleet-tb-rt-{}", std::process::id()));
+        write_fleet(&dir, "instances: {}\n");
+        let entry = InstanceYamlEntry {
+            backend: Some("claude".to_string()),
+            topic_binding_mode: Some("skip".to_string()),
+            ..Default::default()
+        };
+        add_instance_to_yaml(&dir, "internal-helper", &entry).expect("add");
+        let content = std::fs::read_to_string(dir.join("fleet.yaml")).expect("read");
+        assert!(
+            content.contains("topic_binding_mode: skip"),
+            "topic_binding_mode must appear in fleet.yaml: {content}"
+        );
+        let config = FleetConfig::load(&dir.join("fleet.yaml")).expect("load");
+        let inst = config.instances.get("internal-helper").expect("exists");
+        assert_eq!(
+            inst.topic_binding_mode.as_deref(),
+            Some("skip"),
+            "topic_binding_mode must round-trip through serde"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn topic_binding_mode_absent_parses_as_none() {
+        let dir =
+            std::env::temp_dir().join(format!("agend-fleet-tb-absent-{}", std::process::id()));
+        write_fleet(&dir, "instances:\n  agent1:\n    backend: claude\n");
+        let config = FleetConfig::load(&dir.join("fleet.yaml")).expect("load");
+        let inst = config.instances.get("agent1").expect("exists");
+        assert!(
+            inst.topic_binding_mode.is_none(),
+            "absent field must parse as None for back-compat"
         );
         fs::remove_dir_all(&dir).ok();
     }
