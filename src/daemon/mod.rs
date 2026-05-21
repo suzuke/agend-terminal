@@ -1268,6 +1268,7 @@ pub fn run_task_maintenance(home: &Path) {
                 eta_minutes: None,
                 reporting_cadence: None,
                 worktree_binding_required: None,
+                pr_number: None,
             },
         );
     }
@@ -1341,6 +1342,7 @@ fn replay_missed_at_startup(home: &Path, registry: &AgentRegistry) {
                     eta_minutes: None,
                     reporting_cadence: None,
                     worktree_binding_required: None,
+                    pr_number: None,
                 },
             );
         }

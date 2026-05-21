@@ -1355,6 +1355,60 @@ fn dispatch_auto_bind_lease_sets_next_after_ci_from_dispatch_hook_931() {
 
 #[test]
 #[cfg(unix)]
+fn dispatch_persists_task_id_into_ci_watch_sidecar_1031() {
+    // #1031: when `send(kind=task, task_id=T)` triggers the dispatch
+    // auto-arm, the task_id is persisted into the ci-watch sidecar's
+    // `task_id` field. The ci_check_repo emit site reads it back to
+    // enrich `[ci-ready-for-action]` payloads — closing the
+    // dispatcher→reviewer back-link that pre-#1031 required manual
+    // inbox-archaeology.
+    //
+    // REGRESSION-PROOF: revert the `watch_args["task_id"]` write in
+    // dispatch_hook/mod.rs → this assertion FAILS because
+    // `watch["task_id"]` reads as null instead of `"T-1031-persist"`.
+    let parent = std::env::temp_dir().join(format!(
+        "agend-1031-persist-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let (home, _canonical) = p781_canonical_with_team_source_repo(
+        &parent,
+        "feat/1031-persist",
+        true,
+        "val",
+        &["val-dev", "val-reviewer"],
+    );
+
+    let r = super::dispatch_auto_bind_lease_with_chain(
+        &home,
+        "val-dev",
+        "T-1031-persist",
+        "feat/1031-persist",
+        None,
+        Some("val-reviewer"),
+    );
+    assert!(r.is_ok(), "dispatch must succeed: {:?}", r.err());
+
+    let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(
+        crate::daemon::ci_watch::watch_filename("owner/repo", "feat/1031-persist"),
+    );
+    let watch: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&watch_path).expect("read watch"))
+            .expect("parse watch");
+    assert_eq!(
+        watch["task_id"].as_str(),
+        Some("T-1031-persist"),
+        "#1031: dispatch must persist task_id into ci-watch sidecar; got: {watch}"
+    );
+
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+#[test]
+#[cfg(unix)]
 fn dispatch_auto_derives_next_after_ci_from_team_reviewer_convention_1037() {
     // #1037 RED→GREEN: when the dispatcher does NOT explicitly pass
     // `next_after_ci`, the daemon auto-derives the chain target from

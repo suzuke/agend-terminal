@@ -477,6 +477,7 @@ pub(crate) fn maybe_notify_member_state_change(
         eta_minutes: None,
         reporting_cadence: None,
         worktree_binding_required: None,
+        pr_number: None,
     };
     let _ = crate::inbox::enqueue(home, orch, msg);
     crate::inbox::notify_agent(

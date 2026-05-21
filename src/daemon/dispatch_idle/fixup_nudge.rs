@@ -139,6 +139,7 @@ fn emit_nudge(home: &Path, d: &PendingDispatch) -> bool {
         eta_minutes: None,
         reporting_cadence: None,
         worktree_binding_required: None,
+        pr_number: None,
     };
     match crate::inbox::enqueue_with_idle_hint(home, &d.target, msg) {
         Ok(()) => true,

@@ -279,6 +279,7 @@ fn emit_timeout_event(home: &Path, d: &PendingDecision, elapsed_secs: i64) {
         eta_minutes: None,
         reporting_cadence: None,
         worktree_binding_required: None,
+        pr_number: None,
     };
     if let Err(e) = crate::inbox::enqueue_with_idle_hint(home, &recipient, msg) {
         tracing::warn!(error = %e, recipient, "decision_timeout: enqueue failed");

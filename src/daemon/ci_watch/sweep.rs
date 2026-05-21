@@ -190,6 +190,7 @@ fn fan_out_health_event(
                 eta_minutes: None,
                 reporting_cadence: None,
                 worktree_binding_required: None,
+                pr_number: None,
             },
         );
     }

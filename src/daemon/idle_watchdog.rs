@@ -392,6 +392,7 @@ fn emit_idle_alert(
         eta_minutes: None,
         reporting_cadence: None,
         worktree_binding_required: None,
+        pr_number: None,
     };
     if let Err(e) = crate::inbox::enqueue_with_idle_hint(home, recipient, msg) {
         tracing::warn!(error = %e, recipient, kind, "idle_watchdog: enqueue failed");
