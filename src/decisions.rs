@@ -20,7 +20,7 @@ pub struct Decision {
     pub working_directory: Option<String>,
 }
 
-fn decisions_dir(home: &Path) -> std::path::PathBuf {
+pub(crate) fn decisions_dir(home: &Path) -> std::path::PathBuf {
     home.join("decisions")
 }
 
@@ -66,7 +66,7 @@ fn load_all(home: &Path) -> Vec<Decision> {
     decisions
 }
 
-fn decision_path(home: &Path, id: &str) -> std::path::PathBuf {
+pub(crate) fn decision_path(home: &Path, id: &str) -> std::path::PathBuf {
     decisions_dir(home).join(format!("{id}.json"))
 }
 
@@ -89,7 +89,11 @@ fn save(home: &Path, decision: &Decision) -> anyhow::Result<()> {
 /// Hold the per-decision flock for the duration of `f`. flock is not
 /// re-entrant, so inside `f` callers must write via `save_atomic` directly
 /// rather than calling [`save`], which would deadlock on the same path.
-fn with_decision_lock<R>(home: &Path, id: &str, f: impl FnOnce() -> R) -> anyhow::Result<R> {
+pub(crate) fn with_decision_lock<R>(
+    home: &Path,
+    id: &str,
+    f: impl FnOnce() -> R,
+) -> anyhow::Result<R> {
     let dir = decisions_dir(home);
     std::fs::create_dir_all(&dir)?;
     let _lock = crate::store::acquire_file_lock(&decision_lock_path(home, id))?;
