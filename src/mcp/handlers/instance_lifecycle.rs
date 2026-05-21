@@ -105,6 +105,11 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
     // this function's cleanup contract).
     let _ = crate::daemon::dispatch_idle::cleanup_pending_for_instance(home, name);
 
+    // #1022: remove activity sidecar so fleet_idle_watchdog stops
+    // tracking the deleted instance. Without this, ghost agents
+    // accumulate in the tracking list and inflate alert text.
+    crate::daemon::idle_watchdog::remove_agent_activity(home, name);
+
     // Sprint 54 P1-B Bug 1 audit: enumerate every store that still holds
     // the name. If any do, surface a loud error instead of returning
     // success — `auto_start_fleet` revival of a half-deleted instance is
@@ -406,6 +411,20 @@ mod tests {
             post.assignee.is_none(),
             "owned task must be orphaned after full_delete_instance, got assignee={:?}",
             post.assignee
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn full_delete_instance_removes_activity_sidecar() {
+        let home = tmp_home("activity_cleanup");
+        crate::daemon::idle_watchdog::touch_agent_activity(&home, "doomed");
+        let activity_file = home.join("agent-activity").join("doomed.json");
+        assert!(activity_file.exists(), "pre-delete sanity: sidecar exists");
+        let _ = super::full_delete_instance(&home, "doomed");
+        assert!(
+            !activity_file.exists(),
+            "activity sidecar must be removed after full_delete_instance"
         );
         std::fs::remove_dir_all(home).ok();
     }

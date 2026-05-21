@@ -204,6 +204,9 @@ fn run_loop(home: PathBuf, registry: AgentRegistry) {
     // Sprint 59 Wave 1 PR-2 (#10+#12 watchdog cluster): per-agent +
     // fleet-wide idle thresholds, throttled to 5min scans.
     let mut idle_watchdog_tracker = crate::daemon::idle_watchdog::IdleWatchdogTracker::default();
+    // #1022: purge activity sidecars for instances not in fleet.yaml
+    // so ghost agents from prior runs don't pollute the tracking list.
+    crate::daemon::idle_watchdog::gc_stale_activity_sidecars(&home);
     // Sprint 59 Wave 1 PR-4-recover ((B) decision default with
     // timeout): tracks pending operator decisions, fires auto-default
     // on timeout. 5min throttle matches anti-stall cadence.

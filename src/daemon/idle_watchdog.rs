@@ -76,6 +76,22 @@ fn activity_path(home: &Path, agent: &str) -> PathBuf {
     activity_dir(home).join(format!("{agent}.json"))
 }
 
+/// Remove an agent's activity sidecar (file + lock). Called from
+/// `full_delete_instance` so deleted agents stop appearing in the
+/// fleet_idle_watchdog tracking list. Best-effort: IO failures are
+/// logged and swallowed (matches the delete-path cleanup contract).
+pub(crate) fn remove_agent_activity(_home: &Path, _agent: &str) {
+    // #1022 stub — impl in next commit
+}
+
+/// Boot-time GC: remove activity sidecars for agents not present in
+/// `fleet.yaml`. Prevents ghost entries from accumulating across
+/// daemon restarts when instances are deleted while the daemon is
+/// down (or if eager cleanup on delete_instance missed one).
+pub(crate) fn gc_stale_activity_sidecars(_home: &Path) {
+    // #1022 stub — impl in next commit
+}
+
 /// Touch agent activity — atomically write `last_active_at = now()`.
 /// Best-effort; IO failures are logged and swallowed.
 pub(crate) fn touch_agent_activity(home: &Path, agent: &str) {
@@ -629,5 +645,137 @@ mod tests {
         let r = dev_idle_recipient();
         std::env::remove_var("AGEND_IDLE_WATCHDOG_DEV_RECIPIENT");
         assert_eq!(r, "alice");
+    }
+
+    // ── #1022 ghost-agent cleanup tests ───────────────────────────
+
+    #[test]
+    fn remove_agent_activity_deletes_sidecar() {
+        let home = tmp_home("remove-activity");
+        touch_agent_activity(&home, "doomed");
+        assert!(activity_path(&home, "doomed").exists());
+        remove_agent_activity(&home, "doomed");
+        assert!(
+            !activity_path(&home, "doomed").exists(),
+            "sidecar must be deleted after remove_agent_activity"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn remove_agent_activity_noop_for_missing_agent() {
+        let home = tmp_home("remove-missing");
+        remove_agent_activity(&home, "nonexistent");
+    }
+
+    #[test]
+    fn gc_stale_activity_sidecars_removes_ghosts_keeps_live() {
+        let home = tmp_home("gc-ghosts");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  dev:\n    backend: claude\n  lead:\n    backend: claude\n",
+        )
+        .unwrap();
+        let now = chrono::Utc::now();
+        write_activity_at(&home, "dev", now);
+        write_activity_at(&home, "lead", now);
+        write_activity_at(&home, "demo-lead", now);
+        write_activity_at(&home, "conflict-test-1", now);
+        assert_eq!(enumerate_agent_activity(&home).len(), 4);
+        gc_stale_activity_sidecars(&home);
+        let remaining: Vec<String> = enumerate_agent_activity(&home)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(remaining.len(), 2, "only live agents remain: {remaining:?}");
+        assert!(remaining.contains(&"dev".to_string()));
+        assert!(remaining.contains(&"lead".to_string()));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn gc_stale_activity_sidecars_noop_without_fleet_yaml() {
+        let home = tmp_home("gc-no-fleet");
+        let now = chrono::Utc::now();
+        write_activity_at(&home, "orphan", now);
+        gc_stale_activity_sidecars(&home);
+        assert_eq!(
+            enumerate_agent_activity(&home).len(),
+            1,
+            "without fleet.yaml, gc must not delete anything"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn fleet_scan_excludes_ghost_agents_from_alert() {
+        let _g = env_lock();
+        std::env::remove_var("AGEND_IDLE_WATCHDOG_AGENT");
+        std::env::remove_var("AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT");
+        let home = tmp_home("fleet-ghost-filter");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  dev:\n    backend: claude\n  lead:\n    backend: claude\n",
+        )
+        .unwrap();
+        let stale = chrono::Utc::now() - chrono::Duration::seconds(FLEET_IDLE_THRESHOLD_SECS + 60);
+        write_activity_at(&home, "dev", stale);
+        write_activity_at(&home, "lead", stale);
+        write_activity_at(&home, "demo-lead", stale);
+        write_activity_at(&home, "conflict-test-1", stale);
+        let mut last_alerted = HashMap::new();
+        scan_and_emit(&home, &mut last_alerted);
+        let general = crate::inbox::drain(&home, "general");
+        let fleet_msg = general
+            .iter()
+            .find(|m| m.kind.as_deref() == Some("fleet_idle_watchdog"))
+            .expect("fleet alert must fire for stale live agents");
+        assert!(
+            !fleet_msg.text.contains("demo-lead"),
+            "ghost agent 'demo-lead' must not appear in alert: {}",
+            fleet_msg.text
+        );
+        assert!(
+            !fleet_msg.text.contains("conflict-test-1"),
+            "ghost agent 'conflict-test-1' must not appear in alert: {}",
+            fleet_msg.text
+        );
+        assert!(
+            fleet_msg.text.contains("dev"),
+            "live agent 'dev' must appear in alert"
+        );
+        assert!(
+            fleet_msg.text.contains("lead"),
+            "live agent 'lead' must appear in alert"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn fleet_scan_no_alert_when_only_ghosts_stale() {
+        let _g = env_lock();
+        std::env::remove_var("AGEND_IDLE_WATCHDOG_AGENT");
+        std::env::remove_var("AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT");
+        let home = tmp_home("fleet-only-ghosts");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  dev:\n    backend: claude\n",
+        )
+        .unwrap();
+        let recent = chrono::Utc::now() - chrono::Duration::seconds(60);
+        let stale = chrono::Utc::now() - chrono::Duration::seconds(FLEET_IDLE_THRESHOLD_SECS + 60);
+        write_activity_at(&home, "dev", recent);
+        write_activity_at(&home, "ghost-1", stale);
+        write_activity_at(&home, "ghost-2", stale);
+        let mut last_alerted = HashMap::new();
+        scan_and_emit(&home, &mut last_alerted);
+        let general = crate::inbox::drain(&home, "general");
+        assert!(
+            !general
+                .iter()
+                .any(|m| m.kind.as_deref() == Some("fleet_idle_watchdog")),
+            "active live agent + stale ghosts must NOT trigger fleet alert: {general:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 }
