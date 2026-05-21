@@ -33,9 +33,19 @@ pub(super) fn enforce_send_invariants(
     sender: &Option<Sender>,
 ) -> Option<Value> {
     // Wave 4 PR-1 gate: kind=task without task_id rejected.
+    // #1050: single-target + empty task_id exempt — handle_delegate_task
+    // auto-creates after validation passes (avoids orphan tasks).
+    // Malformed (non-empty but bad shape) task_ids still rejected everywhere.
     if args["request_kind"].as_str() == Some("task") {
-        if let Err(msg) = validate_task_id_present(args) {
-            return Some(json!({"error": msg, "code": "task_id_required"}));
+        let is_broadcast = args.get("targets").is_some()
+            || args.get("team").is_some()
+            || args.get("tags").is_some();
+        let auto_create_eligible =
+            !is_broadcast && args["task_id"].as_str().unwrap_or("").is_empty();
+        if !auto_create_eligible {
+            if let Err(msg) = validate_task_id_present(args) {
+                return Some(json!({"error": msg, "code": "task_id_required"}));
+            }
         }
     }
     // Wave 1 PR-1 hooks (a)+(c): any send carrying task_id (or

@@ -2671,6 +2671,82 @@ fn send_kind_task_auto_create_puts_task_on_board() {
 }
 
 #[test]
+fn send_kind_task_missing_target_no_orphan_task() {
+    let _g = fleet_test_guard();
+    let (_rec, home) = setup_recorder("no-orphan-missing");
+
+    let result = handle_tool(
+        "send",
+        &json!({
+            "message": "do",
+            "request_kind": "task",
+        }),
+        "sender",
+    );
+    assert!(result.get("error").is_some(), "must error: {result}");
+    let board = handle_tool("task", &json!({"action": "list"}), "sender");
+    let empty = vec![];
+    let tasks = board["tasks"].as_array().unwrap_or(&empty);
+    assert!(
+        tasks.is_empty(),
+        "no orphan task on missing target: {board}"
+    );
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn send_kind_task_self_send_no_orphan_task() {
+    let _g = fleet_test_guard();
+    let (_rec, home) = setup_recorder("no-orphan-self");
+
+    let _result = handle_tool(
+        "send",
+        &json!({
+            "target_instance": "sender",
+            "message": "do",
+            "request_kind": "task",
+        }),
+        "sender",
+    );
+    let board = handle_tool("task", &json!({"action": "list"}), "sender");
+    let empty = vec![];
+    let tasks = board["tasks"].as_array().unwrap_or(&empty);
+    assert!(tasks.is_empty(), "no orphan task on self-send: {board}");
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn send_kind_task_invalid_target_no_orphan_task() {
+    let _g = fleet_test_guard();
+    let (_rec, home) = setup_recorder("no-orphan-invalid");
+
+    let result = handle_tool(
+        "send",
+        &json!({
+            "target_instance": "///bad-name///",
+            "message": "do",
+            "request_kind": "task",
+        }),
+        "sender",
+    );
+    assert!(result.get("error").is_some(), "must error: {result}");
+    let board = handle_tool("task", &json!({"action": "list"}), "sender");
+    let empty = vec![];
+    let tasks = board["tasks"].as_array().unwrap_or(&empty);
+    assert!(
+        tasks.is_empty(),
+        "no orphan task on invalid target: {board}"
+    );
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn send_kind_task_with_task_id_succeeds() {
     let _g = fleet_test_guard();
     let (_rec, home) = setup_recorder("anti-stall-with-id");
