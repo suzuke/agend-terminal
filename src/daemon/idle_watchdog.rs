@@ -80,16 +80,55 @@ fn activity_path(home: &Path, agent: &str) -> PathBuf {
 /// `full_delete_instance` so deleted agents stop appearing in the
 /// fleet_idle_watchdog tracking list. Best-effort: IO failures are
 /// logged and swallowed (matches the delete-path cleanup contract).
-pub(crate) fn remove_agent_activity(_home: &Path, _agent: &str) {
-    // #1022 stub — impl in next commit
+pub(crate) fn remove_agent_activity(home: &Path, agent: &str) {
+    if agent.is_empty() {
+        return;
+    }
+    let path = activity_path(home, agent);
+    if path.exists() {
+        if let Err(e) = std::fs::remove_file(&path) {
+            tracing::warn!(agent, error = %e, "remove_agent_activity: sidecar delete failed");
+        } else {
+            tracing::debug!(agent, "remove_agent_activity: sidecar removed");
+        }
+    }
+    let lock_path = activity_dir(home).join(format!(".{agent}.lock"));
+    let _ = std::fs::remove_file(&lock_path);
 }
 
 /// Boot-time GC: remove activity sidecars for agents not present in
 /// `fleet.yaml`. Prevents ghost entries from accumulating across
 /// daemon restarts when instances are deleted while the daemon is
 /// down (or if eager cleanup on delete_instance missed one).
-pub(crate) fn gc_stale_activity_sidecars(_home: &Path) {
-    // #1022 stub — impl in next commit
+pub(crate) fn gc_stale_activity_sidecars(home: &Path) {
+    let live: std::collections::HashSet<String> =
+        match crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)) {
+            Ok(cfg) => cfg.instances.keys().cloned().collect(),
+            Err(_) => return,
+        };
+    let dir = activity_dir(home);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let mut removed = 0u32;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(agent) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !live.contains(agent) {
+            if std::fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+            let _ = std::fs::remove_file(dir.join(format!(".{agent}.lock")));
+        }
+    }
+    if removed > 0 {
+        tracing::info!(removed, "gc_stale_activity_sidecars: cleaned ghost entries");
+    }
 }
 
 /// Touch agent activity — atomically write `last_active_at = now()`.
@@ -266,7 +305,22 @@ fn scan_fleet_vantage(
     now: &chrono::DateTime<chrono::Utc>,
     last_alerted: &mut HashMap<(&'static str, String), chrono::DateTime<chrono::Utc>>,
 ) {
-    let pairs = enumerate_agent_activity(home);
+    let raw_pairs = enumerate_agent_activity(home);
+    if raw_pairs.is_empty() {
+        return;
+    }
+    // #1022: filter ghost agents — only consider instances present in
+    // fleet.yaml. If fleet.yaml is unreadable, fall back to unfiltered
+    // (fail-open: better to alert on ghosts than miss a real stall).
+    let pairs: Vec<(String, chrono::DateTime<chrono::Utc>)> =
+        if let Ok(cfg) = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)) {
+            raw_pairs
+                .into_iter()
+                .filter(|(name, _)| cfg.instances.contains_key(name))
+                .collect()
+        } else {
+            raw_pairs
+        };
     if pairs.is_empty() {
         return;
     }
