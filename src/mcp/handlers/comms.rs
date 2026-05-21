@@ -92,7 +92,9 @@ pub(super) fn handle_send_to_instance(
         home,
         &json!({
             "method": crate::api::method::SEND,
-            "params": { "from": sender.as_str(), "target": target, "text": text, "kind": kind, "thread_id": thread_id, "parent_id": parent_id, "correlation_id": args["correlation_id"].as_str(), "sequencing": args["sequencing"].as_str(), "eta_minutes": args["eta_minutes"].as_u64(), "reporting_cadence": args["reporting_cadence"].as_str(), "worktree_binding_required": args["worktree_binding_required"].as_bool(), "expect_reply_within_secs": args["expect_reply_within_secs"].as_i64() }
+            // #1024 (closes #1002 ROOT 2): `reviewed_head` MUST be forwarded; see
+            // sibling `handle_report_result` + `auto_release::is_verdict_message`.
+            "params": { "from": sender.as_str(), "target": target, "text": text, "kind": kind, "thread_id": thread_id, "parent_id": parent_id, "correlation_id": args["correlation_id"].as_str(), "reviewed_head": args["reviewed_head"].as_str(), "sequencing": args["sequencing"].as_str(), "eta_minutes": args["eta_minutes"].as_u64(), "reporting_cadence": args["reporting_cadence"].as_str(), "worktree_binding_required": args["worktree_binding_required"].as_bool(), "expect_reply_within_secs": args["expect_reply_within_secs"].as_i64() }
         }),
     ) {
         Ok(resp) if resp["ok"].as_bool() == Some(true) => {
