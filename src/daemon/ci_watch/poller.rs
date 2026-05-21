@@ -492,13 +492,14 @@ pub(crate) fn dedupe_notifications_by_head_sha<'a>(
     }
     let mut result: Vec<_> = best
         .into_iter()
-        .filter(|(sha, (idx, _))| {
+        .filter(|(sha, (_idx, _))| {
             if last_notified_sha != Some(*sha) {
                 return true; // different sha → always pass
             }
-            // Same sha as last notified — #786: allow through only
-            // when conclusion changed (rerun / re-scheduled run).
-            runs[*idx].conclusion.as_deref() != last_notified_conclusion
+            // #1042: compare AGGREGATE conclusion (not individual run's)
+            // against last_notified_conclusion — the fan-out persists
+            // the aggregate, so dedup must match the same value.
+            aggregate_conclusion_for_sha(runs, sha) != last_notified_conclusion
         })
         .map(|(sha, (idx, id))| (idx, id, sha))
         .collect();
@@ -1857,6 +1858,70 @@ mod tests {
             "aaa already notified with same conclusion → only bbb"
         );
         assert_eq!(deduped[0].2, "bbb");
+    }
+
+    /// #1042 regression anchor: two runs for the same SHA with DIFFERENT
+    /// individual conclusions (coverage=success, CI=failure) but the same
+    /// AGGREGATE conclusion as last_notified. Pre-fix, the highest-id
+    /// run's individual conclusion ("success") differed from the
+    /// persisted aggregate ("failure"), so the dedup filter passed on
+    /// every poll cycle → re-broadcast. Post-fix, the filter compares
+    /// aggregates and correctly blocks.
+    #[test]
+    fn test_1042_same_sha_same_aggregate_suppresses_rebroadcast() {
+        let runs = vec![
+            CiRun {
+                id: 700,
+                conclusion: Some("failure".into()),
+                head_sha: "abc".into(),
+                url: String::new(),
+            },
+            CiRun {
+                id: 701,
+                conclusion: Some("success".into()),
+                head_sha: "abc".into(),
+                url: String::new(),
+            },
+        ];
+        let selected = select_runs_to_notify(&runs, Some(699), None);
+        assert_eq!(selected.len(), 2, "both runs should pass site-1 filter");
+        let deduped =
+            dedupe_notifications_by_head_sha(&runs, &selected, Some("abc"), Some("failure"));
+        assert_eq!(
+            deduped.len(),
+            0,
+            "#1042: same SHA + same aggregate conclusion (failure) \
+             must suppress re-broadcast; got {deduped:?}"
+        );
+    }
+
+    /// #1042 complement: when the aggregate conclusion genuinely changes
+    /// (failure → success after a rerun), the notification MUST fire.
+    #[test]
+    fn test_1042_same_sha_different_aggregate_fires() {
+        let runs = vec![
+            CiRun {
+                id: 800,
+                conclusion: Some("success".into()),
+                head_sha: "abc".into(),
+                url: String::new(),
+            },
+            CiRun {
+                id: 801,
+                conclusion: Some("success".into()),
+                head_sha: "abc".into(),
+                url: String::new(),
+            },
+        ];
+        let selected = select_runs_to_notify(&runs, Some(799), None);
+        let deduped =
+            dedupe_notifications_by_head_sha(&runs, &selected, Some("abc"), Some("failure"));
+        assert_eq!(
+            deduped.len(),
+            1,
+            "#1042: same SHA but aggregate changed (failure→success) \
+             must fire notification; got {deduped:?}"
+        );
     }
 
     #[test]
