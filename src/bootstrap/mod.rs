@@ -211,6 +211,25 @@ pub fn prepare(home: &Path, fleet_path: &Path, opts: PrepareOptions) -> Result<B
     time_step("pr_state_suppress_stale_replay", || {
         crate::daemon::pr_state::suppress_stale_terminal_replay(home);
     });
+    // #704 Phase 1b: warn when AGEND_CAPTURE_FIXTURES=1 is active at
+    // boot. The capture sink writes raw PTY bytes — including operator
+    // prompts and any tool output — to $AGEND_HOME/captures/. Captures
+    // intended for `capture promote` MUST be operator-reviewed before
+    // landing in tests/fixtures/state-replay/ because the raw byte
+    // stream can contain secrets, API keys echoed during tool calls,
+    // path globs containing usernames, etc. Single warn line per boot
+    // is sufficient — the env-var lifetime is process-bound, so this
+    // fires exactly when the operator opted in.
+    time_step("capture_fixtures_privacy_warn", || {
+        if std::env::var("AGEND_CAPTURE_FIXTURES").as_deref() == Ok("1") {
+            tracing::warn!(
+                "#704 AGEND_CAPTURE_FIXTURES=1 active — PTY captures land at \
+                 $AGEND_HOME/captures/<agent>/ and may contain secrets / prompts. \
+                 Operator MUST review tests/fixtures/state-replay/*.raw before \
+                 commit. Promote workflow: see docs/CONTRIBUTING.md \"Capturing a new fixture\"."
+            );
+        }
+    });
 
     let run_dir = crate::daemon::run_dir(home);
     std::fs::create_dir_all(&run_dir)
@@ -747,6 +766,58 @@ mod tests {
         assert!(
             logs_contain("bootstrap-step"),
             "logs must include the bootstrap-step message marker"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #704 Phase 1b: `AGEND_CAPTURE_FIXTURES=1` at boot must emit a
+    /// single privacy `tracing::warn` line so operators know raw PTY
+    /// captures may contain secrets / prompts and require review
+    /// before commit.
+    #[test]
+    #[serial_test::serial]
+    #[tracing_test::traced_test]
+    fn t704_phase1b_capture_fixtures_active_emits_privacy_warn() {
+        // SAFETY: serial-gated; restore at end. The bootstrap step
+        // wrapper reads the env var directly so we set/unset around
+        // the invocation. Bare `time_step(...)` runs the closure
+        // in-band without daemon scaffolding.
+        unsafe { std::env::set_var("AGEND_CAPTURE_FIXTURES", "1") };
+        let home = tmp_home("capture-warn-active");
+        time_step("capture_fixtures_privacy_warn", || {
+            if std::env::var("AGEND_CAPTURE_FIXTURES").as_deref() == Ok("1") {
+                tracing::warn!(
+                    "#704 AGEND_CAPTURE_FIXTURES=1 active — PTY captures may contain \
+                     secrets / prompts. Operator MUST review tests/fixtures/state-replay/ \
+                     before commit. Promote workflow: see docs/CONTRIBUTING.md."
+                );
+            }
+        });
+        assert!(
+            logs_contain("AGEND_CAPTURE_FIXTURES=1 active"),
+            "privacy warn must fire when env var is active"
+        );
+        assert!(logs_contain("#704"), "warn must self-identify as #704 hook");
+        unsafe { std::env::remove_var("AGEND_CAPTURE_FIXTURES") };
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #704 Phase 1b negative pin: no warn when the env var is unset.
+    /// Anti-regression — operators not opting in must NOT see noise.
+    #[test]
+    #[serial_test::serial]
+    #[tracing_test::traced_test]
+    fn t704_phase1b_no_warn_when_capture_fixtures_unset() {
+        unsafe { std::env::remove_var("AGEND_CAPTURE_FIXTURES") };
+        let home = tmp_home("capture-warn-inactive");
+        time_step("capture_fixtures_privacy_warn", || {
+            if std::env::var("AGEND_CAPTURE_FIXTURES").as_deref() == Ok("1") {
+                tracing::warn!("#704 AGEND_CAPTURE_FIXTURES=1 active — should NOT fire here");
+            }
+        });
+        assert!(
+            !logs_contain("AGEND_CAPTURE_FIXTURES=1 active"),
+            "privacy warn MUST NOT fire when env var is unset"
         );
         std::fs::remove_dir_all(&home).ok();
     }

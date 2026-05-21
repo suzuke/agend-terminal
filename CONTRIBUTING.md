@@ -77,6 +77,59 @@ Coverage is observation-only — not a merge gate. PRs that drop project coverag
   - When adding a new fixture, check the existing primitives first
     rather than rolling your own sleep loop.
 
+## Capturing a new fixture (#704 sub-task 1)
+
+Real-PTY captures grow the regression corpus in `tests/fixtures/state-replay/` and lock backend-output drift. The capture pipeline is operator-side and opt-in.
+
+### When to capture
+
+- **New backend** — every preset backend needs at least a `*-thinking.raw` + `*-tooluse.raw` baseline so `replay_manifest_regression` covers it (#987 agy was the most recent addition).
+- **New state-detection regex** — when adding a state pattern (e.g. a Thinking spinner shape), capture a fixture that exercises it so the regex doesn't drift silently across CLI updates.
+- **Reproducing a regression** — file a fixture for any operator-reported state-detection bug so the post-fix regression test has a real byte stream to replay.
+- **F9 corpus gap (#1014)** — productive-marker-fire and productive-silence scenarios per backend; see [#1014](https://github.com/suzuke/agend-terminal/issues/1014) for the recording recipe.
+
+### 5-step recipe
+
+1. **Enable capture** (privacy warning fires at daemon boot):
+   ```bash
+   export AGEND_CAPTURE_FIXTURES=1
+   agend-terminal start --agents capture-target:<backend>
+   ```
+   `<backend>` is one of `claude` / `kiro-cli` / `codex` / `opencode` / `gemini` / `agy`.
+
+2. **Drive the target state.** Interact with the agent until it renders the screen you want to fix. Examples: prompt a tool call to land a completion banner; pause mid-prompt to capture a Thinking spinner; trigger an error path to capture a rate-limit banner.
+
+3. **Promote the capture** to a fixture with a v2 measurement label:
+   ```bash
+   agend-terminal capture promote \
+     $AGEND_HOME/captures/capture-target/*.cap \
+     <scenario-name> \
+     --scenario-kind <productive_marker_fire|productive_silence|silent_stuck|priority_oscillation> \
+     --expected-hung <hung|not_hung> \
+     --scenario-description "<one-line summary>"
+   ```
+   Promote writes `tests/fixtures/state-replay/<scenario-name>.raw` and appends a schema-v2 entry to `tests/fixtures/state-replay/MANIFEST.yaml`. Phase 1a (#1020) shipped this CLI.
+
+4. **Review the .raw bytes BEFORE commit.** Captures contain raw PTY output including your prompts and any tool output. Open the file (`less tests/fixtures/state-replay/<scenario-name>.raw`) and scan for:
+   - API keys / OAuth tokens echoed during error paths
+   - File paths containing your username (`/Users/<you>/...`)
+   - Internal URLs / Slack handles / customer names mentioned in prompts
+   - Anything from a private repo you don't want public
+
+   If you find anything sensitive: delete the capture, redact the prompt, recapture. There is no built-in scrubber yet — operator review is the v1 safety net.
+
+5. **Commit + PR**:
+   - Stage `tests/fixtures/state-replay/<scenario-name>.raw` + `tests/fixtures/state-replay/MANIFEST.yaml`
+   - Run `cargo test --bin agend-terminal corpus_measurement_smoke_f9_marker_signals` to confirm the smoke harness classification matches `--scenario-kind`
+   - Reference the capturing branch + recording conditions in the PR body so future operators can replay if drift forces a recapture
+
+### Privacy + storage
+
+- Captures land at `$AGEND_HOME/captures/<agent>/<epoch_ms>.cap` + sidecar `.meta.json`.
+- Per-agent rotation budget is 50 MB (oldest-mtime first); see `src/capture.rs::rotate_captures`.
+- Tunable opt-out: `unset AGEND_CAPTURE_FIXTURES` returns the daemon to zero-overhead NoOp.
+- See [#1014](https://github.com/suzuke/agend-terminal/issues/1014) for the F9 fixture gap (real-PTY productive markers per backend) and the upstream tracker for the agy MCP integration limitation.
+
 ## Style
 
 - `cargo fmt` always. CI will fail on unformatted diffs.
