@@ -24,6 +24,41 @@ pub(super) fn handle_unified_send(home: &Path, args: &Value, sender: &Option<Sen
         }
     }
 
+    // #1050: auto-create board task when kind=task omits task_id (single-target only).
+    let is_broadcast =
+        args.get("targets").is_some() || args.get("team").is_some() || args.get("tags").is_some();
+    if args["request_kind"].as_str() == Some("task")
+        && args["task_id"].as_str().unwrap_or("").is_empty()
+        && !is_broadcast
+    {
+        let title = args["message"]
+            .as_str()
+            .or_else(|| args["task"].as_str())
+            .unwrap_or("(untitled dispatch)")
+            .chars()
+            .take(80)
+            .collect::<String>();
+        let target = args["target_instance"]
+            .as_str()
+            .or_else(|| args["instance_name"].as_str());
+        let create_args = json!({
+            "action": "create",
+            "title": title,
+            "assignee": target,
+            "branch": args["branch"].as_str(),
+            "priority": "normal",
+        });
+        let emitter = sender
+            .as_ref()
+            .map(|s| s.as_str().to_string())
+            .unwrap_or_default();
+        let result = crate::tasks::handle(home, &emitter, &create_args);
+        if let Some(id) = result["id"].as_str() {
+            args["task_id"] = json!(id);
+            args["_auto_created_task_id"] = json!(id);
+        }
+    }
+
     if let Some(err) = enforce_send_invariants(home, &args, sender) {
         return err;
     }
@@ -42,7 +77,12 @@ pub(super) fn handle_unified_send(home: &Path, args: &Value, sender: &Option<Sen
     match args["request_kind"].as_str().unwrap_or("") {
         "task" => {
             lift_message(&mut args, "task");
-            handle_delegate_task(home, &args, sender)
+            let auto_tid = args["_auto_created_task_id"].as_str().map(String::from);
+            let mut result = handle_delegate_task(home, &args, sender);
+            if let Some(tid) = auto_tid {
+                result["auto_created_task_id"] = json!(tid);
+            }
+            result
         }
         "report" => {
             lift_message(&mut args, "summary");
