@@ -1129,7 +1129,14 @@ async fn ci_check_repo(
                     &repo_branch_key,
                     &supersede_token,
                 );
-                let _ = crate::inbox::enqueue(
+                // #1030: enqueue_with_idle_hint replaces raw enqueue
+                // so the durable inbox write is paired with a
+                // [AGEND-MSG-PENDING] PTY hint that wakes idle backends.
+                // Pre-#1030 the line 1040 inject was the only wake
+                // signal for live subscribers; agents that had cycled
+                // their PTY (session restart, compose-mode entry) saw
+                // the inbox entry but never woke until polled manually.
+                let _ = crate::inbox::enqueue_with_idle_hint(
                     home,
                     sub,
                     crate::inbox::InboxMessage {
@@ -1171,7 +1178,15 @@ async fn ci_check_repo(
         new_notified_conclusion = conclusion.map(String::from);
     }
 
-    // Issue #650: auto-route [ci-ready-for-action] to next_after_ci target on pass
+    // Issue #650 + #1030: auto-route [ci-ready-for-action] to
+    // next_after_ci target on pass. Pre-#1030 this was a PTY-only
+    // inject (only wakes attentive agents; codex/claude-code idle
+    // backends received text in their PTY buffer but never submitted).
+    // Now uses enqueue_with_idle_hint so the durable JSONL inbox carries
+    // the event AND a [AGEND-MSG-PENDING] PTY hint fires to wake the
+    // recipient. Drop the registry lookup — enqueue_with_idle_hint
+    // delivers durably regardless of agent presence, which is the
+    // correct semantic for an actionable handoff.
     if new_notified_sha.is_some() {
         if let Ok(content) = std::fs::read_to_string(watch_path) {
             if let Ok(watch) = serde_json::from_str::<serde_json::Value>(&content) {
@@ -1179,13 +1194,9 @@ async fn ci_check_repo(
                     // Only route on success (not failure)
                     let last_conclusion = aggregate_conclusion_for_sha(&runs, current_sha);
                     if last_conclusion == Some("success") {
-                        let msg =
-                            format!("[ci-ready-for-action] {repo}@{branch}: CI passed, your turn.");
-                        let reg = agent::lock_registry(registry);
-                        if let Some(handle) = reg.get(next) {
-                            let _ = agent::inject_to_agent(handle, msg.as_bytes());
-                        }
-                        drop(reg);
+                        let repo_branch_key = format!("{repo}@{branch}");
+                        let msg = make_ci_ready_for_action_msg(repo, branch, &repo_branch_key);
+                        let _ = crate::inbox::enqueue_with_idle_hint(home, next, msg);
                     }
                 }
 
@@ -3801,10 +3812,7 @@ mod tests {
         ))
         .unwrap();
         let messages = crate::inbox::drain(&dir, "reviewer");
-        let from_ci: Vec<_> = messages
-            .iter()
-            .filter(|m| m.from == "system:ci")
-            .collect();
+        let from_ci: Vec<_> = messages.iter().filter(|m| m.from == "system:ci").collect();
         assert_eq!(
             from_ci.len(),
             1,
