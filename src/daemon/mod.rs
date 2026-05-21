@@ -22,6 +22,7 @@ pub(crate) mod per_tick;
 pub(crate) mod poll_reminder;
 pub(crate) mod pr_state;
 pub(crate) mod restart;
+pub(crate) mod retention;
 pub(crate) mod router;
 pub(crate) mod supervisor;
 pub(crate) mod task_progress;

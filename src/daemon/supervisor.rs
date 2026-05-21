@@ -271,6 +271,7 @@ fn run_loop(
     // second team requests its own policy (L2.1 schema bump).
     let mut dispatch_idle_fixup_nudge_tracker =
         crate::daemon::dispatch_idle::fixup_nudge::DispatchIdleFixupNudgeTracker::default();
+    let mut retention_supervisor = crate::daemon::retention::RetentionSupervisor::default();
     loop {
         thread::sleep(TICK);
         tick(&home, &registry, &mut notify_tracks);
@@ -287,6 +288,7 @@ fn run_loop(
         auto_release_tracker.maybe_scan(&home);
         dispatch_idle_tracker.maybe_scan(&home);
         dispatch_idle_fixup_nudge_tracker.maybe_scan(&home);
+        retention_supervisor.maybe_sweep(&home);
         // #1002 Phase 2: pr_state per-tick scan must run here so APP
         // mode (`agend-terminal app`) drives the #972 aggregator + #986
         // gh-poll integration the same way as daemon mode. Before this
