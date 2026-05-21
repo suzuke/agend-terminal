@@ -161,6 +161,7 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
             eta_minutes: params["eta_minutes"].as_u64().map(|v| v as u32),
             reporting_cadence: params["reporting_cadence"].as_str().map(String::from),
             worktree_binding_required: params["worktree_binding_required"].as_bool(),
+            pr_number: None,
         }
     };
 
@@ -1652,6 +1653,7 @@ mod tests {
             eta_minutes: None,
             reporting_cadence: None,
             worktree_binding_required: None,
+            pr_number: None,
         };
         crate::inbox::enqueue(home, target, msg).expect("seed blocker");
     }
@@ -1746,6 +1748,7 @@ mod tests {
             eta_minutes: None,
             reporting_cadence: None,
             worktree_binding_required: None,
+            pr_number: None,
         };
         msg.read_at = None;
         crate::inbox::enqueue(&home_path, "codex-agent", msg).expect("seed");

@@ -637,6 +637,7 @@ pub(crate) fn make_ci_conflict_alert_msg(
         eta_minutes: None,
         reporting_cadence: None,
         worktree_binding_required: None,
+        pr_number: None,
     }
 }
 
@@ -676,6 +677,7 @@ pub(crate) fn make_ci_stale_drop_msg(
         eta_minutes: None,
         reporting_cadence: None,
         worktree_binding_required: None,
+        pr_number: None,
     }
 }
 
@@ -683,10 +685,21 @@ pub(crate) fn make_ci_stale_drop_msg(
 /// `next_after_ci` chain target on CI pass (#1030). Single construction
 /// site so the production emit and the deterministic-hint test (T4)
 /// see identical bytes.
+///
+/// #1031 enrichment: `head_sha` (full 40-char), `pr_number`, and
+/// `task_id` are threaded through so reviewers receive a
+/// directly-actionable payload without needing `gh pr list --head` or
+/// `git rev-parse` lookups. All three fall through to `Option::None`
+/// when the upstream cache (pr_state) doesn't yet have the data —
+/// graceful degradation for fresh watches where the first poll hasn't
+/// populated the aggregator.
 pub(crate) fn make_ci_ready_for_action_msg(
     repo: &str,
     branch: &str,
     repo_branch_key: &str,
+    head_sha: Option<&str>,
+    pr_number: Option<u64>,
+    task_id: Option<&str>,
 ) -> crate::inbox::InboxMessage {
     crate::inbox::InboxMessage {
         schema_version: 0,
@@ -694,12 +707,12 @@ pub(crate) fn make_ci_ready_for_action_msg(
         read_at: None,
         thread_id: None,
         parent_id: None,
-        task_id: None,
+        task_id: task_id.map(String::from),
         force_meta: None,
         // Same canonical `{repo}@{branch}` form used by the [ci-pass]
         // subscriber enqueue so inbox readers can correlate the two.
         correlation_id: Some(repo_branch_key.to_string()),
-        reviewed_head: None,
+        reviewed_head: head_sha.map(String::from),
         from: "system:ci".to_string(),
         text: format!("[ci-ready-for-action] {repo}@{branch}: CI passed, your turn."),
         kind: Some("ci-ready-for-action".to_string()),
@@ -716,6 +729,7 @@ pub(crate) fn make_ci_ready_for_action_msg(
         eta_minutes: None,
         reporting_cadence: None,
         worktree_binding_required: None,
+        pr_number,
     }
 }
 
@@ -1214,6 +1228,7 @@ async fn ci_check_repo(
                         eta_minutes: None,
                         reporting_cadence: None,
                         worktree_binding_required: None,
+                        pr_number: None,
                     },
                 );
             }
@@ -1242,7 +1257,16 @@ async fn ci_check_repo(
                     let last_conclusion = aggregate_conclusion_for_sha(&runs, current_sha);
                     if last_conclusion == Some("success") {
                         let repo_branch_key = format!("{repo}@{branch}");
-                        let msg = make_ci_ready_for_action_msg(repo, branch, &repo_branch_key);
+                        // #1031 RED: enrichment params are None at this commit;
+                        // GREEN wires them from pr_state + watch.task_id.
+                        let msg = make_ci_ready_for_action_msg(
+                            repo,
+                            branch,
+                            &repo_branch_key,
+                            None,
+                            None,
+                            None,
+                        );
                         let _ = crate::inbox::enqueue_with_idle_hint(home, next, msg);
                     }
                 }
@@ -3801,6 +3825,230 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// #1031 T1: site 3 emit populates `reviewed_head` with the full
+    /// 40-char head SHA from the CI run. RED at this commit (caller
+    /// passes None); GREEN reads `current_sha` at the emit site.
+    #[test]
+    fn ci_ready_for_action_carries_full_head_sha() {
+        let dir = tmp_dir("1031-t1-head-sha");
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).ok();
+        let watch = serde_json::json!({
+            "repo": "o/r",
+            "branch": "feat",
+            "subscribers": [{"instance": "lead", "subscribed_at": "2026-05-21T00:00:00Z"}],
+            "instance": "lead",
+            "interval_secs": 60,
+            "last_run_id": null,
+            "head_sha": null,
+            "last_polled_at": null,
+            "last_notified_head_sha": null,
+            "next_after_ci": "reviewer",
+            "expires_at": (chrono::Utc::now() + chrono::Duration::hours(72)).to_rfc3339(),
+            "last_terminal_seen_at": null,
+        });
+        let watch_path = ci_dir.join(watch_filename("o/r", "feat"));
+        std::fs::write(&watch_path, serde_json::to_string_pretty(&watch).unwrap()).unwrap();
+        let provider = MockCiProvider::with_runs(vec![CiRun {
+            id: 1,
+            conclusion: Some("success".to_string()),
+            // Use a realistic full 40-char SHA.
+            head_sha: "abc1234567890abcdef1234567890abcdef12345".to_string(),
+            url: "https://example/run/1".to_string(),
+        }]);
+        let registry: AgentRegistry =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(ci_check_repo(
+            &dir,
+            &watch_path,
+            "o/r",
+            "feat",
+            &["lead".to_string()],
+            None,
+            None,
+            None,
+            None,
+            None,
+            &registry,
+            &provider,
+        ))
+        .unwrap();
+        let messages = crate::inbox::drain(&dir, "reviewer");
+        let action = messages
+            .iter()
+            .find(|m| m.kind.as_deref() == Some("ci-ready-for-action"))
+            .expect("chain target must have a [ci-ready-for-action] entry");
+        assert_eq!(
+            action.reviewed_head.as_deref(),
+            Some("abc1234567890abcdef1234567890abcdef12345"),
+            "#1031 GREEN: reviewed_head must be the full 40-char SHA; got: {action:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #1031 T2: site 3 emit populates `pr_number` from the pr_state
+    /// aggregator cache. RED at this commit (caller passes None);
+    /// GREEN reads `pr_state::load(home, repo, branch)`.
+    #[test]
+    fn ci_ready_for_action_carries_pr_number_from_pr_state() {
+        let dir = tmp_dir("1031-t2-pr-number");
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).ok();
+        // Pre-populate the pr_state file so the emit-site lookup
+        // finds the cached PR#. record_ci_result writes this naturally
+        // in production; here we seed it manually so the test focuses
+        // on the read-side enrichment.
+        let pr_state_dir = dir.join("pr-state");
+        std::fs::create_dir_all(&pr_state_dir).ok();
+        // The pr_state filename helper hashes repo+branch; emulate by
+        // writing via the public seam.
+        crate::daemon::pr_state::record_ci_result(
+            &dir,
+            "o/r",
+            "feat",
+            "abc1234567890abcdef1234567890abcdef12345",
+            crate::daemon::pr_state::CiConclusion::Pending,
+            vec!["lead".to_string()],
+            crate::daemon::pr_state::ReviewClass::Single,
+        );
+        // Now set pr_number on the seeded state.
+        let pr_state_path = crate::daemon::pr_state::pr_state_dir(&dir)
+            .join(crate::daemon::pr_state::pr_state_filename("o/r", "feat"));
+        if let Ok(content) = std::fs::read_to_string(&pr_state_path) {
+            if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&content) {
+                v["pr_number"] = serde_json::json!(1031);
+                std::fs::write(&pr_state_path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+            }
+        }
+        let watch = serde_json::json!({
+            "repo": "o/r",
+            "branch": "feat",
+            "subscribers": [{"instance": "lead", "subscribed_at": "2026-05-21T00:00:00Z"}],
+            "instance": "lead",
+            "interval_secs": 60,
+            "last_run_id": null,
+            "head_sha": null,
+            "last_polled_at": null,
+            "last_notified_head_sha": null,
+            "next_after_ci": "reviewer",
+            "expires_at": (chrono::Utc::now() + chrono::Duration::hours(72)).to_rfc3339(),
+            "last_terminal_seen_at": null,
+        });
+        let watch_path = ci_dir.join(watch_filename("o/r", "feat"));
+        std::fs::write(&watch_path, serde_json::to_string_pretty(&watch).unwrap()).unwrap();
+        let provider = MockCiProvider::with_runs(vec![CiRun {
+            id: 2,
+            conclusion: Some("success".to_string()),
+            head_sha: "abc1234567890abcdef1234567890abcdef12345".to_string(),
+            url: "https://example/run/2".to_string(),
+        }]);
+        let registry: AgentRegistry =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(ci_check_repo(
+            &dir,
+            &watch_path,
+            "o/r",
+            "feat",
+            &["lead".to_string()],
+            None,
+            None,
+            None,
+            None,
+            None,
+            &registry,
+            &provider,
+        ))
+        .unwrap();
+        let messages = crate::inbox::drain(&dir, "reviewer");
+        let action = messages
+            .iter()
+            .find(|m| m.kind.as_deref() == Some("ci-ready-for-action"))
+            .expect("chain target must have a [ci-ready-for-action] entry");
+        assert_eq!(
+            action.pr_number,
+            Some(1031),
+            "#1031 GREEN: pr_number must be populated from pr_state cache; got: {action:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #1031 T3: site 3 emit populates `task_id` from the ci-watch
+    /// sidecar's persisted dispatch task_id. RED at this commit
+    /// (caller passes None); GREEN reads `watch["task_id"]`. This
+    /// also implicitly RED-asserts the dispatch-side persist hop —
+    /// the watch sidecar pre-seeded below carries `task_id` directly,
+    /// which the GREEN read path picks up regardless of how it
+    /// arrived (dispatch persist OR manual ci_watch arm).
+    #[test]
+    fn ci_ready_for_action_carries_task_id_from_watch_sidecar() {
+        let dir = tmp_dir("1031-t3-task-id");
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).ok();
+        let watch = serde_json::json!({
+            "repo": "o/r",
+            "branch": "feat",
+            "subscribers": [{"instance": "lead", "subscribed_at": "2026-05-21T00:00:00Z"}],
+            "instance": "lead",
+            "interval_secs": 60,
+            "last_run_id": null,
+            "head_sha": null,
+            "last_polled_at": null,
+            "last_notified_head_sha": null,
+            "next_after_ci": "reviewer",
+            "task_id": "t-1031-dispatch-id",
+            "expires_at": (chrono::Utc::now() + chrono::Duration::hours(72)).to_rfc3339(),
+            "last_terminal_seen_at": null,
+        });
+        let watch_path = ci_dir.join(watch_filename("o/r", "feat"));
+        std::fs::write(&watch_path, serde_json::to_string_pretty(&watch).unwrap()).unwrap();
+        let provider = MockCiProvider::with_runs(vec![CiRun {
+            id: 3,
+            conclusion: Some("success".to_string()),
+            head_sha: "abc1234567890abcdef1234567890abcdef12345".to_string(),
+            url: "https://example/run/3".to_string(),
+        }]);
+        let registry: AgentRegistry =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(ci_check_repo(
+            &dir,
+            &watch_path,
+            "o/r",
+            "feat",
+            &["lead".to_string()],
+            None,
+            None,
+            None,
+            None,
+            None,
+            &registry,
+            &provider,
+        ))
+        .unwrap();
+        let messages = crate::inbox::drain(&dir, "reviewer");
+        let action = messages
+            .iter()
+            .find(|m| m.kind.as_deref() == Some("ci-ready-for-action"))
+            .expect("chain target must have a [ci-ready-for-action] entry");
+        assert_eq!(
+            action.task_id.as_deref(),
+            Some("t-1031-dispatch-id"),
+            "#1031 GREEN: task_id must propagate from watch sidecar; got: {action:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// T4 (deterministic hint delivery via test seam):
     /// `make_ci_ready_for_action_msg` produces an InboxMessage that,
     /// when passed through `enqueue_with_idle_hint_with_emitter`,
@@ -3810,7 +4058,7 @@ mod tests {
     fn ci_ready_for_action_hint_format_deterministic() {
         let dir = tmp_dir("1030-t4-hint-format");
         std::fs::create_dir_all(&dir).unwrap();
-        let msg = super::make_ci_ready_for_action_msg("o/r", "feat", "o/r@feat");
+        let msg = super::make_ci_ready_for_action_msg("o/r", "feat", "o/r@feat", None, None, None);
         let captured: std::sync::Arc<parking_lot::Mutex<Option<String>>> =
             std::sync::Arc::new(parking_lot::Mutex::new(None));
         let cap = captured.clone();

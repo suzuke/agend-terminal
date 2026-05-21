@@ -126,6 +126,7 @@ mod tests {
                     eta_minutes: None,
                     reporting_cadence: None,
                     worktree_binding_required: None,
+                    pr_number: None,
                 },
             );
         }

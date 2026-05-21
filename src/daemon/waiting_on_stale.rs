@@ -134,6 +134,7 @@ fn emit_to(home: &Path, recipient: &str, kind: &str, text: &str, correlation_age
         eta_minutes: None,
         reporting_cadence: None,
         worktree_binding_required: None,
+        pr_number: None,
     };
     if let Err(e) = crate::inbox::enqueue_with_idle_hint(home, recipient, msg) {
         tracing::warn!(error = %e, recipient, kind, "waiting_on_stale: enqueue failed");

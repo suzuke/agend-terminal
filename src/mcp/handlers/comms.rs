@@ -139,6 +139,7 @@ pub(super) fn handle_send_to_instance(
                 eta_minutes: None,
                 reporting_cadence: None,
                 worktree_binding_required: None,
+                pr_number: None,
             };
             crate::agent_ops::fallback_deliver(home, sender.as_str(), target, text, msg, &e)
         }
@@ -389,6 +390,7 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
                 eta_minutes: None,
                 reporting_cadence: None,
                 worktree_binding_required: None,
+                pr_number: None,
             };
             crate::agent_ops::fallback_deliver(home, sender.as_str(), target, &msg, inbox_msg, &e)
         }
@@ -526,6 +528,7 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
                     eta_minutes: None,
                     reporting_cadence: None,
                     worktree_binding_required: None,
+                    pr_number: None,
                 };
                 crate::agent_ops::fallback_deliver(
                     home,

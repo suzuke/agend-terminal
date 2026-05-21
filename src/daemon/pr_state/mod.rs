@@ -1222,6 +1222,7 @@ fn build_event_message(
         eta_minutes: None,
         reporting_cadence: None,
         worktree_binding_required: None,
+        pr_number: None,
     }
 }
 

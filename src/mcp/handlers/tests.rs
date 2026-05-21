@@ -975,6 +975,7 @@ fn agent_picked_up_emitted_on_inbox_drain() {
             eta_minutes: None,
             reporting_cadence: None,
             worktree_binding_required: None,
+            pr_number: None,
         },
     );
 
@@ -1044,6 +1045,7 @@ fn agent_picked_up_fires_for_all_pending_messages() {
             eta_minutes: None,
             reporting_cadence: None,
             worktree_binding_required: None,
+            pr_number: None,
         },
     );
 
@@ -1223,6 +1225,7 @@ fn test_describe_message_shows_delivery_mode() {
         eta_minutes: None,
         reporting_cadence: None,
         worktree_binding_required: None,
+        pr_number: None,
     };
     let inbox_dir = home.join("inbox");
     std::fs::create_dir_all(&inbox_dir).ok();
