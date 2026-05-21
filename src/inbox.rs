@@ -161,7 +161,7 @@ impl NotifySource<'_> {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InboxMessage {
     #[serde(default)]
     pub schema_version: u32,

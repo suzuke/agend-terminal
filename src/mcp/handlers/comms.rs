@@ -114,32 +114,14 @@ pub(super) fn handle_send_to_instance(
                 }
             }
             let msg = crate::inbox::InboxMessage {
-                schema_version: 0,
-                id: None,
-                read_at: None,
                 thread_id: resolved_thread,
                 parent_id: resolved_parent,
-                task_id: None,
-                force_meta: None,
                 correlation_id: args["correlation_id"].as_str().map(String::from),
-                reviewed_head: None,
                 from: format!("from:{}", sender.as_str()),
                 text: text.to_string(),
-                kind: None,
                 timestamp: chrono::Utc::now().to_rfc3339(),
-                channel: None,
                 delivery_mode: Some("inbox_fallback".to_string()),
-                attachments: vec![],
-                in_reply_to_msg_id: None,
-                in_reply_to_excerpt: None,
-                superseded_by: None,
-                from_id: None,
-                broadcast_context: None,
-                sequencing: None,
-                eta_minutes: None,
-                reporting_cadence: None,
-                worktree_binding_required: None,
-                pr_number: None,
+                ..Default::default()
             };
             crate::agent_ops::fallback_deliver(home, sender.as_str(), target, text, msg, &e)
         }
@@ -363,34 +345,16 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
         Err(e) => {
             // Centralised fallback (Sprint 40 T-7 B4)
             let inbox_msg = crate::inbox::InboxMessage {
-                schema_version: 0,
-                id: None,
-                read_at: None,
-                thread_id: None,
-                parent_id: None,
                 task_id: task_id_str.map(String::from),
                 force_meta: force_meta_json.as_ref().and_then(|v| {
                     serde_json::from_value::<crate::inbox::ForceMeta>(v.clone()).ok()
                 }),
-                correlation_id: None,
-                reviewed_head: None,
                 delivery_mode: Some("inbox_fallback".to_string()),
                 from: format!("from:{}", sender.as_str()),
                 text: msg.clone(),
                 kind: Some("task".to_string()),
                 timestamp: chrono::Utc::now().to_rfc3339(),
-                channel: None,
-                attachments: vec![],
-                in_reply_to_msg_id: None,
-                in_reply_to_excerpt: None,
-                superseded_by: None,
-                from_id: None,
-                broadcast_context: None,
-                sequencing: None,
-                eta_minutes: None,
-                reporting_cadence: None,
-                worktree_binding_required: None,
-                pr_number: None,
+                ..Default::default()
             };
             crate::agent_ops::fallback_deliver(home, sender.as_str(), target, &msg, inbox_msg, &e)
         }
@@ -503,13 +467,8 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
             Err(e) => {
                 // Centralised fallback (Sprint 40 T-7 B4)
                 let inbox_msg = crate::inbox::InboxMessage {
-                    schema_version: 0,
-                    id: None,
-                    read_at: None,
                     thread_id: args["thread_id"].as_str().map(String::from),
                     parent_id: args["parent_id"].as_str().map(String::from),
-                    task_id: None,
-                    force_meta: None,
                     correlation_id: correlation_id.map(String::from),
                     reviewed_head: reviewed_head.map(String::from),
                     delivery_mode: Some("inbox_fallback".to_string()),
@@ -517,18 +476,7 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
                     text: msg.clone(),
                     kind: Some("report".to_string()),
                     timestamp: chrono::Utc::now().to_rfc3339(),
-                    channel: None,
-                    attachments: vec![],
-                    in_reply_to_msg_id: None,
-                    in_reply_to_excerpt: None,
-                    superseded_by: None,
-                    from_id: None,
-                    broadcast_context: None,
-                    sequencing: None,
-                    eta_minutes: None,
-                    reporting_cadence: None,
-                    worktree_binding_required: None,
-                    pr_number: None,
+                    ..Default::default()
                 };
                 crate::agent_ops::fallback_deliver(
                     home,
