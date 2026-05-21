@@ -283,6 +283,7 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
                 ready_pattern: template_ready_pattern,
                 command: template_command,
                 worktree: template_worktree,
+                topic_binding_mode: None,
             },
         ));
         created.push(inst_name);

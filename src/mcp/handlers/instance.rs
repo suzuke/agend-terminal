@@ -207,14 +207,19 @@ pub(super) fn handle_describe_instance(home: &Path, args: &Value) -> Value {
                 Some(agent) => {
                     let mut info = agent.clone();
                     merge_metadata(home, name, &mut info);
-                    // Surface topic_id from fleet.yaml for debugging (#415).
-                    if info.get("topic_id").is_none() {
-                        if let Some(tid) =
-                            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
-                                .ok()
-                                .and_then(|c| c.instances.get(name)?.topic_id)
-                        {
-                            info["topic_id"] = json!(tid);
+                    // Surface topic_id + topic_binding_mode from fleet.yaml.
+                    if let Some(inst) =
+                        crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+                            .ok()
+                            .and_then(|c| c.instances.get(name).cloned())
+                    {
+                        if info.get("topic_id").is_none() {
+                            if let Some(tid) = inst.topic_id {
+                                info["topic_id"] = json!(tid);
+                            }
+                        }
+                        if let Some(ref mode) = inst.topic_binding_mode {
+                            info["topic_binding_mode"] = json!(mode);
                         }
                     }
                     json!({"instance": info})

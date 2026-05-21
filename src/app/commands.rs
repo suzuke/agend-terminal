@@ -65,6 +65,7 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
                     ready_pattern: None,
                     command: None,
                     worktree: None,
+                    topic_binding_mode: None,
                 },
             ) {
                 tracing::warn!(name = %inst_name, error = %e, "failed to write fleet.yaml");

@@ -214,6 +214,7 @@ mod tests {
             ready_pattern: None,
             command: None,
             worktree: None,
+            topic_binding_mode: None,
         }
     }
 
@@ -313,6 +314,7 @@ mod tests {
             ready_pattern: None,
             command: None,
             worktree: None,
+            topic_binding_mode: None,
         };
         let outcome = add_instance_with_topic(&home, "ctrlb-c-agent", &entry).expect("Ok");
 
@@ -359,6 +361,7 @@ mod tests {
             ready_pattern: None,
             command: None,
             worktree: None,
+            topic_binding_mode: None,
         };
         let outcome = add_instance_with_topic(&home, "palette-agent", &entry).expect("Ok");
 

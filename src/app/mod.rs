@@ -863,6 +863,7 @@ fn pane_from_menu_item(
                     ready_pattern: None,
                     command: None,
                     worktree: None,
+                    topic_binding_mode: None,
                 },
             ) {
                 tracing::warn!(error = %e, "failed to write fleet.yaml");
