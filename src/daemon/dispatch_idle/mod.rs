@@ -24,6 +24,23 @@ use std::path::{Path, PathBuf};
 const PENDING_DIR: &str = "pending-dispatches";
 const SCHEMA_VERSION: u32 = 1;
 
+/// #1018: correlation_id sentinels that the watchdog treats as
+/// placeholder values (no real task-board cross-reference possible).
+/// Sidecars carrying any of these are cleared on the watchdog tick
+/// instead of firing `dispatch_idle_threshold_exceeded` — they
+/// generate noise because the same value is reused across multiple
+/// parallel dispatches so `mark_resolved`'s first-match clears only
+/// one slot while sibling sidecars linger.
+///
+/// Empty string is implicit via `correlation_id.is_none()`.
+const PLACEHOLDER_CORRELATION_IDS: &[&str] = &["t-pending", "t-tbd"];
+
+/// #1018: status values that count as "task still live" — sidecar
+/// targeting a real task whose status matches one of these stays
+/// armed. Anything else (`done`, `cancelled`, `verified`, etc.) means
+/// the task is closed and the sidecar should be cleared.
+const LIVE_TASK_STATUSES: &[&str] = &["open", "claimed", "in_progress", "blocked"];
+
 /// Scan throttle in supervisor ticks. 6 ≈ 60s at the 10s tick rate —
 /// faster than the 30-tick siblings because the threshold the watchdog
 /// is gating (single-digit minutes for orchestrator-class dispatches)
@@ -169,6 +186,139 @@ fn write_dispatch(home: &Path, d: &PendingDispatch) -> bool {
     crate::store::atomic_write(&pending_path(home, &d.dispatch_id), body.as_bytes()).is_ok()
 }
 
+/// #1018 (A): is the correlation_id an explicit placeholder sentinel
+/// (`t-pending`, `t-tbd`, or empty/whitespace-only string) that the
+/// watchdog should clear without firing a notification?
+///
+/// **Note on `None`**: `correlation_id == None` is NOT treated as a
+/// placeholder — it means the dispatch never had an upstream
+/// correlation in the first place, and #947 (load-bearing operator
+/// contract) requires the nudge to still fire with `dispatch_id` as
+/// the fallback. Only sidecars that explicitly carry a placeholder
+/// STRING are eligible for silent cleanup.
+fn is_placeholder_correlation(corr: Option<&str>) -> bool {
+    let Some(c) = corr else {
+        return false;
+    };
+    let c = c.trim();
+    if c.is_empty() {
+        return true;
+    }
+    PLACEHOLDER_CORRELATION_IDS.contains(&c)
+}
+
+/// #1018 (A): is `agent` a known target in the current fleet registry?
+/// Falls back to "yes" (treats unknown fleet.yaml state as live) on
+/// any read/parse error so a transient I/O glitch doesn't flush real
+/// pending dispatches.
+fn target_in_fleet(home: &Path, agent: &str) -> bool {
+    let Ok(fleet) = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)) else {
+        return true; // fail-open
+    };
+    fleet.resolve_instance(agent).is_some()
+}
+
+/// #1018 (A): is `task_id` still live on the task board? Returns
+/// `Some(true)` for live (one of `LIVE_TASK_STATUSES`); `Some(false)`
+/// for a definitively closed task (`done`, `cancelled`, etc.);
+/// `None` when the task can't be found at all (treat as live —
+/// fail-open).
+fn task_still_live(home: &Path, task_id: &str) -> Option<bool> {
+    if task_id.is_empty() {
+        return None;
+    }
+    let path = home.join("tasks").join(format!("{task_id}.json"));
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return None;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return None;
+    };
+    let status = value.get("status").and_then(|v| v.as_str())?;
+    Some(LIVE_TASK_STATUSES.contains(&status))
+}
+
+/// #1018 (B) eager cleanup: when a task transitions to a terminal
+/// state (done / cancelled), scan pending sidecars and delete any
+/// whose `correlation_id` matches the closed task_id. Prevents the
+/// watchdog firing later on a dispatch whose work has already been
+/// reported via the task board instead of via `kind=report`. Returns
+/// the count of sidecars deleted (for callers that want to log).
+pub(crate) fn cleanup_pending_for_task_id(home: &Path, task_id: &str) -> usize {
+    if task_id.is_empty() || is_placeholder_correlation(Some(task_id)) {
+        return 0;
+    }
+    let mut count = 0usize;
+    for d in list_pending(home) {
+        if d.status != "pending" {
+            continue;
+        }
+        if d.correlation_id.as_deref() != Some(task_id) {
+            continue;
+        }
+        let path = pending_path(home, &d.dispatch_id);
+        if std::fs::remove_file(&path).is_ok() {
+            count += 1;
+            tracing::debug!(
+                target: "dispatch_idle",
+                dispatch_id = %d.dispatch_id,
+                task_id = %task_id,
+                "#1018 cleared stale sidecar — task_id closed"
+            );
+        }
+    }
+    if count > 0 {
+        tracing::info!(
+            target: "dispatch_idle",
+            task_id = %task_id,
+            count,
+            "#1018 cleared pending sidecars on task closure"
+        );
+    }
+    count
+}
+
+/// #1018 (C) eager cleanup: when an instance is deleted, scan pending
+/// sidecars and delete any whose `target` matches the deleted instance
+/// name. The deleted instance can never deliver a `kind=report`, so
+/// every sidecar targeting it would fire watchdog noise indefinitely.
+/// Returns the count of sidecars deleted (best-effort; failures are
+/// silently skipped, matching the rest of `full_delete_instance`'s
+/// cleanup contract).
+pub(crate) fn cleanup_pending_for_instance(home: &Path, instance_name: &str) -> usize {
+    if instance_name.is_empty() {
+        return 0;
+    }
+    let mut count = 0usize;
+    for d in list_pending(home) {
+        if d.status != "pending" {
+            continue;
+        }
+        if d.target != instance_name {
+            continue;
+        }
+        let path = pending_path(home, &d.dispatch_id);
+        if std::fs::remove_file(&path).is_ok() {
+            count += 1;
+            tracing::debug!(
+                target: "dispatch_idle",
+                dispatch_id = %d.dispatch_id,
+                instance = %instance_name,
+                "#1018 cleared stale sidecar — target instance deleted"
+            );
+        }
+    }
+    if count > 0 {
+        tracing::info!(
+            target: "dispatch_idle",
+            instance = %instance_name,
+            count,
+            "#1018 cleared pending sidecars on instance deletion"
+        );
+    }
+    count
+}
+
 /// Resolve a pending dispatch by `correlation_id` (NOT by sender —
 /// decision_timeout's sender-keyed semantic is wrong here because a
 /// single dispatcher can have multiple pending dispatches outstanding,
@@ -276,10 +426,58 @@ pub(crate) fn scan_and_emit(home: &Path) {
         if elapsed_secs <= d.threshold_secs {
             continue;
         }
+
+        // #1018 (A): tick-time validation before firing. Stale sidecars
+        // (placeholder correlation_id / deleted target instance / closed
+        // task_id) are deleted silently — operator already received the
+        // canonical signal via task board / instance lifecycle, no need
+        // to surface a second-class "idle threshold" notification.
+        if let Some(reason) = stale_sidecar_reason(home, &d) {
+            let path = pending_path(home, &d.dispatch_id);
+            let _ = std::fs::remove_file(&path);
+            tracing::debug!(
+                target: "dispatch_idle",
+                dispatch_id = %d.dispatch_id,
+                target = %d.target,
+                correlation_id = ?d.correlation_id,
+                reason,
+                "#1018 cleared stale sidecar at tick"
+            );
+            continue;
+        }
+
         emit_exceeded_event(home, &d, elapsed_secs);
         d.status = "exceeded".to_string();
         let _ = write_dispatch(home, &d);
     }
+}
+
+/// #1018 (A): classify whether a sidecar is stale (eligible for
+/// silent cleanup) at the watchdog tick. Returns `Some(reason)` for
+/// stale; `None` for live (proceed with normal exceeded-event emit).
+///
+/// Three stale classes:
+/// - placeholder correlation_id (lead-side hygiene bug — sidecars
+///   sharing `t-pending` etc. across parallel dispatches)
+/// - target instance no longer in fleet (deleted)
+/// - correlation_id is a real task_id that's already done/cancelled
+///
+/// Fail-open semantics: any read/parse error in the lookup paths
+/// treats the sidecar as live (preserves the existing behavior under
+/// transient I/O glitches).
+fn stale_sidecar_reason(home: &Path, d: &PendingDispatch) -> Option<&'static str> {
+    if is_placeholder_correlation(d.correlation_id.as_deref()) {
+        return Some("placeholder_correlation_id");
+    }
+    if !target_in_fleet(home, &d.target) {
+        return Some("target_not_in_fleet");
+    }
+    if let Some(corr) = d.correlation_id.as_deref() {
+        if let Some(false) = task_still_live(home, corr) {
+            return Some("task_closed");
+        }
+    }
+    None
 }
 
 fn emit_exceeded_event(home: &Path, d: &PendingDispatch, elapsed_secs: i64) {
@@ -943,6 +1141,320 @@ mod tests {
                 "gamma nudge correlation_id must be non-empty (fallback): {m:?}"
             );
         }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #1018: stale-sidecar cleanup ───────────────────────────────────
+
+    /// #1018 (A) — placeholder correlation_id classifier covers the
+    /// known sentinels (`t-pending`, `t-tbd`) and the explicit-empty
+    /// string variant. `None` is NOT a placeholder per #947 contract:
+    /// dispatches without upstream correlation must still fire the
+    /// threshold event with `dispatch_id` as fallback. Other strings
+    /// (even short / suspicious-looking ones) are also NOT placeholders.
+    #[test]
+    fn t1018_a_placeholder_correlation_predicate() {
+        assert!(is_placeholder_correlation(Some("t-pending")));
+        assert!(is_placeholder_correlation(Some("t-tbd")));
+        assert!(is_placeholder_correlation(Some("")));
+        assert!(is_placeholder_correlation(Some("   ")));
+        assert!(
+            !is_placeholder_correlation(None),
+            "None != placeholder — #947 fallback contract preserved"
+        );
+        assert!(!is_placeholder_correlation(Some(
+            "t-20260520163333000054-1"
+        )));
+        assert!(!is_placeholder_correlation(Some("t-pending-real")));
+        assert!(!is_placeholder_correlation(Some("real-id")));
+    }
+
+    /// #1018 (A) — sidecar with placeholder correlation_id is cleared
+    /// at scan tick without firing the threshold event.
+    #[test]
+    fn t1018_a_placeholder_correlation_swept_silently() {
+        let home = tmp_home("1018-placeholder");
+        let issued = chrono::Utc::now() - chrono::Duration::seconds(700);
+        let id = write_pending_at(
+            &home,
+            "fixup-lead",
+            "fixup-dev-2",
+            Some("t-pending"),
+            "task",
+            600,
+            issued,
+        );
+        scan_and_emit(&home);
+        let inbox = crate::inbox::drain(&home, "fixup-lead");
+        assert!(
+            !inbox
+                .iter()
+                .any(|m| m.kind.as_deref() == Some("dispatch_idle_threshold_exceeded")),
+            "placeholder correlation_id MUST NOT fire threshold event: {inbox:?}"
+        );
+        let pending = list_pending(&home);
+        assert!(
+            pending.iter().all(|p| p.dispatch_id != id),
+            "stale placeholder sidecar MUST be removed from disk"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1018 (A) — sidecar targeting a non-fleet agent is cleared
+    /// silently (fleet.yaml exists but instance not listed).
+    #[test]
+    fn t1018_a_missing_target_in_fleet_swept_silently() {
+        let home = tmp_home("1018-missing-target");
+        // Empty fleet.yaml → resolve_instance returns None for any name.
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").unwrap();
+        let issued = chrono::Utc::now() - chrono::Duration::seconds(700);
+        let id = write_pending_at(
+            &home,
+            "fixup-lead",
+            "ghost-agent",
+            Some("t-real-task-123"),
+            "task",
+            600,
+            issued,
+        );
+        scan_and_emit(&home);
+        let inbox = crate::inbox::drain(&home, "fixup-lead");
+        assert!(
+            !inbox
+                .iter()
+                .any(|m| m.kind.as_deref() == Some("dispatch_idle_threshold_exceeded")),
+            "missing target MUST NOT fire threshold event: {inbox:?}"
+        );
+        let pending = list_pending(&home);
+        assert!(
+            pending.iter().all(|p| p.dispatch_id != id),
+            "stale missing-target sidecar MUST be removed from disk"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1018 (A) — sidecar correlation_id maps to a real task_id but
+    /// that task is already `done` on the board. Cleared silently.
+    #[test]
+    fn t1018_a_closed_task_id_swept_silently() {
+        let home = tmp_home("1018-closed-task");
+        // Provide a fleet.yaml that includes the target so the
+        // missing-target branch doesn't trip first.
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  fixup-dev-2:\n    backend: claude\n",
+        )
+        .unwrap();
+        let task_id = "t-closed-12345";
+        let tasks_dir = home.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        std::fs::write(
+            tasks_dir.join(format!("{task_id}.json")),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "id": task_id,
+                "status": "done",
+                "title": "test",
+                "assignee": "fixup-dev-2"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let issued = chrono::Utc::now() - chrono::Duration::seconds(700);
+        let id = write_pending_at(
+            &home,
+            "fixup-lead",
+            "fixup-dev-2",
+            Some(task_id),
+            "task",
+            600,
+            issued,
+        );
+        scan_and_emit(&home);
+        let inbox = crate::inbox::drain(&home, "fixup-lead");
+        assert!(
+            !inbox
+                .iter()
+                .any(|m| m.kind.as_deref() == Some("dispatch_idle_threshold_exceeded")),
+            "closed task_id MUST NOT fire threshold event: {inbox:?}"
+        );
+        let pending = list_pending(&home);
+        assert!(
+            pending.iter().all(|p| p.dispatch_id != id),
+            "stale closed-task sidecar MUST be removed from disk"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1018 (A) anti-regression — real task_id + present target +
+    /// task status `in_progress` MUST still fire the threshold event
+    /// when overdue. Guards against over-rotation into clearing live
+    /// sidecars.
+    #[test]
+    fn t1018_a_live_dispatch_still_fires() {
+        let home = tmp_home("1018-live");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  fixup-dev-2:\n    backend: claude\n",
+        )
+        .unwrap();
+        let task_id = "t-live-99";
+        let tasks_dir = home.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        std::fs::write(
+            tasks_dir.join(format!("{task_id}.json")),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "id": task_id,
+                "status": "in_progress",
+                "title": "live work",
+                "assignee": "fixup-dev-2"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let issued = chrono::Utc::now() - chrono::Duration::seconds(700);
+        write_pending_at(
+            &home,
+            "fixup-lead",
+            "fixup-dev-2",
+            Some(task_id),
+            "task",
+            600,
+            issued,
+        );
+        scan_and_emit(&home);
+        let inbox = crate::inbox::drain(&home, "fixup-lead");
+        assert!(
+            inbox.iter().any(
+                |m| m.kind.as_deref() == Some("dispatch_idle_threshold_exceeded")
+                    && m.correlation_id.as_deref() == Some(task_id)
+            ),
+            "live overdue dispatch MUST still fire — got: {inbox:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1018 (B) — `cleanup_pending_for_task_id` deletes sidecars
+    /// matching the closed task_id; leaves others untouched.
+    #[test]
+    fn t1018_b_cleanup_pending_for_task_id() {
+        let home = tmp_home("1018-task-done-cleanup");
+        let now = chrono::Utc::now();
+        let id_match_1 = write_pending_at(
+            &home,
+            "fixup-lead",
+            "dev-1",
+            Some("t-target"),
+            "task",
+            600,
+            now,
+        );
+        let id_match_2 = write_pending_at(
+            &home,
+            "fixup-lead",
+            "dev-2",
+            Some("t-target"),
+            "task",
+            600,
+            now,
+        );
+        let id_other = write_pending_at(
+            &home,
+            "fixup-lead",
+            "dev-1",
+            Some("t-different"),
+            "task",
+            600,
+            now,
+        );
+
+        let cleared = cleanup_pending_for_task_id(&home, "t-target");
+        assert_eq!(cleared, 2, "must delete both sidecars for closed task");
+
+        let pending = list_pending(&home);
+        assert!(pending.iter().all(|p| p.dispatch_id != id_match_1));
+        assert!(pending.iter().all(|p| p.dispatch_id != id_match_2));
+        assert!(
+            pending.iter().any(|p| p.dispatch_id == id_other),
+            "unrelated task_id sidecar must NOT be cleared"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1018 (B) — `cleanup_pending_for_task_id` refuses to act on
+    /// placeholder task_ids so a stray `task_id=t-pending` close
+    /// can't wipe unrelated sidecars.
+    #[test]
+    fn t1018_b_cleanup_refuses_placeholder_task_id() {
+        let home = tmp_home("1018-cleanup-placeholder");
+        let now = chrono::Utc::now();
+        let id = write_pending_at(
+            &home,
+            "fixup-lead",
+            "dev-1",
+            Some("t-pending"),
+            "task",
+            600,
+            now,
+        );
+        let cleared = cleanup_pending_for_task_id(&home, "t-pending");
+        assert_eq!(cleared, 0, "placeholder task_id MUST NOT trigger cleanup");
+        // Sidecar still exists on disk.
+        let pending = list_pending(&home);
+        assert!(pending.iter().any(|p| p.dispatch_id == id));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1018 (C) — `cleanup_pending_for_instance` deletes sidecars
+    /// targeting the deleted instance; leaves dispatcher-side and
+    /// other-target sidecars untouched.
+    #[test]
+    fn t1018_c_cleanup_pending_for_instance() {
+        let home = tmp_home("1018-instance-delete-cleanup");
+        let now = chrono::Utc::now();
+        let id_target = write_pending_at(
+            &home,
+            "fixup-lead",
+            "fixup-reviewer",
+            Some("t-aaa"),
+            "task",
+            600,
+            now,
+        );
+        let id_other_target = write_pending_at(
+            &home,
+            "fixup-lead",
+            "fixup-dev-2",
+            Some("t-bbb"),
+            "task",
+            600,
+            now,
+        );
+        // Sidecar where the deleted instance is the DISPATCHER, not
+        // the target. Must NOT be cleared by this cleanup (different
+        // failure mode — dispatcher-side bookkeeping is operator's
+        // responsibility via task board).
+        let id_dispatcher_role = write_pending_at(
+            &home,
+            "fixup-reviewer",
+            "fixup-dev-2",
+            Some("t-ccc"),
+            "task",
+            600,
+            now,
+        );
+
+        let cleared = cleanup_pending_for_instance(&home, "fixup-reviewer");
+        assert_eq!(cleared, 1, "must delete only target-matching sidecar");
+        let pending = list_pending(&home);
+        assert!(pending.iter().all(|p| p.dispatch_id != id_target));
+        assert!(
+            pending.iter().any(|p| p.dispatch_id == id_other_target),
+            "different-target sidecar untouched"
+        );
+        assert!(
+            pending.iter().any(|p| p.dispatch_id == id_dispatcher_role),
+            "dispatcher-role sidecar untouched"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }
