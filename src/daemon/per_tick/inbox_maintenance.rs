@@ -41,12 +41,16 @@ impl PerTickHandler for InboxMaintenanceHandler {
             return;
         }
         // Sub-op order matches the pre-extraction inline composite verbatim.
+        // #1051: hotspot_scan sub-op removed — the hotspot collision
+        // watchdog feature was Phase 1 design and is now handled by
+        // fleet team-membership orchestration. The whole feature
+        // (hotspot.rs + daemon::hotspot_scan wrapper) is deleted in
+        // the same commit.
         crate::inbox::sweep_expired(ctx.home);
         crate::inbox::check_disk_space(ctx.home);
         crate::daemon::run_task_maintenance(ctx.home);
         worktree_auto_cleanup(ctx.home, ctx.configs);
         worktree_gc(ctx.home);
-        crate::daemon::hotspot_scan(ctx.home, ctx.configs);
     }
 }
 

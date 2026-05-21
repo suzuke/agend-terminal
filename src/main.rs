@@ -31,7 +31,6 @@ mod git_helpers;
 mod github_token;
 mod health;
 #[allow(dead_code)]
-mod hotspot;
 mod identity;
 mod inbox;
 mod instance_monitor;
