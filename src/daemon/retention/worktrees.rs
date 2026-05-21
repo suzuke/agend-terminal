@@ -444,7 +444,12 @@ mod tests {
     }
 
     /// T2 (#1058): purge removes entries older than retention window;
-    /// recent entries preserved.
+    /// recent entries preserved. Unix-only: forcing a directory's mtime
+    /// requires `File::set_modified`, but `File::open` on a Windows
+    /// directory needs `FILE_FLAG_BACKUP_SEMANTICS` which `std::fs`
+    /// doesn't expose. The purge logic itself (`SystemTime` arithmetic)
+    /// is platform-agnostic — Unix coverage is sufficient.
+    #[cfg(unix)]
     #[test]
     fn trash_purge_removes_old_preserves_recent() {
         let dir = tmp_home("t2-purge");
