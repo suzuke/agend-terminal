@@ -94,6 +94,7 @@ fn try_archive(src: &Path, dst: &Path) -> std::io::Result<()> {
     }
     match std::fs::rename(src, dst) {
         Ok(()) => Ok(()),
+        #[cfg(unix)]
         Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
             tracing::warn!(
                 src = %src.display(),
