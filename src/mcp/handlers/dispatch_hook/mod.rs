@@ -228,6 +228,25 @@ pub(crate) fn dispatch_auto_bind_lease(
 ///
 /// Callers: `comms.rs::handle_delegate_task` (kind=task dispatches that
 /// declare a workflow chain via `args["next_after_ci"]`).
+///
+/// #1037 Option A auto-derive helper: when the dispatcher omits
+/// `next_after_ci`, look up the target's team membership and return the
+/// first member whose instance name ends in `-reviewer` (the de facto
+/// convention used by `fixup-reviewer`, `demo-reviewer`, etc.). Returns
+/// `None` when the target is teamless or no team member matches —
+/// preserves pre-#1037 behavior for teams that don't follow the
+/// convention.
+///
+/// Self-match is excluded so a dispatcher targeting `<team>-reviewer`
+/// itself doesn't chain to itself.
+pub(crate) fn derive_team_reviewer(home: &Path, target: &str) -> Option<String> {
+    crate::teams::find_team_for(home, target).and_then(|team| {
+        team.members
+            .into_iter()
+            .find(|m| m.ends_with("-reviewer") && m != target)
+    })
+}
+
 pub(crate) fn dispatch_auto_bind_lease_with_chain(
     home: &Path,
     target: &str,
@@ -433,12 +452,31 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
         // CI pass. Pre-#931 callers had to issue a follow-up
         // `ci action=watch next_after_ci=…` manually — easily forgotten
         // and one of the root causes of the 4-in-a-row PR stalls.
+        //
+        // #1037 Option A: when the dispatcher omits next_after_ci (the
+        // empirical case for lead's typical send calls — see #1037
+        // issue body for the dogfood evidence on PR #1035), fall back
+        // to auto-deriving from the target's team via the
+        // `<team>-reviewer` naming convention. Closes the loop where
+        // wake-aware routing (#1030) already worked but never fired
+        // because the chain target field was always None.
+        let effective_next = next_after_ci
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .or_else(|| derive_team_reviewer(home, target));
         let mut watch_args = serde_json::json!({"repo": &r, "branch": branch});
-        if let Some(next) = next_after_ci.filter(|s| !s.is_empty()) {
+        if let Some(ref next) = effective_next {
             watch_args["next_after_ci"] = serde_json::json!(next);
         }
         crate::mcp::handlers::ci::handle_watch_ci(home, &watch_args, target);
-        tracing::info!(%target, repo = %r, %branch, next_after_ci = ?next_after_ci, "dispatch auto-watch_ci");
+        tracing::info!(
+            %target,
+            repo = %r,
+            %branch,
+            next_after_ci = ?effective_next,
+            explicit = next_after_ci.is_some(),
+            "dispatch auto-watch_ci"
+        );
     }
 
     Ok(DispatchOutcome {
