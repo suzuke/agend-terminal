@@ -1289,18 +1289,16 @@ pub fn compose_aware_send(home: &Path, agent_name: &str, message: &str) {
 ///   [`crate::inbox::notify_agent`] on the same hop.
 /// - `daemon::supervisor` member-state-change emit — paired with
 ///   [`crate::inbox::notify_agent`].
-/// - `daemon::ci_watch::poller`: only the [ci-pass] terminal-run
-///   subscriber loop (was line 1092, pre-#1030) was paired with the
-///   companion [`crate::agent::inject_to_agent`] call at line ~1040.
-///   #1030 migrated that site to [`enqueue_with_idle_hint`] because the
-///   PTY inject is only seen by attentive agents; idle backends
-///   (codex / claude-code at the prompt) needed the
-///   `[AGEND-MSG-PENDING]` wake hint to actually surface the CI
-///   transition. Two sibling poller sites — `emit_ci_conflict_alert`
-///   (#946, ~line 149) and the stale-SHA drop (#745, ~line 940) — still
-///   call bare [`enqueue`]; despite this comment's pre-#1030 wording
-///   they were never paired with a PTY inject in the same hop. Tracked
-///   for migration in #1032.
+/// - `daemon::ci_watch::poller`: historically held three raw `enqueue`
+///   sites. #1030 migrated the [ci-pass] subscriber fan-out (line
+///   ~1092) — that one was paired with the companion
+///   [`crate::agent::inject_to_agent`] call at ~1040 but the inject
+///   only wakes attentive agents; idle codex / claude-code backends
+///   needed the `[AGEND-MSG-PENDING]` hint. #1032 then migrated the
+///   two siblings — `emit_ci_conflict_alert` (#946, ~line 149) and
+///   the stale-SHA drop (#745, ~line 980). All three now use
+///   [`enqueue_with_idle_hint`]; the poller carries no remaining bare
+///   `enqueue` exceptions.
 /// - `mcp::handlers::instance` replace handover — the recipient is
 ///   being killed and respawned, so any hint to the about-to-be-dead
 ///   handle is a no-op and the fresh agent reads inbox on startup.

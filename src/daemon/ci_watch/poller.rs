@@ -139,11 +139,18 @@ pub fn emit_ci_conflict_alert(
     subscribers: &[String],
     source: &str,
 ) {
-    // #1032: build the InboxMessage via the shared helper so the
-    // GREEN swap to enqueue_with_idle_hint is a single-LOC diff and
-    // tests + production see identical bytes.
+    // #1032: enqueue_with_idle_hint replaces raw enqueue so idle
+    // backends (codex / claude-code at the prompt) wake on the
+    // [ci-conflict-detected] alert. Pre-#1032 the recipient saw the
+    // entry only on next inbox poll — for a CI-trigger-blocking
+    // condition the operator wants noticed immediately, that delay
+    // was the bug.
     for sub in subscribers {
-        let _ = crate::inbox::enqueue(home, sub, make_ci_conflict_alert_msg(repo, branch, source));
+        let _ = crate::inbox::enqueue_with_idle_hint(
+            home,
+            sub,
+            make_ci_conflict_alert_msg(repo, branch, source),
+        );
     }
 }
 
@@ -1023,11 +1030,14 @@ async fn ci_check_repo(
                 current_sha,
                 "dropping stale CI notification (newer commit on branch)"
             );
-            // #1032: build the InboxMessage via the shared helper so
-            // the GREEN swap to enqueue_with_idle_hint is a single-LOC
-            // diff and tests + production see identical bytes.
+            // #1032: enqueue_with_idle_hint replaces raw enqueue so
+            // idle backends wake on the stale-SHA drop. The drop
+            // event is operator-actionable signal that they pushed a
+            // new commit that superseded an older run mid-flight —
+            // missing it means the operator doesn't know which run
+            // they're watching.
             for sub in subscribers {
-                let _ = crate::inbox::enqueue(
+                let _ = crate::inbox::enqueue_with_idle_hint(
                     home,
                     sub,
                     make_ci_stale_drop_msg(repo, branch, sha, current_sha),
