@@ -204,9 +204,8 @@ pub(crate) fn touch_progress_for_branch(home: &Path, branch: &str) -> Option<Str
             continue;
         }
         let task_id = v["task_id"].as_str().unwrap_or("");
-        // task_id="" means "self" — agent bound itself without a
-        // task board entry; no progress to touch.
-        if task_id.is_empty() || task_id == "self" {
+        // #1044: empty task_id = self-bind without task board entry.
+        if task_id.is_empty() {
             continue;
         }
         touch(home, task_id, ProgressSource::CiPush);
@@ -447,16 +446,15 @@ mod tests {
 
     #[test]
     fn touch_progress_for_branch_skips_self_bindings() {
-        // Defensive: bind_self uses task_id="self" as a marker.
-        // touch_progress_for_branch must skip these — they have no
-        // task board entry to track progress against.
+        // #1044: bind_self without task_id uses empty string.
+        // touch_progress_for_branch must skip these — no task board entry.
         let home = tmp_home("hook-self-binding");
         let runtime_dir = crate::paths::runtime_dir(&home).join("dev");
         std::fs::create_dir_all(&runtime_dir).unwrap();
         let binding = serde_json::json!({
             "version": 1,
             "agent": "dev",
-            "task_id": "self",
+            "task_id": "",
             "branch": "feature/y",
             "issued_at": "2026-05-09T00:00:00Z",
         });

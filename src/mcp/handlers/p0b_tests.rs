@@ -564,7 +564,6 @@ fn bind_self_with_source_repo_arg_succeeds() {
 // ── #1044: bind_self task_id plumbing ──────────────────────────────────
 
 #[test]
-#[ignore = "RED: fails without #1044 fix"]
 fn bind_self_with_task_id_arg_persists_real_task_id() {
     let home = tmp_home("bs-tid");
     let src = setup_git_repo(&home, "beta");
@@ -590,7 +589,6 @@ fn bind_self_with_task_id_arg_persists_real_task_id() {
 }
 
 #[test]
-#[ignore = "RED: fails without #1044 fix"]
 fn bind_self_without_task_id_arg_uses_empty_not_self() {
     let home = tmp_home("bs-no-tid");
     let src = setup_git_repo(&home, "gamma");

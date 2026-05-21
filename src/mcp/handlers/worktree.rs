@@ -88,13 +88,14 @@ pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender
         }
     }
 
-    // task_id="self" — clear distinction from real task IDs in the binding.json
-    // audit trail. The tasks store doesn't need a row for a self-bind; the
-    // string is purely a marker.
+    let task_id = args["task_id"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("");
     match crate::mcp::handlers::dispatch_hook::dispatch_auto_bind_lease_with_source(
         home,
         agent,
-        "self",
+        task_id,
         branch,
         repo_arg,
         source_repo_path.as_deref(),
@@ -421,8 +422,8 @@ mod tests {
         assert_eq!(v["branch"].as_str(), Some("feat/p17"));
         assert_eq!(
             v["task_id"].as_str(),
-            Some("self"),
-            "self-bind must record task_id=self"
+            Some(""),
+            "self-bind without task_id arg must record empty task_id"
         );
 
         // Worktree dir + .agend-managed marker per P0-X / P1-7.

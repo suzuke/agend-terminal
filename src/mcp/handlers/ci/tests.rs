@@ -723,8 +723,8 @@ fn checkout_bind_true_writes_binding_marker_and_arms_watch() {
     assert_eq!(v["branch"].as_str(), Some("feat/p778"));
     assert_eq!(
         v["task_id"].as_str(),
-        Some("self"),
-        "atomic bind must record task_id=self"
+        Some(""),
+        "atomic bind must record empty task_id (no sentinel)"
     );
 
     // Auto-watch_ci must have been armed via derive_repo_from_remote_pub.
@@ -1318,7 +1318,7 @@ fn checkout_bind_true_auto_create_path_preserves_779_tail_ops() {
     let v: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&binding).unwrap()).unwrap();
     assert_eq!(v["branch"].as_str(), Some("feat/p780-tail"));
-    assert_eq!(v["task_id"].as_str(), Some("self"));
+    assert_eq!(v["task_id"].as_str(), Some(""));
 
     // ci_watch arming uses derive_repo_from_remote_pub on origin URL —
     // the fixture's `https://github.com/owner/repo.git` resolves to

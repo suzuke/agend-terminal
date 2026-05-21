@@ -145,7 +145,7 @@ pub(super) fn handle_checkout_repo(home: &Path, args: &Value, instance_name: &st
                 if let Err(e) = crate::binding::bind_full(
                     home,
                     instance_name,
-                    "self",
+                    "",
                     branch,
                     &worktree_dir,
                     &source_canonical,
