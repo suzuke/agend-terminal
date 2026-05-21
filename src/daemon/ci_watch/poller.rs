@@ -267,6 +267,9 @@ pub(super) fn check_ci_watches_with_provider(
         // poll post-upgrade fires once on any terminal run (bounded
         // migration spam, documented in PR body).
         let last_notified_conclusion = watch["last_notified_conclusion"].as_str().map(String::from);
+        // #1026: debounce field — once ci-stale has been emitted for a
+        // SHA, suppress re-emission on subsequent conclusion changes.
+        let last_stale_emitted_sha = watch["last_stale_emitted_sha"].as_str().map(String::from);
 
         // Audit label for remove_watch: comma-joined subscribers so the
         // event log stays human-readable when multiple agents share a watch.
@@ -381,6 +384,7 @@ pub(super) fn check_ci_watches_with_provider(
                 head_sha.as_deref(),
                 last_notified_sha.as_deref(),
                 last_notified_conclusion.as_deref(),
+                last_stale_emitted_sha.as_deref(),
                 &registry,
                 provider.as_ref(),
             )
@@ -686,6 +690,7 @@ async fn ci_check_repo(
     prev_head_sha: Option<&str>,
     last_notified_sha: Option<&str>,
     last_notified_conclusion: Option<&str>,
+    last_stale_emitted_sha: Option<&str>,
     registry: &AgentRegistry,
     provider: &dyn CiProvider,
 ) -> anyhow::Result<()> {
@@ -947,6 +952,9 @@ async fn ci_check_repo(
     // notifications fire below. Persisted at the end alongside
     // `new_notified_sha` in a single atomic write.
     let mut new_notified_conclusion = last_notified_conclusion.map(String::from);
+    // #1026: track the SHA for which ci-stale was already emitted so
+    // subsequent conclusion changes on the same stale SHA don't flood.
+    let new_stale_emitted_sha = last_stale_emitted_sha.map(String::from);
 
     for (idx, run_id, sha) in &deduped {
         let run = &runs[*idx];
@@ -1239,6 +1247,7 @@ async fn ci_check_repo(
         current_sha,
         new_notified_sha.as_deref(),
         new_notified_conclusion.as_deref(),
+        new_stale_emitted_sha.as_deref(),
     );
     Ok(())
 }
@@ -2178,6 +2187,7 @@ mod tests {
             watch_json["head_sha"].as_str(),
             watch_json["last_notified_head_sha"].as_str(),
             watch_json["last_notified_conclusion"].as_str(),
+            watch_json["last_stale_emitted_sha"].as_str(),
             &registry,
             provider,
         ))
@@ -2403,6 +2413,7 @@ mod tests {
             "o/r",
             "feat",
             &["agent1".to_string()],
+            None,
             None,
             None,
             None,
@@ -3199,6 +3210,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &registry,
             &provider,
         ))
@@ -3243,6 +3255,7 @@ mod tests {
             "o/r",
             "feat-old",
             &["agent1".to_string()],
+            None,
             None,
             None,
             None,
@@ -3293,6 +3306,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &registry,
             &provider,
         ))
@@ -3328,6 +3342,7 @@ mod tests {
             "o/r",
             "feat",
             &["agent1".to_string()],
+            None,
             None,
             None,
             None,
@@ -3376,6 +3391,7 @@ mod tests {
             "o/r",
             "feat-merged",
             &["agent1".to_string()],
+            None,
             None,
             None,
             None,
@@ -3467,6 +3483,7 @@ mod tests {
             "o/r",
             "feat",
             &["lead".to_string(), "dev".to_string()],
+            None,
             None,
             None,
             None,
@@ -3568,6 +3585,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &registry,
             &provider,
         ))
@@ -3618,6 +3636,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &registry,
             &provider,
         ))
@@ -3664,6 +3683,7 @@ mod tests {
             "o/r",
             "feat",
             &["lead".to_string(), "dev".to_string()],
+            None,
             None,
             None,
             None,
@@ -3746,6 +3766,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &registry,
             &provider,
         ))
@@ -3803,6 +3824,7 @@ mod tests {
                 "dev".to_string(),
                 "reviewer".to_string(),
             ],
+            None,
             None,
             None,
             None,
@@ -4865,6 +4887,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &registry,
             &provider,
         ))
@@ -4942,6 +4965,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &registry,
             &provider,
         ))
@@ -5009,6 +5033,7 @@ mod tests {
             "o/r",
             "feat",
             &["a".to_string(), "b".to_string(), "c".to_string()],
+            None,
             None,
             None,
             None,
@@ -5219,6 +5244,7 @@ mod tests {
             repo,
             branch,
             &subscribers,
+            None,
             None,
             None,
             None,
@@ -5434,6 +5460,149 @@ mod tests {
         assert!(
             content.contains(expected),
             "ci-conflict-detected message must carry correlation_id={expected}: {content}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── #1026 ci-stale debounce tests ─────────────────────────────
+
+    #[test]
+    fn ci_stale_debounce_suppresses_repeat_for_same_sha() {
+        let dir = tmp_dir("1026-debounce");
+        let provider = MockCiProvider::with_runs(vec![
+            CiRun {
+                id: 301,
+                conclusion: None,
+                head_sha: "newhead".into(),
+                url: "https://example.com/301".into(),
+            },
+            CiRun {
+                id: 300,
+                conclusion: Some("success".into()),
+                head_sha: "oldhead".into(),
+                url: "https://example.com/300".into(),
+            },
+        ]);
+        // First poll: ci-stale fires for oldhead.
+        run_ci_check(&dir, &base_watch(), &provider).unwrap();
+        let inbox_path = dir.join("inbox").join("agent1.jsonl");
+        let first = std::fs::read_to_string(&inbox_path).unwrap();
+        let first_count = first.matches("[ci-stale]").count();
+        assert_eq!(first_count, 1, "first poll emits exactly 1 ci-stale");
+
+        // Read persisted watch to get updated state for second poll.
+        let ci_dir = dir.join("ci-watches");
+        let watch_path = ci_dir.join(watch_filename("o/r", "feat"));
+        let watch: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();
+        assert_eq!(
+            watch["last_stale_emitted_sha"].as_str(),
+            Some("oldhead"),
+            "stale debounce SHA must be persisted"
+        );
+
+        // Second poll: same stale SHA with different conclusion → suppressed.
+        let provider2 = MockCiProvider::with_runs(vec![
+            CiRun {
+                id: 301,
+                conclusion: None,
+                head_sha: "newhead".into(),
+                url: "https://example.com/301".into(),
+            },
+            CiRun {
+                id: 302,
+                conclusion: Some("failure".into()),
+                head_sha: "oldhead".into(),
+                url: "https://example.com/302".into(),
+            },
+        ]);
+        // Pass the persisted watch state (including last_stale_emitted_sha).
+        run_ci_check(&dir, &watch, &provider2).unwrap();
+        let second = std::fs::read_to_string(&inbox_path).unwrap();
+        let second_count = second.matches("[ci-stale]").count();
+        assert_eq!(
+            second_count, first_count,
+            "second poll must NOT emit another ci-stale (debounced): {second}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ci_stale_debounce_allows_new_stale_sha() {
+        let dir = tmp_dir("1026-new-stale");
+        // First poll: SHA-A is stale.
+        let provider = MockCiProvider::with_runs(vec![
+            CiRun {
+                id: 401,
+                conclusion: None,
+                head_sha: "sha-c".into(),
+                url: "https://example.com/401".into(),
+            },
+            CiRun {
+                id: 400,
+                conclusion: Some("success".into()),
+                head_sha: "sha-a".into(),
+                url: "https://example.com/400".into(),
+            },
+        ]);
+        run_ci_check(&dir, &base_watch(), &provider).unwrap();
+        let inbox_path = dir.join("inbox").join("agent1.jsonl");
+        let first = std::fs::read_to_string(&inbox_path).unwrap();
+        assert_eq!(first.matches("[ci-stale]").count(), 1);
+
+        // Get persisted watch state.
+        let ci_dir = dir.join("ci-watches");
+        let watch_path = ci_dir.join(watch_filename("o/r", "feat"));
+        let watch: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();
+
+        // Second poll: SHA-B is stale (different from SHA-A) → should fire.
+        let provider2 = MockCiProvider::with_runs(vec![
+            CiRun {
+                id: 501,
+                conclusion: None,
+                head_sha: "sha-d".into(),
+                url: "https://example.com/501".into(),
+            },
+            CiRun {
+                id: 500,
+                conclusion: Some("success".into()),
+                head_sha: "sha-b".into(),
+                url: "https://example.com/500".into(),
+            },
+        ]);
+        run_ci_check(&dir, &watch, &provider2).unwrap();
+        let second = std::fs::read_to_string(&inbox_path).unwrap();
+        assert_eq!(
+            second.matches("[ci-stale]").count(),
+            2,
+            "different stale SHA must NOT be suppressed: {second}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ci_stale_debounce_does_not_affect_current_sha_notifications() {
+        let dir = tmp_dir("1026-current-ok");
+        // Set up watch with last_stale_emitted_sha = "oldhead".
+        let mut watch = base_watch();
+        watch["last_stale_emitted_sha"] = serde_json::json!("oldhead");
+        let provider = MockCiProvider::with_runs(vec![CiRun {
+            id: 600,
+            conclusion: Some("success".into()),
+            head_sha: "currenthead".into(),
+            url: "https://example.com/600".into(),
+        }]);
+        run_ci_check(&dir, &watch, &provider).unwrap();
+        let inbox_path = dir.join("inbox").join("agent1.jsonl");
+        let content = std::fs::read_to_string(&inbox_path).unwrap();
+        assert!(
+            content.contains("[ci-pass]"),
+            "current-head notification must still fire: {content}"
+        );
+        assert!(
+            !content.contains("[ci-stale]"),
+            "no stale notification for current-head: {content}"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
