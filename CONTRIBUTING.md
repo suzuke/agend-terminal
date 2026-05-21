@@ -104,11 +104,11 @@ Real-PTY captures grow the regression corpus in `tests/fixtures/state-replay/` a
    agend-terminal capture promote \
      $AGEND_HOME/captures/capture-target/*.cap \
      <scenario-name> \
-     --scenario-kind <productive_marker_fire|productive_silence|silent_stuck|priority_oscillation> \
+     --scenario-kind <productive_marker_fire|productive_silence|silent_stuck> \
      --expected-hung <hung|not_hung> \
      --scenario-description "<one-line summary>"
    ```
-   Promote writes `tests/fixtures/state-replay/<scenario-name>.raw` and appends a schema-v2 entry to `tests/fixtures/state-replay/MANIFEST.yaml`. Phase 1a (#1020) shipped this CLI.
+   Promote writes `tests/fixtures/state-replay/<scenario-name>.raw` and appends a schema-v2 entry to `tests/fixtures/state-replay/MANIFEST.yaml`. Phase 1a (#1020) shipped this CLI. `priority_oscillation` is reserved for a future measurement category and is not currently a valid `--scenario-kind` value — add it to the #1020 parser before listing it here.
 
 4. **Review the .raw bytes BEFORE commit.** Captures contain raw PTY output including your prompts and any tool output. Open the file (`less tests/fixtures/state-replay/<scenario-name>.raw`) and scan for:
    - API keys / OAuth tokens echoed during error paths
