@@ -202,6 +202,15 @@ pub fn prepare(home: &Path, fleet_path: &Path, opts: PrepareOptions) -> Result<B
     time_step("migrate_legacy_watch_filenames", || {
         crate::daemon::ci_watch::migration::migrate_legacy_watch_filenames(home);
     });
+    // #1017: suppress stale pr-state terminal-replay at boot. Without
+    // this, a fresh daemon process re-emits [pr-merged] /
+    // [pr-closed-unmerged] for every Merged / ClosedUnmerged pr-state
+    // file older than `AGEND_PR_STATE_REPLAY_AGE_HOURS` (default 1h)
+    // — operator gets a flood of stale notifications. Fresh terminal-
+    // state files (post-restart actual merges) still fire normally.
+    time_step("pr_state_suppress_stale_replay", || {
+        crate::daemon::pr_state::suppress_stale_terminal_replay(home);
+    });
 
     let run_dir = crate::daemon::run_dir(home);
     std::fs::create_dir_all(&run_dir)
