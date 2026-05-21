@@ -63,6 +63,7 @@ pub fn render(
     repeat_mode: bool,
     registry: &AgentRegistry,
     telegram: TelegramStatus,
+    binary_stale: bool,
 ) {
     let chunks = ratatui::layout::Layout::default()
         .direction(Direction::Vertical)
@@ -75,7 +76,7 @@ pub fn render(
 
     render_pane_tree(frame, chunks[1], layout, repeat_mode, registry);
     render_tab_bar(frame, chunks[0], layout, registry);
-    render_status_bar(frame, chunks[2], layout, telegram);
+    render_status_bar(frame, chunks[2], layout, telegram, binary_stale);
 }
 
 /// Get the highest-priority state across all panes in a tab.
@@ -444,7 +445,12 @@ pub(super) fn render_status_bar(
     area: Rect,
     layout: &Layout,
     telegram: TelegramStatus,
+    binary_stale: bool,
 ) {
+    // RED stub for #1027: the `binary_stale` arg threads through but is
+    // not yet rendered as a warning span. The GREEN commit appends a
+    // " ⚠ daemon binary stale (restart) " span when this is true.
+    let _ = binary_stale;
     let mut spans = Vec::new();
 
     let mut agent_count = 0;
@@ -626,7 +632,13 @@ mod tests {
         let layout = crate::layout::Layout::new();
         terminal
             .draw(|frame| {
-                render_status_bar(frame, frame.area(), &layout, TelegramStatus::NotConfigured);
+                render_status_bar(
+                    frame,
+                    frame.area(),
+                    &layout,
+                    TelegramStatus::NotConfigured,
+                    false,
+                );
             })
             .expect("test terminal draw should succeed");
         let buf = terminal.backend().buffer().clone();
@@ -639,6 +651,71 @@ mod tests {
         assert!(
             text.contains("Ctrl+B ?"),
             "status bar should contain 'Ctrl+B ?' hint, got: {text}"
+        );
+    }
+
+    /// #1027 RED: when `binary_stale` is true, the status bar MUST show
+    /// a "daemon binary stale" warning so the operator sees a stable
+    /// TUI indicator (replacing the previous inbox-emit path which
+    /// targeted agents who cannot act on it).
+    #[test]
+    fn status_bar_shows_warning_when_binary_stale() {
+        let backend = ratatui::backend::TestBackend::new(120, 3);
+        let mut terminal =
+            ratatui::Terminal::new(backend).expect("test terminal creation should succeed");
+        let layout = crate::layout::Layout::new();
+        terminal
+            .draw(|frame| {
+                render_status_bar(
+                    frame,
+                    frame.area(),
+                    &layout,
+                    TelegramStatus::NotConfigured,
+                    true,
+                );
+            })
+            .expect("test terminal draw should succeed");
+        let buf = terminal.backend().buffer().clone();
+        let mut text = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                text.push_str(buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "));
+            }
+        }
+        assert!(
+            text.contains("daemon binary stale"),
+            "binary_stale=true must surface a warning in status bar, got: {text}"
+        );
+    }
+
+    /// #1027 RED: when `binary_stale` is false, no warning is shown.
+    #[test]
+    fn status_bar_no_warning_when_binary_fresh() {
+        let backend = ratatui::backend::TestBackend::new(120, 3);
+        let mut terminal =
+            ratatui::Terminal::new(backend).expect("test terminal creation should succeed");
+        let layout = crate::layout::Layout::new();
+        terminal
+            .draw(|frame| {
+                render_status_bar(
+                    frame,
+                    frame.area(),
+                    &layout,
+                    TelegramStatus::NotConfigured,
+                    false,
+                );
+            })
+            .expect("test terminal draw should succeed");
+        let buf = terminal.backend().buffer().clone();
+        let mut text = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                text.push_str(buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "));
+            }
+        }
+        assert!(
+            !text.contains("daemon binary stale"),
+            "binary_stale=false must NOT surface warning, got: {text}"
         );
     }
 

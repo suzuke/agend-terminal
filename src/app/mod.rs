@@ -412,7 +412,17 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         let repeat_mode = key_handler.in_repeat();
 
         terminal.draw(|frame| {
-            render::render(frame, &mut layout, repeat_mode, &registry, telegram_status);
+            // #1027 RED stub: pass `false` until the GREEN commit wires
+            // the shared `Arc<AtomicBool>` daemon_binary_stale flag from
+            // supervisor through here.
+            render::render(
+                frame,
+                &mut layout,
+                repeat_mode,
+                &registry,
+                telegram_status,
+                false,
+            );
             // &mut because ScratchShell needs to drain output and maybe
             // resize its pane's VTerm/PTY during render.
             match &mut overlay {

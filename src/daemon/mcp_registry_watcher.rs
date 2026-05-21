@@ -34,7 +34,28 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::SystemTime;
+
+/// Shared daemon→TUI flag for "running daemon binary is older than the
+/// on-disk binary" — read by the status bar so the operator sees a
+/// stable indicator instead of a one-shot inbox message routed to
+/// agents who cannot act on it (#1027).
+pub type DaemonBinaryStale = Arc<AtomicBool>;
+
+/// Stub that the GREEN commit implements. Lives in the RED commit as a
+/// no-op so the new tests below compile and FAIL — once impl lands,
+/// the flag flips per binary mtime vs process-start-time comparison.
+pub(crate) fn scan_and_set_flag(
+    _daemon_exe: Option<&Path>,
+    _started_at: SystemTime,
+    _binary_stale: &AtomicBool,
+) {
+    // RED stub: intentionally does nothing so the asserts in
+    // `scan_sets_flag_when_binary_replaced` (post-start binary expects
+    // flag=true) fail at this commit. Impl lands in the next commit.
+}
 
 /// Scan throttle — matches the four prior trackers so all five fire
 /// in the same wall-clock window without interleaving overhead.
@@ -321,6 +342,66 @@ mod tests {
                 .iter()
                 .any(|m| m.kind.as_deref() == Some("mcp_registry_watcher")),
             "post-window scan must re-emit"
+        );
+    }
+
+    /// #1027 RED: post-start binary replacement must flip the shared
+    /// `binary_stale` flag to true (the new contract). The status bar
+    /// reads this flag instead of agents picking up a routed inbox
+    /// message.
+    #[test]
+    fn scan_sets_flag_when_binary_replaced() {
+        let home = tmp_home("flag-post-start");
+        let started_at = SystemTime::now() - Duration::from_secs(10);
+        std::thread::sleep(Duration::from_millis(20));
+        let exe = plant_post_start_binary(&home);
+        let flag = AtomicBool::new(false);
+        scan_and_set_flag(Some(&exe), started_at, &flag);
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "post-start binary must flip flag to true"
+        );
+    }
+
+    /// #1027 RED: binary older than process-start must leave the flag
+    /// untouched (fresh daemon — nothing to surface).
+    #[test]
+    fn scan_leaves_flag_false_when_binary_fresh() {
+        let home = tmp_home("flag-pre-start");
+        let exe = plant_post_start_binary(&home);
+        std::thread::sleep(Duration::from_millis(20));
+        let started_at = SystemTime::now();
+        let flag = AtomicBool::new(false);
+        scan_and_set_flag(Some(&exe), started_at, &flag);
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "binary older than process-start must keep flag=false"
+        );
+    }
+
+    /// #1027 RED anti-regression: even when stale binary detected, the
+    /// new code path MUST NOT enqueue inbox messages — that was the
+    /// behavior we are removing in this issue.
+    #[test]
+    fn scan_does_not_emit_inbox_when_setting_flag() {
+        let home = tmp_home("flag-no-inbox");
+        let started_at = SystemTime::now() - Duration::from_secs(10);
+        std::thread::sleep(Duration::from_millis(20));
+        let exe = plant_post_start_binary(&home);
+        let flag = AtomicBool::new(false);
+        scan_and_set_flag(Some(&exe), started_at, &flag);
+        let general = crate::inbox::drain(&home, "general");
+        let lead = crate::inbox::drain(&home, "lead");
+        assert!(
+            !general
+                .iter()
+                .any(|m| m.kind.as_deref() == Some("mcp_registry_watcher")),
+            "scan_and_set_flag must not enqueue general inbox: {general:?}"
+        );
+        assert!(
+            !lead.iter()
+                .any(|m| m.kind.as_deref() == Some("mcp_registry_watcher")),
+            "scan_and_set_flag must not enqueue lead inbox: {lead:?}"
         );
     }
 
