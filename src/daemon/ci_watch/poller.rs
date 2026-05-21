@@ -954,7 +954,7 @@ async fn ci_check_repo(
     let mut new_notified_conclusion = last_notified_conclusion.map(String::from);
     // #1026: track the SHA for which ci-stale was already emitted so
     // subsequent conclusion changes on the same stale SHA don't flood.
-    let new_stale_emitted_sha = last_stale_emitted_sha.map(String::from);
+    let mut new_stale_emitted_sha = last_stale_emitted_sha.map(String::from);
 
     for (idx, run_id, sha) in &deduped {
         let run = &runs[*idx];
@@ -977,6 +977,12 @@ async fn ci_check_repo(
         // was triggered, so its pass/fail is no longer actionable. The
         // tracker still advances (above and below) so we don't re-process.
         if *sha != current_sha {
+            // #1026: skip if ci-stale already emitted for this SHA.
+            if new_stale_emitted_sha.as_deref() == Some(*sha) {
+                new_notified_sha = Some(sha.to_string());
+                new_notified_conclusion = conclusion.map(String::from);
+                continue;
+            }
             tracing::info!(
                 repo,
                 branch,
@@ -1025,6 +1031,8 @@ async fn ci_check_repo(
             // future same-id rerun on a then-current sha doesn't get
             // confused by stale "last conclusion" state.
             new_notified_conclusion = conclusion.map(String::from);
+            // #1026: record that ci-stale was emitted for this SHA
+            new_stale_emitted_sha = Some(sha.to_string());
             continue;
         }
 
