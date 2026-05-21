@@ -119,11 +119,8 @@ pub(super) fn try_telegram_reply_from(
     instance_name: &str,
     text: &str,
 ) -> anyhow::Result<(i32, i64)> {
-    let (ch, config) = resolve_channel_from(home)?;
-    let topic_id = config
-        .instances
-        .get(instance_name)
-        .and_then(|inst| inst.topic_id);
+    let (ch, _config) = resolve_channel_from(home)?;
+    let topic_id = crate::channel::telegram::lookup_topic_for_instance(home, instance_name);
     // #969: catches the PTY-mirror + reply-tool race (RC2). The RC2
     // root-cause fix (move mirror_skip set BEFORE send in
     // handle_reply) closes the dominant window; this dedup catches
@@ -197,11 +194,8 @@ pub(super) fn try_telegram_reply_no_cleanup_from(
     instance_name: &str,
     text: &str,
 ) -> anyhow::Result<(i32, i64)> {
-    let (ch, config) = resolve_channel_from(home)?;
-    let topic_id = config
-        .instances
-        .get(instance_name)
-        .and_then(|inst| inst.topic_id);
+    let (ch, _config) = resolve_channel_from(home)?;
+    let topic_id = crate::channel::telegram::lookup_topic_for_instance(home, instance_name);
     telegram_reply_send_inner(&ch, instance_name, topic_id, text)
         .map(|msg_id| (msg_id, ch.group_id))
 }
@@ -355,7 +349,7 @@ instances:
     }
 
     #[test]
-    fn try_telegram_reply_cleanup_variant_mutates_fleet_on_topic_deleted() {
+    fn try_telegram_reply_cleanup_variant_clears_topics_json_on_topic_deleted() {
         let _g = channel_env_test_guard();
         let home = tmp_home("cleanup_variant_baseline");
 
@@ -368,12 +362,9 @@ channel:
 instances:
   B:
     command: /bin/true
-    topic_id: 42
 ";
         std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).expect("write fleet.yaml");
-        std::fs::create_dir_all(home.join("channel")).ok();
-        std::fs::write(home.join("channel").join("topics.json"), "{\"B\":42}")
-            .expect("write topics.json");
+        register_topic(&home, 42, "B").unwrap();
 
         std::env::set_var("PR57_ROUND2_FAKE_TOKEN", "fake");
         set_forced_send_error(anyhow::anyhow!("Bad Request: message thread not found"));
@@ -381,24 +372,10 @@ instances:
         let res = try_telegram_reply_from(&home, "B", "main-path send");
         assert!(res.is_err());
 
-        let fleet_yaml =
-            std::fs::read_to_string(crate::fleet::fleet_yaml_path(&home)).expect("read fleet.yaml");
-        assert!(
-            fleet_yaml.contains("B:"),
-            "Sprint 23 P1: instance must survive topic invalidation; yaml was:\n{fleet_yaml}"
-        );
-        let config = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
-            .expect("load fleet.yaml");
-        let inst_b = config.instances.get("B").expect("B exists");
-        assert_eq!(
-            inst_b.topic_id, None,
-            "topic_id must be cleared after invalidation"
-        );
-
         let reg = load_topic_registry(&home);
         assert!(
             !reg.contains_key(&42),
-            "stale topic 42 must be unregistered"
+            "stale topic 42 must be unregistered from topics.json"
         );
 
         std::env::remove_var("PR57_ROUND2_FAKE_TOKEN");
@@ -421,7 +398,7 @@ instances:
     topic_id: 42
 ";
         std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).expect("write fleet.yaml");
-        register_topic(&home, 42, "agent-x");
+        register_topic(&home, 42, "agent-x").unwrap();
         std::env::set_var("SPRINT23_P1_FAKE_TOKEN", "fake");
 
         set_forced_send_error(anyhow::anyhow!("Bad Request: message thread not found"));
@@ -462,7 +439,7 @@ instances:
     topic_id: 42
 ";
         std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).expect("write fleet.yaml");
-        register_topic(&home, 42, "agent-x");
+        register_topic(&home, 42, "agent-x").unwrap();
         std::env::set_var("SPRINT23_P1_FAKE_TOKEN2", "fake");
 
         set_forced_send_error(anyhow::anyhow!("Too Many Requests: retry after 5"));
@@ -509,7 +486,7 @@ instances:
     topic_id: 42
 ";
         std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).expect("write fleet.yaml");
-        register_topic(&home, 42, "agent-x");
+        register_topic(&home, 42, "agent-x").unwrap();
         std::env::set_var("SPRINT56_FAKE_TOKEN", "fake");
 
         let new_id = -1009999999999_i64;
@@ -558,7 +535,7 @@ instances:
     topic_id: 42
 ";
         std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).expect("write fleet.yaml");
-        register_topic(&home, 42, "agent-x");
+        register_topic(&home, 42, "agent-x").unwrap();
         std::env::set_var("SPRINT56_FAKE_TOKEN_2", "fake");
 
         set_forced_send_error(anyhow::anyhow!("Too Many Requests: retry after 5"));

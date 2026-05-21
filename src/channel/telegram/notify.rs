@@ -34,7 +34,7 @@ fn notify_telegram_inner(
             Ok(t) => (
                 t,
                 *group_id,
-                config.instances.get(instance_name).and_then(|i| i.topic_id),
+                crate::channel::telegram::lookup_topic_for_instance(home, instance_name),
             ),
             Err(_) => return,
         },

@@ -61,7 +61,6 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
                 .map(|r| (r.topic_id, r.working_directory))
         })
         .unwrap_or((None, None));
-    let topic_id = topic_id.or_else(|| telegram::lookup_topic_for_instance(home, name));
 
     // Sprint 54 P1-B Bug 1: collect per-step errors instead of silently
     // swallowing them. Each cleanup step runs best-effort so even when

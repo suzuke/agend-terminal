@@ -73,12 +73,9 @@ fn auto_create_general(config: &mut FleetConfig, home: &Path, persist: bool) {
     if let Err(e) = fleet::add_instance_to_yaml(home, "general", &entry) {
         tracing::warn!(error = %e, "failed to persist general instance");
     }
-    let _ = fleet::update_instance_field(
-        home,
-        "general",
-        "topic_id",
-        serde_yaml_ng::Value::Number(serde_yaml_ng::Number::from(1)),
-    );
+    if let Err(e) = crate::channel::telegram::register_topic(home, 1, "general") {
+        tracing::warn!(error = %e, "failed to register general topic_id=1");
+    }
     tracing::info!("auto-created 'general' instance for channel");
 }
 
@@ -142,6 +139,7 @@ mod tests {
             channels: None,
             templates: None,
             display_timezone: None,
+            home: None,
         };
         c.instances.insert(
             "worker".to_string(),

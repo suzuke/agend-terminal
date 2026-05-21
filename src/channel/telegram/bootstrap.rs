@@ -84,22 +84,11 @@ pub fn init_from_config(
     let bot = teloxide::Bot::new(&token);
     let chat_id = teloxide::types::ChatId(*group_id);
 
-    let mut topic_map: HashMap<String, i32> = config
-        .instances
+    let mut topic_map: HashMap<String, i32> = reg
         .iter()
-        .filter_map(|(name, inst)| inst.topic_id.map(|tid| (name.clone(), tid)))
+        .filter(|(tid, name)| **tid != 1 && name.as_str() != FLEET_BINDING_SENTINEL)
+        .map(|(tid, name)| (name.clone(), *tid))
         .collect();
-
-    // Merge topics.json entries not already in fleet.yaml.
-    for (tid, inst_name) in &reg {
-        if *tid != 1 && inst_name != FLEET_BINDING_SENTINEL && !topic_map.contains_key(inst_name) {
-            tracing::info!(
-                instance = %inst_name, topic_id = tid,
-                "merging topic from topics.json (not in fleet.yaml)"
-            );
-            topic_map.insert(inst_name.clone(), *tid);
-        }
-    }
 
     // Auto-create topics for instances without topic_id.
     //
@@ -123,10 +112,16 @@ pub fn init_from_config(
     // operator intervention via the (γ) `agend-terminal doctor
     // topics` surface (Sprint 60+ candidate: teloxide upgrade
     // evaluation if a future Bot API version exposes enumeration).
-    for (name, inst) in &config.instances {
-        if name == "general" && inst.topic_id.is_none() {
+    for name in config.instances.keys() {
+        if topic_map.contains_key(name.as_str()) {
+            continue;
+        }
+        if name == "general" {
             topic_map.insert("general".to_string(), 1);
-        } else if inst.topic_id.is_none() {
+            if let Err(e) = register_topic(home, 1, "general") {
+                tracing::warn!(error = %e, "failed to register general topic");
+            }
+        } else {
             tracing::info!(instance = %name, "auto-creating topic via track-on-create");
             if let Some(tid) = create_topic_for_instance(home, name) {
                 topic_map.insert(name.clone(), tid);
@@ -134,19 +129,12 @@ pub fn init_from_config(
         }
     }
 
-    // Write back topic_ids + update registry
-    if crate::fleet::fleet_yaml_path(home).exists() && !topic_map.is_empty() {
-        for (name, tid) in &topic_map {
-            let _ = crate::fleet::update_instance_field(
-                home,
-                name,
-                "topic_id",
-                serde_yaml_ng::Value::Number(serde_yaml_ng::Number::from(*tid)),
-            );
-            reg.insert(*tid, name.clone());
-        }
-        save_topic_registry(home, &reg);
-        tracing::info!("updated fleet.yaml with topic_ids");
+    // Ensure topic registry reflects any auto-created entries
+    for (name, tid) in &topic_map {
+        reg.insert(*tid, name.clone());
+    }
+    if let Err(e) = save_topic_registry(home, &reg) {
+        tracing::warn!(error = %e, "failed to save topic registry");
     }
 
     let fleet_binding_topic_id =
@@ -207,7 +195,7 @@ pub(super) fn resolve_fleet_binding(
             let tid = topic.thread_id.0 .0;
             tracing::info!(topic_id = tid, %name, "created fleet_binding topic");
             reg.insert(tid, FLEET_BINDING_SENTINEL.to_string());
-            save_topic_registry(home, reg);
+            let _ = save_topic_registry(home, reg);
             Some(tid)
         }
         Err(e) => {

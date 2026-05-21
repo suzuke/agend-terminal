@@ -205,14 +205,6 @@ pub(crate) fn invalidate_and_recreate_topic(
         "invalidating stale topic and recreating"
     );
     unregister_topic(home, stale_tid);
-    // Clear the stale topic_id from fleet.yaml so create_topic_for_instance
-    // doesn't short-circuit on the old value.
-    let _ = crate::fleet::update_instance_field(
-        home,
-        instance_name,
-        "topic_id",
-        serde_yaml_ng::Value::Null,
-    );
     create_topic_for_instance(home, instance_name)
 }
 
@@ -311,7 +303,7 @@ mod tests {
         let mut reg = HashMap::new();
         reg.insert(99, "ghost".to_string());
         reg.insert(100, "alive".to_string());
-        save_topic_registry(&home, &reg);
+        save_topic_registry(&home, &reg).unwrap();
 
         cleanup_deleted_topic(&home, "ghost", 99, None);
 
@@ -339,8 +331,8 @@ mod tests {
     #[test]
     fn invalidate_and_recreate_strips_stale_topic_from_registry() {
         let home = tmp_home("invalidate-recreate-strip");
-        register_topic(&home, 42, "agent-x");
-        register_topic(&home, 99, "agent-y");
+        register_topic(&home, 42, "agent-x").unwrap();
+        register_topic(&home, 99, "agent-y").unwrap();
 
         let result = invalidate_and_recreate_topic(&home, "agent-x", 42);
         assert!(result.is_none(), "no bot → creation fails");
@@ -355,31 +347,19 @@ mod tests {
     }
 
     #[test]
-    fn invalidate_and_recreate_clears_fleet_yaml_topic_id() {
-        let home = tmp_home("invalidate-recreate-yaml");
-        let yaml = "\
-instances:
-  agent-x:
-    command: /bin/true
-    topic_id: 42
-  agent-y:
-    command: /bin/true
-    topic_id: 99
-";
-        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).expect("write fleet.yaml");
-        register_topic(&home, 42, "agent-x");
+    fn invalidate_and_recreate_clears_topics_json() {
+        let home = tmp_home("invalidate-recreate-json");
+        register_topic(&home, 42, "agent-x").unwrap();
+        register_topic(&home, 99, "agent-y").unwrap();
 
         let _ = invalidate_and_recreate_topic(&home, "agent-x", 42);
 
-        let config = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
-            .expect("load fleet.yaml");
-        let agent_x = config.instances.get("agent-x").expect("agent-x exists");
-        assert_eq!(
-            agent_x.topic_id, None,
-            "topic_id must be cleared after invalidation"
+        let reg = load_topic_registry(&home);
+        assert!(
+            !reg.contains_key(&42),
+            "stale topic_id must be removed from topics.json"
         );
-        let agent_y = config.instances.get("agent-y").expect("agent-y exists");
-        assert_eq!(agent_y.topic_id, Some(99));
+        assert_eq!(reg.get(&99), Some(&"agent-y".to_string()));
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -394,7 +374,7 @@ instances:
     role: important
 ";
         std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).expect("write fleet.yaml");
-        register_topic(&home, 42, "agent-x");
+        register_topic(&home, 42, "agent-x").unwrap();
 
         let _ = invalidate_and_recreate_topic(&home, "agent-x", 42);
 
@@ -417,7 +397,7 @@ instances:
         let mut reg = HashMap::new();
         reg.insert(42, FLEET_BINDING_SENTINEL.to_string());
         reg.insert(100, "at-dev-1".to_string());
-        save_topic_registry(&home, &reg);
+        save_topic_registry(&home, &reg).unwrap();
         let state = Arc::new(Mutex::new(TelegramState::new(
             "tok",
             -12345,
@@ -569,7 +549,7 @@ instances:
         let home = tmp_home("fleet-self-heal-neg");
         let mut reg = HashMap::new();
         reg.insert(42, FLEET_BINDING_SENTINEL.to_string());
-        save_topic_registry(&home, &reg);
+        save_topic_registry(&home, &reg).unwrap();
         let state = Arc::new(Mutex::new(TelegramState::new(
             "tok",
             -1,

@@ -12,11 +12,11 @@ use super::state::telegram_runtime;
 /// resolution.
 pub(crate) const FLEET_BINDING_SENTINEL: &str = "__fleet__";
 
-pub(super) fn topic_registry_path(home: &Path) -> PathBuf {
+pub(crate) fn topic_registry_path(home: &Path) -> PathBuf {
     home.join("topics.json")
 }
 
-pub(super) fn load_topic_registry(home: &Path) -> HashMap<i32, String> {
+pub(crate) fn load_topic_registry(home: &Path) -> HashMap<i32, String> {
     let path = topic_registry_path(home);
     std::fs::read_to_string(&path)
         .ok()
@@ -29,36 +29,30 @@ pub(super) fn load_topic_registry(home: &Path) -> HashMap<i32, String> {
         .unwrap_or_default()
 }
 
-pub(super) fn save_topic_registry(home: &Path, registry: &HashMap<i32, String>) {
+pub(crate) fn save_topic_registry(
+    home: &Path,
+    registry: &HashMap<i32, String>,
+) -> anyhow::Result<()> {
     let map: HashMap<String, &String> = registry.iter().map(|(k, v)| (k.to_string(), v)).collect();
-    if let Ok(json) = serde_json::to_string_pretty(&map) {
-        // H2: atomic write to prevent partial-file on crash
-        let _ = crate::store::atomic_write(&topic_registry_path(home), json.as_bytes());
-    }
+    let json = serde_json::to_string_pretty(&map)?;
+    crate::store::atomic_write(&topic_registry_path(home), json.as_bytes())?;
+    Ok(())
 }
 
-pub(super) fn register_topic(home: &Path, topic_id: i32, instance_name: &str) {
-    // Write-side unification (Fix B): all three sources updated atomically.
-    // 1. topics.json (disk registry)
+pub(crate) fn register_topic(
+    home: &Path,
+    topic_id: i32,
+    instance_name: &str,
+) -> anyhow::Result<()> {
     let mut reg = load_topic_registry(home);
     reg.insert(topic_id, instance_name.to_string());
-    save_topic_registry(home, &reg);
-    // 2. fleet.yaml topic_id field
-    let _ = crate::fleet::update_instance_field(
-        home,
-        instance_name,
-        "topic_id",
-        serde_yaml_ng::Value::Number(serde_yaml_ng::Number::from(topic_id)),
-    );
-    // 3. in-memory state is updated by the caller (Channel trait methods
-    //    that hold &self.state). Free-function callers without state access
-    //    rely on resolve_topic's topics.json fallback as defense-in-depth.
+    save_topic_registry(home, &reg)
 }
 
-pub(super) fn unregister_topic(home: &Path, topic_id: i32) {
+pub(crate) fn unregister_topic(home: &Path, topic_id: i32) {
     let mut reg = load_topic_registry(home);
     reg.remove(&topic_id);
-    save_topic_registry(home, &reg);
+    let _ = save_topic_registry(home, &reg);
 }
 
 /// Reverse-lookup a topic_id for an instance from `topics.json`.
@@ -92,7 +86,10 @@ pub fn create_topic_for_instance(home: &std::path::Path, instance_name: &str) ->
     }) {
         Ok(tid) => {
             tracing::info!(instance = %instance_name, topic_id = tid, "created topic");
-            register_topic(home, tid, instance_name);
+            if let Err(e) = register_topic(home, tid, instance_name) {
+                tracing::warn!(instance = %instance_name, topic_id = tid, error = %e, "failed to register topic");
+                return None;
+            }
             Some(tid)
         }
         Err(e) => {
@@ -279,19 +276,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_topic_reloads_from_fleet_yaml() {
+    fn resolve_topic_reloads_from_topics_json() {
         let home = tmp_home("resolve_reload");
-        let yaml = r#"defaults:
-  backend: claude
-instances:
-  alice:
-    role: "Test"
-    topic_id: 229
-  general:
-    role: "General"
-    topic_id: 1
-"#;
-        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).ok();
+        register_topic(&home, 229, "alice").unwrap();
+        register_topic(&home, 1, "general").unwrap();
         let mut state = TelegramState::new(
             "tok",
             -1,
@@ -312,11 +300,7 @@ instances:
     #[test]
     fn resolve_topic_reload_caches_for_next_call() {
         let home = tmp_home("resolve_cache");
-        let yaml = r#"instances:
-  bob:
-    topic_id: 500
-"#;
-        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).ok();
+        register_topic(&home, 500, "bob").unwrap();
         let mut state = TelegramState::new(
             "tok",
             -1,
@@ -326,7 +310,7 @@ instances:
             None,
         );
         assert_eq!(resolve_topic(&mut state, Some(500)), "bob");
-        std::fs::remove_file(crate::fleet::fleet_yaml_path(&home)).ok();
+        std::fs::remove_file(topic_registry_path(&home)).ok();
         assert_eq!(resolve_topic(&mut state, Some(500)), "bob");
         std::fs::remove_dir_all(&home).ok();
     }
@@ -336,7 +320,7 @@ instances:
         let home = tmp_home("resolve_topics_json");
         let mut reg = HashMap::new();
         reg.insert(2474, "test-gemini".to_string());
-        save_topic_registry(&home, &reg);
+        save_topic_registry(&home, &reg).unwrap();
         let mut state = TelegramState::new_for_contract_test(
             -1,
             HashMap::new(),
@@ -354,16 +338,16 @@ instances:
     }
 
     #[test]
-    fn register_topic_writes_fleet_yaml() {
-        let home = tmp_home("register_writes_yaml");
+    fn register_topic_writes_only_topics_json() {
+        let home = tmp_home("register_writes_json");
         let yaml = "defaults:\n  backend: claude\ninstances:\n  alice:\n    backend: claude\n";
         std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).ok();
-        register_topic(&home, 42, "alice");
+        register_topic(&home, 42, "alice").unwrap();
         let content = std::fs::read_to_string(crate::fleet::fleet_yaml_path(&home))
             .expect("fleet.yaml must exist");
         assert!(
-            content.contains("topic_id"),
-            "fleet.yaml must contain topic_id after register_topic: {content}"
+            !content.contains("topic_id"),
+            "fleet.yaml must NOT contain topic_id after register_topic: {content}"
         );
         let reg = load_topic_registry(&home);
         assert_eq!(reg.get(&42), Some(&"alice".to_string()));
@@ -374,8 +358,8 @@ instances:
     fn topic_registry_roundtrip() {
         let home = tmp_home("registry_roundtrip");
         assert!(load_topic_registry(&home).is_empty());
-        register_topic(&home, 100, "alice");
-        register_topic(&home, 200, "bob");
+        register_topic(&home, 100, "alice").unwrap();
+        register_topic(&home, 200, "bob").unwrap();
         let reg = load_topic_registry(&home);
         assert_eq!(reg.get(&100), Some(&"alice".to_string()));
         assert_eq!(reg.get(&200), Some(&"bob".to_string()));
@@ -389,8 +373,8 @@ instances:
     #[test]
     fn topic_registry_overwrite() {
         let home = tmp_home("registry_overwrite");
-        register_topic(&home, 100, "alice");
-        register_topic(&home, 100, "bob");
+        register_topic(&home, 100, "alice").unwrap();
+        register_topic(&home, 100, "bob").unwrap();
         let reg = load_topic_registry(&home);
         assert_eq!(reg.get(&100), Some(&"bob".to_string()));
         assert_eq!(reg.len(), 1);
@@ -425,8 +409,8 @@ instances:
     #[test]
     fn lookup_topic_for_instance_finds_existing() {
         let home = tmp_home("lookup_existing");
-        register_topic(&home, 42, "alice");
-        register_topic(&home, 99, "bob");
+        register_topic(&home, 42, "alice").unwrap();
+        register_topic(&home, 99, "bob").unwrap();
         assert_eq!(lookup_topic_for_instance(&home, "alice"), Some(42));
         assert_eq!(lookup_topic_for_instance(&home, "bob"), Some(99));
         std::fs::remove_dir_all(&home).ok();
@@ -435,7 +419,7 @@ instances:
     #[test]
     fn lookup_topic_for_instance_returns_none_when_missing() {
         let home = tmp_home("lookup_missing");
-        register_topic(&home, 42, "alice");
+        register_topic(&home, 42, "alice").unwrap();
         assert_eq!(lookup_topic_for_instance(&home, "nonexistent"), None);
         std::fs::remove_dir_all(&home).ok();
     }
@@ -449,7 +433,7 @@ instances:
     #[test]
     fn create_topic_for_instance_reuses_existing_topic() {
         let home = tmp_home("create_reuse");
-        register_topic(&home, 77, "reuse-agent");
+        register_topic(&home, 77, "reuse-agent").unwrap();
         let result = create_topic_for_instance(&home, "reuse-agent");
         assert_eq!(
             result,
