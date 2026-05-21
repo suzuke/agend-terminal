@@ -14,14 +14,6 @@ use std::sync::OnceLock;
 pub struct DaemonConfig {
     /// Feature flag: pointer-only inbox injection (replaces AGEND_POINTER_ONLY_INJECT env var).
     pub pointer_only_inject: bool,
-    /// Daemon PID (replaces AGEND_DAEMON_PID env var).
-    /// Sprint 56 Track I-Phase2c (#531): the previous reader
-    /// (`mcp::is_running_inside_daemon_process`) was removed alongside
-    /// `mcp::run` and `proxy_or_local`. Field retained because the
-    /// `DaemonConfig::default()` constructor populates it from env;
-    /// future daemon-side callers may consume it again.
-    #[allow(dead_code)]
-    pub daemon_pid: u32,
 }
 
 impl Default for DaemonConfig {
@@ -31,7 +23,6 @@ impl Default for DaemonConfig {
                 .ok()
                 .map(|v| v == "1")
                 .unwrap_or(false),
-            daemon_pid: std::process::id(),
         }
     }
 }
@@ -55,8 +46,7 @@ mod tests {
 
     #[test]
     fn daemon_config_default_returns_expected_values() {
-        let cfg = DaemonConfig::default();
-        assert_eq!(cfg.daemon_pid, std::process::id());
+        let _cfg = DaemonConfig::default();
         // pointer_only_inject depends on env var; in test context should be false
         // unless explicitly set
     }
@@ -65,9 +55,7 @@ mod tests {
     fn daemon_config_with_overrides() {
         let cfg = DaemonConfig {
             pointer_only_inject: true,
-            daemon_pid: 42,
         };
         assert!(cfg.pointer_only_inject);
-        assert_eq!(cfg.daemon_pid, 42);
     }
 }
