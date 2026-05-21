@@ -532,6 +532,15 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
     if let Some(next) = args["next_after_ci"].as_str().filter(|s| !s.is_empty()) {
         watch["next_after_ci"] = json!(next);
     }
+    // #1031: persist dispatch task_id when supplied (by
+    // dispatch_auto_bind_lease) so the ci_check_repo emit site can
+    // populate `[ci-ready-for-action]` InboxMessage's task_id field,
+    // giving the reviewer a structured back-link to the originating
+    // dispatch. Manual `ci action=watch` callers may also pass
+    // task_id explicitly to bind the watch to a specific task.
+    if let Some(tid) = args["task_id"].as_str().filter(|s| !s.is_empty()) {
+        watch["task_id"] = json!(tid);
+    }
     // #972 reviewer-rejection fix: persist `review_class` so the
     // pr_state aggregator can honor §3.5 dual-review at runtime. Accepted
     // values: `"single"` (default — §3.6) or `"dual"` (§3.5). Other

@@ -468,6 +468,15 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
         if let Some(ref next) = effective_next {
             watch_args["next_after_ci"] = serde_json::json!(next);
         }
+        // #1031: persist the dispatch task_id alongside the watch so
+        // the ci_check_repo emit site can back-link the
+        // `[ci-ready-for-action]` event to the originating dispatch.
+        // Reviewer's verdict report can then echo this task_id in
+        // its correlation_id, closing the [[feedback-dispatch-task-id-mirror]]
+        // false-positive class on the verdict-reply side.
+        if !task_id.is_empty() {
+            watch_args["task_id"] = serde_json::json!(task_id);
+        }
         crate::mcp::handlers::ci::handle_watch_ci(home, &watch_args, target);
         tracing::info!(
             %target,

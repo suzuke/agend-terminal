@@ -1257,15 +1257,33 @@ async fn ci_check_repo(
                     let last_conclusion = aggregate_conclusion_for_sha(&runs, current_sha);
                     if last_conclusion == Some("success") {
                         let repo_branch_key = format!("{repo}@{branch}");
-                        // #1031 RED: enrichment params are None at this commit;
-                        // GREEN wires them from pr_state + watch.task_id.
+                        // #1031 GREEN: enrich the chain-target payload so
+                        // the reviewer who wakes can post §3.12 verdict
+                        // mirror without `gh pr list --head` or
+                        // `git rev-parse` lookups.
+                        // - head_sha: current_sha is the full 40-char from
+                        //   the GitHub API (provider.rs:348). The 7-char
+                        //   prefix in the text body stays for human
+                        //   readability; the structured field carries
+                        //   the full SHA.
+                        // - pr_number: read from pr_state aggregator
+                        //   cache (#972). None until the first poll
+                        //   populates the cache via record_ci_result
+                        //   (which fires below on this same tick).
+                        // - task_id: read from the watch sidecar's
+                        //   `task_id` field — persisted by the dispatch
+                        //   path (post-#1031 wiring; pre-persist watches
+                        //   gracefully read None).
+                        let pr_number =
+                            crate::daemon::pr_state::load(home, repo, branch).map(|s| s.pr_number);
+                        let task_id = watch["task_id"].as_str();
                         let msg = make_ci_ready_for_action_msg(
                             repo,
                             branch,
                             &repo_branch_key,
-                            None,
-                            None,
-                            None,
+                            Some(current_sha),
+                            pr_number,
+                            task_id,
                         );
                         let _ = crate::inbox::enqueue_with_idle_hint(home, next, msg);
                     }
