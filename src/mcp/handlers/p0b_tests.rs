@@ -561,6 +561,59 @@ fn bind_self_with_source_repo_arg_succeeds() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+// ── #1044: bind_self task_id plumbing ──────────────────────────────────
+
+#[test]
+#[ignore = "RED: fails without #1044 fix"]
+fn bind_self_with_task_id_arg_persists_real_task_id() {
+    let home = tmp_home("bs-tid");
+    let src = setup_git_repo(&home, "beta");
+    let sender = crate::identity::Sender::new("beta");
+    let args = json!({
+        "branch": "feat-tid",
+        "source_repo": src.display().to_string(),
+        "task_id": "t-20260521-real-task",
+    });
+    let result = super::worktree::handle_bind_self(&home, &args, &sender);
+    assert_eq!(result["bound"], true, "bind must succeed: {result}");
+    let binding_path = crate::paths::runtime_dir(&home)
+        .join("beta")
+        .join("binding.json");
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&binding_path).unwrap()).unwrap();
+    assert_eq!(
+        v["task_id"].as_str(),
+        Some("t-20260521-real-task"),
+        "#1044: bind_self with task_id arg must persist real task_id, not 'self'"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+#[ignore = "RED: fails without #1044 fix"]
+fn bind_self_without_task_id_arg_uses_empty_not_self() {
+    let home = tmp_home("bs-no-tid");
+    let src = setup_git_repo(&home, "gamma");
+    let sender = crate::identity::Sender::new("gamma");
+    let args = json!({
+        "branch": "feat-no-tid",
+        "source_repo": src.display().to_string(),
+    });
+    let result = super::worktree::handle_bind_self(&home, &args, &sender);
+    assert_eq!(result["bound"], true, "bind must succeed: {result}");
+    let binding_path = crate::paths::runtime_dir(&home)
+        .join("gamma")
+        .join("binding.json");
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&binding_path).unwrap()).unwrap();
+    assert_ne!(
+        v["task_id"].as_str(),
+        Some("self"),
+        "#1044: bind_self without task_id must NOT use 'self' sentinel"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 // ── source_repo override via bind_self_with_source param ────────────────
 
 #[test]
