@@ -695,32 +695,6 @@ pub fn gc_dry_run(home: &Path) -> Vec<GcCandidate> {
     candidates
 }
 
-/// Cutover: actually delete GC candidates. Requires AGEND_WORKTREE_GC=1 env.
-/// Returns number of worktrees removed.
-pub fn gc_cutover(home: &Path) -> usize {
-    if std::env::var("AGEND_WORKTREE_GC").as_deref() != Ok("1") {
-        tracing::debug!("gc_cutover skipped — AGEND_WORKTREE_GC not set");
-        return 0;
-    }
-    let candidates = gc_candidates(home);
-    let mut removed = 0;
-    for c in &candidates {
-        if std::fs::remove_dir_all(&c.path).is_ok() {
-            removed += 1;
-            tracing::info!(agent = %c.agent, path = %c.path.display(), "gc_cutover: removed");
-        }
-    }
-    if removed > 0 {
-        crate::event_log::log(
-            home,
-            "gc_cutover",
-            "",
-            &format!("{removed} worktrees removed"),
-        );
-    }
-    removed
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -1194,30 +1168,6 @@ mod tests {
         let wt = make_gc_candidate(&home, "dry-agent");
         gc_dry_run(&home);
         assert!(wt.exists(), "dry-run must NOT delete");
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn cutover_requires_env_flag() {
-        let home = tmp_home("gc-cutover-no-flag");
-        let wt = make_gc_candidate(&home, "no-flag-agent");
-        // Explicitly unset to avoid race with cutover_deletes_with_flag test.
-        unsafe { std::env::remove_var("AGEND_WORKTREE_GC") };
-        let removed = gc_cutover(&home);
-        assert_eq!(removed, 0, "cutover must skip without flag");
-        assert!(wt.exists(), "worktree must survive without flag");
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn cutover_deletes_with_flag() {
-        let home = tmp_home("gc-cutover-flag");
-        let wt = make_gc_candidate(&home, "flag-agent");
-        unsafe { std::env::set_var("AGEND_WORKTREE_GC", "1") };
-        let removed = gc_cutover(&home);
-        unsafe { std::env::remove_var("AGEND_WORKTREE_GC") };
-        assert_eq!(removed, 1);
-        assert!(!wt.exists(), "worktree must be deleted with flag");
         std::fs::remove_dir_all(&home).ok();
     }
 

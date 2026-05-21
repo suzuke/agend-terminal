@@ -50,7 +50,6 @@ impl PerTickHandler for InboxMaintenanceHandler {
         crate::inbox::check_disk_space(ctx.home);
         crate::daemon::run_task_maintenance(ctx.home);
         worktree_auto_cleanup(ctx.home, ctx.configs);
-        worktree_gc(ctx.home);
     }
 }
 
@@ -92,17 +91,6 @@ fn worktree_auto_cleanup(home: &Path, configs: &ConfigRegistry) {
             &format!("path={path}, branch merged into main"),
         );
         tracing::info!(branch, path, "worktree auto-removed (branch merged)");
-    }
-}
-
-/// Phase 4 git-shim: worktree GC (hourly with sweep). Default dry-run;
-/// cutover when AGEND_WORKTREE_GC=1. Verbatim from the pre-extraction
-/// block at mod.rs:718-724.
-fn worktree_gc(home: &Path) {
-    if std::env::var("AGEND_WORKTREE_GC").as_deref() == Ok("1") {
-        crate::worktree_pool::gc_cutover(home);
-    } else {
-        crate::worktree_pool::gc_dry_run(home);
     }
 }
 
