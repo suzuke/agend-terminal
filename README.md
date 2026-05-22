@@ -80,6 +80,7 @@ For optional Telegram binding (remote control + outbound alerts), see [`docs/USA
 - **Commands** — [`docs/CLI.md`](docs/CLI.md) for the full subcommand reference.
 - **MCP tools** — [`docs/MCP-TOOLS.md`](docs/MCP-TOOLS.md) for the 35 agent-to-agent coordination tools.
 - **Architecture** — [`docs/architecture.md`](docs/architecture.md) covers git worktree isolation, health monitoring + auto-respawn, Telegram topic lifecycle, and daemon-resident design.
+- **Recipes** — [`docs/RECIPE-clean-claude-instance.md`](docs/RECIPE-clean-claude-instance.md) for spawning a Claude Code instance without inherited global instructions or auto-memory.
 - **Contributing** — [`CONTRIBUTING.md`](CONTRIBUTING.md).
 - **Release history** — [`CHANGELOG.md`](CHANGELOG.md).
 
