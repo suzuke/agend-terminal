@@ -181,6 +181,33 @@ impl VTerm {
         scroll_offset: usize,
         show_block_cursor: bool,
     ) {
+        // #1064 area-clamp pre-fill: ratatui Buffer is stateful across
+        // frames (codebase invariant from #819). The clamped-write loop
+        // below only touches `rows × cols = min(self.rows, area.height,
+        // grid_rows)` cells, so trailing rows/cols of `area` (when
+        // `area > grid`, e.g. resize race or initial spawn lag) would
+        // retain previous-frame content → operator-visible residual text.
+        // Blank the full area first with a default cell; the loop then
+        // overwrites with PTY content for the clamped region.
+        let buf_right = buf.area().x.saturating_add(buf.area().width);
+        let buf_bottom = buf.area().y.saturating_add(buf.area().height);
+        let default_style = ratatui::style::Style::default();
+        for dy in 0..area.height {
+            let y = area.y.saturating_add(dy);
+            if y >= buf_bottom {
+                break;
+            }
+            for dx in 0..area.width {
+                let x = area.x.saturating_add(dx);
+                if x >= buf_right {
+                    break;
+                }
+                let cell = &mut buf[(x, y)];
+                cell.set_char(' ');
+                cell.set_style(default_style);
+            }
+        }
+
         let grid = self.term.grid();
         let grid_cols = grid.columns() as u16;
         let grid_rows = grid.screen_lines() as u16;
@@ -1372,9 +1399,11 @@ mod tests {
         let mut buf = ratatui::buffer::Buffer::empty(area);
         vt.render_to_buffer(&mut buf, area, 0, false);
         // Capture pre-resize cell content (non-blank somewhere).
-        let pre_resize_filled =
-            (0..20).any(|x| (0..10).any(|y| buf[(x, y)].symbol() != " "));
-        assert!(pre_resize_filled, "sanity: first render must populate cells");
+        let pre_resize_filled = (0..20).any(|x| (0..10).any(|y| buf[(x, y)].symbol() != " "));
+        assert!(
+            pre_resize_filled,
+            "sanity: first render must populate cells"
+        );
 
         // Shrink grid; render into same area (simulates layout lag).
         vt.resize(10, 5);
@@ -1443,7 +1472,11 @@ mod tests {
         buf[(12, 3)].set_char('R'); // col 12 = area-col 7, beyond grid cols=5
         buf[(8, 7)].set_char('S'); // row 7 = area-row 4, beyond grid rows=2
         vt.render_to_buffer(&mut buf, area, 0, false);
-        assert_eq!(buf[(12, 3)].symbol(), " ", "non-zero origin: col 12 blanked");
+        assert_eq!(
+            buf[(12, 3)].symbol(),
+            " ",
+            "non-zero origin: col 12 blanked"
+        );
         assert_eq!(buf[(8, 7)].symbol(), " ", "non-zero origin: row 7 blanked");
         // Buffer cells OUTSIDE area must NOT be touched (sentinel at (0,0)).
         buf[(0, 0)].set_char('K');
@@ -1468,6 +1501,10 @@ mod tests {
         // Either should panic-free + not touch any cells.
         vt.render_to_buffer(&mut buf, area_zero_h, 0, false);
         vt.render_to_buffer(&mut buf, area_zero_w, 0, false);
-        assert_eq!(buf[(0, 0)].symbol(), "K", "zero-size area must not affect buffer");
+        assert_eq!(
+            buf[(0, 0)].symbol(),
+            "K",
+            "zero-size area must not affect buffer"
+        );
     }
 }
