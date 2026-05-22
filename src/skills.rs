@@ -1196,4 +1196,51 @@ mod tests {
         assert_eq!(report, StageGcReport::default());
         std::fs::remove_dir_all(&home).ok();
     }
+
+    // ── #1080 regression: pre-existing backend config dirs must not
+    //    block skills symlink creation ────────────────────────────
+
+    #[test]
+    fn install_succeeds_when_backend_config_dir_preexists_without_skills() {
+        let home = tmp_home("1080-preexist");
+        let stage = home.join("stage");
+        seed_skill_source(&stage, "anchor");
+        add(&home, stage.join("anchor").to_str().unwrap()).unwrap();
+        let working = home.join("agent-wd");
+        std::fs::create_dir_all(&working).unwrap();
+
+        // Simulate a codex backend that created .codex/ with config
+        // but no skills/ subdir (the #1080 scenario).
+        let codex_dir = working.join(".codex");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        std::fs::write(codex_dir.join("config.toml"), "# codex config").unwrap();
+
+        // Simulate kiro backend with .kiro/settings/ but no skills/.
+        let kiro_dir = working.join(".kiro");
+        std::fs::create_dir_all(kiro_dir.join("settings")).unwrap();
+
+        let outcomes = install_for_agent(&home, &working, None).unwrap();
+        for outcome in &outcomes {
+            assert!(
+                matches!(outcome.mode, InstallMode::Symlink | InstallMode::Copy),
+                "#1080: backend {} must install even when parent config dir preexists: {:?}",
+                outcome.backend,
+                outcome
+            );
+        }
+        // Codex config file must be preserved alongside the new skills symlink.
+        assert!(
+            codex_dir.join("config.toml").exists(),
+            "codex config.toml must not be clobbered"
+        );
+        assert!(
+            working.join(".codex/skills").exists(),
+            ".codex/skills must exist"
+        );
+        assert!(
+            working.join(".kiro/skills").exists(),
+            ".kiro/skills must exist"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
 }

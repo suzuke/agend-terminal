@@ -570,6 +570,24 @@ fn spawn_one(
     env: Option<&std::collections::HashMap<String, String>>,
 ) -> anyhow::Result<crate::backend::SpawnMode> {
     std::fs::create_dir_all(work_dir).ok();
+    // #1080: skills auto-install for dynamically spawned instances.
+    // spawn_one is the SPAWN-RPC choke point — without this, instances
+    // created via create_instance / start_instance / replace_instance
+    // never get skill symlinks (only cold-boot spawn_and_register_agent
+    // called install_for_agent). Best-effort: install-all default (no
+    // fleet.yaml skills filter — cold-boot handles that on next restart).
+    match crate::skills::install_for_agent(home, work_dir, None) {
+        Ok(outcomes) => {
+            let modes: Vec<(&str, crate::skills::InstallMode)> = outcomes
+                .iter()
+                .map(|o| (o.backend.as_str(), o.mode))
+                .collect();
+            tracing::info!(agent = %name, ?modes, "spawn_one skills auto-install complete");
+        }
+        Err(e) => {
+            tracing::warn!(agent = %name, error = %e, "spawn_one skills auto-install failed, proceeding");
+        }
+    }
     // Sprint 34: clear stale metadata from a previous instance with the
     // same name. spawn_one is the true choke point — both handle_spawn
     // (direct) and team.rs (team-spawn) flow through here.
