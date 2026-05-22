@@ -1311,4 +1311,163 @@ mod tests {
             "dump_screen() leaked SPACER as literal space, got: {ansi_str:?}"
         );
     }
+
+    // ── #1064 area-clamp residual-text class ──
+    //
+    // `render_to_buffer_inner` clamps writes to `rows × cols = min(self.rows,
+    // area.height, grid_rows)` (same for cols). When `area > grid` — e.g.
+    // resize race, initial spawn lag, outer terminal resize mid-frame — the
+    // trailing rows/cols of `area` are never written. Combined with the
+    // ratatui Buffer's cross-frame statefulness (codebase invariant from
+    // #819), unwritten cells retain previous-frame content → operator-
+    // observable residual text.
+    //
+    // These tests pre-poison cells outside the clamped region with sentinel
+    // chars, render, and assert the cells are blanked. The fix is a
+    // full-area pre-fill before the existing clamped-write loop.
+
+    /// T1 (#1064): area taller than grid blanks the trailing rows.
+    #[test]
+    fn area_taller_than_grid_clears_trailing_rows() {
+        let mut vt = VTerm::new(10, 3);
+        vt.process(b"hello");
+        let area = ratatui::layout::Rect::new(0, 0, 10, 5);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        for x in 0..10 {
+            buf[(x, 3)].set_char('A');
+            buf[(x, 4)].set_char('B');
+        }
+        vt.render_to_buffer(&mut buf, area, 0, false);
+        let row3: String = (0..10).map(|x| buf[(x, 3)].symbol()).collect();
+        let row4: String = (0..10).map(|x| buf[(x, 4)].symbol()).collect();
+        assert_eq!(row3, "          ", "row 3 (beyond grid) must be blanked");
+        assert_eq!(row4, "          ", "row 4 (beyond grid) must be blanked");
+    }
+
+    /// T2 (#1064): area wider than grid blanks the trailing cols.
+    #[test]
+    fn area_wider_than_grid_clears_trailing_cols() {
+        let mut vt = VTerm::new(5, 2);
+        vt.process(b"abcde");
+        let area = ratatui::layout::Rect::new(0, 0, 10, 2);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        for x in 5..10 {
+            buf[(x, 0)].set_char('Z');
+        }
+        vt.render_to_buffer(&mut buf, area, 0, false);
+        let tail: String = (5..10).map(|x| buf[(x, 0)].symbol()).collect();
+        assert_eq!(tail, "     ", "cols beyond grid must be blanked");
+    }
+
+    /// T3 (#1064): resize-shrink leaves no orphan in trailing region.
+    ///
+    /// Simulates the resize race: grid was 20×10, render produced full
+    /// content; grid shrinks to 10×5 but the pane area in the layout is
+    /// still 20×10 (one frame behind). Trailing strip must be blanked.
+    #[test]
+    fn resize_shrink_clears_orphan_cells() {
+        let mut vt = VTerm::new(20, 10);
+        vt.process(b"line content that fills the wider grid view");
+        let area = ratatui::layout::Rect::new(0, 0, 20, 10);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        vt.render_to_buffer(&mut buf, area, 0, false);
+        // Capture pre-resize cell content (non-blank somewhere).
+        let pre_resize_filled =
+            (0..20).any(|x| (0..10).any(|y| buf[(x, y)].symbol() != " "));
+        assert!(pre_resize_filled, "sanity: first render must populate cells");
+
+        // Shrink grid; render into same area (simulates layout lag).
+        vt.resize(10, 5);
+        vt.render_to_buffer(&mut buf, area, 0, false);
+        // Bottom-right strip cols 10..20 × rows 5..10 must now be blank.
+        for y in 5..10 {
+            for x in 0..20 {
+                assert_eq!(
+                    buf[(x, y)].symbol(),
+                    " ",
+                    "({x},{y}) beyond new grid must be blanked"
+                );
+            }
+        }
+        for y in 0..5 {
+            for x in 10..20 {
+                assert_eq!(
+                    buf[(x, y)].symbol(),
+                    " ",
+                    "({x},{y}) beyond new grid cols must be blanked"
+                );
+            }
+        }
+    }
+
+    /// T4 (#1064): area == grid renders normally — no regression.
+    #[test]
+    fn area_equals_grid_renders_normally() {
+        let mut vt = VTerm::new(10, 3);
+        vt.process(b"hello");
+        let area = ratatui::layout::Rect::new(0, 0, 10, 3);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        vt.render_to_buffer(&mut buf, area, 0, false);
+        assert_eq!(buf[(0, 0)].symbol(), "h");
+        assert_eq!(buf[(1, 0)].symbol(), "e");
+        assert_eq!(buf[(4, 0)].symbol(), "o");
+    }
+
+    /// T5 (#1064): #819 WIDE_CHAR_SPACER invariant carries over.
+    ///
+    /// The pre-fill must not weaken the #819 fix. Pre-poison the spacer
+    /// cell at col 1; render `中` at col 0; spacer at col 1 must be blank
+    /// (per #819) AND the wide char at col 0 must be intact.
+    #[test]
+    fn wide_char_spacer_invariant_carries_with_prefill() {
+        let mut vt = VTerm::new(10, 1);
+        vt.process("中".as_bytes());
+        let area = ratatui::layout::Rect::new(0, 0, 10, 1);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        buf[(1, 0)].set_char('X');
+        vt.render_to_buffer(&mut buf, area, 0, false);
+        assert_eq!(buf[(0, 0)].symbol(), "中", "wide char preserved");
+        assert_eq!(buf[(1, 0)].symbol(), " ", "spacer blanked per #819");
+    }
+
+    /// T6 (#1064, optional dev-2 nit): non-zero area origin still works.
+    #[test]
+    fn area_with_non_zero_origin_clears_trailing_region() {
+        let mut vt = VTerm::new(5, 2);
+        vt.process(b"ab");
+        // Buffer covers (0,0,20,10); area is the sub-region (5,3,10,5).
+        let buf_area = ratatui::layout::Rect::new(0, 0, 20, 10);
+        let area = ratatui::layout::Rect::new(5, 3, 10, 5);
+        let mut buf = ratatui::buffer::Buffer::empty(buf_area);
+        // Pre-poison a cell inside `area` but outside the clamped grid region.
+        buf[(12, 3)].set_char('R'); // col 12 = area-col 7, beyond grid cols=5
+        buf[(8, 7)].set_char('S'); // row 7 = area-row 4, beyond grid rows=2
+        vt.render_to_buffer(&mut buf, area, 0, false);
+        assert_eq!(buf[(12, 3)].symbol(), " ", "non-zero origin: col 12 blanked");
+        assert_eq!(buf[(8, 7)].symbol(), " ", "non-zero origin: row 7 blanked");
+        // Buffer cells OUTSIDE area must NOT be touched (sentinel at (0,0)).
+        buf[(0, 0)].set_char('K');
+        vt.render_to_buffer(&mut buf, area, 0, false);
+        assert_eq!(
+            buf[(0, 0)].symbol(),
+            "K",
+            "cells outside area must NOT be affected by pre-fill"
+        );
+    }
+
+    /// T7 (#1064, optional dev-2 nit): zero-size area is a safe no-op.
+    #[test]
+    fn zero_size_area_is_safe_noop() {
+        let mut vt = VTerm::new(10, 3);
+        vt.process(b"hello");
+        let area_zero_h = ratatui::layout::Rect::new(0, 0, 10, 0);
+        let area_zero_w = ratatui::layout::Rect::new(0, 0, 0, 3);
+        let buf_area = ratatui::layout::Rect::new(0, 0, 10, 3);
+        let mut buf = ratatui::buffer::Buffer::empty(buf_area);
+        buf[(0, 0)].set_char('K');
+        // Either should panic-free + not touch any cells.
+        vt.render_to_buffer(&mut buf, area_zero_h, 0, false);
+        vt.render_to_buffer(&mut buf, area_zero_w, 0, false);
+        assert_eq!(buf[(0, 0)].symbol(), "K", "zero-size area must not affect buffer");
+    }
 }
