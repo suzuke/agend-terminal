@@ -574,9 +574,13 @@ fn spawn_one(
     // spawn_one is the SPAWN-RPC choke point — without this, instances
     // created via create_instance / start_instance / replace_instance
     // never get skill symlinks (only cold-boot spawn_and_register_agent
-    // called install_for_agent). Best-effort: install-all default (no
-    // fleet.yaml skills filter — cold-boot handles that on next restart).
-    match crate::skills::install_for_agent(home, work_dir, None) {
+    // called install_for_agent). Respects fleet.yaml `instance.<name>.skills:`
+    // allowlist, same as cold-boot path.
+    let skills_filter: Option<Vec<String>> =
+        crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+            .ok()
+            .and_then(|c| c.instances.get(name).and_then(|i| i.skills.clone()));
+    match crate::skills::install_for_agent(home, work_dir, skills_filter.as_deref()) {
         Ok(outcomes) => {
             let modes: Vec<(&str, crate::skills::InstallMode)> = outcomes
                 .iter()

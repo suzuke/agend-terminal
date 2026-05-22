@@ -1243,4 +1243,40 @@ mod tests {
         );
         std::fs::remove_dir_all(&home).ok();
     }
+
+    #[test]
+    fn install_with_filter_only_installs_allowlisted_skills() {
+        let home = tmp_home("1080-filter");
+        let stage = home.join("stage");
+        seed_skill_source(&stage, "allowed-skill");
+        seed_skill_source(&stage, "blocked-skill");
+        add(&home, stage.join("allowed-skill").to_str().unwrap()).unwrap();
+        add(&home, stage.join("blocked-skill").to_str().unwrap()).unwrap();
+        let working = home.join("agent-wd");
+        std::fs::create_dir_all(&working).unwrap();
+
+        let filter = vec!["allowed-skill".to_string()];
+        let outcomes = install_for_agent(&home, &working, Some(&filter)).unwrap();
+        for outcome in &outcomes {
+            assert!(
+                matches!(outcome.mode, InstallMode::Symlink | InstallMode::Copy),
+                "backend {} must install: {:?}",
+                outcome.backend,
+                outcome
+            );
+            let skill_dir = outcome.target.join("allowed-skill");
+            assert!(
+                skill_dir.join("SKILL.md").exists(),
+                "allowed-skill must be visible at {:?}",
+                skill_dir
+            );
+            let blocked = outcome.target.join("blocked-skill");
+            assert!(
+                !blocked.exists(),
+                "blocked-skill must NOT be visible at {:?}",
+                blocked
+            );
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
