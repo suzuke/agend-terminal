@@ -190,71 +190,82 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
         }
     }
 
-    let _ = crate::inbox::enqueue(ctx.home, target, msg.clone());
-
-    let inject_msg = if crate::inbox::pointer_only_inject()
-        || text.chars().count() > crate::inbox::HEADER_SIZE_THRESHOLD
-    {
-        format!("{} (use inbox tool)", crate::inbox::format_header(&msg))
-    } else {
-        format!("[from:{from}] {text}")
-    };
-
+    // #1065 unified routing: decide whether the recipient needs a PTY wake
+    // hint, then route through either `enqueue` (inbox-only) or
+    // `enqueue_with_idle_hint` (durable enqueue + short `[AGEND-MSG-PENDING]`
+    // hint emit). Pre-#1065 the inject site here was `compose_aware_send`
+    // which wrote the full `[AGEND-MSG]` header (or `[from:lead] body`
+    // inline) — content-size pressure extended codex's typed-inject write
+    // window past the 50ms pre-submit delay, race-condition on the `\r`.
+    // Daemon-emitted auto-wake (`[ci-ready-for-action]`) already used
+    // `enqueue_with_idle_hint` and was empirically reliable (4/4 fire +
+    // execute); routing kind=task through the same path closes the
+    // divergence. See /tmp/dialectic-1065-primary-dev.md §2 + §4.1.
     let reg = agent::lock_registry(ctx.registry);
-    let delivery_mode = if reg.contains_key(target) {
-        // Issue #603: Codex is one-shot — skip PTY inject for messages that
-        // don't require a reply (update/report), avoiding wasted turns.
-        // Issue #612: Cross-team messages are NEVER silently absorbed.
-        let is_codex = reg
-            .get(target)
-            .map(|h| h.backend_command == "codex")
-            .unwrap_or(false);
-        let kind = params["kind"].as_str().unwrap_or("");
-        drop(reg);
-        let is_cross_team = {
-            let sender_team = crate::teams::find_team_for(ctx.home, from);
-            let target_team = crate::teams::find_team_for(ctx.home, target);
-            match (sender_team, target_team) {
-                (Some(s), Some(t)) => s.name != t.name,
-                _ => true, // no team = treat as cross-team (safe default)
-            }
-        };
-        // Issue #656: orchestrators must always receive PTY inject so they
-        // can react to status updates from team members.
-        let is_orchestrator = crate::teams::find_team_for(ctx.home, target)
-            .and_then(|t| t.orchestrator)
-            .is_some_and(|orch| orch == target);
-        // #982 B-narrow: override codex ack-absorption when the inbound
-        // message replies to a blocking dispatch the recipient already
-        // drained. Without this override, lead → codex query/task replies
-        // strand silently while the codex one-shot waits for a wake.
-        let is_reply_to_drained_blocker = matches!(kind, "update" | "report")
-            && params["correlation_id"]
-                .as_str()
-                .filter(|s| !s.is_empty())
-                .is_some_and(|corr| {
-                    crate::inbox::has_drained_blocker_for_correlation(ctx.home, target, corr)
-                });
-        let skip_inject = is_codex
-            && matches!(kind, "update" | "report")
-            && !is_cross_team
-            && !is_orchestrator
-            && !is_reply_to_drained_blocker;
-        if skip_inject {
-            crate::event_log::log(
-                ctx.home,
-                "ack_absorbed",
-                target,
-                &format!("from={from} kind={kind}"),
-            );
-            "inbox_only"
-        } else {
-            crate::inbox::compose_aware_send(ctx.home, target, &inject_msg);
-            "pty"
+    let target_in_registry = reg.contains_key(target);
+    let is_codex = reg
+        .get(target)
+        .map(|h| h.backend_command == "codex")
+        .unwrap_or(false);
+    drop(reg);
+    let kind = params["kind"].as_str().unwrap_or("");
+    let is_cross_team = {
+        let sender_team = crate::teams::find_team_for(ctx.home, from);
+        let target_team = crate::teams::find_team_for(ctx.home, target);
+        match (sender_team, target_team) {
+            (Some(s), Some(t)) => s.name != t.name,
+            _ => true, // no team = treat as cross-team (safe default)
         }
-    } else {
-        drop(reg);
+    };
+    // Issue #656: orchestrators must always receive PTY inject so they
+    // can react to status updates from team members.
+    let is_orchestrator = crate::teams::find_team_for(ctx.home, target)
+        .and_then(|t| t.orchestrator)
+        .is_some_and(|orch| orch == target);
+    // #982 B-narrow: override codex ack-absorption when the inbound
+    // message replies to a blocking dispatch the recipient already
+    // drained. Without this override, lead → codex query/task replies
+    // strand silently while the codex one-shot waits for a wake.
+    let is_reply_to_drained_blocker = matches!(kind, "update" | "report")
+        && params["correlation_id"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .is_some_and(|corr| {
+                crate::inbox::has_drained_blocker_for_correlation(ctx.home, target, corr)
+            });
+    // Issue #603: Codex is one-shot — skip PTY inject for messages that
+    // don't require a reply (update/report), avoiding wasted turns.
+    // Issue #612: Cross-team messages are NEVER silently absorbed.
+    let skip_inject = is_codex
+        && matches!(kind, "update" | "report")
+        && !is_cross_team
+        && !is_orchestrator
+        && !is_reply_to_drained_blocker;
+
+    let delivery_mode = if !target_in_registry {
+        // Absent target — fleet-defined but no live registry entry; enqueue
+        // to inbox JSONL only. dev-2 nit T6: PTY wake hint would be a
+        // no-op anyway (no handle to inject into).
+        let _ = crate::inbox::enqueue(ctx.home, target, msg.clone());
         "inbox_only"
+    } else if skip_inject {
+        // #982 ack absorption — inbox JSONL gets the entry, no PTY hint
+        // so codex one-shots avoid a wasted turn.
+        let _ = crate::inbox::enqueue(ctx.home, target, msg.clone());
+        crate::event_log::log(
+            ctx.home,
+            "ack_absorbed",
+            target,
+            &format!("from={from} kind={kind}"),
+        );
+        "inbox_only"
+    } else {
+        // #1065 unified path — enqueue_with_idle_hint persists to inbox
+        // AND emits the short `[AGEND-MSG-PENDING]` PTY hint via
+        // `compose_aware_inject`. Same wake signal as the daemon-emit
+        // auto-wake at `daemon::ci_watch::poller::ci_check_repo`.
+        let _ = crate::inbox::enqueue_with_idle_hint(ctx.home, target, msg.clone());
+        "pty"
     };
 
     // B1 boundary: provenance injection pushed from MCP comms to API SEND.

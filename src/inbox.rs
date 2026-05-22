@@ -630,6 +630,9 @@ pub fn unread_count(home: &Path, name: &str) -> (usize, Option<chrono::DateTime<
 
 /// Size threshold for header-only PTY injection. Messages with body > this
 /// value inject only a structured header line; the full body stays in inbox.
+// #1065 removed the only production caller (`handle_send`'s `inject_msg`
+// build); test diagnostics + format-header callers still consume it.
+#[allow(dead_code)]
 pub const HEADER_SIZE_THRESHOLD: usize = 300;
 
 /// Returns true when the `AGEND_POINTER_ONLY_INJECT` feature flag is set to "1".
@@ -667,6 +670,12 @@ fn sanitize_header_value(s: &str) -> String {
 /// Format a single-line structured header for PTY injection.
 /// Fields: from / id / kind / thread / parent / size.
 /// Optional fields (thread/parent) omitted when None.
+///
+/// #1065 removed the production call site (`handle_send` now routes
+/// through `enqueue_with_idle_hint` which builds its own
+/// `[AGEND-MSG-PENDING]` hint). Retained `pub` for test diagnostics
+/// (e.g. `src/instructions.rs` instruction-text invariant checks).
+#[allow(dead_code)]
 pub fn format_header(msg: &InboxMessage) -> String {
     // #761: strip the redundant `from:` prefix that `Source::Agent`'s
     // Display impl (inbox.rs:144) adds. `strip_prefix` returns `Some`
@@ -1264,15 +1273,10 @@ fn msg_already_drained_in_jsonl(home: &Path, agent_name: &str, msg_id: &str) -> 
     })
 }
 
-/// Compose-aware message delivery with auto-submit: checks `is_composing`
-/// and enqueues if mid-typing, otherwise injects via `inject_to_agent` which
-/// appends `inject_prefix` + `submit_key`. Used by `handle_send` for explicit
-/// agent-to-agent messages that must be submitted to the target's CLI.
-pub fn compose_aware_send(home: &Path, agent_name: &str, message: &str) {
-    let _ = route_notification(home, agent_name, message, |msg| {
-        inject_with_submit(home, agent_name, msg)
-    });
-}
+// #1065: `compose_aware_send` removed — `handle_send` now routes through
+// `enqueue_with_idle_hint` for the PTY path, unifying the wake signal with
+// daemon-emitted auto-wake. The composing-aware injection primitive is now
+// solely `compose_aware_inject` (used by `enqueue_with_idle_hint`).
 
 /// #982 Direction A: persist a message to the recipient's inbox AND emit a
 /// best-effort `[AGEND-MSG-PENDING]` PTY hint so daemon-side events do not
@@ -1293,8 +1297,12 @@ pub fn compose_aware_send(home: &Path, agent_name: &str, message: &str) {
 ///   [`crate::inbox::notify_agent`] (which routes through
 ///   [`compose_aware_inject`]) on the same hop, so migrating would
 ///   double-inject and risk re-entry into the API loopback.
-/// - `api::handlers::messaging::handle_send` — paired with the primary
-///   [`compose_aware_send`] call. Migrating duplicates the inject.
+/// - `api::handlers::messaging::handle_send` — (post-#1065) MIGRATED to
+///   this call. Pre-#1065 used bare `enqueue` + `compose_aware_send`
+///   which injected the full `[AGEND-MSG]` header; the size pressure
+///   extended the inject window past the submit-key delay window
+///   (race-condition on `\r`). Migrating here closes the divergence
+///   with daemon-emitted auto-wake.
 /// - `channel::telegram::inbound` status-keyword path — paired with
 ///   [`crate::inbox::notify_agent`] on the same hop.
 /// - `daemon::supervisor` member-state-change emit — paired with
@@ -1889,16 +1897,18 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Regression pins: compose_aware_send vs compose_aware_inject
-    // PR #96 conflated both into raw write; PR #99 splits them.
+    // Regression pins: route_notification — the composing-aware primitive
+    // shared by `compose_aware_inject` and (pre-#1065) `compose_aware_send`.
+    // PR #96 conflated both into raw write; PR #99 split them. #1065 removed
+    // the now-redundant `compose_aware_send` wrapper, so these tests pin
+    // the underlying `route_notification` behavior directly.
     // -----------------------------------------------------------------------
 
     #[test]
-    fn compose_aware_send_calls_injector_when_idle() {
-        // compose_aware_send must call the injector (not enqueue) when agent
-        // is idle. The injector for send uses inject_with_submit (raw=false
-        // → inject_to_agent with submit_key).
-        let home = tmp_home("send-idle");
+    fn route_notification_calls_injector_when_idle() {
+        // `route_notification` must call the injector closure (not enqueue
+        // to the notification_queue) when the agent is NOT composing.
+        let home = tmp_home("route-idle");
         let mut called = false;
         route_notification(&home, "agent1", "msg", |_| {
             called = true;
@@ -1910,9 +1920,10 @@ mod tests {
     }
 
     #[test]
-    fn compose_aware_send_enqueues_when_composing() {
-        // compose_aware_send must enqueue (not inject) when agent is composing.
-        let home = tmp_home("send-composing");
+    fn route_notification_enqueues_when_composing() {
+        // `route_notification` must enqueue to the notification_queue (not
+        // call the injector) when the agent IS composing.
+        let home = tmp_home("route-composing");
         mark_composing(&home, "agent1");
         let mut called = false;
         route_notification(&home, "agent1", "msg", |_| {
