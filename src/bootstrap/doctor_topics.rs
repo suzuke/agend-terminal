@@ -1,18 +1,19 @@
-//! Sprint 59 Wave 2 PR-IMPL (F2 — γ-reduced 4-class) — operator-
+//! Sprint 59 Wave 2 PR-IMPL (F2 — reduced 2-class) — operator-
 //! callable diagnostic + cleanup surface for telegram topic state.
 //!
 //! Backs the `agend-terminal doctor topics [--cleanup] [--format
 //! human|json]` CLI subcommand. Reads `topics.json` (registry) +
 //! `fleet.yaml` (instance list) and classifies every observable
-//! (topic_id, instance_name) pair into one of 4 mutually-exclusive
-//! classes via precedence-ordered first-match-wins assignment.
+//! (topic_id, instance_name) pair into one of 2 mutually-exclusive
+//! classes.
 //!
-//! Post-#994 Phase 1: topics.json is the single source of truth for
-//! topic_id. The `fleet_topic_ids` comparison also reads topics.json,
-//! making DriftFleet and StaleRegistry unreachable from `classify()`.
-//! These classes remain in the enum for manual report construction.
+//! Post-#994: topics.json is the single source of truth for
+//! topic_id. The former 4-class taxonomy (live / drift_fleet /
+//! stale_registry / orphan) collapsed to 2 classes (live / orphan)
+//! because drift_fleet and stale_registry were only possible when
+//! fleet.yaml carried an independent topic_id copy.
 //!
-//! ## Why 4 classes (not 5)
+//! ## Why not `stale_chat`
 //!
 //! The Sprint 59 Wave 2 PR-1 RCA originally proposed a 5-class
 //! taxonomy that included `stale_chat` (topic exists in chat but
@@ -30,32 +31,24 @@
 //! Sprint 60+ candidate: teloxide upgrade evaluation if a future
 //! Bot API version exposes forum-topic enumeration.
 //!
-//! ## Classification algorithm (4 classes, precedence-ordered)
+//! ## Classification algorithm (2 classes)
 //!
-//! For each `(topic_id, instance_name)` candidate observed across
-//! topics.json + fleet.yaml instance list, apply rules in order;
-//! assign first-match:
+//! For each `(topic_id, instance_name)` in topics.json:
 //!
-//! 1. `live` — present in topics.json AND instance in fleet.yaml.
-//! 2. `drift_fleet` — (unreachable post-#994: same-source comparison)
-//! 3. `stale_registry` — (unreachable post-#994: same-source comparison)
-//! 4. `orphan` — present in topics.json mapping to instance name
-//!    NOT in fleet.yaml. Instance retired without registry cleanup.
+//! 1. `live` — instance exists in fleet.yaml.
+//! 2. `orphan` — instance NOT in fleet.yaml (retired without
+//!    registry cleanup).
 
 use crate::fleet::FleetConfig;
 use std::collections::HashMap;
 use std::path::Path;
 
-/// 4-class taxonomy (per F2 reduced from RCA's original 5).
+/// 2-class taxonomy (post-#994; formerly 4 classes before single-source-of-truth).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TopicClass {
-    /// topics.json entry matches (post-#994: always the case).
+    /// Instance in topics.json AND in fleet.yaml.
     Live,
-    /// topics.json entries differ (unreachable post-#994).
-    DriftFleet,
-    /// topics.json says it should exist; chat-side unverifiable.
-    StaleRegistry,
-    /// topics.json maps to instance NOT in fleet.yaml.
+    /// Instance in topics.json but NOT in fleet.yaml.
     Orphan,
 }
 
@@ -63,8 +56,6 @@ impl TopicClass {
     pub fn as_str(self) -> &'static str {
         match self {
             TopicClass::Live => "live",
-            TopicClass::DriftFleet => "drift_fleet",
-            TopicClass::StaleRegistry => "stale_registry",
             TopicClass::Orphan => "orphan",
         }
     }
@@ -76,9 +67,6 @@ pub struct ClassifiedTopic {
     pub topic_id: i32,
     pub instance_name: String,
     pub class: TopicClass,
-    /// `Some(fleet_id)` from topics.json lookup for the instance.
-    /// `None` when not in topics.json.
-    pub fleet_topic_id: Option<i32>,
 }
 
 /// Classification report — sorted by topic_id for stable output.
@@ -103,10 +91,6 @@ impl TopicReport {
 pub fn classify(home: &Path) -> TopicReport {
     let registry = load_topic_registry(home);
     let fleet = FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok();
-    let fleet_topic_ids: HashMap<String, i32> = {
-        let reg = load_topic_registry(home);
-        reg.into_iter().map(|(tid, name)| (name, tid)).collect()
-    };
     let fleet_instance_names: std::collections::HashSet<String> = fleet
         .as_ref()
         .map(|c| c.instances.keys().cloned().collect())
@@ -114,41 +98,17 @@ pub fn classify(home: &Path) -> TopicReport {
 
     let mut entries: Vec<ClassifiedTopic> = registry
         .into_iter()
-        // Skip the fleet_binding sentinel + `general` topic_id=1
-        // pseudo-instance — these are reserved markers, not user-
-        // facing topics that operators classify.
         .filter(|(tid, name)| *tid != 1 && name != crate::channel::telegram::FLEET_BINDING_SENTINEL)
         .map(|(topic_id, instance_name)| {
-            let fleet_topic_id = fleet_topic_ids.get(&instance_name).copied();
-            let in_fleet = fleet_instance_names.contains(&instance_name);
-            // Precedence-ordered first-match-wins assignment per RCA §4.1
-            // (4-class reduction per F2):
-            // 1. orphan — instance not in fleet.yaml (regardless of
-            //    fleet topic_id state, which would be None for
-            //    missing instances anyway).
-            let class = if !in_fleet {
-                TopicClass::Orphan
-            } else if let Some(fleet_id) = fleet_topic_id {
-                if fleet_id == topic_id {
-                    // 2. live — registry + fleet agree.
-                    // Note: chat-side unverifiable per F2 API gap;
-                    // class is "registry says live, chat unverified".
-                    TopicClass::Live
-                } else {
-                    // 3. drift_fleet — registry + fleet differ.
-                    TopicClass::DriftFleet
-                }
+            let class = if fleet_instance_names.contains(&instance_name) {
+                TopicClass::Live
             } else {
-                // 4. stale_registry — instance in fleet but no
-                //    fleet topic_id (or it's been cleared);
-                //    registry is the only anchor.
-                TopicClass::StaleRegistry
+                TopicClass::Orphan
             };
             ClassifiedTopic {
                 topic_id,
                 instance_name,
                 class,
-                fleet_topic_id,
             }
         })
         .collect();
@@ -156,9 +116,6 @@ pub fn classify(home: &Path) -> TopicReport {
 
     TopicReport {
         entries,
-        // can_manage_topics is set externally by callers that
-        // probe the permission via a network call — cli.rs
-        // populates it before display.
         can_manage_topics: None,
     }
 }
@@ -187,12 +144,7 @@ pub fn render_human(report: &TopicReport) -> String {
     if total == 0 {
         out.push_str("  (no tracked topics in topics.json)\n");
     } else {
-        for class in [
-            TopicClass::Live,
-            TopicClass::DriftFleet,
-            TopicClass::StaleRegistry,
-            TopicClass::Orphan,
-        ] {
+        for class in [TopicClass::Live, TopicClass::Orphan] {
             let count = report.count_by_class(class);
             if count == 0 {
                 continue;
@@ -202,15 +154,7 @@ pub fn render_human(report: &TopicReport) -> String {
                 .entries
                 .iter()
                 .filter(|e| e.class == class)
-                .map(|e| {
-                    let drift_note =
-                        if let (TopicClass::DriftFleet, Some(fid)) = (e.class, e.fleet_topic_id) {
-                            format!(" (registry={}, fleet={})", e.topic_id, fid)
-                        } else {
-                            format!(":{}", e.topic_id)
-                        };
-                    format!("{}{}", e.instance_name, drift_note)
-                })
+                .map(|e| format!("{}:{}", e.instance_name, e.topic_id))
                 .collect();
             out.push_str(&format!("({})\n", names.join(", ")));
         }
@@ -235,9 +179,7 @@ pub fn render_human(report: &TopicReport) -> String {
          the Telegram UI directly. Sprint 60+ candidate tracks teloxide upgrade evaluation.\n",
     );
     if total > 0 {
-        out.push_str(
-            "\nRun with --cleanup to act on stale_registry / drift_fleet / orphan entries.\n",
-        );
+        out.push_str("\nRun with --cleanup to act on orphan entries.\n");
     }
     out
 }
@@ -252,19 +194,16 @@ pub fn render_json(report: &TopicReport) -> String {
                 "topic_id": e.topic_id,
                 "instance_name": e.instance_name,
                 "class": e.class.as_str(),
-                "fleet_topic_id": e.fleet_topic_id,
             })
         })
         .collect();
     let counts = serde_json::json!({
         "live": report.count_by_class(TopicClass::Live),
-        "drift_fleet": report.count_by_class(TopicClass::DriftFleet),
-        "stale_registry": report.count_by_class(TopicClass::StaleRegistry),
         "orphan": report.count_by_class(TopicClass::Orphan),
         "total": report.entries.len(),
     });
     let payload = serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "entries": entries,
         "counts": counts,
         "can_manage_topics": report.can_manage_topics,
@@ -276,11 +215,6 @@ pub fn render_json(report: &TopicReport) -> String {
 /// Action taken by `--cleanup` per classification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CleanupAction {
-    /// Removed from `topics.json`; no chat operation.
-    UnregisteredOnly {
-        topic_id: i32,
-        instance_name: String,
-    },
     /// Called `delete_topic` on chat side + unregistered.
     DeletedFromChatAndRegistry {
         topic_id: i32,
@@ -291,13 +225,6 @@ pub enum CleanupAction {
         topic_id: i32,
         instance_name: String,
     },
-    /// Skipped per operator's `--prefer-fleet` / `--prefer-registry`
-    /// resolution choice not matching this entry's class needs.
-    SkippedNeedsResolution {
-        topic_id: i32,
-        instance_name: String,
-        reason: &'static str,
-    },
     /// API error during cleanup; entry left as-is.
     SkippedApiError {
         topic_id: i32,
@@ -306,87 +233,18 @@ pub enum CleanupAction {
     },
 }
 
-/// Cleanup preference for `drift_fleet` resolution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DriftResolution {
-    /// Take fleet.yaml as authoritative; update topics.json to
-    /// match. (Default if operator doesn't pick.)
-    PreferFleet,
-    /// Take topics.json as authoritative; update fleet.yaml to
-    /// match.
-    PreferRegistry,
-    /// Don't resolve; operator wants to see the drift surfaced
-    /// without acting.
-    LeaveDrift,
-}
-
-/// Plan + execute the cleanup pass. The planning + execution split
-/// makes it testable without mocking the telegram API: pure
-/// classification + plan in this function; chat-side mutation
-/// happens via the existing `delete_topic` / `unregister_topic`
-/// surfaces.
+/// Plan + execute the cleanup pass. Only orphan entries are actionable
+/// post-#994 (live entries need no cleanup; drift_fleet / stale_registry
+/// no longer exist).
 ///
 /// `can_manage_topics` short-circuits chat-mutating ops. When
-/// `false` or `None`, only `UnregisteredOnly` actions fire (registry-
-/// only cleanup of `stale_registry` entries).
-pub fn execute_cleanup(
-    home: &Path,
-    report: &TopicReport,
-    drift_resolution: DriftResolution,
-) -> Vec<CleanupAction> {
+/// `false` or `None`, orphan entries are skipped with a permission warning.
+pub fn execute_cleanup(home: &Path, report: &TopicReport) -> Vec<CleanupAction> {
     let mut actions = Vec::new();
     let can_manage = report.can_manage_topics.unwrap_or(false);
     for entry in &report.entries {
         match entry.class {
-            TopicClass::Live => {
-                // No action — agreement state.
-            }
-            TopicClass::StaleRegistry => {
-                // Registry says it should exist; chat-side
-                // unverifiable. Operator's recovery path is manual
-                // verify; we surface the entry but don't auto-clean
-                // (would risk losing a real-but-unverified topic).
-                actions.push(CleanupAction::SkippedNeedsResolution {
-                    topic_id: entry.topic_id,
-                    instance_name: entry.instance_name.clone(),
-                    reason: "stale_registry: chat-side unverifiable per teloxide API gap; \
-                             operator must manually verify via Telegram UI",
-                });
-            }
-            TopicClass::DriftFleet => match drift_resolution {
-                DriftResolution::PreferFleet => {
-                    // Update topics.json to match fleet.yaml.
-                    if let Some(fid) = entry.fleet_topic_id {
-                        let mut reg = registry_load(home);
-                        reg.remove(&entry.topic_id);
-                        reg.insert(fid, entry.instance_name.clone());
-                        registry_save(home, &reg);
-                        actions.push(CleanupAction::UnregisteredOnly {
-                            topic_id: entry.topic_id,
-                            instance_name: entry.instance_name.clone(),
-                        });
-                    }
-                }
-                DriftResolution::PreferRegistry => {
-                    tracing::info!(
-                        instance = %entry.instance_name,
-                        topic_id = entry.topic_id,
-                        "doctor: PreferRegistry is no-op post-refactor (topics.json is canonical)"
-                    );
-                    actions.push(CleanupAction::SkippedNeedsResolution {
-                        topic_id: entry.topic_id,
-                        instance_name: entry.instance_name.clone(),
-                        reason: "prefer_registry: no-op (topics.json is already canonical source)",
-                    });
-                }
-                DriftResolution::LeaveDrift => {
-                    actions.push(CleanupAction::SkippedNeedsResolution {
-                        topic_id: entry.topic_id,
-                        instance_name: entry.instance_name.clone(),
-                        reason: "drift_fleet: operator chose to leave drift unresolved",
-                    });
-                }
-            },
+            TopicClass::Live => {}
             TopicClass::Orphan => {
                 if !can_manage {
                     actions.push(CleanupAction::SkippedNoPermission {
@@ -428,17 +286,6 @@ pub fn execute_cleanup(
         }
     }
     actions
-}
-
-fn registry_load(home: &Path) -> HashMap<i32, String> {
-    load_topic_registry(home)
-}
-
-fn registry_save(home: &Path, reg: &HashMap<i32, String>) {
-    let map: HashMap<String, &String> = reg.iter().map(|(k, v)| (k.to_string(), v)).collect();
-    if let Ok(json) = serde_json::to_string_pretty(&map) {
-        let _ = crate::store::atomic_write(&home.join("topics.json"), json.as_bytes());
-    }
 }
 
 #[cfg(test)]
@@ -652,7 +499,7 @@ mod tests {
         write_fleet(&home, &[("alpha", Some(1))]);
         let mut report = classify(&home);
         report.can_manage_topics = Some(false);
-        let actions = execute_cleanup(&home, &report, DriftResolution::PreferFleet);
+        let actions = execute_cleanup(&home, &report);
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             actions[0],
@@ -662,55 +509,15 @@ mod tests {
     }
 
     #[test]
-    fn execute_cleanup_former_stale_registry_now_live() {
-        // Post-refactor: fleet_topic_ids comes from topics.json, so a registry
-        // entry always matches itself → Live (StaleRegistry unreachable).
-        let home = tmp_home("cleanup-stale");
+    fn execute_cleanup_live_produces_no_actions() {
+        let home = tmp_home("cleanup-live");
         write_registry(&home, &[(42, "alpha")]);
         write_fleet(&home, &[("alpha", None)]);
         let mut report = classify(&home);
         report.can_manage_topics = Some(true);
         assert_eq!(report.entries.len(), 1);
         assert_eq!(report.entries[0].class, TopicClass::Live);
-        let actions = execute_cleanup(&home, &report, DriftResolution::PreferFleet);
-        assert!(
-            actions.is_empty(),
-            "Live entries produce no cleanup actions"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn execute_cleanup_former_drift_now_live_prefer_fleet() {
-        // Post-refactor: fleet_topic_ids comes from topics.json, so registry
-        // entry always agrees with itself → Live (DriftFleet unreachable).
-        let home = tmp_home("cleanup-drift-fleet");
-        write_registry(&home, &[(42, "alpha")]);
-        write_fleet(&home, &[("alpha", Some(99))]);
-        let mut report = classify(&home);
-        report.can_manage_topics = Some(true);
-        assert_eq!(report.entries.len(), 1);
-        assert_eq!(report.entries[0].class, TopicClass::Live);
-        let actions = execute_cleanup(&home, &report, DriftResolution::PreferFleet);
-        assert!(
-            actions.is_empty(),
-            "Live entries produce no cleanup actions"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn execute_cleanup_former_drift_now_live_leave() {
-        // Post-refactor: fleet_topic_ids comes from topics.json, so registry
-        // entry always agrees with itself → Live (DriftFleet unreachable).
-        let home = tmp_home("cleanup-drift-leave");
-        write_registry(&home, &[(42, "alpha")]);
-        write_fleet(&home, &[("alpha", Some(99))]);
-        let mut report = classify(&home);
-        report.can_manage_topics = Some(true);
-        assert_eq!(report.entries.len(), 1);
-        assert_eq!(report.entries[0].class, TopicClass::Live);
-        let actions = execute_cleanup(&home, &report, DriftResolution::LeaveDrift);
+        let actions = execute_cleanup(&home, &report);
         assert!(
             actions.is_empty(),
             "Live entries produce no cleanup actions"
@@ -721,8 +528,6 @@ mod tests {
     #[test]
     fn class_as_str_round_trips_to_taxonomy_names() {
         assert_eq!(TopicClass::Live.as_str(), "live");
-        assert_eq!(TopicClass::DriftFleet.as_str(), "drift_fleet");
-        assert_eq!(TopicClass::StaleRegistry.as_str(), "stale_registry");
         assert_eq!(TopicClass::Orphan.as_str(), "orphan");
     }
 }

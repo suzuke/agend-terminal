@@ -9,6 +9,10 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 - **`agy` backend (#987)** — Google Antigravity CLI as a sixth first-class backend alongside claude / kiro-cli / codex / opencode / gemini. Mirror-pattern addition: `Backend::Agy` variant + `configure_agy` writes `<workdir>/.antigravitycli/mcp_config.json` with the standard `mcpServers` stdio schema (`agend-mcp-bridge` unchanged). Resume via `agy --continue`. Calibrated against `tests/fixtures/state-replay/agy-thinking.raw` (agy 1.0.0 on macOS 14.5). Motivated by Gemini CLI sunset 2026-06-18; existing `gemini` backend retained for paid Code Assist Standard/Enterprise license holders. Operator note: AGY shares OAuth state with the Antigravity desktop app per OS user; multi-instance agents under the same `$HOME` share auth state (same convention as existing `gemini` backend — no daemon intercept).
 
+### Changed (#994)
+
+- **`doctor topics` taxonomy reduced from 4 classes to 2** — `drift_fleet` and `stale_registry` classes removed. With topics.json as the single source of truth for topic_id (Phase 1 #1062), there is no second source to drift against. Only `live` (instance in fleet.yaml) and `orphan` (instance retired) remain. The `--prefer-fleet` / `--prefer-registry` CLI flags are removed (no drift to resolve). JSON output `schema_version` bumped to 2. Operator awareness — not regression: the removed classes were unreachable since #1062.
+
 ### Changed (#995)
 
 - **`agy` backend display name** — TUI Backend picker (ctrl+b c) and serialized `Backend::Agy.name()` now return `antigravity-cli` instead of the binary name `agy`. The binary command (`preset().command`) remains `agy`; `parse_str` still accepts the `agy` / `antigravity` / `antigravity-cli` aliases for backward-compat with fleet.yaml entries written before #995.

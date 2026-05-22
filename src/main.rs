@@ -476,11 +476,11 @@ enum SkillsAction {
 /// topic state diagnostic + optional cleanup.
 #[derive(Subcommand)]
 enum DoctorAction {
-    /// Diagnose telegram topic state (live / drift_fleet / stale_registry / orphan).
-    /// Pair with `--cleanup` to act on stale/drift/orphan entries (chat-mutating
+    /// Diagnose telegram topic state (live / orphan).
+    /// Pair with `--cleanup` to act on orphan entries (chat-mutating
     /// operations gated by bot's `can_manage_topics` permission).
     Topics {
-        /// Act on stale/drift/orphan entries (registry update + chat-side delete).
+        /// Act on orphan entries (registry update + chat-side delete).
         /// Requires the bot to have `can_manage_topics` permission for chat-mutating
         /// operations on `orphan` entries; without permission, those skip with warn.
         #[arg(long)]
@@ -492,16 +492,6 @@ enum DoctorAction {
         /// Skip interactive confirmation prompt for `--cleanup`.
         #[arg(long)]
         yes: bool,
-        /// For `drift_fleet` entries during `--cleanup`: take fleet.yaml as
-        /// authoritative (update topics.json to match). Mutually exclusive with
-        /// `--prefer-registry`.
-        #[arg(long)]
-        prefer_fleet: bool,
-        /// For `drift_fleet` entries during `--cleanup`: take topics.json as
-        /// authoritative (update fleet.yaml to match). Mutually exclusive with
-        /// `--prefer-fleet`.
-        #[arg(long)]
-        prefer_registry: bool,
     },
 }
 
@@ -1056,8 +1046,6 @@ fn main() -> anyhow::Result<()> {
                     cleanup,
                     format,
                     yes,
-                    prefer_fleet,
-                    prefer_registry,
                 }),
         }) => {
             cli::run_doctor_topics(
@@ -1066,8 +1054,6 @@ fn main() -> anyhow::Result<()> {
                     cleanup,
                     format: &format,
                     yes,
-                    prefer_fleet,
-                    prefer_registry,
                 },
             )?;
         }

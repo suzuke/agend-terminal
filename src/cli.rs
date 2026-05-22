@@ -363,20 +363,14 @@ pub struct DoctorTopicsOptions<'a> {
     pub cleanup: bool,
     pub format: &'a str,
     pub yes: bool,
-    pub prefer_fleet: bool,
-    pub prefer_registry: bool,
 }
 
 /// Run the topics-diagnostic doctor flow. Pure read in the default
 /// case; calls `execute_cleanup` when `--cleanup` is set.
 pub fn run_doctor_topics(home: &Path, opts: DoctorTopicsOptions) -> anyhow::Result<()> {
     use crate::bootstrap::doctor_topics::{
-        classify, execute_cleanup, render_human, render_json, CleanupAction, DriftResolution,
+        classify, execute_cleanup, render_human, render_json, CleanupAction,
     };
-
-    if opts.prefer_fleet && opts.prefer_registry {
-        anyhow::bail!("--prefer-fleet and --prefer-registry are mutually exclusive; pick one");
-    }
 
     let mut report = classify(home);
 
@@ -398,10 +392,7 @@ pub fn run_doctor_topics(home: &Path, opts: DoctorTopicsOptions) -> anyhow::Resu
 
     // Cleanup gate: confirmation prompt unless --yes.
     if !opts.yes {
-        eprintln!(
-            "About to act on stale_registry / drift_fleet / orphan entries above. \
-             Continue? (y/N): "
-        );
+        eprintln!("About to act on orphan entries above. Continue? (y/N): ");
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;
         let trimmed = input.trim().to_lowercase();
@@ -411,15 +402,7 @@ pub fn run_doctor_topics(home: &Path, opts: DoctorTopicsOptions) -> anyhow::Resu
         }
     }
 
-    let drift_resolution = if opts.prefer_fleet {
-        DriftResolution::PreferFleet
-    } else if opts.prefer_registry {
-        DriftResolution::PreferRegistry
-    } else {
-        DriftResolution::LeaveDrift
-    };
-
-    let actions = execute_cleanup(home, &report, drift_resolution);
+    let actions = execute_cleanup(home, &report);
     println!("\nCleanup actions ({}):", actions.len());
     for action in &actions {
         match action {
@@ -427,19 +410,10 @@ pub fn run_doctor_topics(home: &Path, opts: DoctorTopicsOptions) -> anyhow::Resu
                 topic_id,
                 instance_name,
             } => println!("  ✓ deleted topic {topic_id} ({instance_name}) — chat + registry"),
-            CleanupAction::UnregisteredOnly {
-                topic_id,
-                instance_name,
-            } => println!("  ✓ updated registry for {topic_id} ({instance_name}) — chat unchanged"),
             CleanupAction::SkippedNoPermission {
                 topic_id,
                 instance_name,
             } => println!("  ⚠ skipped {topic_id} ({instance_name}) — bot lacks can_manage_topics"),
-            CleanupAction::SkippedNeedsResolution {
-                topic_id,
-                instance_name,
-                reason,
-            } => println!("  ⚠ skipped {topic_id} ({instance_name}) — {reason}"),
             CleanupAction::SkippedApiError {
                 topic_id,
                 instance_name,
