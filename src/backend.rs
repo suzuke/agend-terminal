@@ -379,8 +379,9 @@ impl Backend {
                 ready_timeout_secs: 45,
                 dismiss_patterns: &[
                     // Issue #468: anchored regex (see ClaudeCode comment above).
-                    (r"(?m)^[^A-Za-z\n]{0,8}Update Available", b"\r"),
-                    (r"(?m)^[^A-Za-z\n]{0,8}Skip  Confirm", b"\r"),
+                    // #1069: Esc = "Skip" (don't auto-update; let operator decide).
+                    (r"(?m)^[^A-Za-z\n]{0,8}Update Available", b"\x1b"),
+                    (r"(?m)^[^A-Za-z\n]{0,8}Skip  Confirm", b"\x1b"),
                     (r"(?m)^[^A-Za-z\n]{0,8}Update Complete", b"\r"),
                     (r"(?m)^[^A-Za-z\n]{0,8}Please restart", b"\r"),
                 ],
@@ -1505,6 +1506,39 @@ mod tests {
         );
         assert!(
             !re.is_match("User asked: is there an Update available! for the tool?"),
+            "mid-line mention must NOT match (Issue #468 anchoring)"
+        );
+    }
+
+    #[test]
+    fn opencode_update_available_dismiss_uses_esc() {
+        let oc = Backend::OpenCode.preset();
+        let entry = oc
+            .dismiss_patterns
+            .iter()
+            .find(|(re, _)| re.contains("Update Available"))
+            .expect("#1069: opencode must have an `Update Available` dismiss pattern");
+        assert_eq!(
+            entry.1, b"\x1b",
+            "#1069: keystroke must be ESC (skip update, not confirm)"
+        );
+    }
+
+    #[test]
+    fn opencode_update_dismiss_anchored_rejects_mid_line() {
+        let oc = Backend::OpenCode.preset();
+        let (pattern, _) = oc
+            .dismiss_patterns
+            .iter()
+            .find(|(re, _)| re.contains("Update Available"))
+            .expect("#1069: opencode Update Available pattern must exist");
+        let re = regex::Regex::new(pattern).expect("pattern must compile");
+        assert!(
+            re.is_match("  Update Available"),
+            "line-start with TUI prefix must match"
+        );
+        assert!(
+            !re.is_match("The agent mentioned Update Available in its response"),
             "mid-line mention must NOT match (Issue #468 anchoring)"
         );
     }
