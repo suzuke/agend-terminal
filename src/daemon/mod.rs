@@ -871,6 +871,16 @@ fn run_core(
                                 return;
                             }
                             let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
+                            // #1080: re-install skills on crash respawn (idempotent).
+                            if let Some(ref wd) = config.working_dir {
+                                let skills_filter: Option<Vec<String>> =
+                                    crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+                                        .ok()
+                                        .and_then(|c| c.instances.get(&config.name).and_then(|i| i.skills.clone()));
+                                if let Err(e) = crate::skills::install_for_agent(&home, wd, skills_filter.as_deref()) {
+                                    tracing::warn!(agent = %config.name, error = %e, "crash-respawn skills install failed");
+                                }
+                            }
                             // Respawn fresh: stale --resume after a crash tends
                             // to loop on "conversation not found".
                             match agent::spawn_agent(
@@ -1565,6 +1575,20 @@ fn handle_stage2_restart(
             "shutdown during stage2 backoff, aborting"
         );
         return;
+    }
+
+    // #1080: re-install skills on stage2 restart (idempotent).
+    if let Some(ref wd) = config.working_dir {
+        let skills_filter: Option<Vec<String>> =
+            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+                .ok()
+                .and_then(|c| c.instances.get(name).and_then(|i| i.skills.clone()));
+        if let Err(e) = crate::skills::install_for_agent(home, wd, skills_filter.as_deref()) {
+            tracing::warn!(
+                target: "recovery_shadow",
+                agent = %name, error = %e, "stage2 skills install failed"
+            );
+        }
     }
 
     let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
