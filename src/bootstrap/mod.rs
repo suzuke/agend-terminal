@@ -117,8 +117,8 @@ pub struct AttachedFleet {
 
 /// Knobs for [`prepare`]. See field docs for semantics.
 pub struct PrepareOptions {
-    /// If true, fleet.yaml may be rewritten (general auto-create, topic_id
-    /// backfill). Set false for read-only contexts like verifier/CI.
+    /// If true, fleet.yaml may be rewritten (general auto-create) and
+    /// topics.json updated. Set false for read-only contexts like verifier/CI.
     pub mutate_fleet_yaml: bool,
     /// If true, initialize Telegram polling when `channel:` is configured.
     /// Set false for tests that don't need real bot traffic.

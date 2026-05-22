@@ -689,7 +689,8 @@ mod tests {
     #[test]
     #[allow(clippy::unwrap_used)]
     fn topic_id_persists_to_fleet_yaml_via_update_instance_field() {
-        // Regression test for #415: topic_id must round-trip through fleet.yaml.
+        // Helper-level test for update_instance_field (#415). Post-#994
+        // production uses topics.json, but this function still works.
         let home = std::env::temp_dir().join(format!("agend-topic-persist-{}", std::process::id()));
         std::fs::create_dir_all(&home).ok();
         std::fs::write(

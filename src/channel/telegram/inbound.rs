@@ -76,7 +76,7 @@ pub(super) fn resolve_topic(state: &mut TelegramState, topic_id: Option<i32>) ->
         // Fix C: warn before fallback so operator sees misroute.
         tracing::warn!(
             thread_id = tid,
-            "resolve_topic: topic_id not found in memory, fleet.yaml, or topics.json — falling back to \"general\""
+            "resolve_topic: topic_id not found in memory or topics.json — falling back to \"general\""
         );
     }
     "general".to_string()

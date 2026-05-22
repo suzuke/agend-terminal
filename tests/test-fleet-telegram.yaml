@@ -16,9 +16,7 @@ instances:
   general:
     role: "Fleet coordinator"
     working_directory: ~/Documents/Hack/agend
-    topic_id: 1
 
   blog-writer:
     role: "Blog content writer"
     working_directory: ~/Documents/Hack/blog
-    topic_id: 42

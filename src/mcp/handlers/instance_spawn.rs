@@ -136,9 +136,9 @@ pub(super) fn spawn_single_instance_impl(
     );
     let target_pane = target_pane_owned.as_deref();
 
-    // #964: ADD fleet.yaml entry BEFORE the SPAWN RPC so the SPAWN-time
-    // `register_topic` → `update_instance_field("topic_id")` chain finds the
-    // entry. Pre-fix SPAWN-then-add ordering hit #962 Path 2 silent no-op.
+    // #964: ADD fleet.yaml entry BEFORE the SPAWN RPC so the instance
+    // exists when SPAWN runs. Pre-fix SPAWN-then-add ordering caused
+    // silent failures.
     let entry = crate::fleet::InstanceYamlEntry {
         backend: backend_str
             .or_else(|| {

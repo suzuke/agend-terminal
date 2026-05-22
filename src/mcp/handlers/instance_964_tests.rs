@@ -4,11 +4,10 @@
 //!
 //! T1 + T2 inject a mock `spawn_fn` into `spawn_single_instance_impl`
 //! that mimics `handle_spawn`'s side effects (`register_topic` writes
-//! `topic_id` back via `update_instance_field`) WITHOUT standing up a
-//! real daemon. This isolates the ordering invariant: the fleet.yaml
-//! entry MUST exist when SPAWN runs, otherwise the mock's
-//! `update_instance_field` call hits #962 Path 2 (silent no-op) and
-//! the assertion fails — which is exactly what HEAD-pre-fix did.
+//! `topic_id` to `topics.json`) WITHOUT standing up a real daemon.
+//! This isolates the ordering invariant: the fleet.yaml entry MUST
+//! exist when SPAWN runs, otherwise the mock's `register_topic` call
+//! fails and the assertion fails.
 //!
 //! Class lesson (per dev-2 cross-audit): the existing test
 //! `topic_id_persists_to_fleet_yaml_via_update_instance_field`
@@ -38,19 +37,18 @@ fn tmp_home(slug: &str) -> std::path::PathBuf {
 }
 
 /// T1 (load-bearing): MCP create_instance must persist `topic_id` to
-/// fleet.yaml on the happy path. The mock `spawn_fn` mimics
+/// topics.json on the happy path. The mock `spawn_fn` mimics
 /// `handle_spawn`'s `register_topic` chain: it calls
-/// `update_instance_field("topic_id", ...)` then returns the topic_id
+/// `register_topic(home, topic_id, name)` then returns the topic_id
 /// in the SPAWN response. After the swap fix, the fleet.yaml entry
-/// exists by the time the mock fires, so the helper write succeeds and
-/// the post-state has `topic_id = Some(5198)`.
+/// exists by the time the mock fires, so the register succeeds.
 ///
 /// Pre-#964 (SPAWN-then-add ordering): mock would fire BEFORE the
-/// caller added the entry → helper hits #962 Path 2 silent no-op →
-/// `topic_id` stays `None` → assertion fails. This test is the
-/// regression anchor.
+/// caller added the entry. Post-#994 Phase 1, topic_id is persisted
+/// to topics.json (not fleet.yaml), so the ordering constraint is
+/// relaxed — but the test anchors the caller-path contract.
 #[test]
-fn t1_create_instance_persists_topic_id_to_fleet_yaml() {
+fn t1_create_instance_persists_topic_id() {
     let home = tmp_home("t1");
     let target_topic_id = 5198_i32;
 
@@ -58,16 +56,7 @@ fn t1_create_instance_persists_topic_id_to_fleet_yaml() {
         let name = req["params"]["name"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing name"))?;
-        // Mimic handle_spawn → register_topic → update_instance_field.
-        // With the swap fix, fleet.yaml entry exists here, so the
-        // helper persists topic_id. Pre-fix, the entry didn't exist,
-        // so the helper silently no-op'd.
-        crate::fleet::update_instance_field(
-            h,
-            name,
-            "topic_id",
-            serde_yaml_ng::Value::Number(serde_yaml_ng::Number::from(target_topic_id)),
-        )?;
+        crate::channel::telegram::register_topic(h, target_topic_id, name)?;
         Ok(json!({
             "ok": true,
             "result": {"topic_id": target_topic_id}
@@ -87,16 +76,12 @@ fn t1_create_instance_persists_topic_id_to_fleet_yaml() {
         "MCP response must carry topic_id; got {result}"
     );
 
-    let cfg = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
-        .expect("reload fleet.yaml");
-    let persisted = cfg.instances.get("t1-instance").and_then(|i| i.topic_id);
+    let persisted = crate::channel::telegram::lookup_topic_for_instance(&home, "t1-instance");
     assert_eq!(
         persisted,
         Some(target_topic_id),
-        "#964 regression: topic_id must be persisted to fleet.yaml \
-         after MCP create_instance returns. Got {persisted:?} for \
-         entry={:?}",
-        cfg.instances.get("t1-instance")
+        "#964 regression: topic_id must be persisted to topics.json \
+         after MCP create_instance returns. Got {persisted:?}"
     );
 
     let _ = std::fs::remove_dir_all(&home);

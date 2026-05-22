@@ -12,8 +12,8 @@
 //!      `Option<Arc<dyn Channel>>` — post-#945 Phase 1 the channel
 //!      registers ~6s after app startup; cached snapshots are commonly
 //!      `None` and silently no-op forever)
-//!   3. Persist topic_id back to fleet.yaml via `update_instance_field`
-//!      when a topic was created — closes the #964-class caller-path
+//!   3. Persist topic_id to topics.json via `register_topic` when a
+//!      topic was created — closes the #964-class caller-path
 //!      replication for the TUI surface
 //!
 //! Returns `TopicOutcome` so callers handle Created / NoChannel /
@@ -185,7 +185,7 @@ mod tests {
     }
 
     /// T1 — happy path: mock channel registered, helper invoked,
-    /// fleet.yaml ends with topic_id persisted + helper returns
+    /// topics.json ends with topic_id persisted + helper returns
     /// `Created(topic_id)`.
     #[test]
     #[serial]
@@ -247,9 +247,9 @@ mod tests {
     /// post-state matches what ctrl+b c → Backend menu should produce.
     ///
     /// Pre-fix (Backend menu calling `add_instance_to_yaml` directly +
-    /// no topic creation): fleet.yaml had the entry but `topic_id: null`.
-    /// Post-fix (Backend menu calling this helper): fleet.yaml has the
-    /// entry AND topic_id is Some(_).
+    /// no topic creation): no topic_id persisted anywhere.
+    /// Post-fix (Backend menu calling this helper): topics.json has the
+    /// topic_id mapping.
     ///
     /// THIS is the caller-path regression anchor for the #966 bug
     /// (matches #964 T1 pattern — the test PR #966 should ship to

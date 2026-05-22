@@ -3,9 +3,14 @@
 //!
 //! Backs the `agend-terminal doctor topics [--cleanup] [--format
 //! human|json]` CLI subcommand. Reads `topics.json` (registry) +
-//! `fleet.yaml` (instance topic_id) + classifies every observable
+//! `fleet.yaml` (instance list) and classifies every observable
 //! (topic_id, instance_name) pair into one of 4 mutually-exclusive
 //! classes via precedence-ordered first-match-wins assignment.
+//!
+//! Post-#994 Phase 1: topics.json is the single source of truth for
+//! topic_id. The `fleet_topic_ids` comparison also reads topics.json,
+//! making DriftFleet and StaleRegistry unreachable from `classify()`.
+//! These classes remain in the enum for manual report construction.
 //!
 //! ## Why 4 classes (not 5)
 //!
@@ -28,17 +33,12 @@
 //! ## Classification algorithm (4 classes, precedence-ordered)
 //!
 //! For each `(topic_id, instance_name)` candidate observed across
-//! 2 sources (`topics.json` / `fleet.yaml.<inst>.topic_id`), apply
-//! rules in order; assign first-match:
+//! topics.json + fleet.yaml instance list, apply rules in order;
+//! assign first-match:
 //!
-//! 1. `live` — present in topics.json AND fleet.yaml.topic_id
-//!    matches. Both sources agree.
-//! 2. `drift_fleet` — present in topics.json AND fleet.yaml.topic_id
-//!    exists BUT differs. Drift between sources.
-//! 3. `stale_registry` — present in topics.json AND
-//!    fleet.yaml.topic_id matches OR is absent. Treat as
-//!    registry-resident; chat-side unverifiable. Operator's
-//!    manual verification via Telegram UI is the recovery path.
+//! 1. `live` — present in topics.json AND instance in fleet.yaml.
+//! 2. `drift_fleet` — (unreachable post-#994: same-source comparison)
+//! 3. `stale_registry` — (unreachable post-#994: same-source comparison)
 //! 4. `orphan` — present in topics.json mapping to instance name
 //!    NOT in fleet.yaml. Instance retired without registry cleanup.
 
@@ -49,9 +49,9 @@ use std::path::Path;
 /// 4-class taxonomy (per F2 reduced from RCA's original 5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TopicClass {
-    /// topics.json AND fleet.yaml.topic_id agree.
+    /// topics.json entry matches (post-#994: always the case).
     Live,
-    /// topics.json AND fleet.yaml.topic_id exist but differ.
+    /// topics.json entries differ (unreachable post-#994).
     DriftFleet,
     /// topics.json says it should exist; chat-side unverifiable.
     StaleRegistry,
@@ -76,9 +76,8 @@ pub struct ClassifiedTopic {
     pub topic_id: i32,
     pub instance_name: String,
     pub class: TopicClass,
-    /// `Some(fleet_id)` when fleet.yaml has a topic_id for the
-    /// instance (regardless of whether it matches). `None` when
-    /// fleet.yaml has no entry OR no topic_id field.
+    /// `Some(fleet_id)` from topics.json lookup for the instance.
+    /// `None` when not in topics.json.
     pub fleet_topic_id: Option<i32>,
 }
 

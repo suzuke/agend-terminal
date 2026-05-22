@@ -843,7 +843,7 @@ fn pane_from_menu_item(
             // `add_instance_to_yaml` directly, bypassing the topic-creation
             // side effect that `handle_spawn` does. Now routes through
             // `tui_spawn::add_instance_with_topic` so the channel topic is
-            // created + topic_id persisted to fleet.yaml at TUI-spawn time.
+            // created + topic_id persisted to topics.json at TUI-spawn time.
             if let Err(e) = tui_spawn::add_instance_with_topic(
                 home,
                 &inst_name,
