@@ -356,6 +356,9 @@ impl Backend {
                     (r"(?m)^[^A-Za-z\n]{0,8}Do you trust", b"\r"),
                     // Auto-update prompt: "Please restart Codex" → Enter
                     (r"(?m)^[^A-Za-z\n]{0,8}Please restart", b"\r"),
+                    // #1069: version-update modal blocks agent until operator
+                    // selects an option. "2\r" = "Skip" (least invasive).
+                    (r"(?m)^[^A-Za-z\n]{0,8}Update available!", b"2\r"),
                 ],
                 // Codex: "resume --last" → fresh start drops the resume subcommand
                 fresh_args: Some(&["--dangerously-bypass-approvals-and-sandbox"]),
@@ -1471,6 +1474,39 @@ mod tests {
             .windows(2)
             .any(|w| w[0] == "--mcp-config" && w[1].ends_with("mcp-config.json")));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn codex_update_prompt_dismiss_uses_skip() {
+        let codex = Backend::Codex.preset();
+        let entry = codex
+            .dismiss_patterns
+            .iter()
+            .find(|(re, _)| re.contains("Update available!"))
+            .expect("#1069: codex must have an `Update available!` dismiss pattern");
+        assert_eq!(
+            entry.1, b"2\r",
+            "#1069: keystroke must be `2\\r` (option 2 = Skip)"
+        );
+    }
+
+    #[test]
+    fn codex_update_dismiss_anchored_rejects_mid_line() {
+        let codex = Backend::Codex.preset();
+        let (pattern, _) = codex
+            .dismiss_patterns
+            .iter()
+            .find(|(re, _)| re.contains("Update available!"))
+            .expect("#1069: codex update dismiss pattern must exist");
+        let re = regex::Regex::new(pattern).expect("pattern must compile");
+        assert!(
+            re.is_match("✨ Update available! 0.132.0 -> 0.133.0"),
+            "line-start match must succeed"
+        );
+        assert!(
+            !re.is_match("User asked: is there an Update available! for the tool?"),
+            "mid-line mention must NOT match (Issue #468 anchoring)"
+        );
     }
 
     #[test]
