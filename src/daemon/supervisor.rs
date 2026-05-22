@@ -823,6 +823,20 @@ pub(crate) fn process_server_rate_limit_retries(
             // exhausted flag so a restart doesn't re-arm a track
             // that gave up.
             crate::daemon::dedup_state::save(home, name, retry);
+            // #1073: notify operator that auto-retry is exhausted.
+            if let Some(ch) = crate::channel::active_channel() {
+                let msg = format!(
+                    "⚠️ {name} API rate limit auto-retry exhausted ({} retries). Manual intervention required.",
+                    SERVER_RATE_LIMIT_MAX_RETRIES
+                );
+                let _ = crate::channel::gated_notify(
+                    ch.as_ref(),
+                    name,
+                    NotifySeverity::Warn,
+                    &msg,
+                    false,
+                );
+            }
             continue;
         }
 

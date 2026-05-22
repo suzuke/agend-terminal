@@ -171,7 +171,7 @@ impl StatePatterns {
                 // [docs] Claude Code SDK error handling
                 (
                     AgentState::AuthError,
-                    r"API key|authentication failed|unauthorized",
+                    r"API key|authentication failed|unauthorized|API Error: 40[13]\b",
                 ),
                 // [docs] SDK retry logic for 429/overloaded
                 // Sprint 31+ #4: word-boundary `429` to avoid false-positive
@@ -4560,6 +4560,77 @@ mod tests {
         assert_eq!(
             tracker.last_productive_output, after_first,
             "#685 PR-2: identical recent tail across feeds must NOT double-refresh"
+        );
+    }
+
+    // ── #1073 API Error detection tests ──────────────────────────
+
+    #[test]
+    fn claude_api_error_529_triggers_server_rate_limit() {
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+        t.feed(
+            "API Error: 529 Overloaded. This is a server-side issue, \
+             usually temporary — try again in a moment.",
+        );
+        assert_eq!(
+            t.get_state(),
+            AgentState::ServerRateLimit,
+            "529 Overloaded must trigger ServerRateLimit"
+        );
+    }
+
+    #[test]
+    fn claude_api_error_500_triggers_server_rate_limit() {
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+        t.feed("API Error: 500 Internal Server Error");
+        assert_eq!(
+            t.get_state(),
+            AgentState::ServerRateLimit,
+            "500 must trigger ServerRateLimit"
+        );
+    }
+
+    #[test]
+    fn claude_api_error_503_triggers_server_rate_limit() {
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+        t.feed("API Error: 503 Service Unavailable");
+        assert_eq!(
+            t.get_state(),
+            AgentState::ServerRateLimit,
+            "503 must trigger ServerRateLimit"
+        );
+    }
+
+    #[test]
+    fn claude_api_error_403_triggers_auth_error() {
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+        t.feed("API Error: 403 Forbidden");
+        assert_eq!(
+            t.get_state(),
+            AgentState::AuthError,
+            "#1073: 403 must trigger AuthError"
+        );
+    }
+
+    #[test]
+    fn claude_api_error_401_triggers_auth_error() {
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+        t.feed("API Error: 401 Unauthorized");
+        assert_eq!(
+            t.get_state(),
+            AgentState::AuthError,
+            "#1073: 401 must trigger AuthError"
+        );
+    }
+
+    #[test]
+    fn claude_api_error_401_does_not_false_positive_on_prose() {
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+        t.feed("The server returned a 4013 error code in the response body.");
+        assert_ne!(
+            t.get_state(),
+            AgentState::AuthError,
+            "word-boundary must prevent false positive on 4013"
         );
     }
 }
