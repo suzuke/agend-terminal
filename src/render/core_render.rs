@@ -8,7 +8,7 @@ use crate::state::AgentState;
 use ratatui::layout::{Alignment, Constraint, Direction, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Clear, Paragraph};
 use ratatui::Frame;
 
 /// Sprint 20.5 Track 7 transient state badge (per dev-reviewer
@@ -169,6 +169,11 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, layout: &Layout, registry: &Age
         Style::default().fg(Color::Gray)
     };
     spans.push(Span::styled(" [+] ", new_tab_style));
+    // #1071: Clear pre-render blanks any cells that retained chars from
+    // a prior longer tab strip (e.g. tab close shrinks the bar). ratatui's
+    // Paragraph only writes cells covered by span text + applies the area
+    // style; cells outside spans keep their prior char.
+    frame.render_widget(Clear, area);
     let tabs = Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::DarkGray));
     frame.render_widget(tabs, area);
 }
@@ -185,6 +190,10 @@ fn render_pane_tree(
     let tab = match layout.tabs.get_mut(layout.active) {
         Some(t) => t,
         None => {
+            // #1071: Clear pre-render — the fallback Paragraph is reached
+            // after the last tab closes; without Clear the prior frame's
+            // pane-tree cells (border chars + VTerm content) leak through.
+            frame.render_widget(Clear, area);
             let msg = Paragraph::new("No agents. Press Ctrl+B c to create a new tab.")
                 .style(Style::default().fg(Color::DarkGray));
             frame.render_widget(msg, area);
@@ -511,6 +520,12 @@ pub(super) fn render_status_bar(
         TelegramStatus::NotConfigured => {}
     }
 
+    // #1071: Clear pre-render (single Clear before BOTH bars). The two
+    // Paragraphs render to the same area but only cover cells where their
+    // own span text falls; cells in the middle gap between them — and any
+    // trailing cells beyond shorter content compared to a prior frame —
+    // would otherwise retain prior chars.
+    frame.render_widget(Clear, area);
     let left_bar = Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::DarkGray));
     frame.render_widget(left_bar, area);
 
@@ -824,9 +839,8 @@ mod tests {
         let scope_start = prod_src[..no_agents_pos]
             .rfind("None => {")
             .expect("fallback must be inside the None branch");
-        let scope_end = no_agents_pos
-            + "No agents. Press Ctrl+B c to create a new tab.".len()
-            + 200; // enough room past the Paragraph render to catch the call sequence
+        let scope_end =
+            no_agents_pos + "No agents. Press Ctrl+B c to create a new tab.".len() + 200; // enough room past the Paragraph render to catch the call sequence
         let body = &prod_src[scope_start..scope_end.min(prod_src.len())];
         assert!(
             body.contains("Clear"),
@@ -891,26 +905,24 @@ mod tests {
         );
     }
 
-    /// T4 (#1071 reference): #1064/#1066 VTerm pre-fill carries —
-    /// VTerm body rendering remains clean. No new test here; locked by
-    /// `src/vterm.rs::tests::area_taller_than_grid_clears_trailing_rows`
-    /// + sibling tests added in PR #1066. Chrome layer (this PR) and
-    /// VTerm body layer (PR #1066) cover disjoint regions: tab bar = top
-    /// 1 row; status bar = bottom 1 row; VTerm body = middle Min(1).
+    // T4 (#1071 reference): VTerm body residual is locked by PR #1066
+    // (#1064 fix) via `src/vterm.rs::tests::area_taller_than_grid_*` + siblings.
+    // Chrome layer (this PR) and VTerm body layer cover disjoint regions:
+    // tab bar at top row, status bar at bottom row, VTerm body in the middle
+    // Min(1) region. No new test added here.
 
-    /// T5 (#1071, separate concern per reviewer): AGEND_RENDER_DEBUG
-    /// diagnostic env flag is preserved as standalone debug-gate (NOT
-    /// part of the main fix). Documents the protocol — operator can run
-    /// the daemon with `AGEND_RENDER_DEBUG=1` to call `terminal.clear()`
-    /// before each draw, distinguishing chrome-buffer-level residual
-    /// (would disappear) from alacritty-grid-level residual (would
-    /// persist — points at H8 backend partial-redraw class).
+    // T5 (#1071 separate concern per reviewer): AGEND_RENDER_DEBUG diagnostic
+    // env flag is preserved as standalone debug-gate, NOT part of the main fix.
+    // Operator can run the daemon with `AGEND_RENDER_DEBUG=1` to call
+    // `terminal.clear()` before each draw, distinguishing chrome-buffer-level
+    // residual (would disappear under the diagnostic) from alacritty-grid-level
+    // residual (would persist; points at H8 backend partial-redraw class).
     #[test]
     #[ignore = "diagnostic env-gated; runs manually with AGEND_RENDER_DEBUG=1"]
     fn render_debug_env_diagnostic_documented() {
         // Placeholder: the diagnostic gate is implementation-tracked as a
         // separate concern. This test documents the protocol for future
-        // wiring; runs only with `cargo test -- --ignored` against a
-        // daemon spun up with the env set.
+        // wiring; runs only with `cargo test -- --ignored` against a daemon
+        // spun up with the env set.
     }
 }
