@@ -8,7 +8,7 @@ use crate::state::AgentState;
 use ratatui::layout::{Alignment, Constraint, Direction, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Clear, Paragraph};
 use ratatui::Frame;
 
 /// Sprint 20.5 Track 7 transient state badge (per dev-reviewer
@@ -169,6 +169,11 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, layout: &Layout, registry: &Age
         Style::default().fg(Color::Gray)
     };
     spans.push(Span::styled(" [+] ", new_tab_style));
+    // #1071: Clear pre-render blanks any cells that retained chars from
+    // a prior longer tab strip (e.g. tab close shrinks the bar). ratatui's
+    // Paragraph only writes cells covered by span text + applies the area
+    // style; cells outside spans keep their prior char.
+    frame.render_widget(Clear, area);
     let tabs = Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::DarkGray));
     frame.render_widget(tabs, area);
 }
@@ -185,6 +190,10 @@ fn render_pane_tree(
     let tab = match layout.tabs.get_mut(layout.active) {
         Some(t) => t,
         None => {
+            // #1071: Clear pre-render — the fallback Paragraph is reached
+            // after the last tab closes; without Clear the prior frame's
+            // pane-tree cells (border chars + VTerm content) leak through.
+            frame.render_widget(Clear, area);
             let msg = Paragraph::new("No agents. Press Ctrl+B c to create a new tab.")
                 .style(Style::default().fg(Color::DarkGray));
             frame.render_widget(msg, area);
@@ -511,6 +520,12 @@ pub(super) fn render_status_bar(
         TelegramStatus::NotConfigured => {}
     }
 
+    // #1071: Clear pre-render (single Clear before BOTH bars). The two
+    // Paragraphs render to the same area but only cover cells where their
+    // own span text falls; cells in the middle gap between them — and any
+    // trailing cells beyond shorter content compared to a prior frame —
+    // would otherwise retain prior chars.
+    frame.render_widget(Clear, area);
     let left_bar = Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::DarkGray));
     frame.render_widget(left_bar, area);
 
@@ -763,5 +778,151 @@ mod tests {
             "second chunk width must be ≥1, got {}",
             d.width
         );
+    }
+
+    // ── #1071 chrome Clear-widget pre-render tests ──
+    //
+    // Reviewer RC0 caught that `Block::default().style(...)` does NOT clear
+    // cells (verified in ratatui-0.29 source: Block::render_ref calls
+    // `buf.set_style` which is style-only). RC1 uses `Clear` widget which
+    // calls `cell.reset()` per cell — properly blanking before Paragraph
+    // overlay. Tests pin the production wiring at 3 chrome sites:
+    //   1. render_tab_bar
+    //   2. render_status_bar (single Clear before both left + right bars)
+    //   3. "No agents" fallback Paragraph
+    //
+    // T1/T1c/T2 are STRUCTURAL pins (include_str + grep) — they FAIL on
+    // pre-#1071 source and PASS post-fix. T3 is a behavioral sanity test
+    // documenting the Clear-then-Paragraph contract (passes both ways).
+    // T4 references #1064/#1066 VTerm pre-fill (already shipped). T5
+    // documents the AGEND_RENDER_DEBUG diagnostic separately per reviewer.
+
+    /// T1 (#1071 RED): render_tab_bar source must `render_widget(Clear, …)`
+    /// before the Paragraph render. Pre-fix code only has the bare
+    /// Paragraph render at this site.
+    #[test]
+    fn render_tab_bar_uses_clear_widget_pre_render() {
+        let source = include_str!("core_render.rs");
+        let prod_end = source
+            .find("#[cfg(test)]")
+            .expect("core_render.rs must have a #[cfg(test)] tests module");
+        let prod_src = &source[..prod_end];
+        let tab_bar_start = prod_src
+            .find("fn render_tab_bar")
+            .expect("fn render_tab_bar must exist");
+        let tab_bar_end = prod_src[tab_bar_start..]
+            .find("\nfn ")
+            .map(|i| tab_bar_start + i)
+            .unwrap_or(prod_src.len());
+        let body = &prod_src[tab_bar_start..tab_bar_end];
+        assert!(
+            body.contains("Clear"),
+            "#1071 invariant: render_tab_bar must render Clear widget before Paragraph"
+        );
+    }
+
+    /// T1c (#1071 RED, dev-2 nit): "No agents" fallback Paragraph must be
+    /// preceded by Clear render. Pre-fix code has only the fallback
+    /// Paragraph render with no Clear.
+    #[test]
+    fn no_agents_fallback_uses_clear_widget_pre_render() {
+        let source = include_str!("core_render.rs");
+        let prod_end = source
+            .find("#[cfg(test)]")
+            .expect("core_render.rs must have a #[cfg(test)] tests module");
+        let prod_src = &source[..prod_end];
+        // The fallback Paragraph contains a distinctive literal.
+        let no_agents_pos = prod_src
+            .find("No agents. Press Ctrl+B c to create a new tab.")
+            .expect("\"No agents.\" fallback must exist");
+        // Search backwards for the preceding fn boundary to scope the body.
+        let scope_start = prod_src[..no_agents_pos]
+            .rfind("None => {")
+            .expect("fallback must be inside the None branch");
+        let scope_end =
+            no_agents_pos + "No agents. Press Ctrl+B c to create a new tab.".len() + 200; // enough room past the Paragraph render to catch the call sequence
+        let body = &prod_src[scope_start..scope_end.min(prod_src.len())];
+        assert!(
+            body.contains("Clear"),
+            "#1071 invariant: \"No agents\" fallback must render Clear widget before fallback Paragraph"
+        );
+    }
+
+    /// T2 (#1071 RED): render_status_bar source must `render_widget(Clear,
+    /// …)` before any Paragraph render. Pre-fix code has only the
+    /// left+right bar Paragraphs with no Clear.
+    #[test]
+    fn render_status_bar_uses_clear_widget_pre_render() {
+        let source = include_str!("core_render.rs");
+        let prod_end = source
+            .find("#[cfg(test)]")
+            .expect("core_render.rs must have a #[cfg(test)] tests module");
+        let prod_src = &source[..prod_end];
+        let status_start = prod_src
+            .find("fn render_status_bar")
+            .expect("fn render_status_bar must exist");
+        let status_end = prod_src[status_start..]
+            .find("\nfn ")
+            .map(|i| status_start + i)
+            .unwrap_or(prod_src.len());
+        let body = &prod_src[status_start..status_end];
+        assert!(
+            body.contains("Clear"),
+            "#1071 invariant: render_status_bar must render Clear widget before Paragraph(s)"
+        );
+        // Also pin: Clear must appear BEFORE the first Paragraph render.
+        let clear_pos = body.find("Clear").unwrap_or(body.len());
+        let first_para = body
+            .find("Paragraph::new")
+            .expect("status bar must construct a Paragraph");
+        assert!(
+            clear_pos < first_para,
+            "#1071 invariant: Clear must precede Paragraph render in status_bar; \
+             got Clear at {clear_pos}, first Paragraph at {first_para}"
+        );
+    }
+
+    /// T3 (#1071 sanity): Clear widget followed by Paragraph blanks
+    /// pre-poisoned cells outside the Paragraph's span content. Documents
+    /// the contract; passes both pre-fix and post-fix.
+    #[test]
+    fn clear_then_paragraph_blanks_residual_outside_spans() {
+        use ratatui::widgets::{Clear, Widget};
+        let area = Rect::new(0, 0, 30, 1);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        for x in 0..30 {
+            buf[(x, 0)].set_char('X');
+        }
+        Widget::render(Clear, area, &mut buf);
+        let para = Paragraph::new(Line::from(vec![Span::raw("short")]))
+            .style(Style::default().bg(Color::DarkGray));
+        Widget::render(para, area, &mut buf);
+        let tail: String = (5..30).map(|x| buf[(x, 0)].symbol()).collect();
+        let expected: String = " ".repeat(25);
+        assert_eq!(
+            tail, expected,
+            "Clear+Paragraph must blank trailing cells, got: {tail:?}"
+        );
+    }
+
+    // T4 (#1071 reference): VTerm body residual is locked by PR #1066
+    // (#1064 fix) via `src/vterm.rs::tests::area_taller_than_grid_*` + siblings.
+    // Chrome layer (this PR) and VTerm body layer cover disjoint regions:
+    // tab bar at top row, status bar at bottom row, VTerm body in the middle
+    // Min(1) region. No new test added here.
+
+    // T5 (#1071 separate concern per reviewer): AGEND_RENDER_DEBUG diagnostic
+    // env flag is preserved as standalone debug-gate, NOT part of the main fix.
+    // Operator can run the daemon with `AGEND_RENDER_DEBUG=1` to call
+    // `terminal.clear()` before each draw, distinguishing chrome-buffer-level
+    // residual (would disappear under the diagnostic) from alacritty-grid-level
+    // residual (would persist; points at H8 backend partial-redraw class).
+    #[test]
+    #[ignore = "diagnostic env-gated; runs manually with AGEND_RENDER_DEBUG=1"]
+    fn render_debug_env_diagnostic_documented() {
+        // Placeholder: the diagnostic gate is implementation-tracked as a
+        // separate concern. This test documents the protocol for future
+        // wiring; runs only with `cargo test -- --ignored` against a daemon
+        // spun up with the env set.
     }
 }
