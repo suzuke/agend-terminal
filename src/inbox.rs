@@ -275,6 +275,35 @@ pub struct BroadcastContext {
 impl InboxMessage {
     /// Latest schema version this binary can read and write.
     pub const CURRENT_VERSION: u32 = 1;
+
+    pub fn new_system(
+        from: impl Into<String>,
+        kind: impl Into<String>,
+        text: impl Into<String>,
+    ) -> Self {
+        Self {
+            from: from.into(),
+            text: text.into(),
+            kind: Some(kind.into()),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            ..Default::default()
+        }
+    }
+
+    pub fn with_correlation_id(mut self, id: impl Into<String>) -> Self {
+        self.correlation_id = Some(id.into());
+        self
+    }
+
+    pub fn with_reviewed_head(mut self, sha: impl Into<String>) -> Self {
+        self.reviewed_head = Some(sha.into());
+        self
+    }
+
+    pub fn with_delivery_mode(mut self, mode: impl Into<String>) -> Self {
+        self.delivery_mode = Some(mode.into());
+        self
+    }
 }
 
 /// Status of a specific inbox message.
@@ -943,32 +972,12 @@ pub fn deliver(
     broadcast_context: Option<BroadcastContext>,
 ) {
     let msg = InboxMessage {
-        schema_version: 0,
-        id: None,
-        read_at: None,
-        thread_id: None,
-        parent_id: None,
-        task_id: None,
-        force_meta: None,
-        correlation_id: None,
-        reviewed_head: None,
         from: source.to_string(),
         text: text.to_string(),
         kind,
         timestamp: chrono::Utc::now().to_rfc3339(),
-        channel: None,
-        delivery_mode: None,
-        attachments: vec![],
-        in_reply_to_msg_id: None,
-        in_reply_to_excerpt: None,
-        superseded_by: None,
-        from_id: None,
         broadcast_context,
-        sequencing: None,
-        eta_minutes: None,
-        reporting_cadence: None,
-        worktree_binding_required: None,
-        pr_number: None,
+        ..Default::default()
     };
     let _ = enqueue(home, agent_name, msg);
     notify_agent(home, agent_name, source, text);
@@ -1454,32 +1463,10 @@ mod tests {
 
     fn make_msg(from: &str, text: &str) -> InboxMessage {
         InboxMessage {
-            schema_version: 0,
-            id: None,
-            read_at: None,
-            thread_id: None,
-            parent_id: None,
-            task_id: None,
-            force_meta: None,
-            correlation_id: None,
-            reviewed_head: None,
             from: from.to_string(),
             text: text.to_string(),
-            kind: None,
             timestamp: "2025-01-01T00:00:00Z".to_string(),
-            channel: None,
-            delivery_mode: None,
-            attachments: vec![],
-            in_reply_to_msg_id: None,
-            in_reply_to_excerpt: None,
-            superseded_by: None,
-            from_id: None,
-            broadcast_context: None,
-            sequencing: None,
-            eta_minutes: None,
-            reporting_cadence: None,
-            worktree_binding_required: None,
-            pr_number: None,
+            ..Default::default()
         }
     }
 

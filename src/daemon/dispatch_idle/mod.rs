@@ -517,43 +517,20 @@ fn emit_exceeded_event(home: &Path, d: &PendingDispatch, elapsed_secs: i64) {
         threshold_secs = d.threshold_secs,
         overshoot = overshoot,
     );
-    let msg = crate::inbox::InboxMessage {
-        schema_version: 0,
-        id: None,
-        from: "system:dispatch_idle".to_string(),
+    // #947: fall back to dispatch_id when upstream correlation_id is
+    // None so the nudge is always traceable to its source sidecar.
+    let corr = d
+        .correlation_id
+        .clone()
+        .unwrap_or_else(|| d.dispatch_id.clone());
+    let mut msg = crate::inbox::InboxMessage::new_system(
+        "system:dispatch_idle",
+        "dispatch_idle_threshold_exceeded",
         text,
-        kind: Some("dispatch_idle_threshold_exceeded".to_string()),
-        timestamp: chrono::Utc::now().to_rfc3339(),
-        channel: None,
-        read_at: None,
-        thread_id: None,
-        parent_id: None,
-        delivery_mode: Some("inbox_fallback".to_string()),
-        task_id: d.correlation_id.clone(),
-        force_meta: None,
-        // #947: fall back to dispatch_id when upstream correlation_id is
-        // None so the nudge is always traceable to its source sidecar.
-        // The `disp-{ts}-{seq}` prefix is self-documenting — operators
-        // can tell at grep time whether the value is an upstream chain
-        // or a producer record.
-        correlation_id: Some(
-            d.correlation_id
-                .clone()
-                .unwrap_or_else(|| d.dispatch_id.clone()),
-        ),
-        reviewed_head: None,
-        attachments: Vec::new(),
-        in_reply_to_msg_id: None,
-        in_reply_to_excerpt: None,
-        superseded_by: None,
-        from_id: None,
-        broadcast_context: None,
-        sequencing: None,
-        eta_minutes: None,
-        reporting_cadence: None,
-        worktree_binding_required: None,
-        pr_number: None,
-    };
+    )
+    .with_delivery_mode("inbox_fallback")
+    .with_correlation_id(corr);
+    msg.task_id = d.correlation_id.clone();
     if let Err(e) = crate::inbox::enqueue_with_idle_hint(home, &d.dispatcher, msg) {
         tracing::warn!(
             error = %e,

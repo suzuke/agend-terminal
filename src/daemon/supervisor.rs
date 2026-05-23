@@ -453,34 +453,11 @@ pub(crate) fn maybe_notify_member_state_change(
             "consecutive_count": track.consecutive,
         }
     });
-    let msg = crate::inbox::InboxMessage {
-        schema_version: 0,
-        id: None,
-        read_at: None,
-        thread_id: None,
-        parent_id: None,
-        task_id: None,
-        force_meta: None,
-        correlation_id: None,
-        reviewed_head: None,
-        from: "system:supervisor".to_string(),
-        text: payload.to_string(),
-        kind: Some("member_state_change".to_string()),
-        timestamp: chrono::Utc::now().to_rfc3339(),
-        channel: None,
-        delivery_mode: None,
-        attachments: vec![],
-        in_reply_to_msg_id: None,
-        in_reply_to_excerpt: None,
-        superseded_by: None,
-        from_id: None,
-        broadcast_context: None,
-        sequencing: None,
-        eta_minutes: None,
-        reporting_cadence: None,
-        worktree_binding_required: None,
-        pr_number: None,
-    };
+    let msg = crate::inbox::InboxMessage::new_system(
+        "system:supervisor",
+        "member_state_change",
+        payload.to_string(),
+    );
     let _ = crate::inbox::enqueue(home, orch, msg);
     crate::inbox::notify_agent(
         home,

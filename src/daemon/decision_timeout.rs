@@ -262,34 +262,10 @@ fn emit_timeout_event(home: &Path, d: &PendingDecision, elapsed_secs: i64) {
         default_action = d.default_action,
     );
     let recipient = timeout_recipient();
-    let msg = crate::inbox::InboxMessage {
-        schema_version: 0,
-        id: None,
-        from: "system:decision_timeout".to_string(),
-        text,
-        kind: Some("decision_timeout".to_string()),
-        timestamp: chrono::Utc::now().to_rfc3339(),
-        channel: None,
-        read_at: None,
-        thread_id: None,
-        parent_id: None,
-        delivery_mode: Some("inbox_fallback".to_string()),
-        task_id: None,
-        force_meta: None,
-        correlation_id: Some(d.decision_id.clone()),
-        reviewed_head: None,
-        attachments: Vec::new(),
-        in_reply_to_msg_id: None,
-        in_reply_to_excerpt: None,
-        superseded_by: None,
-        from_id: None,
-        broadcast_context: None,
-        sequencing: None,
-        eta_minutes: None,
-        reporting_cadence: None,
-        worktree_binding_required: None,
-        pr_number: None,
-    };
+    let msg =
+        crate::inbox::InboxMessage::new_system("system:decision_timeout", "decision_timeout", text)
+            .with_delivery_mode("inbox_fallback")
+            .with_correlation_id(d.decision_id.clone());
     if let Err(e) = crate::inbox::enqueue_with_idle_hint(home, &recipient, msg) {
         tracing::warn!(error = %e, recipient, "decision_timeout: enqueue failed");
     }

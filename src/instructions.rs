@@ -1092,26 +1092,7 @@ mod tests {
             text: "hello".into(),
             kind: Some("task".into()),
             timestamp: "2026-01-01T00:00:00Z".into(),
-            channel: None,
-            delivery_mode: None,
-            force_meta: None,
-            correlation_id: None,
-            reviewed_head: None,
-            read_at: None,
-            thread_id: None,
-            parent_id: None,
-            task_id: None,
-            attachments: vec![],
-            in_reply_to_msg_id: None,
-            in_reply_to_excerpt: None,
-            superseded_by: None,
-            broadcast_context: None,
-            sequencing: None,
-            eta_minutes: None,
-            reporting_cadence: None,
-            worktree_binding_required: None,
-            pr_number: None,
-            from_id: None,
+            ..Default::default()
         };
         let header = crate::inbox::format_header(&sample_msg);
 

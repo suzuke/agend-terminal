@@ -176,34 +176,14 @@ fn emit_stall(home: &Path, task: &Task, reason: &str) {
         assignee = task.assignee.as_deref().unwrap_or("?"),
     );
     for recipient in stall_recipients() {
-        let msg = crate::inbox::InboxMessage {
-            schema_version: 0,
-            id: None,
-            from: "system:anti_stall".to_string(),
-            text: text.clone(),
-            kind: Some("task_stalled".to_string()),
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            channel: None,
-            read_at: None,
-            thread_id: None,
-            parent_id: None,
-            delivery_mode: Some("inbox_fallback".to_string()),
-            task_id: Some(task.id.clone()),
-            force_meta: None,
-            correlation_id: Some(task.id.clone()),
-            reviewed_head: None,
-            attachments: Vec::new(),
-            in_reply_to_msg_id: None,
-            in_reply_to_excerpt: None,
-            superseded_by: None,
-            from_id: None,
-            broadcast_context: None,
-            sequencing: None,
-            eta_minutes: None,
-            reporting_cadence: None,
-            worktree_binding_required: None,
-            pr_number: None,
-        };
+        let mut msg = crate::inbox::InboxMessage::new_system(
+            "system:anti_stall",
+            "task_stalled",
+            text.clone(),
+        )
+        .with_delivery_mode("inbox_fallback")
+        .with_correlation_id(task.id.clone());
+        msg.task_id = Some(task.id.clone());
         if let Err(e) = crate::inbox::enqueue_with_idle_hint(home, &recipient, msg) {
             tracing::warn!(
                 error = %e,
