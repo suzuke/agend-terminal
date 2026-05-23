@@ -52,6 +52,12 @@ pub struct WatchState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_terminal_seen_at: Option<String>,
 
+    // Mergeable state (#813 periodic recheck)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_mergeable_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_mergeable_check_at: Option<String>,
+
     // Rate-limit backoff
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit_until: Option<u64>,

@@ -794,11 +794,12 @@ async fn ci_check_repo(
     const MERGEABLE_RECHECK_INTERVAL_SECS: i64 = 300;
     let (should_recheck, prev_mergeable) = match std::fs::read_to_string(watch_path)
         .ok()
-        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+        .and_then(|c| serde_json::from_str::<WatchState>(&c).ok())
     {
         Some(w) => {
-            let last = w["last_mergeable_check_at"]
-                .as_str()
+            let last = w
+                .last_mergeable_check_at
+                .as_deref()
                 .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                 .map(|d| d.with_timezone(&chrono::Utc));
             let now = chrono::Utc::now();
@@ -807,24 +808,17 @@ async fn ci_check_repo(
                     now.signed_duration_since(d).num_seconds() >= MERGEABLE_RECHECK_INTERVAL_SECS
                 })
                 .unwrap_or(true);
-            (
-                elapsed_ok,
-                w["last_mergeable_state"].as_str().map(String::from),
-            )
+            (elapsed_ok, w.last_mergeable_state)
         }
         None => (true, None),
     };
     if should_recheck {
         let new_state = provider.check_pr_mergeable(repo, branch).await;
         let now_rfc3339 = chrono::Utc::now().to_rfc3339();
-        // last_mergeable_state / last_mergeable_check_at are not in WatchState
-        // (transient diagnostic fields, not part of the core schema). Keep
-        // using Value for this RMW to avoid bloating the struct with
-        // rarely-queried fields.
         if let Ok(content) = std::fs::read_to_string(watch_path) {
-            if let Ok(mut w) = serde_json::from_str::<serde_json::Value>(&content) {
-                w["last_mergeable_state"] = serde_json::json!(new_state.as_str());
-                w["last_mergeable_check_at"] = serde_json::json!(now_rfc3339);
+            if let Ok(mut w) = serde_json::from_str::<WatchState>(&content) {
+                w.last_mergeable_state = Some(new_state.as_str().to_string());
+                w.last_mergeable_check_at = Some(now_rfc3339);
                 if let Ok(out) = serde_json::to_string_pretty(&w) {
                     let _ = std::fs::write(watch_path, out);
                 }
