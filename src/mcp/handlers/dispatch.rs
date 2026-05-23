@@ -369,6 +369,129 @@ static HEALTH_ACTIONS: &[(&str, HandlerFn)] = &[
     ("clear", dispatch_health_clear),
 ];
 
+// `watchdog` — actions: snooze / resume / status (#1084).
+
+fn dispatch_watchdog(ctx: &HandlerCtx<'_>) -> Value {
+    match ctx.args["action"].as_str().unwrap_or("") {
+        "snooze" => dispatch_watchdog_snooze(ctx),
+        "resume" => dispatch_watchdog_resume(ctx),
+        "status" => dispatch_watchdog_status(ctx),
+        other => json!({"error": format!("unknown watchdog action: {other}")}),
+    }
+}
+
+fn dispatch_watchdog_snooze(ctx: &HandlerCtx<'_>) -> Value {
+    use crate::daemon::idle_watchdog;
+
+    const MAX_SNOOZE_SECS: i64 = 4 * 3600; // 4h clamp
+
+    let duration_str = ctx.args["duration"].as_str().unwrap_or("1h");
+    let secs = match parse_duration_secs(duration_str) {
+        Some(s) => s.min(MAX_SNOOZE_SECS),
+        None => return json!({"error": format!("invalid duration: {duration_str}")}),
+    };
+    let until = chrono::Utc::now() + chrono::Duration::seconds(secs);
+    let actor = ctx.instance_name;
+    match idle_watchdog::snooze_fleet_idle(ctx.home, until, actor) {
+        Ok(snooze) => {
+            crate::event_log::log(
+                ctx.home,
+                "watchdog_snooze",
+                actor,
+                &format!(
+                    "fleet idle snoozed until {} ({duration_str})",
+                    snooze.snoozed_until
+                ),
+            );
+            json!({
+                "snoozed": true,
+                "snoozed_until": snooze.snoozed_until,
+                "duration_secs": secs,
+            })
+        }
+        Err(e) => json!({"error": format!("snooze failed: {e}")}),
+    }
+}
+
+fn dispatch_watchdog_resume(ctx: &HandlerCtx<'_>) -> Value {
+    use crate::daemon::idle_watchdog;
+    idle_watchdog::resume_fleet_idle(ctx.home);
+    crate::event_log::log(
+        ctx.home,
+        "watchdog_resume",
+        ctx.instance_name,
+        "fleet idle snooze cleared",
+    );
+    json!({"snoozed": false})
+}
+
+fn dispatch_watchdog_status(ctx: &HandlerCtx<'_>) -> Value {
+    use crate::daemon::idle_watchdog;
+    if idle_watchdog::is_fleet_idle_snoozed(ctx.home) {
+        let content =
+            std::fs::read_to_string(ctx.home.join("fleet-idle-snooze.json")).unwrap_or_default();
+        let snooze: idle_watchdog::FleetIdleSnooze =
+            serde_json::from_str(&content).unwrap_or_default();
+        let remaining = chrono::DateTime::parse_from_rfc3339(&snooze.snoozed_until)
+            .ok()
+            .map(|dt| {
+                let r = dt
+                    .with_timezone(&chrono::Utc)
+                    .signed_duration_since(chrono::Utc::now())
+                    .num_seconds();
+                r.max(0)
+            })
+            .unwrap_or(0);
+        json!({
+            "snoozed": true,
+            "snoozed_until": snooze.snoozed_until,
+            "remaining_secs": remaining,
+            "actor": snooze.actor,
+        })
+    } else {
+        json!({"snoozed": false})
+    }
+}
+
+/// Parse human-friendly duration strings like "2h", "30m", "1h30m".
+fn parse_duration_secs(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let mut total: i64 = 0;
+    let mut num_buf = String::new();
+    for ch in s.chars() {
+        if ch.is_ascii_digit() {
+            num_buf.push(ch);
+        } else {
+            let n: i64 = num_buf.parse().ok()?;
+            num_buf.clear();
+            match ch {
+                'h' => total += n * 3600,
+                'm' => total += n * 60,
+                's' => total += n,
+                _ => return None,
+            }
+        }
+    }
+    if !num_buf.is_empty() {
+        let n: i64 = num_buf.parse().ok()?;
+        total += n * 60; // bare number = minutes
+    }
+    if total > 0 {
+        Some(total)
+    } else {
+        None
+    }
+}
+
+static WATCHDOG_ACTIONS: &[(&str, HandlerFn)] = &[
+    ("snooze", dispatch_watchdog_snooze),
+    ("resume", dispatch_watchdog_resume),
+    ("status", dispatch_watchdog_status),
+];
+
 // `repo` — actions: checkout / release.
 
 fn dispatch_repo(ctx: &HandlerCtx<'_>) -> Value {
@@ -673,6 +796,12 @@ static REGISTERED: &[HandlerEntry] = &[
         handler: dispatch_health,
         actions: Some(HEALTH_ACTIONS),
     },
+    // #1084: watchdog snooze/resume/status
+    HandlerEntry {
+        name: "watchdog",
+        handler: dispatch_watchdog,
+        actions: Some(WATCHDOG_ACTIONS),
+    },
     HandlerEntry {
         name: "repo",
         handler: dispatch_repo,
@@ -800,6 +929,7 @@ mod tests {
                 "decision",
                 "deployment",
                 "health",
+                "watchdog",
                 "repo",
                 "schedule",
                 "team",
@@ -812,7 +942,7 @@ mod tests {
                 "restart_daemon",
             ]
         );
-        assert_eq!(registered_handlers().len(), 30);
+        assert_eq!(registered_handlers().len(), 31);
     }
 
     /// Coverage test: every tool name advertised by
@@ -884,6 +1014,7 @@ mod tests {
             ),
             ("schedule", &["create", "list", "update", "delete"]),
             ("team", &["create", "delete", "list", "update"]),
+            ("watchdog", &["snooze", "resume", "status"]),
         ];
         for (tool, actions) in cases {
             for action in actions.iter() {
@@ -959,5 +1090,65 @@ mod tests {
         let args = json!({}); // no "action" key
         let ctx = ctx_for(&home, &args, "");
         assert!(try_dispatch("task", &ctx).is_some());
+    }
+
+    // ── #1084 watchdog snooze MCP tests ──────────────────────────
+
+    fn watchdog_home(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("agend-watchdog-mcp-{}-{}", tag, std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    }
+
+    #[test]
+    fn watchdog_snooze_then_status_round_trip() {
+        let home = watchdog_home("snooze-status");
+        let args = json!({"action": "snooze", "duration": "1h"});
+        let ctx = ctx_for(&home, &args, "test-agent");
+        let result = try_dispatch("watchdog", &ctx).unwrap();
+        assert_eq!(result["snoozed"], true);
+        assert!(result["snoozed_until"].is_string());
+        assert_eq!(result["duration_secs"], 3600);
+
+        let status_args = json!({"action": "status"});
+        let status_ctx = ctx_for(&home, &status_args, "test-agent");
+        let status = try_dispatch("watchdog", &status_ctx).unwrap();
+        assert_eq!(status["snoozed"], true);
+        assert!(status["remaining_secs"].as_i64().unwrap() > 0);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn watchdog_snooze_duration_clamped_to_4h() {
+        let home = watchdog_home("snooze-clamp");
+        let args = json!({"action": "snooze", "duration": "24h"});
+        let ctx = ctx_for(&home, &args, "test-agent");
+        let result = try_dispatch("watchdog", &ctx).unwrap();
+        assert_eq!(
+            result["duration_secs"],
+            4 * 3600,
+            "#1084: 24h must clamp to 4h"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn watchdog_resume_clears_snooze() {
+        let home = watchdog_home("resume");
+        let snooze_args = json!({"action": "snooze", "duration": "2h"});
+        let ctx = ctx_for(&home, &snooze_args, "test-agent");
+        try_dispatch("watchdog", &ctx);
+
+        let resume_args = json!({"action": "resume"});
+        let resume_ctx = ctx_for(&home, &resume_args, "test-agent");
+        let result = try_dispatch("watchdog", &resume_ctx).unwrap();
+        assert_eq!(result["snoozed"], false);
+
+        let status_args = json!({"action": "status"});
+        let status_ctx = ctx_for(&home, &status_args, "test-agent");
+        let status = try_dispatch("watchdog", &status_ctx).unwrap();
+        assert_eq!(status["snoozed"], false);
+        std::fs::remove_dir_all(&home).ok();
     }
 }

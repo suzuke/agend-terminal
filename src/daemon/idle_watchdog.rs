@@ -297,6 +297,57 @@ fn scan_dev_vantage(
     last_alerted.insert(key, *now);
 }
 
+/// #1084: snooze sidecar path.
+fn snooze_path(home: &Path) -> PathBuf {
+    home.join("fleet-idle-snooze.json")
+}
+
+/// #1084: on-disk shape for the fleet-idle snooze sidecar.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub(crate) struct FleetIdleSnooze {
+    #[serde(default)]
+    pub snoozed_until: String,
+    #[serde(default)]
+    pub actor: String,
+}
+
+/// #1084: check whether fleet-idle watchdog is currently snoozed.
+pub(crate) fn is_fleet_idle_snoozed(home: &Path) -> bool {
+    let content = match std::fs::read_to_string(snooze_path(home)) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let snooze: FleetIdleSnooze = match serde_json::from_str(&content) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let until = match chrono::DateTime::parse_from_rfc3339(&snooze.snoozed_until) {
+        Ok(dt) => dt.with_timezone(&chrono::Utc),
+        Err(_) => return false,
+    };
+    chrono::Utc::now() < until
+}
+
+/// #1084: snooze fleet-idle watchdog until the given timestamp.
+pub(crate) fn snooze_fleet_idle(
+    home: &Path,
+    until: chrono::DateTime<chrono::Utc>,
+    actor: &str,
+) -> anyhow::Result<FleetIdleSnooze> {
+    let snooze = FleetIdleSnooze {
+        snoozed_until: until.to_rfc3339(),
+        actor: actor.to_string(),
+    };
+    let body = serde_json::to_string_pretty(&snooze)?;
+    crate::store::atomic_write(&snooze_path(home), body.as_bytes())?;
+    Ok(snooze)
+}
+
+/// #1084: resume fleet-idle watchdog (delete snooze sidecar).
+pub(crate) fn resume_fleet_idle(home: &Path) {
+    let _ = std::fs::remove_file(snooze_path(home));
+}
+
 /// Vantage #12 — fleet-wide idle threshold check. Triggers when
 /// EVERY tracked agent has been silent > FLEET threshold AND at
 /// least one agent is tracked (avoid false-positive on empty fleet).
@@ -305,6 +356,10 @@ fn scan_fleet_vantage(
     now: &chrono::DateTime<chrono::Utc>,
     last_alerted: &mut HashMap<(&'static str, String), chrono::DateTime<chrono::Utc>>,
 ) {
+    // #1084: skip entire fleet vantage when snoozed.
+    if is_fleet_idle_snoozed(home) {
+        return;
+    }
     let raw_pairs = enumerate_agent_activity(home);
     if raw_pairs.is_empty() {
         return;
@@ -803,6 +858,87 @@ mod tests {
             fleet_msg.text.contains("lead"),
             "live agent 'lead' must appear in alert"
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #1084 snooze tests ──────────────────────────────────────────
+
+    #[test]
+    fn snooze_suppresses_fleet_idle_alert() {
+        let _g = env_lock();
+        std::env::remove_var("AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT");
+        let home = tmp_home("snooze-suppress");
+        let stale = chrono::Utc::now() - chrono::Duration::seconds(FLEET_IDLE_THRESHOLD_SECS + 60);
+        write_activity_at(&home, "dev", stale);
+        write_activity_at(&home, "lead", stale);
+        // Snooze for 1 hour from now
+        let until = chrono::Utc::now() + chrono::Duration::hours(1);
+        snooze_fleet_idle(&home, until, "test").unwrap();
+        let mut last_alerted = HashMap::new();
+        scan_and_emit(&home, &mut last_alerted);
+        let general = crate::inbox::drain(&home, "general");
+        assert!(
+            !general
+                .iter()
+                .any(|m| m.kind.as_deref() == Some("fleet_idle_watchdog")),
+            "#1084: snoozed fleet must NOT emit alert: {general:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn expired_snooze_resumes_fleet_alert() {
+        let _g = env_lock();
+        std::env::remove_var("AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT");
+        let home = tmp_home("snooze-expired");
+        let stale = chrono::Utc::now() - chrono::Duration::seconds(FLEET_IDLE_THRESHOLD_SECS + 60);
+        write_activity_at(&home, "dev", stale);
+        write_activity_at(&home, "lead", stale);
+        // Snooze with PAST timestamp (already expired)
+        let past = chrono::Utc::now() - chrono::Duration::seconds(10);
+        snooze_fleet_idle(&home, past, "test").unwrap();
+        let mut last_alerted = HashMap::new();
+        scan_and_emit(&home, &mut last_alerted);
+        let general = crate::inbox::drain(&home, "general");
+        assert!(
+            general
+                .iter()
+                .any(|m| m.kind.as_deref() == Some("fleet_idle_watchdog")),
+            "#1084: expired snooze must resume alerting: {general:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn snooze_does_not_suppress_dev_idle_alert() {
+        let _g = env_lock();
+        std::env::remove_var("AGEND_IDLE_WATCHDOG_AGENT");
+        std::env::remove_var("AGEND_IDLE_WATCHDOG_DEV_RECIPIENT");
+        let home = tmp_home("snooze-dev-unaffected");
+        let stale = chrono::Utc::now() - chrono::Duration::seconds(DEV_IDLE_THRESHOLD_SECS + 60);
+        write_activity_at(&home, "dev", stale);
+        // Snooze fleet
+        let until = chrono::Utc::now() + chrono::Duration::hours(1);
+        snooze_fleet_idle(&home, until, "test").unwrap();
+        let mut last_alerted = HashMap::new();
+        scan_and_emit(&home, &mut last_alerted);
+        let lead = crate::inbox::drain(&home, "lead");
+        assert!(
+            lead.iter()
+                .any(|m| m.kind.as_deref() == Some("dev_idle_watchdog")),
+            "#1084: fleet snooze must NOT affect dev vantage: {lead:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn resume_clears_snooze() {
+        let home = tmp_home("snooze-resume");
+        let until = chrono::Utc::now() + chrono::Duration::hours(1);
+        snooze_fleet_idle(&home, until, "test").unwrap();
+        assert!(is_fleet_idle_snoozed(&home));
+        resume_fleet_idle(&home);
+        assert!(!is_fleet_idle_snoozed(&home));
         std::fs::remove_dir_all(&home).ok();
     }
 

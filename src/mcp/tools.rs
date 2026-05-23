@@ -15,6 +15,7 @@ pub fn tool_definitions() -> Value {
     tools.extend(deploy_tools());
     tools.extend(ci_tools());
     tools.extend(health_tools());
+    tools.extend(watchdog_tools());
     tools.extend(worktree_tools());
     json!({"tools": tools})
 }
@@ -230,6 +231,16 @@ fn ci_tools() -> Vec<Value> {
                 "interval_secs": {"type": "number", "description": "Poll interval in seconds (default: 60)"},
                 "next_after_ci": {"type": "string", "description": "Instance to auto-notify when CI passes. Daemon sends [ci-ready-for-action] to this target."},
                 "review_class": {"type": "string", "enum": ["single", "dual"], "description": "#972: review threshold for the daemon's PR-state aggregator. `single` (default) — §3.6 one VERIFIED unlocks the merge gate. `dual` — §3.5 two distinct VERIFIED required before `[pr-ready-for-merge]` fires."}
+            }, "required": ["action"]}}),
+    ]
+}
+
+fn watchdog_tools() -> Vec<Value> {
+    vec![
+        json!({"name": "watchdog", "description": "#1084: Fleet idle watchdog snooze control. Actions: snooze, resume, status.",
+            "inputSchema": {"type": "object", "properties": {
+                "action": {"type": "string", "enum": ["snooze", "resume", "status"]},
+                "duration": {"type": "string", "description": "Snooze duration (e.g. '2h', '30m', '1h30m'). Clamped to max 4h. Default: 1h."}
             }, "required": ["action"]}}),
     ]
 }
@@ -470,8 +481,8 @@ mod tests {
         let tools = defs["tools"].as_array().expect("tools array");
         assert_eq!(
             tools.len(),
-            30,
-            "Sprint 61: 29 + restart_daemon(exit-42) = 30. \
+            31,
+            "#1084: 30 + watchdog(snooze/resume/status) = 31. \
              Current tools: {:?}",
             tools
                 .iter()
