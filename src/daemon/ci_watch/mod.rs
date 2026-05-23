@@ -15,6 +15,7 @@ mod poller;
 mod provider;
 mod registry;
 mod sweep;
+pub(crate) mod watch_state;
 mod watcher;
 
 /// Watch TTL in hours. Used for both absolute expiry and inactivity threshold.
@@ -42,3 +43,5 @@ pub use sweep::{gc_stale_watches, startup_sweep};
 pub use watcher::check_ci_watches;
 
 pub(crate) use registry::parse_subscribers;
+#[allow(unused_imports)]
+pub(crate) use watch_state::WatchState;

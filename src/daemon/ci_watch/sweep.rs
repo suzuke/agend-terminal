@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use super::registry::{ci_watches_dir, parse_subscribers, remove_watch};
+use super::registry::{ci_watches_dir, remove_watch};
 use super::WATCH_TTL_HOURS;
 
 /// Sprint 54 P0-5 (sub-scope B): consecutive rate-limited skips before a
@@ -27,25 +27,23 @@ pub(super) fn bump_consecutive_skips_and_maybe_notify(
     reset_epoch: u64,
     display_timezone: Option<&str>,
 ) {
-    let mut watch: serde_json::Value = match std::fs::read_to_string(watch_path)
+    let mut watch: super::watch_state::WatchState = match std::fs::read_to_string(watch_path)
         .ok()
         .and_then(|c| serde_json::from_str(&c).ok())
     {
         Some(v) => v,
         None => return,
     };
-    let prev_skips = watch["consecutive_skips"].as_u64().unwrap_or(0);
+    let prev_skips = watch.consecutive_skips.unwrap_or(0);
     let next_skips = prev_skips.saturating_add(1);
-    watch["consecutive_skips"] = serde_json::json!(next_skips);
+    watch.consecutive_skips = Some(next_skips);
 
-    let already_notified = watch["stalled_notified"].as_bool().unwrap_or(false);
+    let already_notified = watch.stalled_notified.unwrap_or(false);
     let should_notify = next_skips >= STALL_THRESHOLD && !already_notified;
     if should_notify {
-        watch["stalled_notified"] = serde_json::json!(true);
-        // Stamp `stalled_since_ms` only on the first stall write — gives
-        // operators a stable anchor in the inbox payload.
-        if watch["stalled_since_ms"].as_i64().is_none() {
-            watch["stalled_since_ms"] = serde_json::json!(chrono::Utc::now().timestamp_millis());
+        watch.stalled_notified = Some(true);
+        if watch.stalled_since_ms.is_none() {
+            watch.stalled_since_ms = Some(chrono::Utc::now().timestamp_millis());
         }
     }
     let _ = crate::store::atomic_write(
@@ -56,7 +54,7 @@ pub(super) fn bump_consecutive_skips_and_maybe_notify(
     );
 
     if should_notify {
-        let stalled_since_ms = watch["stalled_since_ms"].as_i64();
+        let stalled_since_ms = watch.stalled_since_ms;
         // next_poll_eta = reset_epoch_ms (skip lifts at reset, then
         // adaptive backoff applies — but reset is the user-visible
         // "stalled until" moment).
@@ -84,21 +82,21 @@ pub(super) fn clear_stall_and_maybe_notify_resumed(
     branch: &str,
     subscribers: &[String],
 ) {
-    let mut watch: serde_json::Value = match std::fs::read_to_string(watch_path)
+    let mut watch: super::watch_state::WatchState = match std::fs::read_to_string(watch_path)
         .ok()
         .and_then(|c| serde_json::from_str(&c).ok())
     {
         Some(v) => v,
         None => return,
     };
-    let was_stalled = watch["stalled_notified"].as_bool().unwrap_or(false);
-    let had_skips = watch["consecutive_skips"].as_u64().unwrap_or(0) > 0;
+    let was_stalled = watch.stalled_notified.unwrap_or(false);
+    let had_skips = watch.consecutive_skips.unwrap_or(0) > 0;
     if !was_stalled && !had_skips {
-        return; // common case — no stall in flight, nothing to write.
+        return;
     }
-    watch["consecutive_skips"] = serde_json::json!(0);
-    watch["stalled_notified"] = serde_json::json!(false);
-    watch["stalled_since_ms"] = serde_json::Value::Null;
+    watch.consecutive_skips = Some(0);
+    watch.stalled_notified = Some(false);
+    watch.stalled_since_ms = None;
     let _ = crate::store::atomic_write(
         watch_path,
         serde_json::to_string_pretty(&watch)
@@ -230,12 +228,16 @@ pub fn gc_stale_watches(home: &Path, sweep_origin: &str) -> usize {
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let Ok(watch) = serde_json::from_str::<serde_json::Value>(&content) else {
+        let Ok(watch) = serde_json::from_str::<super::watch_state::WatchState>(&content) else {
             continue;
         };
-        let repo = watch["repo"].as_str().unwrap_or("?");
-        let branch = watch["branch"].as_str().unwrap_or("?");
-        let audit_label = parse_subscribers(&watch).join(",");
+        let repo = if watch.repo.is_empty() {
+            "?"
+        } else {
+            &watch.repo
+        };
+        let branch = &watch.branch;
+        let audit_label = watch.subscriber_names().join(",");
 
         // (3) E4.5 protected-ref migration — applied first because a
         // protected-ref watch is invalid regardless of TTL state.
@@ -255,7 +257,7 @@ pub fn gc_stale_watches(home: &Path, sweep_origin: &str) -> usize {
         }
 
         // (1) absolute TTL.
-        if let Some(expires_at) = watch["expires_at"].as_str() {
+        if let Some(expires_at) = watch.expires_at.as_deref() {
             if let Ok(exp) = chrono::DateTime::parse_from_rfc3339(expires_at) {
                 if now_utc > exp.with_timezone(&chrono::Utc) {
                     remove_watch(
@@ -275,7 +277,7 @@ pub fn gc_stale_watches(home: &Path, sweep_origin: &str) -> usize {
         }
 
         // (2) inactivity TTL.
-        if let Some(last_seen) = watch["last_terminal_seen_at"].as_str() {
+        if let Some(last_seen) = watch.last_terminal_seen_at.as_deref() {
             if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(last_seen) {
                 let elapsed = now_utc.signed_duration_since(ts.with_timezone(&chrono::Utc));
                 if elapsed > chrono::Duration::hours(WATCH_TTL_HOURS) {
@@ -319,9 +321,13 @@ pub fn startup_sweep(home: &Path) {
                     return None;
                 }
                 let content = std::fs::read_to_string(&path).ok()?;
-                let watch: serde_json::Value = serde_json::from_str(&content).ok()?;
-                let repo = watch["repo"].as_str()?;
-                let branch = watch["branch"].as_str().unwrap_or("main");
+                let watch: super::watch_state::WatchState = serde_json::from_str(&content).ok()?;
+                let repo = if watch.repo.is_empty() {
+                    return None;
+                } else {
+                    &watch.repo
+                };
+                let branch = &watch.branch;
                 Some(format!("{repo}@{branch}"))
             })
             .collect();

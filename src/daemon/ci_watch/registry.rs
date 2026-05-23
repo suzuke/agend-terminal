@@ -120,21 +120,21 @@ pub(super) fn update_watch_state_with_notify(
         }
     };
     if let Ok(content) = std::fs::read_to_string(watch_path) {
-        if let Ok(mut watch) = serde_json::from_str::<serde_json::Value>(&content) {
-            watch["last_run_id"] = serde_json::json!(run_id);
+        if let Ok(mut watch) = serde_json::from_str::<super::watch_state::WatchState>(&content) {
+            watch.last_run_id = run_id;
             if !head_sha.is_empty() {
-                watch["head_sha"] = serde_json::json!(head_sha);
+                watch.head_sha = Some(head_sha.to_string());
             }
             if let Some(sha) = notified_sha {
-                watch["last_notified_head_sha"] = serde_json::json!(sha);
+                watch.last_notified_head_sha = Some(sha.to_string());
             }
             if let Some(c) = notified_conclusion {
-                watch["last_notified_conclusion"] = serde_json::json!(c);
+                watch.last_notified_conclusion = Some(c.to_string());
             }
             if let Some(s) = stale_emitted_sha {
-                watch["last_stale_emitted_sha"] = serde_json::json!(s);
+                watch.last_stale_emitted_sha = Some(s.to_string());
             }
-            watch["last_terminal_seen_at"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
+            watch.last_terminal_seen_at = Some(chrono::Utc::now().to_rfc3339());
             // M1: atomic write to prevent partial-file on crash
             let _ = crate::store::atomic_write(
                 watch_path,

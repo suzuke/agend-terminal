@@ -4,10 +4,10 @@ use std::sync::Arc;
 
 use super::provider::{CiPollResult, CiProvider, CiRun, MergeableState, PrState};
 use super::registry::{
-    ci_watches_dir, parse_subscribers, remove_watch, update_watch_state,
-    update_watch_state_with_notify,
+    ci_watches_dir, remove_watch, update_watch_state, update_watch_state_with_notify,
 };
 use super::sweep::{bump_consecutive_skips_and_maybe_notify, clear_stall_and_maybe_notify_resumed};
+use super::watch_state::WatchState;
 use super::WATCH_TTL_HOURS;
 
 // Test-only re-exports so the existing test module (moved verbatim from
@@ -20,7 +20,7 @@ use super::provider::{
     GitLabCiProvider,
 };
 #[cfg(test)]
-use super::registry::watch_filename;
+use super::registry::{parse_subscribers, watch_filename};
 #[cfg(test)]
 use super::sweep::{gc_stale_watches, startup_sweep, STALL_THRESHOLD};
 #[cfg(test)]
@@ -192,61 +192,45 @@ pub fn watch_start_check_mergeable(
 pub(super) fn check_ci_watches_with_provider(
     home: &Path,
     registry: &AgentRegistry,
-    make_provider: impl Fn(&serde_json::Value) -> Option<Box<dyn CiProvider>> + Send + Sync + 'static,
+    make_provider: impl Fn(&WatchState) -> Option<Box<dyn CiProvider>> + Send + Sync + 'static,
 ) {
     let entries = match std::fs::read_dir(ci_watches_dir(home)) {
         Ok(e) => e,
         Err(_) => return,
     };
-    // #790: one fleet.yaml read per tick to extract the operator's
-    // configured display tz for notification body rendering. Failures
-    // (missing/unreadable fleet.yaml) silently fall through to `None`
-    // → chrono::Local — same behaviour as pre-#790.
     let display_timezone: Option<String> =
         crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
             .ok()
             .and_then(|c| c.display_timezone);
     for entry in entries.flatten() {
         let path = entry.path();
-        let watch: serde_json::Value = match std::fs::read_to_string(&path)
+        let watch: WatchState = match std::fs::read_to_string(&path)
             .ok()
             .and_then(|c| serde_json::from_str(&c).ok())
         {
             Some(v) => v,
             None => continue,
         };
-        let repo = match watch["repo"].as_str() {
-            Some(r) => r.to_string(),
-            None => continue,
-        };
-        // Sprint 54 P0-1: subscribers list (with legacy single-instance fallback)
-        // replaces the single `instance` field. Empty list ⇒ skip — a watch with
-        // no recipients is useless and would only burn rate-limit.
-        let subscribers = parse_subscribers(&watch);
+        if watch.repo.is_empty() {
+            continue;
+        }
+        let subscribers = watch.subscriber_names();
         if subscribers.is_empty() {
             continue;
         }
-        let branch = watch["branch"].as_str().unwrap_or("main").to_string();
-        let interval = watch["interval_secs"].as_u64().unwrap_or(60);
-        let last_run_id = watch["last_run_id"].as_u64();
-        let head_sha = watch["head_sha"].as_str().map(String::from);
-        let last_notified_sha = watch["last_notified_head_sha"].as_str().map(String::from);
-        // #786: load conclusion of the prior notification to feed the
-        // rerun-aware dedup. Absent on pre-#786 watches → None → first
-        // poll post-upgrade fires once on any terminal run (bounded
-        // migration spam, documented in PR body).
-        let last_notified_conclusion = watch["last_notified_conclusion"].as_str().map(String::from);
-        // #1026: debounce field — once ci-stale has been emitted for a
-        // SHA, suppress re-emission on subsequent conclusion changes.
-        let last_stale_emitted_sha = watch["last_stale_emitted_sha"].as_str().map(String::from);
+        let repo = watch.repo.clone();
+        let branch = watch.branch.clone();
+        let interval = watch.interval_secs;
+        let last_run_id = watch.last_run_id;
+        let head_sha = watch.head_sha.clone();
+        let last_notified_sha = watch.last_notified_head_sha.clone();
+        let last_notified_conclusion = watch.last_notified_conclusion.clone();
+        let last_stale_emitted_sha = watch.last_stale_emitted_sha.clone();
 
-        // Audit label for remove_watch: comma-joined subscribers so the
-        // event log stays human-readable when multiple agents share a watch.
         let audit_label = subscribers.join(",");
 
-        // TTL check: remove expired watches before polling.
         let now_utc = chrono::Utc::now();
-        if let Some(expires_at) = watch["expires_at"].as_str() {
+        if let Some(expires_at) = watch.expires_at.as_deref() {
             if let Ok(exp) = chrono::DateTime::parse_from_rfc3339(expires_at) {
                 if now_utc > exp.with_timezone(&chrono::Utc) {
                     remove_watch(home, &path, &audit_label, &repo, &branch, "expired");
@@ -255,8 +239,7 @@ pub(super) fn check_ci_watches_with_provider(
                 }
             }
         }
-        // Inactivity TTL: WATCH_TTL_HOURS since last terminal run seen
-        if let Some(last_seen) = watch["last_terminal_seen_at"].as_str() {
+        if let Some(last_seen) = watch.last_terminal_seen_at.as_deref() {
             if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(last_seen) {
                 let elapsed = now_utc.signed_duration_since(ts.with_timezone(&chrono::Utc));
                 if elapsed > chrono::Duration::hours(WATCH_TTL_HOURS) {
@@ -267,14 +250,8 @@ pub(super) fn check_ci_watches_with_provider(
             }
         }
 
-        // Rate-limit backoff: skip polling until X-RateLimit-Reset time.
-        if let Some(reset_epoch) = watch["rate_limit_until"].as_u64() {
+        if let Some(reset_epoch) = watch.rate_limit_until {
             if (chrono::Utc::now().timestamp() as u64) < reset_epoch {
-                // Sprint 54 P0-5 (sub-scope B): increment consecutive_skips
-                // on each rate-limited tick so subscribers see a
-                // `[ci-watch-stalled]` event after STALL_THRESHOLD
-                // consecutive misses. Persist atomically with `stalled_notified`
-                // so the dispatch is exactly-once per stall window.
                 bump_consecutive_skips_and_maybe_notify(
                     home,
                     &path,
@@ -288,38 +265,17 @@ pub(super) fn check_ci_watches_with_provider(
             }
         }
 
-        // Sprint 54 P0-2: compute adaptive backoff from the most recent
-        // quota counters persisted on the watch file. The poll path
-        // refreshes these on every successful response. First poll has
-        // `None` → `adaptive_interval` falls through to `interval`, so
-        // a fresh watch behaves identically to pre-r0.
-        let prev_remaining = watch["rate_limit_remaining"].as_u64();
-        let prev_limit = watch["rate_limit_limit"].as_u64();
+        let prev_remaining = watch.rate_limit_remaining;
+        let prev_limit = watch.rate_limit_limit;
         let effective_interval = adaptive_interval(interval, prev_remaining, prev_limit);
 
-        // Throttle from a dedicated `last_polled_at` (epoch millis) in the
-        // watch file itself, not file mtime. mtime conflates "when this
-        // file was touched" with "when we last polled" and broke whenever
-        // another writer (migration, hand-edit, freshly created watch)
-        // stamped the file — the handler used to backdate mtime manually
-        // to work around that. Schema-local state removes both the
-        // first-poll-lag quirk and the external-writer fragility.
         let now_ms = chrono::Utc::now().timestamp_millis();
-        if !watch_is_due(watch["last_polled_at"].as_i64(), effective_interval, now_ms) {
+        if !watch_is_due(watch.last_polled_at, effective_interval, now_ms) {
             continue;
         }
-        // Stamp `last_polled_at` BEFORE spawning the GH request so a slow
-        // GH response doesn't let the next tick re-enter for the same
-        // watch. The spawned thread updates last_run_id / head_sha on a
-        // terminal conclusion; non-terminal polls leave those fields
-        // alone but the `last_polled_at` stamp already keeps them in
-        // throttle.
         let mut watch_with_stamp = watch.clone();
-        watch_with_stamp["last_polled_at"] = serde_json::json!(now_ms);
-        // P0-2 diagnostic: stamp the effective interval so operators
-        // can read the current backoff zone from the watch file.
-        watch_with_stamp["effective_interval_secs"] = serde_json::json!(effective_interval);
-        // M1: atomic write
+        watch_with_stamp.last_polled_at = Some(now_ms);
+        watch_with_stamp.effective_interval_secs = Some(effective_interval);
         let _ = crate::store::atomic_write(
             &path,
             serde_json::to_string_pretty(&watch_with_stamp)
@@ -337,10 +293,7 @@ pub(super) fn check_ci_watches_with_provider(
                 continue;
             }
         };
-        // H2: use shared runtime instead of per-poll thread + runtime.
-        // fire-and-forget: ci_check is one-shot per poll cycle. The shared
-        // runtime bounds concurrency to 2 worker threads. No JoinHandle
-        // needed — the tick loop re-spawns next cycle if still watching.
+        // fire-and-forget: ci_check is one-shot per poll cycle
         let subscribers_owned = subscribers.clone();
         shared_ci_runtime().spawn(async move {
             if let Err(e) = ci_check_repo(
@@ -517,6 +470,7 @@ pub(crate) fn dedupe_notifications_by_head_sha<'a>(
 /// other value (including absent / null / unknown) → `ReviewClass::Single`.
 /// Source of the field: `mcp_watch_ci` MCP handler accepts a
 /// `review_class` argument and persists it into the watch file.
+#[cfg(test)]
 pub(crate) fn parse_review_class(
     watch: &serde_json::Value,
 ) -> crate::daemon::pr_state::ReviewClass {
@@ -863,7 +817,10 @@ async fn ci_check_repo(
     if should_recheck {
         let new_state = provider.check_pr_mergeable(repo, branch).await;
         let now_rfc3339 = chrono::Utc::now().to_rfc3339();
-        // Persist the new state regardless of variant.
+        // last_mergeable_state / last_mergeable_check_at are not in WatchState
+        // (transient diagnostic fields, not part of the core schema). Keep
+        // using Value for this RMW to avoid bloating the struct with
+        // rarely-queried fields.
         if let Ok(content) = std::fs::read_to_string(watch_path) {
             if let Ok(mut w) = serde_json::from_str::<serde_json::Value>(&content) {
                 w["last_mergeable_state"] = serde_json::json!(new_state.as_str());
@@ -891,9 +848,8 @@ async fn ci_check_repo(
         } => {
             if let Some(reset_epoch) = rate_limit_reset {
                 if let Ok(content) = std::fs::read_to_string(watch_path) {
-                    if let Ok(mut watch) = serde_json::from_str::<serde_json::Value>(&content) {
-                        watch["rate_limit_until"] = serde_json::json!(reset_epoch);
-                        // M1: atomic write
+                    if let Ok(mut watch) = serde_json::from_str::<WatchState>(&content) {
+                        watch.rate_limit_until = Some(reset_epoch);
                         let _ = crate::store::atomic_write(
                             watch_path,
                             serde_json::to_string_pretty(&watch)
@@ -942,12 +898,12 @@ async fn ci_check_repo(
             // early return below.
             if rate_limit_remaining.is_some() || rate_limit_limit.is_some() {
                 if let Ok(content) = std::fs::read_to_string(watch_path) {
-                    if let Ok(mut watch) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if let Ok(mut watch) = serde_json::from_str::<WatchState>(&content) {
                         if let Some(r) = rate_limit_remaining {
-                            watch["rate_limit_remaining"] = serde_json::json!(r);
+                            watch.rate_limit_remaining = Some(r);
                         }
                         if let Some(l) = rate_limit_limit {
-                            watch["rate_limit_limit"] = serde_json::json!(l);
+                            watch.rate_limit_limit = Some(l);
                         }
                         let _ = crate::store::atomic_write(
                             watch_path,
@@ -1113,13 +1069,8 @@ async fn ci_check_repo(
             let action_target_on_success: Option<String> = if conclusion == Some("success") {
                 std::fs::read_to_string(watch_path)
                     .ok()
-                    .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
-                    .and_then(|w| {
-                        w["next_after_ci"]
-                            .as_str()
-                            .filter(|s| !s.is_empty())
-                            .map(String::from)
-                    })
+                    .and_then(|c| serde_json::from_str::<WatchState>(&c).ok())
+                    .and_then(|w| w.next_after_ci.filter(|s| !s.is_empty()))
             } else {
                 None
             };
@@ -1252,32 +1203,14 @@ async fn ci_check_repo(
     // correct semantic for an actionable handoff.
     if new_notified_sha.is_some() {
         if let Ok(content) = std::fs::read_to_string(watch_path) {
-            if let Ok(watch) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(next) = watch["next_after_ci"].as_str().filter(|s| !s.is_empty()) {
-                    // Only route on success (not failure)
+            if let Ok(watch) = serde_json::from_str::<WatchState>(&content) {
+                if let Some(next) = watch.next_after_ci.as_deref().filter(|s| !s.is_empty()) {
                     let last_conclusion = aggregate_conclusion_for_sha(&runs, current_sha);
                     if last_conclusion == Some("success") {
                         let repo_branch_key = format!("{repo}@{branch}");
-                        // #1031 GREEN: enrich the chain-target payload so
-                        // the reviewer who wakes can post §3.12 verdict
-                        // mirror without `gh pr list --head` or
-                        // `git rev-parse` lookups.
-                        // - head_sha: current_sha is the full 40-char from
-                        //   the GitHub API (provider.rs:348). The 7-char
-                        //   prefix in the text body stays for human
-                        //   readability; the structured field carries
-                        //   the full SHA.
-                        // - pr_number: read from pr_state aggregator
-                        //   cache (#972). None until the first poll
-                        //   populates the cache via record_ci_result
-                        //   (which fires below on this same tick).
-                        // - task_id: read from the watch sidecar's
-                        //   `task_id` field — persisted by the dispatch
-                        //   path (post-#1031 wiring; pre-persist watches
-                        //   gracefully read None).
                         let pr_number =
                             crate::daemon::pr_state::load(home, repo, branch).map(|s| s.pr_number);
-                        let task_id = watch["task_id"].as_str();
+                        let task_id = watch.task_id.as_deref();
                         let msg = make_ci_ready_for_action_msg(
                             repo,
                             branch,
@@ -1290,11 +1223,6 @@ async fn ci_check_repo(
                     }
                 }
 
-                // #972: ALSO record the conclusion into pr_state aggregator.
-                // The legacy next_after_ci chain stays (dev→reviewer
-                // semantic); pr_state owns reviewer→author once VERIFIED
-                // also lands. Fire on every observed conclusion so
-                // pr_state's state machine sees Failed → NotReady too.
                 let last_conclusion = aggregate_conclusion_for_sha(&runs, current_sha);
                 let conclusion = match last_conclusion {
                     Some("success") => crate::daemon::pr_state::CiConclusion::Green,
@@ -1303,13 +1231,16 @@ async fn ci_check_repo(
                     }
                     None => crate::daemon::pr_state::CiConclusion::Pending,
                 };
-                let subscribers = crate::daemon::ci_watch::parse_subscribers(&watch);
-                // #972 reviewer-rejection fix: propagate the watch
-                // file's `review_class` field into pr_state so the
-                // dual-review (§3.5) threshold is honored at runtime.
-                // Pre-fix: PrState defaulted to Single → one VERIFIED
-                // opened the merge gate even for dual-review PRs.
-                let review_class = parse_review_class(&watch);
+                let subscribers = watch.subscriber_names();
+                let review_class = match watch
+                    .review_class
+                    .as_deref()
+                    .map(|s| s.to_ascii_lowercase())
+                    .as_deref()
+                {
+                    Some("dual") => crate::daemon::pr_state::ReviewClass::Dual,
+                    _ => crate::daemon::pr_state::ReviewClass::Single,
+                };
                 crate::daemon::pr_state::record_ci_result(
                     home,
                     repo,
