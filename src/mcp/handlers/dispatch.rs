@@ -376,6 +376,7 @@ fn dispatch_watchdog(ctx: &HandlerCtx<'_>) -> Value {
         "snooze" => dispatch_watchdog_snooze(ctx),
         "resume" => dispatch_watchdog_resume(ctx),
         "status" => dispatch_watchdog_status(ctx),
+        "ack" => dispatch_watchdog_ack(ctx),
         other => json!({"error": format!("unknown watchdog action: {other}")}),
     }
 }
@@ -449,8 +450,25 @@ fn dispatch_watchdog_status(ctx: &HandlerCtx<'_>) -> Value {
             "actor": snooze.actor,
         })
     } else {
-        json!({"snoozed": false})
+        let ack_info = idle_watchdog::fleet_ack_status().map(|ts| json!({"acked_at": ts}));
+        json!({"snoozed": false, "ack": ack_info})
     }
+}
+
+fn dispatch_watchdog_ack(ctx: &HandlerCtx<'_>) -> Value {
+    use crate::daemon::idle_watchdog;
+    let ts = idle_watchdog::ack_fleet_idle();
+    let actor = ctx.instance_name;
+    crate::event_log::log(
+        ctx.home,
+        "watchdog_ack",
+        actor,
+        "fleet idle acked — suppressed until post-ack activity",
+    );
+    json!({
+        "acked": true,
+        "acked_at": ts,
+    })
 }
 
 /// Parse human-friendly duration strings like "2h", "30m", "1h30m".

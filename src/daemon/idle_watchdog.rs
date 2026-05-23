@@ -38,6 +38,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, Ordering};
 
 const ACTIVITY_DIR: &str = "agent-activity";
 const SCHEMA_VERSION: u32 = 1;
@@ -348,6 +349,36 @@ pub(crate) fn resume_fleet_idle(home: &Path) {
     let _ = std::fs::remove_file(snooze_path(home));
 }
 
+/// #1076: epoch seconds when fleet-idle was last acked. 0 = no ack.
+/// In-memory — daemon restart clears ack (correct semantics: restart
+/// means new fleet lifecycle, stale ack should not carry over).
+static FLEET_ACKED_AT: AtomicI64 = AtomicI64::new(0);
+
+/// #1076: ack fleet-idle watchdog. Suppresses fleet alerts until at
+/// least one tracked agent becomes active after the ack timestamp,
+/// then auto-clears so the next all-idle window triggers normally.
+pub(crate) fn ack_fleet_idle() -> i64 {
+    let ts = chrono::Utc::now().timestamp();
+    FLEET_ACKED_AT.store(ts, Ordering::Relaxed);
+    ts
+}
+
+/// #1076: read current fleet ack state.
+pub(crate) fn fleet_ack_status() -> Option<i64> {
+    let ts = FLEET_ACKED_AT.load(Ordering::Relaxed);
+    if ts > 0 {
+        Some(ts)
+    } else {
+        None
+    }
+}
+
+/// #1076: clear fleet ack (used by tests).
+#[cfg(test)]
+fn clear_fleet_ack() {
+    FLEET_ACKED_AT.store(0, Ordering::Relaxed);
+}
+
 /// Vantage #12 — fleet-wide idle threshold check. Triggers when
 /// EVERY tracked agent has been silent > FLEET threshold AND at
 /// least one agent is tracked (avoid false-positive on empty fleet).
@@ -378,6 +409,18 @@ fn scan_fleet_vantage(
         };
     if pairs.is_empty() {
         return;
+    }
+    // #1076: ack cooldown — if fleet idle was acked, suppress until at
+    // least one tracked agent becomes active after the ack timestamp.
+    let acked_epoch = FLEET_ACKED_AT.load(Ordering::Relaxed);
+    if acked_epoch > 0 {
+        if let Some(acked_dt) = chrono::DateTime::from_timestamp(acked_epoch, 0) {
+            let any_active_since = pairs.iter().any(|(_, ts)| *ts > acked_dt);
+            if !any_active_since {
+                return;
+            }
+            FLEET_ACKED_AT.store(0, Ordering::Relaxed);
+        }
     }
     // All agents must exceed the threshold for "fleet idle".
     let all_idle = pairs
@@ -967,6 +1010,90 @@ mod tests {
                 .any(|m| m.kind.as_deref() == Some("fleet_idle_watchdog")),
             "active live agent + stale ghosts must NOT trigger fleet alert: {general:?}"
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #1076 fleet-idle ack tests ───────────────────────────────
+
+    #[test]
+    fn fleet_scan_suppressed_after_ack() {
+        let _g = env_lock();
+        std::env::remove_var("AGEND_IDLE_WATCHDOG_AGENT");
+        std::env::remove_var("AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT");
+        let home = tmp_home("ack-suppress");
+        let stale = chrono::Utc::now() - chrono::Duration::seconds(FLEET_IDLE_THRESHOLD_SECS + 60);
+        write_activity_at(&home, "dev", stale);
+        write_activity_at(&home, "lead", stale);
+        ack_fleet_idle();
+        let mut last_alerted = HashMap::new();
+        scan_and_emit(&home, &mut last_alerted);
+        let general = crate::inbox::drain(&home, "general");
+        assert!(
+            !general
+                .iter()
+                .any(|m| m.kind.as_deref() == Some("fleet_idle_watchdog")),
+            "acked fleet idle must NOT trigger alert: {general:?}"
+        );
+        clear_fleet_ack();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn fleet_scan_resumes_after_post_ack_activity() {
+        let _g = env_lock();
+        std::env::remove_var("AGEND_IDLE_WATCHDOG_AGENT");
+        std::env::remove_var("AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT");
+        let home = tmp_home("ack-resume");
+        let stale = chrono::Utc::now() - chrono::Duration::seconds(FLEET_IDLE_THRESHOLD_SECS + 60);
+        write_activity_at(&home, "dev", stale);
+        write_activity_at(&home, "lead", stale);
+        // Ack in the past so post-ack activity can be simulated.
+        let past_ack =
+            chrono::Utc::now() - chrono::Duration::seconds(FLEET_IDLE_THRESHOLD_SECS + 120);
+        FLEET_ACKED_AT.store(past_ack.timestamp(), Ordering::Relaxed);
+        // Simulate one agent becoming active AFTER ack, then going idle again.
+        let post_ack_active = past_ack + chrono::Duration::seconds(30);
+        write_activity_at(&home, "dev", post_ack_active);
+        write_activity_at(&home, "lead", stale);
+        let mut last_alerted = HashMap::new();
+        // dev's last_active > acked_at → ack auto-clears.
+        // Both agents' activity timestamps are well past threshold
+        // from real Utc::now(), so the alert should fire.
+        scan_and_emit(&home, &mut last_alerted);
+        let general = crate::inbox::drain(&home, "general");
+        assert!(
+            general
+                .iter()
+                .any(|m| m.kind.as_deref() == Some("fleet_idle_watchdog")),
+            "post-ack activity + re-idle must trigger fleet alert: {general:?}"
+        );
+        assert_eq!(
+            FLEET_ACKED_AT.load(Ordering::Relaxed),
+            0,
+            "ack must auto-clear after post-ack activity detected"
+        );
+        clear_fleet_ack();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn dev_vantage_unaffected_by_fleet_ack() {
+        let _g = env_lock();
+        std::env::remove_var("AGEND_IDLE_WATCHDOG_AGENT");
+        std::env::remove_var("AGEND_IDLE_WATCHDOG_DEV_RECIPIENT");
+        let home = tmp_home("ack-dev-unaffected");
+        let stale = chrono::Utc::now() - chrono::Duration::seconds(DEV_IDLE_THRESHOLD_SECS + 60);
+        write_activity_at(&home, "dev", stale);
+        ack_fleet_idle();
+        let mut last_alerted = HashMap::new();
+        scan_and_emit(&home, &mut last_alerted);
+        let lead = crate::inbox::drain(&home, "lead");
+        assert!(
+            lead.iter()
+                .any(|m| m.kind.as_deref() == Some("dev_idle_watchdog")),
+            "fleet ack must NOT suppress dev vantage: {lead:?}"
+        );
+        clear_fleet_ack();
         std::fs::remove_dir_all(&home).ok();
     }
 }

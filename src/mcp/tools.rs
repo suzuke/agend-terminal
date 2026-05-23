@@ -237,9 +237,9 @@ fn ci_tools() -> Vec<Value> {
 
 fn watchdog_tools() -> Vec<Value> {
     vec![
-        json!({"name": "watchdog", "description": "#1084: Fleet idle watchdog snooze control. Actions: snooze, resume, status.",
+        json!({"name": "watchdog", "description": "#1084/#1076: Fleet idle watchdog control. Actions: snooze, resume, status, ack. `ack` suppresses fleet alerts until post-ack agent activity is detected, then auto-clears.",
             "inputSchema": {"type": "object", "properties": {
-                "action": {"type": "string", "enum": ["snooze", "resume", "status"]},
+                "action": {"type": "string", "enum": ["snooze", "resume", "status", "ack"]},
                 "duration": {"type": "string", "description": "Snooze duration (e.g. '2h', '30m', '1h30m'). Clamped to max 4h. Default: 1h."}
             }, "required": ["action"]}}),
     ]
@@ -482,7 +482,7 @@ mod tests {
         assert_eq!(
             tools.len(),
             31,
-            "#1084: 30 + watchdog(snooze/resume/status) = 31. \
+            "#1084/#1076: 30 + watchdog(snooze/resume/status/ack) = 31. \
              Current tools: {:?}",
             tools
                 .iter()
