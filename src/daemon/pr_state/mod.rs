@@ -685,12 +685,7 @@ pub fn record_verdict(
         );
         return;
     };
-    // Look up task → branch via list_all (no per-id getter in v1).
-    // Pre-filter by task id so we only iterate enough to find the match.
-    let task = crate::tasks::list_all(home)
-        .into_iter()
-        .find(|t| t.id == task_id);
-    let Some(task) = task else {
+    let Some(task) = crate::tasks::load_by_id(home, task_id) else {
         tracing::info!(
             task_id,
             reviewer,
