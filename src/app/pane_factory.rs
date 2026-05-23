@@ -98,6 +98,30 @@ pub(super) fn create_pane(
         crate::instructions::generate(&work_dir, command);
     }
 
+    // #1083: install skills for TUI-spawned panes (app mode).
+    // App mode sets resolve_agents=false so the daemon spawn loop is
+    // empty; pane_factory is the sole spawn path. Mirrors the
+    // install_for_agent call in spawn_and_register_agent (cold-boot)
+    // and spawn_one (SPAWN RPC). Best-effort: failures log + continue.
+    {
+        let skills_filter: Option<Vec<String>> =
+            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+                .ok()
+                .and_then(|c| c.instances.get(&name).and_then(|i| i.skills.clone()));
+        match crate::skills::install_for_agent(home, &work_dir, skills_filter.as_deref()) {
+            Ok(outcomes) => {
+                let modes: Vec<(&str, crate::skills::InstallMode)> = outcomes
+                    .iter()
+                    .map(|o| (o.backend.as_str(), o.mode))
+                    .collect();
+                tracing::info!(agent = %name, ?modes, "pane skills auto-install complete");
+            }
+            Err(e) => {
+                tracing::warn!(agent = %name, error = %e, "pane skills auto-install failed");
+            }
+        }
+    }
+
     // Backend-specific flags (Claude's --append-system-prompt-file / --mcp-config /
     // --settings) are now injected centrally by agent::spawn_agent, so callers pass
     // raw args and spawn_agent enriches them from files under work_dir.
