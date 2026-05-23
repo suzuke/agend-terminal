@@ -9,6 +9,14 @@ use super::provider::{
 use super::sweep::gc_stale_watches;
 use super::watch_state::WatchState;
 
+fn url_or_default(url: String, default: &str) -> String {
+    if url.is_empty() {
+        default.to_string()
+    } else {
+        url
+    }
+}
+
 /// Check CI watch configs and inject failure logs to agents when CI fails.
 pub fn check_ci_watches(home: &Path, registry: &AgentRegistry) {
     let _ = gc_stale_watches(home, "eager_gc");
@@ -37,19 +45,11 @@ pub fn check_ci_watches(home: &Path, registry: &AgentRegistry) {
         let url = ci_url.unwrap_or(default_url);
         match ci_type {
             "gitlab" => {
-                let url = if url.is_empty() {
-                    "https://gitlab.com".to_string()
-                } else {
-                    url
-                };
+                let url = url_or_default(url, "https://gitlab.com");
                 Some(Box::new(GitLabCiProvider::with_base_url(url).ok()?) as Box<dyn CiProvider>)
             }
             "bitbucket_cloud" => {
-                let url = if url.is_empty() {
-                    "https://api.bitbucket.org".to_string()
-                } else {
-                    url
-                };
+                let url = url_or_default(url, "https://api.bitbucket.org");
                 Some(Box::new(BitbucketCiProvider::with_base_url(url).ok()?) as Box<dyn CiProvider>)
             }
             "bitbucket_server" => {
@@ -60,11 +60,7 @@ pub fn check_ci_watches(home: &Path, registry: &AgentRegistry) {
                 None
             }
             _ => {
-                let url = if url.is_empty() {
-                    "https://api.github.com".to_string()
-                } else {
-                    url
-                };
+                let url = url_or_default(url, "https://api.github.com");
                 Some(Box::new(GitHubCiProvider::with_base_url(url).ok()?) as Box<dyn CiProvider>)
             }
         }

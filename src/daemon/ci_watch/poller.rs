@@ -362,52 +362,6 @@ pub(super) fn check_ci_watches_with_provider(
     }
 }
 
-/// Outcome of interpreting a `GET /repos/.../actions/runs` response.
-///
-/// Without this, a non-2xx response (e.g. unauthenticated rate-limit
-/// `{"message":"API rate limit exceeded ..."}`) parses cleanly as JSON
-/// but its `workflow_runs` field is absent, and the caller's
-/// `body["workflow_runs"].as_array()` returns `None` — silently behaving
-/// as if the branch had no runs and skipping every subsequent
-/// notification while `last_polled_at` keeps marching forward. Tag the
-/// HTTP status explicitly so API errors surface as `Err` instead of
-/// imitating a quiescent branch.
-///
-/// Production code now uses [`CiPollResult`] via the [`CiProvider`] trait;
-/// this enum is retained for unit-testing the classification logic that
-/// lives inside [`super::provider::GitHubCiProvider::poll_runs`].
-#[cfg(test)]
-enum RunsResponse<'a> {
-    Run(&'a serde_json::Value),
-    NoRuns,
-    ApiError(String),
-}
-
-/// Pure interpreter for a runs-list response. See [`RunsResponse`] for
-/// why the rate-limit / NoRuns distinction matters.
-///
-/// Retained under `#[cfg(test)]` — production classification now happens
-/// inside [`super::provider::GitHubCiProvider::poll_runs`].
-#[cfg(test)]
-fn classify_runs_response(status: u16, body: &serde_json::Value) -> RunsResponse<'_> {
-    if !(200..300).contains(&status) {
-        let message = body["message"].as_str().unwrap_or("(no message)");
-        let hint = if status == 403
-            && std::env::var("GITHUB_TOKEN").is_err()
-            && message.to_lowercase().contains("rate limit")
-        {
-            " — set GITHUB_TOKEN to raise the unauthenticated 60/hr cap"
-        } else {
-            ""
-        };
-        return RunsResponse::ApiError(format!("GH API {status}: {message}{hint}"));
-    }
-    match body["workflow_runs"].as_array().and_then(|a| a.first()) {
-        Some(run) => RunsResponse::Run(run),
-        None => RunsResponse::NoRuns,
-    }
-}
-
 /// Select runs from a CI poll result that should trigger notifications.
 /// Returns indices into `runs` of terminal runs ordered oldest-first
 /// so notifications arrive chronologically. In-progress runs

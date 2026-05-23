@@ -1,6 +1,31 @@
 use super::*;
 use crate::agent::AgentRegistry;
 
+enum RunsResponse<'a> {
+    Run(&'a serde_json::Value),
+    NoRuns,
+    ApiError(String),
+}
+
+fn classify_runs_response(status: u16, body: &serde_json::Value) -> RunsResponse<'_> {
+    if !(200..300).contains(&status) {
+        let message = body["message"].as_str().unwrap_or("(no message)");
+        let hint = if status == 403
+            && std::env::var("GITHUB_TOKEN").is_err()
+            && message.to_lowercase().contains("rate limit")
+        {
+            " — set GITHUB_TOKEN to raise the unauthenticated 60/hr cap"
+        } else {
+            ""
+        };
+        return RunsResponse::ApiError(format!("GH API {status}: {message}{hint}"));
+    }
+    match body["workflow_runs"].as_array().and_then(|a| a.first()) {
+        Some(run) => RunsResponse::Run(run),
+        None => RunsResponse::NoRuns,
+    }
+}
+
 #[test]
 fn ci_watches_dir_returns_expected_path() {
     let home = std::path::Path::new("/tmp/test");

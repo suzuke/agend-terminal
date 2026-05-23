@@ -193,11 +193,7 @@ impl ReviewClass {
 /// Both production ingestion entry points ([`record_ci_result`] and
 /// [`record_verdict`]) translate their inputs into one of these.
 ///
-/// `DraftTransition` / `MergedObserved` / `ClosedUnmergedObserved` are
-/// reserved for v2 (gh-poll integration). Sourced only from tests
-/// today; #972 v1 production code emits `CiObserved` + `VerdictObserved`.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // v2 variants — see docstring
 pub enum Event<'a> {
     /// CI's poll observed a head transition + conclusion.
     CiObserved {
