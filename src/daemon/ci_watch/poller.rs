@@ -688,6 +688,37 @@ pub(crate) fn make_ci_ready_for_action_msg(
     }
 }
 
+// ── ci_check_repo decomposition (#1093) ──
+
+struct CiCheckCtx<'a> {
+    home: &'a Path,
+    watch_path: &'a Path,
+    repo: &'a str,
+    branch: &'a str,
+    subscribers: &'a [String],
+}
+
+struct RunTracking<'a> {
+    last_run_id: Option<u64>,
+    prev_head_sha: Option<&'a str>,
+    last_notified_sha: Option<&'a str>,
+    last_notified_conclusion: Option<&'a str>,
+    last_stale_emitted_sha: Option<&'a str>,
+}
+
+struct PollResult {
+    runs: Vec<CiRun>,
+    current_sha: String,
+    effective_last_run_id: Option<u64>,
+}
+
+struct NotifyOutcome {
+    max_notified_id: u64,
+    new_notified_sha: Option<String>,
+    new_notified_conclusion: Option<String>,
+    new_stale_emitted_sha: Option<String>,
+}
+
 /// Fetch latest CI run and notify ALL subscribed agents on any
 /// terminal conclusion (success, failure, cancelled, timed_out, etc.).
 /// Also tracks `head_sha` — if the branch HEAD changes (e.g. force push),
@@ -717,82 +748,104 @@ async fn ci_check_repo(
     registry: &AgentRegistry,
     provider: &dyn CiProvider,
 ) -> anyhow::Result<()> {
-    let audit_label = subscribers.join(",");
-    // Check if the PR associated with this branch has reached a terminal state.
-    // Skip auto-clear if the watch was just created (< 60s) — the branch may not
-    // be pushed yet, and a stale PR from a previous use of the same branch name
-    // could trigger a false-positive clear (Hotfix E, PR #451 follow-up).
-    if let PrState::Terminal { merged } = provider.check_pr_terminal(repo, branch).await {
-        // Grace: don't clear watches younger than 60s (branch not yet pushed).
-        if let Ok(content) = std::fs::read_to_string(watch_path) {
-            if let Ok(watch) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(expires_at) = watch["expires_at"].as_str() {
-                    if let Ok(exp) = chrono::DateTime::parse_from_rfc3339(expires_at) {
-                        let watch_age = exp.with_timezone(&chrono::Utc)
-                            - chrono::Duration::hours(WATCH_TTL_HOURS);
-                        let since_creation = chrono::Utc::now().signed_duration_since(watch_age);
-                        if since_creation < chrono::Duration::seconds(60) {
-                            tracing::info!(
-                                repo,
-                                branch,
-                                merged,
-                                "skipping PR-terminal auto-clear — watch too young (<60s)"
-                            );
-                            // Don't clear — let the next poll cycle re-check.
-                            // Fall through to normal poll logic below.
-                        } else {
-                            remove_watch(
-                                home,
-                                watch_path,
-                                &audit_label,
-                                repo,
-                                branch,
-                                "pr_terminal",
-                            );
-                            tracing::info!(
-                                repo,
-                                branch,
-                                merged,
-                                "CI watcher auto-cleared: PR terminal"
-                            );
-                            if merged {
-                                crate::status_summary::auto_close_merged_tasks(home, branch);
-                            }
-                            return Ok(());
-                        }
-                    } else {
-                        remove_watch(home, watch_path, &audit_label, repo, branch, "pr_terminal");
-                        tracing::info!(
-                            repo,
-                            branch,
-                            merged,
-                            "CI watcher auto-cleared: PR terminal"
-                        );
-                        if merged {
-                            crate::status_summary::auto_close_merged_tasks(home, branch);
-                        }
-                        return Ok(());
-                    }
-                } else {
-                    remove_watch(home, watch_path, &audit_label, repo, branch, "pr_terminal");
-                    tracing::info!(repo, branch, merged, "CI watcher auto-cleared: PR terminal");
-                    if merged {
-                        crate::status_summary::auto_close_merged_tasks(home, branch);
-                    }
-                    return Ok(());
-                }
+    let ctx = CiCheckCtx {
+        home,
+        watch_path,
+        repo,
+        branch,
+        subscribers,
+    };
+    if check_and_remove_terminal_pr(&ctx, provider).await? {
+        return Ok(());
+    }
+    check_and_alert_mergeable(&ctx, provider).await;
+    let tracking = RunTracking {
+        last_run_id,
+        prev_head_sha,
+        last_notified_sha,
+        last_notified_conclusion,
+        last_stale_emitted_sha,
+    };
+    let pr = match poll_ci_runs(&ctx, &tracking, provider).await? {
+        Some(pr) => pr,
+        None => return Ok(()),
+    };
+    let to_notify = select_runs_to_notify(
+        &pr.runs,
+        pr.effective_last_run_id,
+        tracking.last_notified_conclusion,
+    );
+    if to_notify.is_empty() {
+        if let Some(id) = pr.effective_last_run_id {
+            update_watch_state(ctx.watch_path, Some(id), &pr.current_sha);
+        }
+        return Ok(());
+    }
+    let deduped = dedupe_notifications_by_head_sha(
+        &pr.runs,
+        &to_notify,
+        tracking.last_notified_sha,
+        tracking.last_notified_conclusion,
+    );
+    let outcome = fan_out_notifications(&ctx, &pr, &deduped, &tracking, registry, provider).await;
+    persist_watch_state(&ctx, &pr, &outcome);
+    Ok(())
+}
+
+async fn check_and_remove_terminal_pr(
+    ctx: &CiCheckCtx<'_>,
+    provider: &dyn CiProvider,
+) -> anyhow::Result<bool> {
+    let PrState::Terminal { merged } = provider.check_pr_terminal(ctx.repo, ctx.branch).await
+    else {
+        return Ok(false);
+    };
+    let Ok(content) = std::fs::read_to_string(ctx.watch_path) else {
+        return Ok(false);
+    };
+    let Ok(watch) = serde_json::from_str::<WatchState>(&content) else {
+        return Ok(false);
+    };
+    if let Some(expires_at) = watch.expires_at.as_deref() {
+        if let Ok(exp) = chrono::DateTime::parse_from_rfc3339(expires_at) {
+            let watch_age =
+                exp.with_timezone(&chrono::Utc) - chrono::Duration::hours(WATCH_TTL_HOURS);
+            let since_creation = chrono::Utc::now().signed_duration_since(watch_age);
+            if since_creation < chrono::Duration::seconds(60) {
+                tracing::info!(
+                    repo = ctx.repo,
+                    branch = ctx.branch,
+                    merged,
+                    "skipping PR-terminal auto-clear — watch too young (<60s)"
+                );
+                return Ok(false);
             }
         }
     }
+    let audit_label = ctx.subscribers.join(",");
+    remove_watch(
+        ctx.home,
+        ctx.watch_path,
+        &audit_label,
+        ctx.repo,
+        ctx.branch,
+        "pr_terminal",
+    );
+    tracing::info!(
+        repo = ctx.repo,
+        branch = ctx.branch,
+        merged,
+        "CI watcher auto-cleared: PR terminal"
+    );
+    if merged {
+        crate::status_summary::auto_close_merged_tasks(ctx.home, ctx.branch);
+    }
+    Ok(true)
+}
 
-    // #813: periodic mergeable re-check. Cached `last_mergeable_check_at`
-    // in watch JSON gates the frequency to once every
-    // MERGEABLE_RECHECK_INTERVAL_SECS (5 min). Alert emits ONLY on a
-    // transition INTO CONFLICTING — avoids alert spam while still
-    // conflicting and silently handles transitions OUT of CONFLICTING
-    // (back to Mergeable post-rebase). Fail-open on Unknown.
+async fn check_and_alert_mergeable(ctx: &CiCheckCtx<'_>, provider: &dyn CiProvider) {
     const MERGEABLE_RECHECK_INTERVAL_SECS: i64 = 300;
-    let (should_recheck, prev_mergeable) = match std::fs::read_to_string(watch_path)
+    let (should_recheck, prev_mergeable) = match std::fs::read_to_string(ctx.watch_path)
         .ok()
         .and_then(|c| serde_json::from_str::<WatchState>(&c).ok())
     {
@@ -812,40 +865,51 @@ async fn ci_check_repo(
         }
         None => (true, None),
     };
-    if should_recheck {
-        let new_state = provider.check_pr_mergeable(repo, branch).await;
-        let now_rfc3339 = chrono::Utc::now().to_rfc3339();
-        if let Ok(content) = std::fs::read_to_string(watch_path) {
-            if let Ok(mut w) = serde_json::from_str::<WatchState>(&content) {
-                w.last_mergeable_state = Some(new_state.as_str().to_string());
-                w.last_mergeable_check_at = Some(now_rfc3339);
-                if let Ok(out) = serde_json::to_string_pretty(&w) {
-                    let _ = std::fs::write(watch_path, out);
-                }
+    if !should_recheck {
+        return;
+    }
+    let new_state = provider.check_pr_mergeable(ctx.repo, ctx.branch).await;
+    let now_rfc3339 = chrono::Utc::now().to_rfc3339();
+    if let Ok(content) = std::fs::read_to_string(ctx.watch_path) {
+        if let Ok(mut w) = serde_json::from_str::<WatchState>(&content) {
+            w.last_mergeable_state = Some(new_state.as_str().to_string());
+            w.last_mergeable_check_at = Some(now_rfc3339);
+            if let Ok(out) = serde_json::to_string_pretty(&w) {
+                let _ = std::fs::write(ctx.watch_path, out);
             }
         }
-        // Emit alert ONLY on transition INTO Conflicting (avoid spam
-        // when state stays Conflicting across cycles).
-        if matches!(new_state, MergeableState::Conflicting)
-            && prev_mergeable.as_deref() != Some("CONFLICTING")
-        {
-            emit_ci_conflict_alert(home, repo, branch, subscribers, "poll-transition");
-        }
     }
+    if matches!(new_state, MergeableState::Conflicting)
+        && prev_mergeable.as_deref() != Some("CONFLICTING")
+    {
+        emit_ci_conflict_alert(
+            ctx.home,
+            ctx.repo,
+            ctx.branch,
+            ctx.subscribers,
+            "poll-transition",
+        );
+    }
+}
 
-    let poll_result = provider.poll_runs(repo, branch).await?;
-    let runs = match poll_result {
+async fn poll_ci_runs(
+    ctx: &CiCheckCtx<'_>,
+    tracking: &RunTracking<'_>,
+    provider: &dyn CiProvider,
+) -> anyhow::Result<Option<PollResult>> {
+    let poll_result = provider.poll_runs(ctx.repo, ctx.branch).await?;
+    match poll_result {
         CiPollResult::ApiError {
             status,
             message,
             rate_limit_reset,
         } => {
             if let Some(reset_epoch) = rate_limit_reset {
-                if let Ok(content) = std::fs::read_to_string(watch_path) {
+                if let Ok(content) = std::fs::read_to_string(ctx.watch_path) {
                     if let Ok(mut watch) = serde_json::from_str::<WatchState>(&content) {
                         watch.rate_limit_until = Some(reset_epoch);
                         let _ = crate::store::atomic_write(
-                            watch_path,
+                            ctx.watch_path,
                             serde_json::to_string_pretty(&watch)
                                 .unwrap_or_default()
                                 .as_bytes(),
@@ -855,21 +919,13 @@ async fn ci_check_repo(
             }
             let notify_msg = match rate_limit_reset {
                 Some(reset) => format!(
-                    "[ci-warn] {repo}@{branch}: {message} — backoff until reset (epoch {reset})"
+                    "[ci-warn] {}@{}: {message} — backoff until reset (epoch {reset})",
+                    ctx.repo, ctx.branch
                 ),
-                None => format!("[ci-warn] {repo}@{branch}: {message}"),
+                None => format!("[ci-warn] {}@{}: {message}", ctx.repo, ctx.branch),
             };
-            // Outbound info-leak gate (Sprint 21 Phase 1): `notify_msg`
-            // carries CI run url + repo name; legacy `None`-allowlist
-            // deployments must opt in to receive these via
-            // `user_allowlist: [...]`.
-            //
-            // Sprint 54 P0-1: fan out to every subscriber. The single-call
-            // version was last-write-wins on the warning too — when lead+dev
-            // both watched a branch, only one received the rate-limit
-            // warning and the other silently waited.
             if let Some(ch) = crate::channel::active_channel() {
-                for sub in subscribers {
+                for sub in ctx.subscribers {
                     let _ = crate::channel::gated_notify(
                         ch.as_ref(),
                         sub,
@@ -879,19 +935,15 @@ async fn ci_check_repo(
                     );
                 }
             }
-            return Err(anyhow::anyhow!("{status}: {message}"));
+            Err(anyhow::anyhow!("{status}: {message}"))
         }
         CiPollResult::Runs {
             runs,
             rate_limit_remaining,
             rate_limit_limit,
         } => {
-            // Sprint 54 P0-2: persist the latest quota counters even on
-            // empty-runs polls, so the next tick's `adaptive_interval`
-            // sees the freshest snapshot. Done before the empty-runs
-            // early return below.
             if rate_limit_remaining.is_some() || rate_limit_limit.is_some() {
-                if let Ok(content) = std::fs::read_to_string(watch_path) {
+                if let Ok(content) = std::fs::read_to_string(ctx.watch_path) {
                     if let Ok(mut watch) = serde_json::from_str::<WatchState>(&content) {
                         if let Some(r) = rate_limit_remaining {
                             watch.rate_limit_remaining = Some(r);
@@ -900,7 +952,7 @@ async fn ci_check_repo(
                             watch.rate_limit_limit = Some(l);
                         }
                         let _ = crate::store::atomic_write(
-                            watch_path,
+                            ctx.watch_path,
                             serde_json::to_string_pretty(&watch)
                                 .unwrap_or_default()
                                 .as_bytes(),
@@ -908,133 +960,101 @@ async fn ci_check_repo(
                     }
                 }
             }
-            // Sprint 54 P0-5 (sub-scope B): a successful poll clears
-            // any in-flight stall state. If we previously fired
-            // `[ci-watch-stalled]`, the symmetrical
-            // `[ci-watch-resumed]` event fans out to subscribers
-            // exactly once.
-            clear_stall_and_maybe_notify_resumed(home, watch_path, repo, branch, subscribers);
+            clear_stall_and_maybe_notify_resumed(
+                ctx.home,
+                ctx.watch_path,
+                ctx.repo,
+                ctx.branch,
+                ctx.subscribers,
+            );
             if runs.is_empty() {
-                return Ok(());
+                return Ok(None);
             }
-            runs
+            let current_sha = runs
+                .first()
+                .map(|r| r.head_sha.as_str())
+                .unwrap_or("")
+                .to_string();
+            let effective_last_run_id = if tracking
+                .prev_head_sha
+                .is_some_and(|prev| prev != current_sha)
+            {
+                tracing::info!(
+                    repo = ctx.repo,
+                    branch = ctx.branch,
+                    old_sha = ?tracking.prev_head_sha,
+                    new_sha = %current_sha,
+                    "head_sha changed, resetting run tracking"
+                );
+                let _ =
+                    crate::daemon::task_progress::touch_progress_for_branch(ctx.home, ctx.branch);
+                None
+            } else {
+                tracking.last_run_id
+            };
+            Ok(Some(PollResult {
+                runs,
+                current_sha,
+                effective_last_run_id,
+            }))
         }
-    };
-
-    // Determine the latest head_sha from the newest run.
-    let current_sha = runs.first().map(|r| r.head_sha.as_str()).unwrap_or("");
-
-    // If head_sha changed (force push), reset last_run_id so we pick up new runs.
-    let effective_last_run_id = if prev_head_sha.is_some_and(|prev| prev != current_sha) {
-        tracing::info!(repo, branch, old_sha = ?prev_head_sha, new_sha = current_sha, "head_sha changed, resetting run tracking");
-        // Sprint 59 Wave 1 PR-1 (#9 task stall watchdog) — progress
-        // hook (b): when a watched branch advances to a new SHA,
-        // look up any agent binding whose `branch` matches and
-        // touch the bound task's progress sidecar. This is the
-        // PR-push signal that suppresses stall warnings while
-        // the operator is making forward progress on the branch.
-        let _ = crate::daemon::task_progress::touch_progress_for_branch(home, branch);
-        None
-    } else {
-        last_run_id
-    };
-
-    // #786: same `last_notified_conclusion` arg is consulted at both
-    // Sites 1 + 2 below. Site 1 drops runs at the run_id-equality
-    // boundary; Site 2 drops them at the head_sha-equality boundary.
-    // Both must be conclusion-aware so a rerun on the same run_id OR a
-    // re-scheduled run on the same commit fires the notification.
-    let to_notify = select_runs_to_notify(&runs, effective_last_run_id, last_notified_conclusion);
-    if to_notify.is_empty() {
-        // No new terminal runs — update head_sha but keep last_run_id.
-        // #786: avoid state churn (reviewer constraint 1) — no
-        // `last_notified_conclusion` write here because no notification
-        // fired.
-        if let Some(id) = effective_last_run_id {
-            update_watch_state(watch_path, Some(id), current_sha);
-        }
-        return Ok(());
     }
+}
 
-    let mut max_notified_id = effective_last_run_id.unwrap_or(0);
+async fn fan_out_notifications(
+    ctx: &CiCheckCtx<'_>,
+    pr: &PollResult,
+    deduped: &[(usize, u64, &str)],
+    tracking: &RunTracking<'_>,
+    registry: &AgentRegistry,
+    provider: &dyn CiProvider,
+) -> NotifyOutcome {
+    let mut max_notified_id = pr.effective_last_run_id.unwrap_or(0);
+    let mut new_notified_sha = tracking.last_notified_sha.map(String::from);
+    let mut new_notified_conclusion = tracking.last_notified_conclusion.map(String::from);
+    let mut new_stale_emitted_sha = tracking.last_stale_emitted_sha.map(String::from);
 
-    let deduped = dedupe_notifications_by_head_sha(
-        &runs,
-        &to_notify,
-        last_notified_sha,
-        last_notified_conclusion,
-    );
-    let mut new_notified_sha = last_notified_sha.map(String::from);
-    // #786: track the conclusion of the most-recent notification so the
-    // next poll cycle can detect rerun-on-same-id outcome transitions.
-    // Initialized to the prior persisted value; overwritten as
-    // notifications fire below. Persisted at the end alongside
-    // `new_notified_sha` in a single atomic write.
-    let mut new_notified_conclusion = last_notified_conclusion.map(String::from);
-    // #1026: track the SHA for which ci-stale was already emitted so
-    // subsequent conclusion changes on the same stale SHA don't flood.
-    let mut new_stale_emitted_sha = last_stale_emitted_sha.map(String::from);
-
-    for (idx, run_id, sha) in &deduped {
-        let run = &runs[*idx];
-        // Issue #608: use aggregate conclusion across ALL runs for this sha,
-        // not just the single deduped run's conclusion.
-        let conclusion = aggregate_conclusion_for_sha(&runs, sha);
+    for (idx, run_id, sha) in deduped {
+        let run = &pr.runs[*idx];
+        let conclusion = aggregate_conclusion_for_sha(&pr.runs, sha);
         if conclusion.is_none() {
-            // Some runs for this sha are still in-progress — skip, don't update tracking.
             continue;
         }
-        // Comment intentionally retained: advancing happens BEFORE the
-        // staleness gate so even dropped (stale) runs bump trackers and
-        // can't re-trigger on the next poll. The fan-out is what's gated.
         if *run_id > max_notified_id {
             max_notified_id = *run_id;
         }
 
-        // Issue #745: drop notifications for SHAs that are no longer the
-        // branch's current head. A newer commit was pushed since this run
-        // was triggered, so its pass/fail is no longer actionable. The
-        // tracker still advances (above and below) so we don't re-process.
-        if *sha != current_sha {
-            // #1026: skip if ci-stale already emitted for this SHA.
+        if *sha != pr.current_sha {
             if new_stale_emitted_sha.as_deref() == Some(*sha) {
                 new_notified_sha = Some(sha.to_string());
                 new_notified_conclusion = conclusion.map(String::from);
                 continue;
             }
             tracing::info!(
-                repo,
-                branch,
+                repo = ctx.repo,
+                branch = ctx.branch,
                 stale_sha = %sha,
-                current_sha,
+                current_sha = %pr.current_sha,
                 "dropping stale CI notification (newer commit on branch)"
             );
-            // #1032: enqueue_with_idle_hint replaces raw enqueue so
-            // idle backends wake on the stale-SHA drop. The drop
-            // event is operator-actionable signal that they pushed a
-            // new commit that superseded an older run mid-flight —
-            // missing it means the operator doesn't know which run
-            // they're watching.
-            for sub in subscribers {
+            for sub in ctx.subscribers {
                 let _ = crate::inbox::enqueue_with_idle_hint(
-                    home,
+                    ctx.home,
                     sub,
-                    make_ci_stale_drop_msg(repo, branch, sha, current_sha),
+                    make_ci_stale_drop_msg(ctx.repo, ctx.branch, sha, &pr.current_sha),
                 );
             }
             new_notified_sha = Some(sha.to_string());
-            // #786: stale-drop also updates conclusion tracker so a
-            // future same-id rerun on a then-current sha doesn't get
-            // confused by stale "last conclusion" state.
             new_notified_conclusion = conclusion.map(String::from);
-            // #1026: record that ci-stale was emitted for this SHA
             new_stale_emitted_sha = Some(sha.to_string());
             continue;
         }
 
-        if let Some(headline) = ci_notification_message(repo, branch, conclusion, None, Some(sha)) {
+        if let Some(headline) =
+            ci_notification_message(ctx.repo, ctx.branch, conclusion, None, Some(sha))
+        {
             let failure_detail = if conclusion == Some("failure") {
-                Some(provider.fetch_failure_summary(repo, *run_id).await)
+                Some(provider.fetch_failure_summary(ctx.repo, *run_id).await)
             } else {
                 None
             };
@@ -1045,39 +1065,17 @@ async fn ci_check_repo(
                 &run.url,
             );
 
-            // Sprint 54 P0-1 — Subscriber fan-out: every subscriber receives
-            // the in-band agent inject + the inbox enqueue. Without the
-            // fan-out, the most-recent `ci watch` caller would shadow all
-            // earlier subscribers (last-write-wins on the watch JSON's
-            // single `instance` field). The poll above is shared (one HTTP
-            // request per cycle); only the notification side-effects loop.
-            let repo_branch_key = format!("{repo}@{branch}");
+            let repo_branch_key = format!("{}@{}", ctx.repo, ctx.branch);
             let supersede_token = format!("ci-{}-{}", run_id, sha);
-            // #762: load `next_after_ci` once and only when this notification
-            // is for a successful run. The same agent appearing as both a
-            // subscriber and the action target produced a [ci-pass] +
-            // [ci-ready-for-action] duplicate pre-fix; skipping the
-            // [ci-pass] enqueue for that one subscriber preserves notify
-            // semantics for everyone else (and for the failure path, where
-            // the action target still needs to know about the fail).
             let action_target_on_success: Option<String> = if conclusion == Some("success") {
-                std::fs::read_to_string(watch_path)
+                std::fs::read_to_string(ctx.watch_path)
                     .ok()
                     .and_then(|c| serde_json::from_str::<WatchState>(&c).ok())
                     .and_then(|w| w.next_after_ci.filter(|s| !s.is_empty()))
             } else {
                 None
             };
-            // EMPIRICAL REGRESSION-PROOF FLIP: replace `subscribers` below
-            // with `&subscribers[..1]` to simulate the pre-r0 single-recipient
-            // bug. The `subscriber_fan_out_notifies_every_member` test
-            // immediately fails with the dev-inbox-missing assertion.
-            for sub in subscribers {
-                // #762: skip [ci-pass] enqueue for the action target on
-                // success; it receives [ci-ready-for-action] via inject
-                // below. Match is exact-string equality so a partial-prefix
-                // collision (e.g. "lead" vs "lead-2") doesn't accidentally
-                // drop the notification.
+            for sub in ctx.subscribers {
                 if action_target_on_success.as_deref() == Some(sub.as_str()) {
                     continue;
                 }
@@ -1090,61 +1088,28 @@ async fn ci_check_repo(
                         false
                     }
                 };
-                // #931 Fix 3: gate inbox enqueue against zombie subscriber
-                // names. Pre-#931 inbox enqueue fired unconditionally for
-                // every name in `subscribers[]`, so an agent removed
-                // from the fleet (e.g. via `delete_instance` + manual
-                // cleanup) but still listed in some watch's subs
-                // accumulated jsonl bloat every poll cycle until the 72h
-                // TTL expired. The PTY inject already silently no-op'd
-                // for the same agent; bringing inbox into parity removes
-                // the bloat vector.
-                //
-                // Gate logic: skip enqueue only when the subscriber is
-                // BOTH absent from the live agent registry AND absent
-                // from the fleet.yaml roster. Either presence keeps
-                // delivery enabled:
-                //   - in registry → agent is currently alive
-                //   - in fleet roster → agent is a legitimate fleet
-                //     member who may be temporarily offline (PTY died,
-                //     restart in progress); their inbox is durable so
-                //     they'll see the message on next spawn.
-                //
-                // Fail-permissive: when fleet.yaml is unreadable
-                // (filesystem error, missing file in some test scaffolds,
-                // operator hand-edit transient state), default to
-                // delivering. Better to over-deliver than to silently
-                // drop a notification.
                 let fleet_known =
-                    crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+                    crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(ctx.home))
                         .ok()
                         .map(|f| f.instances.contains_key(sub))
                         .unwrap_or(true);
                 if !in_registry && !fleet_known {
                     tracing::debug!(
                         sub = %sub,
-                        repo = %repo,
-                        branch = %branch,
+                        repo = %ctx.repo,
+                        branch = %ctx.branch,
                         "#931 Fix 3: skipping inbox enqueue for zombie subscriber (not in registry, not in fleet roster)"
                     );
                     continue;
                 }
-                // M6: mark prior ci-watch messages for same repo+branch as superseded
                 crate::inbox::mark_ci_watch_superseded(
-                    home,
+                    ctx.home,
                     sub,
                     &repo_branch_key,
                     &supersede_token,
                 );
-                // #1030: enqueue_with_idle_hint replaces raw enqueue
-                // so the durable inbox write is paired with a
-                // [AGEND-MSG-PENDING] PTY hint that wakes idle backends.
-                // Pre-#1030 the line 1040 inject was the only wake
-                // signal for live subscribers; agents that had cycled
-                // their PTY (session restart, compose-mode entry) saw
-                // the inbox entry but never woke until polled manually.
                 let _ = crate::inbox::enqueue_with_idle_hint(
-                    home,
+                    ctx.home,
                     sub,
                     crate::inbox::InboxMessage {
                         schema_version: 0,
@@ -1154,8 +1119,6 @@ async fn ci_check_repo(
                         parent_id: None,
                         task_id: None,
                         force_meta: None,
-                        // #946: reuse repo_branch_key (line 977) — same
-                        // canonical `{repo}@{branch}` form.
                         correlation_id: Some(repo_branch_key.clone()),
                         reviewed_head: None,
                         from: "system:ci".to_string(),
@@ -1180,44 +1143,42 @@ async fn ci_check_repo(
             }
         }
         new_notified_sha = Some(sha.to_string());
-        // #786: persist the conclusion that fired the notification so
-        // the next poll can detect a rerun outcome transition (same
-        // run_id OR same head_sha with different conclusion).
         new_notified_conclusion = conclusion.map(String::from);
     }
 
-    // Issue #650 + #1030: auto-route [ci-ready-for-action] to
-    // next_after_ci target on pass. Pre-#1030 this was a PTY-only
-    // inject (only wakes attentive agents; codex/claude-code idle
-    // backends received text in their PTY buffer but never submitted).
-    // Now uses enqueue_with_idle_hint so the durable JSONL inbox carries
-    // the event AND a [AGEND-MSG-PENDING] PTY hint fires to wake the
-    // recipient. Drop the registry lookup — enqueue_with_idle_hint
-    // delivers durably regardless of agent presence, which is the
-    // correct semantic for an actionable handoff.
-    if new_notified_sha.is_some() {
-        if let Ok(content) = std::fs::read_to_string(watch_path) {
+    NotifyOutcome {
+        max_notified_id,
+        new_notified_sha,
+        new_notified_conclusion,
+        new_stale_emitted_sha,
+    }
+}
+
+fn persist_watch_state(ctx: &CiCheckCtx<'_>, pr: &PollResult, outcome: &NotifyOutcome) {
+    if outcome.new_notified_sha.is_some() {
+        if let Ok(content) = std::fs::read_to_string(ctx.watch_path) {
             if let Ok(watch) = serde_json::from_str::<WatchState>(&content) {
                 if let Some(next) = watch.next_after_ci.as_deref().filter(|s| !s.is_empty()) {
-                    let last_conclusion = aggregate_conclusion_for_sha(&runs, current_sha);
+                    let last_conclusion = aggregate_conclusion_for_sha(&pr.runs, &pr.current_sha);
                     if last_conclusion == Some("success") {
-                        let repo_branch_key = format!("{repo}@{branch}");
+                        let repo_branch_key = format!("{}@{}", ctx.repo, ctx.branch);
                         let pr_number =
-                            crate::daemon::pr_state::load(home, repo, branch).map(|s| s.pr_number);
+                            crate::daemon::pr_state::load(ctx.home, ctx.repo, ctx.branch)
+                                .map(|s| s.pr_number);
                         let task_id = watch.task_id.as_deref();
                         let msg = make_ci_ready_for_action_msg(
-                            repo,
-                            branch,
+                            ctx.repo,
+                            ctx.branch,
                             &repo_branch_key,
-                            Some(current_sha),
+                            Some(&pr.current_sha),
                             pr_number,
                             task_id,
                         );
-                        let _ = crate::inbox::enqueue_with_idle_hint(home, next, msg);
+                        let _ = crate::inbox::enqueue_with_idle_hint(ctx.home, next, msg);
                     }
                 }
 
-                let last_conclusion = aggregate_conclusion_for_sha(&runs, current_sha);
+                let last_conclusion = aggregate_conclusion_for_sha(&pr.runs, &pr.current_sha);
                 let conclusion = match last_conclusion {
                     Some("success") => crate::daemon::pr_state::CiConclusion::Green,
                     Some(other) => {
@@ -1236,10 +1197,10 @@ async fn ci_check_repo(
                     _ => crate::daemon::pr_state::ReviewClass::Single,
                 };
                 crate::daemon::pr_state::record_ci_result(
-                    home,
-                    repo,
-                    branch,
-                    current_sha,
+                    ctx.home,
+                    ctx.repo,
+                    ctx.branch,
+                    &pr.current_sha,
                     conclusion,
                     subscribers,
                     review_class,
@@ -1249,14 +1210,13 @@ async fn ci_check_repo(
     }
 
     update_watch_state_with_notify(
-        watch_path,
-        Some(max_notified_id),
-        current_sha,
-        new_notified_sha.as_deref(),
-        new_notified_conclusion.as_deref(),
-        new_stale_emitted_sha.as_deref(),
+        ctx.watch_path,
+        Some(outcome.max_notified_id),
+        &pr.current_sha,
+        outcome.new_notified_sha.as_deref(),
+        outcome.new_notified_conclusion.as_deref(),
+        outcome.new_stale_emitted_sha.as_deref(),
     );
-    Ok(())
 }
 
 #[cfg(test)]
