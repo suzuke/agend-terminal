@@ -117,6 +117,15 @@ pub(crate) fn record_pending_decision(
     if std::fs::create_dir_all(&dir).is_err() {
         return None;
     }
+    // #1092: cancel any existing pending decisions for the same sender
+    // before recording a new one. Prevents stacked pendings where
+    // mark_resolved_for_sender only clears the latest, leaving older
+    // ones to timeout-fire unexpectedly.
+    for d in list_pending(home) {
+        if d.sender == sender && d.status == "pending" {
+            let _ = std::fs::remove_file(pending_path(home, &d.decision_id));
+        }
+    }
     let decision_id = next_decision_id();
     let payload = PendingDecision {
         schema_version: SCHEMA_VERSION,
@@ -645,6 +654,112 @@ mod tests {
         assert!(pending.is_empty(), "future-version sidecar must be skipped");
         // File preserved on disk.
         assert!(pending_path(&home, "d-future").exists());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #1092: stacked pending characterization + fix tests ──────
+
+    /// #1092 pre-fix characterization (now regression guard): same
+    /// sender cannot stack two pending decisions. The second
+    /// record_pending_decision call cancels the first.
+    #[test]
+    fn t1092_second_record_cancels_first_for_same_sender() {
+        let _g = env_lock();
+        std::env::remove_var("AGEND_DECISION_TIMEOUT_RECIPIENT");
+        let home = tmp_home("1092-char-resolve");
+        let old = chrono::Utc::now() - chrono::Duration::seconds(2000);
+        let id_old = write_pending_at(&home, "general", "action-A", 1800, old);
+        // Second record via production API cancels the manually-planted one.
+        let id_new =
+            record_pending_decision(&home, "general", "action-B", 1800).expect("second record");
+        let pending = list_pending(&home);
+        assert!(
+            pending.iter().all(|d| d.decision_id != id_old),
+            "#1092 fix: old pending must be removed when new one is recorded"
+        );
+        let new_entry = pending.iter().find(|d| d.decision_id == id_new).unwrap();
+        assert_eq!(new_entry.status, "pending");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1092 regression guard: with the fix, resolve + scan does NOT
+    /// fire stale decisions because stacking is prevented at record time.
+    #[test]
+    fn t1092_no_stale_fire_with_resolve_after_record() {
+        let _g = env_lock();
+        std::env::remove_var("AGEND_DECISION_TIMEOUT_RECIPIENT");
+        let home = tmp_home("1092-char-fire");
+        let old = chrono::Utc::now() - chrono::Duration::seconds(2000);
+        write_pending_at(&home, "general", "stale-action", 1800, old);
+        // Second record cancels the stale one.
+        let id_new =
+            record_pending_decision(&home, "general", "current-action", 1800).expect("new record");
+        // Resolve the current one.
+        let resolved = mark_resolved_for_sender(&home, "general");
+        assert_eq!(resolved.as_deref(), Some(id_new.as_str()));
+        // Scan should NOT fire any timeout (stale was cancelled at record).
+        scan_and_emit(&home);
+        let inbox = crate::inbox::drain(&home, "general");
+        assert!(
+            !inbox
+                .iter()
+                .any(|m| m.kind.as_deref() == Some("decision_timeout")),
+            "#1092 fix: no stale fire after resolve: {inbox:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1092 fix: record_pending_decision auto-cancels prior pending
+    /// from the same sender. Only one pending per sender at any time.
+    #[test]
+    fn t1092_record_cancels_prior_pending_same_sender() {
+        let _g = env_lock();
+        std::env::remove_var("AGEND_DECISION_TIMEOUT_RECIPIENT");
+        let home = tmp_home("1092-fix-cancel");
+        let id_a =
+            record_pending_decision(&home, "general", "action-A", 1800).expect("first record");
+        let id_b =
+            record_pending_decision(&home, "general", "action-B", 1800).expect("second record");
+        let pending = list_pending(&home);
+        let a = pending.iter().find(|d| d.decision_id == id_a);
+        let b = pending.iter().find(|d| d.decision_id == id_b);
+        // After fix: A should be cancelled, B should be pending.
+        assert!(
+            a.is_none() || a.unwrap().status != "pending",
+            "#1092 fix: prior pending must be cancelled when new one is recorded"
+        );
+        assert_eq!(
+            b.unwrap().status,
+            "pending",
+            "#1092 fix: new pending must be live"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1092 fix: after the fix, resolve + scan does NOT fire stale
+    /// decisions because there's only ever one pending per sender.
+    #[test]
+    fn t1092_no_stale_fire_after_fix() {
+        let _g = env_lock();
+        std::env::remove_var("AGEND_DECISION_TIMEOUT_RECIPIENT");
+        let home = tmp_home("1092-fix-no-fire");
+        let old = chrono::Utc::now() - chrono::Duration::seconds(2000);
+        // Record two decisions for same sender (second auto-cancels first).
+        write_pending_at(&home, "general", "stale-action", 1800, old);
+        let id_new =
+            record_pending_decision(&home, "general", "current-action", 1800).expect("new record");
+        // Resolve the current one.
+        let resolved = mark_resolved_for_sender(&home, "general");
+        assert_eq!(resolved.as_deref(), Some(id_new.as_str()));
+        // Scan should NOT fire any timeout.
+        scan_and_emit(&home);
+        let inbox = crate::inbox::drain(&home, "general");
+        assert!(
+            !inbox
+                .iter()
+                .any(|m| m.kind.as_deref() == Some("decision_timeout")),
+            "#1092 fix: no stale fire after resolve: {inbox:?}"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }
