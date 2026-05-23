@@ -218,10 +218,7 @@ fn is_test_only_file(path: &Path) -> bool {
                         cursor -= 1;
                         continue;
                     }
-                    if ptrim.starts_with("#[")
-                        && ptrim.contains("cfg")
-                        && ptrim.contains("test")
-                    {
+                    if ptrim.starts_with("#[") && ptrim.contains("cfg") && ptrim.contains("test") {
                         return true;
                     }
                     if !ptrim.starts_with("#[") {
