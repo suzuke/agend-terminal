@@ -188,6 +188,47 @@ fn is_test_only_file(path: &Path) -> bool {
             }
         }
     }
+    // Fallback: check sibling .rs files for `#[path = "filename.rs"]`
+    // under `#[cfg(test)]` — handles split-out test modules like
+    // `#[cfg(test)] #[path = "poller_tests.rs"] mod tests;`
+    let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if let Ok(siblings) = std::fs::read_dir(parent) {
+        let path_needle = format!("\"{filename}\"");
+        for sibling in siblings.flatten() {
+            let sp = sibling.path();
+            if sp == *path || sp.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&sp) else {
+                continue;
+            };
+            let lines: Vec<&str> = content.lines().collect();
+            for (idx, line) in lines.iter().enumerate() {
+                let trimmed = line.trim();
+                if !(trimmed.starts_with("#[path") && trimmed.contains(&path_needle)) {
+                    continue;
+                }
+                let mut cursor = idx;
+                for _ in 0..5 {
+                    let Some(prev) = cursor.checked_sub(1).and_then(|i| lines.get(i)) else {
+                        break;
+                    };
+                    let ptrim = prev.trim();
+                    if ptrim.is_empty() || ptrim.starts_with("//") {
+                        cursor -= 1;
+                        continue;
+                    }
+                    if ptrim.starts_with("#[") && ptrim.contains("cfg") && ptrim.contains("test") {
+                        return true;
+                    }
+                    if !ptrim.starts_with("#[") {
+                        break;
+                    }
+                    cursor -= 1;
+                }
+            }
+        }
+    }
     false
 }
 

@@ -238,6 +238,10 @@ fn status_to_legacy_str(s: crate::task_events::TaskStatus) -> &'static str {
     }
 }
 
+pub fn load_by_id(home: &Path, task_id: &str) -> Option<Task> {
+    read_task_record(home, task_id).map(|r| record_to_task(&r))
+}
+
 /// Return all tasks as typed structs. **PR3 cutover** — sources state
 /// from `task_events::replay()` instead of the legacy `tasks.json`.
 /// Dep-derived blocking is computed in-memory at this call (option (a)
