@@ -188,6 +188,82 @@ pub fn watch_start_check_mergeable(
     }
 }
 
+enum SkipReason {
+    Invalid,
+    Expired,
+    InactivityTtl,
+    RateLimited { reset_epoch: u64 },
+    NotDue,
+}
+
+struct PollContext {
+    repo: String,
+    branch: String,
+    subscribers: Vec<String>,
+    last_run_id: Option<u64>,
+    head_sha: Option<String>,
+    last_notified_sha: Option<String>,
+    last_notified_conclusion: Option<String>,
+    last_stale_emitted_sha: Option<String>,
+    stamped_watch: WatchState,
+}
+
+fn prepare_poll_context(
+    watch: &WatchState,
+    now_utc: chrono::DateTime<chrono::Utc>,
+    now_ms: i64,
+) -> Result<PollContext, SkipReason> {
+    if watch.repo.is_empty() {
+        return Err(SkipReason::Invalid);
+    }
+    let subscribers = watch.subscriber_names();
+    if subscribers.is_empty() {
+        return Err(SkipReason::Invalid);
+    }
+    if let Some(expires_at) = watch.expires_at.as_deref() {
+        if let Ok(exp) = chrono::DateTime::parse_from_rfc3339(expires_at) {
+            if now_utc > exp.with_timezone(&chrono::Utc) {
+                return Err(SkipReason::Expired);
+            }
+        }
+    }
+    if let Some(last_seen) = watch.last_terminal_seen_at.as_deref() {
+        if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(last_seen) {
+            let elapsed = now_utc.signed_duration_since(ts.with_timezone(&chrono::Utc));
+            if elapsed > chrono::Duration::hours(WATCH_TTL_HOURS) {
+                return Err(SkipReason::InactivityTtl);
+            }
+        }
+    }
+    if let Some(reset_epoch) = watch.rate_limit_until {
+        if (now_utc.timestamp() as u64) < reset_epoch {
+            return Err(SkipReason::RateLimited { reset_epoch });
+        }
+    }
+    let effective_interval = adaptive_interval(
+        watch.interval_secs,
+        watch.rate_limit_remaining,
+        watch.rate_limit_limit,
+    );
+    if !watch_is_due(watch.last_polled_at, effective_interval, now_ms) {
+        return Err(SkipReason::NotDue);
+    }
+    let mut stamped = watch.clone();
+    stamped.last_polled_at = Some(now_ms);
+    stamped.effective_interval_secs = Some(effective_interval);
+    Ok(PollContext {
+        repo: watch.repo.clone(),
+        branch: watch.branch.clone(),
+        subscribers,
+        last_run_id: watch.last_run_id,
+        head_sha: watch.head_sha.clone(),
+        last_notified_sha: watch.last_notified_head_sha.clone(),
+        last_notified_conclusion: watch.last_notified_conclusion.clone(),
+        last_stale_emitted_sha: watch.last_stale_emitted_sha.clone(),
+        stamped_watch: stamped,
+    })
+}
+
 /// Inner implementation that accepts a provider factory for testability.
 pub(super) fn check_ci_watches_with_provider(
     home: &Path,
@@ -211,110 +287,78 @@ pub(super) fn check_ci_watches_with_provider(
             Some(v) => v,
             None => continue,
         };
-        if watch.repo.is_empty() {
-            continue;
-        }
-        let subscribers = watch.subscriber_names();
-        if subscribers.is_empty() {
-            continue;
-        }
-        let repo = watch.repo.clone();
-        let branch = watch.branch.clone();
-        let interval = watch.interval_secs;
-        let last_run_id = watch.last_run_id;
-        let head_sha = watch.head_sha.clone();
-        let last_notified_sha = watch.last_notified_head_sha.clone();
-        let last_notified_conclusion = watch.last_notified_conclusion.clone();
-        let last_stale_emitted_sha = watch.last_stale_emitted_sha.clone();
-
-        let audit_label = subscribers.join(",");
-
         let now_utc = chrono::Utc::now();
-        if let Some(expires_at) = watch.expires_at.as_deref() {
-            if let Ok(exp) = chrono::DateTime::parse_from_rfc3339(expires_at) {
-                if now_utc > exp.with_timezone(&chrono::Utc) {
-                    remove_watch(home, &path, &audit_label, &repo, &branch, "expired");
-                    tracing::info!(repo = %repo, branch = %branch, "CI watch expired (TTL)");
-                    continue;
-                }
+        let now_ms = now_utc.timestamp_millis();
+        match prepare_poll_context(&watch, now_utc, now_ms) {
+            Ok(ctx) => {
+                let _ = crate::store::atomic_write(
+                    &path,
+                    serde_json::to_string_pretty(&ctx.stamped_watch)
+                        .unwrap_or_default()
+                        .as_bytes(),
+                );
+                let provider = match make_provider(&watch) {
+                    Some(p) => p,
+                    None => {
+                        tracing::warn!(repo = %ctx.repo, "ci_check: failed to build CI provider");
+                        continue;
+                    }
+                };
+                let home = home.to_path_buf();
+                let watch_path = path.clone();
+                let registry = Arc::clone(registry);
+                // fire-and-forget: ci_check is one-shot per poll cycle
+                shared_ci_runtime().spawn(async move {
+                    if let Err(e) = ci_check_repo(
+                        &home,
+                        &watch_path,
+                        &ctx.repo,
+                        &ctx.branch,
+                        &ctx.subscribers,
+                        ctx.last_run_id,
+                        ctx.head_sha.as_deref(),
+                        ctx.last_notified_sha.as_deref(),
+                        ctx.last_notified_conclusion.as_deref(),
+                        ctx.last_stale_emitted_sha.as_deref(),
+                        &registry,
+                        provider.as_ref(),
+                    )
+                    .await
+                    {
+                        tracing::warn!(repo = %ctx.repo, error = %e, "CI check failed");
+                    }
+                });
             }
-        }
-        if let Some(last_seen) = watch.last_terminal_seen_at.as_deref() {
-            if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(last_seen) {
-                let elapsed = now_utc.signed_duration_since(ts.with_timezone(&chrono::Utc));
-                if elapsed > chrono::Duration::hours(WATCH_TTL_HOURS) {
-                    remove_watch(home, &path, &audit_label, &repo, &branch, "inactivity_ttl");
-                    tracing::info!(repo = %repo, branch = %branch, hours = WATCH_TTL_HOURS, "CI watch removed: inactivity TTL");
-                    continue;
-                }
+            Err(SkipReason::Expired) => {
+                let a = watch.subscriber_names().join(",");
+                remove_watch(home, &path, &a, &watch.repo, &watch.branch, "expired");
+                tracing::info!(repo = %watch.repo, branch = %watch.branch, "CI watch expired (TTL)");
             }
-        }
-
-        if let Some(reset_epoch) = watch.rate_limit_until {
-            if (chrono::Utc::now().timestamp() as u64) < reset_epoch {
+            Err(SkipReason::InactivityTtl) => {
+                let a = watch.subscriber_names().join(",");
+                remove_watch(
+                    home,
+                    &path,
+                    &a,
+                    &watch.repo,
+                    &watch.branch,
+                    "inactivity_ttl",
+                );
+                tracing::info!(repo = %watch.repo, branch = %watch.branch, hours = WATCH_TTL_HOURS, "CI watch removed: inactivity TTL");
+            }
+            Err(SkipReason::RateLimited { reset_epoch }) => {
                 bump_consecutive_skips_and_maybe_notify(
                     home,
                     &path,
-                    &repo,
-                    &branch,
-                    &subscribers,
+                    &watch.repo,
+                    &watch.branch,
+                    &watch.subscriber_names(),
                     reset_epoch,
                     display_timezone.as_deref(),
                 );
-                continue;
             }
+            Err(SkipReason::NotDue | SkipReason::Invalid) => {}
         }
-
-        let prev_remaining = watch.rate_limit_remaining;
-        let prev_limit = watch.rate_limit_limit;
-        let effective_interval = adaptive_interval(interval, prev_remaining, prev_limit);
-
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        if !watch_is_due(watch.last_polled_at, effective_interval, now_ms) {
-            continue;
-        }
-        let mut watch_with_stamp = watch.clone();
-        watch_with_stamp.last_polled_at = Some(now_ms);
-        watch_with_stamp.effective_interval_secs = Some(effective_interval);
-        let _ = crate::store::atomic_write(
-            &path,
-            serde_json::to_string_pretty(&watch_with_stamp)
-                .unwrap_or_default()
-                .as_bytes(),
-        );
-
-        let home = home.to_path_buf();
-        let watch_path = path.clone();
-        let registry = Arc::clone(registry);
-        let provider = match make_provider(&watch) {
-            Some(p) => p,
-            None => {
-                tracing::warn!(repo = %repo, "ci_check: failed to build CI provider");
-                continue;
-            }
-        };
-        // fire-and-forget: ci_check is one-shot per poll cycle
-        let subscribers_owned = subscribers.clone();
-        shared_ci_runtime().spawn(async move {
-            if let Err(e) = ci_check_repo(
-                &home,
-                &watch_path,
-                &repo,
-                &branch,
-                &subscribers_owned,
-                last_run_id,
-                head_sha.as_deref(),
-                last_notified_sha.as_deref(),
-                last_notified_conclusion.as_deref(),
-                last_stale_emitted_sha.as_deref(),
-                &registry,
-                provider.as_ref(),
-            )
-            .await
-            {
-                tracing::warn!(repo = %repo, error = %e, "CI check failed");
-            }
-        });
     }
 }
 
