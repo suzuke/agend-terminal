@@ -353,12 +353,12 @@ impl Backend {
                     // macOS openpty doesn't translate LF→CR on input (ConPTY does),
                     // so LF here would silently no-op on mac.
                     // Issue #468: anchored regex (see ClaudeCode comment above).
-                    (r"(?m)^[^A-Za-z\n]{0,8}Do you trust", b"\r"),
-                    // Auto-update prompt: "Please restart Codex" → Enter
-                    (r"(?m)^[^A-Za-z\n]{0,8}Please restart", b"\r"),
+                    // #1087: `*` instead of `{0,8}` — TUI centered modals have 40+ char prefix.
+                    (r"(?m)^[^A-Za-z\n]*Do you trust", b"\r"),
+                    (r"(?m)^[^A-Za-z\n]*Please restart", b"\r"),
                     // #1069: version-update modal blocks agent until operator
                     // selects an option. "2\r" = "Skip" (least invasive).
-                    (r"(?m)^[^A-Za-z\n]{0,8}Update available!", b"2\r"),
+                    (r"(?m)^[^A-Za-z\n]*Update available!", b"2\r"),
                 ],
                 // Codex: "resume --last" → fresh start drops the resume subcommand
                 fresh_args: Some(&["--dangerously-bypass-approvals-and-sandbox"]),
@@ -380,10 +380,11 @@ impl Backend {
                 dismiss_patterns: &[
                     // Issue #468: anchored regex (see ClaudeCode comment above).
                     // #1069: Esc = "Skip" (don't auto-update; let operator decide).
-                    (r"(?m)^[^A-Za-z\n]{0,8}Update Available", b"\x1b"),
-                    (r"(?m)^[^A-Za-z\n]{0,8}Skip  Confirm", b"\x1b"),
-                    (r"(?m)^[^A-Za-z\n]{0,8}Update Complete", b"\r"),
-                    (r"(?m)^[^A-Za-z\n]{0,8}Please restart", b"\r"),
+                    // #1087: `*` instead of `{0,8}` — TUI centered modals have 40+ char prefix.
+                    (r"(?m)^[^A-Za-z\n]*Update Available", b"\x1b"),
+                    (r"(?m)^[^A-Za-z\n]*Skip  Confirm", b"\x1b"),
+                    (r"(?m)^[^A-Za-z\n]*Update Complete", b"\r"),
+                    (r"(?m)^[^A-Za-z\n]*Please restart", b"\r"),
                 ],
                 fresh_args: None, // same as args (resume is in resume_mode, not args)
                 fleet_mcp_supported: true,
@@ -1508,6 +1509,12 @@ mod tests {
             !re.is_match("User asked: is there an Update available! for the tool?"),
             "mid-line mention must NOT match (Issue #468 anchoring)"
         );
+        // #1087: centered TUI modal with 40+ char prefix must match
+        let centered = format!("{}Update available! 1.0 -> 2.0", " ".repeat(45));
+        assert!(
+            re.is_match(&centered),
+            "#1087: centered modal with 45-space prefix must match"
+        );
     }
 
     #[test]
@@ -1540,6 +1547,12 @@ mod tests {
         assert!(
             !re.is_match("The agent mentioned Update Available in its response"),
             "mid-line mention must NOT match (Issue #468 anchoring)"
+        );
+        // #1087: centered TUI modal with 40+ char prefix must match
+        let centered = format!("{}Update Available", " ".repeat(45));
+        assert!(
+            re.is_match(&centered),
+            "#1087: centered modal with 45-space prefix must match"
         );
     }
 
