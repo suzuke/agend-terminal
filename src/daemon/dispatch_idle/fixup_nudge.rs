@@ -106,41 +106,21 @@ fn emit_nudge(home: &Path, d: &PendingDispatch) -> bool {
         threshold_secs = d.threshold_secs,
         corr = d.correlation_id.as_deref().unwrap_or(""),
     );
-    let msg = crate::inbox::InboxMessage {
-        schema_version: 0,
-        id: None,
-        from: "system:fixup-watchdog".to_string(),
+    // #947: same fallback as emit_exceeded_event — see that site for
+    // design rationale (blend semantic acceptable due to `disp-`
+    // prefix convention).
+    let corr = d
+        .correlation_id
+        .clone()
+        .unwrap_or_else(|| d.dispatch_id.clone());
+    let mut msg = crate::inbox::InboxMessage::new_system(
+        "system:fixup-watchdog",
+        "dispatch_idle_nudge",
         text,
-        kind: Some("dispatch_idle_nudge".to_string()),
-        timestamp: chrono::Utc::now().to_rfc3339(),
-        channel: None,
-        read_at: None,
-        thread_id: None,
-        parent_id: None,
-        delivery_mode: Some("inbox_fallback".to_string()),
-        task_id: d.correlation_id.clone(),
-        force_meta: None,
-        // #947: same fallback as emit_exceeded_event — see that site for
-        // design rationale (blend semantic acceptable due to `disp-`
-        // prefix convention).
-        correlation_id: Some(
-            d.correlation_id
-                .clone()
-                .unwrap_or_else(|| d.dispatch_id.clone()),
-        ),
-        reviewed_head: None,
-        attachments: Vec::new(),
-        in_reply_to_msg_id: None,
-        in_reply_to_excerpt: None,
-        superseded_by: None,
-        from_id: None,
-        broadcast_context: None,
-        sequencing: None,
-        eta_minutes: None,
-        reporting_cadence: None,
-        worktree_binding_required: None,
-        pr_number: None,
-    };
+    )
+    .with_delivery_mode("inbox_fallback")
+    .with_correlation_id(corr);
+    msg.task_id = d.correlation_id.clone();
     match crate::inbox::enqueue_with_idle_hint(home, &d.target, msg) {
         Ok(()) => true,
         Err(e) => {

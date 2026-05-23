@@ -464,34 +464,11 @@ fn emit_idle_alert(
     text: &str,
     correlation_agent: Option<&str>,
 ) {
-    let msg = crate::inbox::InboxMessage {
-        schema_version: 0,
-        id: None,
-        from: format!("system:{kind}"),
-        text: text.to_string(),
-        kind: Some(kind.to_string()),
-        timestamp: chrono::Utc::now().to_rfc3339(),
-        channel: None,
-        read_at: None,
-        thread_id: None,
-        parent_id: None,
-        delivery_mode: Some("inbox_fallback".to_string()),
-        task_id: None,
-        force_meta: None,
-        correlation_id: correlation_agent.map(String::from),
-        reviewed_head: None,
-        attachments: Vec::new(),
-        in_reply_to_msg_id: None,
-        in_reply_to_excerpt: None,
-        superseded_by: None,
-        from_id: None,
-        broadcast_context: None,
-        sequencing: None,
-        eta_minutes: None,
-        reporting_cadence: None,
-        worktree_binding_required: None,
-        pr_number: None,
-    };
+    let mut msg = crate::inbox::InboxMessage::new_system(format!("system:{kind}"), kind, text)
+        .with_delivery_mode("inbox_fallback");
+    if let Some(agent) = correlation_agent {
+        msg = msg.with_correlation_id(agent);
+    }
     if let Err(e) = crate::inbox::enqueue_with_idle_hint(home, recipient, msg) {
         tracing::warn!(error = %e, recipient, kind, "idle_watchdog: enqueue failed");
     } else {

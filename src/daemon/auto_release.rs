@@ -518,32 +518,15 @@ mod tests {
 
     fn canonical_verdict_message() -> crate::inbox::InboxMessage {
         crate::inbox::InboxMessage {
-            schema_version: 0,
             id: Some("m-verdict-1".into()),
-            read_at: None,
-            thread_id: None,
-            parent_id: None,
             task_id: Some("t-x".into()),
-            force_meta: None,
             correlation_id: Some("t-x".into()),
             reviewed_head: Some("deadbeef".into()),
             from: "from:reviewer-1".into(),
-            from_id: None,
             text: "VERIFIED — clean baseline + 5 platforms green".into(),
             kind: Some("report".into()),
             timestamp: "2026-05-17T00:00:00Z".into(),
-            channel: None,
-            delivery_mode: None,
-            attachments: vec![],
-            in_reply_to_msg_id: None,
-            in_reply_to_excerpt: None,
-            superseded_by: None,
-            broadcast_context: None,
-            sequencing: None,
-            eta_minutes: None,
-            reporting_cadence: None,
-            worktree_binding_required: None,
-            pr_number: None,
+            ..Default::default()
         }
     }
 }

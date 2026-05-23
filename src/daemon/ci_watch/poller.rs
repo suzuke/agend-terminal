@@ -565,35 +565,9 @@ pub(crate) fn make_ci_conflict_alert_msg(
          URL: https://github.com/{repo}/pulls?q=is%3Apr+head%3A{branch} \
          (source: {source})"
     );
-    crate::inbox::InboxMessage {
-        schema_version: 0,
-        id: None,
-        read_at: None,
-        thread_id: None,
-        parent_id: None,
-        task_id: None,
-        force_meta: None,
+    crate::inbox::InboxMessage::new_system("system:ci", "ci-watch", body)
         // #946: stable grep target — canonical `{repo}@{branch}` form.
-        correlation_id: Some(format!("{repo}@{branch}")),
-        reviewed_head: None,
-        from: "system:ci".to_string(),
-        text: body,
-        kind: Some("ci-watch".to_string()),
-        timestamp: chrono::Utc::now().to_rfc3339(),
-        channel: None,
-        delivery_mode: None,
-        attachments: vec![],
-        in_reply_to_msg_id: None,
-        in_reply_to_excerpt: None,
-        superseded_by: None,
-        from_id: None,
-        broadcast_context: None,
-        sequencing: None,
-        eta_minutes: None,
-        reporting_cadence: None,
-        worktree_binding_required: None,
-        pr_number: None,
-    }
+        .with_correlation_id(format!("{repo}@{branch}"))
 }
 
 /// Build the `[ci-stale]` inbox message emitted when a CI run's head
@@ -605,35 +579,13 @@ pub(crate) fn make_ci_stale_drop_msg(
     stale_sha: &str,
     current_sha: &str,
 ) -> crate::inbox::InboxMessage {
-    crate::inbox::InboxMessage {
-        schema_version: 0,
-        id: None,
-        read_at: None,
-        thread_id: None,
-        parent_id: None,
-        task_id: None,
-        force_meta: None,
-        // #946: see emit_ci_conflict_alert for rationale.
-        correlation_id: Some(format!("{repo}@{branch}")),
-        reviewed_head: None,
-        from: "system:ci".to_string(),
-        text: format!("[ci-stale] {repo}@{branch} ({stale_sha}): superseded by {current_sha}"),
-        kind: Some("ci-stale".to_string()),
-        timestamp: chrono::Utc::now().to_rfc3339(),
-        channel: None,
-        delivery_mode: None,
-        attachments: vec![],
-        in_reply_to_msg_id: None,
-        in_reply_to_excerpt: None,
-        superseded_by: None,
-        from_id: None,
-        broadcast_context: None,
-        sequencing: None,
-        eta_minutes: None,
-        reporting_cadence: None,
-        worktree_binding_required: None,
-        pr_number: None,
-    }
+    crate::inbox::InboxMessage::new_system(
+        "system:ci",
+        "ci-stale",
+        format!("[ci-stale] {repo}@{branch} ({stale_sha}): superseded by {current_sha}"),
+    )
+    // #946: see emit_ci_conflict_alert for rationale.
+    .with_correlation_id(format!("{repo}@{branch}"))
 }
 
 /// Build the `[ci-ready-for-action]` inbox message handed to the
@@ -656,36 +608,18 @@ pub(crate) fn make_ci_ready_for_action_msg(
     pr_number: Option<u64>,
     task_id: Option<&str>,
 ) -> crate::inbox::InboxMessage {
-    crate::inbox::InboxMessage {
-        schema_version: 0,
-        id: None,
-        read_at: None,
-        thread_id: None,
-        parent_id: None,
-        task_id: task_id.map(String::from),
-        force_meta: None,
-        // Same canonical `{repo}@{branch}` form used by the [ci-pass]
-        // subscriber enqueue so inbox readers can correlate the two.
-        correlation_id: Some(repo_branch_key.to_string()),
-        reviewed_head: head_sha.map(String::from),
-        from: "system:ci".to_string(),
-        text: format!("[ci-ready-for-action] {repo}@{branch}: CI passed, your turn."),
-        kind: Some("ci-ready-for-action".to_string()),
-        timestamp: chrono::Utc::now().to_rfc3339(),
-        channel: None,
-        delivery_mode: None,
-        attachments: vec![],
-        in_reply_to_msg_id: None,
-        in_reply_to_excerpt: None,
-        superseded_by: None,
-        from_id: None,
-        broadcast_context: None,
-        sequencing: None,
-        eta_minutes: None,
-        reporting_cadence: None,
-        worktree_binding_required: None,
-        pr_number,
+    let mut msg = crate::inbox::InboxMessage::new_system(
+        "system:ci",
+        "ci-ready-for-action",
+        format!("[ci-ready-for-action] {repo}@{branch}: CI passed, your turn."),
+    )
+    .with_correlation_id(repo_branch_key);
+    if let Some(sha) = head_sha {
+        msg = msg.with_reviewed_head(sha);
     }
+    msg.task_id = task_id.map(String::from);
+    msg.pr_number = pr_number;
+    msg
 }
 
 // ── ci_check_repo decomposition (#1093) ──
@@ -1111,34 +1045,8 @@ async fn fan_out_notifications(
                 let _ = crate::inbox::enqueue_with_idle_hint(
                     ctx.home,
                     sub,
-                    crate::inbox::InboxMessage {
-                        schema_version: 0,
-                        id: None,
-                        read_at: None,
-                        thread_id: None,
-                        parent_id: None,
-                        task_id: None,
-                        force_meta: None,
-                        correlation_id: Some(repo_branch_key.clone()),
-                        reviewed_head: None,
-                        from: "system:ci".to_string(),
-                        text: body.clone(),
-                        kind: Some("ci-watch".to_string()),
-                        timestamp: chrono::Utc::now().to_rfc3339(),
-                        channel: None,
-                        delivery_mode: None,
-                        attachments: vec![],
-                        in_reply_to_msg_id: None,
-                        in_reply_to_excerpt: None,
-                        superseded_by: None,
-                        from_id: None,
-                        broadcast_context: None,
-                        sequencing: None,
-                        eta_minutes: None,
-                        reporting_cadence: None,
-                        worktree_binding_required: None,
-                        pr_number: None,
-                    },
+                    crate::inbox::InboxMessage::new_system("system:ci", "ci-watch", body.clone())
+                        .with_correlation_id(repo_branch_key.clone()),
                 );
             }
         }

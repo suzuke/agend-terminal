@@ -159,37 +159,9 @@ fn fan_out_health_event(
         let _ = crate::inbox::enqueue_with_idle_hint(
             home,
             sub,
-            crate::inbox::InboxMessage {
-                schema_version: 0,
-                id: None,
-                read_at: None,
-                thread_id: None,
-                parent_id: None,
-                task_id: None,
-                force_meta: None,
-                // #946: reuse repo_branch_key (line 157) — same canonical
-                // `{repo}@{branch}` form. Stable grep target across hash
-                // migrations because it's logical identity, not filename.
-                correlation_id: Some(repo_branch_key.clone()),
-                reviewed_head: None,
-                from: "system:ci".to_string(),
-                text: body.clone(),
-                kind: Some(kind.to_string()),
-                timestamp: chrono::Utc::now().to_rfc3339(),
-                channel: None,
-                delivery_mode: None,
-                attachments: vec![],
-                in_reply_to_msg_id: None,
-                in_reply_to_excerpt: None,
-                superseded_by: None,
-                from_id: None,
-                broadcast_context: None,
-                sequencing: None,
-                eta_minutes: None,
-                reporting_cadence: None,
-                worktree_binding_required: None,
-                pr_number: None,
-            },
+            crate::inbox::InboxMessage::new_system("system:ci", kind, body.clone())
+                // #946: canonical `{repo}@{branch}` form — stable grep target.
+                .with_correlation_id(repo_branch_key.clone()),
         );
     }
 }

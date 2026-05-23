@@ -1228,34 +1228,7 @@ pub fn run_task_maintenance(home: &Path) {
         let _ = crate::inbox::enqueue_with_idle_hint(
             home,
             &a.to,
-            crate::inbox::InboxMessage {
-                schema_version: 0,
-                id: None,
-                read_at: None,
-                thread_id: None,
-                parent_id: None,
-                task_id: None,
-                from: "system:dispatch".to_string(),
-                text: query,
-                kind: Some("query".to_string()),
-                timestamp: chrono::Utc::now().to_rfc3339(),
-                channel: None,
-                delivery_mode: None,
-                force_meta: None,
-                correlation_id: None,
-                reviewed_head: None,
-                attachments: vec![],
-                in_reply_to_msg_id: None,
-                in_reply_to_excerpt: None,
-                superseded_by: None,
-                from_id: None,
-                broadcast_context: None,
-                sequencing: None,
-                eta_minutes: None,
-                reporting_cadence: None,
-                worktree_binding_required: None,
-                pr_number: None,
-            },
+            crate::inbox::InboxMessage::new_system("system:dispatch", "query", query),
         );
     }
     // 24h orphan sweep
@@ -1278,7 +1251,6 @@ fn replay_missed_at_startup(home: &Path, registry: &AgentRegistry) {
         return;
     }
     tracing::info!(count = missed.len(), "replaying missed one-shot schedules");
-    let now = chrono::Utc::now();
     for sched in &missed {
         let target = sched.target.as_str();
         let message = sched.message.as_str();
@@ -1302,34 +1274,11 @@ fn replay_missed_at_startup(home: &Path, registry: &AgentRegistry) {
             let _ = crate::inbox::enqueue_with_idle_hint(
                 home,
                 target,
-                crate::inbox::InboxMessage {
-                    schema_version: 0,
-                    id: None,
-                    from: "system:schedule".to_string(),
-                    text: message.to_string(),
-                    kind: Some("schedule_replay".to_string()),
-                    timestamp: now.to_rfc3339(),
-                    channel: None,
-                    delivery_mode: None,
-                    force_meta: None,
-                    correlation_id: None,
-                    reviewed_head: None,
-                    read_at: None,
-                    thread_id: None,
-                    parent_id: None,
-                    task_id: None,
-                    attachments: vec![],
-                    in_reply_to_msg_id: None,
-                    in_reply_to_excerpt: None,
-                    superseded_by: None,
-                    from_id: None,
-                    broadcast_context: None,
-                    sequencing: None,
-                    eta_minutes: None,
-                    reporting_cadence: None,
-                    worktree_binding_required: None,
-                    pr_number: None,
-                },
+                crate::inbox::InboxMessage::new_system(
+                    "system:schedule",
+                    "schedule_replay",
+                    message,
+                ),
             );
         }
     }
