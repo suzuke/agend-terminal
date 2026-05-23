@@ -175,8 +175,8 @@ fn emit_conflict_notify(home: &Path, agent: &str) {
         .get("branch")
         .and_then(|v| v.as_str())
         .unwrap_or("(unknown)");
-    let base = "main"; // r0: hardcode; future PR can resolve from fleet.yaml
-    let payload = build_notify_payload(operation, &conflicted_files, branch, base);
+    let base = crate::git_helpers::default_branch(&worktree);
+    let payload = build_notify_payload(operation, &conflicted_files, branch, &base);
     let text = payload.to_string();
     let source = crate::inbox::NotifySource::System("conflict_notify");
     crate::inbox::notify_agent(home, agent, &source, &text);

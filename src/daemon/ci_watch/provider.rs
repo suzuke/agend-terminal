@@ -220,22 +220,13 @@ pub trait CiProvider: Send + Sync {
 
     /// #813: synchronous variant for non-async callers (handler-layer
     /// MCP entry points that need a blocking answer on watch-start).
-    /// Always runs the async future on a fresh current-thread runtime
-    /// in a scoped thread — works regardless of whether the caller is
-    /// already inside a tokio runtime (avoids the multi-thread vs
-    /// current-thread runtime-flavor branch). Dead-code allow lifts
-    /// at C3 when handle_watch_ci wires the call site.
+    /// Runs the async future on the shared CI runtime in a scoped
+    /// thread — works regardless of whether the caller is already
+    /// inside a tokio runtime.
     fn check_pr_mergeable_blocking(&self, repo: &str, branch: &str) -> MergeableState {
         std::thread::scope(|s| {
             let handle = s.spawn(|| {
-                let rt = match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(rt) => rt,
-                    Err(_) => return MergeableState::Unknown,
-                };
-                rt.block_on(self.check_pr_mergeable(repo, branch))
+                super::poller::shared_ci_runtime().block_on(self.check_pr_mergeable(repo, branch))
             });
             handle.join().unwrap_or(MergeableState::Unknown)
         })

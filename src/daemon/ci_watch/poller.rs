@@ -31,7 +31,7 @@ use super::watcher::check_ci_watches;
 // runtime per poll cycle. Bounded to 2 worker threads.
 // ---------------------------------------------------------------------------
 
-fn shared_ci_runtime() -> &'static tokio::runtime::Runtime {
+pub(super) fn shared_ci_runtime() -> &'static tokio::runtime::Runtime {
     static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
     RT.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
