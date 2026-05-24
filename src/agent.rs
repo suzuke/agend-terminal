@@ -926,7 +926,6 @@ fn pty_read_loop(
                         "[pty_read {name}] EOF after {read_count} reads, {total_bytes} bytes"
                     );
                 }
-                handle_pty_close(name, registry, home, crash_tx, shutdown, deleted);
                 break;
             }
             Ok(n_bytes) => {
@@ -987,10 +986,16 @@ fn pty_read_loop(
                         "[pty_read {name}] ERR after {read_count} reads, {total_bytes} bytes: {e}"
                     );
                 }
+                tracing::warn!(agent = name, error = %e, "PTY read error, triggering cleanup");
                 break;
             }
         }
     }
+
+    // #1144: handle_pty_close runs after BOTH exit paths (EOF and read error).
+    // Previously only the Ok(0) branch called it; the Err branch broke without
+    // cleanup, leaving a zombie agent in the registry.
+    handle_pty_close(name, registry, home, crash_tx, shutdown, deleted);
 }
 
 /// Sprint 21 F-NEW1: kill the process tree rooted at the agent's child PID,
@@ -1473,6 +1478,13 @@ fn write_with_timeout(writer: &PtyWriter, data: &[u8]) -> std::io::Result<()> {
     let data = data.to_vec();
     let writer = Arc::clone(writer);
     let (tx, rx) = crossbeam_channel::bounded(1);
+    // #1145: move `key` into thread so it can clear the WRITE_IN_PROGRESS guard
+    // on exit — even if the caller already timed out. Without this, a timeout
+    // leaves the guard set permanently, blocking all future writes to this
+    // PtyWriter (and any new writer allocated at the same address after teardown).
+    // fire-and-forget: write thread is short-lived (bounded by PTY buffer drain);
+    // on timeout the caller returns TimedOut but the thread eventually completes
+    // and self-cleans the guard.
     let spawn_result = std::thread::Builder::new()
         .name("pty_write_timeout".into())
         .spawn(move || {
@@ -1481,6 +1493,10 @@ fn write_with_timeout(writer: &PtyWriter, data: &[u8]) -> std::io::Result<()> {
                 w.write_all(&data)?;
                 w.flush()
             })();
+            // Thread-side guard cleanup: if the caller timed out, rx is dropped
+            // and send returns Err — but we still clear the guard so the next
+            // write attempt is not permanently blocked.
+            write_in_progress_set().lock().remove(&key);
             let _ = tx.send(result);
         });
     if let Err(e) = spawn_result {
@@ -1501,7 +1517,8 @@ fn write_with_timeout(writer: &PtyWriter, data: &[u8]) -> std::io::Result<()> {
             Err(e)
         }
         Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-            // Thread truly stuck: keep guard set to prevent spawning more
+            // Thread still running: guard will be cleared by the thread itself
+            // when it eventually completes (#1145).
             Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "PTY write timed out (5s) — backend may be stuck",
@@ -3048,5 +3065,172 @@ Allow Trust All Tools mode?
 
         // Inject must return Ok (no-op) without writing.
         assert!(inject_with_target(&target, b"should be skipped").is_ok());
+    }
+    /// #1144: pty_read_loop error path must trigger handle_pty_close cleanup.
+    /// Previously, `Err(e)` broke out of the loop without calling
+    /// handle_pty_close, leaving the agent as a zombie in the registry.
+    /// This test simulates a read error by providing a reader that fails
+    /// after producing some output, then verifies the agent is cleaned up
+    /// from the registry (handle_pty_close removes it on non-crash paths).
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn pty_read_error_triggers_cleanup() {
+        use std::collections::HashMap;
+
+        struct FailingReader {
+            call: std::cell::Cell<u32>,
+        }
+        impl std::io::Read for FailingReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.call.get();
+                self.call.set(n + 1);
+                if n == 0 {
+                    buf[0] = b'x';
+                    Ok(1)
+                } else {
+                    Err(std::io::Error::other("simulated read error"))
+                }
+            }
+        }
+
+        let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let pty_writer: PtyWriter = Arc::new(Mutex::new(Box::new(Vec::<u8>::new())));
+        let core = Arc::new(Mutex::new(AgentCore {
+            vterm: VTerm::new(80, 24),
+            subscribers: Vec::new(),
+            state: StateTracker::new(None),
+            health: HealthTracker::new(),
+        }));
+
+        let agent_name = "read-err-test";
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+        registry.lock().insert(
+            agent_name.to_string(),
+            AgentHandle {
+                id: crate::types::InstanceId::default(),
+                name: agent_name.to_string(),
+                backend_command: "test".to_string(),
+                pty_writer: Arc::clone(&pty_writer),
+                pty_master: Arc::new(Mutex::new(
+                    portable_pty::native_pty_system()
+                        .openpty(PtySize {
+                            rows: 24,
+                            cols: 80,
+                            pixel_width: 0,
+                            pixel_height: 0,
+                        })
+                        .unwrap()
+                        .master,
+                )),
+                core: Arc::clone(&core),
+                child: Arc::new(Mutex::new(
+                    portable_pty::native_pty_system()
+                        .openpty(PtySize {
+                            rows: 24,
+                            cols: 80,
+                            pixel_width: 0,
+                            pixel_height: 0,
+                        })
+                        .unwrap()
+                        .slave
+                        .spawn_command(portable_pty::CommandBuilder::new("true"))
+                        .unwrap(),
+                )),
+                submit_key: "\r".to_string(),
+                inject_prefix: String::new(),
+                typed_inject: false,
+                spawned_at: std::time::Instant::now(),
+                spawned_at_epoch_ms: 0,
+                deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+        );
+
+        assert!(
+            registry.lock().contains_key(agent_name),
+            "pre-condition: agent must be in registry"
+        );
+
+        let ctx = PtyReadContext {
+            name: agent_name.to_string(),
+            core,
+            pty_writer,
+            registry: Arc::clone(&registry),
+            home: None,
+            crash_tx: None,
+            dismiss_patterns: Vec::new(),
+            shutdown: Some(shutdown),
+            deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+
+        let mut reader = FailingReader {
+            call: std::cell::Cell::new(0),
+        };
+        let capture = crate::capture::make_capture_writer(None, agent_name, "test");
+        pty_read_loop(&mut reader, &ctx, capture);
+
+        assert!(
+            !registry.lock().contains_key(agent_name),
+            "#1144: read error path must call handle_pty_close which removes \
+             agent from registry (shutdown=true path). Before fix, the Err \
+             branch broke without cleanup, leaving a zombie entry."
+        );
+    }
+
+    /// #1145: write_with_timeout stuck thread must clear WRITE_IN_PROGRESS
+    /// guard on completion, even after the caller has timed out. Before the
+    /// fix, the guard persisted forever after timeout, permanently blocking
+    /// future writes to the same PtyWriter (or any new writer allocated at
+    /// the same pointer address).
+    #[test]
+    fn write_guard_cleared_after_stuck_thread_completes() {
+        let (lock_tx, lock_rx) = crossbeam_channel::bounded::<()>(0);
+        let (unlock_tx, unlock_rx) = crossbeam_channel::bounded::<()>(0);
+
+        struct BlockingWriter {
+            lock_tx: crossbeam_channel::Sender<()>,
+            unlock_rx: crossbeam_channel::Receiver<()>,
+        }
+        impl std::io::Write for BlockingWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                let _ = self.lock_tx.send(());
+                let _ = self.unlock_rx.recv();
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let writer: PtyWriter =
+            Arc::new(Mutex::new(Box::new(BlockingWriter { lock_tx, unlock_rx })));
+        let key = Arc::as_ptr(&writer) as usize;
+
+        let writer2 = Arc::clone(&writer);
+        let handle = std::thread::spawn(move || write_with_timeout(&writer2, b"hello"));
+
+        // Wait for the write thread to enter the blocking write.
+        lock_rx.recv().expect("write thread must signal lock");
+
+        // Caller's recv_timeout will fire after 5s. Speed this up by
+        // spawning a second attempt that hits the in-progress guard.
+        let guard_set = write_in_progress_set().lock().contains(&key);
+        assert!(guard_set, "guard must be set while write is in progress");
+
+        // Unblock the write thread.
+        unlock_tx.send(()).expect("unblock write thread");
+
+        // Wait for the caller to finish.
+        let result = handle.join().expect("write thread joined");
+        assert!(result.is_ok(), "write should succeed after unblock");
+
+        // Guard must be cleared by the thread itself.
+        let guard_after = write_in_progress_set().lock().contains(&key);
+        assert!(
+            !guard_after,
+            "#1145: thread must clear WRITE_IN_PROGRESS guard on exit. \
+             Before fix, only the caller's success/error paths cleared it; \
+             the timeout path left it set permanently."
+        );
     }
 }

@@ -3133,3 +3133,43 @@ fn classify_pty_output_claude_server_rate_limit() {
         "Claude ServerRateLimit must map to RateLimit"
     );
 }
+
+// ── #1136: Network error → ServerRateLimit (auto-retry) ──────────
+
+#[test]
+fn network_error_econnreset_triggers_server_rate_limit() {
+    let patterns = StatePatterns::for_backend(&Backend::ClaudeCode);
+    assert_eq!(
+        patterns.detect("Error: ECONNRESET"),
+        Some(AgentState::ServerRateLimit),
+        "#1136: ECONNRESET must route to ServerRateLimit for auto-retry"
+    );
+}
+
+#[test]
+fn network_error_patterns_all_backends() {
+    let cases = [
+        "ECONNRESET",
+        "ETIMEDOUT",
+        "connection reset",
+        "socket hang up",
+        "fetch failed",
+    ];
+    let backends = [
+        Backend::ClaudeCode,
+        Backend::KiroCli,
+        Backend::Codex,
+        Backend::OpenCode,
+        Backend::Gemini,
+    ];
+    for backend in &backends {
+        let patterns = StatePatterns::for_backend(backend);
+        for case in &cases {
+            assert_eq!(
+                patterns.detect(case),
+                Some(AgentState::ServerRateLimit),
+                "#1136: '{case}' must trigger ServerRateLimit on {backend:?}"
+            );
+        }
+    }
+}
