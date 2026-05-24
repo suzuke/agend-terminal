@@ -97,6 +97,9 @@ pub enum Stage {
     /// `worktree_pool::lease` returned error (worktree creation failed,
     /// cross-agent lease conflict, same-agent different-branch conflict).
     WorktreeLeaseConflict,
+    /// Source repo resolution fell through to stub (tier 4) while
+    /// `AGEND_BIND_STRICT_MODE=1`.
+    ResolveSourceRepo,
 }
 
 /// Canonical `code` enum — stable across releases. Callers MUST match
@@ -119,6 +122,8 @@ pub enum ErrorCode {
     /// `bind_in_flight_set` already contains `(home, agent)` — concurrent
     /// dispatch blocked.
     BindInFlight,
+    /// `AGEND_BIND_STRICT_MODE=1` and source_repo resolved to stub (tier 4).
+    StubRejected,
 }
 
 /// Sprint 55 P0-B EC11: per-agent in-flight guard scoped to the daemon's
@@ -328,6 +333,21 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
     let (source_repo, source_repo_tier) =
         resolve_source_repo(home, target, source_repo_override, resolved.as_ref());
 
+    if source_repo_tier == SourceRepoTier::Stub
+        && std::env::var("AGEND_BIND_STRICT_MODE").as_deref() == Ok("1")
+    {
+        return Err(DispatchError {
+            message: format!(
+                "AGEND_BIND_STRICT_MODE=1: stub fallback rejected for '{target}' — \
+                 set source_repo in fleet.yaml"
+            ),
+            code: ErrorCode::StubRejected,
+            stage: Stage::ResolveSourceRepo,
+            fetch_attempted: false,
+            raw: None,
+        });
+    }
+
     // P0-1.5: central lease registry check — reject if another agent holds this branch.
     if let Some(other) = crate::binding::scan_existing_branch_binding(home, branch, target) {
         return Err(DispatchError {
@@ -535,9 +555,6 @@ fn resolve_source_repo(
     let stub = crate::paths::workspace_dir(home).join(target);
     tracing::warn!(%target, tier = "stub", path = %stub.display(),
         "source_repo using home/workspace stub (tier 4) — fleet.yaml has no source_repo OR working_directory; binding may target wrong git history");
-    if std::env::var("AGEND_BIND_STRICT_MODE").as_deref() == Ok("1") {
-        tracing::error!(%target, "AGEND_BIND_STRICT_MODE=1: stub fallback rejected");
-    }
     (stub, SourceRepoTier::Stub)
 }
 
@@ -875,12 +892,8 @@ pub(crate) fn derive_repo_from_remote_pub(source_repo: &std::path::Path) -> Opti
 /// explicitly. Returns `None` if the repo has no `origin` remote, the remote
 /// isn't GitHub, or the git command fails.
 fn derive_repo_from_remote(source_repo: &std::path::Path) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .current_dir(source_repo)
-        .env("AGEND_GIT_BYPASS", "1")
-        .output()
-        .ok()?;
+    let output =
+        crate::git_helpers::git_bypass(source_repo, &["remote", "get-url", "origin"]).ok()?;
     if !output.status.success() {
         return None;
     }

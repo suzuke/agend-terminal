@@ -92,6 +92,10 @@ fn pending_path(home: &Path, decision_id: &str) -> PathBuf {
     pending_dir(home).join(format!("{decision_id}.json"))
 }
 
+fn decision_lock_path(home: &Path, decision_id: &str) -> PathBuf {
+    pending_dir(home).join(format!("{decision_id}.lock"))
+}
+
 /// Generate a deterministic-format decision ID (`d-<unix_micros>-<seq>`).
 fn next_decision_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -200,10 +204,18 @@ pub(crate) fn mark_resolved_for_sender(home: &Path, sender: &str) -> Option<Stri
         return None;
     }
     pending.sort_by(|a, b| a.issued_at.cmp(&b.issued_at));
-    let mut latest = pending.pop()?;
-    latest.status = "resolved".to_string();
-    let id = latest.decision_id.clone();
-    if write_decision(home, &latest) {
+    let candidate = pending.pop()?;
+    let id = candidate.decision_id.clone();
+    // #1116: flock + re-read to serialize against concurrent scan_and_emit
+    let _lock = crate::store::acquire_file_lock(&decision_lock_path(home, &id)).ok()?;
+    let path = pending_path(home, &id);
+    let content = std::fs::read_to_string(&path).ok()?;
+    let mut current: PendingDecision = serde_json::from_str(&content).ok()?;
+    if current.status != "pending" {
+        return None;
+    }
+    current.status = "resolved".to_string();
+    if write_decision(home, &current) {
         Some(id)
     } else {
         None
@@ -232,7 +244,7 @@ impl DecisionTimeoutTracker {
 /// and emit the auto-default inbox event. Exposed for tests.
 pub(crate) fn scan_and_emit(home: &Path) {
     let now = chrono::Utc::now();
-    for mut d in list_pending(home) {
+    for d in list_pending(home) {
         if d.status != "pending" {
             continue;
         }
@@ -244,9 +256,27 @@ pub(crate) fn scan_and_emit(home: &Path) {
         if elapsed_secs <= d.timeout_secs {
             continue;
         }
-        emit_timeout_event(home, &d, elapsed_secs);
-        d.status = "timeout".to_string();
-        let _ = write_decision(home, &d);
+        // #1116: flock + re-read to serialize against concurrent mark_resolved
+        let _lock = match crate::store::acquire_file_lock(&decision_lock_path(home, &d.decision_id))
+        {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        let path = pending_path(home, &d.decision_id);
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let mut current: PendingDecision = match serde_json::from_str(&content) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        if current.status != "pending" {
+            continue;
+        }
+        emit_timeout_event(home, &current, elapsed_secs);
+        current.status = "timeout".to_string();
+        let _ = write_decision(home, &current);
     }
 }
 
@@ -710,6 +740,54 @@ mod tests {
             "#1092 fix: new pending must be live"
         );
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #1116: resolve-vs-scan race characterization ──────────────
+
+    /// #1116 characterization: concurrent mark_resolved + scan_and_emit
+    /// on the same timed-out decision must not BOTH succeed. Invariant:
+    /// if resolve wins, no timeout event fires; if scan wins, resolve
+    /// returns None.
+    #[test]
+    fn t1116_race_resolve_vs_scan_must_not_both_succeed() {
+        let _g = env_lock();
+        std::env::remove_var("AGEND_DECISION_TIMEOUT_RECIPIENT");
+        for i in 0..100 {
+            let h = tmp_home(&format!("1116-race-{i}"));
+            let issued = chrono::Utc::now() - chrono::Duration::seconds(2000);
+            write_pending_at(&h, "general", "proceed", 1800, issued);
+
+            let h1 = h.clone();
+            let h2 = h.clone();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let b1 = barrier.clone();
+            let b2 = barrier.clone();
+
+            let t1 = std::thread::spawn(move || {
+                b1.wait();
+                mark_resolved_for_sender(&h1, "general")
+            });
+            let t2 = std::thread::spawn(move || {
+                b2.wait();
+                scan_and_emit(&h2);
+            });
+
+            let resolved = t1.join().unwrap();
+            t2.join().unwrap();
+
+            let inbox = crate::inbox::drain(&h, "general");
+            let timeout_fired = inbox
+                .iter()
+                .any(|m| m.kind.as_deref() == Some("decision_timeout"));
+
+            assert!(
+                !(resolved.is_some() && timeout_fired),
+                "#1116 race iteration {i}: resolve succeeded AND timeout fired — \
+                 read-modify-write not serialized"
+            );
+
+            std::fs::remove_dir_all(&h).ok();
+        }
     }
 
     /// #1092 fix: after the fix, resolve + scan does NOT fire stale

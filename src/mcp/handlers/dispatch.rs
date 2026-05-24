@@ -508,6 +508,7 @@ static WATCHDOG_ACTIONS: &[(&str, HandlerFn)] = &[
     ("snooze", dispatch_watchdog_snooze),
     ("resume", dispatch_watchdog_resume),
     ("status", dispatch_watchdog_status),
+    ("ack", dispatch_watchdog_ack),
 ];
 
 // `repo` — actions: checkout / release.
@@ -1015,7 +1016,9 @@ mod tests {
         let cases: &[(&str, &[&str])] = &[
             (
                 "task",
-                &["create", "list", "claim", "update", "done", "sweep"],
+                &[
+                    "create", "list", "claim", "update", "done", "sweep", "health",
+                ],
             ),
             ("ci", &["watch", "unwatch", "status"]),
             ("decision", &["post", "list", "update"]),
@@ -1032,7 +1035,7 @@ mod tests {
             ),
             ("schedule", &["create", "list", "update", "delete"]),
             ("team", &["create", "delete", "list", "update"]),
-            ("watchdog", &["snooze", "resume", "status"]),
+            ("watchdog", &["snooze", "resume", "status", "ack"]),
         ];
         for (tool, actions) in cases {
             for action in actions.iter() {
@@ -1060,6 +1063,7 @@ mod tests {
             "repo",
             "schedule",
             "team",
+            "watchdog",
         ];
         for tool in action_tools {
             let entry = registered_handlers()
