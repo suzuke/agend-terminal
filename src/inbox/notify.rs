@@ -348,10 +348,8 @@ where
     let from = msg.from.clone();
     let kind = msg.kind.clone();
 
-    storage::enqueue(home, target, msg)?;
-
-    // Build the PTY hint AFTER the inbox write succeeds
-    let pending = storage::unread_count(home, target).0;
+    // Single lock scope: enqueue + count in one read, avoiding double I/O.
+    let pending = storage::enqueue_returning_unread_count(home, target, msg)?;
     let from_short = from.strip_prefix("from:").unwrap_or(&from);
     let kind_str = kind.as_deref().unwrap_or("");
     let hint = format!(

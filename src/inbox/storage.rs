@@ -93,6 +93,43 @@ pub fn enqueue(home: &Path, name: &str, mut msg: InboxMessage) -> anyhow::Result
     })?
 }
 
+/// Enqueue a message and return the post-enqueue unread count in one lock
+/// scope. Avoids the double-read of separate `enqueue` + `unread_count` calls.
+pub fn enqueue_returning_unread_count(
+    home: &Path,
+    name: &str,
+    mut msg: InboxMessage,
+) -> anyhow::Result<usize> {
+    if super::disk::is_readonly() {
+        anyhow::bail!("inbox readonly: disk space critically low");
+    }
+    msg.schema_version = InboxMessage::CURRENT_VERSION;
+    ensure_msg_id(&mut msg);
+    let line = format!("{}\n", serde_json::to_string(&msg)?);
+
+    with_inbox_lock(home, name, |path| {
+        let existing = std::fs::read_to_string(path).unwrap_or_default();
+        let mut count = 0usize;
+        for l in existing.lines() {
+            if l.trim().is_empty() {
+                continue;
+            }
+            if let Ok(m) = serde_json::from_str::<InboxMessage>(l) {
+                if m.read_at.is_none() {
+                    count += 1;
+                }
+            }
+        }
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        f.write_all(line.as_bytes())?;
+        f.sync_all()?;
+        Ok(count + 1) // +1 for the message we just appended
+    })?
+}
+
 /// Assign a stable `msg.id` when absent. Shared between [`enqueue`] and
 /// [`enqueue_with_idle_hint`] so the latter can pre-stamp an id before
 /// the enqueue, then reference it in the PTY hint without consuming the
@@ -126,6 +163,16 @@ pub fn mark_ci_watch_superseded(
         let mut lines: Vec<String> = Vec::new();
         for line in content.lines() {
             if line.trim().is_empty() {
+                lines.push(line.to_string());
+                continue;
+            }
+            // Pre-filter: skip JSON parse for lines that can't match criteria.
+            // Matching lines must contain "ci-watch", "system:ci", and the
+            // repo_branch_key, and must NOT already have a non-null read_at.
+            if !line.contains("ci-watch")
+                || !line.contains("system:ci")
+                || !line.contains(repo_branch_key)
+            {
                 lines.push(line.to_string());
                 continue;
             }
@@ -189,8 +236,8 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
         };
 
         let now = chrono::Utc::now().to_rfc3339();
-        let mut unread = Vec::new();
         let mut all_messages: Vec<InboxMessage> = Vec::new();
+        let mut newly_read: Vec<bool> = Vec::new();
 
         for line in content.lines() {
             if line.trim().is_empty() {
@@ -212,28 +259,31 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
                 // M6: skip superseded messages — they are stale
                 if msg.superseded_by.is_some() {
                     msg.read_at = Some(now.clone());
+                    newly_read.push(false);
                     all_messages.push(msg);
                     continue;
                 }
                 msg.read_at = Some(now.clone());
-                // #836: signal post-consume so the notification-dedup
-                // ledger can suppress redundant re-inject attempts
-                // from the rate-limit retry path. The ledger only has
-                // a record when notify_agent earlier called
-                // `record_inject(agent, msg_id)`; for messages whose
-                // delivery never went through the PTY-inject path
-                // (inbox-only or pre-#836 flight), `mark_consumed` is
-                // a no-op.
                 if let Some(ref id) = msg.id {
                     crate::daemon::notification_dedup::global().mark_consumed(name, id);
                 }
-                unread.push(msg.clone());
+                newly_read.push(true);
+            } else {
+                newly_read.push(false);
             }
             all_messages.push(msg);
         }
 
+        let has_unread = newly_read.iter().any(|&b| b);
+
         // Sprint 52: set reply_to on dequeue — last channel-sourced message wins.
-        if let Some(channel_msg) = unread.iter().rev().find(|m| m.channel.is_some()) {
+        if let Some(channel_msg) = all_messages
+            .iter()
+            .zip(newly_read.iter())
+            .rev()
+            .find(|(m, &nr)| nr && m.channel.is_some())
+            .map(|(m, _)| m)
+        {
             let channel_name = match channel_msg.channel.as_ref().expect("checked") {
                 crate::channel::ChannelKind::Telegram => "telegram",
                 crate::channel::ChannelKind::Discord => "discord",
@@ -247,7 +297,7 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
             });
         }
 
-        if !unread.is_empty() {
+        if has_unread {
             let write_tmp = path.with_extension("jsonl.tmp");
             let result = (|| -> anyhow::Result<()> {
                 let mut f = std::fs::OpenOptions::new()
@@ -267,7 +317,13 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
             }
         }
 
-        unread
+        // Extract newly-read messages without cloning — consume all_messages
+        // after write-back (which only borrows).
+        all_messages
+            .into_iter()
+            .zip(newly_read)
+            .filter_map(|(msg, nr)| nr.then_some(msg))
+            .collect()
     }) {
         Ok(msgs) => msgs,
         Err(e) => {
@@ -454,37 +510,46 @@ pub fn describe_message(home: &Path, msg_id: &str, instance: &str) -> MessageSta
 /// Get all messages in a thread, ordered by timestamp.
 /// If `instance` is Some, only scan that agent's inbox; otherwise scan all.
 pub fn get_thread(home: &Path, thread_id: &str, instance: Option<&str>) -> Vec<InboxMessage> {
-    let inbox_dir = home.join("inbox");
-    let entries = match std::fs::read_dir(&inbox_dir) {
-        Ok(e) => e,
-        Err(_) => return Vec::new(),
-    };
     let mut msgs = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-            continue;
-        }
-        if let Some(inst) = instance {
-            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-            if stem != inst {
+
+    if let Some(inst) = instance {
+        // Direct path lookup — skip directory scan entirely.
+        let path = inbox_path_resolved(home, inst);
+        collect_thread_messages(&path, thread_id, &mut msgs);
+    } else {
+        let inbox_dir = home.join("inbox");
+        let entries = match std::fs::read_dir(&inbox_dir) {
+            Ok(e) => e,
+            Err(_) => return Vec::new(),
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
+            collect_thread_messages(&path, thread_id, &mut msgs);
         }
-        let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        for line in content.lines() {
-            if let Ok(msg) = serde_json::from_str::<InboxMessage>(line) {
-                if msg.thread_id.as_deref() == Some(thread_id) {
-                    msgs.push(msg);
-                }
+    }
+
+    msgs.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    msgs
+}
+
+fn collect_thread_messages(path: &Path, thread_id: &str, out: &mut Vec<InboxMessage>) {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    for line in content.lines() {
+        if !line.contains(thread_id) {
+            continue;
+        }
+        if let Ok(msg) = serde_json::from_str::<InboxMessage>(line) {
+            if msg.thread_id.as_deref() == Some(thread_id) {
+                out.push(msg);
             }
         }
     }
-    msgs.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
-    msgs
 }
 
 /// Look up a message by ID across all inbox files. Returns the message if found.
