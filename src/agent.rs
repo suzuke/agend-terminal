@@ -1548,6 +1548,9 @@ pub fn inject_to_agent(agent: &AgentHandle, text: &[u8]) -> crate::error::Result
 /// borrowed `AgentHandle`. This lets callers release the registry lock
 /// before the slow typed-inject sleep loop runs.
 fn inject_with_target(target: &InjectTarget, text: &[u8]) -> crate::error::Result<()> {
+    if target.deleted.load(std::sync::atomic::Ordering::Acquire) {
+        return Ok(());
+    }
     let prefix = target.inject_prefix.as_bytes();
     let submit = target.submit_key.as_bytes();
 
@@ -1605,6 +1608,7 @@ pub(crate) struct InjectTarget {
     pub inject_prefix: String,
     pub submit_key: String,
     pub typed_inject: bool,
+    pub deleted: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl InjectTarget {
@@ -1614,6 +1618,7 @@ impl InjectTarget {
             inject_prefix: h.inject_prefix.clone(),
             submit_key: h.submit_key.clone(),
             typed_inject: h.typed_inject,
+            deleted: Arc::clone(&h.deleted),
         }
     }
 }
@@ -3015,5 +3020,33 @@ Allow Trust All Tools mode?
             inject_site > lock_release,
             "#1146: inject_with_target must appear after lock release"
         );
+    }
+
+    /// #1146 reviewer fix: inject_with_target must skip if the agent
+    /// was deleted between snapshot and inject (delete/reuse race).
+    /// The deleted flag is an Arc<AtomicBool> shared with AgentHandle,
+    /// so setting it on the handle is visible to the snapshot.
+    #[test]
+    fn inject_with_target_skips_deleted_agent_1146() {
+        let writer: PtyWriter = Arc::new(parking_lot::Mutex::new(
+            Box::new(std::io::sink()) as Box<dyn Write + Send>
+        ));
+        let deleted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let target = InjectTarget {
+            pty_writer: writer,
+            inject_prefix: String::new(),
+            submit_key: "\r".to_string(),
+            typed_inject: false,
+            deleted: Arc::clone(&deleted),
+        };
+
+        // Inject succeeds when not deleted.
+        assert!(inject_with_target(&target, b"hello").is_ok());
+
+        // Simulate delete_transaction setting the flag.
+        deleted.store(true, std::sync::atomic::Ordering::Release);
+
+        // Inject must return Ok (no-op) without writing.
+        assert!(inject_with_target(&target, b"should be skipped").is_ok());
     }
 }
