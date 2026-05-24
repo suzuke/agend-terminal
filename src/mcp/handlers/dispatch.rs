@@ -428,19 +428,14 @@ fn dispatch_watchdog_resume(ctx: &HandlerCtx<'_>) -> Value {
 
 fn dispatch_watchdog_status(ctx: &HandlerCtx<'_>) -> Value {
     use crate::daemon::idle_watchdog;
-    if idle_watchdog::is_fleet_idle_snoozed(ctx.home) {
-        let content =
-            std::fs::read_to_string(ctx.home.join("fleet-idle-snooze.json")).unwrap_or_default();
-        let snooze: idle_watchdog::FleetIdleSnooze =
-            serde_json::from_str(&content).unwrap_or_default();
+    if let Some(snooze) = idle_watchdog::get_snooze_state(ctx.home) {
         let remaining = chrono::DateTime::parse_from_rfc3339(&snooze.snoozed_until)
             .ok()
             .map(|dt| {
-                let r = dt
-                    .with_timezone(&chrono::Utc)
+                dt.with_timezone(&chrono::Utc)
                     .signed_duration_since(chrono::Utc::now())
-                    .num_seconds();
-                r.max(0)
+                    .num_seconds()
+                    .max(0)
             })
             .unwrap_or(0);
         json!({
@@ -472,6 +467,9 @@ fn dispatch_watchdog_ack(ctx: &HandlerCtx<'_>) -> Value {
 }
 
 /// Parse human-friendly duration strings like "2h", "30m", "1h30m".
+/// Parse a human duration string into seconds. Supports `h`/`m`/`s`
+/// suffixes (e.g. `"2h30m"`, `"90s"`). A bare number without suffix
+/// is interpreted as **minutes** (e.g. `"30"` → 1800s).
 fn parse_duration_secs(s: &str) -> Option<i64> {
     let s = s.trim();
     if s.is_empty() {

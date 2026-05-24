@@ -40,6 +40,8 @@ use std::path::{Path, PathBuf};
 ///   unlike `Reopened` which preserves it for done→open re-work).
 /// - [`TaskEvent::TaskCloseProposed`] (legacy-backfill dry-run proposal;
 ///   distinct from `Done` per dev-reviewer-2 must-have).
+/// - [`TaskEvent::OwnerAssigned`] (explicit owner assignment without claim).
+/// - [`TaskEvent::PriorityChanged`] (priority mutation tracking).
 /// - [`TaskEvent::Created`] gains `due_at` / `depends_on` / `routed_to`
 ///   fields (`#[serde(default)]` so v1 envelopes round-trip).
 /// - [`TaskRecord`] gains `created_by` / `created_at` / `updated_at` /
@@ -700,9 +702,13 @@ pub fn append_batch(
     let now = chrono::Utc::now().to_rfc3339();
 
     // Sprint 46 P3: resolve emitter's InstanceId for audit trail.
-    let emitter_id = crate::agent::resolve_instance(home, instance.as_str())
-        .ok()
-        .map(|(id, _)| id.full());
+    let emitter_id = match crate::agent::resolve_instance(home, instance.as_str()) {
+        Ok((id, _)) => Some(id.full()),
+        Err(e) => {
+            tracing::debug!(instance = %instance, error = %e, "emitter ID resolution failed");
+            None
+        }
+    };
 
     crate::event_log::append_lines_under_lock(home, LOG_NAME, |log_path| {
         let start_seq = max_seq_for_instance(log_path, &instance)? + 1;
