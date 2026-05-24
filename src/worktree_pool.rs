@@ -49,7 +49,9 @@ pub fn lease(
         None => return Err(format!("failed to create worktree for {agent}@{branch}")),
     };
 
-    // Tag as daemon-managed (R14: only daemon-tagged worktrees are GC candidates).
+    // Tag as daemon-managed — already written by worktree::create (#1137).
+    // Re-write here is idempotent and ensures the marker is present even
+    // for reused worktrees (which skip the create path).
     let marker = info.path.join(MANAGED_MARKER);
     let _ = std::fs::write(
         &marker,
