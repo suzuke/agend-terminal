@@ -127,7 +127,6 @@ pub enum NotifySource<'a> {
     /// Message from another agent instance (e.g., "dev").
     Agent(&'a str),
     /// System message (e.g., "replace", "ci").
-    #[allow(dead_code)]
     System(&'a str),
 }
 
@@ -154,7 +153,7 @@ impl NotifySource<'_> {
                 "\n(Reply using the reply tool — do NOT respond with direct text)".into()
             }
             Self::Agent(sender) => {
-                format!("\n(Reply using the send_to_instance tool with target \"{sender}\")").into()
+                format!("\n(Reply using the send tool with target_instance=\"{sender}\")").into()
             }
             Self::System(_) => "".into(),
         }
@@ -1782,7 +1781,7 @@ mod tests {
         let s = NotifySource::Agent("dev");
         assert_eq!(s.to_string(), "from:dev");
         let h = s.reply_hint();
-        assert!(h.contains("send_to_instance"));
+        assert!(h.contains("send tool"));
         assert!(h.contains("dev"));
     }
 

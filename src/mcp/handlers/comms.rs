@@ -126,7 +126,6 @@ pub(super) fn handle_send_to_instance(
             crate::agent_ops::fallback_deliver(home, sender.as_str(), target, text, msg, &e)
         }
     };
-    // Warn if kind=report without parent_id
     let mut result = result;
     if kind == Some("report") && parent_id.is_none() {
         if let Some(obj) = result.as_object_mut() {
@@ -423,7 +422,6 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
             task_id,
         }));
     }
-    // Add deprecation warning if caller used old field names
     let mut result = result;
     if used_deprecated {
         if let Some(obj) = result.as_object_mut() {
@@ -592,7 +590,6 @@ pub(super) fn handle_broadcast(home: &Path, args: &Value, sender: &Option<Sender
         Some(m) => m,
         None => return json!({"error": "missing 'message'"}),
     };
-    // Resolve targets: team > targets > tags > all
     let team_name = args["team"].as_str().map(String::from);
     let targets: Vec<String> = if let Some(team) = team_name.as_deref() {
         crate::teams::get_members(home, team)
@@ -608,19 +605,20 @@ pub(super) fn handle_broadcast(home: &Path, args: &Value, sender: &Option<Sender
         .filter(|t| *sender != t.as_str())
         .collect();
     let kind = args["request_kind"].as_str().unwrap_or("update");
-    // Sprint 54 layer-5 broadcast visibility: build context once for the
-    // whole fan-out so each recipient's PTY header gets `broadcast=N`
-    // (and `team=NAME` when team-based) and inbox JSON gets the same
-    // metadata. Routing behavior unchanged.
     let broadcast_ctx = crate::inbox::BroadcastContext {
         team: team_name,
         targets: targets.clone(),
         count: targets.len(),
     };
     let mut sent = Vec::new();
+    let mut failed: Vec<Value> = Vec::new();
     for target in &targets {
-        let _ = send_to(home, sender, target, message, kind, Some(&broadcast_ctx));
-        sent.push(target.clone());
+        let result = send_to(home, sender, target, message, kind, Some(&broadcast_ctx));
+        if result.get("error").is_some() {
+            failed.push(json!({"target": target, "error": result["error"]}));
+        } else {
+            sent.push(target.clone());
+        }
     }
     if !sent.is_empty() {
         ux_sink_registry().emit(&UxEvent::Fleet(FleetEvent::Broadcast {
@@ -629,13 +627,18 @@ pub(super) fn handle_broadcast(home: &Path, args: &Value, sender: &Option<Sender
             summary: message.to_string(),
         }));
     }
-    json!({"sent_to": sent, "count": sent.len()})
+    let mut resp = json!({"sent_to": sent, "count": sent.len()});
+    if !failed.is_empty() {
+        resp["failed"] = json!(failed);
+    }
+    resp
 }
 
 pub(super) fn handle_inbox(home: &Path, instance_name: &str) -> Value {
     let messages = crate::inbox::drain(home, instance_name);
     if !messages.is_empty() {
         let meta_path = crate::agent_ops::metadata_path_resolved(home, instance_name);
+        let mut processed_msg_ids: Vec<String> = Vec::new();
         if let Some(meta) = std::fs::read_to_string(&meta_path)
             .ok()
             .and_then(|c| serde_json::from_str::<Value>(&c).ok())
@@ -656,6 +659,7 @@ pub(super) fn handle_inbox(home: &Path, instance_name: &str) -> Value {
                     if msg_id.is_empty() {
                         continue;
                     }
+                    processed_msg_ids.push(msg_id.to_string());
                     let origin_msg = MsgRef {
                         binding: BindingRef::new(kind, Some(instance_name.to_string()), ()),
                         id: msg_id.to_string(),
@@ -667,9 +671,24 @@ pub(super) fn handle_inbox(home: &Path, instance_name: &str) -> Value {
                 }
             }
         }
-        // M6: clear only the pickup IDs we just emitted (not any that arrived
-        // between drain and clear). Save null only if no new IDs accumulated.
-        crate::agent_ops::save_metadata(home, instance_name, "pending_pickup_ids", json!([]));
+        if !processed_msg_ids.is_empty() {
+            let remaining: Vec<Value> = std::fs::read_to_string(&meta_path)
+                .ok()
+                .and_then(|c| serde_json::from_str::<Value>(&c).ok())
+                .and_then(|m| m["pending_pickup_ids"].as_array().cloned())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|e| {
+                    !processed_msg_ids.contains(&e["msg_id"].as_str().unwrap_or("").to_string())
+                })
+                .collect();
+            crate::agent_ops::save_metadata(
+                home,
+                instance_name,
+                "pending_pickup_ids",
+                json!(remaining),
+            );
+        }
     }
     json!({"messages": messages})
 }
