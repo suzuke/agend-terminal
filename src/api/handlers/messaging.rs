@@ -110,7 +110,7 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
         );
     }
 
-    let msg = {
+    let mut msg = {
         let mut thread_id = params["thread_id"].as_str().map(String::from);
         let parent_id = params["parent_id"].as_str().map(String::from);
 
@@ -407,10 +407,7 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
         // Correlation source: `correlation_id` if the caller set one,
         // else `task_id` (the kind=task convention — the task-board id
         // is what the reporter will set as `correlation_id` on the
-        // matching kind=report). For kind=query with neither field
-        // set, sidecar records correlation_id=None and only fires on
-        // timeout (mark_resolved can never match — acceptable for an
-        // un-correlated dispatch).
+        // matching kind=report).
         let outbound_corr = msg.correlation_id.as_deref().or(msg.task_id.as_deref());
         let explicit_threshold = params["expect_reply_within_secs"].as_i64();
         if let Some(threshold) =
@@ -420,11 +417,22 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
                 explicit_threshold,
             )
         {
+            // #1129: kind=query without correlation_id makes the sidecar
+            // unreachable by mark_resolved (keys on correlation_id). Auto-
+            // generate one and stamp it on the outbound message so the
+            // target's reply carries it back.
+            let outbound_corr = if outbound_corr.is_none() && kind_str == "query" {
+                let generated = format!("qcorr-{}", chrono::Utc::now().format("%Y%m%d%H%M%S%6f"));
+                msg.correlation_id = Some(generated.clone());
+                Some(generated)
+            } else {
+                outbound_corr.map(String::from)
+            };
             let _ = crate::daemon::dispatch_idle::record_dispatch(
                 ctx.home,
                 from,
                 target,
-                outbound_corr,
+                outbound_corr.as_deref(),
                 kind_str,
                 threshold,
             );
@@ -2157,6 +2165,63 @@ mod tests {
         assert!(
             combined.contains("\"kind\":\"task\""),
             "inbox JSONL must persist the task entry for absent target: {combined:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1129: kind=query without correlation_id auto-generates one so
+    /// the reply can resolve the dispatch_idle sidecar.
+    #[test]
+    fn hook_kind_query_without_correlation_id_auto_generates_and_reply_resolves() {
+        let home = tmp_home("1129-query-autogen");
+        write_fixup_fleet(&home, &["fixup-lead", "fixup-dev"]);
+        let ctx = test_ctx(&home);
+        // Dispatch kind=query with explicit threshold but NO correlation_id.
+        let result = handle_send(
+            &json!({
+                "from": "fixup-lead",
+                "target": "fixup-dev",
+                "text": "what is the status?",
+                "kind": "query",
+                "expect_reply_within_secs": 300,
+            }),
+            &ctx,
+        );
+        assert_eq!(result["ok"], true, "query must succeed: {result}");
+        // Sidecar must exist with a non-None correlation_id starting with "qcorr-".
+        let pending = crate::daemon::dispatch_idle::list_pending(&home);
+        let entry = pending
+            .iter()
+            .find(|p| p.dispatcher == "fixup-lead" && p.target == "fixup-dev")
+            .expect("sidecar must be recorded for query dispatch");
+        let corr = entry
+            .correlation_id
+            .as_ref()
+            .expect("correlation_id must be auto-generated, not None");
+        assert!(
+            corr.starts_with("qcorr-"),
+            "auto-generated correlation_id must use qcorr- prefix: {corr}"
+        );
+        // Simulate target replying with the auto-generated correlation_id.
+        let report_result = handle_send(
+            &json!({
+                "from": "fixup-dev",
+                "target": "fixup-lead",
+                "text": "all good",
+                "kind": "report",
+                "correlation_id": corr,
+            }),
+            &ctx,
+        );
+        assert_eq!(report_result["ok"], true);
+        let pending_after = crate::daemon::dispatch_idle::list_pending(&home);
+        let resolved = pending_after
+            .iter()
+            .find(|p| p.correlation_id.as_deref() == Some(corr.as_str()))
+            .expect("sidecar must still exist on disk");
+        assert_eq!(
+            resolved.status, "resolved",
+            "reply with auto-generated correlation_id must resolve the sidecar"
         );
         std::fs::remove_dir_all(&home).ok();
     }
