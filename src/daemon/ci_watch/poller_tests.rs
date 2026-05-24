@@ -4767,3 +4767,91 @@ fn ci_pass_friendly_hint_format() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// #1134 T3: Regression guard — source-level assertion that
+/// `inject_to_agent` is NOT called anywhere in the ci_check_repo
+/// fan-out path. If someone re-introduces the PTY inject, this test
+/// will fail, enforcing the single-delivery (inbox-only) invariant.
+#[test]
+fn ci_check_repo_no_inject_to_agent_regression_guard() {
+    let source = include_str!("poller.rs");
+    assert!(
+        !source.contains("inject_to_agent"),
+        "#1134 REGRESSION: inject_to_agent must not appear in poller.rs — \
+         CI-watch delivery is inbox-only. If you need PTY inject for a new \
+         feature, discuss in #1134 first."
+    );
+}
+
+/// #1134 T4: End-to-end — `run_ci_check` with a success run produces
+/// inbox notification but no PTY inject side-effect. Verifies the
+/// full `ci_check_repo` path with a registered agent in the registry.
+#[test]
+fn ci_check_repo_success_no_pty_inject_only_inbox() {
+    use std::sync::Arc;
+
+    let dir = tmp_dir("1134-t4-e2e-no-inject");
+    let provider = MockCiProvider::with_runs(vec![CiRun {
+        id: 200,
+        conclusion: Some("success".into()),
+        head_sha: "def456".into(),
+        url: "https://example.com/200".into(),
+    }]);
+
+    // Create watch with a subscriber
+    let watch = serde_json::json!({
+        "repo": "o/r", "branch": "feat", "interval_secs": 60,
+        "instance": "agent1", "last_run_id": null, "head_sha": null,
+        "last_polled_at": null, "last_notified_head_sha": null,
+    });
+    let ci_dir = dir.join("ci-watches");
+    std::fs::create_dir_all(&ci_dir).ok();
+    let watch_path = ci_dir.join(watch_filename("o/r", "feat"));
+    std::fs::write(&watch_path, serde_json::to_string_pretty(&watch).unwrap()).unwrap();
+
+    let subscribers = vec!["agent1".to_string()];
+
+    // Registry with NO agent handle — if inject_to_agent were still called,
+    // it would try to lock the registry and find nothing. But crucially,
+    // since we removed the call entirely, the registry isn't even consulted
+    // for injection purposes.
+    let registry: AgentRegistry =
+        Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(ci_check_repo(
+        &dir,
+        &watch_path,
+        "o/r",
+        "feat",
+        &subscribers,
+        None,
+        None,
+        None,
+        None,
+        None,
+        &registry,
+        &provider,
+    ))
+    .unwrap();
+
+    // Verify inbox was delivered
+    let inbox_path = dir.join("inbox").join("agent1.jsonl");
+    assert!(
+        inbox_path.exists(),
+        "#1134: inbox notification must be delivered for ci-pass"
+    );
+    let content = std::fs::read_to_string(&inbox_path).unwrap();
+    assert!(
+        content.contains("[ci-pass]"),
+        "#1134: inbox message must contain [ci-pass]; got: {content}"
+    );
+
+    // The absence of inject_to_agent in source (T3) guarantees no PTY
+    // inject happens — this test confirms the inbox-only delivery works
+    // end-to-end through ci_check_repo.
+    std::fs::remove_dir_all(&dir).ok();
+}
