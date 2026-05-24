@@ -19,11 +19,82 @@ fn tmp_home(suffix: &str) -> PathBuf {
 }
 
 fn make_msg(from: &str, text: &str) -> InboxMessage {
-    InboxMessage {
-        from: from.to_string(),
-        text: text.to_string(),
+    msg().sender(from).text(text).build()
+}
+
+struct TestMsgBuilder(InboxMessage);
+
+fn msg() -> TestMsgBuilder {
+    TestMsgBuilder(InboxMessage {
+        schema_version: 1,
         timestamp: "2025-01-01T00:00:00Z".to_string(),
         ..Default::default()
+    })
+}
+
+impl TestMsgBuilder {
+    fn sender(mut self, v: &str) -> Self {
+        self.0.from = v.into();
+        self
+    }
+    fn text(mut self, v: &str) -> Self {
+        self.0.text = v.into();
+        self
+    }
+    fn text_owned(mut self, v: String) -> Self {
+        self.0.text = v;
+        self
+    }
+    fn kind(mut self, v: &str) -> Self {
+        self.0.kind = Some(v.into());
+        self
+    }
+    fn id(mut self, v: &str) -> Self {
+        self.0.id = Some(v.into());
+        self
+    }
+    fn timestamp(mut self, v: &str) -> Self {
+        self.0.timestamp = v.into();
+        self
+    }
+    fn schema_version(mut self, v: u32) -> Self {
+        self.0.schema_version = v;
+        self
+    }
+    fn thread_id(mut self, v: &str) -> Self {
+        self.0.thread_id = Some(v.into());
+        self
+    }
+    fn parent_id(mut self, v: &str) -> Self {
+        self.0.parent_id = Some(v.into());
+        self
+    }
+    fn sender_id(mut self, v: &str) -> Self {
+        self.0.from_id = Some(v.into());
+        self
+    }
+    fn superseded_by(mut self, v: &str) -> Self {
+        self.0.superseded_by = Some(v.into());
+        self
+    }
+    fn in_reply_to_msg_id(mut self, v: &str) -> Self {
+        self.0.in_reply_to_msg_id = Some(v.into());
+        self
+    }
+    fn in_reply_to_excerpt(mut self, v: &str) -> Self {
+        self.0.in_reply_to_excerpt = Some(v.into());
+        self
+    }
+    fn attachments(mut self, v: Vec<crate::channel::event::Attachment>) -> Self {
+        self.0.attachments = v;
+        self
+    }
+    fn broadcast_context(mut self, v: BroadcastContext) -> Self {
+        self.0.broadcast_context = Some(v);
+        self
+    }
+    fn build(self) -> InboxMessage {
+        self.0
     }
 }
 
@@ -138,34 +209,13 @@ fn notify_injects_when_idle() {
 #[test]
 fn inbox_message_fields_preserved() {
     let home = tmp_home("fields");
-    let msg = InboxMessage {
-        schema_version: 0,
-        id: None,
-        read_at: None,
-        thread_id: None,
-        parent_id: None,
-        task_id: None,
-        force_meta: None,
-        correlation_id: None,
-        reviewed_head: None,
-        from: "sender".to_string(),
-        text: "body text".to_string(),
-        kind: Some("notification".to_string()),
-        timestamp: "2025-06-15T12:30:00Z".to_string(),
-        channel: None,
-        delivery_mode: None,
-        attachments: vec![],
-        in_reply_to_msg_id: None,
-        in_reply_to_excerpt: None,
-        superseded_by: None,
-        from_id: None,
-        broadcast_context: None,
-        sequencing: None,
-        eta_minutes: None,
-        reporting_cadence: None,
-        worktree_binding_required: None,
-        pr_number: None,
-    };
+    let msg = msg()
+        .schema_version(0)
+        .sender("sender")
+        .text("body text")
+        .kind("notification")
+        .timestamp("2025-06-15T12:30:00Z")
+        .build();
     enqueue(&home, "agent1", msg).ok();
     let msgs = drain(&home, "agent1");
     assert_eq!(msgs.len(), 1);
@@ -252,34 +302,11 @@ fn multiple_agents_isolated() {
 
 #[test]
 fn inbox_message_serialization() {
-    let msg = InboxMessage {
-        schema_version: 0,
-        id: None,
-        read_at: None,
-        thread_id: None,
-        parent_id: None,
-        task_id: None,
-        force_meta: None,
-        correlation_id: None,
-        reviewed_head: None,
-        from: "test".to_string(),
-        text: "hello \"world\"".to_string(),
-        kind: None,
-        timestamp: "2025-01-01T00:00:00Z".to_string(),
-        channel: None,
-        delivery_mode: None,
-        attachments: vec![],
-        in_reply_to_msg_id: None,
-        in_reply_to_excerpt: None,
-        superseded_by: None,
-        from_id: None,
-        broadcast_context: None,
-        sequencing: None,
-        eta_minutes: None,
-        reporting_cadence: None,
-        worktree_binding_required: None,
-        pr_number: None,
-    };
+    let msg = msg()
+        .schema_version(0)
+        .sender("test")
+        .text("hello \"world\"")
+        .build();
     let json = serde_json::to_string(&msg).expect("serialize");
     let parsed: InboxMessage = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(parsed.from, "test");
@@ -289,34 +316,12 @@ fn inbox_message_serialization() {
 #[test]
 fn inbox_message_with_special_chars() {
     let home = tmp_home("special");
-    let msg = InboxMessage {
-        schema_version: 0,
-        id: None,
-        read_at: None,
-        thread_id: None,
-        parent_id: None,
-        task_id: None,
-        force_meta: None,
-        correlation_id: None,
-        reviewed_head: None,
-        from: "user".to_string(),
-        text: "line1\nline2\ttab".to_string(),
-        kind: Some("special".to_string()),
-        timestamp: "2025-01-01T00:00:00Z".to_string(),
-        channel: None,
-        delivery_mode: None,
-        attachments: vec![],
-        in_reply_to_msg_id: None,
-        in_reply_to_excerpt: None,
-        superseded_by: None,
-        from_id: None,
-        broadcast_context: None,
-        sequencing: None,
-        eta_minutes: None,
-        reporting_cadence: None,
-        worktree_binding_required: None,
-        pr_number: None,
-    };
+    let msg = msg()
+        .schema_version(0)
+        .sender("user")
+        .text("line1\nline2\ttab")
+        .kind("special")
+        .build();
     enqueue(&home, "agent1", msg).ok();
     let msgs = drain(&home, "agent1");
     assert_eq!(msgs.len(), 1);
@@ -880,34 +885,14 @@ fn test_concurrent_drain_no_duplicate_recovery() {
 #[test]
 fn test_inbox_msg_thread_parent_fields_roundtrip() {
     // New fields with #[serde(default)] must round-trip and be absent from legacy
-    let msg = InboxMessage {
-        schema_version: 1,
-        id: Some("m-1".into()),
-        from: "a".into(),
-        text: "t".into(),
-        kind: None,
-        timestamp: "2026-01-01T00:00:00Z".into(),
-        channel: None,
-        delivery_mode: None,
-        force_meta: None,
-        correlation_id: None,
-        reviewed_head: None,
-        read_at: None,
-        thread_id: Some("thread-42".into()),
-        parent_id: Some("m-0".into()),
-        task_id: None,
-        attachments: vec![],
-        in_reply_to_msg_id: None,
-        in_reply_to_excerpt: None,
-        superseded_by: None,
-        from_id: None,
-        broadcast_context: None,
-        sequencing: None,
-        eta_minutes: None,
-        reporting_cadence: None,
-        worktree_binding_required: None,
-        pr_number: None,
-    };
+    let msg = msg()
+        .id("m-1")
+        .sender("a")
+        .text("t")
+        .timestamp("2026-01-01T00:00:00Z")
+        .thread_id("thread-42")
+        .parent_id("m-0")
+        .build();
     let json = serde_json::to_string(&msg).expect("ser");
     assert!(json.contains("thread_id"));
     assert!(json.contains("parent_id"));
@@ -938,34 +923,15 @@ fn test_inbox_msg_thread_parent_fields_roundtrip() {
 
 #[test]
 fn test_header_format_all_fields_present() {
-    let msg = InboxMessage {
-        schema_version: 1,
-        id: Some("m-42".into()),
-        from: "from:dev-lead".into(),
-        text: "x".repeat(500),
-        kind: Some("task".into()),
-        timestamp: "2026-01-01T00:00:00Z".into(),
-        channel: None,
-        delivery_mode: None,
-        force_meta: None,
-        correlation_id: None,
-        reviewed_head: None,
-        read_at: None,
-        thread_id: Some("t-100".into()),
-        parent_id: Some("m-41".into()),
-        task_id: None,
-        attachments: vec![],
-        in_reply_to_msg_id: None,
-        in_reply_to_excerpt: None,
-        superseded_by: None,
-        from_id: None,
-        broadcast_context: None,
-        sequencing: None,
-        eta_minutes: None,
-        reporting_cadence: None,
-        worktree_binding_required: None,
-        pr_number: None,
-    };
+    let msg = msg()
+        .id("m-42")
+        .sender("from:dev-lead")
+        .text_owned("x".repeat(500))
+        .kind("task")
+        .timestamp("2026-01-01T00:00:00Z")
+        .thread_id("t-100")
+        .parent_id("m-41")
+        .build();
     let header = format_header(&msg);
     assert!(header.contains("[AGEND-MSG]"));
     // #761: `from=` field strips the redundant `from:` prefix that
@@ -987,34 +953,13 @@ fn test_header_format_all_fields_present() {
 /// agents that parsed the field as identity.
 #[test]
 fn test_header_format_strips_from_prefix_for_agent_sources() {
-    let msg = InboxMessage {
-        schema_version: 1,
-        id: Some("m-1".into()),
-        from: "from:dev-fast-1".into(),
-        text: "ping".into(),
-        kind: Some("task".into()),
-        timestamp: "2026-05-14T19:00:00Z".into(),
-        channel: None,
-        delivery_mode: None,
-        force_meta: None,
-        correlation_id: None,
-        reviewed_head: None,
-        read_at: None,
-        thread_id: None,
-        parent_id: None,
-        task_id: None,
-        attachments: vec![],
-        in_reply_to_msg_id: None,
-        in_reply_to_excerpt: None,
-        superseded_by: None,
-        from_id: None,
-        broadcast_context: None,
-        sequencing: None,
-        eta_minutes: None,
-        reporting_cadence: None,
-        worktree_binding_required: None,
-        pr_number: None,
-    };
+    let msg = msg()
+        .id("m-1")
+        .sender("from:dev-fast-1")
+        .text("ping")
+        .kind("task")
+        .timestamp("2026-05-14T19:00:00Z")
+        .build();
     let header = format_header(&msg);
     assert!(
         header.contains("from=dev-fast-1"),
@@ -1032,34 +977,13 @@ fn test_header_format_strips_from_prefix_for_agent_sources() {
 /// prefix from `Source::Agent` is dropped.
 #[test]
 fn test_header_format_preserves_system_namespace() {
-    let msg = InboxMessage {
-        schema_version: 1,
-        id: Some("m-1".into()),
-        from: "system:fleet_idle_watchdog".into(),
-        text: "ping".into(),
-        kind: Some("watchdog".into()),
-        timestamp: "2026-05-14T19:00:00Z".into(),
-        channel: None,
-        delivery_mode: None,
-        force_meta: None,
-        correlation_id: None,
-        reviewed_head: None,
-        read_at: None,
-        thread_id: None,
-        parent_id: None,
-        task_id: None,
-        attachments: vec![],
-        in_reply_to_msg_id: None,
-        in_reply_to_excerpt: None,
-        superseded_by: None,
-        from_id: None,
-        broadcast_context: None,
-        sequencing: None,
-        eta_minutes: None,
-        reporting_cadence: None,
-        worktree_binding_required: None,
-        pr_number: None,
-    };
+    let msg = msg()
+        .id("m-1")
+        .sender("system:fleet_idle_watchdog")
+        .text("ping")
+        .kind("watchdog")
+        .timestamp("2026-05-14T19:00:00Z")
+        .build();
     let header = format_header(&msg);
     assert!(
         header.contains("from=system:fleet_idle_watchdog"),
@@ -1069,34 +993,12 @@ fn test_header_format_preserves_system_namespace() {
 
 #[test]
 fn test_header_format_omits_none_fields() {
-    let msg = InboxMessage {
-        schema_version: 1,
-        id: Some("m-1".into()),
-        from: "from:agent".into(),
-        text: "hello".into(),
-        kind: None,
-        timestamp: "2026-01-01T00:00:00Z".into(),
-        channel: None,
-        delivery_mode: None,
-        force_meta: None,
-        correlation_id: None,
-        reviewed_head: None,
-        read_at: None,
-        thread_id: None,
-        parent_id: None,
-        task_id: None,
-        attachments: vec![],
-        in_reply_to_msg_id: None,
-        in_reply_to_excerpt: None,
-        superseded_by: None,
-        from_id: None,
-        broadcast_context: None,
-        sequencing: None,
-        eta_minutes: None,
-        reporting_cadence: None,
-        worktree_binding_required: None,
-        pr_number: None,
-    };
+    let msg = msg()
+        .id("m-1")
+        .sender("from:agent")
+        .text("hello")
+        .timestamp("2026-01-01T00:00:00Z")
+        .build();
     let header = format_header(&msg);
     // #761: agent-source prefix stripped.
     assert!(header.contains("from=agent"));
@@ -1110,41 +1012,20 @@ fn test_header_format_omits_none_fields() {
 
 #[test]
 fn test_header_format_includes_attachments_when_present() {
-    let msg = InboxMessage {
-        schema_version: 1,
-        id: Some("m-1".into()),
-        from: "from:user".into(),
-        text: "see photo".into(),
-        kind: None,
-        timestamp: "2026-01-01T00:00:00Z".into(),
-        channel: None,
-        delivery_mode: None,
-        force_meta: None,
-        correlation_id: None,
-        reviewed_head: None,
-        read_at: None,
-        thread_id: None,
-        parent_id: None,
-        task_id: None,
-        attachments: vec![crate::channel::event::Attachment {
+    let msg = msg()
+        .id("m-1")
+        .sender("from:user")
+        .text("see photo")
+        .timestamp("2026-01-01T00:00:00Z")
+        .attachments(vec![crate::channel::event::Attachment {
             kind: crate::channel::event::AttachmentKind::Photo,
             path: std::path::PathBuf::from("/tmp/photo.jpg"),
             mime: None,
             caption: None,
             size_bytes: None,
             original_filename: None,
-        }],
-        in_reply_to_msg_id: None,
-        in_reply_to_excerpt: None,
-        superseded_by: None,
-        from_id: None,
-        broadcast_context: None,
-        sequencing: None,
-        eta_minutes: None,
-        reporting_cadence: None,
-        worktree_binding_required: None,
-        pr_number: None,
-    };
+        }])
+        .build();
     let header = format_header(&msg);
     assert!(
         header.contains("attachments=[/tmp/photo.jpg]"),
@@ -1154,34 +1035,12 @@ fn test_header_format_includes_attachments_when_present() {
 
 #[test]
 fn test_header_format_omits_attachments_when_empty() {
-    let msg = InboxMessage {
-        schema_version: 1,
-        id: Some("m-1".into()),
-        from: "from:user".into(),
-        text: "text only".into(),
-        kind: None,
-        timestamp: "2026-01-01T00:00:00Z".into(),
-        channel: None,
-        delivery_mode: None,
-        force_meta: None,
-        correlation_id: None,
-        reviewed_head: None,
-        read_at: None,
-        thread_id: None,
-        parent_id: None,
-        task_id: None,
-        attachments: vec![],
-        in_reply_to_msg_id: None,
-        in_reply_to_excerpt: None,
-        superseded_by: None,
-        from_id: None,
-        broadcast_context: None,
-        sequencing: None,
-        eta_minutes: None,
-        reporting_cadence: None,
-        worktree_binding_required: None,
-        pr_number: None,
-    };
+    let msg = msg()
+        .id("m-1")
+        .sender("from:user")
+        .text("text only")
+        .timestamp("2026-01-01T00:00:00Z")
+        .build();
     let header = format_header(&msg);
     assert!(
         !header.contains("attachments"),
@@ -1201,38 +1060,17 @@ fn test_header_format_joins_multiple_attachments_with_comma() {
         size_bytes: None,
         original_filename: None,
     };
-    let msg = InboxMessage {
-        schema_version: 1,
-        id: Some("m-1".into()),
-        from: "from:user".into(),
-        text: "multi".into(),
-        kind: None,
-        timestamp: "2026-01-01T00:00:00Z".into(),
-        channel: None,
-        delivery_mode: None,
-        force_meta: None,
-        correlation_id: None,
-        reviewed_head: None,
-        read_at: None,
-        thread_id: None,
-        parent_id: None,
-        task_id: None,
-        attachments: vec![
+    let msg = msg()
+        .id("m-1")
+        .sender("from:user")
+        .text("multi")
+        .timestamp("2026-01-01T00:00:00Z")
+        .attachments(vec![
             mk_att("/tmp/a.jpg"),
             mk_att("/tmp/b.jpg"),
             mk_att("/tmp/c.jpg"),
-        ],
-        in_reply_to_msg_id: None,
-        in_reply_to_excerpt: None,
-        superseded_by: None,
-        from_id: None,
-        broadcast_context: None,
-        sequencing: None,
-        eta_minutes: None,
-        reporting_cadence: None,
-        worktree_binding_required: None,
-        pr_number: None,
-    };
+        ])
+        .build();
     let header = format_header(&msg);
     assert!(
         header.contains("attachments=[/tmp/a.jpg,/tmp/b.jpg,/tmp/c.jpg]"),
@@ -1248,38 +1086,18 @@ fn test_header_format_joins_multiple_attachments_with_comma() {
 /// this test failing with header lacking `team=` / `broadcast=`.
 #[test]
 fn test_header_format_includes_team_and_broadcast_when_team_broadcast() {
-    let msg = InboxMessage {
-        schema_version: 1,
-        id: Some("m-1".into()),
-        from: "from:lead".into(),
-        text: "ping".into(),
-        kind: Some("query".into()),
-        timestamp: "2026-05-07T18:00:00Z".into(),
-        channel: None,
-        delivery_mode: None,
-        force_meta: None,
-        correlation_id: None,
-        reviewed_head: None,
-        read_at: None,
-        thread_id: None,
-        parent_id: None,
-        task_id: None,
-        attachments: vec![],
-        in_reply_to_msg_id: None,
-        in_reply_to_excerpt: None,
-        superseded_by: None,
-        from_id: None,
-        broadcast_context: Some(BroadcastContext {
+    let msg = msg()
+        .id("m-1")
+        .sender("from:lead")
+        .text("ping")
+        .kind("query")
+        .timestamp("2026-05-07T18:00:00Z")
+        .broadcast_context(BroadcastContext {
             team: Some("qa-test".to_string()),
             targets: vec!["kiro-cli-ea377a".into(), "kiro-cli-4e8a78".into()],
             count: 2,
-        }),
-        sequencing: None,
-        eta_minutes: None,
-        reporting_cadence: None,
-        worktree_binding_required: None,
-        pr_number: None,
-    };
+        })
+        .build();
     let header = format_header(&msg);
     assert!(
         header.contains("broadcast=2"),
@@ -1295,38 +1113,17 @@ fn test_header_format_includes_team_and_broadcast_when_team_broadcast() {
 /// gains `broadcast=N` only, no `team=`.
 #[test]
 fn test_header_format_includes_broadcast_only_when_targets_broadcast() {
-    let msg = InboxMessage {
-        schema_version: 1,
-        id: Some("m-1".into()),
-        from: "from:dev".into(),
-        text: "fyi".into(),
-        kind: None,
-        timestamp: "2026-05-07T18:00:00Z".into(),
-        channel: None,
-        delivery_mode: None,
-        force_meta: None,
-        correlation_id: None,
-        reviewed_head: None,
-        read_at: None,
-        thread_id: None,
-        parent_id: None,
-        task_id: None,
-        attachments: vec![],
-        in_reply_to_msg_id: None,
-        in_reply_to_excerpt: None,
-        superseded_by: None,
-        from_id: None,
-        broadcast_context: Some(BroadcastContext {
+    let msg = msg()
+        .id("m-1")
+        .sender("from:dev")
+        .text("fyi")
+        .timestamp("2026-05-07T18:00:00Z")
+        .broadcast_context(BroadcastContext {
             team: None,
             targets: vec!["a".into(), "b".into(), "c".into()],
             count: 3,
-        }),
-        sequencing: None,
-        eta_minutes: None,
-        reporting_cadence: None,
-        worktree_binding_required: None,
-        pr_number: None,
-    };
+        })
+        .build();
     let header = format_header(&msg);
     assert!(header.contains("broadcast=3"), "{header}");
     assert!(
@@ -1340,34 +1137,12 @@ fn test_header_format_includes_broadcast_only_when_targets_broadcast() {
 /// majority of SEND traffic).
 #[test]
 fn test_header_format_omits_broadcast_fields_when_unicast() {
-    let msg = InboxMessage {
-        schema_version: 1,
-        id: Some("m-1".into()),
-        from: "from:dev".into(),
-        text: "hi".into(),
-        kind: None,
-        timestamp: "2026-05-07T18:00:00Z".into(),
-        channel: None,
-        delivery_mode: None,
-        force_meta: None,
-        correlation_id: None,
-        reviewed_head: None,
-        read_at: None,
-        thread_id: None,
-        parent_id: None,
-        task_id: None,
-        attachments: vec![],
-        in_reply_to_msg_id: None,
-        in_reply_to_excerpt: None,
-        superseded_by: None,
-        from_id: None,
-        broadcast_context: None,
-        sequencing: None,
-        eta_minutes: None,
-        reporting_cadence: None,
-        worktree_binding_required: None,
-        pr_number: None,
-    };
+    let msg = msg()
+        .id("m-1")
+        .sender("from:dev")
+        .text("hi")
+        .timestamp("2026-05-07T18:00:00Z")
+        .build();
     let header = format_header(&msg);
     assert!(
         !header.contains("broadcast="),
@@ -1384,38 +1159,17 @@ fn test_header_format_omits_broadcast_fields_when_unicast() {
 /// PTY header. Absent field stays absent (no `null` leak).
 #[test]
 fn test_inbox_message_broadcast_context_serde_roundtrip() {
-    let with_ctx = InboxMessage {
-        schema_version: 1,
-        id: Some("m-1".into()),
-        from: "from:lead".into(),
-        text: "t".into(),
-        kind: None,
-        timestamp: "2026-05-07T18:00:00Z".into(),
-        channel: None,
-        delivery_mode: None,
-        force_meta: None,
-        correlation_id: None,
-        reviewed_head: None,
-        read_at: None,
-        thread_id: None,
-        parent_id: None,
-        task_id: None,
-        attachments: vec![],
-        in_reply_to_msg_id: None,
-        in_reply_to_excerpt: None,
-        superseded_by: None,
-        from_id: None,
-        broadcast_context: Some(BroadcastContext {
+    let with_ctx = msg()
+        .id("m-1")
+        .sender("from:lead")
+        .text("t")
+        .timestamp("2026-05-07T18:00:00Z")
+        .broadcast_context(BroadcastContext {
             team: Some("qa-test".to_string()),
             targets: vec!["a".into(), "b".into()],
             count: 2,
-        }),
-        sequencing: None,
-        eta_minutes: None,
-        reporting_cadence: None,
-        worktree_binding_required: None,
-        pr_number: None,
-    };
+        })
+        .build();
     let json = serde_json::to_string(&with_ctx).expect("ser");
     assert!(json.contains("broadcast_context"));
     assert!(json.contains("\"team\":\"qa-test\""));
@@ -1427,11 +1181,6 @@ fn test_inbox_message_broadcast_context_serde_roundtrip() {
 
     let without_ctx = InboxMessage {
         broadcast_context: None,
-        sequencing: None,
-        eta_minutes: None,
-        reporting_cadence: None,
-        worktree_binding_required: None,
-        pr_number: None,
         ..with_ctx
     };
     let json2 = serde_json::to_string(&without_ctx).expect("ser");
@@ -1443,34 +1192,14 @@ fn test_inbox_message_broadcast_context_serde_roundtrip() {
 
 #[test]
 fn test_header_reply_excerpt_present() {
-    let mut msg = InboxMessage {
-        schema_version: 1,
-        id: Some("m-1".into()),
-        from: "u".into(),
-        text: "reply".into(),
-        kind: None,
-        timestamp: "t".into(),
-        channel: None,
-        delivery_mode: None,
-        force_meta: None,
-        correlation_id: None,
-        reviewed_head: None,
-        read_at: None,
-        thread_id: None,
-        parent_id: None,
-        task_id: None,
-        attachments: vec![],
-        in_reply_to_msg_id: Some("42".into()),
-        in_reply_to_excerpt: Some("[bob] original".into()),
-        superseded_by: None,
-        from_id: None,
-        broadcast_context: None,
-        sequencing: None,
-        eta_minutes: None,
-        reporting_cadence: None,
-        worktree_binding_required: None,
-        pr_number: None,
-    };
+    let mut msg = msg()
+        .id("m-1")
+        .sender("u")
+        .text("reply")
+        .timestamp("t")
+        .in_reply_to_msg_id("42")
+        .in_reply_to_excerpt("[bob] original")
+        .build();
     let h = format_header(&msg);
     assert!(h.contains("reply_to_excerpt=[bob] original"), "{h}");
     msg.in_reply_to_excerpt = None;
@@ -1565,34 +1294,14 @@ fn test_inline_long_text_hint_points_at_mcp_tool_not_cli() {
 
 #[test]
 fn test_reply_excerpt_newline_escaped() {
-    let msg = InboxMessage {
-        schema_version: 1,
-        id: Some("m-1".into()),
-        from: "u".into(),
-        text: "r".into(),
-        kind: None,
-        timestamp: "t".into(),
-        channel: None,
-        delivery_mode: None,
-        force_meta: None,
-        correlation_id: None,
-        reviewed_head: None,
-        read_at: None,
-        thread_id: None,
-        parent_id: None,
-        task_id: None,
-        attachments: vec![],
-        in_reply_to_msg_id: Some("42".into()),
-        in_reply_to_excerpt: Some("[b] line1\nline2".into()),
-        superseded_by: None,
-        from_id: None,
-        broadcast_context: None,
-        sequencing: None,
-        eta_minutes: None,
-        reporting_cadence: None,
-        worktree_binding_required: None,
-        pr_number: None,
-    };
+    let msg = msg()
+        .id("m-1")
+        .sender("u")
+        .text("r")
+        .timestamp("t")
+        .in_reply_to_msg_id("42")
+        .in_reply_to_excerpt("[b] line1\nline2")
+        .build();
     let h = format_header(&msg);
     assert!(!h.contains('\n'), "must be single line: {h}");
     assert!(h.contains("reply_to_excerpt="), "{h}");
@@ -1600,34 +1309,14 @@ fn test_reply_excerpt_newline_escaped() {
 
 #[test]
 fn test_format_header_escapes_newlines() {
-    let msg = InboxMessage {
-        schema_version: 1,
-        id: Some("m-1".into()),
-        from: "from:evil\nagent".into(),
-        text: "hello".into(),
-        kind: Some("task\r\ninjection".into()),
-        timestamp: "2026-01-01T00:00:00Z".into(),
-        channel: None,
-        delivery_mode: None,
-        force_meta: None,
-        correlation_id: None,
-        reviewed_head: None,
-        read_at: None,
-        thread_id: Some("t\n1".into()),
-        parent_id: None,
-        task_id: None,
-        attachments: vec![],
-        in_reply_to_msg_id: None,
-        in_reply_to_excerpt: None,
-        superseded_by: None,
-        from_id: None,
-        broadcast_context: None,
-        sequencing: None,
-        eta_minutes: None,
-        reporting_cadence: None,
-        worktree_binding_required: None,
-        pr_number: None,
-    };
+    let msg = msg()
+        .id("m-1")
+        .sender("from:evil\nagent")
+        .text("hello")
+        .kind("task\r\ninjection")
+        .timestamp("2026-01-01T00:00:00Z")
+        .thread_id("t\n1")
+        .build();
     let header = format_header(&msg);
     assert!(
         !header.contains('\n'),
@@ -1646,34 +1335,11 @@ fn test_format_header_escapes_newlines() {
 
 #[test]
 fn test_format_header_escapes_control_chars() {
-    let msg = InboxMessage {
-        schema_version: 1,
-        id: None,
-        from: "from:\x00null\x07bell".into(),
-        text: "t".into(),
-        kind: None,
-        timestamp: "2026-01-01T00:00:00Z".into(),
-        channel: None,
-        delivery_mode: None,
-        force_meta: None,
-        correlation_id: None,
-        reviewed_head: None,
-        read_at: None,
-        thread_id: None,
-        parent_id: None,
-        task_id: None,
-        attachments: vec![],
-        in_reply_to_msg_id: None,
-        in_reply_to_excerpt: None,
-        superseded_by: None,
-        from_id: None,
-        broadcast_context: None,
-        sequencing: None,
-        eta_minutes: None,
-        reporting_cadence: None,
-        worktree_binding_required: None,
-        pr_number: None,
-    };
+    let msg = msg()
+        .sender("from:\x00null\x07bell")
+        .text("t")
+        .timestamp("2026-01-01T00:00:00Z")
+        .build();
     let header = format_header(&msg);
     assert!(
         !header.chars().any(|c| c.is_control() && c != '\x1b'),
@@ -1694,34 +1360,13 @@ fn test_long_msg_above_threshold() {
     let long = "a".repeat(HEADER_SIZE_THRESHOLD + 1);
     assert!(long.len() > HEADER_SIZE_THRESHOLD);
     // format_header produces a compact single-line representation
-    let msg = InboxMessage {
-        schema_version: 1,
-        id: Some("m-1".into()),
-        from: "from:x".into(),
-        text: long,
-        kind: Some("task".into()),
-        timestamp: "2026-01-01T00:00:00Z".into(),
-        channel: None,
-        delivery_mode: None,
-        force_meta: None,
-        correlation_id: None,
-        reviewed_head: None,
-        read_at: None,
-        thread_id: None,
-        parent_id: None,
-        task_id: None,
-        attachments: vec![],
-        in_reply_to_msg_id: None,
-        in_reply_to_excerpt: None,
-        superseded_by: None,
-        from_id: None,
-        broadcast_context: None,
-        sequencing: None,
-        eta_minutes: None,
-        reporting_cadence: None,
-        worktree_binding_required: None,
-        pr_number: None,
-    };
+    let msg = msg()
+        .id("m-1")
+        .sender("from:x")
+        .text_owned(long)
+        .kind("task")
+        .timestamp("2026-01-01T00:00:00Z")
+        .build();
     let header = format_header(&msg);
     assert!(
         header.len() < HEADER_SIZE_THRESHOLD,
@@ -1745,34 +1390,11 @@ fn test_threshold_uses_char_count_not_bytes() {
     assert!(long_cjk.chars().count() > HEADER_SIZE_THRESHOLD);
 
     // format_header size= should report char count, not byte count
-    let msg = InboxMessage {
-        schema_version: 1,
-        id: None,
-        from: "from:x".into(),
-        text: cjk,
-        kind: None,
-        timestamp: "2026-01-01T00:00:00Z".into(),
-        channel: None,
-        delivery_mode: None,
-        force_meta: None,
-        correlation_id: None,
-        reviewed_head: None,
-        read_at: None,
-        thread_id: None,
-        parent_id: None,
-        task_id: None,
-        attachments: vec![],
-        in_reply_to_msg_id: None,
-        in_reply_to_excerpt: None,
-        superseded_by: None,
-        from_id: None,
-        broadcast_context: None,
-        sequencing: None,
-        eta_minutes: None,
-        reporting_cadence: None,
-        worktree_binding_required: None,
-        pr_number: None,
-    };
+    let msg = msg()
+        .sender("from:x")
+        .text_owned(cjk)
+        .timestamp("2026-01-01T00:00:00Z")
+        .build();
     let header = format_header(&msg);
     assert!(
         header.contains("size=100"),
@@ -1905,41 +1527,19 @@ fn legacy_inbox_message_without_excerpt_deserializes() {
 #[test]
 fn inbox_message_with_attachment_roundtrips() {
     use crate::channel::event::{Attachment, AttachmentKind};
-    let msg = InboxMessage {
-        schema_version: 1,
-        id: None,
-        read_at: None,
-        thread_id: None,
-        parent_id: None,
-        task_id: None,
-        force_meta: None,
-        correlation_id: None,
-        reviewed_head: None,
-        from: "user:op".into(),
-        text: "see photo".into(),
-        kind: None,
-        timestamp: "2026-04-26T00:00:00Z".into(),
-        channel: None,
-        delivery_mode: None,
-        attachments: vec![Attachment {
+    let msg = msg()
+        .sender("user:op")
+        .text("see photo")
+        .timestamp("2026-04-26T00:00:00Z")
+        .attachments(vec![Attachment {
             kind: AttachmentKind::Photo,
             path: "/tmp/photo.jpg".into(),
             mime: Some("image/jpeg".into()),
             caption: Some("test".into()),
             size_bytes: Some(1234),
             original_filename: None,
-        }],
-        in_reply_to_msg_id: None,
-        in_reply_to_excerpt: None,
-        superseded_by: None,
-        from_id: None,
-        broadcast_context: None,
-        sequencing: None,
-        eta_minutes: None,
-        reporting_cadence: None,
-        worktree_binding_required: None,
-        pr_number: None,
-    };
+        }])
+        .build();
     let json = serde_json::to_string(&msg).unwrap();
     let back: InboxMessage = serde_json::from_str(&json).unwrap();
     assert_eq!(back.attachments.len(), 1);
@@ -1974,34 +1574,14 @@ fn superseded_by_field_backward_compat() {
 fn mark_ci_watch_superseded_tags_prior_messages() {
     let home = tmp_home("supersede_tag");
     let agent = "test-agent";
-    let msg1 = InboxMessage {
-        schema_version: 0,
-        id: Some("old-1".into()),
-        from: "system:ci".into(),
-        text: "[ci-pass] owner/repo@main: passed ✓".into(),
-        kind: Some("ci-watch".into()),
-        timestamp: "2026-01-01T00:00:00Z".into(),
-        read_at: None,
-        thread_id: None,
-        parent_id: None,
-        task_id: None,
-        force_meta: None,
-        correlation_id: None,
-        reviewed_head: None,
-        channel: None,
-        delivery_mode: None,
-        attachments: vec![],
-        in_reply_to_msg_id: None,
-        in_reply_to_excerpt: None,
-        superseded_by: None,
-        from_id: None,
-        broadcast_context: None,
-        sequencing: None,
-        eta_minutes: None,
-        reporting_cadence: None,
-        worktree_binding_required: None,
-        pr_number: None,
-    };
+    let msg1 = msg()
+        .schema_version(0)
+        .id("old-1")
+        .sender("system:ci")
+        .text("[ci-pass] owner/repo@main: passed ✓")
+        .kind("ci-watch")
+        .timestamp("2026-01-01T00:00:00Z")
+        .build();
     enqueue(&home, agent, msg1).unwrap();
     mark_ci_watch_superseded(&home, agent, "owner/repo@main", "new-msg-id");
     let msgs = drain(&home, agent);
@@ -2016,62 +1596,22 @@ fn mark_ci_watch_superseded_tags_prior_messages() {
 fn drain_excludes_superseded_messages() {
     let home = tmp_home("drain_superseded");
     let agent = "test-agent";
-    let normal = InboxMessage {
-        schema_version: 0,
-        id: Some("normal-1".into()),
-        from: "from:lead".into(),
-        text: "hello".into(),
-        kind: None,
-        timestamp: "2026-01-01T00:00:00Z".into(),
-        read_at: None,
-        thread_id: None,
-        parent_id: None,
-        task_id: None,
-        force_meta: None,
-        correlation_id: None,
-        reviewed_head: None,
-        channel: None,
-        delivery_mode: None,
-        attachments: vec![],
-        in_reply_to_msg_id: None,
-        in_reply_to_excerpt: None,
-        superseded_by: None,
-        from_id: None,
-        broadcast_context: None,
-        sequencing: None,
-        eta_minutes: None,
-        reporting_cadence: None,
-        worktree_binding_required: None,
-        pr_number: None,
-    };
-    let superseded = InboxMessage {
-        schema_version: 0,
-        id: Some("old-ci".into()),
-        from: "system:ci".into(),
-        text: "[ci-pass] repo@main".into(),
-        kind: Some("ci-watch".into()),
-        timestamp: "2026-01-01T00:00:01Z".into(),
-        read_at: None,
-        thread_id: None,
-        parent_id: None,
-        task_id: None,
-        force_meta: None,
-        correlation_id: None,
-        reviewed_head: None,
-        channel: None,
-        delivery_mode: None,
-        attachments: vec![],
-        in_reply_to_msg_id: None,
-        in_reply_to_excerpt: None,
-        superseded_by: Some("new-ci".into()),
-        from_id: None,
-        broadcast_context: None,
-        sequencing: None,
-        eta_minutes: None,
-        reporting_cadence: None,
-        worktree_binding_required: None,
-        pr_number: None,
-    };
+    let normal = msg()
+        .schema_version(0)
+        .id("normal-1")
+        .sender("from:lead")
+        .text("hello")
+        .timestamp("2026-01-01T00:00:00Z")
+        .build();
+    let superseded = msg()
+        .schema_version(0)
+        .id("old-ci")
+        .sender("system:ci")
+        .text("[ci-pass] repo@main")
+        .kind("ci-watch")
+        .timestamp("2026-01-01T00:00:01Z")
+        .superseded_by("new-ci")
+        .build();
     enqueue(&home, agent, normal).unwrap();
     enqueue(&home, agent, superseded).unwrap();
     let msgs = drain(&home, agent);
@@ -2082,34 +1622,14 @@ fn drain_excludes_superseded_messages() {
 
 #[test]
 fn from_id_round_trip() {
-    let msg = InboxMessage {
-        schema_version: 0,
-        id: Some("m-1".into()),
-        from: "from:dev".into(),
-        from_id: Some("a3k9p2xf".into()),
-        text: "hello".into(),
-        kind: None,
-        timestamp: "2026-01-01T00:00:00Z".into(),
-        read_at: None,
-        thread_id: None,
-        parent_id: None,
-        task_id: None,
-        force_meta: None,
-        correlation_id: None,
-        reviewed_head: None,
-        channel: None,
-        delivery_mode: None,
-        attachments: vec![],
-        in_reply_to_msg_id: None,
-        in_reply_to_excerpt: None,
-        superseded_by: None,
-        broadcast_context: None,
-        sequencing: None,
-        eta_minutes: None,
-        reporting_cadence: None,
-        worktree_binding_required: None,
-        pr_number: None,
-    };
+    let msg = msg()
+        .schema_version(0)
+        .id("m-1")
+        .sender("from:dev")
+        .sender_id("a3k9p2xf")
+        .text("hello")
+        .timestamp("2026-01-01T00:00:00Z")
+        .build();
     let json = serde_json::to_string(&msg).expect("serialize");
     let parsed: InboxMessage = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(parsed.from_id, Some("a3k9p2xf".to_string()));
