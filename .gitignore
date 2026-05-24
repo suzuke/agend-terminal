@@ -4,7 +4,7 @@
 sessions/
 workspaces/
 decisions/
-inbox/
+/inbox/
 metadata/
 downloads/
 .schedule_last_check
