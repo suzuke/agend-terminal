@@ -1025,7 +1025,8 @@ mod tests {
         // Simulate dry-run: classify returns Some(RateLimit), but we only log, don't set.
         let mut h = HealthTracker::new();
         let backend = crate::backend::Backend::ClaudeCode;
-        let output = "Error: 429 overloaded";
+        // #1125 M4: updated to use canonical for_backend pattern
+        let output = "Server is temporarily limiting requests";
         let reason = crate::state::classify_pty_output(&backend, output);
         assert!(reason.is_some(), "should classify as blocked");
 
