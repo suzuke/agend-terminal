@@ -1011,15 +1011,7 @@ async fn fan_out_notifications(
                 if action_target_on_success.as_deref() == Some(sub.as_str()) {
                     continue;
                 }
-                let in_registry = {
-                    let reg = agent::lock_registry(registry);
-                    if let Some(handle) = reg.get(sub) {
-                        let _ = agent::inject_to_agent(handle, headline.as_bytes());
-                        true
-                    } else {
-                        false
-                    }
-                };
+                let in_registry = agent::lock_registry(registry).contains_key(sub);
                 let fleet_known =
                     crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(ctx.home))
                         .ok()
