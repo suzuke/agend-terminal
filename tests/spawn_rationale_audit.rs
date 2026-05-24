@@ -118,6 +118,58 @@ fn is_exempted_file(rel_path: &str) -> bool {
         .any(|(suffix, _)| rel_path.ends_with(suffix))
 }
 
+/// Test-only file detection: files loaded via `#[cfg(test)] #[path = "file.rs"]`
+/// in a parent module are entirely test code and should be skipped.
+fn is_test_only_file(path: &Path) -> bool {
+    let parent = match path.parent() {
+        Some(p) => p,
+        None => return false,
+    };
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    let path_needle = format!("\"{filename}\"");
+    let Ok(siblings) = std::fs::read_dir(parent) else {
+        return false;
+    };
+    for sibling in siblings.flatten() {
+        let sp = sibling.path();
+        if sp == *path || sp.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&sp) else {
+            continue;
+        };
+        let lines: Vec<&str> = content.lines().collect();
+        for (idx, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            if !(trimmed.starts_with("#[path") && trimmed.contains(&path_needle)) {
+                continue;
+            }
+            let mut cursor = idx;
+            for _ in 0..5 {
+                let Some(prev) = cursor.checked_sub(1).and_then(|i| lines.get(i)) else {
+                    break;
+                };
+                let ptrim = prev.trim();
+                if ptrim.is_empty() || ptrim.starts_with("//") {
+                    cursor -= 1;
+                    continue;
+                }
+                if ptrim.starts_with("#[") && ptrim.contains("cfg") && ptrim.contains("test") {
+                    return true;
+                }
+                if !ptrim.starts_with("#[") {
+                    break;
+                }
+                cursor -= 1;
+            }
+        }
+    }
+    false
+}
+
 fn is_spawn_call_line(line: &str) -> bool {
     let trim = line.trim_start();
     if trim.starts_with("//") || trim.starts_with("///") || trim.starts_with("//!") {
@@ -148,7 +200,7 @@ fn spawn_rationale_present_at_every_in_scope_spawn_site() {
 
     for path in rust_files_in_src() {
         let rel = rel_path_str(&path, &src_root);
-        if is_exempted_file(&rel) {
+        if is_exempted_file(&rel) || is_test_only_file(&path) {
             continue;
         }
         let Ok(content) = std::fs::read_to_string(&path) else {

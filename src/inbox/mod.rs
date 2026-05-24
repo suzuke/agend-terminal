@@ -21,7 +21,7 @@ pub mod storage;
 pub use message::{BroadcastContext, ForceMeta, InboxMessage, MessageStatus, NotifySource};
 
 // Disk health
-pub use disk::{check_disk_space, is_readonly, recover_half_writes};
+pub use disk::{check_disk_space, recover_half_writes};
 
 // Storage CRUD (pub)
 pub use storage::{
@@ -33,14 +33,22 @@ pub(crate) use storage::inbox_path_resolved;
 
 // Notification & PTY injection (pub)
 pub use notify::{
-    compose_aware_inject, deliver, enqueue_with_idle_hint, format_event_header, format_header,
-    format_notification_for_inject, inject_notification_with_submit, notify_agent,
-    notify_agent_with_attachments, pointer_only_inject, AGENT_MSG_PREFIX, HEADER_PREFIX,
-    HEADER_SIZE_THRESHOLD, PENDING_HEADER_PREFIX, SYSTEM_MSG_PREFIX,
+    compose_aware_inject, deliver, enqueue_with_idle_hint, format_event_header,
+    inject_notification_with_submit, notify_agent, notify_agent_with_attachments,
+    AGENT_MSG_PREFIX, SYSTEM_MSG_PREFIX,
 };
 // Notification & PTY injection (pub(crate))
+pub(crate) use notify::build_excerpt;
+
+// Items below are only consumed by test code (inbox/tests.rs, poller_tests, etc.)
+#[cfg(test)]
+pub use notify::{
+    format_header, format_notification_for_inject, pointer_only_inject, HEADER_PREFIX,
+    HEADER_SIZE_THRESHOLD, PENDING_HEADER_PREFIX,
+};
+#[cfg(test)]
 pub(crate) use notify::{
-    attachment_body_placeholder, build_excerpt, enqueue_with_idle_hint_with_emitter,
+    attachment_body_placeholder, enqueue_with_idle_hint_with_emitter,
     should_suppress_911_reinject_with_ledger, summarize_attachments_for_header,
 };
 
