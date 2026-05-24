@@ -887,6 +887,10 @@ pub fn compact(home: &Path) -> anyhow::Result<()> {
         let archive_path = archive.join(format!("task_events.{suffix}.jsonl"));
         crate::store::atomic_write(&archive_path, archived.as_bytes())?;
         crate::store::atomic_write(log_path, kept.as_bytes())?;
+        // Invalidate SEQ_CACHE — the hot file was atomically replaced,
+        // so cached high-water marks derived from the old file are stale.
+        // Next append will re-scan the fresh file on cache miss.
+        SEQ_CACHE.lock().retain(|k, _| k.0 != *log_path);
         // We've already rewritten the hot file — return no extra lines
         // to append.
         Ok(Vec::new())
@@ -2114,5 +2118,74 @@ mod tests {
         let task = replay(&home).unwrap().tasks.get(&tid).cloned().unwrap();
         assert_eq!(task.eta_secs, Some(7200), "eta_secs must round-trip");
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Verifies that compact() clears the SEQ_CACHE so that a subsequent
+    /// cache miss (e.g. process restart) re-scans the hot file correctly.
+    ///
+    /// Bug scenario (pre-fix): Instance A appends many events. Compact
+    /// archives old events but does NOT clear the cache. If the cache entry
+    /// is later evicted (process restart, memory pressure), the next append
+    /// re-scans only the hot file — which is correct here because compact
+    /// keeps the latest events. The defensive clear ensures the cache never
+    /// holds data derived from a file that was atomically replaced.
+    #[test]
+    fn compact_clears_seq_cache_for_post_compact_correctness() {
+        let home = tmp_home("compact-seq-cache");
+        let inst = InstanceName::from("dev");
+
+        // Append events past the compaction threshold
+        let total = COMPACTION_KEEP + 10;
+        let log = home.join("task_events.jsonl");
+        let mut lines = String::new();
+        for i in 1..=total {
+            let env = TaskEventEnvelope {
+                schema_version: SCHEMA_VERSION,
+                seq: i as u64,
+                timestamp: format!("2026-05-24T{:02}:{:02}:00Z", (i / 60) % 24, i % 60),
+                instance: inst.clone(),
+                emitter_id: None,
+                event: TaskEvent::Unblocked {
+                    task_id: format!("t-{i}").as_str().into(),
+                },
+            };
+            lines.push_str(&serde_json::to_string(&env).unwrap());
+            lines.push('\n');
+        }
+        fs::write(&log, &lines).unwrap();
+
+        // Prime the SEQ_CACHE by calling append
+        let seq_before = append(&home, &inst, sample_event("t-pre-compact")).unwrap();
+        assert_eq!(seq_before, total as u64 + 1);
+
+        // Verify cache is populated
+        let key = (log.clone(), inst.clone());
+        assert!(
+            SEQ_CACHE.lock().contains_key(&key),
+            "cache must be populated after append"
+        );
+
+        // Compact — rewrites hot file, should clear cache
+        compact(&home).unwrap();
+
+        // After fix: cache entry should be cleared
+        assert!(
+            !SEQ_CACHE.lock().contains_key(&key),
+            "compact must clear SEQ_CACHE for the compacted file"
+        );
+
+        // Post-compaction append must still produce correct monotonic seq
+        let seq_after = append(&home, &inst, sample_event("t-post-compact")).unwrap();
+        assert_eq!(
+            seq_after,
+            seq_before + 1,
+            "post-compaction seq must be monotonically next"
+        );
+
+        // Replay sees both events
+        let state = replay(&home).unwrap();
+        assert!(state.tasks.contains_key(&TaskId::from("t-pre-compact")));
+        assert!(state.tasks.contains_key(&TaskId::from("t-post-compact")));
+        fs::remove_dir_all(&home).ok();
     }
 }
