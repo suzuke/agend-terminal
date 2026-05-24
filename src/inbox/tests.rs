@@ -2443,3 +2443,165 @@ fn t14_pr_ready_for_merge_load_bearing_emits_hint() {
     assert_eq!(drained[0].kind.as_deref(), Some("pr-ready-for-merge"));
     fs::remove_dir_all(&home).ok();
 }
+
+// --- #1112 characterization tests for scan optimizations ---
+
+#[test]
+fn m4_drain_returns_correct_unread_no_duplicates() {
+    let home = tmp_home("1112-m4-drain");
+    enqueue(&home, "a", make_msg("alice", "msg1")).unwrap();
+    enqueue(&home, "a", make_msg("bob", "msg2")).unwrap();
+    enqueue(&home, "a", make_msg("carol", "msg3")).unwrap();
+
+    let drained = drain(&home, "a");
+    assert_eq!(drained.len(), 3);
+    assert_eq!(drained[0].text, "msg1");
+    assert_eq!(drained[1].text, "msg2");
+    assert_eq!(drained[2].text, "msg3");
+    assert!(drained.iter().all(|m| m.read_at.is_some()));
+
+    // All messages remain in the JSONL file after drain
+    let path = super::storage::inbox_path(&home, "a");
+    let content = fs::read_to_string(&path).unwrap();
+    let persisted: Vec<InboxMessage> = content
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    assert_eq!(persisted.len(), 3, "all messages persisted");
+    assert!(
+        persisted.iter().all(|m| m.read_at.is_some()),
+        "all have read_at on disk"
+    );
+
+    // Second drain returns empty
+    assert!(drain(&home, "a").is_empty());
+    fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn m4_drain_mixed_read_unread() {
+    let home = tmp_home("1112-m4-mixed");
+    enqueue(&home, "a", make_msg("alice", "first")).unwrap();
+    drain(&home, "a"); // mark first as read
+
+    enqueue(&home, "a", make_msg("bob", "second")).unwrap();
+    let drained = drain(&home, "a");
+    assert_eq!(drained.len(), 1);
+    assert_eq!(drained[0].text, "second");
+    fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn m1_supersede_preserves_non_matching_messages() {
+    let home = tmp_home("1112-m1-preserve");
+    let agent = "dev";
+
+    // Enqueue a normal message and a ci-watch message
+    enqueue(&home, agent, make_msg("from:lead", "task dispatch")).unwrap();
+    let mut ci = make_msg("system:ci", "[ci-pass] owner/repo@main: passed");
+    ci.kind = Some("ci-watch".to_string());
+    enqueue(&home, agent, ci).unwrap();
+
+    super::storage::mark_ci_watch_superseded(&home, agent, "owner/repo@main", "new-id");
+
+    // The normal message should drain normally
+    let drained = drain(&home, agent);
+    assert_eq!(drained.len(), 1);
+    assert_eq!(drained[0].text, "task dispatch");
+    fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn m1_supersede_skips_already_read() {
+    let home = tmp_home("1112-m1-read");
+    let agent = "dev";
+
+    let mut ci = make_msg("system:ci", "[ci-pass] owner/repo@main: ok");
+    ci.kind = Some("ci-watch".to_string());
+    enqueue(&home, agent, ci).unwrap();
+
+    // Drain to mark as read
+    drain(&home, agent);
+
+    // Supersede should not affect already-read messages
+    super::storage::mark_ci_watch_superseded(&home, agent, "owner/repo@main", "new-id");
+
+    let path = super::storage::inbox_path(&home, agent);
+    let content = fs::read_to_string(&path).unwrap();
+    let msg: InboxMessage = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+    assert!(
+        msg.superseded_by.is_none(),
+        "already-read should not be superseded"
+    );
+    fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn m3_get_thread_with_instance_direct_path() {
+    let home = tmp_home("1112-m3-thread");
+    let mut msg1 = make_msg("from:lead", "thread msg 1");
+    msg1.thread_id = Some("t-abc".to_string());
+    enqueue(&home, "agent1", msg1).unwrap();
+
+    let mut msg2 = make_msg("from:dev", "thread msg 2");
+    msg2.thread_id = Some("t-abc".to_string());
+    enqueue(&home, "agent1", msg2).unwrap();
+
+    // Unrelated message in different agent's inbox
+    let mut other = make_msg("from:lead", "other thread");
+    other.thread_id = Some("t-xyz".to_string());
+    enqueue(&home, "agent2", other).unwrap();
+
+    // With instance filter — direct path
+    let thread = super::storage::get_thread(&home, "t-abc", Some("agent1"));
+    assert_eq!(thread.len(), 2);
+
+    // Without instance filter — scans all
+    let thread_all = super::storage::get_thread(&home, "t-abc", None);
+    assert_eq!(thread_all.len(), 2);
+
+    // Cross-agent thread
+    let mut msg3 = make_msg("from:lead", "thread msg 3");
+    msg3.thread_id = Some("t-abc".to_string());
+    enqueue(&home, "agent2", msg3).unwrap();
+    let thread_cross = super::storage::get_thread(&home, "t-abc", None);
+    assert_eq!(thread_cross.len(), 3);
+    fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn m2_enqueue_returning_unread_count_accuracy() {
+    let home = tmp_home("1112-m2-count");
+    let count1 =
+        super::storage::enqueue_returning_unread_count(&home, "a", make_msg("x", "1")).unwrap();
+    assert_eq!(count1, 1);
+
+    let count2 =
+        super::storage::enqueue_returning_unread_count(&home, "a", make_msg("x", "2")).unwrap();
+    assert_eq!(count2, 2);
+
+    // Drain marks everything as read
+    drain(&home, "a");
+
+    let count3 =
+        super::storage::enqueue_returning_unread_count(&home, "a", make_msg("x", "3")).unwrap();
+    assert_eq!(count3, 1, "only the new message is unread after drain");
+    fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn m2_hint_uses_merged_enqueue_count() {
+    let home = tmp_home("1112-m2-hint");
+    enqueue(&home, "a", make_msg("seed", "pre")).unwrap();
+
+    let captured = capture_hint();
+    let captured_clone = captured.clone();
+    enqueue_with_idle_hint_with_emitter(&home, "a", make_msg("system:ci", "new"), move |hint| {
+        *captured_clone.lock() = Some(hint.to_string());
+    })
+    .unwrap();
+
+    let got = captured.lock().clone().expect("hint emitted");
+    assert!(got.contains("inbox=2"), "should show 2 unread: {got:?}");
+    fs::remove_dir_all(&home).ok();
+}
