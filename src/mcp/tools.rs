@@ -198,7 +198,7 @@ fn schedule_tools() -> Vec<Value> {
             "inputSchema": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": ["create", "list", "update", "delete"]},
                 "id": {"type": "string"},
-                "cron": {"type": "string", "description": "5- or 6-field cron expression (recurring)."},
+                "cron": {"type": "string", "description": "5- or 6-field cron expression (recurring). 5-field layout: `min hour day-of-month month day-of-week`; 6-field prepends seconds. Day-of-week uses Quartz convention: 1=Sun, 2=Mon, 3=Tue, 4=Wed, 5=Thu, 6=Fri, 7=Sat (NOT Unix 0-6). Example: every Wed+Sat at 15:00 → `0 15 * * 4,7`."},
                 "run_at": {"type": "string", "description": "ISO 8601 one-shot instant."},
                 "message": {"type": "string"}, "target": {"type": "string"},
                 "label": {"type": "string"},
