@@ -16,19 +16,16 @@ pub const PROTOCOL_VERSION: u8 = 1;
 pub const DEFAULT_FRAME_LIMIT: usize = 1_000_000;
 
 pub fn write_frame(w: &mut impl Write, data: &[u8]) -> std::io::Result<()> {
+    write_tagged(w, TAG_DATA, data)
+}
+
+pub fn write_tagged(w: &mut impl Write, tag: u8, data: &[u8]) -> std::io::Result<()> {
     if data.len() > DEFAULT_FRAME_LIMIT {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "frame too large",
         ));
     }
-    w.write_all(&[TAG_DATA])?;
-    w.write_all(&(data.len() as u32).to_be_bytes())?;
-    w.write_all(data)?;
-    w.flush()
-}
-
-pub fn write_tagged(w: &mut impl Write, tag: u8, data: &[u8]) -> std::io::Result<()> {
     w.write_all(&[tag])?;
     w.write_all(&(data.len() as u32).to_be_bytes())?;
     w.write_all(data)?;
@@ -208,5 +205,23 @@ mod tests {
         assert_eq!(PROTOCOL_VERSION, 1);
         // DEFAULT_FRAME_LIMIT is a positive const — checked at compile time.
         const _: () = assert!(DEFAULT_FRAME_LIMIT > 0);
+    }
+
+    #[test]
+    fn write_tagged_rejects_oversized_frame() {
+        let mut buf = Vec::new();
+        let data = vec![0u8; DEFAULT_FRAME_LIMIT + 1];
+        let result = write_tagged(&mut buf, TAG_DATA, &data);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn write_frame_delegates_to_write_tagged() {
+        let mut buf_frame = Vec::new();
+        let mut buf_tagged = Vec::new();
+        write_frame(&mut buf_frame, b"same").expect("write_frame");
+        write_tagged(&mut buf_tagged, TAG_DATA, b"same").expect("write_tagged");
+        assert_eq!(buf_frame, buf_tagged);
     }
 }
