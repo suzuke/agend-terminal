@@ -78,10 +78,10 @@ pub(super) fn handle_send_to_instance(
     if *sender == target {
         return json!({"error": "cannot send to self — use a different instance_name"});
     }
-    let text = args["message"]
-        .as_str()
-        .or_else(|| args["text"].as_str())
-        .unwrap_or("");
+    let text = match args["message"].as_str().or_else(|| args["text"].as_str()) {
+        Some(t) if !t.is_empty() => t,
+        _ => return json!({"error": "missing or empty 'message'"}),
+    };
     let kind = args["request_kind"]
         .as_str()
         .or_else(|| args["kind"].as_str());
@@ -180,18 +180,8 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
         None => return json!({"error": "missing 'task'"}),
     };
 
-    // Busy gate: check if target has claimed tasks on the task board.
-    // New names: force/force_reason. Old names: interrupt/reason (backwards-compat).
-    let force = args
-        .get("force")
-        .and_then(|v| v.as_bool())
-        .or_else(|| args.get("interrupt").and_then(|v| v.as_bool()))
-        .unwrap_or(false);
-    let force_reason = args
-        .get("force_reason")
-        .and_then(|v| v.as_str())
-        .or_else(|| args.get("reason").and_then(|v| v.as_str()));
-    let used_deprecated = args.get("interrupt").is_some() || args.get("reason").is_some();
+    let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+    let force_reason = args.get("force_reason").and_then(|v| v.as_str());
     let claimed_tasks: Vec<_> = crate::tasks::list_all(home)
         .into_iter()
         .filter(|t| t.assignee.as_deref() == Some(target) && t.status == "claimed")
@@ -199,7 +189,7 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
     if !claimed_tasks.is_empty() {
         if force {
             if force_reason.is_none() || force_reason == Some("") {
-                return json!({"error": "force=true requires a non-empty 'force_reason' (or deprecated 'reason')"});
+                return json!({"error": "force=true requires a non-empty 'force_reason'"});
             }
         } else {
             let current = &claimed_tasks[0];
@@ -423,14 +413,6 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
         }));
     }
     let mut result = result;
-    if used_deprecated {
-        if let Some(obj) = result.as_object_mut() {
-            obj.insert(
-                "warning".into(),
-                json!("interrupt/reason fields deprecated, use force/force_reason; will be removed Sprint 11"),
-            );
-        }
-    }
     if let Some(tid) = auto_created_task_id {
         if let Some(obj) = result.as_object_mut() {
             obj.insert("auto_created_task_id".into(), json!(tid));

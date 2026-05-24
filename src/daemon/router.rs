@@ -117,12 +117,14 @@ fn run_loop(home: PathBuf, reg_rx: crossbeam_channel::Receiver<AgentSubscription
             }
         }
 
-        // Remove dead channels.
-        buffers.retain(|_, buf| {
-            matches!(
-                buf.rx.try_recv(),
-                Ok(_) | Err(crossbeam_channel::TryRecvError::Empty)
-            )
+        buffers.retain(|_, buf| match buf.rx.try_recv() {
+            Ok(data) => {
+                let text = String::from_utf8_lossy(&data);
+                buf.buffer.push_str(&text);
+                true
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => true,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => false,
         });
 
         if !had_activity {
@@ -167,7 +169,11 @@ fn try_dispatch_mirror(home: &std::path::Path, name: &str, buf: &mut AgentBuffer
     }
 
     let mirror_text = if text.len() > MAX_MIRROR_LEN {
-        &text[..MAX_MIRROR_LEN]
+        let mut end = MAX_MIRROR_LEN;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        &text[..end]
     } else {
         text
     };
@@ -232,6 +238,7 @@ fn strip_ansi_simple(s: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -381,6 +388,65 @@ mod tests {
 
         crate::channel::reset_active_channel_for_test();
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn mirror_truncation_safe_on_multibyte_utf8() {
+        let _g = registry_guard();
+        crate::channel::reset_active_channel_for_test();
+
+        let tg = RecordingMockChannel::arc("telegram");
+        crate::channel::register_active_channel(tg.clone());
+
+        let agent = "test_mirror_utf8";
+        crate::daemon::heartbeat_pair::update_with(agent, |p| {
+            p.reply_to_channel = Some("telegram".into());
+            p.reply_to_input_id = Some(42);
+            p.mirror_dispatched_for_turn = false;
+            p.mirror_skip_until_next_turn = false;
+            p.last_mirror_event_id = None;
+        });
+
+        let home = std::env::temp_dir().join(format!("agend-router-utf8-{}", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+
+        // Build a string that has multibyte chars near MAX_MIRROR_LEN boundary
+        let prefix = "x".repeat(MAX_MIRROR_LEN - 2);
+        let text = format!("{prefix}日本語"); // 3-byte chars right at the boundary
+        let mut buf = make_buffer(&text);
+        // Must not panic
+        try_dispatch_mirror(&home, agent, &mut buf);
+        assert_eq!(tg.count(), 1);
+
+        crate::channel::reset_active_channel_for_test();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn retain_preserves_received_data() {
+        let (tx, rx) = crossbeam_channel::bounded::<Vec<u8>>(8);
+        let mut buffers = std::collections::HashMap::new();
+        buffers.insert(
+            "agent".to_string(),
+            AgentBuffer {
+                rx,
+                buffer: String::new(),
+                active: false,
+                last_output_at: Instant::now(),
+                input_id: None,
+            },
+        );
+        tx.send(b"hello".to_vec()).unwrap();
+        buffers.retain(|_, buf| match buf.rx.try_recv() {
+            Ok(data) => {
+                let text = String::from_utf8_lossy(&data);
+                buf.buffer.push_str(&text);
+                true
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => true,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => false,
+        });
+        assert_eq!(buffers["agent"].buffer, "hello");
     }
 
     #[test]

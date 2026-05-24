@@ -1539,10 +1539,9 @@ fn test_interrupt_handler_validates_target() {
 // --- Sprint 10: backwards-compat for old interrupt/reason names ---
 
 #[test]
-fn test_delegate_task_old_interrupt_true_still_works() {
-    // Old callers using interrupt=true + reason should still work
+fn test_delegate_task_old_interrupt_field_no_longer_bypasses_busy_gate() {
     let _g = fleet_test_guard();
-    let home = tmp_home("old-interrupt-compat");
+    let home = tmp_home("old-interrupt-removed");
     std::fs::write(
         crate::fleet::fleet_yaml_path(&home),
         "instances:\n  target:\n    backend: claude\n  sender:\n    backend: claude\n",
@@ -1558,23 +1557,14 @@ fn test_delegate_task_old_interrupt_true_still_works() {
     let tid = tasks["tasks"][0]["id"].as_str().unwrap();
     crate::tasks::handle(&home, "target", &json!({"action": "claim", "id": tid}));
 
-    // Use OLD names: interrupt + reason
     let result = handle_tool(
         "send",
         &json!({"target_instance": "target", "task": "urgent", "message": "urgent", "request_kind": "task", "task_id": "t-test-fixture", "interrupt": true, "reason": "legacy caller"}),
         "sender",
     );
-    // Should bypass busy gate (backwards-compat) + emit deprecation warning
     assert!(
-        result.get("busy").is_none(),
-        "old interrupt=true must still bypass busy gate: {result}"
-    );
-    assert!(
-        result["warning"]
-            .as_str()
-            .unwrap_or("")
-            .contains("deprecated"),
-        "old names must emit deprecation warning: {result}"
+        result.get("busy").is_some(),
+        "old interrupt field must NOT bypass busy gate after removal: {result}"
     );
     std::env::remove_var("AGEND_HOME");
     std::fs::remove_dir_all(&home).ok();
