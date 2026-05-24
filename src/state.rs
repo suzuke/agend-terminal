@@ -163,8 +163,34 @@ pub struct StatePatterns {
 impl StatePatterns {
     /// Pattern sources: [実測] = verified from real capture, [文件] = from docs/source, [推測] = estimated
     /// Tested versions: Claude v2.1.89, Codex v0.118.0, OpenCode v1.4.0, Gemini v0.37.1
+    ///
+    /// #1125 M3: cached per-backend via `OnceLock` — regex compilation
+    /// happens once per variant per process, not on every call.
     #[allow(clippy::unwrap_used)] // patterns are const — compile failure is a code bug
-    pub fn for_backend(backend: &Backend) -> Self {
+    pub fn for_backend(backend: &Backend) -> &'static Self {
+        use std::sync::OnceLock;
+        static CLAUDE: OnceLock<StatePatterns> = OnceLock::new();
+        static KIRO: OnceLock<StatePatterns> = OnceLock::new();
+        static CODEX: OnceLock<StatePatterns> = OnceLock::new();
+        static OPENCODE: OnceLock<StatePatterns> = OnceLock::new();
+        static GEMINI: OnceLock<StatePatterns> = OnceLock::new();
+        static AGY: OnceLock<StatePatterns> = OnceLock::new();
+        static EMPTY: OnceLock<StatePatterns> = OnceLock::new();
+
+        let lock = match backend {
+            Backend::ClaudeCode => &CLAUDE,
+            Backend::KiroCli => &KIRO,
+            Backend::Codex => &CODEX,
+            Backend::OpenCode => &OPENCODE,
+            Backend::Gemini => &GEMINI,
+            Backend::Agy => &AGY,
+            Backend::Shell | Backend::Raw(_) => &EMPTY,
+        };
+        lock.get_or_init(|| Self::compile_for(backend))
+    }
+
+    #[allow(clippy::unwrap_used)]
+    fn compile_for(backend: &Backend) -> Self {
         let patterns = match backend {
             // Claude Code v2.1.89
             Backend::ClaudeCode => vec![
@@ -238,7 +264,7 @@ impl StatePatterns {
                 // gate excludes them via `AgentState::is_transient_error()`.
                 (
                     AgentState::UsageLimit,
-                    r"You've hit your session limit|You've hit your weekly limit|You've hit your Opus limit|Credit balance is too low",
+                    r"You've hit your session limit|You've hit your weekly limit|You've hit your Opus limit|Credit balance is too low|credit_balance_too_low",
                 ),
                 // [docs] Auto-compaction on context limit
                 (
@@ -556,11 +582,6 @@ impl StatePatterns {
                     AgentState::AuthError,
                     r"OAuth not authenticated|OAuth expired|UNAUTHENTICATED|check API key",
                 ),
-                // [docs] Usage limit messages
-                (
-                    AgentState::UsageLimit,
-                    r"Usage limit reached|Access resets at",
-                ),
                 // #848 PR-B narrowed bare `\b429\b` to specific
                 // gemini-cli verbatim wordings (issues #10722/#8437/
                 // #22545/#2305/#1502). #854 follow-up further drops
@@ -596,6 +617,17 @@ impl StatePatterns {
                 (
                     AgentState::RateLimit,
                     r"429 RESOURCE_EXHAUSTED|rateLimitExceeded|got status: 429|429 Too Many Requests",
+                ),
+                // [docs] Usage limit messages
+                // #1125 M4: added `RESOURCE_EXHAUSTED` — the gRPC status
+                // code for quota exhaustion. Positioned AFTER RateLimit so
+                // the more specific `429 RESOURCE_EXHAUSTED` (transient)
+                // matches first; bare `RESOURCE_EXHAUSTED` (permanent
+                // quota) falls through to this pattern. Pre-#1125 this
+                // was only in classify_pty_output's divergent regex set.
+                (
+                    AgentState::UsageLimit,
+                    r"Usage limit reached|Access resets at|RESOURCE_EXHAUSTED",
                 ),
                 // [docs] Token/quota limit
                 (AgentState::ContextFull, r"quota.*exceeded|token.*limit"),
@@ -710,76 +742,32 @@ impl StatePatterns {
 /// Classify PTY output into a [`BlockedReason`] for the given backend.
 ///
 /// Returns `None` when the output does not match any known error pattern.
-/// Uses simple substring/regex checks aligned with the per-backend patterns
-/// in [`StatePatterns::for_backend`].
+///
+/// #1125 M4: delegates to [`StatePatterns::for_backend`] as the single
+/// source of truth for per-backend regex patterns. The pre-#1125 version
+/// maintained a separate set of `LazyLock` regexes that diverged from
+/// `for_backend`'s canonical patterns (e.g. pre-#848 broad `rate.?limit`
+/// survived here after `for_backend` narrowed it). Now both callers
+/// — `StateTracker::feed()` and `classify_pty_output()` — run against
+/// the same compiled patterns.
 ///
 /// Stacking dep: production caller wired in S2-T4 (daemon watchdog).
-#[allow(dead_code, clippy::collapsible_match)]
+#[allow(dead_code)]
 pub fn classify_pty_output(
     backend: &crate::backend::Backend,
     output: &str,
 ) -> Option<crate::health::BlockedReason> {
-    use crate::backend::Backend;
     use crate::health::BlockedReason;
 
-    // G1: cached regexes via LazyLock — compiled once, not per-call
-    macro_rules! cached_re {
-        ($name:ident, $pat:expr) => {
-            static $name: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-                regex::Regex::new($pat).expect(concat!("regex: ", $pat))
-            });
-        };
+    let patterns = StatePatterns::for_backend(backend);
+    let (state, _) = patterns.detect_with_match(output)?;
+    match state {
+        AgentState::UsageLimit => Some(BlockedReason::QuotaExceeded),
+        AgentState::RateLimit | AgentState::ServerRateLimit => Some(BlockedReason::RateLimit {
+            retry_after_secs: None,
+        }),
+        _ => None,
     }
-    cached_re!(RE_CLAUDE_QUOTA, r"(?i)credit_balance_too_low");
-    cached_re!(RE_CLAUDE_RATE, r"(?i)overloaded|rate.?limit|\b429\b");
-    cached_re!(
-        RE_KIRO_QUOTA,
-        r"ServiceQuotaExceeded|InsufficientModelCapacity"
-    );
-    cached_re!(RE_KIRO_RATE, r"Too Many Requests|ThrottlingError|\b429\b");
-    cached_re!(RE_CODEX_QUOTA, r"hit your usage limit|try again at");
-    cached_re!(RE_CODEX_RATE, r"(?i)rate.?limit|\b429\b");
-    cached_re!(RE_GEMINI_RATE, r"RESOURCE_EXHAUSTED|\b429\b");
-
-    match backend {
-        Backend::ClaudeCode => {
-            if RE_CLAUDE_QUOTA.is_match(output) {
-                return Some(BlockedReason::QuotaExceeded);
-            }
-            if RE_CLAUDE_RATE.is_match(output) {
-                return Some(BlockedReason::RateLimit {
-                    retry_after_secs: None,
-                });
-            }
-        }
-        Backend::KiroCli => {
-            if RE_KIRO_QUOTA.is_match(output) {
-                return Some(BlockedReason::QuotaExceeded);
-            }
-            if RE_KIRO_RATE.is_match(output) {
-                return Some(BlockedReason::RateLimit {
-                    retry_after_secs: None,
-                });
-            }
-        }
-        Backend::Codex => {
-            if RE_CODEX_QUOTA.is_match(output) {
-                return Some(BlockedReason::QuotaExceeded);
-            }
-            if RE_CODEX_RATE.is_match(output) {
-                return Some(BlockedReason::RateLimit {
-                    retry_after_secs: None,
-                });
-            }
-        }
-        Backend::Gemini => {
-            if RE_GEMINI_RATE.is_match(output) {
-                return Some(BlockedReason::QuotaExceeded);
-            }
-        }
-        _ => {}
-    }
-    None
 }
 
 /// Cheap structural test for a generic startup-time interactive prompt.
@@ -831,7 +819,7 @@ pub struct StateTracker {
     /// call. Used to skip re-detection when the screen hasn't changed —
     /// crucial for not resetting `last_output` on cursor-blink noise.
     last_screen_hash: Option<u64>,
-    patterns: Option<StatePatterns>,
+    patterns: Option<&'static StatePatterns>,
     /// Set to true the moment we enter `InteractivePrompt`; cleared by
     /// `take_interactive_prompt_notice()` once the supervisor has forwarded a
     /// Telegram notice. This deduplicates per-entry: re-entry (e.g. dismissed
@@ -1263,7 +1251,7 @@ impl StateTracker {
 
         self.last_output = Instant::now();
 
-        if let Some(ref patterns) = self.patterns {
+        if let Some(patterns) = self.patterns {
             // #919: detect_with_match returns the matched substring so
             // we can anchor it against the raw-chunk ring. For HIGH_FP
             // states, require a red SGR escape within
@@ -4631,6 +4619,95 @@ mod tests {
             t.get_state(),
             AgentState::AuthError,
             "word-boundary must prevent false positive on 4013"
+        );
+    }
+
+    // ── #1125 M3: for_backend OnceLock caching ──────────────────────
+
+    /// #1125 M3: `for_backend` must return the same `&'static` reference
+    /// on repeated calls — proving the OnceLock cache is active.
+    #[test]
+    fn for_backend_returns_cached_static_ref() {
+        let p1 = StatePatterns::for_backend(&Backend::ClaudeCode);
+        let p2 = StatePatterns::for_backend(&Backend::ClaudeCode);
+        assert!(
+            std::ptr::eq(p1, p2),
+            "for_backend must return the same &'static ref (OnceLock cached)"
+        );
+    }
+
+    /// #1125 M3 source-pin: `for_backend` must contain `OnceLock` so
+    /// regex compilation is cached per-backend per-process.
+    #[test]
+    fn for_backend_uses_oncelock() {
+        let src = include_str!("state.rs");
+        let fn_start = src
+            .find("pub fn for_backend(")
+            .expect("for_backend must exist");
+        let rest = &src[fn_start..];
+        let fn_end = rest.find("\n    fn compile_for(").unwrap_or(rest.len());
+        let body = &rest[..fn_end];
+        assert!(
+            body.contains("OnceLock"),
+            "for_backend must use OnceLock for caching (#1125 M3)"
+        );
+    }
+
+    // ── #1125 M4: classify_pty_output delegates to for_backend ──────
+
+    /// #1125 M4: classify_pty_output must NOT contain its own LazyLock
+    /// regexes — it delegates to `for_backend` as the single source of truth.
+    #[test]
+    fn classify_pty_output_delegates_to_for_backend() {
+        let src = include_str!("state.rs");
+        let fn_start = src
+            .find("pub fn classify_pty_output(")
+            .expect("classify_pty_output must exist");
+        let rest = &src[fn_start..];
+        let fn_end = rest
+            .find("\npub fn ")
+            .or_else(|| rest.find("\nfn "))
+            .unwrap_or(rest.len());
+        let body = &rest[..fn_end];
+        assert!(
+            body.contains("StatePatterns::for_backend"),
+            "classify_pty_output must delegate to for_backend (#1125 M4)"
+        );
+        assert!(
+            !body.contains("LazyLock"),
+            "classify_pty_output must NOT maintain its own LazyLock regexes — \
+             single source of truth is for_backend (#1125 M4)"
+        );
+    }
+
+    /// #1125 M4: Claude UsageLimit patterns must produce QuotaExceeded
+    /// via classify_pty_output (post-unification regression pin).
+    #[test]
+    fn classify_pty_output_claude_usage_limit() {
+        use crate::health::BlockedReason;
+        let result = classify_pty_output(&Backend::ClaudeCode, "You've hit your session limit");
+        assert_eq!(
+            result,
+            Some(BlockedReason::QuotaExceeded),
+            "Claude UsageLimit must map to QuotaExceeded"
+        );
+    }
+
+    /// #1125 M4: Claude ServerRateLimit patterns must produce RateLimit
+    /// via classify_pty_output (post-unification regression pin).
+    #[test]
+    fn classify_pty_output_claude_server_rate_limit() {
+        use crate::health::BlockedReason;
+        let result = classify_pty_output(
+            &Backend::ClaudeCode,
+            "Server is temporarily limiting requests",
+        );
+        assert_eq!(
+            result,
+            Some(BlockedReason::RateLimit {
+                retry_after_secs: None
+            }),
+            "Claude ServerRateLimit must map to RateLimit"
         );
     }
 }

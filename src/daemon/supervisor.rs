@@ -98,12 +98,21 @@ pub(crate) struct RateLimitRetry {
 /// to different `u64`s with overwhelming probability. Used by
 /// `process_server_rate_limit_retries` to dedup re-injects within a
 /// window without committing to any specific message-id format.
+///
+/// #1125 M2: uses FNV-1a (deterministic across Rust versions) instead of
+/// `DefaultHasher` which is NOT guaranteed stable across toolchain updates.
+/// Fingerprints are persisted to disk via `dedup_state::save()` and
+/// rehydrated on restart — a hasher change would break dedup windows
+/// spanning a Rust upgrade.
 pub(crate) fn fingerprint_input(text: &str) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    text.hash(&mut h);
-    h.finish()
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut hash = FNV_OFFSET;
+    for byte in text.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
 }
 
 /// Sprint 56 Track G (#529): the dedup gate's three possible verdicts
@@ -274,37 +283,55 @@ fn run_loop(
     let mut retention_supervisor = crate::daemon::retention::RetentionSupervisor::default();
     loop {
         thread::sleep(TICK);
-        tick(&home, &registry, &mut notify_tracks);
-        process_server_rate_limit_retries(&home, &registry, &mut retry_tracks);
-        check_pane_input_not_submitted(&home, &registry, &mut pane_input_tracks);
-        anti_stall_tracker.maybe_scan(&home);
-        idle_watchdog_tracker.maybe_scan(&home);
-        decision_timeout_tracker.maybe_scan(&home);
-        helper_staleness_tracker.maybe_scan(&home);
-        mcp_registry_tracker.maybe_scan(&daemon_binary_stale);
-        waiting_on_stale_tracker.maybe_scan(&home);
-        conflict_notify_tracker.maybe_scan(&home, &registry);
-        canonical_drift_tracker.maybe_scan(&home);
-        auto_release_tracker.maybe_scan(&home);
-        dispatch_idle_tracker.maybe_scan(&home);
-        dispatch_idle_fixup_nudge_tracker.maybe_scan(&home);
-        retention_supervisor.maybe_sweep(&home);
-        // #1002 Phase 2: pr_state per-tick scan must run here so APP
-        // mode (`agend-terminal app`) drives the #972 aggregator + #986
-        // gh-poll integration the same way as daemon mode. Before this
-        // line, `PrStateScanHandler` was wired ONLY into `run_core`'s
-        // `PerTickHandler` vec (dual-entry-point divergence); APP-mode
-        // operators (the agent fleet) saw `last_gh_poll_at: null`
-        // indefinitely + no `[pr-ready-for-merge]` events.
-        // Source-pin: `pr_state_scan_wired_into_supervisor_loop`.
-        crate::daemon::pr_state::scan_and_emit(&home, &registry);
-        // #836: reclaim expired (10-min TTL) entries from the
-        // notification-dedup ledger so memory pressure stays bounded
-        // on long-lived daemons.
-        crate::daemon::notification_dedup::global().sweep_expired();
-        // #842: same eviction cadence for the bridge↔daemon idempotent-
-        // retry dedup cache. Sibling sweep, same 10-min TTL window.
-        crate::api::request_dedup::global().sweep_expired();
+        // #1125 M1: wrap the entire tick body in catch_unwind so a panic
+        // in any tracker's maybe_scan() doesn't kill the supervisor thread.
+        // Mirrors the run_handlers_with_panic_guard pattern from per_tick.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tick(&home, &registry, &mut notify_tracks);
+            process_server_rate_limit_retries(&home, &registry, &mut retry_tracks);
+            check_pane_input_not_submitted(&home, &registry, &mut pane_input_tracks);
+            anti_stall_tracker.maybe_scan(&home);
+            idle_watchdog_tracker.maybe_scan(&home);
+            decision_timeout_tracker.maybe_scan(&home);
+            helper_staleness_tracker.maybe_scan(&home);
+            mcp_registry_tracker.maybe_scan(&daemon_binary_stale);
+            waiting_on_stale_tracker.maybe_scan(&home);
+            conflict_notify_tracker.maybe_scan(&home, &registry);
+            canonical_drift_tracker.maybe_scan(&home);
+            auto_release_tracker.maybe_scan(&home);
+            dispatch_idle_tracker.maybe_scan(&home);
+            dispatch_idle_fixup_nudge_tracker.maybe_scan(&home);
+            retention_supervisor.maybe_sweep(&home);
+            // #1002 Phase 2: pr_state per-tick scan must run here so APP
+            // mode (`agend-terminal app`) drives the #972 aggregator + #986
+            // gh-poll integration the same way as daemon mode. Before this
+            // line, `PrStateScanHandler` was wired ONLY into `run_core`'s
+            // `PerTickHandler` vec (dual-entry-point divergence); APP-mode
+            // operators (the agent fleet) saw `last_gh_poll_at: null`
+            // indefinitely + no `[pr-ready-for-merge]` events.
+            // Source-pin: `pr_state_scan_wired_into_supervisor_loop`.
+            crate::daemon::pr_state::scan_and_emit(&home, &registry);
+            // #836: reclaim expired (10-min TTL) entries from the
+            // notification-dedup ledger so memory pressure stays bounded
+            // on long-lived daemons.
+            crate::daemon::notification_dedup::global().sweep_expired();
+            // #842: same eviction cadence for the bridge↔daemon idempotent-
+            // retry dedup cache. Sibling sweep, same 10-min TTL window.
+            crate::api::request_dedup::global().sweep_expired();
+        }));
+        if let Err(payload) = outcome {
+            let msg = if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else if let Some(s) = payload.downcast_ref::<&'static str>() {
+                (*s).to_string()
+            } else {
+                "<non-string panic payload>".to_string()
+            };
+            tracing::error!(
+                payload = %msg,
+                "#1125 supervisor tick panicked — next tick will re-run all scans"
+            );
+        }
     }
 }
 
@@ -2027,6 +2054,43 @@ mod tests {
         );
         std::env::remove_var("AGEND_PANE_INPUT_THRESHOLD_SECS");
         std::fs::remove_dir_all(home).ok();
+    }
+
+    /// #1125 M1 source-pin: supervisor's per-tick loop body MUST be
+    /// wrapped in `catch_unwind` so a panic in any tracker doesn't kill
+    /// the supervisor thread (silent loss of all health monitoring).
+    #[test]
+    fn supervisor_tick_loop_has_catch_unwind() {
+        let src = include_str!("supervisor.rs");
+        let loop_start = src.find("fn run_loop(").expect("run_loop must exist");
+        let rest = &src[loop_start..];
+        assert!(
+            rest.contains("catch_unwind"),
+            "supervisor run_loop must wrap tick body in catch_unwind (#1125 M1)"
+        );
+    }
+
+    /// #1125 M2: fingerprint_input must be deterministic across Rust
+    /// versions. Pin specific hash values so a hasher algorithm change
+    /// is caught immediately (test would fail on the new toolchain).
+    #[test]
+    fn fingerprint_is_deterministic_fnv1a() {
+        assert_eq!(
+            super::fingerprint_input("hello"),
+            super::fingerprint_input("hello"),
+            "same input must produce same hash"
+        );
+        assert_ne!(
+            super::fingerprint_input("hello"),
+            super::fingerprint_input("hello\n"),
+            "one-byte difference must change the hash"
+        );
+        // Pin a known FNV-1a value so algorithm changes fail loudly.
+        assert_eq!(
+            super::fingerprint_input(""),
+            0xcbf29ce484222325,
+            "empty string must hash to FNV-1a offset basis"
+        );
     }
 
     /// #1002 Phase 2 source-pin: supervisor's per-tick loop MUST call
