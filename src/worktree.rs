@@ -216,6 +216,15 @@ pub fn create(
                 branch = %branch,
                 "created worktree"
             );
+            // #1137: write .agend-managed marker immediately after successful
+            // checkout to prevent orphan dirs if process dies before caller writes it.
+            let _ = std::fs::write(
+                wt_dir.join(".agend-managed"),
+                format!(
+                    "agent={instance_name}\nbranch={branch}\nleased_at={}\n",
+                    chrono::Utc::now().to_rfc3339()
+                ),
+            );
             Some(WorktreeInfo {
                 path: wt_dir,
                 source_repo: repo_dir.to_path_buf(),
@@ -254,6 +263,14 @@ pub fn create(
                             instance = instance_name,
                             %branch,
                             "created worktree on existing branch"
+                        );
+                        // #1137: write marker immediately (same as primary path above).
+                        let _ = std::fs::write(
+                            wt_dir.join(".agend-managed"),
+                            format!(
+                                "agent={instance_name}\nbranch={branch}\nleased_at={}\n",
+                                chrono::Utc::now().to_rfc3339()
+                            ),
                         );
                         Some(WorktreeInfo {
                             path: wt_dir,
