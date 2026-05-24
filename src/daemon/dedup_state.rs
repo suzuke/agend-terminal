@@ -118,6 +118,12 @@ use crate::daemon::supervisor::RateLimitRetry;
 /// added/removed in a non-backward-compatible way.
 const SCHEMA_VERSION: u32 = 1;
 
+/// Hasher algorithm version. `1` = FNV-1a (deterministic across Rust
+/// toolchains). Old files written with `DefaultHasher` (pre-#1125)
+/// carry `hasher_version: 0` (via `#[serde(default)]`) and are
+/// discarded on load — their fingerprints are incompatible.
+const HASHER_VERSION: u8 = 1;
+
 /// Sub-directory of `$AGEND_HOME` that holds per-agent JSON files.
 pub(crate) const DEDUP_STATE_DIR: &str = "dedup-state";
 
@@ -141,6 +147,8 @@ pub(crate) const DEDUP_STATE_DIR: &str = "dedup-state";
 struct OnDisk {
     #[serde(default)]
     schema_version: u32,
+    #[serde(default)]
+    hasher_version: u8,
     #[serde(default)]
     agent: String,
     /// Hex-formatted u64 (`"0x{:016x}"`) so JSON readers handle the
@@ -240,6 +248,7 @@ pub(crate) fn save(home: &Path, agent: &str, retry: &RateLimitRetry) {
     }
     let on_disk = OnDisk {
         schema_version: SCHEMA_VERSION,
+        hasher_version: HASHER_VERSION,
         agent: agent.to_string(),
         fingerprint: format!("0x{:016x}", retry.fingerprint),
         dedup_count: retry.dedup_count,
@@ -348,6 +357,19 @@ pub(crate) fn load_all(home: &Path) -> HashMap<String, RateLimitRetry> {
                 expected = SCHEMA_VERSION,
                 path = %path.display(),
                 "dedup_state: unknown schema_version — skipping (forward-compat preserved)"
+            );
+            continue;
+        }
+        if on_disk.hasher_version != HASHER_VERSION {
+            // #1125: fingerprints written with a different hasher
+            // (e.g. pre-FNV-1a DefaultHasher) are incompatible.
+            // Discard — dedup window is 60s, any daemon restart
+            // exceeds that, so stale entries are harmless to drop.
+            tracing::warn!(
+                got = on_disk.hasher_version,
+                expected = HASHER_VERSION,
+                path = %path.display(),
+                "dedup_state: hasher_version mismatch — discarding stale entry"
             );
             continue;
         }
@@ -557,6 +579,7 @@ mod tests {
         assert_eq!(parsed["agent"], "dev");
         assert_eq!(parsed["dedup_count"], 1);
         assert_eq!(parsed["schema_version"], SCHEMA_VERSION);
+        assert_eq!(parsed["hasher_version"], HASHER_VERSION as u64);
         assert!(
             parsed["fingerprint"].as_str().unwrap().starts_with("0x"),
             "fingerprint must serialize as 0x-prefixed hex"
@@ -845,6 +868,7 @@ mod tests {
         // that doesn't exist in the v1 OnDisk struct.
         let body = serde_json::json!({
             "schema_version": 1,
+            "hasher_version": 1,
             "agent": "dev",
             "fingerprint": "0x1234567890abcdef",
             "dedup_count": 1,
@@ -894,6 +918,7 @@ mod tests {
         // on its own line. Pin each field name explicitly:
         for field in &[
             "schema_version: u32",
+            "hasher_version: u8",
             "agent: String",
             "fingerprint: String",
             "dedup_count: u32",
@@ -930,6 +955,7 @@ mod tests {
         let json = serde_json::to_string(&zero).unwrap();
         let parsed: OnDisk = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.schema_version, 0);
+        assert_eq!(parsed.hasher_version, 0);
         assert_eq!(parsed.agent, "");
         assert_eq!(parsed.dedup_count, 0);
         assert!(!parsed.exhausted);
@@ -976,6 +1002,104 @@ mod tests {
             !loaded.contains_key("future"),
             "future v(N+k) entry must be skipped per forward-only contract"
         );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn load_all_discards_entries_with_stale_hasher_version() {
+        // #1125: old DefaultHasher fingerprints (hasher_version 0 via
+        // serde default) are incompatible with FNV-1a. load_all must
+        // skip them gracefully — dedup window is 60s so discarding
+        // across a daemon restart is safe.
+        let home = tmp_home("hasher-version-mismatch");
+        let dir = home.join(DEDUP_STATE_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Plant: one file with no hasher_version (pre-#1125, defaults
+        // to 0), one file with current hasher_version, one file with
+        // a future hasher_version.
+        let old_payload = json!({
+            "schema_version": 1,
+            "agent": "old-hasher",
+            "fingerprint": "0xdeadbeefcafebabe",
+            "dedup_count": 1,
+            "last_inject_at_unix_micros": 1_700_000_000_000_000_i64,
+            "dedup_audit_emitted": false,
+            "retry_count": 0,
+            "exhausted": false,
+            "input_text": "old"
+        });
+        std::fs::write(
+            dir.join("old-hasher.json"),
+            serde_json::to_string_pretty(&old_payload).unwrap(),
+        )
+        .unwrap();
+
+        let current_payload = json!({
+            "schema_version": 1,
+            "hasher_version": 1,
+            "agent": "current",
+            "fingerprint": "0x1234567890abcdef",
+            "dedup_count": 0,
+            "last_inject_at_unix_micros": 1_700_000_000_000_000_i64,
+            "dedup_audit_emitted": false,
+            "retry_count": 0,
+            "exhausted": false,
+            "input_text": "current"
+        });
+        std::fs::write(
+            dir.join("current.json"),
+            serde_json::to_string_pretty(&current_payload).unwrap(),
+        )
+        .unwrap();
+
+        let future_payload = json!({
+            "schema_version": 1,
+            "hasher_version": 99,
+            "agent": "future-hasher",
+            "fingerprint": "0xaaaabbbbccccdddd",
+            "dedup_count": 0,
+            "last_inject_at_unix_micros": 1_700_000_000_000_000_i64,
+            "dedup_audit_emitted": false,
+            "retry_count": 0,
+            "exhausted": false,
+            "input_text": "future"
+        });
+        std::fs::write(
+            dir.join("future-hasher.json"),
+            serde_json::to_string_pretty(&future_payload).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load_all(&home);
+        assert_eq!(
+            loaded.len(),
+            1,
+            "only current-hasher entry survives: {loaded:?}"
+        );
+        assert!(loaded.contains_key("current"), "current-hasher entry loads");
+        assert!(
+            !loaded.contains_key("old-hasher"),
+            "old DefaultHasher entry discarded"
+        );
+        assert!(
+            !loaded.contains_key("future-hasher"),
+            "future hasher entry discarded"
+        );
+
+        // Files remain on disk (not quarantined — version mismatch
+        // is not corruption).
+        assert!(
+            dir.join("old-hasher.json").exists(),
+            "old file preserved on disk"
+        );
+        assert!(
+            dir.join("future-hasher.json").exists(),
+            "future file preserved on disk"
+        );
+        let quarantined = quarantine_files(&home);
+        assert!(quarantined.is_empty(), "no quarantine for version mismatch");
 
         std::fs::remove_dir_all(&home).ok();
     }
@@ -1255,6 +1379,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let bad_fingerprint_payload = json!({
             "schema_version": SCHEMA_VERSION,
+            "hasher_version": HASHER_VERSION,
             "agent": "alpha",
             "fingerprint": "totally not hex",
             "input_text": "",
