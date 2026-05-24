@@ -395,6 +395,10 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
             let (c, r) = crossterm::terminal::size().unwrap_or((120, 40));
             let pane_area = ratatui::layout::Rect::new(0, 1, c, r.saturating_sub(2));
             crate::layout::resize_panes(pane_area, &mut layout, &registry);
+            // #1140: force full redraw to clear wide-char ghost artifacts.
+            // ratatui's Buffer::diff() can leave stale spacer cells when
+            // wide chars are replaced by narrow chars across frames.
+            let _ = terminal.clear();
             needs_resize = false;
         }
         sync_notification_state(&home, &mut layout);
