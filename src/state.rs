@@ -1027,16 +1027,8 @@ pub(crate) fn has_red_ansi_anchor(ring: &VecDeque<RawChunk>, phrase: &str, now: 
     false
 }
 
-/// Simple O(n×m) byte-slice substring search. For our ring sizes
-/// (≤10×4KB) and phrase lengths (~30-80 chars), the naive impl is
-/// fast enough. Avoids pulling in `memchr` for a single-site need.
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
-    }
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
+    memchr::memmem::find(haystack, needle)
 }
 
 fn hash_screen(text: &str) -> u64 {
@@ -4313,6 +4305,16 @@ mod tests {
             "oldest should be chunk-2 after eviction"
         );
         assert_eq!(last_bytes, b"chunk-11", "newest should be chunk-11");
+    }
+
+    #[test]
+    fn find_subslice_characterization() {
+        assert_eq!(find_subslice(b"hello world", b"world"), Some(6));
+        assert_eq!(find_subslice(b"hello world", b"hello"), Some(0));
+        assert_eq!(find_subslice(b"hello world", b"xyz"), None);
+        assert_eq!(find_subslice(b"hello", b"hello world"), None);
+        assert_eq!(find_subslice(b"", b"a"), None);
+        assert_eq!(find_subslice(b"\x1b[31mERR\x1b[0m", b"\x1b[31m"), Some(0));
     }
 
     /// #919 RED 4: chunks older than ANCHOR_WINDOW_MS are ignored by

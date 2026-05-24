@@ -96,6 +96,7 @@ dirs = "6"
 # to canonicalize cwd before encoding the project-dir lookup name.
 dunce = "1"
 regex = "1"
+memchr = "2"
 # Sprint 24 P0 PR2 — task_sweep forensic api_response_hash on PrSnapshot.
 # SHA-256 crypto-grade hash + hex encoding so reviewers can correlate an
 # event's response_hash against an archived GitHub API response without

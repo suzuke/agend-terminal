@@ -773,7 +773,23 @@ fn run_core(
                 tracing::info!(agent = %name, "ignoring stage2 restart during shutdown");
                 break;
             }
-            handle_stage2_restart(home, &name, &registry, &configs, &crash_tx, &shutdown);
+            let home_owned = home.to_path_buf();
+            let reg = Arc::clone(&registry);
+            let cfgs = Arc::clone(&configs);
+            let tx = crash_tx.clone();
+            let sd = Arc::clone(&shutdown);
+            // fire-and-forget: stage2 restart worker is short-lived (backoff sleep
+            // then spawn_agent + restore health counters). Observes shutdown flag
+            // after backoff to abort cleanly. JoinHandle dropped because errors are
+            // logged inside handle_stage2_restart + event_log records outcome.
+            if let Err(e) = std::thread::Builder::new()
+                .name(format!("{name}_stage2"))
+                .spawn(move || {
+                    handle_stage2_restart(&home_owned, &name, &reg, &cfgs, &tx, &sd);
+                })
+            {
+                tracing::warn!(error = %e, "failed to spawn stage2 restart thread");
+            }
             continue;
         }
 
@@ -1603,6 +1619,7 @@ fn handle_stage2_restart(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -2182,6 +2199,44 @@ mod tests {
         for name in &agent_names {
             kill_registered_child(&registry, name);
         }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1126 characterization: handle_stage2_restart runs on a spawned
+    /// thread without blocking the caller. Pre-fix, the function ran
+    /// inline on the main loop with `thread::sleep(backoff)`.
+    #[test]
+    fn stage2_restart_does_not_block_caller() {
+        let home = tmp_home("stage2_nonblock");
+        let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let configs: Arc<Mutex<HashMap<String, AgentConfig>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let (crash_tx, _crash_rx) = crossbeam_channel::unbounded();
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        std::env::set_var("AGEND_AUTO_RECOVERY_STAGE2_BACKOFF_MS", "2000");
+
+        let start = std::time::Instant::now();
+        let home_owned = home.to_path_buf();
+        let reg = Arc::clone(&registry);
+        let cfgs = Arc::clone(&configs);
+        let tx = crash_tx.clone();
+        let sd = Arc::clone(&shutdown);
+        let handle = std::thread::Builder::new()
+            .name("test_stage2".into())
+            .spawn(move || {
+                handle_stage2_restart(&home_owned, "ghost", &reg, &cfgs, &tx, &sd);
+            })
+            .unwrap();
+
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(100),
+            "spawn must return immediately — main loop is not blocked"
+        );
+
+        handle.join().unwrap();
+
+        std::env::remove_var("AGEND_AUTO_RECOVERY_STAGE2_BACKOFF_MS");
         std::fs::remove_dir_all(&home).ok();
     }
 }

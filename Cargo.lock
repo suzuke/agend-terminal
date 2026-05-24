@@ -35,6 +35,7 @@ dependencies = [
  "iana-time-zone",
  "insta",
  "libc",
+ "memchr",
  "parking_lot",
  "portable-pty",
  "predicates",
