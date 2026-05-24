@@ -4706,3 +4706,64 @@ fn ci_stale_debounce_does_not_affect_current_sha_notifications() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// #1134 T1: ci-pass inbox delivery does NOT produce generic
+/// `[AGEND-MSG-PENDING]` format — verifies the old dual-delivery
+/// PTY inject path is gone and replaced by inbox-only with friendly hint.
+#[test]
+fn ci_pass_no_agend_msg_pending_format() {
+    let dir = tmp_dir("1134-t1-no-pending");
+    std::fs::create_dir_all(&dir).unwrap();
+    let msg = crate::inbox::InboxMessage::new_system(
+        "system:ci",
+        "ci-watch",
+        "[ci-pass] o/r@feat (abc1234): passed ✓\nURL: https://example.com".to_string(),
+    );
+    let captured: std::sync::Arc<parking_lot::Mutex<Option<String>>> =
+        std::sync::Arc::new(parking_lot::Mutex::new(None));
+    let cap = captured.clone();
+    crate::inbox::enqueue_with_idle_hint_with_emitter(&dir, "agent1", msg, move |hint| {
+        *cap.lock() = Some(hint.to_string());
+    })
+    .unwrap();
+    let hint = captured.lock().clone().expect("emitter must fire once");
+    assert!(
+        !hint.contains("AGEND-MSG-PENDING"),
+        "#1134: ci-pass must NOT use generic AGEND-MSG-PENDING format; got: {hint}"
+    );
+    assert!(
+        !hint.contains("kind=ci-watch"),
+        "#1134: ci-pass friendly hint must not carry kind= header; got: {hint}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// #1134 T2: ci-pass inbox hint renders friendly format preserving
+/// the `[ci-pass] repo@branch (sha): passed ✓` visual.
+#[test]
+fn ci_pass_friendly_hint_format() {
+    let dir = tmp_dir("1134-t2-friendly");
+    std::fs::create_dir_all(&dir).unwrap();
+    let msg = crate::inbox::InboxMessage::new_system(
+        "system:ci",
+        "ci-watch",
+        "[ci-pass] o/r@feat (abc1234): passed ✓\nURL: https://example.com".to_string(),
+    );
+    let captured: std::sync::Arc<parking_lot::Mutex<Option<String>>> =
+        std::sync::Arc::new(parking_lot::Mutex::new(None));
+    let cap = captured.clone();
+    crate::inbox::enqueue_with_idle_hint_with_emitter(&dir, "agent1", msg, move |hint| {
+        *cap.lock() = Some(hint.to_string());
+    })
+    .unwrap();
+    let hint = captured.lock().clone().expect("emitter must fire once");
+    assert!(
+        hint.contains("[ci-pass] o/r@feat (abc1234): passed ✓"),
+        "#1134: friendly hint must contain ci-pass headline; got: {hint}"
+    );
+    assert!(
+        hint.contains("(inbox="),
+        "#1134: friendly hint must contain inbox count; got: {hint}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
