@@ -347,19 +347,32 @@ where
     let id = msg.id.clone().unwrap_or_default();
     let from = msg.from.clone();
     let kind = msg.kind.clone();
+    let msg_text = msg.text.clone();
 
     // Single lock scope: enqueue + count in one read, avoiding double I/O.
     let pending = storage::enqueue_returning_unread_count(home, target, msg)?;
     let from_short = from.strip_prefix("from:").unwrap_or(&from);
     let kind_str = kind.as_deref().unwrap_or("");
-    let hint = format!(
-        "{} id={} kind={} from={} inbox={} (use inbox tool)",
-        PENDING_HEADER_PREFIX,
-        sanitize_header_value(&id),
-        sanitize_header_value(kind_str),
-        sanitize_header_value(from_short),
-        pending,
-    );
+    // #1134: ci-watch messages whose headline is a CI conclusion
+    // (pass/fail/ended) get a friendly inline format instead of the
+    // generic AGEND-MSG-PENDING pointer, reducing dual-delivery feel.
+    let is_ci_conclusion = kind_str == "ci-watch"
+        && (msg_text.starts_with("[ci-pass]")
+            || msg_text.starts_with("[ci-fail]")
+            || msg_text.starts_with("[ci-ended]"));
+    let hint = if is_ci_conclusion {
+        let first_line = msg_text.lines().next().unwrap_or(&msg_text);
+        format!("{} (inbox={})", first_line, pending,)
+    } else {
+        format!(
+            "{} id={} kind={} from={} inbox={} (use inbox tool)",
+            PENDING_HEADER_PREFIX,
+            sanitize_header_value(&id),
+            sanitize_header_value(kind_str),
+            sanitize_header_value(from_short),
+            pending,
+        )
+    };
     emit_hint(&hint);
     Ok(())
 }
