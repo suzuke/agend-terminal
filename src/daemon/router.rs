@@ -172,7 +172,15 @@ fn try_dispatch_mirror(home: &std::path::Path, name: &str, buf: &mut AgentBuffer
         text
     };
 
-    if let Some(ch) = crate::channel::active_channel() {
+    // #1102 fix: prefer-chain — lookup_channel_by_name first, active_channel fallback.
+    // pair.reply_to_channel is verified Some at L148 (early return if None).
+    let ch = pair
+        .reply_to_channel
+        .as_deref()
+        .and_then(crate::channel::lookup_channel_by_name)
+        .or_else(crate::channel::active_channel);
+
+    if let Some(ch) = ch {
         let result = ch.send_from_agent(
             name,
             crate::channel::AgentOutboundOp::Reply {
@@ -241,5 +249,173 @@ mod tests {
     #[test]
     fn max_mirror_len_is_4000() {
         assert_eq!(MAX_MIRROR_LEN, 4000);
+    }
+
+    // ── #1102 prefer-chain tests ──────────────────────────────────────
+
+    use crate::channel::{
+        AgentOutboundOp, BindingOpts, BindingRef, Channel, ChannelCapabilities, ChannelError,
+        ChannelEvent, MsgRef, OutMsg,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct RecordingMockChannel {
+        kind_str: &'static str,
+        caps: ChannelCapabilities,
+        send_count: AtomicUsize,
+    }
+
+    impl RecordingMockChannel {
+        fn arc(kind: &'static str) -> Arc<Self> {
+            Arc::new(Self {
+                kind_str: kind,
+                caps: ChannelCapabilities::default(),
+                send_count: AtomicUsize::new(0),
+            })
+        }
+        fn count(&self) -> usize {
+            self.send_count.load(Ordering::Relaxed)
+        }
+    }
+
+    impl Channel for RecordingMockChannel {
+        fn kind(&self) -> &'static str {
+            self.kind_str
+        }
+        fn caps(&self) -> &ChannelCapabilities {
+            &self.caps
+        }
+        fn poll_event(&self) -> Option<ChannelEvent> {
+            None
+        }
+        fn send(&self, _: &BindingRef, _: OutMsg) -> anyhow::Result<MsgRef> {
+            anyhow::bail!("unused")
+        }
+        fn edit(&self, _: &MsgRef, _: OutMsg) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn delete(&self, _: &MsgRef) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn create_binding(&self, _: &str, _: BindingOpts) -> anyhow::Result<BindingRef> {
+            anyhow::bail!("unused")
+        }
+        fn remove_binding(&self, _: &BindingRef) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn has_binding(&self, _: &str) -> bool {
+            false
+        }
+        fn record_binding(&self, _: &str, _: BindingRef, _: String) {}
+        fn take_binding(&self, _: &str) -> Option<BindingRef> {
+            None
+        }
+        fn attach_registry(&self, _: crate::agent::AgentRegistry) {}
+        fn send_from_agent(&self, _: &str, _: AgentOutboundOp) -> Result<MsgRef, ChannelError> {
+            self.send_count.fetch_add(1, Ordering::Relaxed);
+            Ok(MsgRef {
+                binding: BindingRef::new(self.kind_str, None, ()),
+                id: "mirror-msg".into(),
+            })
+        }
+    }
+
+    fn registry_guard() -> parking_lot::MutexGuard<'static, ()> {
+        static G: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+        G.lock()
+    }
+
+    fn make_buffer(text: &str) -> AgentBuffer {
+        let (_tx, rx) = crossbeam_channel::bounded::<Vec<u8>>(1);
+        AgentBuffer {
+            rx,
+            buffer: text.to_string(),
+            active: true,
+            last_output_at: Instant::now() - Duration::from_secs(10),
+            input_id: Some(42),
+        }
+    }
+
+    #[test]
+    fn mirror_dispatch_uses_named_channel_in_multi_channel_fleet() {
+        let _g = registry_guard();
+        crate::channel::reset_active_channel_for_test();
+
+        let tg = RecordingMockChannel::arc("telegram");
+        let dc = RecordingMockChannel::arc("discord");
+        crate::channel::register_active_channel(tg.clone());
+        crate::channel::register_active_channel(dc.clone());
+
+        assert!(
+            crate::channel::active_channel().is_none(),
+            "active_channel must return None with 2 channels"
+        );
+
+        let agent = "test_mirror_multichan";
+        crate::daemon::heartbeat_pair::update_with(agent, |p| {
+            p.reply_to_channel = Some("telegram".into());
+            p.reply_to_input_id = Some(42);
+            p.mirror_dispatched_for_turn = false;
+            p.mirror_skip_until_next_turn = false;
+            p.last_mirror_event_id = None;
+        });
+
+        let home = std::env::temp_dir().join(format!("agend-router-1102-{}", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+
+        let mut buf = make_buffer("This is mirror text that should be dispatched");
+        try_dispatch_mirror(&home, agent, &mut buf);
+
+        assert_eq!(tg.count(), 1, "telegram channel must receive the mirror");
+        assert_eq!(dc.count(), 0, "discord channel must NOT receive the mirror");
+        assert!(
+            buf.buffer.is_empty(),
+            "buffer must be cleared after dispatch"
+        );
+        assert!(!buf.active, "active must be false after dispatch");
+
+        let pair = crate::daemon::heartbeat_pair::snapshot_for(agent);
+        assert!(pair.mirror_dispatched_for_turn);
+        assert!(pair.reply_to_channel.is_none());
+
+        crate::channel::reset_active_channel_for_test();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn mirror_dispatch_falls_back_to_active_channel_when_lookup_fails() {
+        let _g = registry_guard();
+        crate::channel::reset_active_channel_for_test();
+
+        let tg = RecordingMockChannel::arc("telegram");
+        crate::channel::register_active_channel(tg.clone());
+
+        assert!(
+            crate::channel::active_channel().is_some(),
+            "single channel → active_channel must return Some"
+        );
+
+        let agent = "test_mirror_fallback";
+        crate::daemon::heartbeat_pair::update_with(agent, |p| {
+            p.reply_to_channel = Some("nonexistent".into());
+            p.reply_to_input_id = Some(99);
+            p.mirror_dispatched_for_turn = false;
+            p.mirror_skip_until_next_turn = false;
+            p.last_mirror_event_id = None;
+        });
+
+        let home =
+            std::env::temp_dir().join(format!("agend-router-1102-fb-{}", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+
+        let mut buf = make_buffer("Fallback mirror text for single channel fleet");
+        try_dispatch_mirror(&home, agent, &mut buf);
+
+        assert_eq!(tg.count(), 1, "fallback to active_channel must work");
+        assert!(buf.buffer.is_empty());
+
+        crate::channel::reset_active_channel_for_test();
+        std::fs::remove_dir_all(&home).ok();
     }
 }
