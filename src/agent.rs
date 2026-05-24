@@ -1540,27 +1540,26 @@ pub fn write_to_agent_typed(agent: &AgentHandle, data: &[u8]) -> crate::error::R
 /// - typed=false: write_all(prefix+text), delay, write_all(submit_key)
 /// - typed=true: per-byte(prefix+text), delay, write_all(submit_key)
 pub fn inject_to_agent(agent: &AgentHandle, text: &[u8]) -> crate::error::Result<()> {
-    let prefix = agent.inject_prefix.as_bytes();
-    let submit = agent.submit_key.as_bytes();
+    let target = InjectTarget::from_handle(agent);
+    inject_with_target(&target, text)
+}
+
+/// #1146: inner inject that works on a snapshot of fields rather than a
+/// borrowed `AgentHandle`. This lets callers release the registry lock
+/// before the slow typed-inject sleep loop runs.
+fn inject_with_target(target: &InjectTarget, text: &[u8]) -> crate::error::Result<()> {
+    let prefix = target.inject_prefix.as_bytes();
+    let submit = target.submit_key.as_bytes();
 
     // S54 fix: strip ANSI sequences before injection to avoid ESC conflict in typed_inject.
-    // The [AGEND-MSG] header contains colors that start with \x1b[, which some
-    // backends (Kiro) or shells interpret as a literal ESC key when typed
-    // slowly, canceling the current input line.
     let text_str = String::from_utf8_lossy(text);
     let stripped = strip_ansi(&text_str);
     let text_bytes = stripped.as_bytes();
 
-    if agent.typed_inject {
-        // H1: collect all bytes first, then write in short lock bursts.
-        // Previous pattern held pty_writer lock for 2ms × N bytes (~20s for 10KB).
+    if target.typed_inject {
         let all_bytes: Vec<u8> = prefix.iter().chain(text_bytes.iter()).copied().collect();
 
-        // Issue #658: system headers ([AGEND-MSG] / [from:) must be written
-        // atomically — chunking splits them across PTY reads, causing parse
-        // failures in the receiving agent. Write header line as single unit,
-        // then chunk only the body. Use `stripped` (ANSI-free) for detection
-        // since raw text may have color escapes before the bracket.
+        // Issue #658: system headers must be written atomically.
         let is_system_header = stripped.starts_with(crate::inbox::SYSTEM_MSG_PREFIX)
             || stripped.starts_with(crate::inbox::AGENT_MSG_PREFIX);
         let (atomic_part, chunk_part) = if is_system_header {
@@ -1573,45 +1572,65 @@ pub fn inject_to_agent(agent: &AgentHandle, text: &[u8]) -> crate::error::Result
         };
 
         if !atomic_part.is_empty() {
-            write_with_timeout(&agent.pty_writer, atomic_part)?;
+            write_with_timeout(&target.pty_writer, atomic_part)?;
             std::thread::sleep(std::time::Duration::from_millis(
                 2 * atomic_part.len() as u64,
             ));
         }
 
         for chunk in chunk_part.chunks(64) {
-            write_with_timeout(&agent.pty_writer, chunk)?;
+            write_with_timeout(&target.pty_writer, chunk)?;
             std::thread::sleep(std::time::Duration::from_millis(2 * chunk.len() as u64));
         }
     } else {
         let mut combined = Vec::with_capacity(prefix.len() + text_bytes.len());
         combined.extend_from_slice(prefix);
         combined.extend_from_slice(text_bytes);
-        write_with_timeout(&agent.pty_writer, &combined)?;
+        write_with_timeout(&target.pty_writer, &combined)?;
     }
 
-    // Pre-submit delay (separate from the per-chunk pacing above). 50ms gives
-    // the TUI framework time to flush the input buffer before Enter arrives,
-    // avoiding races where the submit keystroke is consumed by the prior
-    // typed-inject paint cycle.
     std::thread::sleep(std::time::Duration::from_millis(50));
-
-    // Write submit key
-    write_with_timeout(&agent.pty_writer, submit)?;
+    write_with_timeout(&target.pty_writer, submit)?;
     Ok(())
+}
+
+/// #1146: lightweight clone of the fields `inject_to_agent` reads from
+/// `AgentHandle`. Lets callers snapshot under lock then inject after
+/// releasing the registry mutex — typed_inject agents sleep 2ms per
+/// chunk (10KB ≈ 20s), so holding the registry lock during inject
+/// blocks every other registry operation for the entire duration.
+#[derive(Clone)]
+pub(crate) struct InjectTarget {
+    pub pty_writer: PtyWriter,
+    pub inject_prefix: String,
+    pub submit_key: String,
+    pub typed_inject: bool,
+}
+
+impl InjectTarget {
+    pub fn from_handle(h: &AgentHandle) -> Self {
+        Self {
+            pty_writer: Arc::clone(&h.pty_writer),
+            inject_prefix: h.inject_prefix.clone(),
+            submit_key: h.submit_key.clone(),
+            typed_inject: h.typed_inject,
+        }
+    }
 }
 
 /// Send a message to a named agent via direct registry injection.
 /// Returns true if the agent was found and injected.
 pub fn send_to_registry(registry: &AgentRegistry, from: &str, target: &str, text: &str) -> bool {
-    let reg = lock_registry(registry);
-    if let Some(handle) = reg.get(target) {
-        let msg = format!("[from:{from}] {text}");
-        let _ = inject_to_agent(handle, msg.as_bytes());
-        true
-    } else {
-        false
-    }
+    let target_snapshot = {
+        let reg = lock_registry(registry);
+        match reg.get(target) {
+            Some(handle) => InjectTarget::from_handle(handle),
+            None => return false,
+        }
+    }; // lock released before inject
+    let msg = format!("[from:{from}] {text}");
+    let _ = inject_with_target(&target_snapshot, msg.as_bytes());
+    true
 }
 
 /// Broadcast a message to all agents with recognized backends.
@@ -1624,23 +1643,23 @@ pub fn broadcast_registry(
 ) -> Vec<String> {
     let msg = format!("[from:{from}] {text}");
     let msg_bytes = msg.as_bytes();
-    // H1 fix: collect target names under lock, release, then re-acquire
-    // per-target for inject. Avoids holding registry lock during inject().
-    let target_names: Vec<String> = {
+    // #1146: snapshot names + inject targets under one lock, release,
+    // then inject without holding the registry. Previous code re-acquired
+    // the lock per-target and held it during inject — typed_inject agents
+    // sleep 2ms/chunk, so N targets × 20s blocked the entire registry.
+    let targets: Vec<(String, InjectTarget)> = {
         let reg = lock_registry(registry);
         reg.iter()
             .filter(|(name, handle)| {
                 (exclude != Some(name.as_str()))
                     && crate::backend::Backend::from_command(&handle.backend_command).is_some()
             })
-            .map(|(name, _)| name.clone())
+            .map(|(name, handle)| (name.clone(), InjectTarget::from_handle(handle)))
             .collect()
-    }; // lock dropped here
-    for name in &target_names {
-        let reg = lock_registry(registry);
-        if let Some(handle) = reg.get(name) {
-            let _ = inject_to_agent(handle, msg_bytes);
-        }
+    }; // lock released before any inject
+    let target_names: Vec<String> = targets.iter().map(|(n, _)| n.clone()).collect();
+    for (_, snapshot) in &targets {
+        let _ = inject_with_target(snapshot, msg_bytes);
     }
     target_names
 }
@@ -2939,5 +2958,62 @@ Allow Trust All Tools mode?
                 "{key} must default to `true` (no-op editor binary), got {value:?}"
             );
         }
+    }
+
+    /// #1146: send_to_registry must release the registry lock before
+    /// calling inject. Source-grep pin: the lock scope must close
+    /// before inject_with_target appears. This is structurally
+    /// enforced — inject_with_target takes &InjectTarget (a snapshot),
+    /// not &AgentHandle (a registry borrow), so holding the lock
+    /// during inject is impossible without reverting to inject_to_agent.
+    #[test]
+    fn send_to_registry_releases_lock_before_inject_1146() {
+        let src = include_str!("agent.rs");
+        let fn_start = src
+            .find("fn send_to_registry(")
+            .expect("send_to_registry must exist");
+        let fn_body = &src[fn_start..fn_start + 600];
+
+        let lock_end = fn_body
+            .find("}; // lock released")
+            .expect("send_to_registry must have a scoped lock block");
+        let inject_call = fn_body
+            .find("inject_with_target")
+            .expect("send_to_registry must call inject_with_target");
+        assert!(
+            lock_end < inject_call,
+            "#1146: inject_with_target must appear AFTER the lock scope \
+             ends (lock_end={lock_end}, inject_call={inject_call})"
+        );
+    }
+
+    /// #1146: broadcast_registry must snapshot all targets under one
+    /// lock acquisition, release, then inject without re-acquiring.
+    /// Pre-fix: re-acquired lock per-target and held it during
+    /// inject — N typed_inject targets × 20s each.
+    #[test]
+    fn broadcast_registry_releases_lock_before_inject_1146() {
+        let src = include_str!("agent.rs");
+        let fn_start = src
+            .find("fn broadcast_registry(")
+            .expect("broadcast_registry must exist");
+        let fn_body = &src[fn_start..fn_start + 1500];
+
+        let lock_release = fn_body
+            .find("}; // lock released")
+            .expect("broadcast_registry must have a scoped lock block");
+        assert!(
+            !fn_body[lock_release..].contains("lock_registry"),
+            "#1146: broadcast_registry must NOT re-acquire registry \
+             lock after releasing it (pre-fix held lock during inject)"
+        );
+
+        let inject_site = fn_body
+            .find("inject_with_target")
+            .expect("broadcast_registry must call inject_with_target");
+        assert!(
+            inject_site > lock_release,
+            "#1146: inject_with_target must appear after lock release"
+        );
     }
 }
