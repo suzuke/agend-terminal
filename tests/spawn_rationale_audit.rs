@@ -125,10 +125,7 @@ fn is_test_only_file(path: &Path) -> bool {
         Some(p) => p,
         None => return false,
     };
-    let filename = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
+    let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let path_needle = format!("\"{filename}\"");
     let Ok(siblings) = std::fs::read_dir(parent) else {
         return false;
