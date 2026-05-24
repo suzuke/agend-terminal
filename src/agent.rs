@@ -2965,6 +2965,7 @@ Allow Trust All Tools mode?
     /// after producing some output, then verifies the agent is cleaned up
     /// from the registry (handle_pty_close removes it on non-crash paths).
     #[test]
+    #[allow(clippy::unwrap_used)]
     fn pty_read_error_triggers_cleanup() {
         use std::collections::HashMap;
 
@@ -2979,10 +2980,7 @@ Allow Trust All Tools mode?
                     buf[0] = b'x';
                     Ok(1)
                 } else {
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "simulated read error",
-                    ))
+                    Err(std::io::Error::other("simulated read error"))
                 }
             }
         }
