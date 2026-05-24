@@ -329,6 +329,21 @@ pub(crate) fn is_fleet_idle_snoozed(home: &Path) -> bool {
     chrono::Utc::now() < until
 }
 
+/// Read and parse the snooze sidecar. Returns `None` if the file is
+/// missing, malformed, or the snooze has expired.
+pub(crate) fn get_snooze_state(home: &Path) -> Option<FleetIdleSnooze> {
+    let content = std::fs::read_to_string(snooze_path(home)).ok()?;
+    let snooze: FleetIdleSnooze = serde_json::from_str(&content).ok()?;
+    let until = chrono::DateTime::parse_from_rfc3339(&snooze.snoozed_until)
+        .ok()?
+        .with_timezone(&chrono::Utc);
+    if chrono::Utc::now() < until {
+        Some(snooze)
+    } else {
+        None
+    }
+}
+
 /// #1084: snooze fleet-idle watchdog until the given timestamp.
 pub(crate) fn snooze_fleet_idle(
     home: &Path,
