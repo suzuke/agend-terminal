@@ -3096,16 +3096,12 @@ Allow Trust All Tools mode?
             }
         }
 
-        let writer: PtyWriter = Arc::new(Mutex::new(Box::new(BlockingWriter {
-            lock_tx,
-            unlock_rx,
-        })));
+        let writer: PtyWriter =
+            Arc::new(Mutex::new(Box::new(BlockingWriter { lock_tx, unlock_rx })));
         let key = Arc::as_ptr(&writer) as usize;
 
         let writer2 = Arc::clone(&writer);
-        let handle = std::thread::spawn(move || {
-            write_with_timeout(&writer2, b"hello")
-        });
+        let handle = std::thread::spawn(move || write_with_timeout(&writer2, b"hello"));
 
         // Wait for the write thread to enter the blocking write.
         lock_rx.recv().expect("write thread must signal lock");
