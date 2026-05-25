@@ -398,18 +398,21 @@ fn test_multi_run_notifies_all_terminal_since_last() {
             conclusion: Some("success".into()),
             head_sha: "aaa".into(),
             url: String::new(),
+            name: String::new(),
         },
         CiRun {
             id: 101,
             conclusion: Some("success".into()),
             head_sha: "bbb".into(),
             url: String::new(),
+            name: String::new(),
         },
         CiRun {
             id: 102,
             conclusion: None,
             head_sha: "ccc".into(),
             url: String::new(),
+            name: String::new(),
         },
     ];
     let selected = select_runs_to_notify(&runs, Some(99), None);
@@ -427,6 +430,7 @@ fn test_in_progress_does_not_appear_in_selection() {
         conclusion: None,
         head_sha: "aaa".into(),
         url: String::new(),
+        name: String::new(),
     }];
     let selected = select_runs_to_notify(&runs, None, None);
     assert!(selected.is_empty(), "in-progress run must not be selected");
@@ -440,18 +444,21 @@ fn test_mixed_terminal_states_all_notified() {
             conclusion: Some("failure".into()),
             head_sha: "a".into(),
             url: String::new(),
+            name: String::new(),
         },
         CiRun {
             id: 301,
             conclusion: Some("cancelled".into()),
             head_sha: "b".into(),
             url: String::new(),
+            name: String::new(),
         },
         CiRun {
             id: 302,
             conclusion: Some("success".into()),
             head_sha: "c".into(),
             url: String::new(),
+            name: String::new(),
         },
     ];
     let selected = select_runs_to_notify(&runs, Some(299), None);
@@ -470,12 +477,14 @@ fn test_already_notified_runs_skipped() {
             conclusion: Some("success".into()),
             head_sha: "a".into(),
             url: String::new(),
+            name: String::new(),
         },
         CiRun {
             id: 401,
             conclusion: Some("success".into()),
             head_sha: "b".into(),
             url: String::new(),
+            name: String::new(),
         },
     ];
     // #786: "already notified" semantic now requires BOTH the
@@ -500,12 +509,14 @@ fn test_same_head_sha_deduplicates_notification() {
             conclusion: Some("failure".into()),
             head_sha: "abc".into(),
             url: String::new(),
+            name: String::new(),
         },
         CiRun {
             id: 501,
             conclusion: Some("success".into()),
             head_sha: "abc".into(),
             url: String::new(),
+            name: String::new(),
         },
     ];
     let selected = select_runs_to_notify(&runs, Some(499), None);
@@ -523,12 +534,14 @@ fn test_dedupe_skips_already_notified_sha() {
             conclusion: Some("success".into()),
             head_sha: "aaa".into(),
             url: String::new(),
+            name: String::new(),
         },
         CiRun {
             id: 601,
             conclusion: Some("success".into()),
             head_sha: "bbb".into(),
             url: String::new(),
+            name: String::new(),
         },
     ];
     // #786: "already notified" for dedup means BOTH the sha AND
@@ -560,12 +573,14 @@ fn test_1042_same_sha_same_aggregate_suppresses_rebroadcast() {
             conclusion: Some("failure".into()),
             head_sha: "abc".into(),
             url: String::new(),
+            name: String::new(),
         },
         CiRun {
             id: 701,
             conclusion: Some("success".into()),
             head_sha: "abc".into(),
             url: String::new(),
+            name: String::new(),
         },
     ];
     let selected = select_runs_to_notify(&runs, Some(699), None);
@@ -589,12 +604,14 @@ fn test_1042_same_sha_different_aggregate_fires() {
             conclusion: Some("success".into()),
             head_sha: "abc".into(),
             url: String::new(),
+            name: String::new(),
         },
         CiRun {
             id: 801,
             conclusion: Some("success".into()),
             head_sha: "abc".into(),
             url: String::new(),
+            name: String::new(),
         },
     ];
     let selected = select_runs_to_notify(&runs, Some(799), None);
@@ -615,12 +632,14 @@ fn test_different_head_sha_triggers_new_notification() {
             conclusion: Some("success".into()),
             head_sha: "aaa".into(),
             url: String::new(),
+            name: String::new(),
         },
         CiRun {
             id: 601,
             conclusion: Some("success".into()),
             head_sha: "bbb".into(),
             url: String::new(),
+            name: String::new(),
         },
     ];
     let selected = select_runs_to_notify(&runs, Some(599), None);
@@ -1034,6 +1053,7 @@ fn mock_success_run_updates_watch_state() {
         conclusion: Some("success".into()),
         head_sha: "abc".into(),
         url: "https://example.com/100".into(),
+        name: String::new(),
     }]);
     run_ci_check(&dir, &base_watch(), &provider).unwrap();
 
@@ -1073,12 +1093,14 @@ fn mock_stale_sha_drops_notification_but_advances_tracker() {
             conclusion: None,
             head_sha: "newhead".into(),
             url: "https://example.com/301".into(),
+            name: String::new(),
         },
         CiRun {
             id: 300, // OLD_HEAD's run (terminal but stale)
             conclusion: Some("success".into()),
             head_sha: "oldhead".into(),
             url: "https://example.com/300".into(),
+            name: String::new(),
         },
     ]);
     run_ci_check(&dir, &base_watch(), &provider).unwrap();
@@ -1123,12 +1145,14 @@ fn mock_stale_sha_emits_ci_stale_inbox_message() {
             conclusion: None,
             head_sha: "newhead".into(),
             url: "https://example.com/301".into(),
+            name: String::new(),
         },
         CiRun {
             id: 300,
             conclusion: Some("success".into()),
             head_sha: "oldhead".into(),
             url: "https://example.com/300".into(),
+            name: String::new(),
         },
     ]);
     run_ci_check(&dir, &base_watch(), &provider).unwrap();
@@ -1160,6 +1184,7 @@ fn mock_single_run_current_head_still_notifies() {
         conclusion: Some("success".into()),
         head_sha: "onlyhead".into(),
         url: "https://example.com/400".into(),
+        name: String::new(),
     }]);
     run_ci_check(&dir, &base_watch(), &provider).unwrap();
 
@@ -1183,6 +1208,7 @@ fn mock_failure_run_includes_detail() {
         conclusion: Some("failure".into()),
         head_sha: "def".into(),
         url: "https://example.com/200".into(),
+        name: String::new(),
     }]);
     run_ci_check(&dir, &base_watch(), &provider).unwrap();
 
@@ -1280,6 +1306,7 @@ fn mock_force_push_resets_tracking() {
         conclusion: Some("success".into()),
         head_sha: "new456".into(),
         url: "https://example.com/51".into(),
+        name: String::new(),
     }]);
     run_ci_check(&dir, &watch, &provider).unwrap();
 
@@ -2285,6 +2312,7 @@ fn subscriber_fan_out_notifies_every_member() {
         conclusion: Some("success".to_string()),
         head_sha: "deadbeef".to_string(),
         url: "https://example/run/7".to_string(),
+        name: String::new(),
     }]);
 
     let registry: AgentRegistry =
@@ -2384,6 +2412,7 @@ fn ci_pass_subscriber_inbox_anti_regression() {
         conclusion: Some("success".to_string()),
         head_sha: "abc1234".to_string(),
         url: "https://example/run/1".to_string(),
+        name: String::new(),
     }]);
     let registry: AgentRegistry =
         Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
@@ -2435,6 +2464,7 @@ fn ci_pass_chain_target_gets_durable_inbox_entry() {
         conclusion: Some("success".to_string()),
         head_sha: "abc1234".to_string(),
         url: "https://example/run/2".to_string(),
+        name: String::new(),
     }]);
     let registry: AgentRegistry =
         Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
@@ -2485,6 +2515,7 @@ fn ci_pass_chain_target_excluded_from_subscriber_loop() {
         conclusion: Some("success".to_string()),
         head_sha: "abc1234".to_string(),
         url: "https://example/run/3".to_string(),
+        name: String::new(),
     }]);
     let registry: AgentRegistry =
         Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
@@ -2608,6 +2639,7 @@ fn ci_ready_for_action_carries_full_head_sha() {
         // Use a realistic full 40-char SHA.
         head_sha: "abc1234567890abcdef1234567890abcdef12345".to_string(),
         url: "https://example/run/1".to_string(),
+        name: String::new(),
     }]);
     let registry: AgentRegistry =
         Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
@@ -2698,6 +2730,7 @@ fn ci_ready_for_action_carries_pr_number_from_pr_state() {
         conclusion: Some("success".to_string()),
         head_sha: "abc1234567890abcdef1234567890abcdef12345".to_string(),
         url: "https://example/run/2".to_string(),
+        name: String::new(),
     }]);
     let registry: AgentRegistry =
         Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
@@ -2767,6 +2800,7 @@ fn ci_ready_for_action_carries_task_id_from_watch_sidecar() {
         conclusion: Some("success".to_string()),
         head_sha: "abc1234567890abcdef1234567890abcdef12345".to_string(),
         url: "https://example/run/3".to_string(),
+        name: String::new(),
     }]);
     let registry: AgentRegistry =
         Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
@@ -2852,6 +2886,7 @@ fn ci_pass_chain_target_inbox_kind_is_ready_for_action() {
         conclusion: Some("success".to_string()),
         head_sha: "abc1234".to_string(),
         url: "https://example/run/4".to_string(),
+        name: String::new(),
     }]);
     let registry: AgentRegistry =
         Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
@@ -2909,6 +2944,7 @@ fn ci_pass_chain_target_no_double_fire_on_overlap() {
         conclusion: Some("success".to_string()),
         head_sha: "abc1234".to_string(),
         url: "https://example/run/5".to_string(),
+        name: String::new(),
     }]);
     let registry: AgentRegistry =
         Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
@@ -3572,6 +3608,7 @@ fn make_run(id: u64, sha: &str, conclusion: Option<&str>) -> CiRun {
         head_sha: sha.to_string(),
         conclusion: conclusion.map(String::from),
         url: String::new(),
+        name: String::new(),
     }
 }
 
@@ -3746,6 +3783,7 @@ fn rerun_changes_conclusion_fires_notification() {
         conclusion: Some("success".into()),
         head_sha: "abc".into(),
         url: "https://example.com/100".into(),
+        name: String::new(),
     }]);
 
     run_ci_check(&dir, &watch, &provider).unwrap();
@@ -3788,6 +3826,7 @@ fn dedupe_by_head_sha_does_not_block_conclusion_change() {
         conclusion: Some("success".into()),
         head_sha: "abc".into(),
         url: "https://example.com/101".into(),
+        name: String::new(),
     }]);
 
     run_ci_check(&dir, &watch, &provider).unwrap();
@@ -3818,6 +3857,7 @@ fn same_run_id_same_conclusion_does_not_re_fire() {
         conclusion: Some("failure".into()),
         head_sha: "abc".into(),
         url: "https://example.com/100".into(),
+        name: String::new(),
     }]);
     let watch_path = dir.join("ci-watches").join(watch_filename("o/r", "feat"));
 
@@ -3860,6 +3900,7 @@ fn new_run_id_fires_regardless_of_prior_conclusion() {
         conclusion: Some("success".into()),
         head_sha: "def".into(),
         url: "https://example.com/200".into(),
+        name: String::new(),
     }]);
 
     run_ci_check(&dir, &watch, &provider).unwrap();
@@ -3902,6 +3943,7 @@ fn missing_last_notified_conclusion_field_handles_first_poll_gracefully() {
         conclusion: Some("success".into()),
         head_sha: "abc".into(),
         url: "https://example.com/100".into(),
+        name: String::new(),
     }]);
 
     run_ci_check(&dir, &watch, &provider).unwrap();
@@ -3971,6 +4013,7 @@ fn pass_dedupe_drops_ci_pass_for_subscriber_who_is_action_target() {
         conclusion: Some("success".to_string()),
         head_sha: "abc".to_string(),
         url: "https://example/run/100".to_string(),
+        name: String::new(),
     }]);
 
     let registry: AgentRegistry =
@@ -4049,6 +4092,7 @@ fn pass_dedupe_failure_does_not_drop_ci_fail_for_action_target() {
         conclusion: Some("failure".to_string()),
         head_sha: "def".to_string(),
         url: "https://example/run/200".to_string(),
+        name: String::new(),
     }]);
 
     let registry: AgentRegistry =
@@ -4121,6 +4165,7 @@ fn pass_dedupe_non_action_target_subscribers_receive_ci_pass() {
         conclusion: Some("success".to_string()),
         head_sha: "fed".to_string(),
         url: "https://example/run/300".to_string(),
+        name: String::new(),
     }]);
 
     let registry: AgentRegistry =
@@ -4497,6 +4542,7 @@ fn ci_pass_inbox_message_carries_repo_branch_correlation_id() {
         conclusion: Some("success".into()),
         head_sha: "abc".into(),
         url: "https://example.com/100".into(),
+        name: String::new(),
     }]);
     run_ci_check(&dir, &base_watch(), &provider).unwrap();
     let inbox_path = dir.join("inbox").join("agent1.jsonl");
@@ -4522,12 +4568,14 @@ fn ci_stale_inbox_message_carries_repo_branch_correlation_id() {
             conclusion: None,
             head_sha: "newhead".into(),
             url: "https://example.com/301".into(),
+            name: String::new(),
         },
         CiRun {
             id: 300,
             conclusion: Some("success".into()),
             head_sha: "oldhead".into(),
             url: "https://example.com/300".into(),
+            name: String::new(),
         },
     ]);
     run_ci_check(&dir, &base_watch(), &provider).unwrap();
@@ -4575,12 +4623,14 @@ fn ci_stale_debounce_suppresses_repeat_for_same_sha() {
             conclusion: None,
             head_sha: "newhead".into(),
             url: "https://example.com/301".into(),
+            name: String::new(),
         },
         CiRun {
             id: 300,
             conclusion: Some("success".into()),
             head_sha: "oldhead".into(),
             url: "https://example.com/300".into(),
+            name: String::new(),
         },
     ]);
     // First poll: ci-stale fires for oldhead.
@@ -4608,12 +4658,14 @@ fn ci_stale_debounce_suppresses_repeat_for_same_sha() {
             conclusion: None,
             head_sha: "newhead".into(),
             url: "https://example.com/301".into(),
+            name: String::new(),
         },
         CiRun {
             id: 302,
             conclusion: Some("failure".into()),
             head_sha: "oldhead".into(),
             url: "https://example.com/302".into(),
+            name: String::new(),
         },
     ]);
     // Pass the persisted watch state (including last_stale_emitted_sha).
@@ -4637,12 +4689,14 @@ fn ci_stale_debounce_allows_new_stale_sha() {
             conclusion: None,
             head_sha: "sha-c".into(),
             url: "https://example.com/401".into(),
+            name: String::new(),
         },
         CiRun {
             id: 400,
             conclusion: Some("success".into()),
             head_sha: "sha-a".into(),
             url: "https://example.com/400".into(),
+            name: String::new(),
         },
     ]);
     run_ci_check(&dir, &base_watch(), &provider).unwrap();
@@ -4663,12 +4717,14 @@ fn ci_stale_debounce_allows_new_stale_sha() {
             conclusion: None,
             head_sha: "sha-d".into(),
             url: "https://example.com/501".into(),
+            name: String::new(),
         },
         CiRun {
             id: 500,
             conclusion: Some("success".into()),
             head_sha: "sha-b".into(),
             url: "https://example.com/500".into(),
+            name: String::new(),
         },
     ]);
     run_ci_check(&dir, &watch, &provider2).unwrap();
@@ -4692,6 +4748,7 @@ fn ci_stale_debounce_does_not_affect_current_sha_notifications() {
         conclusion: Some("success".into()),
         head_sha: "currenthead".into(),
         url: "https://example.com/600".into(),
+        name: String::new(),
     }]);
     run_ci_check(&dir, &watch, &provider).unwrap();
     let inbox_path = dir.join("inbox").join("agent1.jsonl");
@@ -4796,6 +4853,7 @@ fn ci_check_repo_success_no_pty_inject_only_inbox() {
         conclusion: Some("success".into()),
         head_sha: "def456".into(),
         url: "https://example.com/200".into(),
+        name: String::new(),
     }]);
 
     // Create watch with a subscriber
@@ -4854,4 +4912,36 @@ fn ci_check_repo_success_no_pty_inject_only_inbox() {
     // inject happens — this test confirms the inbox-only delivery works
     // end-to-end through ci_check_repo.
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// #1151: required_checks filter — required pass + non-required failure = "success"
+#[test]
+fn aggregate_required_checks_ignores_non_required_failure() {
+    let runs = vec![
+        CiRun {
+            id: 1,
+            conclusion: Some("success".into()),
+            head_sha: "abc".into(),
+            url: String::new(),
+            name: "CI".into(),
+        },
+        CiRun {
+            id: 2,
+            conclusion: Some("failure".into()),
+            head_sha: "abc".into(),
+            url: String::new(),
+            name: "LOC Overrun Check".into(),
+        },
+    ];
+    // Without filter: failure (all must pass)
+    assert_eq!(
+        super::aggregate_conclusion_for_sha(&runs, "abc"),
+        Some("failure"),
+    );
+    // With required_checks: only "CI" matters → success
+    let required = vec!["CI".to_string()];
+    assert_eq!(
+        super::aggregate_conclusion_for_sha_filtered(&runs, "abc", Some(&required)),
+        Some("success"),
+    );
 }

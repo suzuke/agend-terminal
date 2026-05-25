@@ -81,6 +81,11 @@ pub struct WatchState {
     pub task_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_class: Option<String>,
+    /// #1151: when set, only these workflow names count toward the
+    /// "CI passed" aggregate. Non-required checks (e.g. flaky Windows)
+    /// are ignored. When absent, all checks must pass (backward compat).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_checks: Option<Vec<String>>,
 }
 
 fn default_branch() -> String {

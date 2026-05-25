@@ -118,6 +118,9 @@ pub struct CiRun {
     pub conclusion: Option<String>,
     pub head_sha: String,
     pub url: String,
+    /// Workflow name (e.g. "CI", "LOC Overrun Check").
+    /// Used by #1151 to filter to required checks only.
+    pub name: String,
 }
 
 /// Result of polling CI runs for a branch.
@@ -338,6 +341,7 @@ impl CiProvider for GitHubCiProvider {
                             conclusion: r["conclusion"].as_str().map(String::from),
                             head_sha: r["head_sha"].as_str()?.to_string(),
                             url: r["html_url"].as_str().unwrap_or("").to_string(),
+                            name: r["name"].as_str().unwrap_or("").to_string(),
                         })
                     })
                     .collect()
@@ -620,6 +624,7 @@ impl CiProvider for GitLabCiProvider {
                             conclusion,
                             head_sha: r["sha"].as_str()?.to_string(),
                             url: r["web_url"].as_str().unwrap_or("").to_string(),
+                            name: r["name"].as_str().unwrap_or("").to_string(),
                         })
                     })
                     .collect()
@@ -839,6 +844,7 @@ impl CiProvider for BitbucketCiProvider {
                                 .as_str()
                                 .unwrap_or("")
                                 .to_string(),
+                            name: r["pipeline"]["title"].as_str().unwrap_or("").to_string(),
                         })
                     })
                     .collect()

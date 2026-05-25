@@ -484,7 +484,26 @@ pub(crate) fn parse_review_class(
 }
 
 pub(crate) fn aggregate_conclusion_for_sha<'a>(runs: &'a [CiRun], sha: &str) -> Option<&'a str> {
-    let matching: Vec<&CiRun> = runs.iter().filter(|r| r.head_sha == sha).collect();
+    aggregate_conclusion_for_sha_filtered(runs, sha, None)
+}
+
+/// #1151: when `required_checks` is Some, only runs whose `name` matches
+/// (case-insensitive) are considered. Non-matching runs are ignored entirely.
+/// When None, all runs must pass (backward compat).
+pub(crate) fn aggregate_conclusion_for_sha_filtered<'a>(
+    runs: &'a [CiRun],
+    sha: &str,
+    required_checks: Option<&[String]>,
+) -> Option<&'a str> {
+    let matching: Vec<&CiRun> = runs
+        .iter()
+        .filter(|r| r.head_sha == sha)
+        .filter(|r| {
+            required_checks
+                .map(|checks| checks.iter().any(|c| c.eq_ignore_ascii_case(&r.name)))
+                .unwrap_or(true)
+        })
+        .collect();
     if matching.is_empty() {
         return None;
     }
@@ -1057,7 +1076,11 @@ fn persist_watch_state(ctx: &CiCheckCtx<'_>, pr: &PollResult, outcome: &NotifyOu
         if let Ok(content) = std::fs::read_to_string(ctx.watch_path) {
             if let Ok(watch) = serde_json::from_str::<WatchState>(&content) {
                 if let Some(next) = watch.next_after_ci.as_deref().filter(|s| !s.is_empty()) {
-                    let last_conclusion = aggregate_conclusion_for_sha(&pr.runs, &pr.current_sha);
+                    let last_conclusion = aggregate_conclusion_for_sha_filtered(
+                        &pr.runs,
+                        &pr.current_sha,
+                        watch.required_checks.as_deref(),
+                    );
                     if last_conclusion == Some("success") {
                         let repo_branch_key = format!("{}@{}", ctx.repo, ctx.branch);
                         let pr_number =
