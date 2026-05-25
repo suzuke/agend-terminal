@@ -34,6 +34,10 @@ fn mark_stale_open_tasks(home: &Path) -> usize {
         if record.status != crate::task_events::TaskStatus::Open {
             continue;
         }
+        // #1201: only auto-cancel truly unclaimed tasks (no assignee).
+        if record.owner.is_some() {
+            continue;
+        }
         let created = match chrono::DateTime::parse_from_rfc3339(&record.created_at) {
             Ok(dt) => dt.with_timezone(&chrono::Utc),
             Err(_) => continue,
