@@ -239,7 +239,7 @@ mod tests {
             branch: None,
             started_at: started_at.map(String::from),
             eta_secs,
-            auto_release_on_verdict: None,
+            auto_release_on_verdict: None, tags: vec![],
         }
     }
 
