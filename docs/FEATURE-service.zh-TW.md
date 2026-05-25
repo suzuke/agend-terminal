@@ -3,6 +3,16 @@
 這份文件說明 `service` 子命令如何把 daemon 交給作業系統管理，
 以及三個平台各自的落點與限制。
 
+## 使用情境
+
+> **Target audience:** Operators — used through CLI or TUI.
+
+操作者希望機器登入後 daemon 自動啟動，而不是每次都手動跑 `agend-terminal start`。`service install` 會把 daemon 交給作業系統管理，讓平台負責開機登入時的啟動與 crash 後重拉。
+
+在 binary 升級之後，操作者希望 service manager 指向新的可執行檔路徑。重新執行 `service install` 就會重新產生 artifact，帶入最新的 binary path 與 `AGEND_HOME`。
+
+當機器要退役，或不再需要這個 daemon 時，`service uninstall` 可以乾淨地解除註冊，讓平台回到可預期的狀態。
+
 ## 這個功能解決什麼問題
 
 `agend-terminal` 本身可以在前景、背景、TUI 或 daemon 模式運作，
@@ -299,4 +309,3 @@ agend-terminal service status
 3. 若你在 CI 或臨時環境測試，保留 `install` 產生的檔案比強求 service 真正啟動更有用。
 4. 若 `status` 非 `not_installed` 但 daemon 還是沒反應，先看 platform manager log，不要先懷疑 CLI。
 5. 這個功能是「外部 supervisor 入口」，不是 daemon 的自愈機制。
-

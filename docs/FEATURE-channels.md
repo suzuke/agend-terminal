@@ -2,6 +2,16 @@
 
 The Channels system lets operators talk to agents from Telegram or Discord without opening a terminal. Each agent maps to its own Telegram forum topic, and messages are mirrored bidirectionally.
 
+## Usage Scenarios
+
+> **Target audience:** Both operators and agents.
+
+An operator is away from the keyboard and wants to check whether an agent is still alive, send a quick instruction, or read the latest response without opening a terminal. Telegram becomes the control surface, and the daemon keeps the topic state in sync.
+
+An agent posts a reply after finishing a task. The reply is mirrored back into the same topic, so the operator can follow the conversation in place instead of chasing status across different tools.
+
+When the fleet grows, the one-topic-per-agent model keeps conversations isolated. That makes it practical to monitor several agents at once without mixing their context together.
+
 ## Design Goals
 
 When a team is working with multiple agents, the operator needs a communication path that is always available. Channels provides:

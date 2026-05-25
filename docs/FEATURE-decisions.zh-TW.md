@@ -2,6 +2,16 @@
 
 Decisions 系統讓團隊記錄重要的架構和流程決策，提供可查詢的決策歷史，讓任何人都能追溯「為什麼我們做了這個選擇」。
 
+## 使用情境
+
+> **Target audience:** Agent infrastructure — agents use this via MCP tools; operators typically don't interact directly.
+
+lead agent 做出一個架構選擇，例如決定用 worktree 而不是直接 checkout branch。透過 `decision action=post` 把理由記錄下來，未來其他 agent 可以直接查詢，不需要重新翻一次討論串。
+
+當舊決策已經不適用時，可以用新的決策明確 supersede 舊版本，保留歷史但讓目前的規則保持清楚。這樣大家知道哪一條是最新的，不會靠猜測。
+
+操作者或 reviewer 如果想知道某個 gate、政策或 migration 規則為什麼存在，可以依 tag 搜尋決策。這會變成 fleet 共用的記憶層。
+
 ## 設計理念
 
 多 agent 協作中，決策散落在對話、PR 描述、commit message 裡，很難回溯。Decisions 提供：

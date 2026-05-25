@@ -2,6 +2,16 @@
 
 The Decisions system records important architecture and process choices so the team can answer a simple question later: why did we choose this?
 
+## Usage Scenarios
+
+> **Target audience:** Agent infrastructure — agents use this via MCP tools; operators typically don't interact directly.
+
+A lead agent makes an architecture choice such as preferring worktrees over direct branch checkout. Recording that choice through `decision action=post` creates a durable explanation that future agents can query instead of rediscovering the same discussion.
+
+When a previous choice becomes obsolete, a new decision can supersede it with a clear replacement path. That keeps review history understandable without forcing anyone to guess which note is current.
+
+An operator or reviewer can search for decisions by tag when they need to understand why a particular gate, policy, or migration rule exists. The record becomes a shared memory layer for the fleet.
+
 ## Design Goals
 
 In a multi-agent workflow, decisions end up scattered across chat logs, PR descriptions, and commit messages. Decisions pulls them into one place and makes them queryable.

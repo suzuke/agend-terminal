@@ -2,6 +2,16 @@
 
 Schedules 讓你設定 cron 定時任務或一次性排程，Deployments 讓你一鍵部署多 agent 團隊。兩者都不需要手動重複操作。
 
+## 使用情境
+
+> **Target audience:** Both operators and agents.
+
+操作者希望每天早上 9 點自動送出 standup 提醒給 team，這種固定節奏的工作最適合用 cron 排程，因為不需要任何人手動記得觸發時間。
+
+agent 或操作者想在 PR merge 後 30 分鐘做一次 cleanup，這類只會發生一次的工作更適合用一次性排程，而不是重複型 cron。
+
+如果是要一次建立整套多 agent 團隊，deployment 會先把環境搭起來；之後的提醒與跟進工作則交給 schedules。兩者分工不同，但可以一起使用。
+
 ## 設計理念
 
 - **Schedules**：每天早上 9 點自動給 team 發 standup 訊息、每小時檢查 CI 狀態——不需要操作者記得做

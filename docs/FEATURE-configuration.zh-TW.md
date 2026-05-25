@@ -3,6 +3,16 @@
 這份文件說明 AgEnD 的設定是怎麼分層的、誰能寫哪一層、
 以及你應該在哪裡改哪一種設定。
 
+## 使用情境
+
+> **Target audience:** Operators — used through CLI or TUI.
+
+操作者想知道目前的行為到底是從哪裡來的。`AGEND_HOME`、`.env`、`fleet.yaml` 與 `runtime-config.json` 分別控制不同層級，這個 section 的目的就是幫你判斷該改哪個檔案。
+
+當 instance 需要長期策略變更時，通常應該改 `fleet.yaml`。如果只是暫時調整 live 數值，`runtime-config.json` 更適合，因為 daemon 每個 tick 都會重新載入。
+
+如果 backend 的 project-local MCP config 看起來不對，應該把它視為派生檔，而不是主來源。通常重新產生會比手動直接改 backend artifact 更安全。
+
 核心原則只有一句：
 
 - **來源要單一，派生檔要可重建。**
@@ -431,4 +441,3 @@ service 產物不是來源檔，而是由 install 命令根據目前 binary 與 
 3. 任何會被派生的設定，都要保留原始來源。
 4. 看到疑似設定污染，先看 `bugreport`，再看派生檔是不是被重寫。
 5. 記住一句話：**主來源可編輯，派生檔可重建。**
-

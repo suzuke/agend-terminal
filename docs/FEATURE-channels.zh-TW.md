@@ -2,6 +2,16 @@
 
 Channels 系統讓操作者直接在 Telegram 或 Discord 中與 agent 互動，不需要開啟終端。每個 agent 對應一個 Telegram forum topic，訊息自動雙向同步。
 
+## 使用情境
+
+> **Target audience:** Both operators and agents.
+
+操作者出門在外，想快速確認某個 agent 的狀態、送出一則指令，或直接讀到最新回覆時，Telegram 就變成主要操作面。daemon 會把 topic 狀態維持同步，不需要回到 terminal 才能做事。
+
+agent 完成工作後回覆訊息，系統會把回覆同步回同一個 topic，讓操作者可以在原本的對話脈絡裡直接追蹤進度，而不是分散在不同工具裡找訊息。
+
+當 fleet 規模變大時，每個 agent 對應一個 topic 的設計能維持對話隔離。操作者可以同時看多個 agent，但不會把不同上下文混在一起。
+
 ## 設計理念
 
 多 agent 團隊工作時，操作者需要一個隨時隨地都能觸及 agent 的管道。Channels 提供：

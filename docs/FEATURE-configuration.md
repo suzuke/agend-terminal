@@ -2,6 +2,16 @@
 
 This document explains how AgEnD's configuration is layered, who writes each layer, and where you should make a change depending on the type of setting.
 
+## Usage Scenarios
+
+> **Target audience:** Operators — used through CLI or TUI.
+
+An operator is trying to understand where the current behavior comes from. `AGEND_HOME`, `.env`, `fleet.yaml`, and `runtime-config.json` each control a different layer, and this section helps explain which file should be edited for which kind of change.
+
+When an instance needs a long-term policy change, the right place is usually `fleet.yaml`. When the change is only a live tuning adjustment, `runtime-config.json` is the better fit because it reloads every daemon tick.
+
+If a backend's project-local MCP config looks wrong, the operator should treat it as a derived file rather than the source of truth. Re-running the generator is usually safer than hand-editing the backend-specific artifact.
+
 The main rule is:
 
 - **Keep one source of truth, and make derived files rebuildable.**

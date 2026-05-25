@@ -2,6 +2,16 @@
 
 這份文件整理所有「先觀察、再判斷、最後再修」的診斷入口。
 
+## 使用情境
+
+> **Target audience:** Operators — used through CLI or TUI.
+
+當某個 agent 行為異常時，操作者可以先跑 `agend-terminal doctor`，確認問題是在 `fleet.yaml`、backend binary、helper 檔案，還是某個 agent 的連線已經死掉。重點是在改動之前先縮小故障範圍。
+
+如果 Telegram topic 已經跟 registry 漂移，`doctor topics` 會把 live 與 orphan 的條目清楚列出來，讓操作者在動聊天室之前先做安全判斷。
+
+當問題需要交給別人接手時，`bugreport` 會把 runtime snapshot、log 與已 redaction 的設定包成單一檔案，這樣不用再手動拼湊環境資訊。
+
 它們共同的原則很簡單：
 
 - 預設不改狀態。
@@ -370,4 +380,3 @@ agend-terminal capture promote <cap> <name> --scenario-kind silent_stuck
 3. 需要貼給別人看的狀態，優先用 `bugreport`。
 4. 做 capture 時，記得確認 `AGEND_CAPTURE_FIXTURES=1`。
 5. promote 前先看 `scenario_kind`，不要用錯類型造成 manifest 語義錯位。
-

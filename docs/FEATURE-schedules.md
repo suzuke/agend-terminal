@@ -2,6 +2,16 @@
 
 Schedules let you define cron jobs or one-shot jobs. Deployments let you stamp out a multi-agent team in one step. Both remove repetitive operator work.
 
+## Usage Scenarios
+
+> **Target audience:** Both operators and agents.
+
+An operator wants a daily 9:00 AM standup reminder to go out automatically to the team. A cron-based schedule handles that without requiring anyone to remember the trigger time by hand.
+
+An agent or operator wants to queue a cleanup action after a PR is merged, such as waiting 30 minutes before running a follow-up task. A one-shot schedule is a better fit because the action should happen once, not repeatedly.
+
+For repeatable team setups, a deployment can create the whole arrangement at once while schedules handle the later reminders and follow-up jobs. The two features complement each other rather than overlapping.
+
 ## Design Goals
 
 - **Schedules**: send a morning standup reminder at 9:00 every day, or check CI every hour, without relying on somebody to remember.

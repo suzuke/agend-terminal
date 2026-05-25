@@ -2,6 +2,16 @@
 
 This document groups the operator-facing tools that help you inspect the system before you change it.
 
+## Usage Scenarios
+
+> **Target audience:** Operators — used through CLI or TUI.
+
+When an agent starts behaving oddly, the operator can run `agend-terminal doctor` to check whether the problem is in `fleet.yaml`, the backend binaries, stale helper files, or a dead agent process. The goal is to narrow the blast radius before changing anything.
+
+If Telegram topics have drifted away from the registry, `doctor topics` shows which entries are live and which are orphaned. That gives the operator a safe way to decide whether cleanup is appropriate before touching chat state.
+
+When the problem needs to be handed off, `bugreport` collects the runtime snapshot, logs, and redacted config into one file. That makes it much easier to ask another person for help without reassembling the environment by hand.
+
 The shared rule is simple:
 
 - default to read-only

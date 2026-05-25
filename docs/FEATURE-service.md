@@ -2,6 +2,16 @@
 
 This document explains how the `service` subcommand hands daemon lifecycle management to the operating system, and where each supported platform writes its service artifact.
 
+## Usage Scenarios
+
+> **Target audience:** Operators — used through CLI or TUI.
+
+An operator wants the daemon to start automatically when the machine logs in, instead of having to run `agend-terminal start` every time. `service install` turns the daemon into a managed OS service so the platform owns startup and restart behavior.
+
+After upgrading the binary, the operator wants the service manager to point at the new executable path. Re-running `service install` regenerates the artifact with the current binary path and `AGEND_HOME`.
+
+When the machine is being decommissioned or the service is no longer needed, `service uninstall` removes the registration cleanly and leaves the platform in a known state.
+
 ## What this feature solves
 
 `agend-terminal` can run in the foreground, background, TUI, or daemon mode, but if you want it to start automatically after login and come back up after a crash, you need more than a manual command.
