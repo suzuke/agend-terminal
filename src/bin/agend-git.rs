@@ -755,6 +755,13 @@ fn exec_with_conflict_guidance(args: &[String], worktree: &str) -> ! {
             if !st.success() && has_unmerged_files(&git, worktree) {
                 eprint!("{}", format_conflict_guidance());
             }
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                if let Some(sig) = st.signal() {
+                    std::process::exit(128 + sig);
+                }
+            }
             std::process::exit(st.code().unwrap_or(1))
         }
         Err(e) => {
@@ -1935,6 +1942,44 @@ mod tests {
             .status
             .success());
         assert!(!has_unmerged_files("git", repo.to_str().unwrap()));
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn has_unmerged_files_true_on_conflict() {
+        let repo = std::env::temp_dir().join(format!(
+            "agend-conflict-pos-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.email", "test@test.com"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(repo.join("f.txt"), "base\n").unwrap();
+        git(&["add", "f.txt"]);
+        git(&["commit", "-m", "base"]);
+        git(&["checkout", "-b", "side"]);
+        std::fs::write(repo.join("f.txt"), "side\n").unwrap();
+        git(&["commit", "-am", "side"]);
+        git(&["checkout", "main"]);
+        std::fs::write(repo.join("f.txt"), "main\n").unwrap();
+        git(&["commit", "-am", "main"]);
+        let merge = git(&["merge", "side", "--no-edit"]);
+        assert!(!merge.status.success(), "merge should fail with conflict");
+        assert!(has_unmerged_files("git", repo.to_str().unwrap()));
+        git(&["merge", "--abort"]);
         let _ = std::fs::remove_dir_all(&repo);
     }
 
