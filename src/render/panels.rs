@@ -134,10 +134,10 @@ pub fn render_tasks(
     use crate::app::{BoardView, TaskBoardMode};
     let count = items.len();
     let view_tabs = match view {
-        BoardView::Tasks => "[t] tasks  [f] fleet  [s] status  [m] monitor",
-        BoardView::Fleet => " [t] tasks [f] fleet  [s] status  [m] monitor",
-        BoardView::Status => " [t] tasks  [f] fleet [s] status  [m] monitor",
-        BoardView::Monitor => " [t] tasks  [f] fleet  [s] status [m] monitor",
+        BoardView::Tasks => "[T] TASKS | [f] fleet | [s] status | [m] monitor",
+        BoardView::Fleet => "[t] tasks | [F] FLEET | [s] status | [m] monitor",
+        BoardView::Status => "[t] tasks | [f] fleet | [S] STATUS | [m] monitor",
+        BoardView::Monitor => "[t] tasks | [f] fleet | [s] status | [M] MONITOR",
     };
     let title = format!(" Board ({count}) | {view_tabs} | Tab switch | q close ");
     let inner = render_overlay_frame(frame, Color::Blue, &title);
