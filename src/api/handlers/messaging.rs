@@ -142,16 +142,19 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
             bind: None,
             eta_secs: None,
         };
-        if crate::task_events::append(
+        match crate::task_events::append(
             ctx.home,
             &crate::task_events::InstanceName(from.to_string()),
             event,
-        )
-        .is_ok()
-        {
-            Some(id)
-        } else {
-            None
+        ) {
+            Ok(_) => Some(id),
+            Err(e) => {
+                return json!({
+                    "ok": false,
+                    "error": format!("auto-create task failed: {e}"),
+                    "code": "task_create_failed"
+                });
+            }
         }
     } else {
         None
