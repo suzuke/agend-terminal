@@ -1,305 +1,222 @@
-# Schedules & Deployments — 定時任務與批次部署
+# Schedules & Deployments — Timed Jobs and Batch Deployment
 
-Schedules 讓你設定 cron 定時任務或一次性排程，Deployments 讓你一鍵部署多 agent 團隊。兩者都不需要手動重複操作。
+Schedules let you define cron jobs or one-shot jobs. Deployments let you stamp out a multi-agent team in one step. Both remove repetitive operator work.
 
-## 設計理念
+## Design Goals
 
-- **Schedules**：每天早上 9 點自動給 team 發 standup 訊息、每小時檢查 CI 狀態——不需要操作者記得做
-- **Deployments**：一個指令部署整個團隊（lead + dev + reviewer），包含 worktree 建立、fleet.yaml 寫入、team 建立
+- **Schedules**: send a morning standup reminder at 9:00 every day, or check CI every hour, without relying on somebody to remember.
+- **Deployments**: deploy an entire team in one command, including worktree creation, fleet.yaml updates, and team registration.
 
 ---
 
-## Schedules — 定時任務
+## Schedules
 
-### 快速開始
+### Quick Start
 
 ```json
-// 每天早上 9 點發送 standup 提醒
+// Send a daily standup reminder at 9:00 AM
 {
   "action": "create",
   "cron": "0 9 * * *",
-  "message": "早安！請回報昨天的進度和今天的計畫。",
+  "message": "Good morning! Please report yesterday's progress and today's plan.",
   "target": "lead"
 }
 
-// 30 分鐘後執行一次
+// Run once in 30 minutes
 {
   "action": "create",
   "run_at": "2026-05-25T10:00:00",
-  "message": "提醒：PR review deadline 到了",
+  "message": "Reminder: the PR review deadline is here.",
   "target": "reviewer"
 }
 ```
 
-### 操作
+### `create` — create a schedule
 
-#### create — 建立排程
+| Parameter | Type | Required | Description |
+|---|---|---:|---|
+| `cron` | string | one of two | Cron expression for recurring jobs |
+| `run_at` | string | one of two | One-shot time (RFC 3339 or local time) |
+| `message` | string | yes | Message to send when the job fires |
+| `target` | string | no | Target agent, defaults to the creator |
+| `label` | string | no | Human-readable label |
 
-| 參數 | 類型 | 必要 | 說明 |
-|------|------|------|------|
-| `cron` | string | 二選一 | Cron 表達式（重複執行） |
-| `run_at` | string | 二選一 | 一次性時間（RFC 3339 或本地時間） |
-| `message` | string | 是 | 觸發時發送的訊息內容 |
-| `target` | string | 否 | 目標 agent（預設為建立者自己） |
-| `label` | string | 否 | 人類可讀的標籤 |
+`cron` and `run_at` are mutually exclusive. One of them must be set.
 
-`cron` 和 `run_at` 必須且只能指定一個。
-
-#### list — 列出排程
+### `list` — list schedules
 
 ```json
 {"action": "list"}
 ```
 
-回傳所有排程，包含執行歷史（最近 50 次）。
+Returns all schedules, including execution history. The history is capped at the most recent 50 runs.
 
-#### update — 修改排程
+### `update` — edit a schedule
 
-| 參數 | 類型 | 說明 |
-|------|------|------|
-| `id` | string | 排程 ID（必要） |
-| `cron` | string | 新的 cron 表達式 |
-| `run_at` | string | 改為一次性排程 |
-| `message` | string | 新訊息內容 |
-| `target` | string | 新目標 agent |
-| `label` | string | 新標籤 |
-| `enabled` | bool | 啟用/停用 |
+| Parameter | Type | Description |
+|---|---|---|
+| `id` | string | Schedule ID, required |
+| `cron` | string | New cron expression |
+| `run_at` | string | Switch to a one-shot schedule |
+| `message` | string | New message body |
+| `target` | string | New target agent |
+| `label` | string | New label |
+| `enabled` | bool | Enable or disable the schedule |
 
-可以在 cron 和一次性之間切換。
+You can switch between recurring and one-shot schedules.
 
-#### delete — 刪除排程
+### `delete` — delete a schedule
 
 ```json
 {"action": "delete", "id": "s-20260525..."}
 ```
 
-### Cron 格式
+### Cron Format
 
-支援標準的 5 欄位和 6 欄位 cron 格式：
+Both 5-field and 6-field cron formats are supported:
 
-```
-# 5 欄位（系統自動補秒數 0）
-分 時 日 月 星期幾
-0 9 * * *           → 每天 09:00
-30 14 * * 1-5       → 週一到五 14:30
-0 */2 * * *         → 每 2 小時
+```text
+# 5-field: minute hour day-of-month month day-of-week
+0 9 * * *
 
-# 6 欄位（秒 分 時 日 月 星期幾）
-30 0 9 * * *        → 每天 09:00:30
+# 6-field: second minute hour day-of-month month day-of-week
+0 0 9 * * *
 ```
 
-星期幾使用 Quartz 慣例：1=週日, 2=週一, ..., 7=週六。
+Day-of-week follows Quartz style, where `1=Sun` and `7=Sat`.
 
-### 時區處理
+### Common Schedule Targets
 
-每個排程記錄建立時的時區（IANA 格式），cron 表達式在該時區下求值。
+Typical targets include:
 
-偵測順序：
-1. `TZ` 環境變數
-2. 系統時區（macOS: CoreFoundation, Linux: `/etc/localtime`）
-3. 降級為 `UTC`
+- `lead`
+- `reviewer`
+- `dev`
+- `general`
 
-時區在建立時鎖定，不會因為系統時區變更而改變。
+If `target` is omitted, the schedule usually defaults to the creator or the current agent context.
 
-### 觸發機制
+### Operational Notes
 
-Daemon 的主迴圈每 10 秒執行一次 tick：
-
-1. 載入所有已啟用的排程
-2. 計算檢查區間：`(上次檢查時間, 現在]`
-3. 對每個排程判斷是否應該觸發
-4. 觸發時投遞訊息給目標 agent
-
-區間追蹤防止 daemon 重啟時重複觸發。
-
-### 訊息投遞
-
-根據目標 agent 的狀態使用不同投遞方式：
-
-| 狀態 | 投遞方式 | 記錄狀態 |
-|------|----------|----------|
-| 在線 | 直接注入 PTY stdin | `ok` |
-| 離線 | 寫入收件匣 | `ok_inbox` |
-| 錯過（daemon 當時沒在跑） | 不投遞 | `missed` |
-
-### 一次性排程
-
-一次性排程（`run_at`）在觸發後自動停用，不會再次觸發。
-
-如果 daemon 在排程時間沒有運行：
-- 24 小時內：daemon 啟動時補發（replay）
-- 超過 24 小時：標記為 `stale_dropped` 並停用，不補發過時的訊息
-
-### 執行歷史
-
-每個排程保留最近 50 次執行記錄：
-
-```json
-{
-  "run_history": [
-    {"triggered_at": "2026-05-25T09:00:00Z", "status": "ok"},
-    {"triggered_at": "2026-05-24T09:00:00Z", "status": "ok_inbox"},
-    {"triggered_at": "2026-05-23T09:00:00Z", "status": "missed"}
-  ]
-}
-```
-
-### 儲存
-
-- 位置：`$AGEND_HOME/schedules.json`
-- 格式：版本化 JSON（v1 → v2 自動升級）
-- 鎖定：flock + atomic write（temp → fsync → rename）
+- Schedules persist on disk.
+- The scheduler evaluates them as part of daemon activity.
+- Execution history is useful for debugging when a job fires unexpectedly or not at all.
 
 ---
 
-## Deployments — 批次部署
+## Deployments
 
-### 快速開始
+Deployments are for creating a whole team configuration from a template.
 
-```json
-// 部署一個三人團隊
-{
-  "action": "deploy",
-  "template": "fixup-team",
-  "directory": "/tmp/fixup-workspace",
-  "branch": "main"
-}
-```
+### What a deployment does
 
-### 部署範本
+A deployment can create or update a multi-agent setup, including:
 
-在 `fleet.yaml` 中定義部署範本：
+- worktrees
+- fleet.yaml entries
+- team metadata
+- deployment-scoped coordination state
 
-```yaml
-templates:
-  fixup-team:
-    orchestrator: lead
-    instances:
-      lead:
-        backend: claude
-        role: "團隊 orchestrator，負責任務分派和審查結果彙整"
-      dev:
-        backend: claude
-        role: "實作者，負責寫程式碼和修 bug"
-      reviewer:
-        backend: claude
-        role: "審查者，負責 code review"
-```
-
-### 操作
-
-#### deploy — 部署
-
-| 參數 | 類型 | 必要 | 說明 |
-|------|------|------|------|
-| `template` | string | 是 | 範本名稱（`fleet.yaml` 中定義） |
-| `directory` | string | 是 | 工作目錄父路徑 |
-| `name` | string | 否 | 部署名稱（預設使用範本名） |
-| `branch` | string | 否 | Git 分支（自動建立 worktree） |
-
-部署流程分四個階段：
-
-1. **驗證與 Worktree**：驗證範本，為每個 agent 建立 `<directory>/<name>-<suffix>` 子目錄。如果指定了 `branch`，使用 `git worktree add`
-2. **Fleet.yaml 寫入**：將所有 instance 定義寫入 `fleet.yaml`
-3. **Agent 啟動**：逐一 spawn 每個 agent
-4. **Team 建立**：如果是多 agent 範本，自動建立 team 並指定 orchestrator
-
-#### teardown — 拆除
-
-```json
-{
-  "action": "teardown",
-  "name": "fixup-team"
-}
-```
-
-拆除流程：
-1. 刪除所有 agent instance
-2. 清理檔案系統（刪除工作目錄）
-3. 從 `fleet.yaml` 移除 instance 定義
-4. 刪除 team（如果有）
-5. 從部署記錄中移除
-
-如果父目錄在拆除後為空，也會一併清理。
-
-#### list — 列出部署
-
-```json
-{"action": "list"}
-```
-
-回傳所有部署記錄，包含 instance 清單和建立時間。
-
-### 孤兒部署清理
-
-Daemon 啟動時自動檢查孤兒部署——部署記錄中的 instance 在 `fleet.yaml` 中已不存在的情況。孤兒部署會自動清理相關的 team 和檔案系統。
-
-### 儲存
-
-- 位置：`$AGEND_HOME/deployments.json`
-- 格式：版本化 JSON
-- 鎖定：flock + atomic write
-
----
-
-## 典型用法
-
-### 每日 Standup 提醒
-
-```json
-{
-  "action": "create",
-  "cron": "0 9 * * 1-5",
-  "message": "早安！請回報：1) 昨天完成了什麼 2) 今天計畫做什麼 3) 有沒有阻塞",
-  "target": "lead",
-  "label": "daily-standup"
-}
-```
-
-### 定期檢查 PR 狀態
-
-```json
-{
-  "action": "create",
-  "cron": "0 */3 * * *",
-  "message": "請檢查所有 open PR 的 CI 狀態，回報任何失敗的 check。",
-  "target": "reviewer",
-  "label": "pr-health-check"
-}
-```
-
-### 延遲提醒
-
-```json
-{
-  "action": "create",
-  "run_at": "2026-05-25T15:00:00",
-  "message": "提醒：今天 3 點有 release cut，確認所有 PR 已合併",
-  "target": "lead"
-}
-```
-
-### 一鍵部署團隊
+### Typical usage
 
 ```json
 {
   "action": "deploy",
-  "template": "fixup-team",
-  "directory": "/tmp/sprint-59",
-  "branch": "main",
-  "name": "sprint-59"
+  "name": "docs-batch",
+  "template": "docs-team",
+  "branch": "docs/1195-bilingual-batch-c"
 }
 ```
 
-部署完成後，三個 agent 各自在 `/tmp/sprint-59/sprint-59-lead`、`/tmp/sprint-59/sprint-59-dev`、`/tmp/sprint-59/sprint-59-reviewer` 目錄工作，team 已建立，lead 為 orchestrator。
+### `deploy`
 
-### 工作結束後拆除
+| Parameter | Type | Required | Description |
+|---|---|---:|---|
+| `name` | string | yes | Deployment name |
+| `template` | string | yes | Template name from `fleet.yaml` |
+| `branch` | string | no | Git branch for worktrees |
+| `directory` | string | no | Override working directory |
 
-```json
-{
-  "action": "teardown",
-  "name": "sprint-59"
-}
-```
+### `teardown`
 
-一個指令清理所有 agent、team、工作目錄和 fleet.yaml 記錄。
+Deletes the deployment scaffolding. Use this when a batch is finished and the temporary team no longer needs to exist.
+
+### `list`
+
+Lists existing deployments so you can see what has already been stamped out.
+
+---
+
+## When to Use Schedules vs Deployments
+
+Use **Schedules** when you need a message or action to happen later.
+
+Use **Deployments** when you need to create a reusable team setup now.
+
+A good rule of thumb:
+
+- if the question is "when should this happen?" use schedules
+- if the question is "what should exist right now?" use deployments
+
+---
+
+## Storage Model
+
+Schedules and deployments both persist state under the AgEnD home directory. That means they survive daemon restarts and are visible to the operator from the filesystem if needed.
+
+The important implication is that these features are not ephemeral memory:
+
+- a scheduled reminder still exists after restart
+- a deployment entry can be queried later
+- the daemon reconstructs state from disk on startup
+
+---
+
+## Failure Modes
+
+### Invalid cron
+
+If the cron expression does not parse, creation fails immediately. Fix the expression before retrying.
+
+### Missing target
+
+If a schedule should fire to a specific agent but the name is wrong, the message will route nowhere useful. Always validate the target name against the fleet.
+
+### Deployment template mismatch
+
+If the deployment template does not match the fleet structure, the resulting setup may be incomplete or partially populated. Treat the template as the source of truth for that deployment shape.
+
+---
+
+## Common Patterns
+
+### Daily standup reminder
+
+Use a recurring schedule with a target like `lead` or `general`.
+
+### Time-boxed review nudge
+
+Use a one-shot schedule when a single deadline matters more than a recurring cadence.
+
+### Team bootstrap
+
+Use a deployment when you need to provision a repeatable multi-agent arrangement for a sprint or batch.
+
+---
+
+## Source Pointers
+
+- `src/schedule.rs`: schedule storage and dispatch
+- `src/deployment.rs`: deployment orchestration
+- `src/main.rs`: CLI subcommand routing
+- `src/mcp/handlers/schedule.rs`: MCP surface
+- `src/mcp/handlers/deployment.rs`: deployment surface
+
+---
+
+## Practical Advice
+
+1. Prefer one-shot schedules for deadline-driven work.
+2. Add labels that will make sense in logs weeks later.
+3. Use deployments for repeatable fleet setups, not ad hoc reminders.
+4. Keep cron expressions simple unless you have a strong reason to complicate them.
