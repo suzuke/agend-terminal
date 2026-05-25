@@ -94,7 +94,7 @@ pub(super) fn handle_send_to_instance(
             "method": crate::api::method::SEND,
             // #1024 (closes #1002 ROOT 2): `reviewed_head` MUST be forwarded; see
             // sibling `handle_report_result` + `auto_release::is_verdict_message`.
-            "params": { "from": sender.as_str(), "target": target, "text": text, "kind": kind, "thread_id": thread_id, "parent_id": parent_id, "correlation_id": args["correlation_id"].as_str(), "reviewed_head": args["reviewed_head"].as_str(), "sequencing": args["sequencing"].as_str(), "eta_minutes": args["eta_minutes"].as_u64(), "reporting_cadence": args["reporting_cadence"].as_str(), "worktree_binding_required": args["worktree_binding_required"].as_bool(), "expect_reply_within_secs": args["expect_reply_within_secs"].as_i64() }
+            "params": { "from": sender.as_str(), "target": target, "text": text, "kind": kind, "thread_id": thread_id, "parent_id": parent_id, "correlation_id": args["correlation_id"].as_str(), "reviewed_head": args["reviewed_head"].as_str(), "sequencing": args["sequencing"].as_str(), "eta_minutes": args["eta_minutes"].as_u64(), "reporting_cadence": args["reporting_cadence"].as_str(), "worktree_binding_required": args["worktree_binding_required"].as_bool(), "expect_reply_within_secs": args["expect_reply_within_secs"].as_i64(), "terminal": args["terminal"].as_bool() }
         }),
     ) {
         Ok(resp) if resp["ok"].as_bool() == Some(true) => {
@@ -121,6 +121,7 @@ pub(super) fn handle_send_to_instance(
                 text: text.to_string(),
                 timestamp: chrono::Utc::now().to_rfc3339(),
                 delivery_mode: Some("inbox_fallback".to_string()),
+                terminal: args["terminal"].as_bool(),
                 ..Default::default()
             };
             crate::agent_ops::fallback_deliver(home, sender.as_str(), target, text, msg, &e)
@@ -472,6 +473,7 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
                     "reviewed_head": reviewed_head,
                     "thread_id": args["thread_id"].as_str(),
                     "parent_id": args["parent_id"].as_str(),
+                    "terminal": args["terminal"].as_bool(),
                 }
             }),
         ) {
@@ -489,6 +491,7 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
                     text: msg.clone(),
                     kind: Some("report".to_string()),
                     timestamp: chrono::Utc::now().to_rfc3339(),
+                    terminal: args["terminal"].as_bool(),
                     ..Default::default()
                 };
                 crate::agent_ops::fallback_deliver(
