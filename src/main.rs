@@ -49,6 +49,7 @@ mod protocol;
 mod quickstart;
 mod render;
 mod runtime;
+pub mod runtime_config;
 mod schedules;
 mod service;
 mod skills;

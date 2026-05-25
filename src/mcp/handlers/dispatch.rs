@@ -381,6 +381,34 @@ fn dispatch_watchdog(ctx: &HandlerCtx<'_>) -> Value {
     }
 }
 
+fn dispatch_config(ctx: &HandlerCtx<'_>) -> Value {
+    match ctx.args["action"].as_str().unwrap_or("") {
+        "get" => {
+            let key = ctx.args["key"].as_str().unwrap_or("");
+            if key.is_empty() {
+                return json!({"error": "key is required for get"});
+            }
+            match crate::runtime_config::get_key(key) {
+                Ok(v) => json!({"key": key, "value": v}),
+                Err(e) => json!({"error": e}),
+            }
+        }
+        "set" => {
+            let key = ctx.args["key"].as_str().unwrap_or("");
+            let value = ctx.args["value"].as_str().unwrap_or("");
+            if key.is_empty() || value.is_empty() {
+                return json!({"error": "key and value are required for set"});
+            }
+            match crate::runtime_config::set(ctx.home, key, value) {
+                Ok(_) => json!({"ok": true, "key": key, "value": value}),
+                Err(e) => json!({"error": e}),
+            }
+        }
+        "list" => json!({"config": crate::runtime_config::list()}),
+        other => json!({"error": format!("unknown config action: {other}")}),
+    }
+}
+
 fn dispatch_watchdog_snooze(ctx: &HandlerCtx<'_>) -> Value {
     use crate::daemon::idle_watchdog;
 
@@ -819,6 +847,12 @@ static REGISTERED: &[HandlerEntry] = &[
         handler: dispatch_watchdog,
         actions: Some(WATCHDOG_ACTIONS),
     },
+    // #1085: runtime-mutable config
+    HandlerEntry {
+        name: "config",
+        handler: dispatch_config,
+        actions: None,
+    },
     HandlerEntry {
         name: "repo",
         handler: dispatch_repo,
@@ -947,6 +981,7 @@ mod tests {
                 "deployment",
                 "health",
                 "watchdog",
+                "config",
                 "repo",
                 "schedule",
                 "team",
@@ -959,7 +994,7 @@ mod tests {
                 "restart_daemon",
             ]
         );
-        assert_eq!(registered_handlers().len(), 31);
+        assert_eq!(registered_handlers().len(), 32);
     }
 
     /// Coverage test: every tool name advertised by

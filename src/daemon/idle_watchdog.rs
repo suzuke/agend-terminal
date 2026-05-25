@@ -15,14 +15,14 @@
 //!
 //! ### #10 — dev 60min idle watchdog (P0)
 //! Scans the watched-agent's last_active timestamp. When elapsed
-//! exceeds `DEV_IDLE_THRESHOLD_SECS = 3600` (60 min), emits an
+//! exceeds `dev_idle_threshold_secs() = 3600` (60 min), emits an
 //! inbox ping to `lead` so the orchestrator can re-dispatch /
 //! unblock. Default watched agent: `dev`. Tunable via
 //! `AGEND_IDLE_WATCHDOG_AGENT` env var.
 //!
 //! ### #12 — cross-vantage 30min fleet-idle guard (P1)
 //! Scans the entire fleet's last_active timestamps. When EVERY
-//! tracked agent has been idle > `FLEET_IDLE_THRESHOLD_SECS = 1800`
+//! tracked agent has been idle > `fleet_idle_threshold_secs() = 1800`
 //! (30 min) AND at least one agent has had recent activity (i.e.
 //! a sidecar exists), emits an inbox ping to `general` so the
 //! operator-facing aggregator surfaces the fleet stall. The
@@ -44,12 +44,16 @@ const ACTIVITY_DIR: &str = "agent-activity";
 const SCHEMA_VERSION: u32 = 1;
 
 /// Lead-spec threshold for the dev watchdog (vantage #10): agent
-/// silent > 60 min → ping lead.
-pub(crate) const DEV_IDLE_THRESHOLD_SECS: i64 = 60 * 60;
+/// silent > 60 min → ping lead. Overridable via runtime-config.json (#1085).
+pub(crate) fn dev_idle_threshold_secs() -> i64 {
+    crate::runtime_config::get().dev_idle_threshold_secs
+}
 
 /// Lead-spec threshold for the fleet watchdog (vantage #12): every
-/// tracked agent silent > 30 min → ping general.
-pub(crate) const FLEET_IDLE_THRESHOLD_SECS: i64 = 30 * 60;
+/// tracked agent silent > 30 min → ping general. Overridable via runtime-config.json (#1085).
+pub(crate) fn fleet_idle_threshold_secs() -> i64 {
+    crate::runtime_config::get().fleet_idle_threshold_secs
+}
 
 /// Scan throttle in supervisor TICK iterations. 30 × 10 s = 5 min
 /// — matches PR-1's anti-stall cadence so both watchdogs scan in
@@ -270,7 +274,7 @@ fn scan_dev_vantage(
         return;
     };
     let elapsed_secs = now.signed_duration_since(last_active).num_seconds();
-    if elapsed_secs <= DEV_IDLE_THRESHOLD_SECS {
+    if elapsed_secs <= dev_idle_threshold_secs() {
         return;
     }
     let key = ("dev", agent.clone());
@@ -279,7 +283,7 @@ fn scan_dev_vantage(
         // (suppresses flooding while still surfacing extended
         // stalls every threshold-window).
         let since_alert = now.signed_duration_since(*prev).num_seconds();
-        if since_alert < DEV_IDLE_THRESHOLD_SECS {
+        if since_alert < dev_idle_threshold_secs() {
             return;
         }
     }
@@ -289,9 +293,10 @@ fn scan_dev_vantage(
         "dev_idle_watchdog",
         &format!(
             "[dev_idle_watchdog] agent '{agent}' has been silent for \
-             {elapsed_secs}s (threshold {DEV_IDLE_THRESHOLD_SECS}s). \
+             {elapsed_secs}s (threshold {}s). \
              Possible dispatch protocol gap or unblock-needed state. \
-             Consider: lead dispatch / unblock-ping / decision-log scan."
+             Consider: lead dispatch / unblock-ping / decision-log scan.",
+            dev_idle_threshold_secs()
         ),
         Some(&agent),
     );
@@ -440,7 +445,7 @@ fn scan_fleet_vantage(
     // All agents must exceed the threshold for "fleet idle".
     let all_idle = pairs
         .iter()
-        .all(|(_, ts)| now.signed_duration_since(*ts).num_seconds() > FLEET_IDLE_THRESHOLD_SECS);
+        .all(|(_, ts)| now.signed_duration_since(*ts).num_seconds() > fleet_idle_threshold_secs());
     if !all_idle {
         return;
     }
@@ -452,7 +457,7 @@ fn scan_fleet_vantage(
     let key = ("fleet", "*".to_string());
     if let Some(prev) = last_alerted.get(&key) {
         let since_alert = now.signed_duration_since(*prev).num_seconds();
-        if since_alert < FLEET_IDLE_THRESHOLD_SECS {
+        if since_alert < fleet_idle_threshold_secs() {
             return;
         }
     }
@@ -467,10 +472,11 @@ fn scan_fleet_vantage(
         &fleet_idle_recipient(),
         "fleet_idle_watchdog",
         &format!(
-            "[fleet_idle_watchdog] all tracked agents silent > {FLEET_IDLE_THRESHOLD_SECS}s \
+            "[fleet_idle_watchdog] all tracked agents silent > {}s \
              (max elapsed {oldest}s). Tracked agents: {agent_list:?}. \
              Cross-vantage signal: investigate decision log + git status + inbox \
-             for stalled sprint state."
+             for stalled sprint state.",
+            fleet_idle_threshold_secs()
         ),
         None,
     );
@@ -529,6 +535,12 @@ fn emit_idle_alert(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    // Test-only constants matching runtime defaults.
+    #[allow(dead_code)]
+    const DEV_IDLE_THRESHOLD_SECS: i64 = 3600;
+    #[allow(dead_code)]
+    const FLEET_IDLE_THRESHOLD_SECS: i64 = 1800;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     fn tmp_home(tag: &str) -> std::path::PathBuf {
@@ -579,7 +591,7 @@ mod tests {
         std::env::remove_var("AGEND_IDLE_WATCHDOG_AGENT");
         std::env::remove_var("AGEND_IDLE_WATCHDOG_DEV_RECIPIENT");
         let home = tmp_home("dev-pings");
-        let stale = chrono::Utc::now() - chrono::Duration::seconds(DEV_IDLE_THRESHOLD_SECS + 60);
+        let stale = chrono::Utc::now() - chrono::Duration::seconds(dev_idle_threshold_secs() + 60);
         write_activity_at(&home, "dev", stale);
         let mut last_alerted = HashMap::new();
         scan_and_emit(&home, &mut last_alerted);
@@ -596,7 +608,7 @@ mod tests {
         std::env::remove_var("AGEND_IDLE_WATCHDOG_AGENT");
         std::env::remove_var("AGEND_IDLE_WATCHDOG_DEV_RECIPIENT");
         let home = tmp_home("dev-no-ping");
-        let recent = chrono::Utc::now() - chrono::Duration::seconds(DEV_IDLE_THRESHOLD_SECS - 60);
+        let recent = chrono::Utc::now() - chrono::Duration::seconds(dev_idle_threshold_secs() - 60);
         write_activity_at(&home, "dev", recent);
         let mut last_alerted = HashMap::new();
         scan_and_emit(&home, &mut last_alerted);
@@ -615,7 +627,7 @@ mod tests {
         std::env::remove_var("AGEND_IDLE_WATCHDOG_DEV_RECIPIENT");
         let home = tmp_home("dev-reset");
         // First scan: dev stale → alert.
-        let stale = chrono::Utc::now() - chrono::Duration::seconds(DEV_IDLE_THRESHOLD_SECS + 60);
+        let stale = chrono::Utc::now() - chrono::Duration::seconds(dev_idle_threshold_secs() + 60);
         write_activity_at(&home, "dev", stale);
         let mut last_alerted = HashMap::new();
         scan_and_emit(&home, &mut last_alerted);
@@ -641,11 +653,11 @@ mod tests {
         let home = tmp_home("fleet-idle");
         // Multiple tracked agents, ALL stale > 30min.
         let stale_dev =
-            chrono::Utc::now() - chrono::Duration::seconds(FLEET_IDLE_THRESHOLD_SECS + 60);
+            chrono::Utc::now() - chrono::Duration::seconds(fleet_idle_threshold_secs() + 60);
         let stale_lead =
-            chrono::Utc::now() - chrono::Duration::seconds(FLEET_IDLE_THRESHOLD_SECS + 120);
+            chrono::Utc::now() - chrono::Duration::seconds(fleet_idle_threshold_secs() + 120);
         let stale_reviewer =
-            chrono::Utc::now() - chrono::Duration::seconds(FLEET_IDLE_THRESHOLD_SECS + 200);
+            chrono::Utc::now() - chrono::Duration::seconds(fleet_idle_threshold_secs() + 200);
         // Note: dev stale beyond DEV_IDLE_THRESHOLD too — but
         // FLEET_IDLE_THRESHOLD < DEV_IDLE_THRESHOLD, so dev vantage
         // alone might also fire. We assert the fleet vantage
@@ -676,7 +688,8 @@ mod tests {
         // threshold; one fresh entry pulls the fleet out of idle
         // state. Heartbeat lag = whole fleet appears stale; real
         // partial activity = at least one fresh entry.)
-        let stale = chrono::Utc::now() - chrono::Duration::seconds(FLEET_IDLE_THRESHOLD_SECS + 60);
+        let stale =
+            chrono::Utc::now() - chrono::Duration::seconds(fleet_idle_threshold_secs() + 60);
         let recent = chrono::Utc::now() - chrono::Duration::seconds(60);
         write_activity_at(&home, "dev", stale);
         write_activity_at(&home, "lead", stale);
@@ -703,7 +716,8 @@ mod tests {
         std::env::remove_var("AGEND_IDLE_WATCHDOG_AGENT");
         std::env::remove_var("AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT");
         let home = tmp_home("fleet-investigation");
-        let stale = chrono::Utc::now() - chrono::Duration::seconds(FLEET_IDLE_THRESHOLD_SECS + 60);
+        let stale =
+            chrono::Utc::now() - chrono::Duration::seconds(fleet_idle_threshold_secs() + 60);
         write_activity_at(&home, "dev", stale);
         write_activity_at(&home, "lead", stale);
         let mut last_alerted = HashMap::new();
@@ -769,7 +783,7 @@ mod tests {
         std::env::remove_var("AGEND_IDLE_WATCHDOG_AGENT");
         std::env::remove_var("AGEND_IDLE_WATCHDOG_DEV_RECIPIENT");
         let home = tmp_home("dev-dedup");
-        let stale = chrono::Utc::now() - chrono::Duration::seconds(DEV_IDLE_THRESHOLD_SECS + 60);
+        let stale = chrono::Utc::now() - chrono::Duration::seconds(dev_idle_threshold_secs() + 60);
         write_activity_at(&home, "dev", stale);
         let mut last_alerted = HashMap::new();
         // Two scans without intervening activity touch → dedup
@@ -897,7 +911,8 @@ mod tests {
             "instances:\n  dev:\n    backend: claude\n  lead:\n    backend: claude\n",
         )
         .unwrap();
-        let stale = chrono::Utc::now() - chrono::Duration::seconds(FLEET_IDLE_THRESHOLD_SECS + 60);
+        let stale =
+            chrono::Utc::now() - chrono::Duration::seconds(fleet_idle_threshold_secs() + 60);
         write_activity_at(&home, "dev", stale);
         write_activity_at(&home, "lead", stale);
         write_activity_at(&home, "demo-lead", stale);
@@ -937,7 +952,8 @@ mod tests {
         let _g = env_lock();
         std::env::remove_var("AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT");
         let home = tmp_home("snooze-suppress");
-        let stale = chrono::Utc::now() - chrono::Duration::seconds(FLEET_IDLE_THRESHOLD_SECS + 60);
+        let stale =
+            chrono::Utc::now() - chrono::Duration::seconds(fleet_idle_threshold_secs() + 60);
         write_activity_at(&home, "dev", stale);
         write_activity_at(&home, "lead", stale);
         // Snooze for 1 hour from now
@@ -960,7 +976,8 @@ mod tests {
         let _g = env_lock();
         std::env::remove_var("AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT");
         let home = tmp_home("snooze-expired");
-        let stale = chrono::Utc::now() - chrono::Duration::seconds(FLEET_IDLE_THRESHOLD_SECS + 60);
+        let stale =
+            chrono::Utc::now() - chrono::Duration::seconds(fleet_idle_threshold_secs() + 60);
         write_activity_at(&home, "dev", stale);
         write_activity_at(&home, "lead", stale);
         // Snooze with PAST timestamp (already expired)
@@ -984,7 +1001,7 @@ mod tests {
         std::env::remove_var("AGEND_IDLE_WATCHDOG_AGENT");
         std::env::remove_var("AGEND_IDLE_WATCHDOG_DEV_RECIPIENT");
         let home = tmp_home("snooze-dev-unaffected");
-        let stale = chrono::Utc::now() - chrono::Duration::seconds(DEV_IDLE_THRESHOLD_SECS + 60);
+        let stale = chrono::Utc::now() - chrono::Duration::seconds(dev_idle_threshold_secs() + 60);
         write_activity_at(&home, "dev", stale);
         // Snooze fleet
         let until = chrono::Utc::now() + chrono::Duration::hours(1);
@@ -1023,7 +1040,8 @@ mod tests {
         )
         .unwrap();
         let recent = chrono::Utc::now() - chrono::Duration::seconds(60);
-        let stale = chrono::Utc::now() - chrono::Duration::seconds(FLEET_IDLE_THRESHOLD_SECS + 60);
+        let stale =
+            chrono::Utc::now() - chrono::Duration::seconds(fleet_idle_threshold_secs() + 60);
         write_activity_at(&home, "dev", recent);
         write_activity_at(&home, "ghost-1", stale);
         write_activity_at(&home, "ghost-2", stale);
@@ -1047,7 +1065,8 @@ mod tests {
         std::env::remove_var("AGEND_IDLE_WATCHDOG_AGENT");
         std::env::remove_var("AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT");
         let home = tmp_home("ack-suppress");
-        let stale = chrono::Utc::now() - chrono::Duration::seconds(FLEET_IDLE_THRESHOLD_SECS + 60);
+        let stale =
+            chrono::Utc::now() - chrono::Duration::seconds(fleet_idle_threshold_secs() + 60);
         write_activity_at(&home, "dev", stale);
         write_activity_at(&home, "lead", stale);
         ack_fleet_idle();
@@ -1070,12 +1089,13 @@ mod tests {
         std::env::remove_var("AGEND_IDLE_WATCHDOG_AGENT");
         std::env::remove_var("AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT");
         let home = tmp_home("ack-resume");
-        let stale = chrono::Utc::now() - chrono::Duration::seconds(FLEET_IDLE_THRESHOLD_SECS + 60);
+        let stale =
+            chrono::Utc::now() - chrono::Duration::seconds(fleet_idle_threshold_secs() + 60);
         write_activity_at(&home, "dev", stale);
         write_activity_at(&home, "lead", stale);
         // Ack in the past so post-ack activity can be simulated.
         let past_ack =
-            chrono::Utc::now() - chrono::Duration::seconds(FLEET_IDLE_THRESHOLD_SECS + 120);
+            chrono::Utc::now() - chrono::Duration::seconds(fleet_idle_threshold_secs() + 120);
         FLEET_ACKED_AT.store(past_ack.timestamp(), Ordering::Relaxed);
         // Simulate one agent becoming active AFTER ack, then going idle again.
         let post_ack_active = past_ack + chrono::Duration::seconds(30);
@@ -1108,7 +1128,7 @@ mod tests {
         std::env::remove_var("AGEND_IDLE_WATCHDOG_AGENT");
         std::env::remove_var("AGEND_IDLE_WATCHDOG_DEV_RECIPIENT");
         let home = tmp_home("ack-dev-unaffected");
-        let stale = chrono::Utc::now() - chrono::Duration::seconds(DEV_IDLE_THRESHOLD_SECS + 60);
+        let stale = chrono::Utc::now() - chrono::Duration::seconds(dev_idle_threshold_secs() + 60);
         write_activity_at(&home, "dev", stale);
         ack_fleet_idle();
         let mut last_alerted = HashMap::new();

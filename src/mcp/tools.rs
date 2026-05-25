@@ -16,6 +16,7 @@ pub fn tool_definitions() -> Value {
     tools.extend(ci_tools());
     tools.extend(health_tools());
     tools.extend(watchdog_tools());
+    tools.extend(config_tools());
     tools.extend(worktree_tools());
     json!({"tools": tools})
 }
@@ -242,6 +243,17 @@ fn watchdog_tools() -> Vec<Value> {
                 "action": {"type": "string", "enum": ["snooze", "resume", "status", "ack"]},
                 "duration": {"type": "string", "description": "Snooze duration (e.g. '2h', '30m', '1h30m'). Clamped to max 4h. Default: 1h."}
             }, "required": ["action"]}}),
+    ]
+}
+
+fn config_tools() -> Vec<Value> {
+    vec![
+        json!({"name": "config", "description": "#1085: Runtime-mutable daemon configuration. Actions: get, set, list. Keys: dev_idle_threshold_secs, fleet_idle_threshold_secs.",
+        "inputSchema": {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["get", "set", "list"]},
+            "key": {"type": "string", "description": "Config key name (required for get/set)"},
+            "value": {"type": "string", "description": "New value (required for set)"}
+        }, "required": ["action"]}}),
     ]
 }
 
@@ -481,8 +493,8 @@ mod tests {
         let tools = defs["tools"].as_array().expect("tools array");
         assert_eq!(
             tools.len(),
-            31,
-            "#1084/#1076: 30 + watchdog(snooze/resume/status/ack) = 31. \
+            32,
+            "#1085: 31 + config(get/set/list) = 32. \
              Current tools: {:?}",
             tools
                 .iter()
