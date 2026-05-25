@@ -848,6 +848,7 @@ pub fn merge_instance_into_existing(
         ("model", &config.model),
         ("ready_pattern", &config.ready_pattern),
         ("command", &config.command),
+        ("topic_binding_mode", &config.topic_binding_mode),
     ] {
         merge_string(existing, field, value)?;
     }
@@ -3541,6 +3542,27 @@ instances:
         assert!(
             err.contains("alpha"),
             "conflict report must name the conflicting instance; got: {err}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn merge_preserves_topic_binding_mode_on_existing_instance() {
+        let home = merge_tmp_home("tbm-merge");
+        std::fs::write(
+            fleet_yaml_path(&home),
+            "instances:\n  helper:\n    backend: claude\n",
+        )
+        .unwrap();
+        let entry = InstanceYamlEntry {
+            topic_binding_mode: Some("skip".into()),
+            ..Default::default()
+        };
+        add_instances_to_yaml(&home, &[("helper", &entry)]).unwrap();
+        let v = read_yaml(&home);
+        assert_eq!(
+            v["instances"]["helper"]["topic_binding_mode"], "skip",
+            "#1162: topic_binding_mode must survive merge into existing instance"
         );
         std::fs::remove_dir_all(&home).ok();
     }
