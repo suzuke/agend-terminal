@@ -1193,6 +1193,7 @@ mod tests {
                 branch: None,
                 bind: None,
                 eta_secs: None,
+                tags: vec![],
             },
         )
         .unwrap();

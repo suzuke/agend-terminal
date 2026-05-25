@@ -102,6 +102,14 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                 // optional operator-supplied ETA in seconds. None
                 // disables stall detection for the task.
                 eta_secs: args["eta_secs"].as_i64(),
+                tags: args["tags"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             };
             match crate::task_events::append(home, &emitter, event) {
                 Ok(_) => {
@@ -126,6 +134,7 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
         "list" => {
             let filter_assignee = args["filter_assignee"].as_str();
             let filter_status = args["filter_status"].as_str();
+            let filter_tag = args["filter_tag"].as_str();
             // #806: default trim to actionable statuses unless caller
             // opts in to history. `filtered_default=true` on the
             // response signals callers (audit / forensics) that the
@@ -141,6 +150,7 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                 .iter()
                 .filter(|t| filter_assignee.is_none_or(|a| t.assignee.as_deref() == Some(a)))
                 .filter(|t| filter_status.is_none_or(|s| t.status == s))
+                .filter(|t| filter_tag.is_none_or(|tag| t.tags.iter().any(|tt| tt == tag)))
                 // #806 default-actionable-only filter — only fires
                 // when neither include_history nor filter_status is
                 // set. Preserves zero impact on filter_status callers.
@@ -535,6 +545,16 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                     description: desc.to_string(),
                 });
             }
+            if let Some(new_tags) = args["tags"].as_array() {
+                let tags: Vec<String> = new_tags
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect();
+                pending_events.push(crate::task_events::TaskEvent::TagsSet {
+                    task_id: crate::task_events::TaskId(id.clone()),
+                    tags,
+                });
+            }
             // Assignee change without status transition: queue
             // OwnerAssigned. Distinct from Claimed (status stays put).
             if let Some(ref new_owner) = new_assignee {
@@ -794,5 +814,6 @@ fn summarize_event(env: &crate::task_events::TaskEventEnvelope) -> (&str, String
             actor,
             "description updated".to_string(),
         ),
+        TaskEvent::TagsSet { tags, .. } => ("tags_set", actor, format!("tags → {tags:?}")),
     }
 }

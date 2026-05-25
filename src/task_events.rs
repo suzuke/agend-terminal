@@ -226,6 +226,8 @@ pub enum TaskEvent {
         /// envelopes default to `None` via serde.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         eta_secs: Option<i64>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tags: Vec<String>,
     },
     Claimed {
         task_id: TaskId,
@@ -311,6 +313,11 @@ pub enum TaskEvent {
         by: InstanceName,
         description: String,
     },
+    /// Tags update without status transition.
+    TagsSet {
+        task_id: TaskId,
+        tags: Vec<String>,
+    },
 }
 
 /// Per-task confidence breakdown produced by the legacy-backfill sweep.
@@ -347,7 +354,8 @@ impl TaskEvent {
             | TaskEvent::TaskCloseProposed { task_id, .. }
             | TaskEvent::OwnerAssigned { task_id, .. }
             | TaskEvent::PriorityChanged { task_id, .. }
-            | TaskEvent::DescriptionUpdated { task_id, .. } => task_id,
+            | TaskEvent::DescriptionUpdated { task_id, .. }
+            | TaskEvent::TagsSet { task_id, .. } => task_id,
         }
     }
 
@@ -368,6 +376,7 @@ impl TaskEvent {
             TaskEvent::OwnerAssigned { .. } => "owner_assigned",
             TaskEvent::PriorityChanged { .. } => "priority_changed",
             TaskEvent::DescriptionUpdated { .. } => "description_updated",
+            TaskEvent::TagsSet { .. } => "tags_set",
         }
     }
 }
@@ -458,6 +467,8 @@ pub struct TaskRecord {
     /// `EtaUpdated` event if the contract evolves).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub eta_secs: Option<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -530,6 +541,7 @@ impl TaskBoardState {
                 branch,
                 bind,
                 eta_secs,
+                tags,
                 ..
             } => {
                 self.tasks
@@ -555,6 +567,7 @@ impl TaskBoardState {
                         bind: *bind,
                         started_at: None,
                         eta_secs: *eta_secs,
+                        tags: tags.clone(),
                     });
             }
             TaskEvent::Claimed { by, .. } => {
@@ -670,6 +683,12 @@ impl TaskBoardState {
             TaskEvent::DescriptionUpdated { description, .. } => {
                 if let Some(t) = self.tasks.get_mut(&task_id) {
                     t.description = description.clone();
+                    t.updated_at = touch_at;
+                }
+            }
+            TaskEvent::TagsSet { tags, .. } => {
+                if let Some(t) = self.tasks.get_mut(&task_id) {
+                    t.tags = tags.clone();
                     t.updated_at = touch_at;
                 }
             }
@@ -985,6 +1004,7 @@ mod tests {
             branch: None,
             bind: None,
             eta_secs: None,
+            tags: vec![],
         }
     }
 
@@ -1448,6 +1468,7 @@ mod tests {
                 branch: None,
                 bind: None,
                 eta_secs: None,
+                tags: vec![],
             },
         )
         .unwrap();
@@ -1523,6 +1544,7 @@ mod tests {
                     branch: None,
                     bind: None,
                     eta_secs: None,
+                    tags: vec![],
                 },
                 "Claimed" => TaskEvent::Claimed {
                     task_id: tid.clone(),
@@ -1716,6 +1738,7 @@ mod tests {
                 branch: None,
                 bind: None,
                 eta_secs: None,
+                tags: vec![],
             },
         )
         .unwrap();
@@ -1795,6 +1818,7 @@ mod tests {
                     branch: None,
                     bind: None,
                     eta_secs: None,
+                    tags: vec![],
                 },
             },
             // Sweep Linked appears BEFORE operator Claimed in file order
@@ -1966,6 +1990,7 @@ mod tests {
                 branch: None,
                 bind: Some(false),
                 eta_secs: None,
+                tags: vec![],
             },
         )
         .unwrap();
@@ -2005,6 +2030,7 @@ mod tests {
                 branch: None,
                 bind: None,
                 eta_secs: Some(60),
+                tags: vec![],
             },
         )
         .unwrap();
@@ -2069,6 +2095,7 @@ mod tests {
                 branch: None,
                 bind: None,
                 eta_secs: Some(60),
+                tags: vec![],
             },
         )
         .unwrap();
@@ -2167,6 +2194,7 @@ mod tests {
                 branch: None,
                 bind: None,
                 eta_secs: Some(7200),
+                tags: vec![],
             },
         )
         .unwrap();

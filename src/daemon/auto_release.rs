@@ -345,6 +345,7 @@ mod tests {
             started_at: None,
             eta_secs: None,
             auto_release_on_verdict: None,
+            tags: vec![],
         }
     }
 

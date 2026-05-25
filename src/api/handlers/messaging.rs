@@ -162,6 +162,7 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
             branch: params["branch"].as_str().map(String::from),
             bind: None,
             eta_secs: None,
+            tags: Vec::new(),
         };
         match crate::task_events::append(
             ctx.home,

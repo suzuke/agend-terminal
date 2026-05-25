@@ -40,6 +40,7 @@ fn make_test_task(assignee: Option<&str>) -> Task {
         branch: None,
         started_at: None,
         eta_secs: None,
+        tags: vec![],
         auto_release_on_verdict: None,
     }
 }
@@ -80,6 +81,7 @@ fn make_record(
         bind: None,
         started_at: None,
         eta_secs: None,
+        tags: vec![],
     }
 }
 
@@ -393,6 +395,7 @@ fn reconcile_orphan_owners_with_live_empty_set_orphans_strict_ghost() {
             branch: None,
             bind: None,
             eta_secs: None,
+            tags: vec![],
         }],
     )
     .expect("seed Created event");
@@ -962,6 +965,7 @@ fn test_circular_dep_no_infinite_loop() {
             routed_to: None,
             bind: None,
             eta_secs: None,
+            tags: vec![],
         },
     )
     .unwrap();
@@ -980,6 +984,7 @@ fn test_circular_dep_no_infinite_loop() {
             routed_to: None,
             bind: None,
             eta_secs: None,
+            tags: vec![],
         },
     )
     .unwrap();
@@ -1626,6 +1631,7 @@ fn migration_imports_legacy_tasks_to_event_log() {
                 branch: None,
                 started_at: None,
                 eta_secs: None,
+                tags: vec![],
                 auto_release_on_verdict: None,
             });
         }
@@ -1691,6 +1697,7 @@ fn migration_idempotent_on_second_run() {
             branch: None,
             started_at: None,
             eta_secs: None,
+            tags: vec![],
             auto_release_on_verdict: None,
         });
         Ok(())
