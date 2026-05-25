@@ -110,6 +110,27 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
         );
     }
 
+    // #1176: Dispatch gate — reject kind=task to QuotaExceeded agents.
+    if params["kind"].as_str() == Some("task") {
+        let blocked = {
+            let reg = agent::lock_registry(ctx.registry);
+            reg.get(target).map(|h| {
+                let core = h.core.lock();
+                matches!(
+                    core.health.current_reason,
+                    Some(crate::health::BlockedReason::QuotaExceeded)
+                )
+            })
+        };
+        if blocked == Some(true) {
+            return json!({
+                "ok": false,
+                "error": "target backend quota exceeded",
+                "code": "quota_exceeded"
+            });
+        }
+    }
+
     // #1149: Auto-create task when kind=task + no task_id provided.
     let auto_task_id = if params["kind"].as_str() == Some("task")
         && params["task_id"]
