@@ -326,6 +326,7 @@ pub fn migrate_legacy_tasks_json_to_event_log(home: &Path) -> anyhow::Result<Mig
             // to None which preserves current auto-bind on subsequent
             // dispatches referencing this task_id.
             bind: None,
+            tags: Vec::new(),
         });
         // Emit the minimum status-transition events to bring the task to
         // its current legacy status. The replay-derived view post-PR3

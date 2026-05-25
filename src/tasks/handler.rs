@@ -102,6 +102,14 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                 // optional operator-supplied ETA in seconds. None
                 // disables stall detection for the task.
                 eta_secs: args["eta_secs"].as_i64(),
+                tags: args["tags"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             };
             match crate::task_events::append(home, &emitter, event) {
                 Ok(_) => {

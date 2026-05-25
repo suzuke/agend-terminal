@@ -549,6 +549,7 @@ mod tests {
                 branch: None,
                 bind: None,
                 eta_secs: Some(60),
+                tags: vec![],
             },
         )
         .unwrap();

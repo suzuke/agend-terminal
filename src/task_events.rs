@@ -226,6 +226,8 @@ pub enum TaskEvent {
         /// envelopes default to `None` via serde.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         eta_secs: Option<i64>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tags: Vec<String>,
     },
     Claimed {
         task_id: TaskId,
@@ -539,6 +541,7 @@ impl TaskBoardState {
                 branch,
                 bind,
                 eta_secs,
+                tags,
                 ..
             } => {
                 self.tasks
@@ -564,7 +567,7 @@ impl TaskBoardState {
                         bind: *bind,
                         started_at: None,
                         eta_secs: *eta_secs,
-                        tags: Vec::new(),
+                        tags: tags.clone(),
                     });
             }
             TaskEvent::Claimed { by, .. } => {
@@ -1001,6 +1004,7 @@ mod tests {
             branch: None,
             bind: None,
             eta_secs: None,
+            tags: vec![],
         }
     }
 
@@ -1464,6 +1468,7 @@ mod tests {
                 branch: None,
                 bind: None,
                 eta_secs: None,
+                tags: vec![],
             },
         )
         .unwrap();
@@ -1539,6 +1544,7 @@ mod tests {
                     branch: None,
                     bind: None,
                     eta_secs: None,
+                    tags: vec![],
                 },
                 "Claimed" => TaskEvent::Claimed {
                     task_id: tid.clone(),
@@ -1732,6 +1738,7 @@ mod tests {
                 branch: None,
                 bind: None,
                 eta_secs: None,
+                tags: vec![],
             },
         )
         .unwrap();
@@ -1811,6 +1818,7 @@ mod tests {
                     branch: None,
                     bind: None,
                     eta_secs: None,
+                    tags: vec![],
                 },
             },
             // Sweep Linked appears BEFORE operator Claimed in file order
@@ -1982,6 +1990,7 @@ mod tests {
                 branch: None,
                 bind: Some(false),
                 eta_secs: None,
+                tags: vec![],
             },
         )
         .unwrap();
@@ -2021,6 +2030,7 @@ mod tests {
                 branch: None,
                 bind: None,
                 eta_secs: Some(60),
+                tags: vec![],
             },
         )
         .unwrap();
@@ -2085,6 +2095,7 @@ mod tests {
                 branch: None,
                 bind: None,
                 eta_secs: Some(60),
+                tags: vec![],
             },
         )
         .unwrap();
@@ -2183,6 +2194,7 @@ mod tests {
                 branch: None,
                 bind: None,
                 eta_secs: Some(7200),
+                tags: vec![],
             },
         )
         .unwrap();
