@@ -65,6 +65,9 @@ fn main() {
         is_agent_caller,
     ) {
         Action::Passthrough => exec_real_git(&args, None),
+        Action::ChdirPass(worktree) if is_conflict_capable(subcommand) => {
+            exec_with_conflict_guidance(&args, &worktree);
+        }
         Action::ChdirPass(worktree) => exec_real_git(&args, Some(&worktree)),
         Action::CleanupAndChdirPushPass(worktree) => {
             // #883: best-effort pre-push cleanup of empty `init`
@@ -740,6 +743,34 @@ fn commit_is_empty_heartbeat(worktree: &str, hash: &str) -> bool {
 
 // ── Exec ────────────────────────────────────────────────────────────────
 
+fn exec_with_conflict_guidance(args: &[String], worktree: &str) -> ! {
+    let git = resolve_real_git();
+    let status = Command::new(&git)
+        .arg("-C")
+        .arg(worktree)
+        .args(args)
+        .status();
+    match status {
+        Ok(st) => {
+            if !st.success() && has_unmerged_files(&git, worktree) {
+                eprint!("{}", format_conflict_guidance());
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                if let Some(sig) = st.signal() {
+                    std::process::exit(128 + sig);
+                }
+            }
+            std::process::exit(st.code().unwrap_or(1))
+        }
+        Err(e) => {
+            eprintln!("agend-git: exec failed: {e}");
+            std::process::exit(127);
+        }
+    }
+}
+
 fn exec_real_git(args: &[String], chdir: Option<&str>) -> ! {
     let git = resolve_real_git();
     let mut cmd = Command::new(&git);
@@ -851,6 +882,28 @@ fn write_git_event_typed(
         use std::io::Write;
         let _ = writeln!(f, "{}", event);
     }
+}
+
+fn is_conflict_capable(subcmd: &str) -> bool {
+    matches!(subcmd, "rebase" | "merge" | "pull" | "cherry-pick")
+}
+
+fn has_unmerged_files(git: &str, worktree: &str) -> bool {
+    Command::new(git)
+        .arg("-C")
+        .arg(worktree)
+        .args(["diff", "--name-only", "--diff-filter=U"])
+        .output()
+        .map(|o| !o.stdout.is_empty())
+        .unwrap_or(false)
+}
+
+fn format_conflict_guidance() -> &'static str {
+    "\n\u{26a0} Merge conflict detected. To resolve:\n\
+     1. Edit the conflicted files listed above \u{2014} resolve all <<<<<<< / ======= / >>>>>>> markers\n\
+     2. git add <resolved-files>\n\
+     3. git rebase --continue (or git merge --continue / git cherry-pick --continue)\n\
+     Do NOT abandon and redo from scratch unless the conflict involves complex semantic changes you cannot resolve.\n"
 }
 
 #[cfg(test)]
@@ -1844,5 +1897,101 @@ mod tests {
         let head_after = rev_parse(&worktree, "HEAD");
         assert_eq!(head_before, head_after, "no-op on a clean branch");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ----- #1225: conflict resolution guidance -----
+
+    #[test]
+    fn is_conflict_capable_covers_rebase_merge_pull_cherry_pick() {
+        for cmd in ["rebase", "merge", "pull", "cherry-pick"] {
+            assert!(is_conflict_capable(cmd), "{cmd} should be conflict-capable");
+        }
+        for cmd in ["commit", "add", "push", "status", "reset"] {
+            assert!(
+                !is_conflict_capable(cmd),
+                "{cmd} should NOT be conflict-capable"
+            );
+        }
+    }
+
+    #[test]
+    fn has_unmerged_files_false_on_clean_repo() {
+        let repo = std::env::temp_dir().join(format!(
+            "agend-conflict-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&repo).unwrap();
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["init", "-b", "main"])
+            .output()
+            .unwrap()
+            .status
+            .success());
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["commit", "--allow-empty", "-m", "init"])
+            .output()
+            .unwrap()
+            .status
+            .success());
+        assert!(!has_unmerged_files("git", repo.to_str().unwrap()));
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn has_unmerged_files_true_on_conflict() {
+        let repo = std::env::temp_dir().join(format!(
+            "agend-conflict-pos-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.email", "test@test.com"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(repo.join("f.txt"), "base\n").unwrap();
+        git(&["add", "f.txt"]);
+        git(&["commit", "-m", "base"]);
+        git(&["checkout", "-b", "side"]);
+        std::fs::write(repo.join("f.txt"), "side\n").unwrap();
+        git(&["commit", "-am", "side"]);
+        git(&["checkout", "main"]);
+        std::fs::write(repo.join("f.txt"), "main\n").unwrap();
+        git(&["commit", "-am", "main"]);
+        let merge = git(&["merge", "side", "--no-edit"]);
+        assert!(!merge.status.success(), "merge should fail with conflict");
+        assert!(has_unmerged_files("git", repo.to_str().unwrap()));
+        git(&["merge", "--abort"]);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn conflict_guidance_contains_resolution_steps() {
+        let guidance = format_conflict_guidance();
+        assert!(guidance.contains("resolve"), "should mention resolving");
+        assert!(guidance.contains("git add"), "should mention git add");
+        assert!(guidance.contains("--continue"), "should mention --continue");
+        assert!(
+            guidance.contains("Do NOT abandon"),
+            "should discourage abandoning"
+        );
     }
 }
