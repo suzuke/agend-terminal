@@ -43,6 +43,7 @@ fn make_test_task(assignee: Option<&str>) -> Task {
         tags: vec![],
         parent_id: None,
         auto_release_on_verdict: None,
+        metadata: std::collections::BTreeMap::new(),
     }
 }
 
@@ -84,6 +85,7 @@ fn make_record(
         eta_secs: None,
         tags: vec![],
         parent_id: None,
+        metadata: std::collections::BTreeMap::new(),
     }
 }
 
@@ -1639,6 +1641,7 @@ fn migration_imports_legacy_tasks_to_event_log() {
                 tags: vec![],
                 parent_id: None,
                 auto_release_on_verdict: None,
+                metadata: std::collections::BTreeMap::new(),
             });
         }
         Ok(())
@@ -1706,6 +1709,7 @@ fn migration_idempotent_on_second_run() {
             tags: vec![],
             parent_id: None,
             auto_release_on_verdict: None,
+            metadata: std::collections::BTreeMap::new(),
         });
         Ok(())
     })

@@ -718,6 +718,56 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
             };
             activity_timeline(home, task_id)
         }
+        "metadata_set" => {
+            let id = match args["id"].as_str() {
+                Some(i) => i,
+                None => return serde_json::json!({"error": "missing 'id'"}),
+            };
+            let key = match args["metadata_key"].as_str() {
+                Some(k) => k,
+                None => return serde_json::json!({"error": "missing 'metadata_key'"}),
+            };
+            let value = if let Some(v) = args.get("metadata_value") {
+                if v.is_null() {
+                    return serde_json::json!({"error": "missing 'metadata_value'"});
+                }
+                v.clone()
+            } else {
+                return serde_json::json!({"error": "missing 'metadata_value'"});
+            };
+            let record = match read_task_record(home, id) {
+                Some(r) => r,
+                None => return serde_json::json!({"error": format!("task not found: {id}")}),
+            };
+            if !can_mutate_record(home, instance_name, &record) {
+                return serde_json::json!({"error": "permission denied: caller is not owner/creator"});
+            }
+            let event = crate::task_events::TaskEvent::MetadataSet {
+                task_id: crate::task_events::TaskId(id.to_string()),
+                by: emitter.clone(),
+                key: key.to_string(),
+                value,
+            };
+            match crate::task_events::append(home, &emitter, event) {
+                Ok(_) => {
+                    let task = read_task_record(home, id).map(|r| record_to_task(&r));
+                    serde_json::json!({"id": id, "event": "metadata_set", "task": task})
+                }
+                Err(e) => serde_json::json!({"error": format!("{e}")}),
+            }
+        }
+        "metadata_get" => {
+            let id = match args["id"].as_str() {
+                Some(i) => i,
+                None => return serde_json::json!({"error": "missing 'id'"}),
+            };
+            match read_task_record(home, id) {
+                Some(r) => {
+                    serde_json::json!({"id": id, "metadata": r.metadata})
+                }
+                None => serde_json::json!({"error": format!("task not found: {id}")}),
+            }
+        }
         _ => serde_json::json!({"error": format!("unknown action: {action}")}),
     }
 }
@@ -821,6 +871,244 @@ fn summarize_event(env: &crate::task_events::TaskEventEnvelope) -> (&str, String
             "description updated".to_string(),
         ),
         TaskEvent::TagsSet { tags, .. } => ("tags_set", actor, format!("tags → {tags:?}")),
+        TaskEvent::MetadataSet { key, value, by, .. } => (
+            "metadata_set",
+            by.0.clone(),
+            format!("metadata[{key}] = {value}"),
+        ),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn tmp_home(name: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "agend-metadata-test-{}-{}-{}",
+            std::process::id(),
+            name,
+            id
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    }
+
+    fn create_task(home: &std::path::Path, task_id: &str) {
+        let args = serde_json::json!({
+            "action": "create",
+            "title": "test task",
+        });
+        let emitter = crate::task_events::InstanceName::from("test:operator");
+        let tid = crate::task_events::TaskId(task_id.into());
+        crate::task_events::append(
+            home,
+            &emitter,
+            crate::task_events::TaskEvent::Created {
+                task_id: tid,
+                title: "test task".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: Some(crate::task_events::InstanceName::from("dev-agent")),
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: None,
+                bind: None,
+                eta_secs: None,
+                tags: vec![],
+            },
+        )
+        .expect("create task");
+        let _ = args;
+    }
+
+    #[test]
+    fn metadata_set_writes_and_reads() {
+        let home = tmp_home("set_read");
+        create_task(&home, "t-meta-001");
+
+        let result = handle(
+            &home,
+            "dev-agent",
+            &serde_json::json!({
+                "action": "metadata_set",
+                "id": "t-meta-001",
+                "metadata_key": "pr_url",
+                "metadata_value": "https://github.com/test/repo/pull/42"
+            }),
+        );
+        assert_eq!(result["event"], "metadata_set");
+        assert!(result["error"].is_null(), "unexpected error: {result}");
+
+        let get_result = handle(
+            &home,
+            "dev-agent",
+            &serde_json::json!({
+                "action": "metadata_get",
+                "id": "t-meta-001",
+            }),
+        );
+        assert_eq!(
+            get_result["metadata"]["pr_url"],
+            "https://github.com/test/repo/pull/42"
+        );
+    }
+
+    #[test]
+    fn metadata_set_overwrites_existing_key() {
+        let home = tmp_home("overwrite");
+        create_task(&home, "t-meta-002");
+
+        handle(
+            &home,
+            "dev-agent",
+            &serde_json::json!({
+                "action": "metadata_set",
+                "id": "t-meta-002",
+                "metadata_key": "commit_sha",
+                "metadata_value": "abc123"
+            }),
+        );
+        handle(
+            &home,
+            "dev-agent",
+            &serde_json::json!({
+                "action": "metadata_set",
+                "id": "t-meta-002",
+                "metadata_key": "commit_sha",
+                "metadata_value": "def456"
+            }),
+        );
+
+        let result = handle(
+            &home,
+            "dev-agent",
+            &serde_json::json!({
+                "action": "metadata_get",
+                "id": "t-meta-002",
+            }),
+        );
+        assert_eq!(result["metadata"]["commit_sha"], "def456");
+    }
+
+    #[test]
+    fn metadata_supports_non_string_values() {
+        let home = tmp_home("non_string");
+        create_task(&home, "t-meta-003");
+
+        handle(
+            &home,
+            "dev-agent",
+            &serde_json::json!({
+                "action": "metadata_set",
+                "id": "t-meta-003",
+                "metadata_key": "retry_count",
+                "metadata_value": 3
+            }),
+        );
+
+        let result = handle(
+            &home,
+            "dev-agent",
+            &serde_json::json!({
+                "action": "metadata_get",
+                "id": "t-meta-003",
+            }),
+        );
+        assert_eq!(result["metadata"]["retry_count"], 3);
+    }
+
+    #[test]
+    fn metadata_get_empty_on_new_task() {
+        let home = tmp_home("empty_meta");
+        create_task(&home, "t-meta-004");
+
+        let result = handle(
+            &home,
+            "dev-agent",
+            &serde_json::json!({
+                "action": "metadata_get",
+                "id": "t-meta-004",
+            }),
+        );
+        assert!(result["error"].is_null());
+        assert_eq!(result["metadata"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn metadata_set_missing_key_returns_error() {
+        let home = tmp_home("missing_key");
+        create_task(&home, "t-meta-005");
+
+        let result = handle(
+            &home,
+            "dev-agent",
+            &serde_json::json!({
+                "action": "metadata_set",
+                "id": "t-meta-005",
+                "metadata_value": "some_value"
+            }),
+        );
+        assert!(result["error"].as_str().unwrap().contains("metadata_key"));
+    }
+
+    #[test]
+    fn metadata_set_missing_value_returns_error() {
+        let home = tmp_home("missing_val");
+        create_task(&home, "t-meta-006");
+
+        let result = handle(
+            &home,
+            "dev-agent",
+            &serde_json::json!({
+                "action": "metadata_set",
+                "id": "t-meta-006",
+                "metadata_key": "some_key"
+            }),
+        );
+        assert!(result["error"].as_str().unwrap().contains("metadata_value"));
+    }
+
+    #[test]
+    fn metadata_appears_in_list() {
+        let home = tmp_home("list_meta");
+        create_task(&home, "t-meta-007");
+
+        handle(
+            &home,
+            "dev-agent",
+            &serde_json::json!({
+                "action": "metadata_set",
+                "id": "t-meta-007",
+                "metadata_key": "pr_url",
+                "metadata_value": "https://example.com/pr/1"
+            }),
+        );
+
+        let list = handle(&home, "dev-agent", &serde_json::json!({"action": "list"}));
+        let tasks = list["tasks"].as_array().unwrap();
+        let task = tasks.iter().find(|t| t["id"] == "t-meta-007").unwrap();
+        assert_eq!(task["metadata"]["pr_url"], "https://example.com/pr/1");
+    }
+
+    #[test]
+    fn metadata_get_nonexistent_task_returns_error() {
+        let home = tmp_home("nonexistent");
+
+        let result = handle(
+            &home,
+            "dev-agent",
+            &serde_json::json!({
+                "action": "metadata_get",
+                "id": "t-meta-999",
+            }),
+        );
+        assert!(result["error"].as_str().unwrap().contains("not found"));
     }
 }
 

@@ -146,9 +146,9 @@ fn decision_tools() -> Vec<Value> {
 
 fn task_tools() -> Vec<Value> {
     vec![
-        json!({"name": "task", "description": "Manage task board. Actions: create, list, claim, done, update, sweep, health, activity. #806: default list trims to actionable statuses (open/claimed/in_progress/blocked); pass include_history=true to surface done/cancelled. `sweep` is operator-triggered manual hygiene (4 stale-task categories with dry-run + confirm_ids round-trip). #830: `health` is a one-shot board-hygiene snapshot — totals + by_status + ghost_owners + stale_claims + age aggregates + recommendations array.",
+        json!({"name": "task", "description": "Manage task board. Actions: create, list, claim, done, update, sweep, health, activity, metadata_set, metadata_get. #806: default list trims to actionable statuses (open/claimed/in_progress/blocked); pass include_history=true to surface done/cancelled. `sweep` is operator-triggered manual hygiene (4 stale-task categories with dry-run + confirm_ids round-trip). #830: `health` is a one-shot board-hygiene snapshot — totals + by_status + ghost_owners + stale_claims + age aggregates + recommendations array.",
             "inputSchema": {"type": "object", "properties": {
-                "action": {"type": "string", "enum": ["create", "list", "claim", "done", "update", "sweep", "health", "activity"]},
+                "action": {"type": "string", "enum": ["create", "list", "claim", "done", "update", "sweep", "health", "activity", "metadata_set", "metadata_get"]},
                 "title": {"type": "string"}, "description": {"type": "string"},
                 "priority": {"type": "string", "enum": ["low", "normal", "high", "urgent"]},
                 "assignee": {"type": "string"}, "depends_on": {"type": "array", "items": {"type": "string"}}, "parent_id": {"type": "string", "description": "Parent task ID for subtask composition (A is composed of B,C,D). Complementary to depends_on (execution order)."},
@@ -165,7 +165,9 @@ fn task_tools() -> Vec<Value> {
                 "apply": {"type": "boolean", "description": "#806 sweep: when false (default), returns dry-run plan; when true, emits Cancelled for the confirm_ids subset."},
                 "confirm_ids": {"type": "array", "items": {"type": "string"}, "description": "#806 sweep apply=true: subset of candidate_ids from prior dry-run to actually cancel."},
                 "audit_reason": {"type": "string", "description": "#806 sweep apply=true: required audit text recorded in event-log.jsonl + per-task Cancelled.reason."},
-                "repo": {"type": "string", "description": "#806 sweep: override repo for PR-state queries (defaults to task_sweep.json's repo)."}
+                "repo": {"type": "string", "description": "#806 sweep: override repo for PR-state queries (defaults to task_sweep.json's repo)."},
+                "metadata_key": {"type": "string", "description": "Key for metadata_set action."},
+                "metadata_value": {"description": "Value for metadata_set action (any JSON type)."}
             }, "required": ["action"]}}),
         json!({"name": "task_sweep_config",
         "description": "Configure GitHub-PR auto-close sweep daemon. Sweep polls merged PRs and emits Done events for `Closes t-XXX-N` markers (validated by 5-must-have pipeline).",

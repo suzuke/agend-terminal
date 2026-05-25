@@ -532,6 +532,7 @@ mod tests {
             auto_release_on_verdict: None,
             tags: vec![],
             parent_id: None,
+            metadata: std::collections::BTreeMap::new(),
         }
     }
 
@@ -667,6 +668,7 @@ mod tests {
             auto_release_on_verdict: None,
             tags: vec![],
             parent_id: None,
+            metadata: std::collections::BTreeMap::new(),
         }];
         terminal
             .draw(|frame| {

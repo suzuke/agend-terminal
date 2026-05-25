@@ -325,6 +325,13 @@ pub enum TaskEvent {
         task_id: TaskId,
         tags: Vec<String>,
     },
+    /// Metadata KV bag update — set one key-value pair on a task.
+    MetadataSet {
+        task_id: TaskId,
+        by: InstanceName,
+        key: String,
+        value: serde_json::Value,
+    },
 }
 
 /// Per-task confidence breakdown produced by the legacy-backfill sweep.
@@ -362,7 +369,8 @@ impl TaskEvent {
             | TaskEvent::OwnerAssigned { task_id, .. }
             | TaskEvent::PriorityChanged { task_id, .. }
             | TaskEvent::DescriptionUpdated { task_id, .. }
-            | TaskEvent::TagsSet { task_id, .. } => task_id,
+            | TaskEvent::TagsSet { task_id, .. }
+            | TaskEvent::MetadataSet { task_id, .. } => task_id,
         }
     }
 
@@ -384,6 +392,7 @@ impl TaskEvent {
             TaskEvent::PriorityChanged { .. } => "priority_changed",
             TaskEvent::DescriptionUpdated { .. } => "description_updated",
             TaskEvent::TagsSet { .. } => "tags_set",
+            TaskEvent::MetadataSet { .. } => "metadata_set",
         }
     }
 }
@@ -478,6 +487,8 @@ pub struct TaskRecord {
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<TaskId>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -579,6 +590,7 @@ impl TaskBoardState {
                         eta_secs: *eta_secs,
                         tags: tags.clone(),
                         parent_id: parent_id.clone(),
+                        metadata: BTreeMap::new(),
                     });
             }
             TaskEvent::Claimed { by, .. } => {
@@ -713,6 +725,12 @@ impl TaskBoardState {
             TaskEvent::TagsSet { tags, .. } => {
                 if let Some(t) = self.tasks.get_mut(&task_id) {
                     t.tags = tags.clone();
+                    t.updated_at = touch_at;
+                }
+            }
+            TaskEvent::MetadataSet { key, value, .. } => {
+                if let Some(t) = self.tasks.get_mut(&task_id) {
+                    t.metadata.insert(key.clone(), value.clone());
                     t.updated_at = touch_at;
                 }
             }

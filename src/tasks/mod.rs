@@ -81,6 +81,8 @@ pub struct Task {
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub metadata: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -184,6 +186,7 @@ pub(super) fn record_to_task(r: &crate::task_events::TaskRecord) -> Task {
         auto_release_on_verdict: None,
         tags: r.tags.clone(),
         parent_id: r.parent_id.as_ref().map(|t| t.0.clone()),
+        metadata: r.metadata.clone(),
     }
 }
 
