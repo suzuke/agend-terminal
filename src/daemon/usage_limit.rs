@@ -100,6 +100,7 @@ pub fn notify_operator_usage_limit(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
