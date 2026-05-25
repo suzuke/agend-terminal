@@ -537,6 +537,17 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                     priority: p.to_string(),
                 });
             }
+            // Tags update without status transition.
+            if let Some(new_tags) = args["tags"].as_array() {
+                let tags: Vec<String> = new_tags
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect();
+                pending_events.push(crate::task_events::TaskEvent::TagsSet {
+                    task_id: crate::task_events::TaskId(id.clone()),
+                    tags,
+                });
+            }
             // Assignee change without status transition: queue
             // OwnerAssigned. Distinct from Claimed (status stays put).
             if let Some(ref new_owner) = new_assignee {
@@ -791,5 +802,6 @@ fn summarize_event(env: &crate::task_events::TaskEventEnvelope) -> (&str, String
         TaskEvent::PriorityChanged { priority, .. } => {
             ("priority_changed", actor, format!("priority → {priority}"))
         }
+        TaskEvent::TagsSet { tags, .. } => ("tags_set", actor, format!("tags → {tags:?}")),
     }
 }

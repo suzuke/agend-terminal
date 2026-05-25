@@ -302,6 +302,11 @@ pub enum TaskEvent {
         owner: Option<InstanceName>,
         routed_to: Option<InstanceName>,
     },
+    /// Tags update without status transition.
+    TagsSet {
+        task_id: TaskId,
+        tags: Vec<String>,
+    },
     /// **v2** — priority change without status transition.
     PriorityChanged {
         task_id: TaskId,
@@ -343,7 +348,8 @@ impl TaskEvent {
             | TaskEvent::Released { task_id, .. }
             | TaskEvent::TaskCloseProposed { task_id, .. }
             | TaskEvent::OwnerAssigned { task_id, .. }
-            | TaskEvent::PriorityChanged { task_id, .. } => task_id,
+            | TaskEvent::PriorityChanged { task_id, .. }
+            | TaskEvent::TagsSet { task_id, .. } => task_id,
         }
     }
 
@@ -363,6 +369,7 @@ impl TaskEvent {
             TaskEvent::TaskCloseProposed { .. } => "task_close_proposed",
             TaskEvent::OwnerAssigned { .. } => "owner_assigned",
             TaskEvent::PriorityChanged { .. } => "priority_changed",
+            TaskEvent::TagsSet { .. } => "tags_set",
         }
     }
 }
@@ -664,6 +671,12 @@ impl TaskBoardState {
             TaskEvent::PriorityChanged { priority, .. } => {
                 if let Some(t) = self.tasks.get_mut(&task_id) {
                     t.priority = priority.clone();
+                    t.updated_at = touch_at;
+                }
+            }
+            TaskEvent::TagsSet { tags, .. } => {
+                if let Some(t) = self.tasks.get_mut(&task_id) {
+                    t.tags = tags.clone();
                     t.updated_at = touch_at;
                 }
             }
