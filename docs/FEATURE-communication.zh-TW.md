@@ -2,6 +2,16 @@
 
 AgEnD Terminal 的通訊系統讓 agent 之間能進行結構化的訊息傳遞——委派任務、提出查詢、回報結果、廣播更新。
 
+## 使用情境
+
+> **適用對象：** Agent 基礎設施——agent 透過 MCP 工具使用；operator 通常不直接操作。
+
+**Dev 向 lead 回報完成。** 完成 PR 後，dev agent 呼叫 `send`，帶上 `kind=report` 和任務的 `correlation_id`。Lead agent 的收件匣收到回報，dispatch idle tracker 清除 pending sidecar——全程不需要人工協調。
+
+**Lead 委派任務。** Lead agent 在任務看板建立任務，然後使用 `send` 帶上 `kind=task`、分支名稱和 `next_after_ci=reviewer`。Daemon 自動為 dev 建立 worktree，CI 通過後 reviewer 會被自動通知——整個接力鏈在一次 `send` 呼叫中就設定完成。
+
+**跨團隊狀態廣播。** 某個 agent 需要通知整個團隊 merge freeze。它呼叫 `send` 帶上 `team=fixup` 和 `kind=update`。每個團隊成員都會在收件匣中收到訊息；不需要回覆。發送者會自動從廣播清單中排除。
+
 ## 設計理念
 
 多 agent 協作需要一個可靠的通訊管道。直接透過終端輸出傳遞訊息既不結構化也不可追蹤。通訊系統提供：

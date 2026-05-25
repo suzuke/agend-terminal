@@ -2,6 +2,16 @@
 
 AgEnD Terminal's communication system enables structured message passing between agents — delegating tasks, asking questions, reporting results, and broadcasting updates.
 
+## Usage Scenarios
+
+> **Target audience:** Agent infrastructure — agents use this via MCP tools; operators typically don't interact directly.
+
+**Dev reports completion to lead.** After finishing a PR, the dev agent calls `send` with `kind=report` and the task's `correlation_id`. The lead agent's inbox receives the report, and the dispatch idle tracker clears the pending sidecar — no human coordination needed.
+
+**Lead delegates a task.** The lead agent creates a task on the board, then uses `send` with `kind=task`, a `branch` name, and `next_after_ci=reviewer`. The daemon auto-provisions a worktree for the dev, and once CI passes, the reviewer is automatically notified — the entire handoff chain is wired up in a single `send` call.
+
+**Cross-team status broadcast.** An agent needs to inform the whole team about a merge freeze. It calls `send` with `team=fixup` and `kind=update`. Every team member receives the message in their inbox; no reply is expected. The sender is automatically excluded from the broadcast list.
+
 ## Design Philosophy
 
 Multi-agent collaboration requires a reliable communication channel. Passing messages through raw terminal output is neither structured nor traceable. The communication system provides:

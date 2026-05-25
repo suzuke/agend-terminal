@@ -1,5 +1,15 @@
 # Quickstart — Interactive First-Time Setup
 
+## Usage Scenarios
+
+> **Target audience:** Operators — used through CLI.
+
+**First-time installation.** You've just installed agend-terminal and want to get a working setup with minimal effort. `quickstart` auto-detects which AI backends are on your `$PATH`, walks you through Telegram bot configuration, and generates a `fleet.yaml` you can use immediately.
+
+**Team onboarding.** A new team member joins and needs their own agent fleet. Instead of manually writing fleet.yaml and figuring out Telegram setup, they run `agend-terminal quickstart` and have a working configuration in under 5 minutes.
+
+**Re-setup after machine migration.** You've moved to a new machine and need to reconfigure. Quickstart detects your freshly installed backends and regenerates fleet.yaml, preserving the same interactive flow without requiring you to remember the exact YAML schema.
+
 ## Motivation
 
 AgEnD integrates multiple AI coding backends (Claude Code, Kiro CLI, Codex, OpenCode, Gemini, Agy), each with its own installation path, CLI arguments, and environment variables. The first question every new user faces is: "What do I have installed, and how do I get it running?"

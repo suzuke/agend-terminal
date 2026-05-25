@@ -1,5 +1,15 @@
 # Quickstart — 互動式首次設定
 
+## 使用情境
+
+> **適用對象：** Operator——透過 CLI 使用。
+
+**首次安裝。** 你剛裝好 agend-terminal，想以最少的步驟取得可運作的設定。`quickstart` 會自動偵測 `$PATH` 上的 AI backend、引導你設定 Telegram bot，並產生一份可以直接使用的 `fleet.yaml`。
+
+**團隊新成員加入。** 新成員需要自己的 agent fleet。不用手寫 fleet.yaml 或摸索 Telegram 設定，只要執行 `agend-terminal quickstart`，5 分鐘內就能取得可用的設定。
+
+**換機重新設定。** 搬到新機器後需要重新設定。Quickstart 偵測剛安裝的 backend 並重新產生 fleet.yaml，不需要記住 YAML schema 的細節。
+
 ## 設計初衷
 
 AgEnD 整合了多種 AI coding backend（Claude Code、Kiro CLI、Codex、OpenCode、Gemini、

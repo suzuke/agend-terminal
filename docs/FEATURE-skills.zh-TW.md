@@ -2,6 +2,16 @@
 
 Skills 系統讓你將可重用的技能（prompt、工具定義、參考文件）安裝一次，所有 backend 的 agent 都能自動使用。不需要為每個 backend 分別設定。
 
+## 使用情境
+
+> **適用對象：** Operator 和 agent 皆適用。
+
+**Operator 安裝 code review 技能。** 你在 GitHub 上找到一個社群維護的 code review 技能。執行 `agend-terminal skills add https://github.com/user/code-review-expert.git` 一次，fleet 中的每個 agent——無論它跑的是 Claude、Gemini 還是 Kiro——都能使用這個技能。不需要逐一為每個 backend 設定。
+
+**Agent 啟動時載入技能。** 當 daemon 啟動一個 dev agent 時，skills 系統已經在 agent 的工作目錄下建立好 symlink。Agent 的 backend 從慣例路徑讀取 `SKILL.md`，取得技能的能力——prompt 範本、行為準則或參考資料——不需要任何手動載入步驟。
+
+**Per-agent 篩選。** 你的 reviewer 只應該使用 review 相關的技能，不需要部署或重構技能。你在 fleet.yaml 的 reviewer 設定中加入 `skills: [code-review-expert]`。Daemon 會建立篩選後的 stage 目錄，reviewer 只看得到它需要的技能。
+
 ## 設計理念
 
 不同的 AI backend（Claude、Codex、Gemini、OpenCode、Kiro）各有自己的技能目錄慣例（`.claude/skills/`、`.codex/skills/` 等）。手動在每個目錄下維護相同的技能檔案既繁瑣又容易不同步。

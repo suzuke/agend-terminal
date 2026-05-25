@@ -1,5 +1,15 @@
 # Agent Interaction — 與 Agent 的終端互動
 
+## 使用情境
+
+> **適用對象：** Operator 和 agent 皆適用。
+
+**診斷卡住的 agent。** 儀表板上某個 agent 的健康狀態顯示「hung」。你 `attach` 到它的終端看發生了什麼——也許它在等待權限確認，或陷入迴圈。你可以直接打字讓它脫困，或 `kill` 後讓 daemon 自動重啟。
+
+**腳本自動化。** CI pipeline 需要向正在運行的 agent 發送指令。透過 `inject`，你可以從 shell script 送文字到 agent 的 PTY——不需要互動式終端 session。Agent 會像 operator 親手打字一樣處理它。
+
+**從遠端機器監控。** 你 SSH 到開發伺服器想確認 fleet 狀況。`list --detailed` 可以顯示每個 agent 的狀態和健康度，不需要 TUI。需要更深入的檢查時，`attach` 提供即時終端畫面。
+
 ## 設計初衷
 
 AgEnD 的 agent 運行在獨立的虛擬終端（PTY）中。雖然大部分操作透過 MCP 工具

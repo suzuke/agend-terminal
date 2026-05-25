@@ -1,5 +1,15 @@
 # Fleet Management — Unified Agent Configuration
 
+## Usage Scenarios
+
+> **Target audience:** Operators — used through CLI or TUI.
+
+**Defining your agent team.** You need a lead for task decomposition, a dev for implementation, and a reviewer for code review — all working on the same repo but in isolated worktrees. fleet.yaml lets you declare all three in one file, specifying each agent's role, backend, and working directory.
+
+**Managing shared configuration.** All your agents need the same environment variables and ready patterns, but one uses a different backend. The `defaults` section handles the shared config while individual instances override what's different.
+
+**Scaling up.** Your project grows and you need a second dev or a dedicated tester. Add a few lines to fleet.yaml, restart the daemon, and the new agent is running with the right configuration — including team membership, worktree, and Telegram topic.
+
 ## Motivation
 
 Before fleet.yaml, launching multiple AI agents meant opening separate terminals, configuring environment variables, and specifying working directories for each one. Agents couldn't collaborate, and there was no unified lifecycle management.

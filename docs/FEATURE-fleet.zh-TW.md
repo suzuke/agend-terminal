@@ -1,5 +1,15 @@
 # Fleet Management — 統一管理所有 Agent
 
+## 使用情境
+
+> **適用對象：** Operator——透過 CLI 或 TUI 使用。
+
+**定義你的 agent 團隊。** 你需要一個 lead 負責任務拆解、一個 dev 負責實作、一個 reviewer 負責 code review——三者都在同一個 repo 上工作但使用獨立的 worktree。fleet.yaml 讓你在一個檔案中宣告這三個 agent，分別指定角色、backend 和工作目錄。
+
+**管理共用設定。** 所有 agent 需要相同的環境變數和 ready pattern，但其中一個使用不同的 backend。`defaults` 區段處理共用設定，個別 instance 只覆蓋需要不同的部分。
+
+**擴大團隊。** 專案成長後需要第二個 dev 或專屬的 tester。在 fleet.yaml 加幾行、重啟 daemon，新 agent 就會以正確的設定啟動——包括團隊歸屬、worktree 和 Telegram topic。
+
 ## 設計初衷
 
 在沒有 fleet.yaml 之前，啟動多個 AI agent 需要為每一個分別開終端、設定環境

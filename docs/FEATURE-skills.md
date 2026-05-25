@@ -2,6 +2,16 @@
 
 The Skills system lets you install reusable skills (prompts, tool definitions, reference files) once and have them automatically available to agents on every backend. No need to configure each backend separately.
 
+## Usage Scenarios
+
+> **Target audience:** Both operators and agents.
+
+**Operator installs a code review skill.** You find a community-maintained code review skill on GitHub. You run `agend-terminal skills add https://github.com/user/code-review-expert.git` once, and every agent in your fleet — regardless of whether it runs Claude, Gemini, or Kiro — can now invoke the skill. No per-backend configuration needed.
+
+**Agent loads skills at startup.** When the daemon spawns a dev agent, the skills system has already created symlinks in the agent's working directory. The agent's backend reads `SKILL.md` from its conventional path and gains the skill's capabilities — prompt templates, behavioral guidelines, or reference material — without any explicit loading step.
+
+**Per-agent filtering.** Your reviewer should only have access to review-related skills, not deployment or refactoring skills. You add `skills: [code-review-expert]` to the reviewer's fleet.yaml entry. The daemon creates a filtered stage directory so the reviewer only sees what it needs.
+
 ## Design Philosophy
 
 Different AI backends (Claude, Codex, Gemini, OpenCode, Kiro) each have their own skill directory conventions (`.claude/skills/`, `.codex/skills/`, etc.). Manually maintaining identical skill files across every directory is tedious and error-prone.

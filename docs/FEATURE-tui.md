@@ -2,6 +2,16 @@
 
 AgEnD Terminal provides a tmux-like terminal multiplexer that lets you manage, monitor, and interact with your entire agent fleet from a single screen.
 
+## Usage Scenarios
+
+> **Target audience:** Operators — used through TUI.
+
+**Monitoring a long-running fleet.** Your three-agent team is working on a feature overnight. The TUI lets you see all agents side-by-side — split panes show each agent's terminal output in real time. When one finishes, you switch focus to the next without leaving the interface.
+
+**Interactive task management.** You open the task board overlay (`Ctrl+B T`) to see all tasks in a kanban view — backlog, in progress, and done. You assign a new task to an idle agent directly from the board, then watch it pick up the work in a neighboring pane.
+
+**Ad-hoc agent creation.** Mid-session, you realize you need a helper agent for a one-off task. Press `Ctrl+B c` or type `:spawn helper claude` in the command palette — no fleet.yaml edit or daemon restart needed. The new agent appears as a tab and is ready within seconds.
+
 ## Launch
 
 ```bash

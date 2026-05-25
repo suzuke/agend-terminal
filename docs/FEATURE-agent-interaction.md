@@ -1,5 +1,15 @@
 # Agent Interaction — Terminal Access to Agents
 
+## Usage Scenarios
+
+> **Target audience:** Both operators and agents.
+
+**Diagnosing a stuck agent.** An agent's health status shows "hung" in the dashboard. You `attach` to its terminal to see what's happening — maybe it's waiting for a permission prompt, or stuck in a loop. You can type directly to unstick it, or `kill` and let the daemon auto-restart.
+
+**Scripted automation.** Your CI pipeline needs to send instructions to a running agent. Using `inject`, you send text into the agent's PTY from a shell script — no interactive terminal session required. The agent processes it as if an operator typed it.
+
+**Monitoring from a remote machine.** You SSH into your dev server and want to check on the fleet. `list --detailed` shows each agent's state and health without needing the TUI. For deeper inspection, `attach` gives you a live terminal view.
+
 ## Motivation
 
 AgEnD agents run inside independent pseudo-terminals (PTYs). While most operations go through MCP tools and Telegram, sometimes you need to see the agent's terminal directly — watch what it's thinking, figure out where it's stuck, or type something to steer it.
