@@ -498,13 +498,18 @@ impl FleetConfig {
             .map(|t| t.keys().cloned().collect())
             .unwrap_or_default();
 
-        // Reserved-name warnings (no write).
+        // #1186: Name collision detection — emit error once, not per-tick WARN.
+        static COLLISION_REPORTED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
         for name in self.instances.keys() {
             if template_names.contains(name) {
-                tracing::warn!(
-                    name,
-                    "instance name collides with template name — may cause routing ambiguity"
-                );
+                if !COLLISION_REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::error!(
+                        name,
+                        "fleet.yaml: instance name collides with template name — \
+                         rename one to avoid routing ambiguity"
+                    );
+                }
             }
         }
 
