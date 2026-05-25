@@ -239,6 +239,11 @@ pub struct InstanceConfig {
     /// spawn, operator can retrofit later via `bind_topic`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topic_binding_mode: Option<String>,
+    /// Per-instance idle timeout in seconds. When set, the idle watchdog
+    /// uses this instead of the global `dev_idle_threshold_secs`. Allows
+    /// reviewers to have tighter timeouts than dev agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

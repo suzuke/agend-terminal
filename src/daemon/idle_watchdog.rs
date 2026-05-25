@@ -263,44 +263,81 @@ pub(crate) fn scan_and_emit(
     scan_fleet_vantage(home, &now, last_alerted);
 }
 
-/// Vantage #10 — single agent (dev) idle threshold check.
+/// Look up the current in-progress task for an agent (if any).
+fn current_agent_task(home: &Path, agent: &str) -> Option<String> {
+    let state = crate::task_events::replay(home).ok()?;
+    state
+        .tasks
+        .values()
+        .find(|t| {
+            t.status == crate::task_events::TaskStatus::InProgress
+                && t.owner.as_ref().map(|n| n.as_str()) == Some(agent)
+        })
+        .map(|t| format!("{} — {}", t.id, t.title))
+}
+
+/// Vantage #10 — per-agent idle threshold check. Iterates all fleet
+/// instances, using each agent's `timeout_secs` (falling back to the
+/// global `dev_idle_threshold_secs`). Legacy single-agent mode is
+/// preserved when `AGEND_IDLE_WATCHDOG_AGENT` env var is set.
 fn scan_dev_vantage(
     home: &Path,
     now: &chrono::DateTime<chrono::Utc>,
     last_alerted: &mut HashMap<(&'static str, String), chrono::DateTime<chrono::Utc>>,
 ) {
-    let agent = watched_dev_agent();
-    let Some(last_active) = read_agent_last_active(home, &agent) else {
-        return;
+    let env_agent = std::env::var("AGEND_IDLE_WATCHDOG_AGENT")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+
+    let agents: Vec<(String, i64)> = if let Some(single) = env_agent {
+        vec![(single, dev_idle_threshold_secs())]
+    } else if let Ok(cfg) = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)) {
+        cfg.instances
+            .iter()
+            .map(|(name, ic)| {
+                let threshold = ic
+                    .timeout_secs
+                    .map(|s| s as i64)
+                    .unwrap_or_else(dev_idle_threshold_secs);
+                (name.clone(), threshold)
+            })
+            .collect()
+    } else {
+        vec![(watched_dev_agent(), dev_idle_threshold_secs())]
     };
-    let elapsed_secs = now.signed_duration_since(last_active).num_seconds();
-    if elapsed_secs <= dev_idle_threshold_secs() {
-        return;
-    }
-    let key = ("dev", agent.clone());
-    if let Some(prev) = last_alerted.get(&key) {
-        // Re-alert only after another full threshold has passed
-        // (suppresses flooding while still surfacing extended
-        // stalls every threshold-window).
-        let since_alert = now.signed_duration_since(*prev).num_seconds();
-        if since_alert < dev_idle_threshold_secs() {
-            return;
+
+    for (agent, threshold) in &agents {
+        let Some(last_active) = read_agent_last_active(home, agent) else {
+            continue;
+        };
+        let elapsed_secs = now.signed_duration_since(last_active).num_seconds();
+        if elapsed_secs <= *threshold {
+            continue;
         }
+        let key = ("dev", agent.clone());
+        if let Some(prev) = last_alerted.get(&key) {
+            let since_alert = now.signed_duration_since(*prev).num_seconds();
+            if since_alert < *threshold {
+                continue;
+            }
+        }
+        let task_info =
+            current_agent_task(home, agent).unwrap_or_else(|| "(no active task)".to_string());
+        emit_idle_alert(
+            home,
+            &dev_idle_recipient(),
+            "dev_idle_watchdog",
+            &format!(
+                "[dev_idle_watchdog] agent '{agent}' has been silent for \
+                 {elapsed_secs}s (threshold {threshold}s). \
+                 Current task: {task_info}. \
+                 Possible dispatch protocol gap or unblock-needed state. \
+                 Consider: lead dispatch / unblock-ping / decision-log scan.",
+            ),
+            Some(agent),
+        );
+        last_alerted.insert(key, *now);
     }
-    emit_idle_alert(
-        home,
-        &dev_idle_recipient(),
-        "dev_idle_watchdog",
-        &format!(
-            "[dev_idle_watchdog] agent '{agent}' has been silent for \
-             {elapsed_secs}s (threshold {}s). \
-             Possible dispatch protocol gap or unblock-needed state. \
-             Consider: lead dispatch / unblock-ping / decision-log scan.",
-            dev_idle_threshold_secs()
-        ),
-        Some(&agent),
-    );
-    last_alerted.insert(key, *now);
 }
 
 /// #1084: snooze sidecar path.
@@ -1206,6 +1243,130 @@ mod tests {
                 .iter()
                 .any(|m| m.kind.as_deref() == Some("fleet_idle_watchdog")),
             "#1141: fleet idle must fire when open tasks exist: {general:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── per-agent timeout tests ──────────────────────────────────
+
+    fn write_fleet_yaml(home: &Path, yaml: &str) {
+        std::fs::write(crate::fleet::fleet_yaml_path(home), yaml).unwrap();
+    }
+
+    #[test]
+    fn per_agent_timeout_uses_instance_override() {
+        let _g = env_lock();
+        std::env::remove_var("AGEND_IDLE_WATCHDOG_AGENT");
+        std::env::remove_var("AGEND_IDLE_WATCHDOG_DEV_RECIPIENT");
+        let home = tmp_home("per-agent-override");
+        write_fleet_yaml(
+            &home,
+            "instances:\n  fast-reviewer:\n    backend: claude\n    timeout_secs: 300\n",
+        );
+        let stale = chrono::Utc::now() - chrono::Duration::seconds(400);
+        write_activity_at(&home, "fast-reviewer", stale);
+        let mut last_alerted = HashMap::new();
+        scan_and_emit(&home, &mut last_alerted);
+        let lead = crate::inbox::drain(&home, "lead");
+        assert!(
+            lead.iter()
+                .any(|m| m.kind.as_deref() == Some("dev_idle_watchdog")),
+            "per-agent 300s threshold exceeded at 400s must trigger alert: {lead:?}"
+        );
+        assert!(
+            lead[0].text.contains("fast-reviewer"),
+            "alert must name the agent: {}",
+            lead[0].text
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn per_agent_timeout_no_alert_within_override_window() {
+        let _g = env_lock();
+        std::env::remove_var("AGEND_IDLE_WATCHDOG_AGENT");
+        std::env::remove_var("AGEND_IDLE_WATCHDOG_DEV_RECIPIENT");
+        let home = tmp_home("per-agent-within");
+        write_fleet_yaml(
+            &home,
+            "instances:\n  fast-reviewer:\n    backend: claude\n    timeout_secs: 300\n",
+        );
+        let recent = chrono::Utc::now() - chrono::Duration::seconds(200);
+        write_activity_at(&home, "fast-reviewer", recent);
+        let mut last_alerted = HashMap::new();
+        scan_and_emit(&home, &mut last_alerted);
+        let lead = crate::inbox::drain(&home, "lead");
+        assert!(
+            lead.is_empty(),
+            "200s < 300s threshold must NOT trigger alert: {lead:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn per_agent_timeout_falls_back_to_global_when_unset() {
+        let _g = env_lock();
+        std::env::remove_var("AGEND_IDLE_WATCHDOG_AGENT");
+        std::env::remove_var("AGEND_IDLE_WATCHDOG_DEV_RECIPIENT");
+        let home = tmp_home("per-agent-fallback");
+        write_fleet_yaml(&home, "instances:\n  slow-dev:\n    backend: claude\n");
+        // Stale beyond global threshold (3600s default)
+        let stale = chrono::Utc::now() - chrono::Duration::seconds(dev_idle_threshold_secs() + 60);
+        write_activity_at(&home, "slow-dev", stale);
+        let mut last_alerted = HashMap::new();
+        scan_and_emit(&home, &mut last_alerted);
+        let lead = crate::inbox::drain(&home, "lead");
+        assert!(
+            lead.iter()
+                .any(|m| m.kind.as_deref() == Some("dev_idle_watchdog")),
+            "agent without timeout_secs must use global threshold: {lead:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn per_agent_timeout_alert_includes_current_task() {
+        let _g = env_lock();
+        std::env::remove_var("AGEND_IDLE_WATCHDOG_AGENT");
+        std::env::remove_var("AGEND_IDLE_WATCHDOG_DEV_RECIPIENT");
+        let home = tmp_home("per-agent-task-info");
+        write_fleet_yaml(
+            &home,
+            "instances:\n  dev:\n    backend: claude\n    timeout_secs: 300\n",
+        );
+        // Create an in-progress task owned by "dev"
+        let event = crate::task_events::TaskEvent::Created {
+            task_id: "t-test-1".into(),
+            title: "fix the widget".into(),
+            description: String::new(),
+            priority: "P1".into(),
+            owner: Some("dev".into()),
+            due_at: None,
+            depends_on: vec![],
+            routed_to: None,
+            branch: None,
+            bind: None,
+            eta_secs: None,
+            tags: vec![],
+            parent_id: None,
+        };
+        crate::task_events::append(&home, &"lead".into(), event).unwrap();
+        let claim = crate::task_events::TaskEvent::InProgress {
+            task_id: "t-test-1".into(),
+            by: "dev".into(),
+        };
+        crate::task_events::append(&home, &"dev".into(), claim).unwrap();
+
+        let stale = chrono::Utc::now() - chrono::Duration::seconds(400);
+        write_activity_at(&home, "dev", stale);
+        let mut last_alerted = HashMap::new();
+        scan_and_emit(&home, &mut last_alerted);
+        let lead = crate::inbox::drain(&home, "lead");
+        assert!(!lead.is_empty(), "alert must fire");
+        assert!(
+            lead[0].text.contains("fix the widget"),
+            "alert must include current task title: {}",
+            lead[0].text
         );
         std::fs::remove_dir_all(&home).ok();
     }
