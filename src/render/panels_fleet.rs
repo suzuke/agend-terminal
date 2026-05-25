@@ -151,11 +151,13 @@ pub(super) fn render_fleet_view(
     home: &std::path::Path,
 ) {
     let teams = crate::teams::list_all(home);
-    let all_instances: Vec<String> =
+    let mut all_instances: Vec<String> =
         crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
             .ok()
             .map(|c| c.instance_names())
             .unwrap_or_default();
+    // #1200: stable sort to prevent frame-to-frame jitter (HashMap iteration order).
+    all_instances.sort_unstable();
     let metrics = crate::instance_monitor::latest_metrics();
 
     // Build a lookup of live metrics by instance name.
@@ -186,17 +188,22 @@ pub(super) fn render_fleet_view(
         }
     }
 
-    // Build agent→branch from bindings
-    let mut assigned: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for team in &teams {
+    // #1200: sort teams + members for fully deterministic render order.
+    let mut sorted_teams = teams.clone();
+    sorted_teams.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let mut assigned: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for team in &sorted_teams {
         lines.push(Line::from(Span::styled(
             format!("═══ {} ═══", team.name),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )));
-        for member in &team.members {
-            assigned.insert(member.as_str());
+        let mut members = team.members.clone();
+        members.sort_unstable();
+        for member in &members {
+            assigned.insert(member.clone());
             lines.push(build_agent_line(member, &metrics_map, &agent_tasks, home));
         }
     }
