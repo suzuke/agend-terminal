@@ -1392,36 +1392,43 @@ pub fn try_dismiss_dialog(
             let agent = name.to_string();
             // fire-and-forget: dialog-dismiss keystroke writer is short-lived
             // (sleep 300ms then write). H2: removes from in-flight set on exit.
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(300));
-                // Send keys in chunks split on \r/\n boundaries with delay between,
-                // so TUI frameworks process navigation before confirmation.
-                let mut w = writer.lock();
-                let mut start = 0;
-                for (i, &b) in keys.iter().enumerate() {
-                    if b == b'\r' || b == b'\n' {
-                        // Send everything up to (not including) this Enter
-                        if start < i {
-                            let _ = w.write_all(&keys[start..i]);
+            if std::thread::Builder::new()
+                .name("dismiss-dialog".into())
+                .spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    // Send keys in chunks split on \r/\n boundaries with delay between,
+                    // so TUI frameworks process navigation before confirmation.
+                    let mut w = writer.lock();
+                    let mut start = 0;
+                    for (i, &b) in keys.iter().enumerate() {
+                        if b == b'\r' || b == b'\n' {
+                            // Send everything up to (not including) this Enter
+                            if start < i {
+                                let _ = w.write_all(&keys[start..i]);
+                                let _ = w.flush();
+                                drop(w);
+                                std::thread::sleep(std::time::Duration::from_millis(200));
+                                w = writer.lock();
+                            }
+                            // Send the Enter
+                            let _ = w.write_all(&keys[i..=i]);
                             let _ = w.flush();
-                            drop(w);
-                            std::thread::sleep(std::time::Duration::from_millis(200));
-                            w = writer.lock();
+                            start = i + 1;
                         }
-                        // Send the Enter
-                        let _ = w.write_all(&keys[i..=i]);
-                        let _ = w.flush();
-                        start = i + 1;
                     }
-                }
-                if start < keys.len() {
-                    let _ = w.write_all(&keys[start..]);
-                    let _ = w.flush();
-                }
-                tracing::debug!(agent = %agent, "dismiss keystrokes sent");
-                // H2: remove from in-flight set
-                DISMISS_IN_FLIGHT.lock().remove(&agent);
-            });
+                    if start < keys.len() {
+                        let _ = w.write_all(&keys[start..]);
+                        let _ = w.flush();
+                    }
+                    tracing::debug!(agent = %agent, "dismiss keystrokes sent");
+                    // H2: remove from in-flight set
+                    DISMISS_IN_FLIGHT.lock().remove(&agent);
+                })
+                .is_err()
+            {
+                tracing::warn!(agent = name, "failed to spawn dismiss-dialog thread");
+                DISMISS_IN_FLIGHT.lock().remove(name);
+            }
             return true;
         }
         // Step 4 (Issue #468): operator-visibility log when the literal hint
@@ -1697,7 +1704,7 @@ pub fn broadcast_registry(
 pub fn subscribe_with_dump(agent: &AgentHandle) -> (crossbeam_channel::Receiver<Vec<u8>>, Vec<u8>) {
     let mut core = agent.core.lock();
     let dump = core.vterm.dump_screen();
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let (tx, rx) = crossbeam_channel::bounded(1024);
     core.subscribers.push(tx);
     (rx, dump)
 }

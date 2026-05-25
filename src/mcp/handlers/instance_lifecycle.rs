@@ -61,6 +61,11 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
                 .map(|r| (r.topic_id, r.working_directory))
         })
         .unwrap_or((None, None));
+    // #1157: extract InstanceId before fleet.yaml removal for id-based metadata cleanup.
+    let instance_id = fleet
+        .as_ref()
+        .and_then(|c| c.instances.get(name))
+        .and_then(|i| i.id.clone());
 
     // Sprint 54 P1-B Bug 1: collect per-step errors instead of silently
     // swallowing them. Each cleanup step runs best-effort so even when
@@ -84,6 +89,11 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
     }
     if let Some(ref wd) = working_dir {
         cleanup_working_dir(home, name, wd);
+    }
+    // #1157: clean id-based metadata. Fleet.yaml is already removed above,
+    // so cleanup_working_dir's best-effort lookup may miss the id path.
+    if let Some(ref id) = instance_id {
+        let _ = std::fs::remove_file(home.join("metadata").join(format!("{id}.json")));
     }
     crate::teams::remove_member_from_all(home, name);
 

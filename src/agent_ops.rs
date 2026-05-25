@@ -317,8 +317,21 @@ pub fn cleanup_working_dir(home: &Path, name: &str, working_dir: &Path) {
     }
 
     // Always clean up metadata (regardless of workspace vs user dir)
-    let meta = home.join("metadata").join(format!("{name}.json"));
-    let _ = std::fs::remove_file(&meta);
+    let meta_dir = home.join("metadata");
+    // #1157: also clean id-based metadata (Sprint 46 P2 symlink/copy).
+    // Best-effort: fleet.yaml may already be removed by caller.
+    if let Some(id_path) = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+        .ok()
+        .and_then(|c| {
+            c.instances
+                .get(name)
+                .and_then(|i| i.id.as_deref())
+                .map(|id| meta_dir.join(format!("{id}.json")))
+        })
+    {
+        let _ = std::fs::remove_file(&id_path);
+    }
+    let _ = std::fs::remove_file(meta_dir.join(format!("{name}.json")));
 }
 
 // ---------------------------------------------------------------------------
