@@ -1,0 +1,23 @@
+flowchart TD
+    A["👤 操作者撰寫 fleet.yaml"] --> B["⚙️ Daemon 啟動 agents"]
+    B --> C["👤 操作者透過 TUI / Telegram 指派任務"]
+    C --> D["🤖 Lead 在任務看板建立任務"]
+    D --> E["🤖 Lead 分派任務給 Dev"]
+    E --> F["🤖 Dev 綁定 git Worktree"]
+    F --> G["🤖 Dev 開發 — Skills 載入行為模板"]
+    G --> H["🤖 Dev 推送 PR + 回報 Lead"]
+    H --> I["⚙️ CI Watch 監控 GitHub Actions"]
+    I --> J["⚙️ CI 通過 → 自動通知 Reviewer"]
+    J --> K["🤖 Reviewer 審查程式碼"]
+    K --> L["🤖 Lead 合併 PR → 任務完成"]
+    L --> |"下一個任務"| D
+    E -. "⏱️ Dispatch Idle：10 分鐘未回應則警報" .-> C
+    B -. "🏥 Health：crash/hang 時自動重啟" .-> B
+    K -. "📝 Decisions：記錄架構決策" .-> K
+
+    classDef operator fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20
+    classDef agent fill:#e3f2fd,stroke:#1565c0,color:#0d47a1
+    classDef daemon fill:#fff3e0,stroke:#e65100,color:#bf360c
+    class A,C operator
+    class D,E,F,G,H,K,L agent
+    class B,I,J daemon

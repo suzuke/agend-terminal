@@ -1,0 +1,23 @@
+flowchart TD
+    A["👤 Operator writes fleet.yaml"] --> B["⚙️ Daemon launches agents"]
+    B --> C["👤 Operator assigns task via TUI / Telegram"]
+    C --> D["🤖 Lead creates task on Task Board"]
+    D --> E["🤖 Lead sends task to Dev"]
+    E --> F["🤖 Dev binds git Worktree"]
+    F --> G["🤖 Dev codes — Skills load behavior templates"]
+    G --> H["🤖 Dev pushes PR + reports to Lead"]
+    H --> I["⚙️ CI Watch monitors GitHub Actions"]
+    I --> J["⚙️ CI passes → auto-notify Reviewer"]
+    J --> K["🤖 Reviewer reviews code"]
+    K --> L["🤖 Lead merges PR → Task done"]
+    L --> |"next task"| D
+    E -. "⏱️ Dispatch Idle: alert if no response in 10min" .-> C
+    B -. "🏥 Health: auto-restart on crash/hang" .-> B
+    K -. "📝 Decisions: record architectural choices" .-> K
+
+    classDef operator fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20
+    classDef agent fill:#e3f2fd,stroke:#1565c0,color:#0d47a1
+    classDef daemon fill:#fff3e0,stroke:#e65100,color:#bf360c
+    class A,C operator
+    class D,E,F,G,H,K,L agent
+    class B,I,J daemon

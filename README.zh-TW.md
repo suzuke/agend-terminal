@@ -39,57 +39,13 @@ Crash 後自動重啟並移交上下文。透過多 tab / 多 pane 的 TUI、Tel
 
 ## 開發流程
 
-各功能在多 agent 開發生命週期中的定位。
-虛線框（- - -）為 agent 基礎設施——agent 透過 MCP 工具使用。
-實線框為 operator 面向功能。
+任務在多 agent pipeline 中的流轉方式。每一步標注運作中的功能。
 
-```mermaid
-flowchart TD
-    subgraph S1[" 1 · 環境設定 "]
-        qs["快速開始"]
-        fl["Fleet 設定"]
-        tm["團隊"]
-        cfg["設定"]
-        svc["服務管理"]
-    end
+![開發流程](docs/images/workflow-zh-TW.svg)
 
-    subgraph S2[" 2 · 任務分派 "]
-        tb["任務看板"]
-        send["通訊 · send"]:::infra
-        idle["Dispatch Idle"]:::infra
-        sk["Skills 技能"]
-    end
+**圖例：** 🟢 綠色 = 操作者操作 · 🔵 藍色 = Agent 行為（透過 MCP tools）· 🟠 橙色 = Daemon 自動化
 
-    subgraph S3[" 3 · 開發執行 "]
-        wt["Worktree"]:::infra
-        ai["Agent 互動"]
-        tui["TUI"]
-        ch["頻道"]
-    end
-
-    subgraph S4[" 4 · 整合驗證 "]
-        ci["CI 監控"]:::infra
-        rpt["通訊 · report"]:::infra
-        dec["決策記錄"]:::infra
-        done["任務看板 ✓"]
-    end
-
-    subgraph S5[" 5 · 維運 "]
-        hm["健康與監控"]:::infra
-        dg["診斷工具"]
-        sch["排程"]:::infra
-    end
-
-    S1 --> S2 --> S3 --> S4 --> S5
-
-    classDef infra fill:#e3f2fd,stroke:#1565c0,stroke-dasharray:5 5
-
-    style S1 fill:#e8f5e9,stroke:#2e7d32
-    style S2 fill:#fff3e0,stroke:#e65100
-    style S3 fill:#f3e5f5,stroke:#6a1b9a
-    style S4 fill:#e0f7fa,stroke:#00838f
-    style S5 fill:#fce4ec,stroke:#c62828
-```
+> **背景常駐服務：** Health & Monitoring（自動重啟）、Channels（Telegram 同步）、Schedules（定時任務）、Diagnostics（故障排除）
 
 ## 快速開始
 
