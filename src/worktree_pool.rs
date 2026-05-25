@@ -740,10 +740,19 @@ pub fn gc_run(home: &Path) -> Vec<GcResult> {
     results
 }
 
-fn gc_remove_one(_home: &Path, candidate: &GcCandidate) -> GcResult {
+fn gc_remove_one(home: &Path, candidate: &GcCandidate) -> GcResult {
     let wt_path = &candidate.path;
-    // Derive source repo from the worktree's .git file, which contains
-    // a gitdir pointer back to the main repo's .git/worktrees/<name>.
+
+    // TOCTOU guard: re-validate right before deletion.
+    if evaluate_candidate(home, wt_path).is_none() {
+        return GcResult {
+            path: wt_path.clone(),
+            agent: candidate.agent.clone(),
+            removed: false,
+            error: Some("skipped: pre-deletion re-validation failed".to_string()),
+        };
+    }
+
     let source_repo = resolve_source_repo(wt_path);
 
     let mut result = GcResult {
