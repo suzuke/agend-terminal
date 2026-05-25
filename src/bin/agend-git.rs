@@ -1902,16 +1902,23 @@ mod tests {
             assert!(is_conflict_capable(cmd), "{cmd} should be conflict-capable");
         }
         for cmd in ["commit", "add", "push", "status", "reset"] {
-            assert!(!is_conflict_capable(cmd), "{cmd} should NOT be conflict-capable");
+            assert!(
+                !is_conflict_capable(cmd),
+                "{cmd} should NOT be conflict-capable"
+            );
         }
     }
 
     #[test]
     fn output_has_conflict_signal_detects_conflict_keyword() {
-        assert!(output_has_conflict_signal("CONFLICT (content): Merge conflict in src/lib.rs"));
+        assert!(output_has_conflict_signal(
+            "CONFLICT (content): Merge conflict in src/lib.rs"
+        ));
         assert!(output_has_conflict_signal("Merge conflict in file.rs"));
         assert!(!output_has_conflict_signal("Already up to date."));
-        assert!(!output_has_conflict_signal("Successfully rebased and updated refs/heads/feat."));
+        assert!(!output_has_conflict_signal(
+            "Successfully rebased and updated refs/heads/feat."
+        ));
     }
 
     #[test]
@@ -1920,6 +1927,9 @@ mod tests {
         assert!(guidance.contains("resolve"), "should mention resolving");
         assert!(guidance.contains("git add"), "should mention git add");
         assert!(guidance.contains("--continue"), "should mention --continue");
-        assert!(guidance.contains("Do NOT abandon"), "should discourage abandoning");
+        assert!(
+            guidance.contains("Do NOT abandon"),
+            "should discourage abandoning"
+        );
     }
 }
