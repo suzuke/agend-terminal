@@ -44,7 +44,7 @@ Crash 後自動重啟並移交上下文。透過多 tab / 多 pane 的 TUI、Tel
 實線框為 operator 面向功能。
 
 ```mermaid
-flowchart LR
+flowchart TD
     subgraph S1[" 1 · 環境設定 "]
         qs["快速開始"]
         fl["Fleet 設定"]
