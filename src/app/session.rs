@@ -108,6 +108,7 @@ pub(super) fn sync_fleet_yaml(home: &Path, layout: &Layout) {
             .filter(|name| !active_fleet_names.contains(name))
             .collect();
         if !to_remove.is_empty() {
+            tracing::info!(removed = ?to_remove, "sync_fleet_yaml: removing fleet entries not in any pane");
             let _ = fleet::remove_instances_from_yaml(home, &to_remove);
         }
     }
@@ -348,7 +349,6 @@ fn apply_session_layout(
     let Some(session) = session else {
         return false;
     };
-    let _ = std::fs::remove_file(&session_path);
     if session.tabs.is_empty() {
         return false;
     }
@@ -425,6 +425,7 @@ fn apply_session_layout(
     }
 
     if !layout.tabs.is_empty() {
+        let _ = std::fs::remove_file(&session_path);
         tracing::info!(
             tabs = layout.tabs.len(),
             "session restored with reconciliation"

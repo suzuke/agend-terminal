@@ -43,7 +43,8 @@ pub fn attach(home: &Path, name: &str) -> anyhow::Result<()> {
         .take_reader()
         .ok_or_else(|| anyhow::anyhow!("bridge reader already taken"))?;
 
-    // Output thread: agent → terminal stdout
+    // fire-and-forget: lifetime bounded by bridge reader EOF; thread exits
+    // when the connection closes and read_tagged_frame returns Err.
     std::thread::Builder::new()
         .name("tui_output".into())
         .spawn(move || {

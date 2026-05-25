@@ -339,7 +339,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // enough that the readdir cost is trivial.
     let mut last_remote_sync = std::time::Instant::now();
 
-    // Crossterm event reader thread
+    // fire-and-forget: blocks in crossterm::event::read(); terminated by process exit.
     let (event_tx, event_rx) = crossbeam_channel::unbounded::<Event>();
     std::thread::Builder::new()
         .name("crossterm_events".into())
@@ -402,7 +402,10 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
             needs_resize = false;
         }
         sync_notification_state(&home, &mut layout);
-        // H3: throttle flush to ≥1s intervals (was every 50ms tick → disk I/O storm)
+        // H3: throttle flush to ≥1s intervals (was every 50ms tick → disk I/O storm).
+        // std::sync::Mutex is fine here: only the main thread touches this,
+        // the critical section is sub-microsecond, and the TUI render loop is
+        // not async (crossbeam select!, not tokio).
         {
             static LAST_FLUSH: std::sync::Mutex<Option<std::time::Instant>> =
                 std::sync::Mutex::new(None);

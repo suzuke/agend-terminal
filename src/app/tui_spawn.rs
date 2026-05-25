@@ -44,9 +44,11 @@ pub(crate) fn add_instance_with_topic(
 
     if let TopicOutcome::Created(ref tid) = outcome {
         if let Ok(topic_id) = tid.parse::<i32>() {
-            if let Err(e) = crate::channel::telegram::register_topic(home, topic_id, name) {
-                tracing::warn!(instance = name, error = %e, "TUI-spawn: failed to persist topic_id to topics.json");
-            }
+            crate::channel::telegram::register_topic(home, topic_id, name).map_err(|e| {
+                anyhow::anyhow!(
+                    "topic created (id={tid}) but failed to persist to topics.json: {e}"
+                )
+            })?;
         }
         tracing::info!(
             instance = name,
