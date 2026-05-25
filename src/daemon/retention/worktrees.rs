@@ -52,11 +52,11 @@ fn trash_retention_days() -> u64 {
         .unwrap_or(7)
 }
 
-fn unix_ts() -> u64 {
-    SystemTime::now()
+fn archive_ts() -> String {
+    let d = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .unwrap_or(Duration::ZERO);
+    format!("{}-{:09}", d.as_secs(), d.subsec_nanos())
 }
 
 /// Recursive copy helper used by the `EXDEV` fallback in `try_archive`.
@@ -153,7 +153,21 @@ pub(crate) fn maybe_remove_candidate(home: &Path, path: &Path, agent: &str) -> R
             };
         }
     };
-    let trash_dst = trash_root(home).join(format!("{}-{}", agent, unix_ts()));
+    // #1170 TOCTOU fix: re-validate binding state immediately before archive.
+    // gc_candidates() checked this earlier, but the worktree may have been
+    // rebound between enumeration and now.
+    if crate::binding::read(home, agent).is_some() {
+        tracing::info!(
+            agent,
+            path = %path.display(),
+            "worktree rebound since GC enumeration, skipping archive"
+        );
+        return RemovalOutcome::Skipped {
+            reason: "rebound_since_enumeration".to_string(),
+        };
+    }
+
+    let trash_dst = trash_root(home).join(format!("{}-{}", agent, archive_ts()));
     match try_archive(path, &trash_dst) {
         Ok(()) => {
             tracing::info!(
@@ -600,5 +614,79 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// T8 (#1170): worktree rebound between gc_candidates enumeration and
+    /// maybe_remove_candidate execution → skip archive.
+    #[test]
+    fn rebound_worktree_skipped_by_binding_recheck() {
+        let dir = tmp_home("t8-rebound");
+        let repo = setup_git_repo(&dir);
+        let wt = add_worktree(&repo, "wt-rebound");
+
+        // Simulate a binding written after gc_candidates ran — the worktree
+        // was released at enumeration time but an agent rebound before archive.
+        let runtime_dir = crate::paths::runtime_dir(&dir).join("wt-rebound");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        std::fs::write(
+            runtime_dir.join("binding.json"),
+            r#"{"worktree":"/tmp/fake","bound_at":"2026-05-25T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        let result = maybe_remove_candidate(&dir, &wt, "wt-rebound");
+        assert!(
+            matches!(result, RemovalOutcome::Skipped { ref reason } if reason == "rebound_since_enumeration"),
+            "rebound worktree must be skipped: {result:?}"
+        );
+        assert!(wt.exists(), "worktree must NOT be archived when rebound");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// T9 (#1170): two worktrees for the same agent archived in the same
+    /// sweep tick get distinct .trash paths (no collision).
+    #[test]
+    fn same_agent_same_second_no_trash_collision() {
+        let dir = tmp_home("t9-collision");
+        let repo = setup_git_repo(&dir);
+        let wt1 = add_worktree(&repo, "wt-col-a");
+        let wt2 = add_worktree(&repo, "wt-col-b");
+
+        let r1 = maybe_remove_candidate(&dir, &wt1, "agent-x");
+        let r2 = maybe_remove_candidate(&dir, &wt2, "agent-x");
+        assert!(matches!(r1, RemovalOutcome::Removed), "first: {r1:?}");
+        assert!(matches!(r2, RemovalOutcome::Removed), "second: {r2:?}");
+
+        let trash = trash_root(&dir);
+        let entries: Vec<_> = std::fs::read_dir(&trash)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("agent-x-"))
+            .collect();
+        assert_eq!(
+            entries.len(),
+            2,
+            "two distinct .trash entries for same agent: got {}",
+            entries.len()
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// T10 (#1170): archive_ts produces sub-second granularity.
+    #[test]
+    fn archive_ts_has_nanosecond_precision() {
+        let ts1 = archive_ts();
+        let ts2 = archive_ts();
+        assert!(
+            ts1.contains('-'),
+            "archive_ts must contain secs-nanos separator"
+        );
+        let parts: Vec<&str> = ts1.splitn(2, '-').collect();
+        assert_eq!(parts.len(), 2, "must have secs-nanos: {ts1}");
+        assert_eq!(parts[1].len(), 9, "nanos must be 9 digits: {ts1}");
+        // Two sequential calls should differ (or at least not panic)
+        let _ = (ts1, ts2);
     }
 }
