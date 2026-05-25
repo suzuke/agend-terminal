@@ -556,16 +556,61 @@ fn tick(
 
             // Sprint 43: member-state-change notify to orchestrator.
             let new_state = core.state.current;
-            if prev_state != new_state && new_state.is_notify_error_class() {
-                let pane_tail = core.vterm.tail_lines(10);
-                maybe_notify_member_state_change(
-                    home,
-                    &name,
-                    prev_state,
-                    new_state,
-                    &pane_tail,
-                    notify_tracks,
+            if prev_state != new_state {
+                // #1176: log ALL state transitions for observability.
+                let snippet = core.vterm.tail_lines(3);
+                crate::daemon::usage_limit::log_state_transition(
+                    home, &name, prev_state, new_state, &snippet,
                 );
+
+                // #1176: UsageLimit reaction pipeline.
+                if new_state == crate::state::AgentState::UsageLimit {
+                    let backend_cmd = {
+                        let reg = crate::agent::lock_registry(registry);
+                        reg.get(&name).map(|h| h.backend_command.clone())
+                    };
+                    let backend = backend_cmd
+                        .as_deref()
+                        .and_then(crate::backend::Backend::from_command);
+                    let config = crate::runtime_config::get();
+                    // Always notify operator.
+                    if let Some(ref b) = backend {
+                        crate::daemon::usage_limit::notify_operator_usage_limit(
+                            home,
+                            &name,
+                            b,
+                            &snippet,
+                            &[],
+                        );
+                    }
+                    // Propagate only if enabled.
+                    if config.usage_limit_propagation_enabled {
+                        if let Some(ref b) = backend {
+                            drop(core);
+                            let affected = crate::daemon::usage_limit::propagate_usage_limit(
+                                home, &name, b, registry,
+                            );
+                            tracing::warn!(
+                                agent = %name,
+                                affected = ?affected,
+                                "UsageLimit propagated to same-backend agents"
+                            );
+                            continue; // core was dropped
+                        }
+                    }
+                }
+
+                if new_state.is_notify_error_class() {
+                    let pane_tail = core.vterm.tail_lines(10);
+                    maybe_notify_member_state_change(
+                        home,
+                        &name,
+                        prev_state,
+                        new_state,
+                        &pane_tail,
+                        notify_tracks,
+                    );
+                }
             }
 
             // §4.4 stale decay: clear waiting_on when heartbeat is stale.

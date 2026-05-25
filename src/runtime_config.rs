@@ -23,6 +23,10 @@ pub struct RuntimeConfig {
     /// Default false (shadow mode only).
     #[serde(default)]
     pub hang_auto_recovery_enabled: bool,
+    /// #1176: When true, UsageLimit on one agent propagates QuotaExceeded
+    /// to all same-backend agents + gates new dispatches. Default false.
+    #[serde(default)]
+    pub usage_limit_propagation_enabled: bool,
 }
 
 fn default_dev_idle() -> i64 {
@@ -38,6 +42,7 @@ impl Default for RuntimeConfig {
             dev_idle_threshold_secs: default_dev_idle(),
             fleet_idle_threshold_secs: default_fleet_idle(),
             hang_auto_recovery_enabled: false,
+            usage_limit_propagation_enabled: false,
         }
     }
 }
@@ -84,6 +89,13 @@ pub fn set(home: &Path, key: &str, value: &str) -> Result<String, String> {
                 _ => return Err(format!("invalid boolean: {value} (use true/false)")),
             };
         }
+        "usage_limit_propagation_enabled" => {
+            config.usage_limit_propagation_enabled = match value {
+                "true" | "1" => true,
+                "false" | "0" => false,
+                _ => return Err(format!("invalid boolean: {value} (use true/false)")),
+            };
+        }
         _ => return Err(format!("unknown config key: {key}")),
     }
     let path = home.join("runtime-config.json");
@@ -100,6 +112,7 @@ pub fn get_key(key: &str) -> Result<String, String> {
         "dev_idle_threshold_secs" => Ok(config.dev_idle_threshold_secs.to_string()),
         "fleet_idle_threshold_secs" => Ok(config.fleet_idle_threshold_secs.to_string()),
         "hang_auto_recovery_enabled" => Ok(config.hang_auto_recovery_enabled.to_string()),
+        "usage_limit_propagation_enabled" => Ok(config.usage_limit_propagation_enabled.to_string()),
         _ => Err(format!("unknown config key: {key}")),
     }
 }
