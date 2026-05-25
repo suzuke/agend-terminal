@@ -39,56 +39,54 @@ Crash 後自動重啟並移交上下文。透過多 tab / 多 pane 的 TUI、Tel
 
 ## 開發流程
 
-各功能在多 agent 開發生命週期中的定位。
+這是一個把系統看成「操作者 → agent → 完成」循環的替代視角，而不是功能分類表。
 虛線框（- - -）為 agent 基礎設施——agent 透過 MCP 工具使用。
 實線框為 operator 面向功能。
 
 ```mermaid
-flowchart TD
-    subgraph S1[" 1 · 環境設定 "]
-        qs["快速開始"]
-        fl["Fleet 設定"]
-        tm["團隊"]
-        cfg["設定"]
-        svc["服務管理"]
+flowchart LR
+    subgraph O["Operator"]
+        direction TB
+        ui["TUI / Channels"]
+        fleet["Fleet\n設定"]
+        sched["Schedules\n排程"]
+        dec["Decisions\n決策"]
     end
 
-    subgraph S2[" 2 · 任務分派 "]
-        tb["任務看板"]
-        send["通訊 · send"]:::infra
-        idle["Dispatch Idle"]:::infra
-        sk["Skills 技能"]
-    end
-
-    subgraph S3[" 3 · 開發執行 "]
+    subgraph D["Daemon"]
+        direction TB
+        task["Task Board\n任務看板"]
+        comm["Communication\nsend / inbox / report"]:::infra
         wt["Worktree"]:::infra
-        ai["Agent 互動"]
-        tui["TUI"]
-        ch["頻道"]
+        skills["Skills"]:::infra
+        ci["CI Watch"]:::infra
+        idle["Dispatch Idle"]:::infra
+        health["Health & Monitoring"]:::infra
     end
 
-    subgraph S4[" 4 · 整合驗證 "]
-        ci["CI 監控"]:::infra
-        rpt["通訊 · report"]:::infra
-        dec["決策記錄"]:::infra
-        done["任務看板 ✓"]
+    subgraph A["Agent"]
+        direction TB
+        inbox["Inbox"]
+        build["實作 + 測試"]
+        report["回報結果"]
     end
 
-    subgraph S5[" 5 · 維運 "]
-        hm["健康與監控"]:::infra
-        dg["診斷工具"]
-        sch["排程"]:::infra
-    end
-
-    S1 --> S2 --> S3 --> S4 --> S5
+    ui --> fleet --> task
+    sched -. 排程提醒 .-> ui
+    dec -. 理由與規則 .-> fleet
+    task --> comm --> inbox --> build --> report --> ci --> task
+    build -. 獨立 worktree .-> wt
+    build -. 技能輔助 .-> skills
+    comm -. 超時未回覆 .-> idle -. 通知 operator .-> ui
+    build -. crash / health 檢查 .-> health -. 復原 / 告警 .-> task
+    ci -. merge 完成 .-> dec
+    report -. 狀態更新 .-> ui
 
     classDef infra fill:#e3f2fd,stroke:#1565c0,stroke-dasharray:5 5
 
-    style S1 fill:#e8f5e9,stroke:#2e7d32
-    style S2 fill:#fff3e0,stroke:#e65100
-    style S3 fill:#f3e5f5,stroke:#6a1b9a
-    style S4 fill:#e0f7fa,stroke:#00838f
-    style S5 fill:#fce4ec,stroke:#c62828
+    style O fill:#e8f5e9,stroke:#2e7d32
+    style D fill:#fff3e0,stroke:#e65100
+    style A fill:#f3e5f5,stroke:#6a1b9a
 ```
 
 ## 快速開始

@@ -42,56 +42,54 @@ multi-pane TUI, a Telegram channel, or an optional system tray.
 
 ## Development Workflow
 
-How the features fit together across the multi-agent development lifecycle.
+One alternative way to read the system is as an operator-to-agent execution loop rather than a feature catalog. The diagram below shows how the main surfaces connect from setup to completion.
 Dashed boxes (- - -) are agent infrastructure — used by agents via MCP tools.
 Solid boxes are operator-facing.
 
 ```mermaid
-flowchart TD
-    subgraph S1[" 1 · Setup "]
-        qs["Quick Start"]
-        fl["Fleet Config"]
-        tm["Teams"]
-        cfg["Configuration"]
-        svc["Service"]
+flowchart LR
+    subgraph O["Operator"]
+        direction TB
+        ui["TUI / Channels"]
+        fleet["Fleet\nConfiguration"]
+        sched["Schedules"]
+        dec["Decisions"]
     end
 
-    subgraph S2[" 2 · Dispatch "]
-        tb["Task Board"]
-        send["Communication · send"]:::infra
-        idle["Dispatch Idle"]:::infra
-        sk["Skills"]
-    end
-
-    subgraph S3[" 3 · Development "]
+    subgraph D["Daemon"]
+        direction TB
+        task["Task Board"]
+        comm["Communication\nsend / inbox / report"]:::infra
         wt["Worktree"]:::infra
-        ai["Agent Interaction"]
-        tui["TUI"]
-        ch["Channels"]
-    end
-
-    subgraph S4[" 4 · Integration "]
+        skills["Skills"]:::infra
         ci["CI Watch"]:::infra
-        rpt["Communication · report"]:::infra
-        dec["Decisions"]:::infra
-        done["Task Board ✓"]
+        idle["Dispatch Idle"]:::infra
+        health["Health & Monitoring"]:::infra
     end
 
-    subgraph S5[" 5 · Operations "]
-        hm["Health & Monitoring"]:::infra
-        dg["Diagnostics"]
-        sch["Schedules"]:::infra
+    subgraph A["Agent"]
+        direction TB
+        inbox["Inbox"]
+        build["Implement + test"]
+        report["Report back"]
     end
 
-    S1 --> S2 --> S3 --> S4 --> S5
+    ui --> fleet --> task
+    sched -. scheduled prompt .-> ui
+    dec -. rationale .-> fleet
+    task --> comm --> inbox --> build --> report --> ci --> task
+    build -. isolated checkout .-> wt
+    build -. skill guidance .-> skills
+    comm -. no reply within threshold .-> idle -. notify operator .-> ui
+    build -. crash / health probe .-> health -. recovery / alert .-> task
+    ci -. merge complete .-> dec
+    report -. context update .-> ui
 
     classDef infra fill:#e3f2fd,stroke:#1565c0,stroke-dasharray:5 5
 
-    style S1 fill:#e8f5e9,stroke:#2e7d32
-    style S2 fill:#fff3e0,stroke:#e65100
-    style S3 fill:#f3e5f5,stroke:#6a1b9a
-    style S4 fill:#e0f7fa,stroke:#00838f
-    style S5 fill:#fce4ec,stroke:#c62828
+    style O fill:#e8f5e9,stroke:#2e7d32
+    style D fill:#fff3e0,stroke:#e65100
+    style A fill:#f3e5f5,stroke:#6a1b9a
 ```
 
 ## Quick Start
