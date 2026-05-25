@@ -178,7 +178,11 @@ pub(crate) fn parse_double_quoted(s: &str) -> String {
 
 /// Orchestrate AI coding agents
 #[derive(Parser)]
-#[command(name = "agend-terminal", version, about = "Orchestrate AI coding agents")]
+#[command(
+    name = "agend-terminal",
+    version,
+    about = "Orchestrate AI coding agents"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
