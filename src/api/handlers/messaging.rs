@@ -110,6 +110,50 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
         );
     }
 
+    // #1149: Auto-create task when kind=task + no task_id provided.
+    let auto_task_id = if params["kind"].as_str() == Some("task")
+        && params["task_id"].as_str().filter(|s| !s.is_empty()).is_none()
+    {
+        let title = text
+            .lines()
+            .next()
+            .unwrap_or(text)
+            .chars()
+            .take(80)
+            .collect::<String>();
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static AUTO_TASK_SEQ: AtomicU64 = AtomicU64::new(0);
+        let ts = chrono::Utc::now().format("%Y%m%d%H%M%S%6f");
+        let seq = AUTO_TASK_SEQ.fetch_add(1, Ordering::Relaxed);
+        let id = format!("t-{ts}-{seq}");
+        let event = crate::task_events::TaskEvent::Created {
+            task_id: crate::task_events::TaskId(id.clone()),
+            title,
+            description: String::new(),
+            priority: params["priority"].as_str().unwrap_or("normal").to_string(),
+            owner: Some(crate::task_events::InstanceName(target.to_string())),
+            due_at: None,
+            depends_on: Vec::new(),
+            routed_to: None,
+            branch: params["branch"].as_str().map(String::from),
+            bind: None,
+            eta_secs: None,
+        };
+        if crate::task_events::append(
+            ctx.home,
+            &crate::task_events::InstanceName(from.to_string()),
+            event,
+        )
+        .is_ok()
+        {
+            Some(id)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let mut msg = {
         let mut thread_id = params["thread_id"].as_str().map(String::from);
         let parent_id = params["parent_id"].as_str().map(String::from);
@@ -130,7 +174,10 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
             read_at: None,
             thread_id,
             parent_id,
-            task_id: params["task_id"].as_str().map(String::from),
+            task_id: params["task_id"]
+                .as_str()
+                .map(String::from)
+                .or_else(|| auto_task_id.clone()),
             force_meta: params
                 .get("force_meta")
                 .and_then(|v| serde_json::from_value::<crate::inbox::ForceMeta>(v.clone()).ok()),
@@ -452,6 +499,9 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
     let mut resp = json!({"ok": true, "delivery_mode": delivery_mode});
     if let Some(branch) = branch_checked_out {
         resp["branch_checked_out"] = json!(branch);
+    }
+    if let Some(ref tid) = auto_task_id {
+        resp["task_id"] = json!(tid);
     }
     resp
 }
@@ -2222,6 +2272,89 @@ mod tests {
         assert_eq!(
             resolved.status, "resolved",
             "reply with auto-generated correlation_id must resolve the sidecar"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1149: send kind=task without task_id auto-creates a task and
+    /// stamps it on the outbound message + response.
+    #[test]
+    fn auto_create_task_on_send_kind_task_without_task_id() {
+        let home = tmp_home("1149-auto-create");
+        write_fixup_fleet(&home, &["fixup-lead", "fixup-dev"]);
+        let ctx = test_ctx(&home);
+        let result = handle_send(
+            &json!({
+                "from": "fixup-lead",
+                "target": "fixup-dev",
+                "text": "[delegate_task] implement the widget\ndetailed description here",
+                "kind": "task",
+                "branch": "feat/widget",
+            }),
+            &ctx,
+        );
+        assert_eq!(result["ok"], true, "send must succeed: {result}");
+        // Response must contain auto-generated task_id.
+        let task_id = result["task_id"]
+            .as_str()
+            .expect("response must include task_id");
+        assert!(
+            task_id.starts_with("t-"),
+            "auto-generated task_id must use t- prefix: {task_id}"
+        );
+        // Task must exist on the board.
+        let tasks = crate::tasks::handle(
+            &home,
+            "fixup-lead",
+            &json!({"action": "list", "include_history": true}),
+        );
+        let task_list = tasks["tasks"].as_array().expect("tasks array");
+        let created = task_list
+            .iter()
+            .find(|t| t["id"].as_str() == Some(task_id))
+            .expect("auto-created task must exist on board");
+        assert_eq!(
+            created["title"].as_str().unwrap(),
+            "[delegate_task] implement the widget"
+        );
+        assert_eq!(created["branch"].as_str(), Some("feat/widget"));
+        assert_eq!(created["assignee"].as_str(), Some("fixup-dev"));
+        assert_eq!(created["status"].as_str().unwrap(), "open");
+        // Inbox message must carry the task_id.
+        let inbox = crate::inbox::drain(&home, "fixup-dev");
+        let msg = inbox
+            .iter()
+            .find(|m| m.kind.as_deref() == Some("task"))
+            .expect("task message must be in inbox");
+        assert_eq!(
+            msg.task_id.as_deref(),
+            Some(task_id),
+            "outbound message must carry auto-generated task_id"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1149: send kind=task WITH task_id does NOT auto-create (backward compat).
+    #[test]
+    fn no_auto_create_when_task_id_provided() {
+        let home = tmp_home("1149-no-auto");
+        write_fixup_fleet(&home, &["fixup-lead", "fixup-dev"]);
+        let ctx = test_ctx(&home);
+        let result = handle_send(
+            &json!({
+                "from": "fixup-lead",
+                "target": "fixup-dev",
+                "text": "do the thing",
+                "kind": "task",
+                "task_id": "t-existing-123",
+            }),
+            &ctx,
+        );
+        assert_eq!(result["ok"], true);
+        // Response must NOT contain auto-generated task_id.
+        assert!(
+            result.get("task_id").is_none(),
+            "response must NOT include task_id when caller provided one: {result}"
         );
         std::fs::remove_dir_all(&home).ok();
     }
