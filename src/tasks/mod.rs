@@ -76,6 +76,8 @@ pub struct Task {
     /// through any production code path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_release_on_verdict: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -177,6 +179,7 @@ pub(super) fn record_to_task(r: &crate::task_events::TaskRecord) -> Task {
         // event variant + record field if/when an operator-write
         // surface lands.
         auto_release_on_verdict: None,
+        tags: r.tags.clone(),
     }
 }
 

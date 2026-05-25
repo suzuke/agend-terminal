@@ -311,6 +311,11 @@ pub enum TaskEvent {
         by: InstanceName,
         description: String,
     },
+    /// Tags update without status transition.
+    TagsSet {
+        task_id: TaskId,
+        tags: Vec<String>,
+    },
 }
 
 /// Per-task confidence breakdown produced by the legacy-backfill sweep.
@@ -347,7 +352,8 @@ impl TaskEvent {
             | TaskEvent::TaskCloseProposed { task_id, .. }
             | TaskEvent::OwnerAssigned { task_id, .. }
             | TaskEvent::PriorityChanged { task_id, .. }
-            | TaskEvent::DescriptionUpdated { task_id, .. } => task_id,
+            | TaskEvent::DescriptionUpdated { task_id, .. }
+            | TaskEvent::TagsSet { task_id, .. } => task_id,
         }
     }
 
@@ -368,6 +374,7 @@ impl TaskEvent {
             TaskEvent::OwnerAssigned { .. } => "owner_assigned",
             TaskEvent::PriorityChanged { .. } => "priority_changed",
             TaskEvent::DescriptionUpdated { .. } => "description_updated",
+            TaskEvent::TagsSet { .. } => "tags_set",
         }
     }
 }
@@ -458,6 +465,8 @@ pub struct TaskRecord {
     /// `EtaUpdated` event if the contract evolves).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub eta_secs: Option<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -555,6 +564,7 @@ impl TaskBoardState {
                         bind: *bind,
                         started_at: None,
                         eta_secs: *eta_secs,
+                        tags: Vec::new(),
                     });
             }
             TaskEvent::Claimed { by, .. } => {
@@ -670,6 +680,12 @@ impl TaskBoardState {
             TaskEvent::DescriptionUpdated { description, .. } => {
                 if let Some(t) = self.tasks.get_mut(&task_id) {
                     t.description = description.clone();
+                    t.updated_at = touch_at;
+                }
+            }
+            TaskEvent::TagsSet { tags, .. } => {
+                if let Some(t) = self.tasks.get_mut(&task_id) {
+                    t.tags = tags.clone();
                     t.updated_at = touch_at;
                 }
             }
