@@ -52,7 +52,8 @@ pub fn bind_full(
     std::fs::create_dir_all(&dir).map_err(|e| format!("create_dir_all {}: {e}", dir.display()))?;
     let path = dir.join("binding.json");
     let lock_path = dir.join(".binding.json.lock");
-    let _lock = crate::store::acquire_file_lock(&lock_path);
+    let _lock = crate::store::acquire_file_lock(&lock_path)
+        .map_err(|e| format!("acquire_file_lock {}: {e}", lock_path.display()))?;
     let wt_str = worktree.display().to_string();
     let src_str = source_repo.display().to_string();
     let mut binding = json!({
@@ -368,6 +369,45 @@ mod tests {
     fn marker_check_fails_for_no_binding() {
         let home = tmp_home("marker-no-bind");
         assert!(!is_agent_in_managed_worktree(&home, "nobody"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1163: bind_full must propagate acquire_file_lock errors.
+    /// Pre-fix: lock result was silently ignored, so bind_full would
+    /// write binding.json without holding the lock — breaking the
+    /// serialization guarantee under concurrent lease/bind operations.
+    #[test]
+    fn bind_full_propagates_lock_error_1163() {
+        let home = tmp_home("lock-err");
+        let agent = "lock-test";
+        let rt = crate::paths::runtime_dir(&home).join(agent);
+        std::fs::create_dir_all(&rt).unwrap();
+        let lock_path = rt.join(".binding.json.lock");
+        // Plant a directory where the lock file should be — open() on a
+        // directory fails, so acquire_file_lock returns Err.
+        std::fs::create_dir_all(&lock_path).unwrap();
+        let result = bind_full(
+            &home,
+            agent,
+            "T-999",
+            "branch",
+            std::path::Path::new(""),
+            std::path::Path::new(""),
+        );
+        assert!(
+            result.is_err(),
+            "#1163: bind_full must fail when lock acquisition fails, got Ok"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("acquire_file_lock"),
+            "error must mention lock failure: {err}"
+        );
+        // binding.json must NOT have been written
+        assert!(
+            read(&home, agent).is_none(),
+            "#1163: binding.json must not be written when lock fails"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }
