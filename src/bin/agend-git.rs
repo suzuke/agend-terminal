@@ -744,26 +744,18 @@ fn commit_is_empty_heartbeat(worktree: &str, hash: &str) -> bool {
 // ── Exec ────────────────────────────────────────────────────────────────
 
 fn exec_with_conflict_guidance(args: &[String], worktree: &str) -> ! {
-    use std::io::Write;
     let git = resolve_real_git();
-    let output = Command::new(&git)
+    let status = Command::new(&git)
         .arg("-C")
         .arg(worktree)
         .args(args)
-        .output();
-    match output {
-        Ok(out) => {
-            let _ = std::io::stdout().write_all(&out.stdout);
-            let _ = std::io::stderr().write_all(&out.stderr);
-            let combined = [
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr),
-            ]
-            .concat();
-            if !out.status.success() && output_has_conflict_signal(&combined) {
+        .status();
+    match status {
+        Ok(st) => {
+            if !st.success() && has_unmerged_files(&git, worktree) {
                 eprint!("{}", format_conflict_guidance());
             }
-            std::process::exit(out.status.code().unwrap_or(1))
+            std::process::exit(st.code().unwrap_or(1))
         }
         Err(e) => {
             eprintln!("agend-git: exec failed: {e}");
@@ -889,8 +881,14 @@ fn is_conflict_capable(subcmd: &str) -> bool {
     matches!(subcmd, "rebase" | "merge" | "pull" | "cherry-pick")
 }
 
-fn output_has_conflict_signal(output: &str) -> bool {
-    output.contains("CONFLICT") || output.contains("Merge conflict")
+fn has_unmerged_files(git: &str, worktree: &str) -> bool {
+    Command::new(git)
+        .arg("-C")
+        .arg(worktree)
+        .args(["diff", "--name-only", "--diff-filter=U"])
+        .output()
+        .map(|o| !o.stdout.is_empty())
+        .unwrap_or(false)
 }
 
 fn format_conflict_guidance() -> &'static str {
@@ -1910,15 +1908,34 @@ mod tests {
     }
 
     #[test]
-    fn output_has_conflict_signal_detects_conflict_keyword() {
-        assert!(output_has_conflict_signal(
-            "CONFLICT (content): Merge conflict in src/lib.rs"
+    fn has_unmerged_files_false_on_clean_repo() {
+        let repo = std::env::temp_dir().join(format!(
+            "agend-conflict-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
-        assert!(output_has_conflict_signal("Merge conflict in file.rs"));
-        assert!(!output_has_conflict_signal("Already up to date."));
-        assert!(!output_has_conflict_signal(
-            "Successfully rebased and updated refs/heads/feat."
-        ));
+        std::fs::create_dir_all(&repo).unwrap();
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["init", "-b", "main"])
+            .output()
+            .unwrap()
+            .status
+            .success());
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["commit", "--allow-empty", "-m", "init"])
+            .output()
+            .unwrap()
+            .status
+            .success());
+        assert!(!has_unmerged_files("git", repo.to_str().unwrap()));
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     #[test]
