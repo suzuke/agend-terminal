@@ -444,6 +444,11 @@ fn scan_fleet_vantage(
     if !all_idle {
         return;
     }
+    // #1141: suppress alert when no work is expected — empty task board
+    // + no pending dispatches means silence is normal.
+    if !has_expected_work(home) {
+        return;
+    }
     let key = ("fleet", "*".to_string());
     if let Some(prev) = last_alerted.get(&key) {
         let since_alert = now.signed_duration_since(*prev).num_seconds();
@@ -470,6 +475,35 @@ fn scan_fleet_vantage(
         None,
     );
     last_alerted.insert(key, *now);
+}
+
+/// #1141: Check if there's work the fleet should be doing.
+/// Returns true if open/claimed/in_progress tasks exist OR pending dispatches exist.
+/// Fail-open: if no task board file exists, assumes work may be expected.
+fn has_expected_work(home: &Path) -> bool {
+    // Check pending dispatch sidecars first (cheap).
+    let pending = crate::daemon::dispatch_idle::list_pending(home);
+    if pending.iter().any(|d| d.status == "pending") {
+        return true;
+    }
+    // Only suppress when we can confirm the task board is empty.
+    // If the event log doesn't exist, we can't determine → fail-open.
+    let log_path = home.join("task_events.jsonl");
+    if !log_path.exists() {
+        return true;
+    }
+    match crate::task_events::replay(home) {
+        Ok(state) => state.tasks.values().any(|r| {
+            matches!(
+                r.status,
+                crate::task_events::TaskStatus::Open
+                    | crate::task_events::TaskStatus::Claimed
+                    | crate::task_events::TaskStatus::InProgress
+                    | crate::task_events::TaskStatus::Blocked
+            )
+        }),
+        Err(_) => true, // can't read board → fail-open
+    }
 }
 
 fn emit_idle_alert(
@@ -1086,6 +1120,71 @@ mod tests {
             "fleet ack must NOT suppress dev vantage: {lead:?}"
         );
         clear_fleet_ack();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1141: fleet idle suppressed when task board is empty (all done) and no pending dispatches.
+    #[test]
+    fn fleet_idle_suppressed_when_no_work_expected() {
+        let _g = env_lock();
+        std::env::remove_var("AGEND_IDLE_WATCHDOG_AGENT");
+        std::env::remove_var("AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT");
+        let home = tmp_home("1141-no-work");
+        let stale = chrono::Utc::now() - chrono::Duration::seconds(FLEET_IDLE_THRESHOLD_SECS + 60);
+        write_activity_at(&home, "dev", stale);
+        write_activity_at(&home, "lead", stale);
+        // Create an empty task_events.jsonl (board exists, no open tasks).
+        std::fs::write(home.join("task_events.jsonl"), "").unwrap();
+        let mut last_alerted = HashMap::new();
+        scan_and_emit(&home, &mut last_alerted);
+        let general = crate::inbox::drain(&home, "general");
+        assert!(
+            !general
+                .iter()
+                .any(|m| m.kind.as_deref() == Some("fleet_idle_watchdog")),
+            "#1141: fleet idle must be suppressed when no work expected: {general:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1141: fleet idle fires when open task exists and agents are idle.
+    #[test]
+    fn fleet_idle_fires_when_open_task_exists() {
+        let _g = env_lock();
+        std::env::remove_var("AGEND_IDLE_WATCHDOG_AGENT");
+        std::env::remove_var("AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT");
+        let home = tmp_home("1141-open-task");
+        let stale = chrono::Utc::now() - chrono::Duration::seconds(FLEET_IDLE_THRESHOLD_SECS + 60);
+        write_activity_at(&home, "dev", stale);
+        write_activity_at(&home, "lead", stale);
+        // Create a task on the board (open, assigned to dev).
+        crate::task_events::append(
+            &home,
+            &crate::task_events::InstanceName("lead".to_string()),
+            crate::task_events::TaskEvent::Created {
+                task_id: crate::task_events::TaskId("t-test-1141".to_string()),
+                title: "test task".to_string(),
+                description: String::new(),
+                priority: "normal".to_string(),
+                owner: Some(crate::task_events::InstanceName("dev".to_string())),
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: None,
+                bind: None,
+                eta_secs: None,
+            },
+        )
+        .unwrap();
+        let mut last_alerted = HashMap::new();
+        scan_and_emit(&home, &mut last_alerted);
+        let general = crate::inbox::drain(&home, "general");
+        assert!(
+            general
+                .iter()
+                .any(|m| m.kind.as_deref() == Some("fleet_idle_watchdog")),
+            "#1141: fleet idle must fire when open tasks exist: {general:?}"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }
