@@ -18,9 +18,6 @@ pub struct RuntimeConfig {
     /// Fleet-wide idle threshold before watchdog alerts (seconds).
     #[serde(default = "default_fleet_idle")]
     pub fleet_idle_threshold_secs: i64,
-    /// Dispatch idle threshold before stall alert fires (seconds).
-    #[serde(default = "default_dispatch_idle")]
-    pub dispatch_idle_threshold_secs: i64,
 }
 
 fn default_dev_idle() -> i64 {
@@ -29,16 +26,12 @@ fn default_dev_idle() -> i64 {
 fn default_fleet_idle() -> i64 {
     1800
 }
-fn default_dispatch_idle() -> i64 {
-    600
-}
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             dev_idle_threshold_secs: default_dev_idle(),
             fleet_idle_threshold_secs: default_fleet_idle(),
-            dispatch_idle_threshold_secs: default_dispatch_idle(),
         }
     }
 }
@@ -78,11 +71,6 @@ pub fn set(home: &Path, key: &str, value: &str) -> Result<String, String> {
                 .parse()
                 .map_err(|_| format!("invalid integer: {value}"))?;
         }
-        "dispatch_idle_threshold_secs" => {
-            config.dispatch_idle_threshold_secs = value
-                .parse()
-                .map_err(|_| format!("invalid integer: {value}"))?;
-        }
         _ => return Err(format!("unknown config key: {key}")),
     }
     let path = home.join("runtime-config.json");
@@ -98,7 +86,6 @@ pub fn get_key(key: &str) -> Result<String, String> {
     match key {
         "dev_idle_threshold_secs" => Ok(config.dev_idle_threshold_secs.to_string()),
         "fleet_idle_threshold_secs" => Ok(config.fleet_idle_threshold_secs.to_string()),
-        "dispatch_idle_threshold_secs" => Ok(config.dispatch_idle_threshold_secs.to_string()),
         _ => Err(format!("unknown config key: {key}")),
     }
 }
@@ -118,7 +105,6 @@ mod tests {
         let c = RuntimeConfig::default();
         assert_eq!(c.dev_idle_threshold_secs, 3600);
         assert_eq!(c.fleet_idle_threshold_secs, 1800);
-        assert_eq!(c.dispatch_idle_threshold_secs, 600);
     }
 
     #[test]
