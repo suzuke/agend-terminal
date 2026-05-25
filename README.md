@@ -1,3 +1,5 @@
+[繁體中文](README.zh-TW.md)
+
 # AgEnD Terminal
 
 Orchestrate AI coding agents — not just run them.
@@ -76,6 +78,36 @@ For optional Telegram binding (remote control + outbound alerts), see [`docs/USA
 | Antigravity CLI | `antigravity-cli` (binary `agy`) | Tested (#987 — Gemini CLI's official successor; #995 polish). **Fleet MCP bridge unsupported in current AGY release** — agy instances spawn without `send`/`inbox`/`task` tools (operators see a `[fleet-mcp-unsupported]` warn in `app.log`). Use for manual work; await upstream fix at `google-antigravity/antigravity-cli`. |
 
 ## Learn More
+
+### Feature Guides
+
+**Getting Started**
+- [Quick Start Guide](docs/FEATURE-quickstart.md)
+- [Fleet Configuration](docs/FEATURE-fleet.md)
+- [Agent Interaction](docs/FEATURE-agent-interaction.md)
+
+**Daily Usage**
+- [TUI Interface](docs/FEATURE-tui.md)
+- [Skills System](docs/FEATURE-skills.md)
+- [Communication](docs/FEATURE-communication.md)
+- [Task Board](docs/FEATURE-task-board.md)
+- [Teams](docs/FEATURE-teams.md)
+- [Git Worktree Isolation](docs/FEATURE-worktree.md)
+
+**Advanced**
+- [CI Watch](docs/FEATURE-ci-watch.md)
+- [Health & Monitoring](docs/FEATURE-health.md)
+- [Dispatch Idle Tracking](docs/FEATURE-dispatch-idle.md)
+- [Channels (Telegram/Discord)](docs/FEATURE-channels.md)
+- [Decision Records](docs/FEATURE-decisions.md)
+- [Schedules & Deployments](docs/FEATURE-schedules.md)
+
+**Maintenance**
+- [Service Management](docs/FEATURE-service.md)
+- [Diagnostics](docs/FEATURE-diagnostics.md)
+- [Configuration](docs/FEATURE-configuration.md)
+
+### Reference
 
 - **Commands** — [`docs/CLI.md`](docs/CLI.md) for the full subcommand reference.
 - **MCP tools** — [`docs/MCP-TOOLS.md`](docs/MCP-TOOLS.md) for the 35 agent-to-agent coordination tools.
