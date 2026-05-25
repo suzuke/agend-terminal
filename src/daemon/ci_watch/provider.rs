@@ -997,8 +997,22 @@ pub fn detect_provider_from_remote(repo: &str) -> (&'static str, bool) {
         ("bitbucket_cloud", true) // custom Bitbucket domain
     } else if repo.contains("github.com") {
         ("github", false) // canonical github.com
+    } else if is_short_form_repo(repo) {
+        // #1188: short-form `owner/name` (no dots, no protocol) — GitHub default, not custom.
+        ("github", false)
     } else {
         // GitHub Enterprise custom domain OR fully unknown → default github + warn
         ("github", true)
     }
+}
+
+/// #1188: Detect `owner/name` short-form repo strings (e.g. "suzuke/agend-terminal").
+/// Pattern: exactly one `/`, no dots, no colons, no protocol prefix.
+fn is_short_form_repo(repo: &str) -> bool {
+    let parts: Vec<&str> = repo.split('/').collect();
+    parts.len() == 2
+        && !parts[0].is_empty()
+        && !parts[1].is_empty()
+        && !repo.contains('.')
+        && !repo.contains(':')
 }

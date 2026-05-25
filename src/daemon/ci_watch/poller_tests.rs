@@ -1954,6 +1954,17 @@ fn detect_provider_github_enterprise_custom_domain() {
     assert!(is_custom, "GHE custom domain must flag custom_host");
 }
 
+/// #1188: short-form `owner/name` must be detected as GitHub without custom_host warning.
+#[test]
+fn detect_provider_short_form_owner_name_is_github_not_custom() {
+    let (kind, is_custom) = super::detect_provider_from_remote("suzuke/agend-terminal");
+    assert_eq!(kind, "github");
+    assert!(
+        !is_custom,
+        "short-form owner/name must NOT flag custom_host"
+    );
+}
+
 /// B3: explicit ci_provider in watch JSON overrides auto-detect.
 #[test]
 fn explicit_ci_provider_overrides_auto_detect() {
