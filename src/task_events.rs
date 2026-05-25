@@ -165,6 +165,11 @@ pub enum DoneSource {
     },
     /// Auto-closed when the associated branch was merged.
     AutoCloseOnPrMerge { branch: String, merged_at: String },
+    /// #1228: Auto-closed when assignee sent kind=report with matching correlation_id.
+    ReportAutoClose {
+        report_summary: String,
+        closed_at: String,
+    },
 }
 
 /// How a `Linked` event was discovered: explicit operator/agent action

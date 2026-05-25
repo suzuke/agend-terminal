@@ -1,5 +1,6 @@
 //! Task board — fleet-wide task tracking via JSON file.
 
+pub mod auto_close;
 mod acl;
 mod handler;
 pub mod lifecycle;
