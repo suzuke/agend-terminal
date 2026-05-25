@@ -40,6 +40,60 @@ multi-pane TUI, a Telegram channel, or an optional system tray.
 | Multi-agent comms | Custom IPC | Built-in MCP tools |
 | Git isolation | Manual worktrees | Auto per-agent worktree |
 
+## Development Workflow
+
+How the features fit together across the multi-agent development lifecycle.
+Dashed boxes (- - -) are agent infrastructure — used by agents via MCP tools.
+Solid boxes are operator-facing.
+
+```mermaid
+flowchart LR
+    subgraph S1[" 1 · Setup "]
+        qs["Quick Start"]
+        fl["Fleet Config"]
+        tm["Teams"]
+        cfg["Configuration"]
+        svc["Service"]
+    end
+
+    subgraph S2[" 2 · Dispatch "]
+        tb["Task Board"]
+        send["Communication · send"]:::infra
+        idle["Dispatch Idle"]:::infra
+        sk["Skills"]
+    end
+
+    subgraph S3[" 3 · Development "]
+        wt["Worktree"]:::infra
+        ai["Agent Interaction"]
+        tui["TUI"]
+        ch["Channels"]
+    end
+
+    subgraph S4[" 4 · Integration "]
+        ci["CI Watch"]:::infra
+        rpt["Communication · report"]:::infra
+        dec["Decisions"]:::infra
+        done["Task Board ✓"]
+    end
+
+    subgraph S5[" 5 · Operations "]
+        hm["Health & Monitoring"]:::infra
+        dg["Diagnostics"]
+        sch["Schedules"]:::infra
+    end
+
+    S1 --> S2 --> S3 --> S4 --> S5
+
+    classDef infra fill:#e3f2fd,stroke:#1565c0,stroke-dasharray:5 5
+
+    style S1 fill:#e8f5e9,stroke:#2e7d32
+    style S2 fill:#fff3e0,stroke:#e65100
+    style S3 fill:#f3e5f5,stroke:#6a1b9a
+    style S4 fill:#e0f7fa,stroke:#00838f
+    style S5 fill:#fce4ec,stroke:#c62828
+```
+
 ## Quick Start
 
 ```bash
