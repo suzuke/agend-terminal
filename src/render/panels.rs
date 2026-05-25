@@ -529,7 +529,8 @@ mod tests {
             branch: None,
             started_at: None,
             eta_secs: None,
-            auto_release_on_verdict: None, tags: vec![],
+            auto_release_on_verdict: None,
+            tags: vec![],
         }
     }
 
@@ -662,7 +663,8 @@ mod tests {
             branch: None,
             started_at: None,
             eta_secs: None,
-            auto_release_on_verdict: None, tags: vec![],
+            auto_release_on_verdict: None,
+            tags: vec![],
         }];
         terminal
             .draw(|frame| {
