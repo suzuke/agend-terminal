@@ -305,6 +305,9 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
     // boot covers this via `bootstrap::prepare`.
     let _ = boot_sweep::boot_sweep_zombies(home);
 
+    // #1201: task lifecycle pass — auto-cancel stale open tasks + archive old done tasks.
+    crate::tasks::lifecycle::lifecycle_pass(home);
+
     // Check for existing daemon (secondary check after lock acquired)
     if let Some(existing) = find_active_run_dir(home) {
         anyhow::bail!("Another daemon is already running ({})", existing.display());

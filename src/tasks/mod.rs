@@ -2,6 +2,7 @@
 
 mod acl;
 mod handler;
+pub mod lifecycle;
 mod orphan;
 mod sweep;
 
