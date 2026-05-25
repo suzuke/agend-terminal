@@ -415,7 +415,9 @@ impl FleetConfig {
                 return None;
             }
             // Expand ~ to home directory
-            if let Some(rest) = d.strip_prefix("~/") {
+            if d == "~" {
+                dirs_home().unwrap_or_else(|| PathBuf::from(d))
+            } else if let Some(rest) = d.strip_prefix("~/") {
                 if let Some(home) = dirs_home() {
                     home.join(rest)
                 } else {
@@ -548,7 +550,7 @@ impl FleetConfig {
                     }
                 }
             }
-            Ok(())
+            Ok(!assigned_ref.is_empty())
         }) {
             tracing::warn!(error = %e, "backfill_ids: locked write failed");
             return;
@@ -685,10 +687,12 @@ fn acquire_lock(home: &Path) -> Result<std::fs::File> {
 }
 
 /// Lock fleet.yaml, parse it, apply a mutation, and atomically write back.
+/// The closure returns `Ok(true)` when it changed the doc (triggers write)
+/// or `Ok(false)` when the mutation was a no-op (skips write).
 fn mutate_fleet_yaml(
     home: &Path,
     default_content: &str,
-    mutate: impl FnOnce(&mut serde_yaml_ng::Value) -> Result<()>,
+    mutate: impl FnOnce(&mut serde_yaml_ng::Value) -> Result<bool>,
 ) -> Result<()> {
     let fleet_path = fleet_yaml_path(home);
     if default_content.is_empty() && !fleet_path.exists() {
@@ -699,8 +703,12 @@ fn mutate_fleet_yaml(
         std::fs::read_to_string(&fleet_path).unwrap_or_else(|_| default_content.to_string());
     let mut doc: serde_yaml_ng::Value =
         serde_yaml_ng::from_str(&content).context("Failed to parse fleet.yaml")?;
-    mutate(&mut doc)?;
-    atomic_write_yaml(home, &doc)
+    let changed = mutate(&mut doc)?;
+    if changed {
+        atomic_write_yaml(home, &doc)
+    } else {
+        Ok(())
+    }
 }
 
 /// Add a new instance entry to fleet.yaml. Uses file lock + atomic write.
@@ -1014,10 +1022,10 @@ pub fn add_instances_to_yaml(home: &Path, entries: &[(&str, &InstanceYamlEntry)]
             // merge into it per the 3-tier rules. Otherwise, build a
             // fresh mapping.
             if let Some(serde_yaml_ng::Value::Mapping(existing)) = instances.get_mut(&key) {
-                if let Err(conflict) = merge_instance_into_existing(name, existing, config) {
-                    conflicts.push(conflict);
+                match merge_instance_into_existing(name, existing, config) {
+                    Ok(()) => tracing::info!(%name, "merged instance update into fleet.yaml"),
+                    Err(conflict) => conflicts.push(conflict),
                 }
-                tracing::info!(%name, "merged instance update into fleet.yaml");
             } else {
                 let inst = build_instance_mapping(config);
                 instances.insert(key, serde_yaml_ng::Value::Mapping(inst));
@@ -1039,7 +1047,7 @@ pub fn add_instances_to_yaml(home: &Path, entries: &[(&str, &InstanceYamlEntry)]
                 diff_lines.join("\n")
             ));
         }
-        Ok(())
+        Ok(true)
     })
 }
 
@@ -1050,7 +1058,7 @@ pub fn remove_instance_from_yaml(home: &Path, name: &str) -> Result<()> {
             instances.remove(serde_yaml_ng::Value::String(name.to_string()));
         }
         tracing::info!(%name, "removed instance from fleet.yaml");
-        Ok(())
+        Ok(true)
     })
 }
 
@@ -1065,7 +1073,7 @@ pub fn remove_instances_from_yaml(home: &Path, names: &[String]) -> Result<()> {
                 instances.remove(serde_yaml_ng::Value::String(name.clone()));
             }
         }
-        Ok(())
+        Ok(true)
     })
 }
 
@@ -1092,9 +1100,10 @@ pub fn update_channel_telegram_group_id(home: &Path, new_group_id: i64) -> Resul
                     serde_yaml_ng::Value::Number(new_group_id.into()),
                 );
                 tracing::info!(new_group_id, "fleet.yaml channel.group_id rewritten");
+                return Ok(true);
             }
         }
-        Ok(())
+        Ok(false)
     })
 }
 
@@ -1139,20 +1148,20 @@ pub fn update_instance_field(
     mutate_fleet_yaml(home, "", |doc| {
         let Some(instances) = doc.get_mut("instances").and_then(|v| v.as_mapping_mut()) else {
             skip_reason = Some("instances_section_missing");
-            return Ok(());
+            return Ok(false);
         };
         let key = serde_yaml_ng::Value::String(name.to_string());
         let Some(inst_val) = instances.get_mut(&key) else {
             skip_reason = Some("instance_entry_missing");
-            return Ok(());
+            return Ok(false);
         };
         let Some(inst) = inst_val.as_mapping_mut() else {
             skip_reason = Some("instance_entry_not_mapping");
-            return Ok(());
+            return Ok(false);
         };
         inst.insert(serde_yaml_ng::Value::String(field.to_string()), value);
         persisted = true;
-        Ok(())
+        Ok(true)
     })?;
     if !persisted {
         tracing::warn!(
@@ -1225,7 +1234,7 @@ pub fn add_team_to_yaml(home: &Path, name: &str, config: &TeamConfig) -> Result<
             .context("teams is not a mapping")?;
         let key = serde_yaml_ng::Value::String(name.to_string());
         if teams.contains_key(&key) {
-            return Ok(());
+            return Ok(false);
         }
         teams.insert(
             key,
@@ -1233,7 +1242,7 @@ pub fn add_team_to_yaml(home: &Path, name: &str, config: &TeamConfig) -> Result<
         );
         inserted = true;
         tracing::info!(%name, "added team to fleet.yaml");
-        Ok(())
+        Ok(true)
     })?;
     Ok(inserted)
 }
@@ -1253,7 +1262,7 @@ pub fn remove_team_from_yaml(home: &Path, name: &str) -> Result<bool> {
                 tracing::info!(%name, "removed team from fleet.yaml");
             }
         }
-        Ok(())
+        Ok(removed)
     })?;
     Ok(removed)
 }
@@ -1277,7 +1286,7 @@ pub fn update_team_in_yaml(home: &Path, name: &str, config: &TeamConfig) -> Resu
                 existed = true;
             }
         }
-        Ok(())
+        Ok(existed)
     })?;
     Ok(existed)
 }

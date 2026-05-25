@@ -25,7 +25,7 @@
 // consumers land — see the anti-bypass invariant in
 // `tests/task_events_invariant.rs` for the contract that no other
 // caller may reference the log directly.
-#![allow(dead_code)]
+// #1164: module-level #![allow(dead_code)] removed; targeted allows below.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -53,6 +53,7 @@ use std::path::{Path, PathBuf};
 pub const SCHEMA_VERSION: u32 = 2;
 
 /// Hot-file event count above which [`compact`] archives the older slice.
+#[allow(dead_code)]
 pub const COMPACTION_KEEP: usize = 10_000;
 
 /// Sister-module log basename used with [`crate::event_log::append`] +
@@ -66,6 +67,7 @@ const LOG_NAME: &str = "task_events";
 pub struct TaskId(pub String);
 
 impl TaskId {
+    #[allow(dead_code)]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -899,6 +901,7 @@ fn read_envelopes_strict(path: &Path, out: &mut Vec<TaskEventEnvelope>) -> anyho
 /// short-circuits when the hot log already fits the threshold. Holds the
 /// same lock as [`append`] so concurrent appenders see a consistent
 /// hot-file at all times.
+#[allow(dead_code)]
 pub fn compact(home: &Path) -> anyhow::Result<()> {
     let log_path = log_path(home);
     if !log_path.exists() {

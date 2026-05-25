@@ -115,7 +115,22 @@ fn upsert_mcp_servers(path: &Path, instance_name: Option<&str>) -> Result<()> {
 
     let mut config: serde_json::Value = if path.exists() {
         let content = std::fs::read_to_string(path)?;
-        serde_json::from_str(&content).unwrap_or(json!({}))
+        match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "malformed MCP config JSON, backing up and starting fresh"
+                );
+                let backup = path.with_extension(format!(
+                    "corrupt.{}",
+                    chrono::Utc::now().format("%Y%m%d%H%M%S")
+                ));
+                let _ = std::fs::copy(path, &backup);
+                json!({})
+            }
+        }
     } else {
         json!({})
     };

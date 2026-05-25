@@ -121,14 +121,15 @@ pub fn post(home: &Path, author: &str, args: &Value) -> Value {
     let ttl_days = args["ttl_days"].as_u64();
     let supersedes = args["supersedes"].as_str().map(String::from);
 
-    let now = chrono::Utc::now().to_rfc3339();
+    let clock = chrono::Utc::now();
+    let now = clock.to_rfc3339();
     // The historical id format was seconds-precision only — two posts in the
     // same UTC second collided and the second silently overwrote the first.
     // Append nanoseconds + a process-local counter so no two posts from the
     // same process can share an id, even when issued back-to-back.
     use std::sync::atomic::{AtomicU64, Ordering};
     static ID_SEQ: AtomicU64 = AtomicU64::new(0);
-    let ts = chrono::Utc::now().format("%Y%m%d%H%M%S%6f");
+    let ts = clock.format("%Y%m%d%H%M%S%6f");
     let seq = ID_SEQ.fetch_add(1, Ordering::Relaxed);
     let id = format!("d-{ts}-{seq}");
 

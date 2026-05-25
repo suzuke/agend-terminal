@@ -191,7 +191,19 @@ pub fn load_versioned<T: DeserializeOwned + Default>(path: &Path, current_versio
     // / corrupt fallbacks.
     let peek: serde_json::Value = match serde_json::from_str(&content) {
         Ok(v) => v,
-        Err(_) => return T::default(),
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "load_versioned: corrupt JSON, returning default — backing up corrupt file"
+            );
+            let backup = path.with_extension(format!(
+                "corrupt.{}",
+                chrono::Utc::now().format("%Y%m%d%H%M%S")
+            ));
+            let _ = std::fs::copy(path, &backup);
+            return T::default();
+        }
     };
     let version = peek
         .get("schema_version")

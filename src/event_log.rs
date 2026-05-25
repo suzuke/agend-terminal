@@ -67,30 +67,6 @@ pub fn log(home: &Path, kind: &'static str, instance: &str, detail: &str) {
     }
 }
 
-/// Append a typed event to a sister audit log (e.g. `task_events.jsonl`).
-///
-/// Locked + rotated + fsynced. Returns Err so sister modules with strict
-/// audit semantics can fail-loud rather than swallow IO errors the way
-/// [`log`] does. Future audit logs (decision_events, capability_events)
-/// reuse this primitive.
-#[allow(dead_code)]
-pub fn append<T: Serialize>(home: &Path, log_name: &str, event: &T) -> anyhow::Result<()> {
-    append_lines_under_lock(home, log_name, |_| Ok(vec![serde_json::to_string(event)?]))
-}
-
-/// Append multiple typed events under a single fsync (F7 atomic-batch
-/// pattern). Either all events land or none do — readers never observe a
-/// partial-write window.
-#[allow(dead_code)]
-pub fn append_batch<T: Serialize>(home: &Path, log_name: &str, events: &[T]) -> anyhow::Result<()> {
-    append_lines_under_lock(home, log_name, |_| {
-        events
-            .iter()
-            .map(|e| serde_json::to_string(e).map_err(anyhow::Error::from))
-            .collect()
-    })
-}
-
 /// Lower-level primitive used by sister modules that need read access to
 /// existing log content under the same lock as the write — for example
 /// `task_events::append` computes a monotonic per-instance sequence number
