@@ -7,6 +7,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 /// Pure function: build fleet view text lines for testing.
+#[cfg(test)]
 pub fn build_fleet_view_lines(
     tasks: &[crate::tasks::Task],
     teams: &[crate::teams::Team],
