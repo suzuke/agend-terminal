@@ -2701,3 +2701,51 @@ fn test_task_deserialize_dispatched_at_alias_preserves_back_compat() {
         "serde alias must map legacy `dispatched_at` → new `started_at`"
     );
 }
+
+/// #1147: task action=activity returns chronological timeline.
+#[test]
+fn activity_timeline_returns_events_for_task() {
+    let home = tmp_home("activity-timeline");
+    // Create a task.
+    let create_result = super::handle(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "action": "create",
+            "title": "implement widget",
+            "assignee": "dev",
+            "branch": "feat/widget",
+        }),
+    );
+    let task_id = create_result["id"].as_str().unwrap();
+    // Claim it.
+    super::handle(
+        &home,
+        "dev",
+        &serde_json::json!({"action": "claim", "id": task_id}),
+    );
+    // Mark done.
+    super::handle(
+        &home,
+        "dev",
+        &serde_json::json!({"action": "done", "id": task_id, "result": "PR merged"}),
+    );
+    // Query activity timeline.
+    let result = super::handle(
+        &home,
+        "lead",
+        &serde_json::json!({"action": "activity", "id": task_id}),
+    );
+    assert_eq!(result["task_id"].as_str(), Some(task_id));
+    let events = result["events"].as_array().expect("events array");
+    assert_eq!(
+        events.len(),
+        3,
+        "expected 3 events (created+claimed+done): {events:?}"
+    );
+    assert_eq!(events[0]["event_type"].as_str(), Some("created"));
+    assert_eq!(events[1]["event_type"].as_str(), Some("claimed"));
+    assert_eq!(events[2]["event_type"].as_str(), Some("done"));
+    assert_eq!(events[1]["actor"].as_str(), Some("dev"));
+    std::fs::remove_dir_all(&home).ok();
+}

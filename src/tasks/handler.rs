@@ -677,6 +677,109 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
             };
             build_health_response(&state, live.as_ref(), &fleet_instances)
         }
+        "activity" => {
+            let task_id = match args["id"].as_str().filter(|s| !s.is_empty()) {
+                Some(id) => id,
+                None => return serde_json::json!({"error": "missing 'id'"}),
+            };
+            activity_timeline(home, task_id)
+        }
         _ => serde_json::json!({"error": format!("unknown action: {action}")}),
+    }
+}
+
+/// #1147: Build a chronological activity timeline for a task.
+fn activity_timeline(home: &Path, task_id: &str) -> Value {
+    let envelopes = match crate::task_events::envelopes_for_task(home, task_id) {
+        Ok(e) => e,
+        Err(e) => return serde_json::json!({"error": format!("failed to read task events: {e}")}),
+    };
+
+    let events: Vec<Value> = envelopes
+        .iter()
+        .map(|env| {
+            let (event_type, actor, summary) = summarize_event(env);
+            serde_json::json!({
+                "timestamp": env.timestamp,
+                "actor": actor,
+                "event_type": event_type,
+                "summary": summary,
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "task_id": task_id,
+        "events": events,
+        "count": events.len(),
+    })
+}
+
+fn summarize_event(env: &crate::task_events::TaskEventEnvelope) -> (&str, String, String) {
+    use crate::task_events::TaskEvent;
+    let actor = env.instance.0.clone();
+    match &env.event {
+        TaskEvent::Created {
+            title,
+            branch,
+            owner,
+            ..
+        } => {
+            let assignee = owner.as_ref().map(|o| o.0.as_str()).unwrap_or("unassigned");
+            let br = branch.as_deref().unwrap_or("");
+            let summary = if br.is_empty() {
+                format!("created task: {title} (assignee: {assignee})")
+            } else {
+                format!("created task: {title} (assignee: {assignee}, branch: {br})")
+            };
+            ("created", actor, summary)
+        }
+        TaskEvent::Claimed { by, .. } => ("claimed", by.0.clone(), "claimed task".to_string()),
+        TaskEvent::InProgress { by, .. } => {
+            ("in_progress", by.0.clone(), "started work".to_string())
+        }
+        TaskEvent::Verified { by_reviewer, .. } => {
+            ("verified", by_reviewer.0.clone(), "verified".to_string())
+        }
+        TaskEvent::Done { source, .. } => {
+            let detail = match source {
+                crate::task_events::DoneSource::PrMerged { pr_id, .. } => {
+                    format!("done (PR {} merged)", pr_id)
+                }
+                crate::task_events::DoneSource::OperatorManual { result, .. } => {
+                    format!(
+                        "done{}",
+                        result
+                            .as_ref()
+                            .map(|r| format!(": {r}"))
+                            .unwrap_or_default()
+                    )
+                }
+                _ => "done".to_string(),
+            };
+            ("done", actor, detail)
+        }
+        TaskEvent::Cancelled { by, reason, .. } => {
+            ("cancelled", by.0.clone(), format!("cancelled: {reason}"))
+        }
+        TaskEvent::Blocked { reason, .. } => ("blocked", actor, format!("blocked: {reason}")),
+        TaskEvent::Unblocked { .. } => ("unblocked", actor, "unblocked".to_string()),
+        TaskEvent::Reopened { reason, .. } => ("reopened", actor, format!("reopened: {reason}")),
+        TaskEvent::Released { reason, .. } => {
+            ("released", actor, format!("released claim: {reason}"))
+        }
+        TaskEvent::Linked { pr_id, .. } => ("linked", actor, format!("linked PR {pr_id}")),
+        TaskEvent::TaskCloseProposed { .. } => (
+            "close_proposed",
+            actor,
+            "close proposed by sweep".to_string(),
+        ),
+        TaskEvent::OwnerAssigned { owner, .. } => {
+            let o = owner.as_ref().map(|n| n.0.as_str()).unwrap_or("none");
+            ("owner_assigned", actor, format!("assigned to {o}"))
+        }
+        TaskEvent::PriorityChanged { priority, .. } => {
+            ("priority_changed", actor, format!("priority → {priority}"))
+        }
     }
 }

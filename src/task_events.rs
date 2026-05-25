@@ -818,6 +818,38 @@ pub fn replay(home: &Path) -> anyhow::Result<TaskBoardState> {
     Ok(state)
 }
 
+/// Return all task event envelopes for a given `task_id`, sorted chronologically.
+/// Used by `task action=activity` to build a timeline.
+pub fn envelopes_for_task(home: &Path, task_id: &str) -> anyhow::Result<Vec<TaskEventEnvelope>> {
+    let tid = TaskId(task_id.to_string());
+    let mut all = Vec::new();
+
+    let archive = archive_dir(home);
+    if archive.is_dir() {
+        let mut archives: Vec<std::path::PathBuf> = std::fs::read_dir(&archive)?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
+            .collect();
+        archives.sort();
+        for path in archives {
+            let mut envs = Vec::new();
+            read_envelopes_strict(&path, &mut envs)?;
+            all.extend(envs.into_iter().filter(|e| *e.event.task_id() == tid));
+        }
+    }
+
+    let lp = log_path(home);
+    if lp.exists() {
+        let mut envs = Vec::new();
+        read_envelopes_strict(&lp, &mut envs)?;
+        all.extend(envs.into_iter().filter(|e| *e.event.task_id() == tid));
+    }
+
+    sort_envelopes(&mut all);
+    Ok(all)
+}
+
 /// Sort envelopes by timestamp (absolute nanos) → instance → seq.
 fn sort_envelopes(envelopes: &mut [TaskEventEnvelope]) {
     envelopes.sort_by(|a, b| {
