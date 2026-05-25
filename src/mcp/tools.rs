@@ -493,8 +493,8 @@ mod tests {
         let tools = defs["tools"].as_array().expect("tools array");
         assert_eq!(
             tools.len(),
-            31,
-            "#1084/#1076: 30 + watchdog(snooze/resume/status/ack) = 31. \
+            32,
+            "#1085: 31 + config(get/set/list) = 32. \
              Current tools: {:?}",
             tools
                 .iter()

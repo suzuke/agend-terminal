@@ -981,6 +981,7 @@ mod tests {
                 "deployment",
                 "health",
                 "watchdog",
+                "config",
                 "repo",
                 "schedule",
                 "team",
@@ -993,7 +994,7 @@ mod tests {
                 "restart_daemon",
             ]
         );
-        assert_eq!(registered_handlers().len(), 31);
+        assert_eq!(registered_handlers().len(), 32);
     }
 
     /// Coverage test: every tool name advertised by
