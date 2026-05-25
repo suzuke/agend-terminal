@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-/// Auto-close a task when the assignee sends kind=report.
+/// Auto-close a task when the assignee sends a terminal report.
 /// Returns `Ok(true)` if the task was auto-closed, `Ok(false)` if skipped.
 pub fn auto_close_on_report(
     home: &Path,
@@ -10,7 +10,11 @@ pub fn auto_close_on_report(
     correlation_id: &str,
     reporter: &str,
     report_text: &str,
+    terminal: bool,
 ) -> anyhow::Result<bool> {
+    if !terminal {
+        return Ok(false);
+    }
     if kind != "report" {
         return Ok(false);
     }
@@ -170,10 +174,8 @@ mod tests {
         state.tasks.get(&TaskId(task_id.into())).map(|r| r.status)
     }
 
-    // ── RED tests: all assert-fail on the stub ──
-
     #[test]
-    fn assignee_report_auto_closes_claimed_task() {
+    fn assignee_terminal_report_auto_closes_claimed_task() {
         let home = tmp_home("assignee_close");
         seed_claimed_task(&home, "t-1228-001", "dev-agent");
         let closed = auto_close_on_report(
@@ -182,13 +184,35 @@ mod tests {
             "t-1228-001",
             "dev-agent",
             "Task completed successfully",
+            true,
         )
         .unwrap();
-        assert!(closed, "assignee report should auto-close the task");
+        assert!(closed, "terminal assignee report should auto-close");
         assert_eq!(
             task_status(&home, "t-1228-001"),
             Some(crate::task_events::TaskStatus::Done),
             "task status should be Done after auto-close"
+        );
+    }
+
+    #[test]
+    fn non_terminal_report_does_not_close() {
+        let home = tmp_home("non_terminal");
+        seed_claimed_task(&home, "t-1228-007", "dev-agent");
+        let closed = auto_close_on_report(
+            &home,
+            "report",
+            "t-1228-007",
+            "dev-agent",
+            "progress update — 60% done",
+            false,
+        )
+        .unwrap();
+        assert!(!closed, "terminal=false should NOT auto-close");
+        assert_eq!(
+            task_status(&home, "t-1228-007"),
+            Some(crate::task_events::TaskStatus::Claimed),
+            "task should remain Claimed when terminal=false"
         );
     }
 
@@ -202,9 +226,13 @@ mod tests {
             "t-1228-002",
             "dev-agent",
             "progress update",
+            true,
         )
         .unwrap();
-        assert!(!closed, "kind=update should NOT auto-close");
+        assert!(
+            !closed,
+            "kind=update should NOT auto-close even if terminal"
+        );
         assert_eq!(
             task_status(&home, "t-1228-002"),
             Some(crate::task_events::TaskStatus::Claimed),
@@ -216,9 +244,15 @@ mod tests {
     fn non_assignee_does_not_close() {
         let home = tmp_home("non_assignee");
         seed_claimed_task(&home, "t-1228-003", "dev-agent");
-        let closed =
-            auto_close_on_report(&home, "report", "t-1228-003", "reviewer-agent", "VERIFIED")
-                .unwrap();
+        let closed = auto_close_on_report(
+            &home,
+            "report",
+            "t-1228-003",
+            "reviewer-agent",
+            "VERIFIED",
+            true,
+        )
+        .unwrap();
         assert!(!closed, "non-assignee report should NOT auto-close");
         assert_eq!(
             task_status(&home, "t-1228-003"),
@@ -237,6 +271,7 @@ mod tests {
             "qcorr-20260525",
             "dev-agent",
             "some report",
+            true,
         )
         .unwrap();
         assert!(!closed, "non-t- correlation_id should skip");
@@ -252,6 +287,7 @@ mod tests {
             "t-1228-005",
             "dev-agent",
             "duplicate report",
+            true,
         )
         .unwrap();
         assert!(
@@ -264,9 +300,15 @@ mod tests {
     fn already_cancelled_is_idempotent() {
         let home = tmp_home("already_cancelled");
         seed_cancelled_task(&home, "t-1228-006");
-        let closed =
-            auto_close_on_report(&home, "report", "t-1228-006", "dev-agent", "late report")
-                .unwrap();
+        let closed = auto_close_on_report(
+            &home,
+            "report",
+            "t-1228-006",
+            "dev-agent",
+            "late report",
+            true,
+        )
+        .unwrap();
         assert!(
             !closed,
             "already-cancelled task should return false (idempotent)"

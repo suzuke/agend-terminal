@@ -237,6 +237,7 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
             reporting_cadence: params["reporting_cadence"].as_str().map(String::from),
             worktree_binding_required: params["worktree_binding_required"].as_bool(),
             pr_number: None,
+            terminal: params["terminal"].as_bool(),
         }
     };
 
@@ -515,10 +516,15 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
     } else if kind_str == "report" {
         if let Some(corr) = msg.correlation_id.as_deref() {
             let _ = crate::daemon::dispatch_idle::mark_resolved(ctx.home, corr);
-            // #1228: auto-close task when assignee sends kind=report
+            // #1228: auto-close task when assignee sends terminal report
             if corr.starts_with("t-") {
                 let _ = crate::tasks::auto_close::auto_close_on_report(
-                    ctx.home, kind_str, corr, from, &msg.text,
+                    ctx.home,
+                    kind_str,
+                    corr,
+                    from,
+                    &msg.text,
+                    msg.terminal.unwrap_or(false),
                 );
             }
         }
@@ -1763,6 +1769,7 @@ mod tests {
             reporting_cadence: None,
             worktree_binding_required: None,
             pr_number: None,
+            terminal: None,
         };
         crate::inbox::enqueue(home, target, msg).expect("seed blocker");
     }
@@ -1858,6 +1865,7 @@ mod tests {
             reporting_cadence: None,
             worktree_binding_required: None,
             pr_number: None,
+            terminal: None,
         };
         msg.read_at = None;
         crate::inbox::enqueue(&home_path, "codex-agent", msg).expect("seed");

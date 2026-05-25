@@ -124,6 +124,11 @@ pub struct InboxMessage {
     /// with pre-#1031 JSONL inboxes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_number: Option<u64>,
+    /// #1228: when true, signals that this report is the final/terminal
+    /// deliverable for the correlated task. Auto-close fires only when
+    /// this flag is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<bool>,
 }
 
 /// Metadata attached to a forced delegation (busy gate override).

@@ -326,6 +326,7 @@ pub(super) fn handle_replace_instance(home: &Path, args: &Value) -> Value {
             reporting_cadence: None,
             worktree_binding_required: None,
             pr_number: None,
+            terminal: None,
         },
     );
 
