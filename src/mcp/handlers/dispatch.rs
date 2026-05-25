@@ -223,6 +223,10 @@ fn dispatch_task_health(ctx: &HandlerCtx<'_>) -> Value {
     task::handle_task(ctx.home, ctx.args, ctx.instance_name)
 }
 
+fn dispatch_task_activity(ctx: &HandlerCtx<'_>) -> Value {
+    task::handle_task(ctx.home, ctx.args, ctx.instance_name)
+}
+
 /// Static sub-handler table for `task` action routing. Lifted out of
 /// the entry literal so the table address can be `'static`-borrowed.
 /// Action set matches `tasks::handle`'s internal `match` arms.
@@ -234,6 +238,7 @@ static TASK_ACTIONS: &[(&str, HandlerFn)] = &[
     ("done", dispatch_task_done),
     ("sweep", dispatch_task_sweep),
     ("health", dispatch_task_health),
+    ("activity", dispatch_task_activity),
 ];
 
 // ---------------------------------------------------------------------
@@ -383,31 +388,46 @@ fn dispatch_watchdog(ctx: &HandlerCtx<'_>) -> Value {
 
 fn dispatch_config(ctx: &HandlerCtx<'_>) -> Value {
     match ctx.args["action"].as_str().unwrap_or("") {
-        "get" => {
-            let key = ctx.args["key"].as_str().unwrap_or("");
-            if key.is_empty() {
-                return json!({"error": "key is required for get"});
-            }
-            match crate::runtime_config::get_key(key) {
-                Ok(v) => json!({"key": key, "value": v}),
-                Err(e) => json!({"error": e}),
-            }
-        }
-        "set" => {
-            let key = ctx.args["key"].as_str().unwrap_or("");
-            let value = ctx.args["value"].as_str().unwrap_or("");
-            if key.is_empty() || value.is_empty() {
-                return json!({"error": "key and value are required for set"});
-            }
-            match crate::runtime_config::set(ctx.home, key, value) {
-                Ok(_) => json!({"ok": true, "key": key, "value": value}),
-                Err(e) => json!({"error": e}),
-            }
-        }
-        "list" => json!({"config": crate::runtime_config::list()}),
+        "get" => dispatch_config_get(ctx),
+        "set" => dispatch_config_set(ctx),
+        "list" => dispatch_config_list(ctx),
         other => json!({"error": format!("unknown config action: {other}")}),
     }
 }
+
+fn dispatch_config_get(ctx: &HandlerCtx<'_>) -> Value {
+    let key = ctx.args["key"].as_str().unwrap_or("");
+    if key.is_empty() {
+        return json!({"error": "key is required for get"});
+    }
+    match crate::runtime_config::get_key(key) {
+        Ok(v) => json!({"key": key, "value": v}),
+        Err(e) => json!({"error": e}),
+    }
+}
+
+fn dispatch_config_set(ctx: &HandlerCtx<'_>) -> Value {
+    let key = ctx.args["key"].as_str().unwrap_or("");
+    let value = ctx.args["value"].as_str().unwrap_or("");
+    if key.is_empty() || value.is_empty() {
+        return json!({"error": "key and value are required for set"});
+    }
+    match crate::runtime_config::set(ctx.home, key, value) {
+        Ok(_) => json!({"ok": true, "key": key, "value": value}),
+        Err(e) => json!({"error": e}),
+    }
+}
+
+fn dispatch_config_list(ctx: &HandlerCtx<'_>) -> Value {
+    let _ = ctx;
+    json!({"config": crate::runtime_config::list()})
+}
+
+static CONFIG_ACTIONS: &[(&str, HandlerFn)] = &[
+    ("get", dispatch_config_get),
+    ("set", dispatch_config_set),
+    ("list", dispatch_config_list),
+];
 
 fn dispatch_watchdog_snooze(ctx: &HandlerCtx<'_>) -> Value {
     use crate::daemon::idle_watchdog;
@@ -851,7 +871,7 @@ static REGISTERED: &[HandlerEntry] = &[
     HandlerEntry {
         name: "config",
         handler: dispatch_config,
-        actions: None,
+        actions: Some(CONFIG_ACTIONS),
     },
     HandlerEntry {
         name: "repo",
@@ -1051,6 +1071,7 @@ mod tests {
                 "task",
                 &[
                     "create", "list", "claim", "update", "done", "sweep", "health",
+                    "activity",
                 ],
             ),
             ("ci", &["watch", "unwatch", "status"]),
@@ -1069,6 +1090,7 @@ mod tests {
             ("schedule", &["create", "list", "update", "delete"]),
             ("team", &["create", "delete", "list", "update"]),
             ("watchdog", &["snooze", "resume", "status", "ack"]),
+            ("config", &["get", "set", "list"]),
         ];
         for (tool, actions) in cases {
             for action in actions.iter() {
@@ -1090,6 +1112,7 @@ mod tests {
         let action_tools = [
             "task",
             "ci",
+            "config",
             "decision",
             "deployment",
             "health",

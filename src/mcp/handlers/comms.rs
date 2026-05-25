@@ -184,7 +184,10 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
     let force_reason = args.get("force_reason").and_then(|v| v.as_str());
     let claimed_tasks: Vec<_> = crate::tasks::list_all(home)
         .into_iter()
-        .filter(|t| t.assignee.as_deref() == Some(target) && t.status == "claimed")
+        .filter(|t| {
+            t.assignee.as_deref() == Some(target)
+                && (t.status == "claimed" || t.status == "in_progress")
+        })
         .collect();
     if !claimed_tasks.is_empty() {
         if force {
@@ -654,6 +657,10 @@ pub(super) fn handle_inbox(home: &Path, instance_name: &str) -> Value {
             }
         }
         if !processed_msg_ids.is_empty() {
+            // Known TOCTOU window: a message arriving between this re-read
+            // and the save_metadata call below can lose its pickup_id.
+            // The window is narrow (JSON parse + filter) and self-healing
+            // (next handle_inbox drains surviving IDs).
             let remaining: Vec<Value> = std::fs::read_to_string(&meta_path)
                 .ok()
                 .and_then(|c| serde_json::from_str::<Value>(&c).ok())
