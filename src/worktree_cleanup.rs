@@ -230,6 +230,7 @@ pub fn sweep_from_registry(
 /// ref is gone or that are merged into main. Skips branches checked out in
 /// any worktree.
 fn prune_orphaned_branches(repo_root: &Path) -> Vec<String> {
+    let default = crate::git_helpers::default_branch(repo_root);
     // Collect branches currently checked out in worktrees — cannot delete these
     let wt_branches: HashSet<String> = list_worktrees(repo_root)
         .into_iter()
@@ -244,7 +245,7 @@ fn prune_orphaned_branches(repo_root: &Path) -> Vec<String> {
     let branches: Vec<String> = match output {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
             .lines()
-            .filter(|b| *b != "main" && *b != "master")
+            .filter(|b| *b != default.as_str())
             .map(String::from)
             .collect(),
         _ => return Vec::new(),
@@ -317,6 +318,7 @@ mod tests {
         Command::new("git")
             .args(args)
             .current_dir(dir)
+            .env("AGEND_GIT_BYPASS", "1")
             .env("GIT_AUTHOR_NAME", "test")
             .env("GIT_AUTHOR_EMAIL", "t@t")
             .env("GIT_COMMITTER_NAME", "test")
@@ -497,6 +499,7 @@ mod tests {
                 remote_dir.to_str().unwrap(),
                 repo.to_str().unwrap(),
             ])
+            .env("AGEND_GIT_BYPASS", "1")
             .env("GIT_AUTHOR_NAME", "test")
             .env("GIT_AUTHOR_EMAIL", "t@t")
             .env("GIT_COMMITTER_NAME", "test")
