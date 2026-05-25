@@ -94,7 +94,6 @@ impl Backend {
     /// `$SHELL` (falling back to the platform default — `/bin/bash` on Unix,
     /// `cmd.exe` on Windows). For [`Backend::Raw`] returns the literal stored
     /// path. For presets returns the static preset command.
-    #[allow(dead_code)] // Call sites migrate in follow-up commits.
     pub fn command_string(&self) -> String {
         match self {
             Backend::ClaudeCode
@@ -488,6 +487,8 @@ impl Backend {
     }
 
     /// Try to detect backend from a command string (matches basename, not full path).
+    /// Prefix matching (e.g. `claude-*`) handles versioned binaries like `claude-2.1.89`.
+    /// This is intentionally broader than `parse_str`, which only accepts exact names.
     pub fn from_command(command: &str) -> Option<Backend> {
         let basename = std::path::Path::new(command)
             .file_name()

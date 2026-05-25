@@ -48,7 +48,9 @@ impl CapabilityMatrix {
             ("kiro-cli", ""),
             ("codex", ""),
             ("claude", "LLM context not tied to PTY buffer (known gap)"),
+            ("opencode", ""),
             ("gemini", ""),
+            ("agy", ""),
         ] {
             backends.insert(
                 name.into(),
@@ -355,7 +357,7 @@ mod tests {
     #[test]
     fn test_capability_matrix_serializes_with_split_columns() {
         let matrix = CapabilityMatrix::new();
-        assert_eq!(matrix.backends.len(), 4);
+        assert_eq!(matrix.backends.len(), 6);
         // All start unverified
         for b in matrix.backends.values() {
             assert_eq!(b.esc_semantics_verified, CapabilityLevel::Unverified);
