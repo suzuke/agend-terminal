@@ -698,6 +698,169 @@ pub fn gc_dry_run(home: &Path) -> Vec<GcCandidate> {
     candidates
 }
 
+/// Result of a single GC removal attempt.
+#[derive(Debug, Clone)]
+pub struct GcResult {
+    pub path: PathBuf,
+    pub agent: String,
+    pub removed: bool,
+    pub error: Option<String>,
+}
+
+/// Execute GC: remove all candidates identified by [`gc_candidates`].
+/// Each candidate is removed via `git worktree remove --force` with
+/// `remove_dir_all` fallback (mirrors [`release_full`] deletion pattern).
+pub fn gc_run(home: &Path) -> Vec<GcResult> {
+    let candidates = gc_candidates(home);
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let mut results = Vec::new();
+    for c in &candidates {
+        let result = gc_remove_one(home, c);
+        results.push(result);
+    }
+    let removed_count = results.iter().filter(|r| r.removed).count();
+    let removed_paths: Vec<String> = results
+        .iter()
+        .filter(|r| r.removed)
+        .map(|r| r.path.display().to_string())
+        .collect();
+    if removed_count > 0 {
+        crate::event_log::log(
+            home,
+            "gc_run",
+            "",
+            &format!(
+                "{removed_count} worktrees removed: [{}]",
+                removed_paths.join(", ")
+            ),
+        );
+    }
+    results
+}
+
+fn gc_remove_one(_home: &Path, candidate: &GcCandidate) -> GcResult {
+    let wt_path = &candidate.path;
+    // Derive source repo from the worktree's .git file, which contains
+    // a gitdir pointer back to the main repo's .git/worktrees/<name>.
+    let source_repo = resolve_source_repo(wt_path);
+
+    let mut result = GcResult {
+        path: wt_path.clone(),
+        agent: candidate.agent.clone(),
+        removed: false,
+        error: None,
+    };
+
+    let mut cmd = std::process::Command::new("git");
+    cmd.args([
+        "worktree",
+        "remove",
+        "--force",
+        &wt_path.display().to_string(),
+    ])
+    .env("AGEND_GIT_BYPASS", "1");
+    if let Some(ref sr) = source_repo {
+        cmd.current_dir(sr);
+    }
+    match cmd.output() {
+        Ok(o) if o.status.success() => {
+            result.removed = true;
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            tracing::warn!(
+                agent = %candidate.agent,
+                path = %wt_path.display(),
+                error = %stderr,
+                "gc: git worktree remove failed — falling back to remove_dir_all"
+            );
+            let _ = std::fs::remove_dir_all(wt_path);
+            if !wt_path.exists() {
+                if let Some(ref sr) = source_repo {
+                    let _ = std::process::Command::new("git")
+                        .current_dir(sr)
+                        .args(["worktree", "prune"])
+                        .env("AGEND_GIT_BYPASS", "1")
+                        .output();
+                }
+                result.removed = true;
+            } else {
+                result.error = Some(format!("git worktree remove failed: {stderr}"));
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                agent = %candidate.agent,
+                path = %wt_path.display(),
+                error = %e,
+                "gc: git command failed"
+            );
+            result.error = Some(format!("git command failed: {e}"));
+        }
+    }
+    result
+}
+
+/// Resolve the source (owning) repo from a worktree's `.git` file.
+/// A git worktree's `.git` is a file containing `gitdir: <path>` pointing
+/// to `<source>/.git/worktrees/<name>`. We walk up from that to find the
+/// source repo root.
+fn resolve_source_repo(wt_path: &Path) -> Option<PathBuf> {
+    let git_file = wt_path.join(".git");
+    let content = std::fs::read_to_string(&git_file).ok()?;
+    let gitdir_line = content.lines().find(|l| l.starts_with("gitdir:"))?;
+    let gitdir = gitdir_line.strip_prefix("gitdir:")?.trim();
+    let gitdir_path = if Path::new(gitdir).is_absolute() {
+        PathBuf::from(gitdir)
+    } else {
+        wt_path.join(gitdir).canonicalize().ok()?
+    };
+    // gitdir_path is <source>/.git/worktrees/<name>
+    // Walk up: worktrees → .git → source_repo
+    gitdir_path.parent()?.parent()?.parent().map(PathBuf::from)
+}
+
+/// Cleanup stale ci-watch lock files whose PRs merged >7 days ago.
+pub fn gc_stale_ci_watch_locks(home: &Path) -> usize {
+    let ci_dir = home.join("ci-watches");
+    if !ci_dir.is_dir() {
+        return 0;
+    }
+    let mut removed = 0;
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(7);
+    if let Ok(entries) = std::fs::read_dir(&ci_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("lock") {
+                continue;
+            }
+            // Check file modification time as a proxy for PR merge time.
+            let Ok(meta) = std::fs::metadata(&path) else {
+                continue;
+            };
+            let Ok(modified) = meta.modified() else {
+                continue;
+            };
+            let modified_dt: chrono::DateTime<chrono::Utc> = modified.into();
+            if modified_dt < cutoff && std::fs::remove_file(&path).is_ok() {
+                tracing::info!(path = %path.display(), "gc: removed stale ci-watch lock");
+                removed += 1;
+            }
+        }
+    }
+    if removed > 0 {
+        crate::event_log::log(
+            home,
+            "gc_stale_ci_watch_locks",
+            "",
+            &format!("{removed} stale lock files removed"),
+        );
+    }
+    removed
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -2052,5 +2215,89 @@ mod tests {
             obj["error"], "test failure",
             "error message must round-trip unchanged"
         );
+    }
+
+    // ── gc_run tests ──────────────────────────────────────────────
+
+    #[test]
+    fn gc_run_returns_empty_when_no_candidates() {
+        let home = tmp_home("gc-run-empty");
+        let results = gc_run(&home);
+        assert!(results.is_empty());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn gc_stale_ci_watch_locks_removes_old_locks() {
+        let home = tmp_home("gc-locks");
+        let ci_dir = home.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).unwrap();
+
+        // Create a lock file with an old mtime (> 7 days ago)
+        let stale_lock = ci_dir.join("pr-123.lock");
+        std::fs::write(&stale_lock, "locked").unwrap();
+        // Set mtime to 8 days ago
+        let eight_days_ago =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(8 * 24 * 3600);
+        let f = std::fs::File::options()
+            .write(true)
+            .open(&stale_lock)
+            .unwrap();
+        f.set_modified(eight_days_ago).unwrap();
+
+        // Create a recent lock file (should NOT be removed)
+        let recent_lock = ci_dir.join("pr-456.lock");
+        std::fs::write(&recent_lock, "locked").unwrap();
+
+        // Create a non-lock file (should NOT be removed)
+        let json_file = ci_dir.join("pr-789.json");
+        std::fs::write(&json_file, "{}").unwrap();
+
+        let removed = gc_stale_ci_watch_locks(&home);
+        assert_eq!(removed, 1, "only the stale lock should be removed");
+        assert!(!stale_lock.exists(), "stale lock must be deleted");
+        assert!(recent_lock.exists(), "recent lock must be preserved");
+        assert!(json_file.exists(), "non-lock file must be preserved");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn gc_stale_ci_watch_locks_handles_missing_dir() {
+        let home = tmp_home("gc-locks-nodir");
+        let removed = gc_stale_ci_watch_locks(&home);
+        assert_eq!(removed, 0);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn resolve_source_repo_parses_gitdir_pointer() {
+        let home = tmp_home("resolve-src");
+        let fake_wt = home.join("wt");
+        std::fs::create_dir_all(&fake_wt).unwrap();
+        // Simulate .git file pointing to source/.git/worktrees/wt
+        let source = home.join("source");
+        let gitdir_target = source.join(".git").join("worktrees").join("wt");
+        std::fs::create_dir_all(&gitdir_target).unwrap();
+        std::fs::write(
+            fake_wt.join(".git"),
+            format!("gitdir: {}", gitdir_target.display()),
+        )
+        .unwrap();
+        let resolved = resolve_source_repo(&fake_wt);
+        assert!(resolved.is_some());
+        assert_eq!(resolved.unwrap(), source);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn resolve_source_repo_returns_none_for_regular_repo() {
+        let home = tmp_home("resolve-none");
+        let fake_dir = home.join("regular");
+        std::fs::create_dir_all(&fake_dir).unwrap();
+        // A regular .git directory, not a worktree
+        std::fs::create_dir_all(fake_dir.join(".git")).unwrap();
+        let resolved = resolve_source_repo(&fake_dir);
+        assert!(resolved.is_none());
+        std::fs::remove_dir_all(&home).ok();
     }
 }

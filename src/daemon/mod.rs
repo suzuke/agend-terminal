@@ -670,6 +670,9 @@ fn run_core(
         // `daemon/per_tick/thread_dump.rs` for full design + the
         // wrapper-only blind spot caveat.
         Box::new(per_tick::ThreadDumpHandler::new()),
+        // Hourly worktree GC: 10s tick × 360 = 3600s. Removes daemon-
+        // managed worktrees past grace period + stale ci-watch locks.
+        Box::new(per_tick::GcTickHandler::new(360)),
     ];
 
     // Periodic tick channel (every 10s for health/schedule/session maintenance)
