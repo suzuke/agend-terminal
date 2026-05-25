@@ -65,6 +65,9 @@ fn main() {
         is_agent_caller,
     ) {
         Action::Passthrough => exec_real_git(&args, None),
+        Action::ChdirPass(worktree) if is_conflict_capable(subcommand) => {
+            exec_with_conflict_guidance(&args, &worktree);
+        }
         Action::ChdirPass(worktree) => exec_real_git(&args, Some(&worktree)),
         Action::CleanupAndChdirPushPass(worktree) => {
             // #883: best-effort pre-push cleanup of empty `init`
@@ -740,6 +743,35 @@ fn commit_is_empty_heartbeat(worktree: &str, hash: &str) -> bool {
 
 // ── Exec ────────────────────────────────────────────────────────────────
 
+fn exec_with_conflict_guidance(args: &[String], worktree: &str) -> ! {
+    use std::io::Write;
+    let git = resolve_real_git();
+    let output = Command::new(&git)
+        .arg("-C")
+        .arg(worktree)
+        .args(args)
+        .output();
+    match output {
+        Ok(out) => {
+            let _ = std::io::stdout().write_all(&out.stdout);
+            let _ = std::io::stderr().write_all(&out.stderr);
+            let combined = [
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr),
+            ]
+            .concat();
+            if !out.status.success() && output_has_conflict_signal(&combined) {
+                eprint!("{}", format_conflict_guidance());
+            }
+            std::process::exit(out.status.code().unwrap_or(1))
+        }
+        Err(e) => {
+            eprintln!("agend-git: exec failed: {e}");
+            std::process::exit(127);
+        }
+    }
+}
+
 fn exec_real_git(args: &[String], chdir: Option<&str>) -> ! {
     let git = resolve_real_git();
     let mut cmd = Command::new(&git);
@@ -851,6 +883,22 @@ fn write_git_event_typed(
         use std::io::Write;
         let _ = writeln!(f, "{}", event);
     }
+}
+
+fn is_conflict_capable(subcmd: &str) -> bool {
+    matches!(subcmd, "rebase" | "merge" | "pull" | "cherry-pick")
+}
+
+fn output_has_conflict_signal(output: &str) -> bool {
+    output.contains("CONFLICT") || output.contains("Merge conflict")
+}
+
+fn format_conflict_guidance() -> &'static str {
+    "\n\u{26a0} Merge conflict detected. To resolve:\n\
+     1. Edit the conflicted files listed above \u{2014} resolve all <<<<<<< / ======= / >>>>>>> markers\n\
+     2. git add <resolved-files>\n\
+     3. git rebase --continue (or git merge --continue / git cherry-pick --continue)\n\
+     Do NOT abandon and redo from scratch unless the conflict involves complex semantic changes you cannot resolve.\n"
 }
 
 #[cfg(test)]
@@ -1844,5 +1892,34 @@ mod tests {
         let head_after = rev_parse(&worktree, "HEAD");
         assert_eq!(head_before, head_after, "no-op on a clean branch");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ----- #1225: conflict resolution guidance -----
+
+    #[test]
+    fn is_conflict_capable_covers_rebase_merge_pull_cherry_pick() {
+        for cmd in ["rebase", "merge", "pull", "cherry-pick"] {
+            assert!(is_conflict_capable(cmd), "{cmd} should be conflict-capable");
+        }
+        for cmd in ["commit", "add", "push", "status", "reset"] {
+            assert!(!is_conflict_capable(cmd), "{cmd} should NOT be conflict-capable");
+        }
+    }
+
+    #[test]
+    fn output_has_conflict_signal_detects_conflict_keyword() {
+        assert!(output_has_conflict_signal("CONFLICT (content): Merge conflict in src/lib.rs"));
+        assert!(output_has_conflict_signal("Merge conflict in file.rs"));
+        assert!(!output_has_conflict_signal("Already up to date."));
+        assert!(!output_has_conflict_signal("Successfully rebased and updated refs/heads/feat."));
+    }
+
+    #[test]
+    fn conflict_guidance_contains_resolution_steps() {
+        let guidance = format_conflict_guidance();
+        assert!(guidance.contains("resolve"), "should mention resolving");
+        assert!(guidance.contains("git add"), "should mention git add");
+        assert!(guidance.contains("--continue"), "should mention --continue");
+        assert!(guidance.contains("Do NOT abandon"), "should discourage abandoning");
     }
 }
