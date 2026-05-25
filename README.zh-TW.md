@@ -39,57 +39,43 @@ Crash 後自動重啟並移交上下文。透過多 tab / 多 pane 的 TUI、Tel
 
 ## 開發流程
 
-各功能在多 agent 開發生命週期中的定位。
-虛線框（- - -）為 agent 基礎設施——agent 透過 MCP 工具使用。
-實線框為 operator 面向功能。
+一個任務如何流經多 agent pipeline。每一步標示當下運作的功能。
 
 ```mermaid
 flowchart TD
-    subgraph S1[" 1 · 環境設定 "]
-        qs["快速開始"]
-        fl["Fleet 設定"]
-        tm["團隊"]
-        cfg["設定"]
-        svc["服務管理"]
-    end
+    A["👤 操作者撰寫 fleet.yaml"] --> B["⚙️ Daemon 啟動 agents"]
 
-    subgraph S2[" 2 · 任務分派 "]
-        tb["任務看板"]
-        send["通訊 · send"]:::infra
-        idle["Dispatch Idle"]:::infra
-        sk["Skills 技能"]
-    end
+    B --> C["👤 操作者透過 TUI / Telegram 指派任務"]
+    C --> D["🤖 Lead 在任務看板建立任務"]
+    D --> E["🤖 Lead 分派任務給 Dev"]
 
-    subgraph S3[" 3 · 開發執行 "]
-        wt["Worktree"]:::infra
-        ai["Agent 互動"]
-        tui["TUI"]
-        ch["頻道"]
-    end
+    E --> F["🤖 Dev 綁定 git Worktree"]
+    F --> G["🤖 Dev 開發 — Skills 載入行為模板"]
+    G --> H["🤖 Dev 推送 PR + 回報 Lead"]
 
-    subgraph S4[" 4 · 整合驗證 "]
-        ci["CI 監控"]:::infra
-        rpt["通訊 · report"]:::infra
-        dec["決策記錄"]:::infra
-        done["任務看板 ✓"]
-    end
+    H --> I["⚙️ CI Watch 監控 GitHub Actions"]
+    I --> J["⚙️ CI 通過 → 自動通知 Reviewer"]
+    J --> K["🤖 Reviewer 審查程式碼"]
+    K --> L["🤖 Lead 合併 PR → 任務完成"]
 
-    subgraph S5[" 5 · 維運 "]
-        hm["健康與監控"]:::infra
-        dg["診斷工具"]
-        sch["排程"]:::infra
-    end
+    L --> |"下一個任務"| D
 
-    S1 --> S2 --> S3 --> S4 --> S5
+    E -. "⏱️ Dispatch Idle：10 分鐘未回應則警報" .-> C
+    B -. "🏥 Health：crash/hang 時自動重啟" .-> B
+    K -. "📝 Decisions：記錄架構決策" .-> K
 
-    classDef infra fill:#e3f2fd,stroke:#1565c0,stroke-dasharray:5 5
+    classDef operator fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20
+    classDef agent fill:#e3f2fd,stroke:#1565c0,color:#0d47a1
+    classDef daemon fill:#fff3e0,stroke:#e65100,color:#bf360c
 
-    style S1 fill:#e8f5e9,stroke:#2e7d32
-    style S2 fill:#fff3e0,stroke:#e65100
-    style S3 fill:#f3e5f5,stroke:#6a1b9a
-    style S4 fill:#e0f7fa,stroke:#00838f
-    style S5 fill:#fce4ec,stroke:#c62828
+    class A,C operator
+    class D,E,F,G,H,K,L agent
+    class B,I,J daemon
 ```
+
+圖例：🟢 綠色 = 操作者操作 · 🔵 藍色 = Agent 行為 · 🟠 橙色 = Daemon 自動化
+
+> **背景常駐服務：** Health & Monitoring（自動重啟）、Channels（Telegram 同步）、Schedules（定時任務）、Diagnostics（故障排除）
 
 ## 快速開始
 

@@ -42,57 +42,43 @@ multi-pane TUI, a Telegram channel, or an optional system tray.
 
 ## Development Workflow
 
-How the features fit together across the multi-agent development lifecycle.
-Dashed boxes (- - -) are agent infrastructure — used by agents via MCP tools.
-Solid boxes are operator-facing.
+How a task flows through the multi-agent pipeline. Each step shows which feature is active.
 
 ```mermaid
 flowchart TD
-    subgraph S1[" 1 · Setup "]
-        qs["Quick Start"]
-        fl["Fleet Config"]
-        tm["Teams"]
-        cfg["Configuration"]
-        svc["Service"]
-    end
+    A["👤 Operator writes fleet.yaml"] --> B["⚙️ Daemon launches agents"]
 
-    subgraph S2[" 2 · Dispatch "]
-        tb["Task Board"]
-        send["Communication · send"]:::infra
-        idle["Dispatch Idle"]:::infra
-        sk["Skills"]
-    end
+    B --> C["👤 Operator assigns task via TUI / Telegram"]
+    C --> D["🤖 Lead creates task on Task Board"]
+    D --> E["🤖 Lead sends task to Dev"]
 
-    subgraph S3[" 3 · Development "]
-        wt["Worktree"]:::infra
-        ai["Agent Interaction"]
-        tui["TUI"]
-        ch["Channels"]
-    end
+    E --> F["🤖 Dev binds git Worktree"]
+    F --> G["🤖 Dev codes — Skills load behavior templates"]
+    G --> H["🤖 Dev pushes PR + reports to Lead"]
 
-    subgraph S4[" 4 · Integration "]
-        ci["CI Watch"]:::infra
-        rpt["Communication · report"]:::infra
-        dec["Decisions"]:::infra
-        done["Task Board ✓"]
-    end
+    H --> I["⚙️ CI Watch monitors GitHub Actions"]
+    I --> J["⚙️ CI passes → auto-notify Reviewer"]
+    J --> K["🤖 Reviewer reviews code"]
+    K --> L["🤖 Lead merges PR → Task done"]
 
-    subgraph S5[" 5 · Operations "]
-        hm["Health & Monitoring"]:::infra
-        dg["Diagnostics"]
-        sch["Schedules"]:::infra
-    end
+    L --> |"next task"| D
 
-    S1 --> S2 --> S3 --> S4 --> S5
+    E -. "⏱️ Dispatch Idle: alert if no response in 10min" .-> C
+    B -. "🏥 Health: auto-restart on crash/hang" .-> B
+    K -. "📝 Decisions: record architectural choices" .-> K
 
-    classDef infra fill:#e3f2fd,stroke:#1565c0,stroke-dasharray:5 5
+    classDef operator fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20
+    classDef agent fill:#e3f2fd,stroke:#1565c0,color:#0d47a1
+    classDef daemon fill:#fff3e0,stroke:#e65100,color:#bf360c
 
-    style S1 fill:#e8f5e9,stroke:#2e7d32
-    style S2 fill:#fff3e0,stroke:#e65100
-    style S3 fill:#f3e5f5,stroke:#6a1b9a
-    style S4 fill:#e0f7fa,stroke:#00838f
-    style S5 fill:#fce4ec,stroke:#c62828
+    class A,C operator
+    class D,E,F,G,H,K,L agent
+    class B,I,J daemon
 ```
+
+Legend: 🟢 Green = Operator action · 🔵 Blue = Agent behavior (via MCP tools) · 🟠 Orange = Daemon automation
+
+> **Always running in background:** Health & Monitoring (auto-restart), Channels (Telegram sync), Schedules (cron jobs), Diagnostics (troubleshooting)
 
 ## Quick Start
 
