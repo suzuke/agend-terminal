@@ -67,7 +67,10 @@ pub fn is_git_repo(dir: &Path) -> bool {
 /// matches the pre-Wave-4 `{source_repo}/.worktrees/{name}` layout
 /// and returns `None` for the new layout.
 pub fn source_repo_of(working_dir: &Path) -> Option<PathBuf> {
-    if !working_dir.display().to_string().contains(".worktrees/") {
+    if !working_dir
+        .components()
+        .any(|c| c.as_os_str() == ".worktrees")
+    {
         return None;
     }
     working_dir.parent()?.parent().map(|p| p.to_path_buf())

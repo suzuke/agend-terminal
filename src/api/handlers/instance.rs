@@ -387,7 +387,7 @@ pub(crate) fn handle_pane_snapshot(params: &Value, ctx: &HandlerCtx) -> Value {
         Some(n) => n,
         None => return json!({"ok": false, "error": "missing 'name'"}),
     };
-    let lines = params["lines"].as_u64().unwrap_or(100) as usize;
+    let lines = (params["lines"].as_u64().unwrap_or(100) as usize).min(10_000);
     let reg = agent::lock_registry(ctx.registry);
     let handle = match reg.get(name) {
         Some(h) => h,

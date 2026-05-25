@@ -177,6 +177,14 @@ pub fn sweep_from_registry(
     let mut removed = Vec::new();
 
     for repo in &repos {
+        // Prune stale remote refs before remote-gone detection
+        let remote = crate::git_helpers::primary_remote(repo);
+        let _ = Command::new("git")
+            .args(["fetch", "--prune", &remote])
+            .current_dir(repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output();
+
         // Phase 1: clean worktrees (existing logic + remote-gone)
         let entries = list_worktrees(repo);
         for entry in &entries {

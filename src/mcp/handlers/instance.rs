@@ -291,8 +291,8 @@ pub(super) fn handle_replace_instance(home: &Path, args: &Value) -> Value {
         &json!({"method": crate::api::method::DELETE, "params": {"name": name}}),
     );
 
-    // Brief pause after kill to let OS reclaim resources (ports, file locks)
-    // before spawning the replacement. Prevents startup race on fast exits.
+    // TODO: replace hardcoded 500ms sleep with event-driven readiness check
+    // (e.g. poll until PID is gone or port is free).
     std::thread::sleep(std::time::Duration::from_millis(500));
 
     // Enqueue handover context for the new instance.
@@ -350,12 +350,18 @@ pub(super) fn handle_replace_instance(home: &Path, args: &Value) -> Value {
 
 pub(super) fn handle_set_display_name(home: &Path, args: &Value, instance_name: &str) -> Value {
     let display_name = args["name"].as_str().unwrap_or("");
+    if display_name.len() > 256 {
+        return json!({"error": "display_name exceeds 256 character limit"});
+    }
     save_metadata(home, instance_name, "display_name", json!(display_name));
     json!({"display_name": display_name})
 }
 
 pub(super) fn handle_set_description(home: &Path, args: &Value, instance_name: &str) -> Value {
     let desc = args["description"].as_str().unwrap_or("");
+    if desc.len() > 1024 {
+        return json!({"error": "description exceeds 1024 character limit"});
+    }
     save_metadata(home, instance_name, "description", json!(desc));
     json!({"description": desc})
 }

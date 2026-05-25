@@ -74,7 +74,10 @@ pub(super) fn spawn_single_instance_impl(
         cmd_args.push_str(&format!("--model {model_val}"));
     }
     if let Some(dir) = args.get("working_directory").and_then(|v| v.as_str()) {
-        if dir.contains("..") {
+        if std::path::Path::new(dir)
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
+        {
             return json!({"error": "working_directory must not contain '..'"});
         }
         if !dir.starts_with('/') {

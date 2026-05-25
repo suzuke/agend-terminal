@@ -139,7 +139,7 @@ fn tree_rss(sys: &sysinfo::System, root: sysinfo::Pid) -> u64 {
 
 /// Read heartbeat lag and pending pickup count from metadata JSON.
 fn read_metadata_metrics(home: &std::path::Path, name: &str) -> (Option<u64>, usize) {
-    let meta_path = home.join("metadata").join(format!("{name}.json"));
+    let meta_path = crate::agent_ops::metadata_path_resolved(home, name);
     let content = match std::fs::read_to_string(meta_path) {
         Ok(c) => c,
         Err(_) => return (None, 0),
