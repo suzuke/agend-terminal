@@ -151,9 +151,10 @@ fn cleanup_merged_branch(
         .env("AGEND_GIT_BYPASS", "1")
         .output();
 
-    // Check if branch is ancestor of main (fast-forward or true merge).
+    // Check if branch is ancestor of default branch (fast-forward or true merge).
+    let default = crate::git_helpers::default_branch(source_repo);
     let is_merged = std::process::Command::new("git")
-        .args(["merge-base", "--is-ancestor", branch, "main"])
+        .args(["merge-base", "--is-ancestor", branch, &default])
         .current_dir(source_repo)
         .env("AGEND_GIT_BYPASS", "1")
         .output()

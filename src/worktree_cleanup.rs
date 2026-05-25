@@ -31,6 +31,7 @@ fn list_worktrees(repo_root: &Path) -> Vec<WorktreeEntry> {
     let output = Command::new("git")
         .args(["worktree", "list", "--porcelain"])
         .current_dir(repo_root)
+        .env("AGEND_GIT_BYPASS", "1")
         .output();
     let output = match output {
         Ok(o) if o.status.success() => o,
@@ -64,6 +65,7 @@ fn is_branch_merged(repo_root: &Path, branch: &str) -> bool {
     Command::new("git")
         .args(["merge-base", "--is-ancestor", branch, &default])
         .current_dir(repo_root)
+        .env("AGEND_GIT_BYPASS", "1")
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -78,6 +80,7 @@ fn is_remote_gone(repo_root: &Path, branch: &str) -> bool {
     let output = Command::new("git")
         .args(["config", &format!("branch.{branch}.remote")])
         .current_dir(repo_root)
+        .env("AGEND_GIT_BYPASS", "1")
         .output();
     let remote = output
         .as_ref()
@@ -93,6 +96,7 @@ fn is_remote_gone(repo_root: &Path, branch: &str) -> bool {
     let exists = Command::new("git")
         .args(["rev-parse", "--verify", &remote_ref])
         .current_dir(repo_root)
+        .env("AGEND_GIT_BYPASS", "1")
         .output()
         .map(|o| o.status.success())
         .unwrap_or(true); // assume exists on error (safe default)
@@ -104,6 +108,7 @@ fn is_worktree_dirty(worktree_path: &Path) -> bool {
     Command::new("git")
         .args(["status", "--porcelain"])
         .current_dir(worktree_path)
+        .env("AGEND_GIT_BYPASS", "1")
         .output()
         .map(|o| !o.stdout.is_empty())
         .unwrap_or(true) // assume dirty on error (safe default)
@@ -114,6 +119,7 @@ fn remove_worktree(repo_root: &Path, worktree_path: &str, branch: &str) -> bool 
     let wt_ok = Command::new("git")
         .args(["worktree", "remove", "--force", worktree_path])
         .current_dir(repo_root)
+        .env("AGEND_GIT_BYPASS", "1")
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
@@ -121,6 +127,7 @@ fn remove_worktree(repo_root: &Path, worktree_path: &str, branch: &str) -> bool 
         let _ = Command::new("git")
             .args(["branch", "-D", branch])
             .current_dir(repo_root)
+            .env("AGEND_GIT_BYPASS", "1")
             .output();
     }
     wt_ok
@@ -223,6 +230,7 @@ pub fn sweep_from_registry(
 /// ref is gone or that are merged into main. Skips branches checked out in
 /// any worktree.
 fn prune_orphaned_branches(repo_root: &Path) -> Vec<String> {
+    let default = crate::git_helpers::default_branch(repo_root);
     // Collect branches currently checked out in worktrees — cannot delete these
     let wt_branches: HashSet<String> = list_worktrees(repo_root)
         .into_iter()
@@ -232,11 +240,12 @@ fn prune_orphaned_branches(repo_root: &Path) -> Vec<String> {
     let output = Command::new("git")
         .args(["branch", "--format=%(refname:short)"])
         .current_dir(repo_root)
+        .env("AGEND_GIT_BYPASS", "1")
         .output();
     let branches: Vec<String> = match output {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
             .lines()
-            .filter(|b| *b != "main" && *b != "master")
+            .filter(|b| *b != default.as_str())
             .map(String::from)
             .collect(),
         _ => return Vec::new(),
@@ -255,6 +264,7 @@ fn prune_orphaned_branches(repo_root: &Path) -> Vec<String> {
         let ok = Command::new("git")
             .args(["branch", "-D", branch])
             .current_dir(repo_root)
+            .env("AGEND_GIT_BYPASS", "1")
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false);
@@ -275,6 +285,7 @@ fn prune_stale_worktrees(repo_root: &Path) {
     let _ = Command::new("git")
         .args(["worktree", "prune"])
         .current_dir(repo_root)
+        .env("AGEND_GIT_BYPASS", "1")
         .output();
 }
 
@@ -307,6 +318,7 @@ mod tests {
         Command::new("git")
             .args(args)
             .current_dir(dir)
+            .env("AGEND_GIT_BYPASS", "1")
             .env("GIT_AUTHOR_NAME", "test")
             .env("GIT_AUTHOR_EMAIL", "t@t")
             .env("GIT_COMMITTER_NAME", "test")
@@ -487,6 +499,7 @@ mod tests {
                 remote_dir.to_str().unwrap(),
                 repo.to_str().unwrap(),
             ])
+            .env("AGEND_GIT_BYPASS", "1")
             .env("GIT_AUTHOR_NAME", "test")
             .env("GIT_AUTHOR_EMAIL", "t@t")
             .env("GIT_COMMITTER_NAME", "test")
