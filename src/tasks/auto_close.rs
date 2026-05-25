@@ -5,13 +5,52 @@ use std::path::Path;
 /// Auto-close a task when the assignee sends kind=report.
 /// Returns `Ok(true)` if the task was auto-closed, `Ok(false)` if skipped.
 pub fn auto_close_on_report(
-    _home: &Path,
-    _kind: &str,
-    _correlation_id: &str,
-    _reporter: &str,
-    _report_text: &str,
+    home: &Path,
+    kind: &str,
+    correlation_id: &str,
+    reporter: &str,
+    report_text: &str,
 ) -> anyhow::Result<bool> {
-    Ok(false) // stub — RED tests will assert-fail
+    if kind != "report" {
+        return Ok(false);
+    }
+    if !correlation_id.starts_with("t-") {
+        return Ok(false);
+    }
+    let state = crate::task_events::replay(home).unwrap_or_default();
+    let tid = crate::task_events::TaskId(correlation_id.to_string());
+    let Some(record) = state.tasks.get(&tid) else {
+        return Ok(false);
+    };
+    use crate::task_events::TaskStatus;
+    if !matches!(
+        record.status,
+        TaskStatus::Open | TaskStatus::Claimed | TaskStatus::InProgress | TaskStatus::Blocked
+    ) {
+        return Ok(false);
+    }
+    let assignee = record.owner.as_ref().map(|o| o.0.as_str()).unwrap_or("");
+    if assignee != reporter {
+        return Ok(false);
+    }
+    let summary = if report_text.chars().count() > 200 {
+        let truncated: String = report_text.chars().take(200).collect();
+        format!("{truncated}…")
+    } else {
+        report_text.to_string()
+    };
+    let event = crate::task_events::TaskEvent::Done {
+        task_id: tid,
+        by: crate::task_events::InstanceName(reporter.to_string()),
+        source: crate::task_events::DoneSource::ReportAutoClose {
+            report_summary: summary,
+            closed_at: chrono::Utc::now().to_rfc3339(),
+        },
+    };
+    let emitter = crate::task_events::InstanceName::from("system:auto-close");
+    crate::task_events::append(home, &emitter, event)?;
+    let _ = crate::daemon::dispatch_idle::cleanup_pending_for_task_id(home, correlation_id);
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -128,10 +167,7 @@ mod tests {
 
     fn task_status(home: &Path, task_id: &str) -> Option<crate::task_events::TaskStatus> {
         let state = crate::task_events::replay(home).unwrap();
-        state
-            .tasks
-            .get(&TaskId(task_id.into()))
-            .map(|r| r.status)
+        state.tasks.get(&TaskId(task_id.into())).map(|r| r.status)
     }
 
     // ── RED tests: all assert-fail on the stub ──
@@ -141,7 +177,11 @@ mod tests {
         let home = tmp_home("assignee_close");
         seed_claimed_task(&home, "t-1228-001", "dev-agent");
         let closed = auto_close_on_report(
-            &home, "report", "t-1228-001", "dev-agent", "Task completed successfully",
+            &home,
+            "report",
+            "t-1228-001",
+            "dev-agent",
+            "Task completed successfully",
         )
         .unwrap();
         assert!(closed, "assignee report should auto-close the task");
@@ -157,7 +197,11 @@ mod tests {
         let home = tmp_home("kind_update");
         seed_claimed_task(&home, "t-1228-002", "dev-agent");
         let closed = auto_close_on_report(
-            &home, "update", "t-1228-002", "dev-agent", "progress update",
+            &home,
+            "update",
+            "t-1228-002",
+            "dev-agent",
+            "progress update",
         )
         .unwrap();
         assert!(!closed, "kind=update should NOT auto-close");
@@ -172,10 +216,9 @@ mod tests {
     fn non_assignee_does_not_close() {
         let home = tmp_home("non_assignee");
         seed_claimed_task(&home, "t-1228-003", "dev-agent");
-        let closed = auto_close_on_report(
-            &home, "report", "t-1228-003", "reviewer-agent", "VERIFIED",
-        )
-        .unwrap();
+        let closed =
+            auto_close_on_report(&home, "report", "t-1228-003", "reviewer-agent", "VERIFIED")
+                .unwrap();
         assert!(!closed, "non-assignee report should NOT auto-close");
         assert_eq!(
             task_status(&home, "t-1228-003"),
@@ -189,7 +232,11 @@ mod tests {
         let home = tmp_home("non_task_corr");
         seed_claimed_task(&home, "t-1228-004", "dev-agent");
         let closed = auto_close_on_report(
-            &home, "report", "qcorr-20260525", "dev-agent", "some report",
+            &home,
+            "report",
+            "qcorr-20260525",
+            "dev-agent",
+            "some report",
         )
         .unwrap();
         assert!(!closed, "non-t- correlation_id should skip");
@@ -200,20 +247,29 @@ mod tests {
         let home = tmp_home("already_done");
         seed_done_task(&home, "t-1228-005", "dev-agent");
         let closed = auto_close_on_report(
-            &home, "report", "t-1228-005", "dev-agent", "duplicate report",
+            &home,
+            "report",
+            "t-1228-005",
+            "dev-agent",
+            "duplicate report",
         )
         .unwrap();
-        assert!(!closed, "already-done task should return false (idempotent)");
+        assert!(
+            !closed,
+            "already-done task should return false (idempotent)"
+        );
     }
 
     #[test]
     fn already_cancelled_is_idempotent() {
         let home = tmp_home("already_cancelled");
         seed_cancelled_task(&home, "t-1228-006");
-        let closed = auto_close_on_report(
-            &home, "report", "t-1228-006", "dev-agent", "late report",
-        )
-        .unwrap();
-        assert!(!closed, "already-cancelled task should return false (idempotent)");
+        let closed =
+            auto_close_on_report(&home, "report", "t-1228-006", "dev-agent", "late report")
+                .unwrap();
+        assert!(
+            !closed,
+            "already-cancelled task should return false (idempotent)"
+        );
     }
 }

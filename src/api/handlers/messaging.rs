@@ -515,6 +515,12 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
     } else if kind_str == "report" {
         if let Some(corr) = msg.correlation_id.as_deref() {
             let _ = crate::daemon::dispatch_idle::mark_resolved(ctx.home, corr);
+            // #1228: auto-close task when assignee sends kind=report
+            if corr.starts_with("t-") {
+                let _ = crate::tasks::auto_close::auto_close_on_report(
+                    ctx.home, kind_str, corr, from, &msg.text,
+                );
+            }
         }
     } else if matches!(kind_str, "update" | "query") {
         // #1047: non-report messages from dispatchee signal liveness —
