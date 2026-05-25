@@ -1194,6 +1194,7 @@ mod tests {
                 bind: None,
                 eta_secs: None,
                 tags: vec![],
+                parent_id: None,
             },
         )
         .unwrap();

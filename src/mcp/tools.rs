@@ -151,7 +151,7 @@ fn task_tools() -> Vec<Value> {
                 "action": {"type": "string", "enum": ["create", "list", "claim", "done", "update", "sweep", "health", "activity"]},
                 "title": {"type": "string"}, "description": {"type": "string"},
                 "priority": {"type": "string", "enum": ["low", "normal", "high", "urgent"]},
-                "assignee": {"type": "string"}, "depends_on": {"type": "array", "items": {"type": "string"}},
+                "assignee": {"type": "string"}, "depends_on": {"type": "array", "items": {"type": "string"}}, "parent_id": {"type": "string", "description": "Parent task ID for subtask composition (A is composed of B,C,D). Complementary to depends_on (execution order)."},
                 "id": {"type": "string"}, "result": {"type": "string"},
                 "status": {"type": "string", "enum": ["open", "claimed", "in_progress", "blocked", "verified", "done", "cancelled"]},
                 "filter_assignee": {"type": "string"}, "filter_status": {"type": "string"}, "filter_tag": {"type": "string", "description": "Filter by tag"}, "tags": {"type": "array", "items": {"type": "string"}, "description": "Task tags (for create/update)"},

@@ -787,6 +787,7 @@ mod tests {
             eta_secs: None,
             auto_release_on_verdict: None,
             tags: vec![],
+            parent_id: None,
         }
     }
 

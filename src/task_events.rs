@@ -233,6 +233,8 @@ pub enum TaskEvent {
         eta_secs: Option<i64>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tags: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_id: Option<TaskId>,
     },
     Claimed {
         task_id: TaskId,
@@ -474,6 +476,8 @@ pub struct TaskRecord {
     pub eta_secs: Option<i64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<TaskId>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -547,6 +551,7 @@ impl TaskBoardState {
                 bind,
                 eta_secs,
                 tags,
+                parent_id,
                 ..
             } => {
                 self.tasks
@@ -573,6 +578,7 @@ impl TaskBoardState {
                         started_at: None,
                         eta_secs: *eta_secs,
                         tags: tags.clone(),
+                        parent_id: parent_id.clone(),
                     });
             }
             TaskEvent::Claimed { by, .. } => {
@@ -617,7 +623,20 @@ impl TaskBoardState {
             TaskEvent::Cancelled { .. } => {
                 if let Some(t) = self.tasks.get_mut(&task_id) {
                     t.status = TaskStatus::Cancelled;
-                    t.updated_at = touch_at;
+                    t.updated_at = touch_at.clone();
+                }
+                let children: Vec<TaskId> = self
+                    .tasks
+                    .iter()
+                    .filter(|(_, t)| t.parent_id.as_ref() == Some(&task_id))
+                    .filter(|(_, t)| matches!(t.status, TaskStatus::Open | TaskStatus::Claimed))
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for child_id in children {
+                    if let Some(child) = self.tasks.get_mut(&child_id) {
+                        child.status = TaskStatus::Cancelled;
+                        child.updated_at = touch_at.clone();
+                    }
                 }
             }
             TaskEvent::Linked { pr_id, .. } => {
@@ -1010,6 +1029,7 @@ mod tests {
             bind: None,
             eta_secs: None,
             tags: vec![],
+            parent_id: None,
         }
     }
 
@@ -1474,6 +1494,7 @@ mod tests {
                 bind: None,
                 eta_secs: None,
                 tags: vec![],
+                parent_id: None,
             },
         )
         .unwrap();
@@ -1550,6 +1571,7 @@ mod tests {
                     bind: None,
                     eta_secs: None,
                     tags: vec![],
+                    parent_id: None,
                 },
                 "Claimed" => TaskEvent::Claimed {
                     task_id: tid.clone(),
@@ -1744,6 +1766,7 @@ mod tests {
                 bind: None,
                 eta_secs: None,
                 tags: vec![],
+                parent_id: None,
             },
         )
         .unwrap();
@@ -1824,6 +1847,7 @@ mod tests {
                     bind: None,
                     eta_secs: None,
                     tags: vec![],
+                    parent_id: None,
                 },
             },
             // Sweep Linked appears BEFORE operator Claimed in file order
@@ -1996,6 +2020,7 @@ mod tests {
                 bind: Some(false),
                 eta_secs: None,
                 tags: vec![],
+                parent_id: None,
             },
         )
         .unwrap();
@@ -2036,6 +2061,7 @@ mod tests {
                 bind: None,
                 eta_secs: Some(60),
                 tags: vec![],
+                parent_id: None,
             },
         )
         .unwrap();
@@ -2101,6 +2127,7 @@ mod tests {
                 bind: None,
                 eta_secs: Some(60),
                 tags: vec![],
+                parent_id: None,
             },
         )
         .unwrap();
@@ -2200,6 +2227,7 @@ mod tests {
                 bind: None,
                 eta_secs: Some(7200),
                 tags: vec![],
+                parent_id: None,
             },
         )
         .unwrap();
@@ -2274,6 +2302,306 @@ mod tests {
         let state = replay(&home).unwrap();
         assert!(state.tasks.contains_key(&TaskId::from("t-pre-compact")));
         assert!(state.tasks.contains_key(&TaskId::from("t-post-compact")));
+        fs::remove_dir_all(&home).ok();
+    }
+
+    // ── parent_id tree structure tests ──────────────────────────────
+
+    #[test]
+    fn parent_id_round_trips_through_replay() {
+        let home = tmp_home("parent-rt");
+        let inst = InstanceName::from("dev");
+        append(
+            &home,
+            &inst,
+            TaskEvent::Created {
+                task_id: TaskId::from("t-parent"),
+                title: "parent".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: None,
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: None,
+                bind: None,
+                eta_secs: None,
+                tags: vec![],
+                parent_id: None,
+            },
+        )
+        .unwrap();
+        append(
+            &home,
+            &inst,
+            TaskEvent::Created {
+                task_id: TaskId::from("t-child"),
+                title: "child".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: None,
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: None,
+                bind: None,
+                eta_secs: None,
+                tags: vec![],
+                parent_id: Some(TaskId::from("t-parent")),
+            },
+        )
+        .unwrap();
+        let state = replay(&home).unwrap();
+        let parent = state.tasks.get(&TaskId::from("t-parent")).unwrap();
+        assert_eq!(parent.parent_id, None);
+        let child = state.tasks.get(&TaskId::from("t-child")).unwrap();
+        assert_eq!(child.parent_id, Some(TaskId::from("t-parent")));
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn parent_id_v1_envelope_defaults_to_none() {
+        let home = tmp_home("parent-v1");
+        let log = home.join("task_events.jsonl");
+        let v1_line = serde_json::json!({
+            "schema_version": 1,
+            "seq": 1,
+            "timestamp": "2026-05-25T00:00:00Z",
+            "instance": "v1-emitter",
+            "event": {
+                "kind": "Created",
+                "task_id": "t-old",
+                "title": "old task",
+                "description": "",
+                "priority": "normal",
+                "owner": null
+            }
+        });
+        fs::write(&log, format!("{v1_line}\n")).unwrap();
+        let state = replay(&home).unwrap();
+        let task = state.tasks.get(&TaskId::from("t-old")).unwrap();
+        assert_eq!(task.parent_id, None, "v1 envelope missing parent_id → None");
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn cascade_cancel_cancels_open_and_claimed_children() {
+        let home = tmp_home("cascade");
+        let inst = InstanceName::from("dev");
+        append(
+            &home,
+            &inst,
+            TaskEvent::Created {
+                task_id: TaskId::from("t-root"),
+                title: "root".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: None,
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: None,
+                bind: None,
+                eta_secs: None,
+                tags: vec![],
+                parent_id: None,
+            },
+        )
+        .unwrap();
+        append(
+            &home,
+            &inst,
+            TaskEvent::Created {
+                task_id: TaskId::from("t-child-open"),
+                title: "open child".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: None,
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: None,
+                bind: None,
+                eta_secs: None,
+                tags: vec![],
+                parent_id: Some(TaskId::from("t-root")),
+            },
+        )
+        .unwrap();
+        append(
+            &home,
+            &inst,
+            TaskEvent::Created {
+                task_id: TaskId::from("t-child-claimed"),
+                title: "claimed child".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: None,
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: None,
+                bind: None,
+                eta_secs: None,
+                tags: vec![],
+                parent_id: Some(TaskId::from("t-root")),
+            },
+        )
+        .unwrap();
+        append(
+            &home,
+            &inst,
+            TaskEvent::Claimed {
+                task_id: TaskId::from("t-child-claimed"),
+                by: inst.clone(),
+            },
+        )
+        .unwrap();
+        append(
+            &home,
+            &inst,
+            TaskEvent::Created {
+                task_id: TaskId::from("t-child-done"),
+                title: "done child".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: None,
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: None,
+                bind: None,
+                eta_secs: None,
+                tags: vec![],
+                parent_id: Some(TaskId::from("t-root")),
+            },
+        )
+        .unwrap();
+        append(
+            &home,
+            &inst,
+            TaskEvent::Done {
+                task_id: TaskId::from("t-child-done"),
+                by: inst.clone(),
+                source: DoneSource::OperatorManual {
+                    authored_at: chrono::Utc::now().to_rfc3339(),
+                    result: None,
+                },
+            },
+        )
+        .unwrap();
+        append(
+            &home,
+            &inst,
+            TaskEvent::Created {
+                task_id: TaskId::from("t-child-inprog"),
+                title: "in-progress child".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: None,
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: None,
+                bind: None,
+                eta_secs: None,
+                tags: vec![],
+                parent_id: Some(TaskId::from("t-root")),
+            },
+        )
+        .unwrap();
+        append(
+            &home,
+            &inst,
+            TaskEvent::InProgress {
+                task_id: TaskId::from("t-child-inprog"),
+                by: inst.clone(),
+            },
+        )
+        .unwrap();
+        append(
+            &home,
+            &inst,
+            TaskEvent::Created {
+                task_id: TaskId::from("t-unrelated"),
+                title: "unrelated".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: None,
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: None,
+                bind: None,
+                eta_secs: None,
+                tags: vec![],
+                parent_id: None,
+            },
+        )
+        .unwrap();
+
+        // Cancel the parent
+        append(
+            &home,
+            &inst,
+            TaskEvent::Cancelled {
+                task_id: TaskId::from("t-root"),
+                by: inst.clone(),
+                reason: "test cascade".into(),
+            },
+        )
+        .unwrap();
+
+        let state = replay(&home).unwrap();
+        assert_eq!(
+            state.tasks.get(&TaskId::from("t-root")).unwrap().status,
+            TaskStatus::Cancelled
+        );
+        assert_eq!(
+            state
+                .tasks
+                .get(&TaskId::from("t-child-open"))
+                .unwrap()
+                .status,
+            TaskStatus::Cancelled,
+            "open child must be cascade-cancelled"
+        );
+        assert_eq!(
+            state
+                .tasks
+                .get(&TaskId::from("t-child-claimed"))
+                .unwrap()
+                .status,
+            TaskStatus::Cancelled,
+            "claimed child must be cascade-cancelled"
+        );
+        assert_eq!(
+            state
+                .tasks
+                .get(&TaskId::from("t-child-done"))
+                .unwrap()
+                .status,
+            TaskStatus::Done,
+            "done child must NOT be cascade-cancelled"
+        );
+        assert_eq!(
+            state
+                .tasks
+                .get(&TaskId::from("t-child-inprog"))
+                .unwrap()
+                .status,
+            TaskStatus::InProgress,
+            "in-progress child must NOT be cascade-cancelled"
+        );
+        assert_eq!(
+            state
+                .tasks
+                .get(&TaskId::from("t-unrelated"))
+                .unwrap()
+                .status,
+            TaskStatus::Open,
+            "unrelated task must NOT be affected"
+        );
         fs::remove_dir_all(&home).ok();
     }
 }

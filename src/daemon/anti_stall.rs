@@ -241,6 +241,7 @@ mod tests {
             eta_secs,
             auto_release_on_verdict: None,
             tags: vec![],
+            parent_id: None,
         }
     }
 
@@ -550,6 +551,7 @@ mod tests {
                 bind: None,
                 eta_secs: Some(60),
                 tags: vec![],
+                parent_id: None,
             },
         )
         .unwrap();

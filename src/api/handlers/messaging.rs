@@ -163,6 +163,7 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
             bind: None,
             eta_secs: None,
             tags: Vec::new(),
+            parent_id: None,
         };
         match crate::task_events::append(
             ctx.home,

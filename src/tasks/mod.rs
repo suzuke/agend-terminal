@@ -79,6 +79,8 @@ pub struct Task {
     pub auto_release_on_verdict: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -181,6 +183,7 @@ pub(super) fn record_to_task(r: &crate::task_events::TaskRecord) -> Task {
         // surface lands.
         auto_release_on_verdict: None,
         tags: r.tags.clone(),
+        parent_id: r.parent_id.as_ref().map(|t| t.0.clone()),
     }
 }
 
@@ -328,6 +331,7 @@ pub fn migrate_legacy_tasks_json_to_event_log(home: &Path) -> anyhow::Result<Mig
             // dispatches referencing this task_id.
             bind: None,
             tags: Vec::new(),
+            parent_id: None,
         });
         // Emit the minimum status-transition events to bring the task to
         // its current legacy status. The replay-derived view post-PR3

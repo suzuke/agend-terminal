@@ -110,6 +110,9 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                             .collect()
                     })
                     .unwrap_or_default(),
+                parent_id: args["parent_id"]
+                    .as_str()
+                    .map(|s| crate::task_events::TaskId(s.to_string())),
             };
             match crate::task_events::append(home, &emitter, event) {
                 Ok(_) => {
@@ -588,6 +591,9 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                         let _ =
                             crate::daemon::dispatch_idle::cleanup_pending_for_task_id(home, &id);
                     }
+                    if s == "cancelled" {
+                        cascade_cancel_children(home, &id, &emitter);
+                    }
                 }
             }
             // #807 Item 1: see create arm note.
@@ -815,5 +821,53 @@ fn summarize_event(env: &crate::task_events::TaskEventEnvelope) -> (&str, String
             "description updated".to_string(),
         ),
         TaskEvent::TagsSet { tags, .. } => ("tags_set", actor, format!("tags → {tags:?}")),
+    }
+}
+
+fn cascade_cancel_children(
+    home: &Path,
+    parent_id: &str,
+    emitter: &crate::task_events::InstanceName,
+) {
+    let Ok(state) = crate::task_events::replay(home) else {
+        return;
+    };
+    let parent_tid = crate::task_events::TaskId(parent_id.to_string());
+    let mut cancel_events = Vec::new();
+    let mut notify_ids = Vec::new();
+    for (child_id, child) in &state.tasks {
+        if child.parent_id.as_ref() != Some(&parent_tid) {
+            continue;
+        }
+        match child.status {
+            crate::task_events::TaskStatus::Open | crate::task_events::TaskStatus::Claimed => {
+                cancel_events.push(crate::task_events::TaskEvent::Cancelled {
+                    task_id: child_id.clone(),
+                    by: emitter.clone(),
+                    reason: format!("cascade: parent {parent_id} cancelled"),
+                });
+            }
+            crate::task_events::TaskStatus::InProgress => {
+                notify_ids.push((child_id.clone(), child.owner.clone()));
+            }
+            _ => {}
+        }
+    }
+    if !cancel_events.is_empty() {
+        let _ = crate::task_events::append_batch(home, emitter, cancel_events);
+    }
+    for (child_id, owner) in notify_ids {
+        if let Some(ref owner_name) = owner {
+            let msg = crate::inbox::message::InboxMessage {
+                text: format!(
+                    "[parent-cancelled] Parent task {parent_id} was cancelled. \
+                     Your in-progress subtask {} may need attention.",
+                    child_id.0
+                ),
+                kind: Some("parent_cancelled".to_string()),
+                ..Default::default()
+            };
+            let _ = crate::inbox::storage::enqueue(home, &owner_name.0, msg);
+        }
     }
 }
