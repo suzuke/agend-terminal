@@ -41,6 +41,7 @@ fn make_test_task(assignee: Option<&str>) -> Task {
         started_at: None,
         eta_secs: None,
         auto_release_on_verdict: None,
+        tags: vec![],
     }
 }
 
@@ -78,6 +79,7 @@ fn make_record(
         result: None,
         branch: None,
         bind: None,
+        tags: vec![],
         started_at: None,
         eta_secs: None,
     }
@@ -392,6 +394,7 @@ fn reconcile_orphan_owners_with_live_empty_set_orphans_strict_ghost() {
             routed_to: None,
             branch: None,
             bind: None,
+            tags: vec![],
             eta_secs: None,
         }],
     )
@@ -961,6 +964,7 @@ fn test_circular_dep_no_infinite_loop() {
             depends_on: vec![crate::task_events::TaskId("t-B".into())],
             routed_to: None,
             bind: None,
+            tags: vec![],
             eta_secs: None,
         },
     )
@@ -979,6 +983,7 @@ fn test_circular_dep_no_infinite_loop() {
             depends_on: vec![crate::task_events::TaskId("t-A".into())],
             routed_to: None,
             bind: None,
+            tags: vec![],
             eta_secs: None,
         },
     )
@@ -1627,6 +1632,7 @@ fn migration_imports_legacy_tasks_to_event_log() {
                 started_at: None,
                 eta_secs: None,
                 auto_release_on_verdict: None,
+                tags: vec![],
             });
         }
         Ok(())
@@ -1692,6 +1698,7 @@ fn migration_idempotent_on_second_run() {
             started_at: None,
             eta_secs: None,
             auto_release_on_verdict: None,
+            tags: vec![],
         });
         Ok(())
     })

@@ -154,6 +154,8 @@ fn task_tools() -> Vec<Value> {
                 "id": {"type": "string"}, "result": {"type": "string"},
                 "status": {"type": "string", "enum": ["open", "claimed", "in_progress", "blocked", "verified", "done", "cancelled"]},
                 "filter_assignee": {"type": "string"}, "filter_status": {"type": "string"},
+                "filter_tag": {"type": "string", "description": "Filter tasks by tag"},
+                "tags": {"type": "array", "items": {"type": "string"}, "description": "Task classification tags (for create/update)"},
                 "include_history": {"type": "boolean", "description": "#806: opt in to done/cancelled in `list` response (default trims to actionable)."},
                 "limit": {"type": "integer", "description": "#806: cap `list` response to N newest-first entries (sort by updated_at desc)."},
                 "due_at": {"type": "string", "description": "ISO 8601 deadline for the task"},

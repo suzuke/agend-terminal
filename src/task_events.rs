@@ -226,6 +226,9 @@ pub enum TaskEvent {
         /// envelopes default to `None` via serde.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         eta_secs: Option<i64>,
+        /// Task classification tags.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tags: Vec<String>,
     },
     Claimed {
         task_id: TaskId,
@@ -450,6 +453,9 @@ pub struct TaskRecord {
     /// `EtaUpdated` event if the contract evolves).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub eta_secs: Option<i64>,
+    /// Task classification tags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -522,6 +528,7 @@ impl TaskBoardState {
                 branch,
                 bind,
                 eta_secs,
+                tags,
                 ..
             } => {
                 self.tasks
@@ -547,6 +554,7 @@ impl TaskBoardState {
                         bind: *bind,
                         started_at: None,
                         eta_secs: *eta_secs,
+                        tags: tags.clone(),
                     });
             }
             TaskEvent::Claimed { by, .. } => {
@@ -971,6 +979,7 @@ mod tests {
             branch: None,
             bind: None,
             eta_secs: None,
+            tags: Vec::new(),
         }
     }
 
@@ -1434,6 +1443,7 @@ mod tests {
                 branch: None,
                 bind: None,
                 eta_secs: None,
+                tags: Vec::new(),
             },
         )
         .unwrap();
@@ -1509,6 +1519,7 @@ mod tests {
                     branch: None,
                     bind: None,
                     eta_secs: None,
+                    tags: Vec::new(),
                 },
                 "Claimed" => TaskEvent::Claimed {
                     task_id: tid.clone(),
@@ -1702,6 +1713,7 @@ mod tests {
                 branch: None,
                 bind: None,
                 eta_secs: None,
+                tags: Vec::new(),
             },
         )
         .unwrap();
@@ -1781,6 +1793,7 @@ mod tests {
                     branch: None,
                     bind: None,
                     eta_secs: None,
+                    tags: Vec::new(),
                 },
             },
             // Sweep Linked appears BEFORE operator Claimed in file order
@@ -1952,6 +1965,7 @@ mod tests {
                 branch: None,
                 bind: Some(false),
                 eta_secs: None,
+                tags: Vec::new(),
             },
         )
         .unwrap();
@@ -1991,6 +2005,7 @@ mod tests {
                 branch: None,
                 bind: None,
                 eta_secs: Some(60),
+                tags: vec![],
             },
         )
         .unwrap();
@@ -2055,6 +2070,7 @@ mod tests {
                 branch: None,
                 bind: None,
                 eta_secs: Some(60),
+                tags: vec![],
             },
         )
         .unwrap();
@@ -2153,6 +2169,7 @@ mod tests {
                 branch: None,
                 bind: None,
                 eta_secs: Some(7200),
+                tags: vec![],
             },
         )
         .unwrap();
