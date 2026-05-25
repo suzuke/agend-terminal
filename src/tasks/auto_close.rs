@@ -96,6 +96,7 @@ mod tests {
                     branch: None,
                     bind: None,
                     eta_secs: None,
+                    tags: vec![],
                 },
                 TaskEvent::Claimed {
                     task_id: tid,
@@ -125,6 +126,7 @@ mod tests {
                     branch: None,
                     bind: None,
                     eta_secs: None,
+                    tags: vec![],
                 },
                 TaskEvent::Done {
                     task_id: tid,
@@ -158,6 +160,7 @@ mod tests {
                     branch: None,
                     bind: None,
                     eta_secs: None,
+                    tags: vec![],
                 },
                 TaskEvent::Cancelled {
                     task_id: tid,
