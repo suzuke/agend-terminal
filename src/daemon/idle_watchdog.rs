@@ -258,6 +258,11 @@ pub(crate) fn scan_and_emit(
     home: &Path,
     last_alerted: &mut HashMap<(&'static str, String), chrono::DateTime<chrono::Utc>>,
 ) {
+    // #1240: discard all alerts during snooze — check once at entry
+    // rather than per-vantage so both dev + fleet are suppressed.
+    if is_fleet_idle_snoozed(home) {
+        return;
+    }
     let now = chrono::Utc::now();
     scan_dev_vantage(home, &now, last_alerted);
     scan_fleet_vantage(home, &now, last_alerted);
@@ -444,10 +449,7 @@ fn scan_fleet_vantage(
     now: &chrono::DateTime<chrono::Utc>,
     last_alerted: &mut HashMap<(&'static str, String), chrono::DateTime<chrono::Utc>>,
 ) {
-    // #1084: skip entire fleet vantage when snoozed.
-    if is_fleet_idle_snoozed(home) {
-        return;
-    }
+    // #1084: snooze guard moved to scan_and_emit (#1240).
     let raw_pairs = enumerate_agent_activity(home);
     if raw_pairs.is_empty() {
         return;
@@ -1033,11 +1035,12 @@ mod tests {
     }
 
     #[test]
-    fn snooze_does_not_suppress_dev_idle_alert() {
+    fn snooze_suppresses_dev_idle_alert() {
+        // #1240: snooze now suppresses ALL alerts (both fleet + dev).
         let _g = env_lock();
         std::env::remove_var("AGEND_IDLE_WATCHDOG_AGENT");
         std::env::remove_var("AGEND_IDLE_WATCHDOG_DEV_RECIPIENT");
-        let home = tmp_home("snooze-dev-unaffected");
+        let home = tmp_home("snooze-dev-suppressed");
         let stale = chrono::Utc::now() - chrono::Duration::seconds(dev_idle_threshold_secs() + 60);
         write_activity_at(&home, "dev", stale);
         // Snooze fleet
@@ -1047,9 +1050,10 @@ mod tests {
         scan_and_emit(&home, &mut last_alerted);
         let lead = crate::inbox::drain(&home, "lead");
         assert!(
-            lead.iter()
+            !lead
+                .iter()
                 .any(|m| m.kind.as_deref() == Some("dev_idle_watchdog")),
-            "#1084: fleet snooze must NOT affect dev vantage: {lead:?}"
+            "#1240: snooze must suppress dev vantage alerts too: {lead:?}"
         );
         std::fs::remove_dir_all(&home).ok();
     }
