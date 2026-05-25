@@ -305,6 +305,12 @@ pub enum TaskEvent {
         by: InstanceName,
         priority: String,
     },
+    /// Description update after creation.
+    DescriptionUpdated {
+        task_id: TaskId,
+        by: InstanceName,
+        description: String,
+    },
 }
 
 /// Per-task confidence breakdown produced by the legacy-backfill sweep.
@@ -340,7 +346,8 @@ impl TaskEvent {
             | TaskEvent::Released { task_id, .. }
             | TaskEvent::TaskCloseProposed { task_id, .. }
             | TaskEvent::OwnerAssigned { task_id, .. }
-            | TaskEvent::PriorityChanged { task_id, .. } => task_id,
+            | TaskEvent::PriorityChanged { task_id, .. }
+            | TaskEvent::DescriptionUpdated { task_id, .. } => task_id,
         }
     }
 
@@ -360,6 +367,7 @@ impl TaskEvent {
             TaskEvent::TaskCloseProposed { .. } => "task_close_proposed",
             TaskEvent::OwnerAssigned { .. } => "owner_assigned",
             TaskEvent::PriorityChanged { .. } => "priority_changed",
+            TaskEvent::DescriptionUpdated { .. } => "description_updated",
         }
     }
 }
@@ -656,6 +664,12 @@ impl TaskBoardState {
             TaskEvent::PriorityChanged { priority, .. } => {
                 if let Some(t) = self.tasks.get_mut(&task_id) {
                     t.priority = priority.clone();
+                    t.updated_at = touch_at;
+                }
+            }
+            TaskEvent::DescriptionUpdated { description, .. } => {
+                if let Some(t) = self.tasks.get_mut(&task_id) {
+                    t.description = description.clone();
                     t.updated_at = touch_at;
                 }
             }

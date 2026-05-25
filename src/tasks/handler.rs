@@ -527,6 +527,14 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                     priority: p.to_string(),
                 });
             }
+            // Description update.
+            if let Some(desc) = args["description"].as_str() {
+                pending_events.push(crate::task_events::TaskEvent::DescriptionUpdated {
+                    task_id: crate::task_events::TaskId(id.clone()),
+                    by: crate::task_events::InstanceName::from(caller.as_str()),
+                    description: desc.to_string(),
+                });
+            }
             // Assignee change without status transition: queue
             // OwnerAssigned. Distinct from Claimed (status stays put).
             if let Some(ref new_owner) = new_assignee {
@@ -781,5 +789,10 @@ fn summarize_event(env: &crate::task_events::TaskEventEnvelope) -> (&str, String
         TaskEvent::PriorityChanged { priority, .. } => {
             ("priority_changed", actor, format!("priority → {priority}"))
         }
+        TaskEvent::DescriptionUpdated { .. } => (
+            "description_updated",
+            actor,
+            "description updated".to_string(),
+        ),
     }
 }
