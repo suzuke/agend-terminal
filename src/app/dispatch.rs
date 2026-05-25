@@ -248,6 +248,12 @@ pub(super) fn dispatch(action: Action, ctx: &mut DispatchCtx<'_>) -> DispatchRes
             }
             out.needs_resize = true;
         }
+        Action::FlipSplit => {
+            if let Some(tab) = ctx.layout.active_tab_mut() {
+                tab.flip_focused_split();
+            }
+            out.needs_resize = true;
+        }
         Action::NextLayout => {
             if let Some(tab) = ctx.layout.active_tab_mut() {
                 tab.next_layout();

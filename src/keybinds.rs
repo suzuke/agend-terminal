@@ -32,6 +32,8 @@ pub enum Action {
     ClosePane,
     CloseTab,
     ToggleZoom,
+    /// #917: Flip the split direction (H↔V) for the focused pane pair.
+    FlipSplit,
     NextLayout,
     RenameTab,
     RenamePane,
@@ -191,6 +193,7 @@ fn dispatch_prefix(key: KeyEvent) -> Action {
 
         // Modes
         KeyCode::Char('[') => Action::ScrollMode,
+        KeyCode::Char('@') => Action::FlipSplit,
         KeyCode::Char(':') => Action::CommandPalette,
         KeyCode::Char('D') => Action::ShowDecisions,
         KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::SHIFT) => Action::ShowDecisions,

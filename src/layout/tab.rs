@@ -202,6 +202,15 @@ impl Tab {
         self.split_at_pane(self.focus_id, dir, new_pane)
     }
 
+    /// #917: Flip the split direction of the parent split containing the focused pane.
+    pub fn flip_focused_split(&mut self) -> bool {
+        if let Some(root) = self.root.as_mut() {
+            super::tree::flip_split_containing(root, self.focus_id)
+        } else {
+            false
+        }
+    }
+
     /// Split the pane with `target_id` in `dir`, attaching `new_pane` as the
     /// second child. Returns `true` if the target was found and split; `false`
     /// if the target was absent (the tree is left unchanged and `new_pane` is
