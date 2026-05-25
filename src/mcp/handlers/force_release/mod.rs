@@ -185,6 +185,11 @@ pub(super) fn rebase_clean_self(
     }
 
     let binding_outcome = crate::worktree_pool::release_full(home, agent, false);
+    // release_full returns early when binding.json is absent (line 244-247
+    // in worktree_pool.rs) — skipping clear_bind_in_flight. In the exact
+    // stale-state recovery case this tool is for (binding gone, dir present),
+    // the in-flight guard would leak and block rebind.
+    crate::mcp::handlers::dispatch_hook::clear_bind_in_flight(home, agent);
     Ok(RebaseCleanOutcome {
         dir_existed,
         dir_removed,

@@ -334,6 +334,19 @@ pub(super) fn handle_release_repo(args: &Value) -> Value {
     };
     let path_str = canonical.to_string_lossy();
 
+    // Derive source repo from worktree .git link before any removal —
+    // needed for post-removal prune if git worktree remove fails.
+    let source_repo = canonical
+        .join(".git")
+        .is_file()
+        .then(|| std::fs::read_to_string(canonical.join(".git")).ok())
+        .flatten()
+        .and_then(|content| {
+            let gitdir = content.strip_prefix("gitdir: ")?.trim();
+            let p = std::path::Path::new(gitdir);
+            p.parent()?.parent()?.parent().map(|pp| pp.to_path_buf())
+        });
+
     match std::process::Command::new("git")
         .args(["worktree", "remove", "--force", &path_str])
         .output()
@@ -341,10 +354,16 @@ pub(super) fn handle_release_repo(args: &Value) -> Value {
         Ok(o) if o.status.success() => json!({"path": path}),
         Ok(o) => {
             let _ = std::fs::remove_dir_all(&canonical);
+            if let Some(src) = &source_repo {
+                crate::worktree::prune(src);
+            }
             json!({"path": path, "note": String::from_utf8_lossy(&o.stderr).to_string()})
         }
         Err(_) => {
             let _ = std::fs::remove_dir_all(&canonical);
+            if let Some(src) = &source_repo {
+                crate::worktree::prune(src);
+            }
             json!({"path": path})
         }
     }
@@ -718,12 +737,17 @@ pub(super) fn handle_unwatch_ci(home: &Path, args: &Value) -> Value {
     watch["subscribers"] = json!(subscribers_json);
     watch["instance"] = json!(subscribers.first().cloned().unwrap_or_default());
 
-    let _ = crate::store::atomic_write(
+    if let Err(e) = crate::store::atomic_write(
         &path,
         serde_json::to_string_pretty(&watch)
             .unwrap_or_default()
             .as_bytes(),
-    );
+    ) {
+        return json!({
+            "error": format!("failed to persist unwatch: {e}"),
+            "code": "unwatch_write_failed",
+        });
+    }
     json!({
         "repo": repo,
         "watching": true,

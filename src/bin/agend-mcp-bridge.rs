@@ -419,7 +419,7 @@ fn connect_daemon(
 
     let stream = TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))?;
     let _ = stream.set_nodelay(true);
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(120)));
 
     let writer = stream.try_clone()?;
     let mut rdr = BufReader::new(stream);
@@ -434,7 +434,11 @@ fn connect_daemon(
 
     let mut resp = String::new();
     rdr.read_line(&mut resp)?;
-    if !resp.contains(r#""ok":true"#) && !resp.contains(r#""ok": true"#) {
+    let auth_ok = serde_json::from_str::<serde_json::Value>(resp.trim())
+        .ok()
+        .and_then(|v| v.get("ok")?.as_bool())
+        .unwrap_or(false);
+    if !auth_ok {
         return Err(format!("auth rejected: {}", resp.trim()).into());
     }
 

@@ -19,6 +19,39 @@ pub(crate) fn git_bypass(cwd: &Path, args: &[&str]) -> std::io::Result<std::proc
         .output()
 }
 
+/// Like `git_bypass` but with a process-level timeout. Spawns the git
+/// subprocess and polls `try_wait` until either the process exits or the
+/// deadline is reached, at which point the child is killed.
+pub(crate) fn git_bypass_timeout(
+    cwd: &Path,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> std::io::Result<std::process::Output> {
+    let mut child = std::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .env("AGEND_GIT_BYPASS", "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait()? {
+            Some(_status) => return child.wait_with_output(),
+            None if start.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("git {:?} timed out after {timeout:?}", &args[..1]),
+                ));
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(200)),
+        }
+    }
+}
+
 /// Detect the default branch of a repository.
 /// Reads `refs/remotes/origin/HEAD` → extracts branch name.
 /// Falls back to "main" if detection fails.

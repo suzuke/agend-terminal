@@ -441,12 +441,17 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
     // `git worktree remove` from the owning repo's cwd.
     // #779 P2: bind_full now returns Result; this non-target caller preserves
     // pre-#779-P2 silent semantic via `.ok()` — zero behavior change.
-    let _ =
-        crate::binding::bind_full(home, target, task_id, branch, &lease.path, &source_repo).ok();
-    tracing::info!(
-        %target, %branch, path = %lease.path.display(),
-        "dispatch auto-bind + lease OK"
-    );
+    match crate::binding::bind_full(home, target, task_id, branch, &lease.path, &source_repo) {
+        Ok(()) => tracing::info!(
+            %target, %branch, path = %lease.path.display(),
+            "dispatch auto-bind + lease OK"
+        ),
+        Err(e) => tracing::warn!(
+            %target, %branch, path = %lease.path.display(),
+            error = %e,
+            "dispatch auto-bind lease acquired but bind_full failed — binding.json missing"
+        ),
+    }
 
     // P0-2 + Sprint 55 P0-B EC4: auto-watch_ci. Resolution order:
     //   1. caller-supplied `repo` arg → canonicalize (#942)
@@ -637,8 +642,11 @@ pub(crate) fn ensure_branch_exists(
         // and the local ref is left untouched — dispatch then falls
         // through to lease with the existing local SHA, matching the
         // pre-fix behaviour for that edge case.
-        let fetch_out =
-            crate::git_helpers::git_bypass(source, &["fetch", "origin", branch, "--quiet"]);
+        let fetch_out = crate::git_helpers::git_bypass_timeout(
+            source,
+            &["fetch", "origin", branch, "--quiet"],
+            std::time::Duration::from_secs(60),
+        );
         let fetched_ok = matches!(&fetch_out, Ok(o) if o.status.success());
         let remote_branch_ref = format!("refs/remotes/origin/{branch}");
         let remote_exists =
@@ -675,8 +683,11 @@ pub(crate) fn ensure_branch_exists(
                     "ensure_branch_exists fallback: from_ref unresolved locally — fetching origin"
                 );
                 let fetch_start = std::time::Instant::now();
-                let fetch_out =
-                    crate::git_helpers::git_bypass(source, &["fetch", "origin", "--quiet"]);
+                let fetch_out = crate::git_helpers::git_bypass_timeout(
+                    source,
+                    &["fetch", "origin", "--quiet"],
+                    std::time::Duration::from_secs(60),
+                );
                 let fetch_ms = fetch_start.elapsed().as_millis();
                 crate::event_log::log(
                     home,
