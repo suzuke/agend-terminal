@@ -3,7 +3,7 @@
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use std::collections::HashSet;
 
@@ -218,7 +218,7 @@ pub fn render_tasks(
                 "Esc to go back",
                 Style::default().fg(Color::DarkGray),
             )));
-            frame.render_widget(Paragraph::new(lines), inner);
+            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
             return;
         }
     }
