@@ -226,18 +226,24 @@ fn build_agent_line<'a>(
     agent_tasks: &std::collections::HashMap<&str, &crate::tasks::Task>,
     home: &std::path::Path,
 ) -> Line<'a> {
-    let (state, health_color) = metrics_map
+    let (state, health, health_color) = metrics_map
         .get(name)
         .map(|m| {
             let color = match m.health_state.as_str() {
                 "healthy" | "ok" => Color::Green,
-                "hung" | "crashed" | "failed" => Color::Red,
-                "rate_limit" | "recovering" => Color::Yellow,
+                "hung" | "crashed" | "failed" | "error_loop" => Color::Red,
+                "rate_limit" | "recovering" | "unstable" => Color::Yellow,
+                "idle_long" => Color::DarkGray,
+                "paused" => Color::Magenta,
                 _ => Color::White,
             };
-            (m.agent_state.as_str().to_string(), color)
+            (
+                m.agent_state.as_str().to_string(),
+                m.health_state.clone(),
+                color,
+            )
         })
-        .unwrap_or_else(|| ("stopped".to_string(), Color::DarkGray));
+        .unwrap_or_else(|| ("stopped".to_string(), "—".to_string(), Color::DarkGray));
 
     let task_str = agent_tasks
         .get(name)
@@ -263,7 +269,7 @@ fn build_agent_line<'a>(
             }),
         ),
         Span::styled(format!("{:<12}", state), Style::default().fg(health_color)),
-        Span::styled(format!("{:<10}", ""), Style::default()),
+        Span::styled(format!("{:<10}", health), Style::default().fg(health_color)),
         Span::styled(
             format!("{:<30}", task_str),
             Style::default().fg(Color::White),
