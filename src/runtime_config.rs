@@ -1,0 +1,140 @@
+//! #1085: Runtime-mutable configuration.
+//!
+//! `~/.agend-terminal/runtime-config.json` is read each daemon tick (10s).
+//! Values override compile-time defaults. The MCP `config` tool provides
+//! get/set access.
+
+use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+use std::sync::OnceLock;
+
+/// Runtime-mutable configuration values.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeConfig {
+    /// Per-agent idle threshold before watchdog pings lead (seconds).
+    #[serde(default = "default_dev_idle")]
+    pub dev_idle_threshold_secs: i64,
+    /// Fleet-wide idle threshold before watchdog alerts (seconds).
+    #[serde(default = "default_fleet_idle")]
+    pub fleet_idle_threshold_secs: i64,
+    /// Dispatch idle threshold before stall alert fires (seconds).
+    #[serde(default = "default_dispatch_idle")]
+    pub dispatch_idle_threshold_secs: i64,
+}
+
+fn default_dev_idle() -> i64 {
+    3600
+}
+fn default_fleet_idle() -> i64 {
+    1800
+}
+fn default_dispatch_idle() -> i64 {
+    600
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            dev_idle_threshold_secs: default_dev_idle(),
+            fleet_idle_threshold_secs: default_fleet_idle(),
+            dispatch_idle_threshold_secs: default_dispatch_idle(),
+        }
+    }
+}
+
+static RUNTIME_CONFIG: OnceLock<RwLock<RuntimeConfig>> = OnceLock::new();
+
+fn global() -> &'static RwLock<RuntimeConfig> {
+    RUNTIME_CONFIG.get_or_init(|| RwLock::new(RuntimeConfig::default()))
+}
+
+/// Get a snapshot of the current runtime config.
+pub fn get() -> RuntimeConfig {
+    global().read().clone()
+}
+
+/// Reload config from disk. Called each daemon tick.
+pub fn reload(home: &Path) {
+    let path = home.join("runtime-config.json");
+    let config = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|c| serde_json::from_str::<RuntimeConfig>(&c).ok())
+        .unwrap_or_default();
+    *global().write() = config;
+}
+
+/// Set a single config key and persist to disk.
+pub fn set(home: &Path, key: &str, value: &str) -> Result<String, String> {
+    let mut config = get();
+    match key {
+        "dev_idle_threshold_secs" => {
+            config.dev_idle_threshold_secs = value
+                .parse()
+                .map_err(|_| format!("invalid integer: {value}"))?;
+        }
+        "fleet_idle_threshold_secs" => {
+            config.fleet_idle_threshold_secs = value
+                .parse()
+                .map_err(|_| format!("invalid integer: {value}"))?;
+        }
+        "dispatch_idle_threshold_secs" => {
+            config.dispatch_idle_threshold_secs = value
+                .parse()
+                .map_err(|_| format!("invalid integer: {value}"))?;
+        }
+        _ => return Err(format!("unknown config key: {key}")),
+    }
+    let path = home.join("runtime-config.json");
+    let json = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
+    std::fs::write(&path, json).map_err(|e| e.to_string())?;
+    *global().write() = config.clone();
+    Ok(serde_json::to_string(&config).unwrap_or_default())
+}
+
+/// Get a single config value by key.
+pub fn get_key(key: &str) -> Result<String, String> {
+    let config = get();
+    match key {
+        "dev_idle_threshold_secs" => Ok(config.dev_idle_threshold_secs.to_string()),
+        "fleet_idle_threshold_secs" => Ok(config.fleet_idle_threshold_secs.to_string()),
+        "dispatch_idle_threshold_secs" => Ok(config.dispatch_idle_threshold_secs.to_string()),
+        _ => Err(format!("unknown config key: {key}")),
+    }
+}
+
+/// List all config keys and values.
+pub fn list() -> serde_json::Value {
+    serde_json::to_value(get()).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_values() {
+        let c = RuntimeConfig::default();
+        assert_eq!(c.dev_idle_threshold_secs, 3600);
+        assert_eq!(c.fleet_idle_threshold_secs, 1800);
+        assert_eq!(c.dispatch_idle_threshold_secs, 600);
+    }
+
+    #[test]
+    fn set_and_get_key() {
+        let dir = std::env::temp_dir().join("agend-test-runtime-config");
+        std::fs::create_dir_all(&dir).ok();
+        set(&dir, "dev_idle_threshold_secs", "7200").unwrap();
+        reload(&dir);
+        assert_eq!(get_key("dev_idle_threshold_secs").unwrap(), "7200");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn invalid_key_rejected() {
+        let dir = std::env::temp_dir().join("agend-test-runtime-config-bad");
+        std::fs::create_dir_all(&dir).ok();
+        assert!(set(&dir, "nonexistent", "123").is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
