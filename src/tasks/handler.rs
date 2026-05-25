@@ -117,7 +117,8 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
             match crate::task_events::append(home, &emitter, event) {
                 Ok(_) => {
                     let task = read_task_record(home, &id).map(|r| record_to_task(&r));
-                    if let Some(ref target) = assignee {
+                    let dispatch_target = routed_to.as_ref().or(assignee.as_ref());
+                    if let Some(target) = dispatch_target {
                         if target != instance_name {
                             let branch_str = args["branch"]
                                 .as_str()
@@ -1276,6 +1277,44 @@ mod tests {
             msg.correlation_id.as_deref(),
             Some(task_id),
             "correlation_id should match task_id for auto-close"
+        );
+    }
+
+    fn write_fleet_yaml_with_team(home: &std::path::Path, team: &str, orchestrator: &str) {
+        let yaml = format!(
+            "teams:\n  {team}:\n    orchestrator: {orchestrator}\n    members:\n      - dev-a\n      - dev-b\n"
+        );
+        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+    }
+
+    #[test]
+    fn create_with_team_assignee_routes_to_orchestrator() {
+        let home = tmp_home("team_route");
+        write_fleet_yaml_with_team(&home, "my-team", "team-lead");
+
+        let result = handle(
+            &home,
+            "operator",
+            &serde_json::json!({
+                "action": "create",
+                "title": "team task",
+                "assignee": "my-team",
+            }),
+        );
+        assert_eq!(result["event"], "created");
+
+        let orch_msgs = drain_inbox(&home, "team-lead");
+        assert!(
+            !orch_msgs.is_empty(),
+            "orchestrator should receive inbox message when team is assignee"
+        );
+        assert_eq!(orch_msgs[0].kind.as_deref(), Some("task"));
+        assert!(orch_msgs[0].text.contains("team task"));
+
+        let team_msgs = drain_inbox(&home, "my-team");
+        assert!(
+            team_msgs.is_empty(),
+            "raw team name should NOT receive inbox message"
         );
     }
 }
