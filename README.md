@@ -47,7 +47,7 @@ Dashed boxes (- - -) are agent infrastructure — used by agents via MCP tools.
 Solid boxes are operator-facing.
 
 ```mermaid
-flowchart LR
+flowchart TD
     subgraph S1[" 1 · Setup "]
         qs["Quick Start"]
         fl["Fleet Config"]
