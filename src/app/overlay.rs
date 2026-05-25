@@ -808,6 +808,19 @@ pub(super) fn handle_key(
                         KeyCode::Char('?') => {
                             *mode = TaskBoardMode::Help;
                         }
+                        // #1202: t/f/s/m switch between views within the overlay
+                        KeyCode::Char('t') => {
+                            *view = BoardView::Tasks;
+                        }
+                        KeyCode::Char('f') | KeyCode::Char('F') => {
+                            *view = BoardView::Fleet;
+                        }
+                        KeyCode::Char('s') => {
+                            *view = BoardView::Status;
+                        }
+                        KeyCode::Char('m') | KeyCode::Char('M') => {
+                            *view = BoardView::Monitor;
+                        }
                         KeyCode::Esc | KeyCode::Char('q') => {
                             *overlay = Overlay::None;
                         }
