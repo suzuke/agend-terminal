@@ -1599,6 +1599,9 @@ fn inject_with_target(target: &InjectTarget, text: &[u8]) -> crate::error::Resul
         }
 
         for chunk in chunk_part.chunks(64) {
+            if target.deleted.load(std::sync::atomic::Ordering::Acquire) {
+                return Ok(());
+            }
             write_with_timeout(&target.pty_writer, chunk)?;
             std::thread::sleep(std::time::Duration::from_millis(2 * chunk.len() as u64));
         }
@@ -1609,6 +1612,9 @@ fn inject_with_target(target: &InjectTarget, text: &[u8]) -> crate::error::Resul
         write_with_timeout(&target.pty_writer, &combined)?;
     }
 
+    if target.deleted.load(std::sync::atomic::Ordering::Acquire) {
+        return Ok(());
+    }
     std::thread::sleep(std::time::Duration::from_millis(50));
     write_with_timeout(&target.pty_writer, submit)?;
     Ok(())
