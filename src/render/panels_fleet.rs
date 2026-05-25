@@ -151,11 +151,13 @@ pub(super) fn render_fleet_view(
     home: &std::path::Path,
 ) {
     let teams = crate::teams::list_all(home);
-    let all_instances: Vec<String> =
+    let mut all_instances: Vec<String> =
         crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
             .ok()
             .map(|c| c.instance_names())
             .unwrap_or_default();
+    // #1200: stable sort to prevent frame-to-frame jitter (HashMap iteration order).
+    all_instances.sort_unstable();
     let metrics = crate::instance_monitor::latest_metrics();
 
     // Build a lookup of live metrics by instance name.
