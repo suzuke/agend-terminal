@@ -739,7 +739,7 @@ fn run_core(
         // `per_tick::tests::panicking_handler_does_not_skip_siblings`
         // for the regression-pin.
         // #1085: reload runtime-mutable config each tick.
-        crate::runtime_config::reload(&home);
+        crate::runtime_config::reload(home);
 
         per_tick::run_handlers_with_panic_guard(&handlers, &tick_ctx);
 

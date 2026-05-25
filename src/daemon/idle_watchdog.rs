@@ -503,7 +503,9 @@ mod tests {
     use super::*;
 
     // Test-only constants matching runtime defaults.
+    #[allow(dead_code)]
     const DEV_IDLE_THRESHOLD_SECS: i64 = 3600;
+    #[allow(dead_code)]
     const FLEET_IDLE_THRESHOLD_SECS: i64 = 1800;
     use std::sync::atomic::{AtomicU32, Ordering};
 
