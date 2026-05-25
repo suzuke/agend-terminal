@@ -1933,6 +1933,18 @@ mod tests {
             .unwrap()
             .status
             .success());
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["config", "user.name", "test"])
+            .output()
+            .unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["config", "user.email", "test@test.com"])
+            .output()
+            .unwrap();
         assert!(Command::new("git")
             .arg("-C")
             .arg(&repo)
