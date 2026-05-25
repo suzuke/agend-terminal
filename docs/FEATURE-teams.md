@@ -4,6 +4,16 @@ Teams group agents into named units for structured collaboration. Each team has
 members, an optional (but strongly recommended) orchestrator, and is stored as
 part of `fleet.yaml` — not as a separate data source.
 
+## Usage Scenarios
+
+> **Target audience:** Both operators and agents.
+
+**Team setup by operator.** An operator defines a new team in `fleet.yaml` or via the `team action=create` MCP tool — for example, creating a "fixup" team with a lead, dev, and reviewer, designating the lead as orchestrator. This structures how tasks are routed and who coordinates the group's work.
+
+**Agent-to-team broadcast.** A lead agent needs to inform every member of its team about a status change. Instead of sending individual messages, it uses `send team=fixup` to broadcast to all members at once. The daemon resolves the team membership and delivers the message to each member's inbox.
+
+**Orchestrator-based task routing.** When a task is assigned to a team name rather than a specific agent, the task board routes it to the team's orchestrator via `resolve_team_orchestrator`. If the orchestrator has been removed and the team is degraded, routing fails — prompting the operator to designate a new orchestrator.
+
 ## 1. Design Rationale
 
 - A team is a named group of agents with a designated orchestrator.

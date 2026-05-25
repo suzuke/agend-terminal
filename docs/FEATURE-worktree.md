@@ -5,6 +5,16 @@ collection, as well as the division of responsibility among `bind_self`,
 `release_worktree`, `force_release_worktree`, `repo action=checkout`, and
 `repo action=release`.
 
+## Usage Scenarios
+
+> **Target audience:** Agent infrastructure — fully managed by the daemon; agents work in worktrees transparently without needing to manage them directly.
+
+**Automatic workspace isolation.** When a lead dispatches a task with a branch name to a dev agent, the daemon provisions a dedicated git worktree for that agent at `~/.agend/worktrees/<agent>/<branch>/`. The dev works in this isolated directory, making commits and pushing without risk of conflicting with other agents working on different branches in the same repository.
+
+**Mid-lifecycle recovery.** An agent's worktree binding becomes stale after a crash or daemon restart. The agent uses `bind_self` to re-establish its binding to the existing worktree, optionally with `rebase_mode=true` to rebase onto the latest upstream changes before resuming work.
+
+**Controlled cleanup.** After a task is completed and the PR is merged, the daemon soft-releases the worktree (marking it with `released_at`). The worktree remains on disk for a 24-hour grace period. If no one reclaims it, GC (`gc_cutover` with `AGEND_WORKTREE_GC=1`) removes it automatically. For stuck or orphaned worktrees, the operator can use `force_release_worktree` as an emergency measure.
+
 ## 1. Design Rationale
 
 - Each agent works in its own isolated workspace to avoid branch conflicts and shared-checkout contention.

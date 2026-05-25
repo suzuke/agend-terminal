@@ -1,5 +1,15 @@
 # Health & Monitoring — Agent 健康狀態與自動恢復
 
+## 使用情境
+
+> **適用對象：** Daemon 基礎設施——全自動運作，operator 透過 TUI 觀察。
+
+**自動 crash 恢復。** Dev agent 的程序因為意外的 API 錯誤而 crash。Daemon 偵測到程序結束，將 crash 記錄在滑動窗口中，等待指數退避延遲（從 5 秒開始），然後自動重啟 agent。如果 agent 穩定下來，它會像什麼都沒發生一樣繼續工作。如果連續 crash（5 次以上），daemon 停止重啟並通知 operator。
+
+**Hang 偵測與恢復。** Agent 收到任務但在 `Thinking` 狀態下超過 600 秒沒有 PTY 輸出。Daemon 將其分類為 `Hung`，啟動三階段恢復階梯：先發送 ESC 鍵嘗試中斷，若 ESC 無效則重啟程序，若重啟也無效則暫停 agent 並通知 operator 手動介入。
+
+**Operator 健康儀表板。** Operator 查看 TUI，發現一個 agent 處於 `Unstable` 狀態（10 分鐘內 3 次 crash），另一個顯示 `IdleLong`（沒有待處理工作，只是在等待）。結構化的健康狀態讓 operator 能快速區分需要關注的 agent 和只是閒置的 agent。
+
 ## 設計初衷
 
 AI coding agent 會遇到各種異常：程序 crash、API rate limit、回應超時

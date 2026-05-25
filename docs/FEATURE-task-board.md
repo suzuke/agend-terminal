@@ -6,6 +6,16 @@ current state is reconstructed by replaying (folding) those events. This gives
 the board a complete audit trail, makes state reproducible, and provides the
 foundation for sweep, health, and dependency evaluation.
 
+## Usage Scenarios
+
+> **Target audience:** Agent infrastructure — agents use this via MCP tools; operators typically don't interact directly.
+
+**Task dispatch and tracking.** A lead agent creates a task on the board with a title, priority, and assignee, then dispatches it to a dev agent. The dev receives the task in its inbox, claims it via `task action=claim`, and begins work. As the dev progresses, it updates the task status to `in_progress`. When the work is complete, the dev marks it `done` with a result summary. The entire lifecycle is recorded as append-only events in `task_events.jsonl`.
+
+**Cross-agent visibility.** A reviewer agent checks the task board to see which tasks are marked `done` and ready for verification. After reviewing the associated PR, the reviewer marks the task as `verified`. Meanwhile, the operator can observe the full board state at any time through the TUI without needing to query individual agents.
+
+**Board hygiene.** Over time, tasks accumulate — some with owners who no longer exist in the fleet (ghost owners), others with expired deadlines. The operator runs `task action=health` to get a snapshot of board health, then uses `task action=sweep` in dry-run mode to identify candidates for cleanup before applying changes.
+
 ## 1. Design Rationale
 
 - The task board is a single source of truth shared by every agent.

@@ -1,5 +1,15 @@
 # CI Watch — Automated PR CI Monitoring
 
+## Usage Scenarios
+
+> **Target audience:** Agent infrastructure — agents use this via MCP tools; operators typically don't interact directly.
+
+**Automatic CI-to-reviewer handoff.** A dev agent finishes implementation and creates a PR. The daemon automatically attaches a CI watch to the PR's branch. When all GitHub Actions checks pass, the daemon sends a `[ci-pass]` notification to the reviewer agent, who begins the code review immediately — no human intervention required.
+
+**Selective workflow monitoring.** A repository has multiple CI workflows, but only "build" and "test" are required for merge. The dev specifies `required_checks: ["build", "test"]` when the watch is created, so a flaky "windows-compat" workflow does not block the reviewer handoff.
+
+**Conflict early warning.** While monitoring CI, the daemon also checks the PR's mergeable status. If upstream changes cause a merge conflict, a `[ci-conflict-detected]` notification is sent to the dev agent immediately, allowing it to rebase before the reviewer wastes time on a conflicted branch.
+
 ## Design Rationale
 
 In a multi-agent workflow, after a dev agent pushes a PR it typically needs to

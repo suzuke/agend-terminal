@@ -3,6 +3,16 @@
 這份文件說明 team 的設計、如何建立/更新/刪除 team、以及它和
 `send team=...` 廣播路徑之間的關係。
 
+## 使用情境
+
+> **適用對象：** Operator 與 agent 皆適用。
+
+**Operator 建立團隊。** Operator 在 `fleet.yaml` 中或透過 `team action=create` MCP 工具定義新團隊——例如建立一個包含 lead、dev、reviewer 的 "fixup" 團隊，並指定 lead 為 orchestrator。這決定了任務的路由方式以及由誰協調團隊工作。
+
+**Agent 團隊廣播。** Lead agent 需要通知團隊中的每個成員某項狀態變更。它不需要逐一發送訊息，而是使用 `send team=fixup` 一次廣播給所有成員。Daemon 會解析團隊成員名單，將訊息送到每個成員的 inbox。
+
+**基於 orchestrator 的任務路由。** 當任務指派給團隊名稱而非特定 agent 時，任務板會透過 `resolve_team_orchestrator` 將任務路由到該團隊的 orchestrator。如果 orchestrator 已被移除且團隊處於 degraded 狀態，路由會失敗——提醒 operator 需要指定新的 orchestrator。
+
 ## 1. 設計初衷
 
 - Team 是把 agents 組織成群組的方法。

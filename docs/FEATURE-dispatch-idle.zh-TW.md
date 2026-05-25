@@ -1,5 +1,15 @@
 # Dispatch Idle Tracking — 任務回應超時追蹤
 
+## 使用情境
+
+> **適用對象：** Agent 基礎設施——agent 透過 MCP tools 使用，operator 通常不直接操作。
+
+**遺漏任務偵測。** Lead agent 以 `expect_reply_within_secs=600` 向 dev agent 分派一項任務。Dev agent 在處理訊息前 crash 了。沉默 10 分鐘後，daemon 向 lead 發送 `dispatch_idle_threshold_exceeded` 通知，提醒任務可能被遺漏。Lead 可以重新分派給其他 agent 或進行調查。
+
+**活躍工作確認。** Dev agent 收到一項複雜任務並開始處理。工作過程中，它發送一條 `kind=update` 訊息回報進度。Daemon 看到這個活動後重設閒置計時器，避免在 dev 明顯在工作時觸發誤報。
+
+**Fixup 團隊提醒。** 在 fixup 團隊中，L1 通知送到 lead 之後，L2 層會額外向目標 dev agent 直接發送 `dispatch_idle_nudge`。這種雙管齊下的方式確保分派者和接收者都知道任務停滯了。
+
 ## 設計初衷
 
 在多 agent 協作中，orchestrator（通常是 lead）會分派任務給 dev 或 reviewer。

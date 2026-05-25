@@ -1,5 +1,15 @@
 # Dispatch Idle Tracking — Task Response Timeout Monitoring
 
+## Usage Scenarios
+
+> **Target audience:** Agent infrastructure — agents use this via MCP tools; operators typically don't interact directly.
+
+**Dropped task detection.** A lead agent dispatches a task to a dev agent with `expect_reply_within_secs=600`. The dev agent crashes before processing the message. After 10 minutes of silence, the daemon sends a `dispatch_idle_threshold_exceeded` notification to the lead, alerting it that the task may have been missed. The lead can then re-dispatch to another agent or investigate.
+
+**Active work acknowledgment.** A dev agent receives a complex task and starts working on it. Partway through, it sends a `kind=update` message to report progress. The daemon sees this activity and resets the idle timer, preventing a false alarm while the dev is clearly engaged.
+
+**Fixup team nudge.** In the fixup team, after the L1 notification goes to the lead, the L2 layer sends an additional `dispatch_idle_nudge` directly to the target dev agent. This two-pronged approach ensures both the dispatcher and the recipient are aware of the stalled task.
+
 ## Design Rationale
 
 In multi-agent collaboration, an orchestrator (typically the lead) dispatches

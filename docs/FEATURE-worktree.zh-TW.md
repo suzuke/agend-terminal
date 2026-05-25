@@ -4,6 +4,16 @@
 `bind_self` / `release_worktree` / `force_release_worktree` /
 `repo action=checkout` / `repo action=release` 之間的分工。
 
+## 使用情境
+
+> **適用對象：** Agent 基礎設施——由 daemon 全自動管理，agent 透明地在 worktree 中工作，不需要直接管理。
+
+**自動工作空間隔離。** 當 lead 將帶有分支名稱的任務分派給 dev agent 時，daemon 會在 `~/.agend/worktrees/<agent>/<branch>/` 為該 agent 建立專用的 git worktree。Dev 在這個隔離目錄中工作、提交和推送，不會與同一 repo 中工作於不同分支的其他 agent 產生衝突。
+
+**中途恢復。** Agent 的 worktree binding 在 crash 或 daemon 重啟後可能變得過時。Agent 使用 `bind_self` 重新建立與現有 worktree 的綁定，可選擇以 `rebase_mode=true` 先 rebase 到最新的上游變更再繼續工作。
+
+**可控的清理。** 任務完成且 PR 合併後，daemon 對 worktree 執行 soft release（標記 `released_at`）。Worktree 會在磁碟上保留 24 小時寬限期。如果沒有人重新認領，GC（設定 `AGEND_WORKTREE_GC=1` 後執行 `gc_cutover`）會自動移除。對於卡住或孤立的 worktree，operator 可以使用 `force_release_worktree` 作為緊急手段。
+
 ## 1. 設計初衷
 
 - 每個 agent 應該在自己的工作空間工作。

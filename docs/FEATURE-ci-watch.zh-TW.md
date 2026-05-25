@@ -1,5 +1,15 @@
 # CI Watch — 自動監控 PR 的 CI 狀態
 
+## 使用情境
+
+> **適用對象：** Agent 基礎設施——agent 透過 MCP tools 使用，operator 通常不直接操作。
+
+**自動 CI 到 reviewer 的交接。** Dev agent 完成實作並建立 PR。Daemon 自動在該 PR 的分支上掛載 CI watch。當所有 GitHub Actions check 通過後，daemon 向 reviewer agent 發送 `[ci-pass]` 通知，reviewer 立即開始 code review——完全不需要人工介入。
+
+**選擇性 workflow 監控。** 一個 repo 有多個 CI workflow，但只有 "build" 和 "test" 是合併的必要條件。Dev 在建立 watch 時指定 `required_checks: ["build", "test"]`，這樣不穩定的 "windows-compat" workflow 不會阻擋 reviewer 的交接。
+
+**衝突早期預警。** 在監控 CI 的同時，daemon 也會檢查 PR 的 mergeable 狀態。如果上游變更導致合併衝突，daemon 會立即向 dev agent 發送 `[ci-conflict-detected]` 通知，讓 dev 可以在 reviewer 浪費時間審查衝突分支之前先完成 rebase。
+
 ## 設計初衷
 
 在多 agent 協作的工作流中，dev agent push 完 PR 之後，通常需要等 CI 跑完

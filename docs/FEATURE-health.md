@@ -1,5 +1,15 @@
 # Health & Monitoring — Agent Health State and Auto-Recovery
 
+## Usage Scenarios
+
+> **Target audience:** Daemon infrastructure — fully automated, operators observe via TUI.
+
+**Automatic crash recovery.** A dev agent's process crashes due to an unexpected API error. The daemon detects the exit, records it in the crash sliding window, waits for an exponential backoff delay (starting at 5 seconds), and restarts the agent automatically. If the agent stabilizes, it resumes work as if nothing happened. If it crashes repeatedly (5+ times), the daemon stops restarting and notifies the operator.
+
+**Hang detection and recovery.** An agent receives a task but produces no PTY output for over 600 seconds while in `Thinking` state. The daemon classifies it as `Hung` and initiates the three-stage recovery ladder: first sending an ESC key to interrupt, then restarting the process if ESC fails, and finally pausing the agent and alerting the operator if restarts are also ineffective.
+
+**Operator health dashboard.** The operator checks the TUI and sees that one agent is in `Unstable` state (3 crashes in 10 minutes) while another shows `IdleLong` (no pending work, just waiting). The structured health state lets the operator quickly distinguish between agents that need attention and those that are simply idle.
+
 ## Design Rationale
 
 AI coding agents encounter various anomalies: process crashes, API rate limits,

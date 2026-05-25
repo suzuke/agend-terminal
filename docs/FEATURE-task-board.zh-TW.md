@@ -3,6 +3,16 @@
 這份文件說明共享任務板的設計目的、資料流、MCP 使用方式、以及
 哪些行為是有保證的，哪些只是 best-effort。
 
+## 使用情境
+
+> **適用對象：** Agent 基礎設施——agent 透過 MCP tools 使用，operator 通常不直接操作。
+
+**任務分派與追蹤。** Lead agent 在任務板上建立一個任務，填入標題、優先級和指派對象，然後分派給 dev agent。Dev 在 inbox 中收到任務後，透過 `task action=claim` 認領並開始工作。工作過程中，dev 將任務狀態更新為 `in_progress`。完成後，dev 以 `done` 標記任務並附上結果摘要。整個生命週期以 append-only 事件記錄在 `task_events.jsonl` 中。
+
+**跨 agent 可見性。** Reviewer agent 查看任務板，找出已標記 `done` 且待驗證的任務。完成 PR 審查後，reviewer 將任務標記為 `verified`。同時，operator 可以隨時透過 TUI 觀察完整的任務板狀態，無需逐一查詢各個 agent。
+
+**任務板衛生。** 隨著時間推移，任務會堆積——有些 owner 已不在 fleet 中（ghost owners），有些截止日期已過。Operator 執行 `task action=health` 取得任務板健康快照，再使用 `task action=sweep` 的 dry-run 模式找出清理候選項，確認後才實際執行。
+
 ## 1. 設計初衷
 
 - Task board 是整個 fleet 共用的工作清單。
