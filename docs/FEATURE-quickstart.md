@@ -1,14 +1,10 @@
-# Quickstart — 互動式首次設定
+# Quickstart — Interactive First-Time Setup
 
-## 設計初衷
+## Motivation
 
-AgEnD 整合了多種 AI coding backend（Claude Code、Kiro CLI、Codex、OpenCode、Gemini、
-Agy），每個 backend 有不同的安裝路徑、CLI 參數和環境變數。新使用者面對的第一個
-問題是：「我裝了什麼？我要怎麼把它跑起來？」
+AgEnD integrates multiple AI coding backends (Claude Code, Kiro CLI, Codex, OpenCode, Gemini, Agy), each with its own installation path, CLI arguments, and environment variables. The first question every new user faces is: "What do I have installed, and how do I get it running?"
 
-`quickstart` 就是為了回答這個問題。它自動偵測已安裝的 backend，引導使用者
-設定 Telegram 通知頻道，然後產生一份可以直接使用的 `fleet.yaml`。整個過程
-大約 2–5 分鐘。
+`quickstart` answers that question. It auto-detects installed backends, walks you through Telegram notification setup, and generates a ready-to-use `fleet.yaml`. The whole process takes roughly 2-5 minutes.
 
 ```
 agend-terminal quickstart
@@ -16,14 +12,14 @@ agend-terminal quickstart
 
 ---
 
-## 互動流程
+## Interactive Flow
 
-### 第一步：偵測已安裝的 Backend
+### Step 1: Detect Installed Backends
 
-quickstart 啟動後會掃描 `$PATH` 中的可執行檔，比對所有支援的 backend 命令名稱：
+On launch, quickstart scans your `$PATH` for known backend executables:
 
-| Backend | 偵測的命令 |
-|---------|-----------|
+| Backend | Detected Command |
+|---------|-----------------|
 | Claude Code | `claude` |
 | Kiro CLI | `kiro-cli` |
 | Codex | `codex` |
@@ -31,133 +27,123 @@ quickstart 啟動後會掃描 `$PATH` 中的可執行檔，比對所有支援的
 | Gemini | `gemini` |
 | Agy (Antigravity) | `agy` |
 
-偵測到的 backend 會顯示版本號。如果偵測到多個，使用者可以選擇預設要用哪一個。
-如果只偵測到一個，就自動選取。
+Detected backends are shown with their version number. If multiple are found, you choose a default. If only one is found, it is auto-selected.
 
-如果沒有偵測到任何 backend，quickstart 會列出所有支援的 backend 及安裝提示，
-然後結束。
+If no backend is detected, quickstart lists all supported backends with installation hints and exits.
 
-**範例輸出（偵測到多個 backend）：**
+**Example output (multiple backends detected):**
 
 ```
-偵測到 2 個 AI coding backend：
+Detected 2 AI coding backends:
 
   1. Claude Code (v1.2.3)
   2. Kiro CLI (v0.4.1)
 
-選擇預設 backend [1]:
+Choose default backend [1]:
 ```
 
-### 第二步：Telegram 設定
+### Step 2: Telegram Setup
 
-Telegram 是 AgEnD 目前主要的通知頻道。quickstart 會引導使用者完成 bot 設定：
+Telegram is AgEnD's primary notification channel. Quickstart guides you through bot configuration:
 
-#### 2a. 取得 Bot Token
+#### 2a. Obtain a Bot Token
 
-quickstart 會顯示 BotFather 的操作步驟：
+Quickstart displays BotFather instructions:
 
-1. 在 Telegram 搜尋 `@BotFather`
-2. 發送 `/newbot`
-3. 依提示設定 bot 名稱
-4. 複製產生的 token
+1. Search for `@BotFather` in Telegram
+2. Send `/newbot`
+3. Follow the prompts to name your bot
+4. Copy the generated token
 
-使用者貼上 token 後，quickstart 會驗證格式（`<8位以上數字>:<30字元以上英數字>`）。
-格式不對會提示重新輸入。
+After pasting the token, quickstart validates the format (`<8+ digits>:<30+ alphanumeric chars>`). Invalid formats prompt re-entry.
 
-#### 2b. 驗證 Bot
+#### 2b. Verify the Bot
 
-通過格式檢查後，quickstart 會呼叫 Telegram `getMe` API 確認 token 有效，
-並取回 bot 的 username。
+Once the format check passes, quickstart calls the Telegram `getMe` API to confirm the token is valid and retrieves the bot's username.
 
-#### 2c. 偵測 Telegram 群組
+#### 2c. Detect Telegram Group
 
-quickstart 會請使用者把 bot 加入一個 Telegram 超級群組（supergroup），
-然後在群組裡發送任意訊息。quickstart 會以 3 分鐘的 long-polling（`getUpdates`）
-等待偵測群組。
+Quickstart asks you to add the bot to a Telegram supergroup, then send any message in that group. It uses 3-minute long-polling (`getUpdates`) to detect the group.
 
-偵測條件：
-- 必須是 **supergroup** 類型（一般群組不支援 topic 模式）
-- bot 必須擁有 **管理員權限**（topic 模式需要管理 topic 的權限）
+Detection requirements:
+- Must be a **supergroup** (regular groups don't support topic mode)
+- Bot must have **admin permissions** (required for managing topics)
 
-如果超時，使用者可以選擇：
-- **重試**：再等 3 分鐘
-- **跳過**：先產生 fleet.yaml，之後再手動設定 Telegram
-- **結束**：放棄 quickstart
+On timeout, you can:
+- **Retry**: Wait another 3 minutes
+- **Skip**: Generate fleet.yaml now, configure Telegram later
+- **Exit**: Abort quickstart
 
-重試次數上限為 3 次，之後會建議跳過。
+Maximum 3 retries before suggesting to skip.
 
-#### 2d. 儲存 Token
+#### 2d. Save the Token
 
-成功偵測群組後，quickstart 會將 `AGEND_BOT_TOKEN` 寫入 `~/.env` 檔案。
+After successful group detection, quickstart writes `AGEND_BOT_TOKEN` to `~/.env`.
 
-安全措施：
-- 檔案權限設為 `0600`（僅擁有者可讀寫，Unix only）
-- 檢查 `.gitignore` 是否涵蓋 `.env`，避免意外提交到 git
+Security measures:
+- File permissions set to `0600` (owner read/write only, Unix)
+- Checks whether `.gitignore` covers `.env` to prevent accidental commits
 
-### 第三步：產生 fleet.yaml
+### Step 3: Generate fleet.yaml
 
-quickstart 會在 `$AGEND_HOME/` 下產生 `fleet.yaml`。如果已有現成檔案，
-會詢問是否覆蓋。
+Quickstart generates `fleet.yaml` under `$AGEND_HOME/`. If one already exists, it asks whether to overwrite.
 
-產生的 fleet.yaml 包含：
+Generated fleet.yaml contents:
 
 ```yaml
-# 預設 backend
+# Default backend
 defaults:
-  backend: claude  # 或使用者選擇的 backend
+  backend: claude  # or whichever backend you selected
 
-# Telegram 通知頻道（如果有設定）
+# Telegram notification channel (if configured)
 channel:
   type: telegram
   bot_token_env: AGEND_BOT_TOKEN
   group_id: -100123456789
   mode: topic
   user_allowlist:
-    - 12345  # ← 請填入你的 Telegram user ID
+    - 12345  # fill in your Telegram user ID
 
-# Agent 實例
+# Agent instances
 instances:
   general:
     role: "General-purpose coding assistant"
     working_directory: ~/workspace
 ```
 
-如果跳過了 Telegram 設定，channel 區塊會以註解形式保留，方便之後手動填入。
+If Telegram was skipped, the channel block is preserved as comments for easy manual configuration later.
 
-`user_allowlist` 欄位永遠會產生（即使是空的），這是 Sprint 21 的 fail-closed
-安全設計——沒有在白名單中的 Telegram 使用者無法操作 agent。
+The `user_allowlist` field is always generated (even if empty) — this is the Sprint 21 fail-closed security design: Telegram users not on the allowlist cannot operate agents.
 
-### 第四步：後續步驟提示
+### Step 4: Next Steps
 
-quickstart 完成後會列出接下來需要做的事：
+After completion, quickstart lists what to do next:
 
 ```
-=== 開始之前 ===
+=== Before You Start ===
 
-1. 編輯 fleet.yaml 中的 user_allowlist，填入你的 Telegram user ID
-2. 確認 bot 在群組中擁有管理員權限
-3. 確認群組已升級為超級群組（支援 topic 模式）
+1. Edit user_allowlist in fleet.yaml with your Telegram user ID
+2. Confirm the bot has admin permissions in the group
+3. Confirm the group has been upgraded to a supergroup (for topic mode)
 
-=== 啟動 ===
+=== Launch ===
 
-$ agend-terminal start        # 啟動 daemon
-$ agend-terminal list          # 確認 agent 狀態
-$ agend-terminal attach general  # 連接到 agent 終端
+$ agend-terminal start        # Start the daemon
+$ agend-terminal list          # Check agent status
+$ agend-terminal attach general  # Connect to the agent terminal
 ```
 
 ---
 
-## 常見問題
+## FAQ
 
-### Q: 我沒有 Telegram，可以跳過嗎？
+### Q: I don't have Telegram. Can I skip it?
 
-可以。在 Telegram 設定步驟選擇「跳過」，quickstart 會產生不含 channel
-設定的 fleet.yaml。AgEnD 仍然可以正常運作，只是不會有 Telegram 通知。
+Yes. Choose "Skip" at the Telegram setup step. Quickstart generates a fleet.yaml without channel configuration. AgEnD still works normally — you just won't get Telegram notifications.
 
-### Q: 我想用 Discord 而不是 Telegram
+### Q: I want to use Discord instead of Telegram
 
-quickstart 目前只支援 Telegram 的自動設定。Discord 需要手動在 fleet.yaml
-中設定：
+Quickstart currently only supports automatic Telegram setup. For Discord, manually configure fleet.yaml:
 
 ```yaml
 channel:
@@ -166,51 +152,45 @@ channel:
   guild_id: "123456789"
 ```
 
-### Q: 已經有 fleet.yaml 了，quickstart 會覆蓋嗎？
+### Q: Will quickstart overwrite my existing fleet.yaml?
 
-quickstart 偵測到現有 fleet.yaml 時會詢問是否覆蓋。選擇「否」會保留現有
-檔案，quickstart 結束。
+When an existing fleet.yaml is detected, quickstart asks whether to overwrite. Choosing "No" keeps the existing file and exits quickstart.
 
-### Q: Token 格式驗證失敗怎麼辦？
+### Q: Token format validation fails?
 
-合法的 Telegram bot token 格式是 `<8位以上的數字>:<30字元以上的英數字、底線或
-連字號>`。請從 BotFather 完整複製整段 token，不要漏掉冒號前的數字部分。
+A valid Telegram bot token follows the format `<8+ digits>:<30+ alphanumeric characters, underscores, or hyphens>`. Copy the full token from BotFather — don't miss the numeric portion before the colon.
 
-### Q: 為什麼群組必須是超級群組？
+### Q: Why must the group be a supergroup?
 
-AgEnD 使用 Telegram 的 topic（論壇主題）功能為每個 agent 建立獨立的對話串。
-Topic 功能只有超級群組才支援。將一般群組轉換為超級群組的方式：
-群組設定 → 啟用「Topics」。
+AgEnD uses Telegram's topic (forum thread) feature to create separate conversation threads for each agent. Topics are only available in supergroups. To convert a regular group: Group Settings -> Enable "Topics".
 
 ---
 
-## 技術細節
+## Technical Details
 
-### 支援的 Backend
+### Supported Backends
 
-| Backend | 命令 | 預設參數 | Resume 支援 |
-|---------|------|---------|------------|
+| Backend | Command | Default Args | Resume Support |
+|---------|---------|-------------|---------------|
 | Claude Code | `claude` | `--dangerously-skip-permissions` | `--continue` |
 | Kiro CLI | `kiro-cli` | `--dangerously-skip-permissions` | `--resume` |
-| Codex | `codex` | （依版本） | 內建 |
-| OpenCode | `opencode` | （無） | `--continue` |
-| Gemini | `gemini` | （無） | `--resume latest` |
-| Agy | `agy` | （無） | `--continue` |
+| Codex | `codex` | (version-dependent) | Built-in |
+| OpenCode | `opencode` | (none) | `--continue` |
+| Gemini | `gemini` | (none) | `--resume latest` |
+| Agy | `agy` | (none) | `--continue` |
 
-### 檔案寫入位置
+### File Locations
 
-| 檔案 | 路徑 | 說明 |
-|------|------|------|
-| fleet.yaml | `$AGEND_HOME/fleet.yaml` | Agent 設定檔 |
-| .env | `~/.env` | Bot token 環境變數 |
+| File | Path | Description |
+|------|------|-------------|
+| fleet.yaml | `$AGEND_HOME/fleet.yaml` | Agent configuration |
+| .env | `~/.env` | Bot token environment variable |
 
-`$AGEND_HOME` 預設為 `~/.agend-terminal`。
+`$AGEND_HOME` defaults to `~/.agend-terminal`.
 
-### Token 安全
+### Token Security
 
-- Token 以環境變數名稱（`AGEND_BOT_TOKEN`）儲存在 fleet.yaml 中，
-  而非明文 token 值
-- 實際 token 值只存在 `~/.env` 檔案中
-- `~/.env` 權限為 `0600`（Unix）
-- quickstart 會檢查 `.gitignore` 涵蓋範圍，從工作目錄往上搜尋到根目錄，
-  確保 `.env` 不會被 git 追蹤
+- The token is stored in fleet.yaml as an environment variable name (`AGEND_BOT_TOKEN`), not the plaintext value
+- The actual token value only exists in `~/.env`
+- `~/.env` permissions are `0600` (Unix)
+- Quickstart traverses `.gitignore` files from the working directory up to the root to ensure `.env` is not tracked by git
