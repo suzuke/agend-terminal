@@ -388,3 +388,34 @@ mod tests {
         assert_eq!(*post.last().unwrap(), first_id);
     }
 }
+
+/// #917: Flip the split direction of the parent Split containing `pane_id`.
+/// Returns true if the flip was applied.
+pub fn flip_split_containing(root: &mut PaneNode, pane_id: usize) -> bool {
+    match root {
+        PaneNode::Leaf(_) => false,
+        PaneNode::Split {
+            dir, first, second, ..
+        } => {
+            let in_first = first.pane_ids().contains(&pane_id);
+            let in_second = second.pane_ids().contains(&pane_id);
+            if in_first || in_second {
+                // Check if this split directly contains the pane (as immediate child)
+                let direct_child = matches!(&**first, PaneNode::Leaf(p) if p.id == pane_id)
+                    || matches!(&**second, PaneNode::Leaf(p) if p.id == pane_id);
+                if direct_child {
+                    *dir = dir.opposite();
+                    return true;
+                }
+                // Recurse into the subtree containing the pane
+                if in_first {
+                    flip_split_containing(first, pane_id)
+                } else {
+                    flip_split_containing(second, pane_id)
+                }
+            } else {
+                false
+            }
+        }
+    }
+}
