@@ -73,6 +73,15 @@ pub(super) fn start_api_server(
         .ok();
 
     tracing::info!(path = %run_dir.display(), "in-process API server started");
+
+    // #1189: write `.ready` lifecycle marker in app (TUI) mode.
+    // Daemon mode writes it in `daemon/mod.rs` after the spawn loop;
+    // app mode has no spawn loop, so write it here after API is up.
+    let ready_path = run_dir.join(".ready");
+    if let Err(e) = std::fs::write(&ready_path, chrono::Utc::now().to_rfc3339()) {
+        tracing::warn!(path = %ready_path.display(), error = %e, "failed to write .ready marker");
+    }
+
     ApiGuard {
         run_dir: Some(run_dir),
         _owned: Some(prepared),
