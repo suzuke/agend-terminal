@@ -155,35 +155,123 @@ pub(super) fn render_fleet_view(
             .ok()
             .map(|c| c.instance_names())
             .unwrap_or_default();
-    let text_lines = build_fleet_view_lines(tasks, &teams, &all_instances);
+    let metrics = crate::instance_monitor::latest_metrics();
 
-    let lines: Vec<Line> = if text_lines.is_empty() {
-        vec![Line::from(Span::styled(
-            "No agents configured. Add instances to fleet.yaml.",
-            Style::default().fg(Color::DarkGray),
-        ))]
-    } else {
-        text_lines
-            .iter()
-            .map(|l| {
-                let style = if l.starts_with('═') {
-                    if l.contains("unassigned") {
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD)
-                    }
-                } else {
-                    Style::default().fg(Color::White)
-                };
-                Line::from(Span::styled(l.as_str(), style))
-            })
-            .collect()
-    };
+    // Build a lookup of live metrics by instance name.
+    let metrics_map: std::collections::HashMap<&str, &crate::instance_monitor::InstanceMetrics> =
+        metrics.iter().map(|m| (m.name.as_str(), m)).collect();
+
+    // Header
+    let header = Line::from(Span::styled(
+        format!(
+            " {:<16} {:<12} {:<10} {:<30} {:<20}",
+            "AGENT", "STATE", "HEALTH", "TASK", "BRANCH"
+        ),
+        Style::default()
+            .add_modifier(Modifier::BOLD)
+            .fg(Color::Cyan),
+    ));
+
+    let mut lines = vec![header];
+
+    // Build agent→task mapping
+    let mut agent_tasks: std::collections::HashMap<&str, &crate::tasks::Task> =
+        std::collections::HashMap::new();
+    for t in tasks {
+        if matches!(t.status.as_str(), "claimed" | "in_progress") {
+            if let Some(ref a) = t.assignee {
+                agent_tasks.entry(a.as_str()).or_insert(t);
+            }
+        }
+    }
+
+    // Build agent→branch from bindings
+    let mut assigned: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for team in &teams {
+        lines.push(Line::from(Span::styled(
+            format!("═══ {} ═══", team.name),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for member in &team.members {
+            assigned.insert(member.as_str());
+            lines.push(build_agent_line(member, &metrics_map, &agent_tasks, home));
+        }
+    }
+    let mut unassigned: Vec<&str> = all_instances
+        .iter()
+        .filter(|n| !assigned.contains(n.as_str()))
+        .map(String::as_str)
+        .collect();
+    unassigned.sort_unstable();
+    if !unassigned.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "═══ unassigned ═══",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for name in &unassigned {
+            lines.push(build_agent_line(name, &metrics_map, &agent_tasks, home));
+        }
+    }
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn build_agent_line<'a>(
+    name: &str,
+    metrics_map: &std::collections::HashMap<&str, &crate::instance_monitor::InstanceMetrics>,
+    agent_tasks: &std::collections::HashMap<&str, &crate::tasks::Task>,
+    home: &std::path::Path,
+) -> Line<'a> {
+    let (state, health_color) = metrics_map
+        .get(name)
+        .map(|m| {
+            let color = match m.health_state.as_str() {
+                "healthy" | "ok" => Color::Green,
+                "hung" | "crashed" | "failed" => Color::Red,
+                "rate_limit" | "recovering" => Color::Yellow,
+                _ => Color::White,
+            };
+            (m.agent_state.as_str().to_string(), color)
+        })
+        .unwrap_or_else(|| ("stopped".to_string(), Color::DarkGray));
+
+    let task_str = agent_tasks
+        .get(name)
+        .map(|t| {
+            let title: String = t.title.chars().take(28).collect();
+            title
+        })
+        .unwrap_or_else(|| "—".to_string());
+
+    let branch = crate::binding::read(home, name)
+        .and_then(|v| v["branch"].as_str().map(String::from))
+        .unwrap_or_else(|| "—".to_string());
+    let branch_short: String = branch.chars().take(18).collect();
+
+    let symbol = if state == "stopped" { "○" } else { "●" };
+    Line::from(vec![
+        Span::styled(
+            format!(" {symbol} {:<15}", name),
+            Style::default().fg(if state == "stopped" {
+                Color::DarkGray
+            } else {
+                Color::White
+            }),
+        ),
+        Span::styled(format!("{:<12}", state), Style::default().fg(health_color)),
+        Span::styled(format!("{:<10}", ""), Style::default()),
+        Span::styled(
+            format!("{:<30}", task_str),
+            Style::default().fg(Color::White),
+        ),
+        Span::styled(
+            format!("{:<20}", branch_short),
+            Style::default().fg(Color::Blue),
+        ),
+    ])
 }
 
 #[cfg(test)]

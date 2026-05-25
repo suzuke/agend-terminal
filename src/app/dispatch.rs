@@ -206,6 +206,16 @@ pub(super) fn dispatch(action: Action, ctx: &mut DispatchCtx<'_>) -> DispatchRes
                 view: super::overlay::BoardView::Tasks,
             });
         }
+        Action::ShowFleet => {
+            let items = crate::tasks::list_all(ctx.home);
+            out.new_overlay = Some(Overlay::Tasks {
+                items,
+                col: 0,
+                row: 0,
+                mode: super::overlay::TaskBoardMode::Board,
+                view: super::overlay::BoardView::Fleet,
+            });
+        }
         Action::ShowHelp => {
             out.new_overlay = Some(Overlay::Help);
         }
