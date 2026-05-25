@@ -188,17 +188,22 @@ pub(super) fn render_fleet_view(
         }
     }
 
-    // Build agent→branch from bindings
-    let mut assigned: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for team in &teams {
+    // #1200: sort teams + members for fully deterministic render order.
+    let mut sorted_teams = teams.clone();
+    sorted_teams.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let mut assigned: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for team in &sorted_teams {
         lines.push(Line::from(Span::styled(
             format!("═══ {} ═══", team.name),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )));
-        for member in &team.members {
-            assigned.insert(member.as_str());
+        let mut members = team.members.clone();
+        members.sort_unstable();
+        for member in &members {
+            assigned.insert(member.clone());
             lines.push(build_agent_line(member, &metrics_map, &agent_tasks, home));
         }
     }
