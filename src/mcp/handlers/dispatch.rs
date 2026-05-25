@@ -1070,8 +1070,7 @@ mod tests {
             (
                 "task",
                 &[
-                    "create", "list", "claim", "update", "done", "sweep", "health",
-                    "activity",
+                    "create", "list", "claim", "update", "done", "sweep", "health", "activity",
                 ],
             ),
             ("ci", &["watch", "unwatch", "status"]),
