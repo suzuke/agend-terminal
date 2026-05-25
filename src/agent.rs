@@ -1395,35 +1395,35 @@ pub fn try_dismiss_dialog(
             if std::thread::Builder::new()
                 .name("dismiss-dialog".into())
                 .spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(300));
-                // Send keys in chunks split on \r/\n boundaries with delay between,
-                // so TUI frameworks process navigation before confirmation.
-                let mut w = writer.lock();
-                let mut start = 0;
-                for (i, &b) in keys.iter().enumerate() {
-                    if b == b'\r' || b == b'\n' {
-                        // Send everything up to (not including) this Enter
-                        if start < i {
-                            let _ = w.write_all(&keys[start..i]);
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    // Send keys in chunks split on \r/\n boundaries with delay between,
+                    // so TUI frameworks process navigation before confirmation.
+                    let mut w = writer.lock();
+                    let mut start = 0;
+                    for (i, &b) in keys.iter().enumerate() {
+                        if b == b'\r' || b == b'\n' {
+                            // Send everything up to (not including) this Enter
+                            if start < i {
+                                let _ = w.write_all(&keys[start..i]);
+                                let _ = w.flush();
+                                drop(w);
+                                std::thread::sleep(std::time::Duration::from_millis(200));
+                                w = writer.lock();
+                            }
+                            // Send the Enter
+                            let _ = w.write_all(&keys[i..=i]);
                             let _ = w.flush();
-                            drop(w);
-                            std::thread::sleep(std::time::Duration::from_millis(200));
-                            w = writer.lock();
+                            start = i + 1;
                         }
-                        // Send the Enter
-                        let _ = w.write_all(&keys[i..=i]);
-                        let _ = w.flush();
-                        start = i + 1;
                     }
-                }
-                if start < keys.len() {
-                    let _ = w.write_all(&keys[start..]);
-                    let _ = w.flush();
-                }
-                tracing::debug!(agent = %agent, "dismiss keystrokes sent");
-                // H2: remove from in-flight set
-                DISMISS_IN_FLIGHT.lock().remove(&agent);
-            })
+                    if start < keys.len() {
+                        let _ = w.write_all(&keys[start..]);
+                        let _ = w.flush();
+                    }
+                    tracing::debug!(agent = %agent, "dismiss keystrokes sent");
+                    // H2: remove from in-flight set
+                    DISMISS_IN_FLIGHT.lock().remove(&agent);
+                })
                 .is_err()
             {
                 tracing::warn!(agent = name, "failed to spawn dismiss-dialog thread");
