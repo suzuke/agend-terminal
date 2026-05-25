@@ -334,6 +334,16 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // Start true so restored split panes get correct sizes before first draw.
     let mut needs_resize = true;
 
+    // #1189: write `.ready` lifecycle marker after TUI fully initialized
+    // (API bound + session restore complete). Daemon mode writes it in
+    // daemon/mod.rs after spawn loop; app mode writes here.
+    if !attached_mode {
+        let ready_path = crate::daemon::run_dir(&home).join(".ready");
+        if let Err(e) = std::fs::write(&ready_path, chrono::Utc::now().to_rfc3339()) {
+            tracing::warn!(path = %ready_path.display(), error = %e, "failed to write .ready marker");
+        }
+    }
+
     // Throttle for Attached-mode remote agent discovery. 2s is short enough
     // that a fleet.yaml reload (daemon tick is 10s) feels timely but long
     // enough that the readdir cost is trivial.
