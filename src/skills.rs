@@ -473,7 +473,11 @@ fn install_one(source: &Path, target: &Path, backend: &str) -> InstallOutcome {
     // Pre-existing non-managed directory: don't overwrite operator's
     // hand-crafted skills dir. Symlinks + previously-managed copies
     // are safe to replace.
-    if target.exists() {
+    //
+    // #1229 Bug 2: use symlink_metadata to detect broken symlinks
+    // (target.exists() follows symlinks and returns false for dangling).
+    let entry_exists = target.symlink_metadata().is_ok();
+    if entry_exists {
         let is_symlink = target
             .symlink_metadata()
             .map(|m| m.file_type().is_symlink())
