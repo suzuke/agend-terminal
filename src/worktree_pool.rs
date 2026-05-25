@@ -49,9 +49,15 @@ pub fn lease(
         None => return Err(format!("failed to create worktree for {agent}@{branch}")),
     };
 
+<<<<<<< HEAD
     // #1137: marker is now written inside worktree::create() immediately
     // after checkout. Re-write here is idempotent and ensures the marker
     // is present for reused worktrees (which skip the create path).
+=======
+    // Tag as daemon-managed — already written by worktree::create (#1137).
+    // Re-write here is idempotent and ensures the marker is present even
+    // for reused worktrees (which skip the create path).
+>>>>>>> feat/active
     let marker = info.path.join(MANAGED_MARKER);
     let _ = std::fs::write(
         &marker,
