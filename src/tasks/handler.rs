@@ -894,6 +894,54 @@ fn summarize_event(env: &crate::task_events::TaskEventEnvelope) -> (&str, String
     }
 }
 
+fn cascade_cancel_children(
+    home: &Path,
+    parent_id: &str,
+    emitter: &crate::task_events::InstanceName,
+) {
+    let Ok(state) = crate::task_events::replay(home) else {
+        return;
+    };
+    let parent_tid = crate::task_events::TaskId(parent_id.to_string());
+    let mut cancel_events = Vec::new();
+    let mut notify_ids = Vec::new();
+    for (child_id, child) in &state.tasks {
+        if child.parent_id.as_ref() != Some(&parent_tid) {
+            continue;
+        }
+        match child.status {
+            crate::task_events::TaskStatus::Open | crate::task_events::TaskStatus::Claimed => {
+                cancel_events.push(crate::task_events::TaskEvent::Cancelled {
+                    task_id: child_id.clone(),
+                    by: emitter.clone(),
+                    reason: format!("cascade: parent {parent_id} cancelled"),
+                });
+            }
+            crate::task_events::TaskStatus::InProgress => {
+                notify_ids.push((child_id.clone(), child.owner.clone()));
+            }
+            _ => {}
+        }
+    }
+    if !cancel_events.is_empty() {
+        let _ = crate::task_events::append_batch(home, emitter, cancel_events);
+    }
+    for (child_id, owner) in notify_ids {
+        if let Some(ref owner_name) = owner {
+            let msg = crate::inbox::message::InboxMessage {
+                text: format!(
+                    "[parent-cancelled] Parent task {parent_id} was cancelled. \
+                     Your in-progress subtask {} may need attention.",
+                    child_id.0
+                ),
+                kind: Some("parent_cancelled".to_string()),
+                ..Default::default()
+            };
+            let _ = crate::inbox::storage::enqueue(home, &owner_name.0, msg);
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -1229,53 +1277,5 @@ mod tests {
             Some(task_id),
             "correlation_id should match task_id for auto-close"
         );
-    }
-}
-
-fn cascade_cancel_children(
-    home: &Path,
-    parent_id: &str,
-    emitter: &crate::task_events::InstanceName,
-) {
-    let Ok(state) = crate::task_events::replay(home) else {
-        return;
-    };
-    let parent_tid = crate::task_events::TaskId(parent_id.to_string());
-    let mut cancel_events = Vec::new();
-    let mut notify_ids = Vec::new();
-    for (child_id, child) in &state.tasks {
-        if child.parent_id.as_ref() != Some(&parent_tid) {
-            continue;
-        }
-        match child.status {
-            crate::task_events::TaskStatus::Open | crate::task_events::TaskStatus::Claimed => {
-                cancel_events.push(crate::task_events::TaskEvent::Cancelled {
-                    task_id: child_id.clone(),
-                    by: emitter.clone(),
-                    reason: format!("cascade: parent {parent_id} cancelled"),
-                });
-            }
-            crate::task_events::TaskStatus::InProgress => {
-                notify_ids.push((child_id.clone(), child.owner.clone()));
-            }
-            _ => {}
-        }
-    }
-    if !cancel_events.is_empty() {
-        let _ = crate::task_events::append_batch(home, emitter, cancel_events);
-    }
-    for (child_id, owner) in notify_ids {
-        if let Some(ref owner_name) = owner {
-            let msg = crate::inbox::message::InboxMessage {
-                text: format!(
-                    "[parent-cancelled] Parent task {parent_id} was cancelled. \
-                     Your in-progress subtask {} may need attention.",
-                    child_id.0
-                ),
-                kind: Some("parent_cancelled".to_string()),
-                ..Default::default()
-            };
-            let _ = crate::inbox::storage::enqueue(home, &owner_name.0, msg);
-        }
     }
 }
