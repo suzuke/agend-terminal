@@ -176,9 +176,9 @@ pub(crate) fn parse_double_quoted(s: &str) -> String {
     result
 }
 
-/// AgEnD Terminal — Agent Process Manager
+/// Orchestrate AI coding agents
 #[derive(Parser)]
-#[command(name = "agend-terminal", version, about)]
+#[command(name = "agend-terminal", version, about = "Orchestrate AI coding agents")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -186,7 +186,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start daemon with fleet.yaml or explicit `--agents`
+    /// Start the daemon
     Start {
         /// Run the daemon in the foreground (blocks the calling shell, stdio
         /// stays attached to the terminal).
@@ -210,20 +210,20 @@ enum Commands {
         #[arg(long, num_args = 1.., value_name = "NAME:CMD")]
         agents: Vec<String>,
     },
-    /// Attach to an agent's terminal (Ctrl+B d to detach)
+    /// Attach to an agent's terminal
     Attach {
         /// Agent name
         #[arg(default_value = "shell")]
         name: String,
     },
-    /// Send input to an agent's PTY
+    /// Send input to an agent
     Inject {
         /// Agent name
         name: String,
         /// Text to inject
         text: Vec<String>,
     },
-    /// List running agents (use `--detailed` for state/health/cmd, `--json` for JSON)
+    /// List running agents
     #[command(aliases = ["ls", "status"])]
     List {
         /// Output as JSON. Forces detailed output (full agent record from API).
@@ -244,7 +244,7 @@ enum Commands {
         #[arg(long)]
         legacy_json: bool,
     },
-    /// Connect a local agent to the running daemon
+    /// Connect an external agent to the daemon
     Connect {
         /// Agent name (unique identifier)
         name: String,
@@ -258,7 +258,7 @@ enum Commands {
         #[arg(last = true)]
         extra_args: Vec<String>,
     },
-    /// Launch terminal app — multi-tab/pane TUI with agent management
+    /// Launch the TUI app
     App {
         /// Path to fleet.yaml (default: $AGEND_HOME/fleet.yaml)
         #[arg(long)]
@@ -266,22 +266,22 @@ enum Commands {
     },
     /// Stop the daemon
     Stop,
-    /// Kill a specific agent
+    /// Kill an agent
     Kill {
         /// Agent name
         name: String,
     },
-    /// Admin maintenance utilities
+    /// Admin utilities
     Admin {
         #[command(subcommand)]
         command: AdminCommands,
     },
-    /// Capture backend output or promote captures to fixtures
+    /// Capture agent output
     Capture {
         #[command(subcommand)]
         action: CaptureAction,
     },
-    /// E2E verification (use `--quick` for the lightweight subset)
+    /// Run end-to-end verification
     Verify {
         /// Output as JSON
         #[arg(long)]
@@ -295,42 +295,34 @@ enum Commands {
         #[arg(long)]
         quick: bool,
     },
-    /// Cross-platform OS service integration. `install` registers the
-    /// daemon as a user-level service (macOS launchd / Linux systemd
-    /// user / Windows Task Scheduler at-logon task). `uninstall`
-    /// removes it. `status` queries the platform service manager for
-    /// running / stopped / not_installed. No admin / root required on
-    /// any platform.
+    /// Install or manage the OS service
     Service {
         #[command(subcommand)]
         action: ServiceAction,
     },
-    /// Health check (or `doctor topics` for telegram topic state diagnostic)
+    /// Run health checks
     Doctor {
         #[command(subcommand)]
         action: Option<DoctorAction>,
     },
-    /// Manage shared skills used by all 5 backends (Claude Code /
-    /// Codex / Gemini / OpenCode / Kiro CLI). Skills live in
-    /// `<home>/skills/<name>/` and are surfaced to each agent via
-    /// per-backend symlinks (or copies on Windows) at launch.
+    /// Manage shared agent skills
     Skills {
         #[command(subcommand)]
         action: SkillsAction,
     },
-    /// Menu-bar / system-tray resident app (requires `--features tray`).
+    /// Launch the system tray app
     #[cfg(feature = "tray")]
     Tray,
-    /// Interactive setup — detect backends, configure Telegram, generate fleet.yaml
+    /// Interactive first-time setup
     Quickstart,
-    /// Generate bug report with diagnostics, logs, and config
+    /// Generate a bug report
     Bugreport,
-    /// Generate shell completions (bash, zsh, fish, elvish, powershell)
+    /// Generate shell completions
     Completions {
         /// Shell type
         shell: clap_complete::Shell,
     },
-    /// Verify push claims against actual diff (push-time semantic gate)
+    /// Verify push claims against the actual diff
     VerifyPush {
         /// Base commit (e.g. origin/main)
         #[arg(long)]
