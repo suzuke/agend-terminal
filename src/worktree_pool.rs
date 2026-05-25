@@ -743,7 +743,25 @@ pub fn gc_run(home: &Path) -> Vec<GcResult> {
 fn gc_remove_one(home: &Path, candidate: &GcCandidate) -> GcResult {
     let wt_path = &candidate.path;
 
-    // TOCTOU guard: re-validate right before deletion.
+    // Acquire the same binding lock that bind_full() uses, making
+    // GC deletion and bind mutually exclusive (eliminates TOCTOU).
+    let lock_path = crate::paths::runtime_dir(home)
+        .join(&candidate.agent)
+        .join(".binding.json.lock");
+    let _lock = match crate::store::acquire_file_lock(&lock_path) {
+        Ok(l) => l,
+        Err(e) => {
+            return GcResult {
+                path: wt_path.clone(),
+                agent: candidate.agent.clone(),
+                removed: false,
+                error: Some(format!("skipped: binding lock acquisition failed: {e}")),
+            };
+        }
+    };
+
+    // Re-validate under lock: binding/pinned/grace state may have
+    // changed since gc_candidates() enumerated this worktree.
     if evaluate_candidate(home, wt_path).is_none() {
         return GcResult {
             path: wt_path.clone(),
