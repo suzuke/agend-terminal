@@ -125,9 +125,10 @@ impl RecoveryDispatcherHandler {
 }
 
 fn stage2_gate_active() -> bool {
-    std::env::var(STAGE2_ENV_VAR)
-        .map(|v| v == "1")
-        .unwrap_or(false)
+    crate::runtime_config::get().hang_auto_recovery_enabled
+        || std::env::var(STAGE2_ENV_VAR)
+            .map(|v| v == "1")
+            .unwrap_or(false)
 }
 
 fn stage2_max_restarts() -> u32 {
@@ -141,9 +142,10 @@ fn stage2_max_restarts() -> u32 {
 }
 
 fn stage3_gate_active() -> bool {
-    std::env::var(STAGE3_ENV_VAR)
-        .map(|v| v == "1")
-        .unwrap_or(false)
+    crate::runtime_config::get().hang_auto_recovery_enabled
+        || std::env::var(STAGE3_ENV_VAR)
+            .map(|v| v == "1")
+            .unwrap_or(false)
 }
 
 /// Read an env var as milliseconds with a typed default. Logged at
@@ -160,9 +162,11 @@ fn env_ms(var: &str, default_ms: u64) -> Duration {
 }
 
 fn stage1_gate_active() -> bool {
-    std::env::var(STAGE1_ENV_VAR)
-        .map(|v| v == "1")
-        .unwrap_or(false)
+    // #685 Phase 2: runtime config master gate OR per-stage env var.
+    crate::runtime_config::get().hang_auto_recovery_enabled
+        || std::env::var(STAGE1_ENV_VAR)
+            .map(|v| v == "1")
+            .unwrap_or(false)
 }
 
 /// Decision branch for the combined-gate inspection. Centralises the

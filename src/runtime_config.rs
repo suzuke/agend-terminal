@@ -18,6 +18,11 @@ pub struct RuntimeConfig {
     /// Fleet-wide idle threshold before watchdog alerts (seconds).
     #[serde(default = "default_fleet_idle")]
     pub fleet_idle_threshold_secs: i64,
+    /// #685 Phase 2: Master gate for hang auto-recovery stages 1-3.
+    /// When true, Hung agents trigger ESC → restart → escalate.
+    /// Default false (shadow mode only).
+    #[serde(default)]
+    pub hang_auto_recovery_enabled: bool,
 }
 
 fn default_dev_idle() -> i64 {
@@ -32,6 +37,7 @@ impl Default for RuntimeConfig {
         Self {
             dev_idle_threshold_secs: default_dev_idle(),
             fleet_idle_threshold_secs: default_fleet_idle(),
+            hang_auto_recovery_enabled: false,
         }
     }
 }
@@ -71,6 +77,13 @@ pub fn set(home: &Path, key: &str, value: &str) -> Result<String, String> {
                 .parse()
                 .map_err(|_| format!("invalid integer: {value}"))?;
         }
+        "hang_auto_recovery_enabled" => {
+            config.hang_auto_recovery_enabled = match value {
+                "true" | "1" => true,
+                "false" | "0" => false,
+                _ => return Err(format!("invalid boolean: {value} (use true/false)")),
+            };
+        }
         _ => return Err(format!("unknown config key: {key}")),
     }
     let path = home.join("runtime-config.json");
@@ -86,6 +99,7 @@ pub fn get_key(key: &str) -> Result<String, String> {
     match key {
         "dev_idle_threshold_secs" => Ok(config.dev_idle_threshold_secs.to_string()),
         "fleet_idle_threshold_secs" => Ok(config.fleet_idle_threshold_secs.to_string()),
+        "hang_auto_recovery_enabled" => Ok(config.hang_auto_recovery_enabled.to_string()),
         _ => Err(format!("unknown config key: {key}")),
     }
 }
@@ -122,6 +136,25 @@ mod tests {
         let dir = std::env::temp_dir().join("agend-test-runtime-config-bad");
         std::fs::create_dir_all(&dir).ok();
         assert!(set(&dir, "nonexistent", "123").is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hang_auto_recovery_enabled_default_false() {
+        let c = RuntimeConfig::default();
+        assert!(!c.hang_auto_recovery_enabled);
+    }
+
+    #[test]
+    fn set_hang_auto_recovery_enabled() {
+        let dir = std::env::temp_dir().join("agend-test-runtime-config-hang");
+        std::fs::create_dir_all(&dir).ok();
+        set(&dir, "hang_auto_recovery_enabled", "true").unwrap();
+        reload(&dir);
+        assert_eq!(get_key("hang_auto_recovery_enabled").unwrap(), "true");
+        set(&dir, "hang_auto_recovery_enabled", "false").unwrap();
+        reload(&dir);
+        assert_eq!(get_key("hang_auto_recovery_enabled").unwrap(), "false");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

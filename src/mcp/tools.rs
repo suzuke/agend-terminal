@@ -248,7 +248,7 @@ fn watchdog_tools() -> Vec<Value> {
 
 fn config_tools() -> Vec<Value> {
     vec![
-        json!({"name": "config", "description": "#1085: Runtime-mutable daemon configuration. Actions: get, set, list. Keys: dev_idle_threshold_secs, fleet_idle_threshold_secs.",
+        json!({"name": "config", "description": "#1085: Runtime-mutable daemon configuration. Actions: get, set, list. Keys: dev_idle_threshold_secs, fleet_idle_threshold_secs, hang_auto_recovery_enabled.",
         "inputSchema": {"type": "object", "properties": {
             "action": {"type": "string", "enum": ["get", "set", "list"]},
             "key": {"type": "string", "description": "Config key name (required for get/set)"},
