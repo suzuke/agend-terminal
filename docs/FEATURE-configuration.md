@@ -1,46 +1,45 @@
-# 設定層：`AGEND_HOME`、`fleet.yaml`、runtime config、MCP config
+# Configuration Layers: `AGEND_HOME`, `fleet.yaml`, runtime config, and MCP config
 
-這份文件說明 AgEnD 的設定是怎麼分層的、誰能寫哪一層、
-以及你應該在哪裡改哪一種設定。
+This document explains how AgEnD's configuration is layered, who writes each layer, and where you should make a change depending on the type of setting.
 
-核心原則只有一句：
+The main rule is:
 
-- **來源要單一，派生檔要可重建。**
+- **Keep one source of truth, and make derived files rebuildable.**
 
-也就是說：
+In practice that means:
 
-- `fleet.yaml` 是 fleet 的主要人類可編輯來源。
-- `runtime-config.json` 是可熱更新的執行期數值。
-- 各 backend 的 `mcp.json` / `settings.local.json` 是派生設定，不是主來源。
-- service manager artifact 也是派生設定，不是主來源。
+- `fleet.yaml` is the primary human-editable fleet source.
+- `runtime-config.json` holds live, runtime-tunable numbers.
+- backend `mcp.json` or `settings.local.json` files are derived, not primary sources.
+- service-manager artifacts are also derived files.
 
-## 設定層次總覽
+## Configuration layers at a glance
 
-| 層級 | 典型檔案 / env | 誰寫 | 作用時間 |
+| Layer | Typical file / env | Written by | Used when |
 |---|---|---|---|
-| 進程環境 | `AGEND_HOME`, `AGEND_POINTER_ONLY_INJECT`, `AGEND_CAPTURE_FIXTURES` | 操作員 / 啟動器 | 啟動時讀取 |
-| Fleet 主設定 | `$AGEND_HOME/fleet.yaml` | 操作員 + daemon | 啟動 / 重新載入時 |
-| 執行期設定 | `$AGEND_HOME/runtime-config.json` | MCP `config` 工具 | 每個 daemon tick |
-| MCP 派生設定 | `.claude/settings.local.json`, `.kiro/settings/mcp.json`, `mcp-config.json` | daemon / 生成器 | backend 啟動前 |
-| 服務管理器 artifact | plist / unit / task xml | `service install` | OS 登入時 |
-| 診斷輸出 | `bugreport-*.txt`, `captures/*` | operator / capture 工具 | 需要時 |
+| Process environment | `AGEND_HOME`, `AGEND_POINTER_ONLY_INJECT`, `AGEND_CAPTURE_FIXTURES` | operator / launcher | startup |
+| Fleet source | `$AGEND_HOME/fleet.yaml` | operator + daemon | startup / reload |
+| Runtime config | `$AGEND_HOME/runtime-config.json` | MCP `config` tool | each daemon tick |
+| Derived MCP config | `.claude/settings.local.json`, `.kiro/settings/mcp.json`, `mcp-config.json` | daemon / generator | before backend launch |
+| Service artifact | plist / unit / task XML | `service install` | OS login |
+| Diagnostic output | `bugreport-*.txt`, `captures/*` | operator / capture tools | on demand |
 
 ## `AGEND_HOME`
 
-`AGEND_HOME` 是最重要的根目錄。
+`AGEND_HOME` is the root of almost everything.
 
-### 解析規則
+### Resolution order
 
-程式優先順序是：
+The code resolves the home directory in this order:
 
-1. 如果環境變數 `AGEND_HOME` 存在，就直接用它。
-2. 否則回到使用者家目錄：
-   - 優先 `~/.agend`
-   - 相容舊路徑 `~/.agend-terminal`
+1. if the `AGEND_HOME` environment variable is set, use it
+2. otherwise fall back to the user's home directory:
+   - prefer `~/.agend`
+   - keep `~/.agend-terminal` as a compatibility fallback
 
-### 為什麼這個根目錄重要
+### Why it matters
 
-幾乎所有可持久化狀態都掛在這裡：
+Most persisted state hangs off this directory:
 
 - `fleet.yaml`
 - `runtime-config.json`
@@ -52,50 +51,49 @@
 - `workspace/`
 - `worktrees/`
 
-換句話說，搬家或備份時，先看 `AGEND_HOME`。
+If you are moving a setup, backing it up, or trying to understand where state lives, start here.
 
 ## `.env`
 
-daemon 會從 `AGEND_HOME/.env` 讀取環境變數。
+The daemon loads environment variables from `AGEND_HOME/.env`.
 
-### 支援格式
+### Supported formats
 
 - `KEY=value`
 - `export KEY=value`
-- single quoted / double quoted value
+- single-quoted and double-quoted values
 
-### 注意事項
+### Notes
 
-- `#` 在 quoted value 中會被保留。
-- unquoted 值的 inline comment 會被剝掉。
-- `.env` 不是唯一來源；它只是啟動期環境補充。
+- `#` inside quoted values is preserved.
+- Inline comments are stripped from unquoted values.
+- `.env` is a supplement to startup-time environment, not the only configuration source.
 
-### 適合放什麼
+### Good uses
 
-- bot token 的 env 名稱
-- backend API key 的 env 名稱
-- local-only feature flag
+- bot token variable names
+- API key variable names
+- local-only feature flags
 
-### 不適合放什麼
+### Bad uses
 
-- 大量結構化 fleet 定義
-- runtime 可調 threshold
-- 使用者 global CLI 設定
+- large structured fleet definitions
+- live tuning numbers that should be editable at runtime
+- user-global CLI settings
 
 ## `fleet.yaml`
 
-`fleet.yaml` 是 fleet 的主設定檔。
+`fleet.yaml` is the main fleet definition file.
 
-### 預設位置
+### Default path
 
 ```text
 $AGEND_HOME/fleet.yaml
 ```
 
-### 你會在這裡設定什麼
+### What belongs here
 
-這個檔案描述每個 instance 的來源、角色與啟動方式。
-常見欄位包含：
+This file describes each instance's source, role, and startup behavior. Common fields include:
 
 - `backend`
 - `working_directory`
@@ -115,24 +113,24 @@ $AGEND_HOME/fleet.yaml
 - `topic_id`
 - `id`
 
-### 哪些欄位是 daemon-managed
+### Daemon-managed fields
 
-目前明確歸為 daemon-managed 的欄位有：
+The daemon treats the following fields as managed by the system:
 
 - `id`
 - `topic_id`
 - `git_branch`
 - `source_repo`
 
-意思是：
+Meaning:
 
-- daemon 會覆寫它們。
-- operator 不應把它們當成永久手改欄位。
-- 若手改與 daemon 內容衝突，merge 會以 daemon 為準，或直接報 conflict。
+- the daemon will overwrite them
+- operators should not treat them as permanent manual edits
+- if operator and daemon values diverge, merge logic will favor the daemon value or surface a conflict
 
-### 哪些欄位是 operator hand-edit
+### Operator-hand-edited fields
 
-常見 operator 管欄位：
+Typical operator-controlled fields include:
 
 - `backend`
 - `working_directory`
@@ -149,286 +147,285 @@ $AGEND_HOME/fleet.yaml
 - `skills`
 - `topic_binding_mode`
 
-### `None` 與 `Some(empty)` 的差別
+### `None` vs `Some(empty)`
 
-這個差異很重要，尤其在 `args`、`env`、`skills` 這類欄位。
+This distinction matters for fields like `args`, `env`, and `skills`.
 
-- `None`：不要覆寫預設。
-- `Some(vec![])` / 空集合：明確 opt-out。
+- `None`: do not override the default
+- `Some(empty)` or an empty collection: explicit opt-out
 
-例子：
+Examples:
 
-- `args: null` → 使用 backend 預設參數。
-- `args: []` → 明確要求空參數列。
-- `skills: null` → 安裝全部 skills。
-- `skills: []` → 明確不安裝任何 skills。
+- `args: null` → use the backend default argument list
+- `args: []` → explicitly request an empty argument list
+- `skills: null` → install every shared skill
+- `skills: []` → install no skills at all
 
 ### `skills`
 
-`skills` 是 per-instance allowlist。
+`skills` is a per-instance allowlist.
 
-語意如下：
+Semantics:
 
-- `null`：安裝所有共享 skills。
-- `[]`：不安裝任何 skills。
-- `["foo", "bar"]`：只安裝指定的 skills。
+- `null`: install all shared skills
+- `[]`: install no skills
+- `["foo", "bar"]`: install only the named skills
 
-這個欄位會影響 backend 工作目錄底下的技能安裝內容。
+This affects what is installed into each backend's skill directory under the agent's working directory.
 
 ### `topic_binding_mode`
 
-這個欄位控制 Telegram topic 是否在 spawn 時就建立。
+This field controls whether a Telegram topic is created during spawn.
 
-- `auto` / `null`：目前預設行為。
-- `skip`：永遠不建立 topic。
-- `deferred`：spawn 時不建，之後可補綁。
+- `auto` / `null`: current default behavior
+- `skip`: never create a topic
+- `deferred`: do not create one at spawn, but allow later binding
 
-### `repo` / `source_repo`
+### `repo` vs `source_repo`
 
-這兩個欄位都跟來源 repo 有關，但語意不同：
+These fields are related but not identical.
 
-- `source_repo`：daemon 會把它當成綁定來源的一部分。
-- `repo`：GitHub `owner/name` 層級的覆寫。
+- `source_repo`: part of the binding-derived source identity
+- `repo`: an `owner/name` override at the GitHub-repo level
 
-如果你只是在做 operator hand-edit，避免把 daemon-managed 欄位當成永久真相。
+If you are making a manual operator edit, avoid treating daemon-managed fields as the long-term source of truth.
 
-### merge 行為
+### Merge behavior
 
-fleet merge 不是純覆蓋，而是有欄位分類。
+Fleet merge is not a blind overwrite. Field classification matters.
 
-- daemon-managed 欄位：daemon 值覆寫 operator 值。
-- operator-hand-edit 欄位：
-  - 既有欄位缺失 → 寫入 daemon 值
-  - 既有欄位相同 → no-op
-  - 既有欄位不同 → 產生 conflict
-- daemon 未提供的欄位：保留 operator 原值
+- daemon-managed fields: daemon value overwrites operator value
+- operator-hand-edit fields:
+  - missing existing value → write daemon value
+  - same value → no-op
+  - different value → conflict
+- fields the daemon does not provide: preserve the operator's existing value
 
-這樣做的目的，是避免 daemon 和 operator 互相把對方的資訊洗掉。
+That keeps daemon-owned bookkeeping from clobbering operator intent.
 
 ## `runtime-config.json`
 
-這是執行期設定。
+This is the live runtime config.
 
-### 預設位置
+### Default path
 
 ```text
 $AGEND_HOME/runtime-config.json
 ```
 
-### 讀取方式
+### How it is used
 
-daemon 會在每個 tick 重新載入一次，所以它是 live tunable 的。
+The daemon reloads it every tick, which makes it suitable for live tuning.
 
-### 可調欄位
+### Tunable keys
 
-| key | 預設值 | 意義 |
+| Key | Default | Meaning |
 |---|---|---|
-| `dev_idle_threshold_secs` | `3600` | 單一 agent 的 idle 閾值 |
-| `fleet_idle_threshold_secs` | `1800` | 整體 fleet 的 idle 閾值 |
-| `hang_auto_recovery_enabled` | `false` | 是否啟用 hang auto-recovery |
+| `dev_idle_threshold_secs` | `3600` | Idle threshold for a single agent |
+| `fleet_idle_threshold_secs` | `1800` | Idle threshold for the fleet as a whole |
+| `hang_auto_recovery_enabled` | `false` | Whether hang auto-recovery is enabled |
 
-### 如何修改
+### How to change it
 
-透過 MCP `config` 工具：
+Use the MCP `config` tool:
 
 - `config get`
 - `config set`
 - `config list`
 
-也就是說，這不是一個通常要手改的檔案。
+This is not usually a file you edit by hand.
 
-### 失敗語意
+### Failure behavior
 
-- key 不存在 → error
-- 整數 / 布林 parse 失敗 → error
-- JSON 解析失敗 → 預設值
+- unknown key → error
+- integer parse failure → error
+- boolean parse failure → error
+- JSON parse failure → fall back to defaults
 
-這意味著：runtime config 壞掉時，daemon 不會停；它會回到預設值。
+That means a broken runtime config does not usually crash the daemon. It falls back to defaults.
 
-### 什麼時候適合用它
+### When to use it
 
-- 調整 watchdog 閾值。
-- 暫時拉高 fleet idle 閾值。
-- 開關 hang auto-recovery shadow/active。
+- adjust watchdog thresholds
+- temporarily raise fleet idle thresholds
+- enable or disable hang auto-recovery shadow behavior
 
-### 不適合放什麼
+### What not to put here
 
-- fleet 結構
-- agent 身分
-- backend 路徑
-- 任何需要審核的長期政策
+- fleet structure
+- agent identity
+- backend paths
+- long-term policy that should go through review
 
-## `DaemonConfig`：進程內旗標
+## `DaemonConfig`
 
-`src/daemon_config.rs` 的設定是 process-wide，但不是持久化檔。
+`src/daemon_config.rs` contains process-wide runtime flags.
 
-### 現有欄位
+### Current field
 
 - `pointer_only_inject`
 
-### 來源
+### Source
 
-- `AGEND_POINTER_ONLY_INJECT=1` 會開啟
-- 沒有就預設 `false`
+- `AGEND_POINTER_ONLY_INJECT=1` turns it on
+- otherwise the default is `false`
 
-### 用途
+### Use case
 
-這類設定是 daemon startup 時讀一次，
-適合控制特定注入策略或暫時性實驗旗標。
+This is appropriate for startup-time feature flags or experiment toggles that should not live on disk.
 
-### 注意事項
+### Important note
 
-- 它不會寫回磁碟。
-- 它不會自動跟 fleet.yaml 同步。
-- 如果你要長期保存，應該把需求落到正式設定檔或 MCP config。
+- it is not persisted
+- it is not automatically synchronized with `fleet.yaml`
+- if you want a long-lived policy, use a real config file or the MCP config path
 
-## MCP config：各 backend 的派生設定
+## MCP config: derived settings for each backend
 
-`src/mcp_config.rs` 負責為 backend 生成對應的 MCP 設定檔。
+`src/mcp_config.rs` generates backend-specific MCP configs.
 
-### 設定範圍
+### Scope rule
 
-這裡有一條硬規則：
+There is a hard rule here:
 
-- 寫入只能落在 `$AGEND_HOME` 或專案工作目錄。
-- 不碰使用者全域的 CLI 設定目錄。
+- writes must stay inside `$AGEND_HOME` or the project working directory
+- do not mutate the user's global CLI config directories
 
-也就是說，不要讓程式去改 `~/.claude`、`~/.codex`、`~/.gemini` 之類的個人設定。
+In other words, do not write to `~/.claude`, `~/.codex`, `~/.gemini`, or similar personal settings directories.
 
-### 生成內容
+### What gets generated
 
-產出的 MCP config 會帶上：
+The generated MCP config includes:
 
 - `AGEND_HOME`
-- 某些情況下的 `AGEND_INSTANCE_NAME`
-- bridge binary 的路徑
+- sometimes `AGEND_INSTANCE_NAME`
+- the bridge binary path
 
-### 常見輸出位置
+### Common output paths
 
-視 backend 而定，常見包括：
+Depending on the backend, generated files commonly include:
 
 - `.claude/settings.local.json`
 - `mcp-config.json`
 - `.kiro/settings/mcp.json`
 
-其他 backend 也會有對應的 project-local 設定檔。
+Other backends have their own project-local configuration targets as well.
 
-### 備援與錯誤處理
+### Recovery and error handling
 
-- JSON 破損時，會先備份成 `.corrupt.<timestamp>`。
-- 然後從空物件重新開始。
-- 這跟 `runtime-config.json` 的 silent default 不同；MCP config 會盡量保留一份備份。
+- malformed JSON is backed up to a `.corrupt.<timestamp>` file
+- the generator then starts from an empty object
+- unlike `runtime-config.json`, the MCP path prefers backup-first recovery when the existing file is broken
 
-### 為什麼是派生檔
+### Why this is a derived layer
 
-MCP config 的真相其實是：
+The real source of truth is:
 
-- `fleet.yaml` 裡的 instance 定義
+- the fleet instance definition
 - `AGEND_HOME`
-- 當前 binary 路徑
+- the current binary path
 
-MCP config 只是把這些來源轉成 backend 需要的格式。
+The MCP config is just the backend-specific rendering of those inputs.
 
-## `service` artifact 也是派生設定
+## Service artifacts are also derived
 
-service 產物不是來源檔，而是由 install 命令根據目前 binary 與 `AGEND_HOME` render 出來的。
+The service output is not a source file. It is rendered from the current binary and `AGEND_HOME`.
 
-| 平台 | 產物 |
+| Platform | Artifact |
 |---|---|
 | macOS | plist |
 | Linux | systemd user unit |
 | Windows | Task Scheduler XML |
 
-如果 binary moved / repathed，重跑 `service install` 才會更新。
+If the binary path changes, re-run `service install` so the artifact is regenerated.
 
-## 設定錯誤時的典型反應
+## What happens when a config layer breaks
 
-### `fleet.yaml` 壞掉
+### Broken `fleet.yaml`
 
-- `doctor` 會報 parse error。
-- daemon 可能無法正常啟動。
-- 先用 `bugreport` 取快照，再修檔。
+- `doctor` reports a parse error
+- the daemon may fail to start cleanly
+- use `bugreport` first, then fix the file
 
-### `runtime-config.json` 壞掉
+### Broken `runtime-config.json`
 
-- daemon 會回到 default values。
-- 不一定會立刻看到 crash。
-- 這類問題通常要看 log 或 `doctor` 的結果。
+- the daemon falls back to default values
+- the problem may not be obvious immediately
+- inspect logs or `doctor` output if the behavior looks wrong
 
-### `mcp` 設定檔壞掉
+### Broken MCP config
 
-- 會備份舊檔。
-- 重新產生新的派生檔。
-- 如果 backend 行為怪異，先確認是不是 config 被重寫。
+- the old file is backed up
+- a new derived file is written
+- if backend behavior is weird, verify whether a generated config was rewritten
 
-### `service` artifact 壞掉
+### Broken service artifact
 
-- `service status` 可能顯示 `stopped`。
-- 重新 `service install` 通常比手修 artifact 快。
+- `service status` may say `stopped`
+- re-running `service install` is usually faster than hand-editing the artifact
 
-## 建議的操作順序
+## Recommended order of operations
 
-### 新機器 / 新安裝
+### New machine or fresh install
 
-1. 設好 `AGEND_HOME` 或接受預設。
-2. 準備 `.env`。
-3. 編輯 `fleet.yaml`。
-4. 跑 `service install`。
-5. 跑 `doctor`。
+1. Set `AGEND_HOME` or accept the default.
+2. Prepare `.env`.
+3. Edit `fleet.yaml`.
+4. Run `service install`.
+5. Run `doctor`.
 
-### 想調整 idle / watchdog 閾值
+### Adjusting idle / watchdog thresholds
 
-1. 用 `config set` 改 `runtime-config.json`。
-2. 等下一個 tick。
-3. 用 `doctor` 或看 event / log 驗證。
+1. Change the runtime values with `config set`.
+2. Wait for the next daemon tick.
+3. Verify with `doctor` or the event log.
 
-### 想改某個 agent 的行為
+### Changing an agent's behavior
 
-1. 改 `fleet.yaml` 的 instance 欄位。
-2. 若涉及 backend 設定，讓 MCP config 重新生成。
-3. 必要時重裝 service。
+1. Edit the instance fields in `fleet.yaml`.
+2. Regenerate backend MCP settings if needed.
+3. Reinstall the service if the binary path changed.
 
-### 想追問題
+### Tracking a problem
 
-1. 先跑 `doctor`。
-2. 再跑 `bugreport`。
-3. 若是 backend 互動問題，再考慮 `capture`。
+1. Run `doctor`.
+2. Run `bugreport`.
+3. If the issue is backend interaction, consider `capture` next.
 
-## 常見誤區
+## Common misunderstandings
 
-### 把 MCP config 當主設定
+### Treating MCP config as the primary source
 
-錯。它是派生檔，會被重寫。
+Wrong. It is derived and will be overwritten.
 
-### 把 runtime-config 當 fleet 配置
+### Treating runtime config as fleet configuration
 
-錯。它只管 live threshold 類的數值。
+Wrong. It only controls live tunables.
 
-### 手改 daemon-managed 欄位後期待永久保留
+### Expecting daemon-managed fields to survive manual edits forever
 
-錯。那些欄位會被 daemon 重寫。
+Wrong. Those values are overwritten by design.
 
-### 把空集合和 `null` 當同一件事
+### Treating empty collections and `null` as the same thing
 
-錯。很多欄位的語意剛好相反。
+Wrong. For many fields they mean opposite things.
 
-## 對應原始碼
+## Source pointers
 
-- `src/main.rs`：`AGEND_HOME`、CLI default path、`Doctor` / `Service`
-- `src/fleet.rs`：`FleetConfig`、`InstanceYamlEntry`、欄位 merge 規則
-- `src/runtime_config.rs`：runtime-config 讀寫與 tick reload
-- `src/daemon_config.rs`：process-wide runtime flags
-- `src/mcp_config.rs`：backend MCP config 生成
-- `src/store.rs`：lock、atomic write、corrupt backup
-- `src/service/*`：service manager artifact 生成
-- `src/bugreport.rs`：diagnostic report 打包
-- `src/capture.rs`：capture 與 promote 產物
+- `src/main.rs`: `AGEND_HOME`, CLI defaults, `Doctor` and `Service`
+- `src/fleet.rs`: `FleetConfig`, `InstanceYamlEntry`, field merge rules
+- `src/runtime_config.rs`: runtime-config read/write and tick reload
+- `src/daemon_config.rs`: process-wide runtime flags
+- `src/mcp_config.rs`: backend MCP config generation
+- `src/store.rs`: file locking, atomic writes, corrupt-file backup behavior
+- `src/service/*`: service artifact generation
+- `src/bugreport.rs`: diagnostic report generation
+- `src/capture.rs`: capture and promote output
 
-## 實務建議
+## Practical advice
 
-1. 長期政策放 `fleet.yaml`，不要塞進 runtime config。
-2. 短期 tuning 放 `runtime-config.json`，不要硬改 source code。
-3. 任何會被派生的設定，都要保留原始來源。
-4. 看到疑似設定污染，先看 `bugreport`，再看派生檔是不是被重寫。
-5. 記住一句話：**主來源可編輯，派生檔可重建。**
-
+1. Put long-term policy in `fleet.yaml`, not in runtime config.
+2. Put temporary tuning values in `runtime-config.json`, not in source code.
+3. Keep the original source whenever a file is generated from it.
+4. If you suspect config pollution, inspect `bugreport` first and then check whether a derived file was rewritten.
+5. Remember the rule: **source files are editable, derived files are rebuildable.**

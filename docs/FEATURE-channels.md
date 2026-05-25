@@ -1,23 +1,23 @@
-# Channels — Telegram / Discord 整合
+# Channels — Telegram / Discord Integration
 
-Channels 系統讓操作者直接在 Telegram 或 Discord 中與 agent 互動，不需要開啟終端。每個 agent 對應一個 Telegram forum topic，訊息自動雙向同步。
+The Channels system lets operators talk to agents from Telegram or Discord without opening a terminal. Each agent maps to its own Telegram forum topic, and messages are mirrored bidirectionally.
 
-## 設計理念
+## Design Goals
 
-多 agent 團隊工作時，操作者需要一個隨時隨地都能觸及 agent 的管道。Channels 提供：
+When a team is working with multiple agents, the operator needs a communication path that is always available. Channels provides:
 
-- **雙向通訊**：在 Telegram topic 中發訊息，agent 收到；agent 回覆，Telegram 中看到
-- **一對一映射**：每個 agent 有自己的 topic，對話不會混在一起
-- **平台無關抽象**：核心程式碼不依賴特定平台，透過 Channel trait 適配不同服務
-- **自動設定**：daemon 啟動時自動建立缺少的 topic，不需手動設定
+- **Bidirectional messaging**: post in a Telegram topic and the agent receives it; the agent replies and the operator sees it in the same topic.
+- **One topic per agent**: conversations stay isolated instead of collapsing into one shared stream.
+- **Platform-agnostic core**: the main code does not depend on Telegram specifics; it talks through a Channel trait.
+- **Automatic setup**: the daemon creates missing topics at startup, so there is no manual bootstrap step.
 
 ---
 
-## 快速開始
+## Quick Start
 
-### 1. 設定 Telegram Bot
+### 1. Configure Telegram Bot
 
-在 `fleet.yaml` 中加入 channel 設定：
+Add the channel config to `fleet.yaml`:
 
 ```yaml
 channel:
@@ -25,255 +25,187 @@ channel:
     bot_token: "123456:ABC-DEF..."
     group_id: -1001234567890
     user_allowlist:
-      - 12345678    # 你的 Telegram user ID
+      - 12345678    # your Telegram user ID
 ```
 
-- `bot_token`：從 @BotFather 取得
-- `group_id`：Telegram 群組 ID（必須是已啟用 Topics 的超級群組）
-- `user_allowlist`：允許與 agent 互動的 Telegram user ID 列表
+- `bot_token`: obtained from @BotFather
+- `group_id`: Telegram supergroup ID (must have Topics enabled)
+- `user_allowlist`: Telegram user IDs allowed to interact with agents
 
-### 2. 啟動 daemon
+### 2. Start the daemon
 
 ```bash
 agend-terminal start
 ```
 
-Daemon 啟動時會自動：
-1. 讀取 `fleet.yaml` 的 channel 設定
-2. 載入 `topics.json`（topic ID ↔ agent 名稱的映射）
-3. 為缺少 topic 的 agent 自動建立 Telegram forum topic
-4. 建立 fleet binding topic（跨 agent 的團隊事件通知）
-5. 開始輪詢收取訊息
+On startup the daemon will:
 
-### 3. 開始對話
+1. Load the channel settings from `fleet.yaml`.
+2. Load `topics.json` (the topic ID ↔ agent mapping).
+3. Create missing Telegram forum topics for agents that do not have one yet.
+4. Create the fleet binding topic for cross-agent and team-wide notifications.
+5. Start polling for incoming messages.
 
-在 Telegram 群組中找到對應 agent 名稱的 topic，直接打字即可。Agent 會在該 topic 中回覆。
+### 3. Start chatting
+
+Open the agent's topic in the Telegram group and just type. The agent will answer in the same topic.
 
 ---
 
-## 核心概念
+## Core Concepts
 
 ### Channel Trait
 
-所有 channel 實作共用同一個 trait 介面：
+All channel implementations share one trait interface:
 
-| 方法 | 說明 |
-|------|------|
-| `send` | 發送訊息到指定 binding |
-| `edit` | 編輯已發送的訊息 |
-| `delete` | 刪除訊息 |
-| `create_binding` | 為 agent 建立頻道綁定 |
-| `remove_binding` | 移除綁定 |
-| `create_topic` | 建立新的 forum topic |
-| `poll_event` | 輪詢收取新訊息 |
+| Method | Meaning |
+|---|---|
+| `send` | Send a message to a binding |
+| `edit` | Edit a previously sent message |
+| `delete` | Delete a message |
+| `create_binding` | Create a channel binding for an agent |
+| `remove_binding` | Remove a binding |
+| `create_topic` | Create a new forum topic |
+| `poll_event` | Poll for incoming events |
 
-核心程式碼只透過 trait 操作，不直接呼叫 Telegram API。新增 Discord 或 Slack 支援只需實作這個 trait。
+The core code only talks to the trait. It never calls Telegram APIs directly. If we add Discord or another backend later, it only needs to implement this trait.
 
-### Binding（綁定）
+### Binding
 
-Binding 是 agent 與 channel 之間的連結。每個 binding 包含平台特定的定址資訊（例如 Telegram topic ID），但核心程式碼不需要知道這些細節——binding 是不透明的（opaque）。
+A binding links an agent to a channel-specific address such as a Telegram topic ID. The core code treats the binding as opaque.
 
-```
+```text
 agent "dev" ← binding → Telegram topic #42
 agent "reviewer" ← binding → Telegram topic #43
 ```
 
-### Capabilities（能力矩陣）
+### Topics and Registry
 
-每個 channel 宣告自己支援的功能，核心程式碼據此決定降級行為：
+The daemon keeps a registry of topics so it can reconcile what is live in Telegram with what is known on disk. That registry is the source of truth for topic routing, while the topic itself is the operator-visible conversation surface.
 
-| 能力 | Telegram | Discord |
-|------|----------|---------|
-| 原生討論串 | 是（forum topics） | 是（threads） |
-| Markdown | MarkdownV2 | Discord Markdown |
-| 附件上傳 | 是 | 是 |
-| 訊息編輯 | 是 | 是 |
-| Emoji 反應 | 是 | 是 |
-| 打字指示器 | 是 | 是 |
-| 訊息長度上限 | 4096 bytes | 2000 chars |
-| 刪除事件 | 否 | 是 |
+### Inbound vs Outbound
 
-不支援的功能會靜默降級，不會報錯。
+Channels handles two directions:
+
+- **Inbound**: operator or external events flow into the daemon, then into the agent.
+- **Outbound**: the agent's reply is mirrored back to the same channel surface.
+
+The code path is symmetric enough that debugging either side usually starts from the same topic entry and binding record.
 
 ---
 
-## Topics 映射
+## Telegram Behaviour
 
-### topics.json
+### Topic creation
 
-Agent 與 Telegram topic 的映射關係持久化在 `topics.json`：
+If an agent has no topic yet, the daemon will create one automatically when the channel is enabled. This keeps fleet bootstrap simple: configure the bot, start the daemon, and let the registry populate itself.
 
-```json
-{
-  "42": "dev",
-  "43": "reviewer",
-  "100": "general",
-  "500": "__fleet__"
-}
-```
+### Topic cleanup
 
-- Key 是 Telegram forum topic ID（字串化的數字）
-- Value 是 agent 的 instance name
-- `__fleet__` 是保留的 sentinel，用於跨 agent 的團隊事件通知
+If the registry and the actual Telegram state drift apart, `doctor topics` can detect and optionally clean up orphan entries. See `docs/FEATURE-diagnostics.md` for the operator-facing diagnostic flow.
 
-### 自動建立 Topic
+### Permission boundary
 
-Daemon 啟動時，對每個在 `fleet.yaml` 中定義但在 `topics.json` 中沒有對應 topic 的 agent，自動建立 forum topic。
-
-TUI 中透過 `Ctrl+B c` 新增 agent 時，也會自動建立 topic 並註冊。
-
-### 孤兒 Topic 清理
-
-使用 `doctor topics` 命令檢查和清理孤兒 topic：
-
-```bash
-# 檢查 topic 狀態
-agend-terminal doctor topics
-
-# 清理孤兒 topic
-agend-terminal doctor topics --cleanup
-```
-
-Topic 分為兩類：
-- **Live**：在 `topics.json` 和 `fleet.yaml` 中都存在
-- **Orphan**：在 `topics.json` 中存在但 `fleet.yaml` 中沒有（agent 已刪除但 topic 未清理）
+Topic cleanup that mutates the chat requires the bot to have `can_manage_topics`. If that permission is missing, the daemon will keep the topic in the report and skip the chat-side delete.
 
 ---
 
-## 訊息流程
+## Discord Notes
 
-### 收訊（Telegram → Agent）
+The docs mention Discord because the channel abstraction is not Telegram-only in spirit. The current implementation centers on Telegram, but the abstractions are designed so another platform can be added by implementing the same trait surface.
 
-```
-1. 使用者在 Telegram forum topic 中發送訊息
-2. 輪詢執行緒偵測到新訊息，取得 topic_id
-3. 透過 topic_to_instance 映射解析目標 agent
-4. 訊息寫入 agent 的收件匣
-5. Agent 呼叫 inbox 工具讀取完整訊息
-```
+If a future Discord backend is added, the main expectations are the same:
 
-### 發訊（Agent → Telegram）
-
-```
-1. Agent 呼叫 reply MCP 工具
-2. 去重檢查：相同內容在 5 秒內不重複發送
-3. 查詢 instance_to_topic 取得目標 topic_id
-4. 透過 Telegram Bot API 發送訊息
-5. 記錄 message_id 供後續編輯/刪除使用
-```
-
-### Mirror Skip（防重複）
-
-Agent 的回覆會同時出現在 Telegram topic 和 PTY 終端輸出中。為避免 PTY mirror 把 agent 自己的回覆又轉發一次，系統在發送前設定 `mirror_skip_until_next_turn` 旗標。這個旗標會在下一輪使用者輸入時自動重置。
+- each agent needs a stable addressable conversation target
+- messages must round-trip without losing thread identity
+- registry state must be persisted so the daemon can recover after restart
 
 ---
 
-## 去重機制
+## Common Workflows
 
-防止以下 race condition 造成重複訊息：
+### Operator sends a message
 
-- App 和 daemon 同時輪詢 CI watch，各發一次通知
-- PTY mirror 和 reply 工具同時發送相同內容
-- 重試邏輯未充分保護的發送路徑
+1. Open the agent's topic.
+2. Type the message.
+3. The daemon receives it, routes it to the agent, and mirrors the agent's response back to the same topic.
 
-去重使用內容雜湊 + TTL 視窗（預設 5 秒）：
+### Agent replies to operator
 
-```yaml
-# fleet.yaml 可調整 TTL
-channel:
-  dedup_ttl_secs: 5
-```
+1. The agent emits a response through the channel layer.
+2. The daemon posts or edits the corresponding Telegram message.
+3. The operator sees the reply in context, with the topic history preserved.
 
-相同的 (instance, topic, content hash) 在 TTL 內只會發送一次。記憶體上限 1024 筆，使用插入順序的 LRU 策略。
+### Diagnose drift
+
+If topics seem to exist in Telegram but not in the daemon registry:
+
+1. Run `agend-terminal doctor topics`.
+2. Check whether entries are `live` or `orphan`.
+3. Use `--cleanup` only after you confirm the action set.
 
 ---
 
-## 通知閘門
+## Example Config
 
-Agent 的對外通知（CI 狀態、任務完成等）預設關閉（fail-closed）。必須在 `fleet.yaml` 中設定 `user_allowlist` 才會啟用：
+A minimal working setup looks like this:
 
 ```yaml
 channel:
   telegram:
-    user_allowlist:
-      - 12345678
+    bot_token_env: AGEND_BOT_TOKEN
+    group_id: -1001234567890
+    user_allowlist: [123456789]
 ```
 
-未設定時，所有對外通知靜默丟棄，不會報錯。這防止未設定的 bot 意外將資訊洩漏到未授權的群組。
+Then export the token:
 
----
-
-## Fleet Binding Topic
-
-fleet binding 是一個特殊的 topic，用於顯示跨 agent 的團隊事件：
-
-| 事件類型 | 格式 |
-|----------|------|
-| 任務委派 | `[lead → dev] DELEGATE 修復 #1177 (#t-...)` |
-| 結果回報 | `[dev → lead] REPORT PR 已建立 (#t-...)` |
-| 決策發布 | `[lead] DECISION 使用 prefix match (#d-...)` |
-| 廣播 | `[lead → 3 agents] BROADCAST merge freeze` |
-
-操作者可以在一個 topic 中看到整個團隊的活動概覽，不需要逐一檢查每個 agent 的 topic。
-
----
-
-## 自我修復
-
-### Topic 被刪除
-
-如果 Telegram topic 被意外刪除（管理員操作或 API 錯誤），系統會自動：
-
-1. 偵測到 topic-deleted 錯誤
-2. 清除無效的 topic 映射
-3. 重新建立 topic
-4. 重試發送
-
-### 超級群組遷移
-
-Telegram 群組升級為超級群組時，`group_id` 會改變。系統偵測到 `MigrateToChatId` 錯誤後：
-
-1. 讀取新的 chat ID
-2. 更新 `fleet.yaml` 中的 `group_id`
-3. 重試發送
-
-這兩種情況都不需要操作者介入。
-
----
-
-## 多 Channel 支援
-
-目前支援 Telegram，Discord 為預留介面（feature gate）。架構設計支援同時使用多個 channel：
-
-- 每個 channel 獨立註冊在全域 registry 中
-- 每個 agent 可以綁定到不同的 channel
-- 收訊事件由 dispatcher 統一合併
-- 發訊根據 binding 的 channel kind 路由到正確的 adapter
-
----
-
-## 疑難排解
-
-### Bot 收不到訊息
-
-1. 確認 bot 已加入群組且有讀取權限
-2. 確認群組已啟用 Topics（設定 → Topics → 開啟）
-3. 確認 `user_allowlist` 包含你的 Telegram user ID
-4. 檢查 daemon 日誌中的 channel 初始化訊息
-
-### Topic 沒有自動建立
-
-1. 確認 bot 有 `can_manage_topics` 權限（群組管理員設定）
-2. 執行 `agend-terminal doctor topics` 檢查狀態
-3. 檢查 `topics.json` 中的現有映射
-
-### 訊息重複
-
-調整去重 TTL：
-
-```yaml
-channel:
-  dedup_ttl_secs: 10    # 加大視窗
+```bash
+export AGEND_BOT_TOKEN="123456:abcdef..."
 ```
 
-如果問題持續，檢查是否有多個 daemon 實例同時運行。
+If you want the operator to see the topic map in a group chat, make sure the group has Topics enabled and the bot has the permissions needed to create and manage topics.
+
+---
+
+## Troubleshooting
+
+### The agent never receives messages
+
+Check the following in order:
+
+- `fleet.yaml` has a valid `channel.telegram` block
+- the bot token env var is exported
+- the group ID is correct and the bot is inside the group
+- the topic mapping exists in `topics.json`
+- the daemon is actually running and polling
+
+### The topic exists but replies do not appear
+
+This usually means one of two things:
+
+- the binding points at the wrong topic ID
+- the daemon can receive but cannot post back because of a permission or API failure
+
+### `doctor topics` reports orphans
+
+That means the registry and the live chat state have diverged. Usually the right fix is to run cleanup with the correct permissions, not to hand-edit the registry blindly.
+
+---
+
+## Source Pointers
+
+- `src/channel/telegram.rs`: Telegram channel implementation
+- `src/bootstrap/doctor_topics.rs`: topic classification and cleanup logic
+- `src/cli.rs`: `doctor topics` CLI flow
+- `src/main.rs`: subcommand routing and entry points
+- `src/fleet.rs`: fleet and instance metadata, including topic fields
+
+---
+
+## Practical Advice
+
+1. Treat the topic registry as state, not as a cache.
+2. Always verify permissions before attempting cleanup.
+3. Keep one topic per agent unless you have a specific reason to deviate.
+4. Use `doctor topics` when the visible chat state and the daemon's state stop matching.

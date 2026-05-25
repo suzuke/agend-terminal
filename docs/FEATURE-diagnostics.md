@@ -1,72 +1,72 @@
-# 診斷與取證：`agend-terminal doctor / bugreport / capture`
+# Diagnostics and Evidence: `agend-terminal doctor / bugreport / capture`
 
-這份文件整理所有「先觀察、再判斷、最後再修」的診斷入口。
+This document groups the operator-facing tools that help you inspect the system before you change it.
 
-它們共同的原則很簡單：
+The shared rule is simple:
 
-- 預設不改狀態。
-- 需要改狀態時，會先把可見輸出印給操作員。
-- 能紅就紅，能警告就警告，不會悄悄幫你修掉。
+- default to read-only
+- when state changes are allowed, show the operator the output first
+- fail loudly or warn loudly instead of silently "fixing" things
 
-## 功能總覽
+## Feature overview
 
-| 命令 | 目的 | 預設是否改狀態 |
+| Command | Purpose | Changes state by default? |
 |---|---|---|
-| `doctor` | 全域健康檢查 | 否 |
-| `doctor topics` | Telegram topic 狀態診斷 | 否；`--cleanup` 才會改 |
-| `bugreport` | 匯出可附帶回報的診斷檔 | 否 |
-| `capture backend` | 擷取 backend PTY 內容 | 是，寫 capture 檔 |
-| `capture promote` | 把 capture 提升成 fixture | 是，寫 fixture / manifest |
+| `doctor` | Global health check | No |
+| `doctor topics` | Telegram topic diagnostic | No; only `--cleanup` mutates |
+| `bugreport` | Produce a report bundle for issue filing | No |
+| `capture backend` | Capture raw backend PTY output | Yes, it writes a capture file |
+| `capture promote` | Turn a capture into a fixture | Yes, it writes fixture and manifest files |
 
-這幾個入口對應到不同場景：
+These commands map to different questions:
 
-- `doctor`：我現在這台機器是不是健康？
-- `doctor topics`：Telegram topic 有沒有孤兒或缺失？
-- `bugreport`：我要把現在的狀態打包給別人看。
-- `capture`：我要留下可重播的原始輸出。
+- `doctor`: is this machine healthy right now?
+- `doctor topics`: are Telegram topics consistent with the registry?
+- `bugreport`: can I hand this state to someone else?
+- `capture`: do I want raw replayable output?
 
-## `doctor`：全域健康檢查
+## `doctor`: global health check
 
 ```bash
 agend-terminal doctor
 ```
 
-### 它檢查什麼
+### What it checks
 
-`doctor` 會依序印出以下項目：
+`doctor` prints the following checks in order:
 
-1. `AGEND_HOME` 是否存在。
-2. `.env` 是否存在。
-3. `fleet.yaml` 是否存在、是否能 parse、目前有幾個 instance。
-4. 每個 instance 是否能透過 daemon 的 runtime helper 找到活著的 agent。
-5. thread census。
-6. 所有 backend binary 是否在 PATH。
-7. `$AGEND_HOME/bin` 的 helper staleness。
+1. whether `AGEND_HOME` exists
+2. whether `.env` exists
+3. whether `fleet.yaml` exists, parses correctly, and contains instances
+4. whether each instance can be probed through the runtime helper
+5. the thread census
+6. whether backend binaries are present in `PATH`
+7. helper staleness under `$AGEND_HOME/bin`
 
-### 判讀方式
+### How to read the output
 
-`doctor` 的輸出不是「有沒有一切完美」，而是「哪些層壞了」。
+`doctor` is not trying to say "everything is perfect". It is trying to tell you which layer is broken.
 
-常見訊號：
+Common signals:
 
-- `✗ (not found)`：檔案或目錄缺失。
-- `✗ (parse error: ...)`：設定檔已經壞掉。
-- `✗ (port stale)`：agent 名稱還在，但實際 PTY / IPC 可能已死。
-- `✓ (port responsive)`：daemon 看到該 agent 且 probe 成功。
-- `patterns may need update`：backend 版本與我們 calibrate 的版本不一致。
+- `✗ (not found)`: file or directory missing
+- `✗ (parse error: ...)`: config is broken
+- `✗ (port stale)`: the agent name exists but the PTY or IPC endpoint looks dead
+- `✓ (port responsive)`: daemon sees the agent and the probe succeeded
+- `patterns may need update`: backend version and calibrated version do not match
 
-### `doctor` 不做的事
+### What `doctor` does not do
 
-它不會：
+It does not:
 
-- 自動修 fleet.yaml。
-- 自動更新 backend。
-- 自動重啟 daemon。
-- 自動修 helper staleness。
+- auto-repair fleet.yaml
+- auto-update backend binaries
+- restart the daemon
+- auto-rebuild helper binaries
 
-這是故意的。`doctor` 是觀察，不是治療。
+That is intentional. `doctor` observes; it does not heal.
 
-## `doctor topics`：Telegram topic 診斷
+## `doctor topics`: Telegram topic diagnostic
 
 ```bash
 agend-terminal doctor topics
@@ -75,169 +75,169 @@ agend-terminal doctor topics --cleanup --yes
 agend-terminal doctor topics --format json
 ```
 
-### 主要用途
+### What it is for
 
-這個入口用來看 Telegram topic registry 與實際群組聊天室的狀態是否一致。
+This command checks whether the Telegram topic registry still matches the live chat state.
 
-它會把每個 topic 分成兩類：
+The report classifies topics into at least two buckets:
 
-- `live`：資料庫 / registry 與聊天室都還對得上。
-- `orphan`：registry 裡還有，但聊天室狀態已經不一致，或反過來需要清理。
+- `live`: registry and live Telegram state still agree
+- `orphan`: a registry entry or chat topic has drifted and needs cleanup
 
 ### `--cleanup`
 
-`--cleanup` 不是單純的格式開關，而是會真的執行修復：
+`--cleanup` is not a cosmetic option. It performs actual repair work:
 
-1. 先印出診斷結果。
-2. 再要求確認，除非加了 `--yes`。
-3. 依結果對 registry 與聊天室做同步清理。
+1. print the diagnostic report first
+2. ask for confirmation unless `--yes` is set
+3. synchronize registry state and chat-side deletion when allowed
 
-這裡的清理包含兩個面向：
+The cleanup covers both sides of the mismatch:
 
-- registry 更新
-- chat-side delete
+- registry updates
+- chat-side delete operations
 
-### 權限檢查
+### Permission check
 
-`doctor topics` 會先 probe bot 是否有 `can_manage_topics`。
+`doctor topics` probes whether the bot has `can_manage_topics`.
 
-這件事的影響是：
+That affects the cleanup outcome:
 
-- 有權限 → 可以刪聊天室 topic。
-- 沒權限 → 只會跳過，並印出 warn。
+- permission present → chat-side deletion is allowed
+- permission missing → the operation is skipped and reported as a warning
 
-如果 probe 失敗，輸出會傾向保守，避免誤刪。
+If the probe fails, the command stays conservative and avoids destructive guessing.
 
-### JSON 與 human
+### Human vs JSON output
 
 `--format human`
 
-- 多行表格。
-- 適合人在 terminal 直接看。
+- multi-line text table
+- good for direct terminal use
 
 `--format json`
 
-- 給腳本或其他工具 pipe。
-- 適合在外層做自動化 triage。
+- machine-readable output
+- good for piping into scripts or other tooling
 
-### cleanup 動作的回報格式
+### Cleanup reporting
 
-cleanup 後，CLI 會列出每個動作：
+After cleanup, the CLI prints a per-topic result line such as:
 
 - `deleted topic ... — chat + registry`
 - `skipped ... — bot lacks can_manage_topics`
 - `skipped ... — API error: ...`
 
-這讓你知道是「真的修掉了」還是「因為權限或 API 失敗跳過」。
+That makes it obvious whether the fix succeeded or was skipped for permission/API reasons.
 
-## `bugreport`：一鍵匯出診斷包
+## `bugreport`: one-shot diagnostic bundle
 
 ```bash
 agend-terminal bugreport
 ```
 
-### 輸出位置
+### Output location
 
-`bugreport` 會把檔案寫到：
+The report is written to:
 
-- 目前工作目錄
-- 如果目前工作目錄不可用，則退回 `AGEND_HOME`
+- the current working directory, if available
+- otherwise `AGEND_HOME`
 
-檔名格式：
+The filename looks like this:
 
 ```text
 bugreport-YYYYMMDD-HHMMSS.txt
 ```
 
-### 包含哪些內容
+### What it includes
 
-`bugreport` 的內容很適合拿來附在 issue 或回報裡，因為它收了這些章節：
+`bugreport` is designed to be attached to an issue or sent to another operator. It gathers:
 
-1. 版本資訊
+1. version information
 2. `AGEND_HOME`
-3. fleet config（已 redacted token / secret）
-4. schedules.json
+3. fleet config, with secrets redacted
+4. `schedules.json`
 5. daemon status
-6. 最新 snapshot
-7. event log 最後 50 行
-8. 已安裝 backend
-9. 目前 active sockets
-10. `.env`（已 redacted）
+6. the latest snapshot
+7. the last 50 lines of the event log
+8. installed backends
+9. active sockets
+10. `.env`, with secrets redacted
 
-### 為什麼有些內容會 redacted
+### Why some fields are redacted
 
-`bugreport` 會把敏感值遮掉，尤其是：
+The report avoids leaking sensitive values such as:
 
-- token
-- key
-- secret
-- password
-- bearer
-- authorization
-- credential
-- group_id
+- tokens
+- keys
+- secrets
+- passwords
+- bearer tokens
+- authorization data
+- credentials
+- `group_id`
 
-這樣可以在不外洩敏感資訊的前提下，把狀態完整附上。
+That keeps the report shareable without exposing private material.
 
-### `bugreport` 與 `doctor` 的差別
+### `bugreport` vs `doctor`
 
-- `doctor`：現場即時健康摘要。
-- `bugreport`：可分享的靜態快照。
+- `doctor` is an instant health summary.
+- `bugreport` is a shareable snapshot.
 
-如果你要把問題交給別人看，通常先跑 `bugreport`，再附上 `doctor` 的輸出會更完整。
+If you plan to hand the problem off to someone else, start with `bugreport`, then add the `doctor` output if needed.
 
-## `capture backend`：抓 backend 原始輸出
+## `capture backend`: capture raw backend output
 
 ```bash
 agend-terminal capture backend --backend claude --seconds 15
 ```
 
-### 目的
+### Purpose
 
-這個命令是為了把 backend PTY 的原始輸出留下來，讓你可以：
+This command preserves raw PTY output so you can:
 
-- 做 fixture。
-- 做 replay。
-- 重現某個 shell / backend 的行為。
+- build fixtures
+- replay a session later
+- compare real backend behavior across providers
 
-### 行為
+### Behavior
 
-`capture backend` 會：
+`capture backend`:
 
-1. 起一個對應 backend 的 agent。
-2. 在指定秒數內持續讀取 PTY。
-3. 把 bytes 寫到 capture 檔。
-4. 結束時寫出 `.meta.json` sidecar。
+1. spawns an agent for the selected backend
+2. reads PTY bytes for the requested duration
+3. writes them to a capture file
+4. writes a `.meta.json` sidecar on drop
 
-### 捕獲檔位置
+### Capture layout
 
-預設落在：
+By default the output lands at:
 
 ```text
 $AGEND_HOME/captures/<agent>/<epoch_ms>.cap
 ```
 
-對應 sidecar：
+The companion sidecar is:
 
 ```text
 $AGEND_HOME/captures/<agent>/<epoch_ms>.cap.meta.json
 ```
 
-### 何時使用
+### When to use it
 
-適合以下情境：
+Use this when you want to:
 
-- 你想重播某個 backend 的 prompt / response 序列。
-- 你要建立 fixture corpus。
-- 你要比較不同 backend 的實際輸出差異。
+- reproduce backend prompts and responses
+- build the replay corpus
+- compare the real terminal stream from different backends
 
-### 重要限制
+### Important limitations
 
-- `AGEND_CAPTURE_FIXTURES` 沒開時，capture writer 是 no-op。
-- 這個功能是觀測工具，不是 replay 引擎本身。
-- capture 內容是 raw PTY bytes，不是美化過的摘要。
+- if `AGEND_CAPTURE_FIXTURES` is not set, the capture writer is a no-op
+- this feature stores raw PTY bytes, not prettified summaries
+- capture is an observation tool, not a replay engine by itself
 
-## `capture promote`：把 capture 變成可重播 fixture
+## `capture promote`: turn a capture into a replay fixture
 
 ```bash
 agend-terminal capture promote \
@@ -246,18 +246,18 @@ agend-terminal capture promote \
   --scenario-kind silent_stuck
 ```
 
-### 它會做什麼
+### What it does
 
-`promote` 會把一個 `.cap` 檔提升成 canonical fixture，流程是：
+`promote` takes a `.cap` file and turns it into canonical fixture data:
 
-1. 讀 `.cap.meta.json`。
-2. 複製 `.cap` 到 `tests/fixtures/state-replay/<scenario>.raw`。
-3. 在 `tests/fixtures/state-replay/MANIFEST.yaml` 追加一筆條目。
-4. 可選擇做 `auto_replay` 的警告比對。
+1. read the `.cap.meta.json` sidecar
+2. copy the capture into `tests/fixtures/state-replay/<scenario>.raw`
+3. append a manifest entry to `tests/fixtures/state-replay/MANIFEST.yaml`
+4. optionally run an `auto_replay` warning check
 
 ### `scenario_kind`
 
-目前合法值是：
+The current allowed values are:
 
 - `productive_marker_fire`
 - `productive_silence`
@@ -265,67 +265,59 @@ agend-terminal capture promote \
 - `hung`
 - `real_capture`
 
-這個值是 manifest schema 的一部分，不是任意文字。
+This field is part of the manifest schema, not free-form text.
 
 ### `auto_replay`
 
-如果你加 `--auto-replay`，CLI 會把 `scenario_kind` 對應的 hung/not_hung 預期拿來比對。
+If you pass `--auto-replay`, the CLI compares the implied hung / not-hung classification with the one the scenario kind suggests.
 
-注意：
-
-- mismatch 只會 warning，不會回滾 promote。
-- 這是刻意的，因為 operator review 仍是 v1 safety net。
+Important: a mismatch only warns. It does not roll the promotion back.
 
 ### `expected_hung`
 
-這個選項用來做交叉檢查：
+This option is used for cross-checking:
 
-- `silent_stuck` / `hung` 通常期待 `hung`
-- `productive_*` 通常期待 `not_hung`
-- `real_capture` 不做這個比較
+- `silent_stuck` and `hung` should generally map to `hung`
+- `productive_*` should generally map to `not_hung`
+- `real_capture` skips the check
 
-## 檔案與資料來源對照
+## File and data source map
 
-| 命令 | 主要讀取 | 主要寫入 |
+| Command | Main read path | Main write path |
 |---|---|---|
-| `doctor` | `fleet.yaml`、`$AGEND_HOME/bin`、runtime probe | 無 |
-| `doctor topics` | Telegram channel / registry | 可選：registry + 聊天室刪除 |
-| `bugreport` | `fleet.yaml`、`schedules.json`、snapshot、event log、`.env` | `bugreport-*.txt` |
+| `doctor` | `fleet.yaml`, `$AGEND_HOME/bin`, runtime probes | none |
+| `doctor topics` | Telegram channel / registry state | optional registry + chat cleanup |
+| `bugreport` | `fleet.yaml`, `schedules.json`, snapshot, event log, `.env` | `bugreport-*.txt` |
 | `capture backend` | backend PTY | `$AGEND_HOME/captures/.../*.cap` + `.meta.json` |
 | `capture promote` | `.cap` + `.meta.json` | `tests/fixtures/state-replay/*.raw` + `MANIFEST.yaml` |
 
-## 典型工作流程
+## Typical workflows
 
-### 1. 先做健康檢查
+### 1. Run a health check first
 
 ```bash
 agend-terminal doctor
 ```
 
-看出來是：
+Use it to see whether the issue is in the file layer, the backend binaries, helper staleness, or an agent that has gone stale.
 
-- file 層壞了
-- backend 不在 PATH
-- helper staleness
-- agent port stale
-
-### 2. 若是 Telegram topic 問題
+### 2. If the problem is Telegram topics
 
 ```bash
 agend-terminal doctor topics --format json
 ```
 
-先看哪些是 orphan，再決定要不要 cleanup。
+Look for orphan entries before deciding whether to clean anything up.
 
-### 3. 若要回報 issue
+### 3. If you need to hand the problem off
 
 ```bash
 agend-terminal bugreport
 ```
 
-把產出的檔案貼到 issue 或附檔。
+Attach the generated file to the issue or send it along to the next operator.
 
-### 4. 若要新增 replay fixture
+### 4. If you want a replay fixture
 
 ```bash
 export AGEND_CAPTURE_FIXTURES=1
@@ -333,41 +325,38 @@ agend-terminal capture backend --backend claude --seconds 20
 agend-terminal capture promote <cap> <name> --scenario-kind silent_stuck
 ```
 
-## 常見誤區
+## Common mistakes
 
-### 把 `doctor` 當修復工具
+### Treating `doctor` like a repair tool
 
-不對。`doctor` 是觀察與列舉問題，不是自動修復。
+It is not. `doctor` reports what is broken; it does not change it.
 
-### 忽略 `doctor topics` 的 permission probe
+### Ignoring the `doctor topics` permission probe
 
-如果 bot 沒有 `can_manage_topics`，cleanup 會保守跳過。
-不要把這當成程式沒壞；多半是權限不足。
+If the bot lacks `can_manage_topics`, cleanup will intentionally skip the chat mutation step.
+That is not a bug; it is a permissions problem.
 
-### 把 bugreport 當完整安全備份
+### Treating bugreport as a backup archive
 
-它是診斷包，不是 restore 檔。
-你可以靠它看出狀態，但不要拿它當正式的資料備份。
+It is a diagnostic bundle, not a restore format.
 
-### 把 capture 當 fixture 的最終版本
+### Treating capture as a finished fixture
 
-`capture backend` 只負責抓原始資料。
-要讓 replay harness 看得到，還要 `capture promote`。
+`capture backend` only creates the raw material. You still need `capture promote` to move it into the replay corpus.
 
-## 對應原始碼
+## Source pointers
 
-- `src/cli.rs`：`run_doctor`、`run_doctor_topics`、`capture_backend`
-- `src/main.rs`：CLI subcommand routing
-- `src/bugreport.rs`：bugreport 內容與 redaction
-- `src/capture.rs`：capture sink、rotation、promote
-- `src/bootstrap/doctor_topics.rs`：topic classification 與 cleanup
-- `src/bootstrap/doctor.rs`：fleet health validation
+- `src/cli.rs`: `run_doctor`, `run_doctor_topics`, `capture_backend`
+- `src/main.rs`: CLI subcommand routing
+- `src/bugreport.rs`: report generation and redaction
+- `src/capture.rs`: capture sink, rotation, and promotion
+- `src/bootstrap/doctor_topics.rs`: topic classification and cleanup
+- `src/bootstrap/doctor.rs`: fleet validation logic
 
-## 實務建議
+## Practical advice
 
-1. 遇到 agent staleness，先跑 `doctor`，不要直接刪檔。
-2. Telegram topic 問題先看 `doctor topics`，再做 cleanup。
-3. 需要貼給別人看的狀態，優先用 `bugreport`。
-4. 做 capture 時，記得確認 `AGEND_CAPTURE_FIXTURES=1`。
-5. promote 前先看 `scenario_kind`，不要用錯類型造成 manifest 語義錯位。
-
+1. When an agent looks stale, run `doctor` before deleting anything.
+2. For Telegram topic drift, inspect with `doctor topics` before cleanup.
+3. Use `bugreport` when you need a shareable snapshot.
+4. Make sure `AGEND_CAPTURE_FIXTURES=1` is set before trying to capture fixtures.
+5. Check `scenario_kind` carefully before promoting; a wrong kind makes the corpus less useful.

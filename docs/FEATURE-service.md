@@ -1,38 +1,35 @@
-# 服務管理：`agend-terminal service`
+# Service Management: `agend-terminal service`
 
-這份文件說明 `service` 子命令如何把 daemon 交給作業系統管理，
-以及三個平台各自的落點與限制。
+This document explains how the `service` subcommand hands daemon lifecycle management to the operating system, and where each supported platform writes its service artifact.
 
-## 這個功能解決什麼問題
+## What this feature solves
 
-`agend-terminal` 本身可以在前景、背景、TUI 或 daemon 模式運作，
-但若希望它在登入後自動啟動、在 crash 後重新拉起，
-就不能只靠手動執行。
-`service` 提供的是「交給 OS 管理生命周期」這個入口。
+`agend-terminal` can run in the foreground, background, TUI, or daemon mode, but if you want it to start automatically after login and come back up after a crash, you need more than a manual command.
 
-你可以把它理解成兩件事：
+`service` is the entry point that says: "let the OS manage the lifecycle for me."
 
-1. 把目前這個 `agend-terminal` binary 的絕對路徑寫進平台的 service manager。
-2. 讓平台在使用者登入時自動啟動，並在 daemon 掛掉後嘗試重新拉起。
+You can think of it as two steps:
 
-重要前提：
+1. Record the absolute path to the currently running `agend-terminal` binary in the host service manager.
+2. Let the platform start it at login and attempt restarts when the daemon exits unexpectedly.
 
-- 這是 **user-level** 設定，不需要 root / admin。
-- 它不會讓 daemon 自我監督；真正的 supervisor 是 OS 自己。
-- install / uninstall 都是 idempotent，重跑不會破壞既有狀態。
+Important constraints:
 
-## 支援平台
+- This is **user-level** setup. No root or admin is required.
+- The daemon does not supervise itself. The OS is the supervisor.
+- `install` and `uninstall` are idempotent. Re-running them should not damage an existing setup.
 
-| 平台 | 服務管理器 | 輸出位置 | 註冊方式 |
+## Supported platforms
+
+| Platform | Service manager | Artifact path | Registration command |
 |---|---|---|---|
 | macOS | `launchd` | `~/Library/LaunchAgents/com.agend-terminal.daemon.plist` | `launchctl load -w` |
 | Linux | `systemd --user` | `~/.config/systemd/user/agend-terminal-daemon.service` | `systemctl --user enable --now` |
 | Windows | Task Scheduler | `\AgendTerminalDaemon` | `schtasks /Create /XML` |
 
-這三個平台都屬於使用者層級。
-如果你在沒有對應平台工具的環境中執行，`install` 會回報平台不支援。
+If you run this on a platform without the matching helper, `install` will return a platform-not-supported error.
 
-## 三個子命令
+## The three subcommands
 
 ```bash
 agend-terminal service install
@@ -42,261 +39,253 @@ agend-terminal service status
 
 ### `install`
 
-`install` 會做以下事情：
+`install` does the following:
 
-1. 解析目前執行中的 `agend-terminal` binary 絕對路徑。
-2. 依平台套用對應 template，並把路徑與 `AGEND_HOME` 填入。
-3. 寫入平台要求的 artifact。
-4. 呼叫平台 service manager 完成註冊。
+1. Resolves the absolute path to the currently running `agend-terminal` binary.
+2. Renders the platform-specific template with that binary path and `AGEND_HOME`.
+3. Writes the platform artifact.
+4. Invokes the service manager to register and start the service.
 
-如果你重跑 `install`，它會重新產生 template，這對 binary 更新或 `AGEND_HOME` 變動很有用。
+If you run `install` again, it regenerates the template. That is useful after binary upgrades or when `AGEND_HOME` changes.
 
 ### `uninstall`
 
-`uninstall` 會嘗試：
+`uninstall` tries to:
 
-1. 解除註冊。
-2. 刪除對應的 service artifact。
+1. Remove the platform registration.
+2. Delete the artifact file.
 
-如果原本就沒有安裝，這會是 no-op 成功。
+If nothing was installed, it succeeds as a no-op.
 
 ### `status`
 
-`status` 只回答三種結果：
+`status` only reports one of three values:
 
 - `running`
 - `stopped`
 - `not_installed`
 
-注意：`status` 是在查平台 service manager，而不是直接看 daemon 內部狀態。
+It queries the platform service manager, not daemon internals.
 
-## macOS 行為
+## macOS behavior
 
-macOS 使用 `launchd` 的 user agent。
+macOS uses a `launchd` user agent.
 
-### 位置
+### Paths
 
-- plist：`~/Library/LaunchAgents/com.agend-terminal.daemon.plist`
-- label：`com.agend-terminal.daemon`
+- plist: `~/Library/LaunchAgents/com.agend-terminal.daemon.plist`
+- label: `com.agend-terminal.daemon`
 
-### install
+### Install flow
 
-macOS 的流程是：
+macOS install works like this:
 
-1. 先把 template render 成 plist。
-2. 寫入 LaunchAgents 目錄。
-3. 先 `launchctl unload -w`，再 `launchctl load -w`。
+1. Render the plist template.
+2. Write the plist into `LaunchAgents`.
+3. Run `launchctl unload -w` first.
+4. Run `launchctl load -w` next.
 
-這個順序讓重新安裝保持 idempotent。
+That sequence keeps re-installations idempotent.
 
-### status
+### Status flow
 
-判斷邏輯是：
+Status checks are:
 
-- plist 不存在 → `NotInstalled`
-- `launchctl list <label>` 成功，且輸出包含 PID → `Running`
-- plist 存在但未載入或未執行 → `Stopped`
+- plist missing → `NotInstalled`
+- `launchctl list <label>` succeeds and output contains a PID → `Running`
+- plist exists but the agent is not loaded or not running → `Stopped`
 
-### 注意事項
+### Notes
 
-- `launchctl` 失敗時，status 不會誤判成 `running`。
-- 如果 plist 已存在，但 daemon 沒有被 launchd 管理，仍會顯示 `stopped`。
-- `StandardOutPath` / `StandardErrorPath` 已固定為 `/dev/null`；真正的日誌輸出走 daemon tracing。
+- `launchctl` failures do not magically mean the daemon is down. They only tell you the service manager call failed.
+- If the plist exists but launchd is not managing it, status still reports `stopped`.
+- Standard output and standard error are fixed to `/dev/null`; real logs go through the daemon tracing pipeline.
 
-## Linux 行為
+## Linux behavior
 
-Linux 使用 `systemd --user`。
+Linux uses `systemd --user`.
 
-### 位置
+### Paths
 
-- unit：`~/.config/systemd/user/agend-terminal-daemon.service`
-- 若有設定 `XDG_CONFIG_HOME`，會先使用它。
+- unit: `~/.config/systemd/user/agend-terminal-daemon.service`
+- `XDG_CONFIG_HOME` is honored if set.
 
-### install
+### Install flow
 
-Linux 的流程是：
+Linux install does this:
 
-1. render unit template。
-2. 寫入 `~/.config/systemd/user/`。
-3. 執行 `systemctl --user daemon-reload`。
-4. 執行 `systemctl --user enable --now agend-terminal-daemon.service`。
+1. Render the unit template.
+2. Write the unit file into the user-level systemd directory.
+3. Run `systemctl --user daemon-reload`.
+4. Run `systemctl --user enable --now agend-terminal-daemon.service`.
 
-這樣可以同時做到開機後登入自啟，以及立即啟動。
+### Status flow
 
-### status
+Status checks are:
 
-判斷邏輯是：
+- unit file missing → `NotInstalled`
+- `systemctl --user is-active` succeeds → `Running`
+- unit exists but is not active → `Stopped`
 
-- unit 檔不存在 → `NotInstalled`
-- `systemctl --user is-active` 成功 → `Running`
-- unit 存在但未 active → `Stopped`
+### Notes
 
-### 注意事項
+- In CI or sessions without a user systemd bus, `enable --now` can fail even though the file was written successfully.
+- That is treated as a warning, not as a hard failure for the file-rendering part.
+- No sudo is required because this is all user-level.
 
-- 在某些 CI 或無 systemd session bus 的環境中，`enable --now` 可能失敗，但 unit 檔案仍然已經寫入。
-- 這種情況下，install 會保留檔案並把 activation 問題當成 warning。
-- 因為是 user-level unit，不需要 sudo。
+## Windows behavior
 
-## Windows 行為
+Windows uses Task Scheduler.
 
-Windows 使用 Task Scheduler。
+### Paths
 
-### 位置
+- task name: `\AgendTerminalDaemon`
+- XML cache: `$AGEND_HOME/service/scheduler.task.xml`
 
-- task 名稱：`\AgendTerminalDaemon`
-- XML cache：`$AGEND_HOME/service/scheduler.task.xml`
+### Install flow
 
-### install
+Windows install works like this:
 
-Windows 的流程比較特別：
+1. Render the XML template.
+2. Encode the XML as UTF-16 LE with a BOM.
+3. Run `schtasks /Create /XML <path> /F`.
 
-1. render XML template。
-2. 以 UTF-16 LE + BOM 寫入 XML。
-3. 執行 `schtasks /Create /XML <path> /F`。
+The XML is entity-escaped before writing so characters like `&`, `<`, `>`, `"`, and `'` do not corrupt the template.
 
-XML 會先套用 `xml_escape`，避免 `&`、`<`、`>`、`"`、`'` 破壞結構。
+### Status flow
 
-### status
+Status checks are:
 
-判斷邏輯是：
+- XML cache missing → `NotInstalled`
+- `schtasks /Query /TN \AgendTerminalDaemon /FO LIST` succeeds and contains `Running` → `Running`
+- XML exists but the task is not active → `Stopped`
 
-- XML cache 不存在 → `NotInstalled`
-- `schtasks /Query /TN \AgendTerminalDaemon /FO LIST` 成功且內容含 `Running` → `Running`
-- XML 存在但查詢不是 active → `Stopped`
+### Notes
 
-### 注意事項
+- `schtasks` failures can still leave the XML file behind, which is useful for debugging the rendered content.
+- The task name is fixed. It does not vary per instance.
+- No admin rights are required as long as the current user can create scheduled tasks.
 
-- `schtasks` 失敗時，install 仍可能保留 XML，方便你檢查 render 後的內容。
-- task scheduler 的命名是固定的，不會依 instance 改名。
-- Windows 也不需要 admin，只要使用者自身可建立排程即可。
+## Idempotency rules
 
-## idempotency 規則
-
-| 操作 | 已存在時 | 不存在時 |
+| Operation | Existing state | Missing state |
 |---|---|---|
-| `install` | 重新產生 artifact 並重註冊 | 正常安裝 |
-| `uninstall` | 刪除 artifact 並解除註冊 | no-op 成功 |
-| `status` | 回報 `running` / `stopped` | 回報 `not_installed` |
+| `install` | Re-renders and re-registers | Installs normally |
+| `uninstall` | Removes registration and artifact | Succeeds as no-op |
+| `status` | Reports `running` or `stopped` | Reports `not_installed` |
 
-這裡的 idempotency 是針對「操作結果可重跑」，不是說 platform command 一定完全安靜。
-例如 `launchctl unload`、`systemctl daemon-reload`、`schtasks /Create` 可能會輸出 warning，但功能上仍保持可重跑。
+Idempotent here means the action can be repeated safely, not that every underlying platform command is completely silent. `launchctl`, `systemctl`, and `schtasks` may still print warnings while the operation remains functionally repeatable.
 
-## 與 daemon lifecycle 的關係
+## How this relates to daemon lifecycle
 
-`service` 只負責把 daemon 放到 OS supervisor 底下。
-真正的 daemon 邏輯仍然在 `start` / `app` / `daemon` 路徑中。
+`service` only wires the daemon into the OS supervisor. It does not run the daemon logic itself.
 
-換句話說：
+In practice:
 
-- `service install`：告訴 OS「請幫我啟動這個 binary」
-- `agend-terminal start`：真正跑 daemon
-- `service status`：看 OS 這邊是不是還握著 service 註冊
+- `service install` says: "OS, please start this binary for me."
+- `agend-terminal start` actually runs the daemon.
+- `service status` asks whether the OS still has the service registration.
 
-這也代表如果你更新 binary，通常要重新 install 一次，
-讓 service manager 持有最新的絕對路徑與 `AGEND_HOME`。
+If you upgrade the binary, re-run `service install` so the service manager gets the new absolute path and current `AGEND_HOME`.
 
-## 常見操作流程
+## Common workflows
 
-### 第一次安裝
+### First install
 
 ```bash
 agend-terminal service install
 agend-terminal service status
 ```
 
-你通常會先確認：
+Check that:
 
-- artifact 已寫入
-- service manager 已接受註冊
-- status 顯示 `running` 或 `stopped`，但不是 `not_installed`
+- the artifact was written
+- the service manager accepted the registration
+- status is `running` or `stopped`, not `not_installed`
 
-### 更新 binary 後重裝
+### Reinstall after a binary update
 
 ```bash
 cargo build --release
 agend-terminal service install
 ```
 
-這會重新 render template，帶入新的 `current_exe()` 路徑。
+This refreshes the binary path embedded in the artifact.
 
-### 解除安裝
+### Uninstall
 
 ```bash
 agend-terminal service uninstall
 agend-terminal service status
 ```
 
-如果你想確認真的清掉了，`status` 應該回 `not_installed`。
+If the uninstall worked, status should move to `not_installed`.
 
-## 失敗排查
+## Troubleshooting
 
 ### `this platform is not supported`
 
-表示目前編譯目標沒有對應的 service manager 實作。
-確認你是在 macOS / Linux / Windows 其中之一。
+You are on a target that does not have a matching service manager implementation. Make sure you are on macOS, Linux, or Windows.
 
-### `status` 回 `stopped`
+### `status` returns `stopped`
 
-表示平台認得這個 service artifact，但它現在沒在跑。
-建議檢查：
+The OS still knows about the service artifact, but the daemon is not currently active. Check:
 
-- binary 是否還存在
-- `AGEND_HOME` 是否正確
-- service manager log 是否有啟動失敗
-- daemon 啟動後是否立刻 panic
+- whether the binary still exists
+- whether `AGEND_HOME` is correct
+- the service manager logs
+- whether the daemon exits immediately after startup
 
-### Windows XML 可以寫，但 task 沒出現
+### Windows XML writes, but the task does not appear
 
-常見原因：
+Common causes:
 
-- `schtasks` 不可用
-- 目前使用者沒有建立排程的權限
-- XML 中有未 escape 的字元
+- `schtasks` is unavailable
+- the current user lacks permission to create scheduled tasks
+- the XML was not escaped correctly
 
-### Linux unit 寫入成功但沒有啟動
+### Linux unit writes, but nothing starts
 
-常見原因：
+Common causes:
 
-- 沒有 systemd user session bus
-- `systemctl --user` 無法在該環境運作
-- unit 內容指向了不存在的 binary
+- no systemd user session bus
+- `systemctl --user` is not usable in the current environment
+- the unit points to a missing binary
 
-### macOS plist 存在但沒有載入
+### macOS plist exists, but launchd does not load it
 
-常見原因：
+Common causes:
 
-- `launchctl load -w` 失敗
-- plist 路徑被移動
-- binary 已更新，但 plist 還保留舊路徑（重跑 install 即可）
+- `launchctl load -w` failed
+- the plist path moved
+- the binary changed and the plist still points to the old path; rerun `install`
 
-## 跟其他設定的關係
+## Relationship to other settings
 
-`service` 只管 OS supervisor。
-它不負責：
+`service` only manages the OS supervisor integration.
 
-- fleet.yaml 的 agent 配置
-- runtime-config.json 的 runtime threshold
-- MCP JSON 的 backend 端設定
-- bugreport / capture 的診斷輸出
+It does **not** manage:
 
-這些是不同層次的配置。
-如果你在改完 fleet 或 runtime config 後遇到 daemon 行為異常，
-先看 `doctor`，再看 `service status`，最後再重裝 service。
+- fleet.yaml agent configuration
+- runtime-config.json thresholds
+- MCP JSON backend settings
+- bugreport or capture output
 
-## 對應原始碼
+Those are different layers. If daemon behavior looks wrong after changing fleet or runtime config, run `doctor`, then check `service status`, and only then consider reinstalling the service.
 
-- `src/main.rs`：`Commands::Service` 與 CLI 文案
-- `src/service/mod.rs`：跨平台共用 helper
-- `src/service/macos.rs`：launchd 實作
-- `src/service/linux.rs`：systemd user 實作
-- `src/service/windows.rs`：Task Scheduler 實作
-- `src/daemon/restart.rs`：supervisor 偵測與重啟語意
+## Source pointers
 
-## 實務建議
+- `src/main.rs`: CLI text and `Commands::Service`
+- `src/service/mod.rs`: cross-platform helper logic
+- `src/service/macos.rs`: launchd implementation
+- `src/service/linux.rs`: systemd user implementation
+- `src/service/windows.rs`: Task Scheduler implementation
+- `src/daemon/restart.rs`: supervisor detection and restart semantics
 
-1. 安裝後立刻跑一次 `status`。
-2. 更新 binary 後重新 `install`，不要假設舊 artifact 會自動更新。
-3. 若你在 CI 或臨時環境測試，保留 `install` 產生的檔案比強求 service 真正啟動更有用。
-4. 若 `status` 非 `not_installed` 但 daemon 還是沒反應，先看 platform manager log，不要先懷疑 CLI。
-5. 這個功能是「外部 supervisor 入口」，不是 daemon 的自愈機制。
+## Practical advice
 
+1. Run `status` immediately after installation.
+2. Re-run `install` after binary upgrades instead of assuming the artifact will update itself.
+3. In CI or test environments, it is often more useful to verify the generated files than to force the OS service to start.
+4. If `status` is not `not_installed` but the daemon still looks dead, check the platform manager logs first.
+5. This feature is an external supervisor entry point, not a self-healing mechanism.
