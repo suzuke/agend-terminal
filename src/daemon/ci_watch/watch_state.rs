@@ -104,6 +104,7 @@ impl WatchState {
                 .filter(|s| !s.instance.is_empty())
                 .map(|s| s.instance.clone())
                 .collect();
+            out.sort();
             out.dedup();
             if !out.is_empty() {
                 return out;

@@ -454,24 +454,12 @@ impl HealthTracker {
             }
         }
 
-        let silence_exceeds_threshold = match agent_state {
-            AgentState::Idle => false, // Waiting for input — never hangs
-            AgentState::Starting => silent > Duration::from_secs(120),
-            AgentState::Thinking | AgentState::ToolUse => silent > Duration::from_secs(600),
-            _ => silent > Duration::from_secs(120),
-        };
+        let silence_exceeds_threshold = productive_silence_exceeds(agent_state, silent);
 
         // F9 (#685 sub-task 4): productive-silence threshold mirrors silent
         // thresholds. Active only when `AGEND_PRODUCTIVE_GATE=1` is set;
         // telemetry fires regardless for fixture-corpus measurement.
-        let productive_silence_exceeds = match agent_state {
-            AgentState::Idle => false,
-            AgentState::Starting => silent_productive > Duration::from_secs(120),
-            AgentState::Thinking | AgentState::ToolUse => {
-                silent_productive > Duration::from_secs(600)
-            }
-            _ => silent_productive > Duration::from_secs(120),
-        };
+        let productive_exceeds = productive_silence_exceeds(agent_state, silent_productive);
         let f9_gate_active = std::env::var("AGEND_PRODUCTIVE_GATE")
             .map(|v| v == "1")
             .unwrap_or(false);
@@ -479,7 +467,7 @@ impl HealthTracker {
         // independently flag Hung but the silent path does not. Lets the
         // fixture corpus measure F9 FP rate without affecting prod behavior
         // until the env var flips to active.
-        if productive_silence_exceeds && !silence_exceeds_threshold {
+        if productive_exceeds && !silence_exceeds_threshold {
             tracing::debug!(
                 target: "behavioral_shadow",
                 silent_secs = silent.as_secs(),
@@ -491,8 +479,7 @@ impl HealthTracker {
         }
         // Dual-path: Hung classification fires if either path exceeded,
         // gated on env var for productive path until promoted to default.
-        let any_path_exceeds =
-            silence_exceeds_threshold || (f9_gate_active && productive_silence_exceeds);
+        let any_path_exceeds = silence_exceeds_threshold || (f9_gate_active && productive_exceeds);
 
         if !any_path_exceeds {
             // Hung Exit (X1) / IdleLong Exit (X1): silence dropped below threshold
@@ -721,11 +708,17 @@ impl HealthTracker {
             if self.total_crashes == 0 {
                 self.crash_times.clear();
             }
-            // Recover from Failed/Unstable if crashes decayed enough
+            // Recover from Failed/Unstable if crashes decayed enough.
+            // Known limitation: Failed → Recovering with a dead process
+            // leaves the agent in Recovering until operator manual restart
+            // or #685 Stage 2 auto-restart fires. record_crash returned
+            // (false, _, _) when entering Failed, so the process is gone.
             if self.total_crashes < DEFAULT_MAX_RETRIES && self.state == HealthState::Failed {
                 self.state = HealthState::Recovering;
             }
-            if self.total_crashes < 3 && self.state == HealthState::Unstable {
+            if self.total_crashes < 3
+                && matches!(self.state, HealthState::Unstable | HealthState::Recovering)
+            {
                 self.state = HealthState::Healthy;
             }
         }

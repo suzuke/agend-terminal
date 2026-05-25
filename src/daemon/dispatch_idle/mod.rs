@@ -470,7 +470,9 @@ pub(crate) fn scan_and_emit(home: &Path) {
 
         emit_exceeded_event(home, &d, elapsed_secs);
         d.status = "exceeded".to_string();
-        let _ = write_dispatch(home, &d);
+        if !write_dispatch(home, &d) {
+            tracing::warn!(dispatch_id = %d.dispatch_id, "dispatch-idle exceeded status write failed");
+        }
     }
 }
 

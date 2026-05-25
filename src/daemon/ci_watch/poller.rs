@@ -179,7 +179,7 @@ pub fn watch_start_check_mergeable(
             w["last_mergeable_state"] = serde_json::json!(state.as_str());
             w["last_mergeable_check_at"] = serde_json::json!(now_rfc3339);
             if let Ok(out) = serde_json::to_string_pretty(&w) {
-                let _ = std::fs::write(watch_path, out);
+                let _ = crate::store::atomic_write(watch_path, out.as_bytes());
             }
         }
     }
@@ -826,7 +826,7 @@ async fn check_and_alert_mergeable(ctx: &CiCheckCtx<'_>, provider: &dyn CiProvid
             w.last_mergeable_state = Some(new_state.as_str().to_string());
             w.last_mergeable_check_at = Some(now_rfc3339);
             if let Ok(out) = serde_json::to_string_pretty(&w) {
-                let _ = std::fs::write(ctx.watch_path, out);
+                let _ = crate::store::atomic_write(ctx.watch_path, out.as_bytes());
             }
         }
     }
@@ -1026,16 +1026,17 @@ async fn fan_out_notifications(
             } else {
                 None
             };
+            let fleet_cfg =
+                crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(ctx.home)).ok();
             for sub in ctx.subscribers {
                 if action_target_on_success.as_deref() == Some(sub.as_str()) {
                     continue;
                 }
                 let in_registry = agent::lock_registry(registry).contains_key(sub);
-                let fleet_known =
-                    crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(ctx.home))
-                        .ok()
-                        .map(|f| f.instances.contains_key(sub))
-                        .unwrap_or(true);
+                let fleet_known = fleet_cfg
+                    .as_ref()
+                    .map(|f| f.instances.contains_key(sub))
+                    .unwrap_or(true);
                 if !in_registry && !fleet_known {
                     tracing::debug!(
                         sub = %sub,

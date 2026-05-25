@@ -25,6 +25,7 @@ pub(crate) fn parse_subscribers(watch: &serde_json::Value) -> Vec<String> {
             .filter(|s| !s.is_empty())
             .map(String::from)
             .collect();
+        out.sort();
         out.dedup();
         if !out.is_empty() {
             return out;
@@ -136,12 +137,14 @@ pub(super) fn update_watch_state_with_notify(
             }
             watch.last_terminal_seen_at = Some(chrono::Utc::now().to_rfc3339());
             // M1: atomic write to prevent partial-file on crash
-            let _ = crate::store::atomic_write(
+            if let Err(e) = crate::store::atomic_write(
                 watch_path,
                 serde_json::to_string_pretty(&watch)
                     .unwrap_or_default()
                     .as_bytes(),
-            );
+            ) {
+                tracing::warn!(path = %watch_path.display(), error = %e, "ci-watch state write failed");
+            }
         }
     }
 }

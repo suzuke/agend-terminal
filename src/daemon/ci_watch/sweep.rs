@@ -46,12 +46,14 @@ pub(super) fn bump_consecutive_skips_and_maybe_notify(
             watch.stalled_since_ms = Some(chrono::Utc::now().timestamp_millis());
         }
     }
-    let _ = crate::store::atomic_write(
+    if let Err(e) = crate::store::atomic_write(
         watch_path,
         serde_json::to_string_pretty(&watch)
             .unwrap_or_default()
             .as_bytes(),
-    );
+    ) {
+        tracing::warn!(path = %watch_path.display(), error = %e, "ci-watch stall-counter write failed");
+    }
 
     if should_notify {
         let stalled_since_ms = watch.stalled_since_ms;
@@ -97,12 +99,14 @@ pub(super) fn clear_stall_and_maybe_notify_resumed(
     watch.consecutive_skips = Some(0);
     watch.stalled_notified = Some(false);
     watch.stalled_since_ms = None;
-    let _ = crate::store::atomic_write(
+    if let Err(e) = crate::store::atomic_write(
         watch_path,
         serde_json::to_string_pretty(&watch)
             .unwrap_or_default()
             .as_bytes(),
-    );
+    ) {
+        tracing::warn!(path = %watch_path.display(), error = %e, "ci-watch stall-clear write failed");
+    }
     if was_stalled {
         let body =
             format!("[ci-watch-resumed] {repo}@{branch}: poll resumed after rate-limit backoff");

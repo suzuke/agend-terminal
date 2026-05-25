@@ -152,7 +152,9 @@ pub(crate) fn scan_and_nudge(home: &Path) {
             continue;
         }
         d.nudge_sent_at = Some(chrono::Utc::now().to_rfc3339());
-        let _ = write_dispatch_sidecar(home, &d);
+        if !write_dispatch_sidecar(home, &d) {
+            tracing::warn!(dispatch_id = %d.dispatch_id, "fixup-nudge sidecar write failed");
+        }
     }
 }
 
