@@ -112,7 +112,10 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
 
     // #1149: Auto-create task when kind=task + no task_id provided.
     let auto_task_id = if params["kind"].as_str() == Some("task")
-        && params["task_id"].as_str().filter(|s| !s.is_empty()).is_none()
+        && params["task_id"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .is_none()
     {
         let title = text
             .lines()
