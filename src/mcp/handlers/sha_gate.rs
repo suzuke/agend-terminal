@@ -7,6 +7,13 @@ pub(crate) fn check_sha_gate(
     summary: &str,
     fetch: impl Fn(&str) -> Result<String, String>,
 ) -> Result<(), String> {
+    if reviewed_head.len() < 7 {
+        return Err(format!(
+            "reviewed_head '{}' is too short ({} chars, minimum 7)",
+            reviewed_head,
+            reviewed_head.len()
+        ));
+    }
     let pr_ref = match extract_pr_number(summary) {
         Some(pr) => pr,
         None => {
@@ -113,7 +120,7 @@ mod tests {
     #[test]
     fn sha_gate_green_prefix_match() {
         let summary = "Review of https://github.com/owner/repo/pull/42 done";
-        let result = check_sha_gate("abc123", summary, |_| Ok("abc123def456".to_string()));
+        let result = check_sha_gate("abc1234", summary, |_| Ok("abc1234def456".to_string()));
         assert!(result.is_ok(), "prefix match should pass: {result:?}");
     }
 
@@ -129,7 +136,7 @@ mod tests {
     #[test]
     fn sha_gate_red_fetch_failure() {
         let summary = "Review of https://github.com/owner/repo/pull/42 done";
-        let result = check_sha_gate("abc123", summary, |_| {
+        let result = check_sha_gate("abc1234", summary, |_| {
             Err("gh: not authenticated".to_string())
         });
         assert!(result.is_err(), "fetch failure should reject (fail-closed)");
@@ -139,11 +146,39 @@ mod tests {
     #[test]
     fn sha_gate_red_no_pr_url_with_reviewed_head() {
         let summary = "Just a plain report with no PR link";
-        let result = check_sha_gate("abc123", summary, |_| unreachable!());
+        let result = check_sha_gate("abc1234", summary, |_| unreachable!());
         assert!(
             result.is_err(),
             "no PR URL with reviewed_head should reject"
         );
         assert!(result.unwrap_err().contains("no GitHub PR URL"));
+    }
+
+    // #1177 characterization tests: empty / too-short reviewed_head
+
+    #[test]
+    fn sha_gate_red_empty_reviewed_head() {
+        let summary = "Review of https://github.com/owner/repo/pull/42 done";
+        let result = check_sha_gate("", summary, |_| Ok("abc123def456".to_string()));
+        assert!(result.is_err(), "empty reviewed_head must be rejected");
+        assert!(result.unwrap_err().contains("too short"));
+    }
+
+    #[test]
+    fn sha_gate_red_short_reviewed_head() {
+        let summary = "Review of https://github.com/owner/repo/pull/42 done";
+        let result = check_sha_gate("abc12", summary, |_| Ok("abc123def456".to_string()));
+        assert!(result.is_err(), "5-char reviewed_head must be rejected");
+        assert!(result.unwrap_err().contains("too short"));
+    }
+
+    #[test]
+    fn sha_gate_green_7char_reviewed_head() {
+        let summary = "Review of https://github.com/owner/repo/pull/42 done";
+        let result = check_sha_gate("abc1234", summary, |_| Ok("abc1234def456".to_string()));
+        assert!(
+            result.is_ok(),
+            "7-char reviewed_head should pass: {result:?}"
+        );
     }
 }
