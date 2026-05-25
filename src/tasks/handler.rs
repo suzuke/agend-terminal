@@ -116,18 +116,33 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
             };
             match crate::task_events::append(home, &emitter, event) {
                 Ok(_) => {
-                    // #807 Item 1: response shape consistency. `event`
-                    // names the action verb; `task` carries the full
-                    // Task object so callers can read lifecycle status
-                    // (`task.status == "open"` after create, NOT the
-                    // event name "created"). Legacy `status` field
-                    // kept as back-compat alias.
                     let task = read_task_record(home, &id).map(|r| record_to_task(&r));
+                    if let Some(ref target) = assignee {
+                        if target != instance_name {
+                            let branch_str = args["branch"]
+                                .as_str()
+                                .map(|b| format!("\nBranch: {b}"))
+                                .unwrap_or_default();
+                            let msg_text =
+                                format!("[delegate_task] {title}{branch_str} (task id: {id})");
+                            let inbox_msg = crate::inbox::InboxMessage {
+                                from: format!("from:{instance_name}"),
+                                text: msg_text.clone(),
+                                kind: Some("task".to_string()),
+                                task_id: Some(id.clone()),
+                                correlation_id: Some(id.clone()),
+                                timestamp: chrono::Utc::now().to_rfc3339(),
+                                ..Default::default()
+                            };
+                            let _ = crate::inbox::storage::enqueue(home, target, inbox_msg);
+                            let source = crate::inbox::NotifySource::Agent(instance_name);
+                            crate::inbox::notify::notify_agent(home, target, &source, &msg_text);
+                        }
+                    }
                     serde_json::json!({
                         "id": id,
                         "event": "created",
                         "task": task,
-                        // #807 deprecated alias kept for back-compat — see task.status for lifecycle.
                         "status": "created",
                     })
                 }
@@ -1157,5 +1172,129 @@ fn cascade_cancel_children(
             };
             let _ = crate::inbox::storage::enqueue(home, &owner_name.0, msg);
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn tmp_home(name: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "agend-assign-ux-test-{}-{}-{}",
+            std::process::id(),
+            name,
+            id
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    }
+
+    fn drain_inbox(home: &std::path::Path, agent: &str) -> Vec<crate::inbox::InboxMessage> {
+        crate::inbox::storage::drain(home, agent)
+    }
+
+    #[test]
+    fn create_with_assignee_sends_task_to_inbox() {
+        let home = tmp_home("assign_inbox");
+        let result = handle(
+            &home,
+            "lead-agent",
+            &serde_json::json!({
+                "action": "create",
+                "title": "implement feature X",
+                "assignee": "dev-agent",
+                "branch": "fix/feature-x",
+            }),
+        );
+        assert_eq!(result["event"], "created");
+        let task_id = result["id"].as_str().unwrap();
+
+        let msgs = drain_inbox(&home, "dev-agent");
+        assert!(!msgs.is_empty(), "assignee should receive inbox message");
+        let msg = &msgs[0];
+        assert_eq!(msg.kind.as_deref(), Some("task"));
+        assert_eq!(msg.task_id.as_deref(), Some(task_id));
+        assert!(msg.text.contains("implement feature X"));
+        assert!(msg.text.contains("fix/feature-x"));
+    }
+
+    #[test]
+    fn create_without_assignee_sends_no_message() {
+        let home = tmp_home("no_assign");
+        let result = handle(
+            &home,
+            "lead-agent",
+            &serde_json::json!({
+                "action": "create",
+                "title": "unassigned task",
+            }),
+        );
+        assert_eq!(result["event"], "created");
+
+        let msgs = drain_inbox(&home, "lead-agent");
+        assert!(msgs.is_empty(), "no inbox message without assignee");
+    }
+
+    #[test]
+    fn create_self_assign_sends_no_message() {
+        let home = tmp_home("self_assign");
+        let result = handle(
+            &home,
+            "dev-agent",
+            &serde_json::json!({
+                "action": "create",
+                "title": "self-assigned task",
+                "assignee": "dev-agent",
+            }),
+        );
+        assert_eq!(result["event"], "created");
+
+        let msgs = drain_inbox(&home, "dev-agent");
+        assert!(msgs.is_empty(), "self-assign should not send inbox message");
+    }
+
+    #[test]
+    fn create_with_assignee_task_status_is_open() {
+        let home = tmp_home("status_open");
+        let result = handle(
+            &home,
+            "lead-agent",
+            &serde_json::json!({
+                "action": "create",
+                "title": "test task",
+                "assignee": "dev-agent",
+            }),
+        );
+        let task = &result["task"];
+        assert_eq!(task["status"], "open");
+        assert_eq!(task["assignee"], "dev-agent");
+    }
+
+    #[test]
+    fn create_with_assignee_correlation_id_matches_task_id() {
+        let home = tmp_home("corr_id");
+        let result = handle(
+            &home,
+            "lead-agent",
+            &serde_json::json!({
+                "action": "create",
+                "title": "correlated task",
+                "assignee": "dev-agent",
+            }),
+        );
+        let task_id = result["id"].as_str().unwrap();
+
+        let msgs = drain_inbox(&home, "dev-agent");
+        let msg = &msgs[0];
+        assert_eq!(
+            msg.correlation_id.as_deref(),
+            Some(task_id),
+            "correlation_id should match task_id for auto-close"
+        );
     }
 }
