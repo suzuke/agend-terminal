@@ -1020,8 +1020,15 @@ pub(super) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
             .output();
         match checks_output {
             Ok(o) if o.status.success() => {
-                let checks: Vec<serde_json::Value> =
-                    serde_json::from_slice(&o.stdout).unwrap_or_default();
+                let checks: Vec<serde_json::Value> = match serde_json::from_slice(&o.stdout) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return json!({
+                            "error": format!("failed to parse CI checks response: {e}"),
+                            "hint": "merge refused (fail-closed)"
+                        });
+                    }
+                };
                 let failing: Vec<_> = checks
                     .iter()
                     .filter(|c| {
@@ -1066,13 +1073,20 @@ pub(super) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
             "timestamp": chrono::Utc::now().to_rfc3339(),
         });
         let events_path = home.join("fleet_events.jsonl");
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(events_path)
-        {
+        let audit_written = (|| -> std::io::Result<()> {
             use std::io::Write;
-            let _ = writeln!(f, "{event}");
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(events_path)?;
+            writeln!(f, "{event}")?;
+            Ok(())
+        })();
+        if let Err(e) = audit_written {
+            return json!({
+                "error": format!("force-merge refused: audit log write failed: {e}"),
+                "hint": "fix fleet_events.jsonl permissions or disk space, then retry"
+            });
         }
     }
 
