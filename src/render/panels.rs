@@ -172,7 +172,7 @@ pub fn render_tasks(
         return;
     }
 
-    let columns = task_board_columns(items);
+    let columns = task_board_columns_viewport(items, inner.height as usize);
 
     if matches!(mode, TaskBoardMode::Detail) {
         if let Some(task) = columns[sel_col].get(sel_row) {
@@ -466,11 +466,29 @@ pub fn render_tasks(
 /// Max visible tasks in the Done column before collapsing into a summary line.
 const DONE_VISIBLE_MAX: usize = 20;
 
+/// Extra rows beyond viewport to keep sorted (absorbs off-by-one / border).
+const PARTIAL_SORT_BUFFER: usize = 5;
+
 /// Group tasks into 4 kanban columns: Backlog, Open, In Progress, Done.
 /// Sorted by priority desc then created_at asc within each column.
 /// Done column is sorted by updated_at desc (most recent first).
 /// Cancelled tasks are excluded.
+///
+/// Fully sorts every column. Use [`task_board_columns_viewport`] in
+/// per-frame render paths where only the first `viewport_rows` items
+/// need to be in order.
 pub fn task_board_columns(items: &[crate::tasks::Task]) -> [Vec<&crate::tasks::Task>; 4] {
+    task_board_columns_viewport(items, usize::MAX)
+}
+
+/// Viewport-aware variant: only the first `viewport_rows + BUFFER`
+/// items in each column are guaranteed sorted. Items beyond that
+/// range are partitioned (correct side of the boundary) but in
+/// arbitrary order.
+pub fn task_board_columns_viewport(
+    items: &[crate::tasks::Task],
+    viewport_rows: usize,
+) -> [Vec<&crate::tasks::Task>; 4] {
     let mut backlog: Vec<&crate::tasks::Task> = Vec::new();
     let mut open: Vec<&crate::tasks::Task> = Vec::new();
     let mut in_progress: Vec<&crate::tasks::Task> = Vec::new();
@@ -487,33 +505,46 @@ pub fn task_board_columns(items: &[crate::tasks::Task]) -> [Vec<&crate::tasks::T
         }
     }
 
-    fn sort_col(col: &mut Vec<&crate::tasks::Task>) {
-        col.sort_by(|a, b| {
-            let pri_ord = |p: &str| -> u8 {
-                match p {
-                    "urgent" => 0,
-                    "high" => 1,
-                    "normal" => 2,
-                    "low" => 3,
-                    _ => 4,
-                }
-            };
-            pri_ord(&a.priority)
-                .cmp(&pri_ord(&b.priority))
-                .then(a.created_at.cmp(&b.created_at))
-        });
+    let cap = viewport_rows.saturating_add(PARTIAL_SORT_BUFFER);
+
+    fn pri_cmp(a: &&crate::tasks::Task, b: &&crate::tasks::Task) -> std::cmp::Ordering {
+        let pri_ord = |p: &str| -> u8 {
+            match p {
+                "urgent" => 0,
+                "high" => 1,
+                "normal" => 2,
+                "low" => 3,
+                _ => 4,
+            }
+        };
+        pri_ord(&a.priority)
+            .cmp(&pri_ord(&b.priority))
+            .then(a.created_at.cmp(&b.created_at))
     }
 
-    sort_col(&mut backlog);
-    sort_col(&mut open);
-    sort_col(&mut in_progress);
+    fn partial_sort_by<T>(col: &mut [T], cap: usize, cmp: fn(&T, &T) -> std::cmp::Ordering) {
+        if cap < col.len() {
+            col.select_nth_unstable_by(cap, cmp);
+            col[..cap].sort_by(cmp);
+        } else {
+            col.sort_by(cmp);
+        }
+    }
+
+    partial_sort_by(&mut backlog, cap, pri_cmp);
+    partial_sort_by(&mut open, cap, pri_cmp);
+    partial_sort_by(&mut in_progress, cap, pri_cmp);
     in_progress.sort_by(|a, b| {
         a.assignee
             .as_deref()
             .unwrap_or("")
             .cmp(b.assignee.as_deref().unwrap_or(""))
     });
-    done.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    let done_cap = cap.min(DONE_VISIBLE_MAX);
+    fn done_cmp(a: &&crate::tasks::Task, b: &&crate::tasks::Task) -> std::cmp::Ordering {
+        b.updated_at.cmp(&a.updated_at)
+    }
+    partial_sort_by(&mut done, done_cap, done_cmp);
 
     [backlog, open, in_progress, done]
 }
@@ -731,6 +762,71 @@ mod tests {
         assert_eq!(open[1].title, "high-old", "high second");
         assert_eq!(open[2].title, "normal-old", "normal oldest third");
         assert_eq!(open[3].title, "normal-new", "normal newest last");
+    }
+
+    #[test]
+    fn viewport_partial_sort_matches_full_sort_in_visible_range() {
+        let tasks: Vec<crate::tasks::Task> = (0..50)
+            .map(|i| {
+                let pri = match i % 4 {
+                    0 => "urgent",
+                    1 => "high",
+                    2 => "normal",
+                    _ => "low",
+                };
+                make_task(
+                    &format!("task-{i:03}"),
+                    "open",
+                    pri,
+                    // unique created_at per task (avoids tie-breaking instability)
+                    &format!("2026-{:02}-{:02}", (i / 28) + 1, (i % 28) + 1),
+                )
+            })
+            .collect();
+
+        let full = task_board_columns(&tasks);
+        let partial = task_board_columns_viewport(&tasks, 10);
+        let cap = 10 + PARTIAL_SORT_BUFFER;
+
+        for col in 0..4 {
+            assert_eq!(
+                full[col].len(),
+                partial[col].len(),
+                "column {col} length must match"
+            );
+            let visible = cap.min(full[col].len());
+            for i in 0..visible {
+                assert_eq!(
+                    full[col][i].id, partial[col][i].id,
+                    "column {col} row {i} must match between full and partial sort"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn viewport_partial_sort_done_column_top_n_correct() {
+        let tasks: Vec<crate::tasks::Task> = (0..40)
+            .map(|i| {
+                make_done_task(
+                    &format!("done-{i:03}"),
+                    // unique updated_at per task
+                    &format!("2026-{:02}-{:02}T12:00:00Z", (i / 28) + 1, (i % 28) + 1),
+                )
+            })
+            .collect();
+
+        let full = task_board_columns(&tasks);
+        let partial = task_board_columns_viewport(&tasks, 10);
+
+        assert_eq!(full[3].len(), partial[3].len());
+        let visible = DONE_VISIBLE_MAX.min(full[3].len());
+        for i in 0..visible {
+            assert_eq!(
+                full[3][i].id, partial[3][i].id,
+                "done column row {i}: partial sort must match full sort in visible range"
+            );
+        }
     }
 
     fn render_task_board_to_string(mode: &crate::app::TaskBoardMode) -> String {
