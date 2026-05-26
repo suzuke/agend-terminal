@@ -1,6 +1,6 @@
 //! L1: cross-team-safe dispatch-idle watchdog.
 //!
-//! Tracks `send(kind=task|query)` calls that carry an explicit
+//! Tracks `send(kind=task)` calls that carry an explicit
 //! `expect_reply_within_secs` opt-in. When the expected reply hasn't
 //! arrived inside the threshold window, fires a
 //! `dispatch_idle_threshold_exceeded` event to the dispatcher's inbox.
@@ -63,7 +63,7 @@ pub(crate) struct PendingDispatch {
     /// `task_id` / thread correlation id from the original dispatch.
     #[serde(default)]
     pub(crate) correlation_id: Option<String>,
-    /// Original dispatch kind: `"task"` or `"query"`.
+    /// Original dispatch kind: `"task"` (#1268: query excluded).
     #[serde(default)]
     pub(crate) expected_kind: String,
     #[serde(default)]
@@ -120,7 +120,7 @@ pub(crate) fn record_dispatch(
     if dispatcher.is_empty() || target.is_empty() || threshold_secs <= 0 {
         return None;
     }
-    if !matches!(expected_kind, "task" | "query") {
+    if !matches!(expected_kind, "task") {
         return None;
     }
     let dir = pending_dir(home);
