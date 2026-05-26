@@ -187,8 +187,23 @@ fn is_clean_merged(repo: &Path, base: &str, branch: &str) -> bool {
 /// `base` as an equivalent patch (squash-merged). `git cherry base
 /// branch` output prefix per commit: `-` means present in base, `+`
 /// means missing. All-`-` (and at least one line) ⇒ squash-merged.
-#[allow(dead_code)]
+///
+/// #1280: Falls back to tree-diff comparison when `git cherry` misses
+/// GitHub-style squash merges (single squashed commit has a different
+/// patch-id than the individual commits). The fallback checks if the
+/// diff from merge-base to the branch tip is empty against base HEAD
+/// (i.e., all changes are already incorporated).
 fn is_squash_merged(repo: &Path, base: &str, branch: &str) -> bool {
+    // Method 1: git cherry (works for cherry-picked commits).
+    if is_squash_merged_cherry(repo, base, branch) {
+        return true;
+    }
+    // Method 2: tree-diff comparison (works for GitHub squash-merge).
+    is_squash_merged_diff(repo, base, branch)
+}
+
+/// `git cherry` based detection.
+fn is_squash_merged_cherry(repo: &Path, base: &str, branch: &str) -> bool {
     let output = std::process::Command::new("git")
         .args(["cherry", base, branch])
         .current_dir(repo)
@@ -211,6 +226,24 @@ fn is_squash_merged(repo: &Path, base: &str, branch: &str) -> bool {
         }
     }
     had_any
+}
+
+/// Tree-diff based detection: if the diff between the merge-base and
+/// the branch tip is empty when compared against base HEAD, then all
+/// changes from the branch are already in base (squash-merged).
+fn is_squash_merged_diff(repo: &Path, base: &str, branch: &str) -> bool {
+    // git diff <base>...<branch> --stat → if empty, branch content is in base.
+    let output = std::process::Command::new("git")
+        .args(["diff", "--stat", &format!("{base}...{branch}")])
+        .current_dir(repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output();
+    let Ok(o) = output else { return false };
+    if !o.status.success() {
+        return false;
+    }
+    // Empty diff means all branch changes are already in base.
+    o.stdout.trim_ascii().is_empty()
 }
 
 /// #817 scan local branches and categorize into the 4 buckets.
