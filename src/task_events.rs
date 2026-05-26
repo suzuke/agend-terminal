@@ -805,6 +805,7 @@ pub fn append_batch(
         }
         Ok(lines)
     })?;
+    invalidate_replay_cache();
     // H1: update cached high-water mark after successful append
     if let Some(&last_seq) = seqs.last() {
         let log_path = home.join(format!("{LOG_NAME}.jsonl"));
@@ -850,6 +851,46 @@ fn max_seq_for_instance(log_path: &Path, instance: &InstanceName) -> anyhow::Res
     Ok(max)
 }
 
+// ── Replay cache ─────────────────────────────────────────────────────
+// Read-side cache: avoids full-file replay when nothing has changed.
+// Keyed on (hot_log mtime_ns, hot_log len, archive_dir mtime_ns).
+// Invalidated explicitly after append_batch and implicitly when file
+// metadata changes (external writes, rotation).
+
+type ReplayCacheKey = (i64, u64, i64);
+
+struct ReplayCacheEntry {
+    key: ReplayCacheKey,
+    state: TaskBoardState,
+}
+
+static REPLAY_CACHE: std::sync::LazyLock<parking_lot::Mutex<Option<ReplayCacheEntry>>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(None));
+
+fn replay_cache_key(home: &Path) -> Option<ReplayCacheKey> {
+    let log = log_path(home);
+    let log_meta = std::fs::metadata(&log).ok()?;
+    let log_mtime = log_meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos() as i64;
+    let log_len = log_meta.len();
+    let archive = archive_dir(home);
+    let archive_mtime = std::fs::metadata(&archive)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0);
+    Some((log_mtime, log_len, archive_mtime))
+}
+
+pub fn invalidate_replay_cache() {
+    *REPLAY_CACHE.lock() = None;
+}
+
 // ── Replay: strict reader (forward-compat fail-closed) ─────────────
 
 /// Fold the entire on-disk event history (archive + hot file) into a
@@ -859,9 +900,28 @@ fn max_seq_for_instance(log_path: &Path, instance: &InstanceName) -> anyhow::Res
 /// variant aborts (per dev-reviewer-2 must-have: replay must NOT silently
 /// skip unknown envelopes).
 pub fn replay(home: &Path) -> anyhow::Result<TaskBoardState> {
-    // H2: stream-fold per file instead of collecting all envelopes into memory.
-    // Archives are chronologically ordered by filename; within each file,
-    // events are in append order. We sort per-file then fold immediately.
+    if let Some(key) = replay_cache_key(home) {
+        let cache = REPLAY_CACHE.lock();
+        if let Some(entry) = cache.as_ref() {
+            if entry.key == key {
+                return Ok(entry.state.clone());
+            }
+        }
+    }
+
+    let state = replay_uncached(home)?;
+
+    if let Some(key) = replay_cache_key(home) {
+        *REPLAY_CACHE.lock() = Some(ReplayCacheEntry {
+            key,
+            state: state.clone(),
+        });
+    }
+
+    Ok(state)
+}
+
+fn replay_uncached(home: &Path) -> anyhow::Result<TaskBoardState> {
     let mut state = TaskBoardState::default();
 
     let archive_dir = archive_dir(home);
@@ -928,18 +988,45 @@ pub fn envelopes_for_task(home: &Path, task_id: &str) -> anyhow::Result<Vec<Task
 }
 
 /// Sort envelopes by timestamp (absolute nanos) → instance → seq.
+/// Schwartzian transform: parse timestamps once into a parallel key vec,
+/// then sort both in lockstep — avoids re-parsing on every comparison.
 fn sort_envelopes(envelopes: &mut [TaskEventEnvelope]) {
-    envelopes.sort_by(|a, b| {
-        let a_ts = chrono::DateTime::parse_from_rfc3339(&a.timestamp)
-            .map(|d| d.timestamp_nanos_opt().unwrap_or(0))
-            .unwrap_or(0);
-        let b_ts = chrono::DateTime::parse_from_rfc3339(&b.timestamp)
-            .map(|d| d.timestamp_nanos_opt().unwrap_or(0))
-            .unwrap_or(0);
-        a_ts.cmp(&b_ts)
-            .then_with(|| a.instance.0.cmp(&b.instance.0))
-            .then_with(|| a.seq.cmp(&b.seq))
+    let mut keys: Vec<i64> = envelopes
+        .iter()
+        .map(|e| {
+            chrono::DateTime::parse_from_rfc3339(&e.timestamp)
+                .map(|d| d.timestamp_nanos_opt().unwrap_or(0))
+                .unwrap_or(0)
+        })
+        .collect();
+    let mut indices: Vec<usize> = (0..envelopes.len()).collect();
+    indices.sort_by(|&a, &b| {
+        keys[a]
+            .cmp(&keys[b])
+            .then_with(|| envelopes[a].instance.0.cmp(&envelopes[b].instance.0))
+            .then_with(|| envelopes[a].seq.cmp(&envelopes[b].seq))
     });
+    apply_permutation(envelopes, &mut keys, &indices);
+}
+
+fn apply_permutation<T>(data: &mut [T], _keys: &mut [i64], perm: &[usize]) {
+    let mut placed = vec![false; data.len()];
+    for i in 0..data.len() {
+        if placed[i] || perm[i] == i {
+            continue;
+        }
+        let mut j = i;
+        loop {
+            let next = perm[j];
+            if next == i {
+                break;
+            }
+            data.swap(j, next);
+            placed[j] = true;
+            j = next;
+        }
+        placed[j] = true;
+    }
 }
 
 fn read_envelopes_strict(path: &Path, out: &mut Vec<TaskEventEnvelope>) -> anyhow::Result<()> {
@@ -2621,5 +2708,72 @@ mod tests {
             "unrelated task must NOT be affected"
         );
         fs::remove_dir_all(&home).ok();
+    }
+
+    // ── Perf Group 1A: replay cache tests ──────────────────────────
+
+    #[test]
+    fn replay_cache_hit_returns_same_result() {
+        let home = tmp_home("cache-hit");
+        let inst = InstanceName::from("a");
+        append(&home, &inst, sample_event("t-1")).unwrap();
+
+        let r1 = replay(&home).unwrap();
+        let r2 = replay(&home).unwrap();
+        assert_eq!(r1.tasks.len(), r2.tasks.len());
+        assert_eq!(r1.events_folded, r2.events_folded);
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn replay_cache_invalidated_after_append() {
+        let home = tmp_home("cache-inv");
+        let inst = InstanceName::from("a");
+        append(&home, &inst, sample_event("t-1")).unwrap();
+
+        let r1 = replay(&home).unwrap();
+        assert_eq!(r1.tasks.len(), 1);
+
+        append(&home, &inst, sample_event("t-2")).unwrap();
+
+        let r2 = replay(&home).unwrap();
+        assert_eq!(r2.tasks.len(), 2, "cache must be invalidated after append");
+        fs::remove_dir_all(&home).ok();
+    }
+
+    // ── Perf Group 1B: sort_envelopes Schwartzian consistency ──────
+
+    #[test]
+    fn sort_envelopes_schwartzian_matches_naive() {
+        let mk = |ts: &str, inst: &str, seq: u64| TaskEventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            seq,
+            timestamp: ts.to_string(),
+            instance: InstanceName::from(inst),
+            emitter_id: None,
+            event: sample_event("t-sort"),
+        };
+        let mut envelopes = vec![
+            mk("2026-05-26T03:00:00Z", "b", 2),
+            mk("2026-05-26T01:00:00Z", "a", 1),
+            mk("2026-05-26T02:00:00Z", "a", 1),
+            mk("2026-05-26T02:00:00Z", "b", 1),
+            mk("2026-05-26T02:00:00Z", "a", 2),
+        ];
+        sort_envelopes(&mut envelopes);
+        let order: Vec<(&str, &str, u64)> = envelopes
+            .iter()
+            .map(|e| (e.timestamp.as_str(), e.instance.0.as_str(), e.seq))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                ("2026-05-26T01:00:00Z", "a", 1),
+                ("2026-05-26T02:00:00Z", "a", 1),
+                ("2026-05-26T02:00:00Z", "a", 2),
+                ("2026-05-26T02:00:00Z", "b", 1),
+                ("2026-05-26T03:00:00Z", "b", 2),
+            ]
+        );
     }
 }
