@@ -228,13 +228,13 @@ fn is_squash_merged_cherry(repo: &Path, base: &str, branch: &str) -> bool {
     had_any
 }
 
-/// Tree-diff based detection: if the diff between the merge-base and
-/// the branch tip is empty when compared against base HEAD, then all
-/// changes from the branch are already in base (squash-merged).
+/// Tree-diff based detection: if the diff between base HEAD and
+/// branch tip is empty, then all changes from the branch are already
+/// in base (squash-merged). Uses two-dot diff (base..branch) which
+/// compares the actual trees at both tips.
 fn is_squash_merged_diff(repo: &Path, base: &str, branch: &str) -> bool {
-    // git diff <base>...<branch> --stat → if empty, branch content is in base.
     let output = std::process::Command::new("git")
-        .args(["diff", "--stat", &format!("{base}...{branch}")])
+        .args(["diff", "--stat", base, branch])
         .current_dir(repo)
         .env("AGEND_GIT_BYPASS", "1")
         .output();
@@ -242,7 +242,7 @@ fn is_squash_merged_diff(repo: &Path, base: &str, branch: &str) -> bool {
     if !o.status.success() {
         return false;
     }
-    // Empty diff means all branch changes are already in base.
+    // Empty diff means branch tree is identical to base → squash-merged.
     o.stdout.trim_ascii().is_empty()
 }
 
