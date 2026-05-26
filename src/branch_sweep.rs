@@ -228,22 +228,56 @@ fn is_squash_merged_cherry(repo: &Path, base: &str, branch: &str) -> bool {
     had_any
 }
 
-/// Tree-diff based detection: if the diff between base HEAD and
-/// branch tip is empty, then all changes from the branch are already
-/// in base (squash-merged). Uses two-dot diff (base..branch) which
-/// compares the actual trees at both tips.
-fn is_squash_merged_diff(repo: &Path, base: &str, branch: &str) -> bool {
-    let output = std::process::Command::new("git")
-        .args(["diff", "--stat", base, branch])
+/// GitHub API based detection: query whether a merged PR exists for
+/// this branch. Most reliable — not affected by git history topology.
+fn is_squash_merged_diff(repo: &Path, _base: &str, branch: &str) -> bool {
+    // Resolve owner/repo from git remote origin.
+    let remote = std::process::Command::new("git")
+        .args(["remote", "get-url", "origin"])
         .current_dir(repo)
-        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    let Some(remote_url) = remote else {
+        return false;
+    };
+    let gh_repo = extract_github_repo(&remote_url);
+    let Some(gh_repo) = gh_repo else {
+        return false;
+    };
+    // gh pr list --state merged --head <branch> --repo <owner/repo> --json number --jq 'length'
+    let output = std::process::Command::new("gh")
+        .args([
+            "pr", "list", "--state", "merged", "--head", branch, "--repo", &gh_repo, "--json",
+            "number", "--jq", "length",
+        ])
         .output();
     let Ok(o) = output else { return false };
     if !o.status.success() {
         return false;
     }
-    // Empty diff means branch tree is identical to base → squash-merged.
-    o.stdout.trim_ascii().is_empty()
+    let count: usize = String::from_utf8_lossy(&o.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0);
+    count > 0
+}
+
+/// Extract "owner/repo" from a GitHub remote URL.
+fn extract_github_repo(url: &str) -> Option<String> {
+    // Handles: https://github.com/owner/repo.git, git@github.com:owner/repo.git
+    let stripped = url.trim().trim_end_matches('/').trim_end_matches(".git");
+    if stripped.contains("github.com") {
+        if let Some(path) = stripped.strip_prefix("git@github.com:") {
+            return Some(path.to_string());
+        }
+        // https://github.com/owner/repo
+        if let Some(idx) = stripped.find("github.com/") {
+            return Some(stripped[idx + "github.com/".len()..].to_string());
+        }
+    }
+    None
 }
 
 /// #817 scan local branches and categorize into the 4 buckets.
