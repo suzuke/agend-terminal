@@ -770,6 +770,7 @@ async fn ci_check_repo(
             if state != snapshot {
                 flush_watch_state(watch_path, &state);
             }
+            refresh_expires_at(watch_path);
             return Ok(());
         }
         Err(e) => {

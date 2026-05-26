@@ -5149,3 +5149,32 @@ fn successful_poll_refreshes_expires_at() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn empty_run_poll_refreshes_expires_at() {
+    let dir = tmp_dir("refresh-empty-runs");
+    let ci_dir = dir.join("ci-watches");
+    std::fs::create_dir_all(&ci_dir).ok();
+    let old_expires = (chrono::Utc::now() + chrono::Duration::hours(24)).to_rfc3339();
+    let watch = serde_json::json!({
+        "repo": "o/r", "branch": "feat-empty", "interval_secs": 60,
+        "instance": "agent1", "last_run_id": null, "head_sha": null,
+        "last_polled_at": null, "expires_at": old_expires,
+    });
+    // No runs returned — poll_ci_runs returns Ok(None)
+    let provider = MockCiProvider::with_runs(vec![]);
+    run_ci_check(&dir, &watch, &provider).unwrap();
+
+    let watch_path = ci_dir.join(watch_filename("o/r", "feat-empty"));
+    assert!(watch_path.exists(), "watch must survive empty-run poll");
+    let content = std::fs::read_to_string(&watch_path).unwrap();
+    let ws: super::WatchState = serde_json::from_str(&content).unwrap();
+    let new_expires = ws.expires_at.expect("expires_at must be present");
+    let parsed = chrono::DateTime::parse_from_rfc3339(&new_expires).unwrap();
+    let hours_from_now = (parsed.with_timezone(&chrono::Utc) - chrono::Utc::now()).num_hours();
+    assert!(
+        (71..=72).contains(&hours_from_now),
+        "expires_at must be refreshed to ~72h even on empty runs, got {hours_from_now}h"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
