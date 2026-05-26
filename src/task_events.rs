@@ -991,7 +991,7 @@ pub fn envelopes_for_task(home: &Path, task_id: &str) -> anyhow::Result<Vec<Task
 /// Schwartzian transform: parse timestamps once into a parallel key vec,
 /// then sort both in lockstep — avoids re-parsing on every comparison.
 fn sort_envelopes(envelopes: &mut [TaskEventEnvelope]) {
-    let mut keys: Vec<i64> = envelopes
+    let keys: Vec<i64> = envelopes
         .iter()
         .map(|e| {
             chrono::DateTime::parse_from_rfc3339(&e.timestamp)
