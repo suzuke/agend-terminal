@@ -118,6 +118,11 @@ pub fn scan_and_emit_with(
                         &author,
                         build_event_message("pr-merged", &author, &state, body),
                     );
+                    // #1287: set dedup flag and persist — file removal
+                    // deferred to the next scan so the flag survives
+                    // if gh_poll recreates the watch file.
+                    state.ready_emitted_for_sha = Some(state.head_sha.clone());
+                    dirty = true;
                 } else {
                     tracing::debug!(
                         repo = %state.repo,
@@ -125,9 +130,9 @@ pub fn scan_and_emit_with(
                         head = %state.head_sha,
                         "#1017 pr_state: stale Merged replay suppressed at scan"
                     );
+                    let _ = remove(home, &state.repo, &state.branch);
+                    continue;
                 }
-                let _ = remove(home, &state.repo, &state.branch);
-                continue;
             }
             MergeState::ClosedUnmerged { closed_at } => {
                 if !already_emitted {
@@ -141,6 +146,8 @@ pub fn scan_and_emit_with(
                         &author,
                         build_event_message("pr-closed-unmerged", &author, &state, body),
                     );
+                    state.ready_emitted_for_sha = Some(state.head_sha.clone());
+                    dirty = true;
                 } else {
                     tracing::debug!(
                         repo = %state.repo,
@@ -148,9 +155,9 @@ pub fn scan_and_emit_with(
                         head = %state.head_sha,
                         "#1017 pr_state: stale ClosedUnmerged replay suppressed at scan"
                     );
+                    let _ = remove(home, &state.repo, &state.branch);
+                    continue;
                 }
-                let _ = remove(home, &state.repo, &state.branch);
-                continue;
             }
             _ => {}
         }

@@ -1636,20 +1636,34 @@ mod tests {
             state: GhPrState::Merged,
             merged_at: Some("2026-05-20T04:17:09Z".to_string()),
         };
-        let poller = MockGhPoller::new(vec![Ok(vec![merged_meta])]);
+        let poller = MockGhPoller::new(vec![Ok(vec![merged_meta.clone()])]);
 
         scan_and_emit_with(&home, &empty_registry(), &poller);
 
-        // File swept (Merged is terminal — gets removed).
-        assert!(
-            load(&home, "owner/repo", "feat/test").is_none(),
-            "Merged terminal → file swept"
+        // #1287: first scan emits but persists with dedup flag — file
+        // survives until next scan confirms already_emitted.
+        let persisted = load(&home, "owner/repo", "feat/test")
+            .expect("#1287: file must survive first scan with dedup flag");
+        assert_eq!(
+            persisted.ready_emitted_for_sha.as_deref(),
+            Some("sha-A"),
+            "#1287: ready_emitted_for_sha must be set after emit"
         );
-        // [pr-merged] in fixup-dev's inbox.
+        // [pr-merged] in dev's inbox.
         let msgs = crate::inbox::drain(&home, "dev");
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].kind.as_deref(), Some("pr-merged"));
         assert!(msgs[0].text.contains("pr-merged"));
+
+        // Second scan: already_emitted → remove without re-emitting.
+        let poller2 = MockGhPoller::new(vec![Ok(vec![merged_meta])]);
+        scan_and_emit_with(&home, &empty_registry(), &poller2);
+        assert!(
+            load(&home, "owner/repo", "feat/test").is_none(),
+            "second scan must sweep terminal file"
+        );
+        let msgs2 = crate::inbox::drain(&home, "dev");
+        assert!(msgs2.is_empty(), "#1287: no duplicate emit on second scan");
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -1669,14 +1683,24 @@ mod tests {
             state: GhPrState::Closed,
             merged_at: None,
         };
-        let poller = MockGhPoller::new(vec![Ok(vec![closed_meta])]);
+        let poller = MockGhPoller::new(vec![Ok(vec![closed_meta.clone()])]);
 
         scan_and_emit_with(&home, &empty_registry(), &poller);
 
-        assert!(load(&home, "owner/repo", "feat/test").is_none());
+        // #1287: first scan emits + persists with dedup flag.
+        let persisted = load(&home, "owner/repo", "feat/test")
+            .expect("#1287: file must survive first scan with dedup flag");
+        assert_eq!(persisted.ready_emitted_for_sha.as_deref(), Some("sha-A"));
         let msgs = crate::inbox::drain(&home, "dev");
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].kind.as_deref(), Some("pr-closed-unmerged"));
+
+        // Second scan: already_emitted → remove without re-emitting.
+        let poller2 = MockGhPoller::new(vec![Ok(vec![closed_meta])]);
+        scan_and_emit_with(&home, &empty_registry(), &poller2);
+        assert!(load(&home, "owner/repo", "feat/test").is_none());
+        let msgs2 = crate::inbox::drain(&home, "dev");
+        assert!(msgs2.is_empty(), "#1287: no duplicate emit on second scan");
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -1964,16 +1988,25 @@ mod tests {
             "fresh Merged MUST NOT have ready_emitted_for_sha set by suppress hook"
         );
 
-        // First scan emits normally.
+        // #1287: first scan emits + persists dedup flag (no removal).
         let poller = MockGhPoller::new(vec![Ok(vec![])]);
         scan_and_emit_with(&home, &empty_registry(), &poller);
-        assert!(
-            load(&home, "owner/repo", "feat/test").is_none(),
-            "fresh Merged file swept post-scan"
-        );
+        let persisted = load(&home, "owner/repo", "feat/test")
+            .expect("#1287: file survives first scan with dedup flag");
+        assert_eq!(persisted.ready_emitted_for_sha.as_deref(), Some("sha-B"));
         let msgs = crate::inbox::drain(&home, "dev");
         assert_eq!(msgs.len(), 1, "fresh Merged MUST emit [pr-merged]");
         assert_eq!(msgs[0].kind.as_deref(), Some("pr-merged"));
+
+        // Second scan: already_emitted → swept, no re-emit.
+        let poller2 = MockGhPoller::new(vec![Ok(vec![])]);
+        scan_and_emit_with(&home, &empty_registry(), &poller2);
+        assert!(
+            load(&home, "owner/repo", "feat/test").is_none(),
+            "second scan must sweep terminal file"
+        );
+        let msgs2 = crate::inbox::drain(&home, "dev");
+        assert!(msgs2.is_empty(), "#1287: no duplicate emit on second scan");
         let _ = std::fs::remove_dir_all(&home);
     }
 
