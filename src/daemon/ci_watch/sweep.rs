@@ -75,8 +75,9 @@ pub(super) fn bump_consecutive_skips_and_maybe_notify(
 }
 
 /// Sprint 54 P0-5 helper: clear the stall state on the first successful
-/// poll after a stall window. Fans out `[ci-watch-resumed]` exactly
-/// once per resume — symmetry with the stalled path.
+/// poll after a stall window. Retained for tests; production path uses
+/// `clear_stall_state` with in-memory mutation.
+#[cfg(test)]
 pub(super) fn clear_stall_and_maybe_notify_resumed(
     home: &Path,
     watch_path: &Path,
@@ -107,6 +108,32 @@ pub(super) fn clear_stall_and_maybe_notify_resumed(
     ) {
         tracing::warn!(path = %watch_path.display(), error = %e, "ci-watch stall-clear write failed");
     }
+    if was_stalled {
+        let body =
+            format!("[ci-watch-resumed] {repo}@{branch}: poll resumed after rate-limit backoff");
+        fan_out_health_event(home, repo, branch, subscribers, "ci-watch-resumed", body);
+    }
+}
+
+/// In-memory variant of [`clear_stall_and_maybe_notify_resumed`] — clears
+/// stall fields on the provided `WatchState` and emits the resume
+/// notification if the watch was stalled.  The caller is responsible for
+/// flushing the state to disk.
+pub(super) fn clear_stall_state(
+    state: &mut super::watch_state::WatchState,
+    home: &Path,
+    repo: &str,
+    branch: &str,
+    subscribers: &[String],
+) {
+    let was_stalled = state.stalled_notified.unwrap_or(false);
+    let had_skips = state.consecutive_skips.unwrap_or(0) > 0;
+    if !was_stalled && !had_skips {
+        return;
+    }
+    state.consecutive_skips = Some(0);
+    state.stalled_notified = Some(false);
+    state.stalled_since_ms = None;
     if was_stalled {
         let body =
             format!("[ci-watch-resumed] {repo}@{branch}: poll resumed after rate-limit backoff");

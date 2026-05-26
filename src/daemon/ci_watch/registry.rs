@@ -94,15 +94,19 @@ pub fn watch_filename(repo: &str, branch: &str) -> String {
 }
 
 /// Persist updated tracking state (last_run_id + head_sha) to the watch file.
+/// Retained for tests that exercise the legacy per-field write path.
+#[cfg(test)]
+#[allow(dead_code)]
 pub(super) fn update_watch_state(watch_path: &Path, run_id: Option<u64>, head_sha: &str) {
     update_watch_state_with_notify(watch_path, run_id, head_sha, None, None, None);
 }
 
 /// Persist tracking state including last_notified_head_sha,
 /// last_notified_conclusion (#786), and last_stale_emitted_sha
-/// (#1026). All optional fields are written only when caller
-/// supplies them — preserves the "no state churn when no
-/// notification fires" invariant.
+/// (#1026). Retained for tests; production path uses
+/// `flush_watch_state` after in-memory mutation.
+#[cfg(test)]
+#[allow(dead_code)]
 pub(super) fn update_watch_state_with_notify(
     watch_path: &Path,
     run_id: Option<u64>,
@@ -146,6 +150,28 @@ pub(super) fn update_watch_state_with_notify(
                 tracing::warn!(path = %watch_path.display(), error = %e, "ci-watch state write failed");
             }
         }
+    }
+}
+
+/// Flush an in-memory WatchState to disk under the ci-watch flock.
+/// Used by the single-load-per-tick path so the entire tick mutates
+/// the struct in-memory and writes once at the end.
+pub(super) fn flush_watch_state(watch_path: &Path, state: &super::watch_state::WatchState) {
+    let lock_path = watch_path.with_extension("lock");
+    let _lock = match crate::store::acquire_file_lock(&lock_path) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(path = %lock_path.display(), error = %e, "failed to acquire ci-watch lock, skipping flush");
+            return;
+        }
+    };
+    if let Err(e) = crate::store::atomic_write(
+        watch_path,
+        serde_json::to_string_pretty(state)
+            .unwrap_or_default()
+            .as_bytes(),
+    ) {
+        tracing::warn!(path = %watch_path.display(), error = %e, "ci-watch state flush failed");
     }
 }
 

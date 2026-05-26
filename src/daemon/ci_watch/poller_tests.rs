@@ -1047,6 +1047,7 @@ fn run_ci_check(
         serde_json::to_string_pretty(watch_json).unwrap(),
     )
     .unwrap();
+    let state: WatchState = serde_json::from_value(watch_json.clone()).unwrap();
 
     let registry: AgentRegistry =
         Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
@@ -1057,14 +1058,8 @@ fn run_ci_check(
     rt.block_on(ci_check_repo(
         dir,
         &watch_path,
-        repo,
-        branch,
-        &subscribers,
-        watch_json["last_run_id"].as_u64(),
-        watch_json["head_sha"].as_str(),
-        watch_json["last_notified_head_sha"].as_str(),
-        watch_json["last_notified_conclusion"].as_str(),
-        watch_json["last_stale_emitted_sha"].as_str(),
+        state,
+        subscribers,
         &registry,
         provider,
     ))
@@ -1294,14 +1289,8 @@ fn mock_pr_terminal_clears_watch() {
     rt.block_on(ci_check_repo(
         &dir,
         &watch_path,
-        "o/r",
-        "feat",
-        &["agent1".to_string()],
-        None,
-        None,
-        None,
-        None,
-        None,
+        serde_json::from_value(watch.clone()).unwrap(),
+        vec!["agent1".to_string()],
         &registry,
         &provider,
     ))
@@ -2090,14 +2079,8 @@ fn auto_clear_skips_young_watch() {
     rt.block_on(ci_check_repo(
         &dir,
         &watch_path,
-        "o/r",
-        "feat-new",
-        &["agent1".to_string()],
-        None,
-        None,
-        None,
-        None,
-        None,
+        serde_json::from_value(watch.clone()).unwrap(),
+        vec!["agent1".to_string()],
         &registry,
         &provider,
     ))
@@ -2139,14 +2122,8 @@ fn auto_clear_fires_on_old_watch_with_merged_pr() {
     rt.block_on(ci_check_repo(
         &dir,
         &watch_path,
-        "o/r",
-        "feat-old",
-        &["agent1".to_string()],
-        None,
-        None,
-        None,
-        None,
-        None,
+        serde_json::from_value(watch.clone()).unwrap(),
+        vec!["agent1".to_string()],
         &registry,
         &provider,
     ))
@@ -2186,14 +2163,8 @@ fn fresh_branch_no_pr_classified_as_pending() {
     rt.block_on(ci_check_repo(
         &dir,
         &watch_path,
-        "o/r",
-        "feat",
-        &["agent1".to_string()],
-        None,
-        None,
-        None,
-        None,
-        None,
+        serde_json::from_value(watch.clone()).unwrap(),
+        vec!["agent1".to_string()],
         &registry,
         &provider,
     ))
@@ -2226,14 +2197,8 @@ fn branch_with_open_pr_classified_as_active() {
     rt.block_on(ci_check_repo(
         &dir,
         &watch_path,
-        "o/r",
-        "feat",
-        &["agent1".to_string()],
-        None,
-        None,
-        None,
-        None,
-        None,
+        serde_json::from_value(watch.clone()).unwrap(),
+        vec!["agent1".to_string()],
         &registry,
         &provider,
     ))
@@ -2275,14 +2240,8 @@ fn branch_with_merged_pr_classified_as_terminal() {
     rt.block_on(ci_check_repo(
         &dir,
         &watch_path,
-        "o/r",
-        "feat-merged",
-        &["agent1".to_string()],
-        None,
-        None,
-        None,
-        None,
-        None,
+        serde_json::from_value(watch.clone()).unwrap(),
+        vec!["agent1".to_string()],
         &registry,
         &provider,
     ))
@@ -2368,14 +2327,8 @@ fn subscriber_fan_out_notifies_every_member() {
     rt.block_on(ci_check_repo(
         &dir,
         &watch_path,
-        "o/r",
-        "feat",
-        &["lead".to_string(), "dev".to_string()],
-        None,
-        None,
-        None,
-        None,
-        None,
+        serde_json::from_value(watch.clone()).unwrap(),
+        vec!["lead".to_string(), "dev".to_string()],
         &registry,
         &provider,
     ))
@@ -2467,14 +2420,8 @@ fn ci_pass_subscriber_inbox_anti_regression() {
     rt.block_on(ci_check_repo(
         &dir,
         &watch_path,
-        "o/r",
-        "feat",
-        &["lead".to_string(), "dev".to_string()],
-        None,
-        None,
-        None,
-        None,
-        None,
+        serde_json::from_value(watch.clone()).unwrap(),
+        vec!["lead".to_string(), "dev".to_string()],
         &registry,
         &provider,
     ))
@@ -2519,14 +2466,8 @@ fn ci_pass_chain_target_gets_durable_inbox_entry() {
     rt.block_on(ci_check_repo(
         &dir,
         &watch_path,
-        "o/r",
-        "feat",
-        &["lead".to_string(), "dev".to_string()],
-        None,
-        None,
-        None,
-        None,
-        None,
+        serde_json::from_value(watch.clone()).unwrap(),
+        vec!["lead".to_string(), "dev".to_string()],
         &registry,
         &provider,
     ))
@@ -2571,14 +2512,8 @@ fn ci_pass_chain_target_excluded_from_subscriber_loop() {
     rt.block_on(ci_check_repo(
         &dir,
         &watch_path,
-        "o/r",
-        "feat",
-        &["lead".to_string(), "dev".to_string()],
-        None,
-        None,
-        None,
-        None,
-        None,
+        serde_json::from_value(watch.clone()).unwrap(),
+        vec!["lead".to_string(), "dev".to_string()],
         &registry,
         &provider,
     ))
@@ -2694,14 +2629,8 @@ fn ci_ready_for_action_carries_full_head_sha() {
     rt.block_on(ci_check_repo(
         &dir,
         &watch_path,
-        "o/r",
-        "feat",
-        &["lead".to_string()],
-        None,
-        None,
-        None,
-        None,
-        None,
+        serde_json::from_value(watch.clone()).unwrap(),
+        vec!["lead".to_string()],
         &registry,
         &provider,
     ))
@@ -2785,14 +2714,8 @@ fn ci_ready_for_action_carries_pr_number_from_pr_state() {
     rt.block_on(ci_check_repo(
         &dir,
         &watch_path,
-        "o/r",
-        "feat",
-        &["lead".to_string()],
-        None,
-        None,
-        None,
-        None,
-        None,
+        serde_json::from_value(watch.clone()).unwrap(),
+        vec!["lead".to_string()],
         &registry,
         &provider,
     ))
@@ -2855,14 +2778,8 @@ fn ci_ready_for_action_carries_task_id_from_watch_sidecar() {
     rt.block_on(ci_check_repo(
         &dir,
         &watch_path,
-        "o/r",
-        "feat",
-        &["lead".to_string()],
-        None,
-        None,
-        None,
-        None,
-        None,
+        serde_json::from_value(watch.clone()).unwrap(),
+        vec!["lead".to_string()],
         &registry,
         &provider,
     ))
@@ -2941,14 +2858,8 @@ fn ci_pass_chain_target_inbox_kind_is_ready_for_action() {
     rt.block_on(ci_check_repo(
         &dir,
         &watch_path,
-        "o/r",
-        "feat",
-        &["lead".to_string(), "dev".to_string()],
-        None,
-        None,
-        None,
-        None,
-        None,
+        serde_json::from_value(watch.clone()).unwrap(),
+        vec!["lead".to_string(), "dev".to_string()],
         &registry,
         &provider,
     ))
@@ -3000,18 +2911,12 @@ fn ci_pass_chain_target_no_double_fire_on_overlap() {
     rt.block_on(ci_check_repo(
         &dir,
         &watch_path,
-        "o/r",
-        "feat",
-        &[
+        serde_json::from_value(watch.clone()).unwrap(),
+        vec![
             "lead".to_string(),
             "dev".to_string(),
             "reviewer".to_string(),
         ],
-        None,
-        None,
-        None,
-        None,
-        None,
         &registry,
         &provider,
     ))
@@ -4069,14 +3974,8 @@ fn pass_dedupe_drops_ci_pass_for_subscriber_who_is_action_target() {
     rt.block_on(ci_check_repo(
         &dir,
         &watch_path,
-        "o/r",
-        "feat",
-        &["a".to_string(), "b".to_string()],
-        None,
-        None,
-        None,
-        None,
-        None,
+        serde_json::from_value(watch.clone()).unwrap(),
+        vec!["a".to_string(), "b".to_string()],
         &registry,
         &provider,
     ))
@@ -4148,14 +4047,8 @@ fn pass_dedupe_failure_does_not_drop_ci_fail_for_action_target() {
     rt.block_on(ci_check_repo(
         &dir,
         &watch_path,
-        "o/r",
-        "feat",
-        &["a".to_string(), "b".to_string()],
-        None,
-        None,
-        None,
-        None,
-        None,
+        serde_json::from_value(watch.clone()).unwrap(),
+        vec!["a".to_string(), "b".to_string()],
         &registry,
         &provider,
     ))
@@ -4221,14 +4114,8 @@ fn pass_dedupe_non_action_target_subscribers_receive_ci_pass() {
     rt.block_on(ci_check_repo(
         &dir,
         &watch_path,
-        "o/r",
-        "feat",
-        &["a".to_string(), "b".to_string(), "c".to_string()],
-        None,
-        None,
-        None,
-        None,
-        None,
+        serde_json::from_value(watch.clone()).unwrap(),
+        vec!["a".to_string(), "b".to_string(), "c".to_string()],
         &registry,
         &provider,
     ))
@@ -4423,6 +4310,7 @@ fn run_one_poll_cycle(
     let subscribers = parse_subscribers(watch);
     let watch_path = ci_dir.join(watch_filename(repo, branch));
     std::fs::write(&watch_path, serde_json::to_string_pretty(watch).unwrap()).unwrap();
+    let state: WatchState = serde_json::from_value(watch.clone()).unwrap();
     let registry: AgentRegistry =
         Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -4432,14 +4320,8 @@ fn run_one_poll_cycle(
     let _ = rt.block_on(ci_check_repo(
         dir,
         &watch_path,
-        repo,
-        branch,
-        &subscribers,
-        None,
-        None,
-        None,
-        None,
-        None,
+        state,
+        subscribers,
         &registry,
         provider,
     ));
@@ -4927,14 +4809,8 @@ fn ci_check_repo_success_no_pty_inject_only_inbox() {
     rt.block_on(ci_check_repo(
         &dir,
         &watch_path,
-        "o/r",
-        "feat",
-        &subscribers,
-        None,
-        None,
-        None,
-        None,
-        None,
+        serde_json::from_value(watch.clone()).unwrap(),
+        subscribers,
         &registry,
         &provider,
     ))

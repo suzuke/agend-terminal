@@ -45,10 +45,8 @@ impl CiProvider for CachedCiProvider {
         self.inner.token_warning()
     }
 }
-use super::registry::{
-    ci_watches_dir, remove_watch, update_watch_state, update_watch_state_with_notify,
-};
-use super::sweep::{bump_consecutive_skips_and_maybe_notify, clear_stall_and_maybe_notify_resumed};
+use super::registry::{ci_watches_dir, flush_watch_state, remove_watch};
+use super::sweep::{bump_consecutive_skips_and_maybe_notify, clear_stall_state};
 use super::watch_state::WatchState;
 use super::WATCH_TTL_HOURS;
 
@@ -64,7 +62,9 @@ use super::provider::{
 #[cfg(test)]
 use super::registry::{parse_subscribers, watch_filename};
 #[cfg(test)]
-use super::sweep::{gc_stale_watches, startup_sweep, STALL_THRESHOLD};
+use super::sweep::{
+    clear_stall_and_maybe_notify_resumed, gc_stale_watches, startup_sweep, STALL_THRESHOLD,
+};
 #[cfg(test)]
 use super::watcher::check_ci_watches;
 
@@ -240,13 +240,7 @@ enum SkipReason {
 
 struct PollContext {
     repo: String,
-    branch: String,
     subscribers: Vec<String>,
-    last_run_id: Option<u64>,
-    head_sha: Option<String>,
-    last_notified_sha: Option<String>,
-    last_notified_conclusion: Option<String>,
-    last_stale_emitted_sha: Option<String>,
     stamped_watch: WatchState,
 }
 
@@ -295,13 +289,7 @@ fn prepare_poll_context(
     stamped.effective_interval_secs = Some(effective_interval);
     Ok(PollContext {
         repo: watch.repo.clone(),
-        branch: watch.branch.clone(),
         subscribers,
-        last_run_id: watch.last_run_id,
-        head_sha: watch.head_sha.clone(),
-        last_notified_sha: watch.last_notified_head_sha.clone(),
-        last_notified_conclusion: watch.last_notified_conclusion.clone(),
-        last_stale_emitted_sha: watch.last_stale_emitted_sha.clone(),
         stamped_watch: stamped,
     })
 }
@@ -353,25 +341,24 @@ pub(super) fn check_ci_watches_with_provider(
                 let home = home.to_path_buf();
                 let watch_path = path.clone();
                 let registry = Arc::clone(registry);
+                let PollContext {
+                    repo,
+                    subscribers,
+                    stamped_watch,
+                } = ctx;
                 // fire-and-forget: ci_check is one-shot per poll cycle
                 shared_ci_runtime().spawn(async move {
                     if let Err(e) = ci_check_repo(
                         &home,
                         &watch_path,
-                        &ctx.repo,
-                        &ctx.branch,
-                        &ctx.subscribers,
-                        ctx.last_run_id,
-                        ctx.head_sha.as_deref(),
-                        ctx.last_notified_sha.as_deref(),
-                        ctx.last_notified_conclusion.as_deref(),
-                        ctx.last_stale_emitted_sha.as_deref(),
+                        stamped_watch,
+                        subscribers,
                         &registry,
                         provider.as_ref(),
                     )
                     .await
                     {
-                        tracing::warn!(repo = %ctx.repo, error = %e, "CI check failed");
+                        tracing::warn!(repo = %repo, error = %e, "CI check failed");
                     }
                 });
             }
@@ -741,42 +728,56 @@ struct NotifyOutcome {
 /// (item 2). The audit string for `remove_watch` joins all subscribers
 /// with commas so event-log readers can see the full membership at the
 /// moment of removal.
-#[allow(clippy::too_many_arguments)]
+/// Single-load-per-tick entry point: receives the pre-loaded `WatchState`
+/// from the caller, passes `&mut` to sub-functions, and flushes once at
+/// the end when state has changed.
 async fn ci_check_repo(
     home: &Path,
     watch_path: &Path,
-    repo: &str,
-    branch: &str,
-    subscribers: &[String],
-    last_run_id: Option<u64>,
-    prev_head_sha: Option<&str>,
-    last_notified_sha: Option<&str>,
-    last_notified_conclusion: Option<&str>,
-    last_stale_emitted_sha: Option<&str>,
+    mut state: WatchState,
+    subscribers: Vec<String>,
     registry: &AgentRegistry,
     provider: &dyn CiProvider,
 ) -> anyhow::Result<()> {
+    let snapshot = state.clone();
+    let repo = state.repo.clone();
+    let branch = state.branch.clone();
     let ctx = CiCheckCtx {
         home,
         watch_path,
-        repo,
-        branch,
-        subscribers,
+        repo: &repo,
+        branch: &branch,
+        subscribers: &subscribers,
     };
-    if check_and_remove_terminal_pr(&ctx, provider).await? {
+    if check_and_remove_terminal_pr(&ctx, &state, provider).await? {
         return Ok(());
     }
-    check_and_alert_mergeable(&ctx, provider).await;
+    check_and_alert_mergeable(&ctx, &mut state, provider).await;
+    let prev_head_sha = state.head_sha.clone();
+    let last_notified_sha = state.last_notified_head_sha.clone();
+    let last_notified_conclusion = state.last_notified_conclusion.clone();
+    let last_stale_emitted_sha = state.last_stale_emitted_sha.clone();
     let tracking = RunTracking {
-        last_run_id,
-        prev_head_sha,
-        last_notified_sha,
-        last_notified_conclusion,
-        last_stale_emitted_sha,
+        last_run_id: state.last_run_id,
+        prev_head_sha: prev_head_sha.as_deref(),
+        last_notified_sha: last_notified_sha.as_deref(),
+        last_notified_conclusion: last_notified_conclusion.as_deref(),
+        last_stale_emitted_sha: last_stale_emitted_sha.as_deref(),
     };
-    let pr = match poll_ci_runs(&ctx, &tracking, provider).await? {
-        Some(pr) => pr,
-        None => return Ok(()),
+    let pr = match poll_ci_runs(&ctx, &tracking, &mut state, provider).await {
+        Ok(Some(pr)) => pr,
+        Ok(None) => {
+            if state != snapshot {
+                flush_watch_state(watch_path, &state);
+            }
+            return Ok(());
+        }
+        Err(e) => {
+            if state != snapshot {
+                flush_watch_state(watch_path, &state);
+            }
+            return Err(e);
+        }
     };
     let to_notify = select_runs_to_notify(
         &pr.runs,
@@ -785,7 +786,14 @@ async fn ci_check_repo(
     );
     if to_notify.is_empty() {
         if let Some(id) = pr.effective_last_run_id {
-            update_watch_state(ctx.watch_path, Some(id), &pr.current_sha);
+            state.last_run_id = Some(id);
+            if !pr.current_sha.is_empty() {
+                state.head_sha = Some(pr.current_sha.clone());
+            }
+            state.last_terminal_seen_at = Some(chrono::Utc::now().to_rfc3339());
+        }
+        if state != snapshot {
+            flush_watch_state(watch_path, &state);
         }
         return Ok(());
     }
@@ -795,26 +803,25 @@ async fn ci_check_repo(
         tracking.last_notified_sha,
         tracking.last_notified_conclusion,
     );
-    let outcome = fan_out_notifications(&ctx, &pr, &deduped, &tracking, registry, provider).await;
-    persist_watch_state(&ctx, &pr, &outcome);
+    let outcome =
+        fan_out_notifications(&ctx, &state, &pr, &deduped, &tracking, registry, provider).await;
+    persist_watch_state(&ctx, &pr, &outcome, &mut state);
+    if state != snapshot {
+        flush_watch_state(watch_path, &state);
+    }
     Ok(())
 }
 
 async fn check_and_remove_terminal_pr(
     ctx: &CiCheckCtx<'_>,
+    state: &WatchState,
     provider: &dyn CiProvider,
 ) -> anyhow::Result<bool> {
     let PrState::Terminal { merged } = provider.check_pr_terminal(ctx.repo, ctx.branch).await
     else {
         return Ok(false);
     };
-    let Ok(content) = std::fs::read_to_string(ctx.watch_path) else {
-        return Ok(false);
-    };
-    let Ok(watch) = serde_json::from_str::<WatchState>(&content) else {
-        return Ok(false);
-    };
-    if let Some(expires_at) = watch.expires_at.as_deref() {
+    if let Some(expires_at) = state.expires_at.as_deref() {
         if let Ok(exp) = chrono::DateTime::parse_from_rfc3339(expires_at) {
             let watch_age =
                 exp.with_timezone(&chrono::Utc) - chrono::Duration::hours(WATCH_TTL_HOURS);
@@ -852,42 +859,28 @@ async fn check_and_remove_terminal_pr(
     Ok(true)
 }
 
-async fn check_and_alert_mergeable(ctx: &CiCheckCtx<'_>, provider: &dyn CiProvider) {
+async fn check_and_alert_mergeable(
+    ctx: &CiCheckCtx<'_>,
+    state: &mut WatchState,
+    provider: &dyn CiProvider,
+) {
     const MERGEABLE_RECHECK_INTERVAL_SECS: i64 = 300;
-    let (should_recheck, prev_mergeable) = match std::fs::read_to_string(ctx.watch_path)
-        .ok()
-        .and_then(|c| serde_json::from_str::<WatchState>(&c).ok())
-    {
-        Some(w) => {
-            let last = w
-                .last_mergeable_check_at
-                .as_deref()
-                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                .map(|d| d.with_timezone(&chrono::Utc));
-            let now = chrono::Utc::now();
-            let elapsed_ok = last
-                .map(|d| {
-                    now.signed_duration_since(d).num_seconds() >= MERGEABLE_RECHECK_INTERVAL_SECS
-                })
-                .unwrap_or(true);
-            (elapsed_ok, w.last_mergeable_state)
-        }
-        None => (true, None),
-    };
+    let last = state
+        .last_mergeable_check_at
+        .as_deref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.with_timezone(&chrono::Utc));
+    let now = chrono::Utc::now();
+    let should_recheck = last
+        .map(|d| now.signed_duration_since(d).num_seconds() >= MERGEABLE_RECHECK_INTERVAL_SECS)
+        .unwrap_or(true);
     if !should_recheck {
         return;
     }
+    let prev_mergeable = state.last_mergeable_state.clone();
     let new_state = provider.check_pr_mergeable(ctx.repo, ctx.branch).await;
-    let now_rfc3339 = chrono::Utc::now().to_rfc3339();
-    if let Ok(content) = std::fs::read_to_string(ctx.watch_path) {
-        if let Ok(mut w) = serde_json::from_str::<WatchState>(&content) {
-            w.last_mergeable_state = Some(new_state.as_str().to_string());
-            w.last_mergeable_check_at = Some(now_rfc3339);
-            if let Ok(out) = serde_json::to_string_pretty(&w) {
-                let _ = crate::store::atomic_write(ctx.watch_path, out.as_bytes());
-            }
-        }
-    }
+    state.last_mergeable_state = Some(new_state.as_str().to_string());
+    state.last_mergeable_check_at = Some(now.to_rfc3339());
     if matches!(new_state, MergeableState::Conflicting)
         && prev_mergeable.as_deref() != Some("CONFLICTING")
     {
@@ -904,6 +897,7 @@ async fn check_and_alert_mergeable(ctx: &CiCheckCtx<'_>, provider: &dyn CiProvid
 async fn poll_ci_runs(
     ctx: &CiCheckCtx<'_>,
     tracking: &RunTracking<'_>,
+    state: &mut WatchState,
     provider: &dyn CiProvider,
 ) -> anyhow::Result<Option<PollResult>> {
     let poll_result = provider.poll_runs(ctx.repo, ctx.branch).await?;
@@ -914,17 +908,7 @@ async fn poll_ci_runs(
             rate_limit_reset,
         } => {
             if let Some(reset_epoch) = rate_limit_reset {
-                if let Ok(content) = std::fs::read_to_string(ctx.watch_path) {
-                    if let Ok(mut watch) = serde_json::from_str::<WatchState>(&content) {
-                        watch.rate_limit_until = Some(reset_epoch);
-                        let _ = crate::store::atomic_write(
-                            ctx.watch_path,
-                            serde_json::to_string_pretty(&watch)
-                                .unwrap_or_default()
-                                .as_bytes(),
-                        );
-                    }
-                }
+                state.rate_limit_until = Some(reset_epoch);
             }
             let notify_msg = match rate_limit_reset {
                 Some(reset) => format!(
@@ -951,31 +935,13 @@ async fn poll_ci_runs(
             rate_limit_remaining,
             rate_limit_limit,
         } => {
-            if rate_limit_remaining.is_some() || rate_limit_limit.is_some() {
-                if let Ok(content) = std::fs::read_to_string(ctx.watch_path) {
-                    if let Ok(mut watch) = serde_json::from_str::<WatchState>(&content) {
-                        if let Some(r) = rate_limit_remaining {
-                            watch.rate_limit_remaining = Some(r);
-                        }
-                        if let Some(l) = rate_limit_limit {
-                            watch.rate_limit_limit = Some(l);
-                        }
-                        let _ = crate::store::atomic_write(
-                            ctx.watch_path,
-                            serde_json::to_string_pretty(&watch)
-                                .unwrap_or_default()
-                                .as_bytes(),
-                        );
-                    }
-                }
+            if let Some(r) = rate_limit_remaining {
+                state.rate_limit_remaining = Some(r);
             }
-            clear_stall_and_maybe_notify_resumed(
-                ctx.home,
-                ctx.watch_path,
-                ctx.repo,
-                ctx.branch,
-                ctx.subscribers,
-            );
+            if let Some(l) = rate_limit_limit {
+                state.rate_limit_limit = Some(l);
+            }
+            clear_stall_state(state, ctx.home, ctx.repo, ctx.branch, ctx.subscribers);
             if runs.is_empty() {
                 return Ok(None);
             }
@@ -1012,6 +978,7 @@ async fn poll_ci_runs(
 
 async fn fan_out_notifications(
     ctx: &CiCheckCtx<'_>,
+    state: &WatchState,
     pr: &PollResult,
     deduped: &[(usize, u64, &str)],
     tracking: &RunTracking<'_>,
@@ -1077,18 +1044,15 @@ async fn fan_out_notifications(
 
             let repo_branch_key = format!("{}@{}", ctx.repo, ctx.branch);
             let supersede_token = format!("ci-{}-{}", run_id, sha);
-            let action_target_on_success: Option<String> = if conclusion == Some("success") {
-                std::fs::read_to_string(ctx.watch_path)
-                    .ok()
-                    .and_then(|c| serde_json::from_str::<WatchState>(&c).ok())
-                    .and_then(|w| w.next_after_ci.filter(|s| !s.is_empty()))
+            let action_target_on_success: Option<&str> = if conclusion == Some("success") {
+                state.next_after_ci.as_deref().filter(|s| !s.is_empty())
             } else {
                 None
             };
             let fleet_cfg =
                 crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(ctx.home)).ok();
             for sub in ctx.subscribers {
-                if action_target_on_success.as_deref() == Some(sub.as_str()) {
+                if action_target_on_success == Some(sub.as_str()) {
                     continue;
                 }
                 let in_registry = agent::lock_registry(registry).contains_key(sub);
@@ -1131,73 +1095,77 @@ async fn fan_out_notifications(
     }
 }
 
-fn persist_watch_state(ctx: &CiCheckCtx<'_>, pr: &PollResult, outcome: &NotifyOutcome) {
+fn persist_watch_state(
+    ctx: &CiCheckCtx<'_>,
+    pr: &PollResult,
+    outcome: &NotifyOutcome,
+    state: &mut WatchState,
+) {
     if outcome.new_notified_sha.is_some() {
-        if let Ok(content) = std::fs::read_to_string(ctx.watch_path) {
-            if let Ok(watch) = serde_json::from_str::<WatchState>(&content) {
-                if let Some(next) = watch.next_after_ci.as_deref().filter(|s| !s.is_empty()) {
-                    let last_conclusion = aggregate_conclusion_for_sha_filtered(
-                        &pr.runs,
-                        &pr.current_sha,
-                        watch.required_checks.as_deref(),
-                    );
-                    if last_conclusion == Some("success") {
-                        let repo_branch_key = format!("{}@{}", ctx.repo, ctx.branch);
-                        let pr_number =
-                            crate::daemon::pr_state::load(ctx.home, ctx.repo, ctx.branch)
-                                .map(|s| s.pr_number);
-                        let task_id = watch.task_id.as_deref();
-                        let msg = make_ci_ready_for_action_msg(
-                            ctx.repo,
-                            ctx.branch,
-                            &repo_branch_key,
-                            Some(&pr.current_sha),
-                            pr_number,
-                            task_id,
-                        );
-                        let _ = crate::inbox::enqueue_with_idle_hint(ctx.home, next, msg);
-                    }
-                }
-
-                let last_conclusion = aggregate_conclusion_for_sha(&pr.runs, &pr.current_sha);
-                let conclusion = match last_conclusion {
-                    Some("success") => crate::daemon::pr_state::CiConclusion::Green,
-                    Some(other) => {
-                        crate::daemon::pr_state::CiConclusion::Failed { conclusion: other }
-                    }
-                    None => crate::daemon::pr_state::CiConclusion::Pending,
-                };
-                let subscribers = watch.subscriber_names();
-                let review_class = match watch
-                    .review_class
-                    .as_deref()
-                    .map(|s| s.to_ascii_lowercase())
-                    .as_deref()
-                {
-                    Some("dual") => crate::daemon::pr_state::ReviewClass::Dual,
-                    _ => crate::daemon::pr_state::ReviewClass::Single,
-                };
-                crate::daemon::pr_state::record_ci_result(
-                    ctx.home,
+        if let Some(next) = state.next_after_ci.as_deref().filter(|s| !s.is_empty()) {
+            let last_conclusion = aggregate_conclusion_for_sha_filtered(
+                &pr.runs,
+                &pr.current_sha,
+                state.required_checks.as_deref(),
+            );
+            if last_conclusion == Some("success") {
+                let repo_branch_key = format!("{}@{}", ctx.repo, ctx.branch);
+                let pr_number = crate::daemon::pr_state::load(ctx.home, ctx.repo, ctx.branch)
+                    .map(|s| s.pr_number);
+                let task_id = state.task_id.as_deref();
+                let msg = make_ci_ready_for_action_msg(
                     ctx.repo,
                     ctx.branch,
-                    &pr.current_sha,
-                    conclusion,
-                    subscribers,
-                    review_class,
+                    &repo_branch_key,
+                    Some(&pr.current_sha),
+                    pr_number,
+                    task_id,
                 );
+                let _ = crate::inbox::enqueue_with_idle_hint(ctx.home, next, msg);
             }
         }
+
+        let last_conclusion = aggregate_conclusion_for_sha(&pr.runs, &pr.current_sha);
+        let conclusion = match last_conclusion {
+            Some("success") => crate::daemon::pr_state::CiConclusion::Green,
+            Some(other) => crate::daemon::pr_state::CiConclusion::Failed { conclusion: other },
+            None => crate::daemon::pr_state::CiConclusion::Pending,
+        };
+        let subscriber_names = state.subscriber_names();
+        let review_class = match state
+            .review_class
+            .as_deref()
+            .map(|s| s.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("dual") => crate::daemon::pr_state::ReviewClass::Dual,
+            _ => crate::daemon::pr_state::ReviewClass::Single,
+        };
+        crate::daemon::pr_state::record_ci_result(
+            ctx.home,
+            ctx.repo,
+            ctx.branch,
+            &pr.current_sha,
+            conclusion,
+            subscriber_names,
+            review_class,
+        );
     }
 
-    update_watch_state_with_notify(
-        ctx.watch_path,
-        Some(outcome.max_notified_id),
-        &pr.current_sha,
-        outcome.new_notified_sha.as_deref(),
-        outcome.new_notified_conclusion.as_deref(),
-        outcome.new_stale_emitted_sha.as_deref(),
-    );
+    state.last_run_id = Some(outcome.max_notified_id);
+    if !pr.current_sha.is_empty() {
+        state.head_sha = Some(pr.current_sha.clone());
+    }
+    if let Some(sha) = &outcome.new_notified_sha {
+        state.last_notified_head_sha = Some(sha.clone());
+    }
+    if let Some(c) = &outcome.new_notified_conclusion {
+        state.last_notified_conclusion = Some(c.clone());
+    }
+    if let Some(s) = &outcome.new_stale_emitted_sha {
+        state.last_stale_emitted_sha = Some(s.clone());
+    }
+    state.last_terminal_seen_at = Some(chrono::Utc::now().to_rfc3339());
 }
 
 #[cfg(test)]
