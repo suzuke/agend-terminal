@@ -902,16 +902,22 @@ pub(crate) fn process_server_rate_limit_retries(
                 tracing::info!(
                     agent = %name,
                     msg_id = %msg_id,
-                    "#836: ServerRateLimit retry suppressed — msg already consumed"
+                    "#836: ServerRateLimit retry suppressed — msg already consumed, fallback \\r"
                 );
                 crate::event_log::log(
                     home,
                     "server_rate_limit_retry_suppressed",
                     name,
-                    &format!("msg_id={msg_id} consumed_post_inject"),
+                    &format!("msg_id={msg_id} consumed_post_inject fallback=\\r"),
                 );
                 retry.dedup_count = NOTIFICATION_DEDUP_CAP;
                 crate::daemon::dedup_state::save(home, name, retry);
+                // #1272: fallback inject "\r" so the agent gets a prod
+                // instead of silently stalling.
+                let reg = agent::lock_registry(registry);
+                if let Some(handle) = reg.get(name.as_str()) {
+                    let _ = agent::inject_to_agent(handle, b"\r");
+                }
                 continue;
             }
         }
