@@ -52,6 +52,10 @@ pub struct WatchState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_terminal_seen_at: Option<String>,
 
+    // Two-consecutive-terminal guard (#1267)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_since: Option<String>,
+
     // Mergeable state (#813 periodic recheck)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_mergeable_state: Option<String>,
