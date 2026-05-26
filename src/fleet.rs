@@ -3,6 +3,24 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+/// Mtime-based cache for `FleetConfig::load()`.
+/// Avoids repeated `read_to_string` + `serde_yaml_ng` parse when the
+/// file hasn't changed on disk.
+static FLEET_CACHE: std::sync::Mutex<Option<FleetCacheEntry>> = std::sync::Mutex::new(None);
+
+struct FleetCacheEntry {
+    path: PathBuf,
+    mtime: SystemTime,
+    config: FleetConfig,
+}
+
+#[cfg(test)]
+pub(crate) fn clear_cache() {
+    let mut guard = FLEET_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = None;
+}
 
 /// Single source of truth for the fleet configuration filename.
 pub const FLEET_YAML_FILENAME: &str = "fleet.yaml";
@@ -266,6 +284,32 @@ pub struct TeamConfig {
 
 impl FleetConfig {
     pub fn load(path: &Path) -> Result<Self> {
+        let disk_mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+
+        if let Some(mtime) = disk_mtime {
+            let guard = FLEET_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = guard.as_ref() {
+                if entry.path == path && entry.mtime == mtime {
+                    return Ok(entry.config.clone());
+                }
+            }
+        }
+
+        let config = Self::load_uncached(path)?;
+
+        if let Some(mtime) = disk_mtime {
+            let mut guard = FLEET_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = Some(FleetCacheEntry {
+                path: path.to_path_buf(),
+                mtime,
+                config: config.clone(),
+            });
+        }
+
+        Ok(config)
+    }
+
+    fn load_uncached(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read fleet config: {}", path.display()))?;
         let mut config: FleetConfig = serde_yaml_ng::from_str(&content)
@@ -3796,5 +3840,45 @@ instances:
             cfg.instances.get("test-964-verify")
         );
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn load_cache_returns_same_result_on_unchanged_file() {
+        let _g = env_guard();
+        clear_cache();
+        let dir =
+            std::env::temp_dir().join(format!("agend-fleet-cache-hit-{}", std::process::id()));
+        let path = write_fleet(&dir, "instances:\n  cached-agent:\n    backend: claude\n");
+        let first = FleetConfig::load(&path).expect("first load");
+        let second = FleetConfig::load(&path).expect("second load (cached)");
+        assert_eq!(first.instances.len(), second.instances.len());
+        assert!(second.instances.contains_key("cached-agent"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_cache_invalidates_on_file_change() {
+        let _g = env_guard();
+        clear_cache();
+        let dir =
+            std::env::temp_dir().join(format!("agend-fleet-cache-inv-{}", std::process::id()));
+        let path = write_fleet(&dir, "instances:\n  old-agent:\n    backend: claude\n");
+        let first = FleetConfig::load(&path).expect("first load");
+        assert!(first.instances.contains_key("old-agent"));
+
+        // Ensure mtime changes (some filesystems have 1-second granularity)
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(&path, "instances:\n  new-agent:\n    backend: claude\n").expect("rewrite");
+
+        let second = FleetConfig::load(&path).expect("second load (invalidated)");
+        assert!(
+            !second.instances.contains_key("old-agent"),
+            "old-agent should be gone after rewrite"
+        );
+        assert!(
+            second.instances.contains_key("new-agent"),
+            "new-agent should appear after rewrite"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
