@@ -1,5 +1,7 @@
 //! Core rendering: main entry point, tab bar, status bar, pane tree.
 
+use std::collections::HashMap;
+
 use super::border::{render_border_grid, render_pane_titles};
 use crate::agent::{self, AgentRegistry};
 use crate::channel::TelegramStatus;
@@ -50,11 +52,26 @@ pub fn state_color(state: AgentState) -> Color {
     }
 }
 
-pub(super) fn get_agent_state(registry: &AgentRegistry, name: &str) -> AgentState {
+fn build_agent_state_snapshot(
+    layout: &Layout,
+    registry: &AgentRegistry,
+) -> HashMap<String, AgentState> {
     let reg = agent::lock_registry(registry);
-    reg.get(name)
-        .map(|h| h.core.lock().state.get_state())
-        .unwrap_or(AgentState::Idle)
+    let mut snapshot = HashMap::new();
+    for tab in &layout.tabs {
+        for id in tab.root().pane_ids() {
+            if let Some(pane) = tab.root().find_pane(id) {
+                if pane.backend.is_some() {
+                    snapshot.entry(pane.agent_name.clone()).or_insert_with(|| {
+                        reg.get(&pane.agent_name)
+                            .map(|h| h.core.lock().state.get_state())
+                            .unwrap_or(AgentState::Idle)
+                    });
+                }
+            }
+        }
+    }
+    snapshot
 }
 
 pub fn render(
@@ -74,18 +91,25 @@ pub fn render(
         ])
         .split(frame.area());
 
-    render_pane_tree(frame, chunks[1], layout, repeat_mode, registry);
-    render_tab_bar(frame, chunks[0], layout, registry);
+    let snapshot = build_agent_state_snapshot(layout, registry);
+    render_pane_tree(frame, chunks[1], layout, repeat_mode, &snapshot);
+    render_tab_bar(frame, chunks[0], layout, &snapshot);
     render_status_bar(frame, chunks[2], layout, telegram, binary_stale);
 }
 
 /// Get the highest-priority state across all panes in a tab.
-pub fn highest_priority_state(tab: &crate::layout::Tab, registry: &AgentRegistry) -> AgentState {
+pub fn highest_priority_state(
+    tab: &crate::layout::Tab,
+    snapshot: &HashMap<String, AgentState>,
+) -> AgentState {
     let mut best = AgentState::Idle;
     for id in tab.root().pane_ids() {
         if let Some(pane) = tab.root().find_pane(id) {
             if pane.backend.is_some() {
-                let s = get_agent_state(registry, &pane.agent_name);
+                let s = snapshot
+                    .get(&pane.agent_name)
+                    .copied()
+                    .unwrap_or(AgentState::Idle);
                 if s.priority() > best.priority() {
                     best = s;
                 }
@@ -96,7 +120,12 @@ pub fn highest_priority_state(tab: &crate::layout::Tab, registry: &AgentRegistry
 }
 
 /// SYNC: layout math (label width, spacing) must match tab_bar_hit_test() in app.rs.
-fn render_tab_bar(frame: &mut Frame, area: Rect, layout: &Layout, registry: &AgentRegistry) {
+fn render_tab_bar(
+    frame: &mut Frame,
+    area: Rect,
+    layout: &Layout,
+    snapshot: &HashMap<String, AgentState>,
+) {
     let mut spans = Vec::new();
 
     let drag_tab_target = layout
@@ -110,7 +139,7 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, layout: &Layout, registry: &Age
         let is_reorder_target = layout
             .tab_reorder_target
             .is_some_and(|t| t == i && layout.tab_reorder_source.is_some_and(|s| s != i));
-        let state = highest_priority_state(tab, registry);
+        let state = highest_priority_state(tab, snapshot);
         let sc = state_color(state);
 
         let style = if is_drag_drop || is_reorder_target {
@@ -185,7 +214,7 @@ fn render_pane_tree(
     area: Rect,
     layout: &mut Layout,
     repeat_mode: bool,
-    registry: &AgentRegistry,
+    snapshot: &HashMap<String, AgentState>,
 ) {
     let tab = match layout.tabs.get_mut(layout.active) {
         Some(t) => t,
@@ -205,7 +234,7 @@ fn render_pane_tree(
 
     if tab.zoomed {
         if let Some(pane) = tab.root_mut().find_pane_mut(focus_id) {
-            let info = render_pane(frame, area, pane, true, false, registry, false, false);
+            let info = render_pane(frame, area, pane, true, false, snapshot, false, false);
             let infos = vec![info];
             render_border_grid(frame, &infos);
             render_pane_titles(frame, &infos);
@@ -228,7 +257,7 @@ fn render_pane_tree(
         &mut rects,
         &mut border_infos,
         repeat_mode,
-        registry,
+        snapshot,
         drag_source,
         drag_target,
     );
@@ -246,7 +275,7 @@ fn render_node(
     rects: &mut std::collections::HashMap<usize, (u16, u16, u16, u16)>,
     border_infos: &mut Vec<PaneBorderInfo>,
     repeat_mode: bool,
-    registry: &AgentRegistry,
+    snapshot: &HashMap<String, AgentState>,
     drag_source: Option<usize>,
     drag_target: Option<usize>,
 ) {
@@ -262,7 +291,7 @@ fn render_node(
                 pane,
                 focused,
                 repeat_mode,
-                registry,
+                snapshot,
                 is_drag_source,
                 is_drag_target,
             );
@@ -283,7 +312,7 @@ fn render_node(
                 rects,
                 border_infos,
                 repeat_mode,
-                registry,
+                snapshot,
                 drag_source,
                 drag_target,
             );
@@ -295,7 +324,7 @@ fn render_node(
                 rects,
                 border_infos,
                 repeat_mode,
-                registry,
+                snapshot,
                 drag_source,
                 drag_target,
             );
@@ -318,7 +347,7 @@ fn render_pane(
     pane: &mut crate::layout::Pane,
     focused: bool,
     repeat_mode: bool,
-    registry: &AgentRegistry,
+    snapshot: &HashMap<String, AgentState>,
     is_drag_source: bool,
     is_drag_target: bool,
 ) -> PaneBorderInfo {
@@ -329,7 +358,10 @@ fn render_pane(
     }
 
     let state = if pane.backend.is_some() {
-        get_agent_state(registry, &pane.agent_name)
+        snapshot
+            .get(&pane.agent_name)
+            .copied()
+            .unwrap_or(AgentState::Idle)
     } else {
         AgentState::Idle
     };
@@ -644,9 +676,8 @@ mod tests {
                 source: PaneSource::Local,
             },
         );
-        let registry: crate::agent::AgentRegistry =
-            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
-        let result = highest_priority_state(&tab, &registry);
+        let snapshot = HashMap::new();
+        let result = highest_priority_state(&tab, &snapshot);
         assert_eq!(result, AgentState::Idle);
     }
 

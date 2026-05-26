@@ -16,21 +16,36 @@ use super::panels_fleet::{render_fleet_view, render_monitor_view};
 /// The `None`-vs-`Some(empty)` distinction matters at the filter site:
 /// `None` falls back to current (unfiltered) behavior so a degraded
 /// daemon doesn't make the indicator misleadingly report "all idle".
-/// Per-render call cost is one localhost TCP round-trip; if the
-/// overlay's render frequency makes this a hotspot, a TTL cache can
-/// be slotted in here without changing the call site.
+/// Per-render call cost is one localhost TCP round-trip, amortised
+/// behind a 2-second TTL cache so consecutive frames reuse the
+/// previous result without a network call.
 ///
 /// #830: thin wrapper over `crate::runtime::list_live_agents` (the
 /// canonical helper consolidated when #830 became the fourth consumer
 /// of this pattern). The wrapper survives so the call site keeps the
 /// `tracing::warn!` observability hook that #827 added.
 fn fetch_live_agents(home: &std::path::Path) -> Option<HashSet<String>> {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    type Cache = (Option<Instant>, Option<HashSet<String>>);
+    static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
+    const TTL: Duration = Duration::from_secs(2);
+
+    let cache = CACHE.get_or_init(|| Mutex::new((None, None)));
+    let Ok(mut guard) = cache.lock() else {
+        return crate::runtime::list_live_agents(home);
+    };
+    if guard.0.is_some_and(|ts| ts.elapsed() < TTL) {
+        return guard.1.clone();
+    }
     let result = crate::runtime::list_live_agents(home);
     if result.is_none() {
         tracing::warn!(
             "#827: api::call(LIST) failed — active-indicator ghost filter degrading to identity"
         );
     }
+    *guard = (Some(Instant::now()), result.clone());
     result
 }
 
