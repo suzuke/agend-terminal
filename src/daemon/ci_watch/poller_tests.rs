@@ -5019,11 +5019,14 @@ impl CiProvider for CountingProvider {
     }
 }
 
+fn new_tick_cache() -> super::TickCache {
+    std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 #[test]
 fn tick_cache_dedup_same_repo_branch_single_api_call() {
     let call_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let cache: super::TickCache =
-        std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let cache = new_tick_cache();
     let provider = super::CachedCiProvider {
         inner: Box::new(CountingProvider {
             call_count: std::sync::Arc::clone(&call_count),
@@ -5054,8 +5057,7 @@ fn tick_cache_dedup_same_repo_branch_single_api_call() {
 #[test]
 fn tick_cache_different_repo_branch_independent_calls() {
     let call_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let cache: super::TickCache =
-        std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let cache = new_tick_cache();
     let provider = super::CachedCiProvider {
         inner: Box::new(CountingProvider {
             call_count: std::sync::Arc::clone(&call_count),
@@ -5081,14 +5083,12 @@ fn tick_cache_does_not_persist_across_ticks() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     // Tick 1
     {
-        let cache: super::TickCache =
-            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
         let provider = super::CachedCiProvider {
             inner: Box::new(CountingProvider {
                 call_count: std::sync::Arc::clone(&call_count),
                 runs: vec![],
             }),
-            poll_cache: cache,
+            poll_cache: new_tick_cache(),
         };
         rt.block_on(async {
             let _ = provider.poll_runs("owner/repo", "main").await;
@@ -5096,14 +5096,12 @@ fn tick_cache_does_not_persist_across_ticks() {
     }
     // Tick 2 — fresh cache
     {
-        let cache: super::TickCache =
-            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
         let provider = super::CachedCiProvider {
             inner: Box::new(CountingProvider {
                 call_count: std::sync::Arc::clone(&call_count),
                 runs: vec![],
             }),
-            poll_cache: cache,
+            poll_cache: new_tick_cache(),
         };
         rt.block_on(async {
             let _ = provider.poll_runs("owner/repo", "main").await;
@@ -5113,5 +5111,41 @@ fn tick_cache_does_not_persist_across_ticks() {
         call_count.load(std::sync::atomic::Ordering::Relaxed),
         2,
         "each tick must create a fresh cache — no cross-tick sharing"
+    );
+}
+
+#[tokio::test]
+async fn tick_cache_concurrent_same_key_single_api_call() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    let call_count = Arc::new(AtomicU32::new(0));
+    let cache = new_tick_cache();
+    let barrier = Arc::new(tokio::sync::Barrier::new(4));
+
+    let mut handles = Vec::new();
+    for _ in 0..4 {
+        let cc = Arc::clone(&call_count);
+        let c = Arc::clone(&cache);
+        let b = Arc::clone(&barrier);
+        handles.push(tokio::spawn(async move {
+            let provider = super::CachedCiProvider {
+                inner: Box::new(CountingProvider {
+                    call_count: cc,
+                    runs: vec![],
+                }),
+                poll_cache: c,
+            };
+            b.wait().await;
+            provider.poll_runs("owner/repo", "feat/x").await.unwrap();
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+    assert_eq!(
+        call_count.load(Ordering::Relaxed),
+        1,
+        "4 concurrent tasks with same key must coalesce to 1 API call"
     );
 }

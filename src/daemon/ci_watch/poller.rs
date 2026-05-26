@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use super::provider::{CiPollResult, CiProvider, CiRun, MergeableState, PrState};
 
-type TickCache = Arc<tokio::sync::Mutex<std::collections::HashMap<(String, String), CiPollResult>>>;
+type PerKeySlot = Arc<tokio::sync::Mutex<Option<CiPollResult>>>;
+type TickCache = Arc<std::sync::Mutex<std::collections::HashMap<(String, String), PerKeySlot>>>;
 
 struct CachedCiProvider {
     inner: Box<dyn CiProvider>,
@@ -15,17 +16,16 @@ struct CachedCiProvider {
 impl CiProvider for CachedCiProvider {
     async fn poll_runs(&self, repo: &str, branch: &str) -> anyhow::Result<CiPollResult> {
         let key = (repo.to_string(), branch.to_string());
-        {
-            let cache = self.poll_cache.lock().await;
-            if let Some(cached) = cache.get(&key) {
-                return Ok(cached.clone());
-            }
+        let slot = {
+            let mut map = self.poll_cache.lock().unwrap_or_else(|e| e.into_inner());
+            map.entry(key).or_default().clone()
+        };
+        let mut guard = slot.lock().await;
+        if let Some(cached) = guard.as_ref() {
+            return Ok(cached.clone());
         }
         let result = self.inner.poll_runs(repo, branch).await?;
-        {
-            let mut cache = self.poll_cache.lock().await;
-            cache.insert(key, result.clone());
-        }
+        *guard = Some(result.clone());
         Ok(result)
     }
 
@@ -316,7 +316,7 @@ pub(super) fn check_ci_watches_with_provider(
         Ok(e) => e,
         Err(_) => return,
     };
-    let tick_cache: TickCache = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let tick_cache: TickCache = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let display_timezone: Option<String> =
         crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
             .ok()
