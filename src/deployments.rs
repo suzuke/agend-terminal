@@ -353,13 +353,25 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
                 params["env"] = serde_json::to_value(env).unwrap_or(serde_json::Value::Null);
             }
         }
-        let _ = crate::api::call(
+        let spawn_result = crate::api::call(
             home,
             &serde_json::json!({
                 "method": crate::api::method::SPAWN,
                 "params": params,
             }),
         );
+        match spawn_result {
+            Ok(ref v) if v.get("ok").and_then(|b| b.as_bool()) == Some(false) => {
+                let err = v.get("error").and_then(|e| e.as_str()).unwrap_or("unknown");
+                tracing::error!(instance = %inst_name, error = %err,
+                    "deploy_template: Phase 3 spawn failed");
+            }
+            Err(e) => {
+                tracing::error!(instance = %inst_name, error = %e,
+                    "deploy_template: Phase 3 spawn call failed");
+            }
+            _ => {}
+        }
     }
 
     // Phase 4 — create the team. Route through the CREATE_TEAM API (not a

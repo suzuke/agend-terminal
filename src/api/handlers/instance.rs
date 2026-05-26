@@ -149,7 +149,7 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
     }
     let command = params["backend"]
         .as_str()
-        .map(String::from)
+        .map(|s| crate::backend::Backend::parse_str(s).command_string())
         .unwrap_or_else(|| {
             crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(ctx.home))
                 .ok()
