@@ -268,6 +268,15 @@ pub(crate) fn scan_and_emit(
     scan_fleet_vantage(home, &now, last_alerted);
 }
 
+/// #1256: check if the task board has any tasks (indicating active use).
+/// When the board has tasks, agents without assigned work should not
+/// trigger idle alerts — their silence is expected.
+fn task_board_is_active(home: &Path) -> bool {
+    crate::task_events::replay(home)
+        .map(|s| !s.tasks.is_empty())
+        .unwrap_or(false)
+}
+
 /// Look up the current in-progress task for an agent (if any).
 fn current_agent_task(home: &Path, agent: &str) -> Option<String> {
     let state = crate::task_events::replay(home).ok()?;
@@ -328,6 +337,11 @@ fn scan_dev_vantage(
         }
         let task_info =
             current_agent_task(home, agent).unwrap_or_else(|| "(no active task)".to_string());
+        // #1256: skip alert when task board is active and agent has no
+        // assigned task — silence is expected when no work is assigned.
+        if task_info == "(no active task)" && task_board_is_active(home) {
+            continue;
+        }
         emit_idle_alert(
             home,
             &dev_idle_recipient(),
