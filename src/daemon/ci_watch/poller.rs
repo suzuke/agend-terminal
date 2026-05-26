@@ -534,10 +534,21 @@ pub(crate) fn build_inbox_body(
     conclusion: &str,
     failure_detail: Option<&str>,
     run_url: &str,
+    run_id: Option<u64>,
 ) -> String {
     if conclusion == "failure" {
         let detail = failure_detail.unwrap_or("unknown step");
-        format!("{headline}\nDetail: {detail}\nURL: {run_url}")
+        let run_id_str = run_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "<run_id>".to_string());
+        format!(
+            "{headline}\nDetail: {detail}\nURL: {run_url}\n\n\
+             ⚠ CI failure checklist:\n\
+             1. `gh run view {run_id_str} --log-failed` — read the actual error\n\
+             2. If infra flake → `gh run rerun {run_id_str} --failed`\n\
+             3. If real failure → fix code, push, wait for green\n\
+             4. Do NOT dismiss without evidence"
+        )
     } else {
         format!("{headline}\nURL: {run_url}")
     }
@@ -1015,6 +1026,7 @@ async fn fan_out_notifications(
                 conclusion.unwrap_or(""),
                 failure_detail.as_deref(),
                 &run.url,
+                Some(*run_id),
             );
 
             let repo_branch_key = format!("{}@{}", ctx.repo, ctx.branch);
