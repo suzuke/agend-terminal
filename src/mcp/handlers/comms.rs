@@ -702,48 +702,10 @@ pub(super) fn handle_inbox(home: &Path, instance_name: &str) -> Value {
     json!({"messages": messages})
 }
 
-pub(super) fn handle_describe_message(home: &Path, args: &Value, instance_name: &str) -> Value {
-    let msg_id = match args["message_id"].as_str() {
-        Some(id) => id,
-        None => return json!({"error": "missing 'message_id'"}),
-    };
-    let target = args["instance"].as_str().unwrap_or(instance_name);
-    let status = crate::inbox::describe_message(home, msg_id, target);
-    match status {
-        crate::inbox::MessageStatus::ReadAt(t, dm) => {
-            let mut resp = json!({"status": "read", "read_at": t});
-            if let Some(mode) = dm {
-                resp["delivery_mode"] = json!(mode);
-            }
-            if let Some(msg) = crate::inbox::find_message(home, msg_id) {
-                if let Some(ref cid) = msg.correlation_id {
-                    resp["correlation_id"] = json!(cid);
-                }
-                if let Some(ref rh) = msg.reviewed_head {
-                    resp["reviewed_head"] = json!(rh);
-                    resp["stale_possible"] = json!(true);
-                }
-            }
-            resp
-        }
-        crate::inbox::MessageStatus::UnreadExpired => {
-            json!({"status": "unread_expired"})
-        }
-        crate::inbox::MessageStatus::NotFound => {
-            json!({"status": "not_found"})
-        }
-    }
-}
-
-pub(super) fn handle_describe_thread(home: &Path, args: &Value) -> Value {
-    let thread_id = match args["thread_id"].as_str() {
-        Some(id) => id,
-        None => return json!({"error": "missing 'thread_id'"}),
-    };
-    let instance = args["instance"].as_str();
-    let msgs = crate::inbox::get_thread(home, thread_id, instance);
-    json!({"thread_id": thread_id, "messages": msgs, "count": msgs.len()})
-}
+// #1286: inbox describe handlers extracted to stay under file_size_invariant.
+#[path = "comms_inbox.rs"]
+mod comms_inbox;
+pub(super) use comms_inbox::{handle_describe_message, handle_describe_thread};
 
 /// Sprint 55 P0-C — true when the caller passed `bind: false`, signaling
 /// a read-only RCA/audit/design dispatch that should NOT trigger
