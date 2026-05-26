@@ -154,8 +154,9 @@ pub(super) fn update_watch_state_with_notify(
 }
 
 /// Flush an in-memory WatchState to disk under the ci-watch flock.
-/// Used by the single-load-per-tick path so the entire tick mutates
-/// the struct in-memory and writes once at the end.
+/// Merge-safe: reads the current file under lock and preserves
+/// concurrent subscription changes (`subscribers`, `instance`,
+/// `next_after_ci`) while applying poll-owned field updates.
 pub(super) fn flush_watch_state(watch_path: &Path, state: &super::watch_state::WatchState) {
     let lock_path = watch_path.with_extension("lock");
     let _lock = match crate::store::acquire_file_lock(&lock_path) {
@@ -165,9 +166,18 @@ pub(super) fn flush_watch_state(watch_path: &Path, state: &super::watch_state::W
             return;
         }
     };
+    let mut merged = state.clone();
+    if let Some(current) = std::fs::read_to_string(watch_path)
+        .ok()
+        .and_then(|c| serde_json::from_str::<super::watch_state::WatchState>(&c).ok())
+    {
+        merged.subscribers = current.subscribers;
+        merged.instance = current.instance;
+        merged.next_after_ci = current.next_after_ci;
+    }
     if let Err(e) = crate::store::atomic_write(
         watch_path,
-        serde_json::to_string_pretty(state)
+        serde_json::to_string_pretty(&merged)
             .unwrap_or_default()
             .as_bytes(),
     ) {
@@ -228,5 +238,66 @@ mod tests {
             f.len() > 21,
             "post-#943 filename length must exceed legacy DefaultHasher length (21): got {f}"
         );
+    }
+
+    #[test]
+    fn flush_preserves_concurrent_unwatch() {
+        let dir = std::env::temp_dir().join(format!(
+            "agend-flush-merge-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let watch_path = dir.join("test.json");
+
+        let initial = super::super::watch_state::WatchState {
+            repo: "o/r".into(),
+            branch: "feat".into(),
+            subscribers: Some(vec![
+                super::super::watch_state::Subscriber {
+                    instance: "A".into(),
+                    subscribed_at: None,
+                },
+                super::super::watch_state::Subscriber {
+                    instance: "B".into(),
+                    subscribed_at: None,
+                },
+            ]),
+            ..Default::default()
+        };
+        std::fs::write(
+            &watch_path,
+            serde_json::to_string_pretty(&initial).unwrap(),
+        )
+        .unwrap();
+
+        let mut stale = initial.clone();
+        stale.last_run_id = Some(42);
+        stale.head_sha = Some("abc123".into());
+
+        let mut on_disk = initial;
+        on_disk.subscribers = Some(vec![super::super::watch_state::Subscriber {
+            instance: "A".into(),
+            subscribed_at: None,
+        }]);
+        std::fs::write(
+            &watch_path,
+            serde_json::to_string_pretty(&on_disk).unwrap(),
+        )
+        .unwrap();
+
+        flush_watch_state(&watch_path, &stale);
+
+        let result: super::super::watch_state::WatchState =
+            serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();
+        assert_eq!(result.last_run_id, Some(42), "poll fields must be applied");
+        assert_eq!(result.head_sha.as_deref(), Some("abc123"));
+        let subs: Vec<String> = result.subscriber_names();
+        assert_eq!(
+            subs,
+            vec!["A"],
+            "concurrent unwatch of B must be preserved, not overwritten"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
