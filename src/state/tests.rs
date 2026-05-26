@@ -450,11 +450,11 @@ fn unchanged_screen_does_not_reset_last_output() {
     // last_output (used by hang/awaiting-operator predicates).
     let mut t = StateTracker::new(Some(&Backend::ClaudeCode));
     t.feed("hello world");
-    let first = t.last_output;
-    std::thread::sleep(Duration::from_millis(20));
+    t.last_output = Instant::now() - Duration::from_secs(10);
+    let pinned = t.last_output;
     t.feed("hello world");
     assert_eq!(
-        t.last_output, first,
+        t.last_output, pinned,
         "identical screen must not bump last_output"
     );
 }
@@ -748,16 +748,23 @@ fn claude_permission_prompt_dialog_match() {
 }
 
 #[test]
-fn claude_permission_prompt_legacy_wording_still_matches() {
-    // Keep compat with the pre-2.1.98 wording in case earlier
-    // CLI builds surface through the same backend.
-    let patterns = StatePatterns::for_backend(&Backend::ClaudeCode);
-    for sample in ["Allow once", "Allow always", "approve"] {
-        assert_eq!(
-            patterns.detect(sample),
-            Some(AgentState::PermissionPrompt),
-            "legacy wording {sample:?} must still fire PermissionPrompt",
-        );
+fn permission_prompt_legacy_wording_still_matches() {
+    let cases: &[(Backend, &[&str])] = &[
+        (
+            Backend::ClaudeCode,
+            &["Allow once", "Allow always", "approve"],
+        ),
+        (Backend::Codex, &["Request approval", "approve", "deny"]),
+    ];
+    for (backend, samples) in cases {
+        let patterns = StatePatterns::for_backend(backend);
+        for sample in *samples {
+            assert_eq!(
+                patterns.detect(sample),
+                Some(AgentState::PermissionPrompt),
+                "{backend:?} legacy wording {sample:?} must still fire PermissionPrompt",
+            );
+        }
     }
 }
 
@@ -1008,8 +1015,8 @@ fn pipeline_screen_unchanged_preserves_silence_timer() {
     let mut vt = VTerm::new(80, 24);
     let mut st = StateTracker::new(Some(&Backend::Codex));
     drive(&mut vt, &mut st, b"OpenAI Codex v0.120.0\r\n");
+    st.last_output = Instant::now() - Duration::from_secs(10);
     let before = st.last_output;
-    std::thread::sleep(Duration::from_millis(20));
     // Cursor hide/show — visible grid unchanged.
     drive(&mut vt, &mut st, b"\x1b[?25l\x1b[?25h");
     assert_eq!(
@@ -1286,20 +1293,6 @@ fn codex_permission_prompt_dialog_match() {
 }
 
 #[test]
-fn codex_permission_prompt_legacy_wording_still_matches() {
-    // Keep compat with legacy / docs wording in case earlier Codex
-    // builds or adjacent tooling surface through the same backend.
-    let patterns = StatePatterns::for_backend(&Backend::Codex);
-    for sample in ["Request approval", "approve", "deny"] {
-        assert_eq!(
-            patterns.detect(sample),
-            Some(AgentState::PermissionPrompt),
-            "legacy wording {sample:?} must still fire PermissionPrompt",
-        );
-    }
-}
-
-#[test]
 fn codex_permission_prompt_does_not_false_positive_on_narration() {
     // Narration lines that precede the dialog (`• I'm writing...`,
     // `outside the writable sandbox`, `escalated command`) must not
@@ -1551,114 +1544,6 @@ fn opencode_tooluse_completed_banner_does_not_fire_per_1005() {
             Some(AgentState::ToolUse),
             "#1005: opencode `→` completion banner must NOT fire ToolUse: {sample:?}"
         );
-    }
-}
-
-// ── Replay harness (empirical A/B test vs pre-Phase-1a) ─────────────
-// Driven by env vars so it works without cargo arg plumbing:
-//   REPLAY_FILE=/tmp/session.raw REPLAY_BACKEND=gemini \
-//     cargo test --release -- --ignored --nocapture replay_session
-#[test]
-#[ignore]
-#[allow(clippy::unwrap_used)]
-fn replay_session() {
-    let path = std::env::var("REPLAY_FILE").expect("REPLAY_FILE env var required");
-    let backend_name = std::env::var("REPLAY_BACKEND").unwrap_or_else(|_| "gemini".to_string());
-    let chunk_size: usize = std::env::var("REPLAY_CHUNK")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(512);
-    // REPLAY_DUMP_AT=N[,N...] dumps the visible vterm grid after the
-    // chunk that crosses each byte offset. Used to inspect dialog /
-    // banner wording mid-stream when a pattern fails to match.
-    let mut dump_offsets: Vec<usize> = std::env::var("REPLAY_DUMP_AT")
-        .ok()
-        .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
-        .unwrap_or_default();
-    dump_offsets.sort_unstable();
-    let mut dump_idx = 0;
-    let backend = match backend_name.as_str() {
-        "gemini" => Backend::Gemini,
-        "codex" => Backend::Codex,
-        "claude" | "claude-code" => Backend::ClaudeCode,
-        "kiro" | "kiro-cli" => Backend::KiroCli,
-        "opencode" => Backend::OpenCode,
-        other => panic!("unknown backend: {other}"),
-    };
-
-    let bytes = std::fs::read(&path).unwrap();
-    let mut vt = VTerm::new(120, 40);
-    let mut st = StateTracker::new(Some(&backend));
-    let mut transitions: Vec<(usize, AgentState)> = vec![(0, st.current)];
-
-    let mut total = 0usize;
-    for chunk in bytes.chunks(chunk_size) {
-        total += chunk.len();
-        vt.process(chunk);
-        let rows = vt.rows() as usize;
-        let screen = vt.tail_lines(rows);
-        st.feed(&screen);
-        let last = transitions.last().map(|x| x.1);
-        if last != Some(st.current) {
-            transitions.push((total, st.current));
-        }
-        while dump_idx < dump_offsets.len() && total >= dump_offsets[dump_idx] {
-            eprintln!(
-                "--- screen at byte {} (requested {}) ---",
-                total, dump_offsets[dump_idx]
-            );
-            for (i, line) in screen.lines().enumerate() {
-                let t = line.trim_end();
-                if !t.is_empty() {
-                    eprintln!("  {:>2}| {}", i + 1, t);
-                }
-            }
-            dump_idx += 1;
-        }
-    }
-
-    eprintln!(
-        "[POST-Phase-1a] file={} backend={} bytes={} chunk={}",
-        path,
-        backend_name,
-        bytes.len(),
-        chunk_size
-    );
-    eprintln!("Transitions (byte_offset → state):");
-    for (off, s) in &transitions {
-        eprintln!("  {:>8} → {:?}", off, s);
-    }
-    eprintln!("Final state: {:?}", st.current);
-
-    // Probe: what does pattern.detect return on the final screen?
-    // This bypasses hysteresis — tells us the "if time had passed, would
-    // we transition?" answer, which is what matters in production.
-    let patterns = StatePatterns::for_backend(&backend);
-    let final_screen = vt.tail_lines(vt.rows() as usize);
-    eprintln!(
-        "Final detect() on screen: {:?}",
-        patterns.detect(&final_screen)
-    );
-
-    // Simulated production pacing: backdate `since` by 10s so any
-    // pending downward transition can fire, then re-feed.
-    st.since = std::time::Instant::now() - std::time::Duration::from_secs(10);
-    // Force re-detection by bumping the screen hash (clear it).
-    // We can't easily clear the private field here; just feed a tiny
-    // visible diff and then the real screen to force two detects.
-    vt.process(b"\n");
-    st.feed(&vt.tail_lines(vt.rows() as usize));
-    st.since = std::time::Instant::now() - std::time::Duration::from_secs(10);
-    st.feed(&vt.tail_lines(vt.rows() as usize));
-    eprintln!("After simulated +10s pacing: {:?}", st.current);
-
-    eprintln!("--- final tail_lines(40) ---");
-    let screen = vt.tail_lines(40);
-    for (i, line) in screen.lines().enumerate() {
-        let t = line.trim_end();
-        if !t.is_empty() {
-            eprintln!("  {:>2}| {}", i + 1, t);
-        }
     }
 }
 
@@ -2302,47 +2187,21 @@ fn generic_rate_limit_still_detected() {
 // path (3-attempt cap at SERVER_RATE_LIMIT_MAX_RETRIES) covers them.
 
 #[test]
-fn api_error_500_classified_as_server_rate_limit() {
+fn api_error_5xx_classified_as_server_rate_limit() {
     let patterns = StatePatterns::for_backend(&Backend::ClaudeCode);
-    let screen = "API Error: 500 Internal server error";
-    assert_eq!(
-        patterns.detect(screen),
-        Some(AgentState::ServerRateLimit),
-        "API Error: 500 must classify as ServerRateLimit (#668)"
-    );
-}
-
-#[test]
-fn api_error_502_classified_as_server_rate_limit() {
-    let patterns = StatePatterns::for_backend(&Backend::ClaudeCode);
-    let screen = "API Error: 502 Bad Gateway";
-    assert_eq!(
-        patterns.detect(screen),
-        Some(AgentState::ServerRateLimit),
-        "API Error: 502 must classify as ServerRateLimit (#668)"
-    );
-}
-
-#[test]
-fn api_error_503_classified_as_server_rate_limit() {
-    let patterns = StatePatterns::for_backend(&Backend::ClaudeCode);
-    let screen = "API Error: 503 Service Unavailable";
-    assert_eq!(
-        patterns.detect(screen),
-        Some(AgentState::ServerRateLimit),
-        "API Error: 503 must classify as ServerRateLimit (#668)"
-    );
-}
-
-#[test]
-fn api_error_504_classified_as_server_rate_limit() {
-    let patterns = StatePatterns::for_backend(&Backend::ClaudeCode);
-    let screen = "API Error: 504 Gateway Timeout";
-    assert_eq!(
-        patterns.detect(screen),
-        Some(AgentState::ServerRateLimit),
-        "API Error: 504 must classify as ServerRateLimit (#668)"
-    );
+    let cases = [
+        ("500", "API Error: 500 Internal server error"),
+        ("502", "API Error: 502 Bad Gateway"),
+        ("503", "API Error: 503 Service Unavailable"),
+        ("504", "API Error: 504 Gateway Timeout"),
+    ];
+    for (code, screen) in cases {
+        assert_eq!(
+            patterns.detect(screen),
+            Some(AgentState::ServerRateLimit),
+            "API Error: {code} must classify as ServerRateLimit (#668)"
+        );
+    }
 }
 
 #[test]
@@ -2399,16 +2258,39 @@ fn api_error_long_digit_run_not_classified_as_server_rate_limit() {
 // signal for the specific narrowed-pattern alternations, on top
 // of (not instead of) the broader replay_manifest_regression sweep.
 
-/// Individual: the canonical 429-rejection fixture must classify as
-/// RateLimit (new narrowed Claude pattern's first alternation).
+/// Fixture-based RateLimit detection across backends — each fixture
+/// must classify as RateLimit under the narrowed post-#848 pattern.
 #[test]
-fn claude_rate_limit_429_fixture_triggers_rate_limit() {
-    let bytes = std::fs::read("tests/fixtures/state-replay/claude-rate-limit-429.raw")
-        .expect("read fixture");
-    let text = String::from_utf8_lossy(&bytes);
-    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
-    t.feed(&text);
-    assert_eq!(t.get_state(), AgentState::RateLimit);
+fn rate_limit_fixture_triggers_rate_limit_per_backend() {
+    let cases: &[(Backend, &str)] = &[
+        (
+            Backend::ClaudeCode,
+            "tests/fixtures/state-replay/claude-rate-limit-429.raw",
+        ),
+        (
+            Backend::OpenCode,
+            "tests/fixtures/state-replay/opencode-rate-limit-typical.raw",
+        ),
+        (
+            Backend::Gemini,
+            "tests/fixtures/state-replay/gemini-rate-limit-typical.raw",
+        ),
+        (
+            Backend::KiroCli,
+            "tests/fixtures/state-replay/kiro-rate-limit-typical.raw",
+        ),
+    ];
+    for (backend, path) in cases {
+        let bytes = std::fs::read(path).expect("read fixture");
+        let text = String::from_utf8_lossy(&bytes);
+        let mut t = tracker_at(backend, AgentState::Idle, 0);
+        t.feed(&text);
+        assert_eq!(
+            t.get_state(),
+            AgentState::RateLimit,
+            "{backend:?} fixture {path} must trigger RateLimit"
+        );
+    }
 }
 
 /// Individual: the existing server-throttle wording must keep
@@ -2440,50 +2322,72 @@ fn claude_overloaded_529_fixture_triggers_server_rate_limit() {
     assert_eq!(t.get_state(), AgentState::ServerRateLimit);
 }
 
-/// Individual: the session-limit wording must classify as UsageLimit
-/// (NEW pattern added by #848; Claude previously had no UsageLimit
-/// pattern and these strings fell through to whatever happened to
-/// match — frequently RateLimit via `rate.?limit` substring).
+/// Fixture-based UsageLimit detection across backends — each fixture
+/// must classify as UsageLimit (patterns added by #848).
 #[test]
-fn claude_session_limit_fixture_triggers_usage_limit() {
-    let bytes = std::fs::read("tests/fixtures/state-replay/claude-session-limit.raw")
-        .expect("read fixture");
-    let text = String::from_utf8_lossy(&bytes);
-    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
-    t.feed(&text);
-    assert_eq!(t.get_state(), AgentState::UsageLimit);
+fn usage_limit_fixture_triggers_usage_limit_per_backend() {
+    let cases: &[(Backend, &str)] = &[
+        (
+            Backend::ClaudeCode,
+            "tests/fixtures/state-replay/claude-session-limit.raw",
+        ),
+        (
+            Backend::OpenCode,
+            "tests/fixtures/state-replay/opencode-usage-limit-typical.raw",
+        ),
+        (
+            Backend::KiroCli,
+            "tests/fixtures/state-replay/kiro-usage-limit-typical.raw",
+        ),
+    ];
+    for (backend, path) in cases {
+        let bytes = std::fs::read(path).expect("read fixture");
+        let text = String::from_utf8_lossy(&bytes);
+        let mut t = tracker_at(backend, AgentState::Idle, 0);
+        t.feed(&text);
+        assert_eq!(
+            t.get_state(),
+            AgentState::UsageLimit,
+            "{backend:?} fixture {path} must trigger UsageLimit"
+        );
+    }
 }
 
-/// **CRITICAL** individual: discussion prose containing the literal
-/// substrings `rate_limit` / `rate-limit` / `rate limit` /
-/// `overloaded` must NOT classify as RateLimit. This is the root
-/// cause of the #841 nudge spam — agents debugging the bug
-/// triggered the bug. Pre-#848 the broad
-/// `r"overloaded|rate.?limit|\b429\b"` pattern matched the prose;
-/// post-#848 the narrowed pattern matches only specific error
-/// phrases.
+/// **CRITICAL**: discussion prose containing rate_limit / rate-limit /
+/// overloaded substrings must NOT trigger RateLimit across any backend.
+/// Root cause of #841 nudge spam; post-#848 narrowed patterns fix this.
 #[test]
-fn claude_discussion_text_fixture_does_not_trigger_rate_limit() {
-    let bytes = std::fs::read("tests/fixtures/state-replay/claude-discussion-text.raw")
-        .expect("read fixture");
-    let text = String::from_utf8_lossy(&bytes);
-    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
-    t.feed(&text);
-    assert_eq!(
-        t.get_state(),
-        AgentState::Idle,
-        "discussion prose containing rate_limit / rate-limit / overloaded \
-         substrings must NOT trigger RateLimit (root cause of #841 nudge spam)"
-    );
-}
-
-/// Mirror of the Claude regression-proof gate for Codex — the same
-/// `r"rate.?limit|\b429\b"` broadness existed at src/state.rs:310
-/// pre-#848 (and shipped under the same dogfood failure mode in
-/// fleet operations). Tightening the Codex pattern to specific
-/// phrases must also kill the false-positive on discussion text.
-#[test]
-fn codex_discussion_text_does_not_trigger_rate_limit() {
+fn discussion_text_does_not_trigger_rate_limit_any_backend() {
+    let fixture_cases: &[(Backend, &str)] = &[
+        (
+            Backend::ClaudeCode,
+            "tests/fixtures/state-replay/claude-discussion-text.raw",
+        ),
+        (
+            Backend::OpenCode,
+            "tests/fixtures/state-replay/opencode-discussion-text.raw",
+        ),
+        (
+            Backend::Gemini,
+            "tests/fixtures/state-replay/gemini-discussion-text.raw",
+        ),
+        (
+            Backend::KiroCli,
+            "tests/fixtures/state-replay/kiro-discussion-text.raw",
+        ),
+    ];
+    for (backend, path) in fixture_cases {
+        let bytes = std::fs::read(path).expect("read fixture");
+        let text = String::from_utf8_lossy(&bytes);
+        let mut t = tracker_at(backend, AgentState::Idle, 0);
+        t.feed(&text);
+        assert_ne!(
+            t.get_state(),
+            AgentState::RateLimit,
+            "{backend:?} discussion text from {path} must NOT trigger RateLimit"
+        );
+    }
+    // Codex: inline prose (no fixture file)
     let mut t = tracker_at(&Backend::Codex, AgentState::Idle, 0);
     t.feed(
         "We are debugging the rate_limit classification issue in src/state.rs. \
@@ -2493,145 +2397,7 @@ fn codex_discussion_text_does_not_trigger_rate_limit() {
     assert_ne!(
         t.get_state(),
         AgentState::RateLimit,
-        "Codex discussion prose containing rate_limit / rate-limit substrings \
-         must NOT trigger RateLimit (same false-positive class as Claude pre-#848)"
-    );
-}
-
-// ── #848 PR-B — OpenCode + Gemini + Kiro classifier unit tests ───
-//
-// Mirror of PR-A's pattern: per backend, fixture-based positive
-// assertions for the new alternations + a `<backend>_discussion_
-// text_does_not_trigger_rate_limit` regression-proof negative. The
-// full fixture replay through VTerm + StateTracker is covered by
-// `replay_manifest_regression` (which reads MANIFEST.yaml); the
-// tests below provide focused per-pattern signal on top of that.
-
-/// OpenCode: the canonical 429-rejection wording from sst→anomalyco
-/// fork issues must classify as RateLimit under the new narrowed
-/// pattern.
-#[test]
-fn opencode_rate_limit_typical_fixture_triggers_rate_limit() {
-    let bytes = std::fs::read("tests/fixtures/state-replay/opencode-rate-limit-typical.raw")
-        .expect("read fixture");
-    let text = String::from_utf8_lossy(&bytes);
-    let mut t = tracker_at(&Backend::OpenCode, AgentState::Idle, 0);
-    t.feed(&text);
-    assert_eq!(t.get_state(), AgentState::RateLimit);
-}
-
-/// OpenCode: the `Quota Limit Exceeded` wording classifies as
-/// UsageLimit (NEW pattern — pre-#848 OpenCode had no UsageLimit at
-/// all, so this fell through).
-#[test]
-fn opencode_usage_limit_typical_fixture_triggers_usage_limit() {
-    let bytes = std::fs::read("tests/fixtures/state-replay/opencode-usage-limit-typical.raw")
-        .expect("read fixture");
-    let text = String::from_utf8_lossy(&bytes);
-    let mut t = tracker_at(&Backend::OpenCode, AgentState::Idle, 0);
-    t.feed(&text);
-    assert_eq!(t.get_state(), AgentState::UsageLimit);
-}
-
-/// OpenCode: regression-proof for the false-positive class — the
-/// OLD `r"rate.?limit|\b429\b"` pattern matched bare `rate_limit` /
-/// `rate-limit` / `rate limit` substrings in prose. Post-#848 the
-/// narrowed pattern requires specific OpenCode-CLI wording.
-#[test]
-fn opencode_discussion_text_does_not_trigger_rate_limit() {
-    let bytes = std::fs::read("tests/fixtures/state-replay/opencode-discussion-text.raw")
-        .expect("read fixture");
-    let text = String::from_utf8_lossy(&bytes);
-    let mut t = tracker_at(&Backend::OpenCode, AgentState::Idle, 0);
-    t.feed(&text);
-    assert_ne!(
-        t.get_state(),
-        AgentState::RateLimit,
-        "OpenCode discussion prose containing rate_limit / rate-limit \
-         substrings must NOT trigger RateLimit (same false-positive \
-         class as Claude/Codex pre-#848)"
-    );
-}
-
-/// Gemini: the canonical 429 / RESOURCE_EXHAUSTED / rateLimitExceeded
-/// wordings from google-gemini/gemini-cli issues classify as
-/// RateLimit under the new narrowed pattern.
-#[test]
-fn gemini_rate_limit_typical_fixture_triggers_rate_limit() {
-    let bytes = std::fs::read("tests/fixtures/state-replay/gemini-rate-limit-typical.raw")
-        .expect("read fixture");
-    let text = String::from_utf8_lossy(&bytes);
-    let mut t = tracker_at(&Backend::Gemini, AgentState::Idle, 0);
-    t.feed(&text);
-    assert_eq!(t.get_state(), AgentState::RateLimit);
-}
-
-/// Gemini: regression-proof for the false-positive class — the OLD
-/// `r"RESOURCE_EXHAUSTED|\b429\b"` matched bare `429` token in prose
-/// (any discussion of HTTP 429 status codes). Post-#848 the narrowed
-/// pattern requires full HTTP-context wording (`429 RESOURCE_EXHAUSTED`,
-/// `got status: 429`, `429 Too Many Requests`, etc.).
-#[test]
-fn gemini_discussion_text_does_not_trigger_rate_limit() {
-    let bytes = std::fs::read("tests/fixtures/state-replay/gemini-discussion-text.raw")
-        .expect("read fixture");
-    let text = String::from_utf8_lossy(&bytes);
-    let mut t = tracker_at(&Backend::Gemini, AgentState::Idle, 0);
-    t.feed(&text);
-    assert_ne!(
-        t.get_state(),
-        AgentState::RateLimit,
-        "Gemini discussion prose with bare 429 must NOT trigger RateLimit \
-         (post-#848 the bare `\\b429\\b` token is removed from the \
-         RateLimit pattern; only full HTTP-context wording triggers)"
-    );
-}
-
-/// Kiro: the AWS Bedrock `ThrottlingException: Rate exceeded` wording
-/// classifies as RateLimit under the new ADDITION to the existing
-/// alternation (Kiro pattern is additive, not replace).
-#[test]
-fn kiro_rate_limit_typical_fixture_triggers_rate_limit() {
-    let bytes = std::fs::read("tests/fixtures/state-replay/kiro-rate-limit-typical.raw")
-        .expect("read fixture");
-    let text = String::from_utf8_lossy(&bytes);
-    let mut t = tracker_at(&Backend::KiroCli, AgentState::Idle, 0);
-    t.feed(&text);
-    assert_eq!(t.get_state(), AgentState::RateLimit);
-}
-
-/// Kiro: the casual `you have reached the limit` wording from #5876
-/// classifies as UsageLimit under the new ADDITION to the existing
-/// `ServiceQuotaExceeded|InsufficientModelCapacity` alternation.
-#[test]
-fn kiro_usage_limit_typical_fixture_triggers_usage_limit() {
-    let bytes = std::fs::read("tests/fixtures/state-replay/kiro-usage-limit-typical.raw")
-        .expect("read fixture");
-    let text = String::from_utf8_lossy(&bytes);
-    let mut t = tracker_at(&Backend::KiroCli, AgentState::Idle, 0);
-    t.feed(&text);
-    assert_eq!(t.get_state(), AgentState::UsageLimit);
-}
-
-/// Kiro: regression-proof — Kiro's pre-#848 pattern was already
-/// specific (no false-positive on rate-limit prose). PR-B adds more
-/// alternations; this test pins that the ADDITIONS do NOT
-/// reintroduce broad-substring matching. Passes at both C1 RED and
-/// C2 GREEN — its purpose is locking the contract for future Kiro
-/// pattern changes.
-#[test]
-fn kiro_discussion_text_does_not_trigger_rate_limit() {
-    let bytes = std::fs::read("tests/fixtures/state-replay/kiro-discussion-text.raw")
-        .expect("read fixture");
-    let text = String::from_utf8_lossy(&bytes);
-    let mut t = tracker_at(&Backend::KiroCli, AgentState::Idle, 0);
-    t.feed(&text);
-    assert_ne!(
-        t.get_state(),
-        AgentState::RateLimit,
-        "Kiro discussion prose with rate_limit / rate-limit substrings \
-         must NOT trigger RateLimit (pre-#848 Kiro pattern was already \
-         specific; PR-B's additions must preserve this property)"
+        "Codex discussion prose must NOT trigger RateLimit"
     );
 }
 

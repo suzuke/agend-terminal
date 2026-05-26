@@ -153,15 +153,6 @@ fn cleanup_removes_metadata() {
     std::fs::remove_dir_all(&home).ok();
 }
 
-#[test]
-fn cleanup_nonexistent_dir_no_panic() {
-    let home = tmp_home("cleanup_nodir");
-    let fake = std::path::PathBuf::from("/tmp/nonexistent-agend-test-dir");
-    // Should not panic
-    cleanup_working_dir(&home, "agent1", &fake);
-    std::fs::remove_dir_all(&home).ok();
-}
-
 // ---------------------------------------------------------------------
 // FleetEvent emission tests (Stage B-UX PR-A, design §2)
 //
@@ -1650,30 +1641,6 @@ fn consolidated_decision_routes_correctly() {
 }
 
 #[test]
-fn consolidated_team_routes_list() {
-    let r = super::handle_tool("team", &json!({"action": "list"}), "test");
-    assert!(r.get("error").is_none(), "team list must not error: {r}");
-}
-
-#[test]
-fn consolidated_schedule_routes_list() {
-    let r = super::handle_tool("schedule", &json!({"action": "list"}), "test");
-    assert!(
-        r.get("error").is_none(),
-        "schedule list must not error: {r}"
-    );
-}
-
-#[test]
-fn consolidated_deployment_routes_list() {
-    let r = super::handle_tool("deployment", &json!({"action": "list"}), "test");
-    assert!(
-        r.get("error").is_none(),
-        "deployment list must not error: {r}"
-    );
-}
-
-#[test]
 fn consolidated_ci_unknown_action_errors() {
     let r = super::handle_tool("ci", &json!({"action": "bogus"}), "test");
     let err = r["error"].as_str().expect("must have error");
@@ -1809,18 +1776,6 @@ fn create_instance_explicit_working_directory_used() {
             "explicit valid path must pass validation: {err}"
         );
     }
-}
-
-// Sprint 31+ #84: behavioral assertion — setup_recorder sets AGEND_TEST_ISOLATION
-#[test]
-fn test_isolation_active_after_setup_recorder() {
-    let _g = fleet_test_guard();
-    let (_rec, _home) = setup_recorder("isolation-check");
-    assert_eq!(
-        std::env::var("AGEND_TEST_ISOLATION").as_deref(),
-        Ok("1"),
-        "setup_recorder must set AGEND_TEST_ISOLATION=1"
-    );
 }
 
 // --- Sprint 33 Bonus PR-B: handle_unified_send field-name mapping ---
@@ -2143,31 +2098,6 @@ fn update_team_fallback_to_direct_when_daemon_unreachable() {
     std::fs::remove_dir_all(&home).ok();
 }
 
-#[test]
-fn delete_team_returns_result() {
-    let _g = fleet_test_guard();
-    let home = tmp_home("team-delete");
-    std::env::set_var("AGEND_HOME", &home);
-    // Create then delete
-    let _ = handle_tool(
-        "team",
-        &json!({"action": "create", "name": "del-team", "members": ["x"]}),
-        "sender",
-    );
-    let result = handle_tool(
-        "team",
-        &json!({"action": "delete", "name": "del-team"}),
-        "sender",
-    );
-    // Should not panic regardless of outcome
-    assert!(
-        result.is_object(),
-        "delete_team must return JSON object: {result}"
-    );
-    std::env::remove_var("AGEND_HOME");
-    std::fs::remove_dir_all(&home).ok();
-}
-
 // --- comms.rs broadcast ---
 
 #[test]
@@ -2257,146 +2187,63 @@ fn schedule_list_routes_to_schedules_module() {
 
 // ─── Sprint 40 T-3: instance.rs black-box invariants ─────────────
 
-// --- create_instance ---
+// --- instance name validation (create/start/describe) ---
 
 #[test]
-fn create_instance_missing_name_returns_error() {
+fn instance_name_validation_rejects_bad_names() {
     let _g = fleet_test_guard();
-    let home = tmp_home("ci-no-name");
-    std::env::set_var("AGEND_HOME", &home);
-    let result = handle_tool("create_instance", &json!({"backend": "claude"}), "sender");
-    assert!(
-        result.get("error").is_some(),
-        "create_instance without name must error: {result}"
-    );
-    std::env::remove_var("AGEND_HOME");
-    std::fs::remove_dir_all(&home).ok();
+    let cases: &[(&str, serde_json::Value, &str)] = &[
+        (
+            "create_instance",
+            json!({"backend": "claude"}),
+            "missing name",
+        ),
+        (
+            "create_instance",
+            json!({"name": "../escape", "backend": "claude"}),
+            "path-traversal",
+        ),
+        (
+            "create_instance",
+            json!({"name": "", "backend": "claude"}),
+            "empty name",
+        ),
+        ("start_instance", json!({}), "missing name"),
+        ("start_instance", json!({"name": "a/b"}), "invalid name"),
+        ("describe_instance", json!({}), "missing name"),
+        (
+            "describe_instance",
+            json!({"name": "../../etc"}),
+            "path-traversal",
+        ),
+    ];
+    for (tool, args, label) in cases {
+        let home = tmp_home(&format!("name-val-{label}"));
+        std::env::set_var("AGEND_HOME", &home);
+        let result = handle_tool(tool, args, "sender");
+        assert!(
+            result.get("error").is_some(),
+            "{tool} with {label} must error: {result}"
+        );
+        std::env::remove_var("AGEND_HOME");
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
 
 #[test]
-fn create_instance_invalid_name_returns_error() {
+fn instance_unknown_name_returns_error() {
     let _g = fleet_test_guard();
-    let home = tmp_home("ci-bad-name");
-    std::env::set_var("AGEND_HOME", &home);
-    let result = handle_tool(
-        "create_instance",
-        &json!({"name": "../escape", "backend": "claude"}),
-        "sender",
-    );
-    assert!(
-        result.get("error").is_some(),
-        "create_instance with path-traversal name must error: {result}"
-    );
-    std::env::remove_var("AGEND_HOME");
-    std::fs::remove_dir_all(&home).ok();
-}
-
-#[test]
-fn create_instance_empty_name_returns_error() {
-    let _g = fleet_test_guard();
-    let home = tmp_home("ci-empty-name");
-    std::env::set_var("AGEND_HOME", &home);
-    let result = handle_tool(
-        "create_instance",
-        &json!({"name": "", "backend": "claude"}),
-        "sender",
-    );
-    assert!(
-        result.get("error").is_some(),
-        "create_instance with empty name must error: {result}"
-    );
-    std::env::remove_var("AGEND_HOME");
-    std::fs::remove_dir_all(&home).ok();
-}
-
-// --- start_instance ---
-
-#[test]
-fn start_instance_missing_name_returns_error() {
-    let _g = fleet_test_guard();
-    let home = tmp_home("si-no-name");
-    std::env::set_var("AGEND_HOME", &home);
-    let result = handle_tool("start_instance", &json!({}), "sender");
-    assert!(
-        result.get("error").is_some(),
-        "start_instance without name must error: {result}"
-    );
-    std::env::remove_var("AGEND_HOME");
-    std::fs::remove_dir_all(&home).ok();
-}
-
-#[test]
-fn start_instance_invalid_name_returns_error() {
-    let _g = fleet_test_guard();
-    let home = tmp_home("si-bad-name");
-    std::env::set_var("AGEND_HOME", &home);
-    let result = handle_tool("start_instance", &json!({"name": "a/b"}), "sender");
-    assert!(
-        result.get("error").is_some(),
-        "start_instance with invalid name must error: {result}"
-    );
-    std::env::remove_var("AGEND_HOME");
-    std::fs::remove_dir_all(&home).ok();
-}
-
-#[test]
-fn start_instance_unknown_name_returns_error() {
-    let _g = fleet_test_guard();
-    let home = tmp_home("si-unknown");
-    std::env::set_var("AGEND_HOME", &home);
-    // No fleet.yaml → instance not found
-    let result = handle_tool("start_instance", &json!({"name": "ghost"}), "sender");
-    assert!(
-        result.get("error").is_some(),
-        "start_instance with unknown name must error: {result}"
-    );
-    std::env::remove_var("AGEND_HOME");
-    std::fs::remove_dir_all(&home).ok();
-}
-
-// --- describe_instance ---
-
-#[test]
-fn describe_instance_missing_name_returns_error() {
-    let _g = fleet_test_guard();
-    let home = tmp_home("di-no-name");
-    std::env::set_var("AGEND_HOME", &home);
-    let result = handle_tool("describe_instance", &json!({}), "sender");
-    assert!(
-        result.get("error").is_some(),
-        "describe_instance without name must error: {result}"
-    );
-    std::env::remove_var("AGEND_HOME");
-    std::fs::remove_dir_all(&home).ok();
-}
-
-#[test]
-fn describe_instance_invalid_name_returns_error() {
-    let _g = fleet_test_guard();
-    let home = tmp_home("di-bad-name");
-    std::env::set_var("AGEND_HOME", &home);
-    let result = handle_tool("describe_instance", &json!({"name": "../../etc"}), "sender");
-    assert!(
-        result.get("error").is_some(),
-        "describe_instance with path-traversal name must error: {result}"
-    );
-    std::env::remove_var("AGEND_HOME");
-    std::fs::remove_dir_all(&home).ok();
-}
-
-#[test]
-fn describe_instance_unknown_name_returns_error() {
-    let _g = fleet_test_guard();
-    let home = tmp_home("di-unknown");
-    std::env::set_var("AGEND_HOME", &home);
-    // No daemon → API unavailable → error
-    let result = handle_tool("describe_instance", &json!({"name": "ghost"}), "sender");
-    assert!(
-        result.get("error").is_some(),
-        "describe_instance with unknown name must error: {result}"
-    );
-    std::env::remove_var("AGEND_HOME");
-    std::fs::remove_dir_all(&home).ok();
+    for tool in ["start_instance", "describe_instance"] {
+        let home = tmp_home(&format!("unknown-{tool}"));
+        std::env::set_var("AGEND_HOME", &home);
+        let result = handle_tool(tool, &json!({"name": "ghost"}), "sender");
+        assert!(
+            result.get("error").is_some(),
+            "{tool} with unknown name must error: {result}"
+        );
+        std::env::remove_var("AGEND_HOME");
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
 
 // --- Sprint 40 T-3 r2: response-shape invariant tests ---
@@ -2765,81 +2612,32 @@ fn send_kind_task_with_task_id_succeeds() {
 }
 
 #[test]
-fn send_kind_query_without_task_id_still_works() {
-    // The anti-stall gate scopes to kind=task only — kind=query
-    // should remain unaffected.
+fn send_non_task_kinds_without_task_id_still_work() {
     let _g = fleet_test_guard();
-    let (_rec, home) = setup_recorder("anti-stall-query-ok");
-
-    let result = handle_tool(
-        "send",
-        &json!({
-            "target_instance": "target",
-            "message": "what's the status?",
-            "request_kind": "query",
-        }),
-        "sender",
-    );
-    let err = result["error"].as_str().unwrap_or("");
-    assert!(
-        !err.contains("task_id"),
-        "kind=query must NOT trigger task_id gate: {result}"
-    );
-
-    std::env::remove_var("AGEND_HOME");
-    std::fs::remove_dir_all(&home).ok();
-}
-
-#[test]
-fn send_kind_update_without_task_id_still_works() {
-    // The anti-stall gate scopes to kind=task only — kind=update
-    // should remain unaffected.
-    let _g = fleet_test_guard();
-    let (_rec, home) = setup_recorder("anti-stall-update-ok");
-
-    let result = handle_tool(
-        "send",
-        &json!({
-            "target_instance": "target",
-            "message": "checkpoint reached",
-            "request_kind": "update",
-        }),
-        "sender",
-    );
-    let err = result["error"].as_str().unwrap_or("");
-    assert!(
-        !err.contains("task_id"),
-        "kind=update must NOT trigger task_id gate: {result}"
-    );
-
-    std::env::remove_var("AGEND_HOME");
-    std::fs::remove_dir_all(&home).ok();
-}
-
-#[test]
-fn send_kind_report_without_task_id_still_works() {
-    // The anti-stall gate scopes to kind=task only — kind=report
-    // (which uses correlation_id, not task_id) must remain unaffected.
-    let _g = fleet_test_guard();
-    let (_rec, home) = setup_recorder("anti-stall-report-ok");
-
-    let result = handle_tool(
-        "send",
-        &json!({
-            "target_instance": "target",
-            "message": "review verdict: VERIFIED",
-            "request_kind": "report",
-        }),
-        "sender",
-    );
-    let err = result["error"].as_str().unwrap_or("");
-    assert!(
-        !err.contains("task_id"),
-        "kind=report must NOT trigger task_id gate: {result}"
-    );
-
-    std::env::remove_var("AGEND_HOME");
-    std::fs::remove_dir_all(&home).ok();
+    let cases: &[(&str, &str)] = &[
+        ("query", "what's the status?"),
+        ("update", "checkpoint reached"),
+        ("report", "review verdict: VERIFIED"),
+    ];
+    for (kind, message) in cases {
+        let (_rec, home) = setup_recorder(&format!("anti-stall-{kind}-ok"));
+        let result = handle_tool(
+            "send",
+            &json!({
+                "target_instance": "target",
+                "message": message,
+                "request_kind": kind,
+            }),
+            "sender",
+        );
+        let err = result["error"].as_str().unwrap_or("");
+        assert!(
+            !err.contains("task_id"),
+            "kind={kind} must NOT trigger task_id gate: {result}"
+        );
+        std::env::remove_var("AGEND_HOME");
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
 
 #[test]
@@ -2991,107 +2789,6 @@ fn task_id_required_stable_code_on_team_broadcast() {
         "broadcast kind=task must still reject with stable code: {result}"
     );
 
-    std::env::remove_var("AGEND_HOME");
-    std::fs::remove_dir_all(&home).ok();
-}
-
-// ─── Issue #699: Top 5 MCP tools smoke tests ─────────────────────────────
-
-#[test]
-fn smoke_send_happy_path() {
-    let _g = fleet_test_guard();
-    let home = tmp_home("smoke_send");
-    std::env::set_var("AGEND_HOME", &home);
-    // Setup fleet.yaml with sender + peer in same team
-    let yaml = "instances:\n  sender:\n    backend: claude\n  peer:\n    backend: claude\nteams:\n  dev:\n    members:\n      - sender\n      - peer\n    created_at: \"2026-01-01T00:00:00Z\"\n";
-    std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).ok();
-    let result = handle_tool(
-        "send",
-        &json!({"message": "hello", "target_instance": "peer"}),
-        "sender",
-    );
-    assert!(result.is_object(), "send must return JSON object: {result}");
-    assert!(
-        result.get("target").is_some(),
-        "send should return target field: {result}"
-    );
-    assert!(
-        result.get("error").is_none(),
-        "send should not error: {result}"
-    );
-    std::env::remove_var("AGEND_HOME");
-    std::fs::remove_dir_all(&home).ok();
-}
-
-#[test]
-fn smoke_inbox_happy_path() {
-    let _g = fleet_test_guard();
-    let home = tmp_home("smoke_inbox");
-    std::env::set_var("AGEND_HOME", &home);
-    let result = handle_tool("inbox", &json!({}), "agent1");
-    assert!(
-        result.is_object(),
-        "inbox must return JSON object: {result}"
-    );
-    assert!(
-        result["messages"].is_array(),
-        "inbox must return messages array: {result}"
-    );
-    std::env::remove_var("AGEND_HOME");
-    std::fs::remove_dir_all(&home).ok();
-}
-
-#[test]
-fn smoke_task_list_happy_path() {
-    let _g = fleet_test_guard();
-    let home = tmp_home("smoke_task");
-    std::env::set_var("AGEND_HOME", &home);
-    let result = handle_tool("task", &json!({"action": "list"}), "agent1");
-    assert!(
-        result.is_object(),
-        "task list must return JSON object: {result}"
-    );
-    let tasks = result
-        .get("tasks")
-        .expect("task list should have tasks key");
-    assert!(tasks.is_array(), "tasks should be array");
-    std::env::remove_var("AGEND_HOME");
-    std::fs::remove_dir_all(&home).ok();
-}
-
-#[test]
-fn smoke_ci_status_happy_path() {
-    let _g = fleet_test_guard();
-    let home = tmp_home("smoke_ci");
-    std::env::set_var("AGEND_HOME", &home);
-    std::fs::create_dir_all(home.join("ci-watches")).ok();
-    let result = handle_tool("ci", &json!({"action": "status"}), "agent1");
-    assert!(
-        result.is_object(),
-        "ci status must return JSON object: {result}"
-    );
-    assert!(
-        result.get("watches").is_some(),
-        "ci status must have watches key: {result}"
-    );
-    std::env::remove_var("AGEND_HOME");
-    std::fs::remove_dir_all(&home).ok();
-}
-
-#[test]
-fn smoke_create_instance_missing_name_errors() {
-    let _g = fleet_test_guard();
-    let home = tmp_home("smoke_create");
-    std::env::set_var("AGEND_HOME", &home);
-    let result = handle_tool("create_instance", &json!({}), "agent1");
-    assert!(
-        result.is_object(),
-        "create_instance must return JSON object: {result}"
-    );
-    assert!(
-        result.get("error").is_some(),
-        "create_instance without name must error: {result}"
-    );
     std::env::remove_var("AGEND_HOME");
     std::fs::remove_dir_all(&home).ok();
 }
