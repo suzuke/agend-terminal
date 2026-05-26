@@ -3,6 +3,48 @@ use std::path::Path;
 use std::sync::Arc;
 
 use super::provider::{CiPollResult, CiProvider, CiRun, MergeableState, PrState};
+
+type TickCache = Arc<tokio::sync::Mutex<std::collections::HashMap<(String, String), CiPollResult>>>;
+
+struct CachedCiProvider {
+    inner: Box<dyn CiProvider>,
+    poll_cache: TickCache,
+}
+
+#[async_trait::async_trait]
+impl CiProvider for CachedCiProvider {
+    async fn poll_runs(&self, repo: &str, branch: &str) -> anyhow::Result<CiPollResult> {
+        let key = (repo.to_string(), branch.to_string());
+        {
+            let cache = self.poll_cache.lock().await;
+            if let Some(cached) = cache.get(&key) {
+                return Ok(cached.clone());
+            }
+        }
+        let result = self.inner.poll_runs(repo, branch).await?;
+        {
+            let mut cache = self.poll_cache.lock().await;
+            cache.insert(key, result.clone());
+        }
+        Ok(result)
+    }
+
+    async fn check_pr_terminal(&self, repo: &str, branch: &str) -> PrState {
+        self.inner.check_pr_terminal(repo, branch).await
+    }
+
+    async fn check_pr_mergeable(&self, repo: &str, branch: &str) -> MergeableState {
+        self.inner.check_pr_mergeable(repo, branch).await
+    }
+
+    async fn fetch_failure_summary(&self, repo: &str, run_id: u64) -> String {
+        self.inner.fetch_failure_summary(repo, run_id).await
+    }
+
+    fn token_warning(&self) -> Option<&'static str> {
+        self.inner.token_warning()
+    }
+}
 use super::registry::{
     ci_watches_dir, remove_watch, update_watch_state, update_watch_state_with_notify,
 };
@@ -274,6 +316,7 @@ pub(super) fn check_ci_watches_with_provider(
         Ok(e) => e,
         Err(_) => return,
     };
+    let tick_cache: TickCache = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
     let display_timezone: Option<String> =
         crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
             .ok()
@@ -297,8 +340,11 @@ pub(super) fn check_ci_watches_with_provider(
                         .unwrap_or_default()
                         .as_bytes(),
                 );
-                let provider = match make_provider(&watch) {
-                    Some(p) => p,
+                let provider: Box<dyn CiProvider> = match make_provider(&watch) {
+                    Some(p) => Box::new(CachedCiProvider {
+                        inner: p,
+                        poll_cache: Arc::clone(&tick_cache),
+                    }),
                     None => {
                         tracing::warn!(repo = %ctx.repo, "ci_check: failed to build CI provider");
                         continue;

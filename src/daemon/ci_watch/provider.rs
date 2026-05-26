@@ -130,7 +130,7 @@ pub struct CiRun {
 /// the provider exposes them. The tick-loop feeds these into
 /// [`crate::daemon::ci_watch::adaptive_interval`] to widen the next poll's effective interval
 /// before the limit is exhausted (preempt vs. recover).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum CiPollResult {
     /// Runs retrieved successfully (may be empty). Rate-limit fields
     /// are `None` for providers that don't expose the quota headers
