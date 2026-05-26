@@ -301,6 +301,39 @@ fn is_worktree_clean(worktree: &Path) -> bool {
     out.stdout.is_empty()
 }
 
+/// #1244: auto-release worktree when ci_watch detects PR merged.
+///
+/// Branch→agent reverse lookup via `scan_existing_branch_binding`,
+/// then dirty-tree guard + `release_full`. Silent no-op when no agent
+/// is bound to the branch (manual merge, already released, etc.).
+pub(crate) fn auto_release_for_merged_branch(home: &Path, branch: &str) {
+    let Some(agent) =
+        crate::binding::scan_existing_branch_binding(home, branch, /* exclude */ "")
+    else {
+        return;
+    };
+    let Some(binding) = crate::binding::read(home, &agent) else {
+        return;
+    };
+    let worktree_path = binding["worktree"].as_str().unwrap_or("");
+    if !worktree_path.is_empty() && !is_worktree_clean(Path::new(worktree_path)) {
+        tracing::warn!(
+            agent = %agent,
+            branch = %branch,
+            worktree = %worktree_path,
+            "#1244 auto_release_on_merge: worktree dirty — skipping auto-release"
+        );
+        return;
+    }
+    let outcome = crate::worktree_pool::release_full(home, &agent, false);
+    tracing::info!(
+        agent = %agent,
+        branch = %branch,
+        outcome = ?outcome,
+        "#1244 auto_release_on_merge: released worktree after PR merged"
+    );
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -515,6 +548,44 @@ mod tests {
         assert!(
             !bad_path.exists(),
             "malformed intent must be dropped on drain"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// #1244: no binding for branch → silent no-op.
+    #[test]
+    fn auto_release_on_merge_no_binding_is_noop() {
+        let home = tmp_home("1244-no-bind");
+        std::fs::create_dir_all(crate::paths::runtime_dir(&home)).unwrap();
+        auto_release_for_merged_branch(&home, "feat/gone");
+        // No panic, no crash — silent skip.
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// #1244: binding exists for branch → release_full called,
+    /// binding.json removed.
+    #[test]
+    fn auto_release_on_merge_releases_bound_agent() {
+        let home = tmp_home("1244-release");
+        let agent = "dev-merge";
+        let branch = "feat/merged-branch";
+        let rt = crate::paths::runtime_dir(&home).join(agent);
+        std::fs::create_dir_all(&rt).unwrap();
+        let binding = serde_json::json!({
+            "version": 1,
+            "branch": branch,
+            "task_id": "t-test",
+            "worktree": "",
+        });
+        std::fs::write(
+            rt.join("binding.json"),
+            serde_json::to_string_pretty(&binding).unwrap(),
+        )
+        .unwrap();
+        auto_release_for_merged_branch(&home, branch);
+        assert!(
+            !rt.join("binding.json").exists(),
+            "binding.json must be removed after auto-release on merge"
         );
         let _ = std::fs::remove_dir_all(&home);
     }
