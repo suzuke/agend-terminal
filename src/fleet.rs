@@ -13,11 +13,11 @@ static FLEET_CACHE: std::sync::Mutex<Option<FleetCacheEntry>> = std::sync::Mutex
 struct FleetCacheEntry {
     path: PathBuf,
     mtime: SystemTime,
+    size: u64,
     config: FleetConfig,
 }
 
-#[cfg(test)]
-pub(crate) fn clear_cache() {
+fn invalidate_cache() {
     let mut guard = FLEET_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     *guard = None;
 }
@@ -284,12 +284,14 @@ pub struct TeamConfig {
 
 impl FleetConfig {
     pub fn load(path: &Path) -> Result<Self> {
-        let disk_mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        let meta = std::fs::metadata(path).ok();
+        let disk_mtime = meta.as_ref().and_then(|m| m.modified().ok());
+        let disk_size = meta.as_ref().map(|m| m.len());
 
-        if let Some(mtime) = disk_mtime {
+        if let (Some(mtime), Some(size)) = (disk_mtime, disk_size) {
             let guard = FLEET_CACHE.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(entry) = guard.as_ref() {
-                if entry.path == path && entry.mtime == mtime {
+                if entry.path == path && entry.mtime == mtime && entry.size == size {
                     return Ok(entry.config.clone());
                 }
             }
@@ -297,11 +299,12 @@ impl FleetConfig {
 
         let config = Self::load_uncached(path)?;
 
-        if let Some(mtime) = disk_mtime {
+        if let (Some(mtime), Some(size)) = (disk_mtime, disk_size) {
             let mut guard = FLEET_CACHE.lock().unwrap_or_else(|e| e.into_inner());
             *guard = Some(FleetCacheEntry {
                 path: path.to_path_buf(),
                 mtime,
+                size,
                 config: config.clone(),
             });
         }
@@ -724,8 +727,10 @@ fn atomic_write_yaml(home: &Path, doc: &serde_yaml_ng::Value) -> Result<()> {
     // Use the shared helper so fsync-before-rename is uniform across the
     // codebase. The previous write→rename (no fsync) left a crash window
     // where the renamed-over fleet.yaml could be truncated on power loss.
-    crate::store::atomic_write(&fleet_path, yaml.as_bytes())
-        .context("Failed to atomic-write fleet.yaml")
+    let result = crate::store::atomic_write(&fleet_path, yaml.as_bytes())
+        .context("Failed to atomic-write fleet.yaml");
+    invalidate_cache();
+    result
 }
 
 /// Acquire the fleet.yaml file lock via flock (auto-released on crash/drop).
@@ -3845,7 +3850,7 @@ instances:
     #[test]
     fn load_cache_returns_same_result_on_unchanged_file() {
         let _g = env_guard();
-        clear_cache();
+        invalidate_cache();
         let dir =
             std::env::temp_dir().join(format!("agend-fleet-cache-hit-{}", std::process::id()));
         let path = write_fleet(&dir, "instances:\n  cached-agent:\n    backend: claude\n");
@@ -3859,7 +3864,7 @@ instances:
     #[test]
     fn load_cache_invalidates_on_file_change() {
         let _g = env_guard();
-        clear_cache();
+        invalidate_cache();
         let dir =
             std::env::temp_dir().join(format!("agend-fleet-cache-inv-{}", std::process::id()));
         let path = write_fleet(&dir, "instances:\n  old-agent:\n    backend: claude\n");
@@ -3878,6 +3883,62 @@ instances:
         assert!(
             second.instances.contains_key("new-agent"),
             "new-agent should appear after rewrite"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_cache_detects_same_mtime_different_size() {
+        let _g = env_guard();
+        invalidate_cache();
+        let dir =
+            std::env::temp_dir().join(format!("agend-fleet-cache-size-{}", std::process::id()));
+        let path = write_fleet(&dir, "instances:\n  a:\n    backend: claude\n");
+        let first = FleetConfig::load(&path).expect("first load");
+        assert!(first.instances.contains_key("a"));
+
+        // Rewrite with different content (different size) without sleeping —
+        // mtime may be identical on coarse-grained filesystems.
+        std::fs::write(
+            &path,
+            "instances:\n  longer-name-agent:\n    backend: claude\n",
+        )
+        .expect("rewrite");
+
+        let second = FleetConfig::load(&path).expect("second load");
+        // If size changed, cache must invalidate even with same mtime.
+        // If mtime also changed, cache invalidates too. Either way: correct.
+        assert!(
+            second.instances.contains_key("longer-name-agent"),
+            "different-size rewrite must not return stale cache"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mutate_path_invalidates_cache() {
+        let _g = env_guard();
+        invalidate_cache();
+        let dir =
+            std::env::temp_dir().join(format!("agend-fleet-cache-mutate-{}", std::process::id()));
+        let path = write_fleet(&dir, "instances:\n  before:\n    backend: claude\n");
+        let first = FleetConfig::load(&path).expect("first load");
+        assert!(first.instances.contains_key("before"));
+
+        add_instance_to_yaml(
+            &dir,
+            "after",
+            &InstanceYamlEntry {
+                backend: Some("claude-code".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("add instance");
+
+        let second = FleetConfig::load(&path).expect("load after mutate");
+        assert!(
+            second.instances.contains_key("after"),
+            "cache must be invalidated by atomic_write_yaml"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
