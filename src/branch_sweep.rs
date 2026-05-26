@@ -229,7 +229,9 @@ fn is_squash_merged_cherry(repo: &Path, base: &str, branch: &str) -> bool {
 }
 
 /// GitHub API based detection: query whether a merged PR exists for
-/// this branch. Most reliable — not affected by git history topology.
+/// this branch with matching HEAD SHA. Most reliable — not affected
+/// by git history topology. SHA check prevents false positives from
+/// branch name reuse.
 fn is_squash_merged_diff(repo: &Path, _base: &str, branch: &str) -> bool {
     // Resolve owner/repo from git remote origin.
     let remote = std::process::Command::new("git")
@@ -246,22 +248,45 @@ fn is_squash_merged_diff(repo: &Path, _base: &str, branch: &str) -> bool {
     let Some(gh_repo) = gh_repo else {
         return false;
     };
-    // gh pr list --state merged --head <branch> --repo <owner/repo> --json number --jq 'length'
+    // Get local branch tip SHA.
+    let local_sha = std::process::Command::new("git")
+        .args(["rev-parse", branch])
+        .current_dir(repo)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    let Some(local_sha) = local_sha else {
+        return false;
+    };
+    // gh pr list --state merged --head <branch> --json headRefOid
     let output = std::process::Command::new("gh")
         .args([
-            "pr", "list", "--state", "merged", "--head", branch, "--repo", &gh_repo, "--json",
-            "number", "--jq", "length",
+            "pr",
+            "list",
+            "--state",
+            "merged",
+            "--head",
+            branch,
+            "--repo",
+            &gh_repo,
+            "--json",
+            "headRefOid",
         ])
         .output();
     let Ok(o) = output else { return false };
     if !o.status.success() {
         return false;
     }
-    let count: usize = String::from_utf8_lossy(&o.stdout)
-        .trim()
-        .parse()
-        .unwrap_or(0);
-    count > 0
+    // Parse JSON array and check if any PR's headRefOid matches local SHA.
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    let prs: Vec<serde_json::Value> = serde_json::from_str(&stdout).unwrap_or_default();
+    prs.iter().any(|pr| {
+        pr["headRefOid"]
+            .as_str()
+            .map(|sha| sha == local_sha)
+            .unwrap_or(false)
+    })
 }
 
 /// Extract "owner/repo" from a GitHub remote URL.
