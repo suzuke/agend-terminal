@@ -232,13 +232,15 @@ pub fn render_tasks(
     .split(inner);
 
     let col_titles = ["Backlog", "Open", "In Progress", "Done"];
-    let done_visible = columns.get(3).map(|c| c.len()).unwrap_or(0);
+    let done_total = columns.get(3).map(|c| c.len()).unwrap_or(0);
+    let done_visible = done_total.min(DONE_VISIBLE_MAX);
+    let done_older = done_total.saturating_sub(DONE_VISIBLE_MAX);
     let col_title_strs: Vec<String> = col_titles
         .iter()
         .enumerate()
         .map(|(i, t)| {
             if i == 3 {
-                format!(" {} ({}/14d) ", t, done_visible)
+                format!(" {} ({}) ", t, done_total)
             } else {
                 format!(" {} ({}) ", t, columns.get(i).map(|c| c.len()).unwrap_or(0))
             }
@@ -269,8 +271,13 @@ pub fn render_tasks(
         let block_inner = block.inner(*area);
         frame.render_widget(block, *area);
 
+        let visible_tasks: &[&crate::tasks::Task] = if ci == 3 {
+            &tasks[..done_visible]
+        } else {
+            tasks
+        };
         let mut lines: Vec<Line> = Vec::new();
-        for (ri, t) in tasks.iter().enumerate() {
+        for (ri, t) in visible_tasks.iter().enumerate() {
             let is_selected = is_active && ri == sel_row;
             let pri_badge = match t.priority.as_str() {
                 "urgent" => "🔴",
@@ -294,6 +301,12 @@ pub fn render_tasks(
                 Style::default().fg(Color::White)
             };
             lines.push(Line::from(Span::styled(text, style)));
+        }
+        if ci == 3 && done_older > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("── older ({done_older}) ──"),
+                Style::default().fg(Color::DarkGray),
+            )));
         }
         frame.render_widget(Paragraph::new(lines), block_inner);
     }
@@ -450,8 +463,12 @@ pub fn render_tasks(
     }
 }
 
+/// Max visible tasks in the Done column before collapsing into a summary line.
+const DONE_VISIBLE_MAX: usize = 20;
+
 /// Group tasks into 4 kanban columns: Backlog, Open, In Progress, Done.
 /// Sorted by priority desc then created_at asc within each column.
+/// Done column is sorted by updated_at desc (most recent first).
 /// Cancelled tasks are excluded.
 pub fn task_board_columns(items: &[crate::tasks::Task]) -> [Vec<&crate::tasks::Task>; 4] {
     let mut backlog: Vec<&crate::tasks::Task> = Vec::new();
@@ -496,9 +513,20 @@ pub fn task_board_columns(items: &[crate::tasks::Task]) -> [Vec<&crate::tasks::T
             .unwrap_or("")
             .cmp(b.assignee.as_deref().unwrap_or(""))
     });
-    sort_col(&mut done);
+    done.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
 
     [backlog, open, in_progress, done]
+}
+
+/// Number of selectable (visible) tasks in a column.
+/// Done column is capped at `DONE_VISIBLE_MAX`; others return full length.
+pub fn selectable_len(columns: &[Vec<&crate::tasks::Task>; 4], col: usize) -> usize {
+    let len = columns.get(col).map(|c| c.len()).unwrap_or(0);
+    if col == 3 {
+        len.min(DONE_VISIBLE_MAX)
+    } else {
+        len
+    }
 }
 
 #[cfg(test)]
@@ -534,6 +562,67 @@ mod tests {
             parent_id: None,
             metadata: std::collections::BTreeMap::new(),
         }
+    }
+
+    fn make_done_task(title: &str, updated_at: &str) -> crate::tasks::Task {
+        let mut t = make_task(title, "done", "normal", "2026-01-01");
+        t.updated_at = updated_at.to_string();
+        t
+    }
+
+    #[test]
+    fn done_column_sorted_by_updated_at_desc() {
+        let tasks = vec![
+            make_done_task("old", "2026-01-01T00:00:00Z"),
+            make_done_task("mid", "2026-01-15T00:00:00Z"),
+            make_done_task("new", "2026-01-30T00:00:00Z"),
+        ];
+        let [_, _, _, done] = task_board_columns(&tasks);
+        assert_eq!(done[0].title, "new");
+        assert_eq!(done[1].title, "mid");
+        assert_eq!(done[2].title, "old");
+    }
+
+    #[test]
+    fn done_column_selectable_len_capped() {
+        let tasks: Vec<crate::tasks::Task> = (0..30)
+            .map(|i| {
+                make_done_task(
+                    &format!("task-{i}"),
+                    &format!("2026-01-{:02}T00:00:00Z", (i % 28) + 1),
+                )
+            })
+            .collect();
+        let columns = task_board_columns(&tasks);
+        assert_eq!(columns[3].len(), 30, "full done column has 30 tasks");
+        assert_eq!(
+            selectable_len(&columns, 3),
+            DONE_VISIBLE_MAX,
+            "selectable len capped at DONE_VISIBLE_MAX"
+        );
+    }
+
+    #[test]
+    fn done_column_selectable_len_uncapped_when_small() {
+        let tasks = vec![
+            make_done_task("a", "2026-01-01T00:00:00Z"),
+            make_done_task("b", "2026-01-02T00:00:00Z"),
+        ];
+        let columns = task_board_columns(&tasks);
+        assert_eq!(selectable_len(&columns, 3), 2);
+    }
+
+    #[test]
+    fn other_columns_selectable_len_not_capped() {
+        let tasks: Vec<crate::tasks::Task> = (0..30)
+            .map(|i| make_task(&format!("task-{i}"), "open", "high", "2026-01-01"))
+            .collect();
+        let columns = task_board_columns(&tasks);
+        assert_eq!(
+            selectable_len(&columns, 1),
+            30,
+            "open column should not be capped"
+        );
     }
 
     // ── #827 active-indicator ghost filter ──

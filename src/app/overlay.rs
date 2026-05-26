@@ -651,19 +651,23 @@ pub(super) fn handle_key(
                             if !key.modifiers.contains(KeyModifiers::SHIFT) && *col > 0 =>
                         {
                             *col -= 1;
-                            *row = (*row).min(columns[*col].len().saturating_sub(1));
+                            *row = (*row).min(
+                                crate::render::selectable_len(&columns, *col).saturating_sub(1),
+                            );
                         }
                         KeyCode::Right | KeyCode::Char('l')
                             if !key.modifiers.contains(KeyModifiers::SHIFT) && *col < 3 =>
                         {
                             *col += 1;
-                            *row = (*row).min(columns[*col].len().saturating_sub(1));
+                            *row = (*row).min(
+                                crate::render::selectable_len(&columns, *col).saturating_sub(1),
+                            );
                         }
                         KeyCode::Up | KeyCode::Char('k') if *row > 0 => {
                             *row -= 1;
                         }
                         KeyCode::Down | KeyCode::Char('j') => {
-                            let col_len = columns[*col].len();
+                            let col_len = crate::render::selectable_len(&columns, *col);
                             if *row + 1 < col_len {
                                 *row += 1;
                             }
@@ -694,7 +698,10 @@ pub(super) fn handle_key(
                                 );
                                 *items = crate::tasks::list_all(ctx.home);
                                 let new_cols = crate::render::task_board_columns(items);
-                                *row = (*row).min(new_cols[*col].len().saturating_sub(1));
+                                *row = (*row).min(
+                                    crate::render::selectable_len(&new_cols, *col)
+                                        .saturating_sub(1),
+                                );
                             }
                         }
                         // D (Shift+D) — mark task done from any column
@@ -711,7 +718,10 @@ pub(super) fn handle_key(
                                 );
                                 *items = crate::tasks::list_all(ctx.home);
                                 let new_cols = crate::render::task_board_columns(items);
-                                *row = (*row).min(new_cols[*col].len().saturating_sub(1));
+                                *row = (*row).min(
+                                    crate::render::selectable_len(&new_cols, *col)
+                                        .saturating_sub(1),
+                                );
                             }
                         }
                         // a — assign
@@ -777,7 +787,10 @@ pub(super) fn handle_key(
                                     *items = crate::tasks::list_all(ctx.home);
                                     *col -= 1;
                                     let new_cols = crate::render::task_board_columns(items);
-                                    *row = (*row).min(new_cols[*col].len().saturating_sub(1));
+                                    *row = (*row).min(
+                                        crate::render::selectable_len(&new_cols, *col)
+                                            .saturating_sub(1),
+                                    );
                                 }
                             }
                         }
@@ -801,7 +814,10 @@ pub(super) fn handle_key(
                                     *items = crate::tasks::list_all(ctx.home);
                                     *col += 1;
                                     let new_cols = crate::render::task_board_columns(items);
-                                    *row = (*row).min(new_cols[*col].len().saturating_sub(1));
+                                    *row = (*row).min(
+                                        crate::render::selectable_len(&new_cols, *col)
+                                            .saturating_sub(1),
+                                    );
                                 }
                             }
                         }
