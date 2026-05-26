@@ -121,27 +121,20 @@ pub(super) fn handle_checkout_repo(home: &Path, args: &Value, instance_name: &st
         Ok(o) if o.status.success() => {
             let mut resp =
                 json!({"path": worktree_path_str, "source": source_path, "branch": branch});
+            // #1275: write .agend-managed unconditionally so
+            // release_worktree and GC can always clean up.
+            let mut warnings: Vec<String> = Vec::new();
+            let marker_path = worktree_dir.join(crate::worktree_pool::MANAGED_MARKER);
+            if let Err(e) = std::fs::write(
+                &marker_path,
+                format!(
+                    "agent={instance_name}\nbranch={branch}\nleased_at={}\n",
+                    chrono::Utc::now().to_rfc3339()
+                ),
+            ) {
+                warnings.push(format!("marker: {e}"));
+            }
             if bind {
-                // #779 P2 Option B: collect tail-op partial failures
-                // into a `warnings` array. `bound: true` remains
-                // load-bearing (lease succeeded — the main op went
-                // through); `warnings` flags degraded daemon-side
-                // state so callers can diagnose without grepping logs.
-                // Vec ordering preserves tail-op execution order
-                // (marker → bind_full → watch_ci) for positional
-                // semantics. Prefix convention: `<step>: <message>`
-                // — machine-greppable by callers.
-                let mut warnings: Vec<String> = Vec::new();
-                let marker_path = worktree_dir.join(crate::worktree_pool::MANAGED_MARKER);
-                if let Err(e) = std::fs::write(
-                    &marker_path,
-                    format!(
-                        "agent={instance_name}\nbranch={branch}\nleased_at={}\n",
-                        chrono::Utc::now().to_rfc3339()
-                    ),
-                ) {
-                    warnings.push(format!("marker: {e}"));
-                }
                 if let Err(e) = crate::binding::bind_full(
                     home,
                     instance_name,
@@ -184,9 +177,9 @@ pub(super) fn handle_checkout_repo(home: &Path, args: &Value, instance_name: &st
                 resp["bound"] = json!(true);
                 resp["auto_created_branch"] = json!(auto_created_branch);
                 resp["fetch_attempted"] = json!(fetch_attempted);
-                if !warnings.is_empty() {
-                    resp["warnings"] = json!(warnings);
-                }
+            }
+            if !warnings.is_empty() {
+                resp["warnings"] = json!(warnings);
             }
             resp
         }

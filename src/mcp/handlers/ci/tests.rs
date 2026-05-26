@@ -848,8 +848,8 @@ fn checkout_bind_false_default_preserves_detached_no_binding() {
 
     let wt_path = std::path::PathBuf::from(resp["path"].as_str().expect("path"));
     assert!(
-        !wt_path.join(crate::worktree_pool::MANAGED_MARKER).exists(),
-        ".agend-managed marker must NOT be written without bind:true"
+        wt_path.join(crate::worktree_pool::MANAGED_MARKER).exists(),
+        ".agend-managed marker must be written even without bind:true (#1275)"
     );
 
     let binding = crate::paths::runtime_dir(&home)

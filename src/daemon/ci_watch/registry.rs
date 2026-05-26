@@ -257,10 +257,7 @@ mod tests {
 
     #[test]
     fn flush_preserves_concurrent_unwatch() {
-        let dir = std::env::temp_dir().join(format!(
-            "agend-flush-merge-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("agend-flush-merge-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let watch_path = dir.join("test.json");
 
@@ -279,11 +276,7 @@ mod tests {
             ]),
             ..Default::default()
         };
-        std::fs::write(
-            &watch_path,
-            serde_json::to_string_pretty(&initial).unwrap(),
-        )
-        .unwrap();
+        std::fs::write(&watch_path, serde_json::to_string_pretty(&initial).unwrap()).unwrap();
 
         let mut stale = initial.clone();
         stale.last_run_id = Some(42);
@@ -294,11 +287,7 @@ mod tests {
             instance: "A".into(),
             subscribed_at: None,
         }]);
-        std::fs::write(
-            &watch_path,
-            serde_json::to_string_pretty(&on_disk).unwrap(),
-        )
-        .unwrap();
+        std::fs::write(&watch_path, serde_json::to_string_pretty(&on_disk).unwrap()).unwrap();
 
         flush_watch_state(&watch_path, &stale);
 
@@ -318,10 +307,7 @@ mod tests {
 
     #[test]
     fn flush_respects_concurrent_deletion() {
-        let dir = std::env::temp_dir().join(format!(
-            "agend-flush-delete-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("agend-flush-delete-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let watch_path = dir.join("deleted.json");
 
@@ -345,10 +331,7 @@ mod tests {
 
     #[test]
     fn flush_preserves_concurrent_metadata_update() {
-        let dir = std::env::temp_dir().join(format!(
-            "agend-flush-meta-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("agend-flush-meta-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let watch_path = dir.join("meta.json");
 
@@ -360,11 +343,7 @@ mod tests {
             required_checks: None,
             ..Default::default()
         };
-        std::fs::write(
-            &watch_path,
-            serde_json::to_string_pretty(&initial).unwrap(),
-        )
-        .unwrap();
+        std::fs::write(&watch_path, serde_json::to_string_pretty(&initial).unwrap()).unwrap();
 
         // Poller snapshot taken at tick start (stale metadata).
         let mut stale = initial.clone();
@@ -376,11 +355,7 @@ mod tests {
         updated.expires_at = Some("2026-06-01T00:00:00Z".into());
         updated.task_id = Some("t-new".into());
         updated.required_checks = Some(vec!["build".into()]);
-        std::fs::write(
-            &watch_path,
-            serde_json::to_string_pretty(&updated).unwrap(),
-        )
-        .unwrap();
+        std::fs::write(&watch_path, serde_json::to_string_pretty(&updated).unwrap()).unwrap();
 
         flush_watch_state(&watch_path, &stale);
 
