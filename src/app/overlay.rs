@@ -580,7 +580,10 @@ pub(super) fn handle_key(
             }
             match mode {
                 TaskBoardMode::Detail => {
-                    if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                    if matches!(
+                        key.code,
+                        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace
+                    ) {
                         *mode = TaskBoardMode::Board;
                     }
                 }
