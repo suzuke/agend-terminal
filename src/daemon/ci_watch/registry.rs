@@ -166,15 +166,17 @@ pub(super) fn flush_watch_state(watch_path: &Path, state: &super::watch_state::W
             return;
         }
     };
-    let mut merged = state.clone();
-    if let Some(current) = std::fs::read_to_string(watch_path)
+    let current = match std::fs::read_to_string(watch_path)
         .ok()
         .and_then(|c| serde_json::from_str::<super::watch_state::WatchState>(&c).ok())
     {
-        merged.subscribers = current.subscribers;
-        merged.instance = current.instance;
-        merged.next_after_ci = current.next_after_ci;
-    }
+        Some(c) => c,
+        None => return, // file deleted by concurrent unwatch — respect deletion
+    };
+    let mut merged = state.clone();
+    merged.subscribers = current.subscribers;
+    merged.instance = current.instance;
+    merged.next_after_ci = current.next_after_ci;
     if let Err(e) = crate::store::atomic_write(
         watch_path,
         serde_json::to_string_pretty(&merged)
@@ -296,6 +298,33 @@ mod tests {
             subs,
             vec!["A"],
             "concurrent unwatch of B must be preserved, not overwritten"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn flush_respects_concurrent_deletion() {
+        let dir = std::env::temp_dir().join(format!(
+            "agend-flush-delete-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let watch_path = dir.join("deleted.json");
+
+        let stale = super::super::watch_state::WatchState {
+            repo: "o/r".into(),
+            branch: "feat".into(),
+            last_run_id: Some(99),
+            ..Default::default()
+        };
+
+        // File does not exist (concurrent unwatch deleted it).
+        assert!(!watch_path.exists());
+        flush_watch_state(&watch_path, &stale);
+        assert!(
+            !watch_path.exists(),
+            "flush must not resurrect a deleted watch file"
         );
 
         std::fs::remove_dir_all(&dir).ok();
