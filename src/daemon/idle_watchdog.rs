@@ -284,8 +284,11 @@ fn current_agent_task(home: &Path, agent: &str) -> Option<String> {
         .tasks
         .values()
         .find(|t| {
-            t.status == crate::task_events::TaskStatus::InProgress
-                && t.owner.as_ref().map(|n| n.as_str()) == Some(agent)
+            matches!(
+                t.status,
+                crate::task_events::TaskStatus::InProgress
+                    | crate::task_events::TaskStatus::Claimed
+            ) && t.owner.as_ref().map(|n| n.as_str()) == Some(agent)
         })
         .map(|t| format!("{} — {}", t.id, t.title))
 }
