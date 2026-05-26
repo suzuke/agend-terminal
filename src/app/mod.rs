@@ -634,20 +634,47 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                     binary_stale,
                                 );
                                 // Render overlay (same as normal draw path).
-                                match &overlay {
-                                    Overlay::Tasks { items, col, row, mode, view } => {
-                                        crate::render::render_tasks(frame, items, *col, *row, mode, *view, &home);
+                                match &mut overlay {
+                                    Overlay::NewTabMenu { items, selected }
+                                    | Overlay::SplitMenu { items, selected, .. } => {
+                                        crate::render::render_menu(frame, items, *selected);
                                     }
-                                    Overlay::Decisions { items, scroll } => {
-                                        crate::render::render_decisions(frame, items, *scroll);
+                                    Overlay::RenameTab { input } | Overlay::RenamePane { input } => {
+                                        crate::render::render_rename(frame, input);
+                                    }
+                                    Overlay::ConfirmClose { target } => {
+                                        let msg = match target {
+                                            CloseTarget::Pane => "Close pane? (y/n)",
+                                            CloseTarget::Tab => "Close tab and kill all agents? (y/n)",
+                                        };
+                                        crate::render::render_confirm(frame, msg);
+                                    }
+                                    Overlay::TabList { selected } => {
+                                        crate::render::render_tab_list(frame, &layout, *selected);
+                                    }
+                                    Overlay::MovePaneTarget { selected, source_tab_idx, split_dir, .. } => {
+                                        crate::render::render_move_pane_target(frame, &layout, *selected, *source_tab_idx, *split_dir);
                                     }
                                     Overlay::Help => {
                                         crate::render::render_help(frame);
                                     }
-                                    Overlay::Command { input } => {
+                                    Overlay::Scroll => {
+                                        let so = layout.active_tab().and_then(|t| t.focused_pane()).map(|p| p.scroll_offset).unwrap_or(0);
+                                        crate::render::render_scroll_indicator(frame, so);
+                                    }
+                                    Overlay::Command { ref input } => {
                                         crate::render::render_command_palette(frame, input);
                                     }
-                                    _ => {}
+                                    Overlay::Decisions { ref items, scroll } => {
+                                        crate::render::render_decisions(frame, items, *scroll);
+                                    }
+                                    Overlay::Tasks { ref items, col, row, ref mode, ref view } => {
+                                        crate::render::render_tasks(frame, items, *col, *row, mode, *view, &home);
+                                    }
+                                    Overlay::ScratchShell { pane } => {
+                                        crate::render::render_scratch_shell(frame, pane, &registry);
+                                    }
+                                    Overlay::None => {}
                                 }
                             });
                             crate::screenshot::buffer_to_svg(snap_term.backend())
