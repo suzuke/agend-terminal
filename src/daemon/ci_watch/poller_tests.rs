@@ -654,6 +654,7 @@ fn test_inbox_body_failure_has_detail_and_url() {
         "failure",
         Some("Check / Clippy"),
         "https://github.com/o/r/actions/runs/123",
+        Some(123),
     );
     assert!(
         body.contains("Detail: Check / Clippy"),
@@ -663,12 +664,40 @@ fn test_inbox_body_failure_has_detail_and_url() {
 }
 
 #[test]
+fn test_inbox_body_failure_has_checklist() {
+    let body = build_inbox_body(
+        "[ci-fail] o/r@main: failure",
+        "failure",
+        Some("Tests"),
+        "https://github.com/o/r/actions/runs/789",
+        Some(789),
+    );
+    assert!(
+        body.contains("CI failure checklist"),
+        "failure body must have checklist: {body}"
+    );
+    assert!(
+        body.contains("gh run view 789 --log-failed"),
+        "checklist must include run_id in view command: {body}"
+    );
+    assert!(
+        body.contains("gh run rerun 789 --failed"),
+        "checklist must include run_id in rerun command: {body}"
+    );
+    assert!(
+        body.contains("Do NOT dismiss without evidence"),
+        "checklist must warn against dismissal: {body}"
+    );
+}
+
+#[test]
 fn test_inbox_body_success_has_url_no_detail() {
     let body = build_inbox_body(
         "[ci-pass] o/r@main: passed ✓",
         "success",
         None,
         "https://github.com/o/r/actions/runs/456",
+        Some(456),
     );
     assert!(
         body.contains("URL: https://"),
@@ -677,6 +706,10 @@ fn test_inbox_body_success_has_url_no_detail() {
     assert!(
         !body.contains("Detail:"),
         "success body must not have Detail: {body}"
+    );
+    assert!(
+        !body.contains("checklist"),
+        "success body must not have checklist: {body}"
     );
 }
 
