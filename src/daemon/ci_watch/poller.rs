@@ -365,7 +365,7 @@ pub(super) fn check_ci_watches_with_provider(
             Err(SkipReason::Expired) => {
                 let a = watch.subscriber_names().join(",");
                 remove_watch(home, &path, &a, &watch.repo, &watch.branch, "expired");
-                tracing::info!(repo = %watch.repo, branch = %watch.branch, "CI watch expired (TTL)");
+                tracing::info!(repo = %watch.repo, branch = %watch.branch, subscribers = %a, reason = "expired", "CI watch removed: TTL expired");
             }
             Err(SkipReason::InactivityTtl) => {
                 let a = watch.subscriber_names().join(",");
@@ -377,7 +377,7 @@ pub(super) fn check_ci_watches_with_provider(
                     &watch.branch,
                     "inactivity_ttl",
                 );
-                tracing::info!(repo = %watch.repo, branch = %watch.branch, hours = WATCH_TTL_HOURS, "CI watch removed: inactivity TTL");
+                tracing::info!(repo = %watch.repo, branch = %watch.branch, subscribers = %a, hours = WATCH_TTL_HOURS, reason = "inactivity_ttl", "CI watch removed: inactivity TTL");
             }
             Err(SkipReason::RateLimited { reset_epoch }) => {
                 bump_consecutive_skips_and_maybe_notify(
@@ -749,7 +749,7 @@ async fn ci_check_repo(
         branch: &branch,
         subscribers: &subscribers,
     };
-    if check_and_remove_terminal_pr(&ctx, &state, provider).await? {
+    if check_and_remove_terminal_pr(&ctx, &mut state, provider).await? {
         return Ok(());
     }
     check_and_alert_mergeable(&ctx, &mut state, provider).await;
@@ -795,6 +795,7 @@ async fn ci_check_repo(
         if state != snapshot {
             flush_watch_state(watch_path, &state);
         }
+        refresh_expires_at(watch_path);
         return Ok(());
     }
     let deduped = dedupe_notifications_by_head_sha(
@@ -809,18 +810,29 @@ async fn ci_check_repo(
     if state != snapshot {
         flush_watch_state(watch_path, &state);
     }
+    refresh_expires_at(watch_path);
     Ok(())
 }
 
 async fn check_and_remove_terminal_pr(
     ctx: &CiCheckCtx<'_>,
-    state: &WatchState,
+    state: &mut WatchState,
     provider: &dyn CiProvider,
 ) -> anyhow::Result<bool> {
-    let PrState::Terminal { merged } = provider.check_pr_terminal(ctx.repo, ctx.branch).await
-    else {
+    let pr_state = provider.check_pr_terminal(ctx.repo, ctx.branch).await;
+
+    let PrState::Terminal { merged } = pr_state else {
+        if state.terminal_since.is_some() {
+            state.terminal_since = None;
+            tracing::info!(
+                repo = ctx.repo,
+                branch = ctx.branch,
+                "PR no longer terminal — cleared terminal_since marker"
+            );
+        }
         return Ok(false);
     };
+
     if let Some(expires_at) = state.expires_at.as_deref() {
         if let Ok(exp) = chrono::DateTime::parse_from_rfc3339(expires_at) {
             let watch_age =
@@ -837,7 +849,31 @@ async fn check_and_remove_terminal_pr(
             }
         }
     }
+
+    // Two-consecutive-terminal guard (#1267)
+    if state.terminal_since.is_none() {
+        state.terminal_since = Some(chrono::Utc::now().to_rfc3339());
+        tracing::info!(
+            repo = ctx.repo,
+            branch = ctx.branch,
+            merged,
+            "PR terminal (first observation) — deferring removal to next poll"
+        );
+        return Ok(false);
+    }
+
     let audit_label = ctx.subscribers.join(",");
+    let watch_age_str = state
+        .expires_at
+        .as_deref()
+        .and_then(|e| chrono::DateTime::parse_from_rfc3339(e).ok())
+        .map(|exp| {
+            let created =
+                exp.with_timezone(&chrono::Utc) - chrono::Duration::hours(WATCH_TTL_HOURS);
+            let age = chrono::Utc::now().signed_duration_since(created);
+            format!("{}s", age.num_seconds())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
     remove_watch(
         ctx.home,
         ctx.watch_path,
@@ -850,7 +886,10 @@ async fn check_and_remove_terminal_pr(
         repo = ctx.repo,
         branch = ctx.branch,
         merged,
-        "CI watcher auto-cleared: PR terminal"
+        subscribers = %audit_label,
+        watch_age = %watch_age_str,
+        reason = "pr_terminal",
+        "CI watcher removed: PR terminal (two consecutive observations)"
     );
     if merged {
         crate::status_summary::auto_close_merged_tasks(ctx.home, ctx.branch);
@@ -1166,6 +1205,29 @@ fn persist_watch_state(
         state.last_stale_emitted_sha = Some(s.clone());
     }
     state.last_terminal_seen_at = Some(chrono::Utc::now().to_rfc3339());
+}
+
+/// Refresh `expires_at` to now + 72h after a successful poll (#1267).
+fn refresh_expires_at(watch_path: &Path) {
+    let lock_path = watch_path.with_extension("lock");
+    let _lock = match crate::store::acquire_file_lock(&lock_path) {
+        Ok(l) => l,
+        Err(_) => return,
+    };
+    let Ok(content) = std::fs::read_to_string(watch_path) else {
+        return;
+    };
+    let Ok(mut watch) = serde_json::from_str::<WatchState>(&content) else {
+        return;
+    };
+    watch.expires_at =
+        Some((chrono::Utc::now() + chrono::Duration::hours(WATCH_TTL_HOURS)).to_rfc3339());
+    let _ = crate::store::atomic_write(
+        watch_path,
+        serde_json::to_string_pretty(&watch)
+            .unwrap_or_default()
+            .as_bytes(),
+    );
 }
 
 #[cfg(test)]

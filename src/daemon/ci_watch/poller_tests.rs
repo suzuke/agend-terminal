@@ -1007,6 +1007,11 @@ impl MockCiProvider {
     fn set_mergeable(&self, state: MergeableState) {
         *self.mergeable.lock() = state;
     }
+
+    #[allow(dead_code)]
+    fn set_pr_state(&self, state: PrState) {
+        *self.pr_state.lock() = state;
+    }
 }
 
 #[async_trait::async_trait]
@@ -1272,7 +1277,10 @@ fn mock_pr_terminal_clears_watch() {
     let dir = tmp_dir("mock-pr-term");
     let ci_dir = dir.join("ci-watches");
     std::fs::create_dir_all(&ci_dir).ok();
-    let watch = base_watch();
+    let mut watch = base_watch();
+    // #1267: two-consecutive-terminal guard — pre-set terminal_since to
+    // simulate first observation already recorded.
+    watch["terminal_since"] = serde_json::json!("2026-01-01T00:00:00Z");
     let filename = watch_filename("o/r", "feat");
     let watch_path = ci_dir.join(&filename);
     std::fs::write(&watch_path, serde_json::to_string_pretty(&watch).unwrap()).unwrap();
@@ -2096,17 +2104,17 @@ fn auto_clear_skips_young_watch() {
 
 #[test]
 fn auto_clear_fires_on_old_watch_with_merged_pr() {
-    // A watch created > 60s ago SHOULD be cleared on PR terminal.
+    // A watch created > 60s ago SHOULD be cleared on PR terminal (second observation).
     let dir = tmp_dir("old-watch-clear");
     let ci_dir = dir.join("ci-watches");
     std::fs::create_dir_all(&ci_dir).ok();
-    // Watch with expires_at implying creation > 60s ago.
     let old_creation = chrono::Utc::now() - chrono::Duration::minutes(5);
     let expires = (old_creation + chrono::Duration::hours(super::WATCH_TTL_HOURS)).to_rfc3339();
     let watch = serde_json::json!({
         "repo": "o/r", "branch": "feat-old", "interval_secs": 60,
         "instance": "agent1", "last_run_id": null, "head_sha": null,
         "last_polled_at": null, "expires_at": expires,
+        "terminal_since": "2026-01-01T00:00:00Z",
     });
     let filename = super::watch_filename("o/r", "feat-old");
     let watch_path = ci_dir.join(&filename);
@@ -2213,18 +2221,17 @@ fn branch_with_open_pr_classified_as_active() {
 
 #[test]
 fn branch_with_merged_pr_classified_as_terminal() {
-    // Already tested by mock_pr_terminal_clears_watch — verify preserved.
-    // Merged PR → PrState::Terminal { merged: true } → auto-clear.
+    // Merged PR → PrState::Terminal { merged: true } → auto-clear (second observation).
     let dir = tmp_dir("classify-merged");
     let ci_dir = dir.join("ci-watches");
     std::fs::create_dir_all(&ci_dir).ok();
-    // Use old expires_at so grace period doesn't block.
     let old_creation = chrono::Utc::now() - chrono::Duration::minutes(5);
     let expires = (old_creation + chrono::Duration::hours(super::WATCH_TTL_HOURS)).to_rfc3339();
     let watch = serde_json::json!({
         "repo": "o/r", "branch": "feat-merged", "interval_secs": 60,
         "instance": "agent1", "last_run_id": null, "head_sha": null,
         "last_polled_at": null, "expires_at": expires,
+        "terminal_since": "2026-01-01T00:00:00Z",
     });
     let filename = watch_filename("o/r", "feat-merged");
     let watch_path = ci_dir.join(&filename);
@@ -5024,4 +5031,121 @@ async fn tick_cache_concurrent_same_key_single_api_call() {
         1,
         "4 concurrent tasks with same key must coalesce to 1 API call"
     );
+}
+
+// ── #1267: two-consecutive-terminal guard ────────────────────────
+
+#[test]
+fn terminal_guard_first_observation_defers_removal() {
+    let dir = tmp_dir("term-guard-defer");
+    let ci_dir = dir.join("ci-watches");
+    std::fs::create_dir_all(&ci_dir).ok();
+    let old_creation = chrono::Utc::now() - chrono::Duration::minutes(5);
+    let expires = (old_creation + chrono::Duration::hours(super::WATCH_TTL_HOURS)).to_rfc3339();
+    let watch = serde_json::json!({
+        "repo": "o/r", "branch": "feat-defer", "interval_secs": 60,
+        "instance": "agent1", "last_run_id": null, "head_sha": null,
+        "last_polled_at": null, "expires_at": expires,
+    });
+    let provider = MockCiProvider::with_runs(vec![]).with_pr_terminal();
+    run_ci_check(&dir, &watch, &provider).unwrap();
+
+    let watch_path = ci_dir.join(watch_filename("o/r", "feat-defer"));
+    assert!(
+        watch_path.exists(),
+        "first Terminal observation must NOT remove watch"
+    );
+    let content = std::fs::read_to_string(&watch_path).unwrap();
+    let ws: super::WatchState = serde_json::from_str(&content).unwrap();
+    assert!(
+        ws.terminal_since.is_some(),
+        "terminal_since must be set after first Terminal"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn terminal_guard_two_consecutive_removes() {
+    let dir = tmp_dir("term-guard-2x");
+    let ci_dir = dir.join("ci-watches");
+    std::fs::create_dir_all(&ci_dir).ok();
+    let old_creation = chrono::Utc::now() - chrono::Duration::minutes(5);
+    let expires = (old_creation + chrono::Duration::hours(super::WATCH_TTL_HOURS)).to_rfc3339();
+    let watch = serde_json::json!({
+        "repo": "o/r", "branch": "feat-2x", "interval_secs": 60,
+        "instance": "agent1", "last_run_id": null, "head_sha": null,
+        "last_polled_at": null, "expires_at": expires,
+        "terminal_since": "2026-01-01T00:00:00Z",
+    });
+    let provider = MockCiProvider::with_runs(vec![]).with_pr_terminal();
+    run_ci_check(&dir, &watch, &provider).unwrap();
+
+    let watch_path = ci_dir.join(watch_filename("o/r", "feat-2x"));
+    assert!(
+        !watch_path.exists(),
+        "second consecutive Terminal must remove watch"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn terminal_guard_cleared_on_non_terminal() {
+    let dir = tmp_dir("term-guard-clear");
+    let ci_dir = dir.join("ci-watches");
+    std::fs::create_dir_all(&ci_dir).ok();
+    let old_creation = chrono::Utc::now() - chrono::Duration::minutes(5);
+    let expires = (old_creation + chrono::Duration::hours(super::WATCH_TTL_HOURS)).to_rfc3339();
+    let watch = serde_json::json!({
+        "repo": "o/r", "branch": "feat-clear", "interval_secs": 60,
+        "instance": "agent1", "last_run_id": null, "head_sha": null,
+        "last_polled_at": null, "expires_at": expires,
+        "terminal_since": "2026-01-01T00:00:00Z",
+    });
+    // Provider returns Open (non-terminal) — mock default
+    let provider = MockCiProvider::with_runs(vec![]);
+    run_ci_check(&dir, &watch, &provider).unwrap();
+
+    let watch_path = ci_dir.join(watch_filename("o/r", "feat-clear"));
+    assert!(watch_path.exists(), "non-terminal must preserve watch");
+    let content = std::fs::read_to_string(&watch_path).unwrap();
+    let ws: super::WatchState = serde_json::from_str(&content).unwrap();
+    assert!(
+        ws.terminal_since.is_none(),
+        "terminal_since must be cleared after non-terminal observation"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn successful_poll_refreshes_expires_at() {
+    let dir = tmp_dir("refresh-expires");
+    let ci_dir = dir.join("ci-watches");
+    std::fs::create_dir_all(&ci_dir).ok();
+    let old_expires = (chrono::Utc::now() + chrono::Duration::hours(24)).to_rfc3339();
+    let watch = serde_json::json!({
+        "repo": "o/r", "branch": "feat-refresh", "interval_secs": 60,
+        "instance": "agent1", "last_run_id": null, "head_sha": null,
+        "last_polled_at": null, "expires_at": old_expires,
+    });
+    let provider = MockCiProvider::with_runs(vec![CiRun {
+        id: 200,
+        conclusion: Some("success".into()),
+        head_sha: "def456".into(),
+        url: String::new(),
+        name: "CI".into(),
+    }]);
+    run_ci_check(&dir, &watch, &provider).unwrap();
+
+    let watch_path = ci_dir.join(watch_filename("o/r", "feat-refresh"));
+    assert!(watch_path.exists(), "watch must survive successful poll");
+    let content = std::fs::read_to_string(&watch_path).unwrap();
+    let ws: super::WatchState = serde_json::from_str(&content).unwrap();
+    let new_expires = ws.expires_at.expect("expires_at must be present");
+    let parsed = chrono::DateTime::parse_from_rfc3339(&new_expires).unwrap();
+    let hours_from_now = (parsed.with_timezone(&chrono::Utc) - chrono::Utc::now()).num_hours();
+    assert!(
+        (71..=72).contains(&hours_from_now),
+        "expires_at must be refreshed to ~72h from now, got {hours_from_now}h"
+    );
+    std::fs::remove_dir_all(&dir).ok();
 }
