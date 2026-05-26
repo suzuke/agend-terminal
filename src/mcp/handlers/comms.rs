@@ -190,6 +190,23 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
                 && (t.status == "claimed" || t.status == "in_progress")
         })
         .collect();
+    // #1286: branch-specific dispatch dedup — reject if target already has
+    // an active task on the same branch (more specific than generic busy).
+    if !force {
+        if let Some(branch) = args["branch"].as_str() {
+            if let Some(dup) = claimed_tasks
+                .iter()
+                .find(|t| t.branch.as_deref() == Some(branch))
+            {
+                return json!({
+                    "error": format!(
+                        "dispatch rejected: {} already has active task {} on branch {}",
+                        target, dup.id, branch
+                    )
+                });
+            }
+        }
+    }
     if !claimed_tasks.is_empty() {
         if force {
             if force_reason.is_none() || force_reason == Some("") {

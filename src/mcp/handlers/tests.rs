@@ -1374,6 +1374,172 @@ fn test_delegate_task_force_true_without_reason_rejected() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+// --- #1286: branch-specific dispatch dedup ---
+
+#[test]
+fn test_dispatch_dedup_rejects_same_branch() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("dedup-same-branch");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  target:\n    backend: claude\n  sender:\n    backend: claude\n",
+    )
+    .ok();
+    std::env::set_var("AGEND_HOME", &home);
+    crate::tasks::handle(
+        &home,
+        "sender",
+        &json!({"action": "create", "title": "first task", "assignee": "target", "branch": "feat/x"}),
+    );
+    let tasks = crate::tasks::handle(&home, "target", &json!({"action": "list"}));
+    let tid = tasks["tasks"][0]["id"].as_str().unwrap();
+    crate::tasks::handle(&home, "target", &json!({"action": "claim", "id": tid}));
+
+    let result = handle_tool(
+        "send",
+        &json!({
+            "target_instance": "target",
+            "message": "duplicate work",
+            "request_kind": "task",
+            "task_id": "t-test-dup",
+            "branch": "feat/x"
+        }),
+        "sender",
+    );
+    let err = result["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("dispatch rejected") && err.contains("feat/x"),
+        "#1286 same-branch dispatch must be rejected: {result}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn test_dispatch_dedup_force_bypasses_branch_gate() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("dedup-force-bypass");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  target:\n    backend: claude\n  sender:\n    backend: claude\n",
+    )
+    .ok();
+    std::env::set_var("AGEND_HOME", &home);
+    crate::tasks::handle(
+        &home,
+        "sender",
+        &json!({"action": "create", "title": "first task", "assignee": "target", "branch": "feat/x"}),
+    );
+    let tasks = crate::tasks::handle(&home, "target", &json!({"action": "list"}));
+    let tid = tasks["tasks"][0]["id"].as_str().unwrap();
+    crate::tasks::handle(&home, "target", &json!({"action": "claim", "id": tid}));
+
+    let result = handle_tool(
+        "send",
+        &json!({
+            "target_instance": "target",
+            "message": "force override",
+            "request_kind": "task",
+            "task_id": "t-test-force",
+            "branch": "feat/x",
+            "bind": false,
+            "force": true,
+            "force_reason": "re-dispatch after fix"
+        }),
+        "sender",
+    );
+    let err = result["error"].as_str().unwrap_or("");
+    assert!(
+        !err.contains("dispatch rejected") && !err.contains("already has active task"),
+        "#1286 force=true must bypass branch dedup gate: {result}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn test_dispatch_dedup_different_branch_passes() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("dedup-diff-branch");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  target:\n    backend: claude\n  sender:\n    backend: claude\n",
+    )
+    .ok();
+    std::env::set_var("AGEND_HOME", &home);
+    crate::tasks::handle(
+        &home,
+        "sender",
+        &json!({"action": "create", "title": "first task", "assignee": "target", "branch": "feat/x"}),
+    );
+    let tasks = crate::tasks::handle(&home, "target", &json!({"action": "list"}));
+    let tid = tasks["tasks"][0]["id"].as_str().unwrap();
+    crate::tasks::handle(&home, "target", &json!({"action": "claim", "id": tid}));
+
+    let result = handle_tool(
+        "send",
+        &json!({
+            "target_instance": "target",
+            "message": "different branch work",
+            "request_kind": "task",
+            "task_id": "t-test-diff",
+            "branch": "feat/y"
+        }),
+        "sender",
+    );
+    assert!(
+        result.get("error").is_none()
+            || !result["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("dispatch rejected"),
+        "#1286 different branch must not trigger dedup: {result}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn test_dispatch_dedup_query_kind_not_affected() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("dedup-query-ok");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  target:\n    backend: claude\n  sender:\n    backend: claude\n",
+    )
+    .ok();
+    std::env::set_var("AGEND_HOME", &home);
+    crate::tasks::handle(
+        &home,
+        "sender",
+        &json!({"action": "create", "title": "first task", "assignee": "target", "branch": "feat/x"}),
+    );
+    let tasks = crate::tasks::handle(&home, "target", &json!({"action": "list"}));
+    let tid = tasks["tasks"][0]["id"].as_str().unwrap();
+    crate::tasks::handle(&home, "target", &json!({"action": "claim", "id": tid}));
+
+    let result = handle_tool(
+        "send",
+        &json!({
+            "target_instance": "target",
+            "message": "just a question",
+            "request_kind": "query",
+            "branch": "feat/x"
+        }),
+        "sender",
+    );
+    assert!(
+        result.get("error").is_none()
+            || !result["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("dispatch rejected"),
+        "#1286 kind=query must not trigger branch dedup: {result}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
 #[test]
 fn test_delegate_task_idle_target_normal_delivery() {
     let _g = fleet_test_guard();
