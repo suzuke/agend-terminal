@@ -126,8 +126,10 @@ pub struct ReleaseOutcome {
 /// - Branch is merged into main OR remote tracking ref is gone
 ///
 /// SAFETY: This function ONLY receives the branch from the daemon's own
-/// binding record. User-checkout branches are never passed here because
-/// release_full gates on the .agend-managed marker.
+/// binding record. User-checkout branches never reach here because
+/// release_full early-returns on unmanaged worktrees. The merge-base
+/// check below prevents deletion of unmerged branches regardless of
+/// the managed_verified flag (#1249).
 ///
 /// Returns `(deleted, skip_reason)`:
 /// - `(true, None)` — branch was deleted
@@ -240,6 +242,7 @@ fn cleanup_merged_branch(
 pub fn release_full(home: &Path, agent: &str, dry_run: bool) -> ReleaseOutcome {
     let mut out = ReleaseOutcome::default();
     let mut managed_verified = false;
+    let mut worktree_absent = false;
 
     let Some(binding) = crate::binding::read(home, agent) else {
         // Idempotent no-op on second call. Per spec: not fatal.
@@ -277,6 +280,7 @@ pub fn release_full(home: &Path, agent: &str, dry_run: bool) -> ReleaseOutcome {
                 path = %wt_path.display(),
                 "release: worktree path already absent — pruning registry + clearing binding"
             );
+            worktree_absent = true;
             // Prune registry in case the source repo still lists this path.
             // Safe even when source_repo is empty — git just errors out and
             // we ignore the result.
@@ -403,10 +407,13 @@ pub fn release_full(home: &Path, agent: &str, dry_run: bool) -> ReleaseOutcome {
 
     // Issue #611: auto-cleanup merged local branch after release.
     // Read branch + source_repo from the binding we captured earlier.
-    // Only proceed if we verified the .agend-managed marker (Finding 2).
+    // #1249: branch cleanup is safe when worktree was managed OR already absent —
+    // the unmanaged case early-returns above, so reaching here means the branch
+    // came from our binding record. merge-base check in cleanup_merged_branch()
+    // prevents deleting unmerged branches.
     let branch = binding["branch"].as_str().unwrap_or("");
     let sr_str = binding["source_repo"].as_str().unwrap_or("");
-    if !managed_verified {
+    if !managed_verified && !worktree_absent {
         out.branch_cleanup_skipped_reason =
             Some("cannot verify .agend-managed marker — skipping branch cleanup".to_string());
     } else if !branch.is_empty() && !sr_str.is_empty() {
@@ -2021,6 +2028,123 @@ mod tests {
             .unwrap_or(false);
         assert!(branch_exists, "unmerged branch must still exist in repo");
 
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn release_full_absent_worktree_merged_branch_cleaned_up() {
+        let home = tmp_home("1249-absent-merged");
+        let repo = tmp_repo("1249-absent-merged-repo");
+        let l = lease(&home, &repo, "agent-1249m", "feat/absent-merged").expect("lease");
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "feat",
+            ])
+            .current_dir(&l.path)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=t@t",
+                "merge",
+                "feat/absent-merged",
+                "--no-ff",
+                "-m",
+                "merge",
+            ])
+            .current_dir(&repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .unwrap();
+        // Remove worktree directory to simulate absent-worktree scenario.
+        std::fs::remove_dir_all(&l.path).unwrap();
+        std::process::Command::new("git")
+            .args(["worktree", "prune"])
+            .current_dir(&repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .unwrap();
+
+        let outcome = release_full(&home, "agent-1249m", false);
+
+        assert!(outcome.released);
+        assert!(
+            outcome.branch_deleted,
+            "merged branch must be deleted even when worktree absent: {outcome:?}"
+        );
+        assert!(outcome.branch_cleanup_skipped_reason.is_none());
+        let branch_exists = std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "feat/absent-merged"])
+            .current_dir(&repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(!branch_exists, "branch must not exist after cleanup");
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn release_full_absent_worktree_unmerged_branch_preserved() {
+        let home = tmp_home("1249-absent-unmerged");
+        let repo = tmp_repo("1249-absent-unmerged-repo");
+        let l = lease(&home, &repo, "agent-1249u", "feat/absent-unmerged").expect("lease");
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "wip",
+            ])
+            .current_dir(&l.path)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .unwrap();
+        // Remove worktree directory without merging.
+        std::fs::remove_dir_all(&l.path).unwrap();
+        std::process::Command::new("git")
+            .args(["worktree", "prune"])
+            .current_dir(&repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .unwrap();
+
+        let outcome = release_full(&home, "agent-1249u", false);
+
+        assert!(outcome.released);
+        assert!(
+            !outcome.branch_deleted,
+            "unmerged branch must NOT be deleted"
+        );
+        assert_eq!(
+            outcome.branch_cleanup_skipped_reason.as_deref(),
+            Some("branch not merged into main")
+        );
+        let branch_exists = std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "feat/absent-unmerged"])
+            .current_dir(&repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(branch_exists, "unmerged branch must still exist");
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&repo).ok();
     }
