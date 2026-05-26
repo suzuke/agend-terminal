@@ -136,6 +136,18 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                                 ..Default::default()
                             };
                             let _ = crate::inbox::storage::enqueue(home, target, inbox_msg);
+                            crate::dispatch_tracking::track_dispatch(
+                                home,
+                                crate::dispatch_tracking::DispatchEntry {
+                                    task_id: Some(id.clone()),
+                                    from: instance_name.to_string(),
+                                    to: target.to_string(),
+                                    from_id: None,
+                                    to_id: None,
+                                    delegated_at: chrono::Utc::now().to_rfc3339(),
+                                    status: "pending".to_string(),
+                                },
+                            );
                             let source = crate::inbox::NotifySource::Agent(instance_name);
                             crate::inbox::notify::notify_agent(home, target, &source, &msg_text);
                         }
@@ -1315,6 +1327,70 @@ mod tests {
         assert!(
             team_msgs.is_empty(),
             "raw team name should NOT receive inbox message"
+        );
+    }
+
+    #[test]
+    fn create_with_assignee_tracks_dispatch() {
+        let home = tmp_home("dispatch_track");
+        let result = handle(
+            &home,
+            "lead-agent",
+            &serde_json::json!({
+                "action": "create",
+                "title": "tracked dispatch task",
+                "assignee": "dev-agent",
+            }),
+        );
+        assert_eq!(result["event"], "created");
+        let task_id = result["id"].as_str().unwrap();
+
+        let store: serde_json::Value =
+            crate::store::load(&crate::store::store_path(&home, "dispatch_tracking.json"));
+        let entries = store["entries"].as_array().expect("entries array");
+        assert_eq!(entries.len(), 1, "one dispatch entry expected");
+        assert_eq!(entries[0]["task_id"], task_id);
+        assert_eq!(entries[0]["from"], "lead-agent");
+        assert_eq!(entries[0]["to"], "dev-agent");
+        assert_eq!(entries[0]["status"], "pending");
+    }
+
+    #[test]
+    fn create_self_assign_no_dispatch_tracking() {
+        let home = tmp_home("dispatch_self");
+        handle(
+            &home,
+            "dev-agent",
+            &serde_json::json!({
+                "action": "create",
+                "title": "self task",
+                "assignee": "dev-agent",
+            }),
+        );
+
+        let path = crate::store::store_path(&home, "dispatch_tracking.json");
+        assert!(
+            !path.exists(),
+            "self-assign should not create dispatch tracking entry"
+        );
+    }
+
+    #[test]
+    fn create_without_assignee_no_dispatch_tracking() {
+        let home = tmp_home("dispatch_none");
+        handle(
+            &home,
+            "lead-agent",
+            &serde_json::json!({
+                "action": "create",
+                "title": "unassigned",
+            }),
+        );
+
+        let path = crate::store::store_path(&home, "dispatch_tracking.json");
+        assert!(
+            !path.exists(),
+            "unassigned task should not create dispatch tracking entry"
         );
     }
 }
