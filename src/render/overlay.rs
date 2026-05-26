@@ -37,8 +37,8 @@ pub fn centered_overlay_rect(
 /// Render a centered overlay frame with border and title. Returns the inner area.
 pub(super) fn render_overlay_frame(frame: &mut Frame, color: Color, title: &str) -> Rect {
     let area = frame.area();
-    let h = area.height.saturating_sub(4).max(10);
-    let w = area.width.saturating_sub(6).max(40);
+    let h = (area.height * 80 / 100).max(10);
+    let w = (area.width * 80 / 100).max(40);
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let oa = Rect::new(x, y, w, h);
