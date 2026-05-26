@@ -232,7 +232,7 @@ fn is_squash_merged_cherry(repo: &Path, base: &str, branch: &str) -> bool {
 /// this branch with matching HEAD SHA. Most reliable — not affected
 /// by git history topology. SHA check prevents false positives from
 /// branch name reuse.
-fn is_squash_merged_diff(repo: &Path, _base: &str, branch: &str) -> bool {
+fn is_squash_merged_diff(repo: &Path, base: &str, branch: &str) -> bool {
     // Resolve owner/repo from git remote origin.
     let remote = std::process::Command::new("git")
         .args(["remote", "get-url", "origin"])
@@ -268,6 +268,8 @@ fn is_squash_merged_diff(repo: &Path, _base: &str, branch: &str) -> bool {
             "merged",
             "--head",
             branch,
+            "--base",
+            base,
             "--repo",
             &gh_repo,
             "--json",
