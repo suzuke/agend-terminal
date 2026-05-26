@@ -1006,27 +1006,8 @@ fn sort_envelopes(envelopes: &mut [TaskEventEnvelope]) {
             .then_with(|| envelopes[a].instance.0.cmp(&envelopes[b].instance.0))
             .then_with(|| envelopes[a].seq.cmp(&envelopes[b].seq))
     });
-    apply_permutation(envelopes, &mut keys, &indices);
-}
-
-fn apply_permutation<T>(data: &mut [T], _keys: &mut [i64], perm: &[usize]) {
-    let mut placed = vec![false; data.len()];
-    for i in 0..data.len() {
-        if placed[i] || perm[i] == i {
-            continue;
-        }
-        let mut j = i;
-        loop {
-            let next = perm[j];
-            if next == i {
-                break;
-            }
-            data.swap(j, next);
-            placed[j] = true;
-            j = next;
-        }
-        placed[j] = true;
-    }
+    let gathered: Vec<TaskEventEnvelope> = indices.iter().map(|&i| envelopes[i].clone()).collect();
+    envelopes.clone_from_slice(&gathered);
 }
 
 fn read_envelopes_strict(path: &Path, out: &mut Vec<TaskEventEnvelope>) -> anyhow::Result<()> {
@@ -2774,6 +2755,55 @@ mod tests {
                 ("2026-05-26T02:00:00Z", "b", 1),
                 ("2026-05-26T03:00:00Z", "b", 2),
             ]
+        );
+    }
+
+    #[test]
+    fn sort_envelopes_reverse_and_interleaved() {
+        let mk = |ts: &str, inst: &str, seq: u64| TaskEventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            seq,
+            timestamp: ts.to_string(),
+            instance: InstanceName::from(inst),
+            emitter_id: None,
+            event: sample_event("t-perm"),
+        };
+        // Reverse order input
+        let mut rev = vec![
+            mk("2026-05-26T04:00:00Z", "z", 3),
+            mk("2026-05-26T03:00:00Z", "y", 2),
+            mk("2026-05-26T02:00:00Z", "x", 1),
+            mk("2026-05-26T01:00:00Z", "w", 1),
+        ];
+        sort_envelopes(&mut rev);
+        let ts: Vec<&str> = rev.iter().map(|e| e.timestamp.as_str()).collect();
+        assert_eq!(
+            ts,
+            vec![
+                "2026-05-26T01:00:00Z",
+                "2026-05-26T02:00:00Z",
+                "2026-05-26T03:00:00Z",
+                "2026-05-26T04:00:00Z",
+            ]
+        );
+
+        // Interleaved: same timestamp, different instances and seqs
+        let mut interleaved = vec![
+            mk("2026-05-26T01:00:00Z", "c", 2),
+            mk("2026-05-26T01:00:00Z", "a", 3),
+            mk("2026-05-26T01:00:00Z", "b", 1),
+            mk("2026-05-26T01:00:00Z", "a", 1),
+            mk("2026-05-26T01:00:00Z", "a", 2),
+            mk("2026-05-26T01:00:00Z", "c", 1),
+        ];
+        sort_envelopes(&mut interleaved);
+        let order: Vec<(&str, u64)> = interleaved
+            .iter()
+            .map(|e| (e.instance.0.as_str(), e.seq))
+            .collect();
+        assert_eq!(
+            order,
+            vec![("a", 1), ("a", 2), ("a", 3), ("b", 1), ("c", 1), ("c", 2)]
         );
     }
 }
