@@ -275,9 +275,10 @@ fn health_tools() -> Vec<Value> {
 
 fn repo_tools() -> Vec<Value> {
     vec![
-        json!({"name": "repo", "description": "Manage repo worktrees. Actions: checkout, release, cleanup_init_commits, cleanup_merged_branches. #817: cleanup_merged_branches is operator-triggered local-branch hygiene (4 categories: clean_merged/squash_merged/stale_idle/active_unknown; dry-run by default + confirm_ids + audit_reason required for apply).",
+        json!({"name": "repo", "description": "Manage repo worktrees. Actions: checkout, release, cleanup_init_commits, cleanup_merged_branches, merge. #817: cleanup_merged_branches is operator-triggered local-branch hygiene (4 categories: clean_merged/squash_merged/stale_idle/active_unknown; dry-run by default + confirm_ids + audit_reason required for apply).",
             "inputSchema": {"type": "object", "properties": {
-                "action": {"type": "string", "enum": ["checkout", "release", "cleanup_init_commits", "cleanup_merged_branches"]},
+                "action": {"type": "string", "enum": ["checkout", "release", "cleanup_init_commits", "cleanup_merged_branches", "merge"]},
+                "pr": {"type": "integer", "description": "PR number for merge action."},
                 "source": {"type": "string"}, "branch": {"type": "string"},
                 "path": {"type": "string"},
                 "agent": {"type": "string", "description": "#789: target agent for cleanup_init_commits (defaults to caller's instance_name). Cleans empty `init` commits accumulated in the agent's bound worktree by backend session-checkpoint heartbeats. Returns {cleaned_count, [skipped_reason]}. Idempotent — call before push to scrub PR history."},
