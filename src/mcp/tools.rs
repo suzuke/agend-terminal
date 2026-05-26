@@ -126,6 +126,8 @@ fn instance_tools() -> Vec<Value> {
                 "target": {"type": "string", "description": "Target instance name"},
                 "lines": {"type": "integer", "description": "Number of lines to return (default 100, max 10000)"}
             }, "required": ["target"]}}),
+        json!({"name": "tui_screenshot", "description": "Capture the current TUI state as an SVG image. Only works in TUI mode (not daemon-only). Returns SVG string.",
+            "inputSchema": {"type": "object", "properties": {}}}),
     ]
 }
 
@@ -497,8 +499,8 @@ mod tests {
         let tools = defs["tools"].as_array().expect("tools array");
         assert_eq!(
             tools.len(),
-            32,
-            "#1085: 31 + config(get/set/list) = 32. \
+            33,
+            "#1085: 32 + tui_screenshot = 33. \
              Current tools: {:?}",
             tools
                 .iter()

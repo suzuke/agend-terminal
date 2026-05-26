@@ -382,6 +382,21 @@ pub(crate) fn handle_clear_blocked_reason(params: &Value, ctx: &HandlerCtx) -> V
     }
 }
 
+/// #1257: TUI screenshot — sends ScreenshotRequest to app event loop,
+/// waits for SVG response. Only works in TUI mode.
+pub(crate) fn handle_tui_screenshot(ctx: &HandlerCtx) -> Value {
+    let Some(notifier) = ctx.notifier else {
+        return json!({"ok": false, "error": "tui_screenshot requires TUI mode (daemon-only mode not supported)"});
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    notifier.notify(crate::api::ApiEvent::ScreenshotRequest(tx));
+    // Block waiting for the app loop to render and respond.
+    match rx.blocking_recv() {
+        Ok(svg) => json!({"ok": true, "svg": svg}),
+        Err(_) => json!({"ok": false, "error": "screenshot render failed (channel dropped)"}),
+    }
+}
+
 pub(crate) fn handle_pane_snapshot(params: &Value, ctx: &HandlerCtx) -> Value {
     let name = match params["name"].as_str() {
         Some(n) => n,

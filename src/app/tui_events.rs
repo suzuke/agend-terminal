@@ -10,7 +10,7 @@ use crate::layout::{Layout, MovePlacement, SplitDir, Tab};
 /// Events sent from the API server to the TUI event loop when agents or teams
 /// are created/deleted via MCP tools. The TUI reacts by auto-creating or
 /// removing tabs/panes.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) enum TuiEvent {
     InstanceCreated {
         name: String,
@@ -49,6 +49,8 @@ pub(crate) enum TuiEvent {
         target_tab: String,
         split_dir: SplitDir,
     },
+    /// #1257: TUI screenshot request from MCP tool.
+    ScreenshotRequest(tokio::sync::oneshot::Sender<String>),
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -116,6 +118,7 @@ impl crate::api::ApiNotifier for TuiNotifier {
                     split_dir: dir,
                 }
             }
+            crate::api::ApiEvent::ScreenshotRequest(tx) => TuiEvent::ScreenshotRequest(tx),
         };
         if let Err(e) = self.tx.try_send(tui_event) {
             tracing::warn!(error = %e, "TUI event send failed");
@@ -167,6 +170,9 @@ pub(super) fn handle_tui_event(
             split_dir,
         } => {
             handle_pane_moved(&agent, &target_tab, split_dir, layout);
+        }
+        TuiEvent::ScreenshotRequest(_) => {
+            // Handled directly in app event loop (needs terminal access).
         }
     }
 }

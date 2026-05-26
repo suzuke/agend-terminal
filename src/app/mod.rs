@@ -614,12 +614,53 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
             }
             recv(tui_event_rx) -> ev => {
                 if let Ok(event) = ev {
-                    tui_events::handle_tui_event(
-                        event,
-                        &mut layout,
-                        &registry,
-                        &wakeup_tx,
-                    );
+                    // #1257: handle screenshot request directly (needs terminal access).
+                    if let TuiEvent::ScreenshotRequest(tx) = event {
+                        let svg = {
+                            let size = terminal.size().unwrap_or_default();
+                            let backend = ratatui::backend::TestBackend::new(
+                                if size.width > 0 { size.width } else { 120 },
+                                if size.height > 0 { size.height } else { 40 },
+                            );
+                            let mut snap_term = ratatui::Terminal::new(backend).expect("TestBackend::new cannot fail");
+                            let binary_stale = daemon_binary_stale.load(std::sync::atomic::Ordering::Relaxed);
+                            let _ = snap_term.draw(|frame| {
+                                crate::render::render(
+                                    frame,
+                                    &mut layout,
+                                    key_handler.in_repeat(),
+                                    &registry,
+                                    telegram_status,
+                                    binary_stale,
+                                );
+                                // Render overlay (same as normal draw path).
+                                match &overlay {
+                                    Overlay::Tasks { items, col, row, mode, view } => {
+                                        crate::render::render_tasks(frame, items, *col, *row, mode, *view, &home);
+                                    }
+                                    Overlay::Decisions { items, scroll } => {
+                                        crate::render::render_decisions(frame, items, *scroll);
+                                    }
+                                    Overlay::Help => {
+                                        crate::render::render_help(frame);
+                                    }
+                                    Overlay::Command { input } => {
+                                        crate::render::render_command_palette(frame, input);
+                                    }
+                                    _ => {}
+                                }
+                            });
+                            crate::screenshot::buffer_to_svg(snap_term.backend())
+                        };
+                        let _ = tx.send(svg);
+                    } else {
+                        tui_events::handle_tui_event(
+                            event,
+                            &mut layout,
+                            &registry,
+                            &wakeup_tx,
+                        );
+                    }
                     needs_resize = true;
                 }
             }

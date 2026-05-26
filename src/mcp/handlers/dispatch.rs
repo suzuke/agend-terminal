@@ -727,6 +727,21 @@ fn dispatch_pane_snapshot(ctx: &HandlerCtx<'_>) -> Value {
     instance::handle_pane_snapshot(ctx.home, ctx.args)
 }
 
+fn dispatch_tui_screenshot(ctx: &HandlerCtx<'_>) -> Value {
+    match crate::api::call(
+        ctx.home,
+        &serde_json::json!({"method": crate::api::method::TUI_SCREENSHOT, "params": {}}),
+    ) {
+        Ok(resp) if resp["ok"].as_bool() == Some(true) => {
+            serde_json::json!({"svg": resp["svg"]})
+        }
+        Ok(resp) => {
+            serde_json::json!({"error": resp["error"].as_str().unwrap_or("tui_screenshot failed")})
+        }
+        Err(e) => serde_json::json!({"error": format!("tui_screenshot: {e}")}),
+    }
+}
+
 fn dispatch_task_sweep_config(ctx: &HandlerCtx<'_>) -> Value {
     task::handle_task_sweep_config(ctx.home, ctx.args)
 }
@@ -925,6 +940,11 @@ static REGISTERED: &[HandlerEntry] = &[
         actions: None,
     },
     HandlerEntry {
+        name: "tui_screenshot",
+        handler: dispatch_tui_screenshot,
+        actions: None,
+    },
+    HandlerEntry {
         name: "task_sweep_config",
         handler: dispatch_task_sweep_config,
         actions: None,
@@ -1016,11 +1036,12 @@ mod tests {
                 "reply",
                 "set_display_name",
                 "pane_snapshot",
+                "tui_screenshot",
                 "task_sweep_config",
                 "restart_daemon",
             ]
         );
-        assert_eq!(registered_handlers().len(), 32);
+        assert_eq!(registered_handlers().len(), 33);
     }
 
     /// Coverage test: every tool name advertised by
