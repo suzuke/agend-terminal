@@ -2605,3 +2605,35 @@ fn m2_hint_uses_merged_enqueue_count() {
     assert!(got.contains("inbox=2"), "should show 2 unread: {got:?}");
     fs::remove_dir_all(&home).ok();
 }
+
+#[test]
+fn drain_marks_read_and_preserves_order_after_lock_shrink() {
+    let home = tmp_home("drain-lock-shrink");
+    enqueue(&home, "agent-ls", make_msg("a", "first")).unwrap();
+    enqueue(&home, "agent-ls", make_msg("b", "second")).unwrap();
+    enqueue(&home, "agent-ls", make_msg("c", "third")).unwrap();
+
+    let msgs = drain(&home, "agent-ls");
+    assert_eq!(msgs.len(), 3, "all three messages must be drained");
+    assert_eq!(msgs[0].from, "a");
+    assert_eq!(msgs[1].from, "b");
+    assert_eq!(msgs[2].from, "c");
+
+    // Verify read_at was set (persisted to file under lock)
+    let content = fs::read_to_string(storage::inbox_path_resolved(&home, "agent-ls")).unwrap();
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let m: InboxMessage = serde_json::from_str(line).unwrap();
+        assert!(
+            m.read_at.is_some(),
+            "all messages must have read_at set after drain: {:?}",
+            m.from
+        );
+    }
+
+    let second = drain(&home, "agent-ls");
+    assert!(second.is_empty(), "second drain must return empty");
+    fs::remove_dir_all(&home).ok();
+}

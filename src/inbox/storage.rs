@@ -222,17 +222,19 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
         return Vec::new();
     }
 
-    match with_inbox_lock(home, name, |path| {
-        // Leftover from a crashed predecessor — consume it first, under lock
-        // to prevent duplicate delivery when two drain callers race.
+    // Phase 1 (locked): read file, mark read_at, write back.
+    // Side effects (dedup, heartbeat) are deferred to phase 2.
+    let (all_messages, newly_read) = match with_inbox_lock(home, name, |path| {
         let tmp = path.with_extension("draining");
         if tmp.exists() {
-            return read_drain_file(&tmp);
+            let msgs = read_drain_file(&tmp);
+            let flags = vec![true; msgs.len()];
+            return (msgs, flags);
         }
 
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
-            Err(_) => return Vec::new(),
+            Err(_) => return (Vec::new(), Vec::new()),
         };
 
         let now = chrono::Utc::now().to_rfc3339();
@@ -256,7 +258,6 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
                 continue;
             }
             if msg.read_at.is_none() {
-                // M6: skip superseded messages — they are stale
                 if msg.superseded_by.is_some() {
                     msg.read_at = Some(now.clone());
                     newly_read.push(false);
@@ -264,9 +265,6 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
                     continue;
                 }
                 msg.read_at = Some(now.clone());
-                if let Some(ref id) = msg.id {
-                    crate::daemon::notification_dedup::global().mark_consumed(name, id);
-                }
                 newly_read.push(true);
             } else {
                 newly_read.push(false);
@@ -275,28 +273,6 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
         }
 
         let has_unread = newly_read.iter().any(|&b| b);
-
-        // Sprint 52: set reply_to on dequeue — last channel-sourced message wins.
-        if let Some(channel_msg) = all_messages
-            .iter()
-            .zip(newly_read.iter())
-            .rev()
-            .find(|(m, &nr)| nr && m.channel.is_some())
-            .map(|(m, _)| m)
-        {
-            let channel_name = match channel_msg.channel.as_ref().expect("checked") {
-                crate::channel::ChannelKind::Telegram => "telegram",
-                crate::channel::ChannelKind::Discord => "discord",
-            };
-            crate::daemon::heartbeat_pair::update_with(name, |p| {
-                p.reply_to_channel = Some(channel_name.to_string());
-                p.reply_to_input_id = Some(p.reply_to_input_id.unwrap_or(0) + 1);
-                p.reply_to_set_at_ms = crate::daemon::heartbeat_pair::now_ms() as i64;
-                p.mirror_dispatched_for_turn = false;
-                p.mirror_skip_until_next_turn = false;
-            });
-        }
-
         if has_unread {
             let write_tmp = path.with_extension("jsonl.tmp");
             let result = (|| -> anyhow::Result<()> {
@@ -317,20 +293,49 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
             }
         }
 
-        // Extract newly-read messages without cloning — consume all_messages
-        // after write-back (which only borrows).
-        all_messages
-            .into_iter()
-            .zip(newly_read)
-            .filter_map(|(msg, nr)| nr.then_some(msg))
-            .collect()
+        (all_messages, newly_read)
     }) {
-        Ok(msgs) => msgs,
+        Ok(pair) => pair,
         Err(e) => {
             tracing::warn!(error = %e, "inbox drain lock failed");
-            Vec::new()
+            return Vec::new();
+        }
+    };
+
+    // Phase 2 (unlocked): side effects that don't need file exclusion.
+    for (msg, &is_new) in all_messages.iter().zip(&newly_read) {
+        if is_new {
+            if let Some(ref id) = msg.id {
+                crate::daemon::notification_dedup::global().mark_consumed(name, id);
+            }
         }
     }
+
+    if let Some(channel_msg) = all_messages
+        .iter()
+        .zip(newly_read.iter())
+        .rev()
+        .find(|(m, &nr)| nr && m.channel.is_some())
+        .map(|(m, _)| m)
+    {
+        let channel_name = match channel_msg.channel.as_ref().expect("checked") {
+            crate::channel::ChannelKind::Telegram => "telegram",
+            crate::channel::ChannelKind::Discord => "discord",
+        };
+        crate::daemon::heartbeat_pair::update_with(name, |p| {
+            p.reply_to_channel = Some(channel_name.to_string());
+            p.reply_to_input_id = Some(p.reply_to_input_id.unwrap_or(0) + 1);
+            p.reply_to_set_at_ms = crate::daemon::heartbeat_pair::now_ms() as i64;
+            p.mirror_dispatched_for_turn = false;
+            p.mirror_skip_until_next_turn = false;
+        });
+    }
+
+    all_messages
+        .into_iter()
+        .zip(newly_read)
+        .filter_map(|(msg, nr)| nr.then_some(msg))
+        .collect()
 }
 
 fn read_drain_file(tmp: &Path) -> Vec<InboxMessage> {

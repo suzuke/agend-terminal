@@ -8,20 +8,21 @@ use std::path::Path;
 
 /// Write a binding for an agent (task assigned).
 ///
-/// #779 P2: `bind_full` now returns `Result`; this thin wrapper preserves
-/// the pre-#779-P2 silent semantic via `.ok()` so existing callers (tests
-/// + dispatch path) keep unit-return.
+/// Fail-closed: if lock acquisition or I/O fails, binding.json is NOT
+/// written and the error is logged. Pre-#1163 this silently proceeded
+/// via `.ok()`, breaking the serialization guarantee.
 #[allow(dead_code)] // Used by tests + auto-watch dispatch path
 pub fn bind(home: &Path, agent: &str, task_id: &str, branch: &str) {
-    let _ = bind_full(
+    if let Err(e) = bind_full(
         home,
         agent,
         task_id,
         branch,
         std::path::Path::new(""),
         std::path::Path::new(""),
-    )
-    .ok();
+    ) {
+        tracing::warn!(%agent, task_id, branch, error = %e, "bind failed (fail-closed)");
+    }
 }
 
 /// Write a full binding including worktree + source-repo paths.
@@ -407,6 +408,24 @@ mod tests {
         assert!(
             read(&home, agent).is_none(),
             "#1163: binding.json must not be written when lock fails"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn bind_wrapper_fail_closed_on_lock_error() {
+        let home = tmp_home("bind-failclose");
+        let agent = "fc-agent";
+        let rt = crate::paths::runtime_dir(&home).join(agent);
+        std::fs::create_dir_all(&rt).unwrap();
+        let lock_path = rt.join(".binding.json.lock");
+        std::fs::create_dir_all(&lock_path).unwrap();
+
+        bind(&home, agent, "T-999", "branch");
+
+        assert!(
+            read(&home, agent).is_none(),
+            "bind() must not write binding.json when lock acquisition fails (fail-closed)"
         );
         std::fs::remove_dir_all(&home).ok();
     }
