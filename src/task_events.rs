@@ -285,6 +285,14 @@ pub enum TaskEvent {
         task_id: TaskId,
         reason: String,
     },
+    /// #1265: transition to backlog status.
+    MovedToBacklog {
+        task_id: TaskId,
+    },
+    /// #1265: transition to in_review status.
+    MovedToReview {
+        task_id: TaskId,
+    },
     /// **v2** — sweep dry-run proposal. Distinct from `Done` so an
     /// operator-confirm gate can intercede before the canonical close
     /// transition lands. Per dev-reviewer-2 must-have: do NOT use a
@@ -365,6 +373,8 @@ impl TaskEvent {
             | TaskEvent::Unblocked { task_id }
             | TaskEvent::Reopened { task_id, .. }
             | TaskEvent::Released { task_id, .. }
+            | TaskEvent::MovedToBacklog { task_id }
+            | TaskEvent::MovedToReview { task_id }
             | TaskEvent::TaskCloseProposed { task_id, .. }
             | TaskEvent::OwnerAssigned { task_id, .. }
             | TaskEvent::PriorityChanged { task_id, .. }
@@ -387,6 +397,8 @@ impl TaskEvent {
             TaskEvent::Unblocked { .. } => "unblocked",
             TaskEvent::Reopened { .. } => "reopened",
             TaskEvent::Released { .. } => "released",
+            TaskEvent::MovedToBacklog { .. } => "moved_to_backlog",
+            TaskEvent::MovedToReview { .. } => "moved_to_review",
             TaskEvent::TaskCloseProposed { .. } => "task_close_proposed",
             TaskEvent::OwnerAssigned { .. } => "owner_assigned",
             TaskEvent::PriorityChanged { .. } => "priority_changed",
@@ -423,13 +435,77 @@ pub struct TaskEventEnvelope {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub enum TaskStatus {
+    Backlog,
     Open,
     Claimed,
     InProgress,
+    InReview,
     Verified,
     Done,
     Cancelled,
     Blocked,
+}
+
+impl TaskStatus {
+    /// Parse a status string (MCP-facing).
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "backlog" => Some(Self::Backlog),
+            "open" => Some(Self::Open),
+            "claimed" => Some(Self::Claimed),
+            "in_progress" => Some(Self::InProgress),
+            "in_review" => Some(Self::InReview),
+            "verified" => Some(Self::Verified),
+            "done" => Some(Self::Done),
+            "cancelled" => Some(Self::Cancelled),
+            "blocked" => Some(Self::Blocked),
+            _ => None,
+        }
+    }
+
+    /// #1265: allowed transitions table. Returns true if transitioning
+    /// from `self` to `target` is valid.
+    pub fn can_transition_to(self, target: Self) -> bool {
+        use TaskStatus::*;
+        // Cancelled and Blocked are reachable from any non-terminal state.
+        if target == Cancelled {
+            return self != Done && self != Cancelled;
+        }
+        if target == Blocked {
+            return !matches!(self, Done | Cancelled | Blocked);
+        }
+        matches!(
+            (self, target),
+            // Forward lifecycle
+            (Backlog, Open)
+                | (Open, Claimed)
+                | (Claimed, InProgress)
+                | (InProgress, InReview)
+                | (InReview, Verified)
+                | (Verified, Done)
+                // Skip paths (common shortcuts)
+                | (Open, InProgress)
+                | (Open, Done)
+                | (Claimed, InReview)
+                | (Claimed, Done)
+                | (InProgress, Done)
+                | (InReview, Done)
+                | (InProgress, Verified)
+                // Backward (rejection / rework)
+                | (InReview, InProgress)
+                | (Verified, InProgress)
+                | (Claimed, Open)
+                | (InProgress, Open)
+                // Unblock
+                | (Blocked, Open)
+                | (Blocked, Claimed)
+                | (Blocked, InProgress)
+                | (Blocked, InReview)
+                // Reopen
+                | (Done, Open)
+                | (Cancelled, Open)
+        )
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -688,6 +764,18 @@ impl TaskBoardState {
                     t.status = TaskStatus::Open;
                     t.owner = None;
                     t.routed_to = None;
+                    t.updated_at = touch_at;
+                }
+            }
+            TaskEvent::MovedToBacklog { .. } => {
+                if let Some(t) = self.tasks.get_mut(&task_id) {
+                    t.status = TaskStatus::Backlog;
+                    t.updated_at = touch_at;
+                }
+            }
+            TaskEvent::MovedToReview { .. } => {
+                if let Some(t) = self.tasks.get_mut(&task_id) {
+                    t.status = TaskStatus::InReview;
                     t.updated_at = touch_at;
                 }
             }
@@ -1629,6 +1717,12 @@ mod tests {
                 TaskStatus::Blocked => vec![TaskEvent::Blocked {
                     task_id: tid.clone(),
                     reason: "test".into(),
+                }],
+                TaskStatus::Backlog => vec![TaskEvent::MovedToBacklog {
+                    task_id: tid.clone(),
+                }],
+                TaskStatus::InReview => vec![TaskEvent::MovedToReview {
+                    task_id: tid.clone(),
                 }],
             };
             for e in priming {

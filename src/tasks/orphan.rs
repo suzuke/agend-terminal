@@ -303,9 +303,11 @@ pub fn build_health_response(
     let mut non_terminal_ages_days: Vec<i64> = Vec::new();
     for record in state.tasks.values() {
         let key = match record.status {
+            TaskStatus::Backlog => "backlog",
             TaskStatus::Open => "open",
             TaskStatus::Claimed => "claimed",
             TaskStatus::InProgress => "in_progress",
+            TaskStatus::InReview => "in_review",
             TaskStatus::Blocked => "blocked",
             TaskStatus::Done => "done",
             TaskStatus::Cancelled => "cancelled",

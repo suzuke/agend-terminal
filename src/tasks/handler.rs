@@ -173,7 +173,14 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
             let include_history = args["include_history"].as_bool().unwrap_or(false);
             let limit = args["limit"].as_u64();
             let filtered_default = !include_history && filter_status.is_none();
-            const ACTIONABLE: &[&str] = &["open", "claimed", "in_progress", "blocked"];
+            const ACTIONABLE: &[&str] = &[
+                "backlog",
+                "open",
+                "claimed",
+                "in_progress",
+                "in_review",
+                "blocked",
+            ];
             let now = chrono::Utc::now();
             let done_ttl = chrono::Duration::days(14);
             let tasks = list_all(home);
@@ -296,6 +303,20 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                         "task '{id}' owned by '{}', caller '{caller}' not authorized",
                         record.owner.as_ref().map(|o| o.0.as_str()).unwrap_or("unassigned")
                     )
+                });
+            }
+            // #1265: transition enforcement for done action.
+            if !record
+                .status
+                .can_transition_to(crate::task_events::TaskStatus::Done)
+            {
+                return serde_json::json!({
+                    "error": format!(
+                        "illegal transition: {} → done (task {})",
+                        status_to_legacy_str(record.status),
+                        id
+                    ),
+                    "code": "illegal_transition",
                 });
             }
             if force {
@@ -464,6 +485,20 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
             // "updated" so callers don't need to special-case.
             if let Some(ref s) = new_status {
                 let prev_status = record.status;
+                // #1265: transition enforcement — reject illegal status changes.
+                if let Some(target) = crate::task_events::TaskStatus::from_str(s) {
+                    if !prev_status.can_transition_to(target) {
+                        return serde_json::json!({
+                            "error": format!(
+                                "illegal transition: {} → {} (task {})",
+                                crate::tasks::status_to_legacy_str(prev_status),
+                                s,
+                                id
+                            ),
+                            "code": "illegal_transition",
+                        });
+                    }
+                }
                 let event_for_transition: Option<crate::task_events::TaskEvent> =
                     match (prev_status, s.as_str()) {
                         (_, "claimed") => Some(crate::task_events::TaskEvent::Claimed {
@@ -547,6 +582,12 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                                 "status {} → open",
                                 status_to_legacy_str(prev_status)
                             ),
+                        }),
+                        (_, "backlog") => Some(crate::task_events::TaskEvent::MovedToBacklog {
+                            task_id: crate::task_events::TaskId(id.clone()),
+                        }),
+                        (_, "in_review") => Some(crate::task_events::TaskEvent::MovedToReview {
+                            task_id: crate::task_events::TaskId(id.clone()),
                         }),
                         _ => None,
                     };
@@ -904,6 +945,8 @@ fn summarize_event(env: &crate::task_events::TaskEventEnvelope) -> (&str, String
             by.0.clone(),
             format!("metadata[{key}] = {value}"),
         ),
+        TaskEvent::MovedToBacklog { .. } => ("moved_to_backlog", actor, "→ backlog".to_string()),
+        TaskEvent::MovedToReview { .. } => ("moved_to_review", actor, "→ in_review".to_string()),
     }
 }
 

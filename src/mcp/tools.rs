@@ -155,7 +155,7 @@ fn task_tools() -> Vec<Value> {
                 "priority": {"type": "string", "enum": ["low", "normal", "high", "urgent"]},
                 "assignee": {"type": "string"}, "depends_on": {"type": "array", "items": {"type": "string"}}, "parent_id": {"type": "string", "description": "Parent task ID for subtask composition (A is composed of B,C,D). Complementary to depends_on (execution order)."},
                 "id": {"type": "string"}, "result": {"type": "string"},
-                "status": {"type": "string", "enum": ["open", "claimed", "in_progress", "blocked", "verified", "done", "cancelled"]},
+                "status": {"type": "string", "enum": ["backlog", "open", "claimed", "in_progress", "in_review", "blocked", "verified", "done", "cancelled"]},
                 "filter_assignee": {"type": "string"}, "filter_status": {"type": "string"}, "filter_tag": {"type": "string", "description": "Filter by tag"}, "tags": {"type": "array", "items": {"type": "string"}, "description": "Task tags (for create/update)"},
                 "include_history": {"type": "boolean", "description": "#806: opt in to done/cancelled in `list` response (default trims to actionable)."},
                 "limit": {"type": "integer", "description": "#806: cap `list` response to N newest-first entries (sort by updated_at desc)."},
