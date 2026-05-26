@@ -4,7 +4,19 @@
 //! Uses atomic_write (temp + fsync + rename) + flock for safety.
 
 use serde_json::json;
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{OnceLock, RwLock};
+
+static INDEX: OnceLock<RwLock<HashMap<String, serde_json::Value>>> = OnceLock::new();
+
+fn binding_index() -> &'static RwLock<HashMap<String, serde_json::Value>> {
+    INDEX.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn index_key(home: &Path, agent: &str) -> String {
+    format!("{}:{agent}", home.display())
+}
 
 /// Write a binding for an agent (task assigned).
 ///
@@ -72,7 +84,11 @@ pub fn bind_full(
     }
     let body = serde_json::to_string_pretty(&binding).unwrap_or_default();
     crate::store::atomic_write(&path, body.as_bytes())
-        .map_err(|e| format!("atomic_write {}: {e}", path.display()))
+        .map_err(|e| format!("atomic_write {}: {e}", path.display()))?;
+    if let Ok(mut map) = binding_index().write() {
+        map.insert(index_key(home, agent), binding);
+    }
+    Ok(())
 }
 
 /// Clear a binding for an agent (task completed/released).
@@ -81,6 +97,9 @@ pub fn unbind(home: &Path, agent: &str) {
         .join(agent)
         .join("binding.json");
     let _ = std::fs::remove_file(path);
+    if let Ok(mut map) = binding_index().write() {
+        map.remove(&index_key(home, agent));
+    }
 }
 
 /// Returns Some(agent_name) if any other agent has bound this branch.
@@ -111,12 +130,33 @@ pub fn scan_existing_branch_binding(
     None
 }
 
-/// Read the current binding for an agent (for internal use/tests).
+/// Read the current binding for an agent.
+/// Hot path: returns from in-memory index (read lock). Cold path
+/// (first access per agent): acquires write lock, double-checks,
+/// then reads disk and populates. Disk read under write lock
+/// prevents stale resurrection when a concurrent unbind() deletes
+/// the file between our miss and our insert.
 #[allow(dead_code)] // Used by tests + Phase 2
 pub fn read(home: &Path, agent: &str) -> Option<serde_json::Value> {
+    let key = index_key(home, agent);
+    if let Ok(map) = binding_index().read() {
+        if let Some(v) = map.get(&key) {
+            return Some(v.clone());
+        }
+    }
     let path = crate::paths::runtime_dir(home)
         .join(agent)
         .join("binding.json");
+    if let Ok(mut map) = binding_index().write() {
+        if let Some(v) = map.get(&key) {
+            return Some(v.clone());
+        }
+        let v: serde_json::Value = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|c| serde_json::from_str(&c).ok())?;
+        map.insert(key, v.clone());
+        return Some(v);
+    }
     std::fs::read_to_string(path)
         .ok()
         .and_then(|c| serde_json::from_str(&c).ok())
@@ -270,6 +310,9 @@ pub fn reconcile_orphans(home: &Path) {
                                         continue;
                                     }
                                     let _ = std::fs::remove_file(&binding_path);
+                                    if let Ok(mut map) = binding_index().write() {
+                                        map.remove(&index_key(home, agent_name));
+                                    }
                                     tracing::info!(
                                         path = %binding_path.display(),
                                         "removed orphan binding (>24h old, heartbeat stale)"
@@ -428,5 +471,60 @@ mod tests {
             "bind() must not write binding.json when lock acquisition fails (fail-closed)"
         );
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn index_serves_read_after_bind() {
+        let home = tmp_home("idx-read");
+        bind(&home, "idx-agent", "T-IDX", "idx-branch");
+        let v = read(&home, "idx-agent").expect("index must serve binding");
+        assert_eq!(v["branch"], "idx-branch");
+        // Delete file on disk — index should still serve the cached value
+        let path = crate::paths::runtime_dir(&home)
+            .join("idx-agent")
+            .join("binding.json");
+        std::fs::remove_file(&path).unwrap();
+        let v2 = read(&home, "idx-agent").expect("index must survive disk delete");
+        assert_eq!(v2["task_id"], "T-IDX");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn index_invalidated_by_unbind() {
+        let home = tmp_home("idx-unbind");
+        bind(&home, "idx-ub", "T-UB", "ub-branch");
+        assert!(read(&home, "idx-ub").is_some());
+        unbind(&home, "idx-ub");
+        assert!(
+            read(&home, "idx-ub").is_none(),
+            "unbind must clear index entry"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn no_stale_resurrection_after_concurrent_unbind() {
+        for _ in 0..50 {
+            let home = tmp_home("race");
+            bind(&home, "race-a", "T-R", "race-b");
+            if let Ok(mut map) = binding_index().write() {
+                map.remove(&index_key(&home, "race-a"));
+            }
+            let home2 = home.clone();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let b2 = barrier.clone();
+            let t = std::thread::spawn(move || {
+                b2.wait();
+                unbind(&home2, "race-a");
+            });
+            barrier.wait();
+            let _ = read(&home, "race-a");
+            t.join().expect("unbind thread must not panic");
+            assert!(
+                read(&home, "race-a").is_none(),
+                "stale resurrection: read() returned binding after unbind()"
+            );
+            std::fs::remove_dir_all(&home).ok();
+        }
     }
 }
