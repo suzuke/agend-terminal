@@ -403,6 +403,14 @@ pub(crate) fn maybe_notify_member_state_change(
         ),
     );
     tracing::info!(agent = %name, from = prev_state.display_name(), to = new_state.display_name(), orchestrator = %orch, "member-state-change notify sent");
+    crate::daemon::event_bus::global().emit(
+        crate::daemon::event_bus::EventKind::MemberStateChanged {
+            agent: name.to_string(),
+            team: team.name.clone(),
+            from_state: prev_state.display_name().to_string(),
+            to_state: new_state.display_name().to_string(),
+        },
+    );
     true
 }
 
