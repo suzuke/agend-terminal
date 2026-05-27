@@ -446,11 +446,24 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
             %target, %branch, path = %lease.path.display(),
             "dispatch auto-bind + lease OK"
         ),
-        Err(e) => tracing::warn!(
-            %target, %branch, path = %lease.path.display(),
-            error = %e,
-            "dispatch auto-bind lease acquired but bind_full failed — binding.json missing"
-        ),
+        Err(e) => {
+            // #1310: rollback worktree on binding failure to prevent orphans
+            tracing::warn!(
+                %target, %branch, path = %lease.path.display(),
+                error = %e,
+                "dispatch auto-bind bind_full failed — rolling back worktree"
+            );
+            let _ = std::process::Command::new("git")
+                .args([
+                    "worktree",
+                    "remove",
+                    "--force",
+                    &lease.path.display().to_string(),
+                ])
+                .env("AGEND_GIT_BYPASS", "1")
+                .current_dir(&source_repo)
+                .output();
+        }
     }
 
     // P0-2 + Sprint 55 P0-B EC4: auto-watch_ci. Resolution order:

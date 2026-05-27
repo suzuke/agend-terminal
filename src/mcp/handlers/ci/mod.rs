@@ -143,7 +143,22 @@ pub(super) fn handle_checkout_repo(home: &Path, args: &Value, instance_name: &st
                     &worktree_dir,
                     &source_canonical,
                 ) {
-                    warnings.push(format!("bind_full: {e}"));
+                    // #1310: rollback worktree on binding failure to prevent orphans
+                    tracing::warn!(
+                        %branch, path = %worktree_dir.display(),
+                        error = %e,
+                        "bind_full failed after worktree add — rolling back worktree"
+                    );
+                    let _ = std::process::Command::new("git")
+                        .args(["worktree", "remove", "--force", &worktree_path_str])
+                        .env("AGEND_GIT_BYPASS", "1")
+                        .current_dir(Path::new(&source_path))
+                        .output();
+                    return json!({
+                        "error": format!("bind_full failed, worktree rolled back: {e}"),
+                        "code": "bind_rollback",
+                        "branch": branch,
+                    });
                 }
                 if let Some(r) = crate::mcp::handlers::dispatch_hook::derive_repo_from_remote_pub(
                     &source_canonical,
