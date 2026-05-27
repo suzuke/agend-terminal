@@ -444,13 +444,19 @@ fn render_pane(
         }
     }
 
-    if focused && pane.scroll_offset == 0 {
+    if focused {
         let (cursor_line, cursor_col) = pane.vterm.cursor_pos();
-        let cx = inner.x + cursor_col;
-        let cy = inner.y + cursor_line;
-        if cx < inner.x + inner.width && cy < inner.y + inner.height {
-            frame.set_cursor_position(ratatui::layout::Position::new(cx, cy));
-        }
+        let max_x = inner.x + inner.width.saturating_sub(1);
+        let max_y = inner.y + inner.height.saturating_sub(1);
+        let (cx, cy) = if pane.scroll_offset == 0 {
+            (
+                (inner.x + cursor_col).min(max_x),
+                (inner.y + cursor_line).min(max_y),
+            )
+        } else {
+            (inner.x, max_y)
+        };
+        frame.set_cursor_position(ratatui::layout::Position::new(cx, cy));
     }
 
     PaneBorderInfo {
