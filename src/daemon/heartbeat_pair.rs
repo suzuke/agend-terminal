@@ -67,10 +67,6 @@ pub struct HeartbeatPair {
     /// and `Hung` (input pending past response → real hung). Updated by
     /// `inbox::notify_agent` central inject site.
     pub last_input_at_ms: u64,
-    /// Sprint 52: last input text injected to agent PTY. Used for
-    /// auto-retry on ServerRateLimit (re-inject after backoff).
-    /// Cleared on successful response (Ready/Idle transition).
-    pub last_input_text: Option<String>,
     // ── Sprint 52 router-layer state ─────────────────────────────────
     /// Channel to mirror output to (e.g. "telegram"). Set on inbox dequeue.
     /// Cleared on TUI keyboard input or Ready/Idle transition.

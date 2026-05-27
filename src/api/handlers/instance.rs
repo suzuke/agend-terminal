@@ -24,17 +24,6 @@ pub(crate) fn handle_inject(params: &Value, ctx: &HandlerCtx) -> Value {
                 } else {
                     agent::inject_to_agent(handle, data.as_bytes())
                 };
-                // Record for ServerRateLimit auto-retry.
-                if result.is_ok() && !data.is_empty() {
-                    drop(reg);
-                    crate::daemon::heartbeat_pair::update_with(name, |p| {
-                        p.last_input_text = Some(data.to_string());
-                    });
-                    return match result {
-                        Ok(()) => json!({"ok": true, "result": {"bytes": data.len()}}),
-                        Err(e) => json!({"ok": false, "error": format!("{e}")}),
-                    };
-                }
                 match result {
                     Ok(()) => json!({"ok": true, "result": {"bytes": data.len()}}),
                     Err(e) => json!({"ok": false, "error": format!("{e}")}),

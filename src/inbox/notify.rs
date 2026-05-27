@@ -259,10 +259,6 @@ pub fn notify_agent_with_attachments(
     {
         crate::daemon::notification_dedup::global().record_inject(agent_name, &msg_id);
     }
-    // Store raw body AFTER inject
-    crate::daemon::heartbeat_pair::update_with(agent_name, |p| {
-        p.last_input_text = Some(text.to_string());
-    });
 }
 
 /// Compose-aware notification delivery: checks `is_composing` and enqueues
