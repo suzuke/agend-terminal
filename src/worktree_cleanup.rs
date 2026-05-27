@@ -115,14 +115,27 @@ fn is_worktree_dirty(worktree_path: &Path) -> bool {
 }
 
 /// Remove a worktree and delete its branch.
+///
+/// On Windows, retries up to 3 times with exponential backoff (200ms, 400ms)
+/// to absorb transient EACCES from file locks held by preceding git processes.
 fn remove_worktree(repo_root: &Path, worktree_path: &str, branch: &str) -> bool {
-    let wt_ok = Command::new("git")
-        .args(["worktree", "remove", "--force", worktree_path])
-        .current_dir(repo_root)
-        .env("AGEND_GIT_BYPASS", "1")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+    let max_attempts: u32 = if cfg!(windows) { 3 } else { 1 };
+    let mut wt_ok = false;
+    for attempt in 0..max_attempts {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(100 * (1 << attempt)));
+        }
+        wt_ok = Command::new("git")
+            .args(["worktree", "remove", "--force", worktree_path])
+            .current_dir(repo_root)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if wt_ok {
+            break;
+        }
+    }
     if wt_ok {
         let _ = Command::new("git")
             .args(["branch", "-D", branch])
