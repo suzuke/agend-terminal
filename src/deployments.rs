@@ -56,10 +56,6 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
         Some(t) => t,
         None => return serde_json::json!({"error": "missing 'template'"}),
     };
-    let directory = match args["directory"].as_str() {
-        Some(d) => d,
-        None => return serde_json::json!({"error": "missing 'directory'"}),
-    };
     let deploy_name = args["name"].as_str().unwrap_or(template);
     let branch = args["branch"].as_str();
 
@@ -101,6 +97,18 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
         None => return serde_json::json!({"error": "Template has no instances"}),
     };
 
+    // #1320: 3-tier directory resolution — args > template > default.
+    let directory: String = if let Some(d) = args["directory"].as_str() {
+        d.to_string()
+    } else if let Some(d) = template_def.get("directory").and_then(|v| v.as_str()) {
+        d.to_string()
+    } else {
+        crate::paths::workspace_dir(home)
+            .join(deploy_name)
+            .display()
+            .to_string()
+    };
+
     // Phase 1 — validate every template entry, compute worktrees, and
     // collect the fleet.yaml records. No SPAWN happens here: handle_spawn
     // reads fleet.yaml to build the AgentContext (name + role + peers),
@@ -109,7 +117,7 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
     // an incomplete Identity block into the backend's agend.md.
     let mut created: Vec<String> = Vec::new();
     let mut yaml_entries: Vec<(String, crate::fleet::InstanceYamlEntry)> = Vec::new();
-    let dir = std::path::PathBuf::from(directory);
+    let dir = std::path::PathBuf::from(&directory);
 
     for (name_val, inst_val) in instances_def {
         let inst_suffix = match name_val.as_str() {
@@ -330,7 +338,7 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
     // flag resolves to an existing file.
     for (inst_name, entry) in &yaml_entries {
         let backend_name = entry.backend.as_deref().unwrap_or("claude");
-        let work_dir = entry.working_directory.as_deref().unwrap_or(directory);
+        let work_dir = entry.working_directory.as_deref().unwrap_or(&directory);
         let mut params = serde_json::json!({
             "name": inst_name,
             "backend": backend_name,
@@ -2139,6 +2147,97 @@ templates:
         );
         assert_eq!(lead.command.as_deref(), Some("/tmp/fake-proxy"));
 
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1320: deploy without directory falls back to $AGEND_HOME/workspace/<deploy_name>/.
+    #[test]
+    fn deploy_defaults_directory_to_workspace_deploy_name() {
+        let home = tmp_home("dir_default");
+        let yaml = r#"
+templates:
+  svc:
+    instances:
+      worker:
+        backend: claude
+"#;
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
+        let args = serde_json::json!({
+            "template": "svc",
+        });
+        let out = deploy(&home, "caller", &args);
+        assert_ne!(
+            out.get("error"),
+            None.or(Some(&serde_json::Value::Null)),
+        );
+        let store = load(&home);
+        let dep = store.deployments.iter().find(|d| d.name == "svc");
+        if let Some(dep) = dep {
+            let expected = crate::paths::workspace_dir(&home)
+                .join("svc")
+                .display()
+                .to_string();
+            assert_eq!(dep.directory, expected, "#1320: default dir must be $AGEND_HOME/workspace/<deploy_name>");
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1320: template-level directory takes effect when args omits it.
+    #[test]
+    fn deploy_reads_template_directory_field() {
+        let home = tmp_home("dir_tpl");
+        let yaml = r#"
+templates:
+  svc:
+    directory: /tmp/custom-workspace
+    instances:
+      worker:
+        backend: claude
+"#;
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
+        let args = serde_json::json!({
+            "template": "svc",
+        });
+        let out = deploy(&home, "caller", &args);
+        assert_ne!(
+            out.get("error"),
+            None.or(Some(&serde_json::Value::Null)),
+        );
+        let store = load(&home);
+        let dep = store.deployments.iter().find(|d| d.name == "svc");
+        if let Some(dep) = dep {
+            assert_eq!(dep.directory, "/tmp/custom-workspace", "#1320: template directory must take effect");
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1320: explicit args directory still wins over template and default.
+    #[test]
+    fn deploy_args_directory_overrides_template_and_default() {
+        let home = tmp_home("dir_override");
+        let yaml = r#"
+templates:
+  svc:
+    directory: /tmp/template-dir
+    instances:
+      worker:
+        backend: claude
+"#;
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
+        let args = serde_json::json!({
+            "template": "svc",
+            "directory": "/tmp/explicit-dir",
+        });
+        let out = deploy(&home, "caller", &args);
+        assert_ne!(
+            out.get("error"),
+            None.or(Some(&serde_json::Value::Null)),
+        );
+        let store = load(&home);
+        let dep = store.deployments.iter().find(|d| d.name == "svc");
+        if let Some(dep) = dep {
+            assert_eq!(dep.directory, "/tmp/explicit-dir", "#1320: explicit args directory must win");
+        }
         std::fs::remove_dir_all(&home).ok();
     }
 }
