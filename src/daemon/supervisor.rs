@@ -486,14 +486,36 @@ pub(crate) fn maybe_notify_member_state_change(
         payload.to_string(),
     );
     let _ = crate::inbox::enqueue(home, orch, msg);
+    let action_hint = match new_state {
+        crate::state::AgentState::Hang => {
+            "\nAction: check agent pane snapshot, consider restart if no progress >5min"
+        }
+        crate::state::AgentState::UsageLimit => {
+            "\nAction: wait for limit reset or switch backend. Do NOT retry."
+        }
+        crate::state::AgentState::Crashed => {
+            "\nAction: check logs, restart agent, reassign task if needed"
+        }
+        crate::state::AgentState::PermissionPrompt => {
+            "\nAction: approve or deny the pending permission prompt"
+        }
+        crate::state::AgentState::RateLimit => {
+            "\nAction: wait for rate limit cooldown, auto-retry expected"
+        }
+        crate::state::AgentState::AuthError => {
+            "\nAction: check credentials, may need operator re-auth"
+        }
+        _ => "",
+    };
     crate::inbox::notify_agent(
         home,
         orch,
         &crate::inbox::NotifySource::System("supervisor"),
         &format!(
-            "[member_state_change] {name}: {} → {}",
+            "[member_state_change] {name}: {} → {}{}",
             prev_state.display_name(),
-            new_state.display_name()
+            new_state.display_name(),
+            action_hint,
         ),
     );
     tracing::info!(agent = %name, from = prev_state.display_name(), to = new_state.display_name(), orchestrator = %orch, "member-state-change notify sent");
