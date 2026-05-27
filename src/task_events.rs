@@ -945,7 +945,7 @@ fn max_seq_for_instance(log_path: &Path, instance: &InstanceName) -> anyhow::Res
 // Invalidated explicitly after append_batch and implicitly when file
 // metadata changes (external writes, rotation).
 
-type ReplayCacheKey = (i64, u64, i64);
+type ReplayCacheKey = (std::path::PathBuf, i64, u64, i64);
 
 struct ReplayCacheEntry {
     key: ReplayCacheKey,
@@ -972,7 +972,7 @@ fn replay_cache_key(home: &Path) -> Option<ReplayCacheKey> {
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_nanos() as i64)
         .unwrap_or(0);
-    Some((log_mtime, log_len, archive_mtime))
+    Some((home.to_path_buf(), log_mtime, log_len, archive_mtime))
 }
 
 pub fn invalidate_replay_cache() {
