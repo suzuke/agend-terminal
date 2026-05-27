@@ -509,7 +509,11 @@ where
 /// terminal state (Merged / ClosedUnmerged) is observed and the
 /// `[pr-merged]` / `[pr-closed-unmerged]` events have been emitted.
 pub fn remove(home: &Path, repo: &str, branch: &str) -> std::io::Result<()> {
-    let path = pr_state_dir(home).join(pr_state_filename(repo, branch));
+    let dir = pr_state_dir(home);
+    let filename = pr_state_filename(repo, branch);
+    let path = dir.join(&filename);
+    let lock_path = dir.join(format!("{filename}.lock"));
+    let _ = std::fs::remove_file(&lock_path);
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
