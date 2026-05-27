@@ -618,7 +618,13 @@ pub(crate) fn build_inbox_body(
              4. Do NOT dismiss without evidence"
         )
     } else {
-        format!("{headline}\nURL: {run_url}")
+        format!(
+            "{headline}\nURL: {run_url}\n\n\
+             Next steps:\n\
+             1. If review pending → reviewer picks up\n\
+             2. If already reviewed → lead merges\n\
+             3. Check task board for next assignment"
+        )
     }
 }
 
@@ -969,10 +975,23 @@ async fn poll_ci_runs(
             }
             let notify_msg = match rate_limit_reset {
                 Some(reset) => format!(
-                    "[ci-warn] {}@{}: {message} — backoff until reset (epoch {reset})",
+                    "[ci-warn] {}@{}: {message} — backoff until reset (epoch {reset})\n\n\
+                     Action checklist:\n\
+                     1. Check GitHub status page (githubstatus.com)\n\
+                     2. If rate-limited → wait, polling will auto-resume\n\
+                     3. If persistent >30min → escalate to operator\n\
+                     4. If token error → report to operator",
                     ctx.repo, ctx.branch
                 ),
-                None => format!("[ci-warn] {}@{}: {message}", ctx.repo, ctx.branch),
+                None => format!(
+                    "[ci-warn] {}@{}: {message}\n\n\
+                     Action checklist:\n\
+                     1. Check GitHub status page (githubstatus.com)\n\
+                     2. If rate-limited → wait, polling will auto-resume\n\
+                     3. If persistent >30min → escalate to operator\n\
+                     4. If token error → report to operator",
+                    ctx.repo, ctx.branch
+                ),
             };
             if let Some(ch) = crate::channel::active_channel() {
                 for sub in ctx.subscribers {
