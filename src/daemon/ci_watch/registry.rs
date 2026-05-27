@@ -191,6 +191,7 @@ pub(super) fn flush_watch_state(watch_path: &Path, state: &super::watch_state::W
     merged.stalled_notified = state.stalled_notified;
     merged.stalled_since_ms = state.stalled_since_ms;
     merged.terminal_since = state.terminal_since.clone();
+    merged.early_fail_notified_sha = state.early_fail_notified_sha.clone();
     if let Err(e) = crate::store::atomic_write(
         watch_path,
         serde_json::to_string_pretty(&merged)

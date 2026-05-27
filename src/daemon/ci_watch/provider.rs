@@ -123,6 +123,13 @@ pub struct CiRun {
     pub name: String,
 }
 
+/// A single job within a CI run (#1326 job-level early-fail).
+#[derive(Debug, Clone)]
+pub struct CiJob {
+    pub name: String,
+    pub conclusion: Option<String>,
+}
+
 /// Result of polling CI runs for a branch.
 ///
 /// Sprint 54 P0-2: the success variant carries the
@@ -237,6 +244,12 @@ pub trait CiProvider: Send + Sync {
 
     /// Fetch a human-readable summary of the first failed job/step.
     async fn fetch_failure_summary(&self, repo: &str, run_id: u64) -> String;
+
+    /// #1326: fetch jobs for a run to detect early job-level failures.
+    /// Default returns empty — only GitHub implements this currently.
+    async fn fetch_run_jobs(&self, _repo: &str, _run_id: u64) -> Vec<CiJob> {
+        Vec::new()
+    }
 
     /// Optional token/auth warning shown in the `watch_ci` MCP response.
     /// Currently called via `github_token_warning_from_env()` in the handler;
@@ -511,6 +524,35 @@ impl CiProvider for GitHubCiProvider {
                 })
             })
             .unwrap_or_else(|| "unknown step".to_string())
+    }
+
+    async fn fetch_run_jobs(&self, repo: &str, run_id: u64) -> Vec<CiJob> {
+        let resp = match self
+            .http
+            .get(&format!("repos/{repo}/actions/runs/{run_id}/jobs"))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        let body: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(_) => return Vec::new(),
+        };
+        body["jobs"]
+            .as_array()
+            .map(|jobs| {
+                jobs.iter()
+                    .filter_map(|j| {
+                        Some(CiJob {
+                            name: j["name"].as_str()?.to_string(),
+                            conclusion: j["conclusion"].as_str().map(String::from),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn token_warning(&self) -> Option<&'static str> {

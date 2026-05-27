@@ -46,6 +46,10 @@ pub struct WatchState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_stale_emitted_sha: Option<String>,
 
+    // #1326: job-level early-fail dedup
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub early_fail_notified_sha: Option<String>,
+
     // TTL
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,

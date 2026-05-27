@@ -973,6 +973,8 @@ struct MockCiProvider {
     /// by the new check. Tests targeting #813 set this via
     /// `with_mergeable`.
     mergeable: Mutex<MergeableState>,
+    /// #1326: per-run_id job lists for early-fail testing.
+    jobs: Mutex<std::collections::HashMap<u64, Vec<super::CiJob>>>,
 }
 
 impl MockCiProvider {
@@ -986,6 +988,7 @@ impl MockCiProvider {
             pr_state: Mutex::new(PrState::Open),
             failure_summary: Mutex::new("Build / Test".to_string()),
             mergeable: Mutex::new(MergeableState::Unknown),
+            jobs: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -1003,6 +1006,7 @@ impl MockCiProvider {
             pr_state: Mutex::new(PrState::Open),
             failure_summary: Mutex::new("Build / Test".to_string()),
             mergeable: Mutex::new(MergeableState::Unknown),
+            jobs: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -1016,6 +1020,7 @@ impl MockCiProvider {
             pr_state: Mutex::new(PrState::Open),
             failure_summary: Mutex::new("Build / Test".to_string()),
             mergeable: Mutex::new(MergeableState::Unknown),
+            jobs: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -1047,6 +1052,12 @@ impl MockCiProvider {
     fn set_pr_state(&self, state: PrState) {
         *self.pr_state.lock() = state;
     }
+
+    #[allow(dead_code)]
+    fn with_jobs(self, run_id: u64, jobs: Vec<super::CiJob>) -> Self {
+        self.jobs.lock().insert(run_id, jobs);
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -1063,6 +1074,9 @@ impl CiProvider for MockCiProvider {
     }
     async fn fetch_failure_summary(&self, _repo: &str, _run_id: u64) -> String {
         self.failure_summary.lock().clone()
+    }
+    async fn fetch_run_jobs(&self, _repo: &str, run_id: u64) -> Vec<super::CiJob> {
+        self.jobs.lock().get(&run_id).cloned().unwrap_or_default()
     }
     fn token_warning(&self) -> Option<&'static str> {
         None
@@ -1390,6 +1404,7 @@ fn mock_rate_limit_writes_backoff_and_propagates_error() {
         pr_state: Mutex::new(PrState::Open),
         failure_summary: Mutex::new(String::new()),
         mergeable: Mutex::new(MergeableState::Unknown),
+        jobs: Mutex::new(std::collections::HashMap::new()),
     };
     let result = run_ci_check(&dir, &base_watch(), &provider);
     assert!(result.is_err(), "rate-limit must propagate as error");
@@ -5153,6 +5168,169 @@ fn empty_run_poll_refreshes_expires_at() {
     assert!(
         (71..=72).contains(&hours_from_now),
         "expires_at must be refreshed to ~72h even on empty runs, got {hours_from_now}h"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// --- #1326 job-level early-fail tests ---
+
+#[test]
+fn early_job_failure_sends_notification() {
+    use super::CiJob;
+    let dir = tmp_dir("early-fail");
+    let provider = MockCiProvider::with_runs(vec![CiRun {
+        id: 500,
+        conclusion: None,
+        head_sha: "abc1234".into(),
+        url: "https://example.com/500".into(),
+        name: "CI".into(),
+    }])
+    .with_jobs(
+        500,
+        vec![
+            CiJob {
+                name: "Check (ubuntu)".into(),
+                conclusion: Some("failure".into()),
+            },
+            CiJob {
+                name: "Check (macos)".into(),
+                conclusion: None,
+            },
+            CiJob {
+                name: "Check (windows)".into(),
+                conclusion: None,
+            },
+        ],
+    );
+    run_ci_check(&dir, &base_watch(), &provider).unwrap();
+
+    let watch_path = dir.join("ci-watches").join(watch_filename("o/r", "feat"));
+    let updated: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();
+    assert_eq!(
+        updated["early_fail_notified_sha"].as_str(),
+        Some("abc1234"),
+        "#1326: early_fail_notified_sha must be set"
+    );
+
+    let inbox_path = dir.join("inbox").join("agent1.jsonl");
+    let content = std::fs::read_to_string(&inbox_path).unwrap_or_default();
+    assert!(
+        content.contains("[ci-fail]"),
+        "#1326: early job failure must send inbox notification"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn early_job_failure_includes_running_jobs_in_message() {
+    use super::CiJob;
+    let dir = tmp_dir("early-fail-msg");
+    let provider = MockCiProvider::with_runs(vec![CiRun {
+        id: 600,
+        conclusion: None,
+        head_sha: "def5678".into(),
+        url: "https://example.com/600".into(),
+        name: "CI".into(),
+    }])
+    .with_jobs(
+        600,
+        vec![
+            CiJob {
+                name: "Format check".into(),
+                conclusion: Some("failure".into()),
+            },
+            CiJob {
+                name: "Build".into(),
+                conclusion: None,
+            },
+        ],
+    );
+    run_ci_check(&dir, &base_watch(), &provider).unwrap();
+
+    let inbox_path = dir.join("inbox").join("agent1.jsonl");
+    let msg = std::fs::read_to_string(&inbox_path).expect("must have inbox file");
+    assert!(
+        msg.contains("Format check"),
+        "#1326: message must name the failed job"
+    );
+    assert!(
+        msg.contains("Still running: Build"),
+        "#1326: message must list still-running jobs"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn early_job_failure_dedup_prevents_repeat_notification() {
+    use super::CiJob;
+    let dir = tmp_dir("early-fail-dedup");
+    let ci_dir = dir.join("ci-watches");
+    std::fs::create_dir_all(&ci_dir).ok();
+    let watch = serde_json::json!({
+        "repo": "o/r", "branch": "feat", "interval_secs": 60,
+        "instance": "agent1", "last_run_id": null, "head_sha": null,
+        "last_polled_at": null, "last_notified_head_sha": null,
+        "early_fail_notified_sha": "abc1234",
+    });
+    let provider = MockCiProvider::with_runs(vec![CiRun {
+        id: 700,
+        conclusion: None,
+        head_sha: "abc1234".into(),
+        url: "https://example.com/700".into(),
+        name: "CI".into(),
+    }])
+    .with_jobs(
+        700,
+        vec![CiJob {
+            name: "Check".into(),
+            conclusion: Some("failure".into()),
+        }],
+    );
+    run_ci_check(&dir, &watch, &provider).unwrap();
+
+    let inbox_path = dir.join("inbox").join("agent1.jsonl");
+    let content = std::fs::read_to_string(&inbox_path).unwrap_or_default();
+    assert!(
+        !content.contains("[ci-fail]"),
+        "#1326: must not re-notify when early_fail_notified_sha matches"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn no_early_fail_when_all_jobs_passing() {
+    use super::CiJob;
+    let dir = tmp_dir("early-fail-noop");
+    let provider = MockCiProvider::with_runs(vec![CiRun {
+        id: 800,
+        conclusion: None,
+        head_sha: "ghi9999".into(),
+        url: "https://example.com/800".into(),
+        name: "CI".into(),
+    }])
+    .with_jobs(
+        800,
+        vec![
+            CiJob {
+                name: "Check (ubuntu)".into(),
+                conclusion: Some("success".into()),
+            },
+            CiJob {
+                name: "Check (macos)".into(),
+                conclusion: None,
+            },
+        ],
+    );
+    run_ci_check(&dir, &base_watch(), &provider).unwrap();
+
+    let watch_path = dir.join("ci-watches").join(watch_filename("o/r", "feat"));
+    let updated: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();
+    assert!(
+        updated["early_fail_notified_sha"].is_null()
+            || updated.get("early_fail_notified_sha").is_none(),
+        "#1326: no early-fail dedup flag when no jobs failed"
     );
     std::fs::remove_dir_all(&dir).ok();
 }

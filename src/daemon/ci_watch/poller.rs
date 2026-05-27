@@ -2,7 +2,7 @@ use crate::agent::{self, AgentRegistry};
 use std::path::Path;
 use std::sync::Arc;
 
-use super::provider::{CiPollResult, CiProvider, CiRun, MergeableState, PrState};
+use super::provider::{CiJob, CiPollResult, CiProvider, CiRun, MergeableState, PrState};
 
 type PerKeySlot = Arc<tokio::sync::Mutex<Option<CiPollResult>>>;
 type TickCache = Arc<std::sync::Mutex<std::collections::HashMap<(String, String), PerKeySlot>>>;
@@ -39,6 +39,10 @@ impl CiProvider for CachedCiProvider {
 
     async fn fetch_failure_summary(&self, repo: &str, run_id: u64) -> String {
         self.inner.fetch_failure_summary(repo, run_id).await
+    }
+
+    async fn fetch_run_jobs(&self, repo: &str, run_id: u64) -> Vec<super::provider::CiJob> {
+        self.inner.fetch_run_jobs(repo, run_id).await
     }
 
     fn token_warning(&self) -> Option<&'static str> {
@@ -706,6 +710,93 @@ pub(crate) fn make_ci_ready_for_action_msg(
     msg
 }
 
+// ── #1326 job-level early-fail ──
+
+async fn check_early_job_failures(
+    ctx: &CiCheckCtx<'_>,
+    state: &mut WatchState,
+    pr: &PollResult,
+    provider: &dyn CiProvider,
+) -> bool {
+    if pr.current_sha.is_empty() {
+        return false;
+    }
+    if state.early_fail_notified_sha.as_deref() == Some(pr.current_sha.as_str()) {
+        return false;
+    }
+    let in_progress: Vec<&CiRun> = pr
+        .runs
+        .iter()
+        .filter(|r| r.head_sha == pr.current_sha && r.conclusion.is_none())
+        .collect();
+    if in_progress.is_empty() {
+        return false;
+    }
+
+    let mut all_failed: Vec<String> = Vec::new();
+    let mut all_running: Vec<String> = Vec::new();
+    let mut first_run_id: u64 = 0;
+    let mut first_run_url = String::new();
+
+    for run in &in_progress {
+        let jobs = provider.fetch_run_jobs(ctx.repo, run.id).await;
+        let failed: Vec<&CiJob> = jobs
+            .iter()
+            .filter(|j| j.conclusion.as_deref() == Some("failure"))
+            .collect();
+        if failed.is_empty() {
+            continue;
+        }
+        if first_run_id == 0 {
+            first_run_id = run.id;
+            first_run_url.clone_from(&run.url);
+        }
+        for j in &failed {
+            all_failed.push(j.name.clone());
+        }
+        for j in jobs.iter().filter(|j| j.conclusion.is_none()) {
+            all_running.push(j.name.clone());
+        }
+    }
+
+    if all_failed.is_empty() {
+        return false;
+    }
+
+    let sha_short = &pr.current_sha[..pr.current_sha.len().min(7)];
+    let headline = format!(
+        "[ci-fail] {}@{} ({}): failure",
+        ctx.repo, ctx.branch, sha_short
+    );
+    let detail = all_failed.join(", ");
+    let mut body = format!("{headline}\nDetail: {detail}\nURL: {first_run_url}");
+    if !all_running.is_empty() {
+        body.push_str(&format!("\nStill running: {}", all_running.join(", ")));
+    }
+    body.push_str(&format!(
+        "\n\n⚠ CI failure checklist:\n\
+         1. `gh run view {first_run_id} --log-failed` — read the actual error\n\
+         2. If infra flake → `gh run rerun {first_run_id} --failed`\n\
+         3. If real failure → fix code, push, wait for green\n\
+         4. Do NOT dismiss without evidence"
+    ));
+
+    let repo_branch_key = format!("{}@{}", ctx.repo, ctx.branch);
+    let supersede_token = format!("ci-early-{sha_short}");
+    for sub in ctx.subscribers {
+        crate::inbox::mark_ci_watch_superseded(ctx.home, sub, &repo_branch_key, &supersede_token);
+        let _ = crate::inbox::enqueue_with_idle_hint(
+            ctx.home,
+            sub,
+            crate::inbox::InboxMessage::new_system("system:ci", "ci-watch", body.clone())
+                .with_correlation_id(repo_branch_key.clone()),
+        );
+    }
+
+    state.early_fail_notified_sha = Some(pr.current_sha.clone());
+    true
+}
+
 // ── ci_check_repo decomposition (#1093) ──
 
 struct CiCheckCtx<'a> {
@@ -803,6 +894,10 @@ async fn ci_check_repo(
             return Err(e);
         }
     };
+    // #1326: check in-progress runs for early job-level failures before
+    // the terminal-only notification gates below.
+    check_early_job_failures(&ctx, &mut state, &pr, provider).await;
+
     let to_notify = select_runs_to_notify(
         &pr.runs,
         pr.effective_last_run_id,
