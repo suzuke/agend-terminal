@@ -69,7 +69,8 @@ pub(crate) fn prepare_instructions(
                 fleet
                     .instances
                     .get(name)
-                    .and_then(|c| c.instructions.as_deref()),
+                    .and_then(|c| c.instructions.as_deref())
+                    .or(fleet.defaults.instructions.as_deref()),
                 fleet_dir,
             );
             let ctx = crate::instructions::AgentContext {

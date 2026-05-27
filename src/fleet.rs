@@ -174,6 +174,7 @@ pub struct InstanceDefaults {
     pub env: HashMap<String, String>,
     pub cols: Option<u16>,
     pub rows: Option<u16>,
+    pub instructions: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -524,7 +525,10 @@ impl FleetConfig {
             git_branch: inst.git_branch.clone(),
             model,
             worktree: inst.worktree,
-            instructions: inst.instructions.clone(),
+            instructions: inst
+                .instructions
+                .clone()
+                .or_else(|| defaults.instructions.clone()),
             source_repo,
             // Sprint 55 P0-B EC4: optional explicit GitHub `owner/name`
             // override; copied through unchanged.
@@ -3941,5 +3945,84 @@ instances:
             "cache must be invalidated by atomic_write_yaml"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_instance_inherits_defaults_instructions() {
+        let dir = std::env::temp_dir().join(format!(
+            "agend-fleet-def-instr-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let path = write_fleet(
+            &dir,
+            r#"
+defaults:
+  instructions: shared.md
+instances:
+  agent1:
+    command: /bin/bash
+"#,
+        );
+        let config = FleetConfig::load(&path).expect("load");
+        let resolved = config.resolve_instance("agent1").expect("resolve");
+        assert_eq!(
+            resolved.instructions.as_deref(),
+            Some("shared.md"),
+            "defaults.instructions must propagate when instance omits it"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_instance_instructions_override_beats_defaults() {
+        let dir = std::env::temp_dir().join(format!(
+            "agend-fleet-instr-override-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let path = write_fleet(
+            &dir,
+            r#"
+defaults:
+  instructions: shared.md
+instances:
+  agent1:
+    command: /bin/bash
+    instructions: custom.md
+"#,
+        );
+        let config = FleetConfig::load(&path).expect("load");
+        let resolved = config.resolve_instance("agent1").expect("resolve");
+        assert_eq!(
+            resolved.instructions.as_deref(),
+            Some("custom.md"),
+            "instance instructions must override defaults"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_instance_no_instructions_stays_none() {
+        let dir = std::env::temp_dir().join(format!(
+            "agend-fleet-no-instr-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let path = write_fleet(
+            &dir,
+            r#"
+instances:
+  agent1:
+    command: /bin/bash
+"#,
+        );
+        let config = FleetConfig::load(&path).expect("load");
+        let resolved = config.resolve_instance("agent1").expect("resolve");
+        assert_eq!(
+            resolved.instructions, None,
+            "no instructions anywhere must remain None"
+        );
+        fs::remove_dir_all(&dir).ok();
     }
 }
