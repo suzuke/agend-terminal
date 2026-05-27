@@ -43,6 +43,9 @@ pub fn scan_and_emit_with(
     };
     for entry in entries.flatten() {
         let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
         let content = match std::fs::read_to_string(&path) {
             Ok(c) => c,
             Err(e) => {
@@ -229,6 +232,9 @@ fn apply_gh_poll(home: &Path, dir: &Path, poller: &dyn gh_poll::GhPoller) {
     let mut skipped_should_poll = 0u32;
     for entry in entries.flatten() {
         let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
         let content = match std::fs::read_to_string(&path) {
             Ok(c) => c,
             Err(e) => {
