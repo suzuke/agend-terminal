@@ -108,19 +108,22 @@ pub fn scan_and_emit_with(
                     merged_at,
                 } => {
                     if !already_emitted {
+                        // #1344: auto-release worktree before emitting [pr-merged]
+                        crate::daemon::auto_release::auto_release_for_merged_branch(
+                            home,
+                            &state.branch,
+                        );
                         let author = resolve_author(state);
                         let body = format!(
                             "[pr-merged] {}@{} (merge_commit {}, merged_at {})\n\n\
                              ⚠ Action checklist:\n\
-                             1. `release_worktree` for branch `{}`\n\
-                             2. `gh issue close` (if linked issue)\n\
-                             3. `task action=done` (if correlation_id present)\n\
-                             4. Report completion to lead",
+                             1. `gh issue close` (if linked issue)\n\
+                             2. `task action=done` (if correlation_id present)\n\
+                             3. Report completion to lead",
                             state.repo,
                             state.branch,
                             &merge_commit[..8.min(merge_commit.len())],
                             merged_at,
-                            state.branch,
                         );
                         let _ = crate::inbox::enqueue_with_idle_hint(
                             home,
