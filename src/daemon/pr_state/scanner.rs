@@ -2,9 +2,15 @@ use std::path::Path;
 
 use super::gh_poll;
 use super::{
-    apply, format_ready_body, pr_state_dir, remove, resolve_author, save, DraftState, Event,
-    MergeState, PrState,
+    apply, format_ready_body, pr_state_dir, remove, resolve_author, with_pr_state, DraftState,
+    Event, MergeState, PrState,
 };
+
+enum ScanAction {
+    None,
+    Saved,
+    Remove,
+}
 
 pub fn scan_and_emit(home: &Path, registry: &crate::agent::AgentRegistry) {
     scan_and_emit_with(home, registry, &gh_poll::CliGhPoller);
@@ -48,7 +54,7 @@ pub fn scan_and_emit_with(
                 continue;
             }
         };
-        let mut state: PrState = match serde_json::from_str(&content) {
+        let snapshot: PrState = match serde_json::from_str(&content) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(
@@ -59,128 +65,131 @@ pub fn scan_and_emit_with(
                 continue;
             }
         };
-        let mut dirty = false;
+        let repo = snapshot.repo.clone();
+        let branch = snapshot.branch.clone();
 
-        // Emit [pr-ready-for-merge] if eligible and not already fired.
-        if matches!(state.merge_state, MergeState::MergeReady)
-            && state.ready_emitted_for_sha.as_deref() != Some(state.head_sha.as_str())
-        {
-            let author = resolve_author(&state);
-            let body = format_ready_body(&state);
-            let msg = build_event_message("pr-ready-for-merge", &author, &state, body);
-            if let Err(e) = crate::inbox::enqueue_with_idle_hint(home, &author, msg) {
-                tracing::warn!(
-                    repo = %state.repo,
-                    branch = %state.branch,
-                    error = %e,
-                    "#972 pr_state: [pr-ready-for-merge] enqueue failed"
-                );
+        // #1342: all emit + flag-set under flock to prevent lost-update race.
+        let result = with_pr_state(home, &repo, &branch, |state| {
+            let mut dirty = false;
+
+            // Emit [pr-ready-for-merge] if eligible and not already fired.
+            if matches!(state.merge_state, MergeState::MergeReady)
+                && state.ready_emitted_for_sha.as_deref() != Some(state.head_sha.as_str())
+            {
+                let author = resolve_author(state);
+                let body = format_ready_body(state);
+                let msg = build_event_message("pr-ready-for-merge", &author, state, body);
+                if let Err(e) = crate::inbox::enqueue_with_idle_hint(home, &author, msg) {
+                    tracing::warn!(
+                        repo = %state.repo,
+                        branch = %state.branch,
+                        error = %e,
+                        "#972 pr_state: [pr-ready-for-merge] enqueue failed"
+                    );
+                } else {
+                    state.ready_emitted_for_sha = Some(state.head_sha.clone());
+                    dirty = true;
+                    tracing::info!(
+                        repo = %state.repo,
+                        branch = %state.branch,
+                        head = %state.head_sha,
+                        author = %author,
+                        "#972 pr_state: [pr-ready-for-merge] emitted"
+                    );
+                }
+            }
+
+            // Terminal-state sweep.
+            let already_emitted =
+                state.ready_emitted_for_sha.as_deref() == Some(state.head_sha.as_str());
+            match &state.merge_state {
+                MergeState::Merged {
+                    merge_commit,
+                    merged_at,
+                } => {
+                    if !already_emitted {
+                        let author = resolve_author(state);
+                        let body = format!(
+                            "[pr-merged] {}@{} (merge_commit {}, merged_at {})\n\n\
+                             ⚠ Action checklist:\n\
+                             1. `release_worktree` for branch `{}`\n\
+                             2. `gh issue close` (if linked issue)\n\
+                             3. `task action=done` (if correlation_id present)\n\
+                             4. Report completion to lead",
+                            state.repo,
+                            state.branch,
+                            &merge_commit[..8.min(merge_commit.len())],
+                            merged_at,
+                            state.branch,
+                        );
+                        let _ = crate::inbox::enqueue_with_idle_hint(
+                            home,
+                            &author,
+                            build_event_message("pr-merged", &author, state, body),
+                        );
+                        state.ready_emitted_for_sha = Some(state.head_sha.clone());
+                        dirty = true;
+                    } else {
+                        tracing::debug!(
+                            repo = %state.repo,
+                            branch = %state.branch,
+                            head = %state.head_sha,
+                            "#1017 pr_state: stale Merged replay suppressed at scan"
+                        );
+                        return ScanAction::Remove;
+                    }
+                }
+                MergeState::ClosedUnmerged { closed_at } => {
+                    if !already_emitted {
+                        let author = resolve_author(state);
+                        let body = format!(
+                            "[pr-closed-unmerged] {}@{} (closed_at {})\n\n\
+                             ⚠ Action checklist:\n\
+                             1. `release_worktree` for branch `{}`\n\
+                             2. Investigate closure reason (operator decision? superseded?)\n\
+                             3. Report to lead with context",
+                            state.repo, state.branch, closed_at, state.branch,
+                        );
+                        let _ = crate::inbox::enqueue_with_idle_hint(
+                            home,
+                            &author,
+                            build_event_message("pr-closed-unmerged", &author, state, body),
+                        );
+                        state.ready_emitted_for_sha = Some(state.head_sha.clone());
+                        dirty = true;
+                    } else {
+                        tracing::debug!(
+                            repo = %state.repo,
+                            branch = %state.branch,
+                            head = %state.head_sha,
+                            "#1017 pr_state: stale ClosedUnmerged replay suppressed at scan"
+                        );
+                        return ScanAction::Remove;
+                    }
+                }
+                _ => {}
+            }
+
+            if dirty {
+                ScanAction::Saved
             } else {
-                state.ready_emitted_for_sha = Some(state.head_sha.clone());
-                dirty = true;
-                tracing::info!(
-                    repo = %state.repo,
-                    branch = %state.branch,
-                    head = %state.head_sha,
-                    author = %author,
-                    "#972 pr_state: [pr-ready-for-merge] emitted"
-                );
+                ScanAction::None
             }
-        }
+        });
 
-        // Terminal-state sweep.
-        //
-        // #1017: each terminal-state branch first checks the
-        // `ready_emitted_for_sha` debounce gate. The startup hook
-        // `suppress_stale_terminal_replay` sets this to `Some(head_sha)`
-        // for files older than the replay-age threshold so they are
-        // swept (file removed) without firing a stale event. Fresh
-        // terminal-state files have `ready_emitted_for_sha == None`
-        // and fire normally.
-        let already_emitted =
-            state.ready_emitted_for_sha.as_deref() == Some(state.head_sha.as_str());
-        match &state.merge_state {
-            MergeState::Merged {
-                merge_commit,
-                merged_at,
-            } => {
-                if !already_emitted {
-                    let author = resolve_author(&state);
-                    let body = format!(
-                        "[pr-merged] {}@{} (merge_commit {}, merged_at {})\n\n\
-                         ⚠ Action checklist:\n\
-                         1. `release_worktree` for branch `{}`\n\
-                         2. `gh issue close` (if linked issue)\n\
-                         3. `task action=done` (if correlation_id present)\n\
-                         4. Report completion to lead",
-                        state.repo,
-                        state.branch,
-                        &merge_commit[..8.min(merge_commit.len())],
-                        merged_at,
-                        state.branch,
-                    );
-                    let _ = crate::inbox::enqueue_with_idle_hint(
-                        home,
-                        &author,
-                        build_event_message("pr-merged", &author, &state, body),
-                    );
-                    // #1287: set dedup flag and persist — file removal
-                    // deferred to the next scan so the flag survives
-                    // if gh_poll recreates the watch file.
-                    state.ready_emitted_for_sha = Some(state.head_sha.clone());
-                    dirty = true;
-                } else {
-                    tracing::debug!(
-                        repo = %state.repo,
-                        branch = %state.branch,
-                        head = %state.head_sha,
-                        "#1017 pr_state: stale Merged replay suppressed at scan"
-                    );
-                    let _ = remove(home, &state.repo, &state.branch);
-                    continue;
-                }
+        match result {
+            Ok(Some(ScanAction::Remove)) => {
+                let _ = remove(home, &repo, &branch);
             }
-            MergeState::ClosedUnmerged { closed_at } => {
-                if !already_emitted {
-                    let author = resolve_author(&state);
-                    let body = format!(
-                        "[pr-closed-unmerged] {}@{} (closed_at {})\n\n\
-                         ⚠ Action checklist:\n\
-                         1. `release_worktree` for branch `{}`\n\
-                         2. Investigate closure reason (operator decision? superseded?)\n\
-                         3. Report to lead with context",
-                        state.repo, state.branch, closed_at, state.branch,
-                    );
-                    let _ = crate::inbox::enqueue_with_idle_hint(
-                        home,
-                        &author,
-                        build_event_message("pr-closed-unmerged", &author, &state, body),
-                    );
-                    state.ready_emitted_for_sha = Some(state.head_sha.clone());
-                    dirty = true;
-                } else {
-                    tracing::debug!(
-                        repo = %state.repo,
-                        branch = %state.branch,
-                        head = %state.head_sha,
-                        "#1017 pr_state: stale ClosedUnmerged replay suppressed at scan"
-                    );
-                    let _ = remove(home, &state.repo, &state.branch);
-                    continue;
-                }
-            }
-            _ => {}
-        }
-
-        if dirty {
-            if let Err(e) = save(home, &state) {
+            Err(e) => {
                 tracing::warn!(
-                    repo = %state.repo,
-                    branch = %state.branch,
+                    repo = %repo,
+                    branch = %branch,
                     error = %e,
                     "#972 pr_state: post-emit save failed"
                 );
             }
+            _ => {}
         }
         let _ = registry; // reserved for future gh-poll author lookup hook
     }
@@ -265,14 +274,16 @@ fn apply_gh_poll(home: &Path, dir: &Path, poller: &dyn gh_poll::GhPoller) {
     for (repo, due_states) in by_repo {
         match poller.poll(&repo) {
             Ok(prs) => {
-                for mut state in due_states {
-                    apply_gh_observations(home, &mut state, &prs, &now);
-                    state.gh_poll_failures = 0;
-                    state.last_gh_poll_at = Some(now.clone());
-                    if let Err(e) = save(home, &state) {
+                for state in due_states {
+                    let branch = state.branch.clone();
+                    if let Err(e) = with_pr_state(home, &repo, &branch, |s| {
+                        apply_gh_observations(home, s, &prs, &now);
+                        s.gh_poll_failures = 0;
+                        s.last_gh_poll_at = Some(now.clone());
+                    }) {
                         tracing::warn!(
-                            repo = %state.repo,
-                            branch = %state.branch,
+                            repo = %repo,
+                            branch = %branch,
                             error = %e,
                             "#986 pr_state: post-gh-poll save failed"
                         );
@@ -281,10 +292,12 @@ fn apply_gh_poll(home: &Path, dir: &Path, poller: &dyn gh_poll::GhPoller) {
             }
             Err(e) => {
                 tracing::warn!(repo = %repo, error = %e, "#986 gh-poll failed");
-                for mut state in due_states {
-                    state.gh_poll_failures = state.gh_poll_failures.saturating_add(1);
-                    state.last_gh_poll_at = Some(now.clone());
-                    let _ = save(home, &state);
+                for state in due_states {
+                    let branch = state.branch.clone();
+                    let _ = with_pr_state(home, &repo, &branch, |s| {
+                        s.gh_poll_failures = s.gh_poll_failures.saturating_add(1);
+                        s.last_gh_poll_at = Some(now.clone());
+                    });
                 }
             }
         }
