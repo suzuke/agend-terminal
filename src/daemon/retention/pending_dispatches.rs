@@ -5,9 +5,10 @@ use std::path::Path;
 const RETENTION_DAYS: i64 = 14;
 
 /// Sweep pending-dispatch sidecars older than 14 days.
-/// Gated on AGEND_RETENTION_CUTOVER=1. Returns number swept.
-pub(super) fn sweep(home: &Path) -> usize {
-    if std::env::var("AGEND_RETENTION_CUTOVER").as_deref() != Ok("1") {
+/// `cutover` gates the feature — production passes the env-var value,
+/// tests pass the bool directly to avoid process-wide env-var races.
+pub(super) fn sweep(home: &Path, cutover: bool) -> usize {
+    if !cutover {
         return 0;
     }
     let dir = crate::daemon::dispatch_idle::pending_dir(home);
@@ -102,9 +103,7 @@ mod tests {
         write_dispatch(&home, "disp-old", 20);
         write_dispatch(&home, "disp-recent", 3);
 
-        std::env::set_var("AGEND_RETENTION_CUTOVER", "1");
-        let swept = sweep(&home);
-        std::env::remove_var("AGEND_RETENTION_CUTOVER");
+        let swept = sweep(&home, true);
 
         assert_eq!(swept, 1);
         let dir = crate::daemon::dispatch_idle::pending_dir(&home);
@@ -115,12 +114,11 @@ mod tests {
     }
 
     #[test]
-    fn sweep_skipped_without_env() {
+    fn sweep_skipped_without_cutover() {
         let home = tmp_home("sweep-noenv");
         write_dispatch(&home, "disp-old2", 20);
 
-        std::env::remove_var("AGEND_RETENTION_CUTOVER");
-        let swept = sweep(&home);
+        let swept = sweep(&home, false);
 
         assert_eq!(swept, 0);
         let dir = crate::daemon::dispatch_idle::pending_dir(&home);

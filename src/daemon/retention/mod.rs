@@ -32,7 +32,8 @@ impl RetentionSupervisor {
         tracing::info!("retention sweep: starting cycle");
 
         let decisions_swept = decisions::sweep(home);
-        let dispatches_swept = pending_dispatches::sweep(home);
+        let cutover = std::env::var("AGEND_RETENTION_CUTOVER").as_deref() == Ok("1");
+        let dispatches_swept = pending_dispatches::sweep(home, cutover);
         let worktrees_swept = worktrees::sweep(home);
 
         tracing::info!(
