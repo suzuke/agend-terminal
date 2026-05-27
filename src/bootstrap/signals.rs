@@ -117,19 +117,18 @@ unsafe fn install_unix_sigterm() {
 
 #[cfg(windows)]
 unsafe fn install_windows_close() {
-    use windows_sys::Win32::Foundation::{BOOL, FALSE, TRUE};
     use windows_sys::Win32::System::Console::{
         SetConsoleCtrlHandler, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
     };
 
-    unsafe extern "system" fn handler(ctrl_type: u32) -> BOOL {
+    unsafe extern "system" fn handler(ctrl_type: u32) -> i32 {
         match ctrl_type {
             CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT => {
                 TERM_REQUESTED.store(true, Ordering::Relaxed);
-                TRUE
+                1
             }
             // Leave CTRL_C_EVENT / CTRL_BREAK_EVENT to default / crossterm.
-            _ => FALSE,
+            _ => 0,
         }
     }
 
