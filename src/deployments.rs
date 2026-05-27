@@ -2166,10 +2166,7 @@ templates:
             "template": "svc",
         });
         let out = deploy(&home, "caller", &args);
-        assert_ne!(
-            out.get("error"),
-            None.or(Some(&serde_json::Value::Null)),
-        );
+        assert_ne!(out.get("error"), None.or(Some(&serde_json::Value::Null)),);
         let store = load(&home);
         let dep = store.deployments.iter().find(|d| d.name == "svc");
         if let Some(dep) = dep {
@@ -2177,7 +2174,10 @@ templates:
                 .join("svc")
                 .display()
                 .to_string();
-            assert_eq!(dep.directory, expected, "#1320: default dir must be $AGEND_HOME/workspace/<deploy_name>");
+            assert_eq!(
+                dep.directory, expected,
+                "#1320: default dir must be $AGEND_HOME/workspace/<deploy_name>"
+            );
         }
         std::fs::remove_dir_all(&home).ok();
     }
@@ -2199,14 +2199,14 @@ templates:
             "template": "svc",
         });
         let out = deploy(&home, "caller", &args);
-        assert_ne!(
-            out.get("error"),
-            None.or(Some(&serde_json::Value::Null)),
-        );
+        assert_ne!(out.get("error"), None.or(Some(&serde_json::Value::Null)),);
         let store = load(&home);
         let dep = store.deployments.iter().find(|d| d.name == "svc");
         if let Some(dep) = dep {
-            assert_eq!(dep.directory, "/tmp/custom-workspace", "#1320: template directory must take effect");
+            assert_eq!(
+                dep.directory, "/tmp/custom-workspace",
+                "#1320: template directory must take effect"
+            );
         }
         std::fs::remove_dir_all(&home).ok();
     }
@@ -2229,14 +2229,14 @@ templates:
             "directory": "/tmp/explicit-dir",
         });
         let out = deploy(&home, "caller", &args);
-        assert_ne!(
-            out.get("error"),
-            None.or(Some(&serde_json::Value::Null)),
-        );
+        assert_ne!(out.get("error"), None.or(Some(&serde_json::Value::Null)),);
         let store = load(&home);
         let dep = store.deployments.iter().find(|d| d.name == "svc");
         if let Some(dep) = dep {
-            assert_eq!(dep.directory, "/tmp/explicit-dir", "#1320: explicit args directory must win");
+            assert_eq!(
+                dep.directory, "/tmp/explicit-dir",
+                "#1320: explicit args directory must win"
+            );
         }
         std::fs::remove_dir_all(&home).ok();
     }
