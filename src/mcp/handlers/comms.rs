@@ -91,6 +91,7 @@ pub(super) fn handle_send_to_instance(
     let result = match crate::api::call(
         home,
         &json!({
+            "request_id": uuid::Uuid::new_v4().to_string(),
             "method": crate::api::method::SEND,
             // #1024 (closes #1002 ROOT 2): `reviewed_head` MUST be forwarded; see
             // sibling `handle_report_result` + `auto_release::is_verdict_message`.
@@ -358,6 +359,7 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
     let result = match crate::api::call(
         home,
         &json!({
+            "request_id": uuid::Uuid::new_v4().to_string(),
             "method": crate::api::method::SEND,
             "params": {
                 "from": sender.as_str(),
@@ -480,6 +482,7 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
         match crate::api::call(
             home,
             &json!({
+                "request_id": uuid::Uuid::new_v4().to_string(),
                 "method": crate::api::method::SEND,
                 "params": {
                     "from": sender.as_str(),
