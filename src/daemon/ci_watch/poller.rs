@@ -474,16 +474,16 @@ pub(crate) fn dedupe_notifications_by_head_sha<'a>(
             })
             .or_insert((idx, id));
     }
+    let notify_set: std::collections::HashSet<usize> = to_notify.iter().copied().collect();
     let mut result: Vec<_> = best
         .into_iter()
         .filter(|(sha, (_idx, _))| {
             if last_notified_sha != Some(*sha) {
-                return true; // different sha → always pass
+                return true;
             }
-            // #1042: compare AGGREGATE conclusion (not individual run's)
-            // against last_notified_conclusion — the fan-out persists
-            // the aggregate, so dedup must match the same value.
-            aggregate_conclusion_for_sha(runs, sha) != last_notified_conclusion
+            // #1307: aggregate only over to_notify runs so stale failed
+            // runs (filtered by gate 1) don't poison the conclusion.
+            aggregate_conclusion_for_indices(runs, &notify_set, sha) != last_notified_conclusion
         })
         .map(|(sha, (idx, id))| (idx, id, sha))
         .collect();
@@ -548,6 +548,41 @@ pub(crate) fn aggregate_conclusion_for_sha_filtered<'a>(
         return Some("failure");
     }
     // Still in-progress → wait for all to complete before reporting success
+    if matching.iter().any(|r| r.conclusion.is_none()) {
+        return None;
+    }
+    if let Some(r) = matching
+        .iter()
+        .find(|r| r.conclusion.as_deref() != Some("success"))
+    {
+        return r.conclusion.as_deref();
+    }
+    Some("success")
+}
+
+/// #1307: aggregate conclusion only over runs at the given indices.
+/// Prevents stale failed runs (already filtered out by gate 1) from
+/// poisoning the gate 2 dedup check on rerun.
+fn aggregate_conclusion_for_indices<'a>(
+    runs: &'a [CiRun],
+    indices: &std::collections::HashSet<usize>,
+    sha: &str,
+) -> Option<&'a str> {
+    let matching: Vec<&CiRun> = runs
+        .iter()
+        .enumerate()
+        .filter(|(i, r)| indices.contains(i) && r.head_sha == sha)
+        .map(|(_, r)| r)
+        .collect();
+    if matching.is_empty() {
+        return None;
+    }
+    if matching
+        .iter()
+        .any(|r| r.conclusion.as_deref() == Some("failure"))
+    {
+        return Some("failure");
+    }
     if matching.iter().any(|r| r.conclusion.is_none()) {
         return None;
     }

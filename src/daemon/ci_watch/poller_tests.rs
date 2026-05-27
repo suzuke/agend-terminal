@@ -624,6 +624,41 @@ fn test_1042_same_sha_different_aggregate_fires() {
     );
 }
 
+/// #1307: rerun of a failed run produces a new run_id with success on the
+/// same SHA. Gate 1 filters out the old failed run, but gate 2 was
+/// aggregating over ALL runs (including the filtered-out failure), causing
+/// the aggregate to stay "failure" and suppressing the notification.
+#[test]
+fn test_1307_rerun_pass_same_sha_fires_notification() {
+    let runs = vec![
+        CiRun {
+            id: 900,
+            conclusion: Some("failure".into()),
+            head_sha: "abc".into(),
+            url: String::new(),
+            name: String::new(),
+        },
+        CiRun {
+            id: 901,
+            conclusion: Some("success".into()),
+            head_sha: "abc".into(),
+            url: String::new(),
+            name: String::new(),
+        },
+    ];
+    // last_run_id=900: gate 1 filters out run 900 (same id, same conclusion)
+    let selected = select_runs_to_notify(&runs, Some(900), Some("failure"));
+    assert_eq!(selected, vec![1], "only rerun (id=901) should pass gate 1");
+    // gate 2: same SHA as last notified, but aggregate should use only
+    // to_notify runs (success), not all runs (which includes old failure)
+    let deduped = dedupe_notifications_by_head_sha(&runs, &selected, Some("abc"), Some("failure"));
+    assert_eq!(
+        deduped.len(),
+        1,
+        "#1307: rerun pass on same SHA must fire notification; got {deduped:?}"
+    );
+}
+
 #[test]
 fn test_different_head_sha_triggers_new_notification() {
     let runs = vec![
