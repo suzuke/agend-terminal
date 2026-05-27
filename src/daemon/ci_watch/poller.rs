@@ -1249,6 +1249,33 @@ async fn fan_out_notifications(
         }
         new_notified_sha = Some(sha.to_string());
         new_notified_conclusion = conclusion.map(String::from);
+        if crate::daemon::event_bus::global().is_enabled() {
+            match conclusion {
+                Some("failure") => {
+                    for sub in ctx.subscribers {
+                        crate::daemon::event_bus::global().emit(
+                            crate::daemon::event_bus::EventKind::CiFail {
+                                repo: ctx.repo.to_string(),
+                                branch: ctx.branch.to_string(),
+                                target: sub.clone(),
+                            },
+                        );
+                    }
+                }
+                Some("success") => {
+                    for sub in ctx.subscribers {
+                        crate::daemon::event_bus::global().emit(
+                            crate::daemon::event_bus::EventKind::CiReady {
+                                repo: ctx.repo.to_string(),
+                                branch: ctx.branch.to_string(),
+                                target: sub.clone(),
+                            },
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     NotifyOutcome {

@@ -559,6 +559,13 @@ fn emit_exceeded_event(home: &Path, d: &PendingDispatch, elapsed_secs: i64) {
             d.threshold_secs,
         ),
     );
+    crate::daemon::event_bus::global().emit_lazy(|| {
+        crate::daemon::event_bus::EventKind::DispatchIdleExceeded {
+            dispatcher: d.dispatcher.clone(),
+            target: d.target.clone(),
+            elapsed_secs,
+        }
+    });
 }
 
 /// Per-loop scheduler state.

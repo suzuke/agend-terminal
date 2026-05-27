@@ -11,6 +11,7 @@ pub(crate) mod cron_tick;
 pub(crate) mod decision_timeout;
 pub(crate) mod dedup_state;
 pub(crate) mod dispatch_idle;
+pub(crate) mod event_bus;
 pub(crate) mod heartbeat_pair;
 pub(crate) mod helper_staleness_watchdog;
 pub(crate) mod idle_watchdog;

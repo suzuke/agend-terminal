@@ -199,6 +199,14 @@ fn emit_stall(home: &Path, task: &Task, reason: &str) {
             );
         }
     }
+    crate::daemon::event_bus::global().emit_lazy(|| {
+        crate::daemon::event_bus::EventKind::TaskStateChanged {
+            task_id: task.id.clone(),
+            title: task.title.clone(),
+            assignee: task.assignee.clone(),
+            reason: reason.to_string(),
+        }
+    });
 }
 
 #[cfg(test)]
