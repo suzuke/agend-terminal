@@ -193,9 +193,11 @@ pub(super) fn record_to_task(r: &crate::task_events::TaskRecord) -> Task {
 pub(super) fn status_to_legacy_str(s: crate::task_events::TaskStatus) -> &'static str {
     use crate::task_events::TaskStatus;
     match s {
+        TaskStatus::Backlog => "backlog",
         TaskStatus::Open => "open",
         TaskStatus::Claimed => "claimed",
         TaskStatus::InProgress => "in_progress",
+        TaskStatus::InReview => "in_review",
         TaskStatus::Verified => "verified",
         TaskStatus::Done => "done",
         TaskStatus::Cancelled => "cancelled",
