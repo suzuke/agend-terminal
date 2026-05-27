@@ -1297,7 +1297,10 @@ mod tests {
 
     /// #1325: phase 2 — due retry injects "continue\n" to PTY. Captures
     /// actual PTY output via the reader end to verify the injected payload.
+    /// Windows PTY injects ANSI escapes (`\x1b[6n`) that contaminate the
+    /// read — skip on Windows where `findstr` cannot echo stdin faithfully.
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn phase2_injects_continue_to_pty() {
         let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let home = tmp_home("phase2-inject");
