@@ -1193,6 +1193,8 @@ mod tests {
 
     /// Helper: create a minimal AgentHandle with a real PTY for behavioral
     /// tests. Spawns `cat` (blocks reading stdin, never exits on its own).
+    /// Not available on Windows (no `cat`).
+    #[cfg(not(target_os = "windows"))]
     fn mock_agent_handle(
         name: &str,
         state: crate::state::AgentState,
@@ -1240,6 +1242,7 @@ mod tests {
 
     /// #1325: phase 1 — ServerRateLimit detection populates retry_tracks.
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn phase1_detects_rate_limit_and_schedules_retry() {
         let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let home = tmp_home("phase1-detect");
@@ -1261,6 +1264,7 @@ mod tests {
 
     /// #1325: phase 1 — recovery (Ready/Idle) clears retry track.
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn phase1_recovery_clears_retry_track() {
         let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let home = tmp_home("phase1-recovery");
@@ -1288,6 +1292,7 @@ mod tests {
     /// #1325: phase 2 — due retry injects "continue\n" to PTY. Captures
     /// actual PTY output via the reader end to verify the injected payload.
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn phase2_injects_continue_to_pty() {
         let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let home = tmp_home("phase2-inject");
