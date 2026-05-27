@@ -109,6 +109,11 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
             .to_string()
     };
 
+    let template_source_repo = template_def
+        .get("source_repo")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
     // Phase 1 — validate every template entry, compute worktrees, and
     // collect the fleet.yaml records. No SPAWN happens here: handle_spawn
     // reads fleet.yaml to build the AgentContext (name + role + peers),
@@ -227,6 +232,11 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
             .filter(|s| !s.is_empty())
             .map(String::from);
         let template_worktree = inst_val.get("worktree").and_then(|v| v.as_bool());
+        let source_repo = inst_val
+            .get("source_repo")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .or(template_source_repo.clone());
 
         // Every member gets its own `<directory>/<inst_name>` subdir —
         // same-backend teammates would otherwise clobber each other's
@@ -275,8 +285,7 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
                 working_directory: Some(work_dir),
                 role,
                 instructions,
-                // Sprint 54 P1-B Bug 2 fix: see instance.rs:593.
-                source_repo: None,
+                source_repo,
                 // Sprint 55 P0-B EC4: see instance.rs (gradient).
                 repo: None,
                 github_login: None,
@@ -398,6 +407,9 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
             "members": &created,
             "description": format!("Template deployment: {template}"),
         });
+        if let Some(ref sr) = template_source_repo {
+            team_args["source_repo"] = serde_json::Value::String(sr.clone());
+        }
         if let Some(suffix) = template_def.get("orchestrator").and_then(|v| v.as_str()) {
             let full = format!("{deploy_name}-{suffix}");
             if created.contains(&full) {
@@ -2238,6 +2250,138 @@ templates:
                 "#1320: explicit args directory must win"
             );
         }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn deploy_propagates_template_source_repo_to_instances() {
+        let home = tmp_home("tpl_source_repo");
+        let yaml = r#"
+templates:
+  svc:
+    source_repo: /repos/my-project
+    instances:
+      lead:
+        backend: claude
+      dev:
+        backend: kiro-cli
+"#;
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
+        let args = serde_json::json!({
+            "template": "svc",
+            "directory": home.display().to_string(),
+        });
+        let _ = deploy(&home, "caller", &args);
+
+        let reloaded =
+            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+        let lead = reloaded.instances.get("svc-lead").expect("svc-lead");
+        assert_eq!(
+            lead.source_repo.as_deref(),
+            Some("/repos/my-project"),
+            "template source_repo must propagate to instances"
+        );
+        let dev = reloaded.instances.get("svc-dev").expect("svc-dev");
+        assert_eq!(
+            dev.source_repo.as_deref(),
+            Some("/repos/my-project"),
+            "template source_repo must propagate to all instances"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn deploy_instance_source_repo_overrides_template() {
+        let home = tmp_home("inst_override_sr");
+        let yaml = r#"
+templates:
+  svc:
+    source_repo: /repos/default
+    instances:
+      lead:
+        backend: claude
+        source_repo: /repos/override
+      dev:
+        backend: kiro-cli
+"#;
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
+        let args = serde_json::json!({
+            "template": "svc",
+            "directory": home.display().to_string(),
+        });
+        let _ = deploy(&home, "caller", &args);
+
+        let reloaded =
+            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+        let lead = reloaded.instances.get("svc-lead").expect("svc-lead");
+        assert_eq!(
+            lead.source_repo.as_deref(),
+            Some("/repos/override"),
+            "instance source_repo must override template"
+        );
+        let dev = reloaded.instances.get("svc-dev").expect("svc-dev");
+        assert_eq!(
+            dev.source_repo.as_deref(),
+            Some("/repos/default"),
+            "instance without override inherits template"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn deploy_no_source_repo_stays_none() {
+        let home = tmp_home("no_source_repo");
+        let yaml = r#"
+templates:
+  svc:
+    instances:
+      lead:
+        backend: claude
+"#;
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
+        let args = serde_json::json!({
+            "template": "svc",
+            "directory": home.display().to_string(),
+        });
+        let _ = deploy(&home, "caller", &args);
+
+        let reloaded =
+            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+        let lead = reloaded.instances.get("svc-lead").expect("svc-lead");
+        assert_eq!(
+            lead.source_repo, None,
+            "no source_repo in template or instance must remain None"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn deploy_propagates_template_source_repo_to_team() {
+        let home = tmp_home("tpl_sr_team");
+        let yaml = r#"
+templates:
+  svc:
+    source_repo: /repos/team-project
+    instances:
+      lead:
+        backend: claude
+      dev:
+        backend: kiro-cli
+"#;
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
+        let args = serde_json::json!({
+            "template": "svc",
+            "directory": home.display().to_string(),
+        });
+        let _ = deploy(&home, "caller", &args);
+
+        let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+        let team = fleet.teams.get("svc").expect("team 'svc' must exist");
+        assert_eq!(
+            team.source_repo.as_ref().map(|p| p.display().to_string()),
+            Some("/repos/team-project".to_string()),
+            "template source_repo must propagate to team"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }
