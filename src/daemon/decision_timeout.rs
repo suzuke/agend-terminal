@@ -292,11 +292,15 @@ fn emit_timeout_event(home: &Path, d: &PendingDecision, elapsed_secs: i64) {
         default_action = d.default_action,
     );
     let recipient = timeout_recipient();
-    let msg =
-        crate::inbox::InboxMessage::new_system("system:decision_timeout", "decision_timeout", text)
-            .with_delivery_mode("inbox_fallback")
-            .with_correlation_id(d.decision_id.clone());
-    if let Err(e) = crate::inbox::enqueue_with_idle_hint(home, &recipient, msg) {
+    if let Err(e) = crate::inbox::notify_system(
+        home,
+        &recipient,
+        "system:decision_timeout",
+        "decision_timeout",
+        text,
+        Some(&d.decision_id),
+        None,
+    ) {
         tracing::warn!(error = %e, recipient, "decision_timeout: enqueue failed");
     }
 }

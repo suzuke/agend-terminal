@@ -575,12 +575,16 @@ fn emit_idle_alert(
     text: &str,
     correlation_agent: Option<&str>,
 ) {
-    let mut msg = crate::inbox::InboxMessage::new_system(format!("system:{kind}"), kind, text)
-        .with_delivery_mode("inbox_fallback");
-    if let Some(agent) = correlation_agent {
-        msg = msg.with_correlation_id(agent);
-    }
-    if let Err(e) = crate::inbox::enqueue_with_idle_hint(home, recipient, msg) {
+    let source = format!("system:{kind}");
+    if let Err(e) = crate::inbox::notify_system(
+        home,
+        recipient,
+        &source,
+        kind,
+        text,
+        correlation_agent,
+        None,
+    ) {
         tracing::warn!(error = %e, recipient, kind, "idle_watchdog: enqueue failed");
     } else {
         tracing::info!(recipient, kind, "idle_watchdog: emitted inbox alert");

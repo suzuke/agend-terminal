@@ -176,15 +176,15 @@ fn emit_stall(home: &Path, task: &Task, reason: &str) {
         assignee = task.assignee.as_deref().unwrap_or("?"),
     );
     for recipient in stall_recipients() {
-        let mut msg = crate::inbox::InboxMessage::new_system(
+        if let Err(e) = crate::inbox::notify_system(
+            home,
+            &recipient,
             "system:anti_stall",
             "task_stalled",
             text.clone(),
-        )
-        .with_delivery_mode("inbox_fallback")
-        .with_correlation_id(task.id.clone());
-        msg.task_id = Some(task.id.clone());
-        if let Err(e) = crate::inbox::enqueue_with_idle_hint(home, &recipient, msg) {
+            Some(&task.id),
+            Some(&task.id),
+        ) {
             tracing::warn!(
                 error = %e,
                 recipient = %recipient,

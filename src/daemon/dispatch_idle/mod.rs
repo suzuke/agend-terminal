@@ -530,15 +530,15 @@ fn emit_exceeded_event(home: &Path, d: &PendingDispatch, elapsed_secs: i64) {
         .correlation_id
         .clone()
         .unwrap_or_else(|| d.dispatch_id.clone());
-    let mut msg = crate::inbox::InboxMessage::new_system(
+    if let Err(e) = crate::inbox::notify_system(
+        home,
+        &d.dispatcher,
         "system:dispatch_idle",
         "dispatch_idle_threshold_exceeded",
         text,
-    )
-    .with_delivery_mode("inbox_fallback")
-    .with_correlation_id(corr);
-    msg.task_id = d.correlation_id.clone();
-    if let Err(e) = crate::inbox::enqueue_with_idle_hint(home, &d.dispatcher, msg) {
+        Some(&corr),
+        d.correlation_id.as_deref(),
+    ) {
         tracing::warn!(
             error = %e,
             dispatcher = %d.dispatcher,

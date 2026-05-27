@@ -113,15 +113,15 @@ fn emit_nudge(home: &Path, d: &PendingDispatch) -> bool {
         .correlation_id
         .clone()
         .unwrap_or_else(|| d.dispatch_id.clone());
-    let mut msg = crate::inbox::InboxMessage::new_system(
+    match crate::inbox::notify_system(
+        home,
+        &d.target,
         "system:fixup-watchdog",
         "dispatch_idle_nudge",
         text,
-    )
-    .with_delivery_mode("inbox_fallback")
-    .with_correlation_id(corr);
-    msg.task_id = d.correlation_id.clone();
-    match crate::inbox::enqueue_with_idle_hint(home, &d.target, msg) {
+        Some(&corr),
+        d.correlation_id.as_deref(),
+    ) {
         Ok(()) => true,
         Err(e) => {
             tracing::warn!(
