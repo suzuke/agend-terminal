@@ -925,6 +925,99 @@ back to sleep tuning.
 
 ---
 
+## Cross-Cutting: Daemon Notification & State Helpers
+
+### `notify_system` helper (#1335)
+
+Daemon modules that emit inbox notifications (watchdogs, timeouts, idle
+detectors) previously duplicated ~8 lines of `InboxMessage::new_system` +
+builder chain + `enqueue_with_idle_hint`. The `notify_system()` helper
+collapses this to a single call:
+
+```rust
+crate::inbox::notify_system(
+    home,
+    target,          // recipient agent name
+    "system:source", // source identifier
+    "event-kind",    // inbox message kind
+    body,            // message body (impl Into<String>)
+    correlation_id,  // Option<&str>
+    task_id,         // Option<&str>
+);
+```
+
+All `notify_system` messages use `delivery_mode("inbox_fallback")`. Modules
+that need different delivery modes (e.g. `cron_tick`, `daemon/mod.rs`
+schedule/query) should continue using `InboxMessage` directly.
+
+### Event bus (#1336)
+
+Feature-flagged global event bus for decoupled daemon-internal signaling.
+
+**Enable**: `AGEND_EVENT_BUS=1` environment variable.
+
+**Usage**:
+
+```rust
+// Zero-cost when disabled — closure never called.
+event_bus::emit_lazy("pr_state.merged", || {
+    json!({ "repo": repo, "branch": branch })
+});
+
+// Guard for callers that build expensive payloads.
+if event_bus::is_enabled() {
+    let payload = expensive_computation();
+    event_bus::emit("custom.event", payload);
+}
+```
+
+When disabled (default), `emit_lazy` returns immediately without allocating
+or evaluating the closure. `is_enabled()` is a single `AtomicBool` load.
+
+### `with_pr_state` flock helper (#1342)
+
+All mutations to `pr-state/*.json` files must go through `with_pr_state()`
+or `with_pr_state_or_create()`. These helpers:
+
+1. Acquire an `fs4` file lock on `<filename>.lock`
+2. Read + deserialize the current `PrState`
+3. Run the caller's mutation closure
+4. Serialize + `atomic_write` the result
+
+```rust
+// Mutate existing state (returns None if file doesn't exist).
+let result = with_pr_state(home, repo, branch, |state| {
+    state.ready_emitted_for_sha = Some(state.head_sha.clone());
+    ScanAction::Saved
+});
+
+// Create if absent (uses default_fn for initial state).
+with_pr_state_or_create(home, repo, branch, default_fn, |state| {
+    state.ci_results.push(result);
+});
+```
+
+This eliminates the lost-update race where concurrent writers (scanner tick
++ gh-poll) could overwrite each other's changes. The lock file is separate
+from the data file to avoid holding a lock on a file being atomically
+replaced.
+
+### Auto-release worktree on pr-merged (#1344)
+
+When the scanner detects `MergeState::Merged`, it calls
+`auto_release_for_merged_branch(home, &state.branch)` **before** emitting
+the `[pr-merged]` inbox notification. This function:
+
+1. Scans `runtime/<agent>/binding.json` for agents bound to the branch
+2. Acquires the binding lock
+3. Checks `is_worktree_clean` (dirty worktrees are skipped with a warning)
+4. Calls `release_full` to remove the worktree + clear the binding
+
+This ensures `gh pr merge --delete-branch` succeeds because no local
+worktree holds the branch ref.
+
+---
+
 ## Data Flow Summary
 
 ### User sends message via Telegram

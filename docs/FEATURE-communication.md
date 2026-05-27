@@ -225,6 +225,15 @@ When the daemon API call fails:
 
 Regardless of mode, messages are never lost. The inbox uses append-only JSONL format with file locking to ensure safe concurrent writes.
 
+### Idempotent Retry (#1341)
+
+All three MCP→daemon `api::call` sites (`send`, `delegate_task`,
+`report_result`) include a UUIDv4 `request_id` in the JSON envelope. The
+daemon's `request_dedup::DedupCache` uses this to deduplicate retries: if
+the same `request_id` arrives while the first call is still processing (or
+has already completed), the duplicate is suppressed or returns the cached
+result. Without `request_id`, the legacy at-least-once path applies.
+
 ---
 
 ## Inbox Operations

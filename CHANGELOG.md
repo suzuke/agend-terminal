@@ -7,6 +7,16 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 ### Added
 
+- **`notify_system` helper (#1335)** — `crate::inbox::notify_system()` encapsulates the common daemon notification pattern (`InboxMessage::new_system` + builder chain + `enqueue_with_idle_hint`). Seven daemon modules migrated: `anti_stall`, `decision_timeout`, `dispatch_idle`, `fixup_nudge`, `helper_staleness_watchdog`, `idle_watchdog`, `waiting_on_stale`. Reduces boilerplate from ~8 lines to 1 per notification site.
+- **Event bus (#1336)** — Global event bus behind feature flag `AGEND_EVENT_BUS=1`. `event_bus::emit_lazy(kind, || payload)` defers serialization when disabled; `event_bus::is_enabled()` allows callers to skip payload construction entirely. Zero-cost disabled path (no allocation, no serialization). In-memory broadcast channel with configurable capacity.
+- **`with_pr_state` flock helper (#1342)** — `pr_state::with_pr_state()` and `with_pr_state_or_create()` serialize all read-modify-write operations on `pr-state/*.json` files via `fs4` file locks. Eliminates the lost-update race where gh-poll save overwrites scanner's `ready_emitted_for_sha` flag, causing duplicate `[pr-merged]` notifications. All 6 production `save()` call sites migrated.
+- **Auto-release worktree on pr-merged (#1344)** — Scanner's `MergeState::Merged` branch now calls `auto_release_for_merged_branch()` before emitting `[pr-merged]`. Prevents `gh pr merge --delete-branch` failure when a dev's worktree still holds the local branch. Manual `release_worktree` step removed from the action checklist.
+
+### Changed
+
+- **`request_id` propagation in comms.rs (#1341)** — All three `api::call` sites in `comms.rs` (`handle_send_to_instance`, `handle_delegate_task`, `handle_report_result`) now include a UUIDv4 `request_id` in the JSON envelope, enabling the daemon's `request_dedup::DedupCache` to deduplicate retries on the MCP→daemon path.
+- **`dispatch_idle` flock (#1340)** — `mark_resolved` and `scan_and_emit` in `dispatch_idle` now use flock serialization to prevent race conditions between concurrent resolution and scan operations.
+
 - **`agy` backend (#987)** — Google Antigravity CLI as a sixth first-class backend alongside claude / kiro-cli / codex / opencode / gemini. Mirror-pattern addition: `Backend::Agy` variant + `configure_agy` writes `<workdir>/.antigravitycli/mcp_config.json` with the standard `mcpServers` stdio schema (`agend-mcp-bridge` unchanged). Resume via `agy --continue`. Calibrated against `tests/fixtures/state-replay/agy-thinking.raw` (agy 1.0.0 on macOS 14.5). Motivated by Gemini CLI sunset 2026-06-18; existing `gemini` backend retained for paid Code Assist Standard/Enterprise license holders. Operator note: AGY shares OAuth state with the Antigravity desktop app per OS user; multi-instance agents under the same `$HOME` share auth state (same convention as existing `gemini` backend — no daemon intercept).
 
 ### Changed (#994)
