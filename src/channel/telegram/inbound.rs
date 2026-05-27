@@ -252,7 +252,7 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
         use crate::channel::event::AttachmentKind;
         if let Some(sizes) = msg.photo() {
             sizes.last().map(|p| InboundFile {
-                file_id: p.file.id.as_str(),
+                file_id: p.file.id.0.as_str(),
                 kind: AttachmentKind::Photo,
                 mime: None,
                 size: Some(p.file.size as u64),
@@ -260,7 +260,7 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
             })
         } else if let Some(doc) = msg.document() {
             Some(InboundFile {
-                file_id: doc.file.id.as_str(),
+                file_id: doc.file.id.0.as_str(),
                 kind: AttachmentKind::Document,
                 mime: doc.mime_type.as_ref().map(|m| m.to_string()),
                 size: Some(doc.file.size as u64),
@@ -268,7 +268,7 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
             })
         } else if let Some(voice) = msg.voice() {
             Some(InboundFile {
-                file_id: voice.file.id.as_str(),
+                file_id: voice.file.id.0.as_str(),
                 kind: AttachmentKind::Voice,
                 mime: voice.mime_type.as_ref().map(|m| m.to_string()),
                 size: Some(voice.file.size as u64),
@@ -276,7 +276,7 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
             })
         } else if let Some(video) = msg.video() {
             Some(InboundFile {
-                file_id: video.file.id.as_str(),
+                file_id: video.file.id.0.as_str(),
                 kind: AttachmentKind::Video,
                 mime: video.mime_type.as_ref().map(|m| m.to_string()),
                 size: Some(video.file.size as u64),
@@ -284,7 +284,7 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
             })
         } else {
             msg.sticker().map(|sticker| InboundFile {
-                file_id: sticker.file.id.as_str(),
+                file_id: sticker.file.id.0.as_str(),
                 kind: AttachmentKind::Sticker,
                 mime: None,
                 size: Some(sticker.file.size as u64),

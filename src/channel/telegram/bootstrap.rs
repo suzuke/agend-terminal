@@ -187,10 +187,7 @@ pub(super) fn resolve_fleet_binding(
 
     // Slow path: create the forum topic once and pin it into the registry.
     tracing::info!(%name, "creating fleet_binding topic");
-    match telegram_runtime().block_on(async {
-        bot.create_forum_topic(chat_id, &name, teloxide::types::Rgb::from_u32(0x6FB9F0), "")
-            .await
-    }) {
+    match telegram_runtime().block_on(async { bot.create_forum_topic(chat_id, &name).await }) {
         Ok(topic) => {
             let tid = topic.thread_id.0 .0;
             tracing::info!(topic_id = tid, %name, "created fleet_binding topic");

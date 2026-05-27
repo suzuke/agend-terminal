@@ -104,7 +104,9 @@ pub(super) async fn download_file_async(
 ) -> anyhow::Result<String> {
     use teloxide::net::Download;
     use teloxide::prelude::Requester;
-    let file = bot.get_file(file_id).await?;
+    let file = bot
+        .get_file(teloxide::types::FileId(file_id.to_string()))
+        .await?;
     let download_dir = home.join("downloads").join(instance_name);
     std::fs::create_dir_all(&download_dir)?;
     let filename = std::path::Path::new(&file.path)

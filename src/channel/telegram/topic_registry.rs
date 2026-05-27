@@ -75,12 +75,7 @@ pub fn create_topic_for_instance(home: &std::path::Path, instance_name: &str) ->
     match telegram_runtime().block_on(async {
         let bot = teloxide::Bot::new(&ch.token);
         let topic = bot
-            .create_forum_topic(
-                teloxide::types::ChatId(ch.group_id),
-                instance_name,
-                teloxide::types::Rgb::from_u32(0x6FB9F0),
-                "",
-            )
+            .create_forum_topic(teloxide::types::ChatId(ch.group_id), instance_name)
             .await?;
         Ok::<i32, anyhow::Error>(topic.thread_id.0 .0)
     }) {
