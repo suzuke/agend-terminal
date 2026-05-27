@@ -83,7 +83,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 serde_yaml_ng = "0.10"
 
 # Telegram — rustls backend avoids macOS SecureTransport/Keychain/OCSP flakiness
-teloxide = { version = "0.15", default-features = false, features = ["macros", "ctrlc_handler", "rustls"] }
+teloxide = { version = "0.17", default-features = false, features = ["macros", "ctrlc_handler", "rustls"] }
 
 # Utilities
 async-trait = "0.1"
