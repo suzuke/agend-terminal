@@ -1167,10 +1167,9 @@ fn mock_stale_sha_drops_notification_but_advances_tracker() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// Issue #745 follow-up: stale drops must produce an observable `[ci-stale]`
-/// inbox message so operators can audit which runs were superseded.
+/// Stale SHA runs are silently dropped — no inbox message, only daemon.log.
 #[test]
-fn mock_stale_sha_emits_ci_stale_inbox_message() {
+fn mock_stale_sha_does_not_emit_inbox_message() {
     let dir = tmp_dir("mock-stale-sha-inbox");
     let provider = MockCiProvider::with_runs(vec![
         CiRun {
@@ -1191,19 +1190,13 @@ fn mock_stale_sha_emits_ci_stale_inbox_message() {
     run_ci_check(&dir, &base_watch(), &provider).unwrap();
 
     let inbox_path = dir.join("inbox").join("agent1.jsonl");
-    assert!(
-        inbox_path.exists(),
-        "inbox file must exist after stale drop"
-    );
-    let content = std::fs::read_to_string(&inbox_path).unwrap();
-    assert!(
-        content.contains("[ci-stale]"),
-        "inbox must contain [ci-stale] kind: {content}"
-    );
-    assert!(
-        content.contains("oldhead"),
-        "ci-stale message must reference the stale sha: {content}"
-    );
+    if inbox_path.exists() {
+        let content = std::fs::read_to_string(&inbox_path).unwrap();
+        assert!(
+            !content.contains("[ci-stale]"),
+            "inbox must NOT contain [ci-stale]: {content}"
+        );
+    }
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -2560,37 +2553,6 @@ fn ci_conflict_alert_hint_format_deterministic() {
     assert!(
         hint.contains("from=system:ci"),
         "conflict hint must carry from=system:ci for routing; got: {hint}"
-    );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// #1032 T2: `make_ci_stale_drop_msg` mirrors T1's invariant for
-/// the stale-SHA drop path (#745, site 940). GREEN at site 980
-/// wires this helper through `enqueue_with_idle_hint`.
-#[test]
-fn ci_stale_drop_hint_format_deterministic() {
-    let dir = tmp_dir("1032-t2-stale-hint");
-    std::fs::create_dir_all(&dir).unwrap();
-    let msg = super::make_ci_stale_drop_msg("o/r", "feat", "oldhead", "newhead");
-    assert_eq!(msg.kind.as_deref(), Some("ci-stale"));
-    assert!(msg.text.contains("[ci-stale]"));
-    assert!(msg.text.contains("oldhead"));
-    assert!(msg.text.contains("newhead"));
-    let captured: std::sync::Arc<parking_lot::Mutex<Option<String>>> =
-        std::sync::Arc::new(parking_lot::Mutex::new(None));
-    let cap = captured.clone();
-    crate::inbox::enqueue_with_idle_hint_with_emitter(&dir, "agent1", msg, move |hint| {
-        *cap.lock() = Some(hint.to_string());
-    })
-    .unwrap();
-    let hint = captured.lock().clone().expect("emitter must fire once");
-    assert!(
-        hint.contains("kind=ci-stale"),
-        "stale-drop hint must carry kind=ci-stale; got: {hint}"
-    );
-    assert!(
-        hint.contains("from=system:ci"),
-        "stale-drop hint must carry from=system:ci; got: {hint}"
     );
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -4490,11 +4452,8 @@ fn ci_pass_inbox_message_carries_repo_branch_correlation_id() {
 }
 
 #[test]
-fn ci_stale_inbox_message_carries_repo_branch_correlation_id() {
+fn ci_stale_sha_does_not_emit_inbox_message_with_correlation_id() {
     let dir = tmp_dir("946-ci-stale-corr");
-    // Two-run setup mirrors `mock_stale_sha_emits_ci_stale_inbox_message`
-    // — old-head run completes after new commit pushed; old run's
-    // notification is dropped + emits [ci-stale].
     let provider = MockCiProvider::with_runs(vec![
         CiRun {
             id: 301,
@@ -4513,16 +4472,13 @@ fn ci_stale_inbox_message_carries_repo_branch_correlation_id() {
     ]);
     run_ci_check(&dir, &base_watch(), &provider).unwrap();
     let inbox_path = dir.join("inbox").join("agent1.jsonl");
-    let content = std::fs::read_to_string(&inbox_path).unwrap();
-    assert!(
-        content.contains("[ci-stale]"),
-        "expected [ci-stale] inbox message: {content}"
-    );
-    let expected = r#""correlation_id":"o/r@feat""#;
-    assert!(
-        content.contains(expected),
-        "ci-stale message must carry correlation_id={expected}: {content}"
-    );
+    if inbox_path.exists() {
+        let content = std::fs::read_to_string(&inbox_path).unwrap();
+        assert!(
+            !content.contains("[ci-stale]"),
+            "ci-stale must NOT appear in inbox: {content}"
+        );
+    }
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -4548,7 +4504,7 @@ fn ci_conflict_alert_inbox_message_carries_repo_branch_correlation_id() {
 // ── #1026 ci-stale debounce tests ─────────────────────────────
 
 #[test]
-fn ci_stale_debounce_suppresses_repeat_for_same_sha() {
+fn ci_stale_debounce_persists_sha_without_inbox() {
     let dir = tmp_dir("1026-debounce");
     let provider = MockCiProvider::with_runs(vec![
         CiRun {
@@ -4566,14 +4522,9 @@ fn ci_stale_debounce_suppresses_repeat_for_same_sha() {
             name: String::new(),
         },
     ]);
-    // First poll: ci-stale fires for oldhead.
     run_ci_check(&dir, &base_watch(), &provider).unwrap();
-    let inbox_path = dir.join("inbox").join("agent1.jsonl");
-    let first = std::fs::read_to_string(&inbox_path).unwrap();
-    let first_count = first.matches("[ci-stale]").count();
-    assert_eq!(first_count, 1, "first poll emits exactly 1 ci-stale");
 
-    // Read persisted watch to get updated state for second poll.
+    // Stale debounce SHA must still be persisted even without inbox delivery.
     let ci_dir = dir.join("ci-watches");
     let watch_path = ci_dir.join(watch_filename("o/r", "feat"));
     let watch: serde_json::Value =
@@ -4584,36 +4535,20 @@ fn ci_stale_debounce_suppresses_repeat_for_same_sha() {
         "stale debounce SHA must be persisted"
     );
 
-    // Second poll: same stale SHA with different conclusion → suppressed.
-    let provider2 = MockCiProvider::with_runs(vec![
-        CiRun {
-            id: 301,
-            conclusion: None,
-            head_sha: "newhead".into(),
-            url: "https://example.com/301".into(),
-            name: String::new(),
-        },
-        CiRun {
-            id: 302,
-            conclusion: Some("failure".into()),
-            head_sha: "oldhead".into(),
-            url: "https://example.com/302".into(),
-            name: String::new(),
-        },
-    ]);
-    // Pass the persisted watch state (including last_stale_emitted_sha).
-    run_ci_check(&dir, &watch, &provider2).unwrap();
-    let second = std::fs::read_to_string(&inbox_path).unwrap();
-    let second_count = second.matches("[ci-stale]").count();
-    assert_eq!(
-        second_count, first_count,
-        "second poll must NOT emit another ci-stale (debounced): {second}"
-    );
+    // No ci-stale in inbox.
+    let inbox_path = dir.join("inbox").join("agent1.jsonl");
+    if inbox_path.exists() {
+        let content = std::fs::read_to_string(&inbox_path).unwrap();
+        assert!(
+            !content.contains("[ci-stale]"),
+            "ci-stale must NOT appear in inbox: {content}"
+        );
+    }
     std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
-fn ci_stale_debounce_allows_new_stale_sha() {
+fn ci_stale_debounce_updates_sha_for_new_stale() {
     let dir = tmp_dir("1026-new-stale");
     // First poll: SHA-A is stale.
     let provider = MockCiProvider::with_runs(vec![
@@ -4633,17 +4568,14 @@ fn ci_stale_debounce_allows_new_stale_sha() {
         },
     ]);
     run_ci_check(&dir, &base_watch(), &provider).unwrap();
-    let inbox_path = dir.join("inbox").join("agent1.jsonl");
-    let first = std::fs::read_to_string(&inbox_path).unwrap();
-    assert_eq!(first.matches("[ci-stale]").count(), 1);
 
-    // Get persisted watch state.
     let ci_dir = dir.join("ci-watches");
     let watch_path = ci_dir.join(watch_filename("o/r", "feat"));
     let watch: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();
+    assert_eq!(watch["last_stale_emitted_sha"].as_str(), Some("sha-a"));
 
-    // Second poll: SHA-B is stale (different from SHA-A) → should fire.
+    // Second poll: SHA-B is stale (different from SHA-A) → debounce SHA updates.
     let provider2 = MockCiProvider::with_runs(vec![
         CiRun {
             id: 501,
@@ -4661,12 +4593,23 @@ fn ci_stale_debounce_allows_new_stale_sha() {
         },
     ]);
     run_ci_check(&dir, &watch, &provider2).unwrap();
-    let second = std::fs::read_to_string(&inbox_path).unwrap();
+    let watch2: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();
     assert_eq!(
-        second.matches("[ci-stale]").count(),
-        2,
-        "different stale SHA must NOT be suppressed: {second}"
+        watch2["last_stale_emitted_sha"].as_str(),
+        Some("sha-b"),
+        "debounce SHA must update to the new stale SHA"
     );
+
+    // No ci-stale in inbox from either poll.
+    let inbox_path = dir.join("inbox").join("agent1.jsonl");
+    if inbox_path.exists() {
+        let content = std::fs::read_to_string(&inbox_path).unwrap();
+        assert!(
+            !content.contains("[ci-stale]"),
+            "ci-stale must NOT appear in inbox: {content}"
+        );
+    }
     std::fs::remove_dir_all(&dir).ok();
 }
 

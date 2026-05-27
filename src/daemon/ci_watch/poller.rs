@@ -631,24 +631,6 @@ pub(crate) fn make_ci_conflict_alert_msg(
         .with_correlation_id(format!("{repo}@{branch}"))
 }
 
-/// Build the `[ci-stale]` inbox message emitted when a CI run's head
-/// SHA is no longer the branch's current head (#745 stale-SHA drop,
-/// migrated to wake-aware path in #1032).
-pub(crate) fn make_ci_stale_drop_msg(
-    repo: &str,
-    branch: &str,
-    stale_sha: &str,
-    current_sha: &str,
-) -> crate::inbox::InboxMessage {
-    crate::inbox::InboxMessage::new_system(
-        "system:ci",
-        "ci-stale",
-        format!("[ci-stale] {repo}@{branch} ({stale_sha}): superseded by {current_sha}"),
-    )
-    // #946: see emit_ci_conflict_alert for rationale.
-    .with_correlation_id(format!("{repo}@{branch}"))
-}
-
 /// Build the `[ci-ready-for-action]` inbox message handed to the
 /// `next_after_ci` chain target on CI pass (#1030). Single construction
 /// site so the production emit and the deterministic-hint test (T4)
@@ -1053,13 +1035,6 @@ async fn fan_out_notifications(
                 current_sha = %pr.current_sha,
                 "dropping stale CI notification (newer commit on branch)"
             );
-            for sub in ctx.subscribers {
-                let _ = crate::inbox::enqueue_with_idle_hint(
-                    ctx.home,
-                    sub,
-                    make_ci_stale_drop_msg(ctx.repo, ctx.branch, sha, &pr.current_sha),
-                );
-            }
             new_notified_sha = Some(sha.to_string());
             new_notified_conclusion = conclusion.map(String::from);
             new_stale_emitted_sha = Some(sha.to_string());
