@@ -629,6 +629,14 @@ pub fn record_ci_result(
 ) {
     let mut state = load(home, repo, branch)
         .unwrap_or_else(|| new_for_branch(repo, branch, head_sha, review_class));
+    // #1314: skip CiObserved on terminal states to prevent read-modify-write
+    // race with scanner (which sets ready_emitted_for_sha after emitting).
+    if matches!(
+        state.merge_state,
+        MergeState::Merged { .. } | MergeState::ClosedUnmerged { .. }
+    ) {
+        return;
+    }
     if !subscribers.is_empty() && state.subscribers.is_empty() {
         state.subscribers = subscribers;
     }
