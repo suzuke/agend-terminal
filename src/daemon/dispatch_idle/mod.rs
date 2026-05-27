@@ -93,6 +93,10 @@ pub(crate) fn pending_path(home: &Path, dispatch_id: &str) -> PathBuf {
     pending_dir(home).join(format!("{dispatch_id}.json"))
 }
 
+fn dispatch_lock_path(home: &Path, dispatch_id: &str) -> PathBuf {
+    pending_dir(home).join(format!("{dispatch_id}.lock"))
+}
+
 /// Generate a deterministic-format dispatch id (`disp-<unix_micros>-<seq>`).
 fn next_dispatch_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -331,10 +335,18 @@ pub(crate) fn mark_resolved(home: &Path, correlation_id: &str) -> Option<String>
     let matched = list_pending(home)
         .into_iter()
         .find(|d| d.status == "pending" && d.correlation_id.as_deref() == Some(correlation_id));
-    let mut d = matched?;
-    d.status = "resolved".to_string();
+    let d = matched?;
     let id = d.dispatch_id.clone();
-    if write_dispatch(home, &d) {
+    // #1340: flock + re-read to serialize against concurrent scan_and_emit
+    let _lock = crate::store::acquire_file_lock(&dispatch_lock_path(home, &id)).ok()?;
+    let path = pending_path(home, &id);
+    let content = std::fs::read_to_string(&path).ok()?;
+    let mut current: PendingDispatch = serde_json::from_str(&content).ok()?;
+    if current.status != "pending" {
+        return None;
+    }
+    current.status = "resolved".to_string();
+    if write_dispatch(home, &current) {
         Some(id)
     } else {
         None
@@ -353,10 +365,18 @@ pub(crate) fn refresh_issued_at(home: &Path, correlation_id: &str) -> Option<Str
     let matched = list_pending(home)
         .into_iter()
         .find(|d| d.status == "pending" && d.correlation_id.as_deref() == Some(correlation_id));
-    let mut d = matched?;
-    d.issued_at = chrono::Utc::now().to_rfc3339();
+    let d = matched?;
     let id = d.dispatch_id.clone();
-    if write_dispatch(home, &d) {
+    // #1340: flock + re-read to serialize against concurrent scan_and_emit
+    let _lock = crate::store::acquire_file_lock(&dispatch_lock_path(home, &id)).ok()?;
+    let path = pending_path(home, &id);
+    let content = std::fs::read_to_string(&path).ok()?;
+    let mut current: PendingDispatch = serde_json::from_str(&content).ok()?;
+    if current.status != "pending" {
+        return None;
+    }
+    current.issued_at = chrono::Utc::now().to_rfc3339();
+    if write_dispatch(home, &current) {
         Some(id)
     } else {
         None
@@ -436,7 +456,7 @@ pub(crate) fn pending_for_instance(
 /// the inbox event to the dispatcher. Exposed `pub(crate)` for tests.
 pub(crate) fn scan_and_emit(home: &Path) {
     let now = chrono::Utc::now();
-    for mut d in list_pending(home) {
+    for d in list_pending(home) {
         if d.status != "pending" {
             continue;
         }
@@ -468,9 +488,28 @@ pub(crate) fn scan_and_emit(home: &Path) {
             continue;
         }
 
-        emit_exceeded_event(home, &d, elapsed_secs);
-        d.status = "exceeded".to_string();
-        if !write_dispatch(home, &d) {
+        // #1340: flock + re-read to serialize against concurrent mark_resolved
+        let _lock = match crate::store::acquire_file_lock(&dispatch_lock_path(home, &d.dispatch_id))
+        {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        let path = pending_path(home, &d.dispatch_id);
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let mut current: PendingDispatch = match serde_json::from_str(&content) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        if current.status != "pending" {
+            continue;
+        }
+
+        emit_exceeded_event(home, &current, elapsed_secs);
+        current.status = "exceeded".to_string();
+        if !write_dispatch(home, &current) {
             tracing::warn!(dispatch_id = %d.dispatch_id, "dispatch-idle exceeded status write failed");
         }
     }
