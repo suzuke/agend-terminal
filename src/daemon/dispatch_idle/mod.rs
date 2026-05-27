@@ -509,7 +509,12 @@ fn emit_exceeded_event(home: &Path, d: &PendingDispatch, elapsed_secs: i64) {
     let text = format!(
         "[dispatch_idle_threshold_exceeded] dispatch {dispatch_id} from '{dispatcher}' → '{target}' \
          (kind={expected_kind}, correlation_id={corr}) idle for {elapsed_secs}s \
-         (threshold {threshold_secs}s, exceeded by {overshoot}s).",
+         (threshold {threshold_secs}s, exceeded by {overshoot}s).\n\n\
+         Action checklist:\n\
+         1. Check target agent's pane — is it stuck or just slow?\n\
+         2. If stuck → force release worktree + redispatch\n\
+         3. If slow but progressing → extend patience\n\
+         4. If crashed → restart agent, reassign task",
         dispatch_id = d.dispatch_id,
         dispatcher = d.dispatcher,
         target = d.target,

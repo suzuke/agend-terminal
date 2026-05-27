@@ -169,6 +169,11 @@ fn build_stalled_body(
     if let Some(w) = setup_warning {
         s.push_str(&format!("\nSetup hint: {w}"));
     }
+    s.push_str(
+        "\n\nPolling paused due to rate-limit backoff (\u{2265}3 consecutive skips).\n\
+         Will auto-resume when rate-limit window expires.\n\
+         Action: no immediate action needed. If stalled >30min, check githubstatus.com and escalate to operator.",
+    );
     s
 }
 
