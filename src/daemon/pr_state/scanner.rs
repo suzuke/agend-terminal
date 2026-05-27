@@ -107,11 +107,17 @@ pub fn scan_and_emit_with(
                 if !already_emitted {
                     let author = resolve_author(&state);
                     let body = format!(
-                        "[pr-merged] {}@{} (merge_commit {}, merged_at {})",
+                        "[pr-merged] {}@{} (merge_commit {}, merged_at {})\n\n\
+                         ⚠ Action checklist:\n\
+                         1. `release_worktree` for branch `{}`\n\
+                         2. `gh issue close` (if linked issue)\n\
+                         3. `task action=done` (if correlation_id present)\n\
+                         4. Report completion to lead",
                         state.repo,
                         state.branch,
                         &merge_commit[..8.min(merge_commit.len())],
                         merged_at,
+                        state.branch,
                     );
                     let _ = crate::inbox::enqueue_with_idle_hint(
                         home,
@@ -138,8 +144,12 @@ pub fn scan_and_emit_with(
                 if !already_emitted {
                     let author = resolve_author(&state);
                     let body = format!(
-                        "[pr-closed-unmerged] {}@{} (closed_at {})",
-                        state.repo, state.branch, closed_at
+                        "[pr-closed-unmerged] {}@{} (closed_at {})\n\n\
+                         ⚠ Action checklist:\n\
+                         1. `release_worktree` for branch `{}`\n\
+                         2. Investigate closure reason (operator decision? superseded?)\n\
+                         3. Report to lead with context",
+                        state.repo, state.branch, closed_at, state.branch,
                     );
                     let _ = crate::inbox::enqueue_with_idle_hint(
                         home,

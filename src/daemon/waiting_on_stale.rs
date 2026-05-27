@@ -94,7 +94,13 @@ pub(crate) fn scan_and_emit(
 }
 
 fn emit_stale_alert(home: &Path, agent: &str, condition: &str, elapsed_min: i64) {
-    let text = format!("[waiting_on_stale] {agent}: waiting on \"{condition}\" for {elapsed_min}m");
+    let text = format!(
+        "[waiting_on_stale] {agent}: waiting on \"{condition}\" for {elapsed_min}m\n\n\
+         ⚠ Action checklist:\n\
+         1. Re-evaluate if blocker is resolved\n\
+         2. If resolved → clear waiting_on, resume work\n\
+         3. If still blocked → escalate to lead with status update"
+    );
     // Alert the agent itself
     emit_to(home, agent, "waiting_on_stale", &text, Some(agent));
     // Alert team orchestrator (if any)
