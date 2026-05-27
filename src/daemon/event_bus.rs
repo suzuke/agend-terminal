@@ -79,6 +79,10 @@ impl EventBus {
         }
     }
 
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
     pub fn subscribe(&self, f: impl Fn(&Event) + Send + Sync + 'static) {
         self.subscribers.lock().push(Arc::new(f));
     }
@@ -93,6 +97,13 @@ impl EventBus {
             sub(&event);
         }
         tracing::debug!(kind = ?event.kind, "event_bus: emitted");
+    }
+
+    pub fn emit_lazy(&self, f: impl FnOnce() -> EventKind) {
+        if !self.enabled {
+            return;
+        }
+        self.emit(f());
     }
 }
 
