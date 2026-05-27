@@ -100,6 +100,8 @@ pub enum Stage {
     /// Source repo resolution fell through to stub (tier 4) while
     /// `AGEND_BIND_STRICT_MODE=1`.
     ResolveSourceRepo,
+    /// `bind_full` write failed after worktree was leased.
+    Bind,
 }
 
 /// Canonical `code` enum — stable across releases. Callers MUST match
@@ -124,6 +126,8 @@ pub enum ErrorCode {
     BindInFlight,
     /// `AGEND_BIND_STRICT_MODE=1` and source_repo resolved to stub (tier 4).
     StubRejected,
+    /// `bind_full` failed — worktree was rolled back.
+    BindFailed,
 }
 
 /// Sprint 55 P0-B EC11: per-agent in-flight guard scoped to the daemon's
@@ -463,6 +467,16 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
                 .env("AGEND_GIT_BYPASS", "1")
                 .current_dir(&source_repo)
                 .output();
+            // #1324: surface rollback as dispatch error instead of silent success
+            return Err(DispatchError {
+                message: format!(
+                    "bind_full failed for {target}@{branch}, worktree rolled back: {e}"
+                ),
+                code: ErrorCode::BindFailed,
+                stage: Stage::Bind,
+                fetch_attempted,
+                raw: Some(e),
+            });
         }
     }
 

@@ -210,13 +210,11 @@ fn bind_file_error_rolls_back_worktree() {
     let runtime_agent = runtime_parent.join("test-agent");
     std::fs::write(&runtime_agent, "blocking file").ok();
 
-    // Lease succeeds but bind_full fails → worktree rolled back.
+    // Lease succeeds but bind_full fails → error returned + worktree rolled back.
     let result = super::dispatch_auto_bind_lease(&home, "test-agent", "T-1", "feat/graceful", None);
-    assert!(
-        result.is_ok(),
-        "dispatch_auto_bind_lease must not propagate bind error: {:?}",
-        result.err()
-    );
+    let err = result.expect_err("dispatch must return Err when bind_full fails (#1324)");
+    assert_eq!(err.code, super::ErrorCode::BindFailed);
+    assert_eq!(err.stage, super::Stage::Bind);
 
     // #1310: worktree should NOT exist after rollback.
     let wt = home
