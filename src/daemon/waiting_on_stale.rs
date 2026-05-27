@@ -114,12 +114,16 @@ fn emit_stale_alert(home: &Path, agent: &str, condition: &str, elapsed_min: i64)
 }
 
 fn emit_to(home: &Path, recipient: &str, kind: &str, text: &str, correlation_agent: Option<&str>) {
-    let mut msg = crate::inbox::InboxMessage::new_system(format!("system:{kind}"), kind, text)
-        .with_delivery_mode("inbox_fallback");
-    if let Some(agent) = correlation_agent {
-        msg = msg.with_correlation_id(agent);
-    }
-    if let Err(e) = crate::inbox::enqueue_with_idle_hint(home, recipient, msg) {
+    let source = format!("system:{kind}");
+    if let Err(e) = crate::inbox::notify_system(
+        home,
+        recipient,
+        &source,
+        kind,
+        text,
+        correlation_agent,
+        None,
+    ) {
         tracing::warn!(error = %e, recipient, kind, "waiting_on_stale: enqueue failed");
     } else {
         tracing::info!(

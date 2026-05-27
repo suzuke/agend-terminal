@@ -119,14 +119,15 @@ fn emit_staleness_alert(home: &Path, helper_name: &str) {
          `agend-terminal doctor` reports the same state.)"
     );
     for recipient in RECIPIENTS {
-        let msg = crate::inbox::InboxMessage::new_system(
+        if let Err(e) = crate::inbox::notify_system(
+            home,
+            recipient,
             "system:helper_staleness_watchdog",
             "helper_staleness_watchdog",
             text.clone(),
-        )
-        .with_delivery_mode("inbox_fallback")
-        .with_correlation_id(helper_name);
-        if let Err(e) = crate::inbox::enqueue_with_idle_hint(home, recipient, msg) {
+            Some(helper_name),
+            None,
+        ) {
             tracing::warn!(
                 error = %e,
                 recipient,

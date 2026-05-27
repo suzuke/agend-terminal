@@ -325,6 +325,28 @@ pub fn enqueue_with_idle_hint(home: &Path, target: &str, msg: InboxMessage) -> a
     })
 }
 
+/// #1335: convenience wrapper for the common daemon notification pattern:
+/// `InboxMessage::new_system` + optional `delivery_mode` / `correlation_id` /
+/// `task_id` + `enqueue_with_idle_hint`. Covers ~15 watchdog-class call sites.
+pub fn notify_system(
+    home: &Path,
+    target: &str,
+    source: &str,
+    kind: &str,
+    body: impl Into<String>,
+    correlation_id: Option<&str>,
+    task_id: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut msg = InboxMessage::new_system(source, kind, body).with_delivery_mode("inbox_fallback");
+    if let Some(cid) = correlation_id {
+        msg = msg.with_correlation_id(cid);
+    }
+    if let Some(tid) = task_id {
+        msg.task_id = Some(tid.to_owned());
+    }
+    enqueue_with_idle_hint(home, target, msg)
+}
+
 /// Test-seam variant of [`enqueue_with_idle_hint`]. Accepts a closure
 /// that receives the formatted hint string so unit tests can verify
 /// the wire format without standing up the API loopback.
