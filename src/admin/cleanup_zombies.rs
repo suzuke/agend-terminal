@@ -396,38 +396,48 @@ mod tests {
         );
     }
 
+    /// Spawn python3 with SIG_IGN installed, using a sentinel file to
+    /// synchronize — eliminates the 300ms sleep race that caused flaky
+    /// failures on macOS CI (#1303).
+    #[cfg(unix)]
+    fn spawn_sigign_with_sentinel(
+        sleep_secs: u32,
+    ) -> (u32, std::thread::JoinHandle<()>, std::path::PathBuf) {
+        let sentinel = std::env::temp_dir().join(format!(
+            "agend-sigign-sentinel-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let script = format!(
+            "import signal, time, sys; signal.signal(signal.SIGTERM, signal.SIG_IGN); \
+             open(sys.argv[1], 'w').close(); time.sleep({sleep_secs})"
+        );
+        let (pid, reaper) =
+            spawn_with_reaper("python3", &["-c", &script, sentinel.to_str().unwrap()]);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !sentinel.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "python3 did not write sentinel within 5s — interpreter startup too slow"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        (pid, reaper, sentinel)
+    }
+
     #[cfg(unix)]
     #[test]
     fn cleanup_zombie_daemon_sigterm_ignored_returns_force_killed() {
-        // Use python3 for clean SIGTERM-ignore semantics:
-        // `sh -c "trap '' TERM; ..."` is fragile on macOS where bash-
-        // as-sh and process-group SIGTERM propagation can short-
-        // circuit the trap. Python's `signal.SIG_IGN` installs a true
-        // SIG_IGN disposition that survives all signal delivery paths.
-        //
-        // python3 is universally available on macOS + Linux CI runners
-        // (the test is `#[cfg(unix)]`-gated; Windows-side coverage is
-        // separate). If a future CI image drops python3, fall back to
-        // a compiled C helper or feature-gate this test.
-        let (pid, reaper) = spawn_with_reaper(
-            "python3",
-            &[
-                "-c",
-                "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)",
-            ],
-        );
-
-        // Give python3 ~300ms to actually run `signal.signal(SIGTERM,
-        // SIG_IGN)` — without this, the SIGTERM lands during interpreter
-        // startup before the handler is installed and python's default
-        // SIGTERM disposition (terminate) kills it gracefully, which is
-        // the OPPOSITE of what this test pins.
-        std::thread::sleep(Duration::from_millis(300));
+        let (pid, reaper, sentinel) = spawn_sigign_with_sentinel(60);
 
         // 500ms SIGTERM grace (short — SIG_IGN won't release), 3s SIGKILL grace.
         let outcome =
             cleanup_zombie_daemon(pid, Duration::from_millis(500), Duration::from_secs(3));
         let _ = reaper.join();
+        let _ = std::fs::remove_file(&sentinel);
 
         assert!(
             matches!(outcome, KillOutcome::ForceKilled),
@@ -558,28 +568,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn poll_until_dead_returns_timeout_on_undying_zombie() {
-        // python3 SIG_IGN — process survives SIGTERM. We send SIGTERM
-        // (which is ignored), then poll with a short deadline. Since
-        // we DON'T escalate to SIGKILL here, the process stays alive
-        // and poll_until_dead must return false on timeout.
-        //
-        // Pattern matches `cleanup_zombie_daemon_sigterm_ignored_returns_force_killed`
-        // (line ~374) for SIG_IGN-disposition reliability across macOS +
-        // Linux. python3 is universally available on `#[cfg(unix)]`-gated
-        // CI runners.
-        let (pid, reaper) = spawn_with_reaper(
-            "python3",
-            &[
-                "-c",
-                "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)",
-            ],
-        );
-
-        // Give python3 ~300ms to install the SIG_IGN handler (otherwise
-        // SIGTERM lands during interpreter startup before the handler is
-        // in place; python's default SIGTERM disposition terminates,
-        // which would make poll_until_dead succeed prematurely).
-        std::thread::sleep(Duration::from_millis(300));
+        let (pid, reaper, sentinel) = spawn_sigign_with_sentinel(30);
 
         // Send SIGTERM — ignored by the child.
         unsafe {
@@ -596,6 +585,7 @@ mod tests {
             libc::kill(pid as i32, libc::SIGKILL);
         }
         let _ = reaper.join();
+        let _ = std::fs::remove_file(&sentinel);
 
         assert!(
             !result,
