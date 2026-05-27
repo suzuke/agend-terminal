@@ -1492,19 +1492,16 @@ fn checkout_bind_true_bind_full_failure_surfaces_warning() {
         agent,
     );
 
-    assert_eq!(
-        resp["bound"].as_bool(),
-        Some(true),
-        "lease success → bound=true must hold even with tail-op partial failure: {resp}"
-    );
-    let warnings = resp["warnings"]
-        .as_array()
-        .expect("warnings array must be present when bind_full failed");
+    // #1310: bind_full failure now triggers worktree rollback — response
+    // should be an error with code "bind_rollback", not a success with warnings.
     assert!(
-        warnings
-            .iter()
-            .any(|w| w.as_str().is_some_and(|s| s.starts_with("bind_full:"))),
-        "warnings must contain a `bind_full:` prefix entry: {resp}"
+        resp["error"].as_str().is_some(),
+        "bind_full failure must return error after rollback: {resp}"
+    );
+    assert_eq!(
+        resp["code"].as_str(),
+        Some("bind_rollback"),
+        "error code must be bind_rollback: {resp}"
     );
 
     std::fs::remove_dir_all(&home).ok();

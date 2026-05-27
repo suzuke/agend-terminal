@@ -197,8 +197,8 @@ fn same_agent_re_dispatch_idempotent() {
 }
 
 #[test]
-fn bind_file_error_stays_graceful() {
-    // Q1: bind file write error → dispatch still succeeds (graceful).
+fn bind_file_error_rolls_back_worktree() {
+    // #1310: bind file write error → worktree is rolled back (no orphan).
     // Inject error by making runtime/<agent> a regular file (not dir).
     let home = std::env::temp_dir().join(format!("agend-s53-prod-{}-graceful", std::process::id()));
     std::fs::create_dir_all(&home).ok();
@@ -210,22 +210,23 @@ fn bind_file_error_stays_graceful() {
     let runtime_agent = runtime_parent.join("test-agent");
     std::fs::write(&runtime_agent, "blocking file").ok();
 
-    // Lease should succeed, bind write should fail gracefully (Q1).
+    // Lease succeeds but bind_full fails → worktree rolled back.
     let result = super::dispatch_auto_bind_lease(&home, "test-agent", "T-1", "feat/graceful", None);
     assert!(
         result.is_ok(),
-        "Q1: bind file error stays graceful, dispatch succeeds: {:?}",
+        "dispatch_auto_bind_lease must not propagate bind error: {:?}",
         result.err()
     );
 
-    // Worktree was created (lease succeeded).
-    // Sprint 57 Wave 4 (#546 Item 4): worktrees now live at
-    // `<home>/worktrees/<agent>/<branch>/` external to source_repo.
+    // #1310: worktree should NOT exist after rollback.
     let wt = home
         .join("worktrees")
         .join("test-agent")
         .join("feat/graceful");
-    assert!(wt.exists(), "worktree must be created even if bind fails");
+    assert!(
+        !wt.exists(),
+        "worktree must be rolled back when bind fails (no orphan)"
+    );
 
     std::fs::remove_dir_all(&home).ok();
 }
