@@ -29,6 +29,15 @@ const NOTIFY_COOLDOWN: Duration = Duration::from_secs(60);
 const SERVER_RATE_LIMIT_MAX_RETRIES: u32 = 3;
 /// Backoff schedule for ServerRateLimit retries (seconds).
 const SERVER_RATE_LIMIT_BACKOFF: [u64; 3] = [5, 15, 30];
+/// Fixed payload injected on ServerRateLimit recovery retry.
+/// "continue\n" is a universal resume signal: all supported backends
+/// (ClaudeCode, KiroCli, Codex, OpenCode, Gemini, Agy) accept it as
+/// free-form user input. `inject_to_agent` appends the backend's
+/// `submit_key` ("\r" for all current backends) after this payload.
+///
+/// #1316: replaces the old `last_input_text` replay that caused
+/// infinite modal-keystroke loops.
+const CONTINUE_RETRY_PAYLOAD: &[u8] = b"continue\n";
 
 /// Per-agent notify tracking: last notify time + consecutive error count.
 pub(crate) struct NotifyTrack {
@@ -679,7 +688,7 @@ pub(crate) fn process_server_rate_limit_retries(
         let injected = {
             let reg = agent::lock_registry(registry);
             if let Some(handle) = reg.get(name.as_str()) {
-                agent::inject_to_agent(handle, b"continue\n").is_ok()
+                agent::inject_to_agent(handle, CONTINUE_RETRY_PAYLOAD).is_ok()
             } else {
                 false
             }
@@ -1143,49 +1152,176 @@ mod tests {
         );
     }
 
+    /// #1325: validate the retry payload constant value and that it ends
+    /// with a newline (required for CLI agent prompt submission).
     #[test]
-    fn re_inject_path_does_not_self_ipc() {
-        let src = include_str!("supervisor.rs");
-        let fn_start = src
-            .find("fn process_server_rate_limit_retries(")
-            .expect("function must exist");
-        let rest = &src[fn_start..];
-        let fn_end = rest
-            .find("\n/// ")
-            .or_else(|| rest.find("\nfn "))
-            .unwrap_or(rest.len());
-        let body = &rest[..fn_end];
-        assert!(
-            body.contains("inject_to_agent"),
-            "retry must use inject_to_agent (direct PTY write)"
+    fn continue_retry_payload_is_valid() {
+        assert_eq!(
+            super::CONTINUE_RETRY_PAYLOAD,
+            b"continue\n",
+            "payload must be the fixed resume signal"
         );
         assert!(
-            !body.contains("api::call"),
-            "retry must NOT use api::call (Sprint 49 deadlock)"
+            super::CONTINUE_RETRY_PAYLOAD.ends_with(b"\n"),
+            "payload must end with newline for prompt submission"
         );
     }
 
-    /// #1316: retry injects fixed "continue\n", never replays stored input.
+    /// #1325: validate "continue" works as input for all backends that can
+    /// enter ServerRateLimit (backends with API-backed models). Shell/Raw
+    /// backends never enter ServerRateLimit so they're excluded.
     #[test]
-    fn retry_injects_fixed_continue_not_stored_input() {
-        let src = include_str!("supervisor.rs");
-        let fn_start = src
-            .find("fn process_server_rate_limit_retries(")
-            .expect("function must exist");
-        let rest = &src[fn_start..];
-        let fn_end = rest
-            .find("\n/// ")
-            .or_else(|| rest.find("\nfn "))
-            .unwrap_or(rest.len());
-        let body = &rest[..fn_end];
+    fn continue_payload_compatible_with_all_api_backends() {
+        use crate::backend::Backend;
+        let api_backends = [
+            Backend::ClaudeCode,
+            Backend::KiroCli,
+            Backend::Codex,
+            Backend::OpenCode,
+            Backend::Gemini,
+            Backend::Agy,
+        ];
+        for backend in &api_backends {
+            let preset = backend.preset();
+            assert_eq!(
+                preset.submit_key, "\r",
+                "{:?} must use \\r submit_key for continue inject to work",
+                backend
+            );
+        }
+    }
+
+    /// Helper: create a minimal AgentHandle with a real PTY for behavioral
+    /// tests. Spawns `cat` (blocks reading stdin, never exits on its own).
+    fn mock_agent_handle(
+        name: &str,
+        state: crate::state::AgentState,
+    ) -> (crate::agent::AgentHandle, Box<dyn std::io::Read + Send>) {
+        let pty_system = portable_pty::native_pty_system();
+        let pair = pty_system
+            .openpty(portable_pty::PtySize {
+                rows: 10,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("open pty");
+        let mut cmd = portable_pty::CommandBuilder::new("cat");
+        cmd.cwd(std::env::temp_dir());
+        let child = pair.slave.spawn_command(cmd).expect("spawn cat");
+        drop(pair.slave);
+        let reader = pair.master.try_clone_reader().expect("clone reader");
+        let writer = pair.master.take_writer().expect("take writer");
+        let pty_writer: crate::agent::PtyWriter = Arc::new(parking_lot::Mutex::new(writer));
+        let core = Arc::new(parking_lot::Mutex::new(crate::agent::AgentCore {
+            vterm: crate::vterm::VTerm::with_pty_writer(80, 10, Arc::clone(&pty_writer)),
+            subscribers: Vec::new(),
+            state: crate::state::StateTracker::new(None),
+            health: crate::health::HealthTracker::new(),
+        }));
+        core.lock().state.current = state;
+        let handle = crate::agent::AgentHandle {
+            id: crate::types::InstanceId::default(),
+            name: name.to_string(),
+            backend_command: "claude".to_string(),
+            pty_writer,
+            pty_master: Arc::new(parking_lot::Mutex::new(pair.master)),
+            core,
+            child: Arc::new(parking_lot::Mutex::new(child)),
+            submit_key: "\r".to_string(),
+            inject_prefix: String::new(),
+            typed_inject: false,
+            spawned_at: std::time::Instant::now(),
+            spawned_at_epoch_ms: 0,
+            deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        (handle, reader)
+    }
+
+    /// #1325: phase 1 — ServerRateLimit detection populates retry_tracks.
+    #[test]
+    fn phase1_detects_rate_limit_and_schedules_retry() {
+        let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = tmp_home("phase1-detect");
+        let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
+
+        let (handle, _reader) =
+            mock_agent_handle("test-agent", crate::state::AgentState::ServerRateLimit);
+        registry.lock().insert("test-agent".to_string(), handle);
+
+        super::process_server_rate_limit_retries(&home, &registry, &mut tracks);
         assert!(
-            body.contains(r#"b"continue\n""#),
-            "retry must inject fixed \"continue\\n\""
+            tracks.contains_key("test-agent"),
+            "phase 1 must detect ServerRateLimit and insert retry track"
         );
+        assert_eq!(tracks["test-agent"].retry_count, 0);
+        assert!(!tracks["test-agent"].exhausted);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1325: phase 1 — recovery (Ready/Idle) clears retry track.
+    #[test]
+    fn phase1_recovery_clears_retry_track() {
+        let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = tmp_home("phase1-recovery");
+        let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
+        tracks.insert(
+            "test-agent".to_string(),
+            RateLimitRetry {
+                retry_count: 1,
+                next_retry_at: Instant::now(),
+                exhausted: false,
+            },
+        );
+
+        let (handle, _reader) = mock_agent_handle("test-agent", crate::state::AgentState::Ready);
+        registry.lock().insert("test-agent".to_string(), handle);
+
+        super::process_server_rate_limit_retries(&home, &registry, &mut tracks);
         assert!(
-            !body.contains("last_input_text"),
-            "retry must NOT read last_input_text (#1316 root cause)"
+            !tracks.contains_key("test-agent"),
+            "phase 1 must clear retry track on Ready recovery"
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1325: phase 2 — due retry injects "continue\n" to PTY. Captures
+    /// actual PTY output via the reader end to verify the injected payload.
+    #[test]
+    fn phase2_injects_continue_to_pty() {
+        let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = tmp_home("phase2-inject");
+
+        let (handle, mut reader) =
+            mock_agent_handle("test-agent", crate::state::AgentState::ServerRateLimit);
+        registry.lock().insert("test-agent".to_string(), handle);
+
+        let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
+        tracks.insert(
+            "test-agent".to_string(),
+            RateLimitRetry {
+                retry_count: 0,
+                next_retry_at: Instant::now() - Duration::from_secs(1),
+                exhausted: false,
+            },
+        );
+
+        super::process_server_rate_limit_retries(&home, &registry, &mut tracks);
+        assert_eq!(
+            tracks["test-agent"].retry_count, 1,
+            "retry_count must increment after inject"
+        );
+
+        let mut buf = vec![0u8; 256];
+        use std::io::Read;
+        let n = reader.read(&mut buf).expect("read from PTY");
+        let captured = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            captured.contains("continue"),
+            "PTY must receive \"continue\" payload, got: {:?}",
+            captured.trim_end_matches('\0')
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
