@@ -1097,64 +1097,6 @@ fn test_done_task_ignored_by_sweep() {
 }
 
 #[test]
-fn test_task_create_accepts_duration_30m() {
-    let home = tmp_home("dur-30m");
-    let before = chrono::Utc::now();
-    let result = handle(
-        &home,
-        "agent1",
-        &serde_json::json!({"action": "create", "title": "timed", "duration": "30m"}),
-    );
-    assert_eq!(result["status"], "created");
-    let listed = handle(&home, "agent1", &serde_json::json!({"action": "list"}));
-    let due_str = listed["tasks"][0]["due_at"].as_str().expect("due_at set");
-    let due = chrono::DateTime::parse_from_rfc3339(due_str)
-        .expect("valid rfc3339")
-        .with_timezone(&chrono::Utc);
-    let expected = before + chrono::Duration::minutes(30);
-    let diff = (due - expected).num_seconds().abs();
-    assert!(diff < 5, "due_at should be ~now+30m, diff={diff}s");
-    std::fs::remove_dir_all(&home).ok();
-}
-
-#[test]
-fn test_task_create_duration_variants() {
-    let home = tmp_home("dur-variants");
-    let now = chrono::Utc::now();
-    handle(
-        &home,
-        "a",
-        &serde_json::json!({"action": "create", "title": "1h", "duration": "1h"}),
-    );
-    let listed = handle(&home, "a", &serde_json::json!({"action": "list"}));
-    let due = chrono::DateTime::parse_from_rfc3339(listed["tasks"][0]["due_at"].as_str().unwrap())
-        .unwrap()
-        .with_timezone(&chrono::Utc);
-    assert!((due - now).num_minutes() >= 59);
-    handle(
-        &home,
-        "a",
-        &serde_json::json!({"action": "create", "title": "2d", "duration": "2d"}),
-    );
-    let listed = handle(&home, "a", &serde_json::json!({"action": "list"}));
-    let due = chrono::DateTime::parse_from_rfc3339(listed["tasks"][1]["due_at"].as_str().unwrap())
-        .unwrap()
-        .with_timezone(&chrono::Utc);
-    assert!((due - now).num_hours() >= 47);
-    handle(
-        &home,
-        "a",
-        &serde_json::json!({"action": "create", "title": "bad", "duration": "xyz"}),
-    );
-    let listed = handle(&home, "a", &serde_json::json!({"action": "list"}));
-    assert!(
-        listed["tasks"][2]["due_at"].is_null(),
-        "invalid duration → no due_at"
-    );
-    std::fs::remove_dir_all(&home).ok();
-}
-
-#[test]
 fn test_daemon_maintenance_unclaims_overdue_and_logs_event() {
     let home = tmp_home("daemon-maint");
     let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();

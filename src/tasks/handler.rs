@@ -6,29 +6,9 @@ use super::orphan::build_health_response;
 use super::{list_all, record_to_task, status_to_legacy_str, Task};
 
 fn parse_due_at(args: &Value) -> Option<String> {
-    if let Some(due) = args["due_at"].as_str() {
-        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(due) {
-            return Some(dt.with_timezone(&chrono::Utc).to_rfc3339());
-        }
-    }
-    if let Some(dur) = args["duration"].as_str() {
-        if let Some(d) = parse_duration(dur) {
-            return Some((chrono::Utc::now() + d).to_rfc3339());
-        }
-    }
-    None
-}
-
-fn parse_duration(s: &str) -> Option<chrono::Duration> {
-    let s = s.trim();
-    let (num, unit) = s.split_at(s.len().saturating_sub(1));
-    let n: i64 = num.parse().ok()?;
-    match unit {
-        "m" => Some(chrono::Duration::minutes(n)),
-        "h" => Some(chrono::Duration::hours(n)),
-        "d" => Some(chrono::Duration::days(n)),
-        _ => None,
-    }
+    let due = args["due_at"].as_str()?;
+    let dt = chrono::DateTime::parse_from_rfc3339(due).ok()?;
+    Some(dt.with_timezone(&chrono::Utc).to_rfc3339())
 }
 
 /// Read a single task's current replay-derived record. Used by

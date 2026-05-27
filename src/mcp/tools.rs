@@ -160,7 +160,6 @@ fn task_tools() -> Vec<Value> {
                 "include_history": {"type": "boolean", "description": "#806: opt in to done/cancelled in `list` response (default trims to actionable)."},
                 "limit": {"type": "integer", "description": "#806: cap `list` response to N newest-first entries (sort by updated_at desc)."},
                 "due_at": {"type": "string", "description": "ISO 8601 deadline for the task"},
-                "duration": {"type": "string", "description": "Human duration until deadline (e.g. 30m, 1h, 2d)"},
                 "branch": {"type": "string", "description": "Git branch the implementer should work on"},
                 "force": {"type": "boolean", "description": "#808: bypass ownership ACL on done/update for historical ghost-owned cleanup. Requires non-empty force_reason."},
                 "force_reason": {"type": "string", "description": "#808: required when force=true. Logged to event-log.jsonl and embedded in the per-task event's reason field for audit."},
