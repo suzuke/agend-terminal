@@ -191,6 +191,14 @@ Expired, cleaned-up, or report-dismissed sidecars do not appear.
 - L2 nudge target: target (recipient).
 - Tracking dismissal uses `correlation_id`, not sender or target identity.
 
+### Concurrency (#1340)
+
+`mark_resolved` (called from the MCP report handler) and `scan_and_emit`
+(called from the daemon tick) use flock serialization on the sidecar file
+to prevent lost-update races. Without locking, a concurrent `mark_resolved`
+could overwrite a sidecar that `scan_and_emit` was in the middle of
+processing, causing a missed or duplicate notification.
+
 ---
 
 ## Typical Flow

@@ -15,6 +15,8 @@ collection, as well as the division of responsibility among `bind_self`,
 
 **Controlled cleanup.** After a task is completed and the PR is merged, the daemon soft-releases the worktree (marking it with `released_at`). The worktree remains on disk for a 24-hour grace period. If no one reclaims it, GC (`gc_cutover` with `AGEND_WORKTREE_GC=1`) removes it automatically. For stuck or orphaned worktrees, the operator can use `force_release_worktree` as an emergency measure.
 
+**Auto-release on merge (#1344).** When the pr_state scanner detects a PR has been merged, it automatically calls `auto_release_for_merged_branch` to free the worktree before emitting the `[pr-merged]` notification. This ensures `gh pr merge --delete-branch` succeeds without manual intervention. Dirty worktrees are skipped (with a warning log) and retried on the next scanner tick.
+
 ## 1. Design Rationale
 
 - Each agent works in its own isolated workspace to avoid branch conflicts and shared-checkout contention.
