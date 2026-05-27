@@ -435,14 +435,74 @@ pub fn load(home: &Path, repo: &str, branch: &str) -> Option<PrState> {
     serde_json::from_str(&content).ok()
 }
 
-/// Atomic save. Uses [`crate::store::atomic_write`] which is
-/// post-#965 unique-tmp safe (concurrent saves to different PRs do
-/// not contend on a shared tmp inode).
+/// Atomic save — used by tests for setup. Production mutation paths
+/// go through [`with_pr_state`] which serializes under flock.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn save(home: &Path, state: &PrState) -> anyhow::Result<()> {
     let path = pr_state_dir(home).join(pr_state_filename(&state.repo, &state.branch));
     let body = serde_json::to_string_pretty(state)?;
     crate::store::atomic_write(&path, body.as_bytes())?;
     Ok(())
+}
+
+/// #1342: flock-serialized read-modify-write for pr_state files.
+/// All mutation paths MUST go through this helper to prevent lost-update
+/// races (e.g. gh-poll save overwriting scanner's `ready_emitted_for_sha`).
+/// The closure receives a fresh `&mut PrState` loaded under an exclusive
+/// lock; save happens automatically after the closure returns.
+/// Returns `Ok(None)` when the file does not exist (closure not called).
+pub fn with_pr_state<F, R>(
+    home: &std::path::Path,
+    repo: &str,
+    branch: &str,
+    mutate: F,
+) -> anyhow::Result<Option<R>>
+where
+    F: FnOnce(&mut PrState) -> R,
+{
+    let dir = pr_state_dir(home);
+    std::fs::create_dir_all(&dir)?;
+    let data_path = dir.join(pr_state_filename(repo, branch));
+    let lock_path = dir.join(format!("{}.lock", pr_state_filename(repo, branch)));
+    let _lock = crate::store::acquire_file_lock(&lock_path)?;
+    let Some(mut state) = std::fs::read_to_string(&data_path)
+        .ok()
+        .and_then(|c| serde_json::from_str::<PrState>(&c).ok())
+    else {
+        return Ok(None);
+    };
+    let result = mutate(&mut state);
+    let body = serde_json::to_string_pretty(&state)?;
+    crate::store::atomic_write(&data_path, body.as_bytes())?;
+    Ok(Some(result))
+}
+
+/// Variant of [`with_pr_state`] that creates the file if missing,
+/// using `default_fn` to produce the initial state.
+pub fn with_pr_state_or_create<F, D, R>(
+    home: &std::path::Path,
+    repo: &str,
+    branch: &str,
+    default_fn: D,
+    mutate: F,
+) -> anyhow::Result<R>
+where
+    D: FnOnce() -> PrState,
+    F: FnOnce(&mut PrState) -> R,
+{
+    let dir = pr_state_dir(home);
+    std::fs::create_dir_all(&dir)?;
+    let data_path = dir.join(pr_state_filename(repo, branch));
+    let lock_path = dir.join(format!("{}.lock", pr_state_filename(repo, branch)));
+    let _lock = crate::store::acquire_file_lock(&lock_path)?;
+    let mut state = std::fs::read_to_string(&data_path)
+        .ok()
+        .and_then(|c| serde_json::from_str::<PrState>(&c).ok())
+        .unwrap_or_else(default_fn);
+    let result = mutate(&mut state);
+    let body = serde_json::to_string_pretty(&state)?;
+    crate::store::atomic_write(&data_path, body.as_bytes())?;
+    Ok(result)
 }
 
 /// Remove the per-PR file. Used by the per-tick scanner after a
@@ -522,7 +582,7 @@ pub fn suppress_stale_terminal_replay_with(home: &Path, threshold: std::time::Du
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let Ok(mut state) = serde_json::from_str::<PrState>(&content) else {
+        let Ok(state) = serde_json::from_str::<PrState>(&content) else {
             continue;
         };
         if !matches!(
@@ -531,28 +591,37 @@ pub fn suppress_stale_terminal_replay_with(home: &Path, threshold: std::time::Du
         ) {
             continue;
         }
-        // Already-suppressed (idempotent re-runs land here).
         if state.ready_emitted_for_sha.as_deref() == Some(state.head_sha.as_str()) {
             continue;
         }
-        state.ready_emitted_for_sha = Some(state.head_sha.clone());
-        if let Err(e) = save(home, &state) {
-            tracing::warn!(
-                repo = %state.repo,
-                branch = %state.branch,
-                error = %e,
-                "#1017 pr_state: suppress_stale save failed"
-            );
-            continue;
+        let repo = state.repo.clone();
+        let branch = state.branch.clone();
+        match with_pr_state(home, &repo, &branch, |s| {
+            if s.ready_emitted_for_sha.as_deref() == Some(s.head_sha.as_str()) {
+                return false;
+            }
+            s.ready_emitted_for_sha = Some(s.head_sha.clone());
+            true
+        }) {
+            Ok(Some(true)) => {
+                suppressed += 1;
+                tracing::debug!(
+                    repo = %repo,
+                    branch = %branch,
+                    age_hours = age.as_secs() / 3600,
+                    "#1017 pr_state: stale terminal replay suppressed"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    repo = %repo,
+                    branch = %branch,
+                    error = %e,
+                    "#1017 pr_state: suppress_stale save failed"
+                );
+            }
+            _ => {}
         }
-        suppressed += 1;
-        tracing::debug!(
-            repo = %state.repo,
-            branch = %state.branch,
-            head = %state.head_sha,
-            age_hours = age.as_secs() / 3600,
-            "#1017 pr_state: stale terminal replay suppressed"
-        );
     }
     if suppressed > 0 {
         tracing::info!(
@@ -627,28 +696,33 @@ pub fn record_ci_result(
     subscribers: Vec<String>,
     review_class: ReviewClass,
 ) {
-    let mut state = load(home, repo, branch)
-        .unwrap_or_else(|| new_for_branch(repo, branch, head_sha, review_class));
-    // #1314: skip CiObserved on terminal states to prevent read-modify-write
-    // race with scanner (which sets ready_emitted_for_sha after emitting).
-    if matches!(
-        state.merge_state,
-        MergeState::Merged { .. } | MergeState::ClosedUnmerged { .. }
-    ) {
-        return;
-    }
-    if !subscribers.is_empty() && state.subscribers.is_empty() {
-        state.subscribers = subscribers;
-    }
-    apply(
-        &mut state,
-        Event::CiObserved {
-            head_sha,
-            conclusion,
-            observed_at: chrono::Utc::now().to_rfc3339(),
+    if let Err(e) = with_pr_state_or_create(
+        home,
+        repo,
+        branch,
+        || new_for_branch(repo, branch, head_sha, review_class),
+        |state| {
+            // #1314: skip CiObserved on terminal states to prevent
+            // stale write over scanner's ready_emitted_for_sha.
+            if matches!(
+                state.merge_state,
+                MergeState::Merged { .. } | MergeState::ClosedUnmerged { .. }
+            ) {
+                return;
+            }
+            if !subscribers.is_empty() && state.subscribers.is_empty() {
+                state.subscribers = subscribers;
+            }
+            apply(
+                state,
+                Event::CiObserved {
+                    head_sha,
+                    conclusion,
+                    observed_at: chrono::Utc::now().to_rfc3339(),
+                },
+            );
         },
-    );
-    if let Err(e) = save(home, &state) {
+    ) {
         tracing::warn!(
             repo = %repo,
             branch = %branch,
@@ -736,25 +810,27 @@ pub fn record_verdict(
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let Ok(mut state): Result<PrState, _> = serde_json::from_str(&content) else {
+        let Ok(state): Result<PrState, _> = serde_json::from_str(&content) else {
             continue;
         };
         if state.branch != branch {
             continue;
         }
         matched_any = true;
-        apply(
-            &mut state,
-            Event::VerdictObserved {
-                reviewer,
-                reviewed_head,
-                kind,
-            },
-        );
-        if let Err(e) = save(home, &state) {
+        let repo = state.repo.clone();
+        if let Err(e) = with_pr_state(home, &repo, &branch, |s| {
+            apply(
+                s,
+                Event::VerdictObserved {
+                    reviewer,
+                    reviewed_head,
+                    kind,
+                },
+            );
+        }) {
             tracing::warn!(
-                repo = %state.repo,
-                branch = %state.branch,
+                repo = %repo,
+                branch = %branch,
                 error = %e,
                 "#972 pr_state: record_verdict save failed"
             );
