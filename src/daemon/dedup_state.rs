@@ -68,6 +68,7 @@ pub fn cleanup_tmp_orphans(home: &std::path::Path, retention_secs: u64) -> Dedup
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

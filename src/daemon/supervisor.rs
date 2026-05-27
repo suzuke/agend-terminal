@@ -641,12 +641,11 @@ pub(crate) fn process_server_rate_limit_retries(
                         exhausted: false,
                     },
                 );
-            } else if state == crate::state::AgentState::Ready
-                || state == crate::state::AgentState::Idle
+            } else if (state == crate::state::AgentState::Ready
+                || state == crate::state::AgentState::Idle)
+                && retry_tracks.remove(name).is_some()
             {
-                if retry_tracks.remove(name).is_some() {
-                    tracing::info!(agent = %name, "ServerRateLimit retry cleared (agent recovered)");
-                }
+                tracing::info!(agent = %name, "ServerRateLimit retry cleared (agent recovered)");
             }
         }
     }
