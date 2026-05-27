@@ -239,29 +239,36 @@ pub fn render_tasks(
     }
 
     let col_areas = ratatui::layout::Layout::horizontal([
-        Constraint::Ratio(1, 4),
-        Constraint::Ratio(1, 4),
-        Constraint::Ratio(1, 4),
-        Constraint::Ratio(1, 4),
+        Constraint::Ratio(1, 5),
+        Constraint::Ratio(1, 5),
+        Constraint::Ratio(1, 5),
+        Constraint::Ratio(1, 5),
+        Constraint::Ratio(1, 5),
     ])
     .split(inner);
 
-    let col_titles = ["Backlog", "Open", "In Progress", "Done"];
-    let done_total = columns.get(3).map(|c| c.len()).unwrap_or(0);
+    let col_titles = ["Backlog", "Ready", "Working", "Review", "Done"];
+    let done_total = columns.get(4).map(|c| c.len()).unwrap_or(0);
     let done_visible = done_total.min(DONE_VISIBLE_MAX);
     let done_older = done_total.saturating_sub(DONE_VISIBLE_MAX);
     let col_title_strs: Vec<String> = col_titles
         .iter()
         .enumerate()
         .map(|(i, t)| {
-            if i == 3 {
+            if i == 4 {
                 format!(" {} ({}) ", t, done_total)
             } else {
                 format!(" {} ({}) ", t, columns.get(i).map(|c| c.len()).unwrap_or(0))
             }
         })
         .collect();
-    let col_colors = [Color::Gray, Color::Green, Color::Yellow, Color::DarkGray];
+    let col_colors = [
+        Color::Gray,
+        Color::Green,
+        Color::Yellow,
+        Color::Cyan,
+        Color::DarkGray,
+    ];
 
     for (ci, (tasks, area)) in columns.iter().zip(col_areas.iter()).enumerate() {
         let is_active = ci == sel_col;
@@ -286,7 +293,7 @@ pub fn render_tasks(
         let block_inner = block.inner(*area);
         frame.render_widget(block, *area);
 
-        let visible_tasks: &[&crate::tasks::Task] = if ci == 3 {
+        let visible_tasks: &[&crate::tasks::Task] = if ci == 4 {
             &tasks[..done_visible]
         } else {
             tasks
@@ -317,7 +324,7 @@ pub fn render_tasks(
             };
             lines.push(Line::from(Span::styled(text, style)));
         }
-        if ci == 3 && done_older > 0 {
+        if ci == 4 && done_older > 0 {
             lines.push(Line::from(Span::styled(
                 format!("── older ({done_older}) ──"),
                 Style::default().fg(Color::DarkGray),
@@ -492,7 +499,7 @@ const PARTIAL_SORT_BUFFER: usize = 5;
 /// Fully sorts every column. Use [`task_board_columns_viewport`] in
 /// per-frame render paths where only the first `viewport_rows` items
 /// need to be in order.
-pub fn task_board_columns(items: &[crate::tasks::Task]) -> [Vec<&crate::tasks::Task>; 4] {
+pub fn task_board_columns(items: &[crate::tasks::Task]) -> [Vec<&crate::tasks::Task>; 5] {
     task_board_columns_viewport(items, usize::MAX)
 }
 
@@ -503,20 +510,23 @@ pub fn task_board_columns(items: &[crate::tasks::Task]) -> [Vec<&crate::tasks::T
 pub fn task_board_columns_viewport(
     items: &[crate::tasks::Task],
     viewport_rows: usize,
-) -> [Vec<&crate::tasks::Task>; 4] {
+) -> [Vec<&crate::tasks::Task>; 5] {
     let mut backlog: Vec<&crate::tasks::Task> = Vec::new();
-    let mut open: Vec<&crate::tasks::Task> = Vec::new();
-    let mut in_progress: Vec<&crate::tasks::Task> = Vec::new();
+    let mut ready: Vec<&crate::tasks::Task> = Vec::new();
+    let mut working: Vec<&crate::tasks::Task> = Vec::new();
+    let mut review: Vec<&crate::tasks::Task> = Vec::new();
     let mut done: Vec<&crate::tasks::Task> = Vec::new();
 
     for t in items {
         match t.status.as_str() {
             "cancelled" => {}
+            "backlog" => backlog.push(t),
             "open" | "blocked" if t.priority == "low" => backlog.push(t),
-            "open" | "blocked" => open.push(t),
-            "claimed" => in_progress.push(t),
+            "open" | "blocked" => ready.push(t),
+            "claimed" | "in_progress" => working.push(t),
+            "in_review" | "verified" => review.push(t),
             "done" => done.push(t),
-            _ => open.push(t),
+            _ => ready.push(t),
         }
     }
 
@@ -547,28 +557,29 @@ pub fn task_board_columns_viewport(
     }
 
     partial_sort_by(&mut backlog, cap, pri_cmp);
-    partial_sort_by(&mut open, cap, pri_cmp);
-    partial_sort_by(&mut in_progress, cap, pri_cmp);
-    in_progress.sort_by(|a, b| {
+    partial_sort_by(&mut ready, cap, pri_cmp);
+    partial_sort_by(&mut working, cap, pri_cmp);
+    working.sort_by(|a, b| {
         a.assignee
             .as_deref()
             .unwrap_or("")
             .cmp(b.assignee.as_deref().unwrap_or(""))
     });
+    partial_sort_by(&mut review, cap, pri_cmp);
     let done_cap = cap.min(DONE_VISIBLE_MAX);
     fn done_cmp(a: &&crate::tasks::Task, b: &&crate::tasks::Task) -> std::cmp::Ordering {
         b.updated_at.cmp(&a.updated_at)
     }
     partial_sort_by(&mut done, done_cap, done_cmp);
 
-    [backlog, open, in_progress, done]
+    [backlog, ready, working, review, done]
 }
 
 /// Number of selectable (visible) tasks in a column.
 /// Done column is capped at `DONE_VISIBLE_MAX`; others return full length.
-pub fn selectable_len(columns: &[Vec<&crate::tasks::Task>; 4], col: usize) -> usize {
+pub fn selectable_len(columns: &[Vec<&crate::tasks::Task>; 5], col: usize) -> usize {
     let len = columns.get(col).map(|c| c.len()).unwrap_or(0);
-    if col == 3 {
+    if col == 4 {
         len.min(DONE_VISIBLE_MAX)
     } else {
         len
@@ -623,7 +634,7 @@ mod tests {
             make_done_task("mid", "2026-01-15T00:00:00Z"),
             make_done_task("new", "2026-01-30T00:00:00Z"),
         ];
-        let [_, _, _, done] = task_board_columns(&tasks);
+        let [_, _, _, _, done] = task_board_columns(&tasks);
         assert_eq!(done[0].title, "new");
         assert_eq!(done[1].title, "mid");
         assert_eq!(done[2].title, "old");
@@ -640,9 +651,9 @@ mod tests {
             })
             .collect();
         let columns = task_board_columns(&tasks);
-        assert_eq!(columns[3].len(), 30, "full done column has 30 tasks");
+        assert_eq!(columns[4].len(), 30, "full done column has 30 tasks");
         assert_eq!(
-            selectable_len(&columns, 3),
+            selectable_len(&columns, 4),
             DONE_VISIBLE_MAX,
             "selectable len capped at DONE_VISIBLE_MAX"
         );
@@ -655,7 +666,7 @@ mod tests {
             make_done_task("b", "2026-01-02T00:00:00Z"),
         ];
         let columns = task_board_columns(&tasks);
-        assert_eq!(selectable_len(&columns, 3), 2);
+        assert_eq!(selectable_len(&columns, 4), 2);
     }
 
     #[test]
@@ -757,10 +768,10 @@ mod tests {
             make_task("cancelled-item", "cancelled", "normal", "2026-01-05"),
             make_task("blocked-low", "blocked", "low", "2026-01-06"),
         ];
-        let [backlog, open, in_progress, done] = task_board_columns(&tasks);
+        let [backlog, ready, working, _review, done] = task_board_columns(&tasks);
         assert_eq!(backlog.len(), 2, "open+low and blocked+low → backlog");
-        assert_eq!(open.len(), 1, "open+high → open");
-        assert_eq!(in_progress.len(), 1, "claimed → in progress");
+        assert_eq!(ready.len(), 1, "open+high → open");
+        assert_eq!(working.len(), 1, "claimed → in progress");
         assert_eq!(done.len(), 1, "done → done");
     }
 
@@ -772,11 +783,11 @@ mod tests {
             make_task("normal-new", "open", "normal", "2026-01-02"),
             make_task("high-old", "open", "high", "2026-01-01"),
         ];
-        let [_, open, _, _] = task_board_columns(&tasks);
-        assert_eq!(open[0].title, "urgent-new", "urgent first");
-        assert_eq!(open[1].title, "high-old", "high second");
-        assert_eq!(open[2].title, "normal-old", "normal oldest third");
-        assert_eq!(open[3].title, "normal-new", "normal newest last");
+        let [_, ready, _, _, _] = task_board_columns(&tasks);
+        assert_eq!(ready[0].title, "urgent-new", "urgent first");
+        assert_eq!(ready[1].title, "high-old", "high second");
+        assert_eq!(ready[2].title, "normal-old", "normal oldest third");
+        assert_eq!(ready[3].title, "normal-new", "normal newest last");
     }
 
     #[test]

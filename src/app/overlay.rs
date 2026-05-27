@@ -109,7 +109,7 @@ pub(super) enum Overlay {
     /// Task board overlay — 4-column kanban view with CRUD.
     Tasks {
         items: Vec<crate::tasks::Task>,
-        /// Currently focused column (0=Backlog, 1=Open, 2=InProgress, 3=Done).
+        /// Currently focused column (0=Backlog, 1=Ready, 2=Working, 3=Review, 4=Done).
         col: usize,
         /// Currently focused row within the column.
         row: usize,
@@ -659,7 +659,7 @@ pub(super) fn handle_key(
                             );
                         }
                         KeyCode::Right | KeyCode::Char('l')
-                            if !key.modifiers.contains(KeyModifiers::SHIFT) && *col < 3 =>
+                            if !key.modifiers.contains(KeyModifiers::SHIFT) && *col < 4 =>
                         {
                             *col += 1;
                             *row = (*row).min(
@@ -799,7 +799,7 @@ pub(super) fn handle_key(
                         }
                         // Match 'L' (legacy) and 'l'+SHIFT (Kitty protocol)
                         KeyCode::Char('L') | KeyCode::Char('l')
-                            if !columns[*col].is_empty() && *col < 3 =>
+                            if !columns[*col].is_empty() && *col < 4 =>
                         {
                             if let Some(task) = columns[*col].get(*row) {
                                 let update = match *col {
