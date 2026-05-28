@@ -298,9 +298,9 @@ fn handle_up(
                         .active_tab()
                         .and_then(|t| t.root().find_pane(src))
                         .map(|p| p.agent_name.clone())
-                        .unwrap_or_else(|| "new".to_string());
+                        .unwrap_or_else(|| "new".into());
                     if layout
-                        .move_pane_across_tabs(from_tab_idx, src, MovePlacement::NewTab { name })
+                        .move_pane_across_tabs(from_tab_idx, src, MovePlacement::NewTab { name: name.to_string() })
                         .is_some()
                     {
                         out.new_last_tab = Some(from_tab_idx);
@@ -533,7 +533,7 @@ mod tests {
 
     fn leaf(id: usize, agent: &str) -> Pane {
         Pane {
-            agent_name: agent.to_string(),
+            agent_name: agent.into(),
             vterm: VTerm::new(10, 10),
             rx: crossbeam_channel::bounded(1).1,
             id,

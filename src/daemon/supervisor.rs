@@ -1240,7 +1240,7 @@ mod tests {
         core.lock().state.current = state;
         let handle = crate::agent::AgentHandle {
             id: crate::types::InstanceId::default(),
-            name: name.to_string(),
+            name: name.to_string().into(),
             backend_command: "claude".to_string(),
             pty_writer,
             pty_master: Arc::new(parking_lot::Mutex::new(pair.master)),

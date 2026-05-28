@@ -40,6 +40,57 @@ impl std::fmt::Display for InstanceId {
     }
 }
 
+/// Strongly-typed agent/instance name. Wraps `String` with `Deref<str>`
+/// + `Borrow<str>` so it works transparently with `HashMap<String, _>::get`
+///   and string comparisons. Newtype prevents accidental confusion with
+///   task IDs, branch names, or other string-shaped identifiers.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AgentName(pub String);
+
+impl AgentName {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for AgentName {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::borrow::Borrow<str> for AgentName {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for AgentName {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl From<&str> for AgentName {
+    fn from(s: &str) -> Self {
+        Self(s.to_string())
+    }
+}
+
+impl std::fmt::Display for AgentName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for AgentName {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -28,7 +28,7 @@ pub struct AgentCore {
 #[allow(dead_code)]
 pub struct AgentHandle {
     pub(crate) id: crate::types::InstanceId,
-    pub(crate) name: String,
+    pub(crate) name: crate::types::AgentName,
     pub(crate) backend_command: String,
     pub(crate) pty_writer: PtyWriter,
     pub(crate) pty_master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
@@ -666,7 +666,7 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
             name.to_string(),
             AgentHandle {
                 id: instance_id,
-                name: name.to_string(),
+                name: name.to_string().into(),
                 backend_command: backend_command.to_string(),
                 pty_writer: Arc::clone(&pty_writer),
                 pty_master: Arc::clone(&pty_master),
@@ -2391,7 +2391,7 @@ Allow Trust All Tools mode?
         let agent_name = format!("sweep-test-{}", pid_file.display());
         let handle = AgentHandle {
             id: crate::types::InstanceId::default(),
-            name: agent_name.clone(),
+            name: agent_name.clone().into(),
             backend_command: "sh".to_string(),
             pty_writer,
             pty_master,
@@ -2869,7 +2869,7 @@ Allow Trust All Tools mode?
         }
         let handle = AgentHandle {
             id: crate::types::InstanceId::default(),
-            name: "typed-test".to_string(),
+            name: "typed-test".into(),
             backend_command: "test".to_string(),
             pty_writer: writer,
             pty_master: Arc::new(Mutex::new(pair.master)),
@@ -3100,7 +3100,7 @@ Allow Trust All Tools mode?
             agent_name.to_string(),
             AgentHandle {
                 id: crate::types::InstanceId::default(),
-                name: agent_name.to_string(),
+                name: agent_name.to_string().into(),
                 backend_command: "test".to_string(),
                 pty_writer: Arc::clone(&pty_writer),
                 pty_master: Arc::new(Mutex::new(

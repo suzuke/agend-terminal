@@ -761,9 +761,9 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                             ) {
                                 Ok(pane) => {
                                     let tab_name = pane.agent_name.clone();
-                                    known_remote_agents.insert(tab_name.clone());
+                                    known_remote_agents.insert(tab_name.to_string());
                                     layout.push_tab_preserve_focus(
-                                        crate::layout::Tab::new(tab_name, pane),
+                                        crate::layout::Tab::new(tab_name.to_string(), pane),
                                     );
                                     needs_resize = true;
                                     tracing::info!(
@@ -1192,7 +1192,7 @@ mod tests {
 
     fn pane(name: &str) -> Pane {
         Pane {
-            agent_name: name.to_string(),
+            agent_name: name.into(),
             vterm: VTerm::new(10, 10),
             rx: crossbeam_channel::bounded(1).1,
             id: 1,

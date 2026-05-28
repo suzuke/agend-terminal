@@ -127,7 +127,7 @@ pub(super) fn auto_start_fleet(
             ) {
                 Ok(pane) => {
                     let tab_name = pane.agent_name.clone();
-                    layout.add_tab(Tab::new(tab_name, pane));
+                    layout.add_tab(Tab::new(tab_name.to_string(), pane));
                     spawned = true;
                 }
                 Err(e) => tracing::error!(instance = name, error = %e, "fleet auto-start failed"),

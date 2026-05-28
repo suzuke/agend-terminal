@@ -260,7 +260,7 @@ mod tests {
 
     fn leaf(id: usize, name: &str) -> Pane {
         Pane {
-            agent_name: name.to_string(),
+            agent_name: name.into(),
             vterm: VTerm::new(10, 10),
             rx: crossbeam_channel::bounded(1).1,
             id,

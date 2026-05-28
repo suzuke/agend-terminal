@@ -120,7 +120,7 @@ impl PaneNode {
     /// Collect all agent names in the tree.
     pub fn agent_names(&self) -> Vec<String> {
         match self {
-            PaneNode::Leaf(p) => vec![p.agent_name.clone()],
+            PaneNode::Leaf(p) => vec![p.agent_name.to_string()],
             PaneNode::Split { first, second, .. } => {
                 let mut names = first.agent_names();
                 names.extend(second.agent_names());
@@ -132,7 +132,7 @@ impl PaneNode {
     /// Check if any pane in the tree has the given agent name (no allocation).
     pub fn has_agent(&self, name: &str) -> bool {
         match self {
-            PaneNode::Leaf(p) => p.agent_name == name,
+            PaneNode::Leaf(p) => p.agent_name.as_str() == name,
             PaneNode::Split { first, second, .. } => {
                 first.has_agent(name) || second.has_agent(name)
             }
@@ -142,7 +142,7 @@ impl PaneNode {
     /// Find the pane ID for a given agent name.
     pub fn find_pane_id_by_agent(&self, name: &str) -> Option<usize> {
         match self {
-            PaneNode::Leaf(p) if p.agent_name == name => Some(p.id),
+            PaneNode::Leaf(p) if p.agent_name.as_str() == name => Some(p.id),
             PaneNode::Leaf(_) => None,
             PaneNode::Split { first, second, .. } => first
                 .find_pane_id_by_agent(name)
@@ -352,7 +352,7 @@ mod tests {
 
     fn leaf(id: usize, name: &str) -> Pane {
         Pane {
-            agent_name: name.to_string(),
+            agent_name: name.into(),
             vterm: VTerm::new(10, 10),
             rx: crossbeam_channel::bounded(1).1,
             id,

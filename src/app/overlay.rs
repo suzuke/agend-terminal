@@ -217,7 +217,7 @@ pub(super) fn handle_key(
                                 &pane,
                             );
                             let tab_name = pane.agent_name.clone();
-                            ctx.layout.add_tab(Tab::new(tab_name, pane));
+                            ctx.layout.add_tab(Tab::new(tab_name.to_string(), pane));
                             outcome.needs_resize = true;
                         }
                     }
@@ -466,13 +466,13 @@ pub(super) fn handle_key(
                             .get(src_tab)
                             .and_then(|t| t.root().find_pane(src_pane))
                             .map(|p| p.agent_name.clone())
-                            .unwrap_or_else(|| "new".to_string());
+                            .unwrap_or_else(|| "new".into());
                         if ctx
                             .layout
                             .move_pane_across_tabs(
                                 src_tab,
                                 src_pane,
-                                crate::layout::MovePlacement::NewTab { name },
+                                crate::layout::MovePlacement::NewTab { name: name.to_string() },
                             )
                             .is_some()
                         {
