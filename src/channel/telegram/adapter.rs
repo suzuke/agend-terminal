@@ -1,13 +1,15 @@
 //! Telegram Channel trait adapter (T1d) + UxEventSink impl.
 
 use crate::agent::AgentRegistry;
-use crate::channel::telegram::bot_api::*;
-use crate::channel::telegram::error::*;
-use crate::channel::telegram::notify::*;
-use crate::channel::telegram::reply::*;
-use crate::channel::telegram::send::*;
-use crate::channel::telegram::state::*;
-use crate::channel::telegram::topic_registry::*;
+use crate::channel::telegram::bot_api::{try_telegram_edit, try_telegram_react};
+use crate::channel::telegram::error::handle_fleet_send_failure;
+use crate::channel::telegram::notify::{notify_telegram, notify_telegram_silent};
+use crate::channel::telegram::reply::{inject_provenance, try_telegram_reply_from};
+use crate::channel::telegram::send::{
+    needs_separate_text, resolve_caption, send_media, send_with_topic, send_with_topic_capturing_id,
+};
+use crate::channel::telegram::state::{lock_state, telegram_runtime, TelegramState};
+use crate::channel::telegram::topic_registry::{create_topic_for_instance, delete_topic};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::PathBuf;
