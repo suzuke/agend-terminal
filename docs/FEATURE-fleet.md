@@ -166,6 +166,96 @@ Sets the timezone the daemon uses in human-readable timestamps. Accepts IANA tim
 
 Defines reusable agent configuration templates for dynamically creating instances via `fleet deployment deploy`.
 
+### Environment Variables
+
+#### Merge Priority
+
+Environment variables are resolved in this order (highest priority wins):
+
+1. **Runtime SPAWN params** — `env` object passed in the MCP `start_instance` / SPAWN API call
+2. **Instance `env`** — `instances.<name>.env` in fleet.yaml
+3. **Defaults `env`** — `defaults.env` in fleet.yaml
+4. **Daemon defaults** — automatically injected by the daemon (see below)
+
+Within fleet.yaml, `defaults.env` is applied first, then `instances.<name>.env` extends/overrides it. If the runtime SPAWN call includes an `env` object, it replaces the fleet.yaml-resolved env entirely.
+
+#### Daemon-Injected Variables
+
+The daemon injects these variables into every agent process before applying fleet.yaml env:
+
+| Variable | Value | Purpose |
+|----------|-------|---------|
+| `AGEND_INSTANCE_NAME` | Agent name | Identifies the agent to MCP tools and daemon IPC |
+| `TERM` | `xterm-256color` | Terminal type for PTY rendering |
+| `COLORTERM` | `truecolor` | Enables 24-bit color support |
+| `FORCE_COLOR` | `1` | Forces colored output in tools that check this |
+| `GIT_EDITOR` | `true` | Prevents git from opening an interactive editor |
+| `GIT_SEQUENCE_EDITOR` | `true` | Prevents `git rebase -i` from opening an editor |
+| `EDITOR` | `true` | Fallback editor suppression |
+| `VISUAL` | `true` | Fallback editor suppression |
+| `LANG` | `en_US.UTF-8` | Set only if `LANG` is not already in the environment |
+
+The `GIT_EDITOR` family prevents agents from getting stuck in an interactive editor (e.g., Vim) during git operations. Fleet.yaml env entries override these defaults — setting `instances.dev.env.GIT_EDITOR: vim` restores interactive editing for that agent.
+
+#### Sensitive Key Deny-List
+
+The following environment variable names are **blocked** from fleet.yaml `env` to prevent accidental credential exposure or runtime hijacking. Attempts to set these are silently dropped with a warning log:
+
+| Category | Blocked Keys |
+|----------|-------------|
+| AI backend credentials | `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`, `GEMINI_API_KEY` |
+| Cloud credentials | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` |
+| Git forge tokens | `GITHUB_TOKEN`, `GITLAB_TOKEN`, `NPM_TOKEN` |
+| Dynamic linker injection | `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, `DYLD_INSERT_LIBRARIES`, `DYLD_LIBRARY_PATH`, `DYLD_FALLBACK_LIBRARY_PATH` |
+| AgEnD runtime internals | `AGEND_HOME`, `AGEND_INSTANCE_NAME`, `AGEND_ALLOWED_WORK_ROOTS`, `AGEND_MCP_TOOLS_ALLOW`, `AGEND_MCP_TOOLS_DENY` |
+
+These credentials should be set in the host shell environment or `.env` file instead — the daemon process inherits them and passes them through to agent subprocesses automatically.
+
+#### Examples
+
+**Proxy configuration:**
+
+```yaml
+defaults:
+  env:
+    HTTP_PROXY: "http://proxy.corp:8080"
+    HTTPS_PROXY: "http://proxy.corp:8080"
+    NO_PROXY: "localhost,127.0.0.1"
+```
+
+**API keys via host environment (recommended):**
+
+```yaml
+# DON'T put secrets in fleet.yaml:
+#   env:
+#     MY_API_KEY: "sk-abc123"    # BAD — checked into git
+#
+# Instead, set in your shell profile or .env:
+#   export MY_SERVICE_API_KEY=sk-abc123
+#
+# Then reference in fleet.yaml only if you need to rename:
+defaults:
+  env:
+    SERVICE_KEY_ALIAS: "${MY_SERVICE_API_KEY}"
+```
+
+**Per-instance overrides:**
+
+```yaml
+defaults:
+  env:
+    LOG_LEVEL: info
+
+instances:
+  dev:
+    env:
+      LOG_LEVEL: debug        # overrides defaults
+      RUST_BACKTRACE: "1"     # added for this instance only
+  reviewer:
+    role: "Code reviewer"
+    # inherits LOG_LEVEL=info from defaults
+```
+
 ---
 
 ## Startup Process
