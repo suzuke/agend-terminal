@@ -18,37 +18,37 @@ pub type PtyWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
 /// Core state for one agent — protected by a single Mutex for atomic operations.
 pub struct AgentCore {
-    pub vterm: VTerm,
-    pub subscribers: Vec<crossbeam_channel::Sender<Vec<u8>>>,
-    pub state: StateTracker,
-    pub health: HealthTracker,
+    pub(crate) vterm: VTerm,
+    pub(crate) subscribers: Vec<crossbeam_channel::Sender<Vec<u8>>>,
+    pub(crate) state: StateTracker,
+    pub(crate) health: HealthTracker,
 }
 
 /// Handle to interact with an agent.
 #[allow(dead_code)]
 pub struct AgentHandle {
-    pub id: crate::types::InstanceId,
-    pub name: String,
-    pub backend_command: String,
-    pub pty_writer: PtyWriter,
-    pub pty_master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
-    pub core: Arc<Mutex<AgentCore>>,
-    pub child: Arc<Mutex<Box<dyn portable_pty::Child + Send>>>,
-    pub submit_key: String,
-    pub inject_prefix: String,
-    pub typed_inject: bool,
-    pub spawned_at: std::time::Instant,
-    pub spawned_at_epoch_ms: u64,
+    pub(crate) id: crate::types::InstanceId,
+    pub(crate) name: String,
+    pub(crate) backend_command: String,
+    pub(crate) pty_writer: PtyWriter,
+    pub(crate) pty_master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    pub(crate) core: Arc<Mutex<AgentCore>>,
+    pub(crate) child: Arc<Mutex<Box<dyn portable_pty::Child + Send>>>,
+    pub(crate) submit_key: String,
+    pub(crate) inject_prefix: String,
+    pub(crate) typed_inject: bool,
+    pub(crate) spawned_at: std::time::Instant,
+    pub(crate) spawned_at_epoch_ms: u64,
     /// Set by DELETE handler to prevent reaper from spawning shell fallback.
-    pub deleted: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) deleted: Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub type AgentRegistry = Arc<Mutex<HashMap<String, AgentHandle>>>;
 
 /// Handle for an externally connected agent (not PTY-managed by daemon).
 pub struct ExternalAgentHandle {
-    pub backend_command: String,
-    pub pid: u32,
+    pub(crate) backend_command: String,
+    pub(crate) pid: u32,
 }
 
 pub type ExternalRegistry = Arc<Mutex<HashMap<String, ExternalAgentHandle>>>;
