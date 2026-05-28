@@ -88,6 +88,10 @@ pub enum LayoutHint {
     Tab,
     SplitRight,
     SplitBelow,
+    /// #1431: place the new pane in the tab the same-named pane occupied
+    /// before removal. Used by `replace_instance` so a replaced agent returns
+    /// to its original tab instead of opening a fresh one.
+    SameTab,
 }
 
 impl LayoutHint {
@@ -95,6 +99,7 @@ impl LayoutHint {
         match s {
             "split-right" => Self::SplitRight,
             "split-below" => Self::SplitBelow,
+            "same-tab" => Self::SameTab,
             _ => Self::Tab,
         }
     }

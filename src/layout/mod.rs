@@ -15,6 +15,7 @@ pub use tab::{DragTabTarget, Tab};
 pub use tree::{swap_panes, PaneNode, SplitDir};
 
 use ratatui::layout::Rect;
+use std::collections::HashMap;
 
 /// Where a moved pane should land in its new tab.
 pub enum MovePlacement {
@@ -35,6 +36,11 @@ pub struct Layout {
     pub tab_reorder_source: Option<usize>,
     /// Drop target tab index during tab reorder drag.
     pub tab_reorder_target: Option<usize>,
+    /// #1431: tab name an agent's pane occupied at removal time, keyed by
+    /// agent name. Recorded on pane removal and consumed by a subsequent
+    /// `LayoutHint::SameTab` spawn (replace_instance) so the new pane returns
+    /// to its original tab. Bounded by distinct agent names.
+    removed_tab_memory: HashMap<String, String>,
 }
 
 pub const TAB_BAR_HEIGHT: u16 = 1;
@@ -52,7 +58,19 @@ impl Layout {
             next_pane_id: 0,
             tab_reorder_source: None,
             tab_reorder_target: None,
+            removed_tab_memory: HashMap::new(),
         }
+    }
+
+    /// #1431: remember which tab `agent`'s pane occupied, so a later
+    /// `SameTab` spawn can return its replacement to the same tab.
+    pub fn remember_removed_tab(&mut self, agent: &str, tab_name: String) {
+        self.removed_tab_memory.insert(agent.to_string(), tab_name);
+    }
+
+    /// #1431: take (and forget) the remembered tab name for `agent`.
+    pub fn take_removed_tab(&mut self, agent: &str) -> Option<String> {
+        self.removed_tab_memory.remove(agent)
     }
 
     pub fn next_pane_id(&mut self) -> usize {

@@ -5,7 +5,7 @@
 //! the layout accordingly — auto-creating or removing tabs/panes.
 
 use crate::agent::{self, AgentRegistry};
-use crate::layout::{Layout, MovePlacement, SplitDir, Tab};
+use crate::layout::{Layout, MovePlacement, Pane, SplitDir, Tab};
 
 /// Events sent from the API server to the TUI event loop when agents or teams
 /// are created/deleted via MCP tools. The TUI reacts by auto-creating or
@@ -59,6 +59,9 @@ pub(crate) enum LayoutHint {
     Tab,
     SplitRight,
     SplitBelow,
+    /// #1431: return the new pane to the tab the same-named pane occupied
+    /// before removal (replace_instance).
+    SameTab,
 }
 
 pub(crate) type TuiEventSender = crossbeam_channel::Sender<TuiEvent>;
@@ -82,6 +85,7 @@ impl crate::api::ApiNotifier for TuiNotifier {
                     crate::api::LayoutHint::Tab => LayoutHint::Tab,
                     crate::api::LayoutHint::SplitRight => LayoutHint::SplitRight,
                     crate::api::LayoutHint::SplitBelow => LayoutHint::SplitBelow,
+                    crate::api::LayoutHint::SameTab => LayoutHint::SameTab,
                 };
                 TuiEvent::InstanceCreated {
                     name,
@@ -242,7 +246,9 @@ fn resolve_split_anchor(
     spawner: Option<&str>,
     layout: &Layout,
 ) -> Option<SplitAnchor> {
-    if matches!(hint, LayoutHint::Tab) {
+    // Tab opens a fresh tab; SameTab (#1431) is resolved separately in
+    // handle_instance_created via the remembered-tab map. Neither anchors a split.
+    if matches!(hint, LayoutHint::Tab | LayoutHint::SameTab) {
         return None;
     }
     if let Some(tp) = target_pane {
@@ -320,8 +326,10 @@ fn handle_instance_created(
             let dir = match hint {
                 LayoutHint::SplitRight => SplitDir::Horizontal,
                 LayoutHint::SplitBelow => SplitDir::Vertical,
-                // Tab was filtered out by resolve_split_anchor.
-                LayoutHint::Tab => unreachable!("Tab hint never produces a SplitAnchor"),
+                // Tab / SameTab were filtered out by resolve_split_anchor.
+                LayoutHint::Tab | LayoutHint::SameTab => {
+                    unreachable!("Tab/SameTab hints never produce a SplitAnchor")
+                }
             };
             match a {
                 SplitAnchor::Pane { tab_idx, pane_id } => {
@@ -335,13 +343,38 @@ fn handle_instance_created(
                 }
             }
         }
-        None => {
-            layout.add_tab(Tab::new(name.to_string(), pane));
+        None => match hint {
+            // #1431: a replace_instance re-spawn returns to the tab the old
+            // same-named pane occupied (recorded on its removal).
+            LayoutHint::SameTab => match layout.take_removed_tab(name) {
+                Some(tab_name) => place_in_remembered_tab(layout, &tab_name, pane),
+                None => layout.add_tab(Tab::new(name.to_string(), pane)),
+            },
+            _ => layout.add_tab(Tab::new(name.to_string(), pane)),
+        },
+    }
+}
+
+/// #1431: place a replacement pane into the tab named `tab_name`. Splits the
+/// tab's focused pane if the tab still exists, otherwise recreates a tab with
+/// that name. Same tab is guaranteed; the exact split slot is best-effort —
+/// the original leaf was destroyed when the replaced pane was removed.
+fn place_in_remembered_tab(layout: &mut Layout, tab_name: &str, pane: Pane) {
+    match layout.tabs.iter().position(|t| t.name == tab_name) {
+        Some(idx) => {
+            layout.tabs[idx].split_focused(SplitDir::Horizontal, pane);
         }
+        None => layout.add_tab(Tab::new(tab_name.to_string(), pane)),
     }
 }
 
 fn handle_instance_deleted(name: &str, layout: &mut Layout) {
+    // #1431: remember the tab this agent occupied so a replace_instance
+    // re-spawn (LayoutHint::SameTab) can return the new pane to the same tab.
+    if let Some((tab_idx, _)) = layout.find_agent_pane(name) {
+        let tab_name = layout.tabs[tab_idx].name.clone();
+        layout.remember_removed_tab(name, tab_name);
+    }
     remove_agent_pane(name, layout);
 }
 
@@ -742,5 +775,70 @@ mod tests {
 
         assert_eq!(layout.tabs.len(), 1, "single-pane tab must close");
         assert_eq!(layout.tabs[0].name, "other");
+    }
+
+    /// #1431: deleting a single-pane agent records its tab and closes the tab;
+    /// the SameTab replacement then recreates a tab with the original name so
+    /// the new pane returns to where the old one was (not a fresh tab).
+    #[test]
+    fn replace_recreates_closed_tab_by_name() {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("work".into(), leaf(1, "dev")));
+
+        handle_instance_deleted("dev", &mut layout);
+        assert_eq!(layout.tabs.len(), 0, "single-pane tab closes on delete");
+
+        let tab_name = layout
+            .take_removed_tab("dev")
+            .expect("delete must record the agent's tab");
+        assert_eq!(tab_name, "work");
+
+        place_in_remembered_tab(&mut layout, &tab_name, leaf(2, "dev"));
+        assert_eq!(layout.tabs.len(), 1);
+        assert_eq!(
+            layout.tabs[0].name, "work",
+            "replacement returns to the original tab name"
+        );
+        assert!(layout.tabs[0].root().has_agent("dev"));
+    }
+
+    /// #1431: deleting one agent from a multi-pane tab leaves the tab alive;
+    /// the SameTab replacement splits back into that surviving tab rather than
+    /// opening a new one.
+    #[test]
+    fn replace_splits_into_surviving_tab() {
+        use crate::layout::SplitDir;
+        let mut layout = Layout::new();
+        let mut tab = Tab::new("team".into(), leaf(1, "dev"));
+        tab.split_focused(SplitDir::Horizontal, leaf(2, "reviewer"));
+        layout.add_tab(tab);
+
+        handle_instance_deleted("dev", &mut layout);
+        assert_eq!(layout.tabs.len(), 1, "multi-pane tab survives delete");
+        let tab_name = layout.take_removed_tab("dev").expect("tab recorded");
+        assert_eq!(tab_name, "team");
+
+        place_in_remembered_tab(&mut layout, &tab_name, leaf(3, "dev"));
+        assert_eq!(layout.tabs.len(), 1, "no new tab created");
+        assert_eq!(layout.tabs[0].name, "team");
+        assert!(layout.tabs[0].root().has_agent("dev"));
+        assert!(layout.tabs[0].root().has_agent("reviewer"));
+    }
+
+    /// #1431: SameTab never produces a split anchor — placement is resolved via
+    /// the remembered-tab map, not resolve_split_anchor (even when a
+    /// target_pane / spawner is present).
+    #[test]
+    fn resolve_anchor_same_tab_hint_always_none() {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("t".into(), leaf(1, "a")));
+        assert!(resolve_split_anchor(LayoutHint::SameTab, Some("a"), Some("a"), &layout).is_none());
+    }
+
+    /// #1431: take_removed_tab yields None for an agent that was never removed.
+    #[test]
+    fn take_removed_tab_none_for_unrecorded_agent() {
+        let mut layout = Layout::new();
+        assert!(layout.take_removed_tab("never-seen").is_none());
     }
 }
