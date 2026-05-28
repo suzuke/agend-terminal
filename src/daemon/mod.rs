@@ -178,6 +178,16 @@ pub struct AgentConfig {
     pub submit_key: String,
 }
 
+/// Shared daemon state threaded through run_core's extracted phases.
+struct DaemonContext {
+    registry: AgentRegistry,
+    externals: crate::agent::ExternalRegistry,
+    configs: Arc<Mutex<HashMap<String, AgentConfig>>>,
+    crash_tx: crossbeam_channel::Sender<crate::agent::AgentExitEvent>,
+    crash_rx: crossbeam_channel::Receiver<crate::agent::AgentExitEvent>,
+    shutdown: Arc<AtomicBool>,
+}
+
 /// Get the PID-isolated run directory for the current daemon.
 pub fn run_dir(home: &Path) -> PathBuf {
     home.join("run").join(std::process::id().to_string())
@@ -388,23 +398,101 @@ fn run_core(
     agents: Vec<AgentDef>,
     telegram: Option<Arc<dyn crate::channel::Channel>>,
 ) -> anyhow::Result<()> {
-    // Sprint 57 Wave 3 PR-2 (#548 Q6): record startup time for the
-    // shutdown-sequence uptime metric.
     let started_at = std::time::Instant::now();
 
-    // Sprint 25 P0 Option F: mark this process as the daemon so
-    // `mcp::is_running_inside_daemon_process()` can short-circuit
-    // tool calls without TCP round-trip.
-    // G3 H1: replaced set_var with DaemonConfig init (thread-safe).
+    let ctx = init_daemon_services(home, telegram)?;
+
+    spawn_fleet_agents(home, &agents, &ctx);
+
+    let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
+    crate::bootstrap::signals::install(Arc::clone(&ctx.shutdown), shutdown_tx);
+
+    crate::event_log::log(home, "daemon_start", "", &format!("{} agents", agents.len()));
+    tracing::info!("running, Ctrl+C or `agend-terminal stop` to stop");
+
+    let (_keepalive, handlers, tick_rx) = build_tick_infrastructure(home, &ctx);
+
+    loop {
+        if ctx.shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let exit_event: Option<crate::agent::AgentExitEvent>;
+        crossbeam_channel::select! {
+            recv(ctx.crash_rx) -> msg => { exit_event = msg.ok(); }
+            recv(tick_rx) -> _ => { exit_event = None; }
+            recv(shutdown_rx) -> _ => { continue; }
+        }
+
+        let tick_ctx = per_tick::TickContext {
+            home,
+            registry: &ctx.registry,
+            externals: &ctx.externals,
+            configs: &ctx.configs,
+        };
+        crate::runtime_config::reload(home);
+        per_tick::run_handlers_with_panic_guard(&handlers, &tick_ctx);
+
+        let exit_event = match exit_event {
+            Some(e) => e,
+            None => continue,
+        };
+
+        if ctx.shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+        match exit_event {
+            crate::agent::AgentExitEvent::CleanExit(ref name) => {
+                tracing::info!(agent = %name, "clean exit — removing from registry (no respawn)");
+                ctx.registry.lock().remove(name.as_str());
+                ctx.configs.lock().remove(name.as_str());
+            }
+            crate::agent::AgentExitEvent::Stage2Restart(name) => {
+                spawn_stage2_thread(home, &name, &ctx);
+            }
+            crate::agent::AgentExitEvent::Crash(name) => {
+                handle_crash_respawn(home, &name, &ctx);
+            }
+        }
+    }
+
+    log_residual_worktrees(home, &ctx.configs);
+
+    let metrics = shutdown_sequence(home, &ctx.registry, started_at);
+    crate::event_log::log(
+        home,
+        "daemon_stop",
+        "",
+        &format!(
+            "reason={} agents_total={} agents_killed_after_grace={} uptime_secs={}",
+            metrics.reason.as_str(),
+            metrics.agents_total,
+            metrics.agents_killed_after_grace,
+            metrics.uptime_secs
+        ),
+    );
+    let _ = std::fs::remove_dir_all(run_dir(home));
+    std::thread::sleep(std::time::Duration::from_secs(1));
+
+    if RESTART_PENDING.load(Ordering::Acquire) {
+        let flag = home.join("restart-requested");
+        let _ = std::fs::remove_file(&flag);
+        tracing::info!("operator-initiated restart: exiting with code 42");
+        std::process::exit(42);
+    }
+
+    tracing::info!("exiting");
+    Ok(())
+}
+
+// ── Extracted phases ────────────────────────────────────────────
+
+fn init_daemon_services(
+    home: &Path,
+    telegram: Option<Arc<dyn crate::channel::Channel>>,
+) -> anyhow::Result<DaemonContext> {
     crate::daemon_config::init(crate::daemon_config::DaemonConfig::default());
 
-    // Sprint 62 W1 PR-2 (#P0-2 skills-stage GC): sweep stale
-    // <home>/.skills-stage/<digest>/ dirs older than 7 days. Runs
-    // BEFORE any spawn_and_register_agent invocation so concurrent
-    // install_for_agent never races with the GC. Empty exclusion
-    // list at this site (no installs have happened yet); periodic-
-    // GC sites added later would pass currently-resolved digests.
-    // Best-effort: failures log + continue, never block boot.
     const SKILLS_STAGE_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
     crate::bootstrap::time_step("skills::cleanup_stale_stages", || {
         match crate::skills::cleanup_stale_stages(home, SKILLS_STAGE_RETENTION_SECS, &[]) {
@@ -413,26 +501,12 @@ fn run_core(
         }
     });
 
-    // Sprint 63 W1 PR-2 (Sprint 58 P2 #5): sweep stale `*.tmp` /
-    // `*.json.tmp` orphans under <home>/dedup-state/ left behind by
-    // crashed atomic_write cycles. 1-day retention threshold (much
-    // shorter than skills-stage 7-day because tmp files should never
-    // legitimately persist longer than a single syscall pair).
-    // Best-effort: failures log + continue (function returns
-    // DedupStateGcReport directly, no Err path).
     const DEDUP_TMP_RETENTION_SECS: u64 = 24 * 60 * 60;
     let dedup_report = crate::bootstrap::time_step("dedup_state::cleanup_tmp_orphans", || {
         crate::daemon::dedup_state::cleanup_tmp_orphans(home, DEDUP_TMP_RETENTION_SECS)
     });
     tracing::info!(?dedup_report, "dedup-state GC: daemon-init sweep complete");
 
-    // Sprint 24 P0 PR2 — bridge-phase legacy migration. Walks tasks.json
-    // and emits canonical Created (+ status transition) events into
-    // task_events.jsonl. Idempotent: re-run is a no-op via tail-scan
-    // against the existing event log. Runs synchronously BEFORE any MCP
-    // tool registration / agent spawn so operators never observe a "list
-    // empty" race. Fail-loud: any error aborts daemon startup so the
-    // operator sees the failure rather than silently inconsistent state.
     let legacy_migration =
         crate::bootstrap::time_step("tasks::migrate_legacy_tasks_json_to_event_log", || {
             crate::tasks::migrate_legacy_tasks_json_to_event_log(home)
@@ -449,58 +523,28 @@ fn run_core(
     }
 
     let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
-    // #945 Phase 1: publish registry to the pending slot so the
-    // backgrounded telegram_init thread can attach it after
-    // `register_active_channel` lands (~6s after boot). The
-    // pre-#945 sync path `if let Some(tg) = telegram { ... }`
-    // doesn't fire anymore because `prepared.telegram` is always
-    // None post-backgrounding. The eager-attach path below
-    // covers the rare case where telegram_init completed BEFORE
-    // run_core reached this point (e.g. cached / mocked / fast).
     crate::agent::set_pending_registry(Arc::clone(&registry));
     if let Some(tg) = telegram.as_ref() {
         tg.attach_registry(Arc::clone(&registry));
     } else if let Some(tg) = crate::channel::active_channel() {
-        // #945 Phase 1: eager-attach if telegram_init already
-        // completed before this site (rare but possible — e.g.
-        // a test with mocked-fast init or warm-cache scenario).
         tg.attach_registry(Arc::clone(&registry));
     }
 
-    // External agents registry (connected via `agend-terminal connect`)
     let externals: crate::agent::ExternalRegistry = Arc::new(Mutex::new(HashMap::new()));
-
-    // Crash channel for auto-respawn.
-    //
-    // Bounded to prevent the reaper from accumulating unbounded crash events
-    // if the main loop stalls (P2-2, review 2026-04-18). 64 is comfortably
-    // more than a plausible burst — every fleet member crashing at once —
-    // and senders use `try_send` so a full channel drops the event with a
-    // warning rather than blocking the PTY close handler.
     let (crash_tx, crash_rx) = crossbeam_channel::bounded::<crate::agent::AgentExitEvent>(64);
-
-    // Store configs for respawn
     let configs: Arc<Mutex<HashMap<String, AgentConfig>>> = Arc::new(Mutex::new(HashMap::new()));
+    let shutdown = Arc::new(AtomicBool::new(false));
 
-    // Shutdown flag — shared with agent reapers to distinguish crash from shutdown
-    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-    // #879v4 C1 ordering: start the API socket server BEFORE spawning agents.
-    // The agents' `agend-mcp-bridge` processes attempt to connect to
-    // `api.port` as soon as their MCP backend invokes `tools/list`; a
-    // legacy ordering that spawned agents first delayed `api.port`
-    // publication by ~N×spawn_stagger and surfaced as silent empty tool
-    // lists (see #879 RCA spike + tests/attached_path_mcp_invariants.rs).
-    let api_reg = Arc::clone(&registry);
-    let api_home = home.to_path_buf();
-    let api_shutdown = Arc::clone(&shutdown);
-    let api_configs = Arc::clone(&configs);
-    let api_externals = Arc::clone(&externals);
     // fire-and-forget: api::serve runs the Unix socket accept loop for the
     // daemon's lifetime. Loop observes shutdown via the cloned AtomicBool;
     // the socket file is removed during daemon shutdown, which surfaces as a
     // bind/accept error and exits the loop. JoinHandle dropped because no
     // graceful join is needed — process exit reaps the thread.
+    let api_reg = Arc::clone(&registry);
+    let api_home = home.to_path_buf();
+    let api_shutdown = Arc::clone(&shutdown);
+    let api_configs = Arc::clone(&configs);
+    let api_externals = Arc::clone(&externals);
     std::thread::Builder::new()
         .name("api_server".into())
         .spawn(move || {
@@ -514,20 +558,28 @@ fn run_core(
             )
         })?;
 
-    tracing::info!(count = agents.len(), "starting agents");
+    Ok(DaemonContext {
+        registry,
+        externals,
+        configs,
+        crash_tx,
+        crash_rx,
+        shutdown,
+    })
+}
 
+fn spawn_fleet_agents(home: &Path, agents: &[AgentDef], ctx: &DaemonContext) {
+    tracing::info!(count = agents.len(), "starting agents");
     crate::bootstrap::time_step("agent_spawn_loop", || {
-        for def in &agents {
-            // #896 Option D: spawn_and_register_agent now rolls back on
-            // synchronous TUI prep failure and returns Err. We log + skip
-            // the affected agent rather than aborting the entire daemon
-            // startup — operator sees `agend-terminal list` shorter than
-            // fleet.yaml expected + daemon log explains which agent failed
-            // and why. Daemon-as-a-whole stays up so the surviving agents
-            // are still usable while the operator investigates.
-            if let Err(e) =
-                spawn_and_register_agent(home, def, &registry, &configs, &crash_tx, &shutdown)
-            {
+        for def in agents {
+            if let Err(e) = spawn_and_register_agent(
+                home,
+                def,
+                &ctx.registry,
+                &ctx.configs,
+                &ctx.crash_tx,
+                &ctx.shutdown,
+            ) {
                 tracing::error!(
                     agent = %def.0,
                     error = %e,
@@ -540,149 +592,72 @@ fn run_core(
         }
     });
 
-    // #922: write `<run_dir>/.ready` to signal daemon-init-complete —
-    // the 4th lifecycle file alongside `.daemon` / `api.cookie` / `api.port`
-    // (see CLAUDE.md "Daemon lifecycle files"). Distinct from `api.port`
-    // existence: `api.port` appears at #906 reorder time (before the
-    // spawn loop), so external probers seeing it cannot assume the
-    // registry is populated. `.ready` is the load-bearing "spawn loop
-    // completed, agent count is final" signal — log-and-continue means
-    // count may be < fleet.size, but no further changes from THIS boot
-    // sequence. Single boot-completion signal per lead synth — future
-    // sub-stage signals extend `.ready`'s content (JSON payload), not
-    // add new files. Cleanup is automatic via `remove_dir_all(run_dir)`
-    // at shutdown (no new code path).
     crate::bootstrap::time_step("ready_marker_write", || {
         let ready_path = run_dir(home).join(".ready");
         if let Err(e) = std::fs::write(&ready_path, chrono::Utc::now().to_rfc3339()) {
             tracing::warn!(path = %ready_path.display(), error = %e, "failed to write .ready marker");
         }
     });
+}
 
-    // Shutdown wake channel — signal handler sends on this so the main loop's
-    // select! wakes immediately instead of waiting up to 10s for the next tick.
-    let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
-    crate::bootstrap::signals::install(Arc::clone(&shutdown), shutdown_tx);
+/// Opaque bag of daemon-lifetime handles that must not be dropped
+/// until the main loop exits.
+struct TickKeepalive {
+    _task_sweep: crate::daemon::task_sweep::TaskSweep,
+}
 
-    crate::event_log::log(
-        home,
-        "daemon_start",
-        "",
-        &format!("{} agents", agents.len()),
-    );
-    tracing::info!("running, Ctrl+C or `agend-terminal stop` to stop");
-
-    // Sprint 24 P0 PR2 — task auto-close sweep daemon. Holds the
-    // ticker handle for the duration of run_core so the spawned thread
-    // observes the shared shutdown atomic; drop is a no-op per the
-    // current daemon fire-and-forget convention. Sweep no-ops until the
-    // operator configures `repo` via the `task_sweep_config` MCP tool.
+fn build_tick_infrastructure(
+    home: &Path,
+    ctx: &DaemonContext,
+) -> (
+    TickKeepalive,
+    Vec<Box<dyn per_tick::PerTickHandler>>,
+    crossbeam_channel::Receiver<()>,
+) {
     let _task_sweep =
-        crate::daemon::task_sweep::TaskSweep::spawn(home.to_path_buf(), Arc::clone(&shutdown));
+        crate::daemon::task_sweep::TaskSweep::spawn(home.to_path_buf(), Arc::clone(&ctx.shutdown));
 
-    // Per-agent stall detector — see daemon::supervisor module-doc.
-    // Pushes vterm tail to channel topic when an agent stalls pre-ready.
-    // Fire-and-forget: detector tick loop runs for the daemon process lifetime.
-    // Unix-only (the supervisor itself is Unix-only).
-    //
-    // #1027: headless daemon has no TUI to surface the binary-stale
-    // flag, so pass a throwaway Arc. The flag still flips correctly;
-    // nothing reads it. Adding a richer surface (e.g. structured event
-    // file) is future scope if operators ask for headless visibility.
     #[cfg(unix)]
     {
         let daemon_binary_stale: crate::daemon::mcp_registry_watcher::DaemonBinaryStale =
-            Arc::new(std::sync::atomic::AtomicBool::new(false));
+            Arc::new(AtomicBool::new(false));
         supervisor::spawn(
             home.to_path_buf(),
-            Arc::clone(&registry),
+            Arc::clone(&ctx.registry),
             daemon_binary_stale,
         );
     }
-    router::spawn(home.to_path_buf(), Arc::clone(&registry));
-    crate::instance_monitor::spawn_monitor_tick(home.to_path_buf(), Arc::clone(&registry));
+    router::spawn(home.to_path_buf(), Arc::clone(&ctx.registry));
+    crate::instance_monitor::spawn_monitor_tick(home.to_path_buf(), Arc::clone(&ctx.registry));
 
-    // Recover any half-written inbox files from a previous crash.
     crate::inbox::recover_half_writes(home);
-
-    // Replay missed one-shot schedules from before daemon was down.
-    // Must run once at startup, before the tick loop, so missed one-shots
-    // fire exactly once. The tick loop's check_schedules handles future
-    // one-shots and recurring crons.
-    replay_missed_at_startup(home, &registry);
-
-    // Sprint 57 Wave 2 Track B (#546 Items 1+3) — eager ci-watch
-    // sweep at daemon startup: removes any expired or protected-ref
-    // watch left behind by a prior daemon process before the first
-    // tick fires. Idempotent.
+    replay_missed_at_startup(home, &ctx.registry);
     crate::daemon::ci_watch::startup_sweep(home);
 
-    // Per-tick handlers (#694 BLOCK 1 — see daemon::per_tick). Owned
-    // across the daemon's lifetime so their interior state (snapshot
-    // dedup string, poll-reminder + inbox-maintenance counters) persists
-    // across ticks. Called at their pre-extraction sites in the main
-    // loop below.
-    // Watchdog dry-run mode: log classifications without mutating health
-    // state. Read ONCE at daemon startup (matches pre-extraction
-    // semantics; env changes mid-runtime are not observed).
     let watchdog_dry_run = watchdog::watchdog_dry_run_from_env();
-    // #694 BLOCK 1 closeout — eight handlers collapsed from named bindings
-    // + per-handler call sites into a single Vec dispatched by a uniform
-    // for-loop below. Vec order MUST match the pre-collapse call order;
-    // that ordering is the zero-behavior-change guarantee.
+    // Vec order MUST match the pre-extraction call order (zero-behavior-change guarantee).
     let handlers: Vec<Box<dyn per_tick::PerTickHandler>> = vec![
         Box::new(per_tick::HangDetectionHandler::new()),
-        // `#685` sub-task 7a Stage 1 / 7b Stage 2: recovery dispatcher
-        // MUST run after `HangDetectionHandler` in the same tick so it
-        // reads the freshly-updated `HealthState` (sub-task 1 §Invariants 5b
-        // means `check_hang` returns true only on transition-into-Hung;
-        // dispatcher reads state directly to handle the "still Hung" case).
-        // Shadow-mode by default — gated on `AGEND_AUTO_RECOVERY_STAGE1=1`
-        // / `STAGE2=1`. Constructor takes `crash_tx` so the Stage 2
-        // arm can `try_send` the `AgentExitEvent::Stage2Restart` variant
-        // that the respawn worker (`daemon/mod.rs:642` Stage 2 arm)
-        // splits on. See `docs/RECOVERY-STAGES.md` §RS.9.
         Box::new(per_tick::RecoveryDispatcherHandler::new(
-            std::sync::Arc::new(crash_tx.clone()),
+            std::sync::Arc::new(ctx.crash_tx.clone()),
         )),
         Box::new(per_tick::WatchdogHandler::new(watchdog_dry_run)),
         Box::new(per_tick::ExternalLivenessHandler::new()),
         Box::new(per_tick::SnapshotRotationHandler::new()),
         Box::new(per_tick::CheckSchedulesHandler::new()),
         Box::new(per_tick::CiWatchPollHandler::new()),
-        // #972: pr_state scanner runs AFTER ci_watch_poll so any CI
-        // ingestion that fired this tick can be turned into emitted
-        // events in the same tick. Drains pr-state/*.json, emits
-        // [pr-ready-for-merge] / [pr-merged] / [pr-closed-unmerged]
-        // / [pr-state-invalidated] events to PR authors, sweeps
-        // terminal-state files. Cheap (file walk + json parse) when
-        // no PRs are in flight.
         Box::new(per_tick::PrStateScanHandler::new()),
         Box::new(per_tick::InboxMaintenanceHandler::new(60)),
         Box::new(per_tick::PollReminderHandler::new(30)),
-        // #914 hourly cleanup: 10s tick × 360 = 3600s. Hard backstop on
-        // daemon.log.* dir size beyond what `max_log_files` enforces,
-        // plus the Unix symlink-to-newest refresh.
         Box::new(per_tick::LogRotationHandler::new(360)),
-        // #941: periodic thread-state dump for incident-grade observability.
-        // Gated on `AGEND_DAEMON_THREAD_DUMP_SECS=N` (N >= 1 enable; default
-        // disabled). When disabled, ThreadDumpHandler.run() is a sub-µs
-        // no-op (one cached atomic load). See
-        // `daemon/per_tick/thread_dump.rs` for full design + the
-        // wrapper-only blind spot caveat.
         Box::new(per_tick::ThreadDumpHandler::new()),
-        // Hourly worktree GC: 10s tick × 360 = 3600s. Removes daemon-
-        // managed worktrees past grace period + stale ci-watch locks.
         Box::new(per_tick::GcTickHandler::new(360)),
     ];
 
-    // Periodic tick channel (every 10s for health/schedule/session maintenance)
     let tick_rx = {
         let (tx, rx) = crossbeam_channel::bounded(1);
         // fire-and-forget: tick producer terminates when the bounded(1) tx
-        // returns Err, which happens when the rx end (held by the main loop)
-        // is dropped during daemon shutdown. Self-terminating; no JoinHandle
-        // tracking needed.
+        // returns Err (rx dropped during daemon shutdown). Self-terminating.
         std::thread::Builder::new()
             .name("daemon_tick".into())
             .spawn(move || loop {
@@ -695,390 +670,233 @@ fn run_core(
         rx
     };
 
-    // Main loop: event-driven via select on crash channel + periodic tick
-    loop {
-        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-            break;
-        }
+    (TickKeepalive { _task_sweep }, handlers, tick_rx)
+}
 
-        // Block until an exit event, periodic tick, or shutdown signal.
-        let exit_event: Option<crate::agent::AgentExitEvent>;
-        crossbeam_channel::select! {
-            recv(crash_rx) -> msg => {
-                exit_event = msg.ok();
-            }
-            recv(tick_rx) -> _ => {
-                exit_event = None;
-            }
-            recv(shutdown_rx) -> _ => {
-                // Re-check flag at top of loop and break.
-                continue;
-            }
-        }
-
-        // Per-tick context shared by handlers extracted under #694 BLOCK 1.
-        // Borrows are valid for the rest of this iteration; coexists with
-        // other immutable uses of `&registry` / `&externals` / `&configs`
-        // below.
-        let tick_ctx = per_tick::TickContext {
-            home,
-            registry: &registry,
-            externals: &externals,
-            configs: &configs,
-        };
-
-        // Periodic maintenance (runs on every wake, whether crash or tick).
-        // AwaitingOperator detection lives in the dedicated supervisor thread
-        // (spawned earlier) so app mode gets the same behavior as daemon mode.
-        // Hang detection and health decay stay here — they're daemon-only
-        // concerns (hang notifications tie into crash respawn accounting).
-        // #694 BLOCK 1 closeout — handler dispatch is Vec-driven (see
-        // `let handlers = …` above). The pre-collapse call order is
-        // preserved verbatim by the Vec literal's element order; this
-        // loop is the only call site.
-        //
-        // #1002 Phase 1: dispatch now goes through
-        // `per_tick::run_handlers_with_panic_guard`, which wraps each
-        // `handler.run()` in `catch_unwind`. A panic in handler N no
-        // longer aborts handlers N+1..end on the same tick — they all
-        // run, and the panic is logged with handler identity instead
-        // of vanishing. The wrapper folds in #941 per-handler timing
-        // (previously inline here). See
-        // `per_tick::tests::panicking_handler_does_not_skip_siblings`
-        // for the regression-pin.
-        // #1085: reload runtime-mutable config each tick.
-        crate::runtime_config::reload(home);
-
-        per_tick::run_handlers_with_panic_guard(&handlers, &tick_ctx);
-
-        // Handle exit event (if any)
-        let exit_event = match exit_event {
-            Some(e) => e,
-            None => continue, // Tick only — no exit to handle
-        };
-
-        // Handle clean exit: agent typed /exit or /quit — no respawn.
-        if let crate::agent::AgentExitEvent::CleanExit(ref name) = exit_event {
-            if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-                break;
-            }
-            tracing::info!(agent = %name, "clean exit — removing from registry (no respawn)");
-            {
-                let mut reg = registry.lock();
-                reg.remove(name.as_str());
-            }
-            configs.lock().remove(name.as_str());
-            continue;
-        }
-
-        // `#685` sub-task 7b: Stage 2 auto-restart path. Emitted by the
-        // recovery dispatcher (`per_tick/recovery_dispatcher.rs`) when an
-        // agent re-Hung after Stage 1 ESC fail OR the agent was
-        // dead-likely from the start. Distinct from crash because Stage 2
-        // is controlled, not detected — skip `record_crash`, use shorter
-        // backoff, selectively preserve crash counters + recovery counter
-        // across the spawn boundary (decision §1 critical wrinkle: fresh
-        // `HealthTracker` on spawn). See `docs/RECOVERY-STAGES.md` §RS.9.
-        if let crate::agent::AgentExitEvent::Stage2Restart(name) = exit_event {
-            if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-                tracing::info!(agent = %name, "ignoring stage2 restart during shutdown");
-                break;
-            }
-            let home_owned = home.to_path_buf();
-            let reg = Arc::clone(&registry);
-            let cfgs = Arc::clone(&configs);
-            let tx = crash_tx.clone();
-            let sd = Arc::clone(&shutdown);
-            // fire-and-forget: stage2 restart worker is short-lived (backoff sleep
-            // then spawn_agent + restore health counters). Observes shutdown flag
-            // after backoff to abort cleanly. JoinHandle dropped because errors are
-            // logged inside handle_stage2_restart + event_log records outcome.
-            if let Err(e) = std::thread::Builder::new()
-                .name(format!("{name}_stage2"))
-                .spawn(move || {
-                    handle_stage2_restart(&home_owned, &name, &reg, &cfgs, &tx, &sd);
-                })
-            {
-                tracing::warn!(error = %e, "failed to spawn stage2 restart thread");
-            }
-            continue;
-        }
-
-        // Crash path: extract name and proceed with respawn logic.
-        let crashed_name = match exit_event {
-            crate::agent::AgentExitEvent::Crash(n) => n,
-            _ => continue,
-        };
-
-        // Ignore crash events during shutdown — agents are being killed intentionally.
-        // This prevents spurious respawns and "Agent restarted" system messages.
-        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-            tracing::info!(agent = %crashed_name, "ignoring crash during shutdown");
-            break;
-        }
-
-        tracing::warn!(agent = %crashed_name, "crashed");
-        crate::event_log::log(home, "crash", &crashed_name, "agent crashed");
-
-        // Get config for respawn
-        let config = configs.lock().get(&crashed_name).cloned();
-        let config = match config {
-            Some(c) => c,
-            None => {
-                tracing::debug!(agent = %crashed_name, "no config for respawn (likely deleted)");
-                continue;
-            }
-        };
-
-        // Record crash in health tracker (unified in AgentCore)
-        let (should_respawn, delay, should_notify) = {
-            let reg = agent::lock_registry(&registry);
-            match reg.get(&crashed_name) {
-                Some(handle) => {
-                    let mut core = handle.core.lock();
-                    core.health.record_crash()
-                }
-                None => {
-                    tracing::warn!(agent = %crashed_name, "not in registry, skipping");
-                    continue;
-                }
-            }
-        };
-
-        if should_notify {
-            let state = {
-                let reg = agent::lock_registry(&registry);
-                reg.get(&crashed_name)
-                    .map(|h| h.core.lock().health.state.display_name())
-                    .unwrap_or("unknown")
-            };
-            tracing::warn!(agent = %crashed_name, %state, "notifying");
-            let msg = format!("[health] {crashed_name}: {state}");
-            // Outbound info-leak gate (Sprint 21 Phase 1): crash
-            // notification carries the agent state name; gated_notify
-            // drops when the channel is unauthorised.
-            if let Some(ch) = crate::channel::active_channel() {
-                let _ = crate::channel::gated_notify(
-                    ch.as_ref(),
-                    &crashed_name,
-                    NotifySeverity::Error,
-                    &msg,
-                    false,
-                );
-            } else {
-                tracing::debug!(agent = %crashed_name, "no active channel for crash notification");
-            }
-        }
-
-        if should_respawn {
-            tracing::info!(agent = %crashed_name, ?delay, "respawning");
-            let reg = Arc::clone(&registry);
-            let home = home.to_path_buf();
-            let tx = crash_tx.clone();
-            let shutdown_for_respawn = Arc::clone(&shutdown);
-
-            // Save health tracker from old handle before respawn replaces it
-            let saved_health = {
-                let r = registry.lock();
-                r.get(&crashed_name).map(|h| h.core.lock().health.clone())
-            };
-
-            // fire-and-forget: respawn worker is short-lived (sleep delay then
-            // spawn_agent + restore health + start TUI server). Observes
-            // shutdown flag immediately after backoff to abort cleanly.
-            // JoinHandle dropped because Err is logged + crash counter handles
-            // accounting.
-            if let Err(e) = std::thread::Builder::new()
-                        .name(format!("{crashed_name}_respawn"))
-                        .spawn(move || {
-                            std::thread::sleep(delay);
-                            // Check shutdown flag after backoff — don't respawn during shutdown
-                            if shutdown_for_respawn.load(std::sync::atomic::Ordering::Relaxed) {
-                                tracing::info!(agent = %config.name, "shutdown during respawn backoff, aborting");
-                                return;
-                            }
-                            let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
-                            // #1080: re-install skills on crash respawn (idempotent).
-                            if let Some(ref wd) = config.working_dir {
-                                let skills_filter: Option<Vec<String>> =
-                                    crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
-                                        .ok()
-                                        .and_then(|c| c.instances.get(&config.name).and_then(|i| i.skills.clone()));
-                                if let Err(e) = crate::skills::install_for_agent(&home, wd, skills_filter.as_deref()) {
-                                    tracing::warn!(agent = %config.name, error = %e, "crash-respawn skills install failed");
-                                }
-                            }
-                            // Respawn fresh: stale --resume after a crash tends
-                            // to loop on "conversation not found".
-                            match agent::spawn_agent(
-                                &agent::SpawnConfig {
-                                    name: &config.name,
-                                    backend_command: &config.backend_command,
-                                    args: &config.args,
-                                    spawn_mode: crate::backend::SpawnMode::Fresh,
-                                    cols, rows,
-                                    env: config.env.as_ref(), working_dir: config.working_dir.as_deref(),
-                                    submit_key: &config.submit_key, home: Some(&home), crash_tx: Some(tx),
-                                    shutdown: Some(Arc::clone(&shutdown_for_respawn)),
-                                },
-                                &reg,
-                            ) {
-                                Ok(()) => {
-                                    tracing::info!(agent = %config.name, "respawned");
-                                    crate::event_log::log(&home, "respawn", &config.name, "agent respawned");
-
-                                    // Restore health tracker from old handle + mark respawn OK
-                                    {
-                                        let r = reg.lock();
-                                        if let Some(handle) = r.get(&config.name) {
-                                            let mut core = handle.core.lock();
-                                            if let Some(ref old_health) = saved_health {
-                                                core.health = old_health.clone();
-                                            }
-                                            core.health.respawn_ok();
-                                        }
-                                    }
-
-                                    // Inject system message
-                                    std::thread::sleep(std::time::Duration::from_secs(2));
-                                    {
-                                        let r = reg.lock();
-                                        if let Some(handle) = r.get(&config.name) {
-                                            let reason = handle.core.lock()
-                                                .health.crash_reason().to_string();
-                                            let msg = format!(
-                                                "[system] Agent restarted due to {reason}. Previous context was lost.\r"
-                                            );
-                                            let _ = agent::write_to_agent(handle, msg.as_bytes());
-                                        }
-                                    }
-
-                                    // Start TUI socket for respawned agent
-                                    let rdir = run_dir(&home);
-                                    let n = config.name.clone();
-                                    let n_err = n.clone();
-                                    let reg2 = Arc::clone(&reg);
-                                    // fire-and-forget: respawn-time TUI server
-                                    // exits when the agent is removed from
-                                    // the registry (socket-file removal in
-                                    // delete_transaction). Same shutdown
-                                    // contract as the startup-time TUI server
-                                    // spawn at line 1103.
-                                    if let Err(e) = std::thread::Builder::new()
-                                        .name(format!("{n}_tui_server"))
-                                        .spawn(move || serve_agent_tui(&n, &rdir, &reg2))
-                                    {
-                                        tracing::warn!(agent = %n_err, error = %e, "failed to spawn TUI server");
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!(agent = %config.name, error = %e, "respawn failed");
-                                }
-                            }
-                        })
-                    {
-                        tracing::warn!(agent = %crashed_name, error = %e, "failed to spawn respawn thread");
-                    }
-        } else {
-            tracing::warn!(agent = %crashed_name, "max retries exceeded, not respawning");
-        }
-    }
-
-    // Shutdown: print residual worktrees
+fn spawn_stage2_thread(home: &Path, name: &str, ctx: &DaemonContext) {
+    let home_owned = home.to_path_buf();
+    let name_owned = name.to_owned();
+    let reg = Arc::clone(&ctx.registry);
+    let cfgs = Arc::clone(&ctx.configs);
+    let tx = ctx.crash_tx.clone();
+    let sd = Arc::clone(&ctx.shutdown);
+    // fire-and-forget: stage2 restart worker is short-lived (backoff sleep
+    // then spawn_agent + restore health counters). Observes shutdown flag
+    // after backoff to abort cleanly. JoinHandle dropped because errors are
+    // logged inside handle_stage2_restart + event_log records outcome.
+    if let Err(e) = std::thread::Builder::new()
+        .name(format!("{name}_stage2"))
+        .spawn(move || {
+            handle_stage2_restart(&home_owned, &name_owned, &reg, &cfgs, &tx, &sd);
+        })
     {
-        let cfgs = configs.lock();
-        let mut seen = std::collections::HashSet::new();
-        // Sprint 57 Wave 4 (#546 Item 4): residual worktrees now live
-        // under `$AGEND_HOME/worktrees/<agent>/<branch>/` (the new
-        // canonical layout), so the residual scan is repo-independent.
-        // `list_residual(home)` returns agent-name dirs found there;
-        // `list_legacy_residual(repo)` separately surfaces any
-        // pre-Wave-4 entries still under `<repo>/.worktrees/` for
-        // operator cleanup. Both surface to the same audit log line.
-        let central_residual = crate::worktree::list_residual(home);
-        if !central_residual.is_empty() {
-            tracing::info!(
-                location = %home.join("worktrees").display(),
-                residual = ?central_residual,
-                "residual agent worktrees found under $AGEND_HOME/worktrees/ \
-                 (cleared on next bind_self/release_worktree cycle)"
-            );
+        tracing::warn!(agent = %name, error = %e, "failed to spawn stage2 restart thread");
+    }
+}
+
+fn handle_crash_respawn(home: &Path, crashed_name: &str, ctx: &DaemonContext) {
+    tracing::warn!(agent = %crashed_name, "crashed");
+    crate::event_log::log(home, "crash", crashed_name, "agent crashed");
+
+    let config = match ctx.configs.lock().get(crashed_name).cloned() {
+        Some(c) => c,
+        None => {
+            tracing::debug!(agent = %crashed_name, "no config for respawn (likely deleted)");
+            return;
         }
-        for config in cfgs.values() {
-            // Use worktree_source (original repo) if available, otherwise working_dir
-            let repo = config
-                .worktree_source
-                .as_ref()
-                .or(config.working_dir.as_ref());
-            if let Some(dir) = repo {
-                if seen.insert(dir.clone()) {
-                    let residual = crate::worktree::list_legacy_residual(dir);
-                    if !residual.is_empty() {
-                        tracing::warn!(
-                            repo = %dir.display(),
-                            residual = ?residual,
-                            "Sprint 57 Wave 4 (#546 Item 4): legacy worktrees detected at \
-                             <repo>/.worktrees/<agent>/ — operator cleanup recommended. \
-                             New worktrees land at $AGEND_HOME/worktrees/<agent>/<branch>/. \
-                             Manual cleanup: `git -C <repo> worktree remove <repo>/.worktrees/<agent>` \
-                             then re-bind via task dispatch or bind_self."
-                        );
+    };
+
+    let (should_respawn, delay, should_notify) = {
+        let reg = agent::lock_registry(&ctx.registry);
+        match reg.get(crashed_name) {
+            Some(handle) => handle.core.lock().health.record_crash(),
+            None => {
+                tracing::warn!(agent = %crashed_name, "not in registry, skipping");
+                return;
+            }
+        }
+    };
+
+    if should_notify {
+        notify_crash(crashed_name, &ctx.registry);
+    }
+
+    if !should_respawn {
+        tracing::warn!(agent = %crashed_name, "max retries exceeded, not respawning");
+        return;
+    }
+
+    tracing::info!(agent = %crashed_name, ?delay, "respawning");
+    let saved_health = {
+        let r = ctx.registry.lock();
+        r.get(crashed_name).map(|h| h.core.lock().health.clone())
+    };
+
+    let reg = Arc::clone(&ctx.registry);
+    let home = home.to_path_buf();
+    let tx = ctx.crash_tx.clone();
+    let shutdown_for_respawn = Arc::clone(&ctx.shutdown);
+    let name_for_err = crashed_name.to_owned();
+    // fire-and-forget: respawn worker is short-lived (sleep delay then
+    // spawn_agent + restore health + start TUI server). Observes
+    // shutdown flag immediately after backoff to abort cleanly.
+    // JoinHandle dropped because Err is logged + crash counter handles accounting.
+    if let Err(e) = std::thread::Builder::new()
+        .name(format!("{crashed_name}_respawn"))
+        .spawn(move || {
+            respawn_agent_worker(
+                &home,
+                config,
+                delay,
+                saved_health,
+                &reg,
+                tx,
+                &shutdown_for_respawn,
+            );
+        })
+    {
+        tracing::warn!(agent = %name_for_err, error = %e, "failed to spawn respawn thread");
+    }
+}
+
+fn notify_crash(crashed_name: &str, registry: &AgentRegistry) {
+    let state = {
+        let reg = agent::lock_registry(registry);
+        reg.get(crashed_name)
+            .map(|h| h.core.lock().health.state.display_name())
+            .unwrap_or("unknown")
+    };
+    tracing::warn!(agent = %crashed_name, %state, "notifying");
+    let msg = format!("[health] {crashed_name}: {state}");
+    if let Some(ch) = crate::channel::active_channel() {
+        let _ = crate::channel::gated_notify(
+            ch.as_ref(),
+            crashed_name,
+            NotifySeverity::Error,
+            &msg,
+            false,
+        );
+    } else {
+        tracing::debug!(agent = %crashed_name, "no active channel for crash notification");
+    }
+}
+
+fn respawn_agent_worker(
+    home: &Path,
+    config: AgentConfig,
+    delay: std::time::Duration,
+    saved_health: Option<crate::health::HealthTracker>,
+    reg: &AgentRegistry,
+    tx: crossbeam_channel::Sender<crate::agent::AgentExitEvent>,
+    shutdown: &Arc<AtomicBool>,
+) {
+    std::thread::sleep(delay);
+    if shutdown.load(Ordering::Relaxed) {
+        tracing::info!(agent = %config.name, "shutdown during respawn backoff, aborting");
+        return;
+    }
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
+    if let Some(ref wd) = config.working_dir {
+        let skills_filter: Option<Vec<String>> =
+            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+                .ok()
+                .and_then(|c| c.instances.get(&config.name).and_then(|i| i.skills.clone()));
+        if let Err(e) = crate::skills::install_for_agent(home, wd, skills_filter.as_deref()) {
+            tracing::warn!(agent = %config.name, error = %e, "crash-respawn skills install failed");
+        }
+    }
+    match agent::spawn_agent(
+        &agent::SpawnConfig {
+            name: &config.name,
+            backend_command: &config.backend_command,
+            args: &config.args,
+            spawn_mode: crate::backend::SpawnMode::Fresh,
+            cols,
+            rows,
+            env: config.env.as_ref(),
+            working_dir: config.working_dir.as_deref(),
+            submit_key: &config.submit_key,
+            home: Some(home),
+            crash_tx: Some(tx),
+            shutdown: Some(Arc::clone(shutdown)),
+        },
+        reg,
+    ) {
+        Ok(()) => {
+            tracing::info!(agent = %config.name, "respawned");
+            crate::event_log::log(home, "respawn", &config.name, "agent respawned");
+            {
+                let r = reg.lock();
+                if let Some(handle) = r.get(&config.name) {
+                    let mut core = handle.core.lock();
+                    if let Some(ref old_health) = saved_health {
+                        core.health = old_health.clone();
                     }
+                    core.health.respawn_ok();
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            {
+                let r = reg.lock();
+                if let Some(handle) = r.get(&config.name) {
+                    let reason = handle.core.lock().health.crash_reason().to_string();
+                    let msg = format!(
+                        "[system] Agent restarted due to {reason}. Previous context was lost.\r"
+                    );
+                    let _ = agent::write_to_agent(handle, msg.as_bytes());
+                }
+            }
+            let rdir = run_dir(home);
+            let n = config.name.clone();
+            let n_err = n.clone();
+            let reg2 = Arc::clone(reg);
+            // fire-and-forget: respawn-time TUI server exits when the agent
+            // is removed from the registry (socket-file removal in
+            // delete_transaction).
+            if let Err(e) = std::thread::Builder::new()
+                .name(format!("{n}_tui_server"))
+                .spawn(move || serve_agent_tui(&n, &rdir, &reg2))
+            {
+                tracing::warn!(agent = %n_err, error = %e, "failed to spawn TUI server");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(agent = %config.name, error = %e, "respawn failed");
+        }
+    }
+}
+
+fn log_residual_worktrees(home: &Path, configs: &Arc<Mutex<HashMap<String, AgentConfig>>>) {
+    let cfgs = configs.lock();
+    let mut seen = std::collections::HashSet::new();
+    let central_residual = crate::worktree::list_residual(home);
+    if !central_residual.is_empty() {
+        tracing::info!(
+            location = %home.join("worktrees").display(),
+            residual = ?central_residual,
+            "residual agent worktrees found under $AGEND_HOME/worktrees/ \
+             (cleared on next bind_self/release_worktree cycle)"
+        );
+    }
+    for config in cfgs.values() {
+        let repo = config
+            .worktree_source
+            .as_ref()
+            .or(config.working_dir.as_ref());
+        if let Some(dir) = repo {
+            if seen.insert(dir.clone()) {
+                let residual = crate::worktree::list_legacy_residual(dir);
+                if !residual.is_empty() {
+                    tracing::warn!(
+                        repo = %dir.display(),
+                        residual = ?residual,
+                        "legacy worktrees detected at <repo>/.worktrees/<agent>/ — \
+                         operator cleanup recommended"
+                    );
                 }
             }
         }
     }
-
-    // Sprint 57 Wave 3 PR-2 (#548 Q6): staged shutdown sequence with
-    // reason taxonomy + summary metrics. The `daemon_stop` event name
-    // stays unchanged (preserving downstream query / grep paths) but
-    // its detail payload now carries:
-    //   - reason: signal / api_shutdown / watchdog / unknown
-    //   - agents_total: total registered agents at shutdown
-    //   - agents_killed_after_grace: how many needed SIGKILL escalation
-    //   - uptime_secs: daemon process uptime
-    //
-    // Termination is staged: SIGTERM all agents in parallel, wait the
-    // grace window (2s), then SIGKILL any survivors. Pre-Wave-3-PR-2
-    // shutdown serially called `kill_process_tree` per agent
-    // (effectively N * 500ms grace); the new sequence collapses to a
-    // single 2s wall-clock window regardless of N agents.
-    let metrics = shutdown_sequence(home, &registry, started_at);
-    crate::event_log::log(
-        home,
-        "daemon_stop",
-        "",
-        &format!(
-            "reason={} agents_total={} agents_killed_after_grace={} uptime_secs={}",
-            metrics.reason.as_str(),
-            metrics.agents_total,
-            metrics.agents_killed_after_grace,
-            metrics.uptime_secs
-        ),
-    );
-    // Remove entire run dir (port files + .daemon identity + PID isolation)
-    let _ = std::fs::remove_dir_all(run_dir(home));
-
-    // Give threads time to flush logs and close connections
-    std::thread::sleep(std::time::Duration::from_secs(1));
-
-    // Sprint 60 W1 PR-3 (#P0-3): operator-initiated restart. After
-    // shutdown_sequence has terminated agents and we've flushed
-    // logs, re-exec self if RESTART_PENDING was set. exec() replaces
-    // the current process image in-place on Unix; on Windows we
-    // spawn a fresh process and exit. Either way, the new daemon
-    // comes up clean and re-reads on-disk state (binding metadata,
-    // topic registry, fleet.yaml) — operators re-attach PTY agents
-    // post-restart per the MVP scope.
-    if RESTART_PENDING.load(Ordering::Acquire) {
-        let flag = home.join("restart-requested");
-        let _ = std::fs::remove_file(&flag);
-        tracing::info!("operator-initiated restart: exiting with code 42");
-        std::process::exit(42);
-    }
-
-    tracing::info!("exiting");
-    Ok(())
 }
 
 /// Sprint 57 Wave 3 PR-2 (#548 Q6) shutdown summary record.
