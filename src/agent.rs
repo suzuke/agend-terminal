@@ -127,6 +127,18 @@ pub fn validate_name(name: &str) -> Result<&str, String> {
     Ok(name)
 }
 
+/// [`validate_name`] with a JSON error response for MCP handlers.
+/// Use in functions that return `serde_json::Value`:
+/// `validate_name_or_err!(name)` expands to an early return on failure.
+#[macro_export]
+macro_rules! validate_name_or_err {
+    ($name:expr) => {
+        if let Err(e) = $crate::agent::validate_name($name) {
+            return serde_json::json!({"error": e});
+        }
+    };
+}
+
 /// Error from [`resolve_instance`].
 #[derive(Debug)]
 pub enum ResolveError {

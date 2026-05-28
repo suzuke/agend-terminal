@@ -72,9 +72,7 @@ pub(super) fn handle_send_to_instance(
         Some(t) => t,
         None => return json!({"error": "missing 'instance_name' or 'target'"}),
     };
-    if let Err(e) = crate::agent::validate_name(target) {
-        return json!({"error": e});
-    }
+    crate::validate_name_or_err!(target);
     if *sender == target {
         return json!({"error": "cannot send to self — use a different instance_name"});
     }
@@ -148,9 +146,7 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
         Some(t) => t,
         None => return json!({"error": "missing 'target_instance'"}),
     };
-    if let Err(e) = crate::agent::validate_name(raw_target) {
-        return json!({"error": e});
-    }
+    crate::validate_name_or_err!(raw_target);
     // Sprint 46 P2: resolve target via InstanceId — replaces P1 name-lookup bandaid.
     // If raw_target resolves to a known instance (by id, short-id, or name), route
     // directly. Otherwise fall through to team-orchestrator resolution.
@@ -452,9 +448,7 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
         Some(t) => t,
         None => return json!({"error": "missing 'target_instance'"}),
     };
-    if let Err(e) = crate::agent::validate_name(target) {
-        return json!({"error": e});
-    }
+    crate::validate_name_or_err!(target);
     let summary = match args["summary"].as_str() {
         Some(s) => s,
         None => return json!({"error": "missing 'summary'"}),
@@ -576,9 +570,7 @@ pub(super) fn handle_request_information(
         Some(t) => t,
         None => return json!({"error": "missing 'target_instance'"}),
     };
-    if let Err(e) = crate::agent::validate_name(target) {
-        return json!({"error": e});
-    }
+    crate::validate_name_or_err!(target);
     let question = match args["question"].as_str() {
         Some(q) => q,
         None => return json!({"error": "missing 'question'"}),

@@ -28,9 +28,7 @@ pub(super) fn spawn_single_instance_impl(
         Some(n) => n,
         None => return json!({"error": "missing 'name'"}),
     };
-    if let Err(e) = crate::agent::validate_name(raw_name) {
-        return json!({"error": e});
-    }
+    crate::validate_name_or_err!(raw_name);
     let name_owned = {
         // M4: AtomicU64 prevents 65536 wrap-around collision
         use std::sync::atomic::{AtomicU64, Ordering};
