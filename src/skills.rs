@@ -202,7 +202,15 @@ pub fn add(home: &Path, source: &str) -> Result<Skill> {
                     return Err(anyhow!("git clone failed for {url}: status={status}"));
                 }
                 let sub_path = tmp.join(&sub);
-                if !sub_path.exists() || !sub_path.is_dir() {
+                let resolved = sub_path.canonicalize().unwrap_or_default();
+                let tmp_canon = tmp.canonicalize().unwrap_or_default();
+                if !resolved.starts_with(&tmp_canon) || resolved == tmp_canon {
+                    let _ = std::fs::remove_dir_all(&tmp);
+                    return Err(anyhow!(
+                        "subdir path '{sub}' escapes clone root — path traversal rejected"
+                    ));
+                }
+                if !resolved.is_dir() {
                     let _ = std::fs::remove_dir_all(&tmp);
                     return Err(anyhow!(
                         "subdirectory '{sub}' not found in cloned repo {url}"
