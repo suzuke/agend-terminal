@@ -62,11 +62,13 @@ fn build_agent_state_snapshot(
         for id in tab.root().pane_ids() {
             if let Some(pane) = tab.root().find_pane(id) {
                 if pane.backend.is_some() {
-                    snapshot.entry(pane.agent_name.to_string()).or_insert_with(|| {
-                        reg.get(pane.agent_name.as_str())
-                            .map(|h| h.core.lock().state.get_state())
-                            .unwrap_or(AgentState::Idle)
-                    });
+                    snapshot
+                        .entry(pane.agent_name.to_string())
+                        .or_insert_with(|| {
+                            reg.get(pane.agent_name.as_str())
+                                .map(|h| h.core.lock().state.get_state())
+                                .unwrap_or(AgentState::Idle)
+                        });
                 }
             }
         }

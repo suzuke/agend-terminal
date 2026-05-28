@@ -300,7 +300,13 @@ fn handle_up(
                         .map(|p| p.agent_name.clone())
                         .unwrap_or_else(|| "new".into());
                     if layout
-                        .move_pane_across_tabs(from_tab_idx, src, MovePlacement::NewTab { name: name.to_string() })
+                        .move_pane_across_tabs(
+                            from_tab_idx,
+                            src,
+                            MovePlacement::NewTab {
+                                name: name.to_string(),
+                            },
+                        )
                         .is_some()
                     {
                         out.new_last_tab = Some(from_tab_idx);

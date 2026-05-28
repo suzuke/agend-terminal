@@ -472,7 +472,9 @@ pub(super) fn handle_key(
                             .move_pane_across_tabs(
                                 src_tab,
                                 src_pane,
-                                crate::layout::MovePlacement::NewTab { name: name.to_string() },
+                                crate::layout::MovePlacement::NewTab {
+                                    name: name.to_string(),
+                                },
                             )
                             .is_some()
                         {
