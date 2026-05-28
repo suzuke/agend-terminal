@@ -455,63 +455,69 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
         vec![]
     };
 
-    // Enqueue in inbox. Sprint 54 silent-drop layer-4 hotfix:
-    // clone attachments before the move so the PTY-inject path
-    // below can carry the same metadata as the inbox JSONL record.
-    // Without this, the notify_agent call would see only `text`
-    // and produce a content-less inline notification when text=""
-    // (pure image, no caption, download succeeded — text is empty
-    // because there's no caption, but attachments has the photo).
-    let notify_attachments = attachments.clone();
-    let msg_obj = InboxMessage {
-        schema_version: 0,
-        id: None,
-        read_at: None,
-        thread_id: None,
-        parent_id: None,
-        task_id: None,
-        force_meta: None,
-        correlation_id: None,
-        reviewed_head: None,
-        from: format!("user:{username}"),
-        text: text.to_string(),
-        kind: None, // was "telegram" — channel source now in typed `channel` field
-        timestamp: chrono::Utc::now().to_rfc3339(),
-        channel: Some(crate::channel::ChannelKind::Telegram),
-        delivery_mode: None,
-        attachments,
-        in_reply_to_msg_id: msg.reply_to_message().map(|r| r.id.0.to_string()),
-        in_reply_to_excerpt: msg.reply_to_message().and_then(|r| {
-            let text = r.text().or_else(|| r.caption()).unwrap_or("");
-            let author = r
-                .from
-                .as_ref()
-                .and_then(|u| u.username.as_deref())
-                .unwrap_or("unknown");
-            inbox::build_excerpt(text, author)
-        }),
-        superseded_by: None,
-        from_id: None,
-        broadcast_context: None,
-        sequencing: None,
-        eta_minutes: None,
-        reporting_cadence: None,
-        worktree_binding_required: None,
-        pr_number: None,
-        terminal: None,
-    };
-    let _ = inbox::enqueue(&home, &instance_name, msg_obj);
+    // #1352: length-based delivery split.
+    // Short messages (< 200 chars, no attachments): PTY inject only.
+    // Long messages or attachments: inbox enqueue + pointer-only PTY hint.
+    // AGEND_POINTER_ONLY_INJECT=1: all messages go inbox + hint (unchanged).
+    let is_short = text.chars().count() < 200 && attachments.is_empty();
+    let pointer_only = inbox::notify::pointer_only_inject();
 
-    // Notify agent PTY — passes attachments through so the PTY
-    // header carries `attachments=[…]` and the inline body shows a
-    // human placeholder when text is empty.
-    inbox::notify_agent_with_attachments(
-        &home,
-        &instance_name,
-        &inbox::NotifySource::Channel(username, crate::channel::ChannelKind::Telegram),
-        &text,
-        &notify_attachments,
-    );
+    if is_short && !pointer_only {
+        inbox::notify_agent_with_attachments(
+            &home,
+            &instance_name,
+            &inbox::NotifySource::Channel(username, crate::channel::ChannelKind::Telegram),
+            &text,
+            &attachments,
+        );
+    } else {
+        let notify_attachments = attachments.clone();
+        let msg_obj = InboxMessage {
+            schema_version: 0,
+            id: None,
+            read_at: None,
+            thread_id: None,
+            parent_id: None,
+            task_id: None,
+            force_meta: None,
+            correlation_id: None,
+            reviewed_head: None,
+            from: format!("user:{username}"),
+            text: text.to_string(),
+            kind: None,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            channel: Some(crate::channel::ChannelKind::Telegram),
+            delivery_mode: None,
+            attachments,
+            in_reply_to_msg_id: msg.reply_to_message().map(|r| r.id.0.to_string()),
+            in_reply_to_excerpt: msg.reply_to_message().and_then(|r| {
+                let text = r.text().or_else(|| r.caption()).unwrap_or("");
+                let author = r
+                    .from
+                    .as_ref()
+                    .and_then(|u| u.username.as_deref())
+                    .unwrap_or("unknown");
+                inbox::build_excerpt(text, author)
+            }),
+            superseded_by: None,
+            from_id: None,
+            broadcast_context: None,
+            sequencing: None,
+            eta_minutes: None,
+            reporting_cadence: None,
+            worktree_binding_required: None,
+            pr_number: None,
+            terminal: None,
+        };
+        let _ = inbox::enqueue(&home, &instance_name, msg_obj);
+        inbox::notify_agent_with_attachments(
+            &home,
+            &instance_name,
+            &inbox::NotifySource::Channel(username, crate::channel::ChannelKind::Telegram),
+            &text,
+            &notify_attachments,
+        );
+    }
 
     // Emit UxEvent::UserMsgReceived so the channel adapter can react 👀.
     {
