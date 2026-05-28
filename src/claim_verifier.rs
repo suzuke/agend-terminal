@@ -38,6 +38,26 @@ pub struct ClaimResult {
     pub detail: String,
 }
 
+impl ClaimResult {
+    #[allow(dead_code)]
+    pub fn ok(claim: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            claim: claim.into(),
+            passed: true,
+            detail: detail.into(),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn err(claim: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            claim: claim.into(),
+            passed: false,
+            detail: detail.into(),
+        }
+    }
+}
+
 /// Full verification result for a push.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerifyResult {
