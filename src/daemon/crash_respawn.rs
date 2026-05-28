@@ -114,7 +114,14 @@ fn respawn_agent_worker(
             crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
                 .ok()
                 .and_then(|c| c.instances.get(&config.name).and_then(|i| i.skills.clone()));
-        if let Err(e) = crate::skills::install_for_agent(home, wd, skills_filter.as_deref()) {
+        let backend_skill = crate::backend::Backend::from_command(&config.backend_command)
+            .and_then(|b| b.skill_dir_name());
+        if let Err(e) = crate::skills::install_for_agent_backend(
+            home,
+            wd,
+            skills_filter.as_deref(),
+            backend_skill,
+        ) {
             tracing::warn!(agent = %config.name, error = %e, "crash-respawn skills install failed");
         }
     }

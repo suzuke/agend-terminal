@@ -318,15 +318,30 @@ pub fn install_for_agent(
     working_dir: &Path,
     filter: Option<&[String]>,
 ) -> Result<Vec<InstallOutcome>> {
+    install_for_agent_backend(home, working_dir, filter, None)
+}
+
+/// Backend-scoped variant: when `backend` is `Some`, only install
+/// skills for the matching backend directory. When `None`, install all.
+pub fn install_for_agent_backend(
+    home: &Path,
+    working_dir: &Path,
+    filter: Option<&[String]>,
+    backend: Option<&str>,
+) -> Result<Vec<InstallOutcome>> {
     let source = ensure_skills_root(home)?;
     let staged_source = match filter {
         None => source,
         Some(allowlist) => stage_filtered_source(home, &source, allowlist)?,
     };
-    let mut outcomes = Vec::with_capacity(BACKEND_SKILL_DIRS.len());
-    for (backend, rel) in BACKEND_SKILL_DIRS {
+    let dirs: Vec<_> = BACKEND_SKILL_DIRS
+        .iter()
+        .filter(|(name, _)| backend.is_none_or(|b| *name == b))
+        .collect();
+    let mut outcomes = Vec::with_capacity(dirs.len());
+    for (name, rel) in dirs {
         let target = working_dir.join(rel);
-        let outcome = install_one(&staged_source, &target, backend);
+        let outcome = install_one(&staged_source, &target, name);
         outcomes.push(outcome);
     }
     Ok(outcomes)

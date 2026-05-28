@@ -108,7 +108,13 @@ pub(super) fn create_pane(
             crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
                 .ok()
                 .and_then(|c| c.instances.get(&name).and_then(|i| i.skills.clone()));
-        match crate::skills::install_for_agent(home, &work_dir, skills_filter.as_deref()) {
+        let backend_skill = Backend::from_command(command).and_then(|b| b.skill_dir_name());
+        match crate::skills::install_for_agent_backend(
+            home,
+            &work_dir,
+            skills_filter.as_deref(),
+            backend_skill,
+        ) {
             Ok(outcomes) => {
                 let modes: Vec<(&str, crate::skills::InstallMode)> = outcomes
                     .iter()
