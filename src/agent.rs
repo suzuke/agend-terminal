@@ -1016,6 +1016,199 @@ fn sweep_child_tree(name: &str, registry: &AgentRegistry) {
 }
 
 /// Handle PTY close: determine if crash, graceful exit, or daemon shutdown.
+/// Exit classification for handle_pty_close dispatch.
+enum ExitKind {
+    UserExit,
+    SignalKill,
+    Crash,
+}
+
+fn classify_exit(exit_code: Option<i32>) -> ExitKind {
+    match exit_code {
+        Some(0) | Some(130) => ExitKind::UserExit,
+        Some(137) | Some(143) => {
+            tracing::info!(
+                exit_code = exit_code.unwrap_or(0),
+                "killed by signal, not crash"
+            );
+            ExitKind::SignalKill
+        }
+        Some(c) => {
+            tracing::warn!(exit_code = c, "crash");
+            ExitKind::Crash
+        }
+        None => {
+            tracing::warn!("process didn't exit in 2s, treating as crash");
+            ExitKind::Crash
+        }
+    }
+}
+
+fn wait_for_process_exit(name: &str, registry: &AgentRegistry) -> Option<i32> {
+    for _ in 0..20 {
+        let reg = registry.lock();
+        if reg.get(name).is_none() {
+            tracing::debug!(agent = name, "not in registry, skipping crash handling");
+            return Some(0);
+        }
+        if let Some(handle) = reg.get(name) {
+            let mut c = handle.child.lock();
+            if let Ok(Some(status)) = c.try_wait() {
+                return Some(status.exit_code() as i32);
+            }
+        }
+        drop(reg);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    None
+}
+
+fn cleanup_agent(name: &str, registry: &AgentRegistry, home: &Option<std::path::PathBuf>) {
+    registry.lock().remove(name);
+    if let Some(ref home) = home {
+        crate::ipc::remove_port(&crate::daemon::run_dir(home), name);
+    }
+}
+
+fn is_startup_failure(name: &str, registry: &AgentRegistry) -> bool {
+    let uptime = {
+        let reg = registry.lock();
+        reg.get(name)
+            .map(|h| (h.spawned_at.elapsed(), h.spawned_at_epoch_ms))
+    };
+    let had_user_input = {
+        let pair = crate::daemon::heartbeat_pair::snapshot_for(name);
+        uptime
+            .map(|(_, epoch_ms)| pair.last_input_at_ms >= epoch_ms)
+            .unwrap_or(false)
+    };
+    matches!(uptime, Some((d, _)) if d < std::time::Duration::from_secs(5) && !had_user_input)
+}
+
+fn on_startup_failure(
+    name: &str,
+    home: &Option<std::path::PathBuf>,
+    crash_tx: &Option<CrashChannel>,
+) {
+    tracing::warn!(
+        agent = name,
+        "startup failure (exited too quickly, no user input)"
+    );
+    if let Some(ref home) = home {
+        crate::event_log::log(
+            home,
+            "startup_failure",
+            name,
+            "exited too quickly, no user input",
+        );
+    }
+    if let Some(ref tx) = crash_tx {
+        let _ = tx.send(AgentExitEvent::Crash(name.to_string()));
+    }
+}
+
+fn on_clean_exit_shell_fallback(
+    name: &str,
+    exit_code: Option<i32>,
+    registry: &AgentRegistry,
+    home: &Option<std::path::PathBuf>,
+    crash_tx: &Option<CrashChannel>,
+    shutdown: &Option<Arc<std::sync::atomic::AtomicBool>>,
+) {
+    tracing::info!(
+        agent = name,
+        ?exit_code,
+        "clean exit, spawning shell fallback"
+    );
+    if let Some(ref home) = home {
+        crate::event_log::log(home, "clean_exit", name, "agent exited cleanly");
+    }
+
+    let (cols, rows) = {
+        let reg = registry.lock();
+        reg.get(name)
+            .map(|h| {
+                let c = h.core.lock();
+                (c.vterm.cols(), c.vterm.rows())
+            })
+            .unwrap_or_else(|| crossterm::terminal::size().unwrap_or((120, 40)))
+    };
+
+    let work_dir: Option<std::path::PathBuf> = home.as_ref().and_then(|h| {
+        let meta_path = h.join("metadata").join(format!("{name}.json"));
+        std::fs::read_to_string(meta_path)
+            .ok()
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+            .and_then(|v| {
+                v["working_directory"]
+                    .as_str()
+                    .map(std::path::PathBuf::from)
+            })
+    });
+
+    cleanup_agent(name, registry, home);
+
+    let shell = crate::default_shell();
+    let spawn_result = spawn_agent(
+        &SpawnConfig {
+            name,
+            backend_command: shell,
+            args: &[],
+            spawn_mode: crate::backend::SpawnMode::Fresh,
+            cols,
+            rows,
+            env: None,
+            working_dir: work_dir.as_deref(),
+            submit_key: "\r",
+            home: home.as_deref(),
+            crash_tx: crash_tx.clone(),
+            shutdown: shutdown.clone(),
+        },
+        registry,
+    );
+    match spawn_result {
+        Ok(()) => {
+            tracing::info!(agent = name, shell, "shell fallback spawned");
+            if let Some(ref home) = home {
+                let rdir = crate::daemon::run_dir(home);
+                let reg = Arc::clone(registry);
+                let n = name.to_string();
+                // fire-and-forget: shell TUI server exits when agent removed.
+                let _ = std::thread::Builder::new()
+                    .name(format!("{n}_tui"))
+                    .spawn(move || crate::daemon::serve_agent_tui(&n, &rdir, &reg));
+            }
+        }
+        Err(e) => {
+            tracing::warn!(agent = name, error = %e, "shell fallback failed");
+            if let Some(ref home) = home {
+                let _ = crate::api::call(
+                    home,
+                    &serde_json::json!({"method": crate::api::method::DELETE, "params": {"name": name}}),
+                );
+            }
+            if let Some(ref tx) = crash_tx {
+                let _ = tx.try_send(AgentExitEvent::CleanExit(name.to_string()));
+            }
+        }
+    }
+}
+
+fn on_crash_exit(name: &str, registry: &AgentRegistry, crash_tx: &Option<CrashChannel>) {
+    tracing::info!(agent = name, "setting restarting state");
+    {
+        let reg = registry.lock();
+        if let Some(handle) = reg.get(name) {
+            handle.core.lock().state.set_restarting();
+        }
+    }
+    if let Some(ref tx) = crash_tx {
+        if let Err(e) = tx.try_send(AgentExitEvent::Crash(name.to_string())) {
+            tracing::warn!(agent = %name, error = %e, "crash channel full — respawn event dropped");
+        }
+    }
+}
+
 fn handle_pty_close(
     name: &str,
     registry: &AgentRegistry,
@@ -1024,253 +1217,38 @@ fn handle_pty_close(
     shutdown: &Option<Arc<std::sync::atomic::AtomicBool>>,
     deleted: &Arc<std::sync::atomic::AtomicBool>,
 ) {
-    // Check if daemon is shutting down — if so, this is not a crash
     let is_shutdown = shutdown
         .as_ref()
         .map(|s| s.load(std::sync::atomic::Ordering::Relaxed))
         .unwrap_or(false);
-
     if is_shutdown {
         tracing::info!(agent = name, "stopped (daemon shutdown)");
-        {
-            let mut reg = registry.lock();
-            reg.remove(name);
-        }
-        if let Some(ref home) = home {
-            crate::ipc::remove_port(&crate::daemon::run_dir(home), name);
-        }
+        cleanup_agent(name, registry, home);
         return;
     }
 
     tracing::info!(agent = name, "PTY closed, waiting for process exit");
-
-    // Wait up to 2s for process to fully exit
-    let mut exit_code: Option<i32> = None;
-    for _ in 0..20 {
-        let reg = registry.lock();
-        // Agent removed from registry → shutdown or explicit delete. Not a crash.
-        if reg.get(name).is_none() {
-            tracing::debug!(agent = name, "not in registry, skipping crash handling");
-            return;
-        }
-        if let Some(handle) = reg.get(name) {
-            {
-                let mut c = handle.child.lock();
-                if let Ok(Some(status)) = c.try_wait() {
-                    exit_code = Some(status.exit_code() as i32);
-                    break;
-                }
-            }
-        }
-        drop(reg);
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-
-    let is_crash = match exit_code {
-        Some(0) | Some(130) => false, // Graceful exit: 0 = normal, 130 = SIGINT (user Ctrl+C / /quit)
-        Some(137) | Some(143) => {
-            // SIGKILL (137) / SIGTERM (143) — killed by daemon or user
-            tracing::info!(
-                agent = name,
-                exit_code = exit_code.unwrap_or(0),
-                "killed by signal, not crash"
-            );
-            false
-        }
-        Some(c) => {
-            tracing::warn!(agent = name, exit_code = c, "crash");
-            true
-        }
-        None => {
-            tracing::warn!(agent = name, "process didn't exit in 2s, treating as crash");
-            true
-        }
-    };
-
-    // Distinguish user-initiated clean exit from daemon-initiated kill.
-    // SIGKILL/SIGTERM are daemon kills — not user /exit or /quit.
-    let is_user_clean_exit = matches!(exit_code, Some(0) | Some(130));
-
-    // Sprint 21 F-NEW1: sweep the child process tree before respawn fires so
-    // any leaked grandchildren (kiro-cli's bun + acp etc.) don't survive across
-    // the respawn boundary and collide with the new process tree's port/file
-    // locks. PR-U #158 added kill_process_tree to handle_kill / handle_delete /
-    // run_core but missed this PTY-EOF crash-detection path. Covers both branches:
-    // try_wait succeeded (graceful or crash exit may still leave grandchildren
-    // orphaned to PID 1) and the 2s timeout (leader still alive).
+    let exit_code = wait_for_process_exit(name, registry);
     sweep_child_tree(name, registry);
 
-    // Check if agent was explicitly deleted (e.g. replace_instance DELETE).
-    // Reaper may still fire after DELETE removes the registry entry — the
-    // deleted flag survives because the reaper thread captured Arc<AtomicBool>
-    // at spawn time (via PtyReadContext). Skip shell fallback entirely.
     if deleted.load(std::sync::atomic::Ordering::SeqCst) {
         tracing::info!(agent = name, "agent deleted, skipping shell fallback");
         return;
     }
 
-    if is_user_clean_exit {
-        // Startup grace period: if the process exited within 5s of spawn
-        // AND no user input was received, treat as startup failure.
-        // If user sent input (e.g. /exit), it's a legitimate quick exit.
-        let uptime = {
-            let reg = registry.lock();
-            reg.get(name)
-                .map(|h| (h.spawned_at.elapsed(), h.spawned_at_epoch_ms))
-        };
-        let had_user_input_since_spawn = {
-            let pair = crate::daemon::heartbeat_pair::snapshot_for(name);
-            uptime
-                .map(|(_, epoch_ms)| pair.last_input_at_ms >= epoch_ms)
-                .unwrap_or(false)
-        };
-        if let Some((uptime, _)) = uptime {
-            if uptime < std::time::Duration::from_secs(5) && !had_user_input_since_spawn {
-                tracing::warn!(
-                    agent = name,
-                    uptime_ms = uptime.as_millis() as u64,
-                    "startup failure (exited too quickly, no user input), skipping shell fallback"
-                );
-                if let Some(ref home) = home {
-                    crate::event_log::log(
-                        home,
-                        "startup_failure",
-                        name,
-                        &format!("exited in {}ms, no user input", uptime.as_millis()),
-                    );
-                }
-                // Mark as crashed so daemon can notify operator.
-                if let Some(ref tx) = crash_tx {
-                    let _ = tx.send(AgentExitEvent::Crash(name.to_string()));
-                }
-                return;
+    match classify_exit(exit_code) {
+        ExitKind::UserExit => {
+            if is_startup_failure(name, registry) {
+                on_startup_failure(name, home, crash_tx);
+            } else {
+                on_clean_exit_shell_fallback(name, exit_code, registry, home, crash_tx, shutdown);
             }
         }
-
-        // User-initiated clean exit (code 0 or 130): /exit, /quit, Ctrl+C.
-        // Do NOT respawn the agent — spawn a shell replacement instead
-        // (tmux-style: pane stays alive with a shell prompt).
-        tracing::info!(
-            agent = name,
-            ?exit_code,
-            "clean exit, spawning shell fallback"
-        );
-        if let Some(ref home) = home {
-            crate::event_log::log(home, "clean_exit", name, "agent exited cleanly");
+        ExitKind::SignalKill => {
+            cleanup_agent(name, registry, home);
         }
-
-        // Grab terminal size from the existing VTerm before removing.
-        let (cols, rows) = {
-            let reg = registry.lock();
-            reg.get(name)
-                .map(|h| {
-                    let c = h.core.lock();
-                    (c.vterm.cols(), c.vterm.rows())
-                })
-                .unwrap_or_else(|| crossterm::terminal::size().unwrap_or((120, 40)))
-        };
-
-        // Read working_dir from metadata (agent handle doesn't store it).
-        let work_dir: Option<std::path::PathBuf> = home.as_ref().and_then(|h| {
-            let meta_path = h.join("metadata").join(format!("{name}.json"));
-            std::fs::read_to_string(meta_path)
-                .ok()
-                .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
-                .and_then(|v| {
-                    v["working_directory"]
-                        .as_str()
-                        .map(std::path::PathBuf::from)
-                })
-        });
-
-        // Remove old agent from registry so spawn_agent can reuse the name.
-        {
-            let mut reg = registry.lock();
-            reg.remove(name);
-        }
-        if let Some(ref home) = home {
-            crate::ipc::remove_port(&crate::daemon::run_dir(home), name);
-        }
-
-        // Spawn $SHELL as replacement. Best-effort: if it fails, notify
-        // daemon for cleanup instead.
-        let shell = crate::default_shell();
-        let spawn_result = spawn_agent(
-            &SpawnConfig {
-                name,
-                backend_command: shell,
-                args: &[],
-                spawn_mode: crate::backend::SpawnMode::Fresh,
-                cols,
-                rows,
-                env: None,
-                working_dir: work_dir.as_deref(),
-                submit_key: "\r",
-                home: home.as_deref(),
-                crash_tx: crash_tx.clone(),
-                shutdown: shutdown.clone(),
-            },
-            registry,
-        );
-        match spawn_result {
-            Ok(()) => {
-                tracing::info!(agent = name, shell, "shell fallback spawned");
-                // Start TUI socket for the shell agent so the pane can connect.
-                if let Some(ref home) = home {
-                    let rdir = crate::daemon::run_dir(home);
-                    let reg = Arc::clone(registry);
-                    let n = name.to_string();
-                    // fire-and-forget: shell TUI server exits when agent removed.
-                    let _ = std::thread::Builder::new()
-                        .name(format!("{n}_tui"))
-                        .spawn(move || crate::daemon::serve_agent_tui(&n, &rdir, &reg));
-                }
-            }
-            Err(e) => {
-                tracing::warn!(agent = name, error = %e, "shell fallback failed");
-                // Trigger InstanceDeleted so TUI cleans up the dead pane.
-                // api::call goes through the API server which emits the event.
-                if let Some(ref home) = home {
-                    let _ = crate::api::call(
-                        home,
-                        &serde_json::json!({"method": crate::api::method::DELETE, "params": {"name": name}}),
-                    );
-                }
-                // Also notify daemon for cleanup if channel available.
-                if let Some(ref tx) = crash_tx {
-                    let _ = tx.try_send(AgentExitEvent::CleanExit(name.to_string()));
-                }
-            }
-        }
-        return;
-    }
-
-    if !is_crash {
-        // SIGKILL/SIGTERM — daemon-initiated kill, not user action.
-        // Already handled by shutdown check above; if we reach here it's
-        // an explicit `kill` command. Remove from registry, no respawn.
-        {
-            let mut reg = registry.lock();
-            reg.remove(name);
-        }
-        if let Some(ref home) = home {
-            crate::ipc::remove_port(&crate::daemon::run_dir(home), name);
-        }
-        return;
-    }
-
-    // Crash: set Restarting state and notify daemon for respawn.
-    tracing::info!(agent = name, "setting restarting state");
-    {
-        let reg = registry.lock();
-        if let Some(handle) = reg.get(name) {
-            let mut core = handle.core.lock();
-            core.state.set_restarting();
-        }
-    }
-    if let Some(ref tx) = crash_tx {
-        if let Err(e) = tx.try_send(AgentExitEvent::Crash(name.to_string())) {
-            tracing::warn!(agent = %name, error = %e, "crash channel full — respawn event dropped");
+        ExitKind::Crash => {
+            on_crash_exit(name, registry, crash_tx);
         }
     }
 }
