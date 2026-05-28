@@ -318,6 +318,40 @@ pub(crate) fn build_instructions_body(
     content
 }
 
+/// Remove leaked copies of `extra_instructions` that previous versions
+/// appended outside the agend markers (#1405 self-heal). Returns the
+/// content with all exact occurrences of the extra text stripped from
+/// outside the marker block.
+fn strip_leaked_extra_instructions(content: &str, extra: Option<&str>) -> String {
+    let extra = match extra {
+        Some(e) if !e.is_empty() => e,
+        _ => return content.to_string(),
+    };
+    let end_marker = AGEND_BLOCK_END;
+    let end_pos = content.find(end_marker).map(|p| p + end_marker.len());
+    let end_pos = match end_pos {
+        Some(p) => p,
+        None => return content.to_string(),
+    };
+    let (before_end, after_end) = content.split_at(end_pos);
+    let cleaned = after_end.replace(extra, "");
+    // Collapse runs of 3+ newlines left by removal.
+    let mut result = String::from(before_end);
+    let mut consecutive_newlines = 0u32;
+    for ch in cleaned.chars() {
+        if ch == '\n' {
+            consecutive_newlines += 1;
+            if consecutive_newlines <= 2 {
+                result.push(ch);
+            }
+        } else {
+            consecutive_newlines = 0;
+            result.push(ch);
+        }
+    }
+    result
+}
+
 /// Merge an agend-owned block into a user-shared file, preserving all user
 /// content outside the `<!-- agend:start --> ... <!-- agend:end -->` markers.
 /// Creates the file if missing; replaces the existing block in place if present;
@@ -370,22 +404,27 @@ fn generate_agent_instructions(working_dir: &Path, command: &str, ctx: Option<&A
     let proto_str = proto.display().to_string();
     let body = build_instructions_body(ctx, Some(&proto_str));
 
-    let final_content = if preset.instructions_shared {
-        let existing = std::fs::read_to_string(&instr_path).unwrap_or_default();
-        merge_agend_block(&existing, &body)
+    // Include fleet.yaml `instructions:` inside the managed block so
+    // shared files (AGENTS.md) don't duplicate it on each refresh (#1405).
+    let body = if let Some(extra) = ctx.and_then(|c| c.extra_instructions) {
+        if extra.is_empty() {
+            body
+        } else {
+            format!("{body}\n\n{extra}")
+        }
     } else {
         body
     };
 
-    // Append extra instructions from fleet.yaml `instructions:` field.
-    let final_content = if let Some(extra) = ctx.and_then(|c| c.extra_instructions) {
-        if extra.is_empty() {
-            final_content
-        } else {
-            format!("{final_content}\n\n{extra}")
-        }
+    let final_content = if preset.instructions_shared {
+        let existing = std::fs::read_to_string(&instr_path).unwrap_or_default();
+        // Strip any prior leaked copies of extra instructions outside the
+        // agend markers before merging, so existing duplicates self-heal.
+        let cleaned =
+            strip_leaked_extra_instructions(&existing, ctx.and_then(|c| c.extra_instructions));
+        merge_agend_block(&cleaned, &body)
     } else {
-        final_content
+        body
     };
 
     let _ = std::fs::write(&instr_path, &final_content);
