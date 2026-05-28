@@ -55,8 +55,8 @@ fn supervisor_run_loop_does_not_call_rate_limit_recovery_nudges() {
 fn fleet_yaml_does_not_define_rate_limit_recovery_config() {
     // Companion to the supervisor invariant: the config struct introduced
     // by #841 should also be reverted. If `RateLimitRecoveryConfig` resurfaces
-    // in src/fleet.rs without coordinated re-enablement, this test fires.
-    let fleet = fs::read_to_string("src/fleet.rs").expect("src/fleet.rs must exist");
+    // in src/fleet/mod.rs without coordinated re-enablement, this test fires.
+    let fleet = fs::read_to_string("src/fleet/mod.rs").expect("src/fleet/mod.rs must exist");
 
     let definitions: Vec<_> = fleet
         .lines()
@@ -71,7 +71,7 @@ fn fleet_yaml_does_not_define_rate_limit_recovery_config() {
     assert!(
         definitions.is_empty(),
         "RateLimitRecoveryConfig must stay reverted until #848 ships.\n\
-         Found references in src/fleet.rs:\n{}\n\
+         Found references in src/fleet/mod.rs:\n{}\n\
          See tests/no_rate_limit_recovery_nudge_invariant.rs header.",
         definitions
             .iter()
