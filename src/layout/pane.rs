@@ -94,6 +94,18 @@ impl Pane {
 
     /// Drain pending output into the local VTerm.
     pub fn drain_output(&mut self) {
+        // #1432: while a mouse selection gesture is active, freeze the grid by
+        // not draining new output. `selection_scroll_freeze` is set on MouseDown
+        // and cleared on MouseUp, so this pauses only for the gesture's duration.
+        // The scroll-offset drift compensation (#1358) only handles output that
+        // *appends* to scrollback; agent CLIs frequently redraw in place (cursor
+        // movement, spinners) without growing `max_scroll()`, which the offset
+        // approach cannot pin. Freezing the grid covers every case. Output stays
+        // queued in the unbounded `rx` channel and drains on the next call once
+        // the gesture ends.
+        if self.selection_scroll_freeze.is_some() {
+            return;
+        }
         while let Ok(data) = self.rx.try_recv() {
             self.vterm.process(&data);
             if self.backend.is_some() {
@@ -180,6 +192,52 @@ mod tests {
             selection_scroll_freeze: None,
             source: PaneSource::Local,
         }
+    }
+
+    /// #1432: output must not reach the VTerm while a selection gesture is
+    /// active (grid frozen), and must catch up once the gesture ends.
+    #[test]
+    fn drain_output_frozen_during_selection_then_resumes() {
+        let (tx, rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let mut pane = Pane {
+            agent_name: "agent".into(),
+            vterm: VTerm::new(20, 5),
+            rx,
+            id: 1,
+            backend: None,
+            working_dir: None,
+            display_name: None,
+            scroll_offset: 0,
+            has_notification: false,
+            fleet_instance_name: None,
+            last_input_at: None,
+            pending_notification_count: 0,
+            selection: None,
+            selection_scroll_freeze: None,
+            source: PaneSource::Local,
+        };
+
+        tx.send(b"hello".to_vec()).expect("send baseline output");
+        pane.drain_output();
+        let before = pane.vterm.read_scrollback(100);
+        assert!(before.contains("hello"), "baseline: {before:?}");
+
+        // Selection gesture active → freeze: new output must not be drained.
+        pane.selection_scroll_freeze = Some(pane.vterm.max_scroll());
+        tx.send(b" world".to_vec())
+            .expect("send frozen-window output");
+        pane.drain_output();
+        let during = pane.vterm.read_scrollback(100);
+        assert_eq!(during, before, "grid must stay frozen during selection");
+
+        // Gesture ends → drain resumes and catches up.
+        pane.selection_scroll_freeze = None;
+        pane.drain_output();
+        let after = pane.vterm.read_scrollback(100);
+        assert!(
+            after.contains("hello world"),
+            "output must catch up after selection: {after:?}"
+        );
     }
 
     #[test]

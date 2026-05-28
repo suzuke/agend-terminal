@@ -331,9 +331,11 @@ pub(super) fn dispatch(action: Action, ctx: &mut DispatchCtx<'_>) -> DispatchRes
             if let Some(tab) = ctx.layout.active_tab() {
                 if let Some(pane) = tab.root().find_pane(tab.focus_id) {
                     if let Some(ref sel) = pane.selection {
-                        let text = pane
-                            .vterm
-                            .extract_text(sel.start, sel.end, pane.scroll_offset);
+                        let text = pane.vterm.extract_text(
+                            sel.start,
+                            sel.end,
+                            pane.effective_scroll_offset(),
+                        );
                         if !text.is_empty() {
                             super::mouse::copy_to_clipboard(&text);
                         }
