@@ -165,6 +165,11 @@ adapter!(
     ha,
     instance::handle_replace_instance
 );
+adapter!(
+    dispatch_restart_instance,
+    ha,
+    instance::handle_restart_instance
+);
 adapter!(dispatch_move_pane, ha, instance::handle_move_pane);
 adapter!(
     dispatch_set_waiting_on,
