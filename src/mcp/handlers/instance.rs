@@ -322,7 +322,10 @@ pub(super) fn handle_replace_instance(home: &Path, args: &Value) -> Value {
     );
 
     // Spawn fresh instance with same backend + working directory.
-    let mut spawn_params = json!({"name": name, "backend": backend});
+    // #1431: `layout: same-tab` tells the TUI to return the new pane to the
+    // tab the replaced pane occupied (recorded on its removal) instead of
+    // opening a fresh tab.
+    let mut spawn_params = json!({"name": name, "backend": backend, "layout": "same-tab"});
     if let Some(wd) = &working_dir {
         spawn_params["working_directory"] = json!(wd);
     }
