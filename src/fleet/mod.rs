@@ -2,6 +2,7 @@ pub(crate) mod merge;
 pub(crate) mod persist;
 mod resolve;
 
+#[allow(unused_imports)]
 pub use persist::{
     add_instance_to_yaml, add_instances_to_yaml, add_team_to_yaml, migrate_teams_json_to_yaml,
     remove_instance_from_yaml, remove_instances_from_yaml, remove_team_from_yaml,
@@ -588,11 +589,6 @@ pub struct InstanceYamlEntry {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::merge::{
-        build_instance_mapping, instance_field_class, merge_instance_into_existing, FieldClass,
-        FieldConflict,
-    };
-    use super::persist::mutate_fleet_yaml;
     use super::*;
     use std::fs;
 
