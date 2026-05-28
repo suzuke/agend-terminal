@@ -213,6 +213,7 @@ pub(crate) fn def_team() -> Value {
             "orchestrator": {"type": "string", "description": "Team orchestrator — must be a member."},
             "description": {"type": "string"},
             "source_repo": {"type": "string", "description": "Source repository path for the team."},
+            "accept_from": {"type": "array", "items": {"type": "string"}, "description": "External agent names allowed to send directly to this team's orchestrator (cross-team allowlist). Empty = deny all cross-team sends (default)."},
             "add": {"type": "array", "items": {"type": "string"}},
             "remove": {"type": "array", "items": {"type": "string"}}
         }, "required": ["action"]}})

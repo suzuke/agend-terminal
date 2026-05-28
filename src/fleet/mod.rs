@@ -292,6 +292,8 @@ pub struct TeamConfig {
     pub created_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_repo: Option<std::path::PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accept_from: Vec<String>,
 }
 
 impl FleetConfig {
