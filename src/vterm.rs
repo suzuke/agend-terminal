@@ -1096,6 +1096,143 @@ mod tests {
     }
 
     #[test]
+    fn ed2_clears_all_residual_text() {
+        let mut vt = VTerm::new(40, 10);
+        vt.process(b"RESIDUAL LINE ONE\r\n");
+        vt.process(b"RESIDUAL LINE TWO\r\n");
+        vt.process(b"RESIDUAL LINE THREE");
+        let before = vt.tail_lines(10);
+        assert!(before.contains("RESIDUAL"), "precondition: text present");
+        // ED 2 = erase entire display
+        vt.process(b"\x1b[2J\x1b[H");
+        let after = vt.tail_lines(10);
+        assert!(
+            !after.contains("RESIDUAL"),
+            "ED 2 must clear all residual text, got: {after:?}"
+        );
+    }
+
+    #[test]
+    fn el2_clears_entire_line() {
+        let mut vt = VTerm::new(40, 5);
+        vt.process(b"HELLO WORLD");
+        // Move cursor to col 5, then EL 2 = erase entire line
+        vt.process(b"\x1b[1;6H\x1b[2K");
+        let after = vt.tail_lines(5);
+        assert!(
+            !after.contains("HELLO"),
+            "EL 2 must clear entire line, got: {after:?}"
+        );
+    }
+
+    #[test]
+    fn el0_clears_from_cursor_to_eol() {
+        let mut vt = VTerm::new(40, 5);
+        vt.process(b"ABCDEFGHIJ");
+        // Move cursor to col 5 (1-indexed), EL 0 = erase cursor to end of line
+        vt.process(b"\x1b[1;6H\x1b[0K");
+        let after = vt.tail_lines(5);
+        assert!(
+            after.contains("ABCDE"),
+            "text before cursor preserved, got: {after:?}"
+        );
+        assert!(
+            !after.contains("FGHIJ"),
+            "text after cursor cleared, got: {after:?}"
+        );
+    }
+
+    #[test]
+    fn ed0_clears_from_cursor_to_end_of_display() {
+        let mut vt = VTerm::new(40, 5);
+        vt.process(b"LINE1\r\nLINE2\r\nLINE3");
+        // Move to row 2 col 1, ED 0 = erase from cursor to end of display
+        vt.process(b"\x1b[2;1H\x1b[0J");
+        let after = vt.tail_lines(5);
+        assert!(after.contains("LINE1"), "line1 preserved, got: {after:?}");
+        assert!(!after.contains("LINE2"), "line2 cleared, got: {after:?}");
+        assert!(!after.contains("LINE3"), "line3 cleared, got: {after:?}");
+    }
+
+    #[test]
+    fn erase_display_scroll_region_clears_within_region() {
+        let mut vt = VTerm::new(40, 10);
+        // Set scroll region to rows 3-7 (1-indexed)
+        vt.process(b"\x1b[3;7r");
+        // Fill some text
+        vt.process(b"\x1b[1;1HTOP\r\n");
+        vt.process(b"\x1b[3;1HMIDDLE\r\n");
+        vt.process(b"\x1b[8;1HBOTTOM");
+        // Erase display within scroll region
+        vt.process(b"\x1b[3;1H\x1b[J");
+        let after = vt.tail_lines(10);
+        assert!(
+            after.contains("TOP"),
+            "text outside scroll region preserved, got: {after:?}"
+        );
+        assert!(
+            !after.contains("MIDDLE"),
+            "text inside scroll region cleared, got: {after:?}"
+        );
+    }
+
+    #[test]
+    fn ech_erases_n_characters_at_cursor() {
+        let mut vt = VTerm::new(40, 5);
+        vt.process(b"ABCDEFGHIJ");
+        // Move to col 3 (1-indexed), ECH 4 = erase 4 chars at cursor
+        vt.process(b"\x1b[1;4H\x1b[4X");
+        let after = vt.tail_lines(5);
+        assert!(
+            after.contains("ABC"),
+            "text before cursor preserved, got: {after:?}"
+        );
+        assert!(
+            !after.contains("DEFG"),
+            "4 chars at cursor erased, got: {after:?}"
+        );
+        assert!(
+            after.contains("HIJ"),
+            "text after erased range preserved, got: {after:?}"
+        );
+    }
+
+    #[test]
+    fn dump_screen_after_ed2_has_no_residual() {
+        let mut vt = VTerm::new(40, 10);
+        vt.process(b"RESIDUAL TEXT LINE 1\r\n");
+        vt.process(b"RESIDUAL TEXT LINE 2\r\n");
+        vt.process(b"RESIDUAL TEXT LINE 3");
+        // ED 2 + cursor home
+        vt.process(b"\x1b[2J\x1b[H");
+        vt.process(b"FRESH CONTENT");
+        let raw = vt.dump_screen();
+        let dump = String::from_utf8_lossy(&raw);
+        assert!(
+            !dump.contains("RESIDUAL"),
+            "dump_screen must not contain erased text, got residual in dump"
+        );
+        assert!(dump.contains("FRESH"), "dump_screen must contain new text");
+    }
+
+    #[test]
+    fn alt_screen_switch_no_residual() {
+        let mut vt = VTerm::new(40, 10);
+        vt.process(b"MAIN SCREEN TEXT");
+        // Enter alt screen
+        vt.process(b"\x1b[?1049h");
+        vt.process(b"ALT SCREEN TEXT");
+        let alt = vt.tail_lines(10);
+        assert!(alt.contains("ALT SCREEN"), "alt screen shows alt text");
+        assert!(!alt.contains("MAIN SCREEN"), "alt screen hides main text");
+        // Exit alt screen
+        vt.process(b"\x1b[?1049l");
+        let main = vt.tail_lines(10);
+        assert!(main.contains("MAIN SCREEN"), "main screen restored");
+        assert!(!main.contains("ALT SCREEN"), "alt screen text gone");
+    }
+
+    #[test]
     fn read_scrollback_returns_visible_and_history() {
         let mut vt = VTerm::new(80, 5);
         // Write 10 lines into a 5-row terminal — first 5 scroll into history
