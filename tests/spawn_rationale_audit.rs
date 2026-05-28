@@ -250,7 +250,7 @@ fn dispatch_scoped_sweep_sites_have_rationale() {
     // (file relative to src/, exact substring of the spawn line we expect to find)
     let swept_sites: &[(&str, &str)] = &[
         ("instance_monitor.rs", "std::thread::Builder::new()"),
-        ("agent.rs", "std::thread::Builder::new()"),
+        ("agent/mod.rs", "std::thread::Builder::new()"),
         ("daemon/mod.rs", "std::thread::Builder::new()"),
         // #701 split: ci_watch.rs → ci_watch/{mod,registry,provider,sweep,poller,watcher}.rs
         // The shared_ci_runtime spawn site lives in poller.rs.
