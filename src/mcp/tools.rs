@@ -484,8 +484,8 @@ mod tests {
         let tools = defs["tools"].as_array().expect("tools array");
         assert_eq!(
             tools.len(),
-            33,
-            "#1085: 32 + tui_screenshot = 33. \
+            34,
+            "#1400: 33 + restart_instance = 34. \
              Current tools: {:?}",
             tools
                 .iter()
