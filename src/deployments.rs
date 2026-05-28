@@ -45,66 +45,57 @@ fn save(home: &Path, store: &mut DeploymentStore) -> anyhow::Result<()> {
     crate::store::save_atomic(&store_path(home), store)
 }
 
-pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
-    // C1 fix: flock around load-modify-save to prevent lost-update race.
-    let lock_path = store_path(home).with_extension("lock");
-    let _lock = match crate::store::acquire_file_lock(&lock_path) {
-        Ok(l) => l,
-        Err(e) => return serde_json::json!({"error": format!("deployment lock failed: {e}")}),
-    };
-    let template = match args["template"].as_str() {
-        Some(t) => t,
-        None => return serde_json::json!({"error": "missing 'template'"}),
-    };
-    let deploy_name = args["name"].as_str().unwrap_or(template);
-    let branch = args["branch"].as_str();
+struct DeployParams {
+    template: String,
+    deploy_name: String,
+    branch: Option<String>,
+    directory: String,
+    template_def: serde_yaml_ng::Value,
+    template_source_repo: Option<String>,
+    instances_def: serde_yaml_ng::Mapping,
+}
 
-    // Template / deploy name both feed into paths and shell-visible
-    // identifiers (git branch `deploy_name/suffix`, worktree path,
-    // deployment record). Enforce the same character class as
-    // agent::validate_name. Check template first so an empty `name` that
-    // defaults to `template` still surfaces a template-name error rather
-    // than a confusing deploy-name error.
-    if let Err(e) = crate::agent::validate_name(template) {
-        return serde_json::json!({"error": format!("invalid template name: {e}")});
-    }
-    if let Err(e) = crate::agent::validate_name(deploy_name) {
-        return serde_json::json!({"error": format!("invalid deploy name: {e}")});
-    }
+fn validate_deploy_args(home: &Path, args: &Value) -> Result<DeployParams, Value> {
+    let template = args["template"]
+        .as_str()
+        .ok_or_else(|| serde_json::json!({"error": "missing 'template'"}))?
+        .to_string();
+    let deploy_name = args["name"].as_str().unwrap_or(&template).to_string();
+    let branch = args["branch"].as_str().map(String::from);
 
-    // Load fleet.yaml to find template definition
+    crate::agent::validate_name(&template)
+        .map_err(|e| serde_json::json!({"error": format!("invalid template name: {e}")}))?;
+    crate::agent::validate_name(&deploy_name)
+        .map_err(|e| serde_json::json!({"error": format!("invalid deploy name: {e}")}))?;
+
     let fleet_path = crate::fleet::fleet_yaml_path(home);
     if !fleet_path.exists() {
-        return serde_json::json!({"error": "No fleet.yaml"});
+        return Err(serde_json::json!({"error": "No fleet.yaml"}));
     }
-    let config = match crate::fleet::FleetConfig::load(&fleet_path) {
-        Ok(c) => c,
-        Err(e) => return serde_json::json!({"error": format!("fleet.yaml: {e}")}),
-    };
+    let config = crate::fleet::FleetConfig::load(&fleet_path)
+        .map_err(|e| serde_json::json!({"error": format!("fleet.yaml: {e}")}))?;
 
-    let templates = match &config.templates {
-        Some(t) => t,
-        None => return serde_json::json!({"error": "No templates defined in fleet.yaml"}),
-    };
+    let templates = config
+        .templates
+        .as_ref()
+        .ok_or_else(|| serde_json::json!({"error": "No templates defined in fleet.yaml"}))?;
+    let template_def = templates
+        .get(&template)
+        .ok_or_else(|| serde_json::json!({"error": format!("Template '{template}' not found")}))?
+        .clone();
+    let instances_def = template_def
+        .get("instances")
+        .and_then(|v| v.as_mapping())
+        .ok_or_else(|| serde_json::json!({"error": "Template has no instances"}))?
+        .clone();
 
-    let template_def = match templates.get(template) {
-        Some(t) => t,
-        None => return serde_json::json!({"error": format!("Template '{template}' not found")}),
-    };
-
-    let instances_def = match template_def.get("instances").and_then(|v| v.as_mapping()) {
-        Some(m) => m,
-        None => return serde_json::json!({"error": "Template has no instances"}),
-    };
-
-    // #1320: 3-tier directory resolution — args > template > default.
-    let directory: String = if let Some(d) = args["directory"].as_str() {
+    let directory = if let Some(d) = args["directory"].as_str() {
         d.to_string()
     } else if let Some(d) = template_def.get("directory").and_then(|v| v.as_str()) {
         d.to_string()
     } else {
         crate::paths::workspace_dir(home)
-            .join(deploy_name)
+            .join(&deploy_name)
             .display()
             .to_string()
     };
@@ -114,58 +105,52 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
         .and_then(|v| v.as_str())
         .map(String::from);
 
-    // Phase 1 — validate every template entry, compute worktrees, and
-    // collect the fleet.yaml records. No SPAWN happens here: handle_spawn
-    // reads fleet.yaml to build the AgentContext (name + role + peers),
-    // which means every instance's entry must exist before any member
-    // spawns, otherwise early spawns would see a stale peer list and ship
-    // an incomplete Identity block into the backend's agend.md.
-    let mut created: Vec<String> = Vec::new();
-    let mut yaml_entries: Vec<(String, crate::fleet::InstanceYamlEntry)> = Vec::new();
-    let dir = std::path::PathBuf::from(&directory);
+    Ok(DeployParams {
+        template,
+        deploy_name,
+        branch,
+        directory,
+        template_def,
+        template_source_repo,
+        instances_def,
+    })
+}
 
-    for (name_val, inst_val) in instances_def {
+fn yaml_str(val: &serde_yaml_ng::Value, key: &str) -> Option<String> {
+    val.get(key)
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
+fn create_instance_entries(
+    params: &DeployParams,
+) -> (Vec<String>, Vec<(String, crate::fleet::InstanceYamlEntry)>) {
+    let mut created = Vec::new();
+    let mut yaml_entries = Vec::new();
+    let dir = std::path::PathBuf::from(&params.directory);
+
+    for (name_val, inst_val) in &params.instances_def {
         let inst_suffix = match name_val.as_str() {
             Some(s) => s,
             None => continue,
         };
-        // Template-supplied suffix flows into a git branch name
-        // (`deploy_name/suffix`) and a worktree path segment (`inst_name`).
-        // A hostile fleet.yaml could otherwise stuff `../../etc` or shell
-        // metacharacters here. Skip the entry with a warn rather than
-        // aborting the whole deploy.
         if let Err(e) = crate::agent::validate_name(inst_suffix) {
-            tracing::warn!(
-                %deploy_name,
-                suffix = %inst_suffix,
-                error = %e,
-                "skipping template instance with invalid name"
-            );
+            tracing::warn!(deploy_name = %params.deploy_name, suffix = %inst_suffix, error = %e,
+                "skipping template instance with invalid name");
             continue;
         }
-        let inst_name = format!("{deploy_name}-{inst_suffix}");
+        let inst_name = format!("{}-{inst_suffix}", params.deploy_name);
         if let Err(e) = crate::agent::validate_name(&inst_name) {
-            tracing::warn!(
-                %inst_name,
-                error = %e,
-                "skipping: combined instance name fails validation"
-            );
+            tracing::warn!(%inst_name, error = %e, "skipping: combined instance name fails validation");
             continue;
         }
-        // #787: read `backend:` only — DO NOT fall back to `command:`.
-        // The pre-fix fallback let a template's `command:` value (e.g. a
-        // wrapper-script path) overwrite the durable `backend:` label
-        // field at write time below, conflating the spawn-time
-        // invocation path with the categorical preset label. The
-        // `template_command` passthrough below separately captures the
-        // `command:` value into its own YAML field.
+
         let backend_label = inst_val
             .get("backend")
             .and_then(|v| v.as_str())
             .unwrap_or("claude");
-        // Accept `role:` (preferred) and `description:` (alias, mirrors
-        // InstanceConfig's serde alias). Empty string → None so we don't
-        // write a blank "Role:" line into agend.md.
         let role = inst_val
             .get("role")
             .or_else(|| inst_val.get("description"))
@@ -173,18 +158,6 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(String::from);
-        let instructions = inst_val
-            .get("instructions")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(String::from);
-        // Sprint 56 Track E (#450): pass-through six template
-        // parameters that the prior schema silently discarded. Scalars
-        // mirror the role/instructions trim → filter-empty → None
-        // pattern so a blank YAML field doesn't write a blank stanza.
-        // `args` / `env` use sequence / mapping shape; empty maps to
-        // None so a missing field is never re-written as `args: []`.
         let template_args = inst_val
             .get("args")
             .and_then(|v| v.as_sequence())
@@ -194,12 +167,6 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
                     .collect::<Vec<String>>()
             })
             .filter(|v| !v.is_empty());
-        let template_model = inst_val
-            .get("model")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(String::from);
         let template_env = inst_val
             .get("env")
             .and_then(|v| v.as_mapping())
@@ -213,70 +180,21 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
                 out
             })
             .filter(|m| !m.is_empty());
-        let template_ready_pattern = inst_val
-            .get("ready_pattern")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(String::from);
-        // `command:` template field is preserved verbatim into the
-        // YamlEntry's `command` slot so a custom non-backend invocation
-        // (e.g. `command: my-script.sh`) round-trips. Note that the
-        // existing `command` / `backend` fallback above derives the
-        // SPAWN-time backend label; this passthrough is the durable
-        // YAML record.
-        let template_command = inst_val
-            .get("command")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(String::from);
-        let template_worktree = inst_val.get("worktree").and_then(|v| v.as_bool());
         let source_repo = inst_val
             .get("source_repo")
             .and_then(|v| v.as_str())
             .map(String::from)
-            .or(template_source_repo.clone());
+            .or(params.template_source_repo.clone());
 
-        // Every member gets its own `<directory>/<inst_name>` subdir —
-        // same-backend teammates would otherwise clobber each other's
-        // agend.md (and mcp-config.json) when writing into a shared dir.
-        // `directory` is therefore treated as the parent for all members,
-        // matching branch-mode behavior.
         let inst_dir = dir.join(&inst_name);
-        let work_dir = if let Some(br) = branch {
-            let branch_name = format!("{deploy_name}/{inst_suffix}");
-            match std::process::Command::new("git")
-                .args([
-                    "worktree",
-                    "add",
-                    "-b",
-                    &branch_name,
-                    &inst_dir.display().to_string(),
-                    br,
-                ])
-                .current_dir(&dir)
-                .output()
-            {
-                Ok(o) if o.status.success() => {
-                    tracing::info!(%inst_name, %branch_name, "created worktree");
-                }
-                Ok(o) => {
-                    tracing::warn!(%inst_name, error = %String::from_utf8_lossy(&o.stderr).trim(), "worktree failed");
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "git not available");
-                }
-            }
-            inst_dir.display().to_string()
-        } else {
-            // create_dir_all is a no-op if it already exists; safe to call
-            // unconditionally. handle_spawn also runs one — this pre-create
-            // is defensive for tests that inspect the path without going
-            // through the daemon.
-            std::fs::create_dir_all(&inst_dir).ok();
-            inst_dir.display().to_string()
-        };
+        let work_dir = prepare_work_dir(
+            &inst_dir,
+            &dir,
+            &params.deploy_name,
+            inst_suffix,
+            &inst_name,
+            params.branch.as_deref(),
+        );
 
         yaml_entries.push((
             inst_name.clone(),
@@ -284,70 +202,95 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
                 backend: Some(backend_label.to_string()),
                 working_directory: Some(work_dir),
                 role,
-                instructions,
+                instructions: yaml_str(inst_val, "instructions"),
                 source_repo,
-                // Sprint 55 P0-B EC4: see instance.rs (gradient).
                 repo: None,
                 github_login: None,
-                // Sprint 56 Track E (#450): six template-parameter
-                // passthroughs. Each is `None` when the template stanza
-                // omits the field, preserving Sprint 21+ "no override"
-                // semantics for backwards compat with existing
-                // templates that don't declare them.
                 args: template_args,
-                model: template_model,
+                model: yaml_str(inst_val, "model"),
                 env: template_env,
-                ready_pattern: template_ready_pattern,
-                command: template_command,
-                worktree: template_worktree,
+                ready_pattern: yaml_str(inst_val, "ready_pattern"),
+                command: yaml_str(inst_val, "command"),
+                worktree: inst_val.get("worktree").and_then(|v| v.as_bool()),
                 topic_binding_mode: None,
             },
         ));
         created.push(inst_name);
     }
+    (created, yaml_entries)
+}
 
-    // Phase 2 — persist to fleet.yaml. Must happen before any SPAWN so
-    // handle_spawn can read this instance's role and the full peer list
-    // when building the AgentContext for its agend.md. Single lock take
-    // for the whole batch.
-    //
-    // #962 Layer 3: hard-fail if persist fails. Pre-#962 this was
-    // warn-and-continue, which let Phase 3 spawn instances NOT in
-    // fleet.yaml — `update_instance_field` then silently no-op'd
-    // topic_id persistence (the root cause of operator's demo bug:
-    // 3 demo agents with topic_id=null). Fail-fast here surfaces the
-    // upstream failure immediately and prevents the partial-success
-    // state where agents spawn but fleet.yaml is missing entries.
-    if !yaml_entries.is_empty() {
-        let refs: Vec<(&str, &crate::fleet::InstanceYamlEntry)> =
-            yaml_entries.iter().map(|(n, e)| (n.as_str(), e)).collect();
-        if let Err(e) = crate::fleet::add_instances_to_yaml(home, &refs) {
-            tracing::error!(
-                error = %e,
-                template = template,
-                deploy_name = deploy_name,
-                count = yaml_entries.len(),
-                "deploy_template: Phase 2 add_instances_to_yaml failed — aborting before Phase 3 spawn"
-            );
-            return serde_json::json!({
-                "error": format!(
-                    "deploy_template: failed to persist {} instance(s) to fleet.yaml: {e} \
-                     — Phase 3 spawn aborted to prevent partial-success state \
-                     (no agents spawned)",
-                    yaml_entries.len()
-                ),
-                "code": "deploy_yaml_persist_failed",
-            });
+fn prepare_work_dir(
+    inst_dir: &std::path::Path,
+    parent_dir: &std::path::Path,
+    deploy_name: &str,
+    inst_suffix: &str,
+    inst_name: &str,
+    branch: Option<&str>,
+) -> String {
+    if let Some(br) = branch {
+        let branch_name = format!("{deploy_name}/{inst_suffix}");
+        match std::process::Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "-b",
+                &branch_name,
+                &inst_dir.display().to_string(),
+                br,
+            ])
+            .current_dir(parent_dir)
+            .output()
+        {
+            Ok(o) if o.status.success() => {
+                tracing::info!(%inst_name, %branch_name, "created worktree");
+            }
+            Ok(o) => {
+                tracing::warn!(%inst_name, error = %String::from_utf8_lossy(&o.stderr).trim(), "worktree failed");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "git not available");
+            }
         }
+    } else {
+        std::fs::create_dir_all(inst_dir).ok();
     }
+    inst_dir.display().to_string()
+}
 
-    // Phase 3 — SPAWN each instance. handle_spawn now reads fleet.yaml,
-    // writes a full Identity/Role/Peers agend.md (or GEMINI.md for gemini),
-    // then spawns the child so the backend's --append-system-prompt-file
-    // flag resolves to an existing file.
-    for (inst_name, entry) in &yaml_entries {
+fn persist_to_fleet_yaml(
+    home: &Path,
+    yaml_entries: &[(String, crate::fleet::InstanceYamlEntry)],
+    template: &str,
+    deploy_name: &str,
+) -> Result<(), Value> {
+    if yaml_entries.is_empty() {
+        return Ok(());
+    }
+    let refs: Vec<(&str, &crate::fleet::InstanceYamlEntry)> =
+        yaml_entries.iter().map(|(n, e)| (n.as_str(), e)).collect();
+    crate::fleet::add_instances_to_yaml(home, &refs).map_err(|e| {
+        tracing::error!(error = %e, template, deploy_name, count = yaml_entries.len(),
+            "deploy: Phase 2 add_instances_to_yaml failed — aborting before Phase 3 spawn");
+        serde_json::json!({
+            "error": format!(
+                "deploy_template: failed to persist {} instance(s) to fleet.yaml: {e} \
+                 — Phase 3 spawn aborted to prevent partial-success state (no agents spawned)",
+                yaml_entries.len()
+            ),
+            "code": "deploy_yaml_persist_failed",
+        })
+    })
+}
+
+fn spawn_instances(
+    home: &Path,
+    yaml_entries: &[(String, crate::fleet::InstanceYamlEntry)],
+    directory: &str,
+) {
+    for (inst_name, entry) in yaml_entries {
         let backend_name = entry.backend.as_deref().unwrap_or("claude");
-        let work_dir = entry.working_directory.as_deref().unwrap_or(&directory);
+        let work_dir = entry.working_directory.as_deref().unwrap_or(directory);
         let mut params = serde_json::json!({
             "name": inst_name,
             "backend": backend_name,
@@ -361,10 +304,6 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
                 params["args"] = serde_json::json!(args.join(" "));
             }
         }
-        // #900: forward the template's env directly so handle_spawn
-        // applies it without re-reading fleet.yaml for what we just
-        // wrote there. Skip empty maps so the fleet-fallback path in
-        // handle_spawn still wins for "no override" instances.
         if let Some(ref env) = entry.env {
             if !env.is_empty() {
                 params["env"] = serde_json::to_value(env).unwrap_or(serde_json::Value::Null);
@@ -372,94 +311,112 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
         }
         let spawn_result = crate::api::call(
             home,
-            &serde_json::json!({
-                "method": crate::api::method::SPAWN,
-                "params": params,
-            }),
+            &serde_json::json!({"method": crate::api::method::SPAWN, "params": params}),
         );
         match spawn_result {
             Ok(ref v) if v.get("ok").and_then(|b| b.as_bool()) == Some(false) => {
                 let err = v.get("error").and_then(|e| e.as_str()).unwrap_or("unknown");
-                tracing::error!(instance = %inst_name, error = %err,
-                    "deploy_template: Phase 3 spawn failed");
+                tracing::error!(instance = %inst_name, error = %err, "deploy: Phase 3 spawn failed");
             }
             Err(e) => {
-                tracing::error!(instance = %inst_name, error = %e,
-                    "deploy_template: Phase 3 spawn call failed");
+                tracing::error!(instance = %inst_name, error = %e, "deploy: Phase 3 spawn call failed");
             }
             _ => {}
         }
     }
+}
 
-    // Phase 4 — create the team. Route through the CREATE_TEAM API (not a
-    // direct teams::create call) so the handler emits the TeamCreated event
-    // and the TUI moves all member panes into a single tab, matching the
-    // behavior of `create_instance(team:...)`. Passing empty backends/count
-    // tells handle_create_team to skip its own spawn phase — our members
-    // already exist from Phase 3.
-    //
-    // Orchestrator can be nominated by *suffix* (`orchestrator: lead` →
-    // `dev-lead`). Unknown or unspawned suffixes get dropped with a warn,
-    // leaving the team orchestrator-less rather than failing deploy.
-    if created.len() > 1 {
-        let mut team_args = serde_json::json!({
-            "name": deploy_name,
-            "members": &created,
-            "description": format!("Template deployment: {template}"),
-        });
-        if let Some(ref sr) = template_source_repo {
-            team_args["source_repo"] = serde_json::Value::String(sr.clone());
-        }
-        if let Some(suffix) = template_def.get("orchestrator").and_then(|v| v.as_str()) {
-            let full = format!("{deploy_name}-{suffix}");
-            if created.contains(&full) {
-                team_args["orchestrator"] = serde_json::Value::String(full);
-            } else {
-                tracing::warn!(
-                    template,
-                    suffix,
-                    "template orchestrator not among spawned instances; team created without one"
-                );
-            }
-        }
-        // Route through API so the daemon can emit TeamCreated and the TUI
-        // consolidates member panes into one tab. Fall back to a direct
-        // teams::create when the daemon is unreachable (unit tests, or a
-        // pre-daemon bootstrap) — no TUI means no consolidation anyway, so
-        // just persist the record.
-        match crate::api::call(
-            home,
-            &serde_json::json!({
-                "method": crate::api::method::CREATE_TEAM,
-                "params": &team_args,
-            }),
-        ) {
-            Ok(_) => {}
-            Err(_) => {
-                let _ = crate::teams::create(home, &team_args);
-            }
+fn create_deployment_team(
+    home: &Path,
+    deploy_name: &str,
+    template: &str,
+    template_def: &serde_yaml_ng::Value,
+    template_source_repo: &Option<String>,
+    created: &[String],
+) {
+    if created.len() <= 1 {
+        return;
+    }
+    let mut team_args = serde_json::json!({
+        "name": deploy_name,
+        "members": &created,
+        "description": format!("Template deployment: {template}"),
+    });
+    if let Some(ref sr) = template_source_repo {
+        team_args["source_repo"] = serde_json::Value::String(sr.clone());
+    }
+    if let Some(suffix) = template_def.get("orchestrator").and_then(|v| v.as_str()) {
+        let full = format!("{deploy_name}-{suffix}");
+        if created.contains(&full) {
+            team_args["orchestrator"] = serde_json::Value::String(full);
+        } else {
+            tracing::warn!(
+                template,
+                suffix,
+                "template orchestrator not among spawned instances; team created without one"
+            );
         }
     }
+    match crate::api::call(
+        home,
+        &serde_json::json!({"method": crate::api::method::CREATE_TEAM, "params": &team_args}),
+    ) {
+        Ok(_) => {}
+        Err(_) => {
+            let _ = crate::teams::create(home, &team_args);
+        }
+    }
+}
 
-    // Track deployment
+pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
+    let lock_path = store_path(home).with_extension("lock");
+    let _lock = match crate::store::acquire_file_lock(&lock_path) {
+        Ok(l) => l,
+        Err(e) => return serde_json::json!({"error": format!("deployment lock failed: {e}")}),
+    };
+
+    let params = match validate_deploy_args(home, args) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+
+    let (created, yaml_entries) = create_instance_entries(&params);
+
+    if let Err(e) =
+        persist_to_fleet_yaml(home, &yaml_entries, &params.template, &params.deploy_name)
+    {
+        return e;
+    }
+
+    spawn_instances(home, &yaml_entries, &params.directory);
+
+    create_deployment_team(
+        home,
+        &params.deploy_name,
+        &params.template,
+        &params.template_def,
+        &params.template_source_repo,
+        &created,
+    );
+
     let deployment = Deployment {
-        name: deploy_name.to_string(),
-        template: template.to_string(),
+        name: params.deploy_name.to_string(),
+        template: params.template.to_string(),
         instances: created.clone(),
         team: if created.len() > 1 {
-            Some(deploy_name.to_string())
+            Some(params.deploy_name.to_string())
         } else {
             None
         },
-        directory: directory.to_string(),
+        directory: params.directory,
         created_at: chrono::Utc::now().to_rfc3339(),
     };
     let mut store = load(home);
     store.deployments.push(deployment);
     let _ = save(home, &mut store);
 
-    let _ = instance_name; // suppress unused
-    serde_json::json!({"status": "deployed", "name": deploy_name, "instances": created})
+    let _ = instance_name;
+    serde_json::json!({"status": "deployed", "name": params.deploy_name, "instances": created})
 }
 
 pub fn teardown(home: &Path, args: &Value) -> Value {
