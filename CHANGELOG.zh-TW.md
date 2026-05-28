@@ -3,6 +3,8 @@
 本文件記錄本專案所有重要變更。
 格式基於 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)；專案遵循 [SemVer](https://semver.org/spec/v2.0.0.html)。
 
+## [Unreleased]
+
 ## [0.7.0] — 2026-05-28
 
 自 `0.6.1` 以來超過 200 個 commit，橫跨 Sprint 55–69（2026 年 5 月 7 日至 5 月 28 日）。三大主題：
