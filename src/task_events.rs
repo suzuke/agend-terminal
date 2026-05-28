@@ -941,11 +941,14 @@ fn max_seq_for_instance(log_path: &Path, instance: &InstanceName) -> anyhow::Res
 
 // ── Replay cache ─────────────────────────────────────────────────────
 // Read-side cache: avoids full-file replay when nothing has changed.
-// Keyed on (hot_log mtime_ns, hot_log len, archive_dir mtime_ns).
-// Invalidated explicitly after append_batch and implicitly when file
-// metadata changes (external writes, rotation).
+// Keyed on (home, generation) where generation is a process-wide
+// monotonic counter incremented on every append. This replaces the
+// previous mtime-based key which was unreliable on Linux ext4 where
+// mtime granularity (1ms) is too coarse for rapid concurrent writes.
 
-type ReplayCacheKey = (std::path::PathBuf, i64, u64, i64);
+static REPLAY_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+type ReplayCacheKey = (std::path::PathBuf, u64);
 
 struct ReplayCacheEntry {
     key: ReplayCacheKey,
@@ -955,28 +958,13 @@ struct ReplayCacheEntry {
 static REPLAY_CACHE: std::sync::LazyLock<parking_lot::Mutex<Option<ReplayCacheEntry>>> =
     std::sync::LazyLock::new(|| parking_lot::Mutex::new(None));
 
-fn replay_cache_key(home: &Path) -> Option<ReplayCacheKey> {
-    let log = log_path(home);
-    let log_meta = std::fs::metadata(&log).ok()?;
-    let log_mtime = log_meta
-        .modified()
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_nanos() as i64;
-    let log_len = log_meta.len();
-    let archive = archive_dir(home);
-    let archive_mtime = std::fs::metadata(&archive)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0);
-    Some((home.to_path_buf(), log_mtime, log_len, archive_mtime))
+fn replay_cache_key(home: &Path) -> ReplayCacheKey {
+    let gen = REPLAY_GENERATION.load(std::sync::atomic::Ordering::Acquire);
+    (home.to_path_buf(), gen)
 }
 
 pub fn invalidate_replay_cache() {
-    *REPLAY_CACHE.lock() = None;
+    REPLAY_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
 // ── Replay: strict reader (forward-compat fail-closed) ─────────────
@@ -988,7 +976,8 @@ pub fn invalidate_replay_cache() {
 /// variant aborts (per dev-reviewer-2 must-have: replay must NOT silently
 /// skip unknown envelopes).
 pub fn replay(home: &Path) -> anyhow::Result<TaskBoardState> {
-    if let Some(key) = replay_cache_key(home) {
+    let key = replay_cache_key(home);
+    {
         let cache = REPLAY_CACHE.lock();
         if let Some(entry) = cache.as_ref() {
             if entry.key == key {
@@ -999,12 +988,10 @@ pub fn replay(home: &Path) -> anyhow::Result<TaskBoardState> {
 
     let state = replay_uncached(home)?;
 
-    if let Some(key) = replay_cache_key(home) {
-        *REPLAY_CACHE.lock() = Some(ReplayCacheEntry {
-            key,
-            state: state.clone(),
-        });
-    }
+    *REPLAY_CACHE.lock() = Some(ReplayCacheEntry {
+        key,
+        state: state.clone(),
+    });
 
     Ok(state)
 }
