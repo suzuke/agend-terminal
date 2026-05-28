@@ -285,15 +285,14 @@ pub(super) fn handle_replace_instance(home: &Path, args: &Value) -> Value {
         .and_then(|r| r.working_directory)
         .map(|p| p.display().to_string());
 
-    // Kill via DELETE (synchronous — waits for child exit + removes from registry).
+    // #1366: kill via DELETE with no_wait — sends kill signal and removes
+    // registry entry without blocking up to 5 s for child exit. The OS
+    // reaps the old process asynchronously; the new spawn gets its own
+    // PID / PTY / port with no resource collision.
     let _ = crate::api::call(
         home,
-        &json!({"method": crate::api::method::DELETE, "params": {"name": name}}),
+        &json!({"method": crate::api::method::DELETE, "params": {"name": name, "no_wait": true}}),
     );
-
-    // TODO: replace hardcoded 500ms sleep with event-driven readiness check
-    // (e.g. poll until PID is gone or port is free).
-    std::thread::sleep(std::time::Duration::from_millis(500));
 
     // Enqueue handover context for the new instance.
     let _ = crate::inbox::enqueue(

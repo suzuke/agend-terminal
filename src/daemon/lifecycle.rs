@@ -70,13 +70,21 @@ fn drop_active_binding(name: &str) {
 /// Called by both API `handle_delete` and app-mode `kill_agent` so the two
 /// paths cannot drift in cleanup completeness (Sprint 20 F3 was that drift).
 ///
+/// When `skip_exit_wait` is `true`, the kill signal is sent but
+/// [`wait_for_child_exit`] is skipped — the OS reaps the child
+/// asynchronously. Used by `replace_instance` (#1366) where the caller
+/// spawns a fresh instance immediately and the 5 s synchronous wait is
+/// unnecessary overhead.
+///
 /// Returns `true` if the cleanup observed the child exiting cleanly; `false`
-/// if [`CHILD_EXIT_TIMEOUT`] fired and we force-removed anyway.
+/// if [`CHILD_EXIT_TIMEOUT`] fired and we force-removed anyway. When
+/// `skip_exit_wait` is `true`, always returns `true` (optimistic).
 pub fn delete_transaction(
     home: &Path,
     name: &str,
     registry: &AgentRegistry,
     configs: Option<&Arc<Mutex<HashMap<String, super::AgentConfig>>>>,
+    skip_exit_wait: bool,
 ) -> bool {
     // Step 1: snapshot the child handle while still holding registry entry,
     // then release the registry lock before issuing the kill so concurrent
@@ -101,10 +109,17 @@ pub fn delete_transaction(
             }
             let _ = child.kill();
         }
-        // Step 3: synchronous wait for actual exit (Sprint 20 F2 fix —
-        // previously delete returned before the OS had reaped the PID,
-        // exposing PID re-use + concurrent-spawn collision races).
-        wait_for_child_exit(&child_arc)
+        if skip_exit_wait {
+            // #1366: caller opted out of the synchronous wait. The kill
+            // signal has been sent; the OS will reap the child in the
+            // background. Proceed to registry removal immediately.
+            true
+        } else {
+            // Step 3: synchronous wait for actual exit (Sprint 20 F2 fix —
+            // previously delete returned before the OS had reaped the PID,
+            // exposing PID re-use + concurrent-spawn collision races).
+            wait_for_child_exit(&child_arc)
+        }
     } else {
         // No registry entry; nothing to wait on.
         true
@@ -280,7 +295,7 @@ mod tests {
         let reg = empty_registry();
         // No insert → delete still cleans configs/ipc/event-log; returns true
         // (no child to wait on, so "exit observed" is vacuously true).
-        let observed_exit = delete_transaction(&home, "ghost", &reg, None);
+        let observed_exit = delete_transaction(&home, "ghost", &reg, None, false);
         assert!(
             observed_exit,
             "missing registry entry → wait is vacuous true"
@@ -340,7 +355,7 @@ mod tests {
         reg.lock().insert("gamma".into(), handle);
         // `true` exits immediately, so wait_for_child_exit should observe
         // the exit on the first try_wait.
-        let observed_exit = delete_transaction(&home, "gamma", &reg, None);
+        let observed_exit = delete_transaction(&home, "gamma", &reg, None, false);
         assert!(
             observed_exit,
             "exited child must be observed within timeout"
