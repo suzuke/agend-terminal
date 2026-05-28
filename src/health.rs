@@ -254,7 +254,7 @@ pub struct HealthTracker {
     /// [`Self::maybe_decay_at`] to honour a Paused decay window. Stage 3
     /// is terminal in Phase 2, so nothing in 7c reads the field; carry
     /// `#[allow(dead_code)]` until the unpause sub-task lands.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // reserved for unpause sub-task (Stage 3 decay)
     pub(crate) last_stage3_fired_at: Option<Instant>,
 }
 
@@ -611,7 +611,7 @@ impl HealthTracker {
     }
 
     /// Record an error state. Returns true if error loop detected (3x in 10min).
-    #[allow(dead_code)]
+    #[allow(dead_code)] // wired by daemon health monitoring; used in tests
     pub fn record_error(&mut self, state: AgentState) -> bool {
         let now = Instant::now();
         self.error_events.push_back((now, state));
@@ -725,7 +725,7 @@ impl HealthTracker {
     }
 
     /// Reset health state (e.g., after manual restart).
-    #[allow(dead_code)]
+    #[allow(dead_code)] // used in tests; available for manual restart path
     pub fn reset(&mut self) {
         self.state = HealthState::Healthy;
         self.crash_times.clear();

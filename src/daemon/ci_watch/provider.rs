@@ -152,7 +152,7 @@ pub enum CiPollResult {
     },
     /// API-level error (rate limit, auth failure, server error).
     ApiError {
-        #[allow(dead_code)]
+        #[allow(dead_code)] // serialized in error diagnostics
         status: u16,
         message: String,
         /// If rate-limited, epoch seconds when quota resets.
@@ -254,7 +254,7 @@ pub trait CiProvider: Send + Sync {
     /// Optional token/auth warning shown in the `watch_ci` MCP response.
     /// Currently called via `github_token_warning_from_env()` in the handler;
     /// future providers will use this method directly.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // trait method; future providers use directly
     fn token_warning(&self) -> Option<&'static str>;
 }
 
@@ -575,7 +575,7 @@ impl GitLabCiProvider {
         Self::with_base_url("https://gitlab.com".to_string())
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // wired in Sprint 39 PR-3 (fleet.yaml ci_provider config)
     pub fn with_base_url(base_url: String) -> anyhow::Result<Self> {
         Ok(Self {
             http: CiHttpClient::new(base_url, "api/v4", || {

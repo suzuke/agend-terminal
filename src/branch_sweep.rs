@@ -30,14 +30,14 @@ use std::path::Path;
 /// merged land in `stale_idle`. Operator can override via
 /// `min_age_days` arg on the MCP call. Dead-code allow lifts at C3
 /// when the MCP handler reads the default.
-#[allow(dead_code)]
+#[allow(dead_code)] // used by MCP handler cleanup_merged_branches
 pub(crate) const STALE_IDLE_DEFAULT_DAYS: i64 = 90;
 
 /// Lightweight enumeration of a local branch — what `git for-each-ref`
 /// returns. The category is computed separately via per-branch
 /// `git cherry` / `git branch --merged` checks.
 #[derive(Debug, Clone, serde::Serialize)]
-#[allow(dead_code)]
+#[allow(dead_code)] // used by MCP handler cleanup_merged_branches
 pub(crate) struct BranchInfo {
     pub name: String,
     pub tip_sha: String,
@@ -49,7 +49,7 @@ pub(crate) struct BranchInfo {
 /// exactly one bucket (first match wins, order: clean_merged →
 /// squash_merged → stale_idle → active_unknown).
 #[derive(Debug, Clone, serde::Serialize)]
-#[allow(dead_code)]
+#[allow(dead_code)] // used by MCP handler cleanup_merged_branches
 pub(crate) struct Candidate {
     pub name: String,
     pub tip_sha: String,
@@ -57,7 +57,7 @@ pub(crate) struct Candidate {
 }
 
 #[derive(Debug, Default, serde::Serialize)]
-#[allow(dead_code)]
+#[allow(dead_code)] // used by MCP handler cleanup_merged_branches
 pub(crate) struct Categories {
     pub clean_merged: Vec<Candidate>,
     pub squash_merged: Vec<Candidate>,
@@ -75,7 +75,7 @@ pub(crate) struct Categories {
     pub reviewer_checkout: Vec<Candidate>,
 }
 
-#[allow(dead_code)]
+#[allow(dead_code)] // used by MCP handler cleanup_merged_branches
 impl Categories {
     /// Concatenated sorted list of all candidate branch names across
     /// the deletable buckets (clean_merged + squash_merged +
@@ -122,7 +122,7 @@ impl Categories {
 
 /// Enumerate local branches via `git for-each-ref`, parsing name +
 /// tip SHA + ISO-8601 committerdate per line.
-#[allow(dead_code)]
+#[allow(dead_code)] // used by MCP handler cleanup_merged_branches
 fn enumerate_branches(repo: &Path) -> Result<Vec<BranchInfo>, String> {
     let output = std::process::Command::new("git")
         .args([
@@ -165,7 +165,7 @@ fn enumerate_branches(repo: &Path) -> Result<Vec<BranchInfo>, String> {
 /// Returns true if `branch` is reachable from `base` via a merge
 /// commit (`git branch --merged base` includes it). Used to detect
 /// the `clean_merged` category.
-#[allow(dead_code)]
+#[allow(dead_code)] // used by MCP handler cleanup_merged_branches
 fn is_clean_merged(repo: &Path, base: &str, branch: &str) -> bool {
     let output = std::process::Command::new("git")
         .args(["branch", "--merged", base])
@@ -311,7 +311,7 @@ fn extract_github_repo(url: &str) -> Option<String> {
 /// `now` parameterized so `stale_idle` threshold testing isn't
 /// flaky around day boundaries. Dead-code allow lifts at C3 when
 /// the MCP handler wires the call site.
-#[allow(dead_code)]
+#[allow(dead_code)] // used by MCP handler cleanup_merged_branches
 /// #852 PR-C: classify reviewer-checkout residue by name. Pattern
 /// covers the three observed pollution shapes:
 /// - `tmp.*` — operator's `tmp_pr_review` / `tmp/abc1234` style
@@ -410,7 +410,7 @@ pub(crate) fn scan(
 /// success is observable in the event log.
 ///
 /// Dead-code allow lifts at C3 when the MCP handler wires the call.
-#[allow(dead_code)]
+#[allow(dead_code)] // used by MCP handler cleanup_merged_branches
 pub(crate) fn emit_delete_batch(
     home: &Path,
     repo: &Path,

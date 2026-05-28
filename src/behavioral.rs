@@ -167,23 +167,7 @@ pub struct DivergenceStats {
     pub diverge: u64,
 }
 
-impl DivergenceStats {
-    /// Divergence rate as percentage (0.0–100.0).
-    /// Sprint 27 condition #1: ≤5% gate for behavioral promotion.
-    ///
-    /// Wave 1 CLI consolidation: the standalone `state-divergence-report`
-    /// CLI surface was removed (operator audit decision
-    /// `d-20260507155456191111-0`). The data layer stays intact for any
-    /// future API endpoint or daemon-side consumer.
-    #[allow(dead_code)]
-    pub fn divergence_rate(&self) -> f64 {
-        if self.total_ticks == 0 {
-            0.0
-        } else {
-            self.diverge as f64 / self.total_ticks as f64 * 100.0
-        }
-    }
-}
+impl DivergenceStats {}
 
 /// Global divergence accumulator — keyed by backend name.
 static DIVERGENCE: parking_lot::Mutex<Option<std::collections::HashMap<String, DivergenceStats>>> =
@@ -208,18 +192,11 @@ pub fn record_divergence(backend: &str, behavioral: BehavioralSignal, regex_stat
     }
 }
 
-/// Get divergence report for all backends.
-/// Reset divergence stats (test isolation).
-#[allow(dead_code)]
-pub fn reset_divergence() {
-    *DIVERGENCE.lock() = None;
-}
-
 /// Wave 1 CLI consolidation: the standalone `state-divergence-report`
 /// CLI surface was removed (operator audit decision
 /// `d-20260507155456191111-0`). Data layer kept intact — future API
 /// endpoint or daemon-side consumer can re-expose if needed.
-#[allow(dead_code)]
+#[allow(dead_code)] // used by tests; data layer retained for future API
 pub fn divergence_report() -> Vec<(String, DivergenceStats)> {
     let guard = DIVERGENCE.lock();
     match guard.as_ref() {
@@ -503,7 +480,7 @@ pub fn config_for_productivity(backend: &Backend) -> ProductivityConfig {
 // [`infer_productivity_with_match`] for evidence-substring dedup.
 // `infer_productivity` retained as the simpler interface for tests +
 // future single-signal callers that don't need the matched text.
-#[allow(dead_code)]
+#[allow(dead_code)] // simpler test interface; production uses infer_productivity_with_match
 pub fn infer_productivity(
     config: &ProductivityConfig,
     screen_text: &str,
@@ -650,7 +627,6 @@ pub fn log_productivity_telemetry(
     }
 }
 
-#[allow(dead_code)]
 #[allow(clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {

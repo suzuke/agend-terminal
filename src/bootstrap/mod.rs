@@ -83,17 +83,17 @@ pub enum BootstrapOutcome {
 /// in CI.
 pub struct OwnedFleet {
     pub home: PathBuf,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // read by diagnostics + tests
     pub fleet_path: PathBuf,
     pub config: crate::fleet::FleetConfig,
     pub agents: Vec<AgentDef>,
     pub run_dir: PathBuf,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // read by tests; avoids re-reading cookie file
     pub cookie: crate::auth_cookie::Cookie,
     pub telegram: Option<Arc<dyn crate::channel::Channel>>,
     /// Flock guard — drop releases `.daemon.lock`. Kept last so the lock is
     /// released only after every other resource has been dropped.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // RAII guard: drop releases daemon lock
     pub lock: DaemonLock,
 }
 
@@ -104,12 +104,12 @@ pub struct OwnedFleet {
 /// re-derives them per connection, but a future per-pane cache would read
 /// these. See OwnedFleet note about why `#[allow(dead_code)]` is per-field.
 pub struct AttachedFleet {
-    #[allow(dead_code)]
+    #[allow(dead_code)] // scaffolding for future per-pane cache
     pub home: PathBuf,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // scaffolding for future per-pane cache
     pub fleet_path: PathBuf,
     pub run_dir: PathBuf,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // scaffolding for future per-pane cache
     pub cookie: crate::auth_cookie::Cookie,
     /// PID of the running daemon, parsed from `.daemon`. 0 if unparseable.
     pub daemon_pid: u32,
