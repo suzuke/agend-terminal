@@ -122,9 +122,7 @@ pub(super) fn handle_delete_instance(home: &Path, args: &Value) -> Value {
         Some(n) => n,
         None => return json!({"error": "missing 'name'"}),
     };
-    if let Err(e) = crate::agent::validate_name(name) {
-        return json!({"error": e});
-    }
+    crate::validate_name_or_err!(name);
     let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok();
     if let Some(ref config) = fleet {
         if config.channel.is_some()
@@ -153,9 +151,7 @@ pub(super) fn handle_start_instance(home: &Path, args: &Value) -> Value {
         Some(n) => n,
         None => return json!({"error": "missing 'name'"}),
     };
-    if let Err(e) = crate::agent::validate_name(name) {
-        return json!({"error": e});
-    }
+    crate::validate_name_or_err!(name);
     let fleet_path = crate::fleet::fleet_yaml_path(home);
     if !fleet_path.exists() {
         return json!({"error": "No fleet.yaml"});
@@ -195,9 +191,7 @@ pub(super) fn handle_start_instance(home: &Path, args: &Value) -> Value {
 
 pub(super) fn handle_describe_instance(home: &Path, args: &Value) -> Value {
     let name = args["name"].as_str().unwrap_or("");
-    if let Err(e) = crate::agent::validate_name(name) {
-        return json!({"error": e});
-    }
+    crate::validate_name_or_err!(name);
     match crate::api::call(home, &json!({"method": crate::api::method::LIST})) {
         Ok(resp) => {
             match resp["result"]["agents"]
@@ -238,9 +232,7 @@ pub(super) fn handle_replace_instance(home: &Path, args: &Value) -> Value {
         Some(n) => n,
         None => return json!({"error": "missing 'name'"}),
     };
-    if let Err(e) = crate::agent::validate_name(name) {
-        return json!({"error": e});
-    }
+    crate::validate_name_or_err!(name);
     let reason = args["reason"].as_str().unwrap_or("manual replacement");
 
     // Capture backend + working_directory before kill so we can respawn.
@@ -353,9 +345,7 @@ pub(super) fn handle_restart_instance(home: &Path, args: &Value) -> Value {
         Some(n) => n,
         None => return json!({"error": "missing 'name'"}),
     };
-    if let Err(e) = crate::agent::validate_name(name) {
-        return json!({"error": e});
-    }
+    crate::validate_name_or_err!(name);
     let reason = args["reason"].as_str().unwrap_or("manual restart");
     let mode = args["mode"].as_str().unwrap_or("resume");
 
@@ -421,9 +411,7 @@ pub(super) fn handle_interrupt(home: &Path, args: &Value) -> Value {
         Some(t) => t,
         None => return json!({"error": "missing 'target'"}),
     };
-    if let Err(e) = crate::agent::validate_name(target) {
-        return json!({"error": e});
-    }
+    crate::validate_name_or_err!(target);
     match crate::api::call(home, &super::interrupt_esc_params(target)) {
         Ok(resp) if resp["ok"].as_bool() == Some(true) => {
             if let Some(reason) = args["reason"].as_str() {
@@ -510,9 +498,7 @@ pub(super) fn handle_pane_snapshot(home: &Path, args: &Value) -> Value {
         Some(t) => t,
         None => return json!({"error": "missing 'target'"}),
     };
-    if let Err(e) = crate::agent::validate_name(target) {
-        return json!({"error": e});
-    }
+    crate::validate_name_or_err!(target);
     let lines_u64 = args["lines"].as_u64().unwrap_or(100);
     // M1: explicit bounds check before u64→usize cast (32-bit safety)
     if lines_u64 > 10000 {

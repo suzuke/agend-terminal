@@ -151,9 +151,7 @@ pub(crate) fn handle_release_worktree(
         Some(a) if !a.is_empty() => a,
         _ => return json!({"error": "missing 'agent'"}),
     };
-    if let Err(e) = crate::agent::validate_name(agent) {
-        return json!({"error": e});
-    }
+    crate::validate_name_or_err!(agent);
     let dry_run = args["dry_run"].as_bool().unwrap_or(false);
     // #789: clean empty init commits before removal (best-effort).
     if !dry_run {

@@ -73,9 +73,7 @@ pub(crate) fn handle_binding_state(home: &Path, args: &Value, _sender: &Option<S
         Some(a) if !a.is_empty() => a,
         _ => return json!({"error": "missing 'agent'"}),
     };
-    if let Err(e) = crate::agent::validate_name(agent) {
-        return json!({"error": e});
-    }
+    crate::validate_name_or_err!(agent);
 
     let binding = crate::binding::read(home, agent);
     let bind_in_flight = crate::mcp::handlers::dispatch_hook::is_bind_in_flight(home, agent);
