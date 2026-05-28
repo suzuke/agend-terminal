@@ -5,63 +5,19 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-05-28
+
+200+ commits since `0.6.1` over Sprint 55–69 (May 7 → May 28, 2026). Three themes dominate:
+**(1) Task board reliability** — ghost-owner class root-caused and prevented (`teams::delete` cascade, boot orphan sweep, `force` flag) + new sweepers + operator-visible health snapshot; **(2) Bridge ↔ daemon idempotent retry** — eliminates the double-execution class for side-effect MCP calls under transient transport failures (UUID request_id + DedupCache + Condvar block-wait); **(3) MCP handler refactor #694 complete** — all 30+ tool dispatch arms migrated from inline `match` to a dispatch table, paving the way for tool registry hot-reload (#776). Plus Hung detection shadow-mode foundations (F9 Stage 1–3), rate-limit recovery auto-prompt, and ~50 smaller bug fixes / hardening PRs.
+
 ### Added
 
 - **`notify_system` helper (#1335)** — `crate::inbox::notify_system()` encapsulates the common daemon notification pattern (`InboxMessage::new_system` + builder chain + `enqueue_with_idle_hint`). Seven daemon modules migrated: `anti_stall`, `decision_timeout`, `dispatch_idle`, `fixup_nudge`, `helper_staleness_watchdog`, `idle_watchdog`, `waiting_on_stale`. Reduces boilerplate from ~8 lines to 1 per notification site.
 - **Event bus (#1336)** — Global event bus behind feature flag `AGEND_EVENT_BUS=1`. `event_bus::emit_lazy(kind, || payload)` defers serialization when disabled; `event_bus::is_enabled()` allows callers to skip payload construction entirely. Zero-cost disabled path (no allocation, no serialization). In-memory broadcast channel with configurable capacity.
 - **`with_pr_state` flock helper (#1342)** — `pr_state::with_pr_state()` and `with_pr_state_or_create()` serialize all read-modify-write operations on `pr-state/*.json` files via `fs4` file locks. Eliminates the lost-update race where gh-poll save overwrites scanner's `ready_emitted_for_sha` flag, causing duplicate `[pr-merged]` notifications. All 6 production `save()` call sites migrated.
 - **Auto-release worktree on pr-merged (#1344)** — Scanner's `MergeState::Merged` branch now calls `auto_release_for_merged_branch()` before emitting `[pr-merged]`. Prevents `gh pr merge --delete-branch` failure when a dev's worktree still holds the local branch. Manual `release_worktree` step removed from the action checklist.
-
-### Changed
-
-- **`request_id` propagation in comms.rs (#1341)** — All three `api::call` sites in `comms.rs` (`handle_send_to_instance`, `handle_delegate_task`, `handle_report_result`) now include a UUIDv4 `request_id` in the JSON envelope, enabling the daemon's `request_dedup::DedupCache` to deduplicate retries on the MCP→daemon path.
-- **`dispatch_idle` flock (#1340)** — `mark_resolved` and `scan_and_emit` in `dispatch_idle` now use flock serialization to prevent race conditions between concurrent resolution and scan operations.
-
-- **`agy` backend (#987)** — Google Antigravity CLI as a sixth first-class backend alongside claude / kiro-cli / codex / opencode / gemini. Mirror-pattern addition: `Backend::Agy` variant + `configure_agy` writes `<workdir>/.antigravitycli/mcp_config.json` with the standard `mcpServers` stdio schema (`agend-mcp-bridge` unchanged). Resume via `agy --continue`. Calibrated against `tests/fixtures/state-replay/agy-thinking.raw` (agy 1.0.0 on macOS 14.5). Motivated by Gemini CLI sunset 2026-06-18; existing `gemini` backend retained for paid Code Assist Standard/Enterprise license holders. Operator note: AGY shares OAuth state with the Antigravity desktop app per OS user; multi-instance agents under the same `$HOME` share auth state (same convention as existing `gemini` backend — no daemon intercept).
-
-### Changed (#994)
-
-- **`doctor topics` taxonomy reduced from 4 classes to 2** — `drift_fleet` and `stale_registry` classes removed. With topics.json as the single source of truth for topic_id (Phase 1 #1062), there is no second source to drift against. Only `live` (instance in fleet.yaml) and `orphan` (instance retired) remain. The `--prefer-fleet` / `--prefer-registry` CLI flags are removed (no drift to resolve). JSON output `schema_version` bumped to 2. Operator awareness — not regression: the removed classes were unreachable since #1062.
-
-### Changed (#995)
-
-- **`agy` backend display name** — TUI Backend picker (ctrl+b c) and serialized `Backend::Agy.name()` now return `antigravity-cli` instead of the binary name `agy`. The binary command (`preset().command`) remains `agy`; `parse_str` still accepts the `agy` / `antigravity` / `antigravity-cli` aliases for backward-compat with fleet.yaml entries written before #995.
-- **`agy` workspace-trust prompt auto-dismissed** — fresh agy spawns previously sat at the interactive "Do you trust this folder?" gate requiring `↑/↓` + Enter from a human. The `--dangerously-skip-permissions` flag only auto-approves tool-permission requests (per `agy --help`), not the workspace-trust prompt. Mirrors Codex precedent (#468 anchored regex): `dismiss_patterns` matches the "Yes, I trust" line — Enter alone confirms since the prompt pre-selects the trust option.
-- **`agy` backend ships with `fleet_mcp_supported: false` (#995 Bug 3)** — empirical testing proved AGY discovers `<workdir>/.antigravitycli/mcp_config.json` for project-ID storage but ignores its `mcpServers` field; only HOME-level `~/.gemini/antigravity-cli/mcp_config.json` actually loads MCP servers. The fleet scope rule (`src/mcp_config.rs:5-11`) forbids HOME-level writes, so the `agend-mcp-bridge` cannot be configured for agy in the current AGY release. `configure_agy` is now a no-op (previous project-local write was dead code). Daemon spawn path emits a `[fleet-mcp-unsupported]` `tracing::warn` so operators see in `app.log` why fleet `send`/`inbox`/`task` tools are unavailable in agy instances. Use agy for manual / non-fleet work until upstream (filed at google-antigravity/antigravity-cli) adds project-local `mcpServers` loading.
-- **`agend-terminal admin cleanup-zombies` (#927 PR-B)** — kill long-running zombie daemons holding stale `<home>/run/<pid>/` directories. Lists candidates whose `.daemon` mtime is older than `--age` (default `14d`), prompts `[y/N]` unless `--yes` is supplied. Platform-asymmetric termination by design (#936 closed): Unix uses `SIGTERM` → 5 s grace → `SIGKILL`; Windows uses `TerminateProcess` single-stage.
-- **`AGEND_DAEMON_BOOT_SWEEP_AGE_DAYS=<N>` (#933)** — daemon-boot stale-`run/<pid>/` GC. Sweeps run directories older than N days. `0` / unset disables. Destructive — see `AGEND_DAEMON_BOOT_SWEEP_DRY_RUN`.
-- **`AGEND_DAEMON_BOOT_SWEEP_DRY_RUN=1` (#933)** — log-only mode for the boot sweep. Pair with `AGE_DAYS` for safe trials before flipping the destructive switch. `grep "boot-sweep" $AGEND_HOME/daemon.log` shows the candidate set.
-- **`AGEND_DAEMON_THREAD_DUMP_SECS=<N>` (#941)** — periodic in-process thread state dump every N seconds. Output appears in `daemon.log` with `thread-dump` lines. Zero overhead when unset (closes #932 zombie-debugging observability gap).
-- **`.ready` boot-completion sentinel (#922)** — daemon writes `<home>/run/<pid>/.ready` once the agent spawn loop finishes. Companion to the existing `.daemon` / `api.cookie` / `api.port` lifecycle files. Single-signal policy: future sub-stage readiness MUST extend `.ready`'s content rather than introduce a new file. See `CLAUDE.md` for poll caveats (stale-marker safety requires PID-liveness check — use `agend-terminal doctor` or combine `.ready` + `kill -0` on the run dir's `.daemon` PID).
-- **`bootstrap-step` instrumentation (#945 Phase 0)** — every step in `bootstrap::prepare` emits a `bootstrap-step` tracing line with `step=<name>` + `elapsed_ms=<n>`. Operators can extract the cold-boot timing breakdown via `grep "bootstrap-step" $AGEND_HOME/daemon.log | sort -t= -k3 -n -r`.
-- **State detection red SGR anchor for HIGH_FP patterns (#919 Phase A)** — patterns marked `HIGH_FP` (generic strings like `"Error"`, `"failed"`) now require a red SGR escape (`\x1b[31m` family) within 200 bytes / 30 s of the match. Closes the class of false transitions where a backend echoed an error string from a user prompt without color and the daemon misclassified the agent. `Backend::has_red_anchor()` opts in per-backend; the gate fails open when the backend doesn't emit consistent color signaling.
-
-### Added (#686 — maintainer-only)
-
-- **CI code coverage (cargo-llvm-cov + Codecov)** — `.github/workflows/ci.yml` adds a new `coverage` job that runs `cargo llvm-cov --workspace --tests --features tray` on Ubuntu and uploads an lcov report to Codecov. `fail_ci_if_error: false` keeps PRs mergeable when codecov.io is unreachable or unconfigured. `codecov.yml` configures a 2% project threshold + 80% patch target. **Zero end-user impact** — coverage is maintainer-side QA infrastructure; `cargo install agend-terminal` and operating the fleet do not touch codecov. Operator-side setup: link the GitHub repo to Codecov.io to surface the report (no token required for public repos; optional `CODECOV_TOKEN` secret tightens rate limits).
-
-### Changed
-
-- **`agend-terminal list --json` envelope (#938)** — JSON output now wraps the agent array in a discriminated envelope: `{mode: "live" | "fallback_daemon_stuck" | "fallback_daemon_absent", agents: [...]}`. Operator scripts can distinguish authoritative output from offline fallbacks. Plain (non-JSON) output adds a one-line stderr hint when `mode != live`. `--legacy-json` opts back into the pre-#938 shape for one release cycle.
-- **`AGEND_LOG` precedence (#927 PR-A)** — env-set value now reliably wins over the in-code default (`agend_terminal=info`). Default applies only when the var is unset or empty. Previously the implementation occasionally clobbered caller-set values.
-- **`telegram_init` fire-and-forget (#945 Phase 1)** — `bootstrap::telegram_init::init` returns `None` immediately and spawns a background thread to do the actual 5–10 sequential `bot.create_forum_topic` HTTP calls + fleet-binding resolve. Cold-boot wall time drops from ~6.6 s to ~0.5 s. `active_channel()` returns `None` until init completes; callers (all on >10 s cadence) tolerate this. Registry attachment uses a `PENDING_REGISTRY` `OnceLock` bridge — bounded 30 s poll covers the race where the bg thread finishes before the caller publishes.
-- **CI-watch correlation_id format (#946)** — every `system:ci` inbox notification (pass / fail / stalled / conflict) now carries `correlation_id = "{repo}@{branch}"` instead of `None`. Stable identifier per watched branch enables `grep '"correlation_id":"owner/repo@branch"' inbox/*.jsonl` filtering.
-- **`dispatch_idle` watchdog fallback correlation_id (#947)** — when the watchdog fires on a dispatch whose upstream had no `correlation_id`, the synthesized fallback now uses the canonical `disp-<unix_micros>-<seq>` dispatch id format (self-documenting via prefix, stable across dispatch + report). Pre-#947 the fallback was `None` or a churning per-call ULID with no cross-message tie.
-- **`ci_watch` file identity hardening (#942 / #943)** — watch filenames now use sha256 (64 hex chars; pre-#943 used `DefaultHasher` / 16 hex chars, ~2^32 brute force) over a canonicalized repo slug (#942 — 7 divergent forms `git@github.com:owner/repo.git`, `https://github.com/owner/repo[.git]`, raw `owner/repo`, case variants are all collapsed to canonical `owner/repo`). Legacy files are migrated synchronously at boot via `migrate_legacy_watch_filenames` (#942/#943 PR-B): scans `<home>/ci-watches/*.json`, identifies non-canonical filenames by stem length, rewrites `repo` field + filename. Idempotent. Conflicts log a warning with FIRST-wins resolution.
-- **`ci_watch` survives bind/release handoff (#931)** — `release_worktree`'s sole-subscriber cleanup no longer destroys the watch file. `next_after_ci` chain (workflow handoff target), `last_notified_head_sha`, and polling state all persist. The next agent that binds the same branch inherits the chain so `dispatch_auto_bind_lease`'s `[ci-ready-for-action]` handoff fires automatically on the next CI green tick. Unblocks the `dev → ci → reviewer` chain and analogous multi-agent workflows.
-
-### Test infrastructure
-
-- **`admin::cleanup_zombies::poll_until_dead` (#934)** — `pub(crate)` deterministic primitive. Polls `kill -0` (Unix) / `OpenProcess` (Windows) every 10 ms up to a timeout; returns `bool`. Replaces sleep-tuned waits in `agent.rs` shutdown + `process.rs` reaper tests. SOP 1 (§3.20) compliance.
-- **`api::handlers::instance::await_sentinel_nonempty` (#949, rename)** — pre-#949 named for *file existing*, but the instance-boot callers needed *content present* (file is created empty then written to). Renamed to make the contract clear; flake at the four call sites is gone.
-
-## [0.7.0] — 2026-05-16
-
-150+ commits since `0.6.1` over Sprint 55–65 (May 7 → May 16, 2026). Three themes dominate:
-**(1) Task board reliability** — ghost-owner class root-caused and prevented (`teams::delete` cascade, boot orphan sweep, `force` flag) + new sweepers + operator-visible health snapshot; **(2) Bridge ↔ daemon idempotent retry** — eliminates the double-execution class for side-effect MCP calls under transient transport failures (UUID request_id + DedupCache + Condvar block-wait); **(3) MCP handler refactor #694 complete** — all 30+ tool dispatch arms migrated from inline `match` to a dispatch table, paving the way for tool registry hot-reload (#776). Plus Hung detection shadow-mode foundations (F9 Stage 1–3), rate-limit recovery auto-prompt, and ~50 smaller bug fixes / hardening PRs.
-
-### Added
-
+- **`/setup-telegram` skill + `skill add` URL#subdir support (#1351, PR #1354)** — per-channel install skill for guided Telegram setup. `skill add <url>#<subdir>` clones a skill repo and installs a subdirectory as a skill.
+- **CI code coverage (cargo-llvm-cov + Codecov, #686)** — `.github/workflows/ci.yml` adds a `coverage` job that runs `cargo llvm-cov --workspace --tests --features tray` on Ubuntu and uploads an lcov report to Codecov. `fail_ci_if_error: false` keeps PRs mergeable when codecov.io is unreachable. Maintainer-only infrastructure.
 - **Bridge ↔ daemon idempotent retry (#842, PR #843)** — bridge generates UUID v4 `request_id` per JSON envelope; retry on transport failure reuses the same id. New `src/api/request_dedup.rs` `DedupCache` (TTL 10min, 64KB/entry, 64MB ceiling, Condvar block-wait aligned to per-method timeout 5/30/60s, waiter_cap=8, RAII panic guard) caches completed responses + blocks in-flight duplicates. Caller-side retries are now safe by construction for any side-effect MCP call. Backward-compatible: missing `request_id` skips dedup (legacy clients).
 - **`task action=health` (#830, PR #838)** — operator self-serve board hygiene snapshot. Returns totals + by_status + ghost_owners (strict + soft) + stale_claims + age distribution (over_30d / over_90d / median) + recommendations array. Single-call alternative to scanning the full task list when checking "is the board healthy?". Cross-references `scan_orphan_candidates` (#829) for accuracy.
 - **`task action=sweep` (#806, PR #810)** — operator-triggered stale-task cleanup. 4 categories (`shipped` / `superseded` / `team_disbanded` / `validation_leftovers`) with dry-run by default + `confirm_ids` + `audit_reason` required for apply. Dual-channel audit (per-task event + event_log.jsonl `task_sweep_apply`). System identity `system:task_sweep`.
@@ -103,6 +59,26 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 ### Changed
 
+- **`request_id` propagation in comms.rs (#1341)** — All three `api::call` sites in `comms.rs` now include a UUIDv4 `request_id` in the JSON envelope, enabling the daemon's `request_dedup::DedupCache` to deduplicate retries on the MCP→daemon path.
+- **`dispatch_idle` flock (#1340, PR #1347)** — `mark_resolved` and `scan_and_emit` in `dispatch_idle` now use flock serialization to prevent race conditions between concurrent resolution and scan operations.
+- **`agy` backend (#987)** — Google Antigravity CLI as a sixth first-class backend alongside claude / kiro-cli / codex / opencode / gemini. Motivated by Gemini CLI sunset 2026-06-18; existing `gemini` backend retained for paid Code Assist Standard/Enterprise license holders.
+- **`doctor topics` taxonomy reduced from 4 classes to 2 (#994)** — `drift_fleet` and `stale_registry` classes removed. Only `live` and `orphan` remain.
+- **`agy` backend display name + workspace-trust auto-dismiss + `fleet_mcp_supported: false` (#995)** — TUI shows `antigravity-cli`; workspace-trust prompt auto-dismissed; MCP config write is a no-op until upstream adds project-local `mcpServers` loading.
+- **`agend-terminal list --json` envelope (#938)** — JSON output now wraps the agent array in a discriminated envelope with `mode` field.
+- **`AGEND_LOG` precedence (#927 PR-A)** — env-set value now reliably wins over the in-code default.
+- **`telegram_init` fire-and-forget (#945 Phase 1)** — Cold-boot wall time drops from ~6.6 s to ~0.5 s by backgrounding Telegram init.
+- **CI-watch correlation_id format (#946)** — every `system:ci` inbox notification now carries `correlation_id = "{repo}@{branch}"`.
+- **`dispatch_idle` watchdog fallback correlation_id (#947)** — synthesized fallback uses canonical `disp-<unix_micros>-<seq>` format.
+- **`ci_watch` file identity hardening (#942 / #943)** — watch filenames now use sha256 over canonicalized repo slug. Legacy files migrated at boot.
+- **`ci_watch` survives bind/release handoff (#931)** — `release_worktree`'s cleanup no longer destroys the watch file.
+- **`agend-terminal admin cleanup-zombies` (#927 PR-B)** — kill long-running zombie daemons holding stale run directories.
+- **Boot sweep env vars (#933)** — `AGEND_DAEMON_BOOT_SWEEP_AGE_DAYS` + `AGEND_DAEMON_BOOT_SWEEP_DRY_RUN` for stale run-dir GC.
+- **Thread dump env var (#941)** — `AGEND_DAEMON_THREAD_DUMP_SECS` for periodic in-process state dumps.
+- **`.ready` boot-completion sentinel (#922)** — single-signal policy for daemon init completion.
+- **`bootstrap-step` instrumentation (#945 Phase 0)** — per-step timing breakdown in daemon log.
+- **State detection red SGR anchor (#919 Phase A)** — HIGH_FP patterns require red color escape within 200 bytes.
+- **Telegram inbound length-based delivery split (#1352, PR #1353)** — short messages (<200 chars) PTY only, long messages inbox+hint. Eliminates dual-delivery duplication.
+- **Replay cache mtime→generation counter (#1355, PR #1357)** — fixes false cache hits from mtime collisions by using a monotonic generation counter + mtime quadruple.
 - **Default fixup batch self-merge (operator-authorized SOP)** — `impl team` / `fixup team` with three-tier composition (lead + dev + reviewer) can squash-merge after CI 5 platforms green + reviewer VERIFIED + verdict mirrored to PR comment (§3.12). No operator merge button required. Established 2026-05-13 for `agend-terminal` repo; scope is per-repo (other repos confirm separately).
 - **`task action=list` default filter (#806)** — pre-#806 returned the full board (all statuses, 500KB+ in production). Now defaults to actionable statuses (`open` / `claimed` / `in_progress` / `blocked`); pass `include_history=true` to surface `done` / `cancelled`. Adds `limit` (newest-first cap) and `filtered_default: bool` response field for transparency.
 - **`task action=create` response shape (#807, PR #811)** — returns full task object instead of just `{id, status: "created"}` so caller sees the same `status` field semantics across create/list/get.
@@ -131,6 +107,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 ### Fixed
 
+- **Filter `.lock` files from pr_state scanner (#1349, PR #1350)** — pr_state scanner was attempting to parse `.json.lock` sidecar files as JSON, producing WARN log spam every 10s tick.
+- **TUI mouse selection scroll freeze (#1356, PR #1358)** — selection coordinates drifted when new output arrived during active selection. Fix snapshots `max_scroll()` at MouseDown and compensates for grid growth so the viewport stays pinned to the same content.
 - **WIDE_CHAR_SPACER ratatui buffer cell leak (#819, PR #823)** — Site 1 in `src/vterm.rs::Widget::render` leaked stale chars across frames when the alacritty grid transitioned from `[WIDE_CHAR][SPACER]` to `[NarrowChar][SPACER]`. Fix relocated to the WIDE_CHAR write site (writes blank to (x+1, y) alongside the narrow char). Sites 2-5 (text/ANSI builder paths with fresh allocation) confirmed correct + explicitly regression-proofed. Surfaced as "TUI prompt-line scattered chars that disappear on selection".
 - **Bridge ↔ daemon double-execution under transient transport failure (PR #804 RCA → PR #843)** — `agend-mcp-bridge::is_retriable_io` classified `io::ErrorKind::TimedOut` as retriable. Daemon-side slow handlers (telegram channel inject > 30s) tripped the bridge's `read_timeout` → retry → double execution. Fix is the L1 idempotent retry architecture (see Added). Original PR #804 (cheerc) RCA confirmed correct; closed with credit.
 - **`teams::delete` did not cleanup member tasks (#828)** — single missing wire-up to `full_delete_instance` caused all ghost-owner accumulation. See Added.
@@ -182,6 +160,11 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 - **`rustls-webpki` upgrade** — security advisory fix paired with audit-job-blocking fix (PR #729).
 - **`twilight-model` 0.16 → 0.17.1** (Discord channel dep).
 - **`libc` 0.2.184 → 0.2.186**, **`uuid` 1.23.0 → 1.23.1**, **`which` 6 → 8** — routine dependabot bumps.
+
+### Test infrastructure
+
+- **`admin::cleanup_zombies::poll_until_dead` (#934)** — `pub(crate)` deterministic primitive. Polls `kill -0` (Unix) / `OpenProcess` (Windows) every 10 ms up to a timeout; returns `bool`. Replaces sleep-tuned waits in `agent.rs` shutdown + `process.rs` reaper tests.
+- **`api::handlers::instance::await_sentinel_nonempty` (#949, rename)** — pre-#949 named for *file existing*, but the instance-boot callers needed *content present*. Renamed to make the contract clear; flake at the four call sites is gone.
 
 ### Workflow validation snapshots
 
