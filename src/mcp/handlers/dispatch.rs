@@ -165,6 +165,11 @@ adapter!(
     ha,
     instance::handle_replace_instance
 );
+adapter!(
+    dispatch_restart_instance,
+    ha,
+    instance::handle_restart_instance
+);
 adapter!(dispatch_move_pane, ha, instance::handle_move_pane);
 adapter!(
     dispatch_set_waiting_on,
@@ -499,6 +504,7 @@ mod tests {
                 "delete_instance",
                 "start_instance",
                 "replace_instance",
+                "restart_instance",
                 "interrupt",
                 "set_display_name",
                 "set_description",
@@ -525,7 +531,7 @@ mod tests {
                 "gc_dry_run",
             ]
         );
-        assert_eq!(crate::mcp::registry::all().len(), 33);
+        assert_eq!(crate::mcp::registry::all().len(), 34);
     }
 
     #[test]

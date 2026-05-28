@@ -107,11 +107,21 @@ pub(crate) fn def_replace_instance() -> Value {
         "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}, "reason": {"type": "string"}}, "required": ["name"]}})
 }
 
+pub(crate) fn def_restart_instance() -> Value {
+    json!({"name": "restart_instance", "description": "Kill and restart an instance. Default mode 'resume' preserves conversation state; 'fresh' starts clean (like replace_instance).",
+        "inputSchema": {"type": "object", "properties": {
+            "name": {"type": "string"},
+            "mode": {"type": "string", "enum": ["resume", "fresh"], "default": "resume", "description": "resume = keep conversation (--continue/--resume); fresh = clean start"},
+            "reason": {"type": "string"}
+        }, "required": ["name"]}})
+}
+
 pub(crate) fn def_interrupt() -> Value {
     json!({"name": "interrupt", "description": "Send ESC byte to target agent's PTY to interrupt current LLM turn. Context preserved, agent accepts next prompt.",
         "inputSchema": {"type": "object", "properties": {
             "target": {"type": "string", "description": "Target instance name"},
-            "reason": {"type": "string", "description": "Optional follow-up message to inject after ESC"}
+            "reason": {"type": "string", "description": "Optional follow-up message to inject after ESC"},
+            "snapshot": {"type": "boolean", "default": false, "description": "When true, return a pane snapshot after ESC for closed-loop verification"}
         }, "required": ["target"]}})
 }
 
@@ -474,8 +484,8 @@ mod tests {
         let tools = defs["tools"].as_array().expect("tools array");
         assert_eq!(
             tools.len(),
-            33,
-            "#1085: 32 + tui_screenshot = 33. \
+            34,
+            "#1400: 33 + restart_instance = 34. \
              Current tools: {:?}",
             tools
                 .iter()

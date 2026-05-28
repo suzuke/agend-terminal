@@ -17,7 +17,7 @@ pub(crate) fn all() -> &'static [ToolEntry] {
     &ALL_TOOLS
 }
 
-static ALL_TOOLS: [ToolEntry; 33] = [
+static ALL_TOOLS: [ToolEntry; 34] = [
     // ── Channel ──
     ToolEntry {
         name: "reply",
@@ -65,6 +65,11 @@ static ALL_TOOLS: [ToolEntry; 33] = [
         name: "replace_instance",
         definition: super::tools::def_replace_instance,
         handler: super::handlers::dispatch::dispatch_replace_instance,
+    },
+    ToolEntry {
+        name: "restart_instance",
+        definition: super::tools::def_restart_instance,
+        handler: super::handlers::dispatch::dispatch_restart_instance,
     },
     ToolEntry {
         name: "interrupt",

@@ -348,6 +348,56 @@ pub(super) fn handle_replace_instance(home: &Path, args: &Value) -> Value {
     json!({"name": name, "reason": reason, "spawned": spawned})
 }
 
+pub(super) fn handle_restart_instance(home: &Path, args: &Value) -> Value {
+    let name = match args["name"].as_str() {
+        Some(n) => n,
+        None => return json!({"error": "missing 'name'"}),
+    };
+    if let Err(e) = crate::agent::validate_name(name) {
+        return json!({"error": e});
+    }
+    let reason = args["reason"].as_str().unwrap_or("manual restart");
+    let mode = args["mode"].as_str().unwrap_or("resume");
+
+    let fleet_path = crate::fleet::fleet_yaml_path(home);
+    let config = match crate::fleet::FleetConfig::load(&fleet_path) {
+        Ok(c) => c,
+        Err(e) => return json!({"error": format!("fleet.yaml: {e}")}),
+    };
+    let resolved = match config.resolve_instance(name) {
+        Some(r) => r,
+        None => return json!({"error": format!("Instance '{name}' not in fleet.yaml")}),
+    };
+
+    let _ = crate::api::call(
+        home,
+        &json!({"method": crate::api::method::DELETE, "params": {"name": name, "no_wait": true}}),
+    );
+
+    let mut spawn_params = json!({
+        "name": name,
+        "backend": resolved.backend_command,
+        "args": resolved.args.join(" "),
+        "working_directory": resolved.working_directory.map(|p| p.display().to_string()),
+        "env": serde_json::to_value(&resolved.env).unwrap_or(serde_json::Value::Null),
+    });
+    if mode == "resume" {
+        spawn_params["mode"] = json!("resume");
+    }
+
+    let spawn_result = crate::api::call(
+        home,
+        &json!({"method": crate::api::method::SPAWN, "params": spawn_params}),
+    );
+    let spawned = spawn_result
+        .as_ref()
+        .map(|r| r["ok"].as_bool() == Some(true))
+        .unwrap_or(false);
+
+    tracing::info!(%name, %reason, %mode, %spawned, "restart_instance");
+    json!({"name": name, "reason": reason, "mode": mode, "spawned": spawned})
+}
+
 pub(super) fn handle_set_display_name(home: &Path, args: &Value, instance_name: &str) -> Value {
     let display_name = args["name"].as_str().unwrap_or("");
     if display_name.len() > 256 {
@@ -380,7 +430,18 @@ pub(super) fn handle_interrupt(home: &Path, args: &Value) -> Value {
                 let header = crate::inbox::format_event_header("interrupt", &[("reason", reason)]);
                 crate::inbox::compose_aware_inject(home, target, &header);
             }
-            json!({"ok": true, "target": target})
+            let mut result = json!({"ok": true, "target": target});
+            if args["snapshot"].as_bool() == Some(true) {
+                if let Ok(snap) = crate::api::call(
+                    home,
+                    &json!({"method": crate::api::method::PANE_SNAPSHOT, "params": {"name": target, "lines": 40}}),
+                ) {
+                    if snap["ok"].as_bool() == Some(true) {
+                        result["snapshot"] = snap["text"].clone();
+                    }
+                }
+            }
+            result
         }
         Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("inject failed")}),
         Err(e) => {
