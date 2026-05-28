@@ -181,21 +181,53 @@ pub fn add(home: &Path, source: &str) -> Result<Skill> {
             copy_dir_recursive(&p, &dest)
                 .with_context(|| format!("copy {} → {}", p.display(), dest.display()))?;
         }
-        SourceKind::Git(url) => {
-            // `git clone` shell-out — same approach as the rest of
-            // the codebase (e.g. dispatch_hook source-repo). Wipe
-            // first so re-add is deterministic.
+        SourceKind::Git(url, subdir) => {
             if dest.exists() {
                 std::fs::remove_dir_all(&dest)
                     .with_context(|| format!("clean dest {}", dest.display()))?;
             }
-            let status = std::process::Command::new("git")
-                .args(["clone", "--depth=1", url.as_str()])
-                .arg(&dest)
-                .status()
-                .context("spawn git clone")?;
-            if !status.success() {
-                return Err(anyhow!("git clone failed for {url}: status={status}"));
+            if let Some(sub) = subdir {
+                let tmp = root.join(".git-clone-tmp");
+                if tmp.exists() {
+                    std::fs::remove_dir_all(&tmp)
+                        .with_context(|| format!("clean clone tmp {}", tmp.display()))?;
+                }
+                let status = std::process::Command::new("git")
+                    .args(["clone", "--depth=1", url.as_str()])
+                    .arg(&tmp)
+                    .status()
+                    .context("spawn git clone")?;
+                if !status.success() {
+                    let _ = std::fs::remove_dir_all(&tmp);
+                    return Err(anyhow!("git clone failed for {url}: status={status}"));
+                }
+                let sub_path = tmp.join(&sub);
+                let resolved = sub_path.canonicalize().unwrap_or_default();
+                let tmp_canon = tmp.canonicalize().unwrap_or_default();
+                if !resolved.starts_with(&tmp_canon) || resolved == tmp_canon {
+                    let _ = std::fs::remove_dir_all(&tmp);
+                    return Err(anyhow!(
+                        "subdir path '{sub}' escapes clone root — path traversal rejected"
+                    ));
+                }
+                if !resolved.is_dir() {
+                    let _ = std::fs::remove_dir_all(&tmp);
+                    return Err(anyhow!(
+                        "subdirectory '{sub}' not found in cloned repo {url}"
+                    ));
+                }
+                copy_dir_recursive(&sub_path, &dest)
+                    .with_context(|| format!("copy subdir {sub} → {}", dest.display()))?;
+                let _ = std::fs::remove_dir_all(&tmp);
+            } else {
+                let status = std::process::Command::new("git")
+                    .args(["clone", "--depth=1", url.as_str()])
+                    .arg(&dest)
+                    .status()
+                    .context("spawn git clone")?;
+                if !status.success() {
+                    return Err(anyhow!("git clone failed for {url}: status={status}"));
+                }
             }
         }
     }
@@ -573,7 +605,8 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 #[derive(Debug)]
 enum SourceKind {
     Path(PathBuf),
-    Git(String),
+    /// (clone_url, optional subdirectory path within the repo)
+    Git(String, Option<String>),
 }
 
 fn classify_source(source: &str) -> Result<(String, SourceKind)> {
@@ -581,15 +614,30 @@ fn classify_source(source: &str) -> Result<(String, SourceKind)> {
     if trimmed.is_empty() {
         return Err(anyhow!("empty skill source"));
     }
-    let is_git = trimmed.starts_with("git@")
-        || trimmed.starts_with("https://")
-        || trimmed.starts_with("http://")
-        || trimmed.starts_with("ssh://")
-        || trimmed.ends_with(".git");
+    let (url_part, fragment) = match trimmed.split_once('#') {
+        Some((u, f)) if !f.is_empty() => (u, Some(f)),
+        _ => (trimmed, None),
+    };
+    let is_git = url_part.starts_with("git@")
+        || url_part.starts_with("https://")
+        || url_part.starts_with("http://")
+        || url_part.starts_with("ssh://")
+        || url_part.ends_with(".git");
     if is_git {
-        let name = git_repo_name(trimmed)
-            .ok_or_else(|| anyhow!("could not derive skill name from URL: {trimmed}"))?;
-        Ok((name, SourceKind::Git(trimmed.to_string())))
+        let name = if let Some(sub) = fragment {
+            Path::new(sub)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(String::from)
+                .ok_or_else(|| anyhow!("could not derive skill name from subdir: {sub}"))?
+        } else {
+            git_repo_name(url_part)
+                .ok_or_else(|| anyhow!("could not derive skill name from URL: {url_part}"))?
+        };
+        Ok((
+            name,
+            SourceKind::Git(url_part.to_string(), fragment.map(String::from)),
+        ))
     } else {
         let path = PathBuf::from(trimmed);
         let abs = if path.is_absolute() {
@@ -872,13 +920,32 @@ mod tests {
     fn classify_source_distinguishes_git_and_path() {
         let (name, kind) = classify_source("https://github.com/foo/bar.git").unwrap();
         assert_eq!(name, "bar");
-        assert!(matches!(kind, SourceKind::Git(_)));
+        assert!(matches!(kind, SourceKind::Git(..)));
         let (name, kind) = classify_source("git@github.com:foo/bar").unwrap();
         assert_eq!(name, "bar");
-        assert!(matches!(kind, SourceKind::Git(_)));
+        assert!(matches!(kind, SourceKind::Git(..)));
         let (name, kind) = classify_source("/tmp/local-skill").unwrap();
         assert_eq!(name, "local-skill");
         assert!(matches!(kind, SourceKind::Path(_)));
+    }
+
+    #[test]
+    fn classify_source_git_subdir_fragment() {
+        let (name, kind) =
+            classify_source("https://github.com/foo/bar#skills/setup-telegram").unwrap();
+        assert_eq!(name, "setup-telegram");
+        assert!(matches!(kind, SourceKind::Git(_, Some(_))));
+        if let SourceKind::Git(url, Some(sub)) = kind {
+            assert_eq!(url, "https://github.com/foo/bar");
+            assert_eq!(sub, "skills/setup-telegram");
+        }
+    }
+
+    #[test]
+    fn classify_source_git_no_fragment() {
+        let (name, kind) = classify_source("https://github.com/foo/bar").unwrap();
+        assert_eq!(name, "bar");
+        assert!(matches!(kind, SourceKind::Git(_, None)));
     }
 
     #[test]
