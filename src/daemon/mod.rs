@@ -1024,7 +1024,14 @@ fn spawn_and_register_agent(
             crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
                 .ok()
                 .and_then(|c| c.instances.get(name).and_then(|i| i.skills.clone()));
-        match crate::skills::install_for_agent(home, wd, skills_filter.as_deref()) {
+        let backend_skill =
+            crate::backend::Backend::from_command(command).and_then(|b| b.skill_dir_name());
+        match crate::skills::install_for_agent_backend(
+            home,
+            wd,
+            skills_filter.as_deref(),
+            backend_skill,
+        ) {
             Ok(outcomes) => {
                 let modes: Vec<(&str, crate::skills::InstallMode)> = outcomes
                     .iter()
@@ -1210,7 +1217,14 @@ fn handle_stage2_restart(
             crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
                 .ok()
                 .and_then(|c| c.instances.get(name).and_then(|i| i.skills.clone()));
-        if let Err(e) = crate::skills::install_for_agent(home, wd, skills_filter.as_deref()) {
+        let backend_skill = crate::backend::Backend::from_command(&config.backend_command)
+            .and_then(|b| b.skill_dir_name());
+        if let Err(e) = crate::skills::install_for_agent_backend(
+            home,
+            wd,
+            skills_filter.as_deref(),
+            backend_skill,
+        ) {
             tracing::warn!(
                 target: "recovery_shadow",
                 agent = %name, error = %e, "stage2 skills install failed"

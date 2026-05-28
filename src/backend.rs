@@ -572,6 +572,19 @@ impl Backend {
         self.as_str()
     }
 
+    /// Skill directory key matching `BACKEND_SKILL_DIRS`. Returns `None`
+    /// for backends without a skill directory (Shell, Raw, Agy).
+    pub fn skill_dir_name(&self) -> Option<&'static str> {
+        match self {
+            Backend::ClaudeCode => Some("claude"),
+            Backend::Codex => Some("codex"),
+            Backend::Gemini => Some("gemini"),
+            Backend::OpenCode => Some("opencode"),
+            Backend::KiroCli => Some("kiro"),
+            Backend::Agy | Backend::Shell | Backend::Raw(_) => None,
+        }
+    }
+
     /// Extra CLI flags to pass on spawn, derived from files that
     /// `instructions::generate` has written to `working_dir`. Only emits a flag
     /// when the corresponding file is present, so this is safe to call
