@@ -301,13 +301,17 @@ pub fn render_tasks(
         let mut lines: Vec<Line> = Vec::new();
         for (ri, t) in visible_tasks.iter().enumerate() {
             let is_selected = is_active && ri == sel_row;
-            let pri_badge = match t.priority.as_str() {
-                "urgent" => "🔴",
-                "high" => "🟠",
-                "normal" => "🔵",
-                _ => "⚪",
+            let pri_badge = match t.priority {
+                crate::task_events::TaskPriority::Urgent => "🔴",
+                crate::task_events::TaskPriority::High => "🟠",
+                crate::task_events::TaskPriority::Normal => "🔵",
+                crate::task_events::TaskPriority::Low => "⚪",
             };
-            let blocked = if t.status == "blocked" { " 🔴" } else { "" };
+            let blocked = if t.status == crate::task_events::TaskStatus::Blocked {
+                " 🔴"
+            } else {
+                ""
+            };
             let assignee = t
                 .assignee
                 .as_deref()
@@ -518,32 +522,33 @@ pub fn task_board_columns_viewport(
     let mut done: Vec<&crate::tasks::Task> = Vec::new();
 
     for t in items {
-        match t.status.as_str() {
-            "cancelled" => {}
-            "backlog" => backlog.push(t),
-            "open" | "blocked" if t.priority == "low" => backlog.push(t),
-            "open" | "blocked" => ready.push(t),
-            "claimed" | "in_progress" => working.push(t),
-            "in_review" | "verified" => review.push(t),
-            "done" => done.push(t),
-            _ => ready.push(t),
+        use crate::task_events::{TaskPriority, TaskStatus};
+        match t.status {
+            TaskStatus::Cancelled => {}
+            TaskStatus::Backlog => backlog.push(t),
+            TaskStatus::Open | TaskStatus::Blocked if t.priority == TaskPriority::Low => {
+                backlog.push(t)
+            }
+            TaskStatus::Open | TaskStatus::Blocked => ready.push(t),
+            TaskStatus::Claimed | TaskStatus::InProgress => working.push(t),
+            TaskStatus::InReview | TaskStatus::Verified => review.push(t),
+            TaskStatus::Done => done.push(t),
         }
     }
 
     let cap = viewport_rows.saturating_add(PARTIAL_SORT_BUFFER);
 
     fn pri_cmp(a: &&crate::tasks::Task, b: &&crate::tasks::Task) -> std::cmp::Ordering {
-        let pri_ord = |p: &str| -> u8 {
+        let pri_ord = |p: crate::task_events::TaskPriority| -> u8 {
             match p {
-                "urgent" => 0,
-                "high" => 1,
-                "normal" => 2,
-                "low" => 3,
-                _ => 4,
+                crate::task_events::TaskPriority::Urgent => 0,
+                crate::task_events::TaskPriority::High => 1,
+                crate::task_events::TaskPriority::Normal => 2,
+                crate::task_events::TaskPriority::Low => 3,
             }
         };
-        pri_ord(&a.priority)
-            .cmp(&pri_ord(&b.priority))
+        pri_ord(a.priority)
+            .cmp(&pri_ord(b.priority))
             .then(a.created_at.cmp(&b.created_at))
     }
 
@@ -597,12 +602,16 @@ mod tests {
         priority: &str,
         created_at: &str,
     ) -> crate::tasks::Task {
+        let parsed_status: crate::task_events::TaskStatus =
+            serde_json::from_value(serde_json::Value::String(status.to_string())).unwrap();
+        let parsed_priority: crate::task_events::TaskPriority =
+            serde_json::from_value(serde_json::Value::String(priority.to_string())).unwrap();
         crate::tasks::Task {
             id: title.to_string(),
             title: title.to_string(),
             description: String::new(),
-            status: status.to_string(),
-            priority: priority.to_string(),
+            status: parsed_status,
+            priority: parsed_priority,
             assignee: None,
             routed_to: None,
             created_by: String::new(),
@@ -863,8 +872,8 @@ mod tests {
             id: "t-1".into(),
             title: "test task".into(),
             description: String::new(),
-            status: "open".into(),
-            priority: "normal".into(),
+            status: crate::task_events::TaskStatus::Open,
+            priority: crate::task_events::TaskPriority::Normal,
             assignee: None,
             routed_to: None,
             depends_on: Vec::new(),

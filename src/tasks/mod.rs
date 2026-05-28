@@ -23,8 +23,8 @@ pub struct Task {
     pub id: String,
     pub title: String,
     pub description: String,
-    pub status: String,   // open, claimed, done, blocked, cancelled
-    pub priority: String, // low, normal, high, urgent
+    pub status: crate::task_events::TaskStatus,
+    pub priority: crate::task_events::TaskPriority,
     pub assignee: Option<String>,
     /// When assignee is a team name, this holds the resolved orchestrator.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -118,27 +118,31 @@ fn load(home: &Path) -> TaskStore {
 ///
 /// Uses a visited set to prevent infinite loops on circular deps
 /// (circular → treated as blocked).
-pub fn evaluate_dependency_status(tasks: &[Task], task: &Task) -> String {
+pub fn evaluate_dependency_status(tasks: &[Task], task: &Task) -> crate::task_events::TaskStatus {
+    use crate::task_events::TaskStatus;
     if task.depends_on.is_empty()
-        || matches!(task.status.as_str(), "claimed" | "done" | "cancelled")
+        || matches!(
+            task.status,
+            TaskStatus::Claimed | TaskStatus::Done | TaskStatus::Cancelled
+        )
     {
-        return task.status.clone();
+        return task.status;
     }
     let all_deps_done = task.depends_on.iter().all(|dep_id| {
         tasks
             .iter()
             .find(|t| t.id == *dep_id)
-            .map(|t| t.status == "done")
+            .map(|t| t.status == TaskStatus::Done)
             .unwrap_or(false) // missing dep → not done → blocked
     });
     if all_deps_done {
-        if task.status == "blocked" {
-            "open".to_string()
+        if task.status == TaskStatus::Blocked {
+            TaskStatus::Open
         } else {
-            task.status.clone()
+            task.status
         }
     } else {
-        "blocked".to_string()
+        TaskStatus::Blocked
     }
 }
 
@@ -166,8 +170,9 @@ pub(super) fn record_to_task(r: &crate::task_events::TaskRecord) -> Task {
         id: r.id.0.clone(),
         title: r.title.clone(),
         description: r.description.clone(),
-        status: status_to_legacy_str(r.status).to_string(),
-        priority: r.priority.clone(),
+        status: r.status,
+        priority: serde_json::from_value(serde_json::Value::String(r.priority.clone()))
+            .unwrap_or_default(),
         assignee: r.owner.as_ref().map(|i| i.0.clone()),
         routed_to: r.routed_to.as_ref().map(|i| i.0.clone()),
         created_by: r.created_by.0.clone(),
@@ -311,7 +316,7 @@ pub fn migrate_legacy_tasks_json_to_event_log(home: &Path) -> anyhow::Result<Mig
             task_id: tid.clone(),
             title: t.title.clone(),
             description: t.description.clone(),
-            priority: t.priority.clone(),
+            priority: t.priority.to_string(),
             owner: t
                 .assignee
                 .as_ref()
@@ -341,8 +346,8 @@ pub fn migrate_legacy_tasks_json_to_event_log(home: &Path) -> anyhow::Result<Mig
         // Emit the minimum status-transition events to bring the task to
         // its current legacy status. The replay-derived view post-PR3
         // cutover sees the same final state as the legacy tasks.json.
-        match t.status.as_str() {
-            "claimed" => {
+        match t.status {
+            crate::task_events::TaskStatus::Claimed => {
                 if let Some(by) = &t.assignee {
                     events.push(crate::task_events::TaskEvent::Claimed {
                         task_id: tid.clone(),
@@ -350,7 +355,7 @@ pub fn migrate_legacy_tasks_json_to_event_log(home: &Path) -> anyhow::Result<Mig
                     });
                 }
             }
-            "in_progress" => {
+            crate::task_events::TaskStatus::InProgress => {
                 if let Some(by) = &t.assignee {
                     events.push(crate::task_events::TaskEvent::Claimed {
                         task_id: tid.clone(),
@@ -362,7 +367,7 @@ pub fn migrate_legacy_tasks_json_to_event_log(home: &Path) -> anyhow::Result<Mig
                     });
                 }
             }
-            "done" => {
+            crate::task_events::TaskStatus::Done => {
                 let by = t
                     .assignee
                     .as_deref()
@@ -377,20 +382,20 @@ pub fn migrate_legacy_tasks_json_to_event_log(home: &Path) -> anyhow::Result<Mig
                     },
                 });
             }
-            "cancelled" => {
+            crate::task_events::TaskStatus::Cancelled => {
                 events.push(crate::task_events::TaskEvent::Cancelled {
                     task_id: tid.clone(),
                     by: crate::task_events::InstanceName(t.created_by.clone()),
                     reason: "migrated from legacy tasks.json (status was cancelled)".to_string(),
                 });
             }
-            "blocked" => {
+            crate::task_events::TaskStatus::Blocked => {
                 events.push(crate::task_events::TaskEvent::Blocked {
                     task_id: tid.clone(),
                     reason: "migrated from legacy tasks.json (status was blocked)".to_string(),
                 });
             }
-            // "open" or unknown: Created already left the task at Open.
+            // Open or other statuses: Created already left the task at Open.
             _ => {}
         }
         migrated += 1;

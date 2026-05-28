@@ -19,6 +19,7 @@
 //! - Task list load failure: scan skipped, retried next tick.
 //! - Missing sidecar: falls back to `dispatched_at` (still valid).
 
+use crate::task_events::TaskStatus;
 use crate::tasks::Task;
 use std::collections::HashMap;
 use std::path::Path;
@@ -98,7 +99,7 @@ pub(crate) fn scan_and_emit(
     last_emitted.retain(|tid, _| {
         tasks
             .iter()
-            .any(|t| t.id == *tid && t.status == "in_progress")
+            .any(|t| t.id == *tid && t.status == TaskStatus::InProgress)
     });
 }
 
@@ -111,7 +112,7 @@ pub(crate) fn check_stalled(
     task: &Task,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Option<String> {
-    if task.status != "in_progress" {
+    if task.status != TaskStatus::InProgress {
         return None;
     }
     let eta_secs = task.eta_secs?;
@@ -230,12 +231,15 @@ mod tests {
     }
 
     fn make_task(id: &str, status: &str, eta_secs: Option<i64>, started_at: Option<&str>) -> Task {
+        use crate::task_events::TaskPriority;
+        let parsed_status: TaskStatus =
+            serde_json::from_value(serde_json::Value::String(status.to_string())).unwrap();
         Task {
             id: id.to_string(),
             title: format!("test task {id}"),
             description: String::new(),
-            status: status.to_string(),
-            priority: "normal".to_string(),
+            status: parsed_status,
+            priority: TaskPriority::Normal,
             assignee: Some("dev".to_string()),
             routed_to: None,
             created_by: "test".to_string(),

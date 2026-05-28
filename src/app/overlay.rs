@@ -1044,7 +1044,11 @@ mod tests {
         // Reload from disk — must be persisted
         let reloaded = crate::tasks::list_all(&home);
         let task = reloaded.iter().find(|t| t.id == task_id).expect("task");
-        assert_eq!(task.status, "claimed", "L must persist status change");
+        assert_eq!(
+            task.status,
+            crate::task_events::TaskStatus::Claimed,
+            "L must persist status change"
+        );
 
         std::fs::remove_dir_all(&home).ok();
     }
@@ -1085,7 +1089,11 @@ mod tests {
 
             let reloaded = crate::tasks::list_all(&home);
             let task = reloaded.iter().find(|t| t.id == task_id).expect("task");
-            assert_eq!(task.status, "done", "Shift+D ({label}) must mark done");
+            assert_eq!(
+                task.status,
+                crate::task_events::TaskStatus::Done,
+                "Shift+D ({label}) must mark done"
+            );
 
             std::fs::remove_dir_all(&home).ok();
         }
@@ -1142,14 +1150,19 @@ mod tests {
         let reloaded = crate::tasks::list_all(&home);
         let high = reloaded.iter().find(|t| t.id == high_id).expect("high-pri");
         assert_eq!(
-            high.status, "claimed",
+            high.status,
+            crate::task_events::TaskStatus::Claimed,
             "cursor row 0 must move high-pri task"
         );
         let low = reloaded
             .iter()
             .find(|t| t.title == "low-pri")
             .expect("low-pri");
-        assert_eq!(low.status, "open", "low-pri must remain in Open");
+        assert_eq!(
+            low.status,
+            crate::task_events::TaskStatus::Open,
+            "low-pri must remain in Open"
+        );
 
         std::fs::remove_dir_all(&home).ok();
     }

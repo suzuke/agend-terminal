@@ -167,7 +167,7 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
             let mut filtered: Vec<Task> = tasks
                 .iter()
                 .filter(|t| filter_assignee.is_none_or(|a| t.assignee.as_deref() == Some(a)))
-                .filter(|t| filter_status.is_none_or(|s| t.status == s))
+                .filter(|t| filter_status.is_none_or(|s| t.status.to_string() == s))
                 .filter(|t| filter_tag.is_none_or(|tag| t.tags.iter().any(|tt| tt == tag)))
                 // #806 default-actionable-only filter — only fires
                 // when neither include_history nor filter_status is
@@ -175,12 +175,12 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                 .filter(|t| {
                     include_history
                         || filter_status.is_some()
-                        || ACTIONABLE.contains(&t.status.as_str())
+                        || ACTIONABLE.contains(&t.status.to_string().as_str())
                 })
                 .filter(|t| {
                     // 14d done-ttl preserved for include_history=true
                     // path (default trim already drops done entries).
-                    if filter_status.is_some() || t.status != "done" {
+                    if filter_status.is_some() || t.status != crate::task_events::TaskStatus::Done {
                         return true;
                     }
                     chrono::DateTime::parse_from_rfc3339(&t.updated_at)
@@ -220,9 +220,9 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                 Some(t) => t,
                 None => return serde_json::json!({"error": format!("task '{id}' not found")}),
             };
-            let is_self_reclaim = task_view.status == "claimed"
+            let is_self_reclaim = task_view.status == crate::task_events::TaskStatus::Claimed
                 && task_view.assignee.as_deref() == Some(iname.as_str());
-            if !is_self_reclaim && task_view.status != "open" {
+            if !is_self_reclaim && task_view.status != crate::task_events::TaskStatus::Open {
                 return serde_json::json!({
                     "error": format!(
                         "task '{id}' status is '{}', only 'open' tasks can be claimed",

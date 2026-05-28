@@ -1,6 +1,7 @@
 //! Visibility status summary — shared builder for telegram keyword + TUI panel.
 //! Also contains task-entry parsing and branch-match auto-close helpers.
 
+use crate::task_events::TaskStatus;
 use std::path::Path;
 
 /// Build a human-readable status summary from task board + decisions.
@@ -22,16 +23,19 @@ pub fn build_summary(home: &Path) -> String {
 
     let in_progress: Vec<_> = sprint_tasks
         .iter()
-        .filter(|t| t.status == "claimed" || t.status == "in_progress")
+        .filter(|t| t.status == TaskStatus::Claimed || t.status == TaskStatus::InProgress)
         .collect();
-    let open: Vec<_> = sprint_tasks.iter().filter(|t| t.status == "open").collect();
+    let open: Vec<_> = sprint_tasks
+        .iter()
+        .filter(|t| t.status == TaskStatus::Open)
+        .collect();
     let blocked: Vec<_> = sprint_tasks
         .iter()
-        .filter(|t| t.status == "blocked")
+        .filter(|t| t.status == TaskStatus::Blocked)
         .collect();
     let done: Vec<_> = sprint_tasks
         .iter()
-        .filter(|t| t.status == "done" || t.status == "verified")
+        .filter(|t| t.status == TaskStatus::Done || t.status == TaskStatus::Verified)
         .collect();
     let total = sprint_tasks.len();
 
@@ -134,7 +138,7 @@ pub fn auto_close_merged_tasks(home: &Path, branch: &str) {
     let tasks = crate::tasks::list_all(home);
     let candidates: Vec<_> = tasks
         .iter()
-        .filter(|t| t.status == "verified")
+        .filter(|t| t.status == TaskStatus::Verified)
         .filter(|t| {
             contains_as_token(&t.description, branch) || contains_as_token(&t.title, branch)
         })
@@ -300,7 +304,8 @@ mod tests {
         let tasks = crate::tasks::list_all(&dir);
         let task = tasks.iter().find(|t| t.title == "test task").unwrap();
         assert_ne!(
-            task.status, "done",
+            task.status,
+            TaskStatus::Done,
             "unverified task must NOT be auto-closed"
         );
         std::fs::remove_dir_all(&dir).ok();

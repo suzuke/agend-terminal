@@ -115,7 +115,14 @@ pub fn run(home: &Path, repo: &str, dry_run: bool) -> anyhow::Result<BackfillRep
     let open_tasks = crate::tasks::list_all(home);
     let open_tasks: Vec<&crate::tasks::Task> = open_tasks
         .iter()
-        .filter(|t| matches!(t.status.as_str(), "open" | "claimed" | "in_progress"))
+        .filter(|t| {
+            matches!(
+                t.status,
+                crate::task_events::TaskStatus::Open
+                    | crate::task_events::TaskStatus::Claimed
+                    | crate::task_events::TaskStatus::InProgress
+            )
+        })
         .collect();
 
     let mut report = BackfillReport::default();
@@ -570,8 +577,8 @@ mod tests {
             id: id.into(),
             title: title.into(),
             description: String::new(),
-            status: "open".into(),
-            priority: "normal".into(),
+            status: crate::task_events::TaskStatus::Open,
+            priority: crate::task_events::TaskPriority::Normal,
             assignee: None,
             routed_to: None,
             created_by: "u".into(),

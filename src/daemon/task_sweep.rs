@@ -217,7 +217,14 @@ fn sweep_tick(home: &Path) -> anyhow::Result<()> {
     let open_tasks = crate::tasks::list_all(home);
     let open_ids: std::collections::HashMap<String, &crate::tasks::Task> = open_tasks
         .iter()
-        .filter(|t| matches!(t.status.as_str(), "open" | "claimed" | "in_progress"))
+        .filter(|t| {
+            matches!(
+                t.status,
+                crate::task_events::TaskStatus::Open
+                    | crate::task_events::TaskStatus::Claimed
+                    | crate::task_events::TaskStatus::InProgress
+            )
+        })
         .map(|t| (t.id.clone(), t))
         .collect();
     if open_ids.is_empty() {
@@ -772,8 +779,8 @@ mod tests {
             id: "t-1-1".into(),
             title: "x".into(),
             description: String::new(),
-            status: "open".into(),
-            priority: "normal".into(),
+            status: crate::task_events::TaskStatus::Open,
+            priority: crate::task_events::TaskPriority::Normal,
             assignee: assignee.map(str::to_string),
             routed_to: None,
             created_by: created_by.into(),

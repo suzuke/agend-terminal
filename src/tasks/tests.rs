@@ -27,8 +27,8 @@ fn make_test_task(assignee: Option<&str>) -> Task {
         id: "t-test-fixture".into(),
         title: "fixture".into(),
         description: String::new(),
-        status: "open".into(),
-        priority: "normal".into(),
+        status: crate::task_events::TaskStatus::Open,
+        priority: crate::task_events::TaskPriority::Normal,
         assignee: assignee.map(String::from),
         routed_to: None,
         created_by: "test".into(),
@@ -703,8 +703,8 @@ fn task_board_create_via_handle() {
     let tasks = list_all(&home);
     assert_eq!(tasks.len(), 1);
     assert_eq!(tasks[0].title, "new feature");
-    assert_eq!(tasks[0].status, "open");
-    assert_eq!(tasks[0].priority, "normal");
+    assert_eq!(tasks[0].status, crate::task_events::TaskStatus::Open);
+    assert_eq!(tasks[0].priority, crate::task_events::TaskPriority::Normal);
     std::fs::remove_dir_all(&home).ok();
 }
 
@@ -724,20 +724,26 @@ fn task_board_move_status() {
         &serde_json::json!({"action": "update", "id": id, "priority": "normal"}),
     );
     let t = &list_all(&home)[0];
-    assert_eq!(t.priority, "normal");
-    assert_eq!(t.status, "open");
+    assert_eq!(t.priority, crate::task_events::TaskPriority::Normal);
+    assert_eq!(t.status, crate::task_events::TaskStatus::Open);
     handle(
         &home,
         "user",
         &serde_json::json!({"action": "update", "id": id, "status": "claimed"}),
     );
-    assert_eq!(list_all(&home)[0].status, "claimed");
+    assert_eq!(
+        list_all(&home)[0].status,
+        crate::task_events::TaskStatus::Claimed
+    );
     handle(
         &home,
         "user",
         &serde_json::json!({"action": "update", "id": id, "status": "done"}),
     );
-    assert_eq!(list_all(&home)[0].status, "done");
+    assert_eq!(
+        list_all(&home)[0].status,
+        crate::task_events::TaskStatus::Done
+    );
     std::fs::remove_dir_all(&home).ok();
 }
 
@@ -773,7 +779,10 @@ fn task_board_cancel() {
         "user",
         &serde_json::json!({"action": "update", "id": id, "status": "cancelled"}),
     );
-    assert_eq!(list_all(&home)[0].status, "cancelled");
+    assert_eq!(
+        list_all(&home)[0].status,
+        crate::task_events::TaskStatus::Cancelled
+    );
     let all = list_all(&home);
     let columns = crate::render::task_board_columns(&all);
     let total: usize = columns.iter().map(|c| c.len()).sum();
@@ -829,7 +838,11 @@ fn task_board_shift_d_marks_done() {
             &serde_json::json!({"action": "done", "id": id}),
         );
         assert_eq!(r["status"], "done", "failed for {label}");
-        assert_eq!(list_all(&home)[0].status, "done", "failed for {label}");
+        assert_eq!(
+            list_all(&home)[0].status,
+            crate::task_events::TaskStatus::Done,
+            "failed for {label}"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }
@@ -1381,7 +1394,7 @@ fn test_update_release_claim_ok() {
     assert_eq!(r["status"], "updated");
     let tasks = list_all(&home);
     let t = tasks.iter().find(|t| t.id == id).unwrap();
-    assert_eq!(t.status, "open");
+    assert_eq!(t.status, crate::task_events::TaskStatus::Open);
     assert!(t.assignee.is_none(), "release must clear assignee");
     assert!(t.routed_to.is_none(), "release must clear routed_to");
     std::fs::remove_dir_all(&home).ok();
@@ -1559,12 +1572,14 @@ fn migration_imports_legacy_tasks_to_event_log() {
             ("t-mig-cancelled", "cancelled", None),
             ("t-mig-blocked", "blocked", None),
         ] {
+            let parsed_status: crate::task_events::TaskStatus =
+                serde_json::from_value(serde_json::Value::String(status.to_string())).unwrap();
             store.tasks.push(Task {
                 id: id.into(),
                 title: format!("title {id}"),
                 description: "legacy".into(),
-                status: status.into(),
-                priority: "normal".into(),
+                status: parsed_status,
+                priority: crate::task_events::TaskPriority::Normal,
                 assignee: assignee.map(String::from),
                 routed_to: None,
                 created_by: "operator".into(),
@@ -1635,8 +1650,8 @@ fn migration_idempotent_on_second_run() {
             id: "t-idp-1".into(),
             title: "idem".into(),
             description: String::new(),
-            status: "open".into(),
-            priority: "normal".into(),
+            status: crate::task_events::TaskStatus::Open,
+            priority: crate::task_events::TaskPriority::Normal,
             assignee: None,
             routed_to: None,
             created_by: "op".into(),
@@ -2075,7 +2090,11 @@ fn test_force_update_with_reason_cancels_ghost_and_logs_audit() {
         .iter()
         .find(|t| t.id == id)
         .expect("task still present");
-    assert_eq!(t.status, "cancelled", "task must be cancelled");
+    assert_eq!(
+        t.status,
+        crate::task_events::TaskStatus::Cancelled,
+        "task must be cancelled"
+    );
     // Cross-board audit: event-log.jsonl records the force action.
     let log = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
     assert!(
@@ -2506,7 +2525,8 @@ fn test_sweep_apply_emits_cancelled_and_logs_audit() {
     let listed = list_all(&home);
     let after = listed.iter().find(|t| t.id == task_id).expect("task");
     assert_eq!(
-        after.status, "cancelled",
+        after.status,
+        crate::task_events::TaskStatus::Cancelled,
         "swept task must transition to cancelled"
     );
     let log = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();

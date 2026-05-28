@@ -120,7 +120,12 @@ pub(super) fn scan_categories(
     let mut cats = Categories::default();
     let mut pr_cache: HashMap<u32, PrState> = HashMap::new();
     for t in &tasks {
-        if matches!(t.status.as_str(), "done" | "cancelled" | "verified") {
+        if matches!(
+            t.status,
+            crate::task_events::TaskStatus::Done
+                | crate::task_events::TaskStatus::Cancelled
+                | crate::task_events::TaskStatus::Verified
+        ) {
             continue;
         }
         let age = chrono::DateTime::parse_from_rfc3339(&t.updated_at)

@@ -184,7 +184,8 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
         .into_iter()
         .filter(|t| {
             t.assignee.as_deref() == Some(target)
-                && (t.status == "claimed" || t.status == "in_progress")
+                && (t.status == crate::task_events::TaskStatus::Claimed
+                    || t.status == crate::task_events::TaskStatus::InProgress)
         })
         .collect();
     // #1286: branch-specific dispatch dedup — reject if target already has

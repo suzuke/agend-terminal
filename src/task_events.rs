@@ -433,7 +433,8 @@ pub struct TaskEventEnvelope {
 
 // ── Folded board state (output of replay; not persisted) ───────────
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
     Backlog,
     Open,
@@ -444,6 +445,49 @@ pub enum TaskStatus {
     Done,
     Cancelled,
     Blocked,
+}
+
+impl std::fmt::Display for TaskStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Backlog => write!(f, "backlog"),
+            Self::Open => write!(f, "open"),
+            Self::Claimed => write!(f, "claimed"),
+            Self::InProgress => write!(f, "in_progress"),
+            Self::InReview => write!(f, "in_review"),
+            Self::Verified => write!(f, "verified"),
+            Self::Done => write!(f, "done"),
+            Self::Cancelled => write!(f, "cancelled"),
+            Self::Blocked => write!(f, "blocked"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskPriority {
+    Low,
+    Normal,
+    High,
+    Urgent,
+}
+
+#[allow(clippy::derivable_impls)]
+impl Default for TaskPriority {
+    fn default() -> Self {
+        Self::Normal
+    }
+}
+
+impl std::fmt::Display for TaskPriority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Low => write!(f, "low"),
+            Self::Normal => write!(f, "normal"),
+            Self::High => write!(f, "high"),
+            Self::Urgent => write!(f, "urgent"),
+        }
+    }
 }
 
 impl TaskStatus {

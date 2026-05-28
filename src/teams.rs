@@ -688,7 +688,10 @@ mod tests {
         let tasks = crate::tasks::list_all(&home);
         let urgent: Vec<_> = tasks
             .iter()
-            .filter(|t| t.priority == "urgent" && t.title.contains("needs new orchestrator"))
+            .filter(|t| {
+                t.priority == crate::task_events::TaskPriority::Urgent
+                    && t.title.contains("needs new orchestrator")
+            })
             .collect();
         assert_eq!(urgent.len(), 1, "should create exactly one urgent task");
         assert!(

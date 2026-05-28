@@ -16,7 +16,7 @@ pub fn build_fleet_view_lines(
     let mut agent_tasks: std::collections::HashMap<&str, Vec<&crate::tasks::Task>> =
         std::collections::HashMap::new();
     for t in tasks {
-        if t.status == "claimed" {
+        if t.status == crate::task_events::TaskStatus::Claimed {
             if let Some(ref a) = t.assignee {
                 agent_tasks.entry(a.as_str()).or_default().push(t);
             }
@@ -181,7 +181,10 @@ pub(super) fn render_fleet_view(
     let mut agent_tasks: std::collections::HashMap<&str, &crate::tasks::Task> =
         std::collections::HashMap::new();
     for t in tasks {
-        if matches!(t.status.as_str(), "claimed" | "in_progress") {
+        if matches!(
+            t.status,
+            crate::task_events::TaskStatus::Claimed | crate::task_events::TaskStatus::InProgress
+        ) {
             if let Some(ref a) = t.assignee {
                 agent_tasks.entry(a.as_str()).or_insert(t);
             }
@@ -309,8 +312,8 @@ mod tests {
             id: "t-1".to_string(),
             title: "busy work".to_string(),
             description: String::new(),
-            status: "claimed".to_string(),
-            priority: "normal".to_string(),
+            status: crate::task_events::TaskStatus::Claimed,
+            priority: crate::task_events::TaskPriority::Normal,
             assignee: Some("dev-impl".to_string()),
             routed_to: None,
             created_by: "lead".to_string(),
