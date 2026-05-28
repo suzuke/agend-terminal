@@ -35,7 +35,7 @@ use super::{
 /// Shared per-call context — every common parameter `handle_tool`
 /// would otherwise pass into the match arms, bundled together so each
 /// [`HandlerFn`] has a single uniform shape.
-pub(super) struct HandlerCtx<'a> {
+pub(crate) struct HandlerCtx<'a> {
     pub home: &'a Path,
     pub args: &'a Value,
     pub instance_name: &'a str,
@@ -45,23 +45,16 @@ pub(super) struct HandlerCtx<'a> {
 /// One MCP tool's dispatcher. Function pointer (not `Box<dyn …>`) so
 /// the slice in [`registered_handlers`] is `const`-friendly and
 /// allocation-free.
-pub(super) type HandlerFn = fn(&HandlerCtx<'_>) -> Value;
+pub(crate) type HandlerFn = fn(&HandlerCtx<'_>) -> Value;
 
-pub(super) struct HandlerEntry {
-    pub name: &'static str,
-    pub handler: HandlerFn,
-}
-
-/// Look the `tool` name up in the dispatch table. Returns `Some(value)`
+/// Look the `tool` name up in the registry. Returns `Some(value)`
 /// on hit; returns `None` if the tool isn't registered — the caller
 /// falls back to the inline `match` in `mod.rs` for un-migrated arms.
 pub(super) fn try_dispatch(tool: &str, ctx: &HandlerCtx<'_>) -> Option<Value> {
-    for entry in registered_handlers() {
-        if entry.name == tool {
-            return Some((entry.handler)(ctx));
-        }
-    }
-    None
+    crate::mcp::registry::all()
+        .iter()
+        .find(|entry| entry.name == tool)
+        .map(|entry| (entry.handler)(ctx))
 }
 
 // ---------------------------------------------------------------------
@@ -81,32 +74,32 @@ pub(super) fn try_dispatch(tool: &str, ctx: &HandlerCtx<'_>) -> Option<Value> {
 // ---------------------------------------------------------------------
 macro_rules! adapter {
     ($name:ident, hai, $handler:expr) => {
-        fn $name(ctx: &HandlerCtx<'_>) -> Value {
+        pub(crate) fn $name(ctx: &HandlerCtx<'_>) -> Value {
             $handler(ctx.home, ctx.args, ctx.instance_name)
         }
     };
     ($name:ident, ha, $handler:expr) => {
-        fn $name(ctx: &HandlerCtx<'_>) -> Value {
+        pub(crate) fn $name(ctx: &HandlerCtx<'_>) -> Value {
             $handler(ctx.home, ctx.args)
         }
     };
     ($name:ident, hais, $handler:expr) => {
-        fn $name(ctx: &HandlerCtx<'_>) -> Value {
+        pub(crate) fn $name(ctx: &HandlerCtx<'_>) -> Value {
             $handler(ctx.home, ctx.args, ctx.instance_name, ctx.sender)
         }
     };
     ($name:ident, has, $handler:expr) => {
-        fn $name(ctx: &HandlerCtx<'_>) -> Value {
+        pub(crate) fn $name(ctx: &HandlerCtx<'_>) -> Value {
             $handler(ctx.home, ctx.args, ctx.sender)
         }
     };
     ($name:ident, h, $handler:expr) => {
-        fn $name(ctx: &HandlerCtx<'_>) -> Value {
+        pub(crate) fn $name(ctx: &HandlerCtx<'_>) -> Value {
             $handler(ctx.home)
         }
     };
     ($name:ident, a, $handler:expr) => {
-        fn $name(ctx: &HandlerCtx<'_>) -> Value {
+        pub(crate) fn $name(ctx: &HandlerCtx<'_>) -> Value {
             $handler(ctx.args)
         }
     };
@@ -132,7 +125,7 @@ macro_rules! adapter {
 
 macro_rules! action_adapter {
     ($name:ident, $tool_label:literal, [ $( $action:literal => $handler:expr , $shape:ident );+ $(;)? ]) => {
-        fn $name(ctx: &HandlerCtx<'_>) -> Value {
+        pub(crate) fn $name(ctx: &HandlerCtx<'_>) -> Value {
             match ctx.args["action"].as_str().unwrap_or("") {
                 $( $action => { adapter!(@call ctx, $shape, $handler) } )+
                 other => json!({"error": format!(concat!("unknown ", $tool_label, " action: {}"), other)}),
@@ -271,7 +264,7 @@ action_adapter!(dispatch_team, "team", [
 //   - `message_id` present → describe single message
 //   - else `thread_id` present → describe thread
 //   - else → drain pending
-fn dispatch_inbox(ctx: &HandlerCtx<'_>) -> Value {
+pub(crate) fn dispatch_inbox(ctx: &HandlerCtx<'_>) -> Value {
     if ctx
         .args
         .get("message_id")
@@ -286,7 +279,7 @@ fn dispatch_inbox(ctx: &HandlerCtx<'_>) -> Value {
     }
 }
 
-fn dispatch_tui_screenshot(ctx: &HandlerCtx<'_>) -> Value {
+pub(crate) fn dispatch_tui_screenshot(ctx: &HandlerCtx<'_>) -> Value {
     match crate::api::call(
         ctx.home,
         &serde_json::json!({"method": crate::api::method::TUI_SCREENSHOT, "params": {}}),
@@ -302,7 +295,7 @@ fn dispatch_tui_screenshot(ctx: &HandlerCtx<'_>) -> Value {
 }
 
 // `watchdog` — actions with inline business logic (not just forwarding).
-fn dispatch_watchdog(ctx: &HandlerCtx<'_>) -> Value {
+pub(crate) fn dispatch_watchdog(ctx: &HandlerCtx<'_>) -> Value {
     match ctx.args["action"].as_str().unwrap_or("") {
         "snooze" => dispatch_watchdog_snooze(ctx),
         "resume" => dispatch_watchdog_resume(ctx),
@@ -397,7 +390,7 @@ fn dispatch_watchdog_ack(ctx: &HandlerCtx<'_>) -> Value {
     })
 }
 
-fn dispatch_config(ctx: &HandlerCtx<'_>) -> Value {
+pub(crate) fn dispatch_config(ctx: &HandlerCtx<'_>) -> Value {
     match ctx.args["action"].as_str().unwrap_or("") {
         "get" => {
             let key = ctx.args["key"].as_str().unwrap_or("");
@@ -459,149 +452,6 @@ fn parse_duration_secs(s: &str) -> Option<i64> {
     }
 }
 
-// ---------------------------------------------------------------------
-// Registration table
-// ---------------------------------------------------------------------
-
-static REGISTERED: &[HandlerEntry] = &[
-    HandlerEntry {
-        name: "list_instances",
-        handler: dispatch_list_instances,
-    },
-    HandlerEntry {
-        name: "create_instance",
-        handler: dispatch_create_instance,
-    },
-    HandlerEntry {
-        name: "set_description",
-        handler: dispatch_set_description,
-    },
-    HandlerEntry {
-        name: "interrupt",
-        handler: dispatch_interrupt,
-    },
-    HandlerEntry {
-        name: "delete_instance",
-        handler: dispatch_delete_instance,
-    },
-    HandlerEntry {
-        name: "start_instance",
-        handler: dispatch_start_instance,
-    },
-    HandlerEntry {
-        name: "replace_instance",
-        handler: dispatch_replace_instance,
-    },
-    HandlerEntry {
-        name: "move_pane",
-        handler: dispatch_move_pane,
-    },
-    HandlerEntry {
-        name: "set_waiting_on",
-        handler: dispatch_set_waiting_on,
-    },
-    HandlerEntry {
-        name: "send",
-        handler: dispatch_send,
-    },
-    HandlerEntry {
-        name: "bind_self",
-        handler: dispatch_bind_self,
-    },
-    HandlerEntry {
-        name: "binding_state",
-        handler: dispatch_binding_state,
-    },
-    HandlerEntry {
-        name: "release_worktree",
-        handler: dispatch_release_worktree,
-    },
-    HandlerEntry {
-        name: "force_release_worktree",
-        handler: dispatch_force_release_worktree,
-    },
-    HandlerEntry {
-        name: "gc_dry_run",
-        handler: dispatch_gc_dry_run,
-    },
-    HandlerEntry {
-        name: "task",
-        handler: dispatch_task,
-    },
-    HandlerEntry {
-        name: "ci",
-        handler: dispatch_ci,
-    },
-    HandlerEntry {
-        name: "decision",
-        handler: dispatch_decision,
-    },
-    HandlerEntry {
-        name: "deployment",
-        handler: dispatch_deployment,
-    },
-    HandlerEntry {
-        name: "health",
-        handler: dispatch_health,
-    },
-    HandlerEntry {
-        name: "watchdog",
-        handler: dispatch_watchdog,
-    },
-    HandlerEntry {
-        name: "config",
-        handler: dispatch_config,
-    },
-    HandlerEntry {
-        name: "repo",
-        handler: dispatch_repo,
-    },
-    HandlerEntry {
-        name: "schedule",
-        handler: dispatch_schedule,
-    },
-    HandlerEntry {
-        name: "team",
-        handler: dispatch_team,
-    },
-    HandlerEntry {
-        name: "download_attachment",
-        handler: dispatch_download_attachment,
-    },
-    HandlerEntry {
-        name: "inbox",
-        handler: dispatch_inbox,
-    },
-    HandlerEntry {
-        name: "reply",
-        handler: dispatch_reply,
-    },
-    HandlerEntry {
-        name: "set_display_name",
-        handler: dispatch_set_display_name,
-    },
-    HandlerEntry {
-        name: "pane_snapshot",
-        handler: dispatch_pane_snapshot,
-    },
-    HandlerEntry {
-        name: "tui_screenshot",
-        handler: dispatch_tui_screenshot,
-    },
-    HandlerEntry {
-        name: "task_sweep_config",
-        handler: dispatch_task_sweep_config,
-    },
-    HandlerEntry {
-        name: "restart_daemon",
-        handler: dispatch_restart_daemon,
-    },
-];
-
-pub(super) fn registered_handlers() -> &'static [HandlerEntry] {
-    REGISTERED
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -636,46 +486,46 @@ mod tests {
 
     #[test]
     fn registered_handler_names_pin() {
-        let names: Vec<&'static str> = registered_handlers().iter().map(|e| e.name).collect();
+        let names: Vec<&'static str> = crate::mcp::registry::all().iter().map(|e| e.name).collect();
         assert_eq!(
             names,
             vec![
+                "reply",
+                "download_attachment",
+                "send",
+                "inbox",
                 "list_instances",
                 "create_instance",
-                "set_description",
-                "interrupt",
                 "delete_instance",
                 "start_instance",
                 "replace_instance",
-                "move_pane",
+                "interrupt",
+                "set_display_name",
+                "set_description",
                 "set_waiting_on",
-                "send",
-                "bind_self",
-                "binding_state",
-                "release_worktree",
-                "force_release_worktree",
-                "gc_dry_run",
-                "task",
-                "ci",
+                "move_pane",
+                "pane_snapshot",
+                "tui_screenshot",
                 "decision",
+                "task",
+                "task_sweep_config",
+                "restart_daemon",
+                "team",
+                "schedule",
                 "deployment",
+                "ci",
                 "health",
                 "watchdog",
                 "config",
                 "repo",
-                "schedule",
-                "team",
-                "download_attachment",
-                "inbox",
-                "reply",
-                "set_display_name",
-                "pane_snapshot",
-                "tui_screenshot",
-                "task_sweep_config",
-                "restart_daemon",
+                "bind_self",
+                "release_worktree",
+                "force_release_worktree",
+                "binding_state",
+                "gc_dry_run",
             ]
         );
-        assert_eq!(registered_handlers().len(), 33);
+        assert_eq!(crate::mcp::registry::all().len(), 33);
     }
 
     #[test]

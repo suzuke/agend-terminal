@@ -7,6 +7,7 @@
 //! the bridge proxy and `api/handlers/mcp_proxy.rs`.
 
 pub mod handlers;
+pub(crate) mod registry;
 pub mod tools;
 
 use serde_json::Value;

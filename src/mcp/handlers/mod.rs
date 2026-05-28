@@ -5,7 +5,7 @@ mod binding_state;
 mod channel;
 pub(crate) mod ci;
 mod comms;
-mod dispatch;
+pub(crate) mod dispatch;
 pub(crate) mod dispatch_hook;
 mod force_release;
 pub(crate) mod instance;
