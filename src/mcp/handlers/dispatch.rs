@@ -504,6 +504,7 @@ mod tests {
                 "delete_instance",
                 "start_instance",
                 "replace_instance",
+                "restart_instance",
                 "interrupt",
                 "set_display_name",
                 "set_description",
@@ -530,7 +531,7 @@ mod tests {
                 "gc_dry_run",
             ]
         );
-        assert_eq!(crate::mcp::registry::all().len(), 33);
+        assert_eq!(crate::mcp::registry::all().len(), 34);
     }
 
     #[test]
