@@ -197,6 +197,39 @@ pub enum BlockedReason {
     Crash,
 }
 
+impl BlockedReason {
+    pub fn parse_kind(kind: &str, params: &serde_json::Value) -> Option<Self> {
+        match kind {
+            "rate_limit" => Some(Self::RateLimit {
+                retry_after_secs: params["retry_after_secs"].as_u64(),
+            }),
+            "quota_exceeded" => Some(Self::QuotaExceeded),
+            "awaiting_operator" => Some(Self::AwaitingOperator),
+            "permission_prompt" => Some(Self::PermissionPrompt),
+            "hang" => Some(Self::Hang),
+            "crash" => Some(Self::Crash),
+            _ => None,
+        }
+    }
+
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            Self::Hang => "hang",
+            Self::RateLimit { .. } => "rate_limit",
+            Self::QuotaExceeded => "quota_exceeded",
+            Self::AwaitingOperator => "awaiting_operator",
+            Self::PermissionPrompt => "permission_prompt",
+            Self::Crash => "crash",
+        }
+    }
+}
+
+impl std::fmt::Display for BlockedReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.kind_str())
+    }
+}
+
 /// Tracks health for one agent.
 #[derive(Clone)]
 #[allow(dead_code)] // error_events, last_output, record_error, reset: reserved for daemon health monitoring

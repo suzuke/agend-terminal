@@ -316,16 +316,9 @@ pub(crate) fn handle_set_blocked_reason(params: &Value, ctx: &HandlerCtx) -> Val
         Some(r) => r,
         None => return json!({"ok": false, "error": "missing 'reason'"}),
     };
-    let reason = match reason_str {
-        "rate_limit" => crate::health::BlockedReason::RateLimit {
-            retry_after_secs: params["retry_after_secs"].as_u64(),
-        },
-        "quota_exceeded" => crate::health::BlockedReason::QuotaExceeded,
-        "awaiting_operator" => crate::health::BlockedReason::AwaitingOperator,
-        "permission_prompt" => crate::health::BlockedReason::PermissionPrompt,
-        "hang" => crate::health::BlockedReason::Hang,
-        "crash" => crate::health::BlockedReason::Crash,
-        _ => return json!({"ok": false, "error": format!("unknown reason: {reason_str}")}),
+    let reason = match crate::health::BlockedReason::parse_kind(reason_str, params) {
+        Some(r) => r,
+        None => return json!({"ok": false, "error": format!("unknown reason: {reason_str}")}),
     };
     let reg = agent::lock_registry(ctx.registry);
     match reg.get(name) {
@@ -356,17 +349,11 @@ pub(crate) fn handle_clear_blocked_reason(params: &Value, ctx: &HandlerCtx) -> V
                 .map(|r| serde_json::to_value(r).unwrap_or_default());
             // If a reason filter is specified, only clear if it matches
             if let Some(filter) = filter_reason {
-                let matches = core.health.current_reason.as_ref().is_some_and(|r| {
-                    let kind = match r {
-                        crate::health::BlockedReason::RateLimit { .. } => "rate_limit",
-                        crate::health::BlockedReason::QuotaExceeded => "quota_exceeded",
-                        crate::health::BlockedReason::AwaitingOperator => "awaiting_operator",
-                        crate::health::BlockedReason::PermissionPrompt => "permission_prompt",
-                        crate::health::BlockedReason::Hang => "hang",
-                        crate::health::BlockedReason::Crash => "crash",
-                    };
-                    kind == filter
-                });
+                let matches = core
+                    .health
+                    .current_reason
+                    .as_ref()
+                    .is_some_and(|r| r.kind_str() == filter);
                 if !matches {
                     return json!({"ok": false, "error": "reason mismatch", "current": was});
                 }
