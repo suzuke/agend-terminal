@@ -274,6 +274,12 @@ pub struct InstanceConfig {
     /// reviewers to have tighter timeouts than dev agents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
+    #[serde(default = "default_true")]
+    pub idle_watchdog_enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

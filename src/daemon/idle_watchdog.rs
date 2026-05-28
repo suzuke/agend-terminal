@@ -258,8 +258,9 @@ pub(crate) fn scan_and_emit(
     home: &Path,
     last_alerted: &mut HashMap<(&'static str, String), chrono::DateTime<chrono::Utc>>,
 ) {
-    // #1240: discard all alerts during snooze — check once at entry
-    // rather than per-vantage so both dev + fleet are suppressed.
+    if !crate::runtime_config::get().idle_watchdog_enabled {
+        return;
+    }
     if is_fleet_idle_snoozed(home) {
         return;
     }
@@ -311,6 +312,7 @@ fn scan_dev_vantage(
     } else if let Ok(cfg) = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)) {
         cfg.instances
             .iter()
+            .filter(|(_, ic)| ic.idle_watchdog_enabled)
             .map(|(name, ic)| {
                 let threshold = ic
                     .timeout_secs
@@ -478,7 +480,12 @@ fn scan_fleet_vantage(
         if let Ok(cfg) = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)) {
             raw_pairs
                 .into_iter()
-                .filter(|(name, _)| cfg.instances.contains_key(name))
+                .filter(|(name, _)| {
+                    cfg.instances
+                        .get(name)
+                        .map(|ic| ic.idle_watchdog_enabled)
+                        .unwrap_or(false)
+                })
                 .collect()
         } else {
             raw_pairs

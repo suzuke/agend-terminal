@@ -27,6 +27,14 @@ pub struct RuntimeConfig {
     /// to all same-backend agents + gates new dispatches. Default false.
     #[serde(default)]
     pub usage_limit_propagation_enabled: bool,
+    /// #1402: Master gate for idle watchdog. When false, scan_and_emit
+    /// is a no-op — no dev-idle or fleet-idle alerts fire. Default true.
+    #[serde(default = "default_true")]
+    pub idle_watchdog_enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_dev_idle() -> i64 {
@@ -43,6 +51,7 @@ impl Default for RuntimeConfig {
             fleet_idle_threshold_secs: default_fleet_idle(),
             hang_auto_recovery_enabled: false,
             usage_limit_propagation_enabled: false,
+            idle_watchdog_enabled: true,
         }
     }
 }
@@ -96,6 +105,13 @@ pub fn set(home: &Path, key: &str, value: &str) -> Result<String, String> {
                 _ => return Err(format!("invalid boolean: {value} (use true/false)")),
             };
         }
+        "idle_watchdog_enabled" => {
+            config.idle_watchdog_enabled = match value {
+                "true" | "1" => true,
+                "false" | "0" => false,
+                _ => return Err(format!("invalid boolean: {value} (use true/false)")),
+            };
+        }
         _ => return Err(format!("unknown config key: {key}")),
     }
     let path = home.join("runtime-config.json");
@@ -113,6 +129,7 @@ pub fn get_key(key: &str) -> Result<String, String> {
         "fleet_idle_threshold_secs" => Ok(config.fleet_idle_threshold_secs.to_string()),
         "hang_auto_recovery_enabled" => Ok(config.hang_auto_recovery_enabled.to_string()),
         "usage_limit_propagation_enabled" => Ok(config.usage_limit_propagation_enabled.to_string()),
+        "idle_watchdog_enabled" => Ok(config.idle_watchdog_enabled.to_string()),
         _ => Err(format!("unknown config key: {key}")),
     }
 }
