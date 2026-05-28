@@ -5,6 +5,16 @@
 
 use std::path::{Path, PathBuf};
 
+/// Run a git command with AGEND_GIT_BYPASS=1, optionally in a given directory.
+/// Returns Ok(Output) on successful exec, Err on spawn failure.
+fn run_git(repo: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
+    std::process::Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+}
+
 /// Marker file placed in daemon-managed worktrees (R14 mitigation).
 pub(crate) const MANAGED_MARKER: &str = ".agend-managed";
 
@@ -144,43 +154,26 @@ fn cleanup_merged_branch(
         return (false, Some(format!("branch '{branch}' is protected")));
     }
 
-    // Prune stale remote refs before remote-gone detection
-    // (GitHub deletes remote branch on merge but local ref may be stale)
     let remote = crate::git_helpers::primary_remote(source_repo);
-    let _ = std::process::Command::new("git")
-        .args(["fetch", "--prune", &remote])
-        .current_dir(source_repo)
-        .env("AGEND_GIT_BYPASS", "1")
-        .output();
+    let _ = run_git(source_repo, &["fetch", "--prune", &remote]);
 
-    // Check if branch is ancestor of default branch (fast-forward or true merge).
     let default = crate::git_helpers::default_branch(source_repo);
-    let is_merged = std::process::Command::new("git")
-        .args(["merge-base", "--is-ancestor", branch, &default])
-        .current_dir(source_repo)
-        .env("AGEND_GIT_BYPASS", "1")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+    let is_merged = run_git(
+        source_repo,
+        &["merge-base", "--is-ancestor", branch, &default],
+    )
+    .map(|o| o.status.success())
+    .unwrap_or(false);
 
-    // Check if remote tracking ref is gone (squash-merge detection).
     let is_gone = {
-        let remote_name = std::process::Command::new("git")
-            .args(["config", &format!("branch.{branch}.remote")])
-            .current_dir(source_repo)
-            .env("AGEND_GIT_BYPASS", "1")
-            .output()
+        let remote_name = run_git(source_repo, &["config", &format!("branch.{branch}.remote")])
             .ok()
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_default();
         if !remote_name.is_empty() {
             let remote_ref = format!("refs/remotes/{remote_name}/{branch}");
-            let exists = std::process::Command::new("git")
-                .args(["rev-parse", "--verify", &remote_ref])
-                .current_dir(source_repo)
-                .env("AGEND_GIT_BYPASS", "1")
-                .output()
+            let exists = run_git(source_repo, &["rev-parse", "--verify", &remote_ref])
                 .map(|o| o.status.success())
                 .unwrap_or(true);
             !exists
@@ -200,12 +193,7 @@ fn cleanup_merged_branch(
         );
     }
 
-    // Delete the local branch.
-    let del = std::process::Command::new("git")
-        .args(["branch", "-D", branch])
-        .current_dir(source_repo)
-        .env("AGEND_GIT_BYPASS", "1")
-        .output();
+    let del = run_git(source_repo, &["branch", "-D", branch]);
     match del {
         Ok(o) if o.status.success() => (true, None),
         Ok(o) => {
@@ -239,178 +227,93 @@ fn cleanup_merged_branch(
 /// Partial cleanup: if the worktree path is missing or `git worktree remove`
 /// fails, the binding is still cleared so the agent is not stuck in a
 /// half-released state.
-pub fn release_full(home: &Path, agent: &str, dry_run: bool) -> ReleaseOutcome {
-    let mut out = ReleaseOutcome::default();
-    let mut managed_verified = false;
-    let mut worktree_absent = false;
+/// Result of worktree directory removal attempt.
+enum WorktreeRemoval {
+    Removed,
+    AlreadyAbsent,
+    Unmanaged(String),
+    Failed(String),
+}
 
-    let Some(binding) = crate::binding::read(home, agent) else {
-        // Idempotent no-op on second call. Per spec: not fatal.
-        out.error = Some(format!("no binding for agent '{agent}'"));
-        return out;
-    };
+fn source_repo_from_binding(binding: &serde_json::Value, wt_path: &Path) -> PathBuf {
+    binding["source_repo"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            wt_path
+                .parent()
+                .filter(|p| p.file_name().and_then(|n| n.to_str()) == Some(".worktrees"))
+                .and_then(|p| p.parent())
+                .map(PathBuf::from)
+        })
+        .unwrap_or_default()
+}
 
-    // Worktree removal: gated on (a) path present in binding, (b) path exists
-    // on disk, (c) carries .agend-managed marker (R14 safety).
-    let wt_path_str = binding["worktree"].as_str().unwrap_or("");
-    if !wt_path_str.is_empty() {
-        let wt_path = Path::new(wt_path_str);
-
-        // Source-repo: read from binding (P0-X r1 schema field), else derive
-        // from the daemon's worktree convention `<source>/.worktrees/<agent>`.
-        // Without a correct cwd, `git worktree remove` may fail and the
-        // fallback `remove_dir_all` would leak a stale registry entry.
-        let source_repo: PathBuf = binding["source_repo"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| {
-                // Derive: parent of `.worktrees/<agent>` is the source repo.
-                wt_path
-                    .parent()
-                    .filter(|p| p.file_name().and_then(|n| n.to_str()) == Some(".worktrees"))
-                    .and_then(|p| p.parent())
-                    .map(PathBuf::from)
-            })
-            .unwrap_or_else(PathBuf::new);
-
-        if !wt_path.exists() {
-            tracing::info!(
-                agent,
-                path = %wt_path.display(),
-                "release: worktree path already absent — pruning registry + clearing binding"
-            );
-            worktree_absent = true;
-            // Prune registry in case the source repo still lists this path.
-            // Safe even when source_repo is empty — git just errors out and
-            // we ignore the result.
-            if !source_repo.as_os_str().is_empty() {
-                let _ = std::process::Command::new("git")
-                    .current_dir(&source_repo)
-                    .args(["worktree", "prune"])
-                    .env("AGEND_GIT_BYPASS", "1")
-                    .output();
-            }
-        } else if !is_daemon_managed(wt_path) {
-            // R14 safety: never touch operator-created worktrees.
-            tracing::warn!(
-                agent,
-                path = %wt_path.display(),
-                "release skipped: no .agend-managed marker — worktree left alone"
-            );
-            out.error = Some(format!(
-                "worktree at {} has no .agend-managed marker — refusing to remove (binding NOT cleared)",
-                wt_path.display()
-            ));
-            return out;
-        } else {
-            // git worktree remove --force, run from the OWNING repo's cwd
-            // so the registry entry is cleaned up alongside the directory.
-            // AGEND_GIT_BYPASS=1 bypasses the shim's worktree-deny matrix.
-            managed_verified = true;
-            let mut cmd = std::process::Command::new("git");
-            cmd.args([
-                "worktree",
-                "remove",
-                "--force",
-                &wt_path.display().to_string(),
-            ])
-            .env("AGEND_GIT_BYPASS", "1");
-            if !source_repo.as_os_str().is_empty() {
-                cmd.current_dir(&source_repo);
-            }
-            let result = cmd.output();
-            match result {
-                Ok(o) if o.status.success() => {
-                    out.worktree_removed = true;
-                }
-                Ok(o) => {
-                    let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
-                    tracing::warn!(
-                        agent,
-                        error = %stderr,
-                        path = %wt_path.display(),
-                        "git worktree remove failed — falling back to remove_dir_all"
-                    );
-                    // Fallback: best-effort manual remove + registry prune.
-                    let _ = std::fs::remove_dir_all(wt_path);
-                    if !wt_path.exists() {
-                        // Prune the registry so `git worktree list` doesn't
-                        // keep advertising the (now-deleted) path. Without
-                        // this the next lease re-attempt sees the entry,
-                        // detects it as "checked out", and rejects.
-                        if !source_repo.as_os_str().is_empty() {
-                            let prune = std::process::Command::new("git")
-                                .current_dir(&source_repo)
-                                .args(["worktree", "prune"])
-                                .env("AGEND_GIT_BYPASS", "1")
-                                .output();
-                            if let Err(e) = prune {
-                                tracing::warn!(agent, error = %e, "git worktree prune failed");
-                            }
-                        }
-                        out.worktree_removed = true;
-                    } else {
-                        out.error = Some(format!("git worktree remove failed: {stderr}"));
-                        // Still clear binding (partial cleanup per spec).
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(agent, error = %e, "git command failed for release");
-                    out.error = Some(format!("git command failed: {e}"));
-                    // Still clear binding (partial cleanup per spec).
-                }
-            }
+fn remove_worktree(agent: &str, wt_path: &Path, source_repo: &Path) -> WorktreeRemoval {
+    if !wt_path.exists() {
+        tracing::info!(agent, path = %wt_path.display(),
+            "release: worktree path already absent — pruning registry + clearing binding");
+        if !source_repo.as_os_str().is_empty() {
+            let _ = run_git(source_repo, &["worktree", "prune"]);
         }
+        return WorktreeRemoval::AlreadyAbsent;
+    }
+    if !is_daemon_managed(wt_path) {
+        tracing::warn!(agent, path = %wt_path.display(),
+            "release skipped: no .agend-managed marker — worktree left alone");
+        return WorktreeRemoval::Unmanaged(format!(
+            "worktree at {} has no .agend-managed marker — refusing to remove (binding NOT cleared)",
+            wt_path.display()
+        ));
     }
 
-    // Always clear the binding (partial cleanup OK per spec — except when we
-    // bailed early on the unmanaged-worktree safety gate above).
+    let wt_str = wt_path.display().to_string();
+    let result = if source_repo.as_os_str().is_empty() {
+        std::process::Command::new("git")
+            .args(["worktree", "remove", "--force", &wt_str])
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+    } else {
+        run_git(source_repo, &["worktree", "remove", "--force", &wt_str])
+    };
+    match result {
+        Ok(o) if o.status.success() => WorktreeRemoval::Removed,
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            tracing::warn!(agent, error = %stderr, path = %wt_path.display(),
+                "git worktree remove failed — falling back to remove_dir_all");
+            let _ = std::fs::remove_dir_all(wt_path);
+            if !wt_path.exists() {
+                if !source_repo.as_os_str().is_empty() {
+                    if let Err(e) = run_git(source_repo, &["worktree", "prune"]) {
+                        tracing::warn!(agent, error = %e, "git worktree prune failed");
+                    }
+                }
+                WorktreeRemoval::Removed
+            } else {
+                WorktreeRemoval::Failed(format!("git worktree remove failed: {stderr}"))
+            }
+        }
+        Err(e) => {
+            tracing::warn!(agent, error = %e, "git command failed for release");
+            WorktreeRemoval::Failed(format!("git command failed: {e}"))
+        }
+    }
+}
+
+fn clear_binding_state(home: &Path, agent: &str) {
     crate::binding::unbind(home, agent);
-    out.binding_removed = true;
-    out.released = true;
-
-    // Sprint 58 Wave 3 PR-2 (#9): defensive comprehensive cleanup of
-    // every daemon-side bind-tracking layer, not just on-disk
-    // `binding.json`. The dispatch-hook bind-in-flight set is RAII-
-    // managed via `BindGuard::drop` — but a panic between guard
-    // acquisition and the implicit `Drop` can leave a stale entry
-    // that blocks re-bind silently. Since `release_full` is the
-    // single source of truth for "agent is now released", it's the
-    // right place to clear in-memory state too.
     crate::mcp::handlers::dispatch_hook::clear_bind_in_flight(home, agent);
+}
 
-    // #931 (Direction A.1 pure): release_full no longer mutates any
-    // ci-watch on the agent's behalf. Pre-#931 this site called
-    // `unsubscribe_all_ci_watches_for_agent(home, agent)` (Sprint 57
-    // Wave 2 Track B / #546 Item 2) which removed the released agent
-    // from every ci-watch and deleted the watch file in the sole-
-    // subscriber case — that cascade destroyed `next_after_ci` chains
-    // + polling state and caused 4-in-a-row PR stalls overnight
-    // (PRs #920, #925, #928, #929 — see #931 RCA).
-    //
-    // Operator's stated direction (#931 body): "Subscription persists
-    // across bind handoff unless explicitly `unwatch`ed." Hygiene is
-    // delegated to existing TTL paths:
-    //   - 72h absolute TTL (`expires_at`)
-    //   - 72h inactivity TTL (`last_terminal_seen_at`)
-    //   - PR-terminal auto-clear (`poller.rs::check_pr_terminal`)
-    //   - Explicit `ci action=unwatch` (operator-callable)
-    //
-    // Rollback criteria (PR #931 body): if dead-subscriber bloat
-    // (entries in `subscribers[]` referencing agents removed from the
-    // fleet) exceeds N writes/hour for Y consecutive days, revert by
-    // re-introducing a NARROW unsubscribe helper scoped to the binding-
-    // branch watch only (NOT the cross-branch broad sweep). The dead-
-    // sub bloat itself is harmless at notification time because both
-    // PTY inject and inbox enqueue (post-Fix 3) are registry-gated.
-
-    // Issue #611: auto-cleanup merged local branch after release.
-    // Read branch + source_repo from the binding we captured earlier.
-    // #1249: branch cleanup is safe when worktree was managed OR already absent —
-    // the unmanaged case early-returns above, so reaching here means the branch
-    // came from our binding record. merge-base check in cleanup_merged_branch()
-    // prevents deleting unmerged branches.
+fn resolve_branch_cleanup(
+    binding: &serde_json::Value,
+    managed_verified: bool,
+    worktree_absent: bool,
+    dry_run: bool,
+    out: &mut ReleaseOutcome,
+) {
     let branch = binding["branch"].as_str().unwrap_or("");
     let sr_str = binding["source_repo"].as_str().unwrap_or("");
     if !managed_verified && !worktree_absent {
@@ -425,6 +328,54 @@ pub fn release_full(home: &Path, agent: &str, dry_run: bool) -> ReleaseOutcome {
     } else {
         out.branch_cleanup_skipped_reason = Some("no source_repo in binding".to_string());
     }
+}
+
+pub fn release_full(home: &Path, agent: &str, dry_run: bool) -> ReleaseOutcome {
+    let mut out = ReleaseOutcome::default();
+
+    let Some(binding) = crate::binding::read(home, agent) else {
+        out.error = Some(format!("no binding for agent '{agent}'"));
+        return out;
+    };
+
+    let wt_path_str = binding["worktree"].as_str().unwrap_or("");
+    let mut managed_verified = false;
+    let mut worktree_absent = false;
+
+    if !wt_path_str.is_empty() {
+        let wt_path = Path::new(wt_path_str);
+        let source_repo = source_repo_from_binding(&binding, wt_path);
+
+        match remove_worktree(agent, wt_path, &source_repo) {
+            WorktreeRemoval::Removed => {
+                managed_verified = true;
+                out.worktree_removed = true;
+            }
+            WorktreeRemoval::AlreadyAbsent => {
+                worktree_absent = true;
+            }
+            WorktreeRemoval::Unmanaged(err) => {
+                out.error = Some(err);
+                return out;
+            }
+            WorktreeRemoval::Failed(err) => {
+                managed_verified = true;
+                out.error = Some(err);
+            }
+        }
+    }
+
+    clear_binding_state(home, agent);
+    out.binding_removed = true;
+    out.released = true;
+
+    resolve_branch_cleanup(
+        &binding,
+        managed_verified,
+        worktree_absent,
+        dry_run,
+        &mut out,
+    );
 
     crate::event_log::log(
         home,
