@@ -941,15 +941,15 @@ fn max_seq_for_instance(log_path: &Path, instance: &InstanceName) -> anyhow::Res
 
 // ── Replay cache ─────────────────────────────────────────────────────
 // Read-side cache: avoids full-file replay when nothing has changed.
-// Keyed on (home, generation, file_len) — generation is a process-wide
-// monotonic counter incremented on every in-process append (replaces
-// mtime which was unreliable on Linux ext4 where 1ms granularity
-// caused stale cache hits during rapid concurrent writes). file_len
-// catches external modifications (tests, compaction, manual edits).
+// Keyed on (home, generation, file_len, mtime_ns):
+// - generation: process-wide monotonic counter, catches in-process
+//   concurrent appends (fixes Linux ext4 mtime ms-granularity flake)
+// - file_len + mtime_ns: catch external modifications (cross-process
+//   writes, compaction, tests truncating the log)
 
 static REPLAY_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-type ReplayCacheKey = (std::path::PathBuf, u64, u64);
+type ReplayCacheKey = (std::path::PathBuf, u64, u64, i64);
 
 struct ReplayCacheEntry {
     key: ReplayCacheKey,
@@ -961,10 +961,21 @@ static REPLAY_CACHE: std::sync::LazyLock<parking_lot::Mutex<Option<ReplayCacheEn
 
 fn replay_cache_key(home: &Path) -> ReplayCacheKey {
     let gen = REPLAY_GENERATION.load(std::sync::atomic::Ordering::Acquire);
-    let log_len = std::fs::metadata(log_path(home))
-        .map(|m| m.len())
-        .unwrap_or(0);
-    (home.to_path_buf(), gen, log_len)
+    let log = log_path(home);
+    let (log_len, mtime_ns) = std::fs::metadata(&log)
+        .ok()
+        .map(|m| {
+            let len = m.len();
+            let mtime = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos() as i64)
+                .unwrap_or(0);
+            (len, mtime)
+        })
+        .unwrap_or((0, 0));
+    (home.to_path_buf(), gen, log_len, mtime_ns)
 }
 
 pub fn invalidate_replay_cache() {
