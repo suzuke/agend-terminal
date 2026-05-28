@@ -1090,7 +1090,7 @@ fn spawn_and_register_agent(
                 error = %e,
                 "TUI listener prep failed — rolling back agent registration"
             );
-            lifecycle::delete_transaction(home, name, registry, Some(configs));
+            lifecycle::delete_transaction(home, name, registry, Some(configs), false);
             return Err(anyhow::Error::from(e));
         }
     };
@@ -1116,7 +1116,7 @@ fn spawn_and_register_agent(
             error = %e,
             "TUI server thread spawn failed — rolling back agent registration"
         );
-        lifecycle::delete_transaction(home, name, registry, Some(configs));
+        lifecycle::delete_transaction(home, name, registry, Some(configs), false);
         return Err(e.into());
     }
     Ok(())

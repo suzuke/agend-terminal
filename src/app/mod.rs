@@ -1149,7 +1149,7 @@ fn scroll_focused(layout: &mut Layout, delta: i32) {
 /// `kill_process_tree` + synchronous wait-for-exit + `take_binding` + event
 /// log, matching the API delete path.
 fn kill_agent(home: &Path, registry: &AgentRegistry, name: &str) {
-    crate::daemon::lifecycle::delete_transaction(home, name, registry, None);
+    crate::daemon::lifecycle::delete_transaction(home, name, registry, None, false);
 }
 
 /// Whether the agent's child process is still running.

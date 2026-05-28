@@ -97,7 +97,14 @@ pub(crate) fn handle_delete(params: &Value, ctx: &HandlerCtx) -> Value {
     // the previous implementation removed the registry entry before the OS
     // had reaped the PID, exposing PID re-use + concurrent-spawn collision
     // races.
-    crate::daemon::lifecycle::delete_transaction(ctx.home, name, ctx.registry, Some(ctx.configs));
+    let skip_exit_wait = params["no_wait"].as_bool().unwrap_or(false);
+    crate::daemon::lifecycle::delete_transaction(
+        ctx.home,
+        name,
+        ctx.registry,
+        Some(ctx.configs),
+        skip_exit_wait,
+    );
     // H3: clean up poll_reminder dedup state for deleted agent
     crate::daemon::poll_reminder::remove_agent(name);
     if let Some(n) = ctx.notifier {
