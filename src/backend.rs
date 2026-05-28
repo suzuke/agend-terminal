@@ -185,6 +185,17 @@ impl SpawnMode {
     }
 }
 
+/// A pattern/keystroke pair for auto-dismissing a backend dialog (trust
+/// prompt, update notice). When `label`'s regex matches the rendered screen,
+/// `sequence` is written to the PTY.
+#[derive(Debug, Clone)]
+pub struct DismissPattern {
+    /// Regex matched against the rendered screen (anchored per #468).
+    pub label: &'static str,
+    /// Key bytes sent to the PTY when the pattern matches.
+    pub sequence: &'static [u8],
+}
+
 /// Preset configuration for a backend.
 #[derive(Debug, Clone)]
 pub struct BackendPreset {
@@ -200,8 +211,7 @@ pub struct BackendPreset {
     pub resume_mode: ResumeMode,
     pub quit_command: &'static str,
     /// Patterns to auto-dismiss (trust dialogs, update prompts).
-    /// Each entry: (pattern_text, key_sequence_to_send).
-    pub dismiss_patterns: &'static [(&'static str, &'static [u8])],
+    pub dismiss_patterns: &'static [DismissPattern],
     /// Relative path for instructions file from working dir.
     pub instructions_path: &'static str,
     /// Whether `instructions_path` is a file shared with the user (e.g. AGENTS.md,
@@ -281,8 +291,14 @@ impl Backend {
                 // pending empirical verification at follow-up — modal +
                 // default-cursor for that prompt not yet captured.
                 dismiss_patterns: &[
-                    (r"(?m)^[^A-Za-z\n]{0,8}Yes, I trust", b"\r"),
-                    (r"(?m)^[^A-Za-z\n]{0,8}Yes, proceed", b"\x1b[A\x1b[A\r"),
+                    DismissPattern {
+                        label: r"(?m)^[^A-Za-z\n]{0,8}Yes, I trust",
+                        sequence: b"\r",
+                    },
+                    DismissPattern {
+                        label: r"(?m)^[^A-Za-z\n]{0,8}Yes, proceed",
+                        sequence: b"\x1b[A\x1b[A\r",
+                    },
                 ],
                 fresh_args: None, // same as args (no resume in preset)
                 fleet_mcp_supported: true,
@@ -324,7 +340,10 @@ impl Backend {
                     // SAFE option). Do NOT collapse this to bare `\r` —
                     // see `kiro_no_exit_dismiss_uses_down_then_enter` test
                     // for the regression pin.
-                    (r"(?m)^[^A-Za-z\n]{0,8}No, exit", b"\x1b[B\r"),
+                    DismissPattern {
+                        label: r"(?m)^[^A-Za-z\n]{0,8}No, exit",
+                        sequence: b"\x1b[B\r",
+                    },
                 ],
                 fresh_args: None, // same as args
                 fleet_mcp_supported: true,
@@ -353,11 +372,20 @@ impl Backend {
                     // so LF here would silently no-op on mac.
                     // Issue #468: anchored regex (see ClaudeCode comment above).
                     // #1087: `*` instead of `{0,8}` — TUI centered modals have 40+ char prefix.
-                    (r"(?m)^[^A-Za-z\n]*Do you trust", b"\r"),
-                    (r"(?m)^[^A-Za-z\n]*Please restart", b"\r"),
+                    DismissPattern {
+                        label: r"(?m)^[^A-Za-z\n]*Do you trust",
+                        sequence: b"\r",
+                    },
+                    DismissPattern {
+                        label: r"(?m)^[^A-Za-z\n]*Please restart",
+                        sequence: b"\r",
+                    },
                     // #1069: version-update modal blocks agent until operator
                     // selects an option. "2\r" = "Skip" (least invasive).
-                    (r"(?m)^[^A-Za-z\n]*Update available!", b"2\r"),
+                    DismissPattern {
+                        label: r"(?m)^[^A-Za-z\n]*Update available!",
+                        sequence: b"2\r",
+                    },
                 ],
                 // Codex: "resume --last" → fresh start drops the resume subcommand
                 fresh_args: Some(&["--dangerously-bypass-approvals-and-sandbox"]),
@@ -380,10 +408,22 @@ impl Backend {
                     // Issue #468: anchored regex (see ClaudeCode comment above).
                     // #1069: Esc = "Skip" (don't auto-update; let operator decide).
                     // #1087: `*` instead of `{0,8}` — TUI centered modals have 40+ char prefix.
-                    (r"(?m)^[^A-Za-z\n]*Update Available", b"\x1b"),
-                    (r"(?m)^[^A-Za-z\n]*Skip  Confirm", b"\x1b"),
-                    (r"(?m)^[^A-Za-z\n]*Update Complete", b"\r"),
-                    (r"(?m)^[^A-Za-z\n]*Please restart", b"\r"),
+                    DismissPattern {
+                        label: r"(?m)^[^A-Za-z\n]*Update Available",
+                        sequence: b"\x1b",
+                    },
+                    DismissPattern {
+                        label: r"(?m)^[^A-Za-z\n]*Skip  Confirm",
+                        sequence: b"\x1b",
+                    },
+                    DismissPattern {
+                        label: r"(?m)^[^A-Za-z\n]*Update Complete",
+                        sequence: b"\r",
+                    },
+                    DismissPattern {
+                        label: r"(?m)^[^A-Za-z\n]*Please restart",
+                        sequence: b"\r",
+                    },
                 ],
                 fresh_args: None, // same as args (resume is in resume_mode, not args)
                 fleet_mcp_supported: true,
@@ -412,8 +452,14 @@ impl Backend {
                 // Gemini's Ink-based TUI renders dialogs with `│ ` prefix at
                 // line start, which the anchor accepts.
                 dismiss_patterns: &[
-                    (r"(?m)^[^A-Za-z\n]{0,8}Allow execution of MCP tool", b"3\n"),
-                    (r"(?m)^[^A-Za-z\n]{0,8}Allow execution of:", b"2\n"),
+                    DismissPattern {
+                        label: r"(?m)^[^A-Za-z\n]{0,8}Allow execution of MCP tool",
+                        sequence: b"3\n",
+                    },
+                    DismissPattern {
+                        label: r"(?m)^[^A-Za-z\n]{0,8}Allow execution of:",
+                        sequence: b"2\n",
+                    },
                 ],
                 fresh_args: None, // same as args (resume is in resume_mode, not args)
                 fleet_mcp_supported: true,
@@ -446,7 +492,10 @@ impl Backend {
                 // pre-selects "Yes, I trust this folder" (cursor `>` marker
                 // on first row), so Enter alone confirms. Mirrors Codex's
                 // "Do you trust" pattern with anchored regex per #468.
-                dismiss_patterns: &[(r"(?m)^[^A-Za-z\n]{0,8}Yes, I trust", b"\r")],
+                dismiss_patterns: &[DismissPattern {
+                    label: r"(?m)^[^A-Za-z\n]{0,8}Yes, I trust",
+                    sequence: b"\r",
+                }],
                 fresh_args: None,
                 // #995 Bug 3: AGY discovers `<workdir>/.antigravitycli/mcp_config.json`
                 // for project-ID storage but its `mcpServers` map is ignored —
@@ -1066,8 +1115,8 @@ mod tests {
         assert_eq!(agy.command, "agy");
         assert!(agy.args.contains(&"--dangerously-skip-permissions"));
         assert_eq!(agy.dismiss_patterns.len(), 1, "#995 trust dismiss");
-        assert!(agy.dismiss_patterns[0].0.contains("Yes, I trust"));
-        assert_eq!(agy.dismiss_patterns[0].1, b"\r");
+        assert!(agy.dismiss_patterns[0].label.contains("Yes, I trust"));
+        assert_eq!(agy.dismiss_patterns[0].sequence, b"\r");
         assert_eq!(agy.instructions_path, "AGY.md");
     }
 
@@ -1116,18 +1165,18 @@ mod tests {
         let trust = claude
             .dismiss_patterns
             .iter()
-            .find(|(re, _)| re.contains("Yes, I trust"))
+            .find(|dp| dp.label.contains("Yes, I trust"))
             .expect("ClaudeCode must have a `Yes, I trust` dismiss pattern");
 
         assert_eq!(
-            trust.1, b"\r",
+            trust.sequence, b"\r",
             "#996 Phase 1: trust-prompt keystroke must be single Enter"
         );
 
         // Negative pin: no ESC bytes allowed — historical up-arrow (\x1b[A)
         // and any other CSI sequence in the keystroke is a regression.
         assert!(
-            !trust.1.contains(&0x1b),
+            !trust.sequence.contains(&0x1b),
             "#996: trust dismiss keystroke must not contain ESC (0x1b)"
         );
     }
@@ -1150,12 +1199,12 @@ mod tests {
         let entry = kiro
             .dismiss_patterns
             .iter()
-            .find(|(re, _)| re.contains("No, exit"))
+            .find(|dp| dp.label.contains("No, exit"))
             .expect("KiroCli must have a `No, exit` dismiss pattern");
 
         // Positive pin: exact keystroke shape Down + Enter
         assert_eq!(
-            entry.1, b"\x1b[B\r",
+            entry.sequence, b"\x1b[B\r",
             "#996 Phase 2a: kiro trust-all-tools dismiss must walk off the \
              destructive default (\\x1b[B = Down) before confirming (\\r). \
              Empirical evidence: kiro-tooluse.raw byte offsets 5900 + 6691 \
@@ -1165,7 +1214,7 @@ mod tests {
         // Negative pin: must NOT collapse to bare Enter — that would EXIT kiro
         // on the empirically-verified destructive default.
         assert_ne!(
-            entry.1, b"\r",
+            entry.sequence, b"\r",
             "#996 Phase 2a regression guard: bare Enter would select kiro's \
              destructive default (`No, exit`). Verify `kiro-tooluse.raw` \
              fixture before changing the keystroke shape."
@@ -1175,10 +1224,10 @@ mod tests {
         // some other CSI sequence. Defends against off-by-one keystroke
         // typos like `\x1b[A` (Up — wrong direction).
         assert!(
-            entry.1.starts_with(b"\x1b[B"),
+            entry.sequence.starts_with(b"\x1b[B"),
             "#996 Phase 2a: keystroke must start with Down-arrow CSI \
              (\\x1b[B), got: {:?}",
-            entry.1
+            entry.sequence
         );
     }
 
@@ -1498,10 +1547,10 @@ mod tests {
         let entry = codex
             .dismiss_patterns
             .iter()
-            .find(|(re, _)| re.contains("Update available!"))
+            .find(|dp| dp.label.contains("Update available!"))
             .expect("#1069: codex must have an `Update available!` dismiss pattern");
         assert_eq!(
-            entry.1, b"2\r",
+            entry.sequence, b"2\r",
             "#1069: keystroke must be `2\\r` (option 2 = Skip)"
         );
     }
@@ -1509,11 +1558,12 @@ mod tests {
     #[test]
     fn codex_update_dismiss_anchored_rejects_mid_line() {
         let codex = Backend::Codex.preset();
-        let (pattern, _) = codex
+        let pattern = codex
             .dismiss_patterns
             .iter()
-            .find(|(re, _)| re.contains("Update available!"))
-            .expect("#1069: codex update dismiss pattern must exist");
+            .find(|dp| dp.label.contains("Update available!"))
+            .expect("#1069: codex update dismiss pattern must exist")
+            .label;
         let re = regex::Regex::new(pattern).expect("pattern must compile");
         assert!(
             re.is_match("✨ Update available! 0.132.0 -> 0.133.0"),
@@ -1537,10 +1587,10 @@ mod tests {
         let entry = oc
             .dismiss_patterns
             .iter()
-            .find(|(re, _)| re.contains("Update Available"))
+            .find(|dp| dp.label.contains("Update Available"))
             .expect("#1069: opencode must have an `Update Available` dismiss pattern");
         assert_eq!(
-            entry.1, b"\x1b",
+            entry.sequence, b"\x1b",
             "#1069: keystroke must be ESC (skip update, not confirm)"
         );
     }
@@ -1548,11 +1598,12 @@ mod tests {
     #[test]
     fn opencode_update_dismiss_anchored_rejects_mid_line() {
         let oc = Backend::OpenCode.preset();
-        let (pattern, _) = oc
+        let pattern = oc
             .dismiss_patterns
             .iter()
-            .find(|(re, _)| re.contains("Update Available"))
-            .expect("#1069: opencode Update Available pattern must exist");
+            .find(|dp| dp.label.contains("Update Available"))
+            .expect("#1069: opencode Update Available pattern must exist")
+            .label;
         let re = regex::Regex::new(pattern).expect("pattern must compile");
         assert!(
             re.is_match("  Update Available"),

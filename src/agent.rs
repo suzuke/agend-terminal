@@ -716,7 +716,7 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
             b.preset()
                 .dismiss_patterns
                 .iter()
-                .map(|(p, k)| (p.to_string(), k.to_vec()))
+                .map(|dp| (dp.label.to_string(), dp.sequence.to_vec()))
                 .collect()
         })
         .unwrap_or_default();
