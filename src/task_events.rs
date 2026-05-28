@@ -625,7 +625,21 @@ impl TaskBoardState {
         // Touch-update timestamp for status mutations so on-board
         // `updated_at` mirrors tasks.json's pre-cutover surface.
         let touch_at = env.timestamp.clone();
-        match &env.event {
+        self.apply_event(&env.event, &task_id, &env.instance, &touch_at);
+        if let Some(t) = self.tasks.get_mut(env.event.task_id()) {
+            t.history.push(history_entry);
+        }
+        true
+    }
+
+    fn apply_event(
+        &mut self,
+        event: &TaskEvent,
+        task_id: &TaskId,
+        instance: &InstanceName,
+        touch_at: &str,
+    ) {
+        match event {
             TaskEvent::Created {
                 title,
                 description,
@@ -641,192 +655,238 @@ impl TaskBoardState {
                 parent_id,
                 ..
             } => {
-                self.tasks
-                    .entry(task_id.clone())
-                    .or_insert_with(|| TaskRecord {
-                        id: task_id,
-                        title: title.clone(),
-                        description: description.clone(),
-                        priority: priority.clone(),
-                        status: TaskStatus::Open,
-                        owner: owner.clone(),
-                        linked_prs: Vec::new(),
-                        block_reason: None,
-                        history: Vec::new(),
-                        created_by: env.instance.clone(),
-                        created_at: env.timestamp.clone(),
-                        updated_at: env.timestamp.clone(),
-                        due_at: due_at.clone(),
-                        depends_on: depends_on.clone(),
-                        routed_to: routed_to.clone(),
-                        result: None,
-                        branch: branch.clone(),
-                        bind: *bind,
-                        started_at: None,
-                        eta_secs: *eta_secs,
-                        tags: tags.clone(),
-                        parent_id: parent_id.clone(),
-                        metadata: BTreeMap::new(),
-                    });
+                self.apply_created(
+                    task_id,
+                    instance,
+                    touch_at,
+                    title,
+                    description,
+                    priority,
+                    owner,
+                    due_at,
+                    depends_on,
+                    routed_to,
+                    branch,
+                    bind,
+                    eta_secs,
+                    tags,
+                    parent_id,
+                );
             }
             TaskEvent::Claimed { by, .. } => {
-                if let Some(t) = self.tasks.get_mut(&task_id) {
-                    t.status = TaskStatus::Claimed;
-                    t.owner = Some(by.clone());
-                    // Claim transfers clear team-routing residue.
-                    t.routed_to = None;
-                    t.updated_at = touch_at;
-                }
+                self.apply_status_with_owner(task_id, touch_at, TaskStatus::Claimed, Some(by), true)
             }
-            TaskEvent::InProgress { by, .. } => {
-                if let Some(t) = self.tasks.get_mut(&task_id) {
-                    t.status = TaskStatus::InProgress;
-                    t.owner = Some(by.clone());
-                    t.updated_at = touch_at.clone();
-                    // #807 Item 3: stamp started_at on FIRST transition
-                    // to InProgress (renamed from dispatched_at — the
-                    // value lands here post-claim, not at send()).
-                    // Subsequent re-entries (Released → Claimed →
-                    // InProgress cycle) preserve the original stamp.
-                    if t.started_at.is_none() {
-                        t.started_at = Some(touch_at);
-                    }
-                }
-            }
+            TaskEvent::InProgress { by, .. } => self.apply_in_progress(task_id, touch_at, by),
             TaskEvent::Verified { .. } => {
-                if let Some(t) = self.tasks.get_mut(&task_id) {
-                    t.status = TaskStatus::Verified;
-                    t.updated_at = touch_at;
-                }
+                self.apply_simple_status(task_id, touch_at, TaskStatus::Verified)
             }
-            TaskEvent::Done { source, .. } => {
-                if let Some(t) = self.tasks.get_mut(&task_id) {
-                    t.status = TaskStatus::Done;
-                    t.updated_at = touch_at;
-                    if let DoneSource::OperatorManual { result, .. } = source {
-                        t.result = result.clone();
-                    }
-                }
-            }
-            TaskEvent::Cancelled { .. } => {
-                if let Some(t) = self.tasks.get_mut(&task_id) {
-                    t.status = TaskStatus::Cancelled;
-                    t.updated_at = touch_at.clone();
-                }
-                let children: Vec<TaskId> = self
-                    .tasks
-                    .iter()
-                    .filter(|(_, t)| t.parent_id.as_ref() == Some(&task_id))
-                    .filter(|(_, t)| matches!(t.status, TaskStatus::Open | TaskStatus::Claimed))
-                    .map(|(id, _)| id.clone())
-                    .collect();
-                for child_id in children {
-                    if let Some(child) = self.tasks.get_mut(&child_id) {
-                        child.status = TaskStatus::Cancelled;
-                        child.updated_at = touch_at.clone();
-                    }
-                }
-            }
-            TaskEvent::Linked { pr_id, .. } => {
-                if let Some(t) = self.tasks.get_mut(&task_id) {
-                    if !t.linked_prs.contains(pr_id) {
-                        t.linked_prs.push(*pr_id);
-                    }
-                    t.updated_at = touch_at;
-                }
-            }
-            TaskEvent::Blocked { reason, .. } => {
-                if let Some(t) = self.tasks.get_mut(&task_id) {
-                    t.status = TaskStatus::Blocked;
-                    t.block_reason = Some(reason.clone());
-                    t.updated_at = touch_at;
-                }
-            }
-            TaskEvent::Unblocked { .. } => {
-                if let Some(t) = self.tasks.get_mut(&task_id) {
-                    if t.status == TaskStatus::Blocked {
-                        t.status = TaskStatus::Open;
-                    }
-                    t.block_reason = None;
-                    t.updated_at = touch_at;
-                }
-            }
+            TaskEvent::Done { source, .. } => self.apply_done(task_id, touch_at, source),
+            TaskEvent::Cancelled { .. } => self.apply_cancelled(task_id, touch_at),
+            TaskEvent::Linked { pr_id, .. } => self.apply_linked(task_id, touch_at, *pr_id),
+            TaskEvent::Blocked { reason, .. } => self.apply_blocked(task_id, touch_at, reason),
+            TaskEvent::Unblocked { .. } => self.apply_unblocked(task_id, touch_at),
             TaskEvent::Reopened { .. } => {
-                if let Some(t) = self.tasks.get_mut(&task_id) {
-                    t.status = TaskStatus::Open;
-                    // Reopened preserves owner: done→open is typically the
-                    // same person re-doing the work after CI fail / revert.
-                    t.updated_at = touch_at;
-                }
+                self.apply_simple_status(task_id, touch_at, TaskStatus::Open)
             }
             TaskEvent::Released { .. } => {
-                if let Some(t) = self.tasks.get_mut(&task_id) {
-                    t.status = TaskStatus::Open;
-                    t.owner = None;
-                    t.routed_to = None;
-                    t.updated_at = touch_at;
-                }
+                self.apply_status_with_owner(task_id, touch_at, TaskStatus::Open, None, true)
             }
             TaskEvent::MovedToBacklog { .. } => {
-                if let Some(t) = self.tasks.get_mut(&task_id) {
-                    t.status = TaskStatus::Backlog;
-                    t.updated_at = touch_at;
-                }
+                self.apply_simple_status(task_id, touch_at, TaskStatus::Backlog)
             }
             TaskEvent::MovedToReview { .. } => {
-                if let Some(t) = self.tasks.get_mut(&task_id) {
-                    t.status = TaskStatus::InReview;
-                    t.updated_at = touch_at;
-                }
+                self.apply_simple_status(task_id, touch_at, TaskStatus::InReview)
             }
-            TaskEvent::TaskCloseProposed { .. } => {
-                // Proposal events are audit-only — they do NOT mutate
-                // task status. The operator-confirm path emits a real
-                // `Done` event after approval.
-                if let Some(t) = self.tasks.get_mut(&task_id) {
-                    t.updated_at = touch_at;
-                }
-            }
+            TaskEvent::TaskCloseProposed { .. } => self.apply_touch_only(task_id, touch_at),
             TaskEvent::OwnerAssigned {
                 owner, routed_to, ..
-            } => {
-                if let Some(t) = self.tasks.get_mut(&task_id) {
-                    t.owner = owner.clone();
-                    t.routed_to = routed_to.clone();
-                    t.updated_at = touch_at;
-                    // Status NOT changed — distinct from Claimed which
-                    // sets status=Claimed.
-                }
-            }
+            } => self.apply_owner_assigned(task_id, touch_at, owner, routed_to),
             TaskEvent::PriorityChanged { priority, .. } => {
-                if let Some(t) = self.tasks.get_mut(&task_id) {
+                if let Some(t) = self.tasks.get_mut(task_id) {
                     t.priority = priority.clone();
-                    t.updated_at = touch_at;
+                    t.updated_at = touch_at.to_string();
                 }
             }
             TaskEvent::DescriptionUpdated { description, .. } => {
-                if let Some(t) = self.tasks.get_mut(&task_id) {
+                if let Some(t) = self.tasks.get_mut(task_id) {
                     t.description = description.clone();
-                    t.updated_at = touch_at;
+                    t.updated_at = touch_at.to_string();
                 }
             }
             TaskEvent::TagsSet { tags, .. } => {
-                if let Some(t) = self.tasks.get_mut(&task_id) {
+                if let Some(t) = self.tasks.get_mut(task_id) {
                     t.tags = tags.clone();
-                    t.updated_at = touch_at;
+                    t.updated_at = touch_at.to_string();
                 }
             }
             TaskEvent::MetadataSet { key, value, .. } => {
-                if let Some(t) = self.tasks.get_mut(&task_id) {
+                if let Some(t) = self.tasks.get_mut(task_id) {
                     t.metadata.insert(key.clone(), value.clone());
-                    t.updated_at = touch_at;
+                    t.updated_at = touch_at.to_string();
                 }
             }
         }
-        if let Some(t) = self.tasks.get_mut(env.event.task_id()) {
-            t.history.push(history_entry);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_created(
+        &mut self,
+        task_id: &TaskId,
+        instance: &InstanceName,
+        touch_at: &str,
+        title: &str,
+        description: &str,
+        priority: &str,
+        owner: &Option<InstanceName>,
+        due_at: &Option<String>,
+        depends_on: &[TaskId],
+        routed_to: &Option<InstanceName>,
+        branch: &Option<String>,
+        bind: &Option<bool>,
+        eta_secs: &Option<i64>,
+        tags: &[String],
+        parent_id: &Option<TaskId>,
+    ) {
+        self.tasks
+            .entry(task_id.clone())
+            .or_insert_with(|| TaskRecord {
+                id: task_id.clone(),
+                title: title.to_string(),
+                description: description.to_string(),
+                priority: priority.to_string(),
+                status: TaskStatus::Open,
+                owner: owner.clone(),
+                linked_prs: Vec::new(),
+                block_reason: None,
+                history: Vec::new(),
+                created_by: instance.clone(),
+                created_at: touch_at.to_string(),
+                updated_at: touch_at.to_string(),
+                due_at: due_at.clone(),
+                depends_on: depends_on.to_vec(),
+                routed_to: routed_to.clone(),
+                result: None,
+                branch: branch.clone(),
+                bind: *bind,
+                started_at: None,
+                eta_secs: *eta_secs,
+                tags: tags.to_vec(),
+                parent_id: parent_id.clone(),
+                metadata: BTreeMap::new(),
+            });
+    }
+
+    fn apply_simple_status(&mut self, task_id: &TaskId, touch_at: &str, status: TaskStatus) {
+        if let Some(t) = self.tasks.get_mut(task_id) {
+            t.status = status;
+            t.updated_at = touch_at.to_string();
         }
-        true
+    }
+
+    fn apply_status_with_owner(
+        &mut self,
+        task_id: &TaskId,
+        touch_at: &str,
+        status: TaskStatus,
+        owner: Option<&InstanceName>,
+        clear_routed: bool,
+    ) {
+        if let Some(t) = self.tasks.get_mut(task_id) {
+            t.status = status;
+            t.owner = owner.cloned();
+            if clear_routed {
+                t.routed_to = None;
+            }
+            t.updated_at = touch_at.to_string();
+        }
+    }
+
+    fn apply_in_progress(&mut self, task_id: &TaskId, touch_at: &str, by: &InstanceName) {
+        if let Some(t) = self.tasks.get_mut(task_id) {
+            t.status = TaskStatus::InProgress;
+            t.owner = Some(by.clone());
+            t.updated_at = touch_at.to_string();
+            if t.started_at.is_none() {
+                t.started_at = Some(touch_at.to_string());
+            }
+        }
+    }
+
+    fn apply_done(&mut self, task_id: &TaskId, touch_at: &str, source: &DoneSource) {
+        if let Some(t) = self.tasks.get_mut(task_id) {
+            t.status = TaskStatus::Done;
+            t.updated_at = touch_at.to_string();
+            if let DoneSource::OperatorManual { result, .. } = source {
+                t.result = result.clone();
+            }
+        }
+    }
+
+    fn apply_cancelled(&mut self, task_id: &TaskId, touch_at: &str) {
+        if let Some(t) = self.tasks.get_mut(task_id) {
+            t.status = TaskStatus::Cancelled;
+            t.updated_at = touch_at.to_string();
+        }
+        let children: Vec<TaskId> = self
+            .tasks
+            .iter()
+            .filter(|(_, t)| t.parent_id.as_ref() == Some(task_id))
+            .filter(|(_, t)| matches!(t.status, TaskStatus::Open | TaskStatus::Claimed))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for child_id in children {
+            if let Some(child) = self.tasks.get_mut(&child_id) {
+                child.status = TaskStatus::Cancelled;
+                child.updated_at = touch_at.to_string();
+            }
+        }
+    }
+
+    fn apply_linked(&mut self, task_id: &TaskId, touch_at: &str, pr_id: PrId) {
+        if let Some(t) = self.tasks.get_mut(task_id) {
+            if !t.linked_prs.contains(&pr_id) {
+                t.linked_prs.push(pr_id);
+            }
+            t.updated_at = touch_at.to_string();
+        }
+    }
+
+    fn apply_blocked(&mut self, task_id: &TaskId, touch_at: &str, reason: &str) {
+        if let Some(t) = self.tasks.get_mut(task_id) {
+            t.status = TaskStatus::Blocked;
+            t.block_reason = Some(reason.to_string());
+            t.updated_at = touch_at.to_string();
+        }
+    }
+
+    fn apply_unblocked(&mut self, task_id: &TaskId, touch_at: &str) {
+        if let Some(t) = self.tasks.get_mut(task_id) {
+            if t.status == TaskStatus::Blocked {
+                t.status = TaskStatus::Open;
+            }
+            t.block_reason = None;
+            t.updated_at = touch_at.to_string();
+        }
+    }
+
+    fn apply_touch_only(&mut self, task_id: &TaskId, touch_at: &str) {
+        if let Some(t) = self.tasks.get_mut(task_id) {
+            t.updated_at = touch_at.to_string();
+        }
+    }
+
+    fn apply_owner_assigned(
+        &mut self,
+        task_id: &TaskId,
+        touch_at: &str,
+        owner: &Option<InstanceName>,
+        routed_to: &Option<InstanceName>,
+    ) {
+        if let Some(t) = self.tasks.get_mut(task_id) {
+            t.owner = owner.clone();
+            t.routed_to = routed_to.clone();
+            t.updated_at = touch_at.to_string();
+        }
     }
 }
 
