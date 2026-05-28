@@ -1034,7 +1034,6 @@ impl MockCiProvider {
     /// hitting GitHub. The seed is sticky (not consumed on read)
     /// so a multi-poll test sees the same state across cycles
     /// unless explicitly transitioned via `set_mergeable`.
-    #[allow(dead_code)]
     fn with_mergeable(self, state: MergeableState) -> Self {
         *self.mergeable.lock() = state;
         self
@@ -1053,7 +1052,6 @@ impl MockCiProvider {
         *self.pr_state.lock() = state;
     }
 
-    #[allow(dead_code)]
     fn with_jobs(self, run_id: u64, jobs: Vec<super::CiJob>) -> Self {
         self.jobs.lock().insert(run_id, jobs);
         self

@@ -620,7 +620,6 @@ impl StatePatterns {
 /// the same compiled patterns.
 ///
 /// Stacking dep: production caller wired in S2-T4 (daemon watchdog).
-#[allow(dead_code)]
 pub fn classify_pty_output(
     backend: &crate::backend::Backend,
     output: &str,

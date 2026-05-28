@@ -19,5 +19,4 @@ pub fn binding_path(home: &Path, agent: &str) -> PathBuf {
 }
 
 /// Binding state filename.
-#[allow(dead_code)]
 pub const BINDING_FILENAME: &str = "binding.json";

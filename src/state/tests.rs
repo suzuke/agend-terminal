@@ -1585,7 +1585,6 @@ struct ReplayFixture {
     // future-compat metadata marker; no runtime enforcement Phase 1.
     // See docs/F685-FIXTURE-CORPUS.md §F685-CORPUS.2.
     #[serde(default)]
-    #[allow(dead_code)]
     scenario_kind: Option<String>,
     #[serde(default)]
     #[allow(dead_code)]
@@ -1603,7 +1602,6 @@ struct ReplayFixture {
     #[allow(dead_code)]
     provenance: Option<String>,
     #[serde(default = "default_schema_version")]
-    #[allow(dead_code)]
     schema_version: u32,
 }
 

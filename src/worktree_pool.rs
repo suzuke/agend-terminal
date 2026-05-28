@@ -467,7 +467,6 @@ pub fn unpin(worktree_path: &Path) {
 }
 
 /// Check if a worktree is pinned.
-#[allow(dead_code)]
 pub fn is_pinned(worktree_path: &Path) -> bool {
     worktree_path.join(".agend-pinned").exists()
 }

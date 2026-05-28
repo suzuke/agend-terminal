@@ -136,7 +136,6 @@ pub fn scan_existing_branch_binding(
 /// then reads disk and populates. Disk read under write lock
 /// prevents stale resurrection when a concurrent unbind() deletes
 /// the file between our miss and our insert.
-#[allow(dead_code)] // Used by tests + Phase 2
 pub fn read(home: &Path, agent: &str) -> Option<serde_json::Value> {
     let key = index_key(home, agent);
     if let Ok(map) = binding_index().read() {

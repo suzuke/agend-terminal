@@ -269,7 +269,6 @@ impl GitHubCiProvider {
         Self::with_base_url("https://api.github.com".to_string())
     }
 
-    #[allow(dead_code)] // used by auto-detect for GHE; wired in this PR
     pub fn with_base_url(base_url: String) -> anyhow::Result<Self> {
         Ok(Self {
             http: CiHttpClient::with_accept(
@@ -575,7 +574,6 @@ impl GitLabCiProvider {
         Self::with_base_url("https://gitlab.com".to_string())
     }
 
-    #[allow(dead_code)] // wired in Sprint 39 PR-3 (fleet.yaml ci_provider config)
     pub fn with_base_url(base_url: String) -> anyhow::Result<Self> {
         Ok(Self {
             http: CiHttpClient::new(base_url, "api/v4", || {

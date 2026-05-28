@@ -6,7 +6,6 @@ use teloxide::payloads::SetMessageReactionSetters;
 use teloxide::prelude::Requester;
 
 /// Map emoji name to Unicode character.
-#[allow(dead_code)]
 pub(super) fn map_emoji_name(name: &str) -> &str {
     match name {
         "thumbsup" | "thumbs_up" => "👍",

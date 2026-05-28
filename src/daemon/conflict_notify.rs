@@ -36,24 +36,20 @@ use std::path::Path;
 /// Stale threshold — escalate to operator if conflict still active
 /// after 30 minutes. Mirror of `waiting_on_stale::STALE_THRESHOLD_SECS`
 /// pattern; tuned per spike Q3.
-#[allow(dead_code)] // daemon conflict detection; used in tests
 pub(crate) const STALE_THRESHOLD_SECS: i64 = 30 * 60;
 
 /// Re-alert suppression: 30 minutes between repeated escalations for
 /// the same agent. Prevents telegram spam when the operator can't
 /// resolve immediately.
-#[allow(dead_code)] // daemon conflict detection; used in tests
 pub(crate) const REALERT_INTERVAL_SECS: i64 = 30 * 60;
 
 /// Scan throttle: 30 ticks × 10s = 5 min cadence. Matches
 /// `waiting_on_stale` + `idle_watchdog` + `anti_stall`.
-#[allow(dead_code)] // daemon conflict detection; used in tests
 pub(crate) const TICKS_PER_SCAN: u64 = 30;
 
 /// Per-tick conflict-notify tracker. Mirrors
 /// [`crate::daemon::waiting_on_stale::WaitingOnStaleTracker`].
 #[derive(Debug, Default)]
-#[allow(dead_code)] // daemon conflict detection; used in tests
 pub(crate) struct ConflictNotifyTracker {
     tick_count: u64,
     /// agent → moment of first conflict observation (for stale gate).
@@ -78,7 +74,6 @@ impl ConflictNotifyTracker {
     /// For agents transitioning OUT of `GitConflict`: drop
     /// `last_conflict_at` entry. `waiting_on` is left for operator
     /// manual clear per spike Q3.
-    #[allow(dead_code)] // daemon conflict detection; used in tests
     pub(crate) fn maybe_scan(
         &mut self,
         home: &Path,
@@ -213,7 +208,6 @@ fn emit_telegram_escalation(home: &Path, agent: &str) {
 /// DD / AU / UA / UD / DU per `git status` docs). Returns paths
 /// trimmed of the 3-char prefix (`XY ` → start of path). Empty Vec
 /// on git failure or no conflicts.
-#[allow(dead_code)] // daemon conflict detection; used in tests
 pub(crate) fn discover_conflicted_files(worktree: &Path) -> Vec<String> {
     let output = std::process::Command::new("git")
         .args(["status", "--porcelain"])
@@ -258,7 +252,6 @@ pub(crate) fn discover_conflicted_files(worktree: &Path) -> Vec<String> {
 /// `.git/REBASE_HEAD` (single-step), `.git/rebase-merge/` (interactive
 /// or merge-based), `.git/rebase-apply/` (am-based). Any of the three
 /// signals an in-flight rebase.
-#[allow(dead_code)] // daemon conflict detection; used in tests
 pub(crate) fn discover_operation_type(worktree: &Path) -> Option<&'static str> {
     let git_dir = worktree.join(".git");
     if git_dir.join("REBASE_HEAD").exists()
@@ -280,7 +273,6 @@ pub(crate) fn discover_operation_type(worktree: &Path) -> Option<&'static str> {
 /// detected event. Pure function — composes the JSON from the
 /// discovered context. Caller is responsible for actually sending
 /// via `crate::inbox::notify_agent`.
-#[allow(dead_code)] // daemon conflict detection; used in tests
 pub(crate) fn build_notify_payload(
     operation: &str,
     conflicted_files: &[String],

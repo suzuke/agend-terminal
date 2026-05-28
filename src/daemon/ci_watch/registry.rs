@@ -106,7 +106,6 @@ pub(super) fn update_watch_state(watch_path: &Path, run_id: Option<u64>, head_sh
 /// (#1026). Retained for tests; production path uses
 /// `flush_watch_state` after in-memory mutation.
 #[cfg(test)]
-#[allow(dead_code)]
 pub(super) fn update_watch_state_with_notify(
     watch_path: &Path,
     run_id: Option<u64>,

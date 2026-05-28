@@ -11,7 +11,6 @@ use teloxide::prelude::Requester;
 use teloxide::types::MessageId;
 
 /// Send a reply from an agent to Telegram (called from MCP reply tool).
-#[allow(dead_code)]
 pub fn send_reply(
     state: &Arc<Mutex<TelegramState>>,
     instance_name: &str,

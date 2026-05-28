@@ -57,10 +57,8 @@ pub struct TelegramState {
     /// `.expect("telegram bot not initialized")`; contract tests never
     /// reach those paths (see `src/channel/contract.rs` scope comment).
     pub bot: Option<Bot>,
-    #[allow(dead_code)]
     pub group_id: ChatId,
     pub topic_to_instance: HashMap<i32, String>,
-    #[allow(dead_code)]
     pub instance_to_topic: HashMap<String, i32>,
     pub home: PathBuf,
     /// Submit key per instance (for PTY notification injection).

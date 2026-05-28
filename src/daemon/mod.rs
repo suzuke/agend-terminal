@@ -16,7 +16,6 @@ pub(crate) mod event_bus;
 pub(crate) mod heartbeat_pair;
 pub(crate) mod helper_staleness_watchdog;
 pub(crate) mod idle_watchdog;
-pub(crate) mod legacy_backfill;
 pub(crate) mod lifecycle;
 pub(crate) mod mcp_registry_watcher;
 pub(crate) mod notification_dedup;
@@ -74,7 +73,6 @@ pub(crate) enum ShutdownReason {
     /// Reserved for explicit clean shutdown without any external
     /// trigger (currently unused; kept in the taxonomy for forward
     /// compat with future "graceful exit on completion" code paths).
-    #[allow(dead_code)]
     CleanExit = 4,
     /// Sprint 60 W1 PR-3 (#P0-3): operator-initiated restart via the
     /// `restart_daemon` MCP tool. Differs from `ApiShutdown` in that
@@ -88,7 +86,6 @@ pub(crate) enum ShutdownReason {
     /// install path. Currently set by no production handler — the
     /// app's `install_term_only` is SIGTERM-only, and daemon's
     /// ctrlc-based `install` records `Signal`.
-    #[allow(dead_code)]
     SignalSigint = 6,
     /// Sprint 63 W1 PR-3 (Sprint 58 P2 #6): SIGTERM specifically.
     /// Set by `bootstrap::signals::install_term_only` (the app's
@@ -99,7 +96,6 @@ pub(crate) enum ShutdownReason {
     /// Set by future per-signal daemon migration. No current
     /// production handler distinguishes SIGHUP from the bundled
     /// `Signal` reason.
-    #[allow(dead_code)]
     SignalSighup = 8,
 }
 
