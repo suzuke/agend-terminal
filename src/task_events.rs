@@ -941,14 +941,15 @@ fn max_seq_for_instance(log_path: &Path, instance: &InstanceName) -> anyhow::Res
 
 // ── Replay cache ─────────────────────────────────────────────────────
 // Read-side cache: avoids full-file replay when nothing has changed.
-// Keyed on (home, generation) where generation is a process-wide
-// monotonic counter incremented on every append. This replaces the
-// previous mtime-based key which was unreliable on Linux ext4 where
-// mtime granularity (1ms) is too coarse for rapid concurrent writes.
+// Keyed on (home, generation, file_len) — generation is a process-wide
+// monotonic counter incremented on every in-process append (replaces
+// mtime which was unreliable on Linux ext4 where 1ms granularity
+// caused stale cache hits during rapid concurrent writes). file_len
+// catches external modifications (tests, compaction, manual edits).
 
 static REPLAY_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-type ReplayCacheKey = (std::path::PathBuf, u64);
+type ReplayCacheKey = (std::path::PathBuf, u64, u64);
 
 struct ReplayCacheEntry {
     key: ReplayCacheKey,
@@ -960,7 +961,10 @@ static REPLAY_CACHE: std::sync::LazyLock<parking_lot::Mutex<Option<ReplayCacheEn
 
 fn replay_cache_key(home: &Path) -> ReplayCacheKey {
     let gen = REPLAY_GENERATION.load(std::sync::atomic::Ordering::Acquire);
-    (home.to_path_buf(), gen)
+    let log_len = std::fs::metadata(log_path(home))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    (home.to_path_buf(), gen, log_len)
 }
 
 pub fn invalidate_replay_cache() {
