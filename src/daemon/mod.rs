@@ -7,6 +7,7 @@ pub(crate) mod boot_sweep;
 pub(crate) mod canonical_drift;
 pub(crate) mod ci_watch;
 pub(crate) mod conflict_notify;
+mod crash_respawn;
 pub(crate) mod cron_tick;
 pub(crate) mod decision_timeout;
 pub(crate) mod dedup_state;
@@ -36,7 +37,6 @@ pub(crate) mod waiting_on_stale;
 pub(crate) mod watchdog;
 
 use crate::agent::{self, AgentRegistry};
-use crate::channel::NotifySeverity;
 pub use tui_bridge::serve_agent_tui;
 
 use parking_lot::Mutex;
@@ -179,13 +179,13 @@ pub struct AgentConfig {
 }
 
 /// Shared daemon state threaded through run_core's extracted phases.
-struct DaemonContext {
-    registry: AgentRegistry,
-    externals: crate::agent::ExternalRegistry,
-    configs: Arc<Mutex<HashMap<String, AgentConfig>>>,
-    crash_tx: crossbeam_channel::Sender<crate::agent::AgentExitEvent>,
-    crash_rx: crossbeam_channel::Receiver<crate::agent::AgentExitEvent>,
-    shutdown: Arc<AtomicBool>,
+pub(super) struct DaemonContext {
+    pub(super) registry: AgentRegistry,
+    pub(super) externals: crate::agent::ExternalRegistry,
+    pub(super) configs: Arc<Mutex<HashMap<String, AgentConfig>>>,
+    pub(super) crash_tx: crossbeam_channel::Sender<crate::agent::AgentExitEvent>,
+    pub(super) crash_rx: crossbeam_channel::Receiver<crate::agent::AgentExitEvent>,
+    pub(super) shutdown: Arc<AtomicBool>,
 }
 
 /// Get the PID-isolated run directory for the current daemon.
@@ -456,7 +456,7 @@ fn run_core(
                 spawn_stage2_thread(home, &name, &ctx);
             }
             crate::agent::AgentExitEvent::Crash(name) => {
-                handle_crash_respawn(home, &name, &ctx);
+                crash_respawn::handle_crash_respawn(home, &name, &ctx);
             }
         }
     }
@@ -696,178 +696,6 @@ fn spawn_stage2_thread(home: &Path, name: &str, ctx: &DaemonContext) {
         })
     {
         tracing::warn!(agent = %name, error = %e, "failed to spawn stage2 restart thread");
-    }
-}
-
-fn handle_crash_respawn(home: &Path, crashed_name: &str, ctx: &DaemonContext) {
-    tracing::warn!(agent = %crashed_name, "crashed");
-    crate::event_log::log(home, "crash", crashed_name, "agent crashed");
-
-    let config = match ctx.configs.lock().get(crashed_name).cloned() {
-        Some(c) => c,
-        None => {
-            tracing::debug!(agent = %crashed_name, "no config for respawn (likely deleted)");
-            return;
-        }
-    };
-
-    let (should_respawn, delay, should_notify) = {
-        let reg = agent::lock_registry(&ctx.registry);
-        match reg.get(crashed_name) {
-            Some(handle) => handle.core.lock().health.record_crash(),
-            None => {
-                tracing::warn!(agent = %crashed_name, "not in registry, skipping");
-                return;
-            }
-        }
-    };
-
-    if should_notify {
-        notify_crash(crashed_name, &ctx.registry);
-    }
-
-    if !should_respawn {
-        tracing::warn!(agent = %crashed_name, "max retries exceeded, not respawning");
-        return;
-    }
-
-    tracing::info!(agent = %crashed_name, ?delay, "respawning");
-    let saved_health = {
-        let r = ctx.registry.lock();
-        r.get(crashed_name).map(|h| h.core.lock().health.clone())
-    };
-
-    let reg = Arc::clone(&ctx.registry);
-    let home = home.to_path_buf();
-    let tx = ctx.crash_tx.clone();
-    let shutdown_for_respawn = Arc::clone(&ctx.shutdown);
-    let name_for_err = crashed_name.to_owned();
-    // fire-and-forget: respawn worker is short-lived (sleep delay then
-    // spawn_agent + restore health + start TUI server). Observes
-    // shutdown flag immediately after backoff to abort cleanly.
-    // JoinHandle dropped because Err is logged + crash counter handles accounting.
-    if let Err(e) = std::thread::Builder::new()
-        .name(format!("{crashed_name}_respawn"))
-        .spawn(move || {
-            respawn_agent_worker(
-                &home,
-                config,
-                delay,
-                saved_health,
-                &reg,
-                tx,
-                &shutdown_for_respawn,
-            );
-        })
-    {
-        tracing::warn!(agent = %name_for_err, error = %e, "failed to spawn respawn thread");
-    }
-}
-
-fn notify_crash(crashed_name: &str, registry: &AgentRegistry) {
-    let state = {
-        let reg = agent::lock_registry(registry);
-        reg.get(crashed_name)
-            .map(|h| h.core.lock().health.state.display_name())
-            .unwrap_or("unknown")
-    };
-    tracing::warn!(agent = %crashed_name, %state, "notifying");
-    let msg = format!("[health] {crashed_name}: {state}");
-    if let Some(ch) = crate::channel::active_channel() {
-        let _ = crate::channel::gated_notify(
-            ch.as_ref(),
-            crashed_name,
-            NotifySeverity::Error,
-            &msg,
-            false,
-        );
-    } else {
-        tracing::debug!(agent = %crashed_name, "no active channel for crash notification");
-    }
-}
-
-fn respawn_agent_worker(
-    home: &Path,
-    config: AgentConfig,
-    delay: std::time::Duration,
-    saved_health: Option<crate::health::HealthTracker>,
-    reg: &AgentRegistry,
-    tx: crossbeam_channel::Sender<crate::agent::AgentExitEvent>,
-    shutdown: &Arc<AtomicBool>,
-) {
-    std::thread::sleep(delay);
-    if shutdown.load(Ordering::Relaxed) {
-        tracing::info!(agent = %config.name, "shutdown during respawn backoff, aborting");
-        return;
-    }
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
-    if let Some(ref wd) = config.working_dir {
-        let skills_filter: Option<Vec<String>> =
-            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
-                .ok()
-                .and_then(|c| c.instances.get(&config.name).and_then(|i| i.skills.clone()));
-        if let Err(e) = crate::skills::install_for_agent(home, wd, skills_filter.as_deref()) {
-            tracing::warn!(agent = %config.name, error = %e, "crash-respawn skills install failed");
-        }
-    }
-    match agent::spawn_agent(
-        &agent::SpawnConfig {
-            name: &config.name,
-            backend_command: &config.backend_command,
-            args: &config.args,
-            spawn_mode: crate::backend::SpawnMode::Fresh,
-            cols,
-            rows,
-            env: config.env.as_ref(),
-            working_dir: config.working_dir.as_deref(),
-            submit_key: &config.submit_key,
-            home: Some(home),
-            crash_tx: Some(tx),
-            shutdown: Some(Arc::clone(shutdown)),
-        },
-        reg,
-    ) {
-        Ok(()) => {
-            tracing::info!(agent = %config.name, "respawned");
-            crate::event_log::log(home, "respawn", &config.name, "agent respawned");
-            {
-                let r = reg.lock();
-                if let Some(handle) = r.get(&config.name) {
-                    let mut core = handle.core.lock();
-                    if let Some(ref old_health) = saved_health {
-                        core.health = old_health.clone();
-                    }
-                    core.health.respawn_ok();
-                }
-            }
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            {
-                let r = reg.lock();
-                if let Some(handle) = r.get(&config.name) {
-                    let reason = handle.core.lock().health.crash_reason().to_string();
-                    let msg = format!(
-                        "[system] Agent restarted due to {reason}. Previous context was lost.\r"
-                    );
-                    let _ = agent::write_to_agent(handle, msg.as_bytes());
-                }
-            }
-            let rdir = run_dir(home);
-            let n = config.name.clone();
-            let n_err = n.clone();
-            let reg2 = Arc::clone(reg);
-            // fire-and-forget: respawn-time TUI server exits when the agent
-            // is removed from the registry (socket-file removal in
-            // delete_transaction).
-            if let Err(e) = std::thread::Builder::new()
-                .name(format!("{n}_tui_server"))
-                .spawn(move || serve_agent_tui(&n, &rdir, &reg2))
-            {
-                tracing::warn!(agent = %n_err, error = %e, "failed to spawn TUI server");
-            }
-        }
-        Err(e) => {
-            tracing::warn!(agent = %config.name, error = %e, "respawn failed");
-        }
     }
 }
 
