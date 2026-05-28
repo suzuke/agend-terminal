@@ -407,7 +407,12 @@ fn run_core(
     let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
     crate::bootstrap::signals::install(Arc::clone(&ctx.shutdown), shutdown_tx);
 
-    crate::event_log::log(home, "daemon_start", "", &format!("{} agents", agents.len()));
+    crate::event_log::log(
+        home,
+        "daemon_start",
+        "",
+        &format!("{} agents", agents.len()),
+    );
     tracing::info!("running, Ctrl+C or `agend-terminal stop` to stop");
 
     let (_keepalive, handlers, tick_rx) = build_tick_infrastructure(home, &ctx);
