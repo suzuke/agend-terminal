@@ -19,11 +19,10 @@ pub(super) fn handle_checkout_repo(home: &Path, args: &Value, instance_name: &st
     // (review pool, operator triage) that materialize a detached-HEAD
     // inspection worktree without claiming it.
     let bind = args["bind"].as_bool().unwrap_or(false);
-    if bind && crate::agent_ops::is_protected_ref(branch) {
-        return json!({
-            "error": format!("E4.5 violation: bind=true rejects protected branch '{branch}'"),
-            "code": "e4_5_protected_branch"
-        });
+    if bind {
+        if let Err(e) = crate::agent_ops::ensure_not_protected_json(branch) {
+            return e;
+        }
     }
     if bind && instance_name.is_empty() {
         return json!({
@@ -467,11 +466,8 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
     // edited in exactly one place. The "main" default at the line
     // above is the backstop the gate catches when callers omit both
     // `branch` and explicit-protected branch — both flows land here.
-    if crate::agent_ops::is_protected_ref(branch) {
-        return json!({
-            "error": format!("E4.5 violation: ci action=watch rejects protected branch '{branch}' — use lead/operator dashboards for protected-ref CI surveillance, not per-agent subscriptions"),
-            "code": "e4_5_protected_branch"
-        });
+    if let Err(e) = crate::agent_ops::ensure_not_protected_json(branch) {
+        return e;
     }
 
     // Reject unsupported providers early with operator-actionable error.

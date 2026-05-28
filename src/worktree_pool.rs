@@ -41,15 +41,7 @@ pub fn lease(
     agent: &str,
     branch: &str,
 ) -> Result<WorktreeLease, String> {
-    // E4.5: reject protected-branch lease. Single source of truth for
-    // the protected set is `agent_ops::is_protected_ref` so adding a
-    // new protected ref propagates here and to every other E4.5 site
-    // (Sprint 57 Wave 2 Track B #546 Item 3).
-    if crate::agent_ops::is_protected_ref(branch) {
-        return Err(format!(
-            "E4.5 violation: cannot lease worktree for protected branch '{branch}'"
-        ));
-    }
+    crate::agent_ops::ensure_not_protected(branch)?;
 
     // Create worktree using existing infrastructure. Sprint 57 Wave 4
     // (#546 Item 4): the new external layout requires `home` to

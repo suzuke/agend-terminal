@@ -240,6 +240,27 @@ pub fn is_protected_ref(branch: &str) -> bool {
     matches!(branch, "main" | "master")
 }
 
+pub fn ensure_not_protected(branch: &str) -> Result<(), String> {
+    if is_protected_ref(branch) {
+        Err(format!(
+            "E4.5 violation: protected branch '{branch}' cannot be used for agent worktrees"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+pub fn ensure_not_protected_json(branch: &str) -> Result<(), serde_json::Value> {
+    if is_protected_ref(branch) {
+        Err(serde_json::json!({
+            "error": format!("E4.5 violation: protected branch '{branch}' rejected"),
+            "code": "e4_5_protected_branch"
+        }))
+    } else {
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Working-directory cleanup (CANONICAL 19-entry list)
 // ---------------------------------------------------------------------------
