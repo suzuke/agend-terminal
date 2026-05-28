@@ -355,9 +355,13 @@ pub(super) fn handle_key(
                 // covers the per-instance working_dir which, for custom
                 // `directory:` deployments, was the user-provided-dir branch
                 // of `cleanup_working_dir` and only stripped agend files.
+                // #1363: remove pane/tab from layout FIRST for instant
+                // UI response, then run the blocking delete + cleanup
+                // in a background thread.
+                let names: Vec<String>;
                 if is_tab {
                     let idx = ctx.layout.active;
-                    let names: Vec<String> = ctx
+                    names = ctx
                         .layout
                         .tabs
                         .get(idx)
@@ -370,30 +374,6 @@ pub(super) fn handle_key(
                             })
                         })
                         .collect();
-                    for name in &names {
-                        // Sprint 54 P1-B Bug 1: full_delete_instance now
-                        // returns Result with residual-store audit on
-                        // partial failure. TUI close logs warn (operator
-                        // is right here at the keyboard and can react);
-                        // the MCP path turns the error into JSON for the
-                        // remote caller. Either way the silent-swallow
-                        // pattern that fed `auto_start_fleet` revival is
-                        // gone.
-                        if let Err(detail) =
-                            crate::mcp::handlers::instance_lifecycle::full_delete_instance(
-                                ctx.home, name,
-                            )
-                        {
-                            tracing::warn!(name, detail = %detail,
-                                "TUI tab close: residual state — operator may need manual cleanup");
-                        }
-                    }
-                    if !names.is_empty() {
-                        // Deployment metadata + custom-directory subdir cleanup.
-                        let _ = crate::deployments::reconcile_after_close(ctx.home, &names);
-                    }
-                    // Layout state is the only piece full_delete_instance
-                    // doesn't touch (it's UI state, not agent state).
                     let _ = ctx.layout.close_tab(idx);
                     outcome.needs_resize = true;
                 } else if let Some(tab) = ctx.layout.active_tab_mut() {
@@ -402,25 +382,30 @@ pub(super) fn handle_key(
                         .root()
                         .find_pane(fid)
                         .and_then(|p| p.fleet_instance_name.clone());
-                    if let Some(ref name) = fleet_name {
-                        // Sprint 54 P1-B Bug 1: see tab-close branch above
-                        // for the Result-vs-warn rationale.
-                        if let Err(detail) =
-                            crate::mcp::handlers::instance_lifecycle::full_delete_instance(
-                                ctx.home, name,
-                            )
-                        {
-                            tracing::warn!(name, detail = %detail,
-                                "TUI pane close: residual state — operator may need manual cleanup");
-                        }
-                        let _ = crate::deployments::reconcile_after_close(
-                            ctx.home,
-                            std::slice::from_ref(name),
-                        );
-                    }
                     if tab.close_focused().is_some() {
                         outcome.needs_resize = true;
                     }
+                    names = fleet_name.into_iter().collect();
+                } else {
+                    names = Vec::new();
+                }
+                if !names.is_empty() {
+                    let home = ctx.home.to_path_buf();
+                    // fire-and-forget: blocking delete + deployment
+                    // cleanup runs off the UI thread
+                    std::thread::spawn(move || {
+                        for name in &names {
+                            if let Err(detail) =
+                                crate::mcp::handlers::instance_lifecycle::full_delete_instance(
+                                    &home, name,
+                                )
+                            {
+                                tracing::warn!(name, detail = %detail,
+                                    "TUI close: residual state — operator may need manual cleanup");
+                            }
+                        }
+                        let _ = crate::deployments::reconcile_after_close(&home, &names);
+                    });
                 }
             }
             _ => {
