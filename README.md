@@ -1,34 +1,49 @@
 [繁體中文](README.zh-TW.md)
 
+[![CI](https://github.com/suzuke/agend-terminal/actions/workflows/ci.yml/badge.svg)](https://github.com/suzuke/agend-terminal/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/agend-terminal)](https://crates.io/crates/agend-terminal)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+![Status: Pre-alpha](https://img.shields.io/badge/Status-Pre--alpha-orange)
+
 # AgEnD Terminal
 
 Orchestrate AI coding agents — not just run them.
 
-> ⚠️ **Pre-alpha.** APIs, CLI flags, and `fleet.yaml` schema may change
-> between minor versions. Not for production use. Pin a specific version
-> and read the release notes before upgrading.
+Declare your entire AI dev team in one `fleet.yaml`. AgEnD Terminal launches each agent as a long-lived PTY process with its own git worktree, wires up inter-agent communication via built-in MCP tools, and keeps everything running with auto-respawn and context handover.
+
+## Features
+
+- **Fleet-as-code** — One YAML file declares every agent's backend, role, working directory, and team membership. `agend-terminal start` brings the whole fleet up.
+- **6 backends** — Claude Code, Codex, Kiro, OpenCode, Gemini CLI, and Antigravity CLI. Swap backends by changing one field.
+- **Built-in agent coordination** — Agents delegate tasks, query each other, and broadcast updates through 35 MCP tools. No glue code.
+- **Automatic git worktree isolation** — Each agent works in its own worktree. No merge conflicts between agents, no accidental cross-contamination.
+- **Crash recovery with context handover** — Agents auto-respawn and resume their conversation. Exponential backoff, health monitoring, and hung detection built in.
+- **Remote control** — Drive the fleet through a multi-pane TUI, Telegram, or Discord. Get notifications when agents need attention.
+
+## Quick Start
 
 ```bash
 cargo install agend-terminal
 agend-terminal quickstart    # Interactive setup in 2 minutes
+agend-terminal start         # Launch the fleet
 ```
 
-## ⚠️ Git Behavior Modification (Important)
+## Architecture
 
-agend-terminal modifies git behavior for spawned agents (PATH shim, commit
-trailers, deny matrix, daemon-managed worktrees). Your own terminal is
-**not** affected.
-
-**Read [`docs/GIT-BEHAVIOR.md`](docs/GIT-BEHAVIOR.md) before starting the daemon** — what gets modified, why, the risk surface, and the opt-out paths are all documented there.
-
-## What It Does
-
-Spawns AI coding agents (Claude Code, Codex, Kiro, OpenCode, Gemini, Antigravity) as
-long-lived PTY processes, each in its own git worktree. A built-in MCP
-server lets agents talk to each other — delegate work, request info,
-broadcast updates — without glue code. Crashes are survived by auto-
-respawn with context handover. Drive the fleet through a multi-tab /
-multi-pane TUI, a Telegram channel, or an optional system tray.
+```mermaid
+graph LR
+    Op[Operator] -->|TUI / Telegram / Discord| D[Daemon]
+    F[fleet.yaml] --> D
+    D --> A1[Agent PTY<br/>Claude Code]
+    D --> A2[Agent PTY<br/>Codex]
+    D --> A3[Agent PTY<br/>Kiro]
+    D --> AN[Agent PTY<br/>...]
+    A1 <-->|MCP bridge| A2
+    A2 <-->|MCP bridge| A3
+    A1 <-->|MCP bridge| A3
+    D ---|worktree per agent| G[(Git repo)]
+    D ---|health monitor<br/>auto-respawn| A1
+```
 
 ## Why Not tmux?
 
@@ -40,29 +55,6 @@ multi-pane TUI, a Telegram channel, or an optional system tray.
 | Multi-agent comms | Custom IPC | Built-in MCP tools |
 | Git isolation | Manual worktrees | Auto per-agent worktree |
 
-## Quick Start
-
-```bash
-# Interactive setup — detects backends, optionally wires Telegram, writes fleet.yaml
-agend-terminal quickstart
-
-# Or hand-write a minimum fleet.yaml and start the daemon:
-cat > ~/.agend/fleet.yaml << 'YAML'
-defaults:
-  backend: claude
-instances:
-  dev:
-    role: "Developer"
-    working_directory: ~/my-project
-  reviewer:
-    role: "Code reviewer"
-    working_directory: ~/my-project
-YAML
-agend-terminal start
-```
-
-For optional Telegram binding (remote control + outbound alerts), see [`docs/USAGE.md` § Channel: Telegram](docs/USAGE.md#channel-telegram).
-
 ## Backends
 
 | Backend | Command | Status |
@@ -71,19 +63,25 @@ For optional Telegram binding (remote control + outbound alerts), see [`docs/USA
 | Kiro CLI | `kiro-cli` | Tested |
 | Codex | `codex` | Tested |
 | OpenCode | `opencode` | Tested |
-| Gemini CLI | `gemini` | Tested (sunsets 2026-06-18 for free/Pro/Ultra; paid Code Assist Standard/Enterprise retain access) |
-| Antigravity CLI | `antigravity-cli` (binary `agy`) | Tested (#987 — Gemini CLI's official successor; #995 polish). **Fleet MCP bridge unsupported in current AGY release** — agy instances spawn without `send`/`inbox`/`task` tools (operators see a `[fleet-mcp-unsupported]` warn in `app.log`). Use for manual work; await upstream fix at `google-antigravity/antigravity-cli`. |
+| Gemini CLI | `gemini` | Tested |
+| Antigravity CLI | `agy` | Tested |
 
-## Learn More
+> Gemini CLI sunsets 2026-06-18 for free/Pro/Ultra tiers. Antigravity CLI is the official successor.
+> Agy does not yet support the Fleet MCP bridge — see [#987](https://github.com/suzuke/agend-terminal/issues/987) for status.
 
-### Feature Guides
+## Documentation
 
-**Getting Started**
-- [Quick Start Guide](docs/FEATURE-quickstart.md)
-- [Fleet Configuration](docs/FEATURE-fleet.md)
+**Start here:**
+- [Quick Start Guide](docs/FEATURE-quickstart.md) — First-run walkthrough
+- [Fleet Configuration](docs/FEATURE-fleet.md) — `fleet.yaml` reference
+- [CLI Reference](docs/CLI.md) — All subcommands
+- [MCP Tools](docs/MCP-TOOLS.md) — 35 agent coordination tools
+
+<details>
+<summary><strong>Feature guides</strong></summary>
+
+**Core**
 - [Agent Interaction](docs/FEATURE-agent-interaction.md)
-
-**Daily Usage**
 - [TUI Interface](docs/FEATURE-tui.md)
 - [Skills System](docs/FEATURE-skills.md)
 - [Communication](docs/FEATURE-communication.md)
@@ -103,15 +101,21 @@ For optional Telegram binding (remote control + outbound alerts), see [`docs/USA
 - [Service Management](docs/FEATURE-service.md)
 - [Diagnostics](docs/FEATURE-diagnostics.md)
 - [Configuration](docs/FEATURE-configuration.md)
+</details>
 
-### Reference
+<details>
+<summary><strong>Reference</strong></summary>
 
-- **Commands** — [`docs/CLI.md`](docs/CLI.md) for the full subcommand reference.
-- **MCP tools** — [`docs/MCP-TOOLS.md`](docs/MCP-TOOLS.md) for the 35 agent-to-agent coordination tools.
-- **Architecture** — [`docs/architecture.md`](docs/architecture.md) covers git worktree isolation, health monitoring + auto-respawn, Telegram topic lifecycle, and daemon-resident design.
-- **Recipes** — [`docs/RECIPE-clean-claude-instance.md`](docs/RECIPE-clean-claude-instance.md) for spawning a Claude Code instance without inherited global instructions or auto-memory.
-- **Contributing** — [`CONTRIBUTING.md`](CONTRIBUTING.md).
-- **Release history** — [`CHANGELOG.md`](CHANGELOG.md).
+- [Architecture](docs/architecture.md) — Worktree isolation, health monitoring, Telegram lifecycle, daemon design
+- [Git Behavior](docs/GIT-BEHAVIOR.md) — What the daemon modifies in spawned agents' git environment
+- [Recipes](docs/RECIPE-clean-claude-instance.md) — Spawning a clean Claude Code instance
+- [Contributing](CONTRIBUTING.md)
+- [Changelog](CHANGELOG.md)
+</details>
+
+## Git Behavior
+
+agend-terminal modifies git behavior for spawned agents (PATH shim, commit trailers, deny matrix, daemon-managed worktrees). Your own terminal is **not** affected. Read [`docs/GIT-BEHAVIOR.md`](docs/GIT-BEHAVIOR.md) before starting the daemon.
 
 ## License
 
