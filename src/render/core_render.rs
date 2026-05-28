@@ -416,8 +416,9 @@ fn render_pane(
             priority,
         };
     }
+    let render_offset = pane.effective_scroll_offset();
     pane.vterm
-        .render_to_buffer(frame.buffer_mut(), inner, pane.scroll_offset, !focused);
+        .render_to_buffer(frame.buffer_mut(), inner, render_offset, !focused);
 
     if let Some(ref sel) = pane.selection {
         let (s, e) = if sel.start <= sel.end {
@@ -448,7 +449,7 @@ fn render_pane(
         let (cursor_line, cursor_col) = pane.vterm.cursor_pos();
         let max_x = inner.x + inner.width.saturating_sub(1);
         let max_y = inner.y + inner.height.saturating_sub(1);
-        let (cx, cy) = if pane.scroll_offset == 0 {
+        let (cx, cy) = if render_offset == 0 {
             (
                 (inner.x + cursor_col).min(max_x),
                 (inner.y + cursor_line).min(max_y),
@@ -608,6 +609,7 @@ mod tests {
             last_input_at: None,
             pending_notification_count: 3,
             selection: None,
+            selection_scroll_freeze: None,
             source: PaneSource::Local,
         };
         let segments = pane_title_segments(&pane, Style::default());
@@ -634,6 +636,7 @@ mod tests {
             last_input_at: None,
             pending_notification_count: 0,
             selection: None,
+            selection_scroll_freeze: None,
             source: PaneSource::Local,
         };
         let segments = pane_title_segments(&pane, Style::default());
@@ -679,6 +682,7 @@ mod tests {
                 last_input_at: None,
                 pending_notification_count: 0,
                 selection: None,
+                selection_scroll_freeze: None,
                 source: PaneSource::Local,
             },
         );

@@ -44,6 +44,10 @@ pub struct Pane {
     pub pending_notification_count: usize,
     /// Active text selection (grid coordinates within this pane's VTerm).
     pub selection: Option<Selection>,
+    /// `max_scroll()` snapshot at selection start. Used to compensate for
+    /// new output during selection so the viewport stays pinned to the
+    /// same content.
+    pub selection_scroll_freeze: Option<usize>,
     /// Whether input/resize go to a local PTY (via registry) or a remote
     /// daemon-hosted agent (via `BridgeClient`).
     pub source: PaneSource,
@@ -59,6 +63,19 @@ pub struct Selection {
 }
 
 impl Pane {
+    /// Effective scroll offset: during active selection, compensates for
+    /// new output since selection started so the viewport stays pinned.
+    pub fn effective_scroll_offset(&self) -> usize {
+        match self.selection_scroll_freeze {
+            Some(frozen_max) => {
+                let current_max = self.vterm.max_scroll();
+                let drift = current_max.saturating_sub(frozen_max);
+                self.scroll_offset.saturating_add(drift)
+            }
+            None => self.scroll_offset,
+        }
+    }
+
     /// Display label: display_name if set, otherwise agent_name.
     pub fn label(&self) -> &str {
         self.display_name.as_deref().unwrap_or(&self.agent_name)
@@ -160,6 +177,7 @@ mod tests {
             last_input_at: None,
             pending_notification_count: 0,
             selection: None,
+            selection_scroll_freeze: None,
             source: PaneSource::Local,
         }
     }

@@ -368,6 +368,7 @@ mod tests {
             last_input_at: None,
             pending_notification_count: 0,
             selection: None,
+            selection_scroll_freeze: None,
             source: PaneSource::Local,
         }
     }

@@ -428,6 +428,9 @@ fn handle_selection(layout: &mut Layout, mouse: &MouseEvent) {
                 {
                     let col = mouse.column - inner_x;
                     let row = mouse.row - inner_y;
+                    // #1356: snapshot max_scroll so effective_scroll_offset
+                    // compensates for new output during the selection gesture.
+                    pane.selection_scroll_freeze = Some(pane.vterm.max_scroll());
                     pane.selection = Some(crate::layout::Selection {
                         start: (row, col),
                         end: (row, col),
@@ -446,19 +449,19 @@ fn handle_selection(layout: &mut Layout, mouse: &MouseEvent) {
             MouseEventKind::Up(MouseButton::Left) => {
                 if let Some(ref sel) = pane.selection {
                     if sel.start == sel.end {
-                        // Click without drag — clear the zero-width selection
-                        // to avoid a 1-cell white block artifact.
                         pane.selection = None;
                     } else {
-                        let text = pane
-                            .vterm
-                            .extract_text(sel.start, sel.end, pane.scroll_offset);
+                        let text = pane.vterm.extract_text(
+                            sel.start,
+                            sel.end,
+                            pane.effective_scroll_offset(),
+                        );
                         if !text.is_empty() {
                             copy_to_clipboard(&text);
                         }
                     }
                 }
-                // Keep selection visible — cleared on next mouse down or keypress.
+                pane.selection_scroll_freeze = None;
                 true
             }
             _ => false,
@@ -543,6 +546,7 @@ mod tests {
             last_input_at: None,
             pending_notification_count: 0,
             selection: None,
+            selection_scroll_freeze: None,
             source: PaneSource::Local,
         }
     }
