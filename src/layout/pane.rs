@@ -23,7 +23,7 @@ pub enum PaneSource {
 /// PTY ownership is in AgentRegistry (Local) or BridgeClient (Remote) —
 /// pane only holds a subscriber channel and a local VTerm.
 pub struct Pane {
-    pub agent_name: String,
+    pub agent_name: crate::types::AgentName,
     pub vterm: VTerm,
     pub rx: crossbeam_channel::Receiver<Vec<u8>>,
     pub id: usize,
@@ -117,7 +117,7 @@ impl Pane {
         match &self.source {
             PaneSource::Local => {
                 let reg = agent::lock_registry(registry);
-                if let Some(handle) = reg.get(&self.agent_name) {
+                if let Some(handle) = reg.get(self.agent_name.as_str()) {
                     let _ = agent::write_to_agent(handle, bytes);
                 }
                 drop(reg);
@@ -139,7 +139,7 @@ impl Pane {
         match &self.source {
             PaneSource::Local => {
                 let reg = agent::lock_registry(registry);
-                if let Some(handle) = reg.get(&self.agent_name) {
+                if let Some(handle) = reg.get(self.agent_name.as_str()) {
                     let master = handle.pty_master.lock();
                     let _ = master.resize(portable_pty::PtySize {
                         rows,
@@ -164,7 +164,7 @@ mod tests {
 
     fn leaf(id: usize, name: &str) -> Pane {
         Pane {
-            agent_name: name.to_string(),
+            agent_name: name.into(),
             vterm: VTerm::new(10, 10),
             rx: crossbeam_channel::bounded(1).1,
             id,

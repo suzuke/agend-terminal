@@ -126,7 +126,7 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
                         }
                         _ => {
                             let tab_name = pane.agent_name.clone();
-                            ctx.layout.add_tab(Tab::new(tab_name, pane));
+                            ctx.layout.add_tab(Tab::new(tab_name.to_string(), pane));
                         }
                     }
                     return true;
@@ -156,7 +156,7 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
                 ctx.layout
                     .active_tab()
                     .and_then(|t| t.focused_pane())
-                    .map(|p| p.agent_name.clone())
+                    .map(|p| p.agent_name.to_string())
             });
             if let Some(name) = target_name {
                 // Single pass: find pane info, fleet name, and location
@@ -171,7 +171,7 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
                 'outer: for (ti, tab) in ctx.layout.tabs.iter().enumerate() {
                     for id in tab.root().pane_ids() {
                         if let Some(p) = tab.root().find_pane(id) {
-                            if p.agent_name == name {
+                            if p.agent_name.as_str() == name {
                                 let cmd = match &p.backend {
                                     Some(b) => b.preset().command.to_string(),
                                     None => {
@@ -282,7 +282,7 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
                         }
                         // Fallback: add as new tab
                         let tab_name = new_pane.agent_name.clone();
-                        ctx.layout.add_tab(Tab::new(tab_name, new_pane));
+                        ctx.layout.add_tab(Tab::new(tab_name.to_string(), new_pane));
                         return true;
                     }
                 }
@@ -340,7 +340,7 @@ fn lookup_fleet_name(layout: &Layout, agent_name: &str) -> Option<String> {
     for tab in &layout.tabs {
         for id in tab.root().pane_ids() {
             if let Some(pane) = tab.root().find_pane(id) {
-                if pane.agent_name == agent_name {
+                if pane.agent_name.as_str() == agent_name {
                     return pane.fleet_instance_name.clone();
                 }
             }
@@ -357,7 +357,7 @@ mod tests {
 
     fn test_pane(id: usize, agent: &str, fleet_name: Option<&str>) -> Pane {
         Pane {
-            agent_name: agent.to_string(),
+            agent_name: agent.into(),
             vterm: VTerm::new(10, 10),
             rx: crossbeam_channel::bounded(1).1,
             id,

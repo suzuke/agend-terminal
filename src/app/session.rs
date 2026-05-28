@@ -317,7 +317,7 @@ pub(super) fn restore_with_reconciliation_attached(
                 display_name: None,
             };
             if let Some(pane) = pane_builder(&synthetic_sp, layout) {
-                let tab_name = pane.agent_name.clone();
+                let tab_name = pane.agent_name.to_string();
                 layout.add_tab(Tab::new(tab_name, pane));
             }
         }
@@ -415,7 +415,7 @@ fn apply_session_layout(
             display_name: None,
         };
         if let Some(pane) = pane_builder(&synthetic_sp, layout) {
-            let tab_name = pane.agent_name.clone();
+            let tab_name = pane.agent_name.to_string();
             layout.add_tab(Tab::new(tab_name, pane));
         }
     }
@@ -500,7 +500,7 @@ mod tests {
 
     fn test_pane(id: usize, agent: &str, fleet_name: Option<&str>) -> Pane {
         Pane {
-            agent_name: agent.to_string(),
+            agent_name: agent.into(),
             vterm: VTerm::new(10, 10),
             rx: crossbeam_channel::bounded(1).1,
             id,

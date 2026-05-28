@@ -62,11 +62,13 @@ fn build_agent_state_snapshot(
         for id in tab.root().pane_ids() {
             if let Some(pane) = tab.root().find_pane(id) {
                 if pane.backend.is_some() {
-                    snapshot.entry(pane.agent_name.clone()).or_insert_with(|| {
-                        reg.get(&pane.agent_name)
-                            .map(|h| h.core.lock().state.get_state())
-                            .unwrap_or(AgentState::Idle)
-                    });
+                    snapshot
+                        .entry(pane.agent_name.to_string())
+                        .or_insert_with(|| {
+                            reg.get(pane.agent_name.as_str())
+                                .map(|h| h.core.lock().state.get_state())
+                                .unwrap_or(AgentState::Idle)
+                        });
                 }
             }
         }
@@ -107,7 +109,7 @@ pub fn highest_priority_state(
         if let Some(pane) = tab.root().find_pane(id) {
             if pane.backend.is_some() {
                 let s = snapshot
-                    .get(&pane.agent_name)
+                    .get(pane.agent_name.as_str())
                     .copied()
                     .unwrap_or(AgentState::Idle);
                 if s.priority() > best.priority() {
@@ -359,7 +361,7 @@ fn render_pane(
 
     let state = if pane.backend.is_some() {
         snapshot
-            .get(&pane.agent_name)
+            .get(pane.agent_name.as_str())
             .copied()
             .unwrap_or(AgentState::Idle)
     } else {
@@ -596,7 +598,7 @@ mod tests {
     #[test]
     fn badge_shows_pending_count() {
         let pane = Pane {
-            agent_name: "agent".to_string(),
+            agent_name: "agent".into(),
             vterm: VTerm::new(10, 10),
             rx: crossbeam_channel::bounded(1).1,
             id: 1,
@@ -623,7 +625,7 @@ mod tests {
     #[test]
     fn pane_title_no_state_suffix() {
         let pane = Pane {
-            agent_name: "agent".to_string(),
+            agent_name: "agent".into(),
             vterm: VTerm::new(10, 10),
             rx: crossbeam_channel::bounded(1).1,
             id: 1,
@@ -669,7 +671,7 @@ mod tests {
         let tab = crate::layout::Tab::new(
             "empty".to_string(),
             crate::layout::Pane {
-                agent_name: "test".to_string(),
+                agent_name: "test".into(),
                 vterm: VTerm::new(10, 10),
                 rx: crossbeam_channel::bounded(1).1,
                 id: 1,

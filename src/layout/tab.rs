@@ -298,7 +298,7 @@ impl Tab {
         if self.focus_id == pane_id {
             self.focus_id = next_id;
         }
-        removed.map(|p| p.agent_name)
+        removed.map(|p| p.agent_name.to_string())
     }
 
     /// Detach a pane from this tab's tree without destroying its VTerm or PTY
@@ -355,7 +355,7 @@ mod tests {
 
     fn leaf(id: usize, name: &str) -> Pane {
         Pane {
-            agent_name: name.to_string(),
+            agent_name: name.into(),
             vterm: VTerm::new(10, 10),
             rx: crossbeam_channel::bounded(1).1,
             id,
@@ -484,7 +484,7 @@ mod tests {
         assert!(tab.split_focused(SplitDir::Vertical, leaf(2, "b")));
         tab.focus_id = 1;
         let d = tab.detach_pane(1).unwrap();
-        assert_eq!(d.agent_name, "a");
+        assert_eq!(d.agent_name.as_str(), "a");
         assert_eq!(tab.focus_id, 2);
     }
     #[test]

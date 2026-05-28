@@ -317,7 +317,7 @@ mod tests {
         }));
         crate::agent::AgentHandle {
             id: crate::types::InstanceId::default(),
-            name: name.to_string(),
+            name: name.to_string().into(),
             backend_command: "true".to_string(),
             pty_writer,
             pty_master,

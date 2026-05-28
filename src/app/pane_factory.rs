@@ -57,7 +57,7 @@ pub(super) fn spawn_pane_tab(
         name_counter,
     )?;
     let tab_name = pane.agent_name.clone();
-    layout.add_tab(Tab::new(tab_name, pane));
+    layout.add_tab(Tab::new(tab_name.to_string(), pane));
     Ok(())
 }
 
@@ -183,7 +183,7 @@ pub(super) fn create_pane(
     let backend = Backend::from_command(command);
 
     Ok(Pane {
-        agent_name: name,
+        agent_name: name.into(),
         vterm,
         rx: pane_rx,
         id: pane_id,
@@ -246,7 +246,7 @@ pub(super) fn attach_pane(
     let backend = Backend::from_command(&backend_command);
 
     Ok(Pane {
-        agent_name: name.to_string(),
+        agent_name: name.to_string().into(),
         vterm,
         rx: pane_rx,
         id: pane_id,
@@ -426,7 +426,7 @@ pub(super) fn create_remote_pane(
         .and_then(|r| Backend::from_command(&r.backend_command));
 
     Ok(Pane {
-        agent_name: name.to_string(),
+        agent_name: name.to_string().into(),
         vterm: VTerm::new(cols, rows),
         rx: pane_rx,
         id: pane_id,
