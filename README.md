@@ -10,7 +10,7 @@ Orchestrate AI coding agents — not just run them.
 
 ```bash
 cargo install agend-terminal
-agend-terminal demo    # Try it in 30 seconds
+agend-terminal quickstart    # Interactive setup in 2 minutes
 ```
 
 ## ⚠️ Git Behavior Modification (Important)
@@ -43,9 +43,6 @@ multi-pane TUI, a Telegram channel, or an optional system tray.
 ## Quick Start
 
 ```bash
-# Demo (no config)
-agend-terminal demo
-
 # Interactive setup — detects backends, optionally wires Telegram, writes fleet.yaml
 agend-terminal quickstart
 

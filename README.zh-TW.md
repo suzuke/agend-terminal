@@ -9,7 +9,7 @@
 
 ```bash
 cargo install agend-terminal
-agend-terminal demo    # 30 秒快速體驗
+agend-terminal quickstart    # 互動式設定，2 分鐘完成
 ```
 
 ## ⚠️ Git 行為修改（重要）
@@ -40,9 +40,6 @@ Crash 後自動重啟並移交上下文。透過多 tab / 多 pane 的 TUI、Tel
 ## 快速開始
 
 ```bash
-# 示範（無需設定）
-agend-terminal demo
-
 # 互動式設定——偵測 backend、可選設定 Telegram、產生 fleet.yaml
 agend-terminal quickstart
 
