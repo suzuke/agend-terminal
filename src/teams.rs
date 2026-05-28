@@ -44,6 +44,8 @@ pub struct Team {
     /// staleness, matching #779 P2's `warnings` pattern.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stale_members: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accept_from: Vec<String>,
 }
 
 impl Team {
@@ -68,9 +70,8 @@ fn project_team(name: &str, cfg: &crate::fleet::TeamConfig) -> Team {
         description: cfg.description.clone(),
         created_at: cfg.created_at.clone().unwrap_or_default(),
         source_repo: cfg.source_repo.clone(),
-        // #785: populated by `list()` only — `find_team_for` consumers
-        // don't need the diagnostic, default empty here.
         stale_members: Vec::new(),
+        accept_from: cfg.accept_from.clone(),
     }
 }
 
@@ -146,12 +147,21 @@ pub fn create(home: &Path, args: &Value) -> Value {
              bind agents on the canonical repo."
         ));
     }
+    let accept_from: Vec<String> = args["accept_from"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
     let cfg = crate::fleet::TeamConfig {
         members,
         orchestrator,
         description,
         created_at: Some(chrono::Utc::now().to_rfc3339()),
         source_repo,
+        accept_from,
     };
     match crate::fleet::add_team_to_yaml(home, &name, &cfg) {
         Ok(true) => {
@@ -371,12 +381,21 @@ pub fn update(home: &Path, args: &Value) -> Value {
         .map(std::path::PathBuf::from)
         .or_else(|| current.source_repo.clone());
 
+    let new_accept_from: Vec<String> = args["accept_from"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_else(|| current.accept_from.clone());
     let cfg = crate::fleet::TeamConfig {
         members: new_members,
         orchestrator: resolved_orch,
         description: current.description.clone(),
         created_at: current.created_at.clone(),
         source_repo: new_source_repo,
+        accept_from: new_accept_from,
     };
     match crate::fleet::update_team_in_yaml(home, &name, &cfg) {
         Ok(true) => serde_json::json!({"status": "updated", "name": name}),
@@ -419,6 +438,7 @@ pub fn remove_member_from_all(home: &Path, instance_name: &str) {
             description: cfg.description.clone(),
             created_at: cfg.created_at.clone(),
             source_repo: cfg.source_repo.clone(),
+            accept_from: cfg.accept_from.clone(),
         };
         let _ = crate::fleet::update_team_in_yaml(home, team_name, &new_cfg);
     }
@@ -1198,6 +1218,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             source_repo: None,
             stale_members: Vec::new(),
+            accept_from: Vec::new(),
         };
         let v = serde_json::to_value(&clean).expect("serialize Team");
         assert!(
@@ -1231,6 +1252,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             source_repo: None,
             stale_members: vec!["stale-2".to_string()],
+            accept_from: Vec::new(),
         };
         let v = serde_json::to_value(&team).expect("serialize");
         let stale: Vec<&str> = v["stale_members"]

@@ -80,25 +80,42 @@ fn check_team_isolation(home: &Path, from: &str, target: &str) -> Result<(), Val
         _ => false,
     };
     if !is_general_bus && !same_team {
-        crate::event_log::log(
-            home,
-            "send_cross_team_blocked",
-            from,
-            &format!(
-                "target={target}, sender_team={:?}, target_team={:?}",
-                from_team.as_ref().map(|t| &t.name),
-                target_team.as_ref().map(|t| &t.name),
-            ),
-        );
-        return Err(json!({
-            "ok": false,
-            "error": format!(
-                "cross-team send blocked: '{from}' (team={:?}) → '{target}' (team={:?}). \
-                 Route via general, or use create_instance(team=...) to grow your team.",
-                from_team.as_ref().map(|t| &t.name),
-                target_team.as_ref().map(|t| &t.name),
-            )
-        }));
+        // Rule 4: accept_from allowlist — sender in target team's accept_from
+        // AND target is the team's orchestrator.
+        let allowed_by_allowlist = target_team.as_ref().is_some_and(|t| {
+            t.accept_from.contains(&from.to_string()) && t.orchestrator.as_deref() == Some(target)
+        });
+        if allowed_by_allowlist {
+            crate::event_log::log(
+                home,
+                "send_cross_team_allowed_allowlist",
+                from,
+                &format!(
+                    "target={target}, target_team={:?}",
+                    target_team.as_ref().map(|t| &t.name),
+                ),
+            );
+        } else {
+            crate::event_log::log(
+                home,
+                "send_cross_team_blocked",
+                from,
+                &format!(
+                    "target={target}, sender_team={:?}, target_team={:?}",
+                    from_team.as_ref().map(|t| &t.name),
+                    target_team.as_ref().map(|t| &t.name),
+                ),
+            );
+            return Err(json!({
+                "ok": false,
+                "error": format!(
+                    "cross-team send blocked: '{from}' (team={:?}) → '{target}' (team={:?}). \
+                     Route via general, add sender to team's accept_from, or use create_instance(team=...) to grow your team.",
+                    from_team.as_ref().map(|t| &t.name),
+                    target_team.as_ref().map(|t| &t.name),
+                )
+            }));
+        }
     }
     if is_general_bus && !same_team {
         crate::event_log::log(
