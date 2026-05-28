@@ -129,7 +129,7 @@ channel:
   type: telegram
   bot_token_env: AGEND_BOT_TOKEN    # Environment variable name (not the token itself)
   group_id: -100123456789           # Supergroup ID
-  mode: topic                       # topic (forum mode) or flat
+  mode: topic                       # topic (forum mode)
   user_allowlist: [12345, 67890]    # Allowed Telegram user IDs
   fleet_binding:                    # Optional: agent-topic binding
     dev: 42
@@ -314,7 +314,9 @@ The `teams` structure in fleet.yaml doesn't prevent this, but the MCP communicat
 
 ### Q: How do I add a new agent?
 
-Add a new key-value pair under `instances`, then restart the daemon:
+Three ways, depending on your workflow:
+
+**1. Edit fleet.yaml** — add a new entry under `instances`, then restart the daemon:
 
 ```yaml
 instances:
@@ -323,3 +325,7 @@ instances:
     role: "New agent for feature X"
     working_directory: ~/Projects/feature-x
 ```
+
+**2. TUI app mode** — in `agend-terminal app`, use the built-in UI to create a new instance interactively without editing YAML.
+
+**3. MCP tool** — any running agent can programmatically create a new instance via the `create_instance` MCP tool, useful for automated orchestration and deployment templates.
