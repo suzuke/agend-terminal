@@ -463,22 +463,9 @@ where
     let dir = pr_state_dir(home);
     std::fs::create_dir_all(&dir)?;
     let data_path = dir.join(pr_state_filename(repo, branch));
-    let lock_path = dir.join(format!("{}.lock", pr_state_filename(repo, branch)));
-    let _lock = crate::store::acquire_file_lock(&lock_path)?;
-    let Some(mut state) = std::fs::read_to_string(&data_path)
-        .ok()
-        .and_then(|c| serde_json::from_str::<PrState>(&c).ok())
-    else {
-        return Ok(None);
-    };
-    let result = mutate(&mut state);
-    let body = serde_json::to_string_pretty(&state)?;
-    crate::store::atomic_write(&data_path, body.as_bytes())?;
-    Ok(Some(result))
+    crate::store::with_json_state(&data_path, mutate)
 }
 
-/// Variant of [`with_pr_state`] that creates the file if missing,
-/// using `default_fn` to produce the initial state.
 pub fn with_pr_state_or_create<F, D, R>(
     home: &std::path::Path,
     repo: &str,
@@ -493,16 +480,7 @@ where
     let dir = pr_state_dir(home);
     std::fs::create_dir_all(&dir)?;
     let data_path = dir.join(pr_state_filename(repo, branch));
-    let lock_path = dir.join(format!("{}.lock", pr_state_filename(repo, branch)));
-    let _lock = crate::store::acquire_file_lock(&lock_path)?;
-    let mut state = std::fs::read_to_string(&data_path)
-        .ok()
-        .and_then(|c| serde_json::from_str::<PrState>(&c).ok())
-        .unwrap_or_else(default_fn);
-    let result = mutate(&mut state);
-    let body = serde_json::to_string_pretty(&state)?;
-    crate::store::atomic_write(&data_path, body.as_bytes())?;
-    Ok(result)
+    crate::store::with_json_state_or_create(&data_path, default_fn, mutate)
 }
 
 /// Remove the per-PR file. Used by the per-tick scanner after a

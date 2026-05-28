@@ -337,20 +337,17 @@ pub(crate) fn mark_resolved(home: &Path, correlation_id: &str) -> Option<String>
         .find(|d| d.status == "pending" && d.correlation_id.as_deref() == Some(correlation_id));
     let d = matched?;
     let id = d.dispatch_id.clone();
-    // #1340: flock + re-read to serialize against concurrent scan_and_emit
-    let _lock = crate::store::acquire_file_lock(&dispatch_lock_path(home, &id)).ok()?;
     let path = pending_path(home, &id);
-    let content = std::fs::read_to_string(&path).ok()?;
-    let mut current: PendingDispatch = serde_json::from_str(&content).ok()?;
-    if current.status != "pending" {
-        return None;
-    }
-    current.status = "resolved".to_string();
-    if write_dispatch(home, &current) {
-        Some(id)
-    } else {
-        None
-    }
+    crate::store::with_json_state::<PendingDispatch, _, _>(&path, |current| {
+        if current.status != "pending" {
+            return None;
+        }
+        current.status = "resolved".to_string();
+        Some(id.clone())
+    })
+    .ok()
+    .flatten()
+    .flatten()
 }
 
 /// #1047: reset the timer on a pending sidecar when the dispatchee sends
@@ -367,20 +364,17 @@ pub(crate) fn refresh_issued_at(home: &Path, correlation_id: &str) -> Option<Str
         .find(|d| d.status == "pending" && d.correlation_id.as_deref() == Some(correlation_id));
     let d = matched?;
     let id = d.dispatch_id.clone();
-    // #1340: flock + re-read to serialize against concurrent scan_and_emit
-    let _lock = crate::store::acquire_file_lock(&dispatch_lock_path(home, &id)).ok()?;
     let path = pending_path(home, &id);
-    let content = std::fs::read_to_string(&path).ok()?;
-    let mut current: PendingDispatch = serde_json::from_str(&content).ok()?;
-    if current.status != "pending" {
-        return None;
-    }
-    current.issued_at = chrono::Utc::now().to_rfc3339();
-    if write_dispatch(home, &current) {
-        Some(id)
-    } else {
-        None
-    }
+    crate::store::with_json_state::<PendingDispatch, _, _>(&path, |current| {
+        if current.status != "pending" {
+            return None;
+        }
+        current.issued_at = chrono::Utc::now().to_rfc3339();
+        Some(id.clone())
+    })
+    .ok()
+    .flatten()
+    .flatten()
 }
 
 /// PR2 L3 visibility — per-instance dispatch metadata view.

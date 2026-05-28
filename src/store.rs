@@ -241,6 +241,58 @@ where
     Ok(result)
 }
 
+/// Generic flock-guarded read-modify-write for any JSON state file.
+///
+/// Returns `Ok(None)` when the file does not exist (no mutation performed).
+/// The lock file is `<path>.lock`; caller does not manage it.
+pub fn with_json_state<T, R, F>(path: &Path, mutate: F) -> anyhow::Result<Option<R>>
+where
+    T: DeserializeOwned + Serialize,
+    F: FnOnce(&mut T) -> R,
+{
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let lock_path = path.with_extension("lock");
+    let _lock = acquire_file_lock(&lock_path)?;
+    let Some(mut state) = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|c| serde_json::from_str::<T>(&c).ok())
+    else {
+        return Ok(None);
+    };
+    let result = mutate(&mut state);
+    let body = serde_json::to_string_pretty(&state)?;
+    atomic_write(path, body.as_bytes())?;
+    Ok(Some(result))
+}
+
+/// Like [`with_json_state`] but creates the file from `default_fn` when missing.
+pub fn with_json_state_or_create<T, D, R, F>(
+    path: &Path,
+    default_fn: D,
+    mutate: F,
+) -> anyhow::Result<R>
+where
+    T: DeserializeOwned + Serialize,
+    D: FnOnce() -> T,
+    F: FnOnce(&mut T) -> R,
+{
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let lock_path = path.with_extension("lock");
+    let _lock = acquire_file_lock(&lock_path)?;
+    let mut state = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|c| serde_json::from_str::<T>(&c).ok())
+        .unwrap_or_else(default_fn);
+    let result = mutate(&mut state);
+    let body = serde_json::to_string_pretty(&state)?;
+    atomic_write(path, body.as_bytes())?;
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
