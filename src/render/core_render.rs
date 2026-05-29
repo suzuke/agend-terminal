@@ -418,32 +418,41 @@ fn render_pane(
             priority,
         };
     }
-    let render_offset = pane.effective_scroll_offset();
+    let render_offset = pane.scroll_offset;
     pane.vterm
         .render_to_buffer(frame.buffer_mut(), inner, render_offset, !focused);
 
     if let Some(ref sel) = pane.selection {
+        // Selection is stored in absolute scrollback logical coords; map each
+        // endpoint to the current viewport and clip to the visible window so
+        // the highlight tracks its content as it scrolls (#1432).
         let (s, e) = if sel.start <= sel.end {
             (sel.start, sel.end)
         } else {
             (sel.end, sel.start)
         };
-        for row in s.0..=e.0 {
-            let col_start = if row == s.0 { s.1 } else { 0 };
-            let col_end = if row == e.0 {
+        let s_row = pane.logical_line_to_viewport(s.0);
+        let e_row = pane.logical_line_to_viewport(e.0);
+        let lo = s_row.max(0);
+        let hi = e_row.min(inner.height as i64 - 1);
+        let mut vrow = lo;
+        while vrow <= hi {
+            let col_start = if vrow == s_row { s.1 } else { 0 };
+            let col_end = if vrow == e_row {
                 e.1
             } else {
                 inner.width.saturating_sub(1)
             };
             for col in col_start..=col_end {
                 let x = inner.x + col;
-                let y = inner.y + row;
+                let y = inner.y + vrow as u16;
                 if x < inner.x + inner.width && y < inner.y + inner.height {
                     let cell = &mut frame.buffer_mut()[(x, y)];
                     let style = cell.style().add_modifier(Modifier::REVERSED);
                     cell.set_style(style);
                 }
             }
+            vrow += 1;
         }
     }
 
@@ -611,7 +620,6 @@ mod tests {
             last_input_at: None,
             pending_notification_count: 3,
             selection: None,
-            selection_scroll_freeze: None,
             source: PaneSource::Local,
         };
         let segments = pane_title_segments(&pane, Style::default());
@@ -638,7 +646,6 @@ mod tests {
             last_input_at: None,
             pending_notification_count: 0,
             selection: None,
-            selection_scroll_freeze: None,
             source: PaneSource::Local,
         };
         let segments = pane_title_segments(&pane, Style::default());
@@ -684,7 +691,6 @@ mod tests {
                 last_input_at: None,
                 pending_notification_count: 0,
                 selection: None,
-                selection_scroll_freeze: None,
                 source: PaneSource::Local,
             },
         );

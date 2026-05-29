@@ -434,21 +434,36 @@ fn handle_selection(layout: &mut Layout, mouse: &MouseEvent) {
                 {
                     let col = mouse.column - inner_x;
                     let row = mouse.row - inner_y;
-                    // #1356: snapshot max_scroll so effective_scroll_offset
-                    // compensates for new output during the selection gesture.
-                    pane.selection_scroll_freeze = Some(pane.vterm.max_scroll());
+                    // #1432: anchor in absolute scrollback logical coordinates
+                    // so the selection survives new output and user scrolling.
+                    let logical = pane.viewport_to_logical_line(row);
                     pane.selection = Some(crate::layout::Selection {
-                        start: (row, col),
-                        end: (row, col),
+                        start: (logical, col),
+                        end: (logical, col),
                     });
                 }
                 false
             }
             MouseEventKind::Drag(MouseButton::Left) => {
+                // #1432: dragging past the top/bottom edge auto-scrolls so the
+                // selection can extend beyond the visible viewport. Overshoot
+                // distance sets the scroll step (drag further → scroll faster).
+                let row = if mouse.row < inner_y {
+                    let overshoot = (inner_y - mouse.row) as usize;
+                    pane.scroll_offset =
+                        (pane.scroll_offset + overshoot).min(pane.vterm.max_scroll());
+                    0
+                } else if mouse.row >= inner_y + inner_h {
+                    let overshoot = (mouse.row - (inner_y + inner_h - 1)) as usize;
+                    pane.scroll_offset = pane.scroll_offset.saturating_sub(overshoot);
+                    inner_h - 1
+                } else {
+                    mouse.row - inner_y
+                };
                 let col = mouse.column.max(inner_x).min(inner_x + inner_w - 1) - inner_x;
-                let row = mouse.row.max(inner_y).min(inner_y + inner_h - 1) - inner_y;
+                let logical = pane.viewport_to_logical_line(row);
                 if let Some(ref mut sel) = pane.selection {
-                    sel.end = (row, col);
+                    sel.end = (logical, col);
                 }
                 false
             }
@@ -457,17 +472,12 @@ fn handle_selection(layout: &mut Layout, mouse: &MouseEvent) {
                     if sel.start == sel.end {
                         pane.selection = None;
                     } else {
-                        let text = pane.vterm.extract_text(
-                            sel.start,
-                            sel.end,
-                            pane.effective_scroll_offset(),
-                        );
+                        let text = pane.vterm.extract_text(sel.start, sel.end);
                         if !text.is_empty() {
                             copy_to_clipboard(&text);
                         }
                     }
                 }
-                pane.selection_scroll_freeze = None;
                 true
             }
             _ => false,
@@ -552,7 +562,6 @@ mod tests {
             last_input_at: None,
             pending_notification_count: 0,
             selection: None,
-            selection_scroll_freeze: None,
             source: PaneSource::Local,
         }
     }

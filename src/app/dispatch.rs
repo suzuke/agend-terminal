@@ -331,11 +331,7 @@ pub(super) fn dispatch(action: Action, ctx: &mut DispatchCtx<'_>) -> DispatchRes
             if let Some(tab) = ctx.layout.active_tab() {
                 if let Some(pane) = tab.root().find_pane(tab.focus_id) {
                     if let Some(ref sel) = pane.selection {
-                        let text = pane.vterm.extract_text(
-                            sel.start,
-                            sel.end,
-                            pane.effective_scroll_offset(),
-                        );
+                        let text = pane.vterm.extract_text(sel.start, sel.end);
                         if !text.is_empty() {
                             super::mouse::copy_to_clipboard(&text);
                         }
@@ -369,7 +365,6 @@ mod tests {
             last_input_at: None,
             pending_notification_count: 0,
             selection: None,
-            selection_scroll_freeze: None,
             source: PaneSource::Local,
         }
     }

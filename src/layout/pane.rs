@@ -42,38 +42,50 @@ pub struct Pane {
     pub last_input_at: Option<Instant>,
     /// Count of pending queued notifications for this pane.
     pub pending_notification_count: usize,
-    /// Active text selection (grid coordinates within this pane's VTerm).
+    /// Active text selection, in absolute scrollback logical coordinates.
     pub selection: Option<Selection>,
-    /// `max_scroll()` snapshot at selection start. Used to compensate for
-    /// new output during selection so the viewport stays pinned to the
-    /// same content.
-    pub selection_scroll_freeze: Option<usize>,
     /// Whether input/resize go to a local PTY (via registry) or a remote
     /// daemon-hosted agent (via `BridgeClient`).
     pub source: PaneSource,
 }
 
-/// Text selection within a pane's VTerm grid.
+/// Text selection anchored to absolute scrollback logical coordinates so it
+/// stays pinned to its content under both new output and user scrolling.
+///
+/// `.0` is the logical line index counted from the oldest line currently in
+/// the buffer (`grid_line + max_scroll()`); `.1` is the column. Endpoints are
+/// converted to viewport rows at render / extract time via
+/// [`Pane::logical_line_to_viewport`].
+///
+/// Edge case: a line evicted from the 10000-line history cap loses its anchor
+/// and the selection drifts. Unreachable within a single gesture (would need
+/// ~10000 lines of output in the seconds a drag takes), so left unhandled.
 #[derive(Clone)]
 pub struct Selection {
-    /// Start position (row, col) in VTerm grid coordinates.
-    pub start: (u16, u16),
-    /// End position (row, col) — may be before or after start.
-    pub end: (u16, u16),
+    /// Start: (logical line, column). May be before or after `end`.
+    pub start: (i64, u16),
+    /// End: (logical line, column).
+    pub end: (i64, u16),
 }
 
 impl Pane {
-    /// Effective scroll offset: during active selection, compensates for
-    /// new output since selection started so the viewport stays pinned.
-    pub fn effective_scroll_offset(&self) -> usize {
-        match self.selection_scroll_freeze {
-            Some(frozen_max) => {
-                let current_max = self.vterm.max_scroll();
-                let drift = current_max.saturating_sub(frozen_max);
-                self.scroll_offset.saturating_add(drift)
-            }
-            None => self.scroll_offset,
-        }
+    /// Convert a viewport row (0-based within the pane interior) to an absolute
+    /// scrollback logical line at the current scroll position. Inverse of
+    /// [`Self::logical_line_to_viewport`].
+    ///
+    /// Derivation: render maps viewport row → `grid_line = row - scroll_offset`
+    /// (see `VTerm::render_to_buffer`), and the oldest buffer line sits at
+    /// `grid_line = -max_scroll()`. Counting from that oldest line gives a
+    /// reference stable under append: `logical = grid_line + max_scroll()`.
+    pub fn viewport_to_logical_line(&self, row: u16) -> i64 {
+        row as i64 - self.scroll_offset as i64 + self.vterm.max_scroll() as i64
+    }
+
+    /// Convert an absolute scrollback logical line back to a viewport row at
+    /// the current scroll position. The result may be negative or `>=` viewport
+    /// height when the anchored content has scrolled off-screen; callers clip.
+    pub fn logical_line_to_viewport(&self, logical: i64) -> i64 {
+        logical + self.scroll_offset as i64 - self.vterm.max_scroll() as i64
     }
 
     /// Display label: display_name if set, otherwise agent_name.
@@ -94,18 +106,6 @@ impl Pane {
 
     /// Drain pending output into the local VTerm.
     pub fn drain_output(&mut self) {
-        // #1432: while a mouse selection gesture is active, freeze the grid by
-        // not draining new output. `selection_scroll_freeze` is set on MouseDown
-        // and cleared on MouseUp, so this pauses only for the gesture's duration.
-        // The scroll-offset drift compensation (#1358) only handles output that
-        // *appends* to scrollback; agent CLIs frequently redraw in place (cursor
-        // movement, spinners) without growing `max_scroll()`, which the offset
-        // approach cannot pin. Freezing the grid covers every case. Output stays
-        // queued in the unbounded `rx` channel and drains on the next call once
-        // the gesture ends.
-        if self.selection_scroll_freeze.is_some() {
-            return;
-        }
         while let Ok(data) = self.rx.try_recv() {
             self.vterm.process(&data);
             if self.backend.is_some() {
@@ -189,19 +189,59 @@ mod tests {
             last_input_at: None,
             pending_notification_count: 0,
             selection: None,
-            selection_scroll_freeze: None,
             source: PaneSource::Local,
         }
     }
 
-    /// #1432: output must not reach the VTerm while a selection gesture is
-    /// active (grid frozen), and must catch up once the gesture ends.
+    /// #1432: a fixed content line keeps the same logical anchor regardless of
+    /// scroll offset — the basis for drag-scroll not drifting the selection.
     #[test]
-    fn drain_output_frozen_during_selection_then_resumes() {
-        let (tx, rx) = crossbeam_channel::unbounded::<Vec<u8>>();
-        let mut pane = Pane {
+    fn logical_anchor_is_offset_invariant() {
+        let (_tx, rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let mut pane = test_pane(rx, 20, 5);
+        for i in 0..20 {
+            pane.vterm.process(format!("line{i}\r\n").as_bytes());
+        }
+        // Same grid line (e.g. one line above the screen top) viewed at two
+        // different scroll offsets maps to the same logical anchor.
+        pane.scroll_offset = 0;
+        let a0 = pane.viewport_to_logical_line(1);
+        pane.scroll_offset = 3;
+        // Scrolling back by 3 moves that content down by 3 rows on screen.
+        let a3 = pane.viewport_to_logical_line(1 + 3);
+        assert_eq!(a0, a3, "logical anchor must be offset-invariant");
+        // Round-trip back to a viewport row.
+        assert_eq!(pane.logical_line_to_viewport(a3), 1 + 3);
+    }
+
+    /// #1432: appending output shifts the on-screen row of anchored content but
+    /// leaves its logical anchor unchanged (selection tracks content, no drift).
+    #[test]
+    fn logical_anchor_stable_across_appended_output() {
+        let (_tx, rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let mut pane = test_pane(rx, 20, 5);
+        for i in 0..20 {
+            pane.vterm.process(format!("line{i}\r\n").as_bytes());
+        }
+        pane.scroll_offset = 0;
+        let anchor = pane.viewport_to_logical_line(2);
+        let row_before = pane.logical_line_to_viewport(anchor);
+        // 4 new lines scroll the grid up.
+        for i in 20..24 {
+            pane.vterm.process(format!("line{i}\r\n").as_bytes());
+        }
+        let row_after = pane.logical_line_to_viewport(anchor);
+        assert_eq!(
+            row_after,
+            row_before - 4,
+            "anchored content must move up by exactly the appended line count"
+        );
+    }
+
+    fn test_pane(rx: crossbeam_channel::Receiver<Vec<u8>>, cols: u16, rows: u16) -> Pane {
+        Pane {
             agent_name: "agent".into(),
-            vterm: VTerm::new(20, 5),
+            vterm: VTerm::new(cols, rows),
             rx,
             id: 1,
             backend: None,
@@ -213,31 +253,8 @@ mod tests {
             last_input_at: None,
             pending_notification_count: 0,
             selection: None,
-            selection_scroll_freeze: None,
             source: PaneSource::Local,
-        };
-
-        tx.send(b"hello".to_vec()).expect("send baseline output");
-        pane.drain_output();
-        let before = pane.vterm.read_scrollback(100);
-        assert!(before.contains("hello"), "baseline: {before:?}");
-
-        // Selection gesture active → freeze: new output must not be drained.
-        pane.selection_scroll_freeze = Some(pane.vterm.max_scroll());
-        tx.send(b" world".to_vec())
-            .expect("send frozen-window output");
-        pane.drain_output();
-        let during = pane.vterm.read_scrollback(100);
-        assert_eq!(during, before, "grid must stay frozen during selection");
-
-        // Gesture ends → drain resumes and catches up.
-        pane.selection_scroll_freeze = None;
-        pane.drain_output();
-        let after = pane.vterm.read_scrollback(100);
-        assert!(
-            after.contains("hello world"),
-            "output must catch up after selection: {after:?}"
-        );
+        }
     }
 
     #[test]

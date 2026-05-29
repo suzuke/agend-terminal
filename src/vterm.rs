@@ -351,27 +351,32 @@ impl VTerm {
         (c.line.0 as u16, c.column.0 as u16)
     }
 
-    /// Extract text from a selection range (grid coordinates), accounting for scroll offset.
-    pub fn extract_text(&self, start: (u16, u16), end: (u16, u16), scroll_offset: usize) -> String {
+    /// Extract text from a selection range given in absolute scrollback logical
+    /// coordinates (`.0` = `grid_line + max_scroll()`, `.1` = column).
+    ///
+    /// Offset-independent: the anchor is captured once and resolves to the same
+    /// content regardless of later scrolling or new output. Lines that have
+    /// scrolled past the history cap resolve to blanks via `safe_cell`.
+    pub fn extract_text(&self, start: (i64, u16), end: (i64, u16)) -> String {
+        let max_scroll = self.max_scroll() as i64;
         let grid = self.term.grid();
-        // Same clamp rationale as `render_to_buffer`: `scroll_offset as i32`
-        // wraps negative for pathological values.
-        let offset: i32 = scroll_offset.min(i32::MAX as usize) as i32;
 
-        // Normalize start/end so start is before end
+        // Normalize start/end so start is before end by (logical line, col).
         let (s, e) = if start <= end {
             (start, end)
         } else {
             (end, start)
         };
-        let (s_row, s_col) = s;
-        let (e_row, e_col) = e;
+        let (s_line, s_col) = s;
+        let (e_line, e_col) = e;
 
         let mut text = String::new();
-        for row in s_row..=e_row {
-            let grid_line = Line((row as i32).saturating_sub(offset));
-            let col_start = if row == s_row { s_col } else { 0 };
-            let col_end = if row == e_row {
+        for logical in s_line..=e_line {
+            // logical → grid line: the oldest buffer line is at -max_scroll.
+            let grid_line =
+                Line((logical - max_scroll).clamp(i32::MIN as i64, i32::MAX as i64) as i32);
+            let col_start = if logical == s_line { s_col } else { 0 };
+            let col_end = if logical == e_line {
                 e_col
             } else {
                 self.cols.saturating_sub(1)
@@ -1442,8 +1447,9 @@ mod tests {
             "read_scrollback() leaked SPACER as space, got: {scrollback:?}"
         );
 
-        // Site 2 (line 361) — extract_text() (selection text)
-        let selected = vt.extract_text((0, 0), (0, 5), 0);
+        // Site 2 (line 361) — extract_text() (selection text). max_scroll == 0
+        // here, so logical line 0 == grid row 0.
+        let selected = vt.extract_text((0, 0), (0, 5));
         assert!(
             selected.contains("中A"),
             "extract_text() must NOT insert SPACER as space, got: {selected:?}"
@@ -1504,6 +1510,34 @@ mod tests {
         let row4: String = (0..10).map(|x| buf[(x, 4)].symbol()).collect();
         assert_eq!(row3, "          ", "row 3 (beyond grid) must be blanked");
         assert_eq!(row4, "          ", "row 4 (beyond grid) must be blanked");
+    }
+
+    /// #1432: extract_text resolves absolute scrollback logical coordinates,
+    /// stays correct under new output, and spans beyond the viewport.
+    #[test]
+    fn extract_text_logical_coords_stable_across_output() {
+        let mut vt = VTerm::new(20, 3);
+        for i in 0..10 {
+            vt.process(format!("line{i}\r\n").as_bytes());
+        }
+        // Logical line index counts from the oldest buffer line: line{K} is at K.
+        assert_eq!(vt.extract_text((5, 0), (5, 4)), "line5");
+        // New output appends and scrolls the grid; the same logical anchor must
+        // still extract line5 (selection tracks content, no drift).
+        for i in 10..14 {
+            vt.process(format!("line{i}\r\n").as_bytes());
+        }
+        assert_eq!(
+            vt.extract_text((5, 0), (5, 4)),
+            "line5",
+            "logical anchor must survive appended output"
+        );
+        // A range spanning more than the 3-row viewport extracts every line —
+        // selection can extend beyond the visible window.
+        assert_eq!(
+            vt.extract_text((2, 0), (7, 4)),
+            "line2\nline3\nline4\nline5\nline6\nline7"
+        );
     }
 
     /// T2 (#1064): area wider than grid blanks the trailing cols.

@@ -202,7 +202,6 @@ pub(super) fn create_pane(
         last_input_at: None,
         pending_notification_count: 0,
         selection: None,
-        selection_scroll_freeze: None,
         source: crate::layout::PaneSource::Local,
     })
 }
@@ -265,7 +264,6 @@ pub(super) fn attach_pane(
         last_input_at: None,
         pending_notification_count: 0,
         selection: None,
-        selection_scroll_freeze: None,
         source: crate::layout::PaneSource::Local,
     })
 }
@@ -445,7 +443,6 @@ pub(super) fn create_remote_pane(
         last_input_at: None,
         pending_notification_count: 0,
         selection: None,
-        selection_scroll_freeze: None,
         source: crate::layout::PaneSource::Remote(Arc::new(Mutex::new(client))),
     })
 }
