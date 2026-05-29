@@ -20,9 +20,15 @@ pub(super) fn handle_crash_respawn(home: &Path, crashed_name: &str, ctx: &Daemon
         }
     };
 
+    // #1441: registry is UUID-keyed; resolve the crashed name via fleet.yaml.
+    let Some(instance_id) = crate::fleet::resolve_uuid(home, crashed_name) else {
+        tracing::warn!(agent = %crashed_name, "no fleet UUID, skipping respawn");
+        return;
+    };
+
     let (should_respawn, delay, should_notify) = {
         let reg = agent::lock_registry(&ctx.registry);
-        match reg.get(crashed_name) {
+        match reg.get(&instance_id) {
             Some(handle) => handle.core.lock().health.record_crash(),
             None => {
                 tracing::warn!(agent = %crashed_name, "not in registry, skipping");
@@ -32,7 +38,7 @@ pub(super) fn handle_crash_respawn(home: &Path, crashed_name: &str, ctx: &Daemon
     };
 
     if should_notify {
-        notify_crash(crashed_name, &ctx.registry);
+        notify_crash(crashed_name, &instance_id, &ctx.registry);
     }
 
     if !should_respawn {
@@ -43,7 +49,7 @@ pub(super) fn handle_crash_respawn(home: &Path, crashed_name: &str, ctx: &Daemon
     tracing::info!(agent = %crashed_name, ?delay, "respawning");
     let saved_health = {
         let r = ctx.registry.lock();
-        r.get(crashed_name).map(|h| h.core.lock().health.clone())
+        r.get(&instance_id).map(|h| h.core.lock().health.clone())
     };
 
     let reg = Arc::clone(&ctx.registry);
@@ -72,10 +78,14 @@ pub(super) fn handle_crash_respawn(home: &Path, crashed_name: &str, ctx: &Daemon
     }
 }
 
-fn notify_crash(crashed_name: &str, registry: &AgentRegistry) {
+fn notify_crash(
+    crashed_name: &str,
+    instance_id: &crate::types::InstanceId,
+    registry: &AgentRegistry,
+) {
     let state = {
         let reg = agent::lock_registry(registry);
-        reg.get(crashed_name)
+        reg.get(instance_id)
             .map(|h| h.core.lock().health.state.display_name())
             .unwrap_or("unknown")
     };
@@ -145,9 +155,11 @@ fn respawn_agent_worker(
         Ok(()) => {
             tracing::info!(agent = %config.name, "respawned");
             crate::event_log::log(home, "respawn", &config.name, "agent respawned");
+            // #1441: registry is UUID-keyed; resolve the respawned name once.
+            let respawned_id = crate::fleet::resolve_uuid(home, &config.name);
             {
                 let r = reg.lock();
-                if let Some(handle) = r.get(&config.name) {
+                if let Some(handle) = respawned_id.and_then(|id| r.get(&id)) {
                     let mut core = handle.core.lock();
                     if let Some(ref old_health) = saved_health {
                         core.health = old_health.clone();
@@ -158,7 +170,7 @@ fn respawn_agent_worker(
             std::thread::sleep(std::time::Duration::from_secs(2));
             {
                 let r = reg.lock();
-                if let Some(handle) = r.get(&config.name) {
+                if let Some(handle) = respawned_id.and_then(|id| r.get(&id)) {
                     let reason = handle.core.lock().health.crash_reason().to_string();
                     let msg = format!(
                         "[system] Agent restarted due to {reason}. Previous context was lost.\r"

@@ -698,7 +698,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 crate::daemon::ci_watch::check_ci_watches(&home, &registry);
                 {
                     let reg = crate::agent::lock_registry(&registry);
-                    for (name, handle) in reg.iter() {
+                    for handle in reg.values() {
                         {
                             let mut core = handle.core.lock();
                             core.health.maybe_decay();
@@ -710,7 +710,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                             // Sprint 24 P1: pair snapshot for input-aware
                             // hang discrimination (matches daemon/mod.rs
                             // pattern).
-                            let pair = crate::daemon::heartbeat_pair::snapshot_for(name);
+                            let pair = crate::daemon::heartbeat_pair::snapshot_for(handle.name.as_str());
                             core.health.check_hang(
                                 agent_state,
                                 silent,
@@ -834,7 +834,7 @@ fn build_menu_items(fleet_path: &Path, registry: &AgentRegistry) -> Vec<MenuItem
     // Collect already-running agent names
     let running: Vec<String> = {
         let reg = agent::lock_registry(registry);
-        reg.keys().cloned().collect()
+        reg.values().map(|h| h.name.to_string()).collect()
     };
 
     if let Ok(fleet) = crate::fleet::FleetConfig::load(fleet_path) {
@@ -1161,7 +1161,9 @@ fn kill_agent(home: &Path, registry: &AgentRegistry, name: &str) {
 /// so a spurious poison doesn't auto-dismiss the overlay — Esc still works.
 fn agent_is_alive(registry: &AgentRegistry, name: &str) -> bool {
     let reg = agent::lock_registry(registry);
-    let Some(handle) = reg.get(name) else {
+    // #1441: registry is UUID-keyed; the overlay only knows the display name,
+    // so locate the handle by name (no fleet.yaml on the scratch-shell path).
+    let Some(handle) = reg.values().find(|h| h.name.as_str() == name) else {
         return false;
     };
     // Bind to a local so the child-lock's temporary MutexGuard drops
@@ -1193,6 +1195,7 @@ mod tests {
     fn pane(name: &str) -> Pane {
         Pane {
             agent_name: name.into(),
+            instance_id: crate::types::InstanceId::default(),
             vterm: VTerm::new(10, 10),
             rx: crossbeam_channel::bounded(1).1,
             id: 1,

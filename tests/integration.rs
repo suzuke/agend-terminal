@@ -605,17 +605,24 @@ fn test_fleet_multi_agent_lifecycle() {
     }));
     assert_eq!(resp["ok"], true, "send should succeed");
 
-    // Verify shell2's inbox has the message by draining inbox file directly
-    // The inbox is stored at {home}/inbox/shell2.jsonl
-    let inbox_path = daemon.home.join("inbox").join("shell2.jsonl");
+    // Verify shell2's inbox has the message. #1441: the inbox is keyed by the
+    // instance's UUID (resolved from fleet.yaml, the same source the registry
+    // uses) rather than its display name, so the file is `{home}/inbox/
+    // {uuid}.jsonl`. Scan the inbox dir for the delivered message rather than
+    // assuming a name-based filename.
+    let inbox_dir = daemon.home.join("inbox");
+    let delivered = std::fs::read_dir(&inbox_dir)
+        .expect("inbox dir should exist after send")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
+        .any(|e| {
+            std::fs::read_to_string(e.path())
+                .map(|c| c.contains("hello from shell1"))
+                .unwrap_or(false)
+        });
     assert!(
-        inbox_path.exists(),
-        "shell2 inbox file should exist after send"
-    );
-    let content = std::fs::read_to_string(&inbox_path).expect("read inbox");
-    assert!(
-        content.contains("hello from shell1"),
-        "inbox should contain the sent message"
+        delivered,
+        "shell2's (UUID-keyed) inbox should contain the sent message"
     );
 
     daemon.stop();

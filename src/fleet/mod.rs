@@ -41,6 +41,23 @@ pub fn fleet_yaml_path(home: &Path) -> PathBuf {
     home.join(FLEET_YAML_FILENAME)
 }
 
+/// #1441: single authoritative `name` → `InstanceId` resolution from
+/// fleet.yaml. Both inbox path resolution and the agent registry route
+/// through this one function so live-process identity (PTY inject / pane
+/// subscription) and inbox identity share one source and cannot drift.
+/// Returns `None` when the instance is absent from fleet.yaml or has no
+/// parseable id.
+pub fn resolve_uuid(home: &Path, name: &str) -> Option<crate::types::InstanceId> {
+    FleetConfig::load(&fleet_yaml_path(home))
+        .ok()
+        .and_then(|c| {
+            c.instances
+                .get(name)
+                .and_then(|i| i.id.as_deref())
+                .and_then(crate::types::InstanceId::parse)
+        })
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FleetConfig {
     #[serde(default)]

@@ -80,7 +80,11 @@ pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
         // Dedup: re-creating a team with an existing name would otherwise
         // overwrite the registry entry and orphan the previous tab's PTY
         // subscription.
-        if crate::agent::lock_registry(ctx.registry).contains_key(&inst_name) {
+        // #1441: registry is UUID-keyed; resolve name via fleet.yaml to detect
+        // an existing-member collision.
+        if crate::fleet::resolve_uuid(ctx.home, &inst_name)
+            .is_some_and(|id| crate::agent::lock_registry(ctx.registry).contains_key(&id))
+        {
             tracing::warn!(team = team_name, member = %inst_name, "CREATE_TEAM skip: name already exists");
             failed.push(format!("{inst_name}: agent already exists"));
             continue;

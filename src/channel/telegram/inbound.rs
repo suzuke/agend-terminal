@@ -550,7 +550,9 @@ pub(super) fn agent_wants_raw_keystrokes(
         return false;
     };
     let reg = crate::agent::lock_registry(registry);
-    let Some(handle) = reg.get(instance_name) else {
+    // #1441: registry is UUID-keyed; this raw-keystroke check has no fleet
+    // home in scope, so locate the live handle by display name.
+    let Some(handle) = reg.values().find(|h| h.name.as_str() == instance_name) else {
         return false;
     };
     let core = Arc::clone(&handle.core);

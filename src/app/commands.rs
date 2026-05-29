@@ -309,7 +309,7 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
         }
         "send" => {
             if parts.len() >= 3
-                && !agent::send_to_registry(ctx.registry, "user", parts[1], parts[2])
+                && !agent::send_to_registry(ctx.registry, ctx.home, "user", parts[1], parts[2])
             {
                 tracing::warn!(target = parts[1], "send: agent not found in registry");
             }
@@ -321,10 +321,10 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
         }
         "status" => {
             let reg = agent::lock_registry(ctx.registry);
-            for (name, handle) in reg.iter() {
+            for handle in reg.values() {
                 {
                     let core = handle.core.lock();
-                    tracing::info!(agent = name, state = ?core.state.get_state(), "status");
+                    tracing::info!(agent = %handle.name, state = ?core.state.get_state(), "status");
                 }
             }
         }
@@ -358,6 +358,7 @@ mod tests {
     fn test_pane(id: usize, agent: &str, fleet_name: Option<&str>) -> Pane {
         Pane {
             agent_name: agent.into(),
+            instance_id: crate::types::InstanceId::default(),
             vterm: VTerm::new(10, 10),
             rx: crossbeam_channel::bounded(1).1,
             id,

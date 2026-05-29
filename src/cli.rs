@@ -55,9 +55,11 @@ pub fn capture_backend(b: &backend::Backend, seconds: u64) -> anyhow::Result<()>
     tracing::info!(%seconds, "capture: waiting for output");
     std::thread::sleep(std::time::Duration::from_secs(seconds));
 
+    // #1441: standalone capture spawns one ad-hoc agent into a fresh registry
+    // keyed by a minted UUID (no fleet context), so locate it by display name.
     let stripped = {
         let reg = registry.lock();
-        match reg.get(&name) {
+        match reg.values().find(|h| h.name.as_str() == name.as_str()) {
             Some(handle) => {
                 let raw = handle.core.lock().vterm.dump_screen();
                 agent::strip_ansi_pub(&String::from_utf8_lossy(&raw))
@@ -71,7 +73,7 @@ pub fn capture_backend(b: &backend::Backend, seconds: u64) -> anyhow::Result<()>
 
     {
         let reg = registry.lock();
-        if let Some(h) = reg.get(&name) {
+        if let Some(h) = reg.values().find(|h| h.name.as_str() == name.as_str()) {
             let _ = h.child.lock().kill();
         }
     }

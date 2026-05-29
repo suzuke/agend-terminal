@@ -41,7 +41,8 @@ impl PerTickHandler for HangDetectionHandler {
         // handler ever blocks the main loop (the H1 hypothesis from
         // #932 RCA).
         let reg = agent::lock_registry_tracked(ctx.registry, "hang_detection");
-        for (name, handle) in reg.iter() {
+        for handle in reg.values() {
+            let name = handle.name.as_str();
             let mut core = handle.core.lock();
             core.health.maybe_decay();
             let agent_state = core.state.current;

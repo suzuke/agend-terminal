@@ -150,11 +150,18 @@ pub(super) fn create_pane(
         registry,
     )?;
 
+    // #1441: resolve the authoritative UUID once (same source as the registry
+    // key spawn_agent just used) and route the pane's registry lookups by it.
+    // spawn_agent succeeded above, so the fleet.yaml entry — and thus the
+    // resolution — is guaranteed present.
+    let instance_id = crate::fleet::resolve_uuid(home, &name)
+        .ok_or_else(|| anyhow::anyhow!("agent '{name}' has no fleet UUID after spawn"))?;
+
     // Subscribe to the agent's output
     let (rx, dump) = {
         let reg = agent::lock_registry(registry);
         let handle = reg
-            .get(&name)
+            .get(&instance_id)
             .ok_or_else(|| anyhow::anyhow!("agent not found after spawn"))?;
         agent::subscribe_with_dump(handle)
     };
@@ -190,6 +197,7 @@ pub(super) fn create_pane(
 
     Ok(Pane {
         agent_name: name.into(),
+        instance_id,
         vterm,
         rx: pane_rx,
         id: pane_id,
@@ -216,13 +224,18 @@ pub(super) fn attach_pane(
     wakeup_tx: &crossbeam_channel::Sender<usize>,
     layout: &mut Layout,
 ) -> Result<Pane> {
-    let (rx, dump, backend_command) = {
+    // #1441: registry is UUID-keyed. Locate the live handle by its display
+    // name and adopt its authoritative `id` as the pane's routing key — the
+    // handle's id was itself resolved from fleet.yaml at spawn, so this is the
+    // same single source, no `home` threading needed on the attach path.
+    let (rx, dump, backend_command, instance_id) = {
         let reg = agent::lock_registry(registry);
-        let handle = reg
-            .get(name)
+        let (id, handle) = reg
+            .iter()
+            .find(|(_, h)| h.name.as_str() == name)
             .ok_or_else(|| anyhow::anyhow!("agent '{name}' not found in registry"))?;
         let (rx, dump) = agent::subscribe_with_dump(handle);
-        (rx, dump, handle.backend_command.clone())
+        (rx, dump, handle.backend_command.clone(), *id)
     };
 
     let mut vterm = VTerm::new(cols, rows);
@@ -252,6 +265,7 @@ pub(super) fn attach_pane(
 
     Ok(Pane {
         agent_name: name.to_string().into(),
+        instance_id,
         vterm,
         rx: pane_rx,
         id: pane_id,
@@ -431,6 +445,11 @@ pub(super) fn create_remote_pane(
 
     Ok(Pane {
         agent_name: name.to_string().into(),
+        // #1441: remote panes route input/resize through their `BridgeClient`,
+        // not the local registry, so this id is never used for routing. Resolve
+        // it from fleet.yaml for consistency; default when absent (harmless —
+        // unused on the remote path).
+        instance_id: crate::fleet::resolve_uuid(home, name).unwrap_or_default(),
         vterm: VTerm::new(cols, rows),
         rx: pane_rx,
         id: pane_id,

@@ -12,15 +12,9 @@ pub(crate) fn inbox_path(home: &Path, name: &str) -> PathBuf {
 pub(crate) fn inbox_path_resolved(home: &Path, name: &str) -> PathBuf {
     // Only use id-based path when the instance has a real ID in fleet.yaml
     // (backfilled by P1). Instances without an ID use name-based paths.
-    let id = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
-        .ok()
-        .and_then(|c| {
-            c.instances
-                .get(name)
-                .and_then(|i| i.id.as_deref())
-                .and_then(crate::types::InstanceId::parse)
-        });
-    let Some(id) = id else {
+    // #1441: route through the single authoritative resolver shared with the
+    // agent registry, so inbox identity and live-process identity cannot drift.
+    let Some(id) = crate::fleet::resolve_uuid(home, name) else {
         return inbox_path(home, name);
     };
     let id_path = home.join("inbox").join(format!("{}.jsonl", id.full()));

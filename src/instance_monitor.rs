@@ -65,21 +65,23 @@ pub fn collect(home: &std::path::Path, registry: &crate::agent::AgentRegistry) {
     );
 
     let now = Instant::now();
-    let handles: Vec<(String, Option<u32>)> = {
+    // #1441: registry is UUID-keyed; carry the id for the re-lock lookup and
+    // the display name for metadata / metrics / sort.
+    let handles: Vec<(crate::types::InstanceId, String, Option<u32>)> = {
         let reg = crate::agent::lock_registry(registry);
         reg.iter()
-            .map(|(name, handle)| {
+            .map(|(id, handle)| {
                 let pid = handle.child.lock().process_id();
-                (name.clone(), pid)
+                (*id, handle.name.to_string(), pid)
             })
             .collect()
     };
 
     let mut metrics = Vec::with_capacity(handles.len());
-    for (name, pid) in handles {
+    for (id, name, pid) in handles {
         let (agent_state, health_state) = {
             let reg = crate::agent::lock_registry(registry);
-            reg.get(&name)
+            reg.get(&id)
                 .map(|h| {
                     let c = h.core.lock();
                     (

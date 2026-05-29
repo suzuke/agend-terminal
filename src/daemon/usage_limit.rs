@@ -44,8 +44,8 @@ pub fn propagate_usage_limit(
 ) -> Vec<String> {
     let mut affected = Vec::new();
     let reg = crate::agent::lock_registry(registry);
-    for (name, handle) in reg.iter() {
-        if name == source_agent {
+    for handle in reg.values() {
+        if handle.name.as_str() == source_agent {
             continue;
         }
         let their_backend = crate::backend::Backend::from_command(&handle.backend_command);
@@ -53,7 +53,7 @@ pub fn propagate_usage_limit(
             let mut core = handle.core.lock();
             core.health
                 .set_blocked_reason(crate::health::BlockedReason::QuotaExceeded);
-            affected.push(name.clone());
+            affected.push(handle.name.to_string());
         }
     }
     drop(reg);

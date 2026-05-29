@@ -245,7 +245,7 @@ pub(crate) fn check_pane_input_not_submitted(
 ) {
     let agent_names: Vec<String> = {
         let reg = agent::lock_registry(registry);
-        reg.keys().cloned().collect()
+        reg.values().map(|h| h.name.to_string()).collect()
     };
     check_pane_input_not_submitted_for_agents(home, &agent_names, tracks);
 }
@@ -432,14 +432,16 @@ fn tick(
     // Snapshot the agent names + handles so we can release the registry lock
     // before touching any per-agent core lock. Holding both at once risks
     // deadlocks against code paths that take core then registry.
-    let handles: Vec<(String, _)> = {
+    // #1441: registry is UUID-keyed; carry the id for the re-lock lookup and
+    // the display name for the many name-keyed side channels in this loop.
+    let handles: Vec<(crate::types::InstanceId, String, _)> = {
         let reg = agent::lock_registry(registry);
         reg.iter()
-            .map(|(n, h)| (n.clone(), Arc::clone(&h.core)))
+            .map(|(id, h)| (*id, h.name.to_string(), Arc::clone(&h.core)))
             .collect()
     };
 
-    for (name, core) in handles {
+    for (instance_id, name, core) in handles {
         // Mutate state + pull the tail under the core lock, then drop it
         // before running `format!` and the Telegram spawn. `tail_lines`
         // allocates a fresh String, so the lock window is bounded by the
@@ -490,7 +492,7 @@ fn tick(
                 if new_state == crate::state::AgentState::UsageLimit {
                     let backend_cmd = {
                         let reg = crate::agent::lock_registry(registry);
-                        reg.get(&name).map(|h| h.backend_command.clone())
+                        reg.get(&instance_id).map(|h| h.backend_command.clone())
                     };
                     let backend = backend_cmd
                         .as_deref()
@@ -633,7 +635,7 @@ fn tick(
 /// modal keystrokes ("Yes, proceed") as new message submissions, causing
 /// infinite loops.
 pub(crate) fn process_server_rate_limit_retries(
-    _home: &std::path::Path,
+    home: &std::path::Path,
     registry: &AgentRegistry,
     retry_tracks: &mut HashMap<String, RateLimitRetry>,
 ) {
@@ -642,7 +644,10 @@ pub(crate) fn process_server_rate_limit_retries(
     // Phase 1: detect new ServerRateLimit states and schedule retries.
     {
         let reg = agent::lock_registry(registry);
-        for (name, handle) in reg.iter() {
+        // #1441: registry is UUID-keyed; `retry_tracks` stays name-keyed, so
+        // index it by the handle's display name.
+        for handle in reg.values() {
+            let name = handle.name.as_str();
             let state = handle.core.lock().state.current;
             if state == crate::state::AgentState::ServerRateLimit {
                 if retry_tracks.contains_key(name) {
@@ -651,7 +656,7 @@ pub(crate) fn process_server_rate_limit_retries(
                 let delay = Duration::from_secs(SERVER_RATE_LIMIT_BACKOFF[0]);
                 tracing::info!(agent = %name, delay_secs = delay.as_secs(), "ServerRateLimit detected, scheduling retry");
                 retry_tracks.insert(
-                    name.clone(),
+                    name.to_string(),
                     RateLimitRetry {
                         retry_count: 0,
                         next_retry_at: now + delay,
@@ -695,7 +700,9 @@ pub(crate) fn process_server_rate_limit_retries(
 
         let injected = {
             let reg = agent::lock_registry(registry);
-            if let Some(handle) = reg.get(name.as_str()) {
+            // #1441: registry is UUID-keyed; resolve the name-keyed track id.
+            if let Some(handle) = crate::fleet::resolve_uuid(home, name).and_then(|id| reg.get(&id))
+            {
                 agent::inject_to_agent(handle, CONTINUE_RETRY_PAYLOAD).is_ok()
             } else {
                 false
@@ -1265,7 +1272,8 @@ mod tests {
 
         let (handle, _reader) =
             mock_agent_handle("test-agent", crate::state::AgentState::ServerRateLimit);
-        registry.lock().insert("test-agent".to_string(), handle);
+        // #1441: registry is UUID-keyed — insert under the handle's own id.
+        registry.lock().insert(handle.id, handle);
 
         super::process_server_rate_limit_retries(&home, &registry, &mut tracks);
         assert!(
@@ -1293,7 +1301,8 @@ mod tests {
         );
 
         let (handle, _reader) = mock_agent_handle("test-agent", crate::state::AgentState::Ready);
-        registry.lock().insert("test-agent".to_string(), handle);
+        // #1441: registry is UUID-keyed — insert under the handle's own id.
+        registry.lock().insert(handle.id, handle);
 
         super::process_server_rate_limit_retries(&home, &registry, &mut tracks);
         assert!(
@@ -1315,7 +1324,16 @@ mod tests {
 
         let (handle, mut reader) =
             mock_agent_handle("test-agent", crate::state::AgentState::ServerRateLimit);
-        registry.lock().insert("test-agent".to_string(), handle);
+        // #1441: phase 2 inject resolves the name-keyed track via fleet.yaml;
+        // seed the entry with the handle's own id so resolution hits this
+        // registry entry (registry key == handle.id == resolve_uuid(name)).
+        let agent_id = handle.id;
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            format!("instances:\n  test-agent:\n    id: {}\n", agent_id.full()),
+        )
+        .ok();
+        registry.lock().insert(agent_id, handle);
 
         let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
         tracks.insert(

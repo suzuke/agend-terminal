@@ -550,6 +550,7 @@ mod tests {
     fn leaf(id: usize, agent: &str) -> Pane {
         Pane {
             agent_name: agent.into(),
+            instance_id: crate::types::InstanceId::default(),
             vterm: VTerm::new(10, 10),
             rx: crossbeam_channel::bounded(1).1,
             id,

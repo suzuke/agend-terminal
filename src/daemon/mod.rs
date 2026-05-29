@@ -445,7 +445,10 @@ fn run_core(
         match exit_event {
             crate::agent::AgentExitEvent::CleanExit(ref name) => {
                 tracing::info!(agent = %name, "clean exit — removing from registry (no respawn)");
-                ctx.registry.lock().remove(name.as_str());
+                // #1441: registry is UUID-keyed; resolve name via fleet.yaml.
+                if let Some(id) = crate::fleet::resolve_uuid(home, name) {
+                    ctx.registry.lock().remove(&id);
+                }
                 ctx.configs.lock().remove(name.as_str());
             }
             crate::agent::AgentExitEvent::Stage2Restart(name) => {
@@ -769,7 +772,7 @@ pub(crate) fn shutdown_sequence(
     let agents_to_kill: Vec<_> = {
         let mut reg = registry.lock();
         reg.drain()
-            .map(|(name, handle)| (name, handle.child))
+            .map(|(_id, handle)| (handle.name.to_string(), handle.child))
             .collect()
     };
     let agents_total = agents_to_kill.len();
@@ -939,7 +942,8 @@ fn replay_missed_at_startup(home: &Path, registry: &AgentRegistry) {
         );
 
         let reg = agent::lock_registry(registry);
-        if let Some(handle) = reg.get(target) {
+        // #1441: registry is UUID-keyed; resolve target name via fleet.yaml.
+        if let Some(handle) = crate::fleet::resolve_uuid(home, target).and_then(|id| reg.get(&id)) {
             if let Err(e) = agent::inject_to_agent(handle, message.as_bytes()) {
                 tracing::warn!(error = %e, "replay inject failed");
             }
@@ -1153,11 +1157,15 @@ fn handle_stage2_restart(
     );
     crate::event_log::log(home, "stage2_restart", name, "stage 2 auto-restart");
 
+    // #1441: registry is UUID-keyed; resolve once and key both the snapshot
+    // read and the post-spawn restore by it.
+    let instance_id = crate::fleet::resolve_uuid(home, name);
+
     // Snapshot the 4 fields we'll preserve across spawn. Reads then
     // drops the lock before backoff sleep + spawn.
     let saved = {
         let reg = agent::lock_registry(registry);
-        reg.get(name).map(|h| {
+        instance_id.and_then(|id| reg.get(&id)).map(|h| {
             let core = h.core.lock();
             (
                 core.health.crash_times.clone(),
@@ -1265,7 +1273,7 @@ fn handle_stage2_restart(
             // already encoded by spontaneous-recovery reset in
             // dispatcher).
             let reg = agent::lock_registry(registry);
-            if let Some(handle) = reg.get(name) {
+            if let Some(handle) = instance_id.and_then(|id| reg.get(&id)) {
                 let mut core = handle.core.lock();
                 let (crash_times, total_crashes, last_notification, prev_count) = saved;
                 core.health.crash_times = crash_times;
@@ -1750,10 +1758,24 @@ mod tests {
         (registry, configs, crash_tx, crash_rx, shutdown)
     }
 
+    /// #1441: managed spawns fail-fast unless the instance is in fleet.yaml;
+    /// seed authoritative ids for the named agents under `home`.
+    #[cfg(unix)]
+    fn seed_fleet_ids(home: &std::path::Path, names: &[&str]) {
+        let mut yaml = String::from("instances:\n");
+        for (i, n) in names.iter().enumerate() {
+            yaml.push_str(&format!(
+                "  {n}:\n    id: 0d0d0d0d-0000-4000-8000-{:012x}\n",
+                i + 1
+            ));
+        }
+        std::fs::write(crate::fleet::fleet_yaml_path(home), yaml).expect("seed fleet.yaml");
+    }
+
     #[cfg(unix)]
     fn kill_registered_child(registry: &AgentRegistry, name: &str) {
         let reg = registry.lock();
-        if let Some(handle) = reg.get(name) {
+        if let Some(handle) = reg.values().find(|h| h.name.as_str() == name) {
             let _ = handle.child.lock().kill();
         }
     }
@@ -1763,6 +1785,7 @@ mod tests {
     fn spawn_and_register_agent_publishes_port_synchronously() {
         let home = tmp_home("publish_sync");
         let run_dir = setup_run_dir_with_cookie(&home);
+        seed_fleet_ids(&home, &["probe-1"]);
         let (registry, configs, crash_tx, _crash_rx, shutdown) = make_test_registry();
         let def = make_shell_agent_def("probe-1");
 
@@ -1810,7 +1833,10 @@ mod tests {
         // 2. Registry MUST NOT contain the agent — caller sees a clean
         //    rollback state, no zombie entries.
         assert!(
-            registry.lock().get("rollback-probe").is_none(),
+            !registry
+                .lock()
+                .values()
+                .any(|h| h.name.as_str() == "rollback-probe"),
             "registry must NOT contain 'rollback-probe' after rollback"
         );
         // 3. AgentConfig MUST NOT contain the agent — configs map mirrors
@@ -1849,9 +1875,9 @@ mod tests {
         // covers the helper's degraded mode by construction.
         let home = tmp_home("attach_during_stagger");
         let run_dir = setup_run_dir_with_cookie(&home);
-        let (registry, configs, crash_tx, _crash_rx, shutdown) = make_test_registry();
-
         let agent_names = ["a-1", "a-2", "a-3", "a-4"];
+        seed_fleet_ids(&home, &agent_names);
+        let (registry, configs, crash_tx, _crash_rx, shutdown) = make_test_registry();
         for (i, name) in agent_names.iter().enumerate() {
             let def = make_shell_agent_def(name);
             spawn_and_register_agent(&home, &def, &registry, &configs, &crash_tx, &shutdown)

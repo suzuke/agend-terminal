@@ -601,6 +601,20 @@ fn main() -> anyhow::Result<()> {
                         (name, cmd, preset_args, None, None, submit_key)
                     })
                     .collect();
+                // #1441: managed spawns fail-fast unless the instance is in
+                // fleet.yaml (registry key == inbox identity, no random
+                // fallback). The `--agents` path skips fleet loading, so
+                // register each listed agent in fleet.yaml first — the same
+                // non-destructive merge the MCP create path uses; `FleetConfig::
+                // load` backfills the authoritative id, which the daemon spawn
+                // loop then resolves and registers under.
+                std::fs::create_dir_all(&home)?;
+                for (name, ..) in &agents {
+                    let entry = crate::fleet::InstanceYamlEntry::default();
+                    if let Err(e) = crate::fleet::add_instance_to_yaml(&home, name, &entry) {
+                        anyhow::bail!("failed to register '{name}' in fleet.yaml: {e}");
+                    }
+                }
                 daemon::run(&home, agents)?;
                 return Ok(());
             }
@@ -626,6 +640,17 @@ fn main() -> anyhow::Result<()> {
             } else if fleet_path.exists() {
                 cli::start_with_fleet(&home, &fleet_path)?;
             } else {
+                // #1441: register the fallback shell agent in fleet.yaml so the
+                // managed spawn resolves (registry key == inbox identity, no
+                // random fallback). See the `--agents` branch for rationale.
+                std::fs::create_dir_all(&home)?;
+                if let Err(e) = crate::fleet::add_instance_to_yaml(
+                    &home,
+                    "shell",
+                    &crate::fleet::InstanceYamlEntry::default(),
+                ) {
+                    anyhow::bail!("failed to register 'shell' in fleet.yaml: {e}");
+                }
                 daemon::run(
                     &home,
                     vec![(

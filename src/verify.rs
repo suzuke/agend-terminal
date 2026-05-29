@@ -102,6 +102,16 @@ pub fn run(
     let daemon_home = test_home.join("daemon");
     std::fs::create_dir_all(&daemon_home)?;
 
+    // #1441: spawn_agent fail-fasts for managed (home-bearing) spawns when the
+    // instance is absent from fleet.yaml. Seed authoritative UUIDs for the two
+    // daemon test agents so they spawn and resolve to a stable registry key.
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&daemon_home),
+        "instances:\n  \
+         test-a:\n    id: 11111111-1111-4111-8111-111111111111\n  \
+         test-b:\n    id: 22222222-2222-4222-8222-222222222222\n",
+    )?;
+
     let registry: agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
 
     // Spawn two test agents
@@ -272,7 +282,7 @@ fn test_attach(_home: &Path) -> TestResult {
     std::thread::sleep(std::time::Duration::from_secs(1));
     {
         let reg = registry.lock();
-        let Some(agent) = reg.get("verify-attach") else {
+        let Some(agent) = reg.values().find(|h| h.name.as_str() == "verify-attach") else {
             return TestResult::fail("attach", "agent not found after spawn");
         };
         let _ = agent::write_to_agent(agent, b"echo VERIFY_OK\r");
@@ -281,7 +291,7 @@ fn test_attach(_home: &Path) -> TestResult {
 
     let output = {
         let reg = registry.lock();
-        let Some(agent) = reg.get("verify-attach") else {
+        let Some(agent) = reg.values().find(|h| h.name.as_str() == "verify-attach") else {
             return TestResult::fail("attach", "agent not found before output read");
         };
         let core = agent.core.lock();
@@ -290,7 +300,7 @@ fn test_attach(_home: &Path) -> TestResult {
     let ok = output.contains("VERIFY_OK");
 
     let reg = registry.lock();
-    let Some(agent) = reg.get("verify-attach") else {
+    let Some(agent) = reg.values().find(|h| h.name.as_str() == "verify-attach") else {
         return TestResult::fail("attach", "agent not found during cleanup");
     };
     let _ = agent.child.lock().kill();
@@ -514,7 +524,8 @@ fn test_backend(backend: &backend::Backend, home: &Path) -> Vec<TestResult> {
                 + std::time::Duration::from_secs(preset.ready_timeout_secs);
             let ready = poll_until(deadline, || {
                 let reg = registry.lock();
-                reg.get(&agent_name)
+                reg.values()
+                    .find(|h| h.name.as_str() == agent_name.as_str())
                     .map(|h| {
                         let core = h.core.lock();
                         re.is_match(&String::from_utf8_lossy(&core.vterm.dump_screen()))
@@ -524,7 +535,10 @@ fn test_backend(backend: &backend::Backend, home: &Path) -> Vec<TestResult> {
 
             if !ready {
                 let reg = registry.lock();
-                if let Some(handle) = reg.get(&agent_name) {
+                if let Some(handle) = reg
+                    .values()
+                    .find(|h| h.name.as_str() == agent_name.as_str())
+                {
                     let dump = handle.core.lock().vterm.dump_screen();
                     let stripped = crate::agent::strip_ansi_pub(&String::from_utf8_lossy(&dump));
                     tracing::debug!(%name, "VTerm at timeout:");
@@ -551,7 +565,8 @@ fn test_backend(backend: &backend::Backend, home: &Path) -> Vec<TestResult> {
             if ready {
                 let inject_ok = {
                     let reg = registry.lock();
-                    reg.get(&agent_name)
+                    reg.values()
+                        .find(|h| h.name.as_str() == agent_name.as_str())
                         .map(|h| {
                             agent::write_to_agent(
                                 h,
@@ -574,7 +589,10 @@ fn test_backend(backend: &backend::Backend, home: &Path) -> Vec<TestResult> {
             std::thread::sleep(std::time::Duration::from_secs(2));
             {
                 let reg = registry.lock();
-                if let Some(h) = reg.get(&agent_name) {
+                if let Some(h) = reg
+                    .values()
+                    .find(|h| h.name.as_str() == agent_name.as_str())
+                {
                     let _ = agent::write_to_agent(
                         h,
                         format!("{}{}", preset.quit_command, preset.submit_key).as_bytes(),
@@ -582,7 +600,12 @@ fn test_backend(backend: &backend::Backend, home: &Path) -> Vec<TestResult> {
                 }
             }
 
-            let is_gone = || !registry.lock().contains_key(&agent_name);
+            let is_gone = || {
+                !registry
+                    .lock()
+                    .values()
+                    .any(|h| h.name.as_str() == agent_name.as_str())
+            };
             let mut quit_ok = poll_until(
                 std::time::Instant::now() + std::time::Duration::from_secs(5),
                 &is_gone,
@@ -591,7 +614,10 @@ fn test_backend(backend: &backend::Backend, home: &Path) -> Vec<TestResult> {
             if !quit_ok {
                 {
                     let reg = registry.lock();
-                    if let Some(h) = reg.get(&agent_name) {
+                    if let Some(h) = reg
+                        .values()
+                        .find(|h| h.name.as_str() == agent_name.as_str())
+                    {
                         let _ = agent::write_to_agent(h, &[0x03]); // Ctrl+C
                         std::thread::sleep(std::time::Duration::from_secs(1));
                         let _ = agent::write_to_agent(h, &[0x04]); // Ctrl+D
@@ -605,7 +631,10 @@ fn test_backend(backend: &backend::Backend, home: &Path) -> Vec<TestResult> {
 
             if !quit_ok {
                 let reg = registry.lock();
-                if let Some(h) = reg.get(&agent_name) {
+                if let Some(h) = reg
+                    .values()
+                    .find(|h| h.name.as_str() == agent_name.as_str())
+                {
                     let _ = h.child.lock().kill();
                 }
             }

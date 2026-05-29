@@ -13,7 +13,9 @@ pub(crate) fn handle_register_external(params: &Value, ctx: &HandlerCtx) -> Valu
         return json!({"ok": false, "error": e});
     }
     let reg = agent::lock_registry(ctx.registry);
-    if reg.contains_key(name) {
+    // #1441: registry is UUID-keyed; resolve name via fleet.yaml to detect a
+    // managed-name collision.
+    if crate::fleet::resolve_uuid(ctx.home, name).is_some_and(|id| reg.contains_key(&id)) {
         return json!({"ok": false, "error": format!("agent '{name}' already exists (managed)")});
     }
     let mut ext = agent::lock_external(ctx.externals);

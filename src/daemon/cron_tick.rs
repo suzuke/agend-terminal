@@ -97,13 +97,15 @@ pub fn check_schedules(home: &Path, registry: &AgentRegistry) {
         );
 
         let reg = agent::lock_registry(registry);
+        // #1441: registry is UUID-keyed; resolve target name via fleet.yaml.
+        let target_id = crate::fleet::resolve_uuid(home, target);
         let status = if fire.missed {
             // Daemon was down through the one-shot instant — don't silently
             // inject a stale message (could be a morning "stand-up" from
             // three days ago). Just mark it missed so the user can see it
             // in run_history, and let the auto-disable below retire it.
             "missed"
-        } else if let Some(handle) = reg.get(target) {
+        } else if let Some(handle) = target_id.and_then(|id| reg.get(&id)) {
             match agent::inject_to_agent(handle, message.as_bytes()) {
                 Ok(()) => "ok",
                 Err(e) => {

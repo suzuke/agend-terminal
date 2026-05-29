@@ -91,9 +91,9 @@ impl ConflictNotifyTracker {
         let mut observed: Vec<(String, crate::state::AgentState)> = Vec::new();
         {
             let reg = crate::agent::lock_registry(registry);
-            for (name, handle) in reg.iter() {
+            for handle in reg.values() {
                 let state = handle.core.lock().state.current;
-                observed.push((name.clone(), state));
+                observed.push((handle.name.to_string(), state));
             }
         }
 

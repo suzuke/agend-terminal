@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Unique instance identifier — UUIDv4 primary, 8-char short alias for display.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct InstanceId(pub uuid::Uuid);
 
 impl InstanceId {

@@ -255,7 +255,9 @@ fn sweep_child_tree_body(pid_file: &std::path::Path) {
         deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
-    registry.lock().insert(agent_name.clone(), handle);
+    // #1441: registry is UUID-keyed — insert under the handle's own id.
+    let agent_id = handle.id;
+    registry.lock().insert(agent_id, handle);
 
     // Wait for the grandchild's PID to be observable in the file —
     // `wait_for_nonempty_file` polls for content commit, not just
@@ -275,14 +277,14 @@ fn sweep_child_tree_body(pid_file: &std::path::Path) {
     );
 
     // Invoke the new helper. Should kill the entire process group.
-    sweep_child_tree(&agent_name, &registry);
+    sweep_child_tree(&agent_id, &registry);
 
     // Reap the shell child so kill(pid, 0) doesn't see it as a zombie.
     // Without wait(), the shell shows as "alive" even after SIGKILL
     // because we are its parent and never collected its exit status.
     {
         let reg = &registry.lock();
-        if let Some(h) = reg.get(&agent_name) {
+        if let Some(h) = reg.get(&agent_id) {
             {
                 let mut c = h.child.lock();
                 let _ = c.wait();
@@ -443,7 +445,7 @@ fn sweep_child_tree_unregistered_name_is_no_op() {
     use std::collections::HashMap;
     let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
     // Should not panic, should not error.
-    sweep_child_tree("does-not-exist", &registry);
+    sweep_child_tree(&crate::types::InstanceId::default(), &registry);
 }
 
 /// §3.5.10 concurrent-state fixture: multi-threaded producer/consumer
@@ -607,7 +609,10 @@ fn deleted_agent_reaper_no_shell_fallback() {
     // Set deleted flag (simulates DELETE handler)
     {
         let reg = registry.lock();
-        let handle = reg.get("del-test").expect("agent must exist");
+        let handle = reg
+            .values()
+            .find(|h| h.name.as_str() == "del-test")
+            .expect("agent must exist");
         handle.deleted.store(true, Ordering::SeqCst);
     }
 
@@ -618,7 +623,7 @@ fn deleted_agent_reaper_no_shell_fallback() {
     // With deleted=true, reaper returns early → registry entry removed
     // (by sweep_child_tree or naturally) but no new shell spawned.
     let reg = registry.lock();
-    match reg.get("del-test") {
+    match reg.values().find(|h| h.name.as_str() == "del-test") {
         None => {} // removed from registry — correct (no shell fallback)
         Some(h) => {
             // If still present, backend_command must NOT be a shell
@@ -834,7 +839,9 @@ fn send_to_registry_releases_lock_before_inject_1146() {
     let fn_start = src
         .find("fn send_to_registry(")
         .expect("send_to_registry must exist");
-    let fn_body = &src[fn_start..fn_start + 600];
+    // #1441 widened the window: the fn now resolves name → UUID before the
+    // lock block, so the `}; // lock released` marker sits further in.
+    let fn_body = &src[fn_start..fn_start + 900];
 
     let lock_end = fn_body
         .find("}; // lock released")
@@ -943,12 +950,13 @@ fn pty_read_error_triggers_cleanup() {
     }));
 
     let agent_name = "read-err-test";
+    let instance_id = crate::types::InstanceId::default();
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(true));
 
     registry.lock().insert(
-        agent_name.to_string(),
+        instance_id,
         AgentHandle {
-            id: crate::types::InstanceId::default(),
+            id: instance_id,
             name: agent_name.to_string().into(),
             backend_command: "test".to_string(),
             pty_writer: Arc::clone(&pty_writer),
@@ -987,12 +995,13 @@ fn pty_read_error_triggers_cleanup() {
     );
 
     assert!(
-        registry.lock().contains_key(agent_name),
+        registry.lock().contains_key(&instance_id),
         "pre-condition: agent must be in registry"
     );
 
     let ctx = PtyReadContext {
         name: agent_name.to_string(),
+        instance_id,
         core,
         pty_writer,
         registry: Arc::clone(&registry),
@@ -1010,7 +1019,7 @@ fn pty_read_error_triggers_cleanup() {
     pty_read_loop(&mut reader, &ctx, capture);
 
     assert!(
-        !registry.lock().contains_key(agent_name),
+        !registry.lock().contains_key(&instance_id),
         "#1144: read error path must call handle_pty_close which removes \
              agent from registry (shutdown=true path). Before fix, the Err \
              branch broke without cleanup, leaving a zombie entry."
@@ -1071,4 +1080,250 @@ fn write_guard_cleared_after_stuck_thread_completes() {
              Before fix, only the caller's success/error paths cleared it; \
              the timeout path left it set permanently."
     );
+}
+
+// ── #1441: registry UUID-key test matrix ─────────────────────────────────
+//
+// Six invariants guarding the name/UUID dual-track fix. The registry is keyed
+// by `InstanceId` resolved from fleet.yaml (the same source inbox uses), so a
+// reused name can never route a message to the wrong live process.
+
+/// Per-test temp home with a unique path.
+fn uuid_test_home(tag: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static C: AtomicU32 = AtomicU32::new(0);
+    let n = C.fetch_add(1, Ordering::Relaxed);
+    let d = std::env::temp_dir().join(format!("agend-1441-{}-{}-{}", std::process::id(), tag, n));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).expect("create test home");
+    d
+}
+
+/// Minimal live `AgentHandle` backed by an already-exiting `true` process.
+fn mk_handle_1441(name: &str, id: crate::types::InstanceId) -> AgentHandle {
+    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("openpty");
+    let mut cmd = CommandBuilder::new("true");
+    cmd.cwd(std::env::temp_dir());
+    let child = pair.slave.spawn_command(cmd).expect("spawn true");
+    drop(pair.slave);
+    let pty_writer: PtyWriter = Arc::new(Mutex::new(pair.master.take_writer().expect("writer")));
+    let pty_master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>> =
+        Arc::new(Mutex::new(pair.master));
+    let core = Arc::new(Mutex::new(AgentCore {
+        vterm: crate::vterm::VTerm::with_pty_writer(80, 24, Arc::clone(&pty_writer)),
+        subscribers: Vec::new(),
+        state: StateTracker::new(None),
+        health: HealthTracker::new(),
+    }));
+    AgentHandle {
+        id,
+        name: name.to_string().into(),
+        backend_command: "true".to_string(),
+        pty_writer,
+        pty_master,
+        core,
+        child: Arc::new(Mutex::new(child)),
+        submit_key: "\r".to_string(),
+        inject_prefix: String::new(),
+        typed_inject: false,
+        spawned_at: std::time::Instant::now(),
+        spawned_at_epoch_ms: 0,
+        deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    }
+}
+
+/// (1) Invariant: after a managed spawn, `registry key == handle.id ==
+/// resolve_uuid(name)` — the three identities share one fleet.yaml source.
+#[test]
+fn matrix1_invariant_key_eq_id_eq_resolve() {
+    let home = uuid_test_home("invariant");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  alpha:\n    id: a1a1a1a1-0000-4000-8000-000000000001\n",
+    )
+    .expect("write fleet.yaml");
+    let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let sleep_args = ["30".to_string()];
+    spawn_agent(
+        &SpawnConfig {
+            name: "alpha",
+            backend_command: "sleep",
+            args: &sleep_args,
+            spawn_mode: crate::backend::SpawnMode::Fresh,
+            cols: 80,
+            rows: 24,
+            env: None,
+            working_dir: None,
+            submit_key: "\r",
+            home: Some(&home),
+            crash_tx: None,
+            shutdown: None,
+        },
+        &registry,
+    )
+    .expect("spawn must succeed for fleet-registered instance");
+
+    let resolved = crate::fleet::resolve_uuid(&home, "alpha").expect("resolve");
+    {
+        let reg = registry.lock();
+        assert_eq!(reg.len(), 1, "exactly one managed entry");
+        let (key, handle) = reg.iter().next().expect("one entry");
+        assert_eq!(*key, handle.id, "registry key must equal handle.id");
+        assert_eq!(*key, resolved, "registry key must equal resolve_uuid(name)");
+    }
+    // Cleanup: kill the sleep child.
+    for h in registry.lock().values() {
+        let _ = h.child.lock().kill();
+    }
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// (2) The #1441 repro: two live handles share a name but differ by id.
+/// Resolution via fleet.yaml routes to the fleet id's handle, never the
+/// stale same-name collision.
+#[test]
+fn matrix2_same_name_diff_uuid_routes_to_fleet_id() {
+    let home = uuid_test_home("dual-track");
+    let fleet_id = crate::types::InstanceId::new();
+    let stale_id = crate::types::InstanceId::new();
+    assert_ne!(fleet_id, stale_id);
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!("instances:\n  dup:\n    id: {}\n", fleet_id.full()),
+    )
+    .expect("write fleet.yaml");
+
+    let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+    registry
+        .lock()
+        .insert(fleet_id, mk_handle_1441("dup", fleet_id));
+    registry
+        .lock()
+        .insert(stale_id, mk_handle_1441("dup", stale_id));
+
+    let resolved = crate::fleet::resolve_uuid(&home, "dup").expect("resolve");
+    assert_eq!(resolved, fleet_id, "name must resolve to the fleet id");
+    let reg = registry.lock();
+    let handle = reg.get(&resolved).expect("resolved handle present");
+    assert_eq!(
+        handle.id, fleet_id,
+        "lookup-by-resolved-id must hit the fleet handle, not the same-name stale one"
+    );
+    for h in reg.values() {
+        let _ = h.child.lock().kill();
+    }
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// (3) Pane output/input routing keys on `pane.instance_id` (UUID), not the
+/// display name — so a same-name collision can't steer a pane to the wrong
+/// live handle.
+#[test]
+fn matrix3_pane_routes_by_instance_id_not_name() {
+    let id_a = crate::types::InstanceId::new();
+    let id_b = crate::types::InstanceId::new();
+    let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+    registry.lock().insert(id_a, mk_handle_1441("twin", id_a));
+    registry.lock().insert(id_b, mk_handle_1441("twin", id_b));
+
+    // A pane whose authoritative key is id_b must resolve to the id_b handle,
+    // even though both handles share the name "twin".
+    let reg = registry.lock();
+    let routed = reg.get(&id_b).expect("pane.instance_id handle present");
+    assert_eq!(
+        routed.id, id_b,
+        "pane registry lookup must key on instance_id (UUID), not name"
+    );
+    for h in reg.values() {
+        let _ = h.child.lock().kill();
+    }
+}
+
+/// (4) Spawn fail-fast: a managed (home-bearing) spawn refuses when the
+/// instance is absent from fleet.yaml — no random-UUID fallback.
+#[test]
+fn matrix4_spawn_fails_fast_when_absent_from_fleet() {
+    let home = uuid_test_home("fail-fast"); // empty home, no fleet.yaml
+    let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let sleep_args = ["30".to_string()];
+    let result = spawn_agent(
+        &SpawnConfig {
+            name: "ghost",
+            backend_command: "sleep",
+            args: &sleep_args,
+            spawn_mode: crate::backend::SpawnMode::Fresh,
+            cols: 80,
+            rows: 24,
+            env: None,
+            working_dir: None,
+            submit_key: "\r",
+            home: Some(&home),
+            crash_tx: None,
+            shutdown: None,
+        },
+        &registry,
+    );
+    assert!(
+        result.is_err(),
+        "managed spawn must fail-fast when instance absent from fleet.yaml"
+    );
+    assert!(
+        registry.lock().is_empty(),
+        "no registry entry may be created on fail-fast"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// (5) Remove-by-id removes exactly the targeted handle, never a same-name
+/// collision sharing the display name.
+#[test]
+fn matrix5_remove_by_id_no_same_name_collision() {
+    let id_a = crate::types::InstanceId::new();
+    let id_b = crate::types::InstanceId::new();
+    let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+    registry
+        .lock()
+        .insert(id_a, mk_handle_1441("collide", id_a));
+    registry
+        .lock()
+        .insert(id_b, mk_handle_1441("collide", id_b));
+
+    {
+        let mut reg = registry.lock();
+        reg.remove(&id_a);
+        assert!(!reg.contains_key(&id_a), "targeted id removed");
+        assert!(
+            reg.contains_key(&id_b),
+            "same-name sibling under a different id must survive"
+        );
+        for h in reg.values() {
+            let _ = h.child.lock().kill();
+        }
+    }
+}
+
+/// (6) External agents stay name-keyed: the `ExternalRegistry` is a
+/// `HashMap<String, _>` and external fallback resolves by name (externals
+/// have no fleet.yaml/UUID source).
+#[test]
+fn matrix6_external_fallback_routes_by_name() {
+    let externals: ExternalRegistry = Arc::new(Mutex::new(HashMap::new()));
+    externals.lock().insert(
+        "ext-agent".to_string(),
+        ExternalAgentHandle {
+            backend_command: "remote".to_string(),
+            pid: 4321,
+        },
+    );
+    let reg = lock_external(&externals);
+    let handle = reg.get("ext-agent").expect("external resolves by name");
+    assert_eq!(handle.pid, 4321, "external lookup keyed by name");
 }

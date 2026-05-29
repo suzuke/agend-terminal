@@ -1219,7 +1219,9 @@ async fn fan_out_notifications(
                 if action_target_on_success == Some(sub.as_str()) {
                     continue;
                 }
-                let in_registry = agent::lock_registry(registry).contains_key(sub);
+                // #1441: registry is UUID-keyed; resolve subscriber via fleet.yaml.
+                let in_registry = crate::fleet::resolve_uuid(ctx.home, sub)
+                    .is_some_and(|id| agent::lock_registry(registry).contains_key(&id));
                 let fleet_known = fleet_cfg
                     .as_ref()
                     .map(|f| f.instances.contains_key(sub))

@@ -109,7 +109,9 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
 
         let (rx, pty_writer, pty_master, core) = {
             let reg = agent::lock_registry(registry);
-            let agent = match reg.get(name) {
+            // #1441: registry is UUID-keyed; this TUI-bridge server only knows
+            // the display name, so locate the live handle by name.
+            let agent = match reg.values().find(|h| h.name.as_str() == name) {
                 Some(a) => a,
                 None => continue,
             };

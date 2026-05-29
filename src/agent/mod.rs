@@ -46,7 +46,11 @@ pub struct AgentHandle {
     pub(crate) deleted: Arc<std::sync::atomic::AtomicBool>,
 }
 
-pub type AgentRegistry = Arc<Mutex<HashMap<String, AgentHandle>>>;
+// #1441: keyed by stable InstanceId (UUID), NOT name. Live-process identity
+// (PTY inject / pane subscription) now shares the same UUID authority as inbox
+// delivery (both via crate::fleet::resolve_uuid). Name→id resolution always
+// goes through that single resolver; the registry never holds its own name index.
+pub type AgentRegistry = Arc<Mutex<HashMap<crate::types::InstanceId, AgentHandle>>>;
 
 /// Handle for an externally connected agent (not PTY-managed by daemon).
 pub struct ExternalAgentHandle {
@@ -176,7 +180,7 @@ pub fn resolve_instance(
     // 1. Full UUID match
     if let Some(id) = crate::types::InstanceId::parse(name_or_id) {
         for (name, inst) in &fleet.instances {
-            if inst.id.as_deref().and_then(crate::types::InstanceId::parse) == Some(id.clone()) {
+            if inst.id.as_deref().and_then(crate::types::InstanceId::parse) == Some(id) {
                 return Ok((id, name.clone()));
             }
         }
@@ -213,7 +217,7 @@ pub fn resolve_instance(
 /// Lock the agent registry, recovering from poison.
 pub fn lock_registry(
     reg: &AgentRegistry,
-) -> parking_lot::MutexGuard<'_, std::collections::HashMap<String, AgentHandle>> {
+) -> parking_lot::MutexGuard<'_, std::collections::HashMap<crate::types::InstanceId, AgentHandle>> {
     crate::sync_audit::assert_lock_tier(1, "registry");
     reg.lock()
 }
@@ -281,11 +285,14 @@ pub fn lock_registry_tracked<'a>(reg: &'a AgentRegistry, site: &'static str) -> 
 /// window is harmless — the next acquirer's own `set_registry_holder`
 /// fires immediately after their acquire.
 pub struct RegistryGuard<'a> {
-    inner: parking_lot::MutexGuard<'a, std::collections::HashMap<String, AgentHandle>>,
+    inner: parking_lot::MutexGuard<
+        'a,
+        std::collections::HashMap<crate::types::InstanceId, AgentHandle>,
+    >,
 }
 
 impl<'a> std::ops::Deref for RegistryGuard<'a> {
-    type Target = std::collections::HashMap<String, AgentHandle>;
+    type Target = std::collections::HashMap<crate::types::InstanceId, AgentHandle>;
     fn deref(&self) -> &Self::Target {
         &self.inner
     }
@@ -663,22 +670,37 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
         health: HealthTracker::new(),
     }));
 
+    // #1441: resolve instance ID via the single authoritative resolver
+    // (same source as inbox). Resolved once here and reused for the registry
+    // key, the PTY-reaper context, and the router-subscriber lookup so all
+    // three share one authoritative identity.
+    //
+    // Fail-fast for *managed* spawns (`home` set): a missing fleet.yaml entry
+    // would force a random fallback UUID that diverges from inbox identity and
+    // reintroduces the name/UUID dual-track bug — refuse instead. When `home`
+    // is `None` (standalone `capture` CLI: no fleet, no inbox, no daemon), no
+    // second identity track exists to drift against, so a throwaway minted id
+    // is safe.
+    let instance_id = match config.home {
+        Some(h) => match crate::fleet::resolve_uuid(h, name) {
+            Some(id) => id,
+            None => {
+                return Err(anyhow::anyhow!(
+                    "spawn '{name}': cannot resolve InstanceId from fleet.yaml — \
+                     managed instances must be registered in fleet.yaml before spawn; \
+                     refusing to register the agent registry with a non-authoritative \
+                     random UUID (#1441)"
+                ));
+            }
+        },
+        None => crate::types::InstanceId::new(),
+    };
+
     // Register in registry
     {
-        // Sprint 46 P2: resolve instance ID from fleet.yaml (backfilled by P1).
-        let instance_id = config
-            .home
-            .and_then(|h| crate::fleet::FleetConfig::load(&h.join("fleet.yaml")).ok())
-            .and_then(|c| {
-                c.instances
-                    .get(*name)
-                    .and_then(|i| i.id.as_deref())
-                    .and_then(crate::types::InstanceId::parse)
-            })
-            .unwrap_or_default();
         let mut reg = registry.lock();
         reg.insert(
-            name.to_string(),
+            instance_id,
             AgentHandle {
                 id: instance_id,
                 name: name.to_string().into(),
@@ -705,7 +727,7 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
             },
         );
     }
-    rollback.mark_registered();
+    rollback.mark_registered(instance_id);
 
     // PTY read thread — feeds VTerm + broadcasts + auto-dismiss trust dialog + session reaper
     let core2 = Arc::clone(&core);
@@ -726,13 +748,14 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
     let shutdown_for_reaper = shutdown.clone();
     let deleted_for_reaper = {
         let reg = registry.lock();
-        reg.get(*name)
+        reg.get(&instance_id)
             .map(|h| Arc::clone(&h.deleted))
             .unwrap_or_default()
     };
     let n = name.to_string();
     let ctx = PtyReadContext {
         name: n.clone(),
+        instance_id,
         core: core2,
         pty_writer: pw,
         registry: reg_for_reaper,
@@ -775,6 +798,7 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
                     Ok(content) if !content.trim().is_empty() => {
                         spawn_instructions_bootstrap(
                             Arc::clone(registry),
+                            instance_id,
                             name.to_string(),
                             content,
                             std::time::Duration::from_secs(preset.ready_timeout_secs + 15),
@@ -805,7 +829,7 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
     // Done here (spawn site) so the router thread never needs L1/L2.
     {
         let reg = lock_registry(registry);
-        if let Some(handle) = reg.get(name.to_string().as_str()) {
+        if let Some(handle) = reg.get(&instance_id) {
             let (tx, rx) = crossbeam_channel::bounded(1024);
             handle.core.lock().subscribers.push(tx);
             crate::daemon::router::register_agent(name, rx);
@@ -828,6 +852,7 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
 /// process could swap the instructions file between write and inject.
 fn spawn_instructions_bootstrap(
     registry: AgentRegistry,
+    instance_id: crate::types::InstanceId,
     name: String,
     content: String,
     timeout: std::time::Duration,
@@ -859,7 +884,7 @@ fn spawn_instructions_bootstrap(
 
             let ready = {
                 let reg = &registry.lock();
-                match reg.get(&name) {
+                match reg.get(&instance_id) {
                     Some(h) => {
                         let core = &h.core.lock();
                         core.state.get_state() == crate::state::AgentState::Ready
@@ -880,7 +905,7 @@ fn spawn_instructions_bootstrap(
         std::thread::sleep(std::time::Duration::from_millis(500));
 
         let reg = &registry.lock();
-        if let Some(handle) = reg.get(&name) {
+        if let Some(handle) = reg.get(&instance_id) {
             if let Err(e) = inject_to_agent(handle, content.as_bytes()) {
                 tracing::warn!(agent = %name, error = %e, "instructions bootstrap inject failed");
             } else {
@@ -900,6 +925,10 @@ fn spawn_instructions_bootstrap(
 /// Context for PTY read loop reaper (reduces argument count).
 struct PtyReadContext {
     name: String,
+    /// #1441: authoritative registry key resolved once at spawn. The reaper
+    /// uses it for all registry lookups; `name` is kept for name-keyed side
+    /// channels (ipc port, heartbeat, event log, metadata, router, api).
+    instance_id: crate::types::InstanceId,
     core: Arc<Mutex<AgentCore>>,
     pty_writer: PtyWriter,
     registry: AgentRegistry,
@@ -918,6 +947,7 @@ fn pty_read_loop(
 ) {
     let PtyReadContext {
         name,
+        instance_id,
         core,
         pty_writer,
         registry,
@@ -1010,7 +1040,15 @@ fn pty_read_loop(
     // #1144: handle_pty_close runs after BOTH exit paths (EOF and read error).
     // Previously only the Ok(0) branch called it; the Err branch broke without
     // cleanup, leaving a zombie agent in the registry.
-    handle_pty_close(name, registry, home, crash_tx, shutdown, deleted);
+    handle_pty_close(
+        name,
+        instance_id,
+        registry,
+        home,
+        crash_tx,
+        shutdown,
+        deleted,
+    );
 }
 
 /// Sprint 21 F-NEW1: kill the process tree rooted at the agent's child PID,
@@ -1020,10 +1058,10 @@ fn pty_read_loop(
 /// No-op if the agent is not in the registry (already cleaned up) or if the
 /// child has no live PID (already reaped). Idempotent on dead PIDs — safe to
 /// call multiple times during the same crash-detection sequence.
-fn sweep_child_tree(name: &str, registry: &AgentRegistry) {
+fn sweep_child_tree(id: &crate::types::InstanceId, registry: &AgentRegistry) {
     let pid: Option<u32> = {
         let reg = registry.lock();
-        reg.get(name).and_then(|h| h.child.lock().process_id())
+        reg.get(id).and_then(|h| h.child.lock().process_id())
     };
     if let Some(pid) = pid {
         crate::process::kill_process_tree(pid);
@@ -1059,14 +1097,18 @@ fn classify_exit(exit_code: Option<i32>) -> ExitKind {
     }
 }
 
-fn wait_for_process_exit(name: &str, registry: &AgentRegistry) -> Option<i32> {
+fn wait_for_process_exit(
+    name: &str,
+    id: &crate::types::InstanceId,
+    registry: &AgentRegistry,
+) -> Option<i32> {
     for _ in 0..20 {
         let reg = registry.lock();
-        if reg.get(name).is_none() {
+        if reg.get(id).is_none() {
             tracing::debug!(agent = name, "not in registry, skipping crash handling");
             return Some(0);
         }
-        if let Some(handle) = reg.get(name) {
+        if let Some(handle) = reg.get(id) {
             let mut c = handle.child.lock();
             if let Ok(Some(status)) = c.try_wait() {
                 return Some(status.exit_code() as i32);
@@ -1078,17 +1120,22 @@ fn wait_for_process_exit(name: &str, registry: &AgentRegistry) -> Option<i32> {
     None
 }
 
-fn cleanup_agent(name: &str, registry: &AgentRegistry, home: &Option<std::path::PathBuf>) {
-    registry.lock().remove(name);
+fn cleanup_agent(
+    name: &str,
+    id: &crate::types::InstanceId,
+    registry: &AgentRegistry,
+    home: &Option<std::path::PathBuf>,
+) {
+    registry.lock().remove(id);
     if let Some(ref home) = home {
         crate::ipc::remove_port(&crate::daemon::run_dir(home), name);
     }
 }
 
-fn is_startup_failure(name: &str, registry: &AgentRegistry) -> bool {
+fn is_startup_failure(name: &str, id: &crate::types::InstanceId, registry: &AgentRegistry) -> bool {
     let uptime = {
         let reg = registry.lock();
-        reg.get(name)
+        reg.get(id)
             .map(|h| (h.spawned_at.elapsed(), h.spawned_at_epoch_ms))
     };
     let had_user_input = {
@@ -1124,6 +1171,7 @@ fn on_startup_failure(
 
 fn on_clean_exit_shell_fallback(
     name: &str,
+    id: &crate::types::InstanceId,
     exit_code: Option<i32>,
     registry: &AgentRegistry,
     home: &Option<std::path::PathBuf>,
@@ -1141,7 +1189,7 @@ fn on_clean_exit_shell_fallback(
 
     let (cols, rows) = {
         let reg = registry.lock();
-        reg.get(name)
+        reg.get(id)
             .map(|h| {
                 let c = h.core.lock();
                 (c.vterm.cols(), c.vterm.rows())
@@ -1161,7 +1209,7 @@ fn on_clean_exit_shell_fallback(
             })
     });
 
-    cleanup_agent(name, registry, home);
+    cleanup_agent(name, id, registry, home);
 
     let shell = crate::default_shell();
     let spawn_result = spawn_agent(
@@ -1209,11 +1257,16 @@ fn on_clean_exit_shell_fallback(
     }
 }
 
-fn on_crash_exit(name: &str, registry: &AgentRegistry, crash_tx: &Option<CrashChannel>) {
+fn on_crash_exit(
+    name: &str,
+    id: &crate::types::InstanceId,
+    registry: &AgentRegistry,
+    crash_tx: &Option<CrashChannel>,
+) {
     tracing::info!(agent = name, "setting restarting state");
     {
         let reg = registry.lock();
-        if let Some(handle) = reg.get(name) {
+        if let Some(handle) = reg.get(id) {
             handle.core.lock().state.set_restarting();
         }
     }
@@ -1226,6 +1279,7 @@ fn on_crash_exit(name: &str, registry: &AgentRegistry, crash_tx: &Option<CrashCh
 
 fn handle_pty_close(
     name: &str,
+    id: &crate::types::InstanceId,
     registry: &AgentRegistry,
     home: &Option<std::path::PathBuf>,
     crash_tx: &Option<CrashChannel>,
@@ -1238,13 +1292,13 @@ fn handle_pty_close(
         .unwrap_or(false);
     if is_shutdown {
         tracing::info!(agent = name, "stopped (daemon shutdown)");
-        cleanup_agent(name, registry, home);
+        cleanup_agent(name, id, registry, home);
         return;
     }
 
     tracing::info!(agent = name, "PTY closed, waiting for process exit");
-    let exit_code = wait_for_process_exit(name, registry);
-    sweep_child_tree(name, registry);
+    let exit_code = wait_for_process_exit(name, id, registry);
+    sweep_child_tree(id, registry);
 
     if deleted.load(std::sync::atomic::Ordering::SeqCst) {
         tracing::info!(agent = name, "agent deleted, skipping shell fallback");
@@ -1253,17 +1307,19 @@ fn handle_pty_close(
 
     match classify_exit(exit_code) {
         ExitKind::UserExit => {
-            if is_startup_failure(name, registry) {
+            if is_startup_failure(name, id, registry) {
                 on_startup_failure(name, home, crash_tx);
             } else {
-                on_clean_exit_shell_fallback(name, exit_code, registry, home, crash_tx, shutdown);
+                on_clean_exit_shell_fallback(
+                    name, id, exit_code, registry, home, crash_tx, shutdown,
+                );
             }
         }
         ExitKind::SignalKill => {
-            cleanup_agent(name, registry, home);
+            cleanup_agent(name, id, registry, home);
         }
         ExitKind::Crash => {
-            on_crash_exit(name, registry, crash_tx);
+            on_crash_exit(name, id, registry, crash_tx);
         }
     }
 }
@@ -1474,10 +1530,21 @@ impl InjectTarget {
 
 /// Send a message to a named agent via direct registry injection.
 /// Returns true if the agent was found and injected.
-pub fn send_to_registry(registry: &AgentRegistry, from: &str, target: &str, text: &str) -> bool {
+pub fn send_to_registry(
+    registry: &AgentRegistry,
+    home: &std::path::Path,
+    from: &str,
+    target: &str,
+    text: &str,
+) -> bool {
+    // #1441: resolve name → UUID via the single authoritative resolver so
+    // injection identity matches inbox identity (cannot drift).
+    let Some(target_id) = crate::fleet::resolve_uuid(home, target) else {
+        return false;
+    };
     let target_snapshot = {
         let reg = lock_registry(registry);
-        match reg.get(target) {
+        match reg.get(&target_id) {
             Some(handle) => InjectTarget::from_handle(handle),
             None => return false,
         }
@@ -1504,11 +1571,13 @@ pub fn broadcast_registry(
     let targets: Vec<(String, InjectTarget)> = {
         let reg = lock_registry(registry);
         reg.iter()
-            .filter(|(name, handle)| {
-                (exclude != Some(name.as_str()))
+            // #1441: registry is UUID-keyed; the display name lives on the
+            // handle. Filter `exclude` and the returned names off `handle.name`.
+            .filter(|(_id, handle)| {
+                (exclude != Some(handle.name.as_str()))
                     && crate::backend::Backend::from_command(&handle.backend_command).is_some()
             })
-            .map(|(name, handle)| (name.clone(), InjectTarget::from_handle(handle)))
+            .map(|(_id, handle)| (handle.name.to_string(), InjectTarget::from_handle(handle)))
             .collect()
     }; // lock released before any inject
     let target_names: Vec<String> = targets.iter().map(|(n, _)| n.clone()).collect();

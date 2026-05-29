@@ -35,8 +35,8 @@ impl PerTickHandler for SnapshotRotationHandler {
         let reg = agent::lock_registry_tracked(ctx.registry, "snapshot_rotation");
         let cfgs = ctx.configs.lock();
         let snapshots: Vec<_> = reg
-            .iter()
-            .map(|(name, handle)| {
+            .values()
+            .map(|handle| {
                 let (agent_state, health_state) = {
                     let c = handle.core.lock();
                     (
@@ -44,9 +44,9 @@ impl PerTickHandler for SnapshotRotationHandler {
                         c.health.state.display_name().to_string(),
                     )
                 };
-                let cfg = cfgs.get(name);
+                let cfg = cfgs.get(handle.name.as_str());
                 crate::snapshot::AgentSnapshot {
-                    name: name.clone(),
+                    name: handle.name.to_string(),
                     backend_command: handle.backend_command.clone(),
                     args: cfg.map(|c| c.args.clone()).unwrap_or_default(),
                     working_dir: cfg

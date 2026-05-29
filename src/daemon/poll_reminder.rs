@@ -35,7 +35,8 @@ pub fn remove_agent(name: &str) {
 pub fn collect_poll_reminders(home: &Path, registry: &AgentRegistry) -> Vec<(String, String)> {
     let mut result = Vec::new();
     let reg = agent::lock_registry(registry);
-    for (name, handle) in reg.iter() {
+    for handle in reg.values() {
+        let name = handle.name.as_str();
         let agent_state = handle.core.lock().state.current;
         if agent_state != AgentState::Idle {
             continue;
@@ -62,7 +63,7 @@ pub fn collect_poll_reminders(home: &Path, registry: &AgentRegistry) -> Vec<(Str
             "poll-reminder",
             &[("unread", &count_str), ("oldest", &age_str)],
         );
-        result.push((name.clone(), reminder));
+        result.push((name.to_string(), reminder));
     }
     result
 }
@@ -152,7 +153,8 @@ mod tests {
             deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let reg: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
-        reg.lock().insert(name.to_string(), handle);
+        // #1441: registry is UUID-keyed — insert under the handle's own id.
+        reg.lock().insert(handle.id, handle);
         reg
     }
 

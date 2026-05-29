@@ -13,7 +13,8 @@ pub(crate) fn handle_inject(params: &Value, ctx: &HandlerCtx) -> Value {
     let data = params["data"].as_str().unwrap_or("");
     let raw = params["raw"].as_bool().unwrap_or(false);
     let reg = agent::lock_registry(ctx.registry);
-    match reg.get(name) {
+    // #1441: registry is UUID-keyed; resolve name via fleet.yaml.
+    match crate::fleet::resolve_uuid(ctx.home, name).and_then(|id| reg.get(&id)) {
         Some(handle) => {
             let is_restarting = handle.core.lock().state.current.is_unavailable();
             if is_restarting {
@@ -47,7 +48,8 @@ pub(crate) fn handle_kill(params: &Value, ctx: &HandlerCtx) -> Value {
         return json!({"ok": false, "error": e});
     }
     let reg = agent::lock_registry(ctx.registry);
-    match reg.get(name) {
+    // #1441: registry is UUID-keyed; resolve name via fleet.yaml.
+    match crate::fleet::resolve_uuid(ctx.home, name).and_then(|id| reg.get(&id)) {
         Some(handle) => {
             {
                 let mut core = handle.core.lock();
@@ -140,7 +142,9 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
     if let Err(e) = agent::validate_name(name) {
         return json!({"ok": false, "error": e});
     }
-    if agent::lock_registry(ctx.registry).contains_key(name) {
+    if crate::fleet::resolve_uuid(ctx.home, name)
+        .is_some_and(|id| agent::lock_registry(ctx.registry).contains_key(&id))
+    {
         return json!({"ok": false, "error": format!("agent '{name}' already exists")});
     }
     let command = params["backend"]
@@ -321,7 +325,7 @@ pub(crate) fn handle_set_blocked_reason(params: &Value, ctx: &HandlerCtx) -> Val
         None => return json!({"ok": false, "error": format!("unknown reason: {reason_str}")}),
     };
     let reg = agent::lock_registry(ctx.registry);
-    match reg.get(name) {
+    match crate::fleet::resolve_uuid(ctx.home, name).and_then(|id| reg.get(&id)) {
         Some(handle) => {
             let mut core = handle.core.lock();
             let state = core.state.get_state().display_name().to_string();
@@ -339,7 +343,7 @@ pub(crate) fn handle_clear_blocked_reason(params: &Value, ctx: &HandlerCtx) -> V
     };
     let filter_reason = params["reason"].as_str();
     let reg = agent::lock_registry(ctx.registry);
-    match reg.get(name) {
+    match crate::fleet::resolve_uuid(ctx.home, name).and_then(|id| reg.get(&id)) {
         Some(handle) => {
             let mut core = handle.core.lock();
             let was = core
@@ -387,7 +391,7 @@ pub(crate) fn handle_pane_snapshot(params: &Value, ctx: &HandlerCtx) -> Value {
     };
     let lines = (params["lines"].as_u64().unwrap_or(100) as usize).min(10_000);
     let reg = agent::lock_registry(ctx.registry);
-    let handle = match reg.get(name) {
+    let handle = match crate::fleet::resolve_uuid(ctx.home, name).and_then(|id| reg.get(&id)) {
         Some(h) => h,
         None => return json!({"ok": false, "error": format!("instance '{name}' not found")}),
     };
@@ -415,6 +419,18 @@ mod tests {
         )));
         std::fs::create_dir_all(home.as_ref()).ok();
 
+        // #1441: seed fleet.yaml with an id so the managed spawn resolves to a
+        // stable registry key and the handlers (which resolve name → UUID via
+        // ctx.home) find the same entry.
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(home.as_ref()),
+            format!(
+                "instances:\n  {name}:\n    id: {}\n",
+                crate::types::InstanceId::new().full()
+            ),
+        )
+        .ok();
+
         // Leak the registries so they live for 'static — acceptable in tests.
         let registry: &'static agent::AgentRegistry =
             Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
@@ -434,7 +450,7 @@ mod tests {
             env: None,
             working_dir: None,
             submit_key: "\r",
-            home: None,
+            home: Some(home.as_ref()),
             crash_tx: None,
             shutdown: None,
         };
@@ -453,7 +469,7 @@ mod tests {
 
     fn cleanup_agent(ctx: &HandlerCtx, name: &str) {
         let reg = agent::lock_registry(ctx.registry);
-        if let Some(h) = reg.get(name) {
+        if let Some(h) = reg.values().find(|h| h.name.as_str() == name) {
             let _ = h.child.lock().kill();
         }
     }
@@ -473,7 +489,10 @@ mod tests {
 
         // Verify the reason is actually set on the HealthTracker
         let reg = agent::lock_registry(ctx.registry);
-        let handle = reg.get("health-set").expect("agent exists");
+        let handle = reg
+            .values()
+            .find(|h| h.name.as_str() == "health-set")
+            .expect("agent exists");
         let core = handle.core.lock();
         assert!(core.health.current_reason.is_some());
         match &core.health.current_reason {
@@ -510,7 +529,10 @@ mod tests {
 
         // Verify it's actually cleared
         let reg = agent::lock_registry(ctx.registry);
-        let handle = reg.get("health-clear").expect("agent exists");
+        let handle = reg
+            .values()
+            .find(|h| h.name.as_str() == "health-clear")
+            .expect("agent exists");
         let core = handle.core.lock();
         assert!(core.health.current_reason.is_none());
         drop(core);
@@ -530,7 +552,10 @@ mod tests {
         // Feed deterministic content into the agent's VTerm
         {
             let reg = agent::lock_registry(ctx.registry);
-            let handle = reg.get("snap-shape").expect("agent exists");
+            let handle = reg
+                .values()
+                .find(|h| h.name.as_str() == "snap-shape")
+                .expect("agent exists");
             let mut core = handle.core.lock();
             for i in 1..=5 {
                 core.vterm.process(format!("TESTLINE{i}\r\n").as_bytes());
@@ -567,9 +592,8 @@ mod tests {
 
         // Kill the agent so we can re-spawn with the same name
         cleanup_agent(&ctx, "meta-stale");
-        {
-            let mut reg = agent::lock_registry(ctx.registry);
-            reg.remove("meta-stale");
+        if let Some(id) = crate::fleet::resolve_uuid(ctx.home, "meta-stale") {
+            agent::lock_registry(ctx.registry).remove(&id);
         }
 
         // Pre-seed stale metadata
@@ -612,9 +636,8 @@ mod tests {
         let (ctx, home) = test_ctx_with_agent("meta-fresh");
         std::thread::sleep(std::time::Duration::from_millis(500));
         cleanup_agent(&ctx, "meta-fresh");
-        {
-            let mut reg = agent::lock_registry(ctx.registry);
-            reg.remove("meta-fresh");
+        if let Some(id) = crate::fleet::resolve_uuid(ctx.home, "meta-fresh") {
+            agent::lock_registry(ctx.registry).remove(&id);
         }
 
         // Ensure no metadata file exists
@@ -640,9 +663,8 @@ mod tests {
         let (ctx, home) = test_ctx_with_agent("team-meta");
         std::thread::sleep(std::time::Duration::from_millis(500));
         cleanup_agent(&ctx, "team-meta");
-        {
-            let mut reg = agent::lock_registry(ctx.registry);
-            reg.remove("team-meta");
+        if let Some(id) = crate::fleet::resolve_uuid(ctx.home, "team-meta") {
+            agent::lock_registry(ctx.registry).remove(&id);
         }
 
         // Pre-seed stale metadata
@@ -879,6 +901,15 @@ mod tests {
         let (ctx, home) = env_test_ctx("handle-spawn-params");
         let sentinel = home.join("sentinel.txt");
         let script = write_env_capture_script(&home, "MY_SPIKE_900_PARAMS_VAR", &sentinel);
+
+        // #1441: production create_instance persists the instance to fleet.yaml
+        // (MCP handler) before the SPAWN RPC; this test calls handle_spawn
+        // directly, so seed the entry — spawn_agent fail-fasts without it.
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  env-params-test:\n    backend: shell\n",
+        )
+        .expect("write fleet.yaml");
 
         let result = handle_spawn(
             &json!({

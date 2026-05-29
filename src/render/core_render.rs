@@ -65,7 +65,7 @@ fn build_agent_state_snapshot(
                     snapshot
                         .entry(pane.agent_name.to_string())
                         .or_insert_with(|| {
-                            reg.get(pane.agent_name.as_str())
+                            reg.get(&pane.instance_id)
                                 .map(|h| h.core.lock().state.get_state())
                                 .unwrap_or(AgentState::Idle)
                         });
@@ -608,6 +608,7 @@ mod tests {
     fn badge_shows_pending_count() {
         let pane = Pane {
             agent_name: "agent".into(),
+            instance_id: crate::types::InstanceId::default(),
             vterm: VTerm::new(10, 10),
             rx: crossbeam_channel::bounded(1).1,
             id: 1,
@@ -634,6 +635,7 @@ mod tests {
     fn pane_title_no_state_suffix() {
         let pane = Pane {
             agent_name: "agent".into(),
+            instance_id: crate::types::InstanceId::default(),
             vterm: VTerm::new(10, 10),
             rx: crossbeam_channel::bounded(1).1,
             id: 1,
@@ -679,6 +681,7 @@ mod tests {
             "empty".to_string(),
             crate::layout::Pane {
                 agent_name: "test".into(),
+                instance_id: crate::types::InstanceId::default(),
                 vterm: VTerm::new(10, 10),
                 rx: crossbeam_channel::bounded(1).1,
                 id: 1,

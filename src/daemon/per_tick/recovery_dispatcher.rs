@@ -226,7 +226,8 @@ impl PerTickHandler for RecoveryDispatcherHandler {
         let stage2_max = stage2_max_restarts();
         let stage3_active = stage3_gate_active();
 
-        for (name, handle) in reg.iter() {
+        for handle in reg.values() {
+            let name = handle.name.as_str();
             // Single per-agent lock acquisition reads all dispatcher
             // inputs, then drops the lock before any I/O or channel send.
             let snapshot = {

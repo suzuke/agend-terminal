@@ -24,6 +24,13 @@ pub enum PaneSource {
 /// pane only holds a subscriber channel and a local VTerm.
 pub struct Pane {
     pub agent_name: crate::types::AgentName,
+    /// #1441: authoritative registry key, resolved once from fleet.yaml at
+    /// pane construction (`create_pane` / `attach_pane`). All `Local`-pane
+    /// registry lookups (input/resize inject, status display) route through
+    /// this UUID rather than `agent_name`, so live-process identity matches
+    /// inbox identity and cannot drift when a name is reused. Carries
+    /// `InstanceId::default()` for non-fleet test panes (never routed).
+    pub instance_id: crate::types::InstanceId,
     pub vterm: VTerm,
     pub rx: crossbeam_channel::Receiver<Vec<u8>>,
     pub id: usize,
@@ -129,7 +136,7 @@ impl Pane {
         match &self.source {
             PaneSource::Local => {
                 let reg = agent::lock_registry(registry);
-                if let Some(handle) = reg.get(self.agent_name.as_str()) {
+                if let Some(handle) = reg.get(&self.instance_id) {
                     let _ = agent::write_to_agent(handle, bytes);
                 }
                 drop(reg);
@@ -151,7 +158,7 @@ impl Pane {
         match &self.source {
             PaneSource::Local => {
                 let reg = agent::lock_registry(registry);
-                if let Some(handle) = reg.get(self.agent_name.as_str()) {
+                if let Some(handle) = reg.get(&self.instance_id) {
                     let master = handle.pty_master.lock();
                     let _ = master.resize(portable_pty::PtySize {
                         rows,
@@ -177,6 +184,7 @@ mod tests {
     fn leaf(id: usize, name: &str) -> Pane {
         Pane {
             agent_name: name.into(),
+            instance_id: crate::types::InstanceId::default(),
             vterm: VTerm::new(10, 10),
             rx: crossbeam_channel::bounded(1).1,
             id,
@@ -241,6 +249,7 @@ mod tests {
     fn test_pane(rx: crossbeam_channel::Receiver<Vec<u8>>, cols: u16, rows: u16) -> Pane {
         Pane {
             agent_name: "agent".into(),
+            instance_id: crate::types::InstanceId::default(),
             vterm: VTerm::new(cols, rows),
             rx,
             id: 1,

@@ -389,10 +389,14 @@ fn handle_team_created(
 
     let running: Vec<&str> = {
         let reg = agent::lock_registry(registry);
+        // #1441: registry is UUID-keyed; match members against live display
+        // names (no fleet home threaded into this UI handler).
+        let names: std::collections::HashSet<String> =
+            reg.values().map(|h| h.name.to_string()).collect();
         members
             .iter()
             .map(|m| m.as_str())
-            .filter(|m| reg.contains_key(*m))
+            .filter(|m| names.contains(*m))
             .collect()
     };
     if running.is_empty() {
@@ -560,10 +564,14 @@ fn handle_team_members_changed(
     // nothing to attach). A member already inside the team tab is a no-op.
     let to_attach: Vec<&str> = {
         let reg = agent::lock_registry(registry);
+        // #1441: registry is UUID-keyed; match members against live display
+        // names (no fleet home threaded into this UI handler).
+        let names: std::collections::HashSet<String> =
+            reg.values().map(|h| h.name.to_string()).collect();
         added
             .iter()
             .map(|m| m.as_str())
-            .filter(|m| reg.contains_key(*m))
+            .filter(|m| names.contains(*m))
             .collect()
     };
     if !to_attach.is_empty() {
@@ -624,6 +632,7 @@ mod tests {
     fn leaf(id: usize, agent: &str) -> Pane {
         Pane {
             agent_name: agent.into(),
+            instance_id: crate::types::InstanceId::default(),
             vterm: VTerm::new(10, 10),
             rx: crossbeam_channel::bounded(1).1,
             id,

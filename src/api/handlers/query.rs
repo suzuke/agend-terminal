@@ -10,8 +10,9 @@ use serde_json::{json, Value};
 pub(crate) fn handle_list(_params: &Value, ctx: &HandlerCtx) -> Value {
     let reg = agent::lock_registry(ctx.registry);
     let mut agents: Vec<Value> = reg
-        .iter()
-        .map(|(name, handle)| {
+        .values()
+        .map(|handle| {
+            let name = handle.name.as_str();
             let (agent_state, health_state) = {
                 let c = handle.core.lock();
                 (

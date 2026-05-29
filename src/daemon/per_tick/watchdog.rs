@@ -43,7 +43,7 @@ impl PerTickHandler for WatchdogHandler {
         // migration so the ThreadDumpHandler can attribute either
         // handler as the H1 suspect.
         let reg = agent::lock_registry_tracked(ctx.registry, "watchdog");
-        for (name, handle) in reg.iter() {
+        for handle in reg.values() {
             let backend = match crate::backend::Backend::from_command(&handle.backend_command) {
                 Some(b) => b,
                 None => continue,
@@ -53,7 +53,7 @@ impl PerTickHandler for WatchdogHandler {
             let screen = core.vterm.tail_lines(rows);
             crate::daemon::watchdog::run_watchdog_pass(
                 ctx.home,
-                name,
+                handle.name.as_str(),
                 &backend,
                 &screen,
                 &mut core.health,

@@ -44,7 +44,7 @@ pub(super) fn maybe_create_telegram_topic(
     }
     let submit_key = {
         let reg = agent::lock_registry(registry);
-        reg.get(pane.agent_name.as_str())
+        reg.get(&pane.instance_id)
             .map(|h| h.submit_key.clone())
             .unwrap_or_else(|| "\r".to_string())
     };

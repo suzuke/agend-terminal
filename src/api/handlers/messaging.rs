@@ -45,7 +45,10 @@ fn validate_sender_and_target<'a>(
     }
 
     let reg = agent::lock_registry(ctx.registry);
-    let in_registry = reg.contains_key(target);
+    // #1441: registry is UUID-keyed; reuse the already-resolved target id.
+    let in_registry = target_resolved
+        .as_ref()
+        .is_some_and(|(id, _)| reg.contains_key(id));
     drop(reg);
     if !in_registry && target_resolved.is_none() {
         let msg = match crate::teams::find_team_for(ctx.home, target) {
@@ -130,6 +133,7 @@ fn check_team_isolation(home: &Path, from: &str, target: &str) -> Result<(), Val
 
 fn check_quota_gate(
     registry: &crate::agent::AgentRegistry,
+    home: &std::path::Path,
     params: &Value,
     target: &str,
 ) -> Result<(), Value> {
@@ -138,13 +142,16 @@ fn check_quota_gate(
     }
     let blocked = {
         let reg = agent::lock_registry(registry);
-        reg.get(target).map(|h| {
-            let core = h.core.lock();
-            matches!(
-                core.health.current_reason,
-                Some(crate::health::BlockedReason::QuotaExceeded)
-            )
-        })
+        // #1441: registry is UUID-keyed; resolve target name via fleet.yaml.
+        crate::fleet::resolve_uuid(home, target)
+            .and_then(|id| reg.get(&id))
+            .map(|h| {
+                let core = h.core.lock();
+                matches!(
+                    core.health.current_reason,
+                    Some(crate::health::BlockedReason::QuotaExceeded)
+                )
+            })
     };
     if blocked == Some(true) {
         return Err(
@@ -297,9 +304,11 @@ fn route_and_deliver(
     msg: crate::inbox::InboxMessage,
 ) -> &'static str {
     let reg = agent::lock_registry(ctx.registry);
-    let target_in_registry = reg.contains_key(target);
-    let is_codex = reg
-        .get(target)
+    // #1441: registry is UUID-keyed; resolve target name via fleet.yaml.
+    let target_id = crate::fleet::resolve_uuid(ctx.home, target);
+    let target_in_registry = target_id.is_some_and(|id| reg.contains_key(&id));
+    let is_codex = target_id
+        .and_then(|id| reg.get(&id))
         .map(|h| h.backend_command == "codex")
         .unwrap_or(false);
     drop(reg);
@@ -507,7 +516,7 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
     if let Err(e) = check_team_isolation(ctx.home, vs.from, vs.target) {
         return e;
     }
-    if let Err(e) = check_quota_gate(ctx.registry, params, vs.target) {
+    if let Err(e) = check_quota_gate(ctx.registry, ctx.home, params, vs.target) {
         return e;
     }
     let auto_task_id =
@@ -616,7 +625,7 @@ mod tests {
         let home = tmp_home("active-pty");
         std::fs::write(
             crate::fleet::fleet_yaml_path(&home),
-            "instances:\n  active-agent:\n    backend: claude\n  sender:\n    backend: claude\n",
+            "instances:\n  active-agent:\n    backend: claude\n    id: 0a0a0a0a-0000-4000-8000-000000000001\n  sender:\n    backend: claude\n",
         )
         .ok();
         // Spawn a real agent so it's in the registry
@@ -632,7 +641,7 @@ mod tests {
             env: None,
             working_dir: None,
             submit_key: "\r",
-            home: None,
+            home: Some(&home),
             crash_tx: None,
             shutdown: None,
         };
@@ -640,7 +649,7 @@ mod tests {
         // Override backend_command to "codex" for ACK absorption check
         {
             let mut reg = agent::lock_registry(registry);
-            if let Some(h) = reg.get_mut("codex-agent") {
+            if let Some(h) = reg.values_mut().find(|h| h.name.as_str() == "codex-agent") {
                 h.backend_command = "codex".to_string();
             }
         }
@@ -670,7 +679,7 @@ mod tests {
         );
         // Cleanup
         let reg = agent::lock_registry(registry);
-        if let Some(h) = reg.get("active-agent") {
+        if let Some(h) = reg.values().find(|h| h.name.as_str() == "active-agent") {
             let _ = h.child.lock().kill();
         }
         drop(reg);
@@ -695,10 +704,25 @@ mod tests {
     /// Set up fleet.yaml with given instances and teams. Sprint 54
     /// fleet-yaml unification: teams now live in the `teams:` block of
     /// fleet.yaml directly (was: separate teams.json runtime store).
+    /// #1441: deterministic valid UUID from an instance name so a seeded
+    /// fleet.yaml entry resolves to a stable registry key under the
+    /// UUID-keyed registry. FNV-1a folded into a version-4/variant-8 layout.
+    fn det_uuid(name: &str) -> String {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in name.bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        format!("00000000-0000-4000-8000-{:012x}", h & 0xffff_ffff_ffff)
+    }
+
     fn setup_team_env(home: &std::path::Path, fleet_instances: &[&str], teams: &[(&str, &[&str])]) {
         let mut yaml = String::from("instances:\n");
         for n in fleet_instances {
-            yaml.push_str(&format!("  {n}:\n    backend: claude\n"));
+            yaml.push_str(&format!(
+                "  {n}:\n    backend: claude\n    id: {}\n",
+                det_uuid(n)
+            ));
         }
         if !teams.is_empty() {
             yaml.push_str("teams:\n");
@@ -1079,7 +1103,7 @@ mod tests {
             env: None,
             working_dir: None,
             submit_key: "\r",
-            home: None,
+            home: Some(&home),
             crash_tx: None,
             shutdown: None,
         };
@@ -1087,7 +1111,7 @@ mod tests {
         // Override backend_command to "codex" for ACK absorption check
         {
             let mut reg = agent::lock_registry(registry);
-            if let Some(h) = reg.get_mut("codex-agent") {
+            if let Some(h) = reg.values_mut().find(|h| h.name.as_str() == "codex-agent") {
                 h.backend_command = "codex".to_string();
             }
         }
@@ -1121,7 +1145,7 @@ mod tests {
             "ack_absorbed event must be logged"
         );
         let reg = agent::lock_registry(registry);
-        if let Some(h) = reg.get("codex-agent") {
+        if let Some(h) = reg.values().find(|h| h.name.as_str() == "codex-agent") {
             let _ = h.child.lock().kill();
         }
         drop(reg);
@@ -1155,7 +1179,7 @@ mod tests {
             env: None,
             working_dir: None,
             submit_key: "\r",
-            home: None,
+            home: Some(&home),
             crash_tx: None,
             shutdown: None,
         };
@@ -1163,7 +1187,7 @@ mod tests {
         // Override backend_command to "codex" for ACK absorption check
         {
             let mut reg = agent::lock_registry(registry);
-            if let Some(h) = reg.get_mut("codex-agent") {
+            if let Some(h) = reg.values_mut().find(|h| h.name.as_str() == "codex-agent") {
                 h.backend_command = "codex".to_string();
             }
         }
@@ -1196,7 +1220,7 @@ mod tests {
             "cross-team message must NOT be absorbed: {result}"
         );
         let reg = agent::lock_registry(registry);
-        if let Some(h) = reg.get("codex-agent") {
+        if let Some(h) = reg.values().find(|h| h.name.as_str() == "codex-agent") {
             let _ = h.child.lock().kill();
         }
         drop(reg);
@@ -1207,7 +1231,7 @@ mod tests {
     fn same_team_codex_update_orchestrator_not_skipped() {
         let home = tmp_home("orch-not-skip");
         // codex-agent is the orchestrator of team-a
-        let yaml = "instances:\n  sender:\n    backend: claude\n  codex-agent:\n    backend: codex\n\
+        let yaml = "instances:\n  sender:\n    backend: claude\n  codex-agent:\n    backend: codex\n    id: 0c0c0c0c-0000-4000-8000-000000000001\n\
                     teams:\n  team-a:\n    members:\n      - sender\n      - codex-agent\n    orchestrator: codex-agent\n    created_at: \"2026-01-01T00:00:00Z\"\n";
         std::fs::create_dir_all(&home).unwrap();
         std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).ok();
@@ -1224,14 +1248,14 @@ mod tests {
             env: None,
             working_dir: None,
             submit_key: "\r",
-            home: None,
+            home: Some(&home),
             crash_tx: None,
             shutdown: None,
         };
         crate::agent::spawn_agent(&spawn_cfg, registry).expect("spawn");
         {
             let mut reg = agent::lock_registry(registry);
-            if let Some(h) = reg.get_mut("codex-agent") {
+            if let Some(h) = reg.values_mut().find(|h| h.name.as_str() == "codex-agent") {
                 h.backend_command = "codex".to_string();
             }
         }
@@ -1260,7 +1284,7 @@ mod tests {
             "orchestrator must NOT be skipped even for same-team codex update: {result}"
         );
         let reg = agent::lock_registry(registry);
-        if let Some(h) = reg.get("codex-agent") {
+        if let Some(h) = reg.values().find(|h| h.name.as_str() == "codex-agent") {
             let _ = h.child.lock().kill();
         }
         drop(reg);
@@ -1271,7 +1295,7 @@ mod tests {
     fn same_team_codex_update_non_orchestrator_skipped() {
         let home = tmp_home("non-orch-skip");
         // codex-agent is NOT the orchestrator (lead is)
-        let yaml = "instances:\n  sender:\n    backend: claude\n  codex-agent:\n    backend: codex\n  lead:\n    backend: claude\n\
+        let yaml = "instances:\n  sender:\n    backend: claude\n  codex-agent:\n    backend: codex\n    id: 0c0c0c0c-0000-4000-8000-000000000002\n  lead:\n    backend: claude\n\
                     teams:\n  team-a:\n    members:\n      - sender\n      - codex-agent\n      - lead\n    orchestrator: lead\n    created_at: \"2026-01-01T00:00:00Z\"\n";
         std::fs::create_dir_all(&home).unwrap();
         std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).ok();
@@ -1288,14 +1312,14 @@ mod tests {
             env: None,
             working_dir: None,
             submit_key: "\r",
-            home: None,
+            home: Some(&home),
             crash_tx: None,
             shutdown: None,
         };
         crate::agent::spawn_agent(&spawn_cfg, registry).expect("spawn");
         {
             let mut reg = agent::lock_registry(registry);
-            if let Some(h) = reg.get_mut("codex-agent") {
+            if let Some(h) = reg.values_mut().find(|h| h.name.as_str() == "codex-agent") {
                 h.backend_command = "codex".to_string();
             }
         }
@@ -1324,7 +1348,7 @@ mod tests {
             "non-orchestrator codex must be skipped for same-team update: {result}"
         );
         let reg = agent::lock_registry(registry);
-        if let Some(h) = reg.get("codex-agent") {
+        if let Some(h) = reg.values().find(|h| h.name.as_str() == "codex-agent") {
             let _ = h.child.lock().kill();
         }
         drop(reg);
@@ -1335,7 +1359,7 @@ mod tests {
     fn cross_team_codex_update_orchestrator_not_skipped() {
         let home = tmp_home("cross-orch-no-skip");
         // codex-agent is orchestrator, sender is "general" (cross-team bus)
-        let yaml = "instances:\n  general:\n    backend: claude\n  codex-agent:\n    backend: codex\n\
+        let yaml = "instances:\n  general:\n    backend: claude\n  codex-agent:\n    backend: codex\n    id: 0c0c0c0c-0000-4000-8000-000000000003\n\
                     teams:\n  team-a:\n    members:\n      - general\n    created_at: \"2026-01-01T00:00:00Z\"\n\
                     \n  team-b:\n    members:\n      - codex-agent\n    orchestrator: codex-agent\n    created_at: \"2026-01-01T00:00:00Z\"\n";
         std::fs::create_dir_all(&home).unwrap();
@@ -1353,14 +1377,14 @@ mod tests {
             env: None,
             working_dir: None,
             submit_key: "\r",
-            home: None,
+            home: Some(&home),
             crash_tx: None,
             shutdown: None,
         };
         crate::agent::spawn_agent(&spawn_cfg, registry).expect("spawn");
         {
             let mut reg = agent::lock_registry(registry);
-            if let Some(h) = reg.get_mut("codex-agent") {
+            if let Some(h) = reg.values_mut().find(|h| h.name.as_str() == "codex-agent") {
                 h.backend_command = "codex".to_string();
             }
         }
@@ -1389,7 +1413,7 @@ mod tests {
             "cross-team message must NOT be absorbed regardless of orchestrator: {result}"
         );
         let reg = agent::lock_registry(registry);
-        if let Some(h) = reg.get("codex-agent") {
+        if let Some(h) = reg.values().find(|h| h.name.as_str() == "codex-agent") {
             let _ = h.child.lock().kill();
         }
         drop(reg);
@@ -1702,14 +1726,14 @@ mod tests {
             env: None,
             working_dir: None,
             submit_key: "\r",
-            home: None,
+            home: Some(home),
             crash_tx: None,
             shutdown: None,
         };
         crate::agent::spawn_agent(&spawn_cfg, registry).expect("spawn");
         {
             let mut reg = agent::lock_registry(registry);
-            if let Some(h) = reg.get_mut(codex_agent) {
+            if let Some(h) = reg.values_mut().find(|h| h.name.as_str() == codex_agent) {
                 h.backend_command = "codex".to_string();
             }
         }
@@ -1765,7 +1789,7 @@ mod tests {
 
     fn cleanup_registry(registry: &agent::AgentRegistry, name: &str) {
         let reg = agent::lock_registry(registry);
-        if let Some(h) = reg.get(name) {
+        if let Some(h) = reg.values().find(|h| h.name.as_str() == name) {
             let _ = h.child.lock().kill();
         }
     }
@@ -1955,7 +1979,7 @@ mod tests {
             env: None,
             working_dir: None,
             submit_key: "\r",
-            home: None,
+            home: Some(&home),
             crash_tx: None,
             shutdown: None,
         };
@@ -2124,7 +2148,7 @@ mod tests {
     fn kind_report_cross_team_codex_via_general_still_injects() {
         let home = tmp_home("1065-t4-general");
         let yaml = "instances:\n  general:\n    backend: claude\n  \
-                    codex-rev:\n    backend: codex\nteams:\n  \
+                    codex-rev:\n    backend: codex\n    id: 0c0c0c0c-0000-4000-8000-000000000004\nteams:\n  \
                     team-a:\n    members:\n      - general\n    \
                     created_at: \"2026-01-01T00:00:00Z\"\n  \
                     team-b:\n    members:\n      - codex-rev\n    \
@@ -2144,14 +2168,14 @@ mod tests {
             env: None,
             working_dir: None,
             submit_key: "\r",
-            home: None,
+            home: Some(&home),
             crash_tx: None,
             shutdown: None,
         };
         crate::agent::spawn_agent(&spawn_cfg, registry).expect("spawn");
         {
             let mut reg = agent::lock_registry(registry);
-            if let Some(h) = reg.get_mut("codex-rev") {
+            if let Some(h) = reg.values_mut().find(|h| h.name.as_str() == "codex-rev") {
                 h.backend_command = "codex".to_string();
             }
         }

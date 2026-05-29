@@ -91,13 +91,18 @@ pub fn delete_transaction(
     // listings aren't blocked while we wait for exit.
     // Also set the `deleted` flag so the reaper thread (which may still be
     // alive) knows not to spawn a shell fallback.
-    let child_arc = {
+    // #1441: registry is UUID-keyed. Resolve the authoritative id from
+    // fleet.yaml (same source as inbox). `None` means no managed entry — the
+    // remove/wait steps below all no-op, matching the prior "name absent"
+    // behaviour.
+    let instance_id = crate::fleet::resolve_uuid(home, name);
+    let child_arc = instance_id.and_then(|id| {
         let reg = registry.lock();
-        if let Some(h) = reg.get(name) {
+        if let Some(h) = reg.get(&id) {
             h.deleted.store(true, std::sync::atomic::Ordering::SeqCst);
         }
-        reg.get(name).map(|h| Arc::clone(&h.child))
-    };
+        reg.get(&id).map(|h| Arc::clone(&h.child))
+    });
 
     let waited_ok = if let Some(child_arc) = child_arc {
         // Step 2: kill process tree first (covers backend child trees like
@@ -126,9 +131,9 @@ pub fn delete_transaction(
     };
 
     // Step 4: registry remove (after child exit confirmed or timeout).
-    {
+    if let Some(id) = instance_id {
         let mut reg = registry.lock();
-        reg.remove(name);
+        reg.remove(&id);
     }
 
     // Step 5: drop active-channel binding (Sprint 20.5 cross-validation finding).
@@ -178,7 +183,9 @@ pub struct SpawnRollback<'r> {
     name: String,
     registry: &'r AgentRegistry,
     child: Option<ChildArc>,
-    in_registry: bool,
+    /// #1441: authoritative UUID key for registry removal on rollback. Set by
+    /// `mark_registered` (the insert site already resolved it).
+    instance_id: Option<crate::types::InstanceId>,
     armed: bool,
 }
 
@@ -188,7 +195,7 @@ impl<'r> SpawnRollback<'r> {
             name: name.to_string(),
             registry,
             child: None,
-            in_registry: false,
+            instance_id: None,
             armed: true,
         }
     }
@@ -199,9 +206,10 @@ impl<'r> SpawnRollback<'r> {
         self.child = Some(child);
     }
 
-    /// Record that the registry insert has happened.
-    pub fn mark_registered(&mut self) {
-        self.in_registry = true;
+    /// Record that the registry insert has happened, capturing the UUID key
+    /// so rollback can remove the exact entry.
+    pub fn mark_registered(&mut self, instance_id: crate::types::InstanceId) {
+        self.instance_id = Some(instance_id);
     }
 
     /// Disarm the rollback. Caller invokes this on the success path.
@@ -217,9 +225,9 @@ impl<'r> Drop for SpawnRollback<'r> {
         }
         // Rollback in reverse insertion order so observers can't see a
         // half-cleaned state with a child but no registry entry, etc.
-        if self.in_registry {
+        if let Some(id) = self.instance_id {
             let mut reg = self.registry.lock();
-            reg.remove(&self.name);
+            reg.remove(&id);
             drop(reg);
             drop_active_binding(&self.name);
         }
@@ -267,12 +275,12 @@ mod tests {
         // the entry intact even when the guard is armed mid-flight.
         let reg = empty_registry();
         let mut guard = SpawnRollback::new("alpha", &reg);
-        guard.mark_registered();
+        guard.mark_registered(crate::types::InstanceId::default());
         guard.commit();
         // Drop fires here; armed=false so registry untouched.
         // We pre-seeded nothing, so the registry should still be empty
         // (mark_registered is a recorder, not a mutator).
-        assert!(reg.lock().get("alpha").is_none());
+        assert!(reg.lock().is_empty());
     }
 
     #[test]
@@ -280,13 +288,16 @@ mod tests {
         // Insert a placeholder handle so we can observe the rollback removing it.
         let reg = empty_registry();
         let placeholder = make_placeholder_handle("beta");
-        reg.lock().insert("beta".into(), placeholder);
+        // #1441: registry is UUID-keyed — insert under the handle's own id and
+        // hand the same id to the rollback recorder so Drop removes it.
+        let beta_id = placeholder.id;
+        reg.lock().insert(beta_id, placeholder);
         {
             let mut guard = SpawnRollback::new("beta", &reg);
-            guard.mark_registered();
+            guard.mark_registered(beta_id);
             // No commit — Drop fires armed → registry entry removed.
         }
-        assert!(reg.lock().get("beta").is_none());
+        assert!(reg.lock().is_empty());
     }
 
     #[test]
@@ -352,7 +363,15 @@ mod tests {
         let home = tmp_home("delete-exited");
         let reg = empty_registry();
         let handle = make_placeholder_handle("gamma");
-        reg.lock().insert("gamma".into(), handle);
+        // #1441: delete_transaction resolves the name via fleet.yaml; seed the
+        // entry with the handle's own id so the resolved key hits this entry.
+        let gamma_id = handle.id;
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            format!("instances:\n  gamma:\n    id: {}\n", gamma_id.full()),
+        )
+        .ok();
+        reg.lock().insert(gamma_id, handle);
         // `true` exits immediately, so wait_for_child_exit should observe
         // the exit on the first try_wait.
         let observed_exit = delete_transaction(&home, "gamma", &reg, None, false);
@@ -361,7 +380,7 @@ mod tests {
             "exited child must be observed within timeout"
         );
         assert!(
-            reg.lock().get("gamma").is_none(),
+            reg.lock().is_empty(),
             "registry entry must be removed after delete"
         );
         std::fs::remove_dir_all(&home).ok();
