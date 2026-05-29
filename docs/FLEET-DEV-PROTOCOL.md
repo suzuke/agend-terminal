@@ -1,6 +1,22 @@
-# Fleet Development Protocol v1.2 (Condensed)
+# Fleet Development Protocol v1.3
 
 **Status:** ACTIVE — all fleet agents must follow this protocol.
+
+## Protocol Structure & Maintenance
+
+This document has two layers:
+
+- **Normative layer (§0–§13)** — the rules. Everything you need to *act correctly right now*. No sprint numbers, PR/issue references, dates, or incident retellings live here. When you need to know "what is the rule for X," read only this layer.
+- **Appendix A — Rationale & Incident Log** — the *why* and the *when*. Sprint/PR/SHA references, activation histories, and the empirical incidents that motivated each rule. Keyed by section ID. A normative rule that was distilled from an incident carries a `↳ 緣由 A-§X` pointer; follow it only when you are questioning or revising the rule.
+- **Appendix B — Section Number Map** — archaeology of past renumberings.
+
+**Consolidation ritual (maintenance meta-rule).** New rules accrete; old ones rarely get retired. To keep the normative layer legible:
+
+- A new rule MUST land in the normative layer as an *imperative* (what to do), with any incident narrative going to Appendix A — never inline.
+- Every ~10 new rules OR every protocol-touching sprint, do a consolidation pass: merge overlapping rules, retire superseded ones (move the trail to Appendix A), and verify the normative layer still reads in one sitting.
+- If a normative section can no longer be read without its appendix entry to make sense, the rule wording is incomplete — fix the wording, don't lean on the appendix.
+
+---
 
 ## §0. KISS Principle
 
@@ -39,7 +55,7 @@ Orchestrator posts scope decision + creates task.
 
 Every review report must include: `scope_source`, `audit_mode`, `reviewed_head`, `commands`, `files`
 
-### 3.3.1 CI Verification Gate (Sprint 61)
+### 3.3.1 CI Verification Gate
 Before approving merge, orchestrator/reviewer MUST independently verify CI:
 
 ```
@@ -53,7 +69,7 @@ gh pr checks <PR#>
 - If any check is `pending`, wait and re-check
 - If any check is `fail`, block merge and report to implementer
 
-**Rationale:** Sprint 61 incident — ci_watch emitted false [ci-pass] on partial completion, leading to merge of failing code.
+`↳ 緣由 A-§3.3.1`
 
 ### 3.4 Re-review (r2) Dispatch
 Must enumerate r1 findings with status: fixed / deferred / withdrawn. Missing → reviewer falls back to `full_review`.
@@ -96,49 +112,43 @@ Feature/fix PRs must be test-first: failing test commit BEFORE impl commit.
 - (c) Same root cause deferred twice → mandatory dual reviewer + operator sign-off
 - (d) Removing defensive code → 4-perspective counter-example challenge; 0 compelling = safe to delete
 
-### 3.12 Verdict Externalization (was §3.5.13)
-Fleet-internal verdict MUST mirror to GH PR comment (`gh pr comment`). Self-merge gate: dual VERIFIED + CI green (independently verified via `gh pr checks`) + verdict mirror posted — all three required before merge. Canonical merge command is `gh pr merge <N> --auto --squash --delete-branch` (§3.12.1 ACTIVE since 2026-05-20). Legacy form `gh pr merge <N> --squash --delete-branch` remains valid as escape-hatch for queue-contention recovery or admin-bypass scenarios (per #985/#988 deviation precedent).
+### 3.12 Verdict Externalization
+Fleet-internal verdict MUST mirror to GH PR comment (`gh pr comment`). Self-merge gate: dual VERIFIED + CI green (independently verified via `gh pr checks`) + verdict mirror posted — **all three required before merge**.
 
-#### 3.12.1 `gh pr merge --auto` adoption (Sprint 65, #973) — ACTIVE since 2026-05-20
+Canonical merge command: `gh pr merge <N> --auto --squash --delete-branch` (see §3.12.1). Legacy form `gh pr merge <N> --squash --delete-branch` remains a valid escape-hatch for queue-contention recovery or admin-bypass scenarios.
 
-The canonical self-merge invocation is `gh pr merge <N> --auto --squash --delete-branch` (requires `gh` CLI >= 2.31.0). `--auto` moves merge submission to GitHub's server-side queue, eliminating the "Base branch was modified" race observed in #971 close-loop (2026-05-20).
+`↳ 緣由 A-§3.12`
 
-**Activation status**: ACTIVE as of 2026-05-20 after #986 gh-poll integration shipped (PR #990, merge commit 4242c24). Prior to this date the canonical form was the legacy synchronous `gh pr merge <N> --squash --delete-branch` because `--auto`'s async-return discarded the synchronous merge confirmation. With #972 PR-state aggregator + #986 gh-poll integration both live, the `[pr-merged]` event now fires from real GitHub observation post-merge, restoring async-flow visibility and unlocking this default switch.
+#### 3.12.1 `gh pr merge --auto` (canonical self-merge)
 
-**Prerequisites** (one-time per repo, enabled in #973):
+Canonical invocation: `gh pr merge <N> --auto --squash --delete-branch` (requires `gh` CLI >= 2.31.0). `--auto` moves merge submission to GitHub's server-side queue, eliminating the "Base branch was modified" race.
+
+**Prerequisites** (one-time per repo, repo-admin rights required):
 - `allow_auto_merge: true` at repo level (`gh api repos/<owner>/<repo> -X PATCH -F allow_auto_merge=true`)
 - Branch protection on `main` with `required_status_checks.strict=true` covering the full CI matrix (`Check (ubuntu-latest|macos-latest|windows-latest)`, `LOC overrun`, `audit`). Without `strict=true`, `--auto` invoked after all checks already reported merges IMMEDIATELY — silently skipping the §3.12 conjunction gate. With `strict=true`, GitHub re-checks against current main before merging.
-- Admin-permission note: enabling these settings requires repo admin rights. Delegated maintainers should request via operator.
 
-**Behavior**: `gh pr merge --auto` returns immediately (does NOT block on CI). Merge fires asynchronously when the protection-gate conjunction holds. Author MUST NOT poll manually; the `[pr-merged]` event (delivered by daemon PR-state aggregator #972 + gh-poll observation #986) is the close-loop confirmation source.
+**Behavior**: returns immediately (does NOT block on CI). Merge fires asynchronously when the protection-gate conjunction holds. Author MUST NOT poll manually; wait for the `[pr-merged]` event (daemon close-loop confirmation).
 
-**Escape-hatch — stalled `--auto`**: if no `[pr-merged]` arrives within 30 min of CI green + verdict mirror posted, possible causes:
-1. Required check never reports (CI infrastructure issue)
-2. Branch protection mis-configuration (status-check context name drift)
-3. Token / permission issue on the `--auto` arming agent
-
-Recovery, in order:
+**Escape-hatch — stalled `--auto`** (no `[pr-merged]` within 30 min of CI green + verdict mirror posted). Recovery, in order:
 - (a) Verify protection state: `gh api repos/<owner>/<repo>/branches/main/protection --jq '.required_status_checks'`
 - (b) Verify PR is mergeable: `gh pr view <N> --json mergeable,statusCheckRollup`
-- (c) Re-arm: `gh pr merge <N> --auto --squash --delete-branch` (idempotent — re-arming when already armed is a no-op)
+- (c) Re-arm: `gh pr merge <N> --auto --squash --delete-branch` (idempotent)
 - (d) Last resort — manual fallback: `gh pr merge <N> --squash --delete-branch` (synchronous; may hit base-modified race; retry 3s later if it does)
 - Notify lead via `send(kind=update)` if escape-hatch invoked, with case (a)/(b)/(c)/(d) identifier.
 
-**Async confirmation pipeline (#972 + #986)**: `--auto` returns immediately, so the synchronous "PR merged at SHA" terminal feedback is gone. The daemon PR-state aggregator (#972, merged be23875) + gh-poll integration (#986, merged 4242c24) together emit `[pr-merged]` events to the PR author's inbox after observing the GitHub-side merge. Author waits for the event rather than polling.
+`↳ 緣由 / 活化史 A-§3.12.1`
 
-**Activation history**: §3.12.1 was introduced in #973 (this rule's home PR) but kept INACTIVE until #972 + #986 both shipped. Activation switch landed 2026-05-20 as a docs-only follow-up (flips canonical form from legacy `gh pr merge ... --squash --delete-branch` to `gh pr merge ... --auto --squash --delete-branch`).
-
-### 3.13 Log-level Changes (was §3.5.14)
+### 3.13 Log-level Changes
 Must have inline rationale, otherwise `LEVEL-CHANGE-RATIONALE-ABSENT — UNVERIFIED`.
 
-### 3.14 Observability PRs (was §3.5.15)
+### 3.14 Observability PRs
 Must include e2e integration test exercising the production hook path.
 
 ### 3.15 Daemon-core Cushion Rule
 PRs touching daemon core / channel / supervisor / state.rs must include stress test + lock-ordering analysis before dispatch. "不急 ship" principle — correctness over velocity for infrastructure changes.
 
-### 3.16 Phase 1 Discussion Discipline (Sprint 62)
-**Pre-impl source-code spike is mandatory.** Lead's initial proposal MUST be challenged by dev's 5-10min source-code spike before Phase 2 dispatch. Rationale: lead's "from-code-structure" inference consistently misses scope holes (8/12 PRs in 2026-05-14 retrospective). Spike outputs:
+### 3.16 Phase 1 Discussion Discipline
+**Pre-impl source-code spike is mandatory.** Lead's initial proposal MUST be challenged by dev's 5-10min source-code spike before Phase 2 dispatch. Spike outputs:
 - Confirm or refute lead's initial site count
 - Surface bonus emission sites lead missed
 - Distinguish "near-bug" from "asserts-on-bug-signature" (issue body counts often conflate)
@@ -147,6 +157,8 @@ PRs touching daemon core / channel / supervisor / state.rs must include stress t
 **Three-party substantive consensus required**: reviewer must offer at least one design challenge AND dev must offer at least one impl concern before consensus is recorded. Triple ACK without substance = rubber-stamp = `RUBBER-STAMP — UNVERIFIED`.
 
 **Issue body counts are estimates, not contracts.** When issue body says "N sites / N tests need updating," dev spike re-counts. Actual surface may be narrower OR wider than the initial estimate.
+
+`↳ 緣由 A-§3.16`
 
 ### 3.17 Static-Review Limits + Runtime Validation Required
 Static / structural review is INSUFFICIENT for the following surfaces:
@@ -174,32 +186,24 @@ Reviewers MUST inspect PRs from their own daemon-bound worktree. Specifically:
 - **Never `cd` into the canonical source repo** to inspect a PR. The canonical is the operator's working tree; reviewer activity must not leave detached HEAD or stale refs there.
 - **Never create refs in canonical** (`git checkout -b tmp_pr_review`, `git checkout <sha>`, `git fetch origin pr/N/head:pr_head`, etc.). These leave `pr*_head` / `tmp*` / `review/*` branches behind that pollute `git branch --list` and confuse later operator commands.
 - **Use `gh pr diff <N>` or `gh pr view <N> --json files`** to read PR contents without checkout. If a full tree inspection is needed, `repo action=checkout` MCP tool provisions a fresh daemon-managed worktree at the PR's HEAD; releasing it (`release_worktree`) does not touch canonical.
-- **If canonical state is observed dirty post-review** (detached HEAD, stale `tmp*` / `pr*_head` branches), the reviewer's verdict is REJECTED until the canonical is cleaned (operator action OR `repo action=cleanup_merged_branches` with the `reviewer_checkout` category once L3 lands).
+- **If canonical state is observed dirty post-review** (detached HEAD, stale `tmp*` / `pr*_head` branches), the reviewer's verdict is REJECTED until the canonical is cleaned (operator action OR `repo action=cleanup_merged_branches` with the `reviewer_checkout` category).
 
-Enforcement: L2 `agend-git` shim refuses `checkout -b` and `checkout <sha>` from agent callers when cwd=canonical (PR-B). L3 sweeper cleans the residue and auto-switches detached canonical HEAD back to main at daemon boot (PR-C).
+Enforcement: the `agend-git` shim refuses `checkout -b` and `checkout <sha>` from agent callers when cwd=canonical; a boot-time sweeper cleans residue and auto-switches detached canonical HEAD back to main.
 
 ### 3.19.1 Agent Git Anti-Patterns
 
-§3.19 names what reviewers must not do. This section names two failure modes — both surfaced empirically by the #863 reviewer incident — and the correct recovery path. Apply to every agent, not only reviewers.
+§3.19 names what reviewers must not do. This section names two failure modes and the correct recovery path. Apply to every agent, not only reviewers.
 
-**Anti-pattern 1 — `AGEND_GIT_BYPASS=1` to escape a shim deny.**
-
-When the `agend-git` shim denies an agent action, the deny is a protocol signal, not a transient error. Re-running the same command with `AGEND_GIT_BYPASS=1` is forbidden.
+**Anti-pattern 1 — `AGEND_GIT_BYPASS=1` to escape a shim deny.** When the `agend-git` shim denies an agent action, the deny is a protocol signal, not a transient error. Re-running the same command with `AGEND_GIT_BYPASS=1` is forbidden.
 
 - **WRONG**: shim denies → set `AGEND_GIT_BYPASS=1` → retry. The bypass succeeds at the git level but skips the protocol gate that the deny was enforcing; whatever the gate was protecting (canonical hygiene, lease invariants, reviewer workspace boundary) is now violated silently.
 - **RIGHT**: abort the operation. Send `kind=query` to lead/orchestrator naming the denied command + the shim's reason string, and ask for the correct routing.
 
-Reasoning:
+`AGEND_GIT_BYPASS=1` exists for **daemon-internal helpers** (`canonical_hygiene`, `branch_sweep`, `conflict_notify`) that read worktree state from canonical-rooted paths and would otherwise self-deny. It is not an escape hatch for agents. "Ask, don't bypass" is the universal recovery: a deny means the daemon owns the routing answer, and asking is cheap.
 
-- `AGEND_GIT_BYPASS=1` exists for **daemon-internal helpers** (`canonical_hygiene`, `branch_sweep`, `conflict_notify`) that read worktree state from canonical-rooted paths and would otherwise self-deny. It is not an escape hatch for agents.
-- The bypass typically surfaces hidden state on top of the original problem. In the #863 incident, bypassing a checkout deny materialized a phantom `.gitignore` conflict that did not exist on the target branch, leaving the reviewer stuck on a fabricated merge conflict.
-- "Ask, don't bypass" is the universal recovery: a deny means the daemon owns the routing answer, and asking is cheap.
+**Anti-pattern 2 — `git checkout <sha>` to materialize a PR review.** Even in the agent's own daemon-bound worktree, `git checkout <sha>` is the wrong primitive for PR review:
 
-**Anti-pattern 2 — `git checkout <sha>` to materialize a PR review.**
-
-Even in the agent's own daemon-bound worktree, `git checkout <sha>` is the wrong primitive for PR review:
-
-- Leaves detached-HEAD residue — the class of pollution that #852 (canonical hygiene) and #858 (shim deny matrix) exist to prevent.
+- Leaves detached-HEAD residue.
 - Conflicts with the daemon's branch lease on the worktree, producing later "branch already leased" errors that look unrelated.
 - Bypasses §3.19's shim-enforced workspace boundary even when run from a non-canonical cwd, because the shim's lease/lifecycle invariants assume branch-rooted HEADs.
 
@@ -210,7 +214,7 @@ Right path, by inspection depth:
 
 If `repo action=checkout` fails (lease already held, branch unknown, worktree quota exhausted) → **ask, don't bypass**. Send `kind=query` to lead with the failure mode; lead routes via `force_release_worktree` or alternate provisioning. Falling back to `git checkout <sha>` after a `repo` failure recreates the exact class of pollution this section forbids.
 
-**Relationship to §3.19.** §3.19 says *what reviewers must not do in canonical*. §3.19.1 says *what every agent must do when the protocol gate fires* — abort and ask, not bypass and retry.
+`↳ 緣由 A-§3.19.1`
 
 ### 3.19.2 Reviewer Base Workspace Branch Discipline
 
@@ -224,43 +228,30 @@ Use one of:
 
 **NEVER** in-place `git checkout` of an impl branch in the agent's base workspace dir.
 
-Rationale: incident 2026-05-20 — fixup-reviewer base dir was found stuck on `fix/900-spawn-env-propagation` with 492 deletion markers from a 2026-05-18 in-place checkout that was never reverted. Recovery cost session backend state (`.codex/.claude/.gemini/.kiro/.opencode/AGENTS.md` removed by `git clean -fd` because those dirs weren't in the fix/900-era `.gitignore`). The reflog showed the original Sprint discipline used `review/NNN-r0` per-PR worktrees correctly (2026-05-16 entries), then drifted to in-place checkouts.
-
-**Relationship to §3.19.** §3.19 forbids checkout in CANONICAL. §3.19.2 forbids in-place checkout in the agent's BASE WORKSPACE. Both protect against stale-branch pollution at different boundaries.
+`↳ 緣由 A-§3.19.2`
 
 ### 3.20 Race-Condition PR Discipline
 
-Race-class PRs ship with hidden timing dependencies that pass CI + reviewer VERIFIED yet break production. Empirical motivation: #881 ("app mode never owns the daemon") shipped CI green + reviewer VERIFIED on 2026-05-17, then surfaced a spawn-and-attach race on the first cold-start with a slow filesystem flush. Operator reverted at 470c251; #882 reopen fix shipped at 0fd89e8 with a probe_api gate + `--foreground` mode + actionable error path. The lessons below apply to every spawn / async-coordination / multi-process-startup PR (the "race class"); same discipline framing as §3.19.1.
+Race-class PRs ship with hidden timing dependencies that pass CI + reviewer VERIFIED yet break production. The SOPs below apply to every spawn / async-coordination / multi-process-startup PR (the "race class").
 
-**SOP 1 — Pre-r0 race-condition question.**
-
-Before dispatching r0 on a race-class PR, lead AND dev MUST answer in writing: *"Does this change have a race condition, and can I write a deterministic test that reproduces it without timing dependence?"* The answer goes in the spike report (or the dispatch message if no spike preceded).
+**SOP 1 — Pre-r0 race-condition question.** Before dispatching r0 on a race-class PR, lead AND dev MUST answer in writing: *"Does this change have a race condition, and can I write a deterministic test that reproduces it without timing dependence?"* The answer goes in the spike report (or the dispatch message if no spike preceded).
 
 Race class includes — but is not limited to — `tokio::spawn` / `thread::spawn` sites, multi-process startup ordering, `Drop`-vs-`enqueue` lifecycle, lock-ordering across modules, signal-handler-vs-main-loop coordination, daemon-vs-bridge handshake gates. If the answer is "no deterministic test possible," the PR escalates reviewer RED-protocol scrutiny per SOP 3 and SOP 2 post-merge smoke becomes the primary empirical signal.
 
-**SOP 2 — Post-merge operator smoke sanity check (NOT a merge gate).**
-
-Race-class PRs merge once SOP 1 (deterministic RED→GREEN tests) AND SOP 3 (reviewer RED-protocol) are both satisfied. SOP 2 is a **post-merge sanity check**, not a pre-merge gate.
-
-Empirical motivation: a pre-merge smoke gate creates a chicken-and-egg problem. The operator's daily binary runs from main; to smoke an unmerged race-class PR they must (a) build from the branch manually and (b) point `$AGEND_HOME` away from their daily setup. The gate then blocks merge until smoke confirms — but smoke can't run without operator side-work that breaks the merge flow. PR #908 (2026-05-18 #896 fix) stalled exactly on this loop; operator directive at the time: "smoke gate會造成 chicken-and-egg的問題，要拿掉".
-
-**Post-merge smoke procedure**:
+**SOP 2 — Post-merge operator smoke sanity check (NOT a merge gate).** Race-class PRs merge once SOP 1 AND SOP 3 are both satisfied. SOP 2 is a post-merge sanity check, not a pre-merge gate.
 
 - Operator (or lead on operator's behalf) reproduces the race scenario on a **fresh, isolated `$AGEND_HOME`** — e.g. `/tmp/smoke` or `$TMPDIR/agend-smoke-$$`. **NEVER use the operator's daily `~/.agend-terminal`**; smoke runs MUST be hermetic and disposable so a regression cannot leak into operator state.
-- PR body MAY include a suggested smoke script enumerating the race scenario the fix targets (e.g. "start daemon cold + watch inbox for `bridge_connected` within 5s"). Optional, not required for merge approval.
-- If post-merge smoke uncovers a regression: operator-driven revert (`git revert <merge-sha>`) — race regressions auto-escalate to P0 per §3.11(a) deferred-defense.
+- PR body MAY include a suggested smoke script enumerating the race scenario the fix targets. Optional, not required for merge approval.
+- If post-merge smoke uncovers a regression: operator-driven revert (`git revert <merge-sha>`) — race regressions auto-escalate to P0 per §3.11(a).
 
 **Gating layers (the actual merge gates)**:
-
-- **SOP 1** (deterministic RED→GREEN tests at unit/integration level) — the structural gate. Most race-class behaviour CAN be deterministically tested with proper mocking or DI; the bar is "is there a test that fails pre-fix and passes post-fix, on three back-to-back runs."
+- **SOP 1** (deterministic RED→GREEN tests at unit/integration level) — the structural gate. The bar is "is there a test that fails pre-fix and passes post-fix, on three back-to-back runs."
 - **SOP 3** (reviewer RED-protocol execution on the test surface) — the audit gate. Reviewer must independently observe the RED→GREEN transition.
 - SOP 2 post-merge smoke is supplementary empirical coverage, not a gate.
 
-If SOP 1 honestly says "no deterministic test possible" (rare — usually achievable with `tokio::test` + paused time, channel-based synchronization, or trait-injected clocks), SOP 3 still applies and merge proceeds. SOP 2 post-merge smoke then carries proportionally more weight as the only remaining empirical signal — the PR description should call this out so the operator runs the smoke promptly post-merge.
+If SOP 1 honestly says "no deterministic test possible" (rare — usually achievable with `tokio::test` + paused time, channel-based synchronization, or trait-injected clocks), SOP 3 still applies and merge proceeds. SOP 2 then carries proportionally more weight — the PR description should call this out so the operator runs the smoke promptly post-merge.
 
-**SOP 3 — Reviewer RED-protocol for race-class PRs.**
-
-For race-class PRs, the reviewer MUST execute the RED→GREEN protocol (not skim it):
+**SOP 3 — Reviewer RED-protocol for race-class PRs.** The reviewer MUST execute the RED→GREEN protocol (not skim it):
 
 ```
 # Reviewer's bound worktree (NOT canonical — §3.19):
@@ -271,30 +262,28 @@ git checkout <fix-head>
 # Confirm GREEN: tests pass without flakiness on three back-to-back runs.
 ```
 
-The verdict body MUST explicitly state the protocol execution: "Checked out pre-fix base `<sha>` in this worktree. Verified target tests absent/failing there [by source grep / by cargo test exit code]. Reapplied fix HEAD; tests pass 3/3 runs." Fixup-reviewer's #882 verdict is the bar — it included verbatim: "Checked out pre-fix revert base 470c251 in this worktree. Verified target helper/tests are absent there by source grep."
+The verdict body MUST explicitly state the protocol execution: "Checked out pre-fix base `<sha>` in this worktree. Verified target tests absent/failing there [by source grep / by cargo test exit code]. Reapplied fix HEAD; tests pass 3/3 runs." Reviewers who skip the protocol on a race-class PR get `RUBBER-STAMP — UNVERIFIED` per §3.16.
 
-Reviewers who skip the protocol on a race-class PR get `RUBBER-STAMP — UNVERIFIED` per §3.16 substantive-consensus requirement. The PR returns to dev for explicit reviewer RED-protocol execution before re-dispatch.
-
-**Relationship to §3.19.1.** §3.19.1 says *what every agent must do when a protocol gate fires*. §3.20 says *what lead, dev, and reviewer must do BEFORE the gate could fire* on race-class PRs — a sanctioned discipline addition, not a replacement for any existing rule. Race-class triage at r0 dispatch is cheaper than the ship-then-revert cycle empirically observed on #881.
+`↳ 緣由 A-§3.20`
 
 ## §4. Daemon Enforcement Gates
 
-### 4.1 Push-time Semantic Gate (Sprint 44)
+### 4.1 Push-time Semantic Gate
 Daemon validates dev's push claim matches actual diff. Recognized grammar:
 - `"no other changes"` / `"byte-equal verified"` / `"scope follows dispatch spec X"` / `"only formatting"` / `"deps unchanged"`
 
 Unknown grammar → hard reject. No pass-through.
 
-### 4.2 Reviewer SHA-staleness Gate (Sprint 44)
+### 4.2 Reviewer SHA-staleness Gate
 Daemon compares `reviewed_head` against PR HEAD at verdict time. Mismatch → reject verdict. Reviewer must `git fetch` and re-review. Fail-closed (fetch failure = reject).
 
-### 4.3 Hallucinated-fn Check (Sprint 44)
+### 4.3 Hallucinated-fn Check
 When push claim references a function name, daemon verifies existence via syn-lite + rg fallback. Not found → reject push.
 
-### 4.4 Reserved Name Warning (Sprint 46)
+### 4.4 Reserved Name Warning
 Instance names with routing semantics (`general`, `lead`, `dev`, `reviewer`) emit warning on create. Not a hard reject.
 
-### 4.5 Cross-team ACK Absorption Exception (Sprint 61, #612)
+### 4.5 Cross-team ACK Absorption Exception
 One-shot backends (Codex) skip PTY injection for `kind=update` and `kind=report` messages to avoid wasting turns. However, **cross-team messages are NEVER silently absorbed** — they always inject to PTY regardless of backend or message kind. Team membership is checked at delivery time; agents not in any team are treated as cross-team (safe default). Absorbed messages are audit-logged as `ack_absorbed` events.
 
 ## §5. Async Pipeline
@@ -305,7 +294,7 @@ Impl pushes PR then immediately starts next task. Reviewer issues verdict then i
 - Impl push must include scope statement (follows spec / deviated because)
 - Orchestrator pre-dispatch verification: cross-check dev's claim against actual artifact before forwarding to reviewer
 - dev-lead uses `schedule(action: create)` for auto-poll (30min fallback)
-- **Post-dispatch verification (Sprint 62)**: after `send(kind: task)` returns success (no error), if receiver does not reply within ~5min, dispatcher MUST verify via fallback path:
+- **Post-dispatch verification**: after `send(kind: task)` returns success (no error), if receiver does not reply within ~5min, dispatcher MUST verify via fallback path:
   - `inbox(instance: <receiver>)` — confirms unread queued message (offline agents only; active agents receive PTY direct injection and inbox stays empty)
   - `describe_instance(name: <receiver>)` — confirms agent_state active (PTY delivery already arrived)
   - `binding_state(agent: <receiver>)` — confirms task lifecycle started (binding metadata present)
@@ -341,67 +330,33 @@ Re-review cycles (r1, r2, …) repeat the same three milestones. The dispatcher 
 
 - Pure ack → do not reply (ACK absorption §4 handles this automatically)
 - Response channel must match source channel
-- **Router-layer channel discipline (Sprint 52)**: daemon auto-mirrors agent direct text to the corresponding channel. Agent does not need to force `reply` tool — infrastructure handles routing.
-- **Inbox vs PTY delivery (Sprint 62)**: active agents receive messages via PTY direct injection (not queued in `inbox`). `inbox(instance: X)` returning empty does NOT mean X received nothing — only means X has no unread queue. Verify delivery via `describe_instance` (active state = PTY received) or `pane_snapshot` rather than inbox alone. Inbox queue only fills for offline agents or undeliverable messages.
+- **Router-layer channel discipline**: daemon auto-mirrors agent direct text to the corresponding channel. Agent does not need to force `reply` tool — infrastructure handles routing.
+- **Inbox vs PTY delivery**: active agents receive messages via PTY direct injection (not queued in `inbox`). `inbox(instance: X)` returning empty does NOT mean X received nothing — only means X has no unread queue. Verify delivery via `describe_instance` (active state = PTY received) or `pane_snapshot` rather than inbox alone. Inbox queue only fills for offline agents or undeliverable messages.
 
 ## §7. CI
 
 Use `ci(action: watch)` for ongoing monitoring, not manual polling. Exception: merge-gate final verification requires one-shot `gh pr checks <PR#>` per §3.3.1. Clean up worktree + branch after merge.
 
-**No manual orchestrator polling**. Orchestrators (lead, general,
-operator-in-the-loop) MUST NOT manually poll PR / CI state via
-`gh pr view`, `gh run list`, repeated `cargo test`, or equivalent.
-Rely on:
+**No manual orchestrator polling**. Orchestrators (lead, general, operator-in-the-loop) MUST NOT manually poll PR / CI state via `gh pr view`, `gh run list`, repeated `cargo test`, or equivalent. Rely on:
 
-1. The dispatchee's `kind=update` milestones (§6) — r0 ready, CI
-   all-green, reviewer verdict.
-2. `ci(action: watch)` fan-out — `[ci-pass]` / `[ci-fail]` /
-   `[ci-watch-stalled]` arrive automatically.
+1. The dispatchee's `kind=update` milestones (§6) — r0 ready, CI all-green, reviewer verdict.
+2. `ci(action: watch)` fan-out — `[ci-pass]` / `[ci-fail]` / `[ci-watch-stalled]` arrive automatically.
 
-Manual polling masks broken dispatch communication and burns cache /
-rate-limit budget unnecessarily. If a milestone is missing past a
-reasonable window, the correct response is to message the dispatchee
-asking why, not to poll. Polling is also a smell that the dispatch
-brief itself didn't enumerate the expected milestones — fix the
-dispatch, not the symptom.
+Manual polling masks broken dispatch communication and burns cache / rate-limit budget unnecessarily. If a milestone is missing past a reasonable window, the correct response is to message the dispatchee asking why, not to poll. Polling is also a smell that the dispatch brief itself didn't enumerate the expected milestones — fix the dispatch, not the symptom.
 
-**PR open semantics (Sprint 54)**. Implementers MUST open feature PRs as
-**ready** for review by default. The `--draft` flag is reserved for
-exactly three scenarios:
+**PR open semantics**. Implementers MUST open feature PRs as **ready** for review by default. The `--draft` flag is reserved for exactly three scenarios:
 
-1. **Smoke / verification PRs** that will not be merged (e.g. CI
-   notification path tests). Title prefixes `[smoke]` / `chore: smoke`.
-2. **Explicit work-in-progress** where the implementer needs to push
-   midway and is not yet asking for review. Move to ready before
-   pinging lead/reviewer.
-3. **External-PR patches** where lead is augmenting a community
-   contribution before the upstream PR is merged.
+1. **Smoke / verification PRs** that will not be merged (e.g. CI notification path tests). Title prefixes `[smoke]` / `chore: smoke`.
+2. **Explicit work-in-progress** where the implementer needs to push midway and is not yet asking for review. Move to ready before pinging lead/reviewer.
+3. **External-PR patches** where lead is augmenting a community contribution before the upstream PR is merged.
 
-A draft PR is hidden from GitHub's default UI filters, so operator and
-reviewer miss it without explicit checks. Default-ready keeps the
-review pipeline visible.
+A draft PR is hidden from GitHub's default UI filters, so operator and reviewer miss it without explicit checks. Default-ready keeps the review pipeline visible.
 
-**Setup-warning surfacing (Sprint 54 P0-4)**. CI-related MCP responses
-may include a top-level `setup_warning` string when no GitHub token is
-reachable (env unset AND `gh` unavailable/unauthed). The daemon polls
-unauthenticated in that state and exhausts the 60 req/hr cap quickly.
-Agents MUST surface `setup_warning` verbatim to the user the first time
-it appears in a session — it is operator-actionable guidance, not a
-log line. Suggested phrasing: "CI watch responded: <setup_warning>".
-Subsequent occurrences within the same session may be deduplicated.
+**Setup-warning surfacing**. CI-related MCP responses may include a top-level `setup_warning` string when no GitHub token is reachable (env unset AND `gh` unavailable/unauthed). The daemon polls unauthenticated in that state and exhausts the 60 req/hr cap quickly. Agents MUST surface `setup_warning` verbatim to the user the first time it appears in a session — it is operator-actionable guidance, not a log line. Suggested phrasing: "CI watch responded: <setup_warning>". Subsequent occurrences within the same session may be deduplicated.
 
-**Health surface (Sprint 54 P0-5)**. The `ci(action: watch)` response
-and the new `ci(action: status)` aggregator both carry `rate_limit_active`,
-`rate_limit_until`, and `next_poll_eta` so agents can tell whether CI
-polling is healthy without reading watch files. The daemon also
-fans out two inbox event kinds when polling stalls behind a rate-limit
-window: `ci-watch-stalled` after 3 consecutive missed polls (exactly
-once per stall window) and `ci-watch-resumed` on the first successful
-poll afterward. Both events go to every subscriber via the P0-1 fan-out
-contract — no last-write-wins. Surface stalled events promptly; resumed
-events confirm recovery and may be acknowledged silently.
+**Health surface**. The `ci(action: watch)` response and the `ci(action: status)` aggregator both carry `rate_limit_active`, `rate_limit_until`, and `next_poll_eta` so agents can tell whether CI polling is healthy without reading watch files. The daemon also fans out two inbox event kinds when polling stalls behind a rate-limit window: `ci-watch-stalled` after 3 consecutive missed polls (exactly once per stall window) and `ci-watch-resumed` on the first successful poll afterward. Both events go to every subscriber via the fan-out contract — no last-write-wins. Surface stalled events promptly; resumed events confirm recovery and may be acknowledged silently.
 
-### 7.1 CI Tool Identity & Cache Hygiene (Sprint 62)
+### 7.1 CI Tool Identity & Cache Hygiene
 
 **Tool identity check via output shape, not exit code.** When a CI step verifies a binary's identity (e.g. `cargo`, `rustc`, `rustfmt`):
 
@@ -413,13 +368,15 @@ cargo --version
 cargo --version | grep -qE "^cargo [0-9]"
 ```
 
-Stale `rustup-init` binaries can masquerade as `cargo` / `rustc` / `rustfmt` when cache restores them to the proxy path. Exit-0 alone does NOT prove identity. Pattern caught 2026-05-14 PR #772 v1 → v3 evolution; v1's `cargo --version` exit check missed pollution; v2 detection-recover failed; v3 `cache-bin: false` prevention shipped.
+Stale `rustup-init` binaries can masquerade as `cargo` / `rustc` / `rustfmt` when cache restores them to the proxy path. Exit-0 alone does NOT prove identity.
 
 **Cache pollution requires prevention OR validated cleanup.** Detection alone is insufficient if recovery surface is harder than prevention. KISS: prefer "don't cache the polluted directory" (`Swatinem/rust-cache@v2 with cache-bin: false`) over "detect stale state and rm + reset". Recovery code itself becomes maintenance burden + new failure surface.
 
+`↳ 緣由 A-§7.1`
+
 ### 7.2 Cross-Platform Test Idioms
 
-Cross-platform test failures observed multiple times in 2026-05-13/14 sessions. Mandatory idioms:
+Mandatory idioms:
 
 - **Time arithmetic**: never `Instant::now() - Duration` (Windows monotonic clock anchors to system uptime → underflow on fresh VM). Use `Instant::add` (saturating) or DI inject `now: Instant` for tests.
 - **Regex hot-path**: never per-call `Regex::new` in fed loop. Use `LazyLock<Vec<Regex>>` (or `OnceLock`). Performance ratio: ~100× speedup, prevents Windows runner test timeout from cumulative `min_hold` budget.
@@ -437,7 +394,7 @@ git commit --allow-empty -m "ci: nudge wedged runner (PR #N wedged Nhr)"
 git push origin <PR-branch>
 ```
 
-The fresh CI run fires on the new HEAD; the old wedged run becomes irrelevant (it eventually GH-Actions-times-out at 6 hours without affecting merge). Reviewer's prior VERIFIED verdict still applies — the SHA advance is byte-identical content, so `reviewed_head` SHA-staleness gate (§4.2) accepts a re-stamp once CI completes; merge gates on the fresh CI result.
+The fresh CI run fires on the new HEAD; the old wedged run becomes irrelevant (it eventually GH-Actions-times-out at 6 hours without affecting merge). Reviewer's prior VERIFIED verdict still applies — the SHA advance is byte-identical content, so the `reviewed_head` SHA-staleness gate (§4.2) accepts a re-stamp once CI completes; merge gates on the fresh CI result.
 
 **When to apply** — all three conditions must hold:
 
@@ -448,12 +405,10 @@ The fresh CI run fires on the new HEAD; the old wedged run becomes irrelevant (i
 **What this is NOT**:
 
 - **NOT force-push.** The empty commit advances HEAD via fast-forward; branch history is preserved. Squash-merge folds the nudge commit + the real work into the single PR commit on main, so the nudge leaves no trace in the merged history.
-- **NOT a workaround for legitimate test failures.** A failing test means a real bug. The nudge only addresses runners that genuinely wedged with no progress — same configuration that was working minutes ago would re-pass on a fresh runner.
+- **NOT a workaround for legitimate test failures.** A failing test means a real bug. The nudge only addresses runners that genuinely wedged with no progress.
 - **NOT for "tests are slow".** Slow-but-progressing CI is a different problem (cache miss, fixture cost). Wait for normal completion; if the slowness is systemic, file a separate issue.
 
-**Empirical motivation**: PR #863 (#852 residual PR-A) hit a `windows-latest` wedge on 2026-05-16. The job stayed `in_progress` for 9+ hours starting at 15:19 UTC; `gh run cancel` was accepted but the job never transitioned. Empty-commit nudge dispatched at 16:14 UTC → fresh CI fired → green within ~10 min → merge proceeded. Operator-authorized, ~5 min total recovery vs. the alternative (wait 6 hours for GH-Actions timeout + manual re-trigger).
-
-This recovery technique parallels [§3.19.1](#3191-agent-git-anti-patterns)'s framing for protocol-gate recovery: a deny / wedge is a signal, not a transient error. Document the sanctioned response so future operators don't reach for force-push or `gh run rerun --failed` (which re-runs the same wedged platform on the same SHA, often re-wedging on the same runner-pool resource).
+`↳ 緣由 A-§7.3`
 
 ## §8. Progress Visibility
 
@@ -486,7 +441,7 @@ Daemon detects agent entering error state (UsageLimit/RateLimit/Hang/Crashed/Aut
 - Branch naming: `feat/`, `fix/`, `docs/`
 - Clean up immediately after merge
 - **Never** `git worktree add <path> main` — locks main, breaks operator builds. Always use `-b <new-branch>`. Recovery: `cd <worktree> && git switch -c <dedicated-branch>`
-- **Generic `bind_self` (Sprint 54 P1-7)**: any agent (lead, dev, reviewer, …) may proactively claim a worktree via `bind_self {repo, branch}` without going through the dispatch hook. Inherits every dispatch invariant — Phase 1 trailers, P0-1.5 cross-agent registry, P0-1.6 actual-HEAD verification, P0-X release_worktree as sole exit, source_repo persistence, auto watch_ci. Use case: lead orchestrator escalating to Path A IMPL on a hot branch. Pair with `release_worktree` to unbind. `main`/`master` rejected with E4.5; cross-agent branch conflicts return `code: cross_agent_conflict`.
+- **Generic `bind_self`**: any agent (lead, dev, reviewer, …) may proactively claim a worktree via `bind_self {repo, branch}` without going through the dispatch hook. Inherits every dispatch invariant — Phase 1 trailers, cross-agent registry, actual-HEAD verification, `release_worktree` as sole exit, source_repo persistence, auto watch_ci. Use case: lead orchestrator escalating to Path A IMPL on a hot branch. Pair with `release_worktree` to unbind. `main`/`master` rejected with E4.5; cross-agent branch conflicts return `code: cross_agent_conflict`.
 
 ### release_worktree branch-cleanup scope
 
@@ -501,7 +456,7 @@ User-checkout branches, operator-created worktrees without `.agend-managed` mark
 
 Use `release_worktree(agent: <self>)`. The `path: ...` form is NOT a recognized schema — daemon silently no-ops on unknown params. Verify cleanup with `binding_state(agent: <self>)` returning `bound: false`.
 
-### 10.6 Lead Pre-Dispatch Release (Sprint 62)
+### 10.6 Lead Pre-Dispatch Release
 
 Every `send(kind: task, branch: <X>)` triggers daemon auto-bind for the **dispatcher** (lead) to branch X, then dispatches the task to the assignee. If lead is already bound to a previous dispatch branch, the new dispatch may fail with `lease_failed` OR succeed but leave the previous binding stale.
 
@@ -512,7 +467,7 @@ Normalize: lead MUST `release_worktree(agent: <self>)` BEFORE every `send(kind: 
 
 Lead role does not need a worktree for orchestration work — release immediately after each dispatch is correct hygiene.
 
-### 10.7 Daemon Empty Heartbeat Commits (Sprint 62)
+### 10.7 Daemon Empty Heartbeat Commits
 
 Daemon writes empty `init` commits to bound branches at certain lifecycle events (bind start, task issue, periodic heartbeat). These commits:
 - Have no file diff (empty commits)
@@ -523,7 +478,7 @@ Daemon writes empty `init` commits to bound branches at certain lifecycle events
 
 **§3.10 verifiability impact**: anchor RED commit may be sandwiched between heartbeat commits and impl GREEN commit. Verify §3.10 by `git checkout <anchor-sha>` (cargo test fails) → `git checkout <impl-sha>` (cargo test passes), ignoring intermediate heartbeat noise.
 
-If pollution becomes excessive (>30 heartbeats per PR), file as daemon ergonomic flag for cleanup tool extension (currently #789-class).
+If pollution becomes excessive (>30 heartbeats per PR), file as daemon ergonomic flag for cleanup tool extension.
 
 ## §11. Tool Quick Reference
 
@@ -540,28 +495,22 @@ If pollution becomes excessive (>30 heartbeats per PR), file as daemon ergonomic
 | Schedule | `schedule(action: create)` | backend-specific tools |
 | Timeout | `replace_instance` | waiting forever |
 
-**Daemon-state error format (Sprint 54 #488 hotfix)**. Tools that
-depend on daemon-resident state — `reply`,
-`download_attachment` — never silently fall back to a local handler
-when the daemon is unreachable. They return a structured error of the
-form `tool '<NAME>' requires daemon API; not reachable: <CAUSE>`.
-Agents seeing this prefix should surface the message as-is to the
-user (it's operator-actionable: restart daemon / check socket) rather
-than retry blindly. Stateless tools (`inbox`, `task`, `send`, etc.)
-still fall back gracefully for offline workflows.
+**Daemon-state error format**. Tools that depend on daemon-resident state — `reply`, `download_attachment` — never silently fall back to a local handler when the daemon is unreachable. They return a structured error of the form `tool '<NAME>' requires daemon API; not reachable: <CAUSE>`. Agents seeing this prefix should surface the message as-is to the user (it's operator-actionable: restart daemon / check socket) rather than retry blindly. Stateless tools (`inbox`, `task`, `send`, etc.) still fall back gracefully for offline workflows.
 
-### 11.1 State Persistence Across Daemon Refresh (Sprint 62)
+### 11.1 State Persistence Across Daemon Refresh
 
 Daemon binary refresh (recompile + restart, or hot-reload via `mcp_registry_watcher`) invalidates several in-memory state stores. **After every `mcp_registry_watcher` notification fired**, the following state should be re-verified:
 
-- **CI watch state** — fixed by #786, but pre-#786 watches may be missing
-- **Instance registry vs team metadata sync** — fixed by #785 (better-error surfaces desync); team membership outlives instance restart, may reference wiped instances
-- **Source_repo on team** — historically wiped by `teams.json` migration on refresh (was #781 root cause); persisted as of #781 but verify with `grep source_repo fleet.yaml` if behavior unexpected
+- **CI watch state** — pre-refresh watches may be missing
+- **Instance registry vs team metadata sync** — team membership outlives instance restart, may reference wiped instances
+- **Source_repo on team** — verify with `grep source_repo fleet.yaml` if behavior unexpected
 - **Active bindings** — in-memory `bind_in_flight` flag may be lost; check `binding_state(agent)` and `force_release_worktree` if dangling
 
 **Operator workflow**: `mcp_registry_watcher` notification = restart-needed signal. Run `agend-terminal stop && cargo build --release && agend-terminal start` to pick up new binary. Subsequent agent dispatches benefit from fresh code.
 
 **Agent workflow**: do NOT assume state survives daemon refresh. Re-verify via `team list`, `ci action=status`, `binding_state` after any refresh notification.
+
+`↳ 緣由 A-§11.1`
 
 ## §12. Workflow Efficiency
 
@@ -616,7 +565,7 @@ Don't preemptively prefix `AGEND_GIT_BYPASS=1`. Try bare git, read the deny mess
 
 Operations on the lifecycle/safety surface the daemon manages directly:
 
-- `git worktree add` / `remove` / `move` — worktree pool is daemon-owned (Phase 3 lease, P0-X release)
+- `git worktree add` / `remove` / `move` — worktree pool is daemon-owned
 - `git checkout main` from an agent worktree — cross-branch deny in the shim matrix
 - Operator manual cleanup of orphan worktree or orphan binding (no MCP tool yet for some edge cases)
 - Daemon's own internal git command — bypass is set by the daemon to prevent self-recursion through its own shim
@@ -645,7 +594,7 @@ These are not catastrophic individually. They erode the invariants the shim was 
 
 `AGEND_GIT_BYPASS_UNTIL=<epoch>` exists for time-windowed bypass during multi-step operator interventions; per-command env is preferred for normal use.
 
-### 13.5 Bug-Blocks-Its-Own-Fix Exception (Sprint 62)
+### 13.5 Bug-Blocks-Its-Own-Fix Exception
 
 When fixing a daemon binding bug (or any bug whose existence prevents the bypass-free workflow itself), the fix PR may legitimately require one-shot `AGEND_GIT_BYPASS=1` for `git add` / `git commit` / `git push` of THIS PR — because the very bug being fixed blocks the bypass-free path.
 
@@ -658,11 +607,55 @@ When fixing a daemon binding bug (or any bug whose existence prevents the bypass
 3. After this PR merges + daemon binary updates, all subsequent PRs revert to ZERO BYPASS workflow
 4. Operator authorization required if scope expands beyond commit/push (e.g. into worktree manipulation)
 
+`↳ 緣由 A-§13.5`
+
+---
+
+## Appendix A — Rationale & Incident Log
+
+The *why* and *when* behind normative rules. Referenced from the normative layer via `↳ 緣由 A-§X`. Reading this is optional unless you are questioning or revising a rule.
+
+### A-§3.3.1 — CI Verification Gate
+Sprint 61 incident: ci_watch emitted a false `[ci-pass]` on partial completion, leading to merge of failing code. Hence: independent `gh pr checks` verification, no trusting partial results or ci_watch alone.
+
+### A-§3.12 / A-§3.12.1 — `gh pr merge --auto` adoption
+Introduced Sprint 65 (#973). `--auto` eliminates the "Base branch was modified" race observed in #971 close-loop (2026-05-20).
+
+- **Activation history**: §3.12.1 was introduced in #973 but kept INACTIVE until #972 (PR-state aggregator, merged be23875) and #986 (gh-poll integration, merged 4242c24 / PR #990) both shipped. Activation switch landed 2026-05-20 as a docs-only follow-up, flipping the canonical form from the legacy synchronous `gh pr merge ... --squash --delete-branch` to `... --auto --squash --delete-branch`.
+- **Why it was inactive earlier**: `--auto`'s async-return discarded the synchronous merge confirmation. Once #972 + #986 made the `[pr-merged]` event fire from real GitHub observation post-merge, async-flow visibility was restored and the default switch was unlocked.
+- **Async confirmation pipeline (#972 + #986)**: `--auto` returns immediately, so the synchronous "PR merged at SHA" terminal feedback is gone. The daemon PR-state aggregator + gh-poll integration together emit `[pr-merged]` events to the PR author's inbox after observing the GitHub-side merge. Author waits for the event rather than polling.
+- **Legacy form**: `gh pr merge <N> --squash --delete-branch` remains valid as escape-hatch per #985/#988 deviation precedent.
+
+### A-§3.16 — Phase 1 Discussion Discipline
+Rationale for the mandatory dev source-code spike: lead's "from-code-structure" inference consistently missed scope holes (8/12 PRs in the 2026-05-14 retrospective).
+
+### A-§3.19.1 — Agent Git Anti-Patterns
+Both failure modes surfaced empirically by the #863 reviewer incident. In that incident, bypassing a checkout deny (`AGEND_GIT_BYPASS=1`) materialized a phantom `.gitignore` conflict that did not exist on the target branch, leaving the reviewer stuck on a fabricated merge conflict. Enforcement context: canonical hygiene (#852), shim deny matrix (#858). Recovery framing parallels §7.3 — a deny/wedge is a signal, not a transient error.
+
+### A-§3.19.2 — Reviewer Base Workspace Branch Discipline
+Incident 2026-05-20: fixup-reviewer base dir was found stuck on `fix/900-spawn-env-propagation` with 492 deletion markers from a 2026-05-18 in-place checkout that was never reverted. Recovery cost session backend state (`.codex/.claude/.gemini/.kiro/.opencode/AGENTS.md` removed by `git clean -fd` because those dirs weren't in the fix/900-era `.gitignore`). The reflog showed the original discipline used `review/NNN-r0` per-PR worktrees correctly (2026-05-16), then drifted to in-place checkouts.
+
+### A-§3.20 — Race-Condition PR Discipline
+Empirical motivation: #881 ("app mode never owns the daemon") shipped CI green + reviewer VERIFIED on 2026-05-17, then surfaced a spawn-and-attach race on the first cold-start with a slow filesystem flush. Operator reverted at 470c251; #882 reopen fix shipped at 0fd89e8 with a probe_api gate + `--foreground` mode + actionable error path.
+
+- **Why SOP 2 is post-merge, not a gate**: a pre-merge smoke gate creates a chicken-and-egg problem — the operator's daily binary runs from main; to smoke an unmerged race-class PR they must build from the branch manually AND point `$AGEND_HOME` away from their daily setup, which breaks the merge flow. PR #908 (2026-05-18 #896 fix) stalled exactly on this loop; operator directive: "smoke gate會造成 chicken-and-egg的問題，要拿掉".
+- **The bar for SOP 3**: fixup-reviewer's #882 verdict — verbatim "Checked out pre-fix revert base 470c251 in this worktree. Verified target helper/tests are absent there by source grep."
+
+### A-§7.1 — CI Tool Identity & Cache Hygiene
+Pattern caught 2026-05-14 PR #772 v1 → v3 evolution: v1's `cargo --version` exit check missed rustup-init pollution; v2 detection-recover failed; v3 `cache-bin: false` prevention shipped.
+
+### A-§7.3 — Wedged-Run Recovery
+PR #863 (#852 residual PR-A) hit a `windows-latest` wedge on 2026-05-16. The job stayed `in_progress` for 9+ hours starting 15:19 UTC; `gh run cancel` was accepted but the job never transitioned. Empty-commit nudge dispatched at 16:14 UTC → fresh CI fired → green within ~10 min → merge proceeded. Operator-authorized, ~5 min total recovery vs. the alternative (wait 6 hours for GH-Actions timeout + manual re-trigger). Do NOT reach for force-push or `gh run rerun --failed` (which re-runs the same wedged platform on the same SHA, often re-wedging).
+
+### A-§11.1 — State Persistence Across Daemon Refresh
+Fixes behind the re-verify list: CI watch state (#786), instance/team desync better-error (#785), source_repo-on-team persistence (was #781 root cause — `teams.json` migration wiped it on refresh; persisted as of #781).
+
+### A-§13.5 — Bug-Blocks-Its-Own-Fix Exception
 Reference: PR #779 (Sprint 61) Option 1 + Option 3 daemon binding fix shipped under this exception. PR #781 + #800 followed standard ZERO BYPASS workflow.
 
 ---
 
-## Appendix: Section Number Map (old → new)
+## Appendix B — Section Number Map (old → new)
 
 | Old (v1 full) | New (condensed) |
 |---|---|
