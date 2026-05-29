@@ -1003,6 +1003,75 @@ pub(crate) fn handle_cleanup_merged_branches(
     }
 }
 
+/// #1467: outcome of post-merge verification via `gh pr view`.
+enum MergeVerdict {
+    /// PR confirmed merged: `state == "MERGED"` AND a non-empty merge commit
+    /// oid. Carries the merge commit SHA.
+    Confirmed(String),
+    /// Not (yet) confirmed merged. May be transient (merge queue / eventual
+    /// consistency) — caller should re-query, not treat as a hard failure.
+    Unconfirmed {
+        state: String,
+        merge_state_status: String,
+    },
+}
+
+/// #1467: classify a `gh pr view --json state,mergeCommit,mergeStateStatus`
+/// payload into a [`MergeVerdict`]. PURE — tests drive it directly without
+/// shelling `gh`. A PR is confirmed merged only when GitHub reports
+/// `state == "MERGED"` AND a non-empty `mergeCommit.oid`.
+fn classify_merge_view(view: &Value) -> MergeVerdict {
+    let state = view["state"].as_str().unwrap_or("UNKNOWN").to_string();
+    let oid = view["mergeCommit"]["oid"].as_str().unwrap_or("");
+    if state == "MERGED" && !oid.is_empty() {
+        MergeVerdict::Confirmed(oid.to_string())
+    } else {
+        MergeVerdict::Unconfirmed {
+            state,
+            merge_state_status: view["mergeStateStatus"].as_str().unwrap_or("").to_string(),
+        }
+    }
+}
+
+/// #1467: after `gh pr merge` reports success, confirm the PR actually landed.
+/// Bounded poll (≤3 attempts, 2s apart) to tolerate merge-queue / eventual-
+/// consistency lag — NOT an infinite wait. Returns the last verdict seen; the
+/// first `Confirmed` short-circuits.
+fn verify_merge_landed(repo: &str, pr: u64) -> MergeVerdict {
+    let mut last = MergeVerdict::Unconfirmed {
+        state: "UNKNOWN".to_string(),
+        merge_state_status: String::new(),
+    };
+    for attempt in 0..3 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+        let out = std::process::Command::new("gh")
+            .args([
+                "pr",
+                "view",
+                &pr.to_string(),
+                "--repo",
+                repo,
+                "--json",
+                "state,mergeCommit,mergedAt,mergeStateStatus",
+            ])
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {
+                if let Ok(v) = serde_json::from_slice::<Value>(&o.stdout) {
+                    match classify_merge_view(&v) {
+                        MergeVerdict::Confirmed(c) => return MergeVerdict::Confirmed(c),
+                        unconfirmed => last = unconfirmed,
+                    }
+                }
+            }
+            _ => {} // transient gh failure — keep polling, fall back to `last`
+        }
+    }
+    last
+}
+
 pub(super) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) -> Value {
     let pr = match args["pr"].as_u64() {
         Some(n) => n,
@@ -1116,13 +1185,37 @@ pub(super) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
         ])
         .output();
     match merge_output {
-        Ok(o) if o.status.success() => {
-            json!({
+        // #1467: `gh pr merge` exit 0 is NECESSARY but not SUFFICIENT — a
+        // merge-queue / branch-protection / eventual-consistency situation can
+        // exit 0 without the PR actually landing (observed: cross-team PRs
+        // reported merged:true while still OPEN, commits unpushed). Verify the
+        // post-condition with `gh pr view` before claiming success.
+        Ok(o) if o.status.success() => match verify_merge_landed(&repo, pr) {
+            MergeVerdict::Confirmed(merge_commit) => json!({
                 "merged": true,
                 "pr": pr,
                 "forced": force,
-            })
-        }
+                "mergeCommit": merge_commit,
+            }),
+            MergeVerdict::Unconfirmed {
+                state,
+                merge_state_status,
+            } => json!({
+                // NOT merged, but NOT a hard error either: `gh pr merge`
+                // succeeded and the PR may still land (merge queue / eventual
+                // consistency). Report the true state so the caller can re-query
+                // rather than trust a false merged:true.
+                "merged": false,
+                "pending": true,
+                "code": "merge_unconfirmed",
+                "pr": pr,
+                "state": state,
+                "mergeStateStatus": merge_state_status,
+                "hint": "gh pr merge reported success but the PR is not yet confirmed MERGED \
+                         (possible merge-queue / eventual consistency). Re-query `gh pr view` \
+                         before acting; do NOT blindly re-merge.",
+            }),
+        },
         Ok(o) => {
             json!({
                 "error": "gh pr merge failed",

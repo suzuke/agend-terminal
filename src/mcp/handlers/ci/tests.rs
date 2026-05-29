@@ -2062,3 +2062,57 @@ fn checkout_resolves_repository_path() {
     // Neither present → None (handler then returns the missing-arg error).
     assert_eq!(checkout_source(&json!({"branch": "feat-x"})), None);
 }
+
+// #1467: post-merge verification — `gh pr merge` exit 0 is not proof the PR
+// landed; only state==MERGED + a non-empty merge commit oid confirms it.
+
+#[test]
+fn merge_view_confirmed_when_merged_with_commit() {
+    let view = json!({
+        "state": "MERGED",
+        "mergeCommit": {"oid": "abc123def"},
+        "mergedAt": "2026-05-29T16:00:00Z",
+        "mergeStateStatus": "CLEAN"
+    });
+    match super::classify_merge_view(&view) {
+        super::MergeVerdict::Confirmed(oid) => assert_eq!(oid, "abc123def"),
+        super::MergeVerdict::Unconfirmed { state, .. } => {
+            panic!("expected Confirmed, got Unconfirmed(state={state})")
+        }
+    }
+}
+
+#[test]
+fn merge_view_unconfirmed_when_open_after_merge() {
+    // The #1467 bug shape: `gh pr merge` exited 0 but the PR is still OPEN
+    // (merge-queue / eventual consistency / branch-protection) — must NOT be
+    // reported as merged.
+    let view = json!({
+        "state": "OPEN",
+        "mergeCommit": null,
+        "mergeStateStatus": "BLOCKED"
+    });
+    match super::classify_merge_view(&view) {
+        super::MergeVerdict::Unconfirmed {
+            state,
+            merge_state_status,
+        } => {
+            assert_eq!(state, "OPEN");
+            assert_eq!(merge_state_status, "BLOCKED");
+        }
+        super::MergeVerdict::Confirmed(oid) => {
+            panic!("OPEN PR must not be Confirmed, got commit {oid}")
+        }
+    }
+}
+
+#[test]
+fn merge_view_unconfirmed_when_merged_state_but_no_commit() {
+    // Defensive: state says MERGED but no merge commit oid yet (race window) →
+    // still unconfirmed; don't claim merged without the commit.
+    let view = json!({"state": "MERGED", "mergeCommit": null, "mergeStateStatus": "UNKNOWN"});
+    assert!(matches!(
+        super::classify_merge_view(&view),
+        super::MergeVerdict::Unconfirmed { .. }
+    ));
+}
