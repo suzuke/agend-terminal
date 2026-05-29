@@ -878,6 +878,10 @@ pub(crate) fn handle_status_ci(home: &Path, args: &Value, instance_name: &str) -
             // that haven't run their first mergeable check yet.
             "pr_mergeable_state": watch["last_mergeable_state"].as_str(),
             "pr_mergeable_check_at": watch["last_mergeable_check_at"].as_str(),
+            // #1473 display gap: surface the stored CI-pass handoff target so
+            // `ci action=status` shows it (previously omitted → operators
+            // mis-read it as unset even when armed).
+            "next_after_ci": watch["next_after_ci"].as_str(),
         }));
     }
     let mut resp = json!({"watches": out});

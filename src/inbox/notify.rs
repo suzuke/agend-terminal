@@ -274,9 +274,32 @@ pub fn compose_aware_inject(home: &Path, agent_name: &str, notification: &str) {
     ) {
         return;
     }
+    // #1473: actionable work-delivery (ci-ready / task dispatch / query) MUST
+    // wake the agent's PTY regardless of draft state. The #1457 draft-gate only
+    // exists to stop low-priority notifications from clobbering an operator's
+    // in-progress draft — it must never defer the work the agent is here to do.
+    // (Regression: a never-submitted agent pane read as Abandoned, so ci-ready
+    // for a codex reviewer was deferred to inbox-only and it never woke.)
+    if notification_is_actionable_wake(notification) {
+        let _ = inject_with_submit(home, agent_name, notification);
+        return;
+    }
     let _ = route_notification(home, agent_name, notification, |msg| {
         inject_with_submit(home, agent_name, msg)
     });
+}
+
+/// #1473: does this notification carry an actionable work-delivery marker that
+/// must reach the PTY regardless of draft state? These are the
+/// system/orchestrator wakes the agent is expected to act on (vs. ambient
+/// notifications that may wait behind an operator draft).
+pub(crate) fn notification_is_actionable_wake(notification: &str) -> bool {
+    const ACTIONABLE_MARKERS: &[&str] = &[
+        "[ci-ready-for-action]", // daemon CI-pass handoff
+        "[delegate_task]",       // kind=task dispatch
+        "[request_information]", // kind=query
+    ];
+    ACTIONABLE_MARKERS.iter().any(|m| notification.contains(m))
 }
 
 /// #911 dedup gate predicate. Hybrid (A)+(B) suppression check for
@@ -444,4 +467,32 @@ where
         return Ok(());
     }
     injector(notification)
+}
+
+#[cfg(test)]
+mod actionable_wake_tests {
+    use super::notification_is_actionable_wake as is_actionable;
+
+    /// #1473: ci-ready / task dispatch / query are actionable work-delivery →
+    /// must bypass the draft-gate (recognized regardless of surrounding text).
+    #[test]
+    fn actionable_markers_recognized() {
+        assert!(is_actionable(
+            "[ci-ready-for-action] owner/repo@br: CI passed, your turn."
+        ));
+        assert!(is_actionable(
+            "[from:lead] [delegate_task] do X (task id: t-1)"
+        ));
+        assert!(is_actionable("[from:lead] [request_information] answer Y"));
+    }
+
+    /// Ambient notifications (no actionable marker) stay draft-gated.
+    #[test]
+    fn non_actionable_not_recognized() {
+        assert!(!is_actionable("[from:peer] just a heads-up message"));
+        assert!(!is_actionable(
+            "[system:ci] [ci-fail] owner/repo@br: failure"
+        ));
+        assert!(!is_actionable("[AGEND-MSG] size=42 (use inbox tool)"));
+    }
 }
