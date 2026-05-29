@@ -36,7 +36,7 @@
 //! for concurrency. Forward-compat preserved via `#[serde(default)]`.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
 
@@ -53,6 +53,13 @@ pub(crate) fn dev_idle_threshold_secs() -> i64 {
 /// tracked agent silent > 30 min → ping general. Overridable via runtime-config.json (#1085).
 pub(crate) fn fleet_idle_threshold_secs() -> i64 {
     crate::runtime_config::get().fleet_idle_threshold_secs
+}
+
+/// #1438: max TTL for a fleet-idle ack (seconds). Backstop so an ack never
+/// suppresses forever when the board never progresses. Overridable via
+/// runtime-config.json.
+pub(crate) fn fleet_idle_ack_ttl_secs() -> i64 {
+    crate::runtime_config::get().fleet_idle_ack_ttl_secs
 }
 
 /// Scan throttle in supervisor TICK iterations. 30 × 10 s = 5 min
@@ -294,6 +301,69 @@ fn current_agent_task(home: &Path, agent: &str) -> Option<String> {
         .map(|t| format!("{} — {}", t.id, t.title))
 }
 
+/// Parse an RFC3339 task-board timestamp to UTC.
+fn parse_ts(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|d| d.with_timezone(&chrono::Utc))
+}
+
+/// #1438: a task-board "progress" event happened after `since` — some task is
+/// now Claimed/InProgress/InReview/Verified/Done with `updated_at` past the
+/// ack timestamp. This is the "sprint resumed" signal that lifts a fleet-idle
+/// ack. Mere task creation (status Open) does NOT count as progress.
+fn board_progressed_since(home: &Path, since: &chrono::DateTime<chrono::Utc>) -> bool {
+    let Ok(state) = crate::task_events::replay(home) else {
+        return false;
+    };
+    state.tasks.values().any(|t| {
+        matches!(
+            t.status,
+            crate::task_events::TaskStatus::Claimed
+                | crate::task_events::TaskStatus::InProgress
+                | crate::task_events::TaskStatus::InReview
+                | crate::task_events::TaskStatus::Verified
+                | crate::task_events::TaskStatus::Done
+        ) && parse_ts(&t.updated_at).is_some_and(|u| u > *since)
+    })
+}
+
+/// #1438: an agent that OWNS an active task (Open/Claimed/InProgress/Blocked)
+/// resumed activity after `since`. Worker heartbeat — recovers the ack even
+/// when the board update lags or the work is tracked off-board. Deliberately
+/// scoped to task owners so on-demand chatter (e.g. `general` answering the
+/// operator while owning no task) does NOT lift the ack — that on-any-activity
+/// recovery was the #1438 ack-wash bug.
+fn task_owner_active_since(
+    home: &Path,
+    since: &chrono::DateTime<chrono::Utc>,
+    pairs: &[(String, chrono::DateTime<chrono::Utc>)],
+) -> bool {
+    let Ok(state) = crate::task_events::replay(home) else {
+        return false;
+    };
+    let owners: HashSet<&str> = state
+        .tasks
+        .values()
+        .filter(|t| {
+            matches!(
+                t.status,
+                crate::task_events::TaskStatus::Open
+                    | crate::task_events::TaskStatus::Claimed
+                    | crate::task_events::TaskStatus::InProgress
+                    | crate::task_events::TaskStatus::Blocked
+            )
+        })
+        .filter_map(|t| t.owner.as_ref().map(|n| n.as_str()))
+        .collect();
+    if owners.is_empty() {
+        return false;
+    }
+    pairs
+        .iter()
+        .any(|(name, ts)| ts > since && owners.contains(name.as_str()))
+}
+
 /// Vantage #10 — per-agent idle threshold check. Iterates all fleet
 /// instances, using each agent's `timeout_secs` (falling back to the
 /// global `dev_idle_threshold_secs`). Legacy single-agent mode is
@@ -493,13 +563,25 @@ fn scan_fleet_vantage(
     if pairs.is_empty() {
         return;
     }
-    // #1076: ack cooldown — if fleet idle was acked, suppress until at
-    // least one tracked agent becomes active after the ack timestamp.
+    // #1076 / #1438: ack cooldown. The ack lifts only on a genuine
+    // "sprint resumed" signal — NOT on bare agent activity. Previously ANY
+    // tracked agent active after the ack cleared it, so `general` answering
+    // the operator (on-demand chatter) washed the ack and re-armed the alert
+    // every ~30 min (#1438 ack-wash loop). Recovery now requires one of:
+    //   (a) the task board progressed (a task claimed / advanced since ack),
+    //   (b) a task-OWNING agent resumed activity (worker heartbeat — covers
+    //       board-update lag / off-board work), or
+    //   (c) the ack exceeded its max TTL (time backstop — never silent forever;
+    //       on expiry the fleet is re-evaluated, not auto-alerted, because the
+    //       all-idle + has_expected_work gates below still apply).
     let acked_epoch = FLEET_ACKED_AT.load(Ordering::Relaxed);
     if acked_epoch > 0 {
         if let Some(acked_dt) = chrono::DateTime::from_timestamp(acked_epoch, 0) {
-            let any_active_since = pairs.iter().any(|(_, ts)| *ts > acked_dt);
-            if !any_active_since {
+            let ack_age = now.signed_duration_since(acked_dt).num_seconds();
+            let recovered = board_progressed_since(home, &acked_dt)
+                || task_owner_active_since(home, &acked_dt, &pairs)
+                || ack_age > fleet_idle_ack_ttl_secs();
+            if !recovered {
                 return;
             }
             FLEET_ACKED_AT.store(0, Ordering::Relaxed);
@@ -645,6 +727,43 @@ mod tests {
         std::fs::write(
             activity_path(home, agent),
             serde_json::to_string_pretty(&payload).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// #1438 test helper: create an Open task on the board owned by `owner`.
+    fn seed_task(home: &Path, id: &str, owner: &str) {
+        crate::task_events::append(
+            home,
+            &crate::task_events::InstanceName("lead".to_string()),
+            crate::task_events::TaskEvent::Created {
+                task_id: crate::task_events::TaskId(id.to_string()),
+                title: "t".to_string(),
+                description: String::new(),
+                priority: "normal".to_string(),
+                owner: Some(crate::task_events::InstanceName(owner.to_string())),
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: None,
+                bind: None,
+                eta_secs: None,
+                tags: vec![],
+                parent_id: None,
+            },
+        )
+        .unwrap();
+    }
+
+    /// #1438 test helper: advance a task to InProgress (board "progress" event).
+    fn advance_task(home: &Path, id: &str, by: &str) {
+        crate::task_events::append(
+            home,
+            &crate::task_events::InstanceName(by.to_string()),
+            crate::task_events::TaskEvent::InProgress {
+                task_id: crate::task_events::TaskId(id.to_string()),
+                by: crate::task_events::InstanceName(by.to_string()),
+            },
         )
         .unwrap();
     }
@@ -1151,42 +1270,180 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// #1438: fleet ack resumes on TASK-BOARD PROGRESS, not bare agent activity.
+    /// Previously this test asserted that any post-ack agent activity cleared
+    /// the ack — encoding the #1438 ack-wash bug as if it were the spec.
+    /// Rewritten: board progress is the resume trigger. The "bare activity must
+    /// NOT resume" contract is pinned by `ack_survives_unrelated_agent_activity`.
     #[test]
-    fn fleet_scan_resumes_after_post_ack_activity() {
+    fn fleet_scan_resumes_on_board_progress() {
         let _g = env_lock();
         std::env::remove_var("AGEND_IDLE_WATCHDOG_AGENT");
         std::env::remove_var("AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT");
-        let home = tmp_home("ack-resume");
+        let home = tmp_home("ack-resume-board");
         let stale =
             chrono::Utc::now() - chrono::Duration::seconds(fleet_idle_threshold_secs() + 60);
         write_activity_at(&home, "dev", stale);
         write_activity_at(&home, "lead", stale);
-        // Ack in the past so post-ack activity can be simulated.
+        // Ack in the past; agents stay idle (no post-ack activity at all).
         let past_ack =
             chrono::Utc::now() - chrono::Duration::seconds(fleet_idle_threshold_secs() + 120);
         FLEET_ACKED_AT.store(past_ack.timestamp(), Ordering::Relaxed);
-        // Simulate one agent becoming active AFTER ack, then going idle again.
-        let post_ack_active = past_ack + chrono::Duration::seconds(30);
-        write_activity_at(&home, "dev", post_ack_active);
-        write_activity_at(&home, "lead", stale);
+        // Board PROGRESSES after the ack: a task is created then advanced now.
+        seed_task(&home, "t-resume", "dev");
+        advance_task(&home, "t-resume", "dev");
         let mut last_alerted = HashMap::new();
-        // dev's last_active > acked_at → ack auto-clears.
-        // Both agents' activity timestamps are well past threshold
-        // from real Utc::now(), so the alert should fire.
         scan_and_emit(&home, &mut last_alerted);
         let general = crate::inbox::drain(&home, "general");
         assert!(
             general
                 .iter()
                 .any(|m| m.kind.as_deref() == Some("fleet_idle_watchdog")),
-            "post-ack activity + re-idle must trigger fleet alert: {general:?}"
+            "post-ack board progress + still-idle agents must trigger alert: {general:?}"
         );
         assert_eq!(
             FLEET_ACKED_AT.load(Ordering::Relaxed),
             0,
-            "ack must auto-clear after post-ack activity detected"
+            "ack must clear after board progress detected"
         );
         clear_fleet_ack();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1438 (core regression): ack must SURVIVE unrelated agent activity.
+    /// `general` answering the operator (on-demand chatter, owns no task) must
+    /// NOT clear the ack — that on-any-activity recovery was the ack-wash bug
+    /// that re-fired the alert every ~30 min.
+    #[test]
+    fn ack_survives_unrelated_agent_activity() {
+        let _g = env_lock();
+        std::env::remove_var("AGEND_IDLE_WATCHDOG_AGENT");
+        std::env::remove_var("AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT");
+        let home = tmp_home("ack-wash-regression");
+        let stale =
+            chrono::Utc::now() - chrono::Duration::seconds(fleet_idle_threshold_secs() + 120);
+        write_activity_at(&home, "general", stale);
+        write_activity_at(&home, "dev", stale);
+        // Open task owned by dev → has_expected_work true (alert path armed).
+        seed_task(&home, "t-open", "dev");
+        // Ack now; then general (no owned task) chatters AFTER the ack.
+        let acked = ack_fleet_idle();
+        let post_ack =
+            chrono::DateTime::from_timestamp(acked, 0).unwrap() + chrono::Duration::seconds(5);
+        write_activity_at(&home, "general", post_ack);
+        let mut last_alerted = HashMap::new();
+        scan_and_emit(&home, &mut last_alerted);
+        let general = crate::inbox::drain(&home, "general");
+        assert!(
+            !general
+                .iter()
+                .any(|m| m.kind.as_deref() == Some("fleet_idle_watchdog")),
+            "on-demand chatter must NOT wash the ack / re-fire alert: {general:?}"
+        );
+        assert_ne!(
+            FLEET_ACKED_AT.load(Ordering::Relaxed),
+            0,
+            "ack must remain set after unrelated activity"
+        );
+        clear_fleet_ack();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1438: ack releases when a task-OWNING agent resumes (worker heartbeat),
+    /// even without an explicit board status-advance event — covers board-update
+    /// lag / off-board work. Scoped to owners so chatter can't trigger it.
+    #[test]
+    fn ack_released_on_task_owner_heartbeat() {
+        let _g = env_lock();
+        std::env::remove_var("AGEND_IDLE_WATCHDOG_AGENT");
+        std::env::remove_var("AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT");
+        let home = tmp_home("ack-owner-heartbeat");
+        let stale =
+            chrono::Utc::now() - chrono::Duration::seconds(fleet_idle_threshold_secs() + 120);
+        write_activity_at(&home, "dev", stale);
+        write_activity_at(&home, "lead", stale);
+        // dev owns an Open task (no status-advance after ack → board_progressed false).
+        seed_task(&home, "t-owned", "dev");
+        let past_ack =
+            chrono::Utc::now() - chrono::Duration::seconds(fleet_idle_threshold_secs() + 120);
+        FLEET_ACKED_AT.store(past_ack.timestamp(), Ordering::Relaxed);
+        // dev (task owner) becomes active AFTER the ack.
+        write_activity_at(&home, "dev", past_ack + chrono::Duration::seconds(30));
+        let mut last_alerted = HashMap::new();
+        scan_and_emit(&home, &mut last_alerted);
+        assert_eq!(
+            FLEET_ACKED_AT.load(Ordering::Relaxed),
+            0,
+            "ack must clear when a task-owning agent resumes (heartbeat)"
+        );
+        clear_fleet_ack();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1438: ack expires after its max TTL even with no board progress and no
+    /// owner activity — the time backstop against permanent silence.
+    #[test]
+    fn ack_expires_after_max_ttl() {
+        let _g = env_lock();
+        std::env::remove_var("AGEND_IDLE_WATCHDOG_AGENT");
+        std::env::remove_var("AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT");
+        let home = tmp_home("ack-ttl");
+        let stale = chrono::Utc::now() - chrono::Duration::seconds(fleet_idle_ack_ttl_secs() + 120);
+        write_activity_at(&home, "dev", stale);
+        write_activity_at(&home, "lead", stale);
+        seed_task(&home, "t-ttl", "dev"); // work exists → alert path armed
+                                          // Ack older than the max TTL; no progress, no owner activity since.
+        let old_ack =
+            chrono::Utc::now() - chrono::Duration::seconds(fleet_idle_ack_ttl_secs() + 60);
+        FLEET_ACKED_AT.store(old_ack.timestamp(), Ordering::Relaxed);
+        let mut last_alerted = HashMap::new();
+        scan_and_emit(&home, &mut last_alerted);
+        assert_eq!(
+            FLEET_ACKED_AT.load(Ordering::Relaxed),
+            0,
+            "ack must expire and clear after exceeding max TTL"
+        );
+        clear_fleet_ack();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1438: when the board's tasks are all Done and agents are idle, no alert
+    /// fires (has_expected_work=false) — TTL expiry must not turn into permanent
+    /// re-alert noise once the sprint is genuinely finished.
+    #[test]
+    fn done_board_idle_agents_no_alert() {
+        let _g = env_lock();
+        std::env::remove_var("AGEND_IDLE_WATCHDOG_AGENT");
+        std::env::remove_var("AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT");
+        let home = tmp_home("ack-done-board");
+        let stale =
+            chrono::Utc::now() - chrono::Duration::seconds(fleet_idle_threshold_secs() + 120);
+        write_activity_at(&home, "dev", stale);
+        write_activity_at(&home, "lead", stale);
+        // Task created then marked Done → has_expected_work false.
+        seed_task(&home, "t-done", "dev");
+        crate::task_events::append(
+            &home,
+            &crate::task_events::InstanceName("dev".to_string()),
+            crate::task_events::TaskEvent::Done {
+                task_id: crate::task_events::TaskId("t-done".to_string()),
+                by: crate::task_events::InstanceName("dev".to_string()),
+                source: crate::task_events::DoneSource::OperatorManual {
+                    authored_at: chrono::Utc::now().to_rfc3339(),
+                    result: None,
+                },
+            },
+        )
+        .unwrap();
+        let mut last_alerted = HashMap::new();
+        scan_and_emit(&home, &mut last_alerted);
+        let general = crate::inbox::drain(&home, "general");
+        assert!(
+            !general
+                .iter()
+                .any(|m| m.kind.as_deref() == Some("fleet_idle_watchdog")),
+            "all-done board must not fire fleet idle alert: {general:?}"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
