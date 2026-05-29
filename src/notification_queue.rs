@@ -114,6 +114,18 @@ pub fn draft_state(home: &Path, agent_name: &str) -> DraftState {
     let now_ms = chrono::Utc::now().timestamp_millis();
     if now_ms.saturating_sub(typed_ms) < draft_escape_timeout_ms() {
         DraftState::Drafting
+    } else if submit_ms == 0 {
+        // #1473 (scoped fix): an unsent draft idle past the escape window with
+        // NO submit ever recorded is not evidence of a real operator draft —
+        // e.g. the operator poked an agent pane once but never composed a
+        // message there. Treat as None so notifications deliver normally,
+        // rather than trapping the pane in Abandoned forever. The Drafting
+        // branch above (recent typing = active draft) is untouched, so #1457's
+        // "don't clobber an in-progress draft" protection is preserved.
+        // NOTE: scoped to the Abandoned branch ON PURPOSE — a naive top-level
+        // `submit_ms == 0 → None` would mis-classify the operator's first-ever
+        // draft (recent typing, no prior submit) and re-introduce the #1457 bug.
+        DraftState::None
     } else {
         DraftState::Abandoned
     }
@@ -324,9 +336,45 @@ mod tests {
     fn draft_state_abandoned_past_escape_window() {
         let home = tmp_home("draft_abandoned");
         let now = chrono::Utc::now().timestamp_millis();
-        // typed 400s ago, never submitted since → past the 300s default escape.
+        // typed 400s ago, with a PRIOR submit (submit_ms>0) → past the 300s
+        // escape → genuine "typed then walked away" → Abandoned (trickle kept).
         write_ts(&home, "a", now - 400_000, now - 500_000);
         assert_eq!(draft_state(&home, "a"), DraftState::Abandoned);
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// #1473: stale typed + NEVER submitted (submit_ms==0) → None, NOT
+    /// Abandoned. This is the regression case: an agent pane the operator
+    /// poked once but never composed in (e.g. codex reviewer) was trapped in
+    /// Abandoned, deferring its wakes forever. Must deliver normally now.
+    #[test]
+    fn draft_state_never_submitted_stale_is_none() {
+        let home = tmp_home("draft_never_submit");
+        let now = chrono::Utc::now().timestamp_millis();
+        // typed 400s ago (past escape), submit_ms == 0 (never submitted).
+        write_ts(&home, "a", now - 400_000, 0);
+        assert_eq!(
+            draft_state(&home, "a"),
+            DraftState::None,
+            "never-submitted stale pane must be None, not Abandoned (#1473)"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// #1473 guard: the scoped fix must NOT weaken the active-draft protection.
+    /// A RECENT first-ever draft (typed now, submit_ms==0) is still Drafting —
+    /// proving a naive top-level `submit==0→None` (which would regress #1457)
+    /// was avoided.
+    #[test]
+    fn draft_state_first_draft_recent_still_drafting() {
+        let home = tmp_home("draft_first");
+        let now = chrono::Utc::now().timestamp_millis();
+        write_ts(&home, "a", now - 1_000, 0); // typed 1s ago, never submitted
+        assert_eq!(
+            draft_state(&home, "a"),
+            DraftState::Drafting,
+            "recent first draft must stay protected (Drafting), not None (#1457 preserved)"
+        );
         std::fs::remove_dir_all(home).ok();
     }
 
