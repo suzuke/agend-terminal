@@ -219,7 +219,9 @@ pub(crate) fn build_instructions_body(
     content.push_str("**Primary inter-agent communication**:\n");
     content
         .push_str("- `send` — unified send to one or many agents. Required: `message`. Routing:\n");
-    content.push_str("  - `target_instance` (single recipient) OR `targets` / `team` / `tags` (broadcast mode)\n");
+    content.push_str(
+        "  - `instance` (single recipient) OR `instances` / `team` / `tags` (broadcast mode)\n",
+    );
     content.push_str("  - `request_kind`: `task` (delegation, expects report back) / `report` (results back) / `query` (question, expects reply) / `update` (status) / omit (plain message)\n");
     content.push_str("  - Task-mode optional fields: `success_criteria`, `task_id`, `force` + `force_reason`, `second_reviewer` + `second_reviewer_reason`, `branch`, `working_directory`\n");
     content.push_str(

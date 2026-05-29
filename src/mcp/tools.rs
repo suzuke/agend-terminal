@@ -27,8 +27,8 @@ pub(crate) fn def_download_attachment() -> Value {
 pub(crate) fn def_send() -> Value {
     json!({"name": "send", "description": "Send a message to another instance or broadcast to multiple. Replaces send_to_instance/delegate_task/report_result/request_information/broadcast. Sprint 58 Wave 4 PR-1: kind=task dispatches MUST include task_id (call task action=create first to obtain a 't-...' id).",
         "inputSchema": {"type": "object", "properties": {
-            "target_instance": {"type": "string", "description": "Target instance name (single recipient)"},
-            "targets": {"type": "array", "items": {"type": "string"}, "description": "Multiple targets (broadcast mode)"},
+            "instance": {"type": "string", "description": "Name of the existing instance to send to (single recipient)"},
+            "instances": {"type": "array", "items": {"type": "string"}, "description": "Names of existing instances to broadcast to (broadcast mode)"},
             "team": {"type": "string", "description": "Team name (broadcast to team)"},
             "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags filter (broadcast mode)"},
             "message": {"type": "string", "description": "Message text (or 'task' for delegate, 'summary' for report, 'question' for query)"},
@@ -69,8 +69,8 @@ pub(crate) fn def_inbox() -> Value {
 }
 
 pub(crate) fn def_list_instances() -> Value {
-    json!({"name": "list_instances", "description": "List all active agent instances. Pass optional `name` for detailed info on a single instance.",
-        "inputSchema": {"type": "object", "properties": {"name": {"type": "string", "description": "Optional: instance name for detailed info"}}}})
+    json!({"name": "list_instances", "description": "List all active agent instances. Pass optional `instance` for detailed info on a single instance.",
+        "inputSchema": {"type": "object", "properties": {"instance": {"type": "string", "description": "Optional: name of an existing instance for detailed info"}}}})
 }
 
 pub(crate) fn def_create_instance() -> Value {
@@ -94,26 +94,26 @@ pub(crate) fn def_create_instance() -> Value {
 
 pub(crate) fn def_delete_instance() -> Value {
     json!({"name": "delete_instance", "description": "Stop and remove an instance.",
-        "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}})
+        "inputSchema": {"type": "object", "properties": {"instance": {"type": "string", "description": "Name of the existing instance to remove"}}, "required": ["instance"]}})
 }
 
 pub(crate) fn def_start_instance() -> Value {
     json!({"name": "start_instance", "description": "Start a stopped instance.",
-        "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}})
+        "inputSchema": {"type": "object", "properties": {"instance": {"type": "string", "description": "Name of the existing instance to start"}}, "required": ["instance"]}})
 }
 
 pub(crate) fn def_replace_instance() -> Value {
     json!({"name": "replace_instance", "description": "Replace an instance with a fresh one.",
-        "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}, "reason": {"type": "string"}}, "required": ["name"]}})
+        "inputSchema": {"type": "object", "properties": {"instance": {"type": "string", "description": "Name of the existing instance to replace"}, "reason": {"type": "string"}}, "required": ["instance"]}})
 }
 
 pub(crate) fn def_restart_instance() -> Value {
     json!({"name": "restart_instance", "description": "Kill and restart an instance. Default mode 'resume' preserves conversation state; 'fresh' starts clean (like replace_instance).",
         "inputSchema": {"type": "object", "properties": {
-            "name": {"type": "string"},
+            "instance": {"type": "string", "description": "Name of the existing instance to restart"},
             "mode": {"type": "string", "enum": ["resume", "fresh"], "default": "resume", "description": "resume = keep conversation (--continue/--resume); fresh = clean start"},
             "reason": {"type": "string"}
-        }, "required": ["name"]}})
+        }, "required": ["instance"]}})
 }
 
 pub(crate) fn def_tokens() -> Value {
@@ -128,10 +128,10 @@ pub(crate) fn def_tokens() -> Value {
 pub(crate) fn def_interrupt() -> Value {
     json!({"name": "interrupt", "description": "Send ESC byte to target agent's PTY to interrupt current LLM turn. Context preserved, agent accepts next prompt.",
         "inputSchema": {"type": "object", "properties": {
-            "target": {"type": "string", "description": "Target instance name"},
+            "instance": {"type": "string", "description": "Name of the existing instance to interrupt"},
             "reason": {"type": "string", "description": "Optional follow-up message to inject after ESC"},
             "snapshot": {"type": "boolean", "default": false, "description": "When true, return a pane snapshot after ESC for closed-loop verification"}
-        }, "required": ["target"]}})
+        }, "required": ["instance"]}})
 }
 
 pub(crate) fn def_set_display_name() -> Value {
@@ -152,18 +152,18 @@ pub(crate) fn def_set_waiting_on() -> Value {
 pub(crate) fn def_move_pane() -> Value {
     json!({"name": "move_pane", "description": "Move an instance's pane into a different tab in the TUI. If `target_tab` names an existing tab, the pane splits that tab's focused pane; otherwise a new tab with that name is created and the pane becomes its root. Preserves scrollback and PTY state (unlike delete + create).",
         "inputSchema": {"type": "object", "properties": {
-            "agent": {"type": "string", "description": "Instance name whose pane should be moved."},
+            "instance": {"type": "string", "description": "Name of the existing instance whose pane should be moved."},
             "target_tab": {"type": "string", "description": "Destination tab name. Created if not present."},
             "split_dir": {"type": "string", "enum": ["horizontal", "vertical"], "description": "Split direction when the destination tab already exists. Default: horizontal. Ignored when a new tab is created."}
-        }, "required": ["agent", "target_tab"]}})
+        }, "required": ["instance", "target_tab"]}})
 }
 
 pub(crate) fn def_pane_snapshot() -> Value {
     json!({"name": "pane_snapshot", "description": "Read visible text from a target instance's PTY scrollback. Returns plain text (ANSI stripped). Default 100 lines, max 10000.",
         "inputSchema": {"type": "object", "properties": {
-            "target": {"type": "string", "description": "Target instance name"},
+            "instance": {"type": "string", "description": "Name of the existing instance to snapshot"},
             "lines": {"type": "integer", "description": "Number of lines to return (default 100, max 10000)"}
-        }, "required": ["target"]}})
+        }, "required": ["instance"]}})
 }
 
 pub(crate) fn def_tui_screenshot() -> Value {
@@ -203,7 +203,7 @@ pub(crate) fn def_task() -> Value {
             "apply": {"type": "boolean", "description": "#806 sweep: when false (default), returns dry-run plan; when true, emits Cancelled for the confirm_ids subset."},
             "confirm_ids": {"type": "array", "items": {"type": "string"}, "description": "#806 sweep apply=true: subset of candidate_ids from prior dry-run to actually cancel."},
             "audit_reason": {"type": "string", "description": "#806 sweep apply=true: required audit text recorded in event-log.jsonl + per-task Cancelled.reason."},
-            "repo": {"type": "string", "description": "#806 sweep: override repo for PR-state queries (defaults to task_sweep.json's repo)."},
+            "repository": {"type": "string", "description": "#806 sweep: override GitHub `owner/repo` slug for PR-state queries (defaults to task_sweep.json's repo)."},
             "metadata_key": {"type": "string", "description": "Key for metadata_set action."},
             "metadata_value": {"description": "Value for metadata_set action (any JSON type)."}
         }, "required": ["action"]}})
@@ -213,7 +213,7 @@ pub(crate) fn def_task_sweep_config() -> Value {
     json!({"name": "task_sweep_config",
     "description": "Configure GitHub-PR auto-close sweep daemon. Sweep polls merged PRs and emits Done events for `Closes t-XXX-N` markers (validated by 5-must-have pipeline).",
     "inputSchema": {"type": "object", "properties": {
-        "repo": {"type": "string", "description": "GitHub `owner/repo` to sweep (empty string disables)"},
+        "repository": {"type": "string", "description": "GitHub `owner/repo` slug to sweep (empty string disables)"},
         "pause": {"type": "boolean", "description": "Pause/resume the sweep tick"},
         "dry_run": {"type": "boolean", "description": "Log decisions without emitting events"}
     }}})
@@ -231,7 +231,7 @@ pub(crate) fn def_team() -> Value {
             "name": {"type": "string"}, "members": {"type": "array", "items": {"type": "string"}},
             "orchestrator": {"type": "string", "description": "Team orchestrator — must be a member."},
             "description": {"type": "string"},
-            "source_repo": {"type": "string", "description": "Source repository path for the team."},
+            "repository_path": {"type": "string", "description": "Local filesystem path to the source repository for the team."},
             "accept_from": {"type": "array", "items": {"type": "string"}, "description": "External agent names allowed to send directly to this team's orchestrator (cross-team allowlist). Empty = deny all cross-team sends (default)."},
             "add": {"type": "array", "items": {"type": "string"}},
             "remove": {"type": "array", "items": {"type": "string"}}
@@ -245,7 +245,7 @@ pub(crate) fn def_schedule() -> Value {
             "id": {"type": "string"},
             "cron": {"type": "string", "description": "5- or 6-field cron expression (recurring). 5-field layout: `min hour day-of-month month day-of-week`; 6-field prepends seconds. Day-of-week uses Quartz convention: 1=Sun, 2=Mon, 3=Tue, 4=Wed, 5=Thu, 6=Fri, 7=Sat (NOT Unix 0-6). Example: every Wed+Sat at 15:00 → `0 15 * * 4,7`."},
             "run_at": {"type": "string", "description": "ISO 8601 one-shot instant."},
-            "message": {"type": "string"}, "target": {"type": "string"},
+            "message": {"type": "string"}, "instance": {"type": "string", "description": "Name of the existing instance to deliver the scheduled message to."},
             "label": {"type": "string"},
             "timezone": {"type": "string", "description": "IANA zone name."},
             "enabled": {"type": "boolean"}
@@ -267,7 +267,7 @@ pub(crate) fn def_ci() -> Value {
     json!({"name": "ci", "description": "Manage CI watching. Actions: watch, unwatch, status.",
         "inputSchema": {"type": "object", "properties": {
             "action": {"type": "string", "enum": ["watch", "unwatch", "status"]},
-            "repo": {"type": "string", "description": "GitHub repo (owner/repo). Required for watch/unwatch; optional filter for status."},
+            "repository": {"type": "string", "description": "GitHub `owner/repo` slug. Required for watch/unwatch; optional filter for status."},
             "branch": {"type": "string", "description": "Branch to watch (default: main); optional filter for status."},
             "interval_secs": {"type": "number", "description": "Poll interval in seconds (default: 60)"},
             "next_after_ci": {"type": "string", "description": "Instance to auto-notify when CI passes. Daemon sends [ci-ready-for-action] to this target."},
@@ -308,11 +308,11 @@ pub(crate) fn def_repo() -> Value {
         "inputSchema": {"type": "object", "properties": {
             "action": {"type": "string", "enum": ["checkout", "release", "cleanup_init_commits", "cleanup_merged_branches", "merge"]},
             "pr": {"type": "integer", "description": "PR number for merge action."},
-            "source_repo": {"type": "string", "description": "checkout: local path to the source repository. Standard cross-tool name (matches bind_self / team update)."},
-            "source": {"type": "string", "description": "checkout: alias for `source_repo`, retained for backward compatibility (#1446). Prefer `source_repo`."},
+            "repository": {"type": "string", "description": "merge: GitHub `owner/repo` slug to merge the PR in (defaults to the canonical repo). Distinct from `repository_path` (a local checkout path)."},
+            "repository_path": {"type": "string", "description": "checkout: local filesystem path to the source repository. Standard cross-tool name (matches bind_self / team update)."},
             "branch": {"type": "string"},
             "path": {"type": "string"},
-            "agent": {"type": "string", "description": "#789: target agent for cleanup_init_commits (defaults to caller's instance_name). Cleans empty `init` commits accumulated in the agent's bound worktree by backend session-checkpoint heartbeats. Returns {cleaned_count, [skipped_reason]}. Idempotent — call before push to scrub PR history."},
+            "instance": {"type": "string", "description": "#789: name of the existing instance to target for cleanup_init_commits (defaults to caller's instance_name). Cleans empty `init` commits accumulated in the agent's bound worktree by backend session-checkpoint heartbeats. Returns {cleaned_count, [skipped_reason]}. Idempotent — call before push to scrub PR history."},
             "bind": {"type": "boolean", "description": "#778 Option 1: when true on checkout, atomically bind the caller to the just-provisioned worktree (writes binding.json + .agend-managed marker + arms ci_watches) and lands HEAD on the named branch instead of a detached commit. Default false preserves back-compat for inspection-only callers (review pool, operator triage)."},
             "base": {"type": "string", "description": "#817 cleanup_merged_branches: branch to compare against for clean/squash merge detection (default 'main')."},
             "min_age_days": {"type": "integer", "description": "#817 cleanup_merged_branches: stale_idle threshold in days (default 90)."},
@@ -325,8 +325,8 @@ pub(crate) fn def_repo() -> Value {
 pub(crate) fn def_bind_self() -> Value {
     json!({"name": "bind_self", "description": "Bind the calling agent to a worktree on the named branch. For fresh-task workflows that know the source repo, prefer `repo action=checkout bind:true` (#779 Option 1) — single-step atomic provision + bind. Use `bind_self` when the caller is mid-lifecycle: (a) re-binding a recovered worktree via `rebase_mode=true`, (b) binding via fleet.yaml-resolved source_repo (no explicit source arg), or (c) post-`release_worktree` re-claim of the same branch. Both paths share `dispatch_auto_bind_lease` so binding.json + .agend-managed marker + auto watch_ci all land. Rejects 'main'/'master' (E4.5) and cross-agent branch conflicts. Pair with `release_worktree` to unbind.",
         "inputSchema": {"type": "object", "properties": {
-            "source_repo": {"type": "string", "description": "Local path to source repository. Daemon resolves GitHub owner/repo via `git remote get-url origin`. Sprint 55 P0-B preferred form. Mutually exclusive with `repo` (handler rejects both via `ambiguous_args` code)."},
-            "repo": {"type": "string", "description": "GitHub repo (owner/name). Legacy form retained for one-Sprint deprecation window — emits warn-log; removal Sprint 57. Mutually exclusive with `source_repo`."},
+            "repository_path": {"type": "string", "description": "Local filesystem path to source repository. Daemon resolves GitHub owner/repo via `git remote get-url origin`. Sprint 55 P0-B preferred form. Mutually exclusive with `repository` (handler rejects both via `ambiguous_args` code)."},
+            "repository": {"type": "string", "description": "GitHub `owner/repo` slug. Legacy form retained for one-Sprint deprecation window — emits warn-log; removal Sprint 57. Mutually exclusive with `repository_path`."},
             "branch": {"type": "string", "description": "Branch to bind (must not be main/master)"},
             "rebase_mode": {"type": "boolean", "description": "Sprint 60 W1 PR-1: atomic recover-and-bind. When true, releases self's stale on-disk worktree dir + binding state before lease — closes the lease_failed recovery path without an explicit release_worktree call. Cross-agent isolation preserved (rejects branches leased by another agent)."}
         }, "required": ["branch"]}})
@@ -335,23 +335,23 @@ pub(crate) fn def_bind_self() -> Value {
 pub(crate) fn def_release_worktree() -> Value {
     json!({"name": "release_worktree", "description": "Release the daemon-managed worktree and clear the binding for the given agent. Idempotent. Only removes worktrees carrying the `.agend-managed` marker — operator-created worktrees are left alone.",
         "inputSchema": {"type": "object", "properties": {
-            "agent": {"type": "string", "description": "Agent name whose worktree + binding to release"}
-        }, "required": ["agent"]}})
+            "instance": {"type": "string", "description": "Name of the existing instance whose worktree + binding to release"}
+        }, "required": ["instance"]}})
 }
 
 pub(crate) fn def_force_release_worktree() -> Value {
     json!({"name": "force_release_worktree", "description": "Force-release a stale daemon-managed worktree directory — cleans <home>/worktrees/<agent>/<branch>/ on disk + runs the standard release_full to clear any lingering binding state. Idempotent. Refuses to clean paths outside the daemon worktree pool. Sprint 59 Wave 1 PR-5 emergency cherry-pick supporting Q2=(C) bypass-free permanent protocol.",
         "inputSchema": {"type": "object", "properties": {
-            "agent": {"type": "string", "description": "Agent name (worktree owner)"},
+            "instance": {"type": "string", "description": "Name of the existing instance (worktree owner)"},
             "branch": {"type": "string", "description": "Branch name (worktree subdirectory)"}
-        }, "required": ["agent", "branch"]}})
+        }, "required": ["instance", "branch"]}})
 }
 
 pub(crate) fn def_binding_state() -> Value {
     json!({"name": "binding_state", "description": "Report the structured daemon-side bind state for an agent: binding.json content, worktree existence + .agend-managed marker, ci-watch subscriptions, bind-in-flight guard, and cross-branch holders. Operator + agent introspection surface; non-destructive. Pairs with release_worktree.",
         "inputSchema": {"type": "object", "properties": {
-            "agent": {"type": "string", "description": "Agent name to inspect"}
-        }, "required": ["agent"]}})
+            "instance": {"type": "string", "description": "Name of the existing instance to inspect"}
+        }, "required": ["instance"]}})
 }
 
 pub(crate) fn def_gc_dry_run() -> Value {
@@ -460,7 +460,7 @@ mod tests {
         let required = delete["inputSchema"]["required"]
             .as_array()
             .expect("required");
-        assert!(required.iter().any(|v| v == "name"));
+        assert!(required.iter().any(|v| v == "instance"));
     }
 
     #[test]

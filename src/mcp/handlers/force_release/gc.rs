@@ -410,7 +410,7 @@ mod tests {
         let result = handle_force_release_worktree(
             &home,
             &json!({
-                "agent": "dev826",
+                "instance": "dev826",
                 "branch": "feat/826",
                 "source_repo": source_repo.display().to_string(),
             }),
@@ -450,7 +450,7 @@ mod tests {
         let home = tmp_home("826_c3_response_shape");
         let result = handle_force_release_worktree(
             &home,
-            &json!({"agent": "dev826c3", "branch": "feat/826"}),
+            &json!({"instance": "dev826c3", "branch": "feat/826"}),
             &None,
         );
         assert_eq!(result["git_metadata_pruned"], 0, "got: {result}");
@@ -476,7 +476,7 @@ mod tests {
         let r1 = handle_force_release_worktree(
             &home,
             &json!({
-                "agent": "dev826",
+                "instance": "dev826",
                 "branch": "feat/826",
                 "source_repo": source_repo.display().to_string(),
             }),
@@ -489,7 +489,7 @@ mod tests {
         let r2 = handle_force_release_worktree(
             &home,
             &json!({
-                "agent": "dev826",
+                "instance": "dev826",
                 "branch": "feat/826",
                 "source_repo": source_repo.display().to_string(),
             }),
@@ -529,7 +529,7 @@ mod tests {
         let r1 = handle_force_release_worktree(
             &home,
             &json!({
-                "agent": agent,
+                "instance": agent,
                 "branch": "feat/aaa",
                 "source_repo": repo_a.display().to_string(),
             }),
@@ -545,7 +545,7 @@ mod tests {
         let r2 = handle_force_release_worktree(
             &repo_b_home,
             &json!({
-                "agent": agent,
+                "instance": agent,
                 "branch": "feat/bbb",
                 "source_repo": repo_b.display().to_string(),
             }),
@@ -608,7 +608,7 @@ mod tests {
         let result = handle_force_release_worktree(
             &home,
             &json!({
-                "agent": "agent_x826",
+                "instance": "agent_x826",
                 "branch": "feat/x",
                 "source_repo": source_repo.display().to_string(),
             }),

@@ -15,12 +15,12 @@ Manage decisions. Actions: post, list, update.
 ### `team`
 Manage teams. Actions: create, delete, list, update.
 - **action**: create / delete / list / update
-- name, members, orchestrator, description, source_repo, add, remove
+- name, members, orchestrator, description, repository_path, add, remove
 
 ### `schedule`
 Manage schedules. Actions: create, list, update, delete.
 - **action**: create / list / update / delete
-- id, label, target, message, cron, run_at, timezone, enabled
+- id, label, instance, message, cron, run_at, timezone, enabled
 
 ### `deployment`
 Manage deployments. Actions: deploy, teardown, list.
@@ -30,12 +30,12 @@ Manage deployments. Actions: deploy, teardown, list.
 ### `ci`
 Manage CI watching. Actions: watch, unwatch, status.
 - **action**: watch / unwatch / status
-- repo, branch, interval_secs
+- repository, branch, interval_secs
 
 ### `repo`
 Manage repo worktrees. Actions: checkout, release.
 - **action**: checkout / release
-- source, branch, path
+- repository_path, branch, path
 
 ### `health`
 Manage health state. Actions: report, clear.
@@ -47,7 +47,7 @@ Manage health state. Actions: report, clear.
 ### `send`
 Send a message to another instance or broadcast to multiple. Unified replacement for send_to_instance/delegate_task/report_result/request_information/broadcast.
 - **message**: text content
-- target_instance, targets, team, tags (routing)
+- instance, instances, team, tags (routing)
 - request_kind: query / task / report / update
 - task_id (required for kind=task), success_criteria, branch, working_directory
 - context, requires_reply, task_summary, correlation_id, parent_id, thread_id
@@ -77,19 +77,19 @@ Create agent instance(s). Supports homogeneous teams (count + backend) and heter
 
 ### `delete_instance`
 Stop and remove an instance.
-- **name**: instance to delete
+- **instance**: instance to delete
 
 ### `start_instance`
 Start a stopped instance.
-- **name**: instance to start
+- **instance**: instance to start
 
 ### `replace_instance`
 Replace an instance with a fresh one.
-- **name**: instance to replace
+- **instance**: instance to replace
 - reason
 
 ### `list_instances`
-List all active agent instances. No parameters.
+List all active agent instances. Pass optional `instance` for detailed info on a single instance.
 
 ### `set_display_name`
 Set your display name.
@@ -105,18 +105,18 @@ Declare what this instance is currently waiting for. Empty string to clear.
 
 ### `interrupt`
 Send ESC to target agent's PTY to interrupt current LLM turn.
-- **target**: instance name
+- **instance**: instance name
 - reason
 
 ### `move_pane`
 Move an instance's pane into a different tab in the TUI.
-- **agent**: instance to move
+- **instance**: instance to move
 - **target_tab**: destination tab name
 - split_dir (horizontal / vertical)
 
 ### `pane_snapshot`
 Read visible text from a target instance's PTY scrollback (ANSI stripped).
-- **target**: instance name
+- **instance**: instance name
 - lines (default 100, max 10000)
 
 ## Worktree & Binding
@@ -124,21 +124,21 @@ Read visible text from a target instance's PTY scrollback (ANSI stripped).
 ### `bind_self`
 Bind the calling agent to a fresh worktree on the named branch. Rejects main/master (E4.5) and cross-agent conflicts.
 - **branch**: branch to bind
-- source_repo, repo (deprecated), rebase_mode
+- repository_path, repository (deprecated), rebase_mode
 
 ### `release_worktree`
 Release the daemon-managed worktree and clear binding. Only removes worktrees with `.agend-managed` marker.
-- **agent**: agent to release
+- **instance**: instance to release
 - dry_run
 
 ### `force_release_worktree`
 Force-release a stale daemon-managed worktree directory. Emergency recovery tool.
-- **agent**: agent name
+- **instance**: instance name
 - **branch**: branch name
 
 ### `binding_state`
 Report structured daemon-side bind state for an agent. Non-destructive introspection.
-- **agent**: agent to inspect
+- **instance**: instance to inspect
 
 ### `gc_dry_run`
 List Phase 4 GC candidates without deleting. Non-destructive.
@@ -148,7 +148,7 @@ List Phase 4 GC candidates without deleting. Non-destructive.
 
 ### `task_sweep_config`
 Configure GitHub-PR auto-close sweep daemon.
-- repo, dry_run, pause
+- repository, dry_run, pause
 
 ### `restart_daemon`
 

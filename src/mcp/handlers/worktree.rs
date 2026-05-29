@@ -13,21 +13,21 @@ use std::path::Path;
 ///
 /// **When to use vs `repo action=checkout bind:true`** (#779 Option 1):
 /// - **`bind:true`** — preferred for fresh-task dispatches where the
-///   caller already knows the source repo (passes explicit `source`
-///   arg). Single-step atomic provision + bind.
+///   caller already knows the source repo (passes explicit
+///   `repository_path` arg). Single-step atomic provision + bind.
 /// - **`bind_self`** — preferred for mid-lifecycle scenarios:
 ///   (a) re-binding a recovered worktree via `rebase_mode=true`,
-///   (b) binding via fleet.yaml-resolved source_repo (caller has no
-///   explicit source arg available),
+///   (b) binding via fleet.yaml-resolved source repo (caller has no
+///   explicit `repository_path` arg available),
 ///   (c) post-`release_worktree` re-claim of the same branch.
 ///
 /// Both paths share `dispatch_auto_bind_lease` so binding.json +
 /// .agend-managed marker + auto watch_ci all land. Bug fixes in the
 /// dispatch path inherit automatically.
 ///
-/// Required args: `repo` / `source_repo` (one of), `branch`. Returns
-/// `{bound, worktree_path, branch}` on success or `{error, code}` on
-/// failure.
+/// Required args: `repository_path` / `repository` (one of), `branch`.
+/// Returns `{bound, worktree_path, branch}` on success or `{error, code}`
+/// on failure.
 pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender>) -> Value {
     let agent = match sender.as_ref().map(Sender::as_str) {
         Some(a) if !a.is_empty() => a,
@@ -50,32 +50,32 @@ pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender
     }
 
     // Sprint 55 P0-B EC9: dual-arg shape with two-sprint deprecation cycle.
-    // - `source_repo: <local path>` (NEW unified shape; daemon derives owner/repo)
-    // - `repo: "owner/name"` (legacy GitHub slug; warn-log; removed Sprint 57)
+    // - `repository_path: <local path>` (NEW unified shape; daemon derives owner/repo)
+    // - `repository: "owner/name"` (legacy GitHub slug; warn-log; removed Sprint 57)
     // Both present → reject as `ambiguous_args`. Neither → fleet.yaml fallback chain.
-    let source_repo_arg = args["source_repo"].as_str().filter(|s| !s.is_empty());
-    let repo_arg = args["repo"].as_str().filter(|s| !s.is_empty());
+    let source_repo_arg = args["repository_path"].as_str().filter(|s| !s.is_empty());
+    let repo_arg = args["repository"].as_str().filter(|s| !s.is_empty());
     if source_repo_arg.is_some() && repo_arg.is_some() {
         return json!({
-            "error": "both 'source_repo' and 'repo' provided — pass exactly one",
+            "error": "both 'repository_path' and 'repository' provided — pass exactly one",
             "code": "ambiguous_args"
         });
     }
     if repo_arg.is_some() {
         tracing::warn!(
             %agent,
-            "bind_self(repo=...) is deprecated; use bind_self(source_repo=<local-path>) — Sprint 55 warning, Sprint 57 removal"
+            "bind_self(repository=...) is deprecated; use bind_self(repository_path=<local-path>) — Sprint 55 warning, Sprint 57 removal"
         );
     }
     let source_repo_path = source_repo_arg.map(std::path::PathBuf::from);
 
-    // Issue #689: reject path traversal in source_repo
+    // Issue #689: reject path traversal in repository_path
     if let Some(ref p) = source_repo_path {
         if p.components()
             .any(|c| matches!(c, std::path::Component::ParentDir))
         {
             return json!({
-                "error": "source_repo must not contain '..' (path traversal rejected)",
+                "error": "repository_path must not contain '..' (path traversal rejected)",
                 "code": "path_traversal"
             });
         }
@@ -137,7 +137,7 @@ pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender
     }
 }
 
-/// MCP tool: `release_worktree`. Required arg: `agent`. Returns
+/// MCP tool: `release_worktree`. Required arg: `instance`. Returns
 /// `{released, worktree_removed, binding_removed, error}` —
 /// `released:true` clears binding; worktree removal via
 /// `git worktree remove --force` (or fallback). Idempotent — second
@@ -147,9 +147,9 @@ pub(crate) fn handle_release_worktree(
     args: &Value,
     _sender: &Option<Sender>,
 ) -> Value {
-    let agent = match args["agent"].as_str() {
+    let agent = match args["instance"].as_str() {
         Some(a) if !a.is_empty() => a,
-        _ => return json!({"error": "missing 'agent'"}),
+        _ => return json!({"error": "missing 'instance'"}),
     };
     crate::validate_name_or_err!(agent);
     let dry_run = args["dry_run"].as_bool().unwrap_or(false);
@@ -271,8 +271,8 @@ mod tests {
         let result = handle_release_worktree(&home, &json!({}), &None);
         assert_eq!(
             result["error"].as_str(),
-            Some("missing 'agent'"),
-            "missing agent must surface clear error: {result}"
+            Some("missing 'instance'"),
+            "missing instance must surface clear error: {result}"
         );
         std::fs::remove_dir_all(&home).ok();
     }
@@ -281,7 +281,7 @@ mod tests {
     fn handler_rejects_invalid_agent_name() {
         let home = tmp_home("bad-name");
         // Agent names with `..` are rejected by validate_name.
-        let result = handle_release_worktree(&home, &json!({"agent": "../etc/passwd"}), &None);
+        let result = handle_release_worktree(&home, &json!({"instance": "../etc/passwd"}), &None);
         assert!(
             result.get("error").is_some(),
             "invalid agent name must error: {result}"
@@ -295,7 +295,7 @@ mod tests {
         // uses (`handle_release_worktree`). With no binding, must return
         // released:false and error indicating no binding — not panic.
         let home = tmp_home("idem-no-binding");
-        let result = handle_release_worktree(&home, &json!({"agent": "ghost"}), &None);
+        let result = handle_release_worktree(&home, &json!({"instance": "ghost"}), &None);
         assert_eq!(
             result["released"].as_bool(),
             Some(false),
@@ -394,7 +394,7 @@ mod tests {
 
         let resp = handle_bind_self(
             &home,
-            &json!({"repo": "owner/name", "branch": "feat/p17"}),
+            &json!({"repository": "owner/name", "branch": "feat/p17"}),
             &sender_for("agent-self"),
         );
         assert_eq!(
@@ -446,7 +446,7 @@ mod tests {
         std::fs::create_dir_all(&home).ok();
         p17_setup_repo(&home, "agent-idem");
 
-        let args = json!({"repo": "owner/name", "branch": "feat/idem"});
+        let args = json!({"repository": "owner/name", "branch": "feat/idem"});
         let r1 = handle_bind_self(&home, &args, &sender_for("agent-idem"));
         assert_eq!(r1["bound"].as_bool(), Some(true), "first bind: {r1}");
         let r2 = handle_bind_self(&home, &args, &sender_for("agent-idem"));
@@ -474,7 +474,7 @@ mod tests {
 
         let resp = handle_bind_self(
             &home,
-            &json!({"repo": "owner/name", "branch": "main"}),
+            &json!({"repository": "owner/name", "branch": "main"}),
             &sender_for("agent-e45"),
         );
         assert!(
@@ -511,14 +511,14 @@ mod tests {
 
         let r1 = handle_bind_self(
             &home,
-            &json!({"repo": "owner/name", "branch": "feat/cross"}),
+            &json!({"repository": "owner/name", "branch": "feat/cross"}),
             &sender_for("agent-A"),
         );
         assert_eq!(r1["bound"].as_bool(), Some(true), "A binds first: {r1}");
 
         let r2 = handle_bind_self(
             &home,
-            &json!({"repo": "owner/name", "branch": "feat/cross"}),
+            &json!({"repository": "owner/name", "branch": "feat/cross"}),
             &sender_for("agent-B"),
         );
         assert!(
@@ -546,7 +546,7 @@ mod tests {
 
         let resp = handle_bind_self(
             &home,
-            &json!({"repo": "owner/name", "branch": "feat/cycle"}),
+            &json!({"repository": "owner/name", "branch": "feat/cycle"}),
             &sender_for("agent-cycle"),
         );
         assert_eq!(resp["bound"].as_bool(), Some(true));
@@ -560,7 +560,7 @@ mod tests {
             .join("binding.json");
         assert!(binding.exists());
 
-        let release = handle_release_worktree(&home, &json!({"agent": "agent-cycle"}), &None);
+        let release = handle_release_worktree(&home, &json!({"instance": "agent-cycle"}), &None);
         assert_eq!(
             release["released"].as_bool(),
             Some(true),
@@ -728,7 +728,7 @@ mod path_traversal_tests {
     fn source_repo_with_dotdot_rejected() {
         let home = std::env::temp_dir().join("pt-test-1");
         std::fs::create_dir_all(&home).ok();
-        let args = json!({"branch": "feat-x", "source_repo": "/tmp/../etc/passwd"});
+        let args = json!({"branch": "feat-x", "repository_path": "/tmp/../etc/passwd"});
         let sender = Some(crate::identity::Sender::new("agent-1").unwrap());
         let result = handle_bind_self(&home, &args, &sender);
         assert_eq!(result["code"].as_str(), Some("path_traversal"));
@@ -739,7 +739,7 @@ mod path_traversal_tests {
     fn nested_traversal_rejected() {
         let home = std::env::temp_dir().join("pt-test-2");
         std::fs::create_dir_all(&home).ok();
-        let args = json!({"branch": "feat-x", "source_repo": "/home/user/foo/../../etc"});
+        let args = json!({"branch": "feat-x", "repository_path": "/home/user/foo/../../etc"});
         let sender = Some(crate::identity::Sender::new("agent-2").unwrap());
         let result = handle_bind_self(&home, &args, &sender);
         assert_eq!(result["code"].as_str(), Some("path_traversal"));

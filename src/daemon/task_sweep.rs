@@ -499,7 +499,7 @@ fn parse_pr_meta(v: &serde_json::Value, api_response_hash: String) -> Option<PrM
 /// can verify the change without a follow-up read.
 pub fn handle_task_sweep_config(home: &Path, args: &serde_json::Value) -> serde_json::Value {
     let mut cfg = load_config(home);
-    if let Some(repo) = args.get("repo").and_then(|v| v.as_str()) {
+    if let Some(repo) = args.get("repository").and_then(|v| v.as_str()) {
         cfg.repo = if repo.is_empty() {
             None
         } else {
@@ -995,8 +995,10 @@ mod tests {
     #[test]
     fn config_tool_round_trip() {
         let home = tmp_home("config_rt");
-        let r1 =
-            handle_task_sweep_config(&home, &serde_json::json!({"repo": "suzuke/agend-terminal"}));
+        let r1 = handle_task_sweep_config(
+            &home,
+            &serde_json::json!({"repository": "suzuke/agend-terminal"}),
+        );
         assert_eq!(r1["repo"], "suzuke/agend-terminal");
         assert_eq!(r1["paused"], false);
 
@@ -1016,8 +1018,8 @@ mod tests {
     #[test]
     fn config_tool_empty_repo_disables() {
         let home = tmp_home("config_empty");
-        handle_task_sweep_config(&home, &serde_json::json!({"repo": "x/y"}));
-        let r = handle_task_sweep_config(&home, &serde_json::json!({"repo": ""}));
+        handle_task_sweep_config(&home, &serde_json::json!({"repository": "x/y"}));
+        let r = handle_task_sweep_config(&home, &serde_json::json!({"repository": ""}));
         assert_eq!(r["repo"], serde_json::Value::Null);
         fs::remove_dir_all(&home).ok();
     }

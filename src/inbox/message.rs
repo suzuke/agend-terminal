@@ -35,7 +35,7 @@ impl NotifySource<'_> {
                 "\n(Reply using the reply tool — do NOT respond with direct text)".into()
             }
             Self::Agent(sender) => {
-                format!("\n(Reply using the send tool with target_instance=\"{sender}\")").into()
+                format!("\n(Reply using the send tool with instance=\"{sender}\")").into()
             }
             Self::System(_) => "".into(),
         }

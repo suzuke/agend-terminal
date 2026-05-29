@@ -673,7 +673,7 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
             let audit_reason = args["audit_reason"].as_str().unwrap_or("");
             // Repo resolution: explicit arg → SweepConfig fallback →
             // None (shipped/superseded categories skipped without repo).
-            let repo_owned: Option<String> = args["repo"]
+            let repo_owned: Option<String> = args["repository"]
                 .as_str()
                 .map(String::from)
                 .or_else(|| crate::daemon::task_sweep::load_sweep_config_for_doctor(home).repo);

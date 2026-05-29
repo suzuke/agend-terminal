@@ -31,7 +31,7 @@ All message sending goes through the `send` tool. It automatically routes to the
 
 ```json
 {
-  "target_instance": "dev",
+  "instance": "dev",
   "message": "Please fix the regression in #123",
   "request_kind": "task",
   "task_id": "t-20260525..."
@@ -77,7 +77,7 @@ Used to assign work to another agent. Must include a `task_id` (obtained from th
 
 ```json
 {
-  "target_instance": "dev",
+  "instance": "dev",
   "message": "Fix the empty-string bypass in sha_gate.rs",
   "request_kind": "task",
   "task_id": "t-20260525040842727169-9",
@@ -104,7 +104,7 @@ Ask another agent a question. The recipient must reply.
 
 ```json
 {
-  "target_instance": "reviewer",
+  "instance": "reviewer",
   "message": "Is this race condition fix correct?",
   "request_kind": "query"
 }
@@ -116,7 +116,7 @@ Report task results or review conclusions. Typically paired with `correlation_id
 
 ```json
 {
-  "target_instance": "lead",
+  "instance": "lead",
   "message": "Review complete. VERIFIED — 4M/2L/1I.",
   "request_kind": "report",
   "correlation_id": "t-20260525040842727169-9",
@@ -137,7 +137,7 @@ Informational messages that don't require a reply.
 
 ```json
 {
-  "target_instance": "lead",
+  "instance": "lead",
   "message": "PR #1187 CI passed, awaiting review",
   "request_kind": "update"
 }
@@ -151,7 +151,7 @@ Informational messages that don't require a reply.
 
 ```json
 {
-  "target_instance": "dev",
+  "instance": "dev",
   "message": "..."
 }
 ```
@@ -162,7 +162,7 @@ Message is delivered directly to the specified agent's inbox.
 
 ```json
 {
-  "targets": ["dev", "reviewer", "tester"],
+  "instances": ["dev", "reviewer", "tester"],
   "message": "..."
 }
 ```
@@ -304,7 +304,7 @@ How to obtain a `task_id`:
 // Returns task_id = "t-20260525..."
 
 // Then send a message with task_id
-{"target_instance": "dev", "request_kind": "task", "task_id": "t-20260525..."}
+{"instance": "dev", "request_kind": "task", "task_id": "t-20260525..."}
 ```
 
 ### task_id Format
@@ -319,7 +319,7 @@ Enable timeout monitoring with `expect_reply_within_secs`:
 
 ```json
 {
-  "target_instance": "dev",
+  "instance": "dev",
   "request_kind": "task",
   "task_id": "t-...",
   "expect_reply_within_secs": 600
@@ -339,7 +339,7 @@ When the target agent already has a claimed or in-progress task, `kind=task` del
 ```json
 // Override the busy gate
 {
-  "target_instance": "dev",
+  "instance": "dev",
   "request_kind": "task",
   "force": true,
   "force_reason": "Urgent fix, needs immediate attention"
@@ -356,7 +356,7 @@ When `kind=task` includes a `branch` parameter, the system automatically creates
 
 ```json
 {
-  "target_instance": "dev",
+  "instance": "dev",
   "request_kind": "task",
   "task_id": "t-...",
   "branch": "fix/1177-sha-gate-empty"
@@ -378,7 +378,7 @@ Set `"bind": false` to skip automatic binding (e.g., for notifications that don'
 
 ```json
 {
-  "target_instance": "dev",
+  "instance": "dev",
   "request_kind": "task",
   "branch": "fix/1177",
   "next_after_ci": "reviewer"

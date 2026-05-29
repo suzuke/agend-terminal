@@ -39,7 +39,7 @@ When dispatching a task via the `send` tool, include the
 ```json
 {
   "tool": "send",
-  "target_instance": "dev",
+  "instance": "dev",
   "message": "Please implement the fix for #123",
   "request_kind": "task",
   "task_id": "t-20260525-1",

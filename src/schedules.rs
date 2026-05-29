@@ -325,7 +325,10 @@ pub fn create(home: &Path, instance_name: &str, args: &Value) -> Value {
         id: id.clone(),
         trigger,
         message: message.to_string(),
-        target: args["target"].as_str().unwrap_or(instance_name).to_string(),
+        target: args["instance"]
+            .as_str()
+            .unwrap_or(instance_name)
+            .to_string(),
         label: args["label"].as_str().map(String::from),
         timezone,
         enabled: true,
@@ -345,7 +348,7 @@ pub fn create(home: &Path, instance_name: &str, args: &Value) -> Value {
 
 pub fn list(home: &Path, args: &Value) -> Value {
     let store = load(home);
-    let target_filter = args["target"].as_str();
+    let target_filter = args["instance"].as_str();
     let filtered: Vec<_> = store
         .schedules
         .iter()
@@ -369,7 +372,7 @@ pub fn update(home: &Path, args: &Value) -> Value {
     }
 
     let new_message = args["message"].as_str().map(String::from);
-    let new_target = args["target"].as_str().map(String::from);
+    let new_target = args["instance"].as_str().map(String::from);
     let new_label = args["label"].as_str().map(String::from);
     let new_tz = args["timezone"].as_str().map(String::from);
     let new_enabled = args["enabled"].as_bool();
@@ -567,15 +570,15 @@ mod tests {
         create(
             &home,
             "a",
-            &serde_json::json!({"cron": "0 9 * * *", "message": "m1", "target": "agent1"}),
+            &serde_json::json!({"cron": "0 9 * * *", "message": "m1", "instance": "agent1"}),
         );
         create(
             &home,
             "a",
-            &serde_json::json!({"cron": "0 10 * * *", "message": "m2", "target": "agent2"}),
+            &serde_json::json!({"cron": "0 10 * * *", "message": "m2", "instance": "agent2"}),
         );
 
-        let listed = list(&home, &serde_json::json!({"target": "agent1"}));
+        let listed = list(&home, &serde_json::json!({"instance": "agent1"}));
         assert_eq!(listed["schedules"].as_array().expect("arr").len(), 1);
 
         std::fs::remove_dir_all(&home).ok();

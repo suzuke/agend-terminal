@@ -36,7 +36,7 @@ Dispatch Idle Tracking 解決這個問題。它在分派任務時啟動一個計
 ```json
 {
   "tool": "send",
-  "target_instance": "dev",
+  "instance": "dev",
   "message": "請實作 #123 的修正",
   "request_kind": "task",
   "task_id": "t-20260525-1",

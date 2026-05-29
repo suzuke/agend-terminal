@@ -6,8 +6,8 @@ use std::path::Path;
 use super::err_needs_identity;
 
 pub(super) fn handle_list_instances(home: &Path, args: &Value, instance_name: &str) -> Value {
-    // If `name` param is provided, return detailed info for that instance (replaces describe_instance)
-    if let Some(target) = args["name"].as_str().filter(|s| !s.is_empty()) {
+    // If `instance` param is provided, return detailed info for that instance (replaces describe_instance)
+    if let Some(target) = args["instance"].as_str().filter(|s| !s.is_empty()) {
         return handle_describe_instance(home, &json!({"name": target}));
     }
     match crate::api::call(home, &json!({"method": crate::api::method::LIST})) {
@@ -118,9 +118,9 @@ pub(super) fn handle_create_instance(home: &Path, args: &Value, instance_name: &
 }
 
 pub(super) fn handle_delete_instance(home: &Path, args: &Value) -> Value {
-    let name = match args["name"].as_str() {
+    let name = match args["instance"].as_str() {
         Some(n) => n,
-        None => return json!({"error": "missing 'name'"}),
+        None => return json!({"error": "missing 'instance'"}),
     };
     crate::validate_name_or_err!(name);
     let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok();
@@ -147,9 +147,9 @@ pub(super) fn handle_delete_instance(home: &Path, args: &Value) -> Value {
 }
 
 pub(super) fn handle_start_instance(home: &Path, args: &Value) -> Value {
-    let name = match args["name"].as_str() {
+    let name = match args["instance"].as_str() {
         Some(n) => n,
-        None => return json!({"error": "missing 'name'"}),
+        None => return json!({"error": "missing 'instance'"}),
     };
     crate::validate_name_or_err!(name);
     let fleet_path = crate::fleet::fleet_yaml_path(home);
@@ -228,9 +228,9 @@ pub(super) fn handle_describe_instance(home: &Path, args: &Value) -> Value {
 }
 
 pub(super) fn handle_replace_instance(home: &Path, args: &Value) -> Value {
-    let name = match args["name"].as_str() {
+    let name = match args["instance"].as_str() {
         Some(n) => n,
-        None => return json!({"error": "missing 'name'"}),
+        None => return json!({"error": "missing 'instance'"}),
     };
     crate::validate_name_or_err!(name);
     let reason = args["reason"].as_str().unwrap_or("manual replacement");
@@ -344,9 +344,9 @@ pub(super) fn handle_replace_instance(home: &Path, args: &Value) -> Value {
 }
 
 pub(super) fn handle_restart_instance(home: &Path, args: &Value) -> Value {
-    let name = match args["name"].as_str() {
+    let name = match args["instance"].as_str() {
         Some(n) => n,
-        None => return json!({"error": "missing 'name'"}),
+        None => return json!({"error": "missing 'instance'"}),
     };
     crate::validate_name_or_err!(name);
     let reason = args["reason"].as_str().unwrap_or("manual restart");
@@ -410,9 +410,9 @@ pub(super) fn handle_set_description(home: &Path, args: &Value, instance_name: &
 }
 
 pub(super) fn handle_interrupt(home: &Path, args: &Value) -> Value {
-    let target = match args["target"].as_str() {
+    let target = match args["instance"].as_str() {
         Some(t) => t,
-        None => return json!({"error": "missing 'target'"}),
+        None => return json!({"error": "missing 'instance'"}),
     };
     crate::validate_name_or_err!(target);
     match crate::api::call(home, &super::interrupt_esc_params(target)) {
@@ -484,12 +484,19 @@ pub(super) fn handle_set_waiting_on(
 }
 
 pub(super) fn handle_move_pane(home: &Path, args: &Value) -> Value {
+    // MCP arg is `instance`; the daemon RPC contract names the field `agent`.
+    let instance = args["instance"].as_str().unwrap_or("");
+    let params = json!({
+        "agent": instance,
+        "target_tab": args["target_tab"],
+        "split_dir": args["split_dir"],
+    });
     match crate::api::call(
         home,
-        &json!({"method": crate::api::method::MOVE_PANE, "params": args}),
+        &json!({"method": crate::api::method::MOVE_PANE, "params": params}),
     ) {
         Ok(resp) if resp["ok"].as_bool() == Some(true) => {
-            json!({"ok": true, "agent": args["agent"], "target_tab": args["target_tab"]})
+            json!({"ok": true, "instance": instance, "target_tab": args["target_tab"]})
         }
         Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("move_pane failed")}),
         Err(e) => json!({"error": format!("move_pane: {e}")}),
@@ -497,9 +504,9 @@ pub(super) fn handle_move_pane(home: &Path, args: &Value) -> Value {
 }
 
 pub(super) fn handle_pane_snapshot(home: &Path, args: &Value) -> Value {
-    let target = match args["target"].as_str() {
+    let target = match args["instance"].as_str() {
         Some(t) => t,
-        None => return json!({"error": "missing 'target'"}),
+        None => return json!({"error": "missing 'instance'"}),
     };
     crate::validate_name_or_err!(target);
     let lines_u64 = args["lines"].as_u64().unwrap_or(100);

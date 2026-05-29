@@ -587,7 +587,7 @@ mod tests {
     // ── #1000 bridge-side content-dedup ─────────────────────────────────
 
     fn args_send(target: &str, text: &str) -> serde_json::Value {
-        serde_json::json!({"target_instance": target, "message": text})
+        serde_json::json!({"instance": target, "message": text})
     }
 
     /// LLM double-fire: identical tool + args within the 500 ms window

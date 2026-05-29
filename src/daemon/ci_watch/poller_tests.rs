@@ -1968,7 +1968,7 @@ fn watch_ci_rejects_bitbucket_server_with_actionable_error() {
     let result = crate::mcp::handlers::ci::handle_watch_ci(
         &dir,
         &serde_json::json!({
-            "repo": "myws/myrepo",
+            "repository": "myws/myrepo",
             "branch": "feat-test",
             "ci_provider": "bitbucket_server",
         }),

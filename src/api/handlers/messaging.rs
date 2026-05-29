@@ -1439,7 +1439,7 @@ mod tests {
                 "name": "dev",
                 "members": ["ghost-member"],
                 "orchestrator": "ghost-member",
-                "source_repo": "/tmp/p785-desync",
+                "repository_path": "/tmp/p785-desync",
             }),
         );
 

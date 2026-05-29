@@ -75,7 +75,7 @@
 - `orchestrator` 可省略，但建議填。
 - `orchestrator` 必須是 members 的其中一個。
 - 如果 orchestrator 不在 members 內，create 會錯。
-- `source_repo` 可省略。
+- `repository_path` 可省略。
 - 省略時會產生 warning。
 - 那個 warning 會提醒你 dispatch binding 可能 fall through。
 - create 會先讀 fleet.yaml。
@@ -111,13 +111,13 @@
 - update 可加 `add`。
 - update 可加 `remove`。
 - update 可加 `orchestrator`。
-- update 可加 `source_repo`。
+- update 可加 `repository_path`。
 - `remove` 不能移除目前 orchestrator。
 - 若要換 orchestrator，要先指定新的 orchestrator。
 - 新 orchestrator 必須在更新後的 members 裡。
 - `add` 不能把 member 加進另一個 team。
 - 這個檢查遵守 one-agent-one-team。
-- `source_repo` 若沒給，會沿用舊值。
+- `repository_path` 若沒給，會沿用舊值。
 - update 成功後會寫回 `fleet.yaml`。
 - update 回傳 `status=updated`。
 - update 失敗時會回傳 error。
@@ -178,7 +178,7 @@
 - `team=fixup` 代表廣播給整個 team。
 - 這不是發給 team 名稱本身。
 - 實際上會散發到 team 的成員。
-- `send` 也支援 `targets`、`tags`、`target_instance`。
+- `send` 也支援 `instances`、`tags`、`instance`。
 - team 廣播是其中一種路由方式。
 - 只要 team 成員集合變動，廣播目標也會變。
 - 這表示 `team list` 的 stale_members 很實用。

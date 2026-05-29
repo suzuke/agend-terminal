@@ -847,7 +847,7 @@ mod tests {
         // apply=true without confirm_ids → reject.
         let r = crate::mcp::handlers::ci::handle_cleanup_merged_branches(
             &home,
-            &serde_json::json!({"agent": agent, "apply": true}),
+            &serde_json::json!({"instance": agent, "apply": true}),
             agent,
         );
         assert!(
@@ -863,7 +863,7 @@ mod tests {
         let r = crate::mcp::handlers::ci::handle_cleanup_merged_branches(
             &home,
             &serde_json::json!({
-                "agent": agent,
+                "instance": agent,
                 "apply": true,
                 "confirm_ids": ["some-branch"],
             }),
@@ -914,7 +914,7 @@ mod tests {
         // but not in candidate_ids.
         let r = crate::mcp::handlers::ci::handle_cleanup_merged_branches(
             &home,
-            &serde_json::json!({"agent": agent}),
+            &serde_json::json!({"instance": agent}),
             agent,
         );
         let candidate_ids: Vec<&str> = r["candidate_ids"]
@@ -943,7 +943,7 @@ mod tests {
         let r = crate::mcp::handlers::ci::handle_cleanup_merged_branches(
             &home,
             &serde_json::json!({
-                "agent": agent,
+                "instance": agent,
                 "apply": true,
                 "confirm_ids": ["wip-active"],
                 "audit_reason": "explicit opt-in for active_unknown",

@@ -56,7 +56,7 @@ Key query helpers:
 
 - `name` and `members` are required.
 - `orchestrator` is optional but recommended; must be one of the members.
-- `source_repo` is optional; omitting it triggers a warning about dispatch binding fallback.
+- `repository_path` is optional; omitting it triggers a warning about dispatch binding fallback.
 - Rejects creation if a team with the same name already exists.
 - Enforces the **one-agent-one-team** constraint: rejects if any member belongs to another team.
 - On success, writes the team to `fleet.yaml` and returns `status=created`.
@@ -72,11 +72,11 @@ Key query helpers:
 ## 6. `team action=update`
 
 - Requires `name`.
-- Supports `add` (new members), `remove` (existing members), `orchestrator`, and `source_repo`.
+- Supports `add` (new members), `remove` (existing members), `orchestrator`, and `repository_path`.
 - Cannot remove the current orchestrator without first designating a new one.
 - The new orchestrator must be in the post-update member list.
 - `add` enforces one-agent-one-team (cannot add a member who belongs to another team).
-- `source_repo` is preserved if not explicitly changed.
+- `repository_path` is preserved if not explicitly changed.
 - Writes back to `fleet.yaml` on success.
 
 ## 7. `team action=delete`

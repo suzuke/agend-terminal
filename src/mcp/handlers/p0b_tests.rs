@@ -106,7 +106,7 @@ fn ci_watch_binding_corrupt_returns_error() {
 fn ec9_bind_self_both_args_rejected_as_ambiguous() {
     let home = tmp_home("ec9");
     let sender = crate::identity::Sender::new("alpha");
-    let args = json!({"branch": "feat-x", "repo": "owner/name", "source_repo": "/tmp/x"});
+    let args = json!({"branch": "feat-x", "repository": "owner/name", "repository_path": "/tmp/x"});
     let result = super::worktree::handle_bind_self(&home, &args, &sender);
     assert_eq!(result["code"], "ambiguous_args");
     std::fs::remove_dir_all(&home).ok();
@@ -554,7 +554,7 @@ fn bind_self_with_source_repo_arg_succeeds() {
     let sender = crate::identity::Sender::new("alpha");
     let args = json!({
         "branch": "feat-bs",
-        "source_repo": src.display().to_string(),
+        "repository_path": src.display().to_string(),
     });
     let result = super::worktree::handle_bind_self(&home, &args, &sender);
     assert_eq!(result["bound"], true, "new-shape bind succeeds: {result}");
@@ -570,7 +570,7 @@ fn bind_self_with_task_id_arg_persists_real_task_id() {
     let sender = crate::identity::Sender::new("beta");
     let args = json!({
         "branch": "feat-tid",
-        "source_repo": src.display().to_string(),
+        "repository_path": src.display().to_string(),
         "task_id": "t-20260521-real-task",
     });
     let result = super::worktree::handle_bind_self(&home, &args, &sender);
@@ -595,7 +595,7 @@ fn bind_self_without_task_id_arg_uses_empty_not_self() {
     let sender = crate::identity::Sender::new("gamma");
     let args = json!({
         "branch": "feat-no-tid",
-        "source_repo": src.display().to_string(),
+        "repository_path": src.display().to_string(),
     });
     let result = super::worktree::handle_bind_self(&home, &args, &sender);
     assert_eq!(result["bound"], true, "bind must succeed: {result}");

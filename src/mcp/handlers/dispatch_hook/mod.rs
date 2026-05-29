@@ -516,7 +516,7 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
             .filter(|s| !s.is_empty())
             .map(String::from)
             .or_else(|| derive_team_reviewer(home, target));
-        let mut watch_args = serde_json::json!({"repo": &r, "branch": branch});
+        let mut watch_args = serde_json::json!({"repository": &r, "branch": branch});
         if let Some(ref next) = effective_next {
             watch_args["next_after_ci"] = serde_json::json!(next);
         }

@@ -111,7 +111,9 @@ pub fn create(home: &Path, args: &Value) -> Value {
     };
     let orchestrator = args["orchestrator"].as_str().map(String::from);
     let description = args["description"].as_str().map(String::from);
-    let source_repo = args["source_repo"].as_str().map(std::path::PathBuf::from);
+    let source_repo = args["repository_path"]
+        .as_str()
+        .map(std::path::PathBuf::from);
 
     // Validate orchestrator
     if let Some(ref orch) = orchestrator {
@@ -140,10 +142,10 @@ pub fn create(home: &Path, args: &Value) -> Value {
     // amend before the gap is observed at dispatch.
     if source_repo.is_none() {
         warnings.push(format!(
-            "team '{name}' created without `source_repo` — \
+            "team '{name}' created without `repository_path` — \
              dispatch_auto_bind_lease will fall through Tier 2.5 and \
              land on the workspace stub at Tier 4. Set via \
-             `team(action=update, name={name}, source_repo=...)` to \
+             `team(action=update, name={name}, repository_path=...)` to \
              bind agents on the canonical repo."
         ));
     }
@@ -376,7 +378,7 @@ pub fn update(home: &Path, args: &Value) -> Value {
         current.orchestrator.clone()
     };
 
-    let new_source_repo = args["source_repo"]
+    let new_source_repo = args["repository_path"]
         .as_str()
         .map(std::path::PathBuf::from)
         .or_else(|| current.source_repo.clone());
@@ -1002,7 +1004,7 @@ mod tests {
                 "name": "dev",
                 "members": ["alice", "bob"],
                 "orchestrator": "alice",
-                "source_repo": "/tmp/my-repo"
+                "repository_path": "/tmp/my-repo"
             }),
         );
         assert_eq!(result["status"], "created");
@@ -1024,14 +1026,14 @@ mod tests {
                 "name": "dev",
                 "members": ["alice"],
                 "orchestrator": "alice",
-                "source_repo": "/tmp/old-repo"
+                "repository_path": "/tmp/old-repo"
             }),
         );
         let result = update(
             &home,
             &serde_json::json!({
                 "name": "dev",
-                "source_repo": "/tmp/new-repo"
+                "repository_path": "/tmp/new-repo"
             }),
         );
         assert_eq!(result["status"], "updated");
@@ -1053,7 +1055,7 @@ mod tests {
                 "name": "dev",
                 "members": ["agent-x"],
                 "orchestrator": "agent-x",
-                "source_repo": "/tmp/team-repo"
+                "repository_path": "/tmp/team-repo"
             }),
         );
         let resolved =
@@ -1081,7 +1083,7 @@ mod tests {
                 "name": "with-repo",
                 "members": ["agent-w"],
                 "orchestrator": "agent-w",
-                "source_repo": "/tmp/p781-test-canonical",
+                "repository_path": "/tmp/p781-test-canonical",
             }),
         );
         super::create(
@@ -1140,8 +1142,8 @@ mod tests {
         assert!(
             warnings
                 .iter()
-                .any(|w| w.as_str().is_some_and(|s| s.contains("source_repo"))),
-            "warning text must reference source_repo: {warnings:?}"
+                .any(|w| w.as_str().is_some_and(|s| s.contains("repository_path"))),
+            "warning text must reference repository_path: {warnings:?}"
         );
         std::fs::remove_dir_all(&home).ok();
     }
@@ -1172,7 +1174,7 @@ mod tests {
                 "name": "team-with-stale",
                 "members": ["zeta-agent", "alpha-agent"],
                 "orchestrator": "alpha-agent",
-                "source_repo": "/tmp/p785",
+                "repository_path": "/tmp/p785",
             }),
         );
 

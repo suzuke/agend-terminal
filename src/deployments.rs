@@ -343,7 +343,7 @@ fn create_deployment_team(
         "description": format!("Template deployment: {template}"),
     });
     if let Some(ref sr) = template_source_repo {
-        team_args["source_repo"] = serde_json::Value::String(sr.clone());
+        team_args["repository_path"] = serde_json::Value::String(sr.clone());
     }
     if let Some(suffix) = template_def.get("orchestrator").and_then(|v| v.as_str()) {
         let full = format!("{deploy_name}-{suffix}");

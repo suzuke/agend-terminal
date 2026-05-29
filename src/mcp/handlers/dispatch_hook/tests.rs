@@ -263,7 +263,7 @@ fn delegate_task_main_branch_rejects_without_delivering() {
     setup_test_repo(&home, "target-agent");
 
     let args = serde_json::json!({
-        "target_instance": "target-agent",
+        "instance": "target-agent",
         "task": "implement feature X",
         "task_id": "T-999",
         "branch": "main",  // ← E4.5 rejection trigger
@@ -322,7 +322,7 @@ fn delegate_task_lease_conflict_rejects_without_delivering() {
     assert!(r1.is_ok(), "first lease must succeed: {r1:?}");
 
     let args = serde_json::json!({
-        "target_instance": "agent-b",
+        "instance": "agent-b",
         "task": "implement feature Y",
         "task_id": "T-2",
         "branch": "feat/end2end",
@@ -440,7 +440,7 @@ fn delegate_task_same_agent_different_branch_without_delivering() {
     // a different branch must trip the gate before SEND, not deliver the
     // [delegate_task] message to the inbox.
     let args = serde_json::json!({
-        "target_instance": "agent-x",
+        "instance": "agent-x",
         "task": "implement feature B",
         "task_id": "T-2",
         "branch": "feat/B",
@@ -628,11 +628,11 @@ fn delegate_task_with_repo_creates_ci_watch_via_handle_delegate_task() {
     setup_test_repo(&home, "target-agent");
 
     let args = serde_json::json!({
-        "target_instance": "target-agent",
+        "instance": "target-agent",
         "task": "implement feature X",
         "task_id": "T-100",
         "branch": "feat/p02-integration",
-        "repo": "owner/repo",
+        "repository": "owner/repo",
     });
     let sender = Some(Sender::new("lead").expect("sender"));
 

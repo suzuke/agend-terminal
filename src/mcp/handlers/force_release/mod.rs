@@ -46,9 +46,9 @@ pub(crate) fn handle_force_release_worktree(
     args: &Value,
     _sender: &Option<Sender>,
 ) -> Value {
-    let agent = match args["agent"].as_str() {
+    let agent = match args["instance"].as_str() {
         Some(a) if !a.is_empty() => a,
-        _ => return json!({"error": "missing 'agent'"}),
+        _ => return json!({"error": "missing 'instance'"}),
     };
     let branch = match args["branch"].as_str() {
         Some(b) if !b.is_empty() => b,
@@ -241,7 +241,7 @@ mod tests {
         assert!(dir.exists(), "seeded dir must exist pre-call");
         let result = handle_force_release_worktree(
             &home,
-            &json!({"agent": "dev", "branch": "feature/x"}),
+            &json!({"instance": "dev", "branch": "feature/x"}),
             &None,
         );
         assert_eq!(result["released"].as_bool(), Some(true));
@@ -257,7 +257,7 @@ mod tests {
         // No seed — call directly on a non-existent target.
         let result = handle_force_release_worktree(
             &home,
-            &json!({"agent": "dev", "branch": "feature/never-existed"}),
+            &json!({"instance": "dev", "branch": "feature/never-existed"}),
             &None,
         );
         assert_eq!(result["released"].as_bool(), Some(true));
@@ -284,7 +284,7 @@ mod tests {
         seed_daemon_worktree(&home, "dev", "feature/y");
         let result = handle_force_release_worktree(
             &home,
-            &json!({"agent": "dev", "branch": "feature/y"}),
+            &json!({"instance": "dev", "branch": "feature/y"}),
             &None,
         );
         assert!(
@@ -318,7 +318,7 @@ mod tests {
         // Use empty branch — caught by the missing-branch check
         // first, but this exercises the input-rejection path.
         let r1 =
-            handle_force_release_worktree(&home, &json!({"agent": "dev", "branch": ""}), &None);
+            handle_force_release_worktree(&home, &json!({"instance": "dev", "branch": ""}), &None);
         assert!(r1["error"].is_string(), "empty branch must error: {r1}");
         // The outside dir must still exist (no manipulation).
         assert!(outside.join("important.json").exists());
@@ -330,7 +330,7 @@ mod tests {
         let home = tmp_home("invalid-agent");
         let result = handle_force_release_worktree(
             &home,
-            &json!({"agent": "../etc/passwd", "branch": "feature/x"}),
+            &json!({"instance": "../etc/passwd", "branch": "feature/x"}),
             &None,
         );
         assert!(result["error"].is_string());
@@ -343,7 +343,7 @@ mod tests {
         let home = tmp_home("invalid-branch");
         let result = handle_force_release_worktree(
             &home,
-            &json!({"agent": "dev", "branch": "../../escape"}),
+            &json!({"instance": "dev", "branch": "../../escape"}),
             &None,
         );
         assert!(result["error"].is_string());
@@ -357,14 +357,14 @@ mod tests {
     fn force_release_worktree_rejects_missing_agent() {
         let home = tmp_home("missing-agent");
         let result = handle_force_release_worktree(&home, &json!({"branch": "feature/x"}), &None);
-        assert_eq!(result["error"].as_str(), Some("missing 'agent'"));
+        assert_eq!(result["error"].as_str(), Some("missing 'instance'"));
         std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
     fn force_release_worktree_rejects_missing_branch() {
         let home = tmp_home("missing-branch");
-        let result = handle_force_release_worktree(&home, &json!({"agent": "dev"}), &None);
+        let result = handle_force_release_worktree(&home, &json!({"instance": "dev"}), &None);
         assert_eq!(result["error"].as_str(), Some("missing 'branch'"));
         std::fs::remove_dir_all(&home).ok();
     }
@@ -380,7 +380,7 @@ mod tests {
         assert!(dir.exists(), "stale dir present pre-cleanup");
         let result = handle_force_release_worktree(
             &home,
-            &json!({"agent": "dev", "branch": "sprint59-wave1-pr4-issue-b"}),
+            &json!({"instance": "dev", "branch": "sprint59-wave1-pr4-issue-b"}),
             &None,
         );
         assert_eq!(result["released"].as_bool(), Some(true));
@@ -406,7 +406,7 @@ mod tests {
         std::fs::write(dir.join("leftover"), "data").unwrap();
         let result = handle_force_release_worktree(
             &home,
-            &json!({"agent": "dev", "branch": "feature/x"}),
+            &json!({"instance": "dev", "branch": "feature/x"}),
             &None,
         );
         assert_eq!(result["dir_removed"].as_bool(), Some(true));
@@ -423,7 +423,7 @@ mod tests {
         let dir_y = seed_daemon_worktree(&home, "dev", "feature/y");
         let result = handle_force_release_worktree(
             &home,
-            &json!({"agent": "dev", "branch": "feature/x"}),
+            &json!({"instance": "dev", "branch": "feature/x"}),
             &None,
         );
         assert_eq!(result["dir_removed"].as_bool(), Some(true));
@@ -445,7 +445,7 @@ mod tests {
         let dir_lead = seed_daemon_worktree(&home, "lead", "feature/x");
         let result = handle_force_release_worktree(
             &home,
-            &json!({"agent": "dev", "branch": "feature/x"}),
+            &json!({"instance": "dev", "branch": "feature/x"}),
             &None,
         );
         assert_eq!(result["dir_removed"].as_bool(), Some(true));

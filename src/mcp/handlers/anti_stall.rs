@@ -37,7 +37,7 @@ pub(super) fn enforce_send_invariants(
     // auto-creates after validation passes (avoids orphan tasks).
     // Malformed (non-empty but bad shape) task_ids still rejected everywhere.
     if args["request_kind"].as_str() == Some("task") {
-        let is_broadcast = args.get("targets").is_some()
+        let is_broadcast = args.get("instances").is_some()
             || args.get("team").is_some()
             || args.get("tags").is_some();
         let auto_create_eligible =

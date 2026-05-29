@@ -3,26 +3,19 @@ use crate::git_helpers::git_bypass;
 use serde_json::{json, Value};
 use std::path::Path;
 
-/// #1446: resolve the checkout source repo, accepting `source_repo` (the
-/// cross-tool standard name used by bind_self / team update) as an alias for
-/// the legacy `source`. Prefers `source_repo` when both are given; `source` is
-/// retained for backward compatibility. Returns `None` when neither is present
-/// (or both are empty).
+/// #1447: resolve the checkout source repo from `repository_path` — the
+/// cross-tool standard name used by bind_self / team update. Returns `None`
+/// when absent or empty.
 fn checkout_source(args: &Value) -> Option<&str> {
-    args.get("source_repo")
+    args.get("repository_path")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
-        .or_else(|| {
-            args.get("source")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-        })
 }
 
 pub(super) fn handle_checkout_repo(home: &Path, args: &Value, instance_name: &str) -> Value {
     let source = match checkout_source(args) {
         Some(s) => s,
-        None => return json!({"error": "missing 'source_repo' (alias: 'source')"}),
+        None => return json!({"error": "missing 'repository_path'"}),
     };
     let branch = args["branch"].as_str().unwrap_or("HEAD");
     if !validate_branch(branch) {
@@ -188,7 +181,7 @@ pub(super) fn handle_checkout_repo(home: &Path, args: &Value, instance_name: &st
                     // into the sidecar. Pre-#1040 every modern fixup
                     // PR silently armed `next_after_ci=null` and the
                     // post-#1037 auto-wake quartet never fired.
-                    let mut watch_args = json!({"repo": &r, "branch": branch});
+                    let mut watch_args = json!({"repository": &r, "branch": branch});
                     if let Some(next) = crate::mcp::handlers::dispatch_hook::derive_team_reviewer(
                         home,
                         instance_name,
@@ -314,13 +307,13 @@ fn validate_release_path(path_str: &str) -> Result<std::path::PathBuf, String> {
 ///   active binding; explicit reason so callers don't mistake for noop
 /// - `{error: "...", code: "cleanup_failed"}` — git subprocess failure
 pub(super) fn handle_cleanup_init_commits(home: &Path, args: &Value, instance_name: &str) -> Value {
-    let agent = args["agent"]
+    let agent = args["instance"]
         .as_str()
         .filter(|s| !s.is_empty())
         .unwrap_or(instance_name);
     if agent.is_empty() {
         return json!({
-            "error": "missing 'agent' (and no caller instance_name available)",
+            "error": "missing 'instance' (and no caller instance_name available)",
             "code": "needs_agent"
         });
     }
@@ -406,7 +399,7 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
     // validate the binding's source_repo path still exists before reading.
     let derived_repo: Option<String>;
     let canonical_repo: Option<String>;
-    let repo: &str = match args["repo"].as_str().filter(|s| !s.is_empty()) {
+    let repo: &str = match args["repository"].as_str().filter(|s| !s.is_empty()) {
         Some(r) => {
             // #942: canonicalize on entry so the hash key + stored
             // `repo` field both reflect the single canonical form.
@@ -420,7 +413,7 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
                 None => {
                     return json!({
                         "error": format!(
-                            "invalid 'repo' format: {r:?} — expected `owner/repo` or full GitHub URL"
+                            "invalid 'repository' format: {r:?} — expected `owner/repo` or full GitHub URL"
                         ),
                         "code": "invalid_repo_format",
                     });
@@ -434,26 +427,26 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
                 .join("binding.json");
             let Ok(content) = std::fs::read_to_string(&binding) else {
                 return json!({
-                    "error": "ci(watch) needs explicit 'repo' arg OR active binding (call bind_self first)",
+                    "error": "ci(watch) needs explicit 'repository' arg OR active binding (call bind_self first)",
                     "code": "no_binding_no_repo"
                 });
             };
             let Ok(v) = serde_json::from_str::<Value>(&content) else {
                 return json!({
-                    "error": "binding.json corrupt — re-bind or pass explicit 'repo'",
+                    "error": "binding.json corrupt — re-bind or pass explicit 'repository'",
                     "code": "binding_corrupt"
                 });
             };
             let Some(src) = v["source_repo"].as_str().filter(|s| !s.is_empty()) else {
                 return json!({
-                    "error": "binding has no source_repo — pass explicit 'repo' arg",
+                    "error": "binding has no source_repo — pass explicit 'repository' arg",
                     "code": "no_binding_no_repo"
                 });
             };
             let src_path = std::path::Path::new(src);
             if !src_path.exists() {
                 return json!({
-                    "error": format!("binding source_repo '{src}' no longer exists — re-bind or pass explicit 'repo'"),
+                    "error": format!("binding source_repo '{src}' no longer exists — re-bind or pass explicit 'repository'"),
                     "code": "source_repo_path_deleted"
                 });
             }
@@ -464,7 +457,7 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
                 }
                 None => {
                     return json!({
-                        "error": format!("could not derive owner/repo from '{src}' origin remote — pass explicit 'repo' arg or set fleet.yaml `repo:` override"),
+                        "error": format!("could not derive owner/repo from '{src}' origin remote — pass explicit 'repository' arg or set fleet.yaml `repo:` override"),
                         "code": "non_github_remote_no_override"
                     });
                 }
@@ -693,9 +686,9 @@ fn compute_next_poll_eta(watch: &Value) -> Option<i64> {
 /// array. The watch file is deleted only when the array becomes empty
 /// (no other agent is still interested in this branch).
 pub(super) fn handle_unwatch_ci(home: &Path, args: &Value) -> Value {
-    let repo = match args["repo"].as_str() {
+    let repo = match args["repository"].as_str() {
         Some(r) => r,
-        None => return json!({"error": "missing 'repo'"}),
+        None => return json!({"error": "missing 'repository'"}),
     };
     let branch = args["branch"].as_str().unwrap_or("main");
     // Caller identity for selective removal. Falls back to the env-set
@@ -784,7 +777,7 @@ pub(super) fn handle_unwatch_ci(home: &Path, args: &Value) -> Value {
 /// avoids leaking lead's polling targets to every dev. The empty
 /// instance name (anonymous CLI) sees all watches.
 pub(crate) fn handle_status_ci(home: &Path, args: &Value, instance_name: &str) -> Value {
-    let filter_repo = args["repo"].as_str();
+    let filter_repo = args["repository"].as_str();
     let filter_branch = args["branch"].as_str();
     let ci_dir = crate::daemon::ci_watch::ci_watches_dir(home);
     let entries = match std::fs::read_dir(&ci_dir) {
@@ -916,7 +909,7 @@ pub(crate) fn handle_cleanup_merged_branches(
     args: &Value,
     instance_name: &str,
 ) -> Value {
-    let agent = args["agent"]
+    let agent = args["instance"]
         .as_str()
         .filter(|s| !s.is_empty())
         .unwrap_or(instance_name);
@@ -1015,7 +1008,7 @@ pub(super) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
         Some(n) => n,
         None => return json!({"error": "missing 'pr' (PR number)"}),
     };
-    let repo = args["repo"]
+    let repo = args["repository"]
         .as_str()
         .unwrap_or("suzuke/agend-terminal")
         .to_string();

@@ -63,7 +63,7 @@ fn validate_release_path_accepts_deep_existing() {
 fn dispatch_with_branch_and_repo_auto_invokes_watch_ci() {
     let home = std::env::temp_dir().join(format!("agend-auto-watch-{}", std::process::id()));
     std::fs::create_dir_all(&home).ok();
-    let args = serde_json::json!({"repo": "owner/repo", "branch": "feat/test"});
+    let args = serde_json::json!({"repository": "owner/repo", "branch": "feat/test"});
     handle_watch_ci(&home, &args, "test-agent");
     let filename = crate::daemon::ci_watch::watch_filename("owner/repo", "feat/test");
     let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(&filename);
@@ -75,7 +75,7 @@ fn dispatch_with_branch_and_repo_auto_invokes_watch_ci() {
 fn dispatch_idempotent_double_watch_safe() {
     let home = std::env::temp_dir().join(format!("agend-auto-watch-idem-{}", std::process::id()));
     std::fs::create_dir_all(&home).ok();
-    let args = serde_json::json!({"repo": "owner/repo", "branch": "feat/idem"});
+    let args = serde_json::json!({"repository": "owner/repo", "branch": "feat/idem"});
     handle_watch_ci(&home, &args, "agent-1");
     handle_watch_ci(&home, &args, "agent-1"); // second call — idempotent
     let filename = crate::daemon::ci_watch::watch_filename("owner/repo", "feat/idem");
@@ -123,7 +123,7 @@ fn ci_watch_appends_subscriber_idempotent_distinct_callers() {
     // was the Sprint 53 multi-caller bug.
     let home = std::env::temp_dir().join(format!("agend-watch-append-{}", std::process::id()));
     std::fs::create_dir_all(&home).ok();
-    let args = serde_json::json!({"repo": "owner/repo", "branch": "feat-test"});
+    let args = serde_json::json!({"repository": "owner/repo", "branch": "feat-test"});
 
     handle_watch_ci(&home, &args, "lead");
     handle_watch_ci(&home, &args, "dev");
@@ -149,7 +149,7 @@ fn ci_watch_double_subscribe_same_caller_is_idempotent() {
     // the strict mathematical sense — `f(f(x)) == f(x)`.
     let home = std::env::temp_dir().join(format!("agend-watch-dup-{}", std::process::id()));
     std::fs::create_dir_all(&home).ok();
-    let args = serde_json::json!({"repo": "owner/repo", "branch": "feat-test"});
+    let args = serde_json::json!({"repository": "owner/repo", "branch": "feat-test"});
 
     handle_watch_ci(&home, &args, "lead");
     handle_watch_ci(&home, &args, "lead");
@@ -169,7 +169,7 @@ fn ci_watch_preserves_poll_state_on_resubscribe() {
     // duplicate notification.
     let home = std::env::temp_dir().join(format!("agend-watch-state-{}", std::process::id()));
     std::fs::create_dir_all(&home).ok();
-    let args = serde_json::json!({"repo": "owner/repo", "branch": "feat-test"});
+    let args = serde_json::json!({"repository": "owner/repo", "branch": "feat-test"});
 
     handle_watch_ci(&home, &args, "lead");
 
@@ -227,7 +227,7 @@ fn ci_watch_legacy_instance_field_migrates_on_resubscribe() {
     // Trigger migration via a fresh subscribe.
     handle_watch_ci(
         &home,
-        &serde_json::json!({"repo": "owner/repo", "branch": "feat-test"}),
+        &serde_json::json!({"repository": "owner/repo", "branch": "feat-test"}),
         "dev",
     );
 
@@ -256,7 +256,7 @@ fn ci_unwatch_removes_caller_only_when_others_remain() {
     // and writes the file back. Watch file is NOT deleted.
     let home = std::env::temp_dir().join(format!("agend-unwatch-keep-{}", std::process::id()));
     std::fs::create_dir_all(&home).ok();
-    let args = serde_json::json!({"repo": "owner/repo", "branch": "feat-test"});
+    let args = serde_json::json!({"repository": "owner/repo", "branch": "feat-test"});
     handle_watch_ci(&home, &args, "lead");
     handle_watch_ci(&home, &args, "dev");
 
@@ -264,7 +264,7 @@ fn ci_unwatch_removes_caller_only_when_others_remain() {
     assert!(path.exists());
 
     let unwatch_args = serde_json::json!({
-        "repo": "owner/repo",
+        "repository": "owner/repo",
         "branch": "feat-test",
         "instance": "lead",
     });
@@ -297,14 +297,14 @@ fn ci_unwatch_deletes_file_when_subscribers_empty() {
     // branch nobody cares about anymore.
     let home = std::env::temp_dir().join(format!("agend-unwatch-delete-{}", std::process::id()));
     std::fs::create_dir_all(&home).ok();
-    let args = serde_json::json!({"repo": "owner/repo", "branch": "feat-test"});
+    let args = serde_json::json!({"repository": "owner/repo", "branch": "feat-test"});
     handle_watch_ci(&home, &args, "lead");
 
     let path = watch_path_for(&home, "owner/repo", "feat-test");
     assert!(path.exists());
 
     let unwatch_args = serde_json::json!({
-        "repo": "owner/repo",
+        "repository": "owner/repo",
         "branch": "feat-test",
         "instance": "lead",
     });
@@ -322,12 +322,12 @@ fn ci_unwatch_unknown_caller_is_noop_keeps_watch() {
     // way to clobber lead's watch via dev's typo).
     let home = std::env::temp_dir().join(format!("agend-unwatch-noop-{}", std::process::id()));
     std::fs::create_dir_all(&home).ok();
-    let args = serde_json::json!({"repo": "owner/repo", "branch": "feat-test"});
+    let args = serde_json::json!({"repository": "owner/repo", "branch": "feat-test"});
     handle_watch_ci(&home, &args, "lead");
 
     let path = watch_path_for(&home, "owner/repo", "feat-test");
     let unwatch_args = serde_json::json!({
-        "repo": "owner/repo",
+        "repository": "owner/repo",
         "branch": "feat-test",
         "instance": "stranger",
     });
@@ -372,7 +372,7 @@ fn watch_ci_response_includes_health_fields_when_state_populated() {
     // optional-field ladders.
     let home = std::env::temp_dir().join(format!("agend-p05-A1-{}", std::process::id()));
     std::fs::create_dir_all(&home).ok();
-    let args = serde_json::json!({"repo": "owner/repo", "branch": "feat-test"});
+    let args = serde_json::json!({"repository": "owner/repo", "branch": "feat-test"});
     let resp = handle_watch_ci(&home, &args, "lead");
 
     assert_eq!(resp["watching"].as_bool(), Some(true));
@@ -394,7 +394,7 @@ fn watch_ci_rate_limit_active_when_until_in_future() {
     // just stamped rate_limit_until.
     let home = std::env::temp_dir().join(format!("agend-p05-A2-{}", std::process::id()));
     std::fs::create_dir_all(&home).ok();
-    let args = serde_json::json!({"repo": "owner/repo", "branch": "feat-test"});
+    let args = serde_json::json!({"repository": "owner/repo", "branch": "feat-test"});
     handle_watch_ci(&home, &args, "lead");
 
     let path = watch_path_for(&home, "owner/repo", "feat-test");
@@ -422,7 +422,7 @@ fn watch_ci_next_poll_eta_null_for_fresh_watch() {
     // the next poll" when no poll has happened yet.
     let home = std::env::temp_dir().join(format!("agend-p05-A3-{}", std::process::id()));
     std::fs::create_dir_all(&home).ok();
-    let args = serde_json::json!({"repo": "owner/repo", "branch": "feat-test"});
+    let args = serde_json::json!({"repository": "owner/repo", "branch": "feat-test"});
     let resp = handle_watch_ci(&home, &args, "lead");
     assert!(resp["next_poll_eta"].is_null());
     std::fs::remove_dir_all(&home).ok();
@@ -439,12 +439,12 @@ fn ci_status_returns_caller_subscribed_watches() {
     std::fs::create_dir_all(&home).ok();
     handle_watch_ci(
         &home,
-        &serde_json::json!({"repo": "o/r1", "branch": "feat-test"}),
+        &serde_json::json!({"repository": "o/r1", "branch": "feat-test"}),
         "lead",
     );
     handle_watch_ci(
         &home,
-        &serde_json::json!({"repo": "o/r2", "branch": "feat-test"}),
+        &serde_json::json!({"repository": "o/r2", "branch": "feat-test"}),
         "dev",
     );
 
@@ -474,16 +474,16 @@ fn ci_status_filter_by_repo_returns_subset() {
     std::fs::create_dir_all(&home).ok();
     handle_watch_ci(
         &home,
-        &serde_json::json!({"repo": "o/alpha", "branch": "feat-test"}),
+        &serde_json::json!({"repository": "o/alpha", "branch": "feat-test"}),
         "lead",
     );
     handle_watch_ci(
         &home,
-        &serde_json::json!({"repo": "o/beta", "branch": "feat-test"}),
+        &serde_json::json!({"repository": "o/beta", "branch": "feat-test"}),
         "lead",
     );
 
-    let resp = handle_status_ci(&home, &serde_json::json!({"repo": "o/alpha"}), "lead");
+    let resp = handle_status_ci(&home, &serde_json::json!({"repository": "o/alpha"}), "lead");
     let watches = resp["watches"].as_array().unwrap();
     assert_eq!(watches.len(), 1, "filter must narrow to o/alpha only");
     assert_eq!(watches[0]["repo"].as_str(), Some("o/alpha"));
@@ -524,7 +524,7 @@ fn handle_watch_ci_rejects_protected_refs() {
         let home = watch_test_home(&format!("reject-{branch}"));
         let resp = super::handle_watch_ci(
             &home,
-            &serde_json::json!({"repo": "owner/repo", "branch": branch}),
+            &serde_json::json!({"repository": "owner/repo", "branch": branch}),
             "dev",
         );
         assert!(
@@ -562,7 +562,7 @@ fn handle_watch_ci_default_branch_does_not_silently_set_main() {
     let resp = super::handle_watch_ci(
         &home,
         // NO branch field — exercises the `unwrap_or("main")`.
-        &serde_json::json!({"repo": "owner/repo"}),
+        &serde_json::json!({"repository": "owner/repo"}),
         "dev",
     );
     assert_eq!(
@@ -586,7 +586,7 @@ fn handle_watch_ci_accepts_non_protected_branch() {
     let resp = super::handle_watch_ci(
         &home,
         &serde_json::json!({
-            "repo": "owner/repo",
+            "repository": "owner/repo",
             "branch": "feat/sprint57-wave2-track-b",
             "interval_secs": 60_u64,
         }),
@@ -717,7 +717,7 @@ fn checkout_bind_true_auto_derives_next_after_ci_from_team_1040() {
     let resp = super::handle_checkout_repo(
         &home,
         &serde_json::json!({
-            "source": source.display().to_string(),
+            "repository_path": source.display().to_string(),
             "branch": "feat/1040-derive",
             "bind": true,
         }),
@@ -756,7 +756,7 @@ fn checkout_bind_true_writes_binding_marker_and_arms_watch() {
     let resp = super::handle_checkout_repo(
         &home,
         &serde_json::json!({
-            "source": source.display().to_string(),
+            "repository_path": source.display().to_string(),
             "branch": "feat/p778",
             "bind": true,
         }),
@@ -834,7 +834,7 @@ fn checkout_bind_false_default_preserves_detached_no_binding() {
     let resp = super::handle_checkout_repo(
         &home,
         &serde_json::json!({
-            "source": source.display().to_string(),
+            "repository_path": source.display().to_string(),
             "branch": "feat/p778-bc",
         }),
         agent,
@@ -881,7 +881,7 @@ fn checkout_bind_true_rejects_protected_branch_e45() {
     let resp = super::handle_checkout_repo(
         &home,
         &serde_json::json!({
-            "source": "/tmp",  // never reached — E4.5 fires first
+            "repository_path": "/tmp",  // never reached — E4.5 fires first
             "branch": "main",
             "bind": true,
         }),
@@ -909,7 +909,7 @@ fn checkout_bind_true_rejects_anonymous_caller() {
     let resp = super::handle_checkout_repo(
         &home,
         &serde_json::json!({
-            "source": "/tmp",
+            "repository_path": "/tmp",
             "branch": "feat/p778",
             "bind": true,
         }),
@@ -1024,7 +1024,7 @@ fn checkout_bind_true_auto_creates_branch_from_origin_main_when_missing() {
     let resp = super::handle_checkout_repo(
         &home,
         &serde_json::json!({
-            "source": source.display().to_string(),
+            "repository_path": source.display().to_string(),
             "branch": "feat/p780-new",
             "bind": true,
         }),
@@ -1091,7 +1091,7 @@ fn checkout_bind_true_existing_branch_ignores_from_ref() {
     let resp = super::handle_checkout_repo(
         &home,
         &serde_json::json!({
-            "source": source.display().to_string(),
+            "repository_path": source.display().to_string(),
             "branch": "feat/p780-existing",
             "bind": true,
             // intentional typo — must not be consulted when branch exists.
@@ -1176,7 +1176,7 @@ fn checkout_bind_true_invalid_from_ref_returns_structured_error_with_stage() {
     let resp = super::handle_checkout_repo(
         &home,
         &serde_json::json!({
-            "source": source.display().to_string(),
+            "repository_path": source.display().to_string(),
             "branch": "feat/p780-bad",
             "bind": true,
             // Unresolvable: this remote ref does not exist locally and
@@ -1250,7 +1250,7 @@ fn checkout_bind_true_concurrent_branch_create_race_idempotent() {
             super::handle_checkout_repo(
                 &home_c,
                 &serde_json::json!({
-                    "source": source_c.display().to_string(),
+                    "repository_path": source_c.display().to_string(),
                     "branch": "feat/p780-race",
                     "bind": true,
                 }),
@@ -1310,7 +1310,7 @@ fn checkout_bind_true_stress_50_iter_branch_create_no_flaky_parse() {
         let resp = super::handle_checkout_repo(
             &home,
             &serde_json::json!({
-                "source": source.display().to_string(),
+                "repository_path": source.display().to_string(),
                 "branch": format!("feat/p780-stress-{i}"),
                 "bind": true,
             }),
@@ -1355,7 +1355,7 @@ fn checkout_bind_true_auto_create_path_preserves_779_tail_ops() {
     let resp = super::handle_checkout_repo(
         &home,
         &serde_json::json!({
-            "source": source.display().to_string(),
+            "repository_path": source.display().to_string(),
             "branch": "feat/p780-tail",
             "bind": true,
         }),
@@ -1413,7 +1413,7 @@ fn checkout_bind_false_does_not_auto_create() {
     let resp = super::handle_checkout_repo(
         &home,
         &serde_json::json!({
-            "source": source.display().to_string(),
+            "repository_path": source.display().to_string(),
             "branch": "feat/p780-bind-false",
             // bind defaulting to false — explicit for test clarity.
             "bind": false,
@@ -1485,7 +1485,7 @@ fn checkout_bind_true_bind_full_failure_surfaces_warning() {
     let resp = super::handle_checkout_repo(
         &home,
         &serde_json::json!({
-            "source": source.display().to_string(),
+            "repository_path": source.display().to_string(),
             "branch": "feat/p779p2-bind",
             "bind": true,
         }),
@@ -1536,7 +1536,7 @@ fn handle_watch_ci_atomic_write_failure_returns_error_field() {
 
     let resp = super::handle_watch_ci(
         &home,
-        &serde_json::json!({"repo": "owner/repo", "branch": "feat/p779p2-watch"}),
+        &serde_json::json!({"repository": "owner/repo", "branch": "feat/p779p2-watch"}),
         "p779p2-agent-watch",
     );
 
@@ -1576,7 +1576,7 @@ fn checkout_bind_true_watch_ci_failure_surfaces_warning() {
     let resp = super::handle_checkout_repo(
         &home,
         &serde_json::json!({
-            "source": source.display().to_string(),
+            "repository_path": source.display().to_string(),
             "branch": "feat/p779p2-watch",
             "bind": true,
         }),
@@ -1619,7 +1619,7 @@ fn checkout_bind_true_no_failures_no_warnings_field() {
     let resp = super::handle_checkout_repo(
         &home,
         &serde_json::json!({
-            "source": source.display().to_string(),
+            "repository_path": source.display().to_string(),
             "branch": "feat/p779p2-clean",
             "bind": true,
         }),
@@ -1749,8 +1749,11 @@ fn cleanup_init_commits_mcp_removes_empty_inits_created_after_bind() {
     let worktree = p789_setup_worktree_with_empty_inits(&home, "dev", 3);
     assert_eq!(p789_count_commits_origin_main_head(&worktree), 3);
 
-    let resp =
-        super::handle_cleanup_init_commits(&home, &serde_json::json!({"agent": "dev"}), "operator");
+    let resp = super::handle_cleanup_init_commits(
+        &home,
+        &serde_json::json!({"instance": "dev"}),
+        "operator",
+    );
     assert!(resp.get("error").is_none(), "must succeed: {resp}");
     assert_eq!(
         resp["cleaned_count"].as_u64(),
@@ -1797,8 +1800,11 @@ fn cleanup_preserves_non_empty_commits_with_msg_init() {
         .unwrap();
     assert_eq!(p789_count_commits_origin_main_head(&worktree), 1);
 
-    let resp =
-        super::handle_cleanup_init_commits(&home, &serde_json::json!({"agent": "dev"}), "operator");
+    let resp = super::handle_cleanup_init_commits(
+        &home,
+        &serde_json::json!({"instance": "dev"}),
+        "operator",
+    );
     assert_eq!(
         resp["cleaned_count"].as_u64(),
         Some(0),
@@ -1822,8 +1828,11 @@ fn cleanup_handles_17_burst_pattern_from_pr_781() {
     let worktree = p789_setup_worktree_with_empty_inits(&home, "dev", 17);
     assert_eq!(p789_count_commits_origin_main_head(&worktree), 17);
 
-    let resp =
-        super::handle_cleanup_init_commits(&home, &serde_json::json!({"agent": "dev"}), "operator");
+    let resp = super::handle_cleanup_init_commits(
+        &home,
+        &serde_json::json!({"instance": "dev"}),
+        "operator",
+    );
     assert_eq!(
         resp["cleaned_count"].as_u64(),
         Some(17),
@@ -1858,8 +1867,11 @@ fn cleanup_with_invalid_worktree_returns_error_not_silent() {
     )
     .unwrap();
 
-    let resp =
-        super::handle_cleanup_init_commits(&home, &serde_json::json!({"agent": "dev"}), "operator");
+    let resp = super::handle_cleanup_init_commits(
+        &home,
+        &serde_json::json!({"instance": "dev"}),
+        "operator",
+    );
     assert!(
         resp.get("error").is_some(),
         "invalid worktree path must surface error (NOT silent noop): {resp}"
@@ -1881,7 +1893,7 @@ fn cleanup_on_clean_worktree_is_noop_count_zero() {
     std::fs::create_dir_all(&home).ok();
     let resp = super::handle_cleanup_init_commits(
         &home,
-        &serde_json::json!({"agent": "ghost-agent"}),
+        &serde_json::json!({"instance": "ghost-agent"}),
         "operator",
     );
     assert_eq!(resp["cleaned_count"].as_u64(), Some(0));
@@ -1909,7 +1921,7 @@ fn handle_watch_ci_canonicalizes_caller_supplied_repo_with_git_suffix() {
     let home = p778_tmp_home("942-git-suffix");
     let r = handle_watch_ci(
         &home,
-        &serde_json::json!({"repo": "owner/repo.git", "branch": "feat/x"}),
+        &serde_json::json!({"repository": "owner/repo.git", "branch": "feat/x"}),
         "dev",
     );
     assert!(
@@ -1938,12 +1950,12 @@ fn handle_watch_ci_two_callers_with_different_forms_share_one_watch_file() {
     let home = p778_tmp_home("942-converge");
     let _ = handle_watch_ci(
         &home,
-        &serde_json::json!({"repo": "owner/repo.git", "branch": "feat/x"}),
+        &serde_json::json!({"repository": "owner/repo.git", "branch": "feat/x"}),
         "agent-a",
     );
     let _ = handle_watch_ci(
         &home,
-        &serde_json::json!({"repo": "Owner/Repo", "branch": "feat/x"}),
+        &serde_json::json!({"repository": "Owner/Repo", "branch": "feat/x"}),
         "agent-b",
     );
 
@@ -1981,7 +1993,7 @@ fn handle_watch_ci_rejects_invalid_repo_format() {
     // Non-GitHub URL — canonicalize_repo_slug returns None
     let r = handle_watch_ci(
         &home,
-        &serde_json::json!({"repo": "https://gitlab.com/owner/repo", "branch": "feat/x"}),
+        &serde_json::json!({"repository": "https://gitlab.com/owner/repo", "branch": "feat/x"}),
         "dev",
     );
     assert_eq!(
@@ -2031,32 +2043,22 @@ fn merge_force_audit_write_failure_refuses_merge() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// #1446: `repo checkout` resolves `source_repo` (the cross-tool standard name)
-/// as an alias for `source`. Before the fix, dispatch books calling checkout
-/// with `source_repo` were rejected as "missing source".
+/// #1447: `repo checkout` resolves the source from the cross-tool standard
+/// `repository_path` arg. The legacy `source` / `source_repo` aliases (#1446)
+/// were dropped in favor of the single canonical name.
 #[test]
-fn checkout_accepts_source_repo_alias() {
+fn checkout_resolves_repository_path() {
     use serde_json::json;
-    // Legacy `source` still resolves (backward compat — existing callers).
+    // Canonical `repository_path` resolves.
     assert_eq!(
-        checkout_source(&json!({"source": "/repo/a"})),
-        Some("/repo/a")
-    );
-    // New `source_repo` resolves (the #1446 bug: previously rejected).
-    assert_eq!(
-        checkout_source(&json!({"source_repo": "/repo/b"})),
+        checkout_source(&json!({"repository_path": "/repo/b"})),
         Some("/repo/b")
     );
-    // Both given → standard `source_repo` wins.
-    assert_eq!(
-        checkout_source(&json!({"source_repo": "/repo/std", "source": "/repo/legacy"})),
-        Some("/repo/std")
-    );
-    // Empty `source_repo` falls back to `source`.
-    assert_eq!(
-        checkout_source(&json!({"source_repo": "", "source": "/repo/c"})),
-        Some("/repo/c")
-    );
+    // Empty `repository_path` → None.
+    assert_eq!(checkout_source(&json!({"repository_path": ""})), None);
+    // Dropped legacy aliases no longer resolve.
+    assert_eq!(checkout_source(&json!({"source": "/repo/a"})), None);
+    assert_eq!(checkout_source(&json!({"source_repo": "/repo/b"})), None);
     // Neither present → None (handler then returns the missing-arg error).
     assert_eq!(checkout_source(&json!({"branch": "feat-x"})), None);
 }

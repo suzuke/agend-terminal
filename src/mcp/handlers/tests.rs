@@ -231,7 +231,7 @@ fn delegate_task_emits_fleet_event() {
 
     let result = handle_tool(
         "send",
-        &json!({"target_instance": "target", "task": "do the thing", "message": "do the thing", "request_kind": "task", "task_id": "t-test-fixture", "message": "do the thing", "request_kind": "task", "task_id": "t-test-fixture"}),
+        &json!({"instance": "target", "task": "do the thing", "message": "do the thing", "request_kind": "task", "task_id": "t-test-fixture", "message": "do the thing", "request_kind": "task", "task_id": "t-test-fixture"}),
         "sender",
     );
     // Must have succeeded (API-path or fallback); both populate "target".
@@ -280,7 +280,7 @@ fn report_result_emits_with_correlation_id() {
     let result = handle_tool(
         "send",
         &json!({
-            "target_instance": "target",
+            "instance": "target",
             "message": "done", "request_kind": "report", "summary": "done",
             "correlation_id": "AGD-42",
         }),
@@ -345,7 +345,7 @@ fn bind_persists_across_kind_report_reply() {
     let result = handle_tool(
         "send",
         &json!({
-            "target_instance": "target",
+            "instance": "target",
             "message": "progress update",
             "request_kind": "report",
             "summary": "progress update",
@@ -389,7 +389,7 @@ fn report_result_empty_correlation_id_maps_to_none() {
     let _ = handle_tool(
         "send",
         &json!({
-            "target_instance": "target",
+            "instance": "target",
             "message": "done", "request_kind": "report", "summary": "done",
             "correlation_id": "",
         }),
@@ -488,15 +488,15 @@ fn broadcast_emits_with_resolved_recipients() {
     let _g = fleet_test_guard();
     let (rec, home) = setup_recorder("fleet_broadcast");
 
-    // `targets: ["target", "sender"]` — handler must self-filter
+    // `instances: ["target", "sender"]` — handler must self-filter
     // `sender` out before computing the recipient set. Pin: the
     // emitted `recipients` field comes from the filtered `sent`
-    // vec, NOT from the raw `args["targets"]`.
+    // vec, NOT from the raw `args["instances"]`.
     let result = handle_tool(
         "send",
         &json!({
             "message": "heads up",
-            "targets": ["target", "sender"],
+            "instances": ["target", "sender"],
         }),
         "sender",
     );
@@ -531,14 +531,14 @@ fn broadcast_empty_targets_does_not_emit() {
     let _g = fleet_test_guard();
     let (rec, home) = setup_recorder("fleet_broadcast_empty");
 
-    // `targets: ["sender"]` — all recipients are the sender itself,
+    // `instances: ["sender"]` — all recipients are the sender itself,
     // so the self-filter leaves `sent` empty. Pin: skip-emit on
     // empty fan-out so fleet_binding isn't spammed with "a → *0".
     let result = handle_tool(
         "send",
         &json!({
             "message": "alone",
-            "targets": ["sender"],
+            "instances": ["sender"],
         }),
         "sender",
     );
@@ -563,12 +563,11 @@ fn send_to_instance_does_not_emit_fleet_event() {
     let _g = fleet_test_guard();
     let (rec, home) = setup_recorder("fleet_send_to_excluded");
 
-    // send_to_instance takes `instance_name` (or `target`), not
-    // `target_instance` — use the real arg shape so the negative
-    // pin actually exercises the success path.
+    // send_to_instance takes `instance` — use the real arg shape so the
+    // negative pin actually exercises the success path.
     let result = handle_tool(
         "send",
-        &json!({"instance_name": "target", "message": "hi"}),
+        &json!({"instance": "target", "message": "hi"}),
         "sender",
     );
     assert!(
@@ -596,7 +595,7 @@ fn request_information_does_not_emit_fleet_event() {
 
     let result = handle_tool(
         "request_information",
-        &json!({"target_instance": "target", "question": "what is X?"}),
+        &json!({"instance": "target", "question": "what is X?"}),
         "sender",
     );
     // The send may fail in test env (no active daemon + env race on
@@ -643,7 +642,7 @@ fn delegate_task_main_response_clean_when_provenance_fails() {
 
     let result = handle_tool(
         "send",
-        &json!({"target_instance": "target", "task": "do the thing", "message": "do the thing", "request_kind": "task", "task_id": "t-test-fixture", "message": "do the thing", "request_kind": "task", "task_id": "t-test-fixture"}),
+        &json!({"instance": "target", "task": "do the thing", "message": "do the thing", "request_kind": "task", "task_id": "t-test-fixture", "message": "do the thing", "request_kind": "task", "task_id": "t-test-fixture"}),
         "sender",
     );
 
@@ -709,7 +708,7 @@ fn delegate_task_provenance_failure_logs_tracing_warn() {
     // provenance via SEND params; API layer handles injection.
     let result = handle_tool(
         "send",
-        &json!({"target_instance": "target", "task": "do the thing", "message": "do the thing", "request_kind": "task", "task_id": "t-test-fixture"}),
+        &json!({"instance": "target", "task": "do the thing", "message": "do the thing", "request_kind": "task", "task_id": "t-test-fixture"}),
         "sender",
     );
     // Send may fail (no daemon) — provenance warn only fires on success path.
@@ -1096,7 +1095,7 @@ fn test_send_to_nonexistent_target_returns_error_and_no_inbox() {
     // No fleet.yaml → target doesn't exist anywhere.
     let result = handle_tool(
         "send",
-        &json!({"instance_name": "ghost-agent", "message": "hello"}),
+        &json!({"instance": "ghost-agent", "message": "hello"}),
         "sender",
     );
     assert!(
@@ -1131,7 +1130,7 @@ fn test_delegate_task_resolves_team_to_orchestrator_inbox() {
 
     let result = handle_tool(
         "send",
-        &json!({"target_instance": "dev", "task": "test task", "message": "test task", "request_kind": "task", "task_id": "t-test-fixture", "message": "test task", "request_kind": "task", "task_id": "t-test-fixture"}),
+        &json!({"instance": "dev", "task": "test task", "message": "test task", "request_kind": "task", "task_id": "t-test-fixture", "message": "test task", "request_kind": "task", "task_id": "t-test-fixture"}),
         "dev-impl",
     );
     // Should not error — team resolved to dev-lead.
@@ -1171,7 +1170,7 @@ fn test_send_to_inbox_fallback_mode() {
     std::env::set_var("AGEND_HOME", &home);
     let result = handle_tool(
         "send",
-        &json!({"instance_name": "receiver", "message": "test"}),
+        &json!({"instance": "receiver", "message": "test"}),
         "sender",
     );
     assert_eq!(
@@ -1267,7 +1266,7 @@ fn test_delegate_task_busy_returns_structured_response() {
 
     let result = handle_tool(
         "send",
-        &json!({"target_instance": "target", "task": "new work", "message": "new work", "request_kind": "task", "task_id": "t-test-fixture", "message": "new work", "request_kind": "task", "task_id": "t-test-fixture"}),
+        &json!({"instance": "target", "task": "new work", "message": "new work", "request_kind": "task", "task_id": "t-test-fixture", "message": "new work", "request_kind": "task", "task_id": "t-test-fixture"}),
         "sender",
     );
     assert_eq!(result["busy"], true, "must return busy: {result}");
@@ -1305,7 +1304,7 @@ fn test_delegate_task_force_true_bypasses_busy_gate() {
 
     let result = handle_tool(
         "send",
-        &json!({"target_instance": "target", "task": "urgent", "message": "urgent", "request_kind": "task", "task_id": "t-test-fixture", "force": true, "force_reason": "critical bug"}),
+        &json!({"instance": "target", "task": "urgent", "message": "urgent", "request_kind": "task", "task_id": "t-test-fixture", "force": true, "force_reason": "critical bug"}),
         "sender",
     );
     assert!(
@@ -1354,7 +1353,7 @@ fn test_delegate_task_force_true_without_reason_rejected() {
 
     let result = handle_tool(
         "send",
-        &json!({"target_instance": "target", "task": "urgent", "message": "urgent", "request_kind": "task", "task_id": "t-test-fixture", "force": true}),
+        &json!({"instance": "target", "task": "urgent", "message": "urgent", "request_kind": "task", "task_id": "t-test-fixture", "force": true}),
         "sender",
     );
     assert!(
@@ -1389,7 +1388,7 @@ fn test_dispatch_dedup_rejects_same_branch() {
     let result = handle_tool(
         "send",
         &json!({
-            "target_instance": "target",
+            "instance": "target",
             "message": "duplicate work",
             "request_kind": "task",
             "task_id": "t-test-dup",
@@ -1428,7 +1427,7 @@ fn test_dispatch_dedup_force_bypasses_branch_gate() {
     let result = handle_tool(
         "send",
         &json!({
-            "target_instance": "target",
+            "instance": "target",
             "message": "force override",
             "request_kind": "task",
             "task_id": "t-test-force",
@@ -1470,7 +1469,7 @@ fn test_dispatch_dedup_different_branch_passes() {
     let result = handle_tool(
         "send",
         &json!({
-            "target_instance": "target",
+            "instance": "target",
             "message": "different branch work",
             "request_kind": "task",
             "task_id": "t-test-diff",
@@ -1512,7 +1511,7 @@ fn test_dispatch_dedup_query_kind_not_affected() {
     let result = handle_tool(
         "send",
         &json!({
-            "target_instance": "target",
+            "instance": "target",
             "message": "just a question",
             "request_kind": "query",
             "branch": "feat/x"
@@ -1544,7 +1543,7 @@ fn test_delegate_task_idle_target_normal_delivery() {
     // No claimed tasks for target
     let result = handle_tool(
         "send",
-        &json!({"target_instance": "target", "task": "normal work", "message": "normal work", "request_kind": "task", "task_id": "t-test-fixture", "message": "normal work", "request_kind": "task", "task_id": "t-test-fixture"}),
+        &json!({"instance": "target", "task": "normal work", "message": "normal work", "request_kind": "task", "task_id": "t-test-fixture", "message": "normal work", "request_kind": "task", "task_id": "t-test-fixture"}),
         "sender",
     );
     assert!(
@@ -1569,7 +1568,7 @@ fn test_delegate_task_second_reviewer_flag_requires_reason() {
     std::env::set_var("AGEND_HOME", &home);
     let result = handle_tool(
         "send",
-        &json!({"target_instance": "target", "task": "review PR", "message": "review PR", "request_kind": "task", "task_id": "t-test-fixture", "second_reviewer": true}),
+        &json!({"instance": "target", "task": "review PR", "message": "review PR", "request_kind": "task", "task_id": "t-test-fixture", "second_reviewer": true}),
         "sender",
     );
     assert!(
@@ -1596,7 +1595,7 @@ fn test_delegate_task_second_reviewer_with_reason_ok() {
     let result = handle_tool(
         "send",
         &json!({
-            "target_instance": "target",
+            "instance": "target",
             "task": "review PR",
             "second_reviewer": true,
             "second_reviewer_reason": "high-risk protocol change"
@@ -1627,7 +1626,7 @@ fn test_delegate_task_no_second_reviewer_flag_default_behavior() {
     std::env::set_var("AGEND_HOME", &home);
     let result = handle_tool(
         "send",
-        &json!({"target_instance": "target", "task": "normal work", "message": "normal work", "request_kind": "task", "task_id": "t-test-fixture", "message": "normal work", "request_kind": "task", "task_id": "t-test-fixture"}),
+        &json!({"instance": "target", "task": "normal work", "message": "normal work", "request_kind": "task", "task_id": "t-test-fixture", "message": "normal work", "request_kind": "task", "task_id": "t-test-fixture"}),
         "sender",
     );
     // No second_reviewer flag → no error related to it
@@ -1682,11 +1681,11 @@ fn test_interrupt_handler_validates_target() {
     assert!(r["error"].as_str().unwrap().contains("missing"));
 
     // Invalid target name
-    let r = handle_tool("interrupt", &json!({"target": "../escape"}), "caller");
+    let r = handle_tool("interrupt", &json!({"instance": "../escape"}), "caller");
     assert!(r.get("error").is_some());
 
     // Valid target but no daemon → reaches inject path
-    let r = handle_tool("interrupt", &json!({"target": "valid-agent"}), "caller");
+    let r = handle_tool("interrupt", &json!({"instance": "valid-agent"}), "caller");
     let err = r["error"].as_str().unwrap_or("");
     assert!(
         err.contains("not reachable") || err.contains("API unavailable"),
@@ -1719,7 +1718,7 @@ fn test_delegate_task_old_interrupt_field_no_longer_bypasses_busy_gate() {
 
     let result = handle_tool(
         "send",
-        &json!({"target_instance": "target", "task": "urgent", "message": "urgent", "request_kind": "task", "task_id": "t-test-fixture", "interrupt": true, "reason": "legacy caller"}),
+        &json!({"instance": "target", "task": "urgent", "message": "urgent", "request_kind": "task", "task_id": "t-test-fixture", "interrupt": true, "reason": "legacy caller"}),
         "sender",
     );
     assert!(
@@ -1953,7 +1952,7 @@ fn create_instance_explicit_working_directory_used() {
 #[test]
 fn send_kind_task_maps_message_field_to_task() {
     let sender = crate::identity::Sender::new("lead2-test").expect("valid sender name");
-    let args = json!({"target_instance": "dev", "message": "do X", "request_kind": "task", "task_id": "t-test-fixture"});
+    let args = json!({"instance": "dev", "message": "do X", "request_kind": "task", "task_id": "t-test-fixture"});
     let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
     // Whatever error/success we observe, it must NOT be the field-name bug:
     let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
@@ -1969,7 +1968,7 @@ fn send_kind_task_maps_message_field_to_task() {
 #[test]
 fn send_kind_query_maps_message_field_to_question() {
     let sender = crate::identity::Sender::new("lead2-test").expect("valid sender name");
-    let args = json!({"target_instance": "dev", "message": "what?", "request_kind": "query"});
+    let args = json!({"instance": "dev", "message": "what?", "request_kind": "query"});
     let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
     let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
     assert_ne!(
@@ -1985,7 +1984,7 @@ fn pane_snapshot_target_not_found_returns_error() {
     let _g = fleet_test_guard();
     let home = tmp_home("pane-snapshot-notfound");
     std::env::set_var("AGEND_HOME", &home);
-    let result = handle_tool("pane_snapshot", &json!({"target": "ghost"}), "sender");
+    let result = handle_tool("pane_snapshot", &json!({"instance": "ghost"}), "sender");
     assert!(
         result.get("error").is_some(),
         "pane_snapshot to nonexistent target must error: {result}"
@@ -2135,7 +2134,7 @@ fn watch_ci_valid_repo_returns_watching() {
         // "main" to "feat-test" because handle_watch_ci now rejects
         // protected refs at the E4.5 gate. The happy-path assertion
         // is unaffected — any non-protected branch suffices.
-        &json!({"action": "watch", "repo": "owner/repo", "branch": "feat-test"}),
+        &json!({"action": "watch", "repository": "owner/repo", "branch": "feat-test"}),
         "sender",
     );
     assert_eq!(
@@ -2160,7 +2159,7 @@ fn checkout_repo_absolute_path_used_directly() {
     // because the path doesn't exist, but the error should reference the path)
     let result = handle_tool(
         "repo",
-        &json!({"action": "checkout", "source": "/nonexistent/abs/path", "branch": "main"}),
+        &json!({"action": "checkout", "repository_path": "/nonexistent/abs/path", "branch": "main"}),
         "sender",
     );
     // Either succeeds (unlikely) or errors with the path in the message
@@ -2182,7 +2181,7 @@ fn checkout_repo_tilde_source_expands_home() {
     std::env::set_var("AGEND_HOME", &home);
     let result = handle_tool(
         "repo",
-        &json!({"action": "checkout", "source": "~/nonexistent-tilde-test", "branch": "main"}),
+        &json!({"action": "checkout", "repository_path": "~/nonexistent-tilde-test", "branch": "main"}),
         "sender",
     );
     // Tilde should expand — error message should NOT contain literal "~/"
@@ -2205,7 +2204,7 @@ fn checkout_repo_agent_name_source_with_agent_not_found() {
     // Agent name source — no daemon running, agent lookup fails → fallback to literal string
     let result = handle_tool(
         "repo",
-        &json!({"action": "checkout", "source": "nonexistent-agent", "branch": "main"}),
+        &json!({"action": "checkout", "repository_path": "nonexistent-agent", "branch": "main"}),
         "sender",
     );
     // Should error (git worktree add on a non-repo path) or return structured result
@@ -2451,7 +2450,11 @@ fn start_instance_response_shape_includes_structured_result() {
         "instances:\n  shape-agent:\n    backend: claude\n",
     )
     .ok();
-    let result = handle_tool("start_instance", &json!({"name": "shape-agent"}), "sender");
+    let result = handle_tool(
+        "start_instance",
+        &json!({"instance": "shape-agent"}),
+        "sender",
+    );
     assert!(
         result.is_object(),
         "start_instance must return JSON object: {result}"
@@ -2501,7 +2504,7 @@ fn describe_instance_response_shape_has_required_keys() {
 
 #[test]
 fn delegate_task_instance_first_bypasses_team_orchestrator_collision() {
-    // Sprint 46 P1 M5 root fix: when target_instance name collides with a
+    // Sprint 46 P1 M5 root fix: when instance name collides with a
     // team template name, instance-first lookup wins → dispatches to instance
     // directly, no team resolution. This is the M5 regression test.
     let _g = fleet_test_guard();
@@ -2518,7 +2521,7 @@ fn delegate_task_instance_first_bypasses_team_orchestrator_collision() {
     let result = handle_tool(
         "send",
         &json!({
-            "target_instance": "dev",
+            "instance": "dev",
             "request_kind": "task", "task_id": "t-test-fixture",
             "message": "do something"
         }),
@@ -2560,7 +2563,7 @@ fn m5_regression_via_id_routing() {
     let result = handle_tool(
         "send",
         &json!({
-            "target_instance": "dev",
+            "instance": "dev",
             "request_kind": "task", "task_id": "t-test-fixture",
             "message": "do something"
         }),
@@ -2653,7 +2656,7 @@ fn send_kind_task_auto_create_puts_task_on_board() {
     let result = handle_tool(
         "send",
         &json!({
-            "target_instance": "target",
+            "instance": "target",
             "task": "do the thing",
             "message": "do the thing",
             "request_kind": "task",
@@ -2710,7 +2713,7 @@ fn send_kind_task_self_send_no_orphan_task() {
     let _result = handle_tool(
         "send",
         &json!({
-            "target_instance": "sender",
+            "instance": "sender",
             "message": "do",
             "request_kind": "task",
         }),
@@ -2733,7 +2736,7 @@ fn send_kind_task_invalid_target_no_orphan_task() {
     let result = handle_tool(
         "send",
         &json!({
-            "target_instance": "///bad-name///",
+            "instance": "///bad-name///",
             "message": "do",
             "request_kind": "task",
         }),
@@ -2760,7 +2763,7 @@ fn send_kind_task_with_task_id_succeeds() {
     let result = handle_tool(
         "send",
         &json!({
-            "target_instance": "target",
+            "instance": "target",
             "task": "do the thing",
             "message": "do the thing",
             "request_kind": "task",
@@ -2790,7 +2793,7 @@ fn send_non_task_kinds_without_task_id_still_work() {
         let result = handle_tool(
             "send",
             &json!({
-                "target_instance": "target",
+                "instance": "target",
                 "message": message,
                 "request_kind": kind,
             }),
@@ -2827,7 +2830,7 @@ fn send_with_invalid_task_id_format_rejects() {
         let result = handle_tool(
             "send",
             &json!({
-                "target_instance": "target",
+                "instance": "target",
                 "task": "do",
                 "message": "do",
                 "request_kind": "task",
@@ -2856,7 +2859,7 @@ fn send_kind_task_without_task_id_auto_creates_board_task() {
     let result = handle_tool(
         "send",
         &json!({
-            "target_instance": "target",
+            "instance": "target",
             "task": "do something important",
             "message": "do something important",
             "request_kind": "task",
@@ -2889,7 +2892,7 @@ fn send_kind_task_broadcast_path_also_requires_task_id() {
     let result = handle_tool(
         "send",
         &json!({
-            "targets": ["alpha", "beta"],
+            "instances": ["alpha", "beta"],
             "message": "do",
             "request_kind": "task",
             // task_id intentionally omitted
@@ -2917,7 +2920,7 @@ fn send_default_kind_without_task_id_still_works() {
     let result = handle_tool(
         "send",
         &json!({
-            "target_instance": "target",
+            "instance": "target",
             "message": "plain message",
             // request_kind intentionally omitted → defaults
         }),

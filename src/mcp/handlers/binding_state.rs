@@ -30,7 +30,7 @@ use std::path::Path;
 /// and checking `ci-watches/*.json` separately. Single tool call returns
 /// everything at once.
 ///
-/// Required arg: `agent` (string).
+/// Required arg: `instance` (string).
 ///
 /// Returns (bound case):
 /// ```json
@@ -69,9 +69,9 @@ use std::path::Path;
 /// AND the queried agent has no binding, the operator can immediately
 /// see who's holding the branch).
 pub(crate) fn handle_binding_state(home: &Path, args: &Value, _sender: &Option<Sender>) -> Value {
-    let agent = match args["agent"].as_str() {
+    let agent = match args["instance"].as_str() {
         Some(a) if !a.is_empty() => a,
-        _ => return json!({"error": "missing 'agent'"}),
+        _ => return json!({"error": "missing 'instance'"}),
     };
     crate::validate_name_or_err!(agent);
 
@@ -241,7 +241,7 @@ mod tests {
         std::fs::write(wt.join(".agend-managed"), "agent=alpha\nbranch=feature/x\n").unwrap();
         write_binding(&home, "alpha", "feature/x", wt.to_str().unwrap());
 
-        let result = handle_binding_state(&home, &json!({"agent": "alpha"}), &None);
+        let result = handle_binding_state(&home, &json!({"instance": "alpha"}), &None);
         assert_eq!(
             result["bound"].as_bool(),
             Some(true),
@@ -269,7 +269,7 @@ mod tests {
     #[test]
     fn binding_state_returns_unbound_for_agent_with_no_binding() {
         let home = tmp_home("unbound");
-        let result = handle_binding_state(&home, &json!({"agent": "ghost"}), &None);
+        let result = handle_binding_state(&home, &json!({"instance": "ghost"}), &None);
         assert_eq!(
             result["bound"].as_bool(),
             Some(false),
@@ -299,8 +299,8 @@ mod tests {
         let result = handle_binding_state(&home, &json!({}), &None);
         assert_eq!(
             result["error"].as_str(),
-            Some("missing 'agent'"),
-            "missing agent error: {result}"
+            Some("missing 'instance'"),
+            "missing instance error: {result}"
         );
         std::fs::remove_dir_all(&home).ok();
     }
@@ -308,7 +308,7 @@ mod tests {
     #[test]
     fn binding_state_rejects_invalid_agent_name() {
         let home = tmp_home("bad-name");
-        let result = handle_binding_state(&home, &json!({"agent": "../etc/passwd"}), &None);
+        let result = handle_binding_state(&home, &json!({"instance": "../etc/passwd"}), &None);
         assert!(
             result.get("error").is_some(),
             "invalid name error: {result}"
@@ -326,7 +326,7 @@ mod tests {
         let wt = home.join("never-existed");
         write_binding(&home, "alpha", "feature/x", wt.to_str().unwrap());
 
-        let result = handle_binding_state(&home, &json!({"agent": "alpha"}), &None);
+        let result = handle_binding_state(&home, &json!({"instance": "alpha"}), &None);
         assert_eq!(result["bound"].as_bool(), Some(true));
         assert_eq!(
             result["worktree_exists_on_disk"].as_bool(),
@@ -355,7 +355,7 @@ mod tests {
         // Note: NO .agend-managed marker.
         write_binding(&home, "alpha", "feature/x", wt.to_str().unwrap());
 
-        let result = handle_binding_state(&home, &json!({"agent": "alpha"}), &None);
+        let result = handle_binding_state(&home, &json!({"instance": "alpha"}), &None);
         assert_eq!(
             result["worktree_exists_on_disk"].as_bool(),
             Some(true),
@@ -379,7 +379,7 @@ mod tests {
         write_binding(&home, "beta", "shared-branch", "/tmp/wt-beta");
         write_binding(&home, "gamma", "different-branch", "/tmp/wt-gamma");
 
-        let result = handle_binding_state(&home, &json!({"agent": "alpha"}), &None);
+        let result = handle_binding_state(&home, &json!({"instance": "alpha"}), &None);
         let holders = result["cross_branch_holders"].as_array().unwrap();
         let names: Vec<&str> = holders.iter().filter_map(|v| v.as_str()).collect();
         assert!(
@@ -405,7 +405,7 @@ mod tests {
         // reports `bind_in_flight: false` (the trivial baseline; the
         // RAII guard is exercised in dispatch_hook integration tests).
         let home = tmp_home("inflight");
-        let result = handle_binding_state(&home, &json!({"agent": "concurrent"}), &None);
+        let result = handle_binding_state(&home, &json!({"instance": "concurrent"}), &None);
         assert_eq!(
             result["bind_in_flight"].as_bool(),
             Some(false),
@@ -438,9 +438,9 @@ mod tests {
         // an agent with no binding returns released:false (existing
         // contract) AND doesn't panic on the new cleanup helper.
         let home = tmp_home("release-idem");
-        let r1 = handle_release_worktree(&home, &json!({"agent": "never-bound"}), &None);
+        let r1 = handle_release_worktree(&home, &json!({"instance": "never-bound"}), &None);
         assert_eq!(r1["released"].as_bool(), Some(false));
-        let r2 = handle_release_worktree(&home, &json!({"agent": "never-bound"}), &None);
+        let r2 = handle_release_worktree(&home, &json!({"instance": "never-bound"}), &None);
         assert_eq!(
             r2["released"].as_bool(),
             Some(false),
@@ -462,14 +462,14 @@ mod tests {
         write_binding(&home, "alpha", "feature/x", wt.to_str().unwrap());
 
         // Pre-release: bound.
-        let pre = handle_binding_state(&home, &json!({"agent": "alpha"}), &None);
+        let pre = handle_binding_state(&home, &json!({"instance": "alpha"}), &None);
         assert_eq!(pre["bound"].as_bool(), Some(true));
 
         // Release.
-        let _ = handle_release_worktree(&home, &json!({"agent": "alpha"}), &None);
+        let _ = handle_release_worktree(&home, &json!({"instance": "alpha"}), &None);
 
         // Post-release: unbound, clean.
-        let post = handle_binding_state(&home, &json!({"agent": "alpha"}), &None);
+        let post = handle_binding_state(&home, &json!({"instance": "alpha"}), &None);
         assert_eq!(
             post["bound"].as_bool(),
             Some(false),
@@ -517,7 +517,7 @@ mod tests {
         .unwrap();
         write_binding(&home, "alpha", "feature/x", "/tmp/wt");
 
-        let result = handle_binding_state(&home, &json!({"agent": "alpha"}), &None);
+        let result = handle_binding_state(&home, &json!({"instance": "alpha"}), &None);
         let watches = result["ci_watches"].as_array().unwrap();
         let entries: Vec<&str> = watches.iter().filter_map(|v| v.as_str()).collect();
         assert!(
@@ -559,7 +559,7 @@ mod tests {
         )
         .unwrap();
         // Unbound alpha — exercises the unbound JSON shape.
-        let unbound = handle_binding_state(&home, &json!({"agent": "alpha"}), &None);
+        let unbound = handle_binding_state(&home, &json!({"instance": "alpha"}), &None);
         assert_eq!(unbound["bound"].as_bool(), Some(false));
         let dw = unbound["dispatched_waiting_for"]
             .as_array()
@@ -579,7 +579,7 @@ mod tests {
         std::fs::create_dir_all(&wt).unwrap();
         std::fs::write(wt.join(".agend-managed"), "agent=alpha\n").unwrap();
         write_binding(&home, "alpha", "feature/l3", wt.to_str().unwrap());
-        let bound = handle_binding_state(&home, &json!({"agent": "alpha"}), &None);
+        let bound = handle_binding_state(&home, &json!({"instance": "alpha"}), &None);
         assert_eq!(bound["bound"].as_bool(), Some(true));
         assert_eq!(
             bound["dispatched_waiting_for"].as_array().map(|a| a.len()),

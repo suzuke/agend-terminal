@@ -1185,7 +1185,7 @@ mod tests {
 
         let result = crate::mcp::handlers::worktree_test_release(
             &home,
-            &serde_json::json!({"agent": "agent-prod"}),
+            &serde_json::json!({"instance": "agent-prod"}),
         );
         assert_eq!(result["released"].as_bool(), Some(true), "{result}");
         assert_eq!(result["worktree_removed"].as_bool(), Some(true), "{result}");

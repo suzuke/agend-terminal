@@ -11,24 +11,12 @@ use super::{anti_stall::enforce_send_invariants, err_needs_identity, is_ok_resul
 /// `request_kind` or infers from args (targets/team → broadcast, task field
 /// → delegate, summary → report, question → query, default → send_to).
 pub(super) fn handle_unified_send(home: &Path, args: &Value, sender: &Option<Sender>) -> Value {
-    // Normalize: map instance_name ↔ target_instance for cross-compat
     let mut args = args.clone();
-    if args.get("target_instance").is_none() {
-        if let Some(name) = args.get("instance_name").cloned() {
-            args["target_instance"] = name;
-        }
-    }
-    if args.get("instance_name").is_none() {
-        if let Some(target) = args.get("target_instance").cloned() {
-            args["instance_name"] = target;
-        }
-    }
-
     if let Some(err) = enforce_send_invariants(home, &args, sender) {
         return err;
     }
     // Broadcast mode: targets/team/tags present
-    if args.get("targets").is_some() || args.get("team").is_some() || args.get("tags").is_some() {
+    if args.get("instances").is_some() || args.get("team").is_some() || args.get("tags").is_some() {
         return handle_broadcast(home, &args, sender);
     }
 
@@ -65,16 +53,13 @@ pub(super) fn handle_send_to_instance(
     let Some(sender) = sender.as_ref() else {
         return err_needs_identity(tool);
     };
-    let target = args["instance_name"]
-        .as_str()
-        .or_else(|| args["target"].as_str());
-    let target = match target {
+    let target = match args["instance"].as_str() {
         Some(t) => t,
-        None => return json!({"error": "missing 'instance_name' or 'target'"}),
+        None => return json!({"error": "missing 'instance'"}),
     };
     crate::validate_name_or_err!(target);
     if *sender == target {
-        return json!({"error": "cannot send to self — use a different instance_name"});
+        return json!({"error": "cannot send to self — use a different instance"});
     }
     let text = match args["message"].as_str().or_else(|| args["text"].as_str()) {
         Some(t) if !t.is_empty() => t,
@@ -142,9 +127,9 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
     let Some(sender) = sender.as_ref() else {
         return err_needs_identity("delegate_task");
     };
-    let raw_target = match args["target_instance"].as_str() {
+    let raw_target = match args["instance"].as_str() {
         Some(t) => t,
-        None => return json!({"error": "missing 'target_instance'"}),
+        None => return json!({"error": "missing 'instance'"}),
     };
     crate::validate_name_or_err!(raw_target);
     // Sprint 46 P2: resolve target via InstanceId — replaces P1 name-lookup bandaid.
@@ -169,7 +154,7 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
     if *sender == target && raw_target != target {
         return json!({"error": format!(
             "task target '{}' resolved to sender '{}' (team orchestrator loop) \
-             — verify target_instance name does not collide with a team template name",
+             — verify instance name does not collide with a team template name",
             raw_target, sender.as_str()
         )});
     }
@@ -298,7 +283,7 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
                 "dispatch_auto_bind_lease skipped (bind: false)"
             );
         } else {
-            let repo_arg = args["repo"].as_str();
+            let repo_arg = args["repository"].as_str();
             let next_after_ci_arg = args["next_after_ci"].as_str();
             if let Err(e) = super::dispatch_hook::dispatch_auto_bind_lease_with_chain(
                 home,
@@ -445,9 +430,9 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
     let Some(sender) = sender.as_ref() else {
         return err_needs_identity("report_result");
     };
-    let target = match args["target_instance"].as_str() {
+    let target = match args["instance"].as_str() {
         Some(t) => t,
-        None => return json!({"error": "missing 'target_instance'"}),
+        None => return json!({"error": "missing 'instance'"}),
     };
     crate::validate_name_or_err!(target);
     let summary = match args["summary"].as_str() {
@@ -567,9 +552,9 @@ pub(super) fn handle_request_information(
     let Some(sender) = sender.as_ref() else {
         return err_needs_identity("request_information");
     };
-    let target = match args["target_instance"].as_str() {
+    let target = match args["instance"].as_str() {
         Some(t) => t,
-        None => return json!({"error": "missing 'target_instance'"}),
+        None => return json!({"error": "missing 'instance'"}),
     };
     crate::validate_name_or_err!(target);
     let question = match args["question"].as_str() {
@@ -594,7 +579,7 @@ pub(super) fn handle_broadcast(home: &Path, args: &Value, sender: &Option<Sender
     let team_name = args["team"].as_str().map(String::from);
     let targets: Vec<String> = if let Some(team) = team_name.as_deref() {
         crate::teams::get_members(home, team)
-    } else if let Some(t) = args["targets"].as_array() {
+    } else if let Some(t) = args["instances"].as_array() {
         t.iter()
             .filter_map(|v| v.as_str().map(String::from))
             .collect()
