@@ -2030,3 +2030,33 @@ fn merge_force_audit_write_failure_refuses_merge() {
     );
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// #1446: `repo checkout` resolves `source_repo` (the cross-tool standard name)
+/// as an alias for `source`. Before the fix, dispatch books calling checkout
+/// with `source_repo` were rejected as "missing source".
+#[test]
+fn checkout_accepts_source_repo_alias() {
+    use serde_json::json;
+    // Legacy `source` still resolves (backward compat — existing callers).
+    assert_eq!(
+        checkout_source(&json!({"source": "/repo/a"})),
+        Some("/repo/a")
+    );
+    // New `source_repo` resolves (the #1446 bug: previously rejected).
+    assert_eq!(
+        checkout_source(&json!({"source_repo": "/repo/b"})),
+        Some("/repo/b")
+    );
+    // Both given → standard `source_repo` wins.
+    assert_eq!(
+        checkout_source(&json!({"source_repo": "/repo/std", "source": "/repo/legacy"})),
+        Some("/repo/std")
+    );
+    // Empty `source_repo` falls back to `source`.
+    assert_eq!(
+        checkout_source(&json!({"source_repo": "", "source": "/repo/c"})),
+        Some("/repo/c")
+    );
+    // Neither present → None (handler then returns the missing-arg error).
+    assert_eq!(checkout_source(&json!({"branch": "feat-x"})), None);
+}

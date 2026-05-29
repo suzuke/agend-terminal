@@ -308,7 +308,9 @@ pub(crate) fn def_repo() -> Value {
         "inputSchema": {"type": "object", "properties": {
             "action": {"type": "string", "enum": ["checkout", "release", "cleanup_init_commits", "cleanup_merged_branches", "merge"]},
             "pr": {"type": "integer", "description": "PR number for merge action."},
-            "source": {"type": "string"}, "branch": {"type": "string"},
+            "source_repo": {"type": "string", "description": "checkout: local path to the source repository. Standard cross-tool name (matches bind_self / team update)."},
+            "source": {"type": "string", "description": "checkout: alias for `source_repo`, retained for backward compatibility (#1446). Prefer `source_repo`."},
+            "branch": {"type": "string"},
             "path": {"type": "string"},
             "agent": {"type": "string", "description": "#789: target agent for cleanup_init_commits (defaults to caller's instance_name). Cleans empty `init` commits accumulated in the agent's bound worktree by backend session-checkpoint heartbeats. Returns {cleaned_count, [skipped_reason]}. Idempotent — call before push to scrub PR history."},
             "bind": {"type": "boolean", "description": "#778 Option 1: when true on checkout, atomically bind the caller to the just-provisioned worktree (writes binding.json + .agend-managed marker + arms ci_watches) and lands HEAD on the named branch instead of a detached commit. Default false preserves back-compat for inspection-only callers (review pool, operator triage)."},
