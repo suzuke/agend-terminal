@@ -1665,6 +1665,14 @@ fn setup_repo_and_worktree(tag: &str) -> (std::path::PathBuf, std::path::PathBuf
             .expect("git ran")
     };
     git_run(&repo, &["init", "-b", "main"]);
+    // #1452: disable git auto-gc/maintenance in the fixture repo. The SUT runs
+    // a `git rebase` over 50+ loose-object commits; under llvm-cov's slow,
+    // heavily-parallel CI run an auto-gc repack can fire mid-rebase and race
+    // the revision walk's object reads → "revision walk setup failed: could
+    // not read <sha>" (the recurring Coverage-job flake). Read from the common
+    // config, so it also covers git invocations inside the worktree.
+    git_run(&repo, &["config", "gc.auto", "0"]);
+    git_run(&repo, &["config", "maintenance.auto", "false"]);
     // #814 r1: pin per-repo gitconfig so subprocesses spawned by the
     // SUT (which don't inherit our test env vars) still find an
     // identity. Without this, CI runners with no global gitconfig

@@ -242,7 +242,22 @@ jobs:
         timeout-minutes: 35
         env:
           AGEND_LOCK_AUDIT: "1"
-        run: cargo llvm-cov --workspace --tests --features tray --lcov --output-path coverage.lcov
+        # #1452: Coverage (non-required) recurringly flaked on transient
+        # llvm-profdata profraw corruption and a git-race test under llvm-cov's
+        # slow parallel run — both pass on rerun. Retry once (clean stale
+        # profraw between attempts) so the job self-heals instead of needing a
+        # manual `gh run rerun`. The git-race root is separately hardened by
+        # disabling auto-gc in the affected test's repo setup.
+        run: |
+          for attempt in 1 2; do
+            if cargo llvm-cov --workspace --tests --features tray --lcov --output-path coverage.lcov; then
+              exit 0
+            fi
+            echo "::warning::coverage attempt $attempt failed (likely #1452 profraw/git-race flake); cleaning + retrying"
+            cargo llvm-cov clean --workspace || true
+          done
+          echo "::error::coverage failed after 2 attempts"
+          exit 1
       - name: Upload to Codecov
         uses: codecov/codecov-action@v4
         with:
