@@ -729,6 +729,72 @@ mod tests {
         );
     }
 
+    /// #1140: a wide (2-cell) char replaced by narrow chars across frames must
+    /// leave no ghost in the former spacer cell. Contract-lock for the
+    /// wide→narrow render path our panes depend on.
+    ///
+    /// Note: the plain-CJK case already worked on ratatui 0.29 — the #1140
+    /// ghost came from VS16-emoji width miscalculation, which the 0.30 upgrade
+    /// fixes. That bug is layout-level (width-dependent placement), so it can't
+    /// be cleanly discriminated cross-version in a unit test; the emoji case
+    /// below documents the correct 0.30 behavior and the real-world ghost is
+    /// confirmed by operator visual check (see PR).
+    fn render_row(terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>, text: &str) {
+        terminal
+            .draw(|frame| {
+                frame
+                    .buffer_mut()
+                    .set_string(0, 0, text, ratatui::style::Style::default());
+            })
+            .expect("test draw should succeed");
+    }
+
+    fn backend_row(
+        terminal: &ratatui::Terminal<ratatui::backend::TestBackend>,
+        width: u16,
+    ) -> String {
+        let buf = terminal.backend().buffer();
+        (0..width)
+            .map(|x| buf.cell((x, 0)).map(|c| c.symbol()).unwrap_or(" "))
+            .collect()
+    }
+
+    #[test]
+    fn wide_char_to_narrow_leaves_no_ghost() {
+        let backend = ratatui::backend::TestBackend::new(4, 1);
+        let mut terminal =
+            ratatui::Terminal::new(backend).expect("test terminal creation should succeed");
+
+        // Frame 1: wide "中" spans cols 0-1, "X" at col 2.
+        render_row(&mut terminal, "中X ");
+        // Frame 2: "中" replaced by narrow "ab".
+        render_row(&mut terminal, "abX ");
+        assert_eq!(
+            backend_row(&terminal, 4).trim_end(),
+            "abX",
+            "spacer cell must not retain the wide char's right half"
+        );
+
+        // Issue's exact symptom: lone narrow char where a wide char was, rest empty.
+        render_row(&mut terminal, "中X ");
+        render_row(&mut terminal, "a   ");
+        assert_eq!(
+            backend_row(&terminal, 4).trim_end(),
+            "a",
+            "no lone-char ghost may persist in the former spacer cell"
+        );
+
+        // VS16 emoji (U+2764 U+FE0F) — width-2 on ratatui 0.30, the actual
+        // #1140 ghost source. Documents correct post-upgrade clearing.
+        render_row(&mut terminal, "\u{2764}\u{fe0f}X ");
+        render_row(&mut terminal, "abX ");
+        assert_eq!(
+            backend_row(&terminal, 4).trim_end(),
+            "abX",
+            "VS16-emoji spacer must be cleared on wide→narrow"
+        );
+    }
+
     /// #1027 RED: when `binary_stale` is true, the status bar MUST show
     /// a "daemon binary stale" warning so the operator sees a stable
     /// TUI indicator (replacing the previous inbox-emit path which
