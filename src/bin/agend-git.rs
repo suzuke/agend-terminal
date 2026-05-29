@@ -591,6 +591,19 @@ fn commit_is_init_heartbeat_argv(args: &[String]) -> bool {
         .unwrap_or(false)
 }
 
+/// This shim process's parent PID (the process that invoked `git`). Unix
+/// via `libc::getppid`; -1 elsewhere (Windows `libc` has no `getppid` — the
+/// process-tree forensics are unix-only, matching `parent_process_name`).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn parent_pid() -> i32 {
+    unsafe { libc::getppid() }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn parent_pid() -> i32 {
+    -1
+}
+
 /// Walk the process ancestry from this shim's parent up to `max` levels.
 /// Each entry is `pid ppid comm args` (one ancestor). The immediate parent
 /// is the process that invoked `git` — i.e. the backend CLI we want to pin.
@@ -598,7 +611,7 @@ fn commit_is_init_heartbeat_argv(args: &[String]) -> bool {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn process_ancestry(max: usize) -> Vec<String> {
     let mut out = Vec::new();
-    let mut pid = unsafe { libc::getppid() };
+    let mut pid = parent_pid();
     for _ in 0..max {
         if pid <= 1 {
             break;
@@ -653,7 +666,7 @@ fn log_init_heartbeat_forensics(home: &str, agent: &str, args: &[String]) {
     let cwd = env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
-    let ppid = unsafe { libc::getppid() };
+    let ppid = parent_pid();
     let ancestry = process_ancestry(8);
     let email = effective_git_email(&cwd).unwrap_or_default();
     let has_allow_empty = args.iter().any(|a| a == "--allow-empty");
