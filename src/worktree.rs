@@ -5,12 +5,9 @@
 //! Sprint 57 Wave 4 (#546 Item 4) — worktrees live external to the
 //! source repo per operator-approved Option A. Canonical layout:
 //!   `$AGEND_HOME/worktrees/<agent>/<branch>/`
-//! (e.g. `~/.agend/worktrees/dev/feat/track-x/`). The legacy layout
-//! `<source_repo>/.worktrees/<agent>/` is detected by
-//! `legacy_worktree_path` for migration warnings only — no new
-//! creates land there. `worktree_path` is the single source of truth
-//! for the new layout; all production code paths (lease, create,
-//! release, gc, list_residual) route through it.
+//! (e.g. `~/.agend/worktrees/dev/feat/track-x/`). `worktree_path` is
+//! the single source of truth for this layout; all production code
+//! paths (lease, create, release, gc, list_residual) route through it.
 
 use crate::agent_ops::validate_branch;
 use std::path::{Path, PathBuf};
@@ -24,20 +21,6 @@ use std::path::{Path, PathBuf};
 /// boundary.
 pub fn worktree_path(home: &Path, agent: &str, branch: &str) -> PathBuf {
     home.join("worktrees").join(agent).join(branch)
-}
-
-/// Sprint 57 Wave 4 (#546 Item 4) legacy worktree path detector:
-/// the pre-Sprint-57 layout `<source_repo>/.worktrees/<agent>/`.
-/// Used by the startup migration sweep AND by tests to construct
-/// reference paths for legacy detection. Production creates NEVER
-/// use this path post-Wave-4 — it lives only for detection of
-/// pre-existing on-disk state. Tagged `#[allow(dead_code)]` because
-/// production callers route through `list_legacy_residual` (which
-/// scans the parent dir), but the path-builder is the documented
-/// single source of truth for the legacy layout.
-#[allow(dead_code)]
-pub fn legacy_worktree_path(source_repo: &Path, agent: &str) -> PathBuf {
-    source_repo.join(".worktrees").join(agent)
 }
 
 /// Info about a created worktree.
@@ -423,32 +406,9 @@ pub fn checkout_branch(worktree_dir: &Path, branch: &str) -> Result<(), String> 
 /// `$AGEND_HOME/worktrees/`. The `repo_dir` parameter is retained
 /// for API compatibility with pre-Wave-4 callers but the new layout
 /// is repo-independent — agent dirs live under the central daemon
-/// state, not per-repo. For callers wanting legacy detection,
-/// `list_legacy_residual` keeps the pre-Wave-4 semantics.
+/// state, not per-repo.
 pub fn list_residual(home: &Path) -> Vec<String> {
     let wt_base = home.join("worktrees");
-    if !wt_base.exists() {
-        return Vec::new();
-    }
-    std::fs::read_dir(&wt_base)
-        .ok()
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter(|e| e.path().is_dir())
-                .map(|e| e.file_name().to_string_lossy().to_string())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Sprint 57 Wave 4 (#546 Item 4): list pre-Wave-4 legacy worktree
-/// agent names present under `<source_repo>/.worktrees/`. Used by
-/// the startup migration sweep to surface operator-actionable
-/// warnings. Returns empty Vec for repos that never had legacy
-/// worktrees or have already been cleaned up.
-pub fn list_legacy_residual(source_repo: &Path) -> Vec<String> {
-    let wt_base = source_repo.join(".worktrees");
     if !wt_base.exists() {
         return Vec::new();
     }
@@ -745,16 +705,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_worktree_path_returns_pre_wave4_layout() {
-        // Pin the legacy detector returns the pre-Wave-4 path shape;
-        // production NEVER creates here, but the helper is the single
-        // source of truth for migration warnings.
-        let repo = std::path::Path::new("/test/repo");
-        let path = legacy_worktree_path(repo, "dev");
-        assert_eq!(path, std::path::Path::new("/test/repo/.worktrees/dev"));
-    }
-
-    #[test]
     fn path_layout_invariant_against_regression() {
         // Regression-proof: ensure the new path is NOT under the
         // source repo. This is the load-bearing invariant Wave 4
@@ -801,7 +751,8 @@ mod tests {
         std::fs::create_dir_all(home.join("worktrees").join("dev").join("feat-a")).unwrap();
         std::fs::create_dir_all(home.join("worktrees").join("lead").join("main-mirror")).unwrap();
 
-        // Legacy (old layout) — must NOT be reported by list_residual.
+        // Legacy (old layout) entry on disk — must NOT be reported by
+        // list_residual (which only scans the central new layout).
         std::fs::create_dir_all(repo.join(".worktrees").join("ghost-agent")).unwrap();
 
         let new_residual = list_residual(&home);
@@ -817,54 +768,7 @@ mod tests {
             "legacy entries must NOT be reported by central scan"
         );
 
-        // Legacy entries surface via the dedicated legacy scanner.
-        let legacy = list_legacy_residual(&repo);
-        assert!(legacy.contains(&"ghost-agent".to_string()));
-
         std::fs::remove_dir_all(&home).ok();
-        std::fs::remove_dir_all(&repo).ok();
-    }
-
-    #[test]
-    fn migration_handles_legacy_source_repo_worktrees() {
-        // Migration shape per Wave 4 dispatch: detect-and-warn (NOT
-        // auto-migrate, because `git worktree`'s gitdir pointer +
-        // cross-fs renames make safe automatic migration risky).
-        // Pin: legacy_worktree_path + list_legacy_residual together
-        // give operators an actionable surface for manual cleanup.
-        let repo = tmp_repo("migration-detect");
-        let agent = "alpha";
-
-        // Plant a legacy worktree directly on disk.
-        let legacy = legacy_worktree_path(&repo, agent);
-        std::fs::create_dir_all(&legacy).unwrap();
-
-        // Detection works.
-        let detected = list_legacy_residual(&repo);
-        assert!(
-            detected.contains(&agent.to_string()),
-            "legacy detection must surface the planted worktree"
-        );
-
-        // Path helper agrees with the scan.
-        assert_eq!(
-            legacy_worktree_path(&repo, agent),
-            repo.join(".worktrees").join(agent)
-        );
-
-        std::fs::remove_dir_all(&repo).ok();
-    }
-
-    #[test]
-    fn migration_idempotent_no_legacy_worktrees() {
-        // Pin: list_legacy_residual on a repo that never had legacy
-        // worktrees returns empty (no spurious warnings).
-        let repo = tmp_repo("migration-clean");
-        let detected = list_legacy_residual(&repo);
-        assert!(
-            detected.is_empty(),
-            "no legacy worktrees → no spurious detections, got: {detected:?}"
-        );
         std::fs::remove_dir_all(&repo).ok();
     }
 }

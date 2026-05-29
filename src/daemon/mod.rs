@@ -460,7 +460,7 @@ fn run_core(
         }
     }
 
-    log_residual_worktrees(home, &ctx.configs);
+    log_residual_worktrees(home);
 
     let metrics = shutdown_sequence(home, &ctx.registry, started_at);
     crate::event_log::log(
@@ -698,9 +698,9 @@ fn spawn_stage2_thread(home: &Path, name: &str, ctx: &DaemonContext) {
     }
 }
 
-fn log_residual_worktrees(home: &Path, configs: &Arc<Mutex<HashMap<String, AgentConfig>>>) {
-    let cfgs = configs.lock();
-    let mut seen = std::collections::HashSet::new();
+fn log_residual_worktrees(home: &Path) {
+    // #1458: pre-Wave-4 legacy detection (`<repo>/.worktrees/<agent>/`) retired.
+    // Only the new-layout check under `$AGEND_HOME/worktrees/` remains.
     let central_residual = crate::worktree::list_residual(home);
     if !central_residual.is_empty() {
         tracing::info!(
@@ -709,25 +709,6 @@ fn log_residual_worktrees(home: &Path, configs: &Arc<Mutex<HashMap<String, Agent
             "residual agent worktrees found under $AGEND_HOME/worktrees/ \
              (cleared on next bind_self/release_worktree cycle)"
         );
-    }
-    for config in cfgs.values() {
-        let repo = config
-            .worktree_source
-            .as_ref()
-            .or(config.working_dir.as_ref());
-        if let Some(dir) = repo {
-            if seen.insert(dir.clone()) {
-                let residual = crate::worktree::list_legacy_residual(dir);
-                if !residual.is_empty() {
-                    tracing::warn!(
-                        repo = %dir.display(),
-                        residual = ?residual,
-                        "legacy worktrees detected at <repo>/.worktrees/<agent>/ — \
-                         operator cleanup recommended"
-                    );
-                }
-            }
-        }
     }
 }
 
