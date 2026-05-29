@@ -517,8 +517,8 @@ prior (inaccurate) wording in this section**: the daemon does NOT write them.
 emits `git commit --allow-empty -m "init"` itself, as a session-checkpoint
 side effect. These pass through the `agend-git` shim's `ChdirPass` like any
 other agent git call, so the committer is the operator's **global git
-identity** (user.name/user.email), not the daemon. See the matching note at
-`src/bin/agend-git.rs:189`.
+identity** (user.name/user.email), not the daemon. See the matching note on the
+`Action::CleanupAndChdirPushPass` variant in `src/bin/agend-git.rs`.
 
 **What the daemon actually does** (it never creates these): only
 (a) stamps `Agend-Agent` / `Agend-Task` / `Agend-Branch` / `Agend-Issued-At`
