@@ -3,10 +3,26 @@ use crate::git_helpers::git_bypass;
 use serde_json::{json, Value};
 use std::path::Path;
 
+/// #1446: resolve the checkout source repo, accepting `source_repo` (the
+/// cross-tool standard name used by bind_self / team update) as an alias for
+/// the legacy `source`. Prefers `source_repo` when both are given; `source` is
+/// retained for backward compatibility. Returns `None` when neither is present
+/// (or both are empty).
+fn checkout_source(args: &Value) -> Option<&str> {
+    args.get("source_repo")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            args.get("source")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+        })
+}
+
 pub(super) fn handle_checkout_repo(home: &Path, args: &Value, instance_name: &str) -> Value {
-    let source = match args["source"].as_str() {
+    let source = match checkout_source(args) {
         Some(s) => s,
-        None => return json!({"error": "missing 'source'"}),
+        None => return json!({"error": "missing 'source_repo' (alias: 'source')"}),
     };
     let branch = args["branch"].as_str().unwrap_or("HEAD");
     if !validate_branch(branch) {
