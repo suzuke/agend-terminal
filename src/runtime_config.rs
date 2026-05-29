@@ -18,6 +18,11 @@ pub struct RuntimeConfig {
     /// Fleet-wide idle threshold before watchdog alerts (seconds).
     #[serde(default = "default_fleet_idle")]
     pub fleet_idle_threshold_secs: i64,
+    /// #1438: max TTL (seconds) for a fleet-idle ack. Backstop so an ack
+    /// never suppresses forever when the task board makes no progress; once
+    /// the ack is older than this it expires and the fleet is re-evaluated.
+    #[serde(default = "default_fleet_ack_ttl")]
+    pub fleet_idle_ack_ttl_secs: i64,
     /// #685 Phase 2: Master gate for hang auto-recovery stages 1-3.
     /// When true, Hung agents trigger ESC → restart → escalate.
     /// Default false (shadow mode only).
@@ -43,12 +48,16 @@ fn default_dev_idle() -> i64 {
 fn default_fleet_idle() -> i64 {
     1800
 }
+fn default_fleet_ack_ttl() -> i64 {
+    2700
+}
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             dev_idle_threshold_secs: default_dev_idle(),
             fleet_idle_threshold_secs: default_fleet_idle(),
+            fleet_idle_ack_ttl_secs: default_fleet_ack_ttl(),
             hang_auto_recovery_enabled: false,
             usage_limit_propagation_enabled: false,
             idle_watchdog_enabled: true,
@@ -91,6 +100,11 @@ pub fn set(home: &Path, key: &str, value: &str) -> Result<String, String> {
                 .parse()
                 .map_err(|_| format!("invalid integer: {value}"))?;
         }
+        "fleet_idle_ack_ttl_secs" => {
+            config.fleet_idle_ack_ttl_secs = value
+                .parse()
+                .map_err(|_| format!("invalid integer: {value}"))?;
+        }
         "hang_auto_recovery_enabled" => {
             config.hang_auto_recovery_enabled = match value {
                 "true" | "1" => true,
@@ -127,6 +141,7 @@ pub fn get_key(key: &str) -> Result<String, String> {
     match key {
         "dev_idle_threshold_secs" => Ok(config.dev_idle_threshold_secs.to_string()),
         "fleet_idle_threshold_secs" => Ok(config.fleet_idle_threshold_secs.to_string()),
+        "fleet_idle_ack_ttl_secs" => Ok(config.fleet_idle_ack_ttl_secs.to_string()),
         "hang_auto_recovery_enabled" => Ok(config.hang_auto_recovery_enabled.to_string()),
         "usage_limit_propagation_enabled" => Ok(config.usage_limit_propagation_enabled.to_string()),
         "idle_watchdog_enabled" => Ok(config.idle_watchdog_enabled.to_string()),
