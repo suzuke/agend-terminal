@@ -4,8 +4,13 @@ use serde_json::json;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::time::Duration;
 
+/// #1457: the old fixed compose-idle window. The notification-delivery guards
+/// no longer use it (replaced by the input-vs-submit `DraftState`); it now only
+/// backs `Pane::is_composing`, a test-only helper — hence `#[cfg(test)]`.
+#[cfg(test)]
 pub const COMPOSE_IDLE_TIMEOUT: Duration = Duration::from_secs(3);
 const COMPOSE_METADATA_KEY: &str = "last_input_epoch_ms";
 /// Sprint 54 P2-3: epoch-ms timestamp of the most recent submit-key
@@ -72,21 +77,67 @@ pub fn read_input_submit_timestamps(home: &Path, agent_name: &str) -> (i64, i64)
     (typed_ms, submit_ms)
 }
 
-pub fn is_composing(home: &Path, agent_name: &str) -> bool {
-    let meta_path = home.join("metadata").join(format!("{agent_name}.json"));
-    let meta = match std::fs::read_to_string(meta_path) {
-        Ok(content) => content,
-        Err(_) => return false,
-    };
-    let value: serde_json::Value = match serde_json::from_str(&meta) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    let Some(last_input_ms) = value[COMPOSE_METADATA_KEY].as_i64() else {
-        return false;
-    };
+/// #1457: how long an unsent draft defers notification delivery before the
+/// escape valve releases it (operator likely walked away mid-draft).
+/// Overridable via `AGEND_DRAFT_ESCAPE_SECS`; default 300s (5 min).
+fn draft_escape_timeout_ms() -> i64 {
+    std::env::var("AGEND_DRAFT_ESCAPE_SECS")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|s| *s > 0)
+        .map(|s| s.saturating_mul(1000))
+        .unwrap_or(300_000)
+}
+
+/// #1457: draft state used to gate notification delivery. Derived from the
+/// relative ORDER of the last input vs last submit keystroke (not a fixed idle
+/// window) — fixes the `is_composing` false-negative where a >3s pause mid-draft
+/// was misread as "no draft" and a notification clobbered the operator's input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DraftState {
+    /// No unsent draft: everything typed has been submitted (or never typed).
+    None,
+    /// Unsent draft present and operator likely still composing → defer all.
+    Drafting,
+    /// Unsent draft present but idle past the escape window → trickle-release.
+    Abandoned,
+}
+
+/// #1457: classify the focused pane's draft state for delivery gating.
+/// `typed > submit` means keystrokes were entered but not submitted (a live
+/// draft); `typed <= submit` (or never typed) means the buffer is clean.
+pub fn draft_state(home: &Path, agent_name: &str) -> DraftState {
+    let (typed_ms, submit_ms) = read_input_submit_timestamps(home, agent_name);
+    if typed_ms == 0 || typed_ms <= submit_ms {
+        return DraftState::None;
+    }
     let now_ms = chrono::Utc::now().timestamp_millis();
-    now_ms.saturating_sub(last_input_ms) < COMPOSE_IDLE_TIMEOUT.as_millis() as i64
+    if now_ms.saturating_sub(typed_ms) < draft_escape_timeout_ms() {
+        DraftState::Drafting
+    } else {
+        DraftState::Abandoned
+    }
+}
+
+/// #1457: pop and return the single OLDEST queued notification, leaving the
+/// rest queued. The escape valve uses this so an abandoned-draft pane trickles
+/// its backlog one-per-tick instead of clobbering the draft with a full batch.
+pub fn drain_one(home: &Path, agent_name: &str) -> Option<QueuedNotification> {
+    let path = queue_path(home, agent_name);
+    let content = std::fs::read_to_string(&path).ok()?;
+    let mut lines = content.lines();
+    let first = lines.next()?;
+    let oldest = serde_json::from_str::<QueuedNotification>(first).ok();
+    let rest: Vec<&str> = lines.collect();
+    if rest.is_empty() {
+        let _ = std::fs::remove_file(&path);
+    } else {
+        // Best-effort rewrite of the remaining lines (matches enqueue's
+        // non-atomic append model — notifications are best-effort, and the
+        // #911 dedup ledger absorbs a rare re-inject on crash mid-rewrite).
+        let _ = std::fs::write(&path, format!("{}\n", rest.join("\n")));
+    }
+    oldest
 }
 
 pub fn enqueue(home: &Path, agent_name: &str, text: &str) -> anyhow::Result<()> {
@@ -224,6 +275,75 @@ mod tests {
             submit, 0,
             "submit must stay 0 until record_submit_activity is called"
         );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// #1457: write raw input/submit timestamps so draft-state tests are
+    /// deterministic (no sleeps / no process-global env).
+    fn write_ts(home: &Path, agent: &str, typed_ms: i64, submit_ms: i64) {
+        if typed_ms != 0 {
+            agent_ops::save_metadata(home, agent, COMPOSE_METADATA_KEY, json!(typed_ms));
+        }
+        if submit_ms != 0 {
+            agent_ops::save_metadata(home, agent, SUBMIT_METADATA_KEY, json!(submit_ms));
+        }
+    }
+
+    /// #1457: submitted (or never-typed) buffer → None → notifications deliver.
+    /// This is the submit-then-flush release path.
+    #[test]
+    fn draft_state_none_when_submitted_or_clean() {
+        let home = tmp_home("draft_none");
+        let now = chrono::Utc::now().timestamp_millis();
+        // never typed
+        assert_eq!(draft_state(&home, "fresh"), DraftState::None);
+        // typed then submitted (submit newer) → clean
+        write_ts(&home, "submitted", now - 1000, now - 100);
+        assert_eq!(draft_state(&home, "submitted"), DraftState::None);
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// #1457: unsent draft, typed recently → Drafting (defer). Crucially this
+    /// holds regardless of how long the pause is (no 3s window) — the old
+    /// `is_composing` would have false-negatived after 3s of thinking.
+    #[test]
+    fn draft_state_drafting_when_typed_after_submit() {
+        let home = tmp_home("draft_drafting");
+        let now = chrono::Utc::now().timestamp_millis();
+        // typed AFTER last submit, well within the escape window — but also
+        // older than the old 3s window, proving we no longer false-negative.
+        write_ts(&home, "a", now - 60_000, now - 120_000);
+        assert_eq!(draft_state(&home, "a"), DraftState::Drafting);
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// #1457: unsent draft idle past the escape window → Abandoned (release).
+    /// Covers the "typed then deleted the draft / walked away" edge — the
+    /// escape valve is what bounds the otherwise-indefinite defer.
+    #[test]
+    fn draft_state_abandoned_past_escape_window() {
+        let home = tmp_home("draft_abandoned");
+        let now = chrono::Utc::now().timestamp_millis();
+        // typed 400s ago, never submitted since → past the 300s default escape.
+        write_ts(&home, "a", now - 400_000, now - 500_000);
+        assert_eq!(draft_state(&home, "a"), DraftState::Abandoned);
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// #1457: escape valve releases ONE oldest notification, leaving the rest
+    /// queued (no clobbering batch).
+    #[test]
+    fn drain_one_pops_oldest_leaves_rest() {
+        let home = tmp_home("drain_one");
+        enqueue(&home, "a", "first").expect("enqueue first");
+        enqueue(&home, "a", "second").expect("enqueue second");
+        enqueue(&home, "a", "third").expect("enqueue third");
+        let popped = drain_one(&home, "a").expect("one popped");
+        assert_eq!(popped.text, "first", "oldest must be released first");
+        assert_eq!(pending_count(&home, "a"), 2, "rest stay queued");
+        assert_eq!(drain_one(&home, "a").expect("second pop").text, "second");
+        assert_eq!(drain_one(&home, "a").expect("third pop").text, "third");
+        assert!(drain_one(&home, "a").is_none(), "empty after draining all");
         std::fs::remove_dir_all(home).ok();
     }
 }
