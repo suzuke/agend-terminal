@@ -116,6 +116,15 @@ pub(crate) fn def_restart_instance() -> Value {
         }, "required": ["name"]}})
 }
 
+pub(crate) fn def_tokens() -> Value {
+    json!({"name": "tokens", "description": "On-demand token usage + estimated USD cost from Claude Code session transcripts (Claude backends only, Phase 1). Scans ~/.claude/projects/*.jsonl at query time, dedups streaming-duplicated rows by message id, and attributes usage to fleet instances by transcript cwd (workspace + worktree paths). action=summary → fleet totals + per-instance table; action=by_instance (requires `instance`) → that instance's per-model breakdown. Cost is an ESTIMATE pending operator pricing calibration; excludes the >200k long-context surcharge tier; non-Claude backends (Codex/OpenCode/Kiro/Gemini) are not yet covered.",
+    "inputSchema": {"type": "object", "properties": {
+        "action": {"type": "string", "enum": ["summary", "by_instance"], "default": "summary"},
+        "since": {"type": "string", "description": "Lookback window: \"24h\" (default) / \"7d\" / \"90m\" / \"all\""},
+        "instance": {"type": "string", "description": "Required for action=by_instance; optional filter for action=summary"}
+    }}})
+}
+
 pub(crate) fn def_interrupt() -> Value {
     json!({"name": "interrupt", "description": "Send ESC byte to target agent's PTY to interrupt current LLM turn. Context preserved, agent accepts next prompt.",
         "inputSchema": {"type": "object", "properties": {
@@ -484,8 +493,8 @@ mod tests {
         let tools = defs["tools"].as_array().expect("tools array");
         assert_eq!(
             tools.len(),
-            34,
-            "#1400: 33 + restart_instance = 34. \
+            35,
+            "#1400: 34 + tokens (#1077 Phase 1) = 35. \
              Current tools: {:?}",
             tools
                 .iter()

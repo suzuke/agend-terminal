@@ -63,6 +63,7 @@ mod task_events;
 mod tasks;
 mod teams;
 mod thread_census;
+mod token_cost;
 #[cfg(feature = "tray")]
 mod tray;
 mod tui;

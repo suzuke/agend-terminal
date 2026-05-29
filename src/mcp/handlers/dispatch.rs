@@ -154,6 +154,7 @@ adapter!(
     instance::handle_set_description
 );
 adapter!(dispatch_interrupt, ha, instance::handle_interrupt);
+adapter!(dispatch_tokens, ha, crate::token_cost::handle_tokens);
 adapter!(
     dispatch_delete_instance,
     ha,
@@ -529,9 +530,10 @@ mod tests {
                 "force_release_worktree",
                 "binding_state",
                 "gc_dry_run",
+                "tokens",
             ]
         );
-        assert_eq!(crate::mcp::registry::all().len(), 34);
+        assert_eq!(crate::mcp::registry::all().len(), 35);
     }
 
     #[test]

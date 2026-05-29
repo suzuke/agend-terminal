@@ -17,7 +17,7 @@ pub(crate) fn all() -> &'static [ToolEntry] {
     &ALL_TOOLS
 }
 
-static ALL_TOOLS: [ToolEntry; 34] = [
+static ALL_TOOLS: [ToolEntry; 35] = [
     // ── Channel ──
     ToolEntry {
         name: "reply",
@@ -201,5 +201,11 @@ static ALL_TOOLS: [ToolEntry; 34] = [
         name: "gc_dry_run",
         definition: super::tools::def_gc_dry_run,
         handler: super::handlers::dispatch::dispatch_gc_dry_run,
+    },
+    // ── Observability ──
+    ToolEntry {
+        name: "tokens",
+        definition: super::tools::def_tokens,
+        handler: super::handlers::dispatch::dispatch_tokens,
     },
 ];
