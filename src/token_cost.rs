@@ -13,8 +13,12 @@
 //!   3. prices the deduped totals against a hardcoded Claude table (input /
 //!      output / cache-read / cache-write split 5m vs 1h).
 //!
-//! Phase 2 (Codex `~/.codex/sessions`, OpenCode SQLite) + Kiro/Gemini
-//! (no usable token surface) are out of scope — see the issue follow-up list.
+//! Phase 2 adds Codex (`~/.codex/sessions/.../rollout-*.jsonl`,
+//! `payload.info.total_token_usage` — session-cumulative, so the MAX per file
+//! is taken, never summed), merged into the same per-instance aggregation.
+//! OpenCode is deferred (its SQLite store needs a new `rusqlite`/`sqlx`
+//! dependency — pending operator sign-off). Kiro/Gemini have no usable token
+//! surface and are reported as unsupported (never fabricated).
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -61,16 +65,36 @@ const HAIKU: ModelPricing = ModelPricing {
     cache_write_1h: 2.0,
 };
 
+// #1077 Phase 2 (Codex). ⚠️ CALIBRATION-PENDING — representative OpenAI gpt-5
+// family list prices (USD/million), captured 2026-05-29; operator must confirm
+// per exact model id (gpt-5-codex / gpt-5.x-codex / gpt-5.x). OpenAI bills no
+// cache *creation* charge (auto-cached prompt prefixes are simply discounted on
+// read), so both cache-write rates are 0. `reasoning_output_tokens` is a subset
+// of `output_tokens` and is therefore already priced at the output rate.
+const CODEX_GPT5: ModelPricing = ModelPricing {
+    input: 1.25,
+    output: 10.0,
+    cache_read: 0.125,
+    cache_write_5m: 0.0,
+    cache_write_1h: 0.0,
+};
+
 /// Resolve a `message.model` string to its pricing. Returns `(pricing,
 /// estimated)` where `estimated == true` means the model was unrecognised and
 /// the Sonnet table was used as a best-effort fallback.
 fn pricing_for(model: &str) -> (ModelPricing, bool) {
-    if model.contains("opus") {
+    let m = model.to_ascii_lowercase();
+    if m.contains("opus") {
         (OPUS, false)
-    } else if model.contains("sonnet") {
+    } else if m.contains("sonnet") {
         (SONNET, false)
-    } else if model.contains("haiku") {
+    } else if m.contains("haiku") {
         (HAIKU, false)
+    } else if m.contains("codex") || m.contains("gpt") {
+        // #1077 Phase 2: OpenAI Codex / gpt-5 family. One rate row for the
+        // family (calibration-pending); not `estimated` since the model IS
+        // recognised — the global calibration caveat covers the dollar values.
+        (CODEX_GPT5, false)
     } else {
         (SONNET, true)
     }
@@ -305,6 +329,150 @@ fn claude_projects_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude").join("projects"))
 }
 
+// ── #1077 Phase 2: Codex collector ─────────────────────────────────────────
+//
+// Source: `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`. Each session file
+// carries a `session_meta` line with `payload.cwd` (attribution), `turn_context`
+// lines with `payload.model`, and `event_msg`/`token_count` lines with
+// `payload.info.total_token_usage` — which is SESSION-CUMULATIVE, so we take
+// the MAX (final total) per file, never a sum. Verified against real files
+// 2026-05-29: `total_tokens == input_tokens + output_tokens`,
+// `cached_input_tokens ⊆ input_tokens`, `reasoning_output_tokens ⊆ output_tokens`.
+
+/// `~/.codex/sessions` — the Codex rollout root.
+fn codex_sessions_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".codex").join("sessions"))
+}
+
+/// Recursively collect `rollout-*.jsonl` files under the Y/M/D-nested root.
+fn codex_session_files(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().and_then(|x| x.to_str()) == Some("jsonl")
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("rollout-"))
+            {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// Parse one Codex session file into `(instance, model, usage)`. PURE (drives
+/// tests off a fixture string). Returns `None` when the session has no
+/// attributable `cwd`, no model, or no `token_count` line.
+///
+/// `total_token_usage` is session-cumulative → we keep the MAX-`total_tokens`
+/// occurrence (never a sum). Mapping to the shared `Agg`: uncached input =
+/// `input_tokens − cached_input_tokens`, cached → `cache_read`, `output_tokens`
+/// → output (reasoning already included), no cache-write (OpenAI has no cache-
+/// creation charge).
+fn parse_codex_session(
+    content: &str,
+    roots: &[(String, Vec<PathBuf>)],
+) -> Option<(String, String, Agg)> {
+    let mut cwd: Option<String> = None;
+    let mut model: Option<String> = None;
+    let mut best: Option<(u64, Agg)> = None;
+    for line in content.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let payload = v.get("payload");
+        if cwd.is_none() {
+            if let Some(c) = payload.and_then(|p| p.get("cwd")).and_then(Value::as_str) {
+                cwd = Some(c.to_string());
+            }
+        }
+        // Latest turn_context wins — the model in effect when the session ended.
+        if v.get("type").and_then(Value::as_str) == Some("turn_context") {
+            if let Some(m) = payload.and_then(|p| p.get("model")).and_then(Value::as_str) {
+                model = Some(m.to_string());
+            }
+        }
+        if let Some(tu) = payload
+            .and_then(|p| p.get("info"))
+            .and_then(|i| i.get("total_token_usage"))
+        {
+            let g = |k: &str| tu.get(k).and_then(Value::as_u64).unwrap_or(0);
+            let total = g("total_tokens");
+            if best.as_ref().is_none_or(|(b, _)| total >= *b) {
+                let cached = g("cached_input_tokens");
+                best = Some((
+                    total,
+                    Agg {
+                        input: g("input_tokens").saturating_sub(cached),
+                        output: g("output_tokens"),
+                        cache_read: cached,
+                        cache_write_5m: 0,
+                        cache_write_1h: 0,
+                    },
+                ));
+            }
+        }
+    }
+    let instance = attribute(Path::new(&cwd?), roots)?;
+    Some((instance, model?, best?.1))
+}
+
+/// Scan Codex rollout files → per-instance/per-model aggregates. Freshness is
+/// applied at the session-file granularity via mtime (cumulative totals can't
+/// be per-line filtered): a session untouched since the cutoff is skipped, but
+/// one spanning the cutoff still reports its full cumulative total.
+fn collect_codex(
+    sessions_dir: &Path,
+    roots: &[(String, Vec<PathBuf>)],
+    since_cutoff_ms: Option<i64>,
+) -> HashMap<String, HashMap<String, Agg>> {
+    let mut by_instance: HashMap<String, HashMap<String, Agg>> = HashMap::new();
+    for fp in codex_session_files(sessions_dir) {
+        if let Some(cutoff) = since_cutoff_ms {
+            let fresh = std::fs::metadata(&fp)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .is_none_or(|d| (d.as_millis() as i64) >= cutoff);
+            if !fresh {
+                continue;
+            }
+        }
+        let Ok(content) = std::fs::read_to_string(&fp) else {
+            continue;
+        };
+        if let Some((instance, model, usage)) = parse_codex_session(&content, roots) {
+            by_instance
+                .entry(instance)
+                .or_default()
+                .entry(model)
+                .or_default()
+                .add(&usage);
+        }
+    }
+    by_instance
+}
+
+/// Fold `src` per-instance/per-model aggregates into `dst` (additive). Used to
+/// merge the Codex collector's output into the Claude collector's so a single
+/// instance running both backends sums correctly.
+fn merge_into(
+    dst: &mut HashMap<String, HashMap<String, Agg>>,
+    src: HashMap<String, HashMap<String, Agg>>,
+) {
+    for (inst, models) in src {
+        let d = dst.entry(inst).or_default();
+        for (model, agg) in models {
+            d.entry(model).or_default().add(&agg);
+        }
+    }
+}
+
 /// Parse a `since` argument (`"24h"` / `"7d"` / `"90m"` / `"all"`) into a
 /// cutoff epoch-ms. `None` (or `"all"`) = no cutoff.
 fn parse_since(since: Option<&str>, now_ms: i64) -> Option<i64> {
@@ -389,8 +557,9 @@ fn render(
     // Text table.
     let mut table = String::new();
     table.push_str(&format!(
-        "Token usage ({since_label}) — Claude Code only. Excludes >200k long-context surcharge. \
-         Pricing is an estimate pending operator calibration.\n"
+        "Token usage ({since_label}) — Claude Code + Codex. Excludes Claude >200k long-context \
+         surcharge. Kiro/Gemini unsupported (no token telemetry source). Pricing is an estimate \
+         pending operator calibration.\n"
     ));
     table.push_str(&format!(
         "{:<18} {:>9} {:>9} {:>9} {:>9} {:>10}\n",
@@ -435,8 +604,9 @@ fn render(
     json!({
         "ok": true,
         "since": since_label,
-        "backend": "claude",
-        "note": "Claude Code only; excludes >200k long-context surcharge; pricing pending operator calibration",
+        "backends": ["claude", "codex"],
+        "unsupported_backends": ["kiro-cli", "gemini"],
+        "note": "Claude Code + Codex; Kiro/Gemini unsupported (no token telemetry source, not fabricated); excludes Claude >200k long-context surcharge; pricing pending operator calibration",
         "totals": {
             "input": grand.input,
             "output": grand.output,
@@ -481,7 +651,11 @@ pub(crate) fn handle_tokens(home: &Path, args: &Value) -> Value {
     };
 
     let roots = instance_roots(home);
-    let by_instance = collect(&projects, &roots, cutoff);
+    let mut by_instance = collect(&projects, &roots, cutoff);
+    // #1077 Phase 2: merge Codex usage into the same per-instance aggregation.
+    if let Some(codex) = codex_sessions_dir() {
+        merge_into(&mut by_instance, collect_codex(&codex, &roots, cutoff));
+    }
     render(by_instance, since_label, instance_filter)
 }
 
@@ -636,7 +810,9 @@ mod tests {
             a.cost(&p)
         );
 
-        let (_, est_unknown) = pricing_for("gpt-5-mini");
+        // A model outside the claude/gpt/codex families is unknown → estimated.
+        // (gpt-* is now recognised as the Codex family — see Phase 2.)
+        let (_, est_unknown) = pricing_for("mistral-large-2");
         assert!(est_unknown, "unknown model must flag pricing_estimated");
     }
 
@@ -707,5 +883,104 @@ mod tests {
             Some(1_000_000_000 - 604_800_000)
         );
         assert_eq!(parse_since(None, 1000), None);
+    }
+
+    // ── #1077 Phase 2: Codex collector ──
+
+    /// Build a Codex rollout fixture: session_meta(cwd) + turn_context(model) +
+    /// two cumulative token_count lines (the second strictly larger).
+    fn codex_session(cwd: &str, model: &str) -> String {
+        [
+            format!(r#"{{"type":"session_meta","payload":{{"cwd":"{cwd}"}}}}"#),
+            format!(r#"{{"type":"turn_context","payload":{{"model":"{model}"}}}}"#),
+            // earlier cumulative snapshot
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":400,"output_tokens":100,"reasoning_output_tokens":30,"total_tokens":1100}}}}"#.to_string(),
+            // final (max) cumulative snapshot
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":2000,"cached_input_tokens":800,"output_tokens":200,"reasoning_output_tokens":60,"total_tokens":2200}}}}"#.to_string(),
+        ]
+        .join("\n")
+    }
+
+    /// Cumulative usage → take the MAX snapshot (not a sum); map uncached input,
+    /// cached→cache_read, output_tokens→output (reasoning already included, NOT
+    /// double-counted); attribute via cwd.
+    #[test]
+    fn codex_session_max_not_sum_reasoning_not_doubled() {
+        let cwd = "/h/workspace/dev-a";
+        let roots = vec![("dev-a".to_string(), vec![PathBuf::from(cwd)])];
+        let content = codex_session(cwd, "gpt-5-codex");
+        let (instance, model, agg) = parse_codex_session(&content, &roots).expect("session parses");
+        assert_eq!(instance, "dev-a");
+        assert_eq!(model, "gpt-5-codex");
+        // From the MAX line only: 2000-800 uncached input, 800 cached, 200 output.
+        assert_eq!(
+            agg.input, 1200,
+            "uncached input = input - cached, max line only"
+        );
+        assert_eq!(agg.cache_read, 800);
+        assert_eq!(
+            agg.output, 200,
+            "output_tokens already includes reasoning — must not add 60 again, nor sum the two snapshots"
+        );
+        assert_eq!(
+            agg.cache_creation(),
+            0,
+            "OpenAI has no cache-creation charge"
+        );
+    }
+
+    /// A session whose cwd is not under any fleet root is skipped (None).
+    #[test]
+    fn codex_foreign_cwd_skipped() {
+        let roots = vec![(
+            "dev-a".to_string(),
+            vec![PathBuf::from("/h/workspace/dev-a")],
+        )];
+        let content = codex_session("/some/other/project", "gpt-5-codex");
+        assert!(parse_codex_session(&content, &roots).is_none());
+    }
+
+    /// Codex/gpt models resolve to the Codex pricing row (recognised, not the
+    /// estimated Claude fallback).
+    #[test]
+    fn codex_models_priced_as_codex_not_claude_fallback() {
+        for m in ["gpt-5-codex", "gpt-5.3-codex", "gpt-5.5", "GPT-5"] {
+            let (p, est) = pricing_for(m);
+            assert!(!est, "{m} must be a recognised model");
+            assert_eq!(p.output, CODEX_GPT5.output, "{m} must use Codex pricing");
+            assert_eq!(p.cache_write_5m, 0.0, "{m} has no cache-creation rate");
+        }
+    }
+
+    /// Cross-backend merge: same instance, Claude + Codex models, sums per model.
+    #[test]
+    fn merge_combines_claude_and_codex_per_instance() {
+        let mut claude: HashMap<String, HashMap<String, Agg>> = HashMap::new();
+        claude.entry("dev-a".into()).or_default().insert(
+            "claude-opus-4-8".into(),
+            Agg {
+                input: 10,
+                output: 20,
+                ..Agg::default()
+            },
+        );
+        let mut codex: HashMap<String, HashMap<String, Agg>> = HashMap::new();
+        codex.entry("dev-a".into()).or_default().insert(
+            "gpt-5-codex".into(),
+            Agg {
+                input: 5,
+                output: 7,
+                ..Agg::default()
+            },
+        );
+        merge_into(&mut claude, codex);
+        let dev_a = claude.get("dev-a").expect("dev-a present");
+        assert_eq!(
+            dev_a.len(),
+            2,
+            "both backend models coexist under one instance"
+        );
+        assert_eq!(dev_a.get("gpt-5-codex").unwrap().output, 7);
+        assert_eq!(dev_a.get("claude-opus-4-8").unwrap().input, 10);
     }
 }
