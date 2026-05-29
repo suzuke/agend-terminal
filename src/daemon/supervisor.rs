@@ -301,12 +301,12 @@ pub(crate) fn check_pane_input_not_submitted_for_agents(
     }
 }
 
-/// Sprint 54 P2-3: backend allowlist for submit detection. Hard-coded
-/// claude-only first round per dispatch — extending to other backends
-/// requires both wiring `record_submit_activity` in
-/// `app::write_to_focused` AND adding the matching arm here. Resolves
-/// the agent's backend via fleet.yaml so per-instance overrides are
-/// honoured.
+/// Backend support for submit detection. #1457 widened this from the
+/// Sprint 54 P2-3 claude-only first round to ALL backends that declare a
+/// submit key — paired with `app::pane_input_contains_submit` (which now
+/// records the submit timestamp for every backend). Resolves the agent's
+/// backend via fleet.yaml so per-instance overrides are honoured. A backend
+/// with no submit key (Shell/Raw) is unsupported (can't detect submission).
 fn pane_input_backend_supported(home: &std::path::Path, agent: &str) -> bool {
     let Ok(fleet) = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)) else {
         return false;
@@ -315,7 +315,7 @@ fn pane_input_backend_supported(home: &std::path::Path, agent: &str) -> bool {
         return false;
     };
     crate::backend::Backend::from_command(&resolved.backend_command)
-        .map(|b| matches!(b, crate::backend::Backend::ClaudeCode))
+        .map(|b| !b.preset().submit_key.is_empty())
         .unwrap_or(false)
 }
 
@@ -1566,8 +1566,10 @@ mod tests {
     }
 
     #[test]
-    fn pane_input_not_submitted_skips_non_claude_backend() {
-        // kiro-cli is NOT on the submit-detection allowlist (claude-only first round).
+    fn pane_input_not_submitted_now_fires_for_non_claude_backend() {
+        // #1457: submit detection widened from claude-only to ALL backends with
+        // a submit key. kiro-cli (submit_key=`\r`) is now supported, so a
+        // typed-but-not-submitted kiro pane MUST emit the diagnostic.
         let agent = "kiro-agent-pin-nonclaude";
         let home = fleet_with_backend("pin_nonclaude", agent, "kiro-cli");
         let now_ms = chrono::Utc::now().timestamp_millis();
@@ -1580,19 +1582,18 @@ mod tests {
         let mut tracks: HashMap<String, PaneInputTrack> = HashMap::new();
         check_pane_input_not_submitted_for_agents(&home, &[agent.to_string()], &mut tracks);
         let events = sink.events.lock();
-        for e in events.iter() {
-            if let crate::channel::ux_event::UxEvent::Fleet(
-                crate::channel::ux_event::FleetEvent::PaneInputNotSubmitted {
-                    agent: emitted, ..
-                },
-            ) = e
-            {
-                assert_ne!(
-                    emitted, agent,
-                    "non-claude backend must be skipped per allowlist"
-                );
-            }
-        }
+        let fired = events.iter().any(|e| {
+            matches!(
+                e,
+                crate::channel::ux_event::UxEvent::Fleet(
+                    crate::channel::ux_event::FleetEvent::PaneInputNotSubmitted { agent: emitted, .. },
+                ) if emitted == agent
+            )
+        });
+        assert!(
+            fired,
+            "non-claude backend with a submit key must now emit PaneInputNotSubmitted (#1457)"
+        );
         std::env::remove_var("AGEND_PANE_INPUT_THRESHOLD_SECS");
         std::fs::remove_dir_all(home).ok();
     }

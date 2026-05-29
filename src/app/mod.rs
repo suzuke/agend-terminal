@@ -1053,9 +1053,12 @@ fn pane_input_contains_submit(backend: Option<&crate::backend::Backend>, bytes: 
     let Some(b) = backend else {
         return false;
     };
-    if !matches!(b, crate::backend::Backend::ClaudeCode) {
-        return false;
-    }
+    // #1457: detect the submit key for ALL backends (was claude-only). Without
+    // this, non-claude panes never record a submit timestamp, so `draft_state`
+    // would see `submit=0` and treat every keystroke as a permanent unsent
+    // draft → notifications would NEVER deliver to them (worse than the bug
+    // this fixes). `submit_key` is `\r` for every preset; the empty-key guard
+    // below no-ops backends (Shell/Raw) that declare no submit key.
     let submit = b.preset().submit_key.as_bytes();
     if submit.is_empty() || bytes.len() < submit.len() {
         return false;
@@ -1100,28 +1103,44 @@ fn flush_notifications_for_pane<F>(home: &Path, pane: &mut Pane, mut injector: F
 where
     F: FnMut(&str) -> anyhow::Result<()>,
 {
-    if pane.pending_notification_count == 0
-        || notification_queue::is_composing(home, &pane.agent_name)
-    {
+    if pane.pending_notification_count == 0 {
         return;
     }
-    let queued = notification_queue::drain(home, &pane.agent_name);
-    if queued.is_empty() {
-        pane.pending_notification_count = 0;
-        return;
-    }
-
-    let mut failed_at = None;
-    for (idx, notification) in queued.iter().enumerate() {
-        if injector(&notification.text).is_err() {
-            failed_at = Some(idx);
-            break;
+    // #1457: gate on draft state (input-vs-submit order), not the 3s idle
+    // window. Drafting → defer everything; Abandoned → escape valve releases
+    // just the oldest (trickle, no clobbering batch); None (clean buffer) →
+    // drain the whole backlog.
+    match notification_queue::draft_state(home, &pane.agent_name) {
+        notification_queue::DraftState::Drafting => {}
+        notification_queue::DraftState::Abandoned => {
+            if let Some(notification) = notification_queue::drain_one(home, &pane.agent_name) {
+                if injector(&notification.text).is_err() {
+                    notification_queue::requeue_all(home, &pane.agent_name, &[notification]);
+                }
+            }
+            pane.pending_notification_count =
+                notification_queue::pending_count(home, &pane.agent_name);
+        }
+        notification_queue::DraftState::None => {
+            let queued = notification_queue::drain(home, &pane.agent_name);
+            if queued.is_empty() {
+                pane.pending_notification_count = 0;
+                return;
+            }
+            let mut failed_at = None;
+            for (idx, notification) in queued.iter().enumerate() {
+                if injector(&notification.text).is_err() {
+                    failed_at = Some(idx);
+                    break;
+                }
+            }
+            if let Some(idx) = failed_at {
+                notification_queue::requeue_all(home, &pane.agent_name, &queued[idx..]);
+            }
+            pane.pending_notification_count =
+                notification_queue::pending_count(home, &pane.agent_name);
         }
     }
-    if let Some(idx) = failed_at {
-        notification_queue::requeue_all(home, &pane.agent_name, &queued[idx..]);
-    }
-    pane.pending_notification_count = notification_queue::pending_count(home, &pane.agent_name);
 }
 
 /// Adjust scroll offset of the focused pane by `delta` lines (positive = up, negative = down).
@@ -1181,6 +1200,35 @@ mod tests {
     use super::*;
     use crate::layout::PaneSource;
     use crate::vterm::VTerm;
+
+    /// #1457 regression guard: submit detection must fire for ALL backends, not
+    /// just claude. If this regresses to claude-only, non-claude panes never
+    /// record a submit timestamp → `draft_state` sees `submit=0` → every
+    /// keystroke looks like a permanent unsent draft → notifications NEVER
+    /// deliver to them (strictly worse than the bug #1457 fixes).
+    #[test]
+    fn submit_detection_fires_for_all_backends() {
+        use crate::backend::Backend;
+        for b in [
+            Backend::ClaudeCode,
+            Backend::Codex,
+            Backend::Gemini,
+            Backend::KiroCli,
+            Backend::OpenCode,
+            Backend::Agy,
+        ] {
+            assert!(
+                pane_input_contains_submit(Some(&b), b"hello\r"),
+                "submit key must be detected for {b:?}"
+            );
+            assert!(
+                !pane_input_contains_submit(Some(&b), b"hello"),
+                "no submit key in plain text for {b:?}"
+            );
+        }
+        // No backend → never a submit (anonymous/unknown pane).
+        assert!(!pane_input_contains_submit(None, b"hello\r"));
+    }
 
     fn tmp_home(suffix: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

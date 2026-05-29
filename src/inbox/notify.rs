@@ -434,7 +434,12 @@ pub(super) fn route_notification<F>(
 where
     F: FnMut(&str) -> anyhow::Result<()>,
 {
-    if crate::notification_queue::is_composing(home, agent_name) {
+    // #1457: queue (defer) whenever an unsent draft exists — both while the
+    // operator is actively composing and after the escape window (the flush
+    // path trickles the backlog out one-at-a-time once abandoned). Inject
+    // directly only when the buffer is clean (all typed input was submitted).
+    use crate::notification_queue::DraftState;
+    if crate::notification_queue::draft_state(home, agent_name) != DraftState::None {
         crate::notification_queue::enqueue(home, agent_name, notification)?;
         return Ok(());
     }
