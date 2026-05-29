@@ -53,7 +53,7 @@ gh pr checks <PR#>
 - If any check is `pending`, wait and re-check
 - If any check is `fail`, block merge and report to implementer
 
-**Rationale:** Sprint 61 incident — ci_watch emitted false [ci-pass] on partial completion, leading to merge of failing code.
+`↳ 緣由 A-§3.3.1`
 
 ### 3.4 Re-review (r2) Dispatch
 Must enumerate r1 findings with status: fixed / deferred / withdrawn. Missing → reviewer falls back to `full_review`.
@@ -103,8 +103,6 @@ Fleet-internal verdict MUST mirror to GH PR comment (`gh pr comment`). Self-merg
 
 The canonical self-merge invocation is `gh pr merge <N> --auto --squash --delete-branch` (requires `gh` CLI >= 2.31.0). `--auto` moves merge submission to GitHub's server-side queue, eliminating the "Base branch was modified" race observed in #971 close-loop (2026-05-20).
 
-**Activation status**: ACTIVE as of 2026-05-20 after #986 gh-poll integration shipped (PR #990, merge commit 4242c24). Prior to this date the canonical form was the legacy synchronous `gh pr merge <N> --squash --delete-branch` because `--auto`'s async-return discarded the synchronous merge confirmation. With #972 PR-state aggregator + #986 gh-poll integration both live, the `[pr-merged]` event now fires from real GitHub observation post-merge, restoring async-flow visibility and unlocking this default switch.
-
 **Prerequisites** (one-time per repo, enabled in #973):
 - `allow_auto_merge: true` at repo level (`gh api repos/<owner>/<repo> -X PATCH -F allow_auto_merge=true`)
 - Branch protection on `main` with `required_status_checks.strict=true` covering the full CI matrix (`Check (ubuntu-latest|macos-latest|windows-latest)`, `LOC overrun`, `audit`). Without `strict=true`, `--auto` invoked after all checks already reported merges IMMEDIATELY — silently skipping the §3.12 conjunction gate. With `strict=true`, GitHub re-checks against current main before merging.
@@ -124,9 +122,7 @@ Recovery, in order:
 - (d) Last resort — manual fallback: `gh pr merge <N> --squash --delete-branch` (synchronous; may hit base-modified race; retry 3s later if it does)
 - Notify lead via `send(kind=update)` if escape-hatch invoked, with case (a)/(b)/(c)/(d) identifier.
 
-**Async confirmation pipeline (#972 + #986)**: `--auto` returns immediately, so the synchronous "PR merged at SHA" terminal feedback is gone. The daemon PR-state aggregator (#972, merged be23875) + gh-poll integration (#986, merged 4242c24) together emit `[pr-merged]` events to the PR author's inbox after observing the GitHub-side merge. Author waits for the event rather than polling.
-
-**Activation history**: §3.12.1 was introduced in #973 (this rule's home PR) but kept INACTIVE until #972 + #986 both shipped. Activation switch landed 2026-05-20 as a docs-only follow-up (flips canonical form from legacy `gh pr merge ... --squash --delete-branch` to `gh pr merge ... --auto --squash --delete-branch`).
+`↳ 緣由 / 活化史 A-§3.12.1`
 
 ### 3.13 Log-level Changes (was §3.5.14)
 Must have inline rationale, otherwise `LEVEL-CHANGE-RATIONALE-ABSENT — UNVERIFIED`.
@@ -138,7 +134,7 @@ Must include e2e integration test exercising the production hook path.
 PRs touching daemon core / channel / supervisor / state.rs must include stress test + lock-ordering analysis before dispatch. "不急 ship" principle — correctness over velocity for infrastructure changes.
 
 ### 3.16 Phase 1 Discussion Discipline (Sprint 62)
-**Pre-impl source-code spike is mandatory.** Lead's initial proposal MUST be challenged by dev's 5-10min source-code spike before Phase 2 dispatch. Rationale: lead's "from-code-structure" inference consistently misses scope holes (8/12 PRs in 2026-05-14 retrospective). Spike outputs:
+**Pre-impl source-code spike is mandatory.** Lead's initial proposal MUST be challenged by dev's 5-10min source-code spike before Phase 2 dispatch. Spike outputs:
 - Confirm or refute lead's initial site count
 - Surface bonus emission sites lead missed
 - Distinguish "near-bug" from "asserts-on-bug-signature" (issue body counts often conflate)
@@ -180,7 +176,7 @@ Enforcement: L2 `agend-git` shim refuses `checkout -b` and `checkout <sha>` from
 
 ### 3.19.1 Agent Git Anti-Patterns
 
-§3.19 names what reviewers must not do. This section names two failure modes — both surfaced empirically by the #863 reviewer incident — and the correct recovery path. Apply to every agent, not only reviewers.
+§3.19 names what reviewers must not do. This section names two failure modes and the correct recovery path. Apply to every agent, not only reviewers. `↳ 緣由 A-§3.19.1`
 
 **Anti-pattern 1 — `AGEND_GIT_BYPASS=1` to escape a shim deny.**
 
@@ -192,7 +188,7 @@ When the `agend-git` shim denies an agent action, the deny is a protocol signal,
 Reasoning:
 
 - `AGEND_GIT_BYPASS=1` exists for **daemon-internal helpers** (`canonical_hygiene`, `branch_sweep`, `conflict_notify`) that read worktree state from canonical-rooted paths and would otherwise self-deny. It is not an escape hatch for agents.
-- The bypass typically surfaces hidden state on top of the original problem. In the #863 incident, bypassing a checkout deny materialized a phantom `.gitignore` conflict that did not exist on the target branch, leaving the reviewer stuck on a fabricated merge conflict.
+- The bypass typically surfaces hidden state on top of the original problem.
 - "Ask, don't bypass" is the universal recovery: a deny means the daemon owns the routing answer, and asking is cheap.
 
 **Anti-pattern 2 — `git checkout <sha>` to materialize a PR review.**
@@ -224,13 +220,13 @@ Use one of:
 
 **NEVER** in-place `git checkout` of an impl branch in the agent's base workspace dir.
 
-Rationale: incident 2026-05-20 — fixup-reviewer base dir was found stuck on `fix/900-spawn-env-propagation` with 492 deletion markers from a 2026-05-18 in-place checkout that was never reverted. Recovery cost session backend state (`.codex/.claude/.gemini/.kiro/.opencode/AGENTS.md` removed by `git clean -fd` because those dirs weren't in the fix/900-era `.gitignore`). The reflog showed the original Sprint discipline used `review/NNN-r0` per-PR worktrees correctly (2026-05-16 entries), then drifted to in-place checkouts.
+`↳ 緣由 A-§3.19.2`
 
 **Relationship to §3.19.** §3.19 forbids checkout in CANONICAL. §3.19.2 forbids in-place checkout in the agent's BASE WORKSPACE. Both protect against stale-branch pollution at different boundaries.
 
 ### 3.20 Race-Condition PR Discipline
 
-Race-class PRs ship with hidden timing dependencies that pass CI + reviewer VERIFIED yet break production. Empirical motivation: #881 ("app mode never owns the daemon") shipped CI green + reviewer VERIFIED on 2026-05-17, then surfaced a spawn-and-attach race on the first cold-start with a slow filesystem flush. Operator reverted at 470c251; #882 reopen fix shipped at 0fd89e8 with a probe_api gate + `--foreground` mode + actionable error path. The lessons below apply to every spawn / async-coordination / multi-process-startup PR (the "race class"); same discipline framing as §3.19.1.
+Race-class PRs ship with hidden timing dependencies that pass CI + reviewer VERIFIED yet break production. The lessons below apply to every spawn / async-coordination / multi-process-startup PR (the "race class"); same discipline framing as §3.19.1. `↳ 緣由 A-§3.20`
 
 **SOP 1 — Pre-r0 race-condition question.**
 
@@ -241,8 +237,6 @@ Race class includes — but is not limited to — `tokio::spawn` / `thread::spaw
 **SOP 2 — Post-merge operator smoke sanity check (NOT a merge gate).**
 
 Race-class PRs merge once SOP 1 (deterministic RED→GREEN tests) AND SOP 3 (reviewer RED-protocol) are both satisfied. SOP 2 is a **post-merge sanity check**, not a pre-merge gate.
-
-Empirical motivation: a pre-merge smoke gate creates a chicken-and-egg problem. The operator's daily binary runs from main; to smoke an unmerged race-class PR they must (a) build from the branch manually and (b) point `$AGEND_HOME` away from their daily setup. The gate then blocks merge until smoke confirms — but smoke can't run without operator side-work that breaks the merge flow. PR #908 (2026-05-18 #896 fix) stalled exactly on this loop; operator directive at the time: "smoke gate會造成 chicken-and-egg的問題，要拿掉".
 
 **Post-merge smoke procedure**:
 
@@ -271,7 +265,7 @@ git checkout <fix-head>
 # Confirm GREEN: tests pass without flakiness on three back-to-back runs.
 ```
 
-The verdict body MUST explicitly state the protocol execution: "Checked out pre-fix base `<sha>` in this worktree. Verified target tests absent/failing there [by source grep / by cargo test exit code]. Reapplied fix HEAD; tests pass 3/3 runs." Fixup-reviewer's #882 verdict is the bar — it included verbatim: "Checked out pre-fix revert base 470c251 in this worktree. Verified target helper/tests are absent there by source grep."
+The verdict body MUST explicitly state the protocol execution: "Checked out pre-fix base `<sha>` in this worktree. Verified target tests absent/failing there [by source grep / by cargo test exit code]. Reapplied fix HEAD; tests pass 3/3 runs."
 
 Reviewers who skip the protocol on a race-class PR get `RUBBER-STAMP — UNVERIFIED` per §3.16 substantive-consensus requirement. The PR returns to dev for explicit reviewer RED-protocol execution before re-dispatch.
 
@@ -413,7 +407,9 @@ cargo --version
 cargo --version | grep -qE "^cargo [0-9]"
 ```
 
-Stale `rustup-init` binaries can masquerade as `cargo` / `rustc` / `rustfmt` when cache restores them to the proxy path. Exit-0 alone does NOT prove identity. Pattern caught 2026-05-14 PR #772 v1 → v3 evolution; v1's `cargo --version` exit check missed pollution; v2 detection-recover failed; v3 `cache-bin: false` prevention shipped.
+Stale `rustup-init` binaries can masquerade as `cargo` / `rustc` / `rustfmt` when cache restores them to the proxy path. Exit-0 alone does NOT prove identity.
+
+`↳ 緣由 A-§7.1`
 
 **Cache pollution requires prevention OR validated cleanup.** Detection alone is insufficient if recovery surface is harder than prevention. KISS: prefer "don't cache the polluted directory" (`Swatinem/rust-cache@v2 with cache-bin: false`) over "detect stale state and rm + reset". Recovery code itself becomes maintenance burden + new failure surface.
 
@@ -451,7 +447,7 @@ The fresh CI run fires on the new HEAD; the old wedged run becomes irrelevant (i
 - **NOT a workaround for legitimate test failures.** A failing test means a real bug. The nudge only addresses runners that genuinely wedged with no progress — same configuration that was working minutes ago would re-pass on a fresh runner.
 - **NOT for "tests are slow".** Slow-but-progressing CI is a different problem (cache miss, fixture cost). Wait for normal completion; if the slowness is systemic, file a separate issue.
 
-**Empirical motivation**: PR #863 (#852 residual PR-A) hit a `windows-latest` wedge on 2026-05-16. The job stayed `in_progress` for 9+ hours starting at 15:19 UTC; `gh run cancel` was accepted but the job never transitioned. Empty-commit nudge dispatched at 16:14 UTC → fresh CI fired → green within ~10 min → merge proceeded. Operator-authorized, ~5 min total recovery vs. the alternative (wait 6 hours for GH-Actions timeout + manual re-trigger).
+`↳ 緣由 A-§7.3`
 
 This recovery technique parallels [§3.19.1](#3191-agent-git-anti-patterns)'s framing for protocol-gate recovery: a deny / wedge is a signal, not a transient error. Document the sanctioned response so future operators don't reach for force-push or `gh run rerun --failed` (which re-runs the same wedged platform on the same SHA, often re-wedging on the same runner-pool resource).
 
@@ -658,11 +654,52 @@ When fixing a daemon binding bug (or any bug whose existence prevents the bypass
 3. After this PR merges + daemon binary updates, all subsequent PRs revert to ZERO BYPASS workflow
 4. Operator authorization required if scope expands beyond commit/push (e.g. into worktree manipulation)
 
+`↳ 緣由 A-§13.5`
+
+---
+
+## Appendix A — Rationale & Incident Log
+
+The *why* and *when* behind normative rules. Incident narratives, activation histories, and empirical motivations relocated here from the rule text; referenced from the normative layer via `↳ 緣由 A-§X`. Reading this is optional unless you are questioning or revising a rule.
+
+### A-§3.3.1 — CI Verification Gate
+Sprint 61 incident — ci_watch emitted false [ci-pass] on partial completion, leading to merge of failing code.
+
+### A-§3.12.1 — `gh pr merge --auto` adoption
+**Activation status**: ACTIVE as of 2026-05-20 after #986 gh-poll integration shipped (PR #990, merge commit 4242c24). Prior to this date the canonical form was the legacy synchronous `gh pr merge <N> --squash --delete-branch` because `--auto`'s async-return discarded the synchronous merge confirmation. With #972 PR-state aggregator + #986 gh-poll integration both live, the `[pr-merged]` event now fires from real GitHub observation post-merge, restoring async-flow visibility and unlocking this default switch.
+
+**Async confirmation pipeline (#972 + #986)**: `--auto` returns immediately, so the synchronous "PR merged at SHA" terminal feedback is gone. The daemon PR-state aggregator (#972, merged be23875) + gh-poll integration (#986, merged 4242c24) together emit `[pr-merged]` events to the PR author's inbox after observing the GitHub-side merge. Author waits for the event rather than polling.
+
+**Activation history**: §3.12.1 was introduced in #973 (this rule's home PR) but kept INACTIVE until #972 + #986 both shipped. Activation switch landed 2026-05-20 as a docs-only follow-up (flips canonical form from legacy `gh pr merge ... --squash --delete-branch` to `gh pr merge ... --auto --squash --delete-branch`).
+
+### A-§3.16 — Phase 1 Discussion Discipline
+Rationale: lead's "from-code-structure" inference consistently misses scope holes (8/12 PRs in 2026-05-14 retrospective).
+
+### A-§3.19.1 — Agent Git Anti-Patterns
+Both failure modes surfaced empirically by the #863 reviewer incident. The bypass typically surfaces hidden state on top of the original problem: in the #863 incident, bypassing a checkout deny materialized a phantom `.gitignore` conflict that did not exist on the target branch, leaving the reviewer stuck on a fabricated merge conflict.
+
+### A-§3.19.2 — Reviewer Base Workspace Branch Discipline
+Incident 2026-05-20 — fixup-reviewer base dir was found stuck on `fix/900-spawn-env-propagation` with 492 deletion markers from a 2026-05-18 in-place checkout that was never reverted. Recovery cost session backend state (`.codex/.claude/.gemini/.kiro/.opencode/AGENTS.md` removed by `git clean -fd` because those dirs weren't in the fix/900-era `.gitignore`). The reflog showed the original Sprint discipline used `review/NNN-r0` per-PR worktrees correctly (2026-05-16 entries), then drifted to in-place checkouts.
+
+### A-§3.20 — Race-Condition PR Discipline
+Empirical motivation: #881 ("app mode never owns the daemon") shipped CI green + reviewer VERIFIED on 2026-05-17, then surfaced a spawn-and-attach race on the first cold-start with a slow filesystem flush. Operator reverted at 470c251; #882 reopen fix shipped at 0fd89e8 with a probe_api gate + `--foreground` mode + actionable error path.
+
+Why SOP 2 is post-merge, not a gate: a pre-merge smoke gate creates a chicken-and-egg problem. The operator's daily binary runs from main; to smoke an unmerged race-class PR they must (a) build from the branch manually and (b) point `$AGEND_HOME` away from their daily setup. The gate then blocks merge until smoke confirms — but smoke can't run without operator side-work that breaks the merge flow. PR #908 (2026-05-18 #896 fix) stalled exactly on this loop; operator directive at the time: "smoke gate會造成 chicken-and-egg的問題，要拿掉".
+
+The bar for SOP 3 — fixup-reviewer's #882 verdict, verbatim: "Checked out pre-fix revert base 470c251 in this worktree. Verified target helper/tests are absent there by source grep."
+
+### A-§7.1 — CI Tool Identity & Cache Hygiene
+Pattern caught 2026-05-14 PR #772 v1 → v3 evolution; v1's `cargo --version` exit check missed pollution; v2 detection-recover failed; v3 `cache-bin: false` prevention shipped.
+
+### A-§7.3 — Wedged-Run Recovery
+PR #863 (#852 residual PR-A) hit a `windows-latest` wedge on 2026-05-16. The job stayed `in_progress` for 9+ hours starting at 15:19 UTC; `gh run cancel` was accepted but the job never transitioned. Empty-commit nudge dispatched at 16:14 UTC → fresh CI fired → green within ~10 min → merge proceeded. Operator-authorized, ~5 min total recovery vs. the alternative (wait 6 hours for GH-Actions timeout + manual re-trigger).
+
+### A-§13.5 — Bug-Blocks-Its-Own-Fix Exception
 Reference: PR #779 (Sprint 61) Option 1 + Option 3 daemon binding fix shipped under this exception. PR #781 + #800 followed standard ZERO BYPASS workflow.
 
 ---
 
-## Appendix: Section Number Map (old → new)
+## Appendix B — Section Number Map (old → new)
 
 | Old (v1 full) | New (condensed) |
 |---|---|
