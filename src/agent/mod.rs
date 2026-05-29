@@ -1152,17 +1152,16 @@ fn pty_read_loop(
                 // won't defeat us (VTerm resolves the geometry). Cooldown: 10s.
                 let screen = {
                     let mut c = core.lock();
-                    // #919: push the raw PTY bytes (still containing
-                    // ANSI escapes) into the state tracker's anchor
-                    // ring BEFORE `vterm.process` consumes / strips
-                    // them. Used by the red-SGR anchor gate to
-                    // discriminate real backend errors from prose
-                    // copied via inject_to_agent (which strips ANSI).
-                    c.state.feed_raw(data);
                     c.vterm.process(data);
                     let rows = c.vterm.rows() as usize;
-                    let screen = c.vterm.tail_lines(rows);
-                    c.state.feed(&screen);
+                    // #1450: pull the screen text together with the per-char
+                    // foreground color mask. The HIGH_FP color anchor reads
+                    // the mask off the resolved grid cells (alacritty has
+                    // already normalized 16/256/truecolor SGR), replacing the
+                    // #919 raw-byte SGR ring that missed truecolor and broke
+                    // on Ink redraw fragmentation.
+                    let (screen, fg) = c.vterm.tail_lines_with_fg(rows);
+                    c.state.feed_with_fg(&screen, &fg);
                     c.subscribers.retain(|tx| tx.send(data.to_vec()).is_ok());
                     screen
                 };

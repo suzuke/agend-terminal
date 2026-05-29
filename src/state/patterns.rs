@@ -581,21 +581,22 @@ impl StatePatterns {
 
     /// Match against state buffer, return highest-priority matching state.
     ///
-    /// #919: production calls now go through `detect_with_match` (which
-    /// returns the matched substring for red-SGR anchoring); this thin
-    /// wrapper is retained for tests + future callers that only need
-    /// the state.
+    /// #919/#1450: production calls now go through `detect_with_match`
+    /// (which returns the matched substring so the VTerm cell-color anchor
+    /// can locate every on-screen occurrence of the phrase and check its
+    /// rendered color); this thin wrapper is retained for tests + future
+    /// callers that only need the state.
     #[allow(dead_code)] // Test seam + backward-compat; prod uses detect_with_match.
     pub fn detect(&self, text: &str) -> Option<AgentState> {
         self.detect_with_match(text).map(|(s, _)| s)
     }
 
-    /// #919: detect + return the matched substring so callers can
-    /// anchor it against the raw-chunk ring's red-SGR proximity check.
-    /// Returns `Some((state, matched_text))` on first hit, `None` if
-    /// no pattern matches. Matched text is the regex `Match::as_str()`
-    /// slice (smallest match) — passing this to `has_red_ansi_anchor`
-    /// keeps the byte-substring search precise.
+    /// #919/#1450: detect + return the matched substring so callers can
+    /// locate the phrase's rendered grid cells and check their foreground
+    /// color (#1450 replaced the raw-byte SGR ring with VTerm cell color).
+    /// Returns `Some((state, matched_text))` on first hit, `None` if no
+    /// pattern matches. Matched text is the regex `Match::as_str()` slice
+    /// (smallest match).
     pub fn detect_with_match<'a>(&self, text: &'a str) -> Option<(AgentState, &'a str)> {
         // Patterns are already in priority order (highest first)
         for (state, re) in &self.patterns {

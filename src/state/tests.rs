@@ -1,7 +1,7 @@
-use super::anchor::{find_subslice, ANCHOR_WINDOW_MS};
 use super::patterns::is_generic_startup_prompt;
 use super::*;
 use crate::health::HealthTracker;
+use crate::vterm::CellFg;
 
 /// Create a tracker with a given current state and elapsed time since that state began.
 fn tracker_at(backend: &Backend, state: AgentState, elapsed_secs: u64) -> StateTracker {
@@ -944,12 +944,15 @@ fn ready_pattern_lifts_awaiting_operator() {
 
 use crate::vterm::VTerm;
 
-/// Drive one full PTY cycle: process bytes, snapshot screen, feed state.
+/// Drive one full PTY cycle: process bytes, snapshot screen + color mask,
+/// feed state. Mirrors the production `agent::pty_read` seam exactly
+/// (`tail_lines_with_fg` + `feed_with_fg`), so the #1450 color anchor is
+/// exercised end-to-end through the real vterm — no hand-written escapes.
 fn drive(vterm: &mut VTerm, state: &mut StateTracker, bytes: &[u8]) {
     vterm.process(bytes);
     let rows = vterm.rows() as usize;
-    let screen = vterm.tail_lines(rows);
-    state.feed(&screen);
+    let (screen, fg) = vterm.tail_lines_with_fg(rows);
+    state.feed_with_fg(&screen, &fg);
 }
 
 #[test]
@@ -2399,165 +2402,266 @@ fn discussion_text_does_not_trigger_rate_limit_any_backend() {
     );
 }
 
-// ── #919 Phase A: red-SGR anchor tests ──────────────────────────────
+// ── #1450 Phase A: VTerm cell-color anchor tests ────────────────────
 //
-// The anchor gate suppresses HIGH_FP pattern matches that lack a
-// red SGR escape in the raw-byte ring within ANCHOR_WINDOW_BYTES /
-// ANCHOR_WINDOW_MS of the matched phrase. The 4 tests pin:
-//   1. anchor_suppresses_prose_match — prose injected without
-//      color → pattern matches but anchor fails → no transition
-//   2. anchor_allows_backend_error — same phrase with red SGR
-//      nearby → pattern matches AND anchor succeeds → transition
-//   3. ring_buffer_rotation — ring caps at RAW_RING_CHUNKS; oldest
-//      entries evicted (no panic; bounded memory)
-//   4. window_ms_expiry — chunks older than ANCHOR_WINDOW_MS are
-//      ignored by the anchor check
+// #1450 replaced the #919 raw-byte red-SGR ring with a check on the
+// RESOLVED vterm grid-cell foreground color. These tests drive REAL SGR
+// byte streams through the vterm (via `drive`), exercising the exact
+// production seam (`tail_lines_with_fg` + `feed_with_fg`) rather than
+// hand-asserted color flags.
 //
-// All tests are §3.20 SOP 1 deterministic — no sleep-based timing
-// assertions; window_ms_expiry mutates the ring's chunk timestamps
-// directly via a test seam.
+// The #919 RCA: its sole fixture hand-wrote an idealized
+// `\x1b[31m`+contiguous-phrase shape that the production
+// COLORTERM=truecolor PTY never produces — so truecolor reds and Ink
+// redraw fragmentation went untested and the anchor silently suppressed
+// real rate-limit errors (operator incident 2026-05-29). This suite
+// exercises all three SGR encodings × single/fragmented framing (FN
+// matrix) and the plain-prose false-positive classes (FP matrix), and
+// asserts the INTENDED contract, never the buggy pre-fix output.
 
-/// #919 RED 1: HIGH_FP phrase appears in screen text (post-vterm
-/// strip) but the raw ring has no red SGR near the phrase →
-/// transition suppressed. Pre-#919 behavior: bare pattern match
-/// fires transition unconditionally. Post-#919: suppressed.
-#[test]
-fn anchor_suppresses_prose_match_without_red_sgr() {
-    let backend = Backend::ClaudeCode;
-    let mut tracker = StateTracker::new(Some(&backend));
-    // Simulate the inject_to_agent path: ANSI-stripped prose lands
-    // in the raw ring with no color codes.
-    let prose = b"[AGEND-MSG] Server is temporarily limiting requests";
-    tracker.feed_raw(prose);
-    // The screen (post-vterm strip) would contain the same phrase.
-    tracker.feed(std::str::from_utf8(prose).expect("ASCII test fixture"));
-    assert_ne!(
-        tracker.get_state(),
-        AgentState::ServerRateLimit,
-        "#919: HIGH_FP match without red-SGR anchor must NOT fire transition. Got state {:?}",
-        tracker.get_state()
-    );
+/// Full Claude-Code rate-limit error line. The ServerRateLimit regex
+/// matches the `Server is temporarily limiting requests` substring.
+const SRL_LINE: &str = "API Error: Server is temporarily limiting requests (not your usage limit)";
+
+// Red in each of the three SGR encodings the daemon's COLORTERM=truecolor
+// PTY can elicit from a chalk/Ink backend.
+const RED_16: &str = "\x1b[31m"; // standard 16-color red
+const RED_256: &str = "\x1b[38;5;196m"; // 256-color cube red (r=5,g=0,b=0)
+const RED_TRUE: &str = "\x1b[38;2;215;40;40m"; // 24-bit truecolor red (chalk-style)
+const SGR_RESET: &str = "\x1b[0m";
+
+/// Render a colored error line in ONE PTY write (single chunk).
+fn drive_colored_line(vt: &mut VTerm, st: &mut StateTracker, sgr: &str, text: &str) {
+    let bytes = format!("\x1b[2J\x1b[H{sgr}{text}{SGR_RESET}\r\n");
+    drive(vt, st, bytes.as_bytes());
 }
 
-/// #919 RED 2: HIGH_FP phrase with red SGR nearby in raw ring →
-/// transition fires (the real backend-error path).
-#[test]
-fn anchor_allows_backend_error_with_red_sgr() {
-    let backend = Backend::ClaudeCode;
-    let mut tracker = StateTracker::new(Some(&backend));
-    // Real backend error: red SGR wraps the phrase.
-    let raw_error = b"\x1b[31mServer is temporarily limiting requests\x1b[0m";
-    tracker.feed_raw(raw_error);
-    // Post-vterm-strip screen view: SGR escapes stripped, phrase
-    // intact. (Simulated here; in production the vterm does the
-    // strip.)
-    tracker.feed("Server is temporarily limiting requests");
-    assert_eq!(
-        tracker.get_state(),
-        AgentState::ServerRateLimit,
-        "#919: HIGH_FP match WITH red-SGR anchor must fire transition. Got state {:?}",
-        tracker.get_state()
-    );
-}
-
-/// #919 RED 3: ring buffer caps at RAW_RING_CHUNKS. Push 12 chunks,
-/// only last 10 retained.
-#[test]
-fn anchor_ring_buffer_rotation_caps_at_chunks_limit() {
-    let backend = Backend::ClaudeCode;
-    let mut tracker = StateTracker::new(Some(&backend));
-    for i in 0..12u32 {
-        // Each chunk is a unique byte-tag so we can identify
-        // retention order. Truncation cap (RAW_CHUNK_MAX) doesn't
-        // fire — bytes are short.
-        let tag = format!("chunk-{i}");
-        tracker.feed_raw(tag.as_bytes());
+/// Render a colored error line FRAGMENTED across many PTY writes (one char
+/// per `process` call). Emulates Ink's char-by-char redraw that shattered
+/// the #919 raw-byte contiguous-substring search across chunk boundaries.
+/// The vterm reassembles the grid, so the cell-color anchor must still fire.
+fn drive_fragmented_colored_line(vt: &mut VTerm, st: &mut StateTracker, sgr: &str, text: &str) {
+    drive(vt, st, format!("\x1b[2J\x1b[H{sgr}").as_bytes());
+    for ch in text.chars() {
+        let mut buf = [0u8; 4];
+        drive(vt, st, ch.encode_utf8(&mut buf).as_bytes());
     }
-    let ring = tracker.raw_ring();
-    assert_eq!(
-        ring.len(),
-        RAW_RING_CHUNKS,
-        "ring must cap at {} entries; got {}",
-        RAW_RING_CHUNKS,
-        ring.len()
-    );
-    // First two entries should have been evicted (chunk-0, chunk-1).
-    // Last entry should be chunk-11.
-    let first_bytes = &ring.front().expect("non-empty").bytes;
-    let last_bytes = &ring.back().expect("non-empty").bytes;
-    assert_eq!(
-        first_bytes, b"chunk-2",
-        "oldest should be chunk-2 after eviction"
-    );
-    assert_eq!(last_bytes, b"chunk-11", "newest should be chunk-11");
+    drive(vt, st, format!("{SGR_RESET}\r\n").as_bytes());
+}
+
+/// Render the phrase in DEFAULT foreground (no SGR) — the shape produced by
+/// injected prose / generated discussion / user typing (all uncolored).
+fn drive_plain_line(vt: &mut VTerm, st: &mut StateTracker, text: &str) {
+    let bytes = format!("\x1b[2J\x1b[H{text}\r\n");
+    drive(vt, st, bytes.as_bytes());
+}
+
+fn claude_tracker() -> (VTerm, StateTracker) {
+    (
+        VTerm::new(120, 24),
+        StateTracker::new(Some(&Backend::ClaudeCode)),
+    )
+}
+
+// ── FN matrix: a REAL red error MUST fire ServerRateLimit ───────────
+// 3 encodings × {single chunk, fragmented} = 6 cases. Each proves the
+// anchor reads color off the resolved grid regardless of SGR encoding or
+// raw-byte framing.
+
+#[test]
+fn fn_red_16color_single_chunk_fires() {
+    let (mut vt, mut st) = claude_tracker();
+    drive_colored_line(&mut vt, &mut st, RED_16, SRL_LINE);
+    assert_eq!(st.get_state(), AgentState::ServerRateLimit);
 }
 
 #[test]
-fn find_subslice_characterization() {
-    assert_eq!(find_subslice(b"hello world", b"world"), Some(6));
-    assert_eq!(find_subslice(b"hello world", b"hello"), Some(0));
-    assert_eq!(find_subslice(b"hello world", b"xyz"), None);
-    assert_eq!(find_subslice(b"hello", b"hello world"), None);
-    assert_eq!(find_subslice(b"", b"a"), None);
-    assert_eq!(find_subslice(b"\x1b[31mERR\x1b[0m", b"\x1b[31m"), Some(0));
+fn fn_red_16color_fragmented_fires() {
+    let (mut vt, mut st) = claude_tracker();
+    drive_fragmented_colored_line(&mut vt, &mut st, RED_16, SRL_LINE);
+    assert_eq!(st.get_state(), AgentState::ServerRateLimit);
 }
 
-/// #919 RED 4: chunks older than ANCHOR_WINDOW_MS are ignored by
-/// the anchor check.
+#[test]
+fn fn_red_256color_single_chunk_fires() {
+    let (mut vt, mut st) = claude_tracker();
+    drive_colored_line(&mut vt, &mut st, RED_256, SRL_LINE);
+    assert_eq!(st.get_state(), AgentState::ServerRateLimit);
+}
+
+#[test]
+fn fn_red_256color_fragmented_fires() {
+    let (mut vt, mut st) = claude_tracker();
+    drive_fragmented_colored_line(&mut vt, &mut st, RED_256, SRL_LINE);
+    assert_eq!(st.get_state(), AgentState::ServerRateLimit);
+}
+
+#[test]
+fn fn_red_truecolor_single_chunk_fires() {
+    let (mut vt, mut st) = claude_tracker();
+    drive_colored_line(&mut vt, &mut st, RED_TRUE, SRL_LINE);
+    assert_eq!(st.get_state(), AgentState::ServerRateLimit);
+}
+
+#[test]
+fn fn_red_truecolor_fragmented_fires() {
+    let (mut vt, mut st) = claude_tracker();
+    drive_fragmented_colored_line(&mut vt, &mut st, RED_TRUE, SRL_LINE);
+    assert_eq!(st.get_state(), AgentState::ServerRateLimit);
+}
+
+/// #1450 NAMED REGRESSION — would FAIL before the fix.
 ///
-/// Deterministic without sleep: we directly mutate the chunk's `at`
-/// timestamp to simulate an aged chunk. has_red_ansi_anchor then
-/// rejects it on the freshness check.
+/// Pre-#1450 the raw-byte anchor allow-list knew only 4 sixteen-color
+/// escapes; a truecolor red error (the daemon ships COLORTERM=truecolor,
+/// so chalk/Ink emits `\x1b[38;2;..m`) matched the ServerRateLimit pattern
+/// but failed the anchor → suppressed → no auto-retry → autopilot hang
+/// (operator incident 2026-05-29, #1450 RCA). Combined with Ink-style
+/// fragmentation, the old contiguous-byte search failed twice over. This
+/// asserts the INTENDED contract (fires), not the buggy pre-fix output —
+/// directly closing the "test-encodes-bug-as-spec" gap that let the bug
+/// ship green.
 #[test]
-fn anchor_window_ms_expiry_ignores_stale_chunks() {
-    let backend = Backend::ClaudeCode;
-    let mut tracker = StateTracker::new(Some(&backend));
-    // Push a red-SGR-bearing chunk.
-    let raw = b"\x1b[31mServer is temporarily limiting requests\x1b[0m";
-    tracker.feed_raw(raw);
-    // Anchor should succeed immediately (chunk is fresh).
-    assert!(
-        has_red_ansi_anchor(
-            tracker.raw_ring(),
-            "Server is temporarily limiting requests",
-            Instant::now(),
-        ),
-        "fresh chunk with red SGR must anchor"
-    );
-    // Synthetic clock advance: pretend the test runs ANCHOR_WINDOW_MS + 1s
-    // after the chunk was pushed by querying anchor with a future Instant.
-    let future = Instant::now() + ANCHOR_WINDOW_MS + Duration::from_secs(1);
-    assert!(
-        !has_red_ansi_anchor(
-            tracker.raw_ring(),
-            "Server is temporarily limiting requests",
-            future,
-        ),
-        "stale chunk (> ANCHOR_WINDOW_MS old at query time) must NOT anchor"
+fn regression_1450_truecolor_fragmented_rate_limit_fires() {
+    let (mut vt, mut st) = claude_tracker();
+    drive_fragmented_colored_line(&mut vt, &mut st, RED_TRUE, SRL_LINE);
+    assert_eq!(
+        st.get_state(),
+        AgentState::ServerRateLimit,
+        "#1450: truecolor + fragmented red rate-limit error must fire ServerRateLimit \
+         (pre-fix: suppressed by 16-color-only raw-byte anchor → autopilot hang)"
     );
 }
 
-/// #919 bonus (optional 5th): backend opt-out wiring. Shell backend
-/// has should_anchor_on_red() == false → tracker's anchor_on_red
-/// field is false → HIGH_FP match fires transition without anchor
-/// check (fail-open for non-managed backends).
+// ── FP matrix: the SAME phrase rendered PLAIN MUST suppress ─────────
+// dev-2's classes — none carry red, none may fire ServerRateLimit. The
+// discriminator is purely the rendered cell color.
+
+/// (a) injected prose: daemon-relayed `[AGEND-MSG]` quoting the phrase.
 #[test]
-fn anchor_backend_opt_out_for_shell_fires_transition_without_anchor() {
-    let backend = Backend::Shell;
-    let mut tracker = StateTracker::new(Some(&backend));
-    // Shell backend has no StatePatterns (initial_state == Ready;
-    // patterns is None). This test confirms the wiring path —
-    // even if patterns existed, anchor_on_red would be false.
-    // Direct introspection: the field is private but
-    // should_anchor_on_red() is the source of truth.
-    assert!(
-        !backend.should_anchor_on_red(),
-        "Shell backend must opt out of red-SGR anchor"
+fn fp_injected_prose_plain_suppressed() {
+    let (mut vt, mut st) = claude_tracker();
+    drive_plain_line(
+        &mut vt,
+        &mut st,
+        "[AGEND-MSG] fixup-lead: I hit 'Server is temporarily limiting requests' — diagnosing",
     );
-    // Push a prose match with NO red SGR; if anchor_on_red were
-    // true, the gate would suppress. For Shell it's a moot point
-    // (no patterns), but the wiring is correct.
-    let _ = &mut tracker; // silence unused-mut warning
+    assert_ne!(
+        st.get_state(),
+        AgentState::ServerRateLimit,
+        "injected prose (plain fg) must NOT fire"
+    );
+}
+
+/// (b) agent-generated discussion: the agent itself writing about the bug.
+#[test]
+fn fp_generated_discussion_plain_suppressed() {
+    let (mut vt, mut st) = claude_tracker();
+    drive_plain_line(
+        &mut vt,
+        &mut st,
+        "The pattern matches 'Server is temporarily limiting requests' but I'm just explaining it.",
+    );
+    assert_ne!(st.get_state(), AgentState::ServerRateLimit);
+}
+
+/// (c) user typing the phrase into the input box (echoed in default fg).
+#[test]
+fn fp_user_typed_plain_suppressed() {
+    let (mut vt, mut st) = claude_tracker();
+    drive_plain_line(
+        &mut vt,
+        &mut st,
+        "> why did 'Server is temporarily limiting requests' not trigger a retry?",
+    );
+    assert_ne!(st.get_state(), AgentState::ServerRateLimit);
+}
+
+/// (d-plain) historical scrollback rendered as plain text → color
+/// suppresses. NOTE the OTHER (d) sub-case — a PAST *red* error lingering
+/// in scrollback — is NOT the color anchor's job: it stays red, so color
+/// cannot (and must not try to) discriminate it. That staleness is handled
+/// by `feed()` hash-dedup + `LATCHED_STATE_EXPIRY` (see the latched-expiry
+/// tests above), deliberately out of anchor scope.
+#[test]
+fn fp_plain_historical_scrollback_suppressed() {
+    let (mut vt, mut st) = claude_tracker();
+    drive_plain_line(
+        &mut vt,
+        &mut st,
+        "transcript 12:01> Server is temporarily limiting requests (resolved earlier)",
+    );
+    assert_ne!(st.get_state(), AgentState::ServerRateLimit);
+}
+
+// ── Boundary: injected (plain) + real red error on the SAME screen ──
+// The regex finds the EARLIER plain occurrence first; the all-occurrence
+// scan must still find the red one below → FIRE. Guards the false-negative
+// a naive first-match-only color check would introduce.
+#[test]
+fn boundary_plain_quote_above_red_error_still_fires() {
+    let (mut vt, mut st) = claude_tracker();
+    let bytes = format!(
+        "\x1b[2J\x1b[H[AGEND-MSG] quoting: {SRL_LINE}\r\n{RED_16}{SRL_LINE}{SGR_RESET}\r\n"
+    );
+    drive(&mut vt, &mut st, bytes.as_bytes());
+    assert_eq!(
+        st.get_state(),
+        AgentState::ServerRateLimit,
+        "a real red error below a plain quote must still fire (all-occurrence scan)"
+    );
+}
+
+// ── Backend opt-out: Shell fails the anchor open (pre-#919 behavior) ─
+#[test]
+fn anchor_backend_opt_out_for_shell() {
+    // Shell has should_anchor_on_red() == false → the gate fails open.
+    assert!(
+        !Backend::Shell.should_anchor_on_red(),
+        "Shell backend must opt out of the color anchor"
+    );
+    assert!(
+        Backend::ClaudeCode.should_anchor_on_red(),
+        "ClaudeCode must opt into the color anchor"
+    );
+}
+
+// ── Fail-open: text-only feed() (empty color mask) still fires ──────
+// Guarantees the text-only entry point (tests, non-managed callers) keeps
+// pre-#919 unconditional behavior — a HIGH_FP pattern match fires without a
+// color check when no mask is supplied.
+#[test]
+fn text_only_feed_fails_open_and_fires() {
+    let mut t = StateTracker::new(Some(&Backend::ClaudeCode));
+    t.feed("API Error: Server is temporarily limiting requests (not your usage limit)");
+    assert_eq!(
+        t.get_state(),
+        AgentState::ServerRateLimit,
+        "text-only feed (empty fg mask) must fail open and fire"
+    );
+}
+
+// ── matched_span_has_red unit coverage ─────────────────────────────
+#[test]
+fn matched_span_has_red_detects_any_red_occurrence() {
+    // fg aligned 1:1 with chars: "ab" red, separator, "ab" plain.
+    let screen = "ab\nab";
+    let fg = vec![
+        CellFg::Default,
+        CellFg::Default, // line 1 "ab" (plain)
+        CellFg::Default, // '\n'
+        CellFg::Red,
+        CellFg::Red, // line 2 "ab" (red)
+    ];
+    assert!(
+        super::matched_span_has_red(screen, "ab", &fg),
+        "must find the red occurrence even though the first is plain"
+    );
+    // All-plain → false.
+    let fg_plain = vec![CellFg::Default; 5];
+    assert!(!super::matched_span_has_red(screen, "ab", &fg_plain));
+    // Empty phrase → false (guard).
+    assert!(!super::matched_span_has_red(screen, "", &fg));
 }
 
 // ── #685 PR-2: F9 productive-marker freshness/dedup ─────────────────

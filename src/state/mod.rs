@@ -16,7 +16,6 @@
 
 use crate::backend::Backend;
 use serde::Serialize;
-use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
@@ -153,11 +152,9 @@ impl AgentState {
     }
 }
 
-pub(crate) mod anchor;
 pub(crate) mod patterns;
 
-pub(crate) use anchor::{has_red_ansi_anchor, RawChunk};
-use anchor::{RAW_CHUNK_MAX, RAW_RING_CHUNKS};
+use crate::vterm::CellFg;
 use patterns::is_generic_startup_prompt;
 pub use patterns::{classify_pty_output, StatePatterns};
 
@@ -212,15 +209,11 @@ pub struct StateTracker {
     instance_name: String,
     /// Backend name for telemetry logging.
     backend_name: String,
-    /// #919: ring buffer of recent RAW PTY chunks (with ANSI escapes)
-    /// used to anchor HIGH_FP state-detection patterns against red SGR
-    /// presence. Bounded at `RAW_RING_CHUNKS` entries × `RAW_CHUNK_MAX`
-    /// bytes per entry. Pushed in `feed_raw`; consumed by
-    /// `has_red_ansi_anchor`. See `#919` design memo for rationale.
-    raw_ring: VecDeque<RawChunk>,
-    /// #919: backend's opt-in to anchor on red SGR. Cached at
-    /// construction from `Backend::should_anchor_on_red()`. When
-    /// false, the anchor gate fails open (pre-#919 behavior).
+    /// #919/#1450: backend's opt-in to the HIGH_FP color anchor. Cached at
+    /// construction from `Backend::should_anchor_on_red()`. When false
+    /// (Shell/Raw — no uniform color convention), the anchor gate fails
+    /// open (pre-#919 behavior: a HIGH_FP pattern match fires the
+    /// transition unconditionally).
     anchor_on_red: bool,
     /// #1005 Phase A2: most-recent priority-up transition target +
     /// timestamp. Set on every successful priority-up in `transition()`.
@@ -281,6 +274,58 @@ fn hash_screen(text: &str) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     text.hash(&mut hasher);
     hasher.finish()
+}
+
+/// #1450: char-span (start, end) in `screen_text` for the byte occurrence of
+/// `matched` starting at `byte_off`, clamped to `fg.len()`. The `fg` mask is
+/// aligned 1:1 with `screen_text.chars()`, so the phrase's char-start index
+/// is `screen_text[..byte_off].chars().count()`.
+fn char_span(screen_text: &str, byte_off: usize, matched: &str, fg_len: usize) -> (usize, usize) {
+    let start = screen_text[..byte_off.min(screen_text.len())]
+        .chars()
+        .count();
+    let end = start.saturating_add(matched.chars().count()).min(fg_len);
+    (start, end)
+}
+
+/// #1450: does ANY on-screen occurrence of `matched` render with a red cell?
+///
+/// Scans every byte occurrence of the phrase (not just the regex's first
+/// match) and checks its rendered foreground span in `fg`. Scanning all
+/// occurrences preserves the #919 "red anywhere" semantics: a real red error
+/// still fires even when a plain (injected / user-typed) copy of the same
+/// phrase sits earlier in the screen text. "Any red cell in the span"
+/// mirrors the looseness of the old ±200-byte proximity check while being
+/// more precise — it looks only at the phrase's own cells.
+fn matched_span_has_red(screen_text: &str, matched: &str, fg: &[CellFg]) -> bool {
+    if matched.is_empty() {
+        return false;
+    }
+    let mut search = 0;
+    while let Some(rel) = screen_text[search..].find(matched) {
+        let byte_off = search + rel;
+        let (start, end) = char_span(screen_text, byte_off, matched, fg.len());
+        if fg
+            .get(start..end)
+            .is_some_and(|span| span.iter().any(|c| c.is_red()))
+        {
+            return true;
+        }
+        search = byte_off + matched.len();
+    }
+    false
+}
+
+/// #1450: the `fg` span of the FIRST on-screen occurrence of `matched`, for
+/// the suppress-path WARN diagnostic. Empty if not found / out of range.
+fn first_occurrence_span(screen_text: &str, matched: &str, fg: &[CellFg]) -> Vec<CellFg> {
+    let Some(byte_off) = screen_text.find(matched) else {
+        return Vec::new();
+    };
+    let (start, end) = char_span(screen_text, byte_off, matched, fg.len());
+    fg.get(start..end)
+        .map(<[CellFg]>::to_vec)
+        .unwrap_or_default()
 }
 
 impl StateTracker {
@@ -351,11 +396,7 @@ impl StateTracker {
             productivity_config: backend.map(crate::behavioral::config_for_productivity),
             instance_name: String::new(),
             backend_name: backend.map(|b| b.name().to_string()).unwrap_or_default(),
-            // #919: per-agent raw-chunk ring buffer for red-SGR anchor.
-            // Init empty; populated via `feed_raw` from `on_pty_data`
-            // BEFORE `vterm.process` consumes the bytes.
-            raw_ring: VecDeque::with_capacity(RAW_RING_CHUNKS),
-            // #919: backend opt-in for the anchor gate. Defaults true
+            // #919/#1450: backend opt-in for the color anchor. Defaults true
             // for known TUI backends (Claude/Codex/Gemini/OpenCode/
             // KiroCli), false for Shell/Raw — see
             // `Backend::should_anchor_on_red`.
@@ -365,32 +406,6 @@ impl StateTracker {
             // priority-ups within the window check against it.
             last_priority_up_into: None,
         }
-    }
-
-    /// #919: push raw PTY bytes (with ANSI escapes) into the anchor
-    /// ring buffer. Called from `agent::on_pty_data` BEFORE
-    /// `vterm.process` strips the ANSI. Bounded ring + per-chunk size
-    /// cap — see `RAW_RING_CHUNKS` / `RAW_CHUNK_MAX`.
-    pub fn feed_raw(&mut self, raw: &[u8]) {
-        let truncated: Vec<u8> = if raw.len() > RAW_CHUNK_MAX {
-            raw[..RAW_CHUNK_MAX].to_vec()
-        } else {
-            raw.to_vec()
-        };
-        if self.raw_ring.len() >= RAW_RING_CHUNKS {
-            self.raw_ring.pop_front();
-        }
-        self.raw_ring.push_back(RawChunk {
-            bytes: truncated,
-            at: Instant::now(),
-        });
-    }
-
-    /// #919 test seam: read-only access to the raw ring buffer for
-    /// anchor-behavior tests. Not used in production.
-    #[cfg(test)]
-    pub(crate) fn raw_ring(&self) -> &VecDeque<RawChunk> {
-        &self.raw_ring
     }
 
     /// Set instance name for behavioral telemetry logging.
@@ -476,7 +491,33 @@ impl StateTracker {
     /// state is `PermissionPrompt` but a fresh MCP heartbeat exists, the
     /// detection is overridden to `Thinking` — the agent is alive and the
     /// PTY pattern is a false positive.
+    ///
+    /// Text-only entry point: delegates to [`feed_with_fg`] with an empty
+    /// color mask, which fails the HIGH_FP color anchor *open* (no color
+    /// info ⇒ no suppression). Production drives [`feed_with_fg`] directly
+    /// with the vterm cell-color mask; tests and non-managed callers use
+    /// this.
+    #[allow(dead_code)] // text-only test seam; production uses feed_with_fg
     pub fn feed(&mut self, screen_text: &str) {
+        self.feed_with_fg(screen_text, &[]);
+    }
+
+    /// #1450: feed the current vterm screen text together with the
+    /// per-character foreground color mask (`fg`, aligned 1:1 with
+    /// `screen_text.chars()` — see [`crate::vterm::VTerm::tail_lines_with_fg`]).
+    ///
+    /// HIGH_FP patterns (ServerRateLimit / RateLimit / ContextFull) require
+    /// the matched phrase to be rendered red before the transition fires.
+    /// This replaces the #919 raw-byte SGR ring: instead of scanning raw PTY
+    /// bytes for one of four hard-coded 16-color escapes (which missed
+    /// truecolor and broke on Ink redraw fragmentation — #1450 RCA), we read
+    /// the color straight off the resolved grid cells, where alacritty has
+    /// already normalized every SGR encoding (16 / 256 / truecolor).
+    ///
+    /// Fail-open conditions (HIGH_FP transition fires WITHOUT a red check):
+    /// `anchor_on_red == false` (Shell/Raw) OR `fg` is empty (text-only
+    /// callers / cold paths) — matching pre-#919 unconditional behavior.
+    pub fn feed_with_fg(&mut self, screen_text: &str, fg: &[CellFg]) {
         let hash = hash_screen(screen_text);
         if self.last_screen_hash == Some(hash) {
             return;
@@ -490,26 +531,20 @@ impl StateTracker {
         self.last_output = Instant::now();
 
         if let Some(patterns) = self.patterns {
-            // #919: detect_with_match returns the matched substring so
-            // we can anchor it against the raw-chunk ring. For HIGH_FP
-            // states, require a red SGR escape within
-            // `ANCHOR_WINDOW_BYTES` of the phrase in the recent raw
-            // ring (and the chunk must be within `ANCHOR_WINDOW_MS`).
-            // Gate fail-open when `anchor_on_red` is false (Shell/Raw
-            // backends) OR ring is empty (cold start).
+            // #1450: detect_with_match returns the matched substring so we
+            // can locate its rendered grid cells and check their foreground
+            // color. For HIGH_FP states, require at least one red cell across
+            // some on-screen occurrence of the phrase. Gate fail-open when
+            // `anchor_on_red` is false (Shell/Raw backends) OR no color mask
+            // was supplied (text-only callers).
             match patterns.detect_with_match(screen_text) {
                 Some((detected, matched)) => {
                     if self.anchor_on_red
                         && is_high_fp_state(detected)
-                        && !self.raw_ring.is_empty()
-                        && !has_red_ansi_anchor(&self.raw_ring, matched, Instant::now())
+                        && !fg.is_empty()
+                        && !matched_span_has_red(screen_text, matched, fg)
                     {
-                        tracing::debug!(
-                            agent = %self.instance_name,
-                            state = ?detected,
-                            matched = %matched,
-                            "#919: HIGH_FP pattern matched without red-SGR anchor in raw ring — suppressing transition (likely daemon-injected prose)"
-                        );
+                        self.log_anchor_suppress(detected, matched, screen_text, fg);
                         // Treat as no detection — fall through to
                         // structural fallback / latch maintenance.
                         if matches!(self.current, AgentState::Starting)
@@ -640,6 +675,38 @@ impl StateTracker {
                 &signal,
             );
         }
+    }
+
+    /// #1450 observability: a HIGH_FP pattern matched but no on-screen
+    /// occurrence of the phrase rendered red, so the transition is
+    /// suppressed. Logged at WARN (was `debug!` under #919 — invisible in
+    /// production, which is why the original break went undiagnosed) with
+    /// the actual per-cell foreground of the first occurrence's span. That
+    /// lets a future incident distinguish "real red mis-classified" (tune
+    /// the predicate) from "genuinely not red" (correct suppression)
+    /// straight from the logs — no DEBUG rebuild.
+    fn log_anchor_suppress(
+        &self,
+        detected: AgentState,
+        matched: &str,
+        screen_text: &str,
+        fg: &[CellFg],
+    ) {
+        let span_fg: Vec<CellFg> = first_occurrence_span(screen_text, matched, fg);
+        let line_context = screen_text
+            .lines()
+            .find(|l| l.contains(matched))
+            .unwrap_or(matched);
+        tracing::warn!(
+            agent = %self.instance_name,
+            backend = %self.backend_name,
+            state = ?detected,
+            matched = %matched,
+            span_fg = ?span_fg,
+            line_context = %line_context,
+            "#1450: HIGH_FP pattern matched but rendered fg not red — suppressing transition. \
+             If this was a real backend error, span_fg shows the actual colors (predicate may be too strict)."
+        );
     }
 
     /// Fallback when the screen changed but no pattern matched.

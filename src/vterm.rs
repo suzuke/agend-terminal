@@ -73,6 +73,104 @@ fn supports_truecolor() -> bool {
     })
 }
 
+/// #1450: per-character foreground classification, aligned 1:1 with the
+/// chars of the `String` returned by [`VTerm::tail_lines_with_fg`].
+///
+/// State detection's HIGH_FP color anchor (replaces the #919 raw-byte SGR
+/// ring) reads this to decide whether a matched error phrase is rendered in
+/// red. Because the classification comes off the *resolved* alacritty grid
+/// cell, it is encoding-agnostic: alacritty's `Processor` has already parsed
+/// 16-color (`\x1b[31m`), 256-color (`\x1b[38;5;Nm`) and 24-bit truecolor
+/// (`\x1b[38;2;R;G;Bm`) into a normalized `Color` — so the #919 bugs (the
+/// allow-list only knew 4 sixteen-color escapes, and raw-byte fragmentation
+/// from Ink redraws) cannot recur here.
+///
+/// The non-red variants carry their source encoding purely for
+/// observability — the suppress-path WARN log prints them so a future
+/// incident can tell "real red mis-classified" (tune the predicate) apart
+/// from "genuinely not red" (correct suppression).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CellFg {
+    /// Default foreground (terminal default, no SGR color).
+    Default,
+    /// Any red across the three encodings — the anchor signal.
+    Red,
+    /// A non-red named (16-color) foreground.
+    Named,
+    /// A non-red 256-color indexed foreground.
+    Indexed(u8),
+    /// A non-red 24-bit truecolor foreground.
+    Rgb(u8, u8, u8),
+}
+
+impl CellFg {
+    /// True iff this cell's foreground is classified red (the anchor signal).
+    pub fn is_red(self) -> bool {
+        matches!(self, CellFg::Red)
+    }
+}
+
+/// #1450: is a 256-color palette index a "red"?
+///
+/// - 1 / 9 = the system red / bright-red slots.
+/// - 16..=231 = the 6×6×6 RGB cube, index = 16 + 36·r + 6·g + b with each
+///   channel in 0..=5. Red ⇔ the red channel dominates (`r ≥ 3`) and green /
+///   blue stay low (`≤ 1`).
+///
+/// Grayscale ramp (232..=255) is never red.
+fn is_red_indexed(idx: u8) -> bool {
+    if idx == 1 || idx == 9 {
+        return true;
+    }
+    if (16..=231).contains(&idx) {
+        let c = idx - 16;
+        let r = c / 36;
+        let g = (c % 36) / 6;
+        let b = c % 6;
+        return r >= 3 && g <= 1 && b <= 1;
+    }
+    false
+}
+
+/// #1450: is a 24-bit RGB foreground a "red"?
+///
+/// Red channel must be reasonably saturated AND clearly dominate the other
+/// two (≥ 2×). The ≥2× ratio (not a flat margin) is what rejects orange /
+/// amber, whose green channel is high: rgb(230,160,30) fails because
+/// 230 < 2·160. Initial threshold (authorized by lead, tunable from the
+/// suppress-path WARN observability which prints the actual rgb): `r ≥ 120`
+/// and `r ≥ 2·g` and `r ≥ 2·b`. Covers chalk/Ink reds like rgb(215,40,40) /
+/// rgb(204,0,0) / rgb(255,85,85) while rejecting orange / green / blue.
+fn is_red_rgb(r: u8, g: u8, b: u8) -> bool {
+    let (r, g, b) = (r as u16, g as u16, b as u16);
+    r >= 120 && r >= g * 2 && r >= b * 2
+}
+
+/// #1450: classify an alacritty cell foreground into a [`CellFg`], flagging
+/// red across all three SGR encodings. Single source of truth for the
+/// HIGH_FP color anchor's red predicate.
+fn classify_fg(color: Color) -> CellFg {
+    match color {
+        Color::Named(NamedColor::Red | NamedColor::BrightRed | NamedColor::DimRed) => CellFg::Red,
+        Color::Named(NamedColor::Foreground | NamedColor::Background) => CellFg::Default,
+        Color::Named(_) => CellFg::Named,
+        Color::Indexed(idx) => {
+            if is_red_indexed(idx) {
+                CellFg::Red
+            } else {
+                CellFg::Indexed(idx)
+            }
+        }
+        Color::Spec(rgb) => {
+            if is_red_rgb(rgb.r, rgb.g, rgb.b) {
+                CellFg::Red
+            } else {
+                CellFg::Rgb(rgb.r, rgb.g, rgb.b)
+            }
+        }
+    }
+}
+
 struct VTermSize {
     cols: u16,
     rows: u16,
@@ -462,13 +560,34 @@ impl VTerm {
     /// Used by AwaitingOperator to snapshot "what the CLI printed before
     /// it started waiting for stdin" for forwarding to Telegram.
     pub fn tail_lines(&self, n: usize) -> String {
+        self.tail_lines_impl(n, false).0
+    }
+
+    /// #1450: like [`tail_lines`], but also returns a per-character
+    /// foreground classification ([`CellFg`]) aligned 1:1 with the `chars()`
+    /// of the returned `String` — including a [`CellFg::Default`] entry for
+    /// each `\n` line separator. The HIGH_FP color anchor in state detection
+    /// indexes this mask by the matched phrase's char range to decide whether
+    /// the phrase is rendered red. Building both in one pass guarantees the
+    /// mask and the text can never drift out of alignment.
+    pub fn tail_lines_with_fg(&self, n: usize) -> (String, Vec<CellFg>) {
+        self.tail_lines_impl(n, true)
+    }
+
+    /// Shared core for [`tail_lines`] / [`tail_lines_with_fg`]. When
+    /// `collect_fg` is false the returned `Vec<CellFg>` is empty (no per-cell
+    /// classification cost); the produced `String` is byte-identical either
+    /// way so text-only callers are unaffected.
+    fn tail_lines_impl(&self, n: usize, collect_fg: bool) -> (String, Vec<CellFg>) {
         let grid = self.term.grid();
         let cols = self.cols as usize;
         let rows = self.rows as usize;
 
         let mut lines: Vec<String> = Vec::with_capacity(rows);
+        let mut line_fgs: Vec<Vec<CellFg>> = Vec::with_capacity(rows);
         for row in 0..rows {
             let mut line = String::with_capacity(cols);
+            let mut fg: Vec<CellFg> = Vec::new();
             let mut col = 0;
             while col < cols {
                 let cell = safe_cell(grid, Line(row as i32), col);
@@ -478,9 +597,19 @@ impl VTerm {
                 }
                 let ch = if cell.c == '\0' { ' ' } else { cell.c };
                 line.push(ch);
+                if collect_fg {
+                    fg.push(classify_fg(cell.fg));
+                }
                 col += 1;
             }
-            lines.push(line.trim_end().to_string());
+            // trim_end drops trailing whitespace chars; truncate the parallel
+            // fg vec to the surviving char count so the two stay aligned.
+            let trimmed = line.trim_end();
+            if collect_fg {
+                fg.truncate(trimmed.chars().count());
+            }
+            lines.push(trimmed.to_string());
+            line_fgs.push(fg);
         }
 
         // Trim blank lines at both ends so terse output doesn't look padded
@@ -495,13 +624,27 @@ impl VTerm {
             .map(|i| i + 1)
             .unwrap_or(first);
         let visible = &lines[first..last];
+        let visible_fgs = &line_fgs[first..last];
 
-        let tail = if visible.len() > n {
-            &visible[visible.len() - n..]
-        } else {
-            visible
-        };
-        tail.join("\n")
+        let start = visible.len().saturating_sub(n);
+        let tail = &visible[start..];
+        let tail_fgs = &visible_fgs[start..];
+
+        let mut text = String::new();
+        let mut fg_out: Vec<CellFg> = Vec::new();
+        for (i, line) in tail.iter().enumerate() {
+            if i > 0 {
+                text.push('\n');
+                if collect_fg {
+                    fg_out.push(CellFg::Default);
+                }
+            }
+            text.push_str(line);
+            if collect_fg {
+                fg_out.extend_from_slice(&tail_fgs[i]);
+            }
+        }
+        (text, fg_out)
     }
 
     /// Dump current screen as ANSI escape sequences for full redraw.
@@ -759,6 +902,77 @@ mod tests {
         let screen = vt.dump_screen();
         let screen_str = String::from_utf8_lossy(&screen);
         assert!(screen_str.contains("Hello, world!"));
+    }
+
+    // ── #1450: cell-color classification across all three SGR encodings ─
+    //
+    // The color anchor's whole premise is that alacritty normalizes
+    // 16-color / 256-color / 24-bit truecolor SGR into a cell `Color` that
+    // `classify_fg` recognizes as red. Drive each encoding through the real
+    // vterm and assert `tail_lines_with_fg` flags the cell red; drive a
+    // non-red color and the default fg and assert it is NOT red.
+
+    /// Return the `CellFg` of the first char of the (single-line) screen.
+    fn first_fg(sgr: &str, text: &str) -> CellFg {
+        let mut vt = VTerm::new(80, 24);
+        vt.process(format!("{sgr}{text}\x1b[0m").as_bytes());
+        let (_screen, fg) = vt.tail_lines_with_fg(24);
+        *fg.first().expect("at least one cell")
+    }
+
+    #[test]
+    fn classify_fg_recognizes_red_16color() {
+        assert_eq!(first_fg("\x1b[31m", "ERR"), CellFg::Red, "standard red");
+        assert_eq!(first_fg("\x1b[91m", "ERR"), CellFg::Red, "bright red");
+    }
+
+    #[test]
+    fn classify_fg_recognizes_red_256color() {
+        // 196 = 6x6x6 cube r=5,g=0,b=0; 1 = system red; 9 = bright red.
+        assert_eq!(first_fg("\x1b[38;5;196m", "ERR"), CellFg::Red);
+        assert_eq!(first_fg("\x1b[38;5;1m", "ERR"), CellFg::Red);
+        assert_eq!(first_fg("\x1b[38;5;9m", "ERR"), CellFg::Red);
+    }
+
+    #[test]
+    fn classify_fg_recognizes_red_truecolor() {
+        assert_eq!(first_fg("\x1b[38;2;215;40;40m", "ERR"), CellFg::Red);
+        assert_eq!(first_fg("\x1b[38;2;204;0;0m", "ERR"), CellFg::Red);
+    }
+
+    #[test]
+    fn classify_fg_rejects_non_red() {
+        assert_ne!(first_fg("\x1b[34m", "ok"), CellFg::Red, "blue");
+        assert_ne!(first_fg("\x1b[32m", "ok"), CellFg::Red, "green");
+        assert_ne!(first_fg("\x1b[38;5;46m", "ok"), CellFg::Red, "256 green");
+        assert_ne!(
+            first_fg("\x1b[38;2;40;200;40m", "ok"),
+            CellFg::Red,
+            "rgb green"
+        );
+        // Orange/amber must not read as red (r dominant but g high).
+        assert_ne!(
+            first_fg("\x1b[38;2;230;160;30m", "ok"),
+            CellFg::Red,
+            "orange"
+        );
+        // Default foreground (no SGR) is not red.
+        assert_eq!(first_fg("", "ok"), CellFg::Default);
+    }
+
+    #[test]
+    fn tail_lines_with_fg_mask_aligns_with_chars() {
+        // Two short lines; mask length must equal the char count of the
+        // returned text (including the '\n' separator).
+        let mut vt = VTerm::new(80, 24);
+        vt.process(b"\x1b[2J\x1b[Hab\r\ncd\r\n");
+        let (screen, fg) = vt.tail_lines_with_fg(24);
+        assert_eq!(screen, "ab\ncd");
+        assert_eq!(
+            fg.len(),
+            screen.chars().count(),
+            "fg mask must align 1:1 with chars (incl. '\\n')"
+        );
     }
 
     #[test]
