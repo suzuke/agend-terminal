@@ -36,6 +36,19 @@ fn main() {
     let binding = read_binding(&home, &agent);
     let subcommand = args.first().map(|s| s.as_str()).unwrap_or("");
 
+    // #1463: non-destructive forensic capture of backend `init` heartbeat
+    // commits. The RCA established these are produced by a backend process
+    // (committer = user's global git identity, because this shim's
+    // `commit → ChdirPass` does NOT inject `-c user.*`; agend's own init
+    // bypasses via AGEND_GIT_BYPASS and never reaches here). Desk research
+    // could not isolate WHICH backend / process; this hook records the full
+    // process ancestry + invocation context the instant the shim sees the
+    // heartbeat-shaped commit, so the next live occurrence is pinned. Pure
+    // logging — the commit still passes through unchanged.
+    if subcommand == "commit" && commit_is_init_heartbeat_argv(&args) {
+        log_init_heartbeat_forensics(&home, &agent, &args);
+    }
+
     // Sprint 57 Wave 2 Track D: resolve parent-process-is-gh signal once.
     // Used by `classify` to recognize gh-driven post-merge cleanup
     // checkouts and silently exempt them from the E4.5 cross-branch
@@ -542,6 +555,135 @@ fn parent_process_name() -> Option<String> {
     None
 }
 
+// ── #1463: init-heartbeat forensic capture ──────────────────────────────
+
+/// Extract the `-m` / `--message` value from a `commit` argv. Supports
+/// `-m x`, `-mx`, `--message x`, `--message=x`. Returns the first message.
+fn extract_commit_message(args: &[String]) -> Option<&str> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "-m" || a == "--message" {
+            return it.next().map(|s| s.as_str());
+        }
+        if let Some(v) = a.strip_prefix("--message=") {
+            return Some(v);
+        }
+        if a.len() > 2 && a.starts_with("-m") && !a.starts_with("--") {
+            return Some(&a[2..]);
+        }
+    }
+    None
+}
+
+/// True if argv is a `commit` whose message is a heartbeat subject
+/// (`init` / `initial`) — the bare-init shape the pre-push cleanup targets.
+/// Detected from argv (the commit hasn't run yet, so the empty-diff check
+/// used by `commit_is_empty_heartbeat` isn't available here); the subject is
+/// the heartbeat signature at invocation time. Deliberately does NOT require
+/// `--allow-empty` so a heartbeat that omits it is still captured (forensics
+/// errs toward catching; whether `--allow-empty` was present is logged).
+fn commit_is_init_heartbeat_argv(args: &[String]) -> bool {
+    if args.first().map(|s| s.as_str()) != Some("commit") {
+        return false;
+    }
+    extract_commit_message(args)
+        .map(is_heartbeat_subject_shim)
+        .unwrap_or(false)
+}
+
+/// Walk the process ancestry from this shim's parent up to `max` levels.
+/// Each entry is `pid ppid comm args` (one ancestor). The immediate parent
+/// is the process that invoked `git` — i.e. the backend CLI we want to pin.
+/// Best-effort; empty on unsupported platforms or `ps` failure.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn process_ancestry(max: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut pid = unsafe { libc::getppid() };
+    for _ in 0..max {
+        if pid <= 1 {
+            break;
+        }
+        let line = std::process::Command::new("ps")
+            .args(["-o", "pid=,ppid=,comm=,args=", "-p", &pid.to_string()])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        if line.is_empty() {
+            break;
+        }
+        // 2nd whitespace field is ppid — parse it to keep walking up.
+        let ppid: i32 = line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        out.push(line);
+        if ppid <= 1 {
+            break;
+        }
+        pid = ppid;
+    }
+    out
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn process_ancestry(_max: usize) -> Vec<String> {
+    Vec::new()
+}
+
+/// The git `user.email` that WOULD author/commit in `cwd` — i.e. the
+/// committer identity the heartbeat commit will carry. Invokes the real git
+/// (AGEND_REAL_GIT) to avoid recursing through this shim.
+fn effective_git_email(cwd: &str) -> Option<String> {
+    let real_git = env::var("AGEND_REAL_GIT").unwrap_or_else(|_| "git".to_string());
+    let out = std::process::Command::new(real_git)
+        .args(["-C", cwd, "config", "user.email"])
+        .output()
+        .ok()?;
+    let email = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!email.is_empty()).then_some(email)
+}
+
+/// #1463: append a rich forensic record for an intercepted init-heartbeat
+/// commit to the daemon-observable `fleet_events.jsonl`, plus a stderr line
+/// (surfaces in the agent pane + daemon log). Best-effort; never blocks the
+/// commit.
+fn log_init_heartbeat_forensics(home: &str, agent: &str, args: &[String]) {
+    let cwd = env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let ppid = unsafe { libc::getppid() };
+    let ancestry = process_ancestry(8);
+    let email = effective_git_email(&cwd).unwrap_or_default();
+    let has_allow_empty = args.iter().any(|a| a == "--allow-empty");
+    let event = serde_json::json!({
+        "kind": "git_event",
+        "event": "init_heartbeat_forensics",
+        "agent": agent,
+        "subcommand": "commit",
+        "argv": args,
+        "allow_empty": has_allow_empty,
+        "cwd": cwd,
+        "ppid": ppid,
+        "process_ancestry": ancestry,
+        "git_user_email": email,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    });
+    let events_path = PathBuf::from(home).join("fleet_events.jsonl");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(events_path)
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "{event}");
+    }
+    eprintln!(
+        "[agend-git #1463] init-heartbeat commit intercepted: agent={agent} email={email} ppid={ppid} cwd={cwd} ancestry={ancestry:?}"
+    );
+}
+
 // ── #883 pre-push cleanup ───────────────────────────────────────────────
 
 /// #883: drop empty `init` heartbeat commits between `origin/main..HEAD`
@@ -910,6 +1052,66 @@ fn format_conflict_guidance() -> &'static str {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    // ── #1463: init-heartbeat argv detection (forensic hook gate) ──
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn extract_commit_message_all_forms() {
+        assert_eq!(
+            extract_commit_message(&s(&["commit", "-m", "init"])),
+            Some("init")
+        );
+        assert_eq!(
+            extract_commit_message(&s(&["commit", "-minit"])),
+            Some("init")
+        );
+        assert_eq!(
+            extract_commit_message(&s(&["commit", "--message", "init"])),
+            Some("init")
+        );
+        assert_eq!(
+            extract_commit_message(&s(&["commit", "--message=init"])),
+            Some("init")
+        );
+        assert_eq!(
+            extract_commit_message(&s(&["commit", "--allow-empty"])),
+            None
+        );
+    }
+
+    #[test]
+    fn init_heartbeat_argv_detected() {
+        assert!(commit_is_init_heartbeat_argv(&s(&[
+            "commit",
+            "--allow-empty",
+            "-m",
+            "init"
+        ])));
+        // `--allow-empty` not required (forensics errs toward catching).
+        assert!(commit_is_init_heartbeat_argv(&s(&[
+            "commit", "-m", "initial"
+        ])));
+        assert!(commit_is_init_heartbeat_argv(&s(&["commit", "-minit"])));
+    }
+
+    #[test]
+    fn init_heartbeat_argv_rejects_non_heartbeat() {
+        // Real work commits / other subcommands must NOT trigger the hook.
+        assert!(!commit_is_init_heartbeat_argv(&s(&[
+            "commit",
+            "-m",
+            "fix: real work"
+        ])));
+        assert!(!commit_is_init_heartbeat_argv(&s(&[
+            "commit",
+            "--allow-empty"
+        ])));
+        assert!(!commit_is_init_heartbeat_argv(&s(&["status"])));
+        assert!(!commit_is_init_heartbeat_argv(&s(&["push"])));
+    }
 
     fn bound_binding(branch: &str, worktree: &str) -> Binding {
         Binding {
