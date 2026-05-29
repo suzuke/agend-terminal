@@ -66,7 +66,7 @@ portable-pty = "0.9"
 # Terminal
 crossterm = "0.28"
 alacritty_terminal = "0.26"
-ratatui = "0.29"
+ratatui = "0.30"
 
 # Concurrency
 crossbeam-channel = "0.5"
