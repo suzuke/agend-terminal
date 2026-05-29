@@ -1327,3 +1327,87 @@ fn matrix6_external_fallback_routes_by_name() {
     let handle = reg.get("ext-agent").expect("external resolves by name");
     assert_eq!(handle.pid, 4321, "external lookup keyed by name");
 }
+
+// ── #1440: agent backend env isolation (clear + allowlist) ──
+
+fn env_map(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+    pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+/// #1440: an unlisted secret in the daemon env is absent from the child env
+/// under isolation; a base-allowlist key (HOME) survives.
+#[test]
+fn env_isolation_drops_unlisted_secret() {
+    let src = env_map(&[("MY_FAKE_SECRET", "supersecret-value"), ("HOME", "/home/x")]);
+    let plan = resolve_child_env(Some(&Backend::ClaudeCode), &[], &src);
+    assert!(
+        plan.injected.iter().all(|(k, _)| k != "MY_FAKE_SECRET"),
+        "unlisted secret must not reach the child"
+    );
+    assert!(
+        plan.injected.iter().any(|(k, _)| k == "HOME"),
+        "base-allowlist HOME must survive"
+    );
+    assert!(plan.dropped.contains(&"MY_FAKE_SECRET".to_string()));
+}
+
+/// #1440: cross-backend credential isolation — Codex gets OPENAI but never
+/// ANTHROPIC, and Claude gets ANTHROPIC but never OPENAI.
+#[test]
+fn credential_isolation_across_backends() {
+    let src = env_map(&[
+        ("ANTHROPIC_API_KEY", "sk-ant-xxx"),
+        ("OPENAI_API_KEY", "sk-oai-yyy"),
+    ]);
+
+    let codex = resolve_child_env(Some(&Backend::Codex), &[], &src);
+    assert!(codex.injected.iter().any(|(k, _)| k == "OPENAI_API_KEY"));
+    assert!(
+        codex.injected.iter().all(|(k, _)| k != "ANTHROPIC_API_KEY"),
+        "Codex must not inherit ANTHROPIC_API_KEY"
+    );
+
+    let claude = resolve_child_env(Some(&Backend::ClaudeCode), &[], &src);
+    assert!(claude
+        .injected
+        .iter()
+        .any(|(k, _)| k == "ANTHROPIC_API_KEY"));
+    assert!(
+        claude.injected.iter().all(|(k, _)| k != "OPENAI_API_KEY"),
+        "Claude must not inherit OPENAI_API_KEY"
+    );
+}
+
+/// #1440: a non-sensitive passthrough key passes, but a sensitive one
+/// (LD_PRELOAD) stays blocked even when explicitly listed.
+#[test]
+fn passthrough_passes_but_sensitive_still_blocked() {
+    let src = env_map(&[("MY_CORP_CA", "/etc/ca.pem"), ("LD_PRELOAD", "/evil.so")]);
+    let passthrough = vec!["MY_CORP_CA".to_string(), "LD_PRELOAD".to_string()];
+    let plan = resolve_child_env(Some(&Backend::ClaudeCode), &passthrough, &src);
+    assert!(
+        plan.injected.iter().any(|(k, _)| k == "MY_CORP_CA"),
+        "listed non-sensitive passthrough key must pass"
+    );
+    assert!(
+        plan.injected.iter().all(|(k, _)| k != "LD_PRELOAD"),
+        "LD_PRELOAD must stay blocked even when listed in passthrough"
+    );
+    assert!(plan.dropped.contains(&"LD_PRELOAD".to_string()));
+}
+
+/// #1440: the dropped list feeding the one-time warn carries KEY NAMES only,
+/// never values — so the warn can never leak a secret value.
+#[test]
+fn dropped_warn_input_is_key_names_only() {
+    let src = env_map(&[("STRIPE_SECRET", "rk_live_TOPSECRETVALUE")]);
+    let plan = resolve_child_env(Some(&Backend::ClaudeCode), &[], &src);
+    assert!(plan.dropped.contains(&"STRIPE_SECRET".to_string()));
+    assert!(
+        plan.dropped.iter().all(|d| !d.contains("TOPSECRETVALUE")),
+        "warn input must contain key names only, never values"
+    );
+}

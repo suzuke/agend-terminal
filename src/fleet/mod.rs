@@ -66,6 +66,13 @@ pub struct FleetConfig {
     pub instances: HashMap<String, InstanceConfig>,
     #[serde(default)]
     pub teams: HashMap<String, TeamConfig>,
+    /// #1440: fleet-wide env keys to pass through to every agent backend when
+    /// `AGEND_ENV_ISOLATION` is on (additive with per-instance
+    /// `passthrough_env`). Still gated by `is_sensitive_env_key`, so listing
+    /// `LD_PRELOAD` etc. has no effect. Use for corp-specific, non-secret env
+    /// like `NODE_EXTRA_CA_CERTS` / `SSL_CERT_FILE`.
+    #[serde(default)]
+    pub passthrough_env: Vec<String>,
     /// Channel configuration (e.g., Telegram). Legacy singular form.
     ///
     /// Prefer [`FleetConfig::channels`] (plural) going forward — per
@@ -240,6 +247,11 @@ pub struct InstanceConfig {
     pub ready_pattern: Option<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// #1440: per-instance env keys to pass through under `AGEND_ENV_ISOLATION`
+    /// (additive with fleet-level [`FleetConfig::passthrough_env`]). Still
+    /// `is_sensitive_env_key`-gated.
+    #[serde(default)]
+    pub passthrough_env: Vec<String>,
     pub cols: Option<u16>,
     pub rows: Option<u16>,
     pub topic_id: Option<i32>,
@@ -320,6 +332,19 @@ pub struct TeamConfig {
 }
 
 impl FleetConfig {
+    /// #1440: env keys to pass through to instance `name` under
+    /// `AGEND_ENV_ISOLATION` — fleet-level ∪ per-instance, deduplicated.
+    /// Still `is_sensitive_env_key`-gated at injection time.
+    pub fn resolve_passthrough_env(&self, name: &str) -> Vec<String> {
+        let mut keys = self.passthrough_env.clone();
+        if let Some(inst) = self.instances.get(name) {
+            keys.extend(inst.passthrough_env.iter().cloned());
+        }
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let meta = std::fs::metadata(path).ok();
         let disk_mtime = meta.as_ref().and_then(|m| m.modified().ok());

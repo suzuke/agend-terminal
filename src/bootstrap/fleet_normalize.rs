@@ -129,6 +129,7 @@ mod tests {
             },
             instances: Default::default(),
             teams: Default::default(),
+            passthrough_env: Vec::new(),
             channel: Some(ChannelConfig::Telegram {
                 bot_token_env: "TG_TOKEN".into(),
                 group_id: -1,

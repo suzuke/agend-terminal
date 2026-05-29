@@ -53,6 +53,44 @@ impl Backend {
         }
     }
 
+    /// #1440: credential env-var names this backend legitimately needs to
+    /// authenticate to its LLM provider. Under `AGEND_ENV_ISOLATION`, only
+    /// these (plus the base runtime allowlist + operator `passthrough_env`)
+    /// survive `env_clear()` — so a Claude agent never inherits `OPENAI_API_KEY`
+    /// and vice versa (cross-backend credential isolation).
+    ///
+    /// These intentionally override the `SENSITIVE_ENV_KEYS` deny-list for the
+    /// owning backend only. `OpenCode` is multi-provider by design, so it
+    /// declares the union of the providers agend drives; long-tail providers
+    /// (Groq, OpenRouter, …) go through `passthrough_env`. `KiroCli`'s AWS
+    /// operation creds (`AWS_*`) are deliberately excluded — pass them via
+    /// `passthrough_env` only when that Kiro agent actually performs AWS work.
+    pub fn credential_env_keys(&self) -> &'static [&'static str] {
+        match self {
+            Backend::ClaudeCode => &[
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_AUTH_TOKEN",
+                "CLAUDE_CODE_OAUTH_TOKEN",
+            ],
+            Backend::Codex => &["OPENAI_API_KEY"],
+            Backend::Gemini | Backend::Agy => &[
+                "GEMINI_API_KEY",
+                "GOOGLE_API_KEY",
+                "GOOGLE_APPLICATION_CREDENTIALS",
+            ],
+            Backend::KiroCli => &["KIRO_API_KEY"],
+            Backend::OpenCode => &[
+                "ANTHROPIC_API_KEY",
+                "OPENAI_API_KEY",
+                "GEMINI_API_KEY",
+                "GOOGLE_API_KEY",
+                "OPENCODE_CONFIG",
+                "OPENCODE_API_KEY",
+            ],
+            Backend::Shell | Backend::Raw(_) => &[],
+        }
+    }
+
     /// Parse a bare string form (yaml scalar or MCP tool argument).
     /// Known names → preset variants; shell aliases → [`Backend::Shell`];
     /// anything else becomes [`Backend::Raw`].
