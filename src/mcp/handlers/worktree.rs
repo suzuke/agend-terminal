@@ -140,8 +140,9 @@ pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender
 /// MCP tool: `release_worktree`. Required arg: `instance`. Returns
 /// `{released, worktree_removed, binding_removed, error}` —
 /// `released:true` clears binding; worktree removal via
-/// `git worktree remove --force` (or fallback). Idempotent — second
-/// call returns `released:false, error:"no binding for agent X"`.
+/// `git worktree remove --force` (or fallback). Idempotent (#1465) — a
+/// second call (no binding) returns `released:true, already_released:true`
+/// (success no-op, no error).
 pub(crate) fn handle_release_worktree(
     home: &Path,
     args: &Value,
@@ -290,23 +291,16 @@ mod tests {
     }
 
     #[test]
-    fn handler_idempotent_no_binding_returns_released_false() {
-        // Production-smoke: handler called via the same path the MCP layer
-        // uses (`handle_release_worktree`). With no binding, must return
-        // released:false and error indicating no binding — not panic.
+    fn handler_idempotent_no_binding_returns_success_noop() {
+        // #1465: no binding → idempotent SUCCESS no-op (released:true,
+        // already_released:true, no error; was released:false pre-#1465).
         let home = tmp_home("idem-no-binding");
         let result = handle_release_worktree(&home, &json!({"instance": "ghost"}), &None);
-        assert_eq!(
-            result["released"].as_bool(),
-            Some(false),
-            "missing binding must report released=false: {result}"
-        );
+        assert_eq!(result["released"].as_bool(), Some(true), "{result}");
+        assert_eq!(result["already_released"].as_bool(), Some(true), "{result}");
         assert!(
-            result["error"]
-                .as_str()
-                .unwrap_or("")
-                .contains("no binding"),
-            "error must indicate no binding: {result}"
+            result.get("error").is_none(),
+            "no-op must not error: {result}"
         );
         std::fs::remove_dir_all(&home).ok();
     }

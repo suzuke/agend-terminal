@@ -433,19 +433,21 @@ mod tests {
 
     #[test]
     fn release_worktree_idempotent_on_unbound_agent() {
-        // Pin: release_full's idempotence with the new defensive
-        // clear_bind_in_flight call still works — calling release on
-        // an agent with no binding returns released:false (existing
-        // contract) AND doesn't panic on the new cleanup helper.
+        // #1465: release on an agent with no binding is an idempotent
+        // SUCCESS no-op — released:true, already_released:true, no error
+        // (was released:false + "no binding" pre-#1465). Also pins that the
+        // defensive clear_bind_in_flight call doesn't panic on a clean state.
         let home = tmp_home("release-idem");
         let r1 = handle_release_worktree(&home, &json!({"instance": "never-bound"}), &None);
-        assert_eq!(r1["released"].as_bool(), Some(false));
+        assert_eq!(r1["released"].as_bool(), Some(true), "{r1}");
+        assert_eq!(r1["already_released"].as_bool(), Some(true), "{r1}");
         let r2 = handle_release_worktree(&home, &json!({"instance": "never-bound"}), &None);
         assert_eq!(
             r2["released"].as_bool(),
-            Some(false),
-            "second call same shape: {r2}"
+            Some(true),
+            "second call same idempotent shape: {r2}"
         );
+        assert_eq!(r2["already_released"].as_bool(), Some(true), "{r2}");
         std::fs::remove_dir_all(&home).ok();
     }
 

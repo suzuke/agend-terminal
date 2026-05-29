@@ -291,15 +291,16 @@ mod tests {
             result["binding_outcome"].is_object(),
             "binding_outcome must surface the release_full result: {result}"
         );
-        // No prior binding existed → release_full returns
-        // released:false + error: "no binding..." — that's the
-        // expected idempotent shape.
+        // No prior binding existed → #1465: release_full is an idempotent
+        // SUCCESS no-op (released:true, already_released:true, no error).
         let outcome = &result["binding_outcome"];
-        assert_eq!(outcome["released"].as_bool(), Some(false));
-        assert!(outcome["error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("no binding"));
+        assert_eq!(outcome["released"].as_bool(), Some(true), "{result}");
+        assert_eq!(
+            outcome["already_released"].as_bool(),
+            Some(true),
+            "{result}"
+        );
+        assert!(outcome["error"].is_null(), "no-op must not error: {result}");
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -492,10 +493,12 @@ mod tests {
             .expect("helper must not error on clean state");
         assert!(!outcome.dir_existed);
         assert!(!outcome.dir_removed);
-        // release_full on missing binding returns released:false + "no binding" error.
+        // #1465: release_full on missing binding is an idempotent success
+        // no-op (released:true, already_released:true, no error).
         let bo = &outcome.binding_outcome;
-        assert_eq!(bo["released"].as_bool(), Some(false));
-        assert!(bo["error"].as_str().unwrap_or("").contains("no binding"));
+        assert_eq!(bo["released"].as_bool(), Some(true));
+        assert_eq!(bo["already_released"].as_bool(), Some(true));
+        assert!(bo["error"].is_null(), "no-op must not error: {bo}");
         std::fs::remove_dir_all(&home).ok();
     }
 

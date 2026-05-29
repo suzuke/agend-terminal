@@ -822,6 +822,60 @@ fn checkout_bind_true_writes_binding_marker_and_arms_watch() {
 
 #[test]
 #[cfg(unix)]
+fn checkout_writes_event_log_success_and_error_1466() {
+    // #1466: every checkout outcome — success AND error — must leave a
+    // `worktree_checkout` event-log trace (observability for silent
+    // bootstrap failures: src/ present but no .git). Reuses event_log
+    // (event-log.jsonl), no new schema.
+    let home = p778_tmp_home("evlog");
+    let parent = p778_tmp_home("evlog-src-parent");
+    let source = p778_setup_source_repo(&parent, "feat/evlog");
+    let agent = "evlog-agent";
+
+    // Error path: missing repository_path → must still be logged (ok=false).
+    let err =
+        super::handle_checkout_repo(&home, &serde_json::json!({ "branch": "feat/evlog" }), agent);
+    assert!(err.get("error").is_some(), "missing repo must error: {err}");
+
+    // Success path.
+    let ok = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "repository_path": source.display().to_string(),
+            "branch": "feat/evlog",
+        }),
+        agent,
+    );
+    assert!(ok.get("error").is_none(), "checkout must succeed: {ok}");
+
+    let log = std::fs::read_to_string(home.join("event-log.jsonl")).expect("event-log written");
+    let lines: Vec<&str> = log
+        .lines()
+        .filter(|l| l.contains("worktree_checkout"))
+        .collect();
+    assert!(
+        lines.len() >= 2,
+        "both checkout outcomes must be logged: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("ok=false") && l.contains("err=")),
+        "error outcome must log ok=false + err: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("ok=true") && l.contains("branch=feat/evlog")),
+        "success outcome must log ok=true + branch: {lines:?}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+#[test]
+#[cfg(unix)]
 fn checkout_bind_false_default_preserves_detached_no_binding() {
     // Back-compat: existing callers (review pool, operator triage) pass
     // no `bind` arg → behavior identical to pre-#778 — detached HEAD,

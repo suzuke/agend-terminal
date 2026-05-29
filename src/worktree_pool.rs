@@ -110,6 +110,11 @@ pub fn is_daemon_managed(worktree_path: &Path) -> bool {
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct ReleaseOutcome {
     pub released: bool,
+    /// #1465: true when `released` is a no-op success because the agent had
+    /// no binding to begin with (release is idempotent — the target state
+    /// was already reached). Distinguishes "nothing to do, success" from an
+    /// actual teardown. Never true alongside an `error`.
+    pub already_released: bool,
     pub worktree_removed: bool,
     pub binding_removed: bool,
     pub branch_deleted: bool,
@@ -212,9 +217,11 @@ fn cleanup_merged_branch(
 /// Operator-created worktrees without the marker are left alone — surfaced
 /// as `released: false, error: "...no .agend-managed marker..."`.
 ///
-/// Idempotent: second call on the same agent sees no binding, returns
-/// `released: false, error: "no binding for agent X"` (per spec — not a
-/// fatal error).
+/// Idempotent (#1465): second call on the same agent sees no binding and
+/// returns `released: true, already_released: true` (no error) — the release
+/// target state is already reached, so it's a success no-op. A genuine
+/// cleanup failure WITH a binding present still returns `released: false` +
+/// `error` (idempotent success applies only to the nothing-to-do path).
 ///
 /// Partial cleanup: if the worktree path is missing or `git worktree remove`
 /// fails, the binding is still cleared so the agent is not stuck in a
@@ -326,7 +333,14 @@ pub fn release_full(home: &Path, agent: &str, dry_run: bool) -> ReleaseOutcome {
     let mut out = ReleaseOutcome::default();
 
     let Some(binding) = crate::binding::read(home, agent) else {
-        out.error = Some(format!("no binding for agent '{agent}'"));
+        // #1465: release is idempotent. "No binding" means the release
+        // target state is already reached → report a success no-op rather
+        // than an error, so automated dispatch/release can treat release as
+        // a safe always-succeeds operation. (A genuine cleanup failure WITH
+        // a binding present still returns `released:false` + `error` below —
+        // idempotent success applies ONLY to this nothing-to-do path.)
+        out.released = true;
+        out.already_released = true;
         return out;
     };
 
@@ -359,7 +373,13 @@ pub fn release_full(home: &Path, agent: &str, dry_run: bool) -> ReleaseOutcome {
 
     clear_binding_state(home, agent);
     out.binding_removed = true;
-    out.released = true;
+    // #1465 guardrail: only report `released` when no cleanup step failed.
+    // A `WorktreeRemoval::Failed` set `out.error` above — idempotent success
+    // must NOT mask a real execution error as success (reviewer contract:
+    // "binding present but cleanup failed → released:false + error").
+    if out.error.is_none() {
+        out.released = true;
+    }
 
     resolve_branch_cleanup(
         &binding,
@@ -966,16 +986,28 @@ mod tests {
 
     #[test]
     fn p0x_release_full_idempotent_second_call_noop() {
+        // #1465: release is idempotent. The first call tears down; the
+        // second (no binding left) is a SUCCESS no-op — `released:true,
+        // already_released:true`, no error — NOT the pre-#1465 `released:
+        // false + "no binding"` error (that encoded the bug this fixes).
         let home = tmp_home("p0x-idem");
         let repo = tmp_repo("p0x-idem-repo");
         lease(&home, &repo, "agent-i", "feat/idem").expect("lease");
         let r1 = release_full(&home, "agent-i", false);
         assert!(r1.released, "first call must release");
-        let r2 = release_full(&home, "agent-i", false);
-        assert!(!r2.released, "second call must report no release");
         assert!(
-            r2.error.as_deref().unwrap_or("").contains("no binding"),
-            "second call error must indicate no binding: {:?}",
+            !r1.already_released,
+            "first call is a real teardown, not a no-op"
+        );
+        let r2 = release_full(&home, "agent-i", false);
+        assert!(r2.released, "second call must be idempotent success");
+        assert!(
+            r2.already_released,
+            "second call must flag already_released"
+        );
+        assert!(
+            r2.error.is_none(),
+            "idempotent no-op must NOT error: {:?}",
             r2.error
         );
         std::fs::remove_dir_all(&home).ok();
@@ -984,21 +1016,23 @@ mod tests {
 
     #[test]
     fn p0x_release_full_missing_binding_graceful() {
+        // #1465: releasing an agent that never had a binding is a success
+        // no-op (release target state already reached), not an error.
         let home = tmp_home("p0x-missing-binding");
-        // No lease, no binding written. Calling release on a fresh agent.
         let outcome = release_full(&home, "ghost-agent", false);
-        assert!(!outcome.released);
-        assert!(!outcome.worktree_removed);
-        assert!(!outcome.binding_removed);
         assert!(
-            outcome
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("no binding"),
-            "missing binding must surface clear error: {:?}",
+            outcome.released,
+            "missing binding must be idempotent success"
+        );
+        assert!(outcome.already_released, "must flag already_released");
+        assert!(
+            outcome.error.is_none(),
+            "no-op must not error: {:?}",
             outcome.error
         );
+        // Nothing was actually torn down — no worktree/binding removal.
+        assert!(!outcome.worktree_removed);
+        assert!(!outcome.binding_removed);
         std::fs::remove_dir_all(&home).ok();
     }
 
