@@ -4,7 +4,15 @@
 //! Operator + agent introspection surface that reports:
 //! - `runtime/<agent>/binding.json` content (branch, task_id, worktree,
 //!   source_repo, issued_at)
-//! - on-disk reality checks (worktree dir exists, `.agend-managed` marker)
+//! - on-disk reality checks, three distinct signals (#1486):
+//!   - `worktree_exists_on_disk` — the dir is literally present (true even for
+//!     an empty shell whose contents were cleared).
+//!   - `worktree_valid` — there's a USABLE git worktree (`.git` or the
+//!     `.agend-managed` marker). **Use this for the rebuild decision** — an
+//!     empty shell reads `exists_on_disk=true && valid=false`.
+//!   - `marker_present` — the daemon's `.agend-managed` marker is present.
+//!     **Use this for ownership / GC** (is this a daemon-managed worktree the
+//!     release path may remove, vs an operator-owned one R14 leaves alone).
 //! - CI watch subscriptions (`ci-watches/*.json` enumeration)
 //! - in-memory bind-in-flight guard state
 //!   (Sprint 55 P0-B EC11 — exposed via
@@ -43,6 +51,7 @@ use std::path::Path;
 ///   "source_repo": "...",
 ///   "issued_at": "...",
 ///   "worktree_exists_on_disk": true,
+///   "worktree_valid": true,
 ///   "marker_present": true,
 ///   "ci_watches": ["repo:branch", ...],
 ///   "bind_in_flight": false,
@@ -95,6 +104,17 @@ pub(crate) fn handle_binding_state(home: &Path, args: &Value, _sender: &Option<S
         let wt_path = Path::new(wt_str);
         let worktree_exists_on_disk = !wt_str.is_empty() && wt_path.exists();
         let marker_present = worktree_exists_on_disk && wt_path.join(".agend-managed").exists();
+        // #1486: `worktree_exists_on_disk` is literal (the dir is present) and
+        // returns true even for an empty shell left behind when the worktree's
+        // contents were cleared (external cleanup / CC-compaction restart). That
+        // misleads an agent into thinking the worktree is usable and skipping a
+        // rebuild. `worktree_valid` answers the question that actually matters
+        // for rebuild — "is there a USABLE git worktree here?" — by requiring a
+        // `.git` (any git worktree) or the daemon's `.agend-managed` marker.
+        // (Additive: the literal field is unchanged, so the empty-shell half-
+        // state is now visibly `exists_on_disk=true && valid=false`.)
+        let worktree_valid = worktree_exists_on_disk
+            && (wt_path.join(".git").exists() || wt_path.join(".agend-managed").exists());
 
         // Cross-branch holders: any other agent currently bound to
         // the same branch (should be 0 — `dispatch_auto_bind_lease`'s
@@ -112,6 +132,7 @@ pub(crate) fn handle_binding_state(home: &Path, args: &Value, _sender: &Option<S
             "source_repo": b["source_repo"].as_str().unwrap_or(""),
             "issued_at": b["issued_at"].as_str().unwrap_or(""),
             "worktree_exists_on_disk": worktree_exists_on_disk,
+            "worktree_valid": worktree_valid,
             "marker_present": marker_present,
             "ci_watches": ci_watches,
             "bind_in_flight": bind_in_flight,
@@ -257,6 +278,11 @@ mod tests {
             "worktree dir exists, must report true: {result}"
         );
         assert_eq!(
+            result["worktree_valid"].as_bool(),
+            Some(true),
+            ".agend-managed marker → valid worktree: {result}"
+        );
+        assert_eq!(
             result["marker_present"].as_bool(),
             Some(true),
             ".agend-managed marker present, must report true: {result}"
@@ -334,6 +360,11 @@ mod tests {
             "worktree was never created → false: {result}"
         );
         assert_eq!(
+            result["worktree_valid"].as_bool(),
+            Some(false),
+            "no dir → not a valid worktree: {result}"
+        );
+        assert_eq!(
             result["marker_present"].as_bool(),
             Some(false),
             "no worktree → no marker: {result}"
@@ -352,7 +383,12 @@ mod tests {
         let home = tmp_home("no-marker");
         let wt = home.join("operator-worktree");
         std::fs::create_dir_all(&wt).unwrap();
-        // Note: NO .agend-managed marker.
+        // #1486: a REAL operator-owned worktree has a `.git` (git worktree add
+        // always creates one) but NO `.agend-managed` marker. The fixture must
+        // carry `.git` to faithfully represent that — an empty dir is not an
+        // operator worktree, it's a half-state shell (covered separately by
+        // `binding_state_reports_invalid_for_empty_shell_dir`).
+        std::fs::write(wt.join(".git"), "gitdir: /somewhere/.git/worktrees/x\n").unwrap();
         write_binding(&home, "alpha", "feature/x", wt.to_str().unwrap());
 
         let result = handle_binding_state(&home, &json!({"instance": "alpha"}), &None);
@@ -362,10 +398,66 @@ mod tests {
             "dir exists: {result}"
         );
         assert_eq!(
+            result["worktree_valid"].as_bool(),
+            Some(true),
+            "operator worktree has .git → valid: {result}"
+        );
+        assert_eq!(
             result["marker_present"].as_bool(),
             Some(false),
             "no .agend-managed marker → false: {result}"
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn binding_state_reports_invalid_for_empty_shell_dir() {
+        // #1486 RED: the dir is present but has NEITHER `.git` NOR the
+        // `.agend-managed` marker — an empty shell left behind when the
+        // worktree's contents were cleared (external cleanup / CC-compaction
+        // restart). Pre-#1486 `worktree_exists_on_disk` reported true and there
+        // was no `worktree_valid`, so an agent saw a "present" worktree and
+        // skipped the rebuild it actually needed. Now: exists_on_disk stays
+        // true (literal) but worktree_valid is false (the rebuild signal).
+        let home = tmp_home("empty-shell");
+        let wt = home.join("empty-shell");
+        std::fs::create_dir_all(&wt).unwrap();
+        // No `.git`, no `.agend-managed`.
+        write_binding(&home, "alpha", "feature/x", wt.to_str().unwrap());
+
+        let result = handle_binding_state(&home, &json!({"instance": "alpha"}), &None);
+        assert_eq!(
+            result["worktree_exists_on_disk"].as_bool(),
+            Some(true),
+            "the shell dir is literally present: {result}"
+        );
+        assert_eq!(
+            result["worktree_valid"].as_bool(),
+            Some(false),
+            "empty shell (no .git, no marker) is NOT a usable worktree: {result}"
+        );
+        assert_eq!(
+            result["marker_present"].as_bool(),
+            Some(false),
+            "no .agend-managed marker: {result}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn binding_state_reports_valid_for_daemon_managed_worktree() {
+        // #1486: a daemon-managed worktree (`.agend-managed` marker, no `.git`
+        // in this minimal fixture) is valid via the marker arm of the
+        // `.git || .agend-managed` check — and marker_present is also true.
+        let home = tmp_home("managed-valid");
+        let wt = home.join("managed-worktree");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".agend-managed"), "agent=alpha\n").unwrap();
+        write_binding(&home, "alpha", "feature/x", wt.to_str().unwrap());
+
+        let result = handle_binding_state(&home, &json!({"instance": "alpha"}), &None);
+        assert_eq!(result["worktree_valid"].as_bool(), Some(true), "{result}");
+        assert_eq!(result["marker_present"].as_bool(), Some(true), "{result}");
         std::fs::remove_dir_all(&home).ok();
     }
 
