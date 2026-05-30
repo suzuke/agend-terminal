@@ -145,6 +145,51 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             }
         }
     }
+    // #1494: idempotent bind. When `bind:true` and THIS agent already holds a
+    // binding on the SAME branch whose worktree is live on disk, the branch was
+    // already provisioned — by the dispatch pre-build hook (binding.json +
+    // worktree at `<agent>/<branch>`) or a prior `repo checkout`. The direct
+    // `git worktree add` below would otherwise fail with "is already checked
+    // out" (the same branch is leased at the dispatch path, a DIFFERENT dir
+    // than this handler's `<agent>-<source>` scheme), forcing a manual `cd`.
+    // Return the EXISTING worktree path as success instead — same spirit as
+    // #1465 idempotent-release: operation already at target state = success.
+    //
+    // Cross-agent safety: `binding::read` is keyed per-agent, so a DIFFERENT
+    // agent holding the branch leaves this agent's binding absent/mismatched —
+    // the short-circuit does NOT fire and the genuine `git worktree add`
+    // conflict error below is preserved. Same-agent DIFFERENT-branch bindings
+    // also fall through (branch mismatch), unchanged.
+    if bind {
+        if let Some(existing) = crate::binding::read(home, instance_name) {
+            let same_branch = existing.get("branch").and_then(|v| v.as_str()) == Some(branch);
+            let live_wt = existing
+                .get("worktree")
+                .and_then(|v| v.as_str())
+                .map(std::path::PathBuf::from)
+                .filter(|p| p.exists());
+            if same_branch {
+                if let Some(wt) = live_wt {
+                    let wt_str = wt.display().to_string();
+                    tracing::info!(
+                        instance = instance_name,
+                        %branch,
+                        path = %wt_str,
+                        "repo checkout bind:true idempotent — agent already bound to this branch, returning existing worktree"
+                    );
+                    return json!({
+                        "path": wt_str,
+                        "source": source_path,
+                        "branch": branch,
+                        "bound": true,
+                        "idempotent": true,
+                        "auto_created_branch": auto_created_branch,
+                        "fetch_attempted": fetch_attempted,
+                    });
+                }
+            }
+        }
+    }
     // When `bind:true`, omit `--detach` so HEAD lands on the named
     // branch — subsequent commits write to the right ref without the
     // extra `git switch` that triggered the #778 chicken-and-egg.
