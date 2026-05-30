@@ -621,7 +621,10 @@ mod tests {
     fn save_session_if_changed_writes_only_on_change() {
         let home = tmp_home("save-if-changed");
         let mut layout = Layout::new();
-        layout.add_tab(Tab::new("t1".to_string(), test_pane(1, "dev", Some("dev-1"))));
+        layout.add_tab(Tab::new(
+            "t1".to_string(),
+            test_pane(1, "dev", Some("dev-1")),
+        ));
         let mut cache: Option<String> = None;
 
         assert!(
@@ -633,7 +636,10 @@ mod tests {
             !save_session_if_changed(&home, &layout, &mut cache),
             "unchanged layout must NOT rewrite"
         );
-        layout.add_tab(Tab::new("t2".to_string(), test_pane(2, "rev", Some("rev-1"))));
+        layout.add_tab(Tab::new(
+            "t2".to_string(),
+            test_pane(2, "rev", Some("rev-1")),
+        ));
         assert!(
             save_session_if_changed(&home, &layout, &mut cache),
             "changed layout must write"
