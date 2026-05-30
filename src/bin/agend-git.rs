@@ -342,9 +342,27 @@ fn classify(
                 Action::Deny("bound but no worktree path".into())
             }
         }
-        // Mutating commands: deny when unbound.
+        // Mutating commands: deny when unbound, else route to the bound
+        // worktree.
+        //
+        // #1511: `read-tree`, `update-index`, and `apply` are index-mutating
+        // plumbing that previously fell to the `_` default arm — which is
+        // `unbound → Passthrough`, so an unbound agent (cwd = canonical) could
+        // `git read-tree -m …` straight into the SHARED source-repo index
+        // (UU/DU markers leaking to every worktree). Folding them into this
+        // mutating arm gives them the safe contract the porcelain mutators
+        // already have: `unbound → Deny` (closes the hole) and
+        // `bound → ChdirPass` (routes to the agent's PRIVATE worktree index,
+        // ignoring cwd — so a bound agent is safe even standing in canonical).
+        // No canonical_cwd gate needed: ChdirPass already redirects away from
+        // cwd. Daemon-internal callers set `AGEND_GIT_BYPASS=1` and never reach
+        // `classify`. Exact-match tokens — `read-tree` does NOT catch the
+        // read-only `merge-tree`. `reset` stays here (it always required a
+        // binding); `git reset --hard` remains the agent's self-recovery tool.
+        // Deferred to follow-up (ref/porcelain nuance, not index plumbing):
+        // `restore --staged`, `update-ref`, `symbolic-ref`.
         "commit" | "pull" | "reset" | "revert" | "cherry-pick" | "stash" | "merge" | "rebase"
-        | "am" | "add" | "rm" | "mv" => {
+        | "am" | "add" | "rm" | "mv" | "read-tree" | "update-index" | "apply" => {
             if !bound {
                 return Action::Deny("unbound — no active task assignment".into());
             }
@@ -1132,6 +1150,115 @@ mod tests {
             branch: Some(branch.into()),
             worktree: Some(worktree.into()),
         }
+    }
+
+    // ── #1511: index-mutating plumbing folded into the mutating arm ──
+
+    /// Unbound `read-tree` (the bug shape: `git read-tree -m <base> a b` from a
+    /// canonical-rooted cwd) must now DENY instead of passing through to the
+    /// shared index. Pre-#1511 it fell to the `_` arm → `unbound → Passthrough`.
+    #[test]
+    fn read_tree_unbound_denied_1511() {
+        let action = classify(
+            "read-tree",
+            &[
+                "read-tree".into(),
+                "-m".into(),
+                "base".into(),
+                "a".into(),
+                "b".into(),
+            ],
+            &Binding::default(), // unbound
+            false,
+            false,
+            true,
+        );
+        match action {
+            Action::Deny(reason) => assert!(
+                reason.contains("unbound"),
+                "unbound read-tree must deny: {reason}"
+            ),
+            other => {
+                panic!("unbound read-tree MUST deny (was the index-pollution hole), got {other:?}")
+            }
+        }
+    }
+
+    /// A BOUND agent's `read-tree` routes to its private worktree (ChdirPass)
+    /// regardless of cwd — so it never touches the canonical shared index. No
+    /// canonical_cwd gate is needed; ChdirPass redirects away from cwd.
+    #[test]
+    fn read_tree_bound_routes_to_worktree_1511() {
+        let action = classify(
+            "read-tree",
+            &["read-tree".into(), "-m".into(), "base".into()],
+            &bound_binding("feat/x", "/tmp/.worktrees/dev"),
+            false,
+            false,
+            true,
+        );
+        assert_eq!(
+            action,
+            Action::ChdirPass("/tmp/.worktrees/dev".into()),
+            "bound read-tree must route to the private worktree, not deny"
+        );
+    }
+
+    /// `update-index` and `apply` join the same arm (clear index plumbing).
+    #[test]
+    fn update_index_and_apply_unbound_denied_1511() {
+        for sub in ["update-index", "apply"] {
+            let action = classify(sub, &[sub.into()], &Binding::default(), false, false, true);
+            assert!(
+                matches!(action, Action::Deny(_)),
+                "unbound {sub} must deny, got {action:?}"
+            );
+        }
+    }
+
+    /// Precise-match guard: `merge-tree` is READ-ONLY (writes only to the object
+    /// DB, never the index) — it must NOT be caught by the `read-tree`/`merge`
+    /// tokens. It falls to the `_` arm → unbound Passthrough, so the daemon's
+    /// `merge-tree --write-tree` conflict check (and agents using it) keep working.
+    #[test]
+    fn merge_tree_not_caught_by_1511() {
+        let action = classify(
+            "merge-tree",
+            &[
+                "merge-tree".into(),
+                "--write-tree".into(),
+                "a".into(),
+                "b".into(),
+            ],
+            &Binding::default(),
+            false,
+            false,
+            true,
+        );
+        assert_eq!(
+            action,
+            Action::Passthrough,
+            "merge-tree is read-only and must NOT be denied/caught by #1511"
+        );
+    }
+
+    /// `git reset --hard` stays the agent's self-recovery tool: a bound agent
+    /// must be able to run it (routes to its worktree), not be blocked.
+    #[test]
+    fn reset_hard_not_blocked_for_bound_agent_1511() {
+        let action = classify(
+            "reset",
+            &["reset".into(), "--hard".into(), "origin/main".into()],
+            &bound_binding("feat/x", "/tmp/.worktrees/dev"),
+            false,
+            false,
+            true,
+        );
+        assert_eq!(
+            action,
+            Action::ChdirPass("/tmp/.worktrees/dev".into()),
+            "reset --hard must remain available to a bound agent (self-recovery)"
+        );
     }
 
     #[test]
