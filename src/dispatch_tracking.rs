@@ -127,6 +127,54 @@ pub fn sweep_orphans(home: &Path) -> Vec<DispatchEntry> {
     orphans
 }
 
+/// #1488: drop every dispatch entry that involves `instance` as either the
+/// dispatcher (`from`) or the target (`to`). When an instance is deleted, its
+/// in-flight dispatches can never complete, so `sweep_stuck` would re-warn /
+/// re-ask them forever (the empirical ~81 "dispatch stuck check" messages).
+/// Marking them "orphaned" is NOT enough — `sweep_stuck` only skips
+/// `completed`, so an orphaned-but-uncompleted entry still re-fires. Removal
+/// is the only thing that stops the noise; the entries carry no re-target
+/// value once the instance is gone. Returns the number removed.
+pub fn cleanup_for_instance(home: &Path, instance: &str) -> usize {
+    let mut removed = 0usize;
+    let _ = crate::store::mutate_versioned(&store_path(home), |store: &mut DispatchStore| {
+        let before = store.entries.len();
+        store
+            .entries
+            .retain(|e| e.from != instance && e.to != instance);
+        removed = before - store.entries.len();
+        Ok(())
+    });
+    if removed > 0 {
+        tracing::info!(
+            %instance,
+            count = removed,
+            "#1488: removed dispatch_tracking entries for deleted instance"
+        );
+    }
+    removed
+}
+
+/// #1488: distinct, still-active (`status != "completed"`) dispatch target
+/// names. The boot orphan sweep uses this to find entries whose `to` instance
+/// no longer exists, then reuses [`cleanup_for_instance`] to remove them —
+/// sharing the exact delete-path logic instead of duplicating it.
+pub fn active_target_names(home: &Path) -> Vec<String> {
+    let store: DispatchStore = crate::store::load_versioned(
+        &store_path(home),
+        <DispatchStore as crate::store::SchemaVersioned>::CURRENT,
+    );
+    let mut names: Vec<String> = store
+        .entries
+        .iter()
+        .filter(|e| e.status != "completed" && !e.to.is_empty())
+        .map(|e| e.to.clone())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// M3: Remove terminal entries (completed/orphaned) older than 30 days.
 /// Prevents unbounded growth of dispatch_tracking.json.
 pub fn gc_old_entries(home: &Path) {
@@ -325,6 +373,54 @@ mod tests {
         let entries = store["entries"].as_array().expect("entries");
         assert_eq!(entries.len(), 1, "old entry should be removed: {entries:?}");
         assert_eq!(entries[0]["task_id"], "t-recent");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #1488 cascade: drop dispatch entries for a deleted instance ──
+
+    fn entry(from: &str, to: &str) -> DispatchEntry {
+        DispatchEntry {
+            task_id: Some(format!("t-{from}-{to}")),
+            from: from.into(),
+            to: to.into(),
+            from_id: None,
+            to_id: None,
+            delegated_at: chrono::Utc::now().to_rfc3339(),
+            status: "pending".into(),
+        }
+    }
+
+    #[test]
+    fn cleanup_for_instance_removes_from_and_to_keeps_unrelated() {
+        let home = tmp_home("cleanup-inst");
+        track_dispatch(&home, entry("lead", "doomed")); // to == doomed
+        track_dispatch(&home, entry("doomed", "dev")); // from == doomed
+        track_dispatch(&home, entry("lead", "dev")); // unrelated
+        let removed = cleanup_for_instance(&home, "doomed");
+        assert_eq!(removed, 2, "both from== and to==doomed entries removed");
+        let store: serde_json::Value =
+            crate::store::load(&crate::store::store_path(&home, "dispatch_tracking.json"));
+        let entries = store["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "unrelated entry must survive");
+        assert_eq!(entries[0]["to"], "dev");
+        assert_eq!(entries[0]["from"], "lead");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn active_target_names_returns_distinct_non_completed() {
+        let home = tmp_home("active-targets");
+        track_dispatch(&home, entry("lead", "dev"));
+        track_dispatch(&home, entry("lead", "dev")); // dup target
+        let mut done = entry("lead", "reviewer");
+        done.status = "completed".into();
+        track_dispatch(&home, done);
+        let names = active_target_names(&home);
+        assert_eq!(
+            names,
+            vec!["dev"],
+            "distinct, completed excluded: {names:?}"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }

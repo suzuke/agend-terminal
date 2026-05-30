@@ -64,6 +64,83 @@ pub fn remove_watch(
     );
 }
 
+/// #1488: scrub a deleted instance out of every CI watch. For each watch file:
+/// drop `instance` from the `subscribers` list (and the legacy single
+/// `instance` field), and clear `next_after_ci` if it pointed at the deleted
+/// instance (otherwise CI-pass would route `[ci-ready-for-action]` to a ghost).
+/// A watch left with no subscribers AND no `next_after_ci` is removed entirely
+/// — nothing would ever consume it. Returns the count of watches modified or
+/// removed.
+pub fn cleanup_watches_for_instance(home: &Path, instance: &str) -> usize {
+    let dir = ci_watches_dir(home);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return 0, // no ci-watches dir yet → nothing to clean
+    };
+    let mut affected = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        // flock the watch so a concurrent poll/unwatch doesn't race the RMW.
+        let lock_path = path.with_extension("lock");
+        let _lock = match crate::store::acquire_file_lock(&lock_path) {
+            Ok(l) => l,
+            Err(_) => continue, // contended → skip; boot sweep retries next boot
+        };
+        let mut watch: super::watch_state::WatchState = match std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|c| serde_json::from_str::<super::watch_state::WatchState>(&c).ok())
+        {
+            Some(w) => w,
+            None => continue,
+        };
+
+        let mut changed = false;
+        if let Some(subs) = watch.subscribers.as_mut() {
+            let before = subs.len();
+            subs.retain(|s| s.instance != instance);
+            if subs.len() != before {
+                changed = true;
+            }
+        }
+        if watch.instance.as_deref() == Some(instance) {
+            watch.instance = None;
+            changed = true;
+        }
+        if watch.next_after_ci.as_deref() == Some(instance) {
+            watch.next_after_ci = None;
+            changed = true;
+        }
+        if !changed {
+            continue;
+        }
+
+        let (repo, branch) = (watch.repo.clone(), watch.branch.clone());
+        if watch.subscriber_names().is_empty() && watch.next_after_ci.is_none() {
+            remove_watch(home, &path, instance, &repo, &branch, "instance_deleted");
+        } else if let Err(e) = crate::store::atomic_write(
+            &path,
+            serde_json::to_string_pretty(&watch)
+                .unwrap_or_default()
+                .as_bytes(),
+        ) {
+            tracing::warn!(path = %path.display(), error = %e, "#1488: ci-watch scrub write failed");
+            continue;
+        }
+        affected += 1;
+    }
+    if affected > 0 {
+        tracing::info!(
+            %instance,
+            count = affected,
+            "#1488: scrubbed deleted instance from CI watches"
+        );
+    }
+    affected
+}
+
 /// Deterministic, collision-resistant filename for a CI watch entry.
 /// Uses SHA-256 of `"{repo}:{branch}"` to avoid path traversal and
 /// collisions when repo names contain `/` (e.g. `owner/repo` vs
@@ -304,6 +381,89 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── #1488 cascade: scrub a deleted instance out of CI watches ──
+
+    fn write_watch(home: &Path, name: &str, ws: &super::super::watch_state::WatchState) {
+        let dir = ci_watches_dir(home);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{name}.json")),
+            serde_json::to_string_pretty(ws).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn sub(name: &str) -> super::super::watch_state::Subscriber {
+        super::super::watch_state::Subscriber {
+            instance: name.into(),
+            subscribed_at: None,
+        }
+    }
+
+    #[test]
+    fn cleanup_drops_subscriber_clears_next_keeps_watch_with_survivors() {
+        let home = std::env::temp_dir().join(format!("agend-1488-ciw-keep-{}", std::process::id()));
+        let ws = super::super::watch_state::WatchState {
+            repo: "o/r".into(),
+            branch: "feat".into(),
+            subscribers: Some(vec![sub("doomed"), sub("alive")]),
+            next_after_ci: Some("doomed".into()),
+            ..Default::default()
+        };
+        write_watch(&home, "w", &ws);
+        let n = cleanup_watches_for_instance(&home, "doomed");
+        assert_eq!(n, 1, "one watch modified");
+        let path = ci_watches_dir(&home).join("w.json");
+        assert!(path.exists(), "watch with surviving subscriber must remain");
+        let after: super::super::watch_state::WatchState =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(after.subscriber_names(), vec!["alive"], "doomed removed");
+        assert!(
+            after.next_after_ci.is_none(),
+            "next_after_ci pointing at doomed must be cleared"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn cleanup_removes_watch_with_no_survivors() {
+        let home = std::env::temp_dir().join(format!("agend-1488-ciw-rm-{}", std::process::id()));
+        let ws = super::super::watch_state::WatchState {
+            repo: "o/r".into(),
+            branch: "feat".into(),
+            subscribers: Some(vec![sub("doomed")]),
+            next_after_ci: Some("doomed".into()),
+            ..Default::default()
+        };
+        write_watch(&home, "w", &ws);
+        let n = cleanup_watches_for_instance(&home, "doomed");
+        assert_eq!(n, 1);
+        assert!(
+            !ci_watches_dir(&home).join("w.json").exists(),
+            "watch with no remaining subscribers AND no next_after_ci must be removed"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn cleanup_noop_when_instance_absent() {
+        let home = std::env::temp_dir().join(format!("agend-1488-ciw-noop-{}", std::process::id()));
+        let ws = super::super::watch_state::WatchState {
+            repo: "o/r".into(),
+            branch: "feat".into(),
+            subscribers: Some(vec![sub("alive")]),
+            ..Default::default()
+        };
+        write_watch(&home, "w", &ws);
+        assert_eq!(
+            cleanup_watches_for_instance(&home, "ghost"),
+            0,
+            "no watch references ghost → nothing modified"
+        );
+        assert!(ci_watches_dir(&home).join("w.json").exists());
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]

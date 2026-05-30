@@ -232,6 +232,42 @@ pub fn set_enabled(home: &Path, schedule_id: &str, enabled: bool) {
     });
 }
 
+/// #1488: when an instance is deleted, disable every schedule that targets it
+/// and mark it orphaned in `run_history` — but DON'T delete the row, so the
+/// operator can re-target a still-useful schedule (e.g. an AI-Scout cron) at a
+/// surviving instance. Idempotent: an already-disabled schedule is left
+/// untouched (no duplicate `orphaned` marker), so a boot-time re-sweep doesn't
+/// grow `run_history` unboundedly. Returns the number of schedules newly
+/// orphaned.
+pub fn orphan_schedules_for_target(home: &Path, deleted_target: &str) -> usize {
+    let target = deleted_target.to_string();
+    let mut orphaned = 0usize;
+    let _ = crate::store::mutate_versioned(&store_path(home), |store: &mut ScheduleStore| {
+        let now = chrono::Utc::now().to_rfc3339();
+        for sched in store.schedules.iter_mut() {
+            if sched.target != target || !sched.enabled {
+                continue;
+            }
+            sched.enabled = false;
+            sched.updated_at = now.clone();
+            sched.run_history.push(ScheduleRun {
+                triggered_at: now.clone(),
+                status: format!("orphaned: target instance '{target}' deleted"),
+            });
+            orphaned += 1;
+        }
+        Ok(())
+    });
+    if orphaned > 0 {
+        tracing::info!(
+            target = %deleted_target,
+            count = orphaned,
+            "#1488: disabled + marked orphaned schedules targeting deleted instance"
+        );
+    }
+    orphaned
+}
+
 /// Normalise a 5-field cron to the 6-field form the `cron` crate expects
 /// (prepend a "0" seconds column). Idempotent for 6-field input.
 fn normalise_cron(expr: &str) -> String {
@@ -472,6 +508,7 @@ pub fn delete(home: &Path, args: &Value) -> Value {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -927,5 +964,71 @@ mod tests {
         let id2 = r2["id"].as_str().expect("id2");
         assert_ne!(id1, id2, "rapid-fire schedule IDs must be unique");
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #1488 cascade: orphan schedules when their target is deleted ──
+
+    fn seed_two_schedules(home: &Path) {
+        let store = serde_json::json!({
+            "schema_version": 2,
+            "schedules": [
+                {"id": "s-doomed", "message": "m", "target": "doomed",
+                 "trigger": {"kind": "cron", "expr": "0 9 * * *"}, "enabled": true,
+                 "timezone": "UTC", "created_at": "2026-01-01T00:00:00Z",
+                 "updated_at": "2026-01-01T00:00:00Z", "run_history": []},
+                {"id": "s-alive", "message": "m", "target": "alive",
+                 "trigger": {"kind": "cron", "expr": "0 9 * * *"}, "enabled": true,
+                 "timezone": "UTC", "created_at": "2026-01-01T00:00:00Z",
+                 "updated_at": "2026-01-01T00:00:00Z", "run_history": []}
+            ]
+        });
+        std::fs::write(
+            home.join("schedules.json"),
+            serde_json::to_string_pretty(&store).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn orphan_schedules_disables_target_and_marks_history_leaving_others() {
+        let home = tmp_home("orphan-sched");
+        seed_two_schedules(&home);
+        let n = orphan_schedules_for_target(&home, "doomed");
+        assert_eq!(n, 1, "exactly the doomed-targeting schedule is orphaned");
+        let store = load(&home);
+        let doomed = store.schedules.iter().find(|s| s.id == "s-doomed").unwrap();
+        assert!(!doomed.enabled, "doomed schedule must be disabled");
+        assert!(
+            doomed
+                .run_history
+                .last()
+                .is_some_and(|r| r.status.contains("orphaned")),
+            "doomed schedule must carry an orphaned run_history marker"
+        );
+        let alive = store.schedules.iter().find(|s| s.id == "s-alive").unwrap();
+        assert!(alive.enabled, "unrelated schedule must stay enabled");
+        assert!(alive.run_history.is_empty(), "unrelated schedule untouched");
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn orphan_schedules_is_idempotent_no_double_marking() {
+        let home = tmp_home("orphan-sched-idem");
+        seed_two_schedules(&home);
+        assert_eq!(orphan_schedules_for_target(&home, "doomed"), 1);
+        // Second sweep: already disabled → no-op, no extra history entry.
+        assert_eq!(
+            orphan_schedules_for_target(&home, "doomed"),
+            0,
+            "re-sweep of an already-orphaned schedule must be a no-op"
+        );
+        let store = load(&home);
+        let doomed = store.schedules.iter().find(|s| s.id == "s-doomed").unwrap();
+        assert_eq!(
+            doomed.run_history.len(),
+            1,
+            "idempotent: run_history must not grow on repeated sweeps"
+        );
+        std::fs::remove_dir_all(home).ok();
     }
 }

@@ -58,6 +58,18 @@ pub fn resolve_uuid(home: &Path, name: &str) -> Option<crate::types::InstanceId>
         })
 }
 
+/// #1488: is `name` a currently-known fleet instance? True iff fleet.yaml has
+/// an `instances:` entry for it (regardless of whether it has a parseable id or
+/// is currently running). Unlike [`resolve_uuid`], this does not require an id
+/// — an offline-but-configured instance counts as known. Used by the cron
+/// schedule fail-safe and the boot orphan sweep to distinguish a deletable
+/// ghost target from a legitimate offline instance.
+pub fn instance_is_known(home: &Path, name: &str) -> bool {
+    FleetConfig::load(&fleet_yaml_path(home))
+        .map(|c| c.instances.contains_key(name))
+        .unwrap_or(false)
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FleetConfig {
     #[serde(default)]
@@ -681,6 +693,23 @@ instances:
         // Submit key should be default \r, not preset's
         assert_eq!(resolved.submit_key, "\r");
 
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn instance_is_known_true_for_fleet_entry_false_for_ghost() {
+        // #1488: instance_is_known gates the cron fail-safe + boot sweep. An
+        // entry without an id still counts as known (offline-but-configured);
+        // a name absent from fleet.yaml is a deletable ghost.
+        let dir = std::env::temp_dir().join(format!("agend-1488-known-{}", std::process::id()));
+        fs::create_dir_all(&dir).ok();
+        fs::write(
+            fleet_yaml_path(&dir),
+            "instances:\n  alive:\n    backend: claude\n",
+        )
+        .unwrap();
+        assert!(instance_is_known(&dir, "alive"), "fleet entry is known");
+        assert!(!instance_is_known(&dir, "ghost"), "absent name is a ghost");
         fs::remove_dir_all(&dir).ok();
     }
 
