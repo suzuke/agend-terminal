@@ -58,6 +58,22 @@ Hooks are per-clone. After a fresh `git clone`, install with:
 scripts/install-hooks.sh
 ```
 
+## Test fidelity: feed consumers the producer's real output (#1493)
+
+When a test exercises a consumer of some wire format — a parser, a matcher, a
+predicate over a string/struct another function builds — **construct the input
+by calling the producer, not by hand-writing the shape.** Review check: *"is
+this fixture identical to what production actually sends?"*
+
+This is the #1483 false-green class: `notification_is_actionable_wake` matched
+bracketed body markers that the real `[AGEND-MSG-PENDING]` pointer never
+contains, and the tests hand-crafted that never-emitted shape — so the matcher
+was dead code while the tests passed (then drifted again when #1487 added a
+`now=` field the crafted strings lacked). Fix pattern: extract one builder
+(e.g. `build_pending_pointer`) and route BOTH production and the tests through
+it. Hand-crafted input is still correct for testing a parser's *malformed/edge*
+handling — just pin the happy-path contract against the real producer.
+
 ## sync→async bridge: no raw shared-runtime `block_on` (#1476)
 
 **HARD RULE.** A sync→async bridge MUST NOT call `block_on` directly on a

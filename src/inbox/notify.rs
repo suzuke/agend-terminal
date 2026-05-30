@@ -407,6 +407,38 @@ pub fn notify_system(
     enqueue_with_idle_hint(home, target, msg)
 }
 
+/// #1493: single source of truth for the `[AGEND-MSG-PENDING]` pointer line.
+///
+/// Both the producer ([`enqueue_with_idle_hint_with_emitter`]) and the
+/// actionable-wake consumer tests build pointers through this fn, so a test
+/// input can never *structurally* drift from the real wire shape. That drift
+/// is the false-green class behind #1483: the consumer tests once hand-crafted
+/// a pointer shape (missing the `now=` field, missing `sanitize_header_value`)
+/// that production no longer emits — the matcher tests passed against a shape
+/// the consumer never actually sees. Routing both through one builder closes
+/// the gap: add a field here and every test input gets it for free.
+///
+/// `now_field` is the already-formatted `now=…` token (see
+/// [`operator_now_field`]); it's passed in rather than computed so callers and
+/// tests stay deterministic.
+pub(crate) fn build_pending_pointer(
+    id: &str,
+    kind: &str,
+    from_short: &str,
+    inbox_count: usize,
+    now_field: &str,
+) -> String {
+    format!(
+        "{} id={} kind={} from={} inbox={} {} (use inbox tool)",
+        PENDING_HEADER_PREFIX,
+        sanitize_header_value(id),
+        sanitize_header_value(kind),
+        sanitize_header_value(from_short),
+        inbox_count,
+        now_field,
+    )
+}
+
 /// Test-seam variant of [`enqueue_with_idle_hint`]. Accepts a closure
 /// that receives the formatted hint string so unit tests can verify
 /// the wire format without standing up the API loopback.
@@ -445,15 +477,9 @@ where
         let first_line = msg_text.lines().next().unwrap_or(&msg_text);
         format!("{} (inbox={}) {}", first_line, pending, now_field)
     } else {
-        format!(
-            "{} id={} kind={} from={} inbox={} {} (use inbox tool)",
-            PENDING_HEADER_PREFIX,
-            sanitize_header_value(&id),
-            sanitize_header_value(kind_str),
-            sanitize_header_value(from_short),
-            pending,
-            now_field,
-        )
+        // #1493: build via the shared `build_pending_pointer` so the consumer
+        // tests exercise this exact shape (no hand-crafted drift).
+        build_pending_pointer(&id, kind_str, from_short, pending, &now_field)
     };
     emit_hint(&hint);
     Ok(())
@@ -512,28 +538,45 @@ where
 
 #[cfg(test)]
 mod actionable_wake_tests {
-    use super::notification_is_actionable_wake as is_actionable;
+    use super::{build_pending_pointer, notification_is_actionable_wake as is_actionable};
 
-    // #1483: these assert against the REAL string `compose_aware_inject`
-    // receives — the `[AGEND-MSG-PENDING] … kind=… …` pointer built by
-    // `enqueue_with_idle_hint` — NOT the bracketed body markers that only
-    // appear in the message text. Pre-#1483 the matcher keyed on
-    // `[ci-ready-for-action]`/`[delegate_task]` brackets which never appear in
-    // this pointer, so the bypass was dead code; feeding the real pointer here
-    // makes that regression visible (pre-#1483 these `assert!(...)` go red).
+    // #1483/#1493: these assert against the REAL pointer shape
+    // `compose_aware_inject` receives — built by the SAME `build_pending_pointer`
+    // the producer uses, NOT a hand-crafted string. Hand-crafting was the
+    // false-green trap: the pre-#1483 matcher keyed on bracketed body markers
+    // that never appear in the pointer (dead code), and the old tests had since
+    // drifted to a shape missing the #1487 `now=` field. Routing the test input
+    // through the producer's builder means any future field addition is
+    // exercised automatically and the input can never structurally diverge.
+
+    /// A fixed `now=` token — the value is irrelevant to the matcher; using a
+    /// constant keeps these tests deterministic while still including the field.
+    const NOW: &str = "now=2026-05-30T16:12:34+08:00";
 
     /// ci-ready / task dispatch / query pointers → actionable → bypass draft-gate.
     #[test]
     fn actionable_kinds_recognized_in_real_pointer() {
-        assert!(is_actionable(
-            "[AGEND-MSG-PENDING] id=m-1 kind=ci-ready-for-action from=system:ci inbox=1 (use inbox tool)"
-        ));
-        assert!(is_actionable(
-            "[AGEND-MSG-PENDING] id=m-2 kind=task from=fixup-lead inbox=3 (use inbox tool)"
-        ));
-        assert!(is_actionable(
-            "[AGEND-MSG-PENDING] id=m-3 kind=query from=fixup-lead inbox=1 (use inbox tool)"
-        ));
+        assert!(is_actionable(&build_pending_pointer(
+            "m-1",
+            "ci-ready-for-action",
+            "system:ci",
+            1,
+            NOW
+        )));
+        assert!(is_actionable(&build_pending_pointer(
+            "m-2",
+            "task",
+            "fixup-lead",
+            3,
+            NOW
+        )));
+        assert!(is_actionable(&build_pending_pointer(
+            "m-3",
+            "query",
+            "fixup-lead",
+            1,
+            NOW
+        )));
     }
 
     /// Regression-proof for #1483: the bracketed body markers (which live in
@@ -554,20 +597,32 @@ mod actionable_wake_tests {
     #[test]
     fn non_actionable_kinds_stay_gated() {
         // report / update pointers — informational, not work-delivery.
-        assert!(!is_actionable(
-            "[AGEND-MSG-PENDING] id=m-4 kind=report from=fixup-dev inbox=1 (use inbox tool)"
-        ));
-        assert!(!is_actionable(
-            "[AGEND-MSG-PENDING] id=m-5 kind=update from=fixup-lead inbox=1 (use inbox tool)"
-        ));
+        assert!(!is_actionable(&build_pending_pointer(
+            "m-4",
+            "report",
+            "fixup-dev",
+            1,
+            NOW
+        )));
+        assert!(!is_actionable(&build_pending_pointer(
+            "m-5",
+            "update",
+            "fixup-lead",
+            1,
+            NOW
+        )));
         // ci-conclusion friendly hint (kind=ci-watch, no `kind=` actionable) — informational.
         assert!(!is_actionable(
             "[ci-pass] owner/repo@br: passed ✓ (inbox=1)"
         ));
-        // field-exactness: a hypothetical superstring kind must not false-match `kind=task`.
-        assert!(!is_actionable(
-            "[AGEND-MSG-PENDING] id=m-6 kind=task_summary from=x inbox=1 (use inbox tool)"
-        ));
+        // field-exactness: a superstring kind must not false-match `kind=task`.
+        assert!(!is_actionable(&build_pending_pointer(
+            "m-6",
+            "task_summary",
+            "x",
+            1,
+            NOW
+        )));
     }
 }
 

@@ -242,6 +242,30 @@ mod tests {
         assert_eq!(id, Some("m-20260515184625304633-133".to_string()));
     }
 
+    /// #1493 producer→consumer contract: feed the REAL `format_header` output
+    /// (not a hand-crafted string) through `extract_msg_id_from_header` and
+    /// confirm the id round-trips. The crafted-header tests above are fine for
+    /// exercising parser *edge cases* (missing/empty `id=`), but the happy-path
+    /// contract must be pinned against the actual producer — otherwise a change
+    /// to `format_header`'s `id=` rendering (e.g. the #1487 `now=` addition)
+    /// could silently break suppression while the crafted tests stay green.
+    #[test]
+    fn extract_msg_id_round_trips_real_format_header() {
+        let mut msg = crate::inbox::InboxMessage {
+            from: "from:fixup-lead".to_string(),
+            text: "do the thing".to_string(),
+            ..Default::default()
+        };
+        msg.id = Some("m-20260530120000000000-42".to_string());
+        msg.kind = Some("task".to_string());
+        let header = crate::inbox::format_header(&msg);
+        assert_eq!(
+            extract_msg_id_from_header(&header),
+            Some("m-20260530120000000000-42".to_string()),
+            "id must round-trip through the real producer header: {header}"
+        );
+    }
+
     /// #836 unit: header without id= returns None — caller defaults
     /// to "allow through" per spike risk R3. Locks the conservative
     /// fallback.
