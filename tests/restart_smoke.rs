@@ -13,6 +13,12 @@
 //! catch a block_on panic; fire a schedule at a dynamically-spawned
 //! non-fleet.yaml target to catch the deadlock) is deferred — it needs a live
 //! bot token / schedule fixture that would make CI flaky.
+//!
+//! Unix-only: the daemon API is a Unix-domain socket and the probe agent uses
+//! `/bin/sh`; the fleet's primary platform is macOS and the restart-path bugs
+//! this guards were all Unix/socket-context. A Windows subprocess-daemon
+//! variant would be flaky for little coverage gain (#1481 CI: windows-latest).
+#![cfg(unix)]
 
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
