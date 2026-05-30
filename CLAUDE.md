@@ -33,6 +33,35 @@ Hooks are per-clone. After a fresh `git clone`, install with:
 scripts/install-hooks.sh
 ```
 
+## sync→async bridge: no raw shared-runtime `block_on` (#1476)
+
+**HARD RULE.** A sync→async bridge MUST NOT call `block_on` directly on a
+long-lived shared runtime accessor (`telegram_runtime()`, `discord_runtime()`,
+`shared_ci_runtime()`, …). Those are `current_thread` runtimes, so
+`<name>_runtime().block_on(...)` panics with *"Cannot start a runtime from
+within a runtime"* the moment a caller reaches it from inside a tokio runtime.
+
+This is exactly the bug telegram hit (#1474, teloxide 0.17 made the path
+reachable → panic on the next daemon restart) and that discord had copy-pasted
+(#1476). It stays latent for weeks because it only fires when the *caller's*
+context changes, not the bridge's.
+
+**Required pattern**: route every value-returning shared-runtime call through a
+`block_on_value`-style helper that guards with
+`tokio::runtime::Handle::try_current().is_ok()` and, when already inside a
+runtime, runs the future on a `std::thread::scope` thread with a *fresh* runtime
+(never nested). See `src/channel/telegram/state.rs::block_on_value` and
+`src/channel/discord.rs::block_on_value`.
+
+Local, freshly-built runtimes (`let rt = Builder::…build()?; rt.block_on(…)`)
+are exempt — a non-shared runtime is never nested. Only the shared-accessor
+form is dangerous.
+
+Enforced by `tests/block_on_runtime_guard_invariant.rs`: any
+`<name>_runtime().block_on` not inside a Handle-guarded / scoped-thread helper
+fails CI. Adding a new channel/bridge? Add a guarded helper, never a raw
+`block_on`.
+
 ## Worktree branch policy
 
 When creating a worktree, **always use `-b <dedicated-branch>`** to create a
