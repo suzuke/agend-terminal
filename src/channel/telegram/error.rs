@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use super::state::{lock_state, TelegramState};
-use super::topic_registry::{create_topic_for_instance, unregister_topic};
+use super::topic_registry::{create_topic_for_instance_async, unregister_topic};
 
 /// Classify a send error as "the bound topic was deleted out from under us".
 ///
@@ -194,7 +194,31 @@ pub(crate) fn handle_supergroup_migration(
 /// Returns `Some(new_tid)` on success so callers can retry the send with
 /// the fresh topic. Returns `None` when topic creation fails (no bot
 /// token, network error, etc.) — callers should log and give up.
+///
+/// Synchronous wrapper for callers on a plain (non-runtime) thread — the
+/// reply path, which `block_on`s its own send and only reaches the
+/// topic-deleted branch when NOT inside a runtime (in-runtime sends spawn
+/// fire-and-forget and return early). Async callers — the `notify` send
+/// task, which runs inside the telegram runtime — must use
+/// [`invalidate_and_recreate_topic_async`]; calling this from there would
+/// panic with "Cannot start a runtime from within a runtime" (#1474).
 pub(crate) fn invalidate_and_recreate_topic(
+    home: &Path,
+    instance_name: &str,
+    stale_tid: i32,
+) -> Option<i32> {
+    super::state::telegram_runtime().block_on(invalidate_and_recreate_topic_async(
+        home,
+        instance_name,
+        stale_tid,
+    ))
+}
+
+/// Async core of [`invalidate_and_recreate_topic`]. Awaits topic creation
+/// instead of `block_on`, so the `notify` task (already inside the telegram
+/// runtime) can self-heal a deleted topic without the nested-runtime panic
+/// that wedged the daemon in #1474.
+pub(crate) async fn invalidate_and_recreate_topic_async(
     home: &Path,
     instance_name: &str,
     stale_tid: i32,
@@ -205,7 +229,7 @@ pub(crate) fn invalidate_and_recreate_topic(
         "invalidating stale topic and recreating"
     );
     unregister_topic(home, stale_tid);
-    create_topic_for_instance(home, instance_name)
+    create_topic_for_instance_async(home, instance_name).await
 }
 
 #[cfg(test)]
@@ -388,6 +412,43 @@ instances:
             fleet_yaml.contains("important"),
             "instance role must survive; yaml:\n{fleet_yaml}"
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1474 regression: the async self-heal must be drivable from INSIDE a
+    /// tokio runtime context without the "Cannot start a runtime from within
+    /// a runtime" panic. The pre-fix path reached `block_on` transitively
+    /// (`invalidate_and_recreate_topic` → `create_topic_for_instance`); on a
+    /// runtime worker that panicked, and the `notify` send task hit it in a
+    /// tight retry loop — wedging the daemon (API/MCP timed out, TUI froze).
+    /// `block_on` here enters a runtime context (so `Handle::try_current()`
+    /// is `Ok`, the exact precondition for the panic). Note: with no channel
+    /// configured the async creation path returns early before the network
+    /// `create_forum_topic().await`, so this pins the non-network contract
+    /// (no nested `block_on` on the lookup/unregister/resolve path) and the
+    /// unregister side effect; it does not exercise the live bot call.
+    #[test]
+    fn invalidate_async_runs_inside_runtime_without_nested_runtime_panic() {
+        let home = tmp_home("invalidate-async-in-runtime");
+        register_topic(&home, 42, "agent-x").unwrap();
+        register_topic(&home, 99, "agent-y").unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = rt.block_on(invalidate_and_recreate_topic_async(&home, "agent-x", 42));
+        assert!(
+            result.is_none(),
+            "no channel → creation fails, must not panic"
+        );
+
+        let reg = load_topic_registry(&home);
+        assert!(
+            !reg.contains_key(&42),
+            "stale topic 42 must be unregistered"
+        );
+        assert_eq!(reg.get(&99), Some(&"agent-y".to_string()));
         std::fs::remove_dir_all(&home).ok();
     }
 

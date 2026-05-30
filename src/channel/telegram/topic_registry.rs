@@ -65,20 +65,40 @@ pub fn lookup_topic_for_instance(home: &std::path::Path, instance_name: &str) ->
 }
 
 /// Create a forum topic for a new instance.
+///
+/// Synchronous wrapper around [`create_topic_for_instance_async`]. Safe to
+/// call from plain (non-runtime) threads — boot, `tui_spawn`, MCP/api spawn
+/// handlers. **Must NOT be called from within a tokio runtime** (e.g. the
+/// `notify` send task), because `block_on` inside a runtime worker panics
+/// with "Cannot start a runtime from within a runtime". Async callers must
+/// use [`create_topic_for_instance_async`] directly.
 pub fn create_topic_for_instance(home: &std::path::Path, instance_name: &str) -> Option<i32> {
+    telegram_runtime().block_on(create_topic_for_instance_async(home, instance_name))
+}
+
+/// Async core of [`create_topic_for_instance`]. Awaits the bot call directly
+/// instead of `block_on`, so callers already inside a tokio runtime can reuse
+/// the same idempotent reuse/create/register logic without the nested-runtime
+/// panic.
+pub async fn create_topic_for_instance_async(
+    home: &std::path::Path,
+    instance_name: &str,
+) -> Option<i32> {
     // Idempotent: reuse existing topic from topics.json if present.
     if let Some(tid) = lookup_topic_for_instance(home, instance_name) {
         tracing::info!(instance = %instance_name, topic_id = tid, "reusing existing topic");
         return Some(tid);
     }
     let ch = super::resolve_channel_only_from(home).ok()?;
-    match telegram_runtime().block_on(async {
-        let bot = teloxide::Bot::new(&ch.token);
+    let bot = teloxide::Bot::new(&ch.token);
+    let created: anyhow::Result<i32> = async {
         let topic = bot
             .create_forum_topic(teloxide::types::ChatId(ch.group_id), instance_name)
             .await?;
         Ok::<i32, anyhow::Error>(topic.thread_id.0 .0)
-    }) {
+    }
+    .await;
+    match created {
         Ok(tid) => {
             tracing::info!(instance = %instance_name, topic_id = tid, "created topic");
             if let Err(e) = register_topic(home, tid, instance_name) {
