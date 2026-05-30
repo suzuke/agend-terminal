@@ -119,13 +119,26 @@ pub fn check_schedules(home: &Path, registry: &AgentRegistry) {
                     "inject_failed"
                 }
             }
-        } else {
-            // #1441 routing change (`reg.get(target)` → resolve_uuid via
-            // fleet.yaml) means a schedule targeting a non-fleet instance now
-            // lands here. Defer the self-IPC enqueue past the lock — see the
-            // `deferred_inbox` note above.
+        } else if crate::fleet::instance_is_known(home, target) {
+            // Known fleet instance that simply isn't running right now. Defer
+            // the self-IPC enqueue past the lock (see the `deferred_inbox`
+            // note above) so it lands in the inbox for next time it checks.
             deferred_inbox = true;
             "ok_inbox"
+        } else {
+            // #1488 fail-safe: the target is NOT a known fleet instance —
+            // a deleted/renamed/typo'd target (the #1441 routing change made
+            // these fall through to the inbox fallback). Enqueuing would
+            // create an orphan inbox nobody drains and feed the dangerous
+            // self-IPC fallback that triggered the morning deadlock. Skip +
+            // warn instead; the schedule row stays (cascade/boot-sweep
+            // disables it), so this only fires until cleanup catches up.
+            tracing::warn!(
+                schedule = %sched_id,
+                target,
+                "#1488: schedule target is not a known instance — skipping fire (orphaned target)"
+            );
+            "skipped_unknown_target"
         };
         drop(reg);
 
@@ -214,6 +227,7 @@ pub(crate) fn is_due_in_tz(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
@@ -390,5 +404,88 @@ mod tests {
         let last = Utc.with_ymd_and_hms(2026, 4, 20, 14, 0, 0).unwrap();
         let now = Utc.with_ymd_and_hms(2026, 4, 20, 15, 0, 0).unwrap();
         assert!(classify_once("not a date", last, now).is_none());
+    }
+
+    // ── #1488 fail-safe: don't fire a schedule whose target is a ghost ──
+
+    fn cron_tmp_home(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static C: AtomicU32 = AtomicU32::new(0);
+        let id = C.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "agend-1488-cron-{}-{}-{}",
+            std::process::id(),
+            tag,
+            id
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn empty_registry() -> crate::agent::AgentRegistry {
+        std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    fn seed_oneshot(home: &std::path::Path, target: &str) {
+        let at = (chrono::Utc::now() - chrono::Duration::seconds(2)).to_rfc3339();
+        let store = serde_json::json!({
+            "schema_version": 2,
+            "schedules": [{
+                "id": "s-1488", "message": "ping", "target": target,
+                "trigger": {"kind": "once", "at": at}, "enabled": true,
+                "timezone": "UTC", "label": "t",
+                "created_at": at, "updated_at": at, "run_history": []
+            }]
+        });
+        std::fs::write(
+            home.join("schedules.json"),
+            serde_json::to_string_pretty(&store).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn last_status(home: &std::path::Path) -> String {
+        crate::schedules::load(home).schedules[0]
+            .run_history
+            .last()
+            .map(|r| r.status.clone())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn schedule_targeting_unknown_instance_is_skipped_not_enqueued() {
+        let home = cron_tmp_home("ghost");
+        // No fleet.yaml → "ghost" is not a known instance.
+        seed_oneshot(&home, "ghost");
+        check_schedules(&home, &empty_registry());
+        assert_eq!(
+            last_status(&home),
+            "skipped_unknown_target",
+            "fire to a ghost target must be skipped"
+        );
+        assert!(
+            !home.join("inbox").join("ghost.jsonl").exists(),
+            "no orphan inbox file may be created for a ghost target"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn schedule_targeting_known_offline_instance_enqueues_to_inbox() {
+        let home = cron_tmp_home("known");
+        // fleet.yaml declares "offline" (present but not in the registry).
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  offline:\n    backend: claude\n",
+        )
+        .unwrap();
+        seed_oneshot(&home, "offline");
+        check_schedules(&home, &empty_registry());
+        assert_eq!(
+            last_status(&home),
+            "ok_inbox",
+            "a known but offline target must still get an inbox enqueue"
+        );
+        std::fs::remove_dir_all(home).ok();
     }
 }

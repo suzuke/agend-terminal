@@ -119,6 +119,19 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
     // accumulate in the tracking list and inflate alert text.
     crate::daemon::idle_watchdog::remove_agent_activity(home, name);
 
+    // #1488: cascade-clean the services bound to the deleted instance.
+    // Without these, an orphaned schedule keeps firing into the cron self-IPC
+    // fallback (this morning's deadlock trigger), dispatch_tracking entries
+    // re-warn forever (the ~81 stuck-check messages), and CI watches route
+    // [ci-ready-for-action] to a ghost. All best-effort like the steps above.
+    // - schedules: DISABLED + marked orphaned (never deleted — operator may
+    //   re-target a still-useful cron at a surviving instance).
+    let _ = crate::schedules::orphan_schedules_for_target(home, name);
+    // - dispatch_tracking: GC'd (no re-target value; removal stops stuck noise).
+    let _ = crate::dispatch_tracking::cleanup_for_instance(home, name);
+    // - ci_watch: drop from subscribers + clear next_after_ci (+ remove empty).
+    let _ = crate::daemon::ci_watch::cleanup_watches_for_instance(home, name);
+
     // Sprint 54 P1-B Bug 1 audit: enumerate every store that still holds
     // the name. If any do, surface a loud error instead of returning
     // success — `auto_start_fleet` revival of a half-deleted instance is
@@ -434,6 +447,78 @@ mod tests {
         assert!(
             !activity_file.exists(),
             "activity sidecar must be removed after full_delete_instance"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn full_delete_instance_cascades_bound_services() {
+        // #1488: deleting an instance must cascade-clean its schedules,
+        // dispatch_tracking entries, and CI watches in one teardown.
+        let home = tmp_home("cascade");
+        // schedule targeting the doomed instance
+        std::fs::write(
+            home.join("schedules.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": 2,
+                "schedules": [{"id": "s-d", "message": "m", "target": "doomed",
+                    "trigger": {"kind": "cron", "expr": "0 9 * * *"}, "enabled": true,
+                    "timezone": "UTC", "created_at": "2026-01-01T00:00:00Z",
+                    "updated_at": "2026-01-01T00:00:00Z", "run_history": []}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // dispatch entry to the doomed instance
+        crate::dispatch_tracking::track_dispatch(
+            &home,
+            crate::dispatch_tracking::DispatchEntry {
+                task_id: Some("t-d".into()),
+                from: "lead".into(),
+                to: "doomed".into(),
+                from_id: None,
+                to_id: None,
+                delegated_at: chrono::Utc::now().to_rfc3339(),
+                status: "pending".into(),
+            },
+        );
+        // ci_watch with the doomed instance as sole subscriber
+        let ciw = crate::daemon::ci_watch::ci_watches_dir(&home);
+        std::fs::create_dir_all(&ciw).unwrap();
+        std::fs::write(
+            ciw.join("w.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "repo": "o/r", "branch": "feat",
+                "subscribers": [{"instance": "doomed"}],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let result = super::full_delete_instance(&home, "doomed");
+        assert!(
+            result.is_ok(),
+            "clean cascade must return Ok, got {result:?}"
+        );
+
+        // schedule disabled + marked orphaned (NOT deleted)
+        let sched = &crate::schedules::load(&home).schedules[0];
+        assert!(!sched.enabled, "schedule must be disabled by cascade");
+        assert!(sched
+            .run_history
+            .last()
+            .is_some_and(|r| r.status.contains("orphaned")));
+        // dispatch entry GC'd
+        let store: serde_json::Value =
+            crate::store::load(&crate::store::store_path(&home, "dispatch_tracking.json"));
+        assert!(
+            store["entries"].as_array().unwrap().is_empty(),
+            "dispatch entry to deleted instance must be GC'd"
+        );
+        // ci watch removed (sole subscriber gone)
+        assert!(
+            !ciw.join("w.json").exists(),
+            "ci watch with only the deleted subscriber must be removed"
         );
         std::fs::remove_dir_all(home).ok();
     }

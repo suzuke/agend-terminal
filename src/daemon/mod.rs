@@ -19,6 +19,7 @@ pub(crate) mod idle_watchdog;
 pub(crate) mod lifecycle;
 pub(crate) mod mcp_registry_watcher;
 pub(crate) mod notification_dedup;
+pub(crate) mod orphan_sweep;
 pub(crate) mod per_tick;
 pub(crate) mod poll_reminder;
 pub(crate) mod pr_state;
@@ -647,6 +648,9 @@ fn build_tick_infrastructure(
     crate::inbox::recover_half_writes(home);
     replay_missed_at_startup(home, &ctx.registry);
     crate::daemon::ci_watch::startup_sweep(home);
+    // #1488: GC bindings (schedules/dispatch_tracking/ci_watch) left orphaned
+    // by instances deleted before the cascade-on-delete fix existed.
+    crate::daemon::orphan_sweep::run(home);
 
     let watchdog_dry_run = watchdog::watchdog_dry_run_from_env();
     // Vec order MUST match the pre-extraction call order (zero-behavior-change guarantee).
