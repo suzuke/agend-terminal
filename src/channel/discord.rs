@@ -378,7 +378,7 @@ pub(crate) fn send_keepalive_patch(
     channel_id: u64,
 ) -> anyhow::Result<()> {
     let id = twilight_model::id::Id::new(channel_id);
-    discord_runtime().block_on(async { http.update_thread(id).archived(false).await })?;
+    block_on_value(async { http.update_thread(id).archived(false).await })?;
     Ok(())
 }
 
@@ -395,6 +395,37 @@ fn discord_runtime() -> &'static tokio::runtime::Runtime {
             .build()
             .expect("discord tokio runtime")
     })
+}
+
+/// #1476: run a Discord async call to completion, safe even when already inside
+/// a tokio runtime. `discord_runtime()` is a `current_thread` runtime, so
+/// calling `block_on` on it from within *any* runtime context panics with
+/// "Cannot start a runtime from within a runtime" (the same teloxide-0.17-class
+/// failure telegram hit in #1474). When a runtime is current, run the future on
+/// a dedicated scoped thread with its own fresh runtime — never nested. The
+/// non-nested fast path (shared runtime) is unchanged. Mirrors telegram's
+/// `state::block_on_value`; every shared-runtime `block_on` in this module MUST
+/// go through here (enforced by `tests/block_on_runtime_guard_invariant.rs`).
+fn block_on_value<F>(fut: F) -> F::Output
+where
+    F: std::future::Future + Send,
+    F::Output: Send,
+{
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("discord nested runtime")
+                    .block_on(fut)
+            })
+            .join()
+            .expect("discord nested block_on thread panicked")
+        })
+    } else {
+        discord_runtime().block_on(fut)
+    }
 }
 
 impl crate::channel::Channel for DiscordChannel {
@@ -426,7 +457,7 @@ impl crate::channel::Channel for DiscordChannel {
         let channel_id = twilight_model::id::Id::new(payload.channel_id);
         let text = msg.text;
         let cp = *payload;
-        discord_runtime().block_on(async {
+        block_on_value(async {
             let response = http.create_message(channel_id).content(&text).await?;
             let sent = response.model().await?;
             Ok(MsgRef {
@@ -456,7 +487,7 @@ impl crate::channel::Channel for DiscordChannel {
             .parse()
             .map_err(|_| anyhow::anyhow!("invalid discord message_id: {}", msg.id))?;
         let text = payload.text;
-        discord_runtime().block_on(async {
+        block_on_value(async {
             http.update_message(
                 twilight_model::id::Id::new(channel_id),
                 twilight_model::id::Id::new(mid),
@@ -483,7 +514,7 @@ impl crate::channel::Channel for DiscordChannel {
             .id
             .parse()
             .map_err(|_| anyhow::anyhow!("invalid discord message_id: {}", msg.id))?;
-        discord_runtime().block_on(async {
+        block_on_value(async {
             http.delete_message(
                 twilight_model::id::Id::new(channel_id),
                 twilight_model::id::Id::new(mid),
@@ -512,7 +543,7 @@ impl crate::channel::Channel for DiscordChannel {
             .get("category_id")
             .and_then(|v| v.parse::<u64>().ok());
         let gid = twilight_model::id::Id::new(guild_id);
-        discord_runtime().block_on(async {
+        block_on_value(async {
             let mut req = http.create_guild_channel(gid, display_name);
             if let Some(pid) = parent_id {
                 req = req.parent_id(twilight_model::id::Id::new(pid));
@@ -539,7 +570,7 @@ impl crate::channel::Channel for DiscordChannel {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("discord http client not initialized"))?;
         let cid = twilight_model::id::Id::new(payload.channel_id);
-        discord_runtime().block_on(async {
+        block_on_value(async {
             http.delete_channel(cid).await?;
             Ok(())
         })
