@@ -10,6 +10,7 @@
 #[test]
 fn recursion_guard_hard_fails_at_max_depth_1504() {
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_agend-git"))
+        .env("AGEND_TEST_ISOLATION", "1")
         .env("AGEND_GIT_SHIM_DEPTH", "3")
         .arg("--version")
         .output()
@@ -33,6 +34,7 @@ fn recursion_guard_hard_fails_at_max_depth_1504() {
 #[test]
 fn recursion_guard_does_not_fire_below_cap_1504() {
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_agend-git"))
+        .env("AGEND_TEST_ISOLATION", "1")
         .env("AGEND_GIT_SHIM_DEPTH", "2")
         .arg("--version")
         .output()
