@@ -173,9 +173,18 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
                     || t.status == crate::task_events::TaskStatus::InProgress)
         })
         .collect();
+    // #1496 Option 1: a send(kind=task) whose `task_id` is already one of the
+    // target's active tasks is ENRICHING that in-flight dispatch (finally
+    // delivering its context), not opening a competing one — let it through the
+    // busy-gate. Pairs with dropping task(create)'s premature auto-notify so the
+    // create→send dispatch sequence no longer needs force=true (#1496 spike).
+    let enriching_active = args["task_id"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .is_some_and(|tid| claimed_tasks.iter().any(|t| t.id.as_str() == tid));
     // #1286: branch-specific dispatch dedup — reject if target already has
     // an active task on the same branch (more specific than generic busy).
-    if !force {
+    if !force && !enriching_active {
         if let Some(branch) = args["branch"].as_str() {
             if let Some(dup) = claimed_tasks
                 .iter()
@@ -190,7 +199,7 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
             }
         }
     }
-    if !claimed_tasks.is_empty() {
+    if !claimed_tasks.is_empty() && !enriching_active {
         if force {
             if force_reason.is_none() || force_reason == Some("") {
                 return json!({"error": "force=true requires a non-empty 'force_reason'"});
