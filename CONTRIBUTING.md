@@ -18,6 +18,16 @@ cargo clippy -- -D warnings          # must be warning-free
 
 CI mirrors these steps on Ubuntu + macOS + Windows (`.github/workflows/ci.yml`).
 
+### Before pushing: `scripts/preflight.sh`
+
+Run the one-shot CI-parity preflight to catch failures locally instead of after a push:
+
+```bash
+scripts/preflight.sh          # full matrix; --quick skips the Windows cross-check
+```
+
+It runs exactly CI's `check` job — `cargo fmt --check`, `cargo clippy --all-targets --features tray -- -D warnings`, `cargo test --tests --features tray`, and a **Windows cross-check** (`x86_64-pc-windows-msvc`) that catches windows-only compile errors a unix dev box would otherwise miss. The Windows step prefers [`cargo-xwin`](https://github.com/rust-cross/cargo-xwin) (`cargo install cargo-xwin && rustup target add x86_64-pc-windows-msvc`) since a transitive C dependency (`ring`) won't cross-compile on macOS/Linux without the MSVC toolchain; if it's not installed the step SKIPs with a hint rather than false-failing.
+
 ### Coverage (optional, local)
 
 The `coverage` CI job (#686) runs `cargo-llvm-cov` on Ubuntu and uploads an lcov report to Codecov. To measure locally:
