@@ -17,8 +17,38 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// #1504 L3: max times the shim may re-enter before hard-failing. Healthy
+/// operation never exceeds 1 (real git ≠ shim → no re-entry), so a small cap
+/// has zero false-trip risk while containing a self-resolution spawn storm.
+const MAX_SHIM_DEPTH: u32 = 3;
+
+/// Current shim recursion depth, read from the propagated sentinel env.
+fn shim_depth() -> u32 {
+    env::var("AGEND_GIT_SHIM_DEPTH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
+
+    // #1504 L3: recursion guard. If git ever resolves back to THIS shim (e.g.
+    // AGEND_REAL_GIT unset + self-exclusion miss), each real-git spawn re-enters
+    // here; on Windows `exec_real_git` uses `status()` (spawn), so it's an
+    // unbounded process storm, not a single exec-replace. Cap the depth and
+    // hard-fail with an actionable message. Checked BEFORE `should_bypass`
+    // because the bypass path also execs real git.
+    let depth = shim_depth();
+    if depth >= MAX_SHIM_DEPTH {
+        eprintln!(
+            "agend-git: FATAL recursion guard tripped (AGEND_GIT_SHIM_DEPTH={depth}) — the \
+             shim resolved git to itself. AGEND_REAL_GIT is unset/unresolvable and \
+             $AGEND_HOME/bin was not excluded from PATH. Set AGEND_REAL_GIT to the real \
+             git binary. (#1504)"
+        );
+        std::process::exit(70); // EX_SOFTWARE
+    }
 
     // Bypass checks (3-layer per §7).
     if should_bypass() {
@@ -918,7 +948,10 @@ fn commit_is_empty_heartbeat(worktree: &str, hash: &str) -> bool {
 
 fn exec_with_conflict_guidance(args: &[String], worktree: &str) -> ! {
     let git = resolve_real_git();
+    // #1504 L3: propagate incremented depth (rebase/merge/pull/cherry-pick reach
+    // here and also spawn real git — same recursion vector as exec_real_git).
     let status = Command::new(&git)
+        .env("AGEND_GIT_SHIM_DEPTH", (shim_depth() + 1).to_string())
         .arg("-C")
         .arg(worktree)
         .args(args)
@@ -947,6 +980,9 @@ fn exec_with_conflict_guidance(args: &[String], worktree: &str) -> ! {
 fn exec_real_git(args: &[String], chdir: Option<&str>) -> ! {
     let git = resolve_real_git();
     let mut cmd = Command::new(&git);
+    // #1504 L3: propagate the incremented depth so a self-resolution loop trips
+    // the recursion guard at the next entry instead of spawning unbounded.
+    cmd.env("AGEND_GIT_SHIM_DEPTH", (shim_depth() + 1).to_string());
     if let Some(dir) = chdir {
         cmd.arg("-C").arg(dir);
     }
@@ -979,20 +1015,54 @@ fn resolve_real_git() -> String {
             return path;
         }
     }
-    // Priority 2: which excluding $AGEND_HOME/bin/.
-    let agend_bin = env::var("AGEND_HOME")
-        .map(|h| format!("{h}/bin"))
-        .unwrap_or_default();
-    let path_sep = if cfg!(windows) { ';' } else { ':' };
-    let search: String = env::var("PATH")
-        .unwrap_or_default()
-        .split(path_sep)
-        .filter(|p| !p.is_empty() && *p != agend_bin)
-        .collect::<Vec<_>>()
-        .join(&path_sep.to_string());
+    // Priority 2: which excluding $AGEND_HOME/bin/ (the shim dir).
+    // #1504 L2: exclude via canonicalized Path comparison, not a string compare.
+    // `format!("{h}/bin")` (forward slash) never matched a Windows PATH entry
+    // (backslash / case / trailing-slash), so the shim failed to exclude itself
+    // and `which_in` resolved git back to THIS binary → recursive-spawn storm.
+    // With L1 fixed the daemon injects AGEND_REAL_GIT and Priority 1 above
+    // short-circuits, so this fallback rarely runs — but it must be correct when
+    // it does. `split_paths` also gives the right separator + drive-colon handling.
+    let agend_bin: Option<PathBuf> =
+        env::var_os("AGEND_HOME").map(|h| PathBuf::from(h).join("bin"));
+    let path_os = env::var_os("PATH").unwrap_or_default();
+    let search_paths: Vec<PathBuf> = std::env::split_paths(&path_os)
+        .filter(|p| !p.as_os_str().is_empty())
+        .filter(|p| !same_dir(p, agend_bin.as_deref()))
+        .collect();
+    let search = std::env::join_paths(&search_paths).unwrap_or_default();
     which::which_in("git", Some(&search), ".")
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "/usr/bin/git".to_string())
+}
+
+/// #1504: directory equality via `canonicalize` (resolves slash form, case-folds
+/// on Windows NTFS, follows symlinks), with a lexical fallback when a path can't
+/// be canonicalized (e.g. `$AGEND_HOME/bin` not yet created). NEVER unwraps
+/// `canonicalize` — it `Err`s on missing paths.
+fn same_dir(a: &std::path::Path, b: Option<&std::path::Path>) -> bool {
+    let Some(b) = b else { return false };
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => lexical_path_eq(a, b),
+    }
+}
+
+/// Lexical directory equality: normalize backslashes to `/`, strip trailing
+/// separators, compare case-insensitively on Windows. Fallback only.
+fn lexical_path_eq(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let norm = |p: &std::path::Path| {
+        p.to_string_lossy()
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_string()
+    };
+    let (na, nb) = (norm(a), norm(b));
+    if cfg!(windows) {
+        na.eq_ignore_ascii_case(&nb)
+    } else {
+        na == nb
+    }
 }
 
 // ── Error + Telemetry ───────────────────────────────────────────────────
@@ -1087,6 +1157,23 @@ mod tests {
     // ── #1463: init-heartbeat argv detection (forensic hook gate) ──
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
+    }
+
+    // ── #1504 L2: shim self-exclusion via canonicalize + lexical fallback ──
+    #[test]
+    fn same_dir_lexical_slash_fallback_1504() {
+        // Nonexistent dirs → lexical fallback → backslash normalized to `/`, so a
+        // forward-slash `$AGEND_HOME/bin` still matches a backslash PATH entry
+        // (the Windows self-exclusion miss that caused the recursion).
+        assert!(same_dir(
+            std::path::Path::new("C:/h/bin"),
+            Some(std::path::Path::new("C:\\h\\bin")),
+        ));
+        assert!(!same_dir(
+            std::path::Path::new("/usr/bin"),
+            Some(std::path::Path::new("/h/bin")),
+        ));
+        assert!(!same_dir(std::path::Path::new("/usr/bin"), None));
     }
 
     #[test]

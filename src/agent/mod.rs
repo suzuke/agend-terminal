@@ -544,6 +544,52 @@ pub struct SpawnConfig<'a> {
     pub shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
+/// #1504 L1: split `path` with the platform PATH separator (`;` on Windows,
+/// `:` elsewhere) and drop the shim dir (`$AGEND_HOME/bin`). Pure so the
+/// exclusion is unit-testable without a live env. `split_paths` correctly
+/// handles Windows drive-colons and quoted entries — the bug the old
+/// `.split(':')` introduced.
+fn git_search_without_shim(
+    path: &std::ffi::OsStr,
+    shim_dir: Option<&std::path::Path>,
+) -> Vec<PathBuf> {
+    std::env::split_paths(path)
+        .filter(|p| !p.as_os_str().is_empty())
+        .filter(|p| !same_dir(p, shim_dir))
+        .collect()
+}
+
+/// True when `a` and `b` name the same directory. Prefers `canonicalize`
+/// (resolves slash form + case-folds on Windows NTFS + follows symlinks);
+/// falls back to a lexical compare when either side doesn't exist on disk
+/// (e.g. `$AGEND_HOME/bin` not yet created — a common case). NEVER unwraps
+/// `canonicalize`: it `Err`s on missing paths (#1504).
+fn same_dir(a: &std::path::Path, b: Option<&std::path::Path>) -> bool {
+    let Some(b) = b else { return false };
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => lexical_path_eq(a, b),
+    }
+}
+
+/// Lexical directory equality fallback: normalize backslashes to forward
+/// slashes, strip trailing separators, and compare case-insensitively on
+/// Windows. Used only when a path can't be canonicalized (doesn't exist yet).
+fn lexical_path_eq(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let norm = |p: &std::path::Path| {
+        p.to_string_lossy()
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_string()
+    };
+    let (na, nb) = (norm(a), norm(b));
+    if cfg!(windows) {
+        na.eq_ignore_ascii_case(&nb)
+    } else {
+        na == nb
+    }
+}
+
 /// Build a `CommandBuilder` with resolved args, env, and working directory.
 ///
 /// Extracted from `spawn_agent` so the command-construction logic (arg
@@ -693,16 +739,15 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
     // real git binary without recursion (R12 mitigation).
     // Excludes $AGEND_HOME/bin/ from PATH to avoid resolving to the shim itself.
     if std::env::var("AGEND_REAL_GIT").is_err() {
-        let agend_bin = home
-            .map(|h| h.join("bin").display().to_string())
+        // #1504: build the git search PATH using the platform-aware separator.
+        // The prior `.split(':')` was hardcoded Unix; on Windows PATH is
+        // `;`-separated AND entries carry drive-colons (`C:\…`), so `:`-splitting
+        // shredded PATH → `which_in` failed → AGEND_REAL_GIT never got injected →
+        // the shim later resolved git to itself (recursive-spawn storm, #1504 L1).
+        let agend_bin: Option<PathBuf> = home.map(|h| h.join("bin"));
+        let path_os = std::env::var_os("PATH").unwrap_or_default();
+        let search = std::env::join_paths(git_search_without_shim(&path_os, agend_bin.as_deref()))
             .unwrap_or_default();
-        let search_paths: Vec<PathBuf> = std::env::var("PATH")
-            .unwrap_or_default()
-            .split(':')
-            .filter(|p| !p.is_empty() && *p != agend_bin)
-            .map(PathBuf::from)
-            .collect();
-        let search = std::env::join_paths(&search_paths).unwrap_or_default();
         if let Ok(git_path) = which::which_in("git", Some(search), ".") {
             cmd.env("AGEND_REAL_GIT", git_path);
         }

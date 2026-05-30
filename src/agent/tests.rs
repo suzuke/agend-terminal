@@ -1453,3 +1453,68 @@ fn lock_registry_tracked_guard_trips_self_ipc_assert_1492() {
     let _guard = lock_registry_tracked(&reg, "test-1492");
     crate::sync_audit::assert_no_registry_lock_for_self_ipc("enqueue_with_idle_hint");
 }
+
+// ── #1504: git-shim PATH parsing + self-exclusion (L1) ──
+
+#[test]
+fn git_search_excludes_shim_dir_1504() {
+    // Cross-platform: the shim dir ($AGEND_HOME/bin) must be filtered out of the
+    // git search PATH, and real dirs preserved. Uses the platform separator via
+    // join_paths/split_paths so it exercises the #1504 L1 fix on every OS.
+    let shim = std::path::PathBuf::from("/tmp/agend-home-1504/bin");
+    let real = std::path::PathBuf::from("/usr/bin");
+    let path = std::env::join_paths([real.clone(), shim.clone(), std::path::PathBuf::from("/bin")])
+        .expect("join PATH");
+    let result = super::git_search_without_shim(&path, Some(&shim));
+    assert!(
+        !result.iter().any(|p| super::same_dir(p, Some(&shim))),
+        "#1504: shim dir must be excluded from git search PATH: {result:?}"
+    );
+    assert!(
+        result.contains(&real),
+        "#1504: real PATH dirs must survive: {result:?}"
+    );
+}
+
+#[test]
+fn same_dir_lexical_slash_and_none_1504() {
+    // Nonexistent paths → lexical fallback → backslash normalized to forward,
+    // so a forward-slash AGEND_HOME/bin still matches a backslash PATH entry.
+    assert!(
+        super::same_dir(
+            std::path::Path::new("C:/agend/bin"),
+            Some(std::path::Path::new("C:\\agend\\bin")),
+        ),
+        "#1504: slash-variant dirs must compare equal via lexical fallback"
+    );
+    assert!(!super::same_dir(
+        std::path::Path::new("/usr/bin"),
+        Some(std::path::Path::new("/usr/local/bin")),
+    ));
+    assert!(
+        !super::same_dir(std::path::Path::new("/usr/bin"), None),
+        "no shim dir → never excludes"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn git_search_splits_windows_path_separator_1504() {
+    // RED against the old `.split(':')`: a `;`-separated Windows PATH whose
+    // entries carry drive-colons must split into WHOLE entries (not be shredded
+    // on the `C:` colon), and the shim dir must be excluded. Runs on the
+    // windows-latest CI job.
+    let shim = std::path::PathBuf::from("C:\\agend\\bin");
+    let path = std::ffi::OsString::from(
+        "C:\\Program Files\\Git\\cmd;C:\\agend\\bin;C:\\Windows\\System32",
+    );
+    let result = super::git_search_without_shim(&path, Some(&shim));
+    assert!(
+        result.contains(&std::path::PathBuf::from("C:\\Program Files\\Git\\cmd")),
+        "#1504: drive-colon entry must survive splitting: {result:?}"
+    );
+    assert!(
+        !result.iter().any(|p| super::same_dir(p, Some(&shim))),
+        "#1504: shim dir excluded on Windows: {result:?}"
+    );
+}
