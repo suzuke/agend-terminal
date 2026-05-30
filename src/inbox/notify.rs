@@ -89,7 +89,24 @@ pub fn format_header(msg: &InboxMessage) -> String {
             sanitize_header_value(excerpt)
         ));
     }
+    parts.push(operator_now_field()); // #1487
     parts.join(" ")
+}
+
+/// #1487: build the `now=<operator-TZ timestamp>` header field so an agent
+/// sees the current operator-local time on EVERY message — fixing both the
+/// daemon's UTC offset (operator is e.g. UTC+8) and the spawn-time date
+/// freeze. The value is space-free RFC3339 + offset (`2026-05-30T16:12:34+08:00`):
+/// the header is a space-delimited `key=value` list (agents tokenize on
+/// spaces per agend.md), so a spaced value would shatter field parsing.
+///
+/// Reuses the operator display timezone (`display_timezone`) and the shared
+/// [`crate::display_time::format_iso_offset`] formatter so there is a single
+/// source of truth for operator-tz conversion; `None` → system local time.
+pub(crate) fn operator_now_field() -> String {
+    let tz = crate::daemon_config::get().display_timezone;
+    let stamp = crate::display_time::format_iso_offset(chrono::Utc::now(), tz.as_deref());
+    format!("now={stamp}")
 }
 
 /// Build the `in_reply_to_excerpt` value for inbound replies.
@@ -120,6 +137,7 @@ pub fn format_event_header(kind: &str, fields: &[(&str, &str)]) -> String {
     for (k, v) in fields {
         parts.push(format!("{}={}", k, sanitize_header_value(v)));
     }
+    parts.push(operator_now_field()); // #1487
     parts.join(" ")
 }
 
@@ -415,17 +433,21 @@ where
         && (msg_text.starts_with("[ci-pass]")
             || msg_text.starts_with("[ci-fail]")
             || msg_text.starts_with("[ci-ended]"));
+    // #1487: `now=<operator-TZ timestamp>` so the agent sees fresh, correctly-
+    // zoned time on the wake hint too (space-free value — see operator_now_field).
+    let now_field = operator_now_field();
     let hint = if is_ci_conclusion {
         let first_line = msg_text.lines().next().unwrap_or(&msg_text);
-        format!("{} (inbox={})", first_line, pending,)
+        format!("{} (inbox={}) {}", first_line, pending, now_field)
     } else {
         format!(
-            "{} id={} kind={} from={} inbox={} (use inbox tool)",
+            "{} id={} kind={} from={} inbox={} {} (use inbox tool)",
             PENDING_HEADER_PREFIX,
             sanitize_header_value(&id),
             sanitize_header_value(kind_str),
             sanitize_header_value(from_short),
             pending,
+            now_field,
         )
     };
     emit_hint(&hint);
@@ -541,5 +563,43 @@ mod actionable_wake_tests {
         assert!(!is_actionable(
             "[AGEND-MSG-PENDING] id=m-6 kind=task_summary from=x inbox=1 (use inbox tool)"
         ));
+    }
+}
+
+#[cfg(test)]
+mod operator_tz_tests {
+    use super::{format_header, operator_now_field};
+    use crate::inbox::message::InboxMessage;
+
+    /// #1487: the `now=` field is space-free so it survives the header's
+    /// space-delimited tokenization (the exact tz-conversion math is covered
+    /// in `display_time::format_iso_offset` tests). Uses whatever
+    /// `display_timezone` is configured in this process (None → system local).
+    #[test]
+    fn operator_now_field_is_space_free() {
+        let field = operator_now_field();
+        assert!(field.starts_with("now="), "must be a now= field: {field}");
+        assert!(
+            !field["now=".len()..].contains(' '),
+            "now= value must not contain spaces (would break header tokenization): {field}"
+        );
+    }
+
+    /// #1487: the [AGEND-MSG] header carries `now=` AND still carries the
+    /// existing fields agents parse (id / kind / size) — additive, no break.
+    #[test]
+    fn message_header_includes_now_without_breaking_existing_fields() {
+        let mut msg = InboxMessage {
+            from: "from:lead".to_string(),
+            text: "hello".to_string(),
+            ..Default::default()
+        };
+        msg.id = Some("m-1".to_string());
+        msg.kind = Some("task".to_string());
+        let header = format_header(&msg);
+        assert!(header.contains("now="), "header must carry now=: {header}");
+        assert!(header.contains("id=m-1"), "id= preserved: {header}");
+        assert!(header.contains("kind=task"), "kind= preserved: {header}");
+        assert!(header.contains("size=5"), "size= preserved: {header}");
     }
 }

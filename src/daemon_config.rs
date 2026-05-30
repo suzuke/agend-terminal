@@ -14,6 +14,11 @@ use std::sync::OnceLock;
 pub struct DaemonConfig {
     /// Feature flag: pointer-only inbox injection (replaces AGEND_POINTER_ONLY_INJECT env var).
     pub pointer_only_inject: bool,
+    /// #1487: operator-facing IANA timezone for the `now=` timestamp injected
+    /// into agent message headers. Loaded from fleet.yaml `display_timezone:` at
+    /// boot (see `init_daemon_services`); reuses the same operator-tz concept as
+    /// `display_time::format_local_short`. `None` → system local time.
+    pub display_timezone: Option<String>,
 }
 
 impl Default for DaemonConfig {
@@ -23,6 +28,7 @@ impl Default for DaemonConfig {
                 .ok()
                 .map(|v| v == "1")
                 .unwrap_or(false),
+            display_timezone: None,
         }
     }
 }
@@ -55,7 +61,15 @@ mod tests {
     fn daemon_config_with_overrides() {
         let cfg = DaemonConfig {
             pointer_only_inject: true,
+            display_timezone: Some("Europe/Paris".to_string()),
         };
         assert!(cfg.pointer_only_inject);
+        assert_eq!(cfg.display_timezone.as_deref(), Some("Europe/Paris"));
+    }
+
+    /// #1487: display_timezone defaults to None (→ system local) when unset.
+    #[test]
+    fn daemon_config_display_timezone_defaults_to_none() {
+        assert_eq!(DaemonConfig::default().display_timezone, None);
     }
 }

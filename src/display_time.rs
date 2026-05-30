@@ -47,6 +47,32 @@ pub fn format_local_short(rfc3339: &str, tz: Option<&str>) -> String {
     }
 }
 
+/// #1487: format a UTC instant in the operator display timezone as a
+/// SPACE-FREE RFC 3339 string with year + offset, e.g.
+/// `2026-05-30T16:12:34+08:00`.
+///
+/// Unlike [`format_local_short`] (`MM-DD HH:MM` — spaced, no year, no
+/// offset), this shape is safe to embed as a `now=` field inside the
+/// space-delimited `[AGEND-MSG]` header (agents split fields on spaces),
+/// and it carries the absolute instant plus zone so an agent can reason
+/// about the operator's wall-clock time unambiguously.
+///
+/// `tz` semantics match `format_local_short`: `None` → `chrono::Local`
+/// (system tz); invalid IANA → warn-once + `chrono::Local` fallback.
+pub fn format_iso_offset(now: chrono::DateTime<chrono::Utc>, tz: Option<&str>) -> String {
+    const FMT: &str = "%Y-%m-%dT%H:%M:%S%:z";
+    match tz {
+        Some(iana) => match iana.parse::<chrono_tz::Tz>() {
+            Ok(tz) => now.with_timezone(&tz).format(FMT).to_string(),
+            Err(_) => {
+                warn_invalid_iana_once(iana);
+                now.with_timezone(&chrono::Local).format(FMT).to_string()
+            }
+        },
+        None => now.with_timezone(&chrono::Local).format(FMT).to_string(),
+    }
+}
+
 /// One-shot warn per invalid IANA name to surface fleet.yaml typos
 /// without spamming logs on every render frame.
 fn warn_invalid_iana_once(iana: &str) {
@@ -66,7 +92,7 @@ fn warn_invalid_iana_once(iana: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::format_local_short;
+    use super::{format_iso_offset, format_local_short};
 
     /// `Z` form parses → render-local conversion → `MM-DD HH:MM` shape
     /// (5 chars + space + 5 chars = 11 chars). Shape-only assertion so
@@ -148,5 +174,38 @@ mod tests {
             .format("%m-%d %H:%M")
             .to_string();
         assert_eq!(out_none, expected, "None tz must match chrono::Local");
+    }
+
+    // ─── #1487 format_iso_offset (now= header field) ───────────────────
+
+    /// `Asia/Taipei` converts UTC → UTC+8 and renders the exact
+    /// space-free RFC 3339 + offset string the `now=` header field needs.
+    #[test]
+    fn format_iso_offset_asia_taipei_is_utc_plus_8_space_free() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-05-30T08:12:34Z")
+            .expect("known-good RFC 3339 fixture")
+            .with_timezone(&chrono::Utc);
+        let out = format_iso_offset(now, Some("Asia/Taipei"));
+        assert_eq!(out, "2026-05-30T16:12:34+08:00");
+        assert!(
+            !out.contains(' '),
+            "now= value must be space-free for header field-splitting, got {out:?}"
+        );
+    }
+
+    /// Invalid IANA name falls back to `chrono::Local` (never panics) and
+    /// stays space-free regardless of the system tz.
+    #[test]
+    fn format_iso_offset_invalid_iana_falls_back_and_stays_space_free() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-05-30T08:12:34Z")
+            .expect("known-good RFC 3339 fixture")
+            .with_timezone(&chrono::Utc);
+        let out = format_iso_offset(now, Some("Not/A_Real_TZ"));
+        let local = format_iso_offset(now, None);
+        assert_eq!(out, local, "invalid IANA must match chrono::Local (None)");
+        assert!(
+            !out.contains(' '),
+            "fallback must stay space-free, got {out:?}"
+        );
     }
 }
