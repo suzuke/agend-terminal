@@ -11,6 +11,17 @@
 //!   where dev was idle-waiting for a dispatch that never explicitly
 //!   referenced a task_id (no ETA → PR-1 wouldn't fire).
 //!
+//! ## Standby-role exemption (#1438 / #1491C)
+//!
+//! Per-agent (dev-vantage) idle alerts skip **team orchestrators** (leads)
+//! automatically — a lead with no in-flight task is expected to be quiet, so
+//! flagging it is pure noise. Other standby roles (e.g. a reviewer waiting for
+//! the next CI handoff) are exempted by the operator setting
+//! `idle_watchdog_enabled: false` on that instance in fleet.yaml (the scan
+//! already filters on that flag). Operator decision (#1491): orchestrators are
+//! the only role reliably derivable from fleet.yaml — reviewer `role:` is
+//! often unset — so reviewers use the explicit opt-out.
+//!
 //! ## Vantages
 //!
 //! ### #10 — dev 60min idle watchdog (P0)
@@ -380,9 +391,20 @@ fn scan_dev_vantage(
     let agents: Vec<(String, i64)> = if let Some(single) = env_agent {
         vec![(single, dev_idle_threshold_secs())]
     } else if let Ok(cfg) = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)) {
+        // #1438/#1491(C): auto-exempt team orchestrators (leads) from idle
+        // alerts — a lead with no in-flight task is expected to be quiet, so
+        // flagging it idle is pure noise. Standby reviewers opt out via the
+        // per-instance `idle_watchdog_enabled: false` (operator decision,
+        // #1491). Orchestrators are exempted automatically because their role
+        // (waiting on the team) is inherently a standby role.
+        let orchestrators: std::collections::HashSet<&str> = cfg
+            .teams
+            .values()
+            .filter_map(|t| t.orchestrator.as_deref())
+            .collect();
         cfg.instances
             .iter()
-            .filter(|(_, ic)| ic.idle_watchdog_enabled)
+            .filter(|(name, ic)| ic.idle_watchdog_enabled && !orchestrators.contains(name.as_str()))
             .map(|(name, ic)| {
                 let threshold = ic
                     .timeout_secs
@@ -784,6 +806,44 @@ mod tests {
         assert_eq!(lead.len(), 1, "lead must receive idle alert: {lead:?}");
         assert_eq!(lead[0].kind.as_deref(), Some("dev_idle_watchdog"));
         assert!(lead[0].text.contains("dev"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1438/#1491(C): a team orchestrator (lead) that has been silent past
+    /// the threshold must NOT be idle-alerted — its standby is expected. A
+    /// non-orchestrator member with the same silence still gets flagged.
+    #[test]
+    fn dev_watchdog_exempts_team_orchestrator() {
+        let _g = env_lock();
+        std::env::remove_var("AGEND_IDLE_WATCHDOG_AGENT");
+        std::env::remove_var("AGEND_IDLE_WATCHDOG_DEV_RECIPIENT");
+        let home = tmp_home("orch-exempt");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  lead:\n    backend: claude\n  worker:\n    backend: claude\n\
+             teams:\n  t:\n    members: [lead, worker]\n    orchestrator: lead\n",
+        )
+        .unwrap();
+        let stale = chrono::Utc::now() - chrono::Duration::seconds(dev_idle_threshold_secs() + 60);
+        write_activity_at(&home, "lead", stale);
+        write_activity_at(&home, "worker", stale);
+        let mut last_alerted = HashMap::new();
+        scan_and_emit(&home, &mut last_alerted);
+        // Alerts are delivered to the dev recipient ("lead"); inspect them.
+        let alerts = crate::inbox::drain(&home, "lead");
+        let dev_alerts: Vec<&str> = alerts
+            .iter()
+            .filter(|m| m.kind.as_deref() == Some("dev_idle_watchdog"))
+            .map(|m| m.text.as_str())
+            .collect();
+        assert!(
+            dev_alerts.iter().any(|t| t.contains("'worker'")),
+            "non-orchestrator worker must still be flagged: {dev_alerts:?}"
+        );
+        assert!(
+            !dev_alerts.iter().any(|t| t.contains("'lead'")),
+            "orchestrator 'lead' must be exempt from idle alerts: {dev_alerts:?}"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 

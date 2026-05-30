@@ -70,6 +70,20 @@ pub fn instance_is_known(home: &Path, name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// #1491: the orchestrator (lead) of the first team that lists `member`.
+/// Used by the handoff-timeout watchdog to escalate an unclaimed CI handoff
+/// to the right lead.
+pub fn team_orchestrator_for(home: &Path, member: &str) -> Option<String> {
+    FleetConfig::load(&fleet_yaml_path(home))
+        .ok()
+        .and_then(|c| {
+            c.teams
+                .values()
+                .find(|t| t.members.iter().any(|m| m == member))
+                .and_then(|t| t.orchestrator.clone())
+        })
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FleetConfig {
     #[serde(default)]

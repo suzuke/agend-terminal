@@ -27,6 +27,7 @@ pub use disk::{check_disk_space, recover_half_writes};
 pub use storage::{
     describe_message, drain, enqueue, find_message, get_thread,
     has_drained_blocker_for_correlation, mark_ci_watch_superseded, sweep_expired, unread_count,
+    unread_of_kind,
 };
 // Storage CRUD (pub(crate))
 pub(crate) use storage::inbox_path_resolved;
