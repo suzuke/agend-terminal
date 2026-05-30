@@ -16,6 +16,7 @@ pub(crate) mod event_bus;
 pub(crate) mod heartbeat_pair;
 pub(crate) mod helper_staleness_watchdog;
 pub(crate) mod idle_watchdog;
+pub(crate) mod inbox_stuck_watchdog;
 pub(crate) mod lifecycle;
 pub(crate) mod mcp_registry_watcher;
 pub(crate) mod notification_dedup;
@@ -667,6 +668,9 @@ fn build_tick_infrastructure(
         Box::new(per_tick::PrStateScanHandler::new()),
         Box::new(per_tick::InboxMaintenanceHandler::new(60)),
         Box::new(per_tick::PollReminderHandler::new(30)),
+        // #1491(A): inbox-stuck watchdog — every 30 ticks (~5min). Detects an
+        // agent receiving but not draining its inbox; notifies lead (no auto-restart).
+        Box::new(per_tick::InboxStuckHandler::new(30)),
         Box::new(per_tick::LogRotationHandler::new(360)),
         Box::new(per_tick::ThreadDumpHandler::new()),
         Box::new(per_tick::GcTickHandler::new(360)),
