@@ -88,10 +88,12 @@ pub(crate) fn handle_force_release_worktree(
         });
     }
 
-    // #826: optional operator-supplied `source_repo` arg. When
+    // #826: optional operator-supplied `repository_path` arg. When
     // present, L2 skips enumeration and goes straight to the named
     // repo. When absent, L2 enumerates daemon-managed candidates.
-    let source_repo_hint = args["source_repo"]
+    // #1461 cleanup: renamed from `source_repo` to the cross-tool
+    // standard `repository_path` (matches checkout / bind_self / team).
+    let source_repo_hint = args["repository_path"]
         .as_str()
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);

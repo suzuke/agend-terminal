@@ -343,7 +343,8 @@ pub(crate) fn def_force_release_worktree() -> Value {
     json!({"name": "force_release_worktree", "description": "Force-release a stale daemon-managed worktree directory — cleans <home>/worktrees/<agent>/<branch>/ on disk + runs the standard release_full to clear any lingering binding state. Idempotent. Refuses to clean paths outside the daemon worktree pool. Sprint 59 Wave 1 PR-5 emergency cherry-pick supporting Q2=(C) bypass-free permanent protocol.",
         "inputSchema": {"type": "object", "properties": {
             "instance": {"type": "string", "description": "Name of the existing instance (worktree owner)"},
-            "branch": {"type": "string", "description": "Branch name (worktree subdirectory)"}
+            "branch": {"type": "string", "description": "Branch name (worktree subdirectory)"},
+            "repository_path": {"type": "string", "description": "#826: optional local filesystem path to the source repository. When given, candidate enumeration is skipped and cleanup targets this repo directly. Standard cross-tool name (matches checkout / bind_self / team update)."}
         }, "required": ["instance", "branch"]}})
 }
 

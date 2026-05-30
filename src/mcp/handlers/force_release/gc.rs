@@ -412,7 +412,7 @@ mod tests {
             &json!({
                 "instance": "dev826",
                 "branch": "feat/826",
-                "source_repo": source_repo.display().to_string(),
+                "repository_path": source_repo.display().to_string(),
             }),
             &None,
         );
@@ -478,7 +478,7 @@ mod tests {
             &json!({
                 "instance": "dev826",
                 "branch": "feat/826",
-                "source_repo": source_repo.display().to_string(),
+                "repository_path": source_repo.display().to_string(),
             }),
             &None,
         );
@@ -491,7 +491,7 @@ mod tests {
             &json!({
                 "instance": "dev826",
                 "branch": "feat/826",
-                "source_repo": source_repo.display().to_string(),
+                "repository_path": source_repo.display().to_string(),
             }),
             &None,
         );
@@ -531,7 +531,7 @@ mod tests {
             &json!({
                 "instance": agent,
                 "branch": "feat/aaa",
-                "source_repo": repo_a.display().to_string(),
+                "repository_path": repo_a.display().to_string(),
             }),
             &None,
         );
@@ -547,7 +547,7 @@ mod tests {
             &json!({
                 "instance": agent,
                 "branch": "feat/bbb",
-                "source_repo": repo_b.display().to_string(),
+                "repository_path": repo_b.display().to_string(),
             }),
             &None,
         );
@@ -610,7 +610,7 @@ mod tests {
             &json!({
                 "instance": "agent_x826",
                 "branch": "feat/x",
-                "source_repo": source_repo.display().to_string(),
+                "repository_path": source_repo.display().to_string(),
             }),
             &None,
         );

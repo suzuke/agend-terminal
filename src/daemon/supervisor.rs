@@ -232,9 +232,10 @@ fn run_loop(
 /// state. Read-only — emits a `FleetEvent::PaneInputNotSubmitted` when
 /// the threshold is exceeded but does NOT inject prompts, mutate agent
 /// state, or touch the router layer (router = `src/channel/router/*`,
-/// Sprint 49/52 territory). Backend allowlist (claude only, first
-/// round) avoids false-positive flood for backends without
-/// `record_submit_activity` wiring.
+/// Sprint 49/52 territory). Backend support is now all backends that
+/// declare a submit key (via `preset().submit_key`) — #1457 widened it
+/// from the original claude-only first round once `record_submit_activity`
+/// was wired for every backend.
 ///
 /// Threshold defaults to 60s; override via env
 /// `AGEND_PANE_INPUT_THRESHOLD_SECS`.

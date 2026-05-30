@@ -261,9 +261,11 @@ pub fn notify_agent_with_attachments(
     }
 }
 
-/// Compose-aware notification delivery: checks `is_composing` and enqueues
-/// if the target agent is mid-typing, otherwise injects **with** submit_key
-/// so idle agents actually wake up on the incoming notification.
+/// Compose-aware notification delivery: gates on `draft_state` (the
+/// input-vs-submit signal, #1457) and enqueues when the target agent has an
+/// unsent draft, otherwise injects **with** submit_key so idle agents wake up.
+/// Actionable work-delivery (`notification_is_actionable_wake`, #1473) bypasses
+/// the gate and always injects.
 pub fn compose_aware_inject(home: &Path, agent_name: &str, notification: &str) {
     // #911 dedup gate
     if should_suppress_911_reinject_with_ledger(
