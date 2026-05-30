@@ -12,6 +12,31 @@ cargo clippy --all-targets -- -D warnings
 CI runs these in the first two steps of `ci.yml`. Skipping them locally means
 the next push fails and needs an extra "fix fmt / fix clippy" round trip.
 
+### Before `git push`: run the full CI-parity preflight
+
+```bash
+scripts/preflight.sh          # full matrix; --quick skips the Windows check
+```
+
+This is the one-shot mirror of CI's `check` job and the best way to avoid a
+local-green → CI-red round trip. It runs `cargo fmt --check`,
+`cargo clippy --all-targets --features tray -- -D warnings`,
+`cargo test --tests --features tray` (unit + integration + invariants), and a
+**Windows cross-check** (`x86_64-pc-windows-msvc`) — the keystone, since
+Windows-only code (`libc::getppid`, `/bin/sh` spawns, `UnixStream`) compiles
+fine on a unix dev box but breaks CI's `windows-latest` runner.
+
+The Windows step needs the MSVC C toolchain because a transitive C dependency
+(`ring`) won't otherwise cross-compile on macOS/Linux. Install it once:
+
+```bash
+cargo install cargo-xwin && rustup target add x86_64-pc-windows-msvc
+```
+
+Without `cargo-xwin` the Windows step SKIPs with a hint (never false-fails);
+CI's `windows-latest` runner stays the backstop. The preflight is intentionally
+*not* a git hook — the full matrix takes a few minutes; run it manually.
+
 A pre-commit hook at `.git/hooks/pre-commit` auto-formats staged `.rs` files
 and re-stages them. It does NOT run clippy — clippy is too slow for a
 pre-commit path. Run clippy yourself before `git push`.
