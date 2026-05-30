@@ -35,7 +35,7 @@ use std::path::Path;
 ///
 /// Single-closure design avoids dual-mutable-borrow on shared state
 /// (`name_counter` and `registry` in Owned mode).
-type PaneBuilder<'a> = dyn FnMut(&SessionPane, &mut Layout) -> Option<Pane> + 'a;
+pub(super) type PaneBuilder<'a> = dyn FnMut(&SessionPane, &mut Layout) -> Option<Pane> + 'a;
 
 /// Saved session layout for persistence across restarts.
 #[derive(Serialize, Deserialize)]
@@ -68,11 +68,11 @@ fn default_ratio() -> f32 {
 
 /// Layout-only pane info. Agent config comes from fleet.yaml on restore.
 #[derive(Serialize, Deserialize)]
-struct SessionPane {
+pub(super) struct SessionPane {
     /// Fleet instance name (key in fleet.yaml). None for shell panes.
-    fleet_instance_name: Option<String>,
+    pub(super) fleet_instance_name: Option<String>,
     /// User-defined display name override.
-    display_name: Option<String>,
+    pub(super) display_name: Option<String>,
 }
 
 /// Sync fleet.yaml to match current pane state on detach.
@@ -115,25 +115,53 @@ pub(super) fn sync_fleet_yaml(home: &Path, layout: &Layout) {
 }
 
 /// Save current session layout to disk. Only stores layout geometry, not agent config.
-pub(super) fn save_session(home: &Path, layout: &Layout) {
-    let tabs: Vec<SessionTab> = layout
-        .tabs
-        .iter()
-        .map(|tab| SessionTab {
-            name: tab.name.clone(),
-            root: save_node(tab.root()),
-        })
-        .collect();
-
+/// Serialize the current layout to the pretty-printed `session.json` form.
+fn serialize_session(layout: &Layout) -> Option<String> {
     let session = Session {
         active_tab: layout.active,
-        tabs,
+        tabs: layout
+            .tabs
+            .iter()
+            .map(|tab| SessionTab {
+                name: tab.name.clone(),
+                root: save_node(tab.root()),
+            })
+            .collect(),
     };
+    serde_json::to_string_pretty(&session).ok()
+}
 
+pub(super) fn save_session(home: &Path, layout: &Layout) {
+    if let Some(json) = serialize_session(layout) {
+        let path = home.join("session.json");
+        let _ = std::fs::write(&path, &json);
+        tracing::info!(path = %path.display(), "session saved");
+    }
+}
+
+/// #1479: write `session.json` only when the serialized layout differs from the
+/// last write (`cache`). Called on a throttled main-loop tick so a hard crash
+/// (kill -9 / power loss) still preserves the actual on-screen layout — graceful
+/// exit's `save_session` only covers clean shutdowns. Change-gated against the
+/// exact serialized form (no signature drift), so it never rewrites the file
+/// when nothing changed. Returns true if a write happened.
+pub(super) fn save_session_if_changed(
+    home: &Path,
+    layout: &Layout,
+    cache: &mut Option<String>,
+) -> bool {
+    let Some(json) = serialize_session(layout) else {
+        return false;
+    };
+    if cache.as_deref() == Some(json.as_str()) {
+        return false;
+    }
     let path = home.join("session.json");
-    if let Ok(json) = serde_json::to_string_pretty(&session) {
-        let _ = std::fs::write(&path, json);
-        tracing::info!(path = %path.display(), tabs = session.tabs.len(), "session saved");
+    if std::fs::write(&path, &json).is_ok() {
+        *cache = Some(json);
+        true
+    } else {
+        false
     }
 }
 
@@ -241,6 +269,7 @@ pub(super) fn restore_with_reconciliation(
     }
 
     // No session.json or empty → rule 1: auto-start fleet (Owned-only).
+    // #1479: auto_start_fleet now team-groups via `place_agents_team_grouped`.
     if !agent_source.is_empty() {
         return super::api_server::auto_start_fleet(
             fleet_path,
@@ -367,11 +396,40 @@ fn apply_session_layout(
     // grouped by team where teams are defined in fleet.yaml.
     let mut unplaced: Vec<String> = agent_source.difference(&placed).cloned().collect();
     unplaced.sort();
+    place_agents_team_grouped(home, &unplaced, pane_builder, layout);
 
+    if session.active_tab < layout.tabs.len() {
+        layout.active = session.active_tab;
+    }
+
+    if !layout.tabs.is_empty() {
+        let _ = std::fs::remove_file(&session_path);
+        tracing::info!(
+            tabs = layout.tabs.len(),
+            "session restored with reconciliation"
+        );
+        return true;
+    }
+
+    false
+}
+
+/// #1479: place a flat list of agents into tabs **grouped by team** (members of
+/// the same fleet.yaml team share one tab, orchestrator-first; teamless agents
+/// each get their own tab). Shared by the session-restore Rule-3 path and the
+/// no-session-json `auto_start_fleet` fallback, so a hard restart (session.json
+/// absent) groups identically to a live `create_instance`. `agents` is expected
+/// pre-sorted. Returns true if any pane was placed.
+pub(super) fn place_agents_team_grouped(
+    home: &Path,
+    agents: &[String],
+    pane_builder: &mut PaneBuilder<'_>,
+    layout: &mut Layout,
+) -> bool {
     let teams = crate::teams::list_all(home);
     let mut team_members: HashMap<String, Vec<String>> = HashMap::new();
     let mut standalone = Vec::new();
-    for name in &unplaced {
+    for name in agents {
         if let Some(team) = teams.iter().find(|t| t.members.contains(name)) {
             team_members
                 .entry(team.name.clone())
@@ -382,6 +440,7 @@ fn apply_session_layout(
         }
     }
 
+    let mut placed_any = false;
     for (team_name, members) in &team_members {
         let team = teams.iter().find(|t| t.name == *team_name);
         let orchestrator = team.and_then(|t| t.orchestrator.as_deref());
@@ -399,6 +458,7 @@ fn apply_session_layout(
                 display_name: None,
             };
             if let Some(pane) = pane_builder(&synthetic_sp, layout) {
+                placed_any = true;
                 if !tab_created {
                     layout.add_tab(Tab::new(team_name.clone(), pane));
                     tab_created = true;
@@ -415,25 +475,12 @@ fn apply_session_layout(
             display_name: None,
         };
         if let Some(pane) = pane_builder(&synthetic_sp, layout) {
+            placed_any = true;
             let tab_name = pane.agent_name.to_string();
             layout.add_tab(Tab::new(tab_name, pane));
         }
     }
-
-    if session.active_tab < layout.tabs.len() {
-        layout.active = session.active_tab;
-    }
-
-    if !layout.tabs.is_empty() {
-        let _ = std::fs::remove_file(&session_path);
-        tracing::info!(
-            tabs = layout.tabs.len(),
-            "session restored with reconciliation"
-        );
-        return true;
-    }
-
-    false
+    placed_any
 }
 
 /// Walk a SessionNode tree, building panes via the caller's closures. Returns
@@ -523,6 +570,75 @@ mod tests {
             std::env::temp_dir().join(format!("agend-session-test-{}-{}", tag, std::process::id()));
         std::fs::create_dir_all(&dir).ok();
         dir
+    }
+
+    /// #1479: `place_agents_team_grouped` puts team members in one tab and
+    /// teamless agents in their own — the grouping a hard restart (no
+    /// session.json) must reproduce instead of one naive tab per agent.
+    #[test]
+    fn place_agents_team_grouped_groups_team_members() {
+        let home = tmp_home("team-group");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  dev-1: {}\n  dev-2: {}\n  solo: {}\nteams:\n  dev:\n    orchestrator: dev-1\n    members: [dev-1, dev-2]\n",
+        )
+        .expect("write fleet.yaml");
+
+        let mut layout = Layout::new();
+        let mut next_id = 0;
+        let mut pane_builder = |sp: &SessionPane, _l: &mut Layout| -> Option<Pane> {
+            next_id += 1;
+            sp.fleet_instance_name
+                .as_deref()
+                .map(|n| test_pane(next_id, n, Some(n)))
+        };
+        let agents = vec!["dev-1".to_string(), "dev-2".to_string(), "solo".to_string()];
+        let placed = place_agents_team_grouped(&home, &agents, &mut pane_builder, &mut layout);
+
+        assert!(placed, "agents must be placed");
+        assert_eq!(layout.tabs.len(), 2, "team 'dev' (1 tab) + 'solo' (1 tab)");
+        let dev_tab = layout
+            .tabs
+            .iter()
+            .find(|t| t.name == "dev")
+            .expect("a tab named after the team");
+        assert_eq!(
+            dev_tab.root().pane_ids().len(),
+            2,
+            "both dev team members share the 'dev' tab"
+        );
+        let solo_tab = layout
+            .tabs
+            .iter()
+            .find(|t| t.name == "solo")
+            .expect("teamless agent gets its own tab");
+        assert_eq!(solo_tab.root().pane_ids().len(), 1);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1479: throttled save writes only when the layout changed.
+    #[test]
+    fn save_session_if_changed_writes_only_on_change() {
+        let home = tmp_home("save-if-changed");
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("t1".to_string(), test_pane(1, "dev", Some("dev-1"))));
+        let mut cache: Option<String> = None;
+
+        assert!(
+            save_session_if_changed(&home, &layout, &mut cache),
+            "first call must write"
+        );
+        assert!(home.join("session.json").exists());
+        assert!(
+            !save_session_if_changed(&home, &layout, &mut cache),
+            "unchanged layout must NOT rewrite"
+        );
+        layout.add_tab(Tab::new("t2".to_string(), test_pane(2, "rev", Some("rev-1"))));
+        assert!(
+            save_session_if_changed(&home, &layout, &mut cache),
+            "changed layout must write"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]

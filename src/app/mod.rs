@@ -339,6 +339,14 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // enough that the readdir cost is trivial.
     let mut last_remote_sync = std::time::Instant::now();
 
+    // #1479: throttled, change-gated session.json persistence. Graceful exit
+    // already saves (so a hard crash kept the OLD layout); this periodically
+    // persists the current layout (incl. move_pane / split / close) so a
+    // kill -9 / power loss preserves what's on screen. `last_session_json`
+    // caches the last write to skip no-op rewrites.
+    let mut last_session_save = std::time::Instant::now();
+    let mut last_session_json: Option<String> = None;
+
     // fire-and-forget: blocks in crossterm::event::read(); terminated by process exit.
     let (event_tx, event_rx) = crossbeam_channel::unbounded::<Event>();
     std::thread::Builder::new()
@@ -723,6 +731,14 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 }
             }
             default(std::time::Duration::from_millis(50)) => {
+                // #1479: throttled, change-gated session persistence (every
+                // 10s). Cheap when the layout is unchanged (no write); on a
+                // change it preserves the on-screen layout against a hard
+                // crash. Graceful exit still saves unconditionally below.
+                if last_session_save.elapsed() >= std::time::Duration::from_secs(10) {
+                    last_session_save = std::time::Instant::now();
+                    session::save_session_if_changed(&home, &layout, &mut last_session_json);
+                }
                 // Periodic redraw for state updates. In Attached mode, also
                 // poll the daemon's `*.port` directory every 2s and open a
                 // tab for each newly-appeared remote agent (hot-reload

@@ -7,7 +7,7 @@
 //! tab during first-time startup (no session.json present).
 
 use crate::agent::AgentRegistry;
-use crate::layout::{Layout, Tab};
+use crate::layout::Layout;
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -90,6 +90,11 @@ pub(super) fn noop_guard() -> ApiGuard {
 }
 
 /// Auto-start all fleet instances as tabs. Returns true if any were spawned.
+///
+/// #1479: places agents **grouped by team** (via
+/// `session::place_agents_team_grouped`) rather than one naive tab per agent,
+/// so a hard restart with no `session.json` lands the same team-grouped layout
+/// as a live `create_instance` and the session-restore Rule-3 path.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn auto_start_fleet(
     fleet_path: &Path,
@@ -110,9 +115,11 @@ pub(super) fn auto_start_fleet(
         return false;
     }
     names.sort();
-    let mut spawned = false;
-    for name in &names {
-        if let Some(resolved) = fleet.resolve_instance(name) {
+
+    let mut pane_builder =
+        |sp: &super::session::SessionPane, layout: &mut Layout| -> Option<crate::layout::Pane> {
+            let name = sp.fleet_instance_name.as_deref()?;
+            let resolved = fleet.resolve_instance(name)?;
             match super::pane_factory::create_pane_from_resolved(
                 name,
                 &resolved,
@@ -125,14 +132,13 @@ pub(super) fn auto_start_fleet(
                 name_counter,
                 crate::backend::SpawnMode::Resume,
             ) {
-                Ok(pane) => {
-                    let tab_name = pane.agent_name.clone();
-                    layout.add_tab(Tab::new(tab_name.to_string(), pane));
-                    spawned = true;
+                Ok(pane) => Some(pane),
+                Err(e) => {
+                    tracing::error!(instance = name, error = %e, "fleet auto-start failed");
+                    None
                 }
-                Err(e) => tracing::error!(instance = name, error = %e, "fleet auto-start failed"),
             }
-        }
-    }
-    spawned
+        };
+
+    super::session::place_agents_team_grouped(home, &names, &mut pane_builder, layout)
 }
