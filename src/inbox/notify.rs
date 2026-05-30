@@ -289,17 +289,29 @@ pub fn compose_aware_inject(home: &Path, agent_name: &str, notification: &str) {
     });
 }
 
-/// #1473: does this notification carry an actionable work-delivery marker that
-/// must reach the PTY regardless of draft state? These are the
+/// #1473/#1483: does this notification carry an actionable work-delivery
+/// marker that must reach the PTY regardless of draft state? These are the
 /// system/orchestrator wakes the agent is expected to act on (vs. ambient
 /// notifications that may wait behind an operator draft).
+///
+/// #1483 fix: match the `kind=` field of the `[AGEND-MSG-PENDING] … kind=… …`
+/// pointer that `compose_aware_inject` actually receives (built by
+/// `enqueue_with_idle_hint`), NOT the bracketed body markers (`[delegate_task]`
+/// etc.) which only appear in the message *text* — never in the PTY-wake
+/// pointer. The pre-#1483 bracketed match never fired in production, so
+/// actionable wakes could still be deferred behind a genuine operator draft.
 pub(crate) fn notification_is_actionable_wake(notification: &str) -> bool {
-    const ACTIONABLE_MARKERS: &[&str] = &[
-        "[ci-ready-for-action]", // daemon CI-pass handoff
-        "[delegate_task]",       // kind=task dispatch
-        "[request_information]", // kind=query
+    // The pointer renders `kind={msg.kind}` (see `enqueue_with_idle_hint`):
+    // ci-ready → "ci-ready-for-action", kind=task dispatch → "task",
+    // kind=query → "query". The trailing space (` from=` follows in the
+    // pointer) keeps the match field-exact so a future "kind=task_foo" can't
+    // false-positive on "kind=task".
+    const ACTIONABLE_KINDS: &[&str] = &[
+        "kind=ci-ready-for-action ", // daemon CI-pass handoff
+        "kind=task ",                // kind=task dispatch
+        "kind=query ",               // kind=query
     ];
-    ACTIONABLE_MARKERS.iter().any(|m| notification.contains(m))
+    ACTIONABLE_KINDS.iter().any(|m| notification.contains(m))
 }
 
 /// #911 dedup gate predicate. Hybrid (A)+(B) suppression check for
@@ -473,26 +485,59 @@ where
 mod actionable_wake_tests {
     use super::notification_is_actionable_wake as is_actionable;
 
-    /// #1473: ci-ready / task dispatch / query are actionable work-delivery →
-    /// must bypass the draft-gate (recognized regardless of surrounding text).
+    // #1483: these assert against the REAL string `compose_aware_inject`
+    // receives — the `[AGEND-MSG-PENDING] … kind=… …` pointer built by
+    // `enqueue_with_idle_hint` — NOT the bracketed body markers that only
+    // appear in the message text. Pre-#1483 the matcher keyed on
+    // `[ci-ready-for-action]`/`[delegate_task]` brackets which never appear in
+    // this pointer, so the bypass was dead code; feeding the real pointer here
+    // makes that regression visible (pre-#1483 these `assert!(...)` go red).
+
+    /// ci-ready / task dispatch / query pointers → actionable → bypass draft-gate.
     #[test]
-    fn actionable_markers_recognized() {
+    fn actionable_kinds_recognized_in_real_pointer() {
         assert!(is_actionable(
-            "[ci-ready-for-action] owner/repo@br: CI passed, your turn."
+            "[AGEND-MSG-PENDING] id=m-1 kind=ci-ready-for-action from=system:ci inbox=1 (use inbox tool)"
         ));
         assert!(is_actionable(
-            "[from:lead] [delegate_task] do X (task id: t-1)"
+            "[AGEND-MSG-PENDING] id=m-2 kind=task from=fixup-lead inbox=3 (use inbox tool)"
         ));
-        assert!(is_actionable("[from:lead] [request_information] answer Y"));
+        assert!(is_actionable(
+            "[AGEND-MSG-PENDING] id=m-3 kind=query from=fixup-lead inbox=1 (use inbox tool)"
+        ));
     }
 
-    /// Ambient notifications (no actionable marker) stay draft-gated.
+    /// Regression-proof for #1483: the bracketed body markers (which live in
+    /// the message TEXT, not the wake pointer) must NOT be how we match — that
+    /// was the dead-code bug. A pointer is what production sends.
     #[test]
-    fn non_actionable_not_recognized() {
-        assert!(!is_actionable("[from:peer] just a heads-up message"));
+    fn bracketed_body_markers_alone_do_not_match() {
+        // Raw body text (never reaches compose_aware_inject) — must be false.
         assert!(!is_actionable(
-            "[system:ci] [ci-fail] owner/repo@br: failure"
+            "[ci-ready-for-action] owner/repo@br: CI passed."
         ));
-        assert!(!is_actionable("[AGEND-MSG] size=42 (use inbox tool)"));
+        assert!(!is_actionable(
+            "[from:lead] [delegate_task] do X (task id: t-1)"
+        ));
+    }
+
+    /// Ambient / informational pointers (non-actionable kinds) stay draft-gated.
+    #[test]
+    fn non_actionable_kinds_stay_gated() {
+        // report / update pointers — informational, not work-delivery.
+        assert!(!is_actionable(
+            "[AGEND-MSG-PENDING] id=m-4 kind=report from=fixup-dev inbox=1 (use inbox tool)"
+        ));
+        assert!(!is_actionable(
+            "[AGEND-MSG-PENDING] id=m-5 kind=update from=fixup-lead inbox=1 (use inbox tool)"
+        ));
+        // ci-conclusion friendly hint (kind=ci-watch, no `kind=` actionable) — informational.
+        assert!(!is_actionable(
+            "[ci-pass] owner/repo@br: passed ✓ (inbox=1)"
+        ));
+        // field-exactness: a hypothetical superstring kind must not false-match `kind=task`.
+        assert!(!is_actionable(
+            "[AGEND-MSG-PENDING] id=m-6 kind=task_summary from=x inbox=1 (use inbox tool)"
+        ));
     }
 }

@@ -2306,11 +2306,22 @@ fn t12_pty_state_kind_matrix() {
         })
         .expect("composing enqueue");
         let after = crate::notification_queue::pending_count(&composing_home, "agent1");
-        assert_eq!(
-            after,
-            before + 1,
-            "composing must defer 1 hint for kind={kind}"
-        );
+        // #1483: actionable work-delivery kinds (ci-ready-for-action / task /
+        // query) bypass the draft-gate and inject straight to the PTY — they
+        // are NOT deferred into the queue even while composing. Only ambient
+        // kinds (report / update / waiting_on_stale) defer.
+        if matches!(kind, "task" | "query") {
+            assert_eq!(
+                after, before,
+                "actionable kind={kind} must bypass draft-gate (not deferred) while composing"
+            );
+        } else {
+            assert_eq!(
+                after,
+                before + 1,
+                "ambient kind={kind} must defer 1 hint while composing"
+            );
+        }
         fs::remove_dir_all(&composing_home).ok();
     }
     fs::remove_dir_all(&home).ok();
