@@ -822,6 +822,71 @@ fn checkout_bind_true_writes_binding_marker_and_arms_watch() {
 
 #[test]
 #[cfg(unix)]
+fn checkout_bind_true_idempotent_when_already_bound_1494() {
+    // #1494 RED→GREEN: the dispatch pre-build hook leases the agent's
+    // worktree at the canonical `<agent>/<branch>` path and writes
+    // binding.json before the agent claims. When the agent THEN runs
+    // `repo action=checkout bind:true` on the same branch, this handler's
+    // DIFFERENT `<agent>-<source>` path scheme means the direct
+    // `git worktree add <agent>-<source> <branch>` fails with "is already
+    // checked out at <agent>/<branch>" — the release-dance pain. The
+    // handler must detect the existing same-branch binding and return that
+    // worktree path idempotently (same spirit as #1465 idempotent-release).
+    //
+    // REGRESSION-PROOF: delete the `if bind { if let Some(existing) = ...`
+    // short-circuit in handle_checkout_repo → the claim re-runs
+    // `git worktree add` on an already-checked-out branch, this returns
+    // `{error, code:"worktree_add_failed"}`, and the assertions below fail.
+    let home = p778_tmp_home("1494-idem");
+    let parent = p778_tmp_home("1494-idem-src");
+    let source = p778_setup_source_repo(&parent, "feat/1494");
+    let agent = "idem-dev";
+
+    // Simulate the dispatch pre-build: lease the worktree at the canonical
+    // `<agent>/<branch>` path + write binding.json — exactly what the
+    // dispatch hook does before the agent claims.
+    let lease = crate::worktree_pool::lease(&home, &source, agent, "feat/1494")
+        .expect("dispatch pre-build lease must succeed");
+    let dispatch_path = lease.path.clone();
+    assert!(dispatch_path.exists(), "pre-built worktree must exist");
+
+    // Agent claims via `repo checkout bind:true` on the SAME branch.
+    let resp = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "repository_path": source.display().to_string(),
+            "branch": "feat/1494",
+            "bind": true,
+        }),
+        agent,
+    );
+
+    assert!(
+        resp.get("error").is_none(),
+        "#1494: re-bind to already-bound branch must be idempotent, not error: {resp}"
+    );
+    assert_eq!(
+        resp["bound"].as_bool(),
+        Some(true),
+        "must still report bound: {resp}"
+    );
+    assert_eq!(
+        resp["idempotent"].as_bool(),
+        Some(true),
+        "#1494: short-circuit must flag the idempotent reuse: {resp}"
+    );
+    assert_eq!(
+        resp["path"].as_str(),
+        Some(dispatch_path.display().to_string().as_str()),
+        "#1494: must return the EXISTING dispatch worktree path, not a fresh one: {resp}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+#[test]
+#[cfg(unix)]
 fn checkout_writes_event_log_success_and_error_1466() {
     // #1466: every checkout outcome — success AND error — must leave a
     // `worktree_checkout` event-log trace (observability for silent
