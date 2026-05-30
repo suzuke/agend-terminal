@@ -88,7 +88,10 @@ pub(crate) fn def_create_instance() -> Value {
             "count": {"type": "integer", "description": "Number of instances to spawn (requires team; ignored when `backends` is set)"},
             "team": {"type": "string", "description": "Team name — members become <team>-1, <team>-2, ... grouped in one tab"},
             "backends": {"type": "array", "items": {"type": "string"}, "description": "Per-member backend list for a mixed-backend team (requires team). Length dictates member count."},
-            "command": {"type": "string", "description": "Deprecated: use 'backend' instead"}
+            "command": {"type": "string", "description": "Deprecated: use 'backend' instead"},
+            "role": {"type": "string", "description": "Agent role label (e.g. `reviewer`) recorded on the spawned instance's fleet.yaml entry."},
+            "env": {"type": "object", "description": "#900: environment variables (object of string→string) injected into the spawned backend process and persisted to the fleet.yaml entry so replace/restart flows re-apply them."},
+            "topic_binding": {"type": "string", "description": "Telegram topic binding for the spawned agent, forwarded to the spawn RPC."}
         }, "required": ["name"]}})
 }
 
@@ -271,7 +274,9 @@ pub(crate) fn def_ci() -> Value {
             "branch": {"type": "string", "description": "Branch to watch (default: main); optional filter for status."},
             "interval_secs": {"type": "number", "description": "Poll interval in seconds (default: 60)"},
             "next_after_ci": {"type": "string", "description": "Instance to auto-notify when CI passes. Daemon sends [ci-ready-for-action] to this target."},
-            "review_class": {"type": "string", "enum": ["single", "dual"], "description": "#972: review threshold for the daemon's PR-state aggregator. `single` (default) — §3.6 one VERIFIED unlocks the merge gate. `dual` — §3.5 two distinct VERIFIED required before `[pr-ready-for-merge]` fires."}
+            "review_class": {"type": "string", "enum": ["single", "dual"], "description": "#972: review threshold for the daemon's PR-state aggregator. `single` (default) — §3.6 one VERIFIED unlocks the merge gate. `dual` — §3.5 two distinct VERIFIED required before `[pr-ready-for-merge]` fires."},
+            "ci_provider": {"type": "string", "description": "watch: CI provider override — `github` (default) or `bitbucket_cloud`. `bitbucket_server` is rejected (not yet supported). Persisted on the watch sidecar."},
+            "ci_provider_url": {"type": "string", "description": "watch: base URL for a self-hosted CI provider, persisted on the watch sidecar alongside `ci_provider`."}
         }, "required": ["action"]}})
 }
 
@@ -318,7 +323,8 @@ pub(crate) fn def_repo() -> Value {
             "min_age_days": {"type": "integer", "description": "#817 cleanup_merged_branches: stale_idle threshold in days (default 90)."},
             "apply": {"type": "boolean", "description": "#817 cleanup_merged_branches: when false (default), returns dry-run plan; when true, deletes confirm_ids subset."},
             "confirm_ids": {"type": "array", "items": {"type": "string"}, "description": "#817 cleanup_merged_branches apply=true: subset of candidate_ids from prior dry-run to actually delete via `git branch -D`."},
-            "audit_reason": {"type": "string", "description": "#817 cleanup_merged_branches apply=true: required audit text recorded in event-log.jsonl per deleted branch with source SHA for restore."}
+            "audit_reason": {"type": "string", "description": "#817 cleanup_merged_branches apply=true: required audit text recorded in event-log.jsonl per deleted branch with source SHA for restore."},
+            "from_ref": {"type": "string", "description": "checkout bind:true: base ref to auto-create `branch` from when it doesn't exist locally (default `origin/main`)."}
         }, "required": ["action"]}})
 }
 
@@ -514,6 +520,154 @@ mod tests {
         assert!(
             names.contains(&"pane_snapshot"),
             "pane_snapshot tool must be registered, got: {names:?}"
+        );
+    }
+
+    // ── #1505 Invariant B: handler arg reads ⊆ declared-union ∪ allowlist ──
+
+    fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                collect_rs_files(&p, out);
+            } else if p.extension().and_then(|x| x.to_str()) == Some("rs") {
+                out.push(p);
+            }
+        }
+    }
+
+    /// Extract top-level tool-arg keys read on a line: `args["KEY"]` and
+    /// `args.get("KEY")`. Only simple snake_case identifiers are returned, so
+    /// dynamically-built keys (`args[format!(...)]`, variable indices) and
+    /// nested reads (`args["a"]["b"]` exposes only `a` — the `["b"]` has no
+    /// `args` prefix) are naturally excluded.
+    fn extract_arg_read_keys(line: &str) -> Vec<String> {
+        let mut keys = Vec::new();
+        for (open, close) in [("args[\"", "\"]"), ("args.get(\"", "\")")] {
+            let mut rest = line;
+            while let Some(p) = rest.find(open) {
+                let after = &rest[p + open.len()..];
+                let Some(q) = after.find(close) else { break };
+                let key = &after[..q];
+                if !key.is_empty()
+                    && key
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                {
+                    keys.push(key.to_string());
+                }
+                rest = &after[q + close.len()..];
+            }
+        }
+        keys
+    }
+
+    /// #1505 Invariant B: every MCP handler `args["k"]` / `args.get("k")` read of
+    /// a top-level tool argument must be either declared in SOME tool's schema
+    /// (`inputSchema.properties`) or explicitly allow-listed below. Closes the
+    /// silent schema↔handler drift class from the "read side": a handler reading
+    /// a key that no schema advertises (typo, undocumented param, stale name) is
+    /// invisible to the agent — it can never send that key, so the read always
+    /// gets null with no compile error and no test failure.
+    ///
+    /// Pairs with the retired-name denylist in
+    /// `tests/mcp_retired_arg_keys_invariant.rs` (#1502 Part A), which covers the
+    /// "wrong name" side.
+    ///
+    /// LIMITATION (deliberate, for zero false positives): reconciles against the
+    /// GLOBAL UNION of all tools' declared keys, NOT per-tool. It does not catch
+    /// a key declared in tool X but read by tool Y. Precise per-tool attribution
+    /// would need a source-level call graph — handlers read args in shared
+    /// helpers (`instance_spawn`, `checkout_source`, `lift_message`) that serve
+    /// multiple tools — which is brittle and false-positive-prone. The union
+    /// check is the deterministic zero-FP subset that still catches the
+    /// high-value case: a read no schema declares at all.
+    ///
+    /// RED proof: add a non-comment `args["__bogus_undeclared__"]` read to any
+    /// non-test source under `src/mcp/` → this test fails naming the file:line.
+    #[test]
+    fn mcp_handler_arg_reads_are_declared_or_allowlisted() {
+        use std::collections::BTreeSet;
+
+        // (1) Declared union: every top-level key across all tools' schemas.
+        let defs = tool_definitions();
+        let mut declared: BTreeSet<String> = BTreeSet::new();
+        for tool in defs["tools"].as_array().expect("tools array") {
+            if let Some(props) = tool["inputSchema"]["properties"].as_object() {
+                declared.extend(props.keys().cloned());
+            }
+        }
+
+        // (2) Allowlist: reads that are intentionally NOT agent-facing schema
+        //     params. Each entry carries its reason; remove the entry when the
+        //     read is removed.
+        const ALLOWLIST: &[(&str, &str)] = &[
+            // `send` routes by request_kind and calls lift_message(args, dst) to
+            // COPY the agent-facing `message` field into these internal keys
+            // before handle_report_result / handle_request_information read them.
+            // The agent always sends `message` (the schema documents it), so
+            // these must stay undeclared — only allow-listed.
+            (
+                "summary",
+                "internal: lift_message copies `message` here for kind=report",
+            ),
+            (
+                "question",
+                "internal: lift_message copies `message` here for kind=query",
+            ),
+            // handle_send_to_instance reads `kind` only as a back-compat fallback
+            // when `request_kind` is absent. The current schema name is
+            // `request_kind`; `kind` stays undeclared on purpose.
+            ("kind", "deprecated back-compat alias for `request_kind`"),
+        ];
+        let allow: BTreeSet<&str> = ALLOWLIST.iter().map(|(k, _)| *k).collect();
+
+        // (3) Read sites: scan non-test source under src/mcp/ for top-level arg
+        //     reads.
+        let mcp_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/mcp");
+        let mut files = Vec::new();
+        collect_rs_files(&mcp_dir, &mut files);
+        assert!(!files.is_empty(), "no .rs files under src/mcp/");
+
+        let mut violations = Vec::new();
+        for f in &files {
+            // Skip test files — fixtures legitimately build arbitrary arg shapes.
+            let fname = f.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if fname.ends_with("tests.rs") || fname.ends_with("test.rs") {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(f) else {
+                continue;
+            };
+            for (idx, line) in content.lines().enumerate() {
+                let t = line.trim_start();
+                if t.starts_with("//") || t.starts_with("*") {
+                    continue;
+                }
+                for key in extract_arg_read_keys(line) {
+                    if !declared.contains(&key) && !allow.contains(key.as_str()) {
+                        violations.push(format!(
+                            "{}:{}: reads undeclared arg key `{}`: {}",
+                            f.display(),
+                            idx + 1,
+                            key,
+                            line.trim()
+                        ));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "#1505: MCP handler reads an arg key that no tool schema declares and \
+             that is not allow-listed. Either add it to the tool's \
+             `inputSchema.properties` (if agent-facing) or to ALLOWLIST with a \
+             reason (if internal/deprecated):\n{}",
+            violations.join("\n")
         );
     }
 }
