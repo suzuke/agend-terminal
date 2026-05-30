@@ -1518,3 +1518,128 @@ fn git_search_splits_windows_path_separator_1504() {
         "#1504: shim dir excluded on Windows: {result:?}"
     );
 }
+
+// ── #1519: per-instance opencode session isolation ──
+
+#[test]
+fn opencode_data_dir_is_per_instance_1519() {
+    let home = std::path::Path::new("/tmp/agend-home");
+    let a = opencode_data_dir(home, "fixup-reviewer");
+    let b = opencode_data_dir(home, "fixup-reviewer-2");
+    assert_ne!(a, b, "distinct instances must get distinct data dirs");
+    assert!(
+        a.ends_with("backend-data/opencode/fixup-reviewer"),
+        "got {a:?}"
+    );
+    assert!(
+        b.ends_with("backend-data/opencode/fixup-reviewer-2"),
+        "got {b:?}"
+    );
+}
+
+/// The core #1519 regression: two opencode instances resolve to DISTINCT
+/// XDG_DATA_HOME values — the property that prevents the shared-session
+/// collision. Pre-fix there was no per-instance XDG at all (both inherited the
+/// daemon's, defaulting to the one global DB).
+#[test]
+fn per_instance_opencode_xdg_distinct_for_two_opencode_instances_1519() {
+    let home = std::path::Path::new("/tmp/agend-home");
+    let a = per_instance_opencode_xdg(Some(&Backend::OpenCode), Some(home), "fixup-reviewer");
+    let b = per_instance_opencode_xdg(Some(&Backend::OpenCode), Some(home), "fixup-reviewer-2");
+    assert!(
+        a.is_some() && b.is_some(),
+        "OpenCode + home must yield an XDG dir"
+    );
+    assert_ne!(
+        a, b,
+        "two opencode instances MUST get distinct XDG_DATA_HOME"
+    );
+}
+
+#[test]
+fn per_instance_opencode_xdg_gated_to_opencode_1519() {
+    let home = std::path::Path::new("/tmp/agend-home");
+    // Non-opencode backends must NOT get a per-instance XDG override.
+    assert_eq!(
+        per_instance_opencode_xdg(Some(&Backend::ClaudeCode), Some(home), "dev"),
+        None,
+        "claude must be unaffected"
+    );
+    assert_eq!(
+        per_instance_opencode_xdg(Some(&Backend::Codex), Some(home), "dev"),
+        None,
+        "codex must be unaffected"
+    );
+    // OpenCode but no home → can't isolate → None (falls back to global; logged).
+    assert_eq!(
+        per_instance_opencode_xdg(Some(&Backend::OpenCode), None, "rev"),
+        None,
+        "no home → no per-instance dir"
+    );
+}
+
+#[test]
+#[allow(clippy::unwrap_used)]
+fn provision_opencode_data_dir_copies_auth_1519() {
+    let base = std::env::temp_dir().join(format!(
+        "agend-1519-prov-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    // Fake canonical auth source.
+    let src_dir = base.join("canonical");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    let src = src_dir.join("auth.json");
+    std::fs::write(&src, r#"{"opencode-go":{"type":"api","key":"secret"}}"#).unwrap();
+
+    let xdg = base.join("xdg");
+    provision_opencode_data_dir(&xdg, Some(&src)).unwrap();
+
+    let dst = xdg.join("opencode").join("auth.json");
+    assert!(
+        dst.exists(),
+        "auth.json must be copied into <xdg>/opencode/"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&dst).unwrap(),
+        std::fs::read_to_string(&src).unwrap(),
+        "copied auth content must match the canonical source"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&dst).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "copied auth.json must be mode 600, got {mode:o}"
+        );
+    }
+    std::fs::remove_dir_all(&base).ok();
+}
+
+#[test]
+#[allow(clippy::unwrap_used)]
+fn provision_opencode_data_dir_no_auth_src_is_ok_1519() {
+    let xdg = std::env::temp_dir().join(format!(
+        "agend-1519-noauth-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    // No auth source → still creates the dir, no auth.json, no error.
+    provision_opencode_data_dir(&xdg, None).unwrap();
+    assert!(
+        xdg.join("opencode").is_dir(),
+        "data dir must still be created"
+    );
+    assert!(
+        !xdg.join("opencode").join("auth.json").exists(),
+        "no auth.json when no source provided"
+    );
+    std::fs::remove_dir_all(&xdg).ok();
+}

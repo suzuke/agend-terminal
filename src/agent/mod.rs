@@ -592,6 +592,71 @@ fn lexical_path_eq(a: &std::path::Path, b: &std::path::Path) -> bool {
 
 /// Build a `CommandBuilder` with resolved args, env, and working directory.
 ///
+/// #1519: per-instance opencode data dir (used as `XDG_DATA_HOME`). opencode
+/// writes its session DB + auth under `$XDG_DATA_HOME/opencode/`; keying this
+/// on the instance name gives each opencode agent an isolated session DB.
+/// Pure — testable without a real spawn. Lives under `$AGEND_HOME/backend-data`
+/// so the instance-delete teardown can GC it (see `full_delete_instance`).
+pub(crate) fn opencode_data_dir(home: &std::path::Path, instance: &str) -> PathBuf {
+    home.join("backend-data").join("opencode").join(instance)
+}
+
+/// #1519: the per-instance `XDG_DATA_HOME` to inject for an opencode spawn, or
+/// `None` for any other backend / when `home` is unknown. Pure gate so the
+/// OpenCode-only behavior (and the two-distinct-instances invariant) is
+/// unit-testable without inspecting a `CommandBuilder`.
+fn per_instance_opencode_xdg(
+    backend: Option<&Backend>,
+    home: Option<&std::path::Path>,
+    instance: &str,
+) -> Option<PathBuf> {
+    match (backend, home) {
+        (Some(Backend::OpenCode), Some(h)) => Some(opencode_data_dir(h, instance)),
+        _ => None,
+    }
+}
+
+/// #1519: canonical opencode `auth.json` to seed each per-instance data dir
+/// from. opencode uses XDG semantics on every platform (`~/.local/share`, NOT
+/// macOS's `~/Library/Application Support`), so resolve it the XDG way from the
+/// daemon's CURRENT env — which still holds the operator's (pre-override)
+/// `XDG_DATA_HOME` at spawn time. `None` if neither `XDG_DATA_HOME` nor `HOME`
+/// is set.
+fn canonical_opencode_auth() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share"))
+        })?;
+    Some(base.join("opencode").join("auth.json"))
+}
+
+/// #1519: prepare a per-instance opencode data dir: create `<xdg>/opencode/`
+/// and copy the canonical credential in (mode 600) so the isolated DB dir is
+/// still authenticated. `auth_src` is passed in (not read from env) so this is
+/// deterministically testable; a missing/absent source is a no-op (the agent
+/// then surfaces opencode's own "not logged in" prompt rather than silently
+/// sharing the global session).
+fn provision_opencode_data_dir(
+    xdg_dir: &std::path::Path,
+    auth_src: Option<&std::path::Path>,
+) -> std::io::Result<()> {
+    let oc_dir = xdg_dir.join("opencode");
+    std::fs::create_dir_all(&oc_dir)?;
+    if let Some(src) = auth_src {
+        if src.exists() {
+            let dst = oc_dir.join("auth.json");
+            std::fs::copy(src, &dst)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Extracted from `spawn_agent` so the command-construction logic (arg
 /// enrichment, env filtering, PATH prepend, cwd validation) is isolated
 /// from the PTY plumbing that follows.
@@ -713,6 +778,34 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
             }
             cmd.env(k, v);
         }
+    }
+
+    // #1519: per-instance opencode session isolation. opencode stores ALL
+    // sessions in a single global DB under XDG_DATA_HOME (default
+    // ~/.local/share/opencode/opencode.db), and `--continue` resumes the
+    // GLOBAL most-recent session regardless of cwd — so two opencode instances
+    // (fixup-reviewer + fixup-reviewer-2) shared one session byte-for-byte.
+    // Give each instance its OWN XDG_DATA_HOME → its own DB → its own
+    // `--continue` history (ResumeMode unchanged). opencode also reads its
+    // credential from `$XDG_DATA_HOME/opencode/auth.json`, so copy the canonical
+    // auth in (it's a static api key; copy is robust against opencode's
+    // atomic-rename writes that would sever a symlink — and reviewer-2 confirmed
+    // OPENCODE_API_KEY env isn't honored). Gated to OpenCode only.
+    //
+    // Placement is DELIBERATE: this runs AFTER the fleet.yaml user-env loop and
+    // the #1440 allowlist block so the per-instance value overrides BOTH an
+    // on-allowlist XDG_DATA_HOME and an operator-set one — session isolation is
+    // a correctness invariant that must win over operator preference here.
+    if let Some(data_dir) = per_instance_opencode_xdg(detected_backend.as_ref(), *home, name) {
+        if let Err(e) = provision_opencode_data_dir(&data_dir, canonical_opencode_auth().as_deref())
+        {
+            tracing::warn!(
+                instance = %name,
+                error = %e,
+                "#1519: opencode data-dir provision failed; instance may fall back to the shared session"
+            );
+        }
+        cmd.env("XDG_DATA_HOME", &data_dir);
     }
 
     // Add agend-terminal binary + $AGEND_HOME/bin (shim) to PATH.

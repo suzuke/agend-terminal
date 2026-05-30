@@ -131,6 +131,11 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
     let _ = crate::dispatch_tracking::cleanup_for_instance(home, name);
     // - ci_watch: drop from subscribers + clear next_after_ci (+ remove empty).
     let _ = crate::daemon::ci_watch::cleanup_watches_for_instance(home, name);
+    // #1519: GC the per-instance opencode data dir ($AGEND_HOME/backend-data/
+    // opencode/<name> — the per-instance XDG_DATA_HOME holding its isolated
+    // session DB + copied auth). No-op for non-opencode instances (the dir was
+    // never created). Best-effort like the steps above.
+    let _ = std::fs::remove_dir_all(crate::agent::opencode_data_dir(home, name));
 
     // Sprint 54 P1-B Bug 1 audit: enumerate every store that still holds
     // the name. If any do, surface a loud error instead of returning
