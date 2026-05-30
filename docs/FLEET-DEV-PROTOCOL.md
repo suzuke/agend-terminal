@@ -2,6 +2,20 @@
 
 **Status:** ACTIVE — all fleet agents must follow this protocol.
 
+## Protocol Structure & Maintenance
+
+This document has two layers:
+
+- **Normative layer (§0–§13)** — the rules. Everything you need to *act correctly right now*. No sprint numbers, PR/issue references, dates, or incident retellings belong here.
+- **Appendix A — Rationale & Incident Log** — the *why* and the *when*. The empirical incidents, activation histories, and motivations behind the rules, keyed by section ID. A rule distilled from an incident carries a `↳ 緣由 A-§X` pointer; follow it only when questioning or revising the rule.
+- **Appendix B — Section Number Map** — archaeology of past renumberings.
+
+**Consolidation ritual (maintenance meta-rule).** New rules accrete; old ones rarely get retired. To keep the normative layer legible:
+
+- A new rule MUST land in the normative layer as an *imperative* (what to do), with any incident narrative going to Appendix A — never inline.
+- Every ~10 new rules OR every protocol-touching sprint, do a consolidation pass: merge overlapping rules, retire superseded ones (move the trail to Appendix A), and confirm the normative layer still reads in one sitting.
+- If a normative section can no longer be understood without its appendix entry, the rule wording is incomplete — fix the wording, don't lean on the appendix.
+
 ## §0. KISS Principle
 
 Every PR must answer: **"What real problem does this solve?"** and **"Would deletion break anyone?"** Changes lacking a concrete failure mode = `KISS-VIOLATION — UNVERIFIED`.
