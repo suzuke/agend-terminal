@@ -495,7 +495,17 @@ fn init_daemon_services(
     home: &Path,
     telegram: Option<Arc<dyn crate::channel::Channel>>,
 ) -> anyhow::Result<DaemonContext> {
-    crate::daemon_config::init(crate::daemon_config::DaemonConfig::default());
+    // #1487: source the operator timezone from fleet.yaml `display_timezone:`
+    // (reusing the same operator-tz concept as ci_watch / display_time) for the
+    // `now=` header field; `None`/empty → system local time.
+    let display_timezone = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+        .ok()
+        .and_then(|f| f.display_timezone)
+        .filter(|s| !s.is_empty());
+    crate::daemon_config::init(crate::daemon_config::DaemonConfig {
+        display_timezone,
+        ..crate::daemon_config::DaemonConfig::default()
+    });
 
     const SKILLS_STAGE_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
     crate::bootstrap::time_step("skills::cleanup_stale_stages", || {
