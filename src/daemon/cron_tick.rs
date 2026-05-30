@@ -99,6 +99,12 @@ pub fn check_schedules(home: &Path, registry: &AgentRegistry) {
         let reg = agent::lock_registry(registry);
         // #1441: registry is UUID-keyed; resolve target name via fleet.yaml.
         let target_id = crate::fleet::resolve_uuid(home, target);
+        // The inbox fallback below does self-IPC (`enqueue_with_idle_hint` →
+        // `api::call` over the loopback socket). It MUST run outside the
+        // registry-lock window: the API handler servicing the self-call needs
+        // the same lock, so calling it here deadlocks the daemon tick. Record
+        // the intent under the lock; execute the enqueue after `drop(reg)`.
+        let mut deferred_inbox = false;
         let status = if fire.missed {
             // Daemon was down through the one-shot instant — don't silently
             // inject a stale message (could be a morning "stand-up" from
@@ -114,14 +120,22 @@ pub fn check_schedules(home: &Path, registry: &AgentRegistry) {
                 }
             }
         } else {
+            // #1441 routing change (`reg.get(target)` → resolve_uuid via
+            // fleet.yaml) means a schedule targeting a non-fleet instance now
+            // lands here. Defer the self-IPC enqueue past the lock — see the
+            // `deferred_inbox` note above.
+            deferred_inbox = true;
+            "ok_inbox"
+        };
+        drop(reg);
+
+        if deferred_inbox {
             let _ = crate::inbox::enqueue_with_idle_hint(
                 home,
                 target,
                 crate::inbox::InboxMessage::new_system("system:schedule", "schedule", message),
             );
-            "ok_inbox"
-        };
-        drop(reg);
+        }
 
         crate::schedules::record_run(home, sched_id, status);
         if fire.one_shot {
