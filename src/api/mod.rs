@@ -666,6 +666,11 @@ fn spawn_one(
 /// 0600 so only the daemon's user can read it — this is the peer-UID
 /// substitute for TCP loopback (see `auth_cookie.rs`).
 pub fn call(home: &Path, request: &Value) -> anyhow::Result<Value> {
+    // #1492: self-IPC over the loopback socket. If the caller holds the
+    // registry lock, the API handler servicing this call needs the same lock →
+    // deadlock. Debug builds panic here so any unit test hitting the bad path
+    // fails loudly; release builds compile this to a no-op.
+    crate::sync_audit::assert_no_registry_lock_for_self_ipc("api::call");
     let stream = crate::ipc::connect_api(home)?;
     let run = crate::daemon::find_active_run_dir(home)
         .ok_or_else(|| anyhow::anyhow!("no active daemon (run dir not found)"))?;

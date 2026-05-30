@@ -343,11 +343,13 @@ pub fn resolve_instance(
 }
 
 /// Lock the agent registry, recovering from poison.
-pub fn lock_registry(
-    reg: &AgentRegistry,
-) -> parking_lot::MutexGuard<'_, std::collections::HashMap<crate::types::InstanceId, AgentHandle>> {
+pub fn lock_registry(reg: &AgentRegistry) -> RegistryGuard<'_> {
     crate::sync_audit::assert_lock_tier(1, "registry");
-    reg.lock()
+    let inner = reg.lock();
+    // #1492: mark the registry lock held so self-IPC vectors can detect a
+    // lock-across-IPC deadlock. Debug-only; release no-op.
+    crate::sync_audit::registry_lock_entered();
+    RegistryGuard { inner }
 }
 
 // ── #945 Phase 1: pending-registry slot for deferred attach ────────────
@@ -403,6 +405,8 @@ pub fn lock_registry_tracked<'a>(reg: &'a AgentRegistry, site: &'static str) -> 
     crate::sync_audit::assert_lock_tier(1, "registry");
     let inner = reg.lock();
     crate::sync_audit::set_registry_holder(site);
+    // #1492: see lock_registry. Debug-only; release no-op.
+    crate::sync_audit::registry_lock_entered();
     RegistryGuard { inner }
 }
 
@@ -434,6 +438,10 @@ impl<'a> std::ops::DerefMut for RegistryGuard<'a> {
 
 impl<'a> Drop for RegistryGuard<'a> {
     fn drop(&mut self) {
+        // #1492: clear the held-flag as the registry scope ends (debug-only;
+        // release no-op). The inner MutexGuard releases via field-drop right
+        // after this body.
+        crate::sync_audit::registry_lock_exited();
         crate::sync_audit::clear_registry_holder();
     }
 }

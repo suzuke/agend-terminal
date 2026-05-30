@@ -1411,3 +1411,45 @@ fn dropped_warn_input_is_key_names_only() {
         "warn input must contain key names only, never values"
     );
 }
+
+// ── #1492: lock_registry guard wiring for lock-across-self-IPC detection ──
+
+#[cfg(test)]
+fn empty_registry_1492() -> AgentRegistry {
+    std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Real wiring: `lock_registry` sets the debug held-flag, so a self-IPC vector
+/// (modeled by the assert) panics while the guard is alive. Proves the guard —
+/// not just the raw counter — participates. Debug-only: the detection compiles
+/// out in release, so the panic only exists there.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "lock-across-self-IPC")]
+fn lock_registry_guard_trips_self_ipc_assert_1492() {
+    let reg = empty_registry_1492();
+    let _guard = lock_registry(&reg);
+    crate::sync_audit::assert_no_registry_lock_for_self_ipc("api::call");
+}
+
+/// Dropping the `lock_registry` guard BEFORE self-IPC (the 6f1403d-correct
+/// pattern) clears the held-flag, so the assert does not trip.
+#[cfg(debug_assertions)]
+#[test]
+fn lock_registry_guard_drop_clears_self_ipc_flag_1492() {
+    let reg = empty_registry_1492();
+    {
+        let _guard = lock_registry(&reg);
+    } // guard dropped → flag cleared
+    crate::sync_audit::assert_no_registry_lock_for_self_ipc("api::call");
+}
+
+/// `lock_registry_tracked` participates in the same detection.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "lock-across-self-IPC")]
+fn lock_registry_tracked_guard_trips_self_ipc_assert_1492() {
+    let reg = empty_registry_1492();
+    let _guard = lock_registry_tracked(&reg, "test-1492");
+    crate::sync_audit::assert_no_registry_lock_for_self_ipc("enqueue_with_idle_hint");
+}

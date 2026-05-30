@@ -375,6 +375,11 @@ pub(crate) fn should_suppress_911_reinject_with_ledger(
 /// best-effort `[AGEND-MSG-PENDING]` PTY hint so daemon-side events do not
 /// strand silently when the recipient is at an idle prompt.
 pub fn enqueue_with_idle_hint(home: &Path, target: &str, msg: InboxMessage) -> anyhow::Result<()> {
+    // #1492: this is a self-IPC vector — the default emitter's PTY inject
+    // reaches `api::call` over the loopback socket. Calling it while holding
+    // the registry lock deadlocks the daemon (the morning cron bug). Debug
+    // builds panic here for an early, clear signal; release is a no-op.
+    crate::sync_audit::assert_no_registry_lock_for_self_ipc("enqueue_with_idle_hint");
     enqueue_with_idle_hint_with_emitter(home, target, msg, |hint| {
         compose_aware_inject(home, target, hint);
     })
