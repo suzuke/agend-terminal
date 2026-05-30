@@ -97,41 +97,21 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
             match crate::task_events::append(home, &emitter, event) {
                 Ok(_) => {
                     let task = read_task_record(home, &id).map(|r| record_to_task(&r));
-                    let dispatch_target = routed_to.as_ref().or(assignee.as_ref());
-                    if let Some(target) = dispatch_target {
-                        if target != instance_name {
-                            let branch_str = args["branch"]
-                                .as_str()
-                                .map(|b| format!("\nBranch: {b}"))
-                                .unwrap_or_default();
-                            let msg_text =
-                                format!("[delegate_task] {title}{branch_str} (task id: {id})");
-                            let inbox_msg = crate::inbox::InboxMessage {
-                                from: format!("from:{instance_name}"),
-                                text: msg_text.clone(),
-                                kind: Some("task".to_string()),
-                                task_id: Some(id.clone()),
-                                correlation_id: Some(id.clone()),
-                                timestamp: chrono::Utc::now().to_rfc3339(),
-                                ..Default::default()
-                            };
-                            let _ = crate::inbox::storage::enqueue(home, target, inbox_msg);
-                            crate::dispatch_tracking::track_dispatch(
-                                home,
-                                crate::dispatch_tracking::DispatchEntry {
-                                    task_id: Some(id.clone()),
-                                    from: instance_name.to_string(),
-                                    to: target.to_string(),
-                                    from_id: None,
-                                    to_id: None,
-                                    delegated_at: chrono::Utc::now().to_rfc3339(),
-                                    status: "pending".to_string(),
-                                },
-                            );
-                            let source = crate::inbox::NotifySource::Agent(instance_name);
-                            crate::inbox::notify::notify_agent(home, target, &source, &msg_text);
-                        }
-                    }
+                    // #1496 Option 1: `task(action:create)` is a PURE board record
+                    // with ZERO dispatch side-effects — no inbox enqueue, no
+                    // dispatch_tracking, no PTY notify. Dispatch (notify + worktree
+                    // auto-bind) is solely `send(kind=task)`'s job; it auto-creates
+                    // the board row when `task_id` is empty (comms.rs), so the
+                    // single-step "create + dispatch" use case is fully preserved
+                    // via one `send(kind=task)` call.
+                    //
+                    // The prior auto-notify (#1238) was a second, inferior dispatch
+                    // path: a title-only, non-actionable wake carrying no task
+                    // description. It fired prematurely — pushing the assignee into
+                    // the busy state before the real, context-rich `send(kind=task)`
+                    // arrived — so that send hit the busy-gate and forced operators
+                    // to re-send with `force=true`. Removing it unifies dispatch on
+                    // one path and kills the race (see #1496 spike).
                     serde_json::json!({
                         "id": id,
                         "event": "created",
@@ -1215,30 +1195,12 @@ mod tests {
         crate::inbox::storage::drain(home, agent)
     }
 
-    #[test]
-    fn create_with_assignee_sends_task_to_inbox() {
-        let home = tmp_home("assign_inbox");
-        let result = handle(
-            &home,
-            "lead-agent",
-            &serde_json::json!({
-                "action": "create",
-                "title": "implement feature X",
-                "assignee": "dev-agent",
-                "branch": "fix/feature-x",
-            }),
-        );
-        assert_eq!(result["event"], "created");
-        let task_id = result["id"].as_str().unwrap();
-
-        let msgs = drain_inbox(&home, "dev-agent");
-        assert!(!msgs.is_empty(), "assignee should receive inbox message");
-        let msg = &msgs[0];
-        assert_eq!(msg.kind.as_deref(), Some("task"));
-        assert_eq!(msg.task_id.as_deref(), Some(task_id));
-        assert!(msg.text.contains("implement feature X"));
-        assert!(msg.text.contains("fix/feature-x"));
-    }
+    // #1496 Option 1: create no longer auto-notifies, so the prior
+    // `create_with_assignee_sends_task_to_inbox` /
+    // `create_with_assignee_correlation_id_matches_task_id` tests (which asserted
+    // an inbox message on create) are removed — their inverse is now
+    // `create_with_assignee_has_no_dispatch_side_effects_1496`. Dispatch-message
+    // shape (kind/task_id/correlation_id) is covered on the send(kind=task) path.
 
     #[test]
     fn create_without_assignee_sends_no_message() {
@@ -1292,29 +1254,6 @@ mod tests {
         assert_eq!(task["assignee"], "dev-agent");
     }
 
-    #[test]
-    fn create_with_assignee_correlation_id_matches_task_id() {
-        let home = tmp_home("corr_id");
-        let result = handle(
-            &home,
-            "lead-agent",
-            &serde_json::json!({
-                "action": "create",
-                "title": "correlated task",
-                "assignee": "dev-agent",
-            }),
-        );
-        let task_id = result["id"].as_str().unwrap();
-
-        let msgs = drain_inbox(&home, "dev-agent");
-        let msg = &msgs[0];
-        assert_eq!(
-            msg.correlation_id.as_deref(),
-            Some(task_id),
-            "correlation_id should match task_id for auto-close"
-        );
-    }
-
     fn write_fleet_yaml_with_team(home: &std::path::Path, team: &str, orchestrator: &str) {
         let yaml = format!(
             "teams:\n  {team}:\n    orchestrator: {orchestrator}\n    members:\n      - dev-a\n      - dev-b\n"
@@ -1323,7 +1262,12 @@ mod tests {
     }
 
     #[test]
-    fn create_with_team_assignee_routes_to_orchestrator() {
+    fn create_with_team_assignee_records_orchestrator_routing() {
+        // #1496 Option 1: create no longer notifies, but it still RESOLVES a team
+        // assignee to its orchestrator and RECORDS that on the task (`routed_to`).
+        // The dispatch-time team→orchestrator inbox routing is covered separately
+        // on the send(kind=task) path
+        // (mcp::handlers::tests::test_delegate_task_resolves_team_to_orchestrator_inbox).
         let home = tmp_home("team_route");
         write_fleet_yaml_with_team(&home, "my-team", "team-lead");
 
@@ -1337,64 +1281,61 @@ mod tests {
             }),
         );
         assert_eq!(result["event"], "created");
-
-        let orch_msgs = drain_inbox(&home, "team-lead");
-        assert!(
-            !orch_msgs.is_empty(),
-            "orchestrator should receive inbox message when team is assignee"
+        assert_eq!(
+            result["task"]["routed_to"].as_str(),
+            Some("team-lead"),
+            "team assignee must resolve to its orchestrator in the record: {result}"
         );
-        assert_eq!(orch_msgs[0].kind.as_deref(), Some("task"));
-        assert!(orch_msgs[0].text.contains("team task"));
 
-        let team_msgs = drain_inbox(&home, "my-team");
+        // Pure record: no inbox side-effect for the orchestrator OR the raw team.
         assert!(
-            team_msgs.is_empty(),
-            "raw team name should NOT receive inbox message"
+            !home.join("inbox").join("team-lead.jsonl").exists()
+                && !home.join("inbox").join("my-team.jsonl").exists(),
+            "create must not enqueue any inbox message"
         );
     }
 
     #[test]
-    fn create_with_assignee_tracks_dispatch() {
-        let home = tmp_home("dispatch_track");
+    fn create_with_assignee_has_no_dispatch_side_effects_1496() {
+        // #1496 Option 1: `task(action:create)` is a PURE board record. Creating
+        // a task assigned to ANOTHER agent must NOT enqueue an inbox message or
+        // write a dispatch-tracking entry — dispatch (notify + worktree auto-bind)
+        // is solely `send(kind=task)`'s job. Pre-#1496 (#1238) this auto-notified
+        // with a title-only, non-actionable wake that raced the real send into the
+        // busy-gate, taxing every dispatch with a force-resend.
+        //
+        // REGRESSION-PROOF: restore the auto-notify block in the create handler →
+        // both assertions below fail (the assignee's inbox jsonl and
+        // dispatch_tracking.json reappear). Subsumes the old self-assign case:
+        // create never dispatches now, for self OR other.
+        let home = tmp_home("create_no_dispatch_1496");
         let result = handle(
             &home,
             "lead-agent",
             &serde_json::json!({
                 "action": "create",
-                "title": "tracked dispatch task",
+                "title": "pure record task",
                 "assignee": "dev-agent",
+                "branch": "feat/x",
             }),
         );
-        assert_eq!(result["event"], "created");
-        let task_id = result["id"].as_str().unwrap();
-
-        let store: serde_json::Value =
-            crate::store::load(&crate::store::store_path(&home, "dispatch_tracking.json"));
-        let entries = store["entries"].as_array().expect("entries array");
-        assert_eq!(entries.len(), 1, "one dispatch entry expected");
-        assert_eq!(entries[0]["task_id"], task_id);
-        assert_eq!(entries[0]["from"], "lead-agent");
-        assert_eq!(entries[0]["to"], "dev-agent");
-        assert_eq!(entries[0]["status"], "pending");
-    }
-
-    #[test]
-    fn create_self_assign_no_dispatch_tracking() {
-        let home = tmp_home("dispatch_self");
-        handle(
-            &home,
-            "dev-agent",
-            &serde_json::json!({
-                "action": "create",
-                "title": "self task",
-                "assignee": "dev-agent",
-            }),
-        );
-
-        let path = crate::store::store_path(&home, "dispatch_tracking.json");
+        assert_eq!(result["event"], "created", "task still created: {result}");
         assert!(
-            !path.exists(),
-            "self-assign should not create dispatch tracking entry"
+            result["id"].as_str().is_some(),
+            "task id returned: {result}"
+        );
+
+        // No inbox message enqueued for the assignee.
+        let assignee_inbox = home.join("inbox").join("dev-agent.jsonl");
+        assert!(
+            !assignee_inbox.exists(),
+            "#1496: create must not enqueue an inbox message for the assignee"
+        );
+        // No dispatch-tracking entry written.
+        let track = crate::store::store_path(&home, "dispatch_tracking.json");
+        assert!(
+            !track.exists(),
+            "#1496: create must not write a dispatch-tracking entry"
         );
     }
 

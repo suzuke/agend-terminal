@@ -1284,6 +1284,60 @@ fn test_delegate_task_busy_returns_structured_response() {
 }
 
 #[test]
+fn test_delegate_task_enriching_same_task_id_bypasses_busy_gate_1496() {
+    // #1496 Option 1: a send(kind=task) whose `task_id` IS the target's current
+    // active task is ENRICHING that in-flight dispatch (finally delivering its
+    // context), not opening a competing one — it must pass the busy-gate WITHOUT
+    // force. This is what lets the create→send dispatch sequence work without the
+    // force-resend tax. Contrast test_delegate_task_busy_returns_structured_response
+    // (a DIFFERENT task_id, correctly gated).
+    //
+    // Exercises BOTH gates: the #1286 same-branch dedup reject and the generic
+    // busy reject — the `!enriching_active` guard short-circuits both.
+    //
+    // REGRESSION-PROOF: drop the `&& !enriching_active` guards in comms.rs → this
+    // send is rejected ("already has active task on branch" / busy:true) and the
+    // assertions below fail.
+    let _g = fleet_test_guard();
+    let home = tmp_home("busy-enrich-1496");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  target:\n    backend: claude\n  sender:\n    backend: claude\n",
+    )
+    .ok();
+    std::env::set_var("AGEND_HOME", &home);
+    crate::tasks::handle(
+        &home,
+        "target",
+        &json!({"action": "create", "title": "in-flight work", "branch": "feat/x"}),
+    );
+    let tasks = crate::tasks::handle(&home, "target", &json!({"action": "list"}));
+    let tid = tasks["tasks"][0]["id"].as_str().unwrap().to_string();
+    crate::tasks::handle(&home, "target", &json!({"action": "claim", "id": &tid}));
+
+    // Enriching dispatch: same task_id AND same branch as the target's active task.
+    let result = handle_tool(
+        "send",
+        &json!({"instance": "target", "task": "full context", "message": "full context", "request_kind": "task", "branch": "feat/x", "task_id": tid}),
+        "sender",
+    );
+    assert!(
+        result.get("busy").is_none(),
+        "#1496: send with task_id == target's active task must bypass the busy-gate (enriching, not competing): {result}"
+    );
+    assert!(
+        result.get("error").is_none()
+            || !result["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("already has active task"),
+        "#1496: enriching same-task send must not hit the #1286 same-branch dedup reject: {result}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn test_delegate_task_force_true_bypasses_busy_gate() {
     let _g = fleet_test_guard();
     let home = tmp_home("interrupt-bypass");
