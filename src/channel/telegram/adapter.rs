@@ -8,7 +8,7 @@ use crate::channel::telegram::reply::{inject_provenance, try_telegram_reply_from
 use crate::channel::telegram::send::{
     needs_separate_text, resolve_caption, send_media, send_with_topic, send_with_topic_capturing_id,
 };
-use crate::channel::telegram::state::{lock_state, telegram_runtime, TelegramState};
+use crate::channel::telegram::state::{block_on_value, lock_state, TelegramState};
 use crate::channel::telegram::topic_registry::{create_topic_for_instance, delete_topic};
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -112,9 +112,9 @@ impl TelegramChannel {
             }
         };
         let text = crate::channel::ux_event::format_fleet_oneliner(fe, self.caps.max_msg_bytes);
-        if let Err(e) = telegram_runtime()
-            .block_on(async { send_with_topic(&bot, chat_id, Some(topic_id), &text, None).await })
-        {
+        if let Err(e) = block_on_value(async {
+            send_with_topic(&bot, chat_id, Some(topic_id), &text, None).await
+        }) {
             let handled = handle_fleet_send_failure(&e, &home, &self.state, topic_id);
             if !handled {
                 tracing::warn!(%e, topic_id, "fleet renderer: send failed");
@@ -155,7 +155,7 @@ impl crate::channel::Channel for TelegramChannel {
         match msg.attachment {
             Some(ref att) => {
                 let caption = resolve_caption(&msg.text, att);
-                let msg_id = telegram_runtime().block_on(send_media(
+                let msg_id = block_on_value(send_media(
                     &bot,
                     group_id,
                     topic_id,
@@ -163,8 +163,8 @@ impl crate::channel::Channel for TelegramChannel {
                     caption.as_deref(),
                 ))?;
                 if needs_separate_text(&msg.text, att) {
-                    let _ = telegram_runtime()
-                        .block_on(send_with_topic(&bot, group_id, topic_id, &msg.text, None));
+                    let _ =
+                        block_on_value(send_with_topic(&bot, group_id, topic_id, &msg.text, None));
                 }
                 Ok(crate::channel::MsgRef {
                     binding: build_telegram_msg_binding(topic_id),
@@ -175,7 +175,7 @@ impl crate::channel::Channel for TelegramChannel {
                 if msg.text.is_empty() {
                     anyhow::bail!("OutMsg has no text and no attachment");
                 }
-                let msg_id = telegram_runtime().block_on(send_with_topic_capturing_id(
+                let msg_id = block_on_value(send_with_topic_capturing_id(
                     &bot, group_id, topic_id, &msg.text, None,
                 ))?;
                 Ok(crate::channel::MsgRef {
@@ -206,7 +206,7 @@ impl crate::channel::Channel for TelegramChannel {
         if text.is_empty() {
             anyhow::bail!("OutMsg.text empty — Telegram editMessageText requires non-empty text");
         }
-        telegram_runtime().block_on(async move {
+        block_on_value(async move {
             use teloxide::prelude::Requester;
             bot.edit_message_text(group_id, MessageId(mid), &text)
                 .send()
@@ -227,7 +227,7 @@ impl crate::channel::Channel for TelegramChannel {
             .id
             .parse()
             .map_err(|_| anyhow::anyhow!("invalid telegram message_id: {}", msg.id))?;
-        telegram_runtime().block_on(async move {
+        block_on_value(async move {
             use teloxide::prelude::Requester;
             match bot.delete_message(group_id, MessageId(mid)).send().await {
                 Ok(_) => Ok(()),

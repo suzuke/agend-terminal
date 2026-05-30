@@ -51,6 +51,39 @@ where
     }
 }
 
+/// Value-returning counterpart of [`spawn_or_block_on`] for Telegram calls
+/// that must return a result (topic create, get_me, send-capturing-id, …).
+///
+/// Safe to call even when already inside a tokio runtime: the shared
+/// Telegram runtime is a `current_thread` runtime, so calling `block_on`
+/// on it from within *any* runtime context panics with "Cannot start a
+/// runtime from within a runtime" (surfaced after the teloxide 0.17 /
+/// reqwest 0.12 upgrade, #1293). In that case we run the future on a
+/// dedicated scoped thread with its own fresh runtime, which is never
+/// nested. The non-nested fast path is unchanged (shared runtime), so
+/// existing behaviour is preserved byte-for-byte off the hot path.
+pub(super) fn block_on_value<F>(fut: F) -> F::Output
+where
+    F: std::future::Future + Send,
+    F::Output: Send,
+{
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("telegram nested runtime")
+                    .block_on(fut)
+            })
+            .join()
+            .expect("telegram nested block_on thread panicked")
+        })
+    } else {
+        telegram_runtime().block_on(fut)
+    }
+}
+
 pub struct TelegramState {
     /// `None` only inside the contract-test harness — production `new`
     /// always populates it via `Bot::new`. Transport methods unwrap with
@@ -314,5 +347,30 @@ user_allowlist:
             serde_yaml_ng::from_str(&serialized).expect("yaml round-trip must deserialize");
         assert_eq!(reparsed.group_id, parsed.group_id);
         assert_eq!(reparsed.user_allowlist, parsed.user_allowlist);
+    }
+
+    // Regression: block_on_value must NOT panic with "Cannot start a runtime
+    // from within a runtime" when invoked while already inside a tokio runtime
+    // (the #1293 teloxide-0.17 crash: bootstrap/api path reaches a telegram
+    // value-returning call from within a runtime context).
+    #[test]
+    fn block_on_value_safe_when_nested_in_runtime() {
+        let outer = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("outer runtime");
+        let got = outer.block_on(async {
+            // Inside an async context → Handle::current() is Some, which used
+            // to make the raw `telegram_runtime().block_on` panic.
+            super::block_on_value(async { 21u32 + 21 })
+        });
+        assert_eq!(got, 42);
+    }
+
+    // Sanity: the non-nested fast path still returns the value.
+    #[test]
+    fn block_on_value_works_outside_runtime() {
+        assert_eq!(super::block_on_value(async { 7u8 }), 7);
     }
 }

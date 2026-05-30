@@ -26,7 +26,7 @@ pub fn send_reply(
         s.home.clone(),
     );
     drop(s);
-    let res = telegram_runtime().block_on(send_with_topic(&bot, group_id, topic_id, text, None));
+    let res = block_on_value(send_with_topic(&bot, group_id, topic_id, text, None));
     if let Err(e) = &res {
         handle_send_failure(e, &home, instance_name, topic_id, Some(state));
     }
@@ -81,7 +81,7 @@ pub(super) fn telegram_reply_send_inner(
         });
         return Ok(0);
     }
-    telegram_runtime().block_on(async {
+    block_on_value(async {
         let bot = teloxide::Bot::new(&ch.token);
         let chat_id = teloxide::types::ChatId(ch.group_id);
         let sent = match topic_id {

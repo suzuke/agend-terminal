@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use teloxide::prelude::Requester;
 
-use super::state::telegram_runtime;
+use super::state::block_on_value;
 
 /// Reserved pseudo-instance name used in `topics.json` to pin the
 /// `fleet_binding` topic across daemon restarts. Not a real instance —
@@ -65,40 +65,20 @@ pub fn lookup_topic_for_instance(home: &std::path::Path, instance_name: &str) ->
 }
 
 /// Create a forum topic for a new instance.
-///
-/// Synchronous wrapper around [`create_topic_for_instance_async`]. Safe to
-/// call from plain (non-runtime) threads — boot, `tui_spawn`, MCP/api spawn
-/// handlers. **Must NOT be called from within a tokio runtime** (e.g. the
-/// `notify` send task), because `block_on` inside a runtime worker panics
-/// with "Cannot start a runtime from within a runtime". Async callers must
-/// use [`create_topic_for_instance_async`] directly.
 pub fn create_topic_for_instance(home: &std::path::Path, instance_name: &str) -> Option<i32> {
-    telegram_runtime().block_on(create_topic_for_instance_async(home, instance_name))
-}
-
-/// Async core of [`create_topic_for_instance`]. Awaits the bot call directly
-/// instead of `block_on`, so callers already inside a tokio runtime can reuse
-/// the same idempotent reuse/create/register logic without the nested-runtime
-/// panic.
-pub async fn create_topic_for_instance_async(
-    home: &std::path::Path,
-    instance_name: &str,
-) -> Option<i32> {
     // Idempotent: reuse existing topic from topics.json if present.
     if let Some(tid) = lookup_topic_for_instance(home, instance_name) {
         tracing::info!(instance = %instance_name, topic_id = tid, "reusing existing topic");
         return Some(tid);
     }
     let ch = super::resolve_channel_only_from(home).ok()?;
-    let bot = teloxide::Bot::new(&ch.token);
-    let created: anyhow::Result<i32> = async {
+    match block_on_value(async {
+        let bot = teloxide::Bot::new(&ch.token);
         let topic = bot
             .create_forum_topic(teloxide::types::ChatId(ch.group_id), instance_name)
             .await?;
         Ok::<i32, anyhow::Error>(topic.thread_id.0 .0)
-    }
-    .await;
-    match created {
+    }) {
         Ok(tid) => {
             tracing::info!(instance = %instance_name, topic_id = tid, "created topic");
             if let Err(e) = register_topic(home, tid, instance_name) {
@@ -123,15 +103,14 @@ pub async fn create_topic_for_instance_async(
 /// Used by [`delete_topic`] (α-c surfacing) and the (γ) `--cleanup`
 /// flag pre-call check.
 pub fn can_manage_topics_for(bot: &teloxide::Bot, chat_id: teloxide::types::ChatId) -> bool {
-    let me = match telegram_runtime().block_on(async { bot.get_me().await }) {
+    let me = match block_on_value(async { bot.get_me().await }) {
         Ok(me) => me,
         Err(_) => return false,
     };
-    let member =
-        match telegram_runtime().block_on(async { bot.get_chat_member(chat_id, me.id).await }) {
-            Ok(m) => m,
-            Err(_) => return false,
-        };
+    let member = match block_on_value(async { bot.get_chat_member(chat_id, me.id).await }) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
     match member.kind {
         teloxide::types::ChatMemberKind::Administrator(admin) => admin.can_manage_topics,
         teloxide::types::ChatMemberKind::Owner(_) => true, // chat owners have all rights
@@ -200,7 +179,7 @@ pub fn delete_topic(home: &std::path::Path, topic_id: i32) -> DeleteTopicOutcome
     }
 
     let tid = teloxide::types::ThreadId(teloxide::types::MessageId(topic_id));
-    let result = telegram_runtime().block_on(async {
+    let result = block_on_value(async {
         // close_forum_topic is best-effort — close errors are
         // non-fatal because the subsequent delete_forum_topic
         // will close the topic anyway.

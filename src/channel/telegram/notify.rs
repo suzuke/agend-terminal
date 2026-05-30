@@ -102,8 +102,7 @@ fn notify_telegram_inner(
                         "#969 RC3: notify topic-deleted detected, recreating + retrying"
                     );
                     if let Some(new_tid) =
-                        invalidate_and_recreate_topic_async(&home_owned, &instance_owned, stale_tid)
-                            .await
+                        invalidate_and_recreate_topic(&home_owned, &instance_owned, stale_tid)
                     {
                         tracing::info!(
                             instance = %instance_owned,

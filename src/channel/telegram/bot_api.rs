@@ -88,7 +88,7 @@ pub fn try_download_attachment(
     file_id: &str,
 ) -> anyhow::Result<String> {
     let ch = resolve_channel_only_from(home)?;
-    telegram_runtime().block_on(async {
+    block_on_value(async {
         let bot = teloxide::Bot::new(&ch.token);
         download_file_async(&bot, home, instance_name, file_id).await
     })
