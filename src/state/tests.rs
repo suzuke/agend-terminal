@@ -1950,8 +1950,10 @@ fn claude_spinner_verb_triggers_thinking() {
     let mut st = StateTracker::new(Some(&Backend::ClaudeCode));
     drive(&mut vt, &mut st, b"bypass permissions\r\n");
     assert_eq!(st.get_state(), AgentState::Ready);
-    // Claude spinner uses random verbs, not "Thinking"
-    drive(&mut vt, &mut st, b"Cogitating\xe2\x80\xa6\r\n");
+    // #1541: Claude spinner uses random verbs; the verb-agnostic structural
+    // anchor (sparkle glyph + `<verb>…`) must fire regardless of the verb.
+    // `\xe2\x9c\xbb` = ✻ (U+273B sparkle), `\xe2\x80\xa6` = … (U+2026).
+    drive(&mut vt, &mut st, b"\xe2\x9c\xbb Cogitating\xe2\x80\xa6\r\n");
     assert_eq!(
         st.get_state(),
         AgentState::Thinking,
@@ -3212,4 +3214,62 @@ fn modal_prompt_above_live_tail_still_detected_1518() {
         "#1518: a modal above the live tail must still be detected (full-screen, not bottom-N bounded), got {:?}",
         st.get_state()
     );
+}
+
+// ── #1541: verb-agnostic Claude thinking spinner anchor ─────────────────
+
+#[test]
+fn claude_thinking_anchor_is_verb_agnostic_1541() {
+    // The crux of #1541: spinner verbs roll randomly and were NOT in the old
+    // whitelist (Whisking / Julienning / Burrowing / Lollygagging are all new;
+    // `Churned` proves a past-tense verb in an ACTIVE spinner still counts).
+    // Each frame must fire Thinking so a heads-down agent never reads `idle`.
+    for frame in [
+        "✻ Whisking… (5s)",                         // sparkle glyph + elapsed tail
+        "✶ Churned… (12s · ↑ 2.1k tokens)",         // active past-tense verb + token counter
+        "· Julienning… (16m · thinking)",           // `·` glyph + minutes elapsed
+        "✳ Burrowing… (thinking with high effort)", // sparkle + non-elapsed tail
+        "Lollygagging…(running stop hook)",         // no glyph — Branch B `(running` tail
+    ] {
+        let mut st = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+        st.feed(frame);
+        assert_eq!(
+            st.get_state(),
+            AgentState::Thinking,
+            "#1541: unlisted-verb spinner {frame:?} must fire Thinking"
+        );
+    }
+}
+
+#[test]
+fn claude_thinking_anchor_rejects_prose_and_completion_1541() {
+    // False-positive guards the verb whitelist used to provide for free.
+    for frame in [
+        "Thinking...(7s)",          // prose: ASCII `...`, NOT U+2026
+        "Churned for 7m39s",        // completion: past-tense `for Xm Ys`, no `…`
+        "Let me think about this…", // prose: U+2026 but no glyph and no `(tail`
+    ] {
+        let mut st = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+        st.feed(frame);
+        assert_ne!(
+            st.get_state(),
+            AgentState::Thinking,
+            "#1541: {frame:?} must NOT be misread as Thinking"
+        );
+    }
+}
+
+#[test]
+fn claude_thinking_anchor_does_not_cross_backends_1541() {
+    // The sparkle anchor is Claude-scoped; a Claude spinner frame fed to other
+    // backends' pattern sets must not yield Thinking (each owns its own arm).
+    let claude_frame = "✻ Whisking… (5s)";
+    for backend in [Backend::Codex, Backend::Gemini, Backend::KiroCli] {
+        let detected = StatePatterns::for_backend(&backend).detect(claude_frame);
+        assert_ne!(
+            detected,
+            Some(AgentState::Thinking),
+            "#1541: claude sparkle anchor must not fire Thinking on {backend:?}"
+        );
+    }
 }

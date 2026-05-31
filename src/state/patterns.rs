@@ -142,14 +142,6 @@ impl StatePatterns {
                     AgentState::GitConflict,
                     r"Automatic merge failed; fix conflicts|CONFLICT \(content\)|Resolve all conflicts manually|Failed to merge submodule|Failed to merge in",
                 ),
-                // [estimated] Ink render during processing
-                // [measured] Claude spinner uses random verbs (Cogitating,
-                // Bloviating, Transmuting, etc.) — not "Thinking". The
-                // `thought for Ns` anchor catches post-thinking summary.
-                (
-                    AgentState::Thinking,
-                    r"(?i)(Bloviating|Transmuting|Cogitating|Cooked|Brewed|Worked|Cogitated|Crunched|Brewing)|thought for [0-9]+s",
-                ),
                 // #1005 Phase A1: ToolUse = active tool execution, NOT
                 // historical completion record. Pre-fix regex matched
                 // BOTH the braille spinner (`⠋ Listing`) AND the
@@ -181,6 +173,48 @@ impl StatePatterns {
                 (
                     AgentState::ToolUse,
                     r"(?m)^(?:[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s+(?:Read|Bash|Edit|Write|Grep|Glob|Listing|Reading|Writing|Searching|Editing)|[✓●⏺]\s+(?:Listing|Reading|Writing|Searching|Editing))\b",
+                ),
+                // #1541: verb-AGNOSTIC structural anchor for the Claude thinking
+                // spinner. The old fix enumerated verbs (Cogitating, Bloviating,
+                // …) but Claude's spinner rolls a *random* gerund every run
+                // (Undulating, Julienning, Whisking, …). Any unlisted verb went
+                // undetected → the snapshot recorded `idle` for a busy agent →
+                // the dispatch-idle watchdog mis-fired. (claude-thinking.raw,
+                // verb `Undulating`, is exactly that miss: it used to replay
+                // `[starting, idle]` with no thinking at all.)
+                //
+                // ORDER: placed AFTER the ToolUse arm on purpose. Claude keeps
+                // the sparkle spinner animating WHILE a tool runs, so a tool
+                // frame (`⏺ Listing 1 directory…`) and a spinner frame
+                // (`✳ Burrowing…`) coexist on screen. detect_with_match is
+                // first-match-wins, so ToolUse must precede Thinking to stay
+                // detectable — this keeps #1541 orthogonal to #1005 (a spinner
+                // that is NOT a tool frame still falls through to Thinking).
+                //
+                // [measured] the spinner renders `<glyph> <Verb>… (<elapsed> · …)`
+                // where:
+                //   - <glyph> rolls through the SPARKLE family (✻ ✢ ✶ ✳ ✽) and
+                //     also `*` / `·` — it animates, so do NOT hard-enumerate it.
+                //     (NB: this is sparkle, NOT the braille `⠋⠙⠹` spinner — that
+                //     is ToolUse, the arm directly above.)
+                //   - <Verb>… ends in U+2026 (`…`), never the ASCII `...`.
+                //   - the tail is usually ` (16m · thinking)` / ` (21m · ↑ N
+                //     tokens)` (minutes OR seconds), occasionally `(running stop
+                //     hook)`, occasionally absent.
+                //
+                // Anchor = U+2026 AND (leading sparkle/`*` glyph OR a structural
+                // `(elapsed|running` tail). That double requirement is the prose
+                // false-positive guard the verb list used to provide:
+                //   - `Let me think…`         → U+2026 but no glyph/tail   → no
+                //   - `Thinking...(7s)`       → ASCII `...`, not U+2026    → no
+                //   - `Churned for 7m39s`     → past-tense completion, no `…` → no
+                // `thought for Ns` stays a separate alternation (post-thinking
+                // summary line has no spinner glyph). Backend-scoped to Claude —
+                // codex/kiro/gemini keep their own arms (cross-backend negative
+                // test in src/state/tests.rs).
+                (
+                    AgentState::Thinking,
+                    r"(?i)[✻✢✶✳✽*·]\s*\w+\x{2026}|\w+\x{2026}\s*\((?:\d+[smh]|running )|thought for [0-9]+s",
                 ),
                 // [measured] Prompt symbol in idle state
                 (AgentState::Idle, r"❯"),
