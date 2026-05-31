@@ -349,26 +349,35 @@ impl StatePatterns {
                 ),
                 // [docs] Context overflow error
                 (AgentState::ContextFull, r"ContextOverflow"),
-                // [measured] Codex 0.120.0 renders approval dialogs with a
+                // [measured] Codex 0.120.0 renders its approval dialog with a
                 // distinctive header (`Would you like to run the following
-                // command?`) and a footer (`Press enter to confirm or esc to
-                // cancel`). Observed in tests/fixtures/state-replay/codex-perm.raw.
+                // command?`), a footer (`Press enter to confirm or esc to
+                // cancel`), and the distinctive option `No, and tell Codex what
+                // to do differently`. All three observed in the one captured
+                // surface, tests/fixtures/state-replay/codex-perm.raw.
                 //
-                // #1559 (cross-backend of #1546): anchor on the **chrome**
-                // (header + footer) ONLY. The previous pattern also matched bare
-                // option/verb words (`Yes, proceed`, `No, and tell Codex`,
-                // `Request approval`, `approve`, `deny`) — content-FP-prone: a
-                // codex reviewer agent writing "approve this PR" / "Yes, proceed
-                // with the merge", or a pane quoting an approval discussion,
-                // would falsely read as a live PermissionPrompt. The header +
-                // footer are live-dialog chrome that prose doesn't echo, and
-                // each alone still detects the real codex-perm.raw prompt
-                // (verified: the fixture contains both). Pair with the #1546/
-                // #1552 live-bottom-N position gate at the escalation site so
-                // even the chrome can't FP from a scrollback echo.
+                // #1559 (cross-backend of #1546): anchor on the live-dialog
+                // CHROME + that one distinctive option; DROP the prose-echoable
+                // bare words `approve`, `deny`, `Request approval`, and bare
+                // `Yes, proceed`. Those content-FP'd — a codex reviewer agent
+                // writing "approve this PR" / "Yes, proceed with the merge", or a
+                // pane quoting an approval discussion, would falsely read as a
+                // live PermissionPrompt.
+                //
+                // FN-safety (answering the #1567 review): dropping
+                // `Request approval|approve|deny` is provably FN-free — they were
+                // a [docs] guess that NEVER matched real codex 0.120.0 (fixture
+                // commit e0716ec: "pattern `Request approval|approve|deny`
+                // doesn't match the actual escalation wording … Neither recording
+                // fires PermissionPrompt"). The kept header + footer +
+                // `No, and tell Codex what to do differently` are three
+                // independent, non-prose anchors from the real dialog, so an
+                // approval frame is detected even if one line is off-screen.
+                // Pair with the #1546/#1552 live-bottom-N position gate so even
+                // the chrome can't FP from a scrollback echo.
                 (
                     AgentState::PermissionPrompt,
-                    r"Would you like to run the following command\?|Press enter to confirm or esc to cancel",
+                    r"Would you like to run the following command\?|Press enter to confirm or esc to cancel|No, and tell Codex what to do differently",
                 ),
                 // Phase A Piece-1: git conflict output (backend-independent).
                 (
