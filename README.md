@@ -64,10 +64,10 @@ graph LR
 | Codex | `codex` | Tested |
 | OpenCode | `opencode` | Tested |
 | Gemini CLI | `gemini` | Tested |
-| Antigravity CLI | `agy` | Tested |
+| Antigravity CLI | `agy` | Unsupported |
 
 > Gemini CLI sunsets 2026-06-18 for free/Pro/Ultra tiers. Antigravity CLI is the official successor.
-> Agy does not yet support the Fleet MCP bridge — see [#987](https://github.com/suzuke/agend-terminal/issues/987) for status.
+> The `agy` backend is currently **unsupported**: beyond the missing Fleet MCP bridge, known issues with it are not being addressed for now. It will not be revisited until project-scoped MCP is supported ([#1262](https://github.com/suzuke/agend-terminal/issues/1262)) or a first-party CLI tool lands. See [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) ([#1547](https://github.com/suzuke/agend-terminal/issues/1547)).
 
 ## Documentation
 
@@ -76,6 +76,7 @@ graph LR
 - [Fleet Configuration](docs/FEATURE-fleet.md) — `fleet.yaml` reference
 - [CLI Reference](docs/CLI.md) — All subcommands
 - [MCP Tools](docs/MCP-TOOLS.md) — 35 agent coordination tools
+- [Known Issues](docs/KNOWN_ISSUES.md) — Intentionally-deferred items; check before filing an issue
 
 <details>
 <summary><strong>Feature guides</strong></summary>
