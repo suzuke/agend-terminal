@@ -120,9 +120,10 @@ pub(crate) fn def_restart_instance() -> Value {
 }
 
 pub(crate) fn def_tokens() -> Value {
-    json!({"name": "tokens", "description": "On-demand token usage + estimated USD cost from Claude Code session transcripts (Claude backends only, Phase 1). Scans ~/.claude/projects/*.jsonl at query time, dedups streaming-duplicated rows by message id, and attributes usage to fleet instances by transcript cwd (workspace + worktree paths). action=summary → fleet totals + per-instance table; action=by_instance (requires `instance`) → that instance's per-model breakdown. Cost is an ESTIMATE pending operator pricing calibration; excludes the >200k long-context surcharge tier; non-Claude backends (Codex/OpenCode/Kiro/Gemini) are not yet covered.",
+    json!({"name": "tokens", "description": "On-demand token usage + estimated USD cost from Claude Code + Codex session transcripts. Scans ~/.claude/projects/*.jsonl and ~/.codex/sessions/rollout-*.jsonl at query time, dedups streaming-duplicated rows by message id, and attributes usage to fleet instances by transcript cwd (workspace + worktree paths). action=summary → fleet totals + per-instance table; action=by_instance (requires `instance`) → that instance's per-model breakdown. group_by=task (#1077 slice-1) time-joins each message to whichever task the instance had active at the message's timestamp, with a (no active task) bucket — this is TIME-WINDOW ATTRIBUTION, NOT per-task billing. Cost is an ESTIMATE pending operator pricing calibration; excludes the >200k long-context surcharge tier; OpenCode/Kiro/Gemini are not yet covered.",
     "inputSchema": {"type": "object", "properties": {
         "action": {"type": "string", "enum": ["summary", "by_instance"], "default": "summary"},
+        "group_by": {"type": "string", "enum": ["instance", "task"], "default": "instance", "description": "instance (default) → per-instance/per-model; task → per-instance/per-task time-join (#1077). Default is backward-compatible."},
         "since": {"type": "string", "description": "Lookback window: \"24h\" (default) / \"7d\" / \"90m\" / \"all\""},
         "instance": {"type": "string", "description": "Required for action=by_instance; optional filter for action=summary"}
     }}})

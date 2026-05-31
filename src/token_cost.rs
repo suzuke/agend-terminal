@@ -123,6 +123,12 @@ impl Agg {
         self.cache_write_5m + self.cache_write_1h
     }
 
+    /// All token classes summed — the denominator for the #1077
+    /// unattributed-ratio reconciliation check.
+    fn total_tokens(&self) -> u64 {
+        self.input + self.output + self.cache_read + self.cache_write_5m + self.cache_write_1h
+    }
+
     fn cost(&self, p: &ModelPricing) -> f64 {
         let per_m = |tokens: u64, rate: f64| (tokens as f64) * rate / 1_000_000.0;
         per_m(self.input, p.input)
@@ -138,6 +144,10 @@ struct Row {
     instance: String,
     model: String,
     usage: Agg,
+    /// #1077 slice-1: transcript/event wall-clock (epoch ms) for the per-task
+    /// time-join. `0` = the line had no parseable timestamp → it falls into the
+    /// `(no active task)` bucket (fail-open, never dropped).
+    ts_ms: i64,
 }
 
 /// Parse one transcript line into a `(message_id, Row)` if it is an assistant
@@ -152,14 +162,19 @@ fn parse_line(
     if v.get("type").and_then(Value::as_str) != Some("assistant") {
         return None;
     }
+    // #1077: capture the per-message ts (epoch ms) for the task time-join.
+    // `0` when absent/unparseable — those lines are kept (best-effort) and land
+    // in the `(no active task)` bucket rather than being dropped.
+    let ts_ms = v
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+        .map(|dt| dt.timestamp_millis())
+        .unwrap_or(0);
     // Freshness gate (best-effort: lines without a parseable ts are kept).
     if let Some(cutoff) = since_cutoff_ms {
-        if let Some(ts) = v.get("timestamp").and_then(Value::as_str) {
-            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
-                if dt.timestamp_millis() < cutoff {
-                    return None;
-                }
-            }
+        if ts_ms != 0 && ts_ms < cutoff {
+            return None;
         }
     }
     let cwd = v.get("cwd").and_then(Value::as_str)?;
@@ -207,6 +222,7 @@ fn parse_line(
             instance,
             model,
             usage,
+            ts_ms,
         },
     ))
 }
@@ -231,13 +247,45 @@ fn attribute(cwd: &Path, roots: &[(String, Vec<PathBuf>)]) -> Option<String> {
 /// and fold into per-instance / per-model aggregates. Parameterised on
 /// `projects_dir` + `roots` + `cutoff` so tests drive it with a recorded
 /// fixture instead of `$HOME`.
+/// Test-only per-instance Claude aggregate. Production folds the merged
+/// claude+codex rows once in `handle_tokens`; this wrapper preserves the
+/// original `collect` shape so the pre-#1077 dedup/attribution tests still
+/// assert against the per-instance map directly.
+#[cfg(test)]
 fn collect(
     projects_dir: &Path,
     roots: &[(String, Vec<PathBuf>)],
     since_cutoff_ms: Option<i64>,
 ) -> HashMap<String, HashMap<String, Agg>> {
-    // message_id → (instance, model, usage) — global dedup; an id is unique to
-    // one turn, so global == per-instance dedup but cheaper.
+    fold_by_instance(&collect_rows(projects_dir, roots, since_cutoff_ms))
+}
+
+/// #1077: fold per-message rows into the per-instance/per-model aggregate (the
+/// pre-existing `tokens` view). The per-task fold ([`fold_by_task`]) sums to the
+/// same totals, so the two views are additive / reconcile.
+fn fold_by_instance(rows: &[Row]) -> HashMap<String, HashMap<String, Agg>> {
+    let mut by_instance: HashMap<String, HashMap<String, Agg>> = HashMap::new();
+    for row in rows {
+        by_instance
+            .entry(row.instance.clone())
+            .or_default()
+            .entry(row.model.clone())
+            .or_default()
+            .add(&row.usage);
+    }
+    by_instance
+}
+
+/// #1077: scan + dedup the Claude transcripts into the deduped row set (one row
+/// per unique `message.id`, each carrying `ts_ms`). Both the per-instance and
+/// the per-task folds consume this, so a single scan serves both views.
+fn collect_rows(
+    projects_dir: &Path,
+    roots: &[(String, Vec<PathBuf>)],
+    since_cutoff_ms: Option<i64>,
+) -> Vec<Row> {
+    // message_id → row — global dedup; an id is unique to one turn, so global
+    // == per-instance dedup but cheaper.
     let mut deduped: HashMap<String, Row> = HashMap::new();
 
     let session_dirs = std::fs::read_dir(projects_dir)
@@ -284,16 +332,7 @@ fn collect(
         }
     }
 
-    let mut by_instance: HashMap<String, HashMap<String, Agg>> = HashMap::new();
-    for row in deduped.into_values() {
-        by_instance
-            .entry(row.instance)
-            .or_default()
-            .entry(row.model)
-            .or_default()
-            .add(&row.usage);
-    }
-    by_instance
+    deduped.into_values().collect()
 }
 
 /// Build the instance → roots map from fleet.yaml + the daemon's on-disk
@@ -365,22 +404,25 @@ fn codex_session_files(root: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Parse one Codex session file into `(instance, model, usage)`. PURE (drives
-/// tests off a fixture string). Returns `None` when the session has no
-/// attributable `cwd`, no model, or no `token_count` line.
-///
-/// `total_token_usage` is session-cumulative → we keep the MAX-`total_tokens`
-/// occurrence (never a sum). Mapping to the shared `Agg`: uncached input =
-/// `input_tokens − cached_input_tokens`, cached → `cache_read`, `output_tokens`
-/// → output (reasoning already included), no cache-write (OpenAI has no cache-
-/// creation charge).
-fn parse_codex_session(
+/// Parse one Codex session into per-`token_count`-line rows (delta usage + ts).
+/// PURE (drives tests off a fixture string). Returns one [`Row`] per
+/// `token_count` event using `payload.info.last_token_usage` — the per-turn
+/// DELTA, whose sum reconciles to the final `total_token_usage` (verified;
+/// asserted by `codex_delta_sum_equals_cumulative`) — and the line's top-level
+/// `timestamp`. The session model is the latest `turn_context` (stamped on
+/// every row); the instance is resolved from the session `cwd`. Mapping to the
+/// shared `Agg`: uncached input = `input_tokens − cached_input_tokens`, cached
+/// → `cache_read`, `output_tokens` → output (reasoning already included), no
+/// cache-write (OpenAI bills no cache-creation charge). Empty when the session
+/// has no attributable `cwd`, no model, or no `token_count` line.
+fn parse_codex_rows(
     content: &str,
     roots: &[(String, Vec<PathBuf>)],
-) -> Option<(String, String, Agg)> {
+    since_cutoff_ms: Option<i64>,
+) -> Vec<Row> {
+    // Pass 1: resolve cwd→instance + the session model (latest turn_context).
     let mut cwd: Option<String> = None;
     let mut model: Option<String> = None;
-    let mut best: Option<(u64, Agg)> = None;
     for line in content.lines() {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -397,70 +439,96 @@ fn parse_codex_session(
                 model = Some(m.to_string());
             }
         }
-        if let Some(tu) = payload
-            .and_then(|p| p.get("info"))
-            .and_then(|i| i.get("total_token_usage"))
-        {
-            let g = |k: &str| tu.get(k).and_then(Value::as_u64).unwrap_or(0);
-            let total = g("total_tokens");
-            if best.as_ref().is_none_or(|(b, _)| total >= *b) {
-                let cached = g("cached_input_tokens");
-                best = Some((
-                    total,
-                    Agg {
-                        input: g("input_tokens").saturating_sub(cached),
-                        output: g("output_tokens"),
-                        cache_read: cached,
-                        cache_write_5m: 0,
-                        cache_write_1h: 0,
-                    },
-                ));
+    }
+    let (Some(cwd), Some(model)) = (cwd, model) else {
+        return Vec::new();
+    };
+    let Some(instance) = attribute(Path::new(&cwd), roots) else {
+        return Vec::new();
+    };
+
+    // Pass 2: one row per token_count line — delta usage + per-line ts.
+    let mut rows = Vec::new();
+    for line in content.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let payload = v.get("payload");
+        if payload.and_then(|p| p.get("type")).and_then(Value::as_str) != Some("token_count") {
+            continue;
+        }
+        // Per-row freshness (replaces the old file-mtime gate): each token_count
+        // line carries its own ts, so we filter per row. `0` (unparseable) kept.
+        let ts_ms = v
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+            .map(|dt| dt.timestamp_millis())
+            .unwrap_or(0);
+        if let Some(cutoff) = since_cutoff_ms {
+            if ts_ms != 0 && ts_ms < cutoff {
+                continue;
             }
         }
+        let Some(last) = payload
+            .and_then(|p| p.get("info"))
+            .and_then(|i| i.get("last_token_usage"))
+        else {
+            continue;
+        };
+        let g = |k: &str| last.get(k).and_then(Value::as_u64).unwrap_or(0);
+        let cached = g("cached_input_tokens");
+        rows.push(Row {
+            instance: instance.clone(),
+            model: model.clone(),
+            usage: Agg {
+                input: g("input_tokens").saturating_sub(cached),
+                output: g("output_tokens"),
+                cache_read: cached,
+                cache_write_5m: 0,
+                cache_write_1h: 0,
+            },
+            ts_ms,
+        });
     }
-    let instance = attribute(Path::new(&cwd?), roots)?;
-    Some((instance, model?, best?.1))
+    rows
 }
 
-/// Scan Codex rollout files → per-instance/per-model aggregates. Freshness is
-/// applied at the session-file granularity via mtime (cumulative totals can't
-/// be per-line filtered): a session untouched since the cutoff is skipped, but
-/// one spanning the cutoff still reports its full cumulative total.
+/// Scan Codex rollout files → deduped delta-row set (one row per `token_count`
+/// line). Single scan; both folds consume it.
+fn collect_codex_rows(
+    sessions_dir: &Path,
+    roots: &[(String, Vec<PathBuf>)],
+    since_cutoff_ms: Option<i64>,
+) -> Vec<Row> {
+    let mut rows = Vec::new();
+    for fp in codex_session_files(sessions_dir) {
+        let Ok(content) = std::fs::read_to_string(&fp) else {
+            continue;
+        };
+        rows.extend(parse_codex_rows(&content, roots, since_cutoff_ms));
+    }
+    rows
+}
+
+/// Per-instance/per-model Codex aggregate. Σ of the delta rows == the session
+/// cumulative total (see `codex_delta_sum_equals_cumulative`). Test-only
+/// convenience: production folds the merged claude+codex rows once in
+/// `handle_tokens`; this wrapper lets a codex-only fixture assert the
+/// per-instance reconciliation in isolation.
+#[cfg(test)]
 fn collect_codex(
     sessions_dir: &Path,
     roots: &[(String, Vec<PathBuf>)],
     since_cutoff_ms: Option<i64>,
 ) -> HashMap<String, HashMap<String, Agg>> {
-    let mut by_instance: HashMap<String, HashMap<String, Agg>> = HashMap::new();
-    for fp in codex_session_files(sessions_dir) {
-        if let Some(cutoff) = since_cutoff_ms {
-            let fresh = std::fs::metadata(&fp)
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .is_none_or(|d| (d.as_millis() as i64) >= cutoff);
-            if !fresh {
-                continue;
-            }
-        }
-        let Ok(content) = std::fs::read_to_string(&fp) else {
-            continue;
-        };
-        if let Some((instance, model, usage)) = parse_codex_session(&content, roots) {
-            by_instance
-                .entry(instance)
-                .or_default()
-                .entry(model)
-                .or_default()
-                .add(&usage);
-        }
-    }
-    by_instance
+    fold_by_instance(&collect_codex_rows(sessions_dir, roots, since_cutoff_ms))
 }
 
-/// Fold `src` per-instance/per-model aggregates into `dst` (additive). Used to
-/// merge the Codex collector's output into the Claude collector's so a single
-/// instance running both backends sums correctly.
+/// Fold `src` per-instance/per-model aggregates into `dst` (additive). Test-only
+/// since #1077 — production now folds claude+codex rows in one pass via
+/// `fold_by_instance`, but the cross-backend merge invariant is still asserted.
+#[cfg(test)]
 fn merge_into(
     dst: &mut HashMap<String, HashMap<String, Agg>>,
     src: HashMap<String, HashMap<String, Agg>>,
@@ -489,6 +557,150 @@ fn parse_since(since: Option<&str>, now_ms: i64) -> Option<i64> {
         _ => return None,
     };
     Some(now_ms - ms)
+}
+
+// ── #1077 slice-1: instance→task time-join ──────────────────────────────────
+
+/// A half-open `[start_ms, end_ms)` interval during which one instance was
+/// actively on one task. `end_ms == None` = still open (extends to +∞ until the
+/// instance's next claim). One instance's windows are disjoint and sorted by
+/// `start_ms` — each new claim truncates the prior ("most-recent-active wins").
+#[derive(Clone, Debug, PartialEq)]
+struct TaskWindow {
+    task_id: String,
+    start_ms: i64,
+    end_ms: Option<i64>,
+}
+
+/// Close `inst`'s currently-open window at `end_ms`, recording it. Shared by
+/// every close path (truncate / Done / Cancelled / Released) so the owner-aware
+/// bookkeeping (`holder`) stays consistent.
+fn close_window(
+    result: &mut HashMap<String, Vec<TaskWindow>>,
+    open: &mut HashMap<String, (String, i64)>,
+    holder: &mut HashMap<String, String>,
+    inst: &str,
+    end_ms: i64,
+) {
+    if let Some((tid, start)) = open.remove(inst) {
+        result
+            .entry(inst.to_string())
+            .or_default()
+            .push(TaskWindow {
+                task_id: tid.clone(),
+                start_ms: start,
+                end_ms: Some(end_ms),
+            });
+        if holder.get(&tid).is_some_and(|h| h == inst) {
+            holder.remove(&tid);
+        }
+    }
+}
+
+/// Build per-instance `[start, end)` task windows from the sorted task-event
+/// stream. Open on `Claimed`/`InProgress{by}`; close on `Done`/`Cancelled{by}`
+/// of the active task, on `Released` of the active task (**no `by` field** —
+/// close whichever instance currently holds it, the owner-aware rule), or by
+/// the instance's next claim (truncation). A never-closed window stays open to
+/// +∞.
+fn build_task_windows(
+    envelopes: &[crate::task_events::TaskEventEnvelope],
+) -> HashMap<String, Vec<TaskWindow>> {
+    use crate::task_events::TaskEvent;
+    let mut result: HashMap<String, Vec<TaskWindow>> = HashMap::new();
+    // instance → (task_id, start_ms) currently open (≤1 open window per instance).
+    let mut open: HashMap<String, (String, i64)> = HashMap::new();
+    // task_id → instance currently holding it open (owner-aware Released close).
+    let mut holder: HashMap<String, String> = HashMap::new();
+
+    for env in envelopes {
+        let ts = chrono::DateTime::parse_from_rfc3339(&env.timestamp)
+            .map(|d| d.timestamp_millis())
+            .unwrap_or(0);
+        match &env.event {
+            TaskEvent::Claimed { task_id, by } | TaskEvent::InProgress { task_id, by } => {
+                let (tid, inst) = (task_id.0.clone(), by.0.clone());
+                // Already actively on this exact task → keep the open window
+                // (don't reset its start).
+                if open.get(&inst).is_some_and(|(t, _)| *t == tid) {
+                    continue;
+                }
+                // Truncate this instance's other open window.
+                close_window(&mut result, &mut open, &mut holder, &inst, ts);
+                // Re-claim by a DIFFERENT instance → close the prior holder too.
+                if let Some(prev) = holder.get(&tid).cloned() {
+                    if prev != inst {
+                        close_window(&mut result, &mut open, &mut holder, &prev, ts);
+                    }
+                }
+                open.insert(inst.clone(), (tid.clone(), ts));
+                holder.insert(tid, inst);
+            }
+            TaskEvent::Done { task_id, by, .. } | TaskEvent::Cancelled { task_id, by, .. } => {
+                let (tid, inst) = (task_id.0.clone(), by.0.clone());
+                if open.get(&inst).is_some_and(|(t, _)| *t == tid) {
+                    close_window(&mut result, &mut open, &mut holder, &inst, ts);
+                }
+            }
+            TaskEvent::Released { task_id, .. } => {
+                // No `by` — close whichever instance currently holds it open.
+                if let Some(inst) = holder.get(&task_id.0).cloned() {
+                    close_window(&mut result, &mut open, &mut holder, &inst, ts);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Remaining open windows extend to +∞.
+    for (inst, (tid, start)) in open {
+        result.entry(inst).or_default().push(TaskWindow {
+            task_id: tid,
+            start_ms: start,
+            end_ms: None,
+        });
+    }
+    for windows in result.values_mut() {
+        windows.sort_by_key(|w| w.start_ms);
+    }
+    result
+}
+
+/// Task active at `ts_ms` for one instance's (disjoint, sorted) windows, or
+/// `None` (→ the `(no active task)` bucket).
+fn attribute_to_task(windows: &[TaskWindow], ts_ms: i64) -> Option<&str> {
+    windows
+        .iter()
+        .find(|w| ts_ms >= w.start_ms && w.end_ms.is_none_or(|e| ts_ms < e))
+        .map(|w| w.task_id.as_str())
+}
+
+/// Bucket name for rows whose ts falls in no task window.
+const NO_ACTIVE_TASK: &str = "(no active task)";
+
+/// Time-join `rows` into per-instance → per-task → per-model aggregates. Σ over
+/// tasks (including `(no active task)`) == [`fold_by_instance`], so the per-task
+/// and per-instance views reconcile.
+fn fold_by_task(
+    rows: &[Row],
+    windows: &HashMap<String, Vec<TaskWindow>>,
+) -> HashMap<String, HashMap<String, HashMap<String, Agg>>> {
+    let mut out: HashMap<String, HashMap<String, HashMap<String, Agg>>> = HashMap::new();
+    for row in rows {
+        let task = windows
+            .get(&row.instance)
+            .and_then(|w| attribute_to_task(w, row.ts_ms))
+            .unwrap_or(NO_ACTIVE_TASK)
+            .to_string();
+        out.entry(row.instance.clone())
+            .or_default()
+            .entry(task)
+            .or_default()
+            .entry(row.model.clone())
+            .or_default()
+            .add(&row.usage);
+    }
+    out
 }
 
 // ── human-readable formatting ────────────────────────────────────────────
@@ -623,6 +835,167 @@ fn round2(v: f64) -> f64 {
     (v * 100.0).round() / 100.0
 }
 
+/// Sum one task's per-model aggregates → `(total, usd, by_model_json)`.
+fn task_totals(models: &HashMap<String, Agg>) -> (Agg, f64, Vec<Value>) {
+    let mut total = Agg::default();
+    let mut usd = 0.0;
+    let mut by_model: Vec<(String, Agg, f64, bool)> = models
+        .iter()
+        .map(|(model, agg)| {
+            let (p, est) = pricing_for(model);
+            let c = agg.cost(&p);
+            total.add(agg);
+            usd += c;
+            (model.clone(), *agg, c, est)
+        })
+        .collect();
+    by_model.sort_by(|a, b| b.2.total_cmp(&a.2));
+    let json = by_model
+        .iter()
+        .map(|(model, agg, c, est)| {
+            json!({
+                "model": model,
+                "input": agg.input,
+                "output": agg.output,
+                "cache_read": agg.cache_read,
+                "cache_creation": agg.cache_creation(),
+                "usd": round2(*c),
+                "pricing_estimated": est,
+            })
+        })
+        .collect();
+    (total, usd, json)
+}
+
+/// #1077: render the per-instance → per-task view. Includes the
+/// `(no active task)` bucket so per-task totals reconcile to the per-instance
+/// view, flags any instance whose unattributed share exceeds 25%, and carries
+/// the time-window-attribution caveat (this is NOT per-task billing).
+fn render_by_task(
+    by_task: HashMap<String, HashMap<String, HashMap<String, Agg>>>,
+    since_label: &str,
+    instance_filter: Option<&str>,
+) -> Value {
+    const CAVEAT: &str = "time-window attribution, NOT per-task billing — each \
+        message is attributed to whichever task the instance had active at the \
+        message's timestamp; off-task work within a window is mis-attributed.";
+    const UNATTRIBUTED_FLAG_PCT: f64 = 25.0;
+
+    // Assemble per instance: tasks sorted by cost desc, instance totals,
+    // unattributed share + flag.
+    let mut instances: Vec<(String, Agg, f64, f64, bool, Vec<Value>)> = by_task
+        .into_iter()
+        .filter(|(name, _)| instance_filter.is_none_or(|f| f == name))
+        .map(|(name, tasks)| {
+            let mut inst_total = Agg::default();
+            let mut inst_usd = 0.0;
+            let mut no_task_tokens = 0u64;
+            let mut task_rows: Vec<(String, Agg, f64, Vec<Value>)> = tasks
+                .into_iter()
+                .map(|(task_id, models)| {
+                    let (total, usd, by_model) = task_totals(&models);
+                    inst_total.add(&total);
+                    inst_usd += usd;
+                    if task_id == NO_ACTIVE_TASK {
+                        no_task_tokens = total.total_tokens();
+                    }
+                    (task_id, total, usd, by_model)
+                })
+                .collect();
+            task_rows.sort_by(|a, b| b.2.total_cmp(&a.2));
+            let inst_tokens = inst_total.total_tokens();
+            let unattributed_pct = if inst_tokens > 0 {
+                (no_task_tokens as f64) / (inst_tokens as f64) * 100.0
+            } else {
+                0.0
+            };
+            let flag = unattributed_pct > UNATTRIBUTED_FLAG_PCT;
+            let task_json: Vec<Value> = task_rows
+                .iter()
+                .map(|(task_id, total, usd, by_model)| {
+                    json!({
+                        "task_id": task_id,
+                        "input": total.input,
+                        "output": total.output,
+                        "cache_read": total.cache_read,
+                        "cache_creation": total.cache_creation(),
+                        "usd": round2(*usd),
+                        "by_model": by_model,
+                    })
+                })
+                .collect();
+            (
+                name,
+                inst_total,
+                inst_usd,
+                unattributed_pct,
+                flag,
+                task_json,
+            )
+        })
+        .collect();
+    instances.sort_by(|a, b| b.2.total_cmp(&a.2));
+
+    // Text table.
+    let mut table = String::new();
+    table.push_str(&format!(
+        "Token usage by task ({since_label}) — Claude Code + Codex. \
+         {CAVEAT}\n"
+    ));
+    for (name, inst_total, inst_usd, pct, flag, task_json) in &instances {
+        table.push_str(&format!(
+            "\n{name}  (total {} in / {} out / ${:.2}; unattributed {:.0}%{})\n",
+            fmt_tokens(inst_total.input),
+            fmt_tokens(inst_total.output),
+            inst_usd,
+            pct,
+            if *flag { " ⚠ >25%" } else { "" },
+        ));
+        table.push_str(&format!(
+            "  {:<34} {:>9} {:>9} {:>10}\n",
+            "task", "Input", "Output", "USD"
+        ));
+        for t in task_json {
+            let usd = t.get("usd").and_then(Value::as_f64).unwrap_or(0.0);
+            table.push_str(&format!(
+                "  {:<34} {:>9} {:>9} {:>10}\n",
+                t.get("task_id").and_then(Value::as_str).unwrap_or("?"),
+                fmt_tokens(t.get("input").and_then(Value::as_u64).unwrap_or(0)),
+                fmt_tokens(t.get("output").and_then(Value::as_u64).unwrap_or(0)),
+                format!("${:.2}", usd),
+            ));
+        }
+    }
+
+    let per_instance: Vec<Value> = instances
+        .iter()
+        .map(|(name, total, usd, pct, flag, tasks)| {
+            json!({
+                "instance": name,
+                "input": total.input,
+                "output": total.output,
+                "cache_read": total.cache_read,
+                "cache_creation": total.cache_creation(),
+                "usd": round2(*usd),
+                "unattributed_pct": round2(*pct),
+                "unattributed_flag": flag,
+                "by_task": tasks,
+            })
+        })
+        .collect();
+
+    json!({
+        "ok": true,
+        "since": since_label,
+        "group_by": "task",
+        "backends": ["claude", "codex"],
+        "caveat": CAVEAT,
+        "note": "per-task totals (incl. (no active task)) reconcile to the per-instance view; unattributed_flag marks >25% unattributed",
+        "per_instance": per_instance,
+        "table": table,
+    })
+}
+
 /// MCP `tokens` handler. Shape `ha` — `(home, args)`.
 pub(crate) fn handle_tokens(home: &Path, args: &Value) -> Value {
     let action = args
@@ -631,6 +1004,15 @@ pub(crate) fn handle_tokens(home: &Path, args: &Value) -> Value {
         .unwrap_or("summary");
     if action != "summary" && action != "by_instance" {
         return json!({"ok": false, "error": format!("unknown tokens action: {action} (expected summary | by_instance)")});
+    }
+    // #1077 slice-1: optional per-task grouping. Default `instance` =
+    // pre-existing behaviour (backward-compatible; no schema break).
+    let group_by = args
+        .get("group_by")
+        .and_then(Value::as_str)
+        .unwrap_or("instance");
+    if group_by != "instance" && group_by != "task" {
+        return json!({"ok": false, "error": format!("unknown group_by: {group_by} (expected instance | task)")});
     }
     let since = args.get("since").and_then(Value::as_str);
     let since_label = since.unwrap_or("24h");
@@ -651,12 +1033,20 @@ pub(crate) fn handle_tokens(home: &Path, args: &Value) -> Value {
     };
 
     let roots = instance_roots(home);
-    let mut by_instance = collect(&projects, &roots, cutoff);
-    // #1077 Phase 2: merge Codex usage into the same per-instance aggregation.
+    // Single scan → deduped row set (claude + codex), consumed by whichever fold.
+    let mut rows = collect_rows(&projects, &roots, cutoff);
     if let Some(codex) = codex_sessions_dir() {
-        merge_into(&mut by_instance, collect_codex(&codex, &roots, cutoff));
+        rows.extend(collect_codex_rows(&codex, &roots, cutoff));
     }
-    render(by_instance, since_label, instance_filter)
+
+    if group_by == "task" {
+        let windows = crate::task_events::stream_envelopes(home)
+            .map(|envs| build_task_windows(&envs))
+            .unwrap_or_default();
+        render_by_task(fold_by_task(&rows, &windows), since_label, instance_filter)
+    } else {
+        render(fold_by_instance(&rows), since_label, instance_filter)
+    }
 }
 
 #[cfg(test)]
@@ -887,49 +1277,69 @@ mod tests {
 
     // ── #1077 Phase 2: Codex collector ──
 
-    /// Build a Codex rollout fixture: session_meta(cwd) + turn_context(model) +
-    /// two cumulative token_count lines (the second strictly larger).
+    /// Build a Codex rollout fixture in the REAL format: every line has a
+    /// top-level `timestamp`; `token_count` lines carry both `total_token_usage`
+    /// (session-cumulative) and `last_token_usage` (the per-turn delta). Two
+    /// turns, each delta = (1000 in / 400 cached / 100 out); cumulative ends at
+    /// 2200 — so Σdelta reconciles to the cumulative total.
     fn codex_session(cwd: &str, model: &str) -> String {
         [
-            format!(r#"{{"type":"session_meta","payload":{{"cwd":"{cwd}"}}}}"#),
-            format!(r#"{{"type":"turn_context","payload":{{"model":"{model}"}}}}"#),
-            // earlier cumulative snapshot
-            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":400,"output_tokens":100,"reasoning_output_tokens":30,"total_tokens":1100}}}}"#.to_string(),
-            // final (max) cumulative snapshot
-            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":2000,"cached_input_tokens":800,"output_tokens":200,"reasoning_output_tokens":60,"total_tokens":2200}}}}"#.to_string(),
+            format!(r#"{{"timestamp":"2026-04-25T00:10:18.000Z","type":"session_meta","payload":{{"cwd":"{cwd}"}}}}"#),
+            format!(r#"{{"timestamp":"2026-04-25T00:10:19.000Z","type":"turn_context","payload":{{"model":"{model}"}}}}"#),
+            // turn 1 — cumulative 1100, delta == cumulative (first turn)
+            r#"{"timestamp":"2026-04-25T00:10:22.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":400,"output_tokens":100,"reasoning_output_tokens":30,"total_tokens":1100},"last_token_usage":{"input_tokens":1000,"cached_input_tokens":400,"output_tokens":100,"reasoning_output_tokens":30,"total_tokens":1100}}}}"#.to_string(),
+            // turn 2 — cumulative 2200, delta 1100
+            r#"{"timestamp":"2026-04-25T00:10:29.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":2000,"cached_input_tokens":800,"output_tokens":200,"reasoning_output_tokens":60,"total_tokens":2200},"last_token_usage":{"input_tokens":1000,"cached_input_tokens":400,"output_tokens":100,"reasoning_output_tokens":30,"total_tokens":1100}}}}"#.to_string(),
         ]
         .join("\n")
     }
 
-    /// Cumulative usage → take the MAX snapshot (not a sum); map uncached input,
-    /// cached→cache_read, output_tokens→output (reasoning already included, NOT
-    /// double-counted); attribute via cwd.
+    /// CORRECTION #2 (load-bearing): per-line `last_token_usage` deltas + the
+    /// line's top-level ts. The Σ of the delta rows MUST equal what the old
+    /// cumulative-MAX implementation reported (= the final `total_token_usage`),
+    /// otherwise the default per-instance view regresses. Reasoning tokens are
+    /// already inside `output_tokens` (not double-counted).
     #[test]
-    fn codex_session_max_not_sum_reasoning_not_doubled() {
+    fn codex_delta_sum_equals_cumulative() {
         let cwd = "/h/workspace/dev-a";
         let roots = vec![("dev-a".to_string(), vec![PathBuf::from(cwd)])];
         let content = codex_session(cwd, "gpt-5-codex");
-        let (instance, model, agg) = parse_codex_session(&content, &roots).expect("session parses");
-        assert_eq!(instance, "dev-a");
-        assert_eq!(model, "gpt-5-codex");
-        // From the MAX line only: 2000-800 uncached input, 800 cached, 200 output.
+        let rows = parse_codex_rows(&content, &roots, None);
         assert_eq!(
-            agg.input, 1200,
-            "uncached input = input - cached, max line only"
+            rows.len(),
+            2,
+            "one row per token_count line (delta, not MAX)"
         );
-        assert_eq!(agg.cache_read, 800);
+        for r in &rows {
+            assert_eq!(r.instance, "dev-a");
+            assert_eq!(r.model, "gpt-5-codex");
+            assert!(r.ts_ms > 0, "each delta row carries its per-message ts");
+        }
+        assert!(
+            rows[0].ts_ms < rows[1].ts_ms,
+            "rows preserve chronological order"
+        );
+        // Σ of the per-turn deltas.
+        let mut sum = Agg::default();
+        for r in &rows {
+            sum.add(&r.usage);
+        }
+        // Final cumulative `total_token_usage`: input 2000, cached 800, out 200.
+        // Mapped: uncached input 1200, cache_read 800, output 200, no cache-write.
+        assert_eq!(sum.input, 1200, "Σdelta uncached input == cumulative");
+        assert_eq!(sum.cache_read, 800, "Σdelta cached == cumulative cached");
         assert_eq!(
-            agg.output, 200,
-            "output_tokens already includes reasoning — must not add 60 again, nor sum the two snapshots"
+            sum.output, 200,
+            "Σdelta output == cumulative output (reasoning not doubled)"
         );
         assert_eq!(
-            agg.cache_creation(),
+            sum.cache_creation(),
             0,
             "OpenAI has no cache-creation charge"
         );
     }
 
-    /// A session whose cwd is not under any fleet root is skipped (None).
+    /// A session whose cwd is not under any fleet root yields no rows.
     #[test]
     fn codex_foreign_cwd_skipped() {
         let roots = vec![(
@@ -937,7 +1347,7 @@ mod tests {
             vec![PathBuf::from("/h/workspace/dev-a")],
         )];
         let content = codex_session("/some/other/project", "gpt-5-codex");
-        assert!(parse_codex_session(&content, &roots).is_none());
+        assert!(parse_codex_rows(&content, &roots, None).is_empty());
     }
 
     /// Codex/gpt models resolve to the Codex pricing row (recognised, not the
@@ -982,5 +1392,271 @@ mod tests {
         );
         assert_eq!(dev_a.get("gpt-5-codex").unwrap().output, 7);
         assert_eq!(dev_a.get("claude-opus-4-8").unwrap().input, 10);
+    }
+
+    /// The default per-instance codex view must be UNCHANGED by the delta
+    /// refactor: `collect_codex` (now Σdelta) reports the cumulative total.
+    #[test]
+    fn collect_codex_per_instance_unchanged_after_delta_refactor() {
+        let sessions = tmp("codex-sessions");
+        let day = sessions.join("2026").join("04").join("25");
+        std::fs::create_dir_all(&day).unwrap();
+        // Virtual forward-slash cwd so the `codex_session` fixture (built with
+        // `format!`, which does NOT escape backslashes) is valid JSON on Windows
+        // too — a real tmp path embeds `\U…` and breaks `serde_json::from_str`.
+        let cwd = "/virtual/workspace/dev-a";
+        std::fs::write(
+            day.join("rollout-x.jsonl"),
+            codex_session(cwd, "gpt-5-codex"),
+        )
+        .unwrap();
+        let roots = vec![("dev-a".to_string(), vec![PathBuf::from(cwd)])];
+        let by = collect_codex(&sessions, &roots, None);
+        let agg = &by["dev-a"]["gpt-5-codex"];
+        assert_eq!(agg.input, 1200, "Σdelta per-instance == cumulative");
+        assert_eq!(agg.cache_read, 800);
+        assert_eq!(agg.output, 200);
+    }
+
+    // ── #1077 slice-1: instance→task time-join ──
+
+    use crate::task_events::{DoneSource, InstanceName, TaskEvent, TaskEventEnvelope, TaskId};
+
+    /// `ts_secs` → an RFC3339 envelope; `build_task_windows` parses it back to
+    /// `ts_secs * 1000` ms.
+    fn env(ts_secs: i64, inst: &str, event: TaskEvent) -> TaskEventEnvelope {
+        TaskEventEnvelope {
+            schema_version: 1,
+            seq: 0,
+            timestamp: chrono::DateTime::from_timestamp(ts_secs, 0)
+                .unwrap()
+                .to_rfc3339(),
+            instance: InstanceName(inst.to_string()),
+            emitter_id: None,
+            event,
+        }
+    }
+    fn claimed(task: &str, by: &str) -> TaskEvent {
+        TaskEvent::Claimed {
+            task_id: TaskId(task.into()),
+            by: InstanceName(by.into()),
+        }
+    }
+    fn done(task: &str, by: &str) -> TaskEvent {
+        TaskEvent::Done {
+            task_id: TaskId(task.into()),
+            by: InstanceName(by.into()),
+            source: DoneSource::OperatorManual {
+                authored_at: "2026-01-01T00:00:00Z".into(),
+                result: None,
+            },
+        }
+    }
+    fn released(task: &str) -> TaskEvent {
+        TaskEvent::Released {
+            task_id: TaskId(task.into()),
+            reason: "swept".into(),
+        }
+    }
+
+    #[test]
+    fn attribute_to_task_window_boundaries_and_gaps() {
+        let w = vec![
+            TaskWindow {
+                task_id: "A".into(),
+                start_ms: 100,
+                end_ms: Some(200),
+            },
+            TaskWindow {
+                task_id: "B".into(),
+                start_ms: 300,
+                end_ms: None,
+            },
+        ];
+        assert_eq!(attribute_to_task(&w, 150), Some("A"), "inside window");
+        assert_eq!(attribute_to_task(&w, 100), Some("A"), "start inclusive");
+        assert_eq!(attribute_to_task(&w, 200), None, "end exclusive");
+        assert_eq!(attribute_to_task(&w, 50), None, "before first");
+        assert_eq!(attribute_to_task(&w, 250), None, "in the gap");
+        assert_eq!(attribute_to_task(&w, 9_999), Some("B"), "open window → +∞");
+    }
+
+    #[test]
+    fn windows_next_claim_truncates_overlap() {
+        // dev-a claims A then B without closing A → A truncated at B's claim.
+        let envs = vec![
+            env(100, "dev-a", claimed("A", "dev-a")),
+            env(200, "dev-a", claimed("B", "dev-a")),
+        ];
+        let w = build_task_windows(&envs);
+        let da = &w["dev-a"];
+        assert_eq!(da.len(), 2);
+        assert_eq!(
+            da[0],
+            TaskWindow {
+                task_id: "A".into(),
+                start_ms: 100_000,
+                end_ms: Some(200_000)
+            }
+        );
+        assert_eq!(da[1].end_ms, None, "B stays open to +∞");
+    }
+
+    #[test]
+    fn windows_never_done_stays_open_and_done_closes() {
+        let open = build_task_windows(&[env(100, "dev-a", claimed("A", "dev-a"))]);
+        assert_eq!(open["dev-a"][0].end_ms, None, "never-done → open");
+        let closed = build_task_windows(&[
+            env(100, "dev-a", claimed("A", "dev-a")),
+            env(150, "dev-a", done("A", "dev-a")),
+        ]);
+        assert_eq!(closed["dev-a"][0].end_ms, Some(150_000), "Done closes");
+    }
+
+    #[test]
+    fn windows_owner_aware_released_closes_holder() {
+        // CORRECTION #1: `Released` carries NO `by` — it must close whichever
+        // instance currently HOLDS the task open, not be ignored for lack of by.
+        let w = build_task_windows(&[
+            env(100, "dev-a", claimed("A", "dev-a")),
+            env(150, "dev-a", released("A")),
+        ]);
+        assert_eq!(
+            w["dev-a"][0].end_ms,
+            Some(150_000),
+            "Released closes the holder's open window"
+        );
+    }
+
+    #[test]
+    fn windows_reclaim_yields_disjoint_windows() {
+        // A → B → A on one instance: two disjoint A windows.
+        let w = build_task_windows(&[
+            env(100, "dev-a", claimed("A", "dev-a")),
+            env(200, "dev-a", claimed("B", "dev-a")),
+            env(300, "dev-a", claimed("A", "dev-a")),
+        ]);
+        let a: Vec<_> = w["dev-a"].iter().filter(|x| x.task_id == "A").collect();
+        assert_eq!(a.len(), 2, "re-claim → two disjoint A windows");
+        assert_eq!(a[0].end_ms, Some(200_000));
+    }
+
+    #[test]
+    fn windows_multi_instance_isolation() {
+        let w = build_task_windows(&[
+            env(100, "dev-a", claimed("A", "dev-a")),
+            env(120, "dev-b", claimed("B", "dev-b")),
+        ]);
+        assert_eq!(w["dev-a"][0].task_id, "A");
+        assert_eq!(w["dev-b"][0].task_id, "B");
+        assert_eq!(w["dev-a"].len(), 1);
+        assert_eq!(w["dev-b"].len(), 1);
+    }
+
+    fn row(inst: &str, input: u64, ts_ms: i64) -> Row {
+        Row {
+            instance: inst.into(),
+            model: "claude-opus-4-8".into(),
+            usage: Agg {
+                input,
+                ..Agg::default()
+            },
+            ts_ms,
+        }
+    }
+
+    #[test]
+    fn fold_by_task_buckets_no_task_and_reconciles_to_per_instance() {
+        let rows = vec![
+            row("dev-a", 100, 150), // in window A
+            row("dev-a", 50, 180),  // in window A
+            row("dev-a", 30, 250),  // gap → (no active task)
+        ];
+        let mut windows = HashMap::new();
+        windows.insert(
+            "dev-a".to_string(),
+            vec![TaskWindow {
+                task_id: "A".into(),
+                start_ms: 100,
+                end_ms: Some(200),
+            }],
+        );
+        let by_task = fold_by_task(&rows, &windows);
+        let da = &by_task["dev-a"];
+        assert_eq!(da["A"]["claude-opus-4-8"].input, 150, "in-window rows → A");
+        assert_eq!(
+            da[NO_ACTIVE_TASK]["claude-opus-4-8"].input, 30,
+            "gap row → (no active task)"
+        );
+        // Reconciliation: Σ over tasks == per-instance fold.
+        let per_inst_total: u64 = fold_by_instance(&rows)["dev-a"]
+            .values()
+            .map(|a| a.input)
+            .sum();
+        let per_task_total: u64 = da.values().flat_map(|m| m.values()).map(|a| a.input).sum();
+        assert_eq!(per_task_total, per_inst_total, "per-task Σ == per-instance");
+        assert_eq!(per_task_total, 180);
+    }
+
+    #[test]
+    fn render_by_task_flags_unattributed_over_25pct_and_carries_caveat() {
+        let mut by_task: HashMap<String, HashMap<String, HashMap<String, Agg>>> = HashMap::new();
+        let inst = by_task.entry("dev-a".into()).or_default();
+        inst.entry("A".into()).or_default().insert(
+            "claude-opus-4-8".into(),
+            Agg {
+                input: 70,
+                ..Agg::default()
+            },
+        );
+        inst.entry(NO_ACTIVE_TASK.into()).or_default().insert(
+            "claude-opus-4-8".into(),
+            Agg {
+                input: 30,
+                ..Agg::default()
+            },
+        );
+        let v = render_by_task(by_task, "all", None);
+        assert_eq!(v["group_by"], json!("task"));
+        assert!(v["caveat"]
+            .as_str()
+            .unwrap()
+            .contains("NOT per-task billing"));
+        let pi = &v["per_instance"][0];
+        assert_eq!(pi["unattributed_flag"], json!(true), "30% > 25% → flagged");
+        assert!(pi["unattributed_pct"].as_f64().unwrap() >= 29.0);
+    }
+
+    #[test]
+    fn default_group_by_instance_output_shape_unchanged() {
+        // Regression: the no-group_by (default) render keeps the pre-#1077
+        // shape — per_instance[].by_model, and no group_by/by_task/caveat keys.
+        let rows = vec![Row {
+            instance: "dev-a".into(),
+            model: "claude-opus-4-8".into(),
+            usage: Agg {
+                input: 10,
+                output: 20,
+                ..Agg::default()
+            },
+            ts_ms: 0,
+        }];
+        let v = render(fold_by_instance(&rows), "all", None);
+        assert_eq!(
+            v["group_by"],
+            json!(null),
+            "no group_by key in default view"
+        );
+        assert!(
+            v.get("caveat").is_none(),
+            "no per-task caveat in default view"
+        );
+        let pi = &v["per_instance"][0];
+        assert!(pi.get("by_model").is_some(), "per-model breakdown retained");
+        assert!(
+            pi.get("by_task").is_none(),
+            "no per-task key in default view"
+        );
+        assert_eq!(pi["input"], json!(10));
     }
 }
