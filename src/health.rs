@@ -413,13 +413,22 @@ impl HealthTracker {
     /// Check whether agent is stalled on an interactive startup prompt.
     /// Pure predicate — no state mutation.
     ///
-    /// Fires only when the agent is in `Starting` AND has been silent past
-    /// the threshold. Once the agent reaches `Ready` we trust the backend
-    /// and any further quiet period is handled by `check_hang` with a much
-    /// higher threshold — flagging short Ready silences produced false
-    /// positives for agents in the middle of legitimate tool execution.
+    /// Fires when the agent has been silent past the threshold AND is in a
+    /// state that legitimately awaits operator input: `Starting` (the original
+    /// startup-stall fallback) or, post-#1552, a runtime `PermissionPrompt` /
+    /// `InteractivePrompt` (a mid-task stall on an approval the operator must
+    /// answer). Other states (`Ready` mid-tool-use, etc.) are left to
+    /// `check_hang` — flagging short generic silences here produced FPs.
+    ///
+    /// This is the *necessary* condition only; the supervisor adds escalation
+    /// FP-gates (live-bottom-N position, state-stability, operator-engagement
+    /// cooldown) before it actually notifies — see `daemon::supervisor`.
     pub fn check_awaiting_operator(&self, agent_state: AgentState, silent: Duration) -> bool {
-        silent > AWAITING_OP_SILENCE && matches!(agent_state, AgentState::Starting)
+        silent > AWAITING_OP_SILENCE
+            && matches!(
+                agent_state,
+                AgentState::Starting | AgentState::PermissionPrompt | AgentState::InteractivePrompt
+            )
     }
 
     /// Check for hang based on agent state and output timeout.
@@ -874,18 +883,16 @@ mod tests {
 
     #[test]
     fn test_awaiting_operator_non_starting_exempt() {
-        // Only Starting triggers. Ready and all other states are exempt
-        // regardless of silence — Ready silence is handled by `check_hang`
-        // with much higher thresholds so legitimate pauses between tool
-        // bursts don't produce false positives.
+        // #1552: Starting + runtime prompt states (PermissionPrompt /
+        // InteractivePrompt) trigger; every OTHER state is exempt regardless of
+        // silence — generic Ready/tool silence is handled by `check_hang` with
+        // much higher thresholds so legitimate pauses don't produce FPs.
         let h = HealthTracker::new();
         for s in [
             AgentState::Ready,
             AgentState::Idle,
             AgentState::Thinking,
             AgentState::ToolUse,
-            AgentState::InteractivePrompt,
-            AgentState::PermissionPrompt,
             AgentState::Hang,
             AgentState::AwaitingOperator,
             AgentState::Crashed,
@@ -894,6 +901,18 @@ mod tests {
                 !h.check_awaiting_operator(s, Duration::from_secs(60)),
                 "state {:?} should not trigger awaiting_operator",
                 s
+            );
+        }
+        // #1552: the runtime prompt states DO trigger past the threshold (the
+        // supervisor adds the position/stability/engagement FP-gates on top).
+        for s in [AgentState::PermissionPrompt, AgentState::InteractivePrompt] {
+            assert!(
+                h.check_awaiting_operator(s, Duration::from_secs(60)),
+                "runtime prompt state {s:?} must trigger awaiting_operator past threshold"
+            );
+            assert!(
+                !h.check_awaiting_operator(s, Duration::from_secs(10)),
+                "runtime prompt state {s:?} under threshold must not trigger"
             );
         }
     }

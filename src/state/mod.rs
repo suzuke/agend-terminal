@@ -872,17 +872,23 @@ impl StateTracker {
         self.record_set(AgentState::Restarting); // #1527: also logs the transition
     }
 
-    /// Force state to AwaitingOperator when startup stalls on an unexpected
-    /// interactive prompt. Only fires from `Starting` — Ready-state stalls
-    /// are caught by pattern-based detection (see `InteractivePrompt` once
-    /// added; until then they're missed, which is acceptable for the
-    /// time-based fallback role).
+    /// Force state to AwaitingOperator when the agent is stalled waiting on
+    /// operator input. Fires from `Starting` (the original startup-stall
+    /// fallback) or, post-#1552, from a runtime `PermissionPrompt` /
+    /// `InteractivePrompt` (a mid-task approval stall). Other states are left
+    /// untouched so a late tick-loop detection can't corrupt a healthy
+    /// mid-task agent — the WHEN-to-escalate gating (silence threshold +
+    /// position / stability / engagement FP-gates) lives in the supervisor;
+    /// this setter just guards the legal source states.
     ///
     /// Once the operator unblocks the stall and the ready pattern matches
     /// fresh screen content, `transition()` lifts the state (Ready prio >
     /// AwaitingOperator prio → higher always wins).
     pub fn set_awaiting_operator(&mut self) {
-        if matches!(self.current, AgentState::Starting) {
+        if matches!(
+            self.current,
+            AgentState::Starting | AgentState::PermissionPrompt | AgentState::InteractivePrompt
+        ) {
             self.record_set(AgentState::AwaitingOperator); // #1527: also logs
         }
     }

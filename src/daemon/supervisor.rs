@@ -25,6 +25,18 @@ const TICK: Duration = Duration::from_secs(10);
 const TAIL_LINES: usize = 40;
 /// Debounce cooldown for member-state-change notify (Sprint 43).
 const NOTIFY_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// #1552: minimum continuous time in a runtime prompt state before escalating
+/// to AwaitingOperator (stability gate — a transient streaming flicker of the
+/// permission chrome never holds this long).
+const AWAITING_STABILITY: Duration = Duration::from_secs(8);
+/// #1552: how many live bottom rows the permission chrome must render in for
+/// the escalation position gate. A scrollback footer (the meta-FP: a working
+/// agent whose pane merely echoes the chrome) scrolls above this and fails.
+const AWAITING_TAIL_LINES: usize = 12;
+/// #1552: suppress escalation when the operator typed into the pane within this
+/// window — they're actively dealing with the prompt, no buzz needed.
+const AWAITING_ENGAGEMENT_WINDOW_MS: i64 = 15_000;
 /// Maximum auto-retries for ServerRateLimit before giving up.
 const SERVER_RATE_LIMIT_MAX_RETRIES: u32 = 3;
 /// Backoff schedule for ServerRateLimit retries (seconds).
@@ -500,6 +512,50 @@ fn reaction_kinds(to: crate::state::AgentState, propagation_enabled: bool) -> Ve
     kinds
 }
 
+/// #1552: escalation FP-gate for runtime AwaitingOperator (dev-2 design,
+/// decision d-20260531141354559067-0). `check_awaiting_operator` is the
+/// *necessary* silence+state condition; this adds the *sufficient* guards so a
+/// permission-chrome false positive — a working agent whose pane merely echoes
+/// the footer chrome (e.g. in scrollback: state-detection is full-screen, so it
+/// fires `PermissionPrompt` on healthy agents working on detection code) — can't
+/// escalate into a false operator buzz + a sticky false blocked-state.
+///
+/// `Starting` keeps its original ungated path (a startup stall has no chrome to
+/// position-gate). The runtime prompt states require all three gates; the real
+/// dialog satisfies all three, the meta-FP fails ≥1. Pure (file/now values are
+/// passed in) so it is unit-testable without a daemon.
+fn awaiting_escalation_allowed(
+    state: crate::state::AgentState,
+    state_held: Duration,
+    backend: Option<crate::backend::Backend>,
+    live_tail: &str,
+    operator_typed_ms: i64,
+    now_ms: i64,
+) -> bool {
+    use crate::state::AgentState;
+    match state {
+        // Original startup-stall fallback — no chrome, no position gate.
+        AgentState::Starting => true,
+        AgentState::PermissionPrompt | AgentState::InteractivePrompt => {
+            // (b) stability: the prompt state held continuously long enough.
+            state_held >= AWAITING_STABILITY
+                // (a) position (mandatory): the prompt chrome must re-detect in
+                // the LIVE bottom rows. A scrollback echo fails this — it's the
+                // only gate that catches a finished agent sitting on a footer.
+                && backend.is_some_and(|b| {
+                    matches!(
+                        crate::state::StatePatterns::for_backend(&b).detect(live_tail),
+                        Some(AgentState::PermissionPrompt | AgentState::InteractivePrompt)
+                    )
+                })
+                // (c) engagement: the operator isn't actively typing into it.
+                && !(operator_typed_ms > 0
+                    && now_ms.saturating_sub(operator_typed_ms) < AWAITING_ENGAGEMENT_WINDOW_MS)
+        }
+        _ => false,
+    }
+}
+
 /// One iteration of the supervisor loop. Public for tests.
 fn tick(
     home: &std::path::Path,
@@ -617,22 +673,61 @@ fn tick(
 
             let agent_state = core.state.current;
             let silent = core.state.last_output.elapsed();
-            if core.health.check_awaiting_operator(agent_state, silent) {
-                core.state.set_awaiting_operator();
-                tracing::info!(
-                    agent = %name,
-                    silent_secs = silent.as_secs(),
-                    prev_state = agent_state.display_name(),
-                    "awaiting operator (stalled on interactive prompt)"
+            if core.health.check_awaiting_operator(agent_state, silent) && {
+                // #1552 escalation FP-gates (only reached when silent>30s +
+                // a prompt state, so this registry lock + re-detect is rare,
+                // not per-tick). Lock-free w.r.t. self-IPC; registry-under-
+                // core mirrors the established ordering in this loop.
+                let backend = {
+                    let reg = crate::agent::lock_registry(registry);
+                    reg.get(&instance_id).map(|h| h.backend_command.clone())
+                }
+                .as_deref()
+                .and_then(crate::backend::Backend::from_command);
+                let (typed_ms, _submit_ms) =
+                    crate::notification_queue::read_input_submit_timestamps(home, &name);
+                awaiting_escalation_allowed(
+                    agent_state,
+                    core.state.since.elapsed(),
+                    backend,
+                    &core.vterm.tail_lines(AWAITING_TAIL_LINES),
+                    typed_ms,
+                    crate::daemon::heartbeat_pair::now_ms() as i64,
+                )
+            } {
+                // #1552 Half-1 #3: set the HEALTH reason — `check_hang` exempts
+                // on `current_reason`, not on the state, so setting the state
+                // alone would NOT stop the Hung→Stage-1-ESC path (which would
+                // dismiss the real prompt). The reason also doubles as the
+                // once-per-episode buzz dedup: if it's already AwaitingOperator
+                // we re-affirm state+reason (stay exempt) but don't re-notify,
+                // so the chrome (prio 8 > AwaitingOperator prio 2) flipping the
+                // state back each tick can't buzz the operator repeatedly.
+                let already_escalated = matches!(
+                    core.health.current_reason,
+                    Some(crate::health::BlockedReason::AwaitingOperator)
                 );
+                core.state.set_awaiting_operator();
+                core.health
+                    .set_blocked_reason(crate::health::BlockedReason::AwaitingOperator);
                 // Consume the recovery flag if somehow armed in the same tick,
                 // so the "ready again" ping doesn't fire right after we just
                 // re-entered a blocked state.
                 let _ = core.state.take_recovery_notice();
-                Some(NoticeAction::Stall {
-                    tail: core.vterm.tail_lines(TAIL_LINES),
-                    silent_secs: Some(silent.as_secs()),
-                })
+                if already_escalated {
+                    None
+                } else {
+                    tracing::info!(
+                        agent = %name,
+                        silent_secs = silent.as_secs(),
+                        prev_state = agent_state.display_name(),
+                        "awaiting operator (stalled on prompt) — escalating"
+                    );
+                    Some(NoticeAction::Stall {
+                        tail: core.vterm.tail_lines(TAIL_LINES),
+                        silent_secs: Some(silent.as_secs()),
+                    })
+                }
             } else if core.state.take_interactive_prompt_notice() {
                 // Pattern-based InteractivePrompt fires immediately on state
                 // entry (no silence window), so the notice also goes out on
@@ -650,6 +745,16 @@ fn tick(
                 // Symmetric "ready again" signal: armed on the transition
                 // out of InteractivePrompt / AwaitingOperator. Silent push so
                 // operators aren't vibrated twice per interactive cycle.
+                // #1552: clear the AwaitingOperator health reason on recovery so
+                // `check_hang` is no longer exempt and a future stall can
+                // re-notify (the once-per-episode dedup re-arms). Guarded so we
+                // never clear a different blocked reason (RateLimit / etc.).
+                if matches!(
+                    core.health.current_reason,
+                    Some(crate::health::BlockedReason::AwaitingOperator)
+                ) {
+                    core.health.clear_blocked_reason();
+                }
                 tracing::info!(
                     agent = %name,
                     "recovered from blocked state — notifying telegram"
@@ -1255,6 +1360,101 @@ mod tests {
             reaction_kinds(AgentState::Ready, true).is_empty(),
             "non-error state: no reaction"
         );
+    }
+
+    // ── #1552: runtime AwaitingOperator escalation FP-gates ──
+
+    /// ClaudeCode permission chrome footer — the self-identifying anchor #1546
+    /// installed; `StatePatterns` detects it as `PermissionPrompt`.
+    const PERM_CHROME: &str = "Do you want to proceed?\nEsc to cancel · Tab to amend";
+
+    #[test]
+    fn awaiting_gate_starting_is_ungated() {
+        // Legacy startup-stall path: fires regardless of chrome/position.
+        assert!(awaiting_escalation_allowed(
+            crate::state::AgentState::Starting,
+            Duration::from_secs(0),
+            None,
+            "no chrome here",
+            0,
+            0,
+        ));
+    }
+
+    #[test]
+    fn awaiting_gate_runtime_permission_all_gates_pass() {
+        assert!(awaiting_escalation_allowed(
+            crate::state::AgentState::PermissionPrompt,
+            AWAITING_STABILITY, // held long enough
+            Some(crate::backend::Backend::ClaudeCode),
+            PERM_CHROME, // chrome IS in the live tail
+            0,           // operator never typed
+            10_000,
+        ));
+    }
+
+    #[test]
+    fn awaiting_gate_blocks_scrollback_footer_fp() {
+        // The meta-FP: state is PermissionPrompt (full-screen detection saw the
+        // chrome), held + no typing — but the chrome is NOT in the live bottom
+        // tail (it scrolled up / is a working agent's echo). Position gate (a)
+        // must block escalation. This is the dev-2 live case.
+        assert!(!awaiting_escalation_allowed(
+            crate::state::AgentState::PermissionPrompt,
+            AWAITING_STABILITY,
+            Some(crate::backend::Backend::ClaudeCode),
+            "just normal working output, no dialog chrome at the bottom",
+            0,
+            10_000,
+        ));
+    }
+
+    #[test]
+    fn awaiting_gate_blocks_when_not_stable() {
+        // (b) stability: prompt state held < AWAITING_STABILITY → no escalate.
+        assert!(!awaiting_escalation_allowed(
+            crate::state::AgentState::PermissionPrompt,
+            Duration::from_secs(1),
+            Some(crate::backend::Backend::ClaudeCode),
+            PERM_CHROME,
+            0,
+            10_000,
+        ));
+    }
+
+    #[test]
+    fn awaiting_gate_blocks_when_operator_typing() {
+        // (c) engagement: operator typed 2s ago (< 15s window) → suppress.
+        let now = 100_000i64;
+        assert!(!awaiting_escalation_allowed(
+            crate::state::AgentState::PermissionPrompt,
+            AWAITING_STABILITY,
+            Some(crate::backend::Backend::ClaudeCode),
+            PERM_CHROME,
+            now - 2_000,
+            now,
+        ));
+    }
+
+    #[test]
+    fn awaiting_gate_non_prompt_state_never_escalates() {
+        for s in [
+            crate::state::AgentState::Ready,
+            crate::state::AgentState::Thinking,
+            crate::state::AgentState::ToolUse,
+        ] {
+            assert!(
+                !awaiting_escalation_allowed(
+                    s,
+                    AWAITING_STABILITY,
+                    Some(crate::backend::Backend::ClaudeCode),
+                    PERM_CHROME,
+                    0,
+                    10_000,
+                ),
+                "{s:?} must never escalate via this path"
+            );
+        }
     }
 
     /// NOTIFY_COOLDOWN constant is 60 seconds.

@@ -906,17 +906,30 @@ fn set_awaiting_operator_from_starting() {
 }
 
 #[test]
+fn set_awaiting_operator_fires_from_runtime_prompt_states() {
+    // #1552: a mid-task stall on a permission/interactive prompt must be able
+    // to escalate to AwaitingOperator (was Starting-only before).
+    for s in [AgentState::PermissionPrompt, AgentState::InteractivePrompt] {
+        let mut t = tracker_at(&Backend::ClaudeCode, s, 10);
+        t.set_awaiting_operator();
+        assert_eq!(
+            t.current,
+            AgentState::AwaitingOperator,
+            "runtime prompt state {s:?} must escalate"
+        );
+    }
+}
+
+#[test]
 fn set_awaiting_operator_noop_from_non_starting() {
-    // Only Starting transitions. All other states (including Ready) are
-    // no-ops so late-firing tick-loop detections can't corrupt a healthy
-    // mid-task agent. Known interactive prompts from Ready are caught
-    // by pattern-based detection, not this time-based fallback.
+    // #1552: only Starting + the runtime prompt states (PermissionPrompt /
+    // InteractivePrompt) transition. Every OTHER state is a no-op so a late
+    // tick-loop detection can't corrupt a healthy mid-task agent.
     for s in [
         AgentState::Ready,
         AgentState::Idle,
         AgentState::Thinking,
         AgentState::ToolUse,
-        AgentState::PermissionPrompt,
         AgentState::AwaitingOperator,
         AgentState::Crashed,
     ] {
