@@ -132,18 +132,41 @@ fn is_red_indexed(idx: u8) -> bool {
     false
 }
 
-/// #1450: is a 24-bit RGB foreground a "red"?
+/// #1450 / #1538: is a 24-bit RGB foreground a "red"?
 ///
-/// Red channel must be reasonably saturated AND clearly dominate the other
-/// two (≥ 2×). The ≥2× ratio (not a flat margin) is what rejects orange /
-/// amber, whose green channel is high: rgb(230,160,30) fails because
-/// 230 < 2·160. Initial threshold (authorized by lead, tunable from the
-/// suppress-path WARN observability which prints the actual rgb): `r ≥ 120`
-/// and `r ≥ 2·g` and `r ≥ 2·b`. Covers chalk/Ink reds like rgb(215,40,40) /
-/// rgb(204,0,0) / rgb(255,85,85) while rejecting orange / green / blue.
+/// HSV-based (not the old `r ≥ 2·g, 2·b` ratio). The ratio rejected pastel /
+/// desaturated theme reds as false negatives — rgb(237,135,150) (hue≈351°) has
+/// 237 < 2·135 so it failed — and loosening the ratio to catch them would
+/// re-admit saturated orange (rgb(255,165,0): 255 ≥ 1.5·165), regressing #919.
+/// Hue separates them cleanly: pastel red sits at ~351°, orange at ~39°.
+///
+/// Red iff hue ∈ [345°,360°) ∪ [0°,15°] AND saturation > 0.3 AND value > 0.4.
+/// The sat/val floors drop greys and near-black/near-white prose foregrounds
+/// (achromatic cells have no hue → not red). Covers chalk reds rgb(215,40,40) /
+/// rgb(204,0,0) (hue 0°) and pastel reds rgb(237,135,150) (~351°) while
+/// rejecting orange / amber / green / blue and unsaturated prose fg.
 fn is_red_rgb(r: u8, g: u8, b: u8) -> bool {
-    let (r, g, b) = (r as u16, g as u16, b as u16);
-    r >= 120 && r >= g * 2 && r >= b * 2
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let delta = max - min;
+    if delta == 0 {
+        return false; // achromatic (grey/black/white) → no hue → not red
+    }
+    let sat = delta as f32 / max as f32; // max > 0 since delta > 0
+    let value = max as f32 / 255.0;
+    if sat <= 0.3 || value <= 0.4 {
+        return false;
+    }
+    let (rf, gf, bf, d) = (r as f32, g as f32, b as f32, delta as f32);
+    // Hue in degrees [0,360). `rem_euclid` keeps the red wrap-around positive.
+    let hue = if max == r {
+        60.0 * ((gf - bf) / d).rem_euclid(6.0)
+    } else if max == g {
+        60.0 * ((bf - rf) / d + 2.0)
+    } else {
+        60.0 * ((rf - gf) / d + 4.0)
+    };
+    hue <= 15.0 || hue >= 345.0
 }
 
 /// #1450: classify an alacritty cell foreground into a [`CellFg`], flagging
@@ -936,8 +959,26 @@ mod tests {
 
     #[test]
     fn classify_fg_recognizes_red_truecolor() {
+        // Saturated chalk/Ink reds (hue 0°).
         assert_eq!(first_fg("\x1b[38;2;215;40;40m", "ERR"), CellFg::Red);
         assert_eq!(first_fg("\x1b[38;2;204;0;0m", "ERR"), CellFg::Red);
+        // #1538: pastel / desaturated theme reds the old r≥2·g ratio missed.
+        // Three themes, all hue ~351–355°, sat ~0.5: the FN class #1538 fixes.
+        assert_eq!(
+            first_fg("\x1b[38;2;237;135;150m", "ERR"),
+            CellFg::Red,
+            "pastel red ~351° (237<2·135 failed the old ratio)"
+        );
+        assert_eq!(
+            first_fg("\x1b[38;2;224;108;117m", "ERR"),
+            CellFg::Red,
+            "One Dark red ~355°"
+        );
+        assert_eq!(
+            first_fg("\x1b[38;2;231;118;128m", "ERR"),
+            CellFg::Red,
+            "pastel red ~355°"
+        );
     }
 
     #[test]
@@ -954,7 +995,20 @@ mod tests {
         assert_ne!(
             first_fg("\x1b[38;2;230;160;30m", "ok"),
             CellFg::Red,
-            "orange"
+            "orange ~39°"
+        );
+        // #1538/#919: saturated orange must stay rejected — the whole reason
+        // for HSV over a looser ratio (255 ≥ 1.5·165 would have admitted it).
+        assert_ne!(
+            first_fg("\x1b[38;2;255;165;0m", "ok"),
+            CellFg::Red,
+            "saturated orange ~39° (#919 non-regression)"
+        );
+        // Unsaturated prose foreground (e.g. One Dark fg) is not red.
+        assert_ne!(
+            first_fg("\x1b[38;2;171;178;191m", "ok"),
+            CellFg::Red,
+            "prose default fg (sat ~0.1)"
         );
         // Default foreground (no SGR) is not red.
         assert_eq!(first_fg("", "ok"), CellFg::Default);
