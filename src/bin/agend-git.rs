@@ -335,6 +335,33 @@ fn cwd_is_canonical_rooted() -> bool {
     }
 }
 
+/// #1511 follow-up: a MUTATING-form action — deny when unbound, else route to
+/// the caller's PRIVATE bound worktree. Mirrors the porcelain mutating arm body
+/// so the flag-discriminated plumbing arms (`restore --staged`, `update-ref`,
+/// `symbolic-ref` write) share one contract.
+fn deny_unbound_else_chdir(bound: bool, binding: &Binding) -> Action {
+    if !bound {
+        return Action::Deny("unbound — no active task assignment".into());
+    }
+    match binding.worktree {
+        Some(ref wt) => Action::ChdirPass(wt.clone()),
+        None => Action::Deny("bound but no worktree path".into()),
+    }
+}
+
+/// #1511 follow-up: a READ / working-tree-form action — passthrough when
+/// unbound, else chdir to the bound worktree. Mirrors the `_` default arm, used
+/// for the NON-mutating forms (`restore` working-tree, `symbolic-ref` read) so
+/// they aren't over-denied.
+fn pass_unbound_else_chdir(bound: bool, binding: &Binding) -> Action {
+    if bound {
+        if let Some(ref wt) = binding.worktree {
+            return Action::ChdirPass(wt.clone());
+        }
+    }
+    Action::Passthrough
+}
+
 fn classify(
     subcmd: &str,
     args: &[String],
@@ -497,6 +524,48 @@ fn classify(
         }
         // Worktree management: always deny (fleet-managed).
         "worktree" => Action::Deny("fleet-managed — use agend-terminal worktree tools".into()),
+        // #1511 follow-up: index/ref-mutating plumbing that also fell to the
+        // `_` default arm (unbound → Passthrough, so an unbound agent in
+        // canonical could mutate the shared store). Unlike read-tree/
+        // update-index/apply (#1511), these need FLAG/ARG discrimination so the
+        // read-only / working-tree forms aren't over-denied.
+        //
+        // `restore`: only `--staged`/`-S` touches the INDEX (per-worktree →
+        // ChdirPass isolates a bound agent). A bare or `--worktree` restore
+        // touches the working tree only — left as a non-mutating passthrough
+        // (#1511fu scope; matches the operator's "don't block bare restore").
+        "restore" => {
+            let touches_index = args.iter().any(|a| a == "--staged" || a == "-S");
+            if touches_index {
+                deny_unbound_else_chdir(bound, binding)
+            } else {
+                pass_unbound_else_chdir(bound, binding)
+            }
+        }
+        // `update-ref` always writes or deletes a ref (no read form) → mutating.
+        //
+        // SHARED-REF CAVEAT: refs live in the COMMON `.git` store and are shared
+        // across worktrees (unlike the per-worktree index), so `ChdirPass` does
+        // NOT isolate a bound agent's ref write from canonical. We still adopt
+        // #1511's contract — `unbound → Deny` closes the documented
+        // canonical-write hole; bound agents are trusted (active task) and
+        // already fenced by the E4.5 cross-branch / worktree-policy porcelain
+        // guards. Raw `update-ref` is not part of any agent flow. (Policy A.)
+        "update-ref" => deny_unbound_else_chdir(bound, binding),
+        // `symbolic-ref <name>` (no value) READS the ref; `<name> <ref>` or
+        // `-d/--delete` WRITES it. Only the write form mutates — the read form
+        // must pass so an unbound `git symbolic-ref HEAD` isn't wrongly denied.
+        // Same shared-ref caveat as `update-ref` for the write form.
+        "symbolic-ref" => {
+            let deletes = args.iter().any(|a| a == "-d" || a == "--delete");
+            // Non-flag args after the subcommand: 1 = read, ≥2 = write.
+            let value_args = args.iter().skip(1).filter(|a| !a.starts_with('-')).count();
+            if deletes || value_args >= 2 {
+                deny_unbound_else_chdir(bound, binding)
+            } else {
+                pass_unbound_else_chdir(bound, binding)
+            }
+        }
         // Default: passthrough when unbound, chdir when bound.
         _ => {
             if bound {
@@ -1327,6 +1396,86 @@ mod tests {
             Action::Passthrough,
             "merge-tree is read-only and must NOT be denied/caught by #1511"
         );
+    }
+
+    // ── #1511 follow-up: flag-discriminated index/ref plumbing ──
+
+    /// The MUTATING forms — `restore --staged`/`-S`, `update-ref` (always),
+    /// `symbolic-ref` write (`<name> <ref>` or `-d`) — must DENY when unbound
+    /// (closes the canonical-write hole they had via the `_` Passthrough arm).
+    #[test]
+    fn fu1511_mutating_plumbing_forms_unbound_denied() {
+        let cases: &[&[&str]] = &[
+            &["restore", "--staged", "file.rs"],
+            &["restore", "-S", "file.rs"],
+            &["restore", "--staged", "--worktree", "file.rs"], // both → has --staged
+            &["update-ref", "refs/heads/main", "deadbeef"],
+            &["update-ref", "-d", "refs/heads/tmp"],
+            &["symbolic-ref", "HEAD", "refs/heads/feat"], // 2 non-flag args → write
+            &["symbolic-ref", "-d", "HEAD"],              // delete → write
+        ];
+        for argv in cases {
+            let args: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+            let action = classify(argv[0], &args, &Binding::default(), false, false, true);
+            assert!(
+                matches!(action, Action::Deny(ref reason) if reason.contains("unbound")),
+                "unbound `{}` must deny, got {action:?}",
+                argv.join(" ")
+            );
+        }
+    }
+
+    /// The READ / working-tree forms must NOT be over-denied (the operator's
+    /// "don't block bare restore" + don't break read-only `symbolic-ref`):
+    /// they fall through to `unbound → Passthrough` like any read-only command.
+    #[test]
+    fn fu1511_readonly_and_worktree_forms_not_overdenied() {
+        let cases: &[&[&str]] = &[
+            &["restore", "file.rs"],               // bare → working tree
+            &["restore", "--worktree", "file.rs"], // explicit working tree, no --staged
+            &["symbolic-ref", "HEAD"],             // 1 non-flag arg → read
+            &["symbolic-ref", "--short", "HEAD"],  // read with a flag
+        ];
+        for argv in cases {
+            let args: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+            let action = classify(argv[0], &args, &Binding::default(), false, false, true);
+            assert_eq!(
+                action,
+                Action::Passthrough,
+                "unbound read/working-tree form `{}` must NOT be denied",
+                argv.join(" ")
+            );
+        }
+    }
+
+    /// A BOUND agent's mutating-plumbing forms route to its PRIVATE worktree
+    /// (ChdirPass), never deny. (Shared-ref caveat noted in the arm: ChdirPass
+    /// can't isolate ref writes, but bound agents are trusted — Policy A.)
+    #[test]
+    fn fu1511_bound_routes_to_worktree() {
+        let wt = "/tmp/.worktrees/dev";
+        let cases: &[&[&str]] = &[
+            &["restore", "--staged", "file.rs"],
+            &["update-ref", "refs/heads/main", "deadbeef"],
+            &["symbolic-ref", "HEAD", "refs/heads/feat"],
+        ];
+        for argv in cases {
+            let args: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+            let action = classify(
+                argv[0],
+                &args,
+                &bound_binding("feat/x", wt),
+                false,
+                false,
+                true,
+            );
+            assert_eq!(
+                action,
+                Action::ChdirPass(wt.into()),
+                "bound `{}` must route to the worktree",
+                argv.join(" ")
+            );
+        }
     }
 
     /// `git reset --hard` stays the agent's self-recovery tool: a bound agent
