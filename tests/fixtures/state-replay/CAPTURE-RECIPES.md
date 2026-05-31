@@ -77,6 +77,13 @@ Before starting the capture session, prepare the environment:
 Claude Code asks for permission (e.g. `--dangerously-skip-permissions`
 confirmation or an update prompt). Needed for Phase 2a keystroke audit.
 
+> **#1546 use**: this is the edit/confirm permission class. Its footer + option
+> chrome (`Esc to cancel · Tab to amend`, numbered `❯ 1. Yes / … / N. No`) is the
+> zero-FP detection anchor #1546 keys on. Capture R1/R2/R2b together so #1546 can
+> see whether that chrome is STABLE across permission types (edit vs trust vs
+> bash) — `Tab to amend` is edit-specific, so a single footer anchor may not
+> cover all of them.
+
 ```bash
 # 1. Start capture
 script -q "$CAPTURE_DIR/claude-yes-proceed.raw" claude
@@ -112,6 +119,11 @@ grep -c "Yes, proceed" "$CAPTURE_DIR/claude-yes-proceed.raw"
 launched in an untrusted directory for the first time. Needed for
 composite-signature discriminator calibration.
 
+> **#1546 use**: the trust-folder modal may render DIFFERENT footer/option chrome
+> than the edit permission (R1) — its wording is "Do you trust the files…", not
+> "Tab to amend". #1546 needs this to decide whether one footer anchor covers all
+> permission types or each (edit / trust / bash) needs its own chrome match.
+
 ```bash
 # 1. Ensure clean state (no prior trust for this dir)
 rm -rf /tmp/agend-untrusted-test && mkdir /tmp/agend-untrusted-test
@@ -131,6 +143,66 @@ script -q "$CAPTURE_DIR/claude-trust-prompt.raw" claude
 
 ```bash
 grep -c "trust" "$CAPTURE_DIR/claude-trust-prompt.raw"
+```
+
+**Time estimate**: ~2 min
+
+---
+
+#### R2b. `claude-bash-perm.raw` (#1546 — bash-command permission, ~2 min)
+
+> Numbered `R2b` because it joins the permission group (R1 edit, R2 trust);
+> `R3`–`R10` are the productive-marker captures below.
+
+**Goal**: Capture the permission dialog Claude Code shows before running a
+**shell command**. #1546 needs to know whether the bash-permission footer/option
+chrome matches the edit-permission footer (`Esc to cancel · Tab to amend`) or
+differs — `Tab to amend` is edit-specific, so bash may render a different footer.
+This decides whether a single footer anchor is enough for #1546's detection or
+each permission type needs its own chrome match.
+
+> ⚠ **Do NOT use `--dangerously-skip-permissions`.** Bypass mode skips the
+> permission prompt entirely — that is exactly why fleet agents (which run with
+> bypass) never see it and cannot self-capture this fixture. Launch Claude
+> WITHOUT bypass.
+
+```bash
+# 1. Throwaway repo (keep the capture clean)
+rm -rf /tmp/agend-bash-perm-test && mkdir /tmp/agend-bash-perm-test
+cd /tmp/agend-bash-perm-test && git init
+
+# 2. Start capture — NON-bypass claude
+script -q "$CAPTURE_DIR/claude-bash-perm.raw" claude
+
+# 3. Ask it to run a shell command, e.g. type:   run: ls -la
+#    The bash-permission dialog renders. Let it render fully (2-3 sec).
+#    DO NOT select an option.
+
+# 4. Press Ctrl-C to exit WITHOUT answering (we want the dialog bytes).
+```
+
+**Verify**: ANSI escapes present, and dump the footer/option wording so #1546 can
+compare chrome across permission types:
+
+```bash
+xxd "$CAPTURE_DIR/claude-bash-perm.raw" | grep -c '1b\['
+grep -aoE "Esc to cancel[^|]*|Tab to amend|enter to confirm|Allow|Do you want" \
+  "$CAPTURE_DIR/claude-bash-perm.raw" | sort -u
+```
+
+**MANIFEST entry**:
+
+```yaml
+- file: claude-bash-perm.raw
+  backend: claude-code
+  cli_version: "<version>"
+  recorded_on: "<YYYY-MM-DD>"
+  scenario: "bash-command permission dialog (run shell command, dialog not answered)"
+  expected_transitions: [starting, permission]
+  expected_final_state: permission
+  expected_final_detect: permission
+  capture_kind: real_pty
+  provenance: "#1546 operator capture"
 ```
 
 **Time estimate**: ~2 min
