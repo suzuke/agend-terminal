@@ -9,6 +9,7 @@ Link the issue it closes, e.g. `Closes #123`. -->
 
 ## Prior art check (required)
 
+- [ ] I checked [docs/KNOWN_ISSUES.md](https://github.com/suzuke/agend-terminal/blob/main/docs/KNOWN_ISSUES.md) — this isn't an item listed there as intentionally deferred.
 - [ ] I compared this change against the **current `main`** branch and
       confirmed it isn't already implemented.
 - [ ] I searched **closed** issues and PRs for prior attempts or decisions in

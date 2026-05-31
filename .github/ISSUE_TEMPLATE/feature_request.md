@@ -11,6 +11,7 @@ labels: ['enhancement']
 already-decided approach without new evidence, may be closed without further
 review. A quick search saves everyone time. -->
 
+- [ ] I checked [docs/KNOWN_ISSUES.md](https://github.com/suzuke/agend-terminal/blob/main/docs/KNOWN_ISSUES.md) — this isn't an item already listed there as intentionally deferred.
 - [ ] I searched **open and closed** issues for prior requests or prior
       decisions on this, and linked any I found below.
 - [ ] This is not a re-request of an already-decided topic — or, if it
