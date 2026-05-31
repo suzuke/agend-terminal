@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 pub use handler::handle;
-pub use orphan::{orphan_tasks_for_owner, reconcile_orphan_owners_with_live};
+pub use orphan::{
+    orphan_tasks_for_owner, reconcile_orphan_owners_with_live, release_inprogress_orphans_with_live,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {

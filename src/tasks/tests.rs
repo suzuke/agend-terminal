@@ -1,6 +1,7 @@
 use super::acl::{can_mutate_task, is_system_identity};
 use super::orphan::{
-    build_health_response, classify_owner, scan_orphan_candidates, OwnerClassification,
+    build_health_response, classify_owner, release_inprogress_orphans_with_live,
+    scan_inprogress_orphans, scan_orphan_candidates, OwnerClassification,
 };
 use super::sweep;
 use super::*;
@@ -431,6 +432,143 @@ fn reconcile_orphan_owners_with_live_empty_set_orphans_strict_ghost() {
         owner_after.is_none(),
         "after boot sweep with empty live, Strict ghost's owner must be cleared (got {owner_after:?})"
     );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+// ── Boot orphan sweep (task t-20260526155509233515-8) ──
+// STATUS-orphan sweep: at boot, `live = ∅` (auto_start runs after
+// bootstrap), so every in_progress task is a prev-session orphan and is
+// released to open. Unlike the owner sweep there is NO Soft-defer — a
+// re-spawning fleet agent does not resume its prior in_progress.
+
+use crate::task_events::TaskStatus;
+
+/// RED→GREEN pure-fn matrix. With `live = ∅` (boot), only `InProgress`
+/// tasks are orphans regardless of owner; non-in_progress statuses are
+/// always skipped; a `None`-owner in_progress (malformed) still counts.
+#[test]
+fn scan_inprogress_orphans_boot_empty_live_matrix() {
+    let state = make_state(vec![
+        make_record("t-ip-owned", TaskStatus::InProgress, Some("dev-impl-1")),
+        make_record("t-ip-fleet", TaskStatus::InProgress, Some("dev-impl-2")),
+        make_record("t-ip-noowner", TaskStatus::InProgress, None),
+        make_record("t-open", TaskStatus::Open, Some("dev-impl-1")),
+        make_record("t-claimed", TaskStatus::Claimed, Some("dev-impl-1")),
+        make_record("t-done", TaskStatus::Done, Some("dev-impl-1")),
+        make_record("t-cancelled", TaskStatus::Cancelled, Some("dev-impl-1")),
+    ]);
+    let live = std::collections::HashSet::new(); // boot: no agent alive yet
+
+    let mut got: Vec<String> = scan_inprogress_orphans(&state, &live)
+        .into_iter()
+        .map(|t| t.0)
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            "t-ip-fleet".to_string(),
+            "t-ip-noowner".to_string(),
+            "t-ip-owned".to_string()
+        ],
+        "boot (live=∅): all in_progress (incl. no-owner) are orphans; \
+         open/claimed/done/cancelled skipped — NO Soft-defer for in_progress"
+    );
+}
+
+/// The `live` param IS honoured for a future per-tick variant: an
+/// in_progress task whose owner is in the live set is actively running →
+/// NOT an orphan. A no-owner in_progress is still an orphan.
+#[test]
+fn scan_inprogress_orphans_live_owner_is_not_orphan() {
+    let state = make_state(vec![
+        make_record("t-ip-live", TaskStatus::InProgress, Some("dev-impl-1")),
+        make_record("t-ip-dead", TaskStatus::InProgress, Some("dev-impl-9")),
+        make_record("t-ip-noowner", TaskStatus::InProgress, None),
+    ]);
+    let live = make_set(&["dev-impl-1"]);
+
+    let mut got: Vec<String> = scan_inprogress_orphans(&state, &live)
+        .into_iter()
+        .map(|t| t.0)
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec!["t-ip-dead".to_string(), "t-ip-noowner".to_string()],
+        "owner ∈ live ⇒ actively running ⇒ kept; dead owner + no-owner ⇒ orphan"
+    );
+}
+
+/// Integration: seed an in_progress task in the event log, run the boot
+/// entrypoint (empty live), and confirm replay shows it released back to
+/// Open with the owner cleared (re-dispatchable). Idempotent re-run is a
+/// no-op (the task is no longer in_progress).
+#[test]
+fn release_inprogress_orphans_releases_to_open_and_clears_owner() {
+    use crate::task_events::{InstanceName, TaskEvent, TaskId};
+    let home = tmp_home("release_inprogress_orphans");
+    let emitter = InstanceName::from("test:seed");
+    let tid = TaskId("t-stuck-1".into());
+    let worker = InstanceName::from("dev-impl-1");
+    crate::task_events::append_batch(
+        &home,
+        &emitter,
+        vec![
+            TaskEvent::Created {
+                task_id: tid.clone(),
+                title: "stuck in_progress across restart".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: Some(worker.clone()),
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: None,
+                bind: None,
+                eta_secs: None,
+                tags: vec![],
+                parent_id: None,
+            },
+            TaskEvent::Claimed {
+                task_id: tid.clone(),
+                by: worker.clone(),
+            },
+            TaskEvent::InProgress {
+                task_id: tid.clone(),
+                by: worker.clone(),
+            },
+        ],
+    )
+    .expect("seed in_progress task");
+
+    // Pre-condition: replay sees it in_progress + owned.
+    let pre = crate::task_events::replay(&home).expect("pre replay");
+    let pre_rec = pre.tasks.get(&tid).expect("seeded task present");
+    assert_eq!(pre_rec.status, TaskStatus::InProgress, "pre: in_progress");
+    assert!(pre_rec.owner.is_some(), "pre: owned");
+
+    // Subject: boot entrypoint with live=∅ (the bootstrap call site).
+    let released = release_inprogress_orphans_with_live(&home, &std::collections::HashSet::new());
+    assert_eq!(released, vec![tid.clone()], "the stuck task is released");
+
+    let post = crate::task_events::replay(&home).expect("post replay");
+    let post_rec = post.tasks.get(&tid).expect("task still present");
+    assert_eq!(
+        post_rec.status,
+        TaskStatus::Open,
+        "after boot sweep: in_progress orphan released back to open"
+    );
+    assert!(
+        post_rec.owner.is_none(),
+        "Released clears owner → re-dispatchable (got {:?})",
+        post_rec.owner
+    );
+
+    // Idempotent: re-running finds no in_progress orphan → no-op.
+    let again = release_inprogress_orphans_with_live(&home, &std::collections::HashSet::new());
+    assert!(again.is_empty(), "re-run is a no-op once released to open");
 
     std::fs::remove_dir_all(&home).ok();
 }

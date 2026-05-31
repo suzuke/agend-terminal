@@ -61,6 +61,110 @@ pub fn orphan_tasks_for_owner(home: &Path, owner_name: &str) -> Result<usize, St
         .map_err(|e| e.to_string())
 }
 
+/// Boot orphan sweep (task t-20260526155509233515-8): the STATUS-orphan
+/// analogue of [`scan_orphan_candidates`] (which handles OWNER orphans).
+///
+/// An `InProgress` task is a status-orphan when its owner is absent from `live`
+/// — or it has no owner at all (a malformed in_progress). At boot `live` is
+/// empty (see the bootstrap call site), so this returns ALL in_progress tasks —
+/// provably correct because no agent is alive to be actively working one
+/// (AgEnD agents re-spawn fresh on daemon restart; none resumes a mid-task
+/// in_progress).
+///
+/// Crucially, unlike the owner sweep there is **no Soft-defer**: a fleet agent
+/// re-spawning will NOT resume its prior in_progress, so the task must be
+/// released to open for re-dispatch regardless of whether its owner is in
+/// fleet.yaml. The `live` parameter is kept so a future per-tick variant can
+/// pass an authoritative live set (then `owner ∈ live` ⇒ actively running ⇒
+/// keep) — but the boot caller passes `∅`.
+pub fn scan_inprogress_orphans(
+    state: &crate::task_events::TaskBoardState,
+    live: &std::collections::HashSet<String>,
+) -> Vec<crate::task_events::TaskId> {
+    use crate::task_events::TaskStatus;
+    state
+        .tasks
+        .values()
+        .filter(|r| matches!(r.status, TaskStatus::InProgress))
+        .filter(|r| match r.owner.as_ref() {
+            Some(o) => !live.contains(o.0.as_str()),
+            None => true, // malformed: in_progress with no owner → orphan
+        })
+        .map(|r| r.id.clone())
+        .collect()
+}
+
+/// Boot orphan sweep: release stale `InProgress` tasks (see
+/// [`scan_inprogress_orphans`]) back to `Open` by emitting one batched
+/// [`crate::task_events::TaskEvent::Released`] per task (clears owner →
+/// re-dispatchable), under a single fsync. Returns the released ids.
+///
+/// Best-effort operator courtesy: a single coalesced, file-based inbox notice
+/// (the loopback API socket is NOT bound at bootstrap, so an `api::call`-based
+/// delivery would fail — `inbox::enqueue` is a plain file append). The released
+/// tasks are also visible on the board (now `Open`) and in a `warn` log.
+///
+/// Lock-free + pre-socket-safe by construction: runs in `bootstrap::prepare`
+/// before the agent registry and loopback socket exist, so there is no
+/// registry/core lock to hold across the inbox write → no #1492 concern.
+pub fn release_inprogress_orphans_with_live(
+    home: &Path,
+    live: &std::collections::HashSet<String>,
+) -> Vec<crate::task_events::TaskId> {
+    use crate::task_events::{InstanceName, TaskEvent};
+    let state = match crate::task_events::replay(home) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "boot orphan sweep: task_events replay failed — skipping");
+            return Vec::new();
+        }
+    };
+    let orphans = scan_inprogress_orphans(&state, live);
+    if orphans.is_empty() {
+        tracing::debug!("boot orphan sweep: no in_progress orphans to release");
+        return Vec::new();
+    }
+    let emitter = InstanceName::from("system:boot_orphan_sweep");
+    let events: Vec<TaskEvent> = orphans
+        .iter()
+        .cloned()
+        .map(|task_id| TaskEvent::Released {
+            task_id,
+            reason: "boot orphan recovery: in_progress with no live owner after daemon restart"
+                .to_string(),
+        })
+        .collect();
+    if let Err(e) = crate::task_events::append_batch(home, &emitter, events) {
+        tracing::warn!(error = %e, "boot orphan sweep: Released append_batch failed");
+        return Vec::new();
+    }
+    let ids: Vec<String> = orphans.iter().map(|t| t.0.clone()).collect();
+    tracing::warn!(
+        count = ids.len(),
+        released = ?ids,
+        "boot orphan sweep: released stale in_progress tasks to open (daemon restart)"
+    );
+    notify_boot_orphan_release(home, &ids);
+    orphans
+}
+
+/// Coalesced, file-based operator notice for the boot orphan sweep. One inbox
+/// message listing every released task (NOT one-per-task — avoids flooding).
+/// `enqueue` is a plain append, safe before the loopback socket is bound.
+fn notify_boot_orphan_release(home: &Path, ids: &[String]) {
+    if ids.is_empty() {
+        return;
+    }
+    let body = format!(
+        "[boot_orphan_sweep] released {} stale in_progress task(s) to open after a daemon \
+         restart (now re-dispatchable): {}",
+        ids.len(),
+        ids.join(", ")
+    );
+    let msg = crate::inbox::InboxMessage::new_system("system:boot_orphan_sweep", "update", body);
+    let _ = crate::inbox::enqueue(home, "general", msg);
+}
+
 /// #829: classify a single owner string against the live runtime
 /// registry + the fleet.yaml `instances:` set. Two ghost classes are
 /// distinguished:
