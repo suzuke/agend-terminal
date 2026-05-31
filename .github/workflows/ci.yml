@@ -80,6 +80,18 @@ jobs:
         timeout-minutes: 20
         run: cargo build --release
 
+      # #1478: the discord feature is not in the default/tray build, so nothing
+      # else type-checks it — the twilight version-split that broke
+      # `--features discord` (twilight-model 0.17 vs gateway/http 0.16) rode
+      # along invisibly, and the #1476/#1477 discord block_on fixes couldn't be
+      # CI-verified. `cargo check` (type-check only, no codegen) is enough to
+      # catch dep/API breakage and is fast. Linux-only — the conflict is
+      # platform-independent.
+      - name: Discord feature compiles (#1478)
+        if: runner.os == 'Linux'
+        timeout-minutes: 15
+        run: cargo check --features discord --quiet
+
       # `--tests` covers unit tests (--bin) + every tests/*.rs integration
       # file. `--features tray` ensures tray-gated code is tested too.
       # Previously this was 3 separate steps (unit, unit+tray, integration)
