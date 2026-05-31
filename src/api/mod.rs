@@ -678,18 +678,21 @@ fn spawn_one(
 pub fn call(home: &Path, request: &Value) -> anyhow::Result<Value> {
     // #1492: self-IPC over the loopback socket. If the caller holds the
     // registry lock, the API handler servicing this call needs the same lock →
-    // deadlock. Debug builds panic here so any unit test hitting the bad path
-    // fails loudly; release builds compile this to a no-op.
-    crate::sync_audit::assert_no_registry_lock_for_self_ipc("api::call");
+    // deadlock. #1492-L2: the guard is always-on and fail-fast — on a violation
+    // it logs + returns `Err` here (in EVERY build, not just debug), so the
+    // deadlocking call is refused and the daemon stays live instead of freezing.
+    crate::sync_audit::assert_no_registry_lock_for_self_ipc("api::call")?;
     let stream = crate::ipc::connect_api(home)?;
-    // #1492 backstop: bound every loopback read with a socket-level timeout.
-    // `assert_no_registry_lock_for_self_ipc` only panics in debug builds — in
-    // release it is a no-op, so a self-IPC made while holding the registry/core
-    // lock deadlocks the daemon AND froze the whole TUI permanently, because the
-    // handshake/response `read_line` below had no timeout and blocked forever in
-    // `recvfrom` while still holding the lock. The timeout converts that
-    // permanent freeze into a recoverable error: the read fails, this call
-    // unwinds, the offending lock guard drops, and the waiting threads proceed.
+    // #1492 backstop (L3): bound every loopback read with a socket-level
+    // timeout. #1492-L2 made the guard above always-on + fail-fast (it now
+    // returns `Err` in every build, not just a debug panic), so a self-IPC made
+    // while holding the registry/core lock is refused before we ever reach this
+    // read. This timeout is the complementary containment net (defense-in-depth)
+    // for any future path that bypasses the guard: were such a read to block
+    // forever in `recvfrom` while holding the lock, it would freeze the whole
+    // TUI permanently. The timeout converts that into a recoverable error: the
+    // read fails, this call unwinds, the offending lock guard drops, and the
+    // waiting threads proceed.
     // Generous default (covers the slowest legit method, create_instance ~60s);
     // `AGEND_API_CALL_TIMEOUT_SECS` lets an operator shrink the recovery window.
     let timeout = api_call_read_timeout();

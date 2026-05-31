@@ -94,7 +94,7 @@ pub fn lock_released(tier: u8) {
     }
 }
 
-// ── #1492: lock-across-self-IPC deadlock detection (debug-only) ──────────
+// ── #1492: lock-across-self-IPC deadlock detection (always-on) ───────────
 //
 // The morning cron deadlock (#1479/#1483 neighborhood) was: a thread held the
 // registry lock and then made a self-IPC call (`api::call` over the loopback
@@ -105,34 +105,31 @@ pub fn lock_released(tier: u8) {
 //
 // This makes the bug catchable by ANY unit test that exercises the bad path:
 // a thread-local depth counter is bumped while the registry lock is held, and
-// the self-IPC vectors panic (debug builds only) if it's nonzero. Release
-// builds compile every entry/exit/assert to a no-op — zero overhead.
+// the self-IPC vectors refuse (return `Err`) if it's nonzero.
+//
+// #1492-L2 (decision d-20260531171228817178-0): the depth counters + the
+// self-IPC guard are now ALWAYS-ON (previously debug-only, cfg-gated, with
+// release no-ops). The counters are pure thread-local `Cell` bumps (no atomics,
+// no contention) on control-plane locks, so the steady-state cost is
+// negligible; in exchange a lock-across-self-IPC in a RELEASE daemon now
+// fail-fasts to a logged `Err` instead of freezing the whole daemon. Pairs with
+// the structural collect→drop→emit invariant (#1530) and the #1571 timeout
+// backstop as defense-in-depth.
 
-#[cfg(debug_assertions)]
 thread_local! {
     /// How many registry locks this thread currently holds (0 = none).
     static REGISTRY_LOCK_DEPTH: Cell<u32> = const { Cell::new(0) };
 }
 
-/// Record that this thread acquired the registry lock. Debug-only; release no-op.
-#[cfg(debug_assertions)]
+/// Record that this thread acquired the registry lock.
 pub fn registry_lock_entered() {
     REGISTRY_LOCK_DEPTH.with(|c| c.set(c.get().saturating_add(1)));
 }
-/// Release-build no-op (zero overhead).
-#[cfg(not(debug_assertions))]
-#[inline(always)]
-pub fn registry_lock_entered() {}
 
-/// Record that this thread released the registry lock. Debug-only; release no-op.
-#[cfg(debug_assertions)]
+/// Record that this thread released the registry lock.
 pub fn registry_lock_exited() {
     REGISTRY_LOCK_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
 }
-/// Release-build no-op (zero overhead).
-#[cfg(not(debug_assertions))]
-#[inline(always)]
-pub fn registry_lock_exited() {}
 
 // ── #1535: per-agent core-lock depth tracking + CoreMutex ────────────────
 //
@@ -145,7 +142,6 @@ pub fn registry_lock_exited() {}
 // it). [`CoreMutex`] makes EVERY core lock bump `CORE_LOCK_DEPTH` so the same
 // self-IPC assert covers the core-held case too.
 
-#[cfg(debug_assertions)]
 thread_local! {
     /// How many `AgentCore` locks this thread currently holds (0 = none).
     /// A single total-depth counter is sufficient: the rule is "no self-IPC
@@ -153,23 +149,15 @@ thread_local! {
     static CORE_LOCK_DEPTH: Cell<u32> = const { Cell::new(0) };
 }
 
-/// Record that this thread acquired a core lock. Debug-only; release no-op.
-#[cfg(debug_assertions)]
+/// Record that this thread acquired a core lock.
 fn core_lock_entered() {
     CORE_LOCK_DEPTH.with(|c| c.set(c.get().saturating_add(1)));
 }
-#[cfg(not(debug_assertions))]
-#[inline(always)]
-fn core_lock_entered() {}
 
-/// Record that this thread released a core lock. Debug-only; release no-op.
-#[cfg(debug_assertions)]
+/// Record that this thread released a core lock.
 fn core_lock_exited() {
     CORE_LOCK_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
 }
-#[cfg(not(debug_assertions))]
-#[inline(always)]
-fn core_lock_exited() {}
 
 /// #1535: a `parking_lot::Mutex` wrapper for the per-agent `AgentCore` that
 /// tracks lock depth via [`CORE_LOCK_DEPTH`]. `.lock()` is API-compatible with
@@ -224,29 +212,41 @@ impl<T> Drop for CoreGuard<'_, T> {
     }
 }
 
-/// Panic (debug builds only) if a self-IPC vector is entered while this thread
-/// holds the registry lock (#1492) OR any per-agent core lock (#1535) — either
-/// ordering deadlocks the daemon (the loopback API handler needs the registry
-/// lock and may lock the target agent's core). `ctx` names the vector. Release
-/// builds: no-op, zero cost.
-#[cfg(debug_assertions)]
-pub fn assert_no_registry_lock_for_self_ipc(ctx: &str) {
+/// Return `Err` if a self-IPC vector is entered while this thread holds the
+/// registry lock (#1492) OR any per-agent core lock (#1535) — either ordering
+/// deadlocks the daemon (the loopback API handler needs the registry lock and
+/// may lock the target agent's core). `ctx` names the vector (logged + carried
+/// in the error).
+///
+/// #1492-L2 (decision d-20260531171228817178-0): ALWAYS-ON, fail-fast `Err`
+/// (was debug-only `panic!` + release no-op). On violation it logs at ERROR
+/// with the named site + lock depths, then returns `Err` so the self-IPC
+/// entrypoint refuses the deadlocking call and the daemon stays LIVE — instead
+/// of freezing (the old release no-op gave zero release protection). The two
+/// production vectors (`api::call`, `enqueue_with_idle_hint`) already return
+/// `anyhow::Result`, so they propagate via `?` with no signature change. The
+/// `#[must_use]` `Result` makes ignoring the refusal a compile error at any new
+/// call site.
+pub fn assert_no_registry_lock_for_self_ipc(ctx: &str) -> anyhow::Result<()> {
     let reg = REGISTRY_LOCK_DEPTH.with(|c| c.get());
     let core = CORE_LOCK_DEPTH.with(|c| c.get());
     if reg > 0 || core > 0 {
-        panic!(
+        tracing::error!(
+            ctx,
+            registry_depth = reg,
+            core_depth = core,
+            "#1492/#1535 lock-across-self-IPC deadlock risk — refusing self-IPC (returning Err)"
+        );
+        anyhow::bail!(
             "#1492/#1535 lock-across-self-IPC deadlock risk: `{ctx}` was called while this thread \
              holds locks (registry depth={reg}, core depth={core}). The loopback API handler needs \
              the registry lock and may lock the target agent's core, so this self-IPC would \
              deadlock the daemon. Drop the guard(s) BEFORE the call (collect under lock → drop → \
-             emit; see #1530, commit 6f1403d, docs/DAEMON-LOCK-ORDERING.md)."
+             emit; see #1530, docs/DAEMON-LOCK-ORDERING.md)."
         );
     }
+    Ok(())
 }
-/// Release-build no-op (zero overhead).
-#[cfg(not(debug_assertions))]
-#[inline(always)]
-pub fn assert_no_registry_lock_for_self_ipc(_ctx: &str) {}
 
 /// Convenience macro for lock tier assertion + acquisition tracking.
 #[macro_export]
@@ -382,31 +382,36 @@ mod tests {
     // (Mechanism-level here; the real `lock_registry` guard wiring is tested
     // in `agent::mod` tests — `agent` is bin-only, not in this shared lib.)
 
-    /// No registry lock held → the self-IPC assert is a no-op (no panic). Holds
-    /// in both debug and release (release is a no-op unconditionally).
+    /// No registry lock held → the guard returns `Ok` (allows the self-IPC).
+    /// #1492-L2: always-on now (runs in release too, not just debug).
     #[test]
-    fn self_ipc_assert_is_noop_without_lock() {
-        assert_no_registry_lock_for_self_ipc("test-vector");
+    fn self_ipc_guard_ok_without_lock() {
+        assert!(assert_no_registry_lock_for_self_ipc("test-vector").is_ok());
     }
 
-    /// While the depth flag is set (as `lock_registry` does on acquire), a
-    /// self-IPC vector trips the assert. Debug-only — the detection compiles
-    /// out in release, so the panic only exists there.
-    #[cfg(debug_assertions)]
+    /// #1492-L2: while the depth flag is set (as `lock_registry` does on
+    /// acquire), the self-IPC guard refuses with `Err` (was a debug-only
+    /// `panic!` pre-L2; now an always-on fail-fast `Err`). Balance the
+    /// enter/exit so the always-on thread-local counter doesn't leak into the
+    /// next test sharing this worker thread.
     #[test]
-    #[should_panic(expected = "lock-across-self-IPC")]
-    fn self_ipc_assert_panics_while_lock_depth_nonzero() {
+    fn self_ipc_guard_errs_while_lock_depth_nonzero() {
         registry_lock_entered();
-        assert_no_registry_lock_for_self_ipc("api::call");
+        let result = assert_no_registry_lock_for_self_ipc("api::call");
+        registry_lock_exited();
+        assert!(
+            result.is_err(),
+            "guard must refuse self-IPC while a lock is held"
+        );
     }
 
     /// The correct pattern (release the lock BEFORE self-IPC — the 6f1403d fix
-    /// shape, modeled here by a balanced enter/exit) must NOT trip the assert.
-    #[cfg(debug_assertions)]
+    /// shape, modeled here by a balanced enter/exit) must NOT trip the guard.
+    /// #1492-L2: always-on now (runs in release too).
     #[test]
-    fn self_ipc_assert_ok_after_balanced_enter_exit() {
+    fn self_ipc_guard_ok_after_balanced_enter_exit() {
         registry_lock_entered();
         registry_lock_exited();
-        assert_no_registry_lock_for_self_ipc("api::call");
+        assert!(assert_no_registry_lock_for_self_ipc("api::call").is_ok());
     }
 }
