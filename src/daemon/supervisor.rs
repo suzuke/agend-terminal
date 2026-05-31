@@ -37,6 +37,16 @@ const AWAITING_TAIL_LINES: usize = 12;
 /// #1552: suppress escalation when the operator typed into the pane within this
 /// window — they're actively dealing with the prompt, no buzz needed.
 const AWAITING_ENGAGEMENT_WINDOW_MS: i64 = 15_000;
+/// #1523: minimum continuous time in `AuthError` before the operator re-auth
+/// alert fires. The `AuthError` pattern is content-FP-prone (transient PTY
+/// content can flip it cosmetically — an instance was observed self-healing back
+/// to `Thinking` in ~31s, producing a false "check credentials" buzz). This
+/// stability gate defers the NOTIFICATION (only) until the state has been held
+/// well past that observed self-heal window: a real auth failure persists
+/// indefinitely and still notifies; a transient blip clears before the window
+/// and never does. 90s = ~3× the observed 31s self-heal, with margin. Sibling to
+/// `AWAITING_STABILITY` (#1552); classification/retry/timers are untouched.
+const AUTH_ERROR_NOTIFY_STABILITY: Duration = Duration::from_secs(90);
 /// Maximum auto-retries for ServerRateLimit before giving up.
 const SERVER_RATE_LIMIT_MAX_RETRIES: u32 = 3;
 /// Backoff schedule for ServerRateLimit retries (seconds).
@@ -55,6 +65,46 @@ const CONTINUE_RETRY_PAYLOAD: &[u8] = b"continue\n";
 pub(crate) struct NotifyTrack {
     last_at: Instant,
     consecutive: u32,
+}
+
+/// #1523: a deferred `AuthError` member-notify awaiting stability confirmation.
+/// Recorded when the agent transitions INTO `AuthError`; the actual operator
+/// notify is held until the state has been continuously held
+/// `AUTH_ERROR_NOTIFY_STABILITY`. Carries the originating `from` state + pane
+/// tail captured at the edge so the eventual notify renders the real transition.
+struct PendingAuthError {
+    from: crate::state::AgentState,
+    pane_tail: String,
+}
+
+/// #1523: outcome of the `AuthError` content-FP stability gate, evaluated each
+/// tick against the agent's current held-duration in `AuthError`.
+#[derive(Debug, PartialEq, Eq)]
+enum AuthErrorGate {
+    /// Still in `AuthError` but not held long enough — keep deferring.
+    Wait,
+    /// Held ≥ `AUTH_ERROR_NOTIFY_STABILITY` — emit the deferred notify (once).
+    Fire,
+    /// No longer in `AuthError` — the blip self-healed; drop any pending notify.
+    Cancel,
+}
+
+/// #1523: decide the stability-gate action for a (possibly) pending `AuthError`.
+///
+/// `auth_error_held` is `Some(elapsed)` iff the agent's CURRENT state is
+/// `AuthError` (the held-duration comes straight from `StateTracker::since`, the
+/// authoritative state-age — no separate clock to drift), else `None`.
+///
+/// Pure + testable: `None` → `Cancel`; `Some(held < N)` → `Wait`;
+/// `Some(held ≥ N)` → `Fire`. This is the whole FP fix — a transient `AuthError`
+/// (state leaves before N → `None` on a later tick → `Cancel`) never reaches
+/// `Fire`, while a sustained one does.
+fn auth_error_gate(auth_error_held: Option<Duration>) -> AuthErrorGate {
+    match auth_error_held {
+        Some(held) if held >= AUTH_ERROR_NOTIFY_STABILITY => AuthErrorGate::Fire,
+        Some(_) => AuthErrorGate::Wait,
+        None => AuthErrorGate::Cancel,
+    }
 }
 
 /// Sprint 54 P2-3: dedup key for `PaneInputNotSubmitted` emission.
@@ -124,6 +174,8 @@ fn run_loop(
     daemon_binary_stale: crate::daemon::mcp_registry_watcher::DaemonBinaryStale,
 ) {
     let mut notify_tracks: HashMap<String, NotifyTrack> = HashMap::new();
+    // #1523: deferred AuthError member-notifies awaiting stability confirmation.
+    let mut pending_auth: HashMap<String, PendingAuthError> = HashMap::new();
     let mut retry_tracks: HashMap<String, RateLimitRetry> = HashMap::new();
     let mut pane_input_tracks: HashMap<String, PaneInputTrack> = HashMap::new();
     // Sprint 59 Wave 1 PR-1 (#9 task stall watchdog): per-task ETA
@@ -192,7 +244,7 @@ fn run_loop(
         // in any tracker's maybe_scan() doesn't kill the supervisor thread.
         // Mirrors the run_handlers_with_panic_guard pattern from per_tick.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            tick(&home, &registry, &mut notify_tracks);
+            tick(&home, &registry, &mut notify_tracks, &mut pending_auth);
             process_server_rate_limit_retries(&home, &registry, &mut retry_tracks);
             check_pane_input_not_submitted(&home, &registry, &mut pane_input_tracks);
             anti_stall_tracker.maybe_scan(&home);
@@ -577,6 +629,7 @@ fn tick(
     home: &std::path::Path,
     registry: &AgentRegistry,
     notify_tracks: &mut HashMap<String, NotifyTrack>,
+    pending_auth: &mut HashMap<String, PendingAuthError>,
 ) {
     // Snapshot the agent names + handles so we can release the registry lock
     // before touching any per-agent core lock. Holding both at once risks
@@ -599,6 +652,12 @@ fn tick(
         // #1530: reaction intents collected under the core lock below, emitted
         // lock-free after the lock drops (the member-notify path self-IPCs).
         let mut reaction_intents: Vec<ReactionIntent> = Vec::new();
+        // #1523: held-duration in AuthError captured under the lock (Some iff the
+        // current state IS AuthError), consumed by the stability gate after the
+        // lock drops. Sourced from `StateTracker::since` — the authoritative
+        // state-age — so no separate clock can drift. Assigned exactly once
+        // inside the (unconditional) lock block below.
+        let auth_error_held: Option<Duration>;
         let action: Option<NoticeAction> = {
             let mut core = core.lock();
 
@@ -688,6 +747,11 @@ fn tick(
             clear_waiting_on_if_stale(home, &name, !core.state.is_heartbeat_fresh());
 
             let agent_state = core.state.current;
+            // #1523: capture how long AuthError has been continuously held (state
+            // age) for the post-lock stability gate. `Some` iff currently in
+            // AuthError; the gate uses it to confirm/cancel a deferred notify.
+            auth_error_held = (agent_state == crate::state::AgentState::AuthError)
+                .then(|| core.state.since.elapsed());
             let silent = core.state.last_output.elapsed();
             // #1563: role policy gates the two `Starting`-context stall-forward
             // paths (branch-1 startup-stall, branch-2 startup-prose prompt) for
@@ -831,18 +895,57 @@ fn tick(
                             }
                         }
                         ReactionKind::MemberNotify => {
-                            maybe_notify_member_state_change(
-                                home,
-                                &name,
-                                intent.from,
-                                intent.to,
-                                &intent.pane_tail,
-                                notify_tracks,
-                            );
+                            // #1523: defer the AuthError member-notify — record it
+                            // pending; the stability gate below fires it only once
+                            // AuthError has been held past the FP self-heal window.
+                            // All other notify-error states keep firing on the edge.
+                            if intent.to == crate::state::AgentState::AuthError {
+                                pending_auth
+                                    .entry(name.clone())
+                                    .or_insert(PendingAuthError {
+                                        from: intent.from,
+                                        pane_tail: intent.pane_tail.clone(),
+                                    });
+                            } else {
+                                maybe_notify_member_state_change(
+                                    home,
+                                    &name,
+                                    intent.from,
+                                    intent.to,
+                                    &intent.pane_tail,
+                                    notify_tracks,
+                                );
+                            }
                         }
                     }
                 }
             }
+        }
+
+        // #1523: AuthError content-FP stability gate. AuthError flips cosmetically
+        // on transient PTY content and self-heals within ~31s (observed); an
+        // edge-triggered operator re-auth alert therefore false-fires. The edge
+        // above only RECORDS the pending notify; here it is confirmed (held past
+        // AUTH_ERROR_NOTIFY_STABILITY → fire once) or cancelled (state left
+        // AuthError → drop pending). Classification, retry, and timers are
+        // untouched — only the operator NOTIFICATION is gated.
+        match auth_error_gate(auth_error_held) {
+            AuthErrorGate::Fire => {
+                if let Some(p) = pending_auth.remove(&name) {
+                    maybe_notify_member_state_change(
+                        home,
+                        &name,
+                        p.from,
+                        crate::state::AgentState::AuthError,
+                        &p.pane_tail,
+                        notify_tracks,
+                    );
+                }
+            }
+            AuthErrorGate::Cancel => {
+                pending_auth.remove(&name);
+            }
+            AuthErrorGate::Wait => {}
         }
 
         match action {
@@ -1567,6 +1670,55 @@ instances:
     #[test]
     fn notify_cooldown_is_60_seconds() {
         assert_eq!(super::NOTIFY_COOLDOWN, std::time::Duration::from_secs(60));
+    }
+
+    // ── #1523: AuthError content-FP stability gate ──────────────────────
+
+    /// The stability window must exceed the observed self-heal time (~31s) by a
+    /// safe margin so a transient AuthError can never reach the alert.
+    #[test]
+    fn auth_error_notify_stability_exceeds_observed_self_heal() {
+        assert!(
+            super::AUTH_ERROR_NOTIFY_STABILITY >= std::time::Duration::from_secs(60),
+            "stability window must be well above the observed 31s self-heal"
+        );
+    }
+
+    /// Transient (self-healed): on a later tick the state is no longer AuthError
+    /// → `None` → Cancel → NO alert. This is the FP that #1523 fixes.
+    #[test]
+    fn auth_error_gate_cancels_when_state_left() {
+        assert_eq!(super::auth_error_gate(None), super::AuthErrorGate::Cancel);
+    }
+
+    /// Still in AuthError but inside the window (e.g. the 31s blip before it
+    /// heals) → Wait → no alert yet.
+    #[test]
+    fn auth_error_gate_waits_within_window() {
+        let held = super::AUTH_ERROR_NOTIFY_STABILITY - std::time::Duration::from_secs(1);
+        assert_eq!(
+            super::auth_error_gate(Some(held)),
+            super::AuthErrorGate::Wait
+        );
+        // The observed self-heal point (31s) is firmly in the Wait band.
+        assert_eq!(
+            super::auth_error_gate(Some(std::time::Duration::from_secs(31))),
+            super::AuthErrorGate::Wait
+        );
+    }
+
+    /// Sustained (real auth failure): held ≥ window → Fire → alert sent.
+    #[test]
+    fn auth_error_gate_fires_when_held_past_window() {
+        assert_eq!(
+            super::auth_error_gate(Some(super::AUTH_ERROR_NOTIFY_STABILITY)),
+            super::AuthErrorGate::Fire
+        );
+        let well_past = super::AUTH_ERROR_NOTIFY_STABILITY + std::time::Duration::from_secs(120);
+        assert_eq!(
+            super::auth_error_gate(Some(well_past)),
+            super::AuthErrorGate::Fire
+        );
     }
 
     /// D4: 2×2 invariant fixture — production-path-coupled.
