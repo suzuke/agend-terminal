@@ -134,18 +134,112 @@ pub fn registry_lock_exited() {
 #[inline(always)]
 pub fn registry_lock_exited() {}
 
+// ── #1535: per-agent core-lock depth tracking + CoreMutex ────────────────
+//
+// The #1492 guard above only tracks the REGISTRY lock. But the supervisor
+// per-agent loop holds the `AgentCore` mutex (the registry lock is already
+// released — handles are Arc-cloned out first) while some reactions self-IPC
+// (`api::call(INJECT)` → orchestrator). That core-held self-IPC ALSO deadlocks
+// — the loopback handler locks the registry AND the target agent's core — yet
+// was invisible to the registry-only guard (#1530 surfaced it; #1535 closes
+// it). [`CoreMutex`] makes EVERY core lock bump `CORE_LOCK_DEPTH` so the same
+// self-IPC assert covers the core-held case too.
+
+#[cfg(debug_assertions)]
+thread_local! {
+    /// How many `AgentCore` locks this thread currently holds (0 = none).
+    /// A single total-depth counter is sufficient: the rule is "no self-IPC
+    /// while holding ANY core lock", so per-agent identity is irrelevant.
+    static CORE_LOCK_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Record that this thread acquired a core lock. Debug-only; release no-op.
+#[cfg(debug_assertions)]
+fn core_lock_entered() {
+    CORE_LOCK_DEPTH.with(|c| c.set(c.get().saturating_add(1)));
+}
+#[cfg(not(debug_assertions))]
+#[inline(always)]
+fn core_lock_entered() {}
+
+/// Record that this thread released a core lock. Debug-only; release no-op.
+#[cfg(debug_assertions)]
+fn core_lock_exited() {
+    CORE_LOCK_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
+}
+#[cfg(not(debug_assertions))]
+#[inline(always)]
+fn core_lock_exited() {}
+
+/// #1535: a `parking_lot::Mutex` wrapper for the per-agent `AgentCore` that
+/// tracks lock depth via [`CORE_LOCK_DEPTH`]. `.lock()` is API-compatible with
+/// `parking_lot::Mutex::lock` (the returned [`CoreGuard`] `Deref`s to `T`), so
+/// the ~50 `.core.lock()` call sites are unchanged. The guard decrements the
+/// depth on drop. Release builds: the depth calls compile to no-ops, so this is
+/// a zero-overhead newtype.
+///
+/// This is the SOLE constructor for an `AgentCore` mutex — enforced by
+/// `tests/core_mutex_invariant.rs` so a future bare `Mutex<AgentCore>` cannot
+/// silently reintroduce the #1492 core-lock blind spot.
+pub struct CoreMutex<T> {
+    inner: parking_lot::Mutex<T>,
+}
+
+impl<T> CoreMutex<T> {
+    pub fn new(value: T) -> Self {
+        Self {
+            inner: parking_lot::Mutex::new(value),
+        }
+    }
+
+    /// Lock the core, bumping [`CORE_LOCK_DEPTH`] for the guard's lifetime.
+    pub fn lock(&self) -> CoreGuard<'_, T> {
+        let guard = self.inner.lock();
+        core_lock_entered();
+        CoreGuard { guard }
+    }
+}
+
+/// RAII guard from [`CoreMutex::lock`]; decrements [`CORE_LOCK_DEPTH`] on drop.
+pub struct CoreGuard<'a, T> {
+    guard: parking_lot::MutexGuard<'a, T>,
+}
+
+impl<T> std::ops::Deref for CoreGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.guard
+    }
+}
+
+impl<T> std::ops::DerefMut for CoreGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.guard
+    }
+}
+
+impl<T> Drop for CoreGuard<'_, T> {
+    fn drop(&mut self) {
+        core_lock_exited();
+    }
+}
+
 /// Panic (debug builds only) if a self-IPC vector is entered while this thread
-/// holds the registry lock — that ordering deadlocks the daemon (#1492). `ctx`
-/// names the vector for the panic message. Release builds: no-op, zero cost.
+/// holds the registry lock (#1492) OR any per-agent core lock (#1535) — either
+/// ordering deadlocks the daemon (the loopback API handler needs the registry
+/// lock and may lock the target agent's core). `ctx` names the vector. Release
+/// builds: no-op, zero cost.
 #[cfg(debug_assertions)]
 pub fn assert_no_registry_lock_for_self_ipc(ctx: &str) {
-    let depth = REGISTRY_LOCK_DEPTH.with(|c| c.get());
-    if depth > 0 {
+    let reg = REGISTRY_LOCK_DEPTH.with(|c| c.get());
+    let core = CORE_LOCK_DEPTH.with(|c| c.get());
+    if reg > 0 || core > 0 {
         panic!(
-            "#1492 lock-across-self-IPC deadlock risk: `{ctx}` was called while this thread holds \
-             the registry lock (depth={depth}). The loopback API handler needs the same lock, so \
-             this self-IPC would deadlock the daemon. Drop the registry guard BEFORE the call \
-             (see commit 6f1403d and docs/DAEMON-LOCK-ORDERING.md)."
+            "#1492/#1535 lock-across-self-IPC deadlock risk: `{ctx}` was called while this thread \
+             holds locks (registry depth={reg}, core depth={core}). The loopback API handler needs \
+             the registry lock and may lock the target agent's core, so this self-IPC would \
+             deadlock the daemon. Drop the guard(s) BEFORE the call (collect under lock → drop → \
+             emit; see #1530, commit 6f1403d, docs/DAEMON-LOCK-ORDERING.md)."
         );
     }
 }

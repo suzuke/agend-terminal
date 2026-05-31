@@ -1474,7 +1474,7 @@ mod tests {
         let reader = pair.master.try_clone_reader().expect("clone reader");
         let writer = pair.master.take_writer().expect("take writer");
         let pty_writer: crate::agent::PtyWriter = Arc::new(parking_lot::Mutex::new(writer));
-        let core = Arc::new(parking_lot::Mutex::new(crate::agent::AgentCore {
+        let core = Arc::new(crate::sync_audit::CoreMutex::new(crate::agent::AgentCore {
             vterm: crate::vterm::VTerm::with_pty_writer(80, 10, Arc::clone(&pty_writer)),
             subscribers: Vec::new(),
             state: crate::state::StateTracker::new(None),

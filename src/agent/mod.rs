@@ -6,6 +6,7 @@
 use crate::backend::Backend;
 use crate::health::HealthTracker;
 use crate::state::StateTracker;
+use crate::sync_audit::CoreMutex;
 use crate::vterm::VTerm;
 use parking_lot::Mutex;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
@@ -35,7 +36,7 @@ pub struct AgentHandle {
     pub(crate) backend_command: String,
     pub(crate) pty_writer: PtyWriter,
     pub(crate) pty_master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
-    pub(crate) core: Arc<Mutex<AgentCore>>,
+    pub(crate) core: Arc<CoreMutex<AgentCore>>,
     pub(crate) child: Arc<Mutex<Box<dyn portable_pty::Child + Send>>>,
     pub(crate) submit_key: String,
     pub(crate) inject_prefix: String,
@@ -959,7 +960,7 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
         .map_err(|e| anyhow::anyhow!("clone_reader: {e}"))?;
     let pty_master: Arc<Mutex<Box<dyn MasterPty + Send>>> = Arc::new(Mutex::new(pair.master));
 
-    let core = Arc::new(Mutex::new(AgentCore {
+    let core = Arc::new(CoreMutex::new(AgentCore {
         vterm: VTerm::with_pty_writer(*cols, *rows, Arc::clone(&pty_writer)),
         subscribers: Vec::new(),
         state: StateTracker::new(detected_backend.as_ref()),
@@ -1225,7 +1226,7 @@ struct PtyReadContext {
     /// uses it for all registry lookups; `name` is kept for name-keyed side
     /// channels (ipc port, heartbeat, event log, metadata, router, api).
     instance_id: crate::types::InstanceId,
-    core: Arc<Mutex<AgentCore>>,
+    core: Arc<CoreMutex<AgentCore>>,
     pty_writer: PtyWriter,
     registry: AgentRegistry,
     home: Option<std::path::PathBuf>,
