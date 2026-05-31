@@ -446,10 +446,29 @@ pub(crate) fn pending_for_instance(
     (as_dispatcher, as_target)
 }
 
+/// #1516: is `target` demonstrably working right now? True iff the fleet
+/// snapshot reports its `agent_state` as `thinking` or `tool_use` — the
+/// PTY-output-fed "actively generating / running a tool" signal (the same one
+/// `health.rs` treats as productive). Pure for testability. Unknown target /
+/// missing snapshot → `false` (don't suppress → fire as before; degrades to
+/// the pre-#1516 behavior, never worse).
+fn target_is_working(snapshot: Option<&crate::snapshot::FleetSnapshot>, target: &str) -> bool {
+    snapshot
+        .and_then(|s| s.agents.iter().find(|a| a.name == target))
+        .map(|a| matches!(a.agent_state.as_str(), "thinking" | "tool_use"))
+        .unwrap_or(false)
+}
+
 /// Per-tick scan: flip eligible pending entries to `exceeded` and emit
 /// the inbox event to the dispatcher. Exposed `pub(crate)` for tests.
 pub(crate) fn scan_and_emit(home: &Path) {
     let now = chrono::Utc::now();
+    // #1516: read the fleet snapshot ONCE (file-based: `<home>/snapshot.json`,
+    // rewritten ~every tick) so the working-state gate below adds NO registry
+    // lock and NO self-IPC-under-lock (#1492) risk. We deliberately read
+    // snapshot.json, NOT state-transitions.jsonl (the latter misses some
+    // transitions — see #1470-#4 — so it's an unreliable "current state").
+    let snapshot = crate::snapshot::load(home);
     for d in list_pending(home) {
         if d.status != "pending" {
             continue;
@@ -460,6 +479,23 @@ pub(crate) fn scan_and_emit(home: &Path) {
         };
         let elapsed_secs = now.signed_duration_since(issued).num_seconds();
         if elapsed_secs <= d.threshold_secs {
+            continue;
+        }
+
+        // #1516: the dispatch-idle threshold is for "agent went silent and
+        // never replied", but the idle timer only resets on a correlated
+        // report — so a slow-but-progressing impl agent (heads-down coding /
+        // generating, not sending updates) false-fired 5× the night this
+        // landed. If the target is demonstrably WORKING (Thinking/ToolUse per
+        // the snapshot), reset its clock and don't fire — it's making progress,
+        // not stuck. A genuinely wedged agent stops producing output, so its
+        // latched Thinking/ToolUse expires (LATCHED_STATE_EXPIRY, supervisor.rs)
+        // → state flips to Idle/Hang → this gate releases → the watchdog fires
+        // as designed. (The hang detector independently catches infinite-gen.)
+        if target_is_working(snapshot.as_ref(), &d.target) {
+            if let Some(corr) = d.correlation_id.as_deref() {
+                let _ = refresh_issued_at(home, corr);
+            }
             continue;
         }
 
@@ -1567,6 +1603,123 @@ mod tests {
             .find(|p| p.correlation_id.as_deref() == Some("t-1047-c"))
             .unwrap();
         assert_eq!(d.status, "resolved", "kind=report must set status=resolved");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #1516: agent_state gate (don't fire while target is working) ──
+
+    fn mk_agent_snapshot(name: &str, agent_state: &str) -> crate::snapshot::AgentSnapshot {
+        crate::snapshot::AgentSnapshot {
+            name: name.to_string(),
+            backend_command: "opencode".to_string(),
+            args: vec![],
+            working_dir: None,
+            submit_key: "\r".to_string(),
+            health_state: "healthy".to_string(),
+            agent_state: agent_state.to_string(),
+        }
+    }
+
+    #[test]
+    fn target_is_working_reads_snapshot_state_1516() {
+        let snap = crate::snapshot::FleetSnapshot {
+            timestamp: "t".to_string(),
+            agents: vec![
+                mk_agent_snapshot("worker", "thinking"),
+                mk_agent_snapshot("tooler", "tool_use"),
+                mk_agent_snapshot("idler", "idle"),
+            ],
+        };
+        assert!(
+            target_is_working(Some(&snap), "worker"),
+            "thinking → working"
+        );
+        assert!(
+            target_is_working(Some(&snap), "tooler"),
+            "tool_use → working"
+        );
+        assert!(
+            !target_is_working(Some(&snap), "idler"),
+            "idle → not working"
+        );
+        assert!(
+            !target_is_working(Some(&snap), "ghost"),
+            "absent → not working"
+        );
+        assert!(
+            !target_is_working(None, "worker"),
+            "no snapshot → not working"
+        );
+    }
+
+    /// Core #1516 regression: an overdue dispatch whose target is demonstrably
+    /// WORKING (Thinking/ToolUse) must NOT fire — the timer resets instead.
+    /// Pre-fix this false-fired (5× the night it landed).
+    #[test]
+    fn working_target_does_not_fire_1516() {
+        let home = tmp_home("gate-working");
+        let issued = chrono::Utc::now() - chrono::Duration::seconds(700);
+        let id = write_pending_at(&home, "lead", "worker", Some("t-w"), "task", 600, issued);
+        crate::snapshot::save(&home, &[mk_agent_snapshot("worker", "thinking")]);
+
+        scan_and_emit(&home);
+
+        assert!(
+            crate::inbox::drain(&home, "lead").is_empty(),
+            "a working (thinking) target must NOT trigger an idle nudge"
+        );
+        let p = list_pending(&home)
+            .into_iter()
+            .find(|p| p.dispatch_id == id)
+            .unwrap();
+        assert_eq!(
+            p.status, "pending",
+            "sidecar stays pending (clock refreshed)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Real-stuck still caught: an overdue dispatch whose target is Idle (not
+    /// working) with no report still fires (Q4 — the gate only suppresses
+    /// demonstrable progress).
+    #[test]
+    fn idle_target_still_fires_1516() {
+        let home = tmp_home("gate-idle");
+        let issued = chrono::Utc::now() - chrono::Duration::seconds(700);
+        let id = write_pending_at(&home, "lead", "worker", Some("t-i"), "task", 600, issued);
+        crate::snapshot::save(&home, &[mk_agent_snapshot("worker", "idle")]);
+
+        scan_and_emit(&home);
+
+        assert!(
+            crate::inbox::drain(&home, "lead")
+                .iter()
+                .any(|m| m.kind.as_deref() == Some("dispatch_idle_threshold_exceeded")),
+            "idle + overdue + no report must still fire"
+        );
+        let p = list_pending(&home)
+            .into_iter()
+            .find(|p| p.dispatch_id == id)
+            .unwrap();
+        assert_eq!(p.status, "exceeded");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Graceful degradation: no snapshot at all → fall back to firing (the
+    /// pre-#1516 behavior; the gate never makes things worse).
+    #[test]
+    fn no_snapshot_falls_back_to_firing_1516() {
+        let home = tmp_home("gate-nosnap");
+        let issued = chrono::Utc::now() - chrono::Duration::seconds(700);
+        write_pending_at(&home, "lead", "worker", Some("t-n"), "task", 600, issued);
+        // No snapshot.json written.
+        scan_and_emit(&home);
+        assert!(
+            crate::inbox::drain(&home, "lead")
+                .iter()
+                .any(|m| m.kind.as_deref() == Some("dispatch_idle_threshold_exceeded")),
+            "no snapshot → must fall back to firing (no worse than pre-#1516)"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }
