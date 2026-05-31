@@ -486,7 +486,15 @@ fn track_dispatch(
             );
         }
     } else if kind_str == "report" {
-        if let Some(corr) = msg.correlation_id.as_deref() {
+        // #1525: clear the dispatch-idle sidecar with the SAME key the record
+        // path uses — `correlation_id.or(task_id)` (see the kind=task branch
+        // above). `record_dispatch` keys the sidecar via that fallback, so a
+        // report that carries the id only in `task_id` (correlation_id empty)
+        // must match by task_id too; otherwise `mark_resolved`'s exact lookup
+        // silently no-ops and the completed dispatch's sidecar lingers until it
+        // fires a spurious `dispatch_idle_threshold_exceeded` nudge once the
+        // target goes Idle (#1516's working-state gate does not cover that).
+        if let Some(corr) = msg.correlation_id.as_deref().or(msg.task_id.as_deref()) {
             let _ = crate::daemon::dispatch_idle::mark_resolved(home, corr);
             if corr.starts_with("t-") {
                 let _ = crate::tasks::auto_close::auto_close_on_report(
@@ -1600,6 +1608,75 @@ mod tests {
         assert_eq!(
             entry.threshold_secs, 600,
             "L2 must inject the 600s fixup default"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn report_clears_sidecar_via_task_id_fallback_1525() {
+        // #1525 RED→GREEN: a kind=task dispatch keyed by task_id (no explicit
+        // correlation_id) seeds a sidecar via the `correlation_id.or(task_id)`
+        // record key. The dispatchee's kind=report carries the id in `task_id`
+        // (correlation_id empty) — the clear path must use the SAME fallback,
+        // else `mark_resolved`'s exact lookup never runs and the completed
+        // dispatch's sidecar stays `pending` → spurious nudge once Idle.
+        //
+        // REGRESSION-PROOF: revert the clear key to `msg.correlation_id` only →
+        // the report's correlation_id is None, mark_resolved is skipped, the
+        // sidecar stays `pending`, and the final assertion fails.
+        let home = tmp_home("report-clears-1525");
+        write_fixup_fleet(&home, &["fixup-lead", "fixup-reviewer"]);
+        let ctx = test_ctx(&home);
+
+        // Dispatch: lead → reviewer, kind=task, keyed by task_id only.
+        let dispatched = handle_send(
+            &json!({
+                "from": "fixup-lead",
+                "target": "fixup-reviewer",
+                "text": "[task] review the thing",
+                "kind": "task",
+                "task_id": "t-1525-x",
+            }),
+            &ctx,
+        );
+        assert_eq!(
+            dispatched["ok"], true,
+            "dispatch must succeed: {dispatched}"
+        );
+        let seeded = crate::daemon::dispatch_idle::list_pending(&home);
+        assert_eq!(
+            seeded
+                .iter()
+                .find(|p| p.correlation_id.as_deref() == Some("t-1525-x"))
+                .map(|p| p.status.as_str()),
+            Some("pending"),
+            "sidecar must seed pending, keyed by task_id"
+        );
+
+        // Verdict: reviewer → lead, kind=report, id ONLY in task_id (no correlation_id).
+        let reported = handle_send(
+            &json!({
+                "from": "fixup-reviewer",
+                "target": "fixup-lead",
+                "text": "VERIFIED",
+                "kind": "report",
+                "task_id": "t-1525-x",
+            }),
+            &ctx,
+        );
+        assert_eq!(reported["ok"], true, "report must deliver: {reported}");
+
+        // #1525: the sidecar must now be resolved (mark_resolved flips status,
+        // does not delete). Pre-fix it stayed `pending` → fired a nudge.
+        let after = crate::daemon::dispatch_idle::list_pending(&home);
+        assert_eq!(
+            after
+                .iter()
+                .find(|p| p.correlation_id.as_deref() == Some("t-1525-x"))
+                .map(|p| p.status.as_str()),
+            Some("resolved"),
+            "#1525: a report carrying the id in task_id must clear the sidecar \
+             via the correlation_id.or(task_id) symmetry"
         );
         std::fs::remove_dir_all(&home).ok();
     }
