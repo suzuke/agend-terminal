@@ -84,6 +84,39 @@ pub fn check_schedules(home: &Path, registry: &AgentRegistry) {
         };
         let Some(fire) = fire else { continue };
 
+        // #1521: UntilSuccess fire-strategy — suppress re-fires once the linked
+        // task is `done` for the current calendar day (schedule tz). The status
+        // read mirrors dispatch_idle's lock-free, fail-open pattern. (`missed`
+        // one-shots fall through to their normal missed-handling below.)
+        if sched.fire_strategy == crate::schedules::FireStrategy::UntilSuccess && !fire.missed {
+            let today = now_utc.with_timezone(&tz).format("%Y-%m-%d").to_string();
+            if sched.last_success_date.as_deref() == Some(today.as_str()) {
+                continue; // already succeeded today → suppress until tomorrow
+            }
+            match linked_task_gate(home, sched.linked_task_id.as_deref()) {
+                TaskGate::Done => {
+                    // First success today → stamp + suppress rest of day.
+                    crate::schedules::mark_success_today(home, sched.id.as_str(), &today);
+                    continue;
+                }
+                TaskGate::Missing => {
+                    // Broken link — don't nag forever; disable + audit (NOT a
+                    // silent degrade to Always).
+                    tracing::warn!(
+                        schedule = %sched.id,
+                        task = ?sched.linked_task_id,
+                        "#1521: until_success linked task missing — disabling schedule"
+                    );
+                    crate::schedules::record_run(home, sched.id.as_str(), "target_task_missing");
+                    crate::schedules::set_enabled(home, sched.id.as_str(), false);
+                    continue;
+                }
+                // Pending (task exists, not done) OR ReadError (transient/
+                // malformed → fail-open) → fall through and fire the reminder.
+                TaskGate::Pending | TaskGate::ReadError => {}
+            }
+        }
+
         let (sched_id, target) = (sched.id.as_str(), sched.target.as_str());
         let message = sched.message.as_str();
         let label = sched.label.as_deref().unwrap_or("(unnamed)");
@@ -171,6 +204,46 @@ pub fn check_schedules(home: &Path, registry: &AgentRegistry) {
 struct FireDecision {
     one_shot: bool,
     missed: bool,
+}
+
+/// #1521: the linked task's gate state for an `UntilSuccess` schedule.
+enum TaskGate {
+    /// Current status is `done` → suppress (and stamp the success day).
+    Done,
+    /// Task exists but isn't done → fire the reminder.
+    Pending,
+    /// No task file (deleted/never-existed) → disable the schedule.
+    Missing,
+    /// File present but unreadable / malformed status → fail-open (fire).
+    ReadError,
+}
+
+/// #1521: read a linked task's current status the same lock-free, fail-open way
+/// the dispatch-idle watchdog does (`tasks/{id}.json` direct read; the board
+/// writes per-task files). Current-status gate (not ever-done), so a reopened
+/// task resumes reminders. `NotFound` is `Missing` (a removed/typo'd link);
+/// any other I/O or parse error is `ReadError` → fail-open so a transient
+/// hiccup never silently drops the reminder.
+fn linked_task_gate(home: &Path, task_id: Option<&str>) -> TaskGate {
+    let Some(id) = task_id.filter(|s| !s.is_empty()) else {
+        // UntilSuccess is validated to have a task at create/update, so a
+        // None here means the link was lost — treat as Missing (disable).
+        return TaskGate::Missing;
+    };
+    let path = home.join("tasks").join(format!("{id}.json"));
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return TaskGate::Missing,
+        Err(_) => return TaskGate::ReadError,
+    };
+    match serde_json::from_str::<serde_json::Value>(&content) {
+        Ok(v) => match v.get("status").and_then(|s| s.as_str()) {
+            Some("done") => TaskGate::Done,
+            Some(_) => TaskGate::Pending,
+            None => TaskGate::ReadError,
+        },
+        Err(_) => TaskGate::ReadError,
+    }
 }
 
 /// Classify a `Once` trigger against the current window.
@@ -486,6 +559,159 @@ mod tests {
             "ok_inbox",
             "a known but offline target must still get an inbox enqueue"
         );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    // ── #1521: UntilSuccess fire-strategy ──
+
+    fn seed_task(home: &std::path::Path, id: &str, status: &str) {
+        let dir = home.join("tasks");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{id}.json")),
+            serde_json::json!({"id": id, "status": status}).to_string(),
+        )
+        .unwrap();
+    }
+
+    /// Seed an enabled `* * * * *` (always-due) cron schedule targeting a known
+    /// offline instance (so a fire lands as "ok_inbox"), with #1521 fields.
+    fn seed_until_success_cron(
+        home: &std::path::Path,
+        linked_task_id: &str,
+        last_success_date: Option<&str>,
+    ) {
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(home),
+            "instances:\n  offline:\n    backend: claude\n",
+        )
+        .unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut row = serde_json::json!({
+            "id": "s-1521", "message": "remind", "target": "offline",
+            // 6-field every-second cron → reliably due in any check window.
+            "trigger": {"kind": "cron", "expr": "* * * * * *"}, "enabled": true,
+            "timezone": "UTC", "label": "r",
+            "created_at": now, "updated_at": now, "run_history": [],
+            "fire_strategy": "until_success", "linked_task_id": linked_task_id,
+        });
+        if let Some(d) = last_success_date {
+            row["last_success_date"] = serde_json::json!(d);
+        }
+        let store = serde_json::json!({"schema_version": 2, "schedules": [row]});
+        std::fs::write(
+            home.join("schedules.json"),
+            serde_json::to_string_pretty(&store).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn today_utc() -> String {
+        chrono::Utc::now().format("%Y-%m-%d").to_string()
+    }
+
+    fn sched0(home: &std::path::Path) -> crate::schedules::Schedule {
+        crate::schedules::load(home)
+            .schedules
+            .into_iter()
+            .next()
+            .unwrap()
+    }
+
+    #[test]
+    fn until_success_done_suppresses_and_stamps() {
+        let home = cron_tmp_home("us-done");
+        seed_until_success_cron(&home, "t-done", None);
+        seed_task(&home, "t-done", "done");
+        check_schedules(&home, &empty_registry());
+        let s = sched0(&home);
+        assert!(s.run_history.is_empty(), "done task → no fire");
+        assert_eq!(
+            s.last_success_date.as_deref(),
+            Some(today_utc().as_str()),
+            "first success today must be stamped"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn until_success_pending_fires() {
+        let home = cron_tmp_home("us-pending");
+        seed_until_success_cron(&home, "t-open", None);
+        seed_task(&home, "t-open", "in_progress");
+        check_schedules(&home, &empty_registry());
+        assert_eq!(
+            last_status(&home),
+            "ok_inbox",
+            "unfinished task → fire reminder"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn until_success_missing_task_disables_schedule() {
+        let home = cron_tmp_home("us-missing");
+        seed_until_success_cron(&home, "t-gone", None); // no task file seeded
+        check_schedules(&home, &empty_registry());
+        let s = sched0(&home);
+        assert_eq!(last_status(&home), "target_task_missing");
+        assert!(!s.enabled, "missing linked task must disable the schedule");
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn until_success_already_succeeded_today_suppresses_without_reading_task() {
+        let home = cron_tmp_home("us-today");
+        // last_success_date == today + NO task file: must still suppress (the
+        // same-day short-circuit fires before any task read).
+        seed_until_success_cron(&home, "t-x", Some(&today_utc()));
+        check_schedules(&home, &empty_registry());
+        assert!(
+            sched0(&home).run_history.is_empty(),
+            "already-succeeded-today → suppress"
+        );
+        assert!(
+            sched0(&home).enabled,
+            "must not disable on the same-day short-circuit"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn until_success_cross_day_refires_and_reopen_resumes() {
+        let home = cron_tmp_home("us-crossday");
+        // Succeeded yesterday; today the task is reopened (in_progress) → fire.
+        seed_until_success_cron(&home, "t-reopen", Some("2020-01-01"));
+        seed_task(&home, "t-reopen", "in_progress");
+        check_schedules(&home, &empty_registry());
+        assert_eq!(
+            last_status(&home),
+            "ok_inbox",
+            "stale (yesterday) success must not suppress today; reopened task re-fires"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn linked_task_gate_classifies_status() {
+        let home = cron_tmp_home("gate");
+        seed_task(&home, "d", "done");
+        seed_task(&home, "p", "open");
+        std::fs::write(home.join("tasks").join("bad.json"), "{not json").unwrap();
+        assert!(matches!(linked_task_gate(&home, Some("d")), TaskGate::Done));
+        assert!(matches!(
+            linked_task_gate(&home, Some("p")),
+            TaskGate::Pending
+        ));
+        assert!(matches!(
+            linked_task_gate(&home, Some("nope")),
+            TaskGate::Missing
+        ));
+        assert!(matches!(
+            linked_task_gate(&home, Some("bad")),
+            TaskGate::ReadError
+        ));
+        assert!(matches!(linked_task_gate(&home, None), TaskGate::Missing));
         std::fs::remove_dir_all(home).ok();
     }
 }
