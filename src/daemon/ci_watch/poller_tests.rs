@@ -690,6 +690,7 @@ fn test_inbox_body_failure_has_detail_and_url() {
         Some("Check / Clippy"),
         "https://github.com/o/r/actions/runs/123",
         Some(123),
+        None,
     );
     assert!(
         body.contains("Detail: Check / Clippy"),
@@ -706,6 +707,7 @@ fn test_inbox_body_failure_has_checklist() {
         Some("Tests"),
         "https://github.com/o/r/actions/runs/789",
         Some(789),
+        None,
     );
     assert!(
         body.contains("CI failure checklist"),
@@ -733,6 +735,7 @@ fn test_inbox_body_success_has_url_no_detail() {
         None,
         "https://github.com/o/r/actions/runs/456",
         Some(456),
+        None,
     );
     assert!(
         body.contains("URL: https://"),
@@ -5331,4 +5334,124 @@ fn no_early_fail_when_all_jobs_passing() {
         "#1326: no early-fail dedup flag when no jobs failed"
     );
     std::fs::remove_dir_all(&dir).ok();
+}
+
+// ── CI-fail-notify: log-tail inject + failed-set fingerprint dedup ──
+
+#[test]
+fn failure_fingerprint_order_independent_and_strips_attempt() {
+    // Same set in different order → same fingerprint (sorted).
+    assert_eq!(
+        failure_fingerprint(&["Check (ubuntu)".into(), "Coverage".into()]),
+        failure_fingerprint(&["Coverage".into(), "Check (ubuntu)".into()]),
+        "fingerprint must be order-independent"
+    );
+    // A same-set RERUN appends ` (Attempt N)` — must hash identically (no
+    // spurious re-notify on a plain rerun of the same checks).
+    assert_eq!(
+        failure_fingerprint(&["Check (ubuntu)".into(), "Coverage".into()]),
+        failure_fingerprint(&[
+            "Check (ubuntu) (Attempt 2)".into(),
+            "Coverage (Retry 3)".into(),
+        ]),
+        "attempt/retry suffix must be stripped before hashing"
+    );
+}
+
+#[test]
+fn failure_fingerprint_changes_on_set_change() {
+    let a = failure_fingerprint(&["Check (ubuntu)".into(), "Coverage".into()]);
+    let b = failure_fingerprint(&["Check (ubuntu)".into()]); // a check stopped failing
+    let c = failure_fingerprint(&["Check (ubuntu)".into(), "audit".into()]); // a different check failed
+    assert_ne!(a, b, "dropping a failing check must change the fingerprint");
+    assert_ne!(
+        a, c,
+        "a different failing check must change the fingerprint"
+    );
+    // Dedup policy: same set → suppress (equal fp), changed set → re-notify (≠ fp).
+    let prev = Some(a.clone());
+    assert_eq!(prev.as_deref(), Some(a.as_str()), "same set → suppress");
+    assert_ne!(prev.as_deref(), Some(c.as_str()), "changed set → re-notify");
+}
+
+#[test]
+fn format_log_tail_caps_lines_and_bytes() {
+    // Line cap: 500 lines → tail of 120, with a truncation footer.
+    let many: String = (0..500).map(|i| format!("line {i}\n")).collect();
+    let out = format_log_tail(&many, 120, 8192, 42);
+    assert!(
+        out.lines().count() <= 121,
+        "line cap (+footer): {}",
+        out.lines().count()
+    );
+    assert!(
+        out.contains("line 499"),
+        "must keep the LAST lines (recent error)"
+    );
+    assert!(!out.contains("line 0"), "oldest lines dropped");
+    assert!(out.contains("truncated"), "must footer when truncated");
+    assert!(
+        out.contains("gh run view 42 --log-failed"),
+        "footer keeps full-log cmd"
+    );
+
+    // Byte cap: one huge line over budget → front-truncated, UTF-8-safe.
+    let huge = format!("{}TAIL", "x".repeat(20_000));
+    let out2 = format_log_tail(&huge, 120, 8192, 7);
+    assert!(
+        out2.len() <= 8192 + 120,
+        "byte cap respected (+footer): {}",
+        out2.len()
+    );
+    assert!(
+        out2.contains("TAIL"),
+        "front-truncate keeps the END (recent output)"
+    );
+
+    // No truncation when under both caps → no footer.
+    let small = "short log\nsecond line";
+    let out3 = format_log_tail(small, 120, 8192, 1);
+    assert_eq!(out3, small, "under caps → verbatim, no footer");
+}
+
+#[test]
+fn build_inbox_body_embeds_log_tail_when_present() {
+    let with_tail = build_inbox_body(
+        "[ci-fail] o/r@main: failure",
+        "failure",
+        Some("Check / Tests"),
+        "https://x/runs/9",
+        Some(9),
+        Some("thread 'tests' panicked at assert_eq failed"),
+    );
+    assert!(
+        with_tail.contains("failed log (tail)"),
+        "must embed tail section"
+    );
+    assert!(
+        with_tail.contains("panicked at assert_eq"),
+        "must contain the tail content"
+    );
+    assert!(
+        with_tail.contains("gh run view 9 --log-failed"),
+        "full-log cmd stays as footer"
+    );
+
+    // None → falls back to the instruction-only body (no tail section).
+    let no_tail = build_inbox_body(
+        "[ci-fail] o/r@main: failure",
+        "failure",
+        Some("Check / Tests"),
+        "https://x/runs/9",
+        Some(9),
+        None,
+    );
+    assert!(
+        !no_tail.contains("failed log (tail)"),
+        "no tail section when None"
+    );
+    assert!(
+        no_tail.contains("CI failure checklist"),
+        "checklist still present"
+    );
 }

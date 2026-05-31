@@ -251,6 +251,21 @@ pub trait CiProvider: Send + Sync {
         Vec::new()
     }
 
+    /// CI-fail-notify: fetch the tail of the failed-job logs (~`max_lines`) so
+    /// the daemon can inject the actual error inline instead of telling the
+    /// agent to run `gh run view --log-failed` itself. Default `None` → callers
+    /// fall back to the instruction-only body (so mocks / non-GitHub providers
+    /// are unaffected). MUST stay async — the GitHub impl shells out via
+    /// `tokio::process` and never blocks the shared ci runtime (#1476).
+    async fn fetch_failure_log_tail(
+        &self,
+        _repo: &str,
+        _run_id: u64,
+        _max_lines: usize,
+    ) -> Option<String> {
+        None
+    }
+
     /// Optional token/auth warning shown in the `watch_ci` MCP response.
     /// Currently called via `github_token_warning_from_env()` in the handler;
     /// future providers will use this method directly.
@@ -552,6 +567,49 @@ impl CiProvider for GitHubCiProvider {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    async fn fetch_failure_log_tail(
+        &self,
+        repo: &str,
+        run_id: u64,
+        max_lines: usize,
+    ) -> Option<String> {
+        // `gh run view <id> --log-failed -R <repo>` flattens the failed-job logs
+        // to text. Run the (blocking) CLI on the blocking pool so the async ci
+        // runtime stays free — and so we NEVER `block_on` the shared ci runtime
+        // (#1476: that would panic "cannot start a runtime from within a
+        // runtime"). Bounded by a timeout so a wedged `gh` can't stall the poll.
+        let repo = repo.to_string();
+        let run = tokio::task::spawn_blocking(move || {
+            std::process::Command::new("gh")
+                .args([
+                    "run",
+                    "view",
+                    &run_id.to_string(),
+                    "--log-failed",
+                    "-R",
+                    &repo,
+                ])
+                .output()
+        });
+        let out = tokio::time::timeout(std::time::Duration::from_secs(20), run)
+            .await
+            .ok()? // timeout
+            .ok()? // JoinError
+            .ok()?; // spawn/exec error
+        if !out.status.success() {
+            return None;
+        }
+        let raw = String::from_utf8_lossy(&out.stdout);
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        // 8 KiB byte cap alongside the line cap (defends against one huge line).
+        Some(super::poller::format_log_tail(
+            trimmed, max_lines, 8192, run_id,
+        ))
     }
 
     fn token_warning(&self) -> Option<&'static str> {

@@ -50,6 +50,13 @@ pub struct WatchState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub early_fail_notified_sha: Option<String>,
 
+    // CI-fail-notify: fingerprint of the last-notified failing-check SET, so a
+    // re-notify fires only when the set of failing checks CHANGES (not on every
+    // poll of the same failure, nor on a same-set rerun). Finer than the
+    // conclusion-level `last_notified_conclusion` guard.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_set_fingerprint: Option<String>,
+
     // TTL
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
