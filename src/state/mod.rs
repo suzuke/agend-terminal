@@ -177,6 +177,15 @@ pub struct StateTracker {
     /// depth class as #1005 ToolUse oscillation guard. Cleared on
     /// non-matching feed so a genuine future Productive signal re-fires.
     last_productive_marker_hash: Option<u64>,
+    /// #1450: hash of the last emitted anchor-suppress WARN's
+    /// (state, matched, line_context). The HIGH_FP red-anchor gate is
+    /// level-triggered — it re-evaluates on every `feed()`, so a backend that
+    /// statically displays a phrase matching a HIGH_FP pattern but never renders
+    /// red (e.g. an opencode pane showing the source identifier
+    /// `"ContextOverflow")`) re-logged the suppression on every tick, flooding
+    /// the daemon log (14k+ identical lines/incident). Dedup on this hash so the
+    /// WARN fires once per distinct suppression, not once per render.
+    last_anchor_suppress_hash: Option<u64>,
     /// Hash of the last screen text fed to `feed()`. `None` before the first
     /// call. Used to skip re-detection when the screen hasn't changed —
     /// crucial for not resetting `last_output` on cursor-blink noise.
@@ -448,6 +457,7 @@ impl StateTracker {
             last_output: Instant::now(),
             last_productive_output: Instant::now(),
             last_productive_marker_hash: None,
+            last_anchor_suppress_hash: None,
             last_screen_hash: None,
             patterns: backend.map(StatePatterns::for_backend),
             interactive_prompt_pending_notice: false,
@@ -777,17 +787,28 @@ impl StateTracker {
     /// the predicate) from "genuinely not red" (correct suppression)
     /// straight from the logs — no DEBUG rebuild.
     fn log_anchor_suppress(
-        &self,
+        &mut self,
         detected: AgentState,
         matched: &str,
         screen_text: &str,
         fg: &[CellFg],
     ) {
-        let span_fg: Vec<CellFg> = first_occurrence_span(screen_text, matched, fg);
         let line_context = screen_text
             .lines()
             .find(|l| l.contains(matched))
             .unwrap_or(matched);
+        // #1450: dedup. The gate is level-triggered (re-runs every feed), so a
+        // static on-screen phrase that never renders red would otherwise re-log
+        // this WARN on every tick. Emit only when the suppressed
+        // (state, matched, line) tuple differs from the last one logged.
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        format!("{detected:?}\u{1}{matched}\u{1}{line_context}").hash(&mut hasher);
+        let suppress_hash = hasher.finish();
+        if self.last_anchor_suppress_hash == Some(suppress_hash) {
+            return;
+        }
+        self.last_anchor_suppress_hash = Some(suppress_hash);
+        let span_fg: Vec<CellFg> = first_occurrence_span(screen_text, matched, fg);
         tracing::warn!(
             agent = %self.instance_name,
             backend = %self.backend_name,

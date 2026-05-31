@@ -5,6 +5,7 @@
 //! registry and loopback-binding rules.
 
 use crate::agent::{self, AgentRegistry, ExternalRegistry};
+use anyhow::Context;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -681,6 +682,20 @@ pub fn call(home: &Path, request: &Value) -> anyhow::Result<Value> {
     // fails loudly; release builds compile this to a no-op.
     crate::sync_audit::assert_no_registry_lock_for_self_ipc("api::call");
     let stream = crate::ipc::connect_api(home)?;
+    // #1492 backstop: bound every loopback read with a socket-level timeout.
+    // `assert_no_registry_lock_for_self_ipc` only panics in debug builds — in
+    // release it is a no-op, so a self-IPC made while holding the registry/core
+    // lock deadlocks the daemon AND froze the whole TUI permanently, because the
+    // handshake/response `read_line` below had no timeout and blocked forever in
+    // `recvfrom` while still holding the lock. The timeout converts that
+    // permanent freeze into a recoverable error: the read fails, this call
+    // unwinds, the offending lock guard drops, and the waiting threads proceed.
+    // Generous default (covers the slowest legit method, create_instance ~60s);
+    // `AGEND_API_CALL_TIMEOUT_SECS` lets an operator shrink the recovery window.
+    let timeout = api_call_read_timeout();
+    stream
+        .set_read_timeout(Some(timeout))
+        .context("set api::call read timeout")?;
     let run = crate::daemon::find_active_run_dir(home)
         .ok_or_else(|| anyhow::anyhow!("no active daemon (run dir not found)"))?;
     let cookie = crate::auth_cookie::read_cookie(&run)?;
@@ -693,9 +708,41 @@ pub fn call(home: &Path, request: &Value) -> anyhow::Result<Value> {
     writer.flush()?;
 
     let mut line = String::new();
-    reader.read_line(&mut line)?;
+    if let Err(e) = reader.read_line(&mut line) {
+        if matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ) {
+            let method = request["method"].as_str().unwrap_or("<unknown>");
+            tracing::warn!(
+                method,
+                ?timeout,
+                "#1492: api::call read timed out — the loopback handler did not respond \
+                 in time. This is the self-IPC-deadlock backstop firing; the most likely \
+                 cause is a caller that invoked api::call while holding the registry/core \
+                 lock (drop the guard BEFORE the call — see docs/DAEMON-LOCK-ORDERING.md)."
+            );
+            anyhow::bail!("api::call ({method}) timed out after {timeout:?}");
+        }
+        return Err(e).context("api::call read response");
+    }
     let resp: Value = serde_json::from_str(line.trim())?;
     Ok(resp)
+}
+
+/// Read-response timeout for [`call`]. Defaults to 90s — comfortably above the
+/// slowest legitimate daemon method (`create_instance`, whose own budget is
+/// ~60s) so a genuine slow call never trips the backstop, while still bounding a
+/// wedged self-IPC instead of blocking forever. Overridable via
+/// `AGEND_API_CALL_TIMEOUT_SECS` to shrink the deadlock-recovery window (values
+/// <1 are clamped to 1s).
+fn api_call_read_timeout() -> std::time::Duration {
+    let secs = std::env::var("AGEND_API_CALL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|v| v.max(1))
+        .unwrap_or(90);
+    std::time::Duration::from_secs(secs)
 }
 
 #[cfg(test)]
@@ -813,6 +860,27 @@ mod tests {
             "unexpected error: {msg}"
         );
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn api_call_read_timeout_default_override_and_clamp() {
+        // #1492 backstop: the loopback read timeout that converts a wedged
+        // self-IPC from a permanent daemon freeze into a recoverable error.
+        std::env::remove_var("AGEND_API_CALL_TIMEOUT_SECS");
+        assert_eq!(
+            api_call_read_timeout(),
+            std::time::Duration::from_secs(90),
+            "default must exceed the slowest legit method (create_instance ~60s)"
+        );
+        std::env::set_var("AGEND_API_CALL_TIMEOUT_SECS", "5");
+        assert_eq!(api_call_read_timeout(), std::time::Duration::from_secs(5));
+        std::env::set_var("AGEND_API_CALL_TIMEOUT_SECS", "0");
+        assert_eq!(
+            api_call_read_timeout(),
+            std::time::Duration::from_secs(1),
+            "sub-1s values clamp to 1s — never a zero/instant timeout"
+        );
+        std::env::remove_var("AGEND_API_CALL_TIMEOUT_SECS");
     }
 
     // -----------------------------------------------------------------------

@@ -3370,3 +3370,40 @@ fn claude_permission_footer_anchor_1546() {
         );
     }
 }
+
+/// #1450 regression: a HIGH_FP pattern that matches but never renders red —
+/// e.g. an opencode pane statically displaying the source identifier
+/// `ContextOverflow` — must log the red-anchor suppression ONCE, not on every
+/// render tick. The gate is level-triggered (`feed_with_fg` re-runs detection
+/// each tick), so before the dedup this flooded the daemon log with 14k+
+/// identical WARN lines per incident — the symptom that buried the real signal
+/// during a freeze investigation. A changing line elsewhere on screen (which
+/// defeats `feed()`'s screen-hash dedup) must NOT re-open the floodgate, since
+/// the suppressed (state, matched, line) tuple is unchanged.
+#[test]
+#[tracing_test::traced_test]
+fn anchor_suppress_warn_deduped_across_ticks() {
+    let mut vt = VTerm::new(80, 24);
+    let mut st = StateTracker::new(Some(&Backend::OpenCode));
+    // Five renders: each scrolls a fresh counter line (new screen hash → passes
+    // feed()'s screen-hash dedup) while the non-red `ContextOverflow` line stays
+    // in the live tail, so the HIGH_FP match + red-anchor-fail fires every tick.
+    for i in 0..5 {
+        drive(
+            &mut vt,
+            &mut st,
+            format!("working tick {i}\r\nContextOverflow\r\n").as_bytes(),
+        );
+    }
+    logs_assert(|lines: &[&str]| {
+        let hits = lines.iter().filter(|l| l.contains("#1450")).count();
+        if hits == 1 {
+            Ok(())
+        } else {
+            Err(format!(
+                "#1450 red-anchor suppress WARN must be deduped to exactly one \
+                 across 5 identical-suppression ticks, got {hits}"
+            ))
+        }
+    });
+}
