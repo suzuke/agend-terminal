@@ -393,6 +393,154 @@ fn first_occurrence_span(screen_text: &str, matched: &str, fg: &[CellFg]) -> Vec
         .unwrap_or_default()
 }
 
+/// #1562 self-capture instrument.
+///
+/// Distinctive, **low-FP** server-throttle / transient-error phrases drawn from
+/// the `ServerRateLimit` pattern set (`patterns.rs`). Used by the diagnostic
+/// side-log to detect "a known throttle phrase is on screen but the classifier
+/// did NOT land on a retryable state" — the exact in-the-wild miss #1562 is
+/// chasing. Deliberately a SUBSET of the regex alternations: only multi-word,
+/// prose-unlikely phrases are listed (bare `overloaded` / `429` / `api_error`
+/// are omitted because they're the HIGH_FP tokens that fire on dialectic prose,
+/// which would make this instrument noisy). Cheap `str::contains` only.
+const THROTTLE_DIAG_PHRASES: &[&str] = &[
+    "temporarily limiting requests",
+    "Overloaded errors",
+    "overloaded_error",
+    "Rate limited. Quick retry",
+    "rate_limit_error",
+    "API rate limited",
+    "API Error: 5",
+    "API Error: Request rejected (429)",
+    "hit a rate limit",
+];
+
+/// #1562: rows of the live tail captured into the diagnostic record. Matches
+/// the `ERROR_TAIL_SCAN_LINES` horizon so the captured context lines up with
+/// the bottom-N window the error gates actually look at.
+const UNCLASSIFIED_TAIL_LINES: usize = ERROR_TAIL_SCAN_LINES;
+
+/// #1562: states for which a server-throttle phrase IS the expected
+/// classification (the auto-retry path already handles them). When the
+/// classifier lands on one of these, the throttle phrase is correctly
+/// recognized → nothing to diagnose → no side-log (keeps the instrument
+/// low-noise). Anything else + a throttle phrase = the miss we want captured.
+fn is_throttle_retryable_state(state: AgentState) -> bool {
+    matches!(
+        state,
+        AgentState::ServerRateLimit
+            | AgentState::RateLimit
+            | AgentState::ApiError
+            | AgentState::ContextFull
+    )
+}
+
+/// #1562: a minimal SGR escape for a rendered [`CellFg`]. Reconstructs enough
+/// ANSI to make the captured tail re-renderable in a terminal so an operator
+/// can SEE whether the throttle line was red — the color-anchor hypothesis is
+/// the whole point of #1562's capture. Exact non-red hues are lossy (the vterm
+/// classifier collapses all reds into `CellFg::Red`), but the red/not-red
+/// signal — the only thing the anchor predicate keys on — is preserved exactly.
+fn sgr_for(c: CellFg) -> &'static str {
+    match c {
+        CellFg::Red => "\x1b[31m",
+        CellFg::Default | CellFg::Named => "\x1b[39m",
+        // Indexed / Rgb are non-red (the classifier already mapped reds to
+        // `Red`); a generic "other color" marker is enough for the diagnostic.
+        CellFg::Indexed(_) | CellFg::Rgb(_, _, _) => "\x1b[39m",
+    }
+}
+
+/// #1562: reconstruct the last `n` lines of `screen_text` WITH ANSI color, using
+/// the per-cell `fg` mask (aligned 1:1 with `screen_text.chars()`, see
+/// `char_span`). The result is a colored, re-renderable tail for the side-log.
+/// When `fg` is empty (text-only callers) every cell maps to Default → the tail
+/// is captured without color, which is correct (no color was supplied).
+fn ansi_colored_tail(screen_text: &str, fg: &[CellFg], n: usize) -> String {
+    // Pair each char with its rendered fg, splitting on newlines (the '\n'
+    // itself carries no cell).
+    let mut lines: Vec<Vec<(char, CellFg)>> = vec![Vec::new()];
+    for (i, ch) in screen_text.chars().enumerate() {
+        if ch == '\n' {
+            lines.push(Vec::new());
+        } else {
+            let color = fg.get(i).copied().unwrap_or(CellFg::Default);
+            lines
+                .last_mut()
+                .expect("non-empty by construction")
+                .push((ch, color));
+        }
+    }
+    let start = lines.len().saturating_sub(n);
+    let mut out = String::new();
+    for line in &lines[start..] {
+        let mut cur: Option<CellFg> = None;
+        for &(ch, color) in line {
+            if cur != Some(color) {
+                out.push_str(sgr_for(color));
+                cur = Some(color);
+            }
+            out.push(ch);
+        }
+        out.push_str("\x1b[0m");
+        out.push('\n');
+    }
+    out
+}
+
+/// #1562: the pure decision behind the self-capture instrument — no IO, no env.
+///
+/// Returns `Some(raw_tail)` (ANSI-colored, last [`UNCLASSIFIED_TAIL_LINES`]
+/// rows) iff ALL hold:
+/// 1. a known throttle phrase ([`THROTTLE_DIAG_PHRASES`]) is on screen,
+/// 2. `current` is NOT a retryable throttle state
+///    ([`is_throttle_retryable_state`]) — i.e. the classifier MISSED it, and
+/// 3. the phrase is in the LIVE bottom-N tail (not just scrolled-up scrollback).
+///
+/// `None` otherwise. The order is chosen so the common no-phrase case
+/// fast-rejects on a single allocation-free `str::contains` scan.
+fn unclassified_throttle_tail(
+    current: AgentState,
+    screen_text: &str,
+    fg: &[CellFg],
+) -> Option<String> {
+    // Fast reject (no allocation): no known throttle phrase anywhere.
+    let phrase = THROTTLE_DIAG_PHRASES
+        .iter()
+        .copied()
+        .find(|p| screen_text.contains(p))?;
+    // Classifier landed on a retryable state → throttle phrase was correctly
+    // recognized (auto-retry handles it). Nothing to diagnose → no noise.
+    if is_throttle_retryable_state(current) {
+        return None;
+    }
+    // Require the phrase in the LIVE bottom-N tail — a copy that only survives
+    // in scrolled-up scrollback is stale, not a current miss.
+    let tail = recent_screen_tail(screen_text.trim_end(), UNCLASSIFIED_TAIL_LINES);
+    if !tail.contains(phrase) {
+        return None;
+    }
+    Some(ansi_colored_tail(screen_text, fg, UNCLASSIFIED_TAIL_LINES))
+}
+
+/// #1562: best-effort append of one JSON record as a single `line\n` to `path`,
+/// creating parent dirs / the file as needed. Returns `Err` for the caller to
+/// log; never panics. The single small `write_all` relies on `O_APPEND`
+/// atomicity so concurrent appenders don't interleave within a record.
+fn append_jsonl(path: &std::path::Path, record: &serde_json::Value) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut line = serde_json::to_string(record).map_err(std::io::Error::other)?;
+    line.push('\n');
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    f.write_all(line.as_bytes())
+}
+
 impl StateTracker {
     /// Max time a self-expiring active state (Thinking / ToolUse) may stay
     /// latched when the screen keeps updating but no pattern matches on it.
@@ -679,6 +827,13 @@ impl StateTracker {
             }
         }
 
+        // #1562 self-capture instrument: pure-additive diagnostic. If a known
+        // server-throttle phrase is on screen but the classifier did NOT land
+        // on a retryable state, side-log the colored tail so the in-the-wild
+        // miss can be diagnosed. Zero behavior change (runs AFTER classify,
+        // never touches `self.current`/retry).
+        self.capture_unclassified_throttle(screen_text, fg);
+
         // Sprint 27 shadow-mode: log behavioral signal alongside regex state.
         // Zero state change — telemetry only. Phase 2 (Sprint 28+) promotes
         // behavioral to tiebreaker/primary.
@@ -819,6 +974,46 @@ impl StateTracker {
             "#1450: HIGH_FP pattern matched but rendered fg not red — suppressing transition. \
              If this was a real backend error, span_fg shows the actual colors (predicate may be too strict)."
         );
+    }
+
+    /// #1562 self-capture instrument — a pure-additive diagnostic side-log.
+    ///
+    /// When a known server-throttle / transient-error phrase
+    /// ([`THROTTLE_DIAG_PHRASES`]) is visible in the live tail but the
+    /// classifier did NOT land on a retryable state
+    /// ([`is_throttle_retryable_state`]), append one JSONL record to
+    /// `<agend-home>/unclassified_errors.jsonl`:
+    /// `{ts, backend, classified_state, raw_tail}`, where `raw_tail` carries
+    /// ANSI color (reconstructed from `fg`) so the color-anchor hypothesis
+    /// (#1562: did the throttle line render red?) can be checked from the log.
+    ///
+    /// Invariants:
+    /// - **Zero behavior change** — runs after classify, never touches
+    ///   `self.current`, retry, or any timer; failures are swallowed.
+    /// - **Cheap** — fast-rejects on a `str::contains` scan (no allocation) when
+    ///   no throttle phrase is present, which is the overwhelming common case.
+    /// - **Low-noise** — fires only on phrase-present + classified-non-retryable
+    ///   + phrase-in-live-tail (a scrolled-up scrollback echo is ignored).
+    fn capture_unclassified_throttle(&self, screen_text: &str, fg: &[CellFg]) {
+        let Some(raw_tail) = unclassified_throttle_tail(self.current, screen_text, fg) else {
+            return;
+        };
+        let record = serde_json::json!({
+            "ts": chrono::Utc::now().to_rfc3339(),
+            "backend": self.backend_name,
+            "classified_state": self.current.display_name(),
+            "raw_tail": raw_tail,
+        });
+        let path = crate::home_dir().join("unclassified_errors.jsonl");
+        if let Err(e) = append_jsonl(&path, &record) {
+            // Diagnostic must never affect behavior — log and move on.
+            tracing::debug!(
+                target: "state_detection",
+                agent = %self.instance_name,
+                error = %e,
+                "#1562: failed to append unclassified-throttle diagnostic"
+            );
+        }
     }
 
     /// Fallback when the screen changed but no pattern matched.

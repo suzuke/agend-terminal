@@ -3407,3 +3407,118 @@ fn anchor_suppress_warn_deduped_across_ticks() {
         }
     });
 }
+
+// ── #1562 self-capture instrument ───────────────────────────────────
+//
+// Pure-additive diagnostic: when a known server-throttle phrase is on
+// screen but the classifier did NOT land on a retryable state, side-log
+// the (ANSI-colored) tail. These pin the three behaviors the lead spec
+// names — phrase + non-retryable → logged; classified ServerRateLimit →
+// skipped (no noise); no phrase → skipped — plus the scrollback gate and
+// the color reconstruction (the color-anchor diagnostic point).
+
+const THROTTLE_SCREEN: &str = "\
+some preamble line\n\
+Server is temporarily limiting requests (not your usage limit)\n\
+the agent kept going after the throttle\n";
+
+#[test]
+fn unclassified_throttle_logged_on_phrase_plus_nonretryable_state() {
+    // Throttle phrase present, classifier landed on Ready (the in-the-wild
+    // miss — e.g. anchor suppressed it / wording drifted) → capture.
+    let tail = unclassified_throttle_tail(AgentState::Ready, THROTTLE_SCREEN, &[]);
+    let tail = tail.expect("throttle phrase + non-retryable state must be captured");
+    assert!(
+        tail.contains("temporarily limiting requests"),
+        "captured tail must carry the throttle line, got: {tail:?}"
+    );
+}
+
+#[test]
+fn unclassified_throttle_skipped_when_classified_serverratelimit() {
+    // Classifier correctly recognized the throttle (auto-retry handles it)
+    // → nothing to diagnose → no side-log (keeps the instrument low-noise).
+    for state in [
+        AgentState::ServerRateLimit,
+        AgentState::RateLimit,
+        AgentState::ApiError,
+        AgentState::ContextFull,
+    ] {
+        assert!(
+            unclassified_throttle_tail(state, THROTTLE_SCREEN, &[]).is_none(),
+            "classified retryable state {state:?} must NOT be side-logged"
+        );
+    }
+}
+
+#[test]
+fn unclassified_throttle_skipped_without_phrase() {
+    // No known throttle phrase on screen → never logged, regardless of state.
+    let screen = "claude ready\n❯ awaiting input\n";
+    assert!(unclassified_throttle_tail(AgentState::Ready, screen, &[]).is_none());
+    assert!(unclassified_throttle_tail(AgentState::Thinking, screen, &[]).is_none());
+}
+
+#[test]
+fn unclassified_throttle_skipped_when_phrase_only_in_scrollback() {
+    // Throttle phrase scrolled up past the live bottom-N tail (the agent has
+    // moved on) → stale, not a current miss → not logged.
+    let mut screen =
+        String::from("Server is temporarily limiting requests (not your usage limit)\n");
+    for i in 0..(UNCLASSIFIED_TAIL_LINES + 5) {
+        screen.push_str(&format!("post-recovery output line {i}\n"));
+    }
+    assert!(
+        unclassified_throttle_tail(AgentState::Ready, &screen, &[]).is_none(),
+        "a throttle phrase only surviving in scrollback must NOT be logged"
+    );
+}
+
+#[test]
+fn ansi_colored_tail_marks_red_cells_and_aligns_past_newline() {
+    // fg is 1:1 with screen_text.chars() INCLUDING the '\n' separator (vterm
+    // emits a Default entry for it). Verify red cells reconstruct \x1b[31m and
+    // that alignment survives a newline.
+    // chars:  o k \n b a d   (indices 0..=5)
+    let screen = "ok\nbad";
+    let fg = vec![
+        CellFg::Default, // o
+        CellFg::Default, // k
+        CellFg::Default, // \n
+        CellFg::Red,     // b
+        CellFg::Red,     // a
+        CellFg::Default, // d
+    ];
+    let out = ansi_colored_tail(screen, &fg, 5);
+    assert!(
+        out.contains("\x1b[31mba"),
+        "red cells must emit SGR 31: {out:?}"
+    );
+    assert!(
+        out.contains("ok"),
+        "earlier (non-red) line must still render: {out:?}"
+    );
+    // Empty fg (text-only callers): tail captured without color, no panic.
+    let plain = ansi_colored_tail(screen, &[], 5);
+    assert!(plain.contains("bad") && !plain.contains("\x1b[31m"));
+}
+
+#[test]
+fn append_jsonl_appends_one_record_per_line() {
+    let dir = std::env::temp_dir().join("agend_1562_append_jsonl_test");
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("nested").join("unclassified_errors.jsonl");
+
+    append_jsonl(&path, &serde_json::json!({"backend": "codex", "n": 1})).expect("first append");
+    append_jsonl(&path, &serde_json::json!({"backend": "claude", "n": 2})).expect("second append");
+
+    let body = std::fs::read_to_string(&path).expect("read back jsonl");
+    let lines: Vec<&str> = body.lines().collect();
+    assert_eq!(lines.len(), 2, "one record per line");
+    let first: serde_json::Value = serde_json::from_str(lines[0]).expect("parse line 0");
+    let second: serde_json::Value = serde_json::from_str(lines[1]).expect("parse line 1");
+    assert_eq!(first["backend"], "codex");
+    assert_eq!(second["n"], 2);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
