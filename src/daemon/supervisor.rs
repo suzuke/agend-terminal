@@ -332,6 +332,16 @@ fn pane_input_backend_supported(home: &std::path::Path, agent: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// #1563: resolve an agent's idle policy from fleet.yaml (cached load).
+/// Unknown agent / unreadable config → `Active` (default; preserves pre-#1563
+/// behavior so a misconfiguration never silently suppresses a real stall).
+fn idle_expectation_for(home: &std::path::Path, agent: &str) -> crate::fleet::IdleExpectation {
+    crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+        .ok()
+        .and_then(|cfg| cfg.instances.get(agent).map(|ic| ic.idle_expectation))
+        .unwrap_or_default()
+}
+
 /// Decide and dispatch member-state-change notify. Returns true if notify sent.
 /// Production-path-coupled per §3.5.10 — tests call this same function.
 pub(crate) fn maybe_notify_member_state_change(
@@ -531,11 +541,17 @@ fn awaiting_escalation_allowed(
     live_tail: &str,
     operator_typed_ms: i64,
     now_ms: i64,
+    idle_expectation: crate::fleet::IdleExpectation,
 ) -> bool {
     use crate::state::AgentState;
     match state {
         // Original startup-stall fallback — no chrome, no position gate.
-        AgentState::Starting => true,
+        // #1563: an `OnDemand` coordinator (e.g. `general`) is permanently stuck
+        // in `Starting` (never matches a Ready banner), so this ungated path
+        // would forward its normal pane to the operator forever. Gate the
+        // startup-stall fallback by role; the prompt arms below stay role-blind
+        // so a real permission/interactive prompt still escalates (#1552).
+        AgentState::Starting => idle_expectation == crate::fleet::IdleExpectation::Active,
         AgentState::PermissionPrompt | AgentState::InteractivePrompt => {
             // (b) stability: the prompt state held continuously long enough.
             state_held >= AWAITING_STABILITY
@@ -673,6 +689,11 @@ fn tick(
 
             let agent_state = core.state.current;
             let silent = core.state.last_output.elapsed();
+            // #1563: role policy gates the two `Starting`-context stall-forward
+            // paths (branch-1 startup-stall, branch-2 startup-prose prompt) for
+            // an `OnDemand` coordinator; the runtime permission/interactive
+            // escalation stays role-blind (handled inside the fn).
+            let idle_expectation = idle_expectation_for(home, &name);
             if core.health.check_awaiting_operator(agent_state, silent) && {
                 // #1552 escalation FP-gates (only reached when silent>30s +
                 // a prompt state, so this registry lock + re-detect is rare,
@@ -693,6 +714,7 @@ fn tick(
                     &core.vterm.tail_lines(AWAITING_TAIL_LINES),
                     typed_ms,
                     crate::daemon::heartbeat_pair::now_ms() as i64,
+                    idle_expectation,
                 )
             } {
                 // #1552 Half-1 #3: set the HEALTH reason — `check_hang` exempts
@@ -728,7 +750,16 @@ fn tick(
                         silent_secs: Some(silent.as_secs()),
                     })
                 }
-            } else if core.state.take_interactive_prompt_notice() {
+            } else if core.state.take_interactive_prompt_notice()
+                && idle_expectation == crate::fleet::IdleExpectation::Active
+            {
+                // #1563: `take_…` runs first (always consumes the one-shot flag,
+                // so an `OnDemand` agent's notice doesn't accumulate) — then the
+                // role gate suppresses the forward. This is the startup-prose
+                // co-FP path (`is_generic_startup_prompt` is `Starting`-gated, so
+                // a stuck-`Starting` coordinator reading `(y/n)` PR prose would
+                // otherwise forward it). The real pattern-based InteractivePrompt
+                // escalation for `Active` workers is unchanged.
                 // Pattern-based InteractivePrompt fires immediately on state
                 // entry (no silence window), so the notice also goes out on
                 // the first tick after entry rather than waiting for quiet.
@@ -1370,7 +1401,8 @@ mod tests {
 
     #[test]
     fn awaiting_gate_starting_is_ungated() {
-        // Legacy startup-stall path: fires regardless of chrome/position.
+        // Legacy startup-stall path: fires regardless of chrome/position for an
+        // `Active` worker (the default).
         assert!(awaiting_escalation_allowed(
             crate::state::AgentState::Starting,
             Duration::from_secs(0),
@@ -1378,6 +1410,22 @@ mod tests {
             "no chrome here",
             0,
             0,
+            crate::fleet::IdleExpectation::Active,
+        ));
+    }
+
+    #[test]
+    fn awaiting_gate_starting_ondemand_suppressed() {
+        // #1563: a stuck-`Starting` `OnDemand` coordinator (e.g. `general`) must
+        // NOT forward its startup-stall pane to the operator.
+        assert!(!awaiting_escalation_allowed(
+            crate::state::AgentState::Starting,
+            Duration::from_secs(0),
+            None,
+            "no chrome here",
+            0,
+            0,
+            crate::fleet::IdleExpectation::OnDemand,
         ));
     }
 
@@ -1390,7 +1438,61 @@ mod tests {
             PERM_CHROME, // chrome IS in the live tail
             0,           // operator never typed
             10_000,
+            crate::fleet::IdleExpectation::Active,
         ));
+    }
+
+    #[test]
+    fn awaiting_gate_ondemand_real_permission_still_escalates() {
+        // #1563 preserves #1552: the role gate covers ONLY the `Starting`
+        // startup-stall arm. A genuine runtime permission prompt that satisfies
+        // all three FP-gates STILL escalates for an `OnDemand` agent — otherwise
+        // a coordinator stuck on a real permission dialog would never be surfaced.
+        assert!(awaiting_escalation_allowed(
+            crate::state::AgentState::PermissionPrompt,
+            AWAITING_STABILITY,
+            Some(crate::backend::Backend::ClaudeCode),
+            PERM_CHROME,
+            0,
+            10_000,
+            crate::fleet::IdleExpectation::OnDemand,
+        ));
+    }
+
+    #[test]
+    fn idle_expectation_for_resolves_role_and_defaults() {
+        let home = tmp_home("idle_exp_resolve");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            r#"
+defaults:
+  backend: claude
+instances:
+  worker:
+    role: worker
+  general:
+    role: General assistant
+    idle_expectation: on-demand
+"#,
+        )
+        .expect("write fleet.yaml");
+        // The shared resolver both branch-1 (startup-stall) and branch-2
+        // (startup-prose forward) gate on. `on-demand` → OnDemand suppresses
+        // BOTH forwards; omitted → Active leaves the worker unchanged; an
+        // unknown agent fails open to Active (never silently suppress).
+        assert_eq!(
+            idle_expectation_for(&home, "general"),
+            crate::fleet::IdleExpectation::OnDemand
+        );
+        assert_eq!(
+            idle_expectation_for(&home, "worker"),
+            crate::fleet::IdleExpectation::Active
+        );
+        assert_eq!(
+            idle_expectation_for(&home, "nonexistent"),
+            crate::fleet::IdleExpectation::Active
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
@@ -1406,6 +1508,7 @@ mod tests {
             "just normal working output, no dialog chrome at the bottom",
             0,
             10_000,
+            crate::fleet::IdleExpectation::Active,
         ));
     }
 
@@ -1419,6 +1522,7 @@ mod tests {
             PERM_CHROME,
             0,
             10_000,
+            crate::fleet::IdleExpectation::Active,
         ));
     }
 
@@ -1433,6 +1537,7 @@ mod tests {
             PERM_CHROME,
             now - 2_000,
             now,
+            crate::fleet::IdleExpectation::Active,
         ));
     }
 
@@ -1451,6 +1556,7 @@ mod tests {
                     PERM_CHROME,
                     0,
                     10_000,
+                    crate::fleet::IdleExpectation::Active,
                 ),
                 "{s:?} must never escalate via this path"
             );

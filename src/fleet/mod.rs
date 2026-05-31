@@ -238,6 +238,21 @@ pub struct InstanceDefaults {
     pub instructions: Option<String>,
 }
 
+/// #1563: per-instance idle policy. `Active` (default) is a worker expected to
+/// make steady progress — the idle watchdog tracks it and the supervisor may
+/// escalate a silent `Starting`/startup-prose stall to the operator. `OnDemand`
+/// is a coordinator/responder (e.g. `general`) that is legitimately quiet
+/// between requests: it is exempt from idle-watchdog tracking and from the two
+/// `Starting`-context stall-forward paths, WITHOUT touching the real
+/// permission/interactive-prompt escalation (#1552 still fires for it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum IdleExpectation {
+    #[default]
+    Active,
+    OnDemand,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InstanceConfig {
     /// Role description. TS version uses "description", accepted as alias.
@@ -331,6 +346,13 @@ pub struct InstanceConfig {
     pub timeout_secs: Option<u64>,
     #[serde(default = "default_true")]
     pub idle_watchdog_enabled: bool,
+    /// #1563: idle policy. `Active` (default) tracks the agent in the idle
+    /// watchdog and arms `Starting`-context stall escalation. `OnDemand` exempts
+    /// a legitimately-quiet coordinator (e.g. `general`) from idle-watchdog noise
+    /// and from the two `Starting`-FP stall-forward paths, while preserving the
+    /// #1552 real-prompt escalation. Omitted → `Active` (zero migration).
+    #[serde(default)]
+    pub idle_expectation: IdleExpectation,
 }
 
 fn default_true() -> bool {
@@ -679,6 +701,40 @@ mod tests {
         let path = dir.join("fleet.yaml");
         fs::write(&path, yaml).expect("write fleet.yaml");
         path
+    }
+
+    #[test]
+    fn idle_expectation_parses_and_defaults_to_active() {
+        let dir = std::env::temp_dir().join(format!(
+            "agend-fleet-idle-exp-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let path = write_fleet(
+            &dir,
+            r#"
+defaults:
+  backend: claude
+instances:
+  worker:
+    role: worker
+  general:
+    role: General assistant
+    idle_expectation: on-demand
+"#,
+        );
+        let config = FleetConfig::load(&path).expect("load");
+        // #1563: omitted field → Active (zero-migration backward compat).
+        assert_eq!(
+            config.instances.get("worker").unwrap().idle_expectation,
+            IdleExpectation::Active
+        );
+        // Explicit kebab-case `on-demand` → OnDemand.
+        assert_eq!(
+            config.instances.get("general").unwrap().idle_expectation,
+            IdleExpectation::OnDemand
+        );
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

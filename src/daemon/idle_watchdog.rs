@@ -404,7 +404,14 @@ fn scan_dev_vantage(
             .collect();
         cfg.instances
             .iter()
-            .filter(|(name, ic)| ic.idle_watchdog_enabled && !orchestrators.contains(name.as_str()))
+            .filter(|(name, ic)| {
+                ic.idle_watchdog_enabled
+                    && !orchestrators.contains(name.as_str())
+                    // #1563: an `OnDemand` coordinator is legitimately quiet
+                    // between requests — exempt it from idle tracking (same
+                    // knob that gates the supervisor stall-forward paths).
+                    && ic.idle_expectation == crate::fleet::IdleExpectation::Active
+            })
             .map(|(name, ic)| {
                 let threshold = ic
                     .timeout_secs
@@ -575,7 +582,13 @@ fn scan_fleet_vantage(
                 .filter(|(name, _)| {
                     cfg.instances
                         .get(name)
-                        .map(|ic| ic.idle_watchdog_enabled)
+                        // #1563: also drop `OnDemand` coordinators from the
+                        // fleet-wide all-idle quorum — an exempt agent must not
+                        // count toward "every tracked agent is silent".
+                        .map(|ic| {
+                            ic.idle_watchdog_enabled
+                                && ic.idle_expectation == crate::fleet::IdleExpectation::Active
+                        })
                         .unwrap_or(false)
                 })
                 .collect()
