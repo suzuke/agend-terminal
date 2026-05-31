@@ -229,6 +229,15 @@ pub fn format_notification_for_inject(
         if let Some(s) = &attach_summary {
             header.push_str(&format!(" attachments=[{s}]"));
         }
+        // #1509: stamp the operator-TZ `now=` on this pointer header too,
+        // matching the other formatters (format_header / format_event_header /
+        // enqueue_with_idle_hint). EVERY `notify_agent` path flows through here
+        // — telegram-inbound, conflict_notify, supervisor state-change notices,
+        // boot canonical-hygiene — so this single call closes the #1487 gap for
+        // all of them at once. Placed before `reply_hint` so it stays in the
+        // space-delimited `key=value` header region, not the prose hint.
+        header.push(' ');
+        header.push_str(&operator_now_field());
         header.push_str(&source.reply_hint());
         header
     } else {
@@ -244,6 +253,11 @@ pub fn format_notification_for_inject(
         } else {
             text.to_string()
         };
+        // #1509 NOTE: the body-replace inline form has NO `[AGEND-MSG]` header
+        // to host a `now=` field, and deployments that want the timestamp run
+        // pointer mode (the branch above carries it). Leaving body-mode
+        // unstamped is intentional — revisit only if a header-less `now=` is
+        // ever required.
         format!("[{source}] {display_text}{}", source.reply_hint())
     }
 }
@@ -661,5 +675,28 @@ mod operator_tz_tests {
         assert!(header.contains("id=m-1"), "id= preserved: {header}");
         assert!(header.contains("kind=task"), "kind= preserved: {header}");
         assert!(header.contains("size=5"), "size= preserved: {header}");
+    }
+
+    /// #1509: the `notify_agent` formatter must ALSO stamp `now=` in its
+    /// pointer/header form. Every notify_agent path flows through it
+    /// (telegram-inbound, conflict_notify, supervisor state-change notices, boot
+    /// canonical-hygiene) — pre-#1509 it was the one formatter that dropped it.
+    #[test]
+    fn notify_agent_pointer_header_includes_now_1509() {
+        use super::{format_notification_for_inject, NotifySource};
+        let header = format_notification_for_inject(
+            true, // pointer mode — the [AGEND-MSG] header form
+            &NotifySource::System("telegram"),
+            "an inbound operator message",
+            &[],
+        );
+        assert!(
+            header.contains("[AGEND-MSG]"),
+            "pointer header expected: {header}"
+        );
+        assert!(
+            header.contains("now="),
+            "#1509: notify_agent pointer header must carry now= (was the gap): {header}"
+        );
     }
 }
