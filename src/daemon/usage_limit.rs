@@ -7,17 +7,23 @@
 use crate::state::AgentState;
 use std::path::Path;
 
-/// Log a state transition to `state-transitions.jsonl`.
-pub fn log_state_transition(
+/// #1527: log a state transition to `state-transitions.jsonl` with an explicit
+/// `ts` — the instant the transition was RECORDED (`StateTracker::record_set`),
+/// not the later drain time. The supervisor drains buffered transitions and
+/// logs each with its captured timestamp so the on-disk order + times reflect
+/// reality. File append only (no self-IPC, no lock) → #1492-safe under the
+/// core lock.
+pub fn log_state_transition_at(
     home: &Path,
     agent: &str,
     from: AgentState,
     to: AgentState,
+    ts: &str,
     pty_snippet: &str,
 ) {
     let snippet: String = pty_snippet.chars().take(200).collect();
     let entry = serde_json::json!({
-        "ts": chrono::Utc::now().to_rfc3339(),
+        "ts": ts,
         "agent": agent,
         "from": from.display_name(),
         "to": to.display_name(),
@@ -110,11 +116,12 @@ mod tests {
         std::fs::create_dir_all(&dir).ok();
         std::fs::remove_file(dir.join("state-transitions.jsonl")).ok();
 
-        log_state_transition(
+        log_state_transition_at(
             &dir,
             "dev",
             AgentState::Ready,
             AgentState::UsageLimit,
+            "2026-05-31T00:00:00+00:00",
             "You've hit your limit",
         );
 
@@ -122,6 +129,10 @@ mod tests {
         assert!(content.contains("\"agent\":\"dev\""));
         assert!(content.contains("\"to\":\"usage_limit\""));
         assert!(content.contains("hit your limit"));
+        assert!(
+            content.contains("\"ts\":\"2026-05-31T00:00:00+00:00\""),
+            "must use the explicit (push-time) ts: {content}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -479,16 +479,38 @@ fn tick(
             // can't reach when the agent goes quiet (no PTY output).
             let prev_state = core.state.current;
             core.state.tick();
+            let new_state = core.state.current;
+
+            // #1527: log EVERY transition recorded at its source (read-loop
+            // `feed` AND `tick`), by draining the per-tracker buffer — replaces
+            // the old prev/new-at-tick comparison, which silently missed any
+            // transition that completed async between two supervisor ticks
+            // (prev==new), i.e. nearly all feed-driven ones including the error
+            // states. `log_state_transition_at` is a file append (no self-IPC,
+            // no new lock) so logging under the core lock is #1492-safe.
+            let snippet = core.vterm.tail_lines(3);
+            let (transitions, dropped) = core.state.drain_pending_transitions();
+            if dropped > 0 {
+                tracing::warn!(
+                    agent = %name,
+                    dropped,
+                    "#1527: transition-log buffer overflowed (drainer fell behind) — oldest dropped"
+                );
+            }
+            for t in &transitions {
+                crate::daemon::usage_limit::log_state_transition_at(
+                    home, &name, t.from, t.to, &t.ts, &snippet,
+                );
+            }
 
             // Sprint 43: member-state-change notify to orchestrator.
-            let new_state = core.state.current;
+            // #1527 NOTE: these reactions are STILL gated on the tick prev/new
+            // comparison, so feed-driven UsageLimit / error transitions miss
+            // them — a PRE-EXISTING latent bug (confirmed in the #1527 spike).
+            // De-gating entangles with #1492 lock discipline (these run under
+            // the core lock and may self-IPC), so it is tracked as a separate
+            // follow-up. Transition LOGGING above is now complete regardless.
             if prev_state != new_state {
-                // #1176: log ALL state transitions for observability.
-                let snippet = core.vterm.tail_lines(3);
-                crate::daemon::usage_limit::log_state_transition(
-                    home, &name, prev_state, new_state, &snippet,
-                );
-
                 // #1176: UsageLimit reaction pipeline.
                 if new_state == crate::state::AgentState::UsageLimit {
                     let backend_cmd = {

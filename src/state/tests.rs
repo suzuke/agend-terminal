@@ -3041,3 +3041,89 @@ fn network_error_patterns_all_backends() {
         }
     }
 }
+
+// ── #1527: transition recording at the mutation source ──
+
+#[test]
+fn record_set_buffers_transitions_fifo_then_drains() {
+    let mut st = StateTracker::new(None); // starts Ready
+    st.record_set(AgentState::Thinking);
+    st.record_set(AgentState::Idle);
+    let (recs, dropped) = st.drain_pending_transitions();
+    assert_eq!(dropped, 0);
+    assert_eq!(recs.len(), 2);
+    assert_eq!(
+        (recs[0].from, recs[0].to),
+        (AgentState::Ready, AgentState::Thinking)
+    );
+    assert_eq!(
+        (recs[1].from, recs[1].to),
+        (AgentState::Thinking, AgentState::Idle)
+    );
+    assert!(!recs[0].ts.is_empty(), "ts must be captured at record time");
+    assert!(
+        st.drain_pending_transitions().0.is_empty(),
+        "second drain is empty"
+    );
+}
+
+/// The #1527 regression: a mutation that bypasses BOTH `transition()` and
+/// `tick()` (here `set_restarting`) is still recorded — pre-fix the
+/// supervisor's prev/new-at-tick comparison could miss it entirely because
+/// the change completed async in the read-loop / reaper thread.
+#[test]
+fn set_restarting_records_transition_without_tick() {
+    let mut st = StateTracker::new(None); // Ready
+    st.set_restarting();
+    let (recs, _) = st.drain_pending_transitions();
+    assert_eq!(
+        recs.len(),
+        1,
+        "set_restarting must record (it bypasses transition())"
+    );
+    assert_eq!(recs[0].to, AgentState::Restarting);
+}
+
+#[test]
+fn set_awaiting_operator_records_transition() {
+    let mut st = StateTracker::new(Some(&Backend::ClaudeCode)); // starts Starting
+    st.set_awaiting_operator();
+    let (recs, _) = st.drain_pending_transitions();
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0].from, AgentState::Starting);
+    assert_eq!(recs[0].to, AgentState::AwaitingOperator);
+}
+
+#[test]
+fn same_state_record_set_is_noop() {
+    let mut st = StateTracker::new(None); // Ready
+    st.record_set(AgentState::Ready); // same → no record
+    assert!(
+        st.drain_pending_transitions().0.is_empty(),
+        "same-state record_set must not buffer a spurious transition"
+    );
+}
+
+#[test]
+fn pending_transitions_bounded_drops_oldest() {
+    let mut st = StateTracker::new(None); // Ready
+    let overflow = 5usize;
+    for i in 0..(StateTracker::PENDING_TRANSITIONS_CAP + overflow) {
+        let s = if i % 2 == 0 {
+            AgentState::Thinking
+        } else {
+            AgentState::Idle
+        };
+        st.record_set(s);
+    }
+    let (recs, dropped) = st.drain_pending_transitions();
+    assert_eq!(
+        recs.len(),
+        StateTracker::PENDING_TRANSITIONS_CAP,
+        "buffer must be capped"
+    );
+    assert_eq!(
+        dropped as usize, overflow,
+        "overflow count surfaced for the warn"
+    );
+}

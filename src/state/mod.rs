@@ -229,6 +229,27 @@ pub struct StateTracker {
     /// transition is suppressed and the tracker stays in the lower
     /// state — letting the natural latched-expiry path eventually fire.
     last_priority_up_into: Option<(AgentState, Instant)>,
+    /// #1527: transitions recorded at the moment `current` actually changes
+    /// (via `record_set`), drained + logged by the supervisor. This replaces
+    /// the supervisor's prev/new-at-tick comparison, which silently missed
+    /// every transition that completed async in the read-loop thread (the
+    /// feed → `transition` path) between two supervisor ticks — i.e. nearly
+    /// all of them, including the error states. Bounded (drop-oldest) so a
+    /// stalled drainer can't grow it without limit.
+    pending_transitions: Vec<TransitionRecord>,
+    /// #1527: count of transitions dropped because `pending_transitions` hit
+    /// its cap before the supervisor drained it. Surfaced in a warn at drain
+    /// so a wedged drainer is visible rather than silently lossy.
+    dropped_transition_count: u64,
+}
+
+/// #1527: one recorded `current` transition, captured at the mutation site so
+/// the timestamp is the real transition time (not the later drain time).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TransitionRecord {
+    pub from: AgentState,
+    pub to: AgentState,
+    pub ts: String,
 }
 
 const MARKER_SCAN_TAIL_LINES: usize = 5;
@@ -337,6 +358,11 @@ impl StateTracker {
     /// Scenario C oscillation can keep `since` recent. See
     /// `docs/HUNG-STATE-TRANSITIONS.md §F39.2`. #1005 Phase A2 closes
     /// this gap via the oscillation guard at `transition()`.
+    /// #1527: max buffered transitions before drop-oldest kicks in. The
+    /// supervisor drains every tick (~10s) and a healthy agent produces far
+    /// fewer than this per tick; the cap only bounds memory if the drainer
+    /// stalls.
+    const PENDING_TRANSITIONS_CAP: usize = 256;
     const LATCHED_STATE_EXPIRY: Duration = Duration::from_secs(30);
 
     /// #1005 Phase A2: minimum hold in the lower-priority state before
@@ -405,6 +431,9 @@ impl StateTracker {
             // legitimate priority-up records into it; subsequent
             // priority-ups within the window check against it.
             last_priority_up_into: None,
+            // #1527: transition audit buffer starts empty.
+            pending_transitions: Vec::new(),
+            dropped_transition_count: 0,
         }
     }
 
@@ -778,8 +807,7 @@ impl StateTracker {
 
     /// Force state to Restarting (called by reaper on crash).
     pub fn set_restarting(&mut self) {
-        self.current = AgentState::Restarting;
-        self.since = Instant::now();
+        self.record_set(AgentState::Restarting); // #1527: also logs the transition
     }
 
     /// Force state to AwaitingOperator when startup stalls on an unexpected
@@ -793,9 +821,45 @@ impl StateTracker {
     /// AwaitingOperator prio → higher always wins).
     pub fn set_awaiting_operator(&mut self) {
         if matches!(self.current, AgentState::Starting) {
-            self.current = AgentState::AwaitingOperator;
-            self.since = Instant::now();
+            self.record_set(AgentState::AwaitingOperator); // #1527: also logs
         }
+    }
+
+    /// #1527: the SINGLE funnel for every `current` mutation. Records the
+    /// transition (bounded, drop-oldest) and updates `current` + `since`. All
+    /// five production mutation sites route through this — `transition()`'s
+    /// three assignment branches plus the two that bypass `transition()`
+    /// entirely (`set_restarting` / `set_awaiting_operator`) — so EVERY state
+    /// change is captured at its true source, regardless of which thread
+    /// (read-loop `feed` or supervisor `tick`) drives it. Callers must NOT also
+    /// assign `current`/`since` (record_set owns both — avoids double-update).
+    /// No-op on same-state (won't reset `since` or push a spurious record).
+    fn record_set(&mut self, new_state: AgentState) {
+        if new_state == self.current {
+            return;
+        }
+        if self.pending_transitions.len() >= Self::PENDING_TRANSITIONS_CAP {
+            self.pending_transitions.remove(0); // drop oldest
+            self.dropped_transition_count = self.dropped_transition_count.saturating_add(1);
+        }
+        self.pending_transitions.push(TransitionRecord {
+            from: self.current,
+            to: new_state,
+            ts: chrono::Utc::now().to_rfc3339(),
+        });
+        self.current = new_state;
+        self.since = Instant::now();
+    }
+
+    /// #1527: drain the buffered transitions (FIFO) for the supervisor to log.
+    /// Returns the records in occurrence order plus the count dropped to the
+    /// cap since the last drain (nonzero ⇒ the drainer fell behind). Clears
+    /// both. The supervisor logs each record AFTER dropping the core lock
+    /// (file append, no self-IPC → no #1492).
+    pub(crate) fn drain_pending_transitions(&mut self) -> (Vec<TransitionRecord>, u64) {
+        let dropped = self.dropped_transition_count;
+        self.dropped_transition_count = 0;
+        (std::mem::take(&mut self.pending_transitions), dropped)
     }
 
     fn transition(&mut self, new_state: AgentState) {
@@ -807,8 +871,7 @@ impl StateTracker {
 
         // Error states: instant transition (no hysteresis)
         if new_state.is_error() {
-            self.current = new_state;
-            self.since = Instant::now();
+            self.record_set(new_state); // #1527: records + sets current/since
         } else {
             // Higher priority than current: transition if current held > min duration
             let held = self.since.elapsed();
@@ -862,12 +925,10 @@ impl StateTracker {
                     }
                     self.last_priority_up_into = Some((new_state, now));
                 }
-                self.current = new_state;
-                self.since = now;
+                self.record_set(new_state); // #1527
             } else if held >= min_hold {
                 // Lower priority only after min hold
-                self.current = new_state;
-                self.since = Instant::now();
+                self.record_set(new_state); // #1527
             }
         }
 
