@@ -3296,6 +3296,19 @@ fn claude_permission_footer_anchor_1546() {
         Some(AgentState::PermissionPrompt),
         "allow-all-edits phrase must fire PermissionPrompt"
     );
+    // #1546 trust follow-up: the trust-folder dialog uses a DIFFERENT footer
+    // (`Enter to confirm · Esc to cancel`) — its own chrome anchor.
+    assert_eq!(
+        p.detect("Enter to confirm · Esc to cancel"),
+        Some(AgentState::PermissionPrompt),
+        "trust-folder footer must fire PermissionPrompt"
+    );
+    // FP-safe: a partial fragment that is NOT the full footer chrome must not fire.
+    assert_ne!(
+        p.detect("Press Enter to confirm your email address"),
+        Some(AgentState::PermissionPrompt),
+        "#1546: bare 'Enter to confirm' prose must NOT false-fire PermissionPrompt"
+    );
     // FP-fixed: the cut bare strings must NOT fire on prose / pasted content
     // (this is the member-state + dispatch-idle bleed #1546 stops).
     for prose in [

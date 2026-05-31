@@ -137,13 +137,18 @@ impl StatePatterns {
                 // zero-FP). Same spirit as the #1541 verb-agnostic structural
                 // anchor; full-screen scan is safe (no bottom-N) because the
                 // footer is self-identifying. Replay-validated against
-                // claude-perm.raw (edit) + claude-mcp-perm.raw (mcp). The
-                // trust-folder prompt is a documented low-risk gap (rare; operator
-                // already globally-trusted, no fixture) — widen the anchor if a
-                // future capture shows a different footer. Claude-only.
+                // claude-perm.raw (edit) + claude-mcp-perm.raw (mcp).
+                //
+                // #1546 trust follow-up: the trust-folder ("Quick safety check: Is
+                // this a project you … trust?") dialog uses a DIFFERENT footer —
+                // `Enter to confirm · Esc to cancel` (not `… Tab to amend`) — so it
+                // needs its own chrome alternation, also zero-FP. Operator capture
+                // (claude-trust-prompt.raw) confirmed the wording. Each permission
+                // TYPE carries a self-identifying footer; the anchor is the union.
+                // Claude-only.
                 (
                     AgentState::PermissionPrompt,
-                    r"Esc to cancel · Tab to amend|allow all edits during this session",
+                    r"Esc to cancel · Tab to amend|allow all edits during this session|Enter to confirm · Esc to cancel",
                 ),
                 // Phase A Piece-1: git rebase/merge/cherry-pick conflict
                 // output is identical regardless of which CLI invoked git,

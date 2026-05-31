@@ -194,6 +194,22 @@ fixtures:
     capture_kind: real_pty
     provenance: "#1546 operator capture"
 
+  - file: claude-trust-prompt.raw
+    backend: claude-code
+    cli_version: "2.1.98"
+    recorded_on: "2026-05-31"
+    scenario: "trust-folder dialog ('Quick safety check: Is this a project you trust?' -> 'Yes, I trust this folder' / 'No, exit', not answered)"
+    # #1546 trust follow-up: the trust dialog's footer is `Enter to confirm · Esc
+    # to cancel` (NOT the tool-perm `… Tab to amend`), so it needs its own chrome
+    # alternation. This short fixture goes straight starting -> permission (the
+    # dialog is the first thing rendered). final_detect stays permission (the
+    # dialog is still on the final frame). Proves the trust footer anchor fires.
+    expected_transitions: [starting, permission]
+    expected_final_state: permission
+    expected_final_detect: permission
+    capture_kind: real_pty
+    provenance: "#1546 trust operator capture"
+
   - file: codex-perm.raw
     backend: codex
     cli_version: "0.120.0"
