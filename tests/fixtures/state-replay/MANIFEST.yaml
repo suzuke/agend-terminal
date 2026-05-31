@@ -174,6 +174,26 @@ fixtures:
     expected_final_state: permission
     expected_final_detect: idle
 
+  - file: claude-mcp-perm.raw
+    backend: claude-code
+    cli_version: "2.1.98"
+    recorded_on: "2026-05-31"
+    scenario: "MCP-tool permission dialog (agent asks to run an MCP tool -> Allow/Deny dialog -> not answered)"
+    # #1546: this fixture is the EVIDENCE that the permission footer
+    # `Esc to cancel · Tab to amend` is COMMON across permission types (not
+    # edit-specific). `allow all edits during this session` is edit-only and
+    # is ABSENT here, so the footer alone fires PermissionPrompt — proving the
+    # chrome-footer anchor covers the mcp-tool dialog. Same observed sequence
+    # as claude-perm.raw (edit): a `thinking` phase precedes `permission`
+    # (#1541 verb-agnostic spinner anchor). final_detect is null — the settled
+    # final frame matches no pattern; the tracker retains PermissionPrompt via
+    # hysteresis. Provenance: #1546 operator capture (2026-05-31).
+    expected_transitions: [starting, idle, thinking, permission]
+    expected_final_state: permission
+    expected_final_detect: null
+    capture_kind: real_pty
+    provenance: "#1546 operator capture"
+
   - file: codex-perm.raw
     backend: codex
     cli_version: "0.120.0"

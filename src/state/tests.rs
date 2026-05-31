@@ -735,10 +735,13 @@ fn claude_permission_prompt_dialog_match() {
         Some(AgentState::PermissionPrompt),
         "dialog footer must fire PermissionPrompt",
     );
-    assert_eq!(
+    // #1546: the bare "Do you want to …" question prefix is NO LONGER an anchor
+    // (it false-positived on prose / pasted docs / test content). It must NOT
+    // fire PermissionPrompt on its own.
+    assert_ne!(
         patterns.detect("Do you want to create /tmp/out.txt?"),
         Some(AgentState::PermissionPrompt),
-        "dialog question prefix must fire PermissionPrompt",
+        "#1546: bare 'Do you want to …' prose must NOT fire PermissionPrompt",
     );
     assert_eq!(
         patterns.detect("   2. Yes, allow all edits during this session (shift+tab)"),
@@ -749,13 +752,12 @@ fn claude_permission_prompt_dialog_match() {
 
 #[test]
 fn permission_prompt_legacy_wording_still_matches() {
-    let cases: &[(Backend, &[&str])] = &[
-        (
-            Backend::ClaudeCode,
-            &["Allow once", "Allow always", "approve"],
-        ),
-        (Backend::Codex, &["Request approval", "approve", "deny"]),
-    ];
+    // #1546: Claude's legacy bare wording (`Allow once|Allow always|approve`) was
+    // CUT — it false-positived on prose. Claude now keys on the chrome footer
+    // (see claude_permission_footer_anchor_1546). Codex/other backends are
+    // untouched and still match their own wording.
+    let cases: &[(Backend, &[&str])] =
+        &[(Backend::Codex, &["Request approval", "approve", "deny"])];
     for (backend, samples) in cases {
         let patterns = StatePatterns::for_backend(backend);
         for sample in *samples {
@@ -846,8 +848,9 @@ fn auth_error_instant_transition() {
 #[test]
 fn permission_prompt_higher_than_thinking() {
     let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Thinking, 0);
-    // PermissionPrompt (priority 8) > Thinking (priority 6) — instant
-    t.feed("Allow once");
+    // PermissionPrompt (priority 8) > Thinking (priority 6) — instant.
+    // #1546: trigger via the chrome footer (the new anchor), not bare "Allow once".
+    t.feed("Esc to cancel · Tab to amend");
     assert_eq!(t.get_state(), AgentState::PermissionPrompt);
 }
 
@@ -3200,8 +3203,10 @@ fn modal_prompt_above_live_tail_still_detected_1518() {
     // 20 streaming lines push the prompt above the bottom-N=15 error bound; a
     // HIGH_FP marker this deep WOULD be suppressed, so detection here proves the
     // bound is error-only.
+    // #1546: trigger via the chrome footer (the new zero-FP anchor), not the old
+    // bare "Do you want to …" string (cut as a false-positive source).
     let mut st = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
-    let mut screen = String::from("Do you want to proceed with this edit?\n");
+    let mut screen = String::from("Esc to cancel · Tab to amend\n");
     for i in 0..20 {
         screen.push_str(&format!("streaming output {i}\n"));
     }
@@ -3270,6 +3275,47 @@ fn claude_thinking_anchor_does_not_cross_backends_1541() {
             detected,
             Some(AgentState::Thinking),
             "#1541: claude sparkle anchor must not fire Thinking on {backend:?}"
+        );
+    }
+}
+
+// ── #1546: PermissionPrompt chrome-footer anchor (cut speculative bare strings) ──
+
+#[test]
+fn claude_permission_footer_anchor_1546() {
+    let p = StatePatterns::for_backend(&Backend::ClaudeCode);
+    // FN-preserved: the self-identifying chrome footer + the fully-specific
+    // allow-all-edits phrase still fire PermissionPrompt.
+    assert_eq!(
+        p.detect("Esc to cancel · Tab to amend"),
+        Some(AgentState::PermissionPrompt),
+        "footer chrome must fire PermissionPrompt"
+    );
+    assert_eq!(
+        p.detect("  2. Yes, allow all edits during this session (shift+tab)"),
+        Some(AgentState::PermissionPrompt),
+        "allow-all-edits phrase must fire PermissionPrompt"
+    );
+    // FP-fixed: the cut bare strings must NOT fire on prose / pasted content
+    // (this is the member-state + dispatch-idle bleed #1546 stops).
+    for prose in [
+        "Do you want to proceed with this edit?", // the #1518 modal fixture content
+        "I'll approve the PR once CI is green",   // 'approve' in prose
+        "Allow once you've reviewed it, then merge", // 'Allow once' in prose
+        "Should I Allow always, or just this time?", // 'Allow always' in prose
+    ] {
+        assert_ne!(
+            p.detect(prose),
+            Some(AgentState::PermissionPrompt),
+            "#1546: prose {prose:?} must NOT false-fire PermissionPrompt"
+        );
+    }
+    // The footer anchor is Claude-only — other backends don't borrow it.
+    for b in [Backend::Codex, Backend::Gemini, Backend::KiroCli] {
+        assert_ne!(
+            StatePatterns::for_backend(&b).detect("Esc to cancel · Tab to amend"),
+            Some(AgentState::PermissionPrompt),
+            "claude footer must not fire PermissionPrompt on {b:?}"
         );
     }
 }

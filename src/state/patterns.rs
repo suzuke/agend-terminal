@@ -122,16 +122,28 @@ impl StatePatterns {
                 // [measured] Claude 2.1.98 permission dialog renders as an
                 // Ink overlay with a distinctive footer — `Esc to cancel ·
                 // Tab to amend` — plus a `Do you want to …` question and
-                // `1. Yes / 2. Yes, allow all edits during this session /
-                // 3. No` options. Observed in tests/fixtures/state-replay/
-                // claude-perm.raw at byte ~9216. The previous pattern
-                // (`Allow once|Allow always|approve`) did not match any
-                // wording in this dialog. The footer line is the most
-                // specific anchor; the question prefix and allow-all-edits
-                // option cover variations where the footer is scrolled out.
+                // #1546: PermissionPrompt detection keys on the dialog's CHROME
+                // footer, not bare prose strings. The old alternation also matched
+                // `Do you want to ` / `approve` / `Allow once|always` ANYWHERE on
+                // screen — high false-positive: any prose / pasted doc / test
+                // content containing "Do you want to proceed…" or "approve"
+                // mis-fired PermissionPrompt, masking the live Thinking state and
+                // tripping dispatch-idle + member-state (recurring this session).
+                // Replaced with the self-identifying footer `Esc to cancel · Tab
+                // to amend` (zero-FP — never appears in prose), which operator
+                // capture confirmed is COMMON across edit AND mcp-tool permission
+                // dialogs (NOT edit-specific). `allow all edits during this
+                // session` is kept as a second, fully-specific phrase (also
+                // zero-FP). Same spirit as the #1541 verb-agnostic structural
+                // anchor; full-screen scan is safe (no bottom-N) because the
+                // footer is self-identifying. Replay-validated against
+                // claude-perm.raw (edit) + claude-mcp-perm.raw (mcp). The
+                // trust-folder prompt is a documented low-risk gap (rare; operator
+                // already globally-trusted, no fixture) — widen the anchor if a
+                // future capture shows a different footer. Claude-only.
                 (
                     AgentState::PermissionPrompt,
-                    r"Esc to cancel · Tab to amend|Do you want to |allow all edits during this session|Allow once|Allow always|approve",
+                    r"Esc to cancel · Tab to amend|allow all edits during this session",
                 ),
                 // Phase A Piece-1: git rebase/merge/cherry-pick conflict
                 // output is identical regardless of which CLI invoked git,
