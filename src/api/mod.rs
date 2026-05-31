@@ -755,8 +755,8 @@ mod tests {
         let home = tmp_home("validate_verbatim");
         let work = crate::paths::workspace_dir(&home).join("agent");
         std::fs::create_dir_all(&work).expect("create dir");
-        let resolved =
-            validate_working_directory(&work, &home).expect("existing path under home must validate");
+        let resolved = validate_working_directory(&work, &home)
+            .expect("existing path under home must validate");
         let resolved_str = resolved.to_string_lossy();
         assert!(
             !resolved_str.starts_with(r"\\?\"),
