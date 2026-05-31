@@ -124,9 +124,15 @@ pub fn validate_working_directory(
     if path.components().any(|c| matches!(c, Component::ParentDir)) {
         anyhow::bail!("working_directory must not contain '..'");
     }
-    // Canonicalize to resolve symlinks
+    // Canonicalize to resolve symlinks. `dunce::canonicalize` (not
+    // `std::fs::canonicalize`) so that on Windows the returned path does NOT
+    // carry the `\\?\` UNC verbatim prefix: this value becomes the PTY cwd
+    // (agent::build_command -> cmd.cwd), and a `\\?\`-prefixed cwd makes
+    // cmd.exe-based backends warn "UNC paths are not supported" and silently
+    // fall back to C:\Windows (#893 — same prefix bug already fixed for the
+    // session-name encode path in backend::canonicalize_for_encode).
     let canonical = if path.exists() {
-        std::fs::canonicalize(path)
+        dunce::canonicalize(path)
             .map_err(|e| anyhow::anyhow!("working_directory canonicalize failed: {e}"))?
     } else {
         // Path doesn't exist yet (will be created) — use parent for validation
@@ -159,8 +165,11 @@ fn allowed_roots(home: &std::path::Path) -> Vec<std::path::PathBuf> {
 fn is_under_allowed_root(path: &std::path::Path, home: &std::path::Path) -> bool {
     let roots = allowed_roots(home);
     roots.iter().any(|root| {
-        // Canonicalize root too (home might be a symlink)
-        let canonical_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+        // Canonicalize root too (home might be a symlink). Use
+        // `dunce::canonicalize` to match the prefix form of `path` above —
+        // a `\\?\`-prefixed root vs a plain-prefixed path (or vice versa)
+        // would make `starts_with` spuriously fail on Windows (#893).
+        let canonical_root = dunce::canonicalize(root).unwrap_or_else(|_| root.clone());
         path.starts_with(&canonical_root)
     })
 }
@@ -727,6 +736,35 @@ mod tests {
         std::fs::create_dir_all(&ok).expect("create dir");
         let resolved = validate_working_directory(&ok, &home).expect("normal path must validate");
         assert!(resolved.ends_with("agent"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Windows-only #893 regression: the path returned by
+    /// `validate_working_directory` becomes the PTY cwd
+    /// (`agent::build_command` -> `cmd.cwd`). It MUST NOT carry the `\\?\`
+    /// UNC verbatim prefix that `std::fs::canonicalize` returns on Windows —
+    /// a `\\?\`-prefixed cwd makes cmd.exe-based backends warn "UNC paths are
+    /// not supported" and fall back to C:\Windows. `dunce::canonicalize`
+    /// strips the prefix when safe; falling back to `std::fs::canonicalize`
+    /// here would re-introduce the bug. The validation must also still SUCCEED
+    /// (exercises `is_under_allowed_root`, which must canonicalize the root the
+    /// same way or the `starts_with` check would spuriously reject).
+    #[cfg(windows)]
+    #[test]
+    fn validate_work_dir_strips_verbatim_prefix_on_windows() {
+        let home = tmp_home("validate_verbatim");
+        let work = crate::paths::workspace_dir(&home).join("agent");
+        std::fs::create_dir_all(&work).expect("create dir");
+        let resolved =
+            validate_working_directory(&work, &home).expect("existing path under home must validate");
+        let resolved_str = resolved.to_string_lossy();
+        assert!(
+            !resolved_str.starts_with(r"\\?\"),
+            "validate_working_directory must strip the Windows `\\\\?\\` verbatim \
+             prefix (got {resolved_str:?}); this path becomes the PTY cwd and a \
+             `\\\\?\\` cwd breaks cmd.exe-based backends — keep dunce::canonicalize, \
+             do not fall back to std::fs::canonicalize"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
