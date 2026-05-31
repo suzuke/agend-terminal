@@ -349,22 +349,26 @@ impl StatePatterns {
                 ),
                 // [docs] Context overflow error
                 (AgentState::ContextFull, r"ContextOverflow"),
-                // [measured] Codex 0.120.0 renders approval dialogs with
-                // a distinctive header (`Would you like to run the
-                // following command?`), three numbered options starting
-                // with `Yes, proceed` and ending with `No, and tell
-                // Codex what to do differently`, plus a footer
-                // (`Press enter to confirm or esc to cancel`). Observed
-                // in tests/fixtures/state-replay/codex-perm.raw at byte
-                // ~68K through dismissal at ~90K. The prior pattern
-                // (`Request approval|approve|deny`) never matched any
-                // of the wording. `approve|deny` retained for legacy
-                // and adjacent docs wording; the new alternations cover
-                // the real dialog text. Header + footer are long enough
-                // to avoid false positives on narration lines.
+                // [measured] Codex 0.120.0 renders approval dialogs with a
+                // distinctive header (`Would you like to run the following
+                // command?`) and a footer (`Press enter to confirm or esc to
+                // cancel`). Observed in tests/fixtures/state-replay/codex-perm.raw.
+                //
+                // #1559 (cross-backend of #1546): anchor on the **chrome**
+                // (header + footer) ONLY. The previous pattern also matched bare
+                // option/verb words (`Yes, proceed`, `No, and tell Codex`,
+                // `Request approval`, `approve`, `deny`) — content-FP-prone: a
+                // codex reviewer agent writing "approve this PR" / "Yes, proceed
+                // with the merge", or a pane quoting an approval discussion,
+                // would falsely read as a live PermissionPrompt. The header +
+                // footer are live-dialog chrome that prose doesn't echo, and
+                // each alone still detects the real codex-perm.raw prompt
+                // (verified: the fixture contains both). Pair with the #1546/
+                // #1552 live-bottom-N position gate at the escalation site so
+                // even the chrome can't FP from a scrollback echo.
                 (
                     AgentState::PermissionPrompt,
-                    r"Would you like to run the following command\?|Yes, proceed|No, and tell Codex|Press enter to confirm or esc to cancel|Request approval|approve|deny",
+                    r"Would you like to run the following command\?|Press enter to confirm or esc to cancel",
                 ),
                 // Phase A Piece-1: git conflict output (backend-independent).
                 (

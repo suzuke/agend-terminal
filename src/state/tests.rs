@@ -751,22 +751,36 @@ fn claude_permission_prompt_dialog_match() {
 }
 
 #[test]
-fn permission_prompt_legacy_wording_still_matches() {
-    // #1546: Claude's legacy bare wording (`Allow once|Allow always|approve`) was
-    // CUT — it false-positived on prose. Claude now keys on the chrome footer
-    // (see claude_permission_footer_anchor_1546). Codex/other backends are
-    // untouched and still match their own wording.
-    let cases: &[(Backend, &[&str])] =
-        &[(Backend::Codex, &["Request approval", "approve", "deny"])];
-    for (backend, samples) in cases {
-        let patterns = StatePatterns::for_backend(backend);
-        for sample in *samples {
-            assert_eq!(
-                patterns.detect(sample),
-                Some(AgentState::PermissionPrompt),
-                "{backend:?} legacy wording {sample:?} must still fire PermissionPrompt",
-            );
-        }
+fn codex_permission_chrome_anchor_1559() {
+    // #1559 (cross-backend of #1546): codex PermissionPrompt now keys on the
+    // live-dialog CHROME (header + footer), observed in codex-perm.raw — each
+    // alone fires. The previous bare alternations (`Request approval`,
+    // `approve`, `deny`, `Yes, proceed`, `No, and tell Codex`) were CUT: they
+    // content-FP'd on a codex reviewer's prose / quoted approval discussion.
+    let patterns = StatePatterns::for_backend(&Backend::Codex);
+    // Chrome anchors — each must fire on its own.
+    assert_eq!(
+        patterns.detect("Would you like to run the following command?"),
+        Some(AgentState::PermissionPrompt),
+        "codex dialog header must fire PermissionPrompt",
+    );
+    assert_eq!(
+        patterns.detect("Press enter to confirm or esc to cancel"),
+        Some(AgentState::PermissionPrompt),
+        "codex dialog footer must fire PermissionPrompt",
+    );
+    // FP-block: bare approval words in prose (NOT a live dialog) must NOT fire.
+    for prose in [
+        "I'll approve this PR once CI is green",
+        "Yes, proceed with the merge",
+        "the reviewer will deny the request",
+        "Request approval from the lead before merging",
+    ] {
+        assert_ne!(
+            patterns.detect(prose),
+            Some(AgentState::PermissionPrompt),
+            "#1559: bare approval prose {prose:?} must NOT fire PermissionPrompt",
+        );
     }
 }
 
@@ -1293,20 +1307,31 @@ fn codex_tooluse_does_not_false_positive_on_spinner_or_narration() {
 
 #[test]
 fn codex_permission_prompt_dialog_match() {
-    // Codex 0.120.0 approval dialog — header, every option, and
-    // footer must all fire PermissionPrompt. Observed in
-    // codex-perm.raw byte ~68K-90K.
+    // Codex 0.120.0 approval dialog. #1559: anchor on the live-dialog CHROME
+    // (header + footer) ONLY — both are present in the real box (codex-perm.raw)
+    // and the #1552 position gate keeps the footer at the live bottom. The bare
+    // option rows are NO LONGER anchors (content-FP-prone — they echo in quoted
+    // prose); see codex_permission_chrome_anchor_1559.
     let patterns = StatePatterns::for_backend(&Backend::Codex);
-    for sample in [
+    for chrome in [
         "  Would you like to run the following command?",
-        "  1. Yes, proceed (y)",
-        "› 3. No, and tell Codex what to do differently (esc)",
         "  Press enter to confirm or esc to cancel",
     ] {
         assert_eq!(
-            patterns.detect(sample),
+            patterns.detect(chrome),
             Some(AgentState::PermissionPrompt),
-            "expected PermissionPrompt for {sample:?}"
+            "expected PermissionPrompt for chrome {chrome:?}"
+        );
+    }
+    // Option rows alone (no chrome) must NOT fire — they're echoable prose.
+    for option in [
+        "  1. Yes, proceed (y)",
+        "› 3. No, and tell Codex what to do differently (esc)",
+    ] {
+        assert_ne!(
+            patterns.detect(option),
+            Some(AgentState::PermissionPrompt),
+            "#1559: bare option row {option:?} must NOT fire PermissionPrompt on its own"
         );
     }
 }
