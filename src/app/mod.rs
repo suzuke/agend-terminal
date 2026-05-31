@@ -1138,24 +1138,125 @@ where
                 notification_queue::pending_count(home, &pane.agent_name);
         }
         notification_queue::DraftState::None => {
-            let queued = notification_queue::drain(home, &pane.agent_name);
+            let mut queued = notification_queue::drain(home, &pane.agent_name);
             if queued.is_empty() {
                 pane.pending_notification_count = 0;
                 return;
             }
-            let mut failed_at = None;
-            for (idx, notification) in queued.iter().enumerate() {
-                if injector(&notification.text).is_err() {
-                    failed_at = Some(idx);
-                    break;
+            // #1513: actionable wakes drain FIRST, then ambient (stable by ts).
+            queued.sort_by(|a, b| {
+                b.actionable
+                    .cmp(&a.actionable)
+                    .then_with(|| a.timestamp.cmp(&b.timestamp))
+            });
+            // #1513: if the agent is mid-generation (Thinking/ToolUse), injecting
+            // now would corrupt the PTY stream — HOLD non-expired items and only
+            // release those past their MAX_DEFER cap (anti-starvation). The state
+            // read is lock-free from the snapshot (inject path must not take the
+            // core lock — #1492). Once any inject fails, preserve the remaining
+            // order by holding the rest.
+            let agent_busy = crate::snapshot::agent_is_busy(home, &pane.agent_name);
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let mut keep: Vec<notification_queue::QueuedNotification> = Vec::new();
+            let mut inject_failed = false;
+            for notification in queued {
+                if inject_failed || !flush_release(&notification, agent_busy, now_ms) {
+                    keep.push(notification);
+                } else if injector(&notification.text).is_err() {
+                    inject_failed = true;
+                    keep.push(notification);
                 }
             }
-            if let Some(idx) = failed_at {
-                notification_queue::requeue_all(home, &pane.agent_name, &queued[idx..]);
+            if !keep.is_empty() {
+                notification_queue::requeue_all(home, &pane.agent_name, &keep);
             }
             pane.pending_notification_count =
                 notification_queue::pending_count(home, &pane.agent_name);
         }
+    }
+}
+
+/// #1513: MAX_DEFER anti-starvation caps — once an item has been deferred this
+/// long it is released even while the agent is still busy. Actionable wakes get
+/// a tight cap (work delivery must land fast); ambient can wait longer.
+const ACTIONABLE_MAX_DEFER_MS: i64 = 1_000;
+const AMBIENT_MAX_DEFER_MS: i64 = 7_000;
+
+/// #1513: should this queued item be RELEASED (injected) now vs HELD? Released
+/// when the agent is not mid-generation, OR the item is past its MAX_DEFER cap
+/// (anti-starvation backstop so a perpetually-busy agent never traps the queue).
+/// Pure so the busy-hold / cap-release matrix is unit-testable.
+fn flush_release(
+    item: &notification_queue::QueuedNotification,
+    agent_busy: bool,
+    now_ms: i64,
+) -> bool {
+    if !agent_busy {
+        return true;
+    }
+    let cap = if item.actionable {
+        ACTIONABLE_MAX_DEFER_MS
+    } else {
+        AMBIENT_MAX_DEFER_MS
+    };
+    now_ms.saturating_sub(item.deferred_since_ms) >= cap
+}
+
+#[cfg(test)]
+mod flush_release_tests_1513 {
+    use super::{flush_release, ACTIONABLE_MAX_DEFER_MS};
+    use crate::notification_queue::QueuedNotification;
+
+    fn item(actionable: bool, deferred_since_ms: i64) -> QueuedNotification {
+        QueuedNotification {
+            text: "x".into(),
+            timestamp: String::new(),
+            actionable,
+            deferred_since_ms,
+        }
+    }
+
+    #[test]
+    fn not_busy_always_releases() {
+        let now = 10_000;
+        assert!(
+            flush_release(&item(true, now), false, now),
+            "idle agent releases actionable"
+        );
+        assert!(
+            flush_release(&item(false, now), false, now),
+            "idle agent releases ambient"
+        );
+    }
+
+    #[test]
+    fn busy_holds_then_cap_releases() {
+        let base = 100_000;
+        // fresh defer while busy → held
+        assert!(
+            !flush_release(&item(true, base), true, base),
+            "busy holds fresh actionable"
+        );
+        assert!(
+            !flush_release(&item(false, base), true, base),
+            "busy holds fresh ambient"
+        );
+        // past the actionable cap (1s) but within ambient cap (7s) → actionable releases, ambient holds
+        let mid = base + ACTIONABLE_MAX_DEFER_MS + 1;
+        assert!(
+            flush_release(&item(true, base), true, mid),
+            "actionable releases past its 1s cap even while busy"
+        );
+        assert!(
+            !flush_release(&item(false, base), true, mid),
+            "ambient still held at ~1s while busy"
+        );
+        // well past ambient cap → ambient releases too
+        let late = base + 8_000;
+        assert!(
+            flush_release(&item(false, base), true, late),
+            "ambient releases past its cap while busy"
+        );
     }
 }
 

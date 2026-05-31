@@ -23,6 +23,16 @@ const SUBMIT_METADATA_KEY: &str = "last_submit_epoch_ms";
 pub struct QueuedNotification {
     pub text: String,
     pub timestamp: String,
+    /// #1513: actionable work-delivery wake (ci-ready / task / query) vs ambient.
+    /// Actionable items drain FIRST and carry a tighter MAX_DEFER cap. `serde
+    /// default` keeps pre-#1513 queue lines (no field) deserializing as ambient.
+    #[serde(default)]
+    pub actionable: bool,
+    /// #1513: epoch-ms when this item was FIRST deferred. Drives the MAX_DEFER
+    /// anti-starvation cap (release after the cap even if the agent stays busy).
+    /// Preserved across requeue so the cap counts from the original defer.
+    #[serde(default)]
+    pub deferred_since_ms: i64,
 }
 
 fn queue_path(home: &Path, agent_name: &str) -> PathBuf {
@@ -153,16 +163,37 @@ pub fn drain_one(home: &Path, agent_name: &str) -> Option<QueuedNotification> {
 }
 
 pub fn enqueue(home: &Path, agent_name: &str, text: &str) -> anyhow::Result<()> {
+    enqueue_classified(home, agent_name, text, false)
+}
+
+/// #1513: enqueue a notification tagged actionable/ambient. `deferred_since_ms`
+/// is stamped now (first defer). Actionable items drain first and carry a
+/// tighter MAX_DEFER cap; ambient retains the legacy contract.
+pub fn enqueue_classified(
+    home: &Path,
+    agent_name: &str,
+    text: &str,
+    actionable: bool,
+) -> anyhow::Result<()> {
+    let msg = QueuedNotification {
+        text: text.to_string(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        actionable,
+        deferred_since_ms: chrono::Utc::now().timestamp_millis(),
+    };
+    append_queued(home, agent_name, &msg)
+}
+
+/// #1513: append a fully-formed `QueuedNotification` verbatim, preserving its
+/// `actionable` + `deferred_since_ms` (used by `requeue_all` so the MAX_DEFER
+/// cap counts from the ORIGINAL defer, not the requeue).
+fn append_queued(home: &Path, agent_name: &str, msg: &QueuedNotification) -> anyhow::Result<()> {
     let path = queue_path(home, agent_name);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let msg = QueuedNotification {
-        text: text.to_string(),
-        timestamp: chrono::Utc::now().to_rfc3339(),
-    };
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    writeln!(file, "{}", serde_json::to_string(&msg)?)?;
+    writeln!(file, "{}", serde_json::to_string(msg)?)?;
     Ok(())
 }
 
@@ -197,7 +228,9 @@ pub fn drain(home: &Path, agent_name: &str) -> Vec<QueuedNotification> {
 
 pub fn requeue_all(home: &Path, agent_name: &str, notifications: &[QueuedNotification]) {
     for notification in notifications {
-        let _ = enqueue(home, agent_name, &notification.text);
+        // #1513: preserve actionable + deferred_since_ms verbatim so the
+        // MAX_DEFER cap keeps counting from the original defer.
+        let _ = append_queued(home, agent_name, notification);
     }
 }
 
@@ -226,6 +259,38 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).ok();
         dir
+    }
+
+    #[test]
+    fn enqueue_classified_round_trips_actionable_and_deferred_since_1513() {
+        let home = tmp_home("classified");
+        enqueue_classified(&home, "a", "work", true).expect("enqueue actionable");
+        enqueue(&home, "a", "ambient").expect("enqueue ambient"); // actionable=false default
+        let drained = drain(&home, "a");
+        assert_eq!(drained.len(), 2);
+        let actionable = drained
+            .iter()
+            .find(|q| q.text == "work")
+            .expect("find actionable");
+        assert!(
+            actionable.actionable,
+            "actionable flag preserved across serde"
+        );
+        assert!(actionable.deferred_since_ms > 0, "deferred_since stamped");
+        let ambient = drained
+            .iter()
+            .find(|q| q.text == "ambient")
+            .expect("find ambient");
+        assert!(!ambient.actionable, "ambient default false");
+        // requeue preserves the original deferred_since (cap counts from first defer)
+        let since = actionable.deferred_since_ms;
+        requeue_all(&home, "a", std::slice::from_ref(actionable));
+        let again = drain(&home, "a");
+        assert_eq!(
+            again[0].deferred_since_ms, since,
+            "requeue preserves deferred_since"
+        );
+        std::fs::remove_dir_all(home).ok();
     }
 
     #[test]
