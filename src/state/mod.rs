@@ -254,6 +254,24 @@ pub(crate) struct TransitionRecord {
 
 const MARKER_SCAN_TAIL_LINES: usize = 5;
 
+/// #1518: bottom-N bound for HIGH_FP error re-judging. Detection is
+/// level-triggered (re-judged every feed), so an error string lingering
+/// anywhere in the viewport keeps re-firing the error state — a retry storm
+/// even after the agent has visually moved on. Bounding HIGH_FP re-matching to
+/// the bottom `ERROR_TAIL_SCAN_LINES` rows lets an error scroll out of the live
+/// tail and recover naturally (non-timer).
+///
+/// Value chosen from fixture evidence: across every canonical error recording
+/// in `tests/fixtures/state-replay/` (claude/gemini/kiro/opencode rate-limit,
+/// throttle, 429, usage-limit), a *fresh* error marker sits at depth 5–6 rows
+/// from the bottom (max 6). 15 clears that by >2× — generous headroom for
+/// multi-line / wrapped error bodies not in the fixtures — while still
+/// suppressing an error that newer content has pushed into the top portion of a
+/// typical 24–50 row viewport. Deliberately conservative: bias is toward NOT
+/// dropping a real error. Distinct from `MARKER_SCAN_TAIL_LINES` (a tighter
+/// structural-marker scan) — do not collapse the two.
+const ERROR_TAIL_SCAN_LINES: usize = 15;
+
 fn recent_screen_tail(screen_text: &str, n: usize) -> String {
     let lines: Vec<&str> = screen_text.lines().collect();
     let start = lines.len().saturating_sub(n);
@@ -335,6 +353,23 @@ fn matched_span_has_red(screen_text: &str, matched: &str, fg: &[CellFg]) -> bool
         search = byte_off + matched.len();
     }
     false
+}
+
+/// #1518: is the matched marker still visible in the live bottom-`n` rows? A
+/// HIGH_FP error phrase that has scrolled up past the tail (pushed there by the
+/// agent's post-recovery output) is stale — it must NOT keep re-firing the error
+/// transition every feed. Returns true iff `matched` occurs within the last `n`
+/// rows of `screen_text` (where the agent's current activity is); a copy that
+/// only survives in the scrolled-up region returns false → caller suppresses.
+fn matched_span_in_recent_tail(screen_text: &str, matched: &str, n: usize) -> bool {
+    if matched.is_empty() {
+        return false;
+    }
+    // Trim trailing blank rows so "bottom-N" tracks the last N lines of actual
+    // CONTENT (where the agent's cursor/activity is), not the blank padding the
+    // emulator leaves below the cursor on a not-yet-full screen — otherwise a
+    // single error line on an near-empty screen would look "scrolled out".
+    recent_screen_tail(screen_text.trim_end(), n).contains(matched)
 }
 
 /// #1450: the `fg` span of the FIRST on-screen occurrence of `matched`, for
@@ -568,12 +603,39 @@ impl StateTracker {
             // was supplied (text-only callers).
             match patterns.detect_with_match(screen_text) {
                 Some((detected, matched)) => {
-                    if self.anchor_on_red
-                        && is_high_fp_state(detected)
+                    let high_fp = is_high_fp_state(detected);
+                    // #1450 red anchor: a HIGH_FP marker needs at least one red
+                    // rendered cell, else it's prose ("Error: ...") not a state.
+                    let anchor_fail = self.anchor_on_red
+                        && high_fp
                         && !fg.is_empty()
-                        && !matched_span_has_red(screen_text, matched, fg)
-                    {
-                        self.log_anchor_suppress(detected, matched, screen_text, fg);
+                        && !matched_span_has_red(screen_text, matched, fg);
+                    // #1518 position gate: a HIGH_FP marker that has scrolled out
+                    // of the live bottom-N rows (e.g. an ApiError / ServerRateLimit
+                    // line pushed up by the post-recovery `continue` output) is
+                    // stale — the agent has moved on, so it must NOT keep re-firing
+                    // the error transition (the level-triggered re-match that drove
+                    // the retry storm). Scoped to HIGH_FP/error states ONLY:
+                    // Ready/Idle and modal/interactive prompts keep full-screen
+                    // scanning, because a modal can legitimately sit above the tail.
+                    let stale_position = high_fp
+                        && !matched_span_in_recent_tail(
+                            screen_text,
+                            matched,
+                            ERROR_TAIL_SCAN_LINES,
+                        );
+                    if anchor_fail || stale_position {
+                        if anchor_fail {
+                            self.log_anchor_suppress(detected, matched, screen_text, fg);
+                        } else {
+                            tracing::debug!(
+                                target: "state_detection",
+                                agent = %self.instance_name,
+                                state = ?detected,
+                                tail_rows = ERROR_TAIL_SCAN_LINES,
+                                "#1518: HIGH_FP marker scrolled out of the live tail — suppressing stale error transition"
+                            );
+                        }
                         // Treat as no detection — fall through to
                         // structural fallback / latch maintenance.
                         if matches!(self.current, AgentState::Starting)
