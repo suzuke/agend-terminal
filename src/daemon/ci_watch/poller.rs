@@ -601,26 +601,105 @@ fn aggregate_conclusion_for_indices<'a>(
 
 /// Pure function: build the inbox body text for a CI notification.
 /// Headline + optional failure detail + run URL.
+/// CI-fail-notify: strip the trailing ` (Attempt N)` / ` (Retry N)` suffix
+/// GitHub appends to re-run check names, so a rerun of the SAME checks hashes
+/// identically and doesn't look like a changed failing set.
+fn strip_attempt_suffix(name: &str) -> &str {
+    if let Some(idx) = name.rfind(" (") {
+        if let Some(inner) = name[idx + 2..].strip_suffix(')') {
+            let lower = inner.to_ascii_lowercase();
+            if lower.starts_with("attempt ") || lower.starts_with("retry ") {
+                return name[..idx].trim_end();
+            }
+        }
+    }
+    name
+}
+
+/// CI-fail-notify: stable fingerprint of the SET of failing check names. The set
+/// is normalized (attempt-suffix stripped, deduped, sorted) then FNV-1a hashed —
+/// deterministic across processes/restarts (unlike `DefaultHasher`), so the
+/// persisted `failed_set_fingerprint` compares correctly after a daemon restart.
+/// Re-notify fires iff this changes → suppresses same-set re-polls and same-set
+/// reruns, surfaces a genuinely different failing set.
+pub(crate) fn failure_fingerprint(failed_checks: &[String]) -> String {
+    use std::collections::BTreeSet;
+    let set: BTreeSet<&str> = failed_checks
+        .iter()
+        .map(|c| strip_attempt_suffix(c))
+        .collect();
+    let joined = set.into_iter().collect::<Vec<_>>().join("\n");
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a 64-bit
+    for b in joined.as_bytes() {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// CI-fail-notify: format a fetched failed-log blob for inline injection. Keeps
+/// the LAST `max_lines` lines (the error is at the end), then UTF-8-safely
+/// byte-truncates FROM THE FRONT if still over `max_bytes` (preserving the most
+/// recent output), and appends a footer pointing at the full log.
+pub(crate) fn format_log_tail(
+    raw: &str,
+    max_lines: usize,
+    max_bytes: usize,
+    run_id: u64,
+) -> String {
+    let lines: Vec<&str> = raw.lines().collect();
+    let dropped_lines = lines.len() > max_lines;
+    let kept = if dropped_lines {
+        &lines[lines.len() - max_lines..]
+    } else {
+        &lines[..]
+    };
+    let mut tail = kept.join("\n");
+    let mut dropped_bytes = false;
+    if tail.len() > max_bytes {
+        let mut cut = tail.len() - max_bytes;
+        while cut < tail.len() && !tail.is_char_boundary(cut) {
+            cut += 1; // advance to the next UTF-8 boundary
+        }
+        tail = tail[cut..].to_string();
+        dropped_bytes = true;
+    }
+    if dropped_lines || dropped_bytes {
+        format!("{tail}\n… (truncated; `gh run view {run_id} --log-failed` for full log)")
+    } else {
+        tail
+    }
+}
+
 pub(crate) fn build_inbox_body(
     headline: &str,
     conclusion: &str,
     failure_detail: Option<&str>,
     run_url: &str,
     run_id: Option<u64>,
+    log_tail: Option<&str>,
 ) -> String {
     if conclusion == "failure" {
         let detail = failure_detail.unwrap_or("unknown step");
         let run_id_str = run_id
             .map(|id| id.to_string())
             .unwrap_or_else(|| "<run_id>".to_string());
-        format!(
-            "{headline}\nDetail: {detail}\nURL: {run_url}\n\n\
-             ⚠ CI failure checklist:\n\
-             1. `gh run view {run_id_str} --log-failed` — read the actual error\n\
+        let mut body = format!("{headline}\nDetail: {detail}\nURL: {run_url}");
+        // CI-fail-notify: embed the daemon-fetched failed-log tail inline so the
+        // agent doesn't need an extra `gh run view` round-trip. None → fall back
+        // to the original instruction-only body. The full-log command stays in
+        // the checklist footer below.
+        if let Some(tail) = log_tail.filter(|t| !t.is_empty()) {
+            body.push_str(&format!("\n\n── failed log (tail) ──\n{tail}"));
+        }
+        body.push_str(&format!(
+            "\n\n⚠ CI failure checklist:\n\
+             1. Read the failed-log tail above (full: `gh run view {run_id_str} --log-failed`)\n\
              2. If infra flake → `gh run rerun {run_id_str} --failed`\n\
              3. If real failure → fix code, push, wait for green\n\
              4. Do NOT dismiss without evidence"
-        )
+        ));
+        body
     } else {
         format!(
             "{headline}\nURL: {run_url}\n\n\
@@ -721,9 +800,8 @@ async fn check_early_job_failures(
     if pr.current_sha.is_empty() {
         return false;
     }
-    if state.early_fail_notified_sha.as_deref() == Some(pr.current_sha.as_str()) {
-        return false;
-    }
+    // CI-fail-notify: the SHA-only dedup moved AFTER the failing-set fingerprint
+    // is computed (below) so a changed failing set on the same SHA re-notifies.
     let in_progress: Vec<&CiRun> = pr
         .runs
         .iter()
@@ -763,6 +841,23 @@ async fn check_early_job_failures(
         return false;
     }
 
+    // CI-fail-notify: re-notify only when the failing-check SET changes. Same
+    // sha + same set (incl. same-set reruns, via the attempt-suffix strip) →
+    // suppress; a different/larger failing set on the same sha → re-notify. A
+    // missing stored fingerprint (legacy state notified before this field
+    // existed) counts as "unchanged" so the original #1326 SHA-dedup is
+    // preserved — we never spuriously re-notify an already-notified SHA.
+    let fingerprint = failure_fingerprint(&all_failed);
+    let already_this_sha =
+        state.early_fail_notified_sha.as_deref() == Some(pr.current_sha.as_str());
+    let fingerprint_unchanged = state
+        .failed_set_fingerprint
+        .as_deref()
+        .is_none_or(|fp| fp == fingerprint);
+    if already_this_sha && fingerprint_unchanged {
+        return false;
+    }
+
     let sha_short = &pr.current_sha[..pr.current_sha.len().min(7)];
     let headline = format!(
         "[ci-fail] {}@{} ({}): failure",
@@ -773,9 +868,18 @@ async fn check_early_job_failures(
     if !all_running.is_empty() {
         body.push_str(&format!("\nStill running: {}", all_running.join(", ")));
     }
+    // CI-fail-notify: daemon pre-fetches the failed-log tail and embeds it inline
+    // (no extra `gh run view` round-trip for the agent). None → instruction only.
+    if let Some(tail) = provider
+        .fetch_failure_log_tail(ctx.repo, first_run_id, 120)
+        .await
+        .filter(|t| !t.is_empty())
+    {
+        body.push_str(&format!("\n\n── failed log (tail) ──\n{tail}"));
+    }
     body.push_str(&format!(
         "\n\n⚠ CI failure checklist:\n\
-         1. `gh run view {first_run_id} --log-failed` — read the actual error\n\
+         1. Read the failed-log tail above (full: `gh run view {first_run_id} --log-failed`)\n\
          2. If infra flake → `gh run rerun {first_run_id} --failed`\n\
          3. If real failure → fix code, push, wait for green\n\
          4. Do NOT dismiss without evidence"
@@ -794,6 +898,7 @@ async fn check_early_job_failures(
     }
 
     state.early_fail_notified_sha = Some(pr.current_sha.clone());
+    state.failed_set_fingerprint = Some(fingerprint);
     true
 }
 
@@ -1198,12 +1303,24 @@ async fn fan_out_notifications(
             } else {
                 None
             };
+            // CI-fail-notify: daemon pre-fetches the failed-log tail so the
+            // agent doesn't need an extra `gh run view` round-trip. Async on the
+            // ci runtime (the provider impl uses `gh … --log-failed` via
+            // tokio::process — never block_on the shared runtime, #1476).
+            let log_tail = if conclusion == Some("failure") {
+                provider
+                    .fetch_failure_log_tail(ctx.repo, *run_id, 120)
+                    .await
+            } else {
+                None
+            };
             let body = build_inbox_body(
                 &headline,
                 conclusion.unwrap_or(""),
                 failure_detail.as_deref(),
                 &run.url,
                 Some(*run_id),
+                log_tail.as_deref(),
             );
 
             let repo_branch_key = format!("{}@{}", ctx.repo, ctx.branch);
