@@ -1181,6 +1181,36 @@ pub fn envelopes_for_task(home: &Path, task_id: &str) -> anyhow::Result<Vec<Task
     Ok(all)
 }
 
+/// #1077: stream every persisted envelope (archive + live log), sorted by
+/// timestamp → instance → seq. Unlike [`replay`] this preserves per-event
+/// timestamps (replay folds to state and drops them), which the token
+/// time-join needs to build per-task `[start, end)` windows. Read-only; no
+/// schema change. Fails closed on an unparseable envelope, same as replay.
+pub fn stream_envelopes(home: &Path) -> anyhow::Result<Vec<TaskEventEnvelope>> {
+    let mut all = Vec::new();
+
+    let archive = archive_dir(home);
+    if archive.is_dir() {
+        let mut archives: Vec<std::path::PathBuf> = std::fs::read_dir(&archive)?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
+            .collect();
+        archives.sort();
+        for path in archives {
+            read_envelopes_strict(&path, &mut all)?;
+        }
+    }
+
+    let lp = log_path(home);
+    if lp.exists() {
+        read_envelopes_strict(&lp, &mut all)?;
+    }
+
+    sort_envelopes(&mut all);
+    Ok(all)
+}
+
 /// Sort envelopes by timestamp (absolute nanos) → instance → seq.
 /// Schwartzian transform: parse timestamps once into a parallel key vec,
 /// then sort both in lockstep — avoids re-parsing on every comparison.
