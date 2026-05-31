@@ -1398,16 +1398,19 @@ mod tests {
     /// refactor: `collect_codex` (now Σdelta) reports the cumulative total.
     #[test]
     fn collect_codex_per_instance_unchanged_after_delta_refactor() {
-        let cwd = tmp("codex-collect-cwd");
         let sessions = tmp("codex-sessions");
         let day = sessions.join("2026").join("04").join("25");
         std::fs::create_dir_all(&day).unwrap();
+        // Virtual forward-slash cwd so the `codex_session` fixture (built with
+        // `format!`, which does NOT escape backslashes) is valid JSON on Windows
+        // too — a real tmp path embeds `\U…` and breaks `serde_json::from_str`.
+        let cwd = "/virtual/workspace/dev-a";
         std::fs::write(
             day.join("rollout-x.jsonl"),
-            codex_session(cwd.to_str().unwrap(), "gpt-5-codex"),
+            codex_session(cwd, "gpt-5-codex"),
         )
         .unwrap();
-        let roots = vec![("dev-a".to_string(), vec![cwd.clone()])];
+        let roots = vec![("dev-a".to_string(), vec![PathBuf::from(cwd)])];
         let by = collect_codex(&sessions, &roots, None);
         let agg = &by["dev-a"]["gpt-5-codex"];
         assert_eq!(agg.input, 1200, "Σdelta per-instance == cumulative");
