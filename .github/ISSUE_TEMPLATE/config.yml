@@ -1,0 +1,3 @@
+# Require contributors to go through a template (which carries the prior-art
+# check) rather than opening a blank issue that skips it.
+blank_issues_enabled: false

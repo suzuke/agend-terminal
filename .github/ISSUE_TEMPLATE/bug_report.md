@@ -5,6 +5,17 @@ title: 'bug: '
 labels: ['bug']
 ---
 
+## Prior art check (required)
+
+<!-- Reports that duplicate an existing (open OR closed) issue, or re-raise an
+already-resolved topic without new evidence, may be closed without further
+review. A quick search saves everyone time. -->
+
+- [ ] I searched **open and closed** issues for prior reports or prior
+      conclusions on this, and linked any I found below.
+- [ ] This is not a re-report of an already-resolved issue — or, if it
+      revisits one, I explain what new evidence or change warrants reopening it.
+
 ## Symptom
 
 <!-- One sentence: what's user/operator-visible going wrong.
