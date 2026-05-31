@@ -424,6 +424,82 @@ pub(crate) fn maybe_notify_member_state_change(
     true
 }
 
+/// #1530: a reaction-worthy net state change for one agent in one tick.
+/// `to` is guaranteed reaction-worthy (`is_notify_error_class`, which
+/// includes `UsageLimit`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReactionDecision {
+    from: crate::state::AgentState,
+    to: crate::state::AgentState,
+}
+
+/// #1530: enriched [`ReactionDecision`] carrying the data captured under the
+/// core lock so the actual reaction emit can run lock-free after `drop(core)`.
+struct ReactionIntent {
+    from: crate::state::AgentState,
+    to: crate::state::AgentState,
+    backend: Option<crate::backend::Backend>,
+    /// 3-line PTY tail for the operator UsageLimit notice.
+    snippet: String,
+    /// 10-line PTY tail for the member-state-change notice.
+    pane_tail: String,
+}
+
+/// #1530: which reactions a net `to` state drives. Pure + testable — proves the
+/// emit routing (esp. that a `UsageLimit` final state ALSO produces a
+/// `MemberNotify`, which the pre-#1530 `propagate ... continue` silently ate).
+#[derive(Debug, PartialEq, Eq)]
+enum ReactionKind {
+    NotifyOperator,
+    Propagate,
+    MemberNotify,
+}
+
+/// #1530: derive the NET state change across the drained transition list and
+/// return a reaction decision iff the net `to` differs from the net `from` AND
+/// is reaction-worthy.
+///
+/// Net-state (not per-transition) semantics: an intra-tick flap that enters
+/// then leaves an error state (e.g. `Ready→UsageLimit→Ready`) has no net change
+/// → no reaction, so transient blips don't spam the operator/orchestrator.
+/// Transition LOGGING records every transition separately (#1527); only the
+/// reaction converges to the final state.
+///
+/// This replaces the pre-#1530 `if prev_state != new_state` gate, which was
+/// blind to feed-driven transitions (they complete async in the read-loop
+/// thread, so `prev == new` by the next supervisor tick) — see #1530.
+fn reactions_from_transitions(
+    transitions: &[crate::state::TransitionRecord],
+) -> Vec<ReactionDecision> {
+    let (Some(first), Some(last)) = (transitions.first(), transitions.last()) else {
+        return Vec::new();
+    };
+    let (from, to) = (first.from, last.to);
+    if from == to || !to.is_notify_error_class() {
+        return Vec::new();
+    }
+    vec![ReactionDecision { from, to }]
+}
+
+/// #1530: pure emit-routing. `UsageLimit` → operator notice (+ propagate when
+/// enabled) AND member-notify (UsageLimit ∈ `is_notify_error_class`); any other
+/// error-class state → member-notify only. Keeping this separate from the emit
+/// lets a unit test assert no reaction is dropped (the regression the removed
+/// `continue` caused).
+fn reaction_kinds(to: crate::state::AgentState, propagation_enabled: bool) -> Vec<ReactionKind> {
+    let mut kinds = Vec::new();
+    if to == crate::state::AgentState::UsageLimit {
+        kinds.push(ReactionKind::NotifyOperator);
+        if propagation_enabled {
+            kinds.push(ReactionKind::Propagate);
+        }
+    }
+    if to.is_notify_error_class() {
+        kinds.push(ReactionKind::MemberNotify);
+    }
+    kinds
+}
+
 /// One iteration of the supervisor loop. Public for tests.
 fn tick(
     home: &std::path::Path,
@@ -447,6 +523,10 @@ fn tick(
         // before running `format!` and the Telegram spawn. `tail_lines`
         // allocates a fresh String, so the lock window is bounded by the
         // vterm copy — no async IO or string formatting held against it.
+        //
+        // #1530: reaction intents collected under the core lock below, emitted
+        // lock-free after the lock drops (the member-notify path self-IPCs).
+        let mut reaction_intents: Vec<ReactionIntent> = Vec::new();
         let action: Option<NoticeAction> = {
             let mut core = core.lock();
 
@@ -477,9 +557,7 @@ fn tick(
 
             // Expire stale latched states (ToolUse/Thinking) that feed()
             // can't reach when the agent goes quiet (no PTY output).
-            let prev_state = core.state.current;
             core.state.tick();
-            let new_state = core.state.current;
 
             // #1527: log EVERY transition recorded at its source (read-loop
             // `feed` AND `tick`), by draining the per-tracker buffer — replaces
@@ -503,62 +581,35 @@ fn tick(
                 );
             }
 
-            // Sprint 43: member-state-change notify to orchestrator.
-            // #1527 NOTE: these reactions are STILL gated on the tick prev/new
-            // comparison, so feed-driven UsageLimit / error transitions miss
-            // them — a PRE-EXISTING latent bug (confirmed in the #1527 spike).
-            // De-gating entangles with #1492 lock discipline (these run under
-            // the core lock and may self-IPC), so it is tracked as a separate
-            // follow-up. Transition LOGGING above is now complete regardless.
-            if prev_state != new_state {
-                // #1176: UsageLimit reaction pipeline.
-                if new_state == crate::state::AgentState::UsageLimit {
-                    let backend_cmd = {
-                        let reg = crate::agent::lock_registry(registry);
-                        reg.get(&instance_id).map(|h| h.backend_command.clone())
-                    };
-                    let backend = backend_cmd
-                        .as_deref()
-                        .and_then(crate::backend::Backend::from_command);
-                    let config = crate::runtime_config::get();
-                    // Always notify operator.
-                    if let Some(ref b) = backend {
-                        crate::daemon::usage_limit::notify_operator_usage_limit(
-                            home,
-                            &name,
-                            b,
-                            &snippet,
-                            &[],
-                        );
-                    }
-                    // Propagate only if enabled.
-                    if config.usage_limit_propagation_enabled {
-                        if let Some(ref b) = backend {
-                            drop(core);
-                            let affected = crate::daemon::usage_limit::propagate_usage_limit(
-                                home, &name, b, registry,
-                            );
-                            tracing::warn!(
-                                agent = %name,
-                                affected = ?affected,
-                                "UsageLimit propagated to same-backend agents"
-                            );
-                            continue; // core was dropped
-                        }
-                    }
+            // #1530: de-gate the UsageLimit + member-state reactions off the
+            // (feed-blind) `prev != new` tick comparison. React on the NET state
+            // change derived from the #1527 drained transition list, which is
+            // authoritative and includes feed-driven transitions (the ones the
+            // old gate missed — they complete async, so prev==new at tick).
+            //
+            // Collect intents UNDER the core lock here (capturing backend + PTY
+            // tails), then emit them lock-free AFTER `drop(core)` below. The
+            // member-notify path self-IPCs (`api::call(INJECT)` → orchestrator)
+            // and must not run under the core lock — that would risk the #1492
+            // lock-across-self-IPC deadlock. NOTE: the #1492 guard is registry-
+            // scoped and would NOT catch this core-held self-IPC (the reaction
+            // holds the per-agent core, not the registry) — that guard blind
+            // spot is tracked in #1535; until then this site's regression
+            // protection is the pure-fn tests + this comment.
+            for decision in reactions_from_transitions(&transitions) {
+                let backend = {
+                    let reg = crate::agent::lock_registry(registry);
+                    reg.get(&instance_id).map(|h| h.backend_command.clone())
                 }
-
-                if new_state.is_notify_error_class() {
-                    let pane_tail = core.vterm.tail_lines(10);
-                    maybe_notify_member_state_change(
-                        home,
-                        &name,
-                        prev_state,
-                        new_state,
-                        &pane_tail,
-                        notify_tracks,
-                    );
-                }
+                .as_deref()
+                .and_then(crate::backend::Backend::from_command);
+                reaction_intents.push(ReactionIntent {
+                    from: decision.from,
+                    to: decision.to,
+                    backend,
+                    snippet: snippet.clone(),
+                    pane_tail: core.vterm.tail_lines(10),
+                });
             }
 
             // §4.4 stale decay: clear waiting_on when heartbeat is stale.
@@ -608,6 +659,55 @@ fn tick(
                 None
             }
         };
+
+        // #1530: emit the collected reactions now that the core lock is dropped
+        // (#1492-safe — the member-notify self-IPC no longer runs under the
+        // lock; propagate already required the drop pre-#1530). Routed through
+        // `reaction_kinds` so a UsageLimit final state fires BOTH the operator/
+        // propagate path AND member-notify — the latter was silently eaten by
+        // the old propagate `continue`.
+        if !reaction_intents.is_empty() {
+            let config = crate::runtime_config::get();
+            for intent in &reaction_intents {
+                for kind in reaction_kinds(intent.to, config.usage_limit_propagation_enabled) {
+                    match kind {
+                        ReactionKind::NotifyOperator => {
+                            if let Some(ref b) = intent.backend {
+                                crate::daemon::usage_limit::notify_operator_usage_limit(
+                                    home,
+                                    &name,
+                                    b,
+                                    &intent.snippet,
+                                    &[],
+                                );
+                            }
+                        }
+                        ReactionKind::Propagate => {
+                            if let Some(ref b) = intent.backend {
+                                let affected = crate::daemon::usage_limit::propagate_usage_limit(
+                                    home, &name, b, registry,
+                                );
+                                tracing::warn!(
+                                    agent = %name,
+                                    affected = ?affected,
+                                    "UsageLimit propagated to same-backend agents"
+                                );
+                            }
+                        }
+                        ReactionKind::MemberNotify => {
+                            maybe_notify_member_state_change(
+                                home,
+                                &name,
+                                intent.from,
+                                intent.to,
+                                &intent.pane_tail,
+                                notify_tracks,
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         match action {
             Some(NoticeAction::Stall { tail, silent_secs }) => {
@@ -1042,6 +1142,119 @@ mod tests {
         assert!(!AgentState::Idle.is_notify_error_class());
         assert!(!AgentState::ToolUse.is_notify_error_class());
         assert!(!AgentState::Starting.is_notify_error_class());
+    }
+
+    // ── #1530: feed-driven UsageLimit / member-state reaction de-gate ──
+
+    fn tr(
+        from: crate::state::AgentState,
+        to: crate::state::AgentState,
+    ) -> crate::state::TransitionRecord {
+        crate::state::TransitionRecord {
+            from,
+            to,
+            ts: "2026-05-31T00:00:00+00:00".to_string(),
+        }
+    }
+
+    /// RED ①: a feed-driven `Ready → UsageLimit` (the read-loop records it, so
+    /// the drain carries it even though `prev == new` at the supervisor tick)
+    /// MUST still produce a reaction decision. Pre-#1530 the `prev != new` gate
+    /// skipped it → the UsageLimit reaction was dead since #1176.
+    #[test]
+    fn reactions_from_transitions_fires_on_feed_driven_usagelimit() {
+        use crate::state::AgentState;
+        let decisions =
+            reactions_from_transitions(&[tr(AgentState::Ready, AgentState::UsageLimit)]);
+        assert_eq!(
+            decisions,
+            vec![ReactionDecision {
+                from: AgentState::Ready,
+                to: AgentState::UsageLimit
+            }],
+            "feed-driven →UsageLimit must yield a reaction decision (de-gated off prev!=new)"
+        );
+    }
+
+    /// RED ②: an intra-tick flap (`Ready → UsageLimit → Ready`) has no NET state
+    /// change → no reaction. Avoids double/noise notifications. (Logging still
+    /// records every transition via #1527 — that path is independent.)
+    #[test]
+    fn reactions_from_transitions_converges_on_net_state_no_flap_double_fire() {
+        use crate::state::AgentState;
+        let decisions = reactions_from_transitions(&[
+            tr(AgentState::Ready, AgentState::UsageLimit),
+            tr(AgentState::UsageLimit, AgentState::Ready),
+        ]);
+        assert!(
+            decisions.is_empty(),
+            "flap in-and-out (net Ready→Ready) must not fire a reaction, got {decisions:?}"
+        );
+    }
+
+    /// Net change to a non-error state, and the empty drain, both yield nothing.
+    #[test]
+    fn reactions_from_transitions_ignores_non_error_and_empty() {
+        use crate::state::AgentState;
+        assert!(
+            reactions_from_transitions(&[]).is_empty(),
+            "empty drain → no reaction"
+        );
+        assert!(
+            reactions_from_transitions(&[tr(AgentState::Ready, AgentState::ToolUse)]).is_empty(),
+            "net change to a non-error state → no reaction"
+        );
+    }
+
+    /// Net change THROUGH a flap into a different error state reacts on the
+    /// final state: `UsageLimit → Ready → Hang` ⇒ react on Hang, not UsageLimit.
+    #[test]
+    fn reactions_from_transitions_reacts_on_final_error_state() {
+        use crate::state::AgentState;
+        let decisions = reactions_from_transitions(&[
+            tr(AgentState::UsageLimit, AgentState::Ready),
+            tr(AgentState::Ready, AgentState::Hang),
+        ]);
+        assert_eq!(
+            decisions,
+            vec![ReactionDecision {
+                from: AgentState::UsageLimit,
+                to: AgentState::Hang
+            }],
+            "net from = first.from, net to = last.to (final state)"
+        );
+    }
+
+    /// RED ③: a UsageLimit final state drives BOTH the operator/propagate path
+    /// AND member-notify — the latter was silently eaten by the pre-#1530
+    /// propagate `continue`. A non-UsageLimit error state drives member-notify
+    /// only; a non-error state drives nothing.
+    #[test]
+    fn reaction_kinds_usagelimit_does_not_drop_member_notify() {
+        use crate::state::AgentState;
+        assert_eq!(
+            reaction_kinds(AgentState::UsageLimit, true),
+            vec![
+                ReactionKind::NotifyOperator,
+                ReactionKind::Propagate,
+                ReactionKind::MemberNotify
+            ],
+            "UsageLimit + propagation: all three reactions fire (member-notify NOT eaten)"
+        );
+        assert_eq!(
+            reaction_kinds(AgentState::UsageLimit, false),
+            vec![ReactionKind::NotifyOperator, ReactionKind::MemberNotify],
+            "UsageLimit without propagation: operator notice + member-notify"
+        );
+        assert_eq!(
+            reaction_kinds(AgentState::Hang, true),
+            vec![ReactionKind::MemberNotify],
+            "non-UsageLimit error state: member-notify only"
+        );
+        assert!(
+            reaction_kinds(AgentState::Ready, true).is_empty(),
+            "non-error state: no reaction"
+        );
     }
 
     /// NOTIFY_COOLDOWN constant is 60 seconds.
