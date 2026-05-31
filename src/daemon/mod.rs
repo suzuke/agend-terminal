@@ -948,7 +948,7 @@ fn replay_missed_at_startup(home: &Path, registry: &AgentRegistry) {
         let reg = agent::lock_registry(registry);
         // #1441: registry is UUID-keyed; resolve target name via fleet.yaml.
         if let Some(handle) = crate::fleet::resolve_uuid(home, target).and_then(|id| reg.get(&id)) {
-            if let Err(e) = agent::inject_to_agent(handle, message.as_bytes()) {
+            if let Err(e) = agent::inject_to_agent(handle, message.as_bytes(), false) {
                 tracing::warn!(error = %e, "replay inject failed");
             }
         } else {

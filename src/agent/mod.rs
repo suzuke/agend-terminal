@@ -1203,7 +1203,7 @@ fn spawn_instructions_bootstrap(
 
         let reg = &registry.lock();
         if let Some(handle) = reg.get(&instance_id) {
-            if let Err(e) = inject_to_agent(handle, content.as_bytes()) {
+            if let Err(e) = inject_to_agent(handle, content.as_bytes(), true) {
                 tracing::warn!(agent = %name, error = %e, "instructions bootstrap inject failed");
             } else {
                 tracing::info!(
@@ -1730,11 +1730,38 @@ pub fn write_to_agent_typed(agent: &AgentHandle, data: &[u8]) -> crate::error::R
     Ok(())
 }
 
-/// Inject text + submit to agent PTY. Splits text from submit_key with a delay
-/// so TUI frameworks process them as separate events.
-/// - typed=false: write_all(prefix+text), delay, write_all(submit_key)
-/// - typed=true: per-byte(prefix+text), delay, write_all(submit_key)
-pub fn inject_to_agent(agent: &AgentHandle, text: &[u8]) -> crate::error::Result<()> {
+/// Inject `text` (plus the backend submit key) into an agent's PTY.
+///
+/// `force` exempts the inject from the #1513 busy-gate. Pass `true` for
+/// recovery, operator, and drain injects that MUST reach the PTY: the
+/// ServerRateLimit retry, bootstrap instructions, and the api INJECT handler
+/// (which is both the operator-inject entry AND the notification-queue drain
+/// convergence, so gating it would re-defer an already-flushed item). Pass
+/// `false` for daemon-originated direct injects (cron and schedule replay) that
+/// should yield to a mid-generation or mid-keystroke pane.
+pub fn inject_to_agent(agent: &AgentHandle, text: &[u8], force: bool) -> crate::error::Result<()> {
+    // #1513 PR-2: gate direct PTY injects like the notification path. Self-
+    // contained via AGEND_HOME (this fn has no `home` in scope); the agent-state
+    // read is LOCK-FREE (snapshot) — never the per-agent core lock (#1492). When
+    // AGEND_HOME is absent (non-daemon / unit test) the gate is skipped.
+    if !force {
+        if let Ok(home) = std::env::var("AGEND_HOME") {
+            let home = std::path::Path::new(&home);
+            if crate::inbox::notify::should_defer_direct_inject(home, agent.name.as_str()) {
+                // Gated direct injects (cron / replay) are UTF-8 text wakes;
+                // enqueue ambient-class for the per-tick flush to drain once the
+                // pane settles (the flush re-injects via the api INJECT path,
+                // landing back here with force=true — byte-equivalent delivery).
+                let _ = crate::notification_queue::enqueue_classified(
+                    home,
+                    agent.name.as_str(),
+                    &String::from_utf8_lossy(text),
+                    false,
+                );
+                return Ok(());
+            }
+        }
+    }
     let target = InjectTarget::from_handle(agent);
     inject_with_target(&target, text)
 }

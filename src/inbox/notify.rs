@@ -388,6 +388,16 @@ fn operator_typing_recent(home: &Path, agent_name: &str) -> bool {
             < TYPING_QUIET_WINDOW_MS
 }
 
+/// #1513 PR-2: defer a DIRECT PTY inject (cron / schedule replay via
+/// `inject_to_agent`, force=false) when the agent is mid-generation
+/// (Thinking/ToolUse) or the operator is mid-keystroke — the same collision
+/// avoidance as the notification path, minus the actionable / permission-bypass
+/// nuances (a scheduled wake has no work-delivery urgency). Lock-free snapshot
+/// read (#1492-safe).
+pub(crate) fn should_defer_direct_inject(home: &Path, agent_name: &str) -> bool {
+    crate::snapshot::agent_is_busy(home, agent_name) || operator_typing_recent(home, agent_name)
+}
+
 /// #1473/#1483: does this notification carry an actionable work-delivery
 /// marker that must reach the PTY regardless of draft state? These are the
 /// system/orchestrator wakes the agent is expected to act on (vs. ambient
@@ -905,6 +915,82 @@ mod snapshot_busy_tests_1513 {
         assert!(
             !crate::snapshot::agent_is_busy(&tmp_home("empty"), "a"),
             "no snapshot → not busy"
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod should_defer_direct_inject_tests_1513pr2 {
+    use super::should_defer_direct_inject;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static CTR: AtomicU32 = AtomicU32::new(0);
+    fn tmp_home(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "agend-1513pr2-{}-{}-{}",
+            tag,
+            std::process::id(),
+            CTR.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn snap(name: &str, state: &str) -> crate::snapshot::AgentSnapshot {
+        crate::snapshot::AgentSnapshot {
+            name: name.to_string(),
+            backend_command: String::new(),
+            args: vec![],
+            working_dir: None,
+            submit_key: "\r".to_string(),
+            health_state: "healthy".to_string(),
+            agent_state: state.to_string(),
+        }
+    }
+
+    // cron/replay direct inject while the agent is mid-generation → defer.
+    #[test]
+    fn busy_defers_direct_inject() {
+        let h = tmp_home("busy");
+        crate::snapshot::save(&h, &[snap("a", "thinking")]);
+        assert!(
+            should_defer_direct_inject(&h, "a"),
+            "thinking → defer direct inject"
+        );
+        crate::snapshot::save(&h, &[snap("a", "tool_use")]);
+        assert!(
+            should_defer_direct_inject(&h, "a"),
+            "tool_use → defer direct inject"
+        );
+    }
+
+    // operator mid-keystroke → defer (collision avoidance).
+    #[test]
+    fn typing_defers_direct_inject() {
+        let h = tmp_home("typing");
+        crate::snapshot::save(&h, &[snap("a", "idle")]);
+        crate::notification_queue::record_input_activity(&h, "a");
+        assert!(
+            should_defer_direct_inject(&h, "a"),
+            "recent keystroke → defer direct inject"
+        );
+    }
+
+    // quiet idle pane (and missing snapshot) → inject directly, no false defer.
+    #[test]
+    fn quiet_does_not_defer_direct_inject() {
+        let h = tmp_home("quiet");
+        crate::snapshot::save(&h, &[snap("a", "idle")]);
+        assert!(
+            !should_defer_direct_inject(&h, "a"),
+            "idle + no typing → inject"
+        );
+        // missing snapshot → fail-open (not busy, no typing) → inject
+        assert!(
+            !should_defer_direct_inject(&tmp_home("nosnap"), "a"),
+            "no snapshot → inject"
         );
     }
 }

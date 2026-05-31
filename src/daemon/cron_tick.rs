@@ -112,7 +112,7 @@ pub fn check_schedules(home: &Path, registry: &AgentRegistry) {
             // in run_history, and let the auto-disable below retire it.
             "missed"
         } else if let Some(handle) = target_id.and_then(|id| reg.get(&id)) {
-            match agent::inject_to_agent(handle, message.as_bytes()) {
+            match agent::inject_to_agent(handle, message.as_bytes(), false) {
                 Ok(()) => "ok",
                 Err(e) => {
                     tracing::warn!(error = %e, "schedule inject failed");

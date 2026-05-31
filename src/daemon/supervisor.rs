@@ -826,7 +826,7 @@ pub(crate) fn process_server_rate_limit_retries(
             // #1441: registry is UUID-keyed; resolve the name-keyed track id.
             if let Some(handle) = crate::fleet::resolve_uuid(home, name).and_then(|id| reg.get(&id))
             {
-                agent::inject_to_agent(handle, CONTINUE_RETRY_PAYLOAD).is_ok()
+                agent::inject_to_agent(handle, CONTINUE_RETRY_PAYLOAD, true).is_ok()
             } else {
                 false
             }

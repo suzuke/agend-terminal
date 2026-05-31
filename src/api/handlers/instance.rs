@@ -23,7 +23,7 @@ pub(crate) fn handle_inject(params: &Value, ctx: &HandlerCtx) -> Value {
                 let result = if raw {
                     agent::write_to_agent(handle, data.as_bytes())
                 } else {
-                    agent::inject_to_agent(handle, data.as_bytes())
+                    agent::inject_to_agent(handle, data.as_bytes(), true)
                 };
                 match result {
                     Ok(()) => json!({"ok": true, "result": {"bytes": data.len()}}),
