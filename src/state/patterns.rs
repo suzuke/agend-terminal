@@ -73,7 +73,11 @@ impl StatePatterns {
                 // English-word match) is replaced by specific error phrases.
                 (
                     AgentState::ServerRateLimit,
-                    r"Server is temporarily limiting requests|temporarily limiting.*not your usage|API Error: 5\d{2}\b|server-side issue.*temporary|API Error: Repeated 529 Overloaded|overloaded_error|api_error|timeout_error|ECONNRESET|ETIMEDOUT|InvalidHTTPResponse|fetch failed|connection reset|socket hang up|network error|proxy.*disconnect",
+                    r"Server is temporarily limiting requests|temporarily limiting.*not your usage|API Error: 5\d{2}\b|server-side issue.*temporary|API Error: Repeated 529 Overloaded|overloaded_error|api_error|timeout_error",
+                ),
+                (
+                    AgentState::ApiError,
+                    r"(?i)ECONNRESET|ETIMEDOUT|InvalidHTTPResponse|fetch failed|connection reset|socket hang up|network error|proxy.*disconnect|timed.?out",
                 ),
                 // #848: narrow Claude RateLimit to specific error phrases.
                 // The pre-#848 pattern `r"overloaded|rate.?limit|\b429\b"`
@@ -216,8 +220,8 @@ impl StatePatterns {
                 ),
                 // #1136: network errors — transient, auto-retry safe.
                 (
-                    AgentState::ServerRateLimit,
-                    r"ECONNRESET|ETIMEDOUT|InvalidHTTPResponse|fetch failed|connection reset|socket hang up|network error|proxy.*disconnect",
+                    AgentState::ApiError,
+                    r"(?i)ECONNRESET|ETIMEDOUT|InvalidHTTPResponse|fetch failed|connection reset|socket hang up|network error|proxy.*disconnect|timed.?out",
                 ),
                 // [docs] Context overflow triggers compaction
                 // `/compact` was previously included but matches the slash-
@@ -293,8 +297,8 @@ impl StatePatterns {
                 ),
                 // #1136: network errors — transient, auto-retry safe.
                 (
-                    AgentState::ServerRateLimit,
-                    r"ECONNRESET|ETIMEDOUT|InvalidHTTPResponse|fetch failed|connection reset|socket hang up|network error|proxy.*disconnect",
+                    AgentState::ApiError,
+                    r"(?i)ECONNRESET|ETIMEDOUT|InvalidHTTPResponse|fetch failed|connection reset|socket hang up|network error|proxy.*disconnect|timed.?out",
                 ),
                 // [docs] Context overflow error
                 (AgentState::ContextFull, r"ContextOverflow"),
@@ -370,11 +374,6 @@ impl StatePatterns {
                     AgentState::RateLimit,
                     r"API rate limited \(429\)|Rate limited\. Quick retry|API rate limit exceeded",
                 ),
-                // #1136: network errors — transient, auto-retry safe.
-                (
-                    AgentState::ServerRateLimit,
-                    r"ECONNRESET|ETIMEDOUT|InvalidHTTPResponse|fetch failed|connection reset|socket hang up|network error|proxy.*disconnect",
-                ),
                 // #848 PR-B: NEW OpenCode UsageLimit pattern (pre-#848
                 // OpenCode had no UsageLimit pattern at all, so
                 // subscription-quota strings fell through to whatever
@@ -382,10 +381,10 @@ impl StatePatterns {
                 // the `rate.?limit` substring).
                 (AgentState::UsageLimit, r"Quota Limit Exceeded"),
                 // [measured] Provider-side validation errors (e.g. MiniMax
-                // M2.5 rejecting eager_input_streaming in tool spec).
+                // M2.5 rejecting eager_input_streaming in tool spec) & network errors
                 (
                     AgentState::ApiError,
-                    r"Error from provider:|request validation errors",
+                    r"(?i)Error from provider:|request validation errors|ECONNRESET|ETIMEDOUT|InvalidHTTPResponse|fetch failed|connection reset|socket hang up|network error|proxy.*disconnect|timed.?out",
                 ),
                 // [docs] Context overflow
                 (AgentState::ContextFull, r"ContextOverflow"),
@@ -483,8 +482,8 @@ impl StatePatterns {
                 ),
                 // #1136: network errors — transient, auto-retry safe.
                 (
-                    AgentState::ServerRateLimit,
-                    r"ECONNRESET|ETIMEDOUT|InvalidHTTPResponse|fetch failed|connection reset|socket hang up|network error|proxy.*disconnect",
+                    AgentState::ApiError,
+                    r"(?i)ECONNRESET|ETIMEDOUT|InvalidHTTPResponse|fetch failed|connection reset|socket hang up|network error|proxy.*disconnect|timed.?out",
                 ),
                 // [docs] Usage limit messages
                 // #1125 M4: added `RESOURCE_EXHAUSTED` — the gRPC status

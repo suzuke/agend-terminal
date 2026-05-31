@@ -320,6 +320,54 @@ fn pane_input_backend_supported(home: &std::path::Path, agent: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn extract_api_error_reason(pane_tail: &str) -> String {
+    let lower = pane_tail.to_lowercase();
+    let patterns = [
+        "invalidhttpresponse",
+        "econnreset",
+        "etimedout",
+        "fetch failed",
+        "connection reset",
+        "socket hang up",
+        "network error",
+        "error from provider",
+        "request validation errors",
+    ];
+    for &pat in &patterns {
+        if lower.contains(pat) {
+            return match pat {
+                "invalidhttpresponse" => "InvalidHTTPResponse".to_string(),
+                "econnreset" => "ECONNRESET".to_string(),
+                "etimedout" => "ETIMEDOUT".to_string(),
+                "fetch failed" => "fetch failed".to_string(),
+                "connection reset" => "connection reset".to_string(),
+                "socket hang up" => "socket hang up".to_string(),
+                "network error" => "network error".to_string(),
+                "error from provider" => "error from provider".to_string(),
+                "request validation errors" => "request validation errors".to_string(),
+                _ => pat.to_string(),
+            };
+        }
+    }
+    if lower.contains("proxy") && lower.contains("disconnect") {
+        return "proxy disconnect".to_string();
+    }
+    if let Some((_, right)) = pane_tail.split_once(':') {
+        let trimmed = right.trim();
+        if !trimmed.is_empty() && trimmed.len() <= 60 {
+            return trimmed.to_string();
+        }
+    }
+    let trimmed = pane_tail.trim();
+    if trimmed.len() > 60 {
+        format!("{}...", &trimmed[..57])
+    } else if trimmed.is_empty() {
+        "Unknown API Error".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Decide and dispatch member-state-change notify. Returns true if notify sent.
 /// Production-path-coupled per §3.5.10 — tests call this same function.
 pub(crate) fn maybe_notify_member_state_change(
@@ -382,24 +430,30 @@ pub(crate) fn maybe_notify_member_state_change(
     let _ = crate::inbox::enqueue(home, orch, msg);
     let action_hint = match new_state {
         crate::state::AgentState::Hang => {
-            "\nAction: check agent pane snapshot, consider restart if no progress >5min"
+            "\nAction: check agent pane snapshot, consider restart if no progress >5min".to_string()
         }
         crate::state::AgentState::UsageLimit => {
-            "\nAction: wait for limit reset or switch backend. Do NOT retry."
+            "\nAction: wait for limit reset or switch backend. Do NOT retry.".to_string()
         }
         crate::state::AgentState::Crashed => {
-            "\nAction: check logs, restart agent, reassign task if needed"
+            "\nAction: check logs, restart agent, reassign task if needed".to_string()
         }
         crate::state::AgentState::PermissionPrompt => {
-            "\nAction: approve or deny the pending permission prompt"
+            "\nAction: approve or deny the pending permission prompt".to_string()
         }
         crate::state::AgentState::RateLimit => {
-            "\nAction: wait for rate limit cooldown, auto-retry expected"
+            "\nAction: wait for rate limit cooldown, auto-retry expected".to_string()
         }
         crate::state::AgentState::AuthError => {
-            "\nAction: check credentials, may need operator re-auth"
+            "\nAction: check credentials, may need operator re-auth".to_string()
         }
-        _ => "",
+        crate::state::AgentState::ApiError => {
+            format!(
+                "\nAction: API/Network error detected ({}). Manual check required.",
+                extract_api_error_reason(pane_tail)
+            )
+        }
+        _ => "".to_string(),
     };
     crate::inbox::notify_agent(
         home,
@@ -764,20 +818,24 @@ pub(crate) fn process_server_rate_limit_retries(
 ) {
     let now = Instant::now();
 
-    // Phase 1: detect new ServerRateLimit states and schedule retries.
+    // Phase 1: detect new ServerRateLimit and ApiError states and schedule retries.
+    let mut active_names = std::collections::HashSet::new();
     {
         let reg = agent::lock_registry(registry);
         // #1441: registry is UUID-keyed; `retry_tracks` stays name-keyed, so
         // index it by the handle's display name.
         for handle in reg.values() {
             let name = handle.name.as_str();
+            active_names.insert(name.to_string());
             let state = handle.core.lock().state.current;
-            if state == crate::state::AgentState::ServerRateLimit {
+            if state == crate::state::AgentState::ServerRateLimit
+                || state == crate::state::AgentState::ApiError
+            {
                 if retry_tracks.contains_key(name) {
                     continue;
                 }
                 let delay = Duration::from_secs(SERVER_RATE_LIMIT_BACKOFF[0]);
-                tracing::info!(agent = %name, delay_secs = delay.as_secs(), "ServerRateLimit detected, scheduling retry");
+                tracing::info!(agent = %name, ?state, delay_secs = delay.as_secs(), "Transient error state detected, scheduling retry");
                 retry_tracks.insert(
                     name.to_string(),
                     RateLimitRetry {
@@ -790,10 +848,13 @@ pub(crate) fn process_server_rate_limit_retries(
                 || state == crate::state::AgentState::Idle)
                 && retry_tracks.remove(name).is_some()
             {
-                tracing::info!(agent = %name, "ServerRateLimit retry cleared (agent recovered)");
+                tracing::info!(agent = %name, "Transient error retry cleared (agent recovered)");
             }
         }
     }
+
+    // Clear tracking for any agent that has been killed / restarted / deleted
+    retry_tracks.retain(|name, _| active_names.contains(name));
 
     // Phase 2: fire due retries — inject fixed "continue\n".
     for (name, retry) in retry_tracks.iter_mut() {
@@ -801,13 +862,66 @@ pub(crate) fn process_server_rate_limit_retries(
             continue;
         }
 
+        let state = {
+            let reg = agent::lock_registry(registry);
+            if let Some(handle) = crate::fleet::resolve_uuid(home, name).and_then(|id| reg.get(&id))
+            {
+                handle.core.lock().state.current
+            } else {
+                crate::state::AgentState::Ready
+            }
+        };
+
         retry.retry_count += 1;
         if retry.retry_count > SERVER_RATE_LIMIT_MAX_RETRIES {
-            tracing::warn!(agent = %name, retries = retry.retry_count, "ServerRateLimit max retries exceeded — giving up");
+            tracing::warn!(agent = %name, retries = retry.retry_count, "Transient error max retries exceeded — giving up");
             retry.exhausted = true;
+            let excerpt = {
+                let reg = agent::lock_registry(registry);
+                if let Some(handle) =
+                    crate::fleet::resolve_uuid(home, name).and_then(|id| reg.get(&id))
+                {
+                    let c = handle.core.lock();
+                    let rows = c.vterm.rows() as usize;
+                    let (screen, _) = c.vterm.tail_lines_with_fg(rows);
+                    screen
+                } else {
+                    String::new()
+                }
+            };
+            if let Some(team) = crate::teams::find_team_for(home, name) {
+                if let Some(ref orch) = team.orchestrator {
+                    if orch != name {
+                        let payload = serde_json::json!({
+                            "type": "member_state_change",
+                            "member": name,
+                            "team": team.name,
+                            "from_state": state.display_name(),
+                            "to_state": state.display_name(),
+                            "detected_at": chrono::Utc::now().to_rfc3339(),
+                            "context": {
+                                "last_pane_excerpt": excerpt,
+                                "unlock_at": serde_json::Value::Null,
+                                "consecutive_count": retry.retry_count,
+                            }
+                        });
+                        let msg = crate::inbox::InboxMessage::new_system(
+                            "system:supervisor",
+                            "member_state_change",
+                            payload.to_string(),
+                        );
+                        let _ = crate::inbox::enqueue(home, orch, msg);
+                    }
+                }
+            }
             if let Some(ch) = crate::channel::active_channel() {
+                let error_type = if state == crate::state::AgentState::ServerRateLimit {
+                    "API rate limit"
+                } else {
+                    "API/Network error"
+                };
                 let msg = format!(
-                    "⚠️ {name} API rate limit auto-retry exhausted ({} retries). Manual intervention required.",
+                    "⚠️ {name} {error_type} auto-retry exhausted ({} retries). Manual intervention required.",
                     SERVER_RATE_LIMIT_MAX_RETRIES
                 );
                 let _ = crate::channel::gated_notify(
@@ -836,14 +950,14 @@ pub(crate) fn process_server_rate_limit_retries(
             tracing::info!(
                 agent = %name,
                 retry = retry.retry_count,
-                "ServerRateLimit: injected \"continue\" (attempt {})",
+                "Transient error: injected \"continue\" (attempt {})",
                 retry.retry_count
             );
             let idx = (retry.retry_count as usize).min(SERVER_RATE_LIMIT_BACKOFF.len() - 1);
             retry.next_retry_at =
                 Instant::now() + Duration::from_secs(SERVER_RATE_LIMIT_BACKOFF[idx]);
         } else {
-            tracing::warn!(agent = %name, "ServerRateLimit: inject failed (agent gone?)");
+            tracing::warn!(agent = %name, "Transient error: inject failed (agent gone?)");
             retry.exhausted = true;
         }
     }
@@ -1133,9 +1247,9 @@ mod tests {
         assert!(AgentState::Crashed.is_notify_error_class());
         assert!(AgentState::AuthError.is_notify_error_class());
         assert!(AgentState::PermissionPrompt.is_notify_error_class());
+        assert!(!AgentState::ApiError.is_notify_error_class());
         assert!(!AgentState::ContextFull.is_notify_error_class());
         assert!(!AgentState::AwaitingOperator.is_notify_error_class());
-        assert!(!AgentState::ApiError.is_notify_error_class());
         assert!(!AgentState::Restarting.is_notify_error_class());
         assert!(!AgentState::InteractivePrompt.is_notify_error_class());
         assert!(!AgentState::Ready.is_notify_error_class());
@@ -1599,6 +1713,99 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// #1325: phase 1 — ApiError detection populates retry_tracks.
+    #[test]
+    fn phase1_detects_api_error_and_schedules_retry() {
+        let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = tmp_home("phase1-detect-api-error");
+        let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
+
+        let (handle, _reader) = mock_agent_handle("test-agent", crate::state::AgentState::ApiError);
+        // #1441: registry is UUID-keyed — insert under the handle's own id.
+        registry.lock().insert(handle.id, handle);
+
+        super::process_server_rate_limit_retries(&home, &registry, &mut tracks);
+        assert!(
+            tracks.contains_key("test-agent"),
+            "phase 1 must detect ApiError and insert retry track"
+        );
+        assert_eq!(tracks["test-agent"].retry_count, 0);
+        assert!(!tracks["test-agent"].exhausted);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1325: phase 1 — recovery (Ready/Idle) clears retry track from ApiError.
+    #[test]
+    fn phase1_api_error_recovery_clears_retry_track() {
+        let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = tmp_home("phase1-recovery-api-error");
+        let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
+        tracks.insert(
+            "test-agent".to_string(),
+            RateLimitRetry {
+                retry_count: 1,
+                next_retry_at: Instant::now(),
+                exhausted: false,
+            },
+        );
+
+        let (handle, _reader) = mock_agent_handle("test-agent", crate::state::AgentState::Ready);
+        // #1441: registry is UUID-keyed — insert under the handle's own id.
+        registry.lock().insert(handle.id, handle);
+
+        super::process_server_rate_limit_retries(&home, &registry, &mut tracks);
+        assert!(
+            !tracks.contains_key("test-agent"),
+            "phase 1 must clear retry track on Ready recovery"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1325: phase 2 — due retry injects "continue\n" to PTY for ApiError.
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn phase2_api_error_injects_continue_to_pty() {
+        let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = tmp_home("phase2-inject-api-error");
+
+        let (handle, mut reader) =
+            mock_agent_handle("test-agent", crate::state::AgentState::ApiError);
+        let agent_id = handle.id;
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            format!("instances:\n  test-agent:\n    id: {}\n", agent_id.full()),
+        )
+        .ok();
+        registry.lock().insert(agent_id, handle);
+
+        let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
+        tracks.insert(
+            "test-agent".to_string(),
+            RateLimitRetry {
+                retry_count: 0,
+                next_retry_at: Instant::now() - Duration::from_secs(1),
+                exhausted: false,
+            },
+        );
+
+        super::process_server_rate_limit_retries(&home, &registry, &mut tracks);
+        assert_eq!(
+            tracks["test-agent"].retry_count, 1,
+            "retry_count must increment after inject"
+        );
+
+        let mut buf = vec![0u8; 256];
+        use std::io::Read;
+        let n = reader.read(&mut buf).expect("read from PTY");
+        let captured = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            captured.contains("continue"),
+            "PTY must receive \"continue\" payload, got: {:?}",
+            captured.trim_end_matches('\0')
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     #[test]
     fn retry_loop_does_not_restart_after_max_exceeded() {
         let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
@@ -1908,5 +2115,72 @@ mod tests {
              (#1002 Phase 2 dual-entry-point fix). Without this, APP-mode \
              daemons silently skip the #972 aggregator + #986 gh-poll path."
         );
+    }
+
+    #[test]
+    fn notify_member_state_change_api_error() {
+        let home = std::env::temp_dir().join(format!("agend-notify-api-{}", std::process::id()));
+        std::fs::create_dir_all(home.join("inbox")).ok();
+
+        let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let (handle, _reader) = mock_agent_handle("worker-a", crate::state::AgentState::ApiError);
+        let agent_id = handle.id;
+
+        // Write both teams and instances to fleet.yaml to avoid clobbering
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            format!(
+                "teams:\n  team-a:\n    members: [orch-a, worker-a]\n    orchestrator: orch-a\ninstances:\n  worker-a:\n    id: {}\n",
+                agent_id.full()
+            ),
+        )
+        .ok();
+        registry.lock().insert(agent_id, handle);
+
+        let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
+        // Insert a track that has 4 retries already (so next retry will exceed max=4)
+        tracks.insert(
+            "worker-a".to_string(),
+            RateLimitRetry {
+                retry_count: 4,
+                next_retry_at: Instant::now() - Duration::from_secs(1),
+                exhausted: false,
+            },
+        );
+
+        super::process_server_rate_limit_retries(&home, &registry, &mut tracks);
+        assert!(
+            tracks["worker-a"].exhausted,
+            "retries must be marked exhausted"
+        );
+
+        let orch_a_inbox = home.join("inbox").join("orch-a.jsonl");
+        let content = std::fs::read_to_string(&orch_a_inbox).unwrap_or_default();
+        assert!(content.contains("api_error"), "inbox should show api_error");
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn retry_track_cleared_when_agent_removed_from_registry() {
+        let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = tmp_home("clear-removed-agent");
+        let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
+        tracks.insert(
+            "test-agent".to_string(),
+            RateLimitRetry {
+                retry_count: 1,
+                next_retry_at: Instant::now(),
+                exhausted: false,
+            },
+        );
+
+        // Run with an empty registry (agent removed).
+        super::process_server_rate_limit_retries(&home, &registry, &mut tracks);
+        assert!(
+            !tracks.contains_key("test-agent"),
+            "retry track must be cleared when agent is no longer in the registry"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 }

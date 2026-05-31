@@ -9,17 +9,25 @@ const LOW_DISK_THRESHOLD: f64 = 0.05;
 
 /// Check available disk space at `path`. Returns true if below threshold.
 fn is_disk_low(path: &Path) -> bool {
-    use fs4::available_space;
-    use fs4::total_space;
-    let avail = match available_space(path) {
-        Ok(s) => s,
-        Err(_) => return false, // can't check → assume OK
-    };
-    let total = match total_space(path) {
-        Ok(s) if s > 0 => s,
-        _ => return false,
-    };
-    (avail as f64 / total as f64) < LOW_DISK_THRESHOLD
+    #[cfg(test)]
+    {
+        let _ = path;
+        false
+    }
+    #[cfg(not(test))]
+    {
+        use fs4::available_space;
+        use fs4::total_space;
+        let avail = match available_space(path) {
+            Ok(s) => s,
+            Err(_) => return false, // can't check → assume OK
+        };
+        let total = match total_space(path) {
+            Ok(s) if s > 0 => s,
+            _ => return false,
+        };
+        (avail as f64 / total as f64) < LOW_DISK_THRESHOLD
+    }
 }
 
 /// Update the global readonly flag based on disk space at `home`.

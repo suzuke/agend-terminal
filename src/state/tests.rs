@@ -2387,6 +2387,16 @@ fn discussion_text_does_not_trigger_rate_limit_any_backend() {
             AgentState::RateLimit,
             "{backend:?} discussion text from {path} must NOT trigger RateLimit"
         );
+        assert_ne!(
+            t.get_state(),
+            AgentState::ApiError,
+            "{backend:?} discussion text from {path} must NOT trigger ApiError"
+        );
+        assert_ne!(
+            t.get_state(),
+            AgentState::ServerRateLimit,
+            "{backend:?} discussion text from {path} must NOT trigger ServerRateLimit"
+        );
     }
     // Codex: inline prose (no fixture file)
     let mut t = tracker_at(&Backend::Codex, AgentState::Idle, 0);
@@ -2399,6 +2409,16 @@ fn discussion_text_does_not_trigger_rate_limit_any_backend() {
         t.get_state(),
         AgentState::RateLimit,
         "Codex discussion prose must NOT trigger RateLimit"
+    );
+    assert_ne!(
+        t.get_state(),
+        AgentState::ApiError,
+        "Codex discussion prose must NOT trigger ApiError"
+    );
+    assert_ne!(
+        t.get_state(),
+        AgentState::ServerRateLimit,
+        "Codex discussion prose must NOT trigger ServerRateLimit"
     );
 }
 
@@ -3002,15 +3022,15 @@ fn classify_pty_output_claude_server_rate_limit() {
     );
 }
 
-// ── #1136: Network error → ServerRateLimit (auto-retry) ──────────
+// ── #1136: Network error → ApiError (CLI notify) ──────────────────
 
 #[test]
-fn network_error_econnreset_triggers_server_rate_limit() {
+fn network_error_econnreset_triggers_api_error() {
     let patterns = StatePatterns::for_backend(&Backend::ClaudeCode);
     assert_eq!(
         patterns.detect("Error: ECONNRESET"),
-        Some(AgentState::ServerRateLimit),
-        "#1136: ECONNRESET must route to ServerRateLimit for auto-retry"
+        Some(AgentState::ApiError),
+        "ECONNRESET must route to ApiError"
     );
 }
 
@@ -3035,8 +3055,8 @@ fn network_error_patterns_all_backends() {
         for case in &cases {
             assert_eq!(
                 patterns.detect(case),
-                Some(AgentState::ServerRateLimit),
-                "#1136: '{case}' must trigger ServerRateLimit on {backend:?}"
+                Some(AgentState::ApiError),
+                "'{case}' must trigger ApiError on {backend:?}"
             );
         }
     }

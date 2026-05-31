@@ -287,7 +287,10 @@ fn oscillation_guard_window() -> Duration {
 fn is_high_fp_state(state: AgentState) -> bool {
     matches!(
         state,
-        AgentState::ServerRateLimit | AgentState::RateLimit | AgentState::ContextFull
+        AgentState::ServerRateLimit
+            | AgentState::RateLimit
+            | AgentState::ContextFull
+            | AgentState::ApiError
     )
 }
 
