@@ -3127,3 +3127,89 @@ fn pending_transitions_bounded_drops_oldest() {
         "overflow count surfaced for the warn"
     );
 }
+
+// ── #1518: HIGH_FP error detection bounded to the live bottom-N tail ──
+
+#[test]
+fn matched_span_in_recent_tail_unit_1518() {
+    use super::{matched_span_in_recent_tail, ERROR_TAIL_SCAN_LINES};
+    let mut screen = String::from("ERR: boom\n");
+    for i in 0..(ERROR_TAIL_SCAN_LINES + 3) {
+        screen.push_str(&format!("line {i}\n"));
+    }
+    // The error is now above the last ERROR_TAIL_SCAN_LINES rows.
+    assert!(
+        !matched_span_in_recent_tail(&screen, "ERR: boom", ERROR_TAIL_SCAN_LINES),
+        "error scrolled above the tail → not in recent tail"
+    );
+    // A marker within the last N rows IS in the tail.
+    assert!(
+        matched_span_in_recent_tail(&screen, "line 7", ERROR_TAIL_SCAN_LINES),
+        "a marker in the last N rows is in the recent tail"
+    );
+    assert!(
+        !matched_span_in_recent_tail(&screen, "", ERROR_TAIL_SCAN_LINES),
+        "empty match is never in tail"
+    );
+}
+
+#[test]
+fn high_fp_error_only_fires_within_live_tail_1518() {
+    // #1518: a HIGH_FP ServerRateLimit line visible in the live bottom rows fires
+    // the error state; the SAME line scrolled above the live tail (pushed up by
+    // the agent's post-recovery output) must NOT — that level-triggered re-match
+    // was the retry-storm root. Text-path (`feed`) so the #1450 red anchor
+    // fail-opens (no fg mask) and we test the POSITION gate in isolation.
+    // RateLimit is HIGH_FP; the string is the canonical ClaudeCode trigger.
+    let err = "API Error: Request rejected (429) · this may be a temporary capacity issue";
+
+    // A: error in the live tail → RateLimit fires.
+    let mut a = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+    a.feed(err);
+    assert_eq!(
+        a.get_state(),
+        AgentState::RateLimit,
+        "error visible in the live tail must fire the HIGH_FP error state"
+    );
+
+    // B: SAME error scrolled above the bottom-N (ERROR_TAIL_SCAN_LINES rows of
+    // subsequent output below it) → suppressed (must NOT keep firing the error
+    // state). 20 lines clears the N=15 bound with margin.
+    let mut b = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+    let mut screen = format!("{err}\n");
+    for i in 0..20 {
+        screen.push_str(&format!("subsequent output line {i}\n"));
+    }
+    b.feed(&screen);
+    assert_ne!(
+        b.get_state(),
+        AgentState::RateLimit,
+        "#1518: error scrolled above the live tail must NOT keep firing the error state"
+    );
+}
+
+#[test]
+fn modal_prompt_above_live_tail_still_detected_1518() {
+    // reviewer-2 refinement: modal / interactive prompts are NOT HIGH_FP, so they
+    // keep FULL-screen scanning — a permission prompt that sits above the live
+    // streaming tail must still be detected (the bottom-N bound is error-only).
+    // (gate_on_heartbeat may relabel a fresh PermissionPrompt as Thinking; either
+    // way it is DETECTED, not suppressed/missed — the point of this test.)
+    // 20 streaming lines push the prompt above the bottom-N=15 error bound; a
+    // HIGH_FP marker this deep WOULD be suppressed, so detection here proves the
+    // bound is error-only.
+    let mut st = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+    let mut screen = String::from("Do you want to proceed with this edit?\n");
+    for i in 0..20 {
+        screen.push_str(&format!("streaming output {i}\n"));
+    }
+    st.feed(&screen);
+    assert!(
+        matches!(
+            st.get_state(),
+            AgentState::PermissionPrompt | AgentState::Thinking
+        ),
+        "#1518: a modal above the live tail must still be detected (full-screen, not bottom-N bounded), got {:?}",
+        st.get_state()
+    );
+}
