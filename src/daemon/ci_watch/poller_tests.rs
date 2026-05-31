@@ -5220,6 +5220,22 @@ fn early_job_failure_sends_notification() {
         content.contains("[ci-fail]"),
         "#1326: early job failure must send inbox notification"
     );
+    // #1537-fu: the early-fail path fires mid-run (macos/windows still running),
+    // so it must NOT embed a tail nor claim one is above — `gh run view
+    // --log-failed` is empty until the run completes. It uses the no-tail
+    // checklist (the completion notification carries the tail).
+    assert!(
+        !content.contains("failed log (tail)"),
+        "#1537-fu: mid-run early-fail must not embed a (guaranteed-empty) tail"
+    );
+    assert!(
+        !content.contains("Read the failed-log tail above"),
+        "#1537-fu: mid-run early-fail must not claim a tail is above"
+    );
+    assert!(
+        content.contains("did not attach a failed-log tail"),
+        "#1537-fu: early-fail uses the no-tail checklist wording"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -5436,8 +5452,14 @@ fn build_inbox_body_embeds_log_tail_when_present() {
         with_tail.contains("gh run view 9 --log-failed"),
         "full-log cmd stays as footer"
     );
+    assert!(
+        with_tail.contains("Read the failed-log tail above"),
+        "#1537-fu: tail present → checklist step 1 says read it"
+    );
 
-    // None → falls back to the instruction-only body (no tail section).
+    // None → no tail section AND the checklist must NOT claim a tail is above
+    // (the #1537-fu bug: unconditional "Read the failed-log tail above" with no
+    // tail attached). Step 1 instead points at the manual command.
     let no_tail = build_inbox_body(
         "[ci-fail] o/r@main: failure",
         "failure",
@@ -5453,5 +5475,13 @@ fn build_inbox_body_embeds_log_tail_when_present() {
     assert!(
         no_tail.contains("CI failure checklist"),
         "checklist still present"
+    );
+    assert!(
+        !no_tail.contains("Read the failed-log tail above"),
+        "#1537-fu: no-tail body must NOT claim a tail is above"
+    );
+    assert!(
+        no_tail.contains("did not attach a failed-log tail"),
+        "#1537-fu: no-tail body points to the manual command instead"
     );
 }
