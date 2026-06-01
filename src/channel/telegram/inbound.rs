@@ -228,8 +228,20 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
         );
         let task_id = result["id"].as_str().unwrap_or("?");
         tracing::info!(title, task_id, "task created via telegram keyword");
+        // #1339 PR-2: route the task-create ACK through the single `gated_notify`
+        // chokepoint too — there must be NO production `Channel::notify` call
+        // that skips the operator-mode gate. An operator messaging the channel
+        // does NOT auto-flip the mode (it is read from `operator-mode.json`,
+        // explicitly set), so a direct `ch.notify` here would bypass the gate.
+        // Routed through, an explicit `Sleep`/`Away` suppresses this `Info` ack
+        // (consistent with the mode's "hold non-Error" semantics); `Active`
+        // (the default) passes it unchanged. The distinct "an operator-initiated
+        // request's ACK should always reach the operator regardless of mode"
+        // semantic is a separate operator-response path, tracked as a follow-up
+        // and out of scope here.
         if let Some(ch) = crate::channel::active_channel() {
-            let _ = ch.notify(
+            let _ = crate::channel::gated_notify(
+                ch.as_ref(),
                 "operator",
                 crate::channel::NotifySeverity::Info,
                 &format!("✅ Task created: {title} [{task_id}]"),

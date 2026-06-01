@@ -717,21 +717,34 @@ fn compliance_sweep(home: &Path, repo: &str) -> Vec<ComplianceViolation> {
                     "compliance violation"
                 );
             }
-            // Telegram alert (dedup: skip if already alerted)
+            // Telegram alert (dedup: skip if already alerted).
+            //
+            // #1339 PR-2: route through `gated_notify` (the single operator-mode
+            // chokepoint) instead of `notify_telegram` directly. This is a
+            // fleet-initiated daemon job, so it MUST honor operator mode —
+            // `Sleep` suppresses this `Warn`-tier ping (the violation is still
+            // recorded by the `tracing::warn!` above, so nothing is lost) and
+            // it also picks up the outbound-allowlist gate. Compliance is
+            // important but not P0-crash class, so `Warn` (not `Error`).
             if !cfg.alerted_prs.contains(&pr.number) {
-                crate::channel::telegram::notify::notify_telegram(
-                    home,
-                    SWEEP_EMITTER,
-                    &format!(
-                        "⚠️ Compliance violation PR #{}: {}",
-                        pr.number,
-                        violations
-                            .iter()
-                            .map(|v| v.check_name)
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
+                let msg = format!(
+                    "⚠️ Compliance violation PR #{}: {}",
+                    pr.number,
+                    violations
+                        .iter()
+                        .map(|v| v.check_name)
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 );
+                if let Some(ch) = crate::channel::active_channel() {
+                    let _ = crate::channel::gated_notify(
+                        ch.as_ref(),
+                        SWEEP_EMITTER,
+                        crate::channel::NotifySeverity::Warn,
+                        &msg,
+                        false,
+                    );
+                }
                 cfg.alerted_prs.push(pr.number);
             }
         }
