@@ -615,33 +615,85 @@ fn test_atomic_append_tmp_recovery() {
 }
 
 #[test]
-fn test_half_written_jsonl_goes_to_recovery() {
-    // A JSONL file with a corrupt line must be moved to recovery.
-    let home = tmp_home("half-write");
+fn test_half_written_jsonl_preserves_good_messages() {
+    // bughunt#3 (fail-open): a trailing corrupt line must NOT cost the agent
+    // its whole queue. The good messages survive (still drainable) and only
+    // the corrupt line is moved to recovery for forensics.
+    let home = tmp_home("half-write-failopen");
     let inbox_dir = home.join("inbox");
     fs::create_dir_all(&inbox_dir).ok();
 
     let jsonl = inbox_dir.join("agent1.jsonl");
-    let good = serde_json::to_string(&make_msg("ok", "fine")).unwrap();
-    // Write a good line followed by a truncated/corrupt line
+    let good1 = serde_json::to_string(&make_msg("a", "first")).unwrap();
+    let good2 = serde_json::to_string(&make_msg("b", "second")).unwrap();
+    // Two good lines followed by a truncated/corrupt line (crash mid-append).
     fs::write(
         &jsonl,
-        format!("{good}\n{{\"from\":\"broken\",\"text\":\"trun"),
+        format!("{good1}\n{good2}\n{{\"from\":\"broken\",\"text\":\"trun"),
     )
     .ok();
 
     recover_half_writes(&home);
 
-    assert!(!jsonl.exists(), "corrupt JSONL must be moved to recovery");
+    // The inbox survives and BOTH good messages are still drainable (zero loss).
+    assert!(jsonl.exists(), "inbox must survive a corrupt trailing line");
+    let msgs = drain(&home, "agent1");
+    assert_eq!(msgs.len(), 2, "both good messages must survive (zero loss)");
+    assert_eq!(msgs[0].from, "a");
+    assert_eq!(msgs[1].from, "b");
+
+    // The corrupt line — and only it — is preserved under inbox.recovery/.
     let recovery = home.join("inbox.recovery");
-    assert!(recovery.exists());
-    // The recovery subdir should contain the moved file
+    assert!(recovery.exists(), "recovery dir must hold the dropped line");
     let subdirs: Vec<_> = fs::read_dir(&recovery).unwrap().flatten().collect();
     assert_eq!(subdirs.len(), 1);
     let files: Vec<_> = fs::read_dir(subdirs[0].path()).unwrap().flatten().collect();
     assert_eq!(files.len(), 1);
     assert!(files[0].file_name().to_string_lossy().contains("agent1"));
+    let salvaged = fs::read_to_string(files[0].path()).unwrap();
+    assert!(
+        salvaged.contains("broken") && !salvaged.contains("first"),
+        "only the corrupt line is salvaged, never a good message"
+    );
 
+    fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn test_recover_noop_when_all_lines_good() {
+    // No corrupt line → no rewrite, no recovery dir, every message intact.
+    let home = tmp_home("recover-noop-good");
+    let inbox_dir = home.join("inbox");
+    fs::create_dir_all(&inbox_dir).ok();
+    let jsonl = inbox_dir.join("agent1.jsonl");
+    let good = serde_json::to_string(&make_msg("ok", "fine")).unwrap();
+    fs::write(&jsonl, format!("{good}\n")).ok();
+
+    recover_half_writes(&home);
+
+    assert!(jsonl.exists());
+    assert!(
+        !home.join("inbox.recovery").exists(),
+        "no recovery dir for a clean inbox"
+    );
+    let msgs = drain(&home, "agent1");
+    assert_eq!(msgs.len(), 1);
+    fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn test_recover_noop_on_empty_file() {
+    // Empty inbox file → no corrupt lines → no-op, no recovery dir.
+    let home = tmp_home("recover-noop-empty");
+    let inbox_dir = home.join("inbox");
+    fs::create_dir_all(&inbox_dir).ok();
+    let jsonl = inbox_dir.join("agent1.jsonl");
+    fs::write(&jsonl, "").ok();
+
+    recover_half_writes(&home);
+
+    assert!(jsonl.exists(), "empty inbox must be left untouched");
+    assert!(!home.join("inbox.recovery").exists());
     fs::remove_dir_all(&home).ok();
 }
 
