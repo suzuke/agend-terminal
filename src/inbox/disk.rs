@@ -70,25 +70,65 @@ pub fn recover_half_writes(home: &Path) {
             continue;
         }
 
-        // Check JSONL files for corrupt trailing lines
+        // A corrupt line in a live JSONL inbox (e.g. a truncated trailing line
+        // from a crash mid-append — `enqueue` appends in place, not via
+        // tmp+rename) must NOT cost the agent its entire queue. Every read path
+        // (drain/sweep/unread_count/…) already skips an unparseable line, so the
+        // fail-open fix is to rewrite the file keeping only the good lines and
+        // preserve the dropped line(s) under inbox.recovery/ for forensics —
+        // never silently destroy a valid message. Done under the per-file flock
+        // (the same lock `enqueue` takes for this physical file) so a concurrent
+        // early-boot send cannot race the rewrite.
         if name_str.ends_with(".jsonl") {
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                let lines: Vec<&str> = content.lines().collect();
-                let bad: Vec<&&str> = lines
-                    .iter()
-                    .filter(|l| {
-                        !l.trim().is_empty()
-                            && serde_json::from_str::<super::InboxMessage>(l).is_err()
-                    })
-                    .collect();
-                if !bad.is_empty() {
-                    // Move entire file to recovery, agent gets a fresh start
-                    ensure_recovery_dir(&recovery_dir);
-                    let dest = recovery_dir.join(&name);
-                    if std::fs::rename(&path, &dest).is_ok() {
-                        recovered += 1;
-                    }
+            use std::io::Write;
+            let lock_path = path.with_extension("jsonl.lock");
+            let Ok(_lock) = crate::store::acquire_file_lock(&lock_path) else {
+                continue;
+            };
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let mut kept: Vec<&str> = Vec::new();
+            let mut bad: Vec<&str> = Vec::new();
+            for l in content.lines() {
+                if l.trim().is_empty() || serde_json::from_str::<super::InboxMessage>(l).is_ok() {
+                    kept.push(l);
+                } else {
+                    bad.push(l);
                 }
+            }
+            if bad.is_empty() {
+                continue;
+            }
+            // Forensics: append only the corrupt line(s) to recovery.
+            ensure_recovery_dir(&recovery_dir);
+            if let Ok(mut rf) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(recovery_dir.join(&name))
+            {
+                for l in &bad {
+                    let _ = writeln!(rf, "{l}");
+                }
+            }
+            // Rewrite the inbox with only the good lines via tmp + atomic rename
+            // (mirrors drain/sweep write-back) so every valid message survives.
+            let tmp = path.with_extension("jsonl.tmp");
+            let rewrite = (|| -> std::io::Result<()> {
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&tmp)?;
+                for l in &kept {
+                    writeln!(f, "{l}")?;
+                }
+                f.sync_all()?;
+                std::fs::rename(&tmp, &path)?;
+                Ok(())
+            })();
+            if rewrite.is_ok() {
+                recovered += 1;
             }
         }
     }
