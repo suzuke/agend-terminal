@@ -280,8 +280,23 @@ impl StatePatterns {
                     AgentState::ContextFull,
                     r"context window overflow|compacting context",
                 ),
-                // [docs] Trust-based permission system
-                (AgentState::PermissionPrompt, r"Allow this action|y/n/t"),
+                // #1559: kiro permission dialog chrome (operator capture
+                // kiro-perm.raw, 2026-06-01). The prior [docs] guess
+                // `Allow this action|y/n/t` was a FALSE NEGATIVE — it matched
+                // NONE of the real dialog. The live frame renders a header
+                // `<cmd> requires approval`, options `Yes, single permission` /
+                // `Trust, always allow in this session` / `No (Tab to edit)`,
+                // and a self-identifying footer `ESC to close | Tab to edit`.
+                // Anchor the header + footer chrome (zero-FP; prose never emits
+                // the boxed footer). Distinct from the spinner footer
+                // `Thinking… (esc to cancel)` (lowercase `esc to cancel`, not
+                // this). Pair with `gate_on_heartbeat` (alive→Thinking) + the
+                // #1552 live-bottom-N escalation gate so a scrollback echo can't
+                // FP into a false operator buzz.
+                (
+                    AgentState::PermissionPrompt,
+                    r"requires approval|ESC to close \| Tab to edit",
+                ),
                 // Phase A Piece-1: git conflict output (backend-independent).
                 (
                     AgentState::GitConflict,
@@ -453,10 +468,28 @@ impl StatePatterns {
                 ),
                 // [docs] Context overflow
                 (AgentState::ContextFull, r"ContextOverflow"),
-                // [docs] Permission UI
+                // #1559: opencode permission dialog chrome (operator capture
+                // opencode-perm.raw 1.15.10, 2026-06-01). The prior [docs]
+                // alternation kept the bare option words `Allow once` /
+                // `Allow always`, which echo in changelogs / release-notes /
+                // permission-docs scrollback → content-FP.
+                //
+                // Capture finding (replay-validated): opencode's TUI renders the
+                // boxed `Permission required` HEADER above the live bottom rows
+                // (heavy synchronized-output + Kitty-graphics framing) — it does
+                // NOT land in the bottom-N grid the detector scans. What DOES
+                // render on one line is the OPTION ROW
+                // `Allow once   Allow always   Reject`. Anchor that co-occurrence
+                // (all three options contiguous) — it is self-identifying
+                // (no prose / changelog emits the three option labels in
+                // sequence), so it keeps the bare-single-word FP closed while
+                // still firing on the real dialog. Keep `Permission required`
+                // too (fires if a future/larger pane DOES surface the header).
+                // Pair with `gate_on_heartbeat` + the #1552 live-bottom-N
+                // escalation gate against any residual scrollback echo.
                 (
                     AgentState::PermissionPrompt,
-                    r"Permission required|Allow once|Allow always",
+                    r"Permission required|Allow once\s+Allow always\s+Reject",
                 ),
                 // Phase A Piece-1: git conflict output (backend-independent).
                 (
@@ -563,11 +596,19 @@ impl StatePatterns {
                 ),
                 // [docs] Token/quota limit
                 (AgentState::ContextFull, r"quota.*exceeded|token.*limit"),
-                // [docs] Permission select options
-                (
-                    AgentState::PermissionPrompt,
-                    r"Allow once|Allow for this session|suggest changes",
-                ),
+                // #1559: gemini permission dialog chrome (operator capture
+                // gemini-perm.raw v0.44.1, 2026-06-01). The prior [docs]
+                // alternation `Allow once|Allow for this session|suggest changes`
+                // matched the real dialog but its bare `suggest changes` is
+                // ordinary code-review language (GitHub "suggest changes", any
+                // review/self-analysis pane) → high content-FP. The live frame
+                // is a boxed select: header `Allow execution of [<tool>]?` with
+                // numbered options `1. Allow once` / `2. Allow for this session` /
+                // `3. No, suggest changes (esc)`. Anchor the self-identifying
+                // boxed header `Allow execution of` (prose never asks "Allow
+                // execution of [X]?"); DROP the bare option words. Pair with
+                // `gate_on_heartbeat` + the #1552 live-bottom-N escalation gate.
+                (AgentState::PermissionPrompt, r"Allow execution of"),
                 // Phase A Piece-1: git conflict output (backend-independent).
                 (
                     AgentState::GitConflict,

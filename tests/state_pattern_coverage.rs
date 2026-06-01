@@ -20,6 +20,11 @@ const EXPECTED_FIXTURES: &[&str] = &[
     "kiro-tooluse.raw",
     "opencode-thinking.raw",
     "opencode-tooluse.raw",
+    // #1559 — cross-backend permission-dialog chrome captures (operator
+    // recorded 2026-06-01). Replayed by `replay_manifest_regression`.
+    "kiro-perm.raw",
+    "gemini-perm.raw",
+    "opencode-perm.raw",
     // #848 PR-A — classifier root cause fixtures (synthetic from Anthropic
     // docs verbatim strings). The behavior assertion that each fixture
     // produces the right AgentState lives in `src/state.rs::mod tests`

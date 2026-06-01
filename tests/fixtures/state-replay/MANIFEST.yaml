@@ -233,6 +233,42 @@ fixtures:
     expected_final_state: permission
     expected_final_detect: idle
 
+  # ── #1559 cross-backend permission-dialog chrome captures ───────────
+  # Operator recorded 2026-06-01; lead verified the live chrome. Each
+  # fixture exercises a real permission/approval dialog so the chrome-
+  # anchored PermissionPrompt patterns (patterns.rs, #1559) must surface
+  # `permission` in the transition sequence. expected_* below are filled
+  # from the actual `replay_manifest_regression` observed sequence.
+  - file: kiro-perm.raw
+    backend: kiro
+    cli_version: "unknown"
+    recorded_on: "2026-06-01"
+    scenario: "kiro asked to run a shell command needing approval -> renders approval dialog (header '<cmd> requires approval', options Yes/Trust/No, footer 'ESC to close | Tab to edit') -> #1559 chrome anchor fires PermissionPrompt"
+    provenance: "#1559"
+    expected_transitions: [starting, idle, thinking, permission]
+    expected_final_state: permission
+    expected_final_detect: permission
+
+  - file: gemini-perm.raw
+    backend: gemini
+    cli_version: "0.44.1"
+    recorded_on: "2026-06-01"
+    scenario: "gemini asked to run a shell tool -> boxed select 'Allow execution of [Shell]?' with numbered options (1 Allow once / 2 Allow for this session / 3 No, suggest changes) -> #1559 chrome anchor fires PermissionPrompt"
+    provenance: "#1559"
+    expected_transitions: [starting, idle, thinking, permission]
+    expected_final_state: permission
+    expected_final_detect: permission
+
+  - file: opencode-perm.raw
+    backend: opencode
+    cli_version: "1.15.10"
+    recorded_on: "2026-06-01"
+    scenario: "opencode asked to run a tool needing approval -> boxed dialog (option row 'Allow once  Allow always  Reject' renders in the live tail; 'Permission required' header frames above the bottom-N) -> #1559 option-row chrome anchor fires PermissionPrompt. Final frame shows a tool banner (detect=tool_use) while the tracker holds PermissionPrompt via hysteresis."
+    provenance: "#1559"
+    expected_transitions: [starting, idle, thinking, permission]
+    expected_final_state: permission
+    expected_final_detect: tool_use
+
   # ── Stage 2a ToolUse recordings (2026-04-20) ────────────────────────
   # Every recording below DID exercise a real tool call (verified by
   # final-screen tool banners / session summaries), yet none of the

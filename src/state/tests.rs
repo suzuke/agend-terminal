@@ -1894,7 +1894,7 @@ fn heartbeat_fresh_overrides_permission_prompt() {
     // shows permission pattern → must NOT latch PermissionPrompt.
     let mut t = tracker_at(&Backend::KiroCli, AgentState::Thinking, 5);
     t.update_heartbeat(Duration::from_secs(10)); // 10s ago = fresh
-    t.feed("Allow this action y/n/t");
+    t.feed("shell requires approval");
     assert_ne!(
         t.get_state(),
         AgentState::PermissionPrompt,
@@ -1909,7 +1909,7 @@ fn stale_heartbeat_allows_permission_prompt() {
     // permission pattern → must latch PermissionPrompt normally.
     let mut t = tracker_at(&Backend::KiroCli, AgentState::Thinking, 5);
     t.update_heartbeat(Duration::from_secs(200)); // 200s ago > 120s
-    t.feed("Allow this action y/n/t");
+    t.feed("shell requires approval");
     assert_eq!(t.get_state(), AgentState::PermissionPrompt);
 }
 
@@ -1918,7 +1918,7 @@ fn no_heartbeat_allows_permission_prompt() {
     // Pin 3 — no heartbeat ever: default behavior preserved.
     let mut t = tracker_at(&Backend::KiroCli, AgentState::Thinking, 5);
     // last_heartbeat is None by default
-    t.feed("Allow this action y/n/t");
+    t.feed("shell requires approval");
     assert_eq!(t.get_state(), AgentState::PermissionPrompt);
 }
 
@@ -3367,6 +3367,66 @@ fn claude_permission_footer_anchor_1546() {
             StatePatterns::for_backend(&b).detect("Esc to cancel · Tab to amend"),
             Some(AgentState::PermissionPrompt),
             "claude footer must not fire PermissionPrompt on {b:?}"
+        );
+    }
+}
+
+/// #1559: cross-backend permission patterns are chrome-anchored — the real
+/// dialog chrome fires PermissionPrompt, but the dropped FP-prone bare option
+/// words do NOT fire on prose. Pairs with the replay fixtures (which prove the
+/// chrome fires on the real captures); this pins the FP direction.
+#[test]
+fn cross_backend_permission_chrome_anchor_1559() {
+    // kiro: chrome header + footer fire; the old [docs] guess (a false negative)
+    // and any bare prose do not.
+    let kiro = StatePatterns::for_backend(&Backend::KiroCli);
+    assert_eq!(
+        kiro.detect("rm -rf / requires approval"),
+        Some(AgentState::PermissionPrompt),
+        "kiro header 'requires approval' must fire"
+    );
+    assert_eq!(
+        kiro.detect("ESC to close | Tab to edit"),
+        Some(AgentState::PermissionPrompt),
+        "kiro footer chrome must fire"
+    );
+    // the spinner footer (lowercase 'esc to cancel') must NOT be read as the
+    // permission footer.
+    assert_ne!(
+        kiro.detect("Thinking… (esc to cancel)"),
+        Some(AgentState::PermissionPrompt),
+        "kiro spinner footer must not fire PermissionPrompt"
+    );
+
+    // gemini: boxed header fires; bare 'suggest changes' prose does not.
+    let gemini = StatePatterns::for_backend(&Backend::Gemini);
+    assert_eq!(
+        gemini.detect("Allow execution of [Shell]?"),
+        Some(AgentState::PermissionPrompt),
+        "gemini boxed header must fire"
+    );
+    assert_ne!(
+        gemini.detect("I'll suggest changes to the PR after review"),
+        Some(AgentState::PermissionPrompt),
+        "#1559: bare 'suggest changes' prose must NOT fire PermissionPrompt"
+    );
+
+    // opencode: the option-row co-occurrence fires; single bare option words in
+    // prose (changelog / release-notes echo) do not.
+    let opencode = StatePatterns::for_backend(&Backend::OpenCode);
+    assert_eq!(
+        opencode.detect("┃ Allow once   Allow always   Reject"),
+        Some(AgentState::PermissionPrompt),
+        "opencode option-row chrome must fire"
+    );
+    for prose in [
+        "Allow once you've reviewed it, then merge",
+        "Should I Allow always, or just this time?",
+    ] {
+        assert_ne!(
+            opencode.detect(prose),
+            Some(AgentState::PermissionPrompt),
+            "#1559: bare opencode option word in prose {prose:?} must NOT fire"
         );
     }
 }
