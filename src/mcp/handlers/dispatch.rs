@@ -47,6 +47,57 @@ pub(crate) struct HandlerCtx<'a> {
 /// allocation-free.
 pub(crate) type HandlerFn = fn(&HandlerCtx<'_>) -> Value;
 
+/// #1602: validate `args` against the tool's declared `inputSchema` before
+/// dispatch. The schemas declare `required[]` but nothing enforced it, so a
+/// mis-named / omitted param failed LATE and misleadingly (the operator's
+/// `reply` bug: a wrong key silently became an empty `text`). Now:
+///
+/// - a missing REQUIRED key → hard-reject with `<tool>: missing required
+///   parameter '<name>'`;
+/// - an UNKNOWN key → warn only (forward-compat; never reject).
+///
+/// Returns `Some(error_value)` to short-circuit dispatch, or `None` to proceed.
+///
+/// **Enforceability invariant (#1602/#1603):** every field a tool declares in
+/// `required[]` MUST be one the handler genuinely needs — i.e. the handler
+/// ERRORS (not defaults) when it's absent. The systematic audit found 5 tools
+/// whose handler instead DEFAULTS a "required" field, so their schemas were
+/// LYING. They were schema-aligned (field removed from `required[]`) rather than
+/// allowlisted, keeping this validator a plain hard-reject. The 5:
+/// `mode` (`action` → `"get"`), `create_instance` (`name` auto-derived in team
+/// mode; single path still errors "missing 'name'"), `set_waiting_on`
+/// (`condition` absent = clear), and `set_display_name` / `set_description`
+/// (handler tolerates absent, sets `""` — a separate follow-up decides whether
+/// set-X-without-X should hard-error).
+///
+/// Tools whose handler DOES error on a missing field (`reply.message`,
+/// `send.message`, `delete_instance.instance`, action-based `task`/`decision`)
+/// keep their `required[]` and are hard-rejected here. A new tool that declares
+/// a field its handler defaults will trip the pinning test below.
+fn validate_args(tool: &str, def: &Value, args: &Value) -> Option<Value> {
+    let schema = &def["inputSchema"];
+    if let Some(required) = schema["required"].as_array() {
+        for req in required.iter().filter_map(Value::as_str) {
+            if args.get(req).is_none() {
+                return Some(json!({
+                    "error": format!("{tool}: missing required parameter '{req}'")
+                }));
+            }
+        }
+    }
+    if let (Some(props), Some(obj)) = (schema["properties"].as_object(), args.as_object()) {
+        for key in obj.keys() {
+            if !props.contains_key(key) {
+                tracing::warn!(
+                    tool, param = %key,
+                    "#1602: unknown parameter (ignored) — not in the tool's inputSchema"
+                );
+            }
+        }
+    }
+    None
+}
+
 /// Look the `tool` name up in the registry. Returns `Some(value)`
 /// on hit; returns `None` if the tool isn't registered — the caller
 /// falls back to the inline `match` in `mod.rs` for un-migrated arms.
@@ -54,7 +105,15 @@ pub(super) fn try_dispatch(tool: &str, ctx: &HandlerCtx<'_>) -> Option<Value> {
     crate::mcp::registry::all()
         .iter()
         .find(|entry| entry.name == tool)
-        .map(|entry| (entry.handler)(ctx))
+        .map(|entry| {
+            // #1602: enforce the declared inputSchema at the single dispatch
+            // chokepoint — a missing required param is rejected with a clear
+            // named error instead of failing late inside the handler.
+            if let Some(err) = validate_args(entry.name, &(entry.definition)(), ctx.args) {
+                return err;
+            }
+            (entry.handler)(ctx)
+        })
 }
 
 // ---------------------------------------------------------------------
@@ -718,5 +777,122 @@ mod tests {
         let status = try_dispatch("watchdog", &status_ctx).unwrap();
         assert_eq!(status["snoozed"], false);
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #1602: inputSchema enforcement at dispatch ──────────────────────
+
+    #[test]
+    fn validate_rejects_missing_required_with_named_error() {
+        // reply requires `message` (post-#1602 rename); omitting it is the
+        // exact bug the operator hit (a mis-named param became an empty reply).
+        let def = crate::mcp::tools::def_reply();
+        let err = validate_args("reply", &def, &json!({})).expect("must reject");
+        assert_eq!(
+            err["error"], "reply: missing required parameter 'message'",
+            "must name the tool + the missing param: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_passes_when_required_present_and_unknown_only_warns() {
+        // `message` present → no reject; an unknown key only warns (no reject).
+        let def = crate::mcp::tools::def_reply();
+        assert!(
+            validate_args("reply", &def, &json!({"message": "hi"})).is_none(),
+            "valid call must pass"
+        );
+        assert!(
+            validate_args("reply", &def, &json!({"message": "hi", "bogus": 1})).is_none(),
+            "unknown param must warn, not reject"
+        );
+    }
+
+    /// #1602/#1603 audit pin. The systematic re-audit found 5 tools whose
+    /// HANDLER defaults a field instead of erroring on its absence, so that
+    /// field must NOT be in `required[]` (else the validator would hard-reject a
+    /// legitimate call). Pins BOTH that the schema omits it from `required[]`
+    /// AND that the validator lets the field-less call through. If a future
+    /// tool/edit declares a handler-defaulted field required, this fails — re-run
+    /// the audit (`grep unwrap_or` the handler).
+    #[test]
+    fn handler_defaulted_fields_are_not_declared_required() {
+        use crate::mcp::tools::*;
+        // (tool, def, handler-defaulted field, a legit call that omits it)
+        let cases = [
+            ("mode", def_mode(), "action", json!({})), // → "get" (read-only)
+            (
+                "create_instance",
+                def_create_instance(),
+                "name",
+                json!({"team": "dev", "count": 2, "backend": "claude"}),
+            ), // team mode auto-names; single path still errors "missing 'name'"
+            (
+                "set_waiting_on",
+                def_set_waiting_on(),
+                "condition",
+                json!({}),
+            ), // → clear
+            (
+                "set_display_name",
+                def_set_display_name(),
+                "name",
+                json!({}),
+            ), // → ""
+            (
+                "set_description",
+                def_set_description(),
+                "description",
+                json!({}),
+            ), // → ""
+        ];
+        for case in &cases {
+            let (tool, def, field, args) = (case.0, &case.1, case.2, &case.3);
+            let declares_required = def["inputSchema"]["required"]
+                .as_array()
+                .is_some_and(|r| r.iter().any(|v| v.as_str() == Some(field)));
+            assert!(
+                !declares_required,
+                "{tool}: '{field}' is handler-defaulted — it must NOT be declared required[]"
+            );
+            assert!(
+                validate_args(tool, def, args).is_none(),
+                "{tool}: omitting handler-defaulted '{field}' must pass validation"
+            );
+        }
+    }
+
+    /// #1602: genuinely-required fields (the handler ERRORS on absence) stay
+    /// enforced — the validator hard-rejects them with a named error.
+    #[test]
+    fn genuinely_required_fields_are_hard_rejected() {
+        use crate::mcp::tools::*;
+        let cases = [
+            ("reply", def_reply(), "message"),
+            ("send", def_send(), "message"),
+            ("delete_instance", def_delete_instance(), "instance"),
+            ("task", def_task(), "action"),
+        ];
+        for case in &cases {
+            let (tool, def, field) = (case.0, &case.1, case.2);
+            let err = validate_args(tool, def, &json!({})).expect("must reject");
+            assert_eq!(
+                err["error"],
+                format!("{tool}: missing required parameter '{field}'"),
+                "{tool} must hard-reject its missing required field"
+            );
+        }
+    }
+
+    #[test]
+    fn try_dispatch_rejects_reply_without_message() {
+        // End-to-end through the dispatch chokepoint.
+        let home = std::env::temp_dir();
+        let args = json!({}); // no message
+        let ctx = ctx_for(&home, &args, "alpha");
+        let result = try_dispatch("reply", &ctx).expect("registered tool returns Some");
+        assert_eq!(
+            result["error"], "reply: missing required parameter 'message'",
+            "dispatch must reject reply with no message: {result}"
+        );
     }
 }

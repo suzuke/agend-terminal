@@ -60,7 +60,7 @@ Check pending messages, look up by ID, or fetch thread messages.
 
 ### `reply`
 Reply to the user via the active channel (NOT for inter-agent use).
-- **text**: reply content
+- **message**: reply content
 - default_action, timeout_secs
 
 ### `download_attachment`

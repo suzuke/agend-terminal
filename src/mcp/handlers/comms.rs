@@ -61,7 +61,11 @@ pub(super) fn handle_send_to_instance(
     if *sender == target {
         return json!({"error": "cannot send to self — use a different instance"});
     }
-    let text = match args["message"].as_str().or_else(|| args["text"].as_str()) {
+    // #1602: `message` only — the legacy `text` alias is dropped (reply's
+    // text→message rename removed the last schema that declared `text`, and the
+    // dispatch validator now rejects a message-less `send` before this handler
+    // runs anyway). `send`/`reply`/`schedule` are all `message` now.
+    let text = match args["message"].as_str() {
         Some(t) if !t.is_empty() => t,
         _ => return json!({"error": "missing or empty 'message'"}),
     };

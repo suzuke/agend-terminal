@@ -13,10 +13,10 @@ pub fn tool_definitions() -> Value {
 pub(crate) fn def_reply() -> Value {
     json!({"name": "reply", "description": "Reply to the user via the active channel. Requires daemon API. Sprint 59 Wave 1 PR-4 ((B) decision default with timeout): when both `default_action` and `timeout_secs` are set, the daemon records a pending operator decision sidecar and auto-fires the default after the timeout window. Subsequent reply calls without `default_action` resolve the pending decision (operator override / explicit answer arrived).",
         "inputSchema": {"type": "object", "properties": {
-            "text": {"type": "string"},
+            "message": {"type": "string", "description": "The reply text to send to the user."},
             "default_action": {"type": "string", "description": "Action to auto-execute on timeout when the operator doesn't reply within `timeout_secs`. e.g. 'proceed-with-lean' / 'abort'. Pair with `timeout_secs` (Sprint 59 Wave 1 PR-4)."},
             "timeout_secs": {"type": "integer", "description": "Seconds to wait for an operator response before firing `default_action`. Required when `default_action` is set; ignored otherwise (Sprint 59 Wave 1 PR-4)."}
-        }, "required": ["text"]}})
+        }, "required": ["message"]}})
 }
 
 pub(crate) fn def_download_attachment() -> Value {
@@ -75,24 +75,24 @@ pub(crate) fn def_list_instances() -> Value {
 
 pub(crate) fn def_create_instance() -> Value {
     json!({"name": "create_instance", "description": "Create agent instance(s). Team modes: (a) homogeneous — count:3, backend:\"claude\", team:\"dev\" → dev-1..dev-3 all claude; (b) heterogeneous — backends:[\"codex\",\"kiro-cli\",\"gemini\"], team:\"mixed\" → mixed-1=codex, mixed-2=kiro-cli, mixed-3=gemini, all grouped in one tab.",
-        "inputSchema": {"type": "object", "properties": {
-            "name": {"type": "string", "description": "Instance name (single instance) or base name (ignored when team is set — team name is used as prefix)"},
-            "backend": {"type": "string", "description": "Backend CLI name: claude, gemini, kiro-cli, codex, opencode"},
-            "args": {"type": "string", "description": "Extra CLI arguments"},
-            "model": {"type": "string", "description": "Model override (e.g. --model flag)"},
-            "working_directory": {"type": "string"},
-            "branch": {"type": "string", "description": "Git branch — creates worktree if specified"},
-            "task": {"type": "string", "description": "Initial task to inject after spawn"},
-            "layout": {"type": "string", "enum": ["tab", "split-right", "split-below"], "description": "TUI layout: tab (default), split-right, or split-below. Places the new pane relative to `target_pane` if given, otherwise relative to the caller."},
-            "target_pane": {"type": "string", "description": "Name of an existing instance. When set with layout=split-right/split-below, the new pane is attached next to that instance's pane (wherever it currently lives), instead of the caller's focused pane. Falls back to caller, then new tab, if the target isn't currently displayed."},
-            "count": {"type": "integer", "description": "Number of instances to spawn (requires team; ignored when `backends` is set)"},
-            "team": {"type": "string", "description": "Team name — members become <team>-1, <team>-2, ... grouped in one tab"},
-            "backends": {"type": "array", "items": {"type": "string"}, "description": "Per-member backend list for a mixed-backend team (requires team). Length dictates member count."},
-            "command": {"type": "string", "description": "Deprecated: use 'backend' instead"},
-            "role": {"type": "string", "description": "Agent role label (e.g. `reviewer`) recorded on the spawned instance's fleet.yaml entry."},
-            "env": {"type": "object", "description": "#900: environment variables (object of string→string) injected into the spawned backend process and persisted to the fleet.yaml entry so replace/restart flows re-apply them."},
-            "topic_binding": {"type": "string", "description": "Telegram topic binding for the spawned agent, forwarded to the spawn RPC."}
-        }, "required": ["name"]}})
+    "inputSchema": {"type": "object", "properties": {
+        "name": {"type": "string", "description": "Instance name (single instance) or base name (ignored when team is set — team name is used as prefix)"},
+        "backend": {"type": "string", "description": "Backend CLI name: claude, gemini, kiro-cli, codex, opencode"},
+        "args": {"type": "string", "description": "Extra CLI arguments"},
+        "model": {"type": "string", "description": "Model override (e.g. --model flag)"},
+        "working_directory": {"type": "string"},
+        "branch": {"type": "string", "description": "Git branch — creates worktree if specified"},
+        "task": {"type": "string", "description": "Initial task to inject after spawn"},
+        "layout": {"type": "string", "enum": ["tab", "split-right", "split-below"], "description": "TUI layout: tab (default), split-right, or split-below. Places the new pane relative to `target_pane` if given, otherwise relative to the caller."},
+        "target_pane": {"type": "string", "description": "Name of an existing instance. When set with layout=split-right/split-below, the new pane is attached next to that instance's pane (wherever it currently lives), instead of the caller's focused pane. Falls back to caller, then new tab, if the target isn't currently displayed."},
+        "count": {"type": "integer", "description": "Number of instances to spawn (requires team; ignored when `backends` is set)"},
+        "team": {"type": "string", "description": "Team name — members become <team>-1, <team>-2, ... grouped in one tab"},
+        "backends": {"type": "array", "items": {"type": "string"}, "description": "Per-member backend list for a mixed-backend team (requires team). Length dictates member count."},
+        "command": {"type": "string", "description": "Deprecated: use 'backend' instead"},
+        "role": {"type": "string", "description": "Agent role label (e.g. `reviewer`) recorded on the spawned instance's fleet.yaml entry."},
+        "env": {"type": "object", "description": "#900: environment variables (object of string→string) injected into the spawned backend process and persisted to the fleet.yaml entry so replace/restart flows re-apply them."},
+        "topic_binding": {"type": "string", "description": "Telegram topic binding for the spawned agent, forwarded to the spawn RPC."}
+    }}})
 }
 
 pub(crate) fn def_delete_instance() -> Value {
@@ -140,17 +140,17 @@ pub(crate) fn def_interrupt() -> Value {
 
 pub(crate) fn def_set_display_name() -> Value {
     json!({"name": "set_display_name", "description": "Set your display name.",
-        "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}})
+        "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}}})
 }
 
 pub(crate) fn def_set_description() -> Value {
     json!({"name": "set_description", "description": "Set a description for this instance.",
-        "inputSchema": {"type": "object", "properties": {"description": {"type": "string"}}, "required": ["description"]}})
+        "inputSchema": {"type": "object", "properties": {"description": {"type": "string"}}}})
 }
 
 pub(crate) fn def_set_waiting_on() -> Value {
     json!({"name": "set_waiting_on", "description": "Declare what this instance is currently waiting for. Set to empty string to clear. Automatically cleared when stale.",
-        "inputSchema": {"type": "object", "properties": {"condition": {"type": "string", "description": "What you are waiting for, e.g. 'review from at-dev-4'. Empty string to clear."}}, "required": ["condition"]}})
+        "inputSchema": {"type": "object", "properties": {"condition": {"type": "string", "description": "What you are waiting for, e.g. 'review from at-dev-4'. Empty string to clear."}}}})
 }
 
 pub(crate) fn def_move_pane() -> Value {
@@ -302,9 +302,9 @@ pub(crate) fn def_config() -> Value {
 
 pub(crate) fn def_mode() -> Value {
     json!({"name": "mode", "description": "#1339: Read the operator availability/authority mode (READ-ONLY for agents). `get` → current mode (active|away|sleep) + delegate. Agents observe this to back off when the operator is away/asleep. SETTING the mode is operator-only via the `agend-terminal mode <active|away|sleep>` CLI — never available to agents.",
-        "inputSchema": {"type": "object", "properties": {
-            "action": {"type": "string", "enum": ["get"], "default": "get"}
-        }, "required": ["action"]}})
+    "inputSchema": {"type": "object", "properties": {
+        "action": {"type": "string", "enum": ["get"], "default": "get"}
+    }}})
 }
 
 pub(crate) fn def_health() -> Value {
@@ -412,11 +412,18 @@ mod tests {
             .iter()
             .find(|t| t["name"] == "create_instance")
             .expect("create_instance tool not found");
-        let required = create["inputSchema"]["required"]
+        // #1602/#1603 schema-align: `name` is NOT required — the handler
+        // defaults it (team mode auto-names; the single-instance path still
+        // errors "missing 'name'"). Declaring it required would make the schema
+        // lie and the dispatch validator hard-reject a legitimate team create.
+        let required_strs: Vec<&str> = create["inputSchema"]["required"]
             .as_array()
-            .expect("required");
-        let required_strs: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
-        assert!(required_strs.contains(&"name"), "name should be required");
+            .map(|r| r.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        assert!(
+            !required_strs.contains(&"name"),
+            "name must NOT be required (handler-defaulted — see #1603 audit)"
+        );
         assert!(
             !required_strs.contains(&"command"),
             "command should NOT be required (backend is preferred, default is claude)"
@@ -439,10 +446,10 @@ mod tests {
             props["target_pane"].is_object(),
             "create_instance should expose 'target_pane'"
         );
-        let required = create["inputSchema"]["required"]
+        let required_strs: Vec<&str> = create["inputSchema"]["required"]
             .as_array()
-            .expect("required");
-        let required_strs: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
+            .map(|r| r.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
         assert!(
             !required_strs.contains(&"target_pane"),
             "target_pane must stay optional"

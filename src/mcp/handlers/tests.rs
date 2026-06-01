@@ -2062,7 +2062,7 @@ fn reply_no_active_channel_returns_error() {
         "instances:\n  sender:\n    backend: claude\n",
     )
     .ok();
-    let result = handle_tool("reply", &json!({"text": "hello"}), "sender");
+    let result = handle_tool("reply", &json!({"message": "hello"}), "sender");
     assert!(
         result.get("error").is_some(),
         "reply with no active channel must error: {result}"

@@ -140,7 +140,7 @@ fn ec1_3_4_5_7_snapshot_at_handler_time_falls_back_to_active_when_reply_to_none(
     set_reply_to("alpha", None);
     crate::channel::register_active_channel(MockChannel::arc("telegram", ReplyOutcome::Ok));
 
-    let result = super::handle_reply(&home, &serde_json::json!({"text": "hi"}), "alpha");
+    let result = super::handle_reply(&home, &serde_json::json!({"message": "hi"}), "alpha");
     assert_eq!(
         result["message_id"], "mock-msg-1",
         "fallback to singleton must succeed: {result}"
@@ -158,7 +158,7 @@ fn ec2_6_10_unavailable_returns_structured_error_when_lookup_misses() {
     set_reply_to("alpha", Some("discord"));
     crate::channel::register_active_channel(MockChannel::arc("telegram", ReplyOutcome::Ok));
 
-    let result = super::handle_reply(&home, &serde_json::json!({"text": "hi"}), "alpha");
+    let result = super::handle_reply(&home, &serde_json::json!({"message": "hi"}), "alpha");
     assert_eq!(result["code"], "reply_channel_unavailable");
     assert!(
         result["error"]
@@ -179,7 +179,7 @@ fn ec8_no_active_channel_when_no_external_channel_registered() {
     let home = tmp_home("ec8");
     set_reply_to("alpha", None);
 
-    let result = super::handle_reply(&home, &serde_json::json!({"text": "hi"}), "alpha");
+    let result = super::handle_reply(&home, &serde_json::json!({"message": "hi"}), "alpha");
     assert_eq!(
         result["code"], "no_active_channel",
         "no channels registered must surface no_active_channel: {result}"
@@ -207,7 +207,7 @@ fn ec12_multi_channel_lookup_routes_to_tagged_not_singleton() {
     let home = tmp_home("ec12");
     set_reply_to("alpha", Some("discord"));
 
-    let result = super::handle_reply(&home, &serde_json::json!({"text": "hi"}), "alpha");
+    let result = super::handle_reply(&home, &serde_json::json!({"message": "hi"}), "alpha");
     // discord mock returns Ok → message_id present. If routing collapsed
     // to telegram (singleton-style fallback), it would have surfaced
     // channel_capability_unsupported instead.
@@ -233,7 +233,7 @@ fn ec9_channel_kind_mismatch_is_unavailable_not_silent_fallback() {
     set_reply_to("alpha", Some("telegram-main"));
     crate::channel::register_active_channel(MockChannel::arc("telegram", ReplyOutcome::Ok));
 
-    let result = super::handle_reply(&home, &serde_json::json!({"text": "hi"}), "alpha");
+    let result = super::handle_reply(&home, &serde_json::json!({"message": "hi"}), "alpha");
     assert_eq!(
         result["code"], "reply_channel_unavailable",
         "kind mismatch must NOT silently fall back: {result}"
@@ -254,7 +254,7 @@ fn ec11_capability_unsupported_returns_structured_error() {
         ReplyOutcome::NotSupported,
     ));
 
-    let result = super::handle_reply(&home, &serde_json::json!({"text": "hi"}), "alpha");
+    let result = super::handle_reply(&home, &serde_json::json!({"message": "hi"}), "alpha");
     assert_eq!(result["code"], "channel_capability_unsupported");
     std::fs::remove_dir_all(&home).ok();
 }
@@ -269,7 +269,7 @@ fn happy_path_tagged_channel_matches_singleton_returns_message_id() {
     set_reply_to("alpha", Some("telegram"));
     crate::channel::register_active_channel(MockChannel::arc("telegram", ReplyOutcome::Ok));
 
-    let result = super::handle_reply(&home, &serde_json::json!({"text": "hi"}), "alpha");
+    let result = super::handle_reply(&home, &serde_json::json!({"message": "hi"}), "alpha");
     assert_eq!(result["message_id"], "mock-msg-1");
     let snap = crate::daemon::heartbeat_pair::snapshot_for("alpha");
     assert!(
