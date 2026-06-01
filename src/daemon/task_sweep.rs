@@ -613,27 +613,17 @@ fn is_docs_only_pr(files: &[String]) -> bool {
             .all(|f| f.starts_with("docs/") || f.ends_with(".md"))
 }
 
-/// Get changed files for a PR via GitHub API.
+/// Get changed files for a PR via the [`crate::scm::ScmProvider`]
+/// abstraction (#PR-C; was a direct `gh pr view ... --jq .files[].path`).
 fn get_pr_changed_files(pr_number: u64, repo: &str) -> Vec<String> {
-    let output = std::process::Command::new("gh")
-        .args([
-            "pr",
-            "view",
-            &pr_number.to_string(),
-            "--repo",
-            repo,
-            "--json",
-            "files",
-            "--jq",
-            ".files[].path",
-        ])
-        .output();
-    match output {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
-            .lines()
-            .map(String::from)
-            .collect(),
-        _ => Vec::new(),
+    // #PR-C: behavior-identical. The prior call used `--jq .files[].path`
+    // to print one path per line server-side; the typed `pr_view` returns
+    // the parsed `files` paths instead (the `--jq` gh-ism is abstracted
+    // away — same path list). argv delta: `--jq .files[].path` removed.
+    // Failure → empty Vec (unchanged from the prior `_ => Vec::new()`).
+    match crate::scm::make_scm_provider(repo, None).pr_view(repo, pr_number, &["files"]) {
+        Ok(summary) => summary.files.unwrap_or_default(),
+        Err(_) => Vec::new(),
     }
 }
 
@@ -643,27 +633,39 @@ fn has_review_verdict(pr: &PrMeta) -> bool {
     body_upper.contains("VERIFIED")
 }
 
-/// Check 2: All CI checks passed (queries gh pr checks).
+/// #PR-C: client-side reproduction of site-6's prior `gh` `--jq`:
+///   `[.[] | select(.state != "SUCCESS" and .state != "SKIPPED")] | length`
+/// Counts checks whose `state` is NEITHER "SUCCESS" NOR "SKIPPED"
+/// (case-sensitive; null/empty/unknown states all count as not-passed,
+/// matching jq's `!=` on a null `.state`). This is the byte-for-byte
+/// behavioral equivalent of the dropped server-side jq.
+fn count_checks_not_passed(checks: &[crate::scm::CheckState]) -> usize {
+    checks
+        .iter()
+        .filter(|c| c.state != "SUCCESS" && c.state != "SKIPPED")
+        .count()
+}
+
+/// Check 2: All CI checks passed (queries `gh pr checks` via the
+/// [`crate::scm::ScmProvider`] abstraction — #PR-C).
 fn check_ci_green(pr: &PrMeta, repo: &str) -> Option<ComplianceViolation> {
-    let output = std::process::Command::new("gh")
-        .args([
-            "pr",
-            "checks",
-            &pr.number.to_string(),
-            "--repo",
-            repo,
-            "--json",
-            "state",
-            "--jq",
-            "[.[] | select(.state != \"SUCCESS\" and .state != \"SKIPPED\")] | length",
-        ])
-        .output();
-    match output {
-        Ok(o) if o.status.success() => {
-            let count: u32 = String::from_utf8_lossy(&o.stdout)
-                .trim()
-                .parse()
-                .unwrap_or(1);
+    // #PR-C: behavior-identical, FAIL-CLOSED preserved. The prior call
+    // pushed the count server-side via
+    //   --jq '[.[] | select(.state != "SUCCESS" and .state != "SKIPPED")] | length'
+    // then `unwrap_or(1)` (unparseable → treat as 1 = not green). The
+    // typed `pr_checks` returns every check (a null/absent state is kept
+    // as "" — see scm::parse_checks) and we reproduce the jq filter
+    // client-side: any state that is NEITHER "SUCCESS" NOR "SKIPPED"
+    // counts as not-passed (case-sensitive, null/unknown → not-passed).
+    // Fail-closed direction unchanged: a gh failure / unparseable
+    // response → Err → counted as a violation (was the prior `_ =>` arm +
+    // `unwrap_or(1)`); the ONLY None (passed) path is "all checks
+    // SUCCESS/SKIPPED", identical to before. argv delta: `--jq <expr>`
+    // removed + `--json state` → `name,state` (pr_checks' fixed field
+    // set; the count reads only `state`, so the result is identical).
+    match crate::scm::make_scm_provider(repo, None).pr_checks(repo, pr.number) {
+        Ok(checks) => {
+            let count = count_checks_not_passed(&checks);
             if count > 0 {
                 Some(ComplianceViolation {
                     pr_number: pr.number,
@@ -674,8 +676,9 @@ fn check_ci_green(pr: &PrMeta, repo: &str) -> Option<ComplianceViolation> {
                 None
             }
         }
-        _ => {
-            // Can't verify CI — treat as violation in enforce mode
+        Err(_) => {
+            // Can't verify CI — treat as violation (fail-closed), same as
+            // the prior gh-failure / unparseable path.
             Some(ComplianceViolation {
                 pr_number: pr.number,
                 check_name: "ci_green",
@@ -1076,6 +1079,42 @@ mod tests {
 
     /// #1619: the merged-PR list URL is built from a configurable API
     /// base (self-hosted GitHub Enterprise support) — NOT pinned to
+    /// #PR-C site-6: the client-side `count_checks_not_passed` must
+    /// reproduce the prior `--jq`
+    /// `[.[] | select(.state != "SUCCESS" and .state != "SKIPPED")] | length`
+    /// EXACTLY — incl. the fail-closed treatment of null / empty / unknown
+    /// states as not-passed. (gh-failure / unparseable → pr_checks Err →
+    /// the `Err(_)` violation arm in check_ci_green, also fail-closed.)
+    #[test]
+    fn count_checks_not_passed_reproduces_jq() {
+        use crate::scm::CheckState;
+        let mk = |state: &str| CheckState {
+            name: "c".to_string(),
+            state: state.to_string(),
+        };
+        // empty → 0 (all-passed → None violation).
+        assert_eq!(count_checks_not_passed(&[]), 0);
+        // all SUCCESS / SKIPPED → 0.
+        assert_eq!(
+            count_checks_not_passed(&[mk("SUCCESS"), mk("SKIPPED"), mk("SUCCESS")]),
+            0
+        );
+        // mixed: one FAILURE among greens → 1.
+        assert_eq!(
+            count_checks_not_passed(&[mk("SUCCESS"), mk("FAILURE"), mk("SKIPPED")]),
+            1
+        );
+        // unknown states count as not-passed.
+        assert_eq!(
+            count_checks_not_passed(&[mk("PENDING"), mk("NEUTRAL"), mk("CANCELLED")]),
+            3
+        );
+        // null/empty state (parse_checks keeps it as "") → not-passed.
+        assert_eq!(count_checks_not_passed(&[mk(""), mk("SUCCESS")]), 1);
+        // case-sensitive: lowercase "success" is NOT the green sentinel.
+        assert_eq!(count_checks_not_passed(&[mk("success")]), 1);
+    }
+
     /// github.com. Trailing slashes on the base are trimmed.
     #[test]
     fn build_merged_prs_url_uses_configurable_base() {

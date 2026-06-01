@@ -13,12 +13,11 @@
 //! moved in verbatim (byte-identical argv), which is what makes the
 //! eventual call-site conversion behavior-preserving.
 //!
-//! Wiring is incremental: PR-A added the scaffold; **PR-B wires the first
-//! two call sites** (site 7 `pr_state/gh_poll.rs` via `pr_list`, site 4
-//! `tasks/sweep.rs` via `pr_view`). The remaining verbs (`pr_checks`,
-//! `pr_merge`) and the non-GitHub stubs are still unwired in non-test
-//! builds, so the module-wide `dead_code` allow stays until the later
-//! site conversions (PR-B+ / PR-Z) reach them.
+//! Wiring is incremental: PR-A added the scaffold; PR-B wired sites 7
+//! (`pr_list`) + 4 (`pr_view`); **PR-C wires sites 8 + 5 (`pr_view`) and 6
+//! (`pr_checks`)**. The remaining write verb (`pr_merge`, site 3) and the
+//! non-GitHub stubs are still unwired in non-test builds, so the
+//! module-wide `dead_code` allow stays until PR-Z reaches them.
 #![allow(dead_code)]
 
 use serde_json::Value;
@@ -244,15 +243,20 @@ fn parse_pr_summary(v: &Value) -> PrSummary {
 }
 
 /// Parse a `gh pr checks --json name,state` array.
+///
+/// #PR-C: every array element is kept (NO drop on a missing/null `name`
+/// or `state`) — a null/absent `state` becomes `""`. This is required so
+/// the site-6 (`check_ci_green`) count reproduces the prior `--jq`
+/// `select(.state != "SUCCESS" and .state != "SKIPPED")` exactly, where a
+/// null state is `!= "SUCCESS"` ⟹ counted as not-passed (fail-closed). It
+/// also matches site 2's `as_str().unwrap_or("")` treatment of null state.
 fn parse_checks(v: &Value) -> Vec<CheckState> {
     v.as_array()
         .map(|arr| {
             arr.iter()
-                .filter_map(|c| {
-                    Some(CheckState {
-                        name: c["name"].as_str()?.to_string(),
-                        state: c["state"].as_str()?.to_string(),
-                    })
+                .map(|c| CheckState {
+                    name: c["name"].as_str().unwrap_or("").to_string(),
+                    state: c["state"].as_str().unwrap_or("").to_string(),
                 })
                 .collect()
         })
@@ -430,6 +434,24 @@ mod tests {
     }
 
     #[test]
+    fn pr_view_args_prc_sites_drop_q_and_jq() {
+        // #PR-C: sites 8 + 5 previously used gh's `-q`/`--jq` to extract a
+        // field server-side. pr_view intentionally does NOT emit those —
+        // it returns the parsed PrSummary field instead. These pins make
+        // the (intentional, behavior-identical) argv delta explicit.
+        // site 8 (sha_gate): was `... --json headRefOid -q .headRefOid`.
+        assert_eq!(
+            pr_view_args("o/r", 1, &["headRefOid"]),
+            vec!["pr", "view", "1", "--repo", "o/r", "--json", "headRefOid"]
+        );
+        // site 5 (task_sweep): was `... --json files --jq .files[].path`.
+        assert_eq!(
+            pr_view_args("o/r", 1, &["files"]),
+            vec!["pr", "view", "1", "--repo", "o/r", "--json", "files"]
+        );
+    }
+
+    #[test]
     fn pr_checks_args_match_existing_gh_call() {
         assert_eq!(
             pr_checks_args("o/r", 42),
@@ -593,16 +615,25 @@ mod tests {
     }
 
     #[test]
-    fn parse_checks_filters_malformed_entries() {
+    fn parse_checks_keeps_all_entries_null_state_empty() {
+        // #PR-C: NO drop — a missing/null `state` is kept as "" so the
+        // site-6 fail-closed count treats it as not-passed (matches the
+        // prior `--jq` select on null state).
         let v = serde_json::json!([
             {"name": "build", "state": "SUCCESS"},
-            {"name": "no_state"},                      // dropped (missing state)
+            {"name": "no_state"},          // kept, state → ""
             {"name": "lint", "state": "FAILURE"},
+            {"state": "PENDING"},          // kept, name → ""
         ]);
         let checks = parse_checks(&v);
-        assert_eq!(checks.len(), 2);
+        assert_eq!(checks.len(), 4, "every array element is kept");
         assert_eq!(checks[0].name, "build");
-        assert_eq!(checks[1].state, "FAILURE");
+        assert_eq!(
+            checks[1].state, "",
+            "missing state → empty string (not dropped)"
+        );
+        assert_eq!(checks[2].state, "FAILURE");
+        assert_eq!(checks[3].name, "", "missing name → empty string");
     }
 
     // ---- selection + NotSupported ----
