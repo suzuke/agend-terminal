@@ -107,7 +107,15 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
             continue;
         }
 
-        let (rx, pty_writer, pty_master, core) = {
+        // #1617-class (mirror #1593 F1 snapshot→drop→IO): capture the rx +
+        // initial dump + the Arcs UNDER the registry lock, then DROP the guard
+        // before writing the dump to the client. `write_frame` is a blocking
+        // socket write — a slow/non-draining TUI client would otherwise pin the
+        // GLOBAL registry lock indefinitely (exactly the hung-peer stall #1617
+        // closed for the PTY path), wedging the whole daemon. `dump` is an owned
+        // Vec, so it survives the drop; intervening PTY output buffers in `rx`
+        // and is sent by the tui_out thread after this initial frame.
+        let (rx, dump, pty_writer, pty_master, core) = {
             let reg = agent::lock_registry(registry);
             // #1441: registry is UUID-keyed; this TUI-bridge server only knows
             // the display name, so locate the live handle by name.
@@ -116,16 +124,18 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
                 None => continue,
             };
             let (rx, dump) = agent::subscribe_with_dump(agent);
-            if framing::write_frame(&mut stream, &dump).is_err() {
-                continue;
-            }
             (
                 rx,
+                dump,
                 Arc::clone(&agent.pty_writer),
                 Arc::clone(&agent.pty_master),
                 Arc::clone(&agent.core),
             )
         };
+        // Registry lock released — the blocking initial-dump write runs lock-free.
+        if framing::write_frame(&mut stream, &dump).is_err() {
+            continue;
+        }
 
         let mut write_stream = match stream.try_clone() {
             Ok(s) => s,
@@ -190,5 +200,70 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
         {
             tracing::warn!(agent = %n_err, error = %e, "failed to spawn TUI input thread");
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    /// #1617-class invariant: `serve_tui_accept_loop` must NEVER hold the
+    /// global registry lock across the blocking initial-dump `write_frame`.
+    /// A non-draining TUI client would otherwise pin the registry forever and
+    /// wedge the whole daemon (same hung-peer stall #1617 closed for the PTY).
+    ///
+    /// Structural source-scan (mirrors #1593 F2 /
+    /// `recovery_loop_never_holds_registry_across_blocking_io`): brace-match the
+    /// dump-capture binding block and assert (a) `write_frame` is NOT inside it
+    /// (i.e. not under the lock) and (b) a `write_frame` call DOES exist after
+    /// the block closes (the dump is written lock-free). Needles are `concat`-
+    /// built and the scan is sliced to the production region (before the
+    /// `#[cfg(test)]` mod) so this test's own source can't self-satisfy it.
+    #[test]
+    fn tui_dump_write_not_held_across_registry_lock() {
+        let src = include_str!("tui_bridge.rs");
+        let cfg_test = ["#[cfg(", "test)]"].concat();
+        let prod = match src.find(&cfg_test) {
+            Some(i) => &src[..i],
+            None => src,
+        };
+
+        // The fix marker: the lock block now captures `dump` into the outer
+        // binding (was a 4-tuple without `dump` pre-fix), proving the dump is
+        // moved out of the lock scope before it is written.
+        let bind_needle = ["let (rx, dump, pty_writer", ", pty_master, core) = {"].concat();
+        let bstart = prod
+            .find(&bind_needle)
+            .expect("dump-capture binding present (fix marker)");
+
+        // Brace-match from the binding's opening `{` to find the locked region.
+        let open_rel = prod[bstart..].find('{').expect("binding block opens");
+        let block_start = bstart + open_rel;
+        let mut depth = 0usize;
+        let mut block_end = block_start;
+        for (i, c) in prod[block_start..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        block_end = block_start + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(block_end > block_start, "binding block must close");
+
+        let write_needle = ["write", "_frame"].concat();
+        let locked_region = &prod[block_start..=block_end];
+        assert!(
+            !locked_region.contains(&write_needle),
+            "tui_bridge must NOT write_frame while the registry lock is held (#1617 deadlock class)"
+        );
+        assert!(
+            prod[block_end..].contains(&write_needle),
+            "the initial dump must be written via write_frame AFTER the registry lock is dropped"
+        );
     }
 }
