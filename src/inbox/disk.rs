@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub(super) static DISK_READONLY: AtomicBool = AtomicBool::new(false);
 
 /// Minimum free-space ratio before entering readonly mode.
+#[allow(dead_code)]
 const LOW_DISK_THRESHOLD: f64 = 0.05;
 
 /// Check available disk space at `path`. Returns true if below threshold.
