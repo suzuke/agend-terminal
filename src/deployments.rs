@@ -1578,6 +1578,41 @@ instances: {}
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// #bughunt2 (codex review): teardown's record-cleanup save-failure branch
+    /// must surface a stale-record error, not report `torn_down`. Unix-only: the
+    /// failure is injected by making `home` read-only AFTER deploy (the
+    /// `deployments.lock` already exists so the flock still opens, `load` still
+    /// reads the record, but the `atomic_write` tmp create in the read-only dir
+    /// fails the save).
+    #[cfg(unix)]
+    #[test]
+    fn teardown_surfaces_record_save_failure_not_fake_torn_down() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = deploy_single_instance_for_test("teardown-save-fail", "tpl");
+        assert!(
+            load(&home).deployments.iter().any(|d| d.name == "tpl"),
+            "pre: deployment must exist for the teardown to find"
+        );
+        let ro = std::fs::Permissions::from_mode(0o555);
+        std::fs::set_permissions(&home, ro).unwrap();
+
+        let result = teardown(&home, &serde_json::json!({"name": "tpl"}));
+
+        // Restore write perms so cleanup (and any later test) works.
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            result.get("error").and_then(|e| e.as_str()).is_some(),
+            "a failed record-cleanup save must surface an error, not torn_down: {result}"
+        );
+        assert_ne!(
+            result.get("status").and_then(|s| s.as_str()),
+            Some("torn_down"),
+            "must NOT report torn_down when the record cleanup was not persisted"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     #[test]
     fn close_last_instance_prunes_deployment_entry() {
         // Production smoke for the Issue #474 fix: deploy → simulate the
