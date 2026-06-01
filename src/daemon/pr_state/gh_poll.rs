@@ -94,6 +94,7 @@ impl GhPoller for CliGhPoller {
                 "state",
                 "mergedAt",
             ],
+            None, // #PR-D: uses --repo (no cwd), byte-identical to before
         );
         let elapsed = start.elapsed();
         // dev-2 BLOCKING #1: slip observability. >1s flags potential
