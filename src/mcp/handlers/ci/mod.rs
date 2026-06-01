@@ -465,33 +465,34 @@ pub(super) fn handle_release_repo(args: &Value) -> Value {
 /// other agent's subscription) to APPEND idempotent semantics — the
 /// caller is added to a `subscribers` array if not already present, and
 /// existing poll state (`last_run_id`, `head_sha`, etc.) is preserved.
-pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) -> Value {
-    // Sprint 55 P0-B: when caller omits `repo` arg, auto-derive from
-    // sender's binding.json source_repo (set by `bind_self` /
-    // `dispatch_auto_bind_lease`). EC1: surface explicit error if
-    // neither path nor binding present (no silent cwd-derivation). EC15:
-    // validate the binding's source_repo path still exists before reading.
-    let derived_repo: Option<String>;
-    let canonical_repo: Option<String>;
-    let repo: &str = match args["repository"].as_str().filter(|s| !s.is_empty()) {
+/// #1619: resolve the target `owner/repo` for a PR/CI handler.
+///
+/// Resolution order: explicit `repository` arg (canonicalized) → the
+/// caller's `binding.json` `source_repo` origin remote → error. It
+/// NEVER falls back to a hardcoded repo slug: a detection miss on
+/// someone else's deployment must fail loud, not silently operate
+/// (merge/checks/state) on the maintainer's repo.
+///
+/// Originally inline in `handle_watch_ci` (Sprint 55 P0-B); extracted so
+/// `handle_merge_repo` shares the exact same resolution instead of the
+/// old `.unwrap_or("suzuke/agend-terminal")` footgun. EC1: explicit
+/// error when neither arg nor binding present (no silent cwd-derivation).
+/// EC15: validate the binding's source_repo path still exists.
+fn resolve_repo_or_error(home: &Path, instance_name: &str, args: &Value) -> Result<String, Value> {
+    match args["repository"].as_str().filter(|s| !s.is_empty()) {
         Some(r) => {
             // #942: canonicalize on entry so the hash key + stored
             // `repo` field both reflect the single canonical form.
             // Rejects obviously-malformed input (non-GitHub URL, malformed
             // slug) with operator-actionable error.
             match crate::mcp::handlers::dispatch_hook::canonicalize_repo_slug(r) {
-                Some(c) => {
-                    canonical_repo = Some(c);
-                    canonical_repo.as_deref().unwrap_or("")
-                }
-                None => {
-                    return json!({
-                        "error": format!(
-                            "invalid 'repository' format: {r:?} — expected `owner/repo` or full GitHub URL"
-                        ),
-                        "code": "invalid_repo_format",
-                    });
-                }
+                Some(c) => Ok(c),
+                None => Err(json!({
+                    "error": format!(
+                        "invalid 'repository' format: {r:?} — expected `owner/repo` or full GitHub URL"
+                    ),
+                    "code": "invalid_repo_format",
+                })),
             }
         }
         None => {
@@ -500,44 +501,52 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
                 .join(instance_name)
                 .join("binding.json");
             let Ok(content) = std::fs::read_to_string(&binding) else {
-                return json!({
-                    "error": "ci(watch) needs explicit 'repository' arg OR active binding (call bind_self first)",
+                return Err(json!({
+                    "error": "could not determine repo slug; pass explicit 'repository' arg or call bind_self first (no active binding)",
                     "code": "no_binding_no_repo"
-                });
+                }));
             };
             let Ok(v) = serde_json::from_str::<Value>(&content) else {
-                return json!({
+                return Err(json!({
                     "error": "binding.json corrupt — re-bind or pass explicit 'repository'",
                     "code": "binding_corrupt"
-                });
+                }));
             };
             let Some(src) = v["source_repo"].as_str().filter(|s| !s.is_empty()) else {
-                return json!({
+                return Err(json!({
                     "error": "binding has no source_repo — pass explicit 'repository' arg",
                     "code": "no_binding_no_repo"
-                });
+                }));
             };
             let src_path = std::path::Path::new(src);
             if !src_path.exists() {
-                return json!({
+                return Err(json!({
                     "error": format!("binding source_repo '{src}' no longer exists — re-bind or pass explicit 'repository'"),
                     "code": "source_repo_path_deleted"
-                });
+                }));
             }
             match crate::mcp::handlers::dispatch_hook::derive_repo_from_remote_pub(src_path) {
-                Some(r) => {
-                    derived_repo = Some(r);
-                    derived_repo.as_deref().unwrap_or("")
-                }
-                None => {
-                    return json!({
-                        "error": format!("could not derive owner/repo from '{src}' origin remote — pass explicit 'repository' arg or set fleet.yaml `repo:` override"),
-                        "code": "non_github_remote_no_override"
-                    });
-                }
+                Some(r) => Ok(r),
+                None => Err(json!({
+                    "error": format!("could not derive owner/repo from '{src}' origin remote — pass explicit 'repository' arg or set fleet.yaml `repo:` override"),
+                    "code": "non_github_remote_no_override"
+                })),
             }
         }
+    }
+}
+
+pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) -> Value {
+    // Sprint 55 P0-B: when caller omits `repo` arg, auto-derive from
+    // sender's binding.json source_repo (set by `bind_self` /
+    // `dispatch_auto_bind_lease`). #1619: shared `resolve_repo_or_error`
+    // — explicit error when neither arg nor binding present (no silent
+    // cwd-derivation, no hardcoded fallback).
+    let repo_owned = match resolve_repo_or_error(home, instance_name, args) {
+        Ok(r) => r,
+        Err(e) => return e,
     };
+    let repo: &str = &repo_owned;
     let branch = args["branch"].as_str().unwrap_or("main");
     let interval = args["interval_secs"].as_u64().unwrap_or(60);
 
@@ -1155,10 +1164,13 @@ pub(super) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
         Some(n) => n,
         None => return json!({"error": "missing 'pr' (PR number)"}),
     };
-    let repo = args["repository"]
-        .as_str()
-        .unwrap_or("suzuke/agend-terminal")
-        .to_string();
+    // #1619: resolve via the shared helper instead of the old
+    // `.unwrap_or("suzuke/agend-terminal")` — a detection miss must NOT
+    // silently merge/check/state-query against the maintainer's repo.
+    let repo = match resolve_repo_or_error(home, instance_name, args) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
     let force = args["force"].as_bool().unwrap_or(false);
     let force_reason = args["force_reason"].as_str().unwrap_or("");
 

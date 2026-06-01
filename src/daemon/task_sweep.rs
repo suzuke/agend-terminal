@@ -54,6 +54,12 @@ const SWEEP_EMITTER: &str = "system:task_sweep";
 /// desc so recent merges land first.
 const PR_LIST_LIMIT: u32 = 30;
 
+/// #1619: default GitHub REST API base. Overridable via
+/// `SweepConfig.api_base_url` so self-hosted GitHub Enterprise
+/// (`https://ghe.example.com/api/v3`) works instead of being pinned to
+/// github.com — mirrors `CiProvider::with_base_url`'s configurable base.
+const DEFAULT_GITHUB_API_BASE: &str = "https://api.github.com";
+
 /// Configuration persisted at `<home>/task_sweep.json`. Operator mutates
 /// via the `task_sweep_config` MCP tool; sweep tick reads on each invocation.
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
@@ -61,6 +67,10 @@ pub struct SweepConfig {
     /// `owner/repo` GitHub identifier (e.g. `"suzuke/agend-terminal"`).
     /// `None` = sweep disabled (tick is a no-op).
     pub repo: Option<String>,
+    /// #1619: REST API base URL (e.g. `https://ghe.example.com/api/v3`
+    /// for self-hosted GitHub Enterprise). `None` → `https://api.github.com`.
+    #[serde(default)]
+    pub api_base_url: Option<String>,
     /// `true` = tick body short-circuits with no-op.
     #[serde(default)]
     pub paused: bool,
@@ -195,8 +205,12 @@ fn sweep_tick(home: &Path) -> anyhow::Result<()> {
         Some(r) if !r.is_empty() => r.clone(),
         _ => return Ok(()),
     };
+    let api_base = cfg
+        .api_base_url
+        .as_deref()
+        .unwrap_or(DEFAULT_GITHUB_API_BASE);
 
-    let prs = list_recently_merged_prs(&repo)?;
+    let prs = list_recently_merged_prs(&repo, api_base)?;
     if prs.is_empty() {
         return Ok(());
     }
@@ -404,7 +418,18 @@ struct PrMeta {
     api_response_hash: String,
 }
 
-fn list_recently_merged_prs(repo: &str) -> anyhow::Result<Vec<PrMeta>> {
+/// #1619: build the merged-PR list URL from a configurable API base so
+/// self-hosted GitHub Enterprise works. Trailing slashes on the base are
+/// trimmed so `https://ghe/api/v3` and `https://ghe/api/v3/` both yield a
+/// single-slash join. Pure + testable seam (the live call shells out).
+fn build_merged_prs_url(api_base: &str, repo: &str) -> String {
+    let base = api_base.trim_end_matches('/');
+    format!(
+        "{base}/repos/{repo}/pulls?state=closed&sort=updated&direction=desc&per_page={PR_LIST_LIMIT}"
+    )
+}
+
+fn list_recently_merged_prs(repo: &str, api_base: &str) -> anyhow::Result<Vec<PrMeta>> {
     // Build a per-tick current-thread runtime so the sync DaemonTicker
     // body can call async reqwest. Pattern lifted from `ci_watch.rs`.
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -415,9 +440,7 @@ fn list_recently_merged_prs(repo: &str) -> anyhow::Result<Vec<PrMeta>> {
             .timeout(Duration::from_secs(15))
             .user_agent("agend-terminal/task-sweep")
             .build()?;
-        let url = format!(
-            "https://api.github.com/repos/{repo}/pulls?state=closed&sort=updated&direction=desc&per_page={PR_LIST_LIMIT}"
-        );
+        let url = build_merged_prs_url(api_base, repo);
         let mut req = client
             .get(&url)
             .header("Accept", "application/vnd.github+json");
@@ -512,6 +535,15 @@ pub fn handle_task_sweep_config(home: &Path, args: &serde_json::Value) -> serde_
     if let Some(d) = args.get("dry_run").and_then(|v| v.as_bool()) {
         cfg.dry_run = d;
     }
+    // #1619: self-hosted GitHub Enterprise API base (empty string resets
+    // to the github.com default).
+    if let Some(base) = args.get("api_base_url").and_then(|v| v.as_str()) {
+        cfg.api_base_url = if base.is_empty() {
+            None
+        } else {
+            Some(base.to_string())
+        };
+    }
     if let Err(e) = save_config(home, &cfg) {
         return serde_json::json!({"error": format!("save failed: {e}")});
     }
@@ -521,6 +553,7 @@ pub fn handle_task_sweep_config(home: &Path, args: &serde_json::Value) -> serde_
         "dry_run": cfg.dry_run,
         "compliance_mode": cfg.compliance_mode,
         "last_seen_merged_at": cfg.last_seen_merged_at,
+        "api_base_url": cfg.api_base_url,
     })
 }
 
@@ -675,8 +708,12 @@ fn compliance_sweep(home: &Path, repo: &str) -> Vec<ComplianceViolation> {
     if cfg.compliance_mode == "off" {
         return Vec::new();
     }
+    let api_base = cfg
+        .api_base_url
+        .as_deref()
+        .unwrap_or(DEFAULT_GITHUB_API_BASE);
 
-    let prs = match list_recently_merged_prs(repo) {
+    let prs = match list_recently_merged_prs(repo, api_base) {
         Ok(prs) => prs,
         Err(_) => return Vec::new(),
     };
@@ -1037,6 +1074,46 @@ mod tests {
         fs::remove_dir_all(&home).ok();
     }
 
+    /// #1619: the merged-PR list URL is built from a configurable API
+    /// base (self-hosted GitHub Enterprise support) — NOT pinned to
+    /// github.com. Trailing slashes on the base are trimmed.
+    #[test]
+    fn build_merged_prs_url_uses_configurable_base() {
+        // Default github.com base — byte-identical to the pre-#1619 URL.
+        assert_eq!(
+            build_merged_prs_url(DEFAULT_GITHUB_API_BASE, "suzuke/agend-terminal"),
+            "https://api.github.com/repos/suzuke/agend-terminal/pulls?state=closed&sort=updated&direction=desc&per_page=30"
+        );
+        // Self-hosted GHE base.
+        assert_eq!(
+            build_merged_prs_url("https://ghe.corp.example.com/api/v3", "team/proj"),
+            "https://ghe.corp.example.com/api/v3/repos/team/proj/pulls?state=closed&sort=updated&direction=desc&per_page=30"
+        );
+        // Trailing slash on the base is trimmed (no double slash).
+        assert_eq!(
+            build_merged_prs_url("https://ghe.corp.example.com/api/v3/", "team/proj"),
+            "https://ghe.corp.example.com/api/v3/repos/team/proj/pulls?state=closed&sort=updated&direction=desc&per_page=30"
+        );
+    }
+
+    /// #1619: `api_base_url` round-trips through the config tool and an
+    /// empty string resets it to the github.com default (`None`).
+    #[test]
+    fn config_tool_api_base_url_round_trip() {
+        let home = tmp_home("config_api_base");
+        let r1 = handle_task_sweep_config(
+            &home,
+            &serde_json::json!({"api_base_url": "https://ghe.corp.example.com/api/v3"}),
+        );
+        assert_eq!(r1["api_base_url"], "https://ghe.corp.example.com/api/v3");
+        // Reset to default with empty string.
+        let r2 = handle_task_sweep_config(&home, &serde_json::json!({"api_base_url": ""}));
+        assert_eq!(r2["api_base_url"], serde_json::Value::Null);
+        // Default (unset) deserializes to None.
+        assert!(SweepConfig::default().api_base_url.is_none());
+        fs::remove_dir_all(&home).ok();
+    }
+
     /// `sweep_tick` short-circuits when the config is missing or has no
     /// repo set. Operator sees a no-op rather than a noisy GitHub call.
     #[test]
@@ -1197,6 +1274,7 @@ mod tests {
             compliance_mode: "off".to_string(),
             last_seen_merged_at: None,
             alerted_prs: Vec::new(),
+            api_base_url: None,
         };
         save_config(&home, &cfg).unwrap();
         let violations = compliance_sweep(&home, "test/repo");
@@ -1218,6 +1296,7 @@ mod tests {
             compliance_mode: "warn".to_string(),
             last_seen_merged_at: None,
             alerted_prs: Vec::new(),
+            api_base_url: None,
         };
         // Simulate cursor update (done by compliance_sweep at end)
         cfg.last_seen_merged_at = Some("2026-05-12T00:00:00Z".to_string());

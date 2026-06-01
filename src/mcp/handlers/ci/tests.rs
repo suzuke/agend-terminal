@@ -2137,7 +2137,13 @@ fn merge_missing_pr_returns_error() {
 fn merge_force_without_reason_returns_error() {
     let home = std::env::temp_dir().join(format!("agend-merge-force-test-{}", std::process::id()));
     std::fs::create_dir_all(&home).unwrap();
-    let result = super::handle_merge_repo(&home, &json!({"pr": 1234, "force": true}), "dev");
+    // #1619: explicit `repository` so resolution succeeds and the test
+    // reaches the force/force_reason guard it's actually exercising.
+    let result = super::handle_merge_repo(
+        &home,
+        &json!({"pr": 1234, "force": true, "repository": "suzuke/agend-terminal"}),
+        "dev",
+    );
     assert!(result["error"].as_str().unwrap().contains("force_reason"));
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -2151,7 +2157,9 @@ fn merge_force_audit_write_failure_refuses_merge() {
 
     let result = super::handle_merge_repo(
         &home,
-        &json!({"pr": 9999, "force": true, "force_reason": "test emergency"}),
+        // #1619: explicit `repository` so resolution succeeds and the
+        // test reaches the force-path audit write it's exercising.
+        &json!({"pr": 9999, "force": true, "force_reason": "test emergency", "repository": "suzuke/agend-terminal"}),
         "dev",
     );
     let err = result["error"].as_str().unwrap();
@@ -2159,6 +2167,33 @@ fn merge_force_audit_write_failure_refuses_merge() {
         err.contains("audit log write failed"),
         "expected audit failure error, got: {err}"
     );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// #1619: a merge with neither an explicit `repository` arg nor an
+/// active binding must FAIL LOUD — never silently fall back to a
+/// hardcoded maintainer repo (the old `.unwrap_or("suzuke/agend-terminal")`
+/// bug, which would have mis-targeted merge/checks/state on someone
+/// else's deployment).
+#[test]
+fn merge_no_repo_no_binding_errors_without_hardcoded_fallback() {
+    let home = std::env::temp_dir().join(format!("agend-merge-norepo-{}", std::process::id()));
+    std::fs::create_dir_all(&home).unwrap();
+    let result = super::handle_merge_repo(&home, &json!({"pr": 4242}), "dev");
+    let err = result["error"]
+        .as_str()
+        .expect("expected an error, not a merge");
+    assert_eq!(
+        result["code"].as_str(),
+        Some("no_binding_no_repo"),
+        "no repo + no binding must surface no_binding_no_repo, got: {result}"
+    );
+    assert!(
+        !err.contains("suzuke/agend-terminal"),
+        "error must NOT leak / fall back to the maintainer repo slug, got: {err}"
+    );
+    // And it must not report a successful merge.
+    assert!(result["merged"].as_bool() != Some(true));
     let _ = std::fs::remove_dir_all(&home);
 }
 

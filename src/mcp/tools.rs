@@ -219,7 +219,8 @@ pub(crate) fn def_task_sweep_config() -> Value {
     "inputSchema": {"type": "object", "properties": {
         "repository": {"type": "string", "description": "GitHub `owner/repo` slug to sweep (empty string disables)"},
         "pause": {"type": "boolean", "description": "Pause/resume the sweep tick"},
-        "dry_run": {"type": "boolean", "description": "Log decisions without emitting events"}
+        "dry_run": {"type": "boolean", "description": "Log decisions without emitting events"},
+        "api_base_url": {"type": "string", "description": "REST API base URL for self-hosted GitHub Enterprise (e.g. `https://ghe.example.com/api/v3`). Empty string resets to the default `https://api.github.com`."}
     }}})
 }
 
