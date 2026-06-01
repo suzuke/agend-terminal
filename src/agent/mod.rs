@@ -1237,6 +1237,49 @@ struct PtyReadContext {
 }
 
 /// PTY read loop: feeds VTerm, broadcasts output, auto-dismisses dialogs, handles exit.
+/// Broadcast one PTY output chunk to all subscribers WITHOUT blocking.
+///
+/// The caller holds the agent's `core.lock()` (the broadcast is kept atomic
+/// with `feed_with_fg` so a concurrent `subscribe_with_dump` can't interleave a
+/// dump between process and broadcast). That makes blocking here lethal: a
+/// blocking `send` on a full `bounded(1024)` subscriber channel would hold the
+/// core lock forever and wedge every core-lock waiter — the main TUI
+/// render/input thread, the supervisor, all of it. (Observed: two agents'
+/// pty_read threads parked in a full-channel send while holding their core
+/// locks; the TUI drains those very channels but was itself parked waiting for a
+/// core lock — a deadlock cycle that froze the whole daemon.)
+///
+/// `try_send` never blocks. On `Full` the consumer is too far behind, so the
+/// chunk is dropped (best-effort mirror; the consumer resyncs from the next
+/// screen dump) and `dropped_chunks` is bumped + throttled-logged. On
+/// `Disconnected` the subscriber is removed (the `retain` returns `false`).
+fn broadcast_pty_output(
+    subscribers: &mut Vec<crossbeam_channel::Sender<Vec<u8>>>,
+    data: &[u8],
+    dropped_chunks: &mut u64,
+    agent: &str,
+) {
+    subscribers.retain(|tx| match tx.try_send(data.to_vec()) {
+        Ok(()) => true,
+        Err(crossbeam_channel::TrySendError::Full(_)) => {
+            *dropped_chunks += 1;
+            // Throttle: first drop, then powers-of-two, so a chronically-full
+            // subscriber stays visible in the log without flooding it.
+            if dropped_chunks.is_power_of_two() {
+                tracing::warn!(
+                    agent,
+                    dropped_chunks = *dropped_chunks,
+                    "pty broadcast: subscriber channel full — dropping output chunk (consumer \
+                     stalled). Mirror is best-effort; the daemon is NOT blocked (was a freeze \
+                     before this guard)."
+                );
+            }
+            true
+        }
+        Err(crossbeam_channel::TrySendError::Disconnected(_)) => false,
+    });
+}
+
 fn pty_read_loop(
     pty_reader: &mut dyn Read,
     ctx: &PtyReadContext,
@@ -1259,6 +1302,10 @@ fn pty_read_loop(
     let debug_reads = std::env::var("AGEND_DEBUG_PTY_READ").is_ok();
     let mut read_count: u64 = 0;
     let mut total_bytes: u64 = 0;
+    // #1492-class: count subscriber chunks dropped because a consumer's bounded
+    // channel was full. Throttled-logged so a chronically-stalled subscriber is
+    // observable without flooding (see the broadcast site below).
+    let mut dropped_chunks: u64 = 0;
 
     loop {
         match pty_reader.read(&mut buf) {
@@ -1309,7 +1356,7 @@ fn pty_read_loop(
                     // on Ink redraw fragmentation.
                     let (screen, fg) = c.vterm.tail_lines_with_fg(rows);
                     c.state.feed_with_fg(&screen, &fg);
-                    c.subscribers.retain(|tx| tx.send(data.to_vec()).is_ok());
+                    broadcast_pty_output(&mut c.subscribers, data, &mut dropped_chunks, name);
                     screen
                 };
 
