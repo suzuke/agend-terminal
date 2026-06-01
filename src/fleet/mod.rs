@@ -124,6 +124,15 @@ pub struct FleetConfig {
     /// from Sprint 54 P2-6. Storage timestamps stay UTC unconditionally.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_timezone: Option<String>,
+    /// #1547 (A): base directory under which the daemon creates a NON-hidden
+    /// link to each agy instance's real (hidden) `$AGEND_HOME/workspace/<name>`
+    /// dir. agy rejects any workspace whose path has a dot-prefixed ancestor
+    /// (`is hidden: ignore uri`), so the daemon points agy's `$PWD` at
+    /// `<base>/<name>` (a link) while keeping its CWD at the real allowed-root
+    /// workspace. `None` → default `<user_home>/agend-ws`. Only consulted for
+    /// the agy backend; other backends ignore it. See `crate::agy_workspace`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agy_workspace_link_base: Option<PathBuf>,
     #[serde(skip)]
     pub(crate) home: Option<PathBuf>,
 }

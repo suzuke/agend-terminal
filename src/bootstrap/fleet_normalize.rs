@@ -140,6 +140,7 @@ mod tests {
             channels: None,
             templates: None,
             display_timezone: None,
+            agy_workspace_link_base: None,
             home: None,
         };
         c.instances.insert(

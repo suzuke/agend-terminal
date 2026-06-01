@@ -1,6 +1,7 @@
 mod admin;
 mod agent;
 mod agent_ops;
+mod agy_workspace;
 mod api;
 mod app;
 mod auth_cookie;

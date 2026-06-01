@@ -333,6 +333,38 @@ AGEND_DAEMON_BOOT_SWEEP_DRY_RUN=1 AGEND_DAEMON_BOOT_SWEEP_AGE_DAYS=14 \
 grep "boot-sweep" $AGEND_HOME/daemon.log
 ```
 
+## agy fleet MCP via non-hidden workspace link (#1547)
+
+agy (Antigravity CLI) loads project-scoped fleet MCP from
+`<workspace>/.agents/mcp_config.json` (official Customization Roots), written by
+`configure_agy` (`src/mcp_config.rs`). But agy **refuses any workspace folder
+whose path has a dot-prefixed (hidden) ancestor** — `addWorkspaceFolder` logs
+`is hidden: ignore uri` (`root.go:132`) and never reads `.agents/`. Every daemon
+workspace lives under `$AGEND_HOME` (`~/.agend-terminal`, dot-prefixed) → hidden
+→ no fleet `send`/`inbox`/`task` tools.
+
+**Mechanism (operator e2e-verified):** agy decides "hidden" from the **`$PWD`
+env var**, not `getcwd()`/realpath. So the daemon spawns agy with its CWD at the
+real hidden workspace (the validated allowed root) but its `$PWD` pointed at a
+**non-hidden link** to that same dir. The hidden check passes; project discovery
+still resolves the realpath (via `.antigravitycli`) so it is the SAME antigravity
+project — no duplication — and `.agents/` loads.
+
+`src/agy_workspace.rs` owns the link: `ensure_link` (spawn) creates
+`<base>/<instance>` → `$AGEND_HOME/workspace/<instance>` and returns the path
+set as `$PWD` in `agent::build_command`; `remove_link` (teardown) is called from
+`agent_ops::cleanup_working_dir` and only ever removes the managed link, never
+the real workspace. Base defaults to `<user_home>/agend-ws`, overridable via
+fleet.yaml `agy_workspace_link_base`. **Unix:** symlink. **Windows:** a directory
+**junction** (the `junction` crate) — NOT `symlink_dir`, which needs Developer
+Mode / admin privilege; a junction needs neither.
+
+Recovery-safety (M2): agy caches MCP discovery at
+`~/.gemini/antigravity-cli/mcp/<server>/`, so `configure_agy` busts that cache on
+every (re)configure and the Stage-2 respawn path re-runs `configure()` — a
+respawn that skipped it would come back without fleet tools (recovery is exactly
+when they're needed).
+
 ## Release
 
 Tags matching `v*` trigger `.github/workflows/release.yml`, which builds 5

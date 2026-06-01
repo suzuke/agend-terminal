@@ -34,6 +34,7 @@ dependencies = [
  "hex",
  "iana-time-zone",
  "insta",
+ "junction",
  "libc",
  "memchr",
  "parking_lot",
@@ -2158,6 +2159,16 @@ dependencies = [
  "futures-util",
  "once_cell",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "junction"
+version = "1.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8cfc352a66ba903c23239ef51e809508b6fc2b0f90e3476ac7a9ff47e863ae95"
+dependencies = [
+ "scopeguard",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

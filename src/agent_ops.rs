@@ -353,6 +353,12 @@ pub fn cleanup_working_dir(home: &Path, name: &str, working_dir: &Path) {
         let _ = std::fs::remove_file(&id_path);
     }
     let _ = std::fs::remove_file(meta_dir.join(format!("{name}.json")));
+
+    // #1547 (A): remove the non-hidden agy workspace link (no-op for non-agy
+    // instances / when no link exists). Keyed by instance name, not by
+    // working_dir, so it lives outside both cleanup branches above. Never
+    // touches the real workspace — only the managed symlink/junction.
+    crate::agy_workspace::remove_link(home, name);
 }
 
 // ---------------------------------------------------------------------------
