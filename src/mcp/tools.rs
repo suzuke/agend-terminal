@@ -252,7 +252,9 @@ pub(crate) fn def_schedule() -> Value {
             "message": {"type": "string"}, "instance": {"type": "string", "description": "Name of the existing instance to deliver the scheduled message to."},
             "label": {"type": "string"},
             "timezone": {"type": "string", "description": "IANA zone name."},
-            "enabled": {"type": "boolean"}
+            "enabled": {"type": "boolean"},
+            "fire_strategy": {"type": "string", "enum": ["always", "until_success"], "description": "Default always (fire every cron match). until_success: skip remaining same-day fires once linked_task_id completes (done); resumes next calendar day. Requires linked_task_id when until_success. See #1521."},
+            "linked_task_id": {"type": "string", "description": "Task ID whose done status (today) suppresses further fires under until_success. Missing task disables the schedule with target_task_missing. See #1521."}
         }, "required": ["action"]}})
 }
 
@@ -476,6 +478,44 @@ mod tests {
             .as_array()
             .expect("required");
         assert!(required.iter().any(|v| v == "instance"));
+    }
+
+    #[test]
+    fn schedule_exposes_fire_strategy_and_linked_task_id() {
+        // #1600: #1521 shipped fire_strategy=until_success end-to-end in the
+        // backend (schedules.rs) but def_schedule()'s MCP inputSchema never
+        // exposed the two fields, so MCP callers could not reach the feature.
+        // #1095 was a prior def_schedule schema-doc gap — this guard keeps the
+        // schema and the backend args in sync so the class doesn't recur.
+        let defs = tool_definitions();
+        let tools = defs["tools"].as_array().expect("tools array");
+        let schedule = tools
+            .iter()
+            .find(|t| t["name"] == "schedule")
+            .expect("schedule tool not found");
+        let props = &schedule["inputSchema"]["properties"];
+
+        let fire_strategy = &props["fire_strategy"];
+        assert!(
+            fire_strategy.is_object(),
+            "schedule should expose 'fire_strategy'"
+        );
+        let enum_vals: Vec<&str> = fire_strategy["enum"]
+            .as_array()
+            .expect("fire_strategy enum")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(
+            enum_vals,
+            vec!["always", "until_success"],
+            "fire_strategy enum must match the backend's fire_strategy_from_args"
+        );
+
+        assert!(
+            props["linked_task_id"].is_object(),
+            "schedule should expose 'linked_task_id'"
+        );
     }
 
     #[test]
