@@ -1664,3 +1664,59 @@ fn provision_opencode_data_dir_no_auth_src_is_ok_1519() {
     );
     std::fs::remove_dir_all(&xdg).ok();
 }
+
+// ── pty broadcast must never block under the core lock ──────────────────────
+//
+// Regression for the daemon freeze where `pty_read_loop` broadcast PTY output
+// to subscribers with a BLOCKING `send` while holding `core.lock()`. A full
+// bounded(1024) subscriber channel (consumer stalled) made that send block
+// forever, holding the core lock and wedging the whole daemon (main TUI thread,
+// supervisor, every api_handler). With the old `send`, `broadcast_full_channel_
+// does_not_block` below would hang forever — it is the load-bearing pin.
+
+#[test]
+fn broadcast_full_channel_does_not_block_and_drops() {
+    // bounded(1), pre-filled, and never drained → the next send has nowhere to
+    // go. The OLD blocking `send` would deadlock here; `try_send` drops instead.
+    let (tx, _rx) = crossbeam_channel::bounded::<Vec<u8>>(1);
+    tx.send(vec![0u8]).expect("prime the single slot");
+    let mut subs = vec![tx];
+    let mut dropped = 0u64;
+    // If this blocks, the test harness hangs — that IS the failure signal.
+    broadcast_pty_output(&mut subs, b"more output", &mut dropped, "agent-x");
+    assert_eq!(
+        dropped, 1,
+        "the chunk must be dropped, not block, on a full channel"
+    );
+    assert_eq!(
+        subs.len(),
+        1,
+        "a merely-full (live) subscriber is kept, not removed"
+    );
+}
+
+#[test]
+fn broadcast_removes_disconnected_subscriber() {
+    let (tx, rx) = crossbeam_channel::bounded::<Vec<u8>>(1024);
+    drop(rx); // consumer gone → Disconnected
+    let mut subs = vec![tx];
+    let mut dropped = 0u64;
+    broadcast_pty_output(&mut subs, b"x", &mut dropped, "agent-x");
+    assert!(subs.is_empty(), "a disconnected subscriber must be removed");
+    assert_eq!(dropped, 0, "disconnect is not a drop");
+}
+
+#[test]
+fn broadcast_delivers_to_healthy_subscriber() {
+    let (tx, rx) = crossbeam_channel::bounded::<Vec<u8>>(1024);
+    let mut subs = vec![tx];
+    let mut dropped = 0u64;
+    broadcast_pty_output(&mut subs, b"hello", &mut dropped, "agent-x");
+    assert_eq!(subs.len(), 1, "a healthy subscriber is kept");
+    assert_eq!(dropped, 0);
+    assert_eq!(
+        rx.try_recv().ok(),
+        Some(b"hello".to_vec()),
+        "output must be delivered"
+    );
+}
