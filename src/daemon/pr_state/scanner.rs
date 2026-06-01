@@ -72,6 +72,12 @@ pub fn scan_and_emit_with(
         let branch = snapshot.branch.clone();
 
         // #1342: all emit + flag-set under flock to prevent lost-update race.
+        // #bughunt3 (#1617 lock-while-blocking class): the worktree auto-release
+        // does a `git` subprocess + acquires a SECOND (binding) flock — it must
+        // NOT run under the PR-state flock. The closure only records the branch
+        // to release; the actual release runs after `with_pr_state` returns and
+        // the flock is dropped (see below).
+        let mut release_after_unlock: Option<String> = None;
         let result = with_pr_state(home, &repo, &branch, |state| {
             let mut dirty = false;
 
@@ -111,11 +117,11 @@ pub fn scan_and_emit_with(
                     merged_at,
                 } => {
                     if !already_emitted {
-                        // #1344: auto-release worktree before emitting [pr-merged]
-                        crate::daemon::auto_release::auto_release_for_merged_branch(
-                            home,
-                            &state.branch,
-                        );
+                        // #1344/#bughunt3: defer the worktree auto-release until
+                        // AFTER this flock is dropped (the git subprocess +
+                        // nested binding flock are the #1617 lock-while-blocking
+                        // class). Record the branch; release runs post-unlock.
+                        release_after_unlock = Some(state.branch.clone());
                         let author = resolve_author(state);
                         let body = format!(
                             "[pr-merged] {}@{} (merge_commit {}, merged_at {})\n\n\
@@ -182,6 +188,12 @@ pub fn scan_and_emit_with(
                 ScanAction::None
             }
         });
+
+        // #bughunt3 (#1617 class): PR-state flock is now released — run the
+        // auto-release (git subprocess + nested binding flock) lock-free.
+        if let Some(merged_branch) = release_after_unlock {
+            crate::daemon::auto_release::auto_release_for_merged_branch(home, &merged_branch);
+        }
 
         match result {
             Ok(Some(ScanAction::Remove)) => {
@@ -421,4 +433,62 @@ fn build_event_message(
         // #946 grep target: `{repo}@{branch}` canonical form
         .with_correlation_id(format!("{}@{}", state.repo, state.branch))
         .with_reviewed_head(state.head_sha.clone())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    /// #bughunt3 invariant (#1617 lock-while-blocking class): the worktree
+    /// auto-release does a `git` subprocess + acquires a second (binding) flock,
+    /// so it must NEVER run inside the `with_pr_state` closure — that closure
+    /// runs under the PR-state flock. Structural source-scan (mirrors #1593 F2):
+    /// brace-match the `|state| { ... }` closure body and assert
+    /// `auto_release_for_merged_branch` is NOT called inside it, and IS called
+    /// after the closure (lock-free, post-unlock). Needle is `concat`-built and
+    /// the scan is prod-sliced so this test can't self-satisfy.
+    #[test]
+    fn auto_release_not_called_under_pr_state_flock() {
+        let src = include_str!("scanner.rs");
+        let cfg_test = ["#[cfg(", "test)]"].concat();
+        let prod = match src.find(&cfg_test) {
+            Some(i) => &src[..i],
+            None => src,
+        };
+
+        let closure_needle = [", |state|", " {"].concat();
+        let cstart = prod
+            .find(&closure_needle)
+            .expect("with_pr_state closure present");
+
+        // Brace-match from the closure's opening `{` to find its body span.
+        let open_rel = prod[cstart..].find('{').expect("closure block opens");
+        let block_start = cstart + open_rel;
+        let mut depth = 0usize;
+        let mut block_end = block_start;
+        for (i, c) in prod[block_start..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        block_end = block_start + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(block_end > block_start, "closure block must close");
+
+        let release_needle = ["auto_release_for", "_merged_branch"].concat();
+        let closure_body = &prod[block_start..=block_end];
+        assert!(
+            !closure_body.contains(&release_needle),
+            "auto_release_for_merged_branch must NOT run inside the with_pr_state closure (under the PR-state flock — #1617 class)"
+        );
+        assert!(
+            prod[block_end..].contains(&release_needle),
+            "auto_release_for_merged_branch must run AFTER the PR-state flock is dropped"
+        );
+    }
 }
