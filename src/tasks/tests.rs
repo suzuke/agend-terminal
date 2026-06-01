@@ -1640,17 +1640,32 @@ fn test_list_done_filter_returns_all() {
         &serde_json::json!({"action": "done", "id": id2, "result": "ok"}),
     );
 
-    let _ = crate::store::mutate_versioned(
-        &crate::store::store_path(&home, "tasks.json"),
-        |store: &mut TaskStore| {
-            if let Some(t) = store.tasks.iter_mut().find(|t| t.id == id1) {
-                t.updated_at = (chrono::Utc::now() - chrono::Duration::days(15)).to_rfc3339();
-            }
-            Ok(())
-        },
-    );
+    // #1608b: backdate id1 on the REAL event-sourced path. The `list` handler
+    // reads `updated_at` from `task_events::replay` (the LATEST envelope's
+    // timestamp), NOT `tasks.json` (which no read path consults) — so the old
+    // `mutate_versioned(tasks.json)` backdate had zero effect and this test
+    // could not fail for the regression it guards (#1614 fiction-test class).
+    // Rewrite id1's envelopes in `task_events.jsonl` with a 15-day-old timestamp.
+    {
+        let path = home.join("task_events.jsonl");
+        let content = std::fs::read_to_string(&path).unwrap();
+        let old = (chrono::Utc::now() - chrono::Duration::days(15)).to_rfc3339();
+        let rewritten = content
+            .lines()
+            .map(|line| {
+                let mut v: serde_json::Value = serde_json::from_str(line).unwrap();
+                if v["event"]["task_id"] == serde_json::json!(id1) {
+                    v["timestamp"] = serde_json::json!(old);
+                }
+                serde_json::to_string(&v).unwrap()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, format!("{rewritten}\n")).unwrap();
+    }
 
-    // Explicit filter_status=done returns ALL done tasks regardless of age
+    // Explicit filter_status=done returns ALL done tasks regardless of age (id1
+    // is now genuinely aged past the 14-day done-TTL on the replay path).
     let listed = handle(
         &home,
         "a",
