@@ -4,7 +4,11 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub(super) fn handle_reply(home: &Path, args: &Value, instance_name: &str) -> Value {
-    let text = args["text"].as_str().unwrap_or("").to_string();
+    // #1602: the reply content param is `message` (was `text`) — now consistent
+    // with `send`/`schedule`. The MCP dispatch validator rejects a missing
+    // `message` with a clear named error, so a mis-named param no longer
+    // silently becomes an empty reply.
+    let text = args["message"].as_str().unwrap_or("").to_string();
     tracing::info!(from = %instance_name, %text, "reply");
 
     // Sprint 59 Wave 1 PR-4 ((B) decision default with timeout):
