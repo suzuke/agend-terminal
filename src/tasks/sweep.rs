@@ -21,39 +21,28 @@ pub(super) enum PrState {
 /// `gh_pr_lookup` below.
 pub(super) type PrLookup<'a> = &'a dyn Fn(&str, u32) -> Result<PrState, String>;
 
-/// Production PR-state lookup — shells out to `gh pr view`.
-/// Mirrors the existing precedent at
-/// `src/mcp/handlers/sha_gate.rs::fetch_pr_head_sha`.
+/// Production PR-state lookup — resolves `gh pr view` through the
+/// [`crate::scm::ScmProvider`] abstraction (#PR-B; was a direct
+/// `Command::new("gh")` shell-out).
 pub(super) fn gh_pr_lookup(repo: &str, num: u32) -> Result<PrState, String> {
-    let output = std::process::Command::new("gh")
-        .args([
-            "pr",
-            "view",
-            &num.to_string(),
-            "--repo",
-            repo,
-            "--json",
-            "state,mergedAt",
-        ])
-        .output()
-        .map_err(|e| format!("gh pr view failed: {e}"))?;
-    if !output.status.success() {
-        // PR may not exist on this repo — treat as Unknown so
-        // categorization skips rather than erroring out the whole
-        // sweep over a stale PR reference.
-        return Ok(PrState::Unknown);
-    }
-    let body = String::from_utf8_lossy(&output.stdout);
-    let json: serde_json::Value =
-        serde_json::from_str(&body).map_err(|e| format!("gh json parse: {e}"))?;
-    match json["state"].as_str() {
-        Some("MERGED") => Ok(PrState::Merged {
-            merged_at: json["mergedAt"].as_str().unwrap_or("unknown").to_string(),
-        }),
-        Some("CLOSED") => Ok(PrState::Closed),
-        Some("OPEN") => Ok(PrState::Open),
-        _ => Ok(PrState::Unknown),
-    }
+    // #PR-B: argv is byte-identical to the prior inline call
+    // (`gh pr view <num> --repo R --json state,mergedAt`, pinned by
+    // `scm::tests::pr_view_args_match_existing_gh_call`). The prior code
+    // returned Ok(Unknown) on a non-zero exit (PR may not exist → skip,
+    // don't abort the sweep); pr_view surfaces failures as Err, and the
+    // sole caller already does `.unwrap_or(PrState::Unknown)`
+    // (categorize), so the observable behavior is unchanged.
+    let summary = crate::scm::make_scm_provider(repo, None)
+        .pr_view(repo, num as u64, &["state", "mergedAt"])
+        .map_err(|e| e.to_string())?;
+    Ok(match summary.state.as_deref() {
+        Some("MERGED") => PrState::Merged {
+            merged_at: summary.merged_at.unwrap_or_else(|| "unknown".to_string()),
+        },
+        Some("CLOSED") => PrState::Closed,
+        Some("OPEN") => PrState::Open,
+        _ => PrState::Unknown,
+    })
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

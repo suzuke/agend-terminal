@@ -13,11 +13,12 @@
 //! moved in verbatim (byte-identical argv), which is what makes the
 //! eventual call-site conversion behavior-preserving.
 //!
-//! **PR-A is scaffold only: it defines the trait + GitHub impl + neutral
-//! types and adds no callers.** The 10 `gh` sites stay as-is; conversion
-//! is the subsequent PR-B… series. Everything here is therefore unused
-//! in non-test builds until then — hence the module-wide `dead_code`
-//! allow, which PR-B removes as it wires the first call sites.
+//! Wiring is incremental: PR-A added the scaffold; **PR-B wires the first
+//! two call sites** (site 7 `pr_state/gh_poll.rs` via `pr_list`, site 4
+//! `tasks/sweep.rs` via `pr_view`). The remaining verbs (`pr_checks`,
+//! `pr_merge`) and the non-GitHub stubs are still unwired in non-test
+//! builds, so the module-wide `dead_code` allow stays until the later
+//! site conversions (PR-B+ / PR-Z) reach them.
 #![allow(dead_code)]
 
 use serde_json::Value;
@@ -116,8 +117,16 @@ pub(crate) trait ScmProvider: Send + Sync {
     fn pr_view(&self, repo: &str, pr: u64, fields: &[&str]) -> anyhow::Result<PrSummary>;
     /// `gh pr checks <pr> --json name,state` (sites 2/6).
     fn pr_checks(&self, repo: &str, pr: u64) -> anyhow::Result<Vec<CheckState>>;
-    /// `gh pr list …` → PRs matching `filter` (sites 7/9/10).
-    fn pr_list(&self, repo: &str, filter: &ListFilter) -> anyhow::Result<Vec<PrSummary>>;
+    /// `gh pr list …` → PRs matching `filter` (sites 7/9/10). `fields`
+    /// is the explicit `--json` set (each list site reads a different
+    /// subset), passed verbatim so the emitted argv is byte-identical to
+    /// the site it replaces.
+    fn pr_list(
+        &self,
+        repo: &str,
+        filter: &ListFilter,
+        fields: &[&str],
+    ) -> anyhow::Result<Vec<PrSummary>>;
     /// `gh pr merge …` — the only WRITE (site 3).
     fn pr_merge(&self, repo: &str, pr: u64, opts: &MergeOpts) -> anyhow::Result<MergeOutcome>;
 }
@@ -151,8 +160,15 @@ fn pr_checks_args(repo: &str, pr: u64) -> Vec<String> {
     ]
 }
 
-fn pr_list_args(repo: &str, filter: &ListFilter) -> Vec<String> {
+fn pr_list_args(repo: &str, filter: &ListFilter, fields: &[&str]) -> Vec<String> {
+    // Order: `pr list --repo R --json <fields> [--state] [--head] [--base]
+    // [--limit]`. This reproduces site 7's exact argv (the first list-site
+    // conversion). gh treats flag order as insensitive, so the other list
+    // sites (9/10) stay behavior-identical; their literal-argv match is
+    // pinned when they convert.
     let mut a = vec!["pr".into(), "list".into(), "--repo".into(), repo.into()];
+    a.push("--json".into());
+    a.push(fields.join(","));
     if let Some(s) = filter.state {
         a.push("--state".into());
         a.push(s.into());
@@ -165,10 +181,6 @@ fn pr_list_args(repo: &str, filter: &ListFilter) -> Vec<String> {
         a.push("--base".into());
         a.push(b.clone());
     }
-    a.push("--json".into());
-    // Neutral superset of fields the three list sites read; callers pick
-    // the subset they need off `PrSummary`.
-    a.push("number,state,author,headRefName,headRefOid,isDraft,mergedAt".into());
     if let Some(l) = filter.limit {
         a.push("--limit".into());
         a.push(l.to_string());
@@ -292,8 +304,13 @@ impl ScmProvider for GitHubScmProvider {
         Ok(parse_checks(&v))
     }
 
-    fn pr_list(&self, repo: &str, filter: &ListFilter) -> anyhow::Result<Vec<PrSummary>> {
-        let out = Self::run(&pr_list_args(repo, filter))?;
+    fn pr_list(
+        &self,
+        repo: &str,
+        filter: &ListFilter,
+        fields: &[&str],
+    ) -> anyhow::Result<Vec<PrSummary>> {
+        let out = Self::run(&pr_list_args(repo, filter, fields))?;
         if !out.status.success() {
             anyhow::bail!(
                 "gh pr list ({repo}) exited {}: {}",
@@ -341,7 +358,12 @@ macro_rules! not_supported_provider {
             fn pr_checks(&self, _repo: &str, _pr: u64) -> anyhow::Result<Vec<CheckState>> {
                 Err(NotSupported($kind).into())
             }
-            fn pr_list(&self, _repo: &str, _filter: &ListFilter) -> anyhow::Result<Vec<PrSummary>> {
+            fn pr_list(
+                &self,
+                _repo: &str,
+                _filter: &ListFilter,
+                _fields: &[&str],
+            ) -> anyhow::Result<Vec<PrSummary>> {
                 Err(NotSupported($kind).into())
             }
             fn pr_merge(
@@ -424,42 +446,73 @@ mod tests {
     }
 
     #[test]
-    fn pr_list_args_build_from_filter() {
-        // site 9 (branch_sweep) shape: merged + head + base.
+    fn pr_list_args_match_site7_byte_identical() {
+        // #PR-B byte-identical anchor: site 7 (pr_state/gh_poll.rs
+        // CliGhPoller::poll) emits EXACTLY this argv pre-conversion —
+        // `gh pr list --repo R --json <6 fields> --state all --limit 100`.
+        let f = ListFilter {
+            state: Some("all"),
+            head: None,
+            base: None,
+            limit: Some(100),
+        };
+        assert_eq!(
+            pr_list_args(
+                "suzuke/agend-terminal",
+                &f,
+                &[
+                    "author",
+                    "number",
+                    "headRefName",
+                    "isDraft",
+                    "state",
+                    "mergedAt"
+                ]
+            ),
+            vec![
+                "pr",
+                "list",
+                "--repo",
+                "suzuke/agend-terminal",
+                "--json",
+                "author,number,headRefName,isDraft,state,mergedAt",
+                "--state",
+                "all",
+                "--limit",
+                "100",
+            ]
+        );
+    }
+
+    #[test]
+    fn pr_list_args_optional_flags_omitted_when_unset() {
+        // head/base/state/limit each appear only when set; fields are
+        // passed verbatim (each list site supplies its own subset).
         let f = ListFilter {
             state: Some("merged"),
             head: Some("feat/x".into()),
             base: Some("main".into()),
             limit: None,
         };
+        let a = pr_list_args("o/r", &f, &["headRefOid"]);
         assert_eq!(
-            pr_list_args("o/r", &f),
+            a,
             vec![
                 "pr",
                 "list",
                 "--repo",
                 "o/r",
+                "--json",
+                "headRefOid",
                 "--state",
                 "merged",
                 "--head",
                 "feat/x",
                 "--base",
                 "main",
-                "--json",
-                "number,state,author,headRefName,headRefOid,isDraft,mergedAt",
             ]
         );
-        // site 10 (admin) shape: head + merged + limit 1.
-        let f2 = ListFilter {
-            state: Some("merged"),
-            head: Some("feat/y".into()),
-            base: None,
-            limit: Some(1),
-        };
-        let a = pr_list_args("o/r", &f2);
-        assert_eq!(a.last().map(String::as_str), Some("1"));
-        assert!(a.contains(&"--limit".to_string()));
-        assert!(!a.contains(&"--base".to_string()));
+        assert!(!a.contains(&"--limit".to_string()));
     }
 
     #[test]

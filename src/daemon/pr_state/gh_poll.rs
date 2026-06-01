@@ -71,26 +71,36 @@ pub struct CliGhPoller;
 
 impl GhPoller for CliGhPoller {
     fn poll(&self, repo: &str) -> anyhow::Result<Vec<GhPrMetadata>> {
+        // #PR-B: route the `gh pr list` shell-out through `ScmProvider`
+        // instead of calling `Command::new("gh")` directly. The emitted
+        // argv is byte-identical to the prior inline call (pinned by
+        // `scm::tests::pr_list_args_match_site7_byte_identical`); the
+        // `--json` field set is passed verbatim. Behavior is unchanged:
+        // on any failure pr_list returns Err (same as the prior all-Err
+        // contract), Ok(vec) on success.
         let start = std::time::Instant::now();
-        let out = std::process::Command::new("gh")
-            .args([
-                "pr",
-                "list",
-                "--repo",
-                repo,
-                "--json",
-                "author,number,headRefName,isDraft,state,mergedAt",
-                "--state",
-                "all",
-                "--limit",
-                "100",
-            ])
-            .output()
-            .map_err(|e| anyhow::anyhow!("gh CLI invocation failed: {e}"))?;
+        let result = crate::scm::make_scm_provider(repo, None).pr_list(
+            repo,
+            &crate::scm::ListFilter {
+                state: Some("all"),
+                limit: Some(100),
+                ..Default::default()
+            },
+            &[
+                "author",
+                "number",
+                "headRefName",
+                "isDraft",
+                "state",
+                "mergedAt",
+            ],
+        );
         let elapsed = start.elapsed();
         // dev-2 BLOCKING #1: slip observability. >1s flags potential
         // scanner-thread blocking; >10% of tick budget triggers the
-        // fire-and-forget refactor commitment in the PR body.
+        // fire-and-forget refactor commitment in the PR body. Timing the
+        // whole trait call preserves the original semantics (the prior
+        // code warned after the gh process ran, regardless of exit).
         if elapsed > Duration::from_secs(1) {
             tracing::warn!(
                 repo = %repo,
@@ -99,39 +109,38 @@ impl GhPoller for CliGhPoller {
                  if recurrent, refactor to fire-and-forget worker"
             );
         }
-        if !out.status.success() {
-            anyhow::bail!(
-                "gh pr list exit={}: {}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-        let raw: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout)
-            .map_err(|e| anyhow::anyhow!("gh pr list JSON parse: {e}"))?;
-        Ok(raw.into_iter().filter_map(parse_one).collect())
+        Ok(result?
+            .into_iter()
+            .filter_map(summary_to_gh_metadata)
+            .collect())
     }
 }
 
-/// Parse a single `gh pr list` JSON entry into [`GhPrMetadata`].
-/// Returns None on malformed entries (defensive — skip rather than
-/// abort the whole batch).
-pub(super) fn parse_one(v: serde_json::Value) -> Option<GhPrMetadata> {
+/// Map a provider-neutral [`crate::scm::PrSummary`] to [`GhPrMetadata`].
+/// Reproduces the prior `parse_one` contract verbatim: `number`,
+/// `author_login`, `head_ref` and a recognized `state` are required (a
+/// missing/unknown one drops the entry — defensive skip rather than
+/// aborting the batch), `is_draft` defaults to false, and `merged_at` is
+/// the already-nonempty-filtered optional. (`PrSummary.number` is 0 only
+/// when the JSON had no usable `number`, which a real PR never is, so it
+/// stands in for `parse_one`'s `number?` presence check.)
+fn summary_to_gh_metadata(s: crate::scm::PrSummary) -> Option<GhPrMetadata> {
+    let state = match s.state.as_deref()? {
+        "OPEN" => GhPrState::Open,
+        "MERGED" => GhPrState::Merged,
+        "CLOSED" => GhPrState::Closed,
+        _ => return None,
+    };
+    if s.number == 0 {
+        return None;
+    }
     Some(GhPrMetadata {
-        number: v.get("number")?.as_u64()?,
-        author_login: v.get("author")?.get("login")?.as_str()?.to_string(),
-        head_ref: v.get("headRefName")?.as_str()?.to_string(),
-        is_draft: v.get("isDraft").and_then(|x| x.as_bool()).unwrap_or(false),
-        state: match v.get("state")?.as_str()? {
-            "OPEN" => GhPrState::Open,
-            "MERGED" => GhPrState::Merged,
-            "CLOSED" => GhPrState::Closed,
-            _ => return None,
-        },
-        merged_at: v
-            .get("mergedAt")
-            .and_then(|x| x.as_str())
-            .filter(|s| !s.is_empty())
-            .map(String::from),
+        number: s.number,
+        author_login: s.author_login?,
+        head_ref: s.head_ref?,
+        is_draft: s.is_draft.unwrap_or(false),
+        state,
+        merged_at: s.merged_at,
     })
 }
 
@@ -285,18 +294,22 @@ pub(crate) mod tests {
         }
     }
 
-    /// T1: parse_one handles the canonical `gh pr list` JSON shape.
+    /// T1: summary_to_gh_metadata maps a canonical PrSummary to full
+    /// GhPrMetadata. (gh-JSON → PrSummary parsing is covered by
+    /// `scm::tests`; this pins the gh_poll-side mapping that replaced the
+    /// old `parse_one`.)
     #[test]
-    fn t1_parse_canonical_gh_response() {
-        let raw = serde_json::json!({
-            "number": 984,
-            "author": {"login": "suzuke", "id": "...", "is_bot": false, "name": "suzuke"},
-            "headRefName": "fix/969-channel-dedup-mirror-skip",
-            "isDraft": false,
-            "state": "MERGED",
-            "mergedAt": "2026-05-20T04:17:09Z"
-        });
-        let meta = parse_one(raw).expect("parse OK");
+    fn t1_map_canonical_summary() {
+        let s = crate::scm::PrSummary {
+            number: 984,
+            state: Some("MERGED".into()),
+            author_login: Some("suzuke".into()),
+            head_ref: Some("fix/969-channel-dedup-mirror-skip".into()),
+            is_draft: Some(false),
+            merged_at: Some("2026-05-20T04:17:09Z".into()),
+            ..Default::default()
+        };
+        let meta = summary_to_gh_metadata(s).expect("map OK");
         assert_eq!(meta.number, 984);
         assert_eq!(meta.author_login, "suzuke");
         assert_eq!(meta.head_ref, "fix/969-channel-dedup-mirror-skip");
@@ -305,31 +318,59 @@ pub(crate) mod tests {
         assert_eq!(meta.merged_at.as_deref(), Some("2026-05-20T04:17:09Z"));
     }
 
-    /// T1b: parse_one tolerates missing optional fields.
+    /// T1b: missing optional fields default (is_draft → false, merged_at
+    /// → None), matching the prior parse_one tolerance.
     #[test]
-    fn t1b_parse_missing_optional_fields() {
-        let raw = serde_json::json!({
-            "number": 970,
-            "author": {"login": "suzuke"},
-            "headRefName": "fix/x",
-            "state": "OPEN",
-            // isDraft + mergedAt absent
-        });
-        let meta = parse_one(raw).expect("parse OK");
+    fn t1b_map_missing_optional_fields() {
+        let s = crate::scm::PrSummary {
+            number: 970,
+            state: Some("OPEN".into()),
+            author_login: Some("suzuke".into()),
+            head_ref: Some("fix/x".into()),
+            is_draft: None,
+            merged_at: None,
+            ..Default::default()
+        };
+        let meta = summary_to_gh_metadata(s).expect("map OK");
         assert!(!meta.is_draft, "missing isDraft → false");
         assert_eq!(meta.merged_at, None, "missing mergedAt → None");
     }
 
-    /// T1c: parse_one returns None for unknown state strings.
+    /// T1c: unknown state string → None (drop), matching parse_one.
     #[test]
-    fn t1c_parse_unknown_state_returns_none() {
-        let raw = serde_json::json!({
-            "number": 1,
-            "author": {"login": "x"},
-            "headRefName": "br",
-            "state": "DRAFT", // not a valid PR state
-        });
-        assert!(parse_one(raw).is_none());
+    fn t1c_map_unknown_state_returns_none() {
+        let s = crate::scm::PrSummary {
+            number: 1,
+            state: Some("DRAFT".into()), // not a valid PR state
+            author_login: Some("x".into()),
+            head_ref: Some("br".into()),
+            ..Default::default()
+        };
+        assert!(summary_to_gh_metadata(s).is_none());
+    }
+
+    /// T1d: a missing required field (number absent → 0, or author/head
+    /// None) drops the entry — the parse_one `?` semantics.
+    #[test]
+    fn t1d_map_missing_required_fields_drop() {
+        // number 0 (no usable number in JSON) → drop.
+        let no_num = crate::scm::PrSummary {
+            number: 0,
+            state: Some("OPEN".into()),
+            author_login: Some("x".into()),
+            head_ref: Some("br".into()),
+            ..Default::default()
+        };
+        assert!(summary_to_gh_metadata(no_num).is_none());
+        // missing author_login → drop.
+        let no_author = crate::scm::PrSummary {
+            number: 5,
+            state: Some("OPEN".into()),
+            author_login: None,
+            head_ref: Some("br".into()),
+            ..Default::default()
+        };
+        assert!(summary_to_gh_metadata(no_author).is_none());
     }
 
     fn fresh_state(branch: &str) -> super::super::PrState {
