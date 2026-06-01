@@ -1243,6 +1243,18 @@ fn handle_stage2_restart(
         }
     }
 
+    // #1547 M2(b): re-run MCP config on the recovery/respawn path (idempotent).
+    // Critical for agy: its HOME-level discovery cache means a respawn that does
+    // NOT re-configure comes back WITHOUT fleet tools (recovery is exactly when
+    // they're needed). `configure_agy` rewrites `.agents/mcp_config.json` and
+    // busts the discovery cache; for other backends this is a harmless
+    // idempotent rewrite of the project-local config. Mirrors the skills
+    // re-install above (the spawn path's config-generation is otherwise only
+    // run on the INITIAL spawn, not here).
+    if let Some(ref wd) = config.working_dir {
+        crate::mcp_config::configure(wd, &config.backend_command, Some(name));
+    }
+
     let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
     let spawn_result = agent::spawn_agent(
         &agent::SpawnConfig {

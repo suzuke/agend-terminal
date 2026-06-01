@@ -925,6 +925,29 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
         }
     }
 
+    // #1547 M2(c): agy boot invariant. agy loads fleet MCP from
+    // `<workdir>/.agents/mcp_config.json` (written by `configure_agy` BEFORE
+    // spawn). If it's absent at spawn, agy boots without fleet tools AND caches
+    // "no MCP" in its HOME discovery cache — the recovery-failure class #1547
+    // fixes. Verify + WARN (not fatal: a bare agy is still usable manually, and
+    // configure_agy already errors on its own write failure).
+    if matches!(detected_backend, Some(Backend::Agy)) {
+        if let Some(dir) = working_dir {
+            let cfg = dir.join(".agents").join("mcp_config.json");
+            if !cfg.exists() {
+                tracing::warn!(
+                    target: "fleet_mcp_unsupported",
+                    agent = %name,
+                    path = %cfg.display(),
+                    "⚠️  [agy-mcp-config-missing] spawning agy but \
+                     .agents/mcp_config.json is absent — fleet tools will not load \
+                     and agy will cache 'no MCP'. configure_agy should have written \
+                     it pre-spawn; check earlier warnings."
+                );
+            }
+        }
+    }
+
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {

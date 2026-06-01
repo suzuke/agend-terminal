@@ -2,13 +2,23 @@
 //!
 //! Reference: https://github.com/suzuke/AgEnD (TypeScript version)
 //!
-//! **Scope rule:** every write here must land inside `$AGEND_HOME` or inside
-//! the agent's `working_directory`. User-global tool configs (`~/.codex/`,
-//! `~/.claude/`, etc.) are off-limits — mutating them risks corrupting the
-//! user's personal CLI setup and can't be cleanly undone. If a backend seems
-//! to need global state (codex trust prompt was the reason for the old
-//! `codex_trust_directory` write), reach for a CLI flag or `dismiss_patterns`
-//! in `src/backend.rs` instead.
+//! **Scope rule:** every CONFIG write here must land inside `$AGEND_HOME` or
+//! inside the agent's `working_directory`. User-global tool configs
+//! (`~/.codex/`, `~/.claude/`, etc.) are off-limits — mutating them risks
+//! corrupting the user's personal CLI setup and can't be cleanly undone. If a
+//! backend seems to need global state (codex trust prompt was the reason for
+//! the old `codex_trust_directory` write), reach for a CLI flag or
+//! `dismiss_patterns` in `src/backend.rs` instead.
+//!
+//! **#1547 narrow exception (`clear_agy_mcp_cache`):** the agy un-gate writes
+//! its config to the in-`working_directory` `.agents/mcp_config.json` (rule
+//! honored), but ALSO deletes agy's HOME-level *discovery cache* subdir
+//! `~/.gemini/antigravity-cli/mcp/agend-terminal/`. This is **not** a config
+//! write and does **not** touch the user's personal agy/gemini *settings* — it
+//! removes only OUR server's transient discovery cache so agy re-discovers from
+//! the project-local config on its next boot (the recovery-safety fix; agy
+//! regenerates the cache itself). Deliberate, reviewed (operator-signed-off),
+//! and idempotent — the only HOME-level mutation in this module.
 
 use anyhow::Result;
 use serde_json::json;
@@ -269,32 +279,92 @@ fn configure_gemini(working_dir: &Path, instance_name: Option<&str>) -> Result<(
     Ok(())
 }
 
-/// AGY (Google Antigravity CLI): **no-op since #995 Bug 3.**
+/// AGY (Google Antigravity CLI): write `<workdir>/.agents/mcp_config.json`.
 ///
-/// #987 originally wrote `<workdir>/.antigravitycli/mcp_config.json` with
-/// the standard `{ "mcpServers": { ... } }` schema. Empirical testing
-/// (PR #1002 — dev-2 spike) proved that AGY discovers this file for
-/// project-ID storage but **ignores its `mcpServers` field**. Only
-/// HOME-level `~/.gemini/antigravity-cli/mcp_config.json` actually loads
-/// MCP servers. The fleet scope rule (top-of-file comment lines 5-11)
-/// forbids HOME-level writes, so we cannot make AGY load the bridge in
-/// the current AGY release.
+/// #1547 un-gate: agy loads project-scoped MCP via the official Customization
+/// Roots dir `<workspace>/.agents/` (operator-verified: plain + yolo
+/// `--dangerously-skip-permissions` both load `✓ agend-terminal Tools`). This
+/// replaces the dead `.antigravitycli/mcp_config.json` write (#995 Bug 3 — agy
+/// ignored that file's `mcpServers`). **Self-contained** — deliberately NOT
+/// coupled to `configure_gemini` (gemini sunsets 2026-06-18 / #1580).
 ///
-/// This function is retained as a discoverable no-op so the dispatch
-/// at `configure()` stays exhaustive for Backend variants. When upstream
-/// AGY (filed at google-antigravity/antigravity-cli) supports
-/// project-local `mcpServers`, this function should be restored.
+/// The file carries ONLY the `mcpServers` block and is written FRESH (not
+/// merged) each spawn, so a stale/garbled prior file cannot poison discovery —
+/// a property the recovery-safety below depends on.
 ///
-/// `Backend::Agy.preset().fleet_mcp_supported` is set to `false`; the
-/// daemon spawn path (`src/agent.rs spawn_agent`) emits a
-/// `[fleet-mcp-unsupported]` warning so operators understand the
-/// instance lacks fleet MCP tools.
-fn configure_agy(_working_dir: &Path, _instance_name: Option<&str>) -> Result<()> {
-    tracing::debug!(
-        "configure_agy: no-op (fleet_mcp_supported=false; awaiting upstream \
-         AGY support for project-local mcpServers loading)"
-    );
+/// #1547 M2 recovery-safety: agy persists a HOME-level MCP discovery cache at
+/// `~/.gemini/antigravity-cli/mcp/<server>/`, shared across instances and
+/// reused across restarts. A boot that ever found `.agents/` absent caches
+/// "no MCP" and never re-discovers — including on the Stage-2/crash respawn
+/// path (`daemon/mod.rs`). So this (1) clears our server's cache subdir on
+/// every (re)configure to force re-discovery from the fresh config on agy's
+/// next boot, and (2) verifies the write landed + warns (never silent) on
+/// write/clear failure. The respawn path also calls `configure()` so recovery
+/// re-runs both steps.
+fn configure_agy(working_dir: &Path, instance_name: Option<&str>) -> Result<()> {
+    let path = working_dir.join(".agents").join("mcp_config.json");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Flock + atomic write so concurrent spawns can't interleave their writes.
+    let _lock = crate::store::acquire_file_lock(&config_lock_path(&path))?;
+
+    let mut server = mcp_server_entry(instance_name);
+    server["trust"] = json!(true);
+    let config = json!({ "mcpServers": { "agend-terminal": server } });
+    let body = serde_json::to_string_pretty(&config)?;
+    crate::store::atomic_write(&path, body.as_bytes())?;
+
+    // #1547 M2(c): verify the write actually landed — never silently leave agy
+    // bare (a missing config = agy boots without fleet tools, the exact
+    // recovery-failure class this PR fixes).
+    if !path.exists() {
+        anyhow::bail!(
+            "configure_agy: {} missing after atomic_write",
+            path.display()
+        );
+    }
+
+    // #1547 M2(a): bust agy's HOME-level discovery cache so its next boot
+    // re-discovers from the config just written.
+    clear_agy_mcp_cache();
+
+    tracing::debug!(path = %path.display(), "configured agy MCP (.agents/)");
     Ok(())
+}
+
+/// #1547 M2(a): remove agy's HOME-level MCP discovery cache subdir for the
+/// `agend-terminal` server so a stale "no MCP" (or outdated) cache cannot
+/// survive a (re)configure. Per the Q2 decision the server name is kept as the
+/// operator-verified `agend-terminal` (shared across instances); clearing it
+/// forces every agy's NEXT boot to re-discover from `.agents/` — a running agy
+/// does not re-read mid-session, so the race is narrow and re-discovery is
+/// idempotent. Best-effort + WARN (never fatal): a missing cache dir is the
+/// normal first-spawn case, only a real removal error is surprising.
+fn clear_agy_mcp_cache() {
+    let Some(home) = dirs::home_dir() else {
+        tracing::warn!("configure_agy: cannot resolve user home — skipping agy MCP cache bust");
+        return;
+    };
+    let cache = home
+        .join(".gemini")
+        .join("antigravity-cli")
+        .join("mcp")
+        .join("agend-terminal");
+    if !cache.exists() {
+        return;
+    }
+    match std::fs::remove_dir_all(&cache) {
+        Ok(()) => tracing::debug!(
+            path = %cache.display(),
+            "configure_agy: cleared agy MCP discovery cache"
+        ),
+        Err(e) => tracing::warn!(
+            path = %cache.display(), error = %e,
+            "configure_agy: failed to clear agy MCP discovery cache — a stale \
+             entry may suppress fleet tools until removed manually"
+        ),
+    }
 }
 
 /// OpenCode: opencode.json — uses { "mcp": { ... } } with command as array.
@@ -855,26 +925,46 @@ mod tests {
 
     /// #987: configure dispatches Backend::Agy to write the standard
     /// #995 Bug 3: configure_agy is a no-op since empirical proof showed
-    /// AGY ignores project-local `.antigravitycli/mcp_config.json` mcpServers
-    /// field. Dispatcher routes to the no-op without crashing; NO file is
-    /// written under the working_dir (operator's `~/.gemini/` is also
-    /// untouched per scope rule). When upstream supports project-local
-    /// mcpServers, this test's assertions should flip (require the file
-    /// to exist with the bridge entry).
+    /// #1547: AGY now loads project-scoped MCP via the official Customization
+    /// Roots file `<workspace>/.agents/mcp_config.json`. The dispatcher routes
+    /// to `configure_agy`, which writes that file (self-contained — NOT coupled
+    /// to configure_gemini) with the bridge entry + `trust:true` + per-instance
+    /// env. The dead `.antigravitycli/` write (#995 Bug 3) is gone.
     #[test]
-    fn configure_dispatches_agy_noop() {
+    fn configure_dispatches_agy_writes_agents_mcp() {
         let dir = tmp_dir("dispatch_agy");
-        configure(&dir, "agy", None);
-        // #995 Bug 3: NO project-local mcp_config.json is written (AGY
-        // ignores it anyway; previous write was dead code).
+        configure(&dir, "agy", Some("agy-1"));
+
+        let cfg = dir.join(".agents").join("mcp_config.json");
         assert!(
-            !dir.join(".antigravitycli/mcp_config.json").exists(),
-            "#995 Bug 3: configure_agy must not write a project-local mcp_config"
+            cfg.exists(),
+            "#1547: configure_agy must write .agents/mcp_config.json"
         );
-        // Sanity: must NOT have touched Gemini's path under .gemini/.
-        assert!(!dir.join(".gemini").exists());
-        // Sanity: nothing else under .antigravitycli/ either.
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        let server = &v["mcpServers"]["agend-terminal"];
+        assert!(
+            server["command"].as_str().is_some_and(|c| !c.is_empty()),
+            "bridge command must be present: {v}"
+        );
+        assert_eq!(
+            server["trust"],
+            json!(true),
+            "agy entry must set trust:true"
+        );
+        assert_eq!(
+            server["env"]["AGEND_INSTANCE_NAME"],
+            json!("agy-1"),
+            "per-instance AGEND_INSTANCE_NAME must be wired"
+        );
+        assert!(
+            server["env"]["AGEND_HOME"].as_str().is_some(),
+            "AGEND_HOME must be present in the bridge env"
+        );
+        // The dead legacy path must NOT be written, and gemini's .gemini/ must
+        // be untouched (configure_agy is self-contained, not configure_gemini).
         assert!(!dir.join(".antigravitycli").exists());
+        assert!(!dir.join(".gemini").exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 

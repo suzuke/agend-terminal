@@ -519,7 +519,11 @@ impl Backend {
                 // codex / kiro). Operator-verified in issue body.
                 resume_mode: ResumeMode::ContinueInCwd { flag: "--continue" },
                 quit_command: "/exit",
-                instructions_path: "AGY.md",
+                // #1547: agy reads agent instructions from the official
+                // Customization Roots dir `<workspace>/.agents/AGENTS.md`
+                // (same dir as its MCP config). `create_dir_all` handles the
+                // `.agents/` parent. Shared AGENTS.md format.
+                instructions_path: ".agents/AGENTS.md",
                 instructions_shared: true,
                 inject_instructions_on_ready: false,
                 ready_timeout_secs: 20,
@@ -535,15 +539,15 @@ impl Backend {
                     sequence: b"\r",
                 }],
                 fresh_args: None,
-                // #995 Bug 3: AGY discovers `<workdir>/.antigravitycli/mcp_config.json`
-                // for project-ID storage but its `mcpServers` map is ignored —
-                // only HOME-level `~/.gemini/antigravity-cli/mcp_config.json`
-                // loads (empirically proven; see PR description). The fleet
-                // scope rule (src/mcp_config.rs:5-11) forbids HOME-level
-                // writes, so we ship the agy backend without the bridge until
-                // upstream supports project-local mcpServers. Daemon spawn
-                // path emits a warning so operators are not surprised.
-                fleet_mcp_supported: false,
+                // #1547: agy loads project-scoped MCP via the official
+                // Customization Roots dir `<workspace>/.agents/mcp_config.json`
+                // (operator-verified: plain + yolo both load
+                // `✓ agend-terminal Tools`). `configure_agy`
+                // (src/mcp_config.rs) writes that file + busts agy's HOME
+                // discovery cache so recovery respawns reload the bridge. This
+                // supersedes the dead `.antigravitycli/mcp_config.json` write
+                // (#995 Bug 3 — agy ignored that file's `mcpServers`).
+                fleet_mcp_supported: true,
             },
             // Shell and Raw have no preset behavior. `command` is `""` as a
             // sentinel — callers that need the actual spawn path should use
@@ -1155,7 +1159,9 @@ mod tests {
         assert_eq!(agy.dismiss_patterns.len(), 1, "#995 trust dismiss");
         assert!(agy.dismiss_patterns[0].label.contains("Yes, I trust"));
         assert_eq!(agy.dismiss_patterns[0].sequence, b"\r");
-        assert_eq!(agy.instructions_path, "AGY.md");
+        // #1547: agy instructions live in the official Customization Roots dir
+        // alongside its MCP config (was "AGY.md" pre-un-gate).
+        assert_eq!(agy.instructions_path, ".agents/AGENTS.md");
     }
 
     /// #995 Bug 3: `fleet_mcp_supported` flag pins which backends ship with
@@ -1176,12 +1182,10 @@ mod tests {
         assert!(Backend::Codex.preset().fleet_mcp_supported);
         assert!(Backend::OpenCode.preset().fleet_mcp_supported);
         assert!(Backend::Gemini.preset().fleet_mcp_supported);
-        // Unsupported — see field docstring + Backend::Agy preset comment.
-        assert!(
-            !Backend::Agy.preset().fleet_mcp_supported,
-            "#995 Bug 3: Agy bridge currently doesn't load — flag pins the issue \
-             until upstream supports project-local mcpServers"
-        );
+        // #1547: Agy now loads the bridge via `<workspace>/.agents/mcp_config.json`
+        // (official Customization Roots; configure_agy writes it). Was `false`
+        // under #995 Bug 3 (agy ignored the old `.antigravitycli/` write).
+        assert!(Backend::Agy.preset().fleet_mcp_supported);
         // Shell / Raw — no MCP discovery; sentinel `false`.
         assert!(!Backend::Shell.preset().fleet_mcp_supported);
         assert!(
