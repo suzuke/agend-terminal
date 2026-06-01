@@ -988,6 +988,33 @@ fn tick(
     }
 }
 
+/// #1586: states that CLEAR a pending ServerRateLimit retry track.
+///
+/// A genuine server throttle leaves the agent STUCK in the error state (no
+/// productive output) — the retry persists and the `continue` nudge fires, as
+/// intended. But the ServerRateLimit content-FP class (#841/#846/#1586) flips
+/// the state cosmetically when a throttle phrase merely *renders* in the live
+/// tail — e.g. a red `git diff` line of `src/state/patterns.rs` (which contains
+/// the literal phrases), or an ordinary red dev-error log carrying a short
+/// alternation token (`fetch failed` / `connection reset` / …). Those pass the
+/// #1450 red anchor + #1518 live-bottom-N gate, so the state latches even
+/// though the agent is working fine.
+///
+/// Differentiator: a working agent reaches a productive/active state. Broadened
+/// from {Ready, Idle} (#1316) to also include Thinking / ToolUse, so the retry
+/// track clears the moment the agent is provably progressing — killing the
+/// spurious retry storm before the backoff fires. Tradeoff (lead-confirmed): a
+/// real throttle whose injected `continue` briefly drives Thinking can clear the
+/// track early, but the next tick re-detects the still-present throttle and
+/// re-schedules (bounded by `SERVER_RATE_LIMIT_MAX_RETRIES`).
+fn clears_server_rate_limit_retry(state: crate::state::AgentState) -> bool {
+    use crate::state::AgentState;
+    matches!(
+        state,
+        AgentState::Ready | AgentState::Idle | AgentState::Thinking | AgentState::ToolUse
+    )
+}
+
 /// Process ServerRateLimit retries: detect new rate-limit states, schedule
 /// retries, and inject a fixed "continue" nudge after backoff. Runs AFTER
 /// tick() so all core locks are released — PTY writes happen lock-free.
@@ -1025,11 +1052,14 @@ pub(crate) fn process_server_rate_limit_retries(
                         exhausted: false,
                     },
                 );
-            } else if (state == crate::state::AgentState::Ready
-                || state == crate::state::AgentState::Idle)
-                && retry_tracks.remove(name).is_some()
-            {
-                tracing::info!(agent = %name, "ServerRateLimit retry cleared (agent recovered)");
+            } else if clears_server_rate_limit_retry(state) && retry_tracks.remove(name).is_some() {
+                tracing::info!(
+                    agent = %name,
+                    ?state,
+                    "#1586: ServerRateLimit retry cleared — agent reached a productive \
+                     state (a real throttle stays stuck in the error state; a content-FP \
+                     keeps working, so clearing here kills the spurious retry storm)"
+                );
             }
         }
     }
@@ -2002,6 +2032,97 @@ instances:
         assert!(
             !tracks.contains_key("test-agent"),
             "phase 1 must clear retry track on Ready recovery"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1586: the recovery-clear predicate covers all productive/active states
+    /// (broadened from {Ready, Idle}), but NEVER an error/stuck state — so a
+    /// real throttle's retry persists while a working agent's clears.
+    #[test]
+    fn clears_server_rate_limit_retry_covers_productive_not_error_states() {
+        use crate::state::AgentState::*;
+        // Productive/active → clear (agent is progressing, not throttled).
+        for s in [Ready, Idle, Thinking, ToolUse] {
+            assert!(
+                super::clears_server_rate_limit_retry(s),
+                "#1586: productive state {s:?} must clear the retry track"
+            );
+        }
+        // Error / stuck / blocked → must NOT clear (a real throttle stays here).
+        for s in [
+            ServerRateLimit,
+            RateLimit,
+            ApiError,
+            AuthError,
+            UsageLimit,
+            ContextFull,
+            Hang,
+            PermissionPrompt,
+            Starting,
+        ] {
+            assert!(
+                !super::clears_server_rate_limit_retry(s),
+                "#1586: non-productive state {s:?} must NOT clear the retry track"
+            );
+        }
+    }
+
+    /// #1586 FP-direction: a content-FP flips ServerRateLimit while the agent
+    /// keeps working — once it reaches a productive state (Thinking here) the
+    /// retry track is cleared, so the `continue`-inject storm never fires.
+    #[test]
+    fn phase1_productive_state_clears_retry_track_1586() {
+        let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = tmp_home("phase1-fp-productive");
+        let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
+        tracks.insert(
+            "test-agent".to_string(),
+            RateLimitRetry {
+                retry_count: 1,
+                next_retry_at: Instant::now(),
+                exhausted: false,
+            },
+        );
+        // Agent is THINKING (the throttle phrase was just a red diff / log line
+        // in its tail; it's actively working) — pre-#1586 this only cleared on
+        // Ready/Idle, so the retry storm continued. Now it clears.
+        let (handle, _reader) = mock_agent_handle("test-agent", crate::state::AgentState::Thinking);
+        registry.lock().insert(handle.id, handle);
+
+        super::process_server_rate_limit_retries(&home, &registry, &mut tracks);
+        assert!(
+            !tracks.contains_key("test-agent"),
+            "#1586: a productive (Thinking) agent must clear the retry track — no storm"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1586 FP-direction (the OTHER half): a genuine throttle leaves the agent
+    /// STUCK in ServerRateLimit — the retry track must PERSIST (so the
+    /// `continue` nudge still fires for real throttles).
+    #[test]
+    fn phase1_stuck_throttle_keeps_retry_track_1586() {
+        let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = tmp_home("phase1-real-stuck");
+        let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
+        // Far-future retry so phase 2 doesn't fire / inject during this test.
+        tracks.insert(
+            "test-agent".to_string(),
+            RateLimitRetry {
+                retry_count: 1,
+                next_retry_at: Instant::now() + Duration::from_secs(3600),
+                exhausted: false,
+            },
+        );
+        let (handle, _reader) =
+            mock_agent_handle("test-agent", crate::state::AgentState::ServerRateLimit);
+        registry.lock().insert(handle.id, handle);
+
+        super::process_server_rate_limit_retries(&home, &registry, &mut tracks);
+        assert!(
+            tracks.contains_key("test-agent"),
+            "#1586: a still-throttled (stuck) agent must KEEP its retry track"
         );
         std::fs::remove_dir_all(&home).ok();
     }
