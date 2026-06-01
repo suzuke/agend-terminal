@@ -827,6 +827,81 @@ fn build_command_sets_git_editor_defaults() {
     }
 }
 
+/// #1547 (A): `build_command` for an agy backend must set `$PWD` to the
+/// NON-hidden workspace link (so agy's hidden-path guard passes) while the
+/// CWD stays the real hidden workspace. The `agy_workspace::ensure_link` unit
+/// tests cover the link helper in isolation; THIS pins the integration —
+/// that the agy arm in `build_command` actually wires the link path into the
+/// child env. Unix-only: the link is a symlink here (Windows uses a junction,
+/// compile-checked on Windows CI; the PWD-wiring logic is platform-identical).
+#[cfg(unix)]
+#[test]
+fn build_command_agy_sets_pwd_to_non_hidden_link() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let home = std::env::temp_dir().join(format!(
+        "agend-1547-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    let workspace = crate::paths::workspace_dir(&home).join("agy-int");
+    std::fs::create_dir_all(&workspace).expect("create workspace");
+    // Point the link base inside our tmp home so the test never writes into
+    // the real `<user_home>/agend-ws`.
+    let link_base = home.join("ws-links");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances: {{}}\nteams: {{}}\nagy_workspace_link_base: {}\n",
+            link_base.display()
+        ),
+    )
+    .expect("write fleet.yaml");
+
+    let config = SpawnConfig {
+        name: "agy-int",
+        backend_command: "agy",
+        args: &[],
+        spawn_mode: crate::backend::SpawnMode::Fresh,
+        cols: 80,
+        rows: 24,
+        env: None,
+        working_dir: Some(workspace.as_path()),
+        submit_key: "\r",
+        home: Some(home.as_path()),
+        crash_tx: None,
+        shutdown: None,
+    };
+    let (cmd, backend) = build_command(&config).expect("build_command");
+    assert_eq!(backend, Some(Backend::Agy));
+
+    let expected_link = crate::agy_workspace::link_path(&home, "agy-int");
+    let pwd = cmd
+        .get_env("PWD")
+        .expect("agy build_command must set $PWD to the non-hidden link");
+    assert_eq!(
+        std::path::Path::new(pwd),
+        expected_link.as_path(),
+        "agy $PWD must equal the workspace link path"
+    );
+    // The link exists, is a symlink, and resolves to the real workspace.
+    assert!(
+        expected_link
+            .symlink_metadata()
+            .expect("link must exist")
+            .file_type()
+            .is_symlink(),
+        "agy workspace link must be a symlink on Unix"
+    );
+    assert_eq!(
+        std::fs::canonicalize(&expected_link).expect("canonicalize link"),
+        std::fs::canonicalize(&workspace).expect("canonicalize workspace"),
+        "link must resolve to the real hidden workspace"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// #1146: send_to_registry must release the registry lock before
 /// calling inject. Source-grep pin: the lock scope must close
 /// before inject_with_target appears. This is structurally
