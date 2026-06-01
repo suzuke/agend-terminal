@@ -4,17 +4,23 @@
 //! carries all 36 MCP tools through one arm).
 //!
 //! Security invariants (pinned by tests below):
-//!  1. **Operator is never locked out.** A request with no `instance` identity
-//!     (operator TUI/CLI/Telegram surface) is ALWAYS allowed — a false deny of
-//!     the operator is worse than an over-permissive edge.
-//!  2. **Active = today's behavior** (zero migration): every operation allowed.
+//!  1. **Operator-ness is proven by TRANSPORT, never by the payload.** The agent
+//!     MCP bridge only ever sends `mcp_tool`/`mcp_tools_list`; every other
+//!     (direct) method is the operator's CLI surface, and the operator TUI runs
+//!     in-process (never hits this socket). So a request on a direct method is
+//!     the operator (full authority); a request on `mcp_tool` is an AGENT and is
+//!     gated. An agent can NOT impersonate the operator by sending an empty/forged
+//!     `params["instance"]` (the #1575 identity-trust bypass this closes).
+//!  2. **Active = today's behavior** (zero migration): every agent op allowed.
 //!  3. The gate decodes the **inner** tool (`params["tool"]`) for the `mcp_tool`
 //!     method, never the outer `"mcp_tool"` string (else all tools look alike).
 //!  4. **Never-delegate** (structural / authority-changing) ops are blocked for
 //!     agents in Away/Sleep — even in Sleep with a full `delegate_scope`.
-//!  5. **Fail-closed**: an unmapped / newly-added op defaults to the
-//!     delegate-scoped (deny-by-default in Away/Sleep) class, so taxonomy drift
-//!     can never silently land a new mutation as "allowed".
+//!  5. **Fail-closed**: an empty/unidentified agent is the most-restricted caller
+//!     (never the delegate, never the operator), and an unmapped / newly-added op
+//!     defaults to the delegate-scoped (deny-by-default in Away/Sleep) class — so
+//!     neither an empty `instance` nor taxonomy drift can land a mutation as
+//!     "allowed".
 
 use crate::operator_mode::{OperatorMode, OperatorModeState};
 use serde_json::Value;
@@ -97,35 +103,52 @@ pub(crate) fn check_operation_allowed(
     params: &Value,
     state: &OperatorModeState,
 ) -> Result<(), String> {
-    // Decode op + sub-action + caller identity. For the MCP tunnel the real op
-    // is the INNER tool, not the outer "mcp_tool" method (invariant 3).
-    let (op, action, caller) = if method == super::method::MCP_TOOL {
-        (
-            params.get("tool").and_then(Value::as_str).unwrap_or(""),
-            params
-                .get("arguments")
-                .and_then(|a| a.get("action"))
-                .and_then(Value::as_str),
-            params.get("instance").and_then(Value::as_str).unwrap_or(""),
-        )
-    } else {
-        (
-            method,
-            None,
-            params.get("instance").and_then(Value::as_str).unwrap_or(""),
-        )
-    };
-
-    // Invariant 1 (TOP): operator / operator-surface (no instance) → never deny.
-    if caller.is_empty() {
+    // ── TRUSTED TRANSPORT discriminator (NOT the spoofable payload `instance`). ──
+    // The agent MCP bridge ONLY ever sends `mcp_tool` / `mcp_tools_list`
+    // (verified: `agend-mcp-bridge.rs` emits exactly those two methods). Every
+    // OTHER (direct) method is the operator's CLI surface, and the operator TUI
+    // executes IN-PROCESS — it never reaches this socket gate at all. So
+    // operator-ness is proven by the TRANSPORT/method, and an agent can NEVER
+    // claim operator authority by sending an empty/forged `params["instance"]`
+    // (the #1575 identity-trust bypass this redesign closes).
+    let is_agent_transport =
+        method == super::method::MCP_TOOL || method == super::method::MCP_TOOLS_LIST;
+    if !is_agent_transport {
+        // Operator CLI surface (direct API methods) — trusted, full authority.
         return Ok(());
     }
-    // Invariant 2: Active = today's behavior.
+    // `mcp_tools_list` is read-only tool enumeration — harmless, always allow.
+    if method == super::method::MCP_TOOLS_LIST {
+        return Ok(());
+    }
+
+    // ── Agent transport (`mcp_tool`). Decode the INNER tool + self-declared id. ──
+    let op = params.get("tool").and_then(Value::as_str).unwrap_or("");
+    let action = params
+        .get("arguments")
+        .and_then(|a| a.get("action"))
+        .and_then(Value::as_str);
+    // Self-declared; an agent could claim ANOTHER AGENT's name (a lesser concern —
+    // the never-delegate set is blocked for every agent regardless), but it can no
+    // longer claim to be the operator (that is transport-gated above).
+    let caller = params.get("instance").and_then(Value::as_str).unwrap_or("");
+
+    // An agent must NEVER change operator authority — in ANY mode, incl. Active.
+    // Operator mode control lives on the operator transport (CLI/direct), not here.
+    if op == "mode" && matches!(action, Some("set")) {
+        return Err(
+            "operation 'mode set' is operator-only (operator transport / operator-mode.json); \
+             agents cannot change operator authority"
+                .to_string(),
+        );
+    }
+
+    // Active = today's behavior (zero migration): agents unrestricted.
     if state.mode == OperatorMode::Active {
         return Ok(());
     }
 
-    // An agent caller while the operator is Away or Sleep.
+    // Agent, operator Away or Sleep.
     match classify(op, action) {
         OpClass::AlwaysAllow => Ok(()),
         OpClass::AbsolutelyNever => Err(format!(
@@ -141,7 +164,10 @@ pub(crate) fn check_operation_allowed(
                  (no delegate); queued for the operator"
             )),
             OperatorMode::Sleep => {
-                let is_delegate = state.delegate_to.as_deref() == Some(caller);
+                // The delegate must be a NON-EMPTY, exactly-matching instance — an
+                // empty/unidentified caller is never the delegate (fail-closed).
+                let is_delegate =
+                    !caller.is_empty() && state.delegate_to.as_deref() == Some(caller);
                 let in_scope = state.delegate_scope.iter().any(|s| s == op);
                 if is_delegate && in_scope {
                     Ok(())
@@ -183,15 +209,68 @@ mod tests {
         json!({"tool": tool, "instance": instance, "arguments": {"action": action}})
     }
 
-    // ── MUST-PIN 1: operator lock-out — no-instance identity is NEVER denied ──
+    // ── MUST-PIN 1a: operator-ness from TRANSPORT — direct methods are the
+    // operator CLI surface and stay allowed (operator never locked out). ──
     #[test]
-    fn operator_no_instance_is_never_denied_even_for_structural_in_sleep() {
+    fn operator_direct_method_always_allowed_even_in_sleep() {
         let st = sleep_with("fixup-lead", &[]);
-        // mcp_tool create_instance with NO instance (operator surface) → allow.
-        assert!(check_operation_allowed("mcp_tool", &mcp("create_instance", ""), &st).is_ok());
-        // direct dangerous method, no instance (operator TUI) → allow.
+        // Direct API methods (operator CLI surface) → allowed, even structural.
         assert!(check_operation_allowed("delete", &json!({}), &st).is_ok());
+        assert!(check_operation_allowed("spawn", &json!({}), &st).is_ok());
         assert!(check_operation_allowed("shutdown", &json!({}), &st).is_ok());
+        // mcp_tools_list (read-only enumeration) → allowed.
+        assert!(check_operation_allowed("mcp_tools_list", &json!({}), &st).is_ok());
+    }
+
+    // ── MUST-PIN 1b (THE #1575 must-fix): an agent CANNOT impersonate the
+    // operator by sending an empty/forged `instance` on the mcp_tool transport.
+    // The reviewed exploit: {tool: restart_instance, instance:"", args:{name:victim}}. ──
+    #[test]
+    fn agent_empty_instance_cannot_impersonate_operator() {
+        for st in [away(), sleep_with("fixup-lead", &[])] {
+            let exploit = json!({
+                "tool": "restart_instance",
+                "instance": "",
+                "arguments": {"name": "victim-agent"}
+            });
+            let denied = check_operation_allowed("mcp_tool", &exploit, &st);
+            assert!(
+                denied.is_err(),
+                "empty-instance agent must NOT be treated as operator ({:?})",
+                st.mode
+            );
+        }
+        // ...but in Active (today's behavior) an agent op is still a passthrough.
+        let active = OperatorModeState::default();
+        assert!(check_operation_allowed(
+            "mcp_tool",
+            &json!({"tool": "restart_instance", "instance": "", "arguments": {}}),
+            &active
+        )
+        .is_ok());
+    }
+
+    // ── An agent must never change operator authority (mode set), in ANY mode. ──
+    #[test]
+    fn agent_cannot_set_operator_mode() {
+        for st in [
+            OperatorModeState::default(), // Active
+            away(),
+            sleep_with("dev-2", &["mode"]), // even with mode in its own scope
+        ] {
+            let denied =
+                check_operation_allowed("mcp_tool", &mcp_action("mode", "set", "dev-2"), &st);
+            assert!(
+                denied.is_err(),
+                "agent mode-set must be denied in {:?}",
+                st.mode
+            );
+        }
+        // Reading the mode is fine for agents.
+        assert!(
+            check_operation_allowed("mcp_tool", &mcp_action("mode", "get", "dev-2"), &away())
+                .is_ok()
+        );
     }
 
     // ── MUST-PIN 2: mcp_tool decodes the INNER tool, not the outer method ──
@@ -206,17 +285,20 @@ mod tests {
         assert!(check_operation_allowed("mcp_tool", &mcp("send", "dev-2"), &st).is_ok());
     }
 
-    // ── MUST-PIN 3: fail-closed — unmapped op denied for agents in away/sleep ──
+    // ── MUST-PIN 3: fail-closed — unmapped op AND empty-instance agent denied ──
     #[test]
-    fn unknown_op_is_fail_closed_for_agents() {
+    fn unknown_op_and_empty_instance_are_fail_closed_for_agents() {
+        // Unmapped tool from a named agent → deny (fail-closed) in away.
         assert!(
             check_operation_allowed("mcp_tool", &mcp("frobnicate_widgets", "dev-2"), &away())
                 .is_err(),
             "an unmapped tool must default to deny (fail-closed) in away"
         );
-        // ...but the operator (no instance) is still never denied.
+        // Empty-instance agent (unidentified) → deny on the agent transport — it is
+        // NOT the operator (that is transport-gated) and NOT a delegate.
         assert!(
-            check_operation_allowed("mcp_tool", &mcp("frobnicate_widgets", ""), &away()).is_ok()
+            check_operation_allowed("mcp_tool", &mcp("frobnicate_widgets", ""), &away()).is_err(),
+            "empty-instance agent must be fail-closed, never elevated"
         );
     }
 
