@@ -312,6 +312,14 @@ fn is_worktree_clean(worktree: &Path) -> bool {
 /// One-shot: if `is_worktree_clean` returns false due to transient
 /// I/O error, this call does not retry. The existing worktree GC
 /// (grace-period sweep) serves as the fallback safety net.
+///
+/// #1339 DAEMON-AUTONOMIC, GATE-EXEMPT BY DESIGN: reached ONLY from the per-tick
+/// daemon loop on an internal trigger — a CI/PR-merge detection
+/// (`ci_watch::poller` / `pr_state::scanner`) — never from the API socket. It is
+/// daemon self-heal (a third trusted principal), so the operator-mode gate
+/// (`api::operator_gate`, which governs socket-ingress operator-vs-agent) does
+/// NOT apply: worktrees of merged branches are reclaimed even in away/sleep. Not
+/// agent-invocable (the trigger is GitHub merge state, not an agent request).
 pub(crate) fn auto_release_for_merged_branch(home: &Path, branch: &str) {
     let Some(agent) =
         crate::binding::scan_existing_branch_binding(home, branch, /* exclude */ "")

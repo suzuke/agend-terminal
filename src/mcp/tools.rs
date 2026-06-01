@@ -299,12 +299,9 @@ pub(crate) fn def_config() -> Value {
 }
 
 pub(crate) fn def_mode() -> Value {
-    json!({"name": "mode", "description": "#1339: Operator availability/authority mode. `get` → current mode + delegate. `set` (operator-only) → active|away|sleep; in sleep a `delegate` may proxy the operations listed in `scope` (deny-by-default), but never-delegate structural/authority ops stay blocked. Active = today's behavior (all allowed).",
+    json!({"name": "mode", "description": "#1339: Read the operator availability/authority mode (READ-ONLY for agents). `get` → current mode (active|away|sleep) + delegate. Agents observe this to back off when the operator is away/asleep. SETTING the mode is operator-only via the `agend-terminal mode <active|away|sleep>` CLI — never available to agents.",
         "inputSchema": {"type": "object", "properties": {
-            "action": {"type": "string", "enum": ["get", "set"], "default": "get"},
-            "mode": {"type": "string", "enum": ["active", "away", "sleep"], "description": "Required for set."},
-            "delegate": {"type": "string", "description": "Instance granted proxy authority in sleep (optional)."},
-            "scope": {"type": "array", "items": {"type": "string"}, "description": "Operation/tool names the delegate may proxy in sleep (deny-by-default)."}
+            "action": {"type": "string", "enum": ["get"], "default": "get"}
         }, "required": ["action"]}})
 }
 

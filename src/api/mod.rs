@@ -193,6 +193,10 @@ pub mod method {
     pub const UPDATE_TEAM: &str = "update_team";
     pub const MOVE_PANE: &str = "move_pane";
     pub const SHUTDOWN: &str = "shutdown";
+    /// #1339: operator-only mode control. A DIRECT method (not the `mcp_tool`
+    /// tunnel) → the operator_gate treats it as the operator transport, so only
+    /// the operator CLI can reach it; agents (mcp_tool-only) cannot.
+    pub const MODE: &str = "mode";
     pub const SET_BLOCKED_REASON: &str = "set_blocked_reason";
     pub const CLEAR_BLOCKED_REASON: &str = "clear_blocked_reason";
     pub const MCP_TOOL: &str = "mcp_tool";
@@ -519,6 +523,8 @@ fn handle_session(
                     method::MCP_TOOLS_LIST => {
                         handlers::mcp_proxy::handle_mcp_tools_list(params, &ctx)
                     }
+                    // #1339: operator-only mode control (operator transport).
+                    method::MODE => operator_gate::handle_mode_set(params, home),
                     method::SHUTDOWN => {
                         tracing::info!("API shutdown requested");
                         // Sprint 57 Wave 3 PR-2 (#548 Q6): record API-shutdown

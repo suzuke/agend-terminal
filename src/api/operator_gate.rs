@@ -3,6 +3,21 @@
 //! so it covers every direct API method AND the `mcp_tool` tunnel (which
 //! carries all 36 MCP tools through one arm).
 //!
+//! ## Scope — this gate governs SOCKET-INGRESS principals only.
+//! It classifies the two principals that arrive over the API socket: the
+//! **operator transport** (direct methods / CLI — full authority) and the
+//! **agent transport** (`mcp_tool` — gated). There is a THIRD principal it does
+//! NOT (and must not) see: **daemon-autonomic self-heal** — crash-respawn
+//! (`daemon::crash_respawn`), hang-recovery restart
+//! (`daemon::per_tick::recovery_dispatcher`), and merged-branch worktree release
+//! (`daemon::auto_release`). Those run in the per-tick daemon loop and call
+//! lifecycle directly; they never traverse this socket, so they are gate-exempt
+//! BY CONSTRUCTION (not by an exception here). They are trusted internal,
+//! triggered only by internal events (process exit / hang detection / merge
+//! detection) and are not agent-invocable — so the fleet keeps self-healing even
+//! while the operator is away/asleep. See the gate-exempt markers on those entry
+//! points.
+//!
 //! Security invariants (pinned by tests below):
 //!  1. **Operator-ness is proven by TRANSPORT, never by the payload.** The agent
 //!     MCP bridge only ever sends `mcp_tool`/`mcp_tools_list`; every other
@@ -35,8 +50,13 @@ pub(crate) enum OpClass {
     /// `delegate_scope` (deny-by-default). Also the **fail-closed default** for
     /// any op not explicitly classified.
     DelegateScoped,
-    /// Structural / authority-changing — blocked for agents in Away/Sleep with
-    /// NO delegate escape (the never-delegate set).
+    /// Structural / authority-changing — blocked for an AGENT/DELEGATE-INITIATED
+    /// request (over the `mcp_tool` socket transport) in Away/Sleep, with NO
+    /// delegate escape (the never-delegate set). NOTE: this label is about
+    /// socket-ingress agent ops ONLY — it does NOT mean the mutation never
+    /// happens in Away/Sleep: daemon-autonomic self-heal (crash-respawn,
+    /// hang-recovery restart, merged-branch release) may still perform the same
+    /// structural change, gate-exempt by construction (see the module scope note).
     AbsolutelyNever,
 }
 
@@ -180,6 +200,46 @@ pub(crate) fn check_operation_allowed(
                 }
             }
         },
+    }
+}
+
+/// #1339: handler for the operator-only `MODE` direct method. Reached only via
+/// the operator transport (a direct API method; the gate lets direct methods
+/// through as the operator surface, and agents can only send `mcp_tool`). This
+/// is the AUTHORITATIVE mode-set path: an agent overwriting `operator-mode.json`
+/// is governed by the same operator-owned-config convention as
+/// `runtime-config.json` / `fleet.yaml` (raw-FS integrity is a fleet-wide
+/// follow-up, out of #1339 scope).
+pub(crate) fn handle_mode_set(params: &Value, home: &std::path::Path) -> Value {
+    use serde_json::json;
+    let Some(mode_str) = params.get("mode").and_then(Value::as_str) else {
+        return json!({"ok": false, "error": "mode requires `mode` (active|away|sleep)"});
+    };
+    let mode = match crate::operator_mode::parse_mode(mode_str) {
+        Ok(m) => m,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let delegate_to = params
+        .get("delegate")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let delegate_scope: Vec<String> = params
+        .get("scope")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    match crate::operator_mode::set_mode(home, mode, delegate_to, delegate_scope) {
+        Ok(s) => json!({
+            "ok": true,
+            "mode": s.mode,
+            "delegate_to": s.delegate_to,
+            "delegate_scope": s.delegate_scope,
+        }),
+        Err(e) => json!({"ok": false, "error": e}),
     }
 }
 
@@ -405,6 +465,71 @@ mod tests {
                 check_operation_allowed("mcp_tool", &mcp_action(tool, action, "dev-2"), &away())
                     .is_ok(),
                 "{tool}/{action} read action must stay allowed in away"
+            );
+        }
+    }
+
+    // ── mode-control: the operator's `MODE` direct method passes the gate (it is
+    // the operator transport — NOT mcp_tool), even in sleep, with NO instance. ──
+    #[test]
+    fn operator_direct_mode_method_passes_gate_in_any_mode() {
+        let params = json!({"mode": "active"});
+        for st in [
+            OperatorModeState::default(),
+            away(),
+            sleep_with("fixup-lead", &[]),
+        ] {
+            assert!(
+                check_operation_allowed(super::super::method::MODE, &params, &st).is_ok(),
+                "direct MODE method is operator transport → allowed in {:?}",
+                st.mode
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn handle_mode_set_persists_and_updates_global() {
+        let dir = std::env::temp_dir().join(format!("agend-modeset-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let resp = handle_mode_set(
+            &json!({"mode": "sleep", "delegate": "fixup-lead", "scope": ["custom_op"]}),
+            &dir,
+        );
+        assert_eq!(resp["ok"], json!(true));
+        // The global (what the gate reads) reflects it immediately.
+        let s = crate::operator_mode::get();
+        assert_eq!(s.mode, OperatorMode::Sleep);
+        assert_eq!(s.delegate_to.as_deref(), Some("fixup-lead"));
+        // Bad mode string → error, no change.
+        assert_eq!(
+            handle_mode_set(&json!({"mode": "dnd"}), &dir)["ok"],
+            json!(false)
+        );
+        // Reset global so we don't leak Sleep into other tests.
+        crate::operator_mode::set_mode(&dir, OperatorMode::Active, None, vec![]).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── ② invariant: the daemon-autonomic self-heal paths are gate-exempt BY
+    // CONSTRUCTION — they must NOT reference the gate, and must carry the marker. ──
+    #[test]
+    fn autonomic_paths_are_gate_exempt_by_construction() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        for rel in [
+            "src/daemon/crash_respawn.rs",
+            "src/daemon/auto_release.rs",
+            "src/daemon/per_tick/recovery_dispatcher.rs",
+        ] {
+            let src = std::fs::read_to_string(format!("{root}/{rel}")).expect(rel);
+            assert!(
+                !src.contains("check_operation_allowed"),
+                "{rel} must NOT call the operator-mode gate (gate-exempt by construction)"
+            );
+            assert!(
+                src.contains("DAEMON-AUTONOMIC, GATE-EXEMPT BY DESIGN"),
+                "{rel} must carry the #1339 gate-exempt marker"
             );
         }
     }

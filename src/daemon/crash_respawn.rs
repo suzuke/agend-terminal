@@ -1,4 +1,13 @@
 //! Crash-respawn logic — extracted from daemon/mod.rs (#1382).
+//!
+//! #1339 DAEMON-AUTONOMIC, GATE-EXEMPT BY DESIGN: this structural mutation
+//! (respawning a crashed agent) is reached ONLY from the per-tick daemon loop on
+//! an internal trigger — an agent process exit (`AgentExitEvent`) — never from
+//! the API socket. It is a third trusted principal (daemon self-heal), distinct
+//! from the socket-ingress principals (operator-transport vs agent-transport)
+//! that `api::operator_gate` governs, so the operator-mode gate intentionally
+//! does NOT apply here: the fleet keeps self-healing even in away/sleep. An
+//! agent cannot invoke this (it can at most crash ITSELF → its own respawn).
 
 use crate::agent::{self, AgentRegistry};
 use crate::channel::NotifySeverity;
