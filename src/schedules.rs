@@ -174,8 +174,13 @@ impl From<ScheduleRaw> for Schedule {
 /// #1521: a `linked_task_id` is required for `UntilSuccess` and the task must
 /// already exist on the board — a bare-message reminder has no completion to
 /// gate on, so we reject it at create/update rather than silently degrade.
-fn task_file_exists(home: &Path, task_id: &str) -> bool {
-    !task_id.is_empty() && home.join("tasks").join(format!("{task_id}.json")).exists()
+/// #1608: existence is decided by the task subsystem's authoritative lookup,
+/// NOT a `tasks/<id>.json` file probe — AgEnD's task board is event-sourced and
+/// keeps no per-task JSON, so the old filesystem check always returned `false`
+/// and made `fire_strategy=until_success` permanently unreachable. The old name
+/// (`task_file_exists`) baked in that wrong filesystem abstraction.
+fn task_exists(home: &Path, task_id: &str) -> bool {
+    !task_id.is_empty() && crate::tasks::load_by_id(home, task_id).is_some()
 }
 
 /// #1521: validate a (fire_strategy, linked_task_id) pair. `Ok(())` when the
@@ -189,7 +194,7 @@ fn validate_fire_strategy(
         return Ok(());
     }
     match linked_task_id {
-        Some(id) if task_file_exists(home, id) => Ok(()),
+        Some(id) if task_exists(home, id) => Ok(()),
         Some(id) => Err(format!(
             "fire_strategy=until_success requires an existing linked_task_id (task '{id}' not found)"
         )),
@@ -801,14 +806,37 @@ mod tests {
 
     // ── #1521: fire-strategy validation + backward-compat ──
 
-    fn seed_task_file(home: &Path, id: &str) {
-        let dir = home.join("tasks");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join(format!("{id}.json")),
-            serde_json::json!({"id": id, "status": "open"}).to_string(),
+    /// #1608: create a REAL task on the event-sourced board (so
+    /// `tasks::load_by_id` finds it), NOT a `tasks/<id>.json` file. The old
+    /// `seed_task_file` wrote a file the real lookup never reads — which is
+    /// exactly why this test passed while the feature was broken. Mirrors the
+    /// task subsystem's own `create_task` helper (tasks/handler.rs).
+    fn seed_real_task(home: &Path, id: &str) {
+        crate::task_events::append(
+            home,
+            &crate::task_events::InstanceName::from("test:operator"),
+            crate::task_events::TaskEvent::Created {
+                task_id: crate::task_events::TaskId(id.into()),
+                title: "test task".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: None,
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: None,
+                bind: None,
+                eta_secs: None,
+                tags: vec![],
+                parent_id: None,
+            },
         )
-        .unwrap();
+        .expect("seed real task");
+        // Sanity: the authoritative lookup the fix relies on must now resolve.
+        assert!(
+            crate::tasks::load_by_id(home, id).is_some(),
+            "seeded task '{id}' must be visible to tasks::load_by_id"
+        );
     }
 
     #[test]
@@ -859,7 +887,7 @@ mod tests {
     #[test]
     fn create_until_success_with_existing_task_ok() {
         let home = tmp_home("fs-ok");
-        seed_task_file(&home, "t-real");
+        seed_real_task(&home, "t-real");
         let r = create(
             &home,
             "a",
@@ -870,6 +898,33 @@ mod tests {
         let s = &load(&home).schedules[0];
         assert_eq!(s.fire_strategy, FireStrategy::UntilSuccess);
         assert_eq!(s.linked_task_id.as_deref(), Some("t-real"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1608: pin every branch of `validate_fire_strategy` directly — the
+    /// happy path (`until_success` + an existing event-sourced task) was
+    /// permanently unreachable before this fix because the old check probed a
+    /// non-existent `tasks/<id>.json` file.
+    #[test]
+    fn validate_fire_strategy_all_branches() {
+        let home = tmp_home("fs-validate");
+        seed_real_task(&home, "t-live");
+
+        // until_success + a real task on the board → Ok (the regression).
+        assert!(
+            validate_fire_strategy(&home, FireStrategy::UntilSuccess, Some("t-live")).is_ok(),
+            "until_success with an existing task must validate"
+        );
+        // until_success + non-existent / empty / missing id → Err.
+        assert!(
+            validate_fire_strategy(&home, FireStrategy::UntilSuccess, Some("t-ghost")).is_err()
+        );
+        assert!(validate_fire_strategy(&home, FireStrategy::UntilSuccess, Some("")).is_err());
+        assert!(validate_fire_strategy(&home, FireStrategy::UntilSuccess, None).is_err());
+        // always → Ok regardless of linked_task_id (early return, unaffected).
+        assert!(validate_fire_strategy(&home, FireStrategy::Always, None).is_ok());
+        assert!(validate_fire_strategy(&home, FireStrategy::Always, Some("t-ghost")).is_ok());
+
         std::fs::remove_dir_all(&home).ok();
     }
 
