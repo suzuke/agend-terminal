@@ -91,6 +91,20 @@ impl Layout {
         self.tabs.push(tab);
     }
 
+    /// #1591: index of the single-pane tab whose sole pane belongs to
+    /// `agent_name`, if any. The Attached remote-agent sync is add-only (a gone
+    /// agent's tab is RETAINED with stale output), so when a same-named agent
+    /// re-appears — recovery respawn, or operator create-after-delete churn —
+    /// this lets the sync REUSE the retained tab (reconnect in place) instead of
+    /// appending a duplicate. Scoped to single-pane tabs: a tab the operator has
+    /// split with other agents must not be clobbered, so it falls back to a
+    /// fresh append in that (rare) case.
+    pub fn single_pane_tab_index_for_agent(&self, agent_name: &str) -> Option<usize> {
+        self.tabs.iter().position(|t| {
+            t.root().pane_count() == 1 && t.root().first_pane().agent_name.as_str() == agent_name
+        })
+    }
+
     pub fn active_tab(&self) -> Option<&Tab> {
         self.tabs.get(self.active)
     }
@@ -305,6 +319,58 @@ mod tests {
         assert_eq!(layout.active, 2);
         layout.next_tab();
         assert_eq!(layout.active, 0);
+    }
+
+    /// #1591: locate a retained single-pane tab by agent name; absent → None;
+    /// a multi-pane (operator-split) tab is NOT matched (must not be clobbered).
+    #[test]
+    fn single_pane_tab_index_for_agent_1591() {
+        let mut layout = Layout::new();
+        layout.push_tab_preserve_focus(Tab::new("t-a".to_string(), leaf(1, "a")));
+        layout.push_tab_preserve_focus(Tab::new("t-b".to_string(), leaf(2, "b")));
+        assert_eq!(layout.single_pane_tab_index_for_agent("b"), Some(1));
+        assert_eq!(layout.single_pane_tab_index_for_agent("a"), Some(0));
+        assert_eq!(layout.single_pane_tab_index_for_agent("absent"), None);
+        // A tab the operator split with a second agent is multi-pane → not a
+        // reuse target (whole-tab replace would clobber the other pane).
+        layout.tabs[1].split_focused(SplitDir::Vertical, leaf(3, "c"));
+        assert_eq!(
+            layout.single_pane_tab_index_for_agent("b"),
+            None,
+            "#1591: split (multi-pane) tab must not be a reuse target"
+        );
+    }
+
+    /// #1591: re-appearance of a same-named agent REUSES its retained tab in
+    /// place — no duplicate tab, and the operator's active tab is NOT stolen.
+    #[test]
+    fn reuse_retained_tab_no_duplicate_or_focus_steal_1591() {
+        let mut layout = Layout::new();
+        // Operator working on tab 0; a (now-stale, gone) agy-verify tab retained
+        // at index 1 (add-only sync never removed it).
+        layout.push_tab_preserve_focus(Tab::new("work".to_string(), leaf(1, "operator")));
+        layout.push_tab_preserve_focus(Tab::new("agy-verify".to_string(), leaf(2, "agy-verify")));
+        assert_eq!(layout.active, 0, "operator is on tab 0");
+        let before = layout.tabs.len();
+
+        // agy-verify is re-created → the sync's reuse path replaces the retained
+        // tab in place with a fresh pane (id 99) rather than appending.
+        let idx = layout
+            .single_pane_tab_index_for_agent("agy-verify")
+            .expect("retained agy-verify tab must be found");
+        layout.tabs[idx] = Tab::new("agy-verify".to_string(), leaf(99, "agy-verify"));
+
+        assert_eq!(
+            layout.tabs.len(),
+            before,
+            "#1591: no duplicate tab appended"
+        );
+        assert_eq!(layout.active, 0, "#1591: operator focus not stolen");
+        assert_eq!(
+            layout.tabs[idx].root().first_pane().id,
+            99,
+            "#1591: retained tab now carries the fresh (reconnected) pane"
+        );
     }
     #[test]
     fn move_pane_across_tabs_same_tab_rejected() {

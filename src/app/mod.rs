@@ -778,14 +778,37 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                 Ok(pane) => {
                                     let tab_name = pane.agent_name.clone();
                                     known_remote_agents.insert(tab_name.to_string());
-                                    layout.push_tab_preserve_focus(
-                                        crate::layout::Tab::new(tab_name.to_string(), pane),
-                                    );
+                                    // #1591: this sync is add-only — a gone
+                                    // agent's tab is RETAINED (stale output) so
+                                    // scrollback survives. If a same-named agent
+                                    // re-appears (recovery respawn / operator
+                                    // create-after-delete churn), REUSE the
+                                    // retained single-pane tab in place (the
+                                    // fresh pane reconnects to the new instance;
+                                    // the stale dead-connection pane is dropped)
+                                    // instead of appending a DUPLICATE tab.
+                                    // Preserves tab position + focus.
+                                    if let Some(idx) =
+                                        layout.single_pane_tab_index_for_agent(&tab_name)
+                                    {
+                                        layout.tabs[idx] = crate::layout::Tab::new(
+                                            tab_name.to_string(),
+                                            pane,
+                                        );
+                                        tracing::info!(
+                                            agent = %name,
+                                            "reused retained tab for re-appeared remote agent (no duplicate)"
+                                        );
+                                    } else {
+                                        layout.push_tab_preserve_focus(
+                                            crate::layout::Tab::new(tab_name.to_string(), pane),
+                                        );
+                                        tracing::info!(
+                                            agent = %name,
+                                            "opened tab for newly-appeared remote agent"
+                                        );
+                                    }
                                     needs_resize = true;
-                                    tracing::info!(
-                                        agent = %name,
-                                        "opened tab for newly-appeared remote agent"
-                                    );
                                 }
                                 Err(e) => tracing::warn!(
                                     agent = %name,
