@@ -379,7 +379,10 @@ pub(crate) fn should_defer_inject(
 /// #1513: did the operator type into this pane within the quiet window? Uses the
 /// LIVE keyboard-written `last_input_epoch_ms` (notification_queue metadata) —
 /// NOT `heartbeat_pair.last_input_at_ms` (which is the daemon-INJECT timestamp).
-fn operator_typing_recent(home: &Path, agent_name: &str) -> bool {
+///
+/// `pub(crate)` so the drain-release path (`app::flush_release`, #1513 case A)
+/// shares this ONE typing source-of-truth with the inject-time gate.
+pub(crate) fn operator_typing_recent(home: &Path, agent_name: &str) -> bool {
     let (typed_ms, _) = crate::notification_queue::read_input_submit_timestamps(home, agent_name);
     typed_ms != 0
         && chrono::Utc::now()

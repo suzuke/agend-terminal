@@ -1179,11 +1179,17 @@ where
             // core lock — #1492). Once any inject fails, preserve the remaining
             // order by holding the rest.
             let agent_busy = crate::snapshot::agent_is_busy(home, &pane.agent_name);
+            // #1513 case A: same live-keystroke signal the inject-time gate uses,
+            // so a queued item is held off the operator's input line at the drain
+            // too (bounded by the MAX_DEFER cap below).
+            let typing_recent =
+                crate::inbox::notify::operator_typing_recent(home, &pane.agent_name);
             let now_ms = chrono::Utc::now().timestamp_millis();
             let mut keep: Vec<notification_queue::QueuedNotification> = Vec::new();
             let mut inject_failed = false;
             for notification in queued {
-                if inject_failed || !flush_release(&notification, agent_busy, now_ms) {
+                if inject_failed || !flush_release(&notification, agent_busy, typing_recent, now_ms)
+                {
                     keep.push(notification);
                 } else if injector(&notification.text).is_err() {
                     inject_failed = true;
@@ -1206,23 +1212,31 @@ const ACTIONABLE_MAX_DEFER_MS: i64 = 1_000;
 const AMBIENT_MAX_DEFER_MS: i64 = 7_000;
 
 /// #1513: should this queued item be RELEASED (injected) now vs HELD? Released
-/// when the agent is not mid-generation, OR the item is past its MAX_DEFER cap
-/// (anti-starvation backstop so a perpetually-busy agent never traps the queue).
-/// Pure so the busy-hold / cap-release matrix is unit-testable.
+/// when the pane is SETTLED — the agent is not mid-generation AND the operator
+/// isn't mid-keystroke — OR the item is past its MAX_DEFER cap.
+///
+/// #1513 case A: the drain previously held only on `agent_busy`, so the
+/// anti-starvation release could land an inject on the operator's input line
+/// mid-typing. `typing_recent` (the SAME `operator_typing_recent` live-keystroke
+/// signal the inject-time gate uses — one source of truth) now also holds. The
+/// MAX_DEFER cap stays the backstop: a perpetually-busy OR perpetually-typing
+/// operator never traps the queue (actionable work still lands within
+/// `ACTIONABLE_MAX_DEFER_MS`). Pure so the hold/release matrix is unit-testable.
 fn flush_release(
     item: &notification_queue::QueuedNotification,
     agent_busy: bool,
+    typing_recent: bool,
     now_ms: i64,
 ) -> bool {
-    if !agent_busy {
-        return true;
-    }
     let cap = if item.actionable {
         ACTIONABLE_MAX_DEFER_MS
     } else {
         AMBIENT_MAX_DEFER_MS
     };
-    now_ms.saturating_sub(item.deferred_since_ms) >= cap
+    if now_ms.saturating_sub(item.deferred_since_ms) >= cap {
+        return true; // MAX_DEFER backstop wins, even mid-generation / mid-keystroke.
+    }
+    !agent_busy && !typing_recent
 }
 
 #[cfg(test)]
@@ -1240,45 +1254,87 @@ mod flush_release_tests_1513 {
     }
 
     #[test]
-    fn not_busy_always_releases() {
+    fn not_busy_not_typing_always_releases() {
         let now = 10_000;
         assert!(
-            flush_release(&item(true, now), false, now),
-            "idle agent releases actionable"
+            flush_release(&item(true, now), false, false, now),
+            "settled agent releases actionable"
         );
         assert!(
-            flush_release(&item(false, now), false, now),
-            "idle agent releases ambient"
+            flush_release(&item(false, now), false, false, now),
+            "settled agent releases ambient"
         );
     }
 
     #[test]
     fn busy_holds_then_cap_releases() {
         let base = 100_000;
-        // fresh defer while busy → held
+        // fresh defer while busy (not typing) → held
         assert!(
-            !flush_release(&item(true, base), true, base),
+            !flush_release(&item(true, base), true, false, base),
             "busy holds fresh actionable"
         );
         assert!(
-            !flush_release(&item(false, base), true, base),
+            !flush_release(&item(false, base), true, false, base),
             "busy holds fresh ambient"
         );
         // past the actionable cap (1s) but within ambient cap (7s) → actionable releases, ambient holds
         let mid = base + ACTIONABLE_MAX_DEFER_MS + 1;
         assert!(
-            flush_release(&item(true, base), true, mid),
+            flush_release(&item(true, base), true, false, mid),
             "actionable releases past its 1s cap even while busy"
         );
         assert!(
-            !flush_release(&item(false, base), true, mid),
+            !flush_release(&item(false, base), true, false, mid),
             "ambient still held at ~1s while busy"
         );
         // well past ambient cap → ambient releases too
         let late = base + 8_000;
         assert!(
-            flush_release(&item(false, base), true, late),
-            "ambient releases past its cap while busy"
+            flush_release(&item(false, base), true, true, late),
+            "ambient releases past its cap even while typing (backstop)"
+        );
+    }
+
+    /// #1513 case A: the operator-typing hold + its MAX_DEFER backstop, across
+    /// the four scenarios in the fix spec.
+    #[test]
+    fn typing_holds_until_cap() {
+        let base = 100_000;
+        // (1) busy + actionable + typing + NOT past cap → defer (no collision).
+        assert!(
+            !flush_release(&item(true, base), true, true, base),
+            "typing holds a fresh actionable wake off the input line"
+        );
+        // also holds when the agent is idle but the operator is mid-keystroke —
+        // the case the old `!agent_busy` early-return missed.
+        assert!(
+            !flush_release(&item(true, base), false, true, base),
+            "typing holds even when the agent is idle"
+        );
+        // (2) same but PAST MAX_DEFER → release (backstop; task dispatch 1s).
+        let past = base + ACTIONABLE_MAX_DEFER_MS + 1;
+        assert!(
+            flush_release(&item(true, base), true, true, past),
+            "actionable releases past its 1s cap despite typing"
+        );
+        // (3) NOT typing → unchanged from before (release when settled).
+        assert!(
+            flush_release(&item(true, base), false, false, base),
+            "not typing + idle → release as before"
+        );
+        assert!(
+            !flush_release(&item(true, base), true, false, base),
+            "not typing + busy + fresh → held as before"
+        );
+        // (4) ambient honors typing too, bounded by its 7s cap.
+        assert!(
+            !flush_release(&item(false, base), false, true, base + 6_000),
+            "ambient held while typing within its cap"
+        );
+        assert!(
+            flush_release(&item(false, base), false, true, base + 7_001),
+            "ambient releases past its 7s cap despite typing"
         );
     }
 }
