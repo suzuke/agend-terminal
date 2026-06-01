@@ -87,17 +87,56 @@ fixtures:
     cli_version: "1.0.0"
     recorded_on: "2026-05-20"
     scenario: |
-      #987 fixture for agy (Google Antigravity CLI) — gemini-cli's official
-      successor. Captures alt-screen init + "Antigravity CLI 1.0.0" banner +
-      account/model header. The "Antigravity CLI" banner string fires the
-      Ready transition immediately on boot (pattern at src/state.rs:606
-      matches `Antigravity CLI|Type your message`). Recording cut at /exit
-      before any prompt input — no Thinking transition expected.
-    expected_transitions: [starting, ready]
-    expected_final_state: ready
+      agy (Antigravity CLI) — "Antigravity CLI 1.0.0" banner fires Ready on boot,
+      then a response phase drives the spinner. #1579 added the verb-agnostic
+      Thinking anchor (`esc to cancel` interrupt hint, ordered after ToolUse) — the
+      streaming spinner verb varies (Analyzing / Developing / …), so a verb
+      whitelist would miss it (the #1541 lesson); the structural interrupt hint
+      latches Thinking regardless of verb.
+    expected_transitions: [starting, ready, thinking]
+    expected_final_state: thinking
+    # detect() sees Ready on the final screen (the response finished, spinner
+    # cleared back to the prompt) but hysteresis holds the Thinking state at the
+    # cut — same shape as kiro-thinking below.
     expected_final_detect: ready
     capture_kind: real_pty
-    provenance: "#987 r0 fixture — agy 1.0.0 boot + sanitized account banner; calibrates Ready pattern"
+    provenance: "#987 boot capture; #1579 calibrates the Thinking anchor against the spinner phase"
+
+  - file: agy-tooluse.raw
+    backend: agy
+    cli_version: "1.0.0"
+    recorded_on: "2026-06-01"
+    scenario: "agy running tool calls — `● Bash(...)` / `● Read(...)` / `● ListDir(...)` / `● Create(...)` / `● GenerateImage(...)` bullets fire ToolUse via the structural tool-call anchor"
+    provenance: "#1579"
+    # ToolUse latches in detect() (final_detect=tool_use — the `● Tool(` bullet IS
+    # on the final frame) but not as a SETTLED state transition: agy's tool run
+    # alternates the brief bullet with the dominant spinner (`esc to cancel` =
+    # Thinking), so the hysteresis state machine settles on thinking/permission.
+    expected_transitions: [starting, ready, idle, thinking, permission]
+    expected_final_state: permission
+    expected_final_detect: tool_use
+    capture_kind: real_pty
+
+  - file: agy-idle.raw
+    backend: agy
+    cli_version: "1.0.0"
+    recorded_on: "2026-06-01"
+    scenario: "agy at the clean working prompt — `? for shortcuts` footer with no active spinner/tool; distinct from the `Signing in...` startup animation (braille-only, no `esc to cancel`)"
+    provenance: "#1579"
+    expected_transitions: [starting, idle]
+    expected_final_state: idle
+    expected_final_detect: idle
+
+  - file: agy-perm.raw
+    backend: agy
+    cli_version: "1.0.0"
+    recorded_on: "2026-06-01"
+    scenario: "agy command-approval + trust dialogs — `Requesting permission for:` / `tab Amend · e edit command` / `Do you trust the contents of this project?` fire PermissionPrompt (#1578)"
+    provenance: "#1578"
+    expected_transitions: [starting, ready, thinking, permission]
+    expected_final_state: permission
+    expected_final_detect: permission
+    capture_kind: real_pty
 
   - file: kiro-thinking.raw
     backend: kiro-cli

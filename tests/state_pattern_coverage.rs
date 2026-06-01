@@ -25,6 +25,12 @@ const EXPECTED_FIXTURES: &[&str] = &[
     "kiro-perm.raw",
     "gemini-perm.raw",
     "opencode-perm.raw",
+    // #1579/#1578 — agy (Antigravity CLI) state corpus (operator-recorded
+    // 2026-06-01; chrome verified). Thinking/ToolUse/Idle/Permission replayed
+    // by `replay_manifest_regression`. (agy-thinking.raw already listed above.)
+    "agy-tooluse.raw",
+    "agy-idle.raw",
+    "agy-perm.raw",
     // #848 PR-A — classifier root cause fixtures (synthetic from Anthropic
     // docs verbatim strings). The behavior assertion that each fixture
     // produces the right AgentState lives in `src/state.rs::mod tests`

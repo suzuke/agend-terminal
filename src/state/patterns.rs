@@ -658,12 +658,38 @@ impl StatePatterns {
                 // [measured] Full ready prompt + YOLO mode
                 (AgentState::Ready, r"Type your message|YOLO"),
             ],
-            // #987: agy shares gemini-cli's agent engine + TUI structure;
-            // start with the same pattern set. Calibrate against
-            // `tests/fixtures/state-replay/agy-thinking.raw` in follow-up
-            // PR if AGY's TUI introduces divergent rate-limit / idle
-            // strings.
-            Backend::Agy => vec![(AgentState::Ready, r"Antigravity CLI|Type your message")],
+            // #1579/#1578: agy (Antigravity CLI) state corpus. Operator-recorded
+            // fixtures (agy-{thinking,tooluse,idle,perm}.raw), chrome verified.
+            // First-match-wins ordering: the active/blocking states are anchored on
+            // SELF-IDENTIFYING chrome and ordered before the quiescent fallback so
+            // the persistent `? for shortcuts` footer doesn't mask them.
+            Backend::Agy => vec![
+                // #1578 permission/approval — command-approval header + footer and
+                // the trust prompt. Self-identifying (not the generic "Do you want
+                // to proceed?", which also appears mid-tool-run).
+                (
+                    AgentState::PermissionPrompt,
+                    r"Requesting permission for:|Do you trust the contents of this project|tab Amend · e edit command",
+                ),
+                // ToolUse — the tool-call bullet `● <CamelCase>(<args>)`
+                // (● Bash(…) / Read(…) / ListDir(…) / Create(…) / GenerateImage(…)).
+                // Verb/tool-agnostic structural anchor. Ordered before Thinking so a
+                // tool frame (which also carries the interrupt hint) classifies here.
+                (AgentState::ToolUse, r"●\s+[A-Z][a-zA-Z]+\("),
+                // Thinking — active-generation interrupt hint. The spinner VERB
+                // streams and varies (Analyzing / Developing / Generating …), so per
+                // the #1541 lesson we anchor the verb-AGNOSTIC structural hint rather
+                // than a verb whitelist. `esc to cancel` only appears during active
+                // generation — startup `Signing in…` lacks it — and ToolUse above
+                // already consumed the tool frames, so this catches thinking only.
+                (AgentState::Thinking, r"esc to cancel"),
+                // Idle — clean working prompt. `? for shortcuts` is a PERSISTENT
+                // footer (present in every frame), so it is the quiescent FALLBACK,
+                // matching only once the active anchors above fail.
+                (AgentState::Idle, r"\? for shortcuts"),
+                // Ready — boot banner / fresh prompt.
+                (AgentState::Ready, r"Antigravity CLI|Type your message"),
+            ],
             // Non-preset backends have no state-detection heuristics — pane
             // stays in whatever state the generic output pipeline sets. These
             // variants should never reach here in normal flow (state machine
