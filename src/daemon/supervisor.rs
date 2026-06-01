@@ -1018,6 +1018,50 @@ fn clears_server_rate_limit_retry(state: crate::state::AgentState) -> bool {
     )
 }
 
+/// #1470 (re-scoped slice, credit @cheerc): notify an agent's team
+/// orchestrator, via its INBOX, that the transient-error auto-retry has been
+/// exhausted. This is the agent-inbox path (not operator Telegram), so it does
+/// NOT go through `gated_notify` — the operator Telegram alert is a separate
+/// call at the exhaustion site. Same team/orchestrator guards as
+/// `maybe_notify_member_state_change` (skip when no team, no orchestrator, or
+/// the agent is its own orchestrator).
+fn notify_orchestrator_retry_exhausted(home: &std::path::Path, name: &str, retries: u32) {
+    let Some(team) = crate::teams::find_team_for(home, name) else {
+        return;
+    };
+    let Some(ref orch) = team.orchestrator else {
+        return;
+    };
+    if orch == name {
+        return; // skip self-notify
+    }
+    // Persist to the orchestrator's inbox (durable — read on its next inbox
+    // drain, not dependent on it being live at a prompt). Mirrors
+    // `maybe_notify_member_state_change`'s `enqueue` path. NOT `notify_agent`,
+    // which injects into a live PTY and would be lost if the orchestrator is
+    // idle/away.
+    let payload = serde_json::json!({
+        "type": "member_retry_exhausted",
+        "member": name,
+        "team": team.name,
+        "retries": retries,
+        "detected_at": chrono::Utc::now().to_rfc3339(),
+        "action": "Manual intervention required — check the agent pane, restart, or reassign the task.",
+    });
+    let msg = crate::inbox::InboxMessage::new_system(
+        "system:supervisor",
+        "member_retry_exhausted",
+        payload.to_string(),
+    );
+    let _ = crate::inbox::enqueue(home, orch, msg);
+    tracing::info!(
+        agent = %name,
+        orchestrator = %orch,
+        retries,
+        "retry-exhaustion orchestrator-inbox notify sent"
+    );
+}
+
 /// Process ServerRateLimit retries: detect new rate-limit states, schedule
 /// retries, and inject a fixed "continue" nudge after backoff. Runs AFTER
 /// tick() so all core locks are released — PTY writes happen lock-free.
@@ -1034,12 +1078,14 @@ pub(crate) fn process_server_rate_limit_retries(
     let now = Instant::now();
 
     // Phase 1: detect new ServerRateLimit states and schedule retries.
+    let mut active_names = std::collections::HashSet::new();
     {
         let reg = agent::lock_registry(registry);
         // #1441: registry is UUID-keyed; `retry_tracks` stays name-keyed, so
         // index it by the handle's display name.
         for handle in reg.values() {
             let name = handle.name.as_str();
+            active_names.insert(name.to_string());
             let state = handle.core.lock().state.current;
             if state == crate::state::AgentState::ServerRateLimit {
                 if retry_tracks.contains_key(name) {
@@ -1067,6 +1113,14 @@ pub(crate) fn process_server_rate_limit_retries(
         }
     }
 
+    // #1470 (re-scoped slice, credit @cheerc): drop retry tracks for agents no
+    // longer in the registry (killed / restarted / deleted). Recovery already
+    // clears tracks via `clears_server_rate_limit_retry` above, but an agent
+    // that vanishes mid-retry never reaches a productive state, so without this
+    // its track would leak forever and the map would grow unbounded across
+    // agent churn.
+    retry_tracks.retain(|name, _| active_names.contains(name));
+
     // Phase 2: fire due retries — inject fixed "continue\n".
     for (name, retry) in retry_tracks.iter_mut() {
         if retry.exhausted || now < retry.next_retry_at {
@@ -1077,6 +1131,12 @@ pub(crate) fn process_server_rate_limit_retries(
         if retry.retry_count > SERVER_RATE_LIMIT_MAX_RETRIES {
             tracing::warn!(agent = %name, retries = retry.retry_count, "ServerRateLimit max retries exceeded — giving up");
             retry.exhausted = true;
+            // #1470 (re-scoped slice, credit @cheerc): tell the team
+            // orchestrator (via its INBOX) that auto-retry gave up, so a stuck
+            // member is reassigned/intervened instead of sitting dead. Inbox
+            // path only — the operator Telegram alert below is the separate
+            // `gated_notify` chokepoint call; this does NOT touch it.
+            notify_orchestrator_retry_exhausted(home, name, retry.retry_count);
             if let Some(ch) = crate::channel::active_channel() {
                 let msg = format!(
                     "⚠️ {name} transient upstream error auto-retry exhausted ({} retries). Manual intervention required.",
@@ -2233,6 +2293,82 @@ instances:
         );
         assert!(tracks.contains_key("agent-loop"));
         assert!(tracks["agent-loop"].exhausted);
+    }
+
+    /// #1470 (slice): a retry track for an agent no longer in the registry
+    /// (killed / restarted / deleted) is dropped — the map can't grow unbounded
+    /// across agent churn.
+    #[test]
+    fn retry_track_cleared_when_agent_removed_from_registry() {
+        let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = tmp_home("slice-clear-removed-agent");
+        let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
+        tracks.insert(
+            "ghost-agent".to_string(),
+            RateLimitRetry {
+                retry_count: 1,
+                next_retry_at: Instant::now() + Duration::from_secs(60),
+                exhausted: false,
+            },
+        );
+
+        // Empty registry → the agent is gone → its track must be reaped.
+        super::process_server_rate_limit_retries(&home, &registry, &mut tracks);
+        assert!(
+            !tracks.contains_key("ghost-agent"),
+            "retry track must be cleared when the agent is no longer in the registry"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1470 (slice): when auto-retry is exhausted, the agent's team
+    /// orchestrator is notified via its INBOX (not operator Telegram).
+    #[test]
+    fn retry_exhaustion_notifies_orchestrator_inbox() {
+        let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = tmp_home("slice-exhaustion-notify");
+        std::fs::create_dir_all(home.join("inbox")).ok();
+
+        // Agent stays in ServerRateLimit so Phase 1 keeps its seeded track
+        // (a productive state would clear it via clears_server_rate_limit_retry).
+        let (handle, _reader) =
+            mock_agent_handle("worker-x", crate::state::AgentState::ServerRateLimit);
+        let agent_id = handle.id;
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            format!(
+                "teams:\n  team-x:\n    members: [orch-x, worker-x]\n    orchestrator: orch-x\n\
+                 instances:\n  worker-x:\n    id: {}\n",
+                agent_id.full()
+            ),
+        )
+        .ok();
+        registry.lock().insert(agent_id, handle);
+
+        // Seed at MAX so the next increment exceeds it → exhaustion branch.
+        let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
+        tracks.insert(
+            "worker-x".to_string(),
+            RateLimitRetry {
+                retry_count: super::SERVER_RATE_LIMIT_MAX_RETRIES,
+                next_retry_at: Instant::now() - Duration::from_secs(1),
+                exhausted: false,
+            },
+        );
+
+        super::process_server_rate_limit_retries(&home, &registry, &mut tracks);
+
+        assert!(
+            tracks["worker-x"].exhausted,
+            "track must be marked exhausted after exceeding max retries"
+        );
+        let orch_inbox = home.join("inbox").join("orch-x.jsonl");
+        let content = std::fs::read_to_string(&orch_inbox).unwrap_or_default();
+        assert!(
+            content.contains("member_retry_exhausted") && content.contains("worker-x"),
+            "orchestrator inbox must carry the retry-exhaustion notice, got: {content}"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
