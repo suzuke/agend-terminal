@@ -52,6 +52,7 @@ mod render;
 mod runtime;
 pub mod runtime_config;
 mod schedules;
+mod scm;
 mod screenshot;
 mod service;
 mod skills;
