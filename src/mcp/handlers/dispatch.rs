@@ -424,6 +424,58 @@ pub(crate) fn dispatch_config(ctx: &HandlerCtx<'_>) -> Value {
     }
 }
 
+/// #1339: manual operator-mode control. `mode get` → current mode + delegate;
+/// `mode set <active|away|sleep> [delegate=<name>] [scope=[...]]` → persist and
+/// hot-reload (the daemon tick's `operator_mode::reload` also re-reads the file).
+/// Setting the mode is itself authority-sensitive — the API ingress gate routes
+/// the `mode` tool's `set` action to the never-delegate class, so only the
+/// operator (no `instance` on the wire) or `Active` mode reaches here for a set.
+pub(crate) fn dispatch_mode(ctx: &HandlerCtx<'_>) -> Value {
+    match ctx.args["action"].as_str().unwrap_or("get") {
+        "get" => {
+            let s = crate::operator_mode::get();
+            json!({
+                "ok": true,
+                "mode": s.mode,
+                "delegate_to": s.delegate_to,
+                "delegate_scope": s.delegate_scope,
+            })
+        }
+        "set" => {
+            let Some(mode_str) = ctx.args["mode"].as_str() else {
+                return json!({"error": "mode set requires `mode` (active|away|sleep)"});
+            };
+            let mode = match crate::operator_mode::parse_mode(mode_str) {
+                Ok(m) => m,
+                Err(e) => return json!({"error": e}),
+            };
+            let delegate_to = ctx.args["delegate"].as_str().map(str::to_string);
+            let delegate_scope: Vec<String> = match &ctx.args["scope"] {
+                Value::Array(a) => a
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect(),
+                Value::String(s) => s
+                    .split(',')
+                    .map(|x| x.trim().to_string())
+                    .filter(|x| !x.is_empty())
+                    .collect(),
+                _ => Vec::new(),
+            };
+            match crate::operator_mode::set_mode(ctx.home, mode, delegate_to, delegate_scope) {
+                Ok(s) => json!({
+                    "ok": true,
+                    "mode": s.mode,
+                    "delegate_to": s.delegate_to,
+                    "delegate_scope": s.delegate_scope,
+                }),
+                Err(e) => json!({"error": e}),
+            }
+        }
+        other => json!({"error": format!("unknown mode action: {other} (expected get|set)")}),
+    }
+}
+
 /// Parse human-friendly duration strings like "2h", "30m", "1h30m".
 /// A bare number without suffix is interpreted as **minutes**.
 fn parse_duration_secs(s: &str) -> Option<i64> {
@@ -531,9 +583,10 @@ mod tests {
                 "binding_state",
                 "gc_dry_run",
                 "tokens",
+                "mode",
             ]
         );
-        assert_eq!(crate::mcp::registry::all().len(), 35);
+        assert_eq!(crate::mcp::registry::all().len(), 36);
     }
 
     #[test]

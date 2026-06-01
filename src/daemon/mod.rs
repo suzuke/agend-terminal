@@ -435,6 +435,9 @@ fn run_core(
             configs: &ctx.configs,
         };
         crate::runtime_config::reload(home);
+        // #1339: operator-mode.json reloaded each tick — a mode change (via the
+        // `mode` MCP tool) propagates fleet-wide without a restart (reload-coherent).
+        crate::operator_mode::reload(home);
         per_tick::run_handlers_with_panic_guard(&handlers, &tick_ctx);
 
         let exit_event = match exit_event {

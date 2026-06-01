@@ -42,6 +42,7 @@ mod mcp;
 mod mcp_config;
 mod mouse_forward;
 mod notification_queue;
+pub mod operator_mode;
 mod paths;
 mod process;
 mod protocol;
