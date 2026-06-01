@@ -51,6 +51,24 @@ pub fn link_path(home: &Path, instance: &str) -> PathBuf {
     link_base(home).join(instance)
 }
 
+/// #1597: whether any component of `p` is dot-prefixed (hidden). This is the
+/// same "ANY dot-prefixed ancestor makes the whole path hidden" rule agy
+/// applies in `addWorkspaceFolder` (`root.go:132`). When this is `false`, agy
+/// accepts the path as a workspace directly — so the non-hidden link is NOT
+/// needed and we can point `$PWD` at the real dir (avoids shadowing an explicit
+/// non-hidden `working_directory` + a stray link). When `true` (e.g. the
+/// default `$AGEND_HOME/workspace/<name>` under `~/.agend-terminal`), the link
+/// is required — that is the whole reason #1547/#1582 exists.
+pub fn path_has_hidden_component(p: &Path) -> bool {
+    use std::path::Component;
+    p.components().any(|c| match c {
+        // Only real path segments can be "hidden"; RootDir, the Windows
+        // `Prefix` (`C:\`), `.` and `..` never count.
+        Component::Normal(seg) => seg.to_string_lossy().starts_with('.'),
+        _ => false,
+    })
+}
+
 /// Create (or refresh) the non-hidden link `<base>/<instance>` →
 /// `real_workspace` and return the link path to set as agy's `$PWD`.
 ///
@@ -174,6 +192,27 @@ mod tests {
             "default link base must have no hidden component: {}",
             base.display()
         );
+    }
+
+    #[test]
+    fn path_has_hidden_component_detects_dot_prefixed_segments() {
+        // Hidden: leaf, ancestor, or the default agend workspace.
+        assert!(path_has_hidden_component(Path::new(
+            "/Users/x/.agend-terminal/workspace/agy"
+        )));
+        assert!(path_has_hidden_component(Path::new("/Users/x/.config/agy"))); // hidden ancestor
+        assert!(path_has_hidden_component(Path::new(
+            "/Users/x/proj/.hidden"
+        ))); // hidden leaf
+             // Not hidden: ordinary absolute path, no dot-prefixed segment.
+        assert!(!path_has_hidden_component(Path::new(
+            "/Users/x/projects/agy-ws"
+        )));
+        assert!(!path_has_hidden_component(Path::new(
+            "/var/folders/ab/cd/T/x"
+        )));
+        // `..` / `.` path operators are not "hidden" segments.
+        assert!(!path_has_hidden_component(Path::new("/Users/x/./proj")));
     }
 
     #[test]

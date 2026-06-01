@@ -847,6 +847,9 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
         }
     }
 
+    // #1597: the resolved cwd we actually hand the PTY — captured so the agy
+    // `$PWD` arm below decides on (and points at) the SAME path agy will see.
+    let mut spawn_cwd: Option<PathBuf> = None;
     if let Some(dir) = working_dir {
         // Defense-in-depth: the API spawn handler already calls
         // validate_working_directory at admission, but a symlink could have
@@ -865,6 +868,7 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
             let resolved = crate::api::validate_working_directory(dir, home_path)
                 .map_err(|e| anyhow::anyhow!("working_directory escapes via symlink: {e}"))?;
             cmd.cwd(&resolved);
+            spawn_cwd = Some(resolved);
         } else {
             tracing::warn!(
                 instance = %name,
@@ -873,34 +877,50 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
             );
             std::fs::create_dir_all(dir).ok();
             cmd.cwd(dir);
+            spawn_cwd = Some(dir.to_path_buf());
         }
     }
 
     // #1547 (A): agy rejects a workspace whose path has a dot-prefixed (hidden)
-    // ancestor — and every daemon workspace lives under `$AGEND_HOME`
-    // (`~/.agend-terminal`, hidden). agy reads the workspace path from `$PWD`
-    // (not getcwd/realpath; operator e2e-verified), so we keep the CWD at the
-    // real hidden workspace (the validated allowed root set via `cmd.cwd` above)
-    // but point `$PWD` at a NON-hidden link to it. Done LAST — after the
-    // fleet.yaml user-env loop — so the daemon-derived value is authoritative
-    // (mirrors the opencode XDG_DATA_HOME placement rationale above). Link
-    // failure is non-fatal: agy still spawns, just without fleet MCP (the
-    // pre-#1547 behavior), and the boot invariant in `spawn_agent` warns.
+    // ancestor and reads the workspace path from `$PWD` (not getcwd/realpath;
+    // operator e2e-verified). #1597 makes this CONDITIONAL on the resolved cwd:
+    //
+    // - cwd has NO hidden component (e.g. an explicit non-hidden
+    //   `working_directory`) → agy accepts it directly. Set `$PWD` to the real
+    //   cwd and SKIP the link, so agy reports the user's actual dir and we leave
+    //   no stray symlink shadowing it.
+    // - cwd has a hidden ancestor (the default `$AGEND_HOME/workspace/<name>`
+    //   under `~/.agend-terminal`) → agy would reject it. Point `$PWD` at a
+    //   NON-hidden link to the same dir (the cwd stays the real allowed root).
+    //   This is the case #1547/#1582 exists for.
+    //
+    // Done LAST — after the fleet.yaml user-env loop — so the daemon value is
+    // authoritative. Link failure is non-fatal (agy still spawns, just without
+    // fleet MCP; the boot invariant in `spawn_agent` warns).
     if matches!(detected_backend, Some(Backend::Agy)) {
-        if let (Some(dir), Some(home_path)) = (working_dir, home) {
-            match crate::agy_workspace::ensure_link(home_path, name, dir) {
-                Ok(link) => {
-                    cmd.env("PWD", &link);
-                    tracing::debug!(
-                        instance = %name, pwd = %link.display(),
-                        "agy: $PWD set to non-hidden workspace link"
-                    );
+        if let (Some(cwd), Some(home_path)) = (spawn_cwd.as_deref(), home) {
+            if crate::agy_workspace::path_has_hidden_component(cwd) {
+                match crate::agy_workspace::ensure_link(home_path, name, cwd) {
+                    Ok(link) => {
+                        cmd.env("PWD", &link);
+                        tracing::debug!(
+                            instance = %name, pwd = %link.display(),
+                            "agy: hidden workspace — $PWD set to non-hidden link"
+                        );
+                    }
+                    Err(e) => tracing::warn!(
+                        instance = %name, error = %e,
+                        "agy: could not create non-hidden workspace link — agy will \
+                         reject the hidden workspace and load no fleet MCP"
+                    ),
                 }
-                Err(e) => tracing::warn!(
-                    instance = %name, error = %e,
-                    "agy: could not create non-hidden workspace link — agy will \
-                     reject the hidden workspace and load no fleet MCP"
-                ),
+            } else {
+                // Non-hidden cwd: agy accepts it as-is — no link needed.
+                cmd.env("PWD", cwd);
+                tracing::debug!(
+                    instance = %name, pwd = %cwd.display(),
+                    "agy: non-hidden workspace — $PWD set to the real dir (no link)"
+                );
             }
         }
     }

@@ -827,37 +827,25 @@ fn build_command_sets_git_editor_defaults() {
     }
 }
 
-/// #1547 (A): `build_command` for an agy backend must set `$PWD` to the
-/// NON-hidden workspace link (so agy's hidden-path guard passes) while the
-/// CWD stays the real hidden workspace. The `agy_workspace::ensure_link` unit
-/// tests cover the link helper in isolation; THIS pins the integration —
-/// that the agy arm in `build_command` actually wires the link path into the
-/// child env. Unix-only: the link is a symlink here (Windows uses a junction,
-/// compile-checked on Windows CI; the PWD-wiring logic is platform-identical).
+/// #1597 helper: run `build_command` for an agy backend with the given home +
+/// workspace, returning the resulting cmd and the would-be link path. fleet.yaml
+/// pins `agy_workspace_link_base` inside `home` so tests never touch the real
+/// `<user_home>/agend-ws`.
 #[cfg(unix)]
-#[test]
-fn build_command_agy_sets_pwd_to_non_hidden_link() {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static N: AtomicU64 = AtomicU64::new(0);
-    let home = std::env::temp_dir().join(format!(
-        "agend-1547-{}-{}",
-        std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
-    ));
-    let workspace = crate::paths::workspace_dir(&home).join("agy-int");
-    std::fs::create_dir_all(&workspace).expect("create workspace");
-    // Point the link base inside our tmp home so the test never writes into
-    // the real `<user_home>/agend-ws`.
+fn build_agy_cmd(
+    home: &std::path::Path,
+    workspace: &std::path::Path,
+) -> (CommandBuilder, std::path::PathBuf) {
+    std::fs::create_dir_all(workspace).expect("create workspace");
     let link_base = home.join("ws-links");
     std::fs::write(
-        crate::fleet::fleet_yaml_path(&home),
+        crate::fleet::fleet_yaml_path(home),
         format!(
             "instances: {{}}\nteams: {{}}\nagy_workspace_link_base: {}\n",
             link_base.display()
         ),
     )
     .expect("write fleet.yaml");
-
     let config = SpawnConfig {
         name: "agy-int",
         backend_command: "agy",
@@ -866,39 +854,107 @@ fn build_command_agy_sets_pwd_to_non_hidden_link() {
         cols: 80,
         rows: 24,
         env: None,
-        working_dir: Some(workspace.as_path()),
+        working_dir: Some(workspace),
         submit_key: "\r",
-        home: Some(home.as_path()),
+        home: Some(home),
         crash_tx: None,
         shutdown: None,
     };
     let (cmd, backend) = build_command(&config).expect("build_command");
     assert_eq!(backend, Some(Backend::Agy));
+    (cmd, crate::agy_workspace::link_path(home, "agy-int"))
+}
 
-    let expected_link = crate::agy_workspace::link_path(&home, "agy-int");
-    let pwd = cmd
-        .get_env("PWD")
-        .expect("agy build_command must set $PWD to the non-hidden link");
+#[cfg(unix)]
+fn agy_tmp(tag: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    std::env::temp_dir().join(format!(
+        "agend-1597-{tag}-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+/// #1597 case (a): an explicit NON-hidden working_directory → agy accepts it
+/// directly. `$PWD` is the real (resolved) dir and NO link is created (no
+/// shadowing, no stray symlink).
+#[cfg(unix)]
+#[test]
+fn build_command_agy_non_hidden_workspace_uses_real_dir_no_link() {
+    let home = agy_tmp("nonhidden").join("agend-home");
+    let workspace = home.join("proj");
+    let (cmd, link_path) = build_agy_cmd(&home, &workspace);
+
+    let resolved =
+        crate::api::validate_working_directory(&workspace, &home).expect("validate workspace");
+    let pwd = cmd.get_env("PWD").expect("agy must set $PWD");
     assert_eq!(
         std::path::Path::new(pwd),
-        expected_link.as_path(),
-        "agy $PWD must equal the workspace link path"
+        resolved.as_path(),
+        "non-hidden workspace: $PWD must be the real resolved dir, not a link"
     );
-    // The link exists, is a symlink, and resolves to the real workspace.
     assert!(
-        expected_link
+        link_path.symlink_metadata().is_err(),
+        "non-hidden workspace must NOT create a link at {}",
+        link_path.display()
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #1597 case (b): the default hidden workspace (`$AGEND_HOME` is dot-prefixed)
+/// → agy would reject it, so `$PWD` points at a non-hidden link to the real dir.
+/// (This is the #1547/#1582 case.)
+#[cfg(unix)]
+#[test]
+fn build_command_agy_hidden_workspace_uses_link() {
+    // Hidden home segment `.agend-home` makes the resolved cwd hidden.
+    let home = agy_tmp("hidden").join(".agend-home");
+    let workspace = crate::paths::workspace_dir(&home).join("agy-int");
+    let (cmd, link_path) = build_agy_cmd(&home, &workspace);
+
+    let pwd = cmd.get_env("PWD").expect("agy must set $PWD");
+    assert_eq!(
+        std::path::Path::new(pwd),
+        link_path.as_path(),
+        "hidden workspace: $PWD must be the non-hidden link"
+    );
+    assert!(
+        link_path
             .symlink_metadata()
             .expect("link must exist")
             .file_type()
             .is_symlink(),
-        "agy workspace link must be a symlink on Unix"
+        "hidden workspace must create a symlink"
     );
     assert_eq!(
-        std::fs::canonicalize(&expected_link).expect("canonicalize link"),
+        std::fs::canonicalize(&link_path).expect("canonicalize link"),
         std::fs::canonicalize(&workspace).expect("canonicalize workspace"),
         "link must resolve to the real hidden workspace"
     );
+    std::fs::remove_dir_all(&home).ok();
+}
 
+/// #1597 case (c): a non-hidden LEAF under a hidden ANCESTOR is still hidden by
+/// agy's rule → link required.
+#[cfg(unix)]
+#[test]
+fn build_command_agy_hidden_ancestor_uses_link() {
+    // `.cfg` ancestor is hidden even though the `proj` leaf is not.
+    let home = agy_tmp("ancestor").join(".cfg");
+    let workspace = home.join("proj");
+    let (cmd, link_path) = build_agy_cmd(&home, &workspace);
+
+    let pwd = cmd.get_env("PWD").expect("agy must set $PWD");
+    assert_eq!(
+        std::path::Path::new(pwd),
+        link_path.as_path(),
+        "hidden ancestor: $PWD must be the non-hidden link"
+    );
+    assert!(
+        link_path.symlink_metadata().is_ok(),
+        "hidden ancestor must create a link"
+    );
     std::fs::remove_dir_all(&home).ok();
 }
 
