@@ -296,13 +296,17 @@ fn check_worktree_enforcement(params: &Value, home: &Path, target: &str) -> Resu
 
 // ── Phase 4: Delivery routing ───────────────────────────────────────
 
+/// #bughunt2: returns `Err` when the inbox enqueue fails (disk read-only / I/O)
+/// so `handle_send` can surface a real failure instead of reporting `ok:true`
+/// for a message that was silently dropped — critical for the `inbox_only` /
+/// codex `skip_inject` branches where the inbox is the SOLE delivery channel.
 fn route_and_deliver(
     ctx: &HandlerCtx,
     params: &Value,
     from: &str,
     target: &str,
     msg: crate::inbox::InboxMessage,
-) -> &'static str {
+) -> anyhow::Result<&'static str> {
     let reg = agent::lock_registry(ctx.registry);
     // #1441: registry is UUID-keyed; resolve target name via fleet.yaml.
     let target_id = crate::fleet::resolve_uuid(ctx.home, target);
@@ -338,20 +342,20 @@ fn route_and_deliver(
         && !is_reply_to_drained_blocker;
 
     if !target_in_registry {
-        let _ = crate::inbox::enqueue(ctx.home, target, msg);
-        "inbox_only"
+        crate::inbox::enqueue(ctx.home, target, msg)?;
+        Ok("inbox_only")
     } else if skip_inject {
-        let _ = crate::inbox::enqueue(ctx.home, target, msg);
+        crate::inbox::enqueue(ctx.home, target, msg)?;
         crate::event_log::log(
             ctx.home,
             "ack_absorbed",
             target,
             &format!("from={from} kind={kind}"),
         );
-        "inbox_only"
+        Ok("inbox_only")
     } else {
-        let _ = crate::inbox::enqueue_with_idle_hint(ctx.home, target, msg);
-        "pty"
+        crate::inbox::enqueue_with_idle_hint(ctx.home, target, msg)?;
+        Ok("pty")
     }
 }
 
@@ -536,7 +540,19 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
     if let Err(e) = check_worktree_enforcement(params, ctx.home, vs.target) {
         return e;
     }
-    let delivery_mode = route_and_deliver(ctx, params, vs.from, vs.target, msg.clone());
+    // #bughunt2: a failed enqueue (disk read-only / I/O) must surface as a real
+    // failure — never report ok:true for a silently-dropped message. Return
+    // BEFORE the provenance/dispatch side-effects so they don't fire for an
+    // undelivered message.
+    let delivery_mode = match route_and_deliver(ctx, params, vs.from, vs.target, msg.clone()) {
+        Ok(m) => m,
+        Err(e) => {
+            return json!({
+                "ok": false,
+                "error": format!("send failed: message not delivered to '{}': {e}", vs.target)
+            });
+        }
+    };
     inject_provenance(params, vs.from, vs.target);
     let branch_checked_out = checkout_branch_if_requested(params, ctx.home, vs.target);
     process_verdicts(ctx.home, vs.from, &msg);
@@ -597,6 +613,38 @@ mod tests {
         assert!(
             result["error"].as_str().unwrap_or("").contains("not found"),
             "must return not-found error for nonexistent target: {result}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #bughunt2: a dropped inbox enqueue (disk-low / I/O) must surface as
+    /// `ok:false`, never the silent `ok:true` for a lost message.
+    #[test]
+    fn send_surfaces_enqueue_failure_not_fake_ok() {
+        let home = tmp_home("send-enqueue-fail");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  offline-agent:\n    backend: claude\n",
+        )
+        .ok();
+        // Force the inbox enqueue to fail: `home/inbox` as a FILE makes
+        // `create_dir_all(home/inbox)` error inside with_inbox_lock.
+        std::fs::write(home.join("inbox"), b"blocker").unwrap();
+        let ctx = test_ctx(&home);
+        let result = handle_send(
+            &json!({"from": "sender", "target": "offline-agent", "text": "hi"}),
+            &ctx,
+        );
+        assert_eq!(
+            result["ok"], false,
+            "a dropped enqueue must NOT report ok:true: {result}"
+        );
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("not delivered"),
+            "must surface the delivery failure: {result}"
         );
         std::fs::remove_dir_all(&home).ok();
     }

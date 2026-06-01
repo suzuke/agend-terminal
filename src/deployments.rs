@@ -413,7 +413,21 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
     };
     let mut store = load(home);
     store.deployments.push(deployment);
-    let _ = save(home, &mut store);
+    // #bughunt2: a deploy whose record never persisted is NOT "deployed" — the
+    // instances are live in fleet.yaml but `teardown <name>` can't find them and
+    // a daemon restart resurrects them untracked. Surface the failure (with the
+    // spawned instances) so the operator can reconcile, instead of reporting
+    // success.
+    if let Err(e) = save(home, &mut store) {
+        return serde_json::json!({
+            "error": format!(
+                "deployment '{}' spawned {} instance(s) but failed to persist the deployment record: {e} — teardown-by-name will not work until reconciled",
+                params.deploy_name, created.len()
+            ),
+            "name": params.deploy_name,
+            "instances": created,
+        });
+    }
 
     let _ = instance_name;
     serde_json::json!({"status": "deployed", "name": params.deploy_name, "instances": created})
@@ -464,7 +478,19 @@ pub fn teardown(home: &Path, args: &Value) -> Value {
 
     // Remove from store
     store.deployments.retain(|d| d.name != name);
-    let _ = save(home, &mut store);
+    // #bughunt2: if the record-removal save fails, the instances are already
+    // gone from fleet.yaml but the stale record lingers on disk — `list` and a
+    // re-`teardown` will still show it. Surface it rather than reporting a clean
+    // torn_down.
+    if let Err(e) = save(home, &mut store) {
+        return serde_json::json!({
+            "error": format!(
+                "deployment '{name}' instances were removed but failed to persist the record cleanup: {e} — the stale record remains; retry teardown"
+            ),
+            "name": name,
+            "instances": deployment.instances,
+        });
+    }
 
     serde_json::json!({"status": "torn_down", "name": name, "instances": deployment.instances})
 }
@@ -1512,6 +1538,79 @@ instances: {}
             }),
         );
         home
+    }
+
+    /// #bughunt2: a deploy whose `deployments.json` save fails must surface an
+    /// error (instances are live but untracked), NOT report `status:deployed`.
+    #[test]
+    fn deploy_surfaces_record_save_failure_not_fake_deployed() {
+        let home = tmp_home("deploy-save-fail");
+        let yaml = r#"
+templates:
+  tpl:
+    instances:
+      worker:
+        backend: claude
+instances: {}
+"#;
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
+        // Force the record save to fail: a DIRECTORY at the target path makes
+        // atomic_write's final rename unable to replace it.
+        std::fs::create_dir_all(home.join("deployments.json")).unwrap();
+        let result = deploy(
+            &home,
+            "caller",
+            &serde_json::json!({
+                "template": "tpl",
+                "name": "tpl",
+                "directory": home.display().to_string(),
+            }),
+        );
+        assert!(
+            result.get("error").and_then(|e| e.as_str()).is_some(),
+            "a failed record save must surface as an error, not status:deployed: {result}"
+        );
+        assert_ne!(
+            result.get("status").and_then(|s| s.as_str()),
+            Some("deployed"),
+            "must NOT report deployed when the record was not persisted"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #bughunt2 (codex review): teardown's record-cleanup save-failure branch
+    /// must surface a stale-record error, not report `torn_down`. Unix-only: the
+    /// failure is injected by making `home` read-only AFTER deploy (the
+    /// `deployments.lock` already exists so the flock still opens, `load` still
+    /// reads the record, but the `atomic_write` tmp create in the read-only dir
+    /// fails the save).
+    #[cfg(unix)]
+    #[test]
+    fn teardown_surfaces_record_save_failure_not_fake_torn_down() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = deploy_single_instance_for_test("teardown-save-fail", "tpl");
+        assert!(
+            load(&home).deployments.iter().any(|d| d.name == "tpl"),
+            "pre: deployment must exist for the teardown to find"
+        );
+        let ro = std::fs::Permissions::from_mode(0o555);
+        std::fs::set_permissions(&home, ro).unwrap();
+
+        let result = teardown(&home, &serde_json::json!({"name": "tpl"}));
+
+        // Restore write perms so cleanup (and any later test) works.
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            result.get("error").and_then(|e| e.as_str()).is_some(),
+            "a failed record-cleanup save must surface an error, not torn_down: {result}"
+        );
+        assert_ne!(
+            result.get("status").and_then(|s| s.as_str()),
+            Some("torn_down"),
+            "must NOT report torn_down when the record cleanup was not persisted"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]

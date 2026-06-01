@@ -36,7 +36,16 @@ pub fn fallback_deliver(
     if !in_fleet {
         return json!({"error": format!("target instance '{target}' not found in fleet.yaml (API unavailable: {api_error})")});
     }
-    let _ = crate::inbox::enqueue(home, target, msg);
+    // #bughunt2: this is the last-resort path (the daemon API is already down),
+    // so the inbox is the SOLE channel. A swallowed enqueue here is total,
+    // unrecoverable message loss reported as success — surface it instead.
+    if let Err(e) = crate::inbox::enqueue(home, target, msg) {
+        return json!({
+            "error": format!(
+                "inbox fallback delivery to '{target}' failed — message lost (API unavailable: {api_error}): {e}"
+            )
+        });
+    }
     crate::inbox::notify_agent(home, target, &crate::inbox::NotifySource::Agent(from), text);
     json!({"target": target, "delivery_mode": "inbox_fallback", "note": format!("API unavailable: {api_error}")})
 }
@@ -402,6 +411,35 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).ok();
         dir
+    }
+
+    /// #bughunt2: the last-resort delivery path must surface a dropped enqueue
+    /// (the inbox is the SOLE channel when the API is down) instead of reporting
+    /// `inbox_fallback` success for a silently-lost message.
+    #[test]
+    fn fallback_deliver_surfaces_enqueue_failure_not_fake_success() {
+        let home = tmp_home("fallback-enqueue-fail");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  worker:\n    backend: claude\n",
+        )
+        .unwrap();
+        // Force the inbox enqueue to fail: `home/inbox` as a FILE makes
+        // `create_dir_all(home/inbox)` error inside with_inbox_lock.
+        std::fs::write(home.join("inbox"), b"blocker").unwrap();
+        let msg = crate::inbox::InboxMessage::new_system("sender", "update", "body");
+        let api_error = anyhow::anyhow!("daemon API unavailable");
+        let result = fallback_deliver(&home, "sender", "worker", "hi", msg, &api_error);
+        assert!(
+            result.get("error").and_then(|e| e.as_str()).is_some(),
+            "a dropped enqueue must surface as an error, not inbox_fallback success: {result}"
+        );
+        assert_ne!(
+            result.get("delivery_mode").and_then(|d| d.as_str()),
+            Some("inbox_fallback"),
+            "must NOT report success when the message was lost"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 
     // --- validate_branch (3 from ops.rs + 5 from mcp/handlers.rs) ---
