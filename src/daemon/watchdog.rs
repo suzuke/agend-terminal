@@ -1,8 +1,20 @@
 //! Watchdog: classify PTY output into BlockedReason per daemon tick.
 
 use crate::backend::Backend;
-use crate::health::HealthTracker;
+use crate::health::{BlockedReason, HealthTracker};
+use crate::state::AgentState;
 use std::path::Path;
+
+/// bughunt2: the AgentStates that mean the agent is actively working / ready
+/// again — i.e. recovered from a transient rate-limit. Used to auto-clear
+/// the set-only RateLimit/QuotaExceeded health latch (mirrors the way the
+/// underlying AgentState self-expires when the throttle banner clears).
+fn recovered_from_rate_limit(state: AgentState) -> bool {
+    matches!(
+        state,
+        AgentState::Ready | AgentState::Idle | AgentState::Thinking | AgentState::ToolUse
+    )
+}
 
 /// Parse `AGEND_WATCHDOG_DRY_RUN` env var. Returns true for "1"/"true"/"TRUE"/"True".
 pub fn watchdog_dry_run_from_env() -> bool {
@@ -23,14 +35,40 @@ pub fn run_watchdog_pass(
     screen: &str,
     health: &mut HealthTracker,
     dry_run: bool,
+    current_state: AgentState,
 ) {
-    let reason = match crate::state::classify_pty_output(backend, screen) {
-        Some(r) => r,
-        None => return,
-    };
+    let reason = crate::state::classify_pty_output(backend, screen);
+
     if dry_run {
-        crate::event_log::log(home, "watchdog_dry_run", agent_name, &format!("{reason:?}"));
-    } else {
+        // Observability only — never mutate health (no set, no clear).
+        if let Some(reason) = reason {
+            crate::event_log::log(home, "watchdog_dry_run", agent_name, &format!("{reason:?}"));
+        }
+        return;
+    }
+
+    // bughunt2 auto-clear: the RateLimit/QuotaExceeded BlockedReason is a
+    // SET-ONLY latch — `classify_pty_output` returns `None` once the
+    // throttle banner scrolls off, so the old code never cleared it. That
+    // latch permanently suppresses hang detection AND blocks task delivery,
+    // so an agent stays silently "blocked" forever after a TRANSIENT limit.
+    // The underlying AgentState self-expires when the limit lifts; mirror
+    // that here by clearing the latch once the agent is actively working /
+    // ready again. GUARDED to ONLY the rate-limit/quota latch — never
+    // AwaitingOperator / PermissionPrompt / Crash / Hang (operator- or
+    // crash-action-required reasons must NOT be auto-cleared; cf. the #1564
+    // blocked-reason guard). The set below re-latches if the agent is in
+    // fact still throttled (classify still matches).
+    if recovered_from_rate_limit(current_state)
+        && matches!(
+            health.current_reason,
+            Some(BlockedReason::RateLimit { .. } | BlockedReason::QuotaExceeded)
+        )
+    {
+        health.clear_blocked_reason();
+    }
+
+    if let Some(reason) = reason {
         health.set_blocked_reason(reason);
     }
 }
@@ -72,6 +110,7 @@ mod tests {
             "ThrottlingError: Too Many Requests",
             &mut health,
             true, // dry_run
+            AgentState::RateLimit,
         );
 
         assert!(
@@ -105,6 +144,9 @@ mod tests {
             "ServiceQuotaExceededException: You have exceeded your quota",
             &mut health,
             false, // live
+            // Agent still showing the quota banner → not recovered, so the
+            // bughunt2 auto-clear stays inert and the set is observed.
+            AgentState::RateLimit,
         );
 
         assert!(
@@ -134,6 +176,7 @@ mod tests {
             "Thinking about your request...\n● Read src/main.rs",
             &mut health,
             false,
+            AgentState::Thinking,
         );
 
         assert!(
@@ -146,6 +189,129 @@ mod tests {
             "healthy output must not write watchdog log"
         );
 
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// bughunt2: a rate-limit / quota latch (set by a prior throttled tick)
+    /// auto-clears once the agent has recovered (healthy screen + active
+    /// AgentState) — restoring hang detection + task delivery.
+    #[test]
+    fn test_watchdog_autoclear_rate_limit_latch_on_recovery() {
+        let backend = Backend::KiroCli;
+        let healthy = "Thinking about your request...\n● Read src/main.rs";
+        for (latch, state) in [
+            (
+                BlockedReason::RateLimit {
+                    retry_after_secs: Some(30),
+                },
+                AgentState::Ready,
+            ),
+            (BlockedReason::QuotaExceeded, AgentState::Idle),
+            (
+                BlockedReason::RateLimit {
+                    retry_after_secs: None,
+                },
+                AgentState::ToolUse,
+            ),
+        ] {
+            let home = tmp_home("autoclear-rl");
+            let mut health = HealthTracker::new();
+            health.set_blocked_reason(latch.clone());
+            run_watchdog_pass(
+                &home,
+                "test-agent",
+                &backend,
+                healthy,
+                &mut health,
+                false,
+                state,
+            );
+            assert!(
+                health.current_reason.is_none(),
+                "bughunt2: recovered agent ({state:?}) must auto-clear {latch:?}, got: {:?}",
+                health.current_reason
+            );
+            std::fs::remove_dir_all(&home).ok();
+        }
+    }
+
+    /// A genuinely still-limited agent (throttle banner present, state
+    /// still RateLimit → not recovered) stays latched.
+    #[test]
+    fn test_watchdog_still_limited_stays_latched() {
+        let home = tmp_home("still-limited");
+        let mut health = HealthTracker::new();
+        let backend = Backend::KiroCli;
+        health.set_blocked_reason(BlockedReason::RateLimit {
+            retry_after_secs: None,
+        });
+        run_watchdog_pass(
+            &home,
+            "test-agent",
+            &backend,
+            "ThrottlingError: Too Many Requests",
+            &mut health,
+            false,
+            AgentState::RateLimit,
+        );
+        assert!(
+            matches!(health.current_reason, Some(BlockedReason::RateLimit { .. })),
+            "still-limited agent must stay latched, got: {:?}",
+            health.current_reason
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Guard: the auto-clear is scoped to RateLimit/QuotaExceeded. An
+    /// operator-action-required reason (AwaitingOperator) must NOT be
+    /// cleared even when the agent looks recovered on screen.
+    #[test]
+    fn test_watchdog_autoclear_guard_spares_non_rate_limit_reasons() {
+        let home = tmp_home("guard");
+        let mut health = HealthTracker::new();
+        let backend = Backend::KiroCli;
+        health.set_blocked_reason(BlockedReason::AwaitingOperator);
+        run_watchdog_pass(
+            &home,
+            "test-agent",
+            &backend,
+            "Thinking about your request...\n● Read src/main.rs",
+            &mut health,
+            false,
+            AgentState::Ready,
+        );
+        assert!(
+            matches!(health.current_reason, Some(BlockedReason::AwaitingOperator)),
+            "bughunt2 guard: non-rate-limit reasons must NOT auto-clear, got: {:?}",
+            health.current_reason
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// dry-run never mutates health — it must NOT auto-clear a latch
+    /// either (observability mode is read-only).
+    #[test]
+    fn test_watchdog_dry_run_does_not_autoclear() {
+        let home = tmp_home("dry-noclear");
+        let mut health = HealthTracker::new();
+        let backend = Backend::KiroCli;
+        health.set_blocked_reason(BlockedReason::RateLimit {
+            retry_after_secs: None,
+        });
+        run_watchdog_pass(
+            &home,
+            "test-agent",
+            &backend,
+            "Thinking about your request...\n● Read src/main.rs",
+            &mut health,
+            true, // dry_run
+            AgentState::Ready,
+        );
+        assert!(
+            matches!(health.current_reason, Some(BlockedReason::RateLimit { .. })),
+            "dry-run must not mutate (clear) health, got: {:?}",
+            health.current_reason
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 

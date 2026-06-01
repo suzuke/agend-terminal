@@ -51,6 +51,9 @@ impl PerTickHandler for WatchdogHandler {
             let mut core = handle.core.lock();
             let rows = core.vterm.rows() as usize;
             let screen = core.vterm.tail_lines(rows);
+            // bughunt2: pass the live AgentState so run_watchdog_pass can
+            // auto-clear a stale rate-limit/quota latch on recovery.
+            let current_state = core.state.current;
             crate::daemon::watchdog::run_watchdog_pass(
                 ctx.home,
                 handle.name.as_str(),
@@ -58,6 +61,7 @@ impl PerTickHandler for WatchdogHandler {
                 &screen,
                 &mut core.health,
                 self.dry_run,
+                current_state,
             );
         }
     }
