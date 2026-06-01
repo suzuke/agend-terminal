@@ -33,14 +33,22 @@ pub fn remove_agent(name: &str) {
 /// Pure collector: returns (agent_name, reminder_string) for each agent
 /// that should be nudged. No side effects — does not inject into PTY.
 pub fn collect_poll_reminders(home: &Path, registry: &AgentRegistry) -> Vec<(String, String)> {
+    // #1617-class (mirror conflict_notify's phase-1-collect / phase-2-IO): snapshot
+    // the idle-agent names UNDER the registry lock, then DROP the guard before any
+    // inbox file IO. `inbox::unread_count` does `fs::read_to_string` + full-file
+    // parse; holding the GLOBAL registry lock across that (per agent, in a loop)
+    // stalls every other registry user when the inbox is large or the FS is slow.
+    let idle_names: Vec<String> = {
+        let reg = agent::lock_registry(registry);
+        reg.values()
+            .filter(|handle| handle.core.lock().state.current == AgentState::Idle)
+            .map(|handle| handle.name.to_string())
+            .collect()
+    };
+
+    // Phase 2: the inbox reads + dedup + formatting run lock-free.
     let mut result = Vec::new();
-    let reg = agent::lock_registry(registry);
-    for handle in reg.values() {
-        let name = handle.name.as_str();
-        let agent_state = handle.core.lock().state.current;
-        if agent_state != AgentState::Idle {
-            continue;
-        }
+    for name in &idle_names {
         let (count, oldest) = crate::inbox::unread_count(home, name);
         if count == 0 {
             continue;
@@ -85,6 +93,63 @@ mod tests {
     use parking_lot::Mutex;
     use portable_pty::native_pty_system;
     use std::sync::Arc;
+
+    /// #1617-class invariant: `collect_poll_reminders` must NEVER hold the
+    /// global registry lock across the blocking `inbox::unread_count` file read.
+    /// Holding the registry across per-agent inbox reads stalls every other
+    /// registry user (same class #1593/#1617 closed elsewhere; conflict_notify
+    /// already does the phase-1-collect / phase-2-IO split this mirrors).
+    ///
+    /// Structural source-scan (mirrors #1593 F2): brace-match the idle-name
+    /// snapshot block and assert (a) `unread_count` is NOT inside it (not under
+    /// the lock) and (b) `unread_count` IS called after the block closes (the
+    /// IO runs lock-free). Needles are `concat`-built and the scan is sliced to
+    /// the production region so this test can't self-satisfy.
+    #[test]
+    fn poll_reminder_unread_read_not_held_across_registry_lock() {
+        let src = include_str!("poll_reminder.rs");
+        let cfg_test = ["#[cfg(", "test)]"].concat();
+        let prod = match src.find(&cfg_test) {
+            Some(i) => &src[..i],
+            None => src,
+        };
+
+        // Fix marker: idle agent names are snapshotted into a Vec under the lock.
+        let bind_needle = ["let idle_names: Vec<String>", " = {"].concat();
+        let bstart = prod
+            .find(&bind_needle)
+            .expect("idle-name snapshot binding present (fix marker)");
+
+        let open_rel = prod[bstart..].find('{').expect("binding block opens");
+        let block_start = bstart + open_rel;
+        let mut depth = 0usize;
+        let mut block_end = block_start;
+        for (i, c) in prod[block_start..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        block_end = block_start + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(block_end > block_start, "binding block must close");
+
+        let io_needle = ["unread", "_count"].concat();
+        let locked_region = &prod[block_start..=block_end];
+        assert!(
+            !locked_region.contains(&io_needle),
+            "collect_poll_reminders must NOT call inbox::unread_count under the registry lock (#1617 class)"
+        );
+        assert!(
+            prod[block_end..].contains(&io_needle),
+            "inbox::unread_count must run AFTER the registry lock is dropped"
+        );
+    }
 
     fn tmp_home(tag: &str) -> std::path::PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
