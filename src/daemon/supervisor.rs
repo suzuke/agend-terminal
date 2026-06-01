@@ -601,12 +601,26 @@ fn awaiting_escalation_allowed(
         // #1563: an `OnDemand` coordinator (e.g. `general`) is permanently stuck
         // in `Starting` (never matches a Ready banner), so this ungated path
         // would forward its normal pane to the operator forever. Gate the
-        // startup-stall fallback by role; the prompt arms below stay role-blind
-        // so a real permission/interactive prompt still escalates (#1552).
+        // startup-stall fallback by role. (Part-B below role-gates
+        // `InteractivePrompt` too — same prose-FP root — while `PermissionPrompt`
+        // stays role-blind so a real permission dialog still escalates, #1552.)
         AgentState::Starting => idle_expectation == crate::fleet::IdleExpectation::Active,
         AgentState::PermissionPrompt | AgentState::InteractivePrompt => {
-            // (b) stability: the prompt state held continuously long enough.
-            state_held >= AWAITING_STABILITY
+            // #1563 part-B: split the role policy across the two prompt states.
+            // `PermissionPrompt` is chrome-anchored (#1546, near-zero FP), so a
+            // REAL permission dialog must escalate for ANY role (#1552/#1564) —
+            // role-blind. `InteractivePrompt`'s ONLY source is the weak,
+            // prose-FP-prone `is_generic_startup_prompt` (`Starting`-only), so an
+            // `OnDemand` coordinator (e.g. `general`) permanently stuck in
+            // `Starting` forwards its PR-review prose as a fake "interactive
+            // prompt". Gate `InteractivePrompt` by role, mirroring the `Starting`
+            // arm above; the #1564 gates (position/stability/engagement) below
+            // still apply to BOTH.
+            let role_ok = state != AgentState::InteractivePrompt
+                || idle_expectation == crate::fleet::IdleExpectation::Active;
+            role_ok
+                // (b) stability: the prompt state held continuously long enough.
+                && state_held >= AWAITING_STABILITY
                 // (a) position (mandatory): the prompt chrome must re-detect in
                 // the LIVE bottom rows. A scrollback echo fails this — it's the
                 // only gate that catches a finished agent sitting on a footer.
@@ -1670,6 +1684,60 @@ mod tests {
             0,
             10_000,
             crate::fleet::IdleExpectation::OnDemand,
+        ));
+    }
+
+    // ── #1563 part-B: InteractivePrompt role gate ──
+    // NB: `StatePatterns::detect` has NO `InteractivePrompt` regex (that state
+    // only comes from the weak `is_generic_startup_prompt` at the StateTracker
+    // level), so the position gate (a) for an `InteractivePrompt`-STATE agent is
+    // satisfiable only by a tail that detects as `PermissionPrompt`. `PERM_CHROME`
+    // models exactly the real FP combo: an agent latched to `InteractivePrompt`
+    // whose live tail also shows prompt chrome.
+
+    #[test]
+    fn awaiting_gate_ondemand_interactive_prompt_suppressed() {
+        // #1563 part-B: `general` (OnDemand) latched to `InteractivePrompt` by a
+        // `(y/n)` in its PR-review prose must NOT escalate, even with all three
+        // #1564 gates satisfied — the InteractivePrompt source is prose-FP-prone.
+        assert!(!awaiting_escalation_allowed(
+            crate::state::AgentState::InteractivePrompt,
+            AWAITING_STABILITY,
+            Some(crate::backend::Backend::ClaudeCode),
+            PERM_CHROME,
+            0,
+            10_000,
+            crate::fleet::IdleExpectation::OnDemand,
+        ));
+    }
+
+    #[test]
+    fn awaiting_gate_active_interactive_prompt_still_escalates() {
+        // An `Active` worker's InteractivePrompt still escalates (gates pass) —
+        // the role gate only suppresses OnDemand.
+        assert!(awaiting_escalation_allowed(
+            crate::state::AgentState::InteractivePrompt,
+            AWAITING_STABILITY,
+            Some(crate::backend::Backend::ClaudeCode),
+            PERM_CHROME,
+            0,
+            10_000,
+            crate::fleet::IdleExpectation::Active,
+        ));
+    }
+
+    #[test]
+    fn awaiting_gate_interactive_prompt_1564_gates_still_apply_when_active() {
+        // The new role gate is ADDITIVE: an `Active` InteractivePrompt with the
+        // chrome NOT in the live tail still fails the position gate (a).
+        assert!(!awaiting_escalation_allowed(
+            crate::state::AgentState::InteractivePrompt,
+            AWAITING_STABILITY,
+            Some(crate::backend::Backend::ClaudeCode),
+            "no chrome in the live tail",
+            0,
+            10_000,
+            crate::fleet::IdleExpectation::Active,
         ));
     }
 
