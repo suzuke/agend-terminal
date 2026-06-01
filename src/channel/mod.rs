@@ -383,6 +383,41 @@ pub enum AgentOutboundOp {
     InjectProvenance { from: String, task: String },
 }
 
+/// #1339 PR-2: mode-aware notification policy. The operator mode (#1575)
+/// decides which severities are worth pinging the operator's channel for:
+///
+/// - `Active` — operator at the TUI; today's behavior: **every** severity
+///   passes (hard `true`, no per-severity computation), so a future filter
+///   bug can never silently drop an active-mode notice (reviewer-2 risk).
+/// - `Away` — operator reachable via the channel but not at the TUI: routine
+///   `Info` (e.g. the "ready again" recovery ping) is suppressed; `Warn` and
+///   `Error` still go through.
+/// - `Sleep` — operator unreachable: only `Error` (P0 — a crash, or an agent
+///   stuck awaiting the operator, see #1552 in `daemon::supervisor`) breaks
+///   through; `Info`/`Warn` are held.
+///
+/// CHECKED match on the severity axis for `Away`/`Sleep` (no `_` catch-all) —
+/// adding a `NotifySeverity` variant fails to compile until its per-mode
+/// policy is stated here, the regression-guard the single-chokepoint design
+/// depends on.
+fn should_notify_in_mode(
+    severity: NotifySeverity,
+    mode: crate::operator_mode::OperatorMode,
+) -> bool {
+    use crate::operator_mode::OperatorMode;
+    match mode {
+        OperatorMode::Active => true,
+        OperatorMode::Away => match severity {
+            NotifySeverity::Info => false,
+            NotifySeverity::Warn | NotifySeverity::Error => true,
+        },
+        OperatorMode::Sleep => match severity {
+            NotifySeverity::Info | NotifySeverity::Warn => false,
+            NotifySeverity::Error => true,
+        },
+    }
+}
+
 /// Outbound notify gate — only forwards to [`Channel::notify`] when the
 /// channel reports [`Channel::outbound_authorized`] = `true`. When the
 /// channel is unauthorised (no allowlist configured), the call is
@@ -403,6 +438,22 @@ pub fn gated_notify(
     message: &str,
     silent: bool,
 ) -> std::result::Result<(), ChannelError> {
+    // #1339 PR-2: mode gate at the single Telegram chokepoint. `get()` reads
+    // the process-global operator-mode snapshot the daemon reloads each tick
+    // (reload-coherent); outside the daemon it defaults to `Active`, so this is
+    // a no-op for tests and one-off callers. Placed before the authorization
+    // gate so a mode-suppressed notice is dropped without touching the channel.
+    let mode = crate::operator_mode::get().mode;
+    if !should_notify_in_mode(severity, mode) {
+        tracing::debug!(
+            instance,
+            ?severity,
+            ?mode,
+            "gated_notify: suppressed by operator mode"
+        );
+        return Ok(());
+    }
+
     if !channel.outbound_authorized() {
         // Sprint 22 P1.5 (Candidate 4 from PR #229 P1 dispatch): the
         // previous `tracing::debug!` was invisible at default
@@ -543,6 +594,36 @@ mod tests {
         assert_ne!(NotifySeverity::Info, NotifySeverity::Error);
     }
 
+    /// #1339 PR-2: the full (mode × severity) policy grid. Active passes
+    /// everything (M2 hard-true); Away suppresses only Info; Sleep passes only
+    /// Error (the P0 tier #1552 AwaitingOperator rides on).
+    #[test]
+    fn should_notify_in_mode_policy_grid() {
+        use crate::operator_mode::OperatorMode::{Active, Away, Sleep};
+        use NotifySeverity::{Error, Info, Warn};
+
+        // Active — every severity passes, unconditionally.
+        for sev in [Info, Warn, Error] {
+            assert!(
+                should_notify_in_mode(sev, Active),
+                "Active must pass {sev:?}"
+            );
+        }
+
+        // Away — Info suppressed; Warn + Error pass.
+        assert!(!should_notify_in_mode(Info, Away), "Away suppresses Info");
+        assert!(should_notify_in_mode(Warn, Away), "Away passes Warn");
+        assert!(should_notify_in_mode(Error, Away), "Away passes Error");
+
+        // Sleep — only Error breaks through.
+        assert!(!should_notify_in_mode(Info, Sleep), "Sleep suppresses Info");
+        assert!(!should_notify_in_mode(Warn, Sleep), "Sleep suppresses Warn");
+        assert!(
+            should_notify_in_mode(Error, Sleep),
+            "Sleep passes Error (P0 — AwaitingOperator / crash)"
+        );
+    }
+
     /// Mock channel that records every `notify` call so tests can pin
     /// the gate's pass / drop semantics. Used by the [`gated_notify`]
     /// tests below.
@@ -618,8 +699,12 @@ mod tests {
     fn gated_notify_drops_when_channel_unauthorized() {
         // Fail-closed default: trait method returns false, gate drops
         // the call; underlying `notify` must NOT be invoked.
+        //
+        // #1339 PR-2: `Error` so the drop is provably the *authorization* gate
+        // firing, not the mode gate — `Error` passes every operator mode, so it
+        // always reaches the `outbound_authorized` check this test pins.
         let ch = RecordingChannel::new(false);
-        let result = gated_notify(&ch, "agent1", NotifySeverity::Warn, "leak-bait", false);
+        let result = gated_notify(&ch, "agent1", NotifySeverity::Error, "leak-bait", false);
         assert!(matches!(result, Ok(())), "drop must be Ok, got {result:?}");
         assert_eq!(
             ch.count(),
@@ -632,8 +717,14 @@ mod tests {
     fn gated_notify_forwards_when_channel_authorized() {
         // Operator opted in (allowlist configured) → channel reports
         // outbound_authorized=true → gate forwards to notify.
+        //
+        // #1339 PR-2: use `Error` so this test isolates the *authorization*
+        // gate from the *mode* gate — `Error` passes every operator mode, so a
+        // concurrent operator_mode test leaving the process-global at
+        // `Away`/`Sleep` can't drop this notice and flake the assertion. The
+        // mode dimension is covered by `should_notify_in_mode_policy_grid`.
         let ch = RecordingChannel::new(true);
-        let result = gated_notify(&ch, "agent1", NotifySeverity::Info, "ok", true);
+        let result = gated_notify(&ch, "agent1", NotifySeverity::Error, "ok", true);
         assert!(result.is_ok(), "authorised forward must succeed");
         assert_eq!(
             ch.count(),

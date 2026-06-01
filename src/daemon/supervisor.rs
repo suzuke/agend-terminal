@@ -960,11 +960,21 @@ fn tick(
                 // `gated_notify` drops the call when the channel is
                 // unauthorised; legacy `None`-allowlist deployments
                 // require explicit opt-in via `user_allowlist: [...]`.
+                //
+                // #1339 PR-2 (M3): `Error`, not `Warn`. Both producers of this
+                // `Stall` notice are "agent blocked, awaiting the operator" —
+                // the #1552 AwaitingOperator escalation and the #1563
+                // InteractivePrompt forward. That is exactly the P0 that must
+                // break through `Sleep`/`Away`: at `Warn` the gate would
+                // silently drop it while the operator is asleep, leaving the
+                // agent stuck on a prompt forever. (Severity is routing-only —
+                // the Telegram adapter ignores it for rendering — so this does
+                // not change the Active-mode message.)
                 if let Some(ch) = crate::channel::active_channel() {
                     let _ = crate::channel::gated_notify(
                         ch.as_ref(),
                         &name,
-                        NotifySeverity::Warn,
+                        NotifySeverity::Error,
                         &msg,
                         false,
                     );
