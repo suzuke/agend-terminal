@@ -1076,7 +1076,7 @@ pub(crate) fn process_server_rate_limit_retries(
             retry.exhausted = true;
             if let Some(ch) = crate::channel::active_channel() {
                 let msg = format!(
-                    "⚠️ {name} API rate limit auto-retry exhausted ({} retries). Manual intervention required.",
+                    "⚠️ {name} transient upstream error auto-retry exhausted ({} retries). Manual intervention required.",
                     SERVER_RATE_LIMIT_MAX_RETRIES
                 );
                 let _ = crate::channel::gated_notify(
