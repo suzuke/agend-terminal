@@ -1253,25 +1253,28 @@ pub(super) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
         }
     }
 
-    let merge_output = std::process::Command::new("gh")
-        .args([
-            "pr",
-            "merge",
-            &pr.to_string(),
-            "--repo",
-            &repo,
-            "--admin",
-            "--squash",
-            "--delete-branch",
-        ])
-        .output();
-    match merge_output {
+    // #PR-Z site 3: the ONLY write — `gh pr merge` via ScmProvider. argv
+    // byte-identical (`pr merge <pr> --repo R --admin --squash
+    // --delete-branch`, pinned by scm::tests::pr_merge_args_match_existing_gh_call).
+    // MergeOutcome maps the original exit-status branches 1:1: Submitted =
+    // exit-0 (→ verify_merge_landed post-condition, unchanged; retry loop
+    // stays in that caller), Failed = non-zero (→ "gh pr merge failed" +
+    // raw stderr), Err = spawn failure (→ "failed to run gh: {e}").
+    match crate::scm::make_scm_provider(&repo, None).pr_merge(
+        &repo,
+        pr,
+        &crate::scm::MergeOpts {
+            admin: true,
+            squash: true,
+            delete_branch: true,
+        },
+    ) {
         // #1467: `gh pr merge` exit 0 is NECESSARY but not SUFFICIENT — a
         // merge-queue / branch-protection / eventual-consistency situation can
         // exit 0 without the PR actually landing (observed: cross-team PRs
         // reported merged:true while still OPEN, commits unpushed). Verify the
         // post-condition with `gh pr view` before claiming success.
-        Ok(o) if o.status.success() => match verify_merge_landed(&repo, pr) {
+        Ok(crate::scm::MergeOutcome::Submitted) => match verify_merge_landed(&repo, pr) {
             MergeVerdict::Confirmed(merge_commit) => json!({
                 "merged": true,
                 "pr": pr,
@@ -1297,13 +1300,17 @@ pub(super) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
                          before acting; do NOT blindly re-merge.",
             }),
         },
-        Ok(o) => {
+        Ok(crate::scm::MergeOutcome::Failed { stderr }) => {
             json!({
                 "error": "gh pr merge failed",
-                "stderr": String::from_utf8_lossy(&o.stderr).to_string(),
+                "stderr": stderr,
             })
         }
-        Err(e) => json!({"error": format!("failed to run gh: {e}")}),
+        // pr_merge's spawn-failure Err already carries "failed to run gh: …"
+        // (set in GitHubScmProvider::run), so surface it as-is — using
+        // `e.to_string()` reproduces the original `format!("failed to run
+        // gh: {e}")` exactly (no double prefix).
+        Err(e) => json!({"error": e.to_string()}),
     }
 }
 

@@ -13,13 +13,13 @@
 //! moved in verbatim (byte-identical argv), which is what makes the
 //! eventual call-site conversion behavior-preserving.
 //!
-//! Wiring is incremental: PR-A scaffold; PR-B sites 7 (`pr_list`) + 4
-//! (`pr_view`); PR-C sites 8 + 5 (`pr_view`) + 6 (`pr_checks`); **PR-D
-//! sites 1 (`pr_view`) + 2 (`pr_checks`) + 9 + 10 (`pr_list`, the latter
-//! via the new `cwd` param)**. Only the write verb (`pr_merge`, site 3)
-//! and the non-GitHub stubs remain unwired in non-test builds, so the
-//! module-wide `dead_code` allow stays until PR-Z reaches them.
-#![allow(dead_code)]
+//! Migration complete: PR-A scaffold; PR-B sites 7 (`pr_list`) + 4
+//! (`pr_view`); PR-C sites 8 + 5 (`pr_view`) + 6 (`pr_checks`); PR-D
+//! sites 1 (`pr_view`) + 2 (`pr_checks`) + 9 + 10 (`pr_list` + `cwd`);
+//! **PR-Z site 3 (`pr_merge`, the only write)**. All four verbs and the
+//! non-GitHub stubs (constructed by `make_scm_provider` for non-GitHub
+//! remotes) are now reachable, so the module-wide `dead_code` allow is
+//! gone.
 
 use serde_json::Value;
 use std::path::Path;
@@ -84,7 +84,7 @@ pub(crate) struct MergeOpts {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MergeOutcome {
     Submitted,
-    Failed { code: Option<i32>, stderr: String },
+    Failed { stderr: String },
 }
 
 /// Returned by non-GitHub providers so callers fail LOUD instead of an
@@ -359,8 +359,10 @@ impl ScmProvider for GitHubScmProvider {
             Ok(MergeOutcome::Submitted)
         } else {
             Ok(MergeOutcome::Failed {
-                code: out.status.code(),
-                stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+                // #PR-Z: NOT trimmed — site 3 (the sole caller) put the raw
+                // stderr in its error JSON (`.to_string()`); preserve that
+                // byte-for-byte.
+                stderr: String::from_utf8_lossy(&out.stderr).to_string(),
             })
         }
     }
@@ -644,10 +646,13 @@ mod tests {
 
     #[test]
     fn pr_merge_args_match_existing_gh_call() {
-        // site 3: --admin --squash --delete-branch.
+        // #PR-Z site-3 BYTE-IDENTICAL anchor: handle_merge_repo's only write
+        // emitted EXACTLY `gh pr merge <pr> --repo R --admin --squash
+        // --delete-branch` (verified via git show — flag ORDER is
+        // admin→squash→delete-branch, NOT reordered).
         assert_eq!(
             pr_merge_args(
-                "o/r",
+                "suzuke/agend-terminal",
                 7,
                 &MergeOpts {
                     admin: true,
@@ -660,7 +665,7 @@ mod tests {
                 "merge",
                 "7",
                 "--repo",
-                "o/r",
+                "suzuke/agend-terminal",
                 "--admin",
                 "--squash",
                 "--delete-branch",
@@ -670,6 +675,40 @@ mod tests {
         assert_eq!(
             pr_merge_args("o/r", 7, &MergeOpts::default()),
             vec!["pr", "merge", "7", "--repo", "o/r"]
+        );
+        // Per-flag MergeOpts → argv mapping (each flag independent).
+        assert_eq!(
+            pr_merge_args(
+                "o/r",
+                1,
+                &MergeOpts {
+                    admin: true,
+                    ..Default::default()
+                }
+            ),
+            vec!["pr", "merge", "1", "--repo", "o/r", "--admin"]
+        );
+        assert_eq!(
+            pr_merge_args(
+                "o/r",
+                1,
+                &MergeOpts {
+                    squash: true,
+                    ..Default::default()
+                }
+            ),
+            vec!["pr", "merge", "1", "--repo", "o/r", "--squash"]
+        );
+        assert_eq!(
+            pr_merge_args(
+                "o/r",
+                1,
+                &MergeOpts {
+                    delete_branch: true,
+                    ..Default::default()
+                }
+            ),
+            vec!["pr", "merge", "1", "--repo", "o/r", "--delete-branch"]
         );
     }
 
