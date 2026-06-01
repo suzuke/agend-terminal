@@ -435,6 +435,9 @@ fn run_core(
             configs: &ctx.configs,
         };
         crate::runtime_config::reload(home);
+        // #1339: operator-mode.json reloaded each tick — a mode change (via the
+        // `mode` MCP tool) propagates fleet-wide without a restart (reload-coherent).
+        crate::operator_mode::reload(home);
         per_tick::run_handlers_with_panic_guard(&handlers, &tick_ctx);
 
         let exit_event = match exit_event {
@@ -948,7 +951,7 @@ fn replay_missed_at_startup(home: &Path, registry: &AgentRegistry) {
         let reg = agent::lock_registry(registry);
         // #1441: registry is UUID-keyed; resolve target name via fleet.yaml.
         if let Some(handle) = crate::fleet::resolve_uuid(home, target).and_then(|id| reg.get(&id)) {
-            if let Err(e) = agent::inject_to_agent(handle, message.as_bytes()) {
+            if let Err(e) = agent::inject_to_agent(handle, message.as_bytes(), false) {
                 tracing::warn!(error = %e, "replay inject failed");
             }
         } else {

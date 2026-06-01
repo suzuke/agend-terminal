@@ -5,6 +5,7 @@
 //! registry and loopback-binding rules.
 
 use crate::agent::{self, AgentRegistry, ExternalRegistry};
+use anyhow::Context;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -15,6 +16,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 mod handlers;
+mod operator_gate;
 pub mod request_dedup;
 
 pub type ConfigRegistry = Arc<Mutex<HashMap<String, crate::daemon::AgentConfig>>>;
@@ -124,9 +126,15 @@ pub fn validate_working_directory(
     if path.components().any(|c| matches!(c, Component::ParentDir)) {
         anyhow::bail!("working_directory must not contain '..'");
     }
-    // Canonicalize to resolve symlinks
+    // Canonicalize to resolve symlinks. `dunce::canonicalize` (not
+    // `std::fs::canonicalize`) so that on Windows the returned path does NOT
+    // carry the `\\?\` UNC verbatim prefix: this value becomes the PTY cwd
+    // (agent::build_command -> cmd.cwd), and a `\\?\`-prefixed cwd makes
+    // cmd.exe-based backends warn "UNC paths are not supported" and silently
+    // fall back to C:\Windows (#893 — same prefix bug already fixed for the
+    // session-name encode path in backend::canonicalize_for_encode).
     let canonical = if path.exists() {
-        std::fs::canonicalize(path)
+        dunce::canonicalize(path)
             .map_err(|e| anyhow::anyhow!("working_directory canonicalize failed: {e}"))?
     } else {
         // Path doesn't exist yet (will be created) — use parent for validation
@@ -159,8 +167,11 @@ fn allowed_roots(home: &std::path::Path) -> Vec<std::path::PathBuf> {
 fn is_under_allowed_root(path: &std::path::Path, home: &std::path::Path) -> bool {
     let roots = allowed_roots(home);
     roots.iter().any(|root| {
-        // Canonicalize root too (home might be a symlink)
-        let canonical_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+        // Canonicalize root too (home might be a symlink). Use
+        // `dunce::canonicalize` to match the prefix form of `path` above —
+        // a `\\?\`-prefixed root vs a plain-prefixed path (or vice versa)
+        // would make `starts_with` spuriously fail on Windows (#893).
+        let canonical_root = dunce::canonicalize(root).unwrap_or_else(|_| root.clone());
         path.starts_with(&canonical_root)
     })
 }
@@ -182,6 +193,10 @@ pub mod method {
     pub const UPDATE_TEAM: &str = "update_team";
     pub const MOVE_PANE: &str = "move_pane";
     pub const SHUTDOWN: &str = "shutdown";
+    /// #1339: operator-only mode control. A DIRECT method (not the `mcp_tool`
+    /// tunnel) → the operator_gate treats it as the operator transport, so only
+    /// the operator CLI can reach it; agents (mcp_tool-only) cannot.
+    pub const MODE: &str = "mode";
     pub const SET_BLOCKED_REASON: &str = "set_blocked_reason";
     pub const CLEAR_BLOCKED_REASON: &str = "clear_blocked_reason";
     pub const MCP_TOOL: &str = "mcp_tool";
@@ -466,51 +481,65 @@ fn handle_session(
             home,
         };
 
-        let response = request_dedup::global().dispatch(
-            request_id,
-            request_dedup::method_wait_timeout(method, params),
-            || match method {
-                method::LIST => handlers::query::handle_list(params, &ctx),
-                method::INJECT => handlers::instance::handle_inject(params, &ctx),
-                method::KILL => handlers::instance::handle_kill(params, &ctx),
-                method::DELETE => handlers::instance::handle_delete(params, &ctx),
-                method::SPAWN => handlers::instance::handle_spawn(params, &ctx),
-                method::SEND => handlers::messaging::handle_send(params, &ctx),
-                method::STATUS => handlers::query::handle_status(params, &ctx),
-                method::REGISTER_EXTERNAL => {
-                    handlers::external::handle_register_external(params, &ctx)
-                }
-                method::DEREGISTER_EXTERNAL => {
-                    handlers::external::handle_deregister_external(params, &ctx)
-                }
-                method::CREATE_TEAM => handlers::team::handle_create_team(params, &ctx),
-                method::UPDATE_TEAM => handlers::team::handle_update_team(params, &ctx),
-                method::MOVE_PANE => handlers::instance::handle_move_pane(params, &ctx),
-                method::PANE_SNAPSHOT => handlers::instance::handle_pane_snapshot(params, &ctx),
-                method::TUI_SCREENSHOT => handlers::instance::handle_tui_screenshot(&ctx),
-                method::VERIFY_PUSH => handlers::verify_push::handle_verify_push(params),
-                method::SET_BLOCKED_REASON => {
-                    handlers::instance::handle_set_blocked_reason(params, &ctx)
-                }
-                method::CLEAR_BLOCKED_REASON => {
-                    handlers::instance::handle_clear_blocked_reason(params, &ctx)
-                }
-                method::MCP_TOOL => handlers::mcp_proxy::handle_mcp_tool(params, &ctx),
-                method::MCP_TOOLS_LIST => handlers::mcp_proxy::handle_mcp_tools_list(params, &ctx),
-                method::SHUTDOWN => {
-                    tracing::info!("API shutdown requested");
-                    // Sprint 57 Wave 3 PR-2 (#548 Q6): record API-shutdown
-                    // reason BEFORE flipping the flag so the shutdown
-                    // sequence sees the right taxonomy when it reads.
-                    crate::daemon::record_shutdown_reason(
-                        crate::daemon::ShutdownReason::ApiShutdown,
-                    );
-                    shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
-                    json!({"ok": true})
-                }
-                _ => json!({"ok": false, "error": format!("unknown method: {method}")}),
-            },
-        );
+        // #1339: single operator-mode authority gate. Covers every direct method
+        // AND the `mcp_tool` tunnel (all 36 tools) at the one ingress choke point.
+        // Operator-surface calls (no `instance`) are never denied; Active is a
+        // passthrough. A deny short-circuits before dispatch.
+        let response = if let Err(denied) =
+            operator_gate::check_operation_allowed(method, params, &crate::operator_mode::get())
+        {
+            json!({"ok": false, "error": denied, "denied_by": "operator_mode", "queued": true})
+        } else {
+            request_dedup::global().dispatch(
+                request_id,
+                request_dedup::method_wait_timeout(method, params),
+                || match method {
+                    method::LIST => handlers::query::handle_list(params, &ctx),
+                    method::INJECT => handlers::instance::handle_inject(params, &ctx),
+                    method::KILL => handlers::instance::handle_kill(params, &ctx),
+                    method::DELETE => handlers::instance::handle_delete(params, &ctx),
+                    method::SPAWN => handlers::instance::handle_spawn(params, &ctx),
+                    method::SEND => handlers::messaging::handle_send(params, &ctx),
+                    method::STATUS => handlers::query::handle_status(params, &ctx),
+                    method::REGISTER_EXTERNAL => {
+                        handlers::external::handle_register_external(params, &ctx)
+                    }
+                    method::DEREGISTER_EXTERNAL => {
+                        handlers::external::handle_deregister_external(params, &ctx)
+                    }
+                    method::CREATE_TEAM => handlers::team::handle_create_team(params, &ctx),
+                    method::UPDATE_TEAM => handlers::team::handle_update_team(params, &ctx),
+                    method::MOVE_PANE => handlers::instance::handle_move_pane(params, &ctx),
+                    method::PANE_SNAPSHOT => handlers::instance::handle_pane_snapshot(params, &ctx),
+                    method::TUI_SCREENSHOT => handlers::instance::handle_tui_screenshot(&ctx),
+                    method::VERIFY_PUSH => handlers::verify_push::handle_verify_push(params),
+                    method::SET_BLOCKED_REASON => {
+                        handlers::instance::handle_set_blocked_reason(params, &ctx)
+                    }
+                    method::CLEAR_BLOCKED_REASON => {
+                        handlers::instance::handle_clear_blocked_reason(params, &ctx)
+                    }
+                    method::MCP_TOOL => handlers::mcp_proxy::handle_mcp_tool(params, &ctx),
+                    method::MCP_TOOLS_LIST => {
+                        handlers::mcp_proxy::handle_mcp_tools_list(params, &ctx)
+                    }
+                    // #1339: operator-only mode control (operator transport).
+                    method::MODE => operator_gate::handle_mode_set(params, home),
+                    method::SHUTDOWN => {
+                        tracing::info!("API shutdown requested");
+                        // Sprint 57 Wave 3 PR-2 (#548 Q6): record API-shutdown
+                        // reason BEFORE flipping the flag so the shutdown
+                        // sequence sees the right taxonomy when it reads.
+                        crate::daemon::record_shutdown_reason(
+                            crate::daemon::ShutdownReason::ApiShutdown,
+                        );
+                        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+                        json!({"ok": true})
+                    }
+                    _ => json!({"ok": false, "error": format!("unknown method: {method}")}),
+                },
+            )
+        };
 
         let _ = writeln!(writer, "{}", response);
         let _ = writer.flush();
@@ -668,10 +697,27 @@ fn spawn_one(
 pub fn call(home: &Path, request: &Value) -> anyhow::Result<Value> {
     // #1492: self-IPC over the loopback socket. If the caller holds the
     // registry lock, the API handler servicing this call needs the same lock →
-    // deadlock. Debug builds panic here so any unit test hitting the bad path
-    // fails loudly; release builds compile this to a no-op.
-    crate::sync_audit::assert_no_registry_lock_for_self_ipc("api::call");
+    // deadlock. #1492-L2: the guard is always-on and fail-fast — on a violation
+    // it logs + returns `Err` here (in EVERY build, not just debug), so the
+    // deadlocking call is refused and the daemon stays live instead of freezing.
+    crate::sync_audit::assert_no_registry_lock_for_self_ipc("api::call")?;
     let stream = crate::ipc::connect_api(home)?;
+    // #1492 backstop (L3): bound every loopback read with a socket-level
+    // timeout. #1492-L2 made the guard above always-on + fail-fast (it now
+    // returns `Err` in every build, not just a debug panic), so a self-IPC made
+    // while holding the registry/core lock is refused before we ever reach this
+    // read. This timeout is the complementary containment net (defense-in-depth)
+    // for any future path that bypasses the guard: were such a read to block
+    // forever in `recvfrom` while holding the lock, it would freeze the whole
+    // TUI permanently. The timeout converts that into a recoverable error: the
+    // read fails, this call unwinds, the offending lock guard drops, and the
+    // waiting threads proceed.
+    // Generous default (covers the slowest legit method, create_instance ~60s);
+    // `AGEND_API_CALL_TIMEOUT_SECS` lets an operator shrink the recovery window.
+    let timeout = api_call_read_timeout();
+    stream
+        .set_read_timeout(Some(timeout))
+        .context("set api::call read timeout")?;
     let run = crate::daemon::find_active_run_dir(home)
         .ok_or_else(|| anyhow::anyhow!("no active daemon (run dir not found)"))?;
     let cookie = crate::auth_cookie::read_cookie(&run)?;
@@ -684,9 +730,41 @@ pub fn call(home: &Path, request: &Value) -> anyhow::Result<Value> {
     writer.flush()?;
 
     let mut line = String::new();
-    reader.read_line(&mut line)?;
+    if let Err(e) = reader.read_line(&mut line) {
+        if matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ) {
+            let method = request["method"].as_str().unwrap_or("<unknown>");
+            tracing::warn!(
+                method,
+                ?timeout,
+                "#1492: api::call read timed out — the loopback handler did not respond \
+                 in time. This is the self-IPC-deadlock backstop firing; the most likely \
+                 cause is a caller that invoked api::call while holding the registry/core \
+                 lock (drop the guard BEFORE the call — see docs/DAEMON-LOCK-ORDERING.md)."
+            );
+            anyhow::bail!("api::call ({method}) timed out after {timeout:?}");
+        }
+        return Err(e).context("api::call read response");
+    }
     let resp: Value = serde_json::from_str(line.trim())?;
     Ok(resp)
+}
+
+/// Read-response timeout for [`call`]. Defaults to 90s — comfortably above the
+/// slowest legitimate daemon method (`create_instance`, whose own budget is
+/// ~60s) so a genuine slow call never trips the backstop, while still bounding a
+/// wedged self-IPC instead of blocking forever. Overridable via
+/// `AGEND_API_CALL_TIMEOUT_SECS` to shrink the deadlock-recovery window (values
+/// <1 are clamped to 1s).
+fn api_call_read_timeout() -> std::time::Duration {
+    let secs = std::env::var("AGEND_API_CALL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|v| v.max(1))
+        .unwrap_or(90);
+    std::time::Duration::from_secs(secs)
 }
 
 #[cfg(test)]
@@ -727,6 +805,35 @@ mod tests {
         std::fs::create_dir_all(&ok).expect("create dir");
         let resolved = validate_working_directory(&ok, &home).expect("normal path must validate");
         assert!(resolved.ends_with("agent"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Windows-only #893 regression: the path returned by
+    /// `validate_working_directory` becomes the PTY cwd
+    /// (`agent::build_command` -> `cmd.cwd`). It MUST NOT carry the `\\?\`
+    /// UNC verbatim prefix that `std::fs::canonicalize` returns on Windows —
+    /// a `\\?\`-prefixed cwd makes cmd.exe-based backends warn "UNC paths are
+    /// not supported" and fall back to C:\Windows. `dunce::canonicalize`
+    /// strips the prefix when safe; falling back to `std::fs::canonicalize`
+    /// here would re-introduce the bug. The validation must also still SUCCEED
+    /// (exercises `is_under_allowed_root`, which must canonicalize the root the
+    /// same way or the `starts_with` check would spuriously reject).
+    #[cfg(windows)]
+    #[test]
+    fn validate_work_dir_strips_verbatim_prefix_on_windows() {
+        let home = tmp_home("validate_verbatim");
+        let work = crate::paths::workspace_dir(&home).join("agent");
+        std::fs::create_dir_all(&work).expect("create dir");
+        let resolved = validate_working_directory(&work, &home)
+            .expect("existing path under home must validate");
+        let resolved_str = resolved.to_string_lossy();
+        assert!(
+            !resolved_str.starts_with(r"\\?\"),
+            "validate_working_directory must strip the Windows `\\\\?\\` verbatim \
+             prefix (got {resolved_str:?}); this path becomes the PTY cwd and a \
+             `\\\\?\\` cwd breaks cmd.exe-based backends — keep dunce::canonicalize, \
+             do not fall back to std::fs::canonicalize"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -775,6 +882,27 @@ mod tests {
             "unexpected error: {msg}"
         );
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn api_call_read_timeout_default_override_and_clamp() {
+        // #1492 backstop: the loopback read timeout that converts a wedged
+        // self-IPC from a permanent daemon freeze into a recoverable error.
+        std::env::remove_var("AGEND_API_CALL_TIMEOUT_SECS");
+        assert_eq!(
+            api_call_read_timeout(),
+            std::time::Duration::from_secs(90),
+            "default must exceed the slowest legit method (create_instance ~60s)"
+        );
+        std::env::set_var("AGEND_API_CALL_TIMEOUT_SECS", "5");
+        assert_eq!(api_call_read_timeout(), std::time::Duration::from_secs(5));
+        std::env::set_var("AGEND_API_CALL_TIMEOUT_SECS", "0");
+        assert_eq!(
+            api_call_read_timeout(),
+            std::time::Duration::from_secs(1),
+            "sub-1s values clamp to 1s — never a zero/instant timeout"
+        );
+        std::env::remove_var("AGEND_API_CALL_TIMEOUT_SECS");
     }
 
     // -----------------------------------------------------------------------

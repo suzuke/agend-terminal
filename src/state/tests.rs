@@ -735,10 +735,13 @@ fn claude_permission_prompt_dialog_match() {
         Some(AgentState::PermissionPrompt),
         "dialog footer must fire PermissionPrompt",
     );
-    assert_eq!(
+    // #1546: the bare "Do you want to …" question prefix is NO LONGER an anchor
+    // (it false-positived on prose / pasted docs / test content). It must NOT
+    // fire PermissionPrompt on its own.
+    assert_ne!(
         patterns.detect("Do you want to create /tmp/out.txt?"),
         Some(AgentState::PermissionPrompt),
-        "dialog question prefix must fire PermissionPrompt",
+        "#1546: bare 'Do you want to …' prose must NOT fire PermissionPrompt",
     );
     assert_eq!(
         patterns.detect("   2. Yes, allow all edits during this session (shift+tab)"),
@@ -748,23 +751,40 @@ fn claude_permission_prompt_dialog_match() {
 }
 
 #[test]
-fn permission_prompt_legacy_wording_still_matches() {
-    let cases: &[(Backend, &[&str])] = &[
-        (
-            Backend::ClaudeCode,
-            &["Allow once", "Allow always", "approve"],
-        ),
-        (Backend::Codex, &["Request approval", "approve", "deny"]),
-    ];
-    for (backend, samples) in cases {
-        let patterns = StatePatterns::for_backend(backend);
-        for sample in *samples {
-            assert_eq!(
-                patterns.detect(sample),
-                Some(AgentState::PermissionPrompt),
-                "{backend:?} legacy wording {sample:?} must still fire PermissionPrompt",
-            );
-        }
+fn codex_permission_chrome_anchor_1559() {
+    // #1559 (cross-backend of #1546): codex PermissionPrompt keys on the
+    // live-dialog CHROME (header + footer) + the one distinctive, non-prose
+    // option (`No, and tell Codex what to do differently`) — each fires alone.
+    // The prose-echoable bare words (`Request approval`, `approve`, `deny`, bare
+    // `Yes, proceed`) were CUT: they content-FP'd on a reviewer's prose /
+    // quoted approval discussion (and `approve|deny|Request approval` never
+    // matched real codex anyway — fixture commit e0716ec).
+    let patterns = StatePatterns::for_backend(&Backend::Codex);
+    // The three real-dialog anchors — each must fire on its own (FN-safety:
+    // an approval frame is caught even if one line is off-screen).
+    for anchor in [
+        "Would you like to run the following command?",
+        "Press enter to confirm or esc to cancel",
+        "› 3. No, and tell Codex what to do differently (esc)",
+    ] {
+        assert_eq!(
+            patterns.detect(anchor),
+            Some(AgentState::PermissionPrompt),
+            "codex dialog anchor {anchor:?} must fire PermissionPrompt",
+        );
+    }
+    // FP-block: bare approval words in prose (NOT a live dialog) must NOT fire.
+    for prose in [
+        "I'll approve this PR once CI is green",
+        "Yes, proceed with the merge",
+        "the reviewer will deny the request",
+        "Request approval from the lead before merging",
+    ] {
+        assert_ne!(
+            patterns.detect(prose),
+            Some(AgentState::PermissionPrompt),
+            "#1559: bare approval prose {prose:?} must NOT fire PermissionPrompt",
+        );
     }
 }
 
@@ -846,8 +866,9 @@ fn auth_error_instant_transition() {
 #[test]
 fn permission_prompt_higher_than_thinking() {
     let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Thinking, 0);
-    // PermissionPrompt (priority 8) > Thinking (priority 6) — instant
-    t.feed("Allow once");
+    // PermissionPrompt (priority 8) > Thinking (priority 6) — instant.
+    // #1546: trigger via the chrome footer (the new anchor), not bare "Allow once".
+    t.feed("Esc to cancel · Tab to amend");
     assert_eq!(t.get_state(), AgentState::PermissionPrompt);
 }
 
@@ -903,17 +924,30 @@ fn set_awaiting_operator_from_starting() {
 }
 
 #[test]
+fn set_awaiting_operator_fires_from_runtime_prompt_states() {
+    // #1552: a mid-task stall on a permission/interactive prompt must be able
+    // to escalate to AwaitingOperator (was Starting-only before).
+    for s in [AgentState::PermissionPrompt, AgentState::InteractivePrompt] {
+        let mut t = tracker_at(&Backend::ClaudeCode, s, 10);
+        t.set_awaiting_operator();
+        assert_eq!(
+            t.current,
+            AgentState::AwaitingOperator,
+            "runtime prompt state {s:?} must escalate"
+        );
+    }
+}
+
+#[test]
 fn set_awaiting_operator_noop_from_non_starting() {
-    // Only Starting transitions. All other states (including Ready) are
-    // no-ops so late-firing tick-loop detections can't corrupt a healthy
-    // mid-task agent. Known interactive prompts from Ready are caught
-    // by pattern-based detection, not this time-based fallback.
+    // #1552: only Starting + the runtime prompt states (PermissionPrompt /
+    // InteractivePrompt) transition. Every OTHER state is a no-op so a late
+    // tick-loop detection can't corrupt a healthy mid-task agent.
     for s in [
         AgentState::Ready,
         AgentState::Idle,
         AgentState::Thinking,
         AgentState::ToolUse,
-        AgentState::PermissionPrompt,
         AgentState::AwaitingOperator,
         AgentState::Crashed,
     ] {
@@ -1277,22 +1311,29 @@ fn codex_tooluse_does_not_false_positive_on_spinner_or_narration() {
 
 #[test]
 fn codex_permission_prompt_dialog_match() {
-    // Codex 0.120.0 approval dialog — header, every option, and
-    // footer must all fire PermissionPrompt. Observed in
-    // codex-perm.raw byte ~68K-90K.
+    // Codex 0.120.0 approval dialog. #1559: anchor on the live-dialog CHROME
+    // (header + footer) + the one distinctive option (`No, and tell Codex what
+    // to do differently`) — all three present in the real box (codex-perm.raw),
+    // each fires alone. The prose-echoable rows are NOT anchors.
     let patterns = StatePatterns::for_backend(&Backend::Codex);
-    for sample in [
+    for anchor in [
         "  Would you like to run the following command?",
-        "  1. Yes, proceed (y)",
-        "› 3. No, and tell Codex what to do differently (esc)",
         "  Press enter to confirm or esc to cancel",
+        "› 3. No, and tell Codex what to do differently (esc)",
     ] {
         assert_eq!(
-            patterns.detect(sample),
+            patterns.detect(anchor),
             Some(AgentState::PermissionPrompt),
-            "expected PermissionPrompt for {sample:?}"
+            "expected PermissionPrompt for anchor {anchor:?}"
         );
     }
+    // The prose-echoable option row alone (no chrome / no distinctive option)
+    // must NOT fire — `Yes, proceed` is dropped.
+    assert_ne!(
+        patterns.detect("  1. Yes, proceed (y)"),
+        Some(AgentState::PermissionPrompt),
+        "#1559: bare `Yes, proceed` option row must NOT fire PermissionPrompt on its own"
+    );
 }
 
 #[test]
@@ -1853,7 +1894,7 @@ fn heartbeat_fresh_overrides_permission_prompt() {
     // shows permission pattern → must NOT latch PermissionPrompt.
     let mut t = tracker_at(&Backend::KiroCli, AgentState::Thinking, 5);
     t.update_heartbeat(Duration::from_secs(10)); // 10s ago = fresh
-    t.feed("Allow this action y/n/t");
+    t.feed("shell requires approval");
     assert_ne!(
         t.get_state(),
         AgentState::PermissionPrompt,
@@ -1868,7 +1909,7 @@ fn stale_heartbeat_allows_permission_prompt() {
     // permission pattern → must latch PermissionPrompt normally.
     let mut t = tracker_at(&Backend::KiroCli, AgentState::Thinking, 5);
     t.update_heartbeat(Duration::from_secs(200)); // 200s ago > 120s
-    t.feed("Allow this action y/n/t");
+    t.feed("shell requires approval");
     assert_eq!(t.get_state(), AgentState::PermissionPrompt);
 }
 
@@ -1877,7 +1918,7 @@ fn no_heartbeat_allows_permission_prompt() {
     // Pin 3 — no heartbeat ever: default behavior preserved.
     let mut t = tracker_at(&Backend::KiroCli, AgentState::Thinking, 5);
     // last_heartbeat is None by default
-    t.feed("Allow this action y/n/t");
+    t.feed("shell requires approval");
     assert_eq!(t.get_state(), AgentState::PermissionPrompt);
 }
 
@@ -1950,8 +1991,10 @@ fn claude_spinner_verb_triggers_thinking() {
     let mut st = StateTracker::new(Some(&Backend::ClaudeCode));
     drive(&mut vt, &mut st, b"bypass permissions\r\n");
     assert_eq!(st.get_state(), AgentState::Ready);
-    // Claude spinner uses random verbs, not "Thinking"
-    drive(&mut vt, &mut st, b"Cogitating\xe2\x80\xa6\r\n");
+    // #1541: Claude spinner uses random verbs; the verb-agnostic structural
+    // anchor (sparkle glyph + `<verb>…`) must fire regardless of the verb.
+    // `\xe2\x9c\xbb` = ✻ (U+273B sparkle), `\xe2\x80\xa6` = … (U+2026).
+    drive(&mut vt, &mut st, b"\xe2\x9c\xbb Cogitating\xe2\x80\xa6\r\n");
     assert_eq!(
         st.get_state(),
         AgentState::Thinking,
@@ -3146,4 +3189,416 @@ fn pending_transitions_bounded_drops_oldest() {
         dropped as usize, overflow,
         "overflow count surfaced for the warn"
     );
+}
+
+// ── #1518: HIGH_FP error detection bounded to the live bottom-N tail ──
+
+#[test]
+fn matched_span_in_recent_tail_unit_1518() {
+    use super::{matched_span_in_recent_tail, ERROR_TAIL_SCAN_LINES};
+    let mut screen = String::from("ERR: boom\n");
+    for i in 0..(ERROR_TAIL_SCAN_LINES + 3) {
+        screen.push_str(&format!("line {i}\n"));
+    }
+    // The error is now above the last ERROR_TAIL_SCAN_LINES rows.
+    assert!(
+        !matched_span_in_recent_tail(&screen, "ERR: boom", ERROR_TAIL_SCAN_LINES),
+        "error scrolled above the tail → not in recent tail"
+    );
+    // A marker within the last N rows IS in the tail.
+    assert!(
+        matched_span_in_recent_tail(&screen, "line 7", ERROR_TAIL_SCAN_LINES),
+        "a marker in the last N rows is in the recent tail"
+    );
+    assert!(
+        !matched_span_in_recent_tail(&screen, "", ERROR_TAIL_SCAN_LINES),
+        "empty match is never in tail"
+    );
+}
+
+#[test]
+fn high_fp_error_only_fires_within_live_tail_1518() {
+    // #1518: a HIGH_FP ServerRateLimit line visible in the live bottom rows fires
+    // the error state; the SAME line scrolled above the live tail (pushed up by
+    // the agent's post-recovery output) must NOT — that level-triggered re-match
+    // was the retry-storm root. Text-path (`feed`) so the #1450 red anchor
+    // fail-opens (no fg mask) and we test the POSITION gate in isolation.
+    // RateLimit is HIGH_FP; the string is the canonical ClaudeCode trigger.
+    let err = "API Error: Request rejected (429) · this may be a temporary capacity issue";
+
+    // A: error in the live tail → RateLimit fires.
+    let mut a = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+    a.feed(err);
+    assert_eq!(
+        a.get_state(),
+        AgentState::RateLimit,
+        "error visible in the live tail must fire the HIGH_FP error state"
+    );
+
+    // B: SAME error scrolled above the bottom-N (ERROR_TAIL_SCAN_LINES rows of
+    // subsequent output below it) → suppressed (must NOT keep firing the error
+    // state). 20 lines clears the N=15 bound with margin.
+    let mut b = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+    let mut screen = format!("{err}\n");
+    for i in 0..20 {
+        screen.push_str(&format!("subsequent output line {i}\n"));
+    }
+    b.feed(&screen);
+    assert_ne!(
+        b.get_state(),
+        AgentState::RateLimit,
+        "#1518: error scrolled above the live tail must NOT keep firing the error state"
+    );
+}
+
+#[test]
+fn modal_prompt_above_live_tail_still_detected_1518() {
+    // reviewer-2 refinement: modal / interactive prompts are NOT HIGH_FP, so they
+    // keep FULL-screen scanning — a permission prompt that sits above the live
+    // streaming tail must still be detected (the bottom-N bound is error-only).
+    // (gate_on_heartbeat may relabel a fresh PermissionPrompt as Thinking; either
+    // way it is DETECTED, not suppressed/missed — the point of this test.)
+    // 20 streaming lines push the prompt above the bottom-N=15 error bound; a
+    // HIGH_FP marker this deep WOULD be suppressed, so detection here proves the
+    // bound is error-only.
+    // #1546: trigger via the chrome footer (the new zero-FP anchor), not the old
+    // bare "Do you want to …" string (cut as a false-positive source).
+    let mut st = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+    let mut screen = String::from("Esc to cancel · Tab to amend\n");
+    for i in 0..20 {
+        screen.push_str(&format!("streaming output {i}\n"));
+    }
+    st.feed(&screen);
+    assert!(
+        matches!(
+            st.get_state(),
+            AgentState::PermissionPrompt | AgentState::Thinking
+        ),
+        "#1518: a modal above the live tail must still be detected (full-screen, not bottom-N bounded), got {:?}",
+        st.get_state()
+    );
+}
+
+// ── #1541: verb-agnostic Claude thinking spinner anchor ─────────────────
+
+#[test]
+fn claude_thinking_anchor_is_verb_agnostic_1541() {
+    // The crux of #1541: spinner verbs roll randomly and were NOT in the old
+    // whitelist (Whisking / Julienning / Burrowing / Lollygagging are all new;
+    // `Churned` proves a past-tense verb in an ACTIVE spinner still counts).
+    // Each frame must fire Thinking so a heads-down agent never reads `idle`.
+    for frame in [
+        "✻ Whisking… (5s)",                         // sparkle glyph + elapsed tail
+        "✶ Churned… (12s · ↑ 2.1k tokens)",         // active past-tense verb + token counter
+        "· Julienning… (16m · thinking)",           // `·` glyph + minutes elapsed
+        "✳ Burrowing… (thinking with high effort)", // sparkle + non-elapsed tail
+        "Lollygagging…(running stop hook)",         // no glyph — Branch B `(running` tail
+    ] {
+        let mut st = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+        st.feed(frame);
+        assert_eq!(
+            st.get_state(),
+            AgentState::Thinking,
+            "#1541: unlisted-verb spinner {frame:?} must fire Thinking"
+        );
+    }
+}
+
+#[test]
+fn claude_thinking_anchor_rejects_prose_and_completion_1541() {
+    // False-positive guards the verb whitelist used to provide for free.
+    for frame in [
+        "Thinking...(7s)",          // prose: ASCII `...`, NOT U+2026
+        "Churned for 7m39s",        // completion: past-tense `for Xm Ys`, no `…`
+        "Let me think about this…", // prose: U+2026 but no glyph and no `(tail`
+    ] {
+        let mut st = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+        st.feed(frame);
+        assert_ne!(
+            st.get_state(),
+            AgentState::Thinking,
+            "#1541: {frame:?} must NOT be misread as Thinking"
+        );
+    }
+}
+
+#[test]
+fn claude_thinking_anchor_does_not_cross_backends_1541() {
+    // The sparkle anchor is Claude-scoped; a Claude spinner frame fed to other
+    // backends' pattern sets must not yield Thinking (each owns its own arm).
+    let claude_frame = "✻ Whisking… (5s)";
+    for backend in [Backend::Codex, Backend::Gemini, Backend::KiroCli] {
+        let detected = StatePatterns::for_backend(&backend).detect(claude_frame);
+        assert_ne!(
+            detected,
+            Some(AgentState::Thinking),
+            "#1541: claude sparkle anchor must not fire Thinking on {backend:?}"
+        );
+    }
+}
+
+// ── #1546: PermissionPrompt chrome-footer anchor (cut speculative bare strings) ──
+
+#[test]
+fn claude_permission_footer_anchor_1546() {
+    let p = StatePatterns::for_backend(&Backend::ClaudeCode);
+    // FN-preserved: the self-identifying chrome footer + the fully-specific
+    // allow-all-edits phrase still fire PermissionPrompt.
+    assert_eq!(
+        p.detect("Esc to cancel · Tab to amend"),
+        Some(AgentState::PermissionPrompt),
+        "footer chrome must fire PermissionPrompt"
+    );
+    assert_eq!(
+        p.detect("  2. Yes, allow all edits during this session (shift+tab)"),
+        Some(AgentState::PermissionPrompt),
+        "allow-all-edits phrase must fire PermissionPrompt"
+    );
+    // #1546 trust follow-up: the trust-folder dialog uses a DIFFERENT footer
+    // (`Enter to confirm · Esc to cancel`) — its own chrome anchor.
+    assert_eq!(
+        p.detect("Enter to confirm · Esc to cancel"),
+        Some(AgentState::PermissionPrompt),
+        "trust-folder footer must fire PermissionPrompt"
+    );
+    // FP-safe: a partial fragment that is NOT the full footer chrome must not fire.
+    assert_ne!(
+        p.detect("Press Enter to confirm your email address"),
+        Some(AgentState::PermissionPrompt),
+        "#1546: bare 'Enter to confirm' prose must NOT false-fire PermissionPrompt"
+    );
+    // FP-fixed: the cut bare strings must NOT fire on prose / pasted content
+    // (this is the member-state + dispatch-idle bleed #1546 stops).
+    for prose in [
+        "Do you want to proceed with this edit?", // the #1518 modal fixture content
+        "I'll approve the PR once CI is green",   // 'approve' in prose
+        "Allow once you've reviewed it, then merge", // 'Allow once' in prose
+        "Should I Allow always, or just this time?", // 'Allow always' in prose
+    ] {
+        assert_ne!(
+            p.detect(prose),
+            Some(AgentState::PermissionPrompt),
+            "#1546: prose {prose:?} must NOT false-fire PermissionPrompt"
+        );
+    }
+    // The footer anchor is Claude-only — other backends don't borrow it.
+    for b in [Backend::Codex, Backend::Gemini, Backend::KiroCli] {
+        assert_ne!(
+            StatePatterns::for_backend(&b).detect("Esc to cancel · Tab to amend"),
+            Some(AgentState::PermissionPrompt),
+            "claude footer must not fire PermissionPrompt on {b:?}"
+        );
+    }
+}
+
+/// #1559: cross-backend permission patterns are chrome-anchored — the real
+/// dialog chrome fires PermissionPrompt, but the dropped FP-prone bare option
+/// words do NOT fire on prose. Pairs with the replay fixtures (which prove the
+/// chrome fires on the real captures); this pins the FP direction.
+#[test]
+fn cross_backend_permission_chrome_anchor_1559() {
+    // kiro: chrome header + footer fire; the old [docs] guess (a false negative)
+    // and any bare prose do not.
+    let kiro = StatePatterns::for_backend(&Backend::KiroCli);
+    assert_eq!(
+        kiro.detect("rm -rf / requires approval"),
+        Some(AgentState::PermissionPrompt),
+        "kiro header 'requires approval' must fire"
+    );
+    assert_eq!(
+        kiro.detect("ESC to close | Tab to edit"),
+        Some(AgentState::PermissionPrompt),
+        "kiro footer chrome must fire"
+    );
+    // the spinner footer (lowercase 'esc to cancel') must NOT be read as the
+    // permission footer.
+    assert_ne!(
+        kiro.detect("Thinking… (esc to cancel)"),
+        Some(AgentState::PermissionPrompt),
+        "kiro spinner footer must not fire PermissionPrompt"
+    );
+
+    // gemini: boxed header fires; bare 'suggest changes' prose does not.
+    let gemini = StatePatterns::for_backend(&Backend::Gemini);
+    assert_eq!(
+        gemini.detect("Allow execution of [Shell]?"),
+        Some(AgentState::PermissionPrompt),
+        "gemini boxed header must fire"
+    );
+    assert_ne!(
+        gemini.detect("I'll suggest changes to the PR after review"),
+        Some(AgentState::PermissionPrompt),
+        "#1559: bare 'suggest changes' prose must NOT fire PermissionPrompt"
+    );
+
+    // opencode: the option-row co-occurrence fires; single bare option words in
+    // prose (changelog / release-notes echo) do not.
+    let opencode = StatePatterns::for_backend(&Backend::OpenCode);
+    assert_eq!(
+        opencode.detect("┃ Allow once   Allow always   Reject"),
+        Some(AgentState::PermissionPrompt),
+        "opencode option-row chrome must fire"
+    );
+    for prose in [
+        "Allow once you've reviewed it, then merge",
+        "Should I Allow always, or just this time?",
+    ] {
+        assert_ne!(
+            opencode.detect(prose),
+            Some(AgentState::PermissionPrompt),
+            "#1559: bare opencode option word in prose {prose:?} must NOT fire"
+        );
+    }
+}
+
+/// #1450 regression: a HIGH_FP pattern that matches but never renders red —
+/// e.g. an opencode pane statically displaying the source identifier
+/// `ContextOverflow` — must log the red-anchor suppression ONCE, not on every
+/// render tick. The gate is level-triggered (`feed_with_fg` re-runs detection
+/// each tick), so before the dedup this flooded the daemon log with 14k+
+/// identical WARN lines per incident — the symptom that buried the real signal
+/// during a freeze investigation. A changing line elsewhere on screen (which
+/// defeats `feed()`'s screen-hash dedup) must NOT re-open the floodgate, since
+/// the suppressed (state, matched, line) tuple is unchanged.
+#[test]
+#[tracing_test::traced_test]
+fn anchor_suppress_warn_deduped_across_ticks() {
+    let mut vt = VTerm::new(80, 24);
+    let mut st = StateTracker::new(Some(&Backend::OpenCode));
+    // Five renders: each scrolls a fresh counter line (new screen hash → passes
+    // feed()'s screen-hash dedup) while the non-red `ContextOverflow` line stays
+    // in the live tail, so the HIGH_FP match + red-anchor-fail fires every tick.
+    for i in 0..5 {
+        drive(
+            &mut vt,
+            &mut st,
+            format!("working tick {i}\r\nContextOverflow\r\n").as_bytes(),
+        );
+    }
+    logs_assert(|lines: &[&str]| {
+        let hits = lines.iter().filter(|l| l.contains("#1450")).count();
+        if hits == 1 {
+            Ok(())
+        } else {
+            Err(format!(
+                "#1450 red-anchor suppress WARN must be deduped to exactly one \
+                 across 5 identical-suppression ticks, got {hits}"
+            ))
+        }
+    });
+}
+
+// ── #1562 self-capture instrument ───────────────────────────────────
+//
+// Pure-additive diagnostic: when a known server-throttle phrase is on
+// screen but the classifier did NOT land on a retryable state, side-log
+// the (ANSI-colored) tail. These pin the three behaviors the lead spec
+// names — phrase + non-retryable → logged; classified ServerRateLimit →
+// skipped (no noise); no phrase → skipped — plus the scrollback gate and
+// the color reconstruction (the color-anchor diagnostic point).
+
+const THROTTLE_SCREEN: &str = "\
+some preamble line\n\
+Server is temporarily limiting requests (not your usage limit)\n\
+the agent kept going after the throttle\n";
+
+#[test]
+fn unclassified_throttle_logged_on_phrase_plus_nonretryable_state() {
+    // Throttle phrase present, classifier landed on Ready (the in-the-wild
+    // miss — e.g. anchor suppressed it / wording drifted) → capture.
+    let tail = unclassified_throttle_tail(AgentState::Ready, THROTTLE_SCREEN, &[]);
+    let tail = tail.expect("throttle phrase + non-retryable state must be captured");
+    assert!(
+        tail.contains("temporarily limiting requests"),
+        "captured tail must carry the throttle line, got: {tail:?}"
+    );
+}
+
+#[test]
+fn unclassified_throttle_skipped_when_classified_serverratelimit() {
+    // Classifier correctly recognized the throttle (auto-retry handles it)
+    // → nothing to diagnose → no side-log (keeps the instrument low-noise).
+    for state in [
+        AgentState::ServerRateLimit,
+        AgentState::RateLimit,
+        AgentState::ApiError,
+        AgentState::ContextFull,
+    ] {
+        assert!(
+            unclassified_throttle_tail(state, THROTTLE_SCREEN, &[]).is_none(),
+            "classified retryable state {state:?} must NOT be side-logged"
+        );
+    }
+}
+
+#[test]
+fn unclassified_throttle_skipped_without_phrase() {
+    // No known throttle phrase on screen → never logged, regardless of state.
+    let screen = "claude ready\n❯ awaiting input\n";
+    assert!(unclassified_throttle_tail(AgentState::Ready, screen, &[]).is_none());
+    assert!(unclassified_throttle_tail(AgentState::Thinking, screen, &[]).is_none());
+}
+
+#[test]
+fn unclassified_throttle_skipped_when_phrase_only_in_scrollback() {
+    // Throttle phrase scrolled up past the live bottom-N tail (the agent has
+    // moved on) → stale, not a current miss → not logged.
+    let mut screen =
+        String::from("Server is temporarily limiting requests (not your usage limit)\n");
+    for i in 0..(UNCLASSIFIED_TAIL_LINES + 5) {
+        screen.push_str(&format!("post-recovery output line {i}\n"));
+    }
+    assert!(
+        unclassified_throttle_tail(AgentState::Ready, &screen, &[]).is_none(),
+        "a throttle phrase only surviving in scrollback must NOT be logged"
+    );
+}
+
+#[test]
+fn ansi_colored_tail_marks_red_cells_and_aligns_past_newline() {
+    // fg is 1:1 with screen_text.chars() INCLUDING the '\n' separator (vterm
+    // emits a Default entry for it). Verify red cells reconstruct \x1b[31m and
+    // that alignment survives a newline.
+    // chars:  o k \n b a d   (indices 0..=5)
+    let screen = "ok\nbad";
+    let fg = vec![
+        CellFg::Default, // o
+        CellFg::Default, // k
+        CellFg::Default, // \n
+        CellFg::Red,     // b
+        CellFg::Red,     // a
+        CellFg::Default, // d
+    ];
+    let out = ansi_colored_tail(screen, &fg, 5);
+    assert!(
+        out.contains("\x1b[31mba"),
+        "red cells must emit SGR 31: {out:?}"
+    );
+    assert!(
+        out.contains("ok"),
+        "earlier (non-red) line must still render: {out:?}"
+    );
+    // Empty fg (text-only callers): tail captured without color, no panic.
+    let plain = ansi_colored_tail(screen, &[], 5);
+    assert!(plain.contains("bad") && !plain.contains("\x1b[31m"));
+}
+
+#[test]
+fn append_jsonl_appends_one_record_per_line() {
+    let dir = std::env::temp_dir().join("agend_1562_append_jsonl_test");
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("nested").join("unclassified_errors.jsonl");
+
+    append_jsonl(&path, &serde_json::json!({"backend": "codex", "n": 1})).expect("first append");
+    append_jsonl(&path, &serde_json::json!({"backend": "claude", "n": 2})).expect("second append");
+
+    let body = std::fs::read_to_string(&path).expect("read back jsonl");
+    let lines: Vec<&str> = body.lines().collect();
+    assert_eq!(lines.len(), 2, "one record per line");
+    let first: serde_json::Value = serde_json::from_str(lines[0]).expect("parse line 0");
+    let second: serde_json::Value = serde_json::from_str(lines[1]).expect("parse line 1");
+    assert_eq!(first["backend"], "codex");
+    assert_eq!(second["n"], 2);
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

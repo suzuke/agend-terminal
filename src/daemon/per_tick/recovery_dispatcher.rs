@@ -432,6 +432,13 @@ impl RecoveryDispatcherHandler {
     /// does NOT increment counter; state stays `Stage2Eligible` for
     /// next-tick retry). Telegram notify pre-emit per dev refinement A
     /// (Stages 2/3 fire telegram; Stage 1 silent on success).
+    ///
+    /// #1339 DAEMON-AUTONOMIC, GATE-EXEMPT BY DESIGN: the restart this triggers is
+    /// reached ONLY from the per-tick recovery state machine on an internal
+    /// trigger — a Hung-state detection (gated by `hang_auto_recovery_enabled`) —
+    /// never from the API socket. Daemon self-heal (a third trusted principal),
+    /// so the operator-mode gate does NOT apply: a hung agent is still recovered
+    /// in away/sleep. Not agent-invocable (an agent can at most hang ITSELF).
     fn handle_stage2_fire(
         &self,
         name: &str,

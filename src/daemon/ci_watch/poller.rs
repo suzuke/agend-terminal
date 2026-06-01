@@ -671,6 +671,32 @@ pub(crate) fn format_log_tail(
     }
 }
 
+/// CI-fail-notify checklist footer. Step 1 adapts to whether the daemon
+/// pre-fetched the failed-log tail (embedded above the checklist). When absent
+/// — the early-fail path fires mid-run so `--log-failed` is empty, or a fetch
+/// errored/timed out — point the reader at the manual command + the completion
+/// notification instead of a tail that isn't there (#1537 follow-up: the old
+/// unconditional "Read the failed-log tail above" was self-contradictory when
+/// no tail was attached).
+fn failure_checklist(run_id_str: &str, has_tail: bool) -> String {
+    let step1 = if has_tail {
+        format!("1. Read the failed-log tail above (full: `gh run view {run_id_str} --log-failed`)")
+    } else {
+        format!(
+            "1. Daemon did not attach a failed-log tail (the run may still be in progress) — \
+             fetch it with `gh run view {run_id_str} --log-failed` (the run-completion \
+             notification will also carry it)"
+        )
+    };
+    format!(
+        "\n\n⚠ CI failure checklist:\n\
+         {step1}\n\
+         2. If infra flake → `gh run rerun {run_id_str} --failed`\n\
+         3. If real failure → fix code, push, wait for green\n\
+         4. Do NOT dismiss without evidence"
+    )
+}
+
 pub(crate) fn build_inbox_body(
     headline: &str,
     conclusion: &str,
@@ -689,16 +715,14 @@ pub(crate) fn build_inbox_body(
         // agent doesn't need an extra `gh run view` round-trip. None → fall back
         // to the original instruction-only body. The full-log command stays in
         // the checklist footer below.
-        if let Some(tail) = log_tail.filter(|t| !t.is_empty()) {
-            body.push_str(&format!("\n\n── failed log (tail) ──\n{tail}"));
-        }
-        body.push_str(&format!(
-            "\n\n⚠ CI failure checklist:\n\
-             1. Read the failed-log tail above (full: `gh run view {run_id_str} --log-failed`)\n\
-             2. If infra flake → `gh run rerun {run_id_str} --failed`\n\
-             3. If real failure → fix code, push, wait for green\n\
-             4. Do NOT dismiss without evidence"
-        ));
+        let has_tail = match log_tail.filter(|t| !t.is_empty()) {
+            Some(tail) => {
+                body.push_str(&format!("\n\n── failed log (tail) ──\n{tail}"));
+                true
+            }
+            None => false,
+        };
+        body.push_str(&failure_checklist(&run_id_str, has_tail));
         body
     } else {
         format!(
@@ -868,22 +892,14 @@ async fn check_early_job_failures(
     if !all_running.is_empty() {
         body.push_str(&format!("\nStill running: {}", all_running.join(", ")));
     }
-    // CI-fail-notify: daemon pre-fetches the failed-log tail and embeds it inline
-    // (no extra `gh run view` round-trip for the agent). None → instruction only.
-    if let Some(tail) = provider
-        .fetch_failure_log_tail(ctx.repo, first_run_id, 120)
-        .await
-        .filter(|t| !t.is_empty())
-    {
-        body.push_str(&format!("\n\n── failed log (tail) ──\n{tail}"));
-    }
-    body.push_str(&format!(
-        "\n\n⚠ CI failure checklist:\n\
-         1. Read the failed-log tail above (full: `gh run view {first_run_id} --log-failed`)\n\
-         2. If infra flake → `gh run rerun {first_run_id} --failed`\n\
-         3. If real failure → fix code, push, wait for green\n\
-         4. Do NOT dismiss without evidence"
-    ));
+    // #1537 follow-up: the early-fail detector fires while the run is still in
+    // progress (other jobs running, see `all_running`), so `gh run view
+    // --log-failed` has nothing yet — skip the guaranteed-empty (20s-timeout-
+    // prone) pre-fetch here. The run-completion notification re-fires for this
+    // same failure WITH the tail (separate dedup state: this path writes only
+    // `early_fail_notified_sha`, not `last_notified_conclusion`), so the agent
+    // still receives the log. The no-tail checklist points there meanwhile.
+    body.push_str(&failure_checklist(&first_run_id.to_string(), false));
 
     let repo_branch_key = format!("{}@{}", ctx.repo, ctx.branch);
     let supersede_token = format!("ci-early-{sha_short}");

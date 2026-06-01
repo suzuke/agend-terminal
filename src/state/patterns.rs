@@ -126,16 +126,33 @@ impl StatePatterns {
                 // [measured] Claude 2.1.98 permission dialog renders as an
                 // Ink overlay with a distinctive footer — `Esc to cancel ·
                 // Tab to amend` — plus a `Do you want to …` question and
-                // `1. Yes / 2. Yes, allow all edits during this session /
-                // 3. No` options. Observed in tests/fixtures/state-replay/
-                // claude-perm.raw at byte ~9216. The previous pattern
-                // (`Allow once|Allow always|approve`) did not match any
-                // wording in this dialog. The footer line is the most
-                // specific anchor; the question prefix and allow-all-edits
-                // option cover variations where the footer is scrolled out.
+                // #1546: PermissionPrompt detection keys on the dialog's CHROME
+                // footer, not bare prose strings. The old alternation also matched
+                // `Do you want to ` / `approve` / `Allow once|always` ANYWHERE on
+                // screen — high false-positive: any prose / pasted doc / test
+                // content containing "Do you want to proceed…" or "approve"
+                // mis-fired PermissionPrompt, masking the live Thinking state and
+                // tripping dispatch-idle + member-state (recurring this session).
+                // Replaced with the self-identifying footer `Esc to cancel · Tab
+                // to amend` (zero-FP — never appears in prose), which operator
+                // capture confirmed is COMMON across edit AND mcp-tool permission
+                // dialogs (NOT edit-specific). `allow all edits during this
+                // session` is kept as a second, fully-specific phrase (also
+                // zero-FP). Same spirit as the #1541 verb-agnostic structural
+                // anchor; full-screen scan is safe (no bottom-N) because the
+                // footer is self-identifying. Replay-validated against
+                // claude-perm.raw (edit) + claude-mcp-perm.raw (mcp).
+                //
+                // #1546 trust follow-up: the trust-folder ("Quick safety check: Is
+                // this a project you … trust?") dialog uses a DIFFERENT footer —
+                // `Enter to confirm · Esc to cancel` (not `… Tab to amend`) — so it
+                // needs its own chrome alternation, also zero-FP. Operator capture
+                // (claude-trust-prompt.raw) confirmed the wording. Each permission
+                // TYPE carries a self-identifying footer; the anchor is the union.
+                // Claude-only.
                 (
                     AgentState::PermissionPrompt,
-                    r"Esc to cancel · Tab to amend|Do you want to |allow all edits during this session|Allow once|Allow always|approve",
+                    r"Esc to cancel · Tab to amend|allow all edits during this session|Enter to confirm · Esc to cancel",
                 ),
                 // Phase A Piece-1: git rebase/merge/cherry-pick conflict
                 // output is identical regardless of which CLI invoked git,
@@ -145,14 +162,6 @@ impl StatePatterns {
                 (
                     AgentState::GitConflict,
                     r"Automatic merge failed; fix conflicts|CONFLICT \(content\)|Resolve all conflicts manually|Failed to merge submodule|Failed to merge in",
-                ),
-                // [estimated] Ink render during processing
-                // [measured] Claude spinner uses random verbs (Cogitating,
-                // Bloviating, Transmuting, etc.) — not "Thinking". The
-                // `thought for Ns` anchor catches post-thinking summary.
-                (
-                    AgentState::Thinking,
-                    r"(?i)(Bloviating|Transmuting|Cogitating|Cooked|Brewed|Worked|Cogitated|Crunched|Brewing)|thought for [0-9]+s",
                 ),
                 // #1005 Phase A1: ToolUse = active tool execution, NOT
                 // historical completion record. Pre-fix regex matched
@@ -185,6 +194,48 @@ impl StatePatterns {
                 (
                     AgentState::ToolUse,
                     r"(?m)^(?:[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s+(?:Read|Bash|Edit|Write|Grep|Glob|Listing|Reading|Writing|Searching|Editing)|[✓●⏺]\s+(?:Listing|Reading|Writing|Searching|Editing))\b",
+                ),
+                // #1541: verb-AGNOSTIC structural anchor for the Claude thinking
+                // spinner. The old fix enumerated verbs (Cogitating, Bloviating,
+                // …) but Claude's spinner rolls a *random* gerund every run
+                // (Undulating, Julienning, Whisking, …). Any unlisted verb went
+                // undetected → the snapshot recorded `idle` for a busy agent →
+                // the dispatch-idle watchdog mis-fired. (claude-thinking.raw,
+                // verb `Undulating`, is exactly that miss: it used to replay
+                // `[starting, idle]` with no thinking at all.)
+                //
+                // ORDER: placed AFTER the ToolUse arm on purpose. Claude keeps
+                // the sparkle spinner animating WHILE a tool runs, so a tool
+                // frame (`⏺ Listing 1 directory…`) and a spinner frame
+                // (`✳ Burrowing…`) coexist on screen. detect_with_match is
+                // first-match-wins, so ToolUse must precede Thinking to stay
+                // detectable — this keeps #1541 orthogonal to #1005 (a spinner
+                // that is NOT a tool frame still falls through to Thinking).
+                //
+                // [measured] the spinner renders `<glyph> <Verb>… (<elapsed> · …)`
+                // where:
+                //   - <glyph> rolls through the SPARKLE family (✻ ✢ ✶ ✳ ✽) and
+                //     also `*` / `·` — it animates, so do NOT hard-enumerate it.
+                //     (NB: this is sparkle, NOT the braille `⠋⠙⠹` spinner — that
+                //     is ToolUse, the arm directly above.)
+                //   - <Verb>… ends in U+2026 (`…`), never the ASCII `...`.
+                //   - the tail is usually ` (16m · thinking)` / ` (21m · ↑ N
+                //     tokens)` (minutes OR seconds), occasionally `(running stop
+                //     hook)`, occasionally absent.
+                //
+                // Anchor = U+2026 AND (leading sparkle/`*` glyph OR a structural
+                // `(elapsed|running` tail). That double requirement is the prose
+                // false-positive guard the verb list used to provide:
+                //   - `Let me think…`         → U+2026 but no glyph/tail   → no
+                //   - `Thinking...(7s)`       → ASCII `...`, not U+2026    → no
+                //   - `Churned for 7m39s`     → past-tense completion, no `…` → no
+                // `thought for Ns` stays a separate alternation (post-thinking
+                // summary line has no spinner glyph). Backend-scoped to Claude —
+                // codex/kiro/gemini keep their own arms (cross-backend negative
+                // test in src/state/tests.rs).
+                (
+                    AgentState::Thinking,
+                    r"(?i)[✻✢✶✳✽*·]\s*\w+\x{2026}|\w+\x{2026}\s*\((?:\d+[smh]|running )|thought for [0-9]+s",
                 ),
                 // [measured] Prompt symbol in idle state
                 (AgentState::Idle, r"❯"),
@@ -233,8 +284,23 @@ impl StatePatterns {
                     AgentState::ContextFull,
                     r"context window overflow|compacting context",
                 ),
-                // [docs] Trust-based permission system
-                (AgentState::PermissionPrompt, r"Allow this action|y/n/t"),
+                // #1559: kiro permission dialog chrome (operator capture
+                // kiro-perm.raw, 2026-06-01). The prior [docs] guess
+                // `Allow this action|y/n/t` was a FALSE NEGATIVE — it matched
+                // NONE of the real dialog. The live frame renders a header
+                // `<cmd> requires approval`, options `Yes, single permission` /
+                // `Trust, always allow in this session` / `No (Tab to edit)`,
+                // and a self-identifying footer `ESC to close | Tab to edit`.
+                // Anchor the header + footer chrome (zero-FP; prose never emits
+                // the boxed footer). Distinct from the spinner footer
+                // `Thinking… (esc to cancel)` (lowercase `esc to cancel`, not
+                // this). Pair with `gate_on_heartbeat` (alive→Thinking) + the
+                // #1552 live-bottom-N escalation gate so a scrollback echo can't
+                // FP into a false operator buzz.
+                (
+                    AgentState::PermissionPrompt,
+                    r"requires approval|ESC to close \| Tab to edit",
+                ),
                 // Phase A Piece-1: git conflict output (backend-independent).
                 (
                     AgentState::GitConflict,
@@ -302,22 +368,35 @@ impl StatePatterns {
                 ),
                 // [docs] Context overflow error
                 (AgentState::ContextFull, r"ContextOverflow"),
-                // [measured] Codex 0.120.0 renders approval dialogs with
-                // a distinctive header (`Would you like to run the
-                // following command?`), three numbered options starting
-                // with `Yes, proceed` and ending with `No, and tell
-                // Codex what to do differently`, plus a footer
-                // (`Press enter to confirm or esc to cancel`). Observed
-                // in tests/fixtures/state-replay/codex-perm.raw at byte
-                // ~68K through dismissal at ~90K. The prior pattern
-                // (`Request approval|approve|deny`) never matched any
-                // of the wording. `approve|deny` retained for legacy
-                // and adjacent docs wording; the new alternations cover
-                // the real dialog text. Header + footer are long enough
-                // to avoid false positives on narration lines.
+                // [measured] Codex 0.120.0 renders its approval dialog with a
+                // distinctive header (`Would you like to run the following
+                // command?`), a footer (`Press enter to confirm or esc to
+                // cancel`), and the distinctive option `No, and tell Codex what
+                // to do differently`. All three observed in the one captured
+                // surface, tests/fixtures/state-replay/codex-perm.raw.
+                //
+                // #1559 (cross-backend of #1546): anchor on the live-dialog
+                // CHROME + that one distinctive option; DROP the prose-echoable
+                // bare words `approve`, `deny`, `Request approval`, and bare
+                // `Yes, proceed`. Those content-FP'd — a codex reviewer agent
+                // writing "approve this PR" / "Yes, proceed with the merge", or a
+                // pane quoting an approval discussion, would falsely read as a
+                // live PermissionPrompt.
+                //
+                // FN-safety (answering the #1567 review): dropping
+                // `Request approval|approve|deny` is provably FN-free — they were
+                // a [docs] guess that NEVER matched real codex 0.120.0 (fixture
+                // commit e0716ec: "pattern `Request approval|approve|deny`
+                // doesn't match the actual escalation wording … Neither recording
+                // fires PermissionPrompt"). The kept header + footer +
+                // `No, and tell Codex what to do differently` are three
+                // independent, non-prose anchors from the real dialog, so an
+                // approval frame is detected even if one line is off-screen.
+                // Pair with the #1546/#1552 live-bottom-N position gate so even
+                // the chrome can't FP from a scrollback echo.
                 (
                     AgentState::PermissionPrompt,
-                    r"Would you like to run the following command\?|Yes, proceed|No, and tell Codex|Press enter to confirm or esc to cancel|Request approval|approve|deny",
+                    r"Would you like to run the following command\?|Press enter to confirm or esc to cancel|No, and tell Codex what to do differently",
                 ),
                 // Phase A Piece-1: git conflict output (backend-independent).
                 (
@@ -388,10 +467,28 @@ impl StatePatterns {
                 ),
                 // [docs] Context overflow
                 (AgentState::ContextFull, r"ContextOverflow"),
-                // [docs] Permission UI
+                // #1559: opencode permission dialog chrome (operator capture
+                // opencode-perm.raw 1.15.10, 2026-06-01). The prior [docs]
+                // alternation kept the bare option words `Allow once` /
+                // `Allow always`, which echo in changelogs / release-notes /
+                // permission-docs scrollback → content-FP.
+                //
+                // Capture finding (replay-validated): opencode's TUI renders the
+                // boxed `Permission required` HEADER above the live bottom rows
+                // (heavy synchronized-output + Kitty-graphics framing) — it does
+                // NOT land in the bottom-N grid the detector scans. What DOES
+                // render on one line is the OPTION ROW
+                // `Allow once   Allow always   Reject`. Anchor that co-occurrence
+                // (all three options contiguous) — it is self-identifying
+                // (no prose / changelog emits the three option labels in
+                // sequence), so it keeps the bare-single-word FP closed while
+                // still firing on the real dialog. Keep `Permission required`
+                // too (fires if a future/larger pane DOES surface the header).
+                // Pair with `gate_on_heartbeat` + the #1552 live-bottom-N
+                // escalation gate against any residual scrollback echo.
                 (
                     AgentState::PermissionPrompt,
-                    r"Permission required|Allow once|Allow always",
+                    r"Permission required|Allow once\s+Allow always\s+Reject",
                 ),
                 // Phase A Piece-1: git conflict output (backend-independent).
                 (
@@ -498,11 +595,19 @@ impl StatePatterns {
                 ),
                 // [docs] Token/quota limit
                 (AgentState::ContextFull, r"quota.*exceeded|token.*limit"),
-                // [docs] Permission select options
-                (
-                    AgentState::PermissionPrompt,
-                    r"Allow once|Allow for this session|suggest changes",
-                ),
+                // #1559: gemini permission dialog chrome (operator capture
+                // gemini-perm.raw v0.44.1, 2026-06-01). The prior [docs]
+                // alternation `Allow once|Allow for this session|suggest changes`
+                // matched the real dialog but its bare `suggest changes` is
+                // ordinary code-review language (GitHub "suggest changes", any
+                // review/self-analysis pane) → high content-FP. The live frame
+                // is a boxed select: header `Allow execution of [<tool>]?` with
+                // numbered options `1. Allow once` / `2. Allow for this session` /
+                // `3. No, suggest changes (esc)`. Anchor the self-identifying
+                // boxed header `Allow execution of` (prose never asks "Allow
+                // execution of [X]?"); DROP the bare option words. Pair with
+                // `gate_on_heartbeat` + the #1552 live-bottom-N escalation gate.
+                (AgentState::PermissionPrompt, r"Allow execution of"),
                 // Phase A Piece-1: git conflict output (backend-independent).
                 (
                     AgentState::GitConflict,

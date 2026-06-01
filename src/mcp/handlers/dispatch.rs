@@ -424,6 +424,32 @@ pub(crate) fn dispatch_config(ctx: &HandlerCtx<'_>) -> Value {
     }
 }
 
+/// #1339: read the operator-mode (GET-ONLY for agents). `mode get` → current
+/// mode + delegate. SETTING the mode is operator-only and lives on the operator
+/// transport (`agend-terminal mode <active|away|sleep>` CLI → the direct `MODE`
+/// API method); the ingress gate blocks any agent `mode set` regardless, so this
+/// tool exposes read access only — agents observe the mode (e.g. to back off when
+/// the operator is away/asleep) but can never change operator authority.
+pub(crate) fn dispatch_mode(ctx: &HandlerCtx<'_>) -> Value {
+    match ctx.args["action"].as_str().unwrap_or("get") {
+        "get" => {
+            let s = crate::operator_mode::get();
+            json!({
+                "ok": true,
+                "mode": s.mode,
+                "delegate_to": s.delegate_to,
+                "delegate_scope": s.delegate_scope,
+            })
+        }
+        other => json!({
+            "error": format!(
+                "mode is read-only via MCP (action '{other}'); set the operator mode with the \
+                 `agend-terminal mode <active|away|sleep>` CLI (operator-only)"
+            )
+        }),
+    }
+}
+
 /// Parse human-friendly duration strings like "2h", "30m", "1h30m".
 /// A bare number without suffix is interpreted as **minutes**.
 fn parse_duration_secs(s: &str) -> Option<i64> {
@@ -531,9 +557,10 @@ mod tests {
                 "binding_state",
                 "gc_dry_run",
                 "tokens",
+                "mode",
             ]
         );
-        assert_eq!(crate::mcp::registry::all().len(), 35);
+        assert_eq!(crate::mcp::registry::all().len(), 36);
     }
 
     #[test]

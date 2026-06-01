@@ -17,7 +17,7 @@ pub(crate) fn all() -> &'static [ToolEntry] {
     &ALL_TOOLS
 }
 
-static ALL_TOOLS: [ToolEntry; 35] = [
+static ALL_TOOLS: [ToolEntry; 36] = [
     // ── Channel ──
     ToolEntry {
         name: "reply",
@@ -207,5 +207,11 @@ static ALL_TOOLS: [ToolEntry; 35] = [
         name: "tokens",
         definition: super::tools::def_tokens,
         handler: super::handlers::dispatch::dispatch_tokens,
+    },
+    // ── #1339: Operator mode ──
+    ToolEntry {
+        name: "mode",
+        definition: super::tools::def_mode,
+        handler: super::handlers::dispatch::dispatch_mode,
     },
 ];

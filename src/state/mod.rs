@@ -177,6 +177,15 @@ pub struct StateTracker {
     /// depth class as #1005 ToolUse oscillation guard. Cleared on
     /// non-matching feed so a genuine future Productive signal re-fires.
     last_productive_marker_hash: Option<u64>,
+    /// #1450: hash of the last emitted anchor-suppress WARN's
+    /// (state, matched, line_context). The HIGH_FP red-anchor gate is
+    /// level-triggered — it re-evaluates on every `feed()`, so a backend that
+    /// statically displays a phrase matching a HIGH_FP pattern but never renders
+    /// red (e.g. an opencode pane showing the source identifier
+    /// `"ContextOverflow")`) re-logged the suppression on every tick, flooding
+    /// the daemon log (14k+ identical lines/incident). Dedup on this hash so the
+    /// WARN fires once per distinct suppression, not once per render.
+    last_anchor_suppress_hash: Option<u64>,
     /// Hash of the last screen text fed to `feed()`. `None` before the first
     /// call. Used to skip re-detection when the screen hasn't changed —
     /// crucial for not resetting `last_output` on cursor-blink noise.
@@ -253,6 +262,24 @@ pub(crate) struct TransitionRecord {
 }
 
 const MARKER_SCAN_TAIL_LINES: usize = 5;
+
+/// #1518: bottom-N bound for HIGH_FP error re-judging. Detection is
+/// level-triggered (re-judged every feed), so an error string lingering
+/// anywhere in the viewport keeps re-firing the error state — a retry storm
+/// even after the agent has visually moved on. Bounding HIGH_FP re-matching to
+/// the bottom `ERROR_TAIL_SCAN_LINES` rows lets an error scroll out of the live
+/// tail and recover naturally (non-timer).
+///
+/// Value chosen from fixture evidence: across every canonical error recording
+/// in `tests/fixtures/state-replay/` (claude/gemini/kiro/opencode rate-limit,
+/// throttle, 429, usage-limit), a *fresh* error marker sits at depth 5–6 rows
+/// from the bottom (max 6). 15 clears that by >2× — generous headroom for
+/// multi-line / wrapped error bodies not in the fixtures — while still
+/// suppressing an error that newer content has pushed into the top portion of a
+/// typical 24–50 row viewport. Deliberately conservative: bias is toward NOT
+/// dropping a real error. Distinct from `MARKER_SCAN_TAIL_LINES` (a tighter
+/// structural-marker scan) — do not collapse the two.
+const ERROR_TAIL_SCAN_LINES: usize = 15;
 
 fn recent_screen_tail(screen_text: &str, n: usize) -> String {
     let lines: Vec<&str> = screen_text.lines().collect();
@@ -340,6 +367,23 @@ fn matched_span_has_red(screen_text: &str, matched: &str, fg: &[CellFg]) -> bool
     false
 }
 
+/// #1518: is the matched marker still visible in the live bottom-`n` rows? A
+/// HIGH_FP error phrase that has scrolled up past the tail (pushed there by the
+/// agent's post-recovery output) is stale — it must NOT keep re-firing the error
+/// transition every feed. Returns true iff `matched` occurs within the last `n`
+/// rows of `screen_text` (where the agent's current activity is); a copy that
+/// only survives in the scrolled-up region returns false → caller suppresses.
+fn matched_span_in_recent_tail(screen_text: &str, matched: &str, n: usize) -> bool {
+    if matched.is_empty() {
+        return false;
+    }
+    // Trim trailing blank rows so "bottom-N" tracks the last N lines of actual
+    // CONTENT (where the agent's cursor/activity is), not the blank padding the
+    // emulator leaves below the cursor on a not-yet-full screen — otherwise a
+    // single error line on an near-empty screen would look "scrolled out".
+    recent_screen_tail(screen_text.trim_end(), n).contains(matched)
+}
+
 /// #1450: the `fg` span of the FIRST on-screen occurrence of `matched`, for
 /// the suppress-path WARN diagnostic. Empty if not found / out of range.
 fn first_occurrence_span(screen_text: &str, matched: &str, fg: &[CellFg]) -> Vec<CellFg> {
@@ -350,6 +394,154 @@ fn first_occurrence_span(screen_text: &str, matched: &str, fg: &[CellFg]) -> Vec
     fg.get(start..end)
         .map(<[CellFg]>::to_vec)
         .unwrap_or_default()
+}
+
+/// #1562 self-capture instrument.
+///
+/// Distinctive, **low-FP** server-throttle / transient-error phrases drawn from
+/// the `ServerRateLimit` pattern set (`patterns.rs`). Used by the diagnostic
+/// side-log to detect "a known throttle phrase is on screen but the classifier
+/// did NOT land on a retryable state" — the exact in-the-wild miss #1562 is
+/// chasing. Deliberately a SUBSET of the regex alternations: only multi-word,
+/// prose-unlikely phrases are listed (bare `overloaded` / `429` / `api_error`
+/// are omitted because they're the HIGH_FP tokens that fire on dialectic prose,
+/// which would make this instrument noisy). Cheap `str::contains` only.
+const THROTTLE_DIAG_PHRASES: &[&str] = &[
+    "temporarily limiting requests",
+    "Overloaded errors",
+    "overloaded_error",
+    "Rate limited. Quick retry",
+    "rate_limit_error",
+    "API rate limited",
+    "API Error: 5",
+    "API Error: Request rejected (429)",
+    "hit a rate limit",
+];
+
+/// #1562: rows of the live tail captured into the diagnostic record. Matches
+/// the `ERROR_TAIL_SCAN_LINES` horizon so the captured context lines up with
+/// the bottom-N window the error gates actually look at.
+const UNCLASSIFIED_TAIL_LINES: usize = ERROR_TAIL_SCAN_LINES;
+
+/// #1562: states for which a server-throttle phrase IS the expected
+/// classification (the auto-retry path already handles them). When the
+/// classifier lands on one of these, the throttle phrase is correctly
+/// recognized → nothing to diagnose → no side-log (keeps the instrument
+/// low-noise). Anything else + a throttle phrase = the miss we want captured.
+fn is_throttle_retryable_state(state: AgentState) -> bool {
+    matches!(
+        state,
+        AgentState::ServerRateLimit
+            | AgentState::RateLimit
+            | AgentState::ApiError
+            | AgentState::ContextFull
+    )
+}
+
+/// #1562: a minimal SGR escape for a rendered [`CellFg`]. Reconstructs enough
+/// ANSI to make the captured tail re-renderable in a terminal so an operator
+/// can SEE whether the throttle line was red — the color-anchor hypothesis is
+/// the whole point of #1562's capture. Exact non-red hues are lossy (the vterm
+/// classifier collapses all reds into `CellFg::Red`), but the red/not-red
+/// signal — the only thing the anchor predicate keys on — is preserved exactly.
+fn sgr_for(c: CellFg) -> &'static str {
+    match c {
+        CellFg::Red => "\x1b[31m",
+        CellFg::Default | CellFg::Named => "\x1b[39m",
+        // Indexed / Rgb are non-red (the classifier already mapped reds to
+        // `Red`); a generic "other color" marker is enough for the diagnostic.
+        CellFg::Indexed(_) | CellFg::Rgb(_, _, _) => "\x1b[39m",
+    }
+}
+
+/// #1562: reconstruct the last `n` lines of `screen_text` WITH ANSI color, using
+/// the per-cell `fg` mask (aligned 1:1 with `screen_text.chars()`, see
+/// `char_span`). The result is a colored, re-renderable tail for the side-log.
+/// When `fg` is empty (text-only callers) every cell maps to Default → the tail
+/// is captured without color, which is correct (no color was supplied).
+fn ansi_colored_tail(screen_text: &str, fg: &[CellFg], n: usize) -> String {
+    // Pair each char with its rendered fg, splitting on newlines (the '\n'
+    // itself carries no cell).
+    let mut lines: Vec<Vec<(char, CellFg)>> = vec![Vec::new()];
+    for (i, ch) in screen_text.chars().enumerate() {
+        if ch == '\n' {
+            lines.push(Vec::new());
+        } else {
+            let color = fg.get(i).copied().unwrap_or(CellFg::Default);
+            lines
+                .last_mut()
+                .expect("non-empty by construction")
+                .push((ch, color));
+        }
+    }
+    let start = lines.len().saturating_sub(n);
+    let mut out = String::new();
+    for line in &lines[start..] {
+        let mut cur: Option<CellFg> = None;
+        for &(ch, color) in line {
+            if cur != Some(color) {
+                out.push_str(sgr_for(color));
+                cur = Some(color);
+            }
+            out.push(ch);
+        }
+        out.push_str("\x1b[0m");
+        out.push('\n');
+    }
+    out
+}
+
+/// #1562: the pure decision behind the self-capture instrument — no IO, no env.
+///
+/// Returns `Some(raw_tail)` (ANSI-colored, last [`UNCLASSIFIED_TAIL_LINES`]
+/// rows) iff ALL hold:
+/// 1. a known throttle phrase ([`THROTTLE_DIAG_PHRASES`]) is on screen,
+/// 2. `current` is NOT a retryable throttle state
+///    ([`is_throttle_retryable_state`]) — i.e. the classifier MISSED it, and
+/// 3. the phrase is in the LIVE bottom-N tail (not just scrolled-up scrollback).
+///
+/// `None` otherwise. The order is chosen so the common no-phrase case
+/// fast-rejects on a single allocation-free `str::contains` scan.
+fn unclassified_throttle_tail(
+    current: AgentState,
+    screen_text: &str,
+    fg: &[CellFg],
+) -> Option<String> {
+    // Fast reject (no allocation): no known throttle phrase anywhere.
+    let phrase = THROTTLE_DIAG_PHRASES
+        .iter()
+        .copied()
+        .find(|p| screen_text.contains(p))?;
+    // Classifier landed on a retryable state → throttle phrase was correctly
+    // recognized (auto-retry handles it). Nothing to diagnose → no noise.
+    if is_throttle_retryable_state(current) {
+        return None;
+    }
+    // Require the phrase in the LIVE bottom-N tail — a copy that only survives
+    // in scrolled-up scrollback is stale, not a current miss.
+    let tail = recent_screen_tail(screen_text.trim_end(), UNCLASSIFIED_TAIL_LINES);
+    if !tail.contains(phrase) {
+        return None;
+    }
+    Some(ansi_colored_tail(screen_text, fg, UNCLASSIFIED_TAIL_LINES))
+}
+
+/// #1562: best-effort append of one JSON record as a single `line\n` to `path`,
+/// creating parent dirs / the file as needed. Returns `Err` for the caller to
+/// log; never panics. The single small `write_all` relies on `O_APPEND`
+/// atomicity so concurrent appenders don't interleave within a record.
+fn append_jsonl(path: &std::path::Path, record: &serde_json::Value) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut line = serde_json::to_string(record).map_err(std::io::Error::other)?;
+    line.push('\n');
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    f.write_all(line.as_bytes())
 }
 
 impl StateTracker {
@@ -416,6 +608,7 @@ impl StateTracker {
             last_output: Instant::now(),
             last_productive_output: Instant::now(),
             last_productive_marker_hash: None,
+            last_anchor_suppress_hash: None,
             last_screen_hash: None,
             patterns: backend.map(StatePatterns::for_backend),
             interactive_prompt_pending_notice: false,
@@ -571,12 +764,39 @@ impl StateTracker {
             // was supplied (text-only callers).
             match patterns.detect_with_match(screen_text) {
                 Some((detected, matched)) => {
-                    if self.anchor_on_red
-                        && is_high_fp_state(detected)
+                    let high_fp = is_high_fp_state(detected);
+                    // #1450 red anchor: a HIGH_FP marker needs at least one red
+                    // rendered cell, else it's prose ("Error: ...") not a state.
+                    let anchor_fail = self.anchor_on_red
+                        && high_fp
                         && !fg.is_empty()
-                        && !matched_span_has_red(screen_text, matched, fg)
-                    {
-                        self.log_anchor_suppress(detected, matched, screen_text, fg);
+                        && !matched_span_has_red(screen_text, matched, fg);
+                    // #1518 position gate: a HIGH_FP marker that has scrolled out
+                    // of the live bottom-N rows (e.g. an ApiError / ServerRateLimit
+                    // line pushed up by the post-recovery `continue` output) is
+                    // stale — the agent has moved on, so it must NOT keep re-firing
+                    // the error transition (the level-triggered re-match that drove
+                    // the retry storm). Scoped to HIGH_FP/error states ONLY:
+                    // Ready/Idle and modal/interactive prompts keep full-screen
+                    // scanning, because a modal can legitimately sit above the tail.
+                    let stale_position = high_fp
+                        && !matched_span_in_recent_tail(
+                            screen_text,
+                            matched,
+                            ERROR_TAIL_SCAN_LINES,
+                        );
+                    if anchor_fail || stale_position {
+                        if anchor_fail {
+                            self.log_anchor_suppress(detected, matched, screen_text, fg);
+                        } else {
+                            tracing::debug!(
+                                target: "state_detection",
+                                agent = %self.instance_name,
+                                state = ?detected,
+                                tail_rows = ERROR_TAIL_SCAN_LINES,
+                                "#1518: HIGH_FP marker scrolled out of the live tail — suppressing stale error transition"
+                            );
+                        }
                         // Treat as no detection — fall through to
                         // structural fallback / latch maintenance.
                         if matches!(self.current, AgentState::Starting)
@@ -609,6 +829,13 @@ impl StateTracker {
                 }
             }
         }
+
+        // #1562 self-capture instrument: pure-additive diagnostic. If a known
+        // server-throttle phrase is on screen but the classifier did NOT land
+        // on a retryable state, side-log the colored tail so the in-the-wild
+        // miss can be diagnosed. Zero behavior change (runs AFTER classify,
+        // never touches `self.current`/retry).
+        self.capture_unclassified_throttle(screen_text, fg);
 
         // Sprint 27 shadow-mode: log behavioral signal alongside regex state.
         // Zero state change — telemetry only. Phase 2 (Sprint 28+) promotes
@@ -718,17 +945,28 @@ impl StateTracker {
     /// the predicate) from "genuinely not red" (correct suppression)
     /// straight from the logs — no DEBUG rebuild.
     fn log_anchor_suppress(
-        &self,
+        &mut self,
         detected: AgentState,
         matched: &str,
         screen_text: &str,
         fg: &[CellFg],
     ) {
-        let span_fg: Vec<CellFg> = first_occurrence_span(screen_text, matched, fg);
         let line_context = screen_text
             .lines()
             .find(|l| l.contains(matched))
             .unwrap_or(matched);
+        // #1450: dedup. The gate is level-triggered (re-runs every feed), so a
+        // static on-screen phrase that never renders red would otherwise re-log
+        // this WARN on every tick. Emit only when the suppressed
+        // (state, matched, line) tuple differs from the last one logged.
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        format!("{detected:?}\u{1}{matched}\u{1}{line_context}").hash(&mut hasher);
+        let suppress_hash = hasher.finish();
+        if self.last_anchor_suppress_hash == Some(suppress_hash) {
+            return;
+        }
+        self.last_anchor_suppress_hash = Some(suppress_hash);
+        let span_fg: Vec<CellFg> = first_occurrence_span(screen_text, matched, fg);
         tracing::warn!(
             agent = %self.instance_name,
             backend = %self.backend_name,
@@ -739,6 +977,46 @@ impl StateTracker {
             "#1450: HIGH_FP pattern matched but rendered fg not red — suppressing transition. \
              If this was a real backend error, span_fg shows the actual colors (predicate may be too strict)."
         );
+    }
+
+    /// #1562 self-capture instrument — a pure-additive diagnostic side-log.
+    ///
+    /// When a known server-throttle / transient-error phrase
+    /// ([`THROTTLE_DIAG_PHRASES`]) is visible in the live tail but the
+    /// classifier did NOT land on a retryable state
+    /// ([`is_throttle_retryable_state`]), append one JSONL record to
+    /// `<agend-home>/unclassified_errors.jsonl`:
+    /// `{ts, backend, classified_state, raw_tail}`, where `raw_tail` carries
+    /// ANSI color (reconstructed from `fg`) so the color-anchor hypothesis
+    /// (#1562: did the throttle line render red?) can be checked from the log.
+    ///
+    /// Invariants:
+    /// - **Zero behavior change** — runs after classify, never touches
+    ///   `self.current`, retry, or any timer; failures are swallowed.
+    /// - **Cheap** — fast-rejects on a `str::contains` scan (no allocation) when
+    ///   no throttle phrase is present, which is the overwhelming common case.
+    /// - **Low-noise** — fires only on phrase-present + classified-non-retryable
+    ///   + phrase-in-live-tail (a scrolled-up scrollback echo is ignored).
+    fn capture_unclassified_throttle(&self, screen_text: &str, fg: &[CellFg]) {
+        let Some(raw_tail) = unclassified_throttle_tail(self.current, screen_text, fg) else {
+            return;
+        };
+        let record = serde_json::json!({
+            "ts": chrono::Utc::now().to_rfc3339(),
+            "backend": self.backend_name,
+            "classified_state": self.current.display_name(),
+            "raw_tail": raw_tail,
+        });
+        let path = crate::home_dir().join("unclassified_errors.jsonl");
+        if let Err(e) = append_jsonl(&path, &record) {
+            // Diagnostic must never affect behavior — log and move on.
+            tracing::debug!(
+                target: "state_detection",
+                agent = %self.instance_name,
+                error = %e,
+                "#1562: failed to append unclassified-throttle diagnostic"
+            );
+        }
     }
 
     /// Fallback when the screen changed but no pattern matched.
@@ -813,17 +1091,23 @@ impl StateTracker {
         self.record_set(AgentState::Restarting); // #1527: also logs the transition
     }
 
-    /// Force state to AwaitingOperator when startup stalls on an unexpected
-    /// interactive prompt. Only fires from `Starting` — Ready-state stalls
-    /// are caught by pattern-based detection (see `InteractivePrompt` once
-    /// added; until then they're missed, which is acceptable for the
-    /// time-based fallback role).
+    /// Force state to AwaitingOperator when the agent is stalled waiting on
+    /// operator input. Fires from `Starting` (the original startup-stall
+    /// fallback) or, post-#1552, from a runtime `PermissionPrompt` /
+    /// `InteractivePrompt` (a mid-task approval stall). Other states are left
+    /// untouched so a late tick-loop detection can't corrupt a healthy
+    /// mid-task agent — the WHEN-to-escalate gating (silence threshold +
+    /// position / stability / engagement FP-gates) lives in the supervisor;
+    /// this setter just guards the legal source states.
     ///
     /// Once the operator unblocks the stall and the ready pattern matches
     /// fresh screen content, `transition()` lifts the state (Ready prio >
     /// AwaitingOperator prio → higher always wins).
     pub fn set_awaiting_operator(&mut self) {
-        if matches!(self.current, AgentState::Starting) {
+        if matches!(
+            self.current,
+            AgentState::Starting | AgentState::PermissionPrompt | AgentState::InteractivePrompt
+        ) {
             self.record_set(AgentState::AwaitingOperator); // #1527: also logs
         }
     }

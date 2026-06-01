@@ -175,6 +175,17 @@ pub const STAGE2_MAX_RESTARTS_DEFAULT: u32 = 3;
 pub fn productive_silence_exceeds(agent_state: AgentState, silent_productive: Duration) -> bool {
     match agent_state {
         AgentState::Idle => false,
+        // #1553: an agent parked on a permission/approval/interactive prompt is
+        // CORRECTLY blocked on a human, not hung — silence is expected and
+        // open-ended. It must never reach the Hung threshold, otherwise the
+        // recovery pipeline acts on it: Stage-1 ESC cancels the live prompt and
+        // Stage-2 restart kills the agent mid-approval. Gating here (the single
+        // shared Hung-threshold fn, read by `check_hang`) covers every downstream
+        // recovery path uniformly — Stage 1/2/3 + the cron interrupt/replace
+        // consumers — not just the Stage-1 ESC the issue named.
+        AgentState::PermissionPrompt
+        | AgentState::InteractivePrompt
+        | AgentState::AwaitingOperator => false,
         AgentState::Starting => silent_productive > Duration::from_secs(120),
         AgentState::Thinking | AgentState::ToolUse => silent_productive > Duration::from_secs(600),
         _ => silent_productive > Duration::from_secs(120),
@@ -413,13 +424,22 @@ impl HealthTracker {
     /// Check whether agent is stalled on an interactive startup prompt.
     /// Pure predicate — no state mutation.
     ///
-    /// Fires only when the agent is in `Starting` AND has been silent past
-    /// the threshold. Once the agent reaches `Ready` we trust the backend
-    /// and any further quiet period is handled by `check_hang` with a much
-    /// higher threshold — flagging short Ready silences produced false
-    /// positives for agents in the middle of legitimate tool execution.
+    /// Fires when the agent has been silent past the threshold AND is in a
+    /// state that legitimately awaits operator input: `Starting` (the original
+    /// startup-stall fallback) or, post-#1552, a runtime `PermissionPrompt` /
+    /// `InteractivePrompt` (a mid-task stall on an approval the operator must
+    /// answer). Other states (`Ready` mid-tool-use, etc.) are left to
+    /// `check_hang` — flagging short generic silences here produced FPs.
+    ///
+    /// This is the *necessary* condition only; the supervisor adds escalation
+    /// FP-gates (live-bottom-N position, state-stability, operator-engagement
+    /// cooldown) before it actually notifies — see `daemon::supervisor`.
     pub fn check_awaiting_operator(&self, agent_state: AgentState, silent: Duration) -> bool {
-        silent > AWAITING_OP_SILENCE && matches!(agent_state, AgentState::Starting)
+        silent > AWAITING_OP_SILENCE
+            && matches!(
+                agent_state,
+                AgentState::Starting | AgentState::PermissionPrompt | AgentState::InteractivePrompt
+            )
     }
 
     /// Check for hang based on agent state and output timeout.
@@ -874,18 +894,16 @@ mod tests {
 
     #[test]
     fn test_awaiting_operator_non_starting_exempt() {
-        // Only Starting triggers. Ready and all other states are exempt
-        // regardless of silence — Ready silence is handled by `check_hang`
-        // with much higher thresholds so legitimate pauses between tool
-        // bursts don't produce false positives.
+        // #1552: Starting + runtime prompt states (PermissionPrompt /
+        // InteractivePrompt) trigger; every OTHER state is exempt regardless of
+        // silence — generic Ready/tool silence is handled by `check_hang` with
+        // much higher thresholds so legitimate pauses don't produce FPs.
         let h = HealthTracker::new();
         for s in [
             AgentState::Ready,
             AgentState::Idle,
             AgentState::Thinking,
             AgentState::ToolUse,
-            AgentState::InteractivePrompt,
-            AgentState::PermissionPrompt,
             AgentState::Hang,
             AgentState::AwaitingOperator,
             AgentState::Crashed,
@@ -894,6 +912,18 @@ mod tests {
                 !h.check_awaiting_operator(s, Duration::from_secs(60)),
                 "state {:?} should not trigger awaiting_operator",
                 s
+            );
+        }
+        // #1552: the runtime prompt states DO trigger past the threshold (the
+        // supervisor adds the position/stability/engagement FP-gates on top).
+        for s in [AgentState::PermissionPrompt, AgentState::InteractivePrompt] {
+            assert!(
+                h.check_awaiting_operator(s, Duration::from_secs(60)),
+                "runtime prompt state {s:?} must trigger awaiting_operator past threshold"
+            );
+            assert!(
+                !h.check_awaiting_operator(s, Duration::from_secs(10)),
+                "runtime prompt state {s:?} under threshold must not trigger"
             );
         }
     }
@@ -994,6 +1024,83 @@ mod tests {
             Duration::from_secs(0),
             1_000_000,
             0
+        ));
+    }
+
+    // ── #1553: prompt states must never reach the Hung threshold ──
+    #[test]
+    fn test_1553_prompt_states_never_hang() {
+        // PermissionPrompt / InteractivePrompt / AwaitingOperator are correctly
+        // blocked on a human — silence is expected, so they must NEVER exceed the
+        // Hung threshold (else Stage-1 ESC cancels the live prompt / Stage-2
+        // restart kills the agent mid-approval).
+        let long = Duration::from_secs(600); // well past every per-state threshold
+        for state in [
+            AgentState::PermissionPrompt,
+            AgentState::InteractivePrompt,
+            AgentState::AwaitingOperator,
+        ] {
+            assert!(
+                !productive_silence_exceeds(state, long),
+                "{state:?} must never exceed the Hung threshold"
+            );
+        }
+    }
+
+    #[test]
+    fn test_1553_check_hang_skips_prompt_state_without_reason() {
+        // The exact gap: a real PermissionPrompt agent whose #1552 AwaitingOperator
+        // escalation has NOT fired (current_reason == None) was classified Hung
+        // after 120s → ESC'd/restarted. The AgentState-layer gate must prevent it
+        // even without any blocked reason.
+        for state in [
+            AgentState::PermissionPrompt,
+            AgentState::InteractivePrompt,
+            AgentState::AwaitingOperator,
+        ] {
+            let mut h = HealthTracker::new();
+            assert_eq!(h.current_reason, None, "no blocked reason (the gap)");
+            assert!(
+                !h.check_hang(
+                    state,
+                    Duration::from_secs(300), // 5 min — past the old 120s threshold
+                    Duration::from_secs(300),
+                    1_000_000,
+                    0
+                ),
+                "{state:?} with no reason must not be classified Hung"
+            );
+            assert_ne!(h.state, HealthState::Hung);
+        }
+    }
+
+    #[test]
+    fn test_1553_regression_other_state_thresholds_unchanged() {
+        // The fix must NOT relax the existing per-state thresholds.
+        assert!(!productive_silence_exceeds(
+            AgentState::Idle,
+            Duration::from_secs(100_000)
+        ));
+        assert!(productive_silence_exceeds(
+            AgentState::Starting,
+            Duration::from_secs(121)
+        ));
+        assert!(!productive_silence_exceeds(
+            AgentState::Starting,
+            Duration::from_secs(119)
+        ));
+        assert!(productive_silence_exceeds(
+            AgentState::Thinking,
+            Duration::from_secs(601)
+        ));
+        assert!(!productive_silence_exceeds(
+            AgentState::Thinking,
+            Duration::from_secs(599)
+        ));
+        // A non-prompt state that genuinely stalls still hangs at the 120s floor.
+        assert!(productive_silence_exceeds(
+            AgentState::Ready,
+            Duration::from_secs(121)
         ));
     }
 

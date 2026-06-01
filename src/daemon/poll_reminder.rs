@@ -143,7 +143,7 @@ mod tests {
             backend_command: "test".to_string(),
             pty_writer: Arc::new(Mutex::new(writer)),
             pty_master: Arc::new(Mutex::new(pair.master)),
-            core: Arc::new(Mutex::new(core)),
+            core: Arc::new(crate::sync_audit::CoreMutex::new(core)),
             child: Arc::new(Mutex::new(child)),
             submit_key: "\r".to_string(),
             inject_prefix: String::new(),

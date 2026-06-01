@@ -298,6 +298,13 @@ pub fn notify_agent_with_attachments(
 /// unsent draft, otherwise injects **with** submit_key so idle agents wake up.
 /// Actionable work-delivery (`notification_is_actionable_wake`, #1473) bypasses
 /// the gate and always injects.
+/// #1513: operator-typing quiet window — an actionable wake injected within this
+/// many ms of the operator's last keystroke would collide with their input, so
+/// it is deferred and drained once the pane settles. Short by design (NOT the
+/// #1457 full draft hold) so a reviewer's ci-ready never waits behind a long
+/// operator draft (preserves #1473).
+const TYPING_QUIET_WINDOW_MS: i64 = 1_500;
+
 pub fn compose_aware_inject(home: &Path, agent_name: &str, notification: &str) {
     // #911 dedup gate
     if should_suppress_911_reinject_with_ledger(
@@ -308,19 +315,87 @@ pub fn compose_aware_inject(home: &Path, agent_name: &str, notification: &str) {
     ) {
         return;
     }
-    // #1473: actionable work-delivery (ci-ready / task dispatch / query) MUST
-    // wake the agent's PTY regardless of draft state. The #1457 draft-gate only
-    // exists to stop low-priority notifications from clobbering an operator's
-    // in-progress draft — it must never defer the work the agent is here to do.
-    // (Regression: a never-submitted agent pane read as Abandoned, so ci-ready
-    // for a codex reviewer was deferred to inbox-only and it never woke.)
-    if notification_is_actionable_wake(notification) {
+    let actionable = notification_is_actionable_wake(notification);
+    // #1513: busy-gate BEFORE the actionable split so every path is covered.
+    // agent_state is read LOCK-FREE from the per-tick snapshot — the inject path
+    // must NEVER take the per-agent core lock (#1492 self-IPC-under-lock deadlock
+    // class). ≤1-tick staleness is acceptable (busy states persist > a tick); the
+    // time-critical "operator typing" signal uses the live keystroke metadata.
+    if should_defer_inject(
+        home,
+        agent_name,
+        crate::snapshot::agent_state_of(home, agent_name).as_deref(),
+        actionable,
+    ) {
+        let _ = crate::notification_queue::enqueue_classified(
+            home,
+            agent_name,
+            notification,
+            actionable,
+        );
+        return;
+    }
+    // #1473: actionable work-delivery (ci-ready / task dispatch / query) wakes
+    // the PTY regardless of an operator DRAFT — only the busy/typing gate above
+    // defers it. Ambient stays behind the #1457 draft gate in route_notification.
+    if actionable {
         let _ = inject_with_submit(home, agent_name, notification);
         return;
     }
     let _ = route_notification(home, agent_name, notification, |msg| {
         inject_with_submit(home, agent_name, msg)
     });
+}
+
+/// #1513: should this notification be DEFERRED (enqueued) rather than injected
+/// now? Pure decision over the lock-free snapshot state + live keystroke recency.
+pub(crate) fn should_defer_inject(
+    home: &Path,
+    agent_name: &str,
+    agent_state: Option<&str>,
+    actionable: bool,
+) -> bool {
+    // An actionable wake must reach an agent STUCK waiting for input — a
+    // permission / awaiting-operator pane is exactly where new work delivery
+    // should land, never be held.
+    if actionable && matches!(agent_state, Some("permission") | Some("awaiting_operator")) {
+        return false;
+    }
+    // Agent actively generating → injecting now corrupts the PTY stream
+    // (mid-token). Applies to BOTH classes.
+    if matches!(agent_state, Some("thinking") | Some("tool_use")) {
+        return true;
+    }
+    if actionable {
+        // Short keystroke-collision window only (NOT the #1457 full draft hold).
+        operator_typing_recent(home, agent_name)
+    } else {
+        // Ambient: the #1457 full draft gate is applied downstream by
+        // route_notification — don't double-gate here.
+        false
+    }
+}
+
+/// #1513: did the operator type into this pane within the quiet window? Uses the
+/// LIVE keyboard-written `last_input_epoch_ms` (notification_queue metadata) —
+/// NOT `heartbeat_pair.last_input_at_ms` (which is the daemon-INJECT timestamp).
+fn operator_typing_recent(home: &Path, agent_name: &str) -> bool {
+    let (typed_ms, _) = crate::notification_queue::read_input_submit_timestamps(home, agent_name);
+    typed_ms != 0
+        && chrono::Utc::now()
+            .timestamp_millis()
+            .saturating_sub(typed_ms)
+            < TYPING_QUIET_WINDOW_MS
+}
+
+/// #1513 PR-2: defer a DIRECT PTY inject (cron / schedule replay via
+/// `inject_to_agent`, force=false) when the agent is mid-generation
+/// (Thinking/ToolUse) or the operator is mid-keystroke — the same collision
+/// avoidance as the notification path, minus the actionable / permission-bypass
+/// nuances (a scheduled wake has no work-delivery urgency). Lock-free snapshot
+/// read (#1492-safe).
+pub(crate) fn should_defer_direct_inject(home: &Path, agent_name: &str) -> bool {
+    crate::snapshot::agent_is_busy(home, agent_name) || operator_typing_recent(home, agent_name)
 }
 
 /// #1473/#1483: does this notification carry an actionable work-delivery
@@ -391,9 +466,11 @@ pub(crate) fn should_suppress_911_reinject_with_ledger(
 pub fn enqueue_with_idle_hint(home: &Path, target: &str, msg: InboxMessage) -> anyhow::Result<()> {
     // #1492: this is a self-IPC vector — the default emitter's PTY inject
     // reaches `api::call` over the loopback socket. Calling it while holding
-    // the registry lock deadlocks the daemon (the morning cron bug). Debug
-    // builds panic here for an early, clear signal; release is a no-op.
-    crate::sync_audit::assert_no_registry_lock_for_self_ipc("enqueue_with_idle_hint");
+    // the registry lock deadlocks the daemon (the morning cron bug). #1492-L2:
+    // the guard is always-on and fail-fast — on a violation it logs + returns
+    // `Err` here in every build, so the call is refused (the hint is not
+    // emitted) and the daemon stays live instead of freezing.
+    crate::sync_audit::assert_no_registry_lock_for_self_ipc("enqueue_with_idle_hint")?;
     enqueue_with_idle_hint_with_emitter(home, target, msg, |hint| {
         compose_aware_inject(home, target, hint);
     })
@@ -697,6 +774,225 @@ mod operator_tz_tests {
         assert!(
             header.contains("now="),
             "#1509: notify_agent pointer header must carry now= (was the gap): {header}"
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod should_defer_inject_tests_1513 {
+    use super::should_defer_inject;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static CTR: AtomicU32 = AtomicU32::new(0);
+    fn tmp_home(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "agend-1513-{}-{}-{}",
+            tag,
+            std::process::id(),
+            CTR.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    // Agent mid-generation → defer BOTH classes (injecting corrupts the PTY).
+    #[test]
+    fn busy_defers_both_classes() {
+        let h = tmp_home("busy");
+        for st in ["thinking", "tool_use"] {
+            assert!(
+                should_defer_inject(&h, "a", Some(st), true),
+                "actionable defers when {st}"
+            );
+            assert!(
+                should_defer_inject(&h, "a", Some(st), false),
+                "ambient defers when {st}"
+            );
+        }
+    }
+
+    // Actionable wake must reach an agent STUCK waiting → bypass defer.
+    #[test]
+    fn actionable_bypasses_in_permission_and_awaiting() {
+        let h = tmp_home("perm");
+        for st in ["permission", "awaiting_operator"] {
+            assert!(
+                !should_defer_inject(&h, "a", Some(st), true),
+                "actionable bypasses {st}"
+            );
+        }
+    }
+
+    // No typing + idle (or unknown/stale snapshot) → inject (no false defer).
+    #[test]
+    fn idle_and_stale_snapshot_do_not_defer() {
+        let h = tmp_home("idle");
+        assert!(
+            !should_defer_inject(&h, "a", Some("idle"), true),
+            "idle actionable injects"
+        );
+        assert!(
+            !should_defer_inject(&h, "a", Some("ready"), false),
+            "ready ambient injects"
+        );
+        // stale/missing snapshot → state None → fail-open (no defer)
+        assert!(
+            !should_defer_inject(&h, "a", None, true),
+            "missing snapshot does not defer actionable"
+        );
+        assert!(
+            !should_defer_inject(&h, "a", None, false),
+            "missing snapshot does not defer ambient"
+        );
+    }
+
+    // Ambient is NEVER deferred by this gate when idle — the #1457 full draft
+    // gate downstream (route_notification) owns operator-draft deferral (#1473).
+    #[test]
+    fn ambient_idle_falls_through_to_1457() {
+        let h = tmp_home("amb");
+        crate::notification_queue::record_input_activity(&h, "a"); // operator just typed
+                                                                   // ambient + idle + recent typing → still NOT deferred here (route_notification handles it)
+        assert!(
+            !should_defer_inject(&h, "a", Some("idle"), false),
+            "ambient defers via #1457 downstream, not here"
+        );
+    }
+
+    // Actionable + recent operator keystroke → defer (short anti-collision window).
+    #[test]
+    fn actionable_defers_on_recent_typing() {
+        let h = tmp_home("typing");
+        crate::notification_queue::record_input_activity(&h, "a"); // now
+        assert!(
+            should_defer_inject(&h, "a", Some("idle"), true),
+            "recent typing defers actionable"
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod snapshot_busy_tests_1513 {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static CTR: AtomicU32 = AtomicU32::new(0);
+    fn tmp_home(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "agend-1513snap-{}-{}-{}",
+            tag,
+            std::process::id(),
+            CTR.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn snap(name: &str, state: &str) -> crate::snapshot::AgentSnapshot {
+        crate::snapshot::AgentSnapshot {
+            name: name.to_string(),
+            backend_command: String::new(),
+            args: vec![],
+            working_dir: None,
+            submit_key: "\r".to_string(),
+            health_state: "healthy".to_string(),
+            agent_state: state.to_string(),
+        }
+    }
+
+    #[test]
+    fn agent_is_busy_reads_snapshot_state() {
+        let h = tmp_home("busy");
+        crate::snapshot::save(&h, &[snap("a", "thinking"), snap("b", "idle")]);
+        assert!(crate::snapshot::agent_is_busy(&h, "a"), "thinking → busy");
+        assert!(!crate::snapshot::agent_is_busy(&h, "b"), "idle → not busy");
+        // missing agent / missing snapshot → fail-open (not busy)
+        assert!(
+            !crate::snapshot::agent_is_busy(&h, "ghost"),
+            "unknown agent → not busy"
+        );
+        assert!(
+            !crate::snapshot::agent_is_busy(&tmp_home("empty"), "a"),
+            "no snapshot → not busy"
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod should_defer_direct_inject_tests_1513pr2 {
+    use super::should_defer_direct_inject;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static CTR: AtomicU32 = AtomicU32::new(0);
+    fn tmp_home(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "agend-1513pr2-{}-{}-{}",
+            tag,
+            std::process::id(),
+            CTR.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn snap(name: &str, state: &str) -> crate::snapshot::AgentSnapshot {
+        crate::snapshot::AgentSnapshot {
+            name: name.to_string(),
+            backend_command: String::new(),
+            args: vec![],
+            working_dir: None,
+            submit_key: "\r".to_string(),
+            health_state: "healthy".to_string(),
+            agent_state: state.to_string(),
+        }
+    }
+
+    // cron/replay direct inject while the agent is mid-generation → defer.
+    #[test]
+    fn busy_defers_direct_inject() {
+        let h = tmp_home("busy");
+        crate::snapshot::save(&h, &[snap("a", "thinking")]);
+        assert!(
+            should_defer_direct_inject(&h, "a"),
+            "thinking → defer direct inject"
+        );
+        crate::snapshot::save(&h, &[snap("a", "tool_use")]);
+        assert!(
+            should_defer_direct_inject(&h, "a"),
+            "tool_use → defer direct inject"
+        );
+    }
+
+    // operator mid-keystroke → defer (collision avoidance).
+    #[test]
+    fn typing_defers_direct_inject() {
+        let h = tmp_home("typing");
+        crate::snapshot::save(&h, &[snap("a", "idle")]);
+        crate::notification_queue::record_input_activity(&h, "a");
+        assert!(
+            should_defer_direct_inject(&h, "a"),
+            "recent keystroke → defer direct inject"
+        );
+    }
+
+    // quiet idle pane (and missing snapshot) → inject directly, no false defer.
+    #[test]
+    fn quiet_does_not_defer_direct_inject() {
+        let h = tmp_home("quiet");
+        crate::snapshot::save(&h, &[snap("a", "idle")]);
+        assert!(
+            !should_defer_direct_inject(&h, "a"),
+            "idle + no typing → inject"
+        );
+        // missing snapshot → fail-open (not busy, no typing) → inject
+        assert!(
+            !should_defer_direct_inject(&tmp_home("nosnap"), "a"),
+            "no snapshot → inject"
         );
     }
 }

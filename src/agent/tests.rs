@@ -232,7 +232,7 @@ fn sweep_child_tree_body(pid_file: &std::path::Path) {
         Arc::new(Mutex::new(pair.master.take_writer().expect("take_writer")));
     let pty_master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>> =
         Arc::new(Mutex::new(pair.master));
-    let core = Arc::new(Mutex::new(AgentCore {
+    let core = Arc::new(crate::sync_audit::CoreMutex::new(AgentCore {
         vterm: crate::vterm::VTerm::with_pty_writer(80, 24, Arc::clone(&pty_writer)),
         subscribers: Vec::new(),
         state: StateTracker::new(None),
@@ -727,7 +727,7 @@ fn write_to_agent_typed_uses_timeout() {
         backend_command: "test".to_string(),
         pty_writer: writer,
         pty_master: Arc::new(Mutex::new(pair.master)),
-        core: Arc::new(Mutex::new(AgentCore {
+        core: Arc::new(crate::sync_audit::CoreMutex::new(AgentCore {
             vterm: VTerm::new(80, 24),
             subscribers: Vec::new(),
             state: StateTracker::new(None),
@@ -942,7 +942,7 @@ fn pty_read_error_triggers_cleanup() {
 
     let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
     let pty_writer: PtyWriter = Arc::new(Mutex::new(Box::new(Vec::<u8>::new())));
-    let core = Arc::new(Mutex::new(AgentCore {
+    let core = Arc::new(crate::sync_audit::CoreMutex::new(AgentCore {
         vterm: VTerm::new(80, 24),
         subscribers: Vec::new(),
         state: StateTracker::new(None),
@@ -1117,7 +1117,7 @@ fn mk_handle_1441(name: &str, id: crate::types::InstanceId) -> AgentHandle {
     let pty_writer: PtyWriter = Arc::new(Mutex::new(pair.master.take_writer().expect("writer")));
     let pty_master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>> =
         Arc::new(Mutex::new(pair.master));
-    let core = Arc::new(Mutex::new(AgentCore {
+    let core = Arc::new(crate::sync_audit::CoreMutex::new(AgentCore {
         vterm: crate::vterm::VTerm::with_pty_writer(80, 24, Arc::clone(&pty_writer)),
         subscribers: Vec::new(),
         state: StateTracker::new(None),
@@ -1419,39 +1419,60 @@ fn empty_registry_1492() -> AgentRegistry {
     std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Real wiring: `lock_registry` sets the debug held-flag, so a self-IPC vector
-/// (modeled by the assert) panics while the guard is alive. Proves the guard —
-/// not just the raw counter — participates. Debug-only: the detection compiles
-/// out in release, so the panic only exists there.
-#[cfg(debug_assertions)]
+/// Real wiring: `lock_registry` bumps the held-counter, so a self-IPC vector
+/// (modeled by the guard) refuses with `Err` while the guard is alive. Proves
+/// the guard — not just the raw counter — participates. #1492-L2: the guard is
+/// always-on and returns `Err` (was a debug-only `panic!` pre-L2).
 #[test]
-#[should_panic(expected = "lock-across-self-IPC")]
 fn lock_registry_guard_trips_self_ipc_assert_1492() {
     let reg = empty_registry_1492();
     let _guard = lock_registry(&reg);
-    crate::sync_audit::assert_no_registry_lock_for_self_ipc("api::call");
+    assert!(crate::sync_audit::assert_no_registry_lock_for_self_ipc("api::call").is_err());
 }
 
 /// Dropping the `lock_registry` guard BEFORE self-IPC (the 6f1403d-correct
-/// pattern) clears the held-flag, so the assert does not trip.
-#[cfg(debug_assertions)]
+/// pattern) clears the held-counter, so the guard returns `Ok` (does not trip).
 #[test]
 fn lock_registry_guard_drop_clears_self_ipc_flag_1492() {
     let reg = empty_registry_1492();
     {
         let _guard = lock_registry(&reg);
-    } // guard dropped → flag cleared
-    crate::sync_audit::assert_no_registry_lock_for_self_ipc("api::call");
+    } // guard dropped → counter cleared
+    assert!(crate::sync_audit::assert_no_registry_lock_for_self_ipc("api::call").is_ok());
 }
 
 /// `lock_registry_tracked` participates in the same detection.
-#[cfg(debug_assertions)]
 #[test]
-#[should_panic(expected = "lock-across-self-IPC")]
 fn lock_registry_tracked_guard_trips_self_ipc_assert_1492() {
     let reg = empty_registry_1492();
     let _guard = lock_registry_tracked(&reg, "test-1492");
-    crate::sync_audit::assert_no_registry_lock_for_self_ipc("enqueue_with_idle_hint");
+    assert!(
+        crate::sync_audit::assert_no_registry_lock_for_self_ipc("enqueue_with_idle_hint").is_err()
+    );
+}
+
+// ── #1535: CoreMutex guard wiring for core-held self-IPC detection ──
+
+/// Real wiring: holding a `CoreMutex` guard bumps `CORE_LOCK_DEPTH`, so the
+/// (extended) self-IPC guard refuses with `Err` while the guard is alive —
+/// proving the core-lock blind spot the registry-only guard missed (#1535) is
+/// now covered. #1492-L2: always-on, returns `Err`.
+#[test]
+fn core_mutex_guard_trips_self_ipc_assert_1535() {
+    let m = crate::sync_audit::CoreMutex::new(0u32);
+    let _guard = m.lock();
+    assert!(crate::sync_audit::assert_no_registry_lock_for_self_ipc("api::call").is_err());
+}
+
+/// Dropping the `CoreMutex` guard BEFORE self-IPC (the collect→drop→emit
+/// pattern, e.g. #1530) clears the depth, so the guard returns `Ok`.
+#[test]
+fn core_mutex_guard_drop_clears_self_ipc_flag_1535() {
+    let m = crate::sync_audit::CoreMutex::new(0u32);
+    {
+        let _guard = m.lock();
+    } // guard dropped → core depth cleared
+    assert!(crate::sync_audit::assert_no_registry_lock_for_self_ipc("api::call").is_ok());
 }
 
 // ── #1504: git-shim PATH parsing + self-exclusion (L1) ──

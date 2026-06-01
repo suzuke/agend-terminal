@@ -23,8 +23,15 @@ fixtures:
     cli_version: "2.1.98"
     recorded_on: "2026-04-20"
     scenario: "startup banner to idle prompt; response completes inline"
-    expected_transitions: [starting, idle]
-    expected_final_state: idle
+    # #1541: the spinner verb here is `Undulating` — NOT in the old verb
+    # whitelist, so it used to replay `[starting, idle]` with the thinking phase
+    # invisible (the dispatch-idle-misfire root). The verb-agnostic structural
+    # anchor now detects it: `thinking` appears. `final_state` is `thinking`
+    # (latched: Thinking outranks Idle and no wall-clock passes in replay to
+    # expire the latch) while `final_detect` on the settled idle-menu screen is
+    # `idle` — in real operation LATCHED_STATE_EXPIRY recovers to idle.
+    expected_transitions: [starting, idle, thinking]
+    expected_final_state: thinking
     expected_final_detect: idle
 
   - file: codex-thinking.raw
@@ -157,9 +164,51 @@ fixtures:
     # The tracker retains PermissionPrompt via hysteresis (byte-level
     # replay never crosses the min_hold) — no behavioral change for
     # consumers.
-    expected_transitions: [starting, idle, permission]
+    #
+    # #1541: a `thinking` phase now appears before `permission`. The spinner
+    # verb here is `Swooping` (`✢ Swooping…`) — unlisted in the old verb
+    # whitelist, so the agent's thinking was previously invisible. The
+    # verb-agnostic structural anchor detects it; PermissionPrompt (priority
+    # 8) then correctly overrides the latched Thinking (6).
+    expected_transitions: [starting, idle, thinking, permission]
     expected_final_state: permission
     expected_final_detect: idle
+
+  - file: claude-mcp-perm.raw
+    backend: claude-code
+    cli_version: "2.1.98"
+    recorded_on: "2026-05-31"
+    scenario: "MCP-tool permission dialog (agent asks to run an MCP tool -> Allow/Deny dialog -> not answered)"
+    # #1546: this fixture is the EVIDENCE that the permission footer
+    # `Esc to cancel · Tab to amend` is COMMON across permission types (not
+    # edit-specific). `allow all edits during this session` is edit-only and
+    # is ABSENT here, so the footer alone fires PermissionPrompt — proving the
+    # chrome-footer anchor covers the mcp-tool dialog. Same observed sequence
+    # as claude-perm.raw (edit): a `thinking` phase precedes `permission`
+    # (#1541 verb-agnostic spinner anchor). final_detect is null — the settled
+    # final frame matches no pattern; the tracker retains PermissionPrompt via
+    # hysteresis. Provenance: #1546 operator capture (2026-05-31).
+    expected_transitions: [starting, idle, thinking, permission]
+    expected_final_state: permission
+    expected_final_detect: null
+    capture_kind: real_pty
+    provenance: "#1546 operator capture"
+
+  - file: claude-trust-prompt.raw
+    backend: claude-code
+    cli_version: "2.1.98"
+    recorded_on: "2026-05-31"
+    scenario: "trust-folder dialog ('Quick safety check: Is this a project you trust?' -> 'Yes, I trust this folder' / 'No, exit', not answered)"
+    # #1546 trust follow-up: the trust dialog's footer is `Enter to confirm · Esc
+    # to cancel` (NOT the tool-perm `… Tab to amend`), so it needs its own chrome
+    # alternation. This short fixture goes straight starting -> permission (the
+    # dialog is the first thing rendered). final_detect stays permission (the
+    # dialog is still on the final frame). Proves the trust footer anchor fires.
+    expected_transitions: [starting, permission]
+    expected_final_state: permission
+    expected_final_detect: permission
+    capture_kind: real_pty
+    provenance: "#1546 trust operator capture"
 
   - file: codex-perm.raw
     backend: codex
@@ -184,6 +233,42 @@ fixtures:
     expected_final_state: permission
     expected_final_detect: idle
 
+  # ── #1559 cross-backend permission-dialog chrome captures ───────────
+  # Operator recorded 2026-06-01; lead verified the live chrome. Each
+  # fixture exercises a real permission/approval dialog so the chrome-
+  # anchored PermissionPrompt patterns (patterns.rs, #1559) must surface
+  # `permission` in the transition sequence. expected_* below are filled
+  # from the actual `replay_manifest_regression` observed sequence.
+  - file: kiro-perm.raw
+    backend: kiro
+    cli_version: "unknown"
+    recorded_on: "2026-06-01"
+    scenario: "kiro asked to run a shell command needing approval -> renders approval dialog (header '<cmd> requires approval', options Yes/Trust/No, footer 'ESC to close | Tab to edit') -> #1559 chrome anchor fires PermissionPrompt"
+    provenance: "#1559"
+    expected_transitions: [starting, idle, thinking, permission]
+    expected_final_state: permission
+    expected_final_detect: permission
+
+  - file: gemini-perm.raw
+    backend: gemini
+    cli_version: "0.44.1"
+    recorded_on: "2026-06-01"
+    scenario: "gemini asked to run a shell tool -> boxed select 'Allow execution of [Shell]?' with numbered options (1 Allow once / 2 Allow for this session / 3 No, suggest changes) -> #1559 chrome anchor fires PermissionPrompt"
+    provenance: "#1559"
+    expected_transitions: [starting, idle, thinking, permission]
+    expected_final_state: permission
+    expected_final_detect: permission
+
+  - file: opencode-perm.raw
+    backend: opencode
+    cli_version: "1.15.10"
+    recorded_on: "2026-06-01"
+    scenario: "opencode asked to run a tool needing approval -> boxed dialog (option row 'Allow once  Allow always  Reject' renders in the live tail; 'Permission required' header frames above the bottom-N) -> #1559 option-row chrome anchor fires PermissionPrompt. Final frame shows a tool banner (detect=tool_use) while the tracker holds PermissionPrompt via hysteresis."
+    provenance: "#1559"
+    expected_transitions: [starting, idle, thinking, permission]
+    expected_final_state: permission
+    expected_final_detect: tool_use
+
   # ── Stage 2a ToolUse recordings (2026-04-20) ────────────────────────
   # Every recording below DID exercise a real tool call (verified by
   # final-screen tool banners / session summaries), yet none of the
@@ -204,11 +289,38 @@ fixtures:
     # claude 2.1.98 -ing verbs (Listing|Reading|Writing|Searching|
     # Editing). Final detect() returns Idle because the completion
     # frame shows the bare directory listing under `⏺` without a verb
-    # on the banner line, so only the `❯` prompt glyph matches — the
-    # tracker still reports ToolUse via hysteresis (min_hold=2s not
-    # yet elapsed under byte-level replay).
-    expected_transitions: [starting, idle, tool_use]
-    expected_final_state: tool_use
+    # on the banner line, so only the `❯` prompt glyph matches.
+    #
+    # #1541: the agent THINKS before it runs the tool — `✳ Burrowing…
+    # (thinking with high effort)` renders first. That spinner verb
+    # (`Burrowing`) was unlisted before, so the old replay jumped straight
+    # to `tool_use`; the verb-agnostic anchor now detects the thinking
+    # phase. Thinking (priority 6) latches and the later ToolUse (priority
+    # 5) cannot downgrade it within the zero-wall-clock replay, so the
+    # observed sequence collapses to `[starting, idle, thinking]`
+    # (final_state latched=thinking; final_detect on the settled idle
+    # screen = idle).
+    #
+    # Why this is ACCEPTED under #1541's KISS scope (lead ruling
+    # t-20260531075003109468-4):
+    #  1. EQUIVALENT for the watchdog. dispatch-idle's `target_is_working`
+    #     treats `thinking` and `tool_use` identically as "working", so
+    #     labelling this frame `thinking` vs `tool_use` makes no difference
+    #     to gating — the heads-down agent reads working, NOT idle, and the
+    #     watchdog cannot mis-fire (the entire point of #1541).
+    #  2. ZERO-TIME REPLAY ARTIFACT, not a real regression. In a live
+    #     runtime the Thinking latch expires on its short (30 s) timer and a
+    #     genuinely-running tool registers ToolUse normally — the ToolUse
+    #     PATTERN is untouched and still fires when a tool frame is the
+    #     first busy state (covered directly by
+    #     behavioral::tests::claude_markers_match_completion_glyph_and_tool).
+    #     Only this byte-replay (no wall-clock) collapses the ordering.
+    #  3. Preserving the ToolUse LABEL here would require changing the
+    #     latch/priority machinery — out of #1541's KISS scope. Deferred to
+    #     a follow-up IFF a consumer is ever found that depends on the
+    #     think→tool ToolUse label.
+    expected_transitions: [starting, idle, thinking]
+    expected_final_state: thinking
     expected_final_detect: idle
     # #685 PR-3 (corpus expansion): final=tool_use, no claude productive
     # markers (`✓●⏺ Read|Write|...` -ing form vs Phase A1 alternation)

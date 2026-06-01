@@ -878,9 +878,13 @@ mod tests {
 
     fn tmp_repo(tag: &str) -> PathBuf {
         let dir = tmp_home(tag);
+        // #1463: scratch-repo git must bypass the agend-git shim, else an
+        // agent-run suite (AGEND_INSTANCE_NAME set) ChdirPass-redirects the
+        // commit into the bound worktree (init-pile pollution).
         std::process::Command::new("git")
             .args(["init", "-b", "main"])
             .current_dir(&dir)
+            .env("AGEND_GIT_BYPASS", "1")
             .output()
             .ok();
         std::process::Command::new("git")
@@ -895,6 +899,7 @@ mod tests {
                 "init",
             ])
             .current_dir(&dir)
+            .env("AGEND_GIT_BYPASS", "1")
             .output()
             .ok();
         dir

@@ -61,6 +61,23 @@ pub enum Trigger {
     Once { at: String },
 }
 
+/// #1521: how a recurring schedule decides whether to KEEP firing within a
+/// calendar day (in the schedule's timezone).
+///
+/// - `Always` (default, backward-compatible) — fire every time the trigger
+///   lands.
+/// - `UntilSuccess` — a "remind until done" reminder: once the linked task
+///   reaches `done`, suppress further fires for the rest of that day; re-fire
+///   the next day (and resume immediately if the task is reopened). Requires a
+///   `linked_task_id` that exists (enforced at create/update).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FireStrategy {
+    #[default]
+    Always,
+    UntilSuccess,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(from = "ScheduleRaw")]
 pub struct Schedule {
@@ -76,6 +93,16 @@ pub struct Schedule {
     pub updated_at: String,
     #[serde(default)]
     pub run_history: Vec<ScheduleRun>,
+    /// #1521: fire-strategy. Defaults to `Always` (existing rows unchanged).
+    #[serde(default)]
+    pub fire_strategy: FireStrategy,
+    /// #1521: task whose completion suppresses further fires (UntilSuccess).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linked_task_id: Option<String>,
+    /// #1521: calendar day (`YYYY-MM-DD`, schedule tz) the linked task was last
+    /// observed `done` — suppresses re-fires for the rest of that day.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_success_date: Option<String>,
 }
 
 /// On-wire representation that accepts both v1 (top-level `cron`) and v2
@@ -108,6 +135,12 @@ struct ScheduleRaw {
     updated_at: String,
     #[serde(default)]
     run_history: Vec<ScheduleRun>,
+    #[serde(default)]
+    fire_strategy: FireStrategy,
+    #[serde(default)]
+    linked_task_id: Option<String>,
+    #[serde(default)]
+    last_success_date: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -131,7 +164,50 @@ impl From<ScheduleRaw> for Schedule {
             created_at: r.created_at,
             updated_at: r.updated_at,
             run_history: r.run_history,
+            fire_strategy: r.fire_strategy,
+            linked_task_id: r.linked_task_id,
+            last_success_date: r.last_success_date,
         }
+    }
+}
+
+/// #1521: a `linked_task_id` is required for `UntilSuccess` and the task must
+/// already exist on the board — a bare-message reminder has no completion to
+/// gate on, so we reject it at create/update rather than silently degrade.
+fn task_file_exists(home: &Path, task_id: &str) -> bool {
+    !task_id.is_empty() && home.join("tasks").join(format!("{task_id}.json")).exists()
+}
+
+/// #1521: validate a (fire_strategy, linked_task_id) pair. `Ok(())` when the
+/// combination is legal; `Err(msg)` (operator-facing) otherwise.
+fn validate_fire_strategy(
+    home: &Path,
+    fire_strategy: FireStrategy,
+    linked_task_id: Option<&str>,
+) -> Result<(), String> {
+    if fire_strategy != FireStrategy::UntilSuccess {
+        return Ok(());
+    }
+    match linked_task_id {
+        Some(id) if task_file_exists(home, id) => Ok(()),
+        Some(id) => Err(format!(
+            "fire_strategy=until_success requires an existing linked_task_id (task '{id}' not found)"
+        )),
+        None => {
+            Err("fire_strategy=until_success requires 'linked_task_id'".to_string())
+        }
+    }
+}
+
+/// #1521: parse the `fire_strategy` arg ("always" | "until_success").
+fn fire_strategy_from_args(args: &Value) -> Result<Option<FireStrategy>, String> {
+    match args.get("fire_strategy").and_then(|v| v.as_str()) {
+        None => Ok(None),
+        Some("always") => Ok(Some(FireStrategy::Always)),
+        Some("until_success") => Ok(Some(FireStrategy::UntilSuccess)),
+        Some(other) => Err(format!(
+            "invalid fire_strategy {other:?} (expected 'always' or 'until_success')"
+        )),
     }
 }
 
@@ -227,6 +303,20 @@ pub fn set_enabled(home: &Path, schedule_id: &str, enabled: bool) {
         if let Some(sched) = store.schedules.iter_mut().find(|s| s.id == sid) {
             sched.enabled = enabled;
             sched.updated_at = chrono::Utc::now().to_rfc3339();
+        }
+        Ok(())
+    });
+}
+
+/// #1521: record that an `UntilSuccess` schedule's linked task was observed
+/// `done` on `date` (`YYYY-MM-DD`, schedule tz) — suppresses further fires for
+/// the rest of that calendar day.
+pub fn mark_success_today(home: &Path, schedule_id: &str, date: &str) {
+    let sid = schedule_id.to_string();
+    let d = date.to_string();
+    let _ = crate::store::mutate_versioned(&store_path(home), |store: &mut ScheduleStore| {
+        if let Some(sched) = store.schedules.iter_mut().find(|s| s.id == sid) {
+            sched.last_success_date = Some(d.clone());
         }
         Ok(())
     });
@@ -351,6 +441,18 @@ pub fn create(home: &Path, instance_name: &str, args: &Value) -> Value {
         Ok(t) => t,
         Err(e) => return serde_json::json!({"error": e}),
     };
+    // #1521: fire-strategy (default Always) + optional linked task.
+    let fire_strategy = match fire_strategy_from_args(args) {
+        Ok(fs) => fs.unwrap_or_default(),
+        Err(e) => return serde_json::json!({"error": e}),
+    };
+    let linked_task_id = args["linked_task_id"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    if let Err(e) = validate_fire_strategy(home, fire_strategy, linked_task_id.as_deref()) {
+        return serde_json::json!({"error": e});
+    }
     let now = chrono::Utc::now();
     let now_str = now.to_rfc3339();
     // H3: microsecond precision + counter to prevent same-second collision
@@ -372,6 +474,9 @@ pub fn create(home: &Path, instance_name: &str, args: &Value) -> Value {
         created_at: now_str.clone(),
         updated_at: now_str,
         run_history: Vec::new(),
+        fire_strategy,
+        linked_task_id,
+        last_success_date: None,
     };
     match crate::store::mutate_versioned(&store_path(home), |store: &mut ScheduleStore| {
         store.schedules.push(schedule);
@@ -414,6 +519,16 @@ pub fn update(home: &Path, args: &Value) -> Value {
     let new_enabled = args["enabled"].as_bool();
     let new_cron = args["cron"].as_str().map(String::from);
     let new_run_at = args["run_at"].as_str().map(String::from);
+    // #1521: fire-strategy / linked task changes (validated against the
+    // resulting state inside the store lock below). `Some(None)` for
+    // `linked_task_id` means "clear"; key absent means "unchanged".
+    let new_fire_strategy = match fire_strategy_from_args(args) {
+        Ok(fs) => fs,
+        Err(e) => return serde_json::json!({"error": e}),
+    };
+    let new_linked_task_id: Option<Option<String>> = args
+        .get("linked_task_id")
+        .map(|v| v.as_str().filter(|s| !s.is_empty()).map(String::from));
 
     if let Some(ref c) = new_cron {
         if let Err(e) = validate_cron(c) {
@@ -459,6 +574,24 @@ pub fn update(home: &Path, args: &Value) -> Value {
                     }
                 }
                 schedule.trigger = Trigger::Once { at: parsed };
+            }
+            // #1521: apply fire-strategy / linked-task changes, then validate
+            // the RESULTING combination (UntilSuccess ⇒ existing linked task).
+            if let Some(fs) = new_fire_strategy {
+                schedule.fire_strategy = fs;
+            }
+            if let Some(ref lt) = new_linked_task_id {
+                // Re-pointing (or clearing) the task invalidates a prior
+                // same-day success suppression.
+                schedule.linked_task_id = lt.clone();
+                schedule.last_success_date = None;
+            }
+            if let Err(e) = validate_fire_strategy(
+                home,
+                schedule.fire_strategy,
+                schedule.linked_task_id.as_deref(),
+            ) {
+                return Err(anyhow::anyhow!(e));
             }
             schedule.updated_at = chrono::Utc::now().to_rfc3339();
             Ok(true)
@@ -664,6 +797,93 @@ mod tests {
         let e = r["error"].as_str().expect("err");
         assert!(e.contains("cron") && e.contains("run_at"), "got: {e}");
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #1521: fire-strategy validation + backward-compat ──
+
+    fn seed_task_file(home: &Path, id: &str) {
+        let dir = home.join("tasks");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{id}.json")),
+            serde_json::json!({"id": id, "status": "open"}).to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn create_default_fire_strategy_is_always_backward_compat() {
+        let home = tmp_home("fs-default");
+        let r = create(
+            &home,
+            "a",
+            &serde_json::json!({"cron": "0 9 * * *", "message": "x"}),
+        );
+        assert_eq!(r["status"], "created", "resp: {r}");
+        assert_eq!(load(&home).schedules[0].fire_strategy, FireStrategy::Always);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn create_until_success_without_task_rejected() {
+        let home = tmp_home("fs-notask");
+        let r = create(
+            &home,
+            "a",
+            &serde_json::json!({"cron": "0 9 * * *", "message": "x",
+                "fire_strategy": "until_success"}),
+        );
+        assert!(
+            r["error"].as_str().expect("err").contains("linked_task_id"),
+            "got: {r}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn create_until_success_with_missing_task_rejected() {
+        let home = tmp_home("fs-missingtask");
+        let r = create(
+            &home,
+            "a",
+            &serde_json::json!({"cron": "0 9 * * *", "message": "x",
+                "fire_strategy": "until_success", "linked_task_id": "t-nope"}),
+        );
+        assert!(
+            r["error"].as_str().expect("err").contains("not found"),
+            "got: {r}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn create_until_success_with_existing_task_ok() {
+        let home = tmp_home("fs-ok");
+        seed_task_file(&home, "t-real");
+        let r = create(
+            &home,
+            "a",
+            &serde_json::json!({"cron": "0 9 * * *", "message": "x",
+                "fire_strategy": "until_success", "linked_task_id": "t-real"}),
+        );
+        assert_eq!(r["status"], "created", "resp: {r}");
+        let s = &load(&home).schedules[0];
+        assert_eq!(s.fire_strategy, FireStrategy::UntilSuccess);
+        assert_eq!(s.linked_task_id.as_deref(), Some("t-real"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn schedule_row_without_fire_fields_loads_as_always() {
+        // v1/v2 rows predating #1521 carry no fire_strategy/linked_task_id.
+        let raw: ScheduleRaw = serde_json::from_value(serde_json::json!({
+            "id": "s-old", "message": "m", "cron": "0 9 * * *",
+        }))
+        .expect("legacy row deserializes");
+        let sched: Schedule = raw.into();
+        assert_eq!(sched.fire_strategy, FireStrategy::Always);
+        assert!(sched.linked_task_id.is_none());
+        assert!(sched.last_success_date.is_none());
     }
 
     #[test]

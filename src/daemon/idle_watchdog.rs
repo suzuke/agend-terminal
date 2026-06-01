@@ -35,8 +35,10 @@
 //! Scans the entire fleet's last_active timestamps. When EVERY
 //! tracked agent has been idle > `fleet_idle_threshold_secs() = 1800`
 //! (30 min) AND at least one agent has had recent activity (i.e.
-//! a sidecar exists), emits an inbox ping to `general` so the
-//! operator-facing aggregator surfaces the fleet stall. The
+//! a sidecar exists), emits an inbox ping to `lead` (#1563; was
+//! `general`) so the orchestrator surfaces / re-dispatches the
+//! fleet stall. Overridable via `AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT`.
+//! The
 //! "at least one tracked" guard distinguishes "fleet really
 //! stalled" from "fleet not yet started" / "all sidecars stale".
 //!
@@ -61,7 +63,8 @@ pub(crate) fn dev_idle_threshold_secs() -> i64 {
 }
 
 /// Lead-spec threshold for the fleet watchdog (vantage #12): every
-/// tracked agent silent > 30 min → ping general. Overridable via runtime-config.json (#1085).
+/// tracked agent silent > 30 min → ping lead (#1563; recipient was `general`).
+/// Threshold overridable via runtime-config.json (#1085).
 pub(crate) fn fleet_idle_threshold_secs() -> i64 {
     crate::runtime_config::get().fleet_idle_threshold_secs
 }
@@ -262,12 +265,23 @@ fn dev_idle_recipient() -> String {
         .unwrap_or_else(|| "lead".to_string())
 }
 
-/// Recipient for fleet-vantage idle alerts. Defaults to `general`.
+/// Recipient for fleet-vantage idle alerts. Defaults to `lead`.
+///
+/// #1563: the default was `general`, which spammed the general assistant with
+/// fleet-idle alerts overnight (it received them as the hardcoded recipient, not
+/// because it was itself forwarded). Fleet-idle is non-critical *coordination*
+/// signal ("the whole fleet is quiet — does work need dispatching?"), so the
+/// right recipient is the orchestrator `lead` — matching the sibling
+/// [`dev_idle_recipient`] default. Delivery to lead's inbox also *wakes* an idle
+/// lead so it can act. Operator-channel routing was deliberately NOT chosen:
+/// per #1339 the human operator must not be pinged for non-P0 signals.
+/// `AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT` still overrides (e.g. a mode-aware
+/// recipient under a future sleep mode).
 fn fleet_idle_recipient() -> String {
     std::env::var("AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT")
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "general".to_string())
+        .unwrap_or_else(|| "lead".to_string())
 }
 
 /// Pure scan logic: detects + emits idle alerts at both vantages.
@@ -404,7 +418,14 @@ fn scan_dev_vantage(
             .collect();
         cfg.instances
             .iter()
-            .filter(|(name, ic)| ic.idle_watchdog_enabled && !orchestrators.contains(name.as_str()))
+            .filter(|(name, ic)| {
+                ic.idle_watchdog_enabled
+                    && !orchestrators.contains(name.as_str())
+                    // #1563: an `OnDemand` coordinator is legitimately quiet
+                    // between requests — exempt it from idle tracking (same
+                    // knob that gates the supervisor stall-forward paths).
+                    && ic.idle_expectation == crate::fleet::IdleExpectation::Active
+            })
             .map(|(name, ic)| {
                 let threshold = ic
                     .timeout_secs
@@ -575,7 +596,13 @@ fn scan_fleet_vantage(
                 .filter(|(name, _)| {
                     cfg.instances
                         .get(name)
-                        .map(|ic| ic.idle_watchdog_enabled)
+                        // #1563: also drop `OnDemand` coordinators from the
+                        // fleet-wide all-idle quorum — an exempt agent must not
+                        // count toward "every tracked agent is silent".
+                        .map(|ic| {
+                            ic.idle_watchdog_enabled
+                                && ic.idle_expectation == crate::fleet::IdleExpectation::Active
+                        })
                         .unwrap_or(false)
                 })
                 .collect()
@@ -803,9 +830,19 @@ mod tests {
         let mut last_alerted = HashMap::new();
         scan_and_emit(&home, &mut last_alerted);
         let lead = crate::inbox::drain(&home, "lead");
-        assert_eq!(lead.len(), 1, "lead must receive idle alert: {lead:?}");
-        assert_eq!(lead[0].kind.as_deref(), Some("dev_idle_watchdog"));
-        assert!(lead[0].text.contains("dev"));
+        // #1563: the fleet recipient now also defaults to `lead`, so a
+        // single-agent idle fleet co-fires a `fleet_idle_watchdog` alert here
+        // too. Assert the DEV vantage specifically (filter by kind), not total.
+        let dev_alerts: Vec<_> = lead
+            .iter()
+            .filter(|m| m.kind.as_deref() == Some("dev_idle_watchdog"))
+            .collect();
+        assert_eq!(
+            dev_alerts.len(),
+            1,
+            "lead must receive one dev idle alert: {lead:?}"
+        );
+        assert!(dev_alerts[0].text.contains("dev"));
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -858,9 +895,14 @@ mod tests {
         let mut last_alerted = HashMap::new();
         scan_and_emit(&home, &mut last_alerted);
         let lead = crate::inbox::drain(&home, "lead");
+        // #1563: assert the DEV vantage specifically — a `fleet_idle_watchdog`
+        // alert may co-land on `lead` (the agent is past the shorter fleet
+        // threshold), which is a separate vantage this test does not exercise.
         assert!(
-            lead.is_empty(),
-            "active dev must NOT trigger alert: {lead:?}"
+            !lead
+                .iter()
+                .any(|m| m.kind.as_deref() == Some("dev_idle_watchdog")),
+            "active dev (within dev window) must NOT trigger a dev idle alert: {lead:?}"
         );
         std::fs::remove_dir_all(&home).ok();
     }
@@ -877,7 +919,15 @@ mod tests {
         let mut last_alerted = HashMap::new();
         scan_and_emit(&home, &mut last_alerted);
         let after_first = crate::inbox::drain(&home, "lead");
-        assert_eq!(after_first.len(), 1, "first scan alerts");
+        // #1563: filter the DEV vantage (fleet_idle co-fires to lead now).
+        assert_eq!(
+            after_first
+                .iter()
+                .filter(|m| m.kind.as_deref() == Some("dev_idle_watchdog"))
+                .count(),
+            1,
+            "first scan alerts (dev vantage)"
+        );
         // Touch activity (simulate dev resuming work).
         touch_agent_activity(&home, "dev");
         // Second scan: dev fresh → no alert.
@@ -912,12 +962,12 @@ mod tests {
         write_activity_at(&home, "reviewer", stale_reviewer);
         let mut last_alerted = HashMap::new();
         scan_and_emit(&home, &mut last_alerted);
-        let general = crate::inbox::drain(&home, "general");
+        let recipient = crate::inbox::drain(&home, "lead");
         assert!(
-            general
+            recipient
                 .iter()
                 .any(|m| m.kind.as_deref() == Some("fleet_idle_watchdog")),
-            "general must receive fleet alert: {general:?}"
+            "lead (#1563 default fleet recipient) must receive fleet alert: {recipient:?}"
         );
         std::fs::remove_dir_all(&home).ok();
     }
@@ -941,12 +991,12 @@ mod tests {
         write_activity_at(&home, "general", recent);
         let mut last_alerted = HashMap::new();
         scan_and_emit(&home, &mut last_alerted);
-        let general = crate::inbox::drain(&home, "general");
+        let recipient = crate::inbox::drain(&home, "lead");
         assert!(
-            !general
+            !recipient
                 .iter()
                 .any(|m| m.kind.as_deref() == Some("fleet_idle_watchdog")),
-            "fleet partial-activity must NOT trigger fleet alert: {general:?}"
+            "fleet partial-activity must NOT trigger fleet alert: {recipient:?}"
         );
         std::fs::remove_dir_all(&home).ok();
     }
@@ -967,8 +1017,8 @@ mod tests {
         write_activity_at(&home, "lead", stale);
         let mut last_alerted = HashMap::new();
         scan_and_emit(&home, &mut last_alerted);
-        let general = crate::inbox::drain(&home, "general");
-        let fleet_msg = general
+        let recipient = crate::inbox::drain(&home, "lead");
+        let fleet_msg = recipient
             .iter()
             .find(|m| m.kind.as_deref() == Some("fleet_idle_watchdog"))
             .expect("fleet alert");
@@ -1036,7 +1086,15 @@ mod tests {
         scan_and_emit(&home, &mut last_alerted);
         scan_and_emit(&home, &mut last_alerted);
         let lead = crate::inbox::drain(&home, "lead");
-        assert_eq!(lead.len(), 1, "second scan must be deduped: {lead:?}");
+        // #1563: filter the DEV vantage (fleet_idle co-fires to lead now); the
+        // dedup contract is per-vantage → exactly one dev alert across 2 scans.
+        assert_eq!(
+            lead.iter()
+                .filter(|m| m.kind.as_deref() == Some("dev_idle_watchdog"))
+                .count(),
+            1,
+            "second scan must be deduped (dev vantage): {lead:?}"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -1051,8 +1109,8 @@ mod tests {
         let home = tmp_home("fleet-empty");
         let mut last_alerted = HashMap::new();
         scan_and_emit(&home, &mut last_alerted);
-        let general = crate::inbox::drain(&home, "general");
-        assert!(general.is_empty(), "empty fleet must not alert");
+        let recipient = crate::inbox::drain(&home, "lead");
+        assert!(recipient.is_empty(), "empty fleet must not alert");
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -1083,6 +1141,23 @@ mod tests {
         let r = dev_idle_recipient();
         std::env::remove_var("AGEND_IDLE_WATCHDOG_DEV_RECIPIENT");
         assert_eq!(r, "alice");
+    }
+
+    /// #1563: unset → `lead` (was `general`, which spammed the general
+    /// assistant with fleet-idle alerts overnight); a set env value is honored.
+    #[test]
+    fn fleet_idle_recipient_defaults_to_lead_and_honors_env_override() {
+        let _g = env_lock();
+        std::env::remove_var("AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT");
+        assert_eq!(
+            fleet_idle_recipient(),
+            "lead",
+            "#1563: fleet-idle default recipient must be lead, not general"
+        );
+        std::env::set_var("AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT", "ops-bot");
+        let overridden = fleet_idle_recipient();
+        std::env::remove_var("AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT");
+        assert_eq!(overridden, "ops-bot", "env override must be honored");
     }
 
     // ── #1022 ghost-agent cleanup tests ───────────────────────────
@@ -1164,8 +1239,8 @@ mod tests {
         write_activity_at(&home, "conflict-test-1", stale);
         let mut last_alerted = HashMap::new();
         scan_and_emit(&home, &mut last_alerted);
-        let general = crate::inbox::drain(&home, "general");
-        let fleet_msg = general
+        let recipient = crate::inbox::drain(&home, "lead");
+        let fleet_msg = recipient
             .iter()
             .find(|m| m.kind.as_deref() == Some("fleet_idle_watchdog"))
             .expect("fleet alert must fire for stale live agents");
@@ -1206,12 +1281,12 @@ mod tests {
         snooze_fleet_idle(&home, until, "test").unwrap();
         let mut last_alerted = HashMap::new();
         scan_and_emit(&home, &mut last_alerted);
-        let general = crate::inbox::drain(&home, "general");
+        let recipient = crate::inbox::drain(&home, "lead");
         assert!(
-            !general
+            !recipient
                 .iter()
                 .any(|m| m.kind.as_deref() == Some("fleet_idle_watchdog")),
-            "#1084: snoozed fleet must NOT emit alert: {general:?}"
+            "#1084: snoozed fleet must NOT emit alert: {recipient:?}"
         );
         std::fs::remove_dir_all(&home).ok();
     }
@@ -1230,12 +1305,12 @@ mod tests {
         snooze_fleet_idle(&home, past, "test").unwrap();
         let mut last_alerted = HashMap::new();
         scan_and_emit(&home, &mut last_alerted);
-        let general = crate::inbox::drain(&home, "general");
+        let recipient = crate::inbox::drain(&home, "lead");
         assert!(
-            general
+            recipient
                 .iter()
                 .any(|m| m.kind.as_deref() == Some("fleet_idle_watchdog")),
-            "#1084: expired snooze must resume alerting: {general:?}"
+            "#1084: expired snooze must resume alerting: {recipient:?}"
         );
         std::fs::remove_dir_all(&home).ok();
     }
@@ -1294,12 +1369,12 @@ mod tests {
         write_activity_at(&home, "ghost-2", stale);
         let mut last_alerted = HashMap::new();
         scan_and_emit(&home, &mut last_alerted);
-        let general = crate::inbox::drain(&home, "general");
+        let recipient = crate::inbox::drain(&home, "lead");
         assert!(
-            !general
+            !recipient
                 .iter()
                 .any(|m| m.kind.as_deref() == Some("fleet_idle_watchdog")),
-            "active live agent + stale ghosts must NOT trigger fleet alert: {general:?}"
+            "active live agent + stale ghosts must NOT trigger fleet alert: {recipient:?}"
         );
         std::fs::remove_dir_all(&home).ok();
     }
@@ -1319,12 +1394,12 @@ mod tests {
         ack_fleet_idle();
         let mut last_alerted = HashMap::new();
         scan_and_emit(&home, &mut last_alerted);
-        let general = crate::inbox::drain(&home, "general");
+        let recipient = crate::inbox::drain(&home, "lead");
         assert!(
-            !general
+            !recipient
                 .iter()
                 .any(|m| m.kind.as_deref() == Some("fleet_idle_watchdog")),
-            "acked fleet idle must NOT trigger alert: {general:?}"
+            "acked fleet idle must NOT trigger alert: {recipient:?}"
         );
         clear_fleet_ack();
         std::fs::remove_dir_all(&home).ok();
@@ -1354,12 +1429,12 @@ mod tests {
         advance_task(&home, "t-resume", "dev");
         let mut last_alerted = HashMap::new();
         scan_and_emit(&home, &mut last_alerted);
-        let general = crate::inbox::drain(&home, "general");
+        let recipient = crate::inbox::drain(&home, "lead");
         assert!(
-            general
+            recipient
                 .iter()
                 .any(|m| m.kind.as_deref() == Some("fleet_idle_watchdog")),
-            "post-ack board progress + still-idle agents must trigger alert: {general:?}"
+            "post-ack board progress + still-idle agents must trigger alert: {recipient:?}"
         );
         assert_eq!(
             FLEET_ACKED_AT.load(Ordering::Relaxed),
@@ -1393,12 +1468,12 @@ mod tests {
         write_activity_at(&home, "general", post_ack);
         let mut last_alerted = HashMap::new();
         scan_and_emit(&home, &mut last_alerted);
-        let general = crate::inbox::drain(&home, "general");
+        let recipient = crate::inbox::drain(&home, "lead");
         assert!(
-            !general
+            !recipient
                 .iter()
                 .any(|m| m.kind.as_deref() == Some("fleet_idle_watchdog")),
-            "on-demand chatter must NOT wash the ack / re-fire alert: {general:?}"
+            "on-demand chatter must NOT wash the ack / re-fire alert: {recipient:?}"
         );
         assert_ne!(
             FLEET_ACKED_AT.load(Ordering::Relaxed),
@@ -1497,12 +1572,12 @@ mod tests {
         .unwrap();
         let mut last_alerted = HashMap::new();
         scan_and_emit(&home, &mut last_alerted);
-        let general = crate::inbox::drain(&home, "general");
+        let recipient = crate::inbox::drain(&home, "lead");
         assert!(
-            !general
+            !recipient
                 .iter()
                 .any(|m| m.kind.as_deref() == Some("fleet_idle_watchdog")),
-            "all-done board must not fire fleet idle alert: {general:?}"
+            "all-done board must not fire fleet idle alert: {recipient:?}"
         );
         std::fs::remove_dir_all(&home).ok();
     }
@@ -1542,12 +1617,12 @@ mod tests {
         std::fs::write(home.join("task_events.jsonl"), "").unwrap();
         let mut last_alerted = HashMap::new();
         scan_and_emit(&home, &mut last_alerted);
-        let general = crate::inbox::drain(&home, "general");
+        let recipient = crate::inbox::drain(&home, "lead");
         assert!(
-            !general
+            !recipient
                 .iter()
                 .any(|m| m.kind.as_deref() == Some("fleet_idle_watchdog")),
-            "#1141: fleet idle must be suppressed when no work expected: {general:?}"
+            "#1141: fleet idle must be suppressed when no work expected: {recipient:?}"
         );
         std::fs::remove_dir_all(&home).ok();
     }
@@ -1585,12 +1660,12 @@ mod tests {
         .unwrap();
         let mut last_alerted = HashMap::new();
         scan_and_emit(&home, &mut last_alerted);
-        let general = crate::inbox::drain(&home, "general");
+        let recipient = crate::inbox::drain(&home, "lead");
         assert!(
-            general
+            recipient
                 .iter()
                 .any(|m| m.kind.as_deref() == Some("fleet_idle_watchdog")),
-            "#1141: fleet idle must fire when open tasks exist: {general:?}"
+            "#1141: fleet idle must fire when open tasks exist: {recipient:?}"
         );
         std::fs::remove_dir_all(&home).ok();
     }

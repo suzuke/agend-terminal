@@ -110,6 +110,23 @@ fn mark_composing(home: &Path, agent: &str) {
     .ok();
 }
 
+/// #1513: a PAUSED operator draft — keystroke entered but idle past the
+/// fresh-keystroke anti-collision window (here ~3s ago, still well within the
+/// #1457 5-min draft hold). Used to test that an actionable wake bypasses the
+/// DRAFT HOLD (the #1473 contract) without colliding with the new #1513
+/// fresh-keystroke yield (covered separately in `should_defer_inject_tests_1513`).
+fn mark_composing_stale(home: &Path, agent: &str) {
+    std::fs::create_dir_all(home.join("metadata")).ok();
+    std::fs::write(
+        home.join("metadata").join(format!("{agent}.json")),
+        format!(
+            "{{\"last_input_epoch_ms\":{}}}",
+            chrono::Utc::now().timestamp_millis() - 3_000
+        ),
+    )
+    .ok();
+}
+
 #[test]
 fn enqueue_drain_roundtrip() {
     let home = tmp_home("roundtrip");
@@ -2296,8 +2313,12 @@ fn t12_pty_state_kind_matrix() {
         );
 
         // Composing path — hint deferred into notification_queue.
+        // #1513: use a PAUSED draft (>1.5s since last keystroke) so this tests
+        // the #1473 draft-HOLD bypass, not the new fresh-keystroke anti-collision
+        // yield (which would defer actionable too — covered in
+        // should_defer_inject_tests_1513::actionable_defers_on_recent_typing).
         let composing_home = tmp_home(&format!("982-t12-{kind}"));
-        mark_composing(&composing_home, "agent1");
+        mark_composing_stale(&composing_home, "agent1");
         let mut msg = make_msg("system:t12", "composing");
         msg.kind = Some(kind.to_string());
         let before = crate::notification_queue::pending_count(&composing_home, "agent1");

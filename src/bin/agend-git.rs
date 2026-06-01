@@ -13,7 +13,7 @@
 //! status() + exit(code) for equivalent behavior.
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -99,26 +99,42 @@ fn main() {
     // from polluting canonical worktrees with stale refs.
     let is_agent_caller = env::var_os("AGEND_INSTANCE_NAME").is_some();
 
-    match classify(
+    // #1463 (A): a bound agent's mutating command whose cwd is a FOREIGN git
+    // repo (separate object store — e.g. a test scratch repo) should operate on
+    // THAT repo, not be redirected into the worktree. Post-process the classify
+    // result so the (unchanged, unit-tested) `classify` stays cwd-agnostic.
+    let action = apply_foreign_repo_passthrough(
+        classify(
+            subcommand,
+            &args,
+            &binding,
+            parent_is_gh,
+            canonical_cwd,
+            is_agent_caller,
+        ),
         subcommand,
-        &args,
-        &binding,
-        parent_is_gh,
-        canonical_cwd,
-        is_agent_caller,
-    ) {
+        cwd_is_foreign_repo(&binding),
+    );
+
+    // #1463 (B): on every ChdirPass, strip the caller's leading global target
+    // overrides (`-C` / `--git-dir` / `--work-tree`) so the shim's own
+    // `-C <worktree>` is authoritative. Passthrough is left verbatim (the
+    // command runs against the cwd it was actually aimed at).
+    match action {
         Action::Passthrough => exec_real_git(&args, None),
         Action::ChdirPass(worktree) if is_conflict_capable(subcommand) => {
-            exec_with_conflict_guidance(&args, &worktree);
+            exec_with_conflict_guidance(&strip_target_overrides(&args), &worktree);
         }
-        Action::ChdirPass(worktree) => exec_real_git(&args, Some(&worktree)),
+        Action::ChdirPass(worktree) => {
+            exec_real_git(&strip_target_overrides(&args), Some(&worktree))
+        }
         Action::CleanupAndChdirPushPass(worktree) => {
             // #883: best-effort pre-push cleanup of empty `init`
             // heartbeat commits. Failure is logged + we still pass
             // through to real `git push` — cleanup MUST NOT block
             // real work from landing.
             cleanup_init_pile_pre_push(&worktree);
-            exec_real_git(&args, Some(&worktree))
+            exec_real_git(&strip_target_overrides(&args), Some(&worktree))
         }
         Action::SilentExempt {
             target_branch,
@@ -333,6 +349,229 @@ fn cwd_is_canonical_rooted() -> bool {
         // etc.) — fail closed.
         false
     }
+}
+
+/// #1463: resolve the `.git` directory for `start` the way git does — walk up
+/// to the first `.git`, following a `.git` FILE's `gitdir:` pointer (linked
+/// worktree) but NOT a `.git` symlink (fail-closed against pointer-craft).
+/// Returns the canonicalized gitdir, or `None` on any IO/parse ambiguity.
+/// Kept separate from `cwd_is_canonical_rooted` (which keys off `[remote
+/// "origin"]` presence) per the #1463 ruling — same `.git`-resolve spirit,
+/// different semantics (object-store identity vs canonical-origin membership).
+fn find_git_dir(start: &Path) -> Option<PathBuf> {
+    let start = std::fs::canonicalize(start).ok()?;
+    let mut dir: &Path = &start;
+    loop {
+        let dot_git = dir.join(".git");
+        match std::fs::symlink_metadata(&dot_git) {
+            Ok(meta) if meta.is_dir() => return std::fs::canonicalize(&dot_git).ok(),
+            Ok(meta) if meta.is_file() => {
+                let content = std::fs::read_to_string(&dot_git).ok()?;
+                let ptr = content
+                    .lines()
+                    .find_map(|l| l.strip_prefix("gitdir:").map(str::trim))?;
+                let p = PathBuf::from(ptr);
+                let gitdir = if p.is_absolute() { p } else { dir.join(p) };
+                return std::fs::canonicalize(&gitdir).ok();
+            }
+            // `.git` is a symlink or other irregular shape → fail-closed.
+            Ok(_) => return None,
+            // No `.git` here → walk up.
+            Err(_) => dir = dir.parent()?,
+        }
+    }
+}
+
+/// #1463: resolve the COMMON git dir (shared object store + refs) for `start`,
+/// mirroring git's `commondir` resolution — a linked worktree's gitdir carries
+/// a `commondir` file pointing at the shared `<source>/.git`. Two paths that
+/// resolve to the SAME commondir share one object store. Canonicalized; `None`
+/// on any ambiguity. Defeats `.git`-pointer craft: a `.git` file pointing
+/// `gitdir: <canonical>/.git` resolves to canonical's commondir (no `commondir`
+/// file in the main gitdir → gitdir IS the common dir), so it is NOT seen as
+/// foreign.
+fn resolve_commondir(start: &Path) -> Option<PathBuf> {
+    let gitdir = find_git_dir(start)?;
+    let common = match std::fs::read_to_string(gitdir.join("commondir")) {
+        Ok(s) => {
+            let rel = s.trim();
+            if rel.is_empty() {
+                gitdir.clone()
+            } else {
+                let p = PathBuf::from(rel);
+                if p.is_absolute() {
+                    p
+                } else {
+                    gitdir.join(p)
+                }
+            }
+        }
+        Err(_) => gitdir.clone(),
+    };
+    std::fs::canonicalize(&common).ok()
+}
+
+/// #1463 (A): is the current working directory a git repo whose object store is
+/// SEPARATE from the bound worktree's (a foreign / scratch repo, e.g. a test
+/// incubator)? When true a mutating command was aimed at THAT repo, not the
+/// worktree — passing it through avoids hijacking it into the worktree (the
+/// init-pile pollution). Fail-closed: a retargeting env var, an unresolved
+/// commondir, or a missing worktree → `false` (→ ChdirPass keeps the existing
+/// protection). SAFETY: canonical and EVERY sibling worktree resolve to
+/// canonical's commondir, so a `true` here can ONLY mean a genuinely-separate
+/// store the agent cannot use to reach canonical / shared refs / a sibling.
+fn cwd_is_foreign_repo(binding: &Binding) -> bool {
+    // GIT_DIR / GIT_COMMON_DIR / GIT_WORK_TREE retarget git independently of the
+    // cwd `.git` discovery this check relies on → fail-closed.
+    if env::var_os("GIT_DIR").is_some()
+        || env::var_os("GIT_COMMON_DIR").is_some()
+        || env::var_os("GIT_WORK_TREE").is_some()
+    {
+        return false;
+    }
+    let wt = match binding.worktree {
+        Some(ref w) => w,
+        None => return false,
+    };
+    let cwd = match env::current_dir() {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    paths_are_foreign(&cwd, Path::new(wt))
+}
+
+/// #1463 (A): the pure object-store-identity comparison behind
+/// `cwd_is_foreign_repo` — `true` iff both paths resolve to a commondir AND the
+/// two commondirs differ. Fail-closed (`false`) if either side is unresolvable.
+/// Split out so the adversarial matrix is hermetically testable without
+/// touching the process cwd.
+fn paths_are_foreign(cwd: &Path, worktree: &Path) -> bool {
+    match (resolve_commondir(cwd), resolve_commondir(worktree)) {
+        (Some(c), Some(w)) => c != w,
+        _ => false,
+    }
+}
+
+/// #1463 (A): the LOCAL mutating subcommands eligible for foreign-repo
+/// passthrough — exactly the porcelain/plumbing mutating arm's token set.
+/// `push` and `checkout`/`switch` are deliberately excluded (kept maximally
+/// protected); read-only and unbound paths never reach the conversion.
+fn is_mutating_local(subcmd: &str) -> bool {
+    matches!(
+        subcmd,
+        "commit"
+            | "pull"
+            | "reset"
+            | "revert"
+            | "cherry-pick"
+            | "stash"
+            | "merge"
+            | "rebase"
+            | "am"
+            | "add"
+            | "rm"
+            | "mv"
+            | "read-tree"
+            | "update-index"
+            | "apply"
+    )
+}
+
+/// #1463 (A): convert a bound-agent `ChdirPass` into `Passthrough` when the
+/// command is a local mutating one AND cwd is a foreign repo. Pure so the
+/// matrix is unit-testable; everything else (push/checkout ChdirPass, Deny,
+/// already-Passthrough) is returned unchanged.
+fn apply_foreign_repo_passthrough(action: Action, subcmd: &str, cwd_foreign: bool) -> Action {
+    match action {
+        Action::ChdirPass(_) if cwd_foreign && is_mutating_local(subcmd) => Action::Passthrough,
+        other => other,
+    }
+}
+
+/// #1463: index of the real subcommand in `args` — the first non-option token,
+/// skipping leading git global options and CONSUMING the value of value-taking
+/// ones (so a `-C <path>` value is not mistaken for the subcommand). `None` if
+/// there is no subcommand (globals only). Mirrors the subset of git's
+/// global-option grammar that takes a separate value.
+fn subcommand_index(args: &[String]) -> Option<usize> {
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if !a.starts_with('-') {
+            return Some(i);
+        }
+        // Separated-value globals consume the next token; glued / `=` forms and
+        // no-value globals are a single token.
+        if matches!(
+            a,
+            "-C" | "-c"
+                | "--git-dir"
+                | "--work-tree"
+                | "--namespace"
+                | "--super-prefix"
+                | "--config-env"
+                | "--exec-path"
+        ) {
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// #1463 (B): on a ChdirPass for a MUTATING-local command, strip the caller's
+/// LEADING global target overrides (`-C`, `--git-dir`, `--work-tree`, incl.
+/// glued / `=` / separated-value forms) so the shim's own `-C <worktree>` is the
+/// SOLE authority — a caller's trailing `-C <elsewhere>` would otherwise win the
+/// left-to-right `-C` race and mutate `<elsewhere>` (e.g. canonical) despite the
+/// redirect. GATED to mutating-local subcommands: a NON-mutating `git -C <dir>
+/// rev-parse / log / config / init` keeps honoring `-C` (those neither pollute
+/// nor mutate history, and stripping them would break legit helpers such as
+/// `ensure_project_root`). Only the GLOBAL (pre-subcommand) region is touched,
+/// so a post-subcommand `-C` (`git commit -C <commit>` = reuse-message) is
+/// preserved. Non-mutating commands and arg lists without a leading override are
+/// returned unchanged. Also closes the same `-C` blind spot in the pre-existing
+/// canonical protection.
+fn strip_target_overrides(args: &[String]) -> Vec<String> {
+    let sub_idx = match subcommand_index(args) {
+        Some(i) if is_mutating_local(args[i].as_str()) => i,
+        // No subcommand, or a non-mutating one → leave `-C` etc. intact.
+        _ => return args.to_vec(),
+    };
+    let mut out: Vec<String> = Vec::with_capacity(args.len());
+    let mut i = 0;
+    // Walk ONLY the leading global region [0, sub_idx).
+    while i < sub_idx {
+        let a = args[i].as_str();
+        // Separated-value target overrides → drop the option AND its value.
+        if a == "-C" || a == "--git-dir" || a == "--work-tree" {
+            i += 2;
+            continue;
+        }
+        // Glued / `=` target overrides → drop the single token.
+        if a.starts_with("-C") || a.starts_with("--git-dir=") || a.starts_with("--work-tree=") {
+            i += 1;
+            continue;
+        }
+        // Other value-taking globals: KEEP, with their value.
+        if matches!(
+            a,
+            "-c" | "--namespace" | "--super-prefix" | "--config-env" | "--exec-path"
+        ) {
+            out.push(args[i].clone());
+            if i + 1 < sub_idx {
+                out.push(args[i + 1].clone());
+            }
+            i += 2;
+            continue;
+        }
+        // No-value global → keep the single token.
+        out.push(args[i].clone());
+        i += 1;
+    }
+    out.extend_from_slice(&args[sub_idx..]);
+    out
 }
 
 /// #1511 follow-up: a MUTATING-form action — deny when unbound, else route to
@@ -2583,5 +2822,256 @@ mod tests {
             guidance.contains("Do NOT abandon"),
             "should discourage abandoning"
         );
+    }
+
+    // ── #1463: foreign-repo passthrough (A) + target-override strip (B) ──
+
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static TMP_CTR_1463: AtomicU32 = AtomicU32::new(0);
+
+    fn uniq_tmp_1463(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "agend-1463-{}-{}-{}",
+            tag,
+            std::process::id(),
+            TMP_CTR_1463.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Fabricate a canonical-style source repo (`<root>/.git/` DIR) — hermetic,
+    /// no `git` invocation (so the shim is never re-entered by the test).
+    fn fake_source_repo(root: &Path) {
+        let git = root.join(".git");
+        std::fs::create_dir_all(&git).unwrap();
+        std::fs::write(git.join("config"), "[core]\n").unwrap();
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    }
+
+    /// Fabricate a linked worktree of `source_root`: a `worktrees/<name>/` entry
+    /// carrying a `commondir` file, plus the worktree dir's `.git` FILE pointer.
+    fn fake_worktree(source_root: &Path, wt_root: &Path, name: &str) {
+        let entry = source_root.join(".git").join("worktrees").join(name);
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(entry.join("commondir"), "../..\n").unwrap();
+        std::fs::create_dir_all(wt_root).unwrap();
+        std::fs::write(
+            wt_root.join(".git"),
+            format!("gitdir: {}\n", entry.display()),
+        )
+        .unwrap();
+    }
+
+    // (a) an independent `git init` temp repo is FOREIGN → passthrough.
+    #[test]
+    fn foreign_scratch_repo_is_foreign_1463() {
+        let src = uniq_tmp_1463("src");
+        fake_source_repo(&src);
+        let wt = uniq_tmp_1463("wt");
+        fake_worktree(&src, &wt, "w1");
+        let scratch = uniq_tmp_1463("scratch");
+        fake_source_repo(&scratch); // its own, separate object store
+        assert!(
+            paths_are_foreign(&scratch, &wt),
+            "an independent scratch repo has a separate commondir → foreign"
+        );
+    }
+
+    // (b) the canonical SOURCE repo shares the worktree's commondir → NOT foreign.
+    #[test]
+    fn canonical_source_not_foreign_1463() {
+        let src = uniq_tmp_1463("src");
+        fake_source_repo(&src);
+        let wt = uniq_tmp_1463("wt");
+        fake_worktree(&src, &wt, "w1");
+        assert!(
+            !paths_are_foreign(&src, &wt),
+            "canonical source shares the worktree's commondir → must ChdirPass"
+        );
+    }
+
+    // (c) a SIBLING worktree (`.git` FILE) shares canonical's commondir → NOT foreign.
+    #[test]
+    fn sibling_worktree_not_foreign_1463() {
+        let src = uniq_tmp_1463("src");
+        fake_source_repo(&src);
+        let mine = uniq_tmp_1463("mine");
+        fake_worktree(&src, &mine, "mine");
+        let sib = uniq_tmp_1463("sib");
+        fake_worktree(&src, &sib, "sibling");
+        assert!(
+            !paths_are_foreign(&sib, &mine),
+            "a sibling worktree shares canonical's commondir → must ChdirPass (no sibling-write)"
+        );
+    }
+
+    // (e) craft: a `.git` FILE pointing `gitdir: <canonical>/.git` resolves to
+    // canonical's commondir → NOT foreign (no canonical-write bypass).
+    #[test]
+    fn craft_gitfile_pointing_canonical_not_foreign_1463() {
+        let src = uniq_tmp_1463("src");
+        fake_source_repo(&src);
+        let wt = uniq_tmp_1463("wt");
+        fake_worktree(&src, &wt, "w1");
+        let evil = uniq_tmp_1463("evil");
+        std::fs::write(
+            evil.join(".git"),
+            format!("gitdir: {}\n", src.join(".git").display()),
+        )
+        .unwrap();
+        assert!(
+            !paths_are_foreign(&evil, &wt),
+            "craft pointing at canonical's .git resolves to canonical commondir → NOT foreign"
+        );
+    }
+
+    // (e) a `.git` SYMLINK → fail-closed (NOT foreign → ChdirPass).
+    #[cfg(unix)]
+    #[test]
+    fn symlink_gitfile_fails_closed_1463() {
+        let src = uniq_tmp_1463("src");
+        fake_source_repo(&src);
+        let wt = uniq_tmp_1463("wt");
+        fake_worktree(&src, &wt, "w1");
+        let evil = uniq_tmp_1463("evilsym");
+        std::os::unix::fs::symlink(src.join(".git"), evil.join(".git")).unwrap();
+        assert!(
+            !paths_are_foreign(&evil, &wt),
+            "a `.git` symlink is an irregular shape → fail-closed → NOT foreign"
+        );
+    }
+
+    // parse-fail / no-repo cwd → fail-closed (NOT foreign).
+    #[test]
+    fn unresolvable_cwd_fails_closed_1463() {
+        let src = uniq_tmp_1463("src");
+        fake_source_repo(&src);
+        let wt = uniq_tmp_1463("wt");
+        fake_worktree(&src, &wt, "w1");
+        let nonrepo = uniq_tmp_1463("nonrepo"); // no `.git` anywhere up the tree
+        let garbage = uniq_tmp_1463("garbage");
+        std::fs::write(garbage.join(".git"), "not a gitdir pointer\n").unwrap();
+        assert!(
+            !paths_are_foreign(&nonrepo, &wt),
+            "no resolvable repo → fail-closed NOT foreign"
+        );
+        assert!(
+            !paths_are_foreign(&garbage, &wt),
+            "garbage `.git` file (no gitdir:) → fail-closed NOT foreign"
+        );
+    }
+
+    // (A) the ChdirPass→Passthrough conversion matrix.
+    #[test]
+    fn foreign_passthrough_action_matrix_1463() {
+        use Action::*;
+        // local mutating + foreign → Passthrough
+        assert_eq!(
+            apply_foreign_repo_passthrough(ChdirPass("wt".into()), "commit", true),
+            Passthrough
+        );
+        assert_eq!(
+            apply_foreign_repo_passthrough(ChdirPass("wt".into()), "add", true),
+            Passthrough
+        );
+        // local mutating + NOT foreign → unchanged ChdirPass
+        assert_eq!(
+            apply_foreign_repo_passthrough(ChdirPass("wt".into()), "commit", false),
+            ChdirPass("wt".into())
+        );
+        // push / checkout are NOT local-mutating → stay ChdirPass even if foreign
+        assert_eq!(
+            apply_foreign_repo_passthrough(ChdirPass("wt".into()), "push", true),
+            ChdirPass("wt".into())
+        );
+        assert_eq!(
+            apply_foreign_repo_passthrough(ChdirPass("wt".into()), "checkout", true),
+            ChdirPass("wt".into())
+        );
+        // non-ChdirPass inputs are returned verbatim
+        assert_eq!(
+            apply_foreign_repo_passthrough(Deny("x".into()), "commit", true),
+            Deny("x".into())
+        );
+        assert_eq!(
+            apply_foreign_repo_passthrough(Passthrough, "commit", true),
+            Passthrough
+        );
+    }
+
+    // (B) GATED to mutating-local: a leading `-C`/`--git-dir`/`--work-tree` is
+    // stripped ONLY when the real subcommand mutates (so the shim's
+    // `-C <worktree>` wins and `<elsewhere>` — e.g. canonical — is not touched);
+    // non-mutating `-C` and a post-subcommand `-C` (reuse-message) are preserved.
+    #[test]
+    fn strip_target_overrides_1463() {
+        // ── MUTATING-local + leading override → STRIPPED ──
+        assert_eq!(
+            strip_target_overrides(&s(&["-C", "/tmp/x", "commit", "-m", "z"])),
+            s(&["commit", "-m", "z"])
+        );
+        assert_eq!(
+            strip_target_overrides(&s(&["--git-dir", "/g", "add", "."])),
+            s(&["add", "."])
+        );
+        assert_eq!(
+            strip_target_overrides(&s(&["--git-dir=/g", "commit"])),
+            s(&["commit"])
+        );
+        assert_eq!(
+            strip_target_overrides(&s(&["--work-tree", "/w", "reset", "--hard"])),
+            s(&["reset", "--hard"])
+        );
+        // glued -C<path>
+        assert_eq!(
+            strip_target_overrides(&s(&["-C/tmp/x", "commit"])),
+            s(&["commit"])
+        );
+        // repeated -C all dropped (the left-to-right override chain)
+        assert_eq!(
+            strip_target_overrides(&s(&["-C", "/a", "-C", "/b", "commit"])),
+            s(&["commit"])
+        );
+        // value-taking non-target global (-c) kept WITH its value, -C dropped
+        assert_eq!(
+            strip_target_overrides(&s(&["-c", "k=v", "-C", "/x", "commit"])),
+            s(&["-c", "k=v", "commit"])
+        );
+        // lead matrix: `git -C <canonical> commit` (mutating) → strip → worktree.
+        assert_eq!(
+            strip_target_overrides(&s(&["-C", "/canonical", "commit"])),
+            s(&["commit"])
+        );
+
+        // ── NON-mutating + leading -C → PRESERVED (gating) ──
+        assert_eq!(
+            strip_target_overrides(&s(&["-C", "/tmp/x", "rev-parse", "--is-inside-work-tree"])),
+            s(&["-C", "/tmp/x", "rev-parse", "--is-inside-work-tree"])
+        );
+        assert_eq!(
+            strip_target_overrides(&s(&["-C", "/tmp/x", "init", "--quiet"])),
+            s(&["-C", "/tmp/x", "init", "--quiet"])
+        );
+        // lead matrix: `git -C <canonical> rev-parse` (non-mutating) → read in place.
+        assert_eq!(
+            strip_target_overrides(&s(&["-C", "/canonical", "rev-parse"])),
+            s(&["-C", "/canonical", "rev-parse"])
+        );
+
+        // ── preserved / no-op forms ──
+        // POST-subcommand `-C` (git commit reuse-message) PRESERVED
+        assert_eq!(
+            strip_target_overrides(&s(&["commit", "-C", "HEAD"])),
+            s(&["commit", "-C", "HEAD"])
+        );
+        // no globals → unchanged
+        assert_eq!(
+            strip_target_overrides(&s(&["commit", "-m", "x"])),
+            s(&["commit", "-m", "x"])
+        );
+        // globals-only / malformed (no subcommand) → unchanged, no panic
+        assert_eq!(strip_target_overrides(&s(&["-C"])), s(&["-C"]));
+        assert_eq!(strip_target_overrides(&s(&["-C", "/x"])), s(&["-C", "/x"]));
     }
 }

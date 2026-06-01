@@ -580,6 +580,7 @@ impl CiProvider for GitHubCiProvider {
         // runtime stays free — and so we NEVER `block_on` the shared ci runtime
         // (#1476: that would panic "cannot start a runtime from within a
         // runtime"). Bounded by a timeout so a wedged `gh` can't stall the poll.
+        let repo_log = repo.to_string(); // for diagnostic warns (repo is moved into the closure)
         let repo = repo.to_string();
         let run = tokio::task::spawn_blocking(move || {
             std::process::Command::new("gh")
@@ -593,17 +594,39 @@ impl CiProvider for GitHubCiProvider {
                 ])
                 .output()
         });
-        let out = tokio::time::timeout(std::time::Duration::from_secs(20), run)
-            .await
-            .ok()? // timeout
-            .ok()? // JoinError
-            .ok()?; // spawn/exec error
+        // #1537 follow-up: log WHY a fetch yields no tail instead of swallowing
+        // it (every failure mode used to collapse to a silent `None`, so a
+        // tail-less notification was undiagnosable — e.g. the #1542 windows
+        // case). Still always returns None on any failure (notification degrades
+        // to the no-tail checklist); the warn is observability only.
+        let out = match tokio::time::timeout(std::time::Duration::from_secs(20), run).await {
+            Err(_) => {
+                tracing::warn!(repo = %repo_log, run_id, "#1537: failed-log tail fetch timed out (20s) — notification omits tail");
+                return None;
+            }
+            Ok(Err(join_err)) => {
+                tracing::warn!(repo = %repo_log, run_id, error = %join_err, "#1537: failed-log tail fetch task join error");
+                return None;
+            }
+            Ok(Ok(Err(exec_err))) => {
+                tracing::warn!(repo = %repo_log, run_id, error = %exec_err, "#1537: failed-log tail fetch could not exec `gh`");
+                return None;
+            }
+            Ok(Ok(Ok(out))) => out,
+        };
         if !out.status.success() {
+            let stderr: String = String::from_utf8_lossy(&out.stderr)
+                .trim()
+                .chars()
+                .take(300)
+                .collect();
+            tracing::warn!(repo = %repo_log, run_id, code = ?out.status.code(), stderr = %stderr, "#1537: `gh run view --log-failed` non-zero (run may be incomplete) — notification omits tail");
             return None;
         }
         let raw = String::from_utf8_lossy(&out.stdout);
         let trimmed = raw.trim();
         if trimmed.is_empty() {
+            tracing::warn!(repo = %repo_log, run_id, "#1537: `gh run view --log-failed` empty stdout — notification omits tail");
             return None;
         }
         // 8 KiB byte cap alongside the line cap (defends against one huge line).

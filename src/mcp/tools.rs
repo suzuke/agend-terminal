@@ -120,9 +120,10 @@ pub(crate) fn def_restart_instance() -> Value {
 }
 
 pub(crate) fn def_tokens() -> Value {
-    json!({"name": "tokens", "description": "On-demand token usage + estimated USD cost from Claude Code session transcripts (Claude backends only, Phase 1). Scans ~/.claude/projects/*.jsonl at query time, dedups streaming-duplicated rows by message id, and attributes usage to fleet instances by transcript cwd (workspace + worktree paths). action=summary → fleet totals + per-instance table; action=by_instance (requires `instance`) → that instance's per-model breakdown. Cost is an ESTIMATE pending operator pricing calibration; excludes the >200k long-context surcharge tier; non-Claude backends (Codex/OpenCode/Kiro/Gemini) are not yet covered.",
+    json!({"name": "tokens", "description": "On-demand token usage + estimated USD cost from Claude Code + Codex session transcripts. Scans ~/.claude/projects/*.jsonl and ~/.codex/sessions/rollout-*.jsonl at query time, dedups streaming-duplicated rows by message id, and attributes usage to fleet instances by transcript cwd (workspace + worktree paths). action=summary → fleet totals + per-instance table; action=by_instance (requires `instance`) → that instance's per-model breakdown. group_by=task (#1077 slice-1) time-joins each message to whichever task the instance had active at the message's timestamp, with a (no active task) bucket — this is TIME-WINDOW ATTRIBUTION, NOT per-task billing. Cost is an ESTIMATE pending operator pricing calibration; excludes the >200k long-context surcharge tier; OpenCode/Kiro/Gemini are not yet covered.",
     "inputSchema": {"type": "object", "properties": {
         "action": {"type": "string", "enum": ["summary", "by_instance"], "default": "summary"},
+        "group_by": {"type": "string", "enum": ["instance", "task"], "default": "instance", "description": "instance (default) → per-instance/per-model; task → per-instance/per-task time-join (#1077). Default is backward-compatible."},
         "since": {"type": "string", "description": "Lookback window: \"24h\" (default) / \"7d\" / \"90m\" / \"all\""},
         "instance": {"type": "string", "description": "Required for action=by_instance; optional filter for action=summary"}
     }}})
@@ -295,6 +296,13 @@ pub(crate) fn def_config() -> Value {
         "key": {"type": "string", "description": "Config key name (required for get/set)"},
         "value": {"type": "string", "description": "New value (required for set)"}
     }, "required": ["action"]}})
+}
+
+pub(crate) fn def_mode() -> Value {
+    json!({"name": "mode", "description": "#1339: Read the operator availability/authority mode (READ-ONLY for agents). `get` → current mode (active|away|sleep) + delegate. Agents observe this to back off when the operator is away/asleep. SETTING the mode is operator-only via the `agend-terminal mode <active|away|sleep>` CLI — never available to agents.",
+        "inputSchema": {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["get"], "default": "get"}
+        }, "required": ["action"]}})
 }
 
 pub(crate) fn def_health() -> Value {
@@ -502,8 +510,8 @@ mod tests {
         let tools = defs["tools"].as_array().expect("tools array");
         assert_eq!(
             tools.len(),
-            35,
-            "#1400: 34 + tokens (#1077 Phase 1) = 35. \
+            36,
+            "#1400: 34 + tokens (#1077 Phase 1) = 35; + mode (#1339 Operator Mode) = 36. \
              Current tools: {:?}",
             tools
                 .iter()

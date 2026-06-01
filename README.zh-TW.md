@@ -69,7 +69,9 @@ Telegram 綁定（遠端控制 + 外發通知）請參閱 [`docs/USAGE.md` § Ch
 | Codex | `codex` | 已測試 |
 | OpenCode | `opencode` | 已測試 |
 | Gemini CLI | `gemini` | 已測試（2026-06-18 起免費/Pro/Ultra 停止服務；付費 Code Assist Standard/Enterprise 保留存取） |
-| Antigravity CLI | `antigravity-cli`（二進位 `agy`） | 已測試（#987——Gemini CLI 的官方繼任者；#995 polish）。**目前 AGY 版本不支援 Fleet MCP bridge**——agy instance 啟動時不具備 `send`/`inbox`/`task` 工具（operator 會在 `app.log` 中看到 `[fleet-mcp-unsupported]` 警告）。適合手動作業；等待上游 `google-antigravity/antigravity-cli` 修復。 |
+| Antigravity CLI | `antigravity-cli`（二進位 `agy`） | 不支援 |
+
+> `agy` backend 目前**不支援**：除了缺少 Fleet MCP bridge，此 backend 的已知問題暫不進入修正階段。在 project-scoped MCP 被支援（[#1262](https://github.com/suzuke/agend-terminal/issues/1262)）或自家 CLI 工具完成前不會重啟支援。詳見 [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md)（[#1547](https://github.com/suzuke/agend-terminal/issues/1547)）。
 
 ## 深入了解
 
@@ -105,6 +107,7 @@ Telegram 綁定（遠端控制 + 外發通知）請參閱 [`docs/USAGE.md` § Ch
 
 - **命令**——[`docs/CLI.md`](docs/CLI.md) 完整子命令參考。
 - **MCP 工具**——[`docs/MCP-TOOLS.md`](docs/MCP-TOOLS.md) 35 個 agent 間協作工具。
+- **已知問題**——[`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md) 暫不處理的已知項；開 issue 前請先確認。
 - **架構**——[`docs/architecture.md`](docs/architecture.md) 涵蓋 git worktree 隔離、健康監控 + 自動重啟、Telegram topic 生命週期，以及 daemon-resident 設計。
 - **秘訣**——[`docs/RECIPE-clean-claude-instance.md`](docs/RECIPE-clean-claude-instance.md) 啟動不含全域指令或 auto-memory 的乾淨 Claude Code instance。
 - **貢獻**——[`CONTRIBUTING.md`](CONTRIBUTING.md)。

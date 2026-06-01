@@ -201,14 +201,22 @@ mod tests {
     }
 
     fn init_git_repo(dir: &std::path::Path) {
+        // #1463: this scratch-repo commit must BYPASS the agend-git shim — when
+        // an agent runs the suite its env carries AGEND_INSTANCE_NAME, so a
+        // non-bypassed `commit` would be ChdirPass'd into the bound worktree
+        // (the init-pile pollution). Layer A also catches the current_dir form,
+        // but the explicit bypass is the durable, form-agnostic guard (enforced
+        // by tests/git_test_bypass_invariant.rs).
         std::process::Command::new("git")
             .args(["init", "-b", "main"])
             .current_dir(dir)
+            .env("AGEND_GIT_BYPASS", "1")
             .output()
             .unwrap();
         std::process::Command::new("git")
             .args(["commit", "--allow-empty", "-m", "init"])
             .current_dir(dir)
+            .env("AGEND_GIT_BYPASS", "1")
             .output()
             .unwrap();
     }

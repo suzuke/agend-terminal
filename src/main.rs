@@ -42,6 +42,7 @@ mod mcp;
 mod mcp_config;
 mod mouse_forward;
 mod notification_queue;
+pub mod operator_mode;
 mod paths;
 mod process;
 mod protocol;
@@ -275,6 +276,17 @@ enum Commands {
     Kill {
         /// Agent name
         name: String,
+    },
+    /// #1339: Set the operator availability mode (operator-only authority control).
+    Mode {
+        /// active | away | sleep
+        mode: String,
+        /// Delegate instance that may proxy in-scope ops in sleep mode
+        #[arg(long)]
+        delegate: Option<String>,
+        /// Comma-separated operation/tool names the delegate may proxy in sleep
+        #[arg(long)]
+        scope: Option<String>,
     },
     /// Admin utilities
     Admin {
@@ -856,6 +868,51 @@ fn main() -> anyhow::Result<()> {
                 Ok(resp) if resp["ok"].as_bool() == Some(true) => println!("Killed {name}"),
                 Ok(resp) => eprintln!(
                     "Kill failed: {}",
+                    resp["error"].as_str().unwrap_or("unknown")
+                ),
+                Err(_) => daemon_not_running_hint(),
+            }
+        }
+        Some(Commands::Mode {
+            mode,
+            delegate,
+            scope,
+        }) => {
+            // #1339: operator-only mode control over the DIRECT `MODE` method —
+            // the operator transport (the gate lets direct methods through;
+            // agents can only send `mcp_tool`, which the gate blocks for set).
+            let scope_arr: Vec<String> = scope
+                .as_deref()
+                .map(|s| {
+                    s.split(',')
+                        .map(|x| x.trim().to_string())
+                        .filter(|x| !x.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut p = serde_json::json!({"mode": mode});
+            if let Some(d) = &delegate {
+                p["delegate"] = serde_json::json!(d);
+            }
+            if !scope_arr.is_empty() {
+                p["scope"] = serde_json::json!(scope_arr);
+            }
+            match api::call(
+                &home,
+                &serde_json::json!({"method": api::method::MODE, "params": p}),
+            ) {
+                Ok(resp) if resp["ok"].as_bool() == Some(true) => {
+                    println!(
+                        "Operator mode → {}{}",
+                        resp["mode"].as_str().unwrap_or(&mode),
+                        resp["delegate_to"]
+                            .as_str()
+                            .map(|d| format!(" (delegate: {d})"))
+                            .unwrap_or_default()
+                    );
+                }
+                Ok(resp) => eprintln!(
+                    "mode failed: {}",
                     resp["error"].as_str().unwrap_or("unknown")
                 ),
                 Err(_) => daemon_not_running_hint(),
