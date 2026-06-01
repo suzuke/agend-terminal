@@ -65,7 +65,7 @@ Gemini CLI's official successor (Gemini CLI sunsets 2026-06-18 for free / Pro / 
 - [ ] **Echo** — inject `echo hello` + Enter; response visible
 - [ ] **Tool use** — inject `list files in /tmp`; tool affordance fires
 - [ ] **Quit** — inject `/exit` + Enter; pane closes; no orphan `agy` process
-- [ ] **Fleet MCP unsupported notice (#995 Bug 3)** — `app.log` MUST contain a `[fleet-mcp-unsupported]` `tracing::warn` line on this spawn; the spawned agy instance has NO `send` / `inbox` / `task` MCP tools (awaiting upstream `google-antigravity/antigravity-cli#60`). For multi-agent fleet work, prefer the `gemini` backend until upstream lands the fix.
+- [ ] **Fleet MCP loads (#1547)** — the daemon creates a non-hidden link for the agy workspace (`<base>/<instance>` → the hidden real workspace) and spawns agy with `$PWD` pointed at it, and `configure_agy` writes `.agents/mcp_config.json` + `.agents/AGENTS.md`. Confirm: no `[fleet-mcp-unsupported]` warning; `app.log` shows the `$PWD` link line; the spawned agy has the `send` / `inbox` / `task` MCP tools (e.g. inject "list your fleet via `list_instances`" and verify it returns the fleet).
 
 ---
 

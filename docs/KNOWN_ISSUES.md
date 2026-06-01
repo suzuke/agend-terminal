@@ -19,24 +19,6 @@ Status legend: **Upstream-blocker** (fix lives in another project) ·
 
 ## Upstream / external (not fixed in agend-terminal)
 
-### Antigravity CLI (`agy`) backend — unsupported
-- **Status:** Unsupported
-- **Why:** Beyond the missing Fleet MCP bridge, known problems with this
-  backend are not being addressed for now. Supporting it properly depends on
-  project-scoped MCP being available, or on a first-party CLI tool.
-- **Revisit when:** project-scoped MCP is supported (#1262), or a first-party
-  CLI tool lands.
-- **Refs:** #1547, #1262, #987
-
-### `agy` ignores a hidden parent-directory workspace
-- **Status:** Upstream-blocker
-- **Why:** `agy` treats paths under a hidden directory (e.g.
-  `~/.agend-terminal/*`) as hidden and skips them, so it won't operate in the
-  daemon-managed workspace. The fix belongs in the upstream CLI
-  (`@google/antigravity-cli`).
-- **Revisit when:** upstream supports hidden parent-directory workspaces.
-- **Refs:** #998
-
 ### `opencode --continue` occasionally fails to resume
 - **Status:** Upstream bug (mitigated)
 - **Why:** the OpenCode TUI can send a placeholder ("dummy") session id on
