@@ -65,8 +65,19 @@ use crate::health::{
     productive_silence_exceeds, HealthState, RecoveryStageState, STAGE1_COOLDOWN_DEFAULT_MS,
     STAGE1_TIMEOUT_DEFAULT_MS,
 };
-use std::io::Write;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// #1617 (#1593 F1): per-agent snapshot captured under the registry lock
+/// so the recovery state machine — including the Stage-1 blocking PTY
+/// write and the Stage-2/3 notify I/O — runs AFTER the lock is dropped.
+/// `core` + `pty_writer` are both `Arc`, so cloning them out is cheap and
+/// lets the registry guard be released before any blocking work.
+struct RecoveryTarget {
+    name: String,
+    core: Arc<crate::sync_audit::CoreMutex<agent::AgentCore>>,
+    pty_writer: agent::PtyWriter,
+}
 
 /// Env var name controlling Stage 1 activation. When set to `"1"`, the
 /// dispatcher writes the ESC byte to the agent's PTY; otherwise the
@@ -213,8 +224,6 @@ impl PerTickHandler for RecoveryDispatcherHandler {
     }
 
     fn run(&self, ctx: &TickContext<'_>) {
-        // #941: holder-tracking wrapper for thread-dump observability.
-        let reg = agent::lock_registry_tracked(ctx.registry, "recovery_dispatcher");
         let stage1_active = stage1_gate_active();
         let stage1_timeout = env_ms(STAGE1_TIMEOUT_ENV_VAR, STAGE1_TIMEOUT_DEFAULT_MS);
         let stage1_cooldown = env_ms(STAGE1_COOLDOWN_ENV_VAR, STAGE1_COOLDOWN_DEFAULT_MS);
@@ -226,12 +235,31 @@ impl PerTickHandler for RecoveryDispatcherHandler {
         let stage2_max = stage2_max_restarts();
         let stage3_active = stage3_gate_active();
 
-        for handle in reg.values() {
-            let name = handle.name.as_str();
+        // #1617 (#1593 F1): snapshot each agent's `core` + `pty_writer`
+        // (both `Arc`) UNDER the registry lock, then DROP the lock before
+        // any per-agent recovery work. The Stage-1 path does a blocking PTY
+        // write and Stages 2/3 do notify I/O — holding the global registry
+        // lock across those is the deadlock class #1593 closed elsewhere:
+        // a hung agent's PTY never drains, the write blocks, and the
+        // supervisor tick stalls holding the registry → whole daemon hangs.
+        // #941 holder-tracking still wraps the (now brief) snapshot hold.
+        let targets: Vec<RecoveryTarget> = {
+            let reg = agent::lock_registry_tracked(ctx.registry, "recovery_dispatcher");
+            reg.values()
+                .map(|h| RecoveryTarget {
+                    name: h.name.to_string(),
+                    core: Arc::clone(&h.core),
+                    pty_writer: Arc::clone(&h.pty_writer),
+                })
+                .collect()
+        };
+
+        for target in &targets {
+            let name = target.name.as_str();
             // Single per-agent lock acquisition reads all dispatcher
             // inputs, then drops the lock before any I/O or channel send.
             let snapshot = {
-                let core = handle.core.lock();
+                let core = target.core.lock();
                 DispatchSnapshot {
                     health_state: core.health.state,
                     recovery_stage_state: core.health.recovery_stage_state,
@@ -251,7 +279,7 @@ impl PerTickHandler for RecoveryDispatcherHandler {
             if snapshot.health_state == HealthState::Healthy
                 && snapshot.recovery_stage_state != RecoveryStageState::None
             {
-                let mut core = handle.core.lock();
+                let mut core = target.core.lock();
                 core.health.recovery_stage_state = RecoveryStageState::None;
                 tracing::debug!(
                     target: TARGET,
@@ -279,7 +307,7 @@ impl PerTickHandler for RecoveryDispatcherHandler {
             match snapshot.recovery_stage_state {
                 RecoveryStageState::None => self.handle_stage1_entry(
                     name,
-                    handle,
+                    target,
                     &snapshot,
                     stage1_active,
                     stage1_cooldown,
@@ -294,12 +322,12 @@ impl PerTickHandler for RecoveryDispatcherHandler {
                             gate_active = stage1_active,
                             "stage1 timeout expired without recovery — escalating to Stage2Eligible"
                         );
-                        let mut core = handle.core.lock();
+                        let mut core = target.core.lock();
                         core.health.recovery_stage_state = RecoveryStageState::Stage2Eligible;
                     }
                 }
                 RecoveryStageState::Stage2Eligible => {
-                    self.handle_stage2_fire(name, handle, &snapshot, stage2_active);
+                    self.handle_stage2_fire(name, target, &snapshot, stage2_active);
                 }
                 RecoveryStageState::Stage2Pending { entered_at } => {
                     if entered_at.elapsed() >= stage2_timeout {
@@ -311,12 +339,12 @@ impl PerTickHandler for RecoveryDispatcherHandler {
                             recovery_restart_count = snapshot.recovery_restart_count,
                             "stage2 timeout expired without recovery — escalating to Stage3Eligible"
                         );
-                        let mut core = handle.core.lock();
+                        let mut core = target.core.lock();
                         core.health.recovery_stage_state = RecoveryStageState::Stage3Eligible;
                     }
                 }
                 RecoveryStageState::Stage3Eligible => {
-                    self.handle_stage3_escalate(name, handle, &snapshot, stage3_active);
+                    self.handle_stage3_escalate(name, target, &snapshot, stage3_active);
                 }
                 RecoveryStageState::Stage3Pending { entered_at } => {
                     // Stage 3 is terminal — no further auto-recovery,
@@ -346,7 +374,7 @@ impl RecoveryDispatcherHandler {
     fn handle_stage1_entry(
         &self,
         name: &str,
-        handle: &agent::AgentHandle,
+        target: &RecoveryTarget,
         snapshot: &DispatchSnapshot,
         gate_active: bool,
         cooldown_window: Duration,
@@ -366,7 +394,7 @@ impl RecoveryDispatcherHandler {
                 stage2_max,
                 "recovery restart cap reached — escalating directly to Stage3Eligible"
             );
-            let mut core = handle.core.lock();
+            let mut core = target.core.lock();
             core.health.recovery_stage_state = RecoveryStageState::Stage3Eligible;
             return;
         }
@@ -386,7 +414,7 @@ impl RecoveryDispatcherHandler {
             (Stage1Branch::AliveStuck, false) => {
                 fire_stage1_alive_stuck(
                     name,
-                    handle,
+                    target,
                     gate_active,
                     snapshot.silent,
                     snapshot.silent_productive,
@@ -400,7 +428,7 @@ impl RecoveryDispatcherHandler {
                     gate_active,
                     "stage1 skipped (cooldown active) — escalating to Stage2Eligible"
                 );
-                let mut core = handle.core.lock();
+                let mut core = target.core.lock();
                 core.health.recovery_stage_state = RecoveryStageState::Stage2Eligible;
             }
             (Stage1Branch::DeadLikely, _) => {
@@ -411,7 +439,7 @@ impl RecoveryDispatcherHandler {
                     gate_active,
                     "stage1 skipped (dead-likely: silence > threshold) — escalating to Stage2Eligible"
                 );
-                let mut core = handle.core.lock();
+                let mut core = target.core.lock();
                 core.health.recovery_stage_state = RecoveryStageState::Stage2Eligible;
             }
             (Stage1Branch::Anomaly, _) => {
@@ -442,7 +470,7 @@ impl RecoveryDispatcherHandler {
     fn handle_stage2_fire(
         &self,
         name: &str,
-        handle: &agent::AgentHandle,
+        target: &RecoveryTarget,
         snapshot: &DispatchSnapshot,
         gate_active: bool,
     ) {
@@ -464,7 +492,7 @@ impl RecoveryDispatcherHandler {
 
         // Active mode — emit telegram notify pre-emit so operators have
         // visibility into the restart even if the channel send fails.
-        notify_stage2_fire(name, handle, snapshot);
+        notify_stage2_fire(name, snapshot);
 
         // try_send returns `Err(TrySendError::Full)` if the bounded(64)
         // channel is saturated. Counter NOT incremented on rejection;
@@ -482,7 +510,7 @@ impl RecoveryDispatcherHandler {
                     gate_active = true,
                     "stage2 fired: Stage2Restart event emitted to respawn worker"
                 );
-                let mut core = handle.core.lock();
+                let mut core = target.core.lock();
                 core.health.recovery_stage_state = RecoveryStageState::Stage2Pending {
                     entered_at: Instant::now(),
                 };
@@ -532,7 +560,7 @@ impl RecoveryDispatcherHandler {
     fn handle_stage3_escalate(
         &self,
         name: &str,
-        handle: &agent::AgentHandle,
+        target: &RecoveryTarget,
         snapshot: &DispatchSnapshot,
         gate_active: bool,
     ) {
@@ -542,7 +570,7 @@ impl RecoveryDispatcherHandler {
 
         if gate_active {
             let now = Instant::now();
-            let mut core = handle.core.lock();
+            let mut core = target.core.lock();
             core.health.enter_paused(now);
             tracing::info!(
                 target: TARGET,
@@ -582,7 +610,7 @@ struct DispatchSnapshot {
 /// agent name + backend + Hung duration + Stage 1 fire correlation +
 /// next-step expectation. Uses existing `gated_notify` so the
 /// info-leak gate prevents leakage when channel is unauthorised.
-fn notify_stage2_fire(name: &str, _handle: &agent::AgentHandle, snapshot: &DispatchSnapshot) {
+fn notify_stage2_fire(name: &str, snapshot: &DispatchSnapshot) {
     let body = format!(
         "[recovery] {name}: Stage 2 auto-restart triggered.\n\
          Hung silence: {silent_ms}ms (productive silence: {prod_ms}ms)\n\
@@ -653,7 +681,7 @@ fn notify_stage3_escalate(name: &str, snapshot: &DispatchSnapshot) {
 /// clock.
 fn fire_stage1_alive_stuck(
     name: &str,
-    handle: &agent::AgentHandle,
+    target: &RecoveryTarget,
     gate_active: bool,
     silent: Duration,
     silent_productive: Duration,
@@ -661,14 +689,16 @@ fn fire_stage1_alive_stuck(
     let now = Instant::now();
 
     if gate_active {
-        // Active mode — write the ESC byte directly to PTY. Single
-        // byte; no submit_key suffix (mirrors comments in
-        // `inject_to_agent` re Ink TUI interpretation of `\x1b` as
-        // ESC-cancel). Lock the pty_writer briefly, write, drop.
-        let write_result = {
-            let mut writer = handle.pty_writer.lock();
-            writer.write_all(b"\x1b").and_then(|_| writer.flush())
-        };
+        // Active mode — write the ESC byte to PTY. Single byte; no
+        // submit_key suffix (mirrors comments in `inject_to_agent` re Ink
+        // TUI interpretation of `\x1b` as ESC-cancel). #1617: via the
+        // timeout-safe `write_to_pty` (was a raw `write_all` that blocked
+        // forever on a hung, non-draining PTY) AND only after the registry
+        // lock was dropped (the caller snapshots `target.pty_writer` under
+        // the lock, then releases it) — so a stuck write can no longer
+        // stall the supervisor tick / wedge the daemon. A timeout surfaces
+        // as `Err`, which escalates to Stage 2 just like a write error.
+        let write_result = agent::write_to_pty(&target.pty_writer, b"\x1b");
         match write_result {
             Ok(_) => {
                 tracing::info!(
@@ -687,7 +717,7 @@ fn fire_stage1_alive_stuck(
                     error = %e,
                     "stage1 PTY write failed — escalating to Stage2Eligible"
                 );
-                let mut core = handle.core.lock();
+                let mut core = target.core.lock();
                 core.health.recovery_stage_state = RecoveryStageState::Stage2Eligible;
                 return;
             }
@@ -705,7 +735,7 @@ fn fire_stage1_alive_stuck(
         );
     }
 
-    let mut core = handle.core.lock();
+    let mut core = target.core.lock();
     core.health.recovery_stage_state = RecoveryStageState::Stage1Pending { entered_at: now };
     core.health.last_stage1_fired_at = Some(now);
 }
@@ -877,6 +907,68 @@ mod tests {
         RecoveryDispatcherHandler::new(sentinel_crash_tx()).run(&ctx);
         assert!(registry.lock().is_empty());
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1617 invariant (deadlock class of #1593 F1): the recovery
+    /// dispatcher must NEVER hold the global registry lock across a
+    /// blocking PTY write / notify. Structural source-scan pins:
+    ///  (a) `fire_stage1_alive_stuck` writes via the timeout-safe
+    ///      `write_to_pty`, NOT a raw `pty_writer.lock().write_all`.
+    ///  (b) `run` snapshots agents into a `RecoveryTarget` Vec and loops
+    ///      over THAT (post-drop), never directly over `reg.values()`.
+    /// Needles are built by `concat` so this test's own source (the file
+    /// is `include_str!`'d whole) can't self-satisfy the assertions.
+    #[test]
+    fn recovery_loop_never_holds_registry_across_blocking_io() {
+        // Scope to the PRODUCTION portion only (everything before the
+        // `#[cfg(test)]` mod) so this test's own source — incl. the literal
+        // needles in these assertion messages — can never self-satisfy the
+        // scan (the #1593 F2 / lock-audit lesson). Needles also concat-built.
+        let src = include_str!("recovery_dispatcher.rs");
+        let cfg_test = ["#[cfg(", "test)]"].concat();
+        let prod = &src[..src.find(&cfg_test).expect("test mod present")];
+
+        let timeout_safe = ["write", "_to_pty"].concat(); // write_to_pty
+                                                          // The deadlock idiom is locking the pty_writer directly to write a
+                                                          // raw byte (which blocks forever on a hung PTY). Assert that exact
+                                                          // idiom is absent rather than a loose "write_all" substring (which
+                                                          // would false-match an explanatory code comment).
+        let raw_lock_idiom = ["pty_writer", ".lock()"].concat();
+        let reg_loop = ["for handle in reg", ".values()"].concat();
+
+        // (a) fire_stage1_alive_stuck body uses the timeout-safe write only.
+        let fire_marker = ["fn fire_stage1", "_alive_stuck"].concat();
+        let fstart = prod.find(&fire_marker).expect("fire fn present");
+        let fire_body = &prod[fstart..]; // runs to end of prod (last prod fn)
+        assert!(
+            fire_body.contains(&timeout_safe),
+            "fire_stage1 must write via the timeout-safe write_to_pty"
+        );
+        assert!(
+            !fire_body.contains(&raw_lock_idiom),
+            "fire_stage1 must NOT lock the pty_writer to do a raw blocking write (deadlocks on a hung PTY)"
+        );
+
+        // (b) run() loops over the dropped-lock snapshot, not reg.values().
+        let rstart = prod.find("fn run(").expect("run fn present");
+        let rafter = &prod[rstart..];
+        let rend = rafter[3..]
+            .find("\n    fn ")
+            .map(|i| i + 3)
+            .unwrap_or(rafter.len());
+        let run_body = &rafter[..rend];
+        assert!(
+            !run_body.contains(&reg_loop),
+            "run() must NOT iterate the registry guard directly (holds the lock across the loop)"
+        );
+        assert!(
+            run_body.contains("for target in"),
+            "run() must iterate the post-drop snapshot"
+        );
+        assert!(
+            run_body.contains("RecoveryTarget"),
+            "run() must snapshot handles under the lock before dropping it"
+        );
     }
 
     #[test]
