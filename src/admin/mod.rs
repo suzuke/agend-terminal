@@ -59,18 +59,31 @@ fn local_branches(repo: &Path) -> Vec<String> {
     }
 }
 
-/// Check if a branch has a merged PR via `gh pr list`.
+/// Check if a branch has a merged PR via `gh pr list` (through the
+/// [`crate::scm::ScmProvider`] abstraction — #PR-D).
 fn has_merged_pr(repo: &Path, branch: &str) -> Option<u64> {
-    let output = std::process::Command::new("gh")
-        .args([
-            "pr", "list", "--head", branch, "--state", "merged", "--json", "number", "--limit", "1",
-        ])
-        .current_dir(repo)
-        .output()
+    // #PR-D site 10: the prior call ran `gh pr list --head B --state merged
+    // --json number --limit 1` with `.current_dir(repo)` and NO `--repo`
+    // (gh auto-detects the repo from the cwd) — `repo` here is a filesystem
+    // path, not an owner/repo slug. Routed through pr_list with `cwd =
+    // Some(repo)` so `--repo` is omitted and gh still runs in that dir:
+    // argv set-equal to the original (flag-order canonicalized, gh
+    // order-insensitive; decision d-20260601151209762922-0). Any failure /
+    // no PR → None (unchanged).
+    let prs = crate::scm::make_scm_provider("", None)
+        .pr_list(
+            "",
+            &crate::scm::ListFilter {
+                state: Some("merged"),
+                head: Some(branch.to_string()),
+                limit: Some(1),
+                ..Default::default()
+            },
+            &["number"],
+            Some(repo),
+        )
         .ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    let parsed: serde_json::Value = serde_json::from_str(&text).ok()?;
-    parsed.as_array()?.first()?["number"].as_u64()
+    prs.first().map(|s| s.number).filter(|n| *n != 0)
 }
 
 /// Analyze all local branches and determine cleanup actions.

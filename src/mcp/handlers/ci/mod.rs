@@ -1103,19 +1103,22 @@ enum MergeVerdict {
     },
 }
 
-/// #1467: classify a `gh pr view --json state,mergeCommit,mergeStateStatus`
-/// payload into a [`MergeVerdict`]. PURE — tests drive it directly without
-/// shelling `gh`. A PR is confirmed merged only when GitHub reports
-/// `state == "MERGED"` AND a non-empty `mergeCommit.oid`.
-fn classify_merge_view(view: &Value) -> MergeVerdict {
-    let state = view["state"].as_str().unwrap_or("UNKNOWN").to_string();
-    let oid = view["mergeCommit"]["oid"].as_str().unwrap_or("");
+/// #1467: classify a `gh pr view` result into a [`MergeVerdict`]. PURE —
+/// tests drive it directly without shelling `gh`. A PR is confirmed merged
+/// only when GitHub reports `state == "MERGED"` AND a non-empty merge-commit
+/// oid. #PR-D: takes the typed [`crate::scm::PrSummary`] (was a raw `Value`);
+/// the three reads map 1:1 (`state` → `state`; `mergeCommit.oid` →
+/// `merge_commit_oid`, empty→None; `mergeStateStatus` → `merge_state_status`),
+/// so the verdict is byte-for-byte the same.
+fn classify_merge_summary(s: &crate::scm::PrSummary) -> MergeVerdict {
+    let state = s.state.clone().unwrap_or_else(|| "UNKNOWN".to_string());
+    let oid = s.merge_commit_oid.clone().unwrap_or_default();
     if state == "MERGED" && !oid.is_empty() {
-        MergeVerdict::Confirmed(oid.to_string())
+        MergeVerdict::Confirmed(oid)
     } else {
         MergeVerdict::Unconfirmed {
             state,
-            merge_state_status: view["mergeStateStatus"].as_str().unwrap_or("").to_string(),
+            merge_state_status: s.merge_state_status.clone().unwrap_or_default(),
         }
     }
 }
@@ -1125,6 +1128,13 @@ fn classify_merge_view(view: &Value) -> MergeVerdict {
 /// consistency lag — NOT an infinite wait. Returns the last verdict seen; the
 /// first `Confirmed` short-circuits.
 fn verify_merge_landed(repo: &str, pr: u64) -> MergeVerdict {
+    // #PR-D site 1: the single `gh pr view` goes through ScmProvider. argv
+    // byte-identical (`pr view <pr> --repo R --json state,mergeCommit,
+    // mergedAt,mergeStateStatus`). The retry loop stays here (deliberately
+    // NOT folded into the trait — spike §4). On any gh failure pr_view
+    // returns Err → keep polling / fall back to `last` (was the prior
+    // non-success / parse-fail skip).
+    let provider = crate::scm::make_scm_provider(repo, None);
     let mut last = MergeVerdict::Unconfirmed {
         state: "UNKNOWN".to_string(),
         merge_state_status: String::new(),
@@ -1133,27 +1143,15 @@ fn verify_merge_landed(repo: &str, pr: u64) -> MergeVerdict {
         if attempt > 0 {
             std::thread::sleep(std::time::Duration::from_secs(2));
         }
-        let out = std::process::Command::new("gh")
-            .args([
-                "pr",
-                "view",
-                &pr.to_string(),
-                "--repo",
-                repo,
-                "--json",
-                "state,mergeCommit,mergedAt,mergeStateStatus",
-            ])
-            .output();
-        match out {
-            Ok(o) if o.status.success() => {
-                if let Ok(v) = serde_json::from_slice::<Value>(&o.stdout) {
-                    match classify_merge_view(&v) {
-                        MergeVerdict::Confirmed(c) => return MergeVerdict::Confirmed(c),
-                        unconfirmed => last = unconfirmed,
-                    }
-                }
+        if let Ok(summary) = provider.pr_view(
+            repo,
+            pr,
+            &["state", "mergeCommit", "mergedAt", "mergeStateStatus"],
+        ) {
+            match classify_merge_summary(&summary) {
+                MergeVerdict::Confirmed(c) => return MergeVerdict::Confirmed(c),
+                unconfirmed => last = unconfirmed,
             }
-            _ => {} // transient gh failure — keep polling, fall back to `last`
         }
     }
     last
@@ -1179,59 +1177,52 @@ pub(super) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
     }
 
     if !force {
-        let checks_output = std::process::Command::new("gh")
-            .args([
-                "pr",
-                "checks",
-                &pr.to_string(),
-                "--repo",
-                &repo,
-                "--json",
-                "name,state",
-            ])
-            .output();
-        match checks_output {
-            Ok(o) if o.status.success() => {
-                let checks: Vec<serde_json::Value> = match serde_json::from_slice(&o.stdout) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        return json!({
-                            "error": format!("failed to parse CI checks response: {e}"),
-                            "hint": "merge refused (fail-closed)"
-                        });
-                    }
-                };
-                let failing: Vec<_> = checks
-                    .iter()
-                    .filter(|c| {
-                        let st = c["state"].as_str().unwrap_or("");
-                        st != "SUCCESS" && st != "SKIPPED"
-                    })
-                    .collect();
-                if !failing.is_empty() {
-                    let summary: Vec<String> = failing
-                        .iter()
-                        .map(|c| {
-                            format!(
-                                "{}: {}",
-                                c["name"].as_str().unwrap_or("?"),
-                                c["state"].as_str().unwrap_or("?")
-                            )
-                        })
-                        .collect();
-                    return json!({
-                        "error": "CI checks not all passed — merge refused",
-                        "failing_checks": summary,
-                        "hint": "Wait for CI to pass, or use force=true with force_reason for emergency bypass"
-                    });
-                }
-            }
-            _ => {
+        // #PR-D site 2: `gh pr checks` via ScmProvider. argv byte-identical
+        // (`pr checks <pr> --repo R --json name,state`). The client-side
+        // filter (state ≠ SUCCESS/SKIPPED) reproduces the prior inline one;
+        // a null/empty state counts as failing (lenient parse_checks) — same
+        // as the prior `as_str().unwrap_or("")`, preserving the fail-closed
+        // gate. Intentional observable delta: the prior code surfaced two
+        // distinct errors (parse-fail vs query-fail) which pr_checks can't
+        // tell apart — both now collapse to ONE fail-closed message. The
+        // merge DECISION (any checks problem → refuse) is unchanged.
+        let checks = match crate::scm::make_scm_provider(&repo, None).pr_checks(&repo, pr) {
+            Ok(c) => c,
+            Err(_) => {
                 return json!({
-                    "error": "failed to query CI checks — merge refused",
-                    "hint": "Verify PR number and repo, or use force=true with force_reason"
+                    "error": "CI checks could not be determined — merge refused",
+                    "hint": "Verify PR number and repo, or use force=true with force_reason (fail-closed)"
                 });
             }
+        };
+        let failing: Vec<&crate::scm::CheckState> = checks
+            .iter()
+            .filter(|c| c.state != "SUCCESS" && c.state != "SKIPPED")
+            .collect();
+        if !failing.is_empty() {
+            let summary: Vec<String> = failing
+                .iter()
+                .map(|c| {
+                    // Preserve the prior `unwrap_or("?")` placeholder for an
+                    // empty/null name or state.
+                    let name = if c.name.is_empty() {
+                        "?"
+                    } else {
+                        c.name.as_str()
+                    };
+                    let state = if c.state.is_empty() {
+                        "?"
+                    } else {
+                        c.state.as_str()
+                    };
+                    format!("{name}: {state}")
+                })
+                .collect();
+            return json!({
+                "error": "CI checks not all passed — merge refused",
+                "failing_checks": summary,
+                "hint": "Wait for CI to pass, or use force=true with force_reason for emergency bypass"
+            });
         }
     }
 

@@ -13,14 +13,16 @@
 //! moved in verbatim (byte-identical argv), which is what makes the
 //! eventual call-site conversion behavior-preserving.
 //!
-//! Wiring is incremental: PR-A added the scaffold; PR-B wired sites 7
-//! (`pr_list`) + 4 (`pr_view`); **PR-C wires sites 8 + 5 (`pr_view`) and 6
-//! (`pr_checks`)**. The remaining write verb (`pr_merge`, site 3) and the
-//! non-GitHub stubs are still unwired in non-test builds, so the
+//! Wiring is incremental: PR-A scaffold; PR-B sites 7 (`pr_list`) + 4
+//! (`pr_view`); PR-C sites 8 + 5 (`pr_view`) + 6 (`pr_checks`); **PR-D
+//! sites 1 (`pr_view`) + 2 (`pr_checks`) + 9 + 10 (`pr_list`, the latter
+//! via the new `cwd` param)**. Only the write verb (`pr_merge`, site 3)
+//! and the non-GitHub stubs remain unwired in non-test builds, so the
 //! module-wide `dead_code` allow stays until PR-Z reaches them.
 #![allow(dead_code)]
 
 use serde_json::Value;
+use std::path::Path;
 use std::process::Command;
 
 // ---------------------------------------------------------------------------
@@ -118,13 +120,18 @@ pub(crate) trait ScmProvider: Send + Sync {
     fn pr_checks(&self, repo: &str, pr: u64) -> anyhow::Result<Vec<CheckState>>;
     /// `gh pr list …` → PRs matching `filter` (sites 7/9/10). `fields`
     /// is the explicit `--json` set (each list site reads a different
-    /// subset), passed verbatim so the emitted argv is byte-identical to
-    /// the site it replaces.
+    /// subset), passed verbatim.
+    ///
+    /// `cwd`: when `Some(dir)`, gh runs in `dir` and `--repo` is OMITTED
+    /// (gh auto-detects the repo from the cwd's remote) — site 10
+    /// (`admin::has_merged_pr`) has only a filesystem path, no slug, and
+    /// relied on this. When `None`, `--repo <repo>` is emitted as usual.
     fn pr_list(
         &self,
         repo: &str,
         filter: &ListFilter,
         fields: &[&str],
+        cwd: Option<&Path>,
     ) -> anyhow::Result<Vec<PrSummary>>;
     /// `gh pr merge …` — the only WRITE (site 3).
     fn pr_merge(&self, repo: &str, pr: u64, opts: &MergeOpts) -> anyhow::Result<MergeOutcome>;
@@ -159,13 +166,24 @@ fn pr_checks_args(repo: &str, pr: u64) -> Vec<String> {
     ]
 }
 
-fn pr_list_args(repo: &str, filter: &ListFilter, fields: &[&str]) -> Vec<String> {
-    // Order: `pr list --repo R --json <fields> [--state] [--head] [--base]
-    // [--limit]`. This reproduces site 7's exact argv (the first list-site
-    // conversion). gh treats flag order as insensitive, so the other list
-    // sites (9/10) stay behavior-identical; their literal-argv match is
-    // pinned when they convert.
-    let mut a = vec!["pr".into(), "list".into(), "--repo".into(), repo.into()];
+fn pr_list_args(
+    repo: &str,
+    filter: &ListFilter,
+    fields: &[&str],
+    cwd: Option<&Path>,
+) -> Vec<String> {
+    // Canonical order: `pr list [--repo R] --json <fields> [--state]
+    // [--head] [--base] [--limit]`. Per decision d-20260601151209762922-0,
+    // byte-identical means the same flags + values (a SET); gh treats flag
+    // ORDER as insensitive, so the list sites whose original order differs
+    // (site 9) stay behavior-identical — their pins assert set-equality.
+    // When `cwd` is Some, `--repo` is omitted (gh auto-detects from the
+    // cwd's remote — site 10's exact pre-conversion argv had no `--repo`).
+    let mut a = vec!["pr".into(), "list".into()];
+    if cwd.is_none() {
+        a.push("--repo".into());
+        a.push(repo.into());
+    }
     a.push("--json".into());
     a.push(fields.join(","));
     if let Some(s) = filter.state {
@@ -273,17 +291,23 @@ fn parse_checks(v: &Value) -> Vec<CheckState> {
 pub(crate) struct GitHubScmProvider;
 
 impl GitHubScmProvider {
-    fn run(args: &[String]) -> anyhow::Result<std::process::Output> {
-        Command::new("gh")
-            .args(args)
-            .output()
+    /// Run `gh` with the given args. `cwd`: when `Some`, set the process
+    /// working directory (site 10 runs gh inside the repo dir so gh
+    /// auto-detects the repo, no `--repo`).
+    fn run(args: &[String], cwd: Option<&Path>) -> anyhow::Result<std::process::Output> {
+        let mut cmd = Command::new("gh");
+        cmd.args(args);
+        if let Some(dir) = cwd {
+            cmd.current_dir(dir);
+        }
+        cmd.output()
             .map_err(|e| anyhow::anyhow!("failed to run gh: {e}"))
     }
 }
 
 impl ScmProvider for GitHubScmProvider {
     fn pr_view(&self, repo: &str, pr: u64, fields: &[&str]) -> anyhow::Result<PrSummary> {
-        let out = Self::run(&pr_view_args(repo, pr, fields))?;
+        let out = Self::run(&pr_view_args(repo, pr, fields), None)?;
         if !out.status.success() {
             anyhow::bail!(
                 "gh pr view #{pr} ({repo}) exited {}: {}",
@@ -296,7 +320,7 @@ impl ScmProvider for GitHubScmProvider {
     }
 
     fn pr_checks(&self, repo: &str, pr: u64) -> anyhow::Result<Vec<CheckState>> {
-        let out = Self::run(&pr_checks_args(repo, pr))?;
+        let out = Self::run(&pr_checks_args(repo, pr), None)?;
         if !out.status.success() {
             anyhow::bail!(
                 "gh pr checks #{pr} ({repo}) exited {}: {}",
@@ -313,8 +337,9 @@ impl ScmProvider for GitHubScmProvider {
         repo: &str,
         filter: &ListFilter,
         fields: &[&str],
+        cwd: Option<&Path>,
     ) -> anyhow::Result<Vec<PrSummary>> {
-        let out = Self::run(&pr_list_args(repo, filter, fields))?;
+        let out = Self::run(&pr_list_args(repo, filter, fields, cwd), cwd)?;
         if !out.status.success() {
             anyhow::bail!(
                 "gh pr list ({repo}) exited {}: {}",
@@ -329,7 +354,7 @@ impl ScmProvider for GitHubScmProvider {
     }
 
     fn pr_merge(&self, repo: &str, pr: u64, opts: &MergeOpts) -> anyhow::Result<MergeOutcome> {
-        let out = Self::run(&pr_merge_args(repo, pr, opts))?;
+        let out = Self::run(&pr_merge_args(repo, pr, opts), None)?;
         if out.status.success() {
             Ok(MergeOutcome::Submitted)
         } else {
@@ -367,6 +392,7 @@ macro_rules! not_supported_provider {
                 _repo: &str,
                 _filter: &ListFilter,
                 _fields: &[&str],
+                _cwd: Option<&Path>,
             ) -> anyhow::Result<Vec<PrSummary>> {
                 Err(NotSupported($kind).into())
             }
@@ -489,7 +515,8 @@ mod tests {
                     "isDraft",
                     "state",
                     "mergedAt"
-                ]
+                ],
+                None,
             ),
             vec![
                 "pr",
@@ -516,7 +543,7 @@ mod tests {
             base: Some("main".into()),
             limit: None,
         };
-        let a = pr_list_args("o/r", &f, &["headRefOid"]);
+        let a = pr_list_args("o/r", &f, &["headRefOid"], None);
         assert_eq!(
             a,
             vec![
@@ -535,6 +562,84 @@ mod tests {
             ]
         );
         assert!(!a.contains(&"--limit".to_string()));
+    }
+
+    #[test]
+    fn pr_list_args_site9_set_equality_with_original() {
+        // #PR-D site 9 (branch_sweep): the prior inline argv was
+        //   pr list --state merged --head B --base BASE --repo R --json headRefOid
+        // Our canonical builder emits the SAME flags+values in a different
+        // ORDER (gh order-insensitive). Per decision d-20260601151209762922-0
+        // byte-identical = set-equality (flags+values), not exact sequence —
+        // so assert the multiset of tokens matches.
+        let f = ListFilter {
+            state: Some("merged"),
+            head: Some("feat/dedup".into()),
+            base: Some("main".into()),
+            limit: None,
+        };
+        let mut produced = pr_list_args("suzuke/agend-terminal", &f, &["headRefOid"], None);
+        let mut original: Vec<String> = [
+            "pr",
+            "list",
+            "--state",
+            "merged",
+            "--head",
+            "feat/dedup",
+            "--base",
+            "main",
+            "--repo",
+            "suzuke/agend-terminal",
+            "--json",
+            "headRefOid",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        produced.sort();
+        original.sort();
+        assert_eq!(
+            produced, original,
+            "site-9 argv must be set-equal to the original (flags+values), order aside"
+        );
+    }
+
+    #[test]
+    fn pr_list_args_cwd_some_omits_repo() {
+        // #PR-D site 10 (admin::has_merged_pr): ran gh in the repo dir with
+        // NO --repo (gh auto-detects). cwd=Some ⟹ `--repo` is omitted; the
+        // argv is byte-identical (set) to the prior `pr list --head B
+        // --state merged --json number --limit 1`.
+        let f = ListFilter {
+            state: Some("merged"),
+            head: Some("feat/x".into()),
+            base: None,
+            limit: Some(1),
+        };
+        let a = pr_list_args(
+            "ignored-when-cwd",
+            &f,
+            &["number"],
+            Some(Path::new("/repo")),
+        );
+        assert!(
+            !a.contains(&"--repo".to_string()),
+            "cwd=Some must omit --repo (gh auto-detects from the cwd)"
+        );
+        let mut produced = a;
+        let mut original: Vec<String> = [
+            "pr", "list", "--head", "feat/x", "--state", "merged", "--json", "number", "--limit",
+            "1",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        produced.sort();
+        original.sort();
+        assert_eq!(
+            produced, original,
+            "site-10 argv set-equal to original (no --repo)"
+        );
     }
 
     #[test]

@@ -252,36 +252,28 @@ fn is_squash_merged_diff(repo: &Path, base: &str, branch: &str) -> bool {
     let Some(local_sha) = local_sha else {
         return false;
     };
-    // gh pr list --state merged --head <branch> --json headRefOid
-    let output = std::process::Command::new("gh")
-        .args([
-            "pr",
-            "list",
-            "--state",
-            "merged",
-            "--head",
-            branch,
-            "--base",
-            base,
-            "--repo",
-            &gh_repo,
-            "--json",
-            "headRefOid",
-        ])
-        .output();
-    let Ok(o) = output else { return false };
-    if !o.status.success() {
+    // #PR-D: `gh pr list` via ScmProvider. argv is set-equal to the prior
+    // inline `pr list --state merged --head B --base BASE --repo R --json
+    // headRefOid` — flag ORDER is canonicalized (gh order-insensitive) per
+    // decision d-20260601151209762922-0; same flags+values. Uses --repo
+    // (gh_repo derived above), no cwd. Any failure → false (unchanged from
+    // the prior gh-fail / parse-fail → false).
+    let Ok(prs) = crate::scm::make_scm_provider(&gh_repo, None).pr_list(
+        &gh_repo,
+        &crate::scm::ListFilter {
+            state: Some("merged"),
+            head: Some(branch.to_string()),
+            base: Some(base.to_string()),
+            ..Default::default()
+        },
+        &["headRefOid"],
+        None,
+    ) else {
         return false;
-    }
-    // Parse JSON array and check if any PR's headRefOid matches local SHA.
-    let stdout = String::from_utf8_lossy(&o.stdout);
-    let prs: Vec<serde_json::Value> = serde_json::from_str(&stdout).unwrap_or_default();
-    prs.iter().any(|pr| {
-        pr["headRefOid"]
-            .as_str()
-            .map(|sha| sha == local_sha)
-            .unwrap_or(false)
-    })
+    };
+    // True iff any merged PR's HEAD SHA matches the local branch tip.
+    prs.iter()
+        .any(|s| s.head_ref_oid.as_deref() == Some(local_sha.as_str()))
 }
 
 /// Extract "owner/repo" from a GitHub remote URL.
