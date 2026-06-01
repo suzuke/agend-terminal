@@ -178,13 +178,20 @@ fn respawn_agent_worker(
             }
             std::thread::sleep(std::time::Duration::from_secs(2));
             {
-                let r = reg.lock();
-                if let Some(handle) = respawned_id.and_then(|id| r.get(&id)) {
-                    let reason = handle.core.lock().health.crash_reason().to_string();
+                // #1530/F1: snapshot the writer + crash reason under the
+                // registry lock, then RELEASE it before the blocking PTY write.
+                let snap = {
+                    let r = reg.lock();
+                    respawned_id.and_then(|id| r.get(&id)).map(|handle| {
+                        let reason = handle.core.lock().health.crash_reason().to_string();
+                        (agent::InjectTarget::from_handle(handle), reason)
+                    })
+                };
+                if let Some((tgt, reason)) = snap {
                     let msg = format!(
                         "[system] Agent restarted due to {reason}. Previous context was lost.\r"
                     );
-                    let _ = agent::write_to_agent(handle, msg.as_bytes());
+                    let _ = agent::write_to_pty(&tgt.pty_writer, msg.as_bytes());
                 }
             }
             let rdir = run_dir(home);

@@ -129,14 +129,20 @@ pub fn check_schedules(home: &Path, registry: &AgentRegistry) {
             &format!("{label}: {message}"),
         );
 
-        let reg = agent::lock_registry(registry);
         // #1441: registry is UUID-keyed; resolve target name via fleet.yaml.
         let target_id = crate::fleet::resolve_uuid(home, target);
-        // The inbox fallback below does self-IPC (`enqueue_with_idle_hint` →
-        // `api::call` over the loopback socket). It MUST run outside the
-        // registry-lock window: the API handler servicing the self-call needs
-        // the same lock, so calling it here deadlocks the daemon tick. Record
-        // the intent under the lock; execute the enqueue after `drop(reg)`.
+        // #1530/F1: snapshot the inject target under the registry lock, then
+        // RELEASE the lock before the (up to 5s + payload-scaled) blocking PTY
+        // write — the registry must not be held across inject. The inbox
+        // fallback below also does self-IPC (`enqueue_with_idle_hint` →
+        // `api::call` loopback), which the API handler can't service while we
+        // hold the registry — so it too runs only after the lock is released.
+        let inject_snap = {
+            let reg = agent::lock_registry(registry);
+            target_id
+                .and_then(|id| reg.get(&id))
+                .map(|h| (agent::InjectTarget::from_handle(h), h.name.to_string()))
+        };
         let mut deferred_inbox = false;
         let status = if fire.missed {
             // Daemon was down through the one-shot instant — don't silently
@@ -144,8 +150,8 @@ pub fn check_schedules(home: &Path, registry: &AgentRegistry) {
             // three days ago). Just mark it missed so the user can see it
             // in run_history, and let the auto-disable below retire it.
             "missed"
-        } else if let Some(handle) = target_id.and_then(|id| reg.get(&id)) {
-            match agent::inject_to_agent(handle, message.as_bytes(), false) {
+        } else if let Some((tgt, name)) = inject_snap.as_ref() {
+            match agent::inject_with_target_gated(tgt, name, message.as_bytes(), false) {
                 Ok(()) => "ok",
                 Err(e) => {
                     tracing::warn!(error = %e, "schedule inject failed");
@@ -173,7 +179,6 @@ pub fn check_schedules(home: &Path, registry: &AgentRegistry) {
             );
             "skipped_unknown_target"
         };
-        drop(reg);
 
         if deferred_inbox {
             let _ = crate::inbox::enqueue_with_idle_hint(

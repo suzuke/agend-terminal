@@ -12,18 +12,28 @@ pub(crate) fn handle_inject(params: &Value, ctx: &HandlerCtx) -> Value {
     }
     let data = params["data"].as_str().unwrap_or("");
     let raw = params["raw"].as_bool().unwrap_or(false);
-    let reg = agent::lock_registry(ctx.registry);
+    // #1530/F1: snapshot the inject target (+ the restarting check) under the
+    // registry lock, then RELEASE it before the (up to 5s + payload-scaled)
+    // blocking PTY write — never hold the registry across write/inject.
     // #1441: registry is UUID-keyed; resolve name via fleet.yaml.
-    match crate::fleet::resolve_uuid(ctx.home, name).and_then(|id| reg.get(&id)) {
-        Some(handle) => {
-            let is_restarting = handle.core.lock().state.current.is_unavailable();
+    let snap = {
+        let reg = agent::lock_registry(ctx.registry);
+        crate::fleet::resolve_uuid(ctx.home, name)
+            .and_then(|id| reg.get(&id))
+            .map(|handle| {
+                let is_restarting = handle.core.lock().state.current.is_unavailable();
+                (agent::InjectTarget::from_handle(handle), is_restarting)
+            })
+    };
+    match snap {
+        Some((tgt, is_restarting)) => {
             if is_restarting {
                 json!({"ok": false, "error": format!("agent '{name}' is restarting, retry later")})
             } else {
                 let result = if raw {
-                    agent::write_to_agent(handle, data.as_bytes())
+                    agent::write_to_pty(&tgt.pty_writer, data.as_bytes())
                 } else {
-                    agent::inject_to_agent(handle, data.as_bytes(), true)
+                    agent::inject_with_target_gated(&tgt, name, data.as_bytes(), true)
                 };
                 match result {
                     Ok(()) => json!({"ok": true, "result": {"bytes": data.len()}}),

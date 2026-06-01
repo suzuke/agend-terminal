@@ -961,6 +961,33 @@ fn broadcast_registry_releases_lock_before_inject_1146() {
     );
 }
 
+/// #1530/F1 (lockaudit): the registry-borrow inject footgun
+/// `inject_to_agent(&AgentHandle)` is REMOVED. Every inject/write now goes
+/// through a snapshot — `inject_with_target_gated` / `inject_with_target`
+/// (an `InjectTarget`) or `write_to_pty` (a `PtyWriter`) — so a caller
+/// physically cannot hold the registry across the (up to 5s recv_timeout +
+/// payload-scaled sleep) blocking PTY write: capturing the snapshot drops the
+/// registry borrow. Re-introducing `fn inject_to_agent(&AgentHandle, …)` would
+/// re-open the freeze class (registry held across inject), so this pins it gone.
+#[test]
+fn inject_handle_footgun_removed_uses_snapshots_f1() {
+    let src = include_str!("mod.rs");
+    assert!(
+        !src.contains("pub fn inject_to_agent("),
+        "#1530/F1: inject_to_agent(&AgentHandle) must stay removed — it lets a caller \
+         hold the registry across a blocking inject; use inject_with_target_gated \
+         (snapshot under lock → drop → inject)"
+    );
+    assert!(
+        src.contains("pub(crate) fn inject_with_target_gated("),
+        "#1530/F1: the snapshot inject API inject_with_target_gated must exist"
+    );
+    assert!(
+        src.contains("pub(crate) fn write_to_pty("),
+        "#1530/F1: the snapshot write API write_to_pty must exist"
+    );
+}
+
 /// #1146 reviewer fix: inject_with_target must skip if the agent
 /// was deleted between snapshot and inject (delete/reuse race).
 /// The deleted flag is an Arc<AtomicBool> shared with AgentHandle,

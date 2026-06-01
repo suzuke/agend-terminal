@@ -135,11 +135,17 @@ impl Pane {
         self.mark_input_activity();
         match &self.source {
             PaneSource::Local => {
-                let reg = agent::lock_registry(registry);
-                if let Some(handle) = reg.get(&self.instance_id) {
-                    let _ = agent::write_to_agent(handle, bytes);
+                // #1530/F1: snapshot the writer under the registry lock, release
+                // it, THEN write — never hold the registry across the (up to 5s)
+                // blocking PTY write.
+                let writer_snap = {
+                    let reg = agent::lock_registry(registry);
+                    reg.get(&self.instance_id)
+                        .map(|h| agent::InjectTarget::from_handle(h).pty_writer)
+                };
+                if let Some(writer) = writer_snap {
+                    let _ = agent::write_to_pty(&writer, bytes);
                 }
-                drop(reg);
                 // Clear reply_to on TUI keyboard input (Sprint 52).
                 crate::daemon::heartbeat_pair::update_with(&self.agent_name, |p| {
                     p.reply_to_channel = None;

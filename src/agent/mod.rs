@@ -1253,9 +1253,15 @@ fn spawn_instructions_bootstrap(
         // longer widens an external-mutation window.
         std::thread::sleep(std::time::Duration::from_millis(500));
 
-        let reg = &registry.lock();
-        if let Some(handle) = reg.get(&instance_id) {
-            if let Err(e) = inject_to_agent(handle, content.as_bytes(), true) {
+        // #1530/F1: snapshot the inject target under the registry lock, release
+        // it, THEN inject — don't hold the registry across the blocking write.
+        // force=true bootstrap → use the (non-gated) target inject directly.
+        let inject_snap = {
+            let reg = registry.lock();
+            reg.get(&instance_id).map(InjectTarget::from_handle)
+        };
+        if let Some(tgt) = inject_snap {
+            if let Err(e) = inject_with_target(&tgt, content.as_bytes()) {
                 tracing::warn!(agent = %name, error = %e, "instructions bootstrap inject failed");
             } else {
                 tracing::info!(
@@ -1815,7 +1821,15 @@ fn write_with_timeout(writer: &PtyWriter, data: &[u8]) -> std::io::Result<()> {
 }
 
 pub fn write_to_agent(agent: &AgentHandle, data: &[u8]) -> crate::error::Result<()> {
-    write_with_timeout(&agent.pty_writer, data).map_err(crate::error::AgendError::PtyWrite)?;
+    write_to_pty(&agent.pty_writer, data)
+}
+
+/// #1530/F1: write to a pre-captured [`PtyWriter`] (`Arc::clone(&h.pty_writer)`),
+/// so the caller can release the registry lock BEFORE this blocking write
+/// (`write_with_timeout` waits up to `PTY_WRITE_TIMEOUT`). Same delivery as
+/// [`write_to_agent`].
+pub(crate) fn write_to_pty(writer: &PtyWriter, data: &[u8]) -> crate::error::Result<()> {
+    write_with_timeout(writer, data).map_err(crate::error::AgendError::PtyWrite)?;
     Ok(())
 }
 
@@ -1829,7 +1843,9 @@ pub fn write_to_agent_typed(agent: &AgentHandle, data: &[u8]) -> crate::error::R
     Ok(())
 }
 
-/// Inject `text` (plus the backend submit key) into an agent's PTY.
+/// Inject `text` (plus the backend submit key) into an agent's PTY, via a
+/// pre-captured [`InjectTarget`] snapshot + agent `name`, so the caller can
+/// release the registry lock BEFORE this (potentially multi-second) write runs.
 ///
 /// `force` exempts the inject from the #1513 busy-gate. Pass `true` for
 /// recovery, operator, and drain injects that MUST reach the PTY: the
@@ -1838,22 +1854,33 @@ pub fn write_to_agent_typed(agent: &AgentHandle, data: &[u8]) -> crate::error::R
 /// convergence, so gating it would re-defer an already-flushed item). Pass
 /// `false` for daemon-originated direct injects (cron and schedule replay) that
 /// should yield to a mid-generation or mid-keystroke pane.
-pub fn inject_to_agent(agent: &AgentHandle, text: &[u8], force: bool) -> crate::error::Result<()> {
+///
+/// #1530/F1: this snapshot form replaced the old `inject_to_agent(&AgentHandle)`
+/// — callers must `InjectTarget::from_handle(h)` UNDER the registry lock, `drop`
+/// the guard, THEN call this — so the registry is never held across the (up to
+/// 5s `recv_timeout` + payload-scaled sleep) blocking write. The busy-gate's
+/// agent-state read is the lock-free on-disk snapshot (never the per-agent core
+/// lock, #1492).
+pub(crate) fn inject_with_target_gated(
+    target: &InjectTarget,
+    name: &str,
+    text: &[u8],
+    force: bool,
+) -> crate::error::Result<()> {
     // #1513 PR-2: gate direct PTY injects like the notification path. Self-
-    // contained via AGEND_HOME (this fn has no `home` in scope); the agent-state
-    // read is LOCK-FREE (snapshot) — never the per-agent core lock (#1492). When
-    // AGEND_HOME is absent (non-daemon / unit test) the gate is skipped.
+    // contained via AGEND_HOME; AGEND_HOME absent (non-daemon / unit test) →
+    // gate skipped.
     if !force {
         if let Ok(home) = std::env::var("AGEND_HOME") {
             let home = std::path::Path::new(&home);
-            if crate::inbox::notify::should_defer_direct_inject(home, agent.name.as_str()) {
+            if crate::inbox::notify::should_defer_direct_inject(home, name) {
                 // Gated direct injects (cron / replay) are UTF-8 text wakes;
                 // enqueue ambient-class for the per-tick flush to drain once the
                 // pane settles (the flush re-injects via the api INJECT path,
                 // landing back here with force=true — byte-equivalent delivery).
                 let _ = crate::notification_queue::enqueue_classified(
                     home,
-                    agent.name.as_str(),
+                    name,
                     &String::from_utf8_lossy(text),
                     false,
                 );
@@ -1861,8 +1888,7 @@ pub fn inject_to_agent(agent: &AgentHandle, text: &[u8], force: bool) -> crate::
             }
         }
     }
-    let target = InjectTarget::from_handle(agent);
-    inject_with_target(&target, text)
+    inject_with_target(target, text)
 }
 
 /// #1146: inner inject that works on a snapshot of fields rather than a

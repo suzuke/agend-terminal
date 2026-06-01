@@ -948,14 +948,21 @@ fn replay_missed_at_startup(home: &Path, registry: &AgentRegistry) {
             &format!("{label}: {message}"),
         );
 
-        let reg = agent::lock_registry(registry);
-        // #1441: registry is UUID-keyed; resolve target name via fleet.yaml.
-        if let Some(handle) = crate::fleet::resolve_uuid(home, target).and_then(|id| reg.get(&id)) {
-            if let Err(e) = agent::inject_to_agent(handle, message.as_bytes(), false) {
+        // #1530/F1: snapshot the inject target under the registry lock, then
+        // RELEASE it before the (up to 5s + payload-scaled) blocking PTY write —
+        // never hold the registry across inject. #1441: registry is UUID-keyed.
+        let inject_snap = {
+            let reg = agent::lock_registry(registry);
+            crate::fleet::resolve_uuid(home, target)
+                .and_then(|id| reg.get(&id))
+                .map(|h| (agent::InjectTarget::from_handle(h), h.name.to_string()))
+        };
+        if let Some((tgt, name)) = inject_snap {
+            if let Err(e) = agent::inject_with_target_gated(&tgt, &name, message.as_bytes(), false)
+            {
                 tracing::warn!(error = %e, "replay inject failed");
             }
         } else {
-            drop(reg);
             let _ = crate::inbox::enqueue_with_idle_hint(
                 home,
                 target,

@@ -636,14 +636,25 @@ fn tick(
     // deadlocks against code paths that take core then registry.
     // #1441: registry is UUID-keyed; carry the id for the re-lock lookup and
     // the display name for the many name-keyed side channels in this loop.
-    let handles: Vec<(crate::types::InstanceId, String, _)> = {
+    // #1530/F2: also capture each agent's backend_command here (under the
+    // registry lock, registry→core order) so the per-agent loop never needs to
+    // RE-acquire the registry while holding that agent's core — the core→registry
+    // inversion that risked an AB-BA deadlock with the registry→core render/
+    // monitor loops. `Backend::from_command` on the captured string is lock-free.
+    let handles: Vec<(String, String, _)> = {
         let reg = agent::lock_registry(registry);
-        reg.iter()
-            .map(|(id, h)| (*id, h.name.to_string(), Arc::clone(&h.core)))
+        reg.values()
+            .map(|h| {
+                (
+                    h.name.to_string(),
+                    h.backend_command.clone(),
+                    Arc::clone(&h.core),
+                )
+            })
             .collect()
     };
 
-    for (instance_id, name, core) in handles {
+    for (name, backend_command, core) in handles {
         // Mutate state + pull the tail under the core lock, then drop it
         // before running `format!` and the Telegram spawn. `tail_lines`
         // allocates a fresh String, so the lock window is bounded by the
@@ -728,12 +739,9 @@ fn tick(
             // spot is tracked in #1535; until then this site's regression
             // protection is the pure-fn tests + this comment.
             for decision in reactions_from_transitions(&transitions) {
-                let backend = {
-                    let reg = crate::agent::lock_registry(registry);
-                    reg.get(&instance_id).map(|h| h.backend_command.clone())
-                }
-                .as_deref()
-                .and_then(crate::backend::Backend::from_command);
+                // #1530/F2: backend resolved from the pre-captured command
+                // (no registry re-acquire while holding core).
+                let backend = crate::backend::Backend::from_command(&backend_command);
                 reaction_intents.push(ReactionIntent {
                     from: decision.from,
                     to: decision.to,
@@ -760,15 +768,10 @@ fn tick(
             let idle_expectation = idle_expectation_for(home, &name);
             if core.health.check_awaiting_operator(agent_state, silent) && {
                 // #1552 escalation FP-gates (only reached when silent>30s +
-                // a prompt state, so this registry lock + re-detect is rare,
-                // not per-tick). Lock-free w.r.t. self-IPC; registry-under-
-                // core mirrors the established ordering in this loop.
-                let backend = {
-                    let reg = crate::agent::lock_registry(registry);
-                    reg.get(&instance_id).map(|h| h.backend_command.clone())
-                }
-                .as_deref()
-                .and_then(crate::backend::Backend::from_command);
+                // a prompt state). #1530/F2: backend resolved from the
+                // pre-captured command — NO registry re-acquire while holding
+                // core (removes the core→registry inversion).
+                let backend = crate::backend::Backend::from_command(&backend_command);
                 let (typed_ms, _submit_ms) =
                     crate::notification_queue::read_input_submit_timestamps(home, &name);
                 awaiting_escalation_allowed(
@@ -1091,13 +1094,21 @@ pub(crate) fn process_server_rate_limit_retries(
         }
 
         let injected = {
-            let reg = agent::lock_registry(registry);
-            // #1441: registry is UUID-keyed; resolve the name-keyed track id.
-            if let Some(handle) = crate::fleet::resolve_uuid(home, name).and_then(|id| reg.get(&id))
-            {
-                agent::inject_to_agent(handle, CONTINUE_RETRY_PAYLOAD, true).is_ok()
-            } else {
-                false
+            // #1530/F1: snapshot the inject target under the registry lock, then
+            // release it BEFORE the (up to 5s) blocking PTY write — never hold
+            // the registry across inject. #1441: registry is UUID-keyed.
+            let snap = {
+                let reg = agent::lock_registry(registry);
+                crate::fleet::resolve_uuid(home, name)
+                    .and_then(|id| reg.get(&id))
+                    .map(agent::InjectTarget::from_handle)
+            };
+            match snap {
+                Some(tgt) => {
+                    agent::inject_with_target_gated(&tgt, name, CONTINUE_RETRY_PAYLOAD, true)
+                        .is_ok()
+                }
+                None => false,
             }
         };
 
@@ -1700,6 +1711,37 @@ instances:
     #[test]
     fn notify_cooldown_is_60_seconds() {
         assert_eq!(super::NOTIFY_COOLDOWN, std::time::Duration::from_secs(60));
+    }
+
+    /// #1530/F2 (lockaudit): the per-agent tick must NOT re-acquire the registry
+    /// while holding an agent core (the core→registry inversion that risked an
+    /// AB-BA deadlock with the registry→core render/monitor loops). The backend
+    /// is pre-captured in the handles snapshot (registry→core order) and resolved
+    /// lock-free; the old nested per-agent registry lookups under the core lock
+    /// are gone. Source-grep pin (mirrors #1146); scoped to the `tick` fn body so
+    /// it never matches its own assertion text.
+    #[test]
+    fn tick_does_not_reacquire_registry_under_core_f2() {
+        let src = include_str!("supervisor.rs");
+        let start = src
+            .find("\nfn tick(")
+            .expect("supervisor tick fn must exist");
+        // The per-agent loop lives well within the first 18 KB of the fn; the
+        // test module is far past that, so this window excludes this test.
+        let body = &src[start..(start + 18_000).min(src.len())];
+        // The removed nested lookup keyed the registry by the per-agent id.
+        let needle = ["reg.get(&", "instance_id)"].concat();
+        assert!(
+            !body.contains(&needle),
+            "#1530/F2: the tick per-agent loop must not re-look-up the registry by \
+             agent id while holding the core — the backend is pre-captured in the \
+             handles snapshot (registry→core)"
+        );
+        assert!(
+            body.contains("backend_command"),
+            "#1530/F2: tick must pre-capture each agent's backend_command in the \
+             handles snapshot and resolve Backend lock-free"
+        );
     }
 
     // ── #1523: AuthError content-FP stability gate ──────────────────────
