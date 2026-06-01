@@ -231,15 +231,14 @@ fn task_still_live(home: &Path, task_id: &str) -> Option<bool> {
     if task_id.is_empty() {
         return None;
     }
-    let path = home.join("tasks").join(format!("{task_id}.json"));
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return None;
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return None;
-    };
-    let status = value.get("status").and_then(|v| v.as_str())?;
-    Some(LIVE_TASK_STATUSES.contains(&status))
+    // #1608b/#1614: event-sourced lookup, NOT a `tasks/{id}.json` probe — that
+    // file is never written, so the old read always failed → this check was dead
+    // (always `None`) and the #1018 "skip the nudge for a closed task" branch was
+    // unreachable. `load_by_id` returns `None` on absent OR a transient replay
+    // error → fail-open (treat as live), the existing safe semantics.
+    let task = crate::tasks::load_by_id(home, task_id)?;
+    let status = task.status.to_string();
+    Some(LIVE_TASK_STATUSES.contains(&status.as_str()))
 }
 
 /// #1018 (B) eager cleanup: when a task transitions to a terminal
@@ -1329,19 +1328,47 @@ mod tests {
         )
         .unwrap();
         let task_id = "t-closed-12345";
-        let tasks_dir = home.join("tasks");
-        std::fs::create_dir_all(&tasks_dir).unwrap();
-        std::fs::write(
-            tasks_dir.join(format!("{task_id}.json")),
-            serde_json::to_string_pretty(&serde_json::json!({
-                "id": task_id,
-                "status": "done",
-                "title": "test",
-                "assignee": "fixup-dev-2"
-            }))
-            .unwrap(),
-        )
-        .unwrap();
+        // #1608b: seed a REAL closed task on the event-sourced board (the path
+        // `task_still_live` now reads), not a `tasks/<id>.json` file the board
+        // never writes.
+        {
+            use crate::task_events::{append, DoneSource, InstanceName, TaskEvent, TaskId};
+            let emitter = InstanceName::from("test:operator");
+            let tid = TaskId(task_id.into());
+            append(
+                &home,
+                &emitter,
+                TaskEvent::Created {
+                    task_id: tid.clone(),
+                    title: "test".into(),
+                    description: String::new(),
+                    priority: "normal".into(),
+                    owner: Some(InstanceName::from("fixup-dev-2")),
+                    due_at: None,
+                    depends_on: Vec::new(),
+                    routed_to: None,
+                    branch: None,
+                    bind: None,
+                    eta_secs: None,
+                    tags: vec![],
+                    parent_id: None,
+                },
+            )
+            .unwrap();
+            append(
+                &home,
+                &emitter,
+                TaskEvent::Done {
+                    task_id: tid,
+                    by: InstanceName::from("fixup-dev-2"),
+                    source: DoneSource::OperatorManual {
+                        authored_at: chrono::Utc::now().to_rfc3339(),
+                        result: None,
+                    },
+                },
+            )
+            .unwrap();
+        }
         let issued = chrono::Utc::now() - chrono::Duration::seconds(700);
         let id = write_pending_at(
             &home,

@@ -217,37 +217,39 @@ enum TaskGate {
     Done,
     /// Task exists but isn't done → fire the reminder.
     Pending,
-    /// No task file (deleted/never-existed) → disable the schedule.
+    /// Task absent from the event log (link removed / board reset) → disable.
     Missing,
-    /// File present but unreadable / malformed status → fail-open (fire).
+    /// Replay error (transient log hiccup) → fail-open (fire), never disable.
     ReadError,
 }
 
-/// #1521: read a linked task's current status the same lock-free, fail-open way
-/// the dispatch-idle watchdog does (`tasks/{id}.json` direct read; the board
-/// writes per-task files). Current-status gate (not ever-done), so a reopened
-/// task resumes reminders. `NotFound` is `Missing` (a removed/typo'd link);
-/// any other I/O or parse error is `ReadError` → fail-open so a transient
-/// hiccup never silently drops the reminder.
+/// #1521: read a linked task's current status. Current-status gate (not
+/// ever-done), so a reopened task resumes reminders.
+///
+/// #1608b/#1614: read the EVENT-SOURCED board via `task_events::replay`, NOT a
+/// `tasks/{id}.json` file — that per-task file is never written (the board lives
+/// in `task_events.jsonl`), so the old probe always returned `NotFound` →
+/// `Missing` → `set_enabled(false)`, permanently self-disabling every
+/// `UntilSuccess` schedule on its first fire. (#1608 fixed only the create/update
+/// validator; this is the matching runtime fix.)
+///
+/// A replay ERROR is `ReadError` → fail-open (fire) so a transient log hiccup
+/// never silently drops — OR destructively disables — the reminder. A task
+/// genuinely ABSENT from the (append-only) log is `Missing` (a removed/reset
+/// link); since the task was validated at create-time, this is rare.
 fn linked_task_gate(home: &Path, task_id: Option<&str>) -> TaskGate {
     let Some(id) = task_id.filter(|s| !s.is_empty()) else {
         // UntilSuccess is validated to have a task at create/update, so a
         // None here means the link was lost — treat as Missing (disable).
         return TaskGate::Missing;
     };
-    let path = home.join("tasks").join(format!("{id}.json"));
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return TaskGate::Missing,
-        Err(_) => return TaskGate::ReadError,
-    };
-    match serde_json::from_str::<serde_json::Value>(&content) {
-        Ok(v) => match v.get("status").and_then(|s| s.as_str()) {
-            Some("done") => TaskGate::Done,
-            Some(_) => TaskGate::Pending,
-            None => TaskGate::ReadError,
-        },
+    match crate::task_events::replay(home) {
         Err(_) => TaskGate::ReadError,
+        Ok(state) => match state.tasks.get(&crate::task_events::TaskId(id.to_string())) {
+            None => TaskGate::Missing,
+            Some(rec) if rec.status == crate::task_events::TaskStatus::Done => TaskGate::Done,
+            Some(_) => TaskGate::Pending,
+        },
     }
 }
 
@@ -569,14 +571,59 @@ mod tests {
 
     // ── #1521: UntilSuccess fire-strategy ──
 
+    /// #1608b: seed a REAL event-sourced task (so `task_events::replay` — the
+    /// path `linked_task_gate` now reads — sees it), NOT a `tasks/<id>.json`
+    /// file the board never writes. The old file-seed is exactly why the runtime
+    /// gate's filesystem-probe bug stayed green in tests (#1614). Mirrors
+    /// `schedules.rs::seed_real_task`.
     fn seed_task(home: &std::path::Path, id: &str, status: &str) {
-        let dir = home.join("tasks");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join(format!("{id}.json")),
-            serde_json::json!({"id": id, "status": status}).to_string(),
+        use crate::task_events::{append, DoneSource, InstanceName, TaskEvent, TaskId};
+        let emitter = InstanceName::from("test:operator");
+        let tid = TaskId(id.into());
+        append(
+            home,
+            &emitter,
+            TaskEvent::Created {
+                task_id: tid.clone(),
+                title: "t".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: None,
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: None,
+                bind: None,
+                eta_secs: None,
+                tags: vec![],
+                parent_id: None,
+            },
         )
-        .unwrap();
+        .expect("seed Created");
+        let by = InstanceName::from("test:worker");
+        match status {
+            "done" => {
+                append(
+                    home,
+                    &emitter,
+                    TaskEvent::Done {
+                        task_id: tid,
+                        by,
+                        source: DoneSource::OperatorManual {
+                            authored_at: chrono::Utc::now().to_rfc3339(),
+                            result: None,
+                        },
+                    },
+                )
+                .expect("seed Done");
+            }
+            "in_progress" => {
+                append(home, &emitter, TaskEvent::InProgress { task_id: tid, by })
+                    .expect("seed InProgress");
+            }
+            // "open" / others → the Created event already leaves it Open.
+            _ => {}
+        }
     }
 
     /// Seed an enabled `* * * * *` (always-due) cron schedule targeting a known
@@ -702,21 +749,36 @@ mod tests {
         let home = cron_tmp_home("gate");
         seed_task(&home, "d", "done");
         seed_task(&home, "p", "open");
-        std::fs::write(home.join("tasks").join("bad.json"), "{not json").unwrap();
         assert!(matches!(linked_task_gate(&home, Some("d")), TaskGate::Done));
         assert!(matches!(
             linked_task_gate(&home, Some("p")),
             TaskGate::Pending
         ));
+        // #1608b: a task ABSENT from the event log → Missing (was "no file").
         assert!(matches!(
             linked_task_gate(&home, Some("nope")),
             TaskGate::Missing
         ));
+        assert!(matches!(linked_task_gate(&home, None), TaskGate::Missing));
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// #1608b: a replay ERROR (corrupt event log) → ReadError → fail-open
+    /// (fire), never the destructive `Missing` → `set_enabled(false)`.
+    #[test]
+    fn linked_task_gate_replay_error_fails_open() {
+        let home = cron_tmp_home("gate-err");
+        std::fs::create_dir_all(&home).unwrap();
+        // An unknown event variant makes `task_events::replay` fail-closed (Err).
+        std::fs::write(
+            home.join("task_events.jsonl"),
+            "{\"schema_version\":1,\"seq\":1,\"timestamp\":\"2026-04-27T00:00:00Z\",\"instance\":\"test\",\"event\":{\"kind\":\"TotallyMadeUp\",\"task_id\":\"t-x\"}}\n",
+        )
+        .unwrap();
         assert!(matches!(
-            linked_task_gate(&home, Some("bad")),
+            linked_task_gate(&home, Some("t-x")),
             TaskGate::ReadError
         ));
-        assert!(matches!(linked_task_gate(&home, None), TaskGate::Missing));
         std::fs::remove_dir_all(home).ok();
     }
 }
