@@ -40,6 +40,13 @@ pub(crate) fn scan_and_emit(
     let Ok(fleet) = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)) else {
         return;
     };
+    // #1598-mirror: collect every (target, correlation) key still backed by a
+    // pending unread handoff this tick, so the trailing `retain` can reap
+    // `last_escalated` entries whose repo@branch handoff is no longer active
+    // (read/resolved). Without it the map grows one entry per timed-out
+    // (reviewer, branch) forever — a slow leak, since `.get`/`.insert` were the
+    // only ops and REALERT_AFTER_MINS suppresses but never evicts.
+    let mut active: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
     for target in fleet.instances.keys() {
         for (correlation, sent_at) in crate::inbox::unread_of_kind(home, target, HANDOFF_KIND) {
             let age_min = now.signed_duration_since(sent_at).num_minutes();
@@ -48,6 +55,7 @@ pub(crate) fn scan_and_emit(
             }
             let corr = correlation.unwrap_or_else(|| "<unknown>".to_string());
             let key = (target.clone(), corr.clone());
+            active.insert(key.clone());
             if let Some(prev) = last_escalated.get(&key) {
                 if now.signed_duration_since(*prev).num_minutes() < REALERT_AFTER_MINS {
                     continue;
@@ -86,6 +94,10 @@ pub(crate) fn scan_and_emit(
             last_escalated.insert(key, *now);
         }
     }
+    // Reap dedup entries for handoffs that are no longer pending (read/resolved
+    // → absent from this tick's unread scan), bounding the map to the set of
+    // currently-active handoffs.
+    last_escalated.retain(|k, _| active.contains(k));
 }
 
 #[cfg(test)]
@@ -195,6 +207,32 @@ mod tests {
         assert!(
             crate::inbox::drain(&home, "lead").is_empty(),
             "re-escalation within the dedup window must be suppressed"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn stale_entry_reaped_when_handoff_no_longer_pending() {
+        let home = tmp_home("reap");
+        write_fleet(&home);
+        // Old unread handoff → first scan escalates and records a dedup entry.
+        seed_handoff(&home, "reviewer", "o/r@gone", 15, false);
+        let now = chrono::Utc::now();
+        let mut last = HashMap::new();
+        scan_and_emit(&home, &now, &mut last);
+        assert!(
+            last.contains_key(&("reviewer".to_string(), "o/r@gone".to_string())),
+            "first scan must record a dedup entry for the escalated handoff"
+        );
+        // Reviewer reads/resolves it → the handoff leaves the unread scan. The
+        // next scan must reap the now-stale (reviewer, o/r@gone) entry rather
+        // than accumulating one per dead branch forever (the leak).
+        crate::inbox::drain(&home, "reviewer");
+        scan_and_emit(&home, &(now + chrono::Duration::minutes(1)), &mut last);
+        assert!(
+            last.is_empty(),
+            "a dedup entry whose handoff is no longer pending must be reaped, not leaked: {:?}",
+            last.keys().collect::<Vec<_>>()
         );
         std::fs::remove_dir_all(home).ok();
     }
