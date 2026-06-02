@@ -751,11 +751,18 @@ fn tick(
             // tails), then emit them lock-free AFTER `drop(core)` below. The
             // member-notify path self-IPCs (`api::call(INJECT)` → orchestrator)
             // and must not run under the core lock — that would risk the #1492
-            // lock-across-self-IPC deadlock. NOTE: the #1492 guard is registry-
-            // scoped and would NOT catch this core-held self-IPC (the reaction
-            // holds the per-agent core, not the registry) — that guard blind
-            // spot is tracked in #1535; until then this site's regression
-            // protection is the pure-fn tests + this comment.
+            // lock-across-self-IPC deadlock. This boundary is now enforced two
+            // ways (the comment-only era is over): (1) RUNTIME — `core` is a
+            // `CoreMutex`, so `core.lock()` bumps `CORE_LOCK_DEPTH`, and the
+            // self-IPC vectors call `assert_no_registry_lock_for_self_ipc`, which
+            // since #1535 checks the core tier too — an emit moved under the lock
+            // returns a fail-fast `Err` (daemon stays live, no freeze) instead of
+            // deadlocking; (2) CI — `tick_emitters_run_after_core_lock_drops`
+            // (#1644) source-grep-pins that the self-IPC emitters live after the
+            // `let action = { … }` lock block, catching a regression before it
+            // ships. The big `supervise_one()->TickOutcome` extraction that would
+            // make it compile-impossible is deferred (#1644) — revisit when a new
+            // reaction is added to this loop; both guards above make that safe.
             for decision in reactions_from_transitions(&transitions) {
                 // #1530/F2: backend resolved from the pre-captured command
                 // (no registry re-acquire while holding core).
@@ -1888,6 +1895,69 @@ instances:
             "#1530/F2: tick must pre-capture each agent's backend_command in the \
              handles snapshot and resolve Backend lock-free"
         );
+    }
+
+    /// #1644: CI-time pin of the collect→drop→emit boundary in `tick`. The
+    /// self-IPC / blocking emitters (member-notify `api::call(INJECT)`, the
+    /// usage-limit propagate, the Telegram `gated_notify`) must run AFTER the
+    /// per-agent `let action = { … core.lock() … }` block drops the core lock —
+    /// never inside it (a core-held self-IPC is the #1492/#1535 deadlock class).
+    /// The runtime guard (`CORE_LOCK_DEPTH` + `assert_no_registry_lock_for_self_ipc`,
+    /// #1535) already fail-fasts a violation; this source-grep catches it earlier,
+    /// at CI. It is the cheap structural slice of the deferred
+    /// `supervise_one()->TickOutcome` extraction (#1644). Brace-matches the
+    /// lock block and scopes to the `tick` fn body so it never matches itself.
+    #[test]
+    fn tick_emitters_run_after_core_lock_drops_1644() {
+        let src = include_str!("supervisor.rs");
+        let tick_start = src.find("\nfn tick(").expect("tick fn must exist");
+        let after = &src[tick_start..];
+        // End the slice at the next top-level `fn ` so the test module (and its
+        // needle literals) are excluded.
+        let tick_end = after[1..]
+            .find("\nfn ")
+            .map(|i| i + 1)
+            .unwrap_or(after.len());
+        let tick = &after[..tick_end];
+
+        // Brace-match the per-agent core-lock block `let action … = { … };`.
+        let anchor = ["let action", ": Option<NoticeAction> = {"].concat();
+        let astart = tick.find(&anchor).expect("tick core-lock block present");
+        let open = astart + tick[astart..].find('{').expect("block opens");
+        let mut depth = 0usize;
+        let mut close = open;
+        for (i, c) in tick[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = open + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(close > open, "core-lock block must close");
+        let in_block = &tick[open..=close];
+        let after_block = &tick[close..];
+
+        for emitter in [
+            ["maybe_notify", "_member_state_change("].concat(),
+            ["gated", "_notify("].concat(),
+            ["propagate", "_usage_limit("].concat(),
+        ] {
+            assert!(
+                !in_block.contains(&emitter),
+                "#1644: `{emitter}` is a self-IPC/blocking emitter and must NOT run inside the \
+                 core-lock block (collect→drop→emit; #1492/#1535 deadlock class)"
+            );
+            assert!(
+                after_block.contains(&emitter),
+                "#1644: `{emitter}` must run AFTER the core lock drops"
+            );
+        }
     }
 
     // ── #1523: AuthError content-FP stability gate ──────────────────────
