@@ -405,7 +405,22 @@ impl Backend {
                 ready_pattern: "OpenAI Codex|›",
                 submit_key: "\r",
                 inject_prefix: "",
-                typed_inject: false,
+                // #1670: paced (typed) inject. codex's `›` input widget
+                // (ratatui-style, re-renders/debounces) does not reliably commit
+                // a BULK-written line before the trailing submit `\r` arrives — the
+                // wake sits un-submitted and the agent never wakes; claude's `❯`
+                // tolerates the same bulk bytes, which is why ci-ready auto-waking
+                // worked for claude-reviewer but not codex-reviewer. Typed inject
+                // writes the line in 2ms/byte chunks so the box keeps up and the
+                // line commits before `\r` submits it. The actionable-wake pointer
+                // (`[AGEND-MSG-PENDING]…`) is NOT a system header — it does not
+                // start with `[AGEND-MSG]`/`[from:` — so it takes the CHUNKED path
+                // (not the atomic-header path), i.e. it is genuinely paced. Mirrors
+                // the already-typed backends (opencode/gemini/agy). Paste-race
+                // hypothesis (the A/B that'd confirm is operator-vetoed); the
+                // dogfood — next real ci-green→codex handoff after merge+restart —
+                // is the empirical test (can't validate on this PR).
+                typed_inject: true,
                 resume_mode: ResumeMode::NotSupported,
                 quit_command: "exit",
                 instructions_path: "AGENTS.md",
@@ -1724,6 +1739,36 @@ mod tests {
         assert_eq!(
             entry.sequence, b"2\r",
             "#1069: keystroke must be `2\\r` (option 2 = Skip)"
+        );
+    }
+
+    /// #1670: codex must use paced (typed) inject, and the load-bearing reason
+    /// it actually paces the wake — the actionable-wake pointer is NOT a system
+    /// header, so it takes the CHUNKED path in `inject_with_target`, not the
+    /// atomic-header path. If `PENDING_HEADER_PREFIX` were ever changed to start
+    /// with `[AGEND-MSG]`/`[from:`, the pointer would be written atomically and
+    /// the pacing fix would silently regress — this test pins both halves.
+    #[test]
+    fn codex_uses_paced_inject_and_wake_pointer_is_not_a_system_header_1670() {
+        assert!(
+            Backend::Codex.preset().typed_inject,
+            "#1670: codex must paced-inject so the wake line commits before submit"
+        );
+        // The pointer's visible (ANSI-stripped) prefix is `[AGEND-MSG-PENDING]`.
+        let stripped_pointer_prefix = "[AGEND-MSG-PENDING]";
+        assert!(
+            crate::inbox::PENDING_HEADER_PREFIX.contains(stripped_pointer_prefix),
+            "pointer builder must still emit the [AGEND-MSG-PENDING] marker"
+        );
+        // is_system_header in inject_with_target checks these two prefixes; the
+        // PENDING pointer must match NEITHER so it takes the paced chunk path.
+        assert!(
+            !stripped_pointer_prefix.starts_with(crate::inbox::SYSTEM_MSG_PREFIX),
+            "#1670: [AGEND-MSG-PENDING] must NOT be a system header (else paced inject regresses to atomic)"
+        );
+        assert!(
+            !stripped_pointer_prefix.starts_with(crate::inbox::AGENT_MSG_PREFIX),
+            "#1670: [AGEND-MSG-PENDING] must NOT match the agent-msg prefix"
         );
     }
 

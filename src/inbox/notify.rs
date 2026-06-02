@@ -348,68 +348,10 @@ pub fn compose_aware_inject(home: &Path, agent_name: &str, notification: &str) {
     // defers it. Ambient stays behind the #1457 draft gate in route_notification.
     if actionable {
         let _ = inject_with_submit(home, agent_name, notification);
-        // #1670: backend-agnostic wake-submit robustness. The inject above writes
-        // `text + submit` in one shot; for some input-widget backends (codex's `›`
-        // re-renders/debounces) the separately-timed submit can land before the
-        // box commits the pasted line, leaving the wake stranded un-submitted —
-        // while claude's `❯` accepts the same bytes. Guard: after the pane settles,
-        // if it is STILL idle (the wake never became a turn), re-press submit
-        // (bounded). Only fires on a still-idle pane, so a successfully-submitted
-        // line is never double-entered.
-        spawn_wake_resubmit_guard(home, agent_name);
         return;
     }
     let _ = route_notification(home, agent_name, notification, |msg| {
         inject_with_submit(home, agent_name, msg)
-    });
-}
-
-/// #1670: how long to let the pane react to an injected actionable wake before
-/// deciding the submit didn't take. Must exceed both the inject's own 50ms
-/// text→submit gap and one snapshot-refresh cadence, so a wake that DID submit
-/// has visibly transitioned out of idle by the time we re-read the snapshot.
-const WAKE_RESUBMIT_SETTLE_MS: u64 = 900;
-/// #1670: bound the re-press attempts. Two extra `\r` after the original submit
-/// is plenty for a debounce/re-render race; beyond that the pane is genuinely
-/// idle-by-choice (e.g. the wake was a no-op) and re-pressing is just noise.
-const WAKE_RESUBMIT_MAX: u32 = 2;
-
-/// #1670 pure decision (unit-tested): re-press the submit key iff the pane is
-/// still idle-like — i.e. the injected wake never became a turn — AND we are
-/// under the retry cap. A pane that transitioned to `thinking`/`tool_use` (the
-/// wake took) or whose snapshot is missing/unknown is left alone, so a
-/// successfully-submitted line is never double-entered and a stale snapshot
-/// never triggers a blind re-press.
-pub(crate) fn should_resubmit_wake(state: Option<&str>, attempts: u32) -> bool {
-    attempts < WAKE_RESUBMIT_MAX && matches!(state, Some("idle") | Some("ready"))
-}
-
-/// #1670: spawn the fire-and-forget wake-submit guard for an actionable wake
-/// that was just injected into a (then-)idle pane. Runs OFF the emit path so it
-/// never blocks the caller (ci-watch poller / dispatch). The re-press is a
-/// submit-only inject (empty `data` → the backend's `submit_key` alone), gated
-/// on a still-idle snapshot. Per the daemon-behaviour-can't-validate-on-own-PR
-/// rule, this is empirically validated only on the next real ci-green→codex
-/// handoff after merge+restart, not on this PR.
-fn spawn_wake_resubmit_guard(home: &Path, agent_name: &str) {
-    let home = home.to_path_buf();
-    let agent = agent_name.to_string();
-    // fire-and-forget: best-effort wake robustness; a dropped guard just means no
-    // re-press (worst case is the pre-#1670 status quo — the wake stays stranded).
-    // No JoinHandle: the daemon must not block shutdown on a settle sleep.
-    std::thread::spawn(move || {
-        let mut attempts = 0u32;
-        loop {
-            std::thread::sleep(std::time::Duration::from_millis(WAKE_RESUBMIT_SETTLE_MS));
-            let state = crate::snapshot::agent_state_of(&home, &agent);
-            if !should_resubmit_wake(state.as_deref(), attempts) {
-                return;
-            }
-            // submit-only: empty data → handle_inject writes only the backend
-            // submit_key (codex/claude `\r`), re-pressing Enter on the stranded line.
-            let _ = inject_with_submit(&home, &agent, "");
-            attempts += 1;
-        }
     });
 }
 
@@ -783,46 +725,6 @@ mod actionable_wake_tests {
             1,
             NOW
         )));
-    }
-}
-
-#[cfg(test)]
-mod wake_resubmit_tests_1670 {
-    use super::{should_resubmit_wake, WAKE_RESUBMIT_MAX};
-
-    /// The wake took: pane transitioned to an active state → never re-press
-    /// (a re-pressed `\r` would inject a stray blank turn into live work).
-    #[test]
-    fn submitted_pane_never_resubmits() {
-        assert!(!should_resubmit_wake(Some("thinking"), 0));
-        assert!(!should_resubmit_wake(Some("tool_use"), 0));
-    }
-
-    /// The wake is stranded: pane still idle-like (un-submitted line in the box)
-    /// and under the cap → re-press the submit key.
-    #[test]
-    fn stuck_idle_pane_resubmits_until_cap() {
-        assert!(should_resubmit_wake(Some("idle"), 0));
-        assert!(should_resubmit_wake(Some("ready"), 0));
-        // last permitted attempt
-        assert!(should_resubmit_wake(Some("idle"), WAKE_RESUBMIT_MAX - 1));
-    }
-
-    /// Bounded: at/over the cap, stop even if still idle — avoids an unbounded
-    /// re-press loop against a pane that is idle by choice (wake was a no-op).
-    #[test]
-    fn resubmit_is_bounded() {
-        assert!(!should_resubmit_wake(Some("idle"), WAKE_RESUBMIT_MAX));
-        assert!(!should_resubmit_wake(Some("idle"), WAKE_RESUBMIT_MAX + 5));
-    }
-
-    /// A missing/unknown snapshot must NOT trigger a blind re-press — fail safe
-    /// toward not-injecting (mirrors `agent_is_busy`'s fail-open-to-quiet posture).
-    #[test]
-    fn unknown_state_never_resubmits() {
-        assert!(!should_resubmit_wake(None, 0));
-        assert!(!should_resubmit_wake(Some("starting"), 0));
-        assert!(!should_resubmit_wake(Some("permission_prompt"), 0));
     }
 }
 
