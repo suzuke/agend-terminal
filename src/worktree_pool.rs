@@ -5,15 +5,9 @@
 
 use std::path::{Path, PathBuf};
 
-/// Run a git command with AGEND_GIT_BYPASS=1, optionally in a given directory.
-/// Returns Ok(Output) on successful exec, Err on spawn failure.
-fn run_git(repo: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
-    std::process::Command::new("git")
-        .args(args)
-        .current_dir(repo)
-        .env("AGEND_GIT_BYPASS", "1")
-        .output()
-}
+// #1639: the daemon-internal git wrapper lives in `git_helpers::git_bypass`
+// (the #781-centralized single source for the `AGEND_GIT_BYPASS=1` contract).
+// Call sites below go through it directly rather than a local copy.
 
 /// Marker file placed in daemon-managed worktrees (R14 mitigation).
 pub(crate) const MANAGED_MARKER: &str = ".agend-managed";
@@ -152,10 +146,10 @@ fn cleanup_merged_branch(
     }
 
     let remote = crate::git_helpers::primary_remote(source_repo);
-    let _ = run_git(source_repo, &["fetch", "--prune", &remote]);
+    let _ = crate::git_helpers::git_bypass(source_repo, &["fetch", "--prune", &remote]);
 
     let default = crate::git_helpers::default_branch(source_repo);
-    let is_merged = run_git(
+    let is_merged = crate::git_helpers::git_bypass(
         source_repo,
         &["merge-base", "--is-ancestor", branch, &default],
     )
@@ -163,16 +157,22 @@ fn cleanup_merged_branch(
     .unwrap_or(false);
 
     let is_gone = {
-        let remote_name = run_git(source_repo, &["config", &format!("branch.{branch}.remote")])
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_default();
+        let remote_name = crate::git_helpers::git_bypass(
+            source_repo,
+            &["config", &format!("branch.{branch}.remote")],
+        )
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
         if !remote_name.is_empty() {
             let remote_ref = format!("refs/remotes/{remote_name}/{branch}");
-            let exists = run_git(source_repo, &["rev-parse", "--verify", &remote_ref])
-                .map(|o| o.status.success())
-                .unwrap_or(true);
+            let exists = crate::git_helpers::git_bypass(
+                source_repo,
+                &["rev-parse", "--verify", &remote_ref],
+            )
+            .map(|o| o.status.success())
+            .unwrap_or(true);
             !exists
         } else {
             false
@@ -190,7 +190,7 @@ fn cleanup_merged_branch(
         );
     }
 
-    let del = run_git(source_repo, &["branch", "-D", branch]);
+    let del = crate::git_helpers::git_bypass(source_repo, &["branch", "-D", branch]);
     match del {
         Ok(o) if o.status.success() => (true, None),
         Ok(o) => {
@@ -254,7 +254,7 @@ fn remove_worktree(agent: &str, wt_path: &Path, source_repo: &Path) -> WorktreeR
         tracing::info!(agent, path = %wt_path.display(),
             "release: worktree path already absent — pruning registry + clearing binding");
         if !source_repo.as_os_str().is_empty() {
-            let _ = run_git(source_repo, &["worktree", "prune"]);
+            let _ = crate::git_helpers::git_bypass(source_repo, &["worktree", "prune"]);
         }
         return WorktreeRemoval::AlreadyAbsent;
     }
@@ -274,7 +274,7 @@ fn remove_worktree(agent: &str, wt_path: &Path, source_repo: &Path) -> WorktreeR
             .env("AGEND_GIT_BYPASS", "1")
             .output()
     } else {
-        run_git(source_repo, &["worktree", "remove", "--force", &wt_str])
+        crate::git_helpers::git_bypass(source_repo, &["worktree", "remove", "--force", &wt_str])
     };
     match result {
         Ok(o) if o.status.success() => WorktreeRemoval::Removed,
@@ -285,7 +285,9 @@ fn remove_worktree(agent: &str, wt_path: &Path, source_repo: &Path) -> WorktreeR
             let _ = std::fs::remove_dir_all(wt_path);
             if !wt_path.exists() {
                 if !source_repo.as_os_str().is_empty() {
-                    if let Err(e) = run_git(source_repo, &["worktree", "prune"]) {
+                    if let Err(e) =
+                        crate::git_helpers::git_bypass(source_repo, &["worktree", "prune"])
+                    {
                         tracing::warn!(agent, error = %e, "git worktree prune failed");
                     }
                 }
