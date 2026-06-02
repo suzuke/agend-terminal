@@ -38,6 +38,9 @@ pub mod dedup;
 #[cfg(feature = "discord")]
 pub mod discord;
 pub mod event;
+/// #1642: shared sync→async bridge (`block_on_value`) used by both telegram and
+/// discord — deduped from per-channel copies.
+pub(crate) mod shared_async;
 pub mod sink_registry;
 pub mod telegram;
 pub mod ux_event;

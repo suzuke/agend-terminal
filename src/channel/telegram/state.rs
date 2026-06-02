@@ -54,34 +54,16 @@ where
 /// Value-returning counterpart of [`spawn_or_block_on`] for Telegram calls
 /// that must return a result (topic create, get_me, send-capturing-id, …).
 ///
-/// Safe to call even when already inside a tokio runtime: the shared
-/// Telegram runtime is a `current_thread` runtime, so calling `block_on`
-/// on it from within *any* runtime context panics with "Cannot start a
-/// runtime from within a runtime" (surfaced after the teloxide 0.17 /
-/// reqwest 0.12 upgrade, #1293). In that case we run the future on a
-/// dedicated scoped thread with its own fresh runtime, which is never
-/// nested. The non-nested fast path is unchanged (shared runtime), so
-/// existing behaviour is preserved byte-for-byte off the hot path.
+/// #1642: delegates to the shared [`crate::channel::shared_async::block_on_value`]
+/// helper (deduped from the byte-identical telegram/discord copies). Safe even
+/// when already inside a tokio runtime — see that helper for the nested-runtime
+/// guard rationale (#1474/#1476).
 pub(super) fn block_on_value<F>(fut: F) -> F::Output
 where
     F: std::future::Future + Send,
     F::Output: Send,
 {
-    if tokio::runtime::Handle::try_current().is_ok() {
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("telegram nested runtime")
-                    .block_on(fut)
-            })
-            .join()
-            .expect("telegram nested block_on thread panicked")
-        })
-    } else {
-        telegram_runtime().block_on(fut)
-    }
+    crate::channel::shared_async::block_on_value(telegram_runtime(), "telegram", fut)
 }
 
 pub struct TelegramState {

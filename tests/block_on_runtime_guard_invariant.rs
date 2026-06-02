@@ -16,6 +16,16 @@
 //! `rt.block_on` (a freshly-built, never-shared runtime) does not match the
 //! `_runtime().block_on` marker and is intentionally exempt — a non-shared
 //! runtime is never nested.
+//!
+//! #1642: the canonical `block_on_value` helper was extracted from the
+//! byte-identical telegram/discord copies into `channel::shared_async`, where it
+//! does `runtime.block_on(fut)` on a passed-in `&Runtime` — which does NOT match
+//! the `_runtime().block_on` marker. So the MARKER scan no longer verifies the
+//! central helper is guarded. `shared_helper_is_handle_guarded` closes that gap:
+//! it pins that `channel/shared_async.rs::block_on_value` keeps its
+//! `Handle::try_current` + `thread::scope` guard, so the one place that actually
+//! runs a shared-runtime `block_on` can't be silently de-guarded. The MARKER
+//! scan still catches any NEW raw `*_runtime().block_on` added outside it.
 
 use std::path::{Path, PathBuf};
 
@@ -94,8 +104,33 @@ fn shared_runtime_block_on_must_be_handle_guarded() {
     assert!(
         violations.is_empty(),
         "#1476: unguarded shared-runtime block_on found — every `<name>_runtime().block_on` \
-         must go through a Handle-guarded helper (e.g. `block_on_value`, mirroring telegram \
-         state.rs / discord.rs) so it can't panic from within a tokio runtime:\n{}",
+         must go through the Handle-guarded `channel::shared_async::block_on_value` helper \
+         so it can't panic from within a tokio runtime:\n{}",
         violations.join("\n")
+    );
+}
+
+/// #1642: the extracted central helper runs `runtime.block_on(fut)` on a
+/// passed-in `&Runtime`, which the MARKER scan above does not match. Pin that it
+/// keeps its nested-runtime guard so it can't be de-guarded silently — the
+/// single place that actually performs a shared-runtime `block_on`.
+#[test]
+fn shared_helper_is_handle_guarded() {
+    let helper = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/channel/shared_async.rs");
+    let content = std::fs::read_to_string(&helper)
+        .expect("#1642: channel/shared_async.rs must exist (the deduped block_on_value helper)");
+    assert!(
+        content.contains("fn block_on_value"),
+        "#1642: shared_async.rs must define `block_on_value`"
+    );
+    assert!(
+        content.contains("Handle::try_current"),
+        "#1642: shared_async::block_on_value must keep its `Handle::try_current` guard \
+         (never call `runtime.block_on` unguarded — that reintroduces the #1474/#1476 panic)"
+    );
+    assert!(
+        content.contains("thread::scope"),
+        "#1642: shared_async::block_on_value must run the nested case on a fresh scoped-thread \
+         runtime (`thread::scope`), never nesting on the shared runtime"
     );
 }

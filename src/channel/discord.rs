@@ -398,34 +398,18 @@ fn discord_runtime() -> &'static tokio::runtime::Runtime {
 }
 
 /// #1476: run a Discord async call to completion, safe even when already inside
-/// a tokio runtime. `discord_runtime()` is a `current_thread` runtime, so
-/// calling `block_on` on it from within *any* runtime context panics with
-/// "Cannot start a runtime from within a runtime" (the same teloxide-0.17-class
-/// failure telegram hit in #1474). When a runtime is current, run the future on
-/// a dedicated scoped thread with its own fresh runtime — never nested. The
-/// non-nested fast path (shared runtime) is unchanged. Mirrors telegram's
-/// `state::block_on_value`; every shared-runtime `block_on` in this module MUST
-/// go through here (enforced by `tests/block_on_runtime_guard_invariant.rs`).
+/// a tokio runtime.
+///
+/// #1642: delegates to the shared [`crate::channel::shared_async::block_on_value`]
+/// helper (deduped from the byte-identical telegram/discord copies — discord had
+/// inherited telegram's nested-runtime panic AND its fix). See that helper for
+/// the `current_thread` nested-runtime guard rationale.
 fn block_on_value<F>(fut: F) -> F::Output
 where
     F: std::future::Future + Send,
     F::Output: Send,
 {
-    if tokio::runtime::Handle::try_current().is_ok() {
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("discord nested runtime")
-                    .block_on(fut)
-            })
-            .join()
-            .expect("discord nested block_on thread panicked")
-        })
-    } else {
-        discord_runtime().block_on(fut)
-    }
+    crate::channel::shared_async::block_on_value(discord_runtime(), "discord", fut)
 }
 
 impl crate::channel::Channel for DiscordChannel {
