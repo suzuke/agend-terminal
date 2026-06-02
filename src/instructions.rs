@@ -285,7 +285,10 @@ pub(crate) fn build_instructions_body(
     content.push_str(
         "- Review dispatch expects: source of truth, scope boundary, freshness boundary\n",
     );
-    content.push_str("- Verdict wording: VERIFIED / REJECTED / UNVERIFIED only\n");
+    content.push_str("- Verdict wording: VERIFIED / REJECTED / UNVERIFIED only (start the report with the verdict word)\n");
+    content.push_str(
+        "- Reviewer evidence (#1666 §3.3): a VERIFIED or REJECTED verdict MUST carry an `### Evidence` block — `ran: <cmd> → <result>` (e.g. cargo test / clippy / `gh pr checks`) and/or `cited: path:line — quote`. The daemon HARD-rejects an evidence-less VERIFIED/REJECTED back to you. UNVERIFIED = 'claimed but unproven' (evidence-exempt) — use it when you cannot run/cite.\n",
+    );
     content.push_str("- **Worktree mandatory** (§10.4): always work in a git worktree, never the main repo working tree. Use `git worktree add -b <dedicated-branch> <path> origin/main` per branch — **never** `git worktree add <path> main` (locking main into a worktree blocks operator/CI build).\n");
     content.push_str("- **Spawn site rationale** (§10.5): every `tokio::spawn` / `thread::spawn` site MUST carry `// fire-and-forget: <reason>` comment OR explicitly store JoinHandle for graceful join. Tests exempt; trait-method spawns inherit caller rationale. Phase 5b invariant test enforces.\n");
 

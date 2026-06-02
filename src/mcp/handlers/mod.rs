@@ -7,6 +7,7 @@ pub(crate) mod ci;
 mod comms;
 pub(crate) mod dispatch;
 pub(crate) mod dispatch_hook;
+pub(crate) mod evidence_gate;
 mod force_release;
 pub(crate) mod instance;
 pub(crate) mod instance_lifecycle;

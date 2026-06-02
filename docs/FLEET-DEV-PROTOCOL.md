@@ -49,9 +49,17 @@ Orchestrator posts scope decision + creates task.
 3. **Freshness boundary** — stale if changed after {sha}
 
 ### 3.3 Verdict
-`VERIFIED` / `REJECTED` / `UNVERIFIED`
+`VERIFIED` / `REJECTED` / `UNVERIFIED` — **start the report with the verdict word** (§3.12 convention; the daemon keys on it).
 
-Every review report must include: `scope_source`, `audit_mode`, `reviewed_head`, `commands`, `files`
+Every review report must include: `scope_source`, `audit_mode`, `reviewed_head`, `commands`, `files`.
+
+**Evidence block (#1666 Phase A — daemon-enforced).** A `VERIFIED` or `REJECTED` verdict MUST carry an `### Evidence` block proving the claim:
+- `ran: <cmd> → <result>` — a command actually executed (e.g. `cargo test` / `clippy` / `gh pr checks <PR#>` / `grep`), with its outcome; and/or
+- `cited: path:line — quote` — a source citation backing a finding.
+
+`UNVERIFIED` is redefined as **"claimed but unproven"** — the evidence-exempt verdict. Use it when you assert a concern you could not run-or-cite (so the gate never forces fabricated evidence).
+
+The daemon HARD-gates this at report time: a `VERIFIED`/`REJECTED` with **no recognizable evidence token** (a `cargo`/`gh`/`clippy`/`grep` command line, or a `path:line` cite) is rejected back to the reviewer. The gate is deliberately **lenient** — it accepts any one recognized token and rejects only on total absence; it does NOT enforce a fixed format. (The §3.21 risk-tier review DEPTH remains lead/reviewer judgment — not daemon-enforced.)
 
 ### 3.3.1 CI Verification Gate (Sprint 61)
 Before approving merge, orchestrator/reviewer MUST independently verify CI:
