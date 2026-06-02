@@ -285,6 +285,24 @@ Reviewers who skip the protocol on a race-class PR get `RUBBER-STAMP — UNVERIF
 
 **Relationship to §3.19.1.** §3.19.1 says *what every agent must do when a protocol gate fires*. §3.20 says *what lead, dev, and reviewer must do BEFORE the gate could fire* on race-class PRs — a sanctioned discipline addition, not a replacement for any existing rule. Race-class triage at r0 dispatch is cheaper than the ship-then-revert cycle empirically observed on #881.
 
+### 3.21 Proportional Ceremony — right-size process to task risk
+
+Match fleet ceremony to where a task's risk actually lives. Decided by **lead judgment**, NOT a daemon classifier — a rubric nobody follows is compliance-theater (false confidence, blame-shift). #1656 shipped review-tiering as pure judgment and it caught real defects. Record each dispatch's ceremony call via `decision(action: post)` — the decision log IS the classifier (zero new code). `↳ 緣由 #1656/#1659/#1660 dialectic`
+
+**Three INDEPENDENT axes — decide separately, never collapse into one "trivial/non-trivial" flag.** A task can be single-agent + light-review + spike-REQUIRED (e.g. #1658).
+
+- **A. Fleet vs Single.** FLEET iff *"wrong = expensive"* AND *"only an adversary-who-tries-to-break-it catches the flaw — a test you could write would not"* (the #1654 authority bypass, #1635 evasion forms, #1629 sibling deadlocks). Else SINGLE — small / fail-safe-default / proven-pattern / author-verifiable by a test or empirical run (#1625, #1657's diff). Lead's 5-second question: *"If this is subtly wrong — how bad, and would my own test catch it or only an attacker?"*
+- **B. Spike vs Skip.** Default = spike (its value is PREMISE-CHECK, not size-gating). Skip → straight to impl **only if ALL FIVE hold**: 1 single named fix site (no "investigate/where" verb) 2 structural not behavioral root cause — a fact you can SEE (dup/typo/missing-arm), not "because <runtime behavior>" 3 fix self-evident from the consumer you already read 4 no test/lint-enforced construct is MOVED (the #1642 silent de-enforcement trap) 5 no premise-inversion risk — any "already exists / doesn't exist" assumption verified by reading code FIRST (the #1658 trap: assumed gate absent, one existed). Mnemonic **Site · Structural · Self-evident · Stationary · Verified**. Skip is REVERSIBLE: if impl reveals the premise was shakier (site fans out, unrelated test breaks, grep surfaces more call sites), abort to spike immediately. The skip-checklist is applied by the same agent who'd write the impl → guard against confirmation-biased "yeah, obvious".
+- **C. Review tier (#1656).** normal/single → dual → adversarial, by blast radius. See §3.5.
+
+**High-risk OVERRIDE (the safety floor).** Regardless of apparent size, ANY of these forces MAX ceremony on all three axes (fleet + spike + adversarial review): authority/security surface · silent-failure mechanism (wrong key/glob, dead config field, approval/prompt routing) · empirically-unverifiable integration claim ("works on the installed version/schema/tool") · invariant / forcing-function change · blast-radius that depends on runtime state, not diff size. The cost of waving through ONE disguised-high-risk change (shipped authority bypass / silent deadlock) dwarfs the ceremony saved on many genuinely-low-risk ones.
+
+**Two cross-cutting principles.**
+- **Match ceremony TYPE to risk location.** When the risk is in the *diagnosis/RCA* (not the diff), the load-bearing check is **empirical verification** (treatment/control run), not more reviewers — #1657's risk was the schema key (caught by an A/B run), not the 1-line diff that dual-review scrutinized.
+- **Asymmetric bias — when unsure on ANY axis, escalate.** False-positive ceremony costs minutes; false-negative ships an authority bypass / silent deadlock. Default: when in doubt, more ceremony.
+
+`↳ 緣由: 2026-06-02 4-agent dialectic (dev/dev-2/codex/reviewer-2), /tmp/ceremony-spike-*.md. Resolves #1659 + #1660 as policy (no code).`
+
 ## §4. Daemon Enforcement Gates
 
 ### 4.1 Push-time Semantic Gate (Sprint 44)
