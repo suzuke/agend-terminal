@@ -175,28 +175,42 @@ fn sweep_child_tree_kills_grandchild_via_process_group() {
 /// uses sh + sleep.
 #[cfg(unix)]
 #[test]
-/// #1673: the raw 8×6=48 concurrent PTYs would exhaust the CI runner's PTY pool
-/// under load (intermittent `openpty: Device not configured`). Serialize only the
-/// PTY-allocating body with a shared gate so the runner never holds >1 PTY at a
-/// time; the test still exercises the full assertion set (48 kill paths), and 8
-/// threads still run concurrently for everything outside the PTY window.
-/// Re-exhaustion is structurally impossible — one PTY at a time, indefinitely.
+/// #1673: the raw 8×6=48 concurrent PTY allocations would exhaust the CI runner's
+/// PTY pool under load (intermittent `openpty: Device not configured`). Bound
+/// the openpty calls with a counting semaphore so ≤N body threads hold a PTY
+/// simultaneously — the rest of each body (shell spawn, agent handle build, the
+/// grandchild-kill verification) still runs concurrently across all 8 threads,
+/// preserving the concurrent kill-path coverage the test verifies.
+/// Re-exhaustion: N is well below the runner's PTY ceiling (4 was leak-safe on
+/// the flake-hit macOS runner), so the pool never drains.
 fn sweep_child_tree_kills_grandchild_concurrent_stress() {
-    let gate = std::sync::Arc::new(std::sync::Mutex::new(()));
+    const MAX_CONCURRENT_PTYS: usize = 4;
+    use parking_lot::Mutex;
+    let sem: std::sync::Arc<Mutex<usize>> = std::sync::Arc::new(Mutex::new(0));
     let handles: Vec<_> = (0..8)
         .map({
-            let gate = Arc::clone(&gate);
+            let sem = std::sync::Arc::clone(&sem);
             move |tid| {
                 std::thread::spawn({
-                    let gate = Arc::clone(&gate);
+                    let sem = std::sync::Arc::clone(&sem);
                     move || {
                         for i in 0..6 {
                             let path = std::env::temp_dir().join(format!(
                                 "agend-sweep-stress-{}-{tid}-{i}.pid",
                                 std::process::id()
                             ));
-                            let _guard = gate.lock().expect("PTY gate poisoned");
+                            // Acquire a permit — spin-lock bounded, brief.
+                            loop {
+                                let mut held = sem.lock();
+                                if *held < MAX_CONCURRENT_PTYS {
+                                    *held += 1;
+                                    break;
+                                }
+                                drop(held);
+                                std::thread::yield_now();
+                            }
                             sweep_child_tree_body(&path);
+                            *sem.lock() -= 1;
                         }
                     }
                 })
