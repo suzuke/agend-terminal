@@ -276,6 +276,34 @@ pub(crate) fn ci_check_for_report(home: &std::path::Path, summary: &str) -> CiCh
     }
 }
 
+/// #1666 Phase B: run the WARN-first cross-check with the production deps and LOG
+/// each warning. WARN-ONLY — the caller still delivers the verdict; this only
+/// emits observability so we can measure the false-positive rate. Kept here
+/// (beside the pure [`cross_check_warnings`] + the prod deps) so the comms hook
+/// stays a one-liner.
+pub(crate) fn cross_check_and_log(
+    home: &std::path::Path,
+    reviewer: &str,
+    summary: &str,
+    evidence_body: &str,
+    verdict: Verdict,
+) {
+    let warns = cross_check_warnings(
+        evidence_body,
+        |path| resolve_cite_in_reviewer_tree(home, reviewer, path),
+        || ci_check_for_report(home, summary),
+    );
+    for w in &warns {
+        tracing::warn!(
+            target: "evidence_crosscheck",
+            reviewer = %reviewer,
+            verdict = ?verdict,
+            warning = %w,
+            "#1666 Phase B: verdict evidence did not cross-verify (WARN-only; verdict delivered)"
+        );
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

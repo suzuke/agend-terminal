@@ -487,25 +487,15 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
                 return json!({"error": e});
             }
 
-            // #1666 Phase B (WARN-first): cross-check the CHECKABLE evidence and
-            // LOG warnings for claims that don't verify — the verdict still goes
-            // through (no reject). This measures the false-positive rate before
-            // we decide whether to harden any of these into rejects.
-            let reviewer = sender.as_str().to_string();
-            let warns = super::evidence_gate::cross_check_warnings(
+            // #1666 Phase B (WARN-first): cross-check the checkable evidence and
+            // LOG (never reject) — measures the false-positive rate. See the fn.
+            super::evidence_gate::cross_check_and_log(
+                home,
+                sender.as_str(),
+                summary,
                 &evidence_body,
-                |path| super::evidence_gate::resolve_cite_in_reviewer_tree(home, &reviewer, path),
-                || super::evidence_gate::ci_check_for_report(home, summary),
+                verdict,
             );
-            for w in &warns {
-                tracing::warn!(
-                    target: "evidence_crosscheck",
-                    reviewer = %reviewer,
-                    verdict = ?verdict,
-                    warning = %w,
-                    "#1666 Phase B: verdict evidence did not cross-verify (WARN-only; verdict delivered)"
-                );
-            }
         }
 
         match crate::api::call(
