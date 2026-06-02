@@ -79,7 +79,27 @@ pub(crate) struct PendingDispatch {
     /// source of truth (avoids parallel L2 sidecar bookkeeping).
     #[serde(default)]
     pub(crate) nudge_sent_at: Option<String>,
+    /// #1658: consecutive `scan_and_emit` ticks the target has appeared NOT
+    /// working (snapshot state ∉ thinking/tool_use) while past threshold.
+    /// Debounces the #1516 instantaneous-state gate: a brief idle gap during
+    /// active heads-down work (or a momentarily-stale snapshot) that lands right
+    /// on the threshold boundary must persist for [`DEBOUNCE_SCANS`] consecutive
+    /// scans before firing, so it doesn't false-fire. Reset to 0 the moment the
+    /// target is observed working again.
+    #[serde(default)]
+    pub(crate) not_working_streak: u32,
 }
+
+/// #1658: how many consecutive not-working `scan_and_emit` ticks (past
+/// threshold) the target must show before the dispatch-idle signal fires. A
+/// single brief idle gap during active work is the common false-fire; requiring
+/// a short streak filters it. Cost to a genuinely-stuck agent is at most
+/// `(DEBOUNCE_SCANS - 1) * scan-cadence` of extra delay — negligible vs the
+/// 600s threshold. NOTE: this debounces the EXISTING #1516 gate; it does not
+/// add a missing gate. The structurally-correct fix (gate on output-recency, not
+/// instantaneous state — `AgentSnapshot` has no activity timestamp today) is a
+/// documented follow-up if the residual is still annoying after this + #1657.
+const DEBOUNCE_SCANS: u32 = 3;
 
 /// #1636: lifecycle of a dispatch-idle sidecar, replacing the stringly-typed
 /// 4-state `status` field so the compiler enforces exhaustiveness at the guard
@@ -163,6 +183,7 @@ pub(crate) fn record_dispatch(
         issued_at: chrono::Utc::now().to_rfc3339(),
         status: DispatchStatus::Pending,
         nudge_sent_at: None,
+        not_working_streak: 0,
     };
     let body = match serde_json::to_string_pretty(&payload) {
         Ok(s) => s,
@@ -396,6 +417,19 @@ pub(crate) fn refresh_issued_at(home: &Path, correlation_id: &str) -> Option<Str
     .flatten()
 }
 
+/// #1658: set the debounce streak on a Pending sidecar (RMW under the store's
+/// per-file lock). No-op if the sidecar is gone or no longer Pending (e.g. a
+/// concurrent mark_resolved won the race) — we never resurrect a closed sidecar.
+fn set_not_working_streak(home: &Path, dispatch_id: &str, val: u32) {
+    let path = pending_path(home, dispatch_id);
+    let _ = crate::store::with_json_state::<PendingDispatch, _, _>(&path, |cur| {
+        if cur.status == DispatchStatus::Pending {
+            cur.not_working_streak = val;
+        }
+        Some(())
+    });
+}
+
 /// PR2 L3 visibility — per-instance dispatch metadata view.
 /// Pending sidecars where this instance is the **dispatcher**: outbound
 /// dispatches it's still waiting for replies on.
@@ -512,6 +546,11 @@ pub(crate) fn scan_and_emit(home: &Path) {
         // → state flips to Idle/Hang → this gate releases → the watchdog fires
         // as designed. (The hang detector independently catches infinite-gen.)
         if target_is_working(snapshot.as_ref(), &d.target) {
+            // #1658: the target is producing output — reset the debounce streak
+            // so a later idle run starts fresh.
+            if d.not_working_streak != 0 {
+                set_not_working_streak(home, &d.dispatch_id, 0);
+            }
             if let Some(corr) = d.correlation_id.as_deref() {
                 let _ = refresh_issued_at(home, corr);
             }
@@ -535,6 +574,28 @@ pub(crate) fn scan_and_emit(home: &Path) {
                 "#1018 cleared stale sidecar at tick"
             );
             continue;
+        }
+
+        // #1658: debounce the #1516 instantaneous-state gate. A brief idle gap
+        // during active heads-down work (or a momentarily-stale snapshot) that
+        // lands on the threshold boundary would otherwise false-fire. Require
+        // DEBOUNCE_SCANS consecutive not-working scans past threshold: persist
+        // the growing streak and defer; the busy-branch above resets it the
+        // moment the target produces output. A genuinely idle/stuck target keeps
+        // accumulating → fires once the streak reaches the cap (≤ a couple
+        // scan-cadences of extra delay vs the 600s threshold).
+        //
+        // Only debounce when a snapshot EXISTS to judge work-state against —
+        // debouncing snapshot noise is meaningless without one. No snapshot
+        // (daemon boot, or tests) → fail-open to immediate fire, matching the
+        // #1516 gate's own fail-open. In production the per-tick snapshot is
+        // always present, so the debounce always applies there.
+        if snapshot.is_some() {
+            let streak = d.not_working_streak.saturating_add(1);
+            if streak < DEBOUNCE_SCANS {
+                set_not_working_streak(home, &d.dispatch_id, streak);
+                continue;
+            }
         }
 
         // #1340: flock + re-read to serialize against concurrent mark_resolved.
@@ -769,6 +830,7 @@ mod tests {
             issued_at: issued_at.to_rfc3339(),
             status: DispatchStatus::Pending,
             nudge_sent_at: None,
+            not_working_streak: 0,
         };
         std::fs::write(
             pending_path(home, &id),
@@ -845,6 +907,88 @@ mod tests {
             DispatchStatus::Exceeded,
             "sidecar must flip pending→exceeded"
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1658 helper: write a fleet snapshot setting `target`'s agent_state
+    /// (reuses [`mk_agent_snapshot`]).
+    fn write_target_snapshot(home: &std::path::Path, target: &str, state: &str) {
+        crate::snapshot::save(home, &[mk_agent_snapshot(target, state)]);
+    }
+
+    /// #1658: with a snapshot showing the target NOT working, the signal
+    /// debounces — it requires DEBOUNCE_SCANS consecutive not-working scans past
+    /// threshold before firing (filters the #1516 instantaneous gate's
+    /// false-fire on a brief idle gap during active heads-down work).
+    #[test]
+    fn debounce_idle_requires_consecutive_scans_1658() {
+        let home = tmp_home("debounce-idle");
+        let issued = chrono::Utc::now() - chrono::Duration::seconds(700);
+        let id = write_pending_at(&home, "lead", "dev", Some("t-deb"), "task", 600, issued);
+        write_target_snapshot(&home, "dev", "idle");
+
+        // The first DEBOUNCE_SCANS-1 scans defer: no event, stays Pending, streak grows.
+        for i in 1..DEBOUNCE_SCANS {
+            scan_and_emit(&home);
+            let p = list_pending(&home)
+                .into_iter()
+                .find(|p| p.dispatch_id == id)
+                .unwrap();
+            assert_eq!(p.status, DispatchStatus::Pending, "scan {i}: must defer");
+            assert_eq!(p.not_working_streak, i, "scan {i}: streak must grow");
+            assert!(
+                crate::inbox::drain(&home, "lead").is_empty(),
+                "scan {i}: must NOT emit yet"
+            );
+        }
+        // The DEBOUNCE_SCANS-th consecutive not-working scan fires once.
+        scan_and_emit(&home);
+        let p = list_pending(&home)
+            .into_iter()
+            .find(|p| p.dispatch_id == id)
+            .unwrap();
+        assert_eq!(
+            p.status,
+            DispatchStatus::Exceeded,
+            "the DEBOUNCE_SCANS-th idle scan must fire"
+        );
+        assert!(
+            crate::inbox::drain(&home, "lead")
+                .iter()
+                .any(|m| m.kind.as_deref() == Some("dispatch_idle_threshold_exceeded")),
+            "the firing scan must emit the dispatcher event"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1658: observing the target working resets the debounce streak, so a
+    /// momentary idle blip never accumulates to a false-fire.
+    #[test]
+    fn debounce_resets_streak_when_working_1658() {
+        let home = tmp_home("debounce-reset");
+        let issued = chrono::Utc::now() - chrono::Duration::seconds(700);
+        let id = write_pending_at(&home, "lead", "dev", Some("t-rst"), "task", 600, issued);
+
+        // One idle scan → streak 1, deferred.
+        write_target_snapshot(&home, "dev", "idle");
+        scan_and_emit(&home);
+        let p = list_pending(&home)
+            .into_iter()
+            .find(|p| p.dispatch_id == id)
+            .unwrap();
+        assert_eq!(p.not_working_streak, 1);
+        assert_eq!(p.status, DispatchStatus::Pending);
+
+        // Target resumes working → streak resets to 0, still no fire.
+        write_target_snapshot(&home, "dev", "tool_use");
+        scan_and_emit(&home);
+        let p = list_pending(&home)
+            .into_iter()
+            .find(|p| p.dispatch_id == id)
+            .unwrap();
+        assert_eq!(p.not_working_streak, 0, "working must reset the streak");
+        assert_eq!(p.status, DispatchStatus::Pending);
+        assert!(crate::inbox::drain(&home, "lead").is_empty());
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -1787,7 +1931,8 @@ mod tests {
 
     /// Real-stuck still caught: an overdue dispatch whose target is Idle (not
     /// working) with no report still fires (Q4 — the gate only suppresses
-    /// demonstrable progress).
+    /// demonstrable progress). #1658: now after the DEBOUNCE_SCANS debounce
+    /// window (was 1 scan) — the signal is delayed, not lost.
     #[test]
     fn idle_target_still_fires_1516() {
         let home = tmp_home("gate-idle");
@@ -1795,7 +1940,11 @@ mod tests {
         let id = write_pending_at(&home, "lead", "worker", Some("t-i"), "task", 600, issued);
         crate::snapshot::save(&home, &[mk_agent_snapshot("worker", "idle")]);
 
-        scan_and_emit(&home);
+        // #1658: a snapshot present + not-working debounces — fires on the
+        // DEBOUNCE_SCANS-th consecutive idle scan, not the first.
+        for _ in 0..DEBOUNCE_SCANS {
+            scan_and_emit(&home);
+        }
 
         assert!(
             crate::inbox::drain(&home, "lead")

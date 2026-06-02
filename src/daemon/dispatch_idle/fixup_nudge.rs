@@ -215,6 +215,7 @@ mod tests {
             issued_at: issued,
             status: DispatchStatus::Exceeded,
             nudge_sent_at: None,
+            not_working_streak: 0,
         };
         std::fs::write(
             pending_path(home, &id),
@@ -335,6 +336,7 @@ mod tests {
             issued_at: issued,
             status: DispatchStatus::Exceeded,
             nudge_sent_at: None,
+            not_working_streak: 0,
         };
         std::fs::write(
             pending_path(home, &id),
