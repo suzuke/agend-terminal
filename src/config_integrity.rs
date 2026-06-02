@@ -34,14 +34,6 @@ fn key_path(home: &Path) -> PathBuf {
     home.join(KEY_FILE)
 }
 
-/// Whether the integrity key has ever been created. Used to distinguish a
-/// genuine fresh install (no key, no file → today's default is fine) from a
-/// post-signing tamper (key exists but the signed file is gone/broken → a
-/// deliberate authority downgrade attempt).
-pub fn key_exists(home: &Path) -> bool {
-    key_path(home).exists()
-}
-
 /// Read the key if present and exactly [`KEY_LEN`] bytes; `None` otherwise.
 fn read_key(home: &Path) -> Option<[u8; KEY_LEN]> {
     let bytes = std::fs::read(key_path(home)).ok()?;
@@ -136,7 +128,6 @@ mod tests {
         let content = br#"{"mode":"sleep"}"#;
         let tag = sign(&home, content).unwrap();
         assert!(verify(&home, content, &tag), "fresh signature must verify");
-        assert!(key_exists(&home), "signing creates the key");
     }
 
     #[test]
@@ -153,7 +144,7 @@ mod tests {
     #[test]
     fn verify_without_key_is_false() {
         let home = tmp("nokey");
-        assert!(!key_exists(&home));
+        // No key has been created (nothing signed) → cannot authenticate.
         assert!(
             !verify(&home, b"anything", "00"),
             "no key yet → cannot authenticate → false (fail closed)"
