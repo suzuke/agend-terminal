@@ -11,12 +11,26 @@
 //!     import), matched by the `FileExt::<method>(` needle; and
 //!  2. imported-trait method — `use fs4::FileExt; file.try_lock()` (codex's
 //!     #1635 review probe), matched by the `.<method>(` needle BUT only in files
-//!     that actually import the fs4 `FileExt` trait (a `use … fs4 … FileExt`
-//!     line). That gate is the disambiguation from `Mutex::lock()`/
-//!     `RwLock::lock()`: `.lock(`/`.try_lock(` are ambiguous, so they are only
-//!     flagged where the fs4 trait is in scope — `Mutex::lock()` in a non-fs4
-//!     file never false-FAILs. (`src/inbox/disk.rs` imports `fs4::available_space`
-//!     but NOT `FileExt`, so it is correctly NOT gated on.)
+//!     whose `use` statements import the fs4 `FileExt` trait. That gate is the
+//!     disambiguation from `Mutex::lock()`/`RwLock::lock()`: `.lock(`/`.try_lock(`
+//!     are ambiguous, so they are only flagged where the fs4 trait is in scope —
+//!     `Mutex::lock()` in a non-fs4 file never false-FAILs. (`src/inbox/disk.rs`
+//!     imports `fs4::available_space` but NOT `FileExt`, so it is NOT gated on.)
+//!
+//! The FileExt-in-scope detection parses whole `use` STATEMENTS (each may span
+//! several lines until its `;`), so rustfmt's normal multi-line import block —
+//!   `use fs4::{`/`    available_space,`/`    FileExt,`/`};` — is handled the
+//! same as the single-line form.
+//!
+//! DOCUMENTED LIMIT (by design — this is an ACCIDENTAL-reintroduction guard, not
+//! a security boundary; same philosophy as #1631's documented assign-then-drop
+//! limit): the gate keys on the literal token `FileExt` appearing in an `fs4`
+//! `use` statement. Deliberate-evasion forms that HIDE that token are out of
+//! scope and we do NOT chase them: a glob import `use fs4::*;` (no `FileExt`
+//! token), or aliasing the trait to a different name and calling it via that
+//! alias's UFCS (`use fs4::FileExt as Z; Z::try_lock(`). A dev accidentally
+//! re-adding a raw flock writes an explicit `use fs4::…FileExt…` (single- or
+//! multi-line), which IS caught.
 //!
 //! The three allowed files:
 //! - `store.rs` — `acquire_file_lock` itself (the chokepoint) + its tests.
@@ -29,9 +43,9 @@ use std::path::{Path, PathBuf};
 
 const ALLOWED: [&str; 3] = ["store.rs", "bootstrap/mod.rs", "daemon/mod.rs"];
 
-/// fs4 `FileExt` method names that take/release an advisory lock. `lock` /
-/// `try_lock` are the exclusive aliases the codebase uses; the `_shared` /
-/// `_exclusive` variants are included for forward-coverage.
+/// fs4 `FileExt` lock/unlock method names. `lock` / `try_lock` are the exclusive
+/// aliases the codebase uses; the `_shared` / `_exclusive` variants are included
+/// for forward-coverage.
 const FLOCK_METHODS: [&str; 6] = [
     "lock",
     "try_lock",
@@ -42,13 +56,39 @@ const FLOCK_METHODS: [&str; 6] = [
 ];
 
 /// Does this file import the fs4 `FileExt` trait (so `file.try_lock()` method
-/// syntax resolves to an fs4 flock)? Checked on `use` lines only, so a comment
-/// mentioning the trait does not flip the gate.
+/// syntax resolves to an fs4 flock)? Parses whole `use` STATEMENTS — each runs
+/// from a `use`-prefixed line until the line carrying its `;` — so a multi-line
+/// `use fs4::{ … FileExt … };` block is detected as well as the single-line
+/// form. Comment lines are skipped so a commented mention does not flip the gate.
 fn imports_fs4_fileext(text: &str) -> bool {
-    text.lines().any(|l| {
-        let t = l.trim_start();
-        t.starts_with("use ") && t.contains("fs4") && t.contains("FileExt")
-    })
+    let mut stmt = String::new();
+    let mut in_use = false;
+    for line in text.lines() {
+        let t = line.trim_start();
+        if t.starts_with("//") || t.starts_with('*') {
+            continue;
+        }
+        if !in_use {
+            if t.starts_with("use ") {
+                in_use = true;
+                stmt.clear();
+                stmt.push_str(t);
+            } else {
+                continue;
+            }
+        } else {
+            stmt.push(' ');
+            stmt.push_str(t);
+        }
+        if stmt.contains(';') {
+            if stmt.contains("fs4") && stmt.contains("FileExt") {
+                return true;
+            }
+            in_use = false;
+            stmt.clear();
+        }
+    }
+    false
 }
 
 /// Return the raw-flock violations in `text` (empty for allowlisted files or
@@ -123,24 +163,32 @@ fn acquire_file_lock_is_sole_flock_depth_bumper_1629() {
     );
 }
 
-/// Meta-test: prove the scanner catches BOTH raw-flock forms and does NOT
-/// false-FAIL on `Mutex::lock()`. Guards against the #1635 too-narrow-detection
-/// regression (the original only matched the fully-qualified string and missed
-/// `use fs4::FileExt; file.try_lock()`).
+/// Meta-test: prove the scanner catches all the realistic raw-flock forms and
+/// does NOT false-FAIL on `Mutex::lock()`. Guards against the #1635
+/// too-narrow-detection regressions (rounds 1–3): the original matched only the
+/// fully-qualified string; round 2 added the imported-trait method; round 3
+/// (this) handles the multi-line import block.
 #[test]
-fn scanner_catches_both_forms_and_spares_mutex() {
-    // codex's exact probe: imported-trait method call, non-allowlisted file.
-    let method_probe = "use fs4::FileExt;\nfn f(file: std::fs::File) { let _ = file.try_lock(); }";
+fn scanner_catches_all_realistic_forms_and_spares_mutex() {
+    // codex r2 probe: single-line imported-trait method call.
+    let single = "use fs4::FileExt;\nfn f(file: std::fs::File) { let _ = file.try_lock(); }";
     assert!(
-        !scan_file("some/new_probe.rs", method_probe).is_empty(),
-        "must catch the imported-trait `file.try_lock()` flock form (#1635 hole)"
+        !scan_file("some/new_probe.rs", single).is_empty(),
+        "must catch single-line `use fs4::FileExt; file.try_lock()` (#1635 r2)"
     );
 
-    // Fully-qualified UFCS form, non-allowlisted file (no import needed).
-    let ufcs_probe = "fn f(file: std::fs::File) { let _ = fs4::FileExt::try_lock(&file); }";
+    // codex r3 probe: rustfmt's multi-line import block + method call.
+    let multiline = "use fs4::{\n    available_space,\n    FileExt,\n};\nfn f(file: std::fs::File) { let _ = file.try_lock(); }";
     assert!(
-        !scan_file("some/new_probe.rs", ufcs_probe).is_empty(),
-        "must catch the fully-qualified `fs4::FileExt::try_lock(` flock form"
+        !scan_file("some/new_probe.rs", multiline).is_empty(),
+        "must catch the MULTI-LINE `use fs4::{{ …FileExt… }}; file.try_lock()` (#1635 r3)"
+    );
+
+    // Fully-qualified UFCS form (no import needed).
+    let ufcs = "fn f(file: std::fs::File) { let _ = fs4::FileExt::try_lock(&file); }";
+    assert!(
+        !scan_file("some/new_probe.rs", ufcs).is_empty(),
+        "must catch the fully-qualified `fs4::FileExt::try_lock(` form"
     );
 
     // Legit Mutex::lock() in a non-fs4 file → must NOT false-FAIL.
@@ -150,17 +198,18 @@ fn scanner_catches_both_forms_and_spares_mutex() {
         "must NOT flag Mutex::lock() in a non-fs4 file"
     );
 
-    // fs4 disk-space import without FileExt → not gated; a `.lock()` here is
-    // necessarily non-fs4 and must NOT false-FAIL (mirrors src/inbox/disk.rs).
-    let disk = "use fs4::available_space;\nfn f(m: &std::sync::Mutex<u8>) { let _g = m.lock(); }";
+    // fs4 disk-space import WITHOUT FileExt → not gated; a `.lock()` here is
+    // necessarily non-fs4 and must NOT false-FAIL (mirrors src/inbox/disk.rs),
+    // including the multi-line grouped form that omits FileExt.
+    let disk = "use fs4::{\n    available_space,\n    total_space,\n};\nfn f(m: &std::sync::Mutex<u8>) { let _g = m.lock(); }";
     assert!(
         scan_file("inbox/disk.rs", disk).is_empty(),
-        "fs4::available_space (no FileExt) must not gate the method check on"
+        "fs4 import without FileExt must not gate the method check on"
     );
 
     // The 3 vetted files are exempt even with raw fs4 flock usage.
     assert!(
-        scan_file("store.rs", method_probe).is_empty(),
+        scan_file("store.rs", single).is_empty(),
         "allowlisted files are exempt"
     );
 }
