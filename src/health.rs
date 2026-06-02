@@ -206,6 +206,11 @@ pub enum BlockedReason {
     AwaitingOperator,
     PermissionPrompt,
     Crash,
+    /// #1634: the backend's configured model is rejected by the provider
+    /// (discontinued/unsupported model id). Set from the red-anchored
+    /// `AgentState::ModelUnsupported`. Manual-clear-only and hang-suppressing —
+    /// see `auto_clears_on` / `suppresses_hang_check`.
+    ModelUnsupported,
 }
 
 /// #1638: which recovery signal a [`BlockedReason`] is being tested against.
@@ -233,6 +238,7 @@ impl BlockedReason {
             "permission_prompt" => Some(Self::PermissionPrompt),
             "hang" => Some(Self::Hang),
             "crash" => Some(Self::Crash),
+            "model_unsupported" => Some(Self::ModelUnsupported),
             _ => None,
         }
     }
@@ -245,6 +251,7 @@ impl BlockedReason {
             Self::AwaitingOperator => "awaiting_operator",
             Self::PermissionPrompt => "permission_prompt",
             Self::Crash => "crash",
+            Self::ModelUnsupported => "model_unsupported",
         }
     }
 
@@ -273,7 +280,13 @@ impl BlockedReason {
                 matches!(signal, RecoverySignal::RateLimitLifted)
             }
             Self::AwaitingOperator => matches!(signal, RecoverySignal::OperatorResolved),
-            Self::PermissionPrompt | Self::Hang | Self::Crash => false,
+            // #1634: ModelUnsupported never auto-clears on EITHER axis. A rate-
+            // limit lift doesn't fix a bad model id, and there is no "ready
+            // again" operator-resolution transition (the agent keeps erroring) —
+            // the operator must change the configured model, then the agent
+            // restarts and `HealthTracker::reset()` clears it on respawn. So it
+            // joins the manual-clear-only class with PermissionPrompt/Hang/Crash.
+            Self::PermissionPrompt | Self::Hang | Self::Crash | Self::ModelUnsupported => false,
         }
     }
 
@@ -285,7 +298,17 @@ impl BlockedReason {
     /// suppress; PermissionPrompt/Hang/Crash do not.
     pub fn suppresses_hang_check(&self) -> bool {
         match self {
-            Self::RateLimit { .. } | Self::QuotaExceeded | Self::AwaitingOperator => true,
+            // #1634: ModelUnsupported suppresses hang-check (stuck-but-not-hung —
+            // the model rejection explains the output silence; we don't want
+            // hang-detection ALSO firing/escalating on top of the model-unsupported
+            // notify). NOTE the deliberate novel combination: it NEVER auto-clears
+            // (above, like Crash) yet DOES suppress hang (here, like RateLimit) —
+            // no prior variant pairs those, which is exactly why #1638's
+            // wildcard-free axes force this to be declared explicitly.
+            Self::RateLimit { .. }
+            | Self::QuotaExceeded
+            | Self::AwaitingOperator
+            | Self::ModelUnsupported => true,
             Self::PermissionPrompt | Self::Hang | Self::Crash => false,
         }
     }
@@ -1194,6 +1217,7 @@ mod tests {
             BlockedReason::AwaitingOperator,
             BlockedReason::PermissionPrompt,
             BlockedReason::Crash,
+            BlockedReason::ModelUnsupported,
         ];
         for reason in cases {
             let json = serde_json::to_string(&reason).expect("serialize");
@@ -1635,6 +1659,10 @@ mod tests {
             (PermissionPrompt, false, false, false),
             (Hang, false, false, false),
             (Crash, false, false, false),
+            // #1634: the novel never-auto-clears (false/false) + suppresses-hang
+            // (true) combination — manual-clear-only like Crash, but suppresses
+            // hang-check like RateLimit (stuck-but-not-hung).
+            (ModelUnsupported, false, false, true),
         ];
         for (reason, on_rl, on_op, suppress) in table {
             assert_eq!(

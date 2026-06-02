@@ -364,6 +364,17 @@ impl StatePatterns {
                 ),
                 // [docs] Context overflow error
                 (AgentState::ContextFull, r"ContextOverflow"),
+                // #1634 [実測 incident]: the configured model was discontinued
+                // (`gpt-5.3-codex` went unsupported on the ChatGPT account).
+                // codex prints these OpenAI error wordings then drops back to the
+                // `›` prompt, so this must rank ABOVE Idle/Ready (first-match
+                // wins). HIGH_FP (`is_high_fp_state`) → gated on the #919 red
+                // anchor so a codex agent merely DISCUSSING these strings (incl.
+                // working on this file) does not latch the never-clearing reason.
+                (
+                    AgentState::ModelUnsupported,
+                    r"invalid_request_error|model is not supported|Model metadata for .*? not found",
+                ),
                 // [measured] Codex 0.120.0 renders its approval dialog with a
                 // distinctive header (`Would you like to run the following
                 // command?`), a footer (`Press enter to confirm or esc to

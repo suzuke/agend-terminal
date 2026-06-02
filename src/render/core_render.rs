@@ -48,6 +48,9 @@ pub fn state_color(state: AgentState) -> Color {
             Color::Indexed(208)
         }
         AgentState::UsageLimit | AgentState::AuthError | AgentState::ApiError => Color::Red,
+        // #1634: model-unsupported is a permanent config fault — red like the
+        // other error states.
+        AgentState::ModelUnsupported => Color::Red,
         AgentState::Hang | AgentState::Crashed | AgentState::Restarting => Color::Red,
     }
 }
