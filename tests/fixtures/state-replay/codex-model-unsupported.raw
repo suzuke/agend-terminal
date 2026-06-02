@@ -1,0 +1,7 @@
+[2J[H[1mOpenAI Codex[0m v0.135.0  (model: gpt-5.3-codex)
+
+[2m›[0m run the migration
+
+[31mstream error: invalid_request_error: model is not supported; Model metadata for gpt-5.3-codex not found. Reconfigure the model and restart the session.[0m
+
+[2m›[0m [0m

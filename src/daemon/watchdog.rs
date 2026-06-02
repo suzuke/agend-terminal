@@ -39,10 +39,20 @@ pub fn run_watchdog_pass(
 ) {
     let reason = crate::state::classify_pty_output(backend, screen);
 
+    // #1634: model-unsupported is HIGH_FP + never-auto-clearing + hang-suppressing.
+    // Drive its latch from the RED-ANCHORED live `AgentState` (the StateTracker
+    // applied the #919 red gate to reach `ModelUnsupported`), NOT the colorless
+    // `classify_pty_output` — a plain-text prose mention of the error wording has
+    // no color, so routing the latch through the state inherits the FP boundary.
+    let model_unsupported = current_state == AgentState::ModelUnsupported;
+
     if dry_run {
         // Observability only — never mutate health (no set, no clear).
         if let Some(reason) = reason {
             crate::event_log::log(home, "watchdog_dry_run", agent_name, &format!("{reason:?}"));
+        }
+        if model_unsupported {
+            crate::event_log::log(home, "watchdog_dry_run", agent_name, "ModelUnsupported");
         }
         return;
     }
@@ -68,9 +78,47 @@ pub fn run_watchdog_pass(
         health.clear_blocked_reason();
     }
 
+    // #1634: surface model-unsupported. Transition-gated so the operator notify
+    // fires ONCE on entry, not every tick (the red-gated state re-matches while
+    // the error is on screen). Handled before the classify latch and returns —
+    // ModelUnsupported is the dominant, manual-clear-only reason for this agent.
+    if model_unsupported {
+        let already = matches!(
+            health.current_reason,
+            Some(crate::health::BlockedReason::ModelUnsupported)
+        );
+        health.set_blocked_reason(crate::health::BlockedReason::ModelUnsupported);
+        if !already {
+            notify_model_unsupported(home, agent_name, backend);
+        }
+        return;
+    }
+
     if let Some(reason) = reason {
         health.set_blocked_reason(reason);
     }
+}
+
+/// #1634: one-line operator notice on the transition into `ModelUnsupported`.
+/// Mirrors `conflict_notify`: a `System` `notify_agent` surfaces to the
+/// operator via the agent's channel binding. The agent itself can't act (it
+/// errors every turn) — the operator must change the configured model.
+fn notify_model_unsupported(home: &Path, agent_name: &str, backend: &Backend) {
+    let text = format!(
+        "[model-unsupported] agent `{agent_name}` (backend {}): the configured model is \
+         rejected by the provider (e.g. `invalid_request_error` / \"model is not supported\"). \
+         The agent will ERROR every turn until you change its model — agent_state stays Idle but \
+         it is NOT healthy. Fix the model, then restart the agent (or `health action=clear` once \
+         resolved).",
+        backend.name()
+    );
+    let source = crate::inbox::NotifySource::System("model_unsupported");
+    crate::inbox::notify_agent(home, agent_name, &source, &text);
+    tracing::error!(
+        agent = agent_name,
+        backend = backend.name(),
+        "#1634: ModelUnsupported detected — configured model rejected by provider; operator must change the model"
+    );
 }
 
 #[cfg(test)]
@@ -350,6 +398,50 @@ mod tests {
         assert!(
             !super::watchdog_dry_run_from_env(),
             "unset AGEND_WATCHDOG_DRY_RUN should return false"
+        );
+    }
+
+    /// #1634: a red-gated `AgentState::ModelUnsupported` latches the
+    /// `ModelUnsupported` BlockedReason, and — unlike a rate-limit latch — it
+    /// must NOT auto-clear when the agent next reads Idle (it never auto-clears;
+    /// only an operator model change + respawn `reset()` clears it).
+    #[test]
+    fn model_unsupported_latches_and_never_auto_clears_1634() {
+        let home = tmp_home("model-unsupported");
+        let mut health = HealthTracker::new();
+        let backend = Backend::Codex;
+
+        // Red-gated state arrives as ModelUnsupported → latch (+ one-time notify).
+        run_watchdog_pass(
+            &home,
+            "dev",
+            &backend,
+            "screen",
+            &mut health,
+            false,
+            AgentState::ModelUnsupported,
+        );
+        assert!(
+            matches!(health.current_reason, Some(BlockedReason::ModelUnsupported)),
+            "ModelUnsupported state must latch the BlockedReason, got {:?}",
+            health.current_reason
+        );
+
+        // Agent next reads Idle (recovered_from_rate_limit == true). A rate-limit
+        // latch would auto-clear here; ModelUnsupported must persist.
+        run_watchdog_pass(
+            &home,
+            "dev",
+            &backend,
+            "screen",
+            &mut health,
+            false,
+            AgentState::Idle,
+        );
+        assert!(
+            matches!(health.current_reason, Some(BlockedReason::ModelUnsupported)),
+            "#1634: ModelUnsupported must persist through Idle (never auto-clears), got {:?}",
+            health.current_reason
         );
     }
 }

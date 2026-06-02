@@ -62,6 +62,13 @@ pub enum AgentState {
     UsageLimit,
     AuthError,
     ApiError,
+    /// #1634: the backend's configured model is rejected by the provider
+    /// (discontinued / unsupported / typo'd model id). Distinct from `AuthError`
+    /// (credentials are fine) and `ApiError` (transient) because it is a
+    /// PERMANENT config fault: the agent errors every turn until the operator
+    /// changes the model. HIGH_FP (see `is_high_fp_state`) — requires the #919
+    /// red anchor so an agent merely discussing the error wording can't latch it.
+    ModelUnsupported,
     Crashed,
     Restarting,
 }
@@ -105,6 +112,10 @@ impl AgentState {
             Self::UsageLimit => 11,
             Self::AuthError => 12,
             Self::ApiError => 13,
+            // #1634: error class (instant transition, no hysteresis); shares the
+            // ApiError tier — display ordering only, first-match in `detect()`
+            // is the real gate.
+            Self::ModelUnsupported => 13,
             Self::Crashed => 14,
             Self::Restarting => 15,
         }
@@ -144,6 +155,7 @@ impl AgentState {
             Self::RateLimit => "rate_limit",
             Self::ServerRateLimit => "server_rate_limit",
             Self::UsageLimit => "usage_limit",
+            Self::ModelUnsupported => "model_unsupported",
             Self::AuthError => "auth_error",
             Self::ApiError => "api_error",
             Self::Crashed => "crashed",
@@ -314,7 +326,16 @@ fn oscillation_guard_window() -> Duration {
 fn is_high_fp_state(state: AgentState) -> bool {
     matches!(
         state,
-        AgentState::ServerRateLimit | AgentState::RateLimit | AgentState::ContextFull
+        AgentState::ServerRateLimit
+            | AgentState::RateLimit
+            | AgentState::ContextFull
+            // #1634: the model-unsupported wordings (`invalid_request_error`,
+            // `model is not supported`) appear verbatim in dialectic prose / when
+            // an agent works on THIS detection code, so require the red anchor.
+            // Critical here: ModelUnsupported never auto-clears and suppresses
+            // hang-check, so a FP would silently disable a healthy agent — the
+            // anchor is the FP boundary.
+            | AgentState::ModelUnsupported
     )
 }
 

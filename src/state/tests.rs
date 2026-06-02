@@ -1678,6 +1678,7 @@ fn parse_state(name: &str) -> AgentState {
         "usage_limit" => AgentState::UsageLimit,
         "auth_error" => AgentState::AuthError,
         "api_error" => AgentState::ApiError,
+        "model_unsupported" => AgentState::ModelUnsupported,
         "crashed" => AgentState::Crashed,
         "restarting" => AgentState::Restarting,
         other => panic!("unknown state name in manifest: {other}"),
@@ -2705,6 +2706,74 @@ fn matched_span_has_red_detects_any_red_occurrence() {
     assert!(!super::matched_span_has_red(screen, "ab", &fg_plain));
     // Empty phrase → false (guard).
     assert!(!super::matched_span_has_red(screen, "", &fg));
+}
+
+// ── #1634: model-unsupported detection + red-anchor FP boundary ─────
+
+/// #1634: a red-rendered codex model-unsupported error latches
+/// `ModelUnsupported`; the SAME wording WITHOUT red must NOT latch (the FP
+/// boundary — this reason never auto-clears and suppresses hang-check, so a
+/// codex agent merely discussing the error wording must not silently disable
+/// itself). Text-only feed fails open (pre-#919 contract).
+#[test]
+fn codex_model_unsupported_red_anchor_fp_boundary_1634() {
+    let screen = "invalid_request_error: model is not supported";
+    let n = screen.chars().count();
+    let phrase = "invalid_request_error"; // regex's leftmost match
+    let plen = phrase.chars().count();
+
+    // RED over the matched phrase → latches ModelUnsupported.
+    let mut fg_red = vec![CellFg::Default; n];
+    for c in fg_red.iter_mut().take(plen) {
+        *c = CellFg::Red;
+    }
+    let mut t = StateTracker::new(Some(&Backend::Codex));
+    t.feed_with_fg(screen, &fg_red);
+    assert_eq!(
+        t.get_state(),
+        AgentState::ModelUnsupported,
+        "red-rendered codex model error must latch ModelUnsupported"
+    );
+
+    // NO RED (plain) → FP boundary: must NOT latch the never-clearing reason.
+    let mut t2 = StateTracker::new(Some(&Backend::Codex));
+    let fg_plain = vec![CellFg::Default; n];
+    t2.feed_with_fg(screen, &fg_plain);
+    assert_ne!(
+        t2.get_state(),
+        AgentState::ModelUnsupported,
+        "#1634: same wording without red must NOT latch (prose / dogfood FP boundary)"
+    );
+
+    // Text-only feed (empty fg mask) fails open per the #919/#1450 contract.
+    let mut t3 = StateTracker::new(Some(&Backend::Codex));
+    t3.feed(screen);
+    assert_eq!(
+        t3.get_state(),
+        AgentState::ModelUnsupported,
+        "text-only feed (no color mask) fails open and fires"
+    );
+}
+
+/// #1634: the captured-incident fixture (codex error rendered RED) driven
+/// through the production vterm → `tail_lines_with_fg` → `feed_with_fg` path
+/// must latch `ModelUnsupported`. End-to-end regression pin for the real
+/// silent-error incident (the red SGR is resolved by the vterm, not hand-fed).
+#[test]
+fn codex_model_unsupported_fixture_replay_1634() {
+    let bytes = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/state-replay/codex-model-unsupported.raw"
+    ))
+    .expect("read codex-model-unsupported.raw fixture");
+    let mut vt = VTerm::new(80, 24);
+    let mut st = StateTracker::new(Some(&Backend::Codex));
+    drive(&mut vt, &mut st, &bytes);
+    assert_eq!(
+        st.get_state(),
+        AgentState::ModelUnsupported,
+        "#1634: the red-rendered codex model-unsupported incident must latch ModelUnsupported"
+    );
 }
 
 // ── #685 PR-2: F9 productive-marker freshness/dedup ─────────────────

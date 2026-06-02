@@ -14,6 +14,7 @@ const EXPECTED_FIXTURES: &[&str] = &[
     "codex-tooluse.raw",
     "codex-update.raw",
     "codex-perm.raw",
+    "codex-model-unsupported.raw",
     "gemini-thinking.raw",
     "gemini-tooluse.raw",
     "kiro-thinking.raw",

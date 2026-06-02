@@ -835,3 +835,22 @@ fixtures:
     # asserts None — what we want here.
     capture_kind: synthetic
     provenance: "#848 PR-B regression-proof — prose containing rate-limit substrings, expected Starting (NOT RateLimit)"
+
+  - file: codex-model-unsupported.raw
+    backend: codex
+    cli_version: "0.135.0"
+    recorded_on: "2026-06-02"
+    scenario: |
+      #1634: codex pane shows a discontinued/unsupported configured model
+      (gpt-5.3-codex went unsupported on the ChatGPT account). The error is
+      rendered RED (`invalid_request_error` / "model is not supported" /
+      "Model metadata for gpt-5.3-codex not found") then codex drops back to
+      the `›` prompt. Pre-#1634 this matched NO pattern → agent_state read Idle
+      (the `›`) and no BlockedReason latched → silent. Now the red-anchored
+      ModelUnsupported pattern fires (HIGH_FP: requires the #919 red SGR, so a
+      codex agent merely DISCUSSING the wording does NOT latch).
+    expected_transitions: [starting, model_unsupported]
+    expected_final_state: model_unsupported
+    expected_final_detect: model_unsupported
+    capture_kind: synthetic_from_incident
+    provenance: "#1634 — synthetic reconstruction of the codex model-unsupported incident (exact wording + red SGR)"
