@@ -430,6 +430,20 @@ fn configure_opencode(working_dir: &Path, instance_name: Option<&str>) -> Result
     for key in ["edit", "bash", "webfetch", "external_directory"] {
         perm.insert(key.to_string(), json!("allow"));
     }
+    // #1657: auto-approve the agend-terminal MCP server's tools. Without this,
+    // opencode raises a "Permission required" prompt on every MCP tool-call
+    // (including `send` kind=report) and the call blocks until the 30s MCP
+    // client timeout — so a reviewer's report never lands, its dispatch sidecar
+    // stays Pending, and dispatch_idle false-positives fire (the lead force-
+    // reassigns every review). opencode names MCP tools `<server>_<tool>`, and
+    // its permission keys do simple `*` glob matching, so `agend-terminal_*`
+    // covers all of this server's tools. This mirrors the other backends'
+    // posture (claude `autoApprove:["*"]`, gemini `trust:true`, codex
+    // `--dangerously-bypass`); on a single-user single-machine tool, trusting
+    // the user's own fleet MCP server is consistent and necessary for autonomy.
+    // Empirically verified against opencode 1.15.10: with this key a `send`
+    // tool-call completes immediately; without it the call hangs on the prompt.
+    perm.insert("agend-terminal_*".to_string(), json!("allow"));
 
     let body = serde_json::to_string_pretty(&config)?;
     crate::store::atomic_write(&path, body.as_bytes())?;
@@ -692,6 +706,13 @@ mod tests {
                 "permission.{key} must be \"allow\" so autonomous agents don't block"
             );
         }
+        // #1657: the agend-terminal MCP server's tools must be auto-approved
+        // (`<server>_*` glob), else every MCP tool-call (incl. `send` report)
+        // blocks on opencode's permission prompt until the 30s client timeout.
+        assert_eq!(
+            perm["agend-terminal_*"], "allow",
+            "permission.\"agend-terminal_*\" must be \"allow\" so MCP tool-calls (send/report) don't block on a permission prompt (#1657)"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
