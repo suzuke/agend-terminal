@@ -388,7 +388,16 @@ impl Backend {
             },
             Backend::Codex => BackendPreset {
                 command: "codex",
+                // #1626: `-c check_for_update_on_startup=false` disables codex's
+                // blocking startup update modal ("Update available!"). This is a
+                // per-invocation config override on the child argv — it does NOT
+                // write `~/.codex/config.toml`, so it stays fleet-scoped and never
+                // touches the operator's global codex config. Must precede the
+                // `resume` subcommand (`-c` is a global option). Primary fix; the
+                // #1069 dismiss below stays as a fallback (see its comment).
                 args: &[
+                    "-c",
+                    "check_for_update_on_startup=false",
                     "resume",
                     "--last",
                     "--dangerously-bypass-approvals-and-sandbox",
@@ -420,13 +429,26 @@ impl Backend {
                     },
                     // #1069: version-update modal blocks agent until operator
                     // selects an option. "2\r" = "Skip" (least invasive).
+                    // #1626 FALLBACK: the `-c check_for_update_on_startup=false`
+                    // flag above normally suppresses this modal entirely, so this
+                    // dismiss never fires in the happy path. Kept as belt-and-
+                    // suspenders: codex silently no-ops unknown `-c` keys, so if
+                    // upstream ever renames the key the flag dormant-fails and this
+                    // dismiss degrades the failure from "blocking hang" to a racy
+                    // (but non-blocking) auto-skip.
                     DismissPattern {
                         label: r"(?m)^[^A-Za-z\n]*Update available!",
                         sequence: b"2\r",
                     },
                 ],
-                // Codex: "resume --last" → fresh start drops the resume subcommand
-                fresh_args: Some(&["--dangerously-bypass-approvals-and-sandbox"]),
+                // Codex: "resume --last" → fresh start drops the resume subcommand.
+                // #1626: keep the `-c check_for_update_on_startup=false` override
+                // in fresh mode too (no subcommand here, so order is unconstrained).
+                fresh_args: Some(&[
+                    "-c",
+                    "check_for_update_on_startup=false",
+                    "--dangerously-bypass-approvals-and-sandbox",
+                ]),
                 fleet_mcp_supported: true,
             },
             Backend::OpenCode => BackendPreset {
@@ -1621,6 +1643,34 @@ mod tests {
             re.is_match(&centered),
             "#1087: centered modal with 45-space prefix must match"
         );
+    }
+
+    /// #1626: the `-c check_for_update_on_startup=false` override must be present
+    /// in BOTH spawn modes and, in Resume mode, must come BEFORE the `resume`
+    /// subcommand — `-c` is a global option, so codex's clap rejects it if it
+    /// trails the subcommand. Pins both the presence and the ordering so a future
+    /// preset edit can't silently drop the flag or move it past `resume`.
+    #[test]
+    fn codex_disables_startup_update_check_before_resume() {
+        for mode in [SpawnMode::Resume, SpawnMode::Fresh] {
+            let argv = Backend::Codex.preset_spawn_args(mode);
+            let c_idx = argv
+                .iter()
+                .position(|a| a == "-c")
+                .unwrap_or_else(|| panic!("#1626: codex {mode:?} argv must contain `-c`"));
+            assert_eq!(
+                argv[c_idx + 1],
+                "check_for_update_on_startup=false",
+                "#1626: `-c` must be followed by the update-check override in {mode:?} mode"
+            );
+            if let Some(resume_idx) = argv.iter().position(|a| a == "resume") {
+                assert!(
+                    c_idx < resume_idx,
+                    "#1626: `-c check_for_update_on_startup=false` must precede the \
+                     `resume` subcommand (global option), got argv={argv:?}"
+                );
+            }
+        }
     }
 
     #[test]
