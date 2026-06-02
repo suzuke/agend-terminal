@@ -163,15 +163,30 @@ impl Pane {
     pub fn resize_pty(&self, registry: &AgentRegistry, cols: u16, rows: u16) {
         match &self.source {
             PaneSource::Local => {
+                // #7: some backends' TUIs don't repaint on the SIGWINCH that
+                // `master.resize` delivers (kiro-cli 2.1.x), so we follow the
+                // resize with an explicit redraw trigger for those backends only.
+                let redraw = redraw_seq_after_resize(self.backend.as_ref());
                 let reg = agent::lock_registry(registry);
                 if let Some(handle) = reg.get(&self.instance_id) {
-                    let master = handle.pty_master.lock();
-                    let _ = master.resize(portable_pty::PtySize {
-                        rows,
-                        cols,
-                        pixel_width: 0,
-                        pixel_height: 0,
-                    });
+                    {
+                        let master = handle.pty_master.lock();
+                        let _ = master.resize(portable_pty::PtySize {
+                            rows,
+                            cols,
+                            pixel_width: 0,
+                            pixel_height: 0,
+                        });
+                    }
+                    // #7: send the redraw trigger AFTER the resize, on the input
+                    // writer (not the master). Clone the writer and release the
+                    // registry lock before the blocking write (#1530/F1: never
+                    // hold the registry lock across a PTY write).
+                    if let Some(seq) = redraw {
+                        let writer = handle.pty_writer.clone();
+                        drop(reg);
+                        let _ = agent::write_to_pty(&writer, seq);
+                    }
                 }
             }
             PaneSource::Remote(client) => {
@@ -182,10 +197,56 @@ impl Pane {
     }
 }
 
+/// #7: the byte sequence to emit after a PTY resize to force a repaint, for
+/// backends whose preset opts in via [`crate::backend::BackendPreset::redraw_after_resize`].
+///
+/// Returns `Some(Ctrl+L)` only for opted-in backends (kiro-cli 2.1.x TUI v2,
+/// which ignores the resize SIGWINCH and shows a blank pane until the next
+/// keystroke); `None` for every other backend — so they emit NOTHING extra on
+/// resize and are provably untouched. `Ctrl+L` (`0x0c`, form-feed) is the
+/// conventional TUI/readline "redraw" key, distinct from the submit key (`\r`).
+fn redraw_seq_after_resize(backend: Option<&Backend>) -> Option<&'static [u8]> {
+    backend
+        .filter(|b| b.preset().redraw_after_resize)
+        .map(|_| b"\x0c".as_slice())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::vterm::VTerm;
+
+    // #7: the redraw trigger must fire for Kiro ONLY and emit Ctrl+L; every
+    // other backend (and a backend-less pane) must emit NOTHING, so resize
+    // behavior for Claude/Codex/OpenCode/Gemini/Agy/Shell/Raw is unchanged.
+    #[test]
+    fn redraw_seq_after_resize_is_kiro_only_ctrl_l_7() {
+        assert_eq!(
+            redraw_seq_after_resize(Some(&Backend::KiroCli)),
+            Some(b"\x0c".as_slice()),
+            "Kiro must get Ctrl+L after resize"
+        );
+        for b in [
+            Backend::ClaudeCode,
+            Backend::Codex,
+            Backend::OpenCode,
+            Backend::Gemini,
+            Backend::Agy,
+            Backend::Shell,
+            Backend::Raw("whatever".into()),
+        ] {
+            assert_eq!(
+                redraw_seq_after_resize(Some(&b)),
+                None,
+                "{b:?} must emit nothing after resize (provably untouched)"
+            );
+        }
+        assert_eq!(
+            redraw_seq_after_resize(None),
+            None,
+            "a backend-less pane must emit nothing"
+        );
+    }
 
     fn leaf(id: usize, name: &str) -> Pane {
         Pane {

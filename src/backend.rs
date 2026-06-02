@@ -282,12 +282,19 @@ pub struct BackendPreset {
     /// Daemon spawn path emits a `[fleet-mcp-unsupported]` warning when
     /// this is `false` so operators are not surprised by missing tools.
     pub fleet_mcp_supported: bool,
+    /// #7: emit a redraw trigger (Ctrl+L) after a PTY resize. True ONLY for
+    /// backends whose TUI does not repaint on SIGWINCH — kiro-cli 2.1.x TUI v2,
+    /// which otherwise leaves the pane blank until the next keystroke. Read by
+    /// [`crate::layout::pane::Pane::resize_pty`]; `false` for every other
+    /// backend, so they are provably untouched by the redraw injection.
+    pub redraw_after_resize: bool,
 }
 
 impl Backend {
     pub fn preset(&self) -> BackendPreset {
         match self {
             Backend::ClaudeCode => BackendPreset {
+                redraw_after_resize: false, // #7: repaints on SIGWINCH — no trigger needed.
                 command: "claude",
                 args: &["--dangerously-skip-permissions"],
                 ready_pattern: "bypass permissions|❯",
@@ -342,6 +349,10 @@ impl Backend {
                 fleet_mcp_supported: true,
             },
             Backend::KiroCli => BackendPreset {
+                // #7: kiro-cli 2.1.x TUI v2 does not repaint on SIGWINCH, so a
+                // pane switch (which resizes the PTY) leaves it blank until the
+                // next keystroke. resize_pty sends Ctrl+L to force a repaint.
+                redraw_after_resize: true,
                 command: "kiro-cli",
                 args: &["chat", "--trust-all-tools"],
                 ready_pattern:
@@ -387,6 +398,7 @@ impl Backend {
                 fleet_mcp_supported: true,
             },
             Backend::Codex => BackendPreset {
+                redraw_after_resize: false, // #7: repaints on SIGWINCH — no trigger needed.
                 command: "codex",
                 // #1626: `-c check_for_update_on_startup=false` disables codex's
                 // blocking startup update modal ("Update available!"). This is a
@@ -452,6 +464,7 @@ impl Backend {
                 fleet_mcp_supported: true,
             },
             Backend::OpenCode => BackendPreset {
+                redraw_after_resize: false, // #7: repaints on SIGWINCH — no trigger needed.
                 command: "opencode",
                 args: &[],
                 ready_pattern: "Ask anything|tab agents",
@@ -489,6 +502,7 @@ impl Backend {
                 fleet_mcp_supported: true,
             },
             Backend::Gemini => BackendPreset {
+                redraw_after_resize: false, // #7: repaints on SIGWINCH — no trigger needed.
                 command: "gemini",
                 args: &["--yolo"],
                 ready_pattern: "Type your message|YOLO",
@@ -525,6 +539,7 @@ impl Backend {
                 fleet_mcp_supported: true,
             },
             Backend::Agy => BackendPreset {
+                redraw_after_resize: false, // #7: repaints on SIGWINCH — no trigger needed.
                 command: "agy",
                 args: &["--dangerously-skip-permissions"],
                 // #987: agy's interactive TUI renders an "Antigravity CLI <ver>"
@@ -576,6 +591,7 @@ impl Backend {
             // [`Backend::command_string`], which resolves Shell to `$SHELL`
             // and Raw to its stored path.
             Backend::Shell | Backend::Raw(_) => BackendPreset {
+                redraw_after_resize: false, // #7: plain shell / raw exec — no TUI redraw quirk.
                 command: "",
                 args: &[],
                 ready_pattern: "",
@@ -1231,6 +1247,30 @@ mod tests {
                 BackendBehavior::preset(&b).command,
                 b.preset().command,
                 "preset parity for {b:?}"
+            );
+        }
+    }
+
+    // #7: redraw_after_resize is set on EXACTLY one backend (Kiro). If a new
+    // backend ever needs it, flip it deliberately + update this pin.
+    #[test]
+    fn redraw_after_resize_is_kiro_only_7() {
+        assert!(
+            Backend::KiroCli.preset().redraw_after_resize,
+            "Kiro must opt into redraw-after-resize"
+        );
+        for b in [
+            Backend::ClaudeCode,
+            Backend::Codex,
+            Backend::OpenCode,
+            Backend::Gemini,
+            Backend::Agy,
+            Backend::Shell,
+            Backend::Raw("x".to_string()),
+        ] {
+            assert!(
+                !b.preset().redraw_after_resize,
+                "{b:?} must NOT opt into redraw-after-resize"
             );
         }
     }
