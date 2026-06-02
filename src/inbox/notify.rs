@@ -375,8 +375,22 @@ pub(crate) fn should_defer_inject(
         return true;
     }
     if actionable {
-        // Short keystroke-collision window only (NOT the #1457 full draft hold).
+        // #1675: defer a wake while the operator has a LIVE unsubmitted draft.
+        // `operator_typing_recent` is a 1.5s window — pause-blind, so a slow /
+        // multi-line typist pausing >1.5s fell through and the inject's
+        // submit_key force-submitted their half-typed line. The order-based
+        // `Drafting` signal (#1457: typed > submit) is pause-immune (holds up to
+        // the 5-min escape window), so it covers slow composition. Union keeps the
+        // brief post-keystroke settle (window) AND the paused-but-live draft
+        // (order). `None`/`Abandoned` still wake immediately, preserving #1473's
+        // "wake the idle/abandoned agent" (a never-composed pane reads `None`);
+        // the TUI flush drains the queue the instant the operator submits
+        // (draft_state → `None`). `Drafting` is set ONLY by human TUI keystrokes
+        // (record_input_activity), so this fires exactly when a person is
+        // composing in this pane — agent PTY output never sets it.
         operator_typing_recent(home, agent_name)
+            || crate::notification_queue::draft_state(home, agent_name)
+                == crate::notification_queue::DraftState::Drafting
     } else {
         // Ambient: the #1457 full draft gate is applied downstream by
         // route_notification — don't double-gate here.
@@ -880,6 +894,34 @@ mod should_defer_inject_tests_1513 {
         assert!(
             should_defer_inject(&h, "a", Some("idle"), true),
             "recent typing defers actionable"
+        );
+    }
+
+    // #1675: a PAUSED-but-LIVE operator draft (typed >1.5s ago, never submitted →
+    // `Drafting`) must STILL defer an actionable wake. Pre-#1675 the 1.5s
+    // `operator_typing_recent` window let a paused draft fall through, so the
+    // inject's submit_key force-submitted the operator's half-typed line. The
+    // order-based `Drafting` check (pause-immune) is what closes that hole.
+    #[test]
+    fn actionable_defers_on_paused_live_draft_1675() {
+        let h = tmp_home("paused-draft");
+        // typed 3s ago (> TYPING_QUIET_WINDOW_MS=1.5s), no submit recorded:
+        // operator_typing_recent is FALSE but draft_state is Drafting.
+        std::fs::create_dir_all(h.join("metadata")).unwrap();
+        let typed = chrono::Utc::now().timestamp_millis() - 3_000;
+        std::fs::write(
+            h.join("metadata").join("a.json"),
+            format!("{{\"last_input_epoch_ms\":{typed}}}"),
+        )
+        .unwrap();
+        // sanity: the old window-only signal would NOT defer this.
+        assert!(
+            !super::operator_typing_recent(&h, "a"),
+            "3s-old keystroke is outside the 1.5s window"
+        );
+        assert!(
+            should_defer_inject(&h, "a", Some("idle"), true),
+            "#1675: a paused (3s) live operator draft must defer actionable, not force-submit it"
         );
     }
 }

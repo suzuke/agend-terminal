@@ -2365,10 +2365,14 @@ fn t12_pty_state_kind_matrix() {
         );
 
         // Composing path — hint deferred into notification_queue.
-        // #1513: use a PAUSED draft (>1.5s since last keystroke) so this tests
-        // the #1473 draft-HOLD bypass, not the new fresh-keystroke anti-collision
-        // yield (which would defer actionable too — covered in
-        // should_defer_inject_tests_1513::actionable_defers_on_recent_typing).
+        // #1675: a PAUSED-but-LIVE operator draft (>1.5s since last keystroke,
+        // never submitted → `Drafting`) now defers EVERY kind, including
+        // actionable wakes. Pre-#1675 actionable (#1483) bypassed a paused draft
+        // and force-submitted the operator's half-typed line — the operator
+        // reported that on slow/multi-line typing. The order-based `Drafting`
+        // signal is pause-immune; the TUI flush releases the moment the operator
+        // submits (draft_state → None). (A never-composed pane reads `None` and
+        // still wakes immediately — #1473's wake-the-idle-agent is preserved.)
         let composing_home = tmp_home(&format!("982-t12-{kind}"));
         mark_composing_stale(&composing_home, "agent1");
         let mut msg = make_msg("system:t12", "composing");
@@ -2379,22 +2383,11 @@ fn t12_pty_state_kind_matrix() {
         })
         .expect("composing enqueue");
         let after = crate::notification_queue::pending_count(&composing_home, "agent1");
-        // #1483: actionable work-delivery kinds (ci-ready-for-action / task /
-        // query) bypass the draft-gate and inject straight to the PTY — they
-        // are NOT deferred into the queue even while composing. Only ambient
-        // kinds (report / update / waiting_on_stale) defer.
-        if matches!(kind, "task" | "query") {
-            assert_eq!(
-                after, before,
-                "actionable kind={kind} must bypass draft-gate (not deferred) while composing"
-            );
-        } else {
-            assert_eq!(
-                after,
-                before + 1,
-                "ambient kind={kind} must defer 1 hint while composing"
-            );
-        }
+        assert_eq!(
+            after,
+            before + 1,
+            "#1675: kind={kind} must defer 1 hint while the operator has a live draft"
+        );
         fs::remove_dir_all(&composing_home).ok();
     }
     fs::remove_dir_all(&home).ok();

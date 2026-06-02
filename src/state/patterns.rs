@@ -24,7 +24,10 @@ use regex::Regex;
 /// list (an unverified guess), is the most prose-FP-prone of the set, and no
 /// backend was observed emitting it literally — so dropping it is
 /// false-negative-free (the #1136 coverage test never listed it either).
-const SERVER_RATE_LIMIT_NET_ERRORS: &str = r"ECONNRESET|ETIMEDOUT|InvalidHTTPResponse|fetch failed|connection reset|socket hang up|proxy.*disconnect";
+// #8 Phase 2 (KiroCli migration): pub(crate) so the co-located BackendProfile
+// references this shared net-error alternation by the SAME const (not a re-typed
+// copy), keeping byte-identity with the legacy compile_for arm that also uses it.
+pub(crate) const SERVER_RATE_LIMIT_NET_ERRORS: &str = r"ECONNRESET|ETIMEDOUT|InvalidHTTPResponse|fetch failed|connection reset|socket hang up|proxy.*disconnect";
 
 /// Compiled patterns for one backend.
 pub struct StatePatterns {
