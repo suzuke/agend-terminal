@@ -12,11 +12,12 @@
 
 use std::sync::LazyLock;
 
-/// A recognized reviewer verdict. Detected via the §3.12 canonical convention —
-/// the report text (trimmed) STARTS WITH the verdict word. Starts-with (not a
-/// substring scan) is what keeps the gate OFF non-verdict reports: a dev
-/// completion note mentioning "dual-VERIFIED" does not *start* with it, so it is
-/// never gated. Mirrors `auto_release::is_verdict_message`.
+/// A recognized reviewer verdict. Detected (see [`detect_verdict`]) when the
+/// verdict word is the LEADING token of the report — after stripping leading
+/// whitespace + markdown line-prefixes. Leading-token (not a substring scan) is
+/// what keeps the gate OFF non-verdict reports: a dev completion note mentioning
+/// "dual-VERIFIED" mid-text is never gated. Mirrors the §3.12 verdict convention
+/// (`auto_release::is_verdict_message`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Verdict {
     Verified,
@@ -26,18 +27,34 @@ pub(crate) enum Verdict {
 
 /// Detect the verdict a report carries, or `None` when it is not a verdict
 /// report (so the gate never touches ordinary status/completion reports).
+///
+/// #1668 (codex catch): strip leading whitespace AND markdown line-prefixes
+/// (`>`, `-`, `*`, `#`, in any combination) BEFORE the match — otherwise a
+/// reviewer could evade the gate by markdown-prefixing the verdict
+/// (`> VERIFIED` / `## VERIFIED`). After stripping, the verdict word must be the
+/// leading TOKEN: it matches only when followed by end-of-string or a
+/// non-alphanumeric boundary, so `VERIFIED`/`VERIFIED:`/`VERIFIED —` match while
+/// `dual-VERIFIED` (no prefix to strip; doesn't start with the word) and
+/// `#1604 … dual-VERIFIED` (strips `#` → leads with `1604`) stay `None`. This
+/// preserves the original mid-text-false-positive protection.
 pub(crate) fn detect_verdict(summary: &str) -> Option<Verdict> {
-    let t = summary.trim_start();
-    // UNVERIFIED first — it contains "VERIFIED" as a substring.
-    if t.starts_with("UNVERIFIED") {
-        Some(Verdict::Unverified)
-    } else if t.starts_with("VERIFIED") {
-        Some(Verdict::Verified)
-    } else if t.starts_with("REJECTED") {
-        Some(Verdict::Rejected)
-    } else {
-        None
+    let t = summary
+        .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '>' | '-' | '*' | '#'));
+    // UNVERIFIED first — it shares the "VERIFIED" tail (strip_prefix already
+    // disambiguates, but keep the order explicit).
+    for (word, verdict) in [
+        ("UNVERIFIED", Verdict::Unverified),
+        ("VERIFIED", Verdict::Verified),
+        ("REJECTED", Verdict::Rejected),
+    ] {
+        if let Some(rest) = t.strip_prefix(word) {
+            // Bounded token: EOL or a non-alphanumeric char (rejects `VERIFIEDx`).
+            if rest.chars().next().is_none_or(|c| !c.is_alphanumeric()) {
+                return Some(verdict);
+            }
+        }
     }
+    None
 }
 
 /// `filename.ext:line` citation, e.g. `src/comms.rs:464`. The `.<ext>:<digits>`
@@ -86,9 +103,9 @@ pub(crate) fn check_evidence_gate(body: &str, verdict: Verdict) -> Result<(), St
 mod tests {
     use super::*;
 
-    // ── detect_verdict: starts-with, UNVERIFIED-first, no prose false-fire ──
+    // ── detect_verdict: leading-token match, UNVERIFIED-first, no prose FP ──
     #[test]
-    fn detect_verdict_starts_with_only() {
+    fn detect_verdict_leading_token() {
         assert_eq!(
             detect_verdict("VERIFIED — looks good"),
             Some(Verdict::Verified)
@@ -104,7 +121,43 @@ mod tests {
             detect_verdict("#1604 COMPLETE — dual-VERIFIED, merged"),
             None
         );
+        assert_eq!(detect_verdict("dual-VERIFIED"), None);
         assert_eq!(detect_verdict("task done"), None);
+        assert_eq!(detect_verdict("ratio 12:34 ok"), None);
+        // `VERIFIEDx` is not the verdict word (alphanumeric boundary).
+        assert_eq!(detect_verdict("VERIFIEDish maybe"), None);
+    }
+
+    /// #1668 (codex catch): markdown-prefixed verdicts must NOT evade the gate.
+    /// Stripping leading `>`/`-`/`*`/`#`/whitespace (any combination) before the
+    /// token match — WITHOUT reintroducing the mid-text false-positive.
+    #[test]
+    fn detect_verdict_strips_markdown_prefixes_1668() {
+        // GATED now (were evading via trim_start()-only):
+        for s in [
+            "> VERIFIED",
+            "- VERIFIED",
+            "* VERIFIED",
+            "## VERIFIED",
+            ">VERIFIED",        // no space
+            "  > VERIFIED",     // whitespace + prefix
+            "> - * # VERIFIED", // any combination
+            "- REJECTED: nope",
+            "> UNVERIFIED",
+        ] {
+            assert!(
+                detect_verdict(s).is_some(),
+                "#1668: markdown-prefixed verdict must be detected: {s:?}"
+            );
+        }
+        assert_eq!(detect_verdict("> VERIFIED"), Some(Verdict::Verified));
+        assert_eq!(detect_verdict("## REJECTED — x"), Some(Verdict::Rejected));
+        assert_eq!(detect_verdict("> UNVERIFIED"), Some(Verdict::Unverified));
+
+        // Protection must SURVIVE: stripping leading `#` then leading with a
+        // non-verdict token stays None (no new mid-text false-positive).
+        assert_eq!(detect_verdict("#1604 COMPLETE — dual-VERIFIED"), None);
+        assert_eq!(detect_verdict("- some bullet, later VERIFIED"), None);
     }
 
     // ── the lead's required matrix ──
