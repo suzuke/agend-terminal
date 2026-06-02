@@ -159,6 +159,40 @@ fn core_lock_exited() {
     CORE_LOCK_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
 }
 
+// ── #1629: fs4 advisory-lock (flock) depth tracking ──────────────────────
+//
+// The #1492/#1535 guard tracks the registry + core locks. A THIRD tier — `fs4`
+// advisory file locks (flocks) acquired via [`crate::store::acquire_file_lock`]
+// — was invisible to it: holding a flock across a self-IPC (loopback `api::call`
+// / `enqueue_with_idle_hint`) is the same lock-while-blocking deadlock class as
+// #1617, yet bumped neither counter — so every flock-while-blocking bug
+// (#1617/#1342/#1340/#1624) had to be caught by manual review. The
+// [`crate::store::FileFlockGuard`] returned by `acquire_file_lock` bumps
+// `FLOCK_DEPTH` for its lifetime so the same self-IPC assert covers the flock
+// tier too.
+//
+// The 2 daemon-singleton `.daemon.lock` raw `fs4::try_lock` sites
+// (`bootstrap::acquire_daemon_lock`, `daemon::run`) deliberately bypass
+// `acquire_file_lock` and MUST NOT bump: they hold for the daemon's whole life,
+// which would pin the depth > 0 and false-trip every self-IPC.
+
+thread_local! {
+    /// How many `acquire_file_lock` flocks this thread currently holds (0 = none).
+    /// A single total-depth counter suffices: the rule is "no self-IPC while
+    /// holding ANY flock", so per-path identity is irrelevant.
+    static FLOCK_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Record that this thread acquired an `acquire_file_lock` flock.
+pub fn flock_entered() {
+    FLOCK_DEPTH.with(|c| c.set(c.get().saturating_add(1)));
+}
+
+/// Record that this thread released an `acquire_file_lock` flock.
+pub fn flock_exited() {
+    FLOCK_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
+}
+
 /// #1535: a `parking_lot::Mutex` wrapper for the per-agent `AgentCore` that
 /// tracks lock depth via [`CORE_LOCK_DEPTH`]. `.lock()` is API-compatible with
 /// `parking_lot::Mutex::lock` (the returned [`CoreGuard`] `Deref`s to `T`), so
@@ -213,10 +247,11 @@ impl<T> Drop for CoreGuard<'_, T> {
 }
 
 /// Return `Err` if a self-IPC vector is entered while this thread holds the
-/// registry lock (#1492) OR any per-agent core lock (#1535) — either ordering
+/// registry lock (#1492), any per-agent core lock (#1535), OR any `fs4` flock
+/// acquired via [`crate::store::acquire_file_lock`] (#1629) — each ordering
 /// deadlocks the daemon (the loopback API handler needs the registry lock and
-/// may lock the target agent's core). `ctx` names the vector (logged + carried
-/// in the error).
+/// may lock the target agent's core; a held flock stalls any thread contending
+/// it). `ctx` names the vector (logged + carried in the error).
 ///
 /// #1492-L2 (decision d-20260531171228817178-0): ALWAYS-ON, fail-fast `Err`
 /// (was debug-only `panic!` + release no-op). On violation it logs at ERROR
@@ -230,19 +265,22 @@ impl<T> Drop for CoreGuard<'_, T> {
 pub fn assert_no_registry_lock_for_self_ipc(ctx: &str) -> anyhow::Result<()> {
     let reg = REGISTRY_LOCK_DEPTH.with(|c| c.get());
     let core = CORE_LOCK_DEPTH.with(|c| c.get());
-    if reg > 0 || core > 0 {
+    let flock = FLOCK_DEPTH.with(|c| c.get());
+    if reg > 0 || core > 0 || flock > 0 {
         tracing::error!(
             ctx,
             registry_depth = reg,
             core_depth = core,
-            "#1492/#1535 lock-across-self-IPC deadlock risk — refusing self-IPC (returning Err)"
+            flock_depth = flock,
+            "#1492/#1535/#1629 lock-across-self-IPC deadlock risk — refusing self-IPC (returning Err)"
         );
         anyhow::bail!(
-            "#1492/#1535 lock-across-self-IPC deadlock risk: `{ctx}` was called while this thread \
-             holds locks (registry depth={reg}, core depth={core}). The loopback API handler needs \
-             the registry lock and may lock the target agent's core, so this self-IPC would \
-             deadlock the daemon. Drop the guard(s) BEFORE the call (collect under lock → drop → \
-             emit; see #1530, docs/DAEMON-LOCK-ORDERING.md)."
+            "#1492/#1535/#1629 lock-across-self-IPC deadlock risk: `{ctx}` was called while this thread \
+             holds locks (registry depth={reg}, core depth={core}, flock depth={flock}). The loopback API \
+             handler needs the registry lock and may lock the target agent's core, and an fs4 flock held \
+             across this self-IPC stalls any thread contending it — so this would deadlock the daemon. \
+             Drop the guard(s) BEFORE the call (collect under lock → drop → emit; see #1530, \
+             docs/DAEMON-LOCK-ORDERING.md)."
         );
     }
     Ok(())

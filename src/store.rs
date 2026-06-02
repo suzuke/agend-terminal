@@ -130,14 +130,40 @@ pub fn save_atomic<T: Serialize>(path: &Path, data: &T) -> anyhow::Result<()> {
     atomic_write(path, body.as_bytes())
 }
 
+/// #1629: RAII guard returned by [`acquire_file_lock`]. Holds the locked `File`
+/// (the OS advisory lock releases when the `File` drops) and bumps the
+/// `FLOCK_DEPTH` thread-local for its lifetime so the self-IPC deadlock guard
+/// (`assert_no_registry_lock_for_self_ipc`) can see the flock tier — holding a
+/// flock across a loopback `api::call`/`enqueue_with_idle_hint` is the #1617
+/// lock-while-blocking deadlock class. On drop the depth decrement runs before
+/// the inner `File`'s drop releases the OS lock; both happen at the same scope
+/// exit, so no self-IPC can observe an inconsistent (depth, lock-held) pair.
+///
+/// `Deref` to `&File` is intentionally NOT provided: every call site holds the
+/// guard purely for RAII (`let _lock = acquire_file_lock(..)?`), so an opaque
+/// guard keeps the flock-depth invariant un-bypassable.
+pub struct FileFlockGuard {
+    _file: std::fs::File,
+}
+
+impl Drop for FileFlockGuard {
+    fn drop(&mut self) {
+        crate::sync_audit::flock_exited();
+    }
+}
+
 /// Acquire an exclusive advisory lock tied to `lock_path`.
 ///
-/// Released when the returned handle is dropped. Do NOT open the lock file
-/// with `truncate(true)` — truncation is unnecessary (the file contents are
-/// meaningless) and invites confusion in crash paths where a partially
-/// initialised lock file might be observed empty by another opener while
-/// the flock itself is still held on the inode.
-pub fn acquire_file_lock(lock_path: &Path) -> anyhow::Result<std::fs::File> {
+/// Released when the returned [`FileFlockGuard`] is dropped. Do NOT open the
+/// lock file with `truncate(true)` — truncation is unnecessary (the file
+/// contents are meaningless) and invites confusion in crash paths where a
+/// partially initialised lock file might be observed empty by another opener
+/// while the flock itself is still held on the inode.
+///
+/// #1629: this is the SOLE flock chokepoint that bumps `FLOCK_DEPTH`. The 2
+/// daemon-singleton `.daemon.lock` raw `fs4::try_lock` sites deliberately bypass
+/// it (they hold for the daemon's whole life and must not pin the depth).
+pub fn acquire_file_lock(lock_path: &Path) -> anyhow::Result<FileFlockGuard> {
     if let Some(parent) = lock_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -152,7 +178,9 @@ pub fn acquire_file_lock(lock_path: &Path) -> anyhow::Result<std::fs::File> {
     // (current MSRV is 1.87 per `rust-version`).
     fs4::FileExt::lock(&f)
         .map_err(|e| anyhow::anyhow!("flock failed on {}: {e}", lock_path.display()))?;
-    Ok(f)
+    // Bump AFTER the OS lock is held so depth>0 ⟹ lock held.
+    crate::sync_audit::flock_entered();
+    Ok(FileFlockGuard { _file: f })
 }
 
 /// Helper: build a store path from home + filename.
@@ -507,6 +535,36 @@ mod tests {
         drop(guard);
         // After drop, second can acquire.
         assert!(fs4::FileExt::try_lock(&second).is_ok());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn flock_guard_trips_self_ipc_deadlock_guard_1629() {
+        // #1629: holding an acquire_file_lock flock must make the always-on
+        // self-IPC deadlock guard REFUSE (Err); dropping it must clear (Ok). This
+        // is the wiring proof — FileFlockGuard bumps FLOCK_DEPTH, which
+        // assert_no_registry_lock_for_self_ipc now reads alongside the registry +
+        // core tiers.
+        let dir = tmp_dir("flock_guard_selfipc");
+        let lock_path = dir.join("g.lock");
+
+        // No flock held → guard passes.
+        assert!(
+            crate::sync_audit::assert_no_registry_lock_for_self_ipc("test:pre").is_ok(),
+            "no flock held → self-IPC allowed"
+        );
+        {
+            let _guard = acquire_file_lock(&lock_path).expect("acquire flock");
+            assert!(
+                crate::sync_audit::assert_no_registry_lock_for_self_ipc("test:held").is_err(),
+                "#1629: self-IPC must be refused while an acquire_file_lock flock is held"
+            );
+        }
+        // Flock dropped → guard passes again (FileFlockGuard::drop decremented).
+        assert!(
+            crate::sync_audit::assert_no_registry_lock_for_self_ipc("test:post").is_ok(),
+            "#1629: self-IPC must be allowed once the flock is dropped"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 

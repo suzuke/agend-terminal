@@ -11,7 +11,7 @@ fn atomic_write_yaml(home: &Path, doc: &serde_yaml_ng::Value) -> Result<()> {
     result
 }
 
-fn acquire_lock(home: &Path) -> Result<std::fs::File> {
+fn acquire_lock(home: &Path) -> Result<crate::store::FileFlockGuard> {
     let lock_path = home.join(".fleet.yaml.lock");
     crate::store::acquire_file_lock(&lock_path).context("failed to acquire fleet lock")
 }
