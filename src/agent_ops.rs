@@ -187,8 +187,13 @@ pub fn save_metadata(home: &Path, instance_name: &str, key: &str, value: Value) 
         .unwrap_or(json!({}));
     meta[key] = value;
     let content = serde_json::to_string_pretty(&meta).unwrap_or_default();
-    // M1: atomic write with fsync
-    let _ = crate::store::atomic_write(&meta_path, content.as_bytes());
+    // M1: atomic write with fsync. #1647: log on failure — this metadata is read
+    // back by `merge_metadata`, and the MCP set_* handlers return OK regardless,
+    // so a dropped write was a silent operator-set-but-lost.
+    persist_or_log!(
+        crate::store::atomic_write(&meta_path, content.as_bytes()),
+        "save_metadata"
+    );
 }
 
 /// Persist multiple metadata key/value pairs in a single atomic write.
@@ -205,8 +210,11 @@ pub fn save_metadata_batch(home: &Path, instance_name: &str, entries: &[(&str, V
         meta[*key] = value.clone();
     }
     let content = serde_json::to_string_pretty(&meta).unwrap_or_default();
-    // M1: atomic write with fsync
-    let _ = crate::store::atomic_write(&meta_path, content.as_bytes());
+    // M1: atomic write with fsync. #1647: log on failure — see save_metadata.
+    persist_or_log!(
+        crate::store::atomic_write(&meta_path, content.as_bytes()),
+        "save_metadata_batch"
+    );
 }
 
 // ---------------------------------------------------------------------------

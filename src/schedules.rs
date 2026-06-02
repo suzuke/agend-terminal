@@ -258,44 +258,47 @@ pub fn replay_missed_oneshots(home: &Path) -> Vec<Schedule> {
     let cutoff = now - chrono::Duration::hours(24);
     let mut to_replay = Vec::new();
 
-    let _ = crate::store::mutate_versioned(&store_path(home), |store: &mut ScheduleStore| {
-        for sched in store.schedules.iter_mut() {
-            if !sched.enabled {
-                continue;
+    persist_or_log!(
+        crate::store::mutate_versioned(&store_path(home), |store: &mut ScheduleStore| {
+            for sched in store.schedules.iter_mut() {
+                if !sched.enabled {
+                    continue;
+                }
+                let at = match &sched.trigger {
+                    Trigger::Once { at } => at.clone(),
+                    Trigger::Cron { .. } => continue,
+                };
+                let at_utc = match chrono::DateTime::parse_from_rfc3339(&at) {
+                    Ok(dt) => dt.with_timezone(&chrono::Utc),
+                    Err(_) => continue,
+                };
+                if at_utc >= now {
+                    continue; // not missed yet
+                }
+                sched.enabled = false;
+                sched.updated_at = now.to_rfc3339();
+                if at_utc < cutoff {
+                    tracing::warn!(
+                        id = %sched.id,
+                        run_at = %at,
+                        "dropping stale one-shot schedule (>24h past)"
+                    );
+                    sched.run_history.push(ScheduleRun {
+                        triggered_at: now.to_rfc3339(),
+                        status: "stale_dropped".to_string(),
+                    });
+                } else {
+                    sched.run_history.push(ScheduleRun {
+                        triggered_at: now.to_rfc3339(),
+                        status: "replayed".to_string(),
+                    });
+                    to_replay.push(sched.clone());
+                }
             }
-            let at = match &sched.trigger {
-                Trigger::Once { at } => at.clone(),
-                Trigger::Cron { .. } => continue,
-            };
-            let at_utc = match chrono::DateTime::parse_from_rfc3339(&at) {
-                Ok(dt) => dt.with_timezone(&chrono::Utc),
-                Err(_) => continue,
-            };
-            if at_utc >= now {
-                continue; // not missed yet
-            }
-            sched.enabled = false;
-            sched.updated_at = now.to_rfc3339();
-            if at_utc < cutoff {
-                tracing::warn!(
-                    id = %sched.id,
-                    run_at = %at,
-                    "dropping stale one-shot schedule (>24h past)"
-                );
-                sched.run_history.push(ScheduleRun {
-                    triggered_at: now.to_rfc3339(),
-                    status: "stale_dropped".to_string(),
-                });
-            } else {
-                sched.run_history.push(ScheduleRun {
-                    triggered_at: now.to_rfc3339(),
-                    status: "replayed".to_string(),
-                });
-                to_replay.push(sched.clone());
-            }
-        }
-        Ok(())
-    });
+            Ok(())
+        }),
+        "schedule_replay_missed"
+    );
     to_replay
 }
 
@@ -304,13 +307,16 @@ pub fn replay_missed_oneshots(home: &Path) -> Vec<Schedule> {
 /// retrigger.
 pub fn set_enabled(home: &Path, schedule_id: &str, enabled: bool) {
     let sid = schedule_id.to_string();
-    let _ = crate::store::mutate_versioned(&store_path(home), |store: &mut ScheduleStore| {
-        if let Some(sched) = store.schedules.iter_mut().find(|s| s.id == sid) {
-            sched.enabled = enabled;
-            sched.updated_at = chrono::Utc::now().to_rfc3339();
-        }
-        Ok(())
-    });
+    persist_or_log!(
+        crate::store::mutate_versioned(&store_path(home), |store: &mut ScheduleStore| {
+            if let Some(sched) = store.schedules.iter_mut().find(|s| s.id == sid) {
+                sched.enabled = enabled;
+                sched.updated_at = chrono::Utc::now().to_rfc3339();
+            }
+            Ok(())
+        }),
+        "schedule_set_enabled"
+    );
 }
 
 /// #1521: record that an `UntilSuccess` schedule's linked task was observed
@@ -319,12 +325,15 @@ pub fn set_enabled(home: &Path, schedule_id: &str, enabled: bool) {
 pub fn mark_success_today(home: &Path, schedule_id: &str, date: &str) {
     let sid = schedule_id.to_string();
     let d = date.to_string();
-    let _ = crate::store::mutate_versioned(&store_path(home), |store: &mut ScheduleStore| {
-        if let Some(sched) = store.schedules.iter_mut().find(|s| s.id == sid) {
-            sched.last_success_date = Some(d.clone());
-        }
-        Ok(())
-    });
+    persist_or_log!(
+        crate::store::mutate_versioned(&store_path(home), |store: &mut ScheduleStore| {
+            if let Some(sched) = store.schedules.iter_mut().find(|s| s.id == sid) {
+                sched.last_success_date = Some(d.clone());
+            }
+            Ok(())
+        }),
+        "schedule_mark_success_today"
+    );
 }
 
 /// #1488: when an instance is deleted, disable every schedule that targets it
@@ -337,22 +346,25 @@ pub fn mark_success_today(home: &Path, schedule_id: &str, date: &str) {
 pub fn orphan_schedules_for_target(home: &Path, deleted_target: &str) -> usize {
     let target = deleted_target.to_string();
     let mut orphaned = 0usize;
-    let _ = crate::store::mutate_versioned(&store_path(home), |store: &mut ScheduleStore| {
-        let now = chrono::Utc::now().to_rfc3339();
-        for sched in store.schedules.iter_mut() {
-            if sched.target != target || !sched.enabled {
-                continue;
+    persist_or_log!(
+        crate::store::mutate_versioned(&store_path(home), |store: &mut ScheduleStore| {
+            let now = chrono::Utc::now().to_rfc3339();
+            for sched in store.schedules.iter_mut() {
+                if sched.target != target || !sched.enabled {
+                    continue;
+                }
+                sched.enabled = false;
+                sched.updated_at = now.clone();
+                sched.run_history.push(ScheduleRun {
+                    triggered_at: now.clone(),
+                    status: format!("orphaned: target instance '{target}' deleted"),
+                });
+                orphaned += 1;
             }
-            sched.enabled = false;
-            sched.updated_at = now.clone();
-            sched.run_history.push(ScheduleRun {
-                triggered_at: now.clone(),
-                status: format!("orphaned: target instance '{target}' deleted"),
-            });
-            orphaned += 1;
-        }
-        Ok(())
-    });
+            Ok(())
+        }),
+        "schedule_orphan_for_target"
+    );
     if orphaned > 0 {
         tracing::info!(
             target = %deleted_target,

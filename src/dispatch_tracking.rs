@@ -43,10 +43,13 @@ fn store_path(home: &Path) -> std::path::PathBuf {
 
 /// Record a new delegation.
 pub fn track_dispatch(home: &Path, entry: DispatchEntry) {
-    let _ = crate::store::mutate_versioned(&store_path(home), |store: &mut DispatchStore| {
-        store.entries.push(entry);
-        Ok(())
-    });
+    persist_or_log!(
+        crate::store::mutate_versioned(&store_path(home), |store: &mut DispatchStore| {
+            store.entries.push(entry);
+            Ok(())
+        }),
+        "dispatch_track"
+    );
 }
 
 /// Mark a dispatch as completed (matched by task_id or to-instance).
@@ -55,17 +58,20 @@ pub fn mark_completed(home: &Path, correlation_id: Option<&str>, _to: &str) {
         Some(c) if !c.is_empty() => c,
         _ => return, // No correlation_id → can't match, let sweep continue tracking
     };
-    let _ = crate::store::mutate_versioned(&store_path(home), |store: &mut DispatchStore| {
-        for entry in store.entries.iter_mut() {
-            if entry.status == "completed" {
-                continue;
+    persist_or_log!(
+        crate::store::mutate_versioned(&store_path(home), |store: &mut DispatchStore| {
+            for entry in store.entries.iter_mut() {
+                if entry.status == "completed" {
+                    continue;
+                }
+                if entry.task_id.as_deref() == Some(cid) {
+                    entry.status = "completed".to_string();
+                }
             }
-            if entry.task_id.as_deref() == Some(cid) {
-                entry.status = "completed".to_string();
-            }
-        }
-        Ok(())
-    });
+            Ok(())
+        }),
+        "dispatch_mark_completed"
+    );
 }
 
 /// Sweep for stuck dispatches. Returns (warn_list, ask_list).
@@ -74,27 +80,30 @@ pub fn sweep_stuck(home: &Path) -> (Vec<DispatchEntry>, Vec<DispatchEntry>) {
     let mut warns = Vec::new();
     let mut asks = Vec::new();
 
-    let _ = crate::store::mutate_versioned(&store_path(home), |store: &mut DispatchStore| {
-        for entry in store.entries.iter_mut() {
-            if entry.status == "completed" {
-                continue;
-            }
-            let delegated = match chrono::DateTime::parse_from_rfc3339(&entry.delegated_at) {
-                Ok(dt) => dt.with_timezone(&chrono::Utc),
-                Err(_) => continue,
-            };
-            let age_min = now.signed_duration_since(delegated).num_minutes();
+    persist_or_log!(
+        crate::store::mutate_versioned(&store_path(home), |store: &mut DispatchStore| {
+            for entry in store.entries.iter_mut() {
+                if entry.status == "completed" {
+                    continue;
+                }
+                let delegated = match chrono::DateTime::parse_from_rfc3339(&entry.delegated_at) {
+                    Ok(dt) => dt.with_timezone(&chrono::Utc),
+                    Err(_) => continue,
+                };
+                let age_min = now.signed_duration_since(delegated).num_minutes();
 
-            if age_min >= DISPATCH_ASK_MINUTES && entry.status != "asked" {
-                entry.status = "asked".to_string();
-                asks.push(entry.clone());
-            } else if age_min >= DISPATCH_WARN_MINUTES && entry.status == "pending" {
-                entry.status = "warned".to_string();
-                warns.push(entry.clone());
+                if age_min >= DISPATCH_ASK_MINUTES && entry.status != "asked" {
+                    entry.status = "asked".to_string();
+                    asks.push(entry.clone());
+                } else if age_min >= DISPATCH_WARN_MINUTES && entry.status == "pending" {
+                    entry.status = "warned".to_string();
+                    warns.push(entry.clone());
+                }
             }
-        }
-        Ok(())
-    });
+            Ok(())
+        }),
+        "dispatch_sweep_stuck"
+    );
     (warns, asks)
 }
 
@@ -107,23 +116,26 @@ pub fn sweep_orphans(home: &Path) -> Vec<DispatchEntry> {
     let now = chrono::Utc::now();
     let mut orphans = Vec::new();
 
-    let _ = crate::store::mutate_versioned(&store_path(home), |store: &mut DispatchStore| {
-        for entry in store.entries.iter_mut() {
-            if entry.status == "completed" || entry.status == "orphaned" {
-                continue;
+    persist_or_log!(
+        crate::store::mutate_versioned(&store_path(home), |store: &mut DispatchStore| {
+            for entry in store.entries.iter_mut() {
+                if entry.status == "completed" || entry.status == "orphaned" {
+                    continue;
+                }
+                let delegated = match chrono::DateTime::parse_from_rfc3339(&entry.delegated_at) {
+                    Ok(dt) => dt.with_timezone(&chrono::Utc),
+                    Err(_) => continue,
+                };
+                let age_hours = now.signed_duration_since(delegated).num_hours();
+                if age_hours >= DISPATCH_ORPHAN_HOURS {
+                    entry.status = "orphaned".to_string();
+                    orphans.push(entry.clone());
+                }
             }
-            let delegated = match chrono::DateTime::parse_from_rfc3339(&entry.delegated_at) {
-                Ok(dt) => dt.with_timezone(&chrono::Utc),
-                Err(_) => continue,
-            };
-            let age_hours = now.signed_duration_since(delegated).num_hours();
-            if age_hours >= DISPATCH_ORPHAN_HOURS {
-                entry.status = "orphaned".to_string();
-                orphans.push(entry.clone());
-            }
-        }
-        Ok(())
-    });
+            Ok(())
+        }),
+        "dispatch_sweep_orphans"
+    );
     orphans
 }
 
@@ -137,14 +149,17 @@ pub fn sweep_orphans(home: &Path) -> Vec<DispatchEntry> {
 /// value once the instance is gone. Returns the number removed.
 pub fn cleanup_for_instance(home: &Path, instance: &str) -> usize {
     let mut removed = 0usize;
-    let _ = crate::store::mutate_versioned(&store_path(home), |store: &mut DispatchStore| {
-        let before = store.entries.len();
-        store
-            .entries
-            .retain(|e| e.from != instance && e.to != instance);
-        removed = before - store.entries.len();
-        Ok(())
-    });
+    persist_or_log!(
+        crate::store::mutate_versioned(&store_path(home), |store: &mut DispatchStore| {
+            let before = store.entries.len();
+            store
+                .entries
+                .retain(|e| e.from != instance && e.to != instance);
+            removed = before - store.entries.len();
+            Ok(())
+        }),
+        "dispatch_cleanup_for_instance"
+    );
     if removed > 0 {
         tracing::info!(
             %instance,
@@ -180,6 +195,9 @@ pub fn active_target_names(home: &Path) -> Vec<String> {
 pub fn gc_old_entries(home: &Path) {
     const RETENTION_DAYS: i64 = 30;
     let now = chrono::Utc::now();
+    // best-effort (#1647): unlike the sibling track/sweep/cleanup writes above,
+    // a dropped GC pass is harmless — it only delays pruning already-terminal
+    // rows, and the next maintenance tick retries. Intentionally not logged.
     let _ = crate::store::mutate_versioned(&store_path(home), |store: &mut DispatchStore| {
         store.entries.retain(|entry| {
             if entry.status != "completed" && entry.status != "orphaned" {
