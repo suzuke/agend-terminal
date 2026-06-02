@@ -22,6 +22,7 @@ mod capture;
 mod channel;
 mod claim_verifier;
 mod cli;
+mod config_integrity;
 mod connect;
 mod daemon;
 mod daemon_config;
