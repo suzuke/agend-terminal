@@ -369,12 +369,6 @@ fn create_deployment_team(
 }
 
 pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
-    let lock_path = store_path(home).with_extension("lock");
-    let _lock = match crate::store::acquire_file_lock(&lock_path) {
-        Ok(l) => l,
-        Err(e) => return serde_json::json!({"error": format!("deployment lock failed: {e}")}),
-    };
-
     let params = match validate_deploy_args(home, args) {
         Ok(p) => p,
         Err(e) => return e,
@@ -411,6 +405,17 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
         directory: params.directory,
         created_at: chrono::Utc::now().to_rfc3339(),
     };
+    // #1629: narrow the deployment-store flock to JUST the load-modify-save (its
+    // C1 lost-update purpose). spawn_instances (api::call SPAWN) and
+    // create_deployment_team (api::call CREATE_TEAM) above now run lock-free — a
+    // self-IPC (loopback api::call) held under this flock is the #1617
+    // lock-while-blocking deadlock class. validate_deploy_args reads only
+    // fleet.yaml, not the store, so it needs no lock either.
+    let lock_path = store_path(home).with_extension("lock");
+    let _lock = match crate::store::acquire_file_lock(&lock_path) {
+        Ok(l) => l,
+        Err(e) => return serde_json::json!({"error": format!("deployment lock failed: {e}")}),
+    };
     let mut store = load(home);
     store.deployments.push(deployment);
     // #bughunt2: a deploy whose record never persisted is NOT "deployed" — the
@@ -434,19 +439,16 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
 }
 
 pub fn teardown(home: &Path, args: &Value) -> Value {
-    // C1 fix: flock around load-modify-save to prevent lost-update race.
-    let lock_path = store_path(home).with_extension("lock");
-    let _lock = match crate::store::acquire_file_lock(&lock_path) {
-        Ok(l) => l,
-        Err(e) => return serde_json::json!({"error": format!("deployment lock failed: {e}")}),
-    };
     let name = match args["name"].as_str() {
         Some(n) => n,
         None => return serde_json::json!({"error": "missing 'name'"}),
     };
 
-    let mut store = load(home);
-    let deployment = match store.deployments.iter().find(|d| d.name == name) {
+    let lock_path = store_path(home).with_extension("lock");
+    // #1629: read the deployment record lock-free (load reads atomically-written
+    // files, so no flock is needed) so the DELETE api::calls below run OUTSIDE any
+    // flock — a self-IPC under the deployment flock is the #1617 deadlock class.
+    let deployment = match load(home).deployments.iter().find(|d| d.name == name) {
         Some(d) => d.clone(),
         None => return serde_json::json!({"error": format!("deployment '{name}' not found")}),
     };
@@ -476,6 +478,13 @@ pub fn teardown(home: &Path, args: &Value) -> Value {
         let _ = crate::teams::delete(home, &serde_json::json!({"name": team}));
     }
 
+    // #1629 (C1 lost-update): flock ONLY the store record-removal load-modify-save.
+    // Re-load under the flock so a concurrent deploy/teardown isn't lost-updated.
+    let _lock = match crate::store::acquire_file_lock(&lock_path) {
+        Ok(l) => l,
+        Err(e) => return serde_json::json!({"error": format!("deployment lock failed: {e}")}),
+    };
+    let mut store = load(home);
     // Remove from store
     store.deployments.retain(|d| d.name != name);
     // #bughunt2: if the record-removal save fails, the instances are already
@@ -2439,5 +2448,67 @@ templates:
             "template source_repo must propagate to team"
         );
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    // #1629 invariant (#1617 lock-while-blocking class): the deployment-store
+    // flock must be acquired AFTER the loopback `api::call`s (SPAWN/CREATE_TEAM
+    // in deploy, DELETE in teardown), never around them — a self-IPC held under
+    // that flock deadlocks (the loopback handler needs the registry lock). These
+    // structural source-scans slice each fn and assert the api::call site index
+    // precedes the `acquire_file_lock` index. Prod-sliced + `concat` needles so
+    // they can't self-satisfy.
+    fn prod_src() -> &'static str {
+        let src = include_str!("deployments.rs");
+        let cfg_test = ["#[cfg(", "test)]"].concat();
+        match src.find(&cfg_test) {
+            Some(i) => &src[..i],
+            None => src,
+        }
+    }
+
+    fn fn_body<'a>(prod: &'a str, sig: &str) -> &'a str {
+        let start = prod.find(sig).expect("fn present");
+        let rest = &prod[start + sig.len()..];
+        let end = rest.find("\npub fn ").unwrap_or(rest.len());
+        &prod[start..start + sig.len() + end]
+    }
+
+    #[test]
+    fn deploy_api_calls_not_under_flock() {
+        let prod = prod_src();
+        let body = fn_body(prod, "pub fn deploy(home");
+        let lock_at = body
+            .find(&["acquire_file", "_lock"].concat())
+            .expect("deploy locks the store save");
+        let spawn_at = body
+            .find("spawn_instances(")
+            .expect("deploy spawns instances");
+        let team_at = body
+            .find("create_deployment_team(")
+            .expect("deploy creates the team");
+        assert!(
+            spawn_at < lock_at,
+            "spawn_instances (api::call SPAWN) must run BEFORE the deployment flock (#1617 class)"
+        );
+        assert!(
+            team_at < lock_at,
+            "create_deployment_team (api::call CREATE_TEAM) must run BEFORE the deployment flock (#1617 class)"
+        );
+    }
+
+    #[test]
+    fn teardown_api_calls_not_under_flock() {
+        let prod = prod_src();
+        let body = fn_body(prod, "pub fn teardown(home");
+        let lock_at = body
+            .find(&["acquire_file", "_lock"].concat())
+            .expect("teardown locks the record removal");
+        let delete_at = body
+            .find(&["crate::api::", "call"].concat())
+            .expect("teardown DELETEs instances via api::call");
+        assert!(
+            delete_at < lock_at,
+            "the DELETE api::call loop must run BEFORE the record-removal flock (#1617 class)"
+        );
     }
 }
