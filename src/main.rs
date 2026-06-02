@@ -1,3 +1,8 @@
+// #1630: `#[macro_use]` must precede every module that calls `persist_or_log!`,
+// so it leads the module list. Defines the macro for the whole bin crate.
+#[macro_use]
+mod macros;
+
 mod admin;
 mod agent;
 mod agent_ops;

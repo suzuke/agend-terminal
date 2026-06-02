@@ -162,7 +162,11 @@ fn notify_boot_orphan_release(home: &Path, ids: &[String]) {
         ids.join(", ")
     );
     let msg = crate::inbox::InboxMessage::new_system("system:boot_orphan_sweep", "update", body);
-    let _ = crate::inbox::enqueue(home, "general", msg);
+    persist_or_log!(
+        crate::inbox::enqueue(home, "general", msg),
+        "boot_orphan_sweep",
+        "general"
+    );
 }
 
 /// #829: classify a single owner string against the live runtime

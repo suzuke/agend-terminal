@@ -316,15 +316,19 @@ fn test_attach(_home: &Path) -> TestResult {
 fn test_inbox(home: &Path) -> TestResult {
     let test_name = "verify-inbox";
     for i in 1..=3 {
-        let _ = inbox::enqueue(
-            home,
-            test_name,
-            inbox::InboxMessage {
-                from: format!("test-{i}"),
-                text: format!("msg {i}"),
-                timestamp: "2024-01-01T00:00:00Z".into(),
-                ..Default::default()
-            },
+        persist_or_log!(
+            inbox::enqueue(
+                home,
+                test_name,
+                inbox::InboxMessage {
+                    from: format!("test-{i}"),
+                    text: format!("msg {i}"),
+                    timestamp: "2024-01-01T00:00:00Z".into(),
+                    ..Default::default()
+                },
+            ),
+            "verify_inbox_selftest",
+            test_name
         );
     }
     let msgs = inbox::drain(home, test_name);

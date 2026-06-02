@@ -160,7 +160,11 @@ pub fn deliver(
         broadcast_context,
         ..Default::default()
     };
-    let _ = storage::enqueue(home, agent_name, msg);
+    persist_or_log!(
+        storage::enqueue(home, agent_name, msg),
+        "deliver",
+        agent_name
+    );
     notify_agent(home, agent_name, source, text);
 }
 
@@ -327,11 +331,15 @@ pub fn compose_aware_inject(home: &Path, agent_name: &str, notification: &str) {
         crate::snapshot::agent_state_of(home, agent_name).as_deref(),
         actionable,
     ) {
-        let _ = crate::notification_queue::enqueue_classified(
-            home,
-            agent_name,
-            notification,
-            actionable,
+        persist_or_log!(
+            crate::notification_queue::enqueue_classified(
+                home,
+                agent_name,
+                notification,
+                actionable,
+            ),
+            "compose_aware_inject",
+            agent_name
         );
         return;
     }

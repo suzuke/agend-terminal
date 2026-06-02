@@ -1898,13 +1898,19 @@ pub(crate) fn inject_with_target_gated(
                 // enqueue ambient-class for the per-tick flush to drain once the
                 // pane settles (the flush re-injects via the api INJECT path,
                 // landing back here with force=true — byte-equivalent delivery).
-                let _ = crate::notification_queue::enqueue_classified(
+                // #1630: this enqueue IS the deferred-delivery path — if it
+                // fails the wake is lost outright. The fn returns Result and the
+                // callers handle it (e.g. daemon::replay logs "replay inject
+                // failed"), so propagate rather than swallow. anyhow→AgendError
+                // has no generic variant, so map through ApiError (message
+                // preserved via Display).
+                return crate::notification_queue::enqueue_classified(
                     home,
                     name,
                     &String::from_utf8_lossy(text),
                     false,
-                );
-                return Ok(());
+                )
+                .map_err(|e| crate::error::AgendError::ApiError(format!("deferred enqueue: {e}")));
             }
         }
     }

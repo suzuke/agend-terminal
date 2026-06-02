@@ -192,10 +192,14 @@ pub fn emit_ci_conflict_alert(
     // condition the operator wants noticed immediately, that delay
     // was the bug.
     for sub in subscribers {
-        let _ = crate::inbox::enqueue_with_idle_hint(
-            home,
-            sub,
-            make_ci_conflict_alert_msg(repo, branch, source),
+        persist_or_log!(
+            crate::inbox::enqueue_with_idle_hint(
+                home,
+                sub,
+                make_ci_conflict_alert_msg(repo, branch, source),
+            ),
+            "ci_conflict_alert",
+            sub
         );
     }
 }
@@ -905,11 +909,15 @@ async fn check_early_job_failures(
     let supersede_token = format!("ci-early-{sha_short}");
     for sub in ctx.subscribers {
         crate::inbox::mark_ci_watch_superseded(ctx.home, sub, &repo_branch_key, &supersede_token);
-        let _ = crate::inbox::enqueue_with_idle_hint(
-            ctx.home,
-            sub,
-            crate::inbox::InboxMessage::new_system("system:ci", "ci-watch", body.clone())
-                .with_correlation_id(repo_branch_key.clone()),
+        persist_or_log!(
+            crate::inbox::enqueue_with_idle_hint(
+                ctx.home,
+                sub,
+                crate::inbox::InboxMessage::new_system("system:ci", "ci-watch", body.clone())
+                    .with_correlation_id(repo_branch_key.clone()),
+            ),
+            "ci_early_fail_notify",
+            sub
         );
     }
 
@@ -1374,11 +1382,19 @@ async fn fan_out_notifications(
                     &repo_branch_key,
                     &supersede_token,
                 );
-                let _ = crate::inbox::enqueue_with_idle_hint(
-                    ctx.home,
-                    sub,
-                    crate::inbox::InboxMessage::new_system("system:ci", "ci-watch", body.clone())
+                persist_or_log!(
+                    crate::inbox::enqueue_with_idle_hint(
+                        ctx.home,
+                        sub,
+                        crate::inbox::InboxMessage::new_system(
+                            "system:ci",
+                            "ci-watch",
+                            body.clone()
+                        )
                         .with_correlation_id(repo_branch_key.clone()),
+                    ),
+                    "ci_watch_notify",
+                    sub
                 );
             }
         }
@@ -1447,7 +1463,11 @@ fn persist_watch_state(
                     pr_number,
                     task_id,
                 );
-                let _ = crate::inbox::enqueue_with_idle_hint(ctx.home, next, msg);
+                persist_or_log!(
+                    crate::inbox::enqueue_with_idle_hint(ctx.home, next, msg),
+                    "ci_watch_chain",
+                    next
+                );
             }
         }
 

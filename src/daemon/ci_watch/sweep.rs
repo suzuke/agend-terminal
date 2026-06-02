@@ -192,12 +192,16 @@ fn fan_out_health_event(
     let supersede_token = format!("{kind}-{}", chrono::Utc::now().timestamp_millis());
     for sub in subscribers {
         crate::inbox::mark_ci_watch_superseded(home, sub, &repo_branch_key, &supersede_token);
-        let _ = crate::inbox::enqueue_with_idle_hint(
-            home,
-            sub,
-            crate::inbox::InboxMessage::new_system("system:ci", kind, body.clone())
-                // #946: canonical `{repo}@{branch}` form — stable grep target.
-                .with_correlation_id(repo_branch_key.clone()),
+        persist_or_log!(
+            crate::inbox::enqueue_with_idle_hint(
+                home,
+                sub,
+                crate::inbox::InboxMessage::new_system("system:ci", kind, body.clone())
+                    // #946: canonical `{repo}@{branch}` form — stable grep target.
+                    .with_correlation_id(repo_branch_key.clone()),
+            ),
+            "ci_health_event",
+            sub
         );
     }
 }

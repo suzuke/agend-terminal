@@ -909,10 +909,14 @@ pub fn run_task_maintenance(home: &Path) {
             "dispatch stuck check: still working on task_id={tid} (dispatched {}min ago)?",
             crate::dispatch_tracking::DISPATCH_ASK_MINUTES
         );
-        let _ = crate::inbox::enqueue_with_idle_hint(
-            home,
-            &a.to,
-            crate::inbox::InboxMessage::new_system("system:dispatch", "query", query),
+        persist_or_log!(
+            crate::inbox::enqueue_with_idle_hint(
+                home,
+                &a.to,
+                crate::inbox::InboxMessage::new_system("system:dispatch", "query", query),
+            ),
+            "dispatch_stuck_check",
+            a.to
         );
     }
     // 24h orphan sweep
@@ -963,14 +967,18 @@ fn replay_missed_at_startup(home: &Path, registry: &AgentRegistry) {
                 tracing::warn!(error = %e, "replay inject failed");
             }
         } else {
-            let _ = crate::inbox::enqueue_with_idle_hint(
-                home,
-                target,
-                crate::inbox::InboxMessage::new_system(
-                    "system:schedule",
-                    "schedule_replay",
-                    message,
+            persist_or_log!(
+                crate::inbox::enqueue_with_idle_hint(
+                    home,
+                    target,
+                    crate::inbox::InboxMessage::new_system(
+                        "system:schedule",
+                        "schedule_replay",
+                        message,
+                    ),
                 ),
+                "schedule_replay",
+                target
             );
         }
     }

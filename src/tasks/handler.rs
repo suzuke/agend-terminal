@@ -953,7 +953,11 @@ fn cascade_cancel_children(
                 kind: Some("parent_cancelled".to_string()),
                 ..Default::default()
             };
-            let _ = crate::inbox::storage::enqueue(home, &owner_name.0, msg);
+            persist_or_log!(
+                crate::inbox::storage::enqueue(home, &owner_name.0, msg),
+                "cascade_cancel_notify",
+                owner_name.0
+            );
         }
     }
 }

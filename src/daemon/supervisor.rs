@@ -453,7 +453,11 @@ pub(crate) fn maybe_notify_member_state_change(
         "member_state_change",
         payload.to_string(),
     );
-    let _ = crate::inbox::enqueue(home, orch, msg);
+    persist_or_log!(
+        crate::inbox::enqueue(home, orch, msg),
+        "member_state_change",
+        orch
+    );
     let action_hint = match new_state {
         crate::state::AgentState::Hang => {
             "\nAction: check agent pane snapshot, consider restart if no progress >5min"
@@ -1077,7 +1081,11 @@ fn notify_orchestrator_retry_exhausted(home: &std::path::Path, name: &str, retri
         "member_retry_exhausted",
         payload.to_string(),
     );
-    let _ = crate::inbox::enqueue(home, orch, msg);
+    persist_or_log!(
+        crate::inbox::enqueue(home, orch, msg),
+        "retry_exhausted_notify",
+        orch
+    );
     tracing::info!(
         agent = %name,
         orchestrator = %orch,

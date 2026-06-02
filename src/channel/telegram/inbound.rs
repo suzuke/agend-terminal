@@ -165,38 +165,42 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
         let home = lock_state(state).home.clone();
         let summary = crate::status_summary::build_summary(&home);
         tracing::info!(to = %instance_name, "status keyword detected, injecting summary");
-        let _ = crate::inbox::enqueue(
-            &home,
-            &instance_name,
-            crate::inbox::InboxMessage {
-                schema_version: 0,
-                id: None,
-                read_at: None,
-                thread_id: None,
-                parent_id: None,
-                task_id: None,
-                force_meta: None,
-                correlation_id: None,
-                reviewed_head: None,
-                from: "system:status".to_string(),
-                text: summary,
-                kind: Some("status-summary".to_string()),
-                timestamp: chrono::Utc::now().to_rfc3339(),
-                channel: Some(crate::channel::ChannelKind::Telegram),
-                delivery_mode: None,
-                attachments: vec![],
-                in_reply_to_msg_id: None,
-                in_reply_to_excerpt: None,
-                superseded_by: None,
-                from_id: None,
-                broadcast_context: None,
-                sequencing: None,
-                eta_minutes: None,
-                reporting_cadence: None,
-                worktree_binding_required: None,
-                pr_number: None,
-                terminal: None,
-            },
+        persist_or_log!(
+            crate::inbox::enqueue(
+                &home,
+                &instance_name,
+                crate::inbox::InboxMessage {
+                    schema_version: 0,
+                    id: None,
+                    read_at: None,
+                    thread_id: None,
+                    parent_id: None,
+                    task_id: None,
+                    force_meta: None,
+                    correlation_id: None,
+                    reviewed_head: None,
+                    from: "system:status".to_string(),
+                    text: summary,
+                    kind: Some("status-summary".to_string()),
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    channel: Some(crate::channel::ChannelKind::Telegram),
+                    delivery_mode: None,
+                    attachments: vec![],
+                    in_reply_to_msg_id: None,
+                    in_reply_to_excerpt: None,
+                    superseded_by: None,
+                    from_id: None,
+                    broadcast_context: None,
+                    sequencing: None,
+                    eta_minutes: None,
+                    reporting_cadence: None,
+                    worktree_binding_required: None,
+                    pr_number: None,
+                    terminal: None,
+                },
+            ),
+            "status_summary",
+            instance_name
         );
         // Also notify agent PTY so it picks up the summary
         let username = msg
@@ -521,7 +525,11 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
             pr_number: None,
             terminal: None,
         };
-        let _ = inbox::enqueue(&home, &instance_name, msg_obj);
+        persist_or_log!(
+            inbox::enqueue(&home, &instance_name, msg_obj),
+            "telegram_dispatch",
+            instance_name
+        );
         inbox::notify_agent_with_attachments(
             &home,
             &instance_name,

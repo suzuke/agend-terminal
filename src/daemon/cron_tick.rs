@@ -181,10 +181,14 @@ pub fn check_schedules(home: &Path, registry: &AgentRegistry) {
         };
 
         if deferred_inbox {
-            let _ = crate::inbox::enqueue_with_idle_hint(
-                home,
-                target,
-                crate::inbox::InboxMessage::new_system("system:schedule", "schedule", message),
+            persist_or_log!(
+                crate::inbox::enqueue_with_idle_hint(
+                    home,
+                    target,
+                    crate::inbox::InboxMessage::new_system("system:schedule", "schedule", message),
+                ),
+                "cron_schedule_fire",
+                target
             );
         }
 
