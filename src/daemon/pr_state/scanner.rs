@@ -93,10 +93,16 @@ pub fn scan_and_emit_with(
                 let body = format_ready_body(state);
                 let msg = build_event_message("pr-ready-for-merge", &author, state, body);
                 // #1629: defer the enqueue (see top of fn). Set the dedup flag
-                // optimistically under the flock; on a rare post-unlock enqueue
-                // failure the #911 dedup ledger + next scan backstop. This mirrors
-                // the Merged/ClosedUnmerged arms below, which already set the flag
-                // unconditionally and ignore the enqueue result.
+                // optimistically under the flock. NOTE: this is a behavior change
+                // for the pr-ready arm — previously the flag was set only on
+                // enqueue success, so a failed enqueue retried next scan. Now a
+                // post-unlock enqueue failure leaves the flag already set → next
+                // scan skips → the pr-ready signal is lost (warn-logged at the
+                // drain, not silent) until head_sha changes. The flag IS the dedup
+                // ledger; it suppresses re-emit, it does not back-stop. Accepted:
+                // enqueue failure is near-zero (local inbox write), this matches
+                // the Merged/ClosedUnmerged arms, and the flock-free emit prevents
+                // the #1617 deadlock.
                 state.ready_emitted_for_sha = Some(state.head_sha.clone());
                 dirty = true;
                 tracing::info!(
