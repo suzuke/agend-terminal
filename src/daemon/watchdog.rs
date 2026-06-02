@@ -1,7 +1,7 @@
 //! Watchdog: classify PTY output into BlockedReason per daemon tick.
 
 use crate::backend::Backend;
-use crate::health::{BlockedReason, HealthTracker};
+use crate::health::HealthTracker;
 use crate::state::AgentState;
 use std::path::Path;
 
@@ -60,10 +60,10 @@ pub fn run_watchdog_pass(
     // blocked-reason guard). The set below re-latches if the agent is in
     // fact still throttled (classify still matches).
     if recovered_from_rate_limit(current_state)
-        && matches!(
-            health.current_reason,
-            Some(BlockedReason::RateLimit { .. } | BlockedReason::QuotaExceeded)
-        )
+        && health
+            .current_reason
+            .as_ref()
+            .is_some_and(|r| r.auto_clears_on(crate::health::RecoverySignal::RateLimitLifted))
     {
         health.clear_blocked_reason();
     }
