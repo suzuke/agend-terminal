@@ -2,6 +2,30 @@ use super::AgentState;
 use crate::backend::Backend;
 use regex::Regex;
 
+/// #1587: the ServerRateLimit network-error alternation, deduped from the
+/// byte-identical copy that previously lived in ALL 5 backend pattern blocks
+/// (claude/kiro/codex/opencode/gemini — same copy-paste-the-bug family as
+/// #1639/#1642; one edit now applies uniformly). Sourced from #1136's
+/// operator-observed proxy/network faults (`InvalidHTTPResponse`,
+/// `ECONNRESET`/`ETIMEDOUT`, `fetch failed`, `connection reset`) plus the
+/// realistic Node messages `socket hang up` / `proxy disconnect`.
+///
+/// #1587 deliberately does NOT blind-tighten these tokens. ServerRateLimit is
+/// already `is_high_fp_state`, so the #919 red-SGR anchor + #1518 live-bottom-N
+/// gate apply, and #1586 eliminated the retry-storm — the residual is ≤1
+/// red-gated spurious `continue`. Tightening risks false-NEGATIVES: the English
+/// phrases ARE the Node backends' literal error messages, and the real
+/// rendering carries an `Error:`/`FetchError:` label prefix that a line-start
+/// anchor would reject (cf. the `detect("Error: ECONNRESET")` test). A proper
+/// tighten would need captured per-backend network-error fixtures — a deferred
+/// follow-up only if the single FP ever becomes a real problem.
+///
+/// The bare `network error` token WAS dropped: it was never in #1136's observed
+/// list (an unverified guess), is the most prose-FP-prone of the set, and no
+/// backend was observed emitting it literally — so dropping it is
+/// false-negative-free (the #1136 coverage test never listed it either).
+const SERVER_RATE_LIMIT_NET_ERRORS: &str = r"ECONNRESET|ETIMEDOUT|InvalidHTTPResponse|fetch failed|connection reset|socket hang up|proxy.*disconnect";
+
 /// Compiled patterns for one backend.
 pub struct StatePatterns {
     /// (state, regex) pairs in priority order (highest priority first).
@@ -73,8 +97,12 @@ impl StatePatterns {
                 // English-word match) is replaced by specific error phrases.
                 (
                     AgentState::ServerRateLimit,
-                    r"Server is temporarily limiting requests|temporarily limiting.*not your usage|API Error: 5\d{2}\b|server-side issue.*temporary|API Error: Repeated 529 Overloaded|overloaded_error|api_error|timeout_error|ECONNRESET|ETIMEDOUT|InvalidHTTPResponse|fetch failed|connection reset|socket hang up|network error|proxy.*disconnect",
+                    r"Server is temporarily limiting requests|temporarily limiting.*not your usage|API Error: 5\d{2}\b|server-side issue.*temporary|API Error: Repeated 529 Overloaded|overloaded_error|api_error|timeout_error",
                 ),
+                // #1587: shared network-error tail (see SERVER_RATE_LIMIT_NET_ERRORS).
+                // Same ServerRateLimit state → a second entry is equivalent to
+                // appending the alternation, without duplicating the literal.
+                (AgentState::ServerRateLimit, SERVER_RATE_LIMIT_NET_ERRORS),
                 // #848: narrow Claude RateLimit to specific error phrases.
                 // The pre-#848 pattern `r"overloaded|rate.?limit|\b429\b"`
                 // matched the bare substring `rate_limit` / `rate-limit` /
@@ -266,10 +294,7 @@ impl StatePatterns {
                     r"Too Many Requests|ThrottlingError|ThrottlingException|Rate exceeded|\b429\b",
                 ),
                 // #1136: network errors — transient, auto-retry safe.
-                (
-                    AgentState::ServerRateLimit,
-                    r"ECONNRESET|ETIMEDOUT|InvalidHTTPResponse|fetch failed|connection reset|socket hang up|network error|proxy.*disconnect",
-                ),
+                (AgentState::ServerRateLimit, SERVER_RATE_LIMIT_NET_ERRORS),
                 // [docs] Context overflow triggers compaction
                 // `/compact` was previously included but matches the slash-
                 // command autocomplete menu (kiro lists `/compact` alongside
@@ -358,10 +383,7 @@ impl StatePatterns {
                     r"rate_limit_exceeded|RateLimitError|hit your rate limit",
                 ),
                 // #1136: network errors — transient, auto-retry safe.
-                (
-                    AgentState::ServerRateLimit,
-                    r"ECONNRESET|ETIMEDOUT|InvalidHTTPResponse|fetch failed|connection reset|socket hang up|network error|proxy.*disconnect",
-                ),
+                (AgentState::ServerRateLimit, SERVER_RATE_LIMIT_NET_ERRORS),
                 // [docs] Context overflow error
                 (AgentState::ContextFull, r"ContextOverflow"),
                 // #1634 [実測 incident]: the configured model was discontinued
@@ -461,10 +483,7 @@ impl StatePatterns {
                     r"API rate limited \(429\)|Rate limited\. Quick retry|API rate limit exceeded",
                 ),
                 // #1136: network errors — transient, auto-retry safe.
-                (
-                    AgentState::ServerRateLimit,
-                    r"ECONNRESET|ETIMEDOUT|InvalidHTTPResponse|fetch failed|connection reset|socket hang up|network error|proxy.*disconnect",
-                ),
+                (AgentState::ServerRateLimit, SERVER_RATE_LIMIT_NET_ERRORS),
                 // #848 PR-B: NEW OpenCode UsageLimit pattern (pre-#848
                 // OpenCode had no UsageLimit pattern at all, so
                 // subscription-quota strings fell through to whatever
@@ -590,10 +609,7 @@ impl StatePatterns {
                     r"429 RESOURCE_EXHAUSTED|rateLimitExceeded|got status: 429|429 Too Many Requests",
                 ),
                 // #1136: network errors — transient, auto-retry safe.
-                (
-                    AgentState::ServerRateLimit,
-                    r"ECONNRESET|ETIMEDOUT|InvalidHTTPResponse|fetch failed|connection reset|socket hang up|network error|proxy.*disconnect",
-                ),
+                (AgentState::ServerRateLimit, SERVER_RATE_LIMIT_NET_ERRORS),
                 // [docs] Usage limit messages
                 // #1125 M4: added `RESOURCE_EXHAUSTED` — the gRPC status
                 // code for quota exhaustion. Positioned AFTER RateLimit so

@@ -3154,6 +3154,47 @@ fn network_error_patterns_all_backends() {
     }
 }
 
+/// #1587: lock the bounded-acceptable ServerRateLimit FP behavior at the live
+/// red-anchored gate. A real network error rendered RED still latches
+/// ServerRateLimit (the auto-retry path these tokens exist for); the SAME
+/// FP-prone phrase in plain (non-red) prose does NOT latch. This is the residual
+/// we deliberately do NOT chase with an unsafe blind tighten — see the
+/// `SERVER_RATE_LIMIT_NET_ERRORS` doc for why (FN risk, no per-backend fixtures).
+#[test]
+fn server_rate_limit_red_anchor_fp_boundary_1587() {
+    // Realistic Node rendering carries an `Error:` label prefix.
+    let screen = "Error: socket hang up";
+    let n = screen.chars().count();
+
+    // RED-rendered error → latches ServerRateLimit (auto-retry preserved).
+    let mut t = StateTracker::new(Some(&Backend::Codex));
+    t.feed_with_fg(screen, &vec![CellFg::Red; n]);
+    assert_eq!(
+        t.get_state(),
+        AgentState::ServerRateLimit,
+        "#1587: a real network error rendered red must still latch ServerRateLimit"
+    );
+
+    // Same wording WITHOUT red (prose / dev-log mention) → must NOT latch.
+    let mut t2 = StateTracker::new(Some(&Backend::Codex));
+    t2.feed_with_fg(screen, &vec![CellFg::Default; n]);
+    assert_ne!(
+        t2.get_state(),
+        AgentState::ServerRateLimit,
+        "#1587: same wording without red must NOT latch (red-anchor FP boundary)"
+    );
+
+    // Dropped token regression: `network error` (the unverified #1136 guess) is
+    // gone — even text-only (fail-open) must NOT classify it as ServerRateLimit.
+    let mut t3 = StateTracker::new(Some(&Backend::Codex));
+    t3.feed("network error");
+    assert_ne!(
+        t3.get_state(),
+        AgentState::ServerRateLimit,
+        "#1587: bare `network error` was dropped — must no longer trigger ServerRateLimit"
+    );
+}
+
 // ── #1527: transition recording at the mutation source ──
 
 #[test]
