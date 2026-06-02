@@ -1122,10 +1122,111 @@ mod claude_session {
     }
 }
 
+/// #8 Phase 1 (parent t-20260530160634485744-8): a behavior facade over the
+/// [`Backend`] enum. This is a PURE STRUCTURAL SCAFFOLD — every method delegates
+/// VERBATIM to the existing inherent method / free function; NO detection logic
+/// moves here (that is Phase 2). The seam exists so Phase 2 (per-backend
+/// detection), #1580 (retire Gemini), and #7 (Kiro redraw quirk) can land
+/// without churning call sites.
+///
+/// Dispatch is HAND-ROLLED (`impl BackendBehavior for Backend`), not the
+/// `enum_dispatch` crate. Rationale: `enum_dispatch` generates the enum→trait
+/// fan-out by requiring one concrete TYPE per variant, but `Backend` is a flat
+/// data enum (incl. `Raw(String)`), so adopting it would mean restructuring
+/// `Backend` into per-variant structs — a large, behavior-risky change that has
+/// no place in a zero-behavior-change Phase 1 — plus a proc-macro dependency
+/// (audit + build cost). The hand-rolled impl delegating to the already-
+/// exhaustive `match self` sites is strictly simpler and truly zero-change. The
+/// exhaustiveness stays compiler-checked in those existing matches (`preset`,
+/// `should_anchor_on_red`, `has_resumable_session`, `StatePatterns::for_backend`).
+///
+/// Trait method set is the REAL per-backend behavior that exists today; the
+/// task's `redraw_after_resize` is intentionally NOT added — there is no current
+/// per-backend redraw logic to delegate to (adding one would be new behavior),
+/// so it is deferred to #7 which introduces it.
+///
+/// `#[allow(dead_code)]`: by design no PRODUCTION call site uses the facade in
+/// Phase 1 (call sites still hit the inherent methods, unchanged — that is the
+/// zero-behavior-change guarantee). Phase 2 migrates them onto this trait. The
+/// `backend_behavior_delegates_verbatim` test exercises + parity-checks it now.
+#[allow(dead_code)]
+pub trait BackendBehavior {
+    /// Static config table for this backend. Delegates to [`Backend::preset`].
+    fn preset(&self) -> BackendPreset;
+    /// Classify a PTY-output frame into a blocked state, if any. Delegates to
+    /// the existing free fn [`crate::state::classify_pty_output`].
+    fn detect_state(&self, output: &str) -> Option<crate::health::BlockedReason>;
+    /// Whether this backend has a resumable session in `working_dir`. Delegates
+    /// to [`Backend::has_resumable_session`].
+    fn has_resumable_session(&self, working_dir: &std::path::Path) -> bool;
+    /// Whether state detection anchors on a red-rendered line (#1450). Delegates
+    /// to [`Backend::should_anchor_on_red`].
+    fn should_anchor_on_red(&self) -> bool;
+}
+
+impl BackendBehavior for Backend {
+    fn preset(&self) -> BackendPreset {
+        Backend::preset(self)
+    }
+    fn detect_state(&self, output: &str) -> Option<crate::health::BlockedReason> {
+        crate::state::classify_pty_output(self, output)
+    }
+    fn has_resumable_session(&self, working_dir: &std::path::Path) -> bool {
+        Backend::has_resumable_session(self, working_dir)
+    }
+    fn should_anchor_on_red(&self) -> bool {
+        Backend::should_anchor_on_red(self)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// #8 Phase 1 parity proof: the `BackendBehavior` facade returns EXACTLY
+    /// what the existing inherent methods / free fn return for every variant —
+    /// i.e. the trait delegates verbatim and nothing moved. (Also exercises the
+    /// otherwise-unused scaffold trait.) `<Backend as BackendBehavior>::m(&b)`
+    /// hits the trait; `b.m()` hits the inherent (inherent wins method
+    /// resolution) — they must agree.
+    #[test]
+    fn backend_behavior_delegates_verbatim() {
+        let sample = "ThrottlingError: Too Many Requests";
+        let tmp = std::env::temp_dir();
+        for b in [
+            Backend::ClaudeCode,
+            Backend::KiroCli,
+            Backend::Codex,
+            Backend::OpenCode,
+            Backend::Gemini,
+            Backend::Agy,
+            Backend::Shell,
+            Backend::Raw("x".to_string()),
+        ] {
+            assert_eq!(
+                BackendBehavior::should_anchor_on_red(&b),
+                b.should_anchor_on_red(),
+                "should_anchor_on_red parity for {b:?}"
+            );
+            assert_eq!(
+                BackendBehavior::detect_state(&b, sample),
+                crate::state::classify_pty_output(&b, sample),
+                "detect_state parity for {b:?}"
+            );
+            assert_eq!(
+                BackendBehavior::has_resumable_session(&b, &tmp),
+                b.has_resumable_session(&tmp),
+                "has_resumable_session parity for {b:?}"
+            );
+            // BackendPreset isn't PartialEq; compare a stable field.
+            assert_eq!(
+                BackendBehavior::preset(&b).command,
+                b.preset().command,
+                "preset parity for {b:?}"
+            );
+        }
+    }
 
     #[test]
     fn from_command_detection() {
