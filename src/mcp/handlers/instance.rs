@@ -422,6 +422,15 @@ pub(super) fn handle_restart_instance(home: &Path, args: &Value) -> Value {
 
 pub(super) fn handle_set_display_name(home: &Path, args: &Value, instance_name: &str) -> Value {
     let display_name = args["name"].as_str().unwrap_or("");
+    // #1604: empty/missing `name` = explicit CLEAR (reset to the default = the
+    // agent name; see layout::pane::display_name's `unwrap_or(&agent_name)`),
+    // mirroring set_waiting_on. Pre-#1604 it saved `""` → the pane showed a
+    // blank name instead of falling back. Clear stores `null` so the reader's
+    // Option is None.
+    if display_name.is_empty() {
+        save_metadata(home, instance_name, "display_name", json!(null));
+        return json!({"cleared": true});
+    }
     if display_name.len() > 256 {
         return json!({"error": "display_name exceeds 256 character limit"});
     }
@@ -431,6 +440,12 @@ pub(super) fn handle_set_display_name(home: &Path, args: &Value, instance_name: 
 
 pub(super) fn handle_set_description(home: &Path, args: &Value, instance_name: &str) -> Value {
     let desc = args["description"].as_str().unwrap_or("");
+    // #1604: empty/missing `description` = explicit CLEAR (store `null`),
+    // consistent with set_display_name + set_waiting_on.
+    if desc.is_empty() {
+        save_metadata(home, instance_name, "description", json!(null));
+        return json!({"cleared": true});
+    }
     if desc.len() > 1024 {
         return json!({"error": "description exceeds 1024 character limit"});
     }

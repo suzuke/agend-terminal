@@ -61,6 +61,64 @@ fn save_and_load_metadata() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+fn read_meta(home: &std::path::Path, agent: &str) -> serde_json::Value {
+    let content =
+        std::fs::read_to_string(home.join(format!("metadata/{agent}.json"))).expect("read meta");
+    serde_json::from_str(&content).expect("parse meta")
+}
+
+// #1604: set_display_name — set, then empty/missing = explicit CLEAR (store
+// null so the pane falls back to the agent name), mirroring set_waiting_on.
+#[test]
+fn set_display_name_empty_clears_to_null_1604() {
+    let home = tmp_home("set_display_name");
+    // set
+    let r =
+        super::instance::handle_set_display_name(&home, &json!({"name": "Dev Agent"}), "agent1");
+    assert_eq!(r["display_name"], "Dev Agent");
+    assert_eq!(read_meta(&home, "agent1")["display_name"], "Dev Agent");
+    // empty string → clear (null, NOT "")
+    let r = super::instance::handle_set_display_name(&home, &json!({"name": ""}), "agent1");
+    assert_eq!(r["cleared"], true);
+    assert!(
+        read_meta(&home, "agent1")["display_name"].is_null(),
+        "#1604: empty must clear to null, not persist an empty string"
+    );
+    // missing `name` → also clear (consistent with empty)
+    super::instance::handle_set_display_name(&home, &json!({"name": "Dev Agent"}), "agent1");
+    let r = super::instance::handle_set_display_name(&home, &json!({}), "agent1");
+    assert_eq!(r["cleared"], true);
+    assert!(read_meta(&home, "agent1")["display_name"].is_null());
+    // over-limit still errors
+    let long = "x".repeat(257);
+    let r = super::instance::handle_set_display_name(&home, &json!({ "name": long }), "agent1");
+    assert!(r["error"].as_str().unwrap_or("").contains("256"));
+    std::fs::remove_dir_all(&home).ok();
+}
+
+// #1604: set_description — same contract (empty/missing = clear to null).
+#[test]
+fn set_description_empty_clears_to_null_1604() {
+    let home = tmp_home("set_description");
+    let r =
+        super::instance::handle_set_description(&home, &json!({"description": "does X"}), "agent1");
+    assert_eq!(r["description"], "does X");
+    assert_eq!(read_meta(&home, "agent1")["description"], "does X");
+    let r = super::instance::handle_set_description(&home, &json!({"description": ""}), "agent1");
+    assert_eq!(r["cleared"], true);
+    assert!(
+        read_meta(&home, "agent1")["description"].is_null(),
+        "#1604: empty must clear to null"
+    );
+    let r = super::instance::handle_set_description(&home, &json!({}), "agent1");
+    assert_eq!(r["cleared"], true);
+    let long = "x".repeat(1025);
+    let r =
+        super::instance::handle_set_description(&home, &json!({ "description": long }), "agent1");
+    assert!(r["error"].as_str().unwrap_or("").contains("1024"));
+    std::fs::remove_dir_all(&home).ok();
+}
+
 #[test]
 fn save_metadata_creates_dir() {
     let home = tmp_home("save_meta_dir");

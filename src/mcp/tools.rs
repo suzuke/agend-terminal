@@ -139,13 +139,13 @@ pub(crate) fn def_interrupt() -> Value {
 }
 
 pub(crate) fn def_set_display_name() -> Value {
-    json!({"name": "set_display_name", "description": "Set your display name.",
-        "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}}})
+    json!({"name": "set_display_name", "description": "Set your display name. Empty string (or omitting `name`) clears it — the pane falls back to the agent name.",
+        "inputSchema": {"type": "object", "properties": {"name": {"type": "string", "description": "Display name. Empty string to clear (reset to the agent name)."}}}})
 }
 
 pub(crate) fn def_set_description() -> Value {
-    json!({"name": "set_description", "description": "Set a description for this instance.",
-        "inputSchema": {"type": "object", "properties": {"description": {"type": "string"}}}})
+    json!({"name": "set_description", "description": "Set a description for this instance. Empty string (or omitting `description`) clears it.",
+        "inputSchema": {"type": "object", "properties": {"description": {"type": "string", "description": "Description. Empty string to clear."}}}})
 }
 
 pub(crate) fn def_set_waiting_on() -> Value {
