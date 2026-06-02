@@ -15,8 +15,10 @@
 //! BYTE-IDENTICAL to legacy for the migrated backends; the migration train then
 //! reroutes production one backend per PR, gated by that harness.
 //!
-//! Migrated here: `Shell`/`Raw` (empty — zero-risk shape proof) + `Agy` (the
-//! smallest REAL pattern set — proves the harness catches real-data drift).
+//! Migrated so far: `Shell`/`Raw` (empty), `Agy` (#1672), and `KiroCli` (this
+//! PR — 11 patterns, incl. one that references the shared
+//! `SERVER_RATE_LIMIT_NET_ERRORS` const). The migration train adds one backend
+//! per PR, each proven byte-identical by the harness below.
 
 use crate::backend::Backend;
 use crate::behavioral::{BehavioralConfig, MarkerCacheId, ProductivityConfig};
@@ -42,11 +44,13 @@ pub struct BackendProfile {
 #[allow(dead_code)] // VALIDATION: exposed via BackendBehavior::profile; prod reroute is the migration PR.
 pub fn profile(backend: &Backend) -> Option<&'static BackendProfile> {
     static AGY: OnceLock<BackendProfile> = OnceLock::new();
+    static KIRO: OnceLock<BackendProfile> = OnceLock::new();
     // Shell + Raw share one profile — every legacy source treats `Shell | Raw(_)`
     // identically (empty patterns, default behavioral, generic productivity, Ready).
     static EMPTY: OnceLock<BackendProfile> = OnceLock::new();
     match backend {
         Backend::Agy => Some(AGY.get_or_init(agy_profile)),
+        Backend::KiroCli => Some(KIRO.get_or_init(kirocli_profile)),
         Backend::Shell | Backend::Raw(_) => Some(EMPTY.get_or_init(empty_profile)),
         _ => None,
     }
@@ -81,6 +85,65 @@ fn agy_profile() -> BackendProfile {
     }
 }
 
+/// KiroCli — moved VERBATIM from the four legacy sites (patterns.rs:270,
+/// behavioral.rs config_for + config_for_productivity, state/mod.rs initial).
+/// The ServerRateLimit entry references the SAME shared const the legacy arm
+/// does (`SERVER_RATE_LIMIT_NET_ERRORS`), so it stays byte-identical. The
+/// harness proves it.
+fn kirocli_profile() -> BackendProfile {
+    BackendProfile {
+        patterns: vec![
+            (
+                AgentState::AuthError,
+                r"Not authenticated|AccessDenied|denied access",
+            ),
+            (
+                AgentState::UsageLimit,
+                r"ServiceQuotaExceeded|InsufficientModelCapacity|you have reached the limit",
+            ),
+            (
+                AgentState::RateLimit,
+                r"Too Many Requests|ThrottlingError|ThrottlingException|Rate exceeded|\b429\b",
+            ),
+            (
+                AgentState::ServerRateLimit,
+                crate::state::patterns::SERVER_RATE_LIMIT_NET_ERRORS,
+            ),
+            (
+                AgentState::ContextFull,
+                r"context window overflow|compacting context",
+            ),
+            (
+                AgentState::PermissionPrompt,
+                r"requires approval|ESC to close \| Tab to edit",
+            ),
+            (
+                AgentState::GitConflict,
+                r"Automatic merge failed; fix conflicts|CONFLICT \(content\)|Resolve all conflicts manually|Failed to merge submodule|Failed to merge in",
+            ),
+            (AgentState::ToolUse, r"execute_bash|fs_read|fs_write"),
+            (AgentState::Thinking, r"Kiro is working|esc to cancel"),
+            (
+                AgentState::Idle,
+                r"\d+%\s*$|ask a question or describe a task",
+            ),
+            (AgentState::Ready, r"Trust All Tools active|/quit to exit"),
+        ],
+        behavioral: BehavioralConfig {
+            silence_thinking_ms: 2500,
+            silence_idle_ms: 7000,
+            supports_cursor_query: true,
+        },
+        productivity: ProductivityConfig {
+            markers: crate::behavioral::KIRO_PRODUCTIVE_MARKERS,
+            use_heartbeat: true,
+            heartbeat_fresh_window_ms: 10_000,
+            cache_id: Some(MarkerCacheId::Kiro),
+        },
+        initial_state: AgentState::Starting,
+    }
+}
+
 /// Shell / Raw — moved VERBATIM (empty patterns, default behavioral, generic
 /// productivity, Ready initial state).
 fn empty_profile() -> BackendProfile {
@@ -105,7 +168,12 @@ mod tests {
     use crate::state::StateTracker;
 
     fn migrated() -> Vec<Backend> {
-        vec![Backend::Agy, Backend::Shell, Backend::Raw("x".to_string())]
+        vec![
+            Backend::Agy,
+            Backend::KiroCli,
+            Backend::Shell,
+            Backend::Raw("x".to_string()),
+        ]
     }
 
     /// PRIMARY parity proof (structural, COMPLETE): the profile's raw patterns
@@ -189,7 +257,6 @@ mod tests {
     fn unmigrated_backends_have_no_profile_yet() {
         for b in [
             Backend::ClaudeCode,
-            Backend::KiroCli,
             Backend::Codex,
             Backend::OpenCode,
             Backend::Gemini,

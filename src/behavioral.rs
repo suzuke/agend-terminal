@@ -355,7 +355,9 @@ const CLAUDE_PRODUCTIVE_MARKERS: &[&str] = &[
 /// vocabulary + bracketed tool-call literals (`[fs_read]`, `[fs_write]`,
 /// `[execute_bash]`). The bracket form fires for Kiro's structured tool
 /// trace output.
-const KIRO_PRODUCTIVE_MARKERS: &[&str] = &[
+// #8 Phase 2 (KiroCli migration): pub(crate) so the BackendProfile bundles
+// KiroCli's ProductivityConfig by &'static ref (markers + LazyLock stay here).
+pub(crate) const KIRO_PRODUCTIVE_MARKERS: &[&str] = &[
     r"^Saved to \S+",
     r"^Wrote \d+ bytes",
     r"^Created file: \S+",
