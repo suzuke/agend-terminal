@@ -208,6 +208,20 @@ pub enum BlockedReason {
     Crash,
 }
 
+/// #1638: which recovery signal a [`BlockedReason`] is being tested against.
+/// There are two independent recovery axes, each clearing a different set of
+/// reasons (a single "recovered?" boolean would conflate them and break one):
+/// - [`RateLimitLifted`](Self::RateLimitLifted): the watchdog observed the agent
+///   actively working/ready again after a throttle (#1621/bughunt2 auto-clear).
+/// - [`OperatorResolved`](Self::OperatorResolved): the supervisor consumed a
+///   recovery notice on the transition out of AwaitingOperator/InteractivePrompt
+///   (#1552 "ready again" clear).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoverySignal {
+    RateLimitLifted,
+    OperatorResolved,
+}
+
 impl BlockedReason {
     pub fn parse_kind(kind: &str, params: &serde_json::Value) -> Option<Self> {
         match kind {
@@ -231,6 +245,48 @@ impl BlockedReason {
             Self::AwaitingOperator => "awaiting_operator",
             Self::PermissionPrompt => "permission_prompt",
             Self::Crash => "crash",
+        }
+    }
+
+    /// #1638: does this reason auto-clear when the given [`RecoverySignal`]
+    /// fires? Type-encodes the clear-policy that was previously two hardcoded
+    /// `matches!` (watchdog #1621 + supervisor #1552), so a NEW variant is
+    /// compile-forced to declare its clear behavior for BOTH axes instead of
+    /// silently latching forever (the #1621 set-without-clear class).
+    ///
+    /// Preserves the existing guards exactly:
+    /// - RateLimit/QuotaExceeded auto-clear on `RateLimitLifted` only (#1621),
+    ///   never on operator-resolution.
+    /// - AwaitingOperator auto-clears on `OperatorResolved` only (#1552), never
+    ///   on rate-limit recovery (#1564 — operator-action reasons must persist
+    ///   through an unrelated throttle lift).
+    /// - PermissionPrompt/Hang/Crash never auto-clear (operator/crash action
+    ///   required; today they are MCP-set + MCP/explicit-cleared only). See the
+    ///   PR note on whether InteractivePrompt resolution SHOULD clear
+    ///   PermissionPrompt — left as current behavior here.
+    ///
+    /// The `match self` is intentionally wildcard-free: that is the forcing
+    /// function.
+    pub fn auto_clears_on(&self, signal: RecoverySignal) -> bool {
+        match self {
+            Self::RateLimit { .. } | Self::QuotaExceeded => {
+                matches!(signal, RecoverySignal::RateLimitLifted)
+            }
+            Self::AwaitingOperator => matches!(signal, RecoverySignal::OperatorResolved),
+            Self::PermissionPrompt | Self::Hang | Self::Crash => false,
+        }
+    }
+
+    /// #1638: does this reason legitimately suppress `check_hang` (the agent is
+    /// blocked for a known reason that explains the output silence)? Type-encodes
+    /// what was a hardcoded `matches!` in `check_hang`, so a new variant is
+    /// compile-forced to declare its hang-suppression too. Wildcard-free by
+    /// design. Behavior-preserving: RateLimit/QuotaExceeded/AwaitingOperator
+    /// suppress; PermissionPrompt/Hang/Crash do not.
+    pub fn suppresses_hang_check(&self) -> bool {
+        match self {
+            Self::RateLimit { .. } | Self::QuotaExceeded | Self::AwaitingOperator => true,
+            Self::PermissionPrompt | Self::Hang | Self::Crash => false,
         }
     }
 }
@@ -495,14 +551,9 @@ impl HealthTracker {
         }
 
         // Race mutex: skip hang check when agent is blocked for a known
-        // reason that legitimately suppresses output.
+        // reason that legitimately suppresses output (#1638: policy on the type).
         if let Some(ref reason) = self.current_reason {
-            if matches!(
-                reason,
-                BlockedReason::RateLimit { .. }
-                    | BlockedReason::QuotaExceeded
-                    | BlockedReason::AwaitingOperator
-            ) {
+            if reason.suppresses_hang_check() {
                 return false;
             }
         }
@@ -1556,5 +1607,63 @@ mod tests {
             assert!(result, "silent path must still trigger Hung");
             assert_eq!(h.state, HealthState::Hung);
         });
+    }
+
+    /// #1638: the BlockedReason clear-policy + hang-suppress-policy table. This
+    /// is the behavior-preserving spec — every variant×signal cell must match
+    /// the pre-#1638 hardcoded `matches!` behavior (watchdog #1621 rate-limit
+    /// axis, supervisor #1552 operator-resolution axis, check_hang suppression).
+    /// A new variant added to the enum fails to compile in `auto_clears_on` /
+    /// `suppresses_hang_check` (wildcard-free), forcing a deliberate row here.
+    #[test]
+    fn blocked_reason_policy_table_1638() {
+        use BlockedReason::*;
+        use RecoverySignal::*;
+        let rl = RateLimit {
+            retry_after_secs: Some(30),
+        };
+        let rl_none = RateLimit {
+            retry_after_secs: None,
+        };
+
+        // (reason, clears_on RateLimitLifted, clears_on OperatorResolved, suppresses_hang)
+        let table: &[(BlockedReason, bool, bool, bool)] = &[
+            (rl, true, false, true),
+            (rl_none, true, false, true),
+            (QuotaExceeded, true, false, true),
+            (AwaitingOperator, false, true, true),
+            (PermissionPrompt, false, false, false),
+            (Hang, false, false, false),
+            (Crash, false, false, false),
+        ];
+        for (reason, on_rl, on_op, suppress) in table {
+            assert_eq!(
+                reason.auto_clears_on(RateLimitLifted),
+                *on_rl,
+                "{reason:?} auto_clears_on(RateLimitLifted)"
+            );
+            assert_eq!(
+                reason.auto_clears_on(OperatorResolved),
+                *on_op,
+                "{reason:?} auto_clears_on(OperatorResolved)"
+            );
+            assert_eq!(
+                reason.suppresses_hang_check(),
+                *suppress,
+                "{reason:?} suppresses_hang_check"
+            );
+        }
+
+        // #1564/#1621 guard restated explicitly: an operator-action reason must
+        // NOT clear on a rate-limit lift, and a throttle reason must NOT clear on
+        // operator resolution.
+        assert!(
+            !AwaitingOperator.auto_clears_on(RateLimitLifted),
+            "#1564: AwaitingOperator must survive an unrelated rate-limit lift"
+        );
+        assert!(
+            !QuotaExceeded.auto_clears_on(OperatorResolved),
+            "throttle reason must not be cleared by operator-resolution"
+        );
     }
 }

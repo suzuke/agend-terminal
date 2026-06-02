@@ -863,12 +863,12 @@ fn tick(
                 // operators aren't vibrated twice per interactive cycle.
                 // #1552: clear the AwaitingOperator health reason on recovery so
                 // `check_hang` is no longer exempt and a future stall can
-                // re-notify (the once-per-episode dedup re-arms). Guarded so we
-                // never clear a different blocked reason (RateLimit / etc.).
-                if matches!(
-                    core.health.current_reason,
-                    Some(crate::health::BlockedReason::AwaitingOperator)
-                ) {
+                // re-notify (the once-per-episode dedup re-arms). #1638: the
+                // operator-resolution clear-policy is now on the type, so this
+                // never clears a different blocked reason (RateLimit / etc.).
+                if core.health.current_reason.as_ref().is_some_and(|r| {
+                    r.auto_clears_on(crate::health::RecoverySignal::OperatorResolved)
+                }) {
                     core.health.clear_blocked_reason();
                 }
                 tracing::info!(
