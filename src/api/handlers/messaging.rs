@@ -1585,7 +1585,8 @@ mod tests {
         let pending = crate::daemon::dispatch_idle::list_pending(&home);
         let entry = pending.iter().find(|p| p.dispatch_id == id).unwrap();
         assert_eq!(
-            entry.status, "resolved",
+            entry.status,
+            crate::daemon::dispatch_idle::DispatchStatus::Resolved,
             "kind=report with matching correlation_id must resolve the sidecar"
         );
         std::fs::remove_dir_all(&home).ok();
@@ -1621,7 +1622,8 @@ mod tests {
         let pending = crate::daemon::dispatch_idle::list_pending(&home);
         let entry = pending.iter().find(|p| p.dispatch_id == id).unwrap();
         assert_eq!(
-            entry.status, "pending",
+            entry.status,
+            crate::daemon::dispatch_idle::DispatchStatus::Pending,
             "kind=update must NOT flip status (watchdog stays armed)"
         );
         std::fs::remove_dir_all(&home).ok();
@@ -1696,8 +1698,8 @@ mod tests {
             seeded
                 .iter()
                 .find(|p| p.correlation_id.as_deref() == Some("t-1525-x"))
-                .map(|p| p.status.as_str()),
-            Some("pending"),
+                .map(|p| p.status),
+            Some(crate::daemon::dispatch_idle::DispatchStatus::Pending),
             "sidecar must seed pending, keyed by task_id"
         );
 
@@ -1721,8 +1723,8 @@ mod tests {
             after
                 .iter()
                 .find(|p| p.correlation_id.as_deref() == Some("t-1525-x"))
-                .map(|p| p.status.as_str()),
-            Some("resolved"),
+                .map(|p| p.status),
+            Some(crate::daemon::dispatch_idle::DispatchStatus::Resolved),
             "#1525: a report carrying the id in task_id must clear the sidecar \
              via the correlation_id.or(task_id) symmetry"
         );

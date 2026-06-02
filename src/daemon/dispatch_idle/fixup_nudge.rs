@@ -20,7 +20,7 @@
 
 use std::path::Path;
 
-use super::{list_pending, pending_path, PendingDispatch};
+use super::{list_pending, pending_path, DispatchStatus, PendingDispatch};
 
 /// Fixup team name as it appears in fleet.yaml. Single source of truth.
 pub(crate) const FIXUP_TEAM_NAME: &str = "fixup";
@@ -139,7 +139,7 @@ fn emit_nudge(home: &Path, d: &PendingDispatch) -> bool {
 /// tests.
 pub(crate) fn scan_and_nudge(home: &Path) {
     for mut d in list_pending(home) {
-        if d.status != "exceeded" {
+        if d.status != DispatchStatus::Exceeded {
             continue;
         }
         if d.nudge_sent_at.is_some() {
@@ -213,7 +213,7 @@ mod tests {
             expected_kind: "task".to_string(),
             threshold_secs: 600,
             issued_at: issued,
-            status: "exceeded".to_string(),
+            status: DispatchStatus::Exceeded,
             nudge_sent_at: None,
         };
         std::fs::write(
@@ -333,7 +333,7 @@ mod tests {
             expected_kind: "task".to_string(),
             threshold_secs: 600,
             issued_at: issued,
-            status: "exceeded".to_string(),
+            status: DispatchStatus::Exceeded,
             nudge_sent_at: None,
         };
         std::fs::write(

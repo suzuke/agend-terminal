@@ -683,7 +683,10 @@ fn scan_fleet_vantage(
 fn has_expected_work(home: &Path) -> bool {
     // Check pending dispatch sidecars first (cheap).
     let pending = crate::daemon::dispatch_idle::list_pending(home);
-    if pending.iter().any(|d| d.status == "pending") {
+    if pending
+        .iter()
+        .any(|d| d.status == crate::daemon::dispatch_idle::DispatchStatus::Pending)
+    {
         return true;
     }
     // Only suppress when we can confirm the task board is empty.

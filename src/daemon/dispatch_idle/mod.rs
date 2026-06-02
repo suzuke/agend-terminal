@@ -70,9 +70,9 @@ pub(crate) struct PendingDispatch {
     pub(crate) threshold_secs: i64,
     #[serde(default)]
     pub(crate) issued_at: String,
-    /// `pending` | `exceeded` | `resolved` | `cancelled`.
-    #[serde(default = "default_status")]
-    pub(crate) status: String,
+    /// Sidecar lifecycle state. See [`DispatchStatus`].
+    #[serde(default)]
+    pub(crate) status: DispatchStatus,
     /// L2-owned dedup field: timestamp of the last nudge emitted for
     /// this dispatch. `None` = no nudge sent yet. L1 never reads this
     /// field; it lives in the L1 schema to keep the sidecar a single
@@ -81,8 +81,28 @@ pub(crate) struct PendingDispatch {
     pub(crate) nudge_sent_at: Option<String>,
 }
 
-fn default_status() -> String {
-    "pending".to_string()
+/// #1636: lifecycle of a dispatch-idle sidecar, replacing the stringly-typed
+/// 4-state `status` field so the compiler enforces exhaustiveness at the guard
+/// sites. Serializes to the SAME lowercase wire strings the `String` field used
+/// (`pending` / `resolved` / `exceeded` / `cancelled`) via `rename_all`, so
+/// on-disk sidecars and IPC payloads are byte-identical — pinned by
+/// `dispatch_status_serde_roundtrip`. Strict like the pr_state enums next door:
+/// an unknown status string fails to deserialize, so the sidecar is skipped by
+/// `list_pending`'s existing fail-open loader (the module only ever writes the
+/// four known states).
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum DispatchStatus {
+    /// Dispatch in flight, watchdog armed — the only state that surfaces in
+    /// operator views and matches the resolve/escalate scans.
+    #[default]
+    Pending,
+    /// A matching report arrived → watchdog disarmed.
+    Resolved,
+    /// `threshold_secs` elapsed with no report → idle nudge fired.
+    Exceeded,
+    /// Underlying task reached a terminal state (done/cancelled) → sidecar void.
+    Cancelled,
 }
 
 pub(crate) fn pending_dir(home: &Path) -> PathBuf {
@@ -141,7 +161,7 @@ pub(crate) fn record_dispatch(
         expected_kind: expected_kind.to_string(),
         threshold_secs,
         issued_at: chrono::Utc::now().to_rfc3339(),
-        status: "pending".to_string(),
+        status: DispatchStatus::Pending,
         nudge_sent_at: None,
     };
     let body = match serde_json::to_string_pretty(&payload) {
@@ -253,7 +273,7 @@ pub(crate) fn cleanup_pending_for_task_id(home: &Path, task_id: &str) -> usize {
     }
     let mut count = 0usize;
     for d in list_pending(home) {
-        if d.status != "pending" {
+        if d.status != DispatchStatus::Pending {
             continue;
         }
         if d.correlation_id.as_deref() != Some(task_id) {
@@ -294,7 +314,7 @@ pub(crate) fn cleanup_pending_for_instance(home: &Path, instance_name: &str) -> 
     }
     let mut count = 0usize;
     for d in list_pending(home) {
-        if d.status != "pending" {
+        if d.status != DispatchStatus::Pending {
             continue;
         }
         if d.target != instance_name {
@@ -331,17 +351,17 @@ pub(crate) fn mark_resolved(home: &Path, correlation_id: &str) -> Option<String>
     if correlation_id.is_empty() {
         return None;
     }
-    let matched = list_pending(home)
-        .into_iter()
-        .find(|d| d.status == "pending" && d.correlation_id.as_deref() == Some(correlation_id));
+    let matched = list_pending(home).into_iter().find(|d| {
+        d.status == DispatchStatus::Pending && d.correlation_id.as_deref() == Some(correlation_id)
+    });
     let d = matched?;
     let id = d.dispatch_id.clone();
     let path = pending_path(home, &id);
     crate::store::with_json_state::<PendingDispatch, _, _>(&path, |current| {
-        if current.status != "pending" {
+        if current.status != DispatchStatus::Pending {
             return None;
         }
-        current.status = "resolved".to_string();
+        current.status = DispatchStatus::Resolved;
         Some(id.clone())
     })
     .ok()
@@ -358,14 +378,14 @@ pub(crate) fn refresh_issued_at(home: &Path, correlation_id: &str) -> Option<Str
     if correlation_id.is_empty() {
         return None;
     }
-    let matched = list_pending(home)
-        .into_iter()
-        .find(|d| d.status == "pending" && d.correlation_id.as_deref() == Some(correlation_id));
+    let matched = list_pending(home).into_iter().find(|d| {
+        d.status == DispatchStatus::Pending && d.correlation_id.as_deref() == Some(correlation_id)
+    });
     let d = matched?;
     let id = d.dispatch_id.clone();
     let path = pending_path(home, &id);
     crate::store::with_json_state::<PendingDispatch, _, _>(&path, |current| {
-        if current.status != "pending" {
+        if current.status != DispatchStatus::Pending {
             return None;
         }
         current.issued_at = chrono::Utc::now().to_rfc3339();
@@ -416,7 +436,7 @@ pub(crate) fn pending_for_instance(
         return (as_dispatcher, as_target);
     }
     for d in list_pending(home) {
-        if d.status != "pending" {
+        if d.status != DispatchStatus::Pending {
             continue;
         }
         let elapsed_secs = chrono::DateTime::parse_from_rfc3339(&d.issued_at)
@@ -469,7 +489,7 @@ pub(crate) fn scan_and_emit(home: &Path) {
     // transitions — see #1470-#4 — so it's an unreliable "current state").
     let snapshot = crate::snapshot::load(home);
     for d in list_pending(home) {
-        if d.status != "pending" {
+        if d.status != DispatchStatus::Pending {
             continue;
         }
         let issued = match chrono::DateTime::parse_from_rfc3339(&d.issued_at) {
@@ -538,10 +558,10 @@ pub(crate) fn scan_and_emit(home: &Path) {
                 Ok(d) => d,
                 Err(_) => continue,
             };
-            if current.status != "pending" {
+            if current.status != DispatchStatus::Pending {
                 continue;
             }
-            current.status = "exceeded".to_string();
+            current.status = DispatchStatus::Exceeded;
             if !write_dispatch(home, &current) {
                 tracing::warn!(dispatch_id = %d.dispatch_id, "dispatch-idle exceeded status write failed");
             }
@@ -676,6 +696,41 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
 
+    /// #1636: the `DispatchStatus` enum MUST serialize to / deserialize from the
+    /// exact lowercase wire strings the prior stringly-typed field used, so
+    /// existing on-disk sidecars + IPC payloads stay byte-compatible.
+    #[test]
+    fn dispatch_status_serde_roundtrip() {
+        for (variant, wire) in [
+            (DispatchStatus::Pending, "\"pending\""),
+            (DispatchStatus::Resolved, "\"resolved\""),
+            (DispatchStatus::Exceeded, "\"exceeded\""),
+            (DispatchStatus::Cancelled, "\"cancelled\""),
+        ] {
+            // enum → string matches the legacy wire form
+            assert_eq!(serde_json::to_string(&variant).unwrap(), wire);
+            // string → enum (legacy on-disk values still load)
+            assert_eq!(
+                serde_json::from_str::<DispatchStatus>(wire).unwrap(),
+                variant
+            );
+        }
+        // `#[serde(default)]` on the field → a sidecar JSON with no `status`
+        // key loads as Pending, matching the old `default_status` fn.
+        let no_status = r#"{"dispatch_id":"d1","dispatcher":"a","target":"b"}"#;
+        let d: PendingDispatch = serde_json::from_str(no_status).unwrap();
+        assert_eq!(d.status, DispatchStatus::Pending);
+        // A full sidecar round-trips with the status as a lowercase string.
+        let s = serde_json::to_string(&d).unwrap();
+        assert!(
+            s.contains("\"status\":\"pending\""),
+            "status must serialize as the lowercase wire string, got: {s}"
+        );
+        // An unknown status string fails to deserialize (strict, like the
+        // pr_state enums) — list_pending's fail-open loader then skips it.
+        assert!(serde_json::from_str::<DispatchStatus>("\"bogus\"").is_err());
+    }
+
     fn tmp_home(tag: &str) -> PathBuf {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -712,7 +767,7 @@ mod tests {
             expected_kind: expected_kind.to_string(),
             threshold_secs,
             issued_at: issued_at.to_rfc3339(),
-            status: "pending".to_string(),
+            status: DispatchStatus::Pending,
             nudge_sent_at: None,
         };
         std::fs::write(
@@ -763,7 +818,7 @@ mod tests {
         assert_eq!(p.correlation_id.as_deref(), Some("t-abc"));
         assert_eq!(p.expected_kind, "task");
         assert_eq!(p.threshold_secs, 600);
-        assert_eq!(p.status, "pending");
+        assert_eq!(p.status, DispatchStatus::Pending);
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -785,7 +840,11 @@ mod tests {
         );
         let pending = list_pending(&home);
         let p = pending.iter().find(|p| p.dispatch_id == id).unwrap();
-        assert_eq!(p.status, "exceeded", "sidecar must flip pending→exceeded");
+        assert_eq!(
+            p.status,
+            DispatchStatus::Exceeded,
+            "sidecar must flip pending→exceeded"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -808,9 +867,14 @@ mod tests {
         let pending = list_pending(&home);
         let p_a = pending.iter().find(|p| p.dispatch_id == id_a).unwrap();
         let p_b = pending.iter().find(|p| p.dispatch_id == id_b).unwrap();
-        assert_eq!(p_a.status, "resolved", "matched sidecar must flip");
         assert_eq!(
-            p_b.status, "pending",
+            p_a.status,
+            DispatchStatus::Resolved,
+            "matched sidecar must flip"
+        );
+        assert_eq!(
+            p_b.status,
+            DispatchStatus::Pending,
             "unmatched sidecar from same dispatcher must NOT flip"
         );
         std::fs::remove_dir_all(&home).ok();
@@ -875,9 +939,10 @@ mod tests {
         let pending = list_pending(&home);
         let p_stale = pending.iter().find(|p| p.dispatch_id == id_stale).unwrap();
         let p_fresh = pending.iter().find(|p| p.dispatch_id == id_fresh).unwrap();
-        assert_eq!(p_stale.status, "exceeded");
+        assert_eq!(p_stale.status, DispatchStatus::Exceeded);
         assert_eq!(
-            p_fresh.status, "pending",
+            p_fresh.status,
+            DispatchStatus::Pending,
             "fresh dispatch must remain pending"
         );
         std::fs::remove_dir_all(&home).ok();
@@ -1601,7 +1666,7 @@ mod tests {
         );
         let pending = list_pending(&home);
         assert!(
-            pending.iter().any(|p| p.status == "pending"),
+            pending.iter().any(|p| p.status == DispatchStatus::Pending),
             "sidecar must remain pending after refresh"
         );
         std::fs::remove_dir_all(&home).ok();
@@ -1638,7 +1703,11 @@ mod tests {
             .iter()
             .find(|p| p.correlation_id.as_deref() == Some("t-1047-c"))
             .unwrap();
-        assert_eq!(d.status, "resolved", "kind=report must set status=resolved");
+        assert_eq!(
+            d.status,
+            DispatchStatus::Resolved,
+            "kind=report must set status=resolved"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -1709,7 +1778,8 @@ mod tests {
             .find(|p| p.dispatch_id == id)
             .unwrap();
         assert_eq!(
-            p.status, "pending",
+            p.status,
+            DispatchStatus::Pending,
             "sidecar stays pending (clock refreshed)"
         );
         std::fs::remove_dir_all(&home).ok();
@@ -1737,7 +1807,7 @@ mod tests {
             .into_iter()
             .find(|p| p.dispatch_id == id)
             .unwrap();
-        assert_eq!(p.status, "exceeded");
+        assert_eq!(p.status, DispatchStatus::Exceeded);
         std::fs::remove_dir_all(&home).ok();
     }
 
