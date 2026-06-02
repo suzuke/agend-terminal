@@ -128,9 +128,13 @@ pub(crate) enum CiteResolution {
 pub(crate) enum CiCheck {
     /// A matching ci_watch record shows success.
     Green,
-    /// A matching record exists but its conclusion is not success.
+    /// A matching record exists but its conclusion is not success → the ONLY
+    /// CI state that warns (the daemon checked and the claim contradicts it).
     NotGreen,
-    /// Repo known, but no matching ci_watch record found → checked-and-absent.
+    /// No matching ci_watch record. #1671: this is "can't check", NOT "checked &
+    /// absent" — the poller GCs records (72h TTL + PR-terminal auto-clear,
+    /// #931), so a real late CI-green claim is indistinguishable from a
+    /// fabricated one here → never warn.
     NoRecord,
     /// Could not determine the repo to check → SKIP (never warn).
     Unknown,
@@ -172,9 +176,10 @@ pub(crate) fn claims_ci_green(body: &str) -> bool {
 /// or nothing checkable". The caller logs these and STILL passes the verdict.
 ///
 /// `resolve(path)` yields the repo-relative cite resolution; `ci_check()` yields
-/// the CI-green cross-check. Both carry an explicit "can't check" state
-/// (`RepoUnknown` / `Unknown`) which never produces a warning — the deliberate
-/// false-warn boundary.
+/// the CI-green cross-check. The deliberate false-warn boundary: only a
+/// "checked & failed" outcome warns (`FileMissing`/out-of-range cite, or a live
+/// `NotGreen` record). Every "can't check" outcome — `RepoUnknown`, and (post
+/// #1671) BOTH `Unknown` and `NoRecord` for CI — never warns.
 pub(crate) fn cross_check_warnings(
     body: &str,
     resolve: impl Fn(&str) -> CiteResolution,
@@ -195,14 +200,19 @@ pub(crate) fn cross_check_warnings(
     }
     if claims_ci_green(body) {
         match ci_check() {
+            // ONLY a live record that CONTRADICTS the claim warns.
             CiCheck::NotGreen => warns.push(
                 "claims CI is green, but the ci_watch record shows a non-success conclusion".into(),
             ),
-            CiCheck::NoRecord => {
-                warns.push("claims CI is green, but no matching ci_watch record was found".into())
-            }
-            // Green (verified), or Unknown (can't check) → no warning.
-            CiCheck::Green | CiCheck::Unknown => {}
+            // #1671 (codex catch): NoRecord must NOT warn. The ci_watch poller
+            // legitimately GCs records (72h TTL + PR-terminal auto-clear, #931),
+            // so a real CI-green claim arriving AFTER GC is indistinguishable
+            // from a fabricated one — both present as NoRecord. "Can't check" ≠
+            // "checked & failed". Consequence (honest L3 limitation): the
+            // CI-green cross-check is only effective WHILE the record lives
+            // (ephemeral, ≤72h); after GC we never warn. A weak-but-correct
+            // check beats a false-warning one — warn-first must not cry wolf.
+            CiCheck::Green | CiCheck::NoRecord | CiCheck::Unknown => {}
         }
     }
     warns
@@ -440,16 +450,33 @@ mod tests {
     }
 
     #[test]
-    fn crosscheck_ci_green_no_record_warns() {
+    fn crosscheck_ci_green_no_record_no_warn_1671() {
+        // #1671 (codex catch): NoRecord = can't-check (the watch may have been
+        // GC'd — 72h TTL + PR-terminal auto-clear, #931) → must NOT warn; a real
+        // late CI-green claim is indistinguishable from a fabricated one here.
         let warns = cross_check_warnings(
             "VERIFIED — CI green",
             |_| CiteResolution::RepoUnknown,
             || CiCheck::NoRecord,
         );
+        assert!(
+            warns.is_empty(),
+            "no-record CI-green must NOT warn (GC boundary): {warns:?}"
+        );
+    }
+
+    #[test]
+    fn crosscheck_ci_green_contradicted_by_record_warns() {
+        // The ONLY CI state that warns: a LIVE record whose conclusion ≠ success.
+        let warns = cross_check_warnings(
+            "VERIFIED — CI green",
+            |_| CiteResolution::RepoUnknown,
+            || CiCheck::NotGreen,
+        );
         assert_eq!(
             warns.len(),
             1,
-            "green claim with no record must warn: {warns:?}"
+            "green claim contradicted by a live record must warn: {warns:?}"
         );
     }
 
