@@ -343,6 +343,33 @@ pub(super) fn handle_replace_instance(home: &Path, args: &Value) -> Value {
     json!({"name": name, "reason": reason, "spawned": spawned})
 }
 
+/// #1625: assemble the SPAWN params for a restart. Mirrors replace_instance by
+/// tagging `layout: same-tab` so the respawned pane returns to the tab the
+/// killed pane occupied (recorded on its DELETE) instead of opening a fresh
+/// tab. `mode` only toggles backend resume args — placement is identical for
+/// resume and fresh restarts — so the hint is applied unconditionally.
+fn restart_spawn_params(
+    name: &str,
+    backend_command: &str,
+    args: &[String],
+    working_directory: Option<&Path>,
+    env: &std::collections::HashMap<String, String>,
+    mode: &str,
+) -> Value {
+    let mut spawn_params = json!({
+        "name": name,
+        "backend": backend_command,
+        "args": args.join(" "),
+        "working_directory": working_directory.map(|p| p.display().to_string()),
+        "env": serde_json::to_value(env).unwrap_or(serde_json::Value::Null),
+        "layout": "same-tab",
+    });
+    if mode == "resume" {
+        spawn_params["mode"] = json!("resume");
+    }
+    spawn_params
+}
+
 pub(super) fn handle_restart_instance(home: &Path, args: &Value) -> Value {
     let name = match args["instance"].as_str() {
         Some(n) => n,
@@ -367,16 +394,14 @@ pub(super) fn handle_restart_instance(home: &Path, args: &Value) -> Value {
         &json!({"method": crate::api::method::DELETE, "params": {"name": name, "no_wait": true}}),
     );
 
-    let mut spawn_params = json!({
-        "name": name,
-        "backend": resolved.backend_command,
-        "args": resolved.args.join(" "),
-        "working_directory": resolved.working_directory.map(|p| p.display().to_string()),
-        "env": serde_json::to_value(&resolved.env).unwrap_or(serde_json::Value::Null),
-    });
-    if mode == "resume" {
-        spawn_params["mode"] = json!("resume");
-    }
+    let spawn_params = restart_spawn_params(
+        name,
+        &resolved.backend_command,
+        &resolved.args,
+        resolved.working_directory.as_deref(),
+        &resolved.env,
+        mode,
+    );
 
     let spawn_result = crate::api::call(
         home,
@@ -630,3 +655,29 @@ pub(super) fn resolve_team_layout(
 // #964: spawn_single_instance + spawn_single_instance_impl live in
 // sibling file `instance_spawn.rs` to keep this file under the 750-LOC
 // file_size_invariant.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    // #1625: every restart, regardless of mode, must carry the same-tab layout
+    // hint so the respawned pane returns to its original tab (the fresh path
+    // previously omitted it and fell out into a new tab).
+    #[test]
+    fn restart_spawn_params_carries_same_tab_fresh() {
+        let env = HashMap::new();
+        let p = restart_spawn_params("dev", "claude", &[], None, &env, "fresh");
+        assert_eq!(p["layout"], "same-tab");
+        // fresh must NOT request a resume.
+        assert!(p.get("mode").is_none());
+    }
+
+    #[test]
+    fn restart_spawn_params_carries_same_tab_resume() {
+        let env = HashMap::new();
+        let p = restart_spawn_params("dev", "claude", &[], None, &env, "resume");
+        assert_eq!(p["layout"], "same-tab");
+        assert_eq!(p["mode"], "resume");
+    }
+}

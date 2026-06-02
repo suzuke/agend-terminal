@@ -833,6 +833,39 @@ mod tests {
         assert!(layout.tabs[0].root().has_agent("reviewer"));
     }
 
+    /// #1625: fresh restart of an agent sharing a multi-pane team tab returns
+    /// the respawned pane to that same tab (the repro: fixup-dev was
+    /// fresh-restarted and fell out of the shared "fixup" tab). restart_instance
+    /// now emits LayoutHint::SameTab, which drives the same delete-records-tab →
+    /// SameTab-replacement path as #1431.
+    #[test]
+    fn restart_returns_pane_to_shared_team_tab() {
+        use crate::layout::SplitDir;
+        let mut layout = Layout::new();
+        let mut tab = Tab::new("fixup".into(), leaf(1, "fixup-dev"));
+        tab.split_focused(SplitDir::Horizontal, leaf(2, "fixup-reviewer"));
+        layout.add_tab(tab);
+
+        // restart kills the old pane (DELETE → InstanceDeleted) ...
+        handle_instance_deleted("fixup-dev", &mut layout);
+        assert_eq!(
+            layout.tabs.len(),
+            1,
+            "shared tab survives one pane's delete"
+        );
+        let tab_name = layout
+            .take_removed_tab("fixup-dev")
+            .expect("delete records the agent's tab");
+        assert_eq!(tab_name, "fixup");
+
+        // ... then the SameTab respawn splits back into the shared tab.
+        place_in_remembered_tab(&mut layout, &tab_name, leaf(3, "fixup-dev"));
+        assert_eq!(layout.tabs.len(), 1, "no new tab — pane stays in 'fixup'");
+        assert_eq!(layout.tabs[0].name, "fixup");
+        assert!(layout.tabs[0].root().has_agent("fixup-dev"));
+        assert!(layout.tabs[0].root().has_agent("fixup-reviewer"));
+    }
+
     /// #1431: SameTab never produces a split anchor — placement is resolved via
     /// the remembered-tab map, not resolve_split_anchor (even when a
     /// target_pane / spawner is present).
