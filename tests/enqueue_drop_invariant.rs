@@ -1,29 +1,38 @@
 //! #1630 invariant: a production inbox/notification **enqueue** whose `Result`
 //! is silently dropped is the silent-message-loss bug class (#1614/#1618/#1622
 //! lineage — a dropped `enqueue` means the message never lands on disk and the
-//! recipient never sees it). All 23 historical drops shared one reflexive
-//! shape: `let _ = …enqueue…(…)`. This test fails CI if that shape (or `.ok()`
-//! / a bare-`;` discard) reappears in production code, forcing the author to
-//! either propagate the `Err` or route it through `persist_or_log!`.
+//! recipient never sees it). All 23 historical drops shared the reflexive
+//! `let _ = …enqueue…(…)` shape. This test fails CI if a dropped enqueue
+//! reappears, forcing the author to propagate the `Err` or route it through
+//! `persist_or_log!`.
 //!
-//! Scope / honesty about limits:
-//! - Scans `src/` only, and skips test code (test-module files + `#[cfg(test)]`
+//! **Statement/span-aware** (not line-oriented): after locating a call it
+//! balances parens to the end of the call expression, then inspects the
+//! *leading* binding and the *trailing* consumption — so a multi-line drop
+//! (rustfmt's normal layout for a multi-arg call, e.g. `.ok()` on the line
+//! after the closing paren) is caught, which a per-line scan would miss.
+//!
+//! Drop shapes flagged: `let _ = <call>`, `<call>.ok()`, bare `<call>;`
+//! — even when the binding / `.ok()` / `;` lands on a different line than the
+//! call token. Allow-listed: `persist_or_log!(<call>, …)`, propagation
+//! (`return <call>…`, `<call>?`), binding (`let x = <call>`, `match <call>`),
+//! and tail-expression returns (`<call>` with no trailing `;`).
+//!
+//! Scope / honest limits:
+//! - Scans `src/` only; skips test code (test-module files + `#[cfg(test)]`
 //!   regions) — test cleanup legitimately discards these Results.
-//! - Catches the three common reflexive drop shapes (`let _ =`, `.ok()`,
-//!   bare statement). It CANNOT stop a determined evader who binds the Result
-//!   to a named variable and then drops it (`let r = enqueue(..); /* ignore */`)
-//!   — and that is fine: the goal is to kill the reflexive `let _ =` that
-//!   produced every one of the 23, not to be a watertight escape analysis.
-//! - The bare-`;` shape is also caught by rustc's `unused_must_use`
-//!   (`enqueue` returns `#[must_use] Result`) under CI `-D warnings`; this test
-//!   makes the intent explicit and co-locates all three shapes.
-//!
-//! Allow-listed: any drop routed through `persist_or_log!(…)`.
+//! - Paren balancing is string-literal aware but not char-literal/block-comment
+//!   aware; line (`//`) comments are skipped. These gaps are irrelevant to the
+//!   enqueue call sites in this codebase.
+//! - It CANNOT stop a determined evader who binds the Result then drops it
+//!   (`let r = enqueue(..); /* ignore r */`). That's by design — the goal is to
+//!   kill the reflexive `let _ =` / `.ok()` / bare-`;` that produced the 23.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-/// The persistence/notification enqueue functions whose dropped `Result` is the
-/// #1630 silent-loss class. Matched as call tokens (`<name>(`).
+/// Enqueue/notification fns whose dropped `Result` is the #1630 class. Matched
+/// as call tokens `<name>(`.
 const ENQUEUE_FNS: &[&str] = &["enqueue", "enqueue_with_idle_hint", "enqueue_classified"];
 
 fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -50,43 +59,212 @@ fn is_test_module_file(path: &Path) -> bool {
         .any(|c| c.as_os_str() == "tests" || c.as_os_str() == "test")
 }
 
-/// Does `line` contain a call to one of `ENQUEUE_FNS` (as `<name>(`), and is it
-/// NOT a `fn` definition of one of them?
-fn has_enqueue_call(line: &str) -> bool {
-    let t = line.trim_start();
-    if t.starts_with("//") || t.starts_with('*') || t.starts_with("///") {
-        return false; // comment / doc
+/// 1-based line numbers inside `#[cfg(test)]` module regions (brace-depth
+/// tracked), so in-file test modules are prod-sliced out.
+fn test_region_lines(content: &str) -> HashSet<usize> {
+    let mut out = HashSet::new();
+    let mut depth: i32 = 0;
+    let mut pending_cfg_test = false;
+    let mut region_depth: Option<i32> = None;
+    for (i, line) in content.lines().enumerate() {
+        let t = line.trim();
+        if region_depth.is_none() {
+            if t.starts_with("#[cfg(test)]") {
+                pending_cfg_test = true;
+            } else if pending_cfg_test && t.contains("mod ") && line.contains('{') {
+                region_depth = Some(depth);
+                pending_cfg_test = false;
+            }
+        }
+        if region_depth.is_some_and(|d| depth >= d) {
+            out.insert(i + 1);
+        }
+        let next = depth + line.matches('{').count() as i32 - line.matches('}').count() as i32;
+        if let Some(d) = region_depth {
+            if next <= d {
+                region_depth = None;
+            }
+        }
+        depth = next;
     }
-    // Skip the fn definitions themselves.
-    if t.contains("fn enqueue") {
-        return false;
-    }
-    ENQUEUE_FNS.iter().any(|f| {
-        // Match `name(` and `name_with_idle_hint(` etc. precisely: the token
-        // must be followed by `(` and preceded by a non-identifier char.
-        let needle = format!("{f}(");
-        find_call(line, &needle)
-    })
+    out
 }
 
-/// True if `needle` (e.g. `enqueue(`) appears with a non-identifier char before
-/// it — so `enqueue(` matches but `dequeue(` / `my_enqueue(` do not, and
-/// `enqueue_with_idle_hint(` is not matched by the bare `enqueue(` needle.
-fn find_call(line: &str, needle: &str) -> bool {
-    let bytes = line.as_bytes();
-    let mut from = 0;
-    while let Some(rel) = line[from..].find(needle) {
-        let idx = from + rel;
-        let prev_ok = idx == 0 || {
-            let c = bytes[idx - 1] as char;
-            !(c.is_alphanumeric() || c == '_')
-        };
-        if prev_ok {
-            return true;
-        }
-        from = idx + 1;
+fn line_of(line_starts: &[usize], pos: usize) -> usize {
+    match line_starts.binary_search(&pos) {
+        Ok(i) => i + 1,
+        Err(i) => i, // i = number of starts <= pos
     }
-    false
+}
+
+/// True if `enqueue(`-style needle at `idx` is a real call (non-identifier char
+/// before it — excludes `my_enqueue(`).
+fn is_call_token(bytes: &[u8], idx: usize) -> bool {
+    if idx == 0 {
+        return true;
+    }
+    let c = bytes[idx - 1];
+    !(c.is_ascii_alphanumeric() || c == b'_')
+}
+
+/// Start of the call path: walk back over `[A-Za-z0-9_:]` from the fn-name
+/// token start, so `crate::inbox::enqueue` resolves to the `crate` index.
+fn path_start(bytes: &[u8], name_start: usize) -> usize {
+    let mut i = name_start;
+    while i > 0 {
+        let c = bytes[i - 1];
+        if c.is_ascii_alphanumeric() || c == b'_' || c == b':' {
+            i -= 1;
+        } else {
+            break;
+        }
+    }
+    i
+}
+
+/// Index of the matching `)` for the `(` at `open`, string-literal aware.
+fn matching_paren(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut i = open;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_str {
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == b'"' {
+                in_str = false;
+            }
+        } else {
+            match c {
+                b'"' => in_str = true,
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+#[derive(PartialEq)]
+enum Lead {
+    LetUnderscore, // `let _ = <call>`
+    Allowed,       // persist_or_log!(<call>…), return <call>, let x = <call>, match <call>, …
+    Bare,          // statement position: preceded by `;` `{` `}` or start
+    Other,         // sub-expression (argument, match-arm value, …)
+}
+
+fn classify_lead(bytes: &[u8], call_path_start: usize) -> Lead {
+    // Skip whitespace/newlines backward.
+    let mut i = call_path_start;
+    while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+        i -= 1;
+    }
+    if i == 0 {
+        return Lead::Bare;
+    }
+    let prev = bytes[i - 1];
+    match prev {
+        b';' | b'{' | b'}' => Lead::Bare,
+        b'>' => Lead::Other, // `=>` match arm value
+        b'?' | b',' | b'|' | b'&' | b'+' => Lead::Other,
+        b'=' => {
+            // assignment — `let _ =` is a drop; any other binding is allowed.
+            // (`==`/`!=`/`>=` etc. would have a second op char we don't reach.)
+            let mut j = i - 1;
+            while j > 0 && bytes[j - 1].is_ascii_whitespace() {
+                j -= 1;
+            }
+            // `let _ =` ⇒ char before the ws-run before `=` is `_`, itself
+            // preceded by whitespace then `let`.
+            if j > 0 && bytes[j - 1] == b'_' {
+                let mut k = j - 1;
+                while k > 0 && bytes[k - 1].is_ascii_whitespace() {
+                    k -= 1;
+                }
+                if k >= 3 && &bytes[k - 3..k] == b"let" {
+                    return Lead::LetUnderscore;
+                }
+            }
+            Lead::Allowed
+        }
+        b'(' => {
+            // Argument to a call/macro — allowed iff the macro is persist_or_log!.
+            let paren = i - 1; // index of '('
+            let mut k = paren;
+            while k > 0 {
+                let c = bytes[k - 1];
+                if c.is_ascii_alphanumeric() || c == b'_' || c == b'!' || c == b':' {
+                    k -= 1;
+                } else {
+                    break;
+                }
+            }
+            let ident = std::str::from_utf8(&bytes[k..paren]).unwrap_or("");
+            if ident.contains("persist_or_log!") {
+                Lead::Allowed
+            } else {
+                Lead::Other
+            }
+        }
+        _ => {
+            // word like `return` / `await` / `=>`?
+            let mut k = i;
+            while k > 0 {
+                let c = bytes[k - 1];
+                if c.is_ascii_alphabetic() || c == b'_' {
+                    k -= 1;
+                } else {
+                    break;
+                }
+            }
+            let word = std::str::from_utf8(&bytes[k..i]).unwrap_or("");
+            if word == "return" {
+                Lead::Allowed
+            } else {
+                Lead::Other
+            }
+        }
+    }
+}
+
+enum Trail {
+    DotOk,     // `.ok()` — drop
+    Semicolon, // bare `;` — drop (statement position)
+    Ok,        // `?`, `.method(` chain, `}`, `,`, `)`, EOF — propagation/subexpr/tail
+}
+
+fn classify_trail(bytes: &[u8], close: usize) -> Trail {
+    let mut i = close + 1;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return Trail::Ok;
+    }
+    match bytes[i] {
+        b';' => Trail::Semicolon,
+        b'.' => {
+            // `.ok()` ⇒ drop; any other method chain ⇒ not our concern.
+            let rest = &bytes[i..];
+            if rest.starts_with(b".ok()") || rest.starts_with(b".ok ") || rest.starts_with(b".ok\n")
+            {
+                Trail::DotOk
+            } else {
+                Trail::Ok
+            }
+        }
+        _ => Trail::Ok,
+    }
 }
 
 #[test]
@@ -104,87 +282,68 @@ fn production_enqueue_results_must_not_be_silently_dropped() {
         let Ok(content) = std::fs::read_to_string(f) else {
             continue;
         };
-        let lines: Vec<&str> = content.lines().collect();
+        let bytes = content.as_bytes();
+        let test_lines = test_region_lines(&content);
+        let mut line_starts = vec![0usize];
+        for (i, b) in bytes.iter().enumerate() {
+            if *b == b'\n' {
+                line_starts.push(i + 1);
+            }
+        }
 
-        // Track `#[cfg(test)]` regions by brace depth so in-file test modules
-        // are skipped (the prod-slice requirement — can't false-fail on test
-        // helpers, can't false-pass since prod code is never inside one).
-        let mut depth: i32 = 0;
-        let mut pending_cfg_test = false;
-        let mut test_region_depth: Option<i32> = None;
+        for fname in ENQUEUE_FNS {
+            let needle = format!("{fname}(");
+            let mut from = 0;
+            while let Some(rel) = content[from..].find(&needle) {
+                let name_start = from + rel;
+                let open = name_start + fname.len(); // index of '('
+                from = name_start + 1;
 
-        for (idx, line) in lines.iter().enumerate() {
-            let trimmed = line.trim();
-
-            // Enter/track a #[cfg(test)] module region.
-            if test_region_depth.is_none() {
-                if trimmed.starts_with("#[cfg(test)]") {
-                    pending_cfg_test = true;
-                } else if pending_cfg_test && trimmed.contains("mod ") && line.contains('{') {
-                    test_region_depth = Some(depth);
-                    pending_cfg_test = false;
+                if !is_call_token(bytes, name_start) {
+                    continue;
                 }
-            }
-            let in_test_region = test_region_depth.is_some_and(|d| depth >= d);
-
-            // Update brace depth for the NEXT line.
-            let opens = line.matches('{').count() as i32;
-            let closes = line.matches('}').count() as i32;
-            let next_depth = depth + opens - closes;
-            if let Some(d) = test_region_depth {
-                if next_depth <= d {
-                    test_region_depth = None;
+                let line = line_of(&line_starts, name_start);
+                if test_lines.contains(&line) {
+                    continue;
                 }
-            }
-            depth = next_depth;
+                // Skip line-comment occurrences (`//` before the token).
+                let ls = line_starts[line - 1];
+                let prefix = &content[ls..name_start];
+                if prefix.contains("//") {
+                    continue;
+                }
+                // Skip the fn definitions themselves (`fn enqueue(`).
+                let ps = path_start(bytes, name_start);
+                let mut w = ps;
+                while w > 0 && bytes[w - 1].is_ascii_whitespace() {
+                    w -= 1;
+                }
+                let mut k = w;
+                while k > 0 && (bytes[k - 1].is_ascii_alphabetic() || bytes[k - 1] == b'_') {
+                    k -= 1;
+                }
+                if std::str::from_utf8(&bytes[k..w]).unwrap_or("") == "fn" {
+                    continue;
+                }
 
-            if in_test_region {
-                continue;
-            }
-            if !has_enqueue_call(line) {
-                continue;
-            }
+                let Some(close) = matching_paren(bytes, open) else {
+                    continue; // unbalanced (string edge) — don't false-flag
+                };
 
-            // Allow-listed: routed through persist_or_log! (the macro opener may
-            // be on this line or up to a few lines above for multi-line calls).
-            let guarded = (idx.saturating_sub(4)..=idx)
-                .any(|i| lines.get(i).is_some_and(|l| l.contains("persist_or_log!")));
-            if guarded {
-                continue;
-            }
-
-            // Legit handling: result is propagated or bound, not dropped.
-            //   `return <fn>(…)`, `<fn>(…)?`, `… = <fn>(…)` (incl `let x =`,
-            //   `if let Ok(_) = …`), `match <fn>(…)`.
-            let t = line.trim_start();
-            let propagated_or_bound = t.starts_with("return ")
-                || t.starts_with("match ")
-                || (t.contains("= ") && !t.contains("let _ ="))
-                || line.contains(")?")
-                || line.contains(").await?");
-            // Drop shapes we DO flag:
-            let let_underscore = t.contains("let _ =");
-            let ok_discard = line.contains(".ok()");
-            // Bare statement DROP: the line starts with the call path AND ends
-            // in `);` (the must_use Result discarded as a statement). A tail-
-            // expression `enqueue(…)` that RETURNS the Result ends in `)` with
-            // no `;`, so it is correctly excluded (it's propagation, not a drop).
-            // Multi-line bare-`;` drops are rare and additionally caught by
-            // rustc's `unused_must_use` under CI `-D warnings`.
-            let starts_with_call = ENQUEUE_FNS.iter().any(|f| {
-                t.starts_with(&format!("{f}("))
-                    || t.starts_with(&format!("crate::inbox::{f}("))
-                    || t.starts_with(&format!("inbox::{f}("))
-                    || t.starts_with(&format!("crate::inbox::storage::{f}("))
-                    || t.starts_with(&format!("storage::{f}("))
-                    || t.starts_with(&format!("crate::notification_queue::{f}("))
-                    || t.starts_with(&format!("notification_queue::{f}("))
-            });
-            let bare_stmt = starts_with_call && line.trim_end().ends_with(");");
-
-            let is_drop = let_underscore || ok_discard || (bare_stmt && !propagated_or_bound);
-            if is_drop {
-                violations.push(format!("{}:{}: {}", f.display(), idx + 1, line.trim()));
+                let lead = classify_lead(bytes, ps);
+                let is_drop = match lead {
+                    Lead::LetUnderscore => true,
+                    Lead::Allowed => false,
+                    Lead::Bare | Lead::Other => {
+                        matches!(classify_trail(bytes, close), Trail::DotOk)
+                            || (lead == Lead::Bare
+                                && matches!(classify_trail(bytes, close), Trail::Semicolon))
+                    }
+                };
+                if is_drop {
+                    let line_text = content.lines().nth(line - 1).unwrap_or("").trim();
+                    violations.push(format!("{}:{}: {}", f.display(), line, line_text));
+                }
             }
         }
     }
