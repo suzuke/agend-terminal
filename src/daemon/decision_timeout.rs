@@ -256,27 +256,37 @@ pub(crate) fn scan_and_emit(home: &Path) {
         if elapsed_secs <= d.timeout_secs {
             continue;
         }
-        // #1116: flock + re-read to serialize against concurrent mark_resolved
-        let _lock = match crate::store::acquire_file_lock(&decision_lock_path(home, &d.decision_id))
-        {
-            Ok(l) => l,
-            Err(_) => continue,
+        // #1116: flock + re-read to serialize against concurrent mark_resolved.
+        // #1629: do the RMW (re-read → flip status → write) UNDER the flock, then
+        // drop it and emit lock-free. emit_timeout_event self-IPCs (notify_system
+        // → enqueue_with_idle_hint → loopback api::call); it must never run while a
+        // flock is held (#1617 lock-while-blocking class). The emit reads no mutated
+        // field (status is not in the message), so flipping before emit is neutral.
+        let to_emit: Option<PendingDecision> = {
+            let _lock =
+                match crate::store::acquire_file_lock(&decision_lock_path(home, &d.decision_id)) {
+                    Ok(l) => l,
+                    Err(_) => continue,
+                };
+            let path = pending_path(home, &d.decision_id);
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let mut current: PendingDecision = match serde_json::from_str(&content) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            if current.status != "pending" {
+                continue;
+            }
+            current.status = "timeout".to_string();
+            let _ = write_decision(home, &current);
+            Some(current)
         };
-        let path = pending_path(home, &d.decision_id);
-        let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        let mut current: PendingDecision = match serde_json::from_str(&content) {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
-        if current.status != "pending" {
-            continue;
+        if let Some(current) = to_emit {
+            emit_timeout_event(home, &current, elapsed_secs);
         }
-        emit_timeout_event(home, &current, elapsed_secs);
-        current.status = "timeout".to_string();
-        let _ = write_decision(home, &current);
     }
 }
 
@@ -819,5 +829,54 @@ mod tests {
             "#1092 fix: no stale fire after resolve: {inbox:?}"
         );
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1629 invariant (#1617 lock-while-blocking class): `emit_timeout_event`
+    /// (self-IPC via notify_system → loopback api::call) must NEVER run while the
+    /// #1116 decision flock is held. The RMW happens inside the `let to_emit = {
+    /// ... }` flock block; the emit runs after the block (lock-free). Structural
+    /// source-scan: brace-match the to_emit block and assert the emit call is NOT
+    /// inside it and IS after. Needle is `concat`-built and the scan is
+    /// prod-sliced so this test can't self-satisfy.
+    #[test]
+    fn emit_timeout_not_called_under_flock() {
+        let src = include_str!("decision_timeout.rs");
+        let cfg_test = ["#[cfg(", "test)]"].concat();
+        let prod = match src.find(&cfg_test) {
+            Some(i) => &src[..i],
+            None => src,
+        };
+        let block_anchor = ["let to", "_emit"].concat();
+        let astart = prod
+            .find(&block_anchor)
+            .expect("to_emit flock block present");
+        let open_rel = prod[astart..].find('{').expect("flock block opens");
+        let block_start = astart + open_rel;
+        let mut depth = 0usize;
+        let mut block_end = block_start;
+        for (i, c) in prod[block_start..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        block_end = block_start + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(block_end > block_start, "flock block must close");
+        let emit_needle = ["emit_timeout", "_event("].concat();
+        let block_body = &prod[block_start..=block_end];
+        assert!(
+            !block_body.contains(&emit_needle),
+            "emit_timeout_event must NOT run inside the #1116 decision flock block (#1617 class)"
+        );
+        assert!(
+            prod[block_end..].contains(&emit_needle),
+            "emit_timeout_event must run AFTER the decision flock is dropped"
+        );
     }
 }
