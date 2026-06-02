@@ -78,6 +78,10 @@ pub fn scan_and_emit_with(
         // to release; the actual release runs after `with_pr_state` returns and
         // the flock is dropped (see below).
         let mut release_after_unlock: Option<String> = None;
+        // #1629: collect deferred inbox emits here under the flock; drain them
+        // AFTER `with_pr_state` returns so enqueue_with_idle_hint (self-IPC via
+        // loopback api::call) runs lock-free (#1617 lock-while-blocking class).
+        let mut pending_emits: Vec<(String, crate::inbox::InboxMessage)> = Vec::new();
         let result = with_pr_state(home, &repo, &branch, |state| {
             let mut dirty = false;
 
@@ -88,24 +92,27 @@ pub fn scan_and_emit_with(
                 let author = resolve_author(state);
                 let body = format_ready_body(state);
                 let msg = build_event_message("pr-ready-for-merge", &author, state, body);
-                if let Err(e) = crate::inbox::enqueue_with_idle_hint(home, &author, msg) {
-                    tracing::warn!(
-                        repo = %state.repo,
-                        branch = %state.branch,
-                        error = %e,
-                        "#972 pr_state: [pr-ready-for-merge] enqueue failed"
-                    );
-                } else {
-                    state.ready_emitted_for_sha = Some(state.head_sha.clone());
-                    dirty = true;
-                    tracing::info!(
-                        repo = %state.repo,
-                        branch = %state.branch,
-                        head = %state.head_sha,
-                        author = %author,
-                        "#972 pr_state: [pr-ready-for-merge] emitted"
-                    );
-                }
+                // #1629: defer the enqueue (see top of fn). Set the dedup flag
+                // optimistically under the flock. NOTE: this is a behavior change
+                // for the pr-ready arm — previously the flag was set only on
+                // enqueue success, so a failed enqueue retried next scan. Now a
+                // post-unlock enqueue failure leaves the flag already set → next
+                // scan skips → the pr-ready signal is lost (warn-logged at the
+                // drain, not silent) until head_sha changes. The flag IS the dedup
+                // ledger; it suppresses re-emit, it does not back-stop. Accepted:
+                // enqueue failure is near-zero (local inbox write), this matches
+                // the Merged/ClosedUnmerged arms, and the flock-free emit prevents
+                // the #1617 deadlock.
+                state.ready_emitted_for_sha = Some(state.head_sha.clone());
+                dirty = true;
+                tracing::info!(
+                    repo = %state.repo,
+                    branch = %state.branch,
+                    head = %state.head_sha,
+                    author = %author,
+                    "#972 pr_state: [pr-ready-for-merge] queued (emit after flock drop)"
+                );
+                pending_emits.push((author, msg));
             }
 
             // Terminal-state sweep.
@@ -134,11 +141,10 @@ pub fn scan_and_emit_with(
                             &merge_commit[..8.min(merge_commit.len())],
                             merged_at,
                         );
-                        let _ = crate::inbox::enqueue_with_idle_hint(
-                            home,
-                            &author,
-                            build_event_message("pr-merged", &author, state, body),
-                        );
+                        // #1629: defer the enqueue (see top of fn) — run lock-free
+                        // after the flock drops.
+                        let msg = build_event_message("pr-merged", &author, state, body);
+                        pending_emits.push((author, msg));
                         state.ready_emitted_for_sha = Some(state.head_sha.clone());
                         dirty = true;
                     } else {
@@ -162,11 +168,10 @@ pub fn scan_and_emit_with(
                              3. Report to lead with context",
                             state.repo, state.branch, closed_at, state.branch,
                         );
-                        let _ = crate::inbox::enqueue_with_idle_hint(
-                            home,
-                            &author,
-                            build_event_message("pr-closed-unmerged", &author, state, body),
-                        );
+                        // #1629: defer the enqueue (see top of fn) — run lock-free
+                        // after the flock drops.
+                        let msg = build_event_message("pr-closed-unmerged", &author, state, body);
+                        pending_emits.push((author, msg));
                         state.ready_emitted_for_sha = Some(state.head_sha.clone());
                         dirty = true;
                     } else {
@@ -188,6 +193,20 @@ pub fn scan_and_emit_with(
                 ScanAction::None
             }
         });
+
+        // #1629 (#1617 class): PR-state flock is now released — drain the deferred
+        // inbox emits lock-free (enqueue_with_idle_hint self-IPCs via loopback
+        // api::call). Emit BEFORE auto_release to preserve the prior
+        // under-flock-emit → post-unlock-release ordering.
+        for (author, msg) in pending_emits {
+            if let Err(e) = crate::inbox::enqueue_with_idle_hint(home, &author, msg) {
+                tracing::warn!(
+                    author = %author,
+                    error = %e,
+                    "#1629 pr_state: deferred emit enqueue failed"
+                );
+            }
+        }
 
         // #bughunt3 (#1617 class): PR-state flock is now released — run the
         // auto-release (git subprocess + nested binding flock) lock-free.
@@ -489,6 +508,58 @@ mod tests {
         assert!(
             prod[block_end..].contains(&release_needle),
             "auto_release_for_merged_branch must run AFTER the PR-state flock is dropped"
+        );
+    }
+
+    /// #1629 invariant (#1617 lock-while-blocking class): the inbox emit
+    /// (`enqueue_with_idle_hint` → loopback `api::call`) must NEVER run inside
+    /// the `with_pr_state` closure, which holds the PR-state flock. The emits are
+    /// collected under the flock and drained after it drops. Same structural
+    /// source-scan as the auto_release invariant above: brace-match the closure
+    /// body and assert `enqueue_with_idle_hint` is NOT inside it and IS called
+    /// after. Needle is `concat`-built and the scan is prod-sliced so this test
+    /// can't self-satisfy.
+    #[test]
+    fn deferred_emit_not_called_under_pr_state_flock() {
+        let src = include_str!("scanner.rs");
+        let cfg_test = ["#[cfg(", "test)]"].concat();
+        let prod = match src.find(&cfg_test) {
+            Some(i) => &src[..i],
+            None => src,
+        };
+
+        let closure_needle = [", |state|", " {"].concat();
+        let cstart = prod
+            .find(&closure_needle)
+            .expect("with_pr_state closure present");
+        let open_rel = prod[cstart..].find('{').expect("closure block opens");
+        let block_start = cstart + open_rel;
+        let mut depth = 0usize;
+        let mut block_end = block_start;
+        for (i, c) in prod[block_start..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        block_end = block_start + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(block_end > block_start, "closure block must close");
+
+        let emit_needle = ["enqueue_with", "_idle_hint"].concat();
+        let closure_body = &prod[block_start..=block_end];
+        assert!(
+            !closure_body.contains(&emit_needle),
+            "enqueue_with_idle_hint must NOT run inside the with_pr_state closure (under the PR-state flock — #1617 class)"
+        );
+        assert!(
+            prod[block_end..].contains(&emit_needle),
+            "enqueue_with_idle_hint must run AFTER the PR-state flock is dropped (deferred drain)"
         );
     }
 }
