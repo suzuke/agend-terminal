@@ -472,6 +472,22 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
             }
         }
 
+        // #1666 Phase A: reviewer-evidence gate. Only fires on actual verdict
+        // reports (summary STARTS WITH VERIFIED/REJECTED/UNVERIFIED — §3.12
+        // convention, so non-verdict reports are never touched). VERIFIED/
+        // REJECTED must carry an evidence token; UNVERIFIED is exempt. Scans
+        // summary + artifacts (evidence may live in either) and reuses the
+        // sha_gate reject path (`json!({"error"})` → back to the reviewer).
+        if let Some(verdict) = super::evidence_gate::detect_verdict(summary) {
+            let evidence_body = match args["artifacts"].as_str() {
+                Some(a) => format!("{summary}\n{a}"),
+                None => summary.to_string(),
+            };
+            if let Err(e) = super::evidence_gate::check_evidence_gate(&evidence_body, verdict) {
+                return json!({"error": e});
+            }
+        }
+
         match crate::api::call(
             home,
             &json!({
