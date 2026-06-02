@@ -1,10 +1,22 @@
 //! #1629 invariant: `store::acquire_file_lock` (src/store.rs) must be the SOLE
 //! flock chokepoint that bumps `FLOCK_DEPTH` — the thread-local the self-IPC
 //! deadlock guard (`assert_no_registry_lock_for_self_ipc`) reads to see the
-//! fs4-flock tier. Any RAW `fs4::FileExt::lock` / `fs4::FileExt::try_lock`
-//! OUTSIDE the three vetted files bypasses FLOCK_DEPTH and silently reopens the
-//! flock-while-blocking deadlock blind spot (#1617/#1342/#1340/#1624) this guard
-//! closes. This RED fails CI if a new raw flock site appears.
+//! fs4-flock tier. Any RAW fs4 flock OUTSIDE the three vetted files bypasses
+//! FLOCK_DEPTH and silently reopens the flock-while-blocking deadlock blind spot
+//! (#1617/#1342/#1340/#1624) this guard closes. This RED fails CI if a new raw
+//! flock site appears.
+//!
+//! A raw flock has TWO call forms, BOTH caught:
+//!  1. fully-qualified UFCS — `fs4::FileExt::try_lock(&file)` (works with no
+//!     import), matched by the `FileExt::<method>(` needle; and
+//!  2. imported-trait method — `use fs4::FileExt; file.try_lock()` (codex's
+//!     #1635 review probe), matched by the `.<method>(` needle BUT only in files
+//!     that actually import the fs4 `FileExt` trait (a `use … fs4 … FileExt`
+//!     line). That gate is the disambiguation from `Mutex::lock()`/
+//!     `RwLock::lock()`: `.lock(`/`.try_lock(` are ambiguous, so they are only
+//!     flagged where the fs4 trait is in scope — `Mutex::lock()` in a non-fs4
+//!     file never false-FAILs. (`src/inbox/disk.rs` imports `fs4::available_space`
+//!     but NOT `FileExt`, so it is correctly NOT gated on.)
 //!
 //! The three allowed files:
 //! - `store.rs` — `acquire_file_lock` itself (the chokepoint) + its tests.
@@ -14,6 +26,62 @@
 //! - `daemon/mod.rs` — the escape-hatch `run` `.daemon.lock` singleton.
 
 use std::path::{Path, PathBuf};
+
+const ALLOWED: [&str; 3] = ["store.rs", "bootstrap/mod.rs", "daemon/mod.rs"];
+
+/// fs4 `FileExt` method names that take/release an advisory lock. `lock` /
+/// `try_lock` are the exclusive aliases the codebase uses; the `_shared` /
+/// `_exclusive` variants are included for forward-coverage.
+const FLOCK_METHODS: [&str; 6] = [
+    "lock",
+    "try_lock",
+    "lock_shared",
+    "try_lock_shared",
+    "lock_exclusive",
+    "try_lock_exclusive",
+];
+
+/// Does this file import the fs4 `FileExt` trait (so `file.try_lock()` method
+/// syntax resolves to an fs4 flock)? Checked on `use` lines only, so a comment
+/// mentioning the trait does not flip the gate.
+fn imports_fs4_fileext(text: &str) -> bool {
+    text.lines().any(|l| {
+        let t = l.trim_start();
+        t.starts_with("use ") && t.contains("fs4") && t.contains("FileExt")
+    })
+}
+
+/// Return the raw-flock violations in `text` (empty for allowlisted files or
+/// clean files). Pure + path-string-driven so the meta-test can probe both
+/// directions without touching the filesystem.
+fn scan_file(rel: &str, text: &str) -> Vec<String> {
+    if ALLOWED.contains(&rel) {
+        return Vec::new();
+    }
+    let gated = imports_fs4_fileext(text);
+    let mut violations = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let t = line.trim_start();
+        if t.starts_with("//") || t.starts_with('*') {
+            continue; // skip comment/doc lines that merely mention the pattern
+        }
+        for m in &FLOCK_METHODS {
+            // Form 1: fully-qualified UFCS, e.g. `fs4::FileExt::try_lock(` or
+            // `fs4::fs_std::FileExt::try_lock(`. `FileExt::` is fs4-specific
+            // (std's unix FileExt has no lock methods), so no import is needed.
+            if line.contains(&format!("FileExt::{m}(")) {
+                violations.push(format!("{}:{}: {}", rel, i + 1, line.trim()));
+            }
+            // Form 2: imported-trait method call, e.g. `file.try_lock(` — only
+            // an fs4 flock when the file imports the FileExt trait (else it is
+            // Mutex/RwLock and must NOT false-FAIL).
+            if gated && line.contains(&format!(".{m}(")) {
+                violations.push(format!("{}:{}: {}", rel, i + 1, line.trim()));
+            }
+        }
+    }
+    violations
+}
 
 fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).expect("read_dir src") {
@@ -33,12 +101,6 @@ fn acquire_file_lock_is_sole_flock_depth_bumper_1629() {
     collect_rs(&src, &mut files);
     assert!(!files.is_empty(), "no src/*.rs files found");
 
-    // The 3 vetted files allowed to contain a raw fs4 flock call. store.rs is the
-    // chokepoint; the other two are the daemon-singleton `.daemon.lock` sites
-    // that deliberately bypass FLOCK_DEPTH (held for the daemon's whole life).
-    let allowed = ["store.rs", "bootstrap/mod.rs", "daemon/mod.rs"];
-
-    let needles = ["fs4::FileExt::lock", "fs4::FileExt::try_lock"];
     let mut violations = Vec::new();
     for file in &files {
         let rel = file
@@ -46,30 +108,59 @@ fn acquire_file_lock_is_sole_flock_depth_bumper_1629() {
             .unwrap_or(file)
             .to_string_lossy()
             .replace('\\', "/");
-        if allowed.contains(&rel.as_str()) {
-            continue;
-        }
         let text = std::fs::read_to_string(file).expect("read src file");
-        for (i, line) in text.lines().enumerate() {
-            let t = line.trim_start();
-            if t.starts_with("//") || t.starts_with('*') {
-                continue; // skip comment/doc lines that merely mention the pattern
-            }
-            for needle in &needles {
-                if line.contains(needle) {
-                    violations.push(format!("{}:{}: {}", rel, i + 1, line.trim()));
-                }
-            }
-        }
+        violations.extend(scan_file(&rel, &text));
     }
 
     assert!(
         violations.is_empty(),
-        "#1629: raw `fs4::FileExt::{{lock,try_lock}}` outside the 3 vetted files bypasses \
+        "#1629: a raw fs4 flock outside the 3 vetted files bypasses \
          store::acquire_file_lock's FLOCK_DEPTH tracking → reopens the flock-while-blocking \
          self-IPC deadlock blind spot (#1617 class). Route the lock through \
          `crate::store::acquire_file_lock` instead; or — if it is a deliberate lifetime-held \
          singleton like `.daemon.lock` — add its file to the allowlist with rationale:\n{}",
         violations.join("\n")
+    );
+}
+
+/// Meta-test: prove the scanner catches BOTH raw-flock forms and does NOT
+/// false-FAIL on `Mutex::lock()`. Guards against the #1635 too-narrow-detection
+/// regression (the original only matched the fully-qualified string and missed
+/// `use fs4::FileExt; file.try_lock()`).
+#[test]
+fn scanner_catches_both_forms_and_spares_mutex() {
+    // codex's exact probe: imported-trait method call, non-allowlisted file.
+    let method_probe = "use fs4::FileExt;\nfn f(file: std::fs::File) { let _ = file.try_lock(); }";
+    assert!(
+        !scan_file("some/new_probe.rs", method_probe).is_empty(),
+        "must catch the imported-trait `file.try_lock()` flock form (#1635 hole)"
+    );
+
+    // Fully-qualified UFCS form, non-allowlisted file (no import needed).
+    let ufcs_probe = "fn f(file: std::fs::File) { let _ = fs4::FileExt::try_lock(&file); }";
+    assert!(
+        !scan_file("some/new_probe.rs", ufcs_probe).is_empty(),
+        "must catch the fully-qualified `fs4::FileExt::try_lock(` flock form"
+    );
+
+    // Legit Mutex::lock() in a non-fs4 file → must NOT false-FAIL.
+    let mutex = "use parking_lot::Mutex;\nfn f(m: &Mutex<u8>) { let _g = m.lock(); }";
+    assert!(
+        scan_file("some/other.rs", mutex).is_empty(),
+        "must NOT flag Mutex::lock() in a non-fs4 file"
+    );
+
+    // fs4 disk-space import without FileExt → not gated; a `.lock()` here is
+    // necessarily non-fs4 and must NOT false-FAIL (mirrors src/inbox/disk.rs).
+    let disk = "use fs4::available_space;\nfn f(m: &std::sync::Mutex<u8>) { let _g = m.lock(); }";
+    assert!(
+        scan_file("inbox/disk.rs", disk).is_empty(),
+        "fs4::available_space (no FileExt) must not gate the method check on"
+    );
+
+    // The 3 vetted files are exempt even with raw fs4 flock usage.
+    assert!(
+        scan_file("store.rs", method_probe).is_empty(),
+        "allowlisted files are exempt"
     );
 }
