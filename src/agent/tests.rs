@@ -173,20 +173,34 @@ fn sweep_child_tree_kills_grandchild_via_process_group() {
 /// reproduce — the CI runner's slower scheduler is what exposes
 /// the write/flush gap. Marked `#[cfg(unix)]` because the body
 /// uses sh + sleep.
-#[test]
 #[cfg(unix)]
+#[test]
+/// #1673: the raw 8×6=48 concurrent PTYs would exhaust the CI runner's PTY pool
+/// under load (intermittent `openpty: Device not configured`). Serialize only the
+/// PTY-allocating body with a shared gate so the runner never holds >1 PTY at a
+/// time; the test still exercises the full assertion set (48 kill paths), and 8
+/// threads still run concurrently for everything outside the PTY window.
+/// Re-exhaustion is structurally impossible — one PTY at a time, indefinitely.
 fn sweep_child_tree_kills_grandchild_concurrent_stress() {
+    let gate = std::sync::Arc::new(std::sync::Mutex::new(()));
     let handles: Vec<_> = (0..8)
-        .map(|tid| {
-            std::thread::spawn(move || {
-                for i in 0..6 {
-                    let path = std::env::temp_dir().join(format!(
-                        "agend-sweep-stress-{}-{tid}-{i}.pid",
-                        std::process::id()
-                    ));
-                    sweep_child_tree_body(&path);
-                }
-            })
+        .map({
+            let gate = Arc::clone(&gate);
+            move |tid| {
+                std::thread::spawn({
+                    let gate = Arc::clone(&gate);
+                    move || {
+                        for i in 0..6 {
+                            let path = std::env::temp_dir().join(format!(
+                                "agend-sweep-stress-{}-{tid}-{i}.pid",
+                                std::process::id()
+                            ));
+                            let _guard = gate.lock().expect("PTY gate poisoned");
+                            sweep_child_tree_body(&path);
+                        }
+                    }
+                })
+            }
         })
         .collect();
     for h in handles {
