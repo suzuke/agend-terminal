@@ -749,6 +749,37 @@ impl StatePatterns {
         self.detect_with_match(text).map(|(s, _)| s)
     }
 
+    /// #8 Phase 2 VALIDATION seam: compile a raw `(state, regex)` list exactly as
+    /// `compile_for` does — lets the parity harness compile a `BackendProfile`'s
+    /// patterns and run detection against them for a corpus cross-check.
+    #[cfg(test)]
+    #[allow(clippy::unwrap_used)]
+    pub(crate) fn from_raw_patterns(raw: &[(AgentState, &'static str)]) -> Self {
+        let compiled = raw
+            .iter()
+            .map(|(state, pat)| {
+                let re = Regex::new(pat)
+                    .unwrap_or_else(|e| panic!("BUG: invalid state regex {pat:?}: {e}"));
+                (*state, re)
+            })
+            .collect();
+        Self { patterns: compiled }
+    }
+
+    /// #8 Phase 2 VALIDATION seam: the compiled patterns as `(state, regex
+    /// source string)` pairs, in priority order. Equality of this with another
+    /// backend's raw pattern list is COMPLETE proof of detection parity
+    /// (identical regex strings, order, and states ⟹ identical compiled
+    /// detection) — stronger than a corpus sample. Used by
+    /// `crate::backend_profile`'s parity harness.
+    #[cfg(test)]
+    pub(crate) fn pattern_sources(&self) -> Vec<(AgentState, String)> {
+        self.patterns
+            .iter()
+            .map(|(state, re)| (*state, re.as_str().to_string()))
+            .collect()
+    }
+
     /// #919/#1450: detect + return the matched substring so callers can
     /// locate the phrase's rendered grid cells and check their foreground
     /// color (#1450 replaced the raw-byte SGR ring with VTerm cell color).

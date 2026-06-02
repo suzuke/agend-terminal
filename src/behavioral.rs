@@ -332,7 +332,10 @@ pub enum MarkerCacheId {
 /// Generic structural anchors. File save banners + Claude-shape tool
 /// completion (kept here for Shell/Raw fallback). Each per-backend MARKERS
 /// const includes these three save-banner anchors via explicit duplication.
-const GENERIC_PRODUCTIVE_MARKERS: &[&str] = &[
+// #8 Phase 2: pub(crate) so the co-located BackendProfile (crate::backend_profile)
+// can reference these markers when bundling a backend's ProductivityConfig. The
+// arrays + their LazyLock compilation stay here (the profile holds &'static refs).
+pub(crate) const GENERIC_PRODUCTIVE_MARKERS: &[&str] = &[
     r"^Saved to \S+",
     r"^Wrote \d+ bytes",
     r"^Created file: \S+",
@@ -373,7 +376,7 @@ const CODEX_PRODUCTIVE_MARKERS: &[&str] = &[
 /// Gemini: generic anchors + `✓` completion glyph with Gemini CamelCase
 /// tool-name vocabulary. Excludes `tool.*call` / `MCP.*tool` literals
 /// (heartbeat path already covers MCP — avoid double-counting).
-const GEMINI_PRODUCTIVE_MARKERS: &[&str] = &[
+pub(crate) const GEMINI_PRODUCTIVE_MARKERS: &[&str] = &[
     r"^Saved to \S+",
     r"^Wrote \d+ bytes",
     r"^Created file: \S+",

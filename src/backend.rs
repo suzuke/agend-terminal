@@ -1162,6 +1162,10 @@ pub trait BackendBehavior {
     /// Whether state detection anchors on a red-rendered line (#1450). Delegates
     /// to [`Backend::should_anchor_on_red`].
     fn should_anchor_on_red(&self) -> bool;
+    /// #8 Phase 2: the co-located [`crate::backend_profile::BackendProfile`] for
+    /// this backend, or `None` while it's still on the legacy match path. The
+    /// Phase-2 seam — the migration train routes migrated backends through this.
+    fn profile(&self) -> Option<&'static crate::backend_profile::BackendProfile>;
 }
 
 impl BackendBehavior for Backend {
@@ -1176,6 +1180,9 @@ impl BackendBehavior for Backend {
     }
     fn should_anchor_on_red(&self) -> bool {
         Backend::should_anchor_on_red(self)
+    }
+    fn profile(&self) -> Option<&'static crate::backend_profile::BackendProfile> {
+        crate::backend_profile::profile(self)
     }
 }
 
