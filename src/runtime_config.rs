@@ -7,6 +7,7 @@
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 /// Runtime-mutable configuration values.
@@ -67,6 +68,12 @@ impl Default for RuntimeConfig {
 
 static RUNTIME_CONFIG: OnceLock<RwLock<RuntimeConfig>> = OnceLock::new();
 
+/// #1576: false until the first `reload()` — startup (no last-known-good →
+/// missing/corrupt falls back to the safe DEFAULT) vs runtime (keep last-good).
+static INITIALIZED: AtomicBool = AtomicBool::new(false);
+/// #1576: de-dupes the corrupt-config warning across 10s ticks.
+static CORRUPT_WARNED: AtomicBool = AtomicBool::new(false);
+
 fn global() -> &'static RwLock<RuntimeConfig> {
     RUNTIME_CONFIG.get_or_init(|| RwLock::new(RuntimeConfig::default()))
 }
@@ -77,13 +84,57 @@ pub fn get() -> RuntimeConfig {
 }
 
 /// Reload config from disk. Called each daemon tick.
+///
+/// #1576 — fail-closed (no HMAC; runtime-config isn't an authority gate, so per
+/// the single-user threat model it gets the footgun fix only, not a signature):
+/// a corrupt or vanished file must NOT silently revert to defaults mid-run,
+/// because the default flips watchdog/recovery gates and could silence alerts an
+/// injected agent would want silenced. Disposition:
+/// - valid → load it (clears the warn latch);
+/// - corrupt/missing at STARTUP → the safe `Default` (watchdogs ON);
+/// - corrupt/missing at RUNTIME → KEEP the last-known-good already in `global()`.
 pub fn reload(home: &Path) {
+    let is_startup = !INITIALIZED.swap(true, Ordering::SeqCst);
     let path = home.join("runtime-config.json");
-    let config = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|c| serde_json::from_str::<RuntimeConfig>(&c).ok())
-        .unwrap_or_default();
-    *global().write() = config;
+    match std::fs::read_to_string(&path) {
+        Ok(c) => match serde_json::from_str::<RuntimeConfig>(&c) {
+            Ok(config) => {
+                *global().write() = config;
+                CORRUPT_WARNED.store(false, Ordering::Relaxed);
+            }
+            Err(e) => fail_closed(is_startup, &format!("unparseable: {e}")),
+        },
+        Err(_) if is_startup => {
+            // No file on first load = fresh install → safe defaults.
+            *global().write() = RuntimeConfig::default();
+        }
+        Err(_) => {
+            // Vanished at runtime — keep last-known-good rather than resetting.
+            fail_closed(false, "runtime-config.json disappeared");
+        }
+    }
+}
+
+/// #1576: on a corrupt/missing config, fall back safely. At startup adopt the
+/// `Default` (watchdogs ON); at runtime keep the last-known-good (do not touch
+/// `global()`). Warns once per episode either way.
+fn fail_closed(is_startup: bool, reason: &str) {
+    if is_startup {
+        *global().write() = RuntimeConfig::default();
+    }
+    if !CORRUPT_WARNED.swap(true, Ordering::Relaxed) {
+        let disposition = if is_startup {
+            "using safe defaults (watchdogs enabled)"
+        } else {
+            "keeping last-known-good config"
+        };
+        tracing::warn!(
+            reason,
+            disposition,
+            "#1576: runtime-config.json failed to load — {disposition}; not reverting \
+             to defaults mid-run (a corrupt config must not silently disable watchdogs)."
+        );
+    }
 }
 
 /// Set a single config key and persist to disk.
