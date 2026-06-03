@@ -306,6 +306,39 @@ fn prepare_poll_context(
     })
 }
 
+/// #1705 (codex REJECT fix): on a repo-level batch ApiError, the rate-limit backoff
+/// must cover EVERY watch of the repo — including watches that
+/// `prepare_poll_context` skipped this tick (NotDue / already RateLimited) and so
+/// never entered the `by_repo` eligible slice. Re-enumerate the repo's watch files
+/// on disk and stamp `rate_limit_until` on each, so a later-due watch honours the
+/// repo-wide stall instead of polling per-branch. ApiError is rare (rate-limit), so
+/// the dir scan here is acceptable. Non-watch files (e.g. `.stall` sidecars) fail
+/// the `WatchState` parse and are skipped.
+fn stamp_repo_backoff(home: &Path, repo: &str, reset_epoch: u64) {
+    let Ok(entries) = std::fs::read_dir(ci_watches_dir(home)) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(mut watch) = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|c| serde_json::from_str::<WatchState>(&c).ok())
+        else {
+            continue;
+        };
+        if watch.repo != repo {
+            continue;
+        }
+        watch.rate_limit_until = Some(reset_epoch);
+        let _ = crate::store::atomic_write(
+            &path,
+            serde_json::to_string_pretty(&watch)
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+    }
+}
+
 /// Inner implementation that accepts a provider factory for testability.
 /// #1705 testable seam: one repo-level batch poll → pre-populate the per-tick
 /// cache so the subsequent per-watch `ci_check_repo` calls hit the cache instead
@@ -378,16 +411,14 @@ async fn batch_prefill_repo(
                 display_timezone,
             );
             if let Some(reset) = rate_limit_reset {
-                for (path, ctx) in watches {
-                    let mut w = ctx.stamped_watch.clone();
-                    w.rate_limit_until = Some(reset);
-                    let _ = crate::store::atomic_write(
-                        path,
-                        serde_json::to_string_pretty(&w)
-                            .unwrap_or_default()
-                            .as_bytes(),
-                    );
-                }
+                // Stamp EVERY watch of the repo — not just the eligible `watches`
+                // slice. `by_repo` only holds watches that passed
+                // `prepare_poll_context`; NotDue / already-RateLimited watches were
+                // skipped and never entered the slice. If they don't get the repo
+                // backoff stamp, they wake when due and poll per-branch in defiance
+                // of the repo-wide stall — re-introducing the per-branch API calls
+                // #1705 removes. (codex REJECT fix.)
+                stamp_repo_backoff(home, repo, reset);
             }
             tracing::warn!(repo = %repo, message = %message, "CI batch poll API error; repo backing off");
             false

@@ -3408,6 +3408,73 @@ fn batch_apierror_backs_off_repo_and_skips_fan_out() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+#[test]
+fn batch_apierror_backs_off_all_repo_watches_including_skipped() {
+    // codex REJECT regression: the repo backoff must cover watches that
+    // prepare_poll_context skipped this tick (NotDue / RateLimited) and never
+    // entered the eligible `watches` slice. feat-a is in the slice; feat-b exists
+    // on disk but is NOT in the slice (simulating a NotDue skip). Both must get
+    // rate_limit_until so feat-b honours the repo-wide stall instead of waking up
+    // and polling per-branch.
+    let home = p05_temp_home("p1705_apierr_repowide");
+    let reset = (chrono::Utc::now().timestamp() as u64) + 3600;
+    let path_a = p05_write_watch(
+        &home,
+        "o/r",
+        "feat-a",
+        serde_json::json!({
+            "repo": "o/r", "branch": "feat-a", "head_sha": "aaa",
+            "subscribers": [{"instance": "lead", "subscribed_at": "2026-01-01T00:00:00Z"}],
+        }),
+    );
+    let path_b = p05_write_watch(
+        &home,
+        "o/r",
+        "feat-b",
+        serde_json::json!({
+            "repo": "o/r", "branch": "feat-b", "head_sha": "bbb",
+            "subscribers": [{"instance": "lead", "subscribed_at": "2026-01-01T00:00:00Z"}],
+        }),
+    );
+    // Only feat-a is in the eligible slice handed to batch_prefill_repo.
+    let watch_a: WatchState =
+        serde_json::from_str(&std::fs::read_to_string(&path_a).unwrap()).unwrap();
+    let watches = vec![(
+        path_a.clone(),
+        super::PollContext {
+            repo: "o/r".to_string(),
+            subscribers: vec!["lead".to_string()],
+            stamped_watch: watch_a,
+        },
+    )];
+    let provider = BatchErrProvider { reset: Some(reset) };
+    let cache = new_tick_cache();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let proceed = rt.block_on(async {
+        super::batch_prefill_repo(
+            &home,
+            "o/r",
+            &watches,
+            &cache,
+            &provider,
+            &["lead".to_string()],
+            None,
+        )
+        .await
+    });
+    assert!(!proceed, "ApiError must skip the fan-out");
+    for (label, path) in [("eligible feat-a", &path_a), ("skipped feat-b", &path_b)] {
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(
+            v["rate_limit_until"].as_u64(),
+            Some(reset),
+            "{label} must receive the repo-wide backoff stamp"
+        );
+    }
+    std::fs::remove_dir_all(&home).ok();
+}
+
 // ── Sprint 54 Hotfix F gap: malformed GitHub head query ─────────────
 //
 // Per RCA m-46: `check_pr_terminal` was sending bare `head=feat/foo`
