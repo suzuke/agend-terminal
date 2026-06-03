@@ -460,7 +460,7 @@ fn scan_dev_vantage(
         if task_info == "(no active task)" && task_board_is_active(home) {
             continue;
         }
-        emit_idle_alert(
+        route_idle_alert(
             home,
             &dev_idle_recipient(),
             "dev_idle_watchdog",
@@ -661,7 +661,7 @@ fn scan_fleet_vantage(
         .max()
         .unwrap_or(0);
     let agent_list: Vec<&str> = pairs.iter().map(|(n, _)| n.as_str()).collect();
-    emit_idle_alert(
+    route_idle_alert(
         home,
         &fleet_idle_recipient(),
         "fleet_idle_watchdog",
@@ -730,6 +730,51 @@ fn emit_idle_alert(
     } else {
         tracing::info!(recipient, kind, "idle_watchdog: emitted inbox alert");
     }
+}
+
+/// #event-bus pattern #6 (Option A): gate-ON → emit `IdleAlert` (the subscriber
+/// delivers via `emit_idle_alert`); gate-OFF (prod default) → the legacy direct
+/// `emit_idle_alert`. No double-delivery, no gate-off regression. The recipient
+/// is already resolved by the caller, so the legacy and bus paths deliver
+/// identically. The legacy `else` is retired only at the final cutover.
+fn route_idle_alert(
+    home: &Path,
+    recipient: &str,
+    kind: &str,
+    text: &str,
+    correlation_agent: Option<&str>,
+) {
+    let bus = crate::daemon::event_bus::global();
+    if bus.is_enabled() {
+        bus.emit(crate::daemon::event_bus::EventKind::IdleAlert {
+            recipient: recipient.to_string(),
+            kind: kind.to_string(),
+            text: text.to_string(),
+            correlation_agent: correlation_agent.map(String::from),
+        });
+    } else {
+        emit_idle_alert(home, recipient, kind, text, correlation_agent);
+    }
+}
+
+/// #event-bus pattern #6: bus subscriber — deliver on an `IdleAlert` event (the
+/// gate-ON path) via the shared `emit_idle_alert`. Registered once at daemon startup.
+fn handle_event(home: &Path, event: &crate::daemon::event_bus::Event) {
+    if let crate::daemon::event_bus::EventKind::IdleAlert {
+        recipient,
+        kind,
+        text,
+        correlation_agent,
+    } = &event.kind
+    {
+        emit_idle_alert(home, recipient, kind, text, correlation_agent.as_deref());
+    }
+}
+
+/// #event-bus pattern #6: register the idle_watchdog delivery subscriber on the
+/// global bus. Call ONCE at daemon startup. Dormant while the bus is gate-off.
+pub fn register_subscriber(home: std::path::PathBuf) {
+    crate::daemon::event_bus::global().subscribe(move |e| handle_event(&home, e));
 }
 
 #[cfg(test)]
@@ -1794,6 +1839,75 @@ mod tests {
             "alert must include current task title: {}",
             lead[0].text
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // #event-bus pattern #6: the (from, kind, text, correlation_id) tuple a
+    // drained alert carries — id/timestamp ignored so legacy-vs-bus compares clean.
+    fn alert_payloads(
+        home: &Path,
+        recipient: &str,
+    ) -> Vec<(String, Option<String>, String, Option<String>)> {
+        crate::inbox::drain(home, recipient)
+            .into_iter()
+            .map(|m| (m.from, m.kind, m.text, m.correlation_id))
+            .collect()
+    }
+
+    // gate-ON: emit(IdleAlert)→subscriber re-delivers BYTE-IDENTICALLY to the
+    // legacy `emit_idle_alert` direct enqueue.
+    #[test]
+    fn gate_on_emit_subscriber_matches_legacy_idle_alert() {
+        let recipient = "general";
+        let kind = "fleet_idle_watchdog";
+        let text = "fleet idle 1800s; all agents quiescent";
+        let corr = Some("fixup-dev");
+
+        let home_legacy = tmp_home("p6-parity-legacy");
+        emit_idle_alert(&home_legacy, recipient, kind, text, corr);
+
+        let home_bus = tmp_home("p6-parity-bus");
+        let bus = crate::daemon::event_bus::EventBus::new_enabled_for_test();
+        let h = home_bus.clone();
+        bus.subscribe(move |e| handle_event(&h, e));
+        bus.emit(crate::daemon::event_bus::EventKind::IdleAlert {
+            recipient: recipient.to_string(),
+            kind: kind.to_string(),
+            text: text.to_string(),
+            correlation_agent: corr.map(String::from),
+        });
+
+        let legacy = alert_payloads(&home_legacy, recipient);
+        let via_bus = alert_payloads(&home_bus, recipient);
+        assert!(!legacy.is_empty(), "legacy alert must fire");
+        assert_eq!(
+            legacy, via_bus,
+            "bus delivery must match legacy byte-for-byte"
+        );
+
+        std::fs::remove_dir_all(&home_legacy).ok();
+        std::fs::remove_dir_all(&home_bus).ok();
+    }
+
+    // gate-OFF (default): route_idle_alert falls through to the legacy deliver,
+    // so the alert still lands without the bus.
+    #[test]
+    fn gate_off_route_idle_alert_delivers_via_legacy() {
+        assert!(
+            !crate::daemon::event_bus::global().is_enabled(),
+            "test must run with AGEND_EVENT_BUS gate off"
+        );
+        let home = tmp_home("p6-gate-off");
+        route_idle_alert(
+            &home,
+            "general",
+            "fleet_idle_watchdog",
+            "fleet idle 1800s",
+            None,
+        );
+        let alerts = alert_payloads(&home, "general");
+        assert_eq!(alerts.len(), 1, "gate-off must deliver via legacy path");
+        assert_eq!(alerts[0].1.as_deref(), Some("fleet_idle_watchdog"));
         std::fs::remove_dir_all(&home).ok();
     }
 }
