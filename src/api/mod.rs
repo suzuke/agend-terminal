@@ -650,7 +650,9 @@ fn spawn_one(
     // Sprint 34: clear stale metadata from a previous instance with the
     // same name. spawn_one is the true choke point — both handle_spawn
     // (direct) and team.rs (team-spawn) flow through here.
-    let _ = std::fs::remove_file(home.join("metadata").join(format!("{name}.json")));
+    // #1682: clear BOTH the legacy name file and the id-resolved file — post-#1680
+    // readers use `<uuid>.json`, which the old name-only remove left stale.
+    crate::agent_ops::remove_metadata(home, name);
     let preset_submit_key = crate::backend::Backend::from_command(backend)
         .map(|b| b.preset().submit_key)
         .unwrap_or("\r");

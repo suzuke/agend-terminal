@@ -393,36 +393,36 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
     // Append to pending_pickup_ids array so multi-message bursts each
     // get a ✅ confirmation on inbox drain (F2 fix).
     {
-        let meta_path = home.join("metadata").join(format!("{instance_name}.json"));
-        let mut meta: serde_json::Value = std::fs::read_to_string(&meta_path)
-            .ok()
-            .and_then(|c| serde_json::from_str(&c).ok())
-            .unwrap_or(serde_json::json!({}));
+        // #1682: read-modify-write pending_pickup_ids through the resolver. The
+        // previous hand-coded `<name>.json` read + bare `rename` wrote the legacy
+        // name file (and clobbered the resolver's `<uuid>.json` symlink), so the
+        // pickup IDs split from the id file every other reader/writer uses —
+        // multi-message bursts then lost their ✅ confirmations.
         let entry = serde_json::json!({
             "kind": "telegram",
             "msg_id": msg.id.0.to_string(),
         });
-        match meta.get_mut("pending_pickup_ids") {
-            Some(arr) if arr.is_array() => {
-                let vec = arr.as_array_mut().expect("checked");
-                vec.push(entry);
-                // M2: cap to prevent unbounded growth (keep newest 100)
-                if vec.len() > 100 {
-                    *vec = vec.split_off(vec.len() - 100);
-                }
-            }
-            _ => {
-                meta["pending_pickup_ids"] = serde_json::json!([entry]);
-            }
+        let meta_path = crate::agent_ops::metadata_path_resolved(&home, &instance_name);
+        let existing: serde_json::Value = std::fs::read_to_string(&meta_path)
+            .ok()
+            .and_then(|c| serde_json::from_str(&c).ok())
+            .unwrap_or(serde_json::json!({}));
+        let mut ids: Vec<serde_json::Value> = existing
+            .get("pending_pickup_ids")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        ids.push(entry);
+        // M2: cap to prevent unbounded growth (keep newest 100)
+        if ids.len() > 100 {
+            ids = ids.split_off(ids.len() - 100);
         }
-        let meta_dir = home.join("metadata");
-        std::fs::create_dir_all(&meta_dir).ok();
-        let tmp_path = meta_path.with_extension("json.tmp");
-        if let Ok(content) = serde_json::to_string_pretty(&meta) {
-            if std::fs::write(&tmp_path, &content).is_ok() {
-                let _ = std::fs::rename(&tmp_path, &meta_path);
-            }
-        }
+        crate::agent_ops::save_metadata(
+            &home,
+            &instance_name,
+            "pending_pickup_ids",
+            serde_json::json!(ids),
+        );
     }
     // Also store as last_message_id for the `react` MCP tool's fallback.
     crate::agent_ops::save_metadata(

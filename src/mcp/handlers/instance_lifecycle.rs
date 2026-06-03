@@ -92,8 +92,12 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
     }
     // #1157: clean id-based metadata. Fleet.yaml is already removed above,
     // so cleanup_working_dir's best-effort lookup may miss the id path.
+    // #1682: construct the id path via agent_ops (fleet.yaml is gone, so the
+    // name→id resolver can't be used here — feed the captured id directly).
     if let Some(ref id) = instance_id {
-        let _ = std::fs::remove_file(home.join("metadata").join(format!("{id}.json")));
+        if let Some(id) = crate::types::InstanceId::parse(id) {
+            let _ = std::fs::remove_file(crate::agent_ops::metadata_path_for_id(home, &id));
+        }
     }
     crate::teams::remove_member_from_all(home, name);
 
@@ -191,7 +195,7 @@ pub(crate) fn name_residual_anywhere(home: &Path, name: &str) -> Vec<&'static st
             sources.push("fleet.yaml/teams");
         }
     }
-    if home.join("metadata").join(format!("{name}.json")).exists() {
+    if crate::agent_ops::metadata_exists(home, name) {
         sources.push("metadata");
     }
     if home.join("inbox").join(format!("{name}.jsonl")).exists() {

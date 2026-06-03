@@ -160,6 +160,47 @@ pub fn metadata_path_resolved(home: &Path, name: &str) -> PathBuf {
     id_path
 }
 
+/// #1682: id-based metadata path (pure — no migration side effects, unlike
+/// `metadata_path_resolved`). For cleanup paths where the `InstanceId` is known
+/// directly, e.g. `full_delete_instance` after fleet.yaml has already been
+/// removed (so a name→id lookup would fail).
+pub fn metadata_path_for_id(home: &Path, id: &crate::types::InstanceId) -> PathBuf {
+    home.join("metadata").join(format!("{}.json", id.full()))
+}
+
+/// #1682: resolve an instance's id-based metadata path from fleet.yaml WITHOUT
+/// the symlink/dir migration side effects of `metadata_path_resolved`. `None`
+/// when the name has no id mapping (returns to the caller, which falls back to
+/// the name path). Mirrors the lookup in `metadata_path_resolved`.
+fn id_metadata_path(home: &Path, name: &str) -> Option<PathBuf> {
+    let id = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+        .ok()?
+        .instances
+        .get(name)
+        .and_then(|i| i.id.as_deref())
+        .and_then(crate::types::InstanceId::parse)?;
+    Some(metadata_path_for_id(home, &id))
+}
+
+/// #1682: remove an instance's metadata, covering BOTH the legacy name path and
+/// the id-resolved path, so a delete / spawn-clear leaves no split copy behind.
+/// Pure (no symlink creation). Replaces the hand-coded `remove_file` of just the
+/// name file that, post-#1680, missed the `<uuid>.json` readers actually read.
+pub fn remove_metadata(home: &Path, name: &str) {
+    let _ = std::fs::remove_file(metadata_path(home, name));
+    if let Some(id_path) = id_metadata_path(home, name) {
+        let _ = std::fs::remove_file(id_path);
+    }
+}
+
+/// #1682: does ANY metadata file exist for this instance — legacy name path OR
+/// id-resolved path — WITHOUT the symlink/dir side effects of
+/// `metadata_path_resolved`. For residual / cleanup-verification checks that
+/// must not themselves create metadata.
+pub fn metadata_exists(home: &Path, name: &str) -> bool {
+    metadata_path(home, name).exists() || id_metadata_path(home, name).is_some_and(|p| p.exists())
+}
+
 /// Load metadata for an instance and merge it into the given JSON value.
 pub fn merge_metadata(home: &Path, name: &str, info: &mut Value) {
     let meta_path = metadata_path_resolved(home, name);

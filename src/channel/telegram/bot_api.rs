@@ -34,7 +34,7 @@ pub(crate) fn try_telegram_react(
 ) -> anyhow::Result<()> {
     let ch = resolve_channel_only_from(home)?;
     let mid: i32 = message_id.and_then(|m| m.parse().ok()).unwrap_or_else(|| {
-        let meta_path = home.join("metadata").join(format!("{instance_name}.json"));
+        let meta_path = crate::agent_ops::metadata_path_resolved(home, instance_name);
         std::fs::read_to_string(&meta_path)
             .ok()
             .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())

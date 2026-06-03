@@ -1267,7 +1267,7 @@ fn format_recovery_notice(name: &str) -> String {
 /// as a `Duration`. Returns `None` if the file is missing, unparseable, or
 /// the timestamp is in the future.
 fn read_heartbeat_age(home: &std::path::Path, name: &str) -> Option<Duration> {
-    let meta_path = home.join("metadata").join(format!("{name}.json"));
+    let meta_path = crate::agent_ops::metadata_path_resolved(home, name);
     let content = std::fs::read_to_string(meta_path).ok()?;
     let meta: serde_json::Value = serde_json::from_str(&content).ok()?;
     let ts = meta["last_heartbeat"].as_str()?;
@@ -1282,7 +1282,7 @@ fn clear_waiting_on_if_stale(home: &std::path::Path, name: &str, is_stale: bool)
     if !is_stale {
         return;
     }
-    let meta_path = home.join("metadata").join(format!("{name}.json"));
+    let meta_path = crate::agent_ops::metadata_path_resolved(home, name);
     let meta: serde_json::Value = match std::fs::read_to_string(&meta_path)
         .and_then(|c| serde_json::from_str(&c).map_err(std::io::Error::other))
     {

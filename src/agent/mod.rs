@@ -1619,7 +1619,7 @@ fn on_clean_exit_shell_fallback(
     };
 
     let work_dir: Option<std::path::PathBuf> = home.as_ref().and_then(|h| {
-        let meta_path = h.join("metadata").join(format!("{name}.json"));
+        let meta_path = crate::agent_ops::metadata_path_resolved(h, name);
         std::fs::read_to_string(meta_path)
             .ok()
             .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
