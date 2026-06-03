@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 pub use handler::handle;
+pub use handler::register_subscriber as register_cascade_subscriber;
 pub use orphan::{
     orphan_tasks_for_owner, reconcile_orphan_owners_with_live, release_inprogress_orphans_with_live,
 };

@@ -83,6 +83,14 @@ pub enum EventKind {
         text: String,
         correlation_agent: Option<String>,
     },
+    // #event-bus pattern #7 (cascade_cancel): when a parent task is cancelled,
+    // each in-progress child's owner gets a notify. The text is rebuilt from
+    // parent_id + child_id, so the subscriber re-delivers byte-identically.
+    CascadeCancelNotify {
+        owner: String,
+        parent_id: String,
+        child_id: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -297,6 +305,11 @@ mod tests {
                 kind: "fleet_idle_watchdog".into(),
                 text: "all idle".into(),
                 correlation_agent: None,
+            },
+            EventKind::CascadeCancelNotify {
+                owner: "fixup-dev".into(),
+                parent_id: "t-parent".into(),
+                child_id: "t-child".into(),
             },
         ];
         for k in kinds {
