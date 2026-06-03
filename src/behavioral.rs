@@ -384,7 +384,10 @@ pub(crate) const KIRO_PRODUCTIVE_MARKERS: &[&str] = &[
 
 /// Codex: generic anchors + `•` past-tense title vocabulary (`Explored`,
 /// `Edited`, `Ran`) + `apply_patch` literal completion banner.
-const CODEX_PRODUCTIVE_MARKERS: &[&str] = &[
+// #8 Phase 2 step-2: pub(crate) so the co-located Codex BackendProfile references
+// the SAME markers const (not a re-typed copy) → byte-identity with the legacy
+// config_for_productivity arm. Matches KIRO_/OPENCODE_PRODUCTIVE_MARKERS.
+pub(crate) const CODEX_PRODUCTIVE_MARKERS: &[&str] = &[
     r"^Saved to \S+",
     r"^Wrote \d+ bytes",
     r"^Created file: \S+",

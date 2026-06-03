@@ -16,11 +16,12 @@
 //! reroutes production one backend per PR, gated by that harness.
 //!
 //! Migrated so far: `Shell`/`Raw` (empty), `Agy` (#1672), `KiroCli` (#1674),
-//! and `OpenCode` (#8 step-1, this PR — 12 patterns, incl. the shared
-//! `SERVER_RATE_LIMIT_NET_ERRORS` const). Production is rerouted as of step-0
-//! (#1683): `profile()`-Some backends run detection through the bundle, legacy
-//! is the parity baseline until the train ends. One backend per PR, each proven
-//! byte-identical by the harness below.
+//! `OpenCode` (#1686), and `Codex` (#8 step-2, this PR — 11 patterns incl. the
+//! shared `SERVER_RATE_LIMIT_NET_ERRORS` const + the #1634 ModelUnsupported
+//! pattern). Production is rerouted as of step-0 (#1683): `profile()`-Some
+//! backends run detection through the bundle, legacy is the parity baseline
+//! until the train ends. One backend per PR, each proven byte-identical by the
+//! harness below (and a drift-guard test pins `migrated()` ⟺ `profile().is_some`).
 
 use crate::backend::Backend;
 use crate::behavioral::{BehavioralConfig, MarkerCacheId, ProductivityConfig};
@@ -50,6 +51,7 @@ pub fn profile(backend: &Backend) -> Option<&'static BackendProfile> {
     static AGY: OnceLock<BackendProfile> = OnceLock::new();
     static KIRO: OnceLock<BackendProfile> = OnceLock::new();
     static OPENCODE: OnceLock<BackendProfile> = OnceLock::new();
+    static CODEX: OnceLock<BackendProfile> = OnceLock::new();
     // Shell + Raw share one profile — every legacy source treats `Shell | Raw(_)`
     // identically (empty patterns, default behavioral, generic productivity, Ready).
     static EMPTY: OnceLock<BackendProfile> = OnceLock::new();
@@ -57,6 +59,7 @@ pub fn profile(backend: &Backend) -> Option<&'static BackendProfile> {
         Backend::Agy => Some(AGY.get_or_init(agy_profile)),
         Backend::KiroCli => Some(KIRO.get_or_init(kirocli_profile)),
         Backend::OpenCode => Some(OPENCODE.get_or_init(opencode_profile)),
+        Backend::Codex => Some(CODEX.get_or_init(codex_profile)),
         Backend::Shell | Backend::Raw(_) => Some(EMPTY.get_or_init(empty_profile)),
         _ => None,
     }
@@ -209,6 +212,58 @@ fn opencode_profile() -> BackendProfile {
     }
 }
 
+/// Codex (#8 Phase 2 step-2) — moved VERBATIM from the legacy sites (patterns.rs
+/// `compile_for` Backend::Codex arm, behavioral.rs `config_for_legacy` +
+/// `config_for_productivity_legacy`, managed→Starting). ServerRateLimit
+/// references the SAME shared `SERVER_RATE_LIMIT_NET_ERRORS` const and the
+/// markers the SAME `CODEX_PRODUCTIVE_MARKERS` const the legacy arms use → byte-
+/// identical. Includes the #1634 ModelUnsupported pattern (HIGH_FP, #919 red-
+/// anchor gated downstream — unchanged by this move). The harness proves it.
+fn codex_profile() -> BackendProfile {
+    BackendProfile {
+        patterns: vec![
+            (AgentState::AuthError, r"OPENAI_API_KEY|api.?key"),
+            (AgentState::UsageLimit, r"hit your usage limit|try again at"),
+            (
+                AgentState::RateLimit,
+                r"rate_limit_exceeded|RateLimitError|hit your rate limit",
+            ),
+            (
+                AgentState::ServerRateLimit,
+                crate::state::patterns::SERVER_RATE_LIMIT_NET_ERRORS,
+            ),
+            (AgentState::ContextFull, r"ContextOverflow"),
+            (
+                AgentState::ModelUnsupported,
+                r"invalid_request_error|model is not supported|Model metadata for .*? not found",
+            ),
+            (
+                AgentState::PermissionPrompt,
+                r"Would you like to run the following command\?|Press enter to confirm or esc to cancel|No, and tell Codex what to do differently",
+            ),
+            (
+                AgentState::GitConflict,
+                r"Automatic merge failed; fix conflicts|CONFLICT \(content\)|Resolve all conflicts manually|Failed to merge submodule|Failed to merge in",
+            ),
+            (AgentState::Thinking, r"Working|esc to interrupt"),
+            (AgentState::Idle, r"›"),
+            (AgentState::Ready, r"OpenAI Codex|gpt-.*left"),
+        ],
+        behavioral: BehavioralConfig {
+            silence_thinking_ms: 3000,
+            silence_idle_ms: 8000,
+            supports_cursor_query: false,
+        },
+        productivity: ProductivityConfig {
+            markers: crate::behavioral::CODEX_PRODUCTIVE_MARKERS,
+            use_heartbeat: true,
+            heartbeat_fresh_window_ms: 10_000,
+            cache_id: Some(MarkerCacheId::Codex),
+        },
+        initial_state: AgentState::Starting,
+    }
+}
+
 /// Shell / Raw — moved VERBATIM (empty patterns, default behavioral, generic
 /// productivity, Ready initial state).
 fn empty_profile() -> BackendProfile {
@@ -240,6 +295,7 @@ mod tests {
             Backend::Agy,
             Backend::KiroCli,
             Backend::OpenCode,
+            Backend::Codex,
             Backend::Shell,
             Backend::Raw("x".to_string()),
         ]
@@ -326,7 +382,9 @@ mod tests {
     /// OpenCode left this set in step-1 (#8 Phase 2) — it is now `migrated()`.
     #[test]
     fn unmigrated_backends_have_no_profile_yet() {
-        for b in [Backend::ClaudeCode, Backend::Codex, Backend::Gemini] {
+        // Codex left this set in step-2 (#8 Phase 2) — now `migrated()`. Only
+        // ClaudeCode + Gemini remain on the legacy path (Claude lands in #1689).
+        for b in [Backend::ClaudeCode, Backend::Gemini] {
             assert!(profile(&b).is_none(), "{b:?} must stay on the legacy path");
         }
     }
@@ -379,6 +437,41 @@ mod tests {
                     "for_backend (prod) vs compile_for (legacy) parity for {b:?} on {item:?}"
                 );
             }
+        }
+    }
+
+    /// #8 Phase 2 (codex/#1687) DRIFT GUARD — the systemic fix. `migrated()` (the
+    /// TEST set the byte-identical parity tests iterate) and `profile()` (the PROD
+    /// routing) are two INDEPENDENT lists. If a backend is wired into `profile()`
+    /// but missing from `migrated()`, its byte-identity is SILENTLY un-tested (the
+    /// parity loop just skips it → false-green); the reverse leaves a `migrated()`
+    /// entry with no prod profile. Assert the two agree BIDIRECTIONALLY over EVERY
+    /// `Backend` variant (by discriminant, so `Raw(_)` matches regardless of
+    /// payload) so any future drift goes red immediately. This is the check that
+    /// would have caught the class codex flagged on this PR.
+    #[test]
+    fn migrated_set_matches_profile_some_bidirectional_drift_guard() {
+        use std::mem::discriminant;
+        let all = [
+            Backend::ClaudeCode,
+            Backend::KiroCli,
+            Backend::Codex,
+            Backend::OpenCode,
+            Backend::Gemini,
+            Backend::Agy,
+            Backend::Shell,
+            Backend::Raw("x".to_string()),
+        ];
+        let m = migrated();
+        for b in &all {
+            let in_migrated = m.iter().any(|x| discriminant(x) == discriminant(b));
+            let has_profile = profile(b).is_some();
+            assert_eq!(
+                in_migrated, has_profile,
+                "{b:?}: in migrated()={in_migrated} but profile().is_some()={has_profile} — \
+                 migrated() (parity-test set) and profile() (prod routing) have DRIFTED. A backend \
+                 wired into profile() yet missing from migrated() is SILENTLY un-parity-tested."
+            );
         }
     }
 }
