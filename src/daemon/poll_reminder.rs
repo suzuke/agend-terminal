@@ -77,11 +77,46 @@ pub fn collect_poll_reminders(home: &Path, registry: &AgentRegistry) -> Vec<(Str
 }
 
 /// Run one poll-reminder pass. Called from daemon tick every N ticks.
-/// Collects reminders via [`collect_poll_reminders`] then injects each.
+/// Collects reminders via [`collect_poll_reminders`] then delivers each.
+///
+/// #event-bus pattern #8 (Option A): when the bus is enabled, emit a
+/// `PollReminder` per nudge and let the subscriber deliver; otherwise deliver
+/// directly via the legacy path. Both bottom out in [`deliver_poll_reminder`],
+/// so delivery is byte-identical regardless of the gate.
 pub fn poll_reminder_pass(home: &Path, registry: &AgentRegistry) {
+    let bus = crate::daemon::event_bus::global();
     for (name, reminder) in collect_poll_reminders(home, registry) {
-        crate::inbox::compose_aware_inject(home, &name, &reminder);
+        if bus.is_enabled() {
+            bus.emit(crate::daemon::event_bus::EventKind::PollReminder {
+                agent: name,
+                reminder,
+            });
+        } else {
+            deliver_poll_reminder(home, &name, &reminder);
+        }
     }
+}
+
+/// #event-bus pattern #8: the single delivery primitive, shared by the legacy
+/// pass and the bus subscriber. `reminder` is the already-formatted string from
+/// [`collect_poll_reminders`] (frozen at collect time — see [`EventKind::PollReminder`]
+/// for why the age is NOT recomputed here).
+fn deliver_poll_reminder(home: &Path, agent: &str, reminder: &str) {
+    crate::inbox::compose_aware_inject(home, agent, reminder);
+}
+
+/// #event-bus pattern #8: subscriber — re-deliver the frozen reminder text.
+fn handle_event(home: &Path, event: &crate::daemon::event_bus::Event) {
+    if let crate::daemon::event_bus::EventKind::PollReminder { agent, reminder } = &event.kind {
+        deliver_poll_reminder(home, agent, reminder);
+    }
+}
+
+/// #event-bus pattern #8: register the delivery subscriber at daemon startup
+/// (dormant unless `AGEND_EVENT_BUS=1`). Wired beside the other patterns in
+/// `daemon::mod`.
+pub fn register_subscriber(home: std::path::PathBuf) {
+    crate::daemon::event_bus::global().subscribe(move |e| handle_event(&home, e));
 }
 
 #[cfg(test)]
@@ -304,6 +339,114 @@ mod tests {
 
         let v = collect_poll_reminders(&home, &registry);
         assert!(v.is_empty(), "busy agent must not get reminder");
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #event-bus pattern #8: PTY-inject migration parity ──────────────
+    //
+    // PTY-INJECT TEST TEMPLATE (first of the PTY-inject patterns; reuse for the
+    // rest). `compose_aware_inject` is a complex SHARED delivery fn — the
+    // migration only changes the dispatch ROUTE (legacy pass vs bus subscriber),
+    // never the deliver behavior, so parity = "the subscriber feeds
+    // compose_aware_inject byte-identical (agent, text)". PTY bytes are not a
+    // drainable sink and PTY-readback is windows-flaky (#1699), so we observe via
+    // `notification_queue` — a drainable file sink that `compose_aware_inject`
+    // writes to on its DEFER path. Staging a `thinking` SNAPSHOT forces that
+    // path deterministically + cross-platform (the snapshot agent_state, read by
+    // `should_defer_inject`, is independent of the registry-handle state that the
+    // idle-filter in `collect` reads).
+
+    /// Stage a snapshot with `agent` mid-generation so `compose_aware_inject`
+    /// takes the defer path and enqueues to the drainable `notification_queue`.
+    fn stage_thinking_snapshot(home: &Path, agent: &str) {
+        crate::snapshot::save(
+            home,
+            &[crate::snapshot::AgentSnapshot {
+                name: agent.to_string(),
+                backend_command: "test".to_string(),
+                args: vec![],
+                working_dir: None,
+                submit_key: "\r".to_string(),
+                health_state: "Healthy".to_string(),
+                agent_state: "thinking".to_string(),
+            }],
+        );
+    }
+
+    /// PARITY (gate-ON): the bus `emit`→subscriber path delivers the SAME frozen
+    /// reminder text to `compose_aware_inject` as the legacy direct path — proven
+    /// by byte-comparing the drained `notification_queue` payloads. Separate
+    /// homes isolate the queues; poll-reminder headers carry no `msg_id`, so the
+    /// #911 dedup gate never fires across them. No `env_lock`: the recipient is a
+    /// registry agent name, not env-derived.
+    #[test]
+    fn gate_on_emit_subscriber_matches_legacy_inject() {
+        let agent = "poll-parity-agent";
+        // ONE frozen reminder string fed to BOTH paths (mirrors collect output —
+        // the age is frozen here, never recomputed by the subscriber).
+        let reminder = crate::inbox::format_event_header(
+            "poll-reminder",
+            &[("unread", "3"), ("oldest", "5m")],
+        );
+
+        // Legacy direct deliver (gate-OFF path).
+        let home_legacy = tmp_home("parity-legacy");
+        stage_thinking_snapshot(&home_legacy, agent);
+        deliver_poll_reminder(&home_legacy, agent, &reminder);
+
+        // Bus emit→subscriber (gate-ON path) via a local enabled test bus.
+        let home_bus = tmp_home("parity-bus");
+        stage_thinking_snapshot(&home_bus, agent);
+        let bus = crate::daemon::event_bus::EventBus::new_enabled_for_test();
+        let h = home_bus.clone();
+        bus.subscribe(move |e| handle_event(&h, e));
+        bus.emit(crate::daemon::event_bus::EventKind::PollReminder {
+            agent: agent.to_string(),
+            reminder: reminder.clone(),
+        });
+
+        let legacy: Vec<String> = crate::notification_queue::drain(&home_legacy, agent)
+            .into_iter()
+            .map(|q| q.text)
+            .collect();
+        let viabus: Vec<String> = crate::notification_queue::drain(&home_bus, agent)
+            .into_iter()
+            .map(|q| q.text)
+            .collect();
+        assert_eq!(
+            legacy, viabus,
+            "emit→subscriber inject text must be byte-identical to legacy"
+        );
+        assert!(!legacy.is_empty(), "legacy path must have delivered");
+
+        std::fs::remove_dir_all(&home_legacy).ok();
+        std::fs::remove_dir_all(&home_bus).ok();
+    }
+
+    /// REGRESSION (gate-OFF): with the global bus disabled (default test env),
+    /// `poll_reminder_pass` still delivers via the legacy `compose_aware_inject`
+    /// path. Registry handle is Idle (so `collect` picks the agent up); the
+    /// snapshot is `thinking` (so the deliver defers into the drainable queue).
+    #[test]
+    fn gate_off_pass_delivers_via_legacy() {
+        assert!(
+            !crate::daemon::event_bus::global().is_enabled(),
+            "precondition: the global bus must be gate-off in the test env"
+        );
+        let home = tmp_home("gate-off");
+        let agent = "poll-gateoff-agent";
+        seed_unread(&home, agent, 2);
+        stage_thinking_snapshot(&home, agent);
+        let registry = mock_registry(agent, AgentState::Idle);
+        reset_dedup(agent);
+
+        poll_reminder_pass(&home, &registry);
+
+        assert!(
+            crate::notification_queue::pending_count(&home, agent) > 0,
+            "#event-bus Option A: gate-off must deliver via legacy (no regression)"
+        );
 
         std::fs::remove_dir_all(&home).ok();
     }

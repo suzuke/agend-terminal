@@ -415,6 +415,7 @@ fn run_core(
     crate::daemon::helper_staleness_watchdog::register_subscriber(home.to_path_buf());
     crate::daemon::idle_watchdog::register_subscriber(home.to_path_buf());
     crate::tasks::register_cascade_subscriber(home.to_path_buf());
+    crate::daemon::poll_reminder::register_subscriber(home.to_path_buf());
 
     spawn_fleet_agents(home, &agents, &ctx);
 

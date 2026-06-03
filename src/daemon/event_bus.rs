@@ -91,6 +91,17 @@ pub enum EventKind {
         parent_id: String,
         child_id: String,
     },
+    // #event-bus pattern #8 (poll_reminder) — FIRST PTY-inject pattern.
+    // Carries the FULLY-FORMATTED `reminder` string (not raw count/age fields):
+    // the text embeds a time-sensitive age ("Xm" from `chrono::Utc::now()`), so a
+    // subscriber-side rebuild would recompute a LATER age and drift off
+    // byte-identical. Template lesson for every PTY/time-sensitive pattern: any
+    // text containing now()/age/timestamp must be frozen into the event, not
+    // rebuilt by the subscriber.
+    PollReminder {
+        agent: String,
+        reminder: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -310,6 +321,10 @@ mod tests {
                 owner: "fixup-dev".into(),
                 parent_id: "t-parent".into(),
                 child_id: "t-child".into(),
+            },
+            EventKind::PollReminder {
+                agent: "dev".into(),
+                reminder: "[AGEND-MSG] kind=poll-reminder unread=3 oldest=5m".into(),
             },
         ];
         for k in kinds {
