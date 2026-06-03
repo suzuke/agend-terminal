@@ -117,87 +117,35 @@ pub fn check_schedules(home: &Path, registry: &AgentRegistry) {
             }
         }
 
-        let (sched_id, target) = (sched.id.as_str(), sched.target.as_str());
-        let message = sched.message.as_str();
-        let label = sched.label.as_deref().unwrap_or("(unnamed)");
-
-        tracing::info!(label, target, message, "schedule triggered");
-        crate::event_log::log(
-            home,
-            "schedule_trigger",
-            target,
-            &format!("{label}: {message}"),
-        );
-
-        // #1441: registry is UUID-keyed; resolve target name via fleet.yaml.
-        let target_id = crate::fleet::resolve_uuid(home, target);
-        // #1530/F1: snapshot the inject target under the registry lock, then
-        // RELEASE the lock before the (up to 5s + payload-scaled) blocking PTY
-        // write — the registry must not be held across inject. The inbox
-        // fallback below also does self-IPC (`enqueue_with_idle_hint` →
-        // `api::call` loopback), which the API handler can't service while we
-        // hold the registry — so it too runs only after the lock is released.
-        let inject_snap = {
-            let reg = agent::lock_registry(registry);
-            target_id
-                .and_then(|id| reg.get(&id))
-                .map(|h| (agent::InjectTarget::from_handle(h), h.name.to_string()))
-        };
-        let mut deferred_inbox = false;
-        let status = if fire.missed {
-            // Daemon was down through the one-shot instant — don't silently
-            // inject a stale message (could be a morning "stand-up" from
-            // three days ago). Just mark it missed so the user can see it
-            // in run_history, and let the auto-disable below retire it.
-            "missed"
-        } else if let Some((tgt, name)) = inject_snap.as_ref() {
-            match agent::inject_with_target_gated(tgt, name, message.as_bytes(), false) {
-                Ok(()) => "ok",
-                Err(e) => {
-                    tracing::warn!(error = %e, "schedule inject failed");
-                    "inject_failed"
-                }
-            }
-        } else if crate::fleet::instance_is_known(home, target) {
-            // Known fleet instance that simply isn't running right now. Defer
-            // the self-IPC enqueue past the lock (see the `deferred_inbox`
-            // note above) so it lands in the inbox for next time it checks.
-            deferred_inbox = true;
-            "ok_inbox"
+        // #event-bus pattern (cron_tick), Option A: when the bus is enabled,
+        // emit a `CronFire` and let the subscriber run the effect; otherwise run
+        // it inline (legacy). Both bottom out in `deliver_cron_fire`, so the
+        // fire effect is byte-identical regardless of the gate. The schedule
+        // message/label are STATIC (non-time-sensitive), so they are carried
+        // verbatim and need no frozen-text handling.
+        let bus = crate::daemon::event_bus::global();
+        if bus.is_enabled() {
+            bus.emit(crate::daemon::event_bus::EventKind::CronFire {
+                sched_id: sched.id.clone(),
+                target: sched.target.clone(),
+                message: sched.message.clone(),
+                label: sched
+                    .label
+                    .clone()
+                    .unwrap_or_else(|| "(unnamed)".to_string()),
+                one_shot: fire.one_shot,
+                missed: fire.missed,
+            });
         } else {
-            // #1488 fail-safe: the target is NOT a known fleet instance —
-            // a deleted/renamed/typo'd target (the #1441 routing change made
-            // these fall through to the inbox fallback). Enqueuing would
-            // create an orphan inbox nobody drains and feed the dangerous
-            // self-IPC fallback that triggered the morning deadlock. Skip +
-            // warn instead; the schedule row stays (cascade/boot-sweep
-            // disables it), so this only fires until cleanup catches up.
-            tracing::warn!(
-                schedule = %sched_id,
-                target,
-                "#1488: schedule target is not a known instance — skipping fire (orphaned target)"
+            deliver_cron_fire(
+                home,
+                registry,
+                sched.id.as_str(),
+                sched.target.as_str(),
+                sched.message.as_str(),
+                sched.label.as_deref().unwrap_or("(unnamed)"),
+                &fire,
             );
-            "skipped_unknown_target"
-        };
-
-        if deferred_inbox {
-            persist_or_log!(
-                crate::inbox::enqueue_with_idle_hint(
-                    home,
-                    target,
-                    crate::inbox::InboxMessage::new_system("system:schedule", "schedule", message),
-                ),
-                "cron_schedule_fire",
-                target
-            );
-        }
-
-        crate::schedules::record_run(home, sched_id, status);
-        if fire.one_shot {
-            // Even on inject_failed we disable: one-shots are not retry-
-            // safe (the window already rolled forward). The user can
-            // re-create with a new run_at if they want another attempt.
-            crate::schedules::set_enabled(home, sched_id, false);
         }
         any_triggered = true;
     }
@@ -205,6 +153,136 @@ pub fn check_schedules(home: &Path, registry: &AgentRegistry) {
     if any_triggered || now_utc.signed_duration_since(last_check_utc).num_seconds() >= 10 {
         let _ = crate::store::atomic_write(&last_check_path, now_utc.to_rfc3339().as_bytes());
     }
+}
+
+/// #event-bus pattern (cron_tick): the per-fire EFFECT, shared by the legacy
+/// inline path and the bus subscriber. Resolves the target, injects to a
+/// running agent or enqueues to its inbox (or records missed / skips an
+/// orphaned target), then records the run and auto-disables one-shots.
+/// `message`/`label` are the static schedule strings (frozen by the producer —
+/// non-time-sensitive, so no rebuild-drift concern).
+fn deliver_cron_fire(
+    home: &Path,
+    registry: &AgentRegistry,
+    sched_id: &str,
+    target: &str,
+    message: &str,
+    label: &str,
+    fire: &FireDecision,
+) {
+    let FireDecision { one_shot, missed } = *fire;
+    tracing::info!(label, target, message, "schedule triggered");
+    crate::event_log::log(
+        home,
+        "schedule_trigger",
+        target,
+        &format!("{label}: {message}"),
+    );
+
+    // #1441: registry is UUID-keyed; resolve target name via fleet.yaml.
+    let target_id = crate::fleet::resolve_uuid(home, target);
+    // #1530/F1: snapshot the inject target under the registry lock, then
+    // RELEASE the lock before the (up to 5s + payload-scaled) blocking PTY
+    // write — the registry must not be held across inject. The inbox
+    // fallback below also does self-IPC (`enqueue_with_idle_hint` →
+    // `api::call` loopback), which the API handler can't service while we
+    // hold the registry — so it too runs only after the lock is released.
+    let inject_snap = {
+        let reg = agent::lock_registry(registry);
+        target_id
+            .and_then(|id| reg.get(&id))
+            .map(|h| (agent::InjectTarget::from_handle(h), h.name.to_string()))
+    };
+    let mut deferred_inbox = false;
+    let status = if missed {
+        // Daemon was down through the one-shot instant — don't silently
+        // inject a stale message (could be a morning "stand-up" from
+        // three days ago). Just mark it missed so the user can see it
+        // in run_history, and let the auto-disable below retire it.
+        "missed"
+    } else if let Some((tgt, name)) = inject_snap.as_ref() {
+        match agent::inject_with_target_gated(tgt, name, message.as_bytes(), false) {
+            Ok(()) => "ok",
+            Err(e) => {
+                tracing::warn!(error = %e, "schedule inject failed");
+                "inject_failed"
+            }
+        }
+    } else if crate::fleet::instance_is_known(home, target) {
+        // Known fleet instance that simply isn't running right now. Defer
+        // the self-IPC enqueue past the lock (see the `deferred_inbox`
+        // note above) so it lands in the inbox for next time it checks.
+        deferred_inbox = true;
+        "ok_inbox"
+    } else {
+        // #1488 fail-safe: the target is NOT a known fleet instance —
+        // a deleted/renamed/typo'd target (the #1441 routing change made
+        // these fall through to the inbox fallback). Enqueuing would
+        // create an orphan inbox nobody drains and feed the dangerous
+        // self-IPC fallback that triggered the morning deadlock. Skip +
+        // warn instead; the schedule row stays (cascade/boot-sweep
+        // disables it), so this only fires until cleanup catches up.
+        tracing::warn!(
+            schedule = %sched_id,
+            target,
+            "#1488: schedule target is not a known instance — skipping fire (orphaned target)"
+        );
+        "skipped_unknown_target"
+    };
+
+    if deferred_inbox {
+        persist_or_log!(
+            crate::inbox::enqueue_with_idle_hint(
+                home,
+                target,
+                crate::inbox::InboxMessage::new_system("system:schedule", "schedule", message),
+            ),
+            "cron_schedule_fire",
+            target
+        );
+    }
+
+    crate::schedules::record_run(home, sched_id, status);
+    if one_shot {
+        // Even on inject_failed we disable: one-shots are not retry-
+        // safe (the window already rolled forward). The user can
+        // re-create with a new run_at if they want another attempt.
+        crate::schedules::set_enabled(home, sched_id, false);
+    }
+}
+
+/// #event-bus pattern (cron_tick): subscriber — re-run the fire effect.
+fn handle_event(home: &Path, registry: &AgentRegistry, event: &crate::daemon::event_bus::Event) {
+    if let crate::daemon::event_bus::EventKind::CronFire {
+        sched_id,
+        target,
+        message,
+        label,
+        one_shot,
+        missed,
+    } = &event.kind
+    {
+        deliver_cron_fire(
+            home,
+            registry,
+            sched_id,
+            target,
+            message,
+            label,
+            &FireDecision {
+                one_shot: *one_shot,
+                missed: *missed,
+            },
+        );
+    }
+}
+
+/// #event-bus pattern (cron_tick): register the delivery subscriber at daemon
+/// startup (dormant unless `AGEND_EVENT_BUS=1`). Captures the registry Arc so
+/// the subscriber can resolve + inject to the live fleet, mirroring the
+/// producer's `check_schedules(home, registry)` access.
+pub fn register_subscriber(home: std::path::PathBuf, registry: AgentRegistry) {
+    crate::daemon::event_bus::global().subscribe(move |e| handle_event(&home, &registry, e));
 }
 
 /// Outcome of deciding that a schedule is due. `one_shot` means "auto-
@@ -783,6 +861,100 @@ mod tests {
             linked_task_gate(&home, Some("t-x")),
             TaskGate::ReadError
         ));
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    // ── #event-bus pattern (cron_tick): migration parity ──────────────
+    //
+    // cron_tick is a STANDARD (non-time-sensitive) pattern — the schedule
+    // message/label are static user strings, carried verbatim. A known-but-
+    // offline target routes `deliver_cron_fire` down the inbox-enqueue path, so
+    // parity uses the standard inbox-drain (like helper_staleness), not the
+    // PTY/notification_queue template. record_run no-ops on an unseeded
+    // schedule, so the parity test needs only a fleet.yaml (for
+    // `instance_is_known`).
+
+    const PARITY_FLEET: &str = "instances:\n  offline:\n    backend: claude\n";
+
+    /// PARITY (gate-ON): the bus `emit`→subscriber path runs the SAME fire
+    /// effect as the legacy direct call — proven by byte-comparing the inbox
+    /// payload enqueued for a known-offline target. No `env_lock`: the recipient
+    /// is the schedule's target name (fleet.yaml-resolved), not env-derived.
+    #[test]
+    fn gate_on_emit_subscriber_matches_legacy_fire() {
+        let (target, message, label, sid) = ("offline", "stand-up reminder", "morning", "s-parity");
+
+        // Legacy direct deliver (gate-OFF path).
+        let home_legacy = cron_tmp_home("parity-legacy");
+        std::fs::write(crate::fleet::fleet_yaml_path(&home_legacy), PARITY_FLEET).unwrap();
+        deliver_cron_fire(
+            &home_legacy,
+            &empty_registry(),
+            sid,
+            target,
+            message,
+            label,
+            &FireDecision {
+                one_shot: false,
+                missed: false,
+            },
+        );
+
+        // Bus emit→subscriber (gate-ON path) via a local enabled test bus.
+        let home_bus = cron_tmp_home("parity-bus");
+        std::fs::write(crate::fleet::fleet_yaml_path(&home_bus), PARITY_FLEET).unwrap();
+        let bus = crate::daemon::event_bus::EventBus::new_enabled_for_test();
+        let reg = empty_registry();
+        let h = home_bus.clone();
+        bus.subscribe(move |e| handle_event(&h, &reg, e));
+        bus.emit(crate::daemon::event_bus::EventKind::CronFire {
+            sched_id: sid.to_string(),
+            target: target.to_string(),
+            message: message.to_string(),
+            label: label.to_string(),
+            one_shot: false,
+            missed: false,
+        });
+
+        let legacy: Vec<String> = crate::inbox::drain(&home_legacy, target)
+            .into_iter()
+            .map(|m| m.text)
+            .collect();
+        let viabus: Vec<String> = crate::inbox::drain(&home_bus, target)
+            .into_iter()
+            .map(|m| m.text)
+            .collect();
+        assert_eq!(
+            legacy, viabus,
+            "emit→subscriber inbox payload must be byte-identical to legacy"
+        );
+        assert_eq!(
+            legacy,
+            vec![message.to_string()],
+            "the schedule message must be delivered to the offline target's inbox"
+        );
+
+        std::fs::remove_dir_all(home_legacy).ok();
+        std::fs::remove_dir_all(home_bus).ok();
+    }
+
+    /// REGRESSION (gate-OFF): with the global bus disabled (default test env),
+    /// `check_schedules` still fires via the legacy `deliver_cron_fire` path.
+    #[test]
+    fn gate_off_check_schedules_delivers_via_legacy() {
+        assert!(
+            !crate::daemon::event_bus::global().is_enabled(),
+            "precondition: the global bus must be gate-off in the test env"
+        );
+        let home = cron_tmp_home("gate-off");
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), PARITY_FLEET).unwrap();
+        seed_oneshot(&home, "offline");
+        check_schedules(&home, &empty_registry());
+        assert_eq!(
+            last_status(&home),
+            "ok_inbox",
+            "#event-bus Option A: gate-off must deliver via legacy (no regression)"
+        );
         std::fs::remove_dir_all(home).ok();
     }
 }

@@ -102,6 +102,18 @@ pub enum EventKind {
         agent: String,
         reminder: String,
     },
+    // #event-bus pattern (cron_tick): a due schedule fired. All fields are
+    // STATIC (the user's schedule message/label + the fire decision), NOT
+    // time-sensitive — so the subscriber re-runs the byte-identical effect
+    // (resolve target → inject-or-enqueue → record_run → one-shot disable).
+    CronFire {
+        sched_id: String,
+        target: String,
+        message: String,
+        label: String,
+        one_shot: bool,
+        missed: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -325,6 +337,14 @@ mod tests {
             EventKind::PollReminder {
                 agent: "dev".into(),
                 reminder: "[AGEND-MSG] kind=poll-reminder unread=3 oldest=5m".into(),
+            },
+            EventKind::CronFire {
+                sched_id: "s-1".into(),
+                target: "dev".into(),
+                message: "stand-up".into(),
+                label: "morning".into(),
+                one_shot: false,
+                missed: false,
             },
         ];
         for k in kinds {
