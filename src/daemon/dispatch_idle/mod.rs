@@ -741,7 +741,7 @@ fn deliver_dispatch_idle(
 
 /// #event-bus pattern #3: bus subscriber — deliver on a `DispatchIdleExceeded`
 /// event (the gate-ON path). Registered once at daemon startup via [`register_subscriber`].
-fn handle_event(event: &crate::daemon::event_bus::Event) {
+fn handle_event(event: &crate::daemon::event_bus::Event) -> bool {
     if let crate::daemon::event_bus::EventKind::DispatchIdleExceeded {
         dispatcher,
         target,
@@ -762,6 +762,9 @@ fn handle_event(event: &crate::daemon::event_bus::Event) {
             *elapsed_secs,
             *threshold_secs,
         );
+        true
+    } else {
+        false
     }
 }
 

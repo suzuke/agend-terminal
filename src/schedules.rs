@@ -504,15 +504,67 @@ pub fn create(home: &Path, instance_name: &str, args: &Value) -> Value {
     }
 }
 
+/// #1720 ③ visibility: the next UTC instant this schedule will fire (RFC 3339),
+/// or `None` when it is disabled, a one-shot already in the past, or has an
+/// unparseable trigger/timezone. Computed at list time (not persisted) so an
+/// operator can see when each schedule is next due — directly answering "did it
+/// drop, or is it just not due yet?". Mirrors `cron_tick::check_schedules`'
+/// normalisation (5-field cron → prepend seconds) + tz resolution so the
+/// displayed instant matches the engine's actual firing.
+fn next_fire_at(schedule: &Schedule) -> Option<String> {
+    if !schedule.enabled {
+        return None;
+    }
+    let now = chrono::Utc::now();
+    match &schedule.trigger {
+        Trigger::Once { at } => {
+            let when = chrono::DateTime::parse_from_rfc3339(at)
+                .ok()?
+                .with_timezone(&chrono::Utc);
+            (when > now).then(|| when.to_rfc3339())
+        }
+        Trigger::Cron { expr } => {
+            let tz_name = if schedule.timezone.is_empty() {
+                detect_timezone()
+            } else {
+                schedule.timezone.as_str()
+            };
+            let tz: chrono_tz::Tz = tz_name.parse().ok()?;
+            let full = if expr.split_whitespace().count() == 5 {
+                format!("0 {expr}")
+            } else {
+                expr.clone()
+            };
+            let parsed = cron::Schedule::from_str(&full).ok()?;
+            parsed
+                .after(&now.with_timezone(&tz))
+                .next()
+                .map(|next| next.with_timezone(&chrono::Utc).to_rfc3339())
+        }
+    }
+}
+
 pub fn list(home: &Path, args: &Value) -> Value {
     let store = load(home);
     let target_filter = args["instance"].as_str();
-    let filtered: Vec<_> = store
+    // #1720 ③: each row carries a computed `next_scheduled_fire_at` (not stored)
+    // so operators can see when it next fires.
+    let schedules: Vec<Value> = store
         .schedules
         .iter()
         .filter(|s| target_filter.is_none_or(|t| s.target == t))
+        .map(|s| {
+            let mut v = serde_json::to_value(s).unwrap_or(Value::Null);
+            if let Value::Object(map) = &mut v {
+                map.insert(
+                    "next_scheduled_fire_at".to_string(),
+                    next_fire_at(s).map_or(Value::Null, Value::String),
+                );
+            }
+            v
+        })
         .collect();
-    serde_json::json!({"schedules": filtered})
+    serde_json::json!({"schedules": schedules})
 }
 
 pub fn update(home: &Path, args: &Value) -> Value {
@@ -709,6 +761,40 @@ mod tests {
             .as_array()
             .expect("arr")
             .is_empty());
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1720 ③: `schedule list` carries a computed `next_scheduled_fire_at` —
+    /// non-null + parseable for an enabled cron schedule, and null once disabled
+    /// (so an operator can see when each schedule is next due).
+    #[test]
+    fn list_includes_next_scheduled_fire_at_1720() {
+        let home = tmp_home("next-fire");
+        let r = create(
+            &home,
+            "agent1",
+            &serde_json::json!({"cron": "0 9 * * *", "message": "hi", "timezone": "UTC"}),
+        );
+        let id = r["id"].as_str().expect("id").to_string();
+
+        let listed = list(&home, &serde_json::json!({}));
+        let next = listed["schedules"][0]["next_scheduled_fire_at"]
+            .as_str()
+            .expect("enabled cron must expose a next_scheduled_fire_at");
+        let parsed = chrono::DateTime::parse_from_rfc3339(next).expect("RFC3339");
+        assert!(
+            parsed.with_timezone(&chrono::Utc) > chrono::Utc::now(),
+            "next fire must be in the future: {next}"
+        );
+
+        // Disabled → null (won't fire).
+        update(&home, &serde_json::json!({"id": id, "enabled": false}));
+        let listed = list(&home, &serde_json::json!({}));
+        assert!(
+            listed["schedules"][0]["next_scheduled_fire_at"].is_null(),
+            "a disabled schedule must report next_scheduled_fire_at = null"
+        );
 
         std::fs::remove_dir_all(&home).ok();
     }

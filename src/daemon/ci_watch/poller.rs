@@ -1632,7 +1632,7 @@ fn deliver_ci_watch(
 /// #event-bus (ci_watch) subscriber: re-deliver a `CiReady`/`CiFail` event via the
 /// shared `deliver_ci_watch`. Both kinds deliver identically (the body already
 /// encodes pass/fail); the kind split is purely semantic.
-fn handle_event(event: &crate::daemon::event_bus::Event) {
+fn handle_event(event: &crate::daemon::event_bus::Event) -> bool {
     match &event.kind {
         crate::daemon::event_bus::EventKind::CiReady {
             target,
@@ -1649,8 +1649,9 @@ fn handle_event(event: &crate::daemon::event_bus::Event) {
             ..
         } => {
             deliver_ci_watch(&event.home, target, body, correlation_id, supersede_token);
+            true
         }
-        _ => {}
+        _ => false,
     }
 }
 

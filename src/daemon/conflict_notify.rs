@@ -233,7 +233,7 @@ fn deliver_conflict_alert(home: &Path, agent: &str, escalation: bool, text: &str
 
 /// #event-bus (conflict_notify) subscriber: re-deliver a `ConflictAlert` event via
 /// the shared `deliver_conflict_alert`.
-fn handle_event(event: &crate::daemon::event_bus::Event) {
+fn handle_event(event: &crate::daemon::event_bus::Event) -> bool {
     if let crate::daemon::event_bus::EventKind::ConflictAlert {
         agent,
         escalation,
@@ -241,6 +241,9 @@ fn handle_event(event: &crate::daemon::event_bus::Event) {
     } = &event.kind
     {
         deliver_conflict_alert(&event.home, agent, *escalation, text);
+        true
+    } else {
+        false
     }
 }
 

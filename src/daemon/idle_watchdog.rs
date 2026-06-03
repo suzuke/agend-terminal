@@ -759,7 +759,7 @@ fn route_idle_alert(
 
 /// #event-bus pattern #6: bus subscriber — deliver on an `IdleAlert` event via the
 /// shared `emit_idle_alert`. Registered once at daemon startup.
-fn handle_event(event: &crate::daemon::event_bus::Event) {
+fn handle_event(event: &crate::daemon::event_bus::Event) -> bool {
     if let crate::daemon::event_bus::EventKind::IdleAlert {
         recipient,
         kind,
@@ -774,6 +774,9 @@ fn handle_event(event: &crate::daemon::event_bus::Event) {
             text,
             correlation_agent.as_deref(),
         );
+        true
+    } else {
+        false
     }
 }
 
