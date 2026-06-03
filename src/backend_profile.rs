@@ -26,7 +26,10 @@ use crate::state::AgentState;
 use std::sync::OnceLock;
 
 /// All per-backend detection data for one backend, co-located.
-#[allow(dead_code)] // VALIDATION scaffold: consumed by the harness, not yet by prod.
+///
+/// #8 Phase 2 step-0: now consumed by PROD — `StatePatterns::for_backend`,
+/// `behavioral::config_for[_productivity]`, and `StateTracker::new` route
+/// migrated backends through [`profile`] (else legacy). No longer a scaffold.
 pub struct BackendProfile {
     /// Raw `(state, regex)` detection patterns in priority order — compiled by
     /// the state machine exactly as `StatePatterns::compile_for` does today.
@@ -41,7 +44,6 @@ pub struct BackendProfile {
 /// `None` for backends not yet migrated (their data still lives on the legacy
 /// match path). This `match` is the ONE unavoidable flat-enum lookup; the
 /// per-backend DATA lives in the builders below, one block each.
-#[allow(dead_code)] // VALIDATION: exposed via BackendBehavior::profile; prod reroute is the migration PR.
 pub fn profile(backend: &Backend) -> Option<&'static BackendProfile> {
     static AGY: OnceLock<BackendProfile> = OnceLock::new();
     static KIRO: OnceLock<BackendProfile> = OnceLock::new();
@@ -163,7 +165,10 @@ fn empty_profile() -> BackendProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::behavioral::{config_for, config_for_productivity};
+    // #8 Phase 2 step-0: parity tests must reference the TRUE-legacy companions,
+    // NOT the now-profile-routed prod fns (`config_for`/`for_backend`/`new`) — using
+    // the prod fns would make every assertion circular (profile vs profile).
+    use crate::behavioral::{config_for_legacy, config_for_productivity_legacy};
     use crate::state::patterns::StatePatterns;
     use crate::state::StateTracker;
 
@@ -183,8 +188,9 @@ mod tests {
     #[test]
     fn profile_patterns_byte_identical_to_legacy() {
         for b in migrated() {
+            // TRUE legacy = compile_for directly (for_backend is now profile-routed).
             let legacy: Vec<(AgentState, String)> =
-                StatePatterns::for_backend(&b).pattern_sources();
+                StatePatterns::compile_for(&b).pattern_sources();
             let prof: Vec<(AgentState, String)> = profile(&b)
                 .expect("migrated")
                 .patterns
@@ -216,7 +222,7 @@ mod tests {
             "",
         ];
         for b in migrated() {
-            let legacy = StatePatterns::for_backend(&b);
+            let legacy = StatePatterns::compile_for(&b); // TRUE legacy, not the rerouted entry
             let prof = StatePatterns::from_raw_patterns(&profile(&b).expect("migrated").patterns);
             for item in corpus {
                 assert_eq!(
@@ -236,17 +242,17 @@ mod tests {
             let p = profile(&b).expect("migrated");
             assert_eq!(
                 format!("{:?}", p.behavioral),
-                format!("{:?}", config_for(&b)),
+                format!("{:?}", config_for_legacy(&b)),
                 "behavioral parity for {b:?}"
             );
             assert_eq!(
                 format!("{:?}", p.productivity),
-                format!("{:?}", config_for_productivity(&b)),
+                format!("{:?}", config_for_productivity_legacy(&b)),
                 "productivity parity for {b:?}"
             );
             assert_eq!(
                 p.initial_state,
-                StateTracker::new(Some(&b)).current,
+                StateTracker::legacy_initial_state(Some(&b)),
                 "initial_state parity for {b:?}"
             );
         }
@@ -262,6 +268,57 @@ mod tests {
             Backend::Gemini,
         ] {
             assert!(profile(&b).is_none(), "{b:?} must stay on the legacy path");
+        }
+    }
+
+    /// #8 Phase 2 step-0 MERGE GATE — profile-ON-vs-OFF classify parity at the
+    /// PROD entry. `for_backend` (now profile-routed for migrated backends) must
+    /// detect byte-identically to the TRUE-legacy `compile_for` for EVERY backend
+    /// across the corpus: migrated → the profile path equals legacy; un-migrated →
+    /// both are legacy (guards the fork never perturbs Claude/Codex/OpenCode/Gemini).
+    /// Complements the structural `profile_patterns_byte_identical_to_legacy`
+    /// (identical sources ⟹ identical detection on ALL inputs) — together: complete
+    /// parity, not a snapshot. The full-fixture corpus is also covered empirically
+    /// by `replay_manifest_regression` running against this rerouted prod path.
+    #[test]
+    fn for_backend_classify_parity_with_legacy_step0() {
+        let corpus = [
+            "Requesting permission for: write",
+            "Do you trust the contents of this project",
+            "● Bash(ls -la)",
+            "esc to cancel",
+            "ECONNRESET",
+            "Too Many Requests",
+            "ServiceQuotaExceeded",
+            "Trust All Tools active",
+            "ask a question or describe a task",
+            "Antigravity CLI v2",
+            "Type your message",
+            "? for shortcuts",
+            "Automatic merge failed; fix conflicts",
+            "just unrelated prose with no anchors",
+            "● lowercase(x)",
+            "",
+        ];
+        for b in [
+            Backend::ClaudeCode,
+            Backend::KiroCli,
+            Backend::Codex,
+            Backend::OpenCode,
+            Backend::Gemini,
+            Backend::Agy,
+            Backend::Shell,
+            Backend::Raw("x".to_string()),
+        ] {
+            let prod = StatePatterns::for_backend(&b); // profile-routed entry
+            let legacy = StatePatterns::compile_for(&b); // TRUE legacy
+            for item in corpus {
+                assert_eq!(
+                    prod.detect(item),
+                    legacy.detect(item),
+                    "for_backend (prod) vs compile_for (legacy) parity for {b:?} on {item:?}"
+                );
+            }
         }
     }
 }

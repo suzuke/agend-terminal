@@ -606,6 +606,17 @@ impl StateTracker {
     /// considered alive and `PermissionPrompt` detection is suppressed.
     const HEARTBEAT_FRESH_WINDOW: Duration = Duration::from_secs(120);
 
+    /// The pre-reroute initial-state match — the fork's fallback for un-migrated
+    /// backends (and `None`) AND the TRUE-legacy reference for the parity test
+    /// (after the reroute, `new()` sources migrated backends from the profile, so
+    /// `new().current` can't stand in for "legacy" without circularity).
+    pub(crate) fn legacy_initial_state(backend: Option<&Backend>) -> AgentState {
+        match backend {
+            Some(Backend::Shell | Backend::Raw(_)) | None => AgentState::Ready,
+            Some(_) => AgentState::Starting,
+        }
+    }
+
     pub fn new(backend: Option<&Backend>) -> Self {
         // Backends without a state pattern catalog (Shell, Raw) skip the
         // `Starting → Ready` handshake. Without this they sat in
@@ -616,10 +627,15 @@ impl StateTracker {
         // its own prompt. Managed backends still start in `Starting` so
         // their onboarding / auth dialogs can pattern-match before
         // Ready is declared.
-        let initial_state = match backend {
-            Some(Backend::Shell | Backend::Raw(_)) | None => AgentState::Ready,
-            Some(_) => AgentState::Starting,
-        };
+        // #8 Phase 2 step-0: migrated backends source their initial state from the
+        // co-located profile; un-migrated (and `None`) fall back to
+        // `legacy_initial_state`. The profile values are byte-identical to legacy
+        // (empty_profile=Ready for Shell/Raw, agy/kiro=Starting), proven by
+        // `profile_configs_byte_identical_to_legacy`, so behavior is unchanged.
+        let initial_state = backend
+            .and_then(crate::backend_profile::profile)
+            .map(|p| p.initial_state)
+            .unwrap_or_else(|| Self::legacy_initial_state(backend));
         Self {
             current: initial_state,
             since: Instant::now(),

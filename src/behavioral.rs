@@ -65,7 +65,24 @@ impl Default for BehavioralConfig {
 }
 
 /// Get behavioral config for a backend.
+///
+/// #8 Phase 2 step-0: migrated backends (`profile() == Some`) source from the
+/// co-located [`crate::backend_profile::BackendProfile`]; un-migrated backends
+/// fall back to [`config_for_legacy`]. `profile_configs_byte_identical_to_legacy`
+/// proves `p.behavioral == config_for_legacy(b)` for every migrated backend, so
+/// this is a pure indirection, not a behavior change.
 pub fn config_for(backend: &Backend) -> BehavioralConfig {
+    if let Some(p) = crate::backend_profile::profile(backend) {
+        return p.behavioral;
+    }
+    config_for_legacy(backend)
+}
+
+/// The pre-reroute behavioral match — both the fork's fallback for un-migrated
+/// backends AND the TRUE-legacy reference for the parity test (after the reroute,
+/// `config_for` sources migrated backends from the profile, so it can't stand in
+/// for "legacy" without making the assertion circular).
+pub(crate) fn config_for_legacy(backend: &Backend) -> BehavioralConfig {
     match backend {
         Backend::ClaudeCode => BehavioralConfig {
             silence_thinking_ms: 2000,
@@ -425,7 +442,21 @@ static OPENCODE_PRODUCTIVE_REGEXES: std::sync::LazyLock<Vec<regex::Regex>> =
 /// Get productivity config for a backend. Each managed backend uses its
 /// own per-backend MARKERS list + cache id; Shell/Raw fall back to the
 /// generic anchor set (no MCP heartbeat).
+///
+/// #8 Phase 2 step-0: migrated backends source from the co-located profile;
+/// un-migrated fall back to [`config_for_productivity_legacy`]. The markers +
+/// `cache_id` are byte-identical to legacy (proven by the parity test), so the
+/// per-marker-list regex cache (keyed by `cache_id`) is unchanged.
 pub fn config_for_productivity(backend: &Backend) -> ProductivityConfig {
+    if let Some(p) = crate::backend_profile::profile(backend) {
+        return p.productivity;
+    }
+    config_for_productivity_legacy(backend)
+}
+
+/// The pre-reroute productivity match — the fork's fallback AND the TRUE-legacy
+/// parity reference (see [`config_for_legacy`] for why a separate fn is needed).
+pub(crate) fn config_for_productivity_legacy(backend: &Backend) -> ProductivityConfig {
     match backend {
         Backend::ClaudeCode => ProductivityConfig {
             markers: CLAUDE_PRODUCTIVE_MARKERS,

@@ -61,11 +61,26 @@ impl StatePatterns {
             Backend::Agy => &AGY,
             Backend::Shell | Backend::Raw(_) => &EMPTY,
         };
-        lock.get_or_init(|| Self::compile_for(backend))
+        // #8 Phase 2 step-0: route migrated backends (profile() == Some) through
+        // their co-located BackendProfile; un-migrated backends fall back to the
+        // legacy `compile_for` match. `from_raw_patterns` compiles via the SAME
+        // `Regex::new` pipeline as `compile_for`, and
+        // `profile_patterns_byte_identical_to_legacy` proves the pattern sources
+        // are identical — so this fork is byte-identical detection, not a change.
+        // The per-backend `OnceLock` still owns the compile-once cache (the fork
+        // lives INSIDE `get_or_init`, so each variant compiles exactly once).
+        lock.get_or_init(|| match crate::backend_profile::profile(backend) {
+            Some(p) => Self::from_raw_patterns(&p.patterns),
+            None => Self::compile_for(backend),
+        })
     }
 
+    // #8 Phase 2: `pub(crate)` so the parity tests can reference the TRUE legacy
+    // compilation directly — after the step-0 reroute, `for_backend` sources
+    // migrated backends from the profile, so it can no longer stand in for
+    // "legacy" in a parity assertion (that would be circular).
     #[allow(clippy::unwrap_used)]
-    fn compile_for(backend: &Backend) -> Self {
+    pub(crate) fn compile_for(backend: &Backend) -> Self {
         let patterns = match backend {
             // Claude Code v2.1.89
             Backend::ClaudeCode => vec![
@@ -752,10 +767,11 @@ impl StatePatterns {
         self.detect_with_match(text).map(|(s, _)| s)
     }
 
-    /// #8 Phase 2 VALIDATION seam: compile a raw `(state, regex)` list exactly as
-    /// `compile_for` does — lets the parity harness compile a `BackendProfile`'s
-    /// patterns and run detection against them for a corpus cross-check.
-    #[cfg(test)]
+    /// #8 Phase 2: compile a raw `(state, regex)` list exactly as `compile_for`
+    /// does (same `Regex::new` pipeline). Step-0 makes this a PROD path —
+    /// `for_backend` uses it to compile a migrated backend's `BackendProfile`
+    /// patterns; the parity harness uses it too. (Un-gated from `#[cfg(test)]`
+    /// when prod started consuming it.)
     #[allow(clippy::unwrap_used)]
     pub(crate) fn from_raw_patterns(raw: &[(AgentState, &'static str)]) -> Self {
         let compiled = raw
