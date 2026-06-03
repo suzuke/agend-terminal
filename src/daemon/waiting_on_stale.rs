@@ -132,7 +132,7 @@ fn deliver_stale_alert(home: &Path, agent: &str, condition: &str, elapsed_min: i
 }
 
 /// #event-bus pattern #4: subscriber — rebuild the alert from the event.
-fn handle_event(event: &crate::daemon::event_bus::Event) {
+fn handle_event(event: &crate::daemon::event_bus::Event) -> bool {
     if let crate::daemon::event_bus::EventKind::WaitingOnStale {
         agent,
         condition,
@@ -140,6 +140,9 @@ fn handle_event(event: &crate::daemon::event_bus::Event) {
     } = &event.kind
     {
         deliver_stale_alert(&event.home, agent, condition, *elapsed_min);
+        true
+    } else {
+        false
     }
 }
 

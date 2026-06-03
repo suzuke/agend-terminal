@@ -213,7 +213,14 @@ fn _register_event_bus_subscribers_at_test_load() {
     register_all_subscribers_for_test();
 }
 
-type Subscriber = Arc<dyn Fn(&Event) + Send + Sync>;
+/// A subscriber returns `true` iff it HANDLED the event — i.e. it matched the
+/// `EventKind` it cares about AND completed its delivery. Returning `false`
+/// (didn't match this kind, or its delivery failed) lets [`EventBus::emit`]
+/// report a handled-count, so a producer can detect an event that fanned out to
+/// nothing (#1720: a cron fire emitted while its subscriber was unregistered was
+/// silently lost — a count lets the producer record `skipped` instead of
+/// dropping it without a trace).
+type Subscriber = Arc<dyn Fn(&Event) -> bool + Send + Sync>;
 
 pub struct EventBus {
     subscribers: parking_lot::Mutex<Vec<Subscriber>>,
@@ -226,7 +233,7 @@ impl EventBus {
         }
     }
 
-    pub fn subscribe(&self, f: impl Fn(&Event) + Send + Sync + 'static) {
+    pub fn subscribe(&self, f: impl Fn(&Event) -> bool + Send + Sync + 'static) {
         self.subscribers.lock().push(Arc::new(f));
     }
 
@@ -234,13 +241,17 @@ impl EventBus {
     /// `emit` is unconditional (no gate). `home` is the `$AGEND_HOME` the event
     /// occurred in — carried on the `Event` so a single globally-registered
     /// subscriber delivers to the correct home.
-    pub fn emit(&self, home: &std::path::Path, kind: EventKind) {
+    ///
+    /// Returns the **handled-count**: how many subscribers reported handling this
+    /// event (matched its kind AND delivered). `0` means the event fanned out to
+    /// nothing relevant — the producer can then record/log it rather than let it
+    /// vanish silently (#1720).
+    pub fn emit(&self, home: &std::path::Path, kind: EventKind) -> usize {
         let event = Event::new(home.to_path_buf(), kind);
         let subs = self.subscribers.lock();
-        for sub in subs.iter() {
-            sub(&event);
-        }
-        tracing::debug!(kind = ?event.kind, "event_bus: emitted");
+        let handled = subs.iter().filter(|sub| sub(&event)).count();
+        tracing::debug!(kind = ?event.kind, handled, "event_bus: emitted");
+        handled
     }
 }
 
@@ -269,7 +280,10 @@ mod tests {
         let bus = EventBus::new();
         let received = Arc::new(Mutex::new(Vec::new()));
         let r = Arc::clone(&received);
-        bus.subscribe(move |e| r.lock().unwrap().push(e.kind.clone()));
+        bus.subscribe(move |e| {
+            r.lock().unwrap().push(e.kind.clone());
+            true
+        });
         bus.emit(
             std::path::Path::new("/tmp/h"),
             EventKind::TaskStateChanged {
@@ -293,7 +307,10 @@ mod tests {
         let bus = EventBus::new();
         let seen = Arc::new(Mutex::new(Vec::new()));
         let s = Arc::clone(&seen);
-        bus.subscribe(move |e| s.lock().unwrap().push(e.home.clone()));
+        bus.subscribe(move |e| {
+            s.lock().unwrap().push(e.home.clone());
+            true
+        });
         bus.emit(
             std::path::Path::new("/tmp/agend-home-x"),
             EventKind::CiReady {
@@ -319,9 +336,11 @@ mod tests {
         let cb = Arc::clone(&count_b);
         bus.subscribe(move |_| {
             ca.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            true
         });
         bus.subscribe(move |_| {
             cb.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            true
         });
         bus.emit(
             std::path::Path::new("/tmp/h"),
@@ -334,6 +353,45 @@ mod tests {
         );
         assert_eq!(count_a.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert_eq!(count_b.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    /// #1720 (B): `emit` returns the HANDLED-count — only subscribers that report
+    /// handling (returned `true`, e.g. matched their EventKind) are counted. A
+    /// subscriber that ignores the event (returns `false`, wrong kind) does not.
+    /// This is the signal a producer uses to detect a fire that reached nothing
+    /// relevant (handled==0) instead of losing it silently.
+    #[test]
+    fn emit_returns_handled_count() {
+        let bus = EventBus::new();
+        bus.subscribe(|_| true); // handles
+        bus.subscribe(|_| false); // ignores (e.g. a different pattern's kind)
+        bus.subscribe(|_| true); // handles
+        let handled = bus.emit(
+            std::path::Path::new("/tmp/h"),
+            EventKind::CiFail {
+                target: "dev".into(),
+                body: "[ci-fail]".into(),
+                correlation_id: "o/r@b".into(),
+                supersede_token: "ci-3".into(),
+            },
+        );
+        assert_eq!(
+            handled, 2,
+            "only the handling (true) subscribers are counted"
+        );
+
+        // No subscriber at all → handled == 0 (the #1720 silent-drop signal).
+        let empty = EventBus::new();
+        let none = empty.emit(
+            std::path::Path::new("/tmp/h"),
+            EventKind::CiFail {
+                target: "dev".into(),
+                body: "x".into(),
+                correlation_id: "o/r@b".into(),
+                supersede_token: "ci-4".into(),
+            },
+        );
+        assert_eq!(none, 0, "no subscriber → handled-count 0");
     }
 
     #[test]

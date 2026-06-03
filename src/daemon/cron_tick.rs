@@ -121,7 +121,7 @@ pub fn check_schedules(home: &Path) {
         // runs the effect via `deliver_cron_fire`. The schedule message/label are
         // STATIC (non-time-sensitive), carried verbatim. (The subscriber resolves
         // the live registry it was registered with — see `register_subscriber`.)
-        crate::daemon::event_bus::global().emit(
+        let handled = crate::daemon::event_bus::global().emit(
             home,
             crate::daemon::event_bus::EventKind::CronFire {
                 sched_id: sched.id.clone(),
@@ -135,11 +135,34 @@ pub fn check_schedules(home: &Path) {
                 missed: fire.missed,
             },
         );
+        note_unhandled_cron_fire(home, &sched.id, &sched.target, handled);
         any_triggered = true;
     }
 
     if any_triggered || now_utc.signed_duration_since(last_check_utc).num_seconds() >= 10 {
         let _ = crate::store::atomic_write(&last_check_path, now_utc.to_rfc3339().as_bytes());
+    }
+}
+
+/// #1720 (Y): a cron fire that reached NO subscriber (`handled == 0`) would
+/// otherwise vanish with no run_history + no log — the exact silent-drop the
+/// cutover's intermediate binary hit. Record a `skipped` run + WARN so the drop
+/// is VISIBLE instead of silent, satisfying the operator contract "reliably fires
+/// OR records a `{status: skipped}`". NOTE: `last_check` is deliberately NOT held
+/// here — it is a single global file, so holding it would freeze the whole engine
+/// and double-fire every other schedule; the next slot fires normally and this
+/// one is recorded as skipped (no retry). `deliver_cron_fire` always completes
+/// (inject/enqueue errors become their own `record_run` status, never a throw),
+/// so a REGISTERED subscriber always yields `handled >= 1` — `handled == 0`
+/// specifically means the cron delivery path was unregistered.
+fn note_unhandled_cron_fire(home: &Path, sched_id: &str, target: &str, handled: usize) {
+    if handled == 0 {
+        crate::schedules::record_run(home, sched_id, "skipped: no-subscriber");
+        tracing::warn!(
+            schedule = %sched_id,
+            target = %target,
+            "#1720: cron fire reached no subscriber — recorded skipped (cron delivery path unregistered?)"
+        );
     }
 }
 
@@ -239,8 +262,12 @@ fn deliver_cron_fire(
     }
 }
 
-/// #event-bus pattern (cron_tick): subscriber — re-run the fire effect.
-fn handle_event(registry: &AgentRegistry, event: &crate::daemon::event_bus::Event) {
+/// #event-bus pattern (cron_tick): subscriber — re-run the fire effect. Returns
+/// `true` iff this was a `CronFire` (and the effect ran) — `deliver_cron_fire`
+/// always completes (inject/enqueue errors become a `record_run` status, never a
+/// throw), so a `true` return means the fire was handled. `check_schedules` uses
+/// the emit handled-count: `0` = no cron subscriber ran (#1720) → record skipped.
+fn handle_event(registry: &AgentRegistry, event: &crate::daemon::event_bus::Event) -> bool {
     if let crate::daemon::event_bus::EventKind::CronFire {
         sched_id,
         target,
@@ -262,6 +289,9 @@ fn handle_event(registry: &AgentRegistry, event: &crate::daemon::event_bus::Even
                 missed: *missed,
             },
         );
+        true
+    } else {
+        false
     }
 }
 
@@ -941,6 +971,33 @@ mod tests {
             last_status(&home),
             "ok_inbox",
             "#event-bus Option A: gate-off must deliver via legacy (no regression)"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// #1720 (Y): a fire that reaches NO subscriber (`handled == 0`) is recorded
+    /// as `skipped: no-subscriber` — VISIBLE, not silently lost (the core
+    /// #1720 pain). A delivered fire (`handled >= 1`) records nothing extra (the
+    /// subscriber's `deliver_cron_fire` already recorded the real status). This
+    /// tests the (Y) decision directly — the global subscriber is registered by
+    /// the test-harness ctor, so `check_schedules` itself can't reach
+    /// `handled == 0`; the helper is the seam.
+    #[test]
+    fn unhandled_cron_fire_records_skipped_1720() {
+        let home = cron_tmp_home("unhandled");
+        seed_oneshot(&home, "x"); // schedule "s-1488", empty run_history
+        super::note_unhandled_cron_fire(&home, "s-1488", "x", 0);
+        assert_eq!(
+            last_status(&home),
+            "skipped: no-subscriber",
+            "#1720: an unhandled fire must be recorded, not silently dropped"
+        );
+        let before = crate::schedules::load(&home).schedules[0].run_history.len();
+        super::note_unhandled_cron_fire(&home, "s-1488", "x", 1);
+        let after = crate::schedules::load(&home).schedules[0].run_history.len();
+        assert_eq!(
+            before, after,
+            "#1720: a handled fire (>=1) must NOT record a skip"
         );
         std::fs::remove_dir_all(home).ok();
     }

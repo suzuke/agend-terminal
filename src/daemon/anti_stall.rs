@@ -221,7 +221,7 @@ fn deliver_stall(
 /// #event-bus first-pattern: bus subscriber — on a `TaskStateChanged` event,
 /// run the stall delivery (the gate-ON path). Registered once at daemon startup
 /// via [`register_subscriber`].
-fn handle_event(event: &crate::daemon::event_bus::Event) {
+fn handle_event(event: &crate::daemon::event_bus::Event) -> bool {
     if let crate::daemon::event_bus::EventKind::TaskStateChanged {
         task_id,
         title,
@@ -240,6 +240,9 @@ fn handle_event(event: &crate::daemon::event_bus::Event) {
             *eta_secs,
             assignee.as_deref(),
         );
+        true
+    } else {
+        false
     }
 }
 

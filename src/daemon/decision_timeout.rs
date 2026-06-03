@@ -347,7 +347,7 @@ fn deliver_timeout(
 
 /// #event-bus pattern #2: bus subscriber — deliver on a `DecisionTimeout` event
 /// (the gate-ON path). Registered once at daemon startup via [`register_subscriber`].
-fn handle_event(event: &crate::daemon::event_bus::Event) {
+fn handle_event(event: &crate::daemon::event_bus::Event) -> bool {
     if let crate::daemon::event_bus::EventKind::DecisionTimeout {
         decision_id,
         sender,
@@ -364,6 +364,9 @@ fn handle_event(event: &crate::daemon::event_bus::Event) {
             *timeout_secs,
             default_action,
         );
+        true
+    } else {
+        false
     }
 }
 

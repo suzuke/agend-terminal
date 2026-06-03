@@ -986,7 +986,7 @@ fn deliver_cascade_cancel(home: &Path, owner: &str, parent_id: &str, child_id: &
 
 /// #event-bus pattern #7 subscriber: re-deliver a `CascadeCancelNotify` event
 /// via the shared `deliver_cascade_cancel`.
-fn handle_event(event: &crate::daemon::event_bus::Event) {
+fn handle_event(event: &crate::daemon::event_bus::Event) -> bool {
     if let crate::daemon::event_bus::EventKind::CascadeCancelNotify {
         owner,
         parent_id,
@@ -994,6 +994,9 @@ fn handle_event(event: &crate::daemon::event_bus::Event) {
     } = &event.kind
     {
         deliver_cascade_cancel(&event.home, owner, parent_id, child_id);
+        true
+    } else {
+        false
     }
 }
 

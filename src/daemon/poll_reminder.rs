@@ -103,9 +103,12 @@ fn deliver_poll_reminder(home: &Path, agent: &str, reminder: &str) {
 }
 
 /// #event-bus pattern #8: subscriber — re-deliver the frozen reminder text.
-fn handle_event(event: &crate::daemon::event_bus::Event) {
+fn handle_event(event: &crate::daemon::event_bus::Event) -> bool {
     if let crate::daemon::event_bus::EventKind::PollReminder { agent, reminder } = &event.kind {
         deliver_poll_reminder(&event.home, agent, reminder);
+        true
+    } else {
+        false
     }
 }
 

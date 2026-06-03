@@ -607,7 +607,7 @@ fn deliver_member_state_change(
 
 /// #event-bus pattern #9 subscriber: re-deliver a `MemberStateChanged` event via
 /// the shared `deliver_member_state_change`.
-fn handle_event(event: &crate::daemon::event_bus::Event) {
+fn handle_event(event: &crate::daemon::event_bus::Event) -> bool {
     if let crate::daemon::event_bus::EventKind::MemberStateChanged {
         agent,
         team,
@@ -634,6 +634,9 @@ fn handle_event(event: &crate::daemon::event_bus::Event) {
             *consecutive_count,
             detected_at,
         );
+        true
+    } else {
+        false
     }
 }
 

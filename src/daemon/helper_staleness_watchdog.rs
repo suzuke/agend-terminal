@@ -161,9 +161,12 @@ fn deliver_helper_staleness(home: &Path, helper_name: &str) {
 }
 
 /// #event-bus pattern #5: subscriber — rebuild the alert from the event.
-fn handle_event(event: &crate::daemon::event_bus::Event) {
+fn handle_event(event: &crate::daemon::event_bus::Event) -> bool {
     if let crate::daemon::event_bus::EventKind::HelperStale { helper_name } = &event.kind {
         deliver_helper_staleness(&event.home, helper_name);
+        true
+    } else {
+        false
     }
 }
 
