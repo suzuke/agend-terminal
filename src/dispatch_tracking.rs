@@ -83,7 +83,17 @@ pub fn sweep_stuck(home: &Path) -> (Vec<DispatchEntry>, Vec<DispatchEntry>) {
     persist_or_log!(
         crate::store::mutate_versioned(&store_path(home), |store: &mut DispatchStore| {
             for entry in store.entries.iter_mut() {
-                if entry.status == "completed" {
+                // Skip BOTH terminal states — mirrors `sweep_orphans`' skip set.
+                // Without skipping `orphaned`, an entry past DISPATCH_ORPHAN_HOURS
+                // flip-flops forever: `sweep_orphans` overwrites its `asked` status
+                // with `orphaned`, then this sweep sees `orphaned != "asked"` and
+                // re-asks (re-marking `asked`), which `sweep_orphans` flips back —
+                // re-firing a "dispatch stuck check" every maintenance tick until
+                // the 30-day GC. `orphaned` = already given up after 24h; never nag
+                // again. (#1488 noted this re-fire but only fixed deleted-instance
+                // entries via `cleanup_for_instance`; this fixes still-existing
+                // targets whose orphaned entries otherwise nag for ~30 days.)
+                if entry.status == "completed" || entry.status == "orphaned" {
                     continue;
                 }
                 let delegated = match chrono::DateTime::parse_from_rfc3339(&entry.delegated_at) {
@@ -141,12 +151,12 @@ pub fn sweep_orphans(home: &Path) -> Vec<DispatchEntry> {
 
 /// #1488: drop every dispatch entry that involves `instance` as either the
 /// dispatcher (`from`) or the target (`to`). When an instance is deleted, its
-/// in-flight dispatches can never complete, so `sweep_stuck` would re-warn /
-/// re-ask them forever (the empirical ~81 "dispatch stuck check" messages).
-/// Marking them "orphaned" is NOT enough — `sweep_stuck` only skips
-/// `completed`, so an orphaned-but-uncompleted entry still re-fires. Removal
-/// is the only thing that stops the noise; the entries carry no re-target
-/// value once the instance is gone. Returns the number removed.
+/// in-flight dispatches can never complete, so without cleanup they linger as
+/// noise (the empirical ~81 "dispatch stuck check" messages). `sweep_stuck` now
+/// skips `orphaned` (the flip-flop fix), so such entries stop re-asking after
+/// 24h — but removal is still preferred for a deleted instance: the entry can
+/// never complete and carries no re-target value, so freeing the row beats
+/// leaving it for the 30-day GC. Returns the number removed.
 pub fn cleanup_for_instance(home: &Path, instance: &str) -> usize {
     let mut removed = 0usize;
     persist_or_log!(
@@ -278,6 +288,57 @@ mod tests {
         );
         assert_eq!(asks.len(), 1, "31min old dispatch must ask");
         assert_eq!(asks[0].to, "reviewer");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Flip-flop fix: an `orphaned` entry (already given up on after 24h) must
+    /// NOT be re-asked by `sweep_stuck`. Before the fix, `sweep_orphans`
+    /// overwrote `asked` → `orphaned`, then `sweep_stuck` saw `orphaned != "asked"`
+    /// and re-asked, which `sweep_orphans` flipped back — re-firing a "dispatch
+    /// stuck check" every maintenance tick for ~30 days until GC. The same-age
+    /// `pending` entry MUST still ask: the fix skips only the terminal `orphaned`
+    /// state, it does not suppress normal nagging.
+    #[test]
+    fn orphaned_entry_is_not_re_asked() {
+        let home = tmp_home("orphaned-no-reask");
+        let old = (chrono::Utc::now() - chrono::Duration::hours(25)).to_rfc3339();
+        track_dispatch(
+            &home,
+            DispatchEntry {
+                task_id: Some("t-orphaned".into()),
+                from: "lead".into(),
+                to: "fixup-dev-2".into(),
+                from_id: None,
+                to_id: None,
+                delegated_at: old.clone(),
+                status: "orphaned".into(),
+            },
+        );
+        track_dispatch(
+            &home,
+            DispatchEntry {
+                task_id: Some("t-pending".into()),
+                from: "lead".into(),
+                to: "fixup-dev-2".into(),
+                from_id: None,
+                to_id: None,
+                delegated_at: old,
+                status: "pending".into(),
+            },
+        );
+        let (_warns, asks) = sweep_stuck(&home);
+        assert_eq!(
+            asks.len(),
+            1,
+            "only the pending entry asks; the orphaned one is skipped"
+        );
+        assert_eq!(asks[0].task_id.as_deref(), Some("t-pending"));
+        assert!(
+            !asks
+                .iter()
+                .any(|a| a.task_id.as_deref() == Some("t-orphaned")),
+            "an orphaned entry must never be re-asked (flip-flop fix)"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
