@@ -23,15 +23,27 @@ pub enum EventKind {
         started_at: Option<String>,
         eta_secs: Option<i64>,
     },
+    // #event-bus pattern (ci_watch): the per-subscriber CI pass / fail notify.
+    // `body` is the RENDERED inbox body — it embeds a live-fetched failure-log tail
+    // (`gh --log-failed`), so re-fetching in the subscriber would burn GitHub
+    // rate-limit + could drift; it is frozen at the producer. `correlation_id`
+    // (repo@branch) + `supersede_token` (ci-<run>-<sha>) reproduce the legacy
+    // enqueue + supersede bookkeeping. One event is emitted PER recipient.
     CiReady {
         repo: String,
         branch: String,
         target: String,
+        body: String,
+        correlation_id: String,
+        supersede_token: String,
     },
     CiFail {
         repo: String,
         branch: String,
         target: String,
+        body: String,
+        correlation_id: String,
+        supersede_token: String,
     },
     DispatchIdleExceeded {
         dispatcher: String,
@@ -248,6 +260,9 @@ mod tests {
             repo: "owner/repo".into(),
             branch: "main".into(),
             target: "dev".into(),
+            body: "[ci-pass]".into(),
+            correlation_id: "owner/repo@main".into(),
+            supersede_token: "ci-1-abc".into(),
         });
         assert!(
             received.lock().unwrap().is_empty(),
@@ -299,6 +314,9 @@ mod tests {
             repo: "o/r".into(),
             branch: "feat".into(),
             target: "dev".into(),
+            body: "[ci-fail]".into(),
+            correlation_id: "o/r@feat".into(),
+            supersede_token: "ci-2-def".into(),
         });
         assert_eq!(count_a.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert_eq!(count_b.load(std::sync::atomic::Ordering::Relaxed), 1);
@@ -319,11 +337,17 @@ mod tests {
                 repo: "o/r".into(),
                 branch: "b".into(),
                 target: "t".into(),
+                body: "[ci-pass]".into(),
+                correlation_id: "o/r@b".into(),
+                supersede_token: "ci-1-aaa".into(),
             },
             EventKind::CiFail {
                 repo: "o/r".into(),
                 branch: "b".into(),
                 target: "t".into(),
+                body: "[ci-fail]".into(),
+                correlation_id: "o/r@b".into(),
+                supersede_token: "ci-1-bbb".into(),
             },
             EventKind::DispatchIdleExceeded {
                 dispatcher: "lead".into(),

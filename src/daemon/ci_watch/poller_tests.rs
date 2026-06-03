@@ -5485,3 +5485,83 @@ fn build_inbox_body_embeds_log_tail_when_present() {
         "#1537-fu: no-tail body points to the manual command instead"
     );
 }
+
+// ── #event-bus (ci_watch) migration tests ─────────────────────────────────
+
+/// gate-ON parity: `emit(CiReady)` → subscriber re-delivers the inbox half (A)
+/// BYTE-IDENTICALLY to the legacy `deliver_ci_watch` direct enqueue. The rendered
+/// `body` is carried verbatim (live-fetched log tail frozen at the producer). The
+/// idle-hint PTY wake (B) is covered by the shared-deliver-fn invariant, not
+/// separately asserted. Distinct homes (same recipient) keep the durable inbox
+/// enqueues independent; #911 dedup only gates the inject hint, not the enqueue.
+#[test]
+fn ci_watch_gate_on_emit_subscriber_matches_legacy() {
+    let body = build_inbox_body(
+        "[ci-pass] o/r@feat (abc): passed ✓",
+        "success",
+        None,
+        "https://example.com/1",
+        Some(1),
+        None,
+    );
+    let key = "o/r@feat".to_string();
+    let token = "ci-1-abc".to_string();
+
+    let legacy = tmp_dir("ciwatch-parity-legacy");
+    super::deliver_ci_watch(&legacy, "rev", &body, &key, &token);
+
+    let bus_home = tmp_dir("ciwatch-parity-bus");
+    let bus = crate::daemon::event_bus::EventBus::new_enabled_for_test();
+    let h = bus_home.clone();
+    bus.subscribe(move |e| super::handle_event(&h, e));
+    bus.emit(crate::daemon::event_bus::EventKind::CiReady {
+        repo: "o/r".into(),
+        branch: "feat".into(),
+        target: "rev".into(),
+        body: body.clone(),
+        correlation_id: key.clone(),
+        supersede_token: token.clone(),
+    });
+
+    let legacy_msgs: Vec<_> = crate::inbox::drain(&legacy, "rev")
+        .into_iter()
+        .map(|m| (m.from, m.kind, m.text, m.correlation_id))
+        .collect();
+    let bus_msgs: Vec<_> = crate::inbox::drain(&bus_home, "rev")
+        .into_iter()
+        .map(|m| (m.from, m.kind, m.text, m.correlation_id))
+        .collect();
+    assert!(!legacy_msgs.is_empty(), "legacy enqueue must land");
+    assert_eq!(
+        legacy_msgs, bus_msgs,
+        "bus inbox-half (A) must match legacy byte-for-byte"
+    );
+    std::fs::remove_dir_all(&legacy).ok();
+    std::fs::remove_dir_all(&bus_home).ok();
+}
+
+/// gate-OFF no-regression at the deliver level: `deliver_ci_watch` (the unified
+/// loop's gate-off branch) enqueues the SAME inbox payload the legacy inline
+/// enqueue produced — `system:ci` / `ci-watch` / rendered body / repo@branch
+/// correlation. (The existing `pass_dedupe_*` + `mock_success_*` integration tests
+/// confirm the loop still skips action_target/zombie + delivers on success.)
+#[test]
+fn ci_watch_deliver_matches_legacy_payload() {
+    let body = build_inbox_body(
+        "[ci-fail] o/r@feat (abc): failure",
+        "failure",
+        Some("job X failed"),
+        "https://example.com/2",
+        Some(2),
+        Some("thread panicked"),
+    );
+    let home = tmp_dir("ciwatch-deliver-payload");
+    super::deliver_ci_watch(&home, "rev", &body, "o/r@feat", "ci-2-abc");
+    let msgs = crate::inbox::drain(&home, "rev");
+    assert_eq!(msgs.len(), 1, "deliver must enqueue exactly one msg");
+    assert_eq!(msgs[0].from, "system:ci");
+    assert_eq!(msgs[0].kind.as_deref(), Some("ci-watch"));
+    assert_eq!(msgs[0].text, body);
+    assert_eq!(msgs[0].correlation_id.as_deref(), Some("o/r@feat"));
+    std::fs::remove_dir_all(&home).ok();
+}

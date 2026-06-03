@@ -1356,6 +1356,16 @@ async fn fan_out_notifications(
             };
             let fleet_cfg =
                 crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(ctx.home)).ok();
+            // #event-bus (ci_watch, Option A): ONE skip-aware loop over subscribers.
+            // The skips (action_target_on_success + #931 zombie-subscriber) are
+            // applied ONCE so gate-ON and gate-OFF notify the IDENTICAL recipient
+            // set. Per recipient: gate-ON + success/failure → emit Ci{Ready,Fail}
+            // (the subscriber delivers via the shared `deliver_ci_watch`);
+            // everything else (gate-OFF, OR a non-pair "[ci-ended]" conclusion that
+            // has no event kind) → the legacy direct deliver. No double-delivery, no
+            // gate-off regression, no dropped notify. (Replaces the prior dormant
+            // second emit loop, which lacked these skips — a latent parity bug.)
+            let bus = crate::daemon::event_bus::global();
             for sub in ctx.subscribers {
                 if action_target_on_success == Some(sub.as_str()) {
                     continue;
@@ -1376,57 +1386,44 @@ async fn fan_out_notifications(
                     );
                     continue;
                 }
-                crate::inbox::mark_ci_watch_superseded(
-                    ctx.home,
-                    sub,
-                    &repo_branch_key,
-                    &supersede_token,
-                );
-                persist_or_log!(
-                    crate::inbox::enqueue_with_idle_hint(
-                        ctx.home,
-                        sub,
-                        crate::inbox::InboxMessage::new_system(
-                            "system:ci",
-                            "ci-watch",
-                            body.clone()
-                        )
-                        .with_correlation_id(repo_branch_key.clone()),
-                    ),
-                    "ci_watch_notify",
-                    sub
-                );
+                let emitted = if bus.is_enabled() {
+                    match conclusion {
+                        Some("failure") => {
+                            bus.emit(crate::daemon::event_bus::EventKind::CiFail {
+                                repo: ctx.repo.to_string(),
+                                branch: ctx.branch.to_string(),
+                                target: sub.clone(),
+                                body: body.clone(),
+                                correlation_id: repo_branch_key.clone(),
+                                supersede_token: supersede_token.clone(),
+                            });
+                            true
+                        }
+                        Some("success") => {
+                            bus.emit(crate::daemon::event_bus::EventKind::CiReady {
+                                repo: ctx.repo.to_string(),
+                                branch: ctx.branch.to_string(),
+                                target: sub.clone(),
+                                body: body.clone(),
+                                correlation_id: repo_branch_key.clone(),
+                                supersede_token: supersede_token.clone(),
+                            });
+                            true
+                        }
+                        // non-pair conclusion ("[ci-ended]" etc.): no CiReady/CiFail
+                        // kind → fall through to the legacy direct deliver below.
+                        _ => false,
+                    }
+                } else {
+                    false
+                };
+                if !emitted {
+                    deliver_ci_watch(ctx.home, sub, &body, &repo_branch_key, &supersede_token);
+                }
             }
         }
         new_notified_sha = Some(sha.to_string());
         new_notified_conclusion = conclusion.map(String::from);
-        if crate::daemon::event_bus::global().is_enabled() {
-            match conclusion {
-                Some("failure") => {
-                    for sub in ctx.subscribers {
-                        crate::daemon::event_bus::global().emit(
-                            crate::daemon::event_bus::EventKind::CiFail {
-                                repo: ctx.repo.to_string(),
-                                branch: ctx.branch.to_string(),
-                                target: sub.clone(),
-                            },
-                        );
-                    }
-                }
-                Some("success") => {
-                    for sub in ctx.subscribers {
-                        crate::daemon::event_bus::global().emit(
-                            crate::daemon::event_bus::EventKind::CiReady {
-                                repo: ctx.repo.to_string(),
-                                branch: ctx.branch.to_string(),
-                                target: sub.clone(),
-                            },
-                        );
-                    }
-                }
-                _ => {}
-            }
-        }
     }
 
     NotifyOutcome {
@@ -1435,6 +1432,65 @@ async fn fan_out_notifications(
         new_notified_conclusion,
         new_stale_emitted_sha,
     }
+}
+
+/// #event-bus (ci_watch): shared deliver for one subscriber's CI notify — supersede
+/// prior ci-watch msgs for this (sub, repo@branch), then enqueue the RENDERED body
+/// to the subscriber's inbox (with the idle-hint wake). Called by BOTH the legacy
+/// direct path AND the event-bus subscriber, so the inbox enqueue is byte-identical
+/// by construction; the idle-hint PTY wake is covered by the same invariant.
+/// Must NOT run under the registry lock (#1492 self-IPC-under-lock) — both callers
+/// invoke it lock-free (the legacy loop's registry lock is a dropped temporary; the
+/// subscriber fires from `emit`, outside any lock).
+fn deliver_ci_watch(
+    home: &std::path::Path,
+    sub: &str,
+    body: &str,
+    repo_branch_key: &str,
+    supersede_token: &str,
+) {
+    crate::inbox::mark_ci_watch_superseded(home, sub, repo_branch_key, supersede_token);
+    persist_or_log!(
+        crate::inbox::enqueue_with_idle_hint(
+            home,
+            sub,
+            crate::inbox::InboxMessage::new_system("system:ci", "ci-watch", body.to_string())
+                .with_correlation_id(repo_branch_key.to_string()),
+        ),
+        "ci_watch_notify",
+        sub
+    );
+}
+
+/// #event-bus (ci_watch) subscriber: re-deliver a `CiReady`/`CiFail` event via the
+/// shared `deliver_ci_watch`. Both kinds deliver identically (the body already
+/// encodes pass/fail); the kind split is purely semantic.
+fn handle_event(home: &std::path::Path, event: &crate::daemon::event_bus::Event) {
+    match &event.kind {
+        crate::daemon::event_bus::EventKind::CiReady {
+            target,
+            body,
+            correlation_id,
+            supersede_token,
+            ..
+        }
+        | crate::daemon::event_bus::EventKind::CiFail {
+            target,
+            body,
+            correlation_id,
+            supersede_token,
+            ..
+        } => {
+            deliver_ci_watch(home, target, body, correlation_id, supersede_token);
+        }
+        _ => {}
+    }
+}
+
+/// Register the ci-watch subscriber once at daemon startup (`run_core`). Dormant
+/// unless `AGEND_EVENT_BUS=1` (emit is a no-op when gate-off).
+pub(crate) fn register_subscriber(home: std::path::PathBuf) {
+    crate::daemon::event_bus::global().subscribe(move |e| handle_event(&home, e));
 }
 
 fn persist_watch_state(

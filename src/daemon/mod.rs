@@ -419,6 +419,7 @@ fn run_core(
     crate::daemon::cron_tick::register_subscriber(home.to_path_buf(), ctx.registry.clone());
     crate::daemon::supervisor::register_subscriber(home.to_path_buf());
     crate::daemon::conflict_notify::register_subscriber(home.to_path_buf());
+    crate::daemon::ci_watch::register_subscriber(home.to_path_buf());
 
     spawn_fleet_agents(home, &agents, &ctx);
 

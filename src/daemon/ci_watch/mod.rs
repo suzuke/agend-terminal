@@ -30,6 +30,7 @@ pub use poller::{emit_ci_conflict_alert, watch_start_check_mergeable};
 // gates the clippy unused-imports rule when building production binary.
 #[cfg(test)]
 pub(crate) use poller::parse_review_class;
+pub(crate) use poller::register_subscriber;
 #[allow(unused_imports)]
 pub use provider::{
     detect_provider_from_remote, github_token_warning, github_token_warning_from_env,
