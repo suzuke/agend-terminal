@@ -944,22 +944,64 @@ fn cascade_cancel_children(
     }
     for (child_id, owner) in notify_ids {
         if let Some(ref owner_name) = owner {
-            let msg = crate::inbox::message::InboxMessage {
-                text: format!(
-                    "[parent-cancelled] Parent task {parent_id} was cancelled. \
-                     Your in-progress subtask {} may need attention.",
-                    child_id.0
-                ),
-                kind: Some("parent_cancelled".to_string()),
-                ..Default::default()
-            };
-            persist_or_log!(
-                crate::inbox::storage::enqueue(home, &owner_name.0, msg),
-                "cascade_cancel_notify",
-                owner_name.0
-            );
+            route_cascade_cancel(home, &owner_name.0, parent_id, &child_id.0);
         }
     }
+}
+
+/// #event-bus pattern #7 (Option A): gate-ON → emit `CascadeCancelNotify` (the
+/// subscriber delivers via `deliver_cascade_cancel`); gate-OFF (prod default) →
+/// the legacy direct `deliver_cascade_cancel`. No double-delivery, no gate-off
+/// regression.
+fn route_cascade_cancel(home: &Path, owner: &str, parent_id: &str, child_id: &str) {
+    let bus = crate::daemon::event_bus::global();
+    if bus.is_enabled() {
+        bus.emit(crate::daemon::event_bus::EventKind::CascadeCancelNotify {
+            owner: owner.to_string(),
+            parent_id: parent_id.to_string(),
+            child_id: child_id.to_string(),
+        });
+    } else {
+        deliver_cascade_cancel(home, owner, parent_id, child_id);
+    }
+}
+
+/// Shared deliver: enqueue the parent-cancelled notify to the child's owner.
+/// Called by BOTH the legacy path AND the event-bus subscriber, so the two are
+/// byte-identical by construction.
+fn deliver_cascade_cancel(home: &Path, owner: &str, parent_id: &str, child_id: &str) {
+    let msg = crate::inbox::message::InboxMessage {
+        text: format!(
+            "[parent-cancelled] Parent task {parent_id} was cancelled. \
+             Your in-progress subtask {child_id} may need attention."
+        ),
+        kind: Some("parent_cancelled".to_string()),
+        ..Default::default()
+    };
+    persist_or_log!(
+        crate::inbox::storage::enqueue(home, owner, msg),
+        "cascade_cancel_notify",
+        owner
+    );
+}
+
+/// #event-bus pattern #7 subscriber: re-deliver a `CascadeCancelNotify` event
+/// via the shared `deliver_cascade_cancel`.
+fn handle_event(home: &Path, event: &crate::daemon::event_bus::Event) {
+    if let crate::daemon::event_bus::EventKind::CascadeCancelNotify {
+        owner,
+        parent_id,
+        child_id,
+    } = &event.kind
+    {
+        deliver_cascade_cancel(home, owner, parent_id, child_id);
+    }
+}
+
+/// Register the cascade-cancel subscriber once at daemon startup (`run_core`).
+/// Dormant unless `AGEND_EVENT_BUS=1` (emit is a no-op when gate-off).
+pub fn register_subscriber(home: std::path::PathBuf) {
+    crate::daemon::event_bus::global().subscribe(move |e| handle_event(&home, e));
 }
 
 #[cfg(test)]
@@ -1360,5 +1402,67 @@ mod tests {
             !path.exists(),
             "unassigned task should not create dispatch tracking entry"
         );
+    }
+
+    // #event-bus pattern #7: the (from, kind, text, correlation_id) tuple a
+    // drained notify carries — id/timestamp ignored so legacy-vs-bus compares clean.
+    fn cascade_payloads(
+        home: &std::path::Path,
+        recipient: &str,
+    ) -> Vec<(String, Option<String>, String, Option<String>)> {
+        crate::inbox::drain(home, recipient)
+            .into_iter()
+            .map(|m| (m.from, m.kind, m.text, m.correlation_id))
+            .collect()
+    }
+
+    // gate-ON: emit(CascadeCancelNotify)→subscriber re-delivers BYTE-IDENTICALLY
+    // to the legacy `deliver_cascade_cancel` direct enqueue.
+    #[test]
+    fn cascade_gate_on_emit_subscriber_matches_legacy() {
+        let owner = "fixup-dev";
+        let parent_id = "t-parent-1";
+        let child_id = "t-child-1";
+
+        let home_legacy = tmp_home("p7-parity-legacy");
+        deliver_cascade_cancel(&home_legacy, owner, parent_id, child_id);
+
+        let home_bus = tmp_home("p7-parity-bus");
+        let bus = crate::daemon::event_bus::EventBus::new_enabled_for_test();
+        let h = home_bus.clone();
+        bus.subscribe(move |e| handle_event(&h, e));
+        bus.emit(crate::daemon::event_bus::EventKind::CascadeCancelNotify {
+            owner: owner.to_string(),
+            parent_id: parent_id.to_string(),
+            child_id: child_id.to_string(),
+        });
+
+        let legacy = cascade_payloads(&home_legacy, owner);
+        let via_bus = cascade_payloads(&home_bus, owner);
+        assert!(!legacy.is_empty(), "legacy notify must enqueue");
+        assert_eq!(
+            legacy, via_bus,
+            "bus delivery must match legacy byte-for-byte"
+        );
+
+        std::fs::remove_dir_all(&home_legacy).ok();
+        std::fs::remove_dir_all(&home_bus).ok();
+    }
+
+    // gate-OFF (default): route_cascade_cancel falls through to the legacy
+    // deliver, so the notify still lands without the bus.
+    #[test]
+    fn cascade_gate_off_route_delivers_via_legacy() {
+        assert!(
+            !crate::daemon::event_bus::global().is_enabled(),
+            "test must run with AGEND_EVENT_BUS gate off"
+        );
+        let home = tmp_home("p7-gate-off");
+        route_cascade_cancel(&home, "fixup-dev", "t-parent-2", "t-child-2");
+        let alerts = cascade_payloads(&home, "fixup-dev");
+        assert_eq!(alerts.len(), 1, "gate-off must deliver via legacy path");
+        assert_eq!(alerts[0].1.as_deref(), Some("parent_cancelled"));
+        assert!(alerts[0].2.contains("t-parent-2") && alerts[0].2.contains("t-child-2"));
+        std::fs::remove_dir_all(&home).ok();
     }
 }
