@@ -422,6 +422,47 @@ pub(crate) fn register_event_subscribers(registry: &AgentRegistry) {
     crate::daemon::ci_watch::register_subscriber();
 }
 
+/// Build the canonical per-tick handler pipeline. Shared by `run_core` (daemon)
+/// and `app::run_app` (owned `agend-terminal app`) so both run the IDENTICAL set
+/// — the single source of truth that closes the recurring "app hand-picks a
+/// subset → silently drops a handler" class (#1002 / #982 / #1719). App filters
+/// only an explicit allowlist (see `app::APP_TICK_ALLOWLIST`), and a completeness
+/// invariant fails CI if a new handler lands here but neither runs in app nor is
+/// allowlisted.
+///
+/// `crash_tx` is consumed by `RecoveryDispatcherHandler`; app passes a throwaway
+/// sender because it allowlists that handler out (it does pane-based respawn).
+pub(crate) fn build_default_handlers(
+    crash_tx: crossbeam_channel::Sender<crate::agent::AgentExitEvent>,
+) -> Vec<Box<dyn per_tick::PerTickHandler>> {
+    let watchdog_dry_run = watchdog::watchdog_dry_run_from_env();
+    // Vec order MUST match the pre-extraction call order (zero-behavior-change guarantee).
+    vec![
+        Box::new(per_tick::HangDetectionHandler::new()),
+        Box::new(per_tick::RecoveryDispatcherHandler::new(
+            std::sync::Arc::new(crash_tx),
+        )),
+        Box::new(per_tick::WatchdogHandler::new(watchdog_dry_run)),
+        Box::new(per_tick::ExternalLivenessHandler::new()),
+        Box::new(per_tick::SnapshotRotationHandler::new()),
+        Box::new(per_tick::CheckSchedulesHandler::new()),
+        Box::new(per_tick::CiWatchPollHandler::new()),
+        Box::new(per_tick::PrStateScanHandler::new()),
+        Box::new(per_tick::InboxMaintenanceHandler::new(60)),
+        Box::new(per_tick::PollReminderHandler::new(30)),
+        // #1491(A): inbox-stuck watchdog — every 30 ticks (~5min). Detects an
+        // agent receiving but not draining its inbox; notifies lead (no auto-restart).
+        Box::new(per_tick::InboxStuckHandler::new(30)),
+        // #1491(B): next_after_ci handoff-timeout watchdog — every 30 ticks
+        // (~5min). Escalates an unread [ci-ready-for-action] handoff to the
+        // reviewer's lead when it sits unclaimed past the timeout.
+        Box::new(per_tick::HandoffTimeoutHandler::new(30)),
+        Box::new(per_tick::LogRotationHandler::new(360)),
+        Box::new(per_tick::ThreadDumpHandler::new()),
+        Box::new(per_tick::GcTickHandler::new(360)),
+    ]
+}
+
 /// Sprint 57 Wave 3 PR-2 (#548 Q4 contract pin): the canonical
 /// lockfile is `$AGEND_HOME/.daemon.lock` (one acquirer at a time
 /// across all daemon processes). Per-PID identity is at
@@ -698,32 +739,7 @@ fn build_tick_infrastructure(
     // by instances deleted before the cascade-on-delete fix existed.
     crate::daemon::orphan_sweep::run(home);
 
-    let watchdog_dry_run = watchdog::watchdog_dry_run_from_env();
-    // Vec order MUST match the pre-extraction call order (zero-behavior-change guarantee).
-    let handlers: Vec<Box<dyn per_tick::PerTickHandler>> = vec![
-        Box::new(per_tick::HangDetectionHandler::new()),
-        Box::new(per_tick::RecoveryDispatcherHandler::new(
-            std::sync::Arc::new(ctx.crash_tx.clone()),
-        )),
-        Box::new(per_tick::WatchdogHandler::new(watchdog_dry_run)),
-        Box::new(per_tick::ExternalLivenessHandler::new()),
-        Box::new(per_tick::SnapshotRotationHandler::new()),
-        Box::new(per_tick::CheckSchedulesHandler::new()),
-        Box::new(per_tick::CiWatchPollHandler::new()),
-        Box::new(per_tick::PrStateScanHandler::new()),
-        Box::new(per_tick::InboxMaintenanceHandler::new(60)),
-        Box::new(per_tick::PollReminderHandler::new(30)),
-        // #1491(A): inbox-stuck watchdog — every 30 ticks (~5min). Detects an
-        // agent receiving but not draining its inbox; notifies lead (no auto-restart).
-        Box::new(per_tick::InboxStuckHandler::new(30)),
-        // #1491(B): next_after_ci handoff-timeout watchdog — every 30 ticks
-        // (~5min). Escalates an unread [ci-ready-for-action] handoff to the
-        // reviewer's lead when it sits unclaimed past the timeout.
-        Box::new(per_tick::HandoffTimeoutHandler::new(30)),
-        Box::new(per_tick::LogRotationHandler::new(360)),
-        Box::new(per_tick::ThreadDumpHandler::new()),
-        Box::new(per_tick::GcTickHandler::new(360)),
-    ];
+    let handlers = build_default_handlers(ctx.crash_tx.clone());
 
     let tick_rx = {
         let (tx, rx) = crossbeam_channel::bounded(1);

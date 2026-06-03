@@ -128,6 +128,33 @@ pub fn run(fleet_path_override: Option<&str>) -> Result<()> {
     result
 }
 
+/// #1726: per-tick handlers that app-standalone INTENTIONALLY does not run,
+/// excluded from the otherwise-shared `build_default_handlers` set. Each is a
+/// deliberate, justified omission; the completeness invariant
+/// (`app_tick_handlers_cover_every_non_allowlisted_daemon_handler`) fails CI if a
+/// NEW handler is added to `build_default_handlers` but is neither run in app nor
+/// listed here — so additions are a conscious decision, not silent drift.
+///
+/// - `recovery_dispatcher`: coupled to run_core's `crash_rx` + `handle_crash_respawn`,
+///   which app-standalone has no equivalent of — it does pane-based respawn in the
+///   TUI loop. (#685 dispatch-recovery is shadow-default-off anyway.)
+/// - `snapshot_rotation`: app owns session persistence via `session::save_session_if_changed`.
+/// - `thread_dump`: env-gated diagnostic, not needed in the interactive TUI.
+const APP_TICK_ALLOWLIST: &[&str] = &["recovery_dispatcher", "snapshot_rotation", "thread_dump"];
+
+/// Build the per-tick handler set app-standalone runs: the shared
+/// `build_default_handlers` minus `APP_TICK_ALLOWLIST`. Extracted so the
+/// completeness invariant can compare it against the full daemon set.
+///
+/// `RecoveryDispatcherHandler` is allowlisted out, so the `crash_tx` it would
+/// consume is a throwaway sender (its receiver is dropped immediately).
+fn app_tick_handlers() -> Vec<Box<dyn crate::daemon::per_tick::PerTickHandler>> {
+    let (crash_tx, _crash_rx) = crossbeam_channel::bounded(1);
+    let mut handlers = crate::daemon::build_default_handlers(crash_tx);
+    handlers.retain(|h| !APP_TICK_ALLOWLIST.contains(&h.name()));
+    handlers
+}
+
 /// Main event loop for the TUI app.
 ///
 /// M5 note: this function is 550+ lines with 15+ locals. Extraction to
@@ -392,6 +419,18 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // concrete Receiver but this arm will never fire.
     let never_rx = crossbeam_channel::never::<()>();
     let tick_rx_ref = tick_rx.as_ref().unwrap_or(&never_rx);
+
+    // #1726: app-standalone runs the FULL daemon per-tick pipeline (same
+    // `build_default_handlers` as run_core) minus APP_TICK_ALLOWLIST, replacing
+    // the old hand-picked subset that kept silently dropping handlers (#1002 /
+    // #982 / #1719 class). Built once, reused each tick like run_core. App has no
+    // external-agent / AgentConfig registry, so these are empty; the handlers that
+    // read them (external_liveness, inbox_maintenance worktree cleanup) graceful-
+    // no-op on empty. In attached mode the tick arm never fires, so these are
+    // harmlessly unused.
+    let app_externals: crate::agent::ExternalRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let app_configs: crate::api::ConfigRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let app_handlers = app_tick_handlers();
 
     loop {
         if crate::bootstrap::signals::term_requested() {
@@ -710,35 +749,23 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 }
             }
             recv(tick_rx_ref) -> _ => {
-                // Periodic maintenance — mirrors daemon tick consumers.
-                // Gated to owned mode via tick_rx (None in attached mode).
-                crate::daemon::cron_tick::check_schedules(&home);
-                crate::daemon::ci_watch::check_ci_watches(&home, &registry);
-                {
-                    let reg = crate::agent::lock_registry(&registry);
-                    for handle in reg.values() {
-                        {
-                            let mut core = handle.core.lock();
-                            core.health.maybe_decay();
-                            core.state.tick();
-                            let agent_state = core.state.current;
-                            let silent = core.state.last_output.elapsed();
-                            let silent_productive =
-                                core.state.last_productive_output.elapsed();
-                            // Sprint 24 P1: pair snapshot for input-aware
-                            // hang discrimination (matches daemon/mod.rs
-                            // pattern).
-                            let pair = crate::daemon::heartbeat_pair::snapshot_for(handle.name.as_str());
-                            core.health.check_hang(
-                                agent_state,
-                                silent,
-                                silent_productive,
-                                pair.last_input_at_ms,
-                                pair.heartbeat_at_ms,
-                            );
-                        }
-                    }
-                }
+                // #1726: owned-mode periodic maintenance now runs the FULL daemon
+                // per-tick pipeline (build_default_handlers minus APP_TICK_ALLOWLIST)
+                // instead of a hand-picked subset. Gated to owned mode via tick_rx
+                // (None in attached mode). The replaced manual calls map to:
+                //   cron_tick::check_schedules      → CheckSchedulesHandler
+                //   ci_watch::check_ci_watches      → CiWatchPollHandler
+                //   health.maybe_decay + check_hang → HangDetectionHandler
+                //   core.state.tick()               → supervisor::spawn (runs in
+                //     owned mode too — supervisor.rs:tick; the old manual call here
+                //     was a benign idempotent double, now removed).
+                let tick_ctx = crate::daemon::per_tick::TickContext {
+                    home: &home,
+                    registry: &registry,
+                    externals: &app_externals,
+                    configs: &app_configs,
+                };
+                crate::daemon::per_tick::run_handlers_with_panic_guard(&app_handlers, &tick_ctx);
             }
             default(std::time::Duration::from_millis(50)) => {
                 // #1479: throttled, change-gated session persistence (every
@@ -1444,6 +1471,70 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).ok();
         dir
+    }
+
+    /// #1726 completeness invariant — the guard that closes the recurring
+    /// #1002 / #982 / #1719 "app silently drops a handler" class. Compares two
+    /// independently-built `name()` sets (the full daemon pipeline vs app's actual
+    /// run set), so it has teeth and is not a tautology: a NEW handler added to
+    /// `build_default_handlers` lands in `all`, and unless app runs it OR it is
+    /// allowlisted, `missing` is non-empty → CI red.
+    #[test]
+    fn app_tick_handlers_cover_every_non_allowlisted_daemon_handler() {
+        use std::collections::HashSet;
+        let (crash_tx, _rx) = crossbeam_channel::bounded(1);
+        let all: HashSet<&str> = crate::daemon::build_default_handlers(crash_tx)
+            .iter()
+            .map(|h| h.name())
+            .collect();
+        let app: HashSet<&str> = app_tick_handlers().iter().map(|h| h.name()).collect();
+
+        // Positive: every non-allowlisted daemon handler must run in app.
+        let missing: Vec<&str> = all
+            .difference(&app)
+            .filter(|n| !APP_TICK_ALLOWLIST.contains(n))
+            .copied()
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "app-standalone must run these per_tick handlers (or add to APP_TICK_ALLOWLIST \
+             with a justification): {missing:?}"
+        );
+        // Negative probe: no stale allowlist entry — every allowlisted name must
+        // still exist in the daemon set (catches a renamed/removed handler).
+        for a in APP_TICK_ALLOWLIST {
+            assert!(
+                all.contains(a),
+                "stale APP_TICK_ALLOWLIST entry '{a}' — handler renamed or removed?"
+            );
+            assert!(
+                !app.contains(a),
+                "allowlisted handler '{a}' must NOT run in app-standalone"
+            );
+        }
+    }
+
+    /// #1726 must-verify: app-standalone runs these handlers with EMPTY
+    /// externals/configs (it has no external-agent / AgentConfig registry) and a
+    /// possibly-empty registry. None may panic — `run_handlers` has catch_unwind,
+    /// but we want a clean no-op degrade, so we call each `run()` directly (no
+    /// catch) and a panic fails the test.
+    #[test]
+    fn app_tick_handlers_no_panic_on_empty_context() {
+        let home = tmp_home("tick-empty-ctx");
+        let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let externals: crate::agent::ExternalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let configs: crate::api::ConfigRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let ctx = crate::daemon::per_tick::TickContext {
+            home: &home,
+            registry: &registry,
+            externals: &externals,
+            configs: &configs,
+        };
+        for h in app_tick_handlers() {
+            h.run(&ctx); // panic here = test failure
+        }
+        std::fs::remove_dir_all(&home).ok();
     }
 
     fn pane(name: &str) -> Pane {
