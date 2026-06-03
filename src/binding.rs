@@ -126,45 +126,20 @@ pub fn unbind(home: &Path, agent: &str) {
     }
 }
 
-/// #1651 rollout pass (daemon startup): bless pre-#1651 bindings that have NO
-/// HMAC sidecar yet. Bindings + worktrees PERSIST across a daemon restart and are
-/// NOT re-bound on startup, so without this a pre-existing (unsigned) binding
-/// would verify-fail in the shim and FALSE-DENY a legit agent's push until its
-/// next re-bind.
-///
-/// SECURITY: only bindings with NO sidecar are re-signed (the genuine rollout
-/// case — those files were written by a trusted daemon before this feature, and
-/// were already unprotected pre-#1651). A binding that ALREADY has a sidecar is
-/// left untouched: if that sidecar is invalid (tampered after signing), it stays
-/// fail-closed and is NOT re-blessed by a restart. Idempotent — a no-op once
-/// every binding carries a sidecar.
-pub fn resign_unsigned_bindings(home: &Path) {
-    let Ok(entries) = std::fs::read_dir(crate::paths::runtime_dir(home)) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let dir = entry.path();
-        let binding = dir.join("binding.json");
-        let sig = binding_sig_path(&dir);
-        if !binding.exists() || sig.exists() {
-            continue; // no binding, or already signed → leave it
-        }
-        let Ok(body) = std::fs::read(&binding) else {
-            continue;
-        };
-        match crate::config_integrity::sign(home, &body) {
-            Ok(tag) => match crate::store::atomic_write(&sig, tag.as_bytes()) {
-                Ok(()) => {
-                    tracing::info!(?dir, "#1651 startup: signed pre-existing unsigned binding")
-                }
-                Err(e) => {
-                    tracing::warn!(?dir, error = %e, "#1651 startup re-sign: sidecar write failed")
-                }
-            },
-            Err(e) => tracing::warn!(?dir, error = %e, "#1651 startup re-sign: HMAC sign failed"),
-        }
-    }
-}
+// #1688 (codex): there is intentionally NO startup "re-sign unsigned bindings"
+// pass. It was a wash-white hole — keying the decision on "has no sidecar" cannot
+// distinguish a legit pre-#1651 binding from an attacker that tampered
+// binding.json AND deleted the sidecar, and the daemon has NO trusted source at
+// startup to tell them apart (`reconcile_orphan_leases` is log-only; binding.json
+// is the sole on-disk record; bindings are only (re)established via
+// `dispatch_auto_bind_lease`/`bind_full` at dispatch time). So a sidecar-less
+// binding is left UNSIGNED → the shim fails closed (unbound → deny), exactly like
+// a fresh, never-dispatched agent. A legit binding re-signs on its next dispatch
+// or `bind_self`. The rollout cost — agents whose binding survives the activating
+// restart are denied pushes until re-dispatched — is a VISIBLE, self-healing
+// trade-off (the agent reports `blocked`), deliberately chosen over a SILENT
+// wash-white. (Activating restart: the operator re-dispatches / has running
+// agents `bind_self` once; one-time.)
 
 /// Returns Some(agent_name) if any other agent has bound this branch.
 /// Used by dispatch_auto_bind_lease to enforce cross-agent branch uniqueness.
@@ -407,6 +382,38 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).ok();
         dir
+    }
+
+    /// #1688 (codex): the daemon startup must NOT auto-bless a sidecar-less
+    /// binding. "No sidecar" cannot distinguish a legit unsigned binding from an
+    /// attacker that tampered binding.json AND deleted the sidecar — there is no
+    /// trusted source at startup to tell them apart, so the only safe behaviour is
+    /// to NOT sign (fail-closed → unbound; legit bindings re-sign on the next
+    /// dispatch / `bind_self`). This pins that a tampered, sidecar-less binding is
+    /// NOT made verifiable by the startup pass — RED while the (now-removed) blind
+    /// `resign_unsigned_bindings` washed it white.
+    #[test]
+    fn startup_does_not_wash_white_tampered_sidecarless_binding_1688() {
+        let home = tmp_home("washwhite-1688");
+        // Shared integrity key present → a sign WOULD produce a verifiable tag.
+        std::fs::write(home.join(".config-integrity-key"), [9u8; 32]).unwrap();
+        // Attacker blind-writes a self-authorizing branch and removes the sidecar.
+        let dir = crate::paths::runtime_dir(&home).join("ag");
+        std::fs::create_dir_all(&dir).unwrap();
+        let forged = r#"{"version":1,"agent":"ag","task_id":"T-1","branch":"main"}"#;
+        std::fs::write(dir.join("binding.json"), forged).unwrap();
+        // (no binding.json.sig — the wash-white precondition)
+
+        // Daemon startup binding handling. Post-#1688 this does NOTHING to an
+        // unsigned binding (the blind re-sign is gone) — so nothing blesses it.
+
+        // The forged content must NOT be verifiable as trusted (no valid sidecar).
+        let sig = std::fs::read_to_string(dir.join("binding.json.sig")).unwrap_or_default();
+        assert!(
+            !crate::config_integrity::verify(&home, forged.as_bytes(), &sig),
+            "#1688: a tampered, sidecar-less binding must NOT be auto-blessed at startup"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
