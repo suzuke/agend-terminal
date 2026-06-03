@@ -104,20 +104,40 @@ pub(crate) fn scan_and_emit(
                 continue;
             }
         }
-        emit_staleness_alert(home, name);
+        // #event-bus pattern #5 (Option A): emit→subscriber when the bus is on,
+        // else the legacy direct deliver. Byte-identical either way (both paths
+        // bottom out in `deliver_helper_staleness`).
+        let bus = crate::daemon::event_bus::global();
+        if bus.is_enabled() {
+            bus.emit(crate::daemon::event_bus::EventKind::HelperStale {
+                helper_name: (*name).to_string(),
+            });
+        } else {
+            deliver_helper_staleness(home, name);
+        }
         last_alerted.insert((*name).to_string(), now);
     }
 }
 
-fn emit_staleness_alert(home: &Path, helper_name: &str) {
-    let text = format!(
+/// #event-bus pattern #5: the stale-helper notification text. Shared by the
+/// legacy direct deliver AND the event-bus subscriber so both rebuild the
+/// BYTE-IDENTICAL text.
+fn helper_staleness_text(helper_name: &str) -> String {
+    format!(
         "[helper_staleness_watchdog] helper '{helper_name}' is older \
          than the daemon binary. Run `cargo install --path . --force` \
          then restart the daemon (`agend-terminal stop` → \
          `agend-terminal start`) so the refreshed helpers are loaded. \
          (Sprint 59 Wave 2 PR-3 #13 — proactive vantage; operator-pull \
          `agend-terminal doctor` reports the same state.)"
-    );
+    )
+}
+
+/// #event-bus pattern #5: deliver the stale-helper alert to the hardcoded
+/// `RECIPIENTS` (general + lead). Shared by the legacy path AND the subscriber
+/// ([`handle_event`]), so the two are byte-identical by construction.
+fn deliver_helper_staleness(home: &Path, helper_name: &str) {
+    let text = helper_staleness_text(helper_name);
     for recipient in RECIPIENTS {
         if let Err(e) = crate::inbox::notify_system(
             home,
@@ -142,6 +162,20 @@ fn emit_staleness_alert(home: &Path, helper_name: &str) {
             );
         }
     }
+}
+
+/// #event-bus pattern #5: subscriber — rebuild the alert from the event.
+fn handle_event(home: &Path, event: &crate::daemon::event_bus::Event) {
+    if let crate::daemon::event_bus::EventKind::HelperStale { helper_name } = &event.kind {
+        deliver_helper_staleness(home, helper_name);
+    }
+}
+
+/// #event-bus pattern #5: register the delivery subscriber at daemon startup
+/// (dormant unless `AGEND_EVENT_BUS=1`). Wired beside the other patterns in
+/// `daemon::mod`.
+pub fn register_subscriber(home: std::path::PathBuf) {
+    crate::daemon::event_bus::global().subscribe(move |e| handle_event(&home, e));
 }
 
 #[cfg(test)]
@@ -304,5 +338,73 @@ mod tests {
         assert!(tracker.maybe_scan(&home));
         // Counter reset → next scan requires another full window.
         assert!(!tracker.maybe_scan(&home));
+    }
+
+    fn drained_payloads(
+        home: &Path,
+        recipient: &str,
+    ) -> Vec<(String, Option<String>, String, Option<String>)> {
+        crate::inbox::drain(home, recipient)
+            .into_iter()
+            .map(|m| (m.from, m.kind, m.text, m.correlation_id))
+            .collect()
+    }
+
+    /// #event-bus pattern #5 PARITY (gate-ON): the bus `emit`→subscriber path
+    /// delivers payloads byte-identical (from/kind/text/correlation) to the legacy
+    /// direct enqueue — for BOTH hardcoded recipients (general + lead). Exercises
+    /// the REAL bus emit→fan-out→subscriber wiring. No `env_lock`: `RECIPIENTS` is
+    /// a hardcoded const, not env-derived.
+    #[test]
+    fn gate_on_emit_subscriber_matches_legacy_direct_enqueue() {
+        let helper = "agend-git";
+
+        // Legacy direct deliver (the gate-OFF path).
+        let home_legacy = tmp_home("parity-legacy");
+        std::fs::create_dir_all(home_legacy.join("inbox")).unwrap();
+        deliver_helper_staleness(&home_legacy, helper);
+
+        // Bus emit→subscriber (the gate-ON path) — real fan-out via a test bus.
+        let home_bus = tmp_home("parity-bus");
+        std::fs::create_dir_all(home_bus.join("inbox")).unwrap();
+        let bus = crate::daemon::event_bus::EventBus::new_enabled_for_test();
+        let h = home_bus.clone();
+        bus.subscribe(move |e| handle_event(&h, e));
+        bus.emit(crate::daemon::event_bus::EventKind::HelperStale {
+            helper_name: helper.to_string(),
+        });
+
+        for recipient in RECIPIENTS {
+            let legacy = drained_payloads(&home_legacy, recipient);
+            let viabus = drained_payloads(&home_bus, recipient);
+            assert_eq!(
+                legacy, viabus,
+                "emit→subscriber payload must equal legacy for recipient {recipient}"
+            );
+            assert!(!legacy.is_empty(), "recipient {recipient} must be alerted");
+        }
+        let _ = std::fs::remove_dir_all(&home_legacy);
+        let _ = std::fs::remove_dir_all(&home_bus);
+    }
+
+    /// #event-bus pattern #5 REGRESSION (gate-OFF): with the global bus disabled
+    /// (default test env), the scan still delivers to both recipients via legacy.
+    #[test]
+    fn gate_off_scan_delivers_via_legacy() {
+        assert!(
+            !crate::daemon::event_bus::global().is_enabled(),
+            "precondition: the global bus must be gate-off in the test env"
+        );
+        let home = tmp_home("gate-off");
+        let daemon = stage_stale_state(&home, "agend-git");
+        let mut last_alerted: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
+        scan_and_emit(&home, Some(&daemon), &mut last_alerted);
+        for recipient in RECIPIENTS {
+            assert!(
+                !drained_payloads(&home, recipient).is_empty(),
+                "#event-bus Option A: gate-off must deliver via legacy to {recipient} (no regression)"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

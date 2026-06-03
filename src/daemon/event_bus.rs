@@ -68,6 +68,12 @@ pub enum EventKind {
         condition: String,
         elapsed_min: i64,
     },
+    // #event-bus pattern #5 (helper_staleness_watchdog): the stale-helper alert
+    // formats only the helper name (the rest is static), so the subscriber
+    // rebuilds the byte-identical text + re-runs the hardcoded recipient fan-out.
+    HelperStale {
+        helper_name: String,
+    },
 }
 
 #[derive(Debug, Clone)]
