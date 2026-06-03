@@ -509,17 +509,81 @@ pub(crate) fn maybe_notify_member_state_change(
     });
     track.consecutive += 1;
     track.last_at = now;
+    // #event-bus pattern #9 (Option A): freeze the only now()-derived value
+    // (detected_at) here so BOTH the legacy path and the bus path render the inbox
+    // payload byte-identically. gate-ON → emit MemberStateChanged (the subscriber
+    // delivers via the SAME `deliver_member_state_change`); gate-OFF (prod default)
+    // → call that deliver directly. No double-delivery, no gate-off regression.
+    let detected_at = chrono::Utc::now().to_rfc3339();
+    let from_display = prev_state.display_name();
+    let to_display = new_state.display_name();
+    let bus = crate::daemon::event_bus::global();
+    if bus.is_enabled() {
+        bus.emit(crate::daemon::event_bus::EventKind::MemberStateChanged {
+            agent: name.to_string(),
+            team: team.name.clone(),
+            from_state: from_display.to_string(),
+            to_state: to_display.to_string(),
+            orch: orch.clone(),
+            new_state,
+            pane_tail: pane_tail.to_string(),
+            unlock_at: unlock_at.clone(),
+            consecutive_count: track.consecutive,
+            detected_at,
+        });
+    } else {
+        deliver_member_state_change(
+            home,
+            orch,
+            name,
+            &team.name,
+            from_display,
+            to_display,
+            new_state,
+            pane_tail,
+            unlock_at.as_deref(),
+            track.consecutive,
+            &detected_at,
+        );
+    }
+    true
+}
+
+/// Shared deliver for the member-state-change notify: (A) enqueue the structured
+/// JSON event to the orchestrator's inbox, (B) PTY-notify the orchestrator with
+/// the human-readable line + action hint. Called by BOTH the legacy direct path
+/// AND the event-bus subscriber, so A and B are byte-identical by construction
+/// (the gate only chooses which path invokes this fn — the fn itself is fixed).
+/// The notify_agent half (B) is a PTY-inject, not an inbox enqueue, so it is not
+/// drain-assertable in tests; it is covered by this shared-deliver-fn invariant
+/// (parity tests assert the inbox half A). All now()-derived input (`detected_at`)
+/// is passed in frozen so the bus path reproduces A byte-for-byte.
+#[allow(clippy::too_many_arguments)]
+fn deliver_member_state_change(
+    home: &std::path::Path,
+    orch: &str,
+    name: &str,
+    team_name: &str,
+    from_display: &str,
+    to_display: &str,
+    new_state: crate::state::AgentState,
+    pane_tail: &str,
+    unlock_at: Option<&str>,
+    consecutive: u32,
+    detected_at: &str,
+) {
+    // (A) structured JSON inbox enqueue.
     let payload = serde_json::json!({
         "type": "member_state_change",
         "member": name,
-        "team": team.name,
-        "from_state": prev_state.display_name(),
-        "to_state": new_state.display_name(),
-        "detected_at": chrono::Utc::now().to_rfc3339(),
+        "team": team_name,
+        "from_state": from_display,
+        "to_state": to_display,
+        "detected_at": detected_at,
         "context": {
             "last_pane_excerpt": pane_tail,
             "unlock_at": unlock_at,
-            "consecutive_count": track.consecutive,
+            "consecutive_count": consecutive,
         }
     });
     let msg = crate::inbox::InboxMessage::new_system(
@@ -532,6 +596,7 @@ pub(crate) fn maybe_notify_member_state_change(
         "member_state_change",
         orch
     );
+    // (B) human-readable PTY notify with action hint.
     let action_hint = match new_state {
         crate::state::AgentState::Hang => {
             "\nAction: check agent pane snapshot, consider restart if no progress >5min"
@@ -557,23 +622,47 @@ pub(crate) fn maybe_notify_member_state_change(
         home,
         orch,
         &crate::inbox::NotifySource::System("supervisor"),
-        &format!(
-            "[member_state_change] {name}: {} → {}{}",
-            prev_state.display_name(),
-            new_state.display_name(),
-            action_hint,
-        ),
+        &format!("[member_state_change] {name}: {from_display} → {to_display}{action_hint}"),
     );
-    tracing::info!(agent = %name, from = prev_state.display_name(), to = new_state.display_name(), orchestrator = %orch, "member-state-change notify sent");
-    crate::daemon::event_bus::global().emit_lazy(|| {
-        crate::daemon::event_bus::EventKind::MemberStateChanged {
-            agent: name.to_string(),
-            team: team.name.clone(),
-            from_state: prev_state.display_name().to_string(),
-            to_state: new_state.display_name().to_string(),
-        }
-    });
-    true
+    tracing::info!(agent = %name, from = %from_display, to = %to_display, orchestrator = %orch, "member-state-change notify sent");
+}
+
+/// #event-bus pattern #9 subscriber: re-deliver a `MemberStateChanged` event via
+/// the shared `deliver_member_state_change`.
+fn handle_event(home: &std::path::Path, event: &crate::daemon::event_bus::Event) {
+    if let crate::daemon::event_bus::EventKind::MemberStateChanged {
+        agent,
+        team,
+        from_state,
+        to_state,
+        orch,
+        new_state,
+        pane_tail,
+        unlock_at,
+        consecutive_count,
+        detected_at,
+    } = &event.kind
+    {
+        deliver_member_state_change(
+            home,
+            orch,
+            agent,
+            team,
+            from_state,
+            to_state,
+            *new_state,
+            pane_tail,
+            unlock_at.as_deref(),
+            *consecutive_count,
+            detected_at,
+        );
+    }
+}
+
+/// Register the member-state-change subscriber once at daemon startup (`run_core`).
+/// Dormant unless `AGEND_EVENT_BUS=1` (emit is a no-op when gate-off).
+pub(crate) fn register_subscriber(home: std::path::PathBuf) {
+    crate::daemon::event_bus::global().subscribe(move |e| handle_event(&home, e));
 }
 
 /// #1530: a reaction-worthy net state change for one agent in one tick.
@@ -2345,6 +2434,76 @@ instances:
         );
 
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #event-bus pattern #9: gate-ON emit→subscriber re-delivers the inbox half
+    /// (A) BYTE-IDENTICALLY to the legacy `deliver_member_state_change`. The
+    /// frozen `detected_at` is passed identically to both paths, so the structured
+    /// payloads match exactly. The notify_agent half (B) is a PTY-inject covered by
+    /// the shared-deliver-fn invariant (same fn invoked by both paths), so it is
+    /// not separately drain-asserted (PTY-readback would be platform-gated + fragile).
+    #[test]
+    fn member_state_change_gate_on_emit_subscriber_matches_legacy() {
+        let detected_at = "2026-06-03T09:00:00+00:00";
+        let mk = |tag: &str| {
+            let h =
+                std::env::temp_dir().join(format!("agend-msc-parity-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&h);
+            std::fs::create_dir_all(h.join("inbox")).ok();
+            h
+        };
+        let payloads =
+            |home: &std::path::Path| -> Vec<(String, Option<String>, String, Option<String>)> {
+                crate::inbox::drain(home, "orch-a")
+                    .into_iter()
+                    .map(|m| (m.from, m.kind, m.text, m.correlation_id))
+                    .collect()
+            };
+
+        let home_legacy = mk("legacy");
+        super::deliver_member_state_change(
+            &home_legacy,
+            "orch-a",
+            "worker-a",
+            "team-a",
+            crate::state::AgentState::Ready.display_name(),
+            crate::state::AgentState::UsageLimit.display_name(),
+            crate::state::AgentState::UsageLimit,
+            "Usage limit reached. Resets at 15:14 UTC",
+            Some("15:14"),
+            1,
+            detected_at,
+        );
+
+        let home_bus = mk("bus");
+        let bus = crate::daemon::event_bus::EventBus::new_enabled_for_test();
+        let h = home_bus.clone();
+        bus.subscribe(move |e| super::handle_event(&h, e));
+        bus.emit(crate::daemon::event_bus::EventKind::MemberStateChanged {
+            agent: "worker-a".into(),
+            team: "team-a".into(),
+            from_state: crate::state::AgentState::Ready.display_name().to_string(),
+            to_state: crate::state::AgentState::UsageLimit
+                .display_name()
+                .to_string(),
+            orch: "orch-a".into(),
+            new_state: crate::state::AgentState::UsageLimit,
+            pane_tail: "Usage limit reached. Resets at 15:14 UTC".into(),
+            unlock_at: Some("15:14".into()),
+            consecutive_count: 1,
+            detected_at: detected_at.into(),
+        });
+
+        let legacy = payloads(&home_legacy);
+        let via_bus = payloads(&home_bus);
+        assert!(!legacy.is_empty(), "legacy enqueue must land");
+        assert_eq!(
+            legacy, via_bus,
+            "bus inbox-half (A) must match legacy byte-for-byte"
+        );
+
+        std::fs::remove_dir_all(&home_legacy).ok();
+        std::fs::remove_dir_all(&home_bus).ok();
     }
 
     /// E: no orchestrator → notify returns false (warn logged).

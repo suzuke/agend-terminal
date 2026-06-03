@@ -45,11 +45,25 @@ pub enum EventKind {
         threshold_secs: i64,
         correlation_id: Option<String>,
     },
+    // #event-bus pattern #9 (supervisor member-state-change): the structured
+    // {agent, team, from/to display} PLUS the fields the shared deliver needs to
+    // rebuild BOTH the inbox enqueue (A) and the notify_agent text (B)
+    // byte-identically. `detected_at` is FROZEN at the gate (the only now()-derived
+    // value in the deliver path); `new_state` is the enum so the subscriber derives
+    // the action_hint from the variant (not a fragile display-string match);
+    // `consecutive_count` is the producer-side cooldown-track value the subscriber
+    // has no track to recompute.
     MemberStateChanged {
         agent: String,
         team: String,
         from_state: String,
         to_state: String,
+        orch: String,
+        new_state: crate::state::AgentState,
+        pane_tail: String,
+        unlock_at: Option<String>,
+        consecutive_count: u32,
+        detected_at: String,
     },
     // #event-bus pattern #2 (decision_timeout): all fields the auto-default
     // timeout notification formats, so the subscriber rebuilds it byte-identically.
@@ -315,6 +329,12 @@ mod tests {
                 team: "fixup".into(),
                 from_state: "Ready".into(),
                 to_state: "ServerRateLimit".into(),
+                orch: "lead".into(),
+                new_state: crate::state::AgentState::RateLimit,
+                pane_tail: "rate limit".into(),
+                unlock_at: None,
+                consecutive_count: 1,
+                detected_at: "2026-06-03T09:00:00+00:00".into(),
             },
             EventKind::DecisionTimeout {
                 decision_id: "d-1".into(),

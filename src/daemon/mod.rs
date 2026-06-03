@@ -417,6 +417,7 @@ fn run_core(
     crate::tasks::register_cascade_subscriber(home.to_path_buf());
     crate::daemon::poll_reminder::register_subscriber(home.to_path_buf());
     crate::daemon::cron_tick::register_subscriber(home.to_path_buf(), ctx.registry.clone());
+    crate::daemon::supervisor::register_subscriber(home.to_path_buf());
 
     spawn_fleet_agents(home, &agents, &ctx);
 
