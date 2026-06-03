@@ -2,7 +2,7 @@
 //!
 //! Closes the consume → retry race: after `inbox::drain` marks a
 //! message `read_at = Some(now)`, the existing rate-limit retry
-//! mechanism at `src/daemon/supervisor.rs::process_server_rate_limit_retries`
+//! mechanism at `src/daemon/supervisor.rs::process_error_recovery`
 //! doesn't know the msg was consumed and can still re-inject the
 //! `[AGEND-MSG]` header within the 60s `NOTIFICATION_DEDUP_CAP=1`
 //! window. Recipient sees the header, calls `inbox`, gets empty —
