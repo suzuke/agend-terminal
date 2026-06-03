@@ -500,6 +500,23 @@ impl HealthTracker {
         }
     }
 
+    /// #1701: self-orchestrator crash P0 gate. Unlike [`record_crash`]'s
+    /// `should_notify` (which only fires on the SECOND crash in the window),
+    /// this fires on EVERY orchestrator crash that clears `NOTIFY_COOLDOWN` —
+    /// one crash already lost the orchestrator's in-memory context and no peer
+    /// can relay an inbox P0, so the operator must be told. Reuses
+    /// `last_notification` (the shared per-agent notify cooldown) to avoid
+    /// crash-loop spam, and stamps it on fire. Caller must already have
+    /// established the agent is its own team orchestrator.
+    pub fn self_orch_crash_should_notify(&mut self) -> bool {
+        if self.should_notify() {
+            self.last_notification = Some(Instant::now());
+            true
+        } else {
+            false
+        }
+    }
+
     /// Check whether agent is stalled on an interactive startup prompt.
     /// Pure predicate — no state mutation.
     ///
@@ -863,6 +880,38 @@ impl HealthTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1701 ① + ②: a self-orchestrator crash escalates on the FIRST crash
+    /// (unlike `record_crash`'s recent>=2 `should_notify`), and the cooldown
+    /// blocks an immediate re-fire so a crash-loop can't spam the operator.
+    #[test]
+    fn self_orch_crash_first_fires_then_cooldown_blocks_1701() {
+        let mut h = HealthTracker::new();
+        // ① single crash → fires (fresh tracker, no prior notification).
+        assert!(
+            h.self_orch_crash_should_notify(),
+            "#1701: a self-orchestrator's FIRST crash must escalate (no recent>=2 gate)"
+        );
+        // ② immediate re-fire (crash-loop) → suppressed by the NOTIFY_COOLDOWN
+        // stamp from the first fire.
+        assert!(
+            !h.self_orch_crash_should_notify(),
+            "#1701: a re-fire within NOTIFY_COOLDOWN must be suppressed (no crash-loop spam)"
+        );
+    }
+
+    /// #1701 contrast: the generic crash gate stays recent>=2 — a regular
+    /// agent's FIRST crash is silent (it has peers + self-heals). This pins that
+    /// the #1701 self-orch path did NOT loosen the generic path.
+    #[test]
+    fn generic_first_crash_still_silent_1701() {
+        let mut h = HealthTracker::new();
+        let (_respawn, _delay, notify) = h.record_crash();
+        assert!(
+            !notify,
+            "#1701: a non-orchestrator's first crash stays silent"
+        );
+    }
 
     #[test]
     fn test_first_crash_silent() {

@@ -35,10 +35,27 @@ pub(super) fn handle_crash_respawn(home: &Path, crashed_name: &str, ctx: &Daemon
         return;
     };
 
-    let (should_respawn, delay, should_notify) = {
+    // #1701: is the crashed agent its OWN team orchestrator? Resolved here (a
+    // teams-file read) BEFORE taking the registry lock, so no file IO runs under
+    // the lock (#1530 class). A self-orchestrator crash has no peer to relay an
+    // inbox P0, so it escalates straight to the operator (below).
+    let is_self_orch = is_self_orchestrator(home, crashed_name);
+
+    let (should_respawn, delay, should_notify, fire_self_orch_p0) = {
         let reg = agent::lock_registry(&ctx.registry);
         match reg.get(&instance_id) {
-            Some(handle) => handle.core.lock().health.record_crash(),
+            Some(handle) => {
+                let mut core = handle.core.lock();
+                // #1701: decide the self-orch P0 BEFORE record_crash (which may
+                // itself stamp last_notification on its recent>=2 path) — the
+                // accessor reads+stamps the shared cooldown, and for a
+                // self-orchestrator we use ONLY this gate, never the generic
+                // recent>=2 one. The `&&` short-circuits for non-orchestrators,
+                // so their cooldown is untouched.
+                let fire_p0 = is_self_orch && core.health.self_orch_crash_should_notify();
+                let (respawn, delay, notify) = core.health.record_crash();
+                (respawn, delay, notify, fire_p0)
+            }
             None => {
                 tracing::warn!(agent = %crashed_name, "not in registry, skipping");
                 return;
@@ -46,7 +63,12 @@ pub(super) fn handle_crash_respawn(home: &Path, crashed_name: &str, ctx: &Daemon
         }
     };
 
-    if should_notify {
+    // #1701: a self-orchestrator crash escalates to the operator on EVERY crash
+    // (cooldown-gated) — the team is leaderless until respawn and no peer can
+    // relay. A non-orchestrator agent keeps the generic recent>=2 crash notify.
+    if fire_self_orch_p0 {
+        notify_self_orch_crash(crashed_name, &instance_id, &ctx.registry);
+    } else if !is_self_orch && should_notify {
         notify_crash(crashed_name, &instance_id, &ctx.registry);
     }
 
@@ -84,6 +106,52 @@ pub(super) fn handle_crash_respawn(home: &Path, crashed_name: &str, ctx: &Daemon
         })
     {
         tracing::warn!(agent = %name_for_err, error = %e, "failed to spawn respawn thread");
+    }
+}
+
+/// #1701: is `name` the orchestrator of its own team? A self-orchestrator has
+/// no peer to relay an inbox P0, so its crash/hang escalates straight to the
+/// operator. Mirrors the orch==name guard in
+/// `supervisor::{maybe_notify_member_state_change, notify_orchestrator_retry_exhausted}`.
+fn is_self_orchestrator(home: &Path, name: &str) -> bool {
+    crate::teams::find_team_for(home, name)
+        .and_then(|t| t.orchestrator)
+        .is_some_and(|orch| orch == name)
+}
+
+/// #1701: self-orchestrator-crash P0 — distinct from the generic [`notify_crash`]
+/// in WORDING (it names the leaderless-team / no-peer-relay condition the
+/// operator must act on) and in TRIGGER (fired on every orchestrator crash that
+/// clears the cooldown, see [`crate::health::HealthTracker::self_orch_crash_should_notify`],
+/// not the generic recent>=2 gate). Same `gated_notify(Error)` Sleep-penetrating
+/// path as #1595's AuthError self-orch escalation.
+fn notify_self_orch_crash(
+    crashed_name: &str,
+    instance_id: &crate::types::InstanceId,
+    registry: &AgentRegistry,
+) {
+    let state = {
+        let reg = agent::lock_registry(registry);
+        reg.get(instance_id)
+            .map(|h| h.core.lock().health.state.display_name())
+            .unwrap_or("unknown")
+    };
+    tracing::warn!(agent = %crashed_name, %state, "#1701: self-orchestrator crashed — escalating P0 to operator");
+    let msg = format!(
+        "🛑 {crashed_name} (team orchestrator) crashed [{state}] — the team is leaderless \
+         until it respawns and no peer can relay this. The respawn loses its in-memory \
+         context; check for a crash-loop / re-prime it. Manual intervention may be required."
+    );
+    if let Some(ch) = crate::channel::active_channel() {
+        let _ = crate::channel::gated_notify(
+            ch.as_ref(),
+            crashed_name,
+            NotifySeverity::Error,
+            &msg,
+            false,
+        );
+    } else {
+        tracing::debug!(agent = %crashed_name, "no active channel for self-orch crash P0");
     }
 }
 
@@ -211,5 +279,44 @@ fn respawn_agent_worker(
         Err(e) => {
             tracing::warn!(agent = %config.name, error = %e, "respawn failed");
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::is_self_orchestrator;
+
+    /// #1701 ③: self-orch detection — the gate that routes a crash to the
+    /// self-orch P0 (`fire_self_orch_p0 = is_self_orch && ...`). A regular
+    /// member is NOT its own orchestrator → the `&&` short-circuits → it keeps
+    /// the generic recent>=2 crash notify, never the self-orch P0. An agent that
+    /// IS its team's orchestrator → true. No team / no orchestrator → false.
+    #[test]
+    fn is_self_orchestrator_only_true_for_own_orchestrator_1701() {
+        let home = std::env::temp_dir().join(format!("agend-1701-selforch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+
+        // team "t": orchestrator=lead, member=dev.
+        crate::teams::create(
+            &home,
+            &serde_json::json!({"name": "t", "members": ["lead", "dev"], "orchestrator": "lead"}),
+        );
+
+        assert!(
+            is_self_orchestrator(&home, "lead"),
+            "the team orchestrator IS its own orchestrator"
+        );
+        assert!(
+            !is_self_orchestrator(&home, "dev"),
+            "a regular member is NOT its own orchestrator → keeps generic crash notify"
+        );
+        assert!(
+            !is_self_orchestrator(&home, "unknown"),
+            "an agent in no team is not a self-orchestrator"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
