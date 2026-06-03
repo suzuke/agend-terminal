@@ -39,10 +39,11 @@ pub struct RuntimeConfig {
     pub idle_watchdog_enabled: bool,
     /// #1713/#1523 aid: when true, each pane title appends a `[<State>]` text
     /// badge of the detected `AgentState` so the operator can eyeball-verify
-    /// state detection. Default false (off — the colour dot is the steady-state
-    /// signal; this is a temporary diagnostic toggle). Hot-reloadable via the
-    /// `config` MCP tool, like the other gates here.
-    #[serde(default)]
+    /// state detection. Default true (opt-out — the operator wants the badge as a
+    /// steady diagnostic). `default_true` also fills the field for older configs
+    /// written before it existed. Hot-reloadable via the `config` MCP tool, like
+    /// the other gates here.
+    #[serde(default = "default_true")]
     pub show_pane_state: bool,
 }
 
@@ -69,7 +70,7 @@ impl Default for RuntimeConfig {
             hang_auto_recovery_enabled: false,
             usage_limit_propagation_enabled: false,
             idle_watchdog_enabled: true,
-            show_pane_state: false,
+            show_pane_state: true,
         }
     }
 }
@@ -221,6 +222,17 @@ pub fn list() -> serde_json::Value {
     serde_json::to_value(get()).unwrap_or_default()
 }
 
+/// All config key names, derived from the serialized `Default` so callers (e.g.
+/// the `config` MCP tool description) can never go stale — adding a struct field
+/// makes it appear automatically. Keys equal the serde field names, which are
+/// exactly what `get_key`/`set` match on.
+pub fn keys() -> Vec<String> {
+    serde_json::to_value(RuntimeConfig::default())
+        .ok()
+        .and_then(|v| v.as_object().map(|m| m.keys().cloned().collect()))
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -270,14 +282,15 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// #1713: the pane-state badge flag is OFF by default and runtime-toggleable
-    /// via the same `set`/persist/reload path as the other gates (the `config`
-    /// MCP tool reaches `set`), so the operator can flip it without a rebuild.
+    /// #1713/opt-out: the pane-state badge flag now defaults ON (operator wants
+    /// it as a steady diagnostic) and stays runtime-toggleable via the same
+    /// `set`/persist/reload path as the other gates (the `config` MCP tool reaches
+    /// `set`), so the operator can flip it off without a rebuild.
     #[test]
-    fn show_pane_state_default_off_and_toggleable_1713() {
+    fn show_pane_state_default_on_and_toggleable() {
         assert!(
-            !RuntimeConfig::default().show_pane_state,
-            "show_pane_state must default OFF"
+            RuntimeConfig::default().show_pane_state,
+            "show_pane_state must default ON (opt-out)"
         );
         let dir = std::env::temp_dir().join("agend-test-runtime-config-panestate");
         std::fs::create_dir_all(&dir).ok();
@@ -288,5 +301,25 @@ mod tests {
         reload(&dir);
         assert_eq!(get_key("show_pane_state").unwrap(), "false");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `keys()` is the dynamic source for the `config` MCP tool description, so it
+    /// must cover every settable key — including show_pane_state, whose omission
+    /// from the hand-maintained description is what this change fixes. Every key
+    /// `keys()` reports must also be a valid `set` target (round-trip via get_key).
+    #[test]
+    fn keys_cover_all_settable_keys_including_show_pane_state() {
+        let ks = keys();
+        assert!(
+            ks.iter().any(|k| k == "show_pane_state"),
+            "keys() must include show_pane_state (was missing from the MCP description): {ks:?}"
+        );
+        // Every reported key resolves via get_key — proves keys() ≡ valid keys.
+        for k in &ks {
+            assert!(
+                get_key(k).is_ok(),
+                "keys() reported a non-gettable key: {k}"
+            );
+        }
     }
 }

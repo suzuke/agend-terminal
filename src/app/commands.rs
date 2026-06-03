@@ -1,5 +1,5 @@
 //! Command-palette command execution (`:spawn`, `:kill`, `:restart`, `:layout`,
-//! `:send`, `:broadcast`, `:status`).
+//! `:send`, `:broadcast`, `:status`, `:config`).
 //!
 //! Input is a whitespace-split command line. Returns `true` iff the command
 //! mutated the layout in a way that requires a resize pass.
@@ -328,11 +328,43 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
                 }
             }
         }
+        "config" => handle_config_command(&parts, ctx.home),
         _ => {
             tracing::warn!(cmd = cmd, "unknown command");
         }
     }
     false
+}
+
+/// Handle `:config get <key>` / `:config set <key> <value>` / `:config list`.
+/// Mirrors the `config` MCP tool path (`runtime_config::get_key/set/list`) so the
+/// operator can toggle runtime config from the TUI without invoking an MCP tool.
+/// Split out of `execute` so it is unit-testable without a full `CommandCtx`.
+///
+/// `parts` is the `splitn(3, ' ')` split, so for `set` the third element holds
+/// `"<key> <value>"` glued together; we re-split it on the first space.
+/// Feedback goes through `tracing` like the sibling `:status` command.
+fn handle_config_command(parts: &[&str], home: &Path) {
+    match parts.get(1).copied() {
+        Some("list") => {
+            tracing::info!(config = %crate::runtime_config::list(), "config list");
+        }
+        Some("get") => match parts.get(2) {
+            Some(key) => match crate::runtime_config::get_key(key) {
+                Ok(value) => tracing::info!(key = key, value = %value, "config get"),
+                Err(e) => tracing::warn!(error = %e, "config get failed"),
+            },
+            None => tracing::warn!("config get requires <key>"),
+        },
+        Some("set") => match parts.get(2).and_then(|kv| kv.split_once(' ')) {
+            Some((key, value)) => match crate::runtime_config::set(home, key, value.trim()) {
+                Ok(result) => tracing::info!(result = %result, "config set"),
+                Err(e) => tracing::warn!(error = %e, "config set failed"),
+            },
+            None => tracing::warn!("config set requires <key> <value>"),
+        },
+        _ => tracing::warn!("config: use `get <key>` | `set <key> <value>` | list"),
+    }
 }
 
 /// Look up the fleet_instance_name for an agent by scanning the layout.
@@ -420,5 +452,35 @@ mod tests {
         let parts: Vec<&str> = "".trim().splitn(3, ' ').collect();
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0], "");
+    }
+
+    /// `:config set <key> <value>` parse shape: splitn(3) glues "<key> <value>"
+    /// into parts[2]; the handler re-splits on the first space. Pin it so a future
+    /// change to the split width doesn't silently break `set`.
+    #[test]
+    fn config_set_parse_shape_glues_key_value() {
+        let parts: Vec<&str> = "config set show_pane_state true".splitn(3, ' ').collect();
+        assert_eq!(parts[1], "set");
+        assert_eq!(parts[2], "show_pane_state true");
+        assert_eq!(parts[2].split_once(' '), Some(("show_pane_state", "true")));
+    }
+
+    /// `:config set` from the palette must actually reach `runtime_config::set`
+    /// and persist. Assert against the written file (deterministic — avoids the
+    /// process-global cache shared across parallel tests).
+    #[test]
+    fn config_set_via_palette_persists_to_runtime_config() {
+        let dir =
+            std::env::temp_dir().join(format!("agend-test-cmd-config-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        handle_config_command(&["config", "set", "show_pane_state false"], &dir);
+        let raw = std::fs::read_to_string(dir.join("runtime-config.json")).unwrap_or_default();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+        assert_eq!(
+            v["show_pane_state"],
+            serde_json::json!(false),
+            "palette :config set must persist to runtime-config.json"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

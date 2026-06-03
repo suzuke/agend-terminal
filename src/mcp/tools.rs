@@ -293,7 +293,11 @@ pub(crate) fn def_watchdog() -> Value {
 }
 
 pub(crate) fn def_config() -> Value {
-    json!({"name": "config", "description": "#1085: Runtime-mutable daemon configuration. Actions: get, set, list. Keys: dev_idle_threshold_secs, fleet_idle_threshold_secs, hang_auto_recovery_enabled.",
+    // Keys are derived from runtime_config's serialized fields so this list can
+    // never go stale as config keys are added (it previously omitted several,
+    // incl. show_pane_state).
+    let keys = crate::runtime_config::keys().join(", ");
+    json!({"name": "config", "description": format!("#1085: Runtime-mutable daemon configuration. Actions: get, set, list. Keys: {keys}."),
     "inputSchema": {"type": "object", "properties": {
         "action": {"type": "string", "enum": ["get", "set", "list"]},
         "key": {"type": "string", "description": "Config key name (required for get/set)"},
