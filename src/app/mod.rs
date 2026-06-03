@@ -360,6 +360,16 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         })
         .ok();
 
+    // #event-bus: owned `app` mode never calls `daemon::run_core`, so it must
+    // register the bus subscribers itself — otherwise the maintenance tick below
+    // emits `CronFire` / `CiReady` / idle nudges into a bus with ZERO subscribers
+    // and every delivery silently drops (the live #1720 cron silent-drop; same
+    // regression class as #1002 / #982). Mirrors run_core; gated to owned mode
+    // because the attached daemon process owns delivery when attached.
+    if !attached_mode {
+        crate::daemon::register_event_subscribers(&registry);
+    }
+
     // Periodic maintenance tick (10s) — mirrors daemon tick cadence.
     // Only active in owned (non-attached) mode; when attached, the daemon
     // process handles schedules, CI watches, and health decay.
@@ -1477,6 +1487,31 @@ mod tests {
             "flush_idle_notifications must wire the submit-aware injector \
              (#982 reviewer #999 verdict) — searched for \
              'inject_notification_with_submit' in src/app/mod.rs"
+        );
+    }
+
+    /// app-mode subscriber-wiring source pin. Owned `agend-terminal app` mode
+    /// never calls `daemon::run_core`, so `run_app` MUST itself register the
+    /// event-bus subscribers — otherwise the maintenance tick emits `CronFire` /
+    /// `CiReady` / idle nudges into an empty bus and every delivery silently
+    /// drops (the live #1720 cron silent-drop; regression class #1002 / #982).
+    ///
+    /// File-level positive pin (cross-platform-safe; survives rustfmt re-wrap),
+    /// same pattern as `flush_idle_notifications_wired_to_submit_aware_inject`.
+    /// The functional counterpart —
+    /// `cron_tick::tests::global_bus_cron_subscriber_delivers` — proves the
+    /// registered set actually delivers a CronFire on the process-global bus.
+    #[test]
+    fn run_app_registers_event_bus_subscribers() {
+        let source = std::fs::read_to_string("src/app/mod.rs")
+            .or_else(|_| std::fs::read_to_string("agend-terminal/src/app/mod.rs"))
+            .expect("source file must be readable from test cwd");
+        assert!(
+            source.contains("register_event_subscribers"),
+            "run_app must call daemon::register_event_subscribers in owned mode \
+             (app mode never reaches run_core's registration — #1720 app-mode \
+             silent-drop root fix). Searched for 'register_event_subscribers' in \
+             src/app/mod.rs"
         );
     }
 

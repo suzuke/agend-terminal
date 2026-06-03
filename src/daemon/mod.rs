@@ -392,6 +392,36 @@ pub fn run_with_prepared(mut prepared: Box<crate::bootstrap::OwnedFleet>) -> any
 /// daemon-self-restart loop here would conflict with the OS service
 /// manager's lifecycle ownership.
 ///
+/// #event-bus: register every per-pattern delivery subscriber on the
+/// process-global bus. Post-cutover (#1719 legacy-zero) the bus is the SOLE
+/// delivery path, so this MUST run in every mode that ticks producers.
+///
+/// Called by BOTH `run_core` (headless daemon mode) AND `app::run_app` (owned
+/// `agend-terminal app` mode). The latter never calls `run_core` — so before
+/// this was shared, app mode registered NOTHING and every emit (cron fire,
+/// idle nudge, ci-ready handoff, …) silently dropped. That was the live
+/// silent-drop behind #1720/#1723, and the same regression class as #1002
+/// (`pr_state`) / #982 (idle notifications): "wired only in run_core, broke in
+/// app mode". The test harness (`event_bus::register_all_subscribers_for_test`)
+/// routes through this SAME fn — ONE subscriber list, so test wiring can never
+/// drift from live wiring again (the drift that masked this bug). Each
+/// subscriber is home-agnostic (the home travels on every event); cron captures
+/// the live `registry` to resolve + inject to the fleet.
+pub(crate) fn register_event_subscribers(registry: &AgentRegistry) {
+    crate::daemon::anti_stall::register_subscriber();
+    crate::daemon::decision_timeout::register_subscriber();
+    crate::daemon::dispatch_idle::register_subscriber();
+    crate::daemon::waiting_on_stale::register_subscriber();
+    crate::daemon::helper_staleness_watchdog::register_subscriber();
+    crate::daemon::idle_watchdog::register_subscriber();
+    crate::tasks::register_cascade_subscriber();
+    crate::daemon::poll_reminder::register_subscriber();
+    crate::daemon::cron_tick::register_subscriber(registry.clone());
+    crate::daemon::supervisor::register_subscriber();
+    crate::daemon::conflict_notify::register_subscriber();
+    crate::daemon::ci_watch::register_subscriber();
+}
+
 /// Sprint 57 Wave 3 PR-2 (#548 Q4 contract pin): the canonical
 /// lockfile is `$AGEND_HOME/.daemon.lock` (one acquirer at a time
 /// across all daemon processes). Per-PID identity is at
@@ -407,21 +437,10 @@ fn run_core(
     let ctx = init_daemon_services(home, telegram)?;
 
     // #event-bus Step 2 (legacy-zero): register the per-pattern delivery
-    // subscribers once. The bus is the SOLE delivery path; each subscriber is
-    // home-agnostic (the home travels on every event). cron also captures the live
-    // registry (to resolve + inject to the fleet).
-    crate::daemon::anti_stall::register_subscriber();
-    crate::daemon::decision_timeout::register_subscriber();
-    crate::daemon::dispatch_idle::register_subscriber();
-    crate::daemon::waiting_on_stale::register_subscriber();
-    crate::daemon::helper_staleness_watchdog::register_subscriber();
-    crate::daemon::idle_watchdog::register_subscriber();
-    crate::tasks::register_cascade_subscriber();
-    crate::daemon::poll_reminder::register_subscriber();
-    crate::daemon::cron_tick::register_subscriber(ctx.registry.clone());
-    crate::daemon::supervisor::register_subscriber();
-    crate::daemon::conflict_notify::register_subscriber();
-    crate::daemon::ci_watch::register_subscriber();
+    // subscribers once (the bus is the SOLE delivery path). Shared with
+    // `app::run_app` so owned `agend-terminal app` mode wires the IDENTICAL
+    // set — see `register_event_subscribers`.
+    register_event_subscribers(&ctx.registry);
 
     spawn_fleet_agents(home, &agents, &ctx);
 
@@ -1381,6 +1400,44 @@ mod tests {
         assert!(dir.display().to_string().contains(&pid));
         assert!(dir.ends_with(&pid));
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1720 app-mode root fix: `register_event_subscribers` is the SINGLE
+    /// source of truth for the event-bus subscriber list (run_core, app::run_app,
+    /// and the test harness all route through it). Pin every one of the 12
+    /// per-pattern registrations so a dropped line — which would silently kill
+    /// that pattern's delivery in BOTH prod modes at once — fails CI. Source-level
+    /// pin (cross-platform-safe; survives rustfmt). When adding a pattern, add it
+    /// here AND to `register_event_subscribers`.
+    #[test]
+    fn register_event_subscribers_lists_every_pattern() {
+        let src = std::fs::read_to_string("src/daemon/mod.rs")
+            .or_else(|_| std::fs::read_to_string("agend-terminal/src/daemon/mod.rs"))
+            .expect("source file must be readable from test cwd");
+        let start = src
+            .find("pub(crate) fn register_event_subscribers")
+            .expect("register_event_subscribers must exist");
+        let body = &src[start..(start + 1200).min(src.len())];
+        for pat in [
+            "anti_stall::register_subscriber",
+            "decision_timeout::register_subscriber",
+            "dispatch_idle::register_subscriber",
+            "waiting_on_stale::register_subscriber",
+            "helper_staleness_watchdog::register_subscriber",
+            "idle_watchdog::register_subscriber",
+            "tasks::register_cascade_subscriber",
+            "poll_reminder::register_subscriber",
+            "cron_tick::register_subscriber",
+            "supervisor::register_subscriber",
+            "conflict_notify::register_subscriber",
+            "ci_watch::register_subscriber",
+        ] {
+            assert!(
+                body.contains(pat),
+                "register_event_subscribers must register '{pat}' — a missing \
+                 pattern silently breaks its delivery in app + daemon mode (#1720)"
+            );
+        }
     }
 
     #[test]

@@ -669,6 +669,42 @@ mod tests {
         std::fs::remove_dir_all(home).ok();
     }
 
+    /// app-mode wiring (functional half of the #1720 root fix): the cron
+    /// subscriber MUST be reachable on the PROCESS-GLOBAL bus — the live
+    /// `agend-terminal app` tick emits there (app/mod.rs), and owned mode now
+    /// registers via `daemon::register_event_subscribers`. Emitting a `CronFire`
+    /// DIRECTLY on `global()` (NOT a local test bus — that local-bus convenience
+    /// is exactly the blind spot that let the app-mode silent-drop ship green)
+    /// must reach `deliver_cron_fire` and record a run. Fails if
+    /// `register_event_subscribers` ever drops the cron line. The subscriber is
+    /// registered at test-load by the ctor → `register_all_subscribers_for_test`
+    /// → `register_event_subscribers` (the SAME fn prod uses — no test-only list).
+    /// Unknown target ⇒ deterministic `skipped_unknown_target` (no timing or
+    /// registry-contents dependence).
+    #[test]
+    fn global_bus_cron_subscriber_delivers() {
+        let home = cron_tmp_home("global-wiring");
+        seed_oneshot(&home, "ghost"); // not a known instance → skipped_unknown_target
+        crate::daemon::event_bus::global().emit(
+            &home,
+            crate::daemon::event_bus::EventKind::CronFire {
+                sched_id: "s-1488".to_string(),
+                target: "ghost".to_string(),
+                message: "ping".to_string(),
+                label: "t".to_string(),
+                one_shot: true,
+                missed: false,
+            },
+        );
+        assert_eq!(
+            last_status(&home),
+            "skipped_unknown_target",
+            "a CronFire emitted on the GLOBAL bus must reach the cron subscriber — \
+             register_event_subscribers must wire cron (app-mode delivery depends on it)"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
     // ── #1521: UntilSuccess fire-strategy ──
 
     /// #1608b: seed a REAL event-sourced task (so `task_events::replay` — the

@@ -184,20 +184,16 @@ pub(crate) fn register_all_subscribers_for_test() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        crate::daemon::anti_stall::register_subscriber();
-        crate::daemon::decision_timeout::register_subscriber();
-        crate::daemon::dispatch_idle::register_subscriber();
-        crate::daemon::waiting_on_stale::register_subscriber();
-        crate::daemon::helper_staleness_watchdog::register_subscriber();
-        crate::daemon::idle_watchdog::register_subscriber();
-        crate::tasks::register_cascade_subscriber();
-        crate::daemon::poll_reminder::register_subscriber();
+        // DRY: route through the SAME registration list prod uses
+        // (`daemon::register_event_subscribers`), so test wiring can NEVER drift
+        // from live wiring — the drift that masked the #1720 app-mode silent-drop
+        // (this helper registered cron; the live `agend-terminal app` path did not).
+        // cron gets a dummy empty registry — cron integration tests use empty
+        // registries + assert the home-driven inbox fallback, so the captured
+        // registry's contents don't affect them.
         let dummy_registry: crate::agent::AgentRegistry =
             std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
-        crate::daemon::cron_tick::register_subscriber(dummy_registry);
-        crate::daemon::supervisor::register_subscriber();
-        crate::daemon::conflict_notify::register_subscriber();
-        crate::daemon::ci_watch::register_subscriber();
+        crate::daemon::register_event_subscribers(&dummy_registry);
     });
 }
 
