@@ -1,27 +1,25 @@
-//! #8 Phase 2 VALIDATION (branch `spike/backend-profile-validation`).
+//! #8: per-backend detection data, co-located.
 //!
 //! The team voted (3-1, ORIGINAL/per-variant-structs unanimously rejected) for
 //! the `BackendProfile` data-bundle: co-locate the per-backend detection data
-//! that today lives scattered across FIVE `match backend` sites in three files —
-//! `state::patterns::{for_backend, compile_for}` (patterns), `behavioral::
+//! that previously lived scattered across FIVE `match backend` sites in three
+//! files — `state::patterns::{for_backend, compile_for}` (patterns), `behavioral::
 //! {config_for, config_for_productivity}` (behavioral + productivity), and
 //! `state::StateTracker::new` (initial_state). One backend's full detection
-//! profile is gathered into ONE block here; a single trivial dispatch `match`
-//! replaces the five.
+//! profile is gathered into ONE `*_profile()` block here; a single trivial
+//! dispatch `match` ([`profile`]) replaces the five.
 //!
-//! This is a VALIDATION, not a migration: production is NOT rerouted (the legacy
-//! match paths are untouched, zero risk on the high-stakes #1523 detection
-//! surface). The equivalence harness below proves the moved data is
-//! BYTE-IDENTICAL to legacy for the migrated backends; the migration train then
-//! reroutes production one backend per PR, gated by that harness.
-//!
-//! Migrated so far: `Shell`/`Raw` (empty), `Agy` (#1672), `KiroCli` (#1674),
-//! `OpenCode` (#1686), `Codex` (#1687), and `ClaudeCode` (#8 step-3, this PR).
-//! That is ALL backends except `Gemini` (skipped — retiring via #1580, stays on
-//! the legacy path). Production is rerouted as of step-0 (#1683): `profile()`-Some
-//! backends run detection through the bundle, legacy is the parity baseline until
-//! the final delete-legacy PR. Each migration proven byte-identical by the
-//! harness below (and a drift-guard test pins `migrated()` ⟺ `profile().is_some`).
+//! Production routes ALL backends EXCEPT `Gemini` through these profiles
+//! (for_backend / config_for[_productivity] / StateTracker::new return the
+//! profile for `profile()`-Some backends). `Gemini` is the sole remaining
+//! legacy backend (skipped — retiring via #1580); when #1580 lands, the
+//! Gemini-only legacy stubs + `_ =>` catch-alls disappear too. The data-bundle
+//! migration train (step-0 #1683 reroute → OpenCode #1686 → Codex #1687 →
+//! ClaudeCode #1689 → this delete-legacy PR) was each proven byte-identical to
+//! legacy at its own merge; detection correctness is now pinned by the
+//! fixture-replay suite + per-backend state tests, and the two structural guards
+//! below (drift-guard: `migrated()` ⟺ `profile().is_some()`; and "Gemini is the
+//! only profile-None backend").
 
 use crate::backend::Backend;
 use crate::behavioral::{BehavioralConfig, MarkerCacheId, ProductivityConfig};
@@ -355,12 +353,6 @@ fn empty_profile() -> BackendProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // #8 Phase 2 step-0: parity tests must reference the TRUE-legacy companions,
-    // NOT the now-profile-routed prod fns (`config_for`/`for_backend`/`new`) — using
-    // the prod fns would make every assertion circular (profile vs profile).
-    use crate::behavioral::{config_for_legacy, config_for_productivity_legacy};
-    use crate::state::patterns::StatePatterns;
-    use crate::state::StateTracker;
 
     fn migrated() -> Vec<Backend> {
         vec![
@@ -374,145 +366,42 @@ mod tests {
         ]
     }
 
-    /// PRIMARY parity proof (structural, COMPLETE): the profile's raw patterns
-    /// equal the legacy compiled patterns' source strings + states + order.
-    /// Identical regex strings + order ⟹ identical detection — stronger than a
-    /// corpus sample (this is the answer to codex's "snapshot ≠ proof").
-    #[test]
-    fn profile_patterns_byte_identical_to_legacy() {
-        for b in migrated() {
-            // TRUE legacy = compile_for directly (for_backend is now profile-routed).
-            let legacy: Vec<(AgentState, String)> =
-                StatePatterns::compile_for(&b).pattern_sources();
-            let prof: Vec<(AgentState, String)> = profile(&b)
-                .expect("migrated")
-                .patterns
-                .iter()
-                .map(|(s, p)| (*s, (*p).to_string()))
-                .collect();
-            assert_eq!(prof, legacy, "pattern source/state/order parity for {b:?}");
-        }
-    }
+    // #8 delete-legacy: the four `*_byte_identical_to_legacy` /
+    // `for_backend_classify_parity_with_legacy` tests are REMOVED here — deleting
+    // the legacy arms removes their comparison baseline (each migration already
+    // proved byte-identity at its own merge). Detection correctness is now pinned
+    // by the fixture-replay suite (`replay_manifest_regression` +
+    // `tests/fixtures/state-replay/*.raw`, which run through the profile-routed
+    // `StatePatterns::for_backend`) + the per-backend tests in `state/tests.rs`,
+    // plus the two structural guards below.
 
-    /// SECONDARY (behavioral): compile the profile's patterns and confirm
-    /// `detect` is identical to the legacy compiled patterns across a corpus.
-    /// Redundant given the structural proof above, but exercises the full
-    /// compile+detect pipeline.
+    /// #8 delete-legacy mitigation: Gemini is the ONLY backend on the legacy path
+    /// — EVERY other variant must have a profile. A new backend added to the enum
+    /// without a profile would be a 2nd `None` and silently fall into
+    /// `compile_for`'s `_ => vec![]` catch-all (no detection); this makes that go
+    /// red. (The drift-guard checks `migrated()` ⟺ `profile()` but NOT "no profile
+    /// at all" — both would read `false` and pass; this is the complementary
+    /// guard.)
     #[test]
-    fn profile_detect_matches_legacy_on_corpus() {
-        let corpus = [
-            "Requesting permission for: write",
-            "Do you trust the contents of this project",
-            "tab Amend · e edit command",
-            "● Bash(ls -la)",
-            "● GenerateImage(prompt)",
-            "Analyzing the request… esc to cancel",
-            "? for shortcuts",
-            "Antigravity CLI v2",
-            "Type your message",
-            "just some unrelated prose with no anchors",
-            "● lowercase(x)", // must NOT match ToolUse ([A-Z] anchor)
-            "",
-        ];
-        for b in migrated() {
-            let legacy = StatePatterns::compile_for(&b); // TRUE legacy, not the rerouted entry
-            let prof = StatePatterns::from_raw_patterns(&profile(&b).expect("migrated").patterns);
-            for item in corpus {
-                assert_eq!(
-                    prof.detect(item),
-                    legacy.detect(item),
-                    "detect parity for {b:?} on {item:?}"
-                );
-            }
-        }
-    }
-
-    /// Behavioral + productivity + initial_state byte-identical to legacy
-    /// (Debug-string equality — the configs are `Copy`, not `PartialEq`).
-    #[test]
-    fn profile_configs_byte_identical_to_legacy() {
-        for b in migrated() {
-            let p = profile(&b).expect("migrated");
-            assert_eq!(
-                format!("{:?}", p.behavioral),
-                format!("{:?}", config_for_legacy(&b)),
-                "behavioral parity for {b:?}"
-            );
-            assert_eq!(
-                format!("{:?}", p.productivity),
-                format!("{:?}", config_for_productivity_legacy(&b)),
-                "productivity parity for {b:?}"
-            );
-            assert_eq!(
-                p.initial_state,
-                StateTracker::legacy_initial_state(Some(&b)),
-                "initial_state parity for {b:?}"
-            );
-        }
-    }
-
-    /// Non-migrated backends still return `None` (legacy path owns them).
-    /// OpenCode left this set in step-1 (#8 Phase 2) — it is now `migrated()`.
-    #[test]
-    fn gemini_stays_on_legacy_path() {
-        // After step-3 (#1689, Claude) Gemini is the ONLY backend left on the
-        // legacy path (skipped — retiring via #1580). The drift-guard below
-        // enforces that `migrated()` ⟺ `profile().is_some()` for ALL variants.
-        assert!(
-            profile(&Backend::Gemini).is_none(),
-            "Gemini must stay on the legacy path"
-        );
-    }
-
-    /// #8 Phase 2 step-0 MERGE GATE — profile-ON-vs-OFF classify parity at the
-    /// PROD entry. `for_backend` (now profile-routed for migrated backends) must
-    /// detect byte-identically to the TRUE-legacy `compile_for` for EVERY backend
-    /// across the corpus: migrated → the profile path equals legacy; un-migrated →
-    /// both are legacy (guards the fork never perturbs Claude/Codex/OpenCode/Gemini).
-    /// Complements the structural `profile_patterns_byte_identical_to_legacy`
-    /// (identical sources ⟹ identical detection on ALL inputs) — together: complete
-    /// parity, not a snapshot. The full-fixture corpus is also covered empirically
-    /// by `replay_manifest_regression` running against this rerouted prod path.
-    #[test]
-    fn for_backend_classify_parity_with_legacy_step0() {
-        let corpus = [
-            "Requesting permission for: write",
-            "Do you trust the contents of this project",
-            "● Bash(ls -la)",
-            "esc to cancel",
-            "ECONNRESET",
-            "Too Many Requests",
-            "ServiceQuotaExceeded",
-            "Trust All Tools active",
-            "ask a question or describe a task",
-            "Antigravity CLI v2",
-            "Type your message",
-            "? for shortcuts",
-            "Automatic merge failed; fix conflicts",
-            "just unrelated prose with no anchors",
-            "● lowercase(x)",
-            "",
-        ];
+    fn gemini_is_the_only_profile_none_backend() {
         for b in [
             Backend::ClaudeCode,
             Backend::KiroCli,
             Backend::Codex,
             Backend::OpenCode,
-            Backend::Gemini,
             Backend::Agy,
             Backend::Shell,
             Backend::Raw("x".to_string()),
         ] {
-            let prod = StatePatterns::for_backend(&b); // profile-routed entry
-            let legacy = StatePatterns::compile_for(&b); // TRUE legacy
-            for item in corpus {
-                assert_eq!(
-                    prod.detect(item),
-                    legacy.detect(item),
-                    "for_backend (prod) vs compile_for (legacy) parity for {b:?} on {item:?}"
-                );
-            }
+            assert!(
+                profile(&b).is_some(),
+                "{b:?} must have a BackendProfile — only Gemini stays on legacy"
+            );
         }
+        assert!(
+            profile(&Backend::Gemini).is_none(),
+            "Gemini is the only backend left on the legacy path (#1580 retires it)"
+        );
     }
 
     /// #8 Phase 2 (codex/#1687) DRIFT GUARD — the systemic fix. `migrated()` (the
