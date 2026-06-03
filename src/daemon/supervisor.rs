@@ -47,10 +47,31 @@ const AWAITING_ENGAGEMENT_WINDOW_MS: i64 = 15_000;
 /// and never does. 90s = ~3× the observed 31s self-heal, with margin. Sibling to
 /// `AWAITING_STABILITY` (#1552); classification/retry/timers are untouched.
 const AUTH_ERROR_NOTIFY_STABILITY: Duration = Duration::from_secs(90);
-/// Maximum auto-retries for ServerRateLimit before giving up.
-const SERVER_RATE_LIMIT_MAX_RETRIES: u32 = 3;
-/// Backoff schedule for ServerRateLimit retries (seconds).
-const SERVER_RATE_LIMIT_BACKOFF: [u64; 3] = [5, 15, 30];
+/// #1696: tiered retry budget. Phase A burst (5/15/30s) handles instant jitter;
+/// Phase B backoff (1m/2m/5m) handles minute-scale proxy faults; Phase C
+/// sustained (10m × 6 = 1hr) keeps a "pilot light" through a long outage. The
+/// 2026-06-02 incident gave up at ~80s (Phase A only) against a multi-minute
+/// proxy fault. Total budget ~75min over 12 retries.
+const SERVER_RATE_LIMIT_MAX_RETRIES: u32 = 12;
+/// Backoff schedule for ServerRateLimit retries (seconds). Phase A | B | C.
+const SERVER_RATE_LIMIT_BACKOFF: [u64; 12] =
+    [5, 15, 30, 60, 120, 300, 600, 600, 600, 600, 600, 600];
+/// #1696: backoff index where Phase B (minute-scale) begins (for the escalation
+/// INFO log).
+const RETRY_PHASE_B_START: u32 = 3;
+/// #1696: backoff index where Phase C (sustained 10-min) begins.
+const RETRY_PHASE_C_START: u32 = 6;
+/// #1696: after a continue-inject, a `Thinking`/`ToolUse` transition within this
+/// window is treated as the inject's OWN transient (not real recovery), so the
+/// #1586 clear is suppressed — otherwise tiered Phase B/C can never progress (the
+/// inject drives Thinking → clear → re-detect restarts at Phase A). MUST stay
+/// strictly below the smallest Phase-B+ backoff (60s) so the suppression window
+/// can never overlap the next scheduled inject.
+const RETRY_INJECT_CLEAR_COOLDOWN: Duration = Duration::from_secs(30);
+/// #1696/#1697: minimum spacing between two continue-injects to the SAME agent
+/// across the retry and ApiError-nudge paths (guards a ServerRateLimit↔ApiError
+/// state flicker from double-injecting).
+const CONTINUE_INJECT_MIN_INTERVAL: Duration = Duration::from_secs(5);
 /// Fixed payload injected on ServerRateLimit recovery retry.
 /// "continue\n" is a universal resume signal: all supported backends
 /// (ClaudeCode, KiroCli, Codex, OpenCode, Gemini, Agy) accept it as
@@ -177,6 +198,12 @@ fn run_loop(
     // #1523: deferred AuthError member-notifies awaiting stability confirmation.
     let mut pending_auth: HashMap<String, PendingAuthError> = HashMap::new();
     let mut retry_tracks: HashMap<String, RateLimitRetry> = HashMap::new();
+    // #1697: agents currently in a nudged ApiError episode (re-armed on leaving
+    // the ApiError state). #1696/#1697: last continue-inject time per agent,
+    // shared by the retry + ApiError-nudge paths for the anti-thrash min-interval
+    // and the #1586 clear cooldown.
+    let mut apierror_episodes: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut last_continue_inject: HashMap<String, Instant> = HashMap::new();
     let mut pane_input_tracks: HashMap<String, PaneInputTrack> = HashMap::new();
     // Sprint 59 Wave 1 PR-1 (#9 task stall watchdog): per-task ETA
     // scanner, throttled to 5min via TICKS_PER_SCAN.
@@ -245,7 +272,13 @@ fn run_loop(
         // Mirrors the run_handlers_with_panic_guard pattern from per_tick.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             tick(&home, &registry, &mut notify_tracks, &mut pending_auth);
-            process_server_rate_limit_retries(&home, &registry, &mut retry_tracks);
+            process_error_recovery(
+                &home,
+                &registry,
+                &mut retry_tracks,
+                &mut apierror_episodes,
+                &mut last_continue_inject,
+            );
             check_pane_input_not_submitted(&home, &registry, &mut pane_input_tracks);
             anti_stall_tracker.maybe_scan(&home);
             idle_watchdog_tracker.maybe_scan(&home);
@@ -1114,60 +1147,130 @@ fn notify_orchestrator_retry_exhausted(home: &std::path::Path, name: &str, retri
 /// The old mechanism replayed stored operator input, which could replay
 /// modal keystrokes ("Yes, proceed") as new message submissions, causing
 /// infinite loops.
-pub(crate) fn process_server_rate_limit_retries(
+/// #1696: should the #1586 productive-state clear be SUPPRESSED for `state`?
+/// True ONLY for a `Thinking`/`ToolUse` transition within the inject cooldown —
+/// i.e. the transient our OWN continue-inject just caused, NOT a real recovery.
+/// `Ready`/`Idle` (unambiguous recovery) are never suppressed, so a genuinely
+/// recovered agent always clears immediately. Pure for unit testing.
+fn suppress_thinking_clear(
+    state: crate::state::AgentState,
+    since_last_inject: Option<Duration>,
+) -> bool {
+    use crate::state::AgentState;
+    matches!(state, AgentState::Thinking | AgentState::ToolUse)
+        && since_last_inject.is_some_and(|d| d < RETRY_INJECT_CLEAR_COOLDOWN)
+}
+
+/// #1696/#1697: snapshot the inject target under the registry lock (released
+/// BEFORE the blocking PTY write — #1530/F1), then inject the fixed `continue`
+/// payload **gated by the operator-draft check** (#1680: `force=false` →
+/// `should_defer_direct_inject` defers while the operator is typing instead of
+/// clobbering their half-typed draft; a deferral is enqueued and counts as
+/// handled). Returns true on a successful inject OR deferral. Shared by the
+/// ServerRateLimit retry path and the ApiError quick-nudge.
+fn inject_continue_gated(home: &std::path::Path, registry: &AgentRegistry, name: &str) -> bool {
+    let snap = {
+        let reg = agent::lock_registry(registry);
+        crate::fleet::resolve_uuid(home, name)
+            .and_then(|id| reg.get(&id))
+            .map(agent::InjectTarget::from_handle)
+    };
+    match snap {
+        Some(tgt) => {
+            agent::inject_with_target_gated(&tgt, name, CONTINUE_RETRY_PAYLOAD, false).is_ok()
+        }
+        None => false,
+    }
+}
+
+pub(crate) fn process_error_recovery(
     home: &std::path::Path,
     registry: &AgentRegistry,
     retry_tracks: &mut HashMap<String, RateLimitRetry>,
+    apierror_episodes: &mut std::collections::HashSet<String>,
+    last_continue_inject: &mut HashMap<String, Instant>,
 ) {
+    use crate::state::AgentState;
     let now = Instant::now();
 
-    // Phase 1: detect new ServerRateLimit states and schedule retries.
+    // Phase 1: classify states under the registry lock (NO PTY writes here).
     let mut active_names = std::collections::HashSet::new();
+    let mut apierror_to_nudge: Vec<String> = Vec::new();
     {
         let reg = agent::lock_registry(registry);
-        // #1441: registry is UUID-keyed; `retry_tracks` stays name-keyed, so
-        // index it by the handle's display name.
+        // #1441: registry is UUID-keyed; the tracking maps stay name-keyed, so
+        // index them by the handle's display name.
         for handle in reg.values() {
             let name = handle.name.as_str();
             active_names.insert(name.to_string());
             let state = handle.core.lock().state.current;
-            if state == crate::state::AgentState::ServerRateLimit {
-                if retry_tracks.contains_key(name) {
-                    continue;
+
+            // ── ServerRateLimit retry scheduling / #1586 clear ──
+            if state == AgentState::ServerRateLimit {
+                if !retry_tracks.contains_key(name) {
+                    let delay = Duration::from_secs(SERVER_RATE_LIMIT_BACKOFF[0]);
+                    tracing::info!(agent = %name, delay_secs = delay.as_secs(), "ServerRateLimit detected, scheduling retry (Phase A)");
+                    retry_tracks.insert(
+                        name.to_string(),
+                        RateLimitRetry {
+                            retry_count: 0,
+                            next_retry_at: now + delay,
+                            exhausted: false,
+                        },
+                    );
                 }
-                let delay = Duration::from_secs(SERVER_RATE_LIMIT_BACKOFF[0]);
-                tracing::info!(agent = %name, delay_secs = delay.as_secs(), "ServerRateLimit detected, scheduling retry");
-                retry_tracks.insert(
-                    name.to_string(),
-                    RateLimitRetry {
-                        retry_count: 0,
-                        next_retry_at: now + delay,
-                        exhausted: false,
-                    },
-                );
-            } else if clears_server_rate_limit_retry(state) && retry_tracks.remove(name).is_some() {
-                tracing::info!(
-                    agent = %name,
-                    ?state,
-                    "#1586: ServerRateLimit retry cleared — agent reached a productive \
-                     state (a real throttle stays stuck in the error state; a content-FP \
-                     keeps working, so clearing here kills the spurious retry storm)"
-                );
+            } else if clears_server_rate_limit_retry(state) {
+                // #1696: suppress the Thinking/ToolUse clear within the cooldown of
+                // our OWN continue-inject — that transient is not real recovery, and
+                // clearing here would restart tiered retry at Phase A forever. The
+                // cooldown (30s) < smallest Phase-B+ backoff (60s), so the window
+                // can never overlap the next scheduled inject. Ready/Idle always clear.
+                let since_inject = last_continue_inject
+                    .get(name)
+                    .map(|t| now.duration_since(*t));
+                if !suppress_thinking_clear(state, since_inject)
+                    && retry_tracks.remove(name).is_some()
+                {
+                    tracing::info!(
+                        agent = %name,
+                        ?state,
+                        "#1586: ServerRateLimit retry cleared — agent reached a productive \
+                         state (a real throttle stays stuck in the error state; a content-FP \
+                         keeps working, so clearing here kills the spurious retry storm)"
+                    );
+                }
+            }
+
+            // ── #1697: ApiError-at-prompt quick-nudge (per-episode anti-thrash) ──
+            if state == AgentState::ApiError {
+                if !apierror_episodes.contains(name) {
+                    apierror_to_nudge.push(name.to_string());
+                }
+            } else {
+                // Left the ApiError state → re-arm so the NEXT episode nudges again.
+                apierror_episodes.remove(name);
             }
         }
     }
 
-    // #1470 (re-scoped slice, credit @cheerc): drop retry tracks for agents no
-    // longer in the registry (killed / restarted / deleted). Recovery already
-    // clears tracks via `clears_server_rate_limit_retry` above, but an agent
-    // that vanishes mid-retry never reaches a productive state, so without this
-    // its track would leak forever and the map would grow unbounded across
-    // agent churn.
+    // #1470: drop tracking state for agents no longer in the registry (killed /
+    // restarted / deleted) so the maps don't grow unbounded across agent churn.
     retry_tracks.retain(|name, _| active_names.contains(name));
+    apierror_episodes.retain(|name| active_names.contains(name));
+    last_continue_inject.retain(|name, _| active_names.contains(name));
 
-    // Phase 2: fire due retries — inject fixed "continue\n".
+    // Phase 2: fire due ServerRateLimit retries — inject "continue\n" (lock-free).
     for (name, retry) in retry_tracks.iter_mut() {
         if retry.exhausted || now < retry.next_retry_at {
+            continue;
+        }
+        // #1696/#1697 anti-thrash: never two continue-injects to the same agent
+        // within MIN_INTERVAL (guards a ServerRateLimit↔ApiError flicker). Skip
+        // WITHOUT consuming a retry — next tick re-checks once the window passes.
+        if last_continue_inject
+            .get(name.as_str())
+            .is_some_and(|t| now.duration_since(*t) < CONTINUE_INJECT_MIN_INTERVAL)
+        {
             continue;
         }
 
@@ -1175,11 +1278,9 @@ pub(crate) fn process_server_rate_limit_retries(
         if retry.retry_count > SERVER_RATE_LIMIT_MAX_RETRIES {
             tracing::warn!(agent = %name, retries = retry.retry_count, "ServerRateLimit max retries exceeded — giving up");
             retry.exhausted = true;
-            // #1470 (re-scoped slice, credit @cheerc): tell the team
-            // orchestrator (via its INBOX) that auto-retry gave up, so a stuck
-            // member is reassigned/intervened instead of sitting dead. Inbox
-            // path only — the operator Telegram alert below is the separate
-            // `gated_notify` chokepoint call; this does NOT touch it.
+            // #1470: tell the team orchestrator (via its INBOX) that auto-retry
+            // gave up, so a stuck member is reassigned/intervened. Inbox path only;
+            // the operator Telegram alert below is the separate `gated_notify`.
             notify_orchestrator_retry_exhausted(home, name, retry.retry_count);
             if let Some(ch) = crate::channel::active_channel() {
                 let msg = format!(
@@ -1196,27 +1297,15 @@ pub(crate) fn process_server_rate_limit_retries(
             }
             continue;
         }
+        // #1696: escalation-phase observability (so a long outage is visible in the log).
+        if retry.retry_count == RETRY_PHASE_B_START {
+            tracing::info!(agent = %name, "ServerRateLimit: entering retry Phase B (minute-scale backoff)");
+        } else if retry.retry_count == RETRY_PHASE_C_START {
+            tracing::info!(agent = %name, "ServerRateLimit: entering retry Phase C (sustained 10-min retry)");
+        }
 
-        let injected = {
-            // #1530/F1: snapshot the inject target under the registry lock, then
-            // release it BEFORE the (up to 5s) blocking PTY write — never hold
-            // the registry across inject. #1441: registry is UUID-keyed.
-            let snap = {
-                let reg = agent::lock_registry(registry);
-                crate::fleet::resolve_uuid(home, name)
-                    .and_then(|id| reg.get(&id))
-                    .map(agent::InjectTarget::from_handle)
-            };
-            match snap {
-                Some(tgt) => {
-                    agent::inject_with_target_gated(&tgt, name, CONTINUE_RETRY_PAYLOAD, true)
-                        .is_ok()
-                }
-                None => false,
-            }
-        };
-
-        if injected {
+        if inject_continue_gated(home, registry, name) {
+            last_continue_inject.insert(name.clone(), Instant::now());
             tracing::info!(
                 agent = %name,
                 retry = retry.retry_count,
@@ -1229,6 +1318,22 @@ pub(crate) fn process_server_rate_limit_retries(
         } else {
             tracing::warn!(agent = %name, "ServerRateLimit: inject failed (agent gone?)");
             retry.exhausted = true;
+        }
+    }
+
+    // Phase 2b: #1697 ApiError quick-nudge — inject "continue\n" once per episode,
+    // immediately (no 300s-silence wait), respecting the shared MIN_INTERVAL.
+    for name in apierror_to_nudge {
+        if last_continue_inject
+            .get(&name)
+            .is_some_and(|t| now.duration_since(*t) < CONTINUE_INJECT_MIN_INTERVAL)
+        {
+            continue;
+        }
+        if inject_continue_gated(home, registry, &name) {
+            apierror_episodes.insert(name.clone());
+            last_continue_inject.insert(name.clone(), Instant::now());
+            tracing::info!(agent = %name, "#1697: ApiError-at-prompt quick-nudge — injected \"continue\"");
         }
     }
 }
@@ -2134,23 +2239,44 @@ instances:
 
     // ── ServerRateLimit auto-retry tests ─────────────────────────────
 
+    /// #1696: tiered schedule — Phase A burst (5/15/30s), Phase B backoff
+    /// (1m/2m/5m), Phase C sustained (10m × 6). 12 retries, ~75min budget.
     #[test]
-    fn backoff_5s_15s_30s_schedule() {
-        assert_eq!(super::SERVER_RATE_LIMIT_BACKOFF, [5, 15, 30]);
-        assert_eq!(super::SERVER_RATE_LIMIT_MAX_RETRIES, 3);
+    fn backoff_tiered_phase_a_b_c_schedule_1696() {
+        assert_eq!(
+            super::SERVER_RATE_LIMIT_BACKOFF,
+            [5, 15, 30, 60, 120, 300, 600, 600, 600, 600, 600, 600]
+        );
+        assert_eq!(super::SERVER_RATE_LIMIT_MAX_RETRIES, 12);
+        // Phase boundaries (for the escalation INFO logs) must index into the array.
+        assert_eq!(
+            super::SERVER_RATE_LIMIT_BACKOFF[super::RETRY_PHASE_B_START as usize],
+            60
+        );
+        assert_eq!(
+            super::SERVER_RATE_LIMIT_BACKOFF[super::RETRY_PHASE_C_START as usize],
+            600
+        );
+        // The clear-cooldown MUST stay below the smallest Phase-B+ backoff so the
+        // suppression window can never overlap the next scheduled inject.
+        assert!(
+            super::RETRY_INJECT_CLEAR_COOLDOWN < std::time::Duration::from_secs(60),
+            "#1696: clear cooldown must be < smallest Phase-B backoff (60s)"
+        );
     }
 
     #[test]
-    fn three_retries_then_stop() {
+    fn retries_stop_at_tiered_max_1696() {
+        // #1696: the budget is now MAX_RETRIES (12, tiered A/B/C), not 3.
         let mut retry = RateLimitRetry {
-            retry_count: 3,
+            retry_count: super::SERVER_RATE_LIMIT_MAX_RETRIES,
             next_retry_at: std::time::Instant::now(),
             exhausted: false,
         };
         retry.retry_count += 1;
         assert!(
             retry.retry_count > super::SERVER_RATE_LIMIT_MAX_RETRIES,
-            "after 3 retries, count exceeds max"
+            "the (count+1 > max) guard exhausts only after the full tiered budget"
         );
     }
 
@@ -2262,7 +2388,13 @@ instances:
         // #1441: registry is UUID-keyed — insert under the handle's own id.
         registry.lock().insert(handle.id, handle);
 
-        super::process_server_rate_limit_retries(&home, &registry, &mut tracks);
+        super::process_error_recovery(
+            &home,
+            &registry,
+            &mut tracks,
+            &mut Default::default(),
+            &mut Default::default(),
+        );
         assert!(
             tracks.contains_key("test-agent"),
             "phase 1 must detect ServerRateLimit and insert retry track"
@@ -2291,7 +2423,13 @@ instances:
         // #1441: registry is UUID-keyed — insert under the handle's own id.
         registry.lock().insert(handle.id, handle);
 
-        super::process_server_rate_limit_retries(&home, &registry, &mut tracks);
+        super::process_error_recovery(
+            &home,
+            &registry,
+            &mut tracks,
+            &mut Default::default(),
+            &mut Default::default(),
+        );
         assert!(
             !tracks.contains_key("test-agent"),
             "phase 1 must clear retry track on Ready recovery"
@@ -2353,7 +2491,13 @@ instances:
         let (handle, _reader) = mock_agent_handle("test-agent", crate::state::AgentState::Thinking);
         registry.lock().insert(handle.id, handle);
 
-        super::process_server_rate_limit_retries(&home, &registry, &mut tracks);
+        super::process_error_recovery(
+            &home,
+            &registry,
+            &mut tracks,
+            &mut Default::default(),
+            &mut Default::default(),
+        );
         assert!(
             !tracks.contains_key("test-agent"),
             "#1586: a productive (Thinking) agent must clear the retry track — no storm"
@@ -2382,7 +2526,13 @@ instances:
             mock_agent_handle("test-agent", crate::state::AgentState::ServerRateLimit);
         registry.lock().insert(handle.id, handle);
 
-        super::process_server_rate_limit_retries(&home, &registry, &mut tracks);
+        super::process_error_recovery(
+            &home,
+            &registry,
+            &mut tracks,
+            &mut Default::default(),
+            &mut Default::default(),
+        );
         assert!(
             tracks.contains_key("test-agent"),
             "#1586: a still-throttled (stuck) agent must KEEP its retry track"
@@ -2423,7 +2573,13 @@ instances:
             },
         );
 
-        super::process_server_rate_limit_retries(&home, &registry, &mut tracks);
+        super::process_error_recovery(
+            &home,
+            &registry,
+            &mut tracks,
+            &mut Default::default(),
+            &mut Default::default(),
+        );
         assert_eq!(
             tracks["test-agent"].retry_count, 1,
             "retry_count must increment after inject"
@@ -2474,7 +2630,13 @@ instances:
         );
 
         // Empty registry → the agent is gone → its track must be reaped.
-        super::process_server_rate_limit_retries(&home, &registry, &mut tracks);
+        super::process_error_recovery(
+            &home,
+            &registry,
+            &mut tracks,
+            &mut Default::default(),
+            &mut Default::default(),
+        );
         assert!(
             !tracks.contains_key("ghost-agent"),
             "retry track must be cleared when the agent is no longer in the registry"
@@ -2517,7 +2679,13 @@ instances:
             },
         );
 
-        super::process_server_rate_limit_retries(&home, &registry, &mut tracks);
+        super::process_error_recovery(
+            &home,
+            &registry,
+            &mut tracks,
+            &mut Default::default(),
+            &mut Default::default(),
+        );
 
         assert!(
             tracks["worker-x"].exhausted,
@@ -2825,6 +2993,179 @@ instances:
             "supervisor per-tick loop must invoke pr_state::scan_and_emit \
              (#1002 Phase 2 dual-entry-point fix). Without this, APP-mode \
              daemons silently skip the #972 aggregator + #986 gh-poll path."
+        );
+    }
+
+    // ── #1696 / #1697: tiered retry + ApiError quick-nudge ──
+
+    /// Build a registry with one agent at `state`, fleet.yaml seeded so the
+    /// name-keyed tracking resolves to the handle. Returns (home, registry, reader).
+    fn one_agent_registry(
+        name: &str,
+        state: crate::state::AgentState,
+        tag: &str,
+    ) -> (
+        std::path::PathBuf,
+        AgentRegistry,
+        Box<dyn std::io::Read + Send>,
+    ) {
+        let home = tmp_home(tag);
+        let (handle, reader) = mock_agent_handle(name, state);
+        let id = handle.id;
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            format!("instances:\n  {name}:\n    id: {}\n", id.full()),
+        )
+        .ok();
+        let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        registry.lock().insert(id, handle);
+        (home, registry, reader)
+    }
+
+    /// #1696 (pure): the clear is suppressed ONLY for Thinking/ToolUse within the
+    /// inject cooldown. Ready/Idle and a stale/absent inject always allow the clear.
+    #[test]
+    fn suppress_thinking_clear_only_within_inject_cooldown_1696() {
+        use crate::state::AgentState;
+        let fresh = Some(Duration::from_secs(5));
+        let stale = Some(super::RETRY_INJECT_CLEAR_COOLDOWN + Duration::from_secs(1));
+        assert!(super::suppress_thinking_clear(AgentState::Thinking, fresh));
+        assert!(super::suppress_thinking_clear(AgentState::ToolUse, fresh));
+        assert!(!super::suppress_thinking_clear(AgentState::Thinking, stale));
+        assert!(!super::suppress_thinking_clear(AgentState::Thinking, None));
+        // Ready/Idle = unambiguous recovery → never suppressed, even fresh.
+        assert!(!super::suppress_thinking_clear(AgentState::Ready, fresh));
+        assert!(!super::suppress_thinking_clear(AgentState::Idle, fresh));
+    }
+
+    /// #1696 regression: a continue-inject's transient Thinking must NOT clear the
+    /// retry track (else tiered Phase B/C restarts at Phase A forever). With a
+    /// recent inject the track survives (progress preserved); a real recovery
+    /// (no recent inject) clears it.
+    #[test]
+    fn inject_transient_thinking_keeps_track_real_recovery_clears_1696() {
+        // (a) Thinking + recent inject → track SURVIVES (suppressed).
+        let (home, registry, _r) =
+            one_agent_registry("ag", crate::state::AgentState::Thinking, "suppress-keep");
+        let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
+        tracks.insert(
+            "ag".into(),
+            RateLimitRetry {
+                retry_count: 4,
+                next_retry_at: Instant::now() + Duration::from_secs(120),
+                exhausted: false,
+            },
+        );
+        let mut last_inject: HashMap<String, Instant> = HashMap::new();
+        last_inject.insert("ag".into(), Instant::now());
+        super::process_error_recovery(
+            &home,
+            &registry,
+            &mut tracks,
+            &mut Default::default(),
+            &mut last_inject,
+        );
+        assert!(
+            tracks.contains_key("ag"),
+            "#1696: an inject-transient Thinking must NOT clear the retry track"
+        );
+        assert_eq!(
+            tracks["ag"].retry_count, 4,
+            "tiered retry progress preserved"
+        );
+        std::fs::remove_dir_all(&home).ok();
+
+        // (b) Thinking + NO recent inject → real recovery → track CLEARS (#1586).
+        let (home2, registry2, _r2) =
+            one_agent_registry("ag", crate::state::AgentState::Thinking, "suppress-clear");
+        let mut tracks2: HashMap<String, RateLimitRetry> = HashMap::new();
+        tracks2.insert(
+            "ag".into(),
+            RateLimitRetry {
+                retry_count: 4,
+                next_retry_at: Instant::now() + Duration::from_secs(120),
+                exhausted: false,
+            },
+        );
+        super::process_error_recovery(
+            &home2,
+            &registry2,
+            &mut tracks2,
+            &mut Default::default(),
+            &mut Default::default(),
+        );
+        assert!(
+            !tracks2.contains_key("ag"),
+            "#1586: a real productive recovery (no recent inject) must clear the track"
+        );
+        std::fs::remove_dir_all(&home2).ok();
+    }
+
+    /// #1697: an ApiError-at-prompt agent gets an immediate `continue` nudge, ONCE
+    /// per episode (no re-nudge while still in the same ApiError episode).
+    // Reads the injected payload back off the PTY — Windows' mock PTY (`cmd
+    // findstr`) doesn't echo like unix `cat`, so this is unix-only, mirroring the
+    // existing `phase2_injects_continue_to_pty` gate.
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn apierror_at_prompt_quick_nudge_once_per_episode_1697() {
+        let (home, registry, mut reader) =
+            one_agent_registry("ag", crate::state::AgentState::ApiError, "apierror-nudge");
+        let mut episodes: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut last_inject: HashMap<String, Instant> = HashMap::new();
+
+        super::process_error_recovery(
+            &home,
+            &registry,
+            &mut Default::default(),
+            &mut episodes,
+            &mut last_inject,
+        );
+        assert!(
+            episodes.contains("ag"),
+            "#1697: ApiError episode must be marked nudged"
+        );
+        let mut buf = vec![0u8; 256];
+        use std::io::Read;
+        let n = reader.read(&mut buf).expect("read from PTY");
+        assert!(
+            String::from_utf8_lossy(&buf[..n]).contains("continue"),
+            "#1697: ApiError nudge must inject \"continue\""
+        );
+
+        // Second tick, STILL ApiError + in episode → no re-nudge.
+        let before = last_inject.get("ag").copied();
+        super::process_error_recovery(
+            &home,
+            &registry,
+            &mut Default::default(),
+            &mut episodes,
+            &mut last_inject,
+        );
+        assert_eq!(
+            last_inject.get("ag").copied(),
+            before,
+            "#1697: must not re-nudge within the same ApiError episode"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1680 regression (source guard): the shared continue-inject MUST pass
+    /// `force=false` so it routes through `should_defer_direct_inject` and defers
+    /// while the operator is typing — never clobbering a half-typed draft. Pins the
+    /// fix of the pre-existing force-true retry inject.
+    #[test]
+    fn continue_inject_is_draft_gated_force_false_1680() {
+        let src = include_str!("supervisor.rs");
+        assert!(
+            src.contains("inject_with_target_gated(&tgt, name, CONTINUE_RETRY_PAYLOAD, false)"),
+            "#1680: the continue-inject must pass force=false (draft-gated)"
+        );
+        // Split needle so this assertion's own text can't false-match the source.
+        let force_true = format!("CONTINUE_RETRY_PAYLOAD,{}true)", " ");
+        assert!(
+            !src.contains(&force_true),
+            "#1680: no force=true continue-inject may remain"
         );
     }
 }
