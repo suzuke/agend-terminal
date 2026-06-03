@@ -173,8 +173,7 @@ fn emit_conflict_notify(home: &Path, agent: &str) {
     let base = crate::git_helpers::default_branch(&worktree);
     let payload = build_notify_payload(operation, &conflicted_files, branch, &base);
     let text = payload.to_string();
-    let source = crate::inbox::NotifySource::System("conflict_notify");
-    crate::inbox::notify_agent(home, agent, &source, &text);
+    route_conflict_alert(home, agent, false, &text);
     tracing::info!(
         agent,
         operation,
@@ -194,13 +193,63 @@ fn emit_telegram_escalation(home: &Path, agent: &str) {
          operator intervention may be required. Inspect via `pane_snapshot` or \
          direct check of the agent's worktree."
     );
-    let source = crate::inbox::NotifySource::System("conflict_escalation");
-    crate::inbox::notify_agent(home, agent, &source, &text);
+    route_conflict_alert(home, agent, true, &text);
     tracing::warn!(
         agent,
         threshold_min = STALE_THRESHOLD_SECS / 60,
         "Phase A: GitConflict escalation (operator notified)"
     );
+}
+
+/// #event-bus (conflict_notify, Option A): gate-ON → emit `ConflictAlert` (the
+/// subscriber delivers via `deliver_conflict_alert`); gate-OFF (prod default) →
+/// the legacy direct deliver. No double-delivery, no gate-off regression. `text`
+/// is the already-rendered notify body (built from the live worktree discovery at
+/// the producer) — carried verbatim so the bus path never re-runs discovery.
+fn route_conflict_alert(home: &Path, agent: &str, escalation: bool, text: &str) {
+    let bus = crate::daemon::event_bus::global();
+    if bus.is_enabled() {
+        bus.emit(crate::daemon::event_bus::EventKind::ConflictAlert {
+            agent: agent.to_string(),
+            escalation,
+            text: text.to_string(),
+        });
+    } else {
+        deliver_conflict_alert(home, agent, escalation, text);
+    }
+}
+
+/// Shared deliver for the git-conflict notify: PTY-notify the conflicted agent via
+/// `notify_agent`. Called by BOTH the legacy path AND the event-bus subscriber, so
+/// the delivery is identical by construction (the gate only chooses which path
+/// invokes this fn). `escalation` selects the `NotifySource` tag: the 30-min
+/// stale escalation vs the first-observation conflict notify.
+fn deliver_conflict_alert(home: &Path, agent: &str, escalation: bool, text: &str) {
+    let source = if escalation {
+        crate::inbox::NotifySource::System("conflict_escalation")
+    } else {
+        crate::inbox::NotifySource::System("conflict_notify")
+    };
+    crate::inbox::notify_agent(home, agent, &source, text);
+}
+
+/// #event-bus (conflict_notify) subscriber: re-deliver a `ConflictAlert` event via
+/// the shared `deliver_conflict_alert`.
+fn handle_event(home: &Path, event: &crate::daemon::event_bus::Event) {
+    if let crate::daemon::event_bus::EventKind::ConflictAlert {
+        agent,
+        escalation,
+        text,
+    } = &event.kind
+    {
+        deliver_conflict_alert(home, agent, *escalation, text);
+    }
+}
+
+/// Register the conflict-notify subscriber once at daemon startup (`run_core`).
+/// Dormant unless `AGEND_EVENT_BUS=1` (emit is a no-op when gate-off).
+pub(crate) fn register_subscriber(home: std::path::PathBuf) {
+    crate::daemon::event_bus::global().subscribe(move |e| handle_event(&home, e));
 }
 
 /// Discover conflicted files in a worktree via `git status
@@ -540,5 +589,89 @@ mod tests {
             .env("GIT_COMMITTER_NAME", "test")
             .env("GIT_COMMITTER_EMAIL", "t@t")
             .output();
+    }
+
+    // ── #event-bus (conflict_notify) migration tests ──────────────────────────
+
+    /// Build a home whose snapshot marks `agent` as `thinking`, so `notify_agent`
+    /// → `compose_aware_inject` DEFERS to the notification_queue (observable in a
+    /// test) rather than attempting a live PTY inject (which no-ops without a pane).
+    fn defer_home(tag: &str, agent: &str) -> std::path::PathBuf {
+        let home =
+            std::env::temp_dir().join(format!("agend-conflict-eb-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).ok();
+        crate::snapshot::save(
+            &home,
+            &[crate::snapshot::AgentSnapshot {
+                name: agent.to_string(),
+                backend_command: "claude".to_string(),
+                args: vec![],
+                working_dir: None,
+                submit_key: "\r".to_string(),
+                health_state: "healthy".to_string(),
+                agent_state: "thinking".to_string(),
+            }],
+        );
+        home
+    }
+
+    /// gate-ON: emit(ConflictAlert)→subscriber delivers the CARRIED rendered text
+    /// via the shared `deliver_conflict_alert` (→ notify_agent → deferred to the
+    /// queue under the `thinking` snapshot). The notify_agent half is PTY-inject so
+    /// it is observed via the notification_queue defer path (no inbox enqueue here).
+    #[test]
+    fn conflict_alert_gate_on_emit_subscriber_delivers_carried_text() {
+        let agent = "conflict-gate-on";
+        let home = defer_home("gate-on", agent);
+        let text =
+            build_notify_payload("rebase", &["src/a.rs".to_string()], "feat", "main").to_string();
+
+        let bus = crate::daemon::event_bus::EventBus::new_enabled_for_test();
+        let h = home.clone();
+        bus.subscribe(move |e| handle_event(&h, e));
+        bus.emit(crate::daemon::event_bus::EventKind::ConflictAlert {
+            agent: agent.to_string(),
+            escalation: false,
+            text: text.clone(),
+        });
+
+        let queued = crate::notification_queue::drain(&home, agent);
+        assert_eq!(
+            queued.len(),
+            1,
+            "subscriber must deliver exactly one notify"
+        );
+        assert!(
+            queued[0].text.contains("git_conflict_detected"),
+            "delivered notify must carry the rendered conflict payload, got: {}",
+            queued[0].text
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// gate-OFF (prod default): `route_conflict_alert` falls through to the legacy
+    /// direct deliver, so the conflict notify still lands (deferred to the queue).
+    #[test]
+    fn conflict_alert_gate_off_route_delivers_via_legacy() {
+        assert!(
+            !crate::daemon::event_bus::global().is_enabled(),
+            "test must run with AGEND_EVENT_BUS gate off"
+        );
+        let agent = "conflict-gate-off";
+        let home = defer_home("gate-off", agent);
+        let text =
+            build_notify_payload("rebase", &["src/a.rs".to_string()], "feat", "main").to_string();
+
+        route_conflict_alert(&home, agent, false, &text);
+
+        let queued = crate::notification_queue::drain(&home, agent);
+        assert_eq!(queued.len(), 1, "gate-off must deliver via legacy path");
+        assert!(
+            queued[0].text.contains("git_conflict_detected"),
+            "legacy notify must carry the rendered conflict payload, got: {}",
+            queued[0].text
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 }

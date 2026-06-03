@@ -128,6 +128,16 @@ pub enum EventKind {
         one_shot: bool,
         missed: bool,
     },
+    // #event-bus pattern (conflict_notify): the git-conflict notify / 30-min
+    // stale escalation, both delivered via `notify_agent` (PTY-inject). The text
+    // is built from live worktree discovery (git status + binding + op-marker) at
+    // the producer, so it is carried RENDERED — the subscriber must not re-run the
+    // discovery. `escalation` selects the NotifySource tag the deliver uses.
+    ConflictAlert {
+        agent: String,
+        escalation: bool,
+        text: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -365,6 +375,11 @@ mod tests {
                 label: "morning".into(),
                 one_shot: false,
                 missed: false,
+            },
+            EventKind::ConflictAlert {
+                agent: "fixup-dev".into(),
+                escalation: false,
+                text: "git conflict".into(),
             },
         ];
         for k in kinds {
