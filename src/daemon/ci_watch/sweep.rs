@@ -9,71 +9,6 @@ use super::WATCH_TTL_HOURS;
 /// over-paging on a one-tick blip.
 pub(crate) const STALL_THRESHOLD: u64 = 3;
 
-/// Sprint 54 P0-5 helper: read existing `consecutive_skips`, increment,
-/// persist, and (if we just crossed `STALL_THRESHOLD` and haven't yet
-/// notified for this window) fan out a `[ci-watch-stalled]` inbox event
-/// to every subscriber. The notify step reuses the P0-1 fan-out
-/// contract — one inbox enqueue per subscriber.
-///
-/// Atomicity: the increment + `stalled_notified` flag move in a single
-/// atomic_write so the next tick can't observe a "skips ≥ threshold,
-/// flag still false" intermediate state and fire a duplicate event.
-pub(super) fn bump_consecutive_skips_and_maybe_notify(
-    home: &Path,
-    watch_path: &Path,
-    repo: &str,
-    branch: &str,
-    subscribers: &[String],
-    reset_epoch: u64,
-    display_timezone: Option<&str>,
-) {
-    let mut watch: super::watch_state::WatchState = match std::fs::read_to_string(watch_path)
-        .ok()
-        .and_then(|c| serde_json::from_str(&c).ok())
-    {
-        Some(v) => v,
-        None => return,
-    };
-    let prev_skips = watch.consecutive_skips.unwrap_or(0);
-    let next_skips = prev_skips.saturating_add(1);
-    watch.consecutive_skips = Some(next_skips);
-
-    let already_notified = watch.stalled_notified.unwrap_or(false);
-    let should_notify = next_skips >= STALL_THRESHOLD && !already_notified;
-    if should_notify {
-        watch.stalled_notified = Some(true);
-        if watch.stalled_since_ms.is_none() {
-            watch.stalled_since_ms = Some(chrono::Utc::now().timestamp_millis());
-        }
-    }
-    if let Err(e) = crate::store::atomic_write(
-        watch_path,
-        serde_json::to_string_pretty(&watch)
-            .unwrap_or_default()
-            .as_bytes(),
-    ) {
-        tracing::warn!(path = %watch_path.display(), error = %e, "ci-watch stall-counter write failed");
-    }
-
-    if should_notify {
-        let stalled_since_ms = watch.stalled_since_ms;
-        // next_poll_eta = reset_epoch_ms (skip lifts at reset, then
-        // adaptive backoff applies — but reset is the user-visible
-        // "stalled until" moment).
-        let next_poll_eta = (reset_epoch as i64).saturating_mul(1000);
-        let setup_warning = crate::github_token::cached_setup_warning();
-        let body = build_stalled_body(
-            repo,
-            branch,
-            stalled_since_ms,
-            next_poll_eta,
-            setup_warning,
-            display_timezone,
-        );
-        fan_out_health_event(home, repo, branch, subscribers, "ci-watch-stalled", body);
-    }
-}
-
 /// Sprint 54 P0-5 helper: clear the stall state on the first successful
 /// poll after a stall window. Retained for tests; production path uses
 /// `clear_stall_state` with in-memory mutation.
@@ -138,6 +73,95 @@ pub(super) fn clear_stall_state(
         let body =
             format!("[ci-watch-resumed] {repo}@{branch}: poll resumed after rate-limit backoff");
         fan_out_health_event(home, repo, branch, subscribers, "ci-watch-resumed", body);
+    }
+}
+
+/// #1705: repo-level rate-limit stall tracking. With the repo-level batch poll, a
+/// rate-limit is a REPO property (one batch call hit the cap), so the stall state
+/// lives PER-REPO in a sidecar — NOT borrowed from a representative watch (a watch
+/// can be auto-cleared by #931 PR-terminal mid-stall and must not break the repo's
+/// stall anchor). One `[ci-watch-stalled]` / `[ci-watch-resumed]` per repo.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct RepoStallState {
+    #[serde(default)]
+    consecutive_skips: u64,
+    #[serde(default)]
+    stalled_notified: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stalled_since_ms: Option<i64>,
+}
+
+/// Sidecar path: `<ci-watches>/<repo-slug>.stall` (extension `.stall`, not `.json`,
+/// so the watch-dir scans which filter on `.json` skip it).
+fn repo_stall_path(home: &Path, repo: &str) -> std::path::PathBuf {
+    ci_watches_dir(home).join(format!("{}.stall", repo.replace(['/', ':'], "_")))
+}
+
+fn read_repo_stall(home: &Path, repo: &str) -> RepoStallState {
+    std::fs::read_to_string(repo_stall_path(home, repo))
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
+        .unwrap_or_default()
+}
+
+/// #1705: repo-level stall bump — called ONCE per repo when a batch poll hits an
+/// API/rate-limit error. Emits a single repo-level `[ci-watch-stalled]` when
+/// `consecutive_skips` first crosses `STALL_THRESHOLD` (once per stall window).
+pub(super) fn bump_repo_stall_and_maybe_notify(
+    home: &Path,
+    repo: &str,
+    subscribers: &[String],
+    reset_epoch: Option<u64>,
+    display_timezone: Option<&str>,
+) {
+    let mut st = read_repo_stall(home, repo);
+    st.consecutive_skips = st.consecutive_skips.saturating_add(1);
+    // `stalled_notified` gates the once-per-window emit; `stalled_since_ms`
+    // marks when the window opened (preserved if already set, e.g. seeded by a
+    // prior bump) so the body's "Stalled since" anchor is stable.
+    let should_notify = st.consecutive_skips >= STALL_THRESHOLD && !st.stalled_notified;
+    if should_notify {
+        st.stalled_notified = true;
+        if st.stalled_since_ms.is_none() {
+            st.stalled_since_ms = Some(chrono::Utc::now().timestamp_millis());
+        }
+    }
+    let _ = crate::store::atomic_write(
+        &repo_stall_path(home, repo),
+        serde_json::to_string_pretty(&st)
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    if should_notify {
+        let next_poll_eta = reset_epoch
+            .map(|r| (r as i64).saturating_mul(1000))
+            .unwrap_or(0);
+        let setup_warning = crate::github_token::cached_setup_warning();
+        let body = build_stalled_body(
+            repo,
+            "*",
+            st.stalled_since_ms,
+            next_poll_eta,
+            setup_warning,
+            display_timezone,
+        );
+        fan_out_health_event(home, repo, "*", subscribers, "ci-watch-stalled", body);
+    }
+}
+
+/// #1705: repo-level resume — called when a batch poll SUCCEEDS. Emits one
+/// `[ci-watch-resumed]` if the repo was stalled, then clears the sidecar.
+pub(super) fn clear_repo_stall_and_maybe_resume(home: &Path, repo: &str, subscribers: &[String]) {
+    let st = read_repo_stall(home, repo);
+    if st.consecutive_skips == 0 && !st.stalled_notified && st.stalled_since_ms.is_none() {
+        return; // never stalled this window — nothing to clear/announce
+    }
+    let was_stalled = st.stalled_notified;
+    let _ = std::fs::remove_file(repo_stall_path(home, repo));
+    if was_stalled {
+        let body =
+            format!("[ci-watch-resumed] {repo}: batch poll resumed after rate-limit backoff");
+        fan_out_health_event(home, repo, "*", subscribers, "ci-watch-resumed", body);
     }
 }
 
@@ -373,37 +397,24 @@ mod tests {
         dir
     }
 
-    /// #946 — sweep.rs `[ci-watch-stalled]` enqueue site (fan_out_health_event
-    /// at :161 via bump_consecutive_skips_and_maybe_notify) carries
-    /// `correlation_id = {repo}@{branch}`. Pre-fix: None.
+    /// #946/#1705 — repo-level `[ci-watch-stalled]` enqueue site
+    /// (fan_out_health_event via bump_repo_stall_and_maybe_notify) carries
+    /// `correlation_id = {repo}@*`. The `*` branch marks a repo-level event
+    /// (the batch poll owns stall now, not any single watch). Pre-fix: None.
     #[test]
-    fn ci_stalled_inbox_message_carries_repo_branch_correlation_id() {
+    fn ci_stalled_inbox_message_carries_repo_correlation_id() {
         let dir = tmp_dir("946-stalled-corr");
         let ci_dir = dir.join("ci-watches");
         std::fs::create_dir_all(&ci_dir).unwrap();
-        // Plant a watch with consecutive_skips == STALL_THRESHOLD-1 so
-        // the next bump tips it over and fires the stall notification.
-        let watch_path = ci_dir.join("test-watch.json");
-        let watch = serde_json::json!({
-            "repo": "o/r",
-            "branch": "feat",
-            "consecutive_skips": STALL_THRESHOLD - 1,
-            "stalled_notified": false,
-            "subscribers": [{"instance": "agent1", "subscribed_at": "2026-05-19T00:00:00Z"}],
-        });
-        std::fs::write(&watch_path, serde_json::to_string_pretty(&watch).unwrap()).unwrap();
+        // Plant the repo stall sidecar at STALL_THRESHOLD-1 so the next bump
+        // tips it over and fires the repo-level stall notification.
+        let stall_path = ci_dir.join("o_r.stall");
+        let sidecar = serde_json::json!({ "consecutive_skips": STALL_THRESHOLD - 1 });
+        std::fs::write(&stall_path, serde_json::to_string_pretty(&sidecar).unwrap()).unwrap();
 
         let subscribers = vec!["agent1".to_string()];
         let reset_epoch = chrono::Utc::now().timestamp() as u64 + 3600;
-        bump_consecutive_skips_and_maybe_notify(
-            &dir,
-            &watch_path,
-            "o/r",
-            "feat",
-            &subscribers,
-            reset_epoch,
-            None,
-        );
+        bump_repo_stall_and_maybe_notify(&dir, "o/r", &subscribers, Some(reset_epoch), None);
 
         let inbox_path = dir.join("inbox").join("agent1.jsonl");
         let content = std::fs::read_to_string(&inbox_path).unwrap();
@@ -411,7 +422,7 @@ mod tests {
             content.contains("[ci-watch-stalled]"),
             "expected [ci-watch-stalled] in inbox: {content}"
         );
-        let expected = r#""correlation_id":"o/r@feat""#;
+        let expected = r#""correlation_id":"o/r@*""#;
         assert!(
             content.contains(expected),
             "ci-watch-stalled message must carry correlation_id={expected}: {content}"

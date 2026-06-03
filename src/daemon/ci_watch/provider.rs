@@ -160,6 +160,32 @@ pub enum CiPollResult {
     },
 }
 
+/// #1705: one run row from a REPO-LEVEL batch poll — a `CiRun` tagged with its
+/// `head_branch`, so a single repo query can be fanned out to each watched branch.
+#[derive(Debug, Clone)]
+pub struct RunRow {
+    pub head_branch: String,
+    pub run: CiRun,
+}
+
+/// #1705: result of ONE repo-level batch poll (`actions/runs?per_page=100`, no
+/// `?branch=` filter) — replaces N per-branch polls with one. Rate-limit fields
+/// are repo-level (a single response).
+#[derive(Debug, Clone)]
+pub enum RepoPollResult {
+    Runs {
+        rows: Vec<RunRow>,
+        rate_limit_remaining: Option<u64>,
+        rate_limit_limit: Option<u64>,
+    },
+    ApiError {
+        #[allow(dead_code)] // serialized in error diagnostics
+        status: u16,
+        message: String,
+        rate_limit_reset: Option<u64>,
+    },
+}
+
 /// PR terminal-state check result.
 #[derive(Debug)]
 pub enum PrState {
@@ -210,6 +236,15 @@ impl MergeableState {
 pub trait CiProvider: Send + Sync {
     /// Poll workflow/pipeline runs for `repo@branch`.
     async fn poll_runs(&self, repo: &str, branch: &str) -> anyhow::Result<CiPollResult>;
+
+    /// #1705: poll ALL recent runs for `repo` in ONE query (`?per_page=100`, no
+    /// branch filter); the caller groups by `head_branch` and fans out to each
+    /// watched branch, collapsing N per-branch polls into one. `None` = the
+    /// provider does not support batch polling → the caller falls back to
+    /// per-branch [`poll_runs`] (GitLab / Bitbucket — unverified path).
+    async fn poll_repo_runs(&self, _repo: &str) -> Option<anyhow::Result<RepoPollResult>> {
+        None
+    }
 
     /// Check whether the PR/MR for `branch` has reached a terminal state.
     async fn check_pr_terminal(&self, repo: &str, branch: &str) -> PrState;
@@ -379,6 +414,77 @@ impl CiProvider for GitHubCiProvider {
             rate_limit_remaining,
             rate_limit_limit,
         })
+    }
+
+    async fn poll_repo_runs(&self, repo: &str) -> Option<anyhow::Result<RepoPollResult>> {
+        // #1705: ONE repo-level query (no `?branch=`) → all recent runs across
+        // branches; the caller groups by `head_branch`. `per_page=100` (GitHub max)
+        // covers every active watched branch's latest run in one page (active =
+        // recent run = in-page; terminal watches are auto-cleared and don't poll).
+        Some(async {
+            let resp = self
+                .http
+                .get(&format!("repos/{repo}/actions/runs?per_page=100"))
+                .send()
+                .await?;
+            let status = resp.status().as_u16();
+            let rate_limit_reset = resp
+                .headers()
+                .get("x-ratelimit-reset")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok());
+            let parse_u64_header = |name: &str| {
+                resp.headers()
+                    .get(name)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+            };
+            let rate_limit_remaining = parse_u64_header("x-ratelimit-remaining");
+            let rate_limit_limit = parse_u64_header("x-ratelimit-limit");
+            let body: serde_json::Value = resp.json().await?;
+            if !(200..300).contains(&status) {
+                let message = body["message"].as_str().unwrap_or("(no message)").to_string();
+                let hint = if status == 403
+                    && crate::github_token::cached_token().is_none()
+                    && message.to_lowercase().contains("rate limit")
+                {
+                    " — set GITHUB_TOKEN or run `gh auth login` to raise the unauthenticated 60/hr cap"
+                } else {
+                    ""
+                };
+                return Ok(RepoPollResult::ApiError {
+                    status,
+                    message: format!("GH API {status}: {message}{hint}"),
+                    rate_limit_reset,
+                });
+            }
+            // Same per-run parse as `poll_runs`, plus `head_branch` for grouping.
+            let rows = body["workflow_runs"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|r| {
+                            Some(RunRow {
+                                head_branch: r["head_branch"].as_str()?.to_string(),
+                                run: CiRun {
+                                    id: r["id"].as_u64()?,
+                                    conclusion: r["conclusion"].as_str().map(String::from),
+                                    head_sha: r["head_sha"].as_str()?.to_string(),
+                                    url: r["html_url"].as_str().unwrap_or("").to_string(),
+                                    name: r["name"].as_str().unwrap_or("").to_string(),
+                                },
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(RepoPollResult::Runs {
+                rows,
+                rate_limit_remaining,
+                rate_limit_limit,
+            })
+        }
+        .await)
     }
 
     async fn check_pr_terminal(&self, repo: &str, branch: &str) -> PrState {
