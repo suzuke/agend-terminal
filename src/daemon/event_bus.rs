@@ -4,7 +4,12 @@
 //! remain untouched; this module emits a structured `Event` alongside them
 //! so future subscribers can react without per-module plumbing.
 //!
-//! Gated by `AGEND_EVENT_BUS=1`. When disabled, `emit()` is a no-op.
+//! End-of-train cutover (Step 1): the gate now defaults **ON** (code-shipped) so
+//! the event-bus delivery path is live without any operator env. Set
+//! `AGEND_EVENT_BUS=0` and **restart the daemon** to fall back to the legacy
+//! direct-enqueue path (the kill-switch — `global()` is a `OnceLock` that reads
+//! the env once at startup, so it is NOT a hot-toggle). The legacy `else`
+//! branches are retained as that kill-switch until Step 2 (post-validation).
 
 #![allow(dead_code)]
 
@@ -181,9 +186,15 @@ pub struct EventBus {
 
 impl EventBus {
     pub fn new() -> Self {
+        // #event-bus cutover Step 1: default ON in production. Unset env →
+        // enabled; the kill-switch is `AGEND_EVENT_BUS=0` (any other value stays
+        // ON). In the TEST binary the default is OFF so the existing legacy-path
+        // unit/integration tests keep exercising the legacy direct-enqueue
+        // (the bus path is covered by the per-pattern `new_enabled_for_test`
+        // parity tests). An explicit env value overrides in either build.
         let enabled = std::env::var("AGEND_EVENT_BUS")
-            .map(|v| v == "1")
-            .unwrap_or(false);
+            .map(|v| v != "0")
+            .unwrap_or(!cfg!(test));
         Self {
             subscribers: parking_lot::Mutex::new(Vec::new()),
             enabled,
