@@ -17,6 +17,11 @@ pub enum EventKind {
         title: String,
         assignee: Option<String>,
         reason: String,
+        // #event-bus first-pattern (anti_stall): carry the task's `started_at` +
+        // `eta_secs` so a subscriber can rebuild the BYTE-IDENTICAL notification
+        // text the legacy direct enqueue formats from them.
+        started_at: Option<String>,
+        eta_secs: Option<i64>,
     },
     CiReady {
         repo: String,
@@ -81,6 +86,17 @@ impl EventBus {
 
     pub fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// Test-only: a bus with the gate forced ON (bypasses the env var), so other
+    /// modules' tests can exercise the `emit`→subscriber path deterministically
+    /// without touching the process-global `global()` bus.
+    #[cfg(test)]
+    pub(crate) fn new_enabled_for_test() -> Self {
+        Self {
+            subscribers: parking_lot::Mutex::new(Vec::new()),
+            enabled: true,
+        }
     }
 
     pub fn subscribe(&self, f: impl Fn(&Event) + Send + Sync + 'static) {
@@ -159,6 +175,8 @@ mod tests {
             title: "test".into(),
             assignee: Some("dev".into()),
             reason: "stalled".into(),
+            started_at: None,
+            eta_secs: None,
         });
         let events = received.lock().unwrap();
         assert_eq!(events.len(), 1);
@@ -200,6 +218,8 @@ mod tests {
                 title: "t".into(),
                 assignee: None,
                 reason: "r".into(),
+                started_at: None,
+                eta_secs: None,
             },
             EventKind::CiReady {
                 repo: "o/r".into(),
