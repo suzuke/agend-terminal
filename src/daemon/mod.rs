@@ -406,9 +406,10 @@ fn run_core(
 
     let ctx = init_daemon_services(home, telegram)?;
 
-    // #event-bus first-pattern: register the anti_stall delivery subscriber once.
-    // Dormant unless AGEND_EVENT_BUS=1 (emit is a no-op when gate-off).
+    // #event-bus: register the per-pattern delivery subscribers once. Dormant
+    // unless AGEND_EVENT_BUS=1 (emit is a no-op when gate-off).
     crate::daemon::anti_stall::register_subscriber(home.to_path_buf());
+    crate::daemon::decision_timeout::register_subscriber(home.to_path_buf());
 
     spawn_fleet_agents(home, &agents, &ctx);
 

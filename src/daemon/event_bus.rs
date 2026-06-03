@@ -44,6 +44,15 @@ pub enum EventKind {
         from_state: String,
         to_state: String,
     },
+    // #event-bus pattern #2 (decision_timeout): all fields the auto-default
+    // timeout notification formats, so the subscriber rebuilds it byte-identically.
+    DecisionTimeout {
+        decision_id: String,
+        sender: String,
+        elapsed_secs: i64,
+        timeout_secs: i64,
+        default_action: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -241,6 +250,13 @@ mod tests {
                 team: "fixup".into(),
                 from_state: "Ready".into(),
                 to_state: "ServerRateLimit".into(),
+            },
+            EventKind::DecisionTimeout {
+                decision_id: "d-1".into(),
+                sender: "general".into(),
+                elapsed_secs: 2000,
+                timeout_secs: 1800,
+                default_action: "proceed".into(),
             },
         ];
         for k in kinds {

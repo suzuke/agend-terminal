@@ -290,16 +290,46 @@ pub(crate) fn scan_and_emit(home: &Path) {
     }
 }
 
-fn emit_timeout_event(home: &Path, d: &PendingDecision, elapsed_secs: i64) {
-    let text = format!(
+/// #event-bus pattern #2: the timeout notification text, built from the exact
+/// fields carried by `EventKind::DecisionTimeout`, so the legacy direct enqueue
+/// and the bus subscriber produce a BYTE-IDENTICAL message.
+fn decision_timeout_text(
+    decision_id: &str,
+    sender: &str,
+    elapsed_secs: i64,
+    timeout_secs: i64,
+    default_action: &str,
+) -> String {
+    format!(
         "[decision_timeout] decision {decision_id} from '{sender}' timed out \
          after {elapsed_secs}s (threshold {timeout_secs}s). Auto-default: \
          '{default_action}'. Operator can reverse via reply.",
-        decision_id = d.decision_id,
-        sender = d.sender,
+        decision_id = decision_id,
+        sender = sender,
         elapsed_secs = elapsed_secs,
-        timeout_secs = d.timeout_secs,
-        default_action = d.default_action,
+        timeout_secs = timeout_secs,
+        default_action = default_action,
+    )
+}
+
+/// #event-bus pattern #2: the actual delivery (notify_system to the timeout
+/// recipient). Shared by BOTH the legacy gate-off path and the bus subscriber, so
+/// the two are identical by construction — the parity test proves the event
+/// carries enough to call this the same way.
+fn deliver_timeout(
+    home: &Path,
+    decision_id: &str,
+    sender: &str,
+    elapsed_secs: i64,
+    timeout_secs: i64,
+    default_action: &str,
+) {
+    let text = decision_timeout_text(
+        decision_id,
+        sender,
+        elapsed_secs,
+        timeout_secs,
+        default_action,
     );
     let recipient = timeout_recipient();
     if let Err(e) = crate::inbox::notify_system(
@@ -308,10 +338,64 @@ fn emit_timeout_event(home: &Path, d: &PendingDecision, elapsed_secs: i64) {
         "system:decision_timeout",
         "decision_timeout",
         text,
-        Some(&d.decision_id),
+        Some(decision_id),
         None,
     ) {
         tracing::warn!(error = %e, recipient, "decision_timeout: enqueue failed");
+    }
+}
+
+/// #event-bus pattern #2: bus subscriber — deliver on a `DecisionTimeout` event
+/// (the gate-ON path). Registered once at daemon startup via [`register_subscriber`].
+fn handle_event(home: &Path, event: &crate::daemon::event_bus::Event) {
+    if let crate::daemon::event_bus::EventKind::DecisionTimeout {
+        decision_id,
+        sender,
+        elapsed_secs,
+        timeout_secs,
+        default_action,
+    } = &event.kind
+    {
+        deliver_timeout(
+            home,
+            decision_id,
+            sender,
+            *elapsed_secs,
+            *timeout_secs,
+            default_action,
+        );
+    }
+}
+
+/// #event-bus pattern #2: register the decision_timeout delivery subscriber on
+/// the global bus. Call ONCE at daemon startup. Dormant while the bus is gate-off
+/// (emit never fires), so registration is always safe.
+pub fn register_subscriber(home: std::path::PathBuf) {
+    crate::daemon::event_bus::global().subscribe(move |e| handle_event(&home, e));
+}
+
+fn emit_timeout_event(home: &Path, d: &PendingDecision, elapsed_secs: i64) {
+    // #event-bus pattern #2 (Option A): gate-ON → emit (the subscriber delivers);
+    // gate-OFF (prod default) → the legacy direct delivery. No double-delivery, no
+    // gate-off regression. The legacy `else` is retired only at the final cutover.
+    let bus = crate::daemon::event_bus::global();
+    if bus.is_enabled() {
+        bus.emit(crate::daemon::event_bus::EventKind::DecisionTimeout {
+            decision_id: d.decision_id.clone(),
+            sender: d.sender.clone(),
+            elapsed_secs,
+            timeout_secs: d.timeout_secs,
+            default_action: d.default_action.clone(),
+        });
+    } else {
+        deliver_timeout(
+            home,
+            &d.decision_id,
+            &d.sender,
+            elapsed_secs,
+            d.timeout_secs,
+            &d.default_action,
+        );
     }
 }
 
@@ -878,5 +962,100 @@ mod tests {
             prod[block_end..].contains(&emit_needle),
             "emit_timeout_event must run AFTER the decision flock is dropped"
         );
+    }
+
+    // ── #event-bus pattern #2: emit→subscriber vs legacy parity ──
+
+    /// The comparable inbox payload (ignoring volatile id/timestamp).
+    fn drained_payloads(
+        home: &Path,
+        recipient: &str,
+    ) -> Vec<(String, Option<String>, String, Option<String>)> {
+        crate::inbox::drain(home, recipient)
+            .into_iter()
+            .map(|m| (m.from, m.kind, m.text, m.correlation_id))
+            .collect()
+    }
+
+    /// PARITY (gate-ON): the bus `emit`→subscriber path delivers payloads
+    /// byte-identical (from/kind/text/correlation) to the legacy direct enqueue.
+    /// Exercises the REAL bus emit→fan-out→subscriber wiring.
+    #[test]
+    fn gate_on_emit_subscriber_matches_legacy_direct_enqueue() {
+        let _g = env_lock();
+        std::env::remove_var("AGEND_DECISION_TIMEOUT_RECIPIENT");
+        let (decision_id, sender, elapsed_secs, timeout_secs, default_action) = (
+            "d-parity",
+            "general",
+            2000_i64,
+            1800_i64,
+            "proceed-with-lean",
+        );
+
+        // Legacy direct delivery (the gate-OFF path).
+        let home_legacy = tmp_home("parity-legacy");
+        deliver_timeout(
+            &home_legacy,
+            decision_id,
+            sender,
+            elapsed_secs,
+            timeout_secs,
+            default_action,
+        );
+
+        // Bus emit→subscriber delivery (the gate-ON path) — real fan-out.
+        let home_bus = tmp_home("parity-bus");
+        let bus = crate::daemon::event_bus::EventBus::new_enabled_for_test();
+        let h = home_bus.clone();
+        bus.subscribe(move |e| handle_event(&h, e));
+        bus.emit(crate::daemon::event_bus::EventKind::DecisionTimeout {
+            decision_id: decision_id.to_string(),
+            sender: sender.to_string(),
+            elapsed_secs,
+            timeout_secs,
+            default_action: default_action.to_string(),
+        });
+
+        let recipient = timeout_recipient();
+        let legacy = drained_payloads(&home_legacy, &recipient);
+        let viabus = drained_payloads(&home_bus, &recipient);
+        assert_eq!(
+            legacy, viabus,
+            "emit→subscriber payload must equal legacy direct enqueue"
+        );
+        assert!(
+            !legacy.is_empty(),
+            "parity test must actually deliver ≥1 message (else it proves nothing)"
+        );
+        std::fs::remove_dir_all(&home_legacy).ok();
+        std::fs::remove_dir_all(&home_bus).ok();
+    }
+
+    /// Option A: with the gate OFF (prod default), `emit_timeout_event` must STILL
+    /// deliver via the legacy path. No regression.
+    #[test]
+    fn gate_off_emit_delivers_via_legacy() {
+        let _g = env_lock();
+        std::env::remove_var("AGEND_DECISION_TIMEOUT_RECIPIENT");
+        assert!(
+            !crate::daemon::event_bus::global().is_enabled(),
+            "precondition: the global bus must be gate-off in the test env"
+        );
+        let home = tmp_home("gate-off");
+        let d = PendingDecision {
+            decision_id: "d-gateoff".into(),
+            sender: "general".into(),
+            default_action: "proceed".into(),
+            timeout_secs: 1800,
+            status: "timeout".into(),
+            ..Default::default()
+        };
+        emit_timeout_event(&home, &d, 2000);
+        let recipient = timeout_recipient();
+        assert!(
+            !drained_payloads(&home, &recipient).is_empty(),
+            "#event-bus Option A: gate-off must deliver via the legacy path (no regression)"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 }
