@@ -231,18 +231,14 @@ mod tests {
     // trigger an unauthorized auto-dismiss.
     //
     // Production-realistic patterns: these tests use the EXACT regex strings
-    // from `BackendPreset::dismiss_patterns` (Backend::Gemini) so a future
-    // refactor that diverges the test pattern from prod would still trigger
-    // these assertions on the prod string.
+    // from `BackendPreset::dismiss_patterns` so a future refactor that diverges
+    // the test pattern from prod would still trigger these assertions on the
+    // prod string.
     //
     // Regression-proof: revert `try_dismiss_dialog` to use
     // `screen.contains(pattern.as_str())` (bare substring match) and the
     // false-positive tests below FAIL. Restore the regex match → PASS.
 
-    /// Production dismiss regex for Gemini's MCP-tool dialog (Issue #468).
-    const GEMINI_MCP_TOOL_REGEX: &str = r"(?m)^[^A-Za-z\n]{0,8}Allow execution of MCP tool";
-    /// Production dismiss regex for Gemini's shell-execution dialog (Issue #468).
-    const GEMINI_SHELL_REGEX: &str = r"(?m)^[^A-Za-z\n]{0,8}Allow execution of:";
     /// Production dismiss regex for kiro-cli's "Trust All Tools" prompt
     /// (Issue #468 follow-up — radio-button cursor `)` was unmatched).
     const KIRO_TRUST_REGEX: &str = r"(?m)^[^A-Za-z\n]{0,8}No, exit";
@@ -256,81 +252,6 @@ mod tests {
     /// `Enter` to dismiss kiro-cli's "Trust All Tools" prompt.
     fn kiro_trust_patterns() -> Vec<(String, Vec<u8>)> {
         vec![(KIRO_TRUST_REGEX.to_string(), b"\x1b[B\r".to_vec())]
-    }
-
-    #[test]
-    fn issue_468_true_positive_gemini_mcp_dialog() {
-        // Realistic Gemini Ink TUI render: dialog body is wrapped in box-drawing
-        // chars, lines start with `│ ` (vertical bar + space).
-        let screen = "\
-╭─────────────────────────────────────────────╮
-│ Allow execution of MCP tool: ripgrep?       │
-│                                             │
-│ [1] Allow once                              │
-│ [2] Allow for session                       │
-│ [3] Allow always (this server)              │
-│ [4] Reject                                  │
-╰─────────────────────────────────────────────╯
-";
-        let patterns = vec![(GEMINI_MCP_TOOL_REGEX.to_string(), b"3\n".to_vec())];
-        assert!(
-            try_dismiss_dialog("t", screen, &test_writer(), &patterns),
-            "true Gemini dialog (TUI prefix `│ `) must match anchored regex"
-        );
-    }
-
-    #[test]
-    fn issue_468_false_positive_mid_paragraph_user_text() {
-        // User-typed message containing the dialog phrase mid-paragraph.
-        // Substring match would auto-inject `2\n`; anchored regex must not.
-        let screen = "\
-Could you explain what \"Allow execution of: bash\" actually means?
-I see it in the docs but I'm not sure when Gemini shows it.
-";
-        let patterns = vec![(GEMINI_SHELL_REGEX.to_string(), b"2\n".to_vec())];
-        assert!(
-            !try_dismiss_dialog("t", screen, &test_writer(), &patterns),
-            "Issue #468: user text with phrase mid-paragraph must NOT trigger dismiss"
-        );
-    }
-
-    #[test]
-    fn issue_468_false_positive_scrollback_agent_output() {
-        // Agent's prior output explains the dialog format — phrase appears
-        // embedded in a longer line. Substring match would auto-fire mid-stream.
-        let screen = "\
-[ai] When the tool is invoked, you'll see a prompt: Allow execution of MCP tool — pick option 3 to always allow.
-[user] thanks!
-[ai] Anything else?
-";
-        let patterns = vec![(GEMINI_MCP_TOOL_REGEX.to_string(), b"3\n".to_vec())];
-        assert!(
-            !try_dismiss_dialog("t", screen, &test_writer(), &patterns),
-            "Issue #468: agent scrollback explaining the phrase must NOT trigger dismiss"
-        );
-    }
-
-    #[test]
-    fn issue_468_production_smoke_vterm_rendered_dialog() {
-        // Production-smoke gate (§5): drive VTerm with the ANSI byte stream
-        // a real Gemini TUI emits, then run try_dismiss_dialog against the
-        // rendered screen. Asserts injected bytes only happen when the actual
-        // dialog renders — the same failure mode the user reported.
-        let mut vt = crate::vterm::VTerm::new(80, 24);
-        // Synthesize a minimal Gemini-style dialog frame: top border, body line
-        // with `│ Allow execution of MCP tool: ...`, choice rows, bottom border.
-        vt.process(b"\x1b[2J\x1b[H"); // clear + home
-        vt.process("╭───────────────────────────────────────╮\r\n".as_bytes());
-        vt.process("│ Allow execution of MCP tool: gh?      │\r\n".as_bytes());
-        vt.process("│                                       │\r\n".as_bytes());
-        vt.process("│ [3] Allow always                      │\r\n".as_bytes());
-        vt.process("╰───────────────────────────────────────╯\r\n".as_bytes());
-        let screen = vt.tail_lines(24);
-        let patterns = vec![(GEMINI_MCP_TOOL_REGEX.to_string(), b"3\n".to_vec())];
-        assert!(
-            try_dismiss_dialog("t", &screen, &test_writer(), &patterns),
-            "VTerm-rendered Gemini dialog must match production regex. Screen:\n{screen}"
-        );
     }
 
     /// #996 Phase 1: true Claude workspace-trust prompt — vterm-rendered —
@@ -440,8 +361,8 @@ Should we add a dismiss_pattern?
         // outcome (the actual log line is captured by tracing-test in
         // dedicated integration suites elsewhere; keeping this test free
         // of subscriber setup avoids per-test global-state collisions).
-        let screen = "user said: Allow execution of: please?";
-        let patterns = vec![(GEMINI_SHELL_REGEX.to_string(), b"2\n".to_vec())];
+        let screen = "user said: Yes, I trust this repo, right?";
+        let patterns = vec![(CLAUDE_TRUST_REGEX.to_string(), b"\r".to_vec())];
         let fired = try_dismiss_dialog("t", screen, &test_writer(), &patterns);
         assert!(
             !fired,
@@ -449,8 +370,8 @@ Should we add a dismiss_pattern?
         );
         // dismiss_literal_hint should recover the bare phrase from the prod regex.
         assert_eq!(
-            super::dismiss_literal_hint(GEMINI_SHELL_REGEX),
-            "Allow execution of:",
+            super::dismiss_literal_hint(CLAUDE_TRUST_REGEX),
+            "Yes, I trust",
             "literal hint must strip the standard line-anchor prefix"
         );
     }

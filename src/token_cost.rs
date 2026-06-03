@@ -17,8 +17,8 @@
 //! `payload.info.total_token_usage` — session-cumulative, so the MAX per file
 //! is taken, never summed), merged into the same per-instance aggregation.
 //! OpenCode is deferred (its SQLite store needs a new `rusqlite`/`sqlx`
-//! dependency — pending operator sign-off). Kiro/Gemini have no usable token
-//! surface and are reported as unsupported (never fabricated).
+//! dependency — pending operator sign-off). Kiro has no usable token
+//! surface and is reported as unsupported (never fabricated).
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -770,7 +770,7 @@ fn render(
     let mut table = String::new();
     table.push_str(&format!(
         "Token usage ({since_label}) — Claude Code + Codex. Excludes Claude >200k long-context \
-         surcharge. Kiro/Gemini unsupported (no token telemetry source). Pricing is an estimate \
+         surcharge. Kiro unsupported (no token telemetry source). Pricing is an estimate \
          pending operator calibration.\n"
     ));
     table.push_str(&format!(
@@ -817,8 +817,8 @@ fn render(
         "ok": true,
         "since": since_label,
         "backends": ["claude", "codex"],
-        "unsupported_backends": ["kiro-cli", "gemini"],
-        "note": "Claude Code + Codex; Kiro/Gemini unsupported (no token telemetry source, not fabricated); excludes Claude >200k long-context surcharge; pricing pending operator calibration",
+        "unsupported_backends": ["kiro-cli"],
+        "note": "Claude Code + Codex; Kiro unsupported (no token telemetry source, not fabricated); excludes Claude >200k long-context surcharge; pricing pending operator calibration",
         "totals": {
             "input": grand.input,
             "output": grand.output,

@@ -106,7 +106,7 @@ Real-PTY captures grow the regression corpus in `tests/fixtures/state-replay/` a
    export AGEND_CAPTURE_FIXTURES=1
    agend-terminal start --agents capture-target:<backend>
    ```
-   `<backend>` is one of `claude` / `kiro-cli` / `codex` / `opencode` / `gemini` / `agy`.
+   `<backend>` is one of `claude` / `kiro-cli` / `codex` / `opencode` / `agy`.
 
 2. **Drive the target state.** Interact with the agent until it renders the screen you want to fix. Examples: prompt a tool call to land a completion banner; pause mid-prompt to capture a Thinking spinner; trigger an error path to capture a rate-limit banner.
 

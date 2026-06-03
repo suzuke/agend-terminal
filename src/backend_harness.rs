@@ -49,7 +49,6 @@ impl CapabilityMatrix {
             ("codex", ""),
             ("claude", "LLM context not tied to PTY buffer (known gap)"),
             ("opencode", ""),
-            ("gemini", ""),
             ("agy", ""),
         ] {
             backends.insert(
@@ -357,7 +356,8 @@ mod tests {
     #[test]
     fn test_capability_matrix_serializes_with_split_columns() {
         let matrix = CapabilityMatrix::new();
-        assert_eq!(matrix.backends.len(), 6);
+        // #1580: 6 → 5 (gemini-cli retired).
+        assert_eq!(matrix.backends.len(), 5);
         // All start unverified
         for b in matrix.backends.values() {
             assert_eq!(b.esc_semantics_verified, CapabilityLevel::Unverified);
@@ -470,17 +470,6 @@ mod tests {
         println!("codex: {level:?} — {notes}");
         // Harness measures — any definitive outcome is valid
         assert_eq!(matrix.backends["codex"].esc_semantics_verified, level);
-    }
-
-    #[test]
-    #[ignore] // Requires gemini installed
-    fn test_backend_semantics_gemini() {
-        let mut matrix = CapabilityMatrix::new();
-        let (level, notes) = probe_esc_stops_generation(&crate::backend::Backend::Gemini);
-        matrix.record_semantics_results("gemini", level.clone(), &notes);
-        println!("gemini: {level:?} — {notes}");
-        // Harness measures — any definitive outcome is valid
-        assert_eq!(matrix.backends["gemini"].esc_semantics_verified, level);
     }
 
     #[test]

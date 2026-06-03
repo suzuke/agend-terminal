@@ -67,34 +67,11 @@ impl Default for BehavioralConfig {
 /// Get behavioral config for a backend.
 ///
 /// #8 Phase 2 step-0: migrated backends (`profile() == Some`) source from the
-/// co-located [`crate::backend_profile::BackendProfile`]; un-migrated backends
-/// fall back to [`config_for_legacy`]. `profile_configs_byte_identical_to_legacy`
-/// proves `p.behavioral == config_for_legacy(b)` for every migrated backend, so
-/// this is a pure indirection, not a behavior change.
+/// co-located [`crate::backend_profile::BackendProfile`]. #1580: every backend
+/// now has a profile (Gemini, the last legacy backend, is retired), so this is a
+/// total indirection into the profile — the legacy fallback is gone.
 pub fn config_for(backend: &Backend) -> BehavioralConfig {
-    if let Some(p) = crate::backend_profile::profile(backend) {
-        return p.behavioral;
-    }
-    config_for_legacy(backend)
-}
-
-/// The pre-reroute behavioral match — both the fork's fallback for un-migrated
-/// backends AND the TRUE-legacy reference for the parity test (after the reroute,
-/// `config_for` sources migrated backends from the profile, so it can't stand in
-/// for "legacy" without making the assertion circular).
-pub(crate) fn config_for_legacy(backend: &Backend) -> BehavioralConfig {
-    // #8 delete-legacy: only Gemini remains on the legacy path (the 6 migrated
-    // backends route through BackendProfile). Gemini's arm is byte-intact; every
-    // other variant falls to the default — they never reach here (`config_for`
-    // returns `profile().behavioral` for them).
-    match backend {
-        Backend::Gemini => BehavioralConfig {
-            silence_thinking_ms: 3000,
-            silence_idle_ms: 8000,
-            supports_cursor_query: false,
-        },
-        _ => BehavioralConfig::default(),
-    }
+    crate::backend_profile::profile(backend).behavioral
 }
 
 /// Infer behavioral signal from silence duration.
@@ -304,7 +281,9 @@ pub enum MarkerCacheId {
     Claude,
     Kiro,
     Codex,
-    Gemini,
+    /// #1580: Agy (gemini-cli's successor) is the sole consumer of these markers
+    /// — renamed from `Gemini` when Gemini was retired. Values unchanged.
+    Agy,
     OpenCode,
 }
 
@@ -374,10 +353,12 @@ pub(crate) const CODEX_PRODUCTIVE_MARKERS: &[&str] = &[
     r"apply_patch",
 ];
 
-/// Gemini: generic anchors + `✓` completion glyph with Gemini CamelCase
-/// tool-name vocabulary. Excludes `tool.*call` / `MCP.*tool` literals
-/// (heartbeat path already covers MCP — avoid double-counting).
-pub(crate) const GEMINI_PRODUCTIVE_MARKERS: &[&str] = &[
+/// Agy: generic anchors + `✓` completion glyph with the Gemini-engine CamelCase
+/// tool-name vocabulary (Agy is gemini-cli's successor on the same Google agent
+/// engine). Excludes `tool.*call` / `MCP.*tool` literals (heartbeat path already
+/// covers MCP — avoid double-counting). #1580: renamed from `GEMINI_*` when
+/// Gemini retired; Agy is the sole consumer. Values unchanged.
+pub(crate) const AGY_PRODUCTIVE_MARKERS: &[&str] = &[
     r"^Saved to \S+",
     r"^Wrote \d+ bytes",
     r"^Created file: \S+",
@@ -419,8 +400,8 @@ static KIRO_PRODUCTIVE_REGEXES: std::sync::LazyLock<Vec<regex::Regex>> =
     std::sync::LazyLock::new(|| compile_markers(KIRO_PRODUCTIVE_MARKERS));
 static CODEX_PRODUCTIVE_REGEXES: std::sync::LazyLock<Vec<regex::Regex>> =
     std::sync::LazyLock::new(|| compile_markers(CODEX_PRODUCTIVE_MARKERS));
-static GEMINI_PRODUCTIVE_REGEXES: std::sync::LazyLock<Vec<regex::Regex>> =
-    std::sync::LazyLock::new(|| compile_markers(GEMINI_PRODUCTIVE_MARKERS));
+static AGY_PRODUCTIVE_REGEXES: std::sync::LazyLock<Vec<regex::Regex>> =
+    std::sync::LazyLock::new(|| compile_markers(AGY_PRODUCTIVE_MARKERS));
 static OPENCODE_PRODUCTIVE_REGEXES: std::sync::LazyLock<Vec<regex::Regex>> =
     std::sync::LazyLock::new(|| compile_markers(OPENCODE_PRODUCTIVE_MARKERS));
 
@@ -428,38 +409,11 @@ static OPENCODE_PRODUCTIVE_REGEXES: std::sync::LazyLock<Vec<regex::Regex>> =
 /// own per-backend MARKERS list + cache id; Shell/Raw fall back to the
 /// generic anchor set (no MCP heartbeat).
 ///
-/// #8 Phase 2 step-0: migrated backends source from the co-located profile;
-/// un-migrated fall back to [`config_for_productivity_legacy`]. The markers +
-/// `cache_id` are byte-identical to legacy (proven by the parity test), so the
-/// per-marker-list regex cache (keyed by `cache_id`) is unchanged.
+/// #1580: every backend now has a profile (Gemini, the last legacy backend, is
+/// retired), so this is a total indirection into the profile — the legacy
+/// fallback is gone. The markers + `cache_id` live in the co-located profile.
 pub fn config_for_productivity(backend: &Backend) -> ProductivityConfig {
-    if let Some(p) = crate::backend_profile::profile(backend) {
-        return p.productivity;
-    }
-    config_for_productivity_legacy(backend)
-}
-
-/// The pre-reroute productivity match — the fork's fallback AND the TRUE-legacy
-/// parity reference (see [`config_for_legacy`] for why a separate fn is needed).
-pub(crate) fn config_for_productivity_legacy(backend: &Backend) -> ProductivityConfig {
-    // #8 delete-legacy: only Gemini remains on the legacy path. Gemini's arm is
-    // byte-intact; the `_ =>` catch-all returns the generic Shell/Raw-style config
-    // (never reached — every other backend gets `profile().productivity`). The
-    // per-backend marker consts stay (the profiles reference them).
-    match backend {
-        Backend::Gemini => ProductivityConfig {
-            markers: GEMINI_PRODUCTIVE_MARKERS,
-            use_heartbeat: true,
-            heartbeat_fresh_window_ms: 10_000,
-            cache_id: Some(MarkerCacheId::Gemini),
-        },
-        _ => ProductivityConfig {
-            markers: GENERIC_PRODUCTIVE_MARKERS,
-            use_heartbeat: false,
-            heartbeat_fresh_window_ms: 0,
-            cache_id: Some(MarkerCacheId::Generic),
-        },
-    }
+    crate::backend_profile::profile(backend).productivity
 }
 
 /// Infer productive-output signal from screen text and heartbeat freshness.
@@ -493,7 +447,7 @@ pub fn infer_productivity(
         Some(MarkerCacheId::Claude) => Some(&CLAUDE_PRODUCTIVE_REGEXES),
         Some(MarkerCacheId::Kiro) => Some(&KIRO_PRODUCTIVE_REGEXES),
         Some(MarkerCacheId::Codex) => Some(&CODEX_PRODUCTIVE_REGEXES),
-        Some(MarkerCacheId::Gemini) => Some(&GEMINI_PRODUCTIVE_REGEXES),
+        Some(MarkerCacheId::Agy) => Some(&AGY_PRODUCTIVE_REGEXES),
         Some(MarkerCacheId::OpenCode) => Some(&OPENCODE_PRODUCTIVE_REGEXES),
         None => None,
     };
@@ -562,7 +516,7 @@ pub fn infer_productivity_with_match(
         Some(MarkerCacheId::Claude) => Some(&CLAUDE_PRODUCTIVE_REGEXES),
         Some(MarkerCacheId::Kiro) => Some(&KIRO_PRODUCTIVE_REGEXES),
         Some(MarkerCacheId::Codex) => Some(&CODEX_PRODUCTIVE_REGEXES),
-        Some(MarkerCacheId::Gemini) => Some(&GEMINI_PRODUCTIVE_REGEXES),
+        Some(MarkerCacheId::Agy) => Some(&AGY_PRODUCTIVE_REGEXES),
         Some(MarkerCacheId::OpenCode) => Some(&OPENCODE_PRODUCTIVE_REGEXES),
         None => None,
     };
@@ -676,8 +630,10 @@ mod tests {
     }
 
     #[test]
-    fn gemini_uses_default_thresholds() {
-        let config = config_for(&Backend::Gemini);
+    fn agy_uses_default_thresholds() {
+        // #1580: Agy inherits gemini-cli's behavioral thresholds (it is the
+        // successor on the same engine) — was `gemini_uses_default_thresholds`.
+        let config = config_for(&Backend::Agy);
         assert_eq!(config.silence_thinking_ms, 3000);
     }
 
@@ -817,10 +773,6 @@ mod tests {
         e2e_fixture_behavioral("codex-thinking.raw", &Backend::Codex);
     }
     #[test]
-    fn e2e_gemini_thinking() {
-        e2e_fixture_behavioral("gemini-thinking.raw", &Backend::Gemini);
-    }
-    #[test]
     fn e2e_opencode_thinking() {
         e2e_fixture_behavioral("opencode-thinking.raw", &Backend::OpenCode);
     }
@@ -844,10 +796,6 @@ mod tests {
     #[test]
     fn e2e_codex_perm() {
         e2e_fixture_behavioral("codex-perm.raw", &Backend::Codex);
-    }
-    #[test]
-    fn e2e_gemini_tooluse() {
-        e2e_fixture_behavioral("gemini-tooluse.raw", &Backend::Gemini);
     }
     #[test]
     fn e2e_kiro_tooluse() {
@@ -881,14 +829,6 @@ mod tests {
     #[test]
     fn fixture_replay_codex_perm() {
         replay_fixture("codex-perm.raw", &Backend::Codex);
-    }
-    #[test]
-    fn fixture_replay_gemini_thinking() {
-        replay_fixture("gemini-thinking.raw", &Backend::Gemini);
-    }
-    #[test]
-    fn fixture_replay_gemini_tooluse() {
-        replay_fixture("gemini-tooluse.raw", &Backend::Gemini);
     }
     #[test]
     fn fixture_replay_kiro_thinking() {
@@ -1250,10 +1190,11 @@ mod tests {
     }
 
     #[test]
-    fn gemini_markers_match_check_glyph_and_camelcase_tool() {
-        let config = config_for_productivity(&Backend::Gemini);
-        assert_eq!(config.cache_id, Some(MarkerCacheId::Gemini));
-        // `✓ ReadFile` — Gemini completion glyph + CamelCase tool name.
+    fn agy_markers_match_check_glyph_and_camelcase_tool() {
+        // #1580: Agy is the sole consumer of these markers (gemini-cli engine).
+        let config = config_for_productivity(&Backend::Agy);
+        assert_eq!(config.cache_id, Some(MarkerCacheId::Agy));
+        // `✓ ReadFile` — completion glyph + CamelCase tool name.
         let signal = infer_productivity(&config, "✓ ReadFile foo.toml\n", stale_heartbeat());
         assert!(matches!(
             signal,
@@ -1264,9 +1205,9 @@ mod tests {
     }
 
     #[test]
-    fn gemini_markers_reject_braille_spinner_and_mcp_prose() {
-        let config = config_for_productivity(&Backend::Gemini);
-        // `⠦ Thinking... (esc to cancel, 2s)` — Gemini in-progress spinner.
+    fn agy_markers_reject_braille_spinner_and_mcp_prose() {
+        let config = config_for_productivity(&Backend::Agy);
+        // `⠦ Thinking... (esc to cancel, 2s)` — in-progress spinner.
         let spinner = infer_productivity(
             &config,
             "⠦ Thinking... (esc to cancel, 2s)\n",

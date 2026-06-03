@@ -29,7 +29,6 @@ Before starting the capture session, prepare the environment:
   ```bash
   which claude && claude --version
   which codex && codex --version
-  which gemini && gemini --version
   which kiro && kiro --version
   which opencode && opencode --version
   ```
@@ -263,26 +262,6 @@ script -q "$CAPTURE_DIR/codex-productive-silence.raw" codex
 # 3. Press Ctrl-C mid-response.
 ```
 
-#### R7. Gemini productive_marker_fire (~5 min)
-
-```bash
-script -q "$CAPTURE_DIR/gemini-productive-marker.raw" gemini
-
-# 1. Ask Gemini to create a file.
-# 2. Wait for the MCP-allow prompt and tool completion.
-# 3. Type /exit
-```
-
-#### R8. Gemini productive_silence (~5 min)
-
-```bash
-script -q "$CAPTURE_DIR/gemini-productive-silence.raw" gemini
-
-# 1. Ask a complex question.
-# 2. Wait 30-60 seconds during thinking.
-# 3. Press Ctrl-C mid-response.
-```
-
 #### R9. Kiro productive_marker_fire (~5 min)
 
 ```bash
@@ -356,7 +335,7 @@ For each new fixture, add an entry to `tests/fixtures/state-replay/MANIFEST.yaml
 using the template from the setup checklist. Fields to fill:
 
 - `file`: filename (e.g. `claude-yes-proceed.raw`)
-- `backend`: backend identifier (`claude-code`, `codex`, `gemini`, `kiro-cli`, `opencode`, `agy`)
+- `backend`: backend identifier (`claude-code`, `codex`, `kiro-cli`, `opencode`, `agy`)
 - `cli_version`: exact version string from `<backend> --version`
 - `recorded_on`: today's date in YYYY-MM-DD
 - `scenario`: one-line description of what was captured

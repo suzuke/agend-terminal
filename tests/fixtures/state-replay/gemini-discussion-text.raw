@@ -1,3 +1,0 @@
-[2J[H[0mDebugging gemini rate_limit detection. Bare 429 status codes in scrollback (without specific HTTP wrapping context) caused false RateLimit pre-#848 — the OLD Gemini pattern keyed on bare \b429\b alone. Discussion of rate_limit / rate-limit / rate limit prose should NOT trigger the classifier post-#848.
-
-Type your message
