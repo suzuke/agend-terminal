@@ -673,6 +673,11 @@ fn tick(
     };
 
     for (name, backend_command, core) in handles {
+        // #1665 reply-ledger: TTL/settled fallback for a user-message turn that
+        // never hit a clear site (no reply, no mirror, no takeover). Lock-free
+        // snapshot read; warns only past the grace window AND when the agent has
+        // settled. Infallible — never blocks the supervisor loop.
+        crate::reply_ledger::sweep(home, &name);
         // Mutate state + pull the tail under the core lock, then drop it
         // before running `format!` and the Telegram spawn. `tail_lines`
         // allocates a fresh String, so the lock window is bounded by the

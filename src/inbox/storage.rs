@@ -323,6 +323,17 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
             p.mirror_dispatched_for_turn = false;
             p.mirror_skip_until_next_turn = false;
         });
+        // #1665 reply-ledger: arm the delivery-closure audit for this user
+        // channel message. `m.channel.is_some()` above is exactly the
+        // "[user:… via channel] inbound" eligibility gate. Arming overwrites
+        // any prior in-flight turn (supersede — the user moved on, never warn).
+        crate::reply_ledger::arm(
+            name,
+            *channel_msg.channel.as_ref().expect("checked"),
+            channel_msg.id.clone(),
+            channel_msg.thread_id.clone(),
+            channel_msg.kind.clone(),
+        );
     }
 
     all_messages
