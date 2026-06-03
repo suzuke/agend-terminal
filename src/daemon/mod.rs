@@ -374,6 +374,10 @@ pub fn run_with_prepared(mut prepared: Box<crate::bootstrap::OwnedFleet>) -> any
     if let Err(e) = crate::fleet::migrate_teams_json_to_yaml(&home) {
         tracing::warn!(error = %e, "teams.json migration failed at daemon startup");
     }
+    // #1651: sign any pre-existing (pre-feature) binding.json that has no HMAC
+    // sidecar, so a binding surviving this restart isn't false-denied by the shim.
+    // Idempotent (skips already-signed bindings); see `resign_unsigned_bindings`.
+    crate::binding::resign_unsigned_bindings(&home);
     let _owned = prepared;
     run_core(&home, agents, telegram)
 }

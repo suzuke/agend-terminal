@@ -17,6 +17,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+// #1651: share the EXACT HMAC verifier with the daemon by source (the shim is a
+// separate binary that cannot link the lib). `config_integrity` declares the
+// same file as `mod integrity_core`; this `#[path]` include guarantees no
+// signer/verifier algorithm drift.
+#[path = "../integrity_core.rs"]
+mod integrity_core;
+
 /// #1504 L3: max times the shim may re-enter before hard-failing. Healthy
 /// operation never exceeds 1 (real git ≠ shim → no re-entry), so a small cap
 /// has zero false-trip risk while containing a self-resolution spawn storm.
@@ -202,14 +209,24 @@ struct Binding {
 }
 
 fn read_binding(home: &str, agent: &str) -> Binding {
-    let path = PathBuf::from(home)
-        .join("runtime")
-        .join(agent)
-        .join("binding.json");
+    let dir = PathBuf::from(home).join("runtime").join(agent);
+    let path = dir.join("binding.json");
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
         Err(_) => return Binding::default(),
     };
+    // #1651: verify the HMAC sidecar BEFORE trusting the binding (esp. its
+    // `branch` push-authority). A blind self-authorization rewrite — an injected
+    // agent editing its own `binding.json` without the key — fails verify, so we
+    // treat the agent as UNBOUND (fail-closed → `deny_unbound_else_chdir` denies
+    // mutating ops, the SAME path a parse failure already takes). Missing sidecar
+    // / missing key / mismatch all fail closed. Defense-in-depth against injection
+    // blind-write, NOT a security boundary: a same-uid agent could read the key
+    // and re-sign (accepted); true sealing needs OS-isolation (parked #1653).
+    let tag = std::fs::read_to_string(dir.join("binding.json.sig")).unwrap_or_default();
+    if !integrity_core::verify(Path::new(home), content.as_bytes(), &tag) {
+        return Binding::default();
+    }
     let v: serde_json::Value = match serde_json::from_str(&content) {
         Ok(v) => v,
         Err(_) => return Binding::default(), // parse failure = unbound (fail-safe)
@@ -1461,6 +1478,78 @@ fn format_conflict_guidance() -> &'static str {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    // ── #1651: binding.json HMAC verify (push-authority integrity) ──
+    fn home_1651(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("agend-git-1651-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        // The shared integrity key (both signer + verifier read it).
+        std::fs::write(p.join(".config-integrity-key"), [7u8; 32]).unwrap();
+        p
+    }
+
+    fn write_binding_1651(home: &Path, agent: &str, body: &str, signed: bool) {
+        let dir = home.join("runtime").join(agent);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("binding.json"), body).unwrap();
+        if signed {
+            let tag = integrity_core::sign_for_test(home, body.as_bytes());
+            std::fs::write(dir.join("binding.json.sig"), tag).unwrap();
+        }
+    }
+
+    // No `worktree` field → the orphan-worktree guard is skipped, so the binding
+    // outcome reflects the HMAC verify alone.
+    const BODY_1651: &str = r#"{"version":1,"task_id":"T-1","branch":"feat/x"}"#;
+
+    #[test]
+    fn valid_signed_binding_is_bound_1651() {
+        let home = home_1651("valid");
+        write_binding_1651(&home, "ag", BODY_1651, true);
+        let b = read_binding(home.to_str().unwrap(), "ag");
+        assert!(is_bound(&b), "a validly-signed binding must be bound");
+        assert_eq!(b.branch.as_deref(), Some("feat/x"));
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn tampered_branch_without_resign_is_unbound_and_denied_1651() {
+        let home = home_1651("tamper");
+        // Daemon wrote + signed the original (branch feat/x).
+        write_binding_1651(&home, "ag", BODY_1651, true);
+        // Injection blind-write: self-authorize `main`, WITHOUT re-signing
+        // (the agent doesn't know the key/scheme).
+        let tampered = r#"{"version":1,"task_id":"T-1","branch":"main"}"#;
+        std::fs::write(
+            home.join("runtime").join("ag").join("binding.json"),
+            tampered,
+        )
+        .unwrap();
+        let b = read_binding(home.to_str().unwrap(), "ag");
+        assert!(
+            !is_bound(&b),
+            "#1651: a tampered (unsigned-for-new-content) binding must read as unbound"
+        );
+        // …and a mutating op on unbound takes the EXISTING fail-closed deny path.
+        assert!(matches!(
+            deny_unbound_else_chdir(is_bound(&b), &b),
+            Action::Deny(_)
+        ));
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn missing_sidecar_is_unbound_1651() {
+        let home = home_1651("nosig");
+        write_binding_1651(&home, "ag", BODY_1651, false); // NO sidecar
+        let b = read_binding(home.to_str().unwrap(), "ag");
+        assert!(
+            !is_bound(&b),
+            "#1651: a binding with no HMAC sidecar must fail closed (unbound)"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
 
     // ── #1463: init-heartbeat argv detection (forensic hook gate) ──
     fn s(v: &[&str]) -> Vec<String> {

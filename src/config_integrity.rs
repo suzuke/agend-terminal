@@ -23,22 +23,16 @@
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+// #1651: the VERIFY + key-read half now lives in `integrity_core` (shared by
+// source with the agend-git shim, which only verifies). The SIGN side stays here
+// (getrandom key generation + the threat-model doc). `verify` is re-exported so
+// existing callers (`operator_mode`) keep the `config_integrity::verify` API.
+pub use crate::integrity_core::verify;
+use crate::integrity_core::{key_path, read_key, KEY_FILE, KEY_LEN};
 
 type HmacSha256 = Hmac<Sha256>;
-
-const KEY_LEN: usize = 32;
-const KEY_FILE: &str = ".config-integrity-key";
-
-fn key_path(home: &Path) -> PathBuf {
-    home.join(KEY_FILE)
-}
-
-/// Read the key if present and exactly [`KEY_LEN`] bytes; `None` otherwise.
-fn read_key(home: &Path) -> Option<[u8; KEY_LEN]> {
-    let bytes = std::fs::read(key_path(home)).ok()?;
-    bytes.try_into().ok()
-}
 
 /// Load the key, generating it (crypto-random, 0600) on first use.
 fn ensure_key(home: &Path) -> std::io::Result<[u8; KEY_LEN]> {
@@ -92,27 +86,14 @@ pub fn sign(home: &Path, content: &[u8]) -> std::io::Result<String> {
     Ok(hex::encode(mac.finalize().into_bytes()))
 }
 
-/// Constant-time verify of `content` against the hex `tag`. Returns `false` on
-/// any error (no key yet, malformed tag, mismatch) — callers treat `false` as
-/// "not authentic" and fail closed.
-pub fn verify(home: &Path, content: &[u8], tag: &str) -> bool {
-    let Some(key) = read_key(home) else {
-        return false;
-    };
-    let Ok(mut mac) = HmacSha256::new_from_slice(&key) else {
-        return false;
-    };
-    mac.update(content);
-    let Ok(tag_bytes) = hex::decode(tag.trim()) else {
-        return false;
-    };
-    mac.verify_slice(&tag_bytes).is_ok()
-}
+// `verify` is re-exported from `integrity_core` (see the `pub use` above) —
+// the shim shares that exact verifier by source.
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn tmp(tag: &str) -> PathBuf {
         let p =
@@ -156,5 +137,45 @@ mod tests {
         let home = tmp("malformed");
         sign(&home, b"x").unwrap(); // create the key
         assert!(!verify(&home, b"x", "not-hex-zzz"));
+    }
+
+    /// #1651: GOLDEN parity — pins the exact HMAC-SHA256 output for a FIXED key +
+    /// FIXED operator-mode.json content. Computed from the pre-`integrity_core`-
+    /// extraction code; if the extraction (or any future change) alters the
+    /// algorithm/encoding, this tag changes and the test fails — proving
+    /// operator-mode.json signing stays byte-identical ("別動 #1576 已簽檔邏輯").
+    #[test]
+    fn operator_mode_signing_is_byte_identical_golden_1651() {
+        let home = tmp("golden");
+        // Deterministic key (NOT the random one) so the tag is reproducible.
+        std::fs::write(home.join(KEY_FILE), [1u8; KEY_LEN]).unwrap();
+        let content = br#"{"mode":"active","since":"2026-01-01T00:00:00Z"}"#;
+        let tag = sign(&home, content).unwrap();
+        assert_eq!(
+            tag, "def046eac649ccbc86de77718e0f4363ba835283fdd8bee1a5b11cb98671ef72",
+            "#1651: operator-mode.json HMAC must stay byte-identical across the \
+             integrity_core extraction (golden from pre-extraction code)"
+        );
+    }
+
+    /// #1651 cross-compat: the agend-git shim's verifier (`integrity_core::verify`,
+    /// shared by source) MUST accept what the daemon's signer
+    /// (`config_integrity::sign`) produces — this pins the signer/verifier contract
+    /// the binding push-authority relies on.
+    #[test]
+    fn shim_verifier_accepts_daemon_signature_1651() {
+        let home = tmp("crosscompat");
+        let content = br#"{"version":1,"task_id":"T-9","branch":"feat/y"}"#;
+        let tag = sign(&home, content).unwrap();
+        assert!(
+            crate::integrity_core::verify(&home, content, &tag),
+            "the shim verifier must accept a daemon-signed binding tag"
+        );
+        // negative: same key, mutated content (the blind self-authorization) → reject.
+        assert!(!crate::integrity_core::verify(
+            &home,
+            br#"{"version":1,"task_id":"T-9","branch":"main"}"#,
+            &tag
+        ));
     }
 }

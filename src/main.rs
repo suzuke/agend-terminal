@@ -42,6 +42,7 @@ mod identity;
 mod inbox;
 mod instance_monitor;
 mod instructions;
+mod integrity_core;
 mod ipc;
 mod keybinds;
 mod layout;

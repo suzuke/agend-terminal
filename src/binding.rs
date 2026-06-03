@@ -5,7 +5,7 @@
 
 use serde_json::json;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
 static INDEX: OnceLock<RwLock<HashMap<String, serde_json::Value>>> = OnceLock::new();
@@ -85,20 +85,84 @@ pub fn bind_full(
     let body = serde_json::to_string_pretty(&binding).unwrap_or_default();
     crate::store::atomic_write(&path, body.as_bytes())
         .map_err(|e| format!("atomic_write {}: {e}", path.display()))?;
+    // #1651: HMAC-sign the binding (sidecar `binding.json.sig`, mirroring #1576's
+    // operator-mode.json scheme) so the agend-git shim can reject a blind
+    // self-authorization rewrite — an injected agent editing its own `branch`
+    // without re-signing makes the shim's verify fail → unbound → push denied.
+    // Defense-in-depth against injection blind-write, NOT a security boundary
+    // (a same-uid agent could read the key + re-sign; true sealing needs
+    // OS-isolation, parked #1653). Best-effort: a missing/failed sidecar leaves
+    // the binding unsigned → the shim fails CLOSED (denies), never open.
+    match crate::config_integrity::sign(home, body.as_bytes()) {
+        Ok(tag) => {
+            if let Err(e) = crate::store::atomic_write(&binding_sig_path(&dir), tag.as_bytes()) {
+                tracing::warn!(%agent, error = %e,
+                    "#1651 binding sidecar write failed — shim fails closed (deny) until re-bind");
+            }
+        }
+        Err(e) => tracing::warn!(%agent, error = %e,
+            "#1651 binding HMAC sign failed — shim fails closed (deny) until re-bind"),
+    }
     if let Ok(mut map) = binding_index().write() {
         map.insert(index_key(home, agent), binding);
     }
     Ok(())
 }
 
+/// #1651: the HMAC sidecar path for a binding dir. The agend-git shim hard-codes
+/// the same `binding.json.sig` name (it cannot import this — separate binary).
+fn binding_sig_path(dir: &Path) -> PathBuf {
+    dir.join("binding.json.sig")
+}
+
 /// Clear a binding for an agent (task completed/released).
 pub fn unbind(home: &Path, agent: &str) {
-    let path = crate::paths::runtime_dir(home)
-        .join(agent)
-        .join("binding.json");
-    let _ = std::fs::remove_file(path);
+    let dir = crate::paths::runtime_dir(home).join(agent);
+    let _ = std::fs::remove_file(dir.join("binding.json"));
+    // #1651: drop the HMAC sidecar too, so a stale signature can't linger.
+    let _ = std::fs::remove_file(binding_sig_path(&dir));
     if let Ok(mut map) = binding_index().write() {
         map.remove(&index_key(home, agent));
+    }
+}
+
+/// #1651 rollout pass (daemon startup): bless pre-#1651 bindings that have NO
+/// HMAC sidecar yet. Bindings + worktrees PERSIST across a daemon restart and are
+/// NOT re-bound on startup, so without this a pre-existing (unsigned) binding
+/// would verify-fail in the shim and FALSE-DENY a legit agent's push until its
+/// next re-bind.
+///
+/// SECURITY: only bindings with NO sidecar are re-signed (the genuine rollout
+/// case — those files were written by a trusted daemon before this feature, and
+/// were already unprotected pre-#1651). A binding that ALREADY has a sidecar is
+/// left untouched: if that sidecar is invalid (tampered after signing), it stays
+/// fail-closed and is NOT re-blessed by a restart. Idempotent — a no-op once
+/// every binding carries a sidecar.
+pub fn resign_unsigned_bindings(home: &Path) {
+    let Ok(entries) = std::fs::read_dir(crate::paths::runtime_dir(home)) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        let binding = dir.join("binding.json");
+        let sig = binding_sig_path(&dir);
+        if !binding.exists() || sig.exists() {
+            continue; // no binding, or already signed → leave it
+        }
+        let Ok(body) = std::fs::read(&binding) else {
+            continue;
+        };
+        match crate::config_integrity::sign(home, &body) {
+            Ok(tag) => match crate::store::atomic_write(&sig, tag.as_bytes()) {
+                Ok(()) => {
+                    tracing::info!(?dir, "#1651 startup: signed pre-existing unsigned binding")
+                }
+                Err(e) => {
+                    tracing::warn!(?dir, error = %e, "#1651 startup re-sign: sidecar write failed")
+                }
+            },
+            Err(e) => tracing::warn!(?dir, error = %e, "#1651 startup re-sign: HMAC sign failed"),
+        }
     }
 }
 
