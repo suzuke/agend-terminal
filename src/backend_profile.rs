@@ -15,10 +15,12 @@
 //! BYTE-IDENTICAL to legacy for the migrated backends; the migration train then
 //! reroutes production one backend per PR, gated by that harness.
 //!
-//! Migrated so far: `Shell`/`Raw` (empty), `Agy` (#1672), and `KiroCli` (this
-//! PR — 11 patterns, incl. one that references the shared
-//! `SERVER_RATE_LIMIT_NET_ERRORS` const). The migration train adds one backend
-//! per PR, each proven byte-identical by the harness below.
+//! Migrated so far: `Shell`/`Raw` (empty), `Agy` (#1672), `KiroCli` (#1674),
+//! and `OpenCode` (#8 step-1, this PR — 12 patterns, incl. the shared
+//! `SERVER_RATE_LIMIT_NET_ERRORS` const). Production is rerouted as of step-0
+//! (#1683): `profile()`-Some backends run detection through the bundle, legacy
+//! is the parity baseline until the train ends. One backend per PR, each proven
+//! byte-identical by the harness below.
 
 use crate::backend::Backend;
 use crate::behavioral::{BehavioralConfig, MarkerCacheId, ProductivityConfig};
@@ -47,12 +49,14 @@ pub struct BackendProfile {
 pub fn profile(backend: &Backend) -> Option<&'static BackendProfile> {
     static AGY: OnceLock<BackendProfile> = OnceLock::new();
     static KIRO: OnceLock<BackendProfile> = OnceLock::new();
+    static OPENCODE: OnceLock<BackendProfile> = OnceLock::new();
     // Shell + Raw share one profile — every legacy source treats `Shell | Raw(_)`
     // identically (empty patterns, default behavioral, generic productivity, Ready).
     static EMPTY: OnceLock<BackendProfile> = OnceLock::new();
     match backend {
         Backend::Agy => Some(AGY.get_or_init(agy_profile)),
         Backend::KiroCli => Some(KIRO.get_or_init(kirocli_profile)),
+        Backend::OpenCode => Some(OPENCODE.get_or_init(opencode_profile)),
         Backend::Shell | Backend::Raw(_) => Some(EMPTY.get_or_init(empty_profile)),
         _ => None,
     }
@@ -146,6 +150,65 @@ fn kirocli_profile() -> BackendProfile {
     }
 }
 
+/// OpenCode (#8 Phase 2 step-1) — moved VERBATIM from the legacy sites
+/// (patterns.rs `compile_for` Backend::OpenCode arm, behavioral.rs
+/// `config_for_legacy` + `config_for_productivity_legacy`, managed→Starting
+/// initial state). The ServerRateLimit entry references the SAME shared
+/// `SERVER_RATE_LIMIT_NET_ERRORS` const and the markers reference the SAME
+/// `OPENCODE_PRODUCTIVE_MARKERS` const the legacy arms use, so they stay
+/// byte-identical. The harness proves it.
+fn opencode_profile() -> BackendProfile {
+    BackendProfile {
+        patterns: vec![
+            (
+                AgentState::RateLimit,
+                r"API rate limited \(429\)|Rate limited\. Quick retry|API rate limit exceeded",
+            ),
+            (
+                AgentState::ServerRateLimit,
+                crate::state::patterns::SERVER_RATE_LIMIT_NET_ERRORS,
+            ),
+            (AgentState::UsageLimit, r"Quota Limit Exceeded"),
+            (
+                AgentState::ApiError,
+                r"Error from provider:|request validation errors",
+            ),
+            (AgentState::ContextFull, r"ContextOverflow"),
+            (
+                AgentState::PermissionPrompt,
+                r"Permission required|Allow once\s+Allow always\s+Reject",
+            ),
+            (
+                AgentState::GitConflict,
+                r"Automatic merge failed; fix conflicts|CONFLICT \(content\)|Resolve all conflicts manually|Failed to merge submodule|Failed to merge in",
+            ),
+            (
+                AgentState::ToolUse,
+                r"✱\s+(Read|Write|Edit|Glob|Grep|Bash|List|Task)\b|~\s+(Reading|Writing|Editing|Searching|Listing|Globbing|Grepping)\b",
+            ),
+            (AgentState::Thinking, r"esc interrupt"),
+            (
+                AgentState::PermissionPrompt,
+                r"Update Available|Skip\s+Confirm",
+            ),
+            (AgentState::Idle, r"Ask anything"),
+            (AgentState::Ready, r"Ask anything|tab agents"),
+        ],
+        behavioral: BehavioralConfig {
+            silence_thinking_ms: 3000,
+            silence_idle_ms: 8000,
+            supports_cursor_query: false,
+        },
+        productivity: ProductivityConfig {
+            markers: crate::behavioral::OPENCODE_PRODUCTIVE_MARKERS,
+            use_heartbeat: true,
+            heartbeat_fresh_window_ms: 10_000,
+            cache_id: Some(MarkerCacheId::OpenCode),
+        },
+        initial_state: AgentState::Starting,
+    }
+}
+
 /// Shell / Raw — moved VERBATIM (empty patterns, default behavioral, generic
 /// productivity, Ready initial state).
 fn empty_profile() -> BackendProfile {
@@ -176,6 +239,7 @@ mod tests {
         vec![
             Backend::Agy,
             Backend::KiroCli,
+            Backend::OpenCode,
             Backend::Shell,
             Backend::Raw("x".to_string()),
         ]
@@ -259,14 +323,10 @@ mod tests {
     }
 
     /// Non-migrated backends still return `None` (legacy path owns them).
+    /// OpenCode left this set in step-1 (#8 Phase 2) — it is now `migrated()`.
     #[test]
     fn unmigrated_backends_have_no_profile_yet() {
-        for b in [
-            Backend::ClaudeCode,
-            Backend::Codex,
-            Backend::OpenCode,
-            Backend::Gemini,
-        ] {
+        for b in [Backend::ClaudeCode, Backend::Codex, Backend::Gemini] {
             assert!(profile(&b).is_none(), "{b:?} must stay on the legacy path");
         }
     }

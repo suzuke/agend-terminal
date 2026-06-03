@@ -406,7 +406,10 @@ pub(crate) const GEMINI_PRODUCTIVE_MARKERS: &[&str] = &[
 /// `✱` glyph) with OpenCode tool-name vocabulary. Synthetic-only —
 /// not validated against real PTY captures; corpus growth path per
 /// `docs/F685-FIXTURE-CORPUS.md §F685-CORPUS.6`.
-const OPENCODE_PRODUCTIVE_MARKERS: &[&str] = &[
+// #8 Phase 2 step-1: pub(crate) so the co-located OpenCode BackendProfile
+// references the SAME markers const (not a re-typed copy) → byte-identity with
+// the legacy config_for_productivity arm. Matches KIRO_PRODUCTIVE_MARKERS.
+pub(crate) const OPENCODE_PRODUCTIVE_MARKERS: &[&str] = &[
     r"^Saved to \S+",
     r"^Wrote \d+ bytes",
     r"^Created file: \S+",
