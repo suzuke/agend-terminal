@@ -3103,7 +3103,11 @@ instances:
 
     /// #1697: an ApiError-at-prompt agent gets an immediate `continue` nudge, ONCE
     /// per episode (no re-nudge while still in the same ApiError episode).
+    // Reads the injected payload back off the PTY — Windows' mock PTY (`cmd
+    // findstr`) doesn't echo like unix `cat`, so this is unix-only, mirroring the
+    // existing `phase2_injects_continue_to_pty` gate.
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn apierror_at_prompt_quick_nudge_once_per_episode_1697() {
         let (home, registry, mut reader) =
             one_agent_registry("ag", crate::state::AgentState::ApiError, "apierror-nudge");
