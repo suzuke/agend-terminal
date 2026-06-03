@@ -16,11 +16,11 @@
 //! reroutes production one backend per PR, gated by that harness.
 //!
 //! Migrated so far: `Shell`/`Raw` (empty), `Agy` (#1672), `KiroCli` (#1674),
-//! `OpenCode` (#1686), and `Codex` (#8 step-2, this PR — 11 patterns incl. the
-//! shared `SERVER_RATE_LIMIT_NET_ERRORS` const + the #1634 ModelUnsupported
-//! pattern). Production is rerouted as of step-0 (#1683): `profile()`-Some
-//! backends run detection through the bundle, legacy is the parity baseline
-//! until the train ends. One backend per PR, each proven byte-identical by the
+//! `OpenCode` (#1686), `Codex` (#1687), and `ClaudeCode` (#8 step-3, this PR).
+//! That is ALL backends except `Gemini` (skipped — retiring via #1580, stays on
+//! the legacy path). Production is rerouted as of step-0 (#1683): `profile()`-Some
+//! backends run detection through the bundle, legacy is the parity baseline until
+//! the final delete-legacy PR. Each migration proven byte-identical by the
 //! harness below (and a drift-guard test pins `migrated()` ⟺ `profile().is_some`).
 
 use crate::backend::Backend;
@@ -52,6 +52,7 @@ pub fn profile(backend: &Backend) -> Option<&'static BackendProfile> {
     static KIRO: OnceLock<BackendProfile> = OnceLock::new();
     static OPENCODE: OnceLock<BackendProfile> = OnceLock::new();
     static CODEX: OnceLock<BackendProfile> = OnceLock::new();
+    static CLAUDE: OnceLock<BackendProfile> = OnceLock::new();
     // Shell + Raw share one profile — every legacy source treats `Shell | Raw(_)`
     // identically (empty patterns, default behavioral, generic productivity, Ready).
     static EMPTY: OnceLock<BackendProfile> = OnceLock::new();
@@ -60,6 +61,7 @@ pub fn profile(backend: &Backend) -> Option<&'static BackendProfile> {
         Backend::KiroCli => Some(KIRO.get_or_init(kirocli_profile)),
         Backend::OpenCode => Some(OPENCODE.get_or_init(opencode_profile)),
         Backend::Codex => Some(CODEX.get_or_init(codex_profile)),
+        Backend::ClaudeCode => Some(CLAUDE.get_or_init(claudecode_profile)),
         Backend::Shell | Backend::Raw(_) => Some(EMPTY.get_or_init(empty_profile)),
         _ => None,
     }
@@ -264,6 +266,76 @@ fn codex_profile() -> BackendProfile {
     }
 }
 
+/// ClaudeCode (#8 Phase 2 step-3) — moved VERBATIM from the legacy sites
+/// (patterns.rs `compile_for` Backend::ClaudeCode arm, behavioral.rs
+/// `config_for_legacy` + `config_for_productivity_legacy`, managed→Starting).
+/// The two ServerRateLimit entries (one literal alternation + the shared
+/// `SERVER_RATE_LIMIT_NET_ERRORS` const) and the unicode spinner/glyph patterns
+/// (`⠋…`, `✓●⏺`, sparkle `✻✢✶✳✽`, `❯`, `\x{2026}`) are copied byte-for-byte;
+/// markers reference the SAME `CLAUDE_PRODUCTIVE_MARKERS` const. Does NOT include
+/// any model-unsupported pattern (#1646 is blocked-on-fixture, not in legacy).
+/// The harness proves byte-identity.
+fn claudecode_profile() -> BackendProfile {
+    BackendProfile {
+        patterns: vec![
+            (
+                AgentState::AuthError,
+                r"API key|authentication failed|unauthorized|API Error: 40[13]\b",
+            ),
+            (
+                AgentState::ServerRateLimit,
+                r"Server is temporarily limiting requests|temporarily limiting.*not your usage|API Error: 5\d{2}\b|server-side issue.*temporary|API Error: Repeated 529 Overloaded|overloaded_error|api_error|timeout_error",
+            ),
+            (
+                AgentState::ServerRateLimit,
+                crate::state::patterns::SERVER_RATE_LIMIT_NET_ERRORS,
+            ),
+            (
+                AgentState::RateLimit,
+                r"API Error: Request rejected \(429\)|rate_limit_error|hit a rate limit",
+            ),
+            (
+                AgentState::UsageLimit,
+                r"You've hit your session limit|You've hit your weekly limit|You've hit your Opus limit|Credit balance is too low|credit_balance_too_low",
+            ),
+            (
+                AgentState::ContextFull,
+                r"compacting context|context.*(full|limit)",
+            ),
+            (
+                AgentState::PermissionPrompt,
+                r"Esc to cancel · Tab to amend|allow all edits during this session|Enter to confirm · Esc to cancel",
+            ),
+            (
+                AgentState::GitConflict,
+                r"Automatic merge failed; fix conflicts|CONFLICT \(content\)|Resolve all conflicts manually|Failed to merge submodule|Failed to merge in",
+            ),
+            (
+                AgentState::ToolUse,
+                r"(?m)^(?:[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s+(?:Read|Bash|Edit|Write|Grep|Glob|Listing|Reading|Writing|Searching|Editing)|[✓●⏺]\s+(?:Listing|Reading|Writing|Searching|Editing))\b",
+            ),
+            (
+                AgentState::Thinking,
+                r"(?i)[✻✢✶✳✽*·]\s*\w+\x{2026}|\w+\x{2026}\s*\((?:\d+[smh]|running )|thought for [0-9]+s",
+            ),
+            (AgentState::Idle, r"❯"),
+            (AgentState::Ready, r"bypass permissions"),
+        ],
+        behavioral: BehavioralConfig {
+            silence_thinking_ms: 2000,
+            silence_idle_ms: 6000,
+            supports_cursor_query: true,
+        },
+        productivity: ProductivityConfig {
+            markers: crate::behavioral::CLAUDE_PRODUCTIVE_MARKERS,
+            use_heartbeat: true,
+            heartbeat_fresh_window_ms: 10_000,
+            cache_id: Some(MarkerCacheId::Claude),
+        },
+        initial_state: AgentState::Starting,
+    }
+}
+
 /// Shell / Raw — moved VERBATIM (empty patterns, default behavioral, generic
 /// productivity, Ready initial state).
 fn empty_profile() -> BackendProfile {
@@ -296,6 +368,7 @@ mod tests {
             Backend::KiroCli,
             Backend::OpenCode,
             Backend::Codex,
+            Backend::ClaudeCode,
             Backend::Shell,
             Backend::Raw("x".to_string()),
         ]
@@ -381,12 +454,14 @@ mod tests {
     /// Non-migrated backends still return `None` (legacy path owns them).
     /// OpenCode left this set in step-1 (#8 Phase 2) — it is now `migrated()`.
     #[test]
-    fn unmigrated_backends_have_no_profile_yet() {
-        // Codex left this set in step-2 (#8 Phase 2) — now `migrated()`. Only
-        // ClaudeCode + Gemini remain on the legacy path (Claude lands in #1689).
-        for b in [Backend::ClaudeCode, Backend::Gemini] {
-            assert!(profile(&b).is_none(), "{b:?} must stay on the legacy path");
-        }
+    fn gemini_stays_on_legacy_path() {
+        // After step-3 (#1689, Claude) Gemini is the ONLY backend left on the
+        // legacy path (skipped — retiring via #1580). The drift-guard below
+        // enforces that `migrated()` ⟺ `profile().is_some()` for ALL variants.
+        assert!(
+            profile(&Backend::Gemini).is_none(),
+            "Gemini must stay on the legacy path"
+        );
     }
 
     /// #8 Phase 2 step-0 MERGE GATE — profile-ON-vs-OFF classify parity at the

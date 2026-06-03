@@ -361,7 +361,10 @@ pub(crate) const GENERIC_PRODUCTIVE_MARKERS: &[&str] = &[
 
 /// Claude: generic anchors + completion glyphs (`✓●⏺` — NOT the in-progress
 /// Braille spinner set `⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`) with Claude tool-name vocabulary.
-const CLAUDE_PRODUCTIVE_MARKERS: &[&str] = &[
+// #8 Phase 2 step-3: pub(crate) so the co-located Claude BackendProfile references
+// the SAME markers const (not a re-typed copy) → byte-identity with the legacy
+// config_for_productivity arm. Matches KIRO_/OPENCODE_/CODEX_PRODUCTIVE_MARKERS.
+pub(crate) const CLAUDE_PRODUCTIVE_MARKERS: &[&str] = &[
     r"^Saved to \S+",
     r"^Wrote \d+ bytes",
     r"^Created file: \S+",
