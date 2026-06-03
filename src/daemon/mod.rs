@@ -411,6 +411,7 @@ fn run_core(
     crate::daemon::anti_stall::register_subscriber(home.to_path_buf());
     crate::daemon::decision_timeout::register_subscriber(home.to_path_buf());
     crate::daemon::dispatch_idle::register_subscriber(home.to_path_buf());
+    crate::daemon::waiting_on_stale::register_subscriber(home.to_path_buf());
 
     spawn_fleet_agents(home, &agents, &ctx);
 

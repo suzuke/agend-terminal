@@ -60,6 +60,14 @@ pub enum EventKind {
         timeout_secs: i64,
         default_action: String,
     },
+    // #event-bus pattern #4 (waiting_on_stale): the fields the stale-waiting
+    // notification formats, so the subscriber rebuilds the text byte-identically
+    // and re-derives the agent + team-orchestrator fan-out.
+    WaitingOnStale {
+        agent: String,
+        condition: String,
+        elapsed_min: i64,
+    },
 }
 
 #[derive(Debug, Clone)]
