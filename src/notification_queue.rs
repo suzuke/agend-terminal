@@ -75,7 +75,12 @@ pub fn record_submit_activity(home: &Path, agent_name: &str) {
 /// detection — keeps the read inline-cheap (single file read, single
 /// JSON parse) so per-tick overhead stays bounded.
 pub fn read_input_submit_timestamps(home: &Path, agent_name: &str) -> (i64, i64) {
-    let meta_path = home.join("metadata").join(format!("{agent_name}.json"));
+    // #1680: resolve via the SAME path resolver the write side uses
+    // (`save_metadata` → `metadata_path_resolved`). The previous hand-coded
+    // `metadata/<name>.json` read the never-written name file while the write
+    // landed on `metadata/<uuid>.json`, so `draft_state` was permanently stale
+    // (`None`) and the inject path force-submitted the operator's unsent draft.
+    let meta_path = agent_ops::metadata_path_resolved(home, agent_name);
     let Ok(content) = std::fs::read_to_string(meta_path) else {
         return (0, 0);
     };
@@ -333,6 +338,54 @@ mod tests {
         assert!(
             submit1 >= typed1,
             "submit (called second) must be ≥ typed (called first), got typed={typed1} submit={submit1}"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// #1680 regression: the keystroke WRITE (`record_input_activity` →
+    /// `save_metadata` → `metadata_path_resolved` → `<uuid>.json`) and the
+    /// draft-gate READ (`read_input_submit_timestamps`) MUST land on the SAME
+    /// file when fleet.yaml maps the name → a UUID. Pre-#1680 the read hand-coded
+    /// `<name>.json` (bypassing the resolver) while the write went to
+    /// `<uuid>.json`, so they never intersected → `draft_state` was permanently
+    /// stale (`None`) → the inject path force-submitted the operator's unsent
+    /// draft. Every prior test used a home with NO fleet.yaml (the resolver falls
+    /// back to the name path, so write/read happen to converge) and so could not
+    /// catch the split. This pins the id-mapped path: it FAILS before the read
+    /// resolver alignment and PASSES after.
+    #[test]
+    fn draft_gate_read_resolves_uuid_like_write_1680() {
+        let home = tmp_home("draft_gate_uuid_1680");
+        // Isolate from any prior run sharing the same (suffix,pid) dir.
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::create_dir_all(&home).ok();
+        // fleet.yaml maps the fleet NAME → a UUID, so the resolver routes
+        // metadata to `<uuid>.json` — the production shape that exposed the split.
+        let id = crate::types::InstanceId::new();
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            format!("instances:\n  fixup-x:\n    id: {}\n", id.full()),
+        )
+        .expect("write fleet.yaml");
+
+        // WRITE a compose keystroke (no submit) → `<uuid>.json` via the resolver.
+        record_input_activity(&home, "fixup-x");
+
+        // READ must see it through the SAME resolver. Pre-fix this reads the
+        // never-written `<name>.json` and returns 0 → assert fails (RED).
+        let (typed, submit) = read_input_submit_timestamps(&home, "fixup-x");
+        assert!(
+            typed > 0,
+            "#1680: read must resolve the same UUID file the write used \
+             (got typed=0 → it read the stale name-path)"
+        );
+        assert_eq!(submit, 0, "no submit recorded yet");
+        // End-to-end gate signal: a recent unsent draft must read as Drafting,
+        // NOT None — `None` is precisely what let the inject clobber the draft.
+        assert_eq!(
+            draft_state(&home, "fixup-x"),
+            DraftState::Drafting,
+            "#1680: a live unsent operator draft must gate (Drafting), not read as None"
         );
         std::fs::remove_dir_all(home).ok();
     }
