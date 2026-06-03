@@ -145,7 +145,7 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
     // the name. If any do, surface a loud error instead of returning
     // success — `auto_start_fleet` revival of a half-deleted instance is
     // exactly the silent-drop class pattern this fix prevents.
-    let residual = name_residual_anywhere(home, name);
+    let residual = name_residual_anywhere(home, name, instance_id.as_deref());
     if residual.is_empty() && step_errors.is_empty() {
         return Ok(());
     }
@@ -181,7 +181,19 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
 /// `full_delete_instance` clears them as part of its cleanup. The audit
 /// fn is positioned for stores whose state survives daemon restart
 /// (disk-backed) where the silent-drop revival risk lives.
-pub(crate) fn name_residual_anywhere(home: &Path, name: &str) -> Vec<&'static str> {
+///
+/// #1682 (defect-1): `id` is the instance's captured `InstanceId` (taken BEFORE
+/// fleet.yaml removal). It is required because the metadata residual lives at the
+/// id-resolved `<uuid>.json`, and once fleet.yaml is gone the name→id resolver
+/// can no longer find it — so the audit must check the id path DIRECTLY (no fleet
+/// reload) or it goes blind to exactly the stale file a delete is meant to clear.
+/// `None` when the instance had no id mapping (then only the legacy name path
+/// can carry metadata).
+pub(crate) fn name_residual_anywhere(
+    home: &Path,
+    name: &str,
+    id: Option<&str>,
+) -> Vec<&'static str> {
     let mut sources: Vec<&'static str> = Vec::new();
     if let Ok(cfg) = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)) {
         if cfg.instances.contains_key(name) {
@@ -195,7 +207,14 @@ pub(crate) fn name_residual_anywhere(home: &Path, name: &str) -> Vec<&'static st
             sources.push("fleet.yaml/teams");
         }
     }
-    if crate::agent_ops::metadata_exists(home, name) {
+    // #1682 (defect-1): name path OR the id-direct path. `metadata_exists` resolves
+    // via fleet.yaml, which is already gone at delete-audit time — the explicit
+    // id check below is what keeps the `<uuid>.json` residual visible.
+    let metadata_residual = crate::agent_ops::metadata_exists(home, name)
+        || id
+            .and_then(crate::types::InstanceId::parse)
+            .is_some_and(|id| crate::agent_ops::metadata_path_for_id(home, &id).exists());
+    if metadata_residual {
         sources.push("metadata");
     }
     if home.join("inbox").join(format!("{name}.jsonl")).exists() {
@@ -251,7 +270,7 @@ mod tests {
     #[test]
     fn name_residual_anywhere_clean_home_returns_empty() {
         let home = tmp_home("clean");
-        assert!(name_residual_anywhere(&home, "ghost").is_empty());
+        assert!(name_residual_anywhere(&home, "ghost", None).is_empty());
         std::fs::remove_dir_all(home).ok();
     }
 
@@ -263,7 +282,7 @@ mod tests {
             "instances:\n  zombie:\n    backend: claude\n",
         )
         .unwrap();
-        let sources = name_residual_anywhere(&home, "zombie");
+        let sources = name_residual_anywhere(&home, "zombie", None);
         assert!(
             sources.contains(&"fleet.yaml"),
             "fleet.yaml instances residual must surface, got {sources:?}"
@@ -283,7 +302,7 @@ mod tests {
             "teams:\n  ops:\n    members: [zombie, alice]\n    orchestrator: alice\n",
         )
         .unwrap();
-        let sources = name_residual_anywhere(&home, "zombie");
+        let sources = name_residual_anywhere(&home, "zombie", None);
         assert!(
             sources.contains(&"fleet.yaml/teams"),
             "team-member residual must surface, got {sources:?}"
@@ -297,8 +316,42 @@ mod tests {
         let meta_dir = home.join("metadata");
         std::fs::create_dir_all(&meta_dir).unwrap();
         std::fs::write(meta_dir.join("zombie.json"), "{}").unwrap();
-        let sources = name_residual_anywhere(&home, "zombie");
+        let sources = name_residual_anywhere(&home, "zombie", None);
         assert!(sources.contains(&"metadata"), "got {sources:?}");
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// #1682 (defect-1, codex): the metadata residual lives at the id-resolved
+    /// `<uuid>.json`, and `full_delete_instance` removes fleet.yaml BEFORE the
+    /// audit — so a fleet-reloading resolver can no longer map name→id and the
+    /// audit goes blind to the stale `<uuid>.json`. The captured id must be passed
+    /// so the audit checks the id path directly. This is the exact post-deletion
+    /// shape: fleet.yaml ABSENT + `<uuid>.json` present → audit must still report
+    /// "metadata". (Fails if the id-direct check is dropped — the name path alone
+    /// never sees `<uuid>.json`.)
+    #[test]
+    fn name_residual_anywhere_detects_uuid_metadata_after_fleet_yaml_removed_1682() {
+        let home = tmp_home("uuid_residual_postdelete");
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::create_dir_all(&home).unwrap();
+        let id = crate::types::InstanceId::new();
+        // The resolved metadata file exists ONLY as `<uuid>.json` (what every
+        // post-#1680 reader/writer uses) — and NO `<name>.json`.
+        let meta_dir = home.join("metadata");
+        std::fs::create_dir_all(&meta_dir).unwrap();
+        std::fs::write(meta_dir.join(format!("{}.json", id.full())), "{}").unwrap();
+        // fleet.yaml is ABSENT (already removed, as in full_delete_instance) — so a
+        // name→id resolver cannot find the uuid; only the captured id can.
+        assert!(
+            !crate::fleet::fleet_yaml_path(&home).exists(),
+            "precondition: fleet.yaml must be absent (post-delete state)"
+        );
+        let sources = name_residual_anywhere(&home, "zombie", Some(&id.full()));
+        assert!(
+            sources.contains(&"metadata"),
+            "#1682 defect-1: id-resolved metadata residual must surface even with \
+             fleet.yaml gone, got {sources:?}"
+        );
         std::fs::remove_dir_all(home).ok();
     }
 
@@ -308,7 +361,7 @@ mod tests {
         let inbox_dir = home.join("inbox");
         std::fs::create_dir_all(&inbox_dir).unwrap();
         std::fs::write(inbox_dir.join("zombie.jsonl"), "").unwrap();
-        let sources = name_residual_anywhere(&home, "zombie");
+        let sources = name_residual_anywhere(&home, "zombie", None);
         assert!(sources.contains(&"inbox"), "got {sources:?}");
         std::fs::remove_dir_all(home).ok();
     }
@@ -319,7 +372,7 @@ mod tests {
         let dir = crate::paths::runtime_dir(&home).join("zombie");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("binding.json"), "{}").unwrap();
-        let sources = name_residual_anywhere(&home, "zombie");
+        let sources = name_residual_anywhere(&home, "zombie", None);
         assert!(sources.contains(&"runtime/binding.json"), "got {sources:?}");
         std::fs::remove_dir_all(home).ok();
     }
@@ -330,7 +383,7 @@ mod tests {
         let dir = home.join("notification-queue");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("zombie.jsonl"), "").unwrap();
-        let sources = name_residual_anywhere(&home, "zombie");
+        let sources = name_residual_anywhere(&home, "zombie", None);
         assert!(sources.contains(&"notification-queue"), "got {sources:?}");
         std::fs::remove_dir_all(home).ok();
     }
@@ -349,7 +402,7 @@ mod tests {
         std::fs::write(home.join("metadata").join("zombie.json"), "{}").unwrap();
         std::fs::create_dir_all(home.join("inbox")).unwrap();
         std::fs::write(home.join("inbox").join("zombie.jsonl"), "").unwrap();
-        let sources = name_residual_anywhere(&home, "zombie");
+        let sources = name_residual_anywhere(&home, "zombie", None);
         for expected in ["fleet.yaml", "metadata", "inbox"] {
             assert!(
                 sources.contains(&expected),
