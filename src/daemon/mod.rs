@@ -413,6 +413,7 @@ fn run_core(
     crate::daemon::dispatch_idle::register_subscriber(home.to_path_buf());
     crate::daemon::waiting_on_stale::register_subscriber(home.to_path_buf());
     crate::daemon::helper_staleness_watchdog::register_subscriber(home.to_path_buf());
+    crate::daemon::idle_watchdog::register_subscriber(home.to_path_buf());
 
     spawn_fleet_agents(home, &agents, &ctx);
 

@@ -74,6 +74,15 @@ pub enum EventKind {
     HelperStale {
         helper_name: String,
     },
+    // #event-bus pattern #6 (idle_watchdog): the dev-idle / fleet-idle alert.
+    // `emit_idle_alert` already takes exactly these fields, so the subscriber
+    // re-delivers byte-identically (recipient is resolved at the producer).
+    IdleAlert {
+        recipient: String,
+        kind: String,
+        text: String,
+        correlation_agent: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -282,6 +291,12 @@ mod tests {
                 elapsed_secs: 2000,
                 timeout_secs: 1800,
                 default_action: "proceed".into(),
+            },
+            EventKind::IdleAlert {
+                recipient: "general".into(),
+                kind: "fleet_idle_watchdog".into(),
+                text: "all idle".into(),
+                correlation_agent: None,
             },
         ];
         for k in kinds {
