@@ -46,6 +46,11 @@ pub(super) fn handle_reply(home: &Path, args: &Value, instance_name: &str) -> Va
 
     let fleet_path = crate::fleet::fleet_yaml_path(home);
     if !fleet_path.exists() {
+        // #1665 Gap D (codex catch): the reply cannot be sent (no fleet.yaml), so
+        // this exit is a send-failure too — record it, matching every other
+        // failure exit. Without this the turn stayed Pending and the ledger later
+        // mis-classified it as a plain silent drop instead of SendFailed.
+        crate::reply_ledger::record_reply_outcome(instance_name, false);
         return json!({"error": "No fleet.yaml — cannot send reply"});
     }
 
