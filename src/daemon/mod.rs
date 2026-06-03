@@ -410,6 +410,7 @@ fn run_core(
     // unless AGEND_EVENT_BUS=1 (emit is a no-op when gate-off).
     crate::daemon::anti_stall::register_subscriber(home.to_path_buf());
     crate::daemon::decision_timeout::register_subscriber(home.to_path_buf());
+    crate::daemon::dispatch_idle::register_subscriber(home.to_path_buf());
 
     spawn_fleet_agents(home, &agents, &ctx);
 
