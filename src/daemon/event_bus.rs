@@ -37,6 +37,13 @@ pub enum EventKind {
         dispatcher: String,
         target: String,
         elapsed_secs: i64,
+        // #event-bus pattern #3 (dispatch_idle): the remaining fields the
+        // threshold-exceeded notification formats, so the subscriber rebuilds it
+        // byte-identically (overshoot is derived from elapsed - threshold).
+        dispatch_id: String,
+        expected_kind: String,
+        threshold_secs: i64,
+        correlation_id: Option<String>,
     },
     MemberStateChanged {
         agent: String,
@@ -244,6 +251,10 @@ mod tests {
                 dispatcher: "lead".into(),
                 target: "dev".into(),
                 elapsed_secs: 600,
+                dispatch_id: "di-1".into(),
+                expected_kind: "task".into(),
+                threshold_secs: 300,
+                correlation_id: Some("t-1".into()),
             },
             EventKind::MemberStateChanged {
                 agent: "dev".into(),
