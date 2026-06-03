@@ -1287,10 +1287,17 @@ pub(crate) fn process_error_recovery(
                     "⚠️ {name} transient upstream error auto-retry exhausted ({} retries). Manual intervention required.",
                     SERVER_RATE_LIMIT_MAX_RETRIES
                 );
+                // #1595 Step 1: `Error`, not `Warn`. Exhaustion of the #1696 tiered
+                // retry (the full ~75min budget burned) means the agent is stuck
+                // and auto-recovery has given up — a genuine P0 that MUST break
+                // through `Sleep`/`Away` to wake the operator (the #1594 gate
+                // suppresses `Warn` in Sleep, so at `Warn` this alert was silently
+                // dropped exactly when the operator most needs it). Severity is
+                // routing-only (the Telegram adapter ignores it for rendering).
                 let _ = crate::channel::gated_notify(
                     ch.as_ref(),
                     name,
-                    NotifySeverity::Warn,
+                    NotifySeverity::Error,
                     &msg,
                     false,
                 );
@@ -3166,6 +3173,30 @@ instances:
         assert!(
             !src.contains(&force_true),
             "#1680: no force=true continue-inject may remain"
+        );
+    }
+
+    /// #1595 Step 1 (source guard): the ServerRateLimit retry-exhausted Telegram
+    /// notify MUST be `Error` (not Warn) so it breaks through the #1594 Sleep-mode
+    /// gate. The gate's Error-passes-Sleep / Warn-suppressed policy is pinned by
+    /// `channel::tests::should_notify_in_mode_policy_grid`; this pins the producer
+    /// side — that exhaustion (the full #1696 tiered budget burned) escalates to a
+    /// P0 that wakes a sleeping operator instead of being silently dropped.
+    #[test]
+    fn server_rate_limit_exhausted_notify_is_error_severity_1595() {
+        let src = include_str!("supervisor.rs");
+        // Window the exhaust branch (production), well away from this test body.
+        let idx = src
+            .find("auto-retry exhausted")
+            .expect("exhaust notice present in source");
+        let window = &src[idx..(idx + 1200).min(src.len())];
+        assert!(
+            window.contains("NotifySeverity::Error"),
+            "#1595: the ServerRateLimit-exhausted gated_notify must use Error severity"
+        );
+        assert!(
+            !window.contains("NotifySeverity::Warn"),
+            "#1595: the exhaust notify must not remain Warn (suppressed in Sleep)"
         );
     }
 }
