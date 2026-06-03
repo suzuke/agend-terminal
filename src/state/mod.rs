@@ -606,13 +606,14 @@ impl StateTracker {
     /// considered alive and `PermissionPrompt` detection is suppressed.
     const HEARTBEAT_FRESH_WINDOW: Duration = Duration::from_secs(120);
 
-    /// The pre-reroute initial-state match — the fork's fallback for un-migrated
-    /// backends (and `None`) AND the TRUE-legacy reference for the parity test
-    /// (after the reroute, `new()` sources migrated backends from the profile, so
-    /// `new().current` can't stand in for "legacy" without circularity).
+    /// #8 delete-legacy: the fork's fallback for the un-migrated backend (only
+    /// Gemini) and `None`. Reached only when `profile(backend)` is `None` — i.e.
+    /// `Some(Gemini)`→Starting (managed) or `None`→Ready. Shell/Raw now route
+    /// through their profile (initial_state = Ready), so they no longer reach
+    /// here; the prior `Shell|Raw => Ready` arm folds into `Some(_) => Starting`.
     pub(crate) fn legacy_initial_state(backend: Option<&Backend>) -> AgentState {
         match backend {
-            Some(Backend::Shell | Backend::Raw(_)) | None => AgentState::Ready,
+            None => AgentState::Ready,
             Some(_) => AgentState::Starting,
         }
     }

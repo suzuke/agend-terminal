@@ -83,41 +83,17 @@ pub fn config_for(backend: &Backend) -> BehavioralConfig {
 /// `config_for` sources migrated backends from the profile, so it can't stand in
 /// for "legacy" without making the assertion circular).
 pub(crate) fn config_for_legacy(backend: &Backend) -> BehavioralConfig {
+    // #8 delete-legacy: only Gemini remains on the legacy path (the 6 migrated
+    // backends route through BackendProfile). Gemini's arm is byte-intact; every
+    // other variant falls to the default — they never reach here (`config_for`
+    // returns `profile().behavioral` for them).
     match backend {
-        Backend::ClaudeCode => BehavioralConfig {
-            silence_thinking_ms: 2000,
-            silence_idle_ms: 6000,
-            supports_cursor_query: true,
-        },
-        Backend::KiroCli => BehavioralConfig {
-            silence_thinking_ms: 2500,
-            silence_idle_ms: 7000,
-            supports_cursor_query: true,
-        },
-        Backend::Codex => BehavioralConfig {
-            silence_thinking_ms: 3000,
-            silence_idle_ms: 8000,
-            supports_cursor_query: false, // bubbletea TUI may not respond to DSR
-        },
         Backend::Gemini => BehavioralConfig {
             silence_thinking_ms: 3000,
             silence_idle_ms: 8000,
             supports_cursor_query: false,
         },
-        Backend::OpenCode => BehavioralConfig {
-            silence_thinking_ms: 3000,
-            silence_idle_ms: 8000,
-            supports_cursor_query: false,
-        },
-        // #987: agy shares gemini-cli's agent engine + TUI; inherit gemini's
-        // calibrated thresholds as starting point. Tune in follow-up PR if
-        // empirical telemetry shows divergence.
-        Backend::Agy => BehavioralConfig {
-            silence_thinking_ms: 3000,
-            silence_idle_ms: 8000,
-            supports_cursor_query: false,
-        },
-        Backend::Shell | Backend::Raw(_) => BehavioralConfig::default(),
+        _ => BehavioralConfig::default(),
     }
 }
 
@@ -466,49 +442,18 @@ pub fn config_for_productivity(backend: &Backend) -> ProductivityConfig {
 /// The pre-reroute productivity match — the fork's fallback AND the TRUE-legacy
 /// parity reference (see [`config_for_legacy`] for why a separate fn is needed).
 pub(crate) fn config_for_productivity_legacy(backend: &Backend) -> ProductivityConfig {
+    // #8 delete-legacy: only Gemini remains on the legacy path. Gemini's arm is
+    // byte-intact; the `_ =>` catch-all returns the generic Shell/Raw-style config
+    // (never reached — every other backend gets `profile().productivity`). The
+    // per-backend marker consts stay (the profiles reference them).
     match backend {
-        Backend::ClaudeCode => ProductivityConfig {
-            markers: CLAUDE_PRODUCTIVE_MARKERS,
-            use_heartbeat: true,
-            heartbeat_fresh_window_ms: 10_000,
-            cache_id: Some(MarkerCacheId::Claude),
-        },
-        Backend::KiroCli => ProductivityConfig {
-            markers: KIRO_PRODUCTIVE_MARKERS,
-            use_heartbeat: true,
-            heartbeat_fresh_window_ms: 10_000,
-            cache_id: Some(MarkerCacheId::Kiro),
-        },
-        Backend::Codex => ProductivityConfig {
-            markers: CODEX_PRODUCTIVE_MARKERS,
-            use_heartbeat: true,
-            heartbeat_fresh_window_ms: 10_000,
-            cache_id: Some(MarkerCacheId::Codex),
-        },
         Backend::Gemini => ProductivityConfig {
             markers: GEMINI_PRODUCTIVE_MARKERS,
             use_heartbeat: true,
             heartbeat_fresh_window_ms: 10_000,
             cache_id: Some(MarkerCacheId::Gemini),
         },
-        Backend::OpenCode => ProductivityConfig {
-            markers: OPENCODE_PRODUCTIVE_MARKERS,
-            use_heartbeat: true,
-            heartbeat_fresh_window_ms: 10_000,
-            cache_id: Some(MarkerCacheId::OpenCode),
-        },
-        // #987: agy reuses Gemini's productivity markers + cache id.
-        // Both share the same Google agent engine; markers will diverge
-        // only if AGY's TUI introduces new productivity indicators not
-        // present in Gemini CLI. Telemetry-tune in follow-up PR.
-        Backend::Agy => ProductivityConfig {
-            markers: GEMINI_PRODUCTIVE_MARKERS,
-            use_heartbeat: true,
-            heartbeat_fresh_window_ms: 10_000,
-            cache_id: Some(MarkerCacheId::Gemini),
-        },
-        // Shell / Raw — no MCP, generic markers only.
-        Backend::Shell | Backend::Raw(_) => ProductivityConfig {
+        _ => ProductivityConfig {
             markers: GENERIC_PRODUCTIVE_MARKERS,
             use_heartbeat: false,
             heartbeat_fresh_window_ms: 0,
