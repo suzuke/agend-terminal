@@ -278,3 +278,45 @@ fn happy_path_tagged_channel_matches_singleton_returns_message_id() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+// #1665 (codex catch): the "No fleet.yaml" early-return is a reply send-failure
+// too — it MUST record SendFailed on the audited turn, not leave it Pending
+// (which the reply-ledger would later mis-classify as a plain silent drop rather
+// than a Gap D send-failure). Pre-fix this assertion FAILS (outcome stays
+// Pending). `crate::reply_ledger::ReplyOutcome` is fully qualified to avoid the
+// local mock `ReplyOutcome` (Ok/NotSupported) in this file.
+#[test]
+fn no_fleet_yaml_reply_exit_records_send_failed_gap_d_1665() {
+    let _g = registry_guard();
+    crate::channel::reset_active_channel_for_test();
+    // A home WITHOUT fleet.yaml (the shared `tmp_home` writes one) so handle_reply
+    // hits the no-fleet early-return.
+    let home = std::env::temp_dir().join(format!("agend-1665-nofleet-{}", std::process::id()));
+    std::fs::create_dir_all(&home).ok();
+    std::fs::remove_file(home.join("fleet.yaml")).ok();
+    let agent = "reply-ledger-nofleet-1665";
+    crate::reply_ledger::arm(
+        agent,
+        crate::channel::ChannelKind::Telegram,
+        Some("m-1".into()),
+        None,
+        None,
+    );
+    let result = super::handle_reply(&home, &serde_json::json!({"message": "hi"}), agent);
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("No fleet.yaml"),
+        "must hit the no-fleet.yaml exit: {result}"
+    );
+    let turn = crate::daemon::heartbeat_pair::snapshot_for(agent)
+        .pending_user_turn
+        .expect("turn stays armed through the failed reply");
+    assert_eq!(
+        turn.reply_outcome,
+        crate::reply_ledger::ReplyOutcome::SendFailed,
+        "no-fleet.yaml reply exit must record SendFailed (Gap D), not stay Pending"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}

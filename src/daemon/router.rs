@@ -208,6 +208,9 @@ fn try_dispatch_mirror(home: &std::path::Path, name: &str, buf: &mut AgentBuffer
         p.reply_to_channel = None;
         p.reply_to_input_id = None;
     });
+    // #1665 reply-ledger: a mirror dispatch IS a closure (the user got the
+    // agent's output) — clear the audited turn without warning.
+    crate::reply_ledger::clear_turn(name);
 
     buf.buffer.clear();
     buf.active = false;

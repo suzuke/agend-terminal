@@ -81,6 +81,11 @@ pub struct HeartbeatPair {
     pub mirror_dispatched_for_turn: bool,
     /// Set by handle_reply — skip mirror for current turn (agent replied explicitly).
     pub mirror_skip_until_next_turn: bool,
+    /// #1665 reply-ledger: the in-flight user-message turn being audited for
+    /// delivery-closure, or `None`. Armed at the inbox dequeue (user channel
+    /// message), cleared at the turn boundary / supervisor sweep. Hangs here
+    /// (existing turn state) rather than a new lifecycle file (#922).
+    pub pending_user_turn: Option<crate::reply_ledger::PendingUserTurn>,
 }
 
 /// Per-instance lock registry. Keys are agent names (per

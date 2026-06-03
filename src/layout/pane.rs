@@ -151,6 +151,10 @@ impl Pane {
                     p.reply_to_channel = None;
                     p.reply_to_input_id = None;
                 });
+                // #1665 reply-ledger: operator took over in the TUI — can't tell
+                // "user abandoned" from "operator handled it out-of-band", so
+                // clear the audited turn without warning.
+                crate::reply_ledger::clear_turn(&self.agent_name);
             }
             PaneSource::Remote(client) => {
                 let mut c = client.lock();

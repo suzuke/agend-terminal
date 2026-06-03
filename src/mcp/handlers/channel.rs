@@ -46,6 +46,11 @@ pub(super) fn handle_reply(home: &Path, args: &Value, instance_name: &str) -> Va
 
     let fleet_path = crate::fleet::fleet_yaml_path(home);
     if !fleet_path.exists() {
+        // #1665 Gap D (codex catch): the reply cannot be sent (no fleet.yaml), so
+        // this exit is a send-failure too — record it, matching every other
+        // failure exit. Without this the turn stayed Pending and the ledger later
+        // mis-classified it as a plain silent drop instead of SendFailed.
+        crate::reply_ledger::record_reply_outcome(instance_name, false);
         return json!({"error": "No fleet.yaml — cannot send reply"});
     }
 
@@ -62,6 +67,9 @@ pub(super) fn handle_reply(home: &Path, args: &Value, instance_name: &str) -> Va
                     from = %instance_name, channel = %name,
                     "reply_to_channel tagged but not registered — divergence"
                 );
+                // #1665 Gap D: the agent tried to reply but the channel is
+                // unreachable — record the send-failure (never blocks the reply).
+                crate::reply_ledger::record_reply_outcome(instance_name, false);
                 return json!({
                     "error": format!("reply_to_channel '{name}' not registered or offline"),
                     "code": "reply_channel_unavailable"
@@ -70,7 +78,11 @@ pub(super) fn handle_reply(home: &Path, args: &Value, instance_name: &str) -> Va
         },
         None => match crate::channel::active_channel() {
             Some(ch) => ch,
-            None => return json!({"error": "no active channel", "code": "no_active_channel"}),
+            None => {
+                // #1665 Gap D: no channel to reply on — record the send-failure.
+                crate::reply_ledger::record_reply_outcome(instance_name, false);
+                return json!({"error": "no active channel", "code": "no_active_channel"});
+            }
         },
     };
     // #969 RC2 fix: set mirror_skip BEFORE the send. Pre-fix this set
@@ -97,6 +109,8 @@ pub(super) fn handle_reply(home: &Path, args: &Value, instance_name: &str) -> Va
         crate::channel::AgentOutboundOp::Reply { text },
     ) {
         Ok(msg) => {
+            // #1665: reply delivered — closes the user-turn (no warn at sweep).
+            crate::reply_ledger::record_reply_outcome(instance_name, true);
             // Sprint 59 Wave 1 PR-4: surface the pending-decision /
             // resolved-decision IDs so caller observability is
             // complete (operator can reference IDs, agent can verify
@@ -115,12 +129,18 @@ pub(super) fn handle_reply(home: &Path, args: &Value, instance_name: &str) -> Va
                 from = %instance_name, channel = %ch.kind(),
                 "reply capability unsupported on tagged channel — divergence"
             );
+            // #1665 Gap D: send failed (capability) — record send-failure.
+            crate::reply_ledger::record_reply_outcome(instance_name, false);
             json!({
                 "error": format!("channel '{}' does not support {}", ch.kind(), op),
                 "code": "channel_capability_unsupported"
             })
         }
-        Err(e) => json!({"error": format!("{e}")}),
+        Err(e) => {
+            // #1665 Gap D: send failed — record send-failure.
+            crate::reply_ledger::record_reply_outcome(instance_name, false);
+            json!({"error": format!("{e}")})
+        }
     }
 }
 
