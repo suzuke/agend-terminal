@@ -2981,17 +2981,17 @@ fn parse_subscribers_empty_when_no_data() {
 }
 
 // -----------------------------------------------------------------
-// Sprint 54 P0-5 (sub-scope B) — consecutive_skips tracking +
-// stalled/resumed inbox fan-out. Each test pins one of the four
-// contract gates from dispatch m-20260507045729197032-16.
+// #1705 — REPO-LEVEL rate-limit stall tracking (replaces the
+// Sprint 54 P0-5 per-watch consecutive_skips path). With the batch
+// poll, a rate-limit is a repo property: one repo-level
+// [ci-watch-stalled]/[resumed] pair, tracked in a <repo-slug>.stall
+// sidecar (survives a single watch being auto-cleared by #931).
 //
 // EMPIRICAL REGRESSION-PROOF ANCHOR: if the
-// `if next_skips >= STALL_THRESHOLD && !already_notified` guard
-// in `bump_consecutive_skips_and_maybe_notify` is dropped, the
-// "fires exactly once" assertion in
-// `stalled_event_fires_exactly_once_at_threshold` fails because
-// every subsequent skip would re-enqueue. PR description carries
-// the captured FAIL signature.
+// `consecutive_skips >= STALL_THRESHOLD && stalled_since_ms.is_none()`
+// guard in `bump_repo_stall_and_maybe_notify` is dropped, the "fires
+// exactly once" assertion in `repo_stall_fires_one_event_at_threshold`
+// fails because every subsequent bump would re-enqueue.
 // -----------------------------------------------------------------
 
 fn p05_temp_home(tag: &str) -> std::path::PathBuf {
@@ -3021,74 +3021,53 @@ fn p05_read_inbox_lines(home: &Path, instance: &str) -> Vec<String> {
         .collect()
 }
 
-#[test]
-fn consecutive_skips_increments_on_rate_limited_skip() {
-    // Gate 1: each rate-limited skip bumps the counter atomically.
-    let home = p05_temp_home("p05_skip_inc");
-    let watch = serde_json::json!({
-        "repo": "o/r",
-        "branch": "feat",
-        "subscribers": [{"instance": "lead", "subscribed_at": "2026-05-07T00:00:00Z"}],
-        "consecutive_skips": 0,
-    });
-    let path = p05_write_watch(&home, "o/r", "feat", watch);
-    let subscribers = vec!["lead".to_string()];
+// #1705 sidecar reader — the repo stall state lives at
+// `ci-watches/<repo-slug>.stall`.
+fn p05_read_repo_stall(home: &Path, repo_slug: &str) -> serde_json::Value {
+    let path = ci_watches_dir(home).join(format!("{repo_slug}.stall"));
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
+        .unwrap_or(serde_json::Value::Null)
+}
 
+#[test]
+fn repo_stall_increments_and_holds_below_threshold() {
+    // Pin ④a: each batch ApiError bumps the per-repo counter; below
+    // STALL_THRESHOLD no notification fires.
+    let home = p05_temp_home("p1705_skip_inc");
+    let subscribers = vec!["lead".to_string()];
     let future_reset = (chrono::Utc::now().timestamp() as u64) + 3600;
-    bump_consecutive_skips_and_maybe_notify(
-        &home,
-        &path,
-        "o/r",
-        "feat",
-        &subscribers,
-        future_reset,
-        None,
+
+    bump_repo_stall_and_maybe_notify(&home, "o/r", &subscribers, Some(future_reset), None);
+    bump_repo_stall_and_maybe_notify(&home, "o/r", &subscribers, Some(future_reset), None);
+
+    let st = p05_read_repo_stall(&home, "o_r");
+    assert_eq!(st["consecutive_skips"].as_u64(), Some(2));
+    // Below threshold ⇒ no stall window opened, no event.
+    assert!(
+        st["stalled_since_ms"].is_null(),
+        "below threshold ⇒ not stalled"
     );
-    bump_consecutive_skips_and_maybe_notify(
-        &home,
-        &path,
-        "o/r",
-        "feat",
-        &subscribers,
-        future_reset,
-        None,
+    let lines = p05_read_inbox_lines(&home, "lead");
+    assert!(
+        !lines.iter().any(|l| l.contains("ci-watch-stalled")),
+        "no stalled event below threshold"
     );
-    let watch: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    assert_eq!(watch["consecutive_skips"].as_u64(), Some(2));
-    // Below threshold: stalled_notified is either absent (None) or
-    // false — both mean "no notify fired yet".
-    let notified = watch["stalled_notified"].as_bool().unwrap_or(false);
-    assert!(!notified, "below threshold ⇒ no notify yet");
     std::fs::remove_dir_all(&home).ok();
 }
 
 #[test]
-fn stalled_event_fires_exactly_once_at_threshold() {
-    // Gate 2: at N=3 a [ci-watch-stalled] enqueues; further
-    // tick-skips don't re-fire. This is the regression-proof
-    // anchor — collapsing the guard reveals duplicates.
-    let home = p05_temp_home("p05_stalled_once");
-    let watch = serde_json::json!({
-        "repo": "o/r",
-        "branch": "feat",
-        "subscribers": [{"instance": "lead", "subscribed_at": "2026-05-07T00:00:00Z"}],
-        "consecutive_skips": 0,
-    });
-    let path = p05_write_watch(&home, "o/r", "feat", watch);
+fn repo_stall_fires_one_event_at_threshold() {
+    // Pin ④b: at N=STALL_THRESHOLD one repo-level [ci-watch-stalled]
+    // enqueues; further bumps don't re-fire. Regression-proof anchor —
+    // collapsing the `stalled_since_ms.is_none()` guard reveals duplicates.
+    let home = p05_temp_home("p1705_stalled_once");
     let subscribers = vec!["lead".to_string()];
     let future_reset = (chrono::Utc::now().timestamp() as u64) + 3600;
 
     for _ in 0..5 {
-        bump_consecutive_skips_and_maybe_notify(
-            &home,
-            &path,
-            "o/r",
-            "feat",
-            &subscribers,
-            future_reset,
-            None,
-        );
+        bump_repo_stall_and_maybe_notify(&home, "o/r", &subscribers, Some(future_reset), None);
     }
 
     let lines = p05_read_inbox_lines(&home, "lead");
@@ -3098,7 +3077,7 @@ fn stalled_event_fires_exactly_once_at_threshold() {
         .count();
     assert_eq!(
         stalled_count, 1,
-        "exactly one stalled event per stall window (got {stalled_count})"
+        "exactly one repo-level stalled event per stall window (got {stalled_count})"
     );
     std::fs::remove_dir_all(&home).ok();
 }
@@ -3138,114 +3117,294 @@ fn resumed_event_fires_on_first_successful_clear() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// Pin ④c (fan-out + #790 display-tz): the repo-level stalled + resumed
+/// events reach EVERY subscriber across the repo's watches (P0-1 fan-out),
+/// the stalled body renders the operator display tz, and storage stays UTC.
+/// Stalled-since is seeded deterministically (1746655200000ms =
+/// 2026-05-07T22:00:00Z → Taipei UTC+8 = "05-08 06:00").
 #[test]
-fn stalled_and_resumed_fan_out_to_all_subscribers() {
-    // Gate 4: both event types reach every subscriber per the
-    // P0-1 fan-out contract.
-    let home = p05_temp_home("p05_fanout");
-    let watch = serde_json::json!({
-        "repo": "o/r",
-        "branch": "feat",
-        "subscribers": [
-            {"instance": "lead", "subscribed_at": "2026-05-07T00:00:00Z"},
-            {"instance": "dev",  "subscribed_at": "2026-05-07T00:00:01Z"}
-        ],
-        "consecutive_skips": 0,
+fn repo_stall_fan_out_and_tz_body_storage_utc() {
+    let home = p05_temp_home("p1705_fanout_tz");
+    // Seed the sidecar at threshold-1 with a fixed stalled_since so the next
+    // bump tips over and emits with a deterministic body anchor.
+    let stall_path = ci_watches_dir(&home).join("o_r.stall");
+    let sidecar = serde_json::json!({
+        "consecutive_skips": STALL_THRESHOLD - 1,
+        "stalled_notified": false,
+        "stalled_since_ms": 1746655200000_i64,
     });
-    let path = p05_write_watch(&home, "o/r", "feat", watch);
+    std::fs::write(&stall_path, serde_json::to_string_pretty(&sidecar).unwrap()).unwrap();
+
     let subscribers = vec!["lead".to_string(), "dev".to_string()];
     let future_reset = (chrono::Utc::now().timestamp() as u64) + 3600;
+    bump_repo_stall_and_maybe_notify(
+        &home,
+        "o/r",
+        &subscribers,
+        Some(future_reset),
+        Some("Asia/Taipei"),
+    );
 
-    for _ in 0..STALL_THRESHOLD {
-        bump_consecutive_skips_and_maybe_notify(
-            &home,
-            &path,
-            "o/r",
-            "feat",
-            &subscribers,
-            future_reset,
-            None,
-        );
-    }
     for sub in ["lead", "dev"] {
         let lines = p05_read_inbox_lines(&home, sub);
+        let stalled_line = lines
+            .iter()
+            .find(|l| l.contains("ci-watch-stalled"))
+            .unwrap_or_else(|| panic!("{sub} must receive repo-level stalled event"));
+        let msg: serde_json::Value =
+            serde_json::from_str(stalled_line).expect("inbox line is JSON");
+        let text = msg["text"].as_str().expect("inbox text field");
         assert!(
-            lines.iter().any(|l| l.contains("ci-watch-stalled")),
-            "{sub} must receive stalled event (fan-out regression)"
+            text.contains("Stalled since: 05-08 06:00"),
+            "body must render Taipei tz (UTC+8) for 2026-05-07T22:00:00Z, got:\n{text}"
+        );
+        let ts = msg["timestamp"].as_str().expect("timestamp field");
+        assert!(
+            ts.ends_with('Z') || ts.ends_with("+00:00"),
+            "inbox storage timestamp must be UTC ISO 8601, got {ts:?}"
         );
     }
 
-    clear_stall_and_maybe_notify_resumed(&home, &path, "o/r", "feat", &subscribers);
+    // Resume on the next successful batch poll → both subscribers notified once.
+    clear_repo_stall_and_maybe_resume(&home, "o/r", &subscribers);
     for sub in ["lead", "dev"] {
         let lines = p05_read_inbox_lines(&home, sub);
         assert!(
             lines.iter().any(|l| l.contains("ci-watch-resumed")),
-            "{sub} must receive resumed event"
+            "{sub} must receive repo-level resumed event"
         );
     }
     std::fs::remove_dir_all(&home).ok();
 }
 
-/// #790 wiring test: notification BODY renders Stalled-since and
-/// Next-poll-ETA in the operator's configured display tz, while
-/// the InboxMessage storage `timestamp` field stays UTC (storage
-/// invariant pin guard, per dispatch spec).
-///
-/// Stalled-since is anchored at `2026-05-07T22:00:00Z` (epoch
-/// 1746655200000ms). With `display_timezone=Some("Asia/Taipei")`
-/// the body should contain `"05-08 06:00"` (UTC+8). The inbox
-/// message timestamp field is set inside `fan_out_health_event`
-/// from `chrono::Utc::now().to_rfc3339()` — must end with `Z` or
-/// `+00:00` regardless of display_timezone.
-#[test]
-fn stalled_event_body_uses_display_tz_storage_stays_utc() {
-    let home = p05_temp_home("p790_tz_body");
-    // Pre-stamp stalled_since_ms so the body interpolation is
-    // deterministic (no race on chrono::Utc::now()).
-    let watch = serde_json::json!({
-        "repo": "o/r",
-        "branch": "feat",
-        "subscribers": [{"instance": "lead", "subscribed_at": "2026-05-07T00:00:00Z"}],
-        "consecutive_skips": 0,
-        "stalled_since_ms": 1746655200000_i64, // 2026-05-07T22:00:00Z
-    });
-    let path = p05_write_watch(&home, "o/r", "feat", watch);
-    let subscribers = vec!["lead".to_string()];
-    let future_reset = (chrono::Utc::now().timestamp() as u64) + 3600;
+// ── #1705 repo-level batch poll → tick-cache prefill (pins ①②③) ──
 
-    for _ in 0..STALL_THRESHOLD {
-        bump_consecutive_skips_and_maybe_notify(
-            &home,
-            &path,
-            "o/r",
-            "feat",
-            &subscribers,
-            future_reset,
-            Some("Asia/Taipei"),
-        );
+/// Batch provider: serves one repo-level `poll_repo_runs` (counted) and a
+/// trivial per-branch `poll_runs`. Pairs with `CountingProvider` (the
+/// per-branch fallback inner) sharing the same `TickCache`.
+struct BatchProvider {
+    rows: Vec<crate::daemon::ci_watch::provider::RunRow>,
+    repo_calls: std::sync::Arc<std::sync::atomic::AtomicU32>,
+}
+
+#[async_trait::async_trait]
+impl CiProvider for BatchProvider {
+    async fn poll_runs(&self, _repo: &str, _branch: &str) -> anyhow::Result<CiPollResult> {
+        Ok(CiPollResult::Runs {
+            runs: vec![],
+            rate_limit_remaining: None,
+            rate_limit_limit: None,
+        })
     }
+    async fn poll_repo_runs(&self, _repo: &str) -> Option<anyhow::Result<RepoPollResult>> {
+        self.repo_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(Ok(RepoPollResult::Runs {
+            rows: self.rows.clone(),
+            rate_limit_remaining: Some(59),
+            rate_limit_limit: Some(60),
+        }))
+    }
+    async fn check_pr_terminal(&self, _repo: &str, _branch: &str) -> PrState {
+        PrState::Open
+    }
+    async fn fetch_failure_summary(&self, _repo: &str, _run_id: u64) -> String {
+        String::new()
+    }
+    fn token_warning(&self) -> Option<&'static str> {
+        None
+    }
+}
 
-    let lines = p05_read_inbox_lines(&home, "lead");
-    let stalled_line = lines
-        .iter()
-        .find(|l| l.contains("ci-watch-stalled"))
-        .expect("stalled event must enqueue");
-    let msg: serde_json::Value = serde_json::from_str(stalled_line).expect("inbox line is JSON");
+fn mk_poll_ctx(
+    repo: &str,
+    branch: &str,
+    head_sha: &str,
+) -> (std::path::PathBuf, super::PollContext) {
+    let watch: WatchState = serde_json::from_value(serde_json::json!({
+        "repo": repo,
+        "branch": branch,
+        "head_sha": head_sha,
+        "subscribers": [{"instance": "lead", "subscribed_at": "2026-01-01T00:00:00Z"}],
+    }))
+    .unwrap();
+    let path = std::env::temp_dir().join(format!("ci-batch-{branch}.json"));
+    (
+        path,
+        super::PollContext {
+            repo: repo.to_string(),
+            subscribers: vec!["lead".to_string()],
+            stamped_watch: watch,
+        },
+    )
+}
 
-    // Wiring: body text must contain Taipei-rendered Stalled-since.
-    let text = msg["text"].as_str().expect("inbox text field");
-    assert!(
-        text.contains("Stalled since: 05-08 06:00"),
-        "body must render Taipei tz (UTC+8) for 2026-05-07T22:00:00Z, got:\n{text}"
+fn run_row(branch: &str, sha: &str) -> crate::daemon::ci_watch::provider::RunRow {
+    crate::daemon::ci_watch::provider::RunRow {
+        head_branch: branch.to_string(),
+        run: CiRun {
+            id: 1,
+            conclusion: Some("success".into()),
+            head_sha: sha.into(),
+            url: String::new(),
+            name: "CI".into(),
+        },
+    }
+}
+
+#[test]
+fn batch_prefill_routes_cache_hits_and_head_sha_fallback() {
+    // Pins ①②③ in one flow. Two watches on the same repo:
+    //   feat-a head_sha "aaa" — present in batch → prefilled (cache hit)
+    //   feat-b head_sha "bbb" — batch only has "ccc" for feat-b → NOT
+    //                            prefilled (expected sha absent) → fallback
+    let repo_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let batch = BatchProvider {
+        rows: vec![run_row("feat-a", "aaa"), run_row("feat-b", "ccc")],
+        repo_calls: std::sync::Arc::clone(&repo_calls),
+    };
+    let cache = new_tick_cache();
+    let watches = vec![
+        mk_poll_ctx("o/r", "feat-a", "aaa"),
+        mk_poll_ctx("o/r", "feat-b", "bbb"),
+    ];
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let proceed = rt.block_on(async {
+        super::batch_prefill_repo(
+            std::env::temp_dir().as_path(),
+            "o/r",
+            &watches,
+            &cache,
+            &batch,
+            &["lead".to_string()],
+            None,
+        )
+        .await
+    });
+    assert!(proceed, "Runs result proceeds to fan-out");
+    // ① exactly one batch call covered both watches.
+    assert_eq!(
+        repo_calls.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "N watches on one repo ⇒ a single batch poll"
     );
 
-    // Storage invariant: inbox timestamp field stays UTC ISO 8601.
-    let ts = msg["timestamp"].as_str().expect("timestamp field");
-    assert!(
-        ts.ends_with('Z') || ts.ends_with("+00:00"),
-        "inbox storage timestamp must be UTC ISO 8601, got {ts:?}"
+    // Now drive per-branch reads through CachedCiProvider sharing the cache.
+    let fallback_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let cached = super::CachedCiProvider {
+        inner: Box::new(CountingProvider {
+            call_count: std::sync::Arc::clone(&fallback_calls),
+            runs: vec![],
+        }),
+        poll_cache: std::sync::Arc::clone(&cache),
+    };
+    let (a, b) = rt.block_on(async {
+        let a = cached.poll_runs("o/r", "feat-a").await.unwrap();
+        let b = cached.poll_runs("o/r", "feat-b").await.unwrap();
+        (a, b)
+    });
+    // ② feat-a served from prefilled cache — its run carries the batch sha.
+    match a {
+        CiPollResult::Runs { runs, .. } => {
+            assert_eq!(runs.len(), 1);
+            assert_eq!(
+                runs[0].head_sha, "aaa",
+                "feat-a cache hit returns batch run"
+            );
+        }
+        _ => panic!("feat-a should be a cached Runs result"),
+    }
+    assert!(matches!(b, CiPollResult::Runs { .. }));
+    // ③ only feat-b (head_sha not in batch) fell back to the inner provider.
+    assert_eq!(
+        fallback_calls.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "only the head_sha-absent watch falls back to per-branch poll"
     );
+}
 
+/// Batch provider that always returns a repo-level ApiError.
+struct BatchErrProvider {
+    reset: Option<u64>,
+}
+
+#[async_trait::async_trait]
+impl CiProvider for BatchErrProvider {
+    async fn poll_runs(&self, _repo: &str, _branch: &str) -> anyhow::Result<CiPollResult> {
+        Ok(CiPollResult::Runs {
+            runs: vec![],
+            rate_limit_remaining: None,
+            rate_limit_limit: None,
+        })
+    }
+    async fn poll_repo_runs(&self, _repo: &str) -> Option<anyhow::Result<RepoPollResult>> {
+        Some(Ok(RepoPollResult::ApiError {
+            status: 403,
+            message: "API rate limit exceeded".into(),
+            rate_limit_reset: self.reset,
+        }))
+    }
+    async fn check_pr_terminal(&self, _repo: &str, _branch: &str) -> PrState {
+        PrState::Open
+    }
+    async fn fetch_failure_summary(&self, _repo: &str, _run_id: u64) -> String {
+        String::new()
+    }
+    fn token_warning(&self) -> Option<&'static str> {
+        None
+    }
+}
+
+#[test]
+fn batch_apierror_backs_off_repo_and_skips_fan_out() {
+    // Pin ④ (integration): a batch ApiError returns false (skip fan-out),
+    // bumps the per-repo stall sidecar, and stamps rate_limit_until on every
+    // watch so subsequent ticks back off silently.
+    let home = p05_temp_home("p1705_apierr");
+    let reset = (chrono::Utc::now().timestamp() as u64) + 3600;
+    // Write a real watch file so the rate_limit_until stamp is observable.
+    let watch_json = serde_json::json!({
+        "repo": "o/r",
+        "branch": "feat-a",
+        "head_sha": "aaa",
+        "subscribers": [{"instance": "lead", "subscribed_at": "2026-01-01T00:00:00Z"}],
+    });
+    let path = p05_write_watch(&home, "o/r", "feat-a", watch_json);
+    let watch: WatchState = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let watches = vec![(
+        path.clone(),
+        super::PollContext {
+            repo: "o/r".to_string(),
+            subscribers: vec!["lead".to_string()],
+            stamped_watch: watch,
+        },
+    )];
+    let provider = BatchErrProvider { reset: Some(reset) };
+    let cache = new_tick_cache();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let proceed = rt.block_on(async {
+        super::batch_prefill_repo(
+            &home,
+            "o/r",
+            &watches,
+            &cache,
+            &provider,
+            &["lead".to_string()],
+            None,
+        )
+        .await
+    });
+    assert!(!proceed, "ApiError must skip the fan-out this tick");
+
+    // rate_limit_until stamped on the watch.
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(after["rate_limit_until"].as_u64(), Some(reset));
+    // per-repo stall counter bumped.
+    let st = p05_read_repo_stall(&home, "o_r");
+    assert_eq!(st["consecutive_skips"].as_u64(), Some(1));
     std::fs::remove_dir_all(&home).ok();
 }
 

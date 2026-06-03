@@ -2,7 +2,9 @@ use crate::agent::{self, AgentRegistry};
 use std::path::Path;
 use std::sync::Arc;
 
-use super::provider::{CiJob, CiPollResult, CiProvider, CiRun, MergeableState, PrState};
+use super::provider::{
+    CiJob, CiPollResult, CiProvider, CiRun, MergeableState, PrState, RepoPollResult,
+};
 
 type PerKeySlot = Arc<tokio::sync::Mutex<Option<CiPollResult>>>;
 type TickCache = Arc<std::sync::Mutex<std::collections::HashMap<(String, String), PerKeySlot>>>;
@@ -50,7 +52,9 @@ impl CiProvider for CachedCiProvider {
     }
 }
 use super::registry::{ci_watches_dir, flush_watch_state, remove_watch};
-use super::sweep::{bump_consecutive_skips_and_maybe_notify, clear_stall_state};
+use super::sweep::{
+    bump_repo_stall_and_maybe_notify, clear_repo_stall_and_maybe_resume, clear_stall_state,
+};
 use super::watch_state::WatchState;
 use super::WATCH_TTL_HOURS;
 
@@ -242,7 +246,7 @@ enum SkipReason {
     Invalid,
     Expired,
     InactivityTtl,
-    RateLimited { reset_epoch: u64 },
+    RateLimited,
     NotDue,
 }
 
@@ -281,7 +285,7 @@ fn prepare_poll_context(
     }
     if let Some(reset_epoch) = watch.rate_limit_until {
         if (now_utc.timestamp() as u64) < reset_epoch {
-            return Err(SkipReason::RateLimited { reset_epoch });
+            return Err(SkipReason::RateLimited);
         }
     }
     let effective_interval = adaptive_interval(
@@ -303,6 +307,99 @@ fn prepare_poll_context(
 }
 
 /// Inner implementation that accepts a provider factory for testability.
+/// #1705 testable seam: one repo-level batch poll → pre-populate the per-tick
+/// cache so the subsequent per-watch `ci_check_repo` calls hit the cache instead
+/// of each issuing a per-branch GitHub request.
+///
+/// - `Runs`: clear the per-repo stall, group rows by head_branch, prefill the
+///   cache slot for every watch whose expected `head_sha` is present in the batch
+///   slice. A watch whose branch/sha is absent (pushed off the per_page=100 page)
+///   is left unprefilled → `CachedCiProvider` miss → automatic per-branch fallback.
+///   Returns `true` (proceed to fan-out).
+/// - `ApiError`: rate-limit is a repo property → bump the per-repo stall ONCE and
+///   back off every watch (`rate_limit_until`). Returns `false` (skip fan-out).
+/// - `None` (provider has no batch support) / `Err` (transient): no prefill,
+///   returns `true` → fan-out falls back to per-branch polling.
+async fn batch_prefill_repo(
+    home: &Path,
+    repo: &str,
+    watches: &[(std::path::PathBuf, PollContext)],
+    tick_cache: &TickCache,
+    provider: &dyn CiProvider,
+    subscribers: &[String],
+    display_timezone: Option<&str>,
+) -> bool {
+    match provider.poll_repo_runs(repo).await {
+        Some(Ok(RepoPollResult::Runs {
+            rows,
+            rate_limit_remaining,
+            rate_limit_limit,
+        })) => {
+            clear_repo_stall_and_maybe_resume(home, repo, subscribers);
+            let mut by_branch: std::collections::HashMap<String, Vec<CiRun>> =
+                std::collections::HashMap::new();
+            for row in rows {
+                by_branch.entry(row.head_branch).or_default().push(row.run);
+            }
+            if let Ok(mut cache) = tick_cache.lock() {
+                for (_, ctx) in watches {
+                    let branch = &ctx.stamped_watch.branch;
+                    let slice = match by_branch.get(branch) {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    if let Some(expected) = &ctx.stamped_watch.head_sha {
+                        if !slice.iter().any(|r| &r.head_sha == expected) {
+                            continue; // expected head_sha not in batch → fallback
+                        }
+                    }
+                    cache.insert(
+                        (repo.to_string(), branch.clone()),
+                        Arc::new(tokio::sync::Mutex::new(Some(CiPollResult::Runs {
+                            runs: slice.clone(),
+                            rate_limit_remaining,
+                            rate_limit_limit,
+                        }))),
+                    );
+                }
+            }
+            true
+        }
+        Some(Ok(RepoPollResult::ApiError {
+            message,
+            rate_limit_reset,
+            ..
+        })) => {
+            bump_repo_stall_and_maybe_notify(
+                home,
+                repo,
+                subscribers,
+                rate_limit_reset,
+                display_timezone,
+            );
+            if let Some(reset) = rate_limit_reset {
+                for (path, ctx) in watches {
+                    let mut w = ctx.stamped_watch.clone();
+                    w.rate_limit_until = Some(reset);
+                    let _ = crate::store::atomic_write(
+                        path,
+                        serde_json::to_string_pretty(&w)
+                            .unwrap_or_default()
+                            .as_bytes(),
+                    );
+                }
+            }
+            tracing::warn!(repo = %repo, message = %message, "CI batch poll API error; repo backing off");
+            false
+        }
+        Some(Err(e)) => {
+            tracing::warn!(repo = %repo, error = %e, "CI batch poll failed; falling back to per-branch");
+            true
+        }
+        None => true, // provider doesn't support batch → per-branch fallback
+    }
+}
+
 pub(super) fn check_ci_watches_with_provider(
     home: &Path,
     registry: &AgentRegistry,
@@ -317,6 +414,13 @@ pub(super) fn check_ci_watches_with_provider(
         crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
             .ok()
             .and_then(|c| c.display_timezone);
+    // #1705 PASS 1: collect poll-eligible watches grouped by repo. TTL-expired →
+    // remove; RateLimited → SILENT skip (the repo-level batch poll owns stall
+    // notification now — a watch's rate_limit_until is set by the batch ApiError
+    // arm below, or by a per-branch fallback ApiError, so it backs off without
+    // emitting a per-watch [ci-watch-stalled]).
+    let mut by_repo: std::collections::HashMap<String, Vec<(std::path::PathBuf, PollContext)>> =
+        std::collections::HashMap::new();
     for entry in entries.flatten() {
         let path = entry.path();
         let watch: WatchState = match std::fs::read_to_string(&path)
@@ -336,39 +440,10 @@ pub(super) fn check_ci_watches_with_provider(
                         .unwrap_or_default()
                         .as_bytes(),
                 );
-                let provider: Box<dyn CiProvider> = match make_provider(&watch) {
-                    Some(p) => Box::new(CachedCiProvider {
-                        inner: p,
-                        poll_cache: Arc::clone(&tick_cache),
-                    }),
-                    None => {
-                        tracing::warn!(repo = %ctx.repo, "ci_check: failed to build CI provider");
-                        continue;
-                    }
-                };
-                let home = home.to_path_buf();
-                let watch_path = path.clone();
-                let registry = Arc::clone(registry);
-                let PollContext {
-                    repo,
-                    subscribers,
-                    stamped_watch,
-                } = ctx;
-                // fire-and-forget: ci_check is one-shot per poll cycle
-                shared_ci_runtime().spawn(async move {
-                    if let Err(e) = ci_check_repo(
-                        &home,
-                        &watch_path,
-                        stamped_watch,
-                        subscribers,
-                        &registry,
-                        provider.as_ref(),
-                    )
-                    .await
-                    {
-                        tracing::warn!(repo = %repo, error = %e, "CI check failed");
-                    }
-                });
+                by_repo
+                    .entry(ctx.repo.clone())
+                    .or_default()
+                    .push((path, ctx));
             }
             Err(SkipReason::Expired) => {
                 let a = watch.subscriber_names().join(",");
@@ -387,19 +462,86 @@ pub(super) fn check_ci_watches_with_provider(
                 );
                 tracing::info!(repo = %watch.repo, branch = %watch.branch, subscribers = %a, hours = WATCH_TTL_HOURS, reason = "inactivity_ttl", "CI watch removed: inactivity TTL");
             }
-            Err(SkipReason::RateLimited { reset_epoch }) => {
-                bump_consecutive_skips_and_maybe_notify(
-                    home,
-                    &path,
-                    &watch.repo,
-                    &watch.branch,
-                    &watch.subscriber_names(),
-                    reset_epoch,
-                    display_timezone.as_deref(),
-                );
-            }
+            // #1705: per-watch rate-limit backoff is now a silent skip.
+            Err(SkipReason::RateLimited) => {}
             Err(SkipReason::NotDue | SkipReason::Invalid) => {}
         }
+    }
+
+    // #1705 PASS 2: ONE batch poll per repo (1 GitHub API call instead of N),
+    // pre-populate the per-tick cache from the batch, then fan out to per-watch
+    // ci_check_repo (each hits the prefilled cache, or misses → per-branch fallback).
+    let make_provider = std::sync::Arc::new(make_provider);
+    for (repo, watches) in by_repo {
+        // Union of subscribers across the repo's watches — recipients of the
+        // single repo-level stalled/resumed health event.
+        let mut subs_union: Vec<String> = Vec::new();
+        for (_, ctx) in &watches {
+            for s in &ctx.subscribers {
+                if !subs_union.contains(s) {
+                    subs_union.push(s.clone());
+                }
+            }
+        }
+        let home_buf = home.to_path_buf();
+        let registry = Arc::clone(registry);
+        let tick_cache = Arc::clone(&tick_cache);
+        let make_provider = Arc::clone(&make_provider);
+        let display_timezone = display_timezone.clone();
+        // fire-and-forget: one batch-poll-then-fan-out task per repo per poll cycle
+        shared_ci_runtime().spawn(async move {
+            // Batch poll once for the whole repo, pre-populating the per-tick cache.
+            // None provider → no prefill (per-branch fallback). Returns false on a
+            // repo-level ApiError (backing off) → skip the fan-out this tick.
+            let proceed = match make_provider(&watches[0].1.stamped_watch) {
+                Some(p) => {
+                    batch_prefill_repo(
+                        &home_buf,
+                        &repo,
+                        &watches,
+                        &tick_cache,
+                        p.as_ref(),
+                        &subs_union,
+                        display_timezone.as_deref(),
+                    )
+                    .await
+                }
+                None => true, // no provider → per-branch fallback in fan-out
+            };
+            if !proceed {
+                return;
+            }
+            // Fan out: per-watch ci_check_repo. Cache hit → no HTTP; miss → per-branch.
+            for (path, ctx) in watches {
+                let provider: Box<dyn CiProvider> = match make_provider(&ctx.stamped_watch) {
+                    Some(p) => Box::new(CachedCiProvider {
+                        inner: p,
+                        poll_cache: Arc::clone(&tick_cache),
+                    }),
+                    None => {
+                        tracing::warn!(repo = %ctx.repo, "ci_check: failed to build CI provider");
+                        continue;
+                    }
+                };
+                let PollContext {
+                    repo: r,
+                    subscribers,
+                    stamped_watch,
+                } = ctx;
+                if let Err(e) = ci_check_repo(
+                    &home_buf,
+                    &path,
+                    stamped_watch,
+                    subscribers,
+                    &registry,
+                    provider.as_ref(),
+                )
+                .await
+                {
+                    tracing::warn!(repo = %r, error = %e, "CI check failed");
+                }
+            }
+        });
     }
 }
 
