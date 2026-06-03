@@ -39,7 +39,7 @@ pub(super) fn handle_crash_respawn(home: &Path, crashed_name: &str, ctx: &Daemon
     // teams-file read) BEFORE taking the registry lock, so no file IO runs under
     // the lock (#1530 class). A self-orchestrator crash has no peer to relay an
     // inbox P0, so it escalates straight to the operator (below).
-    let is_self_orch = is_self_orchestrator(home, crashed_name);
+    let is_self_orch = crate::teams::is_self_orchestrator(home, crashed_name);
 
     let (should_respawn, delay, should_notify, fire_self_orch_p0) = {
         let reg = agent::lock_registry(&ctx.registry);
@@ -107,16 +107,6 @@ pub(super) fn handle_crash_respawn(home: &Path, crashed_name: &str, ctx: &Daemon
     {
         tracing::warn!(agent = %name_for_err, error = %e, "failed to spawn respawn thread");
     }
-}
-
-/// #1701: is `name` the orchestrator of its own team? A self-orchestrator has
-/// no peer to relay an inbox P0, so its crash/hang escalates straight to the
-/// operator. Mirrors the orch==name guard in
-/// `supervisor::{maybe_notify_member_state_change, notify_orchestrator_retry_exhausted}`.
-fn is_self_orchestrator(home: &Path, name: &str) -> bool {
-    crate::teams::find_team_for(home, name)
-        .and_then(|t| t.orchestrator)
-        .is_some_and(|orch| orch == name)
 }
 
 /// #1701: self-orchestrator-crash P0 — distinct from the generic [`notify_crash`]
@@ -279,44 +269,5 @@ fn respawn_agent_worker(
         Err(e) => {
             tracing::warn!(agent = %config.name, error = %e, "respawn failed");
         }
-    }
-}
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod tests {
-    use super::is_self_orchestrator;
-
-    /// #1701 ③: self-orch detection — the gate that routes a crash to the
-    /// self-orch P0 (`fire_self_orch_p0 = is_self_orch && ...`). A regular
-    /// member is NOT its own orchestrator → the `&&` short-circuits → it keeps
-    /// the generic recent>=2 crash notify, never the self-orch P0. An agent that
-    /// IS its team's orchestrator → true. No team / no orchestrator → false.
-    #[test]
-    fn is_self_orchestrator_only_true_for_own_orchestrator_1701() {
-        let home = std::env::temp_dir().join(format!("agend-1701-selforch-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&home);
-        std::fs::create_dir_all(&home).unwrap();
-
-        // team "t": orchestrator=lead, member=dev.
-        crate::teams::create(
-            &home,
-            &serde_json::json!({"name": "t", "members": ["lead", "dev"], "orchestrator": "lead"}),
-        );
-
-        assert!(
-            is_self_orchestrator(&home, "lead"),
-            "the team orchestrator IS its own orchestrator"
-        );
-        assert!(
-            !is_self_orchestrator(&home, "dev"),
-            "a regular member is NOT its own orchestrator → keeps generic crash notify"
-        );
-        assert!(
-            !is_self_orchestrator(&home, "unknown"),
-            "an agent in no team is not a self-orchestrator"
-        );
-
-        let _ = std::fs::remove_dir_all(&home);
     }
 }

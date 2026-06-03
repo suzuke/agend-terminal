@@ -329,6 +329,12 @@ pub struct HealthTracker {
     pub total_crashes: u32,
     max_retries: u32,
     pub last_notification: Option<Instant>,
+    /// #1701: when the agent most recently transitioned INTO `HealthState::Hung`
+    /// (set in `check_hang`'s two Hung-entry branches). Drives the self-orch Hung
+    /// escalation confirm-window. Every Hung entry refreshes it and the
+    /// escalation check gates on `state == Hung`, so a stale value from a prior
+    /// episode is never read — no explicit clear-on-exit needed.
+    hung_since: Option<Instant>,
     error_events: VecDeque<(Instant, AgentState)>,
     pub last_output: Instant,
     pub current_reason: Option<BlockedReason>,
@@ -389,6 +395,7 @@ impl HealthTracker {
             total_crashes: 0,
             max_retries: DEFAULT_MAX_RETRIES,
             last_notification: None,
+            hung_since: None,
             error_events: VecDeque::new(),
             last_output: Instant::now(),
             current_reason: None,
@@ -510,6 +517,32 @@ impl HealthTracker {
     /// established the agent is its own team orchestrator.
     pub fn self_orch_crash_should_notify(&mut self) -> bool {
         if self.should_notify() {
+            self.last_notification = Some(Instant::now());
+            true
+        } else {
+            false
+        }
+    }
+
+    /// #1701 (Hung half): should a self-orchestrator's sustained Hung escalate to
+    /// the operator? True only when the agent is CURRENTLY Hung AND has been so
+    /// for at least `confirm_window` (the FP-filter — the Hung/IdleLong split in
+    /// `check_hang` already excludes the 04:00 idle false-alarm; this window
+    /// additionally rides out the documented transient residual FPs F39/F10/
+    /// keystroke-draining so a real page is not fired on a 1-tick blip) AND the
+    /// per-agent notify cooldown (reused from the crash path) has elapsed. Stamps
+    /// the cooldown on fire so a persisting Hung pages at most once per
+    /// `NOTIFY_COOLDOWN`. Caller must already have established the agent is its
+    /// own team orchestrator. Independent of `hang_auto_recovery_enabled` — a
+    /// leaderless team with no peer to relay must page even in recovery shadow.
+    pub fn hung_escalation_due(&mut self, confirm_window: Duration) -> bool {
+        if self.state != HealthState::Hung {
+            return false;
+        }
+        let sustained = self
+            .hung_since
+            .is_some_and(|t| t.elapsed() >= confirm_window);
+        if sustained && self.should_notify() {
             self.last_notification = Some(Instant::now());
             true
         } else {
@@ -676,6 +709,7 @@ impl HealthTracker {
             // See docs/HUNG-STATE-TRANSITIONS.md §Entry.E1
             if self.state != HealthState::Hung {
                 self.state = HealthState::Hung;
+                self.hung_since = Some(Instant::now()); // #1701: confirm-window anchor
                 return true; // First hang detection — caller escalates
             }
             return false;
@@ -714,6 +748,7 @@ impl HealthTracker {
             // See docs/HUNG-STATE-TRANSITIONS.md §Entry.E2
             if self.state != HealthState::Hung {
                 self.state = HealthState::Hung;
+                self.hung_since = Some(Instant::now()); // #1701: confirm-window anchor
                 return true;
             }
             return false;
@@ -910,6 +945,51 @@ mod tests {
         assert!(
             !notify,
             "#1701: a non-orchestrator's first crash stays silent"
+        );
+    }
+
+    /// #1701 Hung ① + ⑤: a self-orchestrator Hung past the confirm-window
+    /// escalates, and the cooldown blocks an immediate re-page while it persists.
+    #[test]
+    fn hung_escalation_fires_after_window_then_cooldown_blocks_1701() {
+        let window = Duration::from_secs(60);
+        let mut h = HealthTracker::new();
+        h.state = HealthState::Hung;
+        h.hung_since = Some(Instant::now() - Duration::from_secs(61)); // sustained > window
+        assert!(
+            h.hung_escalation_due(window),
+            "#1701: Hung sustained past the confirm-window must escalate"
+        );
+        assert!(
+            !h.hung_escalation_due(window),
+            "#1701: re-page within NOTIFY_COOLDOWN must be suppressed"
+        );
+    }
+
+    /// #1701 Hung ②: a transient Hung (under the confirm-window) does NOT escalate
+    /// — this is the FP filter (F39/F10/keystroke-draining blips).
+    #[test]
+    fn hung_escalation_not_due_within_window_1701() {
+        let mut h = HealthTracker::new();
+        h.state = HealthState::Hung;
+        h.hung_since = Some(Instant::now()); // just entered, 0 elapsed
+        assert!(
+            !h.hung_escalation_due(Duration::from_secs(60)),
+            "#1701: Hung shorter than the confirm-window must NOT escalate"
+        );
+    }
+
+    /// #1701 Hung ③: a non-Hung state (e.g. IdleLong — the 04:00 idle false-alarm
+    /// the Hung/IdleLong split already excludes) never escalates, even if a stale
+    /// `hung_since` lingers.
+    #[test]
+    fn hung_escalation_not_due_when_not_hung_1701() {
+        let mut h = HealthTracker::new();
+        h.state = HealthState::IdleLong;
+        h.hung_since = Some(Instant::now() - Duration::from_secs(300));
+        assert!(
+            !h.hung_escalation_due(Duration::from_secs(60)),
+            "#1701: only HealthState::Hung escalates (IdleLong is the 348-FP case)"
         );
     }
 

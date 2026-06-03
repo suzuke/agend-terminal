@@ -97,6 +97,17 @@ pub fn find_team_for(home: &Path, member: &str) -> Option<Team> {
         .map(|(name, cfg)| project_team(name, cfg))
 }
 
+/// #1701: is `member` the orchestrator of its own team? A self-orchestrator has
+/// no peer to relay an inbox P0, so its crash/hang escalates straight to the
+/// operator (see `daemon::crash_respawn` for crash, `daemon::per_tick::hang_detection`
+/// for hang). Mirrors the `orch == name` guard in
+/// `supervisor::{maybe_notify_member_state_change, notify_orchestrator_retry_exhausted}`.
+pub fn is_self_orchestrator(home: &Path, member: &str) -> bool {
+    find_team_for(home, member)
+        .and_then(|t| t.orchestrator)
+        .is_some_and(|orch| orch == member)
+}
+
 pub fn create(home: &Path, args: &Value) -> Value {
     let name = match args["name"].as_str() {
         Some(n) => n.to_string(),
@@ -508,6 +519,32 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).ok();
         dir
+    }
+
+    /// #1701: self-orch detection — the gate that routes a crash/hang to the
+    /// self-orch P0. The orchestrator IS its own orchestrator → true; a regular
+    /// member → false (keeps the generic path, never the self-orch P0); an agent
+    /// in no team → false.
+    #[test]
+    fn is_self_orchestrator_only_true_for_own_orchestrator_1701() {
+        let home = tmp_home("self-orch");
+        create(
+            &home,
+            &serde_json::json!({"name": "t", "members": ["lead", "dev"], "orchestrator": "lead"}),
+        );
+        assert!(
+            is_self_orchestrator(&home, "lead"),
+            "the team orchestrator IS its own orchestrator"
+        );
+        assert!(
+            !is_self_orchestrator(&home, "dev"),
+            "a regular member is NOT its own orchestrator"
+        );
+        assert!(
+            !is_self_orchestrator(&home, "unknown"),
+            "an agent in no team is not a self-orchestrator"
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
