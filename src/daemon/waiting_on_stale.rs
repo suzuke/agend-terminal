@@ -88,19 +88,15 @@ pub(crate) fn scan_and_emit(
             }
         }
         let elapsed_min = elapsed_secs / 60;
-        // #event-bus pattern #4 (Option A): emit→subscriber when the bus is on,
-        // else the legacy direct deliver. Byte-identical either way (both paths
-        // bottom out in `deliver_stale_alert`).
-        let bus = crate::daemon::event_bus::global();
-        if bus.is_enabled() {
-            bus.emit(crate::daemon::event_bus::EventKind::WaitingOnStale {
+        // #event-bus Step 2 (legacy-zero): the bus is the sole delivery path.
+        crate::daemon::event_bus::global().emit(
+            home,
+            crate::daemon::event_bus::EventKind::WaitingOnStale {
                 agent: agent.to_string(),
                 condition: condition.to_string(),
                 elapsed_min,
-            });
-        } else {
-            deliver_stale_alert(home, agent, condition, elapsed_min);
-        }
+            },
+        );
         last_alerted.insert(agent.to_string(), now);
     }
 }
@@ -136,22 +132,22 @@ fn deliver_stale_alert(home: &Path, agent: &str, condition: &str, elapsed_min: i
 }
 
 /// #event-bus pattern #4: subscriber — rebuild the alert from the event.
-fn handle_event(home: &Path, event: &crate::daemon::event_bus::Event) {
+fn handle_event(event: &crate::daemon::event_bus::Event) {
     if let crate::daemon::event_bus::EventKind::WaitingOnStale {
         agent,
         condition,
         elapsed_min,
     } = &event.kind
     {
-        deliver_stale_alert(home, agent, condition, *elapsed_min);
+        deliver_stale_alert(&event.home, agent, condition, *elapsed_min);
     }
 }
 
-/// #event-bus pattern #4: register the delivery subscriber at daemon startup
-/// (dormant unless `AGEND_EVENT_BUS=1`). Wired beside anti_stall /
-/// decision_timeout / dispatch_idle in `daemon::mod`.
-pub fn register_subscriber(home: std::path::PathBuf) {
-    crate::daemon::event_bus::global().subscribe(move |e| handle_event(&home, e));
+/// #event-bus pattern #4: register the delivery subscriber at daemon startup.
+/// Home-agnostic — the home travels on each event. Wired beside the other
+/// patterns in `daemon::mod`.
+pub fn register_subscriber() {
+    crate::daemon::event_bus::global().subscribe(handle_event);
 }
 
 fn emit_to(home: &Path, recipient: &str, kind: &str, text: &str, correlation_agent: Option<&str>) {
@@ -302,14 +298,16 @@ mod tests {
         // Bus emit→subscriber (the gate-ON path) — real fan-out via a test bus.
         let home_bus = tmp_home("parity-bus");
         std::fs::create_dir_all(home_bus.join("inbox")).unwrap();
-        let bus = crate::daemon::event_bus::EventBus::new_enabled_for_test();
-        let h = home_bus.clone();
-        bus.subscribe(move |e| handle_event(&h, e));
-        bus.emit(crate::daemon::event_bus::EventKind::WaitingOnStale {
-            agent: agent.to_string(),
-            condition: condition.to_string(),
-            elapsed_min,
-        });
+        let bus = crate::daemon::event_bus::EventBus::new();
+        bus.subscribe(handle_event);
+        bus.emit(
+            &home_bus,
+            crate::daemon::event_bus::EventKind::WaitingOnStale {
+                agent: agent.to_string(),
+                condition: condition.to_string(),
+                elapsed_min,
+            },
+        );
 
         let legacy = drained_payloads(&home_legacy, agent);
         let viabus = drained_payloads(&home_bus, agent);
@@ -322,15 +320,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home_bus);
     }
 
-    /// #event-bus pattern #4 REGRESSION (gate-OFF): with the global bus disabled
-    /// (default test env), the scan still delivers via the legacy path.
+    /// #event-bus Step 2 (legacy-zero): the scan emits to the global bus; the
+    /// registered subscriber delivers to the agent + orchestrator at the event's
+    /// home (this test's home).
     #[test]
-    fn gate_off_scan_delivers_via_legacy() {
-        assert!(
-            !crate::daemon::event_bus::global().is_enabled(),
-            "precondition: the global bus must be gate-off in the test env"
-        );
-        let home = tmp_home("gate-off");
+    fn scan_delivers_via_bus() {
+        let home = tmp_home("via-bus");
         std::fs::create_dir_all(home.join("inbox")).unwrap();
         let since = (chrono::Utc::now() - chrono::Duration::minutes(20)).to_rfc3339();
         write_metadata(&home, "dev-gateoff", "blocker", &since);

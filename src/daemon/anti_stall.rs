@@ -221,7 +221,7 @@ fn deliver_stall(
 /// #event-bus first-pattern: bus subscriber — on a `TaskStateChanged` event,
 /// run the stall delivery (the gate-ON path). Registered once at daemon startup
 /// via [`register_subscriber`].
-fn handle_event(home: &Path, event: &crate::daemon::event_bus::Event) {
+fn handle_event(event: &crate::daemon::event_bus::Event) {
     if let crate::daemon::event_bus::EventKind::TaskStateChanged {
         task_id,
         title,
@@ -232,7 +232,7 @@ fn handle_event(home: &Path, event: &crate::daemon::event_bus::Event) {
     } = &event.kind
     {
         deliver_stall(
-            home,
+            &event.home,
             task_id,
             title,
             reason,
@@ -243,40 +243,25 @@ fn handle_event(home: &Path, event: &crate::daemon::event_bus::Event) {
     }
 }
 
-/// #event-bus first-pattern: register the anti_stall delivery subscriber on the
-/// global bus. Call ONCE at daemon startup. Safe regardless of the gate — when
-/// the bus is gate-off, `emit` never fires, so the subscriber is dormant.
-pub fn register_subscriber(home: std::path::PathBuf) {
-    crate::daemon::event_bus::global().subscribe(move |e| handle_event(&home, e));
+/// #event-bus: register the anti_stall delivery subscriber on the global bus.
+/// Call ONCE at daemon startup. Home-agnostic — the home travels on each event.
+pub fn register_subscriber() {
+    crate::daemon::event_bus::global().subscribe(handle_event);
 }
 
 fn emit_stall(home: &Path, task: &Task, reason: &str) {
-    // #event-bus first-pattern (Option A): gate-ON → emit (the subscriber
-    // delivers); gate-OFF (prod default) → the legacy direct delivery. No
-    // double-delivery, no gate-off regression. The legacy `else` branch is
-    // retired only at the final cutover (all patterns migrated + gate default
-    // flipped). Parity of the two paths is proven by the gate-on test.
-    let bus = crate::daemon::event_bus::global();
-    if bus.is_enabled() {
-        bus.emit(crate::daemon::event_bus::EventKind::TaskStateChanged {
+    // #event-bus Step 2 (legacy-zero): the bus is the sole delivery path.
+    crate::daemon::event_bus::global().emit(
+        home,
+        crate::daemon::event_bus::EventKind::TaskStateChanged {
             task_id: task.id.clone(),
             title: task.title.clone(),
             assignee: task.assignee.clone(),
             reason: reason.to_string(),
             started_at: task.started_at.clone(),
             eta_secs: task.eta_secs,
-        });
-    } else {
-        deliver_stall(
-            home,
-            &task.id,
-            &task.title,
-            reason,
-            task.started_at.as_deref(),
-            task.eta_secs,
-            task.assignee.as_deref(),
-        );
-    }
+        },
+    );
 }
 
 #[cfg(test)]
@@ -717,19 +702,22 @@ mod tests {
             task.assignee.as_deref(),
         );
 
-        // Bus emit→subscriber delivery (the gate-ON path) — real fan-out.
+        // Bus emit→subscriber delivery — real fan-out on a LOCAL bus (the home
+        // travels on the event, so the subscriber delivers to home_bus).
         let home_bus = tmp_home("parity-bus");
-        let bus = crate::daemon::event_bus::EventBus::new_enabled_for_test();
-        let h = home_bus.clone();
-        bus.subscribe(move |e| handle_event(&h, e));
-        bus.emit(crate::daemon::event_bus::EventKind::TaskStateChanged {
-            task_id: task.id.clone(),
-            title: task.title.clone(),
-            assignee: task.assignee.clone(),
-            reason: reason.to_string(),
-            started_at: task.started_at.clone(),
-            eta_secs: task.eta_secs,
-        });
+        let bus = crate::daemon::event_bus::EventBus::new();
+        bus.subscribe(handle_event);
+        bus.emit(
+            &home_bus,
+            crate::daemon::event_bus::EventKind::TaskStateChanged {
+                task_id: task.id.clone(),
+                title: task.title.clone(),
+                assignee: task.assignee.clone(),
+                reason: reason.to_string(),
+                started_at: task.started_at.clone(),
+                eta_secs: task.eta_secs,
+            },
+        );
 
         let mut delivered = false;
         for r in stall_recipients() {
@@ -747,35 +735,5 @@ mod tests {
         );
         std::fs::remove_dir_all(&home_legacy).ok();
         std::fs::remove_dir_all(&home_bus).ok();
-    }
-
-    /// Option A: with the gate OFF (prod default — the global bus reads
-    /// `AGEND_EVENT_BUS`, unset in tests), `emit_stall` must STILL deliver via the
-    /// legacy path. No regression.
-    #[test]
-    fn gate_off_emit_stall_delivers_via_legacy() {
-        let _g = env_lock();
-        std::env::remove_var("AGEND_TASK_STALL_RECIPIENTS");
-        assert!(
-            !crate::daemon::event_bus::global().is_enabled(),
-            "precondition: the global bus must be gate-off in the test env"
-        );
-        let home = tmp_home("gate-off");
-        let task = make_task(
-            "t-gateoff",
-            "in_progress",
-            Some(60),
-            Some("2026-01-01T00:00:00+00:00"),
-        );
-        emit_stall(&home, &task, "stalled reason");
-        let mut delivered = false;
-        for r in stall_recipients() {
-            delivered |= !drained_payloads(&home, &r).is_empty();
-        }
-        assert!(
-            delivered,
-            "#event-bus Option A: gate-off must deliver via the legacy path (no regression)"
-        );
-        std::fs::remove_dir_all(&home).ok();
     }
 }

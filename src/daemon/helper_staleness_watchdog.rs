@@ -104,17 +104,13 @@ pub(crate) fn scan_and_emit(
                 continue;
             }
         }
-        // #event-bus pattern #5 (Option A): emit→subscriber when the bus is on,
-        // else the legacy direct deliver. Byte-identical either way (both paths
-        // bottom out in `deliver_helper_staleness`).
-        let bus = crate::daemon::event_bus::global();
-        if bus.is_enabled() {
-            bus.emit(crate::daemon::event_bus::EventKind::HelperStale {
+        // #event-bus Step 2 (legacy-zero): the bus is the sole delivery path.
+        crate::daemon::event_bus::global().emit(
+            home,
+            crate::daemon::event_bus::EventKind::HelperStale {
                 helper_name: (*name).to_string(),
-            });
-        } else {
-            deliver_helper_staleness(home, name);
-        }
+            },
+        );
         last_alerted.insert((*name).to_string(), now);
     }
 }
@@ -165,17 +161,17 @@ fn deliver_helper_staleness(home: &Path, helper_name: &str) {
 }
 
 /// #event-bus pattern #5: subscriber — rebuild the alert from the event.
-fn handle_event(home: &Path, event: &crate::daemon::event_bus::Event) {
+fn handle_event(event: &crate::daemon::event_bus::Event) {
     if let crate::daemon::event_bus::EventKind::HelperStale { helper_name } = &event.kind {
-        deliver_helper_staleness(home, helper_name);
+        deliver_helper_staleness(&event.home, helper_name);
     }
 }
 
-/// #event-bus pattern #5: register the delivery subscriber at daemon startup
-/// (dormant unless `AGEND_EVENT_BUS=1`). Wired beside the other patterns in
-/// `daemon::mod`.
-pub fn register_subscriber(home: std::path::PathBuf) {
-    crate::daemon::event_bus::global().subscribe(move |e| handle_event(&home, e));
+/// #event-bus pattern #5: register the delivery subscriber at daemon startup.
+/// Home-agnostic — the home travels on each event. Wired beside the other
+/// patterns in `daemon::mod`.
+pub fn register_subscriber() {
+    crate::daemon::event_bus::global().subscribe(handle_event);
 }
 
 #[cfg(test)]
@@ -367,12 +363,14 @@ mod tests {
         // Bus emit→subscriber (the gate-ON path) — real fan-out via a test bus.
         let home_bus = tmp_home("parity-bus");
         std::fs::create_dir_all(home_bus.join("inbox")).unwrap();
-        let bus = crate::daemon::event_bus::EventBus::new_enabled_for_test();
-        let h = home_bus.clone();
-        bus.subscribe(move |e| handle_event(&h, e));
-        bus.emit(crate::daemon::event_bus::EventKind::HelperStale {
-            helper_name: helper.to_string(),
-        });
+        let bus = crate::daemon::event_bus::EventBus::new();
+        bus.subscribe(handle_event);
+        bus.emit(
+            &home_bus,
+            crate::daemon::event_bus::EventKind::HelperStale {
+                helper_name: helper.to_string(),
+            },
+        );
 
         for recipient in RECIPIENTS {
             let legacy = drained_payloads(&home_legacy, recipient);
@@ -387,15 +385,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home_bus);
     }
 
-    /// #event-bus pattern #5 REGRESSION (gate-OFF): with the global bus disabled
-    /// (default test env), the scan still delivers to both recipients via legacy.
+    /// #event-bus Step 2 (legacy-zero): the scan emits to the global bus; the
+    /// registered subscriber delivers to both recipients (the home travels on the
+    /// event → this test's home).
     #[test]
-    fn gate_off_scan_delivers_via_legacy() {
-        assert!(
-            !crate::daemon::event_bus::global().is_enabled(),
-            "precondition: the global bus must be gate-off in the test env"
-        );
-        let home = tmp_home("gate-off");
+    fn scan_delivers_via_bus() {
+        let home = tmp_home("via-bus");
         let daemon = stage_stale_state(&home, "agend-git");
         let mut last_alerted: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
         scan_and_emit(&home, Some(&daemon), &mut last_alerted);

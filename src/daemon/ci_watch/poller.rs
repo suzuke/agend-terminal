@@ -1358,14 +1358,9 @@ async fn fan_out_notifications(
                 crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(ctx.home)).ok();
             // #event-bus (ci_watch, Option A): ONE skip-aware loop over subscribers.
             // The skips (action_target_on_success + #931 zombie-subscriber) are
-            // applied ONCE so gate-ON and gate-OFF notify the IDENTICAL recipient
-            // set. Per recipient: gate-ON + success/failure → emit Ci{Ready,Fail}
-            // (the subscriber delivers via the shared `deliver_ci_watch`);
-            // everything else (gate-OFF, OR a non-pair "[ci-ended]" conclusion that
-            // has no event kind) → the legacy direct deliver. No double-delivery, no
-            // gate-off regression, no dropped notify. (Replaces the prior dormant
-            // second emit loop, which lacked these skips — a latent parity bug.)
-            let bus = crate::daemon::event_bus::global();
+            // applied ONCE. Per recipient: success/failure → emit Ci{Ready,Fail}
+            // (the subscriber delivers via the shared `deliver_ci_watch`); a
+            // non-pair "[ci-ended]" conclusion has no event kind → direct deliver.
             for sub in ctx.subscribers {
                 if action_target_on_success == Some(sub.as_str()) {
                     continue;
@@ -1386,36 +1381,35 @@ async fn fan_out_notifications(
                     );
                     continue;
                 }
-                let emitted = if bus.is_enabled() {
-                    match conclusion {
-                        Some("failure") => {
-                            bus.emit(crate::daemon::event_bus::EventKind::CiFail {
-                                repo: ctx.repo.to_string(),
-                                branch: ctx.branch.to_string(),
+                // #event-bus Step 2 (legacy-zero): the success/failure pair emits
+                // (the subscriber delivers via deliver_ci_watch). A non-pair
+                // "[ci-ended]" conclusion has no event kind → direct deliver.
+                let emitted = match conclusion {
+                    Some("failure") => {
+                        crate::daemon::event_bus::global().emit(
+                            ctx.home,
+                            crate::daemon::event_bus::EventKind::CiFail {
                                 target: sub.clone(),
                                 body: body.clone(),
                                 correlation_id: repo_branch_key.clone(),
                                 supersede_token: supersede_token.clone(),
-                            });
-                            true
-                        }
-                        Some("success") => {
-                            bus.emit(crate::daemon::event_bus::EventKind::CiReady {
-                                repo: ctx.repo.to_string(),
-                                branch: ctx.branch.to_string(),
-                                target: sub.clone(),
-                                body: body.clone(),
-                                correlation_id: repo_branch_key.clone(),
-                                supersede_token: supersede_token.clone(),
-                            });
-                            true
-                        }
-                        // non-pair conclusion ("[ci-ended]" etc.): no CiReady/CiFail
-                        // kind → fall through to the legacy direct deliver below.
-                        _ => false,
+                            },
+                        );
+                        true
                     }
-                } else {
-                    false
+                    Some("success") => {
+                        crate::daemon::event_bus::global().emit(
+                            ctx.home,
+                            crate::daemon::event_bus::EventKind::CiReady {
+                                target: sub.clone(),
+                                body: body.clone(),
+                                correlation_id: repo_branch_key.clone(),
+                                supersede_token: supersede_token.clone(),
+                            },
+                        );
+                        true
+                    }
+                    _ => false,
                 };
                 if !emitted {
                     deliver_ci_watch(ctx.home, sub, &body, &repo_branch_key, &supersede_token);
@@ -1465,7 +1459,7 @@ fn deliver_ci_watch(
 /// #event-bus (ci_watch) subscriber: re-deliver a `CiReady`/`CiFail` event via the
 /// shared `deliver_ci_watch`. Both kinds deliver identically (the body already
 /// encodes pass/fail); the kind split is purely semantic.
-fn handle_event(home: &std::path::Path, event: &crate::daemon::event_bus::Event) {
+fn handle_event(event: &crate::daemon::event_bus::Event) {
     match &event.kind {
         crate::daemon::event_bus::EventKind::CiReady {
             target,
@@ -1481,16 +1475,16 @@ fn handle_event(home: &std::path::Path, event: &crate::daemon::event_bus::Event)
             supersede_token,
             ..
         } => {
-            deliver_ci_watch(home, target, body, correlation_id, supersede_token);
+            deliver_ci_watch(&event.home, target, body, correlation_id, supersede_token);
         }
         _ => {}
     }
 }
 
-/// Register the ci-watch subscriber once at daemon startup (`run_core`). Dormant
-/// unless `AGEND_EVENT_BUS=1` (emit is a no-op when gate-off).
-pub(crate) fn register_subscriber(home: std::path::PathBuf) {
-    crate::daemon::event_bus::global().subscribe(move |e| handle_event(&home, e));
+/// Register the ci-watch subscriber once at daemon startup (`run_core`).
+/// Home-agnostic — the home travels on each event.
+pub(crate) fn register_subscriber() {
+    crate::daemon::event_bus::global().subscribe(handle_event);
 }
 
 fn persist_watch_state(

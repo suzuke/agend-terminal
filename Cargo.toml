@@ -157,6 +157,11 @@ junction = "1"
 embed-resource = "3"
 
 [dev-dependencies]
+# #event-bus Step 2 (legacy-zero): a `#[ctor] #[cfg(test)]` fn registers the bus
+# subscribers ONCE at test-binary load — before any test — so the integration
+# tests (which `emit` to the now-sole-delivery global bus) deliver order-
+# independently. Test-only; does NOT ship in the prod binary.
+ctor = "0.2"
 # CLI binary smoke testing (Sprint 42 Phase 1)
 assert_cmd = "2.0"
 predicates = "3.1"

@@ -702,7 +702,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
             recv(tick_rx_ref) -> _ => {
                 // Periodic maintenance — mirrors daemon tick consumers.
                 // Gated to owned mode via tick_rx (None in attached mode).
-                crate::daemon::cron_tick::check_schedules(&home, &registry);
+                crate::daemon::cron_tick::check_schedules(&home);
                 crate::daemon::ci_watch::check_ci_watches(&home, &registry);
                 {
                     let reg = crate::agent::lock_registry(&registry);
@@ -1527,8 +1527,6 @@ mod tests {
         // Write a one-shot schedule with past run_at directly to disk,
         // call check_schedules, verify it fires (auto-disabled).
         let home = tmp_home("sched-fire");
-        let registry: crate::agent::AgentRegistry =
-            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
         let past = (chrono::Utc::now() - chrono::Duration::seconds(2)).to_rfc3339();
         let store_json = serde_json::json!({
             "schema_version": 2,
@@ -1553,7 +1551,7 @@ mod tests {
         .expect("write schedule file");
 
         // Fire the tick — schedule is past due, should trigger.
-        crate::daemon::cron_tick::check_schedules(&home, &registry);
+        crate::daemon::cron_tick::check_schedules(&home);
 
         // Verify: schedule should now be disabled (one-shot auto-disable).
         let store = crate::schedules::load(&home);

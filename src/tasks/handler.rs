@@ -954,16 +954,15 @@ fn cascade_cancel_children(
 /// the legacy direct `deliver_cascade_cancel`. No double-delivery, no gate-off
 /// regression.
 fn route_cascade_cancel(home: &Path, owner: &str, parent_id: &str, child_id: &str) {
-    let bus = crate::daemon::event_bus::global();
-    if bus.is_enabled() {
-        bus.emit(crate::daemon::event_bus::EventKind::CascadeCancelNotify {
+    // #event-bus Step 2 (legacy-zero): the bus is the sole delivery path.
+    crate::daemon::event_bus::global().emit(
+        home,
+        crate::daemon::event_bus::EventKind::CascadeCancelNotify {
             owner: owner.to_string(),
             parent_id: parent_id.to_string(),
             child_id: child_id.to_string(),
-        });
-    } else {
-        deliver_cascade_cancel(home, owner, parent_id, child_id);
-    }
+        },
+    );
 }
 
 /// Shared deliver: enqueue the parent-cancelled notify to the child's owner.
@@ -987,21 +986,21 @@ fn deliver_cascade_cancel(home: &Path, owner: &str, parent_id: &str, child_id: &
 
 /// #event-bus pattern #7 subscriber: re-deliver a `CascadeCancelNotify` event
 /// via the shared `deliver_cascade_cancel`.
-fn handle_event(home: &Path, event: &crate::daemon::event_bus::Event) {
+fn handle_event(event: &crate::daemon::event_bus::Event) {
     if let crate::daemon::event_bus::EventKind::CascadeCancelNotify {
         owner,
         parent_id,
         child_id,
     } = &event.kind
     {
-        deliver_cascade_cancel(home, owner, parent_id, child_id);
+        deliver_cascade_cancel(&event.home, owner, parent_id, child_id);
     }
 }
 
 /// Register the cascade-cancel subscriber once at daemon startup (`run_core`).
-/// Dormant unless `AGEND_EVENT_BUS=1` (emit is a no-op when gate-off).
-pub fn register_subscriber(home: std::path::PathBuf) {
-    crate::daemon::event_bus::global().subscribe(move |e| handle_event(&home, e));
+/// Home-agnostic — the home travels on each event.
+pub fn register_subscriber() {
+    crate::daemon::event_bus::global().subscribe(handle_event);
 }
 
 #[cfg(test)]
@@ -1428,14 +1427,16 @@ mod tests {
         deliver_cascade_cancel(&home_legacy, owner, parent_id, child_id);
 
         let home_bus = tmp_home("p7-parity-bus");
-        let bus = crate::daemon::event_bus::EventBus::new_enabled_for_test();
-        let h = home_bus.clone();
-        bus.subscribe(move |e| handle_event(&h, e));
-        bus.emit(crate::daemon::event_bus::EventKind::CascadeCancelNotify {
-            owner: owner.to_string(),
-            parent_id: parent_id.to_string(),
-            child_id: child_id.to_string(),
-        });
+        let bus = crate::daemon::event_bus::EventBus::new();
+        bus.subscribe(handle_event);
+        bus.emit(
+            &home_bus,
+            crate::daemon::event_bus::EventKind::CascadeCancelNotify {
+                owner: owner.to_string(),
+                parent_id: parent_id.to_string(),
+                child_id: child_id.to_string(),
+            },
+        );
 
         let legacy = cascade_payloads(&home_legacy, owner);
         let via_bus = cascade_payloads(&home_bus, owner);
@@ -1449,15 +1450,12 @@ mod tests {
         std::fs::remove_dir_all(&home_bus).ok();
     }
 
-    // gate-OFF (default): route_cascade_cancel falls through to the legacy
-    // deliver, so the notify still lands without the bus.
+    // #event-bus Step 2 (legacy-zero): route_cascade_cancel emits to the global
+    // bus; the registered subscriber delivers via deliver_cascade_cancel to the
+    // event's home (this test's home).
     #[test]
-    fn cascade_gate_off_route_delivers_via_legacy() {
-        assert!(
-            !crate::daemon::event_bus::global().is_enabled(),
-            "test must run with AGEND_EVENT_BUS gate off"
-        );
-        let home = tmp_home("p7-gate-off");
+    fn route_cascade_cancel_delivers_via_bus() {
+        let home = tmp_home("p7-via-bus");
         route_cascade_cancel(&home, "fixup-dev", "t-parent-2", "t-child-2");
         let alerts = cascade_payloads(&home, "fixup-dev");
         assert_eq!(alerts.len(), 1, "gate-off must deliver via legacy path");

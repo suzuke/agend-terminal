@@ -11,7 +11,7 @@ use std::path::Path;
 ///   the window; after firing (or being detected as missed because the
 ///   daemon was down through `at`), the schedule is auto-disabled so it
 ///   never triggers again.
-pub fn check_schedules(home: &Path, registry: &AgentRegistry) {
+pub fn check_schedules(home: &Path) {
     use cron::Schedule;
     use std::str::FromStr;
 
@@ -117,15 +117,13 @@ pub fn check_schedules(home: &Path, registry: &AgentRegistry) {
             }
         }
 
-        // #event-bus pattern (cron_tick), Option A: when the bus is enabled,
-        // emit a `CronFire` and let the subscriber run the effect; otherwise run
-        // it inline (legacy). Both bottom out in `deliver_cron_fire`, so the
-        // fire effect is byte-identical regardless of the gate. The schedule
-        // message/label are STATIC (non-time-sensitive), so they are carried
-        // verbatim and need no frozen-text handling.
-        let bus = crate::daemon::event_bus::global();
-        if bus.is_enabled() {
-            bus.emit(crate::daemon::event_bus::EventKind::CronFire {
+        // #event-bus pattern (cron_tick), Step 2: emit a `CronFire`; the subscriber
+        // runs the effect via `deliver_cron_fire`. The schedule message/label are
+        // STATIC (non-time-sensitive), carried verbatim. (The subscriber resolves
+        // the live registry it was registered with — see `register_subscriber`.)
+        crate::daemon::event_bus::global().emit(
+            home,
+            crate::daemon::event_bus::EventKind::CronFire {
                 sched_id: sched.id.clone(),
                 target: sched.target.clone(),
                 message: sched.message.clone(),
@@ -135,18 +133,8 @@ pub fn check_schedules(home: &Path, registry: &AgentRegistry) {
                     .unwrap_or_else(|| "(unnamed)".to_string()),
                 one_shot: fire.one_shot,
                 missed: fire.missed,
-            });
-        } else {
-            deliver_cron_fire(
-                home,
-                registry,
-                sched.id.as_str(),
-                sched.target.as_str(),
-                sched.message.as_str(),
-                sched.label.as_deref().unwrap_or("(unnamed)"),
-                &fire,
-            );
-        }
+            },
+        );
         any_triggered = true;
     }
 
@@ -252,7 +240,7 @@ fn deliver_cron_fire(
 }
 
 /// #event-bus pattern (cron_tick): subscriber — re-run the fire effect.
-fn handle_event(home: &Path, registry: &AgentRegistry, event: &crate::daemon::event_bus::Event) {
+fn handle_event(registry: &AgentRegistry, event: &crate::daemon::event_bus::Event) {
     if let crate::daemon::event_bus::EventKind::CronFire {
         sched_id,
         target,
@@ -263,7 +251,7 @@ fn handle_event(home: &Path, registry: &AgentRegistry, event: &crate::daemon::ev
     } = &event.kind
     {
         deliver_cron_fire(
-            home,
+            &event.home,
             registry,
             sched_id,
             target,
@@ -278,11 +266,11 @@ fn handle_event(home: &Path, registry: &AgentRegistry, event: &crate::daemon::ev
 }
 
 /// #event-bus pattern (cron_tick): register the delivery subscriber at daemon
-/// startup (dormant unless `AGEND_EVENT_BUS=1`). Captures the registry Arc so
-/// the subscriber can resolve + inject to the live fleet, mirroring the
-/// producer's `check_schedules(home, registry)` access.
-pub fn register_subscriber(home: std::path::PathBuf, registry: AgentRegistry) {
-    crate::daemon::event_bus::global().subscribe(move |e| handle_event(&home, &registry, e));
+/// startup. Captures the registry Arc so the subscriber can resolve + inject to
+/// the live fleet; the home travels on each event (so one registration serves any
+/// home — prod's daemon home, and each integration test's tmp home).
+pub fn register_subscriber(registry: AgentRegistry) {
+    crate::daemon::event_bus::global().subscribe(move |e| handle_event(&registry, e));
 }
 
 /// Outcome of deciding that a schedule is due. `one_shot` means "auto-
@@ -619,7 +607,7 @@ mod tests {
         let home = cron_tmp_home("ghost");
         // No fleet.yaml → "ghost" is not a known instance.
         seed_oneshot(&home, "ghost");
-        check_schedules(&home, &empty_registry());
+        check_schedules(&home);
         assert_eq!(
             last_status(&home),
             "skipped_unknown_target",
@@ -642,7 +630,7 @@ mod tests {
         )
         .unwrap();
         seed_oneshot(&home, "offline");
-        check_schedules(&home, &empty_registry());
+        check_schedules(&home);
         assert_eq!(
             last_status(&home),
             "ok_inbox",
@@ -757,7 +745,7 @@ mod tests {
         let home = cron_tmp_home("us-done");
         seed_until_success_cron(&home, "t-done", None);
         seed_task(&home, "t-done", "done");
-        check_schedules(&home, &empty_registry());
+        check_schedules(&home);
         let s = sched0(&home);
         assert!(s.run_history.is_empty(), "done task → no fire");
         assert_eq!(
@@ -773,7 +761,7 @@ mod tests {
         let home = cron_tmp_home("us-pending");
         seed_until_success_cron(&home, "t-open", None);
         seed_task(&home, "t-open", "in_progress");
-        check_schedules(&home, &empty_registry());
+        check_schedules(&home);
         assert_eq!(
             last_status(&home),
             "ok_inbox",
@@ -786,7 +774,7 @@ mod tests {
     fn until_success_missing_task_disables_schedule() {
         let home = cron_tmp_home("us-missing");
         seed_until_success_cron(&home, "t-gone", None); // no task file seeded
-        check_schedules(&home, &empty_registry());
+        check_schedules(&home);
         let s = sched0(&home);
         assert_eq!(last_status(&home), "target_task_missing");
         assert!(!s.enabled, "missing linked task must disable the schedule");
@@ -799,7 +787,7 @@ mod tests {
         // last_success_date == today + NO task file: must still suppress (the
         // same-day short-circuit fires before any task read).
         seed_until_success_cron(&home, "t-x", Some(&today_utc()));
-        check_schedules(&home, &empty_registry());
+        check_schedules(&home);
         assert!(
             sched0(&home).run_history.is_empty(),
             "already-succeeded-today → suppress"
@@ -817,7 +805,7 @@ mod tests {
         // Succeeded yesterday; today the task is reopened (in_progress) → fire.
         seed_until_success_cron(&home, "t-reopen", Some("2020-01-01"));
         seed_task(&home, "t-reopen", "in_progress");
-        check_schedules(&home, &empty_registry());
+        check_schedules(&home);
         assert_eq!(
             last_status(&home),
             "ok_inbox",
@@ -903,18 +891,20 @@ mod tests {
         // Bus emit→subscriber (gate-ON path) via a local enabled test bus.
         let home_bus = cron_tmp_home("parity-bus");
         std::fs::write(crate::fleet::fleet_yaml_path(&home_bus), PARITY_FLEET).unwrap();
-        let bus = crate::daemon::event_bus::EventBus::new_enabled_for_test();
+        let bus = crate::daemon::event_bus::EventBus::new();
         let reg = empty_registry();
-        let h = home_bus.clone();
-        bus.subscribe(move |e| handle_event(&h, &reg, e));
-        bus.emit(crate::daemon::event_bus::EventKind::CronFire {
-            sched_id: sid.to_string(),
-            target: target.to_string(),
-            message: message.to_string(),
-            label: label.to_string(),
-            one_shot: false,
-            missed: false,
-        });
+        bus.subscribe(move |e| handle_event(&reg, e));
+        bus.emit(
+            &home_bus,
+            crate::daemon::event_bus::EventKind::CronFire {
+                sched_id: sid.to_string(),
+                target: target.to_string(),
+                message: message.to_string(),
+                label: label.to_string(),
+                one_shot: false,
+                missed: false,
+            },
+        );
 
         let legacy: Vec<String> = crate::inbox::drain(&home_legacy, target)
             .into_iter()
@@ -938,18 +928,15 @@ mod tests {
         std::fs::remove_dir_all(home_bus).ok();
     }
 
-    /// REGRESSION (gate-OFF): with the global bus disabled (default test env),
-    /// `check_schedules` still fires via the legacy `deliver_cron_fire` path.
+    /// #event-bus Step 2 (legacy-zero): `check_schedules` emits to the global bus;
+    /// the registered subscriber delivers via `deliver_cron_fire` to the event's
+    /// home (this test's home → inbox fallback for the offline target).
     #[test]
-    fn gate_off_check_schedules_delivers_via_legacy() {
-        assert!(
-            !crate::daemon::event_bus::global().is_enabled(),
-            "precondition: the global bus must be gate-off in the test env"
-        );
-        let home = cron_tmp_home("gate-off");
+    fn check_schedules_delivers_via_bus() {
+        let home = cron_tmp_home("via-bus");
         std::fs::write(crate::fleet::fleet_yaml_path(&home), PARITY_FLEET).unwrap();
         seed_oneshot(&home, "offline");
-        check_schedules(&home, &empty_registry());
+        check_schedules(&home);
         assert_eq!(
             last_status(&home),
             "ok_inbox",

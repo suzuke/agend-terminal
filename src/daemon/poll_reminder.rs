@@ -79,21 +79,18 @@ pub fn collect_poll_reminders(home: &Path, registry: &AgentRegistry) -> Vec<(Str
 /// Run one poll-reminder pass. Called from daemon tick every N ticks.
 /// Collects reminders via [`collect_poll_reminders`] then delivers each.
 ///
-/// #event-bus pattern #8 (Option A): when the bus is enabled, emit a
-/// `PollReminder` per nudge and let the subscriber deliver; otherwise deliver
-/// directly via the legacy path. Both bottom out in [`deliver_poll_reminder`],
-/// so delivery is byte-identical regardless of the gate.
+/// #event-bus pattern #8, Step 2 (legacy-zero): emit a `PollReminder` per nudge;
+/// the subscriber delivers via [`deliver_poll_reminder`]. The bus is the sole
+/// delivery path.
 pub fn poll_reminder_pass(home: &Path, registry: &AgentRegistry) {
-    let bus = crate::daemon::event_bus::global();
     for (name, reminder) in collect_poll_reminders(home, registry) {
-        if bus.is_enabled() {
-            bus.emit(crate::daemon::event_bus::EventKind::PollReminder {
+        crate::daemon::event_bus::global().emit(
+            home,
+            crate::daemon::event_bus::EventKind::PollReminder {
                 agent: name,
                 reminder,
-            });
-        } else {
-            deliver_poll_reminder(home, &name, &reminder);
-        }
+            },
+        );
     }
 }
 
@@ -106,17 +103,17 @@ fn deliver_poll_reminder(home: &Path, agent: &str, reminder: &str) {
 }
 
 /// #event-bus pattern #8: subscriber — re-deliver the frozen reminder text.
-fn handle_event(home: &Path, event: &crate::daemon::event_bus::Event) {
+fn handle_event(event: &crate::daemon::event_bus::Event) {
     if let crate::daemon::event_bus::EventKind::PollReminder { agent, reminder } = &event.kind {
-        deliver_poll_reminder(home, agent, reminder);
+        deliver_poll_reminder(&event.home, agent, reminder);
     }
 }
 
-/// #event-bus pattern #8: register the delivery subscriber at daemon startup
-/// (dormant unless `AGEND_EVENT_BUS=1`). Wired beside the other patterns in
-/// `daemon::mod`.
-pub fn register_subscriber(home: std::path::PathBuf) {
-    crate::daemon::event_bus::global().subscribe(move |e| handle_event(&home, e));
+/// #event-bus pattern #8: register the delivery subscriber at daemon startup.
+/// Home-agnostic — the home travels on each event. Wired beside the other
+/// patterns in `daemon::mod`.
+pub fn register_subscriber() {
+    crate::daemon::event_bus::global().subscribe(handle_event);
 }
 
 #[cfg(test)]
@@ -398,13 +395,15 @@ mod tests {
         // Bus emit→subscriber (gate-ON path) via a local enabled test bus.
         let home_bus = tmp_home("parity-bus");
         stage_thinking_snapshot(&home_bus, agent);
-        let bus = crate::daemon::event_bus::EventBus::new_enabled_for_test();
-        let h = home_bus.clone();
-        bus.subscribe(move |e| handle_event(&h, e));
-        bus.emit(crate::daemon::event_bus::EventKind::PollReminder {
-            agent: agent.to_string(),
-            reminder: reminder.clone(),
-        });
+        let bus = crate::daemon::event_bus::EventBus::new();
+        bus.subscribe(handle_event);
+        bus.emit(
+            &home_bus,
+            crate::daemon::event_bus::EventKind::PollReminder {
+                agent: agent.to_string(),
+                reminder: reminder.clone(),
+            },
+        );
 
         let legacy: Vec<String> = crate::notification_queue::drain(&home_legacy, agent)
             .into_iter()
@@ -424,17 +423,13 @@ mod tests {
         std::fs::remove_dir_all(&home_bus).ok();
     }
 
-    /// REGRESSION (gate-OFF): with the global bus disabled (default test env),
-    /// `poll_reminder_pass` still delivers via the legacy `compose_aware_inject`
-    /// path. Registry handle is Idle (so `collect` picks the agent up); the
-    /// snapshot is `thinking` (so the deliver defers into the drainable queue).
+    /// #event-bus Step 2 (legacy-zero): `poll_reminder_pass` emits to the global
+    /// bus; the registered subscriber delivers via `deliver_poll_reminder`. Registry
+    /// handle is Idle (so `collect` picks the agent up); the snapshot is `thinking`
+    /// (so the deliver defers into the drainable queue).
     #[test]
-    fn gate_off_pass_delivers_via_legacy() {
-        assert!(
-            !crate::daemon::event_bus::global().is_enabled(),
-            "precondition: the global bus must be gate-off in the test env"
-        );
-        let home = tmp_home("gate-off");
+    fn pass_delivers_via_bus() {
+        let home = tmp_home("via-bus");
         let agent = "poll-gateoff-agent";
         seed_unread(&home, agent, 2);
         stage_thinking_snapshot(&home, agent);

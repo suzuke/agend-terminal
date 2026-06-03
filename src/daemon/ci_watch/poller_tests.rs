@@ -5511,17 +5511,17 @@ fn ci_watch_gate_on_emit_subscriber_matches_legacy() {
     super::deliver_ci_watch(&legacy, "rev", &body, &key, &token);
 
     let bus_home = tmp_dir("ciwatch-parity-bus");
-    let bus = crate::daemon::event_bus::EventBus::new_enabled_for_test();
-    let h = bus_home.clone();
-    bus.subscribe(move |e| super::handle_event(&h, e));
-    bus.emit(crate::daemon::event_bus::EventKind::CiReady {
-        repo: "o/r".into(),
-        branch: "feat".into(),
-        target: "rev".into(),
-        body: body.clone(),
-        correlation_id: key.clone(),
-        supersede_token: token.clone(),
-    });
+    let bus = crate::daemon::event_bus::EventBus::new();
+    bus.subscribe(super::handle_event);
+    bus.emit(
+        &bus_home,
+        crate::daemon::event_bus::EventKind::CiReady {
+            target: "rev".into(),
+            body: body.clone(),
+            correlation_id: key.clone(),
+            supersede_token: token.clone(),
+        },
+    );
 
     let legacy_msgs: Vec<_> = crate::inbox::drain(&legacy, "rev")
         .into_iter()

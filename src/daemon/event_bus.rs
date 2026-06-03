@@ -1,17 +1,12 @@
 //! Structured event bus for daemon-internal notifications.
 //!
-//! Phase 1: parallel emit spine. Existing `enqueue_with_idle_hint` calls
-//! remain untouched; this module emits a structured `Event` alongside them
-//! so future subscribers can react without per-module plumbing.
+//! Each per-pattern producer `emit`s a structured `Event` carrying the
+//! notification payload + the `$AGEND_HOME` it occurred in; a per-pattern
+//! subscriber (registered once at daemon startup in `run_core`) re-delivers it.
 //!
-//! End-of-train cutover (Step 1): the gate now defaults **ON** (code-shipped) so
-//! the event-bus delivery path is live without any operator env. Set
-//! `AGEND_EVENT_BUS=0` and **restart the daemon** to fall back to the legacy
-//! direct-enqueue path (the kill-switch — `global()` is a `OnceLock` that reads
-//! the env once at startup, so it is NOT a hot-toggle). The legacy `else`
-//! branches are retained as that kill-switch until Step 2 (post-validation).
-
-#![allow(dead_code)]
+//! End-of-train cutover is COMPLETE (Step 2, legacy-zero): the bus is the SOLE
+//! delivery path — `emit` is unconditional (no gate, no env, no legacy fallback).
+//! Rollback is `git revert` of the cutover, not an env flag.
 
 use std::sync::Arc;
 
@@ -32,19 +27,15 @@ pub enum EventKind {
     // `body` is the RENDERED inbox body — it embeds a live-fetched failure-log tail
     // (`gh --log-failed`), so re-fetching in the subscriber would burn GitHub
     // rate-limit + could drift; it is frozen at the producer. `correlation_id`
-    // (repo@branch) + `supersede_token` (ci-<run>-<sha>) reproduce the legacy
-    // enqueue + supersede bookkeeping. One event is emitted PER recipient.
+    // (repo@branch) + `supersede_token` (ci-<run>-<sha>) reproduce the enqueue +
+    // supersede bookkeeping. One event is emitted PER recipient.
     CiReady {
-        repo: String,
-        branch: String,
         target: String,
         body: String,
         correlation_id: String,
         supersede_token: String,
     },
     CiFail {
-        repo: String,
-        branch: String,
         target: String,
         body: String,
         correlation_id: String,
@@ -160,15 +151,17 @@ pub enum EventKind {
 #[derive(Debug, Clone)]
 pub struct Event {
     pub kind: EventKind,
-    pub timestamp: std::time::Instant,
+    /// #event-bus Step 2 (legacy-zero): the `$AGEND_HOME` the event occurred in.
+    /// Carried ON the event (not captured at subscriber registration) so a single
+    /// globally-registered subscriber delivers to the correct home — required now
+    /// that the bus is the ONLY delivery path (no per-home legacy fallback), and so
+    /// the multi-home integration tests each deliver to their own tmp home.
+    pub home: std::path::PathBuf,
 }
 
 impl Event {
-    pub fn new(kind: EventKind) -> Self {
-        Self {
-            kind,
-            timestamp: std::time::Instant::now(),
-        }
+    pub fn new(home: std::path::PathBuf, kind: EventKind) -> Self {
+        Self { kind, home }
     }
 }
 
@@ -177,42 +170,59 @@ pub fn global() -> &'static EventBus {
     BUS.get_or_init(EventBus::new)
 }
 
+/// #event-bus Step 2 (legacy-zero): test-only one-shot registration of ALL pattern
+/// subscribers on the process-global bus, mirroring `daemon::run_core`. Since the
+/// bus is now the SOLE delivery path, an integration test that drives a production
+/// fn (which `emit`s to `global()`) must register the subscribers first, else the
+/// emit fans out to nothing. Idempotent via `Once` (subscribe appends, so a second
+/// registration would double-deliver). The home travels on each event, so this one
+/// registration serves every test's tmp home. cron gets a dummy empty registry —
+/// cron integration tests use empty registries + assert the home-driven inbox
+/// fallback, so the captured registry's contents don't affect them.
+#[cfg(test)]
+pub(crate) fn register_all_subscribers_for_test() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        crate::daemon::anti_stall::register_subscriber();
+        crate::daemon::decision_timeout::register_subscriber();
+        crate::daemon::dispatch_idle::register_subscriber();
+        crate::daemon::waiting_on_stale::register_subscriber();
+        crate::daemon::helper_staleness_watchdog::register_subscriber();
+        crate::daemon::idle_watchdog::register_subscriber();
+        crate::tasks::register_cascade_subscriber();
+        crate::daemon::poll_reminder::register_subscriber();
+        let dummy_registry: crate::agent::AgentRegistry =
+            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        crate::daemon::cron_tick::register_subscriber(dummy_registry);
+        crate::daemon::supervisor::register_subscriber();
+        crate::daemon::conflict_notify::register_subscriber();
+        crate::daemon::ci_watch::register_subscriber();
+    });
+}
+
+/// #event-bus Step 2 (legacy-zero): register the bus subscribers ONCE at
+/// test-binary LOAD — before any `#[test]` runs — via `ctor`. The bus is now the
+/// sole delivery path, so integration tests that drive a producer (`emit`→global)
+/// would otherwise be order-dependent (only delivering if some earlier test
+/// happened to register first). Running registration before any test makes
+/// delivery order-INDEPENDENT — no per-test harness call, no order-dependent flake.
+#[cfg(test)]
+#[ctor::ctor]
+fn _register_event_bus_subscribers_at_test_load() {
+    register_all_subscribers_for_test();
+}
+
 type Subscriber = Arc<dyn Fn(&Event) + Send + Sync>;
 
 pub struct EventBus {
     subscribers: parking_lot::Mutex<Vec<Subscriber>>,
-    enabled: bool,
 }
 
 impl EventBus {
     pub fn new() -> Self {
-        // #event-bus cutover Step 1: default ON in production. Unset env →
-        // enabled; the kill-switch is `AGEND_EVENT_BUS=0` (any other value stays
-        // ON). In the TEST binary the default is OFF so the existing legacy-path
-        // unit/integration tests keep exercising the legacy direct-enqueue
-        // (the bus path is covered by the per-pattern `new_enabled_for_test`
-        // parity tests). An explicit env value overrides in either build.
-        let enabled = std::env::var("AGEND_EVENT_BUS")
-            .map(|v| v != "0")
-            .unwrap_or(!cfg!(test));
         Self {
             subscribers: parking_lot::Mutex::new(Vec::new()),
-            enabled,
-        }
-    }
-
-    pub fn is_enabled(&self) -> bool {
-        self.enabled
-    }
-
-    /// Test-only: a bus with the gate forced ON (bypasses the env var), so other
-    /// modules' tests can exercise the `emit`→subscriber path deterministically
-    /// without touching the process-global `global()` bus.
-    #[cfg(test)]
-    pub(crate) fn new_enabled_for_test() -> Self {
-        Self {
-            subscribers: parking_lot::Mutex::new(Vec::new()),
-            enabled: true,
         }
     }
 
@@ -220,23 +230,17 @@ impl EventBus {
         self.subscribers.lock().push(Arc::new(f));
     }
 
-    pub fn emit(&self, kind: EventKind) {
-        if !self.enabled {
-            return;
-        }
-        let event = Event::new(kind);
+    /// #event-bus Step 2 (legacy-zero): the bus is the SOLE delivery path, so
+    /// `emit` is unconditional (no gate). `home` is the `$AGEND_HOME` the event
+    /// occurred in — carried on the `Event` so a single globally-registered
+    /// subscriber delivers to the correct home.
+    pub fn emit(&self, home: &std::path::Path, kind: EventKind) {
+        let event = Event::new(home.to_path_buf(), kind);
         let subs = self.subscribers.lock();
         for sub in subs.iter() {
             sub(&event);
         }
         tracing::debug!(kind = ?event.kind, "event_bus: emitted");
-    }
-
-    pub fn emit_lazy(&self, f: impl FnOnce() -> EventKind) {
-        if !self.enabled {
-            return;
-        }
-        self.emit(f());
     }
 }
 
@@ -249,7 +253,6 @@ impl Default for EventBus {
 impl std::fmt::Debug for EventBus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EventBus")
-            .field("enabled", &self.enabled)
             .field("subscriber_count", &self.subscribers.lock().len())
             .finish()
     }
@@ -262,42 +265,22 @@ mod tests {
     use std::sync::Mutex;
 
     #[test]
-    fn emit_disabled_by_default() {
+    fn emit_delivers_to_subscribers() {
         let bus = EventBus::new();
         let received = Arc::new(Mutex::new(Vec::new()));
         let r = Arc::clone(&received);
         bus.subscribe(move |e| r.lock().unwrap().push(e.kind.clone()));
-        bus.emit(EventKind::CiReady {
-            repo: "owner/repo".into(),
-            branch: "main".into(),
-            target: "dev".into(),
-            body: "[ci-pass]".into(),
-            correlation_id: "owner/repo@main".into(),
-            supersede_token: "ci-1-abc".into(),
-        });
-        assert!(
-            received.lock().unwrap().is_empty(),
-            "emit must be no-op when AGEND_EVENT_BUS != 1"
+        bus.emit(
+            std::path::Path::new("/tmp/h"),
+            EventKind::TaskStateChanged {
+                task_id: "t-1".into(),
+                title: "test".into(),
+                assignee: Some("dev".into()),
+                reason: "stalled".into(),
+                started_at: None,
+                eta_secs: None,
+            },
         );
-    }
-
-    #[test]
-    fn emit_delivers_to_subscribers_when_enabled() {
-        let bus = EventBus {
-            subscribers: parking_lot::Mutex::new(Vec::new()),
-            enabled: true,
-        };
-        let received = Arc::new(Mutex::new(Vec::new()));
-        let r = Arc::clone(&received);
-        bus.subscribe(move |e| r.lock().unwrap().push(e.kind.clone()));
-        bus.emit(EventKind::TaskStateChanged {
-            task_id: "t-1".into(),
-            title: "test".into(),
-            assignee: Some("dev".into()),
-            reason: "stalled".into(),
-            started_at: None,
-            eta_secs: None,
-        });
         let events = received.lock().unwrap();
         assert_eq!(events.len(), 1);
         assert!(
@@ -306,11 +289,30 @@ mod tests {
     }
 
     #[test]
+    fn emit_carries_the_home_on_the_event() {
+        let bus = EventBus::new();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let s = Arc::clone(&seen);
+        bus.subscribe(move |e| s.lock().unwrap().push(e.home.clone()));
+        bus.emit(
+            std::path::Path::new("/tmp/agend-home-x"),
+            EventKind::CiReady {
+                target: "dev".into(),
+                body: "[ci-pass]".into(),
+                correlation_id: "owner/repo@main".into(),
+                supersede_token: "ci-1-abc".into(),
+            },
+        );
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            [std::path::PathBuf::from("/tmp/agend-home-x")],
+            "the subscriber must see the home the producer emitted with"
+        );
+    }
+
+    #[test]
     fn multiple_subscribers_all_receive() {
-        let bus = EventBus {
-            subscribers: parking_lot::Mutex::new(Vec::new()),
-            enabled: true,
-        };
+        let bus = EventBus::new();
         let count_a = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let count_b = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let ca = Arc::clone(&count_a);
@@ -321,14 +323,15 @@ mod tests {
         bus.subscribe(move |_| {
             cb.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         });
-        bus.emit(EventKind::CiFail {
-            repo: "o/r".into(),
-            branch: "feat".into(),
-            target: "dev".into(),
-            body: "[ci-fail]".into(),
-            correlation_id: "o/r@feat".into(),
-            supersede_token: "ci-2-def".into(),
-        });
+        bus.emit(
+            std::path::Path::new("/tmp/h"),
+            EventKind::CiFail {
+                target: "dev".into(),
+                body: "[ci-fail]".into(),
+                correlation_id: "o/r@feat".into(),
+                supersede_token: "ci-2-def".into(),
+            },
+        );
         assert_eq!(count_a.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert_eq!(count_b.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
@@ -345,16 +348,12 @@ mod tests {
                 eta_secs: None,
             },
             EventKind::CiReady {
-                repo: "o/r".into(),
-                branch: "b".into(),
                 target: "t".into(),
                 body: "[ci-pass]".into(),
                 correlation_id: "o/r@b".into(),
                 supersede_token: "ci-1-aaa".into(),
             },
             EventKind::CiFail {
-                repo: "o/r".into(),
-                branch: "b".into(),
                 target: "t".into(),
                 body: "[ci-fail]".into(),
                 correlation_id: "o/r@b".into(),

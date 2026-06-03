@@ -502,17 +502,16 @@ pub(crate) fn maybe_notify_member_state_change(
     });
     track.consecutive += 1;
     track.last_at = now;
-    // #event-bus pattern #9 (Option A): freeze the only now()-derived value
-    // (detected_at) here so BOTH the legacy path and the bus path render the inbox
-    // payload byte-identically. gate-ON → emit MemberStateChanged (the subscriber
-    // delivers via the SAME `deliver_member_state_change`); gate-OFF (prod default)
-    // → call that deliver directly. No double-delivery, no gate-off regression.
+    // #event-bus pattern #9, Step 2 (legacy-zero): freeze the only now()-derived
+    // value (detected_at) here so the subscriber renders the inbox payload
+    // byte-identically, then emit MemberStateChanged (the subscriber delivers via
+    // `deliver_member_state_change`). The bus is the sole delivery path.
     let detected_at = chrono::Utc::now().to_rfc3339();
     let from_display = prev_state.display_name();
     let to_display = new_state.display_name();
-    let bus = crate::daemon::event_bus::global();
-    if bus.is_enabled() {
-        bus.emit(crate::daemon::event_bus::EventKind::MemberStateChanged {
+    crate::daemon::event_bus::global().emit(
+        home,
+        crate::daemon::event_bus::EventKind::MemberStateChanged {
             agent: name.to_string(),
             team: team.name.clone(),
             from_state: from_display.to_string(),
@@ -523,22 +522,8 @@ pub(crate) fn maybe_notify_member_state_change(
             unlock_at: unlock_at.clone(),
             consecutive_count: track.consecutive,
             detected_at,
-        });
-    } else {
-        deliver_member_state_change(
-            home,
-            orch,
-            name,
-            &team.name,
-            from_display,
-            to_display,
-            new_state,
-            pane_tail,
-            unlock_at.as_deref(),
-            track.consecutive,
-            &detected_at,
-        );
-    }
+        },
+    );
     true
 }
 
@@ -622,7 +607,7 @@ fn deliver_member_state_change(
 
 /// #event-bus pattern #9 subscriber: re-deliver a `MemberStateChanged` event via
 /// the shared `deliver_member_state_change`.
-fn handle_event(home: &std::path::Path, event: &crate::daemon::event_bus::Event) {
+fn handle_event(event: &crate::daemon::event_bus::Event) {
     if let crate::daemon::event_bus::EventKind::MemberStateChanged {
         agent,
         team,
@@ -637,7 +622,7 @@ fn handle_event(home: &std::path::Path, event: &crate::daemon::event_bus::Event)
     } = &event.kind
     {
         deliver_member_state_change(
-            home,
+            &event.home,
             orch,
             agent,
             team,
@@ -653,9 +638,9 @@ fn handle_event(home: &std::path::Path, event: &crate::daemon::event_bus::Event)
 }
 
 /// Register the member-state-change subscriber once at daemon startup (`run_core`).
-/// Dormant unless `AGEND_EVENT_BUS=1` (emit is a no-op when gate-off).
-pub(crate) fn register_subscriber(home: std::path::PathBuf) {
-    crate::daemon::event_bus::global().subscribe(move |e| handle_event(&home, e));
+/// Home-agnostic — the home travels on each event.
+pub(crate) fn register_subscriber() {
+    crate::daemon::event_bus::global().subscribe(handle_event);
 }
 
 /// #1530: a reaction-worthy net state change for one agent in one tick.
@@ -2443,23 +2428,25 @@ instances:
         );
 
         let home_bus = mk("bus");
-        let bus = crate::daemon::event_bus::EventBus::new_enabled_for_test();
-        let h = home_bus.clone();
-        bus.subscribe(move |e| super::handle_event(&h, e));
-        bus.emit(crate::daemon::event_bus::EventKind::MemberStateChanged {
-            agent: "worker-a".into(),
-            team: "team-a".into(),
-            from_state: crate::state::AgentState::Ready.display_name().to_string(),
-            to_state: crate::state::AgentState::UsageLimit
-                .display_name()
-                .to_string(),
-            orch: "orch-a".into(),
-            new_state: crate::state::AgentState::UsageLimit,
-            pane_tail: "Usage limit reached. Resets at 15:14 UTC".into(),
-            unlock_at: Some("15:14".into()),
-            consecutive_count: 1,
-            detected_at: detected_at.into(),
-        });
+        let bus = crate::daemon::event_bus::EventBus::new();
+        bus.subscribe(super::handle_event);
+        bus.emit(
+            &home_bus,
+            crate::daemon::event_bus::EventKind::MemberStateChanged {
+                agent: "worker-a".into(),
+                team: "team-a".into(),
+                from_state: crate::state::AgentState::Ready.display_name().to_string(),
+                to_state: crate::state::AgentState::UsageLimit
+                    .display_name()
+                    .to_string(),
+                orch: "orch-a".into(),
+                new_state: crate::state::AgentState::UsageLimit,
+                pane_tail: "Usage limit reached. Resets at 15:14 UTC".into(),
+                unlock_at: Some("15:14".into()),
+                consecutive_count: 1,
+                detected_at: detected_at.into(),
+            },
+        );
 
         let legacy = payloads(&home_legacy);
         let via_bus = payloads(&home_bus);

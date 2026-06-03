@@ -744,22 +744,22 @@ fn route_idle_alert(
     text: &str,
     correlation_agent: Option<&str>,
 ) {
-    let bus = crate::daemon::event_bus::global();
-    if bus.is_enabled() {
-        bus.emit(crate::daemon::event_bus::EventKind::IdleAlert {
+    // #event-bus Step 2 (legacy-zero): the bus is the sole delivery path. The
+    // recipient is already resolved by the caller and carried on the event.
+    crate::daemon::event_bus::global().emit(
+        home,
+        crate::daemon::event_bus::EventKind::IdleAlert {
             recipient: recipient.to_string(),
             kind: kind.to_string(),
             text: text.to_string(),
             correlation_agent: correlation_agent.map(String::from),
-        });
-    } else {
-        emit_idle_alert(home, recipient, kind, text, correlation_agent);
-    }
+        },
+    );
 }
 
-/// #event-bus pattern #6: bus subscriber — deliver on an `IdleAlert` event (the
-/// gate-ON path) via the shared `emit_idle_alert`. Registered once at daemon startup.
-fn handle_event(home: &Path, event: &crate::daemon::event_bus::Event) {
+/// #event-bus pattern #6: bus subscriber — deliver on an `IdleAlert` event via the
+/// shared `emit_idle_alert`. Registered once at daemon startup.
+fn handle_event(event: &crate::daemon::event_bus::Event) {
     if let crate::daemon::event_bus::EventKind::IdleAlert {
         recipient,
         kind,
@@ -767,14 +767,20 @@ fn handle_event(home: &Path, event: &crate::daemon::event_bus::Event) {
         correlation_agent,
     } = &event.kind
     {
-        emit_idle_alert(home, recipient, kind, text, correlation_agent.as_deref());
+        emit_idle_alert(
+            &event.home,
+            recipient,
+            kind,
+            text,
+            correlation_agent.as_deref(),
+        );
     }
 }
 
 /// #event-bus pattern #6: register the idle_watchdog delivery subscriber on the
-/// global bus. Call ONCE at daemon startup. Dormant while the bus is gate-off.
-pub fn register_subscriber(home: std::path::PathBuf) {
-    crate::daemon::event_bus::global().subscribe(move |e| handle_event(&home, e));
+/// global bus. Call ONCE at daemon startup. Home-agnostic — home travels on the event.
+pub fn register_subscriber() {
+    crate::daemon::event_bus::global().subscribe(handle_event);
 }
 
 #[cfg(test)]
@@ -1867,15 +1873,17 @@ mod tests {
         emit_idle_alert(&home_legacy, recipient, kind, text, corr);
 
         let home_bus = tmp_home("p6-parity-bus");
-        let bus = crate::daemon::event_bus::EventBus::new_enabled_for_test();
-        let h = home_bus.clone();
-        bus.subscribe(move |e| handle_event(&h, e));
-        bus.emit(crate::daemon::event_bus::EventKind::IdleAlert {
-            recipient: recipient.to_string(),
-            kind: kind.to_string(),
-            text: text.to_string(),
-            correlation_agent: corr.map(String::from),
-        });
+        let bus = crate::daemon::event_bus::EventBus::new();
+        bus.subscribe(handle_event);
+        bus.emit(
+            &home_bus,
+            crate::daemon::event_bus::EventKind::IdleAlert {
+                recipient: recipient.to_string(),
+                kind: kind.to_string(),
+                text: text.to_string(),
+                correlation_agent: corr.map(String::from),
+            },
+        );
 
         let legacy = alert_payloads(&home_legacy, recipient);
         let via_bus = alert_payloads(&home_bus, recipient);
@@ -1889,15 +1897,11 @@ mod tests {
         std::fs::remove_dir_all(&home_bus).ok();
     }
 
-    // gate-OFF (default): route_idle_alert falls through to the legacy deliver,
-    // so the alert still lands without the bus.
+    // #event-bus Step 2 (legacy-zero): route_idle_alert emits to the global bus;
+    // the registered subscriber delivers via emit_idle_alert to the event's home.
     #[test]
-    fn gate_off_route_idle_alert_delivers_via_legacy() {
-        assert!(
-            !crate::daemon::event_bus::global().is_enabled(),
-            "test must run with AGEND_EVENT_BUS gate off"
-        );
-        let home = tmp_home("p6-gate-off");
+    fn route_idle_alert_delivers_via_bus() {
+        let home = tmp_home("p6-via-bus");
         route_idle_alert(
             &home,
             "general",

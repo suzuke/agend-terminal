@@ -207,16 +207,14 @@ fn emit_telegram_escalation(home: &Path, agent: &str) {
 /// is the already-rendered notify body (built from the live worktree discovery at
 /// the producer) — carried verbatim so the bus path never re-runs discovery.
 fn route_conflict_alert(home: &Path, agent: &str, escalation: bool, text: &str) {
-    let bus = crate::daemon::event_bus::global();
-    if bus.is_enabled() {
-        bus.emit(crate::daemon::event_bus::EventKind::ConflictAlert {
+    crate::daemon::event_bus::global().emit(
+        home,
+        crate::daemon::event_bus::EventKind::ConflictAlert {
             agent: agent.to_string(),
             escalation,
             text: text.to_string(),
-        });
-    } else {
-        deliver_conflict_alert(home, agent, escalation, text);
-    }
+        },
+    );
 }
 
 /// Shared deliver for the git-conflict notify: PTY-notify the conflicted agent via
@@ -235,21 +233,21 @@ fn deliver_conflict_alert(home: &Path, agent: &str, escalation: bool, text: &str
 
 /// #event-bus (conflict_notify) subscriber: re-deliver a `ConflictAlert` event via
 /// the shared `deliver_conflict_alert`.
-fn handle_event(home: &Path, event: &crate::daemon::event_bus::Event) {
+fn handle_event(event: &crate::daemon::event_bus::Event) {
     if let crate::daemon::event_bus::EventKind::ConflictAlert {
         agent,
         escalation,
         text,
     } = &event.kind
     {
-        deliver_conflict_alert(home, agent, *escalation, text);
+        deliver_conflict_alert(&event.home, agent, *escalation, text);
     }
 }
 
 /// Register the conflict-notify subscriber once at daemon startup (`run_core`).
-/// Dormant unless `AGEND_EVENT_BUS=1` (emit is a no-op when gate-off).
-pub(crate) fn register_subscriber(home: std::path::PathBuf) {
-    crate::daemon::event_bus::global().subscribe(move |e| handle_event(&home, e));
+/// Home-agnostic — the home travels on each event.
+pub(crate) fn register_subscriber() {
+    crate::daemon::event_bus::global().subscribe(handle_event);
 }
 
 /// Discover conflicted files in a worktree via `git status
@@ -627,14 +625,16 @@ mod tests {
         let text =
             build_notify_payload("rebase", &["src/a.rs".to_string()], "feat", "main").to_string();
 
-        let bus = crate::daemon::event_bus::EventBus::new_enabled_for_test();
-        let h = home.clone();
-        bus.subscribe(move |e| handle_event(&h, e));
-        bus.emit(crate::daemon::event_bus::EventKind::ConflictAlert {
-            agent: agent.to_string(),
-            escalation: false,
-            text: text.clone(),
-        });
+        let bus = crate::daemon::event_bus::EventBus::new();
+        bus.subscribe(handle_event);
+        bus.emit(
+            &home,
+            crate::daemon::event_bus::EventKind::ConflictAlert {
+                agent: agent.to_string(),
+                escalation: false,
+                text: text.clone(),
+            },
+        );
 
         let queued = crate::notification_queue::drain(&home, agent);
         assert_eq!(
@@ -650,16 +650,14 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// gate-OFF (prod default): `route_conflict_alert` falls through to the legacy
-    /// direct deliver, so the conflict notify still lands (deferred to the queue).
+    /// #event-bus Step 2 (legacy-zero): `route_conflict_alert` emits to the global
+    /// bus; the registered subscriber delivers via `deliver_conflict_alert` (the
+    /// home travels on the event → lands in this test's home). End-to-end coverage
+    /// of the production route → bus → subscriber wiring.
     #[test]
-    fn conflict_alert_gate_off_route_delivers_via_legacy() {
-        assert!(
-            !crate::daemon::event_bus::global().is_enabled(),
-            "test must run with AGEND_EVENT_BUS gate off"
-        );
-        let agent = "conflict-gate-off";
-        let home = defer_home("gate-off", agent);
+    fn route_conflict_alert_delivers_via_bus() {
+        let agent = "conflict-route-bus";
+        let home = defer_home("route-bus", agent);
         let text =
             build_notify_payload("rebase", &["src/a.rs".to_string()], "feat", "main").to_string();
 

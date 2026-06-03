@@ -741,7 +741,7 @@ fn deliver_dispatch_idle(
 
 /// #event-bus pattern #3: bus subscriber — deliver on a `DispatchIdleExceeded`
 /// event (the gate-ON path). Registered once at daemon startup via [`register_subscriber`].
-fn handle_event(home: &Path, event: &crate::daemon::event_bus::Event) {
+fn handle_event(event: &crate::daemon::event_bus::Event) {
     if let crate::daemon::event_bus::EventKind::DispatchIdleExceeded {
         dispatcher,
         target,
@@ -753,7 +753,7 @@ fn handle_event(home: &Path, event: &crate::daemon::event_bus::Event) {
     } = &event.kind
     {
         deliver_dispatch_idle(
-            home,
+            &event.home,
             dispatch_id,
             dispatcher,
             target,
@@ -767,8 +767,8 @@ fn handle_event(home: &Path, event: &crate::daemon::event_bus::Event) {
 
 /// #event-bus pattern #3: register the dispatch_idle delivery subscriber on the
 /// global bus. Call ONCE at daemon startup. Dormant while the bus is gate-off.
-pub fn register_subscriber(home: std::path::PathBuf) {
-    crate::daemon::event_bus::global().subscribe(move |e| handle_event(&home, e));
+pub fn register_subscriber() {
+    crate::daemon::event_bus::global().subscribe(handle_event);
 }
 
 fn emit_exceeded_event(home: &Path, d: &PendingDispatch, elapsed_secs: i64) {
@@ -786,13 +786,11 @@ fn emit_exceeded_event(home: &Path, d: &PendingDispatch, elapsed_secs: i64) {
             d.threshold_secs,
         ),
     );
-    // #event-bus pattern #3 (Option A): gate-ON → emit (the subscriber delivers);
-    // gate-OFF (prod default) → the legacy direct delivery. No double-delivery, no
-    // gate-off regression. The flock-drop-before-emit ordering (#1617) is preserved
-    // (scan caller unchanged). The legacy `else` is retired at the final cutover.
-    let bus = crate::daemon::event_bus::global();
-    if bus.is_enabled() {
-        bus.emit(crate::daemon::event_bus::EventKind::DispatchIdleExceeded {
+    // #event-bus Step 2 (legacy-zero): the bus is the sole delivery path. The
+    // flock-drop-before-emit ordering (#1617) is preserved (scan caller unchanged).
+    crate::daemon::event_bus::global().emit(
+        home,
+        crate::daemon::event_bus::EventKind::DispatchIdleExceeded {
             dispatcher: d.dispatcher.clone(),
             target: d.target.clone(),
             elapsed_secs,
@@ -800,19 +798,8 @@ fn emit_exceeded_event(home: &Path, d: &PendingDispatch, elapsed_secs: i64) {
             expected_kind: d.expected_kind.clone(),
             threshold_secs: d.threshold_secs,
             correlation_id: d.correlation_id.clone(),
-        });
-    } else {
-        deliver_dispatch_idle(
-            home,
-            &d.dispatch_id,
-            &d.dispatcher,
-            &d.target,
-            &d.expected_kind,
-            d.correlation_id.as_deref(),
-            elapsed_secs,
-            d.threshold_secs,
-        );
-    }
+        },
+    );
 }
 
 /// Per-loop scheduler state.
@@ -2161,18 +2148,20 @@ mod tests {
 
         // Bus emit→subscriber delivery (the gate-ON path) — real fan-out.
         let home_bus = tmp_home("parity-bus");
-        let bus = crate::daemon::event_bus::EventBus::new_enabled_for_test();
-        let h = home_bus.clone();
-        bus.subscribe(move |e| handle_event(&h, e));
-        bus.emit(crate::daemon::event_bus::EventKind::DispatchIdleExceeded {
-            dispatcher: dispatcher.to_string(),
-            target: target.to_string(),
-            elapsed_secs: elapsed,
-            dispatch_id: dispatch_id.to_string(),
-            expected_kind: expected_kind.to_string(),
-            threshold_secs: threshold,
-            correlation_id: corr.map(String::from),
-        });
+        let bus = crate::daemon::event_bus::EventBus::new();
+        bus.subscribe(handle_event);
+        bus.emit(
+            &home_bus,
+            crate::daemon::event_bus::EventKind::DispatchIdleExceeded {
+                dispatcher: dispatcher.to_string(),
+                target: target.to_string(),
+                elapsed_secs: elapsed,
+                dispatch_id: dispatch_id.to_string(),
+                expected_kind: expected_kind.to_string(),
+                threshold_secs: threshold,
+                correlation_id: corr.map(String::from),
+            },
+        );
 
         let legacy = drained_payloads(&home_legacy, dispatcher);
         let viabus = drained_payloads(&home_bus, dispatcher);
@@ -2188,15 +2177,12 @@ mod tests {
         std::fs::remove_dir_all(&home_bus).ok();
     }
 
-    /// Option A: with the gate OFF (prod default), `emit_exceeded_event` must STILL
-    /// deliver via the legacy path. No regression.
+    /// #event-bus Step 2 (legacy-zero): `emit_exceeded_event` emits to the global
+    /// bus; the registered subscriber delivers via `deliver_dispatch_idle` to the
+    /// event's home (this test's home).
     #[test]
-    fn gate_off_emit_delivers_via_legacy() {
-        assert!(
-            !crate::daemon::event_bus::global().is_enabled(),
-            "precondition: the global bus must be gate-off in the test env"
-        );
-        let home = tmp_home("gate-off");
+    fn emit_exceeded_event_delivers_via_bus() {
+        let home = tmp_home("via-bus");
         let d = PendingDispatch {
             dispatch_id: "di-gateoff".into(),
             dispatcher: "lead".into(),

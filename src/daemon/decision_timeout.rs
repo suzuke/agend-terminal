@@ -347,7 +347,7 @@ fn deliver_timeout(
 
 /// #event-bus pattern #2: bus subscriber — deliver on a `DecisionTimeout` event
 /// (the gate-ON path). Registered once at daemon startup via [`register_subscriber`].
-fn handle_event(home: &Path, event: &crate::daemon::event_bus::Event) {
+fn handle_event(event: &crate::daemon::event_bus::Event) {
     if let crate::daemon::event_bus::EventKind::DecisionTimeout {
         decision_id,
         sender,
@@ -357,7 +357,7 @@ fn handle_event(home: &Path, event: &crate::daemon::event_bus::Event) {
     } = &event.kind
     {
         deliver_timeout(
-            home,
+            &event.home,
             decision_id,
             sender,
             *elapsed_secs,
@@ -368,35 +368,24 @@ fn handle_event(home: &Path, event: &crate::daemon::event_bus::Event) {
 }
 
 /// #event-bus pattern #2: register the decision_timeout delivery subscriber on
-/// the global bus. Call ONCE at daemon startup. Dormant while the bus is gate-off
-/// (emit never fires), so registration is always safe.
-pub fn register_subscriber(home: std::path::PathBuf) {
-    crate::daemon::event_bus::global().subscribe(move |e| handle_event(&home, e));
+/// the global bus. Call ONCE at daemon startup. Home-agnostic — the home travels
+/// on each event.
+pub fn register_subscriber() {
+    crate::daemon::event_bus::global().subscribe(handle_event);
 }
 
 fn emit_timeout_event(home: &Path, d: &PendingDecision, elapsed_secs: i64) {
-    // #event-bus pattern #2 (Option A): gate-ON → emit (the subscriber delivers);
-    // gate-OFF (prod default) → the legacy direct delivery. No double-delivery, no
-    // gate-off regression. The legacy `else` is retired only at the final cutover.
-    let bus = crate::daemon::event_bus::global();
-    if bus.is_enabled() {
-        bus.emit(crate::daemon::event_bus::EventKind::DecisionTimeout {
+    // #event-bus Step 2 (legacy-zero): the bus is the sole delivery path.
+    crate::daemon::event_bus::global().emit(
+        home,
+        crate::daemon::event_bus::EventKind::DecisionTimeout {
             decision_id: d.decision_id.clone(),
             sender: d.sender.clone(),
             elapsed_secs,
             timeout_secs: d.timeout_secs,
             default_action: d.default_action.clone(),
-        });
-    } else {
-        deliver_timeout(
-            home,
-            &d.decision_id,
-            &d.sender,
-            elapsed_secs,
-            d.timeout_secs,
-            &d.default_action,
-        );
-    }
+        },
+    );
 }
 
 #[cfg(test)]
@@ -1005,16 +994,18 @@ mod tests {
 
         // Bus emit→subscriber delivery (the gate-ON path) — real fan-out.
         let home_bus = tmp_home("parity-bus");
-        let bus = crate::daemon::event_bus::EventBus::new_enabled_for_test();
-        let h = home_bus.clone();
-        bus.subscribe(move |e| handle_event(&h, e));
-        bus.emit(crate::daemon::event_bus::EventKind::DecisionTimeout {
-            decision_id: decision_id.to_string(),
-            sender: sender.to_string(),
-            elapsed_secs,
-            timeout_secs,
-            default_action: default_action.to_string(),
-        });
+        let bus = crate::daemon::event_bus::EventBus::new();
+        bus.subscribe(handle_event);
+        bus.emit(
+            &home_bus,
+            crate::daemon::event_bus::EventKind::DecisionTimeout {
+                decision_id: decision_id.to_string(),
+                sender: sender.to_string(),
+                elapsed_secs,
+                timeout_secs,
+                default_action: default_action.to_string(),
+            },
+        );
 
         let recipient = timeout_recipient();
         let legacy = drained_payloads(&home_legacy, &recipient);
@@ -1031,17 +1022,14 @@ mod tests {
         std::fs::remove_dir_all(&home_bus).ok();
     }
 
-    /// Option A: with the gate OFF (prod default), `emit_timeout_event` must STILL
-    /// deliver via the legacy path. No regression.
+    /// #event-bus Step 2 (legacy-zero): `emit_timeout_event` emits to the global
+    /// bus; the registered subscriber delivers via `deliver_timeout` to the event's
+    /// home (this test's home).
     #[test]
-    fn gate_off_emit_delivers_via_legacy() {
+    fn emit_timeout_event_delivers_via_bus() {
         let _g = env_lock();
         std::env::remove_var("AGEND_DECISION_TIMEOUT_RECIPIENT");
-        assert!(
-            !crate::daemon::event_bus::global().is_enabled(),
-            "precondition: the global bus must be gate-off in the test env"
-        );
-        let home = tmp_home("gate-off");
+        let home = tmp_home("via-bus");
         let d = PendingDecision {
             decision_id: "d-gateoff".into(),
             sender: "general".into(),

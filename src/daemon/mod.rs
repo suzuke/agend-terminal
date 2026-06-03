@@ -406,20 +406,22 @@ fn run_core(
 
     let ctx = init_daemon_services(home, telegram)?;
 
-    // #event-bus: register the per-pattern delivery subscribers once. Dormant
-    // unless AGEND_EVENT_BUS=1 (emit is a no-op when gate-off).
-    crate::daemon::anti_stall::register_subscriber(home.to_path_buf());
-    crate::daemon::decision_timeout::register_subscriber(home.to_path_buf());
-    crate::daemon::dispatch_idle::register_subscriber(home.to_path_buf());
-    crate::daemon::waiting_on_stale::register_subscriber(home.to_path_buf());
-    crate::daemon::helper_staleness_watchdog::register_subscriber(home.to_path_buf());
-    crate::daemon::idle_watchdog::register_subscriber(home.to_path_buf());
-    crate::tasks::register_cascade_subscriber(home.to_path_buf());
-    crate::daemon::poll_reminder::register_subscriber(home.to_path_buf());
-    crate::daemon::cron_tick::register_subscriber(home.to_path_buf(), ctx.registry.clone());
-    crate::daemon::supervisor::register_subscriber(home.to_path_buf());
-    crate::daemon::conflict_notify::register_subscriber(home.to_path_buf());
-    crate::daemon::ci_watch::register_subscriber(home.to_path_buf());
+    // #event-bus Step 2 (legacy-zero): register the per-pattern delivery
+    // subscribers once. The bus is the SOLE delivery path; each subscriber is
+    // home-agnostic (the home travels on every event). cron also captures the live
+    // registry (to resolve + inject to the fleet).
+    crate::daemon::anti_stall::register_subscriber();
+    crate::daemon::decision_timeout::register_subscriber();
+    crate::daemon::dispatch_idle::register_subscriber();
+    crate::daemon::waiting_on_stale::register_subscriber();
+    crate::daemon::helper_staleness_watchdog::register_subscriber();
+    crate::daemon::idle_watchdog::register_subscriber();
+    crate::tasks::register_cascade_subscriber();
+    crate::daemon::poll_reminder::register_subscriber();
+    crate::daemon::cron_tick::register_subscriber(ctx.registry.clone());
+    crate::daemon::supervisor::register_subscriber();
+    crate::daemon::conflict_notify::register_subscriber();
+    crate::daemon::ci_watch::register_subscriber();
 
     spawn_fleet_agents(home, &agents, &ctx);
 

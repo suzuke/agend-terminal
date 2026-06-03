@@ -27,7 +27,7 @@ impl PerTickHandler for CheckSchedulesHandler {
     }
 
     fn run(&self, ctx: &TickContext<'_>) {
-        crate::daemon::cron_tick::check_schedules(ctx.home, ctx.registry);
+        crate::daemon::cron_tick::check_schedules(ctx.home);
     }
 }
 
