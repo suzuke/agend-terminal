@@ -14,7 +14,7 @@ Declare your entire AI dev team in one `fleet.yaml`. AgEnD Terminal launches eac
 ## Features
 
 - **Fleet-as-code** — One YAML file declares every agent's backend, role, working directory, and team membership. `agend-terminal start` brings the whole fleet up.
-- **5 backends** — Claude Code, Codex, Kiro, OpenCode, and Antigravity CLI. Swap backends by changing one field.
+- **6 backends** — Claude Code, Codex, Kiro, OpenCode, Gemini CLI, and Antigravity CLI. Swap backends by changing one field.
 - **Built-in agent coordination** — Agents delegate tasks, query each other, and broadcast updates through 35 MCP tools. No glue code.
 - **Automatic git worktree isolation** — Each agent works in its own worktree. No merge conflicts between agents, no accidental cross-contamination.
 - **Crash recovery with context handover** — Agents auto-respawn and resume their conversation. Exponential backoff, health monitoring, and hung detection built in.
@@ -63,9 +63,10 @@ graph LR
 | Kiro CLI | `kiro-cli` | Tested |
 | Codex | `codex` | Tested |
 | OpenCode | `opencode` | Tested |
+| Gemini CLI | `gemini` | Tested |
 | Antigravity CLI | `agy` | Tested |
 
-> Gemini CLI was retired in [#1580](https://github.com/suzuke/agend-terminal/issues/1580) (it sunsets 2026-06-18 for free/Pro/Ultra tiers). Antigravity CLI (`agy`) is its official successor and a **supported** Fleet MCP backend ([#1547](https://github.com/suzuke/agend-terminal/issues/1547)). A `gemini` backend in fleet.yaml now spawns as a generic `Raw` backend.
+> Gemini CLI sunsets 2026-06-18 for free/Pro/Ultra tiers. Antigravity CLI (`agy`) is the official successor and is now a **supported** Fleet MCP backend ([#1547](https://github.com/suzuke/agend-terminal/issues/1547)).
 > agy refuses any workspace whose path has a dot-prefixed (hidden) ancestor, so daemon agents under `~/.agend-terminal` were invisible to it. The daemon now creates a non-hidden link (`<base>/<instance>` → the hidden real workspace) and spawns agy with `$PWD` pointed at that link, clearing agy's hidden-path guard while the real files stay under `$AGEND_HOME`. `configure_agy` writes the project-scoped `.agents/mcp_config.json` + `.agents/AGENTS.md` (agy's official Customization Roots), so `agy` loads the fleet `send`/`inbox`/`task` tools like every other backend.
 
 ## Documentation

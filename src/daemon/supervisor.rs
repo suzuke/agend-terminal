@@ -2448,6 +2448,7 @@ instances:
             Backend::KiroCli,
             Backend::Codex,
             Backend::OpenCode,
+            Backend::Gemini,
             Backend::Agy,
         ];
         for backend in &api_backends {

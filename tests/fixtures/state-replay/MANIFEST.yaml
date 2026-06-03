@@ -60,6 +60,28 @@ fixtures:
     expected_final_state: thinking
     expected_final_detect: idle
 
+  - file: gemini-thinking.raw
+    backend: gemini
+    cli_version: "0.38.2"
+    recorded_on: "2026-04-19"
+    scenario: "startup → ready → idle prompt → thinking (recording cut mid-response)"
+    expected_transitions: [starting, ready, idle, thinking]
+    expected_final_state: thinking
+    # Final detect is None because the spinner token cleared off screen
+    # but Thinking remains latched — Phase 1c's LATCHED_STATE_EXPIRY
+    # fallback (30s) would drop it back to Ready in production.
+    expected_final_detect: null
+    # #685 PR-3 (corpus expansion via dev-2 cross-audit Pushback 2):
+    # final state is `thinking` with no productive markers visible in
+    # the rendered screen. Canonical F9 silent_stuck case — agent on
+    # spinner, no progress evidence. check_hang under productive-gate
+    # default-on would classify as Hung past 600s silence threshold.
+    scenario_kind: silent_stuck
+    expected_hung_classification: hung
+    capture_kind: real
+    provenance: "f685 PR-3 corpus relabel — existing v1 thinking capture promoted to F9 measurement"
+    schema_version: 2
+
   - file: agy-thinking.raw
     backend: agy
     cli_version: "1.0.0"
@@ -266,6 +288,16 @@ fixtures:
     expected_final_state: permission
     expected_final_detect: permission
 
+  - file: gemini-perm.raw
+    backend: gemini
+    cli_version: "0.44.1"
+    recorded_on: "2026-06-01"
+    scenario: "gemini asked to run a shell tool -> boxed select 'Allow execution of [Shell]?' with numbered options (1 Allow once / 2 Allow for this session / 3 No, suggest changes) -> #1559 chrome anchor fires PermissionPrompt"
+    provenance: "#1559"
+    expected_transitions: [starting, idle, thinking, permission]
+    expected_final_state: permission
+    expected_final_detect: permission
+
   - file: opencode-perm.raw
     backend: opencode
     cli_version: "1.15.10"
@@ -365,6 +397,37 @@ fixtures:
     expected_hung_classification: hung
     capture_kind: real
     provenance: "f685 PR-3 corpus relabel — `• Explored` raw-byte marker is offscreen post-render"
+    schema_version: 2
+
+  - file: gemini-tooluse.raw
+    backend: gemini
+    cli_version: "0.38.2"
+    recorded_on: "2026-04-20"
+    scenario: "--yolo mode; prompt 'read package.json' -> gemini reads + replies -> /quit (session summary shows `Tool Calls: 1 ✓ 1`)"
+    # #1005 Phase A1 shift: gemini's ToolUse alternation was REMOVED
+    # entirely — `✓ <ToolName>` was the COMPLETION marker (every
+    # historical match was a completion record). Tool calls now
+    # surface as Thinking via the spinner (`⠦ Thinking... (esc to
+    # cancel, Ns)`). Final detect() shifted from tool_use → null:
+    # the final 40-row grid no longer matches any ToolUse pattern,
+    # and the visible `/quit` / summary text falls through to no-
+    # match. Transition sequence unchanged.
+    #
+    # FOLLOW-UP: if gemini 0.38.2+ adds a dedicated in-flight tool
+    # banner we can detect distinctly from Thinking, capture a new
+    # fixture + re-introduce a narrow ToolUse pattern.
+    expected_transitions: [starting, ready, idle, thinking]
+    expected_final_state: thinking
+    expected_final_detect: null
+    # #685 PR-3 (corpus expansion): final=thinking, no gemini productive
+    # markers (`✓ ReadFile|WriteFile|...`) in rendered output. The
+    # `Tool Calls: 1 ✓ 1` summary line in scenario does NOT match the
+    # marker regex (`✓ <CamelCaseToolName>`). F9 silent_stuck case for
+    # the gemini backend in tool-use scope.
+    scenario_kind: silent_stuck
+    expected_hung_classification: hung
+    capture_kind: real
+    provenance: "f685 PR-3 corpus relabel — existing v1 tooluse capture promoted to F9 measurement"
     schema_version: 2
 
   - file: kiro-tooluse.raw
@@ -483,6 +546,37 @@ fixtures:
     capture_kind: synthetic
     provenance: "f685 sub-task 5 synthetic — F9 anti-FP fixture (bare 'saved' in prose)"
     schema_version: 2
+
+  - file: f685-silent-stuck-stub.raw
+    backend: gemini
+    cli_version: "0.37.1"
+    recorded_on: "2026-05-14"
+    scenario: |
+      Synthetic Gemini session: agent enters Thinking via `⠦ Thinking...
+      (esc to cancel, Ns)` spinner cycle. No productive markers fire.
+      Models the #659 silent-stuck pattern as best-effort byte-only
+      stub: in production this would manifest as continued spinner
+      updates without underlying progress. Replay does not exercise
+      wall-clock silence thresholds; harness uses scenario_kind label
+      to short-circuit time-injection where deferred (see §F685-CORPUS.6).
+    # Replay observation: the `Type your message` idle prompt at fixture
+    # start drives Starting→Thinking directly (Idle pattern is offset by
+    # the `> please analyze` user-input line breaking the Idle match
+    # surface before the spinner appears). Observed [Starting, Thinking];
+    # the Idle hop is not produced under byte-level replay.
+    expected_transitions: [starting, thinking]
+    expected_final_state: thinking
+    expected_final_detect: thinking
+    scenario_kind: silent_stuck
+    expected_hung_classification: hung
+    capture_kind: synthetic_from_real_template
+    provenance: "f685 sub-task 5 synthetic — #659 silent-stuck template; real capture pending"
+    schema_version: 2
+
+  # #848 — state classifier root cause fixtures (PR-A).
+  # Synthetic from Anthropic docs verbatim error strings + Claude Code CLI
+  # observed phrasing. The classifier patterns at src/state.rs:194-197 and
+  # the new Claude UsageLimit pattern are pinned by the assertions below.
 
   - file: claude-rate-limit-429.raw
     backend: claude-code
@@ -613,6 +707,80 @@ fixtures:
     expected_final_detect: idle
     capture_kind: synthetic
     provenance: "#848 PR-B regression-proof — prose containing OpenCode old-pattern trigger substrings"
+
+  - file: gemini-rate-limit-typical.raw
+    backend: gemini
+    cli_version: "0.37.1"
+    recorded_on: "2026-05-16"
+    scenario: |
+      Gemini pane shows the canonical 429 / RESOURCE_EXHAUSTED /
+      rateLimitExceeded wordings observed in google-gemini/gemini-cli
+      issues #10722/#8437/#22545/#2305/#1502. The new Gemini RateLimit
+      pattern matches `429 RESOURCE_EXHAUSTED` / `rateLimitExceeded` /
+      `got status: 429` / `429 Too Many Requests` / `rate limit
+      exceeded` — full HTTP-context wording, not bare `\b429\b`.
+    expected_transitions: [starting, rate_limit]
+    expected_final_state: rate_limit
+    expected_final_detect: rate_limit
+    capture_kind: synthetic_from_docs
+    provenance: "#848 PR-B — synthetic from google-gemini/gemini-cli issue strings"
+
+  - file: gemini-discussion-text.raw
+    backend: gemini
+    cli_version: "0.37.1"
+    recorded_on: "2026-05-16"
+    scenario: |
+      Regression-proof fixture for #848 PR-B Gemini side. Pane contains
+      bare `429` substring (without specific HTTP wrapping) plus
+      `rate_limit` / `rate-limit` / `rate limit` prose. Under the OLD
+      Gemini pattern `r"RESOURCE_EXHAUSTED|\b429\b"` the bare `429`
+      triggered a false RateLimit on every tick. Under the post-#848
+      narrowed pattern (which keys on specific wrapping context like
+      `429 RESOURCE_EXHAUSTED` / `got status: 429`) the classifier
+      stays Idle.
+    expected_transitions: [starting, idle]
+    expected_final_state: idle
+    expected_final_detect: idle
+    capture_kind: synthetic
+    provenance: "#848 PR-B regression-proof — prose containing Gemini old-pattern trigger substrings"
+
+  - file: gemini-rate-limit-canonical-429.raw
+    backend: gemini
+    cli_version: "0.37.1"
+    recorded_on: "2026-05-17"
+    scenario: |
+      Gemini pane shows a minimal 429-anchored RateLimit display that
+      does NOT include the bare `rate limit exceeded` phrase. #854
+      dropped that bare alternation from the Gemini RateLimit pattern;
+      this fixture locks in the detection survival contract — the four
+      remaining alternations (`429 RESOURCE_EXHAUSTED`,
+      `rateLimitExceeded`, `got status: 429`, `429 Too Many Requests`)
+      must still classify a real Gemini 429 as RateLimit even when the
+      casual-wording fallback is absent.
+    expected_transitions: [starting, rate_limit]
+    expected_final_state: rate_limit
+    expected_final_detect: rate_limit
+    capture_kind: synthetic_from_docs
+    provenance: "#854 — synthetic from gemini-cli 429-response anchors"
+
+  - file: gemini-rate-limit-prose-discussion.raw
+    backend: gemini
+    cli_version: "0.37.1"
+    recorded_on: "2026-05-17"
+    scenario: |
+      Regression-proof fixture for #854 — the LOAD-BEARING test of the
+      bare-`rate limit exceeded` alternation drop. Pane contains the
+      bare 3-word phrase in dev-prose context (no 429, no
+      `RESOURCE_EXHAUSTED`, no `rateLimitExceeded`). Under the pre-#854
+      pattern this prose triggered a false RateLimit via the
+      defensive-insurance bare alternation. Under the post-#854
+      narrowed pattern the classifier stays Idle — the false-positive
+      class is closed.
+    expected_transitions: [starting, idle]
+    expected_final_state: idle
+    expected_final_detect: idle
+    capture_kind: synthetic
+    provenance: "#854 regression-proof — prose containing dropped Gemini alternation substring"
 
   - file: kiro-rate-limit-typical.raw
     backend: kiro-cli

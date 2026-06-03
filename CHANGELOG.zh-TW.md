@@ -5,9 +5,6 @@
 
 ## [Unreleased]
 
-### 移除
-- **Gemini CLI backend 退役**（[#1580](https://github.com/suzuke/agend-terminal/issues/1580),完成 [#8](https://github.com/suzuke/agend-terminal/issues/8))。`gemini-cli` 於 2026-06-18 停止服務(免費/Pro/Ultra);其官方後繼者 Antigravity CLI(`agy`)自 [#1547](https://github.com/suzuke/agend-terminal/issues/1547) 起即為支援的 backend。`Backend::Gemini` 變體、其 preset/偵測 patterns、以及 8 個 gemini state-replay fixtures 皆已移除。**操作者注意:** `fleet.yaml` 內指定的 `gemini` / `gemini-cli` 不再解析為受管 backend,改以泛用 `Raw` backend 啟動;請改用 `agy`。移除最後一個 legacy backend 也讓 legacy 偵測骨幹(`compile_for`、`config_for_legacy`、`config_for_productivity_legacy`、`legacy_initial_state`)得以刪除——每個 backend 現在皆透過其同址的 `BackendProfile` 路由(#8 完成)。
-
 ## [0.7.0] — 2026-05-28
 
 自 `0.6.1` 以來超過 200 個 commit，橫跨 Sprint 55–69（2026 年 5 月 7 日至 5 月 28 日）。三大主題：

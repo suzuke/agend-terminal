@@ -105,7 +105,7 @@ fn managed_backends_still_start_in_starting() {
     for backend in [
         Backend::ClaudeCode,
         Backend::KiroCli,
-        Backend::Agy,
+        Backend::Gemini,
         Backend::Codex,
         Backend::OpenCode,
     ] {
@@ -476,8 +476,8 @@ fn feed_fallback_expires_thinking_after_threshold() {
     // Thinking held past LATCHED_STATE_EXPIRY (30s) with no pattern
     // matching on the current screen must drop to Ready so a vanished
     // spinner cannot latch the tracker.
-    let mut t = tracker_at(&Backend::Agy, AgentState::Thinking, 31);
-    // Fresh screen content that matches no pattern for agy.
+    let mut t = tracker_at(&Backend::Gemini, AgentState::Thinking, 31);
+    // Fresh screen content that matches no pattern for gemini.
     t.feed("some unrelated output that matches nothing");
     assert_eq!(t.get_state(), AgentState::Ready);
 }
@@ -486,7 +486,7 @@ fn feed_fallback_expires_thinking_after_threshold() {
 fn feed_fallback_does_not_expire_before_threshold() {
     // Under the threshold Thinking must stay — legitimate thinking can
     // run for tens of seconds with a quiet but still-active spinner.
-    let mut t = tracker_at(&Backend::Agy, AgentState::Thinking, 10);
+    let mut t = tracker_at(&Backend::Gemini, AgentState::Thinking, 10);
     t.feed("some unrelated output that matches nothing");
     assert_eq!(t.get_state(), AgentState::Thinking);
 }
@@ -636,7 +636,7 @@ fn feed_fallback_gated_by_hash_dedup() {
     // tracker has been latched forever — the hash dedup short-circuits
     // feed() before detection runs. Feed the same no-match text twice;
     // only the first call can possibly trigger the fallback path.
-    let mut t = tracker_at(&Backend::Agy, AgentState::Thinking, 31);
+    let mut t = tracker_at(&Backend::Gemini, AgentState::Thinking, 31);
     t.feed("no marker");
     // Tracker already dropped to Ready on the first feed. Reset to
     // Thinking to exercise the dedup-gate specifically.
@@ -814,9 +814,9 @@ fn claude_tooluse_ing_verb_match() {
 
 #[test]
 fn pattern_does_not_cross_backends() {
-    // Claude's "❯" idle pattern should not match on Agy's tracker
-    let agy_patterns = StatePatterns::for_backend(&Backend::Agy);
-    let detected = agy_patterns.detect("❯");
+    // Claude's "❯" idle pattern should not match on Gemini tracker
+    let gemini_patterns = StatePatterns::for_backend(&Backend::Gemini);
+    let detected = gemini_patterns.detect("❯");
     assert_ne!(detected, Some(AgentState::Idle));
 }
 
@@ -1191,6 +1191,35 @@ fn recovery_notice_not_armed_for_unrelated_transitions() {
 }
 
 #[test]
+fn gemini_tooluse_banner_does_not_fire_per_1005() {
+    // #1005 Phase A1: gemini's `✓ <ToolName> <target>` lines ARE
+    // completion records — the `✓` IS the completion marker.
+    // Matching them as ToolUse caused priority oscillation against
+    // Idle (same class as the claude `✓ Bash` bug). Re-pinned:
+    // completion lines must NOT fire ToolUse.
+    //
+    // Follow-up risk acknowledged: gemini-tooluse.raw fixture does
+    // not cover an in-flight tool-call shape distinct from
+    // Thinking. If gemini adds a dedicated in-flight banner we can
+    // detect, capture a new fixture + re-introduce a narrow
+    // ToolUse pattern.
+    let patterns = StatePatterns::for_backend(&Backend::Gemini);
+    for sample in [
+        "   ✓  ReadFile  Cargo.toml",
+        "   ✓  WriteFile  /tmp/out.txt",
+        "   ✓  Edit  Cargo.toml",
+        "   ✓  Shell  ls -la",
+        "   ✓  WebFetch  https://example.com",
+    ] {
+        assert_ne!(
+            patterns.detect(sample),
+            Some(AgentState::ToolUse),
+            "#1005: gemini `✓` completion line must NOT fire ToolUse: {sample:?}"
+        );
+    }
+}
+
+#[test]
 fn codex_tooluse_past_tense_title_does_not_fire_per_1005() {
     // #1005 Phase A1: `• Explored|Edited|Ran` are past-tense title
     // lines — unambiguously completion-render. Matching them as
@@ -1419,6 +1448,90 @@ fn pipeline_opencode_thinking_via_vterm() {
 }
 
 #[test]
+fn pipeline_gemini_thinking_via_vterm() {
+    // Regression for BUG 1: matching on the bare word "Thinking"
+    // latched the state permanently because chat history kept the
+    // token visible. "esc to cancel" lives only on the active spinner
+    // line and is overwritten when streaming completes.
+    let mut vt = VTerm::new(120, 24);
+    let mut st = StateTracker::new(Some(&Backend::Gemini));
+    drive(&mut vt, &mut st, b"Type your message or @path/to/file\r\n");
+    assert_eq!(st.get_state(), AgentState::Idle);
+    drive(
+        &mut vt,
+        &mut st,
+        b"\xe2\xa0\xa6 Thinking... (esc to cancel, 2s)\r\n",
+    );
+    assert_eq!(st.get_state(), AgentState::Thinking);
+}
+
+#[test]
+fn pipeline_gemini_chat_history_does_not_latch_thinking() {
+    // Once the spinner line is gone, "Thinking" left behind in chat
+    // history (e.g. the model's narrative) must NOT keep detect() in
+    // Thinking. After hysteresis, screen should allow transition back
+    // to Idle on "Type your message" prompt re-appearing.
+    let mut vt = VTerm::new(120, 24);
+    let mut st = StateTracker::new(Some(&Backend::Gemini));
+    drive(
+        &mut vt,
+        &mut st,
+        b"\xe2\xa0\xa6 Thinking... (esc to cancel, 2s)\r\n",
+    );
+    assert_eq!(st.get_state(), AgentState::Thinking);
+    // Simulate hysteresis window closing — in production this is wall
+    // time between reads, here we backdate `since` so the passive-hold
+    // gate doesn't block the downgrade.
+    st.since = std::time::Instant::now() - std::time::Duration::from_secs(3);
+    // Clear screen, redraw with "I was thinking about..." in chat
+    // history and a fresh prompt. "Thinking" alone would have latched;
+    // now only the spinner line matches — and it's gone.
+    drive(
+        &mut vt,
+        &mut st,
+        b"\x1b[2J\x1b[HI was thinking about your question. 2+2 = 4.\r\nType your message or @path/to/file\r\n",
+    );
+    assert_eq!(
+        st.get_state(),
+        AgentState::Idle,
+        "stale 'Thinking' word in chat history must not latch"
+    );
+}
+
+#[test]
+fn gemini_thinking_pattern_matches_spinner_with_timer() {
+    // F39 contract (decision d-20260513231713506833-1): active Gemini
+    // spinner line with timer-paren prefix `(esc to cancel, Ns)` must
+    // trigger Thinking transition.
+    let mut vt = VTerm::new(120, 24);
+    let mut st = StateTracker::new(Some(&Backend::Gemini));
+    drive(
+        &mut vt,
+        &mut st,
+        b"\xe2\xa0\xa6 Thinking... (esc to cancel, 5s)\r\n",
+    );
+    assert_eq!(st.get_state(), AgentState::Thinking);
+}
+
+#[test]
+fn gemini_thinking_pattern_does_not_match_bare_scrollback_text() {
+    // F39 contract (decision d-20260513231713506833-1): prose containing
+    // literal "esc to cancel" without the timer-paren prefix (chat
+    // history, docs, help text) must NOT trigger Thinking. Locks the
+    // narrowing: r"esc to cancel" → r"\(esc to cancel,". Test asserts
+    // semantic outcome, not regex literal — future further-narrowing
+    // that preserves this contract is free to refactor.
+    let mut vt = VTerm::new(120, 24);
+    let mut st = StateTracker::new(Some(&Backend::Gemini));
+    drive(
+        &mut vt,
+        &mut st,
+        b"Press Ctrl-C or esc to cancel the operation.\r\n",
+    );
+    assert_ne!(st.get_state(), AgentState::Thinking);
+}
+
+#[test]
 fn pipeline_opencode_ready_prompt_resolves_to_idle() {
     // OpenCode's input prompt "Ask anything" matches BOTH the Idle
     // pattern (listed first) and the Ready pattern, so first-match
@@ -1578,6 +1691,7 @@ fn parse_backend(name: &str) -> Backend {
         "kiro" | "kiro-cli" => Backend::KiroCli,
         "codex" | "codex-cli" => Backend::Codex,
         "opencode" | "opencode-cli" => Backend::OpenCode,
+        "gemini" | "gemini-cli" => Backend::Gemini,
         // #987: agy / antigravity / antigravity-cli — Google's gemini-cli successor.
         "agy" | "antigravity" | "antigravity-cli" => Backend::Agy,
         other => panic!("unknown backend name in manifest: {other}"),
@@ -1846,6 +1960,11 @@ fn test_classify_fixtures() {
         (
             "codex_quota.txt",
             &Backend::Codex,
+            Some(BlockedReason::QuotaExceeded),
+        ),
+        (
+            "gemini_resource_exhausted.txt",
+            &Backend::Gemini,
             Some(BlockedReason::QuotaExceeded),
         ),
     ];
@@ -2198,6 +2317,10 @@ fn rate_limit_fixture_triggers_rate_limit_per_backend() {
             "tests/fixtures/state-replay/opencode-rate-limit-typical.raw",
         ),
         (
+            Backend::Gemini,
+            "tests/fixtures/state-replay/gemini-rate-limit-typical.raw",
+        ),
+        (
             Backend::KiroCli,
             "tests/fixtures/state-replay/kiro-rate-limit-typical.raw",
         ),
@@ -2288,6 +2411,10 @@ fn discussion_text_does_not_trigger_rate_limit_any_backend() {
         (
             Backend::OpenCode,
             "tests/fixtures/state-replay/opencode-discussion-text.raw",
+        ),
+        (
+            Backend::Gemini,
+            "tests/fixtures/state-replay/gemini-discussion-text.raw",
         ),
         (
             Backend::KiroCli,
@@ -2921,9 +3048,7 @@ fn for_backend_uses_oncelock() {
         .find("pub fn for_backend(")
         .expect("for_backend must exist");
     let rest = &src[fn_start..];
-    // #1580: `compile_for` (the old body boundary) is deleted; bound at the next
-    // method, `detect`.
-    let fn_end = rest.find("\n    pub fn detect(").unwrap_or(rest.len());
+    let fn_end = rest.find("\n    fn compile_for(").unwrap_or(rest.len());
     let body = &rest[..fn_end];
     assert!(
         body.contains("OnceLock"),
@@ -3015,6 +3140,7 @@ fn network_error_patterns_all_backends() {
         Backend::KiroCli,
         Backend::Codex,
         Backend::OpenCode,
+        Backend::Gemini,
     ];
     for backend in &backends {
         let patterns = StatePatterns::for_backend(backend);
@@ -3291,7 +3417,7 @@ fn claude_thinking_anchor_does_not_cross_backends_1541() {
     // The sparkle anchor is Claude-scoped; a Claude spinner frame fed to other
     // backends' pattern sets must not yield Thinking (each owns its own arm).
     let claude_frame = "✻ Whisking… (5s)";
-    for backend in [Backend::Codex, Backend::Agy, Backend::KiroCli] {
+    for backend in [Backend::Codex, Backend::Gemini, Backend::KiroCli] {
         let detected = StatePatterns::for_backend(&backend).detect(claude_frame);
         assert_ne!(
             detected,
@@ -3346,7 +3472,7 @@ fn claude_permission_footer_anchor_1546() {
         );
     }
     // The footer anchor is Claude-only — other backends don't borrow it.
-    for b in [Backend::Codex, Backend::Agy, Backend::KiroCli] {
+    for b in [Backend::Codex, Backend::Gemini, Backend::KiroCli] {
         assert_ne!(
             StatePatterns::for_backend(&b).detect("Esc to cancel · Tab to amend"),
             Some(AgentState::PermissionPrompt),
@@ -3380,6 +3506,19 @@ fn cross_backend_permission_chrome_anchor_1559() {
         kiro.detect("Thinking… (esc to cancel)"),
         Some(AgentState::PermissionPrompt),
         "kiro spinner footer must not fire PermissionPrompt"
+    );
+
+    // gemini: boxed header fires; bare 'suggest changes' prose does not.
+    let gemini = StatePatterns::for_backend(&Backend::Gemini);
+    assert_eq!(
+        gemini.detect("Allow execution of [Shell]?"),
+        Some(AgentState::PermissionPrompt),
+        "gemini boxed header must fire"
+    );
+    assert_ne!(
+        gemini.detect("I'll suggest changes to the PR after review"),
+        Some(AgentState::PermissionPrompt),
+        "#1559: bare 'suggest changes' prose must NOT fire PermissionPrompt"
     );
 
     // opencode: the option-row co-occurrence fires; single bare option words in

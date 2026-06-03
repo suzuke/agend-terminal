@@ -234,6 +234,7 @@ mod tests {
             Backend::ClaudeCode,
             Backend::Codex,
             Backend::OpenCode,
+            Backend::Gemini,
             Backend::Agy,
             Backend::Shell,
             Backend::Raw("whatever".into()),

@@ -1,0 +1,1 @@
+Error: RESOURCE_EXHAUSTED: Quota exceeded for aiplatform.googleapis.com/generate_content_requests_per_minute_per_project_per_base_model with base model: gemini-2.5-pro. Please submit a quota increase request.

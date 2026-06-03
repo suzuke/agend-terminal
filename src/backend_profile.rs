@@ -9,18 +9,17 @@
 //! profile is gathered into ONE `*_profile()` block here; a single trivial
 //! dispatch `match` ([`profile`]) replaces the five.
 //!
-//! Production routes EVERY backend through these profiles: `for_backend` /
-//! `config_for[_productivity]` / `StateTracker::new` all source from
-//! [`profile`], which is TOTAL (`&'static BackendProfile`, no `Option`). The
-//! data-bundle migration train (step-0 #1683 reroute → OpenCode #1686 → Codex
-//! #1687 → ClaudeCode #1689 → delete-legacy) was each proven byte-identical to
-//! legacy at its own merge; #1580 then retired the last legacy backend
-//! (`Gemini`), deleting the legacy detection spine (`compile_for`,
-//! `config_for_legacy`, `config_for_productivity_legacy`, `legacy_initial_state`,
-//! the `_ =>` catch-alls) and the runtime drift-guards — the exhaustive `match`
-//! in [`profile`] now statically guarantees every backend has a profile.
-//! Detection correctness is pinned by the fixture-replay suite + per-backend
-//! state tests.
+//! Production routes ALL backends EXCEPT `Gemini` through these profiles
+//! (for_backend / config_for[_productivity] / StateTracker::new return the
+//! profile for `profile()`-Some backends). `Gemini` is the sole remaining
+//! legacy backend (skipped — retiring via #1580); when #1580 lands, the
+//! Gemini-only legacy stubs + `_ =>` catch-alls disappear too. The data-bundle
+//! migration train (step-0 #1683 reroute → OpenCode #1686 → Codex #1687 →
+//! ClaudeCode #1689 → this delete-legacy PR) was each proven byte-identical to
+//! legacy at its own merge; detection correctness is now pinned by the
+//! fixture-replay suite + per-backend state tests, and the two structural guards
+//! below (drift-guard: `migrated()` ⟺ `profile().is_some()`; and "Gemini is the
+//! only profile-None backend").
 
 use crate::backend::Backend;
 use crate::behavioral::{BehavioralConfig, MarkerCacheId, ProductivityConfig};
@@ -31,10 +30,10 @@ use std::sync::OnceLock;
 ///
 /// #8 Phase 2 step-0: now consumed by PROD — `StatePatterns::for_backend`,
 /// `behavioral::config_for[_productivity]`, and `StateTracker::new` route
-/// every backend through [`profile`] (#1580: the legacy path is gone).
+/// migrated backends through [`profile`] (else legacy). No longer a scaffold.
 pub struct BackendProfile {
     /// Raw `(state, regex)` detection patterns in priority order — compiled by
-    /// the state machine via `StatePatterns::from_raw_patterns`.
+    /// the state machine exactly as `StatePatterns::compile_for` does today.
     pub patterns: Vec<(AgentState, &'static str)>,
     pub behavioral: BehavioralConfig,
     pub productivity: ProductivityConfig,
@@ -42,15 +41,11 @@ pub struct BackendProfile {
 }
 
 /// The single dispatch: `Backend → &'static BackendProfile`, lazy-cached
-/// (compile-once, mirroring `StatePatterns::for_backend`'s `OnceLock`). This
-/// `match` is the ONE unavoidable flat-enum lookup; the per-backend DATA lives
-/// in the builders below, one block each.
-///
-/// #1580: now total (no `Option`). Gemini was the last legacy backend; with it
-/// retired EVERY variant has a profile, so the type encodes "every backend has a
-/// profile" and the legacy detection spine is gone. The exhaustive `match`
-/// replaces the old drift-guard runtime invariant.
-pub fn profile(backend: &Backend) -> &'static BackendProfile {
+/// (compile-once, mirroring `StatePatterns::for_backend`'s `OnceLock`). Returns
+/// `None` for backends not yet migrated (their data still lives on the legacy
+/// match path). This `match` is the ONE unavoidable flat-enum lookup; the
+/// per-backend DATA lives in the builders below, one block each.
+pub fn profile(backend: &Backend) -> Option<&'static BackendProfile> {
     static AGY: OnceLock<BackendProfile> = OnceLock::new();
     static KIRO: OnceLock<BackendProfile> = OnceLock::new();
     static OPENCODE: OnceLock<BackendProfile> = OnceLock::new();
@@ -60,12 +55,13 @@ pub fn profile(backend: &Backend) -> &'static BackendProfile {
     // identically (empty patterns, default behavioral, generic productivity, Ready).
     static EMPTY: OnceLock<BackendProfile> = OnceLock::new();
     match backend {
-        Backend::Agy => AGY.get_or_init(agy_profile),
-        Backend::KiroCli => KIRO.get_or_init(kirocli_profile),
-        Backend::OpenCode => OPENCODE.get_or_init(opencode_profile),
-        Backend::Codex => CODEX.get_or_init(codex_profile),
-        Backend::ClaudeCode => CLAUDE.get_or_init(claudecode_profile),
-        Backend::Shell | Backend::Raw(_) => EMPTY.get_or_init(empty_profile),
+        Backend::Agy => Some(AGY.get_or_init(agy_profile)),
+        Backend::KiroCli => Some(KIRO.get_or_init(kirocli_profile)),
+        Backend::OpenCode => Some(OPENCODE.get_or_init(opencode_profile)),
+        Backend::Codex => Some(CODEX.get_or_init(codex_profile)),
+        Backend::ClaudeCode => Some(CLAUDE.get_or_init(claudecode_profile)),
+        Backend::Shell | Backend::Raw(_) => Some(EMPTY.get_or_init(empty_profile)),
+        _ => None,
     }
 }
 
@@ -89,10 +85,10 @@ fn agy_profile() -> BackendProfile {
             supports_cursor_query: false,
         },
         productivity: ProductivityConfig {
-            markers: crate::behavioral::AGY_PRODUCTIVE_MARKERS,
+            markers: crate::behavioral::GEMINI_PRODUCTIVE_MARKERS,
             use_heartbeat: true,
             heartbeat_fresh_window_ms: 10_000,
-            cache_id: Some(MarkerCacheId::Agy),
+            cache_id: Some(MarkerCacheId::Gemini),
         },
         initial_state: AgentState::Starting,
     }
@@ -351,5 +347,95 @@ fn empty_profile() -> BackendProfile {
             cache_id: Some(MarkerCacheId::Generic),
         },
         initial_state: AgentState::Ready,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn migrated() -> Vec<Backend> {
+        vec![
+            Backend::Agy,
+            Backend::KiroCli,
+            Backend::OpenCode,
+            Backend::Codex,
+            Backend::ClaudeCode,
+            Backend::Shell,
+            Backend::Raw("x".to_string()),
+        ]
+    }
+
+    // #8 delete-legacy: the four `*_byte_identical_to_legacy` /
+    // `for_backend_classify_parity_with_legacy` tests are REMOVED here — deleting
+    // the legacy arms removes their comparison baseline (each migration already
+    // proved byte-identity at its own merge). Detection correctness is now pinned
+    // by the fixture-replay suite (`replay_manifest_regression` +
+    // `tests/fixtures/state-replay/*.raw`, which run through the profile-routed
+    // `StatePatterns::for_backend`) + the per-backend tests in `state/tests.rs`,
+    // plus the two structural guards below.
+
+    /// #8 delete-legacy mitigation: Gemini is the ONLY backend on the legacy path
+    /// — EVERY other variant must have a profile. A new backend added to the enum
+    /// without a profile would be a 2nd `None` and silently fall into
+    /// `compile_for`'s `_ => vec![]` catch-all (no detection); this makes that go
+    /// red. (The drift-guard checks `migrated()` ⟺ `profile()` but NOT "no profile
+    /// at all" — both would read `false` and pass; this is the complementary
+    /// guard.)
+    #[test]
+    fn gemini_is_the_only_profile_none_backend() {
+        for b in [
+            Backend::ClaudeCode,
+            Backend::KiroCli,
+            Backend::Codex,
+            Backend::OpenCode,
+            Backend::Agy,
+            Backend::Shell,
+            Backend::Raw("x".to_string()),
+        ] {
+            assert!(
+                profile(&b).is_some(),
+                "{b:?} must have a BackendProfile — only Gemini stays on legacy"
+            );
+        }
+        assert!(
+            profile(&Backend::Gemini).is_none(),
+            "Gemini is the only backend left on the legacy path (#1580 retires it)"
+        );
+    }
+
+    /// #8 Phase 2 (codex/#1687) DRIFT GUARD — the systemic fix. `migrated()` (the
+    /// TEST set the byte-identical parity tests iterate) and `profile()` (the PROD
+    /// routing) are two INDEPENDENT lists. If a backend is wired into `profile()`
+    /// but missing from `migrated()`, its byte-identity is SILENTLY un-tested (the
+    /// parity loop just skips it → false-green); the reverse leaves a `migrated()`
+    /// entry with no prod profile. Assert the two agree BIDIRECTIONALLY over EVERY
+    /// `Backend` variant (by discriminant, so `Raw(_)` matches regardless of
+    /// payload) so any future drift goes red immediately. This is the check that
+    /// would have caught the class codex flagged on this PR.
+    #[test]
+    fn migrated_set_matches_profile_some_bidirectional_drift_guard() {
+        use std::mem::discriminant;
+        let all = [
+            Backend::ClaudeCode,
+            Backend::KiroCli,
+            Backend::Codex,
+            Backend::OpenCode,
+            Backend::Gemini,
+            Backend::Agy,
+            Backend::Shell,
+            Backend::Raw("x".to_string()),
+        ];
+        let m = migrated();
+        for b in &all {
+            let in_migrated = m.iter().any(|x| discriminant(x) == discriminant(b));
+            let has_profile = profile(b).is_some();
+            assert_eq!(
+                in_migrated, has_profile,
+                "{b:?}: in migrated()={in_migrated} but profile().is_some()={has_profile} — \
+                 migrated() (parity-test set) and profile() (prod routing) have DRIFTED. A backend \
+                 wired into profile() yet missing from migrated() is SILENTLY un-parity-tested."
+            );
+        }
     }
 }

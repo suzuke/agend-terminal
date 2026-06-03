@@ -112,7 +112,7 @@ fn config_lock_path(path: &Path) -> PathBuf {
     parent.join(format!(".{name}.lock"))
 }
 
-/// Upsert mcpServers.agend-terminal in a JSON file (Claude, Kiro format).
+/// Upsert mcpServers.agend-terminal in a JSON file (Claude, Gemini, Kiro format).
 ///
 /// Flock-serialised + atomic write. Prior implementation `fs::write`'d
 /// directly with no lock, so two concurrent `create_instance` calls
@@ -239,14 +239,54 @@ fn configure_kiro(working_dir: &Path, instance_name: Option<&str>) -> Result<()>
     Ok(())
 }
 
+/// Gemini: .gemini/settings.json — uses { "mcpServers": { ... } } format.
+///
+/// Adds `"trust": true` to the agend-terminal entry. `--yolo` / `--approval-mode
+/// yolo` only auto-approve built-in tools and shell; MCP tool calls still
+/// prompt unless the server is marked trusted in settings.json.
+fn configure_gemini(working_dir: &Path, instance_name: Option<&str>) -> Result<()> {
+    let path = working_dir.join(".gemini").join("settings.json");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Flock + atomic write so concurrent spawn calls can't lose each
+    // other's edits to the shared settings.json.
+    let _lock = crate::store::acquire_file_lock(&config_lock_path(&path))?;
+
+    let mut config: serde_json::Value = if path.exists() {
+        let content = std::fs::read_to_string(&path)?;
+        serde_json::from_str(&content).unwrap_or(json!({}))
+    } else {
+        json!({})
+    };
+    if config.get("mcpServers").is_none() {
+        config["mcpServers"] = json!({});
+    }
+    let mut env = json!({ "AGEND_HOME": home_path() });
+    if let Some(name) = instance_name {
+        env["AGEND_INSTANCE_NAME"] = json!(name);
+    }
+    let (cmd, args) = bridge_binary_path();
+    config["mcpServers"]["agend-terminal"] = json!({
+        "command": cmd,
+        "args": args,
+        "env": env,
+        "trust": true
+    });
+    let body = serde_json::to_string_pretty(&config)?;
+    crate::store::atomic_write(&path, body.as_bytes())?;
+    tracing::debug!(path = %path.display(), "configured MCP");
+    Ok(())
+}
+
 /// AGY (Google Antigravity CLI): write `<workdir>/.agents/mcp_config.json`.
 ///
 /// #1547 un-gate: agy loads project-scoped MCP via the official Customization
 /// Roots dir `<workspace>/.agents/` (operator-verified: plain + yolo
 /// `--dangerously-skip-permissions` both load `✓ agend-terminal Tools`). This
 /// replaces the dead `.antigravitycli/mcp_config.json` write (#995 Bug 3 — agy
-/// ignored that file's `mcpServers`). **Self-contained** — #1580: the
-/// gemini-cli MCP writer is retired; agy's writer never depended on it.
+/// ignored that file's `mcpServers`). **Self-contained** — deliberately NOT
+/// coupled to `configure_gemini` (gemini sunsets 2026-06-18 / #1580).
 ///
 /// The file carries ONLY the `mcpServers` block and is written FRESH (not
 /// merged) each spawn, so a stale/garbled prior file cannot poison discovery —
@@ -557,6 +597,7 @@ pub fn configure(working_dir: &Path, command: &str, instance_name: Option<&str>)
     let result = match backend {
         Some(crate::backend::Backend::ClaudeCode) => configure_claude(working_dir, instance_name),
         Some(crate::backend::Backend::KiroCli) => configure_kiro(working_dir, instance_name),
+        Some(crate::backend::Backend::Gemini) => configure_gemini(working_dir, instance_name),
         Some(crate::backend::Backend::Agy) => configure_agy(working_dir, instance_name),
         Some(crate::backend::Backend::OpenCode) => configure_opencode(working_dir, instance_name),
         Some(crate::backend::Backend::Codex) => configure_codex(working_dir, instance_name),
@@ -843,6 +884,32 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // --- Gemini: mcpServers format ---
+
+    #[test]
+    fn gemini_uses_mcpservers() {
+        let dir = tmp_dir("gemini");
+        configure_gemini(&dir, None).expect("configure");
+        let content = std::fs::read_to_string(dir.join(".gemini/settings.json")).expect("read");
+        let config: serde_json::Value = serde_json::from_str(&content).expect("parse");
+        assert!(config.get("mcpServers").is_some());
+        assert!(config["mcpServers"]["agend-terminal"]["command"].is_string());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn gemini_mcp_server_marked_trusted() {
+        let dir = tmp_dir("gemini_trust");
+        configure_gemini(&dir, None).expect("configure");
+        let content = std::fs::read_to_string(dir.join(".gemini/settings.json")).expect("read");
+        let config: serde_json::Value = serde_json::from_str(&content).expect("parse");
+        assert_eq!(
+            config["mcpServers"]["agend-terminal"]["trust"], true,
+            "Gemini --yolo doesn't cover MCP — settings.json must mark server trusted"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     // --- Claude: mcp-config.json + .claude/settings.local.json ---
 
     #[test]
@@ -869,13 +936,21 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn configure_dispatches_gemini() {
+        let dir = tmp_dir("dispatch_gem");
+        configure(&dir, "gemini", None);
+        assert!(dir.join(".gemini/settings.json").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// #987: configure dispatches Backend::Agy to write the standard
     /// #995 Bug 3: configure_agy is a no-op since empirical proof showed
     /// #1547: AGY now loads project-scoped MCP via the official Customization
     /// Roots file `<workspace>/.agents/mcp_config.json`. The dispatcher routes
-    /// to `configure_agy`, which writes that file (self-contained — #1580: the
-    /// gemini-cli MCP writer is retired) with the bridge entry + `trust:true` +
-    /// per-instance env. The dead `.antigravitycli/` write (#995 Bug 3) is gone.
+    /// to `configure_agy`, which writes that file (self-contained — NOT coupled
+    /// to configure_gemini) with the bridge entry + `trust:true` + per-instance
+    /// env. The dead `.antigravitycli/` write (#995 Bug 3) is gone.
     #[test]
     fn configure_dispatches_agy_writes_agents_mcp() {
         let dir = tmp_dir("dispatch_agy");
@@ -907,9 +982,8 @@ mod tests {
             server["env"]["AGEND_HOME"].as_str().is_some(),
             "AGEND_HOME must be present in the bridge env"
         );
-        // The dead legacy path must NOT be written, and the workdir `.gemini/`
-        // must be untouched (#1580: configure_agy is self-contained — it never
-        // wrote a project-local `.gemini/`).
+        // The dead legacy path must NOT be written, and gemini's .gemini/ must
+        // be untouched (configure_agy is self-contained, not configure_gemini).
         assert!(!dir.join(".antigravitycli").exists());
         assert!(!dir.join(".gemini").exists());
         std::fs::remove_dir_all(&dir).ok();
@@ -948,6 +1022,34 @@ mod tests {
             toml_string_value(r"C:\Program' Files\x"),
             r#""C:\\Program' Files\\x""#
         );
+    }
+
+    #[test]
+    fn gemini_concurrent_configure_keeps_json_valid_and_trusted() {
+        // Stage 2 extended the per-path flock to Gemini/Kiro/Claude/OpenCode.
+        // Race configure_gemini from 8 threads on the same working_dir and
+        // assert the settings.json is still parseable and retains the trust flag.
+        let dir = tmp_dir("gemini_concurrent");
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    configure_gemini(&dir, None).expect("configure_gemini");
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("thread join");
+        }
+
+        let content = std::fs::read_to_string(dir.join(".gemini/settings.json")).expect("read");
+        let config: serde_json::Value =
+            serde_json::from_str(&content).expect("concurrent writes must leave valid JSON");
+        assert_eq!(
+            config["mcpServers"]["agend-terminal"]["trust"], true,
+            "trust must still be true after concurrent configures"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

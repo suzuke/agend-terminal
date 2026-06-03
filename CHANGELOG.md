@@ -5,9 +5,6 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 ## [Unreleased]
 
-### Removed
-- **Gemini CLI backend retired** ([#1580](https://github.com/suzuke/agend-terminal/issues/1580), completes [#8](https://github.com/suzuke/agend-terminal/issues/8)). `gemini-cli` sunsets 2026-06-18 (free/Pro/Ultra); its official successor Antigravity CLI (`agy`) has been a supported backend since [#1547](https://github.com/suzuke/agend-terminal/issues/1547). The `Backend::Gemini` variant, its preset/detection patterns, and the 8 gemini state-replay fixtures are removed. **Operator note:** a `gemini` / `gemini-cli` backend named in `fleet.yaml` no longer resolves to a managed backend — it now spawns as a generic `Raw` backend. Switch such entries to `agy`. Removing the last legacy backend also let the legacy detection spine (`compile_for`, `config_for_legacy`, `config_for_productivity_legacy`, `legacy_initial_state`) be deleted — every backend now routes through its co-located `BackendProfile` (#8 complete).
-
 ## [0.7.0] — 2026-05-28
 
 200+ commits since `0.6.1` over Sprint 55–69 (May 7 → May 28, 2026). Three themes dominate:
