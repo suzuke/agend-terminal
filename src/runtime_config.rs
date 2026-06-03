@@ -37,6 +37,13 @@ pub struct RuntimeConfig {
     /// is a no-op — no dev-idle or fleet-idle alerts fire. Default true.
     #[serde(default = "default_true")]
     pub idle_watchdog_enabled: bool,
+    /// #1713/#1523 aid: when true, each pane title appends a `[<State>]` text
+    /// badge of the detected `AgentState` so the operator can eyeball-verify
+    /// state detection. Default false (off — the colour dot is the steady-state
+    /// signal; this is a temporary diagnostic toggle). Hot-reloadable via the
+    /// `config` MCP tool, like the other gates here.
+    #[serde(default)]
+    pub show_pane_state: bool,
 }
 
 fn default_true() -> bool {
@@ -62,6 +69,7 @@ impl Default for RuntimeConfig {
             hang_auto_recovery_enabled: false,
             usage_limit_propagation_enabled: false,
             idle_watchdog_enabled: true,
+            show_pane_state: false,
         }
     }
 }
@@ -177,6 +185,13 @@ pub fn set(home: &Path, key: &str, value: &str) -> Result<String, String> {
                 _ => return Err(format!("invalid boolean: {value} (use true/false)")),
             };
         }
+        "show_pane_state" => {
+            config.show_pane_state = match value {
+                "true" | "1" => true,
+                "false" | "0" => false,
+                _ => return Err(format!("invalid boolean: {value} (use true/false)")),
+            };
+        }
         _ => return Err(format!("unknown config key: {key}")),
     }
     let path = home.join("runtime-config.json");
@@ -196,6 +211,7 @@ pub fn get_key(key: &str) -> Result<String, String> {
         "hang_auto_recovery_enabled" => Ok(config.hang_auto_recovery_enabled.to_string()),
         "usage_limit_propagation_enabled" => Ok(config.usage_limit_propagation_enabled.to_string()),
         "idle_watchdog_enabled" => Ok(config.idle_watchdog_enabled.to_string()),
+        "show_pane_state" => Ok(config.show_pane_state.to_string()),
         _ => Err(format!("unknown config key: {key}")),
     }
 }
@@ -251,6 +267,26 @@ mod tests {
         set(&dir, "hang_auto_recovery_enabled", "false").unwrap();
         reload(&dir);
         assert_eq!(get_key("hang_auto_recovery_enabled").unwrap(), "false");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #1713: the pane-state badge flag is OFF by default and runtime-toggleable
+    /// via the same `set`/persist/reload path as the other gates (the `config`
+    /// MCP tool reaches `set`), so the operator can flip it without a rebuild.
+    #[test]
+    fn show_pane_state_default_off_and_toggleable_1713() {
+        assert!(
+            !RuntimeConfig::default().show_pane_state,
+            "show_pane_state must default OFF"
+        );
+        let dir = std::env::temp_dir().join("agend-test-runtime-config-panestate");
+        std::fs::create_dir_all(&dir).ok();
+        set(&dir, "show_pane_state", "true").unwrap();
+        reload(&dir);
+        assert_eq!(get_key("show_pane_state").unwrap(), "true");
+        set(&dir, "show_pane_state", "false").unwrap();
+        reload(&dir);
+        assert_eq!(get_key("show_pane_state").unwrap(), "false");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

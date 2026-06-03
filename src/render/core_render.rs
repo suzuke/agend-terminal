@@ -405,7 +405,12 @@ fn render_pane(
         (s, s, 1u8)
     };
 
-    let title_segments = pane_title_segments(pane, title_style);
+    let title_segments = pane_title_segments(
+        pane,
+        title_style,
+        state,
+        crate::runtime_config::get().show_pane_state,
+    );
 
     let inner = Rect::new(
         area.x + 1,
@@ -485,6 +490,8 @@ fn render_pane(
 pub(super) fn pane_title_segments(
     pane: &crate::layout::Pane,
     title_style: Style,
+    state: AgentState,
+    show_state_badge: bool,
 ) -> Vec<(String, Style)> {
     let mut segments = Vec::new();
     let base = format!(" {}", pane.label());
@@ -497,6 +504,15 @@ pub(super) fn pane_title_segments(
                 .fg(Color::Black)
                 .add_modifier(Modifier::BOLD),
         ));
+    }
+    // #1713/#1523 diagnostic (runtime_config.show_pane_state, default off): append
+    // a `[<State>]` text badge of the DETECTED AgentState so the operator can
+    // eyeball-verify detection against the live pane. Extra text only — the
+    // pane's colour (state_color) is untouched, and it uses the same
+    // `title_style` so it introduces no new colour. The transient
+    // Restarting/Crashed tab-bar badge (`transient_state_badge`) is unaffected.
+    if show_state_badge {
+        segments.push((format!(" [{state:?}]"), title_style));
     }
     segments.push((" ".to_string(), title_style));
     segments
@@ -626,7 +642,7 @@ mod tests {
             selection: None,
             source: PaneSource::Local,
         };
-        let segments = pane_title_segments(&pane, Style::default());
+        let segments = pane_title_segments(&pane, Style::default(), AgentState::Idle, false);
         let joined = segments
             .into_iter()
             .map(|(text, _)| text)
@@ -653,12 +669,50 @@ mod tests {
             selection: None,
             source: PaneSource::Local,
         };
-        let segments = pane_title_segments(&pane, Style::default());
+        // #1713 flag OFF (default): no state badge appended; only the base label
+        // (+ the transient Restarting/Crashed tab badge, which lives elsewhere).
+        let segments = pane_title_segments(&pane, Style::default(), AgentState::Idle, false);
         let joined: String = segments.iter().map(|(t, _)| t.as_str()).collect();
         assert!(
-            !joined.contains("[idle]"),
-            "pane title must not contain state suffix, got: {joined}"
+            !joined.contains("[Idle]") && !joined.contains("[idle]"),
+            "flag-off: pane title must not contain a state badge, got: {joined}"
         );
+    }
+
+    /// #1713 flag ON: the pane title appends a `[<State>]` badge of the detected
+    /// AgentState (all states), so the operator can eyeball-verify detection.
+    #[test]
+    fn pane_title_state_badge_when_flag_on_1713() {
+        let pane = Pane {
+            agent_name: "agent".into(),
+            instance_id: crate::types::InstanceId::default(),
+            vterm: VTerm::new(10, 10),
+            rx: crossbeam_channel::bounded(1).1,
+            id: 1,
+            backend: Some(crate::backend::Backend::ClaudeCode),
+            working_dir: None,
+            display_name: None,
+            scroll_offset: 0,
+            has_notification: false,
+            fleet_instance_name: None,
+            last_input_at: None,
+            pending_notification_count: 0,
+            selection: None,
+            source: PaneSource::Local,
+        };
+        for (state, want) in [
+            (AgentState::ServerRateLimit, "[ServerRateLimit]"),
+            (AgentState::PermissionPrompt, "[PermissionPrompt]"),
+            (AgentState::Thinking, "[Thinking]"),
+            (AgentState::Idle, "[Idle]"),
+        ] {
+            let segments = pane_title_segments(&pane, Style::default(), state, true);
+            let joined: String = segments.iter().map(|(t, _)| t.as_str()).collect();
+            assert!(
+                joined.contains(want),
+                "flag-on: title must contain {want}, got: {joined}"
+            );
+        }
     }
 
     #[test]
