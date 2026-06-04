@@ -1020,7 +1020,9 @@ fn replay_missed_at_startup(home: &Path, registry: &AgentRegistry) {
                 .map(|h| (agent::InjectTarget::from_handle(h), h.name.to_string()))
         };
         if let Some((tgt, name)) = inject_snap {
-            if let Err(e) = agent::inject_with_target_gated(&tgt, &name, message.as_bytes(), false)
+            // #1769: not a daemon auto-nudge (operator/relay message) → no marker.
+            if let Err(e) =
+                agent::inject_with_target_gated(&tgt, &name, message.as_bytes(), false, None)
             {
                 tracing::warn!(error = %e, "replay inject failed");
             }

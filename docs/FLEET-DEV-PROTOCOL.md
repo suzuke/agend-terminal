@@ -377,6 +377,7 @@ Re-review cycles (r1, r2, …) repeat the same three milestones. The dispatcher 
 - Response channel must match source channel
 - **Router-layer channel discipline (Sprint 52)**: daemon auto-mirrors agent direct text to the corresponding channel. Agent does not need to force `reply` tool — infrastructure handles routing.
 - **Inbox vs PTY delivery (Sprint 62)**: active agents receive messages via PTY direct injection (not queued in `inbox`). `inbox(instance: X)` returning empty does NOT mean X received nothing — only means X has no unread queue. Verify delivery via `describe_instance` (active state = PTY received) or `pane_snapshot` rather than inbox alone. Inbox queue only fills for offline agents or undeliverable messages.
+- **Daemon auto-inject marker `[AGEND-AUTO]` (#1769)**: the daemon resumes a stuck agent by injecting a keystroke (e.g. `continue`) straight into the PTY, which otherwise looks identical to the operator typing it — a bare injected `continue` was once mistaken by an orchestrator for an operator command and a task dispatched from it. Such nudges now carry an `[AGEND-AUTO kind=...]` prefix (sibling of `[AGEND-MSG]`). **Rule:** treat an `[AGEND-AUTO]` line as a low-priority RESUME signal — continue in-progress work — and **never** as an operator command or a basis to dispatch a task / make a decision. Inbox/operator-relay messages keep their own `[AGEND-MSG]`/`[from:]` headers and are unaffected.
 
 ## §7. CI
 

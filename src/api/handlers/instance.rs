@@ -33,7 +33,9 @@ pub(crate) fn handle_inject(params: &Value, ctx: &HandlerCtx) -> Value {
                 let result = if raw {
                     agent::write_to_pty(&tgt.pty_writer, data.as_bytes())
                 } else {
-                    agent::inject_with_target_gated(&tgt, name, data.as_bytes(), true)
+                    // #1769: the api INJECT path carries operator/relay data (and
+                    // its own headers) — not a daemon auto-nudge → no marker.
+                    agent::inject_with_target_gated(&tgt, name, data.as_bytes(), true, None)
                 };
                 match result {
                     Ok(()) => json!({"ok": true, "result": {"bytes": data.len()}}),

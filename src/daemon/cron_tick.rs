@@ -212,7 +212,8 @@ fn deliver_cron_fire(
         // in run_history, and let the auto-disable below retire it.
         "missed"
     } else if let Some((tgt, name)) = inject_snap.as_ref() {
-        match agent::inject_with_target_gated(tgt, name, message.as_bytes(), false) {
+        // #1769: cron is an operator-scheduled action, not a daemon auto-nudge → no marker.
+        match agent::inject_with_target_gated(tgt, name, message.as_bytes(), false, None) {
             Ok(()) => "ok",
             Err(e) => {
                 tracing::warn!(error = %e, "schedule inject failed");
