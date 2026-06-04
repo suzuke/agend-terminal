@@ -1266,6 +1266,62 @@ mod tests {
         );
     }
 
+    /// #1744-H2 (codex HIGH regression): persisting a Hung anchor then RECOVERING
+    /// must propagate the CLEAR to the snapshot — so a restart rehydrates `None`,
+    /// not the stale anchor. Otherwise the next (unrelated) Hung re-entry's
+    /// `get_or_insert` would keep the stale, already-elapsed anchor and
+    /// `hung_escalation_due` would fire immediately (a false escalation).
+    #[test]
+    fn cleared_hung_anchor_snapshots_as_none_no_false_escalation_1744_h2() {
+        // 1) Enter Hung → anchor set; the snapshot carries it.
+        let mut h = HealthTracker::new();
+        assert!(h.check_hang(
+            AgentState::Thinking,
+            Duration::from_secs(700),
+            Duration::from_secs(0),
+            1_000_000,
+            0,
+        ));
+        assert!(h.escalation_snapshot().hung_since_epoch_ms.is_some());
+
+        // 2) Recover (silence drops) → Hung exit clears the anchor → the snapshot
+        //    we would persist now carries None.
+        assert!(!h.check_hang(
+            AgentState::Idle,
+            Duration::from_secs(0),
+            Duration::from_secs(0),
+            1_000_000,
+            0,
+        ));
+        let cleared = h.escalation_snapshot();
+        assert!(
+            cleared.hung_since_epoch_ms.is_none(),
+            "#1744-H2: the cleared snapshot must carry hung_since=None"
+        );
+
+        // 3) Restart: rehydrate the cleared snapshot → no anchor.
+        let mut after = HealthTracker::new();
+        after.rehydrate_escalation(&cleared);
+        assert!(
+            after.hung_since.is_none(),
+            "rehydrated cleared anchor is None"
+        );
+
+        // 4) A later, unrelated Hung episode anchors FRESH (≈now) → not yet due,
+        //    so no false immediate escalation (the bug had it fire at once).
+        assert!(after.check_hang(
+            AgentState::Thinking,
+            Duration::from_secs(700),
+            Duration::from_secs(0),
+            1_000_000,
+            0,
+        ));
+        assert!(
+            !after.hung_escalation_due(Duration::from_secs(60)),
+            "#1744-H2: a fresh post-recovery Hung must NOT escalate immediately (stale anchor would have)"
+        );
+    }
+
     #[test]
     fn test_first_crash_silent() {
         let mut h = HealthTracker::new();

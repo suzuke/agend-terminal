@@ -49,14 +49,26 @@ impl PerTickHandler for HangDetectionHandler {
         // was just anchored). #1744-H2 persists a self-orch's anchor on entry
         // (not only on escalation) so a restart in the first confirm-window
         // doesn't reset it.
-        let (hung_now, newly_hung): (Vec<String>, std::collections::HashSet<String>) = {
+        // `hung_now`: every agent currently Hung. `newly_hung`: entered this tick.
+        // `left_hung`: was Hung before this tick's `check_hang` and is no longer —
+        // a recovery/exit that cleared `hung_since` in memory; #1744-H2 must
+        // persist that CLEAR (else a restart rehydrates the stale anchor and the
+        // next unrelated Hung re-entry's `get_or_insert` keeps it → false
+        // immediate escalation. codex catch).
+        let (hung_now, newly_hung, left_hung): (
+            Vec<String>,
+            std::collections::HashSet<String>,
+            Vec<String>,
+        ) = {
             let reg = agent::lock_registry_tracked(ctx.registry, "hang_detection");
             let mut hung = Vec::new();
             let mut newly = std::collections::HashSet::new();
+            let mut left = Vec::new();
             for handle in reg.values() {
                 let name = handle.name.as_str();
                 let mut core = handle.core.lock();
                 core.health.maybe_decay();
+                let was_hung = core.health.state == crate::health::HealthState::Hung;
                 let agent_state = core.state.current;
                 let silent = core.state.last_output.elapsed();
                 // F9 (#685 sub-task 4): productive-silence reads the new
@@ -81,14 +93,18 @@ impl PerTickHandler for HangDetectionHandler {
                         "hang detected"
                     );
                 }
-                if core.health.state == crate::health::HealthState::Hung {
+                let now_hung = core.health.state == crate::health::HealthState::Hung;
+                if now_hung {
                     hung.push(name.to_string());
                     if just_detected {
                         newly.insert(name.to_string());
                     }
+                } else if was_hung {
+                    // Hung → not-Hung this tick: `check_hang` cleared `hung_since`.
+                    left.push(name.to_string());
                 }
             }
-            (hung, newly)
+            (hung, newly, left)
         };
 
         // Phase 2/3 (#1701 Hung half): a self-orchestrator stuck Hung past the
@@ -129,6 +145,32 @@ impl PerTickHandler for HangDetectionHandler {
                 if newly_hung.contains(&name) || due {
                     crate::daemon::escalation_persist::persist(ctx.home, &name, &snapshot);
                 }
+            }
+        }
+
+        // #1744-H2 (codex HIGH): a self-orchestrator that just LEFT Hung had its
+        // `hung_since` cleared in memory by `check_hang` — persist that cleared
+        // snapshot so a restart does not rehydrate the stale anchor. Only when a
+        // store entry already exists (it escalated / was tracked while Hung):
+        // skip otherwise so a never-persisted agent that merely flickered through
+        // Hung doesn't spawn a store entry. The snapshot's `hung_since` is now
+        // None; its crash budget / cooldowns (which DO matter) are preserved.
+        for name in left_hung {
+            if !crate::teams::is_self_orchestrator(ctx.home, &name) {
+                continue;
+            }
+            if crate::daemon::escalation_persist::load_for(ctx.home, &name).is_none() {
+                continue;
+            }
+            let snapshot = {
+                let reg = agent::lock_registry(ctx.registry);
+                reg.values()
+                    .find(|h| h.name.as_str() == name)
+                    .map(|h| h.core.lock().health.escalation_snapshot())
+            };
+            if let Some(snapshot) = snapshot {
+                crate::daemon::escalation_persist::persist(ctx.home, &name, &snapshot);
+                tracing::debug!(agent = %name, "#1744-H2: persisted cleared hung anchor on Hung exit");
             }
         }
     }
