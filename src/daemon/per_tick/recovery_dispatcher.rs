@@ -754,9 +754,11 @@ mod tests {
     #[test]
     fn classify_alive_stuck_when_productive_exceeds_silence_below() {
         // Silent < 120s default threshold, productive_silence > 120s →
-        // alive-stuck branch.
+        // alive-stuck branch. Carrier is `Starting` (120s threshold) — the
+        // Ready/Idle merge made `Idle` exempt (`=> false`), so the old `Ready`
+        // carrier was re-pointed to another 120s-threshold non-exempt state.
         let branch = classify_branch(
-            AgentState::Ready,
+            AgentState::Starting,
             Duration::from_secs(30),
             Duration::from_secs(300),
         );
@@ -767,13 +769,32 @@ mod tests {
     fn classify_dead_likely_when_silence_exceeds() {
         // Silent > 120s → dead-likely; ESC won't help a process not
         // reading PTY. Productive_silence value is irrelevant once
-        // silence exceeds.
+        // silence exceeds. Carrier `Starting` (see note above — `Idle` is now
+        // exempt; `classify_idle_never_dead_likely_on_silence` pins that).
         let branch = classify_branch(
-            AgentState::Ready,
+            AgentState::Starting,
             Duration::from_secs(300),
             Duration::from_secs(500),
         );
         assert!(matches!(branch, Stage1Branch::DeadLikely));
+    }
+
+    #[test]
+    fn classify_idle_never_dead_likely_on_silence() {
+        // Ready/Idle merge (accepted behavior change ②): an `Idle` agent is
+        // NEVER classified dead-likely on silence — it is legitimately quiet.
+        // Pre-merge, `Ready` (agy/opencode idle prompt) fell into the 120s
+        // catch-all and COULD be silence-reaped; now it follows Idle's exemption
+        // (consistent with claude). A real hang still surfaces via Thinking/ToolUse.
+        let branch = classify_branch(
+            AgentState::Idle,
+            Duration::from_secs(600), // far past any silence threshold
+            Duration::from_secs(600),
+        );
+        assert!(
+            matches!(branch, Stage1Branch::Anomaly),
+            "idle agent must never be DeadLikely/AliveStuck from silence alone"
+        );
     }
 
     #[test]
@@ -783,7 +804,7 @@ mod tests {
         // branch classifier directly; the warn log is exercised via
         // the dispatcher-state integration test below.
         let branch = classify_branch(
-            AgentState::Ready,
+            AgentState::Idle,
             Duration::from_secs(30),
             Duration::from_secs(30),
         );

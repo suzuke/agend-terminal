@@ -119,7 +119,7 @@ mod tests {
         log_state_transition_at(
             &dir,
             "dev",
-            AgentState::Ready,
+            AgentState::Idle,
             AgentState::UsageLimit,
             "2026-05-31T00:00:00+00:00",
             "You've hit your limit",

@@ -65,7 +65,7 @@ fixtures:
     cli_version: "0.38.2"
     recorded_on: "2026-04-19"
     scenario: "startup → ready → idle prompt → thinking (recording cut mid-response)"
-    expected_transitions: [starting, ready, idle, thinking]
+    expected_transitions: [starting, idle, thinking]
     expected_final_state: thinking
     # Final detect is None because the spinner token cleared off screen
     # but Thinking remains latched — Phase 1c's LATCHED_STATE_EXPIRY
@@ -93,12 +93,12 @@ fixtures:
       streaming spinner verb varies (Analyzing / Developing / …), so a verb
       whitelist would miss it (the #1541 lesson); the structural interrupt hint
       latches Thinking regardless of verb.
-    expected_transitions: [starting, ready, thinking]
+    expected_transitions: [starting, idle, thinking]
     expected_final_state: thinking
     # detect() sees Ready on the final screen (the response finished, spinner
     # cleared back to the prompt) but hysteresis holds the Thinking state at the
     # cut — same shape as kiro-thinking below.
-    expected_final_detect: ready
+    expected_final_detect: idle
     capture_kind: real_pty
     provenance: "#987 boot capture; #1579 calibrates the Thinking anchor against the spinner phase"
 
@@ -112,7 +112,7 @@ fixtures:
     # on the final frame) but not as a SETTLED state transition: agy's tool run
     # alternates the brief bullet with the dominant spinner (`esc to cancel` =
     # Thinking), so the hysteresis state machine settles on thinking/permission.
-    expected_transitions: [starting, ready, idle, thinking, permission]
+    expected_transitions: [starting, idle, thinking, permission]
     expected_final_state: permission
     expected_final_detect: tool_use
     capture_kind: real_pty
@@ -133,7 +133,7 @@ fixtures:
     recorded_on: "2026-06-01"
     scenario: "agy command-approval + trust dialogs — `Requesting permission for:` / `tab Amend · e edit command` / `Do you trust the contents of this project?` fire PermissionPrompt (#1578)"
     provenance: "#1578"
-    expected_transitions: [starting, ready, thinking, permission]
+    expected_transitions: [starting, idle, thinking, permission]
     expected_final_state: permission
     expected_final_detect: permission
     capture_kind: real_pty
@@ -147,7 +147,7 @@ fixtures:
     expected_final_state: thinking
     # detect() sees Ready on the final screen but hysteresis blocks the
     # immediate downgrade (Thinking held < 2s min_hold at cut time).
-    expected_final_detect: ready
+    expected_final_detect: idle
     # #685 PR-3 (corpus expansion): final=thinking, no kiro productive
     # markers (`● Read|Write|...` / `[fs_*]` literals) in rendered
     # output. F9 silent_stuck case for the kiro backend.
@@ -416,7 +416,7 @@ fixtures:
     # FOLLOW-UP: if gemini 0.38.2+ adds a dedicated in-flight tool
     # banner we can detect distinctly from Thinking, capture a new
     # fixture + re-introduce a narrow ToolUse pattern.
-    expected_transitions: [starting, ready, idle, thinking]
+    expected_transitions: [starting, idle, thinking]
     expected_final_state: thinking
     expected_final_detect: null
     # #685 PR-3 (corpus expansion): final=thinking, no gemini productive
@@ -448,7 +448,7 @@ fixtures:
     # status line.
     expected_transitions: [starting, idle, thinking]
     expected_final_state: thinking
-    expected_final_detect: ready
+    expected_final_detect: idle
     # #685 PR-3 (corpus expansion): final=thinking. `● Read` banner
     # appears in the raw byte stream at ~40960 but is not in the
     # final VTerm-rendered viewport — by the recording cut the trust-
@@ -516,9 +516,9 @@ fixtures:
     # and `ReadFile` lacks that boundary. The fixture's F9 measurement
     # focus is the `Saved to <path>` marker firing — observed via
     # `infer_productivity` independent of AgentState transitions.
-    expected_transitions: [starting, ready]
-    expected_final_state: ready
-    expected_final_detect: ready
+    expected_transitions: [starting, idle]
+    expected_final_state: idle
+    expected_final_detect: idle
     scenario_kind: productive_marker_fire
     expected_hung_classification: not_hung
     capture_kind: synthetic
@@ -538,9 +538,9 @@ fixtures:
       NEITHER appears at a line start nor with the structural anchor
       `^Saved to \S+`. Locks the F9 anti-FP contract: bare keywords
       must not classify as productive.
-    expected_transitions: [starting, ready]
-    expected_final_state: ready
-    expected_final_detect: ready
+    expected_transitions: [starting, idle]
+    expected_final_state: idle
+    expected_final_detect: idle
     scenario_kind: productive_silence
     expected_hung_classification: not_hung
     capture_kind: synthetic

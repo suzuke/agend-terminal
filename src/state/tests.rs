@@ -88,13 +88,13 @@ fn shell_backend_starts_in_ready_not_starting() {
     // 30 s. Initial state Ready sidesteps the silence fallback — a
     // truly-stuck shell still gets caught by `check_hang` later.
     let t = StateTracker::new(Some(&Backend::Shell));
-    assert_eq!(t.get_state(), AgentState::Ready);
+    assert_eq!(t.get_state(), AgentState::Idle);
 }
 
 #[test]
 fn raw_backend_starts_in_ready_not_starting() {
     let t = StateTracker::new(Some(&Backend::Raw("/opt/whatever".to_string())));
-    assert_eq!(t.get_state(), AgentState::Ready);
+    assert_eq!(t.get_state(), AgentState::Idle);
 }
 
 #[test]
@@ -138,7 +138,7 @@ fn interactive_prompt_expires_to_ready_after_two_minutes() {
     t.tick();
     assert_eq!(
         t.get_state(),
-        AgentState::Ready,
+        AgentState::Idle,
         "expected Ready after INTERACTIVE_EXPIRY, still {:?}",
         t.get_state()
     );
@@ -148,7 +148,7 @@ fn interactive_prompt_expires_to_ready_after_two_minutes() {
 fn permission_prompt_also_expires_to_ready() {
     let mut t = tracker_at(&Backend::ClaudeCode, AgentState::PermissionPrompt, 130);
     t.tick();
-    assert_eq!(t.get_state(), AgentState::Ready);
+    assert_eq!(t.get_state(), AgentState::Idle);
 }
 
 #[test]
@@ -157,7 +157,7 @@ fn tool_use_still_uses_short_expiry() {
     // expiry — Thinking / ToolUse should still drop at 30 s.
     let mut t = tracker_at(&Backend::ClaudeCode, AgentState::ToolUse, 31);
     t.tick();
-    assert_eq!(t.get_state(), AgentState::Ready);
+    assert_eq!(t.get_state(), AgentState::Idle);
 }
 
 // ── P0: Core behavior ───────────────────────────────────────────────
@@ -197,13 +197,13 @@ fn passive_to_passive_needs_5s() {
     // Idle(3) → Ready(2): lower priority, passive hold = 5s
     // Idle held for 3s — should NOT transition
     let mut t = tracker_at(&backend, AgentState::Idle, 3);
-    t.transition(AgentState::Ready);
+    t.transition(AgentState::Idle);
     assert_eq!(t.get_state(), AgentState::Idle);
 
     // Idle held for 6s (>= 5s passive hold) — SHOULD transition
     let mut t = tracker_at(&backend, AgentState::Idle, 6);
-    t.transition(AgentState::Ready);
-    assert_eq!(t.get_state(), AgentState::Ready);
+    t.transition(AgentState::Idle);
+    assert_eq!(t.get_state(), AgentState::Idle);
 }
 
 #[test]
@@ -403,7 +403,7 @@ fn oscillation_guard_window_env_disable() {
 #[serial_test::serial]
 fn opencode_tilde_dash_ing_matches_tooluse() {
     let backend = Backend::OpenCode;
-    let mut t = tracker_at(&backend, AgentState::Ready, 6);
+    let mut t = tracker_at(&backend, AgentState::Idle, 6);
     t.feed("~ Reading file...");
     assert_eq!(
         t.get_state(),
@@ -441,7 +441,7 @@ fn dismissed_prompt_clears_on_next_feed() {
     t.feed("Update available! 0.120.0 -> 0.121.0\n1. Update now\n2. Skip");
     // Then the banner re-renders after dismissal
     t.feed("bypass permissions");
-    assert_eq!(t.get_state(), AgentState::Ready);
+    assert_eq!(t.get_state(), AgentState::Idle);
 }
 
 #[test]
@@ -479,7 +479,7 @@ fn feed_fallback_expires_thinking_after_threshold() {
     let mut t = tracker_at(&Backend::Gemini, AgentState::Thinking, 31);
     // Fresh screen content that matches no pattern for gemini.
     t.feed("some unrelated output that matches nothing");
-    assert_eq!(t.get_state(), AgentState::Ready);
+    assert_eq!(t.get_state(), AgentState::Idle);
 }
 
 #[test]
@@ -495,7 +495,7 @@ fn feed_fallback_does_not_expire_before_threshold() {
 fn feed_fallback_expires_tooluse_after_threshold() {
     let mut t = tracker_at(&Backend::ClaudeCode, AgentState::ToolUse, 35);
     t.feed("no tool banner, no ready footer visible here");
-    assert_eq!(t.get_state(), AgentState::Ready);
+    assert_eq!(t.get_state(), AgentState::Idle);
 }
 
 #[test]
@@ -518,7 +518,7 @@ fn tick_expires_stale_tool_use_without_feed() {
     // to Ready without requiring feed() (which needs new screen text).
     let mut t = tracker_at(&Backend::ClaudeCode, AgentState::ToolUse, 35);
     t.tick();
-    assert_eq!(t.get_state(), AgentState::Ready);
+    assert_eq!(t.get_state(), AgentState::Idle);
 }
 
 #[test]
@@ -544,10 +544,10 @@ fn tick_called_twice_still_expires() {
     // Verify tick() works on repeated calls (no hash-based early return).
     let mut t = tracker_at(&Backend::ClaudeCode, AgentState::ToolUse, 35);
     t.tick();
-    assert_eq!(t.get_state(), AgentState::Ready);
+    assert_eq!(t.get_state(), AgentState::Idle);
     // Second tick on Ready is a no-op (Ready is not expiring).
     t.tick();
-    assert_eq!(t.get_state(), AgentState::Ready);
+    assert_eq!(t.get_state(), AgentState::Idle);
 }
 
 #[test]
@@ -563,10 +563,10 @@ fn feed_fallback_does_not_expire_fresh_interactive_prompt() {
 #[test]
 fn feed_fallback_no_op_when_already_ready() {
     // Ready → Ready must not reset `since` (that would defeat the hold).
-    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Ready, 60);
+    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 60);
     let since_before = t.since;
     t.feed("arbitrary text without any markers");
-    assert_eq!(t.get_state(), AgentState::Ready);
+    assert_eq!(t.get_state(), AgentState::Idle);
     assert_eq!(t.since, since_before);
 }
 
@@ -616,9 +616,9 @@ fn non_starting_ignores_generic_prompt_token() {
     // Ready + a model output containing `(y/n)` must not flip state —
     // false positives here were the reason we scope generic detection
     // to Starting.
-    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Ready, 0);
+    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
     t.feed("Here's an example: `git clean -n (y/n)` — the -n flag previews");
-    assert_eq!(t.get_state(), AgentState::Ready);
+    assert_eq!(t.get_state(), AgentState::Idle);
 }
 
 #[test]
@@ -831,7 +831,7 @@ fn empty_input_no_change() {
 fn ready_detection() {
     let mut t = StateTracker::new(Some(&Backend::ClaudeCode));
     t.feed("bypass permissions");
-    assert_eq!(t.get_state(), AgentState::Ready);
+    assert_eq!(t.get_state(), AgentState::Idle);
 }
 
 #[test]
@@ -840,7 +840,7 @@ fn idle_detection() {
     // First get to Ready so that Idle (lower prio than Starting) can be tested
     // Starting → Ready (higher prio) is instant
     t.feed("bypass permissions");
-    assert_eq!(t.get_state(), AgentState::Ready);
+    assert_eq!(t.get_state(), AgentState::Idle);
     // Now wait enough time for passive hold (5s) then feed idle pattern
     t.since = Instant::now() - Duration::from_secs(6);
     t.feed("❯");
@@ -905,7 +905,7 @@ fn awaiting_operator_priority_between_hang_and_ready() {
     // Hang < AwaitingOperator < Ready so it preempts Starting/Hang in
     // tab-bar highest-priority display but doesn't outrank real activity.
     assert!(AgentState::Hang.priority() < AgentState::AwaitingOperator.priority());
-    assert!(AgentState::AwaitingOperator.priority() < AgentState::Ready.priority());
+    assert!(AgentState::AwaitingOperator.priority() < AgentState::Idle.priority());
 }
 
 #[test]
@@ -944,7 +944,7 @@ fn set_awaiting_operator_noop_from_non_starting() {
     // InteractivePrompt) transition. Every OTHER state is a no-op so a late
     // tick-loop detection can't corrupt a healthy mid-task agent.
     for s in [
-        AgentState::Ready,
+        AgentState::Idle,
         AgentState::Idle,
         AgentState::Thinking,
         AgentState::ToolUse,
@@ -965,7 +965,7 @@ fn ready_pattern_lifts_awaiting_operator() {
     t.set_awaiting_operator();
     assert_eq!(t.current, AgentState::AwaitingOperator);
     t.feed("bypass permissions");
-    assert_eq!(t.current, AgentState::Ready);
+    assert_eq!(t.current, AgentState::Idle);
 }
 
 // ── Full pipeline: PTY bytes → VTerm → screen → StateTracker ────────
@@ -1000,7 +1000,7 @@ fn pipeline_claude_ready_via_vterm() {
         &mut st,
         b"\x1b[1;32mClaude Code\x1b[0m ready (bypass permissions mode)\r\n",
     );
-    assert_eq!(st.get_state(), AgentState::Ready);
+    assert_eq!(st.get_state(), AgentState::Idle);
 }
 
 #[test]
@@ -1008,7 +1008,7 @@ fn pipeline_codex_ready_via_vterm() {
     let mut vt = VTerm::new(80, 24);
     let mut st = StateTracker::new(Some(&Backend::Codex));
     drive(&mut vt, &mut st, b"\x1b[1mOpenAI Codex\x1b[0m v0.120.0\r\n");
-    assert_eq!(st.get_state(), AgentState::Ready);
+    assert_eq!(st.get_state(), AgentState::Idle);
 }
 
 #[test]
@@ -1040,7 +1040,7 @@ fn pipeline_dismiss_drops_stale_pattern() {
     drive(&mut vt, &mut st, b"\x1b[2J\x1b[HOpenAI Codex v0.120.0\r\n");
     assert_eq!(
         st.get_state(),
-        AgentState::Ready,
+        AgentState::Idle,
         "after screen clear + ready banner, stale UsageLimit must release"
     );
 }
@@ -1073,10 +1073,7 @@ fn pipeline_usage_limit_instant_from_idle() {
         &mut st,
         b"bypass permissions\r\n> ready\r\n\xe2\x9d\xaf",
     );
-    assert!(matches!(
-        st.get_state(),
-        AgentState::Ready | AgentState::Idle
-    ));
+    assert!(matches!(st.get_state(), AgentState::Idle));
     // #848: canonical Anthropic 429-rejection wording instead of the
     // bare `429 rate limit exceeded` that the OLD broad pattern matched.
     drive(
@@ -1114,8 +1111,8 @@ fn interactive_prompt_notice_rearms_on_reentry() {
 
     // Simulate passive-hold window so InteractivePrompt can drop back.
     t.since = std::time::Instant::now() - std::time::Duration::from_secs(3);
-    t.transition(AgentState::Ready);
-    assert_eq!(t.get_state(), AgentState::Ready);
+    t.transition(AgentState::Idle);
+    assert_eq!(t.get_state(), AgentState::Idle);
     assert!(!t.take_interactive_prompt_notice(), "no notice while Ready");
 
     // Re-enter InteractivePrompt.
@@ -1142,8 +1139,8 @@ fn recovery_notice_armed_when_leaving_interactive_prompt() {
 
     // Dismiss → Ready.
     t.since = std::time::Instant::now() - std::time::Duration::from_secs(3);
-    t.transition(AgentState::Ready);
-    assert_eq!(t.get_state(), AgentState::Ready);
+    t.transition(AgentState::Idle);
+    assert_eq!(t.get_state(), AgentState::Idle);
 
     // First take fires; subsequent ticks within the same Ready don't
     // re-spam.
@@ -1168,7 +1165,7 @@ fn recovery_notice_armed_when_leaving_awaiting_operator() {
     // Fresh Ready banner appears. Ready (prio 3) > AwaitingOperator
     // (prio 2) so the transition is immediate.
     drive(&mut vt, &mut st, b"\x1b[2J\x1b[HOpenAI Codex v0.120.0\r\n");
-    assert_eq!(st.get_state(), AgentState::Ready);
+    assert_eq!(st.get_state(), AgentState::Idle);
     assert!(
         st.take_recovery_notice(),
         "recovery must arm on AwaitingOperator → Ready"
@@ -1180,13 +1177,13 @@ fn recovery_notice_not_armed_for_unrelated_transitions() {
     // Ready → Thinking → Ready must not arm the recovery notice: the
     // operator never saw a blocked state, so "ready again" is noise.
     let mut st = StateTracker::new(Some(&Backend::ClaudeCode));
-    st.current = AgentState::Ready;
+    st.current = AgentState::Idle;
     st.since = std::time::Instant::now() - std::time::Duration::from_secs(10);
     st.transition(AgentState::Thinking);
     assert_eq!(st.get_state(), AgentState::Thinking);
     st.since = std::time::Instant::now() - std::time::Duration::from_secs(10);
-    st.transition(AgentState::Ready);
-    assert_eq!(st.get_state(), AgentState::Ready);
+    st.transition(AgentState::Idle);
+    assert_eq!(st.get_state(), AgentState::Idle);
     assert!(!st.take_recovery_notice());
 }
 
@@ -1418,7 +1415,7 @@ fn pipeline_kiro_slash_menu_does_not_trigger_context_full() {
     let mut vt = VTerm::new(80, 24);
     let mut st = StateTracker::new(Some(&Backend::KiroCli));
     drive(&mut vt, &mut st, b"Trust All Tools active\r\n");
-    assert_eq!(st.get_state(), AgentState::Ready);
+    assert_eq!(st.get_state(), AgentState::Idle);
     // User opens slash menu — `/compact` is listed alongside `/quit`.
     drive(
         &mut vt,
@@ -1665,7 +1662,7 @@ fn parse_state(name: &str) -> AgentState {
         "starting" => AgentState::Starting,
         "hang" => AgentState::Hang,
         "awaiting_operator" => AgentState::AwaitingOperator,
-        "ready" => AgentState::Ready,
+        "ready" => AgentState::Idle,
         "idle" => AgentState::Idle,
         "tool_use" => AgentState::ToolUse,
         "thinking" => AgentState::Thinking,
@@ -1991,7 +1988,7 @@ fn claude_spinner_verb_triggers_thinking() {
     let mut vt = VTerm::new(80, 24);
     let mut st = StateTracker::new(Some(&Backend::ClaudeCode));
     drive(&mut vt, &mut st, b"bypass permissions\r\n");
-    assert_eq!(st.get_state(), AgentState::Ready);
+    assert_eq!(st.get_state(), AgentState::Idle);
     // #1541: Claude spinner uses random verbs; the verb-agnostic structural
     // anchor (sparkle glyph + `<verb>…`) must fire regardless of the verb.
     // `\xe2\x9c\xbb` = ✻ (U+273B sparkle), `\xe2\x80\xa6` = … (U+2026).
@@ -2008,7 +2005,7 @@ fn claude_thought_for_triggers_thinking() {
     let mut vt = VTerm::new(80, 24);
     let mut st = StateTracker::new(Some(&Backend::ClaudeCode));
     drive(&mut vt, &mut st, b"bypass permissions\r\n");
-    assert_eq!(st.get_state(), AgentState::Ready);
+    assert_eq!(st.get_state(), AgentState::Idle);
     // Post-thinking summary line
     drive(&mut vt, &mut st, b"thought for 12s\r\n");
     assert_eq!(
@@ -2023,7 +2020,7 @@ fn kiro_working_triggers_thinking() {
     let mut vt = VTerm::new(80, 24);
     let mut st = StateTracker::new(Some(&Backend::KiroCli));
     drive(&mut vt, &mut st, b"Trust All Tools active\r\n");
-    assert_eq!(st.get_state(), AgentState::Ready);
+    assert_eq!(st.get_state(), AgentState::Idle);
     // Kiro shows "Kiro is working" during generation
     drive(&mut vt, &mut st, b"Kiro is working\r\n  esc to cancel\r\n");
     assert_eq!(
@@ -2038,7 +2035,7 @@ fn codex_working_triggers_thinking() {
     let mut vt = VTerm::new(80, 24);
     let mut st = StateTracker::new(Some(&Backend::Codex));
     drive(&mut vt, &mut st, b"OpenAI Codex gpt-4.1 left\r\n");
-    assert_eq!(st.get_state(), AgentState::Ready);
+    assert_eq!(st.get_state(), AgentState::Idle);
     // Codex shows "Working (Ns • esc to interrupt)"
     drive(
         &mut vt,
@@ -2101,7 +2098,7 @@ fn claude_chat_with_glyph_does_not_trigger_tooluse() {
     let mut vt = VTerm::new(80, 24);
     let mut st = StateTracker::new(Some(&Backend::ClaudeCode));
     drive(&mut vt, &mut st, b"bypass permissions\r\n");
-    assert_eq!(st.get_state(), AgentState::Ready);
+    assert_eq!(st.get_state(), AgentState::Idle);
     // Chat content with glyph + tool name elsewhere on the line
     drive(
         &mut vt,
@@ -2123,7 +2120,7 @@ fn rate_limit_expires_after_300s_window() {
     t.tick();
     assert_eq!(
         t.get_state(),
-        AgentState::Ready,
+        AgentState::Idle,
         "RateLimit must expire to Ready after 300s"
     );
 }
@@ -3207,7 +3204,7 @@ fn record_set_buffers_transitions_fifo_then_drains() {
     assert_eq!(recs.len(), 2);
     assert_eq!(
         (recs[0].from, recs[0].to),
-        (AgentState::Ready, AgentState::Thinking)
+        (AgentState::Idle, AgentState::Thinking)
     );
     assert_eq!(
         (recs[1].from, recs[1].to),
@@ -3250,7 +3247,7 @@ fn set_awaiting_operator_records_transition() {
 #[test]
 fn same_state_record_set_is_noop() {
     let mut st = StateTracker::new(None); // Ready
-    st.record_set(AgentState::Ready); // same → no record
+    st.record_set(AgentState::Idle); // same → no record
     assert!(
         st.drain_pending_transitions().0.is_empty(),
         "same-state record_set must not buffer a spurious transition"
@@ -3596,7 +3593,7 @@ the agent kept going after the throttle\n";
 fn unclassified_throttle_logged_on_phrase_plus_nonretryable_state() {
     // Throttle phrase present, classifier landed on Ready (the in-the-wild
     // miss — e.g. anchor suppressed it / wording drifted) → capture.
-    let tail = unclassified_throttle_tail(AgentState::Ready, THROTTLE_SCREEN, &[]);
+    let tail = unclassified_throttle_tail(AgentState::Idle, THROTTLE_SCREEN, &[]);
     let tail = tail.expect("throttle phrase + non-retryable state must be captured");
     assert!(
         tail.contains("temporarily limiting requests"),
@@ -3625,7 +3622,7 @@ fn unclassified_throttle_skipped_when_classified_serverratelimit() {
 fn unclassified_throttle_skipped_without_phrase() {
     // No known throttle phrase on screen → never logged, regardless of state.
     let screen = "claude ready\n❯ awaiting input\n";
-    assert!(unclassified_throttle_tail(AgentState::Ready, screen, &[]).is_none());
+    assert!(unclassified_throttle_tail(AgentState::Idle, screen, &[]).is_none());
     assert!(unclassified_throttle_tail(AgentState::Thinking, screen, &[]).is_none());
 }
 
@@ -3639,7 +3636,7 @@ fn unclassified_throttle_skipped_when_phrase_only_in_scrollback() {
         screen.push_str(&format!("post-recovery output line {i}\n"));
     }
     assert!(
-        unclassified_throttle_tail(AgentState::Ready, &screen, &[]).is_none(),
+        unclassified_throttle_tail(AgentState::Idle, &screen, &[]).is_none(),
         "a throttle phrase only surviving in scrollback must NOT be logged"
     );
 }

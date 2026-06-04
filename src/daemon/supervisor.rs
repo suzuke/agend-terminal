@@ -137,7 +137,7 @@ pub(crate) struct RateLimitRetry {
     pub retry_count: u32,
     pub next_retry_at: Instant,
     /// Set when max retries exceeded — prevents re-triggering on same
-    /// persistent ServerRateLimit state. Cleared on recovery (Ready/Idle).
+    /// persistent ServerRateLimit state. Cleared on recovery (Idle).
     pub exhausted: bool,
 }
 
@@ -682,7 +682,7 @@ enum ReactionKind {
 /// is reaction-worthy.
 ///
 /// Net-state (not per-transition) semantics: an intra-tick flap that enters
-/// then leaves an error state (e.g. `Ready→UsageLimit→Ready`) has no net change
+/// then leaves an error state (e.g. `Idle→UsageLimit→Idle`) has no net change
 /// → no reaction, so transient blips don't spam the operator/orchestrator.
 /// Transition LOGGING records every transition separately (#1527); only the
 /// reaction converges to the final state.
@@ -747,7 +747,7 @@ fn awaiting_escalation_allowed(
     match state {
         // Original startup-stall fallback — no chrome, no position gate.
         // #1563: an `OnDemand` coordinator (e.g. `general`) is permanently stuck
-        // in `Starting` (never matches a Ready banner), so this ungated path
+        // in `Starting` (never matches an Idle banner), so this ungated path
         // would forward its normal pane to the operator forever. Gate the
         // startup-stall fallback by role. (Part-B below role-gates
         // `InteractivePrompt` too — same prose-FP root — while `PermissionPrompt`
@@ -1184,17 +1184,17 @@ fn tick(
 /// recovered, so a later ServerRateLimit episode starts fresh at Phase A (rather
 /// than inheriting a stale `retry_count`/`exhausted`).
 ///
-/// Reverted to {Ready, Idle} (genuine terminal recovery). #1586 had broadened it
+/// Reverted to {Idle} (genuine terminal recovery). #1586 had broadened it
 /// to also include Thinking / ToolUse purely to kill the blind-fire retry STORM
 /// before the backoff fired — but the #1713 state-gate makes that storm
 /// structurally impossible (no inject unless freshly ServerRateLimit), so the
 /// Thinking/ToolUse broadening (and the `suppress_thinking_clear` band-aid it
-/// required) are no longer needed. A working agent reaches Ready/Idle between
+/// required) are no longer needed. A working agent reaches Idle between
 /// turns and clears then; mid-work Thinking/ToolUse no longer clears (and never
 /// injects either, so no storm).
 fn clears_server_rate_limit_retry(state: crate::state::AgentState) -> bool {
     use crate::state::AgentState;
-    matches!(state, AgentState::Ready | AgentState::Idle)
+    matches!(state, AgentState::Idle)
 }
 
 /// #1470 (re-scoped slice, credit @cheerc): notify an agent's team
@@ -1320,7 +1320,7 @@ pub(crate) fn process_error_recovery(
                     srl_to_inject.push(name.to_string());
                 }
             } else if clears_server_rate_limit_retry(state) {
-                // #1713: clear on genuine recovery (Ready/Idle) — cross-episode reset
+                // #1713: clear on genuine recovery (Idle) — cross-episode reset
                 // so a later ServerRateLimit episode starts fresh at Phase A. No
                 // suppress window needed: the inject is state-gated above, so a
                 // mid-work Thinking/ToolUse transient neither clears here nor injects.
@@ -1328,7 +1328,7 @@ pub(crate) fn process_error_recovery(
                     tracing::info!(
                         agent = %name,
                         ?state,
-                        "ServerRateLimit retry cleared — agent recovered (Ready/Idle)"
+                        "ServerRateLimit retry cleared — agent recovered (Idle)"
                     );
                 }
             }
@@ -1719,7 +1719,7 @@ mod tests {
         assert!(!AgentState::ApiError.is_notify_error_class());
         assert!(!AgentState::Restarting.is_notify_error_class());
         assert!(!AgentState::InteractivePrompt.is_notify_error_class());
-        assert!(!AgentState::Ready.is_notify_error_class());
+        assert!(!AgentState::Idle.is_notify_error_class());
         assert!(!AgentState::Idle.is_notify_error_class());
         assert!(!AgentState::ToolUse.is_notify_error_class());
         assert!(!AgentState::Starting.is_notify_error_class());
@@ -1738,38 +1738,37 @@ mod tests {
         }
     }
 
-    /// RED ①: a feed-driven `Ready → UsageLimit` (the read-loop records it, so
+    /// RED ①: a feed-driven `Idle → UsageLimit` (the read-loop records it, so
     /// the drain carries it even though `prev == new` at the supervisor tick)
     /// MUST still produce a reaction decision. Pre-#1530 the `prev != new` gate
     /// skipped it → the UsageLimit reaction was dead since #1176.
     #[test]
     fn reactions_from_transitions_fires_on_feed_driven_usagelimit() {
         use crate::state::AgentState;
-        let decisions =
-            reactions_from_transitions(&[tr(AgentState::Ready, AgentState::UsageLimit)]);
+        let decisions = reactions_from_transitions(&[tr(AgentState::Idle, AgentState::UsageLimit)]);
         assert_eq!(
             decisions,
             vec![ReactionDecision {
-                from: AgentState::Ready,
+                from: AgentState::Idle,
                 to: AgentState::UsageLimit
             }],
             "feed-driven →UsageLimit must yield a reaction decision (de-gated off prev!=new)"
         );
     }
 
-    /// RED ②: an intra-tick flap (`Ready → UsageLimit → Ready`) has no NET state
+    /// RED ②: an intra-tick flap (`Idle → UsageLimit → Idle`) has no NET state
     /// change → no reaction. Avoids double/noise notifications. (Logging still
     /// records every transition via #1527 — that path is independent.)
     #[test]
     fn reactions_from_transitions_converges_on_net_state_no_flap_double_fire() {
         use crate::state::AgentState;
         let decisions = reactions_from_transitions(&[
-            tr(AgentState::Ready, AgentState::UsageLimit),
-            tr(AgentState::UsageLimit, AgentState::Ready),
+            tr(AgentState::Idle, AgentState::UsageLimit),
+            tr(AgentState::UsageLimit, AgentState::Idle),
         ]);
         assert!(
             decisions.is_empty(),
-            "flap in-and-out (net Ready→Ready) must not fire a reaction, got {decisions:?}"
+            "flap in-and-out (net Idle→Idle) must not fire a reaction, got {decisions:?}"
         );
     }
 
@@ -1782,19 +1781,19 @@ mod tests {
             "empty drain → no reaction"
         );
         assert!(
-            reactions_from_transitions(&[tr(AgentState::Ready, AgentState::ToolUse)]).is_empty(),
+            reactions_from_transitions(&[tr(AgentState::Idle, AgentState::ToolUse)]).is_empty(),
             "net change to a non-error state → no reaction"
         );
     }
 
     /// Net change THROUGH a flap into a different error state reacts on the
-    /// final state: `UsageLimit → Ready → Hang` ⇒ react on Hang, not UsageLimit.
+    /// final state: `UsageLimit → Idle → Hang` ⇒ react on Hang, not UsageLimit.
     #[test]
     fn reactions_from_transitions_reacts_on_final_error_state() {
         use crate::state::AgentState;
         let decisions = reactions_from_transitions(&[
-            tr(AgentState::UsageLimit, AgentState::Ready),
-            tr(AgentState::Ready, AgentState::Hang),
+            tr(AgentState::UsageLimit, AgentState::Idle),
+            tr(AgentState::Idle, AgentState::Hang),
         ]);
         assert_eq!(
             decisions,
@@ -1833,7 +1832,7 @@ mod tests {
             "non-UsageLimit error state: member-notify only"
         );
         assert!(
-            reaction_kinds(AgentState::Ready, true).is_empty(),
+            reaction_kinds(AgentState::Idle, true).is_empty(),
             "non-error state: no reaction"
         );
     }
@@ -2043,7 +2042,7 @@ instances:
     #[test]
     fn awaiting_gate_non_prompt_state_never_escalates() {
         for s in [
-            crate::state::AgentState::Ready,
+            crate::state::AgentState::Idle,
             crate::state::AgentState::Thinking,
             crate::state::AgentState::ToolUse,
         ] {
@@ -2213,7 +2212,7 @@ instances:
 
     /// D4: 2×2 invariant fixture — production-path-coupled.
     /// 2 teams (team-a: orch-a + worker-a, team-b: orch-b + worker-b).
-    /// worker-a transitions Ready → UsageLimit.
+    /// worker-a transitions Idle → UsageLimit.
     /// Assert: orch-a inbox has 1 event; orch-b/worker-a/worker-b have 0.
     #[test]
     fn notify_single_receiver_2x2_invariant() {
@@ -2235,7 +2234,7 @@ instances:
         let sent = super::maybe_notify_member_state_change(
             &home,
             "worker-a",
-            crate::state::AgentState::Ready,
+            crate::state::AgentState::Idle,
             crate::state::AgentState::UsageLimit,
             "Usage limit reached. Resets at 15:14 UTC",
             &mut tracks,
@@ -2280,7 +2279,7 @@ instances:
         let sent = super::maybe_notify_member_state_change(
             &home,
             "orch-a",
-            crate::state::AgentState::Ready,
+            crate::state::AgentState::Idle,
             crate::state::AgentState::UsageLimit,
             "",
             &mut tracks,
@@ -2308,7 +2307,7 @@ instances:
             AgentState::Hang,
             AgentState::Crashed,
             AgentState::PermissionPrompt,
-            AgentState::Ready,
+            AgentState::Idle,
             AgentState::Idle,
         ] {
             assert!(
@@ -2338,7 +2337,7 @@ instances:
         let sent = super::maybe_notify_member_state_change(
             &home,
             "solo",
-            crate::state::AgentState::Ready,
+            crate::state::AgentState::Idle,
             crate::state::AgentState::RateLimit,
             "",
             &mut tracks,
@@ -2355,7 +2354,7 @@ instances:
         let sent = super::maybe_notify_member_state_change(
             &home,
             "solo",
-            crate::state::AgentState::Ready,
+            crate::state::AgentState::Idle,
             crate::state::AgentState::AuthError,
             "",
             &mut tracks,
@@ -2377,7 +2376,7 @@ instances:
         let sent2 = super::maybe_notify_member_state_change(
             &home,
             "solo",
-            crate::state::AgentState::Ready,
+            crate::state::AgentState::Idle,
             crate::state::AgentState::AuthError,
             "",
             &mut tracks,
@@ -2421,7 +2420,7 @@ instances:
             "orch-a",
             "worker-a",
             "team-a",
-            crate::state::AgentState::Ready.display_name(),
+            crate::state::AgentState::Idle.display_name(),
             crate::state::AgentState::UsageLimit.display_name(),
             crate::state::AgentState::UsageLimit,
             "Usage limit reached. Resets at 15:14 UTC",
@@ -2438,7 +2437,7 @@ instances:
             crate::daemon::event_bus::EventKind::MemberStateChanged {
                 agent: "worker-a".into(),
                 team: "team-a".into(),
-                from_state: crate::state::AgentState::Ready.display_name().to_string(),
+                from_state: crate::state::AgentState::Idle.display_name().to_string(),
                 to_state: crate::state::AgentState::UsageLimit
                     .display_name()
                     .to_string(),
@@ -2476,7 +2475,7 @@ instances:
         let sent = super::maybe_notify_member_state_change(
             &home,
             "worker-a",
-            crate::state::AgentState::Ready,
+            crate::state::AgentState::Idle,
             crate::state::AgentState::Hang,
             "",
             &mut tracks,
@@ -2656,7 +2655,7 @@ instances:
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// #1325: phase 1 — recovery (Ready/Idle) clears retry track.
+    /// #1325: phase 1 — recovery (Idle) clears retry track.
     #[test]
     fn phase1_recovery_clears_retry_track() {
         let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
@@ -2671,7 +2670,7 @@ instances:
             },
         );
 
-        let (handle, _reader) = mock_agent_handle("test-agent", crate::state::AgentState::Ready);
+        let (handle, _reader) = mock_agent_handle("test-agent", crate::state::AgentState::Idle);
         // #1441: registry is UUID-keyed — insert under the handle's own id.
         registry.lock().insert(handle.id, handle);
 
@@ -2684,12 +2683,12 @@ instances:
         );
         assert!(
             !tracks.contains_key("test-agent"),
-            "phase 1 must clear retry track on Ready recovery"
+            "phase 1 must clear retry track on Idle recovery"
         );
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// #1713: the recovery-clear predicate is now {Ready, Idle} (genuine terminal
+    /// #1713: the recovery-clear predicate is now {Idle} (genuine terminal
     /// recovery → cross-episode reset). #1586's Thinking/ToolUse broadening is
     /// removed: with the #1713 state-gate at the decision point the blind-fire
     /// storm is structurally impossible, so the broadening that compensated for it
@@ -2698,13 +2697,12 @@ instances:
     #[test]
     fn clears_server_rate_limit_retry_covers_only_terminal_recovery_1713() {
         use crate::state::AgentState::*;
-        // Genuine terminal recovery → clear (cross-episode reset).
-        for s in [Ready, Idle] {
-            assert!(
-                super::clears_server_rate_limit_retry(s),
-                "#1713: terminal-recovery state {s:?} must clear the retry track"
-            );
-        }
+        // Genuine terminal recovery → clear (cross-episode reset). (`Idle` is the
+        // sole terminal-recovery state since the Ready/Idle merge.)
+        assert!(
+            super::clears_server_rate_limit_retry(Idle),
+            "#1713: terminal-recovery state Idle must clear the retry track"
+        );
         // Everything else — incl mid-work Thinking/ToolUse and every waiting/error
         // state — must NOT clear.
         for s in [

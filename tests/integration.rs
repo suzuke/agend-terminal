@@ -399,7 +399,7 @@ fn test_crash_respawn_health() {
 
     let phase_start = Instant::now();
 
-    // Phase 1: process up + new registry handle inserted → agent_state == "ready"
+    // Phase 1: process up + new registry handle inserted → agent_state == "idle"
     if !wait_until(
         || {
             let r = daemon.api_call(&serde_json::json!({"method": "list"}));
@@ -407,7 +407,7 @@ fn test_crash_respawn_health() {
                 .as_array()
                 .and_then(|a| a.first())
                 .and_then(|a| a["agent_state"].as_str())
-                .map(|s| s == "ready")
+                .map(|s| s == "idle")
                 .unwrap_or(false)
         },
         SPAWN_TIMEOUT,
@@ -416,7 +416,7 @@ fn test_crash_respawn_health() {
         let agents = r["result"]["agents"].as_array();
         let first = agents.and_then(|a| a.first());
         panic!(
-            "phase 1 (agent_state == 'ready') not satisfied within 28s. \
+            "phase 1 (agent_state == 'idle') not satisfied within 28s. \
              last: count={}, agent_state={:?}, health_state={:?}",
             agents.map(|a| a.len()).unwrap_or(0),
             first.and_then(|a| a["agent_state"].as_str()).unwrap_or("?"),
@@ -437,7 +437,7 @@ fn test_crash_respawn_health() {
                 .as_array()
                 .and_then(|a| a.first())
                 .map(|a| {
-                    a["agent_state"].as_str() == Some("ready")
+                    a["agent_state"].as_str() == Some("idle")
                         && a["health_state"].as_str() == Some("healthy")
                 })
                 .unwrap_or(false)

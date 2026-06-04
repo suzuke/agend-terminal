@@ -239,7 +239,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // only in the Owned branch — see `install_term_only` above.
 
     // Per-agent AwaitingOperator supervisor: watches for stdout silence during
-    // Starting (or recently-entered Ready — some backends like codex match
+    // Starting (or recently-entered Idle — some backends like codex match
     // ready_pattern against the startup banner that precedes the update menu)
     // and pushes a vterm tail to the agent's Telegram topic. In Attached mode
     // the daemon already runs its own supervisor against the real registry, so

@@ -1152,13 +1152,13 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
         })?;
 
     // Backends whose CLI does not auto-load the instructions file (e.g. Kiro)
-    // need the file contents injected as the first user message on Ready.
+    // need the file contents injected as the first user message on Idle.
     if let Some(b) = detected_backend.as_ref() {
         let preset = b.preset();
         if preset.inject_instructions_on_ready {
             if let Some(dir) = working_dir {
                 // Read the instructions body here — while we hold the spawn
-                // context and before the `Ready` poll window starts — so an
+                // context and before the `Idle` poll window starts — so an
                 // external process mutating the file between write and
                 // bootstrap cannot inject a different prompt. Skip the
                 // bootstrap entirely if the file is missing/empty.
@@ -1212,7 +1212,7 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
     Ok(())
 }
 
-/// Poll until the agent reaches Ready, then inject the pre-read instructions
+/// Poll until the agent reaches Idle, then inject the pre-read instructions
 /// content as a first user message. Used by backends (Kiro) whose CLI does
 /// not auto-load the steering file.
 ///
@@ -1228,7 +1228,7 @@ fn spawn_instructions_bootstrap(
     shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) {
     let thread_name = format!("{name}_instr_boot");
-    // fire-and-forget: instruction-bootstrap thread polls Ready then injects
+    // fire-and-forget: instruction-bootstrap thread polls Idle then injects
     // the snapshotted instructions content. Observes shutdown flag inside the
     // poll loop (returns early on shutdown). JoinHandle dropped because the
     // thread is short-lived and one missed bootstrap on shutdown is cosmetic.
@@ -1246,7 +1246,7 @@ fn spawn_instructions_bootstrap(
             if std::time::Instant::now() >= deadline {
                 tracing::warn!(
                     agent = %name,
-                    "instructions bootstrap timed out waiting for Ready"
+                    "instructions bootstrap timed out waiting for Idle"
                 );
                 return;
             }
@@ -1256,7 +1256,7 @@ fn spawn_instructions_bootstrap(
                 match reg.get(&instance_id) {
                     Some(h) => {
                         let core = &h.core.lock();
-                        core.state.get_state() == crate::state::AgentState::Ready
+                        core.state.get_state() == crate::state::AgentState::Idle
                     }
                     None => return, // agent gone
                 }

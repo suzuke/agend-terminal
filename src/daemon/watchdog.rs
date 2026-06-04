@@ -12,7 +12,7 @@ use std::path::Path;
 fn recovered_from_rate_limit(state: AgentState) -> bool {
     matches!(
         state,
-        AgentState::Ready | AgentState::Idle | AgentState::Thinking | AgentState::ToolUse
+        AgentState::Idle | AgentState::Thinking | AgentState::ToolUse
     )
 }
 
@@ -252,7 +252,7 @@ mod tests {
                 BlockedReason::RateLimit {
                     retry_after_secs: Some(30),
                 },
-                AgentState::Ready,
+                AgentState::Idle,
             ),
             (BlockedReason::QuotaExceeded, AgentState::Idle),
             (
@@ -326,7 +326,7 @@ mod tests {
             "Thinking about your request...\n● Read src/main.rs",
             &mut health,
             false,
-            AgentState::Ready,
+            AgentState::Idle,
         );
         assert!(
             matches!(health.current_reason, Some(BlockedReason::AwaitingOperator)),
@@ -353,7 +353,7 @@ mod tests {
             "Thinking about your request...\n● Read src/main.rs",
             &mut health,
             true, // dry_run
-            AgentState::Ready,
+            AgentState::Idle,
         );
         assert!(
             matches!(health.current_reason, Some(BlockedReason::RateLimit { .. })),

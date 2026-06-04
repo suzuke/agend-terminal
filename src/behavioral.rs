@@ -1023,7 +1023,7 @@ mod tests {
             "thinking",
         );
         record_divergence("test-backend", BehavioralSignal::SilenceThinking, "idle"); // diverge
-        record_divergence("test-backend", BehavioralSignal::None, "ready"); // agree (None = no signal)
+        record_divergence("test-backend", BehavioralSignal::None, "idle"); // agree (None = no signal)
 
         let report = divergence_report();
         let entry = report.iter().find(|(k, _)| k == "test-backend");

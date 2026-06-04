@@ -859,8 +859,8 @@ mod should_defer_inject_tests_1513 {
             "idle actionable injects"
         );
         assert!(
-            !should_defer_inject(&h, "a", Some("ready"), false),
-            "ready ambient injects"
+            !should_defer_inject(&h, "a", Some("idle"), false),
+            "idle ambient injects (was 'ready' pre-merge)"
         );
         // stale/missing snapshot → state None → fail-open (no defer)
         assert!(

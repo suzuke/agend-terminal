@@ -52,7 +52,7 @@ pub fn profile(backend: &Backend) -> Option<&'static BackendProfile> {
     static CODEX: OnceLock<BackendProfile> = OnceLock::new();
     static CLAUDE: OnceLock<BackendProfile> = OnceLock::new();
     // Shell + Raw share one profile — every legacy source treats `Shell | Raw(_)`
-    // identically (empty patterns, default behavioral, generic productivity, Ready).
+    // identically (empty patterns, default behavioral, generic productivity, Idle).
     static EMPTY: OnceLock<BackendProfile> = OnceLock::new();
     match backend {
         Backend::Agy => Some(AGY.get_or_init(agy_profile)),
@@ -77,7 +77,7 @@ fn agy_profile() -> BackendProfile {
             (AgentState::ToolUse, r"●\s+[A-Z][a-zA-Z]+\("),
             (AgentState::Thinking, r"esc to cancel"),
             (AgentState::Idle, r"\? for shortcuts"),
-            (AgentState::Ready, r"Antigravity CLI|Type your message"),
+            (AgentState::Idle, r"Antigravity CLI|Type your message"),
         ],
         behavioral: BehavioralConfig {
             silence_thinking_ms: 3000,
@@ -136,7 +136,7 @@ fn kirocli_profile() -> BackendProfile {
                 AgentState::Idle,
                 r"\d+%\s*$|ask a question or describe a task",
             ),
-            (AgentState::Ready, r"Trust All Tools active|/quit to exit"),
+            (AgentState::Idle, r"Trust All Tools active|/quit to exit"),
         ],
         behavioral: BehavioralConfig {
             silence_thinking_ms: 2500,
@@ -195,7 +195,7 @@ fn opencode_profile() -> BackendProfile {
                 r"Update Available|Skip\s+Confirm",
             ),
             (AgentState::Idle, r"Ask anything"),
-            (AgentState::Ready, r"Ask anything|tab agents"),
+            (AgentState::Idle, r"Ask anything|tab agents"),
         ],
         behavioral: BehavioralConfig {
             silence_thinking_ms: 3000,
@@ -247,7 +247,7 @@ fn codex_profile() -> BackendProfile {
             ),
             (AgentState::Thinking, r"Working|esc to interrupt"),
             (AgentState::Idle, r"›"),
-            (AgentState::Ready, r"OpenAI Codex|gpt-.*left"),
+            (AgentState::Idle, r"OpenAI Codex|gpt-.*left"),
         ],
         behavioral: BehavioralConfig {
             silence_thinking_ms: 3000,
@@ -317,7 +317,7 @@ fn claudecode_profile() -> BackendProfile {
                 r"(?i)[✻✢✶✳✽*·]\s*\w+\x{2026}|\w+\x{2026}\s*\((?:\d+[smh]|running )|thought for [0-9]+s",
             ),
             (AgentState::Idle, r"❯"),
-            (AgentState::Ready, r"bypass permissions"),
+            (AgentState::Idle, r"bypass permissions"),
         ],
         behavioral: BehavioralConfig {
             silence_thinking_ms: 2000,
@@ -335,7 +335,7 @@ fn claudecode_profile() -> BackendProfile {
 }
 
 /// Shell / Raw — moved VERBATIM (empty patterns, default behavioral, generic
-/// productivity, Ready initial state).
+/// productivity, Idle initial state).
 fn empty_profile() -> BackendProfile {
     BackendProfile {
         patterns: vec![],
@@ -346,7 +346,7 @@ fn empty_profile() -> BackendProfile {
             heartbeat_fresh_window_ms: 0,
             cache_id: Some(MarkerCacheId::Generic),
         },
-        initial_state: AgentState::Ready,
+        initial_state: AgentState::Idle,
     }
 }
 

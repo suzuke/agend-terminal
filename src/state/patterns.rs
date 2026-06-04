@@ -197,10 +197,9 @@ impl StatePatterns {
                 // follow-up PR, not committed here.
                 // See docs/HUNG-STATE-TRANSITIONS.md §F39.1
                 (AgentState::Thinking, r"\(esc to cancel,"),
-                // [measured] Input prompt text
-                (AgentState::Idle, r"Type your message"),
-                // [measured] Full ready prompt + YOLO mode
-                (AgentState::Ready, r"Type your message|YOLO"),
+                // [measured] Input prompt text + YOLO mode (both = idle, ready
+                // for input; the Ready/Idle split was collapsed into Idle).
+                (AgentState::Idle, r"Type your message|YOLO"),
             ],
             _ => vec![],
         };
@@ -301,7 +300,7 @@ pub fn classify_pty_output(
 /// Cheap structural test for a generic startup-time interactive prompt.
 ///
 /// Only called while the agent is still in `Starting` state, so false
-/// positives during Thinking/Ready (where model output might legitimately
+/// positives during Thinking/Idle (where model output might legitimately
 /// contain strings like `(y/n)` as examples) are avoided by the caller
 /// gating on state. The token set is restricted to glyph sequences that
 /// effectively never appear outside of a real TUI prompt — broad catches

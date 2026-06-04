@@ -4,7 +4,7 @@
 //! it via `feed()`), not an accumulated byte buffer. Pattern hits therefore
 //! reflect what the user would currently see on screen, so dismissing an
 //! interactive prompt (e.g. codex update menu) drops the matching text from
-//! the grid and the next `feed()` re-evaluates to the underlying Ready state
+//! the grid and the next `feed()` re-evaluates to the underlying Idle state
 //! without stale-buffer lag.
 //!
 //! Hysteresis: error states instant, active 2s, passive 5s.
@@ -30,7 +30,6 @@ pub enum AgentState {
     /// Entered when Starting + stdout silent > threshold. Operator reply is
     /// routed as raw PTY keystrokes (not inbox-wrapped) via INJECT_RAW.
     AwaitingOperator,
-    Ready,
     Idle,
     ToolUse,
     Thinking,
@@ -94,7 +93,8 @@ impl AgentState {
             Self::Starting => 0,
             Self::Hang => 1,
             Self::AwaitingOperator => 2,
-            Self::Ready => 3,
+            // (priority 3 was `Ready`, collapsed into `Idle` — gap is harmless;
+            // priorities are an ordering, not a contiguous index.)
             Self::Idle => 4,
             Self::ToolUse => 5,
             Self::Thinking => 6,
@@ -144,7 +144,6 @@ impl AgentState {
             Self::Starting => "starting",
             Self::Hang => "hang",
             Self::AwaitingOperator => "awaiting_operator",
-            Self::Ready => "ready",
             Self::Idle => "idle",
             Self::ToolUse => "tool_use",
             Self::Thinking => "thinking",
@@ -238,7 +237,7 @@ pub struct StateTracker {
     anchor_on_red: bool,
     /// #1005 Phase A2: most-recent priority-up transition target +
     /// timestamp. Set on every successful priority-up in `transition()`.
-    /// Cleared (set to None) on explicit Ready / lower-priority drops
+    /// Cleared (set to None) on explicit Idle / lower-priority drops
     /// that complete the natural state cycle.
     ///
     /// The oscillation guard reads this to detect the
@@ -584,7 +583,7 @@ impl StateTracker {
     /// treated as part of an oscillation cycle and suppressed.
     ///
     /// Chosen at 5s: matches `min_hold` for passive states (5s for
-    /// Idle/Ready), so legitimate "user briefly idle then activity"
+    /// Idle), so legitimate "user briefly idle then activity"
     /// transitions still go through.
     const OSCILLATION_LOWER_HOLD_THRESHOLD: Duration = Duration::from_secs(5);
 
@@ -593,7 +592,7 @@ impl StateTracker {
     /// LATCHED_STATE_EXPIRY because operators legitimately take a while
     /// to respond to a dialog, but bounded so a prompt dismissed
     /// out-of-band (screen hash unchanged after dismissal ⇒ no re-detect)
-    /// eventually recovers to Ready instead of staying stuck — the
+    /// eventually recovers to Idle instead of staying stuck — the
     /// operator-reported `dev-reviewer 卡在互動 prompt` false positive.
     const INTERACTIVE_EXPIRY: Duration = Duration::from_secs(120);
 
@@ -608,30 +607,30 @@ impl StateTracker {
 
     /// #8 delete-legacy: the fork's fallback for the un-migrated backend (only
     /// Gemini) and `None`. Reached only when `profile(backend)` is `None` — i.e.
-    /// `Some(Gemini)`→Starting (managed) or `None`→Ready. Shell/Raw now route
-    /// through their profile (initial_state = Ready), so they no longer reach
-    /// here; the prior `Shell|Raw => Ready` arm folds into `Some(_) => Starting`.
+    /// `Some(Gemini)`→Starting (managed) or `None`→Idle. Shell/Raw now route
+    /// through their profile (initial_state = Idle), so they no longer reach
+    /// here; the prior `Shell|Raw => Ready` (now `Idle`) arm folds into `Some(_) => Starting`.
     pub(crate) fn legacy_initial_state(backend: Option<&Backend>) -> AgentState {
         match backend {
-            None => AgentState::Ready,
+            None => AgentState::Idle,
             Some(_) => AgentState::Starting,
         }
     }
 
     pub fn new(backend: Option<&Backend>) -> Self {
         // Backends without a state pattern catalog (Shell, Raw) skip the
-        // `Starting → Ready` handshake. Without this they sat in
-        // `Starting` forever — `detect()` can't possibly fire Ready
+        // `Starting → Idle` handshake. Without this they sat in
+        // `Starting` forever — `detect()` can.t possibly fire Idle
         // without any patterns — and the silence-based
         // `check_awaiting_operator` then flagged every idle shell as
         // "stuck on interactive prompt" after 30s of normal quiet at
         // its own prompt. Managed backends still start in `Starting` so
         // their onboarding / auth dialogs can pattern-match before
-        // Ready is declared.
+        // Idle is declared.
         // #8 Phase 2 step-0: migrated backends source their initial state from the
         // co-located profile; un-migrated (and `None`) fall back to
         // `legacy_initial_state`. The profile values are byte-identical to legacy
-        // (empty_profile=Ready for Shell/Raw, agy/kiro=Starting), proven by
+        // (empty_profile=Idle for Shell/Raw, agy/kiro=Starting), proven by
         // `profile_configs_byte_identical_to_legacy`, so behavior is unchanged.
         let initial_state = backend
             .and_then(crate::backend_profile::profile)
@@ -744,8 +743,8 @@ impl StateTracker {
     ///
     /// When detection returns `None` on a changed screen we fall through to
     /// `maybe_expire_latched_state`, which drops long-held active states back
-    /// to Ready so the tracker cannot get stuck if a marker pattern briefly
-    /// disappears without the Ready pattern re-matching.
+    /// to Idle so the tracker cannot get stuck if a marker pattern briefly
+    /// disappears without the Idle pattern re-matching.
     ///
     /// Heartbeat gate (A5 fix): after pattern detection, if the detected
     /// state is `PermissionPrompt` but a fresh MCP heartbeat exists, the
@@ -812,7 +811,7 @@ impl StateTracker {
                     // stale — the agent has moved on, so it must NOT keep re-firing
                     // the error transition (the level-triggered re-match that drove
                     // the retry storm). Scoped to HIGH_FP/error states ONLY:
-                    // Ready/Idle and modal/interactive prompts keep full-screen
+                    // Idle and modal/interactive prompts keep full-screen
                     // scanning, because a modal can legitimately sit above the tail.
                     let stale_position = high_fp
                         && !matched_span_in_recent_tail(
@@ -1058,14 +1057,14 @@ impl StateTracker {
     ///
     /// Active-state markers (Thinking "esc to cancel", ToolUse tool banners)
     /// can stop rendering while the CLI still shows on-screen content that
-    /// happens not to match the backend's Ready pattern either — e.g. a
+    /// happens not to match the backend's Idle pattern either — e.g. a
     /// mid-scroll render between the spinner clearing and the prompt
     /// re-appearing. Without a fallback the tracker would stay latched on
     /// the prior active state indefinitely.
     ///
     /// If the current state is a self-expiring active state
     /// (Thinking / ToolUse) and it has been held longer than
-    /// `LATCHED_STATE_EXPIRY`, drop to Ready. Everything else is excluded:
+    /// `LATCHED_STATE_EXPIRY`, drop to Idle. Everything else is excluded:
     /// InteractivePrompt / PermissionPrompt need explicit operator action,
     /// errors transition instantly on the next matching screen, and
     /// Starting / AwaitingOperator / Hang are driven by their own
@@ -1083,14 +1082,14 @@ impl StateTracker {
         // LATCHED_STATE_EXPIRY is almost always stale.
         let short_expiring = matches!(self.current, AgentState::Thinking | AgentState::ToolUse);
         if short_expiring && self.since.elapsed() >= Self::LATCHED_STATE_EXPIRY {
-            self.transition(AgentState::Ready);
+            self.transition(AgentState::Idle);
             return;
         }
         // RateLimit expires on its own 5-minute window. Real rate limits
         // clear in seconds-to-minutes; stuck for hours is a false positive.
         let rate_limit_expiring = matches!(self.current, AgentState::RateLimit);
         if rate_limit_expiring && self.since.elapsed() >= Self::RATE_LIMIT_EXPIRY {
-            self.transition(AgentState::Ready);
+            self.transition(AgentState::Idle);
             return;
         }
         // Prompt states (InteractivePrompt / PermissionPrompt) expire on
@@ -1105,7 +1104,7 @@ impl StateTracker {
             AgentState::InteractivePrompt | AgentState::PermissionPrompt
         );
         if long_expiring && self.since.elapsed() >= Self::INTERACTIVE_EXPIRY {
-            self.transition(AgentState::Ready);
+            self.transition(AgentState::Idle);
         }
     }
 
@@ -1136,7 +1135,7 @@ impl StateTracker {
     /// this setter just guards the legal source states.
     ///
     /// Once the operator unblocks the stall and the ready pattern matches
-    /// fresh screen content, `transition()` lifts the state (Ready prio >
+    /// fresh screen content, `transition()` lifts the state (Idle prio >
     /// AwaitingOperator prio → higher always wins).
     pub fn set_awaiting_operator(&mut self) {
         if matches!(

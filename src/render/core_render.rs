@@ -33,7 +33,6 @@ pub fn state_color(state: AgentState) -> Color {
     match state {
         AgentState::Starting => Color::White,
         AgentState::AwaitingOperator => Color::Indexed(214),
-        AgentState::Ready => Color::Green,
         AgentState::Idle => Color::DarkGray,
         AgentState::Thinking => Color::Yellow,
         AgentState::ToolUse => Color::Blue,
@@ -720,10 +719,9 @@ mod tests {
         let idle = state_color(AgentState::Idle);
         let thinking = state_color(AgentState::Thinking);
         let tool_use = state_color(AgentState::ToolUse);
-        let ready = state_color(AgentState::Ready);
         assert_ne!(idle, thinking, "idle vs thinking must differ");
         assert_ne!(thinking, tool_use, "thinking vs tool_use must differ");
-        assert_ne!(idle, ready, "idle vs ready must differ");
+        assert_ne!(idle, tool_use, "idle vs tool_use must differ");
     }
 
     #[test]
@@ -931,7 +929,7 @@ mod tests {
             Some(" [crashed]")
         );
         assert_eq!(transient_state_badge(AgentState::Idle), None);
-        assert_eq!(transient_state_badge(AgentState::Ready), None);
+        assert_eq!(transient_state_badge(AgentState::Idle), None);
         assert_eq!(transient_state_badge(AgentState::ToolUse), None);
         assert_eq!(transient_state_badge(AgentState::Hang), None);
         assert_eq!(transient_state_badge(AgentState::PermissionPrompt), None);

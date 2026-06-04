@@ -256,7 +256,7 @@ pub struct BackendPreset {
     /// GEMINI.md). When true, writes use marker-merge to preserve user content;
     /// when false the whole file is agend-owned and rewritten in full.
     pub instructions_shared: bool,
-    /// Inject instructions as the first message once the agent reaches Ready.
+    /// Inject instructions as the first message once the agent reaches Idle.
     /// Needed for backends (Kiro) whose CLI does not auto-load the instructions file.
     pub inject_instructions_on_ready: bool,
     /// Relative path for MCP config file from working dir.
@@ -560,7 +560,7 @@ impl Backend {
                 // #987: agy's interactive TUI renders an "Antigravity CLI <ver>"
                 // banner on startup (calibrated against
                 // tests/fixtures/state-replay/agy-thinking.raw). The pipe-OR
-                // covers post-banner "Ready" state matchable variants in case
+                // covers post-banner "Idle" state matchable variants in case
                 // future TUI iterations rename the banner.
                 ready_pattern: "Antigravity CLI|Type your message",
                 submit_key: "\r",
