@@ -53,6 +53,13 @@ const AUTH_ERROR_NOTIFY_STABILITY: Duration = Duration::from_secs(90);
 /// 2026-06-02 incident gave up at ~80s (Phase A only) against a multi-minute
 /// proxy fault. Total budget ~75min over 12 retries.
 const SERVER_RATE_LIMIT_MAX_RETRIES: u32 = 12;
+/// #1742-F4: max ApiError quick-nudges per flicker-window before the nudge stops.
+/// Mirrors the ServerRateLimit 12-cap. A content false-positive `ApiError↔Thinking`
+/// flicker re-arms the per-episode dedup every cycle, so without a total cap the
+/// quick-nudge would inject indefinitely (bounded only by `CONTINUE_INJECT_MIN_INTERVAL`).
+/// The count resets on genuine recovery (`Idle`), so a real single ApiError still
+/// nudges and only a pathological flicker is capped.
+const APIERROR_NUDGE_MAX: u32 = 12;
 /// Backoff schedule for ServerRateLimit retries (seconds). Phase A | B | C.
 const SERVER_RATE_LIMIT_BACKOFF: [u64; 12] =
     [5, 15, 30, 60, 120, 300, 600, 600, 600, 600, 600, 600];
@@ -213,6 +220,12 @@ fn run_loop(
     // shared by the retry + ApiError-nudge paths for the anti-thrash min-interval
     // and the #1586 clear cooldown.
     let mut apierror_episodes: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // #1742-F4: per-agent total ApiError-nudge count for the current flicker
+    // window. Distinct lifecycle from `apierror_episodes` (which re-arms every
+    // episode): this only resets on genuine recovery (Idle), so it caps a
+    // pathological ApiError↔Thinking flicker at APIERROR_NUDGE_MAX nudges.
+    let mut apierror_nudge_counts: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
     let mut last_continue_inject: HashMap<String, Instant> = HashMap::new();
     let mut pane_input_tracks: HashMap<String, PaneInputTrack> = HashMap::new();
     // Sprint 59 Wave 1 PR-1 (#9 task stall watchdog): per-task ETA
@@ -295,6 +308,7 @@ fn run_loop(
                 &registry,
                 &mut retry_tracks,
                 &mut apierror_episodes,
+                &mut apierror_nudge_counts,
                 &mut last_continue_inject,
             );
             check_pane_input_not_submitted(
@@ -1357,6 +1371,7 @@ pub(crate) fn process_error_recovery(
     registry: &AgentRegistry,
     retry_tracks: &mut HashMap<String, RateLimitRetry>,
     apierror_episodes: &mut std::collections::HashSet<String>,
+    apierror_nudge_counts: &mut HashMap<String, u32>,
     last_continue_inject: &mut HashMap<String, Instant>,
 ) {
     use crate::state::AgentState;
@@ -1421,12 +1436,25 @@ pub(crate) fn process_error_recovery(
 
             // ── #1697: ApiError-at-prompt quick-nudge (per-episode anti-thrash) ──
             if state == AgentState::ApiError {
-                if !apierror_episodes.contains(name) {
+                // #1742-F4: cap the total nudges per flicker-window. A content-FP
+                // `ApiError↔Thinking` flicker re-arms `apierror_episodes` every
+                // cycle, so the per-episode dedup alone lets it nudge indefinitely
+                // (only MIN_INTERVAL-rate-limited). Stop once the window count hits
+                // APIERROR_NUDGE_MAX; the count resets on genuine recovery (below).
+                let capped =
+                    apierror_nudge_counts.get(name).copied().unwrap_or(0) >= APIERROR_NUDGE_MAX;
+                if !apierror_episodes.contains(name) && !capped {
                     apierror_to_nudge.push(name.to_string());
                 }
             } else {
                 // Left the ApiError state → re-arm so the NEXT episode nudges again.
                 apierror_episodes.remove(name);
+                // #1742-F4: reset the flicker cap ONLY on genuine recovery (Idle) —
+                // NOT on a mid-flicker Thinking/ToolUse, else the cap could never
+                // accumulate across the ApiError↔Thinking oscillation it bounds.
+                if clears_server_rate_limit_retry(state) {
+                    apierror_nudge_counts.remove(name);
+                }
             }
         }
     }
@@ -1435,6 +1463,7 @@ pub(crate) fn process_error_recovery(
     // restarted / deleted) so the maps don't grow unbounded across agent churn.
     retry_tracks.retain(|name, _| active_names.contains(name));
     apierror_episodes.retain(|name| active_names.contains(name));
+    apierror_nudge_counts.retain(|name, _| active_names.contains(name));
     last_continue_inject.retain(|name, _| active_names.contains(name));
 
     // Phase 2: EXECUTE the ServerRateLimit injects decided in Phase 1 with fresh
@@ -1564,6 +1593,8 @@ pub(crate) fn process_error_recovery(
         // InjectFailed leave it un-nudged to re-attempt next tick.
         if inject_continue_gated(home, registry, &name) == InjectOutcome::Injected {
             apierror_episodes.insert(name.clone());
+            // #1742-F4: count this nudge toward the per-flicker-window cap.
+            *apierror_nudge_counts.entry(name.clone()).or_insert(0) += 1;
             last_continue_inject.insert(name.clone(), Instant::now());
             tracing::info!(agent = %name, "#1697: ApiError-at-prompt quick-nudge — injected \"continue\"");
         }
@@ -2787,6 +2818,7 @@ instances:
             &mut tracks,
             &mut Default::default(),
             &mut Default::default(),
+            &mut Default::default(),
         );
         assert!(
             tracks.contains_key("test-agent"),
@@ -2821,6 +2853,7 @@ instances:
             &home,
             &registry,
             &mut tracks,
+            &mut Default::default(),
             &mut Default::default(),
             &mut Default::default(),
         );
@@ -2901,6 +2934,7 @@ instances:
             &registry,
             &mut tracks,
             &mut Default::default(),
+            &mut Default::default(),
             &mut last_inject,
         );
 
@@ -2950,6 +2984,7 @@ instances:
             &mut tracks,
             &mut Default::default(),
             &mut Default::default(),
+            &mut Default::default(),
         );
         assert!(
             tracks.contains_key("test-agent"),
@@ -2996,6 +3031,7 @@ instances:
             &home,
             &registry,
             &mut tracks,
+            &mut Default::default(),
             &mut Default::default(),
             &mut Default::default(),
         );
@@ -3057,6 +3093,7 @@ instances:
             &mut tracks,
             &mut Default::default(),
             &mut Default::default(),
+            &mut Default::default(),
         );
         assert!(
             !tracks.contains_key("ghost-agent"),
@@ -3105,6 +3142,7 @@ instances:
             &home,
             &registry,
             &mut tracks,
+            &mut Default::default(),
             &mut Default::default(),
             &mut Default::default(),
         );
@@ -3187,6 +3225,7 @@ instances:
             &registry,
             &mut tracks,
             &mut Default::default(),
+            &mut Default::default(),
             &mut last_inject,
         );
 
@@ -3238,6 +3277,7 @@ instances:
             &home,
             &registry,
             &mut tracks,
+            &mut Default::default(),
             &mut Default::default(),
             &mut Default::default(),
         );
@@ -3719,6 +3759,7 @@ instances:
             &registry,
             &mut tracks,
             &mut Default::default(),
+            &mut Default::default(),
             &mut last_inject,
         );
         assert!(
@@ -3754,6 +3795,7 @@ instances:
             &registry,
             &mut Default::default(),
             &mut episodes,
+            &mut Default::default(),
             &mut last_inject,
         );
         assert!(
@@ -3775,12 +3817,53 @@ instances:
             &registry,
             &mut Default::default(),
             &mut episodes,
+            &mut Default::default(),
             &mut last_inject,
         );
         assert_eq!(
             last_inject.get("ag").copied(),
             before,
             "#1697: must not re-nudge within the same ApiError episode"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn apierror_nudge_caps_per_flicker_window_1742_f4() {
+        // #1742-F4: a content-FP `ApiError↔Thinking` flicker re-arms the
+        // per-episode dedup every cycle, so without a total cap the quick-nudge
+        // injects indefinitely (bounded only by MIN_INTERVAL). Simulate the
+        // flicker by clearing `episodes` (re-armed) + `last_inject` (>MIN_INTERVAL
+        // elapsed) each cycle while the agent stays ApiError, and assert the nudge
+        // count caps at APIERROR_NUDGE_MAX instead of growing unbounded.
+        let (home, registry, _reader) =
+            one_agent_registry("ag", crate::state::AgentState::ApiError, "apierror-cap");
+        let mut episodes: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut counts: HashMap<String, u32> = HashMap::new();
+        let mut last_inject: HashMap<String, Instant> = HashMap::new();
+
+        for _ in 0..(super::APIERROR_NUDGE_MAX + 3) {
+            episodes.clear(); // flicker → next ApiError counts as a "new episode"
+            last_inject.clear(); // >CONTINUE_INJECT_MIN_INTERVAL elapsed
+            super::process_error_recovery(
+                &home,
+                &registry,
+                &mut Default::default(),
+                &mut episodes,
+                &mut counts,
+                &mut last_inject,
+            );
+        }
+
+        // The first APIERROR_NUDGE_MAX cycles nudge (proving a single ApiError
+        // still nudges); the rest are capped — so the count is exactly the cap,
+        // not APIERROR_NUDGE_MAX + 3. (Negative-probe: drop the `!capped` gate and
+        // this reaches APIERROR_NUDGE_MAX + 3.)
+        assert_eq!(
+            counts.get("ag").copied(),
+            Some(super::APIERROR_NUDGE_MAX),
+            "#1742-F4: ApiError nudge count must cap at APIERROR_NUDGE_MAX despite \
+             continued flicker"
         );
         std::fs::remove_dir_all(&home).ok();
     }
