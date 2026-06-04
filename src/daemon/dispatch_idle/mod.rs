@@ -294,14 +294,15 @@ pub(crate) fn cleanup_pending_for_task_id(home: &Path, task_id: &str) -> usize {
     }
     let mut count = 0usize;
     for d in list_pending(home) {
-        if d.status != DispatchStatus::Pending {
-            continue;
-        }
+        // A closed task → purge EVERY sidecar for it, not just Pending ones. A
+        // late report on an already-Exceeded dispatch (or a task closing after the
+        // idle nudge fired) must still clear the sidecar (codex probe #1).
         if d.correlation_id.as_deref() != Some(task_id) {
             continue;
         }
         let path = pending_path(home, &d.dispatch_id);
         if std::fs::remove_file(&path).is_ok() {
+            let _ = std::fs::remove_file(format!("{}.lock", path.display()));
             count += 1;
             tracing::debug!(
                 target: "dispatch_idle",
@@ -373,8 +374,13 @@ pub(crate) fn mark_resolved(home: &Path, correlation_id: &str) -> Option<String>
     if correlation_id.is_empty() {
         return None;
     }
+    // A report arriving = the dispatch is done, whether it was still `Pending` or
+    // had already timed out to `Exceeded` (idle nudge fired). Match BOTH so a LATE
+    // report on an Exceeded dispatch still deletes the sidecar — otherwise it leaks
+    // until the slow retention / terminal-sweep path (codex probe #1 regression).
     let matched = list_pending(home).into_iter().find(|d| {
-        d.status == DispatchStatus::Pending && d.correlation_id.as_deref() == Some(correlation_id)
+        matches!(d.status, DispatchStatus::Pending | DispatchStatus::Exceeded)
+            && d.correlation_id.as_deref() == Some(correlation_id)
     });
     let d = matched?;
     let id = d.dispatch_id.clone();
@@ -1125,6 +1131,35 @@ mod tests {
         let removed = cleanup_pending_for_instance(&home, "gone-agent");
         assert_eq!(removed, 1, "must delete the non-Pending (Exceeded) sidecar");
         assert!(!path.exists(), "Exceeded sidecar must be removed");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// codex probe #1 regression: a LATE report on a dispatch that already timed
+    /// out (Pending → Exceeded, idle nudge fired) must STILL delete the sidecar.
+    /// Pre-fix `mark_resolved` matched only `Pending`, so the Exceeded sidecar
+    /// leaked until the slow retention / terminal-sweep path.
+    #[test]
+    fn mark_resolved_clears_exceeded_sidecar() {
+        let home = tmp_home("resolve-exceeded");
+        let issued = chrono::Utc::now() - chrono::Duration::seconds(700);
+        let id = write_pending_at(&home, "lead", "dev", Some("t-late"), "task", 600, issued);
+        // Flip to Exceeded on disk, as the idle scan would once the threshold passes.
+        let path = pending_path(&home, &id);
+        let mut pd: PendingDispatch =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        pd.status = DispatchStatus::Exceeded;
+        std::fs::write(&path, serde_json::to_string_pretty(&pd).unwrap()).unwrap();
+
+        let resolved = mark_resolved(&home, "t-late");
+        assert_eq!(
+            resolved.as_deref(),
+            Some(id.as_str()),
+            "late report must resolve the already-Exceeded sidecar"
+        );
+        assert!(
+            !path.exists(),
+            "late report must delete the Exceeded sidecar (not leak it)"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
