@@ -3310,6 +3310,69 @@ fn net_error_prose_mention_does_not_latch_1768() {
     );
 }
 
+/// `t-impl-errorline-regex-extend`: the extended error-line-shape regex (now the
+/// generic `in_error_line`) must MATCH the corpus's real backend error lines —
+/// including the ones the old `\b(api ?|fetch)?error[:?]` MISSED: ModelUnsupported
+/// `invalid_request_error:` (the `_error` underscore killed `\berror`), gemini
+/// bare-status (`429` / `got status:` / `RESOURCE_EXHAUSTED`), and structured-JSON
+/// error fields — while still REJECTING bare prose / source mentions.
+#[test]
+fn in_error_line_matches_corpus_errors_rejects_prose_step1() {
+    use crate::state::patterns::in_error_line;
+
+    // (line, a token on that line) — must read as a real backend error line.
+    let real: &[(&str, &str)] = &[
+        (
+            "API Error: InvalidHTTPResponse fetching \"http://x\"",
+            "InvalidHTTPResponse",
+        ),
+        (
+            "FetchError: request failed, reason: ECONNRESET",
+            "ECONNRESET",
+        ),
+        // #corpus bug: the `_error` underscore killed the old `\berror` boundary.
+        (
+            "invalid_request_error: model is not supported",
+            "invalid_request_error",
+        ),
+        (
+            "✕ API Error: got status: 429 RESOURCE_EXHAUSTED",
+            "RESOURCE_EXHAUSTED",
+        ),
+        ("429 Too Many Requests", "429"),
+        ("got status: 429", "429"),
+        ("{\"reason\": \"rateLimitExceeded\"}", "rateLimitExceeded"),
+        ("{\"type\": \"error\", \"message\": \"x\"}", "error"),
+        ("Error: token limit exceeded", "token limit"),
+    ];
+    for (line, tok) in real {
+        assert!(
+            in_error_line(line, tok),
+            "must read as an error line: {line:?} (token {tok:?})"
+        );
+    }
+
+    // Bare prose / source mentions of the same tokens — must NOT read as an error line.
+    let prose: &[(&str, &str)] = &[
+        (
+            "we keep hitting the InvalidHTTPResponse problem",
+            "InvalidHTTPResponse",
+        ),
+        ("the ECONNRESET error happened twice today", "ECONNRESET"),
+        (
+            "pub(crate) const SERVER_RATE_LIMIT_NET_ERRORS: &str = r\"ECONNRESET|...\"",
+            "ECONNRESET",
+        ),
+        ("see issue 4290 for details", "4290"),
+    ];
+    for (line, tok) in prose {
+        assert!(
+            !in_error_line(line, tok),
+            "prose/source mention must NOT read as an error line: {line:?} (token {tok:?})"
+        );
+    }
+}
+
 // ── #1527: transition recording at the mutation source ──
 
 #[test]
