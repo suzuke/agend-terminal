@@ -99,6 +99,33 @@ fn inject_strips_ansi_from_typed_payload() {
     );
 }
 
+/// #1769: the daemon auto-inject marker prefix embeds the kind and uses the
+/// `[AGEND-AUTO` token (sibling of `[AGEND-MSG]`) agents are taught to recognize.
+#[test]
+fn daemon_auto_prefix_embeds_kind_1769() {
+    assert_eq!(
+        super::daemon_auto_prefix("ratelimit-retry"),
+        "[AGEND-AUTO kind=ratelimit-retry] "
+    );
+    assert_eq!(
+        super::daemon_auto_prefix("apierror-nudge"),
+        "[AGEND-AUTO kind=apierror-nudge] "
+    );
+    // The prefix starts with the shared marker token (so the agent-instruction
+    // and the inject path can't drift).
+    assert!(super::daemon_auto_prefix("x").starts_with(super::DAEMON_AUTO_INJECT_MARKER));
+    // The inner payload survives intact after the prefix → worker still sees it.
+    let marked = [
+        super::daemon_auto_prefix("ratelimit-retry").as_bytes(),
+        b"continue\n",
+    ]
+    .concat();
+    let s = String::from_utf8_lossy(&marked);
+    assert!(s.starts_with("[AGEND-AUTO kind=ratelimit-retry] "));
+    assert!(s.contains("continue"));
+    assert!(s.ends_with('\n'), "submit newline preserved");
+}
+
 #[test]
 fn strip_ansi_cursor_move_no_space() {
     // CSI C (cursor forward) and D (cursor back) must not insert spaces

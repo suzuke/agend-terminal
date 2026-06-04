@@ -1919,12 +1919,43 @@ pub fn write_to_agent_typed(agent: &AgentHandle, data: &[u8]) -> crate::error::R
 /// 5s `recv_timeout` + payload-scaled sleep) blocking write. The busy-gate's
 /// agent-state read is the lock-free on-disk snapshot (never the per-agent core
 /// lock, #1492).
+/// #1769: marker token prefixed to daemon-self-originated AUTO injects (e.g. the
+/// ServerRateLimit "continue" retry). The full prefix is
+/// `[AGEND-AUTO kind=<kind>] ` — a sibling of the `[AGEND-MSG]` inbox header, so
+/// an orchestrator agent can tell a daemon auto-nudge apart from a real operator
+/// instruction (a bare injected "continue" was mistaken for an operator command
+/// and acted on). Agents are taught (see `instructions.rs` / FLEET-DEV-PROTOCOL)
+/// to treat an `[AGEND-AUTO]` line as a low-priority resume signal — continue
+/// in-progress work, NEVER dispatch from it.
+pub(crate) const DAEMON_AUTO_INJECT_MARKER: &str = "[AGEND-AUTO";
+
+/// #1769: build the `[AGEND-AUTO kind=<kind>] ` prefix for an auto-inject.
+fn daemon_auto_prefix(kind: &str) -> String {
+    format!("{DAEMON_AUTO_INJECT_MARKER} kind={kind}] ")
+}
+
 pub(crate) fn inject_with_target_gated(
     target: &InjectTarget,
     name: &str,
     text: &[u8],
     force: bool,
+    auto_kind: Option<&str>,
 ) -> crate::error::Result<()> {
+    // #1769: daemon self-originated auto-injects carry an identifying marker so
+    // an orchestrator can distinguish them from real operator/peer input. The
+    // marker is prepended HERE (before both the deferred-enqueue and the direct
+    // inject) so the tag survives whichever delivery path runs. Worker semantics
+    // are unchanged — the inner payload + submit are preserved; only a leading
+    // text tag is added. `None` (operator relay / api INJECT / inbox — which
+    // already carry their own headers) injects verbatim.
+    let marked: Vec<u8>;
+    let text: &[u8] = match auto_kind {
+        Some(kind) => {
+            marked = [daemon_auto_prefix(kind).as_bytes(), text].concat();
+            &marked
+        }
+        None => text,
+    };
     // #1513 PR-2: gate direct PTY injects like the notification path. Self-
     // contained via AGEND_HOME; AGEND_HOME absent (non-daemon / unit test) →
     // gate skipped.

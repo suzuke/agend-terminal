@@ -1392,6 +1392,7 @@ fn inject_continue_gated(
     home: &std::path::Path,
     registry: &AgentRegistry,
     name: &str,
+    auto_kind: &str,
 ) -> InjectOutcome {
     let snap = {
         let reg = agent::lock_registry(registry);
@@ -1401,7 +1402,19 @@ fn inject_continue_gated(
     };
     match snap {
         Some(tgt) => {
-            if agent::inject_with_target_gated(&tgt, name, CONTINUE_RETRY_PAYLOAD, false).is_ok() {
+            // #1769: a daemon self-originated auto-nudge — tag it with
+            // `[AGEND-AUTO kind=...]` so an orchestrator agent doesn't mistake the
+            // injected "continue" for an operator command (the worker still sees
+            // and acts on the inner "continue").
+            if agent::inject_with_target_gated(
+                &tgt,
+                name,
+                CONTINUE_RETRY_PAYLOAD,
+                false,
+                Some(auto_kind),
+            )
+            .is_ok()
+            {
                 InjectOutcome::Injected
             } else {
                 InjectOutcome::InjectFailed
@@ -1585,7 +1598,7 @@ pub(crate) fn process_error_recovery(
             tracing::info!(agent = %name, "ServerRateLimit: entering retry Phase C (sustained 10-min retry)");
         }
 
-        match inject_continue_gated(home, registry, name) {
+        match inject_continue_gated(home, registry, name, "ratelimit-retry") {
             InjectOutcome::Injected => {
                 retry.inject_failures = 0; // #1742: a success clears the failure streak
                 last_continue_inject.insert(name.clone(), Instant::now());
@@ -1663,7 +1676,8 @@ pub(crate) fn process_error_recovery(
         // #1742: the ApiError nudge is per-episode best-effort (not budgeted), so only
         // a genuine `Injected` marks the episode + stamps the interval; AgentGone /
         // InjectFailed leave it un-nudged to re-attempt next tick.
-        if inject_continue_gated(home, registry, &name) == InjectOutcome::Injected {
+        if inject_continue_gated(home, registry, &name, "apierror-nudge") == InjectOutcome::Injected
+        {
             apierror_episodes.insert(name.clone());
             // #1742-F4: count this nudge toward the per-flicker-window cap.
             *apierror_nudge_counts.entry(name.clone()).or_insert(0) += 1;
@@ -3178,6 +3192,13 @@ instances:
             "PTY must receive \"continue\" payload, got: {:?}",
             captured.trim_end_matches('\0')
         );
+        // #1769: the ServerRateLimit auto-retry inject is tagged so an
+        // orchestrator can tell it apart from a real operator "continue".
+        assert!(
+            captured.contains("[AGEND-AUTO kind=ratelimit-retry]"),
+            "#1769: daemon auto-inject must carry the [AGEND-AUTO kind=...] marker, got: {:?}",
+            captured.trim_end_matches('\0')
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -4119,14 +4140,18 @@ instances:
     #[test]
     fn continue_inject_is_draft_gated_force_false_1680() {
         let src = include_str!("supervisor.rs");
+        // #1769: the call is now multi-line (gained the `auto_kind` arg), so
+        // normalize whitespace before substring-matching the arg order.
+        let norm = src.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
-            src.contains("inject_with_target_gated(&tgt, name, CONTINUE_RETRY_PAYLOAD, false)"),
-            "#1680: the continue-inject must pass force=false (draft-gated)"
+            norm.contains("CONTINUE_RETRY_PAYLOAD, false, Some(auto_kind),"),
+            "#1680: the continue-inject must pass force=false (draft-gated); \
+             #1769: and the daemon-auto marker (auto_kind)"
         );
         // Split needle so this assertion's own text can't false-match the source.
-        let force_true = format!("CONTINUE_RETRY_PAYLOAD,{}true)", " ");
+        let force_true = format!("CONTINUE_RETRY_PAYLOAD,{}true", " ");
         assert!(
-            !src.contains(&force_true),
+            !norm.contains(&force_true),
             "#1680: no force=true continue-inject may remain"
         );
     }
