@@ -186,7 +186,11 @@ fn is_clean_merged(repo: &Path, base: &str, branch: &str) -> bool {
 /// patch-id than the individual commits). The fallback checks if the
 /// diff from merge-base to the branch tip is empty against base HEAD
 /// (i.e., all changes are already incorporated).
-fn is_squash_merged(repo: &Path, base: &str, branch: &str) -> bool {
+// #1750-B3: pub(crate) so the automatic per-tick GC
+// (`worktree_cleanup::prune_orphaned_branches`) reuses the SAME squash-merge
+// detection the operator-triggered sweep uses — the squash-blind `git branch
+// --merged` in the auto path missed 95/99 squash-orphan branches.
+pub(crate) fn is_squash_merged(repo: &Path, base: &str, branch: &str) -> bool {
     // Method 1: git cherry (works for cherry-picked commits).
     if is_squash_merged_cherry(repo, base, branch) {
         return true;
