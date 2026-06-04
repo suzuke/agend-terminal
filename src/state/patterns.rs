@@ -49,6 +49,44 @@ pub(crate) fn is_net_error_match(matched: &str) -> bool {
         .is_match(matched)
 }
 
+/// #1768: does some on-screen occurrence of `matched` sit in a real error LINE
+/// (one carrying an `Error:` / `API Error:` / `FetchError:` label)?
+///
+/// The #1757 net-error exemption (fail-open the #1450 red anchor for net-error
+/// tokens, since codex/gemini render them default not red) was too broad — it
+/// fired for the token ANYWHERE in the live tail, so an orchestrator merely
+/// *discussing* a net error (idle between turns, no working-marker below) had it
+/// mis-latch `ServerRateLimit` → retry storm (the case codex's #1769 review
+/// caught). Narrow the exemption to the token's LINE looking like a backend error
+/// line. The trailing `:`/`?` after a word-boundary `error` means the const name
+/// `…NET_ERRORS:` and prose like "the ECONNRESET error happened" do NOT qualify —
+/// only a labeled error line does. A genuine fault
+/// (`API Error: InvalidHTTPResponse fetching …`) IS error-line-shaped → still
+/// fails open → still latches (the #1757 intent). Checks every occurrence so a
+/// real error line alongside a prose mention still qualifies.
+pub(crate) fn net_error_in_error_line(screen_text: &str, matched: &str) -> bool {
+    if matched.is_empty() {
+        return false;
+    }
+    use std::sync::OnceLock;
+    static ERROR_LABEL: OnceLock<Regex> = OnceLock::new();
+    let re = ERROR_LABEL
+        .get_or_init(|| Regex::new(r"(?i)\b(api ?|fetch)?error\s*[:?]").expect("label regex"));
+    let mut search = 0;
+    while let Some(rel) = screen_text[search..].find(matched) {
+        let pos = search + rel;
+        let line_start = screen_text[..pos].rfind('\n').map_or(0, |i| i + 1);
+        let line_end = screen_text[pos..]
+            .find('\n')
+            .map_or(screen_text.len(), |i| pos + i);
+        if re.is_match(&screen_text[line_start..line_end]) {
+            return true;
+        }
+        search = pos + matched.len();
+    }
+    false
+}
+
 /// Compiled patterns for one backend.
 pub struct StatePatterns {
     /// (state, regex) pairs in priority order (highest priority first).
@@ -284,6 +322,30 @@ impl StatePatterns {
             }
         }
         None
+    }
+
+    /// #1768: if a working-state marker (`Thinking`/`ToolUse`) is rendered BELOW
+    /// (more recently than) `error_match` in `text`, return that working state.
+    ///
+    /// A HIGH_FP error (e.g. `ServerRateLimit`) wins the priority race in
+    /// `detect_with_match` even when it has scrolled up and the agent has RESUMED
+    /// WORK below it — `ServerRateLimit` > `Thinking` by pattern order. If the
+    /// agent's most-recent on-screen activity (the lowest Thinking/ToolUse marker)
+    /// sits below the error, the agent recovered, so the caller lands on that
+    /// working state instead of re-latching the stale error (which would keep
+    /// re-injecting `continue` into a working agent — the #1768 retry storm). This
+    /// extends the #1518 absolute-tail-position gate to "relative to the working
+    /// marker" and never touches `clears_server_rate_limit_retry` (#1713). A
+    /// genuinely-stuck error has NO in-flight working marker below it → `None`.
+    pub(crate) fn working_state_below(&self, text: &str, error_match: &str) -> Option<AgentState> {
+        let err_pos = text.rfind(error_match)?;
+        self.patterns
+            .iter()
+            .filter(|(s, _)| matches!(s, AgentState::Thinking | AgentState::ToolUse))
+            .filter_map(|(s, re)| re.find_iter(text).last().map(|m| (m.start(), *s)))
+            .filter(|(pos, _)| *pos > err_pos)
+            .max_by_key(|(pos, _)| *pos)
+            .map(|(_, s)| s)
     }
 }
 

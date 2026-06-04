@@ -810,9 +810,20 @@ impl StateTracker {
                         // suppressed REAL faults → no ServerRateLimit transition →
                         // no auto-retry → stuck agent. Scoped: the FP-prone
                         // api_error/overloaded/context HIGH_FP tokens stay
-                        // red-anchored; the net-error residual FP is bounded by
-                        // #1518/#1586/#1760 (see `patterns::is_net_error_match`).
-                        && !crate::state::patterns::is_net_error_match(matched)
+                        // red-anchored.
+                        // #1768: NARROW that exemption to the token's LINE looking
+                        // like a real backend error line (`Error:`/`API Error:`/
+                        // `FetchError:` label) — a bare prose/source mention (an
+                        // orchestrator discussing net-errors, idle between turns,
+                        // with no working-marker below) stays red-anchored →
+                        // default-rendered → suppressed, instead of mis-latching
+                        // ServerRateLimit (the retry-storm FP codex caught). A real
+                        // fault IS error-line-shaped → still fails open → latches.
+                        && !(crate::state::patterns::is_net_error_match(matched)
+                            && crate::state::patterns::net_error_in_error_line(
+                                screen_text,
+                                matched,
+                            ))
                         && !matched_span_has_red(screen_text, matched, fg);
                     // #1518 position gate: a HIGH_FP marker that has scrolled out
                     // of the live bottom-N rows (e.g. an ApiError / ServerRateLimit
@@ -850,7 +861,28 @@ impl StateTracker {
                             self.maybe_expire_latched_state();
                         }
                     } else {
-                        let gated = self.gate_on_heartbeat(detected);
+                        // #1768: a HIGH_FP error wins the priority race even after
+                        // it scrolled up and the agent RESUMED WORK below it
+                        // (ServerRateLimit > Thinking by pattern order), so it keeps
+                        // re-latching → `clears_server_rate_limit_retry` (Idle-only,
+                        // #1713) never fires → supervisor re-injects `continue` into
+                        // a working agent (the #1768 retry storm; the latched
+                        // ServerRateLimit also doesn't auto-expire). If a
+                        // Thinking/ToolUse marker is rendered BELOW the error, the
+                        // agent recovered → land on that working state instead of the
+                        // stale error. A genuinely-stuck error has NO in-flight
+                        // working marker below it → `landed` stays `detected` → still
+                        // latches → auto-retry fires. Detection-side only;
+                        // `clears_server_rate_limit_retry` untouched → no #1713
+                        // flicker-reset regression.
+                        let landed = if high_fp {
+                            patterns
+                                .working_state_below(screen_text, matched)
+                                .unwrap_or(detected)
+                        } else {
+                            detected
+                        };
+                        let gated = self.gate_on_heartbeat(landed);
                         self.transition(gated);
                     }
                 }
