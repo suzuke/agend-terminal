@@ -96,11 +96,33 @@ jobs:
       # file. `--features tray` ensures tray-gated code is tested too.
       # Previously this was 3 separate steps (unit, unit+tray, integration)
       # which triggered 2 extra recompilations from feature-flag switching.
+      # #1784: a real `Command::new("git")` test (worktree_cleanup / branch_sweep
+      # build real repos + worktrees) intermittently HANGS on windows, timing the
+      # whole job out at ~56min with NO culprit — `cargo test` only prints a test
+      # name on COMPLETION, so a hung test is anonymous. On windows we run via
+      # nextest with a per-test terminate-after (.config/nextest.toml `ci`
+      # profile): parallelism is kept (the intermittent race still reproduces),
+      # but a test still running past the timeout is KILLED and NAMED → a fast,
+      # attributed failure instead of a 56-min mystery. mac/ubuntu keep cargo test.
+      - name: Install nextest (windows hang hunt #1784)
+        if: runner.os == 'Windows'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
       - name: Tests (unit + integration + tray)
+        if: runner.os != 'Windows'
         timeout-minutes: 30
         env:
           AGEND_LOCK_AUDIT: "1"
         run: cargo test --tests --features tray
+
+      - name: Tests (unit + integration + tray) [windows — nextest names a hung test, #1784]
+        if: runner.os == 'Windows'
+        timeout-minutes: 30
+        env:
+          AGEND_LOCK_AUDIT: "1"
+        run: cargo nextest run --features tray --profile ci
 
       - name: CLI smoke (Phase C.5)
         timeout-minutes: 10

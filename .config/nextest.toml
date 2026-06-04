@@ -1,0 +1,20 @@
+# #1784: instrument the fleet-wide windows CI hang hunt.
+#
+# A real `Command::new("git")` test (worktree_cleanup / branch_sweep build real
+# repos + worktrees) intermittently HANGS on windows-latest, timing the whole CI
+# job out at ~56min with NO attribution — `cargo test` prints a test's name only
+# on COMPLETION, so a hung test is anonymous in the log (which also never
+# finalizes on a job timeout).
+#
+# The windows Tests step runs via nextest with this `ci` profile: it keeps the
+# default parallelism (so the intermittent race still reproduces), but any test
+# still running past the slow-timeout is KILLED and NAMED. That turns a 56-min
+# mystery hang into a fast, attributed failure so we can pinpoint + fix the
+# offending test. mac/ubuntu (green) keep `cargo test` unchanged.
+[profile.ci]
+# Warn (mark SLOW) at 60s; SIGKILL the test after 2 periods (120s). Normal tests
+# finish in well under a second; a real-git test that takes >120s is wedged.
+slow-timeout = { period = "60s", terminate-after = 2 }
+# Surface the terminated/hung test prominently in the run summary.
+failure-output = "immediate-final"
+final-status-level = "slow"
