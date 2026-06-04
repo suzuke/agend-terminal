@@ -152,6 +152,9 @@ pub(super) fn handle_start_instance(home: &Path, args: &Value) -> Value {
         None => return json!({"error": "missing 'instance'"}),
     };
     crate::validate_name_or_err!(name);
+    // #1744-PR-B (latch-scope): operator-initiated recovery resets the terminal
+    // self-orch once-off latch, so a fresh terminal death after this start re-pages.
+    crate::daemon::escalation_persist::clear_failed_escalated(home, name);
     let fleet_path = crate::fleet::fleet_yaml_path(home);
     if !fleet_path.exists() {
         return json!({"error": "No fleet.yaml"});
@@ -233,6 +236,9 @@ pub(super) fn handle_replace_instance(home: &Path, args: &Value) -> Value {
         None => return json!({"error": "missing 'instance'"}),
     };
     crate::validate_name_or_err!(name);
+    // #1744-PR-B (latch-scope): operator-initiated recovery resets the terminal
+    // self-orch once-off latch, so a fresh terminal death after this replace re-pages.
+    crate::daemon::escalation_persist::clear_failed_escalated(home, name);
     let reason = args["reason"].as_str().unwrap_or("manual replacement");
 
     // Capture backend + working_directory before kill so we can respawn.
@@ -380,6 +386,9 @@ pub(super) fn handle_restart_instance(home: &Path, args: &Value) -> Value {
         None => return json!({"error": "missing 'instance'"}),
     };
     crate::validate_name_or_err!(name);
+    // #1744-PR-B (latch-scope): operator-initiated recovery resets the terminal
+    // self-orch once-off latch, so a fresh terminal death after this restart re-pages.
+    crate::daemon::escalation_persist::clear_failed_escalated(home, name);
     let reason = args["reason"].as_str().unwrap_or("manual restart");
     let mode = args["mode"].as_str().unwrap_or("resume");
 

@@ -84,6 +84,28 @@ pub(crate) fn remove(home: &Path, name: &str) {
     }
 }
 
+/// #1744-PR-B (latch-scope): clear ONLY the terminal-Failed once-off latch
+/// (`failed_escalated`) for one agent, preserving the crash budget / cooldowns.
+/// Called at operator-initiated recovery boundaries (start / restart / replace):
+/// once the operator has intervened, a fresh terminal death must re-page — without
+/// this the persisted latch (rehydrated onto the re-spawned tracker) would silence
+/// the new death. A daemon restart does NOT route through these RPC handlers, so
+/// the latch survives a plain restart (the same un-recovered death is not re-paged).
+pub(crate) fn clear_failed_escalated(home: &Path, name: &str) {
+    let path = store_file(home);
+    if !path.exists() {
+        return;
+    }
+    if let Err(e) = store::mutate_versioned::<EscalationStore, _, _>(&path, |s| {
+        if let Some(entry) = s.agents.get_mut(name) {
+            entry.failed_escalated = false;
+        }
+        Ok(())
+    }) {
+        tracing::warn!(agent = %name, error = %e, "escalation_persist: clear_failed_escalated failed");
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -135,5 +157,52 @@ mod tests {
         remove(&home, "ghost"); // must not panic / create the file
         assert!(load_for(&home, "ghost").is_none());
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn clear_failed_escalated_resets_latch_preserves_budget_1744_prb() {
+        // #1744-PR-B latch-scope: operator-initiated recovery clears ONLY the
+        // terminal once-off latch (so a fresh terminal death re-pages), preserving
+        // the crash budget / cooldowns. A plain daemon restart (rehydrate) does NOT
+        // route through this, so the latch survives there.
+        let home = tmp_home("clear-latch");
+        persist(
+            &home,
+            "orch",
+            &PersistedEscalation {
+                total_crashes: 7,
+                crash_times_epoch_ms: vec![100],
+                last_crash_notification_epoch_ms: Some(200),
+                last_hung_notification_epoch_ms: None,
+                hung_since_epoch_ms: None,
+                failed_escalated: true,
+            },
+        );
+
+        clear_failed_escalated(&home, "orch");
+
+        let after = load_for(&home, "orch").expect("entry survives the clear");
+        assert!(
+            !after.failed_escalated,
+            "operator recovery must reset the terminal once-off latch"
+        );
+        assert_eq!(
+            after.total_crashes, 7,
+            "the crash budget must be preserved across an operator recovery"
+        );
+        assert_eq!(
+            after.last_crash_notification_epoch_ms,
+            Some(200),
+            "the crash cooldown must be preserved"
+        );
+
+        // No-op on an unknown agent / a missing store (no panic, no file creation).
+        clear_failed_escalated(&home, "ghost");
+        let empty = tmp_home("clear-empty");
+        clear_failed_escalated(&empty, "anyone");
+        assert!(load_for(&empty, "anyone").is_none());
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&empty).ok();
     }
 }
