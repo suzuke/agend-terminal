@@ -140,6 +140,34 @@ fn auth_error_gate(auth_error_held: Option<Duration>) -> AuthErrorGate {
     }
 }
 
+/// #1741 boot-grace (B): apply the [`auth_error_gate`] verdict to the pending
+/// map, honoring boot-grace. Returns `Some(entry)` — removed from `pending_auth`
+/// — when the deferred operator notify should FIRE this tick.
+///
+/// During boot-grace a `Fire` is HELD: the entry stays pending and `None` is
+/// returned, so a post-restart re-page (the in-mem confirm-window restarts on
+/// restart → a pre-existing AuthError re-confirms and would re-fire ~90s in,
+/// still within the 180s grace) is suppressed WITHOUT losing the notify — it
+/// fires on a later tick once the grace ends. `Cancel` drops the pending entry
+/// (self-healed blip); `Wait` leaves it untouched. Pure + testable; the
+/// confirm-window classification (`auth_error_gate`) is never gated.
+fn resolve_pending_auth(
+    gate: AuthErrorGate,
+    in_boot_grace: bool,
+    name: &str,
+    pending_auth: &mut HashMap<String, PendingAuthError>,
+) -> Option<PendingAuthError> {
+    match gate {
+        AuthErrorGate::Fire if in_boot_grace => None,
+        AuthErrorGate::Fire => pending_auth.remove(name),
+        AuthErrorGate::Cancel => {
+            pending_auth.remove(name);
+            None
+        }
+        AuthErrorGate::Wait => None,
+    }
+}
+
 /// Sprint 54 P2-3: dedup key for `PaneInputNotSubmitted` emission.
 /// Records the `last_input_epoch_ms` of the most recent emit so the
 /// supervisor doesn't re-fire on every 10-s tick while the operator
@@ -302,7 +330,13 @@ fn run_loop(
         // in any tracker's maybe_scan() doesn't kill the supervisor thread.
         // Mirrors the run_handlers_with_panic_guard pattern from per_tick.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            tick(&home, &registry, &mut notify_tracks, &mut pending_auth);
+            tick(
+                &home,
+                &registry,
+                &mut notify_tracks,
+                &mut pending_auth,
+                loop_started_at,
+            );
             process_error_recovery(
                 &home,
                 &registry,
@@ -310,6 +344,7 @@ fn run_loop(
                 &mut apierror_episodes,
                 &mut apierror_nudge_counts,
                 &mut last_continue_inject,
+                loop_started_at,
             );
             check_pane_input_not_submitted(
                 &home,
@@ -849,6 +884,7 @@ fn tick(
     registry: &AgentRegistry,
     notify_tracks: &mut HashMap<String, NotifyTrack>,
     pending_auth: &mut HashMap<String, PendingAuthError>,
+    loop_started_at: Instant,
 ) {
     // Snapshot the agent names + handles so we can release the registry lock
     // before touching any per-agent core lock. Holding both at once risks
@@ -1140,7 +1176,13 @@ fn tick(
                                         from: intent.from,
                                         pane_tail: intent.pane_tail.clone(),
                                     });
-                            } else {
+                            } else if !crate::daemon::per_tick::in_boot_grace(loop_started_at) {
+                                // #1741 boot-grace: a daemon restart resets
+                                // notify_tracks (the 60s cooldown) AND re-derives
+                                // agent states, so a pre-existing error state's
+                                // re-detected edge would re-notify the orchestrator.
+                                // Suppress for the post-boot window; a genuine NEW
+                                // edge after grace still notifies.
                                 maybe_notify_member_state_change(
                                     home,
                                     &name,
@@ -1163,23 +1205,27 @@ fn tick(
         // AUTH_ERROR_NOTIFY_STABILITY → fire once) or cancelled (state left
         // AuthError → drop pending). Classification, retry, and timers are
         // untouched — only the operator NOTIFICATION is gated.
-        match auth_error_gate(auth_error_held) {
-            AuthErrorGate::Fire => {
-                if let Some(p) = pending_auth.remove(&name) {
-                    maybe_notify_member_state_change(
-                        home,
-                        &name,
-                        p.from,
-                        crate::state::AgentState::AuthError,
-                        &p.pane_tail,
-                        notify_tracks,
-                    );
-                }
-            }
-            AuthErrorGate::Cancel => {
-                pending_auth.remove(&name);
-            }
-            AuthErrorGate::Wait => {}
+        // #1741 boot-grace (B): `resolve_pending_auth` HOLDS a `Fire` during the
+        // post-boot window (keeps the entry pending, returns None) so a
+        // post-restart re-page is suppressed WITHOUT losing a genuine held-AuthError
+        // notify — it fires once the grace ends. The confirm-window classification
+        // (`auth_error_gate`) itself is never gated, and `Cancel`/`Wait` are
+        // unaffected.
+        let in_boot_grace = crate::daemon::per_tick::in_boot_grace(loop_started_at);
+        if let Some(p) = resolve_pending_auth(
+            auth_error_gate(auth_error_held),
+            in_boot_grace,
+            &name,
+            pending_auth,
+        ) {
+            maybe_notify_member_state_change(
+                home,
+                &name,
+                p.from,
+                crate::state::AgentState::AuthError,
+                &p.pane_tail,
+                notify_tracks,
+            );
         }
 
         match action {
@@ -1373,6 +1419,7 @@ pub(crate) fn process_error_recovery(
     apierror_episodes: &mut std::collections::HashSet<String>,
     apierror_nudge_counts: &mut HashMap<String, u32>,
     last_continue_inject: &mut HashMap<String, Instant>,
+    loop_started_at: Instant,
 ) {
     use crate::state::AgentState;
     let now = Instant::now();
@@ -1443,7 +1490,17 @@ pub(crate) fn process_error_recovery(
                 // APIERROR_NUDGE_MAX; the count resets on genuine recovery (below).
                 let capped =
                     apierror_nudge_counts.get(name).copied().unwrap_or(0) >= APIERROR_NUDGE_MAX;
-                if !apierror_episodes.contains(name) && !capped {
+                // #1741 boot-grace: ALSO skip QUEUING the nudge during the post-boot
+                // window. Because the `apierror_episodes` insert only happens in
+                // Phase 2b when a queued nudge actually fires, NOT queuing here
+                // leaves the episode unmarked → a still-ApiError agent gets a fresh
+                // nudge once the grace ends. Detection (`state == ApiError`), the
+                // #1742-F4 cap, and the re-arm below are all unaffected; SRL retry
+                // above is untouched.
+                if !crate::daemon::per_tick::in_boot_grace(loop_started_at)
+                    && !apierror_episodes.contains(name)
+                    && !capped
+                {
                     apierror_to_nudge.push(name.to_string());
                 }
             } else {
@@ -2819,6 +2876,7 @@ instances:
             &mut Default::default(),
             &mut Default::default(),
             &mut Default::default(),
+            past_boot_grace(),
         );
         assert!(
             tracks.contains_key("test-agent"),
@@ -2856,6 +2914,7 @@ instances:
             &mut Default::default(),
             &mut Default::default(),
             &mut Default::default(),
+            past_boot_grace(),
         );
         assert!(
             !tracks.contains_key("test-agent"),
@@ -2936,6 +2995,7 @@ instances:
             &mut Default::default(),
             &mut Default::default(),
             &mut last_inject,
+            past_boot_grace(),
         );
 
         // Track persists (PermissionPrompt is not a clearing state)…
@@ -2985,6 +3045,7 @@ instances:
             &mut Default::default(),
             &mut Default::default(),
             &mut Default::default(),
+            past_boot_grace(),
         );
         assert!(
             tracks.contains_key("test-agent"),
@@ -3034,6 +3095,7 @@ instances:
             &mut Default::default(),
             &mut Default::default(),
             &mut Default::default(),
+            past_boot_grace(),
         );
         assert_eq!(
             tracks["test-agent"].retry_count, 1,
@@ -3094,6 +3156,7 @@ instances:
             &mut Default::default(),
             &mut Default::default(),
             &mut Default::default(),
+            past_boot_grace(),
         );
         assert!(
             !tracks.contains_key("ghost-agent"),
@@ -3145,6 +3208,7 @@ instances:
             &mut Default::default(),
             &mut Default::default(),
             &mut Default::default(),
+            past_boot_grace(),
         );
 
         assert!(
@@ -3227,6 +3291,7 @@ instances:
             &mut Default::default(),
             &mut Default::default(),
             &mut last_inject,
+            past_boot_grace(),
         );
 
         let t = tracks
@@ -3280,6 +3345,7 @@ instances:
             &mut Default::default(),
             &mut Default::default(),
             &mut Default::default(),
+            past_boot_grace(),
         );
         let t = tracks
             .get("ok-x")
@@ -3761,6 +3827,7 @@ instances:
             &mut Default::default(),
             &mut Default::default(),
             &mut last_inject,
+            past_boot_grace(),
         );
         assert!(
             tracks.contains_key("ag"),
@@ -3797,6 +3864,7 @@ instances:
             &mut episodes,
             &mut Default::default(),
             &mut last_inject,
+            past_boot_grace(),
         );
         assert!(
             episodes.contains("ag"),
@@ -3819,6 +3887,7 @@ instances:
             &mut episodes,
             &mut Default::default(),
             &mut last_inject,
+            past_boot_grace(),
         );
         assert_eq!(
             last_inject.get("ag").copied(),
@@ -3852,6 +3921,7 @@ instances:
                 &mut episodes,
                 &mut counts,
                 &mut last_inject,
+                past_boot_grace(),
             );
         }
 
@@ -3864,6 +3934,108 @@ instances:
             Some(super::APIERROR_NUDGE_MAX),
             "#1742-F4: ApiError nudge count must cap at APIERROR_NUDGE_MAX despite \
              continued flicker"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn resolve_pending_auth_holds_fire_during_boot_grace_1741() {
+        use super::{resolve_pending_auth, AuthErrorGate, PendingAuthError};
+        let entry = || PendingAuthError {
+            from: crate::state::AgentState::Idle,
+            pane_tail: String::new(),
+        };
+
+        // Fire WITHIN boot-grace → held: pending KEPT, nothing fired (the
+        // confirm-window is preserved; it fires once the grace ends).
+        let mut pending: HashMap<String, PendingAuthError> = HashMap::new();
+        pending.insert("ag".into(), entry());
+        assert!(
+            resolve_pending_auth(AuthErrorGate::Fire, true, "ag", &mut pending).is_none(),
+            "#1741: Fire during boot-grace must NOT fire"
+        );
+        assert!(
+            pending.contains_key("ag"),
+            "#1741: Fire during boot-grace must KEEP pending (no lost notify)"
+        );
+
+        // Fire AFTER boot-grace → fires: entry returned + removed from pending.
+        assert!(
+            resolve_pending_auth(AuthErrorGate::Fire, false, "ag", &mut pending).is_some(),
+            "#1741: Fire after grace must fire"
+        );
+        assert!(
+            !pending.contains_key("ag"),
+            "#1741: Fire after grace must remove pending"
+        );
+
+        // Cancel → drop pending, never fires (boot-grace irrelevant).
+        let mut pending: HashMap<String, PendingAuthError> = HashMap::new();
+        pending.insert("ag".into(), entry());
+        assert!(resolve_pending_auth(AuthErrorGate::Cancel, true, "ag", &mut pending).is_none());
+        assert!(
+            !pending.contains_key("ag"),
+            "Cancel must drop the self-healed pending entry"
+        );
+
+        // Wait → keep pending, never fires.
+        let mut pending: HashMap<String, PendingAuthError> = HashMap::new();
+        pending.insert("ag".into(), entry());
+        assert!(resolve_pending_auth(AuthErrorGate::Wait, false, "ag", &mut pending).is_none());
+        assert!(pending.contains_key("ag"), "Wait must keep pending");
+    }
+
+    #[test]
+    fn apierror_nudge_suppressed_during_boot_grace_1741() {
+        let (home, registry, mut reader) = one_agent_registry(
+            "ag",
+            crate::state::AgentState::ApiError,
+            "apierror-bootgrace-1741",
+        );
+        let mut episodes: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut last_inject: HashMap<String, Instant> = HashMap::new();
+
+        // WITHIN boot-grace (loop just started) → no nudge queued, episode UNMARKED
+        // (so a still-ApiError agent gets a fresh nudge after grace, not a phantom
+        // "already nudged" mark).
+        super::process_error_recovery(
+            &home,
+            &registry,
+            &mut Default::default(),
+            &mut episodes,
+            &mut Default::default(),
+            &mut last_inject,
+            Instant::now(),
+        );
+        assert!(
+            !episodes.contains("ag"),
+            "#1741: boot-grace must NOT mark the ApiError episode"
+        );
+        assert!(
+            !last_inject.contains_key("ag"),
+            "#1741: boot-grace must suppress the ApiError nudge"
+        );
+
+        // AFTER boot-grace → still ApiError → fresh nudge fires + episode marked.
+        super::process_error_recovery(
+            &home,
+            &registry,
+            &mut Default::default(),
+            &mut episodes,
+            &mut Default::default(),
+            &mut last_inject,
+            past_boot_grace(),
+        );
+        assert!(
+            episodes.contains("ag"),
+            "#1741: after grace, a still-ApiError agent must be nudged fresh"
+        );
+        let mut buf = vec![0u8; 256];
+        use std::io::Read;
+        let n = reader.read(&mut buf).expect("read from PTY");
+        assert!(
+            String::from_utf8_lossy(&buf[..n]).contains("continue"),
+            "#1741: post-grace ApiError nudge must inject \"continue\""
         );
         std::fs::remove_dir_all(&home).ok();
     }
