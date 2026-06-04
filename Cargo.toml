@@ -151,7 +151,7 @@ windows-sys = { version = "0.61", features = ["Win32_System_Threading", "Win32_S
 # #1547 (A): directory junctions for the non-hidden agy workspace link. A
 # junction needs no privilege, unlike `std::os::windows::fs::symlink_dir`
 # (which requires Developer Mode / admin). Windows-only.
-junction = "1"
+junction = "2"
 
 [target.'cfg(windows)'.build-dependencies]
 embed-resource = "3"
