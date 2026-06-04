@@ -513,11 +513,16 @@ pub(crate) fn pending_for_instance(
 /// `target`? Replaces the #1516 instantaneous `thinking`/`tool_use` state check
 /// with two more-robust conditions read from the fleet snapshot:
 ///
-/// 1. **active-recovery exempt** — `agent_state ∈ {server_rate_limit, api_error}`:
-///    the agent is being driven by the ServerRateLimit/ApiError auto-retry
-///    machinery, which owns its recovery. Nudging it is pure noise (#1694
-///    dialectic finding #4 — without this, a proxy-drop re-creates the very
-///    noise this change removes).
+/// 1. **active-recovery exempt** — `agent_state == server_rate_limit` ONLY: a
+///    rate-limited agent is in a bounded retry-backoff wait (#1696) whose
+///    exhaustion (12 retries → #1744 escalation) is its own stuck-backstop, so
+///    suppressing the idle nudge avoids noise in a legit wait without hiding a
+///    real stuck (#1694 dialectic finding #4). `api_error` is deliberately NOT
+///    exempt — it is a once-per-episode nudge with no retry-loop owning it and
+///    no exhaustion signal, so dispatch-idle is the ONLY watchdog that surfaces
+///    a wedged api_error agent (hang_detector misses it: no BlockedReason →
+///    IdleLong, not Hung). Exempting it would silence a real stuck forever
+///    (codex #1775 HIGH).
 /// 2. **productive-silence gate** — `silent_secs < silence_threshold_secs`: the
 ///    agent has produced *productive* output (marker/heartbeat-gated, so a
 ///    spinner / junk / cursor-blink does NOT count) within the window, i.e. it is
@@ -539,8 +544,12 @@ fn target_is_working(
     snapshot
         .and_then(|s| s.agents.iter().find(|a| a.name == target))
         .map(|a| {
-            matches!(a.agent_state.as_str(), "server_rate_limit" | "api_error")
-                || a.silent_secs < silence_threshold_secs
+            // active-recovery exempt — ONLY `server_rate_limit` (bounded retry
+            // with a #1744 exhaustion backstop). `api_error` is intentionally
+            // excluded: no exhaustion signal owns it, so dispatch-idle must stay
+            // its watchdog or a wedged api_error agent goes silent forever
+            // (codex #1775 HIGH). See the fn doc for the full rationale.
+            a.agent_state.as_str() == "server_rate_limit" || a.silent_secs < silence_threshold_secs
         })
         .unwrap_or(false)
 }
@@ -2064,8 +2073,10 @@ mod tests {
                 // latched 'thinking' but productive-silent past the window → NOT
                 // working (the stuck-but-latched gap the old #1516 state gate missed)
                 mk_agent_snapshot_silence("stuck_thinking", "thinking", 700),
-                // active-recovery: silent but auto-retrying → exempt (suppress)
+                // active-recovery exempt: ONLY server_rate_limit (bounded retry +
+                // #1744 exhaustion backstop) → silent but exempt
                 mk_agent_snapshot_silence("rate_limited", "server_rate_limit", 700),
+                // api_error is NOT exempt (no exhaustion backstop) → silent = stuck
                 mk_agent_snapshot_silence("api_err", "api_error", 700),
             ],
         };
@@ -2082,8 +2093,8 @@ mod tests {
             "ServerRateLimit → active-recovery exempt (suppress nudge)"
         );
         assert!(
-            target_is_working(Some(&snap), "api_err", T),
-            "ApiError → active-recovery exempt (suppress nudge)"
+            !target_is_working(Some(&snap), "api_err", T),
+            "ApiError is NOT exempt (no exhaustion backstop) → silent past window fires"
         );
         assert!(
             !target_is_working(Some(&snap), "ghost", T),
@@ -2236,6 +2247,38 @@ mod tests {
             .find(|p| p.dispatch_id == id)
             .unwrap();
         assert_eq!(p.status, DispatchStatus::Pending);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// codex #1775 HIGH: `api_error` is NOT an exempt active-recovery state (it
+    /// has no retry-exhaustion backstop), so a wedged api_error agent that is
+    /// productive-silent past the window must still fire — dispatch-idle is its
+    /// only watchdog (hang_detector misses it: no BlockedReason → IdleLong, not
+    /// Hung). Contrast with [`active_recovery_exempt_does_not_fire_1694`]
+    /// (server_rate_limit, which IS exempt).
+    #[test]
+    fn stuck_api_error_silent_still_fires_1775() {
+        let home = tmp_home("silence-apierror");
+        let issued = chrono::Utc::now() - chrono::Duration::seconds(800);
+        let id = write_pending_at(&home, "lead", "dev", Some("t-ae"), "task", 600, issued);
+        // api_error AND productive-silent (700s > 600s window) → must fire.
+        crate::snapshot::save(&home, &[mk_agent_snapshot_silence("dev", "api_error", 700)]);
+
+        for _ in 0..DEBOUNCE_SCANS {
+            scan_and_emit(&home);
+        }
+
+        assert!(
+            crate::inbox::drain(&home, "lead")
+                .iter()
+                .any(|m| m.kind.as_deref() == Some("dispatch_idle_threshold_exceeded")),
+            "stuck api_error (silent past window) must fire — no exhaustion backstop owns it"
+        );
+        let p = list_pending(&home)
+            .into_iter()
+            .find(|p| p.dispatch_id == id)
+            .unwrap();
+        assert_eq!(p.status, DispatchStatus::Exceeded);
         std::fs::remove_dir_all(&home).ok();
     }
 
