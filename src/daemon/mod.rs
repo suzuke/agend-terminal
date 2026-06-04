@@ -12,6 +12,7 @@ pub(crate) mod cron_tick;
 pub(crate) mod decision_timeout;
 pub(crate) mod dedup_state;
 pub(crate) mod dispatch_idle;
+pub(crate) mod escalation_persist;
 pub(crate) mod event_bus;
 pub(crate) mod handoff_timeout_watchdog;
 pub(crate) mod heartbeat_pair;
@@ -1150,6 +1151,23 @@ fn spawn_and_register_agent(
         return Err(e);
     }
 
+    // #1744-H2: rehydrate persisted escalation state onto the freshly-spawned
+    // tracker (this is the boot / agent-register path — Resume mode). A daemon
+    // restart otherwise re-zeroes the crash budget, the Hung confirm-window, and
+    // the notify cooldowns; re-applying the last-persisted snapshot keeps those
+    // P0 gates correct across the restart. (The in-daemon crash-respawn path
+    // carries health via its own in-mem `saved_health` clone, so it does not go
+    // through here.)
+    if let Some(snapshot) = escalation_persist::load_for(home, name) {
+        if let Some(id) = crate::fleet::resolve_uuid(home, name) {
+            let reg = agent::lock_registry(registry);
+            if let Some(handle) = reg.get(&id) {
+                handle.core.lock().health.rehydrate_escalation(&snapshot);
+                tracing::info!(agent = %name, "#1744-H2: rehydrated escalation state from store");
+            }
+        }
+    }
+
     let rdir = run_dir(home);
     // #896 Option D: synchronous TUI listener prep BEFORE returning Ok.
     // Pre-#896 this whole step happened inside the fire-and-forget
@@ -1209,8 +1227,9 @@ fn spawn_and_register_agent(
 /// across the spawn boundary so the cap (`STAGE2_MAX_RESTARTS_DEFAULT`)
 /// survives the restart it drove.
 ///
-/// Decision §1 selective restore (4 fields): `crash_times`,
-/// `total_crashes`, `last_notification`, `recovery_restart_count` (+1).
+/// Decision §1 selective restore (5 fields): `crash_times`,
+/// `total_crashes`, `last_crash_notification`, `last_hung_notification`,
+/// `recovery_restart_count` (+1).
 /// All other `HealthTracker` fields reset to fresh defaults — including
 /// `state: Healthy` (Stage 2 success seed) and `recovery_stage_state:
 /// None` (linear escalation rule restarts).
@@ -1249,7 +1268,10 @@ fn handle_stage2_restart(
             (
                 core.health.crash_times.clone(),
                 core.health.total_crashes,
-                core.health.last_notification,
+                // #1744-H3: the former shared `last_notification` is now two
+                // per-class cooldowns — preserve both across the Stage-2 respawn.
+                core.health.last_crash_notification,
+                core.health.last_hung_notification,
                 core.health.recovery_restart_count,
             )
         })
@@ -1366,10 +1388,12 @@ fn handle_stage2_restart(
             let reg = agent::lock_registry(registry);
             if let Some(handle) = instance_id.and_then(|id| reg.get(&id)) {
                 let mut core = handle.core.lock();
-                let (crash_times, total_crashes, last_notification, prev_count) = saved;
+                let (crash_times, total_crashes, last_crash_notif, last_hung_notif, prev_count) =
+                    saved;
                 core.health.crash_times = crash_times;
                 core.health.total_crashes = total_crashes;
-                core.health.last_notification = last_notification;
+                core.health.last_crash_notification = last_crash_notif;
+                core.health.last_hung_notification = last_hung_notif;
                 core.health.recovery_restart_count = prev_count.saturating_add(1);
                 core.health.last_stage2_fired_at = Some(Instant::now());
             }

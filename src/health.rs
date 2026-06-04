@@ -328,12 +328,24 @@ pub struct HealthTracker {
     pub crash_times: VecDeque<Instant>,
     pub total_crashes: u32,
     max_retries: u32,
-    pub last_notification: Option<Instant>,
+    /// #1744-H3: per-class notify cooldown — crash escalations stamp/read THIS,
+    /// hung escalations use `last_hung_notification`. Split from the former shared
+    /// `last_notification` so a crash page and a hung page no longer suppress each
+    /// other inside `NOTIFY_COOLDOWN` (they are distinct failure modes).
+    pub last_crash_notification: Option<Instant>,
+    /// #1744-H3: per-class notify cooldown for the self-orch Hung escalation.
+    /// See `last_crash_notification`.
+    pub last_hung_notification: Option<Instant>,
     /// #1701: when the agent most recently transitioned INTO `HealthState::Hung`
     /// (set in `check_hang`'s two Hung-entry branches). Drives the self-orch Hung
-    /// escalation confirm-window. Every Hung entry refreshes it and the
-    /// escalation check gates on `state == Hung`, so a stale value from a prior
-    /// episode is never read — no explicit clear-on-exit needed.
+    /// escalation confirm-window.
+    ///
+    /// #1744-H2: set via `get_or_insert` (not unconditional `= now`) so a value
+    /// rehydrated across a daemon restart SURVIVES the first post-restart Hung
+    /// re-entry — otherwise the confirm-window would reset to 0 and the P0 be
+    /// delayed/missed for a still-hung resumed session. Paired with an explicit
+    /// clear on Hung EXIT (so a recovered episode's anchor never lingers / is
+    /// never persisted stale).
     hung_since: Option<Instant>,
     error_events: VecDeque<(Instant, AgentState)>,
     pub last_output: Instant,
@@ -366,8 +378,8 @@ pub struct HealthTracker {
     /// Preserved selectively across the Stage 2 respawn boundary in
     /// `daemon/mod.rs` Stage 2 variant arm — fresh `HealthTracker` on
     /// spawn re-applies this counter (plus crash_times + total_crashes,
-    /// plus last_notification) so the cap survives the restart that
-    /// the counter itself drove.
+    /// plus the per-class notify cooldowns) so the cap survives the restart
+    /// that the counter itself drove.
     pub recovery_restart_count: u32,
     /// `#685` sub-task 7b: timestamp of last Stage 2 auto-restart fire.
     /// Used to drive `recovery_restart_count` decay alongside
@@ -387,6 +399,61 @@ pub struct HealthTracker {
     pub(crate) last_stage3_fired_at: Option<Instant>,
 }
 
+/// #1744-H3: shared rate-limit predicate for a per-class notify cooldown stamp.
+/// `None` (never notified) → due; otherwise due once `NOTIFY_COOLDOWN` elapsed.
+fn cooldown_elapsed(last: Option<Instant>) -> bool {
+    match last {
+        Some(t) => t.elapsed() >= NOTIFY_COOLDOWN,
+        None => true,
+    }
+}
+
+/// #1744-H2: cap on how far back a rehydrated wall-clock timestamp may be
+/// projected onto the monotonic clock. Well past every health window
+/// (`CRASH_WINDOW` 600s, `NOTIFY_COOLDOWN` 300s), so a capped value still reads
+/// as "long ago" (cooldown elapsed / crash pruned / hang sustained) — the cap
+/// only guards `Instant::now() - gap` against underflow on an absurd/corrupt
+/// stored value.
+const REHYDRATE_MAX_LOOKBACK_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
+/// #1744-H2: persist an `Instant` as a wall-clock epoch-ms (monotonic `Instant`
+/// is meaningless across a process restart). `now_epoch - instant.elapsed()`.
+fn instant_to_epoch_ms(t: Instant) -> u64 {
+    crate::daemon::heartbeat_pair::now_ms().saturating_sub(t.elapsed().as_millis() as u64)
+}
+
+/// #1744-H2: project a persisted wall-clock epoch-ms back onto the monotonic
+/// clock. A future timestamp (clock skew) clamps to now; an absurdly old one
+/// clamps to [`REHYDRATE_MAX_LOOKBACK_MS`] (still "long ago" for every window).
+fn epoch_ms_to_instant(ms: u64) -> Instant {
+    let gap_ms = crate::daemon::heartbeat_pair::now_ms()
+        .saturating_sub(ms)
+        .min(REHYDRATE_MAX_LOOKBACK_MS);
+    Instant::now()
+        .checked_sub(Duration::from_millis(gap_ms))
+        .unwrap_or_else(Instant::now)
+}
+
+/// #1744-H2: the subset of [`HealthTracker`] escalation state that must survive a
+/// daemon restart, stored as wall-clock epoch-ms (NOT `Instant`). Persisted via
+/// `daemon::escalation_persist` and re-applied on boot/agent-register so a
+/// restart no longer (a) resets the crash budget → infinite respawn that never
+/// reaches `Failed`, (b) resets the Hung confirm-window → delayed/missed self-orch
+/// P0, or (c) clears the notify cooldowns → duplicate P0 for an already-paged agent.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedEscalation {
+    #[serde(default)]
+    pub total_crashes: u32,
+    #[serde(default)]
+    pub crash_times_epoch_ms: Vec<u64>,
+    #[serde(default)]
+    pub last_crash_notification_epoch_ms: Option<u64>,
+    #[serde(default)]
+    pub last_hung_notification_epoch_ms: Option<u64>,
+    #[serde(default)]
+    pub hung_since_epoch_ms: Option<u64>,
+}
+
 impl HealthTracker {
     pub fn new() -> Self {
         Self {
@@ -394,7 +461,8 @@ impl HealthTracker {
             crash_times: VecDeque::new(),
             total_crashes: 0,
             max_retries: DEFAULT_MAX_RETRIES,
-            last_notification: None,
+            last_crash_notification: None,
+            last_hung_notification: None,
             hung_since: None,
             error_events: VecDeque::new(),
             last_output: Instant::now(),
@@ -466,7 +534,7 @@ impl HealthTracker {
             return (false, Duration::ZERO, true); // Don't respawn, do notify
         }
 
-        let should_notify = recent >= 2 && self.should_notify();
+        let should_notify = recent >= 2 && cooldown_elapsed(self.last_crash_notification);
 
         if recent >= 3 {
             self.state = HealthState::Unstable;
@@ -475,7 +543,7 @@ impl HealthTracker {
         }
 
         if should_notify {
-            self.last_notification = Some(now);
+            self.last_crash_notification = Some(now);
         }
 
         (true, delay, should_notify)
@@ -499,25 +567,17 @@ impl HealthTracker {
         delay.min(BACKOFF_MAX)
     }
 
-    /// Check if we should send a notification (rate limiting).
-    fn should_notify(&self) -> bool {
-        match self.last_notification {
-            Some(last) => last.elapsed() >= NOTIFY_COOLDOWN,
-            None => true,
-        }
-    }
-
     /// #1701: self-orchestrator crash P0 gate. Unlike [`record_crash`]'s
-    /// `should_notify` (which only fires on the SECOND crash in the window),
+    /// recent>=2 gate (which only fires on the SECOND crash in the window),
     /// this fires on EVERY orchestrator crash that clears `NOTIFY_COOLDOWN` —
     /// one crash already lost the orchestrator's in-memory context and no peer
-    /// can relay an inbox P0, so the operator must be told. Reuses
-    /// `last_notification` (the shared per-agent notify cooldown) to avoid
-    /// crash-loop spam, and stamps it on fire. Caller must already have
-    /// established the agent is its own team orchestrator.
+    /// can relay an inbox P0, so the operator must be told. Uses the crash-class
+    /// cooldown (#1744-H3: distinct from the hung cooldown) to avoid crash-loop
+    /// spam, and stamps it on fire. Caller must already have established the agent
+    /// is its own team orchestrator.
     pub fn self_orch_crash_should_notify(&mut self) -> bool {
-        if self.should_notify() {
-            self.last_notification = Some(Instant::now());
+        if cooldown_elapsed(self.last_crash_notification) {
+            self.last_crash_notification = Some(Instant::now());
             true
         } else {
             false
@@ -530,8 +590,9 @@ impl HealthTracker {
     /// `check_hang` already excludes the 04:00 idle false-alarm; this window
     /// additionally rides out the documented transient residual FPs F39/F10/
     /// keystroke-draining so a real page is not fired on a 1-tick blip) AND the
-    /// per-agent notify cooldown (reused from the crash path) has elapsed. Stamps
-    /// the cooldown on fire so a persisting Hung pages at most once per
+    /// hung-class notify cooldown (#1744-H3: distinct from the crash cooldown, so
+    /// a recent crash page no longer suppresses this) has elapsed. Stamps the
+    /// cooldown on fire so a persisting Hung pages at most once per
     /// `NOTIFY_COOLDOWN`. Caller must already have established the agent is its
     /// own team orchestrator. Independent of `hang_auto_recovery_enabled` — a
     /// leaderless team with no peer to relay must page even in recovery shadow.
@@ -542,12 +603,52 @@ impl HealthTracker {
         let sustained = self
             .hung_since
             .is_some_and(|t| t.elapsed() >= confirm_window);
-        if sustained && self.should_notify() {
-            self.last_notification = Some(Instant::now());
+        if sustained && cooldown_elapsed(self.last_hung_notification) {
+            self.last_hung_notification = Some(Instant::now());
             true
         } else {
             false
         }
+    }
+
+    /// #1744-H2: snapshot the restart-critical escalation state as wall-clock
+    /// epoch-ms for persistence. Pure read; the daemon calls this at the crash /
+    /// hung chokepoints and hands the result to `escalation_persist`.
+    pub fn escalation_snapshot(&self) -> PersistedEscalation {
+        PersistedEscalation {
+            total_crashes: self.total_crashes,
+            crash_times_epoch_ms: self
+                .crash_times
+                .iter()
+                .map(|t| instant_to_epoch_ms(*t))
+                .collect(),
+            last_crash_notification_epoch_ms: self.last_crash_notification.map(instant_to_epoch_ms),
+            last_hung_notification_epoch_ms: self.last_hung_notification.map(instant_to_epoch_ms),
+            hung_since_epoch_ms: self.hung_since.map(instant_to_epoch_ms),
+        }
+    }
+
+    /// #1744-H2: re-apply persisted escalation state onto a freshly-spawned
+    /// tracker (boot / agent-register). Crash times older than `CRASH_WINDOW` are
+    /// dropped on the way in (they would be pruned on the next `record_crash`
+    /// anyway), so the rehydrated `crash_times` reflects the live window. The
+    /// cumulative `total_crashes` (max-retries budget) is restored verbatim, and
+    /// the cooldowns / `hung_since` are projected back onto the monotonic clock —
+    /// a stale value reads as "elapsed" via [`cooldown_elapsed`] / self-heals via
+    /// the Hung-exit clear, so no `state` is rehydrated (avoids a premature Hung
+    /// that would wrongly trip the recovery dispatcher on boot).
+    pub fn rehydrate_escalation(&mut self, p: &PersistedEscalation) {
+        self.total_crashes = p.total_crashes;
+        let now = crate::daemon::heartbeat_pair::now_ms();
+        self.crash_times = p
+            .crash_times_epoch_ms
+            .iter()
+            .filter(|ms| now.saturating_sub(**ms) <= CRASH_WINDOW.as_millis() as u64)
+            .map(|ms| epoch_ms_to_instant(*ms))
+            .collect();
+        self.last_crash_notification = p.last_crash_notification_epoch_ms.map(epoch_ms_to_instant);
+        self.last_hung_notification = p.last_hung_notification_epoch_ms.map(epoch_ms_to_instant);
+        self.hung_since = p.hung_since_epoch_ms.map(epoch_ms_to_instant);
     }
 
     /// Check whether agent is stalled on an interactive startup prompt.
@@ -668,6 +769,13 @@ impl HealthTracker {
             // See docs/HUNG-STATE-TRANSITIONS.md §Exit.X1
             if matches!(self.state, HealthState::Hung | HealthState::IdleLong) {
                 self.state = HealthState::Healthy;
+                // #1744-H2: explicit clear on Hung EXIT. Pre-#1744 this was unneeded
+                // (every entry overwrote `hung_since`), but now that entry uses
+                // `get_or_insert` so a rehydrated anchor survives a restart, a
+                // recovered episode MUST drop its anchor here — else a stale value
+                // would be persisted and a later unrelated Hung would inherit a
+                // bogus (already-elapsed) confirm-window.
+                self.hung_since = None;
             }
             return false;
         }
@@ -709,7 +817,10 @@ impl HealthTracker {
             // See docs/HUNG-STATE-TRANSITIONS.md §Entry.E1
             if self.state != HealthState::Hung {
                 self.state = HealthState::Hung;
-                self.hung_since = Some(Instant::now()); // #1701: confirm-window anchor
+                // #1744-H2: `get_or_insert` (not `= now`) so a rehydrated cross-restart
+                // anchor survives this first post-restart re-entry → the confirm-window
+                // continues rather than resetting to 0.
+                self.hung_since.get_or_insert_with(Instant::now);
                 return true; // First hang detection — caller escalates
             }
             return false;
@@ -748,7 +859,8 @@ impl HealthTracker {
             // See docs/HUNG-STATE-TRANSITIONS.md §Entry.E2
             if self.state != HealthState::Hung {
                 self.state = HealthState::Hung;
-                self.hung_since = Some(Instant::now()); // #1701: confirm-window anchor
+                // #1744-H2: see §Entry.E1 — `get_or_insert` preserves a rehydrated anchor.
+                self.hung_since.get_or_insert_with(Instant::now);
                 return true;
             }
             return false;
@@ -993,6 +1105,167 @@ mod tests {
         );
     }
 
+    // ── #1744-H3: per-class cooldown split ──
+
+    /// #1744-H3: a crash page and a hung page no longer share one cooldown, so a
+    /// recent crash escalation must NOT suppress a due hung escalation (and vice
+    /// versa). Pre-#1744 both stamped/read `last_notification`, so within 300s the
+    /// first fired suppressed the other.
+    #[test]
+    fn cooldown_split_independent_crash_hung_1744_h3() {
+        // crash page fires + stamps the crash cooldown.
+        let mut h = HealthTracker::new();
+        assert!(h.self_orch_crash_should_notify(), "first crash escalates");
+        assert!(
+            !h.self_orch_crash_should_notify(),
+            "same-class re-fire within cooldown is suppressed"
+        );
+        // A hung escalation that is due must STILL fire — its cooldown is separate.
+        h.state = HealthState::Hung;
+        h.hung_since = Some(Instant::now() - Duration::from_secs(61));
+        assert!(
+            h.hung_escalation_due(Duration::from_secs(60)),
+            "#1744-H3: a recent CRASH page must not suppress a due HUNG page"
+        );
+
+        // Symmetric: a hung page must not suppress a crash page.
+        let mut h2 = HealthTracker::new();
+        h2.state = HealthState::Hung;
+        h2.hung_since = Some(Instant::now() - Duration::from_secs(61));
+        assert!(
+            h2.hung_escalation_due(Duration::from_secs(60)),
+            "hung fires"
+        );
+        assert!(
+            h2.self_orch_crash_should_notify(),
+            "#1744-H3: a recent HUNG page must not suppress a crash page"
+        );
+    }
+
+    // ── #1744-H2: persist / rehydrate escalation state across restart ──
+
+    /// #1744-H2 (pure): an `Instant` projected to wall-clock epoch-ms and back
+    /// round-trips to within a small slop, so a cooldown/anchor keeps its real
+    /// age across a (simulated) restart.
+    #[test]
+    fn instant_epoch_ms_round_trip_1744_h2() {
+        let original = Instant::now() - Duration::from_secs(120);
+        let restored = super::epoch_ms_to_instant(super::instant_to_epoch_ms(original));
+        let drift = restored
+            .elapsed()
+            .as_millis()
+            .abs_diff(original.elapsed().as_millis());
+        assert!(drift < 2_000, "round-trip drift {drift}ms too large");
+    }
+
+    /// #1744-H2: snapshot→rehydrate preserves the escalation semantics across a
+    /// simulated daemon restart — a recently-stamped cooldown STILL suppresses, a
+    /// crash older than `CRASH_WINDOW` is pruned, `total_crashes` is restored, and
+    /// the Hung confirm-window anchor keeps its real age (does NOT reset to 0).
+    #[test]
+    fn escalation_snapshot_rehydrate_round_trip_1744_h2() {
+        let mut before = HealthTracker::new();
+        before.total_crashes = 2;
+        // One in-window crash (10s ago) + one stale crash (700s ago > 600s window).
+        before
+            .crash_times
+            .push_back(Instant::now() - Duration::from_secs(700));
+        before
+            .crash_times
+            .push_back(Instant::now() - Duration::from_secs(10));
+        before.last_crash_notification = Some(Instant::now() - Duration::from_secs(100)); // within 300s
+        before.last_hung_notification = None;
+        before.hung_since = Some(Instant::now() - Duration::from_secs(45));
+
+        let snap = before.escalation_snapshot();
+
+        // Simulate restart: a brand-new tracker, then rehydrate.
+        let mut after = HealthTracker::new();
+        after.rehydrate_escalation(&snap);
+
+        assert_eq!(after.total_crashes, 2, "crash budget restored");
+        assert_eq!(
+            after.crash_times.len(),
+            1,
+            "#1744-H2: a crash older than CRASH_WINDOW is pruned on rehydrate"
+        );
+        assert!(
+            !cooldown_elapsed(after.last_crash_notification),
+            "#1744-H2: a cooldown stamped 100s ago must STILL suppress after restart (no duplicate P0)"
+        );
+        let anchor = after.hung_since.expect("hung_since restored");
+        assert!(
+            anchor.elapsed() >= Duration::from_secs(40),
+            "#1744-H2: the confirm-window anchor keeps its real age (not reset to 0)"
+        );
+    }
+
+    /// #1744-H2: the crash budget survives a restart, so an agent that has already
+    /// burned most of `max_retries` reaches `Failed` on the next crash instead of
+    /// resetting to 0 and respawning forever (the restart-reset gap).
+    #[test]
+    fn rehydrate_preserves_crash_budget_to_failed_1744_h2() {
+        let mut before = HealthTracker::new();
+        before.total_crashes = DEFAULT_MAX_RETRIES - 1;
+        let snap = before.escalation_snapshot();
+
+        let mut after = HealthTracker::new();
+        after.rehydrate_escalation(&snap);
+        assert_eq!(after.total_crashes, DEFAULT_MAX_RETRIES - 1);
+
+        // The next crash crosses the budget → Failed, no respawn.
+        let (respawn, _delay, notify) = after.record_crash();
+        assert!(
+            !respawn,
+            "#1744-H2: budget survived restart → terminal Failed, not infinite respawn"
+        );
+        assert!(notify, "terminal Failed returns should_notify=true");
+        assert_eq!(after.state, HealthState::Failed);
+    }
+
+    /// #1744-H2 (C): a `hung_since` rehydrated across a restart SURVIVES the first
+    /// post-restart Hung re-entry (`get_or_insert`, not `= now`) so the
+    /// confirm-window continues; and a genuine Hung EXIT clears it so a recovered
+    /// episode's anchor never lingers / is persisted stale.
+    #[test]
+    fn hung_since_survives_reentry_and_clears_on_exit_1744_h2() {
+        let mut h = HealthTracker::new();
+        // Rehydrated anchor from before the restart (agent spawns Healthy).
+        h.hung_since = Some(Instant::now() - Duration::from_secs(50));
+        assert_eq!(h.state, HealthState::Healthy);
+
+        // First post-restart Hung detection (E1: silent past threshold + input
+        // pending past heartbeat). Must KEEP the rehydrated anchor.
+        let entered = h.check_hang(
+            AgentState::Thinking,
+            Duration::from_secs(700),
+            Duration::from_secs(0),
+            1_000_000,
+            0,
+        );
+        assert!(entered, "agent classified Hung");
+        assert_eq!(h.state, HealthState::Hung);
+        assert!(
+            h.hung_since.expect("anchor kept").elapsed() >= Duration::from_secs(45),
+            "#1744-H2: get_or_insert preserves the rehydrated anchor (confirm-window continues, not reset to 0)"
+        );
+
+        // Silence drops (1 byte of output) → Hung EXIT → anchor cleared.
+        let still = h.check_hang(
+            AgentState::Idle,
+            Duration::from_secs(0),
+            Duration::from_secs(0),
+            1_000_000,
+            0,
+        );
+        assert!(!still);
+        assert_eq!(h.state, HealthState::Healthy);
+        assert!(
+            h.hung_since.is_none(),
+            "#1744-H2: Hung exit must clear the anchor (no stale persist)"
+        );
+    }
+
     #[test]
     fn test_first_crash_silent() {
         let mut h = HealthTracker::new();
@@ -1165,7 +1438,7 @@ mod tests {
 
         // 3rd crash on cloned tracker should see recent=3
         let (_, _, notify) = h2.record_crash();
-        // notify is false: 2nd crash already set last_notification and cooldown (5 min) hasn't elapsed
+        // notify is false: 2nd crash already set last_crash_notification and cooldown (5 min) hasn't elapsed
         assert!(!notify);
         assert_eq!(h2.state, HealthState::Unstable);
     }

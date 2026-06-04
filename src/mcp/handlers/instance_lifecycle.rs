@@ -123,6 +123,11 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
     // accumulate in the tracking list and inflate alert text.
     crate::daemon::idle_watchdog::remove_agent_activity(home, name);
 
+    // #1744-H2: drop the persisted escalation state so a later agent reusing
+    // this name does not rehydrate the deleted instance's crash budget /
+    // cooldowns / hung anchor (the #1680 stale-state lesson).
+    crate::daemon::escalation_persist::remove(home, name);
+
     // #1488: cascade-clean the services bound to the deleted instance.
     // Without these, an orphaned schedule keeps firing into the cron self-IPC
     // fallback (this morning's deadlock trigger), dispatch_tracking entries

@@ -44,9 +44,15 @@ impl PerTickHandler for HangDetectionHandler {
         // the names currently in Hung. NO teams-file read here — that runs
         // lock-free in phase 2 (#1530 / DAEMON-LOCK-ORDERING: no file IO under
         // the registry lock).
-        let hung_now: Vec<String> = {
+        // `hung_now`: every agent currently Hung. `newly_hung`: the subset whose
+        // `check_hang` returned true THIS tick (first detection — `hung_since`
+        // was just anchored). #1744-H2 persists a self-orch's anchor on entry
+        // (not only on escalation) so a restart in the first confirm-window
+        // doesn't reset it.
+        let (hung_now, newly_hung): (Vec<String>, std::collections::HashSet<String>) = {
             let reg = agent::lock_registry_tracked(ctx.registry, "hang_detection");
             let mut hung = Vec::new();
+            let mut newly = std::collections::HashSet::new();
             for handle in reg.values() {
                 let name = handle.name.as_str();
                 let mut core = handle.core.lock();
@@ -60,13 +66,14 @@ impl PerTickHandler for HangDetectionHandler {
                 // `AGEND_PRODUCTIVE_GATE=1`.
                 let silent_productive = core.state.last_productive_output.elapsed();
                 let pair = crate::daemon::heartbeat_pair::snapshot_for(name);
-                if core.health.check_hang(
+                let just_detected = core.health.check_hang(
                     agent_state,
                     silent,
                     silent_productive,
                     pair.last_input_at_ms,
                     pair.heartbeat_at_ms,
-                ) {
+                );
+                if just_detected {
                     tracing::warn!(
                         agent = %name,
                         state = agent_state.display_name(),
@@ -76,9 +83,12 @@ impl PerTickHandler for HangDetectionHandler {
                 }
                 if core.health.state == crate::health::HealthState::Hung {
                     hung.push(name.to_string());
+                    if just_detected {
+                        newly.insert(name.to_string());
+                    }
                 }
             }
-            hung
+            (hung, newly)
         };
 
         // Phase 2/3 (#1701 Hung half): a self-orchestrator stuck Hung past the
@@ -93,20 +103,32 @@ impl PerTickHandler for HangDetectionHandler {
             if !crate::teams::is_self_orchestrator(ctx.home, &name) {
                 continue;
             }
-            let due = {
+            // Re-lock briefly: run the confirm-window + cooldown gate (which
+            // stamps the hung cooldown on fire) and snapshot the escalation state
+            // for persistence — both under one lock so the snapshot reflects the
+            // gate's stamp.
+            let (due, snapshot) = {
                 let reg = agent::lock_registry(ctx.registry);
                 reg.values()
                     .find(|h| h.name.as_str() == name)
                     .map(|h| {
-                        h.core
-                            .lock()
-                            .health
-                            .hung_escalation_due(HUNG_ESCALATE_AFTER)
+                        let mut core = h.core.lock();
+                        let due = core.health.hung_escalation_due(HUNG_ESCALATE_AFTER);
+                        (due, Some(core.health.escalation_snapshot()))
                     })
-                    .unwrap_or(false)
+                    .unwrap_or((false, None))
             };
             if due {
                 notify_self_orch_hung(&name);
+            }
+            // #1744-H2: persist on first Hung detection (anchor `hung_since`) and
+            // whenever the escalation fires (stamp the hung cooldown) — both must
+            // survive a restart. Between those the snapshot is unchanged, so this
+            // does not write every tick a self-orch stays Hung.
+            if let Some(snapshot) = snapshot {
+                if newly_hung.contains(&name) || due {
+                    crate::daemon::escalation_persist::persist(ctx.home, &name, &snapshot);
+                }
             }
         }
     }
