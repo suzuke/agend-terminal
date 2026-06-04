@@ -3227,6 +3227,67 @@ fn net_error_invalidhttpresponse_default_latches_1757() {
     );
 }
 
+/// #1768 regression (retry storm): a HIGH_FP ServerRateLimit error wins the
+/// priority race over Thinking even after it scrolled UP and the agent RESUMED
+/// WORK below it — so it kept re-latching, `clears_server_rate_limit_retry`
+/// (Idle-only) never fired, and the supervisor re-injected `continue` into a
+/// working agent. When a working-marker (codex Thinking `esc to interrupt`) is
+/// rendered BELOW the error, the agent recovered → land on the working state.
+#[test]
+fn retry_storm_recovered_below_error_lands_on_working_state_1768() {
+    // Error scrolled UP (line 1); the agent's most-recent line is the work spinner.
+    let screen = "▌ API Error: InvalidHTTPResponse fetching \"http://127.0.0.1:3456\".\n\
+                  ▌ retrying the request\n\
+                  ▌ esc to interrupt";
+    let n = screen.chars().count();
+    let mut t = StateTracker::new(Some(&Backend::Codex));
+    t.feed_with_fg(screen, &vec![CellFg::Default; n]);
+    assert_ne!(
+        t.get_state(),
+        AgentState::ServerRateLimit,
+        "#1768: a recovered agent (working-marker below the scrolled-up error) must \
+         NOT re-latch ServerRateLimit (→ no retry storm)"
+    );
+    assert_eq!(
+        t.get_state(),
+        AgentState::Thinking,
+        "#1768: it lands on the working state the marker indicates"
+    );
+}
+
+/// #1768 boundary: a fresh error rendered BELOW the working-marker is genuine →
+/// must STILL latch ServerRateLimit (the fix must not mask a real fault).
+#[test]
+fn retry_storm_fresh_error_below_working_marker_still_latches_1768() {
+    let screen = "▌ working on the task\n\
+                  ▌ esc to interrupt\n\
+                  ▌ API Error: InvalidHTTPResponse fetching \"http://127.0.0.1:3456\".";
+    let n = screen.chars().count();
+    let mut t = StateTracker::new(Some(&Backend::Codex));
+    t.feed_with_fg(screen, &vec![CellFg::Default; n]);
+    assert_eq!(
+        t.get_state(),
+        AgentState::ServerRateLimit,
+        "#1768: a fresh error BELOW the working-marker is genuine → must still latch \
+         ServerRateLimit (auto-retry must fire)"
+    );
+}
+
+/// #1768 boundary: the classic stuck case — an error with NO working-marker at
+/// all must latch ServerRateLimit so auto-retry fires.
+#[test]
+fn retry_storm_error_with_no_working_marker_still_latches_1768() {
+    let screen = "▌ API Error: InvalidHTTPResponse fetching \"http://127.0.0.1:3456\".";
+    let n = screen.chars().count();
+    let mut t = StateTracker::new(Some(&Backend::Codex));
+    t.feed_with_fg(screen, &vec![CellFg::Default; n]);
+    assert_eq!(
+        t.get_state(),
+        AgentState::ServerRateLimit,
+        "#1768: an error with no working-marker must latch ServerRateLimit"
+    );
+}
+
 // ── #1527: transition recording at the mutation source ──
 
 #[test]

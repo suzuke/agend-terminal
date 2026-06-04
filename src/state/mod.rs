@@ -850,7 +850,28 @@ impl StateTracker {
                             self.maybe_expire_latched_state();
                         }
                     } else {
-                        let gated = self.gate_on_heartbeat(detected);
+                        // #1768: a HIGH_FP error wins the priority race even after
+                        // it scrolled up and the agent RESUMED WORK below it
+                        // (ServerRateLimit > Thinking by pattern order), so it keeps
+                        // re-latching → `clears_server_rate_limit_retry` (Idle-only,
+                        // #1713) never fires → supervisor re-injects `continue` into
+                        // a working agent (the #1768 retry storm; the latched
+                        // ServerRateLimit also doesn't auto-expire). If a
+                        // Thinking/ToolUse marker is rendered BELOW the error, the
+                        // agent recovered → land on that working state instead of the
+                        // stale error. A genuinely-stuck error has NO in-flight
+                        // working marker below it → `landed` stays `detected` → still
+                        // latches → auto-retry fires. Detection-side only;
+                        // `clears_server_rate_limit_retry` untouched → no #1713
+                        // flicker-reset regression.
+                        let landed = if high_fp {
+                            patterns
+                                .working_state_below(screen_text, matched)
+                                .unwrap_or(detected)
+                        } else {
+                            detected
+                        };
+                        let gated = self.gate_on_heartbeat(landed);
                         self.transition(gated);
                     }
                 }

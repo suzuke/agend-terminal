@@ -285,6 +285,30 @@ impl StatePatterns {
         }
         None
     }
+
+    /// #1768: if a working-state marker (`Thinking`/`ToolUse`) is rendered BELOW
+    /// (more recently than) `error_match` in `text`, return that working state.
+    ///
+    /// A HIGH_FP error (e.g. `ServerRateLimit`) wins the priority race in
+    /// `detect_with_match` even when it has scrolled up and the agent has RESUMED
+    /// WORK below it — `ServerRateLimit` > `Thinking` by pattern order. If the
+    /// agent's most-recent on-screen activity (the lowest Thinking/ToolUse marker)
+    /// sits below the error, the agent recovered, so the caller lands on that
+    /// working state instead of re-latching the stale error (which would keep
+    /// re-injecting `continue` into a working agent — the #1768 retry storm). This
+    /// extends the #1518 absolute-tail-position gate to "relative to the working
+    /// marker" and never touches `clears_server_rate_limit_retry` (#1713). A
+    /// genuinely-stuck error has NO in-flight working marker below it → `None`.
+    pub(crate) fn working_state_below(&self, text: &str, error_match: &str) -> Option<AgentState> {
+        let err_pos = text.rfind(error_match)?;
+        self.patterns
+            .iter()
+            .filter(|(s, _)| matches!(s, AgentState::Thinking | AgentState::ToolUse))
+            .filter_map(|(s, re)| re.find_iter(text).last().map(|m| (m.start(), *s)))
+            .filter(|(pos, _)| *pos > err_pos)
+            .max_by_key(|(pos, _)| *pos)
+            .map(|(_, s)| s)
+    }
 }
 
 /// Classify PTY output into a [`BlockedReason`] for the given backend.
