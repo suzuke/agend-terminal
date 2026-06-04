@@ -85,6 +85,30 @@ pub(crate) trait PerTickHandler: Send + Sync {
     fn run(&self, ctx: &TickContext<'_>);
 }
 
+/// #t-watchdog-boot-suppress: boot-grace window for the stale-backlog
+/// NOTIFICATION watchdogs (`PollReminder` / `InboxStuck` / `HandoffTimeout`).
+/// Those handlers keep their dedup state IN-MEMORY (empty at boot) and their
+/// cadence counter resets to 0 each boot (so `should_fire` is true on tick 0).
+/// On a daemon restart they would therefore re-fire for the ENTIRE current
+/// backlog of unread / unclaimed items on the very first tick — including
+/// freshly-respawned agents that simply haven't drained their inbox yet (a
+/// false "stuck" alert). Suppressing these handlers for the first
+/// `NOTIFICATION_BOOT_GRACE` after construction (≈ daemon boot) closes all three
+/// causes at once: the in-memory dedup reset, the counter reset, and the
+/// post-restart drain false-positive. 3 min is comfortably longer than agent
+/// spawn + inbox drain (~tens of seconds) and far shorter than the watchdogs'
+/// own 30-min stuck thresholds, so a genuinely-stuck item still alerts shortly
+/// after the grace ends. Mirrors the boot-suppress precedent
+/// `pr_state::suppress_stale_terminal_replay`.
+pub(crate) const NOTIFICATION_BOOT_GRACE: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// True while still within [`NOTIFICATION_BOOT_GRACE`] of `created_at` (the
+/// handler's construction instant ≈ daemon boot). The notification watchdogs
+/// early-return from their `run` while this holds.
+pub(crate) fn in_boot_grace(created_at: std::time::Instant) -> bool {
+    created_at.elapsed() < NOTIFICATION_BOOT_GRACE
+}
+
 // ── #941: per-handler timing observability ─────────────────────────────
 //
 // `HANDLER_TIMING` accumulates per-handler wall-clock stats so the
@@ -210,6 +234,46 @@ mod tests {
     use super::*;
     use parking_lot::Mutex as PLMutex;
     use std::sync::Arc;
+
+    /// #t-watchdog-boot-suppress: the boot-grace predicate is active for a
+    /// just-built handler and expires past the window; the window itself is a
+    /// sane value (not zeroed away, not absurdly long).
+    #[test]
+    fn in_boot_grace_active_then_expires() {
+        use std::time::{Duration, Instant};
+        assert!(
+            in_boot_grace(Instant::now()),
+            "a just-constructed handler is within boot-grace"
+        );
+        assert!(
+            !in_boot_grace(Instant::now() - NOTIFICATION_BOOT_GRACE - Duration::from_secs(1)),
+            "past the window → no longer in boot-grace"
+        );
+        assert!(
+            (Duration::from_secs(60)..=Duration::from_secs(600)).contains(&NOTIFICATION_BOOT_GRACE),
+            "grace must stay a sane window (≥1min to suppress the burst, ≤10min ≪ 30min stuck threshold)"
+        );
+    }
+
+    /// Source-pin: every notification watchdog handler must wire the boot-grace
+    /// gate, so a future edit can't silently drop it and reintroduce the
+    /// restart-burst. (Cross-platform file read, survives rustfmt.)
+    #[test]
+    fn notification_handlers_wire_boot_grace() {
+        for file in [
+            "src/daemon/per_tick/poll_reminder.rs",
+            "src/daemon/per_tick/inbox_stuck.rs",
+            "src/daemon/per_tick/handoff_timeout.rs",
+        ] {
+            let src = std::fs::read_to_string(file)
+                .or_else(|_| std::fs::read_to_string(format!("agend-terminal/{file}")))
+                .unwrap_or_else(|_| panic!("source must be readable: {file}"));
+            assert!(
+                src.contains("in_boot_grace(self.created_at)"),
+                "{file} must gate firing on in_boot_grace (boot-suppress) — #t-watchdog-boot-suppress"
+            );
+        }
+    }
 
     /// Mock handler with arbitrary `run` behaviour: either records a
     /// hit on a shared counter or panics with a fixed message.

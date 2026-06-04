@@ -5,10 +5,14 @@
 
 use super::{PerTickHandler, TickContext};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 pub(crate) struct PollReminderHandler {
     every_n_ticks: u64,
     counter: AtomicU64,
+    /// ≈ daemon boot (handlers are built once at startup). Drives the
+    /// boot-grace suppression — see [`super::in_boot_grace`].
+    created_at: Instant,
 }
 
 impl PollReminderHandler {
@@ -16,6 +20,16 @@ impl PollReminderHandler {
         Self {
             every_n_ticks,
             counter: AtomicU64::new(0),
+            created_at: Instant::now(),
+        }
+    }
+
+    #[cfg(test)]
+    fn new_at(every_n_ticks: u64, created_at: Instant) -> Self {
+        Self {
+            every_n_ticks,
+            counter: AtomicU64::new(0),
+            created_at,
         }
     }
 
@@ -28,6 +42,13 @@ impl PollReminderHandler {
             .fetch_add(1, Ordering::Relaxed)
             .is_multiple_of(self.every_n_ticks)
     }
+
+    /// Gate combining boot-grace + cadence. During boot-grace the `&&`
+    /// short-circuits BEFORE `should_fire`, so the counter is NOT consumed —
+    /// the first tick AFTER grace sees counter 0 and fires immediately.
+    fn should_run(&self) -> bool {
+        !super::in_boot_grace(self.created_at) && self.should_fire()
+    }
 }
 
 impl PerTickHandler for PollReminderHandler {
@@ -36,7 +57,7 @@ impl PerTickHandler for PollReminderHandler {
     }
 
     fn run(&self, ctx: &TickContext<'_>) {
-        if self.should_fire() {
+        if self.should_run() {
             crate::daemon::poll_reminder::poll_reminder_pass(ctx.home, ctx.registry);
         }
     }
@@ -45,6 +66,7 @@ impl PerTickHandler for PollReminderHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     /// Pin the cadence: with N=3, fires on the 1st, 4th, 7th call
     /// (counter values 0, 3, 6 — each a multiple of 3).
@@ -61,5 +83,27 @@ mod tests {
         let h = PollReminderHandler::new(1);
         let fires: Vec<bool> = (0..5).map(|_| h.should_fire()).collect();
         assert_eq!(fires, vec![true; 5]);
+    }
+
+    /// #t-watchdog-boot-suppress: a freshly-built handler (created_at ≈ now) is
+    /// in boot-grace → `should_run` is false even though `should_fire` would be
+    /// true on tick 0. The `&&` must NOT consume the counter during grace.
+    #[test]
+    fn boot_grace_suppresses_first_ticks() {
+        let h = PollReminderHandler::new(1); // N=1 → should_fire always true
+        assert!(!h.should_run(), "in boot-grace → suppressed");
+        assert!(!h.should_run(), "still suppressed; counter not consumed");
+    }
+
+    /// Past the grace window, the first tick fires (counter still 0 because grace
+    /// short-circuited it earlier).
+    #[test]
+    fn fires_on_first_tick_after_grace() {
+        let past = Instant::now() - super::super::NOTIFICATION_BOOT_GRACE - Duration::from_secs(1);
+        let h = PollReminderHandler::new_at(30, past);
+        assert!(
+            h.should_run(),
+            "after grace, the first post-grace tick fires"
+        );
     }
 }
