@@ -509,16 +509,48 @@ pub(crate) fn pending_for_instance(
     (as_dispatcher, as_target)
 }
 
-/// #1516: is `target` demonstrably working right now? True iff the fleet
-/// snapshot reports its `agent_state` as `thinking` or `tool_use` — the
-/// PTY-output-fed "actively generating / running a tool" signal (the same one
-/// `health.rs` treats as productive). Pure for testability. Unknown target /
-/// missing snapshot → `false` (don't suppress → fire as before; degrades to
-/// the pre-#1516 behavior, never worse).
-fn target_is_working(snapshot: Option<&crate::snapshot::FleetSnapshot>, target: &str) -> bool {
+/// #1694② silence-clock: should the dispatch-idle nudge be SUPPRESSED for
+/// `target`? Replaces the #1516 instantaneous `thinking`/`tool_use` state check
+/// with two more-robust conditions read from the fleet snapshot:
+///
+/// 1. **active-recovery exempt** — `agent_state == server_rate_limit` ONLY: a
+///    rate-limited agent is in a bounded retry-backoff wait (#1696) whose
+///    exhaustion (12 retries → #1744 escalation) is its own stuck-backstop, so
+///    suppressing the idle nudge avoids noise in a legit wait without hiding a
+///    real stuck (#1694 dialectic finding #4). `api_error` is deliberately NOT
+///    exempt — it is a once-per-episode nudge with no retry-loop owning it and
+///    no exhaustion signal, so dispatch-idle is the ONLY watchdog that surfaces
+///    a wedged api_error agent (hang_detector misses it: no BlockedReason →
+///    IdleLong, not Hung). Exempting it would silence a real stuck forever
+///    (codex #1775 HIGH).
+/// 2. **productive-silence gate** — `silent_secs < silence_threshold_secs`: the
+///    agent has produced *productive* output (marker/heartbeat-gated, so a
+///    spinner / junk / cursor-blink does NOT count) within the window, i.e. it is
+///    making progress, just slow. A genuinely wedged agent stops producing
+///    productive output, its `silent_secs` climbs past the window, and the gate
+///    releases → the watchdog fires. This subsumes the old thinking/tool_use
+///    check (a thinking agent that's actually producing has low `silent_secs`)
+///    while ALSO catching a stuck agent whose latched state never flipped.
+///
+/// Pure for testability. Unknown target / missing snapshot → `false` (don't
+/// suppress → fire; degrades to the pre-#1516 fail-open, never worse). The
+/// `silent_secs` field itself fails open (large default) on an old-format
+/// snapshot, so a missing field also fires rather than silently suppressing.
+fn target_is_working(
+    snapshot: Option<&crate::snapshot::FleetSnapshot>,
+    target: &str,
+    silence_threshold_secs: i64,
+) -> bool {
     snapshot
         .and_then(|s| s.agents.iter().find(|a| a.name == target))
-        .map(|a| matches!(a.agent_state.as_str(), "thinking" | "tool_use"))
+        .map(|a| {
+            // active-recovery exempt — ONLY `server_rate_limit` (bounded retry
+            // with a #1744 exhaustion backstop). `api_error` is intentionally
+            // excluded: no exhaustion signal owns it, so dispatch-idle must stay
+            // its watchdog or a wedged api_error agent goes silent forever
+            // (codex #1775 HIGH). See the fn doc for the full rationale.
+            a.agent_state.as_str() == "server_rate_limit" || a.silent_secs < silence_threshold_secs
+        })
         .unwrap_or(false)
 }
 
@@ -545,17 +577,19 @@ pub(crate) fn scan_and_emit(home: &Path) {
             continue;
         }
 
-        // #1516: the dispatch-idle threshold is for "agent went silent and
-        // never replied", but the idle timer only resets on a correlated
+        // #1516/#1694②: the dispatch-idle threshold is for "agent went silent
+        // and never replied", but the idle timer only resets on a correlated
         // report — so a slow-but-progressing impl agent (heads-down coding /
-        // generating, not sending updates) false-fired 5× the night this
-        // landed. If the target is demonstrably WORKING (Thinking/ToolUse per
-        // the snapshot), reset its clock and don't fire — it's making progress,
-        // not stuck. A genuinely wedged agent stops producing output, so its
-        // latched Thinking/ToolUse expires (LATCHED_STATE_EXPIRY, supervisor.rs)
-        // → state flips to Idle/Hang → this gate releases → the watchdog fires
-        // as designed. (The hang detector independently catches infinite-gen.)
-        if target_is_working(snapshot.as_ref(), &d.target) {
+        // generating, not sending updates) false-fired 5× the night #1516
+        // landed. #1694② replaced the instantaneous Thinking/ToolUse check with
+        // a productive-SILENCE clock (`silent_secs` from the snapshot) plus an
+        // active-recovery exemption: suppress while the agent is producing
+        // productive output within `threshold_secs` (making progress, just slow)
+        // or is in an auto-retry state. A genuinely wedged agent stops producing
+        // productive output → `silent_secs` climbs past the window → this gate
+        // releases → the watchdog fires as designed. (The hang detector
+        // independently catches infinite-gen / MCP-active-but-stuck.)
+        if target_is_working(snapshot.as_ref(), &d.target, d.threshold_secs) {
             // #1658: the target is producing output — reset the debounce streak
             // so a later idle run starts fresh.
             if d.not_working_streak != 0 {
@@ -1993,7 +2027,24 @@ mod tests {
 
     // ── #1516: agent_state gate (don't fire while target is working) ──
 
+    /// #1694②: map the legacy state label to a productive-silence value so the
+    /// pre-existing #1516/#1658 state-based tests keep their intent under the
+    /// silence-clock gate — `thinking`/`tool_use` = recently productive
+    /// (`silent_secs` 0 → working), anything else = productive-silent past any
+    /// window. New silence-specific tests use [`mk_agent_snapshot_silence`].
     fn mk_agent_snapshot(name: &str, agent_state: &str) -> crate::snapshot::AgentSnapshot {
+        let silent_secs = match agent_state {
+            "thinking" | "tool_use" => 0,
+            _ => i64::MAX,
+        };
+        mk_agent_snapshot_silence(name, agent_state, silent_secs)
+    }
+
+    fn mk_agent_snapshot_silence(
+        name: &str,
+        agent_state: &str,
+        silent_secs: i64,
+    ) -> crate::snapshot::AgentSnapshot {
         crate::snapshot::AgentSnapshot {
             name: name.to_string(),
             backend_command: "opencode".to_string(),
@@ -2002,38 +2053,56 @@ mod tests {
             submit_key: "\r".to_string(),
             health_state: "healthy".to_string(),
             agent_state: agent_state.to_string(),
+            silent_secs,
         }
     }
 
+    /// #1694②: the gate reads the productive-SILENCE clock, not the
+    /// instantaneous thinking/tool_use state. Recently-productive
+    /// (`silent_secs < threshold`) → working (suppress); productive-silent past
+    /// the window → not working (fire); active-recovery states are exempt
+    /// regardless of silence.
     #[test]
-    fn target_is_working_reads_snapshot_state_1516() {
+    fn target_is_working_reads_silence_clock_1694() {
+        const T: i64 = 600;
         let snap = crate::snapshot::FleetSnapshot {
             timestamp: "t".to_string(),
             agents: vec![
-                mk_agent_snapshot("worker", "thinking"),
-                mk_agent_snapshot("tooler", "tool_use"),
-                mk_agent_snapshot("idler", "idle"),
+                // recently productive while NOT thinking/tool_use → still working
+                mk_agent_snapshot_silence("fresh_idle", "idle", 10),
+                // latched 'thinking' but productive-silent past the window → NOT
+                // working (the stuck-but-latched gap the old #1516 state gate missed)
+                mk_agent_snapshot_silence("stuck_thinking", "thinking", 700),
+                // active-recovery exempt: ONLY server_rate_limit (bounded retry +
+                // #1744 exhaustion backstop) → silent but exempt
+                mk_agent_snapshot_silence("rate_limited", "server_rate_limit", 700),
+                // api_error is NOT exempt (no exhaustion backstop) → silent = stuck
+                mk_agent_snapshot_silence("api_err", "api_error", 700),
             ],
         };
         assert!(
-            target_is_working(Some(&snap), "worker"),
-            "thinking → working"
+            target_is_working(Some(&snap), "fresh_idle", T),
+            "recently productive (silent<threshold) → working even when not thinking"
         );
         assert!(
-            target_is_working(Some(&snap), "tooler"),
-            "tool_use → working"
+            !target_is_working(Some(&snap), "stuck_thinking", T),
+            "productive-silent past window → not working, even latched 'thinking'"
         );
         assert!(
-            !target_is_working(Some(&snap), "idler"),
-            "idle → not working"
+            target_is_working(Some(&snap), "rate_limited", T),
+            "ServerRateLimit → active-recovery exempt (suppress nudge)"
         );
         assert!(
-            !target_is_working(Some(&snap), "ghost"),
-            "absent → not working"
+            !target_is_working(Some(&snap), "api_err", T),
+            "ApiError is NOT exempt (no exhaustion backstop) → silent past window fires"
         );
         assert!(
-            !target_is_working(None, "worker"),
-            "no snapshot → not working"
+            !target_is_working(Some(&snap), "ghost", T),
+            "absent → not working (fire)"
+        );
+        assert!(
+            !target_is_working(None, "fresh_idle", T),
+            "no snapshot → not working (fail-open fire)"
         );
     }
 
@@ -2111,6 +2180,135 @@ mod tests {
                 .any(|m| m.kind.as_deref() == Some("dispatch_idle_threshold_exceeded")),
             "no snapshot → must fall back to firing (no worse than pre-#1516)"
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1694② de-noise regression: an overdue dispatch whose target is NOT in
+    /// thinking/tool_use but is recently PRODUCTIVE (low `silent_secs`) must NOT
+    /// fire. Pre-#1694 the #1516 state gate fired here (state ≠ thinking) — the
+    /// exact "reminders became noise" complaint, e.g. a dev heads-down for 13 min
+    /// whose snapshot state isn't thinking at the scan instant but who is plainly
+    /// producing output.
+    #[test]
+    fn productive_but_not_thinking_suppressed_1694() {
+        let home = tmp_home("silence-productive");
+        let issued = chrono::Utc::now() - chrono::Duration::seconds(800);
+        let id = write_pending_at(&home, "lead", "dev", Some("t-p"), "task", 600, issued);
+        // Idle state label, but productive output 60s ago (well under the 600s
+        // window) → the silence clock says "working".
+        crate::snapshot::save(&home, &[mk_agent_snapshot_silence("dev", "idle", 60)]);
+
+        for _ in 0..DEBOUNCE_SCANS + 1 {
+            scan_and_emit(&home);
+        }
+
+        assert!(
+            crate::inbox::drain(&home, "lead").is_empty(),
+            "recently-productive target must NOT trigger an idle nudge"
+        );
+        let p = list_pending(&home)
+            .into_iter()
+            .find(|p| p.dispatch_id == id)
+            .unwrap();
+        assert_eq!(
+            p.status,
+            DispatchStatus::Pending,
+            "sidecar stays pending (silence clock refreshed it)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1694② finding #4: an overdue dispatch whose target is in an
+    /// active-recovery state (ServerRateLimit) must NOT fire even when
+    /// productive-silent — the auto-retry machinery owns the recovery, so
+    /// nudging is pure noise (and would re-create the very proxy-drop noise this
+    /// change removes).
+    #[test]
+    fn active_recovery_exempt_does_not_fire_1694() {
+        let home = tmp_home("silence-recovery");
+        let issued = chrono::Utc::now() - chrono::Duration::seconds(800);
+        let id = write_pending_at(&home, "lead", "dev", Some("t-r"), "task", 600, issued);
+        // Productive-silent (700s) AND in an auto-recovery state → exempt.
+        crate::snapshot::save(
+            &home,
+            &[mk_agent_snapshot_silence("dev", "server_rate_limit", 700)],
+        );
+
+        for _ in 0..DEBOUNCE_SCANS + 1 {
+            scan_and_emit(&home);
+        }
+
+        assert!(
+            crate::inbox::drain(&home, "lead").is_empty(),
+            "active-recovery (ServerRateLimit) target must NOT trigger an idle nudge"
+        );
+        let p = list_pending(&home)
+            .into_iter()
+            .find(|p| p.dispatch_id == id)
+            .unwrap();
+        assert_eq!(p.status, DispatchStatus::Pending);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// codex #1775 HIGH: `api_error` is NOT an exempt active-recovery state (it
+    /// has no retry-exhaustion backstop), so a wedged api_error agent that is
+    /// productive-silent past the window must still fire — dispatch-idle is its
+    /// only watchdog (hang_detector misses it: no BlockedReason → IdleLong, not
+    /// Hung). Contrast with [`active_recovery_exempt_does_not_fire_1694`]
+    /// (server_rate_limit, which IS exempt).
+    #[test]
+    fn stuck_api_error_silent_still_fires_1775() {
+        let home = tmp_home("silence-apierror");
+        let issued = chrono::Utc::now() - chrono::Duration::seconds(800);
+        let id = write_pending_at(&home, "lead", "dev", Some("t-ae"), "task", 600, issued);
+        // api_error AND productive-silent (700s > 600s window) → must fire.
+        crate::snapshot::save(&home, &[mk_agent_snapshot_silence("dev", "api_error", 700)]);
+
+        for _ in 0..DEBOUNCE_SCANS {
+            scan_and_emit(&home);
+        }
+
+        assert!(
+            crate::inbox::drain(&home, "lead")
+                .iter()
+                .any(|m| m.kind.as_deref() == Some("dispatch_idle_threshold_exceeded")),
+            "stuck api_error (silent past window) must fire — no exhaustion backstop owns it"
+        );
+        let p = list_pending(&home)
+            .into_iter()
+            .find(|p| p.dispatch_id == id)
+            .unwrap();
+        assert_eq!(p.status, DispatchStatus::Exceeded);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1694② complement to [`active_recovery_exempt_does_not_fire_1694`]: a
+    /// genuinely stuck target — productive-silent past the window AND in a
+    /// non-recovery state — still fires after the debounce (the watchdog must
+    /// not be neutered by the de-noise change).
+    #[test]
+    fn productive_silent_non_recovery_still_fires_1694() {
+        let home = tmp_home("silence-stuck");
+        let issued = chrono::Utc::now() - chrono::Duration::seconds(800);
+        let id = write_pending_at(&home, "lead", "dev", Some("t-s"), "task", 600, issued);
+        // Productive-silent (700s > 600s window), ordinary state → not working → fire.
+        crate::snapshot::save(&home, &[mk_agent_snapshot_silence("dev", "idle", 700)]);
+
+        for _ in 0..DEBOUNCE_SCANS {
+            scan_and_emit(&home);
+        }
+
+        assert!(
+            crate::inbox::drain(&home, "lead")
+                .iter()
+                .any(|m| m.kind.as_deref() == Some("dispatch_idle_threshold_exceeded")),
+            "productive-silent past window + overdue + no report must still fire"
+        );
+        let p = list_pending(&home)
+            .into_iter()
+            .find(|p| p.dispatch_id == id)
+            .unwrap();
+        assert_eq!(p.status, DispatchStatus::Exceeded);
         std::fs::remove_dir_all(&home).ok();
     }
 

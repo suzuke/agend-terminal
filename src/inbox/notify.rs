@@ -953,6 +953,7 @@ mod snapshot_busy_tests_1513 {
             submit_key: "\r".to_string(),
             health_state: "healthy".to_string(),
             agent_state: state.to_string(),
+            silent_secs: 0,
         }
     }
 
@@ -1002,6 +1003,7 @@ mod should_defer_direct_inject_tests_1513pr2 {
             submit_key: "\r".to_string(),
             health_state: "healthy".to_string(),
             agent_state: state.to_string(),
+            silent_secs: 0,
         }
     }
 
