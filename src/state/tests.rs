@@ -3288,6 +3288,28 @@ fn retry_storm_error_with_no_working_marker_still_latches_1768() {
     );
 }
 
+/// #1768 (the idle-between-turns FP that REJECTED the first cut): a net-error
+/// TOKEN merely MENTIONED in prose — an orchestrator discussing the bug, idle
+/// between turns — rendered DEFAULT, with NO error-label on its line and NO
+/// working-marker below, must NOT latch ServerRateLimit. The #1757 net-error
+/// red-anchor exemption is narrowed to real error-LINES (#1768), so a bare prose
+/// mention stays red-anchored → default-rendered → suppressed. (Contrast
+/// `net_error_invalidhttpresponse_default_latches_1757`: a real `API Error:`
+/// line IS error-line-shaped → still latches.)
+#[test]
+fn net_error_prose_mention_does_not_latch_1768() {
+    let screen = "we keep hitting the InvalidHTTPResponse problem when the proxy is flaky";
+    let n = screen.chars().count();
+    let mut t = StateTracker::new(Some(&Backend::Codex));
+    t.feed_with_fg(screen, &vec![CellFg::Default; n]);
+    assert_ne!(
+        t.get_state(),
+        AgentState::ServerRateLimit,
+        "#1768: a net-error token in prose (no error-label, default-rendered, no \
+         working-marker below) must NOT latch ServerRateLimit (idle-between-turns FP)"
+    );
+}
+
 // ── #1527: transition recording at the mutation source ──
 
 #[test]

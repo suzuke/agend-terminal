@@ -49,6 +49,44 @@ pub(crate) fn is_net_error_match(matched: &str) -> bool {
         .is_match(matched)
 }
 
+/// #1768: does some on-screen occurrence of `matched` sit in a real error LINE
+/// (one carrying an `Error:` / `API Error:` / `FetchError:` label)?
+///
+/// The #1757 net-error exemption (fail-open the #1450 red anchor for net-error
+/// tokens, since codex/gemini render them default not red) was too broad — it
+/// fired for the token ANYWHERE in the live tail, so an orchestrator merely
+/// *discussing* a net error (idle between turns, no working-marker below) had it
+/// mis-latch `ServerRateLimit` → retry storm (the case codex's #1769 review
+/// caught). Narrow the exemption to the token's LINE looking like a backend error
+/// line. The trailing `:`/`?` after a word-boundary `error` means the const name
+/// `…NET_ERRORS:` and prose like "the ECONNRESET error happened" do NOT qualify —
+/// only a labeled error line does. A genuine fault
+/// (`API Error: InvalidHTTPResponse fetching …`) IS error-line-shaped → still
+/// fails open → still latches (the #1757 intent). Checks every occurrence so a
+/// real error line alongside a prose mention still qualifies.
+pub(crate) fn net_error_in_error_line(screen_text: &str, matched: &str) -> bool {
+    if matched.is_empty() {
+        return false;
+    }
+    use std::sync::OnceLock;
+    static ERROR_LABEL: OnceLock<Regex> = OnceLock::new();
+    let re = ERROR_LABEL
+        .get_or_init(|| Regex::new(r"(?i)\b(api ?|fetch)?error\s*[:?]").expect("label regex"));
+    let mut search = 0;
+    while let Some(rel) = screen_text[search..].find(matched) {
+        let pos = search + rel;
+        let line_start = screen_text[..pos].rfind('\n').map_or(0, |i| i + 1);
+        let line_end = screen_text[pos..]
+            .find('\n')
+            .map_or(screen_text.len(), |i| pos + i);
+        if re.is_match(&screen_text[line_start..line_end]) {
+            return true;
+        }
+        search = pos + matched.len();
+    }
+    false
+}
+
 /// Compiled patterns for one backend.
 pub struct StatePatterns {
     /// (state, regex) pairs in priority order (highest priority first).

@@ -810,9 +810,20 @@ impl StateTracker {
                         // suppressed REAL faults → no ServerRateLimit transition →
                         // no auto-retry → stuck agent. Scoped: the FP-prone
                         // api_error/overloaded/context HIGH_FP tokens stay
-                        // red-anchored; the net-error residual FP is bounded by
-                        // #1518/#1586/#1760 (see `patterns::is_net_error_match`).
-                        && !crate::state::patterns::is_net_error_match(matched)
+                        // red-anchored.
+                        // #1768: NARROW that exemption to the token's LINE looking
+                        // like a real backend error line (`Error:`/`API Error:`/
+                        // `FetchError:` label) — a bare prose/source mention (an
+                        // orchestrator discussing net-errors, idle between turns,
+                        // with no working-marker below) stays red-anchored →
+                        // default-rendered → suppressed, instead of mis-latching
+                        // ServerRateLimit (the retry-storm FP codex caught). A real
+                        // fault IS error-line-shaped → still fails open → latches.
+                        && !(crate::state::patterns::is_net_error_match(matched)
+                            && crate::state::patterns::net_error_in_error_line(
+                                screen_text,
+                                matched,
+                            ))
                         && !matched_span_has_red(screen_text, matched, fg);
                     // #1518 position gate: a HIGH_FP marker that has scrolled out
                     // of the live bottom-N rows (e.g. an ApiError / ServerRateLimit
