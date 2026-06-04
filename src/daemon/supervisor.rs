@@ -3986,6 +3986,11 @@ instances:
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
+    // Mirrors #1697's gate: the one_agent_registry PTY/inject path (the post-grace
+    // `reader.read(...).contains("continue")` assertion) doesn't work under
+    // Windows conpty. The boot-grace logic itself is platform-agnostic and the
+    // pure `resolve_pending_auth` test covers the confirm-window path on all OSes.
     fn apierror_nudge_suppressed_during_boot_grace_1741() {
         let (home, registry, mut reader) = one_agent_registry(
             "ag",
