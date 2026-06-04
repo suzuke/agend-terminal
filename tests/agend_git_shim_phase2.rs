@@ -36,21 +36,28 @@ fn unbind_idempotent() {
 
 #[test]
 fn shim_binary_compiles() {
-    // #1784: cargo builds the agend-git bin before running this integration test
-    // and exposes its path via CARGO_BIN_EXE_agend-git (guaranteed present) — its
-    // existence proves the binary compiled, which is all this test asserts.
+    // #1784: prove the agend-git bin builds + runs via the PREBUILT artifact.
+    // cargo builds it before this integration test and exposes its path as
+    // CARGO_BIN_EXE_agend-git; running `--version` process-isolated (via
+    // AGEND_TEST_ISOLATION, like shim_recursion_guard_1504) proves it compiled and
+    // is runnable.
     //
     // Previously this spawned a NESTED `cargo build --bin agend-git`, which
     // contends on the cargo/`target` lock held by the outer test runner: merely
-    // slow (~38s) on unix (advisory locks), but an intermittent DEADLOCK on
-    // windows (mandatory file locks / AV scanning the .exe write) — the fleet-wide
-    // ~56-min windows-CI hang. It was also redundant: the workspace build and the
-    // test harness already compile every bin. Use the same CARGO_BIN_EXE
-    // convention as `shim_recursion_guard_1504` — no subprocess, no deadlock.
-    let bin = env!("CARGO_BIN_EXE_agend-git");
+    // slow (~38s) on unix (advisory locks), but an intermittent DEADLOCK on windows
+    // (mandatory file locks / AV scanning the .exe write) — the fleet-wide ~56-min
+    // windows-CI hang that reddened main HEAD itself. The prebuilt binary has no
+    // nested-cargo target-lock contention; the build was also redundant (the
+    // workspace build + test harness already compile every bin).
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_agend-git"))
+        .env("AGEND_TEST_ISOLATION", "1")
+        .arg("--version")
+        .output()
+        .expect("run agend-git --version");
     assert!(
-        std::path::Path::new(bin).exists(),
-        "agend-git binary must exist at {bin}"
+        out.status.code().is_some(),
+        "agend-git must compile and run to completion; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
