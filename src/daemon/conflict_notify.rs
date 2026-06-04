@@ -645,6 +645,7 @@ mod tests {
                 submit_key: "\r".to_string(),
                 health_state: "healthy".to_string(),
                 agent_state: "thinking".to_string(),
+                silent_secs: 0,
             }],
         );
         home

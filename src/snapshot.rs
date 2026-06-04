@@ -18,6 +18,23 @@ pub struct AgentSnapshot {
     pub submit_key: String,
     pub health_state: String,
     pub agent_state: String,
+    /// #1694②: seconds since the agent last produced *productive* output
+    /// (`StateTracker::last_productive_output`, marker/heartbeat-gated — resists
+    /// spinner/blink/junk). The dispatch-idle silence-clock reads this to gate on
+    /// "is the agent actually making progress" rather than the instantaneous
+    /// thinking/tool_use state. `serde(default)` returns a large value so a
+    /// snapshot written by an older daemon (no field) fails OPEN — the watchdog
+    /// fires rather than silently suppressing a possible stuck.
+    #[serde(default = "default_silent_secs")]
+    pub silent_secs: i64,
+}
+
+/// Fail-open default for a snapshot missing `silent_secs` (old-format / boot
+/// transient): a large value reads as "very silent" → the idle watchdog fires
+/// rather than suppressing. The live daemon rewrites the snapshot every tick with
+/// the real value, so this only covers the sub-tick boot window.
+fn default_silent_secs() -> i64 {
+    i64::MAX
 }
 
 pub fn save(home: &Path, agents: &[AgentSnapshot]) {
@@ -81,6 +98,7 @@ mod tests {
             submit_key: "\r".to_string(),
             health_state: "healthy".to_string(),
             agent_state: state.to_string(),
+            silent_secs: 0,
         }
     }
 
