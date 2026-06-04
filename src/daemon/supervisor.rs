@@ -275,6 +275,14 @@ fn run_loop(
     let mut dispatch_idle_fixup_nudge_tracker =
         crate::daemon::dispatch_idle::fixup_nudge::DispatchIdleFixupNudgeTracker::default();
     let mut retention_supervisor = crate::daemon::retention::RetentionSupervisor::default();
+    // #1741 boot-grace anchor: this Instant ≈ supervisor/daemon boot (set once,
+    // never reset). It gates the every-tick pane-input diagnostic so a restart's
+    // freshly-empty `pane_input_tracks` dedup map can't re-emit for inputs typed
+    // BEFORE the restart (typically a pre-existing operator draft). Mirrors the
+    // #1736 `NOTIFICATION_BOOT_GRACE` suppression already used by the notification
+    // watchdogs; the slow (5-min-scan) sibling watchdogs are out of scope here
+    // because their first scan lands after the 180s grace window.
+    let loop_started_at = Instant::now();
     loop {
         thread::sleep(TICK);
         // #1125 M1: wrap the entire tick body in catch_unwind so a panic
@@ -289,7 +297,12 @@ fn run_loop(
                 &mut apierror_episodes,
                 &mut last_continue_inject,
             );
-            check_pane_input_not_submitted(&home, &registry, &mut pane_input_tracks);
+            check_pane_input_not_submitted(
+                &home,
+                &registry,
+                &mut pane_input_tracks,
+                loop_started_at,
+            );
             anti_stall_tracker.maybe_scan(&home);
             idle_watchdog_tracker.maybe_scan(&home);
             decision_timeout_tracker.maybe_scan(&home);
@@ -350,12 +363,13 @@ pub(crate) fn check_pane_input_not_submitted(
     home: &std::path::Path,
     registry: &AgentRegistry,
     tracks: &mut HashMap<String, PaneInputTrack>,
+    loop_started_at: Instant,
 ) {
     let agent_names: Vec<String> = {
         let reg = agent::lock_registry(registry);
         reg.values().map(|h| h.name.to_string()).collect()
     };
-    check_pane_input_not_submitted_for_agents(home, &agent_names, tracks);
+    check_pane_input_not_submitted_for_agents(home, &agent_names, tracks, loop_started_at);
 }
 
 /// Sprint 54 P2-3: pure-function variant of
@@ -367,7 +381,19 @@ pub(crate) fn check_pane_input_not_submitted_for_agents(
     home: &std::path::Path,
     agent_names: &[String],
     tracks: &mut HashMap<String, PaneInputTrack>,
+    loop_started_at: Instant,
 ) {
+    // #1741 boot-grace: `tracks` (the per-agent last-emitted dedup) is in-memory
+    // and zeroed on every daemon restart. Within the first ticks after a restart
+    // the diagnostic would therefore re-fire for any input typed BEFORE the
+    // restart — which the pane-input detector cannot distinguish from a genuine
+    // fresh strand (the timestamps it reads are operator-keystroke-only). Suppress
+    // the whole scan for `NOTIFICATION_BOOT_GRACE` after boot; a still-stranded
+    // input re-emits exactly once after the grace ends (its typed_ms is well past
+    // the 60s threshold by then). Reuses the #1736 watchdog boot-grace helper.
+    if crate::daemon::per_tick::in_boot_grace(loop_started_at) {
+        return;
+    }
     let threshold_secs: u64 = std::env::var("AGEND_PANE_INPUT_THRESHOLD_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -3327,6 +3353,15 @@ instances:
         .expect("write metadata");
     }
 
+    /// A `loop_started_at` far enough in the past that `in_boot_grace` is
+    /// false, so the #1741 boot-grace gate added to
+    /// `check_pane_input_not_submitted_for_agents` lets the detection run.
+    /// Mirrors the `past` helper in per_tick/{poll_reminder,inbox_stuck,
+    /// handoff_timeout}.rs boot-grace tests.
+    fn past_boot_grace() -> Instant {
+        Instant::now() - crate::daemon::per_tick::NOTIFICATION_BOOT_GRACE - Duration::from_secs(1)
+    }
+
     #[test]
     fn pane_input_not_submitted_emits_event_when_threshold_exceeded() {
         // Per-test unique agent name avoids cross-test sink_registry
@@ -3343,7 +3378,12 @@ instances:
         });
         crate::channel::sink_registry::registry().register(sink.clone());
         let mut tracks: HashMap<String, PaneInputTrack> = HashMap::new();
-        check_pane_input_not_submitted_for_agents(&home, &[agent.to_string()], &mut tracks);
+        check_pane_input_not_submitted_for_agents(
+            &home,
+            &[agent.to_string()],
+            &mut tracks,
+            past_boot_grace(),
+        );
         let events = sink.events.lock();
         let matched = events.iter().filter_map(|e| match e {
             crate::channel::ux_event::UxEvent::Fleet(
@@ -3373,7 +3413,12 @@ instances:
         });
         crate::channel::sink_registry::registry().register(sink.clone());
         let mut tracks: HashMap<String, PaneInputTrack> = HashMap::new();
-        check_pane_input_not_submitted_for_agents(&home, &[agent.to_string()], &mut tracks);
+        check_pane_input_not_submitted_for_agents(
+            &home,
+            &[agent.to_string()],
+            &mut tracks,
+            past_boot_grace(),
+        );
         let events = sink.events.lock();
         for e in events.iter() {
             if let crate::channel::ux_event::UxEvent::Fleet(
@@ -3401,7 +3446,12 @@ instances:
         });
         crate::channel::sink_registry::registry().register(sink.clone());
         let mut tracks: HashMap<String, PaneInputTrack> = HashMap::new();
-        check_pane_input_not_submitted_for_agents(&home, &[agent.to_string()], &mut tracks);
+        check_pane_input_not_submitted_for_agents(
+            &home,
+            &[agent.to_string()],
+            &mut tracks,
+            past_boot_grace(),
+        );
         let events = sink.events.lock();
         for e in events.iter() {
             if let crate::channel::ux_event::UxEvent::Fleet(
@@ -3435,7 +3485,12 @@ instances:
         });
         crate::channel::sink_registry::registry().register(sink.clone());
         let mut tracks: HashMap<String, PaneInputTrack> = HashMap::new();
-        check_pane_input_not_submitted_for_agents(&home, &[agent.to_string()], &mut tracks);
+        check_pane_input_not_submitted_for_agents(
+            &home,
+            &[agent.to_string()],
+            &mut tracks,
+            past_boot_grace(),
+        );
         let events = sink.events.lock();
         let fired = events.iter().any(|e| {
             matches!(
@@ -3467,8 +3522,18 @@ instances:
         crate::channel::sink_registry::registry().register(sink.clone());
         let mut tracks: HashMap<String, PaneInputTrack> = HashMap::new();
         // Tick once → one emit. Tick again with same metadata → still one.
-        check_pane_input_not_submitted_for_agents(&home, &[agent.to_string()], &mut tracks);
-        check_pane_input_not_submitted_for_agents(&home, &[agent.to_string()], &mut tracks);
+        check_pane_input_not_submitted_for_agents(
+            &home,
+            &[agent.to_string()],
+            &mut tracks,
+            past_boot_grace(),
+        );
+        check_pane_input_not_submitted_for_agents(
+            &home,
+            &[agent.to_string()],
+            &mut tracks,
+            past_boot_grace(),
+        );
         let events = sink.events.lock();
         let count = events
             .iter()
@@ -3485,6 +3550,72 @@ instances:
             count, 1,
             "must dedup repeated ticks for same typed_ms; got {count}"
         );
+        std::env::remove_var("AGEND_PANE_INPUT_THRESHOLD_SECS");
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn pane_input_not_submitted_suppressed_during_boot_grace() {
+        // #1741: a daemon restart zeroes `pane_input_tracks`, so without the
+        // boot-grace gate the diagnostic re-fires on the first ticks for an
+        // input typed BEFORE the restart (a pre-existing operator draft the
+        // detector cannot tell apart from a fresh strand). A `loop_started_at`
+        // still within NOTIFICATION_BOOT_GRACE must suppress the emit AND leave
+        // the dedup map untouched; once the grace elapses the same
+        // still-stranded input emits exactly once.
+        let agent = "claude-agent-pin-bootgrace";
+        let home = fleet_with_backend("pin_bootgrace", agent, "claude");
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        seed_input_submit(&home, agent, now_ms - 300_000, 0);
+        std::env::set_var("AGEND_PANE_INPUT_THRESHOLD_SECS", "60");
+        let sink = std::sync::Arc::new(TestSink {
+            events: parking_lot::Mutex::new(Vec::new()),
+        });
+        crate::channel::sink_registry::registry().register(sink.clone());
+        let mut tracks: HashMap<String, PaneInputTrack> = HashMap::new();
+
+        // Within boot-grace (loop just started) → suppressed, dedup untouched.
+        check_pane_input_not_submitted_for_agents(
+            &home,
+            &[agent.to_string()],
+            &mut tracks,
+            Instant::now(),
+        );
+        let fired_in_grace = sink.events.lock().iter().any(|e| {
+            matches!(
+                e,
+                crate::channel::ux_event::UxEvent::Fleet(
+                    crate::channel::ux_event::FleetEvent::PaneInputNotSubmitted { agent: emitted, .. },
+                ) if emitted == agent
+            )
+        });
+        assert!(!fired_in_grace, "must NOT emit during boot-grace");
+        assert!(
+            !tracks.contains_key(agent),
+            "boot-grace must skip the scan entirely (no dedup-map mutation)"
+        );
+
+        // After boot-grace elapsed → the still-stranded input emits once.
+        check_pane_input_not_submitted_for_agents(
+            &home,
+            &[agent.to_string()],
+            &mut tracks,
+            past_boot_grace(),
+        );
+        let count_after = sink
+            .events
+            .lock()
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    crate::channel::ux_event::UxEvent::Fleet(
+                        crate::channel::ux_event::FleetEvent::PaneInputNotSubmitted { agent: emitted, .. },
+                    ) if emitted == agent
+                )
+            })
+            .count();
+        assert_eq!(count_after, 1, "must emit exactly once after grace ends");
         std::env::remove_var("AGEND_PANE_INPUT_THRESHOLD_SECS");
         std::fs::remove_dir_all(home).ok();
     }
