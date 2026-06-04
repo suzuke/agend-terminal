@@ -1583,11 +1583,9 @@ mod tests {
         );
         assert_eq!(result["ok"], true, "report send must succeed: {result}");
         let pending = crate::daemon::dispatch_idle::list_pending(&home);
-        let entry = pending.iter().find(|p| p.dispatch_id == id).unwrap();
-        assert_eq!(
-            entry.status,
-            crate::daemon::dispatch_idle::DispatchStatus::Resolved,
-            "kind=report with matching correlation_id must resolve the sidecar"
+        assert!(
+            !pending.iter().any(|p| p.dispatch_id == id),
+            "kind=report with matching correlation_id must resolve (delete) the sidecar"
         );
         std::fs::remove_dir_all(&home).ok();
     }
@@ -1716,17 +1714,16 @@ mod tests {
         );
         assert_eq!(reported["ok"], true, "report must deliver: {reported}");
 
-        // #1525: the sidecar must now be resolved (mark_resolved flips status,
-        // does not delete). Pre-fix it stayed `pending` → fired a nudge.
+        // #1525: the report must clear the sidecar. mark_resolved now DELETES the
+        // file (rather than flipping to Resolved), so the sidecar must be absent.
+        // Pre-fix it stayed `pending` → fired a nudge.
         let after = crate::daemon::dispatch_idle::list_pending(&home);
-        assert_eq!(
+        assert!(
             after
                 .iter()
-                .find(|p| p.correlation_id.as_deref() == Some("t-1525-x"))
-                .map(|p| p.status),
-            Some(crate::daemon::dispatch_idle::DispatchStatus::Resolved),
-            "#1525: a report carrying the id in task_id must clear the sidecar \
-             via the correlation_id.or(task_id) symmetry"
+                .all(|p| p.correlation_id.as_deref() != Some("t-1525-x")),
+            "#1525: a report carrying the id in task_id must clear (delete) the \
+             sidecar via the correlation_id.or(task_id) symmetry"
         );
         std::fs::remove_dir_all(&home).ok();
     }

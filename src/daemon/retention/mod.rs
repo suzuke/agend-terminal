@@ -32,13 +32,23 @@ impl RetentionSupervisor {
         tracing::info!("retention sweep: starting cycle");
 
         let decisions_swept = decisions::sweep(home);
-        let cutover = std::env::var("AGEND_RETENTION_CUTOVER").as_deref() == Ok("1");
+        // Pending-dispatch retention now defaults ON (opt-out via
+        // AGEND_RETENTION_CUTOVER=0). It was a staged-rollout gate, not a
+        // bug-gate; the sweep only deletes sidecars with `issued_at < now-14d`
+        // (a real dispatch resolves in minutes, never survives 14 days), so it
+        // is safe to enable by default — closing the `exceeded`/abandoned leak
+        // that has no resolve event and can only be time-GC'd.
+        let cutover = std::env::var("AGEND_RETENTION_CUTOVER").as_deref() != Ok("0");
         let dispatches_swept = pending_dispatches::sweep(home, cutover);
         let worktrees_swept = worktrees::sweep(home);
+        // Drop terminal dispatch_tracking rows (completed/orphaned) each cycle so
+        // they don't accumulate until the 30-day gc_old_entries backstop.
+        let tracking_swept = crate::dispatch_tracking::sweep_terminal_entries(home);
 
         tracing::info!(
             decisions = decisions_swept,
             dispatches = dispatches_swept,
+            tracking = tracking_swept,
             worktrees = worktrees_swept,
             "retention sweep: cycle complete"
         );
@@ -47,7 +57,7 @@ impl RetentionSupervisor {
             "retention_sweep",
             "supervisor",
             &format!(
-                "decisions={decisions_swept} dispatches={dispatches_swept} worktrees={worktrees_swept}"
+                "decisions={decisions_swept} dispatches={dispatches_swept} tracking={tracking_swept} worktrees={worktrees_swept}"
             ),
         );
     }
