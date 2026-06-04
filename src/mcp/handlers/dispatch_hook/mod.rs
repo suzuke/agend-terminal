@@ -309,6 +309,20 @@ pub(crate) fn dispatch_auto_bind_lease_with_source(
     )
 }
 
+/// #1750 A1: classify a `handle_watch_ci` result. The handler returns a JSON
+/// `{"error":..,"code":..}` object on a failed arm and an ok-shaped object
+/// otherwise; this extracts `(code, error)` when arming failed, else `None`.
+/// Pure so the dispatch-time auto-watch error-surfacing is unit-testable without
+/// provoking a real disk-write failure.
+fn auto_watch_arm_error(result: &serde_json::Value) -> Option<(&str, &str)> {
+    let err = result.get("error")?.as_str()?;
+    let code = result
+        .get("code")
+        .and_then(|c| c.as_str())
+        .unwrap_or("unknown");
+    Some((code, err))
+}
+
 /// #931 Fix 2 (H5a): unified entry that accepts both `source_repo_override`
 /// (Sprint 55 P0-B) and `next_after_ci` (the workflow chain target).
 /// All four convenience entry points (`dispatch_auto_bind_lease`,
@@ -529,15 +543,29 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
         if !task_id.is_empty() {
             watch_args["task_id"] = serde_json::json!(task_id);
         }
-        crate::mcp::handlers::ci::handle_watch_ci(home, &watch_args, target);
-        tracing::info!(
-            %target,
-            repo = %r,
-            %branch,
-            next_after_ci = ?effective_next,
-            explicit = next_after_ci.is_some(),
-            "dispatch auto-watch_ci"
-        );
+        let watch_result = crate::mcp::handlers::ci::handle_watch_ci(home, &watch_args, target);
+        // #1750 A1: `handle_watch_ci` returns `{"error":..,"code":..}` on a failed
+        // arm (watch_write_failed / ci_watches_dir_create_failed / binding-stale).
+        // Previously this Result was discarded and the success log fired
+        // unconditionally — a silently-failed arm left no trace, the surface
+        // behind "CI green but no watch armed, ci-ready never fires". Surface the
+        // failure as an error log instead of a false success (the dispatch itself
+        // still proceeds — auto-watch is best-effort convenience, not a gate).
+        if let Some((code, err)) = auto_watch_arm_error(&watch_result) {
+            tracing::error!(
+                %target, repo = %r, %branch, code, error = %err,
+                "dispatch auto-watch_ci FAILED — no CI watch armed (ci-ready will not fire)"
+            );
+        } else {
+            tracing::info!(
+                %target,
+                repo = %r,
+                %branch,
+                next_after_ci = ?effective_next,
+                explicit = next_after_ci.is_some(),
+                "dispatch auto-watch_ci"
+            );
+        }
     }
 
     Ok(DispatchOutcome {

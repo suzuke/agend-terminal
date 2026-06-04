@@ -580,6 +580,31 @@ fn delegate_task_same_agent_different_branch_without_delivering() {
 // `dispatch_auto_bind_lease` and `delegate_task_with_repo_creates_ci_watch`
 // FAILS (no watch file). Restore → PASS. See commit message §regression-proof.
 
+/// #1750 A1: `auto_watch_arm_error` classifies a `handle_watch_ci` result so the
+/// dispatch-time auto-watch path can surface a failed arm (previously the Result
+/// was discarded and a success log fired unconditionally).
+#[test]
+fn auto_watch_arm_error_classifies_handle_watch_ci_result_1750() {
+    // ok-shaped result (no `error` field) → None → success-log path
+    let ok = serde_json::json!({ "status": "watching", "repo": "owner/repo" });
+    assert!(super::auto_watch_arm_error(&ok).is_none());
+    // error-shaped result → Some((code, error)) → error-log path
+    let err = serde_json::json!({
+        "error": "watch file write failed: disk full",
+        "code": "watch_write_failed",
+    });
+    assert_eq!(
+        super::auto_watch_arm_error(&err),
+        Some(("watch_write_failed", "watch file write failed: disk full")),
+    );
+    // error without an explicit code → "unknown"
+    let err_no_code = serde_json::json!({ "error": "boom" });
+    assert_eq!(
+        super::auto_watch_arm_error(&err_no_code),
+        Some(("unknown", "boom"))
+    );
+}
+
 #[test]
 fn delegate_task_with_repo_creates_ci_watch() {
     let home = std::env::temp_dir().join(format!("agend-s53-p02-{}-with-repo", std::process::id()));
