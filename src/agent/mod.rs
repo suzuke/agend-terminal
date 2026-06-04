@@ -1497,6 +1497,16 @@ enum ExitKind {
     Crash,
 }
 
+/// #1744-H5: should an external signal-kill of `name` escalate a leaderless-team
+/// P0? Fail-closed via `self_orch_status` (`Yes`|`Unknown` fire, `No` skip).
+/// `home == None` can't read the teams config → can't determine self-orch → skip
+/// (a SignalKill normally carries a home; `None` is an extreme / test path).
+fn signal_kill_self_orch_should_escalate(home: &Option<std::path::PathBuf>, name: &str) -> bool {
+    home.as_ref()
+        .map(|h| crate::teams::self_orch_status(h, name) != crate::teams::SelfOrchStatus::No)
+        .unwrap_or(false)
+}
+
 fn classify_exit(exit_code: Option<i32>) -> ExitKind {
     match exit_code {
         Some(0) | Some(130) => ExitKind::UserExit,
@@ -1737,6 +1747,34 @@ fn handle_pty_close(
             }
         }
         ExitKind::SignalKill => {
+            // #1744-H5: an external signal-kill (OOM exit 137 / SIGTERM 143) of a
+            // self-orchestrator is a SILENT leaderless death — cleanup_agent just
+            // removes it, emitting no crash event / notify. A graceful daemon
+            // shutdown (`is_shutdown`) and a deleted agent both early-returned
+            // above, so this branch only ever sees an UNEXPECTED external kill of
+            // a live agent. Escalate a P0 before cleanup. Fail-closed via
+            // self_orch_status (Yes|Unknown fire, No skip); home=None can't
+            // determine self-orch → skip.
+            if signal_kill_self_orch_should_escalate(home, name) {
+                tracing::error!(
+                    agent = name,
+                    exit_code = exit_code.unwrap_or(0),
+                    "#1744-H5: self-orchestrator killed by external signal — escalating P0"
+                );
+                let msg = format!(
+                    "🛑 Self-orchestrator `{name}` was killed by an external signal (OOM / \
+                     SIGKILL, exit {code}) and removed — it will NOT be auto-respawned \
+                     (a signal-kill is not a crash). Its team is leaderless and no peer can \
+                     relay: manual operator intervention is required.",
+                    code = exit_code.unwrap_or(0),
+                );
+                crate::channel::notify_all_escalation_channels(
+                    name,
+                    crate::channel::NotifySeverity::Error,
+                    &msg,
+                    false,
+                );
+            }
             cleanup_agent(name, id, registry, home);
         }
         ExitKind::Crash => {

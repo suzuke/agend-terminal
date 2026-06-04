@@ -113,6 +113,7 @@ mod tests {
             last_crash_notification_epoch_ms: Some(333),
             last_hung_notification_epoch_ms: None,
             hung_since_epoch_ms: Some(444),
+            failed_escalated: true,
         };
         persist(&home, "a", &snap);
         // A second agent's entry must not clobber the first.

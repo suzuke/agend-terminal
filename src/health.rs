@@ -347,6 +347,10 @@ pub struct HealthTracker {
     /// clear on Hung EXIT (so a recovered episode's anchor never lingers / is
     /// never persisted stale).
     hung_since: Option<Instant>,
+    /// #1744-H4: once-off latch — set when the terminal-Failed self-orchestrator
+    /// P0 fires, so the permanent leaderless-death page is sent exactly once
+    /// (persisted across restart via [`PersistedEscalation`]).
+    pub failed_escalated: bool,
     error_events: VecDeque<(Instant, AgentState)>,
     pub last_output: Instant,
     pub current_reason: Option<BlockedReason>,
@@ -452,6 +456,11 @@ pub struct PersistedEscalation {
     pub last_hung_notification_epoch_ms: Option<u64>,
     #[serde(default)]
     pub hung_since_epoch_ms: Option<u64>,
+    /// #1744-H4: once-off latch for the terminal-Failed self-orchestrator P0.
+    /// Persisted so a daemon restart (which does NOT rehydrate `state`, only the
+    /// crash budget) doesn't re-page the operator about the same permanent death.
+    #[serde(default)]
+    pub failed_escalated: bool,
 }
 
 impl HealthTracker {
@@ -464,6 +473,7 @@ impl HealthTracker {
             last_crash_notification: None,
             last_hung_notification: None,
             hung_since: None,
+            failed_escalated: false,
             error_events: VecDeque::new(),
             last_output: Instant::now(),
             current_reason: None,
@@ -625,6 +635,7 @@ impl HealthTracker {
             last_crash_notification_epoch_ms: self.last_crash_notification.map(instant_to_epoch_ms),
             last_hung_notification_epoch_ms: self.last_hung_notification.map(instant_to_epoch_ms),
             hung_since_epoch_ms: self.hung_since.map(instant_to_epoch_ms),
+            failed_escalated: self.failed_escalated,
         }
     }
 
@@ -649,6 +660,7 @@ impl HealthTracker {
         self.last_crash_notification = p.last_crash_notification_epoch_ms.map(epoch_ms_to_instant);
         self.last_hung_notification = p.last_hung_notification_epoch_ms.map(epoch_ms_to_instant);
         self.hung_since = p.hung_since_epoch_ms.map(epoch_ms_to_instant);
+        self.failed_escalated = p.failed_escalated;
     }
 
     /// Check whether agent is stalled on an interactive startup prompt.

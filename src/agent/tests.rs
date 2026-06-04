@@ -1906,3 +1906,36 @@ fn broadcast_delivers_to_healthy_subscriber() {
         "output must be delivered"
     );
 }
+
+/// #1744-H5: an external signal-kill (OOM) escalates a leaderless-team P0 only
+/// for a self-orchestrator — fail-closed via `self_orch_status` (Yes|Unknown
+/// fire, No skip), and `home == None` (can't read teams) skips.
+#[test]
+#[allow(clippy::unwrap_used)]
+fn signal_kill_escalates_only_for_self_orch_1744_h5() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-h5-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    crate::teams::create(
+        &home,
+        &serde_json::json!({"name": "t", "members": ["lead", "dev"], "orchestrator": "lead"}),
+    );
+
+    assert!(
+        signal_kill_self_orch_should_escalate(&Some(home.clone()), "lead"),
+        "a self-orchestrator's OOM must escalate (Yes → fire)"
+    );
+    assert!(
+        !signal_kill_self_orch_should_escalate(&Some(home.clone()), "dev"),
+        "a non-orchestrator member's OOM must stay silent (No → skip)"
+    );
+    assert!(
+        !signal_kill_self_orch_should_escalate(&None, "lead"),
+        "home=None can't determine self-orch → skip"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}

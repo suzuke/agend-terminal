@@ -47,7 +47,14 @@ pub(super) fn handle_crash_respawn(home: &Path, crashed_name: &str, ctx: &Daemon
     let self_orch = crate::teams::self_orch_status(home, crashed_name);
     let is_self_orch = self_orch == crate::teams::SelfOrchStatus::Yes;
 
-    let (should_respawn, delay, should_notify, fire_self_orch_p0, escalation_snapshot) = {
+    let (
+        should_respawn,
+        delay,
+        should_notify,
+        fire_self_orch_p0,
+        fire_terminal_p0,
+        escalation_snapshot,
+    ) = {
         let reg = agent::lock_registry(&ctx.registry);
         match reg.get(&instance_id) {
             Some(handle) => {
@@ -61,11 +68,24 @@ pub(super) fn handle_crash_respawn(home: &Path, crashed_name: &str, ctx: &Daemon
                 // untouched.
                 let fire_p0 = is_self_orch && core.health.self_orch_crash_should_notify();
                 let (respawn, delay, notify) = core.health.record_crash();
+                // #1744-H4: a terminal Failed (max-retries) self-orchestrator crash
+                // is a PERMANENT leaderless death. record_crash returns notify=true
+                // ("don't respawn, do notify"), but fire_p0 is cooldown-gated and
+                // the generic notify branch below is `!is_self_orch` — so without
+                // this it pages NEITHER. Fire a once-off, cooldown-EXEMPT terminal
+                // P0, fail-closed (Yes|Unknown fire, No skip), latched via the
+                // PERSISTED `failed_escalated` so a restart (which rehydrates the
+                // crash budget but not `state`) doesn't re-page the same death.
+                let fire_terminal =
+                    should_fire_terminal_p0(respawn, self_orch, core.health.failed_escalated);
+                if fire_terminal {
+                    core.health.failed_escalated = true;
+                }
                 // #1744-H2: snapshot the (just-mutated) escalation state under the
                 // lock; persisted lock-free below so the crash budget + cooldown
-                // survive a daemon restart.
+                // (+ #1744-H4 failed_escalated) survive a daemon restart.
                 let snap = core.health.escalation_snapshot();
-                (respawn, delay, notify, fire_p0, snap)
+                (respawn, delay, notify, fire_p0, fire_terminal, snap)
             }
             None => {
                 tracing::warn!(agent = %crashed_name, "not in registry, skipping");
@@ -80,7 +100,12 @@ pub(super) fn handle_crash_respawn(home: &Path, crashed_name: &str, ctx: &Daemon
     // #1701: a self-orchestrator crash escalates to the operator on EVERY crash
     // (cooldown-gated) — the team is leaderless until respawn and no peer can
     // relay. A non-orchestrator agent keeps the generic recent>=2 crash notify.
-    if fire_self_orch_p0 {
+    if fire_terminal_p0 {
+        // #1744-H4: terminal-Failed self-orch — takes precedence over the
+        // per-crash page (its wording is "permanent, won't respawn", not "until
+        // respawn"). Once-off via the persisted `failed_escalated` latch.
+        notify_self_orch_terminal(crashed_name);
+    } else if fire_self_orch_p0 {
         notify_self_orch_crash(crashed_name, &instance_id, &ctx.registry);
     } else if !is_self_orch && should_notify {
         notify_crash(crashed_name, &instance_id, &ctx.registry);
@@ -148,6 +173,45 @@ fn notify_self_orch_crash(
     );
     // #1744-M6: every registered channel — a leaderless-orchestrator P0 must not
     // be dropped just because the fleet runs multiple channels.
+    crate::channel::notify_all_escalation_channels(
+        crashed_name,
+        NotifySeverity::Error,
+        &msg,
+        false,
+    );
+}
+
+/// #1744-H4: should the terminal-Failed self-orchestrator P0 fire? True iff the
+/// agent will NOT respawn (max-retries Failed), it is a self-orchestrator
+/// (fail-closed: `Yes`|`Unknown` fire, `No` skip — a leaderless death is too
+/// costly to miss on an indeterminate teams read), and it has not already been
+/// terminally paged (`failed_escalated`, persisted for cross-restart once-off).
+fn should_fire_terminal_p0(
+    should_respawn: bool,
+    self_orch: crate::teams::SelfOrchStatus,
+    failed_escalated: bool,
+) -> bool {
+    !should_respawn && self_orch != crate::teams::SelfOrchStatus::No && !failed_escalated
+}
+
+/// #1744-H4: terminal-Failed self-orchestrator P0 — fired exactly ONCE when a
+/// self-orchestrator exhausts its respawn budget and will NOT be respawned. The
+/// team is permanently leaderless until the operator intervenes. Distinct from
+/// the per-crash [`notify_self_orch_crash`] in WORDING (permanent death, not
+/// "until respawn") and TRIGGER (cooldown-EXEMPT once-off, latched on the
+/// persisted `failed_escalated`). Routes through PR-A's
+/// `notify_all_escalation_channels` (#1744-M6) so the page reaches every channel.
+fn notify_self_orch_terminal(crashed_name: &str) {
+    tracing::error!(
+        agent = %crashed_name,
+        "#1744-H4: self-orchestrator PERMANENTLY FAILED (respawn budget exhausted) — escalating terminal P0"
+    );
+    let msg = format!(
+        "🛑 Self-orchestrator `{crashed_name}` has PERMANENTLY FAILED — it crashed past \
+         its auto-retry budget and will NOT be respawned. Its team is leaderless and no \
+         peer can relay this: manual operator intervention is required (restart / reassign \
+         the orchestrator)."
+    );
     crate::channel::notify_all_escalation_channels(
         crashed_name,
         NotifySeverity::Error,
@@ -276,5 +340,34 @@ fn respawn_agent_worker(
         Err(e) => {
             tracing::warn!(agent = %config.name, error = %e, "respawn failed");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_fire_terminal_p0;
+    use crate::teams::SelfOrchStatus;
+
+    /// #1744-H4: the terminal self-orch P0 fires for a Failed (no-respawn)
+    /// self-orchestrator — fail-closed (Yes|Unknown), skipped for No / non-terminal,
+    /// and exactly once (the persisted `failed_escalated` latch suppresses re-page,
+    /// so a daemon restart doesn't re-page the same permanent death).
+    #[test]
+    fn terminal_p0_fires_for_failed_self_orch_once_1744_h4() {
+        // Terminal + self-orch (fail-closed) + not yet paged → fire.
+        assert!(should_fire_terminal_p0(false, SelfOrchStatus::Yes, false));
+        assert!(
+            should_fire_terminal_p0(false, SelfOrchStatus::Unknown, false),
+            "fail-closed: Unknown must still fire the leaderless-death P0"
+        );
+        // Not a self-orchestrator → skip (keeps the generic crash notify).
+        assert!(!should_fire_terminal_p0(false, SelfOrchStatus::No, false));
+        // Still respawning (non-terminal) → not a terminal page.
+        assert!(!should_fire_terminal_p0(true, SelfOrchStatus::Yes, false));
+        // Once-off: already terminally paged → never re-page.
+        assert!(
+            !should_fire_terminal_p0(false, SelfOrchStatus::Yes, true),
+            "#1744-H4 once-off: an already-paged terminal self-orch must not re-page"
+        );
     }
 }
