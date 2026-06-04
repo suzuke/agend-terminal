@@ -3288,6 +3288,49 @@ fn retry_storm_error_with_no_working_marker_still_latches_1768() {
     );
 }
 
+/// #1777 (cheerc, "Sticky UsageLimit"): UsageLimit (prio 11 > Thinking/ToolUse,
+/// and never auto-expires) is the same sticky-error class as the #1768 retry
+/// storm — after the agent resumed work below a scrolled-up UsageLimit line, the
+/// status stayed stuck on `[UsageLimit]` until the line scrolled off. The #1768
+/// working-marker override now covers UsageLimit too.
+#[test]
+fn usage_limit_recovered_below_error_lands_on_working_state_1777() {
+    // UsageLimit line scrolled UP; the agent's most-recent line is the work spinner.
+    let screen = "▌ You've hit your usage limit. try again at 3pm.\n\
+                  ▌ resuming\n\
+                  ▌ esc to interrupt";
+    let n = screen.chars().count();
+    let mut t = StateTracker::new(Some(&Backend::Codex));
+    t.feed_with_fg(screen, &vec![CellFg::Default; n]);
+    assert_ne!(
+        t.get_state(),
+        AgentState::UsageLimit,
+        "#1777: a recovered agent (working-marker below the scrolled-up UsageLimit) \
+         must NOT re-latch UsageLimit"
+    );
+    assert_eq!(
+        t.get_state(),
+        AgentState::Thinking,
+        "#1777: it lands on the working state the marker indicates"
+    );
+}
+
+/// #1777: the override is recovery-only — a genuinely-stuck UsageLimit (no
+/// in-flight working marker below it) must STILL latch so the operator is notified.
+#[test]
+fn usage_limit_stuck_no_working_marker_still_latches_1777() {
+    let screen = "▌ You've hit your usage limit. try again at 3pm.\n\
+                  ▌ waiting for the limit to reset";
+    let n = screen.chars().count();
+    let mut t = StateTracker::new(Some(&Backend::Codex));
+    t.feed_with_fg(screen, &vec![CellFg::Default; n]);
+    assert_eq!(
+        t.get_state(),
+        AgentState::UsageLimit,
+        "#1777: a UsageLimit with no working-marker below must still latch"
+    );
+}
+
 /// #1768 (the idle-between-turns FP that REJECTED the first cut): a net-error
 /// TOKEN merely MENTIONED in prose — an orchestrator discussing the bug, idle
 /// between turns — rendered DEFAULT, with NO error-label on its line and NO

@@ -872,7 +872,18 @@ impl StateTracker {
                         // latches → auto-retry fires. Detection-side only;
                         // `clears_server_rate_limit_retry` untouched → no #1713
                         // flicker-reset regression.
-                        let landed = if high_fp {
+                        //
+                        // #1777 (cheerc, "Sticky UsageLimit"): UsageLimit (prio 11)
+                        // is the same kind of sticky error — it outranks
+                        // Thinking/ToolUse and never auto-expires (no
+                        // `maybe_expire_latched_state` arm), so a stale UsageLimit
+                        // line keeps re-latching after the agent resumed work below
+                        // it (status stuck on `[UsageLimit]` until the line scrolls
+                        // off). Extend the same recovery override to it. UsageLimit
+                        // stays OUT of `is_high_fp_state` → the #1450 red anchor is
+                        // unchanged (that decision is ① Step-2, pending the
+                        // operator); this is the #1768 working-marker override only.
+                        let landed = if high_fp || matches!(detected, AgentState::UsageLimit) {
                             patterns
                                 .working_state_below(screen_text, matched)
                                 .unwrap_or(detected)
