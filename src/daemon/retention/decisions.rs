@@ -148,6 +148,13 @@ pub(super) fn sweep(home: &Path) -> usize {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    // The `sweep_*` tests set/remove the process-global `AGEND_RETENTION_CUTOVER`
+    // env var that `sweep()` reads — running them concurrently lets one test's
+    // `remove_var` clear the gate before another's `sweep()` reads it, so the
+    // latter early-returns 0 and its `assert_eq!(archived, 1)` flakes (reddened
+    // #1752 CI). Serialize them under a named group (mirrors capture.rs's
+    // `#[serial(capture_env)]`); non-env retention tests stay parallel.
+    use serial_test::serial;
 
     fn tmp_home(name: &str) -> std::path::PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -211,6 +218,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(retention_cutover)]
     fn sweep_archives_expired_decisions() {
         let home = tmp_home("sweep-expired");
         write_decision(&home, "d-old", 100, &[]);
@@ -231,6 +239,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(retention_cutover)]
     fn sweep_respects_protected_tags() {
         let home = tmp_home("sweep-protected");
         write_decision(&home, "d-protected", 100, &["SPRINT_99"]);
@@ -258,6 +267,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(retention_cutover)]
     fn sweep_enforces_14d_floor() {
         let home = tmp_home("sweep-floor");
         // Decision with ttl_days=1 but only 10 days old — 14d floor protects it

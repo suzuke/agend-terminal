@@ -386,6 +386,12 @@ mod tests {
     use super::*;
     use crate::layout::{Layout, Pane, PaneSource, Tab};
     use crate::vterm::VTerm;
+    // #1763 residual: `config_set_via_palette_*` mutates the process-global
+    // `RUNTIME_CONFIG` (via `runtime_config::set` → `*global().write()`), the same
+    // singleton the `runtime_config::tests` serialize on. Join the SAME
+    // `runtime_config` serial group so this cross-module test can't clobber their
+    // global mid-assertion.
+    use serial_test::serial;
 
     fn test_pane(id: usize, agent: &str, fleet_name: Option<&str>) -> Pane {
         Pane {
@@ -469,6 +475,7 @@ mod tests {
     /// and persist. Assert against the written file (deterministic — avoids the
     /// process-global cache shared across parallel tests).
     #[test]
+    #[serial(runtime_config)]
     fn config_set_via_palette_persists_to_runtime_config() {
         let dir =
             std::env::temp_dir().join(format!("agend-test-cmd-config-{}", std::process::id()));
