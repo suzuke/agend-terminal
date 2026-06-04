@@ -739,22 +739,40 @@ fn bridge_rejects_malformed_mcp_json() {
 
 #[test]
 fn bridge_handles_half_up_daemon() {
-    // Get a random port that nothing is listening on
-    let port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        l.local_addr().expect("addr").port()
-        // l drops here — port is free but nothing listening
-    };
-    // Try to connect — should fail (connection refused), not hang
-    let start = Instant::now();
-    let result = TcpStream::connect_timeout(
-        &SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
-        Duration::from_secs(3),
-    );
-    let elapsed = start.elapsed();
-    assert!(result.is_err(), "connect to non-listening port should fail");
-    assert!(
-        elapsed < Duration::from_secs(5),
-        "should fail quickly, not hang: {elapsed:?}"
-    );
+    // The real property under test: connecting to a port with nothing listening
+    // fails FAST (connection refused), it does not hang.
+    //
+    // De-flake: under a parallel test run another test can re-bind the just-freed
+    // ephemeral port between our drop and our connect, so the connect spuriously
+    // SUCCEEDS — a port-reuse race in the fixture, not a real outcome. Retry with a
+    // fresh ephemeral port when that happens; the assertion only fires on the
+    // genuine refused case.
+    for attempt in 0..8 {
+        // A random port that nothing is listening on.
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            l.local_addr().expect("addr").port()
+            // l drops here — port is free but nothing listening
+        };
+        let start = Instant::now();
+        let result = TcpStream::connect_timeout(
+            &SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+            Duration::from_secs(3),
+        );
+        let elapsed = start.elapsed();
+        if result.is_ok() {
+            // The freed port was re-bound by a concurrent test — not a real
+            // "nothing listening" connect. Retry with a fresh port.
+            assert!(
+                attempt < 7,
+                "ephemeral port kept getting reused across 8 attempts (test infra)"
+            );
+            continue;
+        }
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "should fail quickly, not hang: {elapsed:?}"
+        );
+        return;
+    }
 }
