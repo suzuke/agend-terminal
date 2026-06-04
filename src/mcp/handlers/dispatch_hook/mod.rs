@@ -999,6 +999,47 @@ fn derive_repo_from_remote(source_repo: &std::path::Path) -> Option<String> {
 #[allow(clippy::unwrap_used)]
 mod tests;
 
+/// #1787: run an IDEMPOTENT git subprocess with bounded retry on transient
+/// failure. The #1784 windows-CI hang fix let the full suite run for the first
+/// time and surfaced intermittent transient failures of these dispatch-hook git
+/// calls — e.g. `git log origin/main..HEAD` exiting non-zero with empty stderr
+/// (#1783) under windows scratch-repo lock contention — which a retry clears.
+///
+/// ONLY for idempotent commands (log / diff-tree / reset-to-a-fixed-ref): a
+/// non-idempotent op (`rebase -i`) must NOT route through here and stays a direct
+/// call. Returns the FINAL attempt's output (or the spawn error), so callers keep
+/// their existing success/stderr handling unchanged. `AGEND_GIT_BYPASS=1` is
+/// pinned exactly as the direct calls did. (Wall-clock timeout for the hang class
+/// is the #1787 Phase-4 daemon-git audit; here the confirmed flake is a transient
+/// non-zero exit, and test-level hangs are caught by the #1785 nextest guard.)
+fn run_git_idempotent(args: &[&str], cwd: &Path) -> std::io::Result<std::process::Output> {
+    const MAX_ATTEMPTS: u32 = 3;
+    const BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+    let mut last: Option<std::process::Output> = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()?;
+        if out.status.success() {
+            return Ok(out);
+        }
+        tracing::debug!(
+            target: "dispatch_hook",
+            attempt,
+            args = ?args,
+            stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+            "#1787: transient git failure, retrying idempotent git command"
+        );
+        last = Some(out);
+        if attempt < MAX_ATTEMPTS {
+            std::thread::sleep(BACKOFF);
+        }
+    }
+    Ok(last.expect("loop runs at least once"))
+}
+
 /// Remove empty commits with message "init" between origin/main and HEAD.
 /// These come from BACKEND session checkpoints (claude-code / kiro-cli)
 /// that fire heartbeats every ~90s; not from agend-terminal production
@@ -1028,11 +1069,9 @@ pub(crate) fn clean_empty_init_commits(worktree: &Path) -> Result<usize, String>
     // helper — worst case we get the same status 256 we had before.
     clear_stale_rebase_state(worktree);
 
-    let output = std::process::Command::new("git")
-        .args(["log", "origin/main..HEAD", "--format=%H %s"])
-        .current_dir(worktree)
-        .env("AGEND_GIT_BYPASS", "1")
-        .output();
+    // #1787: retry — the confirmed #1783 windows flake was this command exiting
+    // non-zero with empty stderr under scratch-repo lock contention.
+    let output = run_git_idempotent(&["log", "origin/main..HEAD", "--format=%H %s"], worktree);
     let output = match output {
         Ok(o) if o.status.success() => o,
         Ok(o) => {
@@ -1070,11 +1109,10 @@ pub(crate) fn clean_empty_init_commits(worktree: &Path) -> Result<usize, String>
             continue;
         }
         // Check if commit has no file changes.
-        let diff = std::process::Command::new("git")
-            .args(["diff-tree", "--no-commit-id", "--name-only", "-r", hash])
-            .current_dir(worktree)
-            .env("AGEND_GIT_BYPASS", "1")
-            .output();
+        let diff = run_git_idempotent(
+            &["diff-tree", "--no-commit-id", "--name-only", "-r", hash],
+            worktree,
+        );
         if let Ok(d) = diff {
             if d.status.success() && d.stdout.trim_ascii().is_empty() {
                 empty_inits.push(hash);
@@ -1089,23 +1127,21 @@ pub(crate) fn clean_empty_init_commits(worktree: &Path) -> Result<usize, String>
     // All commits between origin/main..HEAD are empty inits → soft reset.
     let total_commits = log.lines().count();
     if empty_inits.len() == total_commits {
-        let status = std::process::Command::new("git")
-            .args(["reset", "--soft", "origin/main"])
-            .current_dir(worktree)
-            .env("AGEND_GIT_BYPASS", "1")
-            .status();
+        // #1787: retry — soft-reset to a fixed ref is idempotent.
+        let status = run_git_idempotent(&["reset", "--soft", "origin/main"], worktree);
         match status {
-            Ok(s) if s.success() => {
+            Ok(o) if o.status.success() => {
                 tracing::info!(
                     count = total_commits,
                     "cleaned all empty init commits via soft reset"
                 );
                 return Ok(total_commits);
             }
-            Ok(s) => {
+            Ok(o) => {
                 tracing::warn!("failed to soft-reset empty init commits");
                 return Err(format!(
-                    "git reset --soft origin/main exited with status {s:?}"
+                    "git reset --soft origin/main exited with status {:?}",
+                    o.status
                 ));
             }
             Err(e) => {
@@ -1139,6 +1175,10 @@ pub(crate) fn clean_empty_init_commits(worktree: &Path) -> Result<usize, String>
         .collect();
     let sed_script = sed_parts.join(";");
     let cleaned = empty_inits.len();
+    // #1787 audit: NOT routed through `run_git_idempotent` — `rebase -i` is not
+    // idempotent (a partial/interrupted rebase leaves a rebase-merge dir that a
+    // blind retry would trip over). `clear_stale_rebase_state` above pre-clears
+    // that state, and the `Err` arm below already surfaces a failed abort.
     let status = std::process::Command::new("git")
         .args(["-c", "core.abbrev=7", "rebase", "-i", "origin/main"])
         .current_dir(worktree)
@@ -1288,11 +1328,7 @@ fn strip_known_trailers(body: &str) -> String {
 /// empty" behavior when body-detection fails — neutral fallback that
 /// does not block legitimate cleanups on transient git failures.
 fn commit_body_is_empty(worktree: &Path, hash: &str) -> bool {
-    let out = std::process::Command::new("git")
-        .args(["log", "-1", "--format=%b", hash])
-        .current_dir(worktree)
-        .env("AGEND_GIT_BYPASS", "1")
-        .output();
+    let out = run_git_idempotent(&["log", "-1", "--format=%b", hash], worktree);
     match out {
         Ok(o) if o.status.success() => {
             // #833: strip daemon-injected trailers before the empty

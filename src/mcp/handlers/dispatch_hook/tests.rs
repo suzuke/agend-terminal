@@ -1978,6 +1978,36 @@ fn clean_empty_init_commits_handles_50_interleaved_inits() {
     std::fs::remove_dir_all(_repo.parent().unwrap()).ok();
 }
 
+/// #1787: `run_git_idempotent` contract — succeeds on a good command, and on a
+/// persistent failure returns the FINAL non-success output (the retry loop
+/// terminates; no panic, no hang). The transient-recovery path is exercised by
+/// the windows CI on the real flaky `clean_empty_init_commits` git calls.
+#[test]
+fn run_git_idempotent_succeeds_and_surfaces_persistent_failure_1787() {
+    let tmp = std::env::temp_dir();
+    // Success on the first attempt — `git --version` needs no repo.
+    let ok = super::run_git_idempotent(&["--version"], &tmp).expect("git --version spawns");
+    assert!(ok.status.success(), "#1787: git --version must succeed");
+
+    // Persistent failure — a fresh empty dir is not a git repo, so `git status`
+    // fails every attempt; the helper must return the final non-success output.
+    let empty = tmp.join(format!(
+        "agend-1787-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&empty).expect("mkdir temp");
+    let bad = super::run_git_idempotent(&["status"], &empty).expect("git status spawns");
+    assert!(
+        !bad.status.success(),
+        "#1787: git status in a non-repo must fail after retries (loop terminates)"
+    );
+    std::fs::remove_dir_all(&empty).ok();
+}
+
 #[test]
 fn clean_empty_init_commits_clears_stale_dir_even_when_no_inits_to_drop() {
     // #814 edge case: stale rebase-merge dir survives a prior
