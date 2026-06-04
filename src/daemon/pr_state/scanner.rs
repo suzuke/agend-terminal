@@ -329,6 +329,11 @@ fn apply_gh_poll(home: &Path, dir: &Path, poller: &dyn gh_poll::GhPoller) {
                         );
                     }
                 }
+                // #1750-B4: piggyback remote-orphan branch GC on the poll just
+                // done — `prs` already carries every PR's {state, head_ref,
+                // merged_at}, so no second poller. Best-effort; never blocks the
+                // scanner.
+                super::remote_gc::gc_remote_orphans(&repo, &prs);
             }
             Err(e) => {
                 tracing::warn!(repo = %repo, error = %e, "#986 gh-poll failed");

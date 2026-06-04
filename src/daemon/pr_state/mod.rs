@@ -48,6 +48,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 pub mod gh_poll;
+mod remote_gc;
 mod scanner;
 pub use scanner::scan_and_emit;
 #[cfg(test)]
