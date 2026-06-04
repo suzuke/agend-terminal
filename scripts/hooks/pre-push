@@ -1,65 +1,113 @@
 #!/usr/bin/env bash
-# Pre-push hook: verify push claims against actual diff.
+# Pre-push hook. Two gates, in order:
 #
-# Reads push refs from stdin (standard git pre-push protocol), extracts
-# claim text from the latest commit's message trailer, and runs the
-# claim verifier via `cargo run --quiet --bin agend-terminal -- verify-push`.
+#   1. CI-parity  — run locally EXACTLY what the required CI Check runs, so a
+#                   push cannot pass this hook while failing CI.
+#   2. Claim-verify — verify push-claim trailers against the actual diff.
 #
-# Emergency override: `git push --no-verify`
+# Emergency override for both: `git push --no-verify` (a warning is echoed;
+# the daemon-side gate still applies, so override is not a free pass).
 #
-# The daemon-side API endpoint provides defense-in-depth — bypassing
-# this hook via --no-verify does not bypass the daemon gate.
+# Install / coexistence (see scripts/install-hooks.sh):
+#   Fleet agents push under a git whose `core.hooksPath` the daemon sets to
+#   `$AGEND_HOME/hooks` (src/binding.rs::install_hooks), where it writes ONLY
+#   `prepare-commit-msg` and does NOT clear the directory. install-hooks.sh
+#   copies THIS script into `$AGEND_HOME/hooks/pre-push` so it coexists and
+#   fires for agent pushes. If the daemon ever starts clearing that dir, this
+#   coexistence breaks — re-run install-hooks.sh (it is idempotent).
 
 set -euo pipefail
 
-# Locate repo root (works in worktrees too)
+# Repo root (works in worktrees too).
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 
-# Read push refs from stdin: <local ref> <local sha> <remote ref> <remote sha>
-while read -r local_ref local_sha remote_ref remote_sha; do
-    # Skip delete pushes
-    if [ "$local_sha" = "0000000000000000000000000000000000000000" ]; then
-        continue
-    fi
+# Capture the push refs from stdin ONCE so both gates can read them.
+# git pre-push protocol line: <local ref> <local sha> <remote ref> <remote sha>
+refs="$(cat)"
 
-    # Determine base: if remote_sha is zero (new branch), use merge-base with origin/main
-    if [ "$remote_sha" = "0000000000000000000000000000000000000000" ]; then
-        base=$(git merge-base origin/main "$local_sha" 2>/dev/null || echo "")
+ZERO="0000000000000000000000000000000000000000"
+
+# ── Gate 1: CI-parity (#t-ci-parity-prepush-guard) ──────────────────────────
+# Closes the recurring miss where an agent ran only `cargo test --bin` — which
+# SKIPS the `tests/` integration targets — declared CI-ready, and CI then
+# rejected the push: #1734 (stale "ready" string in tests/integration.rs),
+# #1735 (block_on invariant under tests/). The three commands below mirror
+# `.github/workflows/ci.yml` (fmt / clippy / `test --tests`) verbatim — by
+# definition the hook catches what CI catches, no more, no less.
+#
+# Gated to code pushes (src/ tests/ Cargo.* build.rs); a docs-only push skips
+# the (~1–3 min, cargo-incremental) build to keep latency down.
+ci_parity_needed=0
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+    [ -z "${local_sha:-}" ] && continue
+    [ "$local_sha" = "$ZERO" ] && continue # delete push
+    if [ "$remote_sha" = "$ZERO" ]; then
+        base="$(git merge-base origin/main "$local_sha" 2>/dev/null || echo "")"
+    else
+        base="$remote_sha"
+    fi
+    if [ -z "$base" ]; then
+        ci_parity_needed=1 # unknown range → run to be safe
+        break
+    fi
+    if git diff --name-only "$base" "$local_sha" -- \
+        src/ tests/ Cargo.toml Cargo.lock build.rs 2>/dev/null | grep -q .; then
+        ci_parity_needed=1
+        break
+    fi
+done <<<"$refs"
+
+if [ "$ci_parity_needed" = "1" ]; then
+    cd "$REPO_ROOT"
+    # DRY: delegate to the canonical preflight (fmt --check + clippy
+    # --all-targets --features tray + `cargo test --tests --features tray`),
+    # `--quick` to skip the slow Windows cross-check (CI's windows-latest is the
+    # backstop for that). Single source of the parity commands → the hook can
+    # never drift from CI / preflight.sh.
+    if [ -x scripts/preflight.sh ]; then
+        echo "pre-push: CI-parity via 'scripts/preflight.sh --quick' (mirrors CI's check job, host-only)…" >&2
+        if ! scripts/preflight.sh --quick; then
+            echo "pre-push: CI-parity FAILED — fix the above; this is exactly what CI will reject." >&2
+            echo "pre-push: (emergency only) 'git push --no-verify' bypasses the hook; CI still gates." >&2
+            exit 1
+        fi
+        echo "pre-push: CI-parity passed ✓" >&2
+    else
+        # Fail-OPEN (loud): don't block a push just because the repo-layer
+        # preflight script is missing/unexecutable — CI remains the backstop.
+        echo "pre-push: WARNING scripts/preflight.sh not found/executable — local CI-parity NOT enforced (CI still gates)." >&2
+    fi
+fi
+
+# ── Gate 2: claim-verify (per-ref) ──────────────────────────────────────────
+# Extract claim text from the latest commit's "Claim:" trailer only. Incidental
+# prose containing claim keywords must NOT trigger verification.
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+    [ -z "${local_sha:-}" ] && continue
+    [ "$local_sha" = "$ZERO" ] && continue
+
+    if [ "$remote_sha" = "$ZERO" ]; then
+        base="$(git merge-base origin/main "$local_sha" 2>/dev/null || echo "")"
         if [ -z "$base" ]; then
-            echo "pre-push: cannot determine base for new branch, skipping verification." >&2
+            echo "pre-push: cannot determine base for new branch, skipping claim verification." >&2
             continue
         fi
     else
         base="$remote_sha"
     fi
 
-    # Extract claim text from the latest commit's "Claim:" trailer only.
-    # Incidental prose containing claim keywords must NOT trigger verification.
-    commit_msg=$(git log -1 --format=%B "$local_sha")
-    claim_text=""
-
-    # Trailer-only: "Claim: <text>"
-    trailer=$(echo "$commit_msg" | grep -i '^Claim:' | sed 's/^[Cc]laim:[[:space:]]*//' || true)
-    if [ -n "$trailer" ]; then
-        claim_text="$trailer"
-    fi
-
-    # If no claim text found, skip verification (no claims to check)
-    if [ -z "$claim_text" ]; then
-        continue
-    fi
+    commit_msg="$(git log -1 --format=%B "$local_sha")"
+    claim_text="$(echo "$commit_msg" | grep -i '^Claim:' | sed 's/^[Cc]laim:[[:space:]]*//' || true)"
+    [ -z "$claim_text" ] && continue # no claims to check
 
     echo "pre-push: verifying claims for ${local_sha:0:7}..." >&2
-
-    # Run the claim verifier
     if ! echo "$claim_text" | cargo run --quiet --bin agend-terminal -- verify-push \
         --base "$base" --head "$local_sha" --claim-from-stdin; then
         echo "pre-push: claim verification FAILED — fix claims or amend diff." >&2
         echo "pre-push: use 'git push --no-verify' for emergency override." >&2
         exit 1
     fi
-
     echo "pre-push: claims verified ✓" >&2
-done
+done <<<"$refs"
 
 exit 0

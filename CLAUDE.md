@@ -41,9 +41,22 @@ A pre-commit hook at `.git/hooks/pre-commit` auto-formats staged `.rs` files
 and re-stages them. It does NOT run clippy — clippy is too slow for a
 pre-commit path. Run clippy yourself before `git push`.
 
-A pre-push hook verifies push claims (e.g. "no other changes", "deps
-unchanged") against the actual diff. Override with `git push --no-verify`
-in emergencies.
+The pre-push hook (`scripts/hooks/pre-push`) runs **two gates**:
+
+1. **CI-parity** (#t-ci-parity-prepush-guard) — on a push whose range touches
+   `src/` / `tests/` / `Cargo.*` / `build.rs`, it runs `scripts/preflight.sh
+   --quick` (the exact CI `check` commands: `cargo fmt --check`, `cargo clippy
+   --all-targets --features tray -- -D warnings`, `cargo test --tests --features
+   tray`) and **blocks the push if they fail**. This closes the recurring miss
+   where an agent ran only `cargo test --bin` — which SKIPS the `tests/`
+   integration targets — declared CI-ready, and CI then rejected it
+   (#1734 stale-string integration test, #1735 block_on invariant). Docs-only
+   pushes skip the build. `--quick` omits the Windows cross-check (CI's
+   `windows-latest` is the backstop for that).
+2. **claim-verify** — verifies `Claim:` trailers against the actual diff.
+
+Override either with `git push --no-verify` in emergencies (the daemon-side gate
+and CI still apply, so `--no-verify` is not a free pass).
 
 A post-merge hook triggers a background `cargo build --release` when `src/`
 files change. Desktop notification on completion. Does not auto-restart the
@@ -55,8 +68,18 @@ daemon — operator decides restart timing. Disable with
 Hooks are per-clone. After a fresh `git clone`, install with:
 
 ```bash
-scripts/install-hooks.sh
+scripts/install-hooks.sh   # idempotent — safe to re-run
 ```
+
+**Fleet-agent coexistence**: the daemon sets each managed worktree's
+`core.hooksPath` to `$AGEND_HOME/hooks` (`src/binding.rs::install_hooks`) and
+writes only `prepare-commit-msg` there — it does *not* clear the directory. So
+`install-hooks.sh` *copies* the tracked `pre-push` into `$AGEND_HOME/hooks/pre-push`,
+where it coexists and fires for agent pushes (one copy covers every current and
+future worktree, since they share that dir). Agent pushes DO run the hook: the
+`agend-git` shim and the `AGEND_GIT_BYPASS` path both `exec` real `git`, which
+honours `core.hooksPath`. This coexistence relies on the daemon not deleting
+`$AGEND_HOME/hooks/pre-push`; if that changes, re-run `install-hooks.sh`.
 
 ## Test fidelity: feed consumers the producer's real output (#1493)
 
