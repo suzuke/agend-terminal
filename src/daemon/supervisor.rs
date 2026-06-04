@@ -65,6 +65,18 @@ const RETRY_PHASE_C_START: u32 = 6;
 /// across the retry and ApiError-nudge paths (guards a ServerRateLimit↔ApiError
 /// state flicker from double-injecting).
 const CONTINUE_INJECT_MIN_INTERVAL: Duration = Duration::from_secs(5);
+/// #1742: consecutive ServerRateLimit `continue`-inject FAILURES (agent still
+/// present, but the PTY write erred) tolerated before giving up. A single failure
+/// is treated as a transient PTY blip that self-heals, so the track is KEPT and
+/// re-attempted next tick — only after this many back-to-back failures is the
+/// track exhausted (and only THEN via the full notification path). Before #1742 a
+/// single failed inject silently set `exhausted` with no operator/orchestrator
+/// notice, permanently disabling auto-recovery for a still-throttled agent.
+const MAX_INJECT_FAILURES: u32 = 3;
+/// #1742: short re-attempt delay after a transient inject failure (well below the
+/// Phase-A first backoff) so a recoverable PTY blip is retried promptly rather
+/// than waiting out the tiered backoff.
+const RETRY_AFTER_INJECT_FAIL: Duration = Duration::from_secs(5);
 /// Fixed payload injected on ServerRateLimit recovery retry.
 /// "continue\n" is a universal resume signal: all supported backends
 /// (ClaudeCode, KiroCli, Codex, OpenCode, Gemini, Agy) accept it as
@@ -139,6 +151,11 @@ pub(crate) struct RateLimitRetry {
     /// Set when max retries exceeded — prevents re-triggering on same
     /// persistent ServerRateLimit state. Cleared on recovery (Idle).
     pub exhausted: bool,
+    /// #1742: consecutive `continue`-inject failures while the agent is STILL
+    /// present (PTY write erred). Reset to 0 on a successful inject. Only when it
+    /// reaches `MAX_INJECT_FAILURES` is the track exhausted — and then via the
+    /// full notification path, never silently.
+    pub inject_failures: u32,
 }
 
 /// Parse unlock time from usage_limit pane output (e.g., "resets at 15:14 UTC").
@@ -1245,14 +1262,32 @@ fn notify_orchestrator_retry_exhausted(home: &std::path::Path, name: &str, retri
     );
 }
 
+/// #1742: outcome of a `continue`-inject attempt. Distinguishes the agent having
+/// VANISHED (snap=None — resolve_uuid / registry miss → nobody to inject into,
+/// reaped next tick, harmless) from a TRANSIENT inject failure (agent present but
+/// the PTY write erred → worth retrying). Before #1742 both collapsed to `false`
+/// and silently exhausted the retry track.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InjectOutcome {
+    Injected,
+    AgentGone,
+    InjectFailed,
+}
+
 /// #1696/#1697: snapshot the inject target under the registry lock (released
 /// BEFORE the blocking PTY write — #1530/F1), then inject the fixed `continue`
 /// payload **gated by the operator-draft check** (#1680: `force=false` →
 /// `should_defer_direct_inject` defers while the operator is typing instead of
 /// clobbering their half-typed draft; a deferral is enqueued and counts as
-/// handled). Returns true on a successful inject OR deferral. Shared by the
-/// ServerRateLimit retry path and the ApiError quick-nudge.
-fn inject_continue_gated(home: &std::path::Path, registry: &AgentRegistry, name: &str) -> bool {
+/// handled — so a deferral reports `Injected`). Shared by the ServerRateLimit
+/// retry path and the ApiError quick-nudge. #1742: returns a 3-state
+/// `InjectOutcome` (was `bool`) so the caller can keep retrying a transient PTY
+/// failure instead of silently giving up.
+fn inject_continue_gated(
+    home: &std::path::Path,
+    registry: &AgentRegistry,
+    name: &str,
+) -> InjectOutcome {
     let snap = {
         let reg = agent::lock_registry(registry);
         crate::fleet::resolve_uuid(home, name)
@@ -1261,9 +1296,33 @@ fn inject_continue_gated(home: &std::path::Path, registry: &AgentRegistry, name:
     };
     match snap {
         Some(tgt) => {
-            agent::inject_with_target_gated(&tgt, name, CONTINUE_RETRY_PAYLOAD, false).is_ok()
+            if agent::inject_with_target_gated(&tgt, name, CONTINUE_RETRY_PAYLOAD, false).is_ok() {
+                InjectOutcome::Injected
+            } else {
+                InjectOutcome::InjectFailed
+            }
         }
-        None => false,
+        None => InjectOutcome::AgentGone,
+    }
+}
+
+/// #1742 (pure, unit-tested): given the running count of consecutive inject
+/// failures (after incrementing for the current failure), decide whether to give
+/// up (`Exhaust`) or keep the track and re-attempt next tick (`RetrySoon`). A
+/// transient PTY blip (fewer than `MAX_INJECT_FAILURES`) self-heals, so we
+/// retry; only a sustained run of failures exhausts — and the caller routes that
+/// through the FULL notification path (never silent).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InjectFailAction {
+    Exhaust,
+    RetrySoon,
+}
+
+fn classify_inject_failure(consecutive_failures: u32) -> InjectFailAction {
+    if consecutive_failures >= MAX_INJECT_FAILURES {
+        InjectFailAction::Exhaust
+    } else {
+        InjectFailAction::RetrySoon
     }
 }
 
@@ -1308,6 +1367,7 @@ pub(crate) fn process_error_recovery(
                         retry_count: 0,
                         next_retry_at: now + delay,
                         exhausted: false,
+                        inject_failures: 0,
                     }
                 });
                 // Due + not exhausted + outside the anti-thrash MIN_INTERVAL (guards a
@@ -1396,20 +1456,71 @@ pub(crate) fn process_error_recovery(
             tracing::info!(agent = %name, "ServerRateLimit: entering retry Phase C (sustained 10-min retry)");
         }
 
-        if inject_continue_gated(home, registry, name) {
-            last_continue_inject.insert(name.clone(), Instant::now());
-            tracing::info!(
-                agent = %name,
-                retry = retry.retry_count,
-                "ServerRateLimit: injected \"continue\" (attempt {})",
-                retry.retry_count
-            );
-            let idx = (retry.retry_count as usize).min(SERVER_RATE_LIMIT_BACKOFF.len() - 1);
-            retry.next_retry_at =
-                Instant::now() + Duration::from_secs(SERVER_RATE_LIMIT_BACKOFF[idx]);
-        } else {
-            tracing::warn!(agent = %name, "ServerRateLimit: inject failed (agent gone?)");
-            retry.exhausted = true;
+        match inject_continue_gated(home, registry, name) {
+            InjectOutcome::Injected => {
+                retry.inject_failures = 0; // #1742: a success clears the failure streak
+                last_continue_inject.insert(name.clone(), Instant::now());
+                tracing::info!(
+                    agent = %name,
+                    retry = retry.retry_count,
+                    "ServerRateLimit: injected \"continue\" (attempt {})",
+                    retry.retry_count
+                );
+                let idx = (retry.retry_count as usize).min(SERVER_RATE_LIMIT_BACKOFF.len() - 1);
+                retry.next_retry_at =
+                    Instant::now() + Duration::from_secs(SERVER_RATE_LIMIT_BACKOFF[idx]);
+            }
+            InjectOutcome::AgentGone => {
+                // #1742: the agent vanished between the Phase-1 decision and here —
+                // nobody to inject into. The `retain` at the top of the NEXT tick
+                // reaps the track (agent no longer in the registry), so do NOT
+                // exhaust or notify (harmless). Roll back the attempt the top of
+                // the loop pre-counted so `retry_count` stays "successful injects".
+                retry.retry_count -= 1;
+                tracing::debug!(agent = %name, "ServerRateLimit: agent gone before inject — track reaped next tick");
+            }
+            InjectOutcome::InjectFailed => {
+                // #1742: the agent is STILL present but the PTY write erred. Do NOT
+                // silently exhaust (the bug) — roll back the pre-counted attempt so a
+                // failure never burns the tiered budget, bump the consecutive-failure
+                // counter, and retry next tick after a short delay. Only after
+                // MAX_INJECT_FAILURES back-to-back failures do we give up — and then
+                // via the FULL notification path (orchestrator inbox + operator
+                // Telegram), never silently.
+                retry.retry_count -= 1;
+                retry.inject_failures += 1;
+                tracing::warn!(
+                    agent = %name,
+                    failures = retry.inject_failures,
+                    "ServerRateLimit: inject failed (agent present, transient PTY error?) — will retry"
+                );
+                match classify_inject_failure(retry.inject_failures) {
+                    InjectFailAction::RetrySoon => {
+                        retry.next_retry_at = now + RETRY_AFTER_INJECT_FAIL;
+                    }
+                    InjectFailAction::Exhaust => {
+                        retry.exhausted = true;
+                        notify_orchestrator_retry_exhausted(home, name, retry.retry_count);
+                        if let Some(ch) = crate::channel::active_channel() {
+                            let msg = format!(
+                                "⚠️ {name} ServerRateLimit auto-retry inject 連續失敗 {} 次、已放棄 — agent 可能 unreachable,需人工介入(檢查 pane / 重啟 / 重新指派)。",
+                                retry.inject_failures
+                            );
+                            // #1742: same Error severity + same Sleep-penetrating gate as
+                            // the budget-exhausted alert (#1595 Step 1) — a stuck agent
+                            // whose auto-recovery cannot even deliver `continue` is the
+                            // same P0 that must wake a sleeping operator.
+                            let _ = crate::channel::gated_notify(
+                                ch.as_ref(),
+                                name,
+                                NotifySeverity::Error,
+                                &msg,
+                                false,
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1422,7 +1533,10 @@ pub(crate) fn process_error_recovery(
         {
             continue;
         }
-        if inject_continue_gated(home, registry, &name) {
+        // #1742: the ApiError nudge is per-episode best-effort (not budgeted), so only
+        // a genuine `Injected` marks the episode + stamps the interval; AgentGone /
+        // InjectFailed leave it un-nudged to re-attempt next tick.
+        if inject_continue_gated(home, registry, &name) == InjectOutcome::Injected {
             apierror_episodes.insert(name.clone());
             last_continue_inject.insert(name.clone(), Instant::now());
             tracing::info!(agent = %name, "#1697: ApiError-at-prompt quick-nudge — injected \"continue\"");
@@ -1525,6 +1639,7 @@ mod tests {
             retry_count: 0,
             next_retry_at: Instant::now(),
             exhausted: false,
+            inject_failures: 0,
         }
     }
 
@@ -2523,6 +2638,7 @@ instances:
             retry_count: super::SERVER_RATE_LIMIT_MAX_RETRIES,
             next_retry_at: std::time::Instant::now(),
             exhausted: false,
+            inject_failures: 0,
         };
         retry.retry_count += 1;
         assert!(
@@ -2667,6 +2783,7 @@ instances:
                 retry_count: 1,
                 next_retry_at: Instant::now(),
                 exhausted: false,
+                inject_failures: 0,
             },
         );
 
@@ -2745,6 +2862,7 @@ instances:
                 retry_count: 1,
                 next_retry_at: Instant::now(), // due now
                 exhausted: false,
+                inject_failures: 0,
             },
         );
         let (handle, _reader) =
@@ -2793,6 +2911,7 @@ instances:
                 retry_count: 1,
                 next_retry_at: Instant::now() + Duration::from_secs(3600),
                 exhausted: false,
+                inject_failures: 0,
             },
         );
         let (handle, _reader) =
@@ -2843,6 +2962,7 @@ instances:
                 retry_count: 0,
                 next_retry_at: Instant::now() - Duration::from_secs(1),
                 exhausted: false,
+                inject_failures: 0,
             },
         );
 
@@ -2879,6 +2999,7 @@ instances:
                 retry_count: 4,
                 next_retry_at: std::time::Instant::now(),
                 exhausted: true,
+                inject_failures: 0,
             },
         );
         assert!(tracks.contains_key("agent-loop"));
@@ -2899,6 +3020,7 @@ instances:
                 retry_count: 1,
                 next_retry_at: Instant::now() + Duration::from_secs(60),
                 exhausted: false,
+                inject_failures: 0,
             },
         );
 
@@ -2949,6 +3071,7 @@ instances:
                 retry_count: super::SERVER_RATE_LIMIT_MAX_RETRIES,
                 next_retry_at: Instant::now() - Duration::from_secs(1),
                 exhausted: false,
+                inject_failures: 0,
             },
         );
 
@@ -2973,6 +3096,140 @@ instances:
         std::fs::remove_dir_all(&home).ok();
     }
 
+    // ── #1742: ServerRateLimit inject-failure handling (no silent exhaust) ──
+
+    /// #1742 (pure): a transient inject failure self-heals, so fewer than
+    /// `MAX_INJECT_FAILURES` consecutive failures keep retrying; only the Nth
+    /// back-to-back failure exhausts (and the caller routes THAT through the full
+    /// notification path). This is the unit gate for the InjectFailed branch,
+    /// which is otherwise hard to drive (a PTY write failing while the agent is
+    /// still present can't be cheaply mocked) — see PR notes.
+    #[test]
+    fn classify_inject_failure_exhausts_only_after_max_1742() {
+        use super::{classify_inject_failure, InjectFailAction, MAX_INJECT_FAILURES};
+        assert_eq!(
+            MAX_INJECT_FAILURES, 3,
+            "design-pinned: give up after 3 fails"
+        );
+        for n in 0..MAX_INJECT_FAILURES {
+            assert_eq!(
+                classify_inject_failure(n),
+                InjectFailAction::RetrySoon,
+                "#1742: {n} consecutive failures (< {MAX_INJECT_FAILURES}) must keep retrying, not exhaust"
+            );
+        }
+        for n in MAX_INJECT_FAILURES..(MAX_INJECT_FAILURES + 3) {
+            assert_eq!(
+                classify_inject_failure(n),
+                InjectFailAction::Exhaust,
+                "#1742: {n} consecutive failures (>= {MAX_INJECT_FAILURES}) must exhaust"
+            );
+        }
+    }
+
+    /// #1742 regression (the silent-drop bug): a due ServerRateLimit track whose
+    /// inject hits `AgentGone` (the agent vanished between the Phase-1 decision and
+    /// the Phase-2 PTY write — here modelled by an unresolvable name: in the
+    /// registry but absent from fleet.yaml, so `resolve_uuid` returns None) must
+    /// NOT be marked exhausted and must NOT consume a retry. The track is left for
+    /// the next-tick `retain` to reap. Pre-#1742 this set `exhausted=true` with a
+    /// bare warn — permanently disabling auto-recovery with no notification.
+    #[test]
+    fn srl_inject_agent_gone_does_not_exhaust_1742() {
+        let home = tmp_home("1742-agent-gone");
+        // Registry has the agent in ServerRateLimit, but NO fleet.yaml mapping →
+        // Phase 1 schedules it (it iterates the registry directly), Phase 2's
+        // resolve_uuid misses → InjectOutcome::AgentGone.
+        let (handle, _reader) =
+            mock_agent_handle("gone-x", crate::state::AgentState::ServerRateLimit);
+        let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        registry.lock().insert(handle.id, handle);
+
+        let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
+        tracks.insert(
+            "gone-x".to_string(),
+            RateLimitRetry {
+                retry_count: 2,
+                next_retry_at: Instant::now() - Duration::from_secs(1), // due
+                exhausted: false,
+                inject_failures: 0,
+            },
+        );
+        let mut last_inject: HashMap<String, Instant> = HashMap::new();
+        super::process_error_recovery(
+            &home,
+            &registry,
+            &mut tracks,
+            &mut Default::default(),
+            &mut last_inject,
+        );
+
+        let t = tracks
+            .get("gone-x")
+            .expect("#1742: track must survive an AgentGone tick (reaped only once the agent leaves the registry)");
+        assert!(
+            !t.exhausted,
+            "#1742: AgentGone must NOT silently exhaust the retry track"
+        );
+        assert_eq!(
+            t.retry_count, 2,
+            "#1742: a no-op AgentGone tick must roll back the pre-counted attempt (retry_count == successful injects)"
+        );
+        assert!(
+            t.inject_failures == 0,
+            "#1742: AgentGone is not a present-agent inject failure → no failure-streak bump"
+        );
+        assert!(
+            last_inject.is_empty(),
+            "#1742: nothing was injected (no PTY write happened)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1742: a SUCCESSFUL inject clears any accumulated failure streak and
+    /// advances the tiered budget — so a recovered PTY blip doesn't leave the
+    /// track one failure away from giving up. Unix-only (mirrors the other PTY
+    /// inject tests: the Windows mock PTY doesn't accept the write the same way).
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn srl_successful_inject_resets_failure_streak_1742() {
+        let (home, registry, _reader) = one_agent_registry(
+            "ok-x",
+            crate::state::AgentState::ServerRateLimit,
+            "1742-reset-streak",
+        );
+        let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
+        tracks.insert(
+            "ok-x".to_string(),
+            RateLimitRetry {
+                retry_count: 1,
+                next_retry_at: Instant::now() - Duration::from_secs(1), // due
+                exhausted: false,
+                inject_failures: 2, // one short of MAX_INJECT_FAILURES
+            },
+        );
+        super::process_error_recovery(
+            &home,
+            &registry,
+            &mut tracks,
+            &mut Default::default(),
+            &mut Default::default(),
+        );
+        let t = tracks
+            .get("ok-x")
+            .expect("track persists after a successful inject");
+        assert!(!t.exhausted, "#1742: a successful inject must not exhaust");
+        assert_eq!(
+            t.inject_failures, 0,
+            "#1742: a successful inject must reset the consecutive-failure streak"
+        );
+        assert_eq!(
+            t.retry_count, 2,
+            "#1742: a real inject advances the tiered budget (1 → 2)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     #[test]
     fn retry_resumes_after_recovery_then_new_failure() {
         let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
@@ -2982,6 +3239,7 @@ instances:
                 retry_count: 4,
                 next_retry_at: std::time::Instant::now(),
                 exhausted: true,
+                inject_failures: 0,
             },
         );
         tracks.remove("agent-recover");
@@ -2992,6 +3250,7 @@ instances:
                 retry_count: 0,
                 next_retry_at: std::time::Instant::now(),
                 exhausted: false,
+                inject_failures: 0,
             },
         );
         assert_eq!(tracks["agent-recover"].retry_count, 0);
@@ -3007,6 +3266,7 @@ instances:
                 retry_count: 1,
                 next_retry_at: std::time::Instant::now(),
                 exhausted: false,
+                inject_failures: 0,
             },
         );
         for _ in 0..30 {
@@ -3319,6 +3579,7 @@ instances:
                 retry_count: 4,
                 next_retry_at: Instant::now(),
                 exhausted: false,
+                inject_failures: 0,
             },
         );
         let mut last_inject: HashMap<String, Instant> = HashMap::new();
