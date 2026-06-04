@@ -75,6 +75,104 @@ fn setup_test_repo(home: &std::path::Path, agent: &str) -> std::path::PathBuf {
     repo
 }
 
+/// #1755: `ensure_branch_exists` must REFRESH a remote-tracking `from_ref`
+/// (`origin/main`) before creating a new branch — otherwise a fresh checkout
+/// starts on a stale local ref and silently reverse-reverts merges that landed
+/// since the last fetch. Uses a REAL local bare origin (unlike `setup_test_repo`
+/// whose `file:///dev/null` origin makes fetch fast-fail) so the fetch actually
+/// advances `refs/remotes/origin/main`.
+#[test]
+fn ensure_branch_exists_refreshes_stale_origin_before_create_1755() {
+    let home = std::env::temp_dir().join(format!("agend-1755-freshbase-{}", std::process::id()));
+    std::fs::create_dir_all(&home).ok();
+    let workspace = crate::paths::workspace_dir(&home);
+    std::fs::create_dir_all(&workspace).ok();
+    let origin = workspace.join("o.git");
+    let repo = workspace.join("agent");
+
+    let git = |args: &[&str], dir: &std::path::Path| -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git spawn");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    // Bare origin + a source repo wired to it.
+    std::fs::create_dir_all(&origin).ok();
+    git(&["init", "--bare", "-b", "main"], &origin);
+    std::fs::create_dir_all(&repo).ok();
+    git(&["init", "-b", "main"], &repo);
+    git(
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+        &repo,
+    );
+    git(
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "A",
+        ],
+        &repo,
+    );
+    let sha_a = git(&["rev-parse", "HEAD"], &repo);
+    git(&["push", "-q", "origin", "main"], &repo);
+
+    // Advance origin/main to B, then force the LOCAL remote-tracking ref STALE
+    // back to A — simulating "someone merged after my last fetch".
+    git(
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "B",
+        ],
+        &repo,
+    );
+    let sha_b = git(&["rev-parse", "HEAD"], &repo);
+    git(&["push", "-q", "origin", "main"], &repo);
+    git(&["update-ref", "refs/remotes/origin/main", &sha_a], &repo);
+    assert_ne!(sha_a, sha_b);
+    assert_eq!(
+        git(&["rev-parse", "refs/remotes/origin/main"], &repo),
+        sha_a,
+        "precondition: local origin/main must be STALE at A"
+    );
+
+    // The fix: fetch (origin/main → B) BEFORE creating, so the new branch lands
+    // on FRESH main (B), not the stale local ref (A).
+    let (created, fetched) =
+        super::ensure_branch_exists(&home, &repo, "feat/x-1755", "origin/main", "agent")
+            .expect("ensure_branch_exists ok");
+    assert!(created, "branch must be auto-created");
+    assert!(
+        fetched,
+        "#1755: must fetch (real origin reachable) before create"
+    );
+    assert_eq!(
+        git(&["rev-parse", "refs/heads/feat/x-1755"], &repo),
+        sha_b,
+        "#1755: new branch must base on FRESH origin/main (B), not the stale local ref (A)"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 #[test]
 fn dispatch_with_branch_creates_binding_and_worktree() {
     let home = std::env::temp_dir().join(format!("agend-s53-prod-{}-bind", std::process::id()));

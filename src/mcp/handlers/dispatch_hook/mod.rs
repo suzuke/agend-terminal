@@ -688,10 +688,38 @@ pub(crate) fn ensure_branch_exists(
         }
         return Ok((false, fetched_ok));
     }
-    // Step 2: try create from `from_ref` (no fetch yet — zero network
-    // on the fast path where origin/main is already a valid local ref).
+    // Step 2: create from `from_ref`. #1755: a remote-tracking `from_ref` like
+    // `origin/main` ALWAYS resolves as a local ref, so a bare `git branch` here
+    // silently bases the new branch on a STALE local ref (whatever was last
+    // fetched) — the reverse-revert hazard where a fresh checkout starts behind
+    // main and would clobber merges that landed since. Refresh the remote ref
+    // FIRST (mirrors the #869 branch-EXISTS path above) so the create lands on
+    // current `origin/<x>`. Best-effort: a fetch failure (offline / no-remote
+    // fixture) leaves the local ref as-is and the create still succeeds against
+    // whatever's present (degraded but functional, same contract as #869).
+    // `fetch_attempted` reports SUCCESS (matches #869's `fetched_ok`), so the
+    // no-remote test fixtures keep reporting `false`.
+    let mut create_fetched = false;
+    if let Some(remote_branch) = from_ref.strip_prefix("origin/") {
+        let fetch_start = std::time::Instant::now();
+        let fetch_out = crate::git_helpers::git_bypass_timeout(
+            source,
+            &["fetch", "origin", remote_branch, "--quiet"],
+            std::time::Duration::from_secs(60),
+        );
+        create_fetched = matches!(&fetch_out, Ok(o) if o.status.success());
+        crate::event_log::log(
+            home,
+            "ensure_branch_fetch",
+            actor,
+            &format!(
+                "branch={branch} from_ref={from_ref} duration_ms={} ok={create_fetched} (#1755 pre-create refresh)",
+                fetch_start.elapsed().as_millis()
+            ),
+        );
+    }
     match crate::git_helpers::git_bypass(source, &["branch", branch, from_ref]) {
-        Ok(o) if o.status.success() => Ok((true, false)),
+        Ok(o) if o.status.success() => Ok((true, create_fetched)),
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr).to_string();
             if stderr.contains("already exists") {
