@@ -1075,10 +1075,38 @@ fn pane_from_menu_item(
     }
 }
 
+/// #1762: does this forwarded keystroke ENTER the agent's input buffer
+/// (text-composing), as opposed to NAVIGATE / CONTROL (arrows, F-keys, Esc,
+/// Ctrl-combos, Tab, Backspace)? Only composing input should mark a draft
+/// (#1457/#1675 draft-gating); navigation/control must NOT, or an idle operator
+/// who merely browses history (Up/Down) or fat-fingers a non-text key traps every
+/// actionable inject (task dispatch / ci-ready) behind the ~5min draft escape
+/// window — exactly when away (the #1762 report).
+///
+/// Composing = at least one byte that enters the buffer: a non-space printable
+/// (`> 0x20`, excluding DEL `0x7f`) or any UTF-8 continuation/lead byte
+/// (`>= 0x80`). Deliberately NON-composing: ESC-prefixed sequences (arrows /
+/// F-keys / Esc / Alt-combos — `key_to_bytes` encodes every nav key with a `0x1b`
+/// lead), bare control bytes (Ctrl-combos, `Tab`=`\t`, `Backspace`=`0x7f`, and
+/// `Enter`=`\r`/`\n` — Enter is the separately-detected SUBMIT signal), and lone
+/// whitespace (the fat-fingered-space case — a real draft always carries a
+/// non-space char that marks it, so #1675 protection is preserved). EXCEPTION:
+/// bracketed paste (`ESC [ 200 ~`) wraps PASTED TEXT and IS composing.
+fn is_text_composing_input(bytes: &[u8]) -> bool {
+    if bytes.first() == Some(&0x1b) {
+        return bytes.starts_with(b"\x1b[200~");
+    }
+    bytes.iter().any(|&b| (b > 0x20 && b != 0x7f) || b >= 0x80)
+}
+
 /// Write bytes to the focused pane's PTY (Local) or remote bridge (Remote).
 fn write_to_focused(home: &Path, layout: &mut Layout, registry: &AgentRegistry, bytes: &[u8]) {
     if let Some(pane) = layout.active_tab_mut().and_then(|t| t.focused_pane_mut()) {
-        notification_queue::record_input_activity(home, &pane.agent_name);
+        // #1762: only text-composing input marks a draft — navigation / control
+        // keys (and lone whitespace) must not defer actionable injects.
+        if is_text_composing_input(bytes) {
+            notification_queue::record_input_activity(home, &pane.agent_name);
+        }
         // Sprint 54 P2-3: backend-aware submit detection (claude-first
         // allowlist). When the keystroke buffer contains the agent's
         // submit key (`\r` for claude, also matches paste-with-newlines
@@ -1112,7 +1140,10 @@ fn write_to_pane(
         .active_tab_mut()
         .and_then(|t| t.root_mut().find_pane_mut(pane_id))
     {
-        notification_queue::record_input_activity(home, &pane.agent_name);
+        // #1762: only text-composing input marks a draft (see `write_to_focused`).
+        if is_text_composing_input(bytes) {
+            notification_queue::record_input_activity(home, &pane.agent_name);
+        }
         if pane_input_contains_submit(pane.backend.as_ref(), bytes) {
             notification_queue::record_submit_activity(home, &pane.agent_name);
         }
@@ -1641,6 +1672,92 @@ mod tests {
             "fresh pane must respect disk compose state"
         );
         assert_eq!(pane.pending_notification_count, 1);
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // #1762: draft detection — only text-composing input marks a draft
+    // -----------------------------------------------------------------------
+
+    /// #1762: navigation / control keys + lone whitespace are NOT text-composing
+    /// (they must not defer actionable injects), while real character input,
+    /// UTF-8, and bracketed paste ARE (so #1675 still protects a live draft).
+    /// Byte forms mirror `tui::key_to_bytes`.
+    #[test]
+    fn is_text_composing_input_excludes_nav_control_whitespace_1762() {
+        // Navigation / control (ESC-prefixed) → NOT composing.
+        for seq in [
+            &b"\x1b[A"[..], // Up
+            b"\x1b[B",      // Down
+            b"\x1b[C",      // Right
+            b"\x1b[D",      // Left
+            b"\x1b[H",      // Home
+            b"\x1b[F",      // End
+            b"\x1b[5~",     // PageUp
+            b"\x1b[6~",     // PageDown
+            b"\x1b[3~",     // Delete
+            b"\x1b[Z",      // Shift+Tab (BackTab, if ever forwarded)
+            b"\x1bOP",      // F1
+            b"\x1b",        // Esc
+            b"\x1ba",       // Alt+a
+        ] {
+            assert!(
+                !is_text_composing_input(seq),
+                "ESC-seq {seq:?} must NOT be text-composing"
+            );
+        }
+        // Bare control bytes → NOT composing.
+        assert!(!is_text_composing_input(&[0x01])); // Ctrl+A
+        assert!(!is_text_composing_input(b"\t")); // Tab
+        assert!(!is_text_composing_input(&[0x7f])); // Backspace (DEL)
+        assert!(!is_text_composing_input(b"\r")); // Enter (submit — counted separately)
+        assert!(!is_text_composing_input(b"\n")); // Shift+Enter
+                                                  // Lone whitespace → NOT composing (#1762 fat-fingered space).
+        assert!(!is_text_composing_input(b" "));
+        assert!(!is_text_composing_input(b"   "));
+        assert!(!is_text_composing_input(&[])); // empty
+
+        // Real character input → IS composing.
+        assert!(is_text_composing_input(b"a"));
+        assert!(is_text_composing_input(b"hello"));
+        assert!(is_text_composing_input(b"hi there")); // space among text still composing
+        assert!(is_text_composing_input("café".as_bytes())); // UTF-8
+        assert!(is_text_composing_input("日本語".as_bytes())); // multibyte
+                                                               // Bracketed paste wraps PASTED TEXT → composing.
+        assert!(is_text_composing_input(b"\x1b[200~pasted\x1b[201~"));
+    }
+
+    /// #1762 behavioral contract: exercising the exact gate `write_to_focused`
+    /// applies (`if is_text_composing_input(bytes) { record_input_activity }`),
+    /// a navigation key leaves the pane Clean (actionable injects NOT deferred),
+    /// while real typing marks it Drafting (#1675 still protects a live draft).
+    /// (`write_to_focused` itself needs a PTY-backed Layout; the wiring is the
+    /// 3-line gate, exercised here against the real predicate + draft_state.)
+    #[test]
+    fn nav_key_does_not_defer_but_typing_does_1762() {
+        let home = tmp_home("1762-behavior");
+        let agent = "agent1";
+
+        // (a) operator browses history with Up while idle → gate skips → no draft.
+        let up = b"\x1b[A";
+        if is_text_composing_input(up) {
+            notification_queue::record_input_activity(&home, agent);
+        }
+        assert_eq!(
+            notification_queue::draft_state(&home, agent),
+            notification_queue::DraftState::None,
+            "#1762: a nav key must NOT mark a draft → actionable notif not deferred"
+        );
+
+        // (b) operator types real text → gate records → draft present (deferred).
+        if is_text_composing_input(b"hello") {
+            notification_queue::record_input_activity(&home, agent);
+        }
+        assert_eq!(
+            notification_queue::draft_state(&home, agent),
+            notification_queue::DraftState::Drafting,
+            "#1762: real typing still marks a draft (#1675 preserved)"
+        );
         std::fs::remove_dir_all(home).ok();
     }
 
