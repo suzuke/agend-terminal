@@ -1491,7 +1491,9 @@ mod tests {
         // result so the run log shows the handshake completed.
         match outcome {
             Ok(_) => eprintln!("TLS smoke: handshake + request OK (gateway responded)"),
-            Err(e) => eprintln!("TLS smoke: handshake OK, request returned (expected w/o token): {e}"),
+            Err(e) => {
+                eprintln!("TLS smoke: handshake OK, request returned (expected w/o token): {e}")
+            }
         }
     }
 
