@@ -9,6 +9,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 /// Returns true unless `AGEND_WORKTREE_AUTO_CLEANUP` is explicitly set to "0".
 /// Cleanup is on by default — set `AGEND_WORKTREE_AUTO_CLEANUP=0` to disable.
@@ -247,9 +248,47 @@ pub fn sweep_from_registry(
     removed
 }
 
+/// #1750-B3: minimum branch-tip age before the SQUASH-merged path will auto-GC
+/// a branch. The `--merged`/remote-gone signals are definitive and need no age
+/// belt, but the cherry/tree-diff squash detection is heuristic — a young branch
+/// that happens to be tree-equal to main (or a PR merged moments ago that a
+/// human may still follow up on locally) is left for a later tick. A
+/// genuinely-orphaned squash-merged branch's tip predates the merge, so it
+/// clears this floor on the next sweep.
+const SQUASH_GC_MIN_TIP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// #1750-B3: age of `branch`'s tip commit (committer date), or `None` if it
+/// can't be resolved. `%ct` is a unix timestamp (seconds), so no date parsing.
+fn branch_tip_age(repo_root: &Path, branch: &str) -> Option<Duration> {
+    let out = Command::new("git")
+        .args(["log", "-1", "--format=%ct", branch])
+        .current_dir(repo_root)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let ts: u64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some(Duration::from_secs(now.saturating_sub(ts)))
+}
+
+/// #1750-B3: is `branch` a squash-merge orphan eligible for auto-GC? True when
+/// it is squash-merged into the default branch AND its tip is older than
+/// [`SQUASH_GC_MIN_TIP_AGE`]. Reuses `branch_sweep`'s detection (git cherry +
+/// #1280 tree-diff fallback) so the auto path matches the operator sweep.
+fn is_squash_gc_eligible(repo_root: &Path, branch: &str, default: &str) -> bool {
+    crate::branch_sweep::is_squash_merged(repo_root, default, branch)
+        && branch_tip_age(repo_root, branch).is_some_and(|age| age >= SQUASH_GC_MIN_TIP_AGE)
+}
+
 /// Run `git worktree prune` then delete local branches whose remote tracking
-/// ref is gone or that are merged into main. Skips branches checked out in
-/// any worktree.
+/// ref is gone, that are merged into main, or that are squash-merge orphans
+/// (#1750-B3). Skips branches checked out in any worktree.
 fn prune_orphaned_branches(repo_root: &Path) -> Vec<String> {
     let default = crate::git_helpers::default_branch(repo_root);
     // Collect branches currently checked out in worktrees — cannot delete these
@@ -279,7 +318,11 @@ fn prune_orphaned_branches(repo_root: &Path) -> Vec<String> {
         }
         let merged = is_branch_merged(repo_root, branch);
         let gone = is_remote_gone(repo_root, branch);
-        if !merged && !gone {
+        // #1750-B3: also reap squash-merge orphans (the 95/99 case the
+        // squash-blind `--merged` missed) — gated on tip-age for the heuristic
+        // squash detection only.
+        let squash = !merged && !gone && is_squash_gc_eligible(repo_root, branch, &default);
+        if !merged && !gone && !squash {
             continue;
         }
         let ok = Command::new("git")
@@ -290,11 +333,14 @@ fn prune_orphaned_branches(repo_root: &Path) -> Vec<String> {
             .map(|o| o.status.success())
             .unwrap_or(false);
         if ok {
-            tracing::info!(
-                branch,
-                reason = if merged { "merged" } else { "remote-gone" },
-                "pruned orphaned branch"
-            );
+            let reason = if merged {
+                "merged"
+            } else if gone {
+                "remote-gone"
+            } else {
+                "squash-merged"
+            };
+            tracing::info!(branch, reason, "pruned orphaned branch");
             pruned.push(branch.clone());
         }
     }
@@ -575,5 +621,136 @@ mod tests {
         std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
         std::fs::remove_dir_all(&repo).ok();
         std::fs::remove_dir_all(&remote_dir).ok();
+    }
+
+    // ── #1750-B3: local squash-merge orphan auto-GC ──
+
+    /// Commit like `git_in`'s commit but with a fixed author+committer DATE, so
+    /// `branch_tip_age` is deterministic regardless of wall-clock.
+    fn git_commit_dated(dir: &Path, msg: &str, date: &str) {
+        Command::new("git")
+            .args(["commit", "-m", msg])
+            .current_dir(dir)
+            .env("AGEND_GIT_BYPASS", "1")
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .env("GIT_AUTHOR_DATE", date)
+            .env("GIT_COMMITTER_DATE", date)
+            .output()
+            .expect("dated commit");
+    }
+
+    /// Build a LOCAL squash-merge orphan: `branch` carries `feat.txt`, then main
+    /// diverges (`other.txt`) and cherry-picks `branch`'s patch — so `branch` is
+    /// NOT a `--merged` ancestor (different SHA) but IS squash-merged (git cherry
+    /// shows `-`). `branch`'s tip is committed at `tip_date`.
+    fn make_squash_orphan(repo: &Path, branch: &str, tip_date: &str) {
+        git_in(repo, &["checkout", "-b", branch]);
+        std::fs::write(repo.join("feat.txt"), "feature").ok();
+        git_in(repo, &["add", "."]);
+        git_commit_dated(repo, "feature work", tip_date);
+        git_in(repo, &["checkout", "main"]);
+        // Diverge main on a DIFFERENT file so the cherry-pick applies cleanly.
+        std::fs::write(repo.join("other.txt"), "main-side").ok();
+        git_in(repo, &["add", "."]);
+        git_in(repo, &["commit", "-m", "main diverge"]);
+        git_in(repo, &["cherry-pick", branch]);
+    }
+
+    #[test]
+    fn prune_squash_merged_old_branch_1750_b3() {
+        let _lock = ENV_LOCK.lock();
+        let repo = setup_test_repo("b3-squash-old");
+        // Old tip (well past SQUASH_GC_MIN_TIP_AGE) + squash-merged into main.
+        make_squash_orphan(&repo, "feat/squash-old", "2024-01-01T00:00:00 +0000");
+        // Precondition: the squash-blind signals MISS it (the #1750 bug).
+        assert!(
+            !is_branch_merged(&repo, "feat/squash-old"),
+            "not a --merged ancestor"
+        );
+        assert!(
+            !is_remote_gone(&repo, "feat/squash-old"),
+            "no remote configured"
+        );
+
+        let pruned = prune_orphaned_branches(&repo);
+        assert!(
+            pruned.iter().any(|b| b == "feat/squash-old"),
+            "#1750-B3: a squash-merged orphan past the age floor must be auto-GC'd, got: {pruned:?}"
+        );
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn prune_skips_squash_merged_too_new_1750_b3() {
+        let _lock = ENV_LOCK.lock();
+        let repo = setup_test_repo("b3-squash-new");
+        // Squash-merged but tip committed NOW (git_in default date) → under the
+        // age floor → must NOT be deleted yet (a later sweep reaps it).
+        git_in(&repo, &["checkout", "-b", "feat/squash-new"]);
+        std::fs::write(repo.join("feat.txt"), "feature").ok();
+        git_in(&repo, &["add", "."]);
+        git_in(&repo, &["commit", "-m", "feature work"]); // now-dated tip
+        git_in(&repo, &["checkout", "main"]);
+        std::fs::write(repo.join("other.txt"), "main-side").ok();
+        git_in(&repo, &["add", "."]);
+        git_in(&repo, &["commit", "-m", "main diverge"]);
+        git_in(&repo, &["cherry-pick", "feat/squash-new"]);
+
+        assert!(
+            crate::branch_sweep::is_squash_merged(&repo, "main", "feat/squash-new"),
+            "precondition: detected as squash-merged"
+        );
+        let pruned = prune_orphaned_branches(&repo);
+        assert!(
+            !pruned.iter().any(|b| b == "feat/squash-new"),
+            "#1750-B3: a squash-merged branch under the tip-age floor must NOT be GC'd yet"
+        );
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn prune_skips_unmerged_branch_1750_b3() {
+        let _lock = ENV_LOCK.lock();
+        let repo = setup_test_repo("b3-unmerged");
+        // A genuinely unmerged branch (old tip) — squash detection must NOT fire.
+        git_in(&repo, &["checkout", "-b", "feat/wip"]);
+        std::fs::write(repo.join("feat.txt"), "wip").ok();
+        git_in(&repo, &["add", "."]);
+        git_commit_dated(&repo, "wip", "2024-01-01T00:00:00 +0000");
+        git_in(&repo, &["checkout", "main"]);
+
+        assert!(
+            !crate::branch_sweep::is_squash_merged(&repo, "main", "feat/wip"),
+            "precondition: NOT squash-merged"
+        );
+        let pruned = prune_orphaned_branches(&repo);
+        assert!(
+            !pruned.iter().any(|b| b == "feat/wip"),
+            "#1750-B3: a real unmerged branch must NOT be GC'd"
+        );
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn prune_skips_checked_out_squash_orphan_1750_b3() {
+        let _lock = ENV_LOCK.lock();
+        let repo = setup_test_repo("b3-squash-checkedout");
+        make_squash_orphan(&repo, "feat/squash-wt", "2024-01-01T00:00:00 +0000");
+        // Check the squash-merged branch out in a worktree → must be skipped.
+        let wt = repo.join("wt-squash");
+        git_in(
+            &repo,
+            &["worktree", "add", wt.to_str().unwrap(), "feat/squash-wt"],
+        );
+
+        let pruned = prune_orphaned_branches(&repo);
+        assert!(
+            !pruned.iter().any(|b| b == "feat/squash-wt"),
+            "#1750-B3: a squash-merged branch checked out in a worktree must NOT be GC'd"
+        );
+        std::fs::remove_dir_all(&repo).ok();
     }
 }
