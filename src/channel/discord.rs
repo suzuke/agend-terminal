@@ -1063,7 +1063,7 @@ mod tests {
         // twilight-http 0.17's ratelimiter initialises inside `build()` and needs
         // a Tokio reactor in scope, so construct it within the shared discord
         // runtime (production builds the client in async context already).
-        let client = super::discord_runtime().block_on(async {
+        let client = super::block_on_value(async {
             twilight_http::Client::builder()
                 .proxy(format!("127.0.0.1:{port}"), true)
                 .build()
@@ -1172,7 +1172,7 @@ mod tests {
     ) -> (super::DiscordChannel, std::sync::mpsc::Sender<ChannelEvent>) {
         // twilight-http 0.17's ratelimiter initialises inside `build()` and needs
         // a Tokio reactor in scope — build within the shared discord runtime.
-        let client = super::discord_runtime().block_on(async {
+        let client = super::block_on_value(async {
             twilight_http::Client::builder()
                 .proxy(format!("127.0.0.1:{port}"), true)
                 .build()
@@ -1448,7 +1448,7 @@ mod tests {
     fn discord_keepalive_patch_method_matches_spec() {
         let (port, handle, captured) = mock_http_server(200, "{}");
         // twilight-http 0.17's ratelimiter needs a Tokio reactor at build().
-        let client = super::discord_runtime().block_on(async {
+        let client = super::block_on_value(async {
             twilight_http::Client::builder()
                 .proxy(format!("127.0.0.1:{port}"), true)
                 .build()
