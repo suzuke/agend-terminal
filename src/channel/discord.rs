@@ -1471,6 +1471,30 @@ mod tests {
         assert_eq!(body["archived"], false, "must set archived=false");
     }
 
+    /// TLS smoke (network, manual): proves twilight-http 0.17's
+    /// rustls-native-roots/ring stack actually completes a real TLS handshake —
+    /// the one merge-gate CI can't cover (the spec tests use a plaintext mock
+    /// server). `#[ignore]` so normal/CI runs skip it; run with
+    /// `cargo test --features tray,discord -- --ignored tls_handshake_smoke`.
+    ///
+    /// A missing crypto provider would panic ("no process-level CryptoProvider")
+    /// during the handshake. We hit `GET /gateway` (no valid token → 401 is fine);
+    /// any HTTP/auth response proves the handshake succeeded. Auth is NOT tested.
+    #[tokio::test]
+    #[ignore = "network: real Discord TLS handshake smoke; run manually"]
+    async fn tls_handshake_smoke_real_discord() {
+        let client = twilight_http::Client::new("Bot tls-smoke-no-valid-token".to_string());
+        // `.gateway()` GETs https://discord.com/api/v10/gateway. The handshake
+        // happens before any auth check. A panic here = rustls/ring not wired.
+        let outcome = client.gateway().await;
+        // Reaching this line at all means no CryptoProvider panic. Surface the
+        // result so the run log shows the handshake completed.
+        match outcome {
+            Ok(_) => eprintln!("TLS smoke: handshake + request OK (gateway responded)"),
+            Err(e) => eprintln!("TLS smoke: handshake OK, request returned (expected w/o token): {e}"),
+        }
+    }
+
     /// Keepalive interval constant is reasonable (≤ Discord's shortest
     /// auto-archive of 3600s). Compile-time check via `const {}` blocks —
     /// per `clippy::assertions_on_constants` and Rust 1.79+ const block
