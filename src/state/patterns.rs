@@ -29,6 +29,26 @@ use regex::Regex;
 // copy), keeping byte-identity with the legacy compile_for arm that also uses it.
 pub(crate) const SERVER_RATE_LIMIT_NET_ERRORS: &str = r"ECONNRESET|ETIMEDOUT|InvalidHTTPResponse|fetch failed|connection reset|socket hang up|proxy.*disconnect";
 
+/// #1757: is `matched` one of the [`SERVER_RATE_LIMIT_NET_ERRORS`] tokens?
+///
+/// These hard network faults are rendered in DEFAULT/grey (not red) by codex /
+/// gemini (observed `span_fg=[Default,...]` for `InvalidHTTPResponse` /
+/// `ECONNRESET`), so the #1450 red anchor wrongly suppressed REAL faults → no
+/// `ServerRateLimit` transition → no auto-retry → stuck agent (worst when the
+/// operator is away). The anchor exempts these tokens (fails open like the
+/// empty-`fg` / `Shell` paths). Scoped on purpose: the FP-prone
+/// `api_error`/`overloaded`/context HIGH_FP tokens STAY red-anchored. The
+/// residual net-error FP (these tokens can appear in source/logs/prose — e.g. an
+/// agent viewing THIS file) is bounded by the #1518 live-tail gate, #1586, and
+/// the #1760 nudge cap, so the cost asymmetry (severe stuck-agent vs rare,
+/// self-correcting spurious `continue`) favors the exemption.
+pub(crate) fn is_net_error_match(matched: &str) -> bool {
+    use std::sync::OnceLock;
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(SERVER_RATE_LIMIT_NET_ERRORS).expect("net-error regex compiles"))
+        .is_match(matched)
+}
+
 /// Compiled patterns for one backend.
 pub struct StatePatterns {
     /// (state, regex) pairs in priority order (highest priority first).

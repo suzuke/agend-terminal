@@ -3151,12 +3151,15 @@ fn network_error_patterns_all_backends() {
     }
 }
 
-/// #1587: lock the bounded-acceptable ServerRateLimit FP behavior at the live
-/// red-anchored gate. A real network error rendered RED still latches
-/// ServerRateLimit (the auto-retry path these tokens exist for); the SAME
-/// FP-prone phrase in plain (non-red) prose does NOT latch. This is the residual
-/// we deliberately do NOT chase with an unsafe blind tighten — see the
-/// `SERVER_RATE_LIMIT_NET_ERRORS` doc for why (FN risk, no per-backend fixtures).
+/// #1587 → #1757: a real network error rendered RED latches ServerRateLimit (the
+/// auto-retry path these tokens exist for). #1757 SUPERSEDED the original #1587
+/// "prose-in-default does NOT latch" half: codex/gemini render hard net errors in
+/// DEFAULT (not red), so the red anchor was suppressing REAL faults → no
+/// auto-retry → stuck agent. Net-error tokens are now exempt from the red anchor,
+/// so the same wording in DEFAULT ALSO latches; the residual prose/source FP is
+/// bounded by #1518/#1586/#1760. The dropped `network error` token still must not
+/// trigger. (The FP-prone api_error/overloaded/context HIGH_FP tokens remain
+/// red-anchored — see `codex_model_unsupported_red_anchor_fp_boundary_1634 (a non-net-error HIGH_FP still red-anchored)`.)
 #[test]
 fn server_rate_limit_red_anchor_fp_boundary_1587() {
     // Realistic Node rendering carries an `Error:` label prefix.
@@ -3172,13 +3175,22 @@ fn server_rate_limit_red_anchor_fp_boundary_1587() {
         "#1587: a real network error rendered red must still latch ServerRateLimit"
     );
 
-    // Same wording WITHOUT red (prose / dev-log mention) → must NOT latch.
+    // #1757: net-error tokens are now EXEMPT from the red anchor. codex/gemini
+    // render `InvalidHTTPResponse`/`ECONNRESET`/`socket hang up` in DEFAULT/grey
+    // (not red), so the anchor wrongly suppressed REAL faults → no auto-retry →
+    // stuck agent. The SAME wording in DEFAULT therefore now LATCHES — the #1587
+    // net-error red-anchor boundary is deliberately superseded; the residual
+    // prose/source FP (these tokens appear in code/logs) is bounded by the #1518
+    // live-tail gate, #1586, and the #1760 nudge cap. The FP-prone
+    // api_error/overloaded/context HIGH_FP tokens STAY red-anchored — see
+    // `codex_model_unsupported_red_anchor_fp_boundary_1634 (a non-net-error HIGH_FP still red-anchored)`.
     let mut t2 = StateTracker::new(Some(&Backend::Codex));
     t2.feed_with_fg(screen, &vec![CellFg::Default; n]);
-    assert_ne!(
+    assert_eq!(
         t2.get_state(),
         AgentState::ServerRateLimit,
-        "#1587: same wording without red must NOT latch (red-anchor FP boundary)"
+        "#1757: a net-error rendered DEFAULT must STILL latch ServerRateLimit \
+         (exempt from the red anchor — real faults are not always rendered red)"
     );
 
     // Dropped token regression: `network error` (the unverified #1136 guess) is
@@ -3189,6 +3201,29 @@ fn server_rate_limit_red_anchor_fp_boundary_1587() {
         t3.get_state(),
         AgentState::ServerRateLimit,
         "#1587: bare `network error` was dropped — must no longer trigger ServerRateLimit"
+    );
+}
+
+/// #1757 regression: the EXACT failure from the issue. codex hit a real
+/// `API Error: InvalidHTTPResponse fetching "http://…"` that VTerm recorded as
+/// `span_fg=[Default,…]` (the backend renders it default/grey, not red). Before
+/// #1757 the #1450 red anchor suppressed the transition → no ServerRateLimit →
+/// no auto-retry → the agent sat stuck (worst case: operator away). The net-error
+/// exemption must let a DEFAULT-rendered net error latch ServerRateLimit so
+/// auto-retry fires.
+#[test]
+fn net_error_invalidhttpresponse_default_latches_1757() {
+    let screen = "API Error: InvalidHTTPResponse fetching \"http://127.0.0.1:3456/v1/messages\".";
+    let n = screen.chars().count();
+    let mut t = StateTracker::new(Some(&Backend::Codex));
+    // All-DEFAULT fg — exactly what VTerm recorded for the real fault in the
+    // issue's logs (`span_fg=[Default × 19]`).
+    t.feed_with_fg(screen, &vec![CellFg::Default; n]);
+    assert_eq!(
+        t.get_state(),
+        AgentState::ServerRateLimit,
+        "#1757: a real InvalidHTTPResponse rendered DEFAULT must latch \
+         ServerRateLimit (→ auto-retry), not be suppressed by the red anchor"
     );
 }
 

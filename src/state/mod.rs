@@ -804,6 +804,15 @@ impl StateTracker {
                     let anchor_fail = self.anchor_on_red
                         && high_fp
                         && !fg.is_empty()
+                        // #1757: exempt hard network errors from the red anchor —
+                        // codex/gemini render `InvalidHTTPResponse`/`ECONNRESET`/…
+                        // in DEFAULT/grey (not red), so the anchor wrongly
+                        // suppressed REAL faults → no ServerRateLimit transition →
+                        // no auto-retry → stuck agent. Scoped: the FP-prone
+                        // api_error/overloaded/context HIGH_FP tokens stay
+                        // red-anchored; the net-error residual FP is bounded by
+                        // #1518/#1586/#1760 (see `patterns::is_net_error_match`).
+                        && !crate::state::patterns::is_net_error_match(matched)
                         && !matched_span_has_red(screen_text, matched, fg);
                     // #1518 position gate: a HIGH_FP marker that has scrolled out
                     // of the live bottom-N rows (e.g. an ApiError / ServerRateLimit
