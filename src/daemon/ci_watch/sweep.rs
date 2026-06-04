@@ -334,6 +334,55 @@ pub fn gc_stale_watches(home: &Path, sweep_origin: &str) -> usize {
             }
         }
     }
+
+    // #1740: reap orphaned `.stall` sidecars. The per-repo `<repo-slug>.stall`
+    // (see `repo_stall_path`) carries the deliberate `.stall` extension so the
+    // `.json` scan above skips it — but that also means once a repo's LAST
+    // `.json` watch is gc'd, its `.stall` would leak on disk forever. A `.stall`
+    // whose repo STILL has a surviving `.json` watch is a live stall state and
+    // MUST be kept; only remove ones with no surviving watch for that repo. Run
+    // AFTER the `.json` removal loop above so just-removed watches don't count as
+    // surviving. (`.stall` removals are NOT added to `removed`, which counts
+    // watches.)
+    let surviving_repo_slugs: std::collections::HashSet<String> = std::fs::read_dir(&ci_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("json") {
+                return None;
+            }
+            let content = std::fs::read_to_string(&p).ok()?;
+            let watch: super::watch_state::WatchState = serde_json::from_str(&content).ok()?;
+            if watch.repo.is_empty() {
+                return None;
+            }
+            // Mirror `repo_stall_path`'s slug so it matches the `.stall` stem.
+            Some(watch.repo.replace(['/', ':'], "_"))
+        })
+        .collect();
+    if let Ok(entries) = std::fs::read_dir(&ci_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("stall") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if !surviving_repo_slugs.contains(stem) {
+                if let Err(e) = std::fs::remove_file(&path) {
+                    tracing::warn!(stall = %path.display(), error = %e,
+                        "#1740: orphaned .stall sidecar removal failed");
+                } else {
+                    tracing::info!(stall = %path.display(), sweep = %sweep_origin,
+                        "#1740: removed orphaned ci-watch .stall sidecar (no surviving watch for repo)");
+                }
+            }
+        }
+    }
+
     removed
 }
 
@@ -426,6 +475,60 @@ mod tests {
         assert!(
             content.contains(expected),
             "ci-watch-stalled message must carry correlation_id={expected}: {content}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #1740: `gc_stale_watches` reaps an orphaned `.stall` sidecar once a repo's
+    /// last `.json` watch is gone, but KEEPS a `.stall` while the repo still has
+    /// a surviving watch (it's a live stall state). The `.stall` extension is
+    /// skipped by the `.json` scan, so without this it would leak forever.
+    #[test]
+    fn gc_reaps_orphaned_stall_but_keeps_active() {
+        let dir = tmp_dir("1740-stall-gc");
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).unwrap();
+
+        let stall = |slug: &str| ci_dir.join(format!("{slug}.stall"));
+        let write_stall =
+            |slug: &str| std::fs::write(stall(slug), r#"{"consecutive_skips":3}"#).unwrap();
+        let write_watch = |name: &str, repo: &str, expires_at: &str| {
+            let w = serde_json::json!({ "repo": repo, "branch": "feature-x", "expires_at": expires_at });
+            std::fs::write(
+                ci_dir.join(format!("{name}.json")),
+                serde_json::to_string_pretty(&w).unwrap(),
+            )
+            .unwrap();
+        };
+
+        let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let future = (chrono::Utc::now() + chrono::Duration::hours(24)).to_rfc3339();
+
+        // repo "o/r" (slug o_r): only watch is EXPIRED → gc'd → .stall orphaned.
+        write_watch("o_r_main", "o/r", &past);
+        write_stall("o_r");
+        // repo "a/b" (slug a_b): watch ALIVE (future TTL) → survives → keep .stall.
+        write_watch("a_b_main", "a/b", &future);
+        write_stall("a_b");
+
+        gc_stale_watches(&dir, "test");
+
+        assert!(
+            !stall("o_r").exists(),
+            "orphaned .stall (no surviving watch for repo) must be gc'd"
+        );
+        assert!(
+            stall("a_b").exists(),
+            "active .stall (repo still has a surviving watch) must be KEPT"
+        );
+        // sanity on the watches themselves
+        assert!(
+            !ci_dir.join("o_r_main.json").exists(),
+            "expired watch should be removed"
+        );
+        assert!(
+            ci_dir.join("a_b_main.json").exists(),
+            "live watch should survive"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
