@@ -1060,9 +1060,14 @@ mod tests {
         });
 
         // Step 3: Create twilight client pointed at mock server.
-        let client = twilight_http::Client::builder()
-            .proxy(format!("127.0.0.1:{port}"), true)
-            .build();
+        // twilight-http 0.17's ratelimiter initialises inside `build()` and needs
+        // a Tokio reactor in scope, so construct it within the shared discord
+        // runtime (production builds the client in async context already).
+        let client = super::discord_runtime().block_on(async {
+            twilight_http::Client::builder()
+                .proxy(format!("127.0.0.1:{port}"), true)
+                .build()
+        });
         let client = std::sync::Arc::new(client);
 
         // Step 4: Create DiscordChannel with this client + a recorded binding.
@@ -1165,9 +1170,13 @@ mod tests {
     fn make_test_channel_with_mock(
         port: u16,
     ) -> (super::DiscordChannel, std::sync::mpsc::Sender<ChannelEvent>) {
-        let client = twilight_http::Client::builder()
-            .proxy(format!("127.0.0.1:{port}"), true)
-            .build();
+        // twilight-http 0.17's ratelimiter initialises inside `build()` and needs
+        // a Tokio reactor in scope — build within the shared discord runtime.
+        let client = super::discord_runtime().block_on(async {
+            twilight_http::Client::builder()
+                .proxy(format!("127.0.0.1:{port}"), true)
+                .build()
+        });
         super::DiscordChannel::new_for_test_with_http(std::sync::Arc::new(client))
     }
 
@@ -1438,9 +1447,12 @@ mod tests {
     #[test]
     fn discord_keepalive_patch_method_matches_spec() {
         let (port, handle, captured) = mock_http_server(200, "{}");
-        let client = twilight_http::Client::builder()
-            .proxy(format!("127.0.0.1:{port}"), true)
-            .build();
+        // twilight-http 0.17's ratelimiter needs a Tokio reactor at build().
+        let client = super::discord_runtime().block_on(async {
+            twilight_http::Client::builder()
+                .proxy(format!("127.0.0.1:{port}"), true)
+                .build()
+        });
 
         let result = super::send_keepalive_patch(&client, 290926798999357250);
 
