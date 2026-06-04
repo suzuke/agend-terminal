@@ -1186,7 +1186,13 @@ async fn ci_check_repo(
             if state != snapshot {
                 flush_watch_state(watch_path, &state);
             }
-            refresh_expires_at(watch_path);
+            // #1750 A2: do NOT refresh `expires_at` here. `Ok(None)` means the
+            // poll found NO runs for the branch — a deleted/merged-away branch or
+            // a branch CI never ran. Refreshing on this case is exactly what kept
+            // 56 stale watches alive forever (each empty poll bumped expiry +72h).
+            // Withholding the refresh lets a runless watch finally age past its
+            // existing `expires_at` and get GC'd. A still-active watch (CI in
+            // progress / runs present) refreshes via the run-bearing paths below.
             return Ok(());
         }
         Err(e) => {

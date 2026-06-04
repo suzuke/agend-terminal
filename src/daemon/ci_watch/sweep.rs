@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use super::registry::{ci_watches_dir, remove_watch};
-use super::WATCH_TTL_HOURS;
+use super::{MAX_WATCH_AGE_HOURS, WATCH_TTL_HOURS};
 
 /// Sprint 54 P0-5 (sub-scope B): consecutive rate-limited skips before a
 /// `[ci-watch-stalled]` notification fires. Picked low (3) so a watch
@@ -333,6 +333,31 @@ pub fn gc_stale_watches(home: &Path, sweep_origin: &str) -> usize {
                 }
             }
         }
+
+        // (2b) #1750 A2: absolute age cap — backstop against a watch kept
+        // perpetually young by `refresh_expires_at` on every active poll (so it
+        // never trips the refreshed `expires_at` or inactivity TTL above).
+        // Anchored on the earliest `subscribed_at`, the one timestamp polling
+        // never moves. A watch older than MAX_WATCH_AGE_HOURS never reached
+        // terminal (which would have removed it) → stale by definition.
+        if let Some(created) = watch.earliest_subscribed_at() {
+            if now_utc.signed_duration_since(created) > chrono::Duration::hours(MAX_WATCH_AGE_HOURS)
+            {
+                remove_watch(
+                    home,
+                    &path,
+                    &audit_label,
+                    repo,
+                    branch,
+                    &format!("{sweep_origin}_max_age"),
+                );
+                tracing::info!(repo = %repo, branch = %branch, hours = MAX_WATCH_AGE_HOURS,
+                    sweep = %sweep_origin,
+                    "ci_watch removed (absolute max-age cap — never reached terminal)");
+                removed += 1;
+                continue;
+            }
+        }
     }
 
     // #1740: reap orphaned `.stall` sidecars. The per-repo `<repo-slug>.stall`
@@ -378,6 +403,47 @@ pub fn gc_stale_watches(home: &Path, sweep_origin: &str) -> usize {
                 } else {
                     tracing::info!(stall = %path.display(), sweep = %sweep_origin,
                         "#1740: removed orphaned ci-watch .stall sidecar (no surviving watch for repo)");
+                }
+            }
+        }
+    }
+
+    // #1750 A2: reap orphaned `<hash>.lock` files. A lock shares its stem with
+    // its `<hash>.json` watch and exists only to guard concurrent writes to that
+    // watch; once the watch is gone the lock is dead weight. `remove_watch` now
+    // deletes the sibling lock, but historical removals (and the pre-fix lack of
+    // any deletion site) left 269 orphans on disk — sweep every `.lock` whose
+    // sibling `.json` no longer exists. Run AFTER the `.json` removal loop so a
+    // just-removed watch's lock counts as orphaned. (Not added to `removed`,
+    // which counts watches, mirroring the `.stall` sweep.)
+    let surviving_json_stems: std::collections::HashSet<String> = std::fs::read_dir(&ci_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("json") {
+                return None;
+            }
+            p.file_stem().and_then(|s| s.to_str()).map(String::from)
+        })
+        .collect();
+    if let Ok(entries) = std::fs::read_dir(&ci_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("lock") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if !surviving_json_stems.contains(stem) {
+                if let Err(e) = std::fs::remove_file(&path) {
+                    tracing::warn!(lock = %path.display(), error = %e,
+                        "#1750 A2: orphaned ci-watch .lock removal failed");
+                } else {
+                    tracing::info!(lock = %path.display(), sweep = %sweep_origin,
+                        "#1750 A2: removed orphaned ci-watch .lock (no surviving watch)");
                 }
             }
         }
@@ -530,6 +596,109 @@ mod tests {
             ci_dir.join("a_b_main.json").exists(),
             "live watch should survive"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #1750 A2: an orphaned `<hash>.lock` (no sibling `.json`) is reaped; a
+    /// `.lock` whose `.json` watch still lives is kept.
+    #[test]
+    fn gc_reaps_orphaned_lock_but_keeps_sibling_of_live_watch() {
+        let dir = tmp_dir("1750-lock-gc");
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).unwrap();
+
+        let future = (chrono::Utc::now() + chrono::Duration::hours(24)).to_rfc3339();
+        let w = serde_json::json!({ "repo": "o/r", "branch": "feat", "expires_at": future });
+        std::fs::write(
+            ci_dir.join("live.json"),
+            serde_json::to_string_pretty(&w).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(ci_dir.join("live.lock"), b"").unwrap();
+        // orphan: a .lock with no sibling .json
+        std::fs::write(ci_dir.join("orphan.lock"), b"").unwrap();
+
+        gc_stale_watches(&dir, "test");
+
+        assert!(
+            !ci_dir.join("orphan.lock").exists(),
+            "orphaned .lock (no sibling .json) must be gc'd"
+        );
+        assert!(
+            ci_dir.join("live.lock").exists(),
+            "sibling .lock of a live watch must be KEPT"
+        );
+        assert!(ci_dir.join("live.json").exists(), "live watch survives");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #1750 A2: a watch kept perpetually young by `refresh_expires_at` (future
+    /// `expires_at`) is still removed once its earliest `subscribed_at` is older
+    /// than the absolute max-age cap; a recently-subscribed watch survives.
+    #[test]
+    fn gc_max_age_cap_removes_watch_kept_young_by_polling() {
+        let dir = tmp_dir("1750-maxage-gc");
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).unwrap();
+
+        let future = (chrono::Utc::now() + chrono::Duration::hours(24)).to_rfc3339();
+        let old_sub =
+            (chrono::Utc::now() - chrono::Duration::hours(MAX_WATCH_AGE_HOURS + 1)).to_rfc3339();
+        let stale = serde_json::json!({
+            "repo": "o/r", "branch": "stale", "expires_at": future,
+            "subscribers": [{ "instance": "dev", "subscribed_at": old_sub }],
+        });
+        std::fs::write(
+            ci_dir.join("stale.json"),
+            serde_json::to_string_pretty(&stale).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(ci_dir.join("stale.lock"), b"").unwrap();
+
+        let recent_sub = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let young = serde_json::json!({
+            "repo": "o/r", "branch": "young", "expires_at": future,
+            "subscribers": [{ "instance": "dev", "subscribed_at": recent_sub }],
+        });
+        std::fs::write(
+            ci_dir.join("young.json"),
+            serde_json::to_string_pretty(&young).unwrap(),
+        )
+        .unwrap();
+
+        let removed = gc_stale_watches(&dir, "test");
+
+        assert!(
+            !ci_dir.join("stale.json").exists(),
+            "watch older than max-age cap must be removed despite a future expires_at"
+        );
+        assert!(
+            !ci_dir.join("stale.lock").exists(),
+            "the max-age-removed watch's sibling .lock goes with it (remove_watch)"
+        );
+        assert!(
+            ci_dir.join("young.json").exists(),
+            "recently-subscribed watch must survive the age cap"
+        );
+        assert_eq!(removed, 1, "exactly the over-age watch removed");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #1750 A2: `remove_watch` deletes the sibling `.lock` alongside the `.json`.
+    #[test]
+    fn remove_watch_deletes_sibling_lock_1750() {
+        let dir = tmp_dir("1750-remove-lock");
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).unwrap();
+        let json = ci_dir.join("w.json");
+        let lock = ci_dir.join("w.lock");
+        std::fs::write(&json, "{}").unwrap();
+        std::fs::write(&lock, b"").unwrap();
+
+        remove_watch(&dir, &json, "dev", "o/r", "feat", "test");
+
+        assert!(!json.exists(), "watch .json removed");
+        assert!(!lock.exists(), "sibling .lock removed too");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

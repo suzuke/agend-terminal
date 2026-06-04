@@ -21,6 +21,15 @@ mod watcher;
 /// Watch TTL in hours. Used for both absolute expiry and inactivity threshold.
 pub const WATCH_TTL_HOURS: i64 = 72;
 
+/// #1750 A2: absolute watch-age cap (anchored on the earliest `subscribed_at`,
+/// which is never refreshed by polling) as a backstop against a watch that keeps
+/// receiving "active" poll results and so never hits the refreshed `expires_at`
+/// / inactivity TTL. A real per-push CI watch goes terminal (and is removed)
+/// within minutes-to-an-hour; a watch alive this long never reached terminal and
+/// is stale by definition. Generous (7 days) so it can only ever catch genuine
+/// leaks, never a live watch.
+pub const MAX_WATCH_AGE_HOURS: i64 = 7 * 24;
+
 // Pre-#701 callers reached these names via `crate::daemon::ci_watch::X`.
 // The re-exports preserve that path even when the only in-tree use of
 // some items is via the trait object inside `watcher::check_ci_watches`.

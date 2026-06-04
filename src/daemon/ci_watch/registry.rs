@@ -56,6 +56,13 @@ pub fn remove_watch(
     reason: &str,
 ) {
     let _ = std::fs::remove_file(watch_path);
+    // #1750 A2: remove the sibling `<hash>.lock` too. The lock file is created by
+    // `acquire_file_lock` on every poll/update and never had a deletion site, so
+    // every removed watch used to leave its `.lock` behind (269 orphans observed).
+    // Best-effort: a concurrent re-acquire could recreate it, but the watch is
+    // gone so that path won't run; any straggler is reaped by the orphaned-`.lock`
+    // sweep in `gc_stale_watches`.
+    let _ = std::fs::remove_file(watch_path.with_extension("lock"));
     crate::event_log::log(
         home,
         "ci_watch_removed",

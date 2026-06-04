@@ -5370,8 +5370,15 @@ fn successful_poll_refreshes_expires_at() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// #1750 A2: an empty-run poll (`Ok(None)` — deleted/merged-away branch, or CI
+/// that never ran) must NOT refresh `expires_at`; the original expiry is
+/// preserved so the watch finally ages out. Pre-fix every empty poll bumped it to
+/// ~72h, which is exactly what kept 56 stale watches alive forever. (Renamed +
+/// inverted from `empty_run_poll_refreshes_expires_at`, which pinned the removed
+/// refresh-on-empty behavior.) Contrast `successful_poll_refreshes_expires_at`
+/// directly above: a RUN-bearing poll still refreshes.
 #[test]
-fn empty_run_poll_refreshes_expires_at() {
+fn empty_run_poll_does_not_refresh_expires_at_1750() {
     let dir = tmp_dir("refresh-empty-runs");
     let ci_dir = dir.join("ci-watches");
     std::fs::create_dir_all(&ci_dir).ok();
@@ -5390,11 +5397,9 @@ fn empty_run_poll_refreshes_expires_at() {
     let content = std::fs::read_to_string(&watch_path).unwrap();
     let ws: super::WatchState = serde_json::from_str(&content).unwrap();
     let new_expires = ws.expires_at.expect("expires_at must be present");
-    let parsed = chrono::DateTime::parse_from_rfc3339(&new_expires).unwrap();
-    let hours_from_now = (parsed.with_timezone(&chrono::Utc) - chrono::Utc::now()).num_hours();
-    assert!(
-        (71..=72).contains(&hours_from_now),
-        "expires_at must be refreshed to ~72h even on empty runs, got {hours_from_now}h"
+    assert_eq!(
+        new_expires, old_expires,
+        "empty-run poll must NOT refresh expires_at (#1750 A2) — leave the watch to age out"
     );
     std::fs::remove_dir_all(&dir).ok();
 }

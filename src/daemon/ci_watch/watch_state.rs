@@ -132,6 +132,23 @@ impl WatchState {
         }
         Vec::new()
     }
+
+    /// #1750 A2: the earliest `subscribed_at` across subscribers, as a stable
+    /// watch-age anchor. Unlike `expires_at` / `last_polled_at`, `subscribed_at`
+    /// is set once at subscription time and never refreshed by polling, so it is
+    /// the only field the per-poll `refresh_expires_at` cannot perpetually push
+    /// forward — exactly what an absolute-age GC backstop needs. Returns `None`
+    /// when no subscriber carries a parseable timestamp (legacy/empty watch); the
+    /// caller then falls back to the refreshed-TTL paths.
+    pub fn earliest_subscribed_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.subscribers
+            .as_ref()?
+            .iter()
+            .filter_map(|s| s.subscribed_at.as_deref())
+            .filter_map(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .min()
+    }
 }
 
 #[cfg(test)]
