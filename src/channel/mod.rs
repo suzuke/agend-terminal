@@ -163,6 +163,52 @@ pub fn lookup_channel_by_name(name: &str) -> Option<Arc<dyn Channel>> {
     channels_registry().read().get(name).cloned()
 }
 
+/// #1744-M6: the set of channels an operator-facing **escalation P0** must reach.
+///
+/// [`active_channel`] returns `None` whenever ZERO **or MULTIPLE** channels are
+/// registered, so once a fleet runs telegram + discord every `if let Some(ch) =
+/// active_channel()` escalation silently no-ops — exactly when an orchestrator-
+/// down P0 must get through. This resolver instead returns ALL registered
+/// channels (one per `kind()`): a P0 is delivered to every surface, because for
+/// a leaderless-orchestrator alert "deliver twice" beats "deliver never". With a
+/// single channel it returns just that one (unchanged single-fleet behavior);
+/// with none, an empty vec (caller logs the drop).
+///
+/// Scope discipline (#1744-M6): this is for **Error-severity escalation P0s
+/// only** — the crash / hung / AuthError / retry-exhausted / stall pages. Non-P0
+/// notices (e.g. the Info "agent ready" recovery ping) deliberately keep
+/// [`active_channel`] so the multi-channel fan-out can never leak into routine
+/// traffic. An operator-designated `primary_channel()` is deferred (a routing
+/// nicety, not a reachability fix).
+pub fn resolve_escalation_channels() -> Vec<Arc<dyn Channel>> {
+    channels_registry().read().values().cloned().collect()
+}
+
+/// #1744-M6: dispatch one operator-facing **escalation P0** to EVERY registered
+/// channel (telegram, discord, …) via [`gated_notify`]. Centralizes the
+/// iterate-all fan-out so every orchestrator-down page (crash / hung / AuthError
+/// / retry-exhausted / stall) gets through even in a multi-channel fleet, where
+/// [`active_channel`] would return `None` and silently drop the alert. Returns
+/// the number of channels dispatched to; `0` (no channel registered) is logged
+/// as a dropped P0. Reserve for Error-severity P0s — routine notices keep
+/// [`active_channel`] so this fan-out never leaks into non-escalation traffic.
+pub fn notify_all_escalation_channels(
+    instance: &str,
+    severity: NotifySeverity,
+    message: &str,
+    silent: bool,
+) -> usize {
+    let channels = resolve_escalation_channels();
+    if channels.is_empty() {
+        tracing::debug!(agent = %instance, "no channel registered — escalation P0 dropped");
+        return 0;
+    }
+    for ch in &channels {
+        let _ = gated_notify(ch.as_ref(), instance, severity, message, silent);
+    }
+    channels.len()
+}
+
 /// Sprint 55 P0-A — test-only: clear all registered channels.
 #[cfg(test)]
 pub fn reset_active_channel_for_test() {
@@ -745,6 +791,130 @@ mod tests {
             !ch.outbound_authorized(),
             "default trait method must fail-closed"
         );
+    }
+
+    // ── #1744-M6: escalation channel resolver / multi-channel fan-out ──
+
+    /// Serialize the process-global channel registry across the registry-touching
+    /// tests in this module (mirrors `daemon::router` / `mcp::handlers::channel`).
+    fn m6_registry_guard() -> parking_lot::MutexGuard<'static, ()> {
+        static G: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+        G.lock()
+    }
+
+    /// Recording channel with a configurable `kind()` (the registry is keyed by
+    /// kind, so a multi-channel test needs distinct kinds) and authorized=true.
+    struct KindedRecording {
+        kind: &'static str,
+        caps: ChannelCapabilities,
+        count: std::sync::atomic::AtomicUsize,
+    }
+    impl KindedRecording {
+        fn arc(kind: &'static str) -> Arc<Self> {
+            Arc::new(Self {
+                kind,
+                caps: ChannelCapabilities::default(),
+                count: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+        fn count(&self) -> usize {
+            self.count.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+    impl Channel for KindedRecording {
+        fn kind(&self) -> &'static str {
+            self.kind
+        }
+        fn caps(&self) -> &ChannelCapabilities {
+            &self.caps
+        }
+        fn poll_event(&self) -> Option<ChannelEvent> {
+            None
+        }
+        fn send(&self, _: &BindingRef, _: OutMsg) -> Result<MsgRef> {
+            anyhow::bail!("mock")
+        }
+        fn edit(&self, _: &MsgRef, _: OutMsg) -> Result<()> {
+            anyhow::bail!("mock")
+        }
+        fn delete(&self, _: &MsgRef) -> Result<()> {
+            anyhow::bail!("mock")
+        }
+        fn create_binding(&self, _: &str, _: BindingOpts) -> Result<BindingRef> {
+            anyhow::bail!("mock")
+        }
+        fn remove_binding(&self, _: &BindingRef) -> Result<()> {
+            anyhow::bail!("mock")
+        }
+        fn has_binding(&self, _: &str) -> bool {
+            false
+        }
+        fn record_binding(&self, _: &str, _: BindingRef, _: String) {}
+        fn take_binding(&self, _: &str) -> Option<BindingRef> {
+            None
+        }
+        fn attach_registry(&self, _: crate::agent::AgentRegistry) {}
+        fn outbound_authorized(&self) -> bool {
+            true
+        }
+        fn notify(
+            &self,
+            _: &str,
+            _: NotifySeverity,
+            _: &str,
+            _: bool,
+        ) -> std::result::Result<(), ChannelError> {
+            self.count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    /// #1744-M6: an escalation P0 must reach EVERY registered channel — the bug
+    /// was `active_channel()` returning `None` with ≥2 channels, silently dropping
+    /// the alert. `notify_all_escalation_channels` fans out to all of them.
+    #[test]
+    fn notify_all_escalation_channels_fans_out_to_every_channel_1744_m6() {
+        let _g = m6_registry_guard();
+        reset_active_channel_for_test();
+        let tg = KindedRecording::arc("telegram-m6");
+        let dc = KindedRecording::arc("discord-m6");
+        register_active_channel(tg.clone());
+        register_active_channel(dc.clone());
+
+        // Precondition: this is exactly the case `active_channel()` drops.
+        assert!(
+            active_channel().is_none(),
+            "active_channel() returns None with 2 channels — the M6 bug"
+        );
+
+        let sent = notify_all_escalation_channels("orch", NotifySeverity::Error, "P0", false);
+        assert_eq!(sent, 2, "must dispatch to both channels");
+        assert_eq!(tg.count(), 1, "telegram got the P0");
+        assert_eq!(dc.count(), 1, "discord got the P0");
+
+        reset_active_channel_for_test();
+    }
+
+    /// #1744-M6: single-channel returns 1 (unchanged single-fleet behavior); zero
+    /// returns 0 (logged drop, no panic).
+    #[test]
+    fn notify_all_escalation_channels_single_and_zero_1744_m6() {
+        let _g = m6_registry_guard();
+        reset_active_channel_for_test();
+        assert_eq!(
+            notify_all_escalation_channels("a", NotifySeverity::Error, "p", false),
+            0,
+            "zero channels → 0 (drop logged)"
+        );
+        let only = KindedRecording::arc("solo-m6");
+        register_active_channel(only.clone());
+        assert_eq!(
+            notify_all_escalation_channels("a", NotifySeverity::Error, "p", false),
+            1
+        );
+        assert_eq!(only.count(), 1);
+        reset_active_channel_for_test();
     }
 
     // ---- Phase 5b: Channel::send_from_agent default + AgentOutboundOp ----
