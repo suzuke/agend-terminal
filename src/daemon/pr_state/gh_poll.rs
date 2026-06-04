@@ -8,7 +8,7 @@
 //! ## Architecture
 //!
 //! - [`GhPoller`] trait — production [`CliGhPoller`] shells out to
-//!   `gh pr list --json author,number,headRefName,isDraft,state,mergedAt
+//!   `gh pr list --json author,number,headRefName,isCrossRepository,isDraft,state,mergedAt
 //!   --state all`; tests inject [`MockGhPoller`] with canned responses
 //!   (§3.20 SOP 1 — no subprocess invocation in unit tests).
 //! - Single batched call per repo per scanner tick (NOT per-PR
@@ -46,6 +46,12 @@ pub struct GhPrMetadata {
     pub number: u64,
     pub author_login: String,
     pub head_ref: String,
+    /// #1750-B4: true when the head branch lives in a FORK (`isCrossRepository`),
+    /// so its `head_ref` is NOT a base-repo branch — remote-orphan GC must skip it
+    /// (a fork head_ref colliding with a base-repo branch name would otherwise
+    /// delete the unrelated base-repo branch).
+    #[serde(default)]
+    pub is_cross_repository: bool,
     pub is_draft: bool,
     pub state: GhPrState,
     pub merged_at: Option<String>,
@@ -90,6 +96,7 @@ impl GhPoller for CliGhPoller {
                 "author",
                 "number",
                 "headRefName",
+                "isCrossRepository",
                 "isDraft",
                 "state",
                 "mergedAt",
@@ -139,6 +146,7 @@ fn summary_to_gh_metadata(s: crate::scm::PrSummary) -> Option<GhPrMetadata> {
         number: s.number,
         author_login: s.author_login?,
         head_ref: s.head_ref?,
+        is_cross_repository: s.is_cross_repository.unwrap_or(false),
         is_draft: s.is_draft.unwrap_or(false),
         state,
         merged_at: s.merged_at,
@@ -563,6 +571,7 @@ pub(crate) mod tests {
             number: 970,
             author_login: "suzuke".into(),
             head_ref: "fix/x".into(),
+            is_cross_repository: false,
             is_draft: false,
             state: GhPrState::Open,
             merged_at: None,

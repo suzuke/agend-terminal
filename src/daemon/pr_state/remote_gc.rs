@@ -53,6 +53,13 @@ pub(crate) fn select_remote_orphans_to_delete(
         if pr.state != GhPrState::Merged {
             continue;
         }
+        // #1750-B4 (codex): a fork/cross-repo PR's head branch lives in the FORK,
+        // not `repo` — its head_ref name can collide with a real base-repo branch,
+        // so "delete the base-repo branch of that name" would nuke an unrelated
+        // branch. Never GC off a cross-repo PR.
+        if pr.is_cross_repository {
+            continue;
+        }
         let head = pr.head_ref.as_str();
         if head == default_branch || head == "main" || head == "master" {
             continue;
@@ -217,10 +224,22 @@ mod tests {
     use super::*;
 
     fn pr(number: u64, head: &str, state: GhPrState, merged_at: Option<&str>) -> GhPrMetadata {
+        pr_x(number, head, state, merged_at, false)
+    }
+
+    /// `pr` with an explicit `is_cross_repository` (fork) flag.
+    fn pr_x(
+        number: u64,
+        head: &str,
+        state: GhPrState,
+        merged_at: Option<&str>,
+        is_cross_repository: bool,
+    ) -> GhPrMetadata {
         GhPrMetadata {
             number,
             author_login: "x".into(),
             head_ref: head.into(),
+            is_cross_repository,
             is_draft: false,
             state,
             merged_at: merged_at.map(String::from),
@@ -274,6 +293,47 @@ mod tests {
             vec!["feat/merged-old".to_string()],
             "only the merged, old-enough, still-existing, non-open, non-protected branch is GC'd"
         );
+    }
+
+    /// #1750-B4 (codex): a FORK / cross-repo merged PR whose `headRefName`
+    /// collides with a real base-repo branch must NEVER be selected — deleting
+    /// "the base-repo branch of that name" would nuke an unrelated branch. The
+    /// other belts (open-PR / protected) don't catch this when no open PR uses
+    /// the name, so the `is_cross_repository` skip is the guard.
+    #[test]
+    fn select_skips_fork_pr_collision_1750_b4() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-06-05T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let old = "2026-06-01T00:00:00Z";
+        // A merged fork PR whose head_ref happens to match an EXISTING base-repo
+        // branch name ("dev") — exists, old enough, no open PR, not protected.
+        let prs = vec![pr_x(1, "dev", GhPrState::Merged, Some(old), true)];
+        let got = select_remote_orphans_to_delete(
+            &prs,
+            &set(&["dev"]),
+            &HashSet::new(),
+            "main",
+            now,
+            REMOTE_ORPHAN_MIN_AGE,
+        );
+        assert!(
+            got.is_empty(),
+            "#1750-B4: a cross-repo (fork) PR must never trigger a base-repo branch delete, got: {got:?}"
+        );
+
+        // Sanity: the SAME branch from a SAME-REPO merged PR IS still GC'd (belt
+        // is scoped to fork PRs, not a blanket skip).
+        let same_repo = vec![pr_x(2, "dev", GhPrState::Merged, Some(old), false)];
+        let got2 = select_remote_orphans_to_delete(
+            &same_repo,
+            &set(&["dev"]),
+            &HashSet::new(),
+            "main",
+            now,
+            REMOTE_ORPHAN_MIN_AGE,
+        );
+        assert_eq!(got2, vec!["dev".to_string()], "same-repo orphan still GC'd");
     }
 
     /// #1750-B4: a branch backing several merged PRs over time is emitted once.
