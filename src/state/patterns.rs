@@ -65,6 +65,15 @@ pub(crate) fn is_net_error_match(matched: &str) -> bool {
 ///   corpus bug where the `_error` underscore killed the old `\berror`
 ///   word-boundary, so `ModelUnsupported`'s `invalid_request_error:` never
 ///   qualified;
+/// - labeled exception — `\w*exception\s*[:?]`: `ThrottlingException:` /
+///   `ThrottlingError:` (AWS/Bedrock-style names kiro renders). The
+///   `t-coloranchor-corpus-gate` rg-on-fixture check found kiro RateLimit
+///   (`ThrottlingException: Rate exceeded …`) was the one color-gated content
+///   false-negative — `Exception` has no `error` substring and the line carries
+///   no `429`/JSON, so it failed every alternation above. The structured
+///   `…Exception:` label is the same strong error-line signal as `…error:`; the
+///   bare phrase `Rate exceeded` is deliberately NOT added — it is prose-ambiguous
+///   (the #848/#854 class) and the real kiro error always carries the label;
 /// - bare HTTP-status (gemini RateLimit lines with no `Error:` label):
 ///   `\b429\b` / `RESOURCE_EXHAUSTED` / `Too Many Requests` / `got status:`;
 /// - structured-JSON error fields: `"type"|"code"|"status": "…error…"` /
@@ -85,7 +94,7 @@ pub(crate) fn in_error_line(screen_text: &str, matched: &str) -> bool {
     static ERROR_LINE: OnceLock<Regex> = OnceLock::new();
     let re = ERROR_LINE.get_or_init(|| {
         Regex::new(
-            r#"(?i)(\b\w*error\s*[:?]|\b429\b|resource_exhausted|too many requests|got status\s*:|"(type|code|status)"\s*:\s*"\w*error\w*"|"reason"\s*:\s*"[^"]*exceeded")"#,
+            r#"(?i)(\b\w*error\s*[:?]|\b\w*exception\s*[:?]|\b429\b|resource_exhausted|too many requests|got status\s*:|"(type|code|status)"\s*:\s*"\w*error\w*"|"reason"\s*:\s*"[^"]*exceeded")"#,
         )
         .expect("error-line regex")
     });

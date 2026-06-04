@@ -854,3 +854,22 @@ fixtures:
     expected_final_detect: model_unsupported
     capture_kind: synthetic_from_incident
     provenance: "#1634 — synthetic reconstruction of the codex model-unsupported incident (exact wording + red SGR)"
+
+  - file: codex-rate-limit-typical.raw
+    backend: codex
+    cli_version: "0.135.0"
+    recorded_on: "2026-06-04"
+    scenario: |
+      t-coloranchor-corpus-gate: codex RateLimit rendered via the same RED
+      `stream error: <code>: <message>` wrapper as the model-unsupported
+      incident, with the OpenAI `rate_limit_exceeded` code. Confirms the codex
+      RateLimit token sits on an error-line-shaped line (`stream error:` →
+      `in_error_line` matches via `\w*error:`), so the content path covers codex
+      RateLimit when the #1450 color anchor is eventually dropped (the gate's
+      go/no-go). The RateLimit pattern (`rate_limit_exceeded|RateLimitError|
+      hit your rate limit`) matches; HIGH_FP, so today still requires the red SGR.
+    expected_transitions: [starting, rate_limit]
+    expected_final_state: rate_limit
+    expected_final_detect: rate_limit
+    capture_kind: synthetic_from_docs
+    provenance: "t-coloranchor-corpus-gate — synthetic from the verified codex stream-error shape + OpenAI rate_limit_exceeded code"
