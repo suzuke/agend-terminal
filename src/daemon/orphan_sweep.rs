@@ -61,10 +61,18 @@ pub fn run(home: &Path) {
         watches_scrubbed += crate::daemon::ci_watch::cleanup_watches_for_instance(home, &name);
     }
 
-    if schedules_orphaned + dispatches_gced + watches_scrubbed > 0 {
+    // dispatch_tracking terminal rows (completed/orphaned) for ANY target —
+    // including LIVE ones whose dispatches completed or were given up. The
+    // dead-target loop above only catches gone instances; this clears the
+    // accumulated terminal backlog (e.g. the completed/orphaned rows behind the
+    // flood) at boot rather than waiting for the 30-day TTL.
+    let tracking_gced = crate::dispatch_tracking::sweep_terminal_entries(home);
+
+    if schedules_orphaned + dispatches_gced + watches_scrubbed + tracking_gced > 0 {
         tracing::info!(
             schedules_orphaned,
             dispatches_gced,
+            tracking_gced,
             watches_scrubbed,
             "#1488 boot orphan sweep: cleaned stale bindings of deleted instances"
         );

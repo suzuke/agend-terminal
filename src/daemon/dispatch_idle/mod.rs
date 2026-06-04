@@ -294,14 +294,15 @@ pub(crate) fn cleanup_pending_for_task_id(home: &Path, task_id: &str) -> usize {
     }
     let mut count = 0usize;
     for d in list_pending(home) {
-        if d.status != DispatchStatus::Pending {
-            continue;
-        }
+        // A closed task → purge EVERY sidecar for it, not just Pending ones. A
+        // late report on an already-Exceeded dispatch (or a task closing after the
+        // idle nudge fired) must still clear the sidecar (codex probe #1).
         if d.correlation_id.as_deref() != Some(task_id) {
             continue;
         }
         let path = pending_path(home, &d.dispatch_id);
         if std::fs::remove_file(&path).is_ok() {
+            let _ = std::fs::remove_file(format!("{}.lock", path.display()));
             count += 1;
             tracing::debug!(
                 target: "dispatch_idle",
@@ -335,14 +336,15 @@ pub(crate) fn cleanup_pending_for_instance(home: &Path, instance_name: &str) -> 
     }
     let mut count = 0usize;
     for d in list_pending(home) {
-        if d.status != DispatchStatus::Pending {
-            continue;
-        }
+        // Clean EVERY sidecar for the deleted instance, not just Pending ones.
+        // Resolved/Exceeded sidecars have no further use once the target is gone,
+        // and skipping them (the pre-fix behaviour) left them to accumulate.
         if d.target != instance_name {
             continue;
         }
         let path = pending_path(home, &d.dispatch_id);
         if std::fs::remove_file(&path).is_ok() {
+            let _ = std::fs::remove_file(format!("{}.lock", path.display()));
             count += 1;
             tracing::debug!(
                 target: "dispatch_idle",
@@ -372,22 +374,30 @@ pub(crate) fn mark_resolved(home: &Path, correlation_id: &str) -> Option<String>
     if correlation_id.is_empty() {
         return None;
     }
+    // A report arriving = the dispatch is done, whether it was still `Pending` or
+    // had already timed out to `Exceeded` (idle nudge fired). Match BOTH so a LATE
+    // report on an Exceeded dispatch still deletes the sidecar — otherwise it leaks
+    // until the slow retention / terminal-sweep path (codex probe #1 regression).
     let matched = list_pending(home).into_iter().find(|d| {
-        d.status == DispatchStatus::Pending && d.correlation_id.as_deref() == Some(correlation_id)
+        matches!(d.status, DispatchStatus::Pending | DispatchStatus::Exceeded)
+            && d.correlation_id.as_deref() == Some(correlation_id)
     });
     let d = matched?;
     let id = d.dispatch_id.clone();
     let path = pending_path(home, &id);
-    crate::store::with_json_state::<PendingDispatch, _, _>(&path, |current| {
-        if current.status != DispatchStatus::Pending {
-            return None;
-        }
-        current.status = DispatchStatus::Resolved;
-        Some(id.clone())
-    })
-    .ok()
-    .flatten()
-    .flatten()
+    // A resolved dispatch has no further use — the idle timer's job is done.
+    // DELETE the sidecar rather than flip it to `Resolved` and leave the file to
+    // accumulate. Pre-fix this set `status = Resolved` and nothing ever removed it
+    // (the primary `pending-dispatches/` leak: `cleanup_pending_for_instance`
+    // skipped non-Pending and the 14-day retention sweep was gated off), so
+    // resolved sidecars piled up and a restart re-processed the whole backlog.
+    if std::fs::remove_file(&path).is_ok() {
+        // Best-effort: drop the sidecar's lock file too so it doesn't orphan.
+        let _ = std::fs::remove_file(format!("{}.lock", path.display()));
+        Some(id)
+    } else {
+        None
+    }
 }
 
 /// #1047: reset the timer on a pending sidecar when the dispatchee sends
@@ -1088,17 +1098,67 @@ mod tests {
             "must resolve the correlation_id-matching sidecar, not sender-matching"
         );
         let pending = list_pending(&home);
-        let p_a = pending.iter().find(|p| p.dispatch_id == id_a).unwrap();
-        let p_b = pending.iter().find(|p| p.dispatch_id == id_b).unwrap();
-        assert_eq!(
-            p_a.status,
-            DispatchStatus::Resolved,
-            "matched sidecar must flip"
+        // A: the matched sidecar is DELETED on resolve (no longer flipped to
+        // Resolved + left behind), so it must be absent from list_pending.
+        assert!(
+            !pending.iter().any(|p| p.dispatch_id == id_a),
+            "matched sidecar must be deleted on resolve"
         );
+        let p_b = pending.iter().find(|p| p.dispatch_id == id_b).unwrap();
         assert_eq!(
             p_b.status,
             DispatchStatus::Pending,
-            "unmatched sidecar from same dispatcher must NOT flip"
+            "unmatched sidecar from same dispatcher must NOT be touched"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// A: `cleanup_pending_for_instance` deletes EVERY sidecar for the instance,
+    /// including non-Pending (Exceeded/Resolved) ones — previously it skipped
+    /// them, leaving resolved/exceeded sidecars to accumulate.
+    #[test]
+    fn cleanup_pending_deletes_non_pending_sidecars() {
+        let home = tmp_home("cleanup-non-pending");
+        let now = chrono::Utc::now();
+        let id = write_pending_at(&home, "lead", "gone-agent", Some("t-x"), "task", 600, now);
+        // Flip the sidecar to a terminal (non-Pending) status on disk.
+        let path = pending_path(&home, &id);
+        let mut pd: PendingDispatch =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        pd.status = DispatchStatus::Exceeded;
+        std::fs::write(&path, serde_json::to_string_pretty(&pd).unwrap()).unwrap();
+
+        let removed = cleanup_pending_for_instance(&home, "gone-agent");
+        assert_eq!(removed, 1, "must delete the non-Pending (Exceeded) sidecar");
+        assert!(!path.exists(), "Exceeded sidecar must be removed");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// codex probe #1 regression: a LATE report on a dispatch that already timed
+    /// out (Pending → Exceeded, idle nudge fired) must STILL delete the sidecar.
+    /// Pre-fix `mark_resolved` matched only `Pending`, so the Exceeded sidecar
+    /// leaked until the slow retention / terminal-sweep path.
+    #[test]
+    fn mark_resolved_clears_exceeded_sidecar() {
+        let home = tmp_home("resolve-exceeded");
+        let issued = chrono::Utc::now() - chrono::Duration::seconds(700);
+        let id = write_pending_at(&home, "lead", "dev", Some("t-late"), "task", 600, issued);
+        // Flip to Exceeded on disk, as the idle scan would once the threshold passes.
+        let path = pending_path(&home, &id);
+        let mut pd: PendingDispatch =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        pd.status = DispatchStatus::Exceeded;
+        std::fs::write(&path, serde_json::to_string_pretty(&pd).unwrap()).unwrap();
+
+        let resolved = mark_resolved(&home, "t-late");
+        assert_eq!(
+            resolved.as_deref(),
+            Some(id.as_str()),
+            "late report must resolve the already-Exceeded sidecar"
+        );
+        assert!(
+            !path.exists(),
+            "late report must delete the Exceeded sidecar (not leak it)"
         );
         std::fs::remove_dir_all(&home).ok();
     }
@@ -1922,14 +1982,11 @@ mod tests {
         let resolved = mark_resolved(&home, "t-1047-c");
         assert!(resolved.is_some(), "report must resolve sidecar");
         let pending = list_pending(&home);
-        let d = pending
-            .iter()
-            .find(|p| p.correlation_id.as_deref() == Some("t-1047-c"))
-            .unwrap();
-        assert_eq!(
-            d.status,
-            DispatchStatus::Resolved,
-            "kind=report must set status=resolved"
+        assert!(
+            !pending
+                .iter()
+                .any(|p| p.correlation_id.as_deref() == Some("t-1047-c")),
+            "kind=report must resolve (delete) the sidecar"
         );
         std::fs::remove_dir_all(&home).ok();
     }

@@ -60,14 +60,12 @@ pub fn mark_completed(home: &Path, correlation_id: Option<&str>, _to: &str) {
     };
     persist_or_log!(
         crate::store::mutate_versioned(&store_path(home), |store: &mut DispatchStore| {
-            for entry in store.entries.iter_mut() {
-                if entry.status == "completed" {
-                    continue;
-                }
-                if entry.task_id.as_deref() == Some(cid) {
-                    entry.status = "completed".to_string();
-                }
-            }
+            // Remove the resolved dispatch entry outright (was: flip to "completed"
+            // and linger until the 30-day `gc_old_entries`). A completed dispatch
+            // needs no further warn/ask tracking, so dropping it caps accumulation
+            // at the source (the 651KB / 1649-completed bloat). Complementary to
+            // #1727: that stops `orphaned` nag; this removes the rows.
+            store.entries.retain(|e| e.task_id.as_deref() != Some(cid));
             Ok(())
         }),
         "dispatch_mark_completed"
@@ -223,6 +221,26 @@ pub fn gc_old_entries(home: &Path) {
     });
 }
 
+/// Remove ALL terminal entries (`completed` / `orphaned`) regardless of age.
+/// More aggressive than `gc_old_entries` (30-day): completed entries are normally
+/// dropped at report time by `mark_completed`, but a dispatch that never got a
+/// correlated report ends up `orphaned` (>24h, given up — never re-asked since
+/// #1727) and would otherwise sit until the 30-day TTL. Called at boot
+/// (`orphan_sweep`) and each retention cycle so terminal rows don't accumulate.
+/// Returns the number removed. Best-effort: a dropped pass just delays pruning.
+pub fn sweep_terminal_entries(home: &Path) -> usize {
+    let mut removed = 0usize;
+    let _ = crate::store::mutate_versioned(&store_path(home), |store: &mut DispatchStore| {
+        let before = store.entries.len();
+        store
+            .entries
+            .retain(|e| e.status != "completed" && e.status != "orphaned");
+        removed = before - store.entries.len();
+        Ok(())
+    });
+    removed
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -359,10 +377,54 @@ mod tests {
         );
         // Mark completed (simulates report_result handler calling this)
         mark_completed(&home, Some("t-123"), "impl");
-        // Sweep should find nothing — entry is completed
+        // C: the entry is REMOVED outright (not flipped to "completed" and kept).
+        let store: DispatchStore = crate::store::load(&store_path(&home));
+        assert!(
+            store.entries.is_empty(),
+            "completed dispatch entry must be removed, not retained: {:?}",
+            store.entries
+        );
+        // And so the sweep finds nothing.
         let (warns, asks) = sweep_stuck(&home);
         assert!(warns.is_empty(), "completed dispatch must not warn");
         assert!(asks.is_empty(), "completed dispatch must not ask");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn sweep_terminal_entries_removes_terminal_keeps_active() {
+        let home = tmp_home("sweep-terminal");
+        for (tid, st) in [
+            ("t-c", "completed"),
+            ("t-o", "orphaned"),
+            ("t-p", "pending"),
+            ("t-a", "asked"),
+        ] {
+            track_dispatch(
+                &home,
+                DispatchEntry {
+                    task_id: Some(tid.into()),
+                    from: "lead".into(),
+                    to: "dev".into(),
+                    from_id: None,
+                    to_id: None,
+                    delegated_at: chrono::Utc::now().to_rfc3339(),
+                    status: st.into(),
+                },
+            );
+        }
+        let removed = sweep_terminal_entries(&home);
+        assert_eq!(removed, 2, "must remove completed + orphaned only");
+        let store: DispatchStore = crate::store::load(&store_path(&home));
+        let kept: Vec<&str> = store.entries.iter().map(|e| e.status.as_str()).collect();
+        assert!(
+            kept.contains(&"pending") && kept.contains(&"asked"),
+            "active (pending/asked) entries must survive: {kept:?}"
+        );
+        assert!(
+            !kept.contains(&"completed") && !kept.contains(&"orphaned"),
+            "terminal entries must be gone: {kept:?}"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
