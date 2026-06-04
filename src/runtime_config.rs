@@ -237,6 +237,13 @@ pub fn keys() -> Vec<String> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    // These tests mutate the process-global `RUNTIME_CONFIG` singleton via
+    // `reload()`, so running them concurrently lets one test's reload clobber
+    // another's value between its own `reload` + `get_key` — an intermittent
+    // assertion flake that reddened UNRELATED PRs (#1752, #1758) and forced
+    // churny CI reruns. Serialize the global-touching ones under a named group
+    // (keeps unrelated `#[serial]` tests in other modules running in parallel).
+    use serial_test::serial;
 
     #[test]
     fn default_values() {
@@ -246,6 +253,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(runtime_config)]
     fn set_and_get_key() {
         let dir = std::env::temp_dir().join("agend-test-runtime-config");
         std::fs::create_dir_all(&dir).ok();
@@ -270,6 +278,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(runtime_config)]
     fn set_hang_auto_recovery_enabled() {
         let dir = std::env::temp_dir().join("agend-test-runtime-config-hang");
         std::fs::create_dir_all(&dir).ok();
@@ -287,6 +296,7 @@ mod tests {
     /// `set`/persist/reload path as the other gates (the `config` MCP tool reaches
     /// `set`), so the operator can flip it off without a rebuild.
     #[test]
+    #[serial(runtime_config)]
     fn show_pane_state_default_on_and_toggleable() {
         assert!(
             RuntimeConfig::default().show_pane_state,
@@ -308,6 +318,7 @@ mod tests {
     /// from the hand-maintained description is what this change fixes. Every key
     /// `keys()` reports must also be a valid `set` target (round-trip via get_key).
     #[test]
+    #[serial(runtime_config)]
     fn keys_cover_all_settable_keys_including_show_pane_state() {
         let ks = keys();
         assert!(
