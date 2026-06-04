@@ -2831,7 +2831,13 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&repo).unwrap();
-        assert!(Command::new("git")
+        // #1748: drive fixture git through the REAL git binary, not the bare
+        // `git` PATH entry which resolves to this agend-git shim — whose #1463
+        // ChdirPass strips the `-C <tempdir>` and redirects the op onto the
+        // caller's bound worktree, corrupting it. `resolve_real_git()` is the
+        // same resolver the shim uses to exec real git (excludes $AGEND_HOME/bin).
+        let git_bin = resolve_real_git();
+        assert!(Command::new(&git_bin)
             .arg("-C")
             .arg(&repo)
             .args(["init", "-b", "main"])
@@ -2839,19 +2845,19 @@ mod tests {
             .unwrap()
             .status
             .success());
-        Command::new("git")
+        Command::new(&git_bin)
             .arg("-C")
             .arg(&repo)
             .args(["config", "user.name", "test"])
             .output()
             .unwrap();
-        Command::new("git")
+        Command::new(&git_bin)
             .arg("-C")
             .arg(&repo)
             .args(["config", "user.email", "test@test.com"])
             .output()
             .unwrap();
-        assert!(Command::new("git")
+        assert!(Command::new(&git_bin)
             .arg("-C")
             .arg(&repo)
             .args(["commit", "--allow-empty", "-m", "init"])
@@ -2859,7 +2865,7 @@ mod tests {
             .unwrap()
             .status
             .success());
-        assert!(!has_unmerged_files("git", repo.to_str().unwrap()));
+        assert!(!has_unmerged_files(&git_bin, repo.to_str().unwrap()));
         let _ = std::fs::remove_dir_all(&repo);
     }
 
@@ -2874,8 +2880,10 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&repo).unwrap();
+        // #1748: real git, not the shim — see has_unmerged_files_false_on_clean_repo.
+        let git_bin = resolve_real_git();
         let git = |args: &[&str]| {
-            Command::new("git")
+            Command::new(&git_bin)
                 .arg("-C")
                 .arg(&repo)
                 .args(args)
@@ -2896,7 +2904,7 @@ mod tests {
         git(&["commit", "-am", "main"]);
         let merge = git(&["merge", "side", "--no-edit"]);
         assert!(!merge.status.success(), "merge should fail with conflict");
-        assert!(has_unmerged_files("git", repo.to_str().unwrap()));
+        assert!(has_unmerged_files(&git_bin, repo.to_str().unwrap()));
         git(&["merge", "--abort"]);
         let _ = std::fs::remove_dir_all(&repo);
     }
