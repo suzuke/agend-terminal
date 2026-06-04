@@ -56,6 +56,15 @@ pub(crate) struct ConflictNotifyTracker {
     last_conflict_at: HashMap<String, chrono::DateTime<chrono::Utc>>,
     /// agent → last telegram-escalation timestamp (dedup guard).
     last_escalated_at: HashMap<String, chrono::DateTime<chrono::Utc>>,
+    /// #1739 boot-seed latch. The first scan after a fresh daemon start records
+    /// agents already in `GitConflict` into `last_conflict_at` (stamped now)
+    /// WITHOUT firing the first-observation notify, so a restart doesn't re-ping
+    /// conflicts the operator already saw. NOTE (option a): seeding stamps
+    /// `last_conflict_at = now`, so the 30-min staleness escalation clock starts
+    /// at boot — a conflict surviving restart + 30 min still escalates. The
+    /// escalation dedup itself (`last_escalated_at`) is out of scope here (#1739
+    /// ②, persisted separately).
+    seeded: bool,
 }
 
 impl ConflictNotifyTracker {
@@ -84,6 +93,8 @@ impl ConflictNotifyTracker {
             return false;
         }
         self.tick_count = 0;
+        let seeding = !self.seeded;
+        self.seeded = true;
 
         // Phase 1: collect per-agent (name, state, worktree, branch)
         // tuples under a single registry lock. The worktree-state
@@ -103,8 +114,13 @@ impl ConflictNotifyTracker {
                 crate::state::AgentState::GitConflict => {
                     let first_observation = !self.last_conflict_at.contains_key(&name);
                     if first_observation {
-                        self.last_conflict_at.insert(name.clone(), now);
-                        emit_conflict_notify(home, &name);
+                        record_first_observation(
+                            &mut self.last_conflict_at,
+                            home,
+                            &name,
+                            now,
+                            seeding,
+                        );
                     } else if let Some(&last_at) = self.last_conflict_at.get(&name) {
                         let stale = now.signed_duration_since(last_at)
                             > chrono::Duration::seconds(STALE_THRESHOLD_SECS);
@@ -144,6 +160,23 @@ impl ConflictNotifyTracker {
 /// agent via `crate::inbox::notify_agent`. Discovers worktree state
 /// (conflicted files + op type + branch) from disk + binding.json.
 /// Failures are logged + skipped (boot continues).
+/// #1739: handle a first-observation conflict. The dedup record happens
+/// unconditionally; the first-observation notify is suppressed during the boot
+/// seeding pass (`seeding == true`) so a daemon restart doesn't re-ping
+/// conflicts the operator already saw before the restart.
+fn record_first_observation(
+    last_conflict_at: &mut HashMap<String, chrono::DateTime<chrono::Utc>>,
+    home: &Path,
+    name: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    seeding: bool,
+) {
+    last_conflict_at.insert(name.to_string(), now);
+    if !seeding {
+        emit_conflict_notify(home, name);
+    }
+}
+
 fn emit_conflict_notify(home: &Path, agent: &str) {
     let Some(binding_json) = crate::binding::read(home, agent) else {
         tracing::debug!(
@@ -649,6 +682,52 @@ mod tests {
             queued[0].text.contains("git_conflict_detected"),
             "delivered notify must carry the rendered conflict payload, got: {}",
             queued[0].text
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn boot_seed_records_conflict_without_notifying() {
+        // #1739: record_first_observation seeds the dedup unconditionally, but
+        // suppresses the first-observation notify during the boot seeding pass —
+        // a restart must not re-ping conflicts the operator already saw.
+        let agent = "conflict-bootseed";
+        let home = defer_home("bootseed", agent);
+        // Binding with a worktree so emit_conflict_notify reaches the notify
+        // (else it early-returns and the test would have no teeth).
+        let bdir = crate::paths::runtime_dir(&home).join(agent);
+        std::fs::create_dir_all(&bdir).unwrap();
+        // Serialize via serde so the worktree path is JSON-escaped correctly —
+        // on Windows `home.display()` contains backslashes, which a hand-rolled
+        // `format!` would emit as invalid JSON escapes (breaking binding::read).
+        std::fs::write(
+            bdir.join("binding.json"),
+            serde_json::json!({ "worktree": home.to_string_lossy(), "branch": "feat" }).to_string(),
+        )
+        .unwrap();
+        let now = chrono::Utc::now();
+
+        // seeding scan: record the conflict, do NOT notify.
+        let mut last_conflict_at = HashMap::new();
+        record_first_observation(&mut last_conflict_at, &home, agent, now, true);
+        assert!(
+            last_conflict_at.contains_key(agent),
+            "boot-seed must record the conflict in last_conflict_at"
+        );
+        assert!(
+            crate::notification_queue::drain(&home, agent).is_empty(),
+            "boot-seed must NOT notify for a restart-existing conflict \
+             (negative-probe: removing the `if !seeding` gate makes this fire)"
+        );
+
+        // normal first observation: the notify fires.
+        let mut lc2 = HashMap::new();
+        record_first_observation(&mut lc2, &home, agent, now, false);
+        assert_eq!(
+            crate::notification_queue::drain(&home, agent).len(),
+            1,
+            "a normal first-observation conflict must notify"
         );
         std::fs::remove_dir_all(&home).ok();
     }

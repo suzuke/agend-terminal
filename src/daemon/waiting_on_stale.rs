@@ -26,6 +26,11 @@ pub(crate) struct WaitingOnStaleTracker {
     tick_count: u64,
     /// agent → last alert timestamp (dedup guard).
     last_alerted_at: HashMap<String, chrono::DateTime<chrono::Utc>>,
+    /// #1739 boot-seed latch. The first scan after a fresh daemon start seeds
+    /// `last_alerted_at` with currently-stale waiters (stamped now) WITHOUT
+    /// emitting, so a restart doesn't re-alert conditions the operator already
+    /// saw. Only waiters newly stale after boot (or past REALERT_INTERVAL) emit.
+    seeded: bool,
 }
 
 impl WaitingOnStaleTracker {
@@ -35,7 +40,9 @@ impl WaitingOnStaleTracker {
             return false;
         }
         self.tick_count = 0;
-        scan_and_emit(home, &mut self.last_alerted_at);
+        let seeding = !self.seeded;
+        self.seeded = true;
+        scan_and_emit(home, &mut self.last_alerted_at, seeding);
         true
     }
 }
@@ -45,6 +52,7 @@ impl WaitingOnStaleTracker {
 pub(crate) fn scan_and_emit(
     home: &Path,
     last_alerted: &mut HashMap<String, chrono::DateTime<chrono::Utc>>,
+    seeding: bool,
 ) {
     let now = chrono::Utc::now();
     let meta_dir = home.join("metadata");
@@ -88,15 +96,20 @@ pub(crate) fn scan_and_emit(
             }
         }
         let elapsed_min = elapsed_secs / 60;
-        // #event-bus Step 2 (legacy-zero): the bus is the sole delivery path.
-        crate::daemon::event_bus::global().emit(
-            home,
-            crate::daemon::event_bus::EventKind::WaitingOnStale {
-                agent: agent.to_string(),
-                condition: condition.to_string(),
-                elapsed_min,
-            },
-        );
+        // #1739 boot-seed: on the first scan, record the stale waiter without
+        // emitting (treated as already-known across the restart). The dedup
+        // insert below still runs so later scans suppress it.
+        if !seeding {
+            // #event-bus Step 2 (legacy-zero): the bus is the sole delivery path.
+            crate::daemon::event_bus::global().emit(
+                home,
+                crate::daemon::event_bus::EventKind::WaitingOnStale {
+                    agent: agent.to_string(),
+                    condition: condition.to_string(),
+                    elapsed_min,
+                },
+            );
+        }
         last_alerted.insert(agent.to_string(), now);
     }
 }
@@ -208,7 +221,7 @@ mod tests {
         std::fs::create_dir_all(home.join("inbox")).unwrap();
 
         let mut last_alerted = HashMap::new();
-        scan_and_emit(&home, &mut last_alerted);
+        scan_and_emit(&home, &mut last_alerted, false);
 
         assert!(last_alerted.contains_key("dev-1"));
         let inbox_file = home.join("inbox").join("dev-1.jsonl");
@@ -221,13 +234,45 @@ mod tests {
     }
 
     #[test]
+    fn boot_seed_suppresses_existing_stale_then_no_reburst() {
+        // #1739: the first scan after a fresh daemon start seeds an
+        // already-stale waiter into the dedup WITHOUT emitting (restart should
+        // not re-alert backlog the operator saw before), and a subsequent scan
+        // does not re-burst it.
+        let home = tmp_home("bootseed");
+        let since = (chrono::Utc::now() - chrono::Duration::minutes(20)).to_rfc3339();
+        write_metadata(&home, "dev-bs", "review from reviewer", &since);
+        std::fs::create_dir_all(home.join("inbox")).unwrap();
+
+        let mut last_alerted = HashMap::new();
+        // seeding scan: record the existing stale waiter, but do NOT emit.
+        scan_and_emit(&home, &mut last_alerted, true);
+        assert!(
+            last_alerted.contains_key("dev-bs"),
+            "boot-seed must record the existing stale waiter in the dedup"
+        );
+        assert!(
+            !home.join("inbox").join("dev-bs.jsonl").exists(),
+            "boot-seed must NOT emit for restart-existing backlog (negative-probe: \
+             removing the `if !seeding` gate makes this fire)"
+        );
+        // next normal scan: the seeded waiter stays suppressed (no boot-burst).
+        scan_and_emit(&home, &mut last_alerted, false);
+        assert!(
+            !home.join("inbox").join("dev-bs.jsonl").exists(),
+            "seeded waiter must remain suppressed on the next scan within REALERT"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn skips_fresh_waiting_on() {
         let home = tmp_home("fresh");
         let since = (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
         write_metadata(&home, "dev-2", "CI result", &since);
 
         let mut last_alerted = HashMap::new();
-        scan_and_emit(&home, &mut last_alerted);
+        scan_and_emit(&home, &mut last_alerted, false);
 
         assert!(!last_alerted.contains_key("dev-2"));
         let _ = std::fs::remove_dir_all(&home);
@@ -241,7 +286,7 @@ mod tests {
         std::fs::create_dir_all(home.join("inbox")).unwrap();
 
         let mut last_alerted = HashMap::new();
-        scan_and_emit(&home, &mut last_alerted);
+        scan_and_emit(&home, &mut last_alerted, false);
         assert!(last_alerted.contains_key("dev-3"));
 
         let count_lines = || {
@@ -252,7 +297,7 @@ mod tests {
         };
         let first_count = count_lines();
 
-        scan_and_emit(&home, &mut last_alerted);
+        scan_and_emit(&home, &mut last_alerted, false);
         assert_eq!(
             count_lines(),
             first_count,
@@ -333,7 +378,7 @@ mod tests {
         let since = (chrono::Utc::now() - chrono::Duration::minutes(20)).to_rfc3339();
         write_metadata(&home, "dev-gateoff", "blocker", &since);
         let mut last_alerted = HashMap::new();
-        scan_and_emit(&home, &mut last_alerted);
+        scan_and_emit(&home, &mut last_alerted, false);
         assert!(
             !drained_payloads(&home, "dev-gateoff").is_empty(),
             "#event-bus Option A: gate-off must deliver via the legacy path (no regression)"

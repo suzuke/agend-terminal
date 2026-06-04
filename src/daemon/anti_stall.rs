@@ -42,12 +42,18 @@ pub(crate) struct AntiStallTracker {
     /// Tick counter — used to gate scans to once per
     /// [`TICKS_PER_SCAN`] supervisor ticks.
     tick_count: u64,
-    /// Per-task last-emitted-at timestamp (RFC3339 string for
-    /// portability across daemon restart — though state is
-    /// in-memory only and resets on restart, which acceptable: a
-    /// fresh restart re-scans and re-emits, surfacing live stalls
-    /// to operators who may have missed prior warnings).
+    /// Per-task last-emitted-at timestamp. In-memory only. #1739: the first
+    /// scan after a fresh daemon start *seeds* this map with every
+    /// currently-stalled task (stamped now) WITHOUT emitting — restart-existing
+    /// stalls are treated as already-known so the operator isn't re-flooded
+    /// with warnings they already saw before the restart. Only stalls that
+    /// newly appear after boot (or persist past the per-task dedup window)
+    /// emit. (Boot-grace was insufficient here: the first scan lands ~5 min in,
+    /// past any short grace, and the backlog persists across restart.)
     last_emitted_at: HashMap<String, chrono::DateTime<chrono::Utc>>,
+    /// #1739 boot-seed latch: false until the first scan has seeded
+    /// `last_emitted_at`. The seeding scan records without emitting.
+    seeded: bool,
 }
 
 impl AntiStallTracker {
@@ -60,16 +66,23 @@ impl AntiStallTracker {
             return false;
         }
         self.tick_count = 0;
-        scan_and_emit(home, &mut self.last_emitted_at);
+        let seeding = !self.seeded;
+        self.seeded = true;
+        scan_and_emit(home, &mut self.last_emitted_at, seeding);
         true
     }
 }
 
 /// Pure scan logic — exposed for tests so they can invoke without
 /// waiting through 30 supervisor ticks.
+/// `seeding` (#1739): when true (the first scan after a fresh daemon start),
+/// record currently-stalled tasks into `last_emitted` without emitting — they
+/// are treated as already-known so a restart doesn't re-flood warnings. The
+/// dedup `insert` still runs so subsequent scans suppress them.
 pub(crate) fn scan_and_emit(
     home: &Path,
     last_emitted: &mut HashMap<String, chrono::DateTime<chrono::Utc>>,
+    seeding: bool,
 ) {
     let tasks = crate::tasks::list_all(home);
     let now = chrono::Utc::now();
@@ -90,7 +103,9 @@ pub(crate) fn scan_and_emit(
                     continue;
                 }
             }
-            emit_stall(home, task, &reason);
+            if !seeding {
+                emit_stall(home, task, &reason);
+            }
             last_emitted.insert(task.id.clone(), now);
         }
     }
@@ -738,5 +753,87 @@ mod tests {
         );
         std::fs::remove_dir_all(&home_legacy).ok();
         std::fs::remove_dir_all(&home_bus).ok();
+    }
+
+    #[test]
+    fn boot_seed_suppresses_existing_stall_then_no_reburst() {
+        // #1739: the first scan after a fresh daemon start seeds an
+        // already-stalled task into the dedup WITHOUT emitting (restart should
+        // not re-flood warnings the operator already saw), and a subsequent
+        // scan does not re-burst it.
+        let _g = env_lock();
+        std::env::remove_var("AGEND_TASK_STALL_RECIPIENTS");
+        let home = tmp_home("ls-bootseed");
+        let inst = crate::task_events::InstanceName::from("test");
+        let tid = || crate::task_events::TaskId::from("t-bs");
+        crate::task_events::append(
+            &home,
+            &inst,
+            crate::task_events::TaskEvent::Created {
+                task_id: tid(),
+                title: "bootseed".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: None,
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: None,
+                bind: None,
+                eta_secs: Some(60),
+                tags: vec![],
+                parent_id: None,
+            },
+        )
+        .unwrap();
+        crate::task_events::append(
+            &home,
+            &inst,
+            crate::task_events::TaskEvent::Claimed {
+                task_id: tid(),
+                by: inst.clone(),
+            },
+        )
+        .unwrap();
+        crate::task_events::append(
+            &home,
+            &inst,
+            crate::task_events::TaskEvent::InProgress {
+                task_id: tid(),
+                by: inst.clone(),
+            },
+        )
+        .unwrap();
+        // Back-date the progress sidecar so the task reads as stalled
+        // (elapsed ≫ eta_secs*1.5). check_stalled reads this before started_at.
+        let prog_dir = home.join("task-progress");
+        std::fs::create_dir_all(&prog_dir).unwrap();
+        let old = (chrono::Utc::now() - chrono::Duration::seconds(9999)).to_rfc3339();
+        std::fs::write(
+            prog_dir.join("t-bs.json"),
+            format!(r#"{{"schema_version":1,"last_progress_at":"{old}","source":"broadcast"}}"#),
+        )
+        .unwrap();
+
+        let mut last_emitted = HashMap::new();
+        // seeding scan: record the stalled task, do NOT emit.
+        scan_and_emit(&home, &mut last_emitted, true);
+        assert!(
+            last_emitted.contains_key("t-bs"),
+            "boot-seed must record the stalled task in the dedup"
+        );
+        assert!(
+            crate::inbox::drain(&home, "general").is_empty(),
+            "boot-seed must NOT emit for a restart-existing stall (negative-probe: \
+             removing the `if !seeding` gate makes this fire)"
+        );
+        assert!(crate::inbox::drain(&home, "lead").is_empty());
+        // next normal scan: the seeded stall stays suppressed within the window.
+        scan_and_emit(&home, &mut last_emitted, false);
+        assert!(
+            crate::inbox::drain(&home, "general").is_empty(),
+            "seeded stall must remain suppressed on the next scan"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 }

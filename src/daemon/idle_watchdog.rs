@@ -232,6 +232,11 @@ pub(crate) struct IdleWatchdogTracker {
     tick_count: u64,
     /// (vantage, agent_or_fleet_marker) → last alert ts.
     last_alerted_at: HashMap<(&'static str, String), chrono::DateTime<chrono::Utc>>,
+    /// #1739 boot-seed latch for the DEV vantage. First scan seeds the dev
+    /// entries of `last_alerted_at` (stamped now) WITHOUT emitting, so a restart
+    /// doesn't re-page about agents already idle before the restart. The fleet
+    /// vantage is unaffected — it has its own persisted snooze.
+    seeded: bool,
 }
 
 impl IdleWatchdogTracker {
@@ -243,7 +248,9 @@ impl IdleWatchdogTracker {
             return false;
         }
         self.tick_count = 0;
-        scan_and_emit(home, &mut self.last_alerted_at);
+        let seeding = !self.seeded;
+        self.seeded = true;
+        scan_and_emit(home, &mut self.last_alerted_at, seeding);
         true
     }
 }
@@ -289,6 +296,7 @@ fn fleet_idle_recipient() -> String {
 pub(crate) fn scan_and_emit(
     home: &Path,
     last_alerted: &mut HashMap<(&'static str, String), chrono::DateTime<chrono::Utc>>,
+    seeding: bool,
 ) {
     if !crate::runtime_config::get().idle_watchdog_enabled {
         return;
@@ -297,7 +305,10 @@ pub(crate) fn scan_and_emit(
         return;
     }
     let now = chrono::Utc::now();
-    scan_dev_vantage(home, &now, last_alerted);
+    // #1739: only the DEV vantage gets boot-seeded (it used the in-memory
+    // `last_alerted` dedup that re-fired on restart). The fleet vantage has its
+    // own persisted snooze, so it is left as-is.
+    scan_dev_vantage(home, &now, last_alerted, seeding);
     scan_fleet_vantage(home, &now, last_alerted);
 }
 
@@ -397,6 +408,7 @@ fn scan_dev_vantage(
     home: &Path,
     now: &chrono::DateTime<chrono::Utc>,
     last_alerted: &mut HashMap<(&'static str, String), chrono::DateTime<chrono::Utc>>,
+    seeding: bool,
 ) {
     let env_agent = std::env::var("AGEND_IDLE_WATCHDOG_AGENT")
         .ok()
@@ -460,19 +472,22 @@ fn scan_dev_vantage(
         if task_info == "(no active task)" && task_board_is_active(home) {
             continue;
         }
-        route_idle_alert(
-            home,
-            &dev_idle_recipient(),
-            "dev_idle_watchdog",
-            &format!(
-                "[dev_idle_watchdog] agent '{agent}' has been silent for \
-                 {elapsed_secs}s (threshold {threshold}s). \
-                 Current task: {task_info}. \
-                 Possible dispatch protocol gap or unblock-needed state. \
-                 Consider: lead dispatch / unblock-ping / decision-log scan.",
-            ),
-            Some(agent),
-        );
+        // #1739 boot-seed: first scan records the idle agent without paging.
+        if !seeding {
+            route_idle_alert(
+                home,
+                &dev_idle_recipient(),
+                "dev_idle_watchdog",
+                &format!(
+                    "[dev_idle_watchdog] agent '{agent}' has been silent for \
+                     {elapsed_secs}s (threshold {threshold}s). \
+                     Current task: {task_info}. \
+                     Possible dispatch protocol gap or unblock-needed state. \
+                     Consider: lead dispatch / unblock-ping / decision-log scan.",
+                ),
+                Some(agent),
+            );
+        }
         last_alerted.insert(key, *now);
     }
 }
@@ -885,7 +900,7 @@ mod tests {
         let stale = chrono::Utc::now() - chrono::Duration::seconds(dev_idle_threshold_secs() + 60);
         write_activity_at(&home, "dev", stale);
         let mut last_alerted = HashMap::new();
-        scan_and_emit(&home, &mut last_alerted);
+        scan_and_emit(&home, &mut last_alerted, false);
         let lead = crate::inbox::drain(&home, "lead");
         // #1563: the fleet recipient now also defaults to `lead`, so a
         // single-agent idle fleet co-fires a `fleet_idle_watchdog` alert here
@@ -900,6 +915,48 @@ mod tests {
             "lead must receive one dev idle alert: {lead:?}"
         );
         assert!(dev_alerts[0].text.contains("dev"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn boot_seed_suppresses_existing_idle_dev_then_no_reburst() {
+        // #1739: the first scan after a fresh daemon start seeds an already-idle
+        // dev agent into the dedup WITHOUT paging lead, and a subsequent scan
+        // does not re-burst it. (Only the dev vantage is seeded; the fleet
+        // vantage is unaffected, so we filter by the `dev_idle_watchdog` kind.)
+        let _g = env_lock();
+        std::env::remove_var("AGEND_IDLE_WATCHDOG_AGENT");
+        std::env::remove_var("AGEND_IDLE_WATCHDOG_DEV_RECIPIENT");
+        let home = tmp_home("dev-bootseed");
+        let stale = chrono::Utc::now() - chrono::Duration::seconds(dev_idle_threshold_secs() + 60);
+        write_activity_at(&home, "dev", stale);
+        let count_dev_alerts = |home: &Path| {
+            crate::inbox::drain(home, "lead")
+                .into_iter()
+                .filter(|m| m.kind.as_deref() == Some("dev_idle_watchdog"))
+                .count()
+        };
+
+        let mut last_alerted = HashMap::new();
+        // seeding scan: record the idle dev, do NOT page.
+        scan_and_emit(&home, &mut last_alerted, true);
+        assert_eq!(
+            count_dev_alerts(&home),
+            0,
+            "boot-seed must NOT page lead for a restart-existing idle dev \
+             (negative-probe: removing the `if !seeding` gate makes this fire)"
+        );
+        assert!(
+            last_alerted.keys().any(|(vantage, _)| *vantage == "dev"),
+            "boot-seed must record the idle dev in the dev-vantage dedup"
+        );
+        // next normal scan: the seeded dev stays suppressed within threshold.
+        scan_and_emit(&home, &mut last_alerted, false);
+        assert_eq!(
+            count_dev_alerts(&home),
+            0,
+            "seeded idle dev must remain suppressed on the next scan"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -922,7 +979,7 @@ mod tests {
         write_activity_at(&home, "lead", stale);
         write_activity_at(&home, "worker", stale);
         let mut last_alerted = HashMap::new();
-        scan_and_emit(&home, &mut last_alerted);
+        scan_and_emit(&home, &mut last_alerted, false);
         // Alerts are delivered to the dev recipient ("lead"); inspect them.
         let alerts = crate::inbox::drain(&home, "lead");
         let dev_alerts: Vec<&str> = alerts
@@ -950,7 +1007,7 @@ mod tests {
         let recent = chrono::Utc::now() - chrono::Duration::seconds(dev_idle_threshold_secs() - 60);
         write_activity_at(&home, "dev", recent);
         let mut last_alerted = HashMap::new();
-        scan_and_emit(&home, &mut last_alerted);
+        scan_and_emit(&home, &mut last_alerted, false);
         let lead = crate::inbox::drain(&home, "lead");
         // #1563: assert the DEV vantage specifically — a `fleet_idle_watchdog`
         // alert may co-land on `lead` (the agent is past the shorter fleet
@@ -974,7 +1031,7 @@ mod tests {
         let stale = chrono::Utc::now() - chrono::Duration::seconds(dev_idle_threshold_secs() + 60);
         write_activity_at(&home, "dev", stale);
         let mut last_alerted = HashMap::new();
-        scan_and_emit(&home, &mut last_alerted);
+        scan_and_emit(&home, &mut last_alerted, false);
         let after_first = crate::inbox::drain(&home, "lead");
         // #1563: filter the DEV vantage (fleet_idle co-fires to lead now).
         assert_eq!(
@@ -988,7 +1045,7 @@ mod tests {
         // Touch activity (simulate dev resuming work).
         touch_agent_activity(&home, "dev");
         // Second scan: dev fresh → no alert.
-        scan_and_emit(&home, &mut last_alerted);
+        scan_and_emit(&home, &mut last_alerted, false);
         let after_second = crate::inbox::drain(&home, "lead");
         assert!(
             after_second.is_empty(),
@@ -1018,7 +1075,7 @@ mod tests {
         write_activity_at(&home, "lead", stale_lead);
         write_activity_at(&home, "reviewer", stale_reviewer);
         let mut last_alerted = HashMap::new();
-        scan_and_emit(&home, &mut last_alerted);
+        scan_and_emit(&home, &mut last_alerted, false);
         let recipient = crate::inbox::drain(&home, "lead");
         assert!(
             recipient
@@ -1047,7 +1104,7 @@ mod tests {
         write_activity_at(&home, "lead", stale);
         write_activity_at(&home, "general", recent);
         let mut last_alerted = HashMap::new();
-        scan_and_emit(&home, &mut last_alerted);
+        scan_and_emit(&home, &mut last_alerted, false);
         let recipient = crate::inbox::drain(&home, "lead");
         assert!(
             !recipient
@@ -1073,7 +1130,7 @@ mod tests {
         write_activity_at(&home, "dev", stale);
         write_activity_at(&home, "lead", stale);
         let mut last_alerted = HashMap::new();
-        scan_and_emit(&home, &mut last_alerted);
+        scan_and_emit(&home, &mut last_alerted, false);
         let recipient = crate::inbox::drain(&home, "lead");
         let fleet_msg = recipient
             .iter()
@@ -1140,8 +1197,8 @@ mod tests {
         let mut last_alerted = HashMap::new();
         // Two scans without intervening activity touch → dedup
         // suppresses the second alert.
-        scan_and_emit(&home, &mut last_alerted);
-        scan_and_emit(&home, &mut last_alerted);
+        scan_and_emit(&home, &mut last_alerted, false);
+        scan_and_emit(&home, &mut last_alerted, false);
         let lead = crate::inbox::drain(&home, "lead");
         // #1563: filter the DEV vantage (fleet_idle co-fires to lead now); the
         // dedup contract is per-vantage → exactly one dev alert across 2 scans.
@@ -1165,7 +1222,7 @@ mod tests {
         std::env::remove_var("AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT");
         let home = tmp_home("fleet-empty");
         let mut last_alerted = HashMap::new();
-        scan_and_emit(&home, &mut last_alerted);
+        scan_and_emit(&home, &mut last_alerted, false);
         let recipient = crate::inbox::drain(&home, "lead");
         assert!(recipient.is_empty(), "empty fleet must not alert");
         std::fs::remove_dir_all(&home).ok();
@@ -1295,7 +1352,7 @@ mod tests {
         write_activity_at(&home, "demo-lead", stale);
         write_activity_at(&home, "conflict-test-1", stale);
         let mut last_alerted = HashMap::new();
-        scan_and_emit(&home, &mut last_alerted);
+        scan_and_emit(&home, &mut last_alerted, false);
         let recipient = crate::inbox::drain(&home, "lead");
         let fleet_msg = recipient
             .iter()
@@ -1337,7 +1394,7 @@ mod tests {
         let until = chrono::Utc::now() + chrono::Duration::hours(1);
         snooze_fleet_idle(&home, until, "test").unwrap();
         let mut last_alerted = HashMap::new();
-        scan_and_emit(&home, &mut last_alerted);
+        scan_and_emit(&home, &mut last_alerted, false);
         let recipient = crate::inbox::drain(&home, "lead");
         assert!(
             !recipient
@@ -1361,7 +1418,7 @@ mod tests {
         let past = chrono::Utc::now() - chrono::Duration::seconds(10);
         snooze_fleet_idle(&home, past, "test").unwrap();
         let mut last_alerted = HashMap::new();
-        scan_and_emit(&home, &mut last_alerted);
+        scan_and_emit(&home, &mut last_alerted, false);
         let recipient = crate::inbox::drain(&home, "lead");
         assert!(
             recipient
@@ -1385,7 +1442,7 @@ mod tests {
         let until = chrono::Utc::now() + chrono::Duration::hours(1);
         snooze_fleet_idle(&home, until, "test").unwrap();
         let mut last_alerted = HashMap::new();
-        scan_and_emit(&home, &mut last_alerted);
+        scan_and_emit(&home, &mut last_alerted, false);
         let lead = crate::inbox::drain(&home, "lead");
         assert!(
             !lead
@@ -1425,7 +1482,7 @@ mod tests {
         write_activity_at(&home, "ghost-1", stale);
         write_activity_at(&home, "ghost-2", stale);
         let mut last_alerted = HashMap::new();
-        scan_and_emit(&home, &mut last_alerted);
+        scan_and_emit(&home, &mut last_alerted, false);
         let recipient = crate::inbox::drain(&home, "lead");
         assert!(
             !recipient
@@ -1450,7 +1507,7 @@ mod tests {
         write_activity_at(&home, "lead", stale);
         ack_fleet_idle();
         let mut last_alerted = HashMap::new();
-        scan_and_emit(&home, &mut last_alerted);
+        scan_and_emit(&home, &mut last_alerted, false);
         let recipient = crate::inbox::drain(&home, "lead");
         assert!(
             !recipient
@@ -1485,7 +1542,7 @@ mod tests {
         seed_task(&home, "t-resume", "dev");
         advance_task(&home, "t-resume", "dev");
         let mut last_alerted = HashMap::new();
-        scan_and_emit(&home, &mut last_alerted);
+        scan_and_emit(&home, &mut last_alerted, false);
         let recipient = crate::inbox::drain(&home, "lead");
         assert!(
             recipient
@@ -1524,7 +1581,7 @@ mod tests {
             chrono::DateTime::from_timestamp(acked, 0).unwrap() + chrono::Duration::seconds(5);
         write_activity_at(&home, "general", post_ack);
         let mut last_alerted = HashMap::new();
-        scan_and_emit(&home, &mut last_alerted);
+        scan_and_emit(&home, &mut last_alerted, false);
         let recipient = crate::inbox::drain(&home, "lead");
         assert!(
             !recipient
@@ -1562,7 +1619,7 @@ mod tests {
         // dev (task owner) becomes active AFTER the ack.
         write_activity_at(&home, "dev", past_ack + chrono::Duration::seconds(30));
         let mut last_alerted = HashMap::new();
-        scan_and_emit(&home, &mut last_alerted);
+        scan_and_emit(&home, &mut last_alerted, false);
         assert_eq!(
             FLEET_ACKED_AT.load(Ordering::Relaxed),
             0,
@@ -1589,7 +1646,7 @@ mod tests {
             chrono::Utc::now() - chrono::Duration::seconds(fleet_idle_ack_ttl_secs() + 60);
         FLEET_ACKED_AT.store(old_ack.timestamp(), Ordering::Relaxed);
         let mut last_alerted = HashMap::new();
-        scan_and_emit(&home, &mut last_alerted);
+        scan_and_emit(&home, &mut last_alerted, false);
         assert_eq!(
             FLEET_ACKED_AT.load(Ordering::Relaxed),
             0,
@@ -1628,7 +1685,7 @@ mod tests {
         )
         .unwrap();
         let mut last_alerted = HashMap::new();
-        scan_and_emit(&home, &mut last_alerted);
+        scan_and_emit(&home, &mut last_alerted, false);
         let recipient = crate::inbox::drain(&home, "lead");
         assert!(
             !recipient
@@ -1649,7 +1706,7 @@ mod tests {
         write_activity_at(&home, "dev", stale);
         ack_fleet_idle();
         let mut last_alerted = HashMap::new();
-        scan_and_emit(&home, &mut last_alerted);
+        scan_and_emit(&home, &mut last_alerted, false);
         let lead = crate::inbox::drain(&home, "lead");
         assert!(
             lead.iter()
@@ -1673,7 +1730,7 @@ mod tests {
         // Create an empty task_events.jsonl (board exists, no open tasks).
         std::fs::write(home.join("task_events.jsonl"), "").unwrap();
         let mut last_alerted = HashMap::new();
-        scan_and_emit(&home, &mut last_alerted);
+        scan_and_emit(&home, &mut last_alerted, false);
         let recipient = crate::inbox::drain(&home, "lead");
         assert!(
             !recipient
@@ -1716,7 +1773,7 @@ mod tests {
         )
         .unwrap();
         let mut last_alerted = HashMap::new();
-        scan_and_emit(&home, &mut last_alerted);
+        scan_and_emit(&home, &mut last_alerted, false);
         let recipient = crate::inbox::drain(&home, "lead");
         assert!(
             recipient
@@ -1746,7 +1803,7 @@ mod tests {
         let stale = chrono::Utc::now() - chrono::Duration::seconds(400);
         write_activity_at(&home, "fast-reviewer", stale);
         let mut last_alerted = HashMap::new();
-        scan_and_emit(&home, &mut last_alerted);
+        scan_and_emit(&home, &mut last_alerted, false);
         let lead = crate::inbox::drain(&home, "lead");
         assert!(
             lead.iter()
@@ -1774,7 +1831,7 @@ mod tests {
         let recent = chrono::Utc::now() - chrono::Duration::seconds(200);
         write_activity_at(&home, "fast-reviewer", recent);
         let mut last_alerted = HashMap::new();
-        scan_and_emit(&home, &mut last_alerted);
+        scan_and_emit(&home, &mut last_alerted, false);
         let lead = crate::inbox::drain(&home, "lead");
         assert!(
             lead.is_empty(),
@@ -1794,7 +1851,7 @@ mod tests {
         let stale = chrono::Utc::now() - chrono::Duration::seconds(dev_idle_threshold_secs() + 60);
         write_activity_at(&home, "slow-dev", stale);
         let mut last_alerted = HashMap::new();
-        scan_and_emit(&home, &mut last_alerted);
+        scan_and_emit(&home, &mut last_alerted, false);
         let lead = crate::inbox::drain(&home, "lead");
         assert!(
             lead.iter()
@@ -1840,7 +1897,7 @@ mod tests {
         let stale = chrono::Utc::now() - chrono::Duration::seconds(400);
         write_activity_at(&home, "dev", stale);
         let mut last_alerted = HashMap::new();
-        scan_and_emit(&home, &mut last_alerted);
+        scan_and_emit(&home, &mut last_alerted, false);
         let lead = crate::inbox::drain(&home, "lead");
         assert!(!lead.is_empty(), "alert must fire");
         assert!(
