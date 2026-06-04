@@ -39,7 +39,13 @@ pub(super) fn handle_crash_respawn(home: &Path, crashed_name: &str, ctx: &Daemon
     // teams-file read) BEFORE taking the registry lock, so no file IO runs under
     // the lock (#1530 class). A self-orchestrator crash has no peer to relay an
     // inbox P0, so it escalates straight to the operator (below).
-    let is_self_orch = crate::teams::is_self_orchestrator(home, crashed_name);
+    // #1744-M7: 3-state. The crash path stays CONSERVATIVE — only a determinate
+    // `Yes` fires the self-orch P0; `Unknown` (teams config unreadable) falls
+    // back to the generic recent>=2 notify rather than firing the more-aggressive
+    // leaderless page off an indeterminate read. (The no-peer hung/AuthError
+    // paths fail the other way — they escalate on `Unknown`.)
+    let self_orch = crate::teams::self_orch_status(home, crashed_name);
+    let is_self_orch = self_orch == crate::teams::SelfOrchStatus::Yes;
 
     let (should_respawn, delay, should_notify, fire_self_orch_p0, escalation_snapshot) = {
         let reg = agent::lock_registry(&ctx.registry);
@@ -140,17 +146,14 @@ fn notify_self_orch_crash(
          until it respawns and no peer can relay this. The respawn loses its in-memory \
          context; check for a crash-loop / re-prime it. Manual intervention may be required."
     );
-    if let Some(ch) = crate::channel::active_channel() {
-        let _ = crate::channel::gated_notify(
-            ch.as_ref(),
-            crashed_name,
-            NotifySeverity::Error,
-            &msg,
-            false,
-        );
-    } else {
-        tracing::debug!(agent = %crashed_name, "no active channel for self-orch crash P0");
-    }
+    // #1744-M6: every registered channel — a leaderless-orchestrator P0 must not
+    // be dropped just because the fleet runs multiple channels.
+    crate::channel::notify_all_escalation_channels(
+        crashed_name,
+        NotifySeverity::Error,
+        &msg,
+        false,
+    );
 }
 
 fn notify_crash(
@@ -166,17 +169,13 @@ fn notify_crash(
     };
     tracing::warn!(agent = %crashed_name, %state, "notifying");
     let msg = format!("[health] {crashed_name}: {state}");
-    if let Some(ch) = crate::channel::active_channel() {
-        let _ = crate::channel::gated_notify(
-            ch.as_ref(),
-            crashed_name,
-            NotifySeverity::Error,
-            &msg,
-            false,
-        );
-    } else {
-        tracing::debug!(agent = %crashed_name, "no active channel for crash notification");
-    }
+    // #1744-M6: every registered channel (multi-channel-safe).
+    crate::channel::notify_all_escalation_channels(
+        crashed_name,
+        NotifySeverity::Error,
+        &msg,
+        false,
+    );
 }
 
 fn respawn_agent_worker(

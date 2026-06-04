@@ -659,21 +659,17 @@ fn format_stage3_body(name: &str, recovery_restart_count: u32) -> String {
 /// info-leak gate prevents leakage when channel is unauthorised.
 fn notify_stage3_escalate(name: &str, snapshot: &DispatchSnapshot) {
     let body = format_stage3_body(name, snapshot.recovery_restart_count);
-    if let Some(channel) = crate::channel::active_channel() {
-        let _ = crate::channel::gated_notify(
-            channel.as_ref(),
-            name,
-            crate::channel::NotifySeverity::Error,
-            &body,
-            false,
-        );
-    } else {
-        tracing::debug!(
-            target: TARGET,
-            agent = %name,
-            "stage3 telegram skipped: no active channel"
-        );
-    }
+    // #1744-M6: Stage 3 is an Error-severity operator P0 (auto-recovery exhausted,
+    // only operator action resumes) — deliver to EVERY registered channel.
+    // `active_channel()` would silently drop it in a multi-channel fleet. (Stage 2
+    // above stays `Warn` + `active_channel()` — not a P0.) `gated_notify` inside
+    // the helper still enforces the info-leak / authorization gate per channel.
+    crate::channel::notify_all_escalation_channels(
+        name,
+        crate::channel::NotifySeverity::Error,
+        &body,
+        false,
+    );
 }
 
 /// Stage 1 alive-stuck branch — emit ESC byte (or shadow-log it),

@@ -521,6 +521,31 @@ fn self_orchestrator_escalates(new_state: crate::state::AgentState) -> bool {
     new_state == crate::state::AgentState::AuthError
 }
 
+/// #1595/#1744: escalate a self-orchestrator `AuthError` straight to the operator
+/// — stamp the per-agent notify cooldown (so a persistent AuthError pages at most
+/// once per `NOTIFY_COOLDOWN`) and dispatch the P0 to EVERY registered channel
+/// (#1744-M6: multi-channel-safe; `active_channel()` would silently drop it).
+/// Shared by the resolved-self-orch path AND the #1744-M7 fail-closed path
+/// (teams config unreadable → can't identify a peer to relay to, and AuthError is
+/// operator-only, so page the operator rather than drop).
+fn escalate_self_orch_autherror(
+    name: &str,
+    now: Instant,
+    tracks: &mut HashMap<String, NotifyTrack>,
+) {
+    let track = tracks.entry(name.to_string()).or_insert(NotifyTrack {
+        last_at: now,
+        consecutive: 0,
+    });
+    track.consecutive += 1;
+    track.last_at = now;
+    let msg = format!(
+        "🔑 {name} (team orchestrator) hit AuthError — only the operator can re-authenticate, and no peer can relay this. Check credentials / re-auth the agent."
+    );
+    crate::channel::notify_all_escalation_channels(name, NotifySeverity::Error, &msg, false);
+    tracing::info!(agent = %name, "#1595/#1744: self-orchestrator AuthError escalated to operator (all channels)");
+}
+
 /// Decide and dispatch member-state-change notify. Returns true if notify sent.
 /// Production-path-coupled per §3.5.10 — tests call this same function.
 pub(crate) fn maybe_notify_member_state_change(
@@ -541,7 +566,22 @@ pub(crate) fn maybe_notify_member_state_change(
     if !should {
         return false;
     }
-    let Some(team) = crate::teams::find_team_for(home, name) else {
+    // #1744-M7: distinguish "teams config unreadable" (Err → can't determine the
+    // orchestrator) from "loaded, no team for this member" (None). For the no-peer
+    // AuthError P0 the unreadable case fails CLOSED — escalate to the operator
+    // rather than silently dropping (we can't relay to an orchestrator we can't
+    // identify, and AuthError is operator-only). Non-escalation states stay
+    // dropped (we genuinely can't route them).
+    let fleet = match crate::teams::try_load_fleet(home) {
+        Ok(f) => f,
+        Err(_) => {
+            if self_orchestrator_escalates(new_state) {
+                escalate_self_orch_autherror(name, now, tracks);
+            }
+            return false;
+        }
+    };
+    let Some(team) = crate::teams::find_team_for_in(&fleet, name) else {
         return false;
     };
     let Some(ref orch) = team.orchestrator else {
@@ -551,7 +591,7 @@ pub(crate) fn maybe_notify_member_state_change(
     if orch == name {
         // #1595 Step 2: the orchestrator IS the affected agent — no peer can relay
         // its inbox P0. For a state only the operator can resolve (AuthError: only
-        // the operator can re-authenticate), escalate straight to operator Telegram
+        // the operator can re-authenticate), escalate straight to the operator
         // via gated_notify(Error) — the same Sleep-penetrating path #1594 allows
         // through. Cooldown-stamped so a persistent AuthError escalates at most
         // once per NOTIFY_COOLDOWN, not every tick. Other states keep the D3
@@ -561,25 +601,7 @@ pub(crate) fn maybe_notify_member_state_change(
         // follow-up (#1701) using the process-exit / HealthState::Hung paths (the
         // latter strong-gated for the known 348-FP).
         if self_orchestrator_escalates(new_state) {
-            let track = tracks.entry(name.to_string()).or_insert(NotifyTrack {
-                last_at: now,
-                consecutive: 0,
-            });
-            track.consecutive += 1;
-            track.last_at = now;
-            if let Some(ch) = crate::channel::active_channel() {
-                let msg = format!(
-                    "🔑 {name} (team orchestrator) hit AuthError — only the operator can re-authenticate, and no peer can relay this. Check credentials / re-auth the agent."
-                );
-                let _ = crate::channel::gated_notify(
-                    ch.as_ref(),
-                    name,
-                    NotifySeverity::Error,
-                    &msg,
-                    false,
-                );
-            }
-            tracing::info!(agent = %name, "#1595: self-orchestrator AuthError escalated to operator Telegram (no peer to relay)");
+            escalate_self_orch_autherror(name, now, tracks);
         }
         return false; // D3: still skip the inbox self-notify (no peer reads it)
     }
@@ -1247,17 +1269,14 @@ fn tick(
                 // agent stuck on a prompt forever. (Severity is routing-only —
                 // the Telegram adapter ignores it for rendering — so this does
                 // not change the Active-mode message.)
-                if let Some(ch) = crate::channel::active_channel() {
-                    let _ = crate::channel::gated_notify(
-                        ch.as_ref(),
-                        &name,
-                        NotifySeverity::Error,
-                        &msg,
-                        false,
-                    );
-                } else {
-                    tracing::debug!(agent = %name, "no active channel — stall notice dropped");
-                }
+                // #1744-M6: stall is an Error-severity operator P0 — deliver to
+                // every registered channel (multi-channel-safe).
+                crate::channel::notify_all_escalation_channels(
+                    &name,
+                    NotifySeverity::Error,
+                    &msg,
+                    false,
+                );
             }
             Some(NoticeAction::Recovered) => {
                 let msg = format_recovery_notice(&name);
@@ -1539,26 +1558,24 @@ pub(crate) fn process_error_recovery(
             // gave up, so a stuck member is reassigned/intervened. Inbox path only;
             // the operator Telegram alert below is the separate `gated_notify`.
             notify_orchestrator_retry_exhausted(home, name, retry.retry_count);
-            if let Some(ch) = crate::channel::active_channel() {
-                let msg = format!(
-                    "⚠️ {name} transient upstream error auto-retry exhausted ({} retries). Manual intervention required.",
-                    SERVER_RATE_LIMIT_MAX_RETRIES
-                );
-                // #1595 Step 1: `Error`, not `Warn`. Exhaustion of the #1696 tiered
-                // retry (the full ~75min budget burned) means the agent is stuck
-                // and auto-recovery has given up — a genuine P0 that MUST break
-                // through `Sleep`/`Away` to wake the operator (the #1594 gate
-                // suppresses `Warn` in Sleep, so at `Warn` this alert was silently
-                // dropped exactly when the operator most needs it). Severity is
-                // routing-only (the Telegram adapter ignores it for rendering).
-                let _ = crate::channel::gated_notify(
-                    ch.as_ref(),
-                    name,
-                    NotifySeverity::Error,
-                    &msg,
-                    false,
-                );
-            }
+            let msg = format!(
+                "⚠️ {name} transient upstream error auto-retry exhausted ({} retries). Manual intervention required.",
+                SERVER_RATE_LIMIT_MAX_RETRIES
+            );
+            // #1595 Step 1: `Error`, not `Warn`. Exhaustion of the #1696 tiered
+            // retry (the full ~75min budget burned) means the agent is stuck
+            // and auto-recovery has given up — a genuine P0 that MUST break
+            // through `Sleep`/`Away` to wake the operator (the #1594 gate
+            // suppresses `Warn` in Sleep, so at `Warn` this alert was silently
+            // dropped exactly when the operator most needs it). Severity is
+            // routing-only (the Telegram adapter ignores it for rendering).
+            // #1744-M6: deliver to every registered channel (multi-channel-safe).
+            crate::channel::notify_all_escalation_channels(
+                name,
+                NotifySeverity::Error,
+                &msg,
+                false,
+            );
             continue;
         }
         // #1696: escalation-phase observability (so a long outage is visible in the log).
@@ -1613,23 +1630,21 @@ pub(crate) fn process_error_recovery(
                     InjectFailAction::Exhaust => {
                         retry.exhausted = true;
                         notify_orchestrator_retry_exhausted(home, name, retry.retry_count);
-                        if let Some(ch) = crate::channel::active_channel() {
-                            let msg = format!(
-                                "⚠️ {name} ServerRateLimit auto-retry inject 連續失敗 {} 次、已放棄 — agent 可能 unreachable,需人工介入(檢查 pane / 重啟 / 重新指派)。",
-                                retry.inject_failures
-                            );
-                            // #1742: same Error severity + same Sleep-penetrating gate as
-                            // the budget-exhausted alert (#1595 Step 1) — a stuck agent
-                            // whose auto-recovery cannot even deliver `continue` is the
-                            // same P0 that must wake a sleeping operator.
-                            let _ = crate::channel::gated_notify(
-                                ch.as_ref(),
-                                name,
-                                NotifySeverity::Error,
-                                &msg,
-                                false,
-                            );
-                        }
+                        let msg = format!(
+                            "⚠️ {name} ServerRateLimit auto-retry inject 連續失敗 {} 次、已放棄 — agent 可能 unreachable,需人工介入(檢查 pane / 重啟 / 重新指派)。",
+                            retry.inject_failures
+                        );
+                        // #1742: same Error severity + same Sleep-penetrating gate as
+                        // the budget-exhausted alert (#1595 Step 1) — a stuck agent
+                        // whose auto-recovery cannot even deliver `continue` is the
+                        // same P0 that must wake a sleeping operator.
+                        // #1744-M6: every registered channel (multi-channel-safe).
+                        crate::channel::notify_all_escalation_channels(
+                            name,
+                            NotifySeverity::Error,
+                            &msg,
+                            false,
+                        );
                     }
                 }
             }
@@ -2614,6 +2629,58 @@ instances:
         assert_eq!(
             tracks["solo"].consecutive, 1,
             "#1595: NOTIFY_COOLDOWN must prevent re-escalation within the window"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1744-M7: when the teams config is UNREADABLE (exists but corrupt → the
+    /// orchestrator can't be identified), a self-orch AuthError must STILL escalate
+    /// to the operator (fail-closed) — we can't relay to a peer we can't find and
+    /// AuthError is operator-only. A non-escalation state under the same unreadable
+    /// config stays dropped (we genuinely can't route it).
+    #[test]
+    fn self_orch_autherror_fail_closed_on_unreadable_teams_1744_m7() {
+        let home = std::env::temp_dir().join(format!("agend-1744m7-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join("inbox")).ok();
+        // Corrupt (existing-but-invalid) fleet.yaml → try_load_fleet Err → Unknown.
+        let _ = std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "teams: : : not valid [[[\n",
+        );
+
+        // AuthError → fail-closed escalation runs (stamps the cooldown track).
+        let mut tracks = std::collections::HashMap::new();
+        let sent = super::maybe_notify_member_state_change(
+            &home,
+            "solo",
+            crate::state::AgentState::Idle,
+            crate::state::AgentState::AuthError,
+            "",
+            &mut tracks,
+        );
+        assert!(!sent, "still not an inbox self-notify");
+        assert_eq!(
+            tracks.get("solo").map(|t| t.consecutive),
+            Some(1),
+            "#1744-M7: AuthError must escalate even when teams config is unreadable (fail-closed)"
+        );
+
+        // A non-escalation state under the same unreadable config → no escalation.
+        let mut tracks2 = std::collections::HashMap::new();
+        let sent2 = super::maybe_notify_member_state_change(
+            &home,
+            "solo",
+            crate::state::AgentState::Idle,
+            crate::state::AgentState::RateLimit,
+            "",
+            &mut tracks2,
+        );
+        assert!(!sent2);
+        assert!(
+            !tracks2.contains_key("solo"),
+            "#1744-M7: a non-AuthError state under an unreadable config must NOT escalate"
         );
 
         std::fs::remove_dir_all(&home).ok();

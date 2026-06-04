@@ -110,13 +110,16 @@ impl PerTickHandler for HangDetectionHandler {
         // Phase 2/3 (#1701 Hung half): a self-orchestrator stuck Hung past the
         // confirm-window has no peer to relay — escalate operator P0, INDEPENDENT
         // of `hang_auto_recovery_enabled` (a leaderless team must page even in
-        // recovery shadow mode). `is_self_orchestrator` is a teams-file read (done
+        // recovery shadow mode). `self_orch_status` is a teams-file read (done
         // lock-free); the confirm-window + cooldown gate (`hung_escalation_due`)
         // then runs under a brief per-candidate re-lock and stamps, so a
         // persisting Hung pages at most once per cooldown. Self-orch Hung is rare,
         // so the re-lock cost is negligible.
+        // #1744-M7: fail-closed — escalate on `Yes` OR `Unknown` (teams config
+        // unreadable). A no-peer Hung P0 is high-cost to miss, so an indeterminate
+        // read errs toward paging; only a determinate `No` skips.
         for name in hung_now {
-            if !crate::teams::is_self_orchestrator(ctx.home, &name) {
+            if crate::teams::self_orch_status(ctx.home, &name) == crate::teams::SelfOrchStatus::No {
                 continue;
             }
             // Re-lock briefly: run the confirm-window + cooldown gate (which
@@ -156,7 +159,9 @@ impl PerTickHandler for HangDetectionHandler {
         // Hung doesn't spawn a store entry. The snapshot's `hung_since` is now
         // None; its crash budget / cooldowns (which DO matter) are preserved.
         for name in left_hung {
-            if !crate::teams::is_self_orchestrator(ctx.home, &name) {
+            // #1744-M7: mirror the fire loop — `Yes`|`Unknown` proceed (clearing a
+            // stale anchor on an indeterminate read is harmless and correct).
+            if crate::teams::self_orch_status(ctx.home, &name) == crate::teams::SelfOrchStatus::No {
                 continue;
             }
             if crate::daemon::escalation_persist::load_for(ctx.home, &name).is_none() {
@@ -200,17 +205,13 @@ fn notify_self_orch_hung(name: &str) {
          pane / interrupt / re-prime).",
         HUNG_ESCALATE_AFTER.as_secs()
     );
-    if let Some(ch) = crate::channel::active_channel() {
-        let _ = crate::channel::gated_notify(
-            ch.as_ref(),
-            name,
-            crate::channel::NotifySeverity::Error,
-            &msg,
-            false,
-        );
-    } else {
-        tracing::debug!(agent = %name, "no active channel for self-orch hung P0");
-    }
+    // #1744-M6: every registered channel (multi-channel-safe P0).
+    crate::channel::notify_all_escalation_channels(
+        name,
+        crate::channel::NotifySeverity::Error,
+        &msg,
+        false,
+    );
 }
 
 #[cfg(test)]

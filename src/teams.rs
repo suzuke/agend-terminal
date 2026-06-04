@@ -58,6 +58,59 @@ fn load_fleet(home: &Path) -> crate::fleet::FleetConfig {
     crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).unwrap_or_default()
 }
 
+/// #1744-M7: load fleet config distinguishing "no fleet configured" (a missing
+/// file → `Ok(default)`, i.e. genuinely no teams) from "could not determine"
+/// (the file EXISTS but failed to read/parse → `Err`, i.e. a transient IO race
+/// or corruption). [`load_fleet`]'s `unwrap_or_default()` collapses both into an
+/// empty fleet, which makes every self-orch check silently read `false` during a
+/// teams.yaml read failure — defeating the orchestrator-down safety net exactly
+/// when it matters. `self_orch_status` maps the `Err` to `Unknown` so consumers
+/// can fail to the SAFE side.
+pub fn try_load_fleet(home: &Path) -> anyhow::Result<crate::fleet::FleetConfig> {
+    let path = crate::fleet::fleet_yaml_path(home);
+    if !path.exists() {
+        // No fleet.yaml = no teams configured (determinate "No"), not an error.
+        return Ok(crate::fleet::FleetConfig::default());
+    }
+    crate::fleet::FleetConfig::load(&path)
+}
+
+/// #1744-M7: deterministic team lookup. `fleet.teams` is a `HashMap`, so the
+/// prior `.iter().find()` returned an ARBITRARY team when a member appeared on
+/// more than one — a non-deterministic self-orch verdict across calls/restarts.
+/// Iterate in sorted-team-name order so the result is stable.
+pub(crate) fn find_team_for_in(fleet: &crate::fleet::FleetConfig, member: &str) -> Option<Team> {
+    let mut entries: Vec<_> = fleet.teams.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    entries
+        .into_iter()
+        .find(|(_, cfg)| cfg.members.iter().any(|m| m == member))
+        .map(|(name, cfg)| project_team(name, cfg))
+}
+
+/// #1744-M7: three-state self-orchestrator verdict. `Unknown` means the teams
+/// config could not be read (transient IO / parse) — distinct from a determinate
+/// `No`. Escalation consumers choose their own safe side for `Unknown` (the
+/// no-peer hung/AuthError P0 paths escalate on `Unknown`; the crash path stays
+/// conservative and falls back to its generic recent>=2 notify).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelfOrchStatus {
+    Yes,
+    No,
+    Unknown,
+}
+
+/// #1744-M7: deterministic + fail-closed self-orch verdict. See [`SelfOrchStatus`].
+pub fn self_orch_status(home: &Path, member: &str) -> SelfOrchStatus {
+    match try_load_fleet(home) {
+        Ok(fleet) => match find_team_for_in(&fleet, member).and_then(|t| t.orchestrator) {
+            Some(orch) if orch == member => SelfOrchStatus::Yes,
+            _ => SelfOrchStatus::No,
+        },
+        Err(_) => SelfOrchStatus::Unknown,
+    }
+}
+
 /// Project a fleet.yaml `(name, TeamConfig)` pair into the public `Team`
 /// JSON shape used by `list` / `find_team_for`. `created_at` defaults
 /// to empty string when absent (operator-edited fleet.yaml entries may
@@ -89,23 +142,8 @@ fn find_team_for_member(fleet: &crate::fleet::FleetConfig, name: &str) -> Option
 /// `api::handlers::prepare_instructions` to split agend.md's peer list
 /// into team members vs other fleet agents.
 pub fn find_team_for(home: &Path, member: &str) -> Option<Team> {
-    let fleet = load_fleet(home);
-    fleet
-        .teams
-        .iter()
-        .find(|(_, cfg)| cfg.members.iter().any(|m| m == member))
-        .map(|(name, cfg)| project_team(name, cfg))
-}
-
-/// #1701: is `member` the orchestrator of its own team? A self-orchestrator has
-/// no peer to relay an inbox P0, so its crash/hang escalates straight to the
-/// operator (see `daemon::crash_respawn` for crash, `daemon::per_tick::hang_detection`
-/// for hang). Mirrors the `orch == name` guard in
-/// `supervisor::{maybe_notify_member_state_change, notify_orchestrator_retry_exhausted}`.
-pub fn is_self_orchestrator(home: &Path, member: &str) -> bool {
-    find_team_for(home, member)
-        .and_then(|t| t.orchestrator)
-        .is_some_and(|orch| orch == member)
+    // #1744-M7: deterministic lookup (sorted team-name order).
+    find_team_for_in(&load_fleet(home), member)
 }
 
 pub fn create(home: &Path, args: &Value) -> Value {
@@ -521,29 +559,81 @@ mod tests {
         dir
     }
 
-    /// #1701: self-orch detection — the gate that routes a crash/hang to the
-    /// self-orch P0. The orchestrator IS its own orchestrator → true; a regular
-    /// member → false (keeps the generic path, never the self-orch P0); an agent
-    /// in no team → false.
+    // ── #1744-M7: deterministic + fail-closed self-orch verdict ──
+    // (#1701's boolean `is_self_orchestrator` was replaced by the 3-state
+    // `self_orch_status`; the Yes/No verdict is covered by
+    // `self_orch_status_yes_no_for_loaded_fleet_1744_m7` below.)
+
+    /// #1744-M7: `self_orch_status` is `Yes` for the orchestrator, `No` for a
+    /// regular member, and `No` for an agent in no team / a missing fleet.yaml
+    /// (a determinate "no fleet configured", NOT an indeterminate read).
     #[test]
-    fn is_self_orchestrator_only_true_for_own_orchestrator_1701() {
-        let home = tmp_home("self-orch");
+    fn self_orch_status_yes_no_for_loaded_fleet_1744_m7() {
+        let home = tmp_home("m7-yes-no");
         create(
             &home,
             &serde_json::json!({"name": "t", "members": ["lead", "dev"], "orchestrator": "lead"}),
         );
-        assert!(
-            is_self_orchestrator(&home, "lead"),
-            "the team orchestrator IS its own orchestrator"
+        assert_eq!(self_orch_status(&home, "lead"), SelfOrchStatus::Yes);
+        assert_eq!(self_orch_status(&home, "dev"), SelfOrchStatus::No);
+        assert_eq!(self_orch_status(&home, "ghost"), SelfOrchStatus::No);
+
+        // Missing fleet.yaml = no fleet configured = determinate No (not Unknown).
+        let empty = tmp_home("m7-missing");
+        assert_eq!(self_orch_status(&empty, "anyone"), SelfOrchStatus::No);
+
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    /// #1744-M7: an EXISTING but unreadable/corrupt fleet.yaml → `Unknown`
+    /// (fail-closed), distinct from the determinate `No` of a missing file. This
+    /// is the gap the old `unwrap_or_default()` collapsed: a transient parse/IO
+    /// failure silently made every agent read as not-self-orch.
+    #[test]
+    fn self_orch_status_unknown_on_unreadable_fleet_1744_m7() {
+        let home = tmp_home("m7-unknown");
+        // A file that EXISTS but is not valid fleet YAML → FleetConfig::load Err.
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "this: is: not: valid: fleet: yaml: [[[\n",
+        )
+        .unwrap();
+        assert_eq!(
+            self_orch_status(&home, "lead"),
+            SelfOrchStatus::Unknown,
+            "#1744-M7: an unreadable teams config must be Unknown (fail-closed), not No"
         );
-        assert!(
-            !is_self_orchestrator(&home, "dev"),
-            "a regular member is NOT its own orchestrator"
-        );
-        assert!(
-            !is_self_orchestrator(&home, "unknown"),
-            "an agent in no team is not a self-orchestrator"
-        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// #1744-M7: `find_team_for` is deterministic when a member appears on more
+    /// than one team — it picks the alphabetically-first team name on every call,
+    /// so the self-orch verdict can't flip between runs/restarts. Here `shared`
+    /// is on `ateam` (orch=a1) and `bteam` (orch=shared); sorted-first `ateam`
+    /// wins, so `shared` is consistently NOT a self-orchestrator.
+    #[test]
+    fn find_team_for_deterministic_across_multi_team_1744_m7() {
+        let home = tmp_home("m7-determinism");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "teams:\n  \
+               bteam:\n    members: [shared, b1]\n    orchestrator: shared\n  \
+               ateam:\n    members: [shared, a1]\n    orchestrator: a1\n",
+        )
+        .unwrap();
+        for _ in 0..20 {
+            assert_eq!(
+                find_team_for(&home, "shared").map(|t| t.name),
+                Some("ateam".to_string()),
+                "#1744-M7: multi-team lookup must deterministically pick the sorted-first team"
+            );
+            assert_eq!(
+                self_orch_status(&home, "shared"),
+                SelfOrchStatus::No,
+                "#1744-M7: deterministic team → stable self-orch verdict"
+            );
+        }
         let _ = std::fs::remove_dir_all(&home);
     }
 
