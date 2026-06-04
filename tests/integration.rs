@@ -520,17 +520,23 @@ fn test_shutdown_no_crash_log() {
 #[test]
 fn test_event_log_written() {
     let mut daemon = TestDaemon::start("event_log");
-    // Poll for event log to appear
     let log_path = daemon.home.join("event-log.jsonl");
+    // Poll on the CONTENT, not just file existence, with the 30s ceiling used by
+    // the other event-log waits here. The old 3s existence-only check flaked under
+    // load (e.g. the coverage job's slow, CPU-saturated parallel run): daemon
+    // startup could exceed 3s, and the file can exist a tick before `daemon_start`
+    // is flushed (exists-but-empty race). `wait_until` polls, so a higher ceiling
+    // adds no common-case slowdown — it only tolerates a slow start.
     assert!(
-        wait_until(|| log_path.exists(), Duration::from_secs(3)),
-        "event-log.jsonl should exist"
-    );
-
-    let content = std::fs::read_to_string(&log_path).expect("read log");
-    assert!(
-        content.contains("daemon_start"),
-        "should have daemon_start event"
+        wait_until(
+            || {
+                std::fs::read_to_string(&log_path)
+                    .map(|c| c.contains("daemon_start"))
+                    .unwrap_or(false)
+            },
+            Duration::from_secs(30)
+        ),
+        "event-log.jsonl should be written with a daemon_start event"
     );
 
     daemon.stop();

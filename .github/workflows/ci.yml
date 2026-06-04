@@ -254,22 +254,37 @@ jobs:
         timeout-minutes: 35
         env:
           AGEND_LOCK_AUDIT: "1"
-        # #1452: Coverage (non-required) recurringly flaked on transient
-        # llvm-profdata profraw corruption and a git-race test under llvm-cov's
-        # slow parallel run — both pass on rerun. Retry once (clean stale
-        # profraw between attempts) so the job self-heals instead of needing a
-        # manual `gh run rerun`. The git-race root is separately hardened by
-        # disabling auto-gc in the affected test's repo setup.
+        # #1452: Coverage (non-required) can flake on transient llvm-profdata
+        # profraw corruption under llvm-cov's slow parallel run — that passes on a
+        # clean rerun, so retry once.
+        #
+        # SMART RETRY: a plain `test ... FAILED` is a REAL, deterministic failure.
+        # The old loop retried it unconditionally AND labelled it "likely flake" —
+        # which wasted a second slow coverage run and, worse, MASKED real bugs as
+        # flakes (e.g. #1735's block_on invariant surfaced here and was dismissed
+        # as a Coverage flake). So: only retry when the failure carries an
+        # llvm-cov profraw/profdata-corruption signature; otherwise fail FAST with
+        # an honest label so the real `test ... FAILED` is trusted, not ignored.
         run: |
-          for attempt in 1 2; do
-            if cargo llvm-cov --workspace --tests --features tray --lcov --output-path coverage.lcov; then
+          set -o pipefail
+          attempt=1
+          while :; do
+            if cargo llvm-cov --workspace --tests --features tray --lcov --output-path coverage.lcov 2>&1 | tee cov-attempt.log; then
               exit 0
             fi
-            echo "::warning::coverage attempt $attempt failed (likely #1452 profraw/git-race flake); cleaning + retrying"
-            cargo llvm-cov clean --workspace || true
+            if [ "$attempt" -ge 2 ]; then
+              echo "::error::coverage failed again after retrying the profraw flake"
+              exit 1
+            fi
+            if grep -qiE 'profdata|\.profraw|malformed instrumentation|raw profile|invalid instrumentation profile|failed to (load|merge).*profile|no profile can be merged' cov-attempt.log; then
+              echo "::warning::coverage attempt $attempt hit an llvm-cov profraw/profdata corruption flake; cleaning + retrying once"
+              cargo llvm-cov clean --workspace || true
+              attempt=$((attempt + 1))
+              continue
+            fi
+            echo "::error::coverage failed with a REAL test failure (no profraw-corruption signature) — NOT a flake; failing fast. See the 'test ... FAILED' above."
+            exit 1
           done
-          echo "::error::coverage failed after 2 attempts"
-          exit 1
       - name: Upload to Codecov
         uses: codecov/codecov-action@v4
         with:
