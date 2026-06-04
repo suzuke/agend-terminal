@@ -49,29 +49,46 @@ pub(crate) fn is_net_error_match(matched: &str) -> bool {
         .is_match(matched)
 }
 
-/// #1768: does some on-screen occurrence of `matched` sit in a real error LINE
-/// (one carrying an `Error:` / `API Error:` / `FetchError:` label)?
+/// Does some on-screen occurrence of `matched` sit in a real backend ERROR LINE
+/// (vs a bare prose/source mention of the same token)?
 ///
-/// The #1757 net-error exemption (fail-open the #1450 red anchor for net-error
-/// tokens, since codex/gemini render them default not red) was too broad — it
-/// fired for the token ANYWHERE in the live tail, so an orchestrator merely
-/// *discussing* a net error (idle between turns, no working-marker below) had it
-/// mis-latch `ServerRateLimit` → retry storm (the case codex's #1769 review
-/// caught). Narrow the exemption to the token's LINE looking like a backend error
-/// line. The trailing `:`/`?` after a word-boundary `error` means the const name
-/// `…NET_ERRORS:` and prose like "the ECONNRESET error happened" do NOT qualify —
-/// only a labeled error line does. A genuine fault
-/// (`API Error: InvalidHTTPResponse fetching …`) IS error-line-shaped → still
-/// fails open → still latches (the #1757 intent). Checks every occurrence so a
-/// real error line alongside a prose mention still qualifies.
-pub(crate) fn net_error_in_error_line(screen_text: &str, matched: &str) -> bool {
+/// Generalized from the #1768 net-error gate (was `net_error_in_error_line`) so
+/// the content-shape signal can serve EVERY HIGH_FP state, not just net errors.
+/// The #1757 net-error red-anchor exemption was too broad (fired for the token
+/// ANYWHERE in the tail), so an agent merely *discussing* a net error mis-latched
+/// `ServerRateLimit` → retry storm (codex's #1769 review). Gate on the token's
+/// LINE looking like a real error line.
+///
+/// Error-line signatures (corpus-derived, `t-step1-detection-corpus`):
+/// - labeled error — `\w*error\s*[:?]`: `Error:` / `API Error:` / `FetchError:` /
+///   `api_error:` / `invalid_request_error:`. The `\w*` (not `\b`) fixes the
+///   corpus bug where the `_error` underscore killed the old `\berror`
+///   word-boundary, so `ModelUnsupported`'s `invalid_request_error:` never
+///   qualified;
+/// - bare HTTP-status (gemini RateLimit lines with no `Error:` label):
+///   `\b429\b` / `RESOURCE_EXHAUSTED` / `Too Many Requests` / `got status:`;
+/// - structured-JSON error fields: `"type"|"code"|"status": "…error…"` /
+///   `"reason": "…exceeded"`.
+///
+/// A bare prose/source mention (the const name `…NET_ERRORS:`, "the ECONNRESET
+/// error happened" with no colon, "see issue 4290") does NOT qualify → stays
+/// red-anchored. Checks every occurrence so a real error line alongside a prose
+/// mention still qualifies. ⚠ This is the CONTENT-shape signal ONLY — it does NOT
+/// change the red→content anchor decision (a follow-up pending the operator's
+/// call on keeping/dropping the color signal); today it still gates only the
+/// #1757 net-error exemption at its single call site.
+pub(crate) fn in_error_line(screen_text: &str, matched: &str) -> bool {
     if matched.is_empty() {
         return false;
     }
     use std::sync::OnceLock;
-    static ERROR_LABEL: OnceLock<Regex> = OnceLock::new();
-    let re = ERROR_LABEL
-        .get_or_init(|| Regex::new(r"(?i)\b(api ?|fetch)?error\s*[:?]").expect("label regex"));
+    static ERROR_LINE: OnceLock<Regex> = OnceLock::new();
+    let re = ERROR_LINE.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(\b\w*error\s*[:?]|\b429\b|resource_exhausted|too many requests|got status\s*:|"(type|code|status)"\s*:\s*"\w*error\w*"|"reason"\s*:\s*"[^"]*exceeded")"#,
+        )
+        .expect("error-line regex")
+    });
     let mut search = 0;
     while let Some(rel) = screen_text[search..].find(matched) {
         let pos = search + rel;

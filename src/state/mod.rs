@@ -820,10 +820,7 @@ impl StateTracker {
                         // ServerRateLimit (the retry-storm FP codex caught). A real
                         // fault IS error-line-shaped → still fails open → latches.
                         && !(crate::state::patterns::is_net_error_match(matched)
-                            && crate::state::patterns::net_error_in_error_line(
-                                screen_text,
-                                matched,
-                            ))
+                            && crate::state::patterns::in_error_line(screen_text, matched))
                         && !matched_span_has_red(screen_text, matched, fg);
                     // #1518 position gate: a HIGH_FP marker that has scrolled out
                     // of the live bottom-N rows (e.g. an ApiError / ServerRateLimit
