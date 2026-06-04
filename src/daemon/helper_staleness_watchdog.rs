@@ -54,6 +54,11 @@ pub(crate) struct HelperStalenessWatchdogTracker {
     /// so a sequential rebuild that fixes one helper but not the other
     /// still produces fresh alerts for the lagging one.
     last_alerted_at: HashMap<String, chrono::DateTime<chrono::Utc>>,
+    /// #1739 boot-seed latch. First scan seeds `last_alerted_at` with
+    /// currently-stale helpers (stamped now) WITHOUT emitting, so a restart
+    /// doesn't re-page about staleness the operator already saw. Only helpers
+    /// newly stale after boot (or past RE_ALERT_THRESHOLD) emit.
+    seeded: bool,
 }
 
 impl HelperStalenessWatchdogTracker {
@@ -66,7 +71,14 @@ impl HelperStalenessWatchdogTracker {
         }
         self.tick_count = 0;
         let daemon_exe = std::env::current_exe().ok();
-        scan_and_emit(home, daemon_exe.as_deref(), &mut self.last_alerted_at);
+        let seeding = !self.seeded;
+        self.seeded = true;
+        scan_and_emit(
+            home,
+            daemon_exe.as_deref(),
+            &mut self.last_alerted_at,
+            seeding,
+        );
         true
     }
 }
@@ -86,6 +98,7 @@ pub(crate) fn scan_and_emit(
     home: &Path,
     daemon_exe: Option<&Path>,
     last_alerted: &mut HashMap<String, chrono::DateTime<chrono::Utc>>,
+    seeding: bool,
 ) {
     let now = chrono::Utc::now();
     for name in TRACKED_HELPERS {
@@ -104,13 +117,16 @@ pub(crate) fn scan_and_emit(
                 continue;
             }
         }
-        // #event-bus Step 2 (legacy-zero): the bus is the sole delivery path.
-        crate::daemon::event_bus::global().emit(
-            home,
-            crate::daemon::event_bus::EventKind::HelperStale {
-                helper_name: (*name).to_string(),
-            },
-        );
+        // #1739 boot-seed: first scan records the stale helper without emitting.
+        if !seeding {
+            // #event-bus Step 2 (legacy-zero): the bus is the sole delivery path.
+            crate::daemon::event_bus::global().emit(
+                home,
+                crate::daemon::event_bus::EventKind::HelperStale {
+                    helper_name: (*name).to_string(),
+                },
+            );
+        }
         last_alerted.insert((*name).to_string(), now);
     }
 }
@@ -228,7 +244,7 @@ mod tests {
         let home = tmp_home("stale-emits");
         let daemon = stage_stale_state(&home, "agend-git");
         let mut last_alerted: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
-        scan_and_emit(&home, Some(&daemon), &mut last_alerted);
+        scan_and_emit(&home, Some(&daemon), &mut last_alerted, false);
 
         // Both recipients should receive an alert for the stale
         // helper. Other helpers (agend-mcp-bridge in this case) are
@@ -252,6 +268,34 @@ mod tests {
     }
 
     #[test]
+    fn boot_seed_suppresses_existing_stale_helper_then_no_reburst() {
+        // #1739: the first scan after a fresh daemon start seeds an
+        // already-stale helper into the dedup WITHOUT paging, and a subsequent
+        // scan does not re-burst it.
+        let home = tmp_home("stale-bootseed");
+        let daemon = stage_stale_state(&home, "agend-git");
+        let mut last_alerted: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
+        // seeding scan: record the stale helper, do NOT page.
+        scan_and_emit(&home, Some(&daemon), &mut last_alerted, true);
+        assert!(
+            last_alerted.contains_key("agend-git"),
+            "boot-seed must record the stale helper in the dedup"
+        );
+        assert!(
+            crate::inbox::drain(&home, "general").is_empty(),
+            "boot-seed must NOT page for a restart-existing stale helper \
+             (negative-probe: removing the `if !seeding` gate makes this fire)"
+        );
+        assert!(crate::inbox::drain(&home, "lead").is_empty());
+        // next normal scan: the seeded helper stays suppressed within RE_ALERT.
+        scan_and_emit(&home, Some(&daemon), &mut last_alerted, false);
+        assert!(
+            crate::inbox::drain(&home, "general").is_empty(),
+            "seeded helper must remain suppressed on the next scan"
+        );
+    }
+
+    #[test]
     fn throttle_suppresses_re_alert_within_window() {
         let home = tmp_home("throttle");
         let daemon = stage_stale_state(&home, "agend-git");
@@ -264,7 +308,7 @@ mod tests {
             now - chrono::Duration::seconds(RE_ALERT_THRESHOLD_SECS / 2),
         );
         let snapshot = last_alerted.clone();
-        scan_and_emit(&home, Some(&daemon), &mut last_alerted);
+        scan_and_emit(&home, Some(&daemon), &mut last_alerted, false);
 
         // Timestamp should NOT have moved → throttle held.
         assert_eq!(
@@ -295,7 +339,7 @@ mod tests {
             "agend-git".to_string(),
             now - chrono::Duration::seconds(RE_ALERT_THRESHOLD_SECS + 60),
         );
-        scan_and_emit(&home, Some(&daemon), &mut last_alerted);
+        scan_and_emit(&home, Some(&daemon), &mut last_alerted, false);
 
         // Timestamp should have advanced to ~now → re-alert fired.
         let updated = last_alerted.get("agend-git").copied().unwrap();
@@ -316,7 +360,7 @@ mod tests {
         // proactive page (operator-pull doctor still surfaces).
         let home = tmp_home("missing");
         let mut last_alerted: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
-        scan_and_emit(&home, None, &mut last_alerted);
+        scan_and_emit(&home, None, &mut last_alerted, false);
         assert!(
             last_alerted.is_empty(),
             "NotInstalled state must not emit proactive alerts"
@@ -396,7 +440,7 @@ mod tests {
         let home = tmp_home("via-bus");
         let daemon = stage_stale_state(&home, "agend-git");
         let mut last_alerted: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
-        scan_and_emit(&home, Some(&daemon), &mut last_alerted);
+        scan_and_emit(&home, Some(&daemon), &mut last_alerted, false);
         for recipient in RECIPIENTS {
             assert!(
                 !drained_payloads(&home, recipient).is_empty(),
