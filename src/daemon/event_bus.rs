@@ -244,8 +244,37 @@ impl EventBus {
     /// vanish silently (#1720).
     pub fn emit(&self, home: &std::path::Path, kind: EventKind) -> usize {
         let event = Event::new(home.to_path_buf(), kind);
-        let subs = self.subscribers.lock();
-        let handled = subs.iter().filter(|sub| sub(&event)).count();
+        // #1745: snapshot the subscriber list under the lock, then DROP the guard
+        // before invoking any callback. Running `sub(&event)` while holding the
+        // lock (a) deadlocks a re-entrant subscriber — one that itself calls
+        // `emit`/`subscribe` — and (b) lets a panicking subscriber abort the
+        // fan-out (and risk poisoning). Subscribers are `Arc<dyn Fn>`, so cloning
+        // the Vec is a cheap refcount bump.
+        let subs: Vec<Subscriber> = self.subscribers.lock().clone();
+        let mut handled = 0usize;
+        for sub in &subs {
+            // #1745: isolate each subscriber — a panic in one must not abort the
+            // fan-out to the rest (mirrors the per_tick handler isolation). The
+            // handled-count semantics are unchanged: only a subscriber returning
+            // `true` (matched + delivered) is counted; a panic counts as not
+            // handled.
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sub(&event))) {
+                Ok(true) => handled += 1,
+                Ok(false) => {}
+                Err(payload) => {
+                    let detail = payload
+                        .downcast_ref::<&'static str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "<non-string panic payload>".to_string());
+                    tracing::error!(
+                        kind = ?event.kind,
+                        panic = %detail,
+                        "#1745 event_bus subscriber panicked — continuing fan-out to the rest"
+                    );
+                }
+            }
+        }
         tracing::debug!(kind = ?event.kind, handled, "event_bus: emitted");
         handled
     }
@@ -295,6 +324,75 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert!(
             matches!(&events[0], EventKind::TaskStateChanged { task_id, .. } if task_id == "t-1")
+        );
+    }
+
+    fn dummy_event() -> EventKind {
+        EventKind::TaskStateChanged {
+            task_id: "t".into(),
+            title: "t".into(),
+            assignee: None,
+            reason: "r".into(),
+            started_at: None,
+            eta_secs: None,
+        }
+    }
+
+    #[test]
+    fn panicking_subscriber_does_not_abort_fan_out() {
+        // #1745: a subscriber that panics must not prevent the remaining
+        // subscribers from receiving the event, and must not be counted as
+        // handled. (Negative-probe: without the per-subscriber catch_unwind the
+        // `after` assertion fails — the panic aborts the fan-out.)
+        let bus = EventBus::new();
+        let before = Arc::new(Mutex::new(false));
+        let after = Arc::new(Mutex::new(false));
+        let b = Arc::clone(&before);
+        let a = Arc::clone(&after);
+        bus.subscribe(move |_e| {
+            *b.lock().unwrap() = true;
+            true
+        });
+        bus.subscribe(|_e| panic!("boom subscriber"));
+        bus.subscribe(move |_e| {
+            *a.lock().unwrap() = true;
+            true
+        });
+        let handled = bus.emit(std::path::Path::new("/tmp/h"), dummy_event());
+        assert!(
+            *before.lock().unwrap(),
+            "subscriber registered before the panicker must run"
+        );
+        assert!(
+            *after.lock().unwrap(),
+            "subscriber registered AFTER the panicker must still run — the panic \
+             must not abort the fan-out"
+        );
+        assert_eq!(
+            handled, 2,
+            "handled-count must exclude the panicking subscriber (2 returned true)"
+        );
+    }
+
+    #[test]
+    fn reentrant_subscribe_during_emit_does_not_deadlock() {
+        // #1745: a subscriber that registers another subscriber (re-entrant
+        // `subscribe`) must not deadlock. The guard is dropped before any
+        // callback runs, so the inner `subscribe` can acquire the lock. With the
+        // pre-fix code (callbacks invoked while holding the lock) this re-entrant
+        // lock would dead­lock the non-reentrant parking_lot::Mutex and hang.
+        let bus = Arc::new(EventBus::new());
+        let bus2 = Arc::clone(&bus);
+        bus.subscribe(move |_e| {
+            bus2.subscribe(|_e| false);
+            true
+        });
+        let handled = bus.emit(std::path::Path::new("/tmp/h"), dummy_event());
+        assert_eq!(handled, 1, "the original subscriber handled the event");
+        assert_eq!(
+            bus.subscribers.lock().len(),
+            2,
+            "the re-entrant subscribe must have registered the new subscriber"
         );
     }
 
