@@ -2,11 +2,19 @@
 
 use std::path::Path;
 
-const RETENTION_DAYS: i64 = 14;
+/// t-dispatchidle-clear-on-report (3): terminal-status sidecars (`Resolved` /
+/// `Exceeded`) are DONE — a resolved dispatch had its report, an exceeded one
+/// already fired its nudge — so they have no further use and are swept after a
+/// SHORT age rather than lingering the old 14 days (the observed backlog: 786
+/// sidecars, 558 resolved + 228 exceeded, oldest 2026-05-22). A `Pending` sidecar
+/// is ACTIVE dispatch tracking and is NEVER swept here (a real pending resolves in
+/// minutes or transitions to `Exceeded`; we do not time-GC live tracking).
+const TERMINAL_RETENTION_DAYS: i64 = 2;
 
-/// Sweep pending-dispatch sidecars older than 14 days.
-/// `cutover` gates the feature — production passes the env-var value,
-/// tests pass the bool directly to avoid process-wide env-var races.
+/// Sweep terminal-status (Resolved/Exceeded) pending-dispatch sidecars older than
+/// [`TERMINAL_RETENTION_DAYS`]. `cutover` gates the feature — production passes the
+/// env-var value (defaults on), tests pass the bool directly to avoid
+/// process-wide env-var races.
 pub(super) fn sweep(home: &Path, cutover: bool) -> usize {
     if !cutover {
         return 0;
@@ -15,8 +23,8 @@ pub(super) fn sweep(home: &Path, cutover: bool) -> usize {
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return 0;
     };
-    let cutoff =
-        chrono::Utc::now() - chrono::TimeDelta::try_days(RETENTION_DAYS).expect("14 fits in i64");
+    let cutoff = chrono::Utc::now()
+        - chrono::TimeDelta::try_days(TERMINAL_RETENTION_DAYS).expect("2 fits in i64");
     let mut swept = 0;
 
     for entry in entries.flatten() {
@@ -32,6 +40,15 @@ pub(super) fn sweep(home: &Path, cutover: bool) -> usize {
         else {
             continue;
         };
+        // Only sweep TERMINAL-status sidecars; a `Pending` dispatch is live
+        // tracking and must never be time-GC'd (t-dispatchidle-clear-on-report §3).
+        if !matches!(
+            dispatch.status,
+            crate::daemon::dispatch_idle::DispatchStatus::Resolved
+                | crate::daemon::dispatch_idle::DispatchStatus::Exceeded
+        ) {
+            continue;
+        }
         let Ok(issued) = chrono::DateTime::parse_from_rfc3339(&dispatch.issued_at) else {
             continue;
         };
@@ -73,7 +90,7 @@ mod tests {
         dir
     }
 
-    fn write_dispatch(home: &Path, dispatch_id: &str, age_days: i64) {
+    fn write_dispatch(home: &Path, dispatch_id: &str, age_days: i64, status: &str) {
         let dir = crate::daemon::dispatch_idle::pending_dir(home);
         std::fs::create_dir_all(&dir).unwrap();
         let issued_at =
@@ -87,7 +104,7 @@ mod tests {
             "expected_kind": "task",
             "threshold_secs": 600,
             "issued_at": issued_at,
-            "status": "pending",
+            "status": status,
             "nudge_sent_at": null,
         });
         std::fs::write(
@@ -98,17 +115,30 @@ mod tests {
     }
 
     #[test]
-    fn sweep_removes_old_dispatches() {
+    fn sweep_removes_old_terminal_keeps_recent_and_pending() {
         let home = tmp_home("sweep-old");
-        write_dispatch(&home, "disp-old", 20);
-        write_dispatch(&home, "disp-recent", 3);
+        // old TERMINAL (exceeded/resolved) → swept past TERMINAL_RETENTION_DAYS.
+        write_dispatch(&home, "disp-exceeded-old", 20, "exceeded");
+        write_dispatch(&home, "disp-resolved-old", 20, "resolved");
+        // recent terminal (< 2d) → kept.
+        write_dispatch(&home, "disp-exceeded-recent", 1, "exceeded");
+        // old PENDING → KEPT (active tracking is never time-GC'd, §3).
+        write_dispatch(&home, "disp-pending-old", 20, "pending");
 
         let swept = sweep(&home, true);
 
-        assert_eq!(swept, 1);
+        assert_eq!(swept, 2, "both old terminal sidecars swept");
         let dir = crate::daemon::dispatch_idle::pending_dir(&home);
-        assert!(!dir.join("disp-old.json").exists());
-        assert!(dir.join("disp-recent.json").exists());
+        assert!(!dir.join("disp-exceeded-old.json").exists());
+        assert!(!dir.join("disp-resolved-old.json").exists());
+        assert!(
+            dir.join("disp-exceeded-recent.json").exists(),
+            "recent terminal (< age) kept"
+        );
+        assert!(
+            dir.join("disp-pending-old.json").exists(),
+            "old PENDING must be KEPT — active dispatch tracking is never swept"
+        );
 
         std::fs::remove_dir_all(&home).ok();
     }
@@ -116,7 +146,7 @@ mod tests {
     #[test]
     fn sweep_skipped_without_cutover() {
         let home = tmp_home("sweep-noenv");
-        write_dispatch(&home, "disp-old2", 20);
+        write_dispatch(&home, "disp-old2", 20, "exceeded");
 
         let swept = sweep(&home, false);
 
