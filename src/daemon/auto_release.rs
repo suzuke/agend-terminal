@@ -103,6 +103,11 @@ pub(crate) struct LeaseIdentity {
     pub task_id: String,
     pub branch: String,
     pub worktree: String,
+    /// `binding.json` `source_repo` (the repo path) — t-worktree-leak codex gap ①b:
+    /// included so the CAS catches a re-lease to a DIFFERENT repo at the same
+    /// branch name (cross-repo same-branch collision).
+    #[serde(default)]
+    pub source_repo: String,
     /// `binding.json` `issued_at` — changes on every fresh lease.
     pub issued_at: String,
 }
@@ -123,6 +128,7 @@ impl LeaseIdentity {
             task_id: s("task_id"),
             branch: s("branch"),
             worktree: s("worktree"),
+            source_repo: s("source_repo"),
             issued_at: s("issued_at"),
         }
     }
@@ -204,14 +210,29 @@ fn close_grace_passed(closed_at: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// t-worktree-leak (PR-1) must-fix #4: ALL tasks on the branch are terminal
-/// (Done | Cancelled). Aggregates across the branch, not just one task.
-fn all_branch_tasks_done(home: &Path, branch: &str) -> bool {
+/// t-worktree-leak (PR-1) must-fix #4 + codex gap ①c: ALL tasks on (repo, branch)
+/// are terminal (Done | Cancelled). Tasks are branch-keyed (no `repo` field), so a
+/// same-named branch in a DIFFERENT repo could pollute the aggregation. We scope
+/// by deriving each PENDING task's repo from its owner's live binding: a pending
+/// task blocks release ONLY if it is confirmed to belong to THIS repo; a pending
+/// task confirmed in a DIFFERENT repo does not block; an UNresolvable pending task
+/// (owner unbound) blocks (conservative — never mis-release).
+fn all_branch_tasks_done(home: &Path, repo: &str, branch: &str) -> bool {
     use crate::task_events::TaskStatus;
     crate::tasks::list_all(home)
         .iter()
         .filter(|t| t.branch.as_deref() == Some(branch))
-        .all(|t| matches!(t.status, TaskStatus::Done | TaskStatus::Cancelled))
+        // Only non-terminal (pending) tasks can block; Done/Cancelled never do.
+        .filter(|t| !matches!(t.status, TaskStatus::Done | TaskStatus::Cancelled))
+        .all(|t| {
+            let owner_repo = t
+                .assignee
+                .as_deref()
+                .and_then(|a| crate::binding::read(home, a))
+                .and_then(|b| repo_slug_from_binding(&b));
+            // "does NOT block" ⟺ this pending task is CONFIRMED in a different repo.
+            matches!(&owner_repo, Some(r) if r != repo)
+        })
 }
 
 /// t-worktree-leak (PR-1): the unified release invariant (must-fix #2/#3/#4),
@@ -225,8 +246,8 @@ fn releasable_by_invariant(home: &Path, repo: &str, branch: &str) -> (bool, PrCo
         // team-resolved T1: merge releases the worktree, doesn't touch the task).
         // `pr_releasable` is true for merged, grace-gated for closed-unmerged.
         PrConfidence::ObservedTerminal => pr_releasable,
-        // No PR found → release only once the branch's tasks are all done.
-        PrConfidence::QueriedNone => all_branch_tasks_done(home, branch),
+        // No PR found → release only once the branch's tasks (this repo) are done.
+        PrConfidence::QueriedNone => all_branch_tasks_done(home, repo, branch),
         // Open PR or unknown → not releasable (the sweeper retries until merge).
         PrConfidence::ObservedOpen | PrConfidence::Unknown => false,
     };
@@ -500,11 +521,35 @@ fn process_intent(home: &Path, intent: &AutoReleaseIntent) -> IntentOutcome {
         .map(|w| !is_worktree_clean(Path::new(w)));
     match decide_release(task.as_ref(), Some(&binding), worktree_dirty) {
         ReleaseDecision::Release => {
-            // The TOCTOU CAS above (live-binding vs snapshot) ran on the same
-            // `binding` value we pass to release_full; the daemon sweep is
-            // single-threaded, so no re-lease can interleave between the compare
-            // and the release. (A fully binding-lock-atomic CAS would need a
-            // binding-locking refactor — tracked as a follow-up.)
+            // codex gap ②: CAS+release must be ONE atomic critical section under
+            // `.binding.json.lock` — the same lock `bind_full` holds (binding.rs:67)
+            // and the GC path uses (worktree_pool.rs:717). The pre-lock CAS above is
+            // only a cheap early-out; a concurrent bind_full from ANOTHER thread
+            // (MCP handler) could interleave between it and the release. So re-read
+            // + re-validate the FULL lease identity under the lock, then release in
+            // the same section. (`release_full` → `unbind` does NOT take this lock —
+            // binding.rs:119 just removes the file — so no deadlock, mirroring the
+            // pre-PR-1 merge path.)
+            let lock_path = crate::paths::runtime_dir(home)
+                .join(&assignee)
+                .join(".binding.json.lock");
+            let _lock = match crate::store::acquire_file_lock(&lock_path) {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::warn!(agent = %assignee, error = %e, "auto_release: binding lock failed — retaining for retry");
+                    return IntentOutcome::Retry;
+                }
+            };
+            let Some(live) = crate::binding::read(home, &assignee) else {
+                // Unbound under the lock → already released. Nothing to do.
+                return IntentOutcome::Done;
+            };
+            if let Some(snap) = intent.lease.as_ref() {
+                if &LeaseIdentity::from_binding(&assignee, &live) != snap {
+                    tracing::info!(agent = %assignee, task_id = %intent.task_id, "auto_release: lease identity changed under lock (re-leased) — skip (TOCTOU CAS)");
+                    return IntentOutcome::Done;
+                }
+            }
             let outcome = crate::worktree_pool::release_full(home, &assignee, false);
             tracing::info!(agent = %assignee, task_id = %intent.task_id, event, ?confidence, outcome = ?outcome, "auto_release: released worktree (release invariant satisfied)");
             IntentOutcome::Done
@@ -573,6 +618,19 @@ pub(crate) fn enqueue_release_recompute(home: &Path, repo: &str, branch: &str, e
     let Some(binding) = crate::binding::read(home, &agent) else {
         return;
     };
+    // codex gap ①a: cross-repo same-branch guard. `scan_existing_branch_binding`
+    // matches by BRANCH only, so for a same-named branch in a different repo it can
+    // resolve the WRONG agent. Verify the resolved binding's repo == the event's
+    // repo (when the caller supplied one) and skip the mismatch.
+    if !repo.is_empty() {
+        let binding_repo = repo_slug_from_binding(&binding);
+        if binding_repo.as_deref() != Some(repo) {
+            tracing::debug!(agent = %agent, branch = %branch, event = %event_kind,
+                event_repo = %repo, binding_repo = ?binding_repo,
+                "auto_release: bound branch's repo != event repo (cross-repo same-branch) — skip");
+            return;
+        }
+    }
     let task_id = binding
         .get("task_id")
         .and_then(|v| v.as_str())
@@ -919,6 +977,9 @@ mod tests {
     #[test]
     fn auto_release_on_merge_enqueues_recompute_intent() {
         let home = tmp_home("1244-release");
+        // Real source repo whose origin resolves to "owner/repo" so the codex ①a
+        // cross-repo guard (binding repo == event repo) passes.
+        let repo = itest_source_repo(&home, "owner/repo");
         let agent = "dev-merge";
         let branch = "feat/merged-branch";
         let rt = crate::paths::runtime_dir(&home).join(agent);
@@ -928,6 +989,7 @@ mod tests {
             "branch": branch,
             "task_id": "t-test",
             "worktree": "",
+            "source_repo": repo.to_str().unwrap(),
             "issued_at": "2026-06-05T00:00:00Z",
         });
         std::fs::write(
@@ -1114,6 +1176,38 @@ mod tests {
             &serde_json::json!({ "task_id": "t-2", "branch": "feat/x", "worktree": "/w", "issued_at": "T2" }),
         );
         assert_ne!(snap, relesed);
+        // codex gap ①b: re-leased to the SAME branch name in a DIFFERENT repo →
+        // source_repo differs → CAS catches it.
+        let snap_repo = LeaseIdentity::from_binding(
+            "dev",
+            &serde_json::json!({ "task_id": "t-1", "branch": "feat/x", "worktree": "/w", "issued_at": "T1", "source_repo": "/repos/a" }),
+        );
+        let other_repo = LeaseIdentity::from_binding(
+            "dev",
+            &serde_json::json!({ "task_id": "t-1", "branch": "feat/x", "worktree": "/w", "issued_at": "T1", "source_repo": "/repos/b" }),
+        );
+        assert_ne!(
+            snap_repo, other_repo,
+            "CAS must catch a re-lease to a different repo"
+        );
+    }
+
+    #[test]
+    fn cross_repo_same_branch_enqueue_skips_codex_1a() {
+        // codex gap ①a: a bound branch in repo B must NOT be released by an event
+        // for the same branch name in repo A.
+        let home = tmp_home("itest-xrepo");
+        let repo_b = itest_source_repo(&home, "owner/repo-b");
+        itest_lease(&home, &repo_b, "dev", "feat/shared", "t-b", false);
+        // Event for repo-A (a DIFFERENT repo) on the same branch name.
+        enqueue_release_recompute(&home, "owner/repo-a", "feat/shared", "merge");
+        assert_eq!(
+            queue_len(&home),
+            0,
+            "cross-repo same-branch event must not enqueue against repo-b's lease"
+        );
+        assert!(bound(&home, "dev"), "repo-b's binding untouched");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -1259,8 +1353,29 @@ mod tests {
             .unwrap_or(0)
     }
 
+    fn write_fleet(home: &Path, agent: &str) {
+        let p = crate::fleet::fleet_yaml_path(home);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        std::fs::write(&p, format!("instances:\n  {agent}:\n    backend: claude\n")).unwrap();
+    }
+
+    /// REAL task-done entry: the MCP handler (`task action=done`) — exercises the
+    /// handler→enqueue wiring (codex gap ③ / §3.9). Asserts no error.
+    fn task_done_via_handler(home: &Path, agent: &str, task_id: &str) {
+        let r = crate::tasks::handle(
+            home,
+            agent,
+            &serde_json::json!({ "action": "done", "id": task_id }),
+        );
+        assert!(r.get("error").is_none(), "task action=done failed: {r}");
+    }
+
     #[test]
-    fn integration_merge_releases_worktree() {
+    fn integration_merge_releases_via_real_scanner() {
+        // codex gap ③: drive the REAL scanner entry `scan_and_emit_with` (not the
+        // helper) so the scanner→enqueue wiring is under test (breaks → fails).
         let home = tmp_home("itest-merge");
         let repo = itest_source_repo(&home, "owner/repo");
         itest_lease(&home, &repo, "dev", "feat/m", "t-m", false);
@@ -1276,21 +1391,31 @@ mod tests {
             true,
         );
         assert!(bound(&home, "dev"), "pre: agent is bound");
-        // REAL entry: the scanner's merge call → enqueue.
-        auto_release_for_merged_branch(&home, "owner/repo", "feat/m");
-        assert_eq!(queue_len(&home), 1, "merge enqueues a recompute intent");
+        use parking_lot::Mutex;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        // Mock poller returns no PRs; the stored Merged state is sticky and drives
+        // the scanner's terminal-merge arm → auto_release_for_merged_branch → enqueue.
+        let poller = crate::daemon::pr_state::gh_poll::tests::MockGhPoller::new(vec![Ok(vec![])]);
+        crate::daemon::pr_state::scan_and_emit_with(&home, &registry, &poller);
+        assert_eq!(
+            queue_len(&home),
+            1,
+            "real scanner→enqueue wiring produced an intent"
+        );
         drain_queue(&home);
         assert!(
             !bound(&home, "dev"),
-            "merge → worktree released (binding gone)"
+            "real scanner → enqueue → sweep → released (binding gone)"
         );
-        assert_eq!(queue_len(&home), 0, "released intent deleted");
         let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
-    fn integration_open_pr_retains_intent_for_retry() {
+    fn integration_open_pr_retains_via_real_handler() {
         let home = tmp_home("itest-open");
+        write_fleet(&home, "dev");
         let repo = itest_source_repo(&home, "owner/repo");
         itest_lease(&home, &repo, "dev", "feat/o", "t-o", false);
         write_pr_slug(
@@ -1301,12 +1426,9 @@ mod tests {
             7,
             true,
         );
-        crate::daemon::auto_release::enqueue_release_recompute(
-            &home,
-            "owner/repo",
-            "feat/o",
-            "task_done",
-        );
+        // REAL entry: the task-done handler marks done + enqueues.
+        task_done_via_handler(&home, "dev", "t-o");
+        assert_eq!(queue_len(&home), 1, "task-done handler→enqueue wiring");
         drain_queue(&home);
         assert!(
             bound(&home, "dev"),
@@ -1317,19 +1439,19 @@ mod tests {
     }
 
     #[test]
-    fn integration_no_pr_with_task_done_releases() {
+    fn integration_no_pr_task_done_releases_via_real_handler() {
         let home = tmp_home("itest-nopr");
+        write_fleet(&home, "dev");
         let repo = itest_source_repo(&home, "owner/repo");
-        itest_lease(&home, &repo, "dev", "feat/n", "t-n", true); // task marked DONE
+        itest_lease(&home, &repo, "dev", "feat/n", "t-n", false);
         write_pr_slug(&home, "owner/repo", "feat/n", MergeState::NotReady, 0, true); // polled, no PR
-        crate::daemon::auto_release::enqueue_release_recompute(
-            &home,
-            "owner/repo",
-            "feat/n",
-            "task_done",
-        );
+                                                                                     // REAL entry: task-done handler.
+        task_done_via_handler(&home, "dev", "t-n");
         drain_queue(&home);
-        assert!(!bound(&home, "dev"), "no-PR + all tasks done → released");
+        assert!(
+            !bound(&home, "dev"),
+            "no-PR + task done (via real handler) → released"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
