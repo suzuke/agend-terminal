@@ -1674,30 +1674,53 @@ fn persist_watch_state(
     state: &mut WatchState,
 ) {
     if outcome.new_notified_sha.is_some() {
-        if let Some(next) = state.next_after_ci.as_deref().filter(|s| !s.is_empty()) {
-            let last_conclusion = aggregate_conclusion_for_sha_filtered(
-                &pr.runs,
-                &pr.current_sha,
-                state.required_checks.as_deref(),
-            );
-            if last_conclusion == Some("success") {
-                let repo_branch_key = format!("{}@{}", ctx.repo, ctx.branch);
-                let pr_number = crate::daemon::pr_state::load(ctx.home, ctx.repo, ctx.branch)
-                    .map(|s| s.pr_number);
-                let task_id = state.task_id.as_deref();
-                let msg = make_ci_ready_for_action_msg(
-                    ctx.repo,
-                    ctx.branch,
-                    &repo_branch_key,
-                    Some(&pr.current_sha),
-                    pr_number,
-                    task_id,
-                );
-                persist_or_log!(
-                    crate::inbox::enqueue_with_idle_hint(ctx.home, next, msg),
-                    "ci_watch_chain",
-                    next
-                );
+        // t-ci-ready-robust-fallback-design (PR-1, option C): the actionable
+        // `[ci-ready-for-action]` is a CHAIN signal — it routes to `next_after_ci`
+        // (the workflow's next agent). When there is NO chain, non-chain
+        // subscribers ALREADY receive the informational `[ci-pass]` (correct
+        // semantics: no "your turn" exists without a chain), so we do NOT forge an
+        // actionable signal for them. (Verified not load-bearing: `[ci-pass]`
+        // carries the SAME `repo@branch` correlation_id, nothing keys on the
+        // ci-ready correlation for tracking, and CI-done tracking via
+        // `record_ci_result` below is keyed on repo/branch independent of routing.)
+        // The ONE genuinely-silent case — no `next_after_ci` AND no subscribers
+        // (a malformed watch) — is loud-logged rather than dropped silently.
+        if aggregate_conclusion_for_sha_filtered(
+            &pr.runs,
+            &pr.current_sha,
+            state.required_checks.as_deref(),
+        ) == Some("success")
+        {
+            match state.next_after_ci.as_deref().filter(|s| !s.is_empty()) {
+                Some(next) => {
+                    let repo_branch_key = format!("{}@{}", ctx.repo, ctx.branch);
+                    let pr_number = crate::daemon::pr_state::load(ctx.home, ctx.repo, ctx.branch)
+                        .map(|s| s.pr_number);
+                    let task_id = state.task_id.as_deref();
+                    let msg = make_ci_ready_for_action_msg(
+                        ctx.repo,
+                        ctx.branch,
+                        &repo_branch_key,
+                        Some(&pr.current_sha),
+                        pr_number,
+                        task_id,
+                    );
+                    persist_or_log!(
+                        crate::inbox::enqueue_with_idle_hint(ctx.home, next, msg),
+                        "ci_watch_chain",
+                        next
+                    );
+                }
+                None if state.subscriber_names().is_empty() => {
+                    tracing::warn!(
+                        target: "ci_watch",
+                        repo = ctx.repo,
+                        branch = ctx.branch,
+                        "CI passed but watch has no next_after_ci AND no subscribers — \
+                         no one to notify (malformed watch); not dropping silently"
+                    );
+                }
+                None => {}
             }
         }
 

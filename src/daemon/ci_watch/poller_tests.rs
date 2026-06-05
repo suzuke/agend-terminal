@@ -2576,6 +2576,68 @@ fn ci_pass_chain_target_excluded_from_subscriber_loop() {
     );
 }
 
+/// t-ci-ready-robust-fallback-design (PR-1, option C): a watch with NO
+/// `next_after_ci` AND NO subscribers (malformed) must NOT silently forge a
+/// `[ci-ready-for-action]` to nobody, and must complete without panic — it
+/// loud-logs and no-ops. (When subscribers ARE present they receive the
+/// informational `[ci-pass]` via the separate subscriber loop; the actionable
+/// `[ci-ready-for-action]` is a chain-only signal, never forged for non-chain
+/// agents.)
+#[test]
+fn ci_pass_no_next_no_subscribers_does_not_forge_ci_ready() {
+    let dir = tmp_dir("ciready-malformed");
+    let ci_dir = dir.join("ci-watches");
+    std::fs::create_dir_all(&ci_dir).ok();
+    let watch = serde_json::json!({
+        "repo": "o/r",
+        "branch": "feat",
+        "subscribers": [],
+        "instance": null,
+        "interval_secs": 60,
+        "last_run_id": null,
+        "head_sha": null,
+        "last_polled_at": null,
+        "last_notified_head_sha": null,
+        "expires_at": (chrono::Utc::now() + chrono::Duration::hours(72)).to_rfc3339(),
+        "last_terminal_seen_at": null,
+    });
+    let watch_path = ci_dir.join(watch_filename("o/r", "feat"));
+    std::fs::write(&watch_path, serde_json::to_string_pretty(&watch).unwrap()).unwrap();
+    let provider = MockCiProvider::with_runs(vec![CiRun {
+        id: 9,
+        conclusion: Some("success".to_string()),
+        head_sha: "abc1234".to_string(),
+        url: "https://example/run/9".to_string(),
+        name: String::new(),
+    }]);
+    let registry: AgentRegistry =
+        Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    // No subscribers, no next → graceful no-op (loud-log), must not panic.
+    rt.block_on(ci_check_repo(
+        &dir,
+        &watch_path,
+        serde_json::from_value(watch.clone()).unwrap(),
+        vec![],
+        &registry,
+        &provider,
+    ))
+    .unwrap();
+    for probe in ["lead", "dev", "reviewer"] {
+        let messages = crate::inbox::drain(&dir, probe);
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.text.contains("[ci-ready-for-action]")),
+            "{probe} must NOT receive a forged [ci-ready-for-action] (no chain, no subscribers); got: {messages:?}"
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// #1032 T1: `make_ci_conflict_alert_msg` produces an InboxMessage
 /// whose `enqueue_with_idle_hint_with_emitter` invocation yields a
 /// canonical `[AGEND-MSG-PENDING]` hint. The GREEN swap at site 149
