@@ -2886,12 +2886,11 @@ mod tests {
     }
 
     #[test]
-    fn gc_run_force_reclaim_never_hard_deletes() {
+    fn gc_run_force_reclaim_archives_never_hard_deletes() {
         // codex gap ① CRITICAL: the daemon gc_run/gc_remove_one path must route a
-        // force-reclaim through the SAFE helper, never hard-delete. Proof: a dirty
-        // worktree (here, the untracked .agend-managed marker) that the OLD
-        // `git worktree remove --force` would have destroyed is PRESERVED by the
-        // safe path's status pre-check.
+        // force-reclaim through the SAFE helper, never hard-delete. Proof: it is
+        // ARCHIVED to .trash (recoverable) rather than removed — the old
+        // `git worktree remove --force` would have left nothing behind.
         let home = tmp_home("fr-gcrun");
         let repo = tmp_repo("fr-gcrun-repo");
         let lease = lease(&home, &repo, "fr-gcrun-agent", "feat/x").expect("lease");
@@ -2903,13 +2902,21 @@ mod tests {
         };
         let result = gc_remove_one(&home, &cand);
         assert!(
-            !result.removed,
-            "dirty force-reclaim must be skipped by the safe pre-check, not removed"
+            result.removed,
+            "force-reclaim via gc_run should archive: {:?}",
+            result.error
+        );
+        assert!(!lease.path.exists(), "worktree moved out");
+        let trash = home.join(".trash").join("worktrees");
+        assert!(
+            std::fs::read_dir(&trash)
+                .map(|d| d.flatten().count() > 0)
+                .unwrap_or(false),
+            "gc_run force-reclaim must ARCHIVE to .trash (recoverable), never hard-delete"
         );
         assert!(
-            lease.path.exists(),
-            "force-reclaim must route through the SAFE path — the OLD gc_run would have \
-             force-removed this dirty worktree (data loss)"
+            crate::binding::read(&home, "fr-gcrun-agent").is_none(),
+            "binding unbound after force-reclaim"
         );
         let _ = std::fs::remove_dir_all(&home);
     }

@@ -130,8 +130,20 @@ pub(crate) fn maybe_remove_candidate(
         crate::git_helpers::git_bypass(path, &["status", "--porcelain=v1", "--ignored"]);
     match status_output {
         Ok(o) if o.status.success() => {
-            if !o.stdout.is_empty() {
-                let status_text = String::from_utf8_lossy(&o.stdout);
+            let status_text = String::from_utf8_lossy(&o.stdout);
+            // #1053 keeps `--ignored` to protect operator data in gitignored files
+            // (T13a). But the daemon's OWN `.agend-managed` marker is gitignored
+            // too (.gitignore:29), so `--ignored` lists `!! .agend-managed` in
+            // EVERY managed worktree — counting that as WIP skipped every worktree,
+            // no-oping ALL GC (reviewer-2 efficacy defect: force-reclaim +
+            // clean-release reclaimed nothing). Exclude ONLY the marker line; any
+            // other entry (real tracked/untracked WIP, or operator gitignored data)
+            // still skips. Porcelain v1 line = `XY <path>` → path starts at col 3.
+            let has_protectable_content = status_text.lines().any(|line| {
+                let p = line.get(3..).map(str::trim).unwrap_or("");
+                !p.is_empty() && p != crate::worktree_pool::MANAGED_MARKER
+            });
+            if has_protectable_content {
                 tracing::warn!(
                     path = %path.display(),
                     status = %status_text.trim(),
@@ -880,5 +892,85 @@ mod tests {
             "merged PR never released → event-release bug"
         );
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// setup_git_repo + commit a .gitignore with `.agend-managed`, so a leased
+    /// worktree's marker is reported as `!! .agend-managed` under `--ignored` —
+    /// the exact production / reviewer-2 repro condition.
+    fn setup_git_repo_marker_ignored(dir: &Path) -> PathBuf {
+        let repo = setup_git_repo(dir);
+        std::fs::write(repo.join(".gitignore"), ".agend-managed\n").unwrap();
+        for args in [
+            vec!["add", ".gitignore"],
+            vec!["commit", "-m", "gitignore marker"],
+        ] {
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(&repo)
+                .env("AGEND_GIT_BYPASS", "1")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+        }
+        repo
+    }
+
+    /// reviewer-2 efficacy (§3.9 representative fixture): a REAL `lease()` worktree
+    /// carries the gitignored `.agend-managed` marker, which `--ignored` reports as
+    /// `!! .agend-managed`. It MUST archive — NOT be skipped as WIP by its own
+    /// marker. (The old `add_worktree` fixture had no marker → masked this.)
+    #[test]
+    fn force_reclaim_real_lease_with_marker_is_archived() {
+        let dir = tmp_home("fr-real-lease");
+        let repo = setup_git_repo_marker_ignored(&dir);
+        let lease = crate::worktree_pool::lease(&dir, &repo, "dev-real", "feat/x").expect("lease");
+        assert!(
+            crate::binding::read(&dir, "dev-real").is_some(),
+            "pre: bound"
+        );
+        let cand = crate::worktree_pool::GcCandidate {
+            path: lease.path.clone(),
+            agent: "dev-real".to_string(),
+            reason: "fr".to_string(),
+            kind: crate::worktree_pool::GcKind::ForceReclaim,
+        };
+        let outcome = maybe_remove_candidate(&dir, &cand);
+        assert!(
+            matches!(outcome, RemovalOutcome::Removed),
+            "marker-bearing real lease must archive, not be skipped by its own marker: {outcome:?}"
+        );
+        assert!(!lease.path.exists(), "archived");
+        assert!(
+            crate::binding::read(&dir, "dev-real").is_none(),
+            "unbound after force-reclaim"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The 4th leak root: a RELEASED marker-bearing worktree must also archive
+    /// (clean-release uses the same dirty-check).
+    #[test]
+    fn clean_release_real_lease_with_marker_is_archived() {
+        let dir = tmp_home("cr-real-lease");
+        let repo = setup_git_repo_marker_ignored(&dir);
+        let lease = crate::worktree_pool::lease(&dir, &repo, "dev-cr", "feat/y").expect("lease");
+        // Released → binding cleared (clean-release path requires the binding gone).
+        crate::binding::unbind(&dir, "dev-cr");
+        let cand = crate::worktree_pool::GcCandidate {
+            path: lease.path.clone(),
+            agent: "dev-cr".to_string(),
+            reason: "cr".to_string(),
+            kind: crate::worktree_pool::GcKind::CleanRelease,
+        };
+        let outcome = maybe_remove_candidate(&dir, &cand);
+        assert!(
+            matches!(outcome, RemovalOutcome::Removed),
+            "released marker-bearing worktree must archive (clean-release efficacy): {outcome:?}"
+        );
+        assert!(!lease.path.exists(), "archived");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
