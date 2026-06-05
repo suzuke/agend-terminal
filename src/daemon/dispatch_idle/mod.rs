@@ -609,6 +609,31 @@ fn target_is_working(
         .unwrap_or(false)
 }
 
+/// #absorb-blocked: does `target` have an ACTIVE `waiting_on` — i.e. it called
+/// `set_waiting_on(<condition>)` (declaring an intentional block/queue) and hasn't
+/// cleared it? Read from the in-mem `heartbeat_pair` (`waiting_on_since_ms` is
+/// `Some` while a condition is set, `None` after `set_waiting_on("")`), so this
+/// adds NO registry lock and NO file read in the scan.
+///
+/// A blocked agent is intentionally waiting (e.g. on a dependency PR), so the
+/// dispatch-idle "you've gone silent, status?" nudge is noise — absorb it. KISS:
+/// any active `waiting_on` absorbs, with NO correlation to a specific dispatch (a
+/// blocked agent is waiting regardless of which dispatch is overdue;
+/// correlate-to-`correlation_id` is a deferred over-precision refinement).
+///
+/// FOLLOW-UP (in-mem-reset-on-restart class): `heartbeat_pair` is in-memory, so a
+/// daemon restart zeroes `waiting_on_since_ms` → a still-blocked target is nudged
+/// once post-restart until it re-sets `waiting_on`. The persistent source is the
+/// instance metadata `waiting_on` field (written by `set_waiting_on`); a
+/// boot-rehydrate (metadata → `heartbeat_pair`) would close this. Deferred: the
+/// restart edge is transient + minor (the silence-clock `silent_secs` also resets
+/// on restart), but it IS the known in-mem-reset class — do not forget.
+fn target_has_active_waiting_on(target: &str) -> bool {
+    crate::daemon::heartbeat_pair::snapshot_for(target)
+        .waiting_on_since_ms
+        .is_some()
+}
+
 /// Per-tick scan: flip eligible pending entries to `exceeded` and emit
 /// the inbox event to the dispatcher. Exposed `pub(crate)` for tests.
 pub(crate) fn scan_and_emit(home: &Path) {
@@ -644,9 +669,22 @@ pub(crate) fn scan_and_emit(home: &Path) {
         // productive output → `silent_secs` climbs past the window → this gate
         // releases → the watchdog fires as designed. (The hang detector
         // independently catches infinite-gen / MCP-active-but-stuck.)
-        if target_is_working(snapshot.as_ref(), &d.target, d.threshold_secs) {
-            // #1658: the target is producing output — reset the debounce streak
-            // so a later idle run starts fresh.
+        // #absorb-blocked: ALSO suppress when the target has an active
+        // `waiting_on` — it has declared an intentional block/queue (e.g. waiting
+        // on a dependency PR), so a "you've gone silent, status?" nudge is pure
+        // noise. (The N=3 false-positives this session: a blocked/queued target
+        // reads as idle/silent — not "working" — so it flipped to Exceeded and got
+        // nudged despite replying BUSY + blocked_on.) KISS: reuse the existing
+        // `set_waiting_on` signal, no correlation to THIS dispatch — a blocked
+        // agent is waiting regardless of which dispatch is overdue. Absorbing here
+        // at the L1 source suppresses BOTH the dispatcher `..._exceeded` event AND
+        // the L2 `..._nudge` to the target. Boundary: `set_waiting_on("")` clears
+        // it → the gate releases → a genuinely-stuck-after-unblock target fires.
+        if target_is_working(snapshot.as_ref(), &d.target, d.threshold_secs)
+            || target_has_active_waiting_on(&d.target)
+        {
+            // #1658: the target is producing output (or intentionally blocked) —
+            // reset the debounce streak so a later idle run starts fresh.
             if d.not_working_streak != 0 {
                 set_not_working_streak(home, &d.dispatch_id, 0);
             }
@@ -2456,6 +2494,82 @@ mod tests {
                 .iter()
                 .any(|m| m.kind.as_deref() == Some("dispatch_idle_threshold_exceeded")),
             "productive-silent past window + overdue + no report must still fire"
+        );
+        let p = list_pending(&home)
+            .into_iter()
+            .find(|p| p.dispatch_id == id)
+            .unwrap();
+        assert_eq!(p.status, DispatchStatus::Exceeded);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #absorb-blocked (the N=3 false-positive replay): a target that is
+    /// idle/silent (NOT "working") but has declared an ACTIVE `waiting_on`
+    /// (intentional block/queue, e.g. waiting on a dependency PR) must NOT fire —
+    /// the sidecar stays Pending, so neither the dispatcher `..._exceeded` event
+    /// NOR the downstream L2 `..._nudge` to the target is sent.
+    #[test]
+    fn blocked_target_with_waiting_on_is_absorbed() {
+        let home = tmp_home("absorb-blocked");
+        let target = "absorb-blocked-tgt";
+        let issued = chrono::Utc::now() - chrono::Duration::seconds(700);
+        let id = write_pending_at(&home, "lead", target, Some("t-ab"), "task", 600, issued);
+        // Idle + productive-silent past the window (would normally fire) ...
+        crate::snapshot::save(&home, &[mk_agent_snapshot_silence(target, "idle", 700)]);
+        // ... BUT the target declared an active waiting_on (set_waiting_on).
+        crate::daemon::heartbeat_pair::update_with(target, |p| {
+            p.waiting_on_since_ms = Some(crate::daemon::heartbeat_pair::now_ms());
+        });
+
+        for _ in 0..DEBOUNCE_SCANS + 1 {
+            scan_and_emit(&home);
+        }
+
+        assert!(
+            crate::inbox::drain(&home, "lead").is_empty(),
+            "#absorb-blocked: an active-waiting_on target must NOT fire the exceeded event"
+        );
+        let p = list_pending(&home)
+            .into_iter()
+            .find(|p| p.dispatch_id == id)
+            .unwrap();
+        assert_eq!(
+            p.status,
+            DispatchStatus::Pending,
+            "#absorb-blocked: sidecar stays Pending (absorbed) → the L2 target nudge is also suppressed"
+        );
+        // Global hygiene: clear this name's waiting_on (heartbeat_pair is process-global).
+        crate::daemon::heartbeat_pair::update_with(target, |p| {
+            p.waiting_on_since_ms = None;
+        });
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #absorb-blocked boundary: once the target CLEARS its waiting_on
+    /// (`set_waiting_on("")` → `waiting_on_since_ms = None`), the absorb releases —
+    /// a still-overdue, still-silent target fires normally. We must not permanently
+    /// suppress a genuinely-stuck-after-unblock target.
+    #[test]
+    fn cleared_waiting_on_resumes_firing() {
+        let home = tmp_home("absorb-cleared");
+        let target = "absorb-cleared-tgt";
+        let issued = chrono::Utc::now() - chrono::Duration::seconds(700);
+        let id = write_pending_at(&home, "lead", target, Some("t-ac"), "task", 600, issued);
+        crate::snapshot::save(&home, &[mk_agent_snapshot_silence(target, "idle", 700)]);
+        // Cleared (no active waiting_on) — the resume side of the boundary.
+        crate::daemon::heartbeat_pair::update_with(target, |p| {
+            p.waiting_on_since_ms = None;
+        });
+
+        for _ in 0..DEBOUNCE_SCANS {
+            scan_and_emit(&home);
+        }
+
+        assert!(
+            crate::inbox::drain(&home, "lead")
+                .iter()
+                .any(|m| m.kind.as_deref() == Some("dispatch_idle_threshold_exceeded")),
+            "#absorb-blocked: a cleared (no waiting_on) overdue+silent target must still fire"
         );
         let p = list_pending(&home)
             .into_iter()
