@@ -119,11 +119,24 @@ Feature/fix PRs must be test-first: failing test commit BEFORE impl commit.
 - (d) Removing defensive code → 4-perspective counter-example challenge; 0 compelling = safe to delete
 
 ### 3.12 Verdict Externalization (was §3.5.13)
-Fleet-internal verdict MUST mirror to GH PR comment (`gh pr comment`). Self-merge gate: dual VERIFIED + CI green (independently verified via `gh pr checks`) + verdict mirror posted — all three required before merge. Canonical merge command is `gh pr merge <N> --auto --squash --delete-branch` (§3.12.1 ACTIVE since 2026-05-20). Legacy form `gh pr merge <N> --squash --delete-branch` remains valid as escape-hatch for queue-contention recovery or admin-bypass scenarios (per #985/#988 deviation precedent).
+Fleet-internal verdict MUST mirror to GH PR comment (`gh pr comment`). Self-merge gate: dual VERIFIED + CI green + verdict mirror posted — all three required before merge.
+
+**Canonical merge step: `repo action=merge pr=<N>`** (the MCP `repo` tool → `handle_merge_repo`, `src/mcp/handlers/ci/mod.rs`). It issues the **byte-identical** merge a raw `gh` call would (`gh pr merge <N> --repo R --admin --squash --delete-branch`, pinned by `scm::tests::pr_merge_args_match_existing_gh_call`) but wraps it in three safety nets the raw command lacks:
+1. **Safe repo-resolution (#1619)** — resolves the target `owner/repo` via `resolve_repo_or_error`; a detection miss ERRORS instead of silently merging against a hardcoded/maintainer repo.
+2. **CI fail-closed gate** — runs `pr checks` (via `ScmProvider`) first; ANY non-`SUCCESS`/`SKIPPED` check OR an undeterminable result REFUSES the merge. Bypass only with `force=true` + a non-empty `force_reason` (audit-logged to `fleet_events.jsonl`).
+3. **`verify_merge_landed` (#1467)** — `gh pr merge` exit-0 is necessary but NOT sufficient (merge-queue / eventual-consistency can exit-0 without landing); it re-`view`s the PR and reports `merged:false, pending:true` rather than a false success, so the caller re-queries instead of blindly re-merging.
+
+It also routes through `ScmProvider` (platform-agnostic — not hardwired to `gh`).
+
+⚠ **Scope of the gate:** `repo action=merge` gates **CI fail-closed**, NOT the review verdict. The dual-VERIFIED requirement above stays a **fleet convention** the orchestrator enforces (dispatch reviewer → await `VERIFIED` → THEN run `repo action=merge`) — this change does NOT make review a hard precondition of the merge primitive.
+
+**Fallback (emergency / MCP unavailable):** raw `gh pr merge <N>` — the `--auto --squash --delete-branch` form (§3.12.1, server-side queue; needs strict branch protection) or the synchronous `--admin --squash --delete-branch` form (queue-contention recovery / admin-bypass, per #985/#988 deviation precedent). Prefer the MCP primitive; drop to raw `gh` only when the MCP path can't run.
 
 #### 3.12.1 `gh pr merge --auto` adoption (Sprint 65, #973) — ACTIVE since 2026-05-20
 
-The canonical self-merge invocation is `gh pr merge <N> --auto --squash --delete-branch` (requires `gh` CLI >= 2.31.0). `--auto` moves merge submission to GitHub's server-side queue, eliminating the "Base branch was modified" race observed in #971 close-loop (2026-05-20).
+> NOTE (t-protocol-merge-via-repo-action): §3.12 now makes **`repo action=merge`** the canonical merge step. This subsection governs the **raw-`gh` fallback** path — when you have to drop below the MCP primitive, `--auto` is the preferred raw form (it respects branch protection; the daemon's CI fail-closed gate is unavailable on this path).
+
+When dropping to the raw-`gh` fallback, the preferred invocation is `gh pr merge <N> --auto --squash --delete-branch` (requires `gh` CLI >= 2.31.0). `--auto` moves merge submission to GitHub's server-side queue, eliminating the "Base branch was modified" race observed in #971 close-loop (2026-05-20).
 
 **Prerequisites** (one-time per repo, enabled in #973):
 - `allow_auto_merge: true` at repo level (`gh api repos/<owner>/<repo> -X PATCH -F allow_auto_merge=true`)
