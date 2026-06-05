@@ -1125,4 +1125,267 @@ mod tests {
         intent.enqueued_at = chrono::Utc::now().to_rfc3339();
         assert!(!intent_expired(&intent), "fresh intent does not expire");
     }
+
+    // ── t-worktree-leak (PR-1): enqueue→sweep→release INTEGRATION tests ──
+    // §3.9 / #1799: drive the REAL entry (the scanner's merge call /
+    // enqueue_release_recompute), provision real state (managed git worktree +
+    // dispatch binding + board task + pr_state), run the sweeper, and assert the
+    // worktree is actually released or retained — not an injected-input unit test.
+
+    fn itest_source_repo(home: &Path, slug: &str) -> std::path::PathBuf {
+        let dir = home.join("source-repo");
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("https://github.com/{slug}.git");
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["remote", "add", "origin", url.as_str()],
+        ] {
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(&dir)
+                .env("AGEND_GIT_BYPASS", "1")
+                .output()
+                .ok();
+        }
+        // Mirror the real repo's .gitignore (line 29) so the `.agend-managed`
+        // marker the lease writes into the worktree does NOT show as untracked —
+        // otherwise `git status --porcelain` is non-empty and the dirty-guard
+        // refuses to release (exactly how production stays clean).
+        std::fs::write(dir.join(".gitignore"), ".agend-managed\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", ".gitignore"])
+            .current_dir(&dir)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .ok();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-m",
+                "init",
+            ])
+            .current_dir(&dir)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .ok();
+        dir
+    }
+
+    fn seed_task(home: &Path, id: &str, owner: &str, branch: &str, done: bool) {
+        use crate::task_events::{append, DoneSource, InstanceName, TaskEvent, TaskId};
+        append(
+            home,
+            &InstanceName::from("test:lead"),
+            TaskEvent::Created {
+                task_id: TaskId(id.into()),
+                title: "t".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: Some(InstanceName::from(owner)),
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: Some(branch.into()),
+                bind: None,
+                eta_secs: None,
+                tags: vec![],
+                parent_id: None,
+            },
+        )
+        .unwrap();
+        if done {
+            append(
+                home,
+                &InstanceName::from(owner),
+                TaskEvent::Done {
+                    task_id: TaskId(id.into()),
+                    by: InstanceName::from(owner),
+                    source: DoneSource::OperatorManual {
+                        authored_at: chrono::Utc::now().to_rfc3339(),
+                        result: Some("ok".into()),
+                    },
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    /// Provision a real managed worktree + dispatch binding (non-empty task_id) +
+    /// a board task owned by the agent. Returns the worktree path.
+    fn itest_lease(
+        home: &Path,
+        repo: &Path,
+        agent: &str,
+        branch: &str,
+        task_id: &str,
+        done: bool,
+    ) -> std::path::PathBuf {
+        let lease = crate::worktree_pool::lease(home, repo, agent, branch).expect("lease");
+        crate::binding::bind_full(home, agent, task_id, branch, &lease.path, repo)
+            .expect("bind_full");
+        seed_task(home, task_id, agent, branch, done);
+        lease.path
+    }
+
+    fn write_pr_slug(
+        home: &Path,
+        repo: &str,
+        branch: &str,
+        ms: MergeState,
+        pr_number: u64,
+        polled: bool,
+    ) {
+        use crate::daemon::pr_state;
+        let mut s =
+            pr_state::new_for_branch(repo, branch, "headsha", pr_state::ReviewClass::Single);
+        s.merge_state = ms;
+        s.pr_number = pr_number;
+        if polled {
+            s.last_gh_poll_at = Some("2026-06-05T00:00:00Z".to_string());
+        }
+        pr_state::save(home, &s).unwrap();
+    }
+
+    fn bound(home: &Path, agent: &str) -> bool {
+        crate::binding::read(home, agent).is_some()
+    }
+    fn queue_len(home: &Path) -> usize {
+        std::fs::read_dir(queue_dir(home))
+            .map(|d| d.flatten().count())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn integration_merge_releases_worktree() {
+        let home = tmp_home("itest-merge");
+        let repo = itest_source_repo(&home, "owner/repo");
+        itest_lease(&home, &repo, "dev", "feat/m", "t-m", false);
+        write_pr_slug(
+            &home,
+            "owner/repo",
+            "feat/m",
+            MergeState::Merged {
+                merge_commit: "c0ffee".into(),
+                merged_at: "2026-06-05T00:00:00Z".into(),
+            },
+            5,
+            true,
+        );
+        assert!(bound(&home, "dev"), "pre: agent is bound");
+        // REAL entry: the scanner's merge call → enqueue.
+        auto_release_for_merged_branch(&home, "owner/repo", "feat/m");
+        assert_eq!(queue_len(&home), 1, "merge enqueues a recompute intent");
+        drain_queue(&home);
+        assert!(
+            !bound(&home, "dev"),
+            "merge → worktree released (binding gone)"
+        );
+        assert_eq!(queue_len(&home), 0, "released intent deleted");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn integration_open_pr_retains_intent_for_retry() {
+        let home = tmp_home("itest-open");
+        let repo = itest_source_repo(&home, "owner/repo");
+        itest_lease(&home, &repo, "dev", "feat/o", "t-o", false);
+        write_pr_slug(
+            &home,
+            "owner/repo",
+            "feat/o",
+            MergeState::MergeReady,
+            7,
+            true,
+        );
+        crate::daemon::auto_release::enqueue_release_recompute(
+            &home,
+            "owner/repo",
+            "feat/o",
+            "task_done",
+        );
+        drain_queue(&home);
+        assert!(
+            bound(&home, "dev"),
+            "open PR → NOT released (binding stays)"
+        );
+        assert_eq!(queue_len(&home), 1, "open-PR intent retained for retry");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn integration_no_pr_with_task_done_releases() {
+        let home = tmp_home("itest-nopr");
+        let repo = itest_source_repo(&home, "owner/repo");
+        itest_lease(&home, &repo, "dev", "feat/n", "t-n", true); // task marked DONE
+        write_pr_slug(&home, "owner/repo", "feat/n", MergeState::NotReady, 0, true); // polled, no PR
+        crate::daemon::auto_release::enqueue_release_recompute(
+            &home,
+            "owner/repo",
+            "feat/n",
+            "task_done",
+        );
+        drain_queue(&home);
+        assert!(!bound(&home, "dev"), "no-PR + all tasks done → released");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn integration_cas_skips_re_leased_binding() {
+        let home = tmp_home("itest-cas");
+        let repo = itest_source_repo(&home, "owner/repo");
+        let wt = itest_lease(&home, &repo, "dev", "feat/c", "t-c", false);
+        write_pr_slug(
+            &home,
+            "owner/repo",
+            "feat/c",
+            MergeState::Merged {
+                merge_commit: "c".into(),
+                merged_at: "2026-06-05T00:00:00Z".into(),
+            },
+            5,
+            true,
+        );
+        // Enqueue snapshots the CURRENT lease (task_id=t-c).
+        crate::daemon::auto_release::enqueue_release_recompute(
+            &home,
+            "owner/repo",
+            "feat/c",
+            "merge",
+        );
+        // Re-lease the SAME agent to a new task → snapshot is now stale.
+        crate::binding::bind_full(&home, "dev", "t-c2", "feat/c", &wt, &repo).expect("rebind");
+        drain_queue(&home);
+        assert!(
+            bound(&home, "dev"),
+            "CAS: a stale (re-leased) intent must NOT release the new lease"
+        );
+        assert_eq!(
+            queue_len(&home),
+            0,
+            "stale intent dropped (CAS skip is terminal)"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn integration_expired_intent_dropped() {
+        let home = tmp_home("itest-exp");
+        std::fs::create_dir_all(queue_dir(&home)).unwrap();
+        let mut intent = sample_intent("t-exp");
+        intent.enqueued_at =
+            (chrono::Utc::now() - chrono::Duration::days(INTENT_EXPIRY_DAYS + 1)).to_rfc3339();
+        enqueue_intent(&home, &intent).unwrap();
+        assert_eq!(queue_len(&home), 1);
+        drain_queue(&home);
+        assert_eq!(
+            queue_len(&home),
+            0,
+            "expired intent dropped (force-reclaim backstop takes over)"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }
