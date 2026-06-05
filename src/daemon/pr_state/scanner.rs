@@ -77,7 +77,9 @@ pub fn scan_and_emit_with(
         // NOT run under the PR-state flock. The closure only records the branch
         // to release; the actual release runs after `with_pr_state` returns and
         // the flock is dropped (see below).
-        let mut release_after_unlock: Option<String> = None;
+        // t-worktree-leak (PR-1): (branch, event_kind) of a terminal PR transition
+        // observed this scan — the release-invariant recompute runs post-flock.
+        let mut release_after_unlock: Option<(String, &'static str)> = None;
         // #1629: collect deferred inbox emits here under the flock; drain them
         // AFTER `with_pr_state` returns so enqueue_with_idle_hint (self-IPC via
         // loopback api::call) runs lock-free (#1617 lock-while-blocking class).
@@ -131,7 +133,7 @@ pub fn scan_and_emit_with(
                         // AFTER this flock is dropped (the git subprocess +
                         // nested binding flock are the #1617 lock-while-blocking
                         // class). Record the branch; release runs post-unlock.
-                        release_after_unlock = Some(state.branch.clone());
+                        release_after_unlock = Some((state.branch.clone(), "merge"));
                         let author = resolve_author(state);
                         let body = format!(
                             "[pr-merged] {}@{} (merge_commit {}, merged_at {})\n\n\
@@ -176,6 +178,10 @@ pub fn scan_and_emit_with(
                         let msg = build_event_message("pr-closed-unmerged", &author, state, body);
                         pending_emits.push((author, msg));
                         state.ready_emitted_for_sha = Some(state.head_sha.clone());
+                        // t-worktree-leak (PR-1): close-unmerged is a terminal PR
+                        // transition → recompute the release invariant post-flock
+                        // (the sweeper applies the conservative close-grace).
+                        release_after_unlock = Some((state.branch.clone(), "close_unmerged"));
                         dirty = true;
                     } else {
                         tracing::debug!(
@@ -212,9 +218,18 @@ pub fn scan_and_emit_with(
         }
 
         // #bughunt3 (#1617 class): PR-state flock is now released — run the
-        // auto-release (git subprocess + nested binding flock) lock-free.
-        if let Some(merged_branch) = release_after_unlock {
-            crate::daemon::auto_release::auto_release_for_merged_branch(home, &merged_branch);
+        // release-invariant recompute lock-free. t-worktree-leak (PR-1): merge
+        // keeps the named entry (the #1617 invariant test pins it); close-unmerged
+        // enqueues through the same HYBRID path with its own event kind.
+        if let Some((branch, event_kind)) = release_after_unlock {
+            match event_kind {
+                "merge" => crate::daemon::auto_release::auto_release_for_merged_branch(
+                    home, &repo, &branch,
+                ),
+                _ => crate::daemon::auto_release::enqueue_release_recompute(
+                    home, &repo, &branch, event_kind,
+                ),
+            }
         }
 
         match result {

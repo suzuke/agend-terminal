@@ -425,6 +425,16 @@ fn process_verdicts(home: &Path, from: &str, msg: &crate::inbox::InboxMessage) {
                 verdict_msg_id: msg.id.clone(),
                 reviewed_head: msg.reviewed_head.clone(),
                 enqueued_at: chrono::Utc::now().to_rfc3339(),
+                // t-worktree-leak (PR-1) Q1(b): a VERIFIED verdict no longer
+                // releases an OPEN PR's worktree — the sweeper gates it through the
+                // release invariant, so release waits for the terminal (merge/close)
+                // or no-PR+task-done event. repo/branch/lease are derived by the
+                // sweeper from the live binding; the superseding merge intent
+                // carries the CAS snapshot.
+                event_kind: Some("verdict".to_string()),
+                repo: None,
+                branch: None,
+                lease: None,
             };
             if let Err(e) = crate::daemon::auto_release::enqueue_intent(home, &intent) {
                 tracing::warn!(task_id = %task_id, error = %e, "#870 auto_release: enqueue failed");

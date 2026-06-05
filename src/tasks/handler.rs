@@ -340,11 +340,27 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                         .as_ref()
                         .map(|o| o.0.clone())
                         .unwrap_or_else(|| caller.clone());
-                    if let Some(wt) = crate::binding::read(home, &owner)
-                        .and_then(|v| v["worktree"].as_str().map(std::path::PathBuf::from))
-                    {
-                        let _ =
-                            crate::mcp::handlers::dispatch_hook::clean_empty_init_commits(&wt).ok();
+                    if let Some(binding) = crate::binding::read(home, &owner) {
+                        if let Some(wt) = binding["worktree"].as_str().map(std::path::PathBuf::from)
+                        {
+                            let _ =
+                                crate::mcp::handlers::dispatch_hook::clean_empty_init_commits(&wt)
+                                    .ok();
+                        }
+                        // t-worktree-leak (PR-1): task-done is one of the 3 release
+                        // events. Enqueue a release-invariant recompute — if the
+                        // branch has no open PR and all its tasks are done, the
+                        // sweeper releases the worktree (covers tasks that never
+                        // produce a PR: RCA / design / spike). An open PR holds the
+                        // release until it terminates. (repo="" → sweeper derives it.)
+                        if let Some(branch) = binding["branch"].as_str() {
+                            crate::daemon::auto_release::enqueue_release_recompute(
+                                home,
+                                "",
+                                branch,
+                                "task_done",
+                            );
+                        }
                     }
                     // #1018 (B): eager cleanup of pending dispatch
                     // sidecars whose correlation_id matches this

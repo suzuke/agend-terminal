@@ -1320,7 +1320,7 @@ async fn check_and_remove_terminal_pr(
     );
     if merged {
         crate::status_summary::auto_close_merged_tasks(ctx.home, ctx.branch);
-        crate::daemon::auto_release::auto_release_for_merged_branch(ctx.home, ctx.branch);
+        crate::daemon::auto_release::auto_release_for_merged_branch(ctx.home, ctx.repo, ctx.branch);
     }
     Ok(true)
 }
