@@ -2967,8 +2967,15 @@ instances:
         // a wedged-throttle agent that has produced nothing; the gate
         // (`productive_silent >= RECOVERY_SILENCE`) would otherwise treat every mock
         // as freshly-recovered. The recovery test overrides this back to fresh.
+        //
+        // Offset = RECOVERY_SILENCE + 30s (just past the gate, NOT 3600s): on
+        // windows `Instant` is monotonic from system BOOT and the CI VM's uptime is
+        // < 1h, so `checked_sub(3600s)` UNDERFLOWED → fell back to `now` (fresh) →
+        // the stuck-agent tests saw "recovered" and failed (macos/ubuntu have larger
+        // Instants and passed). The runner is always up far longer than ~75s by the
+        // Tests step (boot + checkout + build), so this never underflows.
         core.lock().state.last_productive_output = std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_secs(3600))
+            .checked_sub(RECOVERY_SILENCE + std::time::Duration::from_secs(30))
             .unwrap_or_else(std::time::Instant::now);
         let handle = crate::agent::AgentHandle {
             id: crate::types::InstanceId::default(),
