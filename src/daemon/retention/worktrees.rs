@@ -131,19 +131,39 @@ pub(crate) fn maybe_remove_candidate(
     match status_output {
         Ok(o) if o.status.success() => {
             let status_text = String::from_utf8_lossy(&o.stdout);
-            // #1053 keeps `--ignored` to protect operator data in gitignored files
-            // (T13a). But the daemon's OWN `.agend-managed` marker is gitignored
-            // too (.gitignore:29), so `--ignored` lists `!! .agend-managed` in
-            // EVERY managed worktree — counting that as WIP skipped every worktree,
-            // no-oping ALL GC (reviewer-2 efficacy defect: force-reclaim +
-            // clean-release reclaimed nothing). Exclude ONLY the marker line; any
-            // other entry (real tracked/untracked WIP, or operator gitignored data)
-            // still skips. Porcelain v1 line = `XY <path>` → path starts at col 3.
-            let has_protectable_content = status_text.lines().any(|line| {
-                let p = line.get(3..).map(str::trim).unwrap_or("");
-                !p.is_empty() && p != crate::worktree_pool::MANAGED_MARKER
+            // Dirty pre-check, parameterized by mode (reviewer-2 efficacy). Porcelain
+            // v1 line = `XY <path>`: code at cols 0..2, path from col 3. `!!` = ignored.
+            //
+            // FORCE-RECLAIM (only fires on dead+age, ALWAYS archive-to-trash =
+            // recoverable): no gitignored file should block — `target/`, the
+            // `.agend-managed` marker, operator scratch all land in `.trash`
+            // recoverably (the archive IS the safety net). Block ONLY on real
+            // tracked/untracked WIP. Without this, every BUILT worktree (`!! target/`)
+            // no-ops — the same defect the marker caused.
+            //
+            // CLEAN-RELEASE (can hard-delete via gc_run = irrecoverable): keep #1053's
+            // `--ignored` strictness to protect operator gitignored DATA (T13a) — but
+            // never let the daemon's OWN marker block. (CleanRelease over-protecting
+            // `target/` is a separate pre-existing leak root, tracked as follow-up.)
+            let has_blocking_content = status_text.lines().any(|line| {
+                let code = line.get(..2).unwrap_or("");
+                let path = line.get(3..).map(str::trim).unwrap_or("");
+                if path.is_empty() {
+                    return false;
+                }
+                // The daemon's OWN marker NEVER blocks, under ANY status code — it is
+                // `!! .agend-managed` where the repo gitignores it (.gitignore:29) and
+                // `?? .agend-managed` where it does not. Either way, not operator data.
+                if path == crate::worktree_pool::MANAGED_MARKER {
+                    return false;
+                }
+                if code == "!!" {
+                    // Other ignored file (e.g. `target/`, operator scratch).
+                    return !force_reclaim; // force-reclaim: archive-recoverable → never blocks
+                }
+                true // tracked/untracked = real WIP → always blocks
             });
-            if has_protectable_content {
+            if has_blocking_content {
                 tracing::warn!(
                     path = %path.display(),
                     status = %status_text.trim(),
@@ -407,6 +427,15 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// Serializes the tests that mutate the process-global
+    /// `AGEND_WORKTREE_GC_TRASH_DAYS` env var, so they cannot race each other (or be
+    /// observed mid-mutation) under the parallel test runner.
+    static GC_TRASH_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn gc_trash_env_guard() -> std::sync::MutexGuard<'static, ()> {
+        GC_TRASH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Build a CleanRelease GcCandidate for the existing maybe_remove_candidate tests.
     fn clean_cand(path: &Path, agent: &str) -> crate::worktree_pool::GcCandidate {
         crate::worktree_pool::GcCandidate {
@@ -594,6 +623,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn trash_purge_removes_old_preserves_recent() {
+        let _env = gc_trash_env_guard();
         let dir = tmp_home("t2-purge");
         let trash = trash_root(&dir);
         std::fs::create_dir_all(&trash).unwrap();
@@ -623,6 +653,7 @@ mod tests {
     /// in the same sweep tick (replaces a separate disable flag).
     #[test]
     fn trash_days_zero_purges_same_tick() {
+        let _env = gc_trash_env_guard();
         let dir = tmp_home("t3-zero");
         let trash = trash_root(&dir);
         std::fs::create_dir_all(&trash).unwrap();
@@ -698,6 +729,7 @@ mod tests {
     /// preserves the new entry under the default retention window.
     #[test]
     fn purge_preserves_fresh_archive_in_same_tick() {
+        let _env = gc_trash_env_guard();
         let dir = tmp_home("t6-concurrent");
         let trash = trash_root(&dir);
         std::fs::create_dir_all(&trash).unwrap();
@@ -899,7 +931,7 @@ mod tests {
     /// the exact production / reviewer-2 repro condition.
     fn setup_git_repo_marker_ignored(dir: &Path) -> PathBuf {
         let repo = setup_git_repo(dir);
-        std::fs::write(repo.join(".gitignore"), ".agend-managed\n").unwrap();
+        std::fs::write(repo.join(".gitignore"), ".agend-managed\ntarget/\n").unwrap();
         for args in [
             vec!["add", ".gitignore"],
             vec!["commit", "-m", "gitignore marker"],
@@ -971,6 +1003,56 @@ mod tests {
             "released marker-bearing worktree must archive (clean-release efficacy): {outcome:?}"
         );
         assert!(!lease.path.exists(), "archived");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// reviewer-2 residual: a BUILT worktree carries in-tree `target/`
+    /// (`!! target/`). force-reclaim is always archive-to-trash (recoverable), so
+    /// gitignored build output must NOT block it — else every built worktree
+    /// (i.e. all of them) no-ops, the same defect the marker caused.
+    #[test]
+    fn force_reclaim_built_worktree_with_target_is_archived() {
+        let dir = tmp_home("fr-built");
+        let repo = setup_git_repo_marker_ignored(&dir);
+        let lease = crate::worktree_pool::lease(&dir, &repo, "dev-built", "feat/x").expect("lease");
+        std::fs::create_dir_all(lease.path.join("target")).unwrap();
+        std::fs::write(lease.path.join("target").join("artifact.o"), "build").unwrap();
+        let cand = crate::worktree_pool::GcCandidate {
+            path: lease.path.clone(),
+            agent: "dev-built".to_string(),
+            reason: "fr".to_string(),
+            kind: crate::worktree_pool::GcKind::ForceReclaim,
+        };
+        let outcome = maybe_remove_candidate(&dir, &cand);
+        assert!(
+            matches!(outcome, RemovalOutcome::Removed),
+            "built worktree (!! target/) force-reclaim must archive (recoverable): {outcome:?}"
+        );
+        assert!(!lease.path.exists(), "archived");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// force-reclaim still respects REAL WIP: an untracked (non-ignored) file means
+    /// uncommitted operator/agent work → skip (don't archive it away).
+    #[test]
+    fn force_reclaim_with_real_wip_is_skipped() {
+        let dir = tmp_home("fr-wip");
+        let repo = setup_git_repo_marker_ignored(&dir);
+        let lease = crate::worktree_pool::lease(&dir, &repo, "dev-wip", "feat/x").expect("lease");
+        // A non-gitignored untracked file = real WIP (`?? notes.txt`).
+        std::fs::write(lease.path.join("notes.txt"), "uncommitted work").unwrap();
+        let cand = crate::worktree_pool::GcCandidate {
+            path: lease.path.clone(),
+            agent: "dev-wip".to_string(),
+            reason: "fr".to_string(),
+            kind: crate::worktree_pool::GcKind::ForceReclaim,
+        };
+        let outcome = maybe_remove_candidate(&dir, &cand);
+        assert!(
+            matches!(outcome, RemovalOutcome::Skipped { .. }),
+            "force-reclaim must NOT archive a worktree with real (tracked/untracked) WIP: {outcome:?}"
+        );
+        assert!(lease.path.exists(), "preserved");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
