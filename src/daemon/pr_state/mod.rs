@@ -2221,7 +2221,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn verdict_verified_not_merge_ready_notifies_bound_author() {
         let home = verdict_home("verified-notready");
         seed_task_with_branch(&home, "t-v", "feat/x");
@@ -2244,7 +2243,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn verdict_verified_merge_ready_does_not_double_notify() {
         let home = verdict_home("verified-ready");
         seed_task_with_branch(&home, "t-v", "feat/x");
@@ -2266,7 +2264,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn verdict_rejected_notifies_author_with_fix_hint() {
         let home = verdict_home("rejected");
         seed_task_with_branch(&home, "t-r", "feat/x");
@@ -2291,7 +2288,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn verdict_unverified_notifies_author() {
         let home = verdict_home("unverified");
         seed_task_with_branch(&home, "t-u", "feat/x");
@@ -2313,7 +2309,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn verdict_recipient_is_bound_agent_not_fixup_lead_or_gh_login() {
         let home = verdict_home("recipient");
         seed_task_with_branch(&home, "t-rec", "feat/x");
@@ -2342,7 +2337,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn pr_ready_for_merge_routes_to_bound_agent_gap_c() {
         let home = verdict_home("prready-recipient");
         seed_task_with_branch(&home, "t-p", "feat/x");
