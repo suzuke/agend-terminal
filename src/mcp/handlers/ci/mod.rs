@@ -245,23 +245,16 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                 if let Some(r) = crate::mcp::handlers::dispatch_hook::derive_repo_from_remote_pub(
                     &source_canonical,
                 ) {
-                    // #1040 Option F: this checkout-arm path bypasses
-                    // `dispatch_auto_bind_lease_with_source_and_chain`
-                    // (which carries the #1037 auto-derive). Apply the
-                    // same convention scan here so the dev-self-claim
-                    // flow (`repo action=checkout bind=true` at
-                    // task-claim time — the canonical fixup-team
-                    // entry per protocol) propagates the chain target
-                    // into the sidecar. Pre-#1040 every modern fixup
-                    // PR silently armed `next_after_ci=null` and the
-                    // post-#1037 auto-wake quartet never fired.
-                    let mut watch_args = json!({"repository": &r, "branch": branch});
-                    if let Some(next) = crate::mcp::handlers::dispatch_hook::derive_team_reviewer(
-                        home,
-                        instance_name,
-                    ) {
-                        watch_args["next_after_ci"] = json!(next);
-                    }
+                    // t-ci-ready-pr2-drop-derive-reviewer (operator-approved B): the
+                    // #1040/#1037 `<team>-reviewer` auto-derive was REMOVED from the
+                    // dev-self-claim path too (consistent decouple with the dispatch
+                    // side). A self-claimed `repo action=checkout bind=true` now arms
+                    // the watch with NO chain target → on CI pass the dev (a
+                    // subscriber) gets the informational `[ci-pass]`; chaining the
+                    // actionable `[ci-ready-for-action]` to a reviewer requires an
+                    // EXPLICIT `next_after_ci` (review handoff is now explicit, not a
+                    // silent naming-convention auto-handoff).
+                    let watch_args = json!({"repository": &r, "branch": branch});
                     let watch_resp = handle_watch_ci(home, &watch_args, instance_name);
                     if let Some(err_msg) = watch_resp.get("error").and_then(|v| v.as_str()) {
                         let code = watch_resp

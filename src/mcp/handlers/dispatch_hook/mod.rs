@@ -238,24 +238,12 @@ pub(crate) fn dispatch_auto_bind_lease(
 /// Callers: `comms.rs::handle_delegate_task` (kind=task dispatches that
 /// declare a workflow chain via `args["next_after_ci"]`).
 ///
-/// #1037 Option A auto-derive helper: when the dispatcher omits
-/// `next_after_ci`, look up the target's team membership and return the
-/// first member whose instance name ends in `-reviewer` (the de facto
-/// convention used by `fixup-reviewer`, `demo-reviewer`, etc.). Returns
-/// `None` when the target is teamless or no team member matches —
-/// preserves pre-#1037 behavior for teams that don't follow the
-/// convention.
-///
-/// Self-match is excluded so a dispatcher targeting `<team>-reviewer`
-/// itself doesn't chain to itself.
-pub(crate) fn derive_team_reviewer(home: &Path, target: &str) -> Option<String> {
-    crate::teams::find_team_for(home, target).and_then(|team| {
-        team.members
-            .into_iter()
-            .find(|m| m.ends_with("-reviewer") && m != target)
-    })
-}
-
+/// t-ci-ready-pr2-drop-derive-reviewer (operator-approved B): the #1037
+/// `<team>-reviewer` name-derived `next_after_ci` auto-default
+/// (`derive_team_reviewer`) was DELETED. Both call sites (this auto-watch path
+/// and the `ci/mod.rs` self-claim path) leave `next_after_ci` explicit-only now,
+/// so the helper became dead code. Role-based auto-handoff is a future follow-up
+/// (needs role infra), not a naming convention.
 pub(crate) fn dispatch_auto_bind_lease_with_chain(
     home: &Path,
     target: &str,
@@ -519,17 +507,16 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
         // `ci action=watch next_after_ci=…` manually — easily forgotten
         // and one of the root causes of the 4-in-a-row PR stalls.
         //
-        // #1037 Option A: when the dispatcher omits next_after_ci (the
-        // empirical case for lead's typical send calls — see #1037
-        // issue body for the dogfood evidence on PR #1035), fall back
-        // to auto-deriving from the target's team via the
-        // `<team>-reviewer` naming convention. Closes the loop where
-        // wake-aware routing (#1030) already worked but never fired
-        // because the chain target field was always None.
-        let effective_next = next_after_ci
-            .filter(|s| !s.is_empty())
-            .map(String::from)
-            .or_else(|| derive_team_reviewer(home, target));
+        // t-ci-ready-pr2-drop-derive-reviewer (operator-approved B): the #1037
+        // `<team>-reviewer` name-derived auto-default was REMOVED — it baked the
+        // `-reviewer` naming convention into the daemon and only worked for teams
+        // that follow it. `next_after_ci` is now explicit-only: unset → the watch
+        // arms with no chain target, and on CI pass the dev/subscribers receive
+        // the informational `[ci-pass]` (PR-1 #1796); routing the actionable
+        // `[ci-ready-for-action]` to a reviewer requires an EXPLICIT
+        // `next_after_ci` (lead dispatches the reviewer, or passes it). Role-based
+        // auto-handoff is a future follow-up (needs role infra).
+        let effective_next = next_after_ci.filter(|s| !s.is_empty()).map(String::from);
         let mut watch_args = serde_json::json!({"repository": &r, "branch": branch});
         if let Some(ref next) = effective_next {
             watch_args["next_after_ci"] = serde_json::json!(next);

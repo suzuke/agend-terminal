@@ -1531,22 +1531,16 @@ fn dispatch_persists_task_id_into_ci_watch_sidecar_1031() {
 
 #[test]
 #[cfg(unix)]
-fn dispatch_auto_derives_next_after_ci_from_team_reviewer_convention_1037() {
-    // #1037 RED→GREEN: when the dispatcher does NOT explicitly pass
-    // `next_after_ci`, the daemon auto-derives the chain target from
-    // the target's team using the `<team>-reviewer` naming convention.
-    //
-    // Empirical motivation (lead 2026-05-21): the post-#1030 wake-aware
-    // fix never triggered on real fixup-team PRs because lead's
-    // send(kind=task) MCP calls never set `next_after_ci=fixup-reviewer`
-    // in the args. The wire path propagates the field correctly (per
-    // `dispatch_auto_bind_lease_sets_next_after_ci_from_dispatch_hook_931`)
-    // — the gap is the caller didn't know to set it. Auto-derive
-    // closes the loop without requiring a per-call burden.
-    //
-    // REGRESSION-PROOF: revert the auto-derive lookup → this test
-    // FAILS because `watch["next_after_ci"]` reads as `null` instead
-    // of `"val-reviewer"` (the team's reviewer-suffixed member).
+fn dispatch_no_longer_auto_derives_next_after_ci_pr2() {
+    // t-ci-ready-pr2-drop-derive-reviewer (operator-approved B): the #1037
+    // `<team>-reviewer` name-derived auto-default was REMOVED. When the dispatcher
+    // does NOT pass `next_after_ci`, the daemon NO LONGER scans the team for a
+    // `-reviewer` member — `next_after_ci` stays unset. On CI pass the dev (a
+    // subscriber) gets the informational `[ci-pass]`; chaining the actionable
+    // `[ci-ready-for-action]` to a reviewer now requires an EXPLICIT
+    // `next_after_ci` (review handoff is explicit, not a naming-convention
+    // auto-handoff). The override path is pinned by the sibling
+    // `dispatch_explicit_next_after_ci_overrides_auto_derive_1037` test.
     let parent = std::env::temp_dir().join(format!(
         "agend-1037-auto-{}-{}",
         std::process::id(),
@@ -1590,12 +1584,20 @@ fn dispatch_auto_derives_next_after_ci_from_team_reviewer_convention_1037() {
     let watch: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&watch_path).expect("read watch"))
             .expect("parse watch");
-    assert_eq!(
-        watch["next_after_ci"].as_str(),
-        Some("val-reviewer"),
-        "#1037 GREEN: dispatch must auto-derive next_after_ci from \
-         `<team>-reviewer` convention when caller omits the arg. \
-         Got: {watch}"
+    assert!(
+        watch["next_after_ci"].as_str().is_none(),
+        "PR-2: dispatch must NOT auto-derive next_after_ci from the `<team>-reviewer` \
+         convention (explicit-only now). Got: {watch}"
+    );
+    // The dev stays a subscriber → it receives the informational [ci-pass] on CI
+    // pass (the non-chain default; no actionable [ci-ready] is forged).
+    let subscriber_names: Vec<&str> = watch["subscribers"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|s| s["instance"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        subscriber_names.contains(&"val-dev"),
+        "dev must remain a subscriber (for [ci-pass]). Got: {watch}"
     );
 
     std::fs::remove_dir_all(&parent).ok();

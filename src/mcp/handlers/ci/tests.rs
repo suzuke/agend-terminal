@@ -683,24 +683,15 @@ fn p778_setup_source_repo(parent: &Path, branch: &str) -> std::path::PathBuf {
 
 #[test]
 #[cfg(unix)]
-fn checkout_bind_true_auto_derives_next_after_ci_from_team_1040() {
-    // #1040 RED→GREEN: when `repo action=checkout bind=true` arms a
-    // ci-watch sidecar, the team's `<team>-reviewer` member should be
-    // auto-derived into `next_after_ci` — same convention as the
-    // #1037 dispatch-side auto-derive, applied at the checkout path.
-    //
-    // Empirical motivation (per /tmp/dialectic-1040-primary-dev.md):
-    // `handle_checkout_repo:158-162` calls `handle_watch_ci` directly
-    // with only `{repo, branch}` args, bypassing
-    // `dispatch_auto_bind_lease_with_source_and_chain` entirely. The
-    // #1037 auto-derive helper lives inside the bypassed wrapper, so
-    // every modern fixup-team PR (#1027 through #1031, all of which
-    // used `repo action=checkout bind=true` at task-claim time) armed
-    // sidecars with `next_after_ci=None`.
-    //
-    // REGRESSION-PROOF: revert the `derive_team_reviewer` call at
-    // handle_checkout_repo line 158 → this assertion FAILS because
-    // `watch["next_after_ci"]` reads as null instead of `"val-reviewer"`.
+fn checkout_bind_true_no_longer_auto_derives_next_after_ci_pr2() {
+    // t-ci-ready-pr2-drop-derive-reviewer (operator-approved B): the #1040/#1037
+    // `<team>-reviewer` auto-derive was REMOVED from the dev-self-claim checkout
+    // path too (consistent decouple with the dispatch side). A self-claimed
+    // `repo action=checkout bind=true` now arms the watch with `next_after_ci`
+    // UNSET → on CI pass the dev (a subscriber) gets the informational `[ci-pass]`;
+    // the actionable `[ci-ready-for-action]` review handoff is now EXPLICIT
+    // (lead dispatches the reviewer, or an explicit `next_after_ci`), not a silent
+    // naming-convention auto-handoff.
     let home = p778_tmp_home("1040-derive");
     let parent = p778_tmp_home("1040-derive-src");
     let source = p778_setup_source_repo(&parent, "feat/1040-derive");
@@ -733,11 +724,19 @@ fn checkout_bind_true_auto_derives_next_after_ci_from_team_1040() {
     let watch: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&watch_path).expect("read watch"))
             .expect("parse watch");
-    assert_eq!(
-        watch["next_after_ci"].as_str(),
-        Some("val-reviewer"),
-        "#1040 GREEN: checkout-bound watch must auto-derive next_after_ci \
-         from team `<team>-reviewer` convention. Got: {watch}"
+    assert!(
+        watch["next_after_ci"].as_str().is_none(),
+        "PR-2: checkout-bound watch must NOT auto-derive next_after_ci from the \
+         `<team>-reviewer` convention (explicit-only now). Got: {watch}"
+    );
+    // The dev (armer) stays a subscriber → it receives [ci-pass] on CI pass.
+    let subscriber_names: Vec<&str> = watch["subscribers"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|s| s["instance"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        subscriber_names.contains(&"val-dev"),
+        "dev (armer) must remain a subscriber (for [ci-pass]). Got: {watch}"
     );
 
     std::fs::remove_dir_all(&home).ok();
