@@ -2675,6 +2675,61 @@ fn srl_plain_error_line_fires_via_content_anchor() {
     );
 }
 
+/// #badge-recovery (operator-reported flicker): a ServerRateLimit error still
+/// matching in the tail, but with PRODUCTIVE output within the recovery window →
+/// the agent recovered → the badge must NOT re-latch ServerRateLimit. The
+/// `last_productive_output` signal is position-independent (it works even when the
+/// re-injected error is the bottom-most line, defeating `working_state_below`).
+#[test]
+fn server_rate_limit_recent_productive_does_not_relatch_badge() {
+    let (mut vt, mut st) = claude_tracker();
+    // Recovered: produced productive output just now (overrides the None default).
+    st.last_productive_output = Some(std::time::Instant::now());
+    drive_plain_line(&mut vt, &mut st, SRL_LINE);
+    assert_ne!(
+        st.get_state(),
+        AgentState::ServerRateLimit,
+        "#badge-recovery: a recently-productive agent must NOT re-latch ServerRateLimit"
+    );
+}
+
+/// #badge-recovery 2-sided: a fresh / just-spawned agent that has NEVER produced
+/// (`last_productive_output == None`) is NOT recovery — it must latch
+/// ServerRateLimit normally (so the retry + nudge engage). `None` must never be
+/// misread as recovery — exactly the creation-stamp ambiguity the Option fix
+/// resolves (and the #1795 fresh-agent edge it closes).
+#[test]
+fn server_rate_limit_fresh_agent_no_productive_history_latches_badge() {
+    let (mut vt, mut st) = claude_tracker();
+    assert!(
+        st.last_productive_output.is_none(),
+        "a fresh tracker must start with no productive history (None)"
+    );
+    drive_plain_line(&mut vt, &mut st, SRL_LINE);
+    assert_eq!(
+        st.get_state(),
+        AgentState::ServerRateLimit,
+        "#badge-recovery: a never-produced (fresh) agent must latch ServerRateLimit — None is not recovery"
+    );
+}
+
+/// #badge-recovery boundary: an agent that DID produce, but whose last productive
+/// output is PAST the recovery window, is a genuinely-throttled agent → must still
+/// latch ServerRateLimit. Confirms the suppression is BOUNDED (it only suppresses
+/// recently-productive flicker, never hides a real stuck throttle indefinitely).
+#[test]
+fn server_rate_limit_stale_productive_past_window_still_latches_badge() {
+    let (mut vt, mut st) = claude_tracker();
+    // Produced, but 90s ago — past the 45s recovery window → NOT recovered.
+    st.last_productive_output = Some(Instant::now() - Duration::from_secs(90));
+    drive_plain_line(&mut vt, &mut st, SRL_LINE);
+    assert_eq!(
+        st.get_state(),
+        AgentState::ServerRateLimit,
+        "#badge-recovery: productive output past the recovery window must still latch (bounded suppression)"
+    );
+}
+
 /// RateLimit: a claude 429-rejection error rendered PLAIN fires via content.
 #[test]
 fn rate_limit_plain_error_line_fires_via_content_anchor() {
@@ -2893,7 +2948,7 @@ fn screen_with_marker_at_row(marker: &str, marker_row: usize, total_rows: usize)
 #[test]
 fn t1_685_pr2_active_marker_in_recent_tail_refreshes_productive_output() {
     let mut tracker = StateTracker::new(Some(&Backend::Codex));
-    tracker.last_productive_output = Instant::now() - Duration::from_secs(10);
+    tracker.last_productive_output = Some(Instant::now() - Duration::from_secs(10));
     let before = tracker.last_productive_output;
 
     // Place marker in the recent tail (last 5 rows). Codex
@@ -2919,7 +2974,7 @@ fn t1_685_pr2_active_marker_in_recent_tail_refreshes_productive_output() {
 #[test]
 fn t2_685_pr2_stale_marker_outside_recent_tail_does_not_refresh() {
     let mut tracker = StateTracker::new(Some(&Backend::Codex));
-    tracker.last_productive_output = Instant::now() - Duration::from_secs(60);
+    tracker.last_productive_output = Some(Instant::now() - Duration::from_secs(60));
     let before = tracker.last_productive_output;
 
     // Marker at row 5 of a 40-row viewport — far outside the
@@ -2942,7 +2997,7 @@ fn t2_685_pr2_stale_marker_outside_recent_tail_does_not_refresh() {
 #[test]
 fn t3_685_pr2_grey_failure_trickle_does_not_refresh_after_marker_scrolled_out() {
     let mut tracker = StateTracker::new(Some(&Backend::Codex));
-    tracker.last_productive_output = Instant::now() - Duration::from_secs(60);
+    tracker.last_productive_output = Some(Instant::now() - Duration::from_secs(60));
 
     // Feed 1: marker in recent tail (fresh) — DOES refresh.
     let screen1 = screen_with_marker_at_row("apply_patch succeeded for /tmp/foo.txt", 38, 40);
@@ -2971,7 +3026,7 @@ fn t3_685_pr2_grey_failure_trickle_does_not_refresh_after_marker_scrolled_out() 
 #[test]
 fn t5_685_pr2_rc1_changing_adjacent_line_does_not_refresh() {
     let mut tracker = StateTracker::new(Some(&Backend::Codex));
-    tracker.last_productive_output = Instant::now() - Duration::from_secs(60);
+    tracker.last_productive_output = Some(Instant::now() - Duration::from_secs(60));
 
     // Feed 1: stale marker in tail (row 36 of 40), spinner-A at
     // row 38. Note marker is in last-5-rows window so it WILL
@@ -3014,7 +3069,7 @@ fn t5_685_pr2_rc1_changing_adjacent_line_does_not_refresh() {
 #[test]
 fn t4_685_pr2_identical_recent_tail_does_not_double_refresh() {
     let mut tracker = StateTracker::new(Some(&Backend::Codex));
-    tracker.last_productive_output = Instant::now() - Duration::from_secs(60);
+    tracker.last_productive_output = Some(Instant::now() - Duration::from_secs(60));
 
     // Feed 1: marker in tail, plus arbitrary content above.
     let mut screen1: Vec<String> = (0..35).map(|i| format!("scrollback row {i}")).collect();

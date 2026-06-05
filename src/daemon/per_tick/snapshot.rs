@@ -44,7 +44,7 @@ impl PerTickHandler for SnapshotRotationHandler {
                         c.health.state.display_name().to_string(),
                         // #1694②: productive-silence for the dispatch-idle
                         // silence-clock (marker/heartbeat-gated, spinner-resistant).
-                        c.state.last_productive_output.elapsed().as_secs() as i64,
+                        c.state.productive_silence().as_secs() as i64,
                     )
                 };
                 let cfg = cfgs.get(handle.name.as_str());

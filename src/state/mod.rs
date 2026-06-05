@@ -173,13 +173,23 @@ pub struct StateTracker {
     pub current: AgentState,
     pub(crate) since: Instant,
     pub last_output: Instant,
-    /// F9 (#685 sub-task 4): bumped only when `infer_productivity()` returns
-    /// a `Productive` signal (heartbeat refresh or structural marker match).
-    /// Bare screen change does NOT bump this — unlike `last_output`. Read by
+    /// F9 (#685 sub-task 4): `Some(t)` only when `infer_productivity()` returned
+    /// a `Productive` signal (heartbeat refresh or structural marker match) at
+    /// `t`. Bare screen change does NOT set this — unlike `last_output`. Read by
     /// the daemon supervisor and passed to `check_hang` as `silent_productive`
     /// for the dual-path Hung detection. See `docs/F9-PRODUCTIVE-OUTPUT-GATE.md`
     /// §F9.1 architecture and §F9.3 dual-path decision table.
-    pub last_productive_output: Instant,
+    ///
+    /// `None` until the FIRST productive signal — distinguishing "never produced"
+    /// (a fresh tracker / just-spawned agent) from "recently produced". The
+    /// recovery gates (`recovered_within`: #1795 retry, #badge re-latch) treat
+    /// `None` as NOT recovered, so a creation stamp can no longer be misread as
+    /// recovery. Silence readers (`productive_silence`) fall back to `created_at`,
+    /// preserving the pre-Option behavior.
+    pub last_productive_output: Option<Instant>,
+    /// Silence baseline for an agent that has not yet produced
+    /// (`last_productive_output == None`): the tracker's creation instant.
+    pub(crate) created_at: Instant,
     /// #685 PR-2: hash of the matched-marker substring on the most-recent
     /// productive refresh. Used to suppress re-firing
     /// `last_productive_output = now()` when the same marker text remains
@@ -273,6 +283,24 @@ pub(crate) struct TransitionRecord {
 }
 
 const MARKER_SCAN_TAIL_LINES: usize = 5;
+
+/// ServerRateLimit recovery window — the single source of truth shared by the
+/// detection-side `#badge-recovery` re-latch gate (here) and the supervisor's
+/// `#1795` retry-inject gate (`supervisor` imports this as `RECOVERY_SILENCE`).
+///
+/// If the agent produced PRODUCTIVE output (a `last_productive_output` bump —
+/// marker/heartbeat-gated, NOT the error re-render) within this window, it has
+/// recovered: the badge must not re-latch ServerRateLimit and the retry must not
+/// inject `continue`. This is the robust, position-INDEPENDENT recovery signal
+/// (same insight as the #1775/#1792 silence clock): the stale "Server is
+/// temporarily limiting" line re-latches ServerRateLimit in the tail and
+/// `working_state_below` (#1769) can't see a marker BELOW the most-recent error
+/// line, so the agent flickers Thinking↔ServerRateLimit and the Idle-only #1713
+/// clear never fires — but `last_productive_output` stays fresh throughout,
+/// breaking the loop. 45s comfortably exceeds the 10s tick and the generation
+/// gaps between an agent's outputs while still firing fast for a truly wedged
+/// throttle (which produces nothing). Tunable 30–60s.
+pub(crate) const SERVER_RATE_LIMIT_RECOVERY_SILENCE: Duration = Duration::from_secs(45);
 
 /// #1518: bottom-N bound for HIGH_FP error re-judging. Detection is
 /// level-triggered (re-judged every feed), so an error string lingering
@@ -665,7 +693,8 @@ impl StateTracker {
             current: initial_state,
             since: Instant::now(),
             last_output: Instant::now(),
-            last_productive_output: Instant::now(),
+            last_productive_output: None,
+            created_at: Instant::now(),
             last_productive_marker_hash: None,
             last_anchor_suppress_hash: None,
             last_screen_hash: None,
@@ -917,9 +946,27 @@ impl StateTracker {
                         // unchanged (that decision is ① Step-2, pending the
                         // operator); this is the #1768 working-marker override only.
                         let landed = if high_fp || matches!(detected, AgentState::UsageLimit) {
+                            // #badge-recovery (state-level mirror of #1795): a
+                            // ServerRateLimit whose agent produced PRODUCTIVE output
+                            // within the recovery window has recovered even though
+                            // the stale error still matches and working_state_below
+                            // can't see a marker below the bottom-most (re-injected)
+                            // error line. Land Idle instead of re-latching the badge.
+                            // `recovered_within` is None-safe: a fresh / just-spawned
+                            // agent (never produced) is NOT recovery → falls through
+                            // to `detected` → latches + nudges normally. Scoped to
+                            // ServerRateLimit (the #1795 storm's state); other HIGH_FP
+                            // / UsageLimit keep re-latching as before.
+                            let fallback = if matches!(detected, AgentState::ServerRateLimit)
+                                && self.recovered_within(SERVER_RATE_LIMIT_RECOVERY_SILENCE)
+                            {
+                                AgentState::Idle
+                            } else {
+                                detected
+                            };
                             patterns
                                 .working_state_below(screen_text, matched)
-                                .unwrap_or(detected)
+                                .unwrap_or(fallback)
                         } else {
                             detected
                         };
@@ -1020,7 +1067,7 @@ impl StateTracker {
                     // edits) changes around it.
                     let marker_hash = hash_screen(matched);
                     if self.last_productive_marker_hash != Some(marker_hash) {
-                        self.last_productive_output = Instant::now();
+                        self.last_productive_output = Some(Instant::now());
                         self.last_productive_marker_hash = Some(marker_hash);
                     }
                 }
@@ -1033,7 +1080,7 @@ impl StateTracker {
                     // Heartbeat source is timestamp-driven — each fresh
                     // heartbeat IS new evidence. Always refresh; reset
                     // marker-hash so a subsequent Marker re-fires.
-                    self.last_productive_output = Instant::now();
+                    self.last_productive_output = Some(Instant::now());
                     self.last_productive_marker_hash = None;
                 }
                 _ => {
@@ -1193,6 +1240,28 @@ impl StateTracker {
     /// Get current state.
     pub fn get_state(&self) -> AgentState {
         self.current
+    }
+
+    /// Time since the agent last produced PRODUCTIVE output, for the silence-based
+    /// readers (`check_hang` `silent_productive`, the recovery dispatcher, the
+    /// snapshot `silent_secs`). When the agent has not produced yet
+    /// (`last_productive_output == None`), the baseline is `created_at` — i.e. it
+    /// has been productive-silent since it started. This preserves the pre-Option
+    /// behavior exactly (the field used to be stamped `now()` at creation).
+    pub fn productive_silence(&self) -> Duration {
+        self.last_productive_output
+            .unwrap_or(self.created_at)
+            .elapsed()
+    }
+
+    /// Has the agent produced PRODUCTIVE output within `window`? Used by the
+    /// recovery gates (#1795 retry inject, #badge re-latch). `None` (never
+    /// produced) is NOT recovery — a creation stamp must never be misread as
+    /// recovery, and a just-spawned agent that immediately errors must latch +
+    /// nudge normally. Only a real, recent productive signal counts.
+    pub fn recovered_within(&self, window: Duration) -> bool {
+        self.last_productive_output
+            .is_some_and(|t| t.elapsed() < window)
     }
 
     /// Periodic tick — expire stale latched states without requiring new PTY

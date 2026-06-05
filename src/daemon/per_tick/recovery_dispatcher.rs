@@ -307,7 +307,7 @@ impl PerTickHandler for RecoveryDispatcherHandler {
                     recovery_restart_count: core.health.recovery_restart_count,
                     agent_state: core.state.current,
                     silent: core.state.last_output.elapsed(),
-                    silent_productive: core.state.last_productive_output.elapsed(),
+                    silent_productive: core.state.productive_silence(),
                 }
             };
 

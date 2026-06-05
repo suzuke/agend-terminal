@@ -72,19 +72,11 @@ const RETRY_PHASE_C_START: u32 = 6;
 /// across the retry and ApiError-nudge paths (guards a ServerRateLimit↔ApiError
 /// state flicker from double-injecting).
 const CONTINUE_INJECT_MIN_INTERVAL: Duration = Duration::from_secs(5);
-/// ServerRateLimit recovery window: if the agent has produced PRODUCTIVE output
-/// (a `last_productive_output` bump — marker/heartbeat-gated, NOT the error
-/// re-render) within this window, it has recovered and the retry must NOT inject
-/// `continue` into it (and the track clears). This is the robust, position-
-/// INDEPENDENT recovery signal (same insight as the #1775/#1792 silence clock):
-/// the stale "Server is temporarily limiting" line re-latches ServerRateLimit in
-/// the tail and `working_state_below` (#1769) can't see a marker BELOW the
-/// most-recent error line, so the agent flickers Thinking↔ServerRateLimit and the
-/// Idle-only #1713 clear never fires — but `last_productive_output` stays fresh
-/// throughout, breaking the loop. 45s comfortably exceeds the 10s tick and the
-/// generation gaps between an agent's outputs while still firing fast for a truly
-/// wedged throttle (which produces nothing). Tunable 30–60s.
-const RECOVERY_SILENCE: Duration = Duration::from_secs(45);
+/// ServerRateLimit recovery window — single source of truth in `state` (the
+/// foundational layer). This retry-inject gate and the detection-side badge
+/// re-latch gate share the SAME window, so they're one constant. See
+/// `crate::state::SERVER_RATE_LIMIT_RECOVERY_SILENCE` for the full rationale.
+use crate::state::SERVER_RATE_LIMIT_RECOVERY_SILENCE as RECOVERY_SILENCE;
 /// #1742: consecutive ServerRateLimit `continue`-inject FAILURES (agent still
 /// present, but the PTY write erred) tolerated before giving up. A single failure
 /// is treated as a transient PTY blip that self-heals, so the track is KEPT and
@@ -1482,15 +1474,19 @@ pub(crate) fn process_error_recovery(
         for handle in reg.values() {
             let name = handle.name.as_str();
             active_names.insert(name.to_string());
-            // Capture current state + productive-silence under one lock. The latter
+            // Capture current state + recovery signal under one lock. `recovered`
             // is the #ratelimit-recovery gate below: a recovered-but-still-latched
-            // ServerRateLimit agent that's producing output has fresh
-            // `last_productive_output`.
-            let (state, productive_silent) = {
+            // ServerRateLimit agent that produced output within RECOVERY_SILENCE.
+            // `recovered_within` is None-safe — a just-spawned agent that has NEVER
+            // produced (`last_productive_output == None`) is NOT recovery, so it
+            // latches + injects normally (the fresh-agent edge the creation stamp
+            // used to mis-suppress). `productive_silence` is for the log only.
+            let (state, recovered, productive_silence) = {
                 let core = handle.core.lock();
                 (
                     core.state.current,
-                    core.state.last_productive_output.elapsed(),
+                    core.state.recovered_within(RECOVERY_SILENCE),
+                    core.state.productive_silence(),
                 )
             };
 
@@ -1502,7 +1498,7 @@ pub(crate) fn process_error_recovery(
             // only EXECUTES the lock-free PTY inject for the names decided here. So a
             // track can never blind-fire `continue` into a non-error state (e.g. a
             // PermissionPrompt the agent reached after the throttle cleared).
-            if state == AgentState::ServerRateLimit && productive_silent < RECOVERY_SILENCE {
+            if state == AgentState::ServerRateLimit && recovered {
                 // #ratelimit-recovery: still latched ServerRateLimit (the stale
                 // "Server is temporarily limiting" line re-matches in the tail and
                 // working_state_below can't see a marker BELOW the most-recent error
@@ -1516,7 +1512,7 @@ pub(crate) fn process_error_recovery(
                 if retry_tracks.remove(name).is_some() {
                     tracing::info!(
                         agent = %name,
-                        productive_silent_secs = productive_silent.as_secs(),
+                        productive_silent_secs = productive_silence.as_secs(),
                         "ServerRateLimit retry cleared — agent recovered (recent productive output)"
                     );
                 }
@@ -2961,22 +2957,12 @@ instances:
             health: crate::health::HealthTracker::new(),
         }));
         core.lock().state.current = state;
-        // #ratelimit-recovery: default mock agents to STALE productive output — a
-        // realistic stuck/idle agent. `StateTracker::new` stamps
-        // `last_productive_output = now()`, but a ServerRateLimit-retry test models
-        // a wedged-throttle agent that has produced nothing; the gate
-        // (`productive_silent >= RECOVERY_SILENCE`) would otherwise treat every mock
-        // as freshly-recovered. The recovery test overrides this back to fresh.
-        //
-        // Offset = RECOVERY_SILENCE + 30s (just past the gate, NOT 3600s): on
-        // windows `Instant` is monotonic from system BOOT and the CI VM's uptime is
-        // < 1h, so `checked_sub(3600s)` UNDERFLOWED → fell back to `now` (fresh) →
-        // the stuck-agent tests saw "recovered" and failed (macos/ubuntu have larger
-        // Instants and passed). The runner is always up far longer than ~75s by the
-        // Tests step (boot + checkout + build), so this never underflows.
-        core.lock().state.last_productive_output = std::time::Instant::now()
-            .checked_sub(RECOVERY_SILENCE + std::time::Duration::from_secs(30))
-            .unwrap_or_else(std::time::Instant::now);
+        // A fresh `StateTracker` now defaults `last_productive_output` to `None`
+        // (never produced) — exactly the stuck/just-spawned agent a
+        // ServerRateLimit-retry test models, so `recovered_within` is false → the
+        // retry latches + injects. No stale-Instant stamp needed (the old
+        // `checked_sub(3600s)` underflowed on windows). The recovery test instead
+        // stamps `Some(now())` to model an agent that DID just produce.
         let handle = crate::agent::AgentHandle {
             id: crate::types::InstanceId::default(),
             name: name.to_string().into(),
@@ -3052,8 +3038,8 @@ instances:
         let (handle, _reader) =
             mock_agent_handle("test-agent", crate::state::AgentState::ServerRateLimit);
         // Recovered: produced productive output just now (< RECOVERY_SILENCE),
-        // overriding mock_agent_handle's stale default.
-        handle.core.lock().state.last_productive_output = Instant::now();
+        // overriding the `None` (never-produced) default.
+        handle.core.lock().state.last_productive_output = Some(Instant::now());
         registry.lock().insert(handle.id, handle);
 
         // Several ticks (the live flicker) — must never re-arm + inject.
