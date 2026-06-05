@@ -169,6 +169,40 @@ pub fn scan_existing_branch_binding(
     None
 }
 
+/// PR-3 (t-ci-ready-pr3-arm-not-armed): the distinct `source_repo` paths of every
+/// LIVE bound branch (each `runtime/<agent>/binding.json`'s `source_repo`).
+///
+/// The pr_state scanner seeds its poll-repo list from these (after resolving each
+/// to a gh `owner/repo` slug) so a repo that has a bound branch but NO pr-state
+/// file yet — a bypass / non-dispatch PR — is still polled. Without this seed the
+/// scanner only ever polls repos that already have a pr-state, so a brand-new
+/// unwatched PR in an otherwise-unseeded repo would never be discovered (the
+/// #1782 gap). Returns raw paths (slug resolution is the caller's job) to keep
+/// this module free of the git/scm dependency.
+pub fn bound_source_repos(home: &Path) -> Vec<std::path::PathBuf> {
+    let runtime_dir = crate::paths::runtime_dir(home);
+    let Ok(entries) = std::fs::read_dir(&runtime_dir) else {
+        return Vec::new();
+    };
+    let mut repos: Vec<std::path::PathBuf> = Vec::new();
+    for entry in entries.flatten() {
+        let binding_path = entry.path().join("binding.json");
+        let Ok(content) = std::fs::read_to_string(&binding_path) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) else {
+            continue;
+        };
+        if let Some(src) = v["source_repo"].as_str() {
+            let path = std::path::PathBuf::from(src);
+            if !repos.contains(&path) {
+                repos.push(path);
+            }
+        }
+    }
+    repos
+}
+
 /// Read the current binding for an agent.
 /// Hot path: returns from in-memory index (read lock). Cold path
 /// (first access per agent): acquires write lock, double-checks,

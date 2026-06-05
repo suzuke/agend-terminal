@@ -243,25 +243,25 @@ pub fn scan_and_emit_with(
 /// re-applying the same metadata is a no-op for the reducer if state
 /// already matches.
 fn apply_gh_poll(home: &Path, dir: &Path, poller: &dyn gh_poll::GhPoller) {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::warn!(
-                dir = %dir.display(),
-                error = %e,
-                "#1002 apply_gh_poll read_dir failed — gh-poll skipped this tick"
-            );
-            return;
-        }
-    };
+    // PR-3 (t-ci-ready-pr3-arm-not-armed): the pr_state dir may be ABSENT (cold
+    // start / no PR tracked yet). That must NOT skip the gh-poll — the
+    // bound-branch seed below still drives discovery of unwatched open PRs. So
+    // tolerate a missing/unreadable dir (empty iterator) instead of early
+    // returning, which previously bypassed the whole auto-arm path.
+    let entries = std::fs::read_dir(dir).ok();
     let now = chrono::Utc::now().to_rfc3339();
     // Group files by repo + collect those due for refresh.
     let mut by_repo: HashMap<String, Vec<PrState>> = HashMap::new();
+    // PR-3 (t-ci-ready-pr3-arm-not-armed): every repo with a non-terminal
+    // pr-state is already cadence-managed (it polls on its own `should_poll`
+    // schedule). Track them so the bound-branch seed below does NOT force an
+    // extra poll on an already-known repo (which would defeat `should_poll`).
+    let mut seen_repos: HashSet<String> = HashSet::new();
     let mut skipped_terminal = 0u32;
     let mut skipped_should_poll = 0u32;
-    for entry in entries.flatten() {
+    for entry in entries.into_iter().flatten().flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
@@ -297,10 +297,30 @@ fn apply_gh_poll(home: &Path, dir: &Path, poller: &dyn gh_poll::GhPoller) {
             skipped_terminal = skipped_terminal.saturating_add(1);
             continue;
         }
+        // Non-terminal pr-state → this repo is cadence-managed already.
+        seen_repos.insert(state.repo.clone());
         if gh_poll::should_poll(&state, &now) {
             by_repo.entry(state.repo.clone()).or_default().push(state);
         } else {
             skipped_should_poll = skipped_should_poll.saturating_add(1);
+        }
+    }
+
+    // PR-3 (t-ci-ready-pr3-arm-not-armed): seed the poll-repo list from LIVE
+    // BOUND BRANCHES whose repo has NO non-terminal pr-state yet. This is the
+    // discovery path #1782 needs — a bypass / non-dispatch PR has neither a
+    // ci-watch nor a pr-state, so its repo would never be polled from pr-state
+    // alone. Each bound agent's binding.json carries the `source_repo`; resolve
+    // it to a gh slug and poll it (empty `due_states` → the poll just feeds
+    // `auto_arm_unwatched_open_prs`). `seen_repos` keeps this from re-polling a
+    // repo the cadence already manages.
+    for src_path in crate::binding::bound_source_repos(home) {
+        if let Some(slug) =
+            crate::mcp::handlers::dispatch_hook::derive_repo_from_remote_pub(&src_path)
+        {
+            if !seen_repos.contains(&slug) {
+                by_repo.entry(slug).or_default();
+            }
         }
     }
     if !by_repo.is_empty() || skipped_terminal > 0 || skipped_should_poll > 0 {

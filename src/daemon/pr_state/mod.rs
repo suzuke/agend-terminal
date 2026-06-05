@@ -1701,6 +1701,83 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// PR-3 (t-ci-ready-pr3-arm-not-armed) — INTEGRATION (codex re-verify): a
+    /// BOUND branch with NO ci-watch AND NO pr-state file must STILL be
+    /// discovered and auto-armed. This exercises the binding-seeded discovery
+    /// path through the real scanner — the exact structural hole codex's first
+    /// pass found, which the `auto_arm` unit tests (injecting `prs` directly)
+    /// could not reach. Without the bound-branch seed, the repo never enters the
+    /// poll list (no pr-state) → the open PR is never discovered → #1782 unfixed.
+    #[test]
+    #[cfg(unix)]
+    fn pr3_bound_branch_with_no_seed_is_discovered_and_armed() {
+        let parent = std::env::temp_dir().join(format!("agend-pr3-integ-{}", std::process::id()));
+        let home = parent.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+
+        // Source repo whose origin remote resolves to the slug "owner/repo".
+        let repo_path = parent.join("source-repo");
+        std::fs::create_dir_all(&repo_path).unwrap();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec![
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/owner/repo.git",
+            ],
+        ] {
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(&repo_path)
+                .env("AGEND_GIT_BYPASS", "1")
+                .output()
+                .unwrap();
+        }
+
+        // Bind "dev-x" → branch "feat/x" in that repo. NO pr-state, NO ci-watch.
+        let bdir = crate::paths::runtime_dir(&home).join("dev-x");
+        std::fs::create_dir_all(&bdir).unwrap();
+        std::fs::write(
+            bdir.join("binding.json"),
+            serde_json::to_string(&serde_json::json!({
+                "version": 1, "agent": "dev-x", "task_id": "t",
+                "branch": "feat/x", "worktree": "/tmp/wt-dev-x",
+                "source_repo": repo_path.display().to_string(),
+                "issued_at": "2026-06-05T00:00:00Z",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // gh-poll observes one OPEN PR on that branch.
+        let poller = MockGhPoller::new(vec![Ok(vec![gh_meta_open(700, "feat/x", "suzuke")])]);
+
+        scan_and_emit_with(&home, &empty_registry(), &poller);
+
+        // The bound-branch discovery path must have auto-armed a watch.
+        let watch = crate::daemon::ci_watch::ci_watches_dir(&home).join(
+            crate::daemon::ci_watch::watch_filename("owner/repo", "feat/x"),
+        );
+        assert!(
+            watch.exists(),
+            "a bound branch with no pr-state/watch seed must be discovered + auto-armed"
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&watch).unwrap()).unwrap();
+        let subs: Vec<&str> = v["subscribers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|s| s["instance"].as_str())
+            .collect();
+        assert!(
+            subs.contains(&"dev-x"),
+            "subscriber must be the BOUND agent (not the gh author login): {subs:?}"
+        );
+        std::fs::remove_dir_all(&parent).ok();
+    }
+
     /// #986 T4 — `gh state=MERGED + mergedAt!=None` fires
     /// MergedObserved → reducer transitions to Merged terminal state
     /// → scanner emits `[pr-merged]` to author inbox + sweeps file.
