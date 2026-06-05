@@ -1,34 +1,30 @@
-//! L2: fixup-team-specific dispatch-idle automation.
+//! L2: generic per-team dispatch-idle automation.
 //!
-//! Two responsibilities, both hard-coded for the fixup team:
-//! 1. **Threshold injection** at dispatch time — when fixup-team
-//!    members `send(kind=task|query)` without explicit
-//!    `expect_reply_within_secs`, inject the default 600s (10min)
-//!    so the L1 tracker engages by default for fixup orchestration.
-//! 2. **Auto-nudge** when the L1 watchdog fires — scan exceeded
-//!    sidecars where the dispatcher belongs to the fixup team and the
-//!    nudge has not yet been emitted, then send a status-request
-//!    message to the dispatchee (NOT team-wide — target-specific,
-//!    matching the L1 sidecar's `target` field).
+//! Two responsibilities, for ANY team (t-dehardcode-fixup-nudge-multiteam — was
+//! hard-coded to the "fixup" team):
+//! 1. **Threshold injection** at dispatch time — when a team member
+//!    `send(kind=task|query)` without an explicit `expect_reply_within_secs`,
+//!    inject the default [`DEFAULT_DISPATCH_THRESHOLD_SECS`] so the L1 tracker
+//!    engages by default for that team's orchestration.
+//! 2. **Auto-nudge** when the L1 watchdog fires — scan exceeded sidecars where the
+//!    dispatcher belongs to ANY team and the nudge has not yet been emitted, then
+//!    send a status-request message to the dispatchee (NOT team-wide —
+//!    target-specific, matching the L1 sidecar's `target` field), stamped
+//!    per-team `[<team>-watchdog]` so the operator sees which team.
 //!
-//! Cross-team isolation: this is the ONLY file that knows the string
-//! "fixup". Other teams who want the same automation add a sibling
-//! `dispatch_idle/<team>_nudge.rs` module following this exact shape.
-//!
-//! Defer config-driven thresholds to L2.1 (TeamConfig schema bump)
-//! when a second team requests its own default.
+//! Solo agents (no team) are intentionally NOT tracked here — without a team
+//! there is no orchestrator / SLA context. Per-team threshold config is a
+//! deferred follow-up (TeamConfig schema bump); today the threshold is a single
+//! global default.
 
 use std::path::Path;
 
 use super::{list_pending, pending_path, DispatchStatus, PendingDispatch};
 
-/// Fixup team name as it appears in fleet.yaml. Single source of truth.
-pub(crate) const FIXUP_TEAM_NAME: &str = "fixup";
-
-/// Default dispatch-idle threshold for fixup-team members when no
-/// explicit `expect_reply_within_secs` is set on the dispatch. 600s
-/// (10 min) per the original watchdog spec.
-pub(crate) const FIXUP_DEFAULT_THRESHOLD_SECS: i64 = 600;
+/// Default dispatch-idle threshold for ANY team member when no explicit
+/// `expect_reply_within_secs` is set on the dispatch. 600s (10 min) per the
+/// original watchdog spec. Per-team override is a deferred follow-up.
+pub(crate) const DEFAULT_DISPATCH_THRESHOLD_SECS: i64 = 600;
 
 /// Scan throttle: 6 ticks × 10s = ~60s — matches L1 cadence.
 pub(crate) const TICKS_PER_SCAN: u64 = 6;
@@ -36,9 +32,10 @@ pub(crate) const TICKS_PER_SCAN: u64 = 6;
 /// Resolve the threshold the dispatcher's send should record against.
 /// Returns:
 /// - `Some(explicit)` when the caller provided one.
-/// - `Some(FIXUP_DEFAULT_THRESHOLD_SECS)` when no explicit value and
-///   the dispatcher is a fixup-team member.
-/// - `None` otherwise (cross-team-safe default-disabled).
+/// - `Some(DEFAULT_DISPATCH_THRESHOLD_SECS)` when no explicit value and the
+///   dispatcher belongs to ANY team.
+/// - `None` for a teamless (solo) dispatcher (no orchestration context → no
+///   default tracking).
 pub(crate) fn resolve_threshold_for_dispatch(
     home: &Path,
     dispatcher: &str,
@@ -49,21 +46,18 @@ pub(crate) fn resolve_threshold_for_dispatch(
             return Some(explicit);
         }
     }
-    let team = crate::teams::find_team_for(home, dispatcher)?;
-    if team.name == FIXUP_TEAM_NAME {
-        Some(FIXUP_DEFAULT_THRESHOLD_SECS)
-    } else {
-        None
-    }
+    // Any team member's dispatch gets the default threshold (was gated to
+    // team.name == "fixup"; #t-dehardcode-fixup-nudge-multiteam generalised it).
+    crate::teams::find_team_for(home, dispatcher).map(|_team| DEFAULT_DISPATCH_THRESHOLD_SECS)
 }
 
 /// Per-loop scheduler state for the auto-nudge tracker.
 #[derive(Debug, Default)]
-pub(crate) struct DispatchIdleFixupNudgeTracker {
+pub(crate) struct DispatchIdleNudgeTracker {
     tick_count: u64,
 }
 
-impl DispatchIdleFixupNudgeTracker {
+impl DispatchIdleNudgeTracker {
     pub(crate) fn maybe_scan(&mut self, home: &Path) -> bool {
         self.tick_count = self.tick_count.saturating_add(1);
         if self.tick_count < TICKS_PER_SCAN {
@@ -75,10 +69,11 @@ impl DispatchIdleFixupNudgeTracker {
     }
 }
 
-fn is_fixup_member(home: &Path, agent: &str) -> bool {
-    crate::teams::find_team_for(home, agent)
-        .map(|t| t.name == FIXUP_TEAM_NAME)
-        .unwrap_or(false)
+/// The dispatcher's team name, if it belongs to one. Gates the auto-nudge AND
+/// supplies the per-team `[<team>-watchdog]` label. `None` for a teamless (solo)
+/// dispatcher → not nudged.
+fn dispatcher_team(home: &Path, agent: &str) -> Option<String> {
+    crate::teams::find_team_for(home, agent).map(|t| t.name)
 }
 
 fn write_dispatch_sidecar(home: &Path, d: &PendingDispatch) -> bool {
@@ -89,7 +84,7 @@ fn write_dispatch_sidecar(home: &Path, d: &PendingDispatch) -> bool {
     crate::store::atomic_write(&pending_path(home, &d.dispatch_id), body.as_bytes()).is_ok()
 }
 
-fn emit_nudge(home: &Path, d: &PendingDispatch) -> bool {
+fn emit_nudge(home: &Path, d: &PendingDispatch, team: &str) -> bool {
     let elapsed = chrono::DateTime::parse_from_rfc3339(&d.issued_at)
         .map(|t| {
             chrono::Utc::now()
@@ -97,10 +92,12 @@ fn emit_nudge(home: &Path, d: &PendingDispatch) -> bool {
                 .num_seconds()
         })
         .unwrap_or(0);
+    // Per-team label so the operator sees which team's dispatch stalled.
     let text = format!(
-        "[fixup-watchdog] dispatched by '{dispatcher}' {elapsed}s ago \
+        "[{team}-watchdog] dispatched by '{dispatcher}' {elapsed}s ago \
          (threshold {threshold_secs}s, correlation_id={corr}). \
          Please status: BUSY / progress / VERIFIED-if-ready.",
+        team = team,
         dispatcher = d.dispatcher,
         elapsed = elapsed,
         threshold_secs = d.threshold_secs,
@@ -116,7 +113,8 @@ fn emit_nudge(home: &Path, d: &PendingDispatch) -> bool {
     match crate::inbox::notify_system(
         home,
         &d.target,
-        "system:fixup-watchdog",
+        // Generic sender across all teams (was `system:fixup-watchdog`).
+        "system:dispatch-watchdog",
         "dispatch_idle_nudge",
         text,
         Some(&corr),
@@ -128,7 +126,7 @@ fn emit_nudge(home: &Path, d: &PendingDispatch) -> bool {
                 error = %e,
                 target = %d.target,
                 dispatch_id = %d.dispatch_id,
-                "fixup_nudge: enqueue failed"
+                "team_nudge: enqueue failed"
             );
             false
         }
@@ -145,15 +143,17 @@ pub(crate) fn scan_and_nudge(home: &Path) {
         if d.nudge_sent_at.is_some() {
             continue;
         }
-        if !is_fixup_member(home, &d.dispatcher) {
+        // Nudge for ANY team's dispatch (was gated to the fixup team); a teamless
+        // (solo) dispatcher has no orchestration context → skip.
+        let Some(team) = dispatcher_team(home, &d.dispatcher) else {
             continue;
-        }
-        if !emit_nudge(home, &d) {
+        };
+        if !emit_nudge(home, &d, &team) {
             continue;
         }
         d.nudge_sent_at = Some(chrono::Utc::now().to_rfc3339());
         if !write_dispatch_sidecar(home, &d) {
-            tracing::warn!(dispatch_id = %d.dispatch_id, "fixup-nudge sidecar write failed");
+            tracing::warn!(dispatch_id = %d.dispatch_id, "team-nudge sidecar write failed");
         }
     }
 }
@@ -282,13 +282,12 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// 11. Cross-team isolation contract: if the dispatcher is not in
-    /// the fixup team, this module does not nudge. Other teams must
-    /// supply their own `<team>_nudge.rs`.
+    /// t-dehardcode-fixup-nudge-multiteam: ANY team's dispatch now nudges (was
+    /// gated to "fixup"). A non-fixup team's overdue dispatch fires the nudge,
+    /// stamped with that team's `[<team>-watchdog]` label.
     #[test]
-    fn nudge_skips_non_fixup_dispatcher() {
+    fn nudge_fires_for_any_team_dispatcher_multiteam() {
         let home = tmp_home("non-fixup");
-        // No fleet.yaml fixup team → dispatcher isn't a fixup member.
         let yaml = "schema_version: 1\n\
                     teams:\n  research:\n    members: [research-lead, research-dev]\n\
                             orchestrator: research-lead\n";
@@ -296,11 +295,43 @@ mod tests {
         write_exceeded_sidecar(&home, "research-lead", "research-dev", "t-cross", 700);
         scan_and_nudge(&home);
         let inbox = crate::inbox::drain(&home, "research-dev");
+        let nudge = inbox
+            .iter()
+            .find(|m| m.kind.as_deref() == Some("dispatch_idle_nudge"));
+        assert!(
+            nudge.is_some(),
+            "any-team dispatch must now be nudged (multi-team): {inbox:?}"
+        );
+        assert!(
+            nudge.unwrap().text.contains("[research-watchdog]"),
+            "nudge must carry the per-team label `[research-watchdog]`: {:?}",
+            nudge.unwrap().text
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// t-dehardcode-fixup-nudge-multiteam: a TEAMLESS (solo) dispatcher has no
+    /// orchestration context → still NOT nudged (and `resolve_threshold_for_dispatch`
+    /// returns None for it, so no sidecar is even tracked in production).
+    #[test]
+    fn nudge_skips_teamless_solo_dispatcher() {
+        let home = tmp_home("solo");
+        // fleet.yaml with NO teams → the dispatcher belongs to none.
+        std::fs::write(home.join("fleet.yaml"), "schema_version: 1\nteams: {}\n").unwrap();
+        write_exceeded_sidecar(&home, "solo-agent", "other-agent", "t-solo", 700);
+        scan_and_nudge(&home);
+        let inbox = crate::inbox::drain(&home, "other-agent");
         assert!(
             !inbox
                 .iter()
                 .any(|m| m.kind.as_deref() == Some("dispatch_idle_nudge")),
-            "fixup_nudge must NOT nudge non-fixup-team dispatchees: {inbox:?}"
+            "a teamless (solo) dispatcher must NOT be nudged: {inbox:?}"
+        );
+        // And the threshold helper declines a teamless dispatcher.
+        assert_eq!(
+            resolve_threshold_for_dispatch(&home, "solo-agent", None),
+            None,
+            "teamless dispatcher gets no default threshold"
         );
         std::fs::remove_dir_all(&home).ok();
     }

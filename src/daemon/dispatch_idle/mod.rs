@@ -9,14 +9,14 @@
 //! `no_team_name_strings_in_l1` is the load-bearing invariant test —
 //! any L1 grep hit for "fixup" / "reviewer" / "lead" fails CI.
 //! Teams opt in by setting `expect_reply_within_secs` on their own
-//! dispatches; team-specific automation lives in sibling modules
-//! (see `fixup_nudge`).
+//! dispatches; the generic per-team automation lives in `team_nudge`
+//! (was `fixup_nudge`, which was hard-coded to the fixup team).
 //!
 //! Pattern lineage: closest mirror is `decision_timeout` (threshold +
 //! resolve + sidecar lifecycle); hook-site precedent is #870 in
 //! `auto_release` (handle_send post-enqueue).
 
-pub(crate) mod fixup_nudge;
+pub(crate) mod team_nudge;
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -1381,7 +1381,7 @@ mod tests {
     /// right home for that code.
     ///
     /// Two structural allowances: comment lines (any `// …` prefix) and
-    /// the boilerplate `pub(crate) mod fixup_nudge;` declaration that
+    /// the boilerplate `pub(crate) mod team_nudge;` declaration that
     /// wires the L2 submodule into the dispatch_idle module tree.
     /// Test-module contents are also exempt — placeholder names like
     /// "lead" / "reviewer" / "dev-1" are legitimate test inputs.
@@ -1406,7 +1406,7 @@ mod tests {
             }
             // Allowlist: the L2 submodule declaration is structural,
             // not behavioral. Behaviour-side references stay forbidden.
-            if trimmed == "pub(crate) mod fixup_nudge;" {
+            if trimmed == "pub(crate) mod team_nudge;" {
                 continue;
             }
             for needle in ["fixup", "reviewer", "lead"] {

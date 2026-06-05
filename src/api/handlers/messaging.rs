@@ -473,7 +473,7 @@ fn track_dispatch(
         let outbound_corr = msg.correlation_id.as_deref().or(msg.task_id.as_deref());
         let explicit_threshold = params["expect_reply_within_secs"].as_i64();
         if let Some(threshold) =
-            crate::daemon::dispatch_idle::fixup_nudge::resolve_threshold_for_dispatch(
+            crate::daemon::dispatch_idle::team_nudge::resolve_threshold_for_dispatch(
                 home,
                 from,
                 explicit_threshold,
@@ -1729,10 +1729,12 @@ mod tests {
     }
 
     #[test]
-    fn hook_non_fixup_dispatch_no_recording_without_explicit_threshold() {
-        // Cross-team-safe default-disabled invariant: non-fixup
-        // dispatcher with no explicit threshold → NO sidecar.
-        let home = tmp_home("hook-non-fixup-no-record");
+    fn hook_non_fixup_team_dispatch_now_records_via_default_threshold_multiteam() {
+        // t-dehardcode-fixup-nudge-multiteam: a NON-fixup team's dispatcher with
+        // no explicit threshold now RECORDS a sidecar via the global default (was
+        // gated to the fixup team → no sidecar). The teamless (solo) case still
+        // records nothing — covered by the team_nudge unit tests.
+        let home = tmp_home("hook-non-fixup-records");
         // Distinct team that ISN'T fixup.
         std::fs::write(
             crate::fleet::fleet_yaml_path(&home),
@@ -1757,8 +1759,8 @@ mod tests {
         assert!(
             pending
                 .iter()
-                .all(|p| p.correlation_id.as_deref() != Some("t-non-fixup")),
-            "non-fixup dispatch without explicit threshold must NOT record"
+                .any(|p| p.correlation_id.as_deref() == Some("t-non-fixup")),
+            "any-team dispatch must now record a sidecar via the default threshold (multi-team)"
         );
         std::fs::remove_dir_all(&home).ok();
     }
