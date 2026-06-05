@@ -125,13 +125,28 @@ pub(crate) struct RecoveryDispatcherHandler {
     /// future stages and avoids leaking `crossbeam_channel::Sender`
     /// across the trait boundary.
     crash_tx: std::sync::Arc<crossbeam_channel::Sender<crate::agent::AgentExitEvent>>,
+    /// #1694(a): whether a `Stage2Restart` emitted on `crash_tx` actually has a
+    /// live consumer in THIS runtime. `run_core` wires `crash_rx` →
+    /// `handle_crash_respawn` (true); app-standalone passes a throwaway channel
+    /// whose `rx` is dropped (false), so a Stage2 `try_send` there would silently
+    /// vanish. When false, `handle_stage2_fire` escalates straight to Stage3
+    /// (graceful pause + operator escalation) instead of a no-op restart — the
+    /// M-class silent-drop this whole sprint has been closing. (The real fix —
+    /// Stage2 driving app mode's pane-based respawn — is a follow-up; Stage2 stays
+    /// gated-off by default, so this only fires if an operator enables Stage2 in
+    /// app mode.)
+    stage2_dispatch_available: bool,
 }
 
 impl RecoveryDispatcherHandler {
     pub(crate) fn new(
         crash_tx: std::sync::Arc<crossbeam_channel::Sender<crate::agent::AgentExitEvent>>,
+        stage2_dispatch_available: bool,
     ) -> Self {
-        Self { crash_tx }
+        Self {
+            crash_tx,
+            stage2_dispatch_available,
+        }
     }
 }
 
@@ -215,6 +230,31 @@ fn classify_branch(
         Stage1Branch::AliveStuck
     } else {
         Stage1Branch::Anomaly
+    }
+}
+
+/// #1694(a): three-way decision for `handle_stage2_fire`, extracted (like
+/// [`Stage1Branch`]) so the branch logic is unit-testable independent of the
+/// PTY/channel side effects — no AgentHandle harness needed.
+#[derive(Debug, PartialEq, Eq)]
+enum Stage2Decision {
+    /// Gate off — shadow mode: log the would-fire, no send, no transition.
+    Shadow,
+    /// Gate on but no live crash consumer in this runtime (app-standalone) —
+    /// escalate to Stage3 (graceful pause + escalation) rather than silent-drop
+    /// the `Stage2Restart` onto a receiver-less channel.
+    EscalateNoConsumer,
+    /// Gate on + a live consumer — emit the `Stage2Restart` (active mode).
+    Fire,
+}
+
+fn stage2_decision(gate_active: bool, stage2_dispatch_available: bool) -> Stage2Decision {
+    if !gate_active {
+        Stage2Decision::Shadow
+    } else if !stage2_dispatch_available {
+        Stage2Decision::EscalateNoConsumer
+    } else {
+        Stage2Decision::Fire
     }
 }
 
@@ -474,20 +514,43 @@ impl RecoveryDispatcherHandler {
         snapshot: &DispatchSnapshot,
         gate_active: bool,
     ) {
-        if !gate_active {
-            // Shadow mode — emit telemetry but no event send and no
-            // state transition. Operator can observe the decision
-            // pattern before flipping `AGEND_AUTO_RECOVERY_STAGE2=1`.
-            tracing::info!(
-                target: TARGET,
-                agent = %name,
-                recovery_restart_count = snapshot.recovery_restart_count,
-                silent_ms = snapshot.silent.as_millis() as u64,
-                silent_productive_ms = snapshot.silent_productive.as_millis() as u64,
-                gate_active = false,
-                "stage2 would-have-fired (shadow mode): Stage2Restart event NOT emitted"
-            );
-            return;
+        match stage2_decision(gate_active, self.stage2_dispatch_available) {
+            Stage2Decision::Shadow => {
+                // Emit telemetry but no event send and no state transition.
+                // Operator can observe the decision pattern before flipping
+                // `AGEND_AUTO_RECOVERY_STAGE2=1`.
+                tracing::info!(
+                    target: TARGET,
+                    agent = %name,
+                    recovery_restart_count = snapshot.recovery_restart_count,
+                    silent_ms = snapshot.silent.as_millis() as u64,
+                    silent_productive_ms = snapshot.silent_productive.as_millis() as u64,
+                    gate_active = false,
+                    "stage2 would-have-fired (shadow mode): Stage2Restart event NOT emitted"
+                );
+                return;
+            }
+            Stage2Decision::EscalateNoConsumer => {
+                // #1694(a): Stage 2 auto-restart has no consumer in THIS runtime —
+                // app-standalone passes a throwaway `crash_tx` whose `rx` is
+                // dropped, so `try_send(Stage2Restart)` would silently vanish (the
+                // M-class silent-drop). Escalate straight to Stage3 (graceful pause
+                // + operator escalation, which needs no crash consumer) so the
+                // stuck agent is SURFACED, not dropped. Stage2 stays gated-off by
+                // default, so this only fires if an operator enabled Stage2 in app
+                // mode; the proper fix (Stage2 driving app mode's pane-based
+                // respawn) is a follow-up.
+                tracing::warn!(
+                    target: TARGET,
+                    agent = %name,
+                    recovery_restart_count = snapshot.recovery_restart_count,
+                    "stage2 restart unavailable in this runtime (no crash consumer) — escalating to Stage3 instead of silent-drop"
+                );
+                let mut core = target.core.lock();
+                core.health.recovery_stage_state = RecoveryStageState::Stage3Eligible;
+                return;
+            }
+            Stage2Decision::Fire => {}
         }
 
         // Active mode — emit telegram notify pre-emit so operators have
@@ -921,7 +984,7 @@ mod tests {
             externals: &externals,
             configs: &configs,
         };
-        RecoveryDispatcherHandler::new(sentinel_crash_tx()).run(&ctx);
+        RecoveryDispatcherHandler::new(sentinel_crash_tx(), true).run(&ctx);
         assert!(registry.lock().is_empty());
         std::fs::remove_dir_all(&home).ok();
     }
@@ -991,7 +1054,7 @@ mod tests {
     #[test]
     fn name_matches_module() {
         assert_eq!(
-            RecoveryDispatcherHandler::new(sentinel_crash_tx()).name(),
+            RecoveryDispatcherHandler::new(sentinel_crash_tx(), true).name(),
             "recovery_dispatcher"
         );
     }
@@ -1026,7 +1089,7 @@ mod tests {
                 externals: &externals,
                 configs: &configs,
             };
-            RecoveryDispatcherHandler::new(sentinel_crash_tx()).run(&ctx);
+            RecoveryDispatcherHandler::new(sentinel_crash_tx(), true).run(&ctx);
             std::fs::remove_dir_all(&home).ok();
         });
     }
@@ -1112,6 +1175,24 @@ mod tests {
         with_stage2_gate(false, || {
             assert!(!stage2_gate_active());
         });
+    }
+
+    /// #1694(a): the three-way Stage2 decision — the seam that makes
+    /// `handle_stage2_fire`'s no-consumer escalation testable without a full
+    /// AgentHandle/PTY harness (same pattern as `classify_branch`/`Stage1Branch`).
+    #[test]
+    fn stage2_decision_escalates_on_no_consumer_else_fires_1694a() {
+        // Gate OFF → shadow, regardless of consumer (no send, no transition).
+        assert_eq!(stage2_decision(false, true), Stage2Decision::Shadow);
+        assert_eq!(stage2_decision(false, false), Stage2Decision::Shadow);
+        // Gate ON + live consumer (run_core's crash_rx) → Fire (emit Stage2Restart).
+        assert_eq!(stage2_decision(true, true), Stage2Decision::Fire);
+        // Gate ON + NO consumer (app-standalone's throwaway crash_tx) → escalate
+        // to Stage3 instead of silently dropping the restart onto a dead channel.
+        assert_eq!(
+            stage2_decision(true, false),
+            Stage2Decision::EscalateNoConsumer
+        );
     }
 
     #[test]

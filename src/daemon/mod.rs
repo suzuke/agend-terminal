@@ -431,10 +431,15 @@ pub(crate) fn register_event_subscribers(registry: &AgentRegistry) {
 /// invariant fails CI if a new handler lands here but neither runs in app nor is
 /// allowlisted.
 ///
-/// `crash_tx` is consumed by `RecoveryDispatcherHandler`; app passes a throwaway
-/// sender because it allowlists that handler out (it does pane-based respawn).
+/// `crash_tx` is consumed by `RecoveryDispatcherHandler`. `stage2_dispatch_available`
+/// tells the handler whether a `Stage2Restart` on that channel has a live consumer
+/// in this runtime: `run_core` wires `crash_rx` (true); app-standalone passes a
+/// throwaway sender (false) — #1694(a) now RUNS the handler in app mode (Stage1
+/// ESC-nudge), but its Stage2 path escalates to Stage3 rather than silent-drop
+/// onto the consumerless channel.
 pub(crate) fn build_default_handlers(
     crash_tx: crossbeam_channel::Sender<crate::agent::AgentExitEvent>,
+    stage2_dispatch_available: bool,
 ) -> Vec<Box<dyn per_tick::PerTickHandler>> {
     let watchdog_dry_run = watchdog::watchdog_dry_run_from_env();
     // Vec order MUST match the pre-extraction call order (zero-behavior-change guarantee).
@@ -442,6 +447,7 @@ pub(crate) fn build_default_handlers(
         Box::new(per_tick::HangDetectionHandler::new()),
         Box::new(per_tick::RecoveryDispatcherHandler::new(
             std::sync::Arc::new(crash_tx),
+            stage2_dispatch_available,
         )),
         Box::new(per_tick::WatchdogHandler::new(watchdog_dry_run)),
         Box::new(per_tick::ExternalLivenessHandler::new()),
@@ -744,7 +750,9 @@ fn build_tick_infrastructure(
     // by instances deleted before the cascade-on-delete fix existed.
     crate::daemon::orphan_sweep::run(home);
 
-    let handlers = build_default_handlers(ctx.crash_tx.clone());
+    // #1694(a): run_core wires `crash_rx` → `handle_crash_respawn`, so Stage2
+    // restarts have a live consumer here (true).
+    let handlers = build_default_handlers(ctx.crash_tx.clone(), true);
 
     let tick_rx = {
         let (tx, rx) = crossbeam_channel::bounded(1);

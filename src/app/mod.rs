@@ -135,22 +135,30 @@ pub fn run(fleet_path_override: Option<&str>) -> Result<()> {
 /// NEW handler is added to `build_default_handlers` but is neither run in app nor
 /// listed here — so additions are a conscious decision, not silent drift.
 ///
-/// - `recovery_dispatcher`: coupled to run_core's `crash_rx` + `handle_crash_respawn`,
-///   which app-standalone has no equivalent of — it does pane-based respawn in the
-///   TUI loop. (#685 dispatch-recovery is shadow-default-off anyway.)
 /// - `snapshot_rotation`: app owns session persistence via `session::save_session_if_changed`.
 /// - `thread_dump`: env-gated diagnostic, not needed in the interactive TUI.
-const APP_TICK_ALLOWLIST: &[&str] = &["recovery_dispatcher", "snapshot_rotation", "thread_dump"];
+///
+/// #1694(a): `recovery_dispatcher` was REMOVED from this allowlist — the live
+/// daemon runs in app mode (`app::run_app`, never `run_core`), so allowlisting it
+/// out meant the #685 recovery ladder was silently dead in the live daemon (the
+/// #1720 class). It now runs in app mode: Stage1 (ESC-nudge to the PTY) needs no
+/// `crash_rx`; Stage2 (restart) has no app-mode consumer, so it escalates to
+/// Stage3 instead of silent-dropping (see `build_default_handlers`'
+/// `stage2_dispatch_available = false` below). All stages stay shadow-gated-off by
+/// default — zero behavior change unless an operator opts in.
+const APP_TICK_ALLOWLIST: &[&str] = &["snapshot_rotation", "thread_dump"];
 
 /// Build the per-tick handler set app-standalone runs: the shared
 /// `build_default_handlers` minus `APP_TICK_ALLOWLIST`. Extracted so the
 /// completeness invariant can compare it against the full daemon set.
 ///
-/// `RecoveryDispatcherHandler` is allowlisted out, so the `crash_tx` it would
-/// consume is a throwaway sender (its receiver is dropped immediately).
+/// #1694(a): `crash_tx` here is a throwaway sender (its receiver is dropped), so
+/// `stage2_dispatch_available = false` — `RecoveryDispatcherHandler` now RUNS
+/// (no longer allowlisted out) and its Stage2 path escalates to Stage3 rather
+/// than emit onto the consumerless channel.
 fn app_tick_handlers() -> Vec<Box<dyn crate::daemon::per_tick::PerTickHandler>> {
     let (crash_tx, _crash_rx) = crossbeam_channel::bounded(1);
-    let mut handlers = crate::daemon::build_default_handlers(crash_tx);
+    let mut handlers = crate::daemon::build_default_handlers(crash_tx, false);
     handlers.retain(|h| !APP_TICK_ALLOWLIST.contains(&h.name()));
     handlers
 }
@@ -1514,7 +1522,7 @@ mod tests {
     fn app_tick_handlers_cover_every_non_allowlisted_daemon_handler() {
         use std::collections::HashSet;
         let (crash_tx, _rx) = crossbeam_channel::bounded(1);
-        let all: HashSet<&str> = crate::daemon::build_default_handlers(crash_tx)
+        let all: HashSet<&str> = crate::daemon::build_default_handlers(crash_tx, true)
             .iter()
             .map(|h| h.name())
             .collect();
@@ -1543,6 +1551,23 @@ mod tests {
                 "allowlisted handler '{a}' must NOT run in app-standalone"
             );
         }
+    }
+
+    /// #1694(a): the #685 recovery ladder must RUN in app mode — the live daemon
+    /// is app-standalone (`run_app`), never `run_core`, so allowlisting
+    /// `recovery_dispatcher` out left the whole ladder silently dead in production
+    /// (the #1720 / #1002 class). This pins it back IN the app run set.
+    #[test]
+    fn recovery_dispatcher_runs_in_app_mode_1694a() {
+        let names: Vec<&str> = app_tick_handlers().iter().map(|h| h.name()).collect();
+        assert!(
+            names.contains(&"recovery_dispatcher"),
+            "recovery_dispatcher must RUN in app mode (#1694a) — got {names:?}"
+        );
+        assert!(
+            !APP_TICK_ALLOWLIST.contains(&"recovery_dispatcher"),
+            "recovery_dispatcher must NOT be allowlisted out of app mode (#1694a)"
+        );
     }
 
     /// #1726 must-verify: app-standalone runs these handlers with EMPTY
