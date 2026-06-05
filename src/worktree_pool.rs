@@ -678,21 +678,31 @@ pub(crate) fn is_agent_alive(home: &Path, agent: &str) -> bool {
     agent_has_liveness(home, agent, &live_agents)
 }
 
-/// PR-2: is `agent` a subscriber on any live ci-watch?
+/// PR-2: is `agent` a subscriber on any live ci-watch? codex gap ②: this is a
+/// liveness source, so every read failure FAILS TOWARD ALIVE (returns `true`,
+/// blocking reclaim) rather than silently treating the agent as not-subscribed —
+/// a mis-read must never let us reclaim a live agent. The ONE exception is the
+/// watch dir being genuinely absent (NotFound), which is a real "no watches"
+/// state, not a read failure.
 fn agent_is_ci_watch_subscriber(home: &Path, agent: &str) -> bool {
     let dir = crate::daemon::ci_watch::ci_watches_dir(home);
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return false;
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true, // can't enumerate watches → fail-toward-alive
     };
     for entry in entries.flatten() {
-        if entry.path().extension().and_then(|e| e.to_str()) != Some("json") {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        let Ok(content) = std::fs::read_to_string(entry.path()) else {
-            continue;
+        // A watch file we cannot read/parse COULD carry this agent's subscription
+        // → fail-toward-alive rather than skip it.
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            return true;
         };
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) else {
-            continue;
+            return true;
         };
         if let Some(subs) = v.get("subscribers").and_then(|s| s.as_array()) {
             if subs
@@ -889,6 +899,26 @@ pub fn gc_run(home: &Path) -> Vec<GcResult> {
 
 fn gc_remove_one(home: &Path, candidate: &GcCandidate) -> GcResult {
     let wt_path = &candidate.path;
+
+    // t-worktree-leak PR-2 (codex gap ① CRITICAL): a force-reclaim candidate MUST
+    // NEVER be hard-deleted. Route it through the SINGLE safe deletion path
+    // (retention's `maybe_remove_candidate`: pre-archive liveness re-check +
+    // atomic archive-to-trash + unbind + LOUD confidence ALERT), so the daemon
+    // `gc_run` path and the retention sweep cannot diverge into an irrecoverable
+    // delete. Clean-release candidates keep the historical hard-delete below.
+    if candidate.kind == GcKind::ForceReclaim {
+        use crate::daemon::retention::worktrees::{maybe_remove_candidate, RemovalOutcome};
+        let outcome = maybe_remove_candidate(home, candidate);
+        return GcResult {
+            path: wt_path.clone(),
+            agent: candidate.agent.clone(),
+            removed: matches!(outcome, RemovalOutcome::Removed),
+            error: match outcome {
+                RemovalOutcome::Skipped { reason } => Some(reason),
+                RemovalOutcome::Removed => None,
+            },
+        };
+    }
 
     // Acquire the same binding lock that bind_full() uses, making
     // GC deletion and bind mutually exclusive (eliminates TOCTOU).
@@ -2705,6 +2735,111 @@ mod tests {
         assert!(
             evaluate_candidate(&home, &lease.path, &live).is_none(),
             "recent lease → not yet reclaimable (age gate)"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // codex gap ③: the heartbeat / PTY / waiting_on liveness signals + the
+    // read-failure → fail-toward-alive path (§3.9, safety-critical).
+
+    #[test]
+    fn force_reclaim_spares_recent_heartbeat() {
+        let home = tmp_home("fr-hb");
+        let repo = tmp_repo("fr-hb-repo");
+        let agent = "fr-hb-agent";
+        let lease = lease(&home, &repo, agent, "feat/x").expect("lease");
+        backdate_lease(&lease.path, force_reclaim_age_days() + 2);
+        crate::daemon::heartbeat_pair::update_with(agent, |p| {
+            p.heartbeat_at_ms = crate::daemon::heartbeat_pair::now_ms();
+        });
+        let live: std::collections::HashSet<String> = std::collections::HashSet::new();
+        assert!(
+            evaluate_candidate(&home, &lease.path, &live).is_none(),
+            "recent heartbeat → spared (heartbeat liveness signal)"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn force_reclaim_spares_recent_pty_input() {
+        let home = tmp_home("fr-pty");
+        let repo = tmp_repo("fr-pty-repo");
+        let agent = "fr-pty-agent";
+        let lease = lease(&home, &repo, agent, "feat/x").expect("lease");
+        backdate_lease(&lease.path, force_reclaim_age_days() + 2);
+        crate::daemon::heartbeat_pair::update_with(agent, |p| {
+            p.last_input_at_ms = crate::daemon::heartbeat_pair::now_ms();
+        });
+        let live: std::collections::HashSet<String> = std::collections::HashSet::new();
+        assert!(
+            evaluate_candidate(&home, &lease.path, &live).is_none(),
+            "recent PTY input → spared (PTY liveness signal)"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn force_reclaim_spares_declared_waiting_on() {
+        let home = tmp_home("fr-wait");
+        let repo = tmp_repo("fr-wait-repo");
+        let agent = "fr-wait-agent";
+        let lease = lease(&home, &repo, agent, "feat/x").expect("lease");
+        backdate_lease(&lease.path, force_reclaim_age_days() + 2);
+        crate::daemon::heartbeat_pair::update_with(agent, |p| {
+            p.waiting_on_since_ms = Some(crate::daemon::heartbeat_pair::now_ms());
+        });
+        let live: std::collections::HashSet<String> = std::collections::HashSet::new();
+        assert!(
+            evaluate_candidate(&home, &lease.path, &live).is_none(),
+            "declared waiting_on → spared (blocked-but-alive signal)"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn force_reclaim_ci_watch_read_failure_fails_alive() {
+        let home = tmp_home("fr-ciwfail");
+        let repo = tmp_repo("fr-ciwfail-repo");
+        let agent = "fr-ciwfail-agent";
+        let lease = lease(&home, &repo, agent, "feat/x").expect("lease");
+        backdate_lease(&lease.path, force_reclaim_age_days() + 2);
+        // An unparseable ci-watch file → the liveness read fails → fail-toward-alive.
+        let ci_dir = crate::daemon::ci_watch::ci_watches_dir(&home);
+        std::fs::create_dir_all(&ci_dir).unwrap();
+        std::fs::write(ci_dir.join("corrupt.json"), "{ this is not json").unwrap();
+        let live: std::collections::HashSet<String> = std::collections::HashSet::new();
+        assert!(
+            evaluate_candidate(&home, &lease.path, &live).is_none(),
+            "unparseable ci-watch → fail-toward-alive → spared (never reclaim on uncertainty)"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn gc_run_force_reclaim_never_hard_deletes() {
+        // codex gap ① CRITICAL: the daemon gc_run/gc_remove_one path must route a
+        // force-reclaim through the SAFE helper, never hard-delete. Proof: a dirty
+        // worktree (here, the untracked .agend-managed marker) that the OLD
+        // `git worktree remove --force` would have destroyed is PRESERVED by the
+        // safe path's status pre-check.
+        let home = tmp_home("fr-gcrun");
+        let repo = tmp_repo("fr-gcrun-repo");
+        let lease = lease(&home, &repo, "fr-gcrun-agent", "feat/x").expect("lease");
+        let cand = GcCandidate {
+            path: lease.path.clone(),
+            agent: "fr-gcrun-agent".to_string(),
+            reason: "fr".to_string(),
+            kind: GcKind::ForceReclaim,
+        };
+        let result = gc_remove_one(&home, &cand);
+        assert!(
+            !result.removed,
+            "dirty force-reclaim must be skipped by the safe pre-check, not removed"
+        );
+        assert!(
+            lease.path.exists(),
+            "force-reclaim must route through the SAFE path — the OLD gc_run would have \
+             force-removed this dirty worktree (data loss)"
         );
         let _ = std::fs::remove_dir_all(&home);
     }
