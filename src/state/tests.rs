@@ -2653,6 +2653,103 @@ fn boundary_plain_quote_above_red_error_still_fires() {
     );
 }
 
+// ── t-coloranchor-remove-ratelimit: RateLimit/ServerRateLimit CONTENT anchor ──
+// Operator-approved after the corpus gate: these two now gate on `in_error_line`
+// (error-line shape) instead of the #1450 RED anchor, so a real fault rendered
+// PLAIN/grey (codex/gemini net errors, or any error-line-shaped line) FIRES, and
+// the prose FP classes still suppress because they lack the `…error:` label.
+// ContextFull / ModelUnsupported KEEP the red anchor (see the two tests below).
+
+/// ServerRateLimit: a real error line rendered PLAIN (no red, fg mask present)
+/// now FIRES via the content anchor — pre-change the red anchor suppressed it
+/// (the #1450/#1757 net-error stuck-agent class, now the general rule).
+#[test]
+fn srl_plain_error_line_fires_via_content_anchor() {
+    let (mut vt, mut st) = claude_tracker();
+    drive_plain_line(&mut vt, &mut st, SRL_LINE);
+    assert_eq!(
+        st.get_state(),
+        AgentState::ServerRateLimit,
+        "plain (grey) ServerRateLimit on an error-line-shaped line must fire via \
+         the in_error_line content anchor (no red required)"
+    );
+}
+
+/// RateLimit: a claude 429-rejection error rendered PLAIN fires via content.
+#[test]
+fn rate_limit_plain_error_line_fires_via_content_anchor() {
+    let (mut vt, mut st) = claude_tracker();
+    drive_plain_line(
+        &mut vt,
+        &mut st,
+        "API Error: Request rejected (429) · this may be a temporary capacity issue",
+    );
+    assert_eq!(st.get_state(), AgentState::RateLimit);
+}
+
+/// The content anchor still rejects a plain line with NO error-label — the prose
+/// FP class — pinned against the new gate (the inner phrase quoted without the
+/// `API Error:` wrapper is not error-line-shaped).
+#[test]
+fn srl_plain_prose_without_error_label_still_suppressed() {
+    let (mut vt, mut st) = claude_tracker();
+    drive_plain_line(
+        &mut vt,
+        &mut st,
+        "note: Server is temporarily limiting requests is the phrase we detect",
+    );
+    assert_ne!(
+        st.get_state(),
+        AgentState::ServerRateLimit,
+        "prose without an error-label must stay suppressed under the content anchor"
+    );
+}
+
+/// ContextFull KEEPS the red anchor (no fixture corpus to prove a content path):
+/// a plain ContextFull line does NOT fire; the same line in red does.
+#[test]
+fn context_full_still_requires_red_anchor() {
+    let line = "context window is full, compacting";
+    let (mut vt, mut st) = claude_tracker();
+    drive_plain_line(&mut vt, &mut st, line);
+    assert_ne!(
+        st.get_state(),
+        AgentState::ContextFull,
+        "plain ContextFull (no red) must stay suppressed — it keeps the red anchor"
+    );
+    let (mut vt2, mut st2) = claude_tracker();
+    drive_colored_line(&mut vt2, &mut st2, RED_16, line);
+    assert_eq!(
+        st2.get_state(),
+        AgentState::ContextFull,
+        "red ContextFull must fire (anchor unchanged)"
+    );
+}
+
+/// ModelUnsupported KEEPS the red anchor (never auto-clears + suppresses
+/// hang-check, so a verbatim-quote FP would silently disable a healthy agent):
+/// a plain codex line does NOT fire; red does.
+#[test]
+fn model_unsupported_still_requires_red_anchor() {
+    let line = "stream error: invalid_request_error: model is not supported";
+    let mut vt = VTerm::new(120, 24);
+    let mut st = StateTracker::new(Some(&Backend::Codex));
+    drive_plain_line(&mut vt, &mut st, line);
+    assert_ne!(
+        st.get_state(),
+        AgentState::ModelUnsupported,
+        "plain ModelUnsupported (no red) must stay suppressed — it keeps the red anchor"
+    );
+    let mut vt2 = VTerm::new(120, 24);
+    let mut st2 = StateTracker::new(Some(&Backend::Codex));
+    drive_colored_line(&mut vt2, &mut st2, RED_16, line);
+    assert_eq!(
+        st2.get_state(),
+        AgentState::ModelUnsupported,
+        "red ModelUnsupported must fire (anchor unchanged)"
+    );
+}
+
 // ── Backend opt-out: Shell fails the anchor open (pre-#919 behavior) ─
 #[test]
 fn anchor_backend_opt_out_for_shell() {

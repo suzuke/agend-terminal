@@ -29,25 +29,13 @@ use regex::Regex;
 // copy), keeping byte-identity with the legacy compile_for arm that also uses it.
 pub(crate) const SERVER_RATE_LIMIT_NET_ERRORS: &str = r"ECONNRESET|ETIMEDOUT|InvalidHTTPResponse|fetch failed|connection reset|socket hang up|proxy.*disconnect";
 
-/// #1757: is `matched` one of the [`SERVER_RATE_LIMIT_NET_ERRORS`] tokens?
-///
-/// These hard network faults are rendered in DEFAULT/grey (not red) by codex /
-/// gemini (observed `span_fg=[Default,...]` for `InvalidHTTPResponse` /
-/// `ECONNRESET`), so the #1450 red anchor wrongly suppressed REAL faults → no
-/// `ServerRateLimit` transition → no auto-retry → stuck agent (worst when the
-/// operator is away). The anchor exempts these tokens (fails open like the
-/// empty-`fg` / `Shell` paths). Scoped on purpose: the FP-prone
-/// `api_error`/`overloaded`/context HIGH_FP tokens STAY red-anchored. The
-/// residual net-error FP (these tokens can appear in source/logs/prose — e.g. an
-/// agent viewing THIS file) is bounded by the #1518 live-tail gate, #1586, and
-/// the #1760 nudge cap, so the cost asymmetry (severe stuck-agent vs rare,
-/// self-correcting spurious `continue`) favors the exemption.
-pub(crate) fn is_net_error_match(matched: &str) -> bool {
-    use std::sync::OnceLock;
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(SERVER_RATE_LIMIT_NET_ERRORS).expect("net-error regex compiles"))
-        .is_match(matched)
-}
+// #1757's `is_net_error_match` red-anchor EXEMPTION was removed by
+// t-coloranchor-remove-ratelimit: ServerRateLimit now uses the general content
+// anchor (`in_error_line`) instead of the red anchor, so the net-error special
+// case (net faults render grey → exempt from red) is subsumed — a grey net-error
+// on an error-line-shaped line latches via content, and a bare prose mention is
+// suppressed by content + #1518 position. The shared const above stays: it is
+// still the ServerRateLimit DETECTION pattern (backend_profile + compile_for).
 
 /// Does some on-screen occurrence of `matched` sit in a real backend ERROR LINE
 /// (vs a bare prose/source mention of the same token)?

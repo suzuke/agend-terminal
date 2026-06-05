@@ -315,7 +315,13 @@ fn oscillation_guard_window() -> Duration {
     Duration::from_secs(secs)
 }
 
-/// HIGH_FP states require the red-SGR anchor before transitioning.
+/// HIGH_FP states: FP-prone error states whose markers appear in dialectic prose
+/// / JSON dumps, so they get the extra FP defenses (the #1518 position gate + the
+/// #1769 working-marker override + an anchor gate). The ANCHOR gate splits by
+/// [`requires_red_anchor`] — RateLimit/ServerRateLimit now use a content anchor
+/// (`in_error_line`), only ContextFull/ModelUnsupported still require red. This
+/// predicate stays the full set because position + working-marker apply to all
+/// four regardless of which anchor regime they use.
 /// Per #919 spike + dev-2 cross-audit:
 /// - ServerRateLimit / RateLimit: server-side throttle alternations
 ///   include `api_error|timeout_error|overloaded_error` etc which
@@ -335,6 +341,25 @@ fn is_high_fp_state(state: AgentState) -> bool {
             // hang-check, so a FP would silently disable a healthy agent — the
             // anchor is the FP boundary.
             | AgentState::ModelUnsupported
+    )
+}
+
+/// t-coloranchor-remove-ratelimit (operator-approved after the corpus gate):
+/// which HIGH_FP states still require the #1450 RED-SGR anchor vs the content
+/// anchor (`in_error_line`).
+///
+/// - **`true`** — ContextFull, ModelUnsupported: keep RED. ContextFull has no
+///   fixture corpus to prove a content path; ModelUnsupported never auto-clears
+///   AND suppresses hang-check, so a verbatim-quote FP would silently disable a
+///   healthy agent (the anchor is the FP boundary, #1634).
+/// - **`false`** — RateLimit, ServerRateLimit: content anchor instead. The corpus
+///   gate proved content+position+working-marker preserves detection (5/5 prose
+///   suppressed, FN-covered incl. kiro via #1789), and the residual verbatim-quote
+///   FP self-corrects because both states auto-clear + are retry-driven.
+fn requires_red_anchor(state: AgentState) -> bool {
+    matches!(
+        state,
+        AgentState::ContextFull | AgentState::ModelUnsupported
     )
 }
 
@@ -799,29 +824,37 @@ impl StateTracker {
             match patterns.detect_with_match(screen_text) {
                 Some((detected, matched)) => {
                     let high_fp = is_high_fp_state(detected);
-                    // #1450 red anchor: a HIGH_FP marker needs at least one red
-                    // rendered cell, else it's prose ("Error: ...") not a state.
-                    let anchor_fail = self.anchor_on_red
-                        && high_fp
-                        && !fg.is_empty()
-                        // #1757: exempt hard network errors from the red anchor —
-                        // codex/gemini render `InvalidHTTPResponse`/`ECONNRESET`/…
-                        // in DEFAULT/grey (not red), so the anchor wrongly
-                        // suppressed REAL faults → no ServerRateLimit transition →
-                        // no auto-retry → stuck agent. Scoped: the FP-prone
-                        // api_error/overloaded/context HIGH_FP tokens stay
-                        // red-anchored.
-                        // #1768: NARROW that exemption to the token's LINE looking
-                        // like a real backend error line (`Error:`/`API Error:`/
-                        // `FetchError:` label) — a bare prose/source mention (an
-                        // orchestrator discussing net-errors, idle between turns,
-                        // with no working-marker below) stays red-anchored →
-                        // default-rendered → suppressed, instead of mis-latching
-                        // ServerRateLimit (the retry-storm FP codex caught). A real
-                        // fault IS error-line-shaped → still fails open → latches.
-                        && !(crate::state::patterns::is_net_error_match(matched)
-                            && crate::state::patterns::in_error_line(screen_text, matched))
-                        && !matched_span_has_red(screen_text, matched, fg);
+                    // Anchor gate — two regimes (t-coloranchor-remove-ratelimit,
+                    // operator-approved after the corpus gate's go/no-go):
+                    //
+                    // - **`requires_red_anchor`** {ContextFull, ModelUnsupported}:
+                    //   keep the #1450 RED anchor — a marker needs ≥1 red rendered
+                    //   cell, else it's prose not a state. ContextFull has no
+                    //   corpus to prove a content path; ModelUnsupported never
+                    //   auto-clears AND suppresses hang-check, so a verbatim-quote
+                    //   FP would silently disable a healthy agent (cost too high).
+                    //
+                    // - **content-anchor** {RateLimit, ServerRateLimit}: the marker
+                    //   must sit on an error-line-shaped line (`in_error_line`) —
+                    //   corpus-proven safe (5/5 prose suppressed via pattern-narrow
+                    //   + #1518 position + #1769 working-marker; FN-covered incl.
+                    //   kiro `ThrottlingException` via #1789). NO red required, so a
+                    //   real fault rendered in DEFAULT/grey (codex/gemini net
+                    //   errors) latches — the old #1757 net-error red-exemption is
+                    //   now the GENERAL rule, not a special case. The residual
+                    //   verbatim-quote FP (an agent pasting a real error line into
+                    //   the live tail with no working-marker below) is ACCEPTED for
+                    //   these two: both auto-clear and are retry-driven, so a
+                    //   one-off mis-latch self-corrects (unlike ModelUnsupported).
+                    let anchor_fail = if requires_red_anchor(detected) {
+                        self.anchor_on_red
+                            && !fg.is_empty()
+                            && !matched_span_has_red(screen_text, matched, fg)
+                    } else if high_fp {
+                        !crate::state::patterns::in_error_line(screen_text, matched)
+                    } else {
+                        false
+                    };
                     // #1518 position gate: a HIGH_FP marker that has scrolled out
                     // of the live bottom-N rows (e.g. an ApiError / ServerRateLimit
                     // line pushed up by the post-recovery `continue` output) is
