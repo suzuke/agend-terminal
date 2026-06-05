@@ -509,11 +509,19 @@ pub(crate) fn pending_for_instance(
     (as_dispatcher, as_target)
 }
 
-/// #1694② silence-clock: should the dispatch-idle nudge be SUPPRESSED for
-/// `target`? Replaces the #1516 instantaneous `thinking`/`tool_use` state check
-/// with two more-robust conditions read from the fleet snapshot:
+/// #1694② silence-clock + #1516 state gate: should the dispatch-idle nudge be
+/// SUPPRESSED for `target`? Suppresses when ANY of three snapshot-read signals
+/// says the agent is working (fire only when NONE hold):
 ///
-/// 1. **active-recovery exempt** — `agent_state == server_rate_limit` ONLY: a
+/// 1. **instantaneous working state** — `agent_state ∈ {thinking, tool_use}`: a
+///    long LOCAL tool_use (e.g. a 9-min `Bash` run) produces NO pane marker and
+///    NO MCP heartbeat, so its `silent_secs` climbs past the window even though it
+///    is plainly working — the silence clock alone (#1775) false-fired on it.
+///    This instantaneous state covers that gap. A genuinely HUNG thinking/tool_use
+///    is NOT dispatch-idle's job: `health::productive_silence_exceeds` flags it
+///    Hung at silent>600s and the hang_detector owns that recovery path, so
+///    treating these as "working" here cannot hide a real stuck.
+/// 2. **active-recovery exempt** — `agent_state == server_rate_limit` ONLY: a
 ///    rate-limited agent is in a bounded retry-backoff wait (#1696) whose
 ///    exhaustion (12 retries → #1744 escalation) is its own stuck-backstop, so
 ///    suppressing the idle nudge avoids noise in a legit wait without hiding a
@@ -523,14 +531,14 @@ pub(crate) fn pending_for_instance(
 ///    a wedged api_error agent (hang_detector misses it: no BlockedReason →
 ///    IdleLong, not Hung). Exempting it would silence a real stuck forever
 ///    (codex #1775 HIGH).
-/// 2. **productive-silence gate** — `silent_secs < silence_threshold_secs`: the
+/// 3. **productive-silence gate** — `silent_secs < silence_threshold_secs`: the
 ///    agent has produced *productive* output (marker/heartbeat-gated, so a
 ///    spinner / junk / cursor-blink does NOT count) within the window, i.e. it is
-///    making progress, just slow. A genuinely wedged agent stops producing
-///    productive output, its `silent_secs` climbs past the window, and the gate
-///    releases → the watchdog fires. This subsumes the old thinking/tool_use
-///    check (a thinking agent that's actually producing has low `silent_secs`)
-///    while ALSO catching a stuck agent whose latched state never flipped.
+///    making progress, just slow. This catches the #1516 momentary-not-thinking
+///    case — an agent producing output whose snapshot state isn't thinking at the
+///    scan instant. (It does NOT subsume condition 1: a long local tool_use
+///    produces no pane/heartbeat output, so its `silent_secs` is high — hence the
+///    instantaneous-state OR above.)
 ///
 /// Pure for testability. Unknown target / missing snapshot → `false` (don't
 /// suppress → fire; degrades to the pre-#1516 fail-open, never worse). The
@@ -544,12 +552,22 @@ fn target_is_working(
     snapshot
         .and_then(|s| s.agents.iter().find(|a| a.name == target))
         .map(|a| {
-            // active-recovery exempt — ONLY `server_rate_limit` (bounded retry
-            // with a #1744 exhaustion backstop). `api_error` is intentionally
-            // excluded: no exhaustion signal owns it, so dispatch-idle must stay
-            // its watchdog or a wedged api_error agent goes silent forever
-            // (codex #1775 HIGH). See the fn doc for the full rationale.
-            a.agent_state.as_str() == "server_rate_limit" || a.silent_secs < silence_threshold_secs
+            // Working = instantaneous-working state OR active-recovery OR
+            // productive-silence. `thinking`/`tool_use` re-added (#1775's
+            // silence-clock dropped them) because a long LOCAL tool_use — e.g. a
+            // 9-min `Bash` run — emits NO pane marker and NO MCP heartbeat, so
+            // `silent_secs` climbs past the window and the silence clock alone
+            // false-fired on a plainly-working agent. A genuinely HUNG
+            // thinking/tool_use is NOT dispatch-idle's job: the hang_detector owns
+            // it (`health::productive_silence_exceeds` → Hung at silent>600s).
+            // active-recovery exempt = ONLY `server_rate_limit` (bounded retry +
+            // #1744 exhaustion backstop); `api_error` stays NON-exempt (no
+            // exhaustion signal owns it → dispatch-idle is its only watchdog,
+            // codex #1775 HIGH). See the fn doc for the full rationale.
+            matches!(
+                a.agent_state.as_str(),
+                "thinking" | "tool_use" | "server_rate_limit"
+            ) || a.silent_secs < silence_threshold_secs
         })
         .unwrap_or(false)
 }
@@ -2070,9 +2088,14 @@ mod tests {
             agents: vec![
                 // recently productive while NOT thinking/tool_use → still working
                 mk_agent_snapshot_silence("fresh_idle", "idle", 10),
-                // latched 'thinking' but productive-silent past the window → NOT
-                // working (the stuck-but-latched gap the old #1516 state gate missed)
-                mk_agent_snapshot_silence("stuck_thinking", "thinking", 700),
+                // #toolu-gap: a long LOCAL tool_use (9-min Bash) emits no pane
+                // marker / MCP heartbeat → silent_secs high, but agent_state is
+                // tool_use → WORKING. A hung one is the hang_detector's job
+                // (productive_silence_exceeds → Hung at silent>600s).
+                mk_agent_snapshot_silence("long_tool_use", "tool_use", 700),
+                // same for thinking: instantaneous-working → WORKING here; a hung
+                // thinking is the hang_detector's, not dispatch-idle's.
+                mk_agent_snapshot_silence("long_thinking", "thinking", 700),
                 // active-recovery exempt: ONLY server_rate_limit (bounded retry +
                 // #1744 exhaustion backstop) → silent but exempt
                 mk_agent_snapshot_silence("rate_limited", "server_rate_limit", 700),
@@ -2085,8 +2108,13 @@ mod tests {
             "recently productive (silent<threshold) → working even when not thinking"
         );
         assert!(
-            !target_is_working(Some(&snap), "stuck_thinking", T),
-            "productive-silent past window → not working, even latched 'thinking'"
+            target_is_working(Some(&snap), "long_tool_use", T),
+            "#toolu-gap: long local tool_use (silent past window, no pane/heartbeat) \
+             → WORKING (instantaneous state); hang_detector owns a genuinely hung one"
+        );
+        assert!(
+            target_is_working(Some(&snap), "long_thinking", T),
+            "thinking past window → WORKING (instantaneous state); hang_detector owns hung"
         );
         assert!(
             target_is_working(Some(&snap), "rate_limited", T),
@@ -2214,6 +2242,39 @@ mod tests {
             p.status,
             DispatchStatus::Pending,
             "sidecar stays pending (silence clock refreshed it)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #toolu-gap: a long LOCAL tool_use (e.g. a 9-min `Bash` run) emits no pane
+    /// marker / MCP heartbeat, so `silent_secs` climbs past the window — but the
+    /// agent is plainly WORKING (`agent_state=tool_use`). It must NOT fire (the
+    /// live noise dev-2 hit: `✻ Proofing… 9m`, not stuck, even shipped a PR). A
+    /// genuinely hung tool_use is the hang_detector's job, not dispatch-idle's.
+    #[test]
+    fn long_tool_use_silent_does_not_fire_toolu_gap() {
+        let home = tmp_home("silence-tooluse");
+        let issued = chrono::Utc::now() - chrono::Duration::seconds(800);
+        let id = write_pending_at(&home, "lead", "dev", Some("t-tu"), "task", 600, issued);
+        // tool_use AND productive-silent past the window (no pane/heartbeat output).
+        crate::snapshot::save(&home, &[mk_agent_snapshot_silence("dev", "tool_use", 700)]);
+
+        for _ in 0..DEBOUNCE_SCANS + 1 {
+            scan_and_emit(&home);
+        }
+
+        assert!(
+            crate::inbox::drain(&home, "lead").is_empty(),
+            "long tool_use (silent past window) must NOT fire — it is working, not stuck"
+        );
+        let p = list_pending(&home)
+            .into_iter()
+            .find(|p| p.dispatch_id == id)
+            .unwrap();
+        assert_eq!(
+            p.status,
+            DispatchStatus::Pending,
+            "sidecar stays pending (instantaneous tool_use state suppresses the nudge)"
         );
         std::fs::remove_dir_all(&home).ok();
     }
