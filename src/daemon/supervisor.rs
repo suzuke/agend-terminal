@@ -72,6 +72,19 @@ const RETRY_PHASE_C_START: u32 = 6;
 /// across the retry and ApiError-nudge paths (guards a ServerRateLimit↔ApiError
 /// state flicker from double-injecting).
 const CONTINUE_INJECT_MIN_INTERVAL: Duration = Duration::from_secs(5);
+/// ServerRateLimit recovery window: if the agent has produced PRODUCTIVE output
+/// (a `last_productive_output` bump — marker/heartbeat-gated, NOT the error
+/// re-render) within this window, it has recovered and the retry must NOT inject
+/// `continue` into it (and the track clears). This is the robust, position-
+/// INDEPENDENT recovery signal (same insight as the #1775/#1792 silence clock):
+/// the stale "Server is temporarily limiting" line re-latches ServerRateLimit in
+/// the tail and `working_state_below` (#1769) can't see a marker BELOW the
+/// most-recent error line, so the agent flickers Thinking↔ServerRateLimit and the
+/// Idle-only #1713 clear never fires — but `last_productive_output` stays fresh
+/// throughout, breaking the loop. 45s comfortably exceeds the 10s tick and the
+/// generation gaps between an agent's outputs while still firing fast for a truly
+/// wedged throttle (which produces nothing). Tunable 30–60s.
+const RECOVERY_SILENCE: Duration = Duration::from_secs(45);
 /// #1742: consecutive ServerRateLimit `continue`-inject FAILURES (agent still
 /// present, but the PTY write erred) tolerated before giving up. A single failure
 /// is treated as a transient PTY blip that self-heals, so the track is KEPT and
@@ -1469,7 +1482,17 @@ pub(crate) fn process_error_recovery(
         for handle in reg.values() {
             let name = handle.name.as_str();
             active_names.insert(name.to_string());
-            let state = handle.core.lock().state.current;
+            // Capture current state + productive-silence under one lock. The latter
+            // is the #ratelimit-recovery gate below: a recovered-but-still-latched
+            // ServerRateLimit agent that's producing output has fresh
+            // `last_productive_output`.
+            let (state, productive_silent) = {
+                let core = handle.core.lock();
+                (
+                    core.state.current,
+                    core.state.last_productive_output.elapsed(),
+                )
+            };
 
             // ── #1713 root-fix: ServerRateLimit retry — DECIDE with fresh state ──
             // The "should we inject this tick" decision lives HERE, under the lock,
@@ -1479,7 +1502,25 @@ pub(crate) fn process_error_recovery(
             // only EXECUTES the lock-free PTY inject for the names decided here. So a
             // track can never blind-fire `continue` into a non-error state (e.g. a
             // PermissionPrompt the agent reached after the throttle cleared).
-            if state == AgentState::ServerRateLimit {
+            if state == AgentState::ServerRateLimit && productive_silent < RECOVERY_SILENCE {
+                // #ratelimit-recovery: still latched ServerRateLimit (the stale
+                // "Server is temporarily limiting" line re-matches in the tail and
+                // working_state_below can't see a marker BELOW the most-recent error
+                // line — #1769's positional defeat), BUT the agent has produced
+                // productive output within RECOVERY_SILENCE → it RECOVERED and is
+                // working. Clear the track and do NOT inject. `last_productive_output`
+                // is position-independent, so it breaks the Thinking↔ServerRateLimit
+                // flicker that kept the Idle-only #1713 clear from ever firing (the
+                // live storm that wedged fixup-lead). A genuinely-throttled agent
+                // produces nothing → stays silent → the inject branch below fires.
+                if retry_tracks.remove(name).is_some() {
+                    tracing::info!(
+                        agent = %name,
+                        productive_silent_secs = productive_silent.as_secs(),
+                        "ServerRateLimit retry cleared — agent recovered (recent productive output)"
+                    );
+                }
+            } else if state == AgentState::ServerRateLimit {
                 let track = retry_tracks.entry(name.to_string()).or_insert_with(|| {
                     let delay = Duration::from_secs(SERVER_RATE_LIMIT_BACKOFF[0]);
                     tracing::info!(agent = %name, delay_secs = delay.as_secs(), "ServerRateLimit detected, scheduling retry (Phase A)");
@@ -2920,6 +2961,15 @@ instances:
             health: crate::health::HealthTracker::new(),
         }));
         core.lock().state.current = state;
+        // #ratelimit-recovery: default mock agents to STALE productive output — a
+        // realistic stuck/idle agent. `StateTracker::new` stamps
+        // `last_productive_output = now()`, but a ServerRateLimit-retry test models
+        // a wedged-throttle agent that has produced nothing; the gate
+        // (`productive_silent >= RECOVERY_SILENCE`) would otherwise treat every mock
+        // as freshly-recovered. The recovery test overrides this back to fresh.
+        core.lock().state.last_productive_output = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(3600))
+            .unwrap_or_else(std::time::Instant::now);
         let handle = crate::agent::AgentHandle {
             id: crate::types::InstanceId::default(),
             name: name.to_string().into(),
@@ -2965,6 +3015,63 @@ instances:
         );
         assert_eq!(tracks["test-agent"].retry_count, 0);
         assert!(!tracks["test-agent"].exhausted);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #ratelimit-recovery (the live storm that wedged fixup-lead): an agent still
+    /// LATCHED ServerRateLimit (the stale "Server is temporarily limiting" line
+    /// re-matches in the tail, and `working_state_below` can't see a marker BELOW
+    /// the most-recent error line) but that has produced PRODUCTIVE output within
+    /// RECOVERY_SILENCE has recovered — its retry track must be CLEARED and NO
+    /// `continue` injected. `last_productive_output` is position-independent, so it
+    /// breaks the Thinking↔ServerRateLimit flicker the Idle-only #1713 clear missed.
+    #[test]
+    fn server_rate_limit_recent_productive_output_clears_and_skips_inject() {
+        let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = tmp_home("srl-recovered");
+        // Pre-arm an in-flight retry track (a ServerRateLimit episode already running).
+        let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
+        tracks.insert(
+            "test-agent".to_string(),
+            RateLimitRetry {
+                retry_count: 2,
+                next_retry_at: Instant::now(),
+                exhausted: false,
+                inject_failures: 0,
+            },
+        );
+        let mut last_inject: HashMap<String, Instant> = HashMap::new();
+
+        let (handle, _reader) =
+            mock_agent_handle("test-agent", crate::state::AgentState::ServerRateLimit);
+        // Recovered: produced productive output just now (< RECOVERY_SILENCE),
+        // overriding mock_agent_handle's stale default.
+        handle.core.lock().state.last_productive_output = Instant::now();
+        registry.lock().insert(handle.id, handle);
+
+        // Several ticks (the live flicker) — must never re-arm + inject.
+        for _ in 0..3 {
+            super::process_error_recovery(
+                &home,
+                &registry,
+                &mut tracks,
+                &mut Default::default(),
+                &mut Default::default(),
+                &mut last_inject,
+                past_boot_grace(),
+            );
+        }
+
+        assert!(
+            !tracks.contains_key("test-agent"),
+            "#ratelimit-recovery: a recently-productive ServerRateLimit agent's retry \
+             track must be cleared (recovered), not maintained/re-armed"
+        );
+        assert!(
+            !last_inject.contains_key("test-agent"),
+            "#ratelimit-recovery: no `continue` may be injected into a recovered \
+             (recently-productive) agent — that was the live storm"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
