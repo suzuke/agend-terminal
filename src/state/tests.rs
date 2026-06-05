@@ -3387,6 +3387,21 @@ fn in_error_line_matches_corpus_errors_rejects_prose_step1() {
         ("{\"reason\": \"rateLimitExceeded\"}", "rateLimitExceeded"),
         ("{\"type\": \"error\", \"message\": \"x\"}", "error"),
         ("Error: token limit exceeded", "token limit"),
+        // t-coloranchor-corpus-gate: kiro RateLimit — the one color-gated content
+        // FN the rg-on-fixture check found. Needs the new `\w*exception` label
+        // (`Exception` has no `error` substring; the line carries no 429/JSON).
+        (
+            "ThrottlingException: Rate exceeded for this AWS account",
+            "ThrottlingException",
+        ),
+        // codex RateLimit — already covered by the existing `\w*error:` via the
+        // verified `stream error:` wrapper (cf. codex-model-unsupported fixture)
+        // and by the `RateLimitError:` token; pinned here to lock that coverage.
+        (
+            "stream error: rate_limit_exceeded: retry after 60s",
+            "rate_limit_exceeded",
+        ),
+        ("RateLimitError: 429 Too Many Requests", "RateLimitError"),
     ];
     for (line, tok) in real {
         assert!(
@@ -3407,6 +3422,18 @@ fn in_error_line_matches_corpus_errors_rejects_prose_step1() {
             "ECONNRESET",
         ),
         ("see issue 4290 for details", "4290"),
+        // t-coloranchor-corpus-gate: the new `\w*exception` label requires a
+        // trailing `:`/`?` — a bare prose mention with no label stays prose, and
+        // the bare `Rate exceeded` / `rate_limit_exceeded` phrases are NOT in the
+        // regex (prose-ambiguous, #848/#854 class).
+        (
+            "we keep hitting a ThrottlingException in prod lately",
+            "ThrottlingException",
+        ),
+        (
+            "discussing the rate_limit_exceeded code path in state.rs",
+            "rate_limit_exceeded",
+        ),
     ];
     for (line, tok) in prose {
         assert!(
