@@ -323,11 +323,11 @@ fn run_loop(
     // sub-minute fire-time accuracy. No new spawn site — supervisor's
     // per-tick loop hosts the scan.
     let mut dispatch_idle_tracker = crate::daemon::dispatch_idle::DispatchIdleTracker::default();
-    // PR1 watchdog L2: fixup-team-specific auto-nudge on exceeded
-    // dispatches. Same cadence as L1; hard-coded for fixup until a
-    // second team requests its own policy (L2.1 schema bump).
-    let mut dispatch_idle_fixup_nudge_tracker =
-        crate::daemon::dispatch_idle::fixup_nudge::DispatchIdleFixupNudgeTracker::default();
+    // PR1 watchdog L2: generic per-team auto-nudge on exceeded dispatches. Same
+    // cadence as L1; fires for ANY team (t-dehardcode-fixup-nudge-multiteam — was
+    // hard-coded to the fixup team).
+    let mut dispatch_idle_nudge_tracker =
+        crate::daemon::dispatch_idle::team_nudge::DispatchIdleNudgeTracker::default();
     let mut retention_supervisor = crate::daemon::retention::RetentionSupervisor::default();
     // #1741 boot-grace anchor: this Instant ≈ supervisor/daemon boot (set once,
     // never reset). It gates the every-tick pane-input diagnostic so a restart's
@@ -375,7 +375,7 @@ fn run_loop(
             canonical_drift_tracker.maybe_scan(&home);
             auto_release_tracker.maybe_scan(&home);
             dispatch_idle_tracker.maybe_scan(&home);
-            dispatch_idle_fixup_nudge_tracker.maybe_scan(&home);
+            dispatch_idle_nudge_tracker.maybe_scan(&home);
             retention_supervisor.maybe_sweep(&home);
             // #1002 Phase 2: pr_state per-tick scan must run here so APP
             // mode (`agend-terminal app`) drives the #972 aggregator + #986
