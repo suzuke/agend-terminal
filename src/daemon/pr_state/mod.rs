@@ -814,6 +814,11 @@ pub fn record_verdict(
         }
         matched_any = true;
         let repo = state.repo.clone();
+        let label = verdict_label(&kind);
+        // #2 (t-verdict-to-author-routing): capture the verdict notification under
+        // the flock, enqueue it AFTER `with_pr_state` returns (self-IPC safety —
+        // mirrors the scanner's #1629 deferred-emit pattern).
+        let mut pending_notify: Option<(String, crate::inbox::InboxMessage)> = None;
         if let Err(e) = with_pr_state(home, &repo, &branch, |s| {
             apply(
                 s,
@@ -823,6 +828,22 @@ pub fn record_verdict(
                     kind,
                 },
             );
+            // Surface the verdict to the author UNLESS it already made the PR
+            // merge-ready — in that case the scanner's [pr-ready-for-merge] covers
+            // it (no double-notify). REJECTED/UNVERIFIED never reach merge-ready,
+            // so they always notify (the author must learn they need to fix).
+            if !is_merge_ready(s) {
+                let recipient = resolve_notify_recipient(home, s);
+                let body = format_verdict_body(s, reviewer, label);
+                let msg = crate::inbox::InboxMessage::new_system(
+                    "system:pr-state",
+                    "review-verdict",
+                    body,
+                )
+                .with_correlation_id(format!("{}@{}", s.repo, s.branch))
+                .with_reviewed_head(s.head_sha.clone());
+                pending_notify = Some((recipient, msg));
+            }
         }) {
             tracing::warn!(
                 repo = %repo,
@@ -830,6 +851,18 @@ pub fn record_verdict(
                 error = %e,
                 "#972 pr_state: record_verdict save failed"
             );
+        }
+        // Enqueue OUTSIDE the with_pr_state flock (self-IPC via loopback api::call).
+        if let Some((recipient, msg)) = pending_notify {
+            if let Err(e) = crate::inbox::enqueue_with_idle_hint(home, &recipient, msg) {
+                tracing::warn!(
+                    repo = %repo,
+                    branch = %branch,
+                    recipient = %recipient,
+                    error = %e,
+                    "#2 review-verdict notify enqueue failed"
+                );
+            }
         }
     }
     if !matched_any {
@@ -862,6 +895,45 @@ pub fn resolve_author(state: &PrState) -> String {
          fixup-lead fallback (gh-poll may not have run yet)"
     );
     "fixup-lead".to_string()
+}
+
+/// t-verdict-to-author-routing-design (#2): resolve the AGENT to notify for an
+/// author-facing pr-state signal (`[review-verdict]`, `[pr-ready-for-merge]`).
+///
+/// BINDING-first (shared-account-proof, reusing PR-3 #1799): the fleet shares one
+/// GitHub account, so `resolve_author`'s gh-login chain can mis-route (and its
+/// last resort is a hard-coded `"fixup-lead"`). The agent BOUND to the branch is
+/// the dispatchee/author who is waiting; resolve that first, then fall back to the
+/// existing `resolve_author` chain (`pr_author` → `subscribers[0]` → `fixup-lead`)
+/// unchanged. The binding lookup is a plain FS read (no flock / subprocess), so it
+/// is safe inside a `with_pr_state` closure.
+pub fn resolve_notify_recipient(home: &Path, state: &PrState) -> String {
+    crate::binding::scan_existing_branch_binding(home, &state.branch, "")
+        .unwrap_or_else(|| resolve_author(state))
+}
+
+/// t-verdict-to-author-routing-design (#2): the wire label for a verdict kind.
+fn verdict_label(kind: &VerdictKind) -> &'static str {
+    match kind {
+        VerdictKind::Verified => "VERIFIED",
+        VerdictKind::Rejected { .. } => "REJECTED",
+        VerdictKind::Unverified => "UNVERIFIED",
+    }
+}
+
+/// t-verdict-to-author-routing-design (#2): the `[review-verdict]` body surfaced
+/// to the author when a verdict lands but the PR is not (yet) merge-ready.
+fn format_verdict_body(state: &PrState, reviewer: &str, label: &str) -> String {
+    let pr_id = if state.pr_number > 0 {
+        format!("{}@{} (PR #{})", state.repo, state.branch, state.pr_number)
+    } else {
+        format!("{}@{}", state.repo, state.branch)
+    };
+    let mut body = format!("[review-verdict] {pr_id}: {label} by {reviewer}");
+    if label == "REJECTED" {
+        body.push_str(" — fix and re-push");
+    }
+    body
 }
 
 /// Build the `[pr-ready-for-merge]` event body. Pulled out for
@@ -2074,6 +2146,226 @@ mod tests {
         );
         assert!(logs_contain("gate A"), "trace must identify gate A by name");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // ─── #2 t-verdict-to-author-routing: verdict → author notification ───
+
+    fn verdict_home(tag: &str) -> std::path::PathBuf {
+        let home =
+            std::env::temp_dir().join(format!("agend-verdict-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").unwrap();
+        home
+    }
+
+    fn seed_task_with_branch(home: &Path, id: &str, branch: &str) {
+        use crate::task_events::{append, InstanceName, TaskEvent, TaskId};
+        append(
+            home,
+            &InstanceName::from("test:lead"),
+            TaskEvent::Created {
+                task_id: TaskId(id.into()),
+                title: "t".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: None,
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: Some(branch.into()),
+                bind: None,
+                eta_secs: None,
+                tags: vec![],
+                parent_id: None,
+            },
+        )
+        .expect("seed task");
+    }
+
+    fn bind_author(home: &Path, agent: &str, branch: &str) {
+        let dir = crate::paths::runtime_dir(home).join(agent);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("binding.json"),
+            serde_json::to_string(&serde_json::json!({
+                "version": 1, "agent": agent, "task_id": "t",
+                "branch": branch, "worktree": "/tmp/wt",
+                "source_repo": "owner/repo", "issued_at": "2026-06-05T00:00:00Z",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Write a pr-state for ("owner/repo", branch) at `head`. `green` makes CI
+    /// green+aligned. `pr_author` is set to a gh login ("suzuke") to prove the
+    /// binding resolution beats it under a shared account.
+    fn write_verdict_state(home: &Path, branch: &str, head: &str, green: bool) {
+        let mut s = new_for_branch("owner/repo", branch, head, ReviewClass::Single);
+        s.pr_author = "suzuke".to_string();
+        if green {
+            s.ci_state = CiState::Green {
+                sha: head.to_string(),
+                observed_at: "2026-06-05T00:00:00Z".to_string(),
+            };
+        }
+        save(home, &s).unwrap();
+    }
+
+    fn has_verdict_msg(home: &Path, agent: &str) -> Option<String> {
+        crate::inbox::drain(home, agent)
+            .into_iter()
+            .find(|m| m.text.contains("[review-verdict]"))
+            .map(|m| m.text)
+    }
+
+    #[test]
+    fn verdict_verified_not_merge_ready_notifies_bound_author() {
+        let home = verdict_home("verified-notready");
+        seed_task_with_branch(&home, "t-v", "feat/x");
+        bind_author(&home, "dev-x", "feat/x");
+        write_verdict_state(&home, "feat/x", "headsha", false); // CI pending → not merge-ready
+        record_verdict(
+            &home,
+            "t-v",
+            "fixup-reviewer",
+            Some("headsha"),
+            VerdictKind::Verified,
+        );
+        let txt = has_verdict_msg(&home, "dev-x");
+        assert!(
+            txt.as_deref()
+                .is_some_and(|t| t.contains("VERIFIED by fixup-reviewer")),
+            "VERIFIED-not-merge-ready must notify the bound author: {txt:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn verdict_verified_merge_ready_does_not_double_notify() {
+        let home = verdict_home("verified-ready");
+        seed_task_with_branch(&home, "t-v", "feat/x");
+        bind_author(&home, "dev-x", "feat/x");
+        write_verdict_state(&home, "feat/x", "headsha", true); // green + aligned
+        record_verdict(
+            &home,
+            "t-v",
+            "fixup-reviewer",
+            Some("headsha"),
+            VerdictKind::Verified,
+        );
+        assert!(
+            has_verdict_msg(&home, "dev-x").is_none(),
+            "VERIFIED that becomes merge-ready must NOT emit [review-verdict] \
+             (dedup — the scanner sends [pr-ready-for-merge])"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn verdict_rejected_notifies_author_with_fix_hint() {
+        let home = verdict_home("rejected");
+        seed_task_with_branch(&home, "t-r", "feat/x");
+        bind_author(&home, "dev-x", "feat/x");
+        // Even green: REJECTED never reaches merge-ready, so it always notifies.
+        write_verdict_state(&home, "feat/x", "headsha", true);
+        record_verdict(
+            &home,
+            "t-r",
+            "fixup-reviewer",
+            Some("headsha"),
+            VerdictKind::Rejected { reason: None },
+        );
+        let txt = has_verdict_msg(&home, "dev-x");
+        assert!(
+            txt.as_deref().is_some_and(
+                |t| t.contains("REJECTED by fixup-reviewer") && t.contains("fix and re-push")
+            ),
+            "REJECTED must notify the author with the fix hint: {txt:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn verdict_unverified_notifies_author() {
+        let home = verdict_home("unverified");
+        seed_task_with_branch(&home, "t-u", "feat/x");
+        bind_author(&home, "dev-x", "feat/x");
+        write_verdict_state(&home, "feat/x", "headsha", false);
+        record_verdict(
+            &home,
+            "t-u",
+            "fixup-reviewer",
+            Some("headsha"),
+            VerdictKind::Unverified,
+        );
+        let txt = has_verdict_msg(&home, "dev-x");
+        assert!(
+            txt.as_deref().is_some_and(|t| t.contains("UNVERIFIED")),
+            "UNVERIFIED must notify the author: {txt:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn verdict_recipient_is_bound_agent_not_fixup_lead_or_gh_login() {
+        let home = verdict_home("recipient");
+        seed_task_with_branch(&home, "t-rec", "feat/x");
+        bind_author(&home, "dev-x", "feat/x");
+        write_verdict_state(&home, "feat/x", "headsha", false); // pr_author="suzuke"
+        record_verdict(
+            &home,
+            "t-rec",
+            "fixup-reviewer",
+            Some("headsha"),
+            VerdictKind::Verified,
+        );
+        assert!(
+            has_verdict_msg(&home, "dev-x").is_some(),
+            "the BOUND agent must receive the verdict"
+        );
+        assert!(
+            has_verdict_msg(&home, "fixup-lead").is_none(),
+            "fixup-lead must NOT receive it (binding beats the resolve_author fallback)"
+        );
+        assert!(
+            has_verdict_msg(&home, "suzuke").is_none(),
+            "the gh-login pr_author must NOT receive it under a shared account"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn pr_ready_for_merge_routes_to_bound_agent_gap_c() {
+        let home = verdict_home("prready-recipient");
+        seed_task_with_branch(&home, "t-p", "feat/x");
+        bind_author(&home, "dev-x", "feat/x");
+        write_verdict_state(&home, "feat/x", "headsha", true); // green, pr_author="suzuke"
+                                                               // record VERIFIED → merge_state becomes MergeReady (no [review-verdict] — dedup).
+        record_verdict(
+            &home,
+            "t-p",
+            "fixup-reviewer",
+            Some("headsha"),
+            VerdictKind::Verified,
+        );
+        // The scanner emits [pr-ready-for-merge] for the merge-ready state.
+        let poller = MockGhPoller::new(vec![Ok(vec![])]);
+        scan_and_emit_with(&home, &empty_registry(), &poller);
+        assert!(
+            crate::inbox::drain(&home, "dev-x")
+                .iter()
+                .any(|m| m.text.contains("[pr-ready-for-merge]")),
+            "[pr-ready-for-merge] must route to the BOUND agent (Gap C)"
+        );
+        assert!(
+            !crate::inbox::drain(&home, "suzuke")
+                .iter()
+                .any(|m| m.text.contains("[pr-ready-for-merge]")),
+            "[pr-ready-for-merge] must NOT route to the gh-login pr_author"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 
     // ─── #1017 startup-replay suppression ─────────────────────────────

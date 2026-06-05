@@ -2,8 +2,8 @@ use std::path::Path;
 
 use super::gh_poll;
 use super::{
-    apply, format_ready_body, pr_state_dir, remove, resolve_author, with_pr_state, DraftState,
-    Event, MergeState, PrState,
+    apply, format_ready_body, pr_state_dir, remove, resolve_author, resolve_notify_recipient,
+    with_pr_state, DraftState, Event, MergeState, PrState,
 };
 
 enum ScanAction {
@@ -89,7 +89,10 @@ pub fn scan_and_emit_with(
             if matches!(state.merge_state, MergeState::MergeReady)
                 && state.ready_emitted_for_sha.as_deref() != Some(state.head_sha.as_str())
             {
-                let author = resolve_author(state);
+                // #2 (t-verdict-to-author-routing) Gap C: route to the BINDING-
+                // resolved author (shared-account-proof), not `resolve_author`'s
+                // gh-login chain whose last resort is a hard-coded "fixup-lead".
+                let author = resolve_notify_recipient(home, state);
                 let body = format_ready_body(state);
                 let msg = build_event_message("pr-ready-for-merge", &author, state, body);
                 // #1629: defer the enqueue (see top of fn). Set the dedup flag
