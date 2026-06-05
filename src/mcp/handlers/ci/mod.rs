@@ -1150,6 +1150,27 @@ fn verify_merge_landed(repo: &str, pr: u64) -> MergeVerdict {
     last
 }
 
+/// #base-drift: pure decision — should GitHub's `mergeStateStatus` REFUSE the
+/// merge? `BEHIND` (PR base behind main → an `--admin` squash lands a
+/// phantom-reversion diff, dev-2 #1798) and `DIRTY` (conflicts) refuse;
+/// everything else (CLEAN / UNSTABLE / BLOCKED / UNKNOWN / empty) proceeds —
+/// fail-OPEN, because GitHub may still be computing mergeability and we must not
+/// block a real merge on a transient (#813 pattern). Returns `Some((why, hint))`
+/// to refuse, `None` to proceed.
+fn base_drift_refusal(merge_state_status: &str) -> Option<(&'static str, &'static str)> {
+    match merge_state_status {
+        "BEHIND" => Some((
+            "PR base is behind main (phantom-reversion risk)",
+            "rebase onto current main: git fetch && git rebase origin/main && git push --force-with-lease",
+        )),
+        "DIRTY" => Some((
+            "PR has merge conflicts with main",
+            "resolve: git fetch && git rebase origin/main, fix conflicts, git push --force-with-lease",
+        )),
+        _ => None,
+    }
+}
+
 pub(super) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) -> Value {
     let pr = match args["pr"].as_u64() {
         Some(n) => n,
@@ -1216,6 +1237,32 @@ pub(super) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
                 "failing_checks": summary,
                 "hint": "Wait for CI to pass, or use force=true with force_reason for emergency bypass"
             });
+        }
+
+        // #base-drift: refuse a stacked/behind PR. GitHub's `mergeStateStatus`
+        // BEHIND means the PR base is behind main (another PR merged first) → an
+        // `--admin` squash lands a phantom-reversion diff (looks like reverting the
+        // already-merged PR — dev-2 #1798, only caught by a manual diff-check +
+        // rebase). DIRTY = conflicts (can't merge cleanly). Critically, the
+        // `--admin` merge BYPASSES branch-protection's
+        // `required_status_checks.strict`, so GitHub will NOT block these — the
+        // daemon must. Any other state (CLEAN/UNSTABLE/BLOCKED/UNKNOWN) or a
+        // pr_view error → fail-OPEN (proceed): GitHub may still be computing
+        // mergeability and we must not block a real merge on a transient (the #813
+        // mergeable-check pattern). Reuses the same `pr_view` path
+        // `verify_merge_landed` uses — no new infra. `force=true` bypasses (the
+        // audit block below logs it, like the CI gate).
+        if let Ok(summary) =
+            crate::scm::make_scm_provider(&repo, None).pr_view(&repo, pr, &["mergeStateStatus"])
+        {
+            let mss = summary.merge_state_status.as_deref().unwrap_or("");
+            if let Some((why, hint)) = base_drift_refusal(mss) {
+                return json!({
+                    "error": format!("base is stale — merge refused: {why}"),
+                    "merge_state_status": mss,
+                    "hint": format!("{hint}; or force=true with force_reason for emergency bypass"),
+                });
+            }
         }
     }
 

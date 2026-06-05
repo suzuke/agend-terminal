@@ -2196,6 +2196,49 @@ fn merge_no_repo_no_binding_errors_without_hardcoded_fallback() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// #base-drift: the pure refusal decision — `BEHIND` (phantom-reversion) and
+/// `DIRTY` (conflicts) refuse with a rebase hint; everything else
+/// (CLEAN/UNSTABLE/BLOCKED/UNKNOWN/empty/...) proceeds (fail-open, since GitHub
+/// may still be computing mergeability). force-bypass is structural — the gate
+/// sits inside `handle_merge_repo`'s `if !force` block, so force skips it.
+///
+/// NOTE (per FLEET-DEV-PROTOCOL §3.9 real-entry discipline): the WIRING
+/// (`handle_merge_repo` → `pr_view(["mergeStateStatus"])` → this decision, placed
+/// after the CI-pass gate and before the merge) is gh-integration-only — there is
+/// no `ScmProvider` test double — so it is verified by code-reading, not a unit
+/// test. Only the pure decision is unit-tested here; flagged transparently rather
+/// than hidden.
+#[test]
+fn base_drift_refusal_behind_and_dirty_refuse_else_proceed() {
+    assert!(
+        super::base_drift_refusal("BEHIND").is_some(),
+        "BEHIND (base behind main) must refuse"
+    );
+    assert!(
+        super::base_drift_refusal("DIRTY").is_some(),
+        "DIRTY (conflicts) must refuse"
+    );
+    for ok in [
+        "CLEAN",
+        "UNSTABLE",
+        "BLOCKED",
+        "UNKNOWN",
+        "",
+        "HAS_HOOKS",
+        "DRAFT",
+    ] {
+        assert!(
+            super::base_drift_refusal(ok).is_none(),
+            "{ok} must proceed (fail-open) — only BEHIND/DIRTY refuse"
+        );
+    }
+    let (_why, hint) = super::base_drift_refusal("BEHIND").unwrap();
+    assert!(
+        hint.contains("rebase"),
+        "BEHIND refusal must carry an actionable rebase hint, got: {hint}"
+    );
+}
+
 /// #1447: `repo checkout` resolves the source from the cross-tool standard
 /// `repository_path` arg. The legacy `source` / `source_repo` aliases (#1446)
 /// were dropped in favor of the single canonical name.
