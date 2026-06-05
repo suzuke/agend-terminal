@@ -171,6 +171,40 @@ pub(crate) fn record_dispatch(
     if std::fs::create_dir_all(&dir).is_err() {
         return None;
     }
+    // t-dispatchidle-clear-on-report (2): dedup by (dispatcher, target,
+    // correlation_id). Re-dispatching the SAME task (same task_id) used to create a
+    // fresh duplicate sidecar each call (`next_dispatch_id()`), so 142 correlation
+    // ids had duplicate sidecars live and a single report cleared only one. If a
+    // NON-terminal sidecar with this exact key already exists, REFRESH it in place
+    // (reset the clock + nudge state, keep its `dispatch_id`) instead of creating a
+    // new one — one sidecar per (dispatcher, target, correlation) dispatch-intent.
+    // Only when a `correlation_id` is present: without one we can't tell two
+    // distinct dispatches apart, so fall through to a fresh sidecar.
+    if let Some(corr) = correlation_id {
+        if let Some(mut existing) = list_pending(home).into_iter().find(|d| {
+            matches!(d.status, DispatchStatus::Pending | DispatchStatus::Exceeded)
+                && d.dispatcher == dispatcher
+                && d.target == target
+                && d.correlation_id.as_deref() == Some(corr)
+        }) {
+            existing.issued_at = chrono::Utc::now().to_rfc3339();
+            existing.status = DispatchStatus::Pending;
+            existing.nudge_sent_at = None;
+            existing.not_working_streak = 0;
+            existing.threshold_secs = threshold_secs;
+            if let Ok(body) = serde_json::to_string_pretty(&existing) {
+                if crate::store::atomic_write(
+                    &pending_path(home, &existing.dispatch_id),
+                    body.as_bytes(),
+                )
+                .is_ok()
+                {
+                    return Some(existing.dispatch_id);
+                }
+            }
+            // Refresh write failed → fall through to a fresh sidecar (best effort).
+        }
+    }
     let dispatch_id = next_dispatch_id();
     let payload = PendingDispatch {
         schema_version: SCHEMA_VERSION,
@@ -376,28 +410,31 @@ pub(crate) fn mark_resolved(home: &Path, correlation_id: &str) -> Option<String>
     }
     // A report arriving = the dispatch is done, whether it was still `Pending` or
     // had already timed out to `Exceeded` (idle nudge fired). Match BOTH so a LATE
-    // report on an Exceeded dispatch still deletes the sidecar — otherwise it leaks
-    // until the slow retention / terminal-sweep path (codex probe #1 regression).
-    let matched = list_pending(home).into_iter().find(|d| {
+    // report on an Exceeded dispatch still deletes the sidecar.
+    //
+    // t-dispatchidle-clear-on-report: delete ALL sidecars with this
+    // `correlation_id`, not just the first. A re-dispatched task (the SAME task_id
+    // sent twice — e.g. an initial dispatch + a design re-confirm, both
+    // `task_id=t-…`) creates DUPLICATE sidecars via `record_dispatch`'s fresh
+    // `next_dispatch_id()`. The pre-fix `.find()` deleted only one duplicate; the
+    // survivor went `Exceeded` and nudged the delegate AFTER it had already
+    // reported (the clear-on-report noise). (`record_dispatch`'s new dedup stops
+    // NEW duplicates; this delete-all keeps the resolve correct regardless.)
+    let mut first_deleted: Option<String> = None;
+    for d in list_pending(home).into_iter().filter(|d| {
         matches!(d.status, DispatchStatus::Pending | DispatchStatus::Exceeded)
             && d.correlation_id.as_deref() == Some(correlation_id)
-    });
-    let d = matched?;
-    let id = d.dispatch_id.clone();
-    let path = pending_path(home, &id);
-    // A resolved dispatch has no further use — the idle timer's job is done.
-    // DELETE the sidecar rather than flip it to `Resolved` and leave the file to
-    // accumulate. Pre-fix this set `status = Resolved` and nothing ever removed it
-    // (the primary `pending-dispatches/` leak: `cleanup_pending_for_instance`
-    // skipped non-Pending and the 14-day retention sweep was gated off), so
-    // resolved sidecars piled up and a restart re-processed the whole backlog.
-    if std::fs::remove_file(&path).is_ok() {
-        // Best-effort: drop the sidecar's lock file too so it doesn't orphan.
-        let _ = std::fs::remove_file(format!("{}.lock", path.display()));
-        Some(id)
-    } else {
-        None
+    }) {
+        let path = pending_path(home, &d.dispatch_id);
+        // DELETE the sidecar rather than flip it to `Resolved` and leave the file
+        // to accumulate (the pre-fix primary `pending-dispatches/` leak).
+        if std::fs::remove_file(&path).is_ok() {
+            // Best-effort: drop the sidecar's lock file too so it doesn't orphan.
+            let _ = std::fs::remove_file(format!("{}.lock", path.display()));
+            first_deleted.get_or_insert(d.dispatch_id);
+        }
     }
+    first_deleted
 }
 
 /// #1047: reset the timer on a pending sidecar when the dispatchee sends
@@ -979,6 +1016,61 @@ mod tests {
         )
         .unwrap();
         id
+    }
+
+    /// t-dispatchidle-clear-on-report (1): a report clears EVERY sidecar with the
+    /// matching correlation_id, not just the first — so a duplicate left by a
+    /// re-dispatch can't survive to nudge after the report.
+    #[test]
+    fn mark_resolved_deletes_all_duplicate_sidecars_clearonreport() {
+        let home = tmp_home("resolve-all-dups");
+        let now = chrono::Utc::now();
+        // Two sidecars, SAME correlation_id (the re-dispatch duplicate case).
+        let dup_a = write_pending_at(&home, "lead", "dev", Some("t-dup"), "task", 600, now);
+        let dup_b = write_pending_at(&home, "lead", "dev", Some("t-dup"), "task", 600, now);
+        // An unrelated sidecar that must survive.
+        let other = write_pending_at(&home, "lead", "dev", Some("t-other"), "task", 600, now);
+
+        let resolved = mark_resolved(&home, "t-dup");
+        assert!(resolved.is_some(), "must report a deletion");
+
+        let pending = list_pending(&home);
+        assert!(
+            !pending
+                .iter()
+                .any(|p| p.dispatch_id == dup_a || p.dispatch_id == dup_b),
+            "BOTH duplicate sidecars for t-dup must be deleted"
+        );
+        assert!(
+            pending.iter().any(|p| p.dispatch_id == other),
+            "the unrelated correlation's sidecar must survive"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// t-dispatchidle-clear-on-report (2): re-dispatching the SAME task
+    /// (dispatcher, target, correlation_id) refreshes the existing sidecar in
+    /// place instead of creating a duplicate.
+    #[test]
+    fn record_dispatch_dedups_redispatch_by_key_clearonreport() {
+        let home = tmp_home("record-dedup");
+        let first = record_dispatch(&home, "lead", "dev", Some("t-redispatch"), "task", 600);
+        let second = record_dispatch(&home, "lead", "dev", Some("t-redispatch"), "task", 600);
+        assert!(first.is_some() && second.is_some());
+        assert_eq!(
+            first, second,
+            "re-dispatch must REFRESH the same sidecar (same dispatch_id), not create a new one"
+        );
+        let pending = list_pending(&home);
+        let dups = pending
+            .iter()
+            .filter(|p| p.correlation_id.as_deref() == Some("t-redispatch"))
+            .count();
+        assert_eq!(
+            dups, 1,
+            "exactly ONE sidecar for the re-dispatched correlation"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 
     /// 1. Throttle contract — TICKS_PER_SCAN-1 calls return false, the
