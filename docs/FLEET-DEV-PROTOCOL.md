@@ -106,6 +106,8 @@ Three PR categories require external fixtures:
 
 Additional: wire-format invariant tests (pin shape); production-path-coupled (no helper mimics).
 
+**Test through the REAL entry point (integration); don't inject input mid-pipeline.** A test that hand-feeds a helper's INPUT (e.g. passing `prs` straight to the classifier) skips — and therefore HIDES — the discovery/wiring path that produces that input in production. Drive the test from the real entry the production caller uses (the scanner / handler / dispatcher), so a discovery or wiring gap FAILS the test instead of being silently bypassed. Evidence: #1799 PR-3's unit test injected `prs` directly into the helper, hiding that discovery was seed-bound to pr-state; codex required an integration test through the real scanner to surface it. **Review checklist** — the reviewer MUST ask: *"does this test exercise the real entry point, or inject mid-pipeline?"* A mid-pipeline inject on a discovery/wiring-coupled path is an unverified-coverage gap → request a real-entry integration test.
+
 ### 3.10 Test-first
 Feature/fix PRs must be test-first: failing test commit BEFORE impl commit.
 - Every fix PR MUST include an empirical reproduction test case. Reviewers MUST verify the presence and validity of this test.
