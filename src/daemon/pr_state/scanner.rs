@@ -334,6 +334,11 @@ fn apply_gh_poll(home: &Path, dir: &Path, poller: &dyn gh_poll::GhPoller) {
                 // merged_at}, so no second poller. Best-effort; never blocks the
                 // scanner.
                 super::remote_gc::gc_remote_orphans(&repo, &prs);
+                // PR-3 (t-ci-ready-pr3-arm-not-armed): same piggyback — auto-arm a
+                // ci-watch for any OPEN PR with no armed watch. Closes the
+                // bypass/non-dispatch arm-not-armed gap (#1782) server-side, the
+                // only place a `--no-verify` bypass push is observable.
+                super::auto_arm::auto_arm_unwatched_open_prs(home, &repo, &prs);
             }
             Err(e) => {
                 tracing::warn!(repo = %repo, error = %e, "#986 gh-poll failed");

@@ -47,6 +47,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+pub mod auto_arm;
 pub mod gh_poll;
 mod remote_gc;
 mod scanner;
@@ -434,6 +435,18 @@ pub fn load(home: &Path, repo: &str, branch: &str) -> Option<PrState> {
     let path = pr_state_dir(home).join(pr_state_filename(repo, branch));
     let content = std::fs::read_to_string(&path).ok()?;
     serde_json::from_str(&content).ok()
+}
+
+/// PR-3 (t-ci-ready-pr3-arm-not-armed): is the branch a KNOWN-open PR per the
+/// last gh-poll observation? Used by the ci-watch age-cap GC to exempt open PRs
+/// (an open PR should keep notifying on CI; aging its watch out would only let
+/// the auto-arm re-create it next poll — churn). Conservative: an untracked /
+/// never-polled branch returns `false` (ages out normally).
+pub fn is_branch_open(home: &Path, repo: &str, branch: &str) -> bool {
+    load(home, repo, branch)
+        .and_then(|s| s.last_gh_state)
+        .map(|m| matches!(m.state, gh_poll::GhPrState::Open))
+        .unwrap_or(false)
 }
 
 /// Atomic save — used by tests for setup. Production mutation paths

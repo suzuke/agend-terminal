@@ -343,6 +343,14 @@ pub fn gc_stale_watches(home: &Path, sweep_origin: &str) -> usize {
         if let Some(created) = watch.earliest_subscribed_at() {
             if now_utc.signed_duration_since(created) > chrono::Duration::hours(MAX_WATCH_AGE_HOURS)
             {
+                // PR-3 (t-ci-ready-pr3-arm-not-armed): exempt watches whose PR is
+                // still OPEN. An open PR should keep notifying on CI, and the
+                // PR-3 auto-arm would otherwise re-create this watch on the next
+                // gh-poll (remove→rearm churn every MAX_WATCH_AGE_HOURS). Only
+                // merged/closed/untracked branches age out here.
+                if crate::daemon::pr_state::is_branch_open(home, repo, branch) {
+                    continue;
+                }
                 remove_watch(
                     home,
                     &path,
@@ -681,6 +689,69 @@ mod tests {
             "recently-subscribed watch must survive the age cap"
         );
         assert_eq!(removed, 1, "exactly the over-age watch removed");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// PR-3 (t-ci-ready-pr3-arm-not-armed): an over-age watch whose PR is still
+    /// OPEN is EXEMPT from the absolute age-cap (it should keep notifying on CI,
+    /// and the auto-arm would re-create it anyway). A same-age watch whose PR is
+    /// MERGED still ages out — proving the exemption is open-specific.
+    #[test]
+    fn gc_max_age_cap_exempts_open_pr_pr3() {
+        use crate::daemon::pr_state::gh_poll::{GhPrMetadata, GhPrState};
+        use crate::daemon::pr_state::{new_for_branch, save, ReviewClass};
+
+        let dir = tmp_dir("pr3-maxage-open-exempt");
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).unwrap();
+        let future = (chrono::Utc::now() + chrono::Duration::hours(24)).to_rfc3339();
+        let old_sub =
+            (chrono::Utc::now() - chrono::Duration::hours(MAX_WATCH_AGE_HOURS + 1)).to_rfc3339();
+
+        let gh_meta = |branch: &str, state: GhPrState, merged: bool| GhPrMetadata {
+            number: 1,
+            author_login: "suzuke".to_string(),
+            head_ref: branch.to_string(),
+            is_cross_repository: false,
+            is_draft: false,
+            state,
+            merged_at: merged.then(|| "2026-06-05T00:00:00Z".to_string()),
+        };
+        let write_old_watch = |branch: &str| {
+            let w = serde_json::json!({
+                "repo": "o/r", "branch": branch, "expires_at": future,
+                "subscribers": [{ "instance": "dev", "subscribed_at": old_sub }],
+            });
+            std::fs::write(
+                ci_dir.join(format!("{branch}.json")),
+                serde_json::to_string_pretty(&w).unwrap(),
+            )
+            .unwrap();
+        };
+
+        // Over-age watch for an OPEN PR → exempt.
+        write_old_watch("openpr");
+        let mut open_st = new_for_branch("o/r", "openpr", "deadbeef", ReviewClass::Single);
+        open_st.last_gh_state = Some(gh_meta("openpr", GhPrState::Open, false));
+        save(&dir, &open_st).unwrap();
+
+        // Over-age watch for a MERGED PR → still ages out.
+        write_old_watch("mergedpr");
+        let mut merged_st = new_for_branch("o/r", "mergedpr", "cafef00d", ReviewClass::Single);
+        merged_st.last_gh_state = Some(gh_meta("mergedpr", GhPrState::Merged, true));
+        save(&dir, &merged_st).unwrap();
+
+        let removed = gc_stale_watches(&dir, "test");
+
+        assert!(
+            ci_dir.join("openpr.json").exists(),
+            "an open PR's over-age watch must be EXEMPT from the age cap"
+        );
+        assert!(
+            !ci_dir.join("mergedpr.json").exists(),
+            "a merged PR's over-age watch must still age out (exemption is open-specific)"
+        );
+        assert_eq!(removed, 1, "only the merged PR's watch removed");
         std::fs::remove_dir_all(&dir).ok();
     }
 
