@@ -284,6 +284,17 @@ pub(crate) fn read_daemon_pid(run_dir: &Path) -> Option<u32> {
         .and_then(|(pid, _)| pid.parse().ok())
 }
 
+/// Read the boot epoch (unix seconds) recorded in `{run_dir}/.daemon`
+/// (`{pid}:{boot_unix}`). Used by the worktree force-reclaim boot-grace
+/// (reviewer-2 #5). `None` if the file is missing or malformed.
+pub(crate) fn read_daemon_boot_unix(run_dir: &Path) -> Option<u64> {
+    std::fs::read_to_string(run_dir.join(".daemon"))
+        .ok()?
+        .trim()
+        .split_once(':')
+        .and_then(|(_, ts)| ts.parse().ok())
+}
+
 /// Agent definition tuple for daemon startup.
 pub type AgentDef = (
     String,

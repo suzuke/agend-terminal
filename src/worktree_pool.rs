@@ -538,6 +538,47 @@ fn force_reclaim_age_days() -> i64 {
         .unwrap_or(7)
 }
 
+/// reviewer-2 #5: force-reclaim post-boot grace (seconds). After a daemon restart
+/// the live-agent registry (the process-liveness signal) is empty until agents
+/// re-spawn; suspend force-reclaim for this window so a mid-respawn agent is not
+/// reclaimed during the liveness blind spot. Configurable
+/// (`AGEND_WORKTREE_FORCE_RECLAIM_BOOT_GRACE_SECS`).
+fn force_reclaim_boot_grace_secs() -> u64 {
+    std::env::var("AGEND_WORKTREE_FORCE_RECLAIM_BOOT_GRACE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(600) // 10 min
+}
+
+/// Pure boot-grace predicate: is `now_unix` within `grace_secs` of `boot_unix`?
+/// Unknown boot time → conservative `true` (suspend reclaim — never reclaim when
+/// we cannot tell how long the daemon has been up).
+fn within_boot_grace(boot_unix: Option<u64>, now_unix: u64, grace_secs: u64) -> bool {
+    match boot_unix {
+        Some(b) => now_unix.saturating_sub(b) < grace_secs,
+        None => true,
+    }
+}
+
+/// reviewer-2 #5: is the running daemon still inside its post-boot grace window?
+/// No active daemon run dir → NOT in grace (tests / non-daemon contexts — GC only
+/// runs inside the daemon). Daemon present but boot time unreadable → conservative
+/// in-grace (suspend).
+fn daemon_within_boot_grace(home: &Path) -> bool {
+    let Some(run_dir) = crate::daemon::find_active_run_dir(home) else {
+        return false;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    within_boot_grace(
+        crate::daemon::read_daemon_boot_unix(&run_dir),
+        now,
+        force_reclaim_boot_grace_secs(),
+    )
+}
+
 /// PR-2: liveness recency window (mirrors the binding-reconcile heartbeat window,
 /// binding.rs:380). A heartbeat / PTY input within this counts as alive.
 const LIVENESS_WINDOW_MS: u64 = 3_600_000; // 1h
@@ -570,6 +611,37 @@ pub struct GcCandidate {
 }
 
 /// Scan for GC candidates: daemon-tagged, past grace TTL, not pinned, no active binding.
+/// Max directory depth the marker-walk descends under the worktree root. Covers
+/// flat (`<agent>-<enc>/` = depth 1), nested (`<agent>/<branch>/` = depth 2), and
+/// slash-branch (`<agent>/fix/xxx/` = depth 3) layouts with headroom; bounded so a
+/// pathological tree can't make the walk unbounded.
+const MARKER_WALK_MAX_DEPTH: usize = 5;
+
+/// t-worktree-leak (reviewer-2 #4): recursively collect daemon-managed worktree
+/// dirs (those holding a `.agend-managed` marker) under `root`, to any depth up to
+/// `max_depth`. Once a dir carries the marker it IS a worktree → collected and NOT
+/// descended into (so we never walk a worktree's own working tree). This replaces
+/// the old fixed-depth scan that missed slash-branch worktrees.
+fn collect_managed_worktrees(root: &Path, max_depth: usize, out: &mut Vec<PathBuf>) {
+    if max_depth == 0 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if !p.is_dir() {
+            continue;
+        }
+        if p.join(MANAGED_MARKER).exists() {
+            out.push(p); // a worktree — collect, don't descend into its working tree
+        } else {
+            collect_managed_worktrees(&p, max_depth - 1, out);
+        }
+    }
+}
+
 pub fn gc_candidates(home: &Path) -> Vec<GcCandidate> {
     let mut candidates = Vec::new();
     // t-worktree-leak PR-2: snapshot the live-agent set ONCE per pass (the
@@ -580,26 +652,19 @@ pub fn gc_candidates(home: &Path) -> Vec<GcCandidate> {
             .into_iter()
             .collect();
 
-    // New layout: <home>/worktrees/<agent>/<branch>/
+    // New layout: <home>/worktrees/<agent>/<branch>/ — but a SLASH branch
+    // (`fix/xxx`, `feat/yyy` = the common case) nests an EXTRA level
+    // (`<agent>/fix/xxx`), so the old fixed 1-level descent enumerated `fix` (not a
+    // worktree, no marker) and missed the real worktree entirely (reviewer-2 #4, a
+    // pre-existing GC bug that silently disabled GC — clean-release AND
+    // force-reclaim — for most branches). Walk DOWN to the `.agend-managed` marker
+    // instead of assuming a fixed depth.
     let new_root = daemon_managed_worktree_root(home);
-    if new_root.is_dir() {
-        if let Ok(agents) = std::fs::read_dir(&new_root) {
-            for agent_entry in agents.flatten() {
-                if !agent_entry.path().is_dir() {
-                    continue;
-                }
-                if let Ok(branches) = std::fs::read_dir(agent_entry.path()) {
-                    for branch_entry in branches.flatten() {
-                        let wt_path = branch_entry.path();
-                        if !wt_path.is_dir() {
-                            continue;
-                        }
-                        if let Some(candidate) = evaluate_candidate(home, &wt_path, &live_agents) {
-                            candidates.push(candidate);
-                        }
-                    }
-                }
-            }
+    let mut managed = Vec::new();
+    collect_managed_worktrees(&new_root, MARKER_WALK_MAX_DEPTH, &mut managed);
+    for wt_path in &managed {
+        if let Some(candidate) = evaluate_candidate(home, wt_path, &live_agents) {
+            candidates.push(candidate);
         }
     }
 
@@ -811,6 +876,11 @@ fn evaluate_candidate(
         // here). liveness-AND-age: ANY live signal → never reclaim (even past the
         // cap); otherwise require the per-agent-jittered age cap.
         None => {
+            // reviewer-2 #5: suspend force-reclaim during the daemon's post-boot
+            // grace window (the process-liveness signal is still re-establishing).
+            if daemon_within_boot_grace(home) {
+                return None;
+            }
             if agent_has_liveness(home, &agent_name, live_agents) {
                 return None;
             }
@@ -2842,5 +2912,45 @@ mod tests {
              force-removed this dirty worktree (data loss)"
         );
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn collect_managed_worktrees_finds_slash_branch_nested() {
+        // reviewer-2 #4: a slash-branch worktree nests an extra level
+        // (worktrees/<agent>/fix/xxx) and was missed by the old fixed-depth scan.
+        let home = tmp_home("walk-slash");
+        let root = daemon_managed_worktree_root(&home);
+        let nested = root.join("dev").join("fix").join("xxx");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join(MANAGED_MARKER), "agent=dev\n").unwrap();
+        let flat = root.join("dev").join("track-x");
+        std::fs::create_dir_all(&flat).unwrap();
+        std::fs::write(flat.join(MANAGED_MARKER), "agent=dev\n").unwrap();
+        let mut out = Vec::new();
+        collect_managed_worktrees(&root, MARKER_WALK_MAX_DEPTH, &mut out);
+        assert!(
+            out.contains(&nested),
+            "slash-branch nested worktree must be enumerated (reviewer-2 #4)"
+        );
+        assert!(out.contains(&flat), "non-slash worktree still enumerated");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn boot_grace_predicate_suspends_only_when_recent_or_unknown() {
+        // reviewer-2 #5: recent boot → suspend; aged boot → proceed; unknown →
+        // conservative suspend.
+        assert!(
+            within_boot_grace(Some(1000), 1100, 600),
+            "100s after boot, 600s grace → in grace (suspend)"
+        );
+        assert!(
+            !within_boot_grace(Some(1000), 2000, 600),
+            "1000s after boot → past grace (proceed)"
+        );
+        assert!(
+            within_boot_grace(None, 2000, 600),
+            "unknown boot time → conservative suspend"
+        );
     }
 }
