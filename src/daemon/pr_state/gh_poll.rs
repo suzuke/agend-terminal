@@ -770,7 +770,7 @@ pub(crate) mod tests {
         );
         // poll() recorded demand so the worker will pick the repo up.
         assert!(
-            cache.demand.lock().unwrap().contains("owner/repo"),
+            cache.demand_contains_for_test("owner/repo"),
             "demand recorded for the worker"
         );
         // Worker polled, found NO PRs (empty) → Ok((empty, polled_at)) = real "no PR".
