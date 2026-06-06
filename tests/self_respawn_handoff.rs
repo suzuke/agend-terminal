@@ -44,6 +44,20 @@ enum SuccessorFault {
 /// single no-auth shell probe agent (fleet size 1). `fault` injects a successor
 /// failure seam for the abort-path tests.
 fn boot(home: &Path, fault: SuccessorFault) -> Child {
+    // Define `probe` via fleet.yaml (NOT `--agents`) so BOTH the first boot AND
+    // the handoff successor resolve it IDENTICALLY to a shell agent. The
+    // `--agents probe:/bin/sh` path registers a DEFAULT fleet entry (no
+    // backend), so the successor's re-resolve from fleet.yaml falls back to the
+    // default `claude` backend — absent on CI runners → agent spawn fails →
+    // the post-restart "agents re-spawned" assertion would fail on ubuntu. A
+    // `backend: shell` + `command: /bin/sh` entry resolves to /bin/sh on every
+    // platform.
+    std::fs::create_dir_all(home).ok();
+    std::fs::write(
+        home.join("fleet.yaml"),
+        "instances:\n  probe:\n    backend: shell\n    command: /bin/sh\n",
+    )
+    .expect("write fleet.yaml");
     let mut cmd = Command::new(bin());
     cmd.env("AGEND_HOME", home)
         .env("AGEND_RESTART_HANDOFF", "1")
@@ -56,7 +70,7 @@ fn boot(home: &Path, fault: SuccessorFault) -> Child {
         .env_remove("AGEND_SUCCESSOR_HANDOFF")
         .env_remove("AGEND_FORCE_SUCCESSOR_FAIL")
         .env_remove("AGEND_FORCE_SUCCESSOR_FAIL_AFTER_CONTROL_READY")
-        .args(["start", "--foreground", "--agents", "probe:/bin/sh"])
+        .args(["start", "--foreground"])
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     match fault {
@@ -196,7 +210,7 @@ fn trigger_restart(home: &Path, active_pid: u32) -> Option<serde_json::Value> {
 /// Kill any daemon still alive under `home/run` and remove the dir. Handoff
 /// successors run in their own process group (detached), so a harness pgid kill
 /// would miss them — clean up by scanning run dirs.
-fn teardown(home: &Path) {
+fn cleanup_test_home(home: &Path) {
     for pid in active_pids(home) {
         // SAFETY: deliberate cleanup signal to a known test daemon pid.
         unsafe {
@@ -231,7 +245,7 @@ fn self_respawn_succeeds_with_no_external_supervisor() {
         Some(p) => p,
         None => {
             let _ = d1.kill();
-            teardown(&home);
+            cleanup_test_home(&home);
             panic!("first boot never became the single active daemon");
         }
     };
@@ -261,7 +275,7 @@ fn self_respawn_succeeds_with_no_external_supervisor() {
 
     // The original child handle is the OLD daemon (now exited 0); reap it.
     let _ = d1.wait();
-    teardown(&home);
+    cleanup_test_home(&home);
 
     let new_pid =
         new_pid.expect("a NEW daemon pid must serve after self-respawn (old must be dead)");
@@ -290,7 +304,7 @@ fn self_respawn_aborts_and_old_stays_alive_when_successor_fails() {
         Some(p) => p,
         None => {
             let _ = d1.kill();
-            teardown(&home);
+            cleanup_test_home(&home);
             panic!("first boot never became the single active daemon");
         }
     };
@@ -310,7 +324,7 @@ fn self_respawn_aborts_and_old_stays_alive_when_successor_fails() {
 
     let _ = d1.kill();
     let _ = d1.wait();
-    teardown(&home);
+    cleanup_test_home(&home);
 
     // The mcp_tool tunnel wraps handler output as {ok:true, result:{...}}; the
     // self-respawn ABORT is signalled by result.ok == false.
@@ -357,7 +371,7 @@ fn self_respawn_aborts_when_successor_dies_after_phase1_commit() {
         Some(p) => p,
         None => {
             let _ = d1.kill();
-            teardown(&home);
+            cleanup_test_home(&home);
             panic!("first boot never became the single active daemon");
         }
     };
@@ -376,7 +390,7 @@ fn self_respawn_aborts_when_successor_dies_after_phase1_commit() {
 
     let _ = d1.kill();
     let _ = d1.wait();
-    teardown(&home);
+    cleanup_test_home(&home);
 
     assert!(
         still_old,
