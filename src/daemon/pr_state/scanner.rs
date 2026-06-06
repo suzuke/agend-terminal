@@ -12,10 +12,6 @@ enum ScanAction {
     Remove,
 }
 
-pub fn scan_and_emit(home: &Path, registry: &crate::agent::AgentRegistry) {
-    scan_and_emit_with(home, registry, &gh_poll::CliGhPoller);
-}
-
 /// Per-tick scanner: walks `<home>/pr-state/*.json`, emits any newly-
 /// eligible `[pr-ready-for-merge]` events (debounced via
 /// `ready_emitted_for_sha`), and sweeps terminal-state files.
@@ -260,6 +256,22 @@ pub fn scan_and_emit_with(
 /// would over-suppress); success clears the counter. Idempotent:
 /// re-applying the same metadata is a no-op for the reducer if state
 /// already matches.
+/// #986 Bug A: is a poll taken at `polled_at` fresh enough to confirm "no PR" for
+/// a branch first tracked at `created_at`? True iff the poll happened at/after the
+/// branch became tracked (so the poll would have observed the PR if it existed).
+/// A retained snapshot polled BEFORE the branch existed must not assert "no PR".
+/// Parse failure → conservative `false` (treat as stale → ambiguous, never a false
+/// no-PR).
+fn poll_is_fresh_for(polled_at: &str, created_at: &str) -> bool {
+    match (
+        chrono::DateTime::parse_from_rfc3339(polled_at),
+        chrono::DateTime::parse_from_rfc3339(created_at),
+    ) {
+        (Ok(p), Ok(c)) => p >= c,
+        _ => false,
+    }
+}
+
 fn apply_gh_poll(home: &Path, dir: &Path, poller: &dyn gh_poll::GhPoller) {
     use std::collections::{HashMap, HashSet};
 
@@ -351,9 +363,28 @@ fn apply_gh_poll(home: &Path, dir: &Path, poller: &dyn gh_poll::GhPoller) {
     }
     for (repo, due_states) in by_repo {
         match poller.poll(&repo) {
-            Ok(prs) => {
+            Ok((prs, polled_at)) => {
                 for state in due_states {
                     let branch = state.branch.clone();
+                    // #986 Bug A (codex round-3): freshness gates ALL state-changing
+                    // observations UNIFORMLY — not just "no PR found". A stale
+                    // snapshot (polled BEFORE this branch was first tracked) is
+                    // applied to NOTHING: not a no-PR confirmation, and NOT a
+                    // found-PR transition. The earlier `found ||` bypass let a stale
+                    // found-PR — e.g. an old `Closed` for a since-reopened PR — drive
+                    // a STICKY terminal transition (ClosedUnmergedObserved) →
+                    // false-release. Async snapshots introduce this staleness (the
+                    // pre-#986 synchronous poll was always fresh). Stale → leave the
+                    // branch due + ambiguous; a fresh poll arrives within ~1 worker
+                    // cadence (~15s) and only then applies observations + stamps.
+                    if !poll_is_fresh_for(&polled_at, &state.created_at) {
+                        tracing::debug!(
+                            repo = %repo, branch = %branch,
+                            polled_at = %polled_at, created_at = %state.created_at,
+                            "#986 gh-poll: stale snapshot predates branch tracking — applying nothing, awaiting fresh poll"
+                        );
+                        continue;
+                    }
                     if let Err(e) = with_pr_state(home, &repo, &branch, |s| {
                         apply_gh_observations(home, s, &prs, &now);
                         s.gh_poll_failures = 0;
@@ -367,16 +398,13 @@ fn apply_gh_poll(home: &Path, dir: &Path, poller: &dyn gh_poll::GhPoller) {
                         );
                     }
                 }
-                // #1750-B4: piggyback remote-orphan branch GC on the poll just
-                // done — `prs` already carries every PR's {state, head_ref,
-                // merged_at}, so no second poller. Best-effort; never blocks the
-                // scanner.
-                super::remote_gc::gc_remote_orphans(&repo, &prs);
-                // PR-3 (t-ci-ready-pr3-arm-not-armed): same piggyback — auto-arm a
-                // ci-watch for any OPEN PR with no armed watch. Closes the
-                // bypass/non-dispatch arm-not-armed gap (#1782) server-side, the
-                // only place a `--no-verify` bypass push is observable.
-                super::auto_arm::auto_arm_unwatched_open_prs(home, &repo, &prs);
+                // #986 round-4: `gc_remote_orphans` (DESTRUCTIVE — #1750-B4) and
+                // `auto_arm` (#1782 / PR-3) MOVED OUT of this stale-snapshot scanner
+                // path into `gh_poll::worker_poll_and_act`, where they run on the
+                // worker's FRESH poll. A stale snapshot here could have driven
+                // `delete_remote_ref` against a since-reused live branch (Merged PR
+                // branch-reuse). The scanner now only does the per-branch,
+                // freshness-gated state apply above.
             }
             Err(e) => {
                 tracing::warn!(repo = %repo, error = %e, "#986 gh-poll failed");

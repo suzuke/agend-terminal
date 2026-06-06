@@ -185,11 +185,18 @@ fn evaluate_pr_for_release(home: &Path, repo: &str, branch: &str) -> (bool, PrCo
         MergeState::NotReady | MergeState::MergeReady => {
             if state.pr_number > 0 {
                 (false, PrConfidence::ObservedOpen)
-            } else if state.last_gh_poll_at.is_some() {
-                // gh-poll ran, pr_number still 0 ⟹ positively no PR.
+            } else if state.last_gh_poll_at.is_some() && state.gh_poll_failures == 0 {
+                // A SUCCESSFUL gh-poll ran (failures==0), pr_number still 0 ⟹
+                // positively no PR. #986: gate on `gh_poll_failures == 0` — the Err
+                // path (scanner.rs:387) ALSO sets `last_gh_poll_at` (for backoff),
+                // so a FAILED or cold-cache poll (failures>0) must NOT be misread as
+                // "no PR found". Also closes a pre-existing latent bug where a
+                // transient gh-poll failure could false-release a worktree whose PR
+                // was simply not observed.
                 (true, PrConfidence::QueriedNone)
             } else {
-                // pr_state exists (ci-watch armed) but never gh-polled.
+                // pr_state exists (ci-watch armed) but never successfully gh-polled
+                // (never polled, or last poll failed / cold cache) → ambiguous.
                 (false, PrConfidence::Unknown)
             }
         }
@@ -1103,6 +1110,28 @@ mod tests {
         let (r, c) = releasable_by_invariant(&home, "o/r", "feat/x");
         assert!(!r);
         assert_eq!(c, PrConfidence::Unknown);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn queried_none_requires_successful_poll_986() {
+        // #986: QueriedNone (positively-no-PR → release) requires a SUCCESSFUL poll
+        // (gh_poll_failures == 0). The Err path (scanner.rs:387) ALSO sets
+        // last_gh_poll_at, so a failed / cold-cache poll (failures>0) must be
+        // ambiguous (Unknown), never a false "no PR" that releases the worktree.
+        let home = tmp_home("qn-986");
+        // Successful poll, pr_number 0 → positively no PR → releasable.
+        write_pr(&home, "feat/x", MergeState::NotReady, 0, true);
+        let (r, c) = releasable_by_invariant(&home, "o/r", "feat/x");
+        assert!(r, "success + no PR → releasable");
+        assert_eq!(c, PrConfidence::QueriedNone);
+        // Failed / cold-cache poll: failures>0 → ambiguous → NOT releasable.
+        let mut s = crate::daemon::pr_state::load(&home, "o/r", "feat/x").unwrap();
+        s.gh_poll_failures = 1;
+        crate::daemon::pr_state::save(&home, &s).unwrap();
+        let (r2, c2) = releasable_by_invariant(&home, "o/r", "feat/x");
+        assert!(!r2, "failed/cold poll (failures>0) must NOT release");
+        assert_eq!(c2, PrConfidence::Unknown);
         let _ = std::fs::remove_dir_all(&home);
     }
 

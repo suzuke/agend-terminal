@@ -51,9 +51,10 @@ pub mod auto_arm;
 pub mod gh_poll;
 mod remote_gc;
 mod scanner;
-pub use scanner::scan_and_emit;
-#[cfg(test)]
-pub use scanner::scan_and_emit_with;
+// #986: the production per-tick handler drives the scanner with an explicit
+// (snapshot) poller via `scan_and_emit_with` — the old `scan_and_emit` wrapper
+// (hardcoded `CliGhPoller`, synchronous on the scanner thread) is gone.
+pub(crate) use scanner::scan_and_emit_with;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PrState {
@@ -1476,7 +1477,11 @@ mod tests {
         let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
 
         // First scan: emit.
-        scan_and_emit(&dir, &registry);
+        scan_and_emit_with(
+            &dir,
+            &registry,
+            &crate::daemon::pr_state::gh_poll::CliGhPoller,
+        );
         let inbox_msgs = crate::inbox::drain(&dir, "dev");
         assert_eq!(inbox_msgs.len(), 1, "expected one [pr-ready-for-merge]");
         assert_eq!(inbox_msgs[0].kind.as_deref(), Some("pr-ready-for-merge"));
@@ -1499,7 +1504,11 @@ mod tests {
         assert_eq!(inbox_msgs[0].reviewed_head.as_deref(), Some("sha-A"));
 
         // Second scan: must NOT re-emit (debounce per ready_emitted_for_sha).
-        scan_and_emit(&dir, &registry);
+        scan_and_emit_with(
+            &dir,
+            &registry,
+            &crate::daemon::pr_state::gh_poll::CliGhPoller,
+        );
         let inbox_msgs = crate::inbox::drain(&dir, "dev");
         assert!(
             inbox_msgs.is_empty(),
@@ -1643,7 +1652,11 @@ mod tests {
 
         // Scanner pass: NO event emitted because state is NotReady.
         let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
-        scan_and_emit(&dir, &registry);
+        scan_and_emit_with(
+            &dir,
+            &registry,
+            &crate::daemon::pr_state::gh_poll::CliGhPoller,
+        );
         assert!(
             crate::inbox::drain(&dir, "dev").is_empty(),
             "no [pr-ready-for-merge] until second verdict"
@@ -1663,7 +1676,11 @@ mod tests {
         save(&dir, &s).unwrap();
 
         // Scanner now fires [pr-ready-for-merge].
-        scan_and_emit(&dir, &registry);
+        scan_and_emit_with(
+            &dir,
+            &registry,
+            &crate::daemon::pr_state::gh_poll::CliGhPoller,
+        );
         let msgs = crate::inbox::drain(&dir, "dev");
         assert_eq!(msgs.len(), 1, "second verdict unlocks the merge gate");
         assert_eq!(msgs[0].kind.as_deref(), Some("pr-ready-for-merge"));
@@ -1773,6 +1790,99 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// #986 §3.9 real-entry: a COLD `SnapshotGhPoller` (the background worker has
+    /// not filled the cache yet) driven through the REAL scanner must NOT mark the
+    /// pr_state as a clean "polled, 0 PR" — it records a gh_poll_failure (→
+    /// ambiguous), so a worktree whose open PR is simply not-yet-in-cache is never
+    /// false-released. Asserts the scanner reads the snapshot (cold→Err), never a
+    /// live `gh` poll.
+    #[test]
+    fn cold_snapshot_poll_marks_failure_not_false_no_pr_986() {
+        let mut s = new_state("sha-cold", ReviewClass::Single);
+        s.pr_number = 0;
+        s.last_gh_poll_at = None; // never polled → due
+        let home = home_with_state("cold-986", s);
+        // COLD cache — the worker has never run, so the repo is absent.
+        let cache = crate::daemon::pr_state::gh_poll::GhPollCache::new();
+        let poller = crate::daemon::pr_state::gh_poll::SnapshotGhPoller::new(cache);
+        scan_and_emit_with(&home, &empty_registry(), &poller);
+        let loaded = load(&home, "owner/repo", "feat/test").unwrap();
+        assert!(
+            loaded.gh_poll_failures > 0,
+            "#986: cold-cache poll must mark a failure (ambiguous), not a clean 'no PR'"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// #986 Bug A §3.9 real-entry: a WARM repo whose cached snapshot predates the
+    /// branch's `created_at` (the branch's PR exists but isn't in the stale
+    /// snapshot yet) must NOT confirm "no PR" for that branch — it must NOT stamp
+    /// `last_gh_poll_at` (which would make `evaluate_pr_for_release` → QueriedNone →
+    /// false-release). Drives the REAL scanner with a stale snapshot.
+    #[test]
+    fn stale_snapshot_does_not_confirm_no_pr_986() {
+        let mut s = new_state("sha-stale", ReviewClass::Single);
+        s.pr_number = 0;
+        s.last_gh_poll_at = None; // created_at is "now" (new_state)
+        let home = home_with_state("stale-986", s);
+        // Warm cache, but the snapshot was polled FAR in the past (before created_at)
+        // and is empty (the branch's PR isn't captured) — the stale-reuse case.
+        let cache = crate::daemon::pr_state::gh_poll::GhPollCache::new();
+        cache.seed_for_test("owner/repo", vec![], "2000-01-01T00:00:00+00:00");
+        let poller = crate::daemon::pr_state::gh_poll::SnapshotGhPoller::new(cache);
+        scan_and_emit_with(&home, &empty_registry(), &poller);
+        let loaded = load(&home, "owner/repo", "feat/test").unwrap();
+        assert!(
+            loaded.last_gh_poll_at.is_none(),
+            "#986: a stale snapshot (polled before the branch was tracked) must NOT \
+             confirm no-PR — last_gh_poll_at must stay unset (ambiguous)"
+        );
+        assert_eq!(loaded.pr_number, 0, "no PR observed (stale snapshot empty)");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// #986 round-3 (codex) §3.9 real-entry: a stale snapshot that FINDS the
+    /// branch's PR as `Closed` (the PR was since reopened; the worker hasn't
+    /// refreshed) must NOT apply the sticky `ClosedUnmergedObserved` transition.
+    /// Removing the `found ||` bypass means freshness gates found-PR transitions
+    /// too — a stale found-PR is applied to nothing until a fresh poll.
+    #[test]
+    fn stale_found_pr_does_not_drive_terminal_transition_986() {
+        let mut s = new_state("sha-reopen", ReviewClass::Single);
+        s.pr_number = 42; // previously observed open
+        s.last_gh_poll_at = Some("2026-06-06T00:00:00+00:00".into());
+        // merge_state defaults to NotReady (non-terminal) — the PR is open.
+        let home = home_with_state("reopen-986", s);
+        // Stale snapshot (polled long before created_at) showing the PR as Closed.
+        let closed = GhPrMetadata {
+            number: 42,
+            author_login: "dev".into(),
+            head_ref: "feat/test".into(),
+            is_cross_repository: false,
+            is_draft: false,
+            state: GhPrState::Closed,
+            merged_at: None,
+        };
+        let cache = crate::daemon::pr_state::gh_poll::GhPollCache::new();
+        cache.seed_for_test("owner/repo", vec![closed], "2000-01-01T00:00:00+00:00");
+        let poller = crate::daemon::pr_state::gh_poll::SnapshotGhPoller::new(cache);
+        scan_and_emit_with(&home, &empty_registry(), &poller);
+        let loaded = load(&home, "owner/repo", "feat/test").unwrap();
+        assert!(
+            !matches!(
+                loaded.merge_state,
+                MergeState::ClosedUnmerged { .. } | MergeState::Merged { .. }
+            ),
+            "#986: a STALE found-Closed must NOT drive a terminal transition: {:?}",
+            loaded.merge_state
+        );
+        assert!(
+            loaded.last_gh_poll_at == Some("2026-06-06T00:00:00+00:00".into()),
+            "stale poll must not re-stamp last_gh_poll_at"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     /// PR-3 (t-ci-ready-pr3-arm-not-armed) — INTEGRATION (codex re-verify): a
     /// BOUND branch with NO ci-watch AND NO pr-state file must STILL be
     /// discovered and auto-armed. This exercises the binding-seeded discovery
@@ -1822,12 +1932,24 @@ mod tests {
         )
         .unwrap();
 
-        // gh-poll observes one OPEN PR on that branch.
+        // #986 round-4: auto_arm MOVED to the worker, so discovery now spans
+        // scanner → worker. (1) The scanner (snapshot poller) must seed DEMAND for
+        // the bound branch's repo (the #1782 discovery seed). (2) The worker then
+        // polls that repo (one OPEN PR) and runs auto_arm on the FRESH data.
+        let cache = crate::daemon::pr_state::gh_poll::GhPollCache::new();
+        scan_and_emit_with(
+            &home,
+            &empty_registry(),
+            &crate::daemon::pr_state::gh_poll::SnapshotGhPoller::new(cache.clone()),
+        );
+        assert!(
+            cache.demand_contains_for_test("owner/repo"),
+            "scanner must seed demand for the bound branch's repo (#1782 discovery)"
+        );
         let poller = MockGhPoller::new(vec![Ok(vec![gh_meta_open(700, "feat/x", "suzuke")])]);
+        crate::daemon::pr_state::gh_poll::worker_poll_and_act(&home, &cache, "owner/repo", &poller);
 
-        scan_and_emit_with(&home, &empty_registry(), &poller);
-
-        // The bound-branch discovery path must have auto-armed a watch.
+        // The worker's auto_arm must have armed a watch for the discovered branch.
         let watch = crate::daemon::ci_watch::ci_watches_dir(&home).join(
             crate::daemon::ci_watch::watch_filename("owner/repo", "feat/x"),
         );

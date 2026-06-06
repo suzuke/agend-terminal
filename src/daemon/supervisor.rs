@@ -369,15 +369,17 @@ fn run_loop(
             dispatch_idle_tracker.maybe_scan(&home);
             dispatch_idle_nudge_tracker.maybe_scan(&home);
             retention_supervisor.maybe_sweep(&home);
-            // #1002 Phase 2: pr_state per-tick scan must run here so APP
-            // mode (`agend-terminal app`) drives the #972 aggregator + #986
-            // gh-poll integration the same way as daemon mode. Before this
-            // line, `PrStateScanHandler` was wired ONLY into `run_core`'s
-            // `PerTickHandler` vec (dual-entry-point divergence); APP-mode
-            // operators (the agent fleet) saw `last_gh_poll_at: null`
-            // indefinitely + no `[pr-ready-for-merge]` events.
-            // Source-pin: `pr_state_scan_wired_into_supervisor_loop`.
-            crate::daemon::pr_state::scan_and_emit(&home, &registry);
+            // #986: the supervisor loop NO LONGER scans pr_state directly. The
+            // `PrStateScanHandler` per-tick handler is the SINGLE scanner in ALL
+            // modes — it runs in run_core's handler vec (daemon) AND in
+            // `app::app_tick_handlers` (app standalone, both attached and owned,
+            // since `pr_state_scan` is not in `APP_TICK_ALLOWLIST`). The old direct
+            // scan here was a vestigial app-mode belt from when the handler was
+            // run_core-only; with the handler now live in every mode it was a
+            // redundant SECOND scanner + (post-#986) a SECOND gh-poll worker. The
+            // handler owns the single snapshot cache + worker.
+            // Source-pin: `pr_state_scan_wired_into_supervisor_loop` asserts the
+            // supervisor does NOT scan (guards against re-adding it here).
             // #836: reclaim expired (10-min TTL) entries from the
             // notification-dedup ledger so memory pressure stays bounded
             // on long-lived daemons.
@@ -4012,29 +4014,31 @@ instances:
         );
     }
 
-    /// #1002 Phase 2 source-pin: supervisor's per-tick loop MUST call
-    /// `crate::daemon::pr_state::scan_and_emit`. The #972 / #986
-    /// aggregator + gh-poll integration was previously wired only via
-    /// `run_core`'s `PerTickHandler` vec (daemon-only entry). In APP
-    /// mode (`agend-terminal app`), `run_core` is never called — the
-    /// supervisor loop is the canonical per-tick driver instead.
-    /// Without this wiring, `last_gh_poll_at: null` persists
-    /// indefinitely and `[pr-ready-for-merge]` events never emit.
-    ///
-    /// File-level positive pin (cross-platform-safe; same pattern as
-    /// `app::tests::flush_idle_notifications_wired_to_submit_aware_inject`
-    /// from #982 RC2). If a future refactor moves the call out of
-    /// the loop, update this assertion alongside.
+    /// #986 source-pin (INVERTED from #1002 Phase 2): the supervisor's per-tick
+    /// loop must NOT scan pr_state. The `PrStateScanHandler` per-tick handler is the
+    /// SINGLE scanner+worker in EVERY mode — it runs in `run_core`'s handler vec
+    /// (daemon) AND in `app::app_tick_handlers` (app standalone, attached AND owned,
+    /// since `pr_state_scan` is not in `APP_TICK_ALLOWLIST`). The #1002-era direct
+    /// supervisor scan was a vestigial belt from when the handler was run_core-only;
+    /// with the handler now live in every mode it was a redundant second scanner +
+    /// (post-#986) a second gh-poll worker. This pin guards against re-adding it.
     #[test]
     fn pr_state_scan_wired_into_supervisor_loop() {
         let source = std::fs::read_to_string("src/daemon/supervisor.rs")
             .or_else(|_| std::fs::read_to_string("agend-terminal/src/daemon/supervisor.rs"))
             .expect("source file must be readable from test cwd");
+        // #986: the supervisor loop must NOT scan pr_state. `PrStateScanHandler`
+        // is the SINGLE scanner+worker in ALL modes (run_core handler vec + app
+        // `app_tick_handlers`, both attached and owned). A supervisor scan would be
+        // a redundant SECOND scanner + a SECOND gh-poll worker. Guard against
+        // re-adding it. The needle is assembled from fragments so this assertion's
+        // own source does not match (the file never contains the verbatim call).
+        let needle = format!("{}{}", "scan_and", "_emit");
         assert!(
-            source.contains("pr_state::scan_and_emit"),
-            "supervisor per-tick loop must invoke pr_state::scan_and_emit \
-             (#1002 Phase 2 dual-entry-point fix). Without this, APP-mode \
-             daemons silently skip the #972 aggregator + #986 gh-poll path."
+            !source.contains(&needle),
+            "supervisor loop must NOT invoke a pr_state scan (#986: the handler is \
+             the sole scanner+worker in every mode; a supervisor scan would double \
+             both the scanner and the gh-poll worker)."
         );
     }
 

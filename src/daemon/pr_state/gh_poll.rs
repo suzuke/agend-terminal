@@ -67,16 +67,22 @@ pub enum GhPrState {
 /// IO surface for observing GitHub PR state. Production:
 /// [`CliGhPoller`]; tests: [`MockGhPoller`].
 pub trait GhPoller: Send + Sync {
-    /// Batch-poll all PRs for `repo`. Returns Err on transport / CLI
-    /// errors; Ok(vec) on success (empty vec when no PRs match).
-    fn poll(&self, repo: &str) -> anyhow::Result<Vec<GhPrMetadata>>;
+    /// Batch-poll all PRs for `repo`. Returns `Err` on transport / CLI errors;
+    /// `Ok((prs, polled_at))` on success (empty `prs` when no PRs match).
+    ///
+    /// #986: `polled_at` (RFC3339) is WHEN the data was actually fetched from
+    /// GitHub. For the live pollers it is ~now; for [`SnapshotGhPoller`] it is the
+    /// background worker's poll time, which may LAG — so the scanner can gate
+    /// "positively no PR" on `polled_at >= pr_state.created_at` (a snapshot taken
+    /// before a branch's PR existed must never assert "no PR" for that branch).
+    fn poll(&self, repo: &str) -> anyhow::Result<(Vec<GhPrMetadata>, String)>;
 }
 
 /// Production poller — invokes `gh pr list --json ... --state all`.
 pub struct CliGhPoller;
 
 impl GhPoller for CliGhPoller {
-    fn poll(&self, repo: &str) -> anyhow::Result<Vec<GhPrMetadata>> {
+    fn poll(&self, repo: &str) -> anyhow::Result<(Vec<GhPrMetadata>, String)> {
         // #PR-B: route the `gh pr list` shell-out through `ScmProvider`
         // instead of calling `Command::new("gh")` directly. The emitted
         // argv is byte-identical to the prior inline call (pinned by
@@ -117,10 +123,12 @@ impl GhPoller for CliGhPoller {
                  if recurrent, refactor to fire-and-forget worker"
             );
         }
-        Ok(result?
+        let prs = result?
             .into_iter()
             .filter_map(summary_to_gh_metadata)
-            .collect())
+            .collect();
+        // A live poll: the data is current as of now.
+        Ok((prs, chrono::Utc::now().to_rfc3339()))
     }
 }
 
@@ -151,6 +159,168 @@ fn summary_to_gh_metadata(s: crate::scm::PrSummary) -> Option<GhPrMetadata> {
         state,
         merged_at: s.merged_at,
     })
+}
+
+// ─── #986 fire-and-forget snapshot poller ──────────────────────────────
+//
+// The scanner thread used to call `CliGhPoller::poll` SYNCHRONOUSLY — a
+// `gh pr list` subprocess (>1s) per repo per tick — which blocked the whole
+// scanner tick and surfaced as operator INPUT LAG (#986: slips 1000-1500ms,
+// ~every 60s, even with 0 ci-watches because the #972 aggregator maintains the
+// full-repo PR-state map). The poll is moved OFF the scanner thread into a single
+// background worker; the scanner reads a cached snapshot, never the live gh.
+
+/// Shared snapshot cache + demand set bridging the scanner (reader) and the
+/// background gh-poll worker (writer). Race contract: the worker writes, the
+/// scanner reads; the worker polls into a LOCAL then briefly locks to swap, never
+/// holding the cache lock across the `gh` subprocess.
+#[derive(Default)]
+pub struct GhPollCache {
+    /// repo slug → (latest successful poll snapshot, `polled_at` RFC3339). A repo
+    /// PRESENT (even with an empty vec) means the worker has polled it (→ `Ok`);
+    /// ABSENT means cold / never-polled (→ `Err`, so a consumer treats it as
+    /// ambiguous, NOT a positive "no PR" — the #986 cold-start race). `polled_at`
+    /// rides along so the scanner can gate a positive "no PR" on it being newer
+    /// than the branch's `created_at` (the stale-snapshot-reuse fix).
+    cache: std::sync::Mutex<std::collections::HashMap<String, (Vec<GhPrMetadata>, String)>>,
+    /// repos the scanner has requested since the worker last drained — the worker
+    /// polls exactly these (zero duplication of the scanner's repo enumeration;
+    /// drain = retention: a no-longer-requested repo stops being polled).
+    demand: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+impl GhPollCache {
+    pub fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self::default())
+    }
+
+    /// Test seam: seed a per-repo snapshot with an explicit `polled_at`, so a
+    /// freshness/stale-reuse test can drive a snapshot whose poll time predates a
+    /// branch's `created_at` without a live worker.
+    #[cfg(test)]
+    pub(crate) fn seed_for_test(&self, repo: &str, prs: Vec<GhPrMetadata>, polled_at: &str) {
+        if let Ok(mut c) = self.cache.lock() {
+            c.insert(repo.to_string(), (prs, polled_at.to_string()));
+        }
+    }
+
+    /// Test seam: did the scanner (`SnapshotGhPoller::poll`) record demand for
+    /// `repo`? Verifies the discovery half of the chain (scanner seeds demand → the
+    /// worker later polls + acts).
+    #[cfg(test)]
+    pub(crate) fn demand_contains_for_test(&self, repo: &str) -> bool {
+        self.demand
+            .lock()
+            .map(|d| d.contains(repo))
+            .unwrap_or(false)
+    }
+}
+
+/// Non-blocking [`GhPoller`] (#986): records demand + returns the worker's latest
+/// snapshot for `repo`. NEVER spawns `gh` — the scanner thread never blocks.
+/// Cold cache (worker has not polled `repo` yet) returns `Err` (ambiguous), so a
+/// downstream positive-no-PR consumer is never fed a false "0 PRs" during warm-up.
+pub struct SnapshotGhPoller {
+    shared: std::sync::Arc<GhPollCache>,
+}
+
+impl SnapshotGhPoller {
+    pub fn new(shared: std::sync::Arc<GhPollCache>) -> Self {
+        Self { shared }
+    }
+}
+
+impl GhPoller for SnapshotGhPoller {
+    fn poll(&self, repo: &str) -> anyhow::Result<(Vec<GhPrMetadata>, String)> {
+        if let Ok(mut d) = self.shared.demand.lock() {
+            d.insert(repo.to_string());
+        }
+        match self.shared.cache.lock() {
+            Ok(c) => match c.get(repo) {
+                Some((prs, polled_at)) => Ok((prs.clone(), polled_at.clone())),
+                // Cold / never-polled → ambiguous, NOT a positive "no PR".
+                None => anyhow::bail!(
+                    "#986 gh-poll snapshot not ready for {repo} (worker has not polled yet)"
+                ),
+            },
+            Err(_) => anyhow::bail!("#986 gh-poll cache lock poisoned"),
+        }
+    }
+}
+
+/// Worker poll cadence. Off the scanner thread, so we keep armed-flow
+/// responsiveness without any scanner-tick cost; rate ~240/hr/repo, far under the
+/// 5000/hr authenticated ceiling.
+const WORKER_CADENCE: Duration = Duration::from_secs(15);
+
+/// One worker cycle's work for a single repo (#986 round-4): poll via `poller`
+/// (the real [`CliGhPoller`] in production) into a LOCAL, store the snapshot under
+/// the cache lock (never held across the subprocess), AND run the
+/// FRESHNESS-SENSITIVE `prs` consumers on the JUST-POLLED data so they NEVER see a
+/// stale snapshot:
+///
+/// - `gc_remote_orphans` — DESTRUCTIVE (`delete_remote_ref`). On a stale snapshot
+///   this hit the branch-REUSE hazard: `feat/x` PR#10 cached as Merged → `feat/x`
+///   recreated/force-pushed with new work → a stale-Merged snapshot in the scanner
+///   path would `delete_remote_ref` the now-live branch = lost work. Running it on
+///   the worker's fresh poll closes that class. (Bonus: its `gh` calls leave the
+///   scanner thread, removing more input lag.)
+/// - `auto_arm_unwatched_open_prs` — idempotent + non-destructive, so
+///   safe-on-stale, but moved here too so EVERY `prs` consumer either reads
+///   fresh-poll data here or is per-branch freshness-gated in the scanner — leaving
+///   no ungated consumer.
+///
+/// A snapshot is updated only on a SUCCESSFUL poll, so a transient `gh` failure
+/// RETAINS the last-good snapshot. Extracted (vs inline in the loop) for unit
+/// testing with a [`MockGhPoller`].
+pub(crate) fn worker_poll_and_act(
+    home: &std::path::Path,
+    shared: &GhPollCache,
+    repo: &str,
+    poller: &dyn GhPoller,
+) {
+    match poller.poll(repo) {
+        Ok((prs, polled_at)) => {
+            if let Ok(mut c) = shared.cache.lock() {
+                c.insert(repo.to_string(), (prs.clone(), polled_at));
+            }
+            super::remote_gc::gc_remote_orphans(repo, &prs);
+            super::auto_arm::auto_arm_unwatched_open_prs(home, repo, &prs);
+        }
+        Err(e) => tracing::warn!(
+            repo = %repo, error = %e,
+            "#986 gh-poll worker: poll failed (retaining last snapshot)"
+        ),
+    }
+}
+
+/// Spawn the single background gh-poll worker (#986). Drains the demand set each
+/// cycle and runs [`worker_poll_and_act`] per repo (poll + store + fresh-data
+/// consumers). `home` is needed for `auto_arm`.
+pub fn spawn_gh_poll_worker(home: std::path::PathBuf, shared: std::sync::Arc<GhPollCache>) {
+    // fire-and-forget: daemon-lifetime gh-poll worker; the loop has no exit
+    // condition and ends only when the process exits (§10.5).
+    let spawned = std::thread::Builder::new()
+        .name("gh-poll-worker".into())
+        .spawn(move || {
+            let real = CliGhPoller;
+            loop {
+                std::thread::sleep(WORKER_CADENCE);
+                let repos: Vec<String> = match shared.demand.lock() {
+                    Ok(mut d) => d.drain().collect(),
+                    Err(_) => continue,
+                };
+                for repo in repos {
+                    worker_poll_and_act(&home, &shared, &repo, &real);
+                }
+            }
+        });
+    // codex minor: a failed spawn would leave the cache permanently cold (every
+    // repo Err → no auto-arm / auto-release). Surface it loudly rather than
+    // silently degrading.
+    if let Err(e) = spawned {
+        tracing::error!(error = %e, "#986 FAILED to spawn gh-poll worker — pr_state gh-poll is now permanently cold");
+    }
 }
 
 // ─── cadence + backoff ─────────────────────────────────────────────────
@@ -294,12 +464,16 @@ pub(crate) mod tests {
     }
 
     impl GhPoller for MockGhPoller {
-        fn poll(&self, repo: &str) -> anyhow::Result<Vec<GhPrMetadata>> {
+        fn poll(&self, repo: &str) -> anyhow::Result<(Vec<GhPrMetadata>, String)> {
             self.calls.lock().push(repo.to_string());
-            self.responses
+            let prs = self
+                .responses
                 .lock()
                 .pop()
-                .unwrap_or_else(|| Ok(Vec::new()))
+                .unwrap_or_else(|| Ok(Vec::new()))?;
+            // Mock = a live poll: data is current "now" (gate always passes). Tests
+            // exercising the stale-snapshot freshness gate drive the cache directly.
+            Ok((prs, chrono::Utc::now().to_rfc3339()))
         }
     }
 
@@ -577,8 +751,155 @@ pub(crate) mod tests {
             merged_at: None,
         }])];
         let poller = MockGhPoller::new(responses);
-        let r = poller.poll("owner/repo").unwrap();
-        assert_eq!(r.len(), 1);
+        let (prs, _polled_at) = poller.poll("owner/repo").unwrap();
+        assert_eq!(prs.len(), 1);
         assert_eq!(poller.call_count(), 1);
+    }
+
+    /// #986: the SnapshotGhPoller reads the worker's cache (never spawns `gh`), and
+    /// a COLD repo returns `Err` (ambiguous) — never `Ok(empty)`, which a
+    /// positive-no-PR consumer would misread as "no PR" and false-release.
+    #[test]
+    fn snapshot_poller_cold_is_err_polled_is_ok() {
+        let cache = GhPollCache::new();
+        let poller = SnapshotGhPoller::new(cache.clone());
+        // Cold (worker hasn't polled) → Err.
+        assert!(
+            poller.poll("owner/repo").is_err(),
+            "cold cache must be Err (ambiguous), never Ok(empty)"
+        );
+        // poll() recorded demand so the worker will pick the repo up.
+        assert!(
+            cache.demand_contains_for_test("owner/repo"),
+            "demand recorded for the worker"
+        );
+        // Worker polled, found NO PRs (empty) → Ok((empty, polled_at)) = real "no PR".
+        cache
+            .cache
+            .lock()
+            .unwrap()
+            .insert("owner/repo".into(), (vec![], "2026-06-06T00:00:00Z".into()));
+        let (prs, _at) = poller.poll("owner/repo").unwrap();
+        assert_eq!(
+            prs,
+            Vec::<GhPrMetadata>::new(),
+            "polled-empty → Ok(empty) = positively no PR (distinct from cold)"
+        );
+        // Worker polled, found a PR → Ok((prs, polled_at)).
+        let pr = GhPrMetadata {
+            number: 5,
+            author_login: "a".into(),
+            head_ref: "fix/y".into(),
+            is_cross_repository: false,
+            is_draft: false,
+            state: GhPrState::Open,
+            merged_at: None,
+        };
+        cache.cache.lock().unwrap().insert(
+            "o/r2".into(),
+            (vec![pr.clone()], "2026-06-06T00:00:00Z".into()),
+        );
+        let (prs2, _at2) = poller.poll("o/r2").unwrap();
+        assert_eq!(prs2, vec![pr]);
+    }
+
+    /// #986 Bug B: the gh-poll worker must be spawned EXACTLY ONCE in production —
+    /// the `PrStateScanHandler`, the single scanner in every mode. A second spawn
+    /// (e.g. re-adding the supervisor scan) means 2× gh + warm-up flapping with two
+    /// independent caches. Guard the production call-site count across all entry
+    /// points. (This test lives in gh_poll.rs — which holds the spawn fn DEFINITION,
+    /// not a call site — and assembles the needle, so it never self-counts.)
+    #[test]
+    fn exactly_one_gh_poll_worker_spawn_site_986() {
+        let files = [
+            "src/daemon/per_tick/pr_state_scan.rs",
+            "src/daemon/supervisor.rs",
+            "src/daemon/mod.rs",
+            "src/app/mod.rs",
+        ];
+        let needle = format!("{}(", "spawn_gh_poll_worker");
+        let count: usize = files
+            .iter()
+            .map(|f| {
+                std::fs::read_to_string(f)
+                    .or_else(|_| std::fs::read_to_string(format!("agend-terminal/{f}")))
+                    .unwrap_or_default()
+            })
+            .map(|src| src.matches(needle.as_str()).count())
+            .sum();
+        assert_eq!(
+            count, 1,
+            "#986: gh-poll worker must be spawned exactly once across all entry points (got {count})"
+        );
+    }
+
+    /// #986 round-4: the worker runs the moved fresh-data `prs` consumers on the
+    /// JUST-polled data — verified via `auto_arm`'s observable effect (a ci-watch
+    /// armed for an open PR with a bound agent). It also stores the snapshot.
+    /// (`remote_gc`'s `delete_remote_ref` is destructive + not unit-observable, but
+    /// rides the same code path here.)
+    #[test]
+    fn worker_poll_and_act_runs_fresh_consumers_986() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-986-worker-{}-{}",
+            std::process::id(),
+            "fresh"
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        // Bind an agent to feat/x so auto_arm can resolve a subscriber.
+        let rt = crate::paths::runtime_dir(&home).join("dev-x");
+        std::fs::create_dir_all(&rt).unwrap();
+        std::fs::write(
+            rt.join("binding.json"),
+            serde_json::json!({
+                "version": 1, "branch": "feat/x", "task_id": "t",
+                "worktree": "", "source_repo": "/x", "issued_at": "2026-06-06T00:00:00Z"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let open = GhPrMetadata {
+            number: 7,
+            author_login: "dev-x".into(),
+            head_ref: "feat/x".into(),
+            is_cross_repository: false,
+            is_draft: false,
+            state: GhPrState::Open,
+            merged_at: None,
+        };
+        let cache = GhPollCache::new();
+        let poller = MockGhPoller::new(vec![Ok(vec![open])]);
+        worker_poll_and_act(&home, &cache, "owner/repo", &poller);
+        assert!(
+            cache.cache.lock().unwrap().contains_key("owner/repo"),
+            "worker stored the fresh snapshot"
+        );
+        let ci_dir = crate::daemon::ci_watch::ci_watches_dir(&home);
+        let armed = std::fs::read_dir(&ci_dir)
+            .map(|d| d.flatten().count() > 0)
+            .unwrap_or(false);
+        assert!(
+            armed,
+            "worker ran auto_arm on the FRESH poll → a ci-watch was armed"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// #986 round-4 (codex branch-reuse hazard): the DESTRUCTIVE `gc_remote_orphans`
+    /// must NEVER be reachable from the stale-snapshot scanner path. A source-scan
+    /// pins it OUT of `scanner.rs` (it lives only in the worker, on fresh data) — so
+    /// a stale-Merged snapshot can never drive `delete_remote_ref` against a
+    /// since-reused live branch. Needle assembled so this test never self-matches.
+    #[test]
+    fn scanner_does_not_invoke_remote_gc_986() {
+        let src = std::fs::read_to_string("src/daemon/pr_state/scanner.rs")
+            .or_else(|_| std::fs::read_to_string("agend-terminal/src/daemon/pr_state/scanner.rs"))
+            .expect("scanner.rs readable");
+        let needle = format!("{}(", "gc_remote_orphans");
+        assert!(
+            !src.contains(needle.as_str()),
+            "#986: gc_remote_orphans (destructive) must not run in the stale-snapshot \
+             scanner path — it belongs in the worker on fresh poll data"
+        );
     }
 }
