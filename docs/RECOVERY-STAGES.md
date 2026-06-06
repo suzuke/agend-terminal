@@ -147,12 +147,16 @@ shared with future Stages 2/3 and any other dispatcher consumers).
 | Env var | Default | Purpose |
 |---|---|---|
 | `AGEND_AUTO_RECOVERY_STAGE1` | unset (shadow) | `"1"` activates: dispatcher writes ESC byte to PTY. Unset: same telemetry, no I/O. |
-| `AGEND_AUTO_RECOVERY_STAGE1_TIMEOUT_MS` | 10000 | Window between Stage 1 fire and `Stage2Eligible` transition. |
-| `AGEND_AUTO_RECOVERY_STAGE1_COOLDOWN_MS` | 60000 | Window during which a re-entry into `Hung` skips Stage 1 (anti-thrash). |
 
-The dispatcher reads env vars **each tick** — operator can flip
+The dispatcher reads the gate env var **each tick** — operator can flip
 `AGEND_AUTO_RECOVERY_STAGE1=1` without restarting the daemon. Important
 for the shadow→active promotion workflow.
+
+The Stage 1 timeout (10 s, `STAGE1_TIMEOUT_DEFAULT_MS`) and cooldown
+(60 s, `STAGE1_COOLDOWN_DEFAULT_MS`) are **fixed consts, not
+env-configurable** (#env-cleanup: the
+`AGEND_AUTO_RECOVERY_STAGE1_TIMEOUT_MS` / `_COOLDOWN_MS` overrides were
+demoted).
 
 ### Promotion criteria (operator action)
 
@@ -298,8 +302,9 @@ Decision §1.4 Delta 2: 1s default backoff before `spawn_agent` runs in
 the Stage 2 arm. Defensive padding against tight-loop on transient
 spawn errors (filesystem / network / PTY allocation). Crash path uses
 exponential 5s+ backoff; Stage 2's controlled action permits shorter
-delay. Operator override via env var
-`AGEND_AUTO_RECOVERY_STAGE2_BACKOFF_MS`.
+delay. Fixed const `STAGE2_BACKOFF_DEFAULT_MS` (1 s), not env-configurable
+(#env-cleanup: the `AGEND_AUTO_RECOVERY_STAGE2_BACKOFF_MS` override was
+demoted).
 
 ### 9.4 Stage 2 fail criteria (3 modes)
 
@@ -311,8 +316,9 @@ on any of:
    Operator already received telegram pre-emit. Phase 1 limitation:
    manual respawn or future operator-unpause command required.
 2. **30s timeout window expired** without recovery (`state != Healthy`
-   when `entered_at.elapsed() >= STAGE2_TIMEOUT_DEFAULT_MS`). Operator
-   override via `AGEND_AUTO_RECOVERY_STAGE2_TIMEOUT_MS`.
+   when `entered_at.elapsed() >= STAGE2_TIMEOUT_DEFAULT_MS`). Fixed const
+   (30 s), not env-configurable (#env-cleanup: the
+   `AGEND_AUTO_RECOVERY_STAGE2_TIMEOUT_MS` override was demoted).
 3. **Agent re-Hungs within Stage 2 window** — `Stage2Pending` and
    state == Hung implies brief Healthy then back to Hung; more
    aggressive escalation. (Phase 1 implementation: timeout check
@@ -370,9 +376,13 @@ escalation timeline.
 | Env var | Default | Purpose |
 |---|---|---|
 | `AGEND_AUTO_RECOVERY_STAGE2` | unset (shadow) | `"1"` activates: dispatcher emits `Stage2Restart` event. Unset: same telemetry, no emission. |
-| `AGEND_AUTO_RECOVERY_STAGE2_TIMEOUT_MS` | 30000 | Stage 2 monitoring window. |
-| `AGEND_AUTO_RECOVERY_STAGE2_BACKOFF_MS` | 1000 | Backoff before respawn worker spawn attempt. |
 | `AGEND_AUTO_RECOVERY_STAGE2_MAX_RESTARTS` | 3 | Cumulative cap → direct `Stage3Eligible` escalation. |
+
+The Stage 2 monitoring window (30 s, `STAGE2_TIMEOUT_DEFAULT_MS`) and
+respawn backoff (1 s, `STAGE2_BACKOFF_DEFAULT_MS`) are **fixed consts, not
+env-configurable** (#env-cleanup: the
+`AGEND_AUTO_RECOVERY_STAGE2_TIMEOUT_MS` / `_BACKOFF_MS` overrides were
+demoted).
 
 Same shadow-mode promotion workflow as Stage 1: operator runs in
 shadow for ≥2 weeks, classifies would-have-fires via

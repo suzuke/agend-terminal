@@ -798,7 +798,7 @@ The daemon exposes a localhost-only TCP API using NDJSON (newline-delimited JSON
 
 - **Localhost TCP** on a random port (published to `<home>/run/<pid>/api.port`)
 - **No TLS** — localhost-only assumption; same-user access enforced by filesystem permissions
-- **Connection cap**: 32 concurrent sessions (configurable via `AGEND_API_MAX_CONNS`)
+- **Connection cap**: 32 concurrent sessions (fixed const; #env-cleanup: the `AGEND_API_MAX_CONNS` override was demoted)
 
 ### Authentication
 
