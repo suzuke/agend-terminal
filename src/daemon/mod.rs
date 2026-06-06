@@ -1086,8 +1086,16 @@ fn replay_missed_at_startup(home: &Path, registry: &AgentRegistry) {
 }
 
 /// Staggered-spawn delay — rate-limits PTY init during multi-agent startup
-/// bursts. Tunable via `AGEND_SPAWN_STAGGER_MS`.
+/// bursts. Production value is a fixed 500 ms.
+///
+/// `AGEND_SPAWN_STAGGER_MS` is a **test-only seam, NOT a production tunable**
+/// (#env-cleanup): the daemon is a separate process, so a cross-process
+/// integration test that spawns it has env as its only lever to set a
+/// deterministic stagger (e.g. `tests/ready_marker_invariants` /
+/// `tests/attached_path_mcp_invariants` pin a specific value to create a
+/// reproducible startup-race window). Operators never set it.
 fn spawn_stagger() -> std::time::Duration {
+    // test-only seam (see fn doc): prod always falls through to the 500ms default.
     let ms: u64 = std::env::var("AGEND_SPAWN_STAGGER_MS")
         .ok()
         .and_then(|v| v.parse().ok())

@@ -260,14 +260,22 @@ fn proxy_tool_call(
 /// answered with `ok:false` — propagate immediately so the caller sees
 /// the real diagnostic instead of looping on a deterministic failure.
 ///
-/// Default budget 30 s — well above any observed startup time on a 9-agent
-/// fleet — overridable via `AGEND_BRIDGE_TOOLS_LIST_TIMEOUT_MS` for tests.
-/// On exhaustion the last transport error propagates; callers convert to a
-/// visible JSON-RPC error, never a silent empty tool list (Bug 2 contract).
+/// Production budget is a fixed 30 s — well above any observed startup time on
+/// a 9-agent fleet. On exhaustion the last transport error propagates; callers
+/// convert to a visible JSON-RPC error, never a silent empty tool list (Bug 2
+/// contract).
+///
+/// `AGEND_BRIDGE_TOOLS_LIST_TIMEOUT_MS` is a **test-only seam, NOT a production
+/// tunable** (#env-cleanup): this proxy runs in the `agend-mcp-bridge` BINARY,
+/// so a cross-process integration test that spawns the bridge has env as its
+/// only lever to shorten this timeout (e.g. `tests/attached_path_mcp_invariants`
+/// sets 300ms so the daemon-unreachable error path returns fast instead of
+/// waiting the full 30 s). Operators never set it.
 fn proxy_tools_list_with_retry(
     home: &Path,
     conn: &mut Option<(BufReader<TcpStream>, TcpStream)>,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    // test-only seam (see fn doc): prod always falls through to the 30_000 default.
     let timeout_ms: u64 = std::env::var("AGEND_BRIDGE_TOOLS_LIST_TIMEOUT_MS")
         .ok()
         .and_then(|v| v.parse().ok())

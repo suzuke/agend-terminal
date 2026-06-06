@@ -128,7 +128,6 @@ These live in the `agend-git` shim binary (`src/bin/agend-git.rs`). The three
 
 | Name | Purpose | Default (unset) | Valid values / format | Source | Notes |
 |------|---------|-----------------|-----------------------|--------|-------|
-| `AGEND_BRIDGE_TOOLS_LIST_TIMEOUT_MS` | Overrides the `tools/list` retry-timeout budget in the MCP bridge proxy. | `30_000` ms. | `u64` ms; malformed → default. | `src/bin/agend-mcp-bridge.rs:271` | Test-oriented override (internal). |
 
 ---
 
@@ -148,7 +147,6 @@ These live in the `agend-git` shim binary (`src/bin/agend-git.rs`). The three
 |------|---------|-----------------|-----------------------|--------|-------|
 | `AGEND_POINTER_ONLY_INJECT` | When on, PTY inbox injection uses header-only ("pointer") format, forcing agents to call `inbox` for the body. | `false`. | `"1"` enables; else off. | `src/daemon_config.rs:27` (seeds `DaemonConfig::default`); consumed via `src/inbox/notify.rs:14` | Env read only at default-construction; runtime value lives in `DaemonConfig`. |
 | `AGEND_CTRLC_SENTINEL` | Debug aid: inside the Ctrl+C handler, if set, write a "fired at &lt;time&gt;" sentinel file to the given path (isolating signal handling on Windows). | No sentinel file written. | Filesystem path string. | `src/bootstrap/signals.rs:39` | Internal diagnostic. |
-| `AGEND_SPAWN_STAGGER_MS` | Staggered-spawn delay rate-limiting PTY init during multi-agent startup bursts. | `500` ms. | `u64` ms; unparseable → 500. | `src/daemon/mod.rs:1073` | Startup tuning. |
 
 ---
 
@@ -177,13 +175,18 @@ verify against code once their PRs land.
 
 ---
 
-## 14. Test-only fixtures
+## 14. Test-only fixtures & seams
 
 ⚠️ **Do not set these in production.** They are test-harness conventions /
-fixtures and have no (or vestigial) production read sites.
+fixtures, or **test-only seams** whose env read exists ONLY so a cross-process
+integration test (which spawns an agend binary as a subprocess) can control
+that subprocess's timing — production always uses the fixed default. They are
+**not production tunables**.
 
 | Name | Purpose | Source | Notes |
 |------|---------|--------|-------|
+| `AGEND_BRIDGE_TOOLS_LIST_TIMEOUT_MS` | **Test-only seam.** Shortens the `agend-mcp-bridge` `tools/list` retry-timeout budget so a cross-process test sees the daemon-unreachable error fast. Production always uses the fixed **30 s** default. | `src/bin/agend-mcp-bridge.rs:271` (read); set by `tests/attached_path_mcp_invariants.rs` | Not a production tunable (#env-cleanup reclassify). `u64` ms; malformed → default. |
+| `AGEND_SPAWN_STAGGER_MS` | **Test-only seam.** Sets the multi-agent staggered-spawn delay in a spawned daemon so a cross-process test gets a deterministic startup-race window. Production always uses the fixed **500 ms** default. | `src/daemon/mod.rs:1091` (read); set by `tests/ready_marker_invariants.rs`, `tests/attached_path_mcp_invariants.rs` | Not a production tunable (#env-cleanup reclassify). `u64` ms; unparseable → default. |
 
 ---
 
