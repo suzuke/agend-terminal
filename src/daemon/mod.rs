@@ -210,6 +210,19 @@ fn confirm_shutdown_or_abort_respawn(shutdown: &AtomicBool) -> bool {
     true
 }
 
+/// #1814 round-2: settle window before the FINAL pre-exit liveness recheck (the
+/// recover-as-primary gate in `run_core`). Gives a successor that is crashing
+/// around the predecessor's teardown a moment to surface so the recheck catches
+/// it. Env-overridable (`AGEND_SELF_RESPAWN_SETTLE_SECS`) — tests widen it so
+/// the cross-process death lands deterministically inside the recheck window.
+fn self_respawn_settle() -> std::time::Duration {
+    let secs = std::env::var("AGEND_SELF_RESPAWN_SETTLE_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(1);
+    std::time::Duration::from_secs(secs)
+}
+
 /// Record the reason the daemon is shutting down. Idempotent on
 /// re-entry (first-write-wins via `compare_exchange`); safe to
 /// call from signal handlers + API threads + watchdog without
@@ -701,6 +714,17 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
                 std::thread::sleep(std::time::Duration::from_secs(3));
                 std::process::exit(1);
             }
+            // §3.9 round-2 test seam: stay alive LONG enough to pass the
+            // predecessor's loop-break recheck (so teardown begins), then die
+            // DURING the predecessor's teardown window — exercises the final
+            // recover-as-primary gate (predecessor re-spawns agents + resumes).
+            if std::env::var("AGEND_FORCE_SUCCESSOR_FAIL_DURING_TEARDOWN").as_deref() == Ok("1") {
+                tracing::warn!(
+                    "#1814 AGEND_FORCE_SUCCESSOR_FAIL_DURING_TEARDOWN=1 — successor surviving Phase-1 + loop-break, dying in teardown window (test seam)"
+                );
+                std::thread::sleep(std::time::Duration::from_secs(15));
+                std::process::exit(1);
+            }
             tracing::info!(
                 "#1814 successor-handoff: control-ready; waiting for predecessor to release flock"
             );
@@ -735,79 +759,127 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
 
     let (_keepalive, handlers, tick_rx) = build_tick_infrastructure(home, &ctx);
 
-    loop {
-        if ctx.shutdown.load(Ordering::Relaxed) {
-            // #1814 FIX2: a set shutdown flag from a self-respawn commit only
-            // tears down if the successor is still alive; otherwise abort-stay-alive.
-            if confirm_shutdown_or_abort_respawn(&ctx.shutdown) {
-                break;
-            }
-            continue;
-        }
-
-        let exit_event: Option<crate::agent::AgentExitEvent>;
-        crossbeam_channel::select! {
-            recv(ctx.crash_rx) -> msg => { exit_event = msg.ok(); }
-            recv(tick_rx) -> _ => { exit_event = None; }
-            recv(shutdown_rx) -> _ => { continue; }
-        }
-
-        let tick_ctx = per_tick::TickContext {
-            home,
-            registry: &ctx.registry,
-            externals: &ctx.externals,
-            configs: &ctx.configs,
-        };
-        crate::runtime_config::reload(home);
-        // #1339: operator-mode.json reloaded each tick — a mode change (via the
-        // `mode` MCP tool) propagates fleet-wide without a restart (reload-coherent).
-        crate::operator_mode::reload(home);
-        per_tick::run_handlers_with_panic_guard(&handlers, &tick_ctx);
-
-        let exit_event = match exit_event {
-            Some(e) => e,
-            None => continue,
-        };
-
-        if ctx.shutdown.load(Ordering::Relaxed) {
-            if confirm_shutdown_or_abort_respawn(&ctx.shutdown) {
-                break;
-            }
-            continue;
-        }
-        match exit_event {
-            crate::agent::AgentExitEvent::CleanExit(ref name) => {
-                tracing::info!(agent = %name, "clean exit — removing from registry (no respawn)");
-                // #1441: registry is UUID-keyed; resolve name via fleet.yaml.
-                if let Some(id) = crate::fleet::resolve_uuid(home, name) {
-                    ctx.registry.lock().remove(&id);
+    // #1814 round-2: `'serve` wraps the tick loop + teardown so the final
+    // recover-as-primary gate (below) can `continue 'serve` to resume serving if
+    // the successor dies during the predecessor's teardown — instead of exiting
+    // into a brick. Flag-off never enters the recover gate, so it falls straight
+    // through to the byte-identical exit path after the loop.
+    'serve: loop {
+        loop {
+            if ctx.shutdown.load(Ordering::Relaxed) {
+                // #1814 FIX2: a set shutdown flag from a self-respawn commit only
+                // tears down if the successor is still alive; otherwise abort-stay-alive.
+                if confirm_shutdown_or_abort_respawn(&ctx.shutdown) {
+                    break;
                 }
-                ctx.configs.lock().remove(name.as_str());
+                continue;
             }
-            crate::agent::AgentExitEvent::Stage2Restart(name) => {
-                spawn_stage2_thread(home, &name, &ctx);
+
+            let exit_event: Option<crate::agent::AgentExitEvent>;
+            crossbeam_channel::select! {
+                recv(ctx.crash_rx) -> msg => { exit_event = msg.ok(); }
+                recv(tick_rx) -> _ => { exit_event = None; }
+                recv(shutdown_rx) -> _ => { continue; }
             }
-            crate::agent::AgentExitEvent::Crash(name) => {
-                crash_respawn::handle_crash_respawn(home, &name, &ctx);
+
+            let tick_ctx = per_tick::TickContext {
+                home,
+                registry: &ctx.registry,
+                externals: &ctx.externals,
+                configs: &ctx.configs,
+            };
+            crate::runtime_config::reload(home);
+            // #1339: operator-mode.json reloaded each tick — a mode change (via the
+            // `mode` MCP tool) propagates fleet-wide without a restart (reload-coherent).
+            crate::operator_mode::reload(home);
+            per_tick::run_handlers_with_panic_guard(&handlers, &tick_ctx);
+
+            let exit_event = match exit_event {
+                Some(e) => e,
+                None => continue,
+            };
+
+            if ctx.shutdown.load(Ordering::Relaxed) {
+                if confirm_shutdown_or_abort_respawn(&ctx.shutdown) {
+                    break;
+                }
+                continue;
+            }
+            match exit_event {
+                crate::agent::AgentExitEvent::CleanExit(ref name) => {
+                    tracing::info!(agent = %name, "clean exit — removing from registry (no respawn)");
+                    // #1441: registry is UUID-keyed; resolve name via fleet.yaml.
+                    if let Some(id) = crate::fleet::resolve_uuid(home, name) {
+                        ctx.registry.lock().remove(&id);
+                    }
+                    ctx.configs.lock().remove(name.as_str());
+                }
+                crate::agent::AgentExitEvent::Stage2Restart(name) => {
+                    spawn_stage2_thread(home, &name, &ctx);
+                }
+                crate::agent::AgentExitEvent::Crash(name) => {
+                    crash_respawn::handle_crash_respawn(home, &name, &ctx);
+                }
             }
         }
+
+        log_residual_worktrees(home);
+
+        let metrics = shutdown_sequence(home, &ctx.registry, started_at);
+        crate::event_log::log(
+            home,
+            "daemon_stop",
+            "",
+            &format!(
+                "reason={} agents_total={} agents_killed_after_grace={} uptime_secs={}",
+                metrics.reason.as_str(),
+                metrics.agents_total,
+                metrics.agents_killed_after_grace,
+                metrics.uptime_secs
+            ),
+        );
+
+        // #1814 round-2 (reviewer TOCTOU): FINAL recover-as-primary gate. We have
+        // killed our agents (`shutdown_sequence` drained the registry) but the run
+        // dir + cookie + api-server thread are STILL intact (`remove_dir_all` below
+        // hasn't run). This is the last point before the irreversible exit/flock-
+        // release. Re-check the successor's liveness as late as possible:
+        //   • successor DEAD → do NOT exit. Recover as primary: clear the restart
+        //     flags, re-spawn our fleet agents into the (still-live) registry, and
+        //     `continue 'serve` to resume serving. No brick; agents re-spawned.
+        //   • successor ALIVE → commit: drop the run dir and exit(0) IMMEDIATELY
+        //     (no intervening sleep) so the only un-closable window is the
+        //     microseconds between this check and the exit syscall (the d-2 step-6
+        //     residual — a successor death after THIS point needs an external
+        //     supervisor and is out of scope for Stage 1).
+        // Flag-off never enters this block → it falls through to the byte-identical
+        // exit path after `'serve`.
+        if RESTART_PENDING.load(Ordering::Acquire) && crate::daemon::restart::self_respawn_enabled()
+        {
+            std::thread::sleep(self_respawn_settle());
+            if self_respawn_successor_died() {
+                tracing::error!(
+                "#1814 self-respawn: successor died DURING predecessor teardown — recovering as \
+                 primary (re-spawning agents, resuming; no brick)."
+            );
+                RESTART_PENDING.store(false, Ordering::Release);
+                ctx.shutdown.store(false, Ordering::Relaxed);
+                *SELF_RESPAWN_SUCCESSOR
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = None;
+                let _ = std::fs::remove_file(home.join("restart-requested"));
+                spawn_fleet_agents(home, &agents, &ctx);
+                continue 'serve;
+            }
+            let _ = std::fs::remove_file(home.join("restart-requested"));
+            let _ = std::fs::remove_dir_all(run_dir(home));
+            tracing::info!("#1814 self-respawn: successor healthy through teardown — exiting 0");
+            std::process::exit(0);
+        }
+
+        break 'serve;
     }
 
-    log_residual_worktrees(home);
-
-    let metrics = shutdown_sequence(home, &ctx.registry, started_at);
-    crate::event_log::log(
-        home,
-        "daemon_stop",
-        "",
-        &format!(
-            "reason={} agents_total={} agents_killed_after_grace={} uptime_secs={}",
-            metrics.reason.as_str(),
-            metrics.agents_total,
-            metrics.agents_killed_after_grace,
-            metrics.uptime_secs
-        ),
-    );
     let _ = std::fs::remove_dir_all(run_dir(home));
     std::thread::sleep(std::time::Duration::from_secs(1));
 

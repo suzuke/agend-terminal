@@ -38,6 +38,10 @@ enum SuccessorFault {
     /// Successor passes Phase-1 (answers STATUS) then dies before the flock —
     /// exercises the predecessor's commit→exit liveness recheck (FIX2).
     AfterControlReady,
+    /// Successor survives Phase-1 AND the predecessor's loop-break recheck, then
+    /// dies DURING the predecessor's teardown window — exercises the round-2
+    /// final recover-as-primary gate (predecessor re-spawns agents + resumes).
+    DuringTeardown,
 }
 
 /// Boot a real daemon with self-respawn ON, NO external-supervisor env, and a
@@ -70,6 +74,8 @@ fn boot(home: &Path, fault: SuccessorFault) -> Child {
         .env_remove("AGEND_SUCCESSOR_HANDOFF")
         .env_remove("AGEND_FORCE_SUCCESSOR_FAIL")
         .env_remove("AGEND_FORCE_SUCCESSOR_FAIL_AFTER_CONTROL_READY")
+        .env_remove("AGEND_FORCE_SUCCESSOR_FAIL_DURING_TEARDOWN")
+        .env_remove("AGEND_SELF_RESPAWN_SETTLE_SECS")
         .args(["start", "--foreground"])
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -80,6 +86,14 @@ fn boot(home: &Path, fault: SuccessorFault) -> Child {
         }
         SuccessorFault::AfterControlReady => {
             cmd.env("AGEND_FORCE_SUCCESSOR_FAIL_AFTER_CONTROL_READY", "1");
+        }
+        SuccessorFault::DuringTeardown => {
+            // Successor stays alive 15s past control-ready (surviving the
+            // predecessor's ~10s loop-break tick), then dies. Widen the
+            // predecessor's pre-exit settle so its final recover-gate recheck
+            // lands AFTER the successor's death — deterministic across CI slop.
+            cmd.env("AGEND_FORCE_SUCCESSOR_FAIL_DURING_TEARDOWN", "1")
+                .env("AGEND_SELF_RESPAWN_SETTLE_SECS", "12");
         }
     }
     cmd.spawn().expect("daemon must spawn")
@@ -399,5 +413,55 @@ fn self_respawn_aborts_when_successor_dies_after_phase1_commit() {
     assert!(
         still_serves,
         "predecessor must keep serving its agents after the FIX2 abort"
+    );
+}
+
+/// #1814 round-2 (reviewer TOCTOU): the successor survives Phase-1 AND the
+/// predecessor's loop-break recheck (so the predecessor begins teardown), then
+/// dies DURING teardown — before the predecessor's irreversible exit. The final
+/// recover-as-primary gate must catch this: the predecessor does NOT exit, it
+/// re-spawns its agents and resumes as primary. Asserts the predecessor (SAME
+/// pid) is still the single active daemon, serving its (re-spawned) agent — no
+/// brick. (`SELF_RESPAWN_SETTLE_SECS=12` widens the recheck window so the
+/// cross-process death lands inside it deterministically.)
+#[test]
+fn self_respawn_recovers_as_primary_when_successor_dies_during_teardown() {
+    let home =
+        std::env::temp_dir().join(format!("agend-selfrespawn-teardown-{}", std::process::id()));
+    std::fs::create_dir_all(&home).expect("mkdir AGEND_HOME");
+
+    let mut d1 = boot(&home, SuccessorFault::DuringTeardown);
+
+    let old_pid = match wait_for_single_active(&home, Duration::from_secs(30), pid_alive) {
+        Some(p) => p,
+        None => {
+            let _ = d1.kill();
+            cleanup_test_home(&home);
+            panic!("first boot never became the single active daemon");
+        }
+    };
+    set_mode_active(&home);
+
+    let _ = trigger_restart(&home, old_pid);
+
+    // Wait out: loop-break tick (~10s) + shutdown_sequence (~2s) + settle (12s) +
+    // re-spawn/resume + margin. Successor dies at control-ready+15s, inside the
+    // widened recheck window → predecessor recovers as primary.
+    std::thread::sleep(Duration::from_secs(40));
+
+    let still_old = active_pids(&home) == vec![old_pid] && pid_alive(old_pid);
+    let still_serves = ls_lists_probe_within(&home, Duration::from_secs(15));
+
+    let _ = d1.kill();
+    let _ = d1.wait();
+    cleanup_test_home(&home);
+
+    assert!(
+        still_old,
+        "predecessor must recover-as-primary (SAME pid) when the successor dies during teardown — no brick"
+    );
+    assert!(
+        still_serves,
+        "predecessor must re-spawn + keep serving its agent after recover-as-primary"
     );
 }
