@@ -43,16 +43,18 @@ pub(super) fn handle_restart_daemon(home: &Path) -> Value {
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
-    use std::sync::{Mutex, OnceLock};
 
     /// Tests touch the process-global `RESTART_PENDING` static and env
-    /// state — serialise via a function-scoped mutex so parallel test
-    /// threads can't race. Also resets `RESTART_PENDING` after each
-    /// test so the next caller sees a clean slate.
+    /// state. Serialise via the SINGLE crate-wide
+    /// [`crate::daemon::test_env_lock`] (shared with `daemon::restart` +
+    /// `per_tick::recovery_dispatcher`) — env mutation races across all
+    /// keys, so a module-local mutex wouldn't serialise against those
+    /// other modules' env tests (#1812). Also resets `RESTART_PENDING`
+    /// after each test so the next caller sees a clean slate.
     fn with_env_and_reset<R>(set: &[(&str, &str)], unset: &[&str], f: impl FnOnce() -> R) -> R {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let lock = LOCK.get_or_init(|| Mutex::new(()));
-        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::daemon::test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let all_keys: Vec<&str> = set
             .iter()

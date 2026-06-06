@@ -193,6 +193,24 @@ pub fn run_dir(home: &Path) -> PathBuf {
     home.join("run").join(std::process::id().to_string())
 }
 
+/// #1812: the SINGLE process-wide lock that every test mutating (or
+/// reading) process-global env must hold.
+///
+/// `std::env::set_var` / `remove_var` / `var` race across the WHOLE
+/// environment, not per key — the libc `environ` is one shared,
+/// non-atomic array (which is exactly why Rust 1.84 made the mutators
+/// `unsafe`). So two tests guarding DIFFERENT keys with DIFFERENT
+/// per-module mutexes still data-race each other. A reviewer caught this
+/// when `cargo test restart` interleaved `daemon::restart` and
+/// `per_tick::recovery_dispatcher` env tests under their separate locks.
+/// Cross-module env tests must lock THIS, not a local static.
+#[cfg(test)]
+pub(crate) fn test_env_lock() -> &'static std::sync::Mutex<()> {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 /// Find any active run directory (for CLI commands connecting to daemon).
 /// Verifies identity via .daemon file (PID + start timestamp) to prevent PID reuse false positives.
 pub fn find_active_run_dir(home: &Path) -> Option<PathBuf> {

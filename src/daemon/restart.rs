@@ -91,15 +91,15 @@ fn has_env(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
 
-    /// Tests touch process-global env state — serialise via a
-    /// function-scoped mutex so parallel test threads don't race.
-    /// Mirror of the `with_f9_gate` pattern in `src/health.rs`.
+    /// Tests touch process-global env state — serialise via the SINGLE
+    /// crate-wide [`crate::daemon::test_env_lock`] (NOT a module-local
+    /// mutex): env mutation races across all keys, so per-module locks
+    /// don't serialise against other modules' env tests (#1812).
     fn with_env<R>(set: &[(&str, &str)], unset: &[&str], f: impl FnOnce() -> R) -> R {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let lock = LOCK.get_or_init(|| Mutex::new(()));
-        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::daemon::test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let all_keys: Vec<&str> = set
             .iter()

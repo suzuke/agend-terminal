@@ -888,6 +888,11 @@ mod tests {
     fn env_ms_defaults_when_var_unset() {
         // Sanity: env_ms falls back to default when env var missing.
         // Use a unique var name to avoid colliding with other tests.
+        // #1812: shared crate-wide env lock — even a unique key data-races
+        // the global environ against another module's concurrent set_var.
+        let _guard = crate::daemon::test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::remove_var("AGEND_TEST_RECOVERY_NONEXISTENT_VAR");
         }
@@ -906,13 +911,15 @@ mod tests {
 
     use crate::agent::{AgentRegistry, ExternalRegistry};
     use std::collections::HashMap;
-    use std::sync::OnceLock;
 
     fn with_stage1_gate<R>(active: bool, f: impl FnOnce() -> R) -> R {
-        // Serialise tests touching `AGEND_AUTO_RECOVERY_STAGE1`.
-        static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
-        let lock = LOCK.get_or_init(|| std::sync::Mutex::new(()));
-        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        // #1812: serialise via the SINGLE crate-wide env lock, not a
+        // module-local one — env mutation races across ALL keys, so a
+        // local mutex wouldn't serialise against `daemon::restart`'s env
+        // tests (the `cargo test restart` interleave the reviewer caught).
+        let _guard = crate::daemon::test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let prior = std::env::var(STAGE1_ENV_VAR).ok();
         // SAFETY: serialised by the LOCK guard. Test-only env mutation.
         unsafe {
@@ -1111,6 +1118,10 @@ mod tests {
     #[test]
     fn env_ms_parses_valid_integer() {
         // Env var parses to Duration via integer ms.
+        // #1812: shared crate-wide env lock (see `env_ms_defaults_when_var_unset`).
+        let _guard = crate::daemon::test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var("AGEND_TEST_RECOVERY_ENV_MS_VALID", "5000");
         }
@@ -1125,6 +1136,10 @@ mod tests {
     fn env_ms_falls_back_on_invalid_integer() {
         // Garbage env var value → fall back to default rather than
         // panic. Operator typo doesn't crash the dispatcher.
+        // #1812: shared crate-wide env lock (see `env_ms_defaults_when_var_unset`).
+        let _guard = crate::daemon::test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var("AGEND_TEST_RECOVERY_ENV_MS_INVALID", "not a number");
         }
@@ -1144,9 +1159,10 @@ mod tests {
     // -------------------------------------------------------------------
 
     fn with_stage2_gate<R>(active: bool, f: impl FnOnce() -> R) -> R {
-        static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
-        let lock = LOCK.get_or_init(|| std::sync::Mutex::new(()));
-        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        // #1812: shared crate-wide env lock (see `with_stage1_gate`).
+        let _guard = crate::daemon::test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let prior = std::env::var(STAGE2_ENV_VAR).ok();
         unsafe {
             if active {
@@ -1198,7 +1214,14 @@ mod tests {
     #[test]
     fn stage2_max_restarts_default_is_three() {
         // Default cap N=3 per decision §Q1/Q2. Env var override unset
-        // returns the default.
+        // returns the default. #1812: hold the shared crate-wide env lock
+        // — `stage2_max_restarts()` READS env, which races a concurrent
+        // `set_var` from another module's test (e.g. daemon::restart)
+        // just as a write would.
+        let _guard = crate::daemon::test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var(STAGE2_MAX_RESTARTS_ENV_VAR).ok();
         unsafe {
             std::env::remove_var(STAGE2_MAX_RESTARTS_ENV_VAR);
         }
@@ -1206,16 +1229,30 @@ mod tests {
             stage2_max_restarts(),
             crate::health::STAGE2_MAX_RESTARTS_DEFAULT
         );
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var(STAGE2_MAX_RESTARTS_ENV_VAR, v),
+                None => std::env::remove_var(STAGE2_MAX_RESTARTS_ENV_VAR),
+            }
+        }
     }
 
     #[test]
     fn stage2_max_restarts_env_override() {
+        // #1812: shared crate-wide env lock + save/restore (see above).
+        let _guard = crate::daemon::test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var(STAGE2_MAX_RESTARTS_ENV_VAR).ok();
         unsafe {
             std::env::set_var(STAGE2_MAX_RESTARTS_ENV_VAR, "5");
         }
         assert_eq!(stage2_max_restarts(), 5);
         unsafe {
-            std::env::remove_var(STAGE2_MAX_RESTARTS_ENV_VAR);
+            match prior {
+                Some(v) => std::env::set_var(STAGE2_MAX_RESTARTS_ENV_VAR, v),
+                None => std::env::remove_var(STAGE2_MAX_RESTARTS_ENV_VAR),
+            }
         }
     }
 
@@ -1304,9 +1341,10 @@ mod tests {
     // -------------------------------------------------------------------
 
     fn with_stage3_gate<R>(active: bool, f: impl FnOnce() -> R) -> R {
-        static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
-        let lock = LOCK.get_or_init(|| std::sync::Mutex::new(()));
-        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        // #1812: shared crate-wide env lock (see `with_stage1_gate`).
+        let _guard = crate::daemon::test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let prior = std::env::var(STAGE3_ENV_VAR).ok();
         unsafe {
             if active {
