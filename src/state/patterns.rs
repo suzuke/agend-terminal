@@ -351,15 +351,30 @@ impl StatePatterns {
     /// extends the #1518 absolute-tail-position gate to "relative to the working
     /// marker" and never touches `clears_server_rate_limit_retry` (#1713). A
     /// genuinely-stuck error has NO in-flight working marker below it → `None`.
-    pub(crate) fn working_state_below(&self, text: &str, error_match: &str) -> Option<AgentState> {
+    ///
+    /// Returns the winning `(state, marker_text)`. The matched marker substring is
+    /// surfaced for the `#1808-flaw2-probe` instrumentation so a caller can log
+    /// *which* on-screen marker overrode a ServerRateLimit (to check empirically
+    /// whether a static bottom-bar chrome — e.g. Agy/Kiro's bare `esc to cancel` —
+    /// is masking a stuck throttle). The state-selection logic is unchanged (same
+    /// filter + lowest-marker-below-error pick), so detection behavior is identical.
+    pub(crate) fn working_state_below<'a>(
+        &self,
+        text: &'a str,
+        error_match: &str,
+    ) -> Option<(AgentState, &'a str)> {
         let err_pos = text.rfind(error_match)?;
         self.patterns
             .iter()
             .filter(|(s, _)| matches!(s, AgentState::Thinking | AgentState::ToolUse))
-            .filter_map(|(s, re)| re.find_iter(text).last().map(|m| (m.start(), *s)))
-            .filter(|(pos, _)| *pos > err_pos)
-            .max_by_key(|(pos, _)| *pos)
-            .map(|(_, s)| s)
+            .filter_map(|(s, re)| {
+                re.find_iter(text)
+                    .last()
+                    .map(|m| (m.start(), *s, m.as_str()))
+            })
+            .filter(|(pos, _, _)| *pos > err_pos)
+            .max_by_key(|(pos, _, _)| *pos)
+            .map(|(_, s, marker)| (s, marker))
     }
 }
 
