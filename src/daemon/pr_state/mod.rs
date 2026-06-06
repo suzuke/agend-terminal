@@ -1932,12 +1932,24 @@ mod tests {
         )
         .unwrap();
 
-        // gh-poll observes one OPEN PR on that branch.
+        // #986 round-4: auto_arm MOVED to the worker, so discovery now spans
+        // scanner → worker. (1) The scanner (snapshot poller) must seed DEMAND for
+        // the bound branch's repo (the #1782 discovery seed). (2) The worker then
+        // polls that repo (one OPEN PR) and runs auto_arm on the FRESH data.
+        let cache = crate::daemon::pr_state::gh_poll::GhPollCache::new();
+        scan_and_emit_with(
+            &home,
+            &empty_registry(),
+            &crate::daemon::pr_state::gh_poll::SnapshotGhPoller::new(cache.clone()),
+        );
+        assert!(
+            cache.demand_contains_for_test("owner/repo"),
+            "scanner must seed demand for the bound branch's repo (#1782 discovery)"
+        );
         let poller = MockGhPoller::new(vec![Ok(vec![gh_meta_open(700, "feat/x", "suzuke")])]);
+        crate::daemon::pr_state::gh_poll::worker_poll_and_act(&home, &cache, "owner/repo", &poller);
 
-        scan_and_emit_with(&home, &empty_registry(), &poller);
-
-        // The bound-branch discovery path must have auto-armed a watch.
+        // The worker's auto_arm must have armed a watch for the discovered branch.
         let watch = crate::daemon::ci_watch::ci_watches_dir(&home).join(
             crate::daemon::ci_watch::watch_filename("owner/repo", "feat/x"),
         );

@@ -398,16 +398,13 @@ fn apply_gh_poll(home: &Path, dir: &Path, poller: &dyn gh_poll::GhPoller) {
                         );
                     }
                 }
-                // #1750-B4: piggyback remote-orphan branch GC on the poll just
-                // done — `prs` already carries every PR's {state, head_ref,
-                // merged_at}, so no second poller. Best-effort; never blocks the
-                // scanner.
-                super::remote_gc::gc_remote_orphans(&repo, &prs);
-                // PR-3 (t-ci-ready-pr3-arm-not-armed): same piggyback — auto-arm a
-                // ci-watch for any OPEN PR with no armed watch. Closes the
-                // bypass/non-dispatch arm-not-armed gap (#1782) server-side, the
-                // only place a `--no-verify` bypass push is observable.
-                super::auto_arm::auto_arm_unwatched_open_prs(home, &repo, &prs);
+                // #986 round-4: `gc_remote_orphans` (DESTRUCTIVE — #1750-B4) and
+                // `auto_arm` (#1782 / PR-3) MOVED OUT of this stale-snapshot scanner
+                // path into `gh_poll::worker_poll_and_act`, where they run on the
+                // worker's FRESH poll. A stale snapshot here could have driven
+                // `delete_remote_ref` against a since-reused live branch (Merged PR
+                // branch-reuse). The scanner now only does the per-branch,
+                // freshness-gated state apply above.
             }
             Err(e) => {
                 tracing::warn!(repo = %repo, error = %e, "#986 gh-poll failed");
