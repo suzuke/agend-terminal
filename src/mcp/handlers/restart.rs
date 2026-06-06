@@ -88,10 +88,17 @@ fn handle_self_respawn(home: &Path) -> Value {
         // freshly-bound SUCCESSOR — which then shuts itself down the instant it
         // promotes (observed). RESTART_PENDING is process-local to THIS
         // predecessor, so there is no cross-daemon misdelivery.
+        // #1814 FIX2: park the successor's child handle so the run_core loop can
+        // do a FINAL liveness recheck before the irreversible teardown — if the
+        // successor dies in the commit→exit window, the loop aborts-stay-alive
+        // instead of bricking. Park BEFORE setting RESTART_PENDING (which arms
+        // the shutdown bridge) so the handle is always available to the recheck.
+        let succ_pid = succ.pid;
+        crate::daemon::park_self_respawn_successor(succ.child);
         crate::daemon::RESTART_PENDING.store(true, std::sync::atomic::Ordering::Release);
         std::fs::write(home.join("restart-requested"), "").ok();
         tracing::info!(
-            successor_pid = succ.pid,
+            successor_pid = succ_pid,
             "#1814 self-respawn: committed — predecessor exiting"
         );
         json!({

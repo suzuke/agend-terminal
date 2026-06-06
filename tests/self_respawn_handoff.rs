@@ -28,10 +28,22 @@ fn bin() -> PathBuf {
     assert_cmd::cargo::cargo_bin("agend-terminal")
 }
 
+/// Injected successor failure mode for the abort-path tests.
+#[derive(Clone, Copy, PartialEq)]
+enum SuccessorFault {
+    /// Successor comes up healthy and promotes (happy path).
+    None,
+    /// Successor crashes on launch (fails the Phase-1 gate → handler aborts).
+    OnLaunch,
+    /// Successor passes Phase-1 (answers STATUS) then dies before the flock —
+    /// exercises the predecessor's commit→exit liveness recheck (FIX2).
+    AfterControlReady,
+}
+
 /// Boot a real daemon with self-respawn ON, NO external-supervisor env, and a
-/// single no-auth shell probe agent (fleet size 1). `force_successor_fail`
-/// injects the abort seam (the spawned successor crashes on launch).
-fn boot(home: &Path, force_successor_fail: bool) -> Child {
+/// single no-auth shell probe agent (fleet size 1). `fault` injects a successor
+/// failure seam for the abort-path tests.
+fn boot(home: &Path, fault: SuccessorFault) -> Child {
     let mut cmd = Command::new(bin());
     cmd.env("AGEND_HOME", home)
         .env("AGEND_RESTART_HANDOFF", "1")
@@ -42,13 +54,19 @@ fn boot(home: &Path, force_successor_fail: bool) -> Child {
         .env_remove("XPC_SERVICE_NAME")
         .env_remove("INVOCATION_ID")
         .env_remove("AGEND_SUCCESSOR_HANDOFF")
+        .env_remove("AGEND_FORCE_SUCCESSOR_FAIL")
+        .env_remove("AGEND_FORCE_SUCCESSOR_FAIL_AFTER_CONTROL_READY")
         .args(["start", "--foreground", "--agents", "probe:/bin/sh"])
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    if force_successor_fail {
-        cmd.env("AGEND_FORCE_SUCCESSOR_FAIL", "1");
-    } else {
-        cmd.env_remove("AGEND_FORCE_SUCCESSOR_FAIL");
+    match fault {
+        SuccessorFault::None => {}
+        SuccessorFault::OnLaunch => {
+            cmd.env("AGEND_FORCE_SUCCESSOR_FAIL", "1");
+        }
+        SuccessorFault::AfterControlReady => {
+            cmd.env("AGEND_FORCE_SUCCESSOR_FAIL_AFTER_CONTROL_READY", "1");
+        }
     }
     cmd.spawn().expect("daemon must spawn")
 }
@@ -206,7 +224,7 @@ fn self_respawn_succeeds_with_no_external_supervisor() {
     let home = std::env::temp_dir().join(format!("agend-selfrespawn-ok-{}", std::process::id()));
     std::fs::create_dir_all(&home).expect("mkdir AGEND_HOME");
 
-    let mut d1 = boot(&home, false);
+    let mut d1 = boot(&home, SuccessorFault::None);
 
     // First boot must serve (generous: cold spawn + bind + agent spawn).
     let old_pid = match wait_for_single_active(&home, Duration::from_secs(30), pid_alive) {
@@ -266,7 +284,7 @@ fn self_respawn_aborts_and_old_stays_alive_when_successor_fails() {
     let home = std::env::temp_dir().join(format!("agend-selfrespawn-fail-{}", std::process::id()));
     std::fs::create_dir_all(&home).expect("mkdir AGEND_HOME");
 
-    let mut d1 = boot(&home, true); // successor will crash on launch
+    let mut d1 = boot(&home, SuccessorFault::OnLaunch); // successor crashes on launch
 
     let old_pid = match wait_for_single_active(&home, Duration::from_secs(30), pid_alive) {
         Some(p) => p,
@@ -316,5 +334,56 @@ fn self_respawn_aborts_and_old_stays_alive_when_successor_fails() {
     assert!(
         still_serves,
         "predecessor must keep serving its agents after abort"
+    );
+}
+
+/// #1814 FIX2 (reviewer race High): the successor passes Phase-1 (answers a
+/// STATUS round-trip) so the predecessor COMMITS, but then dies before
+/// acquiring the flock — the predecessor's pre-exit liveness recheck must catch
+/// this and abort-stay-alive instead of exiting into a brick. Asserts the
+/// predecessor (SAME pid) is still the single active daemon, still serving, a
+/// while after the commit window.
+#[test]
+fn self_respawn_aborts_when_successor_dies_after_phase1_commit() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-selfrespawn-postphase1-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&home).expect("mkdir AGEND_HOME");
+
+    let mut d1 = boot(&home, SuccessorFault::AfterControlReady);
+
+    let old_pid = match wait_for_single_active(&home, Duration::from_secs(30), pid_alive) {
+        Some(p) => p,
+        None => {
+            let _ = d1.kill();
+            teardown(&home);
+            panic!("first boot never became the single active daemon");
+        }
+    };
+    set_mode_active(&home);
+
+    // Commit happens (successor answers Phase-1), then the successor dies before
+    // the flock. The predecessor's loop recheck must abort + stay alive.
+    let _ = trigger_restart(&home, old_pid);
+
+    // Wait past the predecessor's tick-latency recheck window (the loop notices
+    // the shutdown flag + rechecks the dead successor on its next ~10s tick).
+    std::thread::sleep(Duration::from_secs(25));
+
+    let still_old = active_pids(&home) == vec![old_pid] && pid_alive(old_pid);
+    let still_serves = ls_lists_probe_within(&home, Duration::from_secs(10));
+
+    let _ = d1.kill();
+    let _ = d1.wait();
+    teardown(&home);
+
+    assert!(
+        still_old,
+        "predecessor must abort-stay-alive (SAME pid) when the successor dies in the commit→exit window — no brick"
+    );
+    assert!(
+        still_serves,
+        "predecessor must keep serving its agents after the FIX2 abort"
     );
 }

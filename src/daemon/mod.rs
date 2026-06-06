@@ -152,6 +152,64 @@ pub(crate) static SHUTDOWN_REASON: AtomicU8 = AtomicU8::new(0);
 /// without API-layer plumbing.
 pub(crate) static RESTART_PENDING: AtomicBool = AtomicBool::new(false);
 
+/// #1814 FIX2 (reviewer race High): the spawned successor's child handle, parked
+/// by `handle_self_respawn` at commit so the run_core loop can do a FINAL
+/// liveness recheck (`try_wait`, which also reaps) before the irreversible
+/// teardown. Phase-1 only proves the successor was healthy at probe time; it has
+/// not yet acquired the flock / spawned agents. If it dies in the commit→exit
+/// window, exiting anyway would brick the control plane — so the loop aborts
+/// (clears RESTART_PENDING, stays alive) instead. (Residual: a successor that
+/// dies AFTER the predecessor has already exited needs an external supervisor —
+/// the d-2 step-6 accepted residual, not closable here.)
+static SELF_RESPAWN_SUCCESSOR: std::sync::Mutex<Option<std::process::Child>> =
+    std::sync::Mutex::new(None);
+
+/// #1814 FIX2: park the successor child handle for the pre-exit liveness recheck.
+pub(crate) fn park_self_respawn_successor(child: std::process::Child) {
+    *SELF_RESPAWN_SUCCESSOR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(child);
+}
+
+/// #1814 FIX2: true iff a parked successor has already exited (`try_wait` reaps
+/// it). `None` parked → false (no self-respawn in flight).
+fn self_respawn_successor_died() -> bool {
+    let mut guard = SELF_RESPAWN_SUCCESSOR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    match guard.as_mut() {
+        Some(child) => matches!(child.try_wait(), Ok(Some(_))),
+        None => false,
+    }
+}
+
+/// #1814 FIX2: when the shutdown flag is set, decide whether to truly tear down.
+/// For a self-respawn restart, do a final successor-liveness recheck; if the
+/// successor died after commit, ABORT-STAY-ALIVE (clear the flags, drop the
+/// dead handle, keep serving). Returns `true` → break the loop (teardown);
+/// `false` → keep running. (Residual race: an in-flight api session could
+/// re-set the shutdown flag from a stale RESTART_PENDING read after we clear it
+/// → the next iteration would then exit; this is no worse than pre-FIX2 and the
+/// window is vanishingly small.)
+fn confirm_shutdown_or_abort_respawn(shutdown: &AtomicBool) -> bool {
+    if !RESTART_PENDING.load(Ordering::Acquire) || !crate::daemon::restart::self_respawn_enabled() {
+        return true;
+    }
+    if self_respawn_successor_died() {
+        tracing::error!(
+            "#1814 self-respawn: successor died after commit but before predecessor exit — \
+             ABORTING restart, staying alive (no brick). Operator may retry restart_daemon."
+        );
+        RESTART_PENDING.store(false, Ordering::Release);
+        shutdown.store(false, Ordering::Relaxed);
+        *SELF_RESPAWN_SUCCESSOR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        return false;
+    }
+    true
+}
+
 /// Record the reason the daemon is shutting down. Idempotent on
 /// re-entry (first-write-wins via `compare_exchange`); safe to
 /// call from signal handlers + API threads + watchdog without
@@ -249,8 +307,22 @@ pub fn find_active_run_dir(home: &Path) -> Option<PathBuf> {
                     continue;
                 }
             }
-            // No .daemon file but PID alive → legacy or corrupted, accept it
-            return Some(entry.path());
+            // No (valid) `.daemon` identity file but PID alive → NOT discoverable.
+            // #1814 (reviewer race High): a handoff successor publishes its
+            // run dir + api.port pre-flock (so the predecessor can Phase-1-probe
+            // it by name via `connect_run_dir_api`) but writes `.daemon` only
+            // AFTER it acquires the flock (promotes). Skipping un-`.daemon`'d
+            // dirs here keeps a half-promoted successor invisible to generic
+            // discovery during the overlap window — generic clients route only
+            // to the fully-promoted daemon (single-primary-lease invariant). A
+            // normal daemon writes `.daemon` at boot (microsecond gap), so this
+            // never hides a real primary. (Pre-#1814 this fell through to
+            // "accept it" for a since-extinct legacy/no-`.daemon` daemon class.)
+            tracing::debug!(
+                path = %entry.path().display(),
+                "#1814: run dir has no `.daemon` identity (pre-promote successor or mid-boot) — not discoverable yet"
+            );
+            continue;
         }
     }
     None
@@ -618,10 +690,26 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
         FleetSource::Resolved { agents, .. } => (agents, None::<crate::bootstrap::DaemonLock>),
         FleetSource::HandoffDeferred { fleet_path, opts } => {
             write_control_ready(home);
+            // §3.9 FIX2 test seam: pass Phase-1 (api stays up to answer STATUS
+            // for a moment) then die BEFORE acquiring the flock — exercises the
+            // predecessor's commit→exit liveness recheck (abort-stay-alive).
+            if std::env::var("AGEND_FORCE_SUCCESSOR_FAIL_AFTER_CONTROL_READY").as_deref() == Ok("1")
+            {
+                tracing::warn!(
+                    "#1814 AGEND_FORCE_SUCCESSOR_FAIL_AFTER_CONTROL_READY=1 — successor answering Phase-1 then aborting before flock (test seam)"
+                );
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                std::process::exit(1);
+            }
             tracing::info!(
                 "#1814 successor-handoff: control-ready; waiting for predecessor to release flock"
             );
             let lock = crate::bootstrap::acquire_daemon_lock_blocking(home, HANDOFF_LOCK_WAIT)?;
+            // #1814 FIX1: NOW that we hold the flock (predecessor has exited),
+            // publish the `.daemon` identity so generic discovery
+            // (`find_active_run_dir`) starts routing to us. Before this point we
+            // were intentionally undiscoverable (pre-flock = not the primary).
+            write_daemon_id(&run_dir(home));
             tracing::info!(
                 "#1814 successor-handoff: flock acquired — sole daemon, running deferred reconciles + resolve"
             );
@@ -649,7 +737,12 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
 
     loop {
         if ctx.shutdown.load(Ordering::Relaxed) {
-            break;
+            // #1814 FIX2: a set shutdown flag from a self-respawn commit only
+            // tears down if the successor is still alive; otherwise abort-stay-alive.
+            if confirm_shutdown_or_abort_respawn(&ctx.shutdown) {
+                break;
+            }
+            continue;
         }
 
         let exit_event: Option<crate::agent::AgentExitEvent>;
@@ -677,7 +770,10 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
         };
 
         if ctx.shutdown.load(Ordering::Relaxed) {
-            break;
+            if confirm_shutdown_or_abort_respawn(&ctx.shutdown) {
+                break;
+            }
+            continue;
         }
         match exit_event {
             crate::agent::AgentExitEvent::CleanExit(ref name) => {
@@ -760,6 +856,15 @@ fn init_daemon_services(
         ..crate::daemon_config::DaemonConfig::default()
     });
 
+    // #1814 FIX3 (reviewer-2, non-blocking) TODO(Stage 2): the three shared-
+    // state GC/migration steps below (skills::cleanup_stale_stages,
+    // dedup_state::cleanup_tmp_orphans, tasks::migrate_legacy_tasks_json_to_event_log)
+    // run inside `init_daemon_services`, which on the successor-handoff path
+    // executes PRE-flock (before the predecessor exits) — technically escaping
+    // the "minimal pre-lock" contract. Low risk for now (the first two are
+    // retention-gated; the third is idempotent), so left in place for Stage 1.
+    // Stage 2 should split `init_daemon_services` (as `prepare` was split into
+    // pre/post-lock) so these run only after the handoff successor holds the flock.
     const SKILLS_STAGE_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
     crate::bootstrap::time_step("skills::cleanup_stale_stages", || {
         match crate::skills::cleanup_stale_stages(home, SKILLS_STAGE_RETENTION_SECS, &[]) {
@@ -1725,6 +1830,49 @@ mod tests {
         let found = find_active_run_dir(&home);
         assert!(found.is_none());
         assert!(!run.exists());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1814 FIX1 (reviewer race High): a run dir with an alive pid but NO
+    /// `.daemon` identity file (= a handoff successor that has published its api
+    /// pre-flock but NOT yet promoted) must NOT be discoverable via
+    /// `find_active_run_dir`. Otherwise generic CLI/MCP clients could route to a
+    /// half-promoted, no-agent successor during the overlap window (split-brain).
+    #[test]
+    fn find_active_run_dir_skips_dir_without_daemon_identity() {
+        let home = tmp_home("no_daemon_identity");
+        let pid = std::process::id(); // this test process — guaranteed alive
+        let run = home.join("run").join(pid.to_string());
+        std::fs::create_dir_all(&run).ok();
+        // Successor pre-promote shape: api.port published, but NO `.daemon`.
+        crate::ipc::write_port(&run, crate::ipc::API_NAME, 65000).ok();
+        assert!(
+            find_active_run_dir(&home).is_none(),
+            "a run dir without a `.daemon` identity must not be discoverable (pre-promote successor)"
+        );
+        // The dir must survive (it's a live successor mid-handoff, not stale).
+        assert!(
+            run.exists(),
+            "must NOT delete the un-promoted successor's run dir"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1814 FIX1 companion: once the `.daemon` identity (matching pid) IS
+    /// present (= the successor promoted post-flock), the dir becomes
+    /// discoverable again — the normal-daemon path is unchanged.
+    #[test]
+    fn find_active_run_dir_returns_dir_with_valid_daemon_identity() {
+        let home = tmp_home("valid_daemon_identity");
+        let pid = std::process::id();
+        let run = home.join("run").join(pid.to_string());
+        std::fs::create_dir_all(&run).ok();
+        write_daemon_id(&run); // writes `<pid>:<ts>` for the current (alive) pid
+        assert_eq!(
+            find_active_run_dir(&home).as_deref(),
+            Some(run.as_path()),
+            "a run dir with a valid matching `.daemon` must be discoverable"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 

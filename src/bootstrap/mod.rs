@@ -394,7 +394,15 @@ pub fn prepare_handoff_prelock(home: &Path) -> Result<PathBuf> {
     let run_dir = crate::daemon::run_dir(home);
     std::fs::create_dir_all(&run_dir)
         .with_context(|| format!("create run dir {}", run_dir.display()))?;
-    crate::daemon::write_daemon_id(&run_dir);
+    // #1814 (reviewer race High, FIX1): do NOT write the `.daemon` identity
+    // file here. Writing it pre-flock would make `find_active_run_dir` treat
+    // this half-promoted successor as a discoverable primary during the overlap
+    // window (split-brain — generic clients could route to a no-agent daemon).
+    // `.daemon` is written only AFTER the flock is acquired (see
+    // `run_successor_handoff` → post-lock `write_daemon_id`). The predecessor's
+    // Phase-1 probe reaches us by NAME (`connect_run_dir_api` on our run dir),
+    // not via `find_active_run_dir`, so omitting `.daemon` here is harmless to
+    // the handshake.
     crate::auth_cookie::issue(&run_dir).context("issue api.cookie (handoff pre-lock)")?;
     Ok(run_dir)
 }

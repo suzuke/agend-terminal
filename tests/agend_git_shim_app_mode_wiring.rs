@@ -4,40 +4,62 @@
 //! the 4 init functions (binding::reconcile_hooks, symlink_shim,
 //! reconcile_orphans, worktree_pool::reconcile_orphan_leases).
 
-/// Verify bootstrap::prepare source contains all 4 init calls.
+/// Verify the bootstrap prepare path wires all 4 shim init calls + extract.
 /// Source-grep approach (same pattern as sprint52_no_self_ipc).
-#[test]
-fn bootstrap_prepare_contains_all_shim_init_calls() {
-    let src = include_str!("../src/bootstrap/mod.rs");
+///
+/// #1814: the init calls moved out of `prepare`'s textual body into the
+/// extracted `resolve_fleet_and_reconcile` helper (which `prepare` calls, and
+/// which the successor-handoff path re-uses post-lock). The wiring is still
+/// in the prepare path — so this test now (a) confirms `prepare` calls
+/// `resolve_fleet_and_reconcile`, and (b) greps that helper's body for the
+/// init calls. Net guarantee is unchanged: the shim init runs on the daemon
+/// `start` path.
+fn fn_body<'a>(src: &'a str, signature: &str) -> &'a str {
     let fn_start = src
-        .find("pub fn prepare(")
-        .expect("prepare function must exist");
+        .find(signature)
+        .unwrap_or_else(|| panic!("{signature} must exist"));
     let rest = &src[fn_start..];
     let fn_end = rest
         .find("\n/// ")
         .or_else(|| rest.find("\npub fn "))
+        .or_else(|| rest.find("\npub(crate) fn "))
+        .or_else(|| rest.find("\nfn "))
         .unwrap_or(rest.len());
-    let body = &rest[..fn_end];
+    &rest[..fn_end]
+}
 
+#[test]
+fn bootstrap_prepare_contains_all_shim_init_calls() {
+    let src = include_str!("../src/bootstrap/mod.rs");
+
+    // (a) prepare must delegate to the extracted helper (the wiring link).
+    let prepare_body = fn_body(src, "pub fn prepare(");
+    assert!(
+        prepare_body.contains("resolve_fleet_and_reconcile("),
+        "bootstrap::prepare must call resolve_fleet_and_reconcile (the shim-init home)"
+    );
+
+    // (b) the helper must contain all 4 init calls + extract_default.
+    let body = fn_body(src, "pub(crate) fn resolve_fleet_and_reconcile(");
     assert!(
         body.contains("binding::reconcile_hooks("),
-        "bootstrap::prepare must call reconcile_hooks"
+        "resolve_fleet_and_reconcile must call reconcile_hooks"
     );
     assert!(
         body.contains("binding::symlink_shim("),
-        "bootstrap::prepare must call symlink_shim"
+        "resolve_fleet_and_reconcile must call symlink_shim"
     );
     assert!(
         body.contains("binding::reconcile_orphans("),
-        "bootstrap::prepare must call reconcile_orphans"
+        "resolve_fleet_and_reconcile must call reconcile_orphans"
     );
     assert!(
         body.contains("worktree_pool::reconcile_orphan_leases("),
-        "bootstrap::prepare must call reconcile_orphan_leases"
+        "resolve_fleet_and_reconcile must call reconcile_orphan_leases"
     );
     assert!(
         body.contains("protocol::extract_default("),
-        "bootstrap::prepare must call protocol::extract_default"
+        "resolve_fleet_and_reconcile must call protocol::extract_default"
     );
 }
 
