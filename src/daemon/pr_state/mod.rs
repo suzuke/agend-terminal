@@ -1841,6 +1841,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// #986 round-3 (codex) §3.9 real-entry: a stale snapshot that FINDS the
+    /// branch's PR as `Closed` (the PR was since reopened; the worker hasn't
+    /// refreshed) must NOT apply the sticky `ClosedUnmergedObserved` transition.
+    /// Removing the `found ||` bypass means freshness gates found-PR transitions
+    /// too — a stale found-PR is applied to nothing until a fresh poll.
+    #[test]
+    fn stale_found_pr_does_not_drive_terminal_transition_986() {
+        let mut s = new_state("sha-reopen", ReviewClass::Single);
+        s.pr_number = 42; // previously observed open
+        s.last_gh_poll_at = Some("2026-06-06T00:00:00+00:00".into());
+        // merge_state defaults to NotReady (non-terminal) — the PR is open.
+        let home = home_with_state("reopen-986", s);
+        // Stale snapshot (polled long before created_at) showing the PR as Closed.
+        let closed = GhPrMetadata {
+            number: 42,
+            author_login: "dev".into(),
+            head_ref: "feat/test".into(),
+            is_cross_repository: false,
+            is_draft: false,
+            state: GhPrState::Closed,
+            merged_at: None,
+        };
+        let cache = crate::daemon::pr_state::gh_poll::GhPollCache::new();
+        cache.seed_for_test("owner/repo", vec![closed], "2000-01-01T00:00:00+00:00");
+        let poller = crate::daemon::pr_state::gh_poll::SnapshotGhPoller::new(cache);
+        scan_and_emit_with(&home, &empty_registry(), &poller);
+        let loaded = load(&home, "owner/repo", "feat/test").unwrap();
+        assert!(
+            !matches!(
+                loaded.merge_state,
+                MergeState::ClosedUnmerged { .. } | MergeState::Merged { .. }
+            ),
+            "#986: a STALE found-Closed must NOT drive a terminal transition: {:?}",
+            loaded.merge_state
+        );
+        assert!(
+            loaded.last_gh_poll_at == Some("2026-06-06T00:00:00+00:00".into()),
+            "stale poll must not re-stamp last_gh_poll_at"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     /// PR-3 (t-ci-ready-pr3-arm-not-armed) — INTEGRATION (codex re-verify): a
     /// BOUND branch with NO ci-watch AND NO pr-state file must STILL be
     /// discovered and auto-armed. This exercises the binding-seeded discovery

@@ -366,39 +366,35 @@ fn apply_gh_poll(home: &Path, dir: &Path, poller: &dyn gh_poll::GhPoller) {
             Ok((prs, polled_at)) => {
                 for state in due_states {
                     let branch = state.branch.clone();
-                    // #986 Bug A (stale-snapshot freshness gate): the SnapshotGhPoller
-                    // may return a RETAINED snapshot that predates this branch's PR.
-                    // A "no PR found" only counts as a positive "no PR" (clears
-                    // failures + stamps last_gh_poll_at → eligible for QueriedNone /
-                    // release) if the poll POST-DATES the branch's first-tracked time
-                    // (`created_at`) — otherwise a stale-reuse would manufacture a
-                    // false "queried, none found" and false-release a worktree whose
-                    // PR simply isn't in the cache yet. Finding the PR is always
-                    // trustworthy (a real observation, regardless of poll age).
-                    let found = prs.iter().any(|m| m.head_ref == branch);
-                    let trustworthy = found || poll_is_fresh_for(&polled_at, &state.created_at);
+                    // #986 Bug A (codex round-3): freshness gates ALL state-changing
+                    // observations UNIFORMLY — not just "no PR found". A stale
+                    // snapshot (polled BEFORE this branch was first tracked) is
+                    // applied to NOTHING: not a no-PR confirmation, and NOT a
+                    // found-PR transition. The earlier `found ||` bypass let a stale
+                    // found-PR — e.g. an old `Closed` for a since-reopened PR — drive
+                    // a STICKY terminal transition (ClosedUnmergedObserved) →
+                    // false-release. Async snapshots introduce this staleness (the
+                    // pre-#986 synchronous poll was always fresh). Stale → leave the
+                    // branch due + ambiguous; a fresh poll arrives within ~1 worker
+                    // cadence (~15s) and only then applies observations + stamps.
+                    if !poll_is_fresh_for(&polled_at, &state.created_at) {
+                        tracing::debug!(
+                            repo = %repo, branch = %branch,
+                            polled_at = %polled_at, created_at = %state.created_at,
+                            "#986 gh-poll: stale snapshot predates branch tracking — applying nothing, awaiting fresh poll"
+                        );
+                        continue;
+                    }
                     if let Err(e) = with_pr_state(home, &repo, &branch, |s| {
                         apply_gh_observations(home, s, &prs, &now);
-                        if trustworthy {
-                            s.gh_poll_failures = 0;
-                            s.last_gh_poll_at = Some(now.clone());
-                        }
-                        // else: leave the state untouched → it stays due and
-                        // ambiguous (Unknown) until a fresh poll (polled_at >=
-                        // created_at) arrives; never a false positive-no-PR.
+                        s.gh_poll_failures = 0;
+                        s.last_gh_poll_at = Some(now.clone());
                     }) {
                         tracing::warn!(
                             repo = %repo,
                             branch = %branch,
                             error = %e,
                             "#986 pr_state: post-gh-poll save failed"
-                        );
-                    }
-                    if !trustworthy {
-                        tracing::debug!(
-                            repo = %repo, branch = %branch,
-                            polled_at = %polled_at, created_at = %state.created_at,
-                            "#986 gh-poll: snapshot predates branch tracking — not a confirmed no-PR"
                         );
                     }
                 }
