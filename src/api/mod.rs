@@ -696,6 +696,29 @@ fn spawn_one(
 /// if the server does not reply `{"ok":true}`. The cookie file has mode
 /// 0600 so only the daemon's user can read it — this is the peer-UID
 /// substitute for TCP loopback (see `auth_cookie.rs`).
+/// #1814: like [`call`] but targets a SPECIFIC run dir (cookie + api.port read
+/// from `run_dir`), not the active daemon. Used by the self-respawn Phase-1
+/// gate so the predecessor can do a real cookie-authenticated round-trip
+/// against the successor's own control plane while both are briefly alive. A
+/// short fixed read timeout (the gate retries) keeps a flaky successor from
+/// hanging the handler. No self-IPC guard: this connects to a DIFFERENT
+/// process's socket, so the registry-lock deadlock class does not apply.
+pub fn call_at(run_dir: &Path, request: &Value) -> anyhow::Result<Value> {
+    let stream = crate::ipc::connect_run_dir_api(run_dir)?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .context("set call_at read timeout")?;
+    let cookie = crate::auth_cookie::read_cookie(run_dir)?;
+    let mut writer = stream.try_clone()?;
+    let mut reader = BufReader::new(stream);
+    crate::auth_cookie::client_handshake_ndjson(&mut reader, &mut writer, &cookie)?;
+    writeln!(writer, "{request}")?;
+    writer.flush()?;
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    Ok(serde_json::from_str(&line)?)
+}
+
 pub fn call(home: &Path, request: &Value) -> anyhow::Result<Value> {
     // #1492: self-IPC over the loopback socket. If the caller holds the
     // registry lock, the API handler servicing this call needs the same lock →

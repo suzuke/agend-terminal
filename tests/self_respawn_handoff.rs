@@ -1,0 +1,320 @@
+//! #1814 Stage 1 — self-respawn (flag-gated successor handoff) §3.9 real-entry
+//! integration tests.
+//!
+//! These drive the REAL flow end-to-end, not a mocked handoff: a real daemon
+//! binary boots with `AGEND_RESTART_HANDOFF=1` and NO external supervisor env, the
+//! real `restart_daemon` MCP tool is invoked over the real api socket, which
+//! spawns a REAL successor binary (`start --foreground` + `AGEND_SUCCESSOR_
+//! HANDOFF`), runs the real Phase-1 health gate, and either commits (predecessor
+//! exits 0, successor promotes) or aborts (predecessor stays alive).
+//!
+//! Coverage:
+//! - happy / no external supervisor → a NEW pid serves the api, the OLD pid is
+//!   dead, agents are re-spawned, exactly one active run dir remains.
+//! - successor-fails (injected via `AGEND_FORCE_SUCCESSOR_FAIL=1`) → the OLD
+//!   daemon stays alive (SAME pid still serving), restart reports ok:false.
+//!
+//! Unix-only (mirrors `restart_smoke.rs`): the handoff path is Unix-first for
+//! Stage 1; Windows keeps `exit(42)` + Task Scheduler.
+#![cfg(unix)]
+
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpStream;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+fn bin() -> PathBuf {
+    assert_cmd::cargo::cargo_bin("agend-terminal")
+}
+
+/// Boot a real daemon with self-respawn ON, NO external-supervisor env, and a
+/// single no-auth shell probe agent (fleet size 1). `force_successor_fail`
+/// injects the abort seam (the spawned successor crashes on launch).
+fn boot(home: &Path, force_successor_fail: bool) -> Child {
+    let mut cmd = Command::new(bin());
+    cmd.env("AGEND_HOME", home)
+        .env("AGEND_RESTART_HANDOFF", "1")
+        // Strip any ambient supervisor signal so this is a genuine
+        // "no external supervisor" environment (e.g. macOS GUI sets
+        // XPC_SERVICE_NAME; CI/systemd may set INVOCATION_ID).
+        .env_remove("AGEND_WRAPPED")
+        .env_remove("XPC_SERVICE_NAME")
+        .env_remove("INVOCATION_ID")
+        .env_remove("AGEND_SUCCESSOR_HANDOFF")
+        .args(["start", "--foreground", "--agents", "probe:/bin/sh"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if force_successor_fail {
+        cmd.env("AGEND_FORCE_SUCCESSOR_FAIL", "1");
+    } else {
+        cmd.env_remove("AGEND_FORCE_SUCCESSOR_FAIL");
+    }
+    cmd.spawn().expect("daemon must spawn")
+}
+
+fn pid_alive(pid: u32) -> bool {
+    // SAFETY: signal 0 only checks existence/permission, never delivers.
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+/// Active daemon pids: a `run/<pid>` dir whose pid is alive AND has an
+/// `api.port` file. After a settled handoff there is exactly one.
+fn active_pids(home: &Path) -> Vec<u32> {
+    let run = home.join("run");
+    let Ok(entries) = std::fs::read_dir(&run) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for e in entries.flatten() {
+        if let Ok(pid) = e.file_name().to_string_lossy().parse::<u32>() {
+            if pid_alive(pid) && e.path().join("api.port").exists() {
+                out.push(pid);
+            }
+        }
+    }
+    out
+}
+
+/// Poll until exactly one daemon is active and `pred(pid)` holds, returning that
+/// pid. `None` on timeout.
+fn wait_for_single_active<F: Fn(u32) -> bool>(
+    home: &Path,
+    budget: Duration,
+    pred: F,
+) -> Option<u32> {
+    let deadline = Instant::now() + budget;
+    while Instant::now() < deadline {
+        let pids = active_pids(home);
+        if pids.len() == 1 && pred(pids[0]) {
+            return Some(pids[0]);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    None
+}
+
+/// The probe agent is listed by `ls` (which queries the live socket) within
+/// `budget` — proves the socket is up AND serving AND agents re-spawned.
+fn ls_lists_probe_within(home: &Path, budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    while Instant::now() < deadline {
+        if let Ok(out) = Command::new(bin())
+            .env("AGEND_HOME", home)
+            .arg("ls")
+            .output()
+        {
+            if String::from_utf8_lossy(&out.stdout).contains("probe") {
+                return true;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    false
+}
+
+/// Set operator mode to Active via the real `mode` CLI (api MODE → signed
+/// operator-mode.json + immediate in-memory update). REQUIRED before triggering
+/// restart: a fresh daemon with no signed operator-mode.json locks down to
+/// "Away" (#1576), and the operator gate blocks `restart_daemon` while Away —
+/// so without this the restart is (racily) gated and the handoff never runs.
+fn set_mode_active(home: &Path) {
+    let _ = Command::new(bin())
+        .env("AGEND_HOME", home)
+        .args(["mode", "active"])
+        .output();
+}
+
+/// Hex-encode bytes (lower-case), matching `auth_cookie::to_hex`.
+fn hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// Invoke the real `restart_daemon` MCP tool over the live api socket. Speaks
+/// the daemon's real wire protocol: the NDJSON cookie handshake
+/// (`{"auth":"<hex>"}` → `{"ok":true}`) FIRST, then the `mcp_tool` request. The
+/// cookie file is raw 32 bytes (see `auth_cookie::issue`); hex-encode it for the
+/// handshake. Best-effort: on the happy path the predecessor may exit before the
+/// reply lands, so commit-expecting callers poll process state, not the reply.
+fn trigger_restart(home: &Path, active_pid: u32) -> Option<serde_json::Value> {
+    let run_dir = home.join("run").join(active_pid.to_string());
+    let port: u16 = std::fs::read_to_string(run_dir.join("api.port"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    let cookie_bytes = std::fs::read(run_dir.join("api.cookie")).ok()?; // raw 32 bytes
+    let stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(45))).ok();
+    let mut writer = stream.try_clone().ok()?;
+    let mut reader = BufReader::new(stream);
+
+    // NDJSON cookie handshake (server requires this BEFORE any request).
+    writeln!(writer, "{{\"auth\":\"{}\"}}", hex(&cookie_bytes)).ok()?;
+    writer.flush().ok();
+    let mut ack = String::new();
+    reader.read_line(&mut ack).ok()?;
+    let ack: serde_json::Value = serde_json::from_str(ack.trim()).ok()?;
+    if !ack.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) {
+        return None;
+    }
+
+    // The real restart_daemon tool call.
+    let req = serde_json::json!({
+        "method": "mcp_tool",
+        "params": { "tool": "restart_daemon", "arguments": {} },
+    });
+    writeln!(writer, "{req}").ok()?;
+    writer.flush().ok();
+    let mut line = String::new();
+    reader.read_line(&mut line).ok()?;
+    serde_json::from_str(line.trim()).ok()
+}
+
+/// Kill any daemon still alive under `home/run` and remove the dir. Handoff
+/// successors run in their own process group (detached), so a harness pgid kill
+/// would miss them — clean up by scanning run dirs.
+fn teardown(home: &Path) {
+    for pid in active_pids(home) {
+        // SAFETY: deliberate cleanup signal to a known test daemon pid.
+        unsafe {
+            libc::kill(pid as i32, libc::SIGTERM);
+        }
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    for pid in active_pids(home) {
+        unsafe {
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
+    }
+    if std::env::var("AGEND_KEEP_TEST_HOME").is_err() {
+        std::fs::remove_dir_all(home).ok();
+    }
+}
+
+/// #1814 happy path: with self-respawn ON and NO external supervisor,
+/// `restart_daemon` brings up a successor that takes over — a NEW pid serves,
+/// the OLD pid dies, agents re-spawn, exactly one active run dir remains. This
+/// is the brick-class fix: restart can't strand the control plane even with no
+/// supervisor to respawn the process.
+#[test]
+fn self_respawn_succeeds_with_no_external_supervisor() {
+    let home = std::env::temp_dir().join(format!("agend-selfrespawn-ok-{}", std::process::id()));
+    std::fs::create_dir_all(&home).expect("mkdir AGEND_HOME");
+
+    let mut d1 = boot(&home, false);
+
+    // First boot must serve (generous: cold spawn + bind + agent spawn).
+    let old_pid = match wait_for_single_active(&home, Duration::from_secs(30), pid_alive) {
+        Some(p) => p,
+        None => {
+            let _ = d1.kill();
+            teardown(&home);
+            panic!("first boot never became the single active daemon");
+        }
+    };
+    assert!(
+        ls_lists_probe_within(&home, Duration::from_secs(30)),
+        "first boot must serve the probe agent"
+    );
+
+    // Operator gate allows restart only when Active (fresh daemon → Away).
+    set_mode_active(&home);
+
+    // Real restart over the real api → spawns + health-gates a real successor.
+    let _ = trigger_restart(&home, old_pid);
+
+    // A DIFFERENT pid must become the single active daemon (the successor
+    // promoted). We assert via `active_pids` (run dir + api.port + live pid),
+    // NOT `pid_alive(old_pid)`: the old daemon is a child of THIS test process,
+    // so after it exits(0) it stays a zombie (un-`wait`ed) and `kill(pid, 0)`
+    // reports a zombie as alive — a false "still alive". `active_pids` instead
+    // sees old vanish the moment it removes its own run dir on exit, leaving
+    // exactly the successor.
+    let new_pid = wait_for_single_active(&home, Duration::from_secs(60), |p| p != old_pid);
+
+    // The successor's agents must be re-spawned (probe served by the new pid).
+    let served = new_pid.is_some() && ls_lists_probe_within(&home, Duration::from_secs(30));
+    let single_after = active_pids(&home).len() == 1;
+
+    // The original child handle is the OLD daemon (now exited 0); reap it.
+    let _ = d1.wait();
+    teardown(&home);
+
+    let new_pid =
+        new_pid.expect("a NEW daemon pid must serve after self-respawn (old must be dead)");
+    assert_ne!(new_pid, old_pid, "successor must be a distinct process");
+    assert!(
+        served,
+        "successor must re-spawn agents (probe served by new pid)"
+    );
+    assert!(
+        single_after,
+        "exactly one active run dir after handoff (no double-bind / duplication)"
+    );
+}
+
+/// #1814 abort-stay-alive: when the successor fails its Phase-1 gate (injected
+/// crash-on-launch), the predecessor must NOT shut down — the SAME pid keeps
+/// serving and `restart_daemon` reports ok:false. No brick, agents intact.
+#[test]
+fn self_respawn_aborts_and_old_stays_alive_when_successor_fails() {
+    let home = std::env::temp_dir().join(format!("agend-selfrespawn-fail-{}", std::process::id()));
+    std::fs::create_dir_all(&home).expect("mkdir AGEND_HOME");
+
+    let mut d1 = boot(&home, true); // successor will crash on launch
+
+    let old_pid = match wait_for_single_active(&home, Duration::from_secs(30), pid_alive) {
+        Some(p) => p,
+        None => {
+            let _ = d1.kill();
+            teardown(&home);
+            panic!("first boot never became the single active daemon");
+        }
+    };
+
+    // Operator gate allows restart only when Active (fresh daemon → Away).
+    set_mode_active(&home);
+
+    // Restart must come back ok:false (the predecessor was never signalled, so
+    // the reply lands) and the predecessor must still be the SAME live daemon.
+    let resp = trigger_restart(&home, old_pid);
+
+    // Give any (wrongly) spawned successor a moment to settle/die, then assert
+    // the OLD daemon is unchanged and still serving.
+    std::thread::sleep(Duration::from_secs(2));
+    let still_old = active_pids(&home) == vec![old_pid] && pid_alive(old_pid);
+    let still_serves = ls_lists_probe_within(&home, Duration::from_secs(10));
+
+    let _ = d1.kill();
+    let _ = d1.wait();
+    teardown(&home);
+
+    // The mcp_tool tunnel wraps handler output as {ok:true, result:{...}}; the
+    // self-respawn ABORT is signalled by result.ok == false.
+    if let Some(resp) = resp {
+        let result_ok = resp
+            .get("result")
+            .and_then(|r| r.get("ok"))
+            .and_then(|b| b.as_bool());
+        assert_eq!(
+            result_ok,
+            Some(false),
+            "failed-successor restart must report result.ok=false, got {resp}"
+        );
+    } else {
+        panic!("abort path must return a reply (predecessor stays alive to answer)");
+    }
+    assert!(
+        still_old,
+        "predecessor must stay the SAME live daemon after abort"
+    );
+    assert!(
+        still_serves,
+        "predecessor must keep serving its agents after abort"
+    );
+}

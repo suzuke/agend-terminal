@@ -25,9 +25,12 @@ pub(crate) fn tool_timeout(tool: &str) -> Duration {
         | "list_deployments" | "set_waiting_on" | "set_display_name" | "set_description"
         | "react" | "report_health" => Duration::from_secs(5),
 
-        // Slow tools that spawn processes or do network I/O (~60s)
+        // Slow tools that spawn processes or do network I/O (~60s).
+        // #1814: restart_daemon (self-respawn) spawns a successor + runs a
+        // ≤30s Phase-1 health gate before returning — give it the 60s budget so
+        // the gate can't collide with the default 30s tool timeout.
         "create_instance" | "deploy_template" | "replace_instance" | "watch_ci"
-        | "checkout_repo" => Duration::from_secs(60),
+        | "checkout_repo" | "restart_daemon" => Duration::from_secs(60),
 
         // Default for everything else (~30s)
         _ => Duration::from_secs(30),

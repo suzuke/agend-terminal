@@ -190,7 +190,14 @@ pub(super) struct DaemonContext {
 
 /// Get the PID-isolated run directory for the current daemon.
 pub fn run_dir(home: &Path) -> PathBuf {
-    home.join("run").join(std::process::id().to_string())
+    run_dir_for_pid(home, std::process::id())
+}
+
+/// Run dir for an arbitrary daemon `pid` (`home/run/<pid>`). #1814: the
+/// self-respawn Phase-1 gate needs the SUCCESSOR's run dir (a different pid),
+/// which `run_dir` — pinned to the current process — can't give.
+pub fn run_dir_for_pid(home: &Path, pid: u32) -> PathBuf {
+    home.join("run").join(pid.to_string())
 }
 
 /// #1812: the SINGLE process-wide lock that every test mutating (or
@@ -379,7 +386,13 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
         }
     }
 
-    run_core(home, agents, None)
+    run_core(
+        home,
+        FleetSource::Resolved {
+            agents,
+            telegram: None,
+        },
+    )
 }
 
 /// Start daemon with a fleet already prepared by [`crate::bootstrap::prepare`].
@@ -410,7 +423,7 @@ pub fn run_with_prepared(mut prepared: Box<crate::bootstrap::OwnedFleet>) -> any
     // trusted source at startup to tell them apart. Unsigned bindings fail closed
     // (unbound) and re-sign on their next dispatch / bind_self.
     let _owned = prepared;
-    run_core(&home, agents, telegram)
+    run_core(&home, FleetSource::Resolved { agents, telegram })
 }
 
 /// Sprint 57 Wave 3 PR-2 (#548 Q3 contract pin): this daemon does
@@ -508,20 +521,116 @@ pub(crate) fn build_default_handlers(
 /// across all daemon processes). Per-PID identity is at
 /// `$AGEND_HOME/run/<pid>/.daemon` (PID-recycling guard for
 /// discovery — distinct purpose from the exclusive lock).
-fn run_core(
-    home: &Path,
-    agents: Vec<AgentDef>,
-    telegram: Option<Arc<dyn crate::channel::Channel>>,
-) -> anyhow::Result<()> {
+/// Where `run_core` sources its fleet from.
+///
+/// `Resolved` is the normal path: `bootstrap::prepare` already resolved the
+/// agents (and channel) under the flock. `HandoffDeferred` is the #1814
+/// successor-handoff path: the agents are NOT resolved yet because the
+/// destructive reconciles + resolve MUST wait until this successor acquires
+/// the flock (after the predecessor exits), never running in the two-daemon
+/// overlap window.
+enum FleetSource {
+    Resolved {
+        agents: Vec<AgentDef>,
+        telegram: Option<Arc<dyn crate::channel::Channel>>,
+    },
+    HandoffDeferred {
+        fleet_path: PathBuf,
+        opts: crate::bootstrap::PrepareOptions,
+    },
+}
+
+/// #1814: how long a successor waits for its predecessor to release the flock
+/// (by exiting) after Phase-1 passed. Generous — the predecessor only needs to
+/// run `shutdown_sequence` (≤2s grace) + a 1s settle before exit. A timeout is
+/// a backstop for a predecessor wedged in shutdown.
+const HANDOFF_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// #1814: marker file a handoff successor writes once its control plane (api
+/// socket) is bound, signalling the predecessor's Phase-1 gate that the
+/// control plane is ready. Distinct from `.ready` (which means "agent spawn
+/// loop complete" and is written only after promotion).
+pub const CONTROL_READY_FILE: &str = "control-ready";
+
+/// #1814 successor-handoff boot entry. Runs the minimal pre-lock prep (run dir
+/// and cookie), then `run_core` in deferred-fleet mode: bind api, write
+/// control-ready, block on the flock until the predecessor exits, then run the
+/// destructive reconciles, resolve, and spawn agents. Routed to from the
+/// `start` command only when a legitimate `AGEND_SUCCESSOR_HANDOFF` marker is
+/// present.
+pub fn run_successor_handoff(home: &Path, fleet_path: &Path) -> anyhow::Result<()> {
+    tracing::info!("#1814 successor-handoff boot: minimal pre-lock prep (no flock, no reconcile)");
+    // §3.9 test injection seam: force the successor to crash on launch (before
+    // it writes control-ready) so the integration test can exercise the
+    // predecessor's abort-stay-alive path against a REAL spawned successor.
+    // Only the handoff boot path reads this — a normal start never reaches here.
+    if std::env::var("AGEND_FORCE_SUCCESSOR_FAIL").as_deref() == Ok("1") {
+        tracing::warn!(
+            "#1814 AGEND_FORCE_SUCCESSOR_FAIL=1 — successor aborting on launch (test seam)"
+        );
+        std::process::exit(1);
+    }
+    crate::bootstrap::prepare_handoff_prelock(home)?;
+    run_core(
+        home,
+        FleetSource::HandoffDeferred {
+            fleet_path: fleet_path.to_path_buf(),
+            opts: crate::bootstrap::PrepareOptions::default(),
+        },
+    )
+}
+
+/// #1814: write the `control-ready` marker into this daemon's run dir.
+fn write_control_ready(home: &Path) {
+    let path = run_dir(home).join(CONTROL_READY_FILE);
+    if let Err(e) = std::fs::write(&path, chrono::Utc::now().to_rfc3339()) {
+        tracing::warn!(path = %path.display(), error = %e, "failed to write control-ready marker (handoff)");
+    }
+}
+
+fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
     let started_at = std::time::Instant::now();
 
-    let ctx = init_daemon_services(home, telegram)?;
+    // For the handoff path, the channel inits post-lock (its registry attaches
+    // via the #945 pending-registry bridge that `init_daemon_services` arms),
+    // so pass None here; `Resolved` carries the already-inited channel.
+    let telegram_pre = match &source {
+        FleetSource::Resolved { telegram, .. } => telegram.clone(),
+        FleetSource::HandoffDeferred { .. } => None,
+    };
+
+    let ctx = init_daemon_services(home, telegram_pre)?;
 
     // #event-bus Step 2 (legacy-zero): register the per-pattern delivery
     // subscribers once (the bus is the SOLE delivery path). Shared with
     // `app::run_app` so owned `agend-terminal app` mode wires the IDENTICAL
     // set — see `register_event_subscribers`.
     register_event_subscribers(&ctx.registry);
+
+    // `init_daemon_services` has now bound + published this process's api port.
+    // For the handoff path the predecessor is still alive: signal control-ready
+    // (so its Phase-1 gate can confirm us), then block on the flock until it
+    // exits (the commit point), and ONLY THEN run the destructive reconciles +
+    // resolve. `_handoff_lock` holds the flock for the daemon's lifetime on the
+    // handoff path (None on the normal path, where `prepare`'s `OwnedFleet`
+    // already holds it).
+    let (agents, _handoff_lock) = match source {
+        FleetSource::Resolved { agents, .. } => (agents, None::<crate::bootstrap::DaemonLock>),
+        FleetSource::HandoffDeferred { fleet_path, opts } => {
+            write_control_ready(home);
+            tracing::info!(
+                "#1814 successor-handoff: control-ready; waiting for predecessor to release flock"
+            );
+            let lock = crate::bootstrap::acquire_daemon_lock_blocking(home, HANDOFF_LOCK_WAIT)?;
+            tracing::info!(
+                "#1814 successor-handoff: flock acquired — sole daemon, running deferred reconciles + resolve"
+            );
+            crate::bootstrap::boot_hygiene_sweeps(home);
+            let (_config, agents, _telegram) =
+                crate::bootstrap::resolve_fleet_and_reconcile(home, &fleet_path, &opts)?;
+            (agents, Some(lock))
+        }
+    };
 
     spawn_fleet_agents(home, &agents, &ctx);
 
@@ -609,6 +718,22 @@ fn run_core(
     if RESTART_PENDING.load(Ordering::Acquire) {
         let flag = home.join("restart-requested");
         let _ = std::fs::remove_file(&flag);
+        if crate::daemon::restart::self_respawn_enabled() {
+            // #1814: the restart handler already spawned + Phase-1-confirmed a
+            // successor. It is blocked on our flock and promotes the moment we
+            // exit, so exit(0) (not 42) — no external supervisor is required.
+            //
+            // KNOWN/INTENDED Stage-1 race: if an external supervisor (launchd
+            // `KeepAlive=true`, systemd `Restart`, the wrapper) is ALSO active,
+            // our exit triggers BOTH our successor AND an external respawn.
+            // This self-corrects via the flock — whichever process acquires
+            // `.daemon.lock` first becomes the daemon; the loser hits the
+            // singleton attach-reject guard in `bootstrap::prepare` and exits.
+            // Not a bug; flagged here + in the PR so reviewers don't file it as
+            // one. (Stage 2 downgrades `is_restart_supervised` to advisory.)
+            tracing::info!("#1814 self-respawn: successor confirmed healthy — exiting 0");
+            std::process::exit(0);
+        }
         tracing::info!("operator-initiated restart: exiting with code 42");
         std::process::exit(42);
     }

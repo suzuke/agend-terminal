@@ -113,3 +113,68 @@ pub struct DaemonHandle {
     pub run_dir: PathBuf,
     pub log_path: PathBuf,
 }
+
+/// #1814: handle to a spawned successor daemon (self-respawn handoff).
+pub struct SuccessorHandle {
+    /// The successor daemon's pid. `start --foreground` does NOT re-exec, so
+    /// the spawned child IS the daemon — `child.id()` is authoritative.
+    pub pid: u32,
+    /// The successor's run dir (`home/run/<pid>`) — where the Phase-1 gate
+    /// looks for `control-ready` + `api.port` + `api.cookie`.
+    pub run_dir: PathBuf,
+    /// The live child handle. Held so the Phase-1 gate can `try_wait()` —
+    /// detecting a crash-on-launch immediately AND reaping it (vs. `kill(pid,
+    /// 0)`, which reports a zombie as still alive). On the COMMIT path the
+    /// handle is dropped when the predecessor exits; `std::process::Child::drop`
+    /// neither waits nor kills, so the promoted successor keeps running.
+    pub child: std::process::Child,
+}
+
+/// #1814: spawn a successor daemon for self-respawn handoff. Like
+/// [`spawn_detached`] but (a) injects `AGEND_SUCCESSOR_HANDOFF=<value>` so the
+/// child takes the minimal pre-lock handoff boot path (bypassing the singleton
+/// attach-reject guard, deferring flock + destructive reconciles), and (b)
+/// does NOT wait for readiness — the caller (restart handler) runs the Phase-1
+/// health gate against the returned run dir, then either commits (signals the
+/// predecessor to exit) or aborts (kills this successor). The child inherits
+/// the predecessor's env (incl. `AGEND_RESTART_HANDOFF=1`), so the successor will
+/// itself self-respawn on a later restart.
+pub fn spawn_successor_handoff(home: &Path, handoff_value: &str) -> Result<SuccessorHandle> {
+    let exe = std::env::current_exe().context("resolve current_exe for successor spawn")?;
+    std::fs::create_dir_all(home).with_context(|| format!("create home {}", home.display()))?;
+
+    let mut cmd = Command::new(&exe);
+    cmd.arg("start").arg("--foreground");
+    // Explicit set OVERRIDES any inherited stale value (the predecessor may
+    // itself have been a successor carrying an old AGEND_SUCCESSOR_HANDOFF).
+    cmd.env(crate::daemon::restart::SUCCESSOR_HANDOFF_ENV, handoff_value);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS (0x00000008) | CREATE_NEW_PROCESS_GROUP (0x00000200)
+        cmd.creation_flags(0x00000008 | 0x00000200);
+    }
+
+    let child = cmd
+        .spawn()
+        .with_context(|| format!("spawn successor daemon: {} start", exe.display()))?;
+    let pid = child.id();
+    // The child handle is RETAINED (not dropped) so the Phase-1 gate can
+    // `try_wait()` it: fast crash detection + zombie reaping on abort. On the
+    // commit path the predecessor's `exit(0)` drops it without killing — the
+    // promoted successor lives on (std Child drop is a no-op on the process).
+    Ok(SuccessorHandle {
+        pid,
+        run_dir: crate::daemon::run_dir_for_pid(home, pid),
+        child,
+    })
+}

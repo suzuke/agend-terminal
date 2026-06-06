@@ -92,9 +92,14 @@ pub struct OwnedFleet {
     pub cookie: crate::auth_cookie::Cookie,
     pub telegram: Option<Arc<dyn crate::channel::Channel>>,
     /// Flock guard — drop releases `.daemon.lock`. Kept last so the lock is
-    /// released only after every other resource has been dropped.
+    /// released only after every other resource has been dropped. `Option`
+    /// since #1814: the normal `prepare` path holds `Some(lock)`; the
+    /// successor-handoff path acquires the flock later (after Phase-1, in
+    /// `daemon::run_successor_handoff`) and never constructs an `OwnedFleet`,
+    /// so this stays `Some` for every real `OwnedFleet` today — the `Option`
+    /// only future-proofs a handoff `OwnedFleet` should one ever be built.
     #[allow(dead_code)] // RAII guard: drop releases daemon lock
-    pub lock: DaemonLock,
+    pub lock: Option<DaemonLock>,
 }
 
 /// Attached state: an existing daemon owns the run dir. We read its cookie so
@@ -180,11 +185,44 @@ pub fn prepare(home: &Path, fleet_path: &Path, opts: PrepareOptions) -> Result<B
     }
 
     // We hold the exclusive daemon lock, so no one else is attaching or
-    // creating run dirs. Sweep any `~/.agend/run/*` left behind by prior
-    // daemons whose PIDs have since been recycled — otherwise the first
-    // one `find_active_run_dir` visits on a later app launch can lure that
-    // process into attaching to a dead daemon (symptom: input lag from 2s
-    // port-poll hitting closed sockets).
+    // creating run dirs. These boot-hygiene sweeps are DESTRUCTIVE (remove
+    // stale run dirs, env-gated zombie kill, mutate shared watch/pr-state
+    // files) and assume sole-daemon ownership — hence they run only under the
+    // lock. #1814: the successor-handoff path runs the SAME set, but only
+    // AFTER it acquires the flock (see `daemon::run_successor_handoff`), never
+    // during the two-daemon overlap window.
+    boot_hygiene_sweeps(home);
+
+    let run_dir = crate::daemon::run_dir(home);
+    std::fs::create_dir_all(&run_dir)
+        .with_context(|| format!("create run dir {}", run_dir.display()))?;
+    crate::daemon::write_daemon_id(&run_dir);
+
+    let cookie = crate::auth_cookie::issue(&run_dir).context("issue api.cookie")?;
+
+    let (config, agents, telegram) = resolve_fleet_and_reconcile(home, fleet_path, &opts)?;
+
+    Ok(BootstrapOutcome::Owned(Box::new(OwnedFleet {
+        home: home.to_path_buf(),
+        fleet_path: fleet_path.to_path_buf(),
+        config,
+        agents,
+        run_dir,
+        cookie,
+        telegram,
+        lock: Some(lock),
+    })))
+}
+
+/// Destructive boot-hygiene sweeps that assume sole-daemon ownership. Extracted
+/// (#1814) so the successor-handoff path can run the IDENTICAL set, but gated
+/// behind the flock so it never races a still-live predecessor. Behaviour for
+/// the normal `prepare` path is unchanged — same calls, same order.
+pub(crate) fn boot_hygiene_sweeps(home: &Path) {
+    // Sweep any `~/.agend/run/*` left behind by prior daemons whose PIDs have
+    // since been recycled — otherwise the first one `find_active_run_dir`
+    // visits on a later app launch can lure that process into attaching to a
+    // dead daemon (symptom: input lag from 2s port-poll hitting closed sockets).
     time_step("sweep_stale_run_dirs", || {
         crate::daemon::sweep_stale_run_dirs(home);
     });
@@ -230,14 +268,31 @@ pub fn prepare(home: &Path, fleet_path: &Path, opts: PrepareOptions) -> Result<B
             );
         }
     });
+}
 
-    let run_dir = crate::daemon::run_dir(home);
-    std::fs::create_dir_all(&run_dir)
-        .with_context(|| format!("create run dir {}", run_dir.display()))?;
-    crate::daemon::write_daemon_id(&run_dir);
+/// Result of [`resolve_fleet_and_reconcile`]: the normalized fleet config, the
+/// spawn-ready agent defs, and the (optional) inited channel.
+pub(crate) type ResolvedFleet = (
+    crate::fleet::FleetConfig,
+    Vec<AgentDef>,
+    Option<Arc<dyn crate::channel::Channel>>,
+);
 
-    let cookie = crate::auth_cookie::issue(&run_dir).context("issue api.cookie")?;
-
+/// Load + normalize the fleet, resolve every instance into a spawn-ready
+/// [`AgentDef`], init the channel, and run the shared-state reconciles
+/// (binding / worktree-lease / canonical-hygiene / task-orphan sweeps).
+///
+/// Extracted (#1814) so the successor-handoff path can run the IDENTICAL work
+/// AFTER it has acquired the flock. These steps MUTATE shared state and
+/// several (notably `release_inprogress_orphans`, which assumes `live = ∅`)
+/// are only correct when this process is the sole daemon — so the handoff path
+/// must never call this during the two-daemon overlap window. Behaviour for
+/// the normal `prepare` path is unchanged — same calls, same order.
+pub(crate) fn resolve_fleet_and_reconcile(
+    home: &Path,
+    fleet_path: &Path,
+    opts: &PrepareOptions,
+) -> Result<ResolvedFleet> {
     let mut config = crate::fleet::FleetConfig::load(fleet_path)?;
     fleet_normalize::normalize(&mut config, home, opts.mutate_fleet_yaml);
 
@@ -322,16 +377,54 @@ pub fn prepare(home: &Path, fleet_path: &Path, opts: PrepareOptions) -> Result<B
         crate::tasks::release_inprogress_orphans_with_live(home, &std::collections::HashSet::new());
     });
 
-    Ok(BootstrapOutcome::Owned(Box::new(OwnedFleet {
-        home: home.to_path_buf(),
-        fleet_path: fleet_path.to_path_buf(),
-        config,
-        agents,
-        run_dir,
-        cookie,
-        telegram,
-        lock,
-    })))
+    Ok((config, agents, telegram))
+}
+
+/// #1814 successor-handoff pre-lock minimal prep. The successor process runs
+/// ONLY this before binding its control socket: create the run dir, write the
+/// `.daemon` identity, and issue the api cookie — the bare minimum
+/// `api::serve` needs to bind + publish `api.port` so the predecessor can
+/// Phase-1-probe it. It deliberately SKIPS the singleton attach-reject guard
+/// (the predecessor is intentionally still alive), the flock (the predecessor
+/// still holds it), and ALL destructive reconciles / fleet resolve — those run
+/// later, after the successor acquires the flock (see
+/// `daemon::run_successor_handoff`). Returns the run dir for the caller.
+pub fn prepare_handoff_prelock(home: &Path) -> Result<PathBuf> {
+    std::fs::create_dir_all(home).with_context(|| format!("create home {}", home.display()))?;
+    let run_dir = crate::daemon::run_dir(home);
+    std::fs::create_dir_all(&run_dir)
+        .with_context(|| format!("create run dir {}", run_dir.display()))?;
+    crate::daemon::write_daemon_id(&run_dir);
+    crate::auth_cookie::issue(&run_dir).context("issue api.cookie (handoff pre-lock)")?;
+    Ok(run_dir)
+}
+
+/// Blocking variant of [`acquire_daemon_lock`] used by the successor-handoff
+/// path: poll `try_lock` every 100ms until the predecessor releases
+/// `.daemon.lock` (by exiting) or `ceiling` elapses. The predecessor's exit is
+/// the handoff commit point; this is how the successor waits for it without a
+/// double-bound window. A timeout is a backstop for a predecessor that hangs in
+/// shutdown — the successor then gives up and exits (its run dir is swept later).
+pub(crate) fn acquire_daemon_lock_blocking(
+    home: &Path,
+    ceiling: std::time::Duration,
+) -> Result<DaemonLock> {
+    let path = home.join(".daemon.lock");
+    let file = std::fs::File::create(&path).with_context(|| format!("open {}", path.display()))?;
+    let deadline = std::time::Instant::now() + ceiling;
+    loop {
+        // Explicit trait method (MSRV 1.87): Err == lock held by predecessor.
+        if fs4::FileExt::try_lock(&file).is_ok() {
+            return Ok(DaemonLock { _file: file });
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "successor: predecessor did not release .daemon.lock within {:?} — aborting handoff",
+                ceiling
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 /// Return `Some(AttachedFleet)` if a live daemon owns the run dir, else `None`.

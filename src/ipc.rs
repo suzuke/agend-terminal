@@ -72,6 +72,18 @@ pub fn connect_api(home: &Path) -> Result<TcpStream> {
     connect_port(port).map_err(Into::into)
 }
 
+/// Connect to a SPECIFIC run dir's daemon api port (not the active one).
+///
+/// #1814: the self-respawn Phase-1 gate must reach the successor's OWN api
+/// port while both predecessor and successor are briefly alive — `connect_api`
+/// (which resolves via `find_active_run_dir`) could return either, so the gate
+/// targets the successor's run dir explicitly.
+pub fn connect_run_dir_api(run_dir: &Path) -> Result<TcpStream> {
+    let port = read_port(run_dir, API_NAME)
+        .with_context(|| format!("api.port missing/invalid in {}", run_dir.display()))?;
+    connect_port(port).map_err(Into::into)
+}
+
 /// Connect to a named agent's TUI port.
 pub fn connect_agent(home: &Path, name: &str) -> Result<TcpStream> {
     let run =

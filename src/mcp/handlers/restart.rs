@@ -2,6 +2,16 @@ use serde_json::{json, Value};
 use std::path::Path;
 
 pub(super) fn handle_restart_daemon(home: &Path) -> Value {
+    // #1814 Stage 1: flag-gated self-respawn. When AGEND_RESTART_HANDOFF=1 the
+    // daemon owns its own respawn (spawn successor → Phase-1 health gate →
+    // abort-stay-alive on failure), so restart never hinges on an external
+    // supervisor being correctly detected (retires the #851/#1812 brick class
+    // at the root). Flag OFF → the legacy supervisor + exit(42) path below runs
+    // byte-identically.
+    if crate::daemon::restart::self_respawn_enabled() {
+        return handle_self_respawn(home);
+    }
+
     // #851 fail-closed: refuse the request when no supervisor will
     // respawn the daemon. Without this check, `restart_daemon` on a
     // bare `agend-terminal start` invocation would set
@@ -37,6 +47,114 @@ pub(super) fn handle_restart_daemon(home: &Path) -> Value {
     std::fs::write(home.join("restart-requested"), "").ok();
     let _ = crate::api::call(home, &json!({"method": crate::api::method::SHUTDOWN}));
     json!({"ok": true, "restart": "pending", "note": "daemon will exit(42) after graceful shutdown; supervisor restarts"})
+}
+
+/// #1814 self-respawn orchestration (runs in the daemon's `mcp_tool_*` worker
+/// thread, NOT the api accept loop — see `api::serve` thread-per-connection):
+/// spawn a successor, gate on its health, and only commit the predecessor's
+/// shutdown if the successor is confirmed up. On failure the predecessor is
+/// never signalled → it stays fully alive with its agents intact.
+fn handle_self_respawn(home: &Path) -> Value {
+    let old_pid = std::process::id();
+    let handoff_value = crate::daemon::restart::make_handoff_value(old_pid);
+    let mut succ = match crate::bootstrap::daemon_spawn::spawn_successor_handoff(
+        home,
+        &handoff_value,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            return json!({
+                "ok": false,
+                "error": format!("self-respawn: failed to spawn successor: {e}; daemon stays alive")
+            });
+        }
+    };
+    tracing::info!(
+        successor_pid = succ.pid,
+        "#1814 self-respawn: successor spawned — running Phase-1 health gate"
+    );
+
+    if phase1_gate(&mut succ) {
+        // Successor healthy → COMMIT. Set RESTART_PENDING ONLY; do NOT send an
+        // api SHUTDOWN. The existing `handle_session` bridge (api/mod.rs: "the
+        // restart_daemon MCP handler sets RESTART_PENDING … bridge it here") flips
+        // the daemon's shutdown flag on the next api-loop iteration → the main
+        // loop breaks → the run_core tail sees RESTART_PENDING + self_respawn and
+        // exits(0), releasing the flock so the (blocked) successor promotes.
+        //
+        // We deliberately AVOID `api::call(home, SHUTDOWN)` here: during the
+        // handoff overlap BOTH daemons are alive with a published api.port, so its
+        // `find_active_run_dir` is ambiguous and could deliver SHUTDOWN to the
+        // freshly-bound SUCCESSOR — which then shuts itself down the instant it
+        // promotes (observed). RESTART_PENDING is process-local to THIS
+        // predecessor, so there is no cross-daemon misdelivery.
+        crate::daemon::RESTART_PENDING.store(true, std::sync::atomic::Ordering::Release);
+        std::fs::write(home.join("restart-requested"), "").ok();
+        tracing::info!(
+            successor_pid = succ.pid,
+            "#1814 self-respawn: committed — predecessor exiting"
+        );
+        json!({
+            "ok": true,
+            "restart": "self-respawn",
+            "successor_pid": succ.pid,
+            "note": "successor confirmed healthy; predecessor exiting(0) — no external supervisor required"
+        })
+    } else {
+        // ABORT-STAY-ALIVE. Kill the successor + remove its run dir so no stale
+        // discovery artifact (api.port / control-ready / .daemon / cookie) lures
+        // a client to a half-dead successor. The predecessor was NEVER signalled
+        // → it stays fully alive with its agents intact.
+        tracing::warn!(
+            successor_pid = succ.pid,
+            "#1814 self-respawn: successor FAILED Phase-1 gate — aborting; predecessor stays alive"
+        );
+        crate::process::kill_process_tree(succ.pid);
+        let _ = succ.child.wait(); // reap so we don't leave a zombie
+        let _ = std::fs::remove_dir_all(&succ.run_dir);
+        json!({
+            "ok": false,
+            "error": "self-respawn aborted: successor failed the Phase-1 health gate. Daemon stays alive (no restart, agents intact). Check daemon.log for the successor's startup failure."
+        })
+    }
+}
+
+/// #1814 Phase-1 health gate: poll (≤30s, 100ms) until the successor's control
+/// plane is confirmed — process alive + `control-ready` marker present + a real
+/// cookie-authenticated api round-trip succeeds. Returns false on the
+/// successor dying, the timeout, or a persistently unreachable api.
+fn phase1_gate(succ: &mut crate::bootstrap::daemon_spawn::SuccessorHandle) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let control_ready = succ.run_dir.join(crate::daemon::CONTROL_READY_FILE);
+    loop {
+        // `try_wait` detects a crash-on-launch immediately AND reaps the child
+        // (so it never lingers as a zombie that `kill(pid, 0)` would misreport
+        // as alive). `Ok(Some(_))` = exited.
+        if matches!(succ.child.try_wait(), Ok(Some(_))) {
+            tracing::warn!(
+                successor_pid = succ.pid,
+                "#1814 Phase-1: successor process exited during startup"
+            );
+            return false;
+        }
+        if control_ready.exists()
+            && crate::api::call_at(
+                &succ.run_dir,
+                &json!({"method": crate::api::method::STATUS}),
+            )
+            .is_ok()
+        {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!(
+                successor_pid = succ.pid,
+                "#1814 Phase-1: successor not control-ready within timeout"
+            );
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 #[cfg(test)]

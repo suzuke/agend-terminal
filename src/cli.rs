@@ -11,6 +11,18 @@ use std::path::Path;
 /// and `app` entry points through the same seam — see the `bootstrap` module
 /// docs for the bug this addresses.
 pub fn start_with_fleet(home: &Path, fleet_path: &Path) -> anyhow::Result<()> {
+    // #1814 Stage 1: a successor spawned by `restart_daemon` carries a
+    // legitimate `AGEND_SUCCESSOR_HANDOFF` marker and MUST take the minimal
+    // pre-lock handoff boot path — NOT the full `prepare` (which would run the
+    // destructive sole-daemon reconciles while the predecessor is still alive).
+    // The marker is set only by `spawn_successor_handoff`; a normal/operator
+    // start never carries it, so this is a no-op for every non-handoff boot.
+    if crate::daemon::restart::successor_handoff_marker().is_some() {
+        tracing::info!(
+            "#1814: AGEND_SUCCESSOR_HANDOFF present — taking successor-handoff boot path"
+        );
+        return crate::daemon::run_successor_handoff(home, fleet_path);
+    }
     match crate::bootstrap::prepare(home, fleet_path, Default::default())? {
         crate::bootstrap::BootstrapOutcome::Owned(prepared) => {
             if prepared.agents.is_empty() {

@@ -88,6 +88,65 @@ fn has_env(name: &str) -> bool {
     std::env::var_os(name).is_some()
 }
 
+// ── #1814 Stage 1: self-respawn (flag-gated successor handoff) ──────────
+//
+// When `AGEND_RESTART_HANDOFF=1`, `restart_daemon` no longer relies on an
+// external supervisor + `exit(42)`. Instead the running daemon spawns its
+// OWN successor, confirms it is healthy (Phase-1 gate), and only then exits
+// (0). If the successor fails the gate, the old daemon never shuts down — it
+// stays alive with its agents intact (abort-stay-alive). This retires the
+// supervision-detection brick class (#851/#1812) at the root: restart no
+// longer hinges on a static env-var guess about whether something will
+// respawn the process. See decision d-20260606104934346030-2.
+//
+// Flag OFF (default) → behaviour is byte-identical to the pre-#1814
+// `is_restart_supervised()` + `exit(42)` path. Stage 1 is opt-in.
+
+/// Env flag enabling #1814 self-respawn. `"1"` activates; anything else (or
+/// unset) keeps the legacy supervisor + `exit(42)` path.
+pub const RESTART_HANDOFF_ENV: &str = "AGEND_RESTART_HANDOFF";
+
+/// Env marker the old daemon sets on the successor it spawns:
+/// `AGEND_SUCCESSOR_HANDOFF=<old_pid>:<token>`. Its presence (well-formed)
+/// is the ONLY signal that routes a boot through the minimal pre-lock handoff
+/// path; a normal / operator `agend-terminal start` never carries it and so
+/// always runs the full `bootstrap::prepare` (including the destructive
+/// reconciles that MUST NOT run in a two-daemon overlap window).
+pub const SUCCESSOR_HANDOFF_ENV: &str = "AGEND_SUCCESSOR_HANDOFF";
+
+/// True iff `AGEND_RESTART_HANDOFF=1`. Read at restart time (handler) and at
+/// daemon exit (to choose `exit(0)` vs `exit(42)`).
+pub fn self_respawn_enabled() -> bool {
+    std::env::var(RESTART_HANDOFF_ENV).as_deref() == Ok("1")
+}
+
+/// Parse a legitimate successor-handoff marker into `(old_pid, token)`.
+/// Returns `None` when the env is absent or malformed — the boot then takes
+/// the normal full-prepare path. "Legitimate" = `<u32 pid>:<non-empty token>`
+/// (the token guard the lead required so a stray/normal start can never skip
+/// the destructive reconciles).
+pub fn successor_handoff_marker() -> Option<(u32, String)> {
+    let raw = std::env::var(SUCCESSOR_HANDOFF_ENV).ok()?;
+    let (pid, token) = raw.split_once(':')?;
+    let pid: u32 = pid.parse().ok()?;
+    if token.is_empty() {
+        return None;
+    }
+    Some((pid, token.to_string()))
+}
+
+/// Build the `AGEND_SUCCESSOR_HANDOFF` env VALUE (`<old_pid>:<token>`) for a
+/// fresh successor spawn. The token is derived from the old pid + a monotonic
+/// nanos stamp so each handoff is distinguishable in logs; it carries no
+/// security role (the loopback api + cookie do).
+pub fn make_handoff_value(old_pid: u32) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{old_pid}:{old_pid}-{nanos}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,5 +483,68 @@ mod tests {
                 },
             );
         }
+    }
+
+    // ── #1814 self-respawn helpers ──────────────────────────────────────
+
+    #[test]
+    fn self_respawn_enabled_only_for_exactly_one() {
+        with_env(&[(RESTART_HANDOFF_ENV, "1")], &[], || {
+            assert!(self_respawn_enabled(), "AGEND_RESTART_HANDOFF=1 enables");
+        });
+        with_env(&[(RESTART_HANDOFF_ENV, "0")], &[], || {
+            assert!(!self_respawn_enabled(), "0 does not enable");
+        });
+        with_env(&[(RESTART_HANDOFF_ENV, "true")], &[], || {
+            assert!(!self_respawn_enabled(), "only the literal \"1\" enables");
+        });
+        with_env(&[], &[RESTART_HANDOFF_ENV], || {
+            assert!(!self_respawn_enabled(), "unset = off (flag-off default)");
+        });
+    }
+
+    #[test]
+    fn handoff_marker_parses_only_well_formed_values() {
+        // Well-formed → Some. This is the guard: only a legitimate marker
+        // routes a boot through the minimal pre-lock handoff path.
+        with_env(&[(SUCCESSOR_HANDOFF_ENV, "4321:4321-99")], &[], || {
+            assert_eq!(
+                successor_handoff_marker(),
+                Some((4321, "4321-99".to_string()))
+            );
+        });
+        // Absent → None (normal/operator start never skips reconciles).
+        with_env(&[], &[SUCCESSOR_HANDOFF_ENV], || {
+            assert_eq!(successor_handoff_marker(), None);
+        });
+        // Malformed → None (no colon / bad pid / empty token).
+        for bad in ["nopid", "abc:tok", "4321:", ":tok", ""] {
+            with_env(&[(SUCCESSOR_HANDOFF_ENV, bad)], &[], || {
+                assert_eq!(
+                    successor_handoff_marker(),
+                    None,
+                    "malformed {bad:?} must be rejected"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn make_handoff_value_round_trips_through_marker_parser() {
+        // The value `make_handoff_value` produces must be accepted by the
+        // parser the successor uses — pins the producer/consumer contract.
+        with_env(&[], &[], || {
+            let value = make_handoff_value(777);
+            let parsed = {
+                // SAFETY: serialised by with_env's lock; restored on exit.
+                unsafe { std::env::set_var(SUCCESSOR_HANDOFF_ENV, &value) };
+                let m = successor_handoff_marker();
+                unsafe { std::env::remove_var(SUCCESSOR_HANDOFF_ENV) };
+                m
+            };
+            let (pid, token) = parsed.expect("self-produced value must parse");
+            assert_eq!(pid, 777, "old pid prefix preserved");
+            assert!(!token.is_empty(), "token non-empty");
+        });
     }
 }
