@@ -541,13 +541,13 @@ fn force_reclaim_age_days() -> i64 {
 /// reviewer-2 #5: force-reclaim post-boot grace (seconds). After a daemon restart
 /// the live-agent registry (the process-liveness signal) is empty until agents
 /// re-spawn; suspend force-reclaim for this window so a mid-respawn agent is not
-/// reclaimed during the liveness blind spot. Configurable
-/// (`AGEND_WORKTREE_FORCE_RECLAIM_BOOT_GRACE_SECS`).
+/// reclaimed during the liveness blind spot. Fixed const 600s / 10 min
+/// (#env-cleanup: was env-overridable via
+/// `AGEND_WORKTREE_FORCE_RECLAIM_BOOT_GRACE_SECS`; demoted to YAGNI).
+const FORCE_RECLAIM_BOOT_GRACE_SECS: u64 = 600;
+
 fn force_reclaim_boot_grace_secs() -> u64 {
-    std::env::var("AGEND_WORKTREE_FORCE_RECLAIM_BOOT_GRACE_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(600) // 10 min
+    FORCE_RECLAIM_BOOT_GRACE_SECS
 }
 
 /// Pure boot-grace predicate: is `now_unix` within `grace_secs` of `boot_unix`?

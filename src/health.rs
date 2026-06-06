@@ -133,29 +133,28 @@ pub enum RecoveryStageState {
 /// Decision §1.4 Delta 1: 10s default (reviewer recommendation: ESC
 /// delivery latency = PTY write + agent process scheduling + Ink TUI
 /// state reset; under load, 5s false-positives Stage 2 escalation).
-/// Operator override via env var `AGEND_AUTO_RECOVERY_STAGE1_TIMEOUT_MS`.
+/// Fixed const (#env-cleanup: was env-overridable; demoted to YAGNI).
 pub const STAGE1_TIMEOUT_DEFAULT_MS: u64 = 10_000;
 
 /// Stage 1 default cooldown — if agent re-enters Hung within this window
 /// after a recent Stage 1 fire, dispatcher skips Stage 1 (goes directly
 /// to `Stage2Eligible`). Prevents rapid-fire ESC sending that masks
 /// underlying issues. Decision §1.4 Refinement B.
-/// Operator override via env var `AGEND_AUTO_RECOVERY_STAGE1_COOLDOWN_MS`.
+/// Fixed const (#env-cleanup: was env-overridable; demoted to YAGNI).
 pub const STAGE1_COOLDOWN_DEFAULT_MS: u64 = 60_000;
 
 /// Stage 2 default backoff — sleep before `spawn_agent` re-runs in the
 /// respawn worker's Stage 2 arm. Decision §1.4 Delta 2: 1s default
 /// (defensive padding against tight-loop on transient spawn errors —
-/// transient filesystem / network / PTY allocation failures), with env
-/// var override for operators who observe unnecessary latency.
-/// Operator override via env var `AGEND_AUTO_RECOVERY_STAGE2_BACKOFF_MS`.
+/// transient filesystem / network / PTY allocation failures).
+/// Fixed const (#env-cleanup: was env-overridable; demoted to YAGNI).
 pub const STAGE2_BACKOFF_DEFAULT_MS: u64 = 1_000;
 
 /// Stage 2 default monitoring window — how long the dispatcher waits in
 /// `Stage2Pending` for the agent to settle on `Healthy` before
 /// classifying Stage 2 as failed and escalating to `Stage3Eligible`.
 /// Mirrors the 30s window already documented in `docs/RECOVERY-STAGES.md`.
-/// Operator override via env var `AGEND_AUTO_RECOVERY_STAGE2_TIMEOUT_MS`.
+/// Fixed const (#env-cleanup: was env-overridable; demoted to YAGNI).
 pub const STAGE2_TIMEOUT_DEFAULT_MS: u64 = 30_000;
 
 /// Stage 2 cumulative retry cap — when `recovery_restart_count` reaches

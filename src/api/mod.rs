@@ -264,10 +264,10 @@ pub fn serve(
     }
 
     // #680: connection counter — limits concurrent API sessions.
-    let max_conns: usize = std::env::var("AGEND_API_MAX_CONNS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(32);
+    // Fixed const (#env-cleanup: was env-overridable via `AGEND_API_MAX_CONNS`;
+    // demoted to YAGNI for single-user deploys).
+    const API_MAX_CONNS: usize = 32;
+    let max_conns: usize = API_MAX_CONNS;
     let active_conns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     // #941: signal listener entered the `accept()` blocking phase.
@@ -714,8 +714,7 @@ pub fn call(home: &Path, request: &Value) -> anyhow::Result<Value> {
     // TUI permanently. The timeout converts that into a recoverable error: the
     // read fails, this call unwinds, the offending lock guard drops, and the
     // waiting threads proceed.
-    // Generous default (covers the slowest legit method, create_instance ~60s);
-    // `AGEND_API_CALL_TIMEOUT_SECS` lets an operator shrink the recovery window.
+    // Generous fixed timeout (covers the slowest legit method, create_instance ~60s).
     let timeout = api_call_read_timeout();
     stream
         .set_read_timeout(Some(timeout))
@@ -758,15 +757,11 @@ pub fn call(home: &Path, request: &Value) -> anyhow::Result<Value> {
 /// slowest legitimate daemon method (`create_instance`, whose own budget is
 /// ~60s) so a genuine slow call never trips the backstop, while still bounding a
 /// wedged self-IPC instead of blocking forever. Overridable via
-/// `AGEND_API_CALL_TIMEOUT_SECS` to shrink the deadlock-recovery window (values
-/// <1 are clamped to 1s).
+/// Fixed const 90s (#env-cleanup: was env-overridable via
+/// `AGEND_API_CALL_TIMEOUT_SECS`; demoted to YAGNI for single-user deploys).
 fn api_call_read_timeout() -> std::time::Duration {
-    let secs = std::env::var("AGEND_API_CALL_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(|v| v.max(1))
-        .unwrap_or(90);
-    std::time::Duration::from_secs(secs)
+    const API_CALL_READ_TIMEOUT_SECS: u64 = 90;
+    std::time::Duration::from_secs(API_CALL_READ_TIMEOUT_SECS)
 }
 
 #[cfg(test)]
@@ -887,24 +882,17 @@ mod tests {
     }
 
     #[test]
-    fn api_call_read_timeout_default_override_and_clamp() {
+    fn api_call_read_timeout_is_fixed_90s() {
         // #1492 backstop: the loopback read timeout that converts a wedged
         // self-IPC from a permanent daemon freeze into a recoverable error.
-        std::env::remove_var("AGEND_API_CALL_TIMEOUT_SECS");
+        // #env-cleanup: now a fixed const (the AGEND_API_CALL_TIMEOUT_SECS
+        // override + sub-1s clamp were demoted). 90s must still exceed the
+        // slowest legit method (create_instance ~60s).
         assert_eq!(
             api_call_read_timeout(),
             std::time::Duration::from_secs(90),
-            "default must exceed the slowest legit method (create_instance ~60s)"
+            "fixed default must exceed the slowest legit method (create_instance ~60s)"
         );
-        std::env::set_var("AGEND_API_CALL_TIMEOUT_SECS", "5");
-        assert_eq!(api_call_read_timeout(), std::time::Duration::from_secs(5));
-        std::env::set_var("AGEND_API_CALL_TIMEOUT_SECS", "0");
-        assert_eq!(
-            api_call_read_timeout(),
-            std::time::Duration::from_secs(1),
-            "sub-1s values clamp to 1s — never a zero/instant timeout"
-        );
-        std::env::remove_var("AGEND_API_CALL_TIMEOUT_SECS");
     }
 
     // -----------------------------------------------------------------------

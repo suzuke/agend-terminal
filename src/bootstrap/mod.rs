@@ -205,7 +205,7 @@ pub fn prepare(home: &Path, fleet_path: &Path, opts: PrepareOptions) -> Result<B
     // #1017: suppress stale pr-state terminal-replay at boot. Without
     // this, a fresh daemon process re-emits [pr-merged] /
     // [pr-closed-unmerged] for every Merged / ClosedUnmerged pr-state
-    // file older than `AGEND_PR_STATE_REPLAY_AGE_HOURS` (default 1h)
+    // file older than the fixed 1h replay-age threshold
     // — operator gets a flood of stale notifications. Fresh terminal-
     // state files (post-restart actual merges) still fire normally.
     time_step("pr_state_suppress_stale_replay", || {

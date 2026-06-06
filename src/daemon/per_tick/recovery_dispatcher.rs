@@ -57,7 +57,6 @@
 //! `STAGE1_COOLDOWN_DEFAULT_MS` of a recent Stage 1 fire, dispatcher
 //! skips Stage 1 and goes directly to `Stage2Eligible`. Prevents
 //! rapid-fire ESC sending that would mask the underlying issue.
-//! Operator override via env var `AGEND_AUTO_RECOVERY_STAGE1_COOLDOWN_MS`.
 
 use super::{PerTickHandler, TickContext};
 use crate::agent;
@@ -83,8 +82,6 @@ struct RecoveryTarget {
 /// dispatcher writes the ESC byte to the agent's PTY; otherwise the
 /// dispatcher logs the would-fire decision and skips the write.
 const STAGE1_ENV_VAR: &str = "AGEND_AUTO_RECOVERY_STAGE1";
-const STAGE1_TIMEOUT_ENV_VAR: &str = "AGEND_AUTO_RECOVERY_STAGE1_TIMEOUT_MS";
-const STAGE1_COOLDOWN_ENV_VAR: &str = "AGEND_AUTO_RECOVERY_STAGE1_COOLDOWN_MS";
 
 /// `tracing` target for shadow-mode + active-mode telemetry. Parallels
 /// the F9 `behavioral_shadow` target (sub-task 4 §F9.5) so dashboards
@@ -97,12 +94,6 @@ const TARGET: &str = "recovery_shadow";
 /// to `crash_tx` (active mode). Default unset = shadow mode: same
 /// telemetry, no event emission.
 const STAGE2_ENV_VAR: &str = "AGEND_AUTO_RECOVERY_STAGE2";
-/// Read in `handle_stage2_restart` (`daemon/mod.rs`) — declared here for
-/// co-location with the other Stage 2 env vars even though the
-/// dispatcher doesn't read it directly.
-#[allow(dead_code)]
-const STAGE2_BACKOFF_ENV_VAR: &str = "AGEND_AUTO_RECOVERY_STAGE2_BACKOFF_MS";
-const STAGE2_TIMEOUT_ENV_VAR: &str = "AGEND_AUTO_RECOVERY_STAGE2_TIMEOUT_MS";
 const STAGE2_MAX_RESTARTS_ENV_VAR: &str = "AGEND_AUTO_RECOVERY_STAGE2_MAX_RESTARTS";
 
 /// `#685` sub-task 7c: env var controlling Stage 3 escalation activation.
@@ -172,19 +163,6 @@ fn stage3_gate_active() -> bool {
         || std::env::var(STAGE3_ENV_VAR)
             .map(|v| v == "1")
             .unwrap_or(false)
-}
-
-/// Read an env var as milliseconds with a typed default. Logged at
-/// `trace` so operators can confirm the override took effect without
-/// noise.
-fn env_ms(var: &str, default_ms: u64) -> Duration {
-    match std::env::var(var) {
-        Ok(v) => match v.parse::<u64>() {
-            Ok(ms) => Duration::from_millis(ms),
-            Err(_) => Duration::from_millis(default_ms),
-        },
-        Err(_) => Duration::from_millis(default_ms),
-    }
 }
 
 fn stage1_gate_active() -> bool {
@@ -265,13 +243,10 @@ impl PerTickHandler for RecoveryDispatcherHandler {
 
     fn run(&self, ctx: &TickContext<'_>) {
         let stage1_active = stage1_gate_active();
-        let stage1_timeout = env_ms(STAGE1_TIMEOUT_ENV_VAR, STAGE1_TIMEOUT_DEFAULT_MS);
-        let stage1_cooldown = env_ms(STAGE1_COOLDOWN_ENV_VAR, STAGE1_COOLDOWN_DEFAULT_MS);
+        let stage1_timeout = Duration::from_millis(STAGE1_TIMEOUT_DEFAULT_MS);
+        let stage1_cooldown = Duration::from_millis(STAGE1_COOLDOWN_DEFAULT_MS);
         let stage2_active = stage2_gate_active();
-        let stage2_timeout = env_ms(
-            STAGE2_TIMEOUT_ENV_VAR,
-            crate::health::STAGE2_TIMEOUT_DEFAULT_MS,
-        );
+        let stage2_timeout = Duration::from_millis(crate::health::STAGE2_TIMEOUT_DEFAULT_MS);
         let stage2_max = stage2_max_restarts();
         let stage3_active = stage3_gate_active();
 
@@ -884,22 +859,6 @@ mod tests {
         assert!(matches!(branch, Stage1Branch::Anomaly));
     }
 
-    #[test]
-    fn env_ms_defaults_when_var_unset() {
-        // Sanity: env_ms falls back to default when env var missing.
-        // Use a unique var name to avoid colliding with other tests.
-        // #1812: shared crate-wide env lock — even a unique key data-races
-        // the global environ against another module's concurrent set_var.
-        let _guard = crate::daemon::test_env_lock()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        unsafe {
-            std::env::remove_var("AGEND_TEST_RECOVERY_NONEXISTENT_VAR");
-        }
-        let d = env_ms("AGEND_TEST_RECOVERY_NONEXISTENT_VAR", 12345);
-        assert_eq!(d, Duration::from_millis(12345));
-    }
-
     // -------------------------------------------------------------------
     // Production-hook integration tests — exercise the dispatcher tick
     // path against a real `TickContext` + minimal agent registry. Per
@@ -1113,41 +1072,6 @@ mod tests {
         with_stage1_gate(false, || {
             assert!(!stage1_gate_active());
         });
-    }
-
-    #[test]
-    fn env_ms_parses_valid_integer() {
-        // Env var parses to Duration via integer ms.
-        // #1812: shared crate-wide env lock (see `env_ms_defaults_when_var_unset`).
-        let _guard = crate::daemon::test_env_lock()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        unsafe {
-            std::env::set_var("AGEND_TEST_RECOVERY_ENV_MS_VALID", "5000");
-        }
-        let d = env_ms("AGEND_TEST_RECOVERY_ENV_MS_VALID", 9999);
-        assert_eq!(d, Duration::from_millis(5000));
-        unsafe {
-            std::env::remove_var("AGEND_TEST_RECOVERY_ENV_MS_VALID");
-        }
-    }
-
-    #[test]
-    fn env_ms_falls_back_on_invalid_integer() {
-        // Garbage env var value → fall back to default rather than
-        // panic. Operator typo doesn't crash the dispatcher.
-        // #1812: shared crate-wide env lock (see `env_ms_defaults_when_var_unset`).
-        let _guard = crate::daemon::test_env_lock()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        unsafe {
-            std::env::set_var("AGEND_TEST_RECOVERY_ENV_MS_INVALID", "not a number");
-        }
-        let d = env_ms("AGEND_TEST_RECOVERY_ENV_MS_INVALID", 7777);
-        assert_eq!(d, Duration::from_millis(7777));
-        unsafe {
-            std::env::remove_var("AGEND_TEST_RECOVERY_ENV_MS_INVALID");
-        }
     }
 
     // -------------------------------------------------------------------

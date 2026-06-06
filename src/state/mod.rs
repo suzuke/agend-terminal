@@ -349,16 +349,12 @@ fn recent_screen_tail(screen_text: &str, n: usize) -> String {
 /// `StateTracker::LATCHED_STATE_EXPIRY` so the guard's protection
 /// covers the same horizon as the latched-state expiry it backstops.
 ///
-/// Operator-tunable via `AGEND_OSCILLATION_GUARD_WINDOW_SECS=<N>`.
-/// Set to `0` to effectively disable (no bounce ever falls within
-/// a zero-duration window).
+/// Fixed const 30s (#env-cleanup: was env-overridable via
+/// `AGEND_OSCILLATION_GUARD_WINDOW_SECS`; demoted to YAGNI for single-user
+/// deploys — re-add an override later if a real need appears).
 fn oscillation_guard_window() -> Duration {
     const DEFAULT_SECS: u64 = 30;
-    let secs = std::env::var("AGEND_OSCILLATION_GUARD_WINDOW_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_SECS);
-    Duration::from_secs(secs)
+    Duration::from_secs(DEFAULT_SECS)
 }
 
 /// HIGH_FP states: FP-prone error states whose markers appear in dialectic prose

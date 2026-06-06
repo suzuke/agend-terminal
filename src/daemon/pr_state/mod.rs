@@ -514,21 +514,16 @@ pub fn remove(home: &Path, repo: &str, branch: &str) -> std::io::Result<()> {
     }
 }
 
-/// Read the `AGEND_PR_STATE_REPLAY_AGE_HOURS` env var (default 1) and
-/// return as a `Duration`. Tunable upper bound for "stale terminal
-/// state" classification at daemon boot — see
-/// [`suppress_stale_terminal_replay`].
+/// Fixed 1h upper bound for "stale terminal state" classification at daemon
+/// boot — see [`suppress_stale_terminal_replay`]. (#env-cleanup: was
+/// env-overridable via `AGEND_PR_STATE_REPLAY_AGE_HOURS`; demoted to YAGNI.)
 fn replay_age_threshold() -> std::time::Duration {
     const DEFAULT_HOURS: u64 = 1;
-    let hours = std::env::var("AGEND_PR_STATE_REPLAY_AGE_HOURS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_HOURS);
-    std::time::Duration::from_secs(hours.saturating_mul(3600))
+    std::time::Duration::from_secs(DEFAULT_HOURS.saturating_mul(3600))
 }
 
 /// #1017: at daemon boot, mark terminal-state pr-state files whose
-/// mtime is older than `AGEND_PR_STATE_REPLAY_AGE_HOURS` (default 1h)
+/// mtime is older than the fixed 1h replay-age threshold
 /// as already-emitted. Without this, a fresh daemon process replays
 /// the [pr-merged] / [pr-closed-unmerged] events for every stale
 /// Merged / ClosedUnmerged file on the first `scan_and_emit_with`
@@ -2493,7 +2488,7 @@ mod tests {
     // ─── #1017 startup-replay suppression ─────────────────────────────
 
     /// #1017 T17: stale Merged terminal-state files (mtime older than
-    /// `AGEND_PR_STATE_REPLAY_AGE_HOURS`, default 1h) MUST be marked
+    /// the fixed 1h replay-age threshold) MUST be marked
     /// as already-emitted by `suppress_stale_terminal_replay` at boot.
     /// The next `scan_and_emit_with` tick then sweeps (removes) the
     /// file without firing the [pr-merged] event — closing the
@@ -2608,19 +2603,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// #1017 T20: `AGEND_PR_STATE_REPLAY_AGE_HOURS` env var overrides
-    /// the default 1h threshold. Operator-tunable.
+    /// #1017 T20 → #env-cleanup: the replay-age threshold is now a fixed 1h
+    /// const (the `AGEND_PR_STATE_REPLAY_AGE_HOURS` override was demoted).
     #[test]
-    #[serial_test::serial]
-    fn t20_1017_replay_age_threshold_env_override() {
-        // SAFETY: set + remove around test; serial_test ensures no race.
-        unsafe { std::env::set_var("AGEND_PR_STATE_REPLAY_AGE_HOURS", "24") };
-        let got = replay_age_threshold();
-        assert_eq!(got, std::time::Duration::from_secs(24 * 3600));
-        unsafe { std::env::remove_var("AGEND_PR_STATE_REPLAY_AGE_HOURS") };
-
-        // Default fallback when unset.
-        let default = replay_age_threshold();
-        assert_eq!(default, std::time::Duration::from_secs(3600));
+    fn t20_1017_replay_age_threshold_is_fixed_1h() {
+        assert_eq!(replay_age_threshold(), std::time::Duration::from_secs(3600));
     }
 }

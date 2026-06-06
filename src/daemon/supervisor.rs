@@ -413,8 +413,8 @@ fn run_loop(
 /// from the original claude-only first round once `record_submit_activity`
 /// was wired for every backend.
 ///
-/// Threshold defaults to 60s; override via env
-/// `AGEND_PANE_INPUT_THRESHOLD_SECS`.
+/// Threshold is a fixed 60s const (#env-cleanup: the
+/// `AGEND_PANE_INPUT_THRESHOLD_SECS` override was demoted).
 pub(crate) fn check_pane_input_not_submitted(
     home: &std::path::Path,
     registry: &AgentRegistry,
@@ -450,11 +450,10 @@ pub(crate) fn check_pane_input_not_submitted_for_agents(
     if crate::daemon::per_tick::in_boot_grace(loop_started_at) {
         return;
     }
-    let threshold_secs: u64 = std::env::var("AGEND_PANE_INPUT_THRESHOLD_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(60);
-    let threshold_ms = (threshold_secs as i64).saturating_mul(1000);
+    // Fixed const 60s (#env-cleanup: was env-overridable via
+    // `AGEND_PANE_INPUT_THRESHOLD_SECS`; demoted to YAGNI for single-user deploys).
+    const PANE_INPUT_THRESHOLD_SECS: u64 = 60;
+    let threshold_ms = (PANE_INPUT_THRESHOLD_SECS as i64).saturating_mul(1000);
     let now_ms = chrono::Utc::now().timestamp_millis();
     for name in agent_names {
         if !pane_input_backend_supported(home, name) {
@@ -3752,7 +3751,6 @@ instances:
         // Typed 5 minutes ago, never submitted → must emit.
         let now_ms = chrono::Utc::now().timestamp_millis();
         seed_input_submit(&home, agent, now_ms - 300_000, 0);
-        std::env::set_var("AGEND_PANE_INPUT_THRESHOLD_SECS", "60");
         let sink = std::sync::Arc::new(TestSink {
             events: parking_lot::Mutex::new(Vec::new()),
         });
@@ -3777,7 +3775,6 @@ instances:
             matched.count() >= 1,
             "expected ≥1 PaneInputNotSubmitted event for {agent}, got: {events:?}"
         );
-        std::env::remove_var("AGEND_PANE_INPUT_THRESHOLD_SECS");
         std::fs::remove_dir_all(home).ok();
     }
 
@@ -3820,7 +3817,6 @@ instances:
         // Typed 5min ago AND submitted 4min ago (submit > 0 and >= typed).
         let now_ms = chrono::Utc::now().timestamp_millis();
         seed_input_submit(&home, agent, now_ms - 300_000, now_ms - 240_000);
-        std::env::set_var("AGEND_PANE_INPUT_THRESHOLD_SECS", "60");
         let sink = std::sync::Arc::new(TestSink {
             events: parking_lot::Mutex::new(Vec::new()),
         });
@@ -3846,7 +3842,6 @@ instances:
                 );
             }
         }
-        std::env::remove_var("AGEND_PANE_INPUT_THRESHOLD_SECS");
         std::fs::remove_dir_all(home).ok();
     }
 
@@ -3859,7 +3854,6 @@ instances:
         let home = fleet_with_backend("pin_nonclaude", agent, "kiro-cli");
         let now_ms = chrono::Utc::now().timestamp_millis();
         seed_input_submit(&home, agent, now_ms - 300_000, 0);
-        std::env::set_var("AGEND_PANE_INPUT_THRESHOLD_SECS", "60");
         let sink = std::sync::Arc::new(TestSink {
             events: parking_lot::Mutex::new(Vec::new()),
         });
@@ -3884,7 +3878,6 @@ instances:
             fired,
             "non-claude backend with a submit key must now emit PaneInputNotSubmitted (#1457)"
         );
-        std::env::remove_var("AGEND_PANE_INPUT_THRESHOLD_SECS");
         std::fs::remove_dir_all(home).ok();
     }
 
@@ -3895,7 +3888,6 @@ instances:
         let now_ms = chrono::Utc::now().timestamp_millis();
         let typed_ms = now_ms - 300_000;
         seed_input_submit(&home, agent, typed_ms, 0);
-        std::env::set_var("AGEND_PANE_INPUT_THRESHOLD_SECS", "60");
         let sink = std::sync::Arc::new(TestSink {
             events: parking_lot::Mutex::new(Vec::new()),
         });
@@ -3930,7 +3922,6 @@ instances:
             count, 1,
             "must dedup repeated ticks for same typed_ms; got {count}"
         );
-        std::env::remove_var("AGEND_PANE_INPUT_THRESHOLD_SECS");
         std::fs::remove_dir_all(home).ok();
     }
 
@@ -3947,7 +3938,6 @@ instances:
         let home = fleet_with_backend("pin_bootgrace", agent, "claude");
         let now_ms = chrono::Utc::now().timestamp_millis();
         seed_input_submit(&home, agent, now_ms - 300_000, 0);
-        std::env::set_var("AGEND_PANE_INPUT_THRESHOLD_SECS", "60");
         let sink = std::sync::Arc::new(TestSink {
             events: parking_lot::Mutex::new(Vec::new()),
         });
@@ -3996,7 +3986,6 @@ instances:
             })
             .count();
         assert_eq!(count_after, 1, "must emit exactly once after grace ends");
-        std::env::remove_var("AGEND_PANE_INPUT_THRESHOLD_SECS");
         std::fs::remove_dir_all(home).ok();
     }
 

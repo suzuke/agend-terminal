@@ -218,12 +218,10 @@ fn higher_priority_instant() {
 
 // ── #1005 Phase A2: oscillation guard ─────────────────────────────────
 //
-// All tests in this section read `oscillation_guard_window()` which
-// peeks `AGEND_OSCILLATION_GUARD_WINDOW_SECS`. The env-disable test
-// (oscillation_guard_window_env_disable) flips the var temporarily,
-// so every other test in this section is marked `#[serial]` to
-// prevent cross-test env-var bleed when cargo test runs them in
-// parallel.
+// All tests in this section read `oscillation_guard_window()`, now a fixed
+// 30s const (#env-cleanup: the `AGEND_OSCILLATION_GUARD_WINDOW_SECS` override
+// was demoted). The `#[serial]` markers below are retained as-is — they no
+// longer guard against env-var bleed (none remains) but are harmless.
 
 /// Phase A2 core invariant: when a priority-up to active state X is
 /// followed within `OSCILLATION_LOWER_HOLD_THRESHOLD` (5s) by another
@@ -363,35 +361,6 @@ fn oscillation_guard_multi_cycle_settles_in_idle() {
     t.since = Instant::now() - Duration::from_secs(2);
     t.transition(AgentState::ToolUse);
     assert_eq!(t.get_state(), AgentState::Idle, "cycle 4 bounce");
-}
-
-/// Phase A2 env tunable: `AGEND_OSCILLATION_GUARD_WINDOW_SECS=0`
-/// effectively disables the guard. Operators who experience
-/// false-suppression can opt out.
-#[test]
-#[serial_test::serial]
-fn oscillation_guard_window_env_disable() {
-    // SAFETY: only set + remove the env var around this test.
-    // serial_test ensures no concurrent test races.
-    unsafe { std::env::set_var("AGEND_OSCILLATION_GUARD_WINDOW_SECS", "0") };
-    assert_eq!(oscillation_guard_window(), Duration::from_secs(0));
-
-    let backend = Backend::ClaudeCode;
-    let mut t = tracker_at(&backend, AgentState::Idle, 0);
-    t.transition(AgentState::ToolUse);
-    t.since = Instant::now() - Duration::from_secs(3);
-    t.transition(AgentState::Idle);
-    t.since = Instant::now() - Duration::from_secs(1);
-    // With window=0, no priority-up record falls within the window
-    // → guard cannot trigger → bounce goes through.
-    t.transition(AgentState::ToolUse);
-    assert_eq!(
-        t.get_state(),
-        AgentState::ToolUse,
-        "#1005 A2: window=0 must disable the guard"
-    );
-
-    unsafe { std::env::remove_var("AGEND_OSCILLATION_GUARD_WINDOW_SECS") };
 }
 
 /// Phase A2 companion (#1005 dev-2 fixture finding): opencode's

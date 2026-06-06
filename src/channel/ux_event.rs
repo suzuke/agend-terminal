@@ -125,8 +125,7 @@ pub enum FleetEvent {
     },
     /// Sprint 54 P2-3: operator typed input into an agent's pane but
     /// has not yet submitted it (no submit-key keystroke since the last
-    /// non-submit keystroke) for at least
-    /// `AGEND_PANE_INPUT_THRESHOLD_SECS` (default 60). Read-only
+    /// non-submit keystroke) for at least the fixed 60s threshold. Read-only
     /// diagnostic emitted by the daemon supervisor tick — the agent is
     /// not interrupted, no prompt injected, no state mutated. Backend
     /// allowlist applies (claude only, first round); other backends

@@ -64,11 +64,7 @@ master gate (`hang_auto_recovery_enabled`) can also enable Stages 1–3.
 | Name | Purpose | Default (unset) | Valid values / format | Source | Notes |
 |------|---------|-----------------|-----------------------|--------|-------|
 | `AGEND_AUTO_RECOVERY_STAGE1` | Stage 1 gate: write ESC byte to a hung agent's PTY. | Inactive (shadow mode) unless master gate on. | `"1"` enables; else off. | `src/daemon/per_tick/recovery_dispatcher.rs:193` | Operator flag; mutates a live PTY. |
-| `AGEND_AUTO_RECOVERY_STAGE1_TIMEOUT_MS` | Stage 1 timeout/threshold. | `10_000` ms (`STAGE1_TIMEOUT_DEFAULT_MS`). | `u64` ms. | `src/daemon/per_tick/recovery_dispatcher.rs:268` | Default const at `src/health.rs:137`. |
-| `AGEND_AUTO_RECOVERY_STAGE1_COOLDOWN_MS` | Cooldown between Stage 1 fires. | `60_000` ms (`STAGE1_COOLDOWN_DEFAULT_MS`). | `u64` ms. | `src/daemon/per_tick/recovery_dispatcher.rs:269` | Default const at `src/health.rs:144`. |
 | `AGEND_AUTO_RECOVERY_STAGE2` | Stage 2 gate: emit `Stage2Restart` event (restarts the agent). | Inactive (shadow mode) unless master gate on. | `"1"` enables; else off. | `src/daemon/per_tick/recovery_dispatcher.rs:155` | Operator flag; triggers agent restart. |
-| `AGEND_AUTO_RECOVERY_STAGE2_TIMEOUT_MS` | Stage 2 timeout. | `30_000` ms (`STAGE2_TIMEOUT_DEFAULT_MS`). | `u64` ms. | `src/daemon/per_tick/recovery_dispatcher.rs:271` | Default const at `src/health.rs:159`. |
-| `AGEND_AUTO_RECOVERY_STAGE2_BACKOFF_MS` | Backoff before a Stage 2 restart respawns the agent. | `1_000` ms (`STAGE2_BACKOFF_DEFAULT_MS`). | `u64` ms. | `src/daemon/mod.rs:1328` | Default const at `src/health.rs:152`. |
 | `AGEND_AUTO_RECOVERY_STAGE2_MAX_RESTARTS` | Max Stage 2 restart attempts. | `3` (`STAGE2_MAX_RESTARTS_DEFAULT`). | `u32`. | `src/daemon/per_tick/recovery_dispatcher.rs:161` | Safety bound on restart loops. |
 | `AGEND_AUTO_RECOVERY_STAGE3` | Stage 3 gate: escalate by writing `HealthState::Paused`. | Inactive (shadow mode: telegram + tracing only) unless master gate on. | `"1"` enables; else off. | `src/daemon/per_tick/recovery_dispatcher.rs:114` | Operator escalation gate. |
 | `AGEND_PRODUCTIVE_GATE` | Activates the F9 "productive-silence" hang-detection path (can flag an agent Hung). Off → shadow telemetry only. | `false` (inactive). | `"1"` activates; else off. | `src/health.rs:753` | Rollout feature gate. |
@@ -84,7 +80,6 @@ master gate (`hang_auto_recovery_enabled`) can also enable Stages 1–3.
 | `AGEND_WORKTREE_GC` | Master gate for the worktree GC sweep (archives clean orphan worktrees to `.trash`, purges old trash). | **Off** (no-op). | `"1"` enables; else off. | `src/daemon/retention/worktrees.rs:391` | ⚠️ Gates worktree deletion. Strict `=="1"`. |
 | `AGEND_WORKTREE_GC_TRASH_DAYS` | Retention window (days) for `.trash/worktrees/*`; older entries purged on GC sweep. | `7`. | `u64` days; `0` = purge same sweep; no positivity filter. | `src/daemon/retention/worktrees.rs:49` | Tuning knob. |
 | `AGEND_WORKTREE_FORCE_RECLAIM_DAYS` | Age cap (days) for the force-reclaim backstop: a never-released lease with no agent liveness older than this is force-reclaimed. | `7` (also when `<=0`). | `i64` days, filtered `>0`. | `src/worktree_pool.rs:534` | ⚠️ Controls destructive reclaim. |
-| `AGEND_WORKTREE_FORCE_RECLAIM_BOOT_GRACE_SECS` | Post-boot grace window (seconds) during which force-reclaim is suspended (avoids reclaiming mid-respawn agents). | `600` (10 min). | `u64` seconds; `0` accepted (no grace). | `src/worktree_pool.rs:547` | Tuning knob. |
 
 ---
 
@@ -152,14 +147,8 @@ These live in the `agend-git` shim binary (`src/bin/agend-git.rs`). The three
 | Name | Purpose | Default (unset) | Valid values / format | Source | Notes |
 |------|---------|-----------------|-----------------------|--------|-------|
 | `AGEND_POINTER_ONLY_INJECT` | When on, PTY inbox injection uses header-only ("pointer") format, forcing agents to call `inbox` for the body. | `false`. | `"1"` enables; else off. | `src/daemon_config.rs:27` (seeds `DaemonConfig::default`); consumed via `src/inbox/notify.rs:14` | Env read only at default-construction; runtime value lives in `DaemonConfig`. |
-| `AGEND_OSCILLATION_GUARD_WINDOW_SECS` | Window within which a `Lower→Active(X)→Lower→Active(X)` bounce is treated as state oscillation. | `30` s (`DEFAULT_SECS`). | `u64` seconds; `0` disables the guard. | `src/state/mod.rs:357` | State-machine knob. |
-| `AGEND_PANE_INPUT_THRESHOLD_SECS` | Age threshold before the "pane input typed but not submitted" diagnostic fires. | `60` s. | `u64` seconds. | `src/daemon/supervisor.rs:453` | Daemon diagnostic. |
 | `AGEND_CTRLC_SENTINEL` | Debug aid: inside the Ctrl+C handler, if set, write a "fired at &lt;time&gt;" sentinel file to the given path (isolating signal handling on Windows). | No sentinel file written. | Filesystem path string. | `src/bootstrap/signals.rs:39` | Internal diagnostic. |
-| `AGEND_API_CALL_TIMEOUT_SECS` | Read-timeout backstop for self-IPC API calls (shrinks the deadlock-recovery window). | `90` s. | `u64` seconds, clamped `.max(1)`; unparseable → 90. | `src/api/mod.rs:764` | Perf tuning. |
-| `AGEND_API_MAX_CONNS` | Caps concurrent API sessions in the listener accept loop (#680). | `32`. | `usize`; unparseable → 32. | `src/api/mod.rs:267` | Resource limit. |
 | `AGEND_SPAWN_STAGGER_MS` | Staggered-spawn delay rate-limiting PTY init during multi-agent startup bursts. | `500` ms. | `u64` ms; unparseable → 500. | `src/daemon/mod.rs:1073` | Startup tuning. |
-| `AGEND_DRAFT_ESCAPE_SECS` | How long an unsent draft defers notification delivery before the escape valve releases it. | `300_000` ms (300 s / 5 min). | `i64` seconds, filtered `>0`, ×1000; invalid/`<=0` → default. | `src/notification_queue.rs:99` | Notification tuning. |
-| `AGEND_PR_STATE_REPLAY_AGE_HOURS` | At boot, age threshold above which terminal PR-state files are marked already-emitted (suppresses stale "PR merged/closed" replays). | `1` hour (`DEFAULT_HOURS`; also on unparseable). | `u64` hours. | `src/daemon/pr_state/mod.rs:523` | Boot tuning. |
 
 ---
 
@@ -195,9 +184,6 @@ fixtures and have no (or vestigial) production read sites.
 
 | Name | Purpose | Source | Notes |
 |------|---------|--------|-------|
-| `AGEND_TEST_RECOVERY_ENV_MS_VALID` | Fixture fed to the `env_ms()` recovery helper to verify a valid integer parses correctly. Set to `"5000"`. | `src/daemon/per_tick/recovery_dispatcher.rs:1115` (inside `#[cfg(test)]`) | Test of `env_ms` parse-success branch. |
-| `AGEND_TEST_RECOVERY_ENV_MS_INVALID` | Fixture fed to `env_ms()` to verify a garbage value falls back to the default. Set to `"not a number"`. | `src/daemon/per_tick/recovery_dispatcher.rs:1129` (inside `#[cfg(test)]`) | Test of `env_ms` invalid-parse branch. |
-| `AGEND_TEST_RECOVERY_NONEXISTENT_VAR` | Fixture deliberately removed, then passed to `env_ms()` to verify the unset path falls back to the default. | `src/daemon/per_tick/recovery_dispatcher.rs:892` (inside `#[cfg(test)]`) | Test of `env_ms` missing-var branch. |
 
 ---
 

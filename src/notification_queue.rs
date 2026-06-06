@@ -94,14 +94,11 @@ pub fn read_input_submit_timestamps(home: &Path, agent_name: &str) -> (i64, i64)
 
 /// #1457: how long an unsent draft defers notification delivery before the
 /// escape valve releases it (operator likely walked away mid-draft).
-/// Overridable via `AGEND_DRAFT_ESCAPE_SECS`; default 300s (5 min).
+/// Fixed const 300s / 5 min (#env-cleanup: was env-overridable via
+/// `AGEND_DRAFT_ESCAPE_SECS`; demoted to YAGNI for single-user deploys).
 fn draft_escape_timeout_ms() -> i64 {
-    std::env::var("AGEND_DRAFT_ESCAPE_SECS")
-        .ok()
-        .and_then(|s| s.parse::<i64>().ok())
-        .filter(|s| *s > 0)
-        .map(|s| s.saturating_mul(1000))
-        .unwrap_or(300_000)
+    const DRAFT_ESCAPE_MS: i64 = 300_000;
+    DRAFT_ESCAPE_MS
 }
 
 /// #1457: draft state used to gate notification delivery. Derived from the
