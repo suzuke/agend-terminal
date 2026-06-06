@@ -213,9 +213,15 @@ fn confirm_shutdown_or_abort_respawn(shutdown: &AtomicBool) -> bool {
 /// #1814 round-2: settle window before the FINAL pre-exit liveness recheck (the
 /// recover-as-primary gate in `run_core`). Gives a successor that is crashing
 /// around the predecessor's teardown a moment to surface so the recheck catches
-/// it. Env-overridable (`AGEND_SELF_RESPAWN_SETTLE_SECS`) — tests widen it so
-/// the cross-process death lands deterministically inside the recheck window.
+/// it. Production is ALWAYS 1s.
+///
+/// `AGEND_SELF_RESPAWN_SETTLE_SECS` is a **test-only seam, NOT a production
+/// tunable** (same convention as `AGEND_FORCE_SUCCESSOR_FAIL*`): it exists only
+/// so the cross-process integration tests can widen the window deterministically
+/// (the successor's death must land inside it). Operators should never set it —
+/// it is intentionally absent from the operator-facing tuning docs.
 fn self_respawn_settle() -> std::time::Duration {
+    // Test-only override (see doc above); unset/garbage → the 1s prod default.
     let secs = std::env::var("AGEND_SELF_RESPAWN_SETTLE_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
@@ -854,6 +860,15 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
         //     supervisor and is out of scope for Stage 1).
         // Flag-off never enters this block → it falls through to the byte-identical
         // exit path after `'serve`.
+        //
+        // INVARIANT (do not break): this gate's safety relies on
+        // `flag-on + RESTART_PENDING ⟹ a successor was parked`
+        // (`handle_self_respawn` parks the child BEFORE setting RESTART_PENDING).
+        // `self_respawn_successor_died()` returns `false` when nothing is parked.
+        // So if a FUTURE path sets RESTART_PENDING under flag-on WITHOUT parking a
+        // successor, this gate sees "not died" → falls through to exit(0) with no
+        // successor coming up → BRICK. Any new RESTART_PENDING writer on the
+        // self-respawn path MUST park a live successor first (or gate itself out).
         if RESTART_PENDING.load(Ordering::Acquire) && crate::daemon::restart::self_respawn_enabled()
         {
             std::thread::sleep(self_respawn_settle());
