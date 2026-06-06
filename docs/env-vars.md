@@ -1,0 +1,250 @@
+# Environment Variables Reference
+
+A categorized reference for every `AGEND_*` environment variable read by the
+codebase, plus the honored external/standard variables and test-only fixtures.
+
+Every entry was derived by reading the **actual read site** (`std::env::var` /
+`var_os` / `has_env`) and its default-resolution logic — not inferred from the
+name. `file:line` points at the primary read site; line numbers are relative to
+the crate root and reflect `origin/main` at the time of writing.
+
+## Conventions
+
+- **Presence-based** flag: enabled by the variable merely being *set*
+  (`var_os(name).is_some()` / `var(name).is_ok()`), value ignored.
+- **Value-based** flag: enabled only when the value matches a specific string
+  (commonly exactly `"1"`); any other value — including empty — is "off".
+- **Default** describes behavior when the variable is **unset** (the `unwrap_or`
+  fallback or "feature off"). Unparseable numeric values generally fall back to
+  the same default.
+- 🔒 **Secret** — never log, print, echo, or commit a value. No example values
+  are shown for these.
+- ⚠️ **Security-sensitive** — changing it weakens an enforcement boundary or
+  triggers destructive/irreversible behavior.
+
+---
+
+## 1. Core / identity
+
+| Name | Purpose | Default (unset) | Valid values / format | Source | Notes |
+|------|---------|-----------------|-----------------------|--------|-------|
+| `AGEND_HOME` | Overrides the core agend home directory (state / runtime / `.env` root). Also consumed by the git shim, mcp-bridge, agent, and claim_verifier. | `~/.agend` if it exists (else legacy `~/.agend-terminal` for back-compat). In the git shim, unset → empty → shim execs real git unmodified. | Absolute directory path. | `src/main.rs:111` (primary); also `src/bin/agend-git.rs:66`, `src/bin/agend-mcp-bridge.rs:486`, `src/agent/mod.rs:1963` | Operator-facing core config. Heavily used in tests for isolated homes. |
+| `AGEND_INSTANCE_NAME` | The agent's identity name. Daemon injects it into each spawned agent's env; read back to stamp the "from" on cross-instance messages and to authorize bind / CI actions. | Unset/empty → `None` = anonymous / standalone mode; identity-gated handlers reject anonymous callers. No literal default name. | String restricted to `[A-Za-z0-9_:-]`, non-empty. | `src/identity.rs:29` (canonical read); also `src/bin/agend-git.rs:107`, `src/mcp/handlers/ci/mod.rs:776` | ⚠️ Security-sensitive (gates bind/CI authority). Listed in `SENSITIVE_ENV_KEYS` so templates cannot override it. Presence distinguishes agent-caller vs operator-shell. |
+
+---
+
+## 2. Channels & tokens
+
+All bot tokens are read **indirectly**: a fleet.yaml `bot_token_env` field names
+the variable, whose value is then fetched via `std::env::var(bot_token_env)`.
+The variables below are the **default names** for that indirection.
+
+| Name | Purpose | Default (unset) | Valid values / format | Source | Notes |
+|------|---------|-----------------|-----------------------|--------|-------|
+| `AGEND_TELEGRAM_BOT_TOKEN` | Default name of the env var holding the Telegram bot token. | Config field defaults to the name `AGEND_TELEGRAM_BOT_TOKEN`; if that var is unset at read time, falls back to legacy `AGEND_BOT_TOKEN` (with deprecation warning). | Telegram bot token string. | `src/fleet/mod.rs:227` (default name); read at `src/channel/telegram/creds.rs:23` | 🔒 Secret. Operator-facing. |
+| `AGEND_DISCORD_BOT_TOKEN` | Default name of the env var holding the Discord bot token. | Token var unset → Discord channel not activated (no-credentials arm). | Discord bot token string. | `src/fleet/mod.rs:230` (default name); deref read at `src/channel/telegram/creds.rs:23` | 🔒 Secret. Operator-facing. Shares the telegram channel's token indirection. |
+| `AGEND_BOT_TOKEN` | **Legacy/fallback** Telegram bot token, read only when the configured `bot_token_env` var is unset; emits a deprecation warning steering operators to `bot_token_env`. | Both unset → "bot token env not set" error; telegram verify test is skipped. | Telegram bot token string. | `src/channel/telegram/creds.rs:25`; `src/channel/telegram/bootstrap.rs:39` | 🔒 Secret. **Deprecated** — prefer `bot_token_env` in fleet.yaml. |
+
+---
+
+## 3. Supervision & restart
+
+| Name | Purpose | Default (unset) | Valid values / format | Source | Notes |
+|------|---------|-----------------|-----------------------|--------|-------|
+| `AGEND_WRAPPED` | Restart-supervisor marker set by `scripts/agend-wrapper.sh` before each daemon start; one signal that a supervisor will respawn the daemon on `exit(42)`, letting `restart_daemon` proceed. | Absent → contributes no supervised signal; if no other signal is present, `is_restart_supervised()` is false and restart fails closed. | **Presence-based** (`var_os(...).is_some()`); any value, even empty, counts. | `src/daemon/restart.rs:55` (`has_env`, lines 62–63) | ⚠️ Security-relevant: fail-closed gate on the destructive `restart_daemon` path. See also external `XPC_SERVICE_NAME` / `INVOCATION_ID` below, and the in-flight `AGEND_SUPERVISED` / handoff vars in [Pending](#13-pending--in-flight-not-yet-on-main). |
+
+---
+
+## 4. Auto-recovery
+
+The Stage gates are **value-based** (must equal `"1"`); when off they run in
+"shadow mode" (telemetry/logging only, no live action). A separate runtime-config
+master gate (`hang_auto_recovery_enabled`) can also enable Stages 1–3.
+
+| Name | Purpose | Default (unset) | Valid values / format | Source | Notes |
+|------|---------|-----------------|-----------------------|--------|-------|
+| `AGEND_AUTO_RECOVERY_STAGE1` | Stage 1 gate: write ESC byte to a hung agent's PTY. | Inactive (shadow mode) unless master gate on. | `"1"` enables; else off. | `src/daemon/per_tick/recovery_dispatcher.rs:193` | Operator flag; mutates a live PTY. |
+| `AGEND_AUTO_RECOVERY_STAGE1_TIMEOUT_MS` | Stage 1 timeout/threshold. | `10_000` ms (`STAGE1_TIMEOUT_DEFAULT_MS`). | `u64` ms. | `src/daemon/per_tick/recovery_dispatcher.rs:268` | Default const at `src/health.rs:137`. |
+| `AGEND_AUTO_RECOVERY_STAGE1_COOLDOWN_MS` | Cooldown between Stage 1 fires. | `60_000` ms (`STAGE1_COOLDOWN_DEFAULT_MS`). | `u64` ms. | `src/daemon/per_tick/recovery_dispatcher.rs:269` | Default const at `src/health.rs:144`. |
+| `AGEND_AUTO_RECOVERY_STAGE2` | Stage 2 gate: emit `Stage2Restart` event (restarts the agent). | Inactive (shadow mode) unless master gate on. | `"1"` enables; else off. | `src/daemon/per_tick/recovery_dispatcher.rs:155` | Operator flag; triggers agent restart. |
+| `AGEND_AUTO_RECOVERY_STAGE2_TIMEOUT_MS` | Stage 2 timeout. | `30_000` ms (`STAGE2_TIMEOUT_DEFAULT_MS`). | `u64` ms. | `src/daemon/per_tick/recovery_dispatcher.rs:271` | Default const at `src/health.rs:159`. |
+| `AGEND_AUTO_RECOVERY_STAGE2_BACKOFF_MS` | Backoff before a Stage 2 restart respawns the agent. | `1_000` ms (`STAGE2_BACKOFF_DEFAULT_MS`). | `u64` ms. | `src/daemon/mod.rs:1328` | Default const at `src/health.rs:152`. |
+| `AGEND_AUTO_RECOVERY_STAGE2_MAX_RESTARTS` | Max Stage 2 restart attempts. | `3` (`STAGE2_MAX_RESTARTS_DEFAULT`). | `u32`. | `src/daemon/per_tick/recovery_dispatcher.rs:161` | Safety bound on restart loops. |
+| `AGEND_AUTO_RECOVERY_STAGE3` | Stage 3 gate: escalate by writing `HealthState::Paused`. | Inactive (shadow mode: telegram + tracing only) unless master gate on. | `"1"` enables; else off. | `src/daemon/per_tick/recovery_dispatcher.rs:114` | Operator escalation gate. |
+| `AGEND_PRODUCTIVE_GATE` | Activates the F9 "productive-silence" hang-detection path (can flag an agent Hung). Off → shadow telemetry only. | `false` (inactive). | `"1"` activates; else off. | `src/health.rs:753` | Rollout feature gate. |
+
+---
+
+## 5. Worktree & GC
+
+| Name | Purpose | Default (unset) | Valid values / format | Source | Notes |
+|------|---------|-----------------|-----------------------|--------|-------|
+| `AGEND_WORKTREE_AUTO_CLEANUP` | Gates the runtime worktree auto-cleanup sweep (removes merged worktrees, prunes orphan branches). | **On** (`unwrap_or(true)`). | Any value except `"0"` → enabled; only `"0"` disables. | `src/worktree_cleanup.rs:17` | Opt-**out**. ⚠️ Module doc comment says "`=1` opt-in" but code is opt-out — code is authoritative. |
+| `AGEND_WORKTREE_ENFORCEMENT` | In the messaging handler, whether a task target must be bound in a managed worktree before delivery. | `"warn"` (log a warning but allow delivery). | `"off"` (skip), `"enforce"` (reject `worktree_not_managed`), else (incl. `"warn"`) → warn-and-allow. | `src/api/handlers/messaging.rs:282` | ⚠️ Security-sensitive (gates messaging unbound agents). Tri-state, not a bool. |
+| `AGEND_WORKTREE_GC` | Master gate for the worktree GC sweep (archives clean orphan worktrees to `.trash`, purges old trash). | **Off** (no-op). | `"1"` enables; else off. | `src/daemon/retention/worktrees.rs:391` | ⚠️ Gates worktree deletion. Strict `=="1"`. |
+| `AGEND_WORKTREE_GC_TRASH_DAYS` | Retention window (days) for `.trash/worktrees/*`; older entries purged on GC sweep. | `7`. | `u64` days; `0` = purge same sweep; no positivity filter. | `src/daemon/retention/worktrees.rs:49` | Tuning knob. |
+| `AGEND_WORKTREE_FORCE_RECLAIM_DAYS` | Age cap (days) for the force-reclaim backstop: a never-released lease with no agent liveness older than this is force-reclaimed. | `7` (also when `<=0`). | `i64` days, filtered `>0`. | `src/worktree_pool.rs:534` | ⚠️ Controls destructive reclaim. |
+| `AGEND_WORKTREE_FORCE_RECLAIM_BOOT_GRACE_SECS` | Post-boot grace window (seconds) during which force-reclaim is suspended (avoids reclaiming mid-respawn agents). | `600` (10 min). | `u64` seconds; `0` accepted (no grace). | `src/worktree_pool.rs:547` | Tuning knob. |
+
+---
+
+## 6. Git-shim & bypass
+
+These live in the `agend-git` shim binary (`src/bin/agend-git.rs`). The three
+`AGEND_GIT_BYPASS*` controls are layered emergency overrides — all ⚠️ security-sensitive.
+
+| Name | Purpose | Default (unset) | Valid values / format | Source | Notes |
+|------|---------|-----------------|-----------------------|--------|-------|
+| `AGEND_GIT_BYPASS` | Layer-1 one-shot override: if set, `should_bypass()` returns true and execs real git, skipping all enforcement. | Not bypassed. | **Presence-based** (`is_ok()`); any value, even empty. | `src/bin/agend-git.rs:178` | ⚠️ Emergency override. Daemon-internal callers set `=1` to skip the shim. |
+| `AGEND_GIT_BYPASS_AGENT` | Layer-2 agent-specific exemption: bypass when value equals the current `AGEND_INSTANCE_NAME`. | No agent exemption. | Agent/instance name string. | `src/bin/agend-git.rs:181` | ⚠️ Value-compared against `AGEND_INSTANCE_NAME`. |
+| `AGEND_GIT_BYPASS_UNTIL` | Layer-3 time-limited exemption: bypass while now < the given epoch. | No time exemption. | **Unix epoch seconds** (`u64`, not ISO). | `src/bin/agend-git.rs:188` | ⚠️ Expired/unparseable → no bypass. |
+| `AGEND_GIT_SHIM_DEPTH` | Recursion guard propagated into spawned git; hard-fails at `MAX_SHIM_DEPTH = 3`. | `0`. | Non-negative `u32`; unparseable → 0. | `src/bin/agend-git.rs:33` (read); set at `:1279`, `:1310` | Internal sentinel; not normally user-set. Exits 70 when `>= 3` (#1504). |
+| `AGEND_REAL_GIT` | Escape hatch holding the path to the real git binary so the shim execs git without recursing. Daemon injects it at agent spawn. | Shim: unset → falls back to literal `"git"` then PATH-exclude resolution. Daemon: only injected when not already set. | Absolute path to a git executable; accepted only if it exists. | `src/bin/agend-git.rs:1338` (read); injected at `src/agent/mod.rs:835` | ⚠️ Correctness-sensitive: wrong/missing value risks recursive-spawn storm (#1504). |
+
+---
+
+## 7. Logging & diagnostics
+
+| Name | Purpose | Default (unset) | Valid values / format | Source | Notes |
+|------|---------|-----------------|-----------------------|--------|-------|
+| `AGEND_LOG` | `EnvFilter` directive controlling log verbosity for CLI and the rolling daemon/app subscribers. | CLI → `agend_terminal=info`; rolling → caller-supplied default filter. | `tracing_subscriber::EnvFilter` syntax, e.g. `agend_terminal=debug`, `info,agend_terminal::daemon=trace`. | `src/logging.rs:76` (CLI), `:156` (rolling) | Operator-facing. |
+| `AGEND_LOG_MAX_BYTES` | Directory-size backstop: hourly handler prunes oldest `daemon.log.*` until total footprint is under the cap. | `2 GiB` (`DEFAULT_MAX_BYTES`). | Plain bytes or `K`/`M`/`G` suffix (case-insensitive), e.g. `2G`, `500M`. | `src/daemon/per_tick/log_rotation.rs:43`; parser `src/logging.rs:198` | Daemon-only tuning. |
+| `AGEND_LOG_RETAIN_DAYS` | `max_log_files` on the daily rolling appender (count of rotated daily files retained). | `3` (`DEFAULT_RETAIN_DAYS`; also when `<=0`). | Positive `usize`. | `src/logging.rs:62` | Orthogonal to the byte cap. |
+| `AGEND_DAEMON_THREAD_DUMP_SECS` | Per-tick thread-dump interval (seconds); `N>=1` enables periodic dumps. | `0` / disabled. | `u64` seconds; `0` disables. | `src/daemon/per_tick/thread_dump.rs:47` | Cached once via `OnceLock` — restart to toggle. |
+| `AGEND_DEBUG_PTY_READ` | In the PTY read loop, enables verbose debug logging of read counts/byte totals. | Off. | **Presence-based** (`is_ok()`); any value. | `src/agent/mod.rs:1380` | Internal debug flag. |
+| `AGEND_LOCK_AUDIT` | Enables lock-ordering audit in **release** builds (logs tier violations instead of being a no-op). | Release build → no-op; debug/test builds always audit regardless. | **Presence-based** (`is_err()` check). | `src/sync_audit.rs:43` | Dev/diagnostic; affects release builds only. |
+
+---
+
+## 8. Watchdog & recipients
+
+| Name | Purpose | Default (unset) | Valid values / format | Source | Notes |
+|------|---------|-----------------|-----------------------|--------|-------|
+| `AGEND_IDLE_WATCHDOG_AGENT` | Which agent the dev-vantage idle watchdog watches. | `"dev"`. | Agent name; empty/whitespace ignored. | `src/daemon/idle_watchdog.rs:261` | Tuning for multi-agent fleets. |
+| `AGEND_IDLE_WATCHDOG_DEV_RECIPIENT` | Recipient for dev-vantage idle alerts. | `"lead"`. | Recipient name; empty/whitespace ignored. | `src/daemon/idle_watchdog.rs:269` | Tuning. |
+| `AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT` | Recipient for fleet-vantage idle alerts ("whole fleet is quiet"). | `"lead"`. | Recipient name; empty/whitespace ignored. | `src/daemon/idle_watchdog.rs:288` | Tuning. |
+| `AGEND_TASK_STALL_RECIPIENTS` | Override recipients of task-stall warnings (normally `general` + `lead`). | `["general", "lead"]`. | Comma-separated names; entries trimmed, empties filtered. | `src/daemon/anti_stall.rs:166` | List override. |
+| `AGEND_DECISION_TIMEOUT_RECIPIENT` | Recipient for the decision-timeout auto-default (operator-proceed) emission. | `"general"`. | Non-empty recipient name; blank treated as unset. | `src/daemon/decision_timeout.rs:58` | Tuning. |
+| `AGEND_WATCHDOG_DRY_RUN` | Makes the per-tick watchdog log classified PTY errors to the event log only instead of mutating agent health state. | `false` (health mutations applied). | `"1"`/`"true"`/`"TRUE"`/`"True"` → dry-run; else off. | `src/daemon/watchdog.rs:21` | Operator safety toggle. |
+
+---
+
+## 9. MCP & tools
+
+| Name | Purpose | Default (unset) | Valid values / format | Source | Notes |
+|------|---------|-----------------|-----------------------|--------|-------|
+| `AGEND_BRIDGE_TOOLS_LIST_TIMEOUT_MS` | Overrides the `tools/list` retry-timeout budget in the MCP bridge proxy. | `30_000` ms. | `u64` ms; malformed → default. | `src/bin/agend-mcp-bridge.rs:271` | Test-oriented override (internal). |
+| `AGEND_MCP_TOOLS_ALLOW` | Intended MCP per-tool ACL allow-list. **No active read site** in current `src/` — the former reader was removed when the stdio JSON-RPC server moved to the bridge binary. | N/A (no live read). | Historically comma-separated tool names (deny overrides allow). | Only occurrence: `src/agent/mod.rs:107` (`SENSITIVE_ENV_KEYS` deny-list, not a read) | ⚠️ Reserved/deny-listed only — blocked from template override. Not currently consumed. |
+| `AGEND_MCP_TOOLS_DENY` | Intended MCP per-tool ACL deny-list. **No active read site** in current `src/` (same removal as above). | N/A (no live read). | Historically comma-separated tool names. | Only occurrence: `src/agent/mod.rs:108` (`SENSITIVE_ENV_KEYS`, not a read) | ⚠️ Reserved/deny-listed only. Not currently consumed. |
+
+---
+
+## 10. Env-isolation & security
+
+| Name | Purpose | Default (unset) | Valid values / format | Source | Notes |
+|------|---------|-----------------|-----------------------|--------|-------|
+| `AGEND_ENV_ISOLATION` | Gate for agent-backend env isolation (#1440 phased rollout). | Disabled. | `"1"` enables; else off. | `src/agent/mod.rs:179` | Default-off feature flag. When on, only allowlisted env is forwarded to backends (see [external env](#12-honored-external-env)). |
+| `AGEND_ALLOWED_ROOTS` | Extra allowed root directories for `working_directory` validation (appended to home, workspace, cwd). | No extra roots; only home + workspace + cwd allowed. | OS-path-separator list (`:` Unix, `;` Windows); empty segments skipped. | `src/api/mod.rs:156` | ⚠️ Controls path-traversal allowlist for agent working dirs. |
+| `AGEND_ALLOWED_WORK_ROOTS` | **Not read as config.** Present only as a `SENSITIVE_ENV_KEYS` deny-list entry so a template cannot inject it into a spawned agent. | N/A (never read via `env::var`). | N/A. | `src/agent/mod.rs:106` (deny-list entry; not a read site) | ⚠️ Reserved sensitive key name only. |
+| `AGEND_BIND_STRICT_MODE` | In dispatch_hook: when `source_repo` resolves to a stub (tier 4) and this is `"1"`, reject the stub fallback, forcing an explicit `source_repo` in fleet.yaml. | Strict mode off; stub fallback allowed. | `"1"` enables; else off. | `src/mcp/handlers/dispatch_hook/mod.rs:343` | Production safety gate. |
+
+---
+
+## 11. State-detection, injection & timing/tuning
+
+| Name | Purpose | Default (unset) | Valid values / format | Source | Notes |
+|------|---------|-----------------|-----------------------|--------|-------|
+| `AGEND_POINTER_ONLY_INJECT` | When on, PTY inbox injection uses header-only ("pointer") format, forcing agents to call `inbox` for the body. | `false`. | `"1"` enables; else off. | `src/daemon_config.rs:27` (seeds `DaemonConfig::default`); consumed via `src/inbox/notify.rs:14` | Env read only at default-construction; runtime value lives in `DaemonConfig`. |
+| `AGEND_OSCILLATION_GUARD_WINDOW_SECS` | Window within which a `Lower→Active(X)→Lower→Active(X)` bounce is treated as state oscillation. | `30` s (`DEFAULT_SECS`). | `u64` seconds; `0` disables the guard. | `src/state/mod.rs:357` | State-machine knob. |
+| `AGEND_PANE_INPUT_THRESHOLD_SECS` | Age threshold before the "pane input typed but not submitted" diagnostic fires. | `60` s. | `u64` seconds. | `src/daemon/supervisor.rs:453` | Daemon diagnostic. |
+| `AGEND_CTRLC_SENTINEL` | Debug aid: inside the Ctrl+C handler, if set, write a "fired at &lt;time&gt;" sentinel file to the given path (isolating signal handling on Windows). | No sentinel file written. | Filesystem path string. | `src/bootstrap/signals.rs:39` | Internal diagnostic. |
+| `AGEND_API_CALL_TIMEOUT_SECS` | Read-timeout backstop for self-IPC API calls (shrinks the deadlock-recovery window). | `90` s. | `u64` seconds, clamped `.max(1)`; unparseable → 90. | `src/api/mod.rs:764` | Perf tuning. |
+| `AGEND_API_MAX_CONNS` | Caps concurrent API sessions in the listener accept loop (#680). | `32`. | `usize`; unparseable → 32. | `src/api/mod.rs:267` | Resource limit. |
+| `AGEND_SPAWN_STAGGER_MS` | Staggered-spawn delay rate-limiting PTY init during multi-agent startup bursts. | `500` ms. | `u64` ms; unparseable → 500. | `src/daemon/mod.rs:1073` | Startup tuning. |
+| `AGEND_DRAFT_ESCAPE_SECS` | How long an unsent draft defers notification delivery before the escape valve releases it. | `300_000` ms (300 s / 5 min). | `i64` seconds, filtered `>0`, ×1000; invalid/`<=0` → default. | `src/notification_queue.rs:99` | Notification tuning. |
+| `AGEND_PR_STATE_REPLAY_AGE_HOURS` | At boot, age threshold above which terminal PR-state files are marked already-emitted (suppresses stale "PR merged/closed" replays). | `1` hour (`DEFAULT_HOURS`; also on unparseable). | `u64` hours. | `src/daemon/pr_state/mod.rs:523` | Boot tuning. |
+
+---
+
+## 12. Daemon lifecycle / retention / capture
+
+| Name | Purpose | Default (unset) | Valid values / format | Source | Notes |
+|------|---------|-----------------|-----------------------|--------|-------|
+| `AGEND_DAEMON_BOOT_SWEEP_AGE_DAYS` | Enables the destructive boot-time zombie-daemon sweep and sets the age threshold (days); candidates older than N are killed. | Telemetry-only (no kills); threshold const `DEFAULT_AGE_DAYS = 14`. | Positive integer `>=1` days; malformed → warn + treated as unset. | `src/daemon/boot_sweep.rs:36` | ⚠️ **Destructive** (SIGTERM/SIGKILL zombie daemons). Setting a valid value flips destructive mode on. |
+| `AGEND_DAEMON_BOOT_SWEEP_DRY_RUN` | Secondary gate: when `"1"` and age-days is set, downgrades the destructive sweep to log-only. | Not dry-run (destructive if age-days set). | `"1"` enables dry-run; else off. | `src/daemon/boot_sweep.rs:40` | Safety override for the sweep. |
+| `AGEND_RETENTION_CUTOVER` | Staged-rollout gate for retention sweeps, with **asymmetric** semantics across two sites. | Pending-dispatch sweep: **on** unless `=="0"` (opt-out). Decisions sweep: **off** unless `=="1"` (opt-in). | `"0"` disables pending-dispatch; `"1"` enables decisions. | `src/daemon/retention/mod.rs:41` (opt-out); `src/daemon/retention/decisions.rs:83` (opt-in) | Rollout gate. Note the two opposite defaults. |
+| `AGEND_FLEET_NO_AUTO_MIGRATE` | Disables automatic backfill/migration of missing instance IDs in `fleet.yaml` during load. | Auto-migration runs (backfills IDs and rewrites fleet.yaml). | `"1"` skips migration; else off. | `src/fleet/mod.rs:544` | Opt out of auto-rewrite. |
+| `AGEND_CAPTURE_FIXTURES` | Activates the PTY-capture fixture sink: raw PTY bytes written to `$AGEND_HOME/captures/<agent>/`. Boot path emits a privacy warning. | `NoOpCapture` (no capture, zero overhead). | `"1"` enables; else off. | `src/capture.rs:56`; `src/bootstrap/mod.rs:224` | ⚠️ Fixture-capture tool, readable on the real boot path. Captured bytes may contain **secrets/prompts** — review before committing. See also [test-only](#14-test-only-fixtures). |
+
+---
+
+## 13. Pending / in-flight (not yet on `main`)
+
+These are designed but not yet merged. Documented here for forward reference;
+verify against code once their PRs land.
+
+| Name | Purpose | Status |
+|------|---------|--------|
+| `AGEND_SUPERVISED` | Positive supervisor sentinel written into the generated launchd plist / systemd unit (and wrapper), replacing the ambient `XPC_SERVICE_NAME` false-positive signal in `is_restart_supervised()`. | #1812 — proposed. |
+| `AGEND_RESTART_HANDOFF` | On/off switch for the self-healing successor-handoff restart path (vs the legacy `exit(42)` + external-respawn fallback). | #1814 — feature flag. |
+| `AGEND_SUCCESSOR_HANDOFF` | Internal token used during restart handoff to let the spawned successor bypass the singleton "another daemon is already running" guard. | #1814 — internal. |
+
+---
+
+## 14. Test-only fixtures
+
+⚠️ **Do not set these in production.** They are test-harness conventions /
+fixtures and have no (or vestigial) production read sites.
+
+| Name | Purpose | Source | Notes |
+|------|---------|--------|-------|
+| `AGEND_TEST_ISOLATION` | Intended to flag test runs so spawned binaries skip real fleet-instance creation / daemon API calls. | Set-only in `src/mcp/handlers/tests.rs` + `.env()` in `tests/`; invariant enforced by `tests/test_isolation_invariant.rs` | **Vestigial** — the former production reader (`src/mcp/mod.rs`) was removed with the deleted `agend-terminal mcp` subcommand. No live `env::var` reader remains. |
+| `AGEND_TEST_RECOVERY_ENV_MS_VALID` | Fixture fed to the `env_ms()` recovery helper to verify a valid integer parses correctly. Set to `"5000"`. | `src/daemon/per_tick/recovery_dispatcher.rs:1115` (inside `#[cfg(test)]`) | Test of `env_ms` parse-success branch. |
+| `AGEND_TEST_RECOVERY_ENV_MS_INVALID` | Fixture fed to `env_ms()` to verify a garbage value falls back to the default. Set to `"not a number"`. | `src/daemon/per_tick/recovery_dispatcher.rs:1129` (inside `#[cfg(test)]`) | Test of `env_ms` invalid-parse branch. |
+| `AGEND_TEST_RECOVERY_NONEXISTENT_VAR` | Fixture deliberately removed, then passed to `env_ms()` to verify the unset path falls back to the default. | `src/daemon/per_tick/recovery_dispatcher.rs:892` (inside `#[cfg(test)]`) | Test of `env_ms` missing-var branch. |
+
+---
+
+## 15. Honored external env
+
+Standard / third-party variables the codebase actually reads (confirmed read
+sites only). When `AGEND_ENV_ISOLATION=1`, a broader **allowlist** of locale /
+proxy / platform vars is forwarded to spawned backends (bulk passthrough via
+`std::env::vars()`, not individual reads).
+
+### Directly read
+
+| Name | Purpose | Default (unset) | Source | Notes |
+|------|---------|-----------------|--------|-------|
+| `GITHUB_TOKEN` | GitHub API auth; top of the token-discovery chain before `gh auth token`; `Bearer` header for CI/PR polling. | Falls back to `gh` CLI, else unauthenticated (60/hr). | `src/github_token.rs:166`; `src/daemon/ci_watch/provider.rs:745` | 🔒 Secret. (`GH_TOKEN` is **not** honored — only `GITHUB_TOKEN`.) |
+| `GITLAB_TOKEN` | GitLab API auth (`PRIVATE-TOKEN` header). | Falls back to `~/.config/glab-cli/config.yml`. | `src/daemon/ci_watch/provider.rs:776` | 🔒 Secret. |
+| `BITBUCKET_TOKEN` | Bitbucket auth (`user:app_password`). | Falls back to `~/.config/bb/config`. | `src/daemon/ci_watch/provider.rs:1001` | 🔒 Secret. |
+| `HOME` | Home dir: `~` expansion, XDG fallback base, service unit paths, CLI-config fallback for tokens, backend session dirs. | Hard error for service/`~` paths; skip elsewhere. | `src/service/macos.rs:17`; `src/connect.rs:62`; `src/agent/mod.rs:630` | Unix-centric. |
+| `XDG_CONFIG_HOME` | Base dir for the systemd user unit path. | `$HOME/.config`. | `src/service/linux.rs:17` | Linux. |
+| `XDG_DATA_HOME` | Resolve canonical opencode `auth.json`. | `$HOME/.local/share`. | `src/agent/mod.rs:627` | XDG semantics. |
+| `PATH` | Prepend agend bin / shim dir; locate real `git`/`gh`; foreign-repo detection. | `unwrap_or_default()` / harness fallback `"/usr/bin:/bin:/usr/local/bin"`. | `src/connect.rs:120`; `src/bin/agend-git.rs:1353` | Cross-platform. |
+| `SHELL` | Command launched for the `Shell` backend / terminal spawns. | `crate::default_shell()`. | `src/backend.rs:144`; `src/app/mod.rs:354` | Unix. |
+| `LANG` | If unset, daemon injects `LANG=en_US.UTF-8` into the spawned agent env. | Inject default if unset; left untouched if set. | `src/agent/mod.rs:762` | Cross-platform. |
+| `TZ` | IANA timezone for schedule evaluation (first source before `iana-time-zone`). | Platform TZ, then `"UTC"`. | `src/schedules.rs:33` | Cross-platform. |
+| `COLORTERM` | Detect 24-bit truecolor (`truecolor`/`24bit`) for rendering. | `unwrap_or_default()` → no truecolor. | `src/vterm.rs:71` | Cross-platform. |
+| `TERMINAL` | Preferred terminal emulator for the tray "open terminal" action. | Try `x-terminal-emulator`, then fallback chain. | `src/tray/terminal/linux.rs:23` | Linux. |
+| `USERNAME` | Windows current-user identifier (`DOMAIN\USER`) for the scheduled-task XML. | `unwrap_or_default()` → empty. | `src/service/windows.rs:22` | Windows. |
+| `USERDOMAIN` | Windows domain prefix for the user identifier. | Bare `USERNAME`. | `src/service/windows.rs:23` | Windows. |
+| `XPC_SERVICE_NAME` | macOS launchd supervisor-detection signal gating `restart_daemon`. | Not detected (fail-closed). | `src/daemon/restart.rs:55` (`has_env`) | macOS. ⚠️ Known false-positive source — see #1812 and `AGEND_SUPERVISED` (Pending). |
+| `INVOCATION_ID` | systemd supervisor-detection signal gating `restart_daemon`. | Not detected (fail-closed). | `src/daemon/restart.rs:55` (`has_env`) | Linux. |
+| `GIT_DIR` / `GIT_COMMON_DIR` / `GIT_WORK_TREE` | Presence makes the git shim fail-closed (skip foreign-repo protection) since they retarget git independently of cwd. | Normal `.git` discovery. | `src/bin/agend-git.rs:443`–`445` (`var_os`, presence only) | Cross-platform. |
+
+### Forwarded to backends when `AGEND_ENV_ISOLATION=1` (allowlist passthrough)
+
+Matched against `BASE_ENV_ALLOWLIST` and injected if present (absent keys simply
+not forwarded). Read in bulk via `std::env::vars()` at `src/agent/mod.rs:716`;
+allowlist at `src/agent/mod.rs:124`.
+
+- **Locale / session:** `USER`, `LOGNAME`, `LANGUAGE`, `LC_ALL`, `LC_CTYPE`, `LC_MESSAGES`, `SSH_AUTH_SOCK`, `XDG_CACHE_HOME`, `XDG_RUNTIME_DIR`, `TMPDIR`, `TMP`, `TEMP`
+- **Proxy:** `http_proxy`, `https_proxy`, `all_proxy`, `no_proxy` (+ uppercase variants)
+- **Windows platform:** `SYSTEMROOT`, `SystemDrive`, `windir`, `PATHEXT`, `COMSPEC`, `USERPROFILE`, `HOMEDRIVE`, `HOMEPATH`, `APPDATA`, `LOCALAPPDATA`, `ProgramData`, `ProgramFiles`, `ProgramFiles(x86)`, `NUMBER_OF_PROCESSORS`, `PROCESSOR_ARCHITECTURE`
+- **Backend credentials** (🔒 forwarded to the detected backend's child; keys at `src/backend.rs:68`): `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `GOOGLE_APPLICATION_CREDENTIALS`, `KIRO_API_KEY`, `OPENCODE_CONFIG`, `OPENCODE_API_KEY`
+
+### Searched but NOT read in `src/`
+
+`GH_TOKEN`, `RUST_LOG` (consumed by `tracing-subscriber` internally, no explicit read), `RUST_BACKTRACE`, `NO_COLOR`, `COLUMNS`/`LINES` (size comes from the PTY), `TERM` (only written, never read), and `XDG_RUNTIME_DIR`/`TMPDIR`/`USER` as direct reads (allowlist passthrough only).
