@@ -294,7 +294,9 @@ fn classify_force_reclaim(home: &Path, repo: Option<&str>, branch: Option<&str>)
             // event-driven release (PR-1) NEVER fired for it = a bug.
             MergeState::Merged { .. } | MergeState::ClosedUnmerged { .. } => "observed_terminal",
             _ if s.pr_number > 0 => "observed_open",
-            _ if s.last_gh_poll_at.is_some() => "queried_none",
+            // #986: a SUCCESSFUL poll (failures==0) is required to claim
+            // "queried, none found" — a failed/cold poll also sets last_gh_poll_at.
+            _ if s.last_gh_poll_at.is_some() && s.gh_poll_failures == 0 => "queried_none",
             _ => "unknown",
         },
         None => "unknown",

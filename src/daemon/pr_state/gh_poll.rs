@@ -153,6 +153,111 @@ fn summary_to_gh_metadata(s: crate::scm::PrSummary) -> Option<GhPrMetadata> {
     })
 }
 
+// ─── #986 fire-and-forget snapshot poller ──────────────────────────────
+//
+// The scanner thread used to call `CliGhPoller::poll` SYNCHRONOUSLY — a
+// `gh pr list` subprocess (>1s) per repo per tick — which blocked the whole
+// scanner tick and surfaced as operator INPUT LAG (#986: slips 1000-1500ms,
+// ~every 60s, even with 0 ci-watches because the #972 aggregator maintains the
+// full-repo PR-state map). The poll is moved OFF the scanner thread into a single
+// background worker; the scanner reads a cached snapshot, never the live gh.
+
+/// Shared snapshot cache + demand set bridging the scanner (reader) and the
+/// background gh-poll worker (writer). Race contract: the worker writes, the
+/// scanner reads; the worker polls into a LOCAL then briefly locks to swap, never
+/// holding the cache lock across the `gh` subprocess.
+#[derive(Default)]
+pub struct GhPollCache {
+    /// repo slug → latest successful poll snapshot. A repo PRESENT (even with an
+    /// empty vec) means the worker has polled it (→ `Ok`); ABSENT means cold /
+    /// never-polled (→ `Err`, so a consumer treats it as ambiguous, NOT as a
+    /// positive "no PR" — the #986 cold-start race: auto-release's `QueriedNone`
+    /// must never fire on a repo the worker has not actually polled yet).
+    cache: std::sync::Mutex<std::collections::HashMap<String, Vec<GhPrMetadata>>>,
+    /// repos the scanner has requested since the worker last drained — the worker
+    /// polls exactly these (zero duplication of the scanner's repo enumeration;
+    /// drain = retention: a no-longer-requested repo stops being polled).
+    demand: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+impl GhPollCache {
+    pub fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self::default())
+    }
+}
+
+/// Non-blocking [`GhPoller`] (#986): records demand + returns the worker's latest
+/// snapshot for `repo`. NEVER spawns `gh` — the scanner thread never blocks.
+/// Cold cache (worker has not polled `repo` yet) returns `Err` (ambiguous), so a
+/// downstream positive-no-PR consumer is never fed a false "0 PRs" during warm-up.
+pub struct SnapshotGhPoller {
+    shared: std::sync::Arc<GhPollCache>,
+}
+
+impl SnapshotGhPoller {
+    pub fn new(shared: std::sync::Arc<GhPollCache>) -> Self {
+        Self { shared }
+    }
+}
+
+impl GhPoller for SnapshotGhPoller {
+    fn poll(&self, repo: &str) -> anyhow::Result<Vec<GhPrMetadata>> {
+        if let Ok(mut d) = self.shared.demand.lock() {
+            d.insert(repo.to_string());
+        }
+        match self.shared.cache.lock() {
+            Ok(c) => match c.get(repo) {
+                Some(prs) => Ok(prs.clone()),
+                // Cold / never-polled → ambiguous, NOT a positive "no PR".
+                None => anyhow::bail!(
+                    "#986 gh-poll snapshot not ready for {repo} (worker has not polled yet)"
+                ),
+            },
+            Err(_) => anyhow::bail!("#986 gh-poll cache lock poisoned"),
+        }
+    }
+}
+
+/// Worker poll cadence. Off the scanner thread, so we keep armed-flow
+/// responsiveness without any scanner-tick cost; rate ~240/hr/repo, far under the
+/// 5000/hr authenticated ceiling.
+const WORKER_CADENCE: Duration = Duration::from_secs(15);
+
+/// Spawn the single background gh-poll worker (#986). Drains the demand set each
+/// cycle, polls each repo via the real [`CliGhPoller`] into a LOCAL, then swaps the
+/// per-repo snapshot under the cache lock (never held across the subprocess). A
+/// snapshot is updated only on a SUCCESSFUL poll, so a transient `gh` failure
+/// RETAINS the last-good snapshot rather than evicting it to cold.
+pub fn spawn_gh_poll_worker(shared: std::sync::Arc<GhPollCache>) {
+    // fire-and-forget: daemon-lifetime gh-poll worker; the loop has no exit
+    // condition and ends only when the process exits (§10.5).
+    let _ = std::thread::Builder::new()
+        .name("gh-poll-worker".into())
+        .spawn(move || {
+            let real = CliGhPoller;
+            loop {
+                std::thread::sleep(WORKER_CADENCE);
+                let repos: Vec<String> = match shared.demand.lock() {
+                    Ok(mut d) => d.drain().collect(),
+                    Err(_) => continue,
+                };
+                for repo in repos {
+                    match real.poll(&repo) {
+                        Ok(prs) => {
+                            if let Ok(mut c) = shared.cache.lock() {
+                                c.insert(repo, prs);
+                            }
+                        }
+                        Err(e) => tracing::warn!(
+                            repo = %repo, error = %e,
+                            "#986 gh-poll worker: poll failed (retaining last snapshot)"
+                        ),
+                    }
+                }
+            }
+        });
+}
+
 // ─── cadence + backoff ─────────────────────────────────────────────────
 
 /// Refresh cadence when `auto_armed` (active self-merge flow).
@@ -580,5 +685,51 @@ pub(crate) mod tests {
         let r = poller.poll("owner/repo").unwrap();
         assert_eq!(r.len(), 1);
         assert_eq!(poller.call_count(), 1);
+    }
+
+    /// #986: the SnapshotGhPoller reads the worker's cache (never spawns `gh`), and
+    /// a COLD repo returns `Err` (ambiguous) — never `Ok(empty)`, which a
+    /// positive-no-PR consumer would misread as "no PR" and false-release.
+    #[test]
+    fn snapshot_poller_cold_is_err_polled_is_ok() {
+        let cache = GhPollCache::new();
+        let poller = SnapshotGhPoller::new(cache.clone());
+        // Cold (worker hasn't polled) → Err.
+        assert!(
+            poller.poll("owner/repo").is_err(),
+            "cold cache must be Err (ambiguous), never Ok(empty)"
+        );
+        // poll() recorded demand so the worker will pick the repo up.
+        assert!(
+            cache.demand.lock().unwrap().contains("owner/repo"),
+            "demand recorded for the worker"
+        );
+        // Worker polled, found NO PRs (empty) → Ok(empty) = a real "no PR".
+        cache
+            .cache
+            .lock()
+            .unwrap()
+            .insert("owner/repo".into(), vec![]);
+        assert_eq!(
+            poller.poll("owner/repo").unwrap(),
+            Vec::<GhPrMetadata>::new(),
+            "polled-empty → Ok(empty) = positively no PR (distinct from cold)"
+        );
+        // Worker polled, found a PR → Ok(prs).
+        let pr = GhPrMetadata {
+            number: 5,
+            author_login: "a".into(),
+            head_ref: "fix/y".into(),
+            is_cross_repository: false,
+            is_draft: false,
+            state: GhPrState::Open,
+            merged_at: None,
+        };
+        cache
+            .cache
+            .lock()
+            .unwrap()
+            .insert("o/r2".into(), vec![pr.clone()]);
+        assert_eq!(poller.poll("o/r2").unwrap(), vec![pr]);
     }
 }

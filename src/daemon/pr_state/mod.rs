@@ -51,9 +51,10 @@ pub mod auto_arm;
 pub mod gh_poll;
 mod remote_gc;
 mod scanner;
-pub use scanner::scan_and_emit;
-#[cfg(test)]
-pub use scanner::scan_and_emit_with;
+// #986: the production per-tick handler drives the scanner with an explicit
+// (snapshot) poller via `scan_and_emit_with` — the old `scan_and_emit` wrapper
+// (hardcoded `CliGhPoller`, synchronous on the scanner thread) is gone.
+pub(crate) use scanner::scan_and_emit_with;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PrState {
@@ -1476,7 +1477,11 @@ mod tests {
         let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
 
         // First scan: emit.
-        scan_and_emit(&dir, &registry);
+        scan_and_emit_with(
+            &dir,
+            &registry,
+            &crate::daemon::pr_state::gh_poll::CliGhPoller,
+        );
         let inbox_msgs = crate::inbox::drain(&dir, "dev");
         assert_eq!(inbox_msgs.len(), 1, "expected one [pr-ready-for-merge]");
         assert_eq!(inbox_msgs[0].kind.as_deref(), Some("pr-ready-for-merge"));
@@ -1499,7 +1504,11 @@ mod tests {
         assert_eq!(inbox_msgs[0].reviewed_head.as_deref(), Some("sha-A"));
 
         // Second scan: must NOT re-emit (debounce per ready_emitted_for_sha).
-        scan_and_emit(&dir, &registry);
+        scan_and_emit_with(
+            &dir,
+            &registry,
+            &crate::daemon::pr_state::gh_poll::CliGhPoller,
+        );
         let inbox_msgs = crate::inbox::drain(&dir, "dev");
         assert!(
             inbox_msgs.is_empty(),
@@ -1643,7 +1652,11 @@ mod tests {
 
         // Scanner pass: NO event emitted because state is NotReady.
         let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
-        scan_and_emit(&dir, &registry);
+        scan_and_emit_with(
+            &dir,
+            &registry,
+            &crate::daemon::pr_state::gh_poll::CliGhPoller,
+        );
         assert!(
             crate::inbox::drain(&dir, "dev").is_empty(),
             "no [pr-ready-for-merge] until second verdict"
@@ -1663,7 +1676,11 @@ mod tests {
         save(&dir, &s).unwrap();
 
         // Scanner now fires [pr-ready-for-merge].
-        scan_and_emit(&dir, &registry);
+        scan_and_emit_with(
+            &dir,
+            &registry,
+            &crate::daemon::pr_state::gh_poll::CliGhPoller,
+        );
         let msgs = crate::inbox::drain(&dir, "dev");
         assert_eq!(msgs.len(), 1, "second verdict unlocks the merge gate");
         assert_eq!(msgs[0].kind.as_deref(), Some("pr-ready-for-merge"));
@@ -1770,6 +1787,30 @@ mod tests {
         assert_eq!(loaded.pr_author, "dev"); // tier 2 direct name match (no fleet entries)
         assert_eq!(loaded.gh_poll_failures, 0);
         assert!(loaded.last_gh_poll_at.is_some());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// #986 §3.9 real-entry: a COLD `SnapshotGhPoller` (the background worker has
+    /// not filled the cache yet) driven through the REAL scanner must NOT mark the
+    /// pr_state as a clean "polled, 0 PR" — it records a gh_poll_failure (→
+    /// ambiguous), so a worktree whose open PR is simply not-yet-in-cache is never
+    /// false-released. Asserts the scanner reads the snapshot (cold→Err), never a
+    /// live `gh` poll.
+    #[test]
+    fn cold_snapshot_poll_marks_failure_not_false_no_pr_986() {
+        let mut s = new_state("sha-cold", ReviewClass::Single);
+        s.pr_number = 0;
+        s.last_gh_poll_at = None; // never polled → due
+        let home = home_with_state("cold-986", s);
+        // COLD cache — the worker has never run, so the repo is absent.
+        let cache = crate::daemon::pr_state::gh_poll::GhPollCache::new();
+        let poller = crate::daemon::pr_state::gh_poll::SnapshotGhPoller::new(cache);
+        scan_and_emit_with(&home, &empty_registry(), &poller);
+        let loaded = load(&home, "owner/repo", "feat/test").unwrap();
+        assert!(
+            loaded.gh_poll_failures > 0,
+            "#986: cold-cache poll must mark a failure (ambiguous), not a clean 'no PR'"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 

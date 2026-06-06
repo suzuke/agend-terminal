@@ -329,6 +329,13 @@ fn run_loop(
     // watchdogs; the slow (5-min-scan) sibling watchdogs are out of scope here
     // because their first scan lands after the 180s grace window.
     let loop_started_at = Instant::now();
+    // #986: the app-mode supervisor loop is the LIVE scanner path (run_core's
+    // PrStateScanHandler is dead in app mode — see the scan_and_emit_with call
+    // below). Own the gh-poll snapshot cache here + spawn the single background
+    // worker ONCE, so the per-tick scan reads a cached snapshot instead of
+    // blocking on the `gh pr list` subprocess (the input-lag root cause).
+    let gh_cache = crate::daemon::pr_state::gh_poll::GhPollCache::new();
+    crate::daemon::pr_state::gh_poll::spawn_gh_poll_worker(gh_cache.clone());
     loop {
         thread::sleep(TICK);
         // #1125 M1: wrap the entire tick body in catch_unwind so a panic
@@ -377,7 +384,11 @@ fn run_loop(
             // operators (the agent fleet) saw `last_gh_poll_at: null`
             // indefinitely + no `[pr-ready-for-merge]` events.
             // Source-pin: `pr_state_scan_wired_into_supervisor_loop`.
-            crate::daemon::pr_state::scan_and_emit(&home, &registry);
+            crate::daemon::pr_state::scan_and_emit_with(
+                &home,
+                &registry,
+                &crate::daemon::pr_state::gh_poll::SnapshotGhPoller::new(gh_cache.clone()),
+            );
             // #836: reclaim expired (10-min TTL) entries from the
             // notification-dedup ledger so memory pressure stays bounded
             // on long-lived daemons.

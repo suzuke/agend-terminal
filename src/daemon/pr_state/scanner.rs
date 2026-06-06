@@ -12,10 +12,6 @@ enum ScanAction {
     Remove,
 }
 
-pub fn scan_and_emit(home: &Path, registry: &crate::agent::AgentRegistry) {
-    scan_and_emit_with(home, registry, &gh_poll::CliGhPoller);
-}
-
 /// Per-tick scanner: walks `<home>/pr-state/*.json`, emits any newly-
 /// eligible `[pr-ready-for-merge]` events (debounced via
 /// `ready_emitted_for_sha`), and sweeps terminal-state files.
