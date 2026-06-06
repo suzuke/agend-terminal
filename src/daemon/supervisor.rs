@@ -1541,12 +1541,39 @@ pub(crate) fn process_error_recovery(
                 // so a later ServerRateLimit episode starts fresh at Phase A. No
                 // suppress window needed: the inject is state-gated above, so a
                 // mid-work Thinking/ToolUse transient neither clears here nor injects.
-                if retry_tracks.remove(name).is_some() {
-                    tracing::info!(
-                        agent = %name,
-                        ?state,
-                        "ServerRateLimit retry cleared — agent recovered (Idle)"
-                    );
+                if let Some(cleared) = retry_tracks.remove(name) {
+                    // #1808-flaw1-probe (instrumentation-only, NO behavior change):
+                    // cheerc claims a backend that hits a fatal net error ABORTS to an
+                    // Idle prompt → this unconditional Idle-clear drops the in-flight
+                    // SRL retry track → `continue` never re-injects → the agent freezes
+                    // until waiting_on_stale. The clear itself is unchanged; we only
+                    // SPLIT the log to see empirically whether the suspicious shape ever
+                    // occurs: a track with retries already attempted (`retry_count > 0`)
+                    // reaching Idle with NO recent productive output (`!recovered`) is
+                    // the abort-to-Idle path. A genuine recovery reaches Idle either
+                    // before any retry (`retry_count == 0`) or with recent productive
+                    // output (`recovered`) → INFO. When the WARN fires, cross-check
+                    // whether dispatch_idle then nudges the agent (dev's claimed
+                    // backstop) vs. it sitting frozen.
+                    if cleared.retry_count > 0 && !recovered {
+                        tracing::warn!(
+                            agent = %name,
+                            tag = "#1808-flaw1-probe",
+                            retry_count = cleared.retry_count,
+                            productive_silent_secs = productive_silence.as_secs(),
+                            recovered = false,
+                            "abort-to-Idle cleared an in-flight ServerRateLimit retry with no recent productive output — cheerc's claimed freeze path"
+                        );
+                    } else {
+                        tracing::info!(
+                            agent = %name,
+                            ?state,
+                            retry_count = cleared.retry_count,
+                            recovered,
+                            productive_silent_secs = productive_silence.as_secs(),
+                            "ServerRateLimit retry cleared — agent recovered (Idle)"
+                        );
+                    }
                 }
             }
 
@@ -3100,6 +3127,63 @@ instances:
         assert!(
             !tracks.contains_key("test-agent"),
             "phase 1 must clear retry track on Idle recovery"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1808-flaw1-probe (behavior pin, §3.9 real entry): cheerc claims a backend
+    /// that hits a fatal net error ABORTS to an Idle prompt while a ServerRateLimit
+    /// retry is in flight, and the unconditional Idle-clear then leaves the agent
+    /// "frozen" (no `continue` ever injected). This pins the ACTUAL current
+    /// behavior the Probe-1 WARN instruments: the in-flight track (`retry_count >
+    /// 0`) IS cleared, and — critically — NO `continue` is injected, because the
+    /// inject is state-gated on ServerRateLimit and the agent is now Idle (so
+    /// clearing the track is NOT what suppresses the inject). The SRL retry path
+    /// deliberately does not resume an aborted-to-Idle agent; that recovery belongs
+    /// to dispatch_idle / waiting_on_stale. The probe measures whether this shape
+    /// ever actually occurs in prod.
+    #[test]
+    fn abort_to_idle_clears_in_flight_retry_and_does_not_inject_1808() {
+        let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = tmp_home("abort-to-idle-1808");
+        // In-flight retry (retry_count > 0) from a ServerRateLimit episode.
+        let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
+        tracks.insert(
+            "test-agent".to_string(),
+            RateLimitRetry {
+                retry_count: 2,
+                next_retry_at: Instant::now(),
+                exhausted: false,
+                inject_failures: 0,
+            },
+        );
+        let mut last_inject: HashMap<String, Instant> = HashMap::new();
+
+        // Aborted to an Idle prompt with NO recent productive output
+        // (`last_productive_output` defaults to None) — the cheerc freeze shape.
+        let (handle, _reader) = mock_agent_handle("test-agent", crate::state::AgentState::Idle);
+        registry.lock().insert(handle.id, handle);
+
+        for _ in 0..3 {
+            super::process_error_recovery(
+                &home,
+                &registry,
+                &mut tracks,
+                &mut Default::default(),
+                &mut Default::default(),
+                &mut last_inject,
+                past_boot_grace(),
+            );
+        }
+
+        assert!(
+            !tracks.contains_key("test-agent"),
+            "abort-to-Idle clears the in-flight ServerRateLimit retry track (current behavior)"
+        );
+        assert!(
+            !last_inject.contains_key("test-agent"),
+            "no `continue` is injected into an aborted-to-Idle agent — inject is \
+             state-gated on ServerRateLimit; SRL retry does not resume an Idle agent"
         );
         std::fs::remove_dir_all(&home).ok();
     }

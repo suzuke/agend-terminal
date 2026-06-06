@@ -271,6 +271,24 @@ pub struct StateTracker {
     /// its cap before the supervisor drained it. Surfaced in a warn at drain
     /// so a wedged drainer is visible rather than silently lossy.
     dropped_transition_count: u64,
+    /// #1808-probe0-phantom (instrumentation-only): signature of the LAST
+    /// ServerRateLimit detection's error line — `(error_line_hash,
+    /// dist_from_bottom)`. Persists ACROSS non-SRL/Idle states (deliberately NOT
+    /// cleared) so a same-error re-match after the agent recovered to Idle (the
+    /// cross-Idle phantom loop in cheerc's #1808 Evidence 2) is still detected.
+    /// Read/written only for the phantom probe log; never affects transitions.
+    last_srl_match_sig: Option<(u64, usize)>,
+    /// #1808-probe0-phantom (instrumentation-only): how many CONSECUTIVE feed
+    /// ticks the same SRL error re-matched with NO intervening non-SRL state
+    /// (the in-place clock-tick re-scan). Resets on a different signature or a
+    /// cross-cycle refire. Distinct from `cross_cycle` (see the probe site).
+    srl_consecutive_rematch: u32,
+    /// #1808-probe0-phantom (instrumentation-only): set true whenever a feed
+    /// lands a NON-ServerRateLimit state (esp. Idle); cleared on an SRL
+    /// detection. Lets the probe distinguish a cross-Idle refire (same error
+    /// re-grabbed AFTER the agent recovered) from a same-state continuous
+    /// re-scan. Telemetry-only.
+    non_srl_since_last_srl: bool,
 }
 
 /// #1527: one recorded `current` transition, captured at the mutation site so
@@ -395,6 +413,24 @@ fn hash_screen(text: &str) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     text.hash(&mut hasher);
     hasher.finish()
+}
+
+/// #1808-probe0-phantom (instrumentation-only): a stable signature of the
+/// bottom-most occurrence of an SRL error line — `(line_hash, dist_from_bottom)`.
+/// `dist_from_bottom` is the byte distance from the error line's start to the end
+/// of `screen_text`; an error that has not physically moved keeps the same
+/// distance across the cursor-blink / clock-tick re-renders that flip the screen
+/// hash (the phantom trigger). Used only to compare consecutive SRL detections in
+/// the phantom probe — never affects classification.
+fn srl_match_signature(screen_text: &str, matched: &str) -> (u64, usize) {
+    let pos = screen_text.rfind(matched).unwrap_or(0);
+    let line_start = screen_text[..pos].rfind('\n').map_or(0, |i| i + 1);
+    let line_end = screen_text[pos..]
+        .find('\n')
+        .map_or(screen_text.len(), |i| pos + i);
+    let line_hash = hash_screen(&screen_text[line_start..line_end]);
+    let dist_from_bottom = screen_text.len().saturating_sub(line_start);
+    (line_hash, dist_from_bottom)
 }
 
 /// #1450: char-span (start, end) in `screen_text` for the byte occurrence of
@@ -718,6 +754,10 @@ impl StateTracker {
             // #1527: transition audit buffer starts empty.
             pending_transitions: Vec::new(),
             dropped_transition_count: 0,
+            // #1808-probe0-phantom: no SRL seen yet.
+            last_srl_match_sig: None,
+            srl_consecutive_rematch: 0,
+            non_srl_since_last_srl: false,
         }
     }
 
@@ -964,12 +1004,111 @@ impl StateTracker {
                             } else {
                                 detected
                             };
-                            patterns
-                                .working_state_below(screen_text, matched)
-                                .unwrap_or(fallback)
+                            let working_below = patterns.working_state_below(screen_text, matched);
+                            // #1808-flaw2-probe (instrumentation-only, NO behavior
+                            // change): cheerc claims a static bottom status bar (Agy/
+                            // Kiro Thinking = the bare `esc to cancel` token) can sit
+                            // BELOW the error → `working_state_below` overrides a
+                            // ServerRateLimit → masks a stuck throttle. Record it
+                            // empirically: when such an override actually fires on
+                            // Agy/Kiro, log the winning marker + productive silence. NO
+                            // recent productive output ⇒ the override may be masking a
+                            // genuinely-stuck agent (the suspicious case cheerc
+                            // describes) ⇒ WARN; recent output ⇒ INFO (genuine
+                            // recovery). Scoped to Agy/Kiro + SRL-override only (low
+                            // noise); does NOT alter `landed`.
+                            if let Some((_, marker)) = working_below {
+                                if matches!(detected, AgentState::ServerRateLimit)
+                                    && (self.backend_name == Backend::Agy.name()
+                                        || self.backend_name == Backend::KiroCli.name())
+                                {
+                                    let productive_silent_secs =
+                                        self.productive_silence().as_secs();
+                                    if self.recovered_within(SERVER_RATE_LIMIT_RECOVERY_SILENCE) {
+                                        tracing::info!(
+                                            target: "state_detection",
+                                            agent = %self.instance_name,
+                                            tag = "#1808-flaw2-probe",
+                                            backend = %self.backend_name,
+                                            working_marker = %marker,
+                                            productive_silent_secs,
+                                            "working_state_below overrode ServerRateLimit (Agy/Kiro) with recent productive output — likely genuine recovery"
+                                        );
+                                    } else {
+                                        tracing::warn!(
+                                            target: "state_detection",
+                                            agent = %self.instance_name,
+                                            tag = "#1808-flaw2-probe",
+                                            backend = %self.backend_name,
+                                            working_marker = %marker,
+                                            productive_silent_secs,
+                                            "working_state_below overrode ServerRateLimit (Agy/Kiro) with NO recent productive output — possible static-chrome mask of a stuck throttle (cheerc Flaw 2)"
+                                        );
+                                    }
+                                }
+                            }
+                            working_below.map(|(s, _)| s).unwrap_or(fallback)
                         } else {
                             detected
                         };
+                        // #1808-probe0-phantom (instrumentation-only, NO behavior
+                        // change): cheerc Evidence 2 claims a stale SRL error stuck in
+                        // the bottom-N tail keeps re-matching after the agent recovered
+                        // (the screen hash flips when the CLI clock ticks → feed
+                        // re-scans → re-grabs the SAME old error → re-latch → blind
+                        // inject). Record it empirically: signature the matched error
+                        // line `(line_hash, dist_from_bottom)` and compare to the
+                        // previous SRL detection —
+                        //   • same sig, NO intervening non-SRL state  → in-place
+                        //     clock-tick re-scan → `srl_consecutive_rematch++`;
+                        //   • same sig, intervening Idle/non-SRL state → `cross_cycle`
+                        //     refire (the agent recovered, then the OLD error was
+                        //     re-grabbed) = cheerc's exact cross-Idle loop.
+                        // `last_srl_match_sig` PERSISTS across Idle so the cross-cycle
+                        // case survives. WARN only when the SRL actually wins
+                        // (`landed == ServerRateLimit` → would latch → inject) AND there
+                        // is no recent productive output (`!recovered`) AND it is a
+                        // re-match. Not backend-scoped (the phantom is the Claude
+                        // `Server is temporarily limiting` re-match — cheerc's `general`
+                        // agent). Telemetry-only; never touches `landed`/transition.
+                        if matches!(detected, AgentState::ServerRateLimit) {
+                            let sig = srl_match_signature(screen_text, matched);
+                            let same_sig = self.last_srl_match_sig == Some(sig);
+                            let cross_cycle = same_sig && self.non_srl_since_last_srl;
+                            self.srl_consecutive_rematch =
+                                if same_sig && !self.non_srl_since_last_srl {
+                                    self.srl_consecutive_rematch.saturating_add(1)
+                                } else {
+                                    0
+                                };
+                            self.last_srl_match_sig = Some(sig);
+                            self.non_srl_since_last_srl = false;
+
+                            let would_latch = matches!(landed, AgentState::ServerRateLimit);
+                            let recovered_now =
+                                self.recovered_within(SERVER_RATE_LIMIT_RECOVERY_SILENCE);
+                            if would_latch
+                                && !recovered_now
+                                && (self.srl_consecutive_rematch > 0 || cross_cycle)
+                            {
+                                let kind = if cross_cycle {
+                                    "cross_cycle_refire"
+                                } else {
+                                    "consecutive_rematch"
+                                };
+                                tracing::warn!(
+                                    target: "state_detection",
+                                    agent = %self.instance_name,
+                                    tag = "#1808-probe0-phantom",
+                                    kind,
+                                    consecutive_rematch = self.srl_consecutive_rematch,
+                                    cross_cycle_refire = cross_cycle,
+                                    dist_from_bottom = sig.1,
+                                    productive_silent_secs = self.productive_silence().as_secs(),
+                                    "phantom re-match: same stale ServerRateLimit error re-detected (would latch → inject) with no recent productive output"
+                                );
+                            }
+                        }
                         let gated = self.gate_on_heartbeat(landed);
                         self.transition(gated);
                     }
@@ -990,6 +1129,16 @@ impl StateTracker {
                         self.maybe_expire_latched_state();
                     }
                 }
+            }
+
+            // #1808-probe0-phantom (instrumentation-only): record that the tracker
+            // passed through a NON-ServerRateLimit landed state since the last SRL
+            // detection, so a later same-error re-match is flagged as a cross-Idle
+            // phantom refire (not a same-state continuous re-scan). The SRL branch
+            // above clears this on detection; here we (re)set it whenever the landed
+            // state is anything else. Telemetry-only — does not affect classification.
+            if !matches!(self.current, AgentState::ServerRateLimit) {
+                self.non_srl_since_last_srl = true;
             }
         }
 

@@ -3681,6 +3681,37 @@ fn pending_transitions_bounded_drops_oldest() {
     );
 }
 
+// ── #1808-probe0-phantom: SRL re-match signature freshness primitive ──
+
+/// `srl_match_signature` must be STABLE for the same error line at the same
+/// distance-from-bottom (the clock-tick re-render that flips the screen hash but
+/// does NOT move the error), and CHANGE when the error scrolls up because fresh
+/// output rendered below it. This is the freshness primitive the phantom probe
+/// compares across ticks to tell an in-place re-scan from real progress.
+#[test]
+fn srl_match_signature_stable_until_error_moves_1808() {
+    use super::srl_match_signature;
+    let err = "Server is temporarily limiting requests";
+    // Same error at the bottom; only a benign top line differs (screen hash flips,
+    // error unmoved) → identical signature. The two top lines are equal length so
+    // the error's line_start (and thus dist_from_bottom) is unchanged.
+    let a = format!("clock 12:00:01\n{err}\n");
+    let b = format!("clock 12:00:02\n{err}\n");
+    assert_eq!(
+        srl_match_signature(&a, err),
+        srl_match_signature(&b, err),
+        "same error line at the same distance-from-bottom must sign identically \
+         (the in-place clock-tick re-render that triggers the phantom re-scan)"
+    );
+    // Error pushed UP by fresh output below it → different dist_from_bottom.
+    let c = format!("clock 12:00:03\n{err}\nthe agent resumed work\n");
+    assert_ne!(
+        srl_match_signature(&a, err).1,
+        srl_match_signature(&c, err).1,
+        "an error pushed up by new output below must change dist_from_bottom"
+    );
+}
+
 // ── #1518: HIGH_FP error detection bounded to the live bottom-N tail ──
 
 #[test]
