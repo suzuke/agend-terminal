@@ -74,7 +74,6 @@ impl AgendHarness {
         let mut cmd = Command::new(&binary);
         cmd.args(args)
             .env("AGEND_HOME", &home)
-            .env("AGEND_TEST_ISOLATION", "1")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 

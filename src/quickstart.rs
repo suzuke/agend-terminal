@@ -48,8 +48,8 @@ pub fn run(home: &Path) -> anyhow::Result<()> {
         .and_then(|content| {
             content
                 .lines()
-                .find(|l| l.starts_with("AGEND_BOT_TOKEN="))
-                .map(|l| l.trim_start_matches("AGEND_BOT_TOKEN=").trim().to_string())
+                .find_map(extract_env_token)
+                .map(str::to_string)
         })
         .filter(|t| !t.is_empty());
 
@@ -541,21 +541,41 @@ instances:
     Ok(())
 }
 
-/// Save AGEND_BOT_TOKEN to .env, preserving other variables.
+/// Canonical `.env` key quickstart writes for the Telegram bot token.
+const TELEGRAM_TOKEN_KEY: &str = "AGEND_TELEGRAM_BOT_TOKEN";
+
+/// Extract the token value from a `.env` line written as either the canonical
+/// `AGEND_TELEGRAM_BOT_TOKEN=` or the legacy `AGEND_BOT_TOKEN=` key. Legacy is
+/// still detected so operators who ran an older quickstart keep being
+/// recognized (and get migrated to the canonical key on the next write). The
+/// runtime read keeps its own separate legacy fallback — see
+/// `channel::telegram::creds`.
+fn extract_env_token(line: &str) -> Option<&str> {
+    line.strip_prefix("AGEND_TELEGRAM_BOT_TOKEN=")
+        .or_else(|| line.strip_prefix("AGEND_BOT_TOKEN="))
+        .map(str::trim)
+}
+
+/// True if a `.env` line carries the bot token under either the canonical or
+/// the legacy key (used to strip both before rewriting the canonical one).
+fn is_telegram_token_line(line: &str) -> bool {
+    line.starts_with("AGEND_TELEGRAM_BOT_TOKEN=") || line.starts_with("AGEND_BOT_TOKEN=")
+}
+
+/// Save the Telegram bot token to .env under the canonical
+/// `AGEND_TELEGRAM_BOT_TOKEN` key, preserving other variables (and migrating
+/// any legacy `AGEND_BOT_TOKEN` line out).
 fn save_env_token(home: &Path, token: &str) -> anyhow::Result<()> {
     let env_path = home.join(".env");
     let existing = std::fs::read_to_string(&env_path).unwrap_or_default();
-    let existing_token = existing
-        .lines()
-        .find(|l| l.starts_with("AGEND_BOT_TOKEN="))
-        .map(|l| l.trim_start_matches("AGEND_BOT_TOKEN=").trim());
+    let existing_token = existing.lines().find_map(extract_env_token);
 
     if let Some(old) = existing_token {
         if old == token {
             println!("  ✓ Token unchanged in .env\n");
             return Ok(());
         }
-        println!("  .env already has AGEND_BOT_TOKEN={}", mask_token(old));
+        println!("  .env already has a bot token: {}", mask_token(old));
         // Sprint 56 Track H4 (#525 item 14): destructive prompts default
         // to `N` (preserve operator data); non-destructive prompts
         // default to `Y` (the convenient path). Updating an existing
@@ -586,10 +606,10 @@ fn save_env_token(home: &Path, token: &str) -> anyhow::Result<()> {
 
     let mut lines: Vec<String> = existing
         .lines()
-        .filter(|l| !l.starts_with("AGEND_BOT_TOKEN="))
+        .filter(|l| !is_telegram_token_line(l))
         .map(|l| l.to_string())
         .collect();
-    lines.push(format!("AGEND_BOT_TOKEN={token}"));
+    lines.push(format!("{TELEGRAM_TOKEN_KEY}={token}"));
     std::fs::write(&env_path, lines.join("\n") + "\n")?;
     // Sprint 56 Track H1 (#525 item 4): chmod 0600 on Unix so the bot
     // token isn't world-readable (default umask 0022 produces 0644).
@@ -814,7 +834,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let home = tmp_home("chmod_unix");
         let path = home.join(".env");
-        std::fs::write(&path, "AGEND_BOT_TOKEN=secret\n").unwrap();
+        std::fs::write(&path, "AGEND_TELEGRAM_BOT_TOKEN=secret\n").unwrap();
         // Force a default-umask shape (0644) so we can verify the
         // helper actually tightens the bits — on most macOS / Linux
         // dev boxes umask is already 022 so post-write is 0644.

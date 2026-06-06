@@ -62,7 +62,6 @@ impl TestDaemon {
 
         let child = Command::new(binary())
             .args(&args)
-            .env("AGEND_TEST_ISOLATION", "1")
             .env("AGEND_HOME", &home)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())

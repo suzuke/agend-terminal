@@ -207,7 +207,7 @@ The following environment variable names are **blocked** from fleet.yaml `env` t
 | Cloud credentials | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` |
 | Git forge tokens | `GITHUB_TOKEN`, `GITLAB_TOKEN`, `NPM_TOKEN` |
 | Dynamic linker injection | `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, `DYLD_INSERT_LIBRARIES`, `DYLD_LIBRARY_PATH`, `DYLD_FALLBACK_LIBRARY_PATH` |
-| AgEnD runtime internals | `AGEND_HOME`, `AGEND_INSTANCE_NAME`, `AGEND_ALLOWED_WORK_ROOTS`, `AGEND_MCP_TOOLS_ALLOW`, `AGEND_MCP_TOOLS_DENY` |
+| AgEnD runtime internals | `AGEND_HOME`, `AGEND_INSTANCE_NAME` |
 
 These credentials should be set in the host shell environment or `.env` file instead — the daemon process inherits them and passes them through to agent subprocesses automatically.
 

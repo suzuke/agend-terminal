@@ -38,8 +38,7 @@ fn unbind_idempotent() {
 fn shim_binary_compiles() {
     // #1784: prove the agend-git bin builds + runs via the PREBUILT artifact.
     // cargo builds it before this integration test and exposes its path as
-    // CARGO_BIN_EXE_agend-git; running `--version` process-isolated (via
-    // AGEND_TEST_ISOLATION, like shim_recursion_guard_1504) proves it compiled and
+    // CARGO_BIN_EXE_agend-git; running `--version` proves it compiled and
     // is runnable.
     //
     // Previously this spawned a NESTED `cargo build --bin agend-git`, which
@@ -50,7 +49,6 @@ fn shim_binary_compiles() {
     // nested-cargo target-lock contention; the build was also redundant (the
     // workspace build + test harness already compile every bin).
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_agend-git"))
-        .env("AGEND_TEST_ISOLATION", "1")
         .arg("--version")
         .output()
         .expect("run agend-git --version");

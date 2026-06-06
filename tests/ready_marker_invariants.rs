@@ -98,7 +98,6 @@ fn agent_count_via_list(bin: &Path, home: &Path) -> Option<usize> {
         .arg("list")
         .arg("--json")
         .env("AGEND_HOME", home)
-        .env("AGEND_TEST_ISOLATION", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -127,7 +126,6 @@ fn spawn_daemon_with_agents(
     }
     cmd.env("AGEND_HOME", home)
         .env("AGEND_SPAWN_STAGGER_MS", stagger_ms)
-        .env("AGEND_TEST_ISOLATION", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

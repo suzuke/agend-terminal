@@ -271,7 +271,6 @@ fn setup_recorder(tag: &str) -> (Arc<Recorder>, std::path::PathBuf) {
     // racers (instructions.rs, telegram.rs) no longer set AGEND_HOME.
     std::env::set_var("AGEND_HOME", &home);
     // Sprint 31 P0: prevent daemon API pollution during tests
-    std::env::set_var("AGEND_TEST_ISOLATION", "1");
     // Minimal fleet so send_to's `get_submit_key` lookup resolves
     // (fallback path on unreachable daemon still needs submit_key).
     let yaml = "defaults:\n  backend: claude\ninstances:\n  target:\n    role: Test\n  sender:\n    role: Test\n";
@@ -2038,14 +2037,11 @@ fn create_instance_relative_path_rejection() {
 fn create_instance_explicit_working_directory_used() {
     let _g = fleet_test_guard();
     let (_rec, _home) = setup_recorder("explicit-wd");
-    // Use AGEND_TEST_ISOLATION to prevent real instance creation
-    std::env::set_var("AGEND_TEST_ISOLATION", "1");
     let r = super::handle_tool(
         "create_instance",
         &json!({"name": "test-explicit", "backend": "claude", "working_directory": "/tmp/my-workspace"}),
         "operator",
     );
-    std::env::remove_var("AGEND_TEST_ISOLATION");
     // Explicit valid path must pass validation (.. and absolute checks)
     if let Some(err) = r.get("error").and_then(|e| e.as_str()) {
         assert!(
@@ -2622,7 +2618,6 @@ fn delegate_task_instance_first_bypasses_team_orchestrator_collision() {
     let _g = fleet_test_guard();
     let home = tmp_home("m5_instance_first");
     std::env::set_var("AGEND_HOME", &home);
-    std::env::set_var("AGEND_TEST_ISOLATION", "1");
     // Fleet: instance "dev" exists, sender is "lead".
     // Sprint 54 fleet-yaml unification: instances + teams both in fleet.yaml.
     let yaml = "defaults:\n  backend: claude\ninstances:\n  dev:\n    role: Test\n  \
@@ -2661,7 +2656,6 @@ fn m5_regression_via_id_routing() {
     let _g = fleet_test_guard();
     let home = tmp_home("m5_id_routing");
     std::env::set_var("AGEND_HOME", &home);
-    std::env::set_var("AGEND_TEST_ISOLATION", "1");
     let id = crate::types::InstanceId::new();
     // Sprint 54 fleet-yaml unification: instances + teams both in fleet.yaml.
     let yaml = format!(

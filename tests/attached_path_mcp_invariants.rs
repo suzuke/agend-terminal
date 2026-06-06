@@ -115,7 +115,6 @@ fn api_port_published_before_agent_spawn_loop_completes() {
         // Disable any background work that could compete for startup time
         // and inflate the legacy budget (false positives), and silence
         // logs going to a real $HOME log dir.
-        .env("AGEND_TEST_ISOLATION", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -172,7 +171,6 @@ fn bridge_tools_list_no_silent_empty_when_daemon_unreachable() {
     let mut child = Command::new(&bridge)
         .env("AGEND_HOME", &tmp)
         .env("AGEND_INSTANCE_NAME", "test-silent-degrade")
-        .env("AGEND_TEST_ISOLATION", "1")
         // C2 introduces this knob; on main (no C2) the bridge ignores it
         // and returns `{tools: []}` immediately. The contract this test
         // pins is the visible-error response, not the timeout duration.

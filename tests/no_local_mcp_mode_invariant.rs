@@ -266,9 +266,6 @@ fn bridge_emits_daemon_error_when_daemon_down() {
     let mut child = Command::new(&bridge)
         .env("AGEND_HOME", &home)
         .env("AGEND_INSTANCE_NAME", "no-daemon-runtime-test")
-        // Disable any test-isolation env that might short-circuit the
-        // daemon-down code path inside the bridge.
-        .env_remove("AGEND_TEST_ISOLATION")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
