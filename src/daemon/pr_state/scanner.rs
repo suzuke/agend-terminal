@@ -256,6 +256,22 @@ pub fn scan_and_emit_with(
 /// would over-suppress); success clears the counter. Idempotent:
 /// re-applying the same metadata is a no-op for the reducer if state
 /// already matches.
+/// #986 Bug A: is a poll taken at `polled_at` fresh enough to confirm "no PR" for
+/// a branch first tracked at `created_at`? True iff the poll happened at/after the
+/// branch became tracked (so the poll would have observed the PR if it existed).
+/// A retained snapshot polled BEFORE the branch existed must not assert "no PR".
+/// Parse failure → conservative `false` (treat as stale → ambiguous, never a false
+/// no-PR).
+fn poll_is_fresh_for(polled_at: &str, created_at: &str) -> bool {
+    match (
+        chrono::DateTime::parse_from_rfc3339(polled_at),
+        chrono::DateTime::parse_from_rfc3339(created_at),
+    ) {
+        (Ok(p), Ok(c)) => p >= c,
+        _ => false,
+    }
+}
+
 fn apply_gh_poll(home: &Path, dir: &Path, poller: &dyn gh_poll::GhPoller) {
     use std::collections::{HashMap, HashSet};
 
@@ -347,19 +363,42 @@ fn apply_gh_poll(home: &Path, dir: &Path, poller: &dyn gh_poll::GhPoller) {
     }
     for (repo, due_states) in by_repo {
         match poller.poll(&repo) {
-            Ok(prs) => {
+            Ok((prs, polled_at)) => {
                 for state in due_states {
                     let branch = state.branch.clone();
+                    // #986 Bug A (stale-snapshot freshness gate): the SnapshotGhPoller
+                    // may return a RETAINED snapshot that predates this branch's PR.
+                    // A "no PR found" only counts as a positive "no PR" (clears
+                    // failures + stamps last_gh_poll_at → eligible for QueriedNone /
+                    // release) if the poll POST-DATES the branch's first-tracked time
+                    // (`created_at`) — otherwise a stale-reuse would manufacture a
+                    // false "queried, none found" and false-release a worktree whose
+                    // PR simply isn't in the cache yet. Finding the PR is always
+                    // trustworthy (a real observation, regardless of poll age).
+                    let found = prs.iter().any(|m| m.head_ref == branch);
+                    let trustworthy = found || poll_is_fresh_for(&polled_at, &state.created_at);
                     if let Err(e) = with_pr_state(home, &repo, &branch, |s| {
                         apply_gh_observations(home, s, &prs, &now);
-                        s.gh_poll_failures = 0;
-                        s.last_gh_poll_at = Some(now.clone());
+                        if trustworthy {
+                            s.gh_poll_failures = 0;
+                            s.last_gh_poll_at = Some(now.clone());
+                        }
+                        // else: leave the state untouched → it stays due and
+                        // ambiguous (Unknown) until a fresh poll (polled_at >=
+                        // created_at) arrives; never a false positive-no-PR.
                     }) {
                         tracing::warn!(
                             repo = %repo,
                             branch = %branch,
                             error = %e,
                             "#986 pr_state: post-gh-poll save failed"
+                        );
+                    }
+                    if !trustworthy {
+                        tracing::debug!(
+                            repo = %repo, branch = %branch,
+                            polled_at = %polled_at, created_at = %state.created_at,
+                            "#986 gh-poll: snapshot predates branch tracking — not a confirmed no-PR"
                         );
                     }
                 }

@@ -1814,6 +1814,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// #986 Bug A §3.9 real-entry: a WARM repo whose cached snapshot predates the
+    /// branch's `created_at` (the branch's PR exists but isn't in the stale
+    /// snapshot yet) must NOT confirm "no PR" for that branch — it must NOT stamp
+    /// `last_gh_poll_at` (which would make `evaluate_pr_for_release` → QueriedNone →
+    /// false-release). Drives the REAL scanner with a stale snapshot.
+    #[test]
+    fn stale_snapshot_does_not_confirm_no_pr_986() {
+        let mut s = new_state("sha-stale", ReviewClass::Single);
+        s.pr_number = 0;
+        s.last_gh_poll_at = None; // created_at is "now" (new_state)
+        let home = home_with_state("stale-986", s);
+        // Warm cache, but the snapshot was polled FAR in the past (before created_at)
+        // and is empty (the branch's PR isn't captured) — the stale-reuse case.
+        let cache = crate::daemon::pr_state::gh_poll::GhPollCache::new();
+        cache.seed_for_test("owner/repo", vec![], "2000-01-01T00:00:00+00:00");
+        let poller = crate::daemon::pr_state::gh_poll::SnapshotGhPoller::new(cache);
+        scan_and_emit_with(&home, &empty_registry(), &poller);
+        let loaded = load(&home, "owner/repo", "feat/test").unwrap();
+        assert!(
+            loaded.last_gh_poll_at.is_none(),
+            "#986: a stale snapshot (polled before the branch was tracked) must NOT \
+             confirm no-PR — last_gh_poll_at must stay unset (ambiguous)"
+        );
+        assert_eq!(loaded.pr_number, 0, "no PR observed (stale snapshot empty)");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     /// PR-3 (t-ci-ready-pr3-arm-not-armed) — INTEGRATION (codex re-verify): a
     /// BOUND branch with NO ci-watch AND NO pr-state file must STILL be
     /// discovered and auto-armed. This exercises the binding-seeded discovery
