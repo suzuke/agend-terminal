@@ -31,6 +31,12 @@ Placeholders (substituted at install time by service::install):
     <dict>
         <key>AGEND_HOME</key>
         <string>__HOME__</string>
+        <!-- #1812: explicit supervisor sentinel. is_restart_supervised()
+             reads this to confirm the daemon was launched by an
+             agend-installed launchd KeepAlive service (replaces the
+             ambient XPC_SERVICE_NAME false-positive). -->
+        <key>AGEND_SUPERVISED</key>
+        <string>1</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>

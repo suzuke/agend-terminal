@@ -171,6 +171,13 @@ serial_test = "3"
 # Used only for asserting that codex_trust_directory writes syntactically
 # valid TOML — the prod code appends raw text, it doesn't depend on this crate.
 toml = "1.1"
+# #1812 §3.9 real-entry tests: parse the rendered launchd plist
+# (`plist`) and systemd unit (`ini`/rust-ini) with REAL format parsers to
+# extract the AGEND_SUPERVISED sentinel out of its structural env block —
+# the templates are plain text the prod code substitutes into, so these
+# crates are test-only (mirrors the `toml` dev-dep convention above).
+plist = "1.7"
+rust-ini = "0.21"
 # Sprint 54 P1-A — `tests/cargo_include_invariant.rs` matches resolved
 # `include_str!` paths against `[package].include` glob patterns
 # (e.g. `src/**/*.rs`, `assets/hooks/*`). Test-only.

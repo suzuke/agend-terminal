@@ -23,6 +23,11 @@ After=network.target
 Type=simple
 ExecStart=__EXECUTABLE__ start --foreground
 Environment=AGEND_HOME=__HOME__
+# #1812: explicit supervisor sentinel. is_restart_supervised() reads
+# AGEND_SUPERVISED to confirm the daemon was launched by an agend-installed
+# systemd Restart=on-failure unit. (INVOCATION_ID, set by systemd at
+# runtime, remains a belt-and-suspenders signal.)
+Environment=AGEND_SUPERVISED=1
 # Sprint 57 Wave 3 PR-2 (#548 Q3): the daemon does NOT supervise itself.
 # systemd is the supervisor of last resort. Restart=on-failure ensures
 # operator-visible crashes get respawned by systemd, but Q6 graceful

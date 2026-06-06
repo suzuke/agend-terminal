@@ -10,9 +10,27 @@ pub(super) fn handle_restart_daemon(home: &Path) -> Value {
     // `Resource temporarily unavailable (os error 35)` on every
     // subsequent MCP call until they manually restart.
     if !crate::daemon::restart::is_restart_supervised() {
+        // #1812 fail-closed remediation. Two operator situations collapse to
+        // the same missing-sentinel state; spell out BOTH rather than try to
+        // reliably tell them apart (a stale-install probe would have to parse
+        // the on-disk plist/unit for the sentinel — too heavy for the value):
+        //   (a) never installed → run `service install` (or use the wrapper).
+        //   (b) installed on an earlier build → the AGEND_SUPERVISED sentinel
+        //       is new, so an existing macOS/Linux service config predates it;
+        //       re-run `service install` + restart once so the daemon relaunches
+        //       carrying it. (This is the macOS upgrade migration from the design.)
         return json!({
             "ok": false,
-            "error": "restart_daemon requires a supervisor (launchd / systemd / scripts/agend-wrapper.sh / Task Scheduler). Detected: bare daemon invocation. Run `agend-terminal service install` to enable safe restart, or launch via `scripts/agend-wrapper.sh` for manual operation."
+            "error": "restart_daemon requires a supervisor that will respawn the daemon \
+                      (launchd / systemd / scripts/agend-wrapper.sh). No supervisor sentinel \
+                      (AGEND_SUPERVISED / AGEND_WRAPPED / INVOCATION_ID) was found in the \
+                      daemon's environment. Remediation — if you have NOT installed the service: \
+                      run `agend-terminal service install` (or launch via scripts/agend-wrapper.sh). \
+                      If you installed it on an EARLIER build: the AGEND_SUPERVISED sentinel was \
+                      added recently and your existing service config predates it, so re-run \
+                      `agend-terminal service install` and restart the daemon once so it relaunches \
+                      under the updated config. (Windows Task Scheduler cannot carry the sentinel \
+                      yet and stays fail-closed.)"
         });
     }
     crate::daemon::RESTART_PENDING.store(true, std::sync::atomic::Ordering::Release);
@@ -82,7 +100,12 @@ mod tests {
     fn handle_restart_daemon_fails_closed_when_unsupervised() {
         with_env_and_reset(
             &[],
-            &["AGEND_WRAPPED", "XPC_SERVICE_NAME", "INVOCATION_ID"],
+            &[
+                "AGEND_WRAPPED",
+                "AGEND_SUPERVISED",
+                "INVOCATION_ID",
+                "XPC_SERVICE_NAME",
+            ],
             || {
                 // Manual tempdir — matches the std::env::temp_dir pattern
                 // used elsewhere in this crate (e.g. claim_verifier.rs
@@ -118,6 +141,49 @@ mod tests {
                 assert!(
                     !tmp.join("restart-requested").exists(),
                     "restart-requested marker file must NOT exist when fail-closed"
+                );
+                let _ = std::fs::remove_dir_all(&tmp);
+            },
+        );
+    }
+
+    /// #1812 regression — bare GUI launch on macOS. `XPC_SERVICE_NAME` is
+    /// ambient in a macOS GUI login session (set on EVERY process,
+    /// including a bare `agend-terminal start` from Terminal.app), so the
+    /// pre-#1812 detector treated an UNsupervised daemon as supervised and
+    /// `restart_daemon` would exit(42) with nobody to respawn it (#851
+    /// defeat). With XPC dropped, the REAL handler must fail-closed: only
+    /// `XPC_SERVICE_NAME` set, all our markers unset → `ok: false` and no
+    /// `RESTART_PENDING`. Drives the production `handle_restart_daemon`, not
+    /// the bare detector.
+    #[test]
+    fn handle_restart_daemon_fails_closed_on_bare_gui_xpc_only() {
+        with_env_and_reset(
+            &[("XPC_SERVICE_NAME", "0")],
+            &["AGEND_WRAPPED", "AGEND_SUPERVISED", "INVOCATION_ID"],
+            || {
+                let tmp = std::env::temp_dir().join(format!(
+                    "agend-restart-gui-test-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0),
+                ));
+                std::fs::create_dir_all(&tmp).expect("create tempdir");
+                let response = handle_restart_daemon(&tmp);
+                assert_eq!(
+                    response["ok"], false,
+                    "ambient XPC_SERVICE_NAME alone must NOT be accepted as a \
+                     supervisor (the #851/#1812 macOS-GUI false-positive) — got {response}"
+                );
+                assert!(
+                    !crate::daemon::RESTART_PENDING.load(Ordering::Acquire),
+                    "RESTART_PENDING must stay unset on the bare-GUI fail-closed path"
+                );
+                assert!(
+                    !tmp.join("restart-requested").exists(),
+                    "restart-requested marker must NOT be written on fail-closed"
                 );
                 let _ = std::fs::remove_dir_all(&tmp);
             },

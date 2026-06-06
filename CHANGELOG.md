@@ -5,6 +5,10 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 ## [Unreleased]
 
+### Changed
+
+- **Restart-supervisor detection: positive `AGEND_SUPERVISED` sentinel, `XPC_SERVICE_NAME` dropped (#1812)** — `is_restart_supervised()` (the #851 fail-closed guard for `restart_daemon`) no longer trusts `XPC_SERVICE_NAME`. macOS exports that variable into *every* process in a GUI login session (including a bare `agend-terminal start` from Terminal.app), so on macOS the guard returned true unconditionally and `restart_daemon` could `exit(42)` with nothing to respawn the daemon. The check now keys on an explicit `AGEND_SUPERVISED=1` sentinel that `agend-terminal service install` writes into the launchd plist (`EnvironmentVariables`) and systemd unit (`Environment=`). `AGEND_WRAPPED` and systemd's `INVOCATION_ID` remain accepted. **macOS/Linux migration: re-run `agend-terminal service install` after upgrading, then restart the daemon once** — an existing service config installed on an earlier build predates the sentinel, so until it is regenerated `restart_daemon` fails-closed with an actionable error (the safe direction — it refuses rather than bricking). Windows Task Scheduler cannot carry the sentinel (its task XML has no env element) and stays fail-closed on bare-start as before.
+
 ## [0.7.0] — 2026-05-28
 
 200+ commits since `0.6.1` over Sprint 55–69 (May 7 → May 28, 2026). Three themes dominate:
