@@ -295,7 +295,7 @@ pub(super) fn dispatch(action: Action, ctx: &mut DispatchCtx<'_>) -> DispatchRes
             // there's no focused pane with a cwd (remote-source pane, empty
             // layout). Both paths stay under `home`, so the
             // `validate_working_directory` check in agent::spawn_agent
-            // accepts them without needing AGEND_ALLOWED_WORK_ROOTS.
+            // accepts them without needing AGEND_ALLOWED_ROOTS.
             let cwd = ctx
                 .layout
                 .active_tab()

@@ -8,10 +8,6 @@
 //! `AGEND_GIT_BYPASS` is unset, leaking test ops into the host
 //! worktree's `.git`.
 //!
-//! Sister invariant to `tests/test_isolation_invariant.rs` (Sprint 31
-//! P0, which enforces `AGEND_TEST_ISOLATION=1` for binary-spawning
-//! tests). Different bug class — different env var — different scope.
-//!
 //! ## What it checks
 //!
 //! For every `.rs` file under `tests/`, grep for the literal

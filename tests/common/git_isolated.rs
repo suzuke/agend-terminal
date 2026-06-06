@@ -42,7 +42,7 @@
 //! ## Allowlist
 //!
 //! Pre-existing test files using raw `Command::new("git")` are
-//! grandfathered via the `tests/test_isolation_invariant.rs` allowlist.
+//! grandfathered via the `tests/git_subprocess_invariant.rs` allowlist.
 //! New tests added after #821 ships MUST use this helper.
 
 use std::path::{Path, PathBuf};

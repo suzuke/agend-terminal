@@ -148,7 +148,7 @@ fn sensitive_env_keys_covers_known_dangerous() {
     assert!(is_sensitive_env_key("LD_PRELOAD"));
     assert!(is_sensitive_env_key("DYLD_INSERT_LIBRARIES"));
     assert!(is_sensitive_env_key("AGEND_HOME"));
-    assert!(is_sensitive_env_key("AGEND_MCP_TOOLS_DENY"));
+    assert!(is_sensitive_env_key("AGEND_INSTANCE_NAME"));
 }
 
 #[test]

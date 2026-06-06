@@ -103,9 +103,6 @@ const SENSITIVE_ENV_KEYS: &[&str] = &[
     // the spawned agent to a different home / break MCP config discovery
     "AGEND_HOME",
     "AGEND_INSTANCE_NAME",
-    "AGEND_ALLOWED_WORK_ROOTS",
-    "AGEND_MCP_TOOLS_ALLOW",
-    "AGEND_MCP_TOOLS_DENY",
 ];
 
 /// Returns true if the env-var name is on the spawn-time deny-list.
@@ -855,7 +852,7 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
         // validate_working_directory at admission, but a symlink could have
         // been swapped in between admission and spawn. Revalidate here both
         // before and after create_dir_all so the final cwd we hand to the PTY
-        // provably resolves inside AGEND_HOME / AGEND_ALLOWED_WORK_ROOTS.
+        // provably resolves inside AGEND_HOME / AGEND_ALLOWED_ROOTS.
         // If no home is available (ad-hoc test spawn), skip the recheck.
         if let Some(home_path) = *home {
             if let Err(e) = crate::api::validate_working_directory(dir, home_path) {

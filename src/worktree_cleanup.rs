@@ -1,6 +1,7 @@
 //! Worktree auto-cleanup v2 — runtime registry based.
 //!
-//! Gated by `AGEND_WORKTREE_AUTO_CLEANUP=1` (opt-in).
+//! On by default; gated **opt-out** via `AGEND_WORKTREE_AUTO_CLEANUP=0`
+//! (any other value, or unset, leaves it enabled — see `auto_cleanup_enabled`).
 //! Sweeps worktrees whose branches are merged into main OR whose remote
 //! tracking ref has been deleted (squash-merged PRs), using the daemon's
 //! live AgentConfig registry to find repos and detect in-use worktrees.

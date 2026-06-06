@@ -43,7 +43,7 @@ The variables below are the **default names** for that indirection.
 |------|---------|-----------------|-----------------------|--------|-------|
 | `AGEND_TELEGRAM_BOT_TOKEN` | Default name of the env var holding the Telegram bot token. | Config field defaults to the name `AGEND_TELEGRAM_BOT_TOKEN`; if that var is unset at read time, falls back to legacy `AGEND_BOT_TOKEN` (with deprecation warning). | Telegram bot token string. | `src/fleet/mod.rs:227` (default name); read at `src/channel/telegram/creds.rs:23` | 🔒 Secret. Operator-facing. |
 | `AGEND_DISCORD_BOT_TOKEN` | Default name of the env var holding the Discord bot token. | Token var unset → Discord channel not activated (no-credentials arm). | Discord bot token string. | `src/fleet/mod.rs:230` (default name); deref read at `src/channel/telegram/creds.rs:23` | 🔒 Secret. Operator-facing. Shares the telegram channel's token indirection. |
-| `AGEND_BOT_TOKEN` | **Legacy/fallback** Telegram bot token, read only when the configured `bot_token_env` var is unset; emits a deprecation warning steering operators to `bot_token_env`. | Both unset → "bot token env not set" error; telegram verify test is skipped. | Telegram bot token string. | `src/channel/telegram/creds.rs:25`; `src/channel/telegram/bootstrap.rs:39` | 🔒 Secret. **Deprecated** — prefer `bot_token_env` in fleet.yaml. |
+| `AGEND_BOT_TOKEN` | **Legacy/fallback** Telegram bot token, read only when the configured `bot_token_env` var is unset; emits a deprecation warning steering operators to `bot_token_env`. | Both unset → "bot token env not set" error; telegram verify test is skipped. | Telegram bot token string. | `src/channel/telegram/creds.rs:25`; `src/channel/telegram/bootstrap.rs:39` | 🔒 Secret. **Deprecated** — read-time fallback only. `quickstart` now writes the canonical `AGEND_TELEGRAM_BOT_TOKEN` (and migrates a legacy line out on re-run); prefer `bot_token_env` in fleet.yaml. |
 
 ---
 
@@ -134,8 +134,6 @@ These live in the `agend-git` shim binary (`src/bin/agend-git.rs`). The three
 | Name | Purpose | Default (unset) | Valid values / format | Source | Notes |
 |------|---------|-----------------|-----------------------|--------|-------|
 | `AGEND_BRIDGE_TOOLS_LIST_TIMEOUT_MS` | Overrides the `tools/list` retry-timeout budget in the MCP bridge proxy. | `30_000` ms. | `u64` ms; malformed → default. | `src/bin/agend-mcp-bridge.rs:271` | Test-oriented override (internal). |
-| `AGEND_MCP_TOOLS_ALLOW` | Intended MCP per-tool ACL allow-list. **No active read site** in current `src/` — the former reader was removed when the stdio JSON-RPC server moved to the bridge binary. | N/A (no live read). | Historically comma-separated tool names (deny overrides allow). | Only occurrence: `src/agent/mod.rs:107` (`SENSITIVE_ENV_KEYS` deny-list, not a read) | ⚠️ Reserved/deny-listed only — blocked from template override. Not currently consumed. |
-| `AGEND_MCP_TOOLS_DENY` | Intended MCP per-tool ACL deny-list. **No active read site** in current `src/` (same removal as above). | N/A (no live read). | Historically comma-separated tool names. | Only occurrence: `src/agent/mod.rs:108` (`SENSITIVE_ENV_KEYS`, not a read) | ⚠️ Reserved/deny-listed only. Not currently consumed. |
 
 ---
 
@@ -145,7 +143,6 @@ These live in the `agend-git` shim binary (`src/bin/agend-git.rs`). The three
 |------|---------|-----------------|-----------------------|--------|-------|
 | `AGEND_ENV_ISOLATION` | Gate for agent-backend env isolation (#1440 phased rollout). | Disabled. | `"1"` enables; else off. | `src/agent/mod.rs:179` | Default-off feature flag. When on, only allowlisted env is forwarded to backends (see [external env](#12-honored-external-env)). |
 | `AGEND_ALLOWED_ROOTS` | Extra allowed root directories for `working_directory` validation (appended to home, workspace, cwd). | No extra roots; only home + workspace + cwd allowed. | OS-path-separator list (`:` Unix, `;` Windows); empty segments skipped. | `src/api/mod.rs:156` | ⚠️ Controls path-traversal allowlist for agent working dirs. |
-| `AGEND_ALLOWED_WORK_ROOTS` | **Not read as config.** Present only as a `SENSITIVE_ENV_KEYS` deny-list entry so a template cannot inject it into a spawned agent. | N/A (never read via `env::var`). | N/A. | `src/agent/mod.rs:106` (deny-list entry; not a read site) | ⚠️ Reserved sensitive key name only. |
 | `AGEND_BIND_STRICT_MODE` | In dispatch_hook: when `source_repo` resolves to a stub (tier 4) and this is `"1"`, reject the stub fallback, forcing an explicit `source_repo` in fleet.yaml. | Strict mode off; stub fallback allowed. | `"1"` enables; else off. | `src/mcp/handlers/dispatch_hook/mod.rs:343` | Production safety gate. |
 
 ---
@@ -198,7 +195,6 @@ fixtures and have no (or vestigial) production read sites.
 
 | Name | Purpose | Source | Notes |
 |------|---------|--------|-------|
-| `AGEND_TEST_ISOLATION` | Intended to flag test runs so spawned binaries skip real fleet-instance creation / daemon API calls. | Set-only in `src/mcp/handlers/tests.rs` + `.env()` in `tests/`; invariant enforced by `tests/test_isolation_invariant.rs` | **Vestigial** — the former production reader (`src/mcp/mod.rs`) was removed with the deleted `agend-terminal mcp` subcommand. No live `env::var` reader remains. |
 | `AGEND_TEST_RECOVERY_ENV_MS_VALID` | Fixture fed to the `env_ms()` recovery helper to verify a valid integer parses correctly. Set to `"5000"`. | `src/daemon/per_tick/recovery_dispatcher.rs:1115` (inside `#[cfg(test)]`) | Test of `env_ms` parse-success branch. |
 | `AGEND_TEST_RECOVERY_ENV_MS_INVALID` | Fixture fed to `env_ms()` to verify a garbage value falls back to the default. Set to `"not a number"`. | `src/daemon/per_tick/recovery_dispatcher.rs:1129` (inside `#[cfg(test)]`) | Test of `env_ms` invalid-parse branch. |
 | `AGEND_TEST_RECOVERY_NONEXISTENT_VAR` | Fixture deliberately removed, then passed to `env_ms()` to verify the unset path falls back to the default. | `src/daemon/per_tick/recovery_dispatcher.rs:892` (inside `#[cfg(test)]`) | Test of `env_ms` missing-var branch. |
