@@ -11,10 +11,8 @@
 //!   still deliver Ctrl+C as 0x03 to the focused pane's PTY.
 //!
 //! Both handlers:
-//! 1. Write `AGEND_CTRLC_SENTINEL` if set (debugging aid on Windows where
-//!    the daemon's console may be detached).
-//! 2. Set the `shutdown` flag so every cooperating thread sees it.
-//! 3. Wake the main loop via `shutdown_tx` (daemon) / polling (app).
+//! 1. Set the `shutdown` flag so every cooperating thread sees it.
+//! 2. Wake the main loop via `shutdown_tx` (daemon) / polling (app).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -36,12 +34,6 @@ pub fn install(shutdown: Arc<AtomicBool>, shutdown_tx: crossbeam_channel::Sender
     }
 
     if let Err(e) = ctrlc::set_handler(move || {
-        if let Ok(path) = std::env::var("AGEND_CTRLC_SENTINEL") {
-            let _ = std::fs::write(
-                &path,
-                format!("fired at {:?}\n", std::time::SystemTime::now()),
-            );
-        }
         tracing::info!("shutting down (signal received)");
         // Sprint 57 Wave 3 PR-2 (#548 Q6): record reason taxonomy
         // BEFORE flipping the shutdown flag so the shutdown sequence
