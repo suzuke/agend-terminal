@@ -64,20 +64,16 @@ fn connect_port(port: u16) -> io::Result<TcpStream> {
     Ok(stream)
 }
 
-/// Connect to the active daemon's API port.
-pub fn connect_api(home: &Path) -> Result<TcpStream> {
-    let run =
-        crate::daemon::find_active_run_dir(home).context("no active daemon (run dir not found)")?;
-    let port = read_port(&run, API_NAME).context("daemon api.port missing or invalid")?;
-    connect_port(port).map_err(Into::into)
-}
-
 /// Connect to a SPECIFIC run dir's daemon api port (not the active one).
 ///
-/// #1814: the self-respawn Phase-1 gate must reach the successor's OWN api
-/// port while both predecessor and successor are briefly alive — `connect_api`
-/// (which resolves via `find_active_run_dir`) could return either, so the gate
-/// targets the successor's run dir explicitly.
+/// #1814: the self-respawn Phase-1 gate must reach the successor's OWN api port
+/// while both predecessor and successor are briefly alive — a bare
+/// `find_active_run_dir` resolution could return either, so the gate targets the
+/// successor's run dir explicitly.
+///
+/// #bughunt-r1 (#2): also used by `api::call`, which resolves the active run dir
+/// ONCE and passes it here so the api port and the cookie come from the SAME
+/// resolution (no port-vs-cookie run-dir TOCTOU across a restart).
 pub fn connect_run_dir_api(run_dir: &Path) -> Result<TcpStream> {
     let port = read_port(run_dir, API_NAME)
         .with_context(|| format!("api.port missing/invalid in {}", run_dir.display()))?;

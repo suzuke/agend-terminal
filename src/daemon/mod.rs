@@ -1181,6 +1181,30 @@ pub(crate) struct ShutdownMetrics {
 /// equivalent); the sequence falls back to `kill_process_tree`
 /// per agent — equivalent semantics, just without the parallel
 /// SIGTERM stage.
+///
+/// #bughunt-r1: per-agent disposition at the post-grace SIGKILL stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GraceDisposition {
+    /// Child still alive after the grace window → escalate to a process-group
+    /// SIGKILL (`kill_process_tree`).
+    HardKill,
+    /// Child already exited cleanly during the grace window → only reap it.
+    /// MUST NOT `kill_process_tree`: the exited child's PID may have been reused
+    /// by an unrelated process, so SIGKILLing that group is collateral damage.
+    ReapOnly,
+}
+
+/// #bughunt-r1 (HIGH): a child that exited cleanly within the grace window must
+/// NOT be hard-killed (PID-reuse → wrong-process-group SIGKILL). Only a holdout
+/// (`still_alive`) escalates to `kill_process_tree`.
+fn grace_disposition(still_alive: bool) -> GraceDisposition {
+    if still_alive {
+        GraceDisposition::HardKill
+    } else {
+        GraceDisposition::ReapOnly
+    }
+}
+
 pub(crate) fn shutdown_sequence(
     home: &Path,
     registry: &AgentRegistry,
@@ -1241,18 +1265,25 @@ pub(crate) fn shutdown_sequence(
             Some(p) => crate::process::is_pid_alive(p),
             None => false,
         };
-        if let Some(p) = pid {
-            crate::process::kill_process_tree(p);
-        }
-        let _ = child.lock().kill();
-        if still_alive {
-            agents_killed_after_grace += 1;
-            tracing::info!(
-                agent = %name,
-                "killed (after grace window)"
-            );
-        } else {
-            tracing::info!(agent = %name, "killed");
+        match grace_disposition(still_alive) {
+            GraceDisposition::HardKill => {
+                // Holdout after the grace window — escalate to a SIGKILL of the
+                // whole process group, then reap the child handle.
+                if let Some(p) = pid {
+                    crate::process::kill_process_tree(p);
+                }
+                let _ = child.lock().kill();
+                let _ = child.lock().wait();
+                agents_killed_after_grace += 1;
+                tracing::info!(agent = %name, "killed (after grace window)");
+            }
+            GraceDisposition::ReapOnly => {
+                // #bughunt-r1: clean exit during the grace window. Do NOT
+                // `kill_process_tree` — the PID may have been reused, so the
+                // group SIGKILL would hit an unrelated process. Just reap.
+                let _ = child.lock().wait();
+                tracing::info!(agent = %name, "exited cleanly during grace window");
+            }
         }
     }
 
@@ -1781,6 +1812,48 @@ fn handle_stage2_restart(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    // ── #bughunt-r1 #1: post-grace SIGKILL must not hit clean exits ─────────
+
+    #[test]
+    fn grace_disposition_reaps_clean_exit_does_not_hard_kill() {
+        // A child that exited cleanly within the grace window → ReapOnly. This
+        // is the crux of the fix: it must NOT escalate to kill_process_tree,
+        // whose PID may have been reused by an unrelated process.
+        assert_eq!(grace_disposition(false), GraceDisposition::ReapOnly);
+        // A holdout still alive after the grace window → HardKill.
+        assert_eq!(grace_disposition(true), GraceDisposition::HardKill);
+    }
+
+    /// Source-scan invariant: in `shutdown_sequence`, `kill_process_tree` must
+    /// only be reachable via the `GraceDisposition::HardKill` arm — never an
+    /// unconditional call (the bug). Guards against a regression that bypasses
+    /// `grace_disposition` and SIGKILLs every child's (possibly-reused) PID.
+    #[test]
+    fn shutdown_kill_process_tree_only_in_hard_kill_arm_bughunt_r1() {
+        let src = include_str!("mod.rs");
+        let start = src
+            .find("pub(crate) fn shutdown_sequence(")
+            .expect("shutdown_sequence present");
+        let after = &src[start..];
+        // Scope to the fn body up to the start of the #[cfg(test)] module.
+        let cfg_test = ["#[cfg(", "test)]"].concat();
+        let end = after.find(&cfg_test).unwrap_or(after.len());
+        let body = &after[..end];
+
+        let hard_kill_arm = body
+            .find("GraceDisposition::HardKill =>")
+            .expect("shutdown_sequence must branch on GraceDisposition::HardKill");
+        let kill_call = body
+            .find("kill_process_tree(")
+            .expect("shutdown_sequence still calls kill_process_tree for holdouts");
+        assert!(
+            kill_call > hard_kill_arm,
+            "#bughunt-r1 #1: kill_process_tree must appear only inside the \
+             GraceDisposition::HardKill arm, never unconditionally (a clean exit \
+             during the grace window must be reaped, not SIGKILL'd)"
+        );
+    }
 
     fn tmp_home(name: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};

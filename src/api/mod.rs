@@ -279,7 +279,40 @@ pub fn serve(
         std::sync::atomic::Ordering::Relaxed,
     );
 
-    for stream in listener.incoming().flatten() {
+    // #bughunt-r1 (#4): explicit accept-error handling. The old
+    // `.incoming().flatten()` silently dropped every `accept()` Err with no log
+    // and no backoff — a persistent failure (e.g. EMFILE) would hot-spin and the
+    // operator would see nothing. Now: rate-limited log, brief backoff, and a
+    // give-up after a sustained streak.
+    let mut consecutive_accept_errors: u32 = 0;
+    for stream in listener.incoming() {
+        let stream = match stream {
+            Ok(s) => {
+                consecutive_accept_errors = 0;
+                s
+            }
+            Err(e) => {
+                consecutive_accept_errors += 1;
+                let (should_log, should_break) =
+                    accept_error_disposition(consecutive_accept_errors);
+                if should_log {
+                    tracing::warn!(
+                        error = %e,
+                        consecutive = consecutive_accept_errors,
+                        "API accept() failed"
+                    );
+                }
+                if should_break {
+                    tracing::error!(
+                        consecutive = consecutive_accept_errors,
+                        "API accept() failing persistently — stopping accept loop"
+                    );
+                    break;
+                }
+                std::thread::sleep(ACCEPT_ERROR_BACKOFF);
+                continue;
+            }
+        };
         // Phase flips to "processing" while we set up the per-session
         // thread; flips back to in_accept at top of next iteration.
         LISTENER_PHASE.store(
@@ -370,6 +403,25 @@ pub fn serve(
 
 pub const LISTENER_PHASE_PROCESSING: u8 = 0;
 pub const LISTENER_PHASE_IN_ACCEPT: u8 = 1;
+
+/// #bughunt-r1 (#4): backoff slept after each `accept()` error so a persistent
+/// failure (e.g. EMFILE from fd exhaustion) doesn't hot-spin the CPU.
+const ACCEPT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
+/// Log only the 1st error in a streak and every Nth thereafter (rate-limit).
+const ACCEPT_ERROR_LOG_EVERY: u32 = 50;
+/// Give up the accept loop after this many consecutive `accept()` errors — the
+/// listener is wedged (not a transient blip), so spinning forever helps nobody.
+const MAX_CONSECUTIVE_ACCEPT_ERRORS: u32 = 100;
+
+/// #bughunt-r1 (#4): decide how the accept loop reacts to the Nth consecutive
+/// `accept()` error — `(should_log, should_break)`. Pure so it is unit-testable
+/// without inducing real socket errors. `consecutive` is 1-based (the first
+/// error in a streak is 1).
+fn accept_error_disposition(consecutive: u32) -> (bool, bool) {
+    let should_log = consecutive == 1 || consecutive.is_multiple_of(ACCEPT_ERROR_LOG_EVERY);
+    let should_break = consecutive >= MAX_CONSECUTIVE_ACCEPT_ERRORS;
+    (should_log, should_break)
+}
 
 /// Current API listener thread phase. Read by the periodic thread-dump
 /// handler. Zero (`LISTENER_PHASE_PROCESSING`) on initial daemon boot
@@ -726,7 +778,15 @@ pub fn call(home: &Path, request: &Value) -> anyhow::Result<Value> {
     // it logs + returns `Err` here (in EVERY build, not just debug), so the
     // deadlocking call is refused and the daemon stays live instead of freezing.
     crate::sync_audit::assert_no_registry_lock_for_self_ipc("api::call")?;
-    let stream = crate::ipc::connect_api(home)?;
+    // #bughunt-r1 (#2 TOCTOU): resolve the active run dir ONCE and read BOTH the
+    // api port and the cookie from it. The previous code connected via
+    // `connect_api` (which resolved the run dir internally for the port) and THEN
+    // re-resolved via `find_active_run_dir` for the cookie — during a daemon
+    // restart those two resolutions could land on DIFFERENT run dirs (run dir B's
+    // cookie sent to run dir A's socket → handshake failure). Mirror `call_at`.
+    let run = crate::daemon::find_active_run_dir(home)
+        .ok_or_else(|| anyhow::anyhow!("no active daemon (run dir not found)"))?;
+    let stream = crate::ipc::connect_run_dir_api(&run)?;
     // #1492 backstop (L3): bound every loopback read with a socket-level
     // timeout. #1492-L2 made the guard above always-on + fail-fast (it now
     // returns `Err` in every build, not just a debug panic), so a self-IPC made
@@ -742,8 +802,7 @@ pub fn call(home: &Path, request: &Value) -> anyhow::Result<Value> {
     stream
         .set_read_timeout(Some(timeout))
         .context("set api::call read timeout")?;
-    let run = crate::daemon::find_active_run_dir(home)
-        .ok_or_else(|| anyhow::anyhow!("no active daemon (run dir not found)"))?;
+    // Cookie from the SAME `run` resolution used for the port above (#2 fix).
     let cookie = crate::auth_cookie::read_cookie(&run)?;
 
     let mut writer = stream.try_clone()?;
@@ -1959,5 +2018,87 @@ mod tests {
             .map(|b| b.preset().submit_key)
             .unwrap_or("\r");
         assert_eq!(unknown, "\r");
+    }
+
+    // ── #bughunt-r1 #4: accept-loop error disposition ──────────────────────
+
+    #[test]
+    fn accept_error_disposition_logs_first_then_rate_limits() {
+        // First error in a streak always logs; subsequent ones are suppressed
+        // until the next `ACCEPT_ERROR_LOG_EVERY` multiple — so a persistent
+        // failure produces a bounded log rate, not one line per spin.
+        assert_eq!(accept_error_disposition(1), (true, false), "1st error logs");
+        assert_eq!(
+            accept_error_disposition(2),
+            (false, false),
+            "2nd suppressed"
+        );
+        assert_eq!(
+            accept_error_disposition(ACCEPT_ERROR_LOG_EVERY),
+            (true, false),
+            "every Nth logs"
+        );
+        assert_eq!(
+            accept_error_disposition(ACCEPT_ERROR_LOG_EVERY + 1),
+            (false, false),
+            "N+1 suppressed"
+        );
+    }
+
+    #[test]
+    fn accept_error_disposition_breaks_after_sustained_failure() {
+        // Below the cap → keep going; at/over the cap → give up the loop.
+        assert!(
+            !accept_error_disposition(MAX_CONSECUTIVE_ACCEPT_ERRORS - 1).1,
+            "just under cap keeps accepting"
+        );
+        assert!(
+            accept_error_disposition(MAX_CONSECUTIVE_ACCEPT_ERRORS).1,
+            "at cap breaks the accept loop"
+        );
+    }
+
+    // ── #bughunt-r1 #2: api::call port+cookie single run-dir resolution ────
+
+    /// Source-scan invariant (the runtime TOCTOU needs a daemon-restart race
+    /// that's impractical to drive in a unit test): `api::call` MUST resolve the
+    /// active run dir exactly ONCE and feed that same dir to BOTH the port
+    /// connect (`connect_run_dir_api`) and the cookie read (`read_cookie`). It
+    /// must NOT use `connect_api` (which does its OWN internal resolution) — that
+    /// was the bug: a second `find_active_run_dir` for the cookie could land on a
+    /// different run dir mid-restart.
+    #[test]
+    fn call_resolves_run_dir_once_for_port_and_cookie_bughunt_r1() {
+        let src = include_str!("mod.rs");
+        // Scope to the `pub fn call(` body. Stop at the next top-level item
+        // (`\nfn ` — the following `api_call_read_timeout`) so the scan can NOT
+        // reach the `#[cfg(test)]` module, whose own source contains the literal
+        // `connect_api(` in this test's assert message (#1593 self-match trap).
+        let start = src
+            .find("pub fn call(home: &Path")
+            .expect("call fn present");
+        let after = &src[start..];
+        let end = after[1..]
+            .find("\nfn ")
+            .map(|i| i + 1)
+            .unwrap_or(after.len());
+        let body = &after[..end];
+
+        assert!(
+            !body.contains("connect_api("),
+            "#bughunt-r1 #2: api::call must NOT use connect_api (it re-resolves the \
+             run dir internally → port/cookie TOCTOU); use connect_run_dir_api on a \
+             single resolution"
+        );
+        assert!(
+            body.contains("connect_run_dir_api("),
+            "api::call must connect via connect_run_dir_api on the resolved run dir"
+        );
+        assert_eq!(
+            body.matches("find_active_run_dir(").count(),
+            1,
+            "api::call must resolve the active run dir exactly ONCE (port + cookie \
+             from the same dir)"
+        );
     }
 }
