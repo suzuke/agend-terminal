@@ -52,15 +52,6 @@ const SCHEMA_VERSION: u32 = 1;
 /// min — matches Wave 1 PR-1/PR-2 cadence.
 pub(crate) const TICKS_PER_DECISION_SCAN: u64 = 30;
 
-/// Default recipient for the auto-default emission (operator-
-/// proceed signal). Tunable via `AGEND_DECISION_TIMEOUT_RECIPIENT`.
-fn timeout_recipient() -> String {
-    std::env::var("AGEND_DECISION_TIMEOUT_RECIPIENT")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "general".to_string())
-}
-
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct PendingDecision {
     #[serde(default)]
@@ -331,7 +322,7 @@ fn deliver_timeout(
         timeout_secs,
         default_action,
     );
-    let recipient = timeout_recipient();
+    let recipient = crate::fleet::watchdog::resolve_decision_timeout_recipient(home);
     if let Err(e) = crate::inbox::notify_system(
         home,
         &recipient,
@@ -708,13 +699,45 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    // #1812-followup: recipient resolution (default / env / fleet.yaml
+    // precedence) moved to `fleet::watchdog` tests. The §3.9 real-entry test
+    // `fleet_decision_timeout_recipient_routes_via_bus` below proves a fleet.yaml
+    // `watchdog.decision_timeout_recipient` value reaches the live emit path.
+
+    /// §3.9 real-entry: a fleet.yaml `watchdog.decision_timeout_recipient` must
+    /// reach the live bus→subscriber→`deliver_timeout` path — delivery lands in the
+    /// configured recipient, NOT the built-in `general` default.
     #[test]
-    fn timeout_recipient_honors_env_override() {
+    fn fleet_decision_timeout_recipient_routes_via_bus() {
         let _g = env_lock();
-        std::env::set_var("AGEND_DECISION_TIMEOUT_RECIPIENT", "alice");
-        let r = timeout_recipient();
         std::env::remove_var("AGEND_DECISION_TIMEOUT_RECIPIENT");
-        assert_eq!(r, "alice");
+        let home = tmp_home("fleet-dec-route");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "watchdog:\n  decision_timeout_recipient: arbiter\ninstances: {}\n",
+        )
+        .unwrap();
+        let bus = crate::daemon::event_bus::EventBus::new();
+        bus.subscribe(handle_event);
+        bus.emit(
+            &home,
+            crate::daemon::event_bus::EventKind::DecisionTimeout {
+                decision_id: "d-fleet".to_string(),
+                sender: "general".to_string(),
+                elapsed_secs: 2000,
+                timeout_secs: 1800,
+                default_action: "proceed".to_string(),
+            },
+        );
+        assert!(
+            !drained_payloads(&home, "arbiter").is_empty(),
+            "fleet-configured recipient `arbiter` must receive the decision-timeout alert"
+        );
+        assert!(
+            drained_payloads(&home, "general").is_empty(),
+            "built-in default `general` must NOT receive once fleet.yaml overrides"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
@@ -1010,7 +1033,7 @@ mod tests {
             },
         );
 
-        let recipient = timeout_recipient();
+        let recipient = crate::fleet::watchdog::resolve_decision_timeout_recipient(&home_legacy);
         let legacy = drained_payloads(&home_legacy, &recipient);
         let viabus = drained_payloads(&home_bus, &recipient);
         assert_eq!(
@@ -1042,7 +1065,7 @@ mod tests {
             ..Default::default()
         };
         emit_timeout_event(&home, &d, 2000);
-        let recipient = timeout_recipient();
+        let recipient = crate::fleet::watchdog::resolve_decision_timeout_recipient(&home);
         assert!(
             !drained_payloads(&home, &recipient).is_empty(),
             "#event-bus Option A: gate-off must deliver via the legacy path (no regression)"

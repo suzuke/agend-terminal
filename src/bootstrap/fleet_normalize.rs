@@ -141,6 +141,7 @@ mod tests {
             templates: None,
             display_timezone: None,
             agy_workspace_link_base: None,
+            watchdog: Default::default(),
             home: None,
         };
         c.instances.insert(

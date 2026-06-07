@@ -116,13 +116,30 @@ These live in the `agend-git` shim binary (`src/bin/agend-git.rs`). The three
 
 ## 8. Watchdog & recipients
 
+> **Deprecation (watchdog topology → `fleet.yaml`).** The five `AGEND_IDLE_WATCHDOG_*`
+> / `AGEND_TASK_STALL_RECIPIENTS` / `AGEND_DECISION_TIMEOUT_RECIPIENT` vars below are
+> agent / recipient **names** — fleet *topology*, not env tuning. Their home is the
+> `fleet.yaml` top-level `watchdog:` block (see `docs/FEATURE-fleet.md`). The env vars
+> remain as a **deprecated fallback for one window** so existing setups keep working;
+> resolution precedence is **fleet.yaml `watchdog:` value > env var (deprecated, warns
+> once) > built-in default**. Move them to `fleet.yaml` and drop the env vars:
+>
+> ```yaml
+> watchdog:
+>   idle_watchdog_agent: dev          # AGEND_IDLE_WATCHDOG_AGENT (single-agent mode)
+>   dev_recipient: lead               # AGEND_IDLE_WATCHDOG_DEV_RECIPIENT
+>   fleet_recipient: lead             # AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT
+>   task_stall_recipients: [general, lead]   # AGEND_TASK_STALL_RECIPIENTS
+>   decision_timeout_recipient: general      # AGEND_DECISION_TIMEOUT_RECIPIENT
+> ```
+
 | Name | Purpose | Default (unset) | Valid values / format | Source | Notes |
 |------|---------|-----------------|-----------------------|--------|-------|
-| `AGEND_IDLE_WATCHDOG_AGENT` | Which agent the dev-vantage idle watchdog watches. | `"dev"`. | Agent name; empty/whitespace ignored. | `src/daemon/idle_watchdog.rs:261` | Tuning for multi-agent fleets. |
-| `AGEND_IDLE_WATCHDOG_DEV_RECIPIENT` | Recipient for dev-vantage idle alerts. | `"lead"`. | Recipient name; empty/whitespace ignored. | `src/daemon/idle_watchdog.rs:269` | Tuning. |
-| `AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT` | Recipient for fleet-vantage idle alerts ("whole fleet is quiet"). | `"lead"`. | Recipient name; empty/whitespace ignored. | `src/daemon/idle_watchdog.rs:288` | Tuning. |
-| `AGEND_TASK_STALL_RECIPIENTS` | Override recipients of task-stall warnings (normally `general` + `lead`). | `["general", "lead"]`. | Comma-separated names; entries trimmed, empties filtered. | `src/daemon/anti_stall.rs:166` | List override. |
-| `AGEND_DECISION_TIMEOUT_RECIPIENT` | Recipient for the decision-timeout auto-default (operator-proceed) emission. | `"general"`. | Non-empty recipient name; blank treated as unset. | `src/daemon/decision_timeout.rs:58` | Tuning. |
+| `AGEND_IDLE_WATCHDOG_AGENT` | **Deprecated** → `watchdog.idle_watchdog_agent`. Single-agent mode for the dev-vantage idle watchdog (watch only this agent). | `"dev"` (load-failure fallback only). | Agent name; empty/whitespace ignored. | `src/fleet/watchdog.rs` | Fleet config wins; env is the deprecated fallback. |
+| `AGEND_IDLE_WATCHDOG_DEV_RECIPIENT` | **Deprecated** → `watchdog.dev_recipient`. Recipient for dev-vantage idle alerts. | `"lead"`. | Recipient name; empty/whitespace ignored. | `src/fleet/watchdog.rs` | Fleet config wins; deprecated fallback. |
+| `AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT` | **Deprecated** → `watchdog.fleet_recipient`. Recipient for fleet-vantage idle alerts ("whole fleet is quiet"). | `"lead"`. | Recipient name; empty/whitespace ignored. | `src/fleet/watchdog.rs` | Fleet config wins; deprecated fallback. |
+| `AGEND_TASK_STALL_RECIPIENTS` | **Deprecated** → `watchdog.task_stall_recipients`. Recipients of task-stall warnings. | `["general", "lead"]`. | Comma-separated names; entries trimmed, empties filtered. | `src/fleet/watchdog.rs` | Fleet config (list) wins; deprecated fallback. |
+| `AGEND_DECISION_TIMEOUT_RECIPIENT` | **Deprecated** → `watchdog.decision_timeout_recipient`. Recipient for the decision-timeout auto-default (operator-proceed) emission. | `"general"`. | Non-empty recipient name; blank treated as unset. | `src/fleet/watchdog.rs` | Fleet config wins; deprecated fallback. |
 | `AGEND_WATCHDOG_DRY_RUN` | Makes the per-tick watchdog log classified PTY errors to the event log only instead of mutating agent health state. | `false` (health mutations applied). | `"1"`/`"true"`/`"TRUE"`/`"True"` → dry-run; else off. | `src/daemon/watchdog.rs:21` | Operator safety toggle. |
 
 ---
