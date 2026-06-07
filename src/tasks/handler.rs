@@ -190,32 +190,44 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
             if !instance_exists(home, &iname) {
                 return serde_json::json!({"error": format!("instance '{iname}' not found in fleet.yaml")});
             }
+            // #t-21: validate + append in ONE critical section to close the
+            // claim race. Pre-fix, the claimable check ran here (against a
+            // replay snapshot) and the append happened afterwards under a
+            // separate lock that did NOT re-validate — so two agents racing
+            // the same Open task both passed the check and both appended a
+            // Claimed event. `append_checked` re-runs the precondition under
+            // the append lock against a FRESH replay, so exactly one wins.
+            //
             // PR3: dep-derived blocking is computed in-memory at list time
-            // (not persisted). claim must respect that view, otherwise an
-            // operator could claim a task whose deps are unsatisfied. Use
-            // `list_all` (which applies the in-memory dep eval) instead of
-            // raw replay() for the validation read.
-            let tasks_view = list_all(home);
-            let task_view = match tasks_view.iter().find(|t| t.id == id) {
-                Some(t) => t,
-                None => return serde_json::json!({"error": format!("task '{id}' not found")}),
-            };
-            let is_self_reclaim = task_view.status == crate::task_events::TaskStatus::Claimed
-                && task_view.assignee.as_deref() == Some(iname.as_str());
-            if !is_self_reclaim && task_view.status != crate::task_events::TaskStatus::Open {
-                return serde_json::json!({
-                    "error": format!(
-                        "task '{id}' status is '{}', only 'open' tasks can be claimed",
-                        task_view.status
-                    )
-                });
-            }
+            // (not persisted), so the precondition rebuilds the SAME dep-aware
+            // view `list_all` produces (replay → record_to_task → dep eval)
+            // rather than reading raw status — an operator must not claim a
+            // task whose deps are unsatisfied.
+            let claim_id = id.clone();
+            let by = iname.clone();
             let event = crate::task_events::TaskEvent::Claimed {
                 task_id: crate::task_events::TaskId(id.clone()),
                 by: crate::task_events::InstanceName(iname.clone()),
             };
-            match crate::task_events::append(home, &emitter, event) {
-                Ok(_) => {
+            let result = crate::task_events::append_checked(home, &emitter, event, |state| {
+                let mut tasks: Vec<Task> = state.tasks.values().map(record_to_task).collect();
+                super::apply_dependency_eval_in_memory(&mut tasks);
+                let tv = tasks
+                    .iter()
+                    .find(|t| t.id == claim_id)
+                    .ok_or_else(|| format!("task '{claim_id}' not found"))?;
+                let is_self_reclaim = tv.status == crate::task_events::TaskStatus::Claimed
+                    && tv.assignee.as_deref() == Some(by.as_str());
+                if !is_self_reclaim && tv.status != crate::task_events::TaskStatus::Open {
+                    return Err(format!(
+                        "task '{claim_id}' status is '{}', only 'open' tasks can be claimed",
+                        tv.status
+                    ));
+                }
+                Ok(())
+            });
+            match result {
+                Ok(Ok(_)) => {
                     // #807 Item 1: see create arm note. claim's
                     // legacy `status` happens to match lifecycle
                     // ("claimed"), but the field is still the action
@@ -231,6 +243,8 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                         "status": "claimed",
                     })
                 }
+                // Lost the race / precondition no longer holds — no event written.
+                Ok(Err(reason)) => serde_json::json!({"error": reason}),
                 Err(e) => serde_json::json!({"error": format!("event log append failed: {e}")}),
             }
         }

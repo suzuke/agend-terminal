@@ -1340,6 +1340,75 @@ fn test_claim_already_claimed_by_other_rejected() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// §3.9 regression (#t-21 HIGH #2): N agents racing to claim the SAME Open task
+/// — exactly ONE must win, the rest must be rejected, and the board must end up
+/// Claimed by that single winner. Pre-fix, the claimable check ran before a
+/// separate append lock that did NOT re-validate, so multiple racers all
+/// appended `Claimed` events. Regression-proof: revert the claim arm to
+/// `append` + outer pre-check and this FAILS (successes > 1).
+#[test]
+fn concurrent_claims_exactly_one_wins_t21() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = tmp_home("concurrent-claim");
+    const N: usize = 8;
+    let agents: Vec<String> = (0..N).map(|i| format!("agent-{i}")).collect();
+    let agent_refs: Vec<&str> = agents.iter().map(|s| s.as_str()).collect();
+    write_fleet_yaml(&home, &agent_refs);
+
+    let r = handle(
+        &home,
+        "agent-0",
+        &serde_json::json!({"action": "create", "title": "t"}),
+    );
+    let id = r["id"].as_str().unwrap().to_string();
+
+    let successes = AtomicUsize::new(0);
+    let winner: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    std::thread::scope(|s| {
+        for agent in &agents {
+            let (home, id, successes, winner) = (&home, &id, &successes, &winner);
+            s.spawn(move || {
+                let res = handle(
+                    home,
+                    agent,
+                    &serde_json::json!({"action": "claim", "id": id}),
+                );
+                if res["status"] == "claimed" {
+                    successes.fetch_add(1, Ordering::SeqCst);
+                    *winner.lock().unwrap() = Some(agent.clone());
+                } else {
+                    assert!(
+                        res["error"].as_str().unwrap_or("").contains("only 'open'"),
+                        "a losing racer must get the not-open rejection, got: {res}"
+                    );
+                }
+            });
+        }
+    });
+
+    assert_eq!(
+        successes.load(Ordering::SeqCst),
+        1,
+        "exactly one concurrent claim may succeed — the append-lock revalidation \
+         must reject all racers that lost"
+    );
+    // Final board state must agree with the single reported winner.
+    let winner = winner.lock().unwrap().clone().expect("a winner must exist");
+    let tasks = list_all(&home);
+    let task = tasks.iter().find(|t| t.id == id).expect("task exists");
+    assert_eq!(
+        task.status,
+        crate::task_events::TaskStatus::Claimed,
+        "board must be Claimed after the race"
+    );
+    assert_eq!(
+        task.assignee.as_deref(),
+        Some(winner.as_str()),
+        "board assignee must be the claim that reported success"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 #[test]
 fn test_claim_self_reclaim_ok() {
     let home = tmp_home("claim-reclaim");

@@ -1007,6 +1007,76 @@ pub fn append_batch(
     Ok(seqs)
 }
 
+/// Append `event` atomically iff `precondition` — evaluated under the append
+/// lock against a FRESH on-disk replay — returns `Ok`. This closes the TOCTOU
+/// where a caller validates task state, then appends after a concurrent writer
+/// has already mutated it (e.g. #t-21: two agents claiming the same Open task,
+/// both seeing it Open before either appends, both succeeding).
+///
+/// The precondition runs inside the SAME critical section as the write, so the
+/// state it inspects is the authoritative committed history: any racing writer
+/// either committed before us (and is visible) or is blocked waiting for the
+/// lock (and will re-validate against OUR committed event next).
+///
+/// On precondition failure NO event is written; the rejection reason is
+/// returned as `Ok(Err(reason))`. The outer `Err` is reserved for IO / replay
+/// failures. Replay/append semantics are otherwise unchanged — this reuses
+/// `replay_uncached` (lock-free) for the read and the same seq/cache plumbing
+/// as [`append_batch`].
+pub fn append_checked<F>(
+    home: &Path,
+    instance: &InstanceName,
+    event: TaskEvent,
+    precondition: F,
+) -> anyhow::Result<Result<u64, String>>
+where
+    F: FnOnce(&TaskBoardState) -> Result<(), String>,
+{
+    let instance = instance.clone();
+    let now = chrono::Utc::now().to_rfc3339();
+    let emitter_id = match crate::agent::resolve_instance(home, instance.as_str()) {
+        Ok((id, _)) => Some(id.full()),
+        Err(e) => {
+            tracing::debug!(instance = %instance, error = %e, "emitter ID resolution failed");
+            None
+        }
+    };
+
+    let mut assigned_seq: Option<u64> = None;
+    let mut rejection: Option<String> = None;
+
+    crate::event_log::append_lines_under_lock(home, LOG_NAME, |log_path| {
+        // FRESH replay under the lock — authoritative committed history.
+        let state = replay_uncached(home)?;
+        if let Err(reason) = precondition(&state) {
+            rejection = Some(reason);
+            return Ok(Vec::new()); // empty ⇒ no write
+        }
+        let seq = max_seq_for_instance(log_path, &instance)? + 1;
+        assigned_seq = Some(seq);
+        let envelope = TaskEventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            seq,
+            timestamp: now.clone(),
+            instance: instance.clone(),
+            emitter_id: emitter_id.clone(),
+            event,
+        };
+        Ok(vec![serde_json::to_string(&envelope)?])
+    })?;
+
+    if let Some(reason) = rejection {
+        return Ok(Err(reason));
+    }
+    invalidate_replay_cache();
+    if let Some(seq) = assigned_seq {
+        let log_path = home.join(format!("{LOG_NAME}.jsonl"));
+        SEQ_CACHE.lock().insert((log_path, instance), seq);
+        return Ok(Ok(seq));
+    }
+    Ok(Ok(0))
+}
+
 /// Tail-scan the hot log for the highest seq# this instance has emitted.
 /// Best-effort: malformed lines are skipped because [`replay`] is the
 /// strict reader; here we just need the high-water mark.

@@ -118,6 +118,13 @@ pub struct ReleaseOutcome {
     // drops `None` only, never `Some`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch_cleanup_skipped_reason: Option<String>,
+    /// #t-21: on a `dry_run=true` release, a human-readable preview of the
+    /// destructive effects that were deliberately NOT performed (worktree
+    /// removal + binding clear). `None` on a real release. The pre-fix bug ran
+    /// `remove_worktree` + `clear_binding_state` unconditionally, so a dry_run
+    /// actually destroyed the worktree and binding; now they are previewed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dry_run_preview: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -354,33 +361,70 @@ pub fn release_full(home: &Path, agent: &str, dry_run: bool) -> ReleaseOutcome {
         let wt_path = Path::new(wt_path_str);
         let source_repo = source_repo_from_binding(&binding, wt_path);
 
-        match remove_worktree(agent, wt_path, &source_repo) {
-            WorktreeRemoval::Removed => {
-                managed_verified = true;
-                out.worktree_removed = true;
-            }
-            WorktreeRemoval::AlreadyAbsent => {
+        if dry_run {
+            // #t-21: dry_run is observation-only. Classify the worktree with the
+            // SAME checks `remove_worktree` uses (path-exists → absent;
+            // missing .agend-managed marker → refuse; managed+present → would
+            // remove) but perform NO mutation. This closes the bug where
+            // `remove_worktree` deleted the worktree on a dry run before the
+            // (dry-run-honoring) branch cleanup ever ran.
+            if !wt_path.exists() {
                 worktree_absent = true;
-            }
-            WorktreeRemoval::Unmanaged(err) => {
-                out.error = Some(err);
+            } else if !is_daemon_managed(wt_path) {
+                out.error = Some(format!(
+                    "worktree at {} has no .agend-managed marker — refusing to remove (binding NOT cleared)",
+                    wt_path.display()
+                ));
                 return out;
-            }
-            WorktreeRemoval::Failed(err) => {
+            } else {
                 managed_verified = true;
-                out.error = Some(err);
+            }
+        } else {
+            match remove_worktree(agent, wt_path, &source_repo) {
+                WorktreeRemoval::Removed => {
+                    managed_verified = true;
+                    out.worktree_removed = true;
+                }
+                WorktreeRemoval::AlreadyAbsent => {
+                    worktree_absent = true;
+                }
+                WorktreeRemoval::Unmanaged(err) => {
+                    out.error = Some(err);
+                    return out;
+                }
+                WorktreeRemoval::Failed(err) => {
+                    managed_verified = true;
+                    out.error = Some(err);
+                }
             }
         }
     }
 
-    clear_binding_state(home, agent);
-    out.binding_removed = true;
-    // #1465 guardrail: only report `released` when no cleanup step failed.
-    // A `WorktreeRemoval::Failed` set `out.error` above — idempotent success
-    // must NOT mask a real execution error as success (reviewer contract:
-    // "binding present but cleanup failed → released:false + error").
-    if out.error.is_none() {
+    if dry_run {
+        // #t-21: preserve the binding + worktree; report what WOULD happen.
+        // `released` is an observation-success (matches the dry-run branch
+        // cleanup contract), but nothing was actually removed.
+        let wt_preview = if worktree_absent {
+            format!("worktree {wt_path_str} already absent")
+        } else if managed_verified {
+            format!("would remove worktree {wt_path_str}")
+        } else {
+            "no worktree to remove".to_string()
+        };
+        out.dry_run_preview = Some(format!(
+            "dry-run: {wt_preview}; would clear binding for '{agent}'"
+        ));
         out.released = true;
+    } else {
+        clear_binding_state(home, agent);
+        out.binding_removed = true;
+        // #1465 guardrail: only report `released` when no cleanup step failed.
+        // A `WorktreeRemoval::Failed` set `out.error` above — idempotent success
+        // must NOT mask a real execution error as success (reviewer contract:
+        // "binding present but cleanup failed → released:false + error").
+        if out.error.is_none() {
+            out.released = true;
+        }
     }
 
     resolve_branch_cleanup(
@@ -1268,6 +1312,52 @@ mod tests {
         assert!(outcome.error.is_none(), "no error: {:?}", outcome.error);
         assert!(!l.path.exists(), "worktree dir must be gone post-release");
         assert!(crate::binding::read(&home, "agent-h").is_none());
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// §3.9 regression (#t-21 HIGH #1): `release_full(dry_run=true)` must be
+    /// observation-only — the worktree directory AND binding.json must survive.
+    /// Pre-fix, `remove_worktree` + `clear_binding_state` ran unconditionally,
+    /// so a dry run actually destroyed both. Regression-proof: revert the
+    /// `if dry_run` guard in `release_full` and this FAILS (`l.path` gone,
+    /// binding cleared).
+    #[test]
+    fn dry_run_release_preserves_worktree_and_binding_t21() {
+        let home = tmp_home("t21-dry-run");
+        let repo = tmp_repo("t21-dry-run-repo");
+        let l = lease(&home, &repo, "agent-dry", "feat/keep").expect("lease");
+        assert!(l.path.exists(), "pre: worktree must exist");
+        assert!(crate::binding::read(&home, "agent-dry").is_some());
+
+        let outcome = release_full(&home, "agent-dry", true);
+
+        // Observation-success, nothing actually removed.
+        assert!(outcome.released, "dry-run reports observation success");
+        assert!(
+            !outcome.worktree_removed,
+            "dry-run must NOT remove worktree"
+        );
+        assert!(!outcome.binding_removed, "dry-run must NOT clear binding");
+        assert!(outcome.error.is_none(), "no error: {:?}", outcome.error);
+        // The destructive effects are previewed, not performed.
+        assert!(
+            outcome.dry_run_preview.as_deref().is_some_and(
+                |p| p.contains("would remove worktree") && p.contains("would clear binding")
+            ),
+            "dry-run must preview both effects: {:?}",
+            outcome.dry_run_preview
+        );
+        // The actual on-disk state is untouched.
+        assert!(
+            l.path.exists(),
+            "worktree dir MUST survive a dry-run release"
+        );
+        assert!(
+            crate::binding::read(&home, "agent-dry").is_some(),
+            "binding.json MUST survive a dry-run release"
+        );
 
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&repo).ok();
