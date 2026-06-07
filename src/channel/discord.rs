@@ -253,12 +253,35 @@ pub(crate) fn map_ready_to_connected(
 }
 
 /// Map a twilight `Message` (from MESSAGE_CREATE dispatch) to
-/// `ChannelEvent::MessageIn`.
+/// `ChannelEvent::MessageIn`, gated on the operator `user_allowlist`.
+///
+/// #bughunt-r3 #3: returns `None` (message dropped) when the author is not
+/// authorised — the gate is baked into the mapper, NOT left to the (still
+/// scaffold) dispatch loop, so no future wiring can emit an un-gated MessageIn.
+/// Mirrors the telegram inbound allowlist gate (`telegram/inbound.rs`).
+/// Fail-closed: `None` / empty / not-listed allowlist → dropped. Discord author
+/// ids are u64 snowflakes; the allowlist is `i64` (matches `ChannelConfig`), so
+/// an id that doesn't fit `i64` also fails closed.
 pub(crate) fn map_message_create_to_message_in(
     msg: &twilight_model::channel::Message,
-) -> ChannelEvent {
+    allowlist: &Option<Vec<i64>>,
+) -> Option<ChannelEvent> {
     use crate::channel::event::{MsgPayload, User};
-    ChannelEvent::MessageIn {
+
+    let author_id = msg.author.id.get();
+    let allowed = i64::try_from(author_id)
+        .ok()
+        .is_some_and(|id| crate::channel::auth::is_authorized_recipient(allowlist, id));
+    if !allowed {
+        tracing::warn!(
+            author = %msg.author.name,
+            user_id = author_id,
+            "discord message rejected by user_allowlist"
+        );
+        return None;
+    }
+
+    Some(ChannelEvent::MessageIn {
         binding: BindingRef::new(
             "discord",
             Some(format!("DC#{}", msg.channel_id)),
@@ -276,7 +299,7 @@ pub(crate) fn map_message_create_to_message_in(
         ts: chrono::DateTime::parse_from_rfc3339(&msg.timestamp.iso_8601().to_string())
             .map(|dt| dt.with_timezone(&chrono::Utc))
             .unwrap_or_else(|_| chrono::Utc::now()),
-    }
+    })
 }
 
 /// Map a twilight `Message` (from REST response) to `MsgRef`.
@@ -923,7 +946,10 @@ mod tests {
         let msg: twilight_model::channel::Message =
             serde_json::from_value(d.clone()).expect("Message");
 
-        let event = super::map_message_create_to_message_in(&msg);
+        // #bughunt-r3 #3: author on the allowlist → emitted.
+        let allowlist = Some(vec![82198898841029460_i64]);
+        let event = super::map_message_create_to_message_in(&msg, &allowlist)
+            .expect("allowlisted author must emit MessageIn");
 
         match event {
             ChannelEvent::MessageIn {
@@ -941,6 +967,34 @@ mod tests {
             }
             other => panic!("expected MessageIn, got: {other:?}"),
         }
+    }
+
+    /// #bughunt-r3 #3: Discord inbound must be allowlist-gated like telegram.
+    /// An author NOT on the allowlist (and the fail-closed `None` / empty cases)
+    /// must be dropped — `map_message_create_to_message_in` returns `None`.
+    #[test]
+    fn discord_message_create_rejected_when_author_not_allowlisted() {
+        let fixture = include_str!("../../tests/fixtures/discord-gateway-message-create.json");
+        let frame: serde_json::Value = serde_json::from_str(fixture).expect("fixture must parse");
+        let d = frame.get("d").expect("d field");
+        let msg: twilight_model::channel::Message =
+            serde_json::from_value(d.clone()).expect("Message");
+
+        // Author 82198898841029460 is NOT in this list → dropped.
+        assert!(
+            super::map_message_create_to_message_in(&msg, &Some(vec![999_i64])).is_none(),
+            "author absent from allowlist must be dropped"
+        );
+        // Fail-closed: unconfigured allowlist (None) → dropped.
+        assert!(
+            super::map_message_create_to_message_in(&msg, &None).is_none(),
+            "None allowlist must fail-closed (drop)"
+        );
+        // Fail-closed: empty allowlist → dropped.
+        assert!(
+            super::map_message_create_to_message_in(&msg, &Some(vec![])).is_none(),
+            "empty allowlist must reject all"
+        );
     }
 
     /// §3.5.10 wire-format fixture: outbound POST /channels/{id}/messages
