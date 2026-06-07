@@ -49,9 +49,6 @@ pub struct BehavioralConfig {
     pub silence_thinking_ms: u64,
     /// Silence duration before inferring "idle" (ms).
     pub silence_idle_ms: u64,
-    /// Whether this backend supports cursor position query (DSR CPR).
-    #[allow(dead_code)] // Phase 2 Sprint 28+
-    pub supports_cursor_query: bool,
 }
 
 impl Default for BehavioralConfig {
@@ -59,7 +56,6 @@ impl Default for BehavioralConfig {
         Self {
             silence_thinking_ms: 3000,
             silence_idle_ms: 8000,
-            supports_cursor_query: false,
         }
     }
 }
@@ -91,7 +87,6 @@ pub(crate) fn config_for_legacy(backend: &Backend) -> BehavioralConfig {
         Backend::Gemini => BehavioralConfig {
             silence_thinking_ms: 3000,
             silence_idle_ms: 8000,
-            supports_cursor_query: false,
         },
         _ => BehavioralConfig::default(),
     }
@@ -107,25 +102,6 @@ pub fn infer_from_silence(config: &BehavioralConfig, silence: Duration) -> Behav
     } else {
         BehavioralSignal::None
     }
-}
-
-/// Get the foreground process group ID for a PTY fd.
-/// Delegates to `backend_harness::verify_tcgetpgrp` (promoted, not rebuilt).
-#[allow(dead_code)] // Phase 2 Sprint 28+
-#[cfg(unix)]
-pub fn fg_pgid(_pty_fd: i32) -> Option<u32> {
-    // Phase 2: wire to actual PTY fd. For now, use verify_tcgetpgrp
-    // which probes stdin — sufficient for shadow-mode telemetry.
-    crate::backend_harness::verify_tcgetpgrp()
-        .ok()
-        .map(|pgid| pgid as u32)
-}
-
-#[allow(dead_code)] // Phase 2 Sprint 28+
-#[cfg(not(unix))]
-pub fn fg_pgid(_pty_fd: i32) -> Option<u32> {
-    // Windows: ConsoleProcessList stub — Sprint 28+ Phase 2
-    Option::None
 }
 
 /// Shadow-mode telemetry: log behavioral signal alongside regex state.
@@ -657,11 +633,6 @@ mod tests {
     }
 
     #[test]
-    fn kiro_supports_cursor_query() {
-        assert!(config_for(&Backend::KiroCli).supports_cursor_query);
-    }
-
-    #[test]
     fn shell_uses_defaults() {
         let config = config_for(&Backend::Shell);
         let default = BehavioralConfig::default();
@@ -672,7 +643,6 @@ mod tests {
     fn codex_uses_default_thresholds() {
         let config = config_for(&Backend::Codex);
         assert_eq!(config.silence_thinking_ms, 3000);
-        assert!(!config.supports_cursor_query); // bubbletea TUI
     }
 
     #[test]
@@ -685,14 +655,6 @@ mod tests {
     fn opencode_uses_default_thresholds() {
         let config = config_for(&Backend::OpenCode);
         assert_eq!(config.silence_idle_ms, 8000);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn fg_pgid_on_stdin_returns_some() {
-        // stdin (fd 0) should have a valid foreground pgid in a terminal
-        // This may return None in CI (no controlling terminal)
-        let _ = fg_pgid(0); // Just verify it doesn't panic
     }
 
     #[test]

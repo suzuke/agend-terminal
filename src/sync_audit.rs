@@ -317,18 +317,27 @@ pub struct HolderInfo {
 
 static REGISTRY_HOLDER: parking_lot::Mutex<Option<HolderInfo>> = parking_lot::Mutex::new(None);
 
-/// Cached env-var check — parsed once on first call into a `OnceLock<bool>`.
-/// Operator must restart the daemon to change the gate; live toggling is
-/// explicitly not supported (cost: per-call atomic load only after init).
-pub fn thread_dump_enabled() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
+/// Cached parse of `AGEND_DAEMON_THREAD_DUMP_SECS` → interval seconds
+/// (`0` = disabled). Parsed once on first call into a `OnceLock<u64>`; operator
+/// must restart the daemon to change it (live toggling is not supported).
+///
+/// #t-23: single source for BOTH the registry-holder tracking gate
+/// ([`thread_dump_enabled`]) and `ThreadDumpHandler`'s emit interval — these
+/// previously parsed the env var independently.
+pub fn thread_dump_interval_secs() -> u64 {
+    static CACHE: OnceLock<u64> = OnceLock::new();
     *CACHE.get_or_init(|| {
         std::env::var("AGEND_DAEMON_THREAD_DUMP_SECS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
-            .map(|n| n > 0)
-            .unwrap_or(false)
+            .unwrap_or(0)
     })
+}
+
+/// Whether thread-dump observability is enabled — derived from
+/// [`thread_dump_interval_secs`] (`> 0`).
+pub fn thread_dump_enabled() -> bool {
+    thread_dump_interval_secs() > 0
 }
 
 /// Update `REGISTRY_HOLDER` with the current thread's identity + site
