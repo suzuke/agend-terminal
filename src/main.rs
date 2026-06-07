@@ -31,6 +31,7 @@ mod decisions;
 mod deployments;
 mod dispatch_tracking;
 mod display_time;
+mod env_util;
 mod error;
 mod event_log;
 mod fleet;

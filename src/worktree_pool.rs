@@ -575,11 +575,7 @@ const GC_GRACE_HOURS: i64 = 24;
 /// never-released lease whose agent shows NO liveness AND whose `leased_at` is
 /// older than this is force-reclaimed. Configurable (`AGEND_WORKTREE_FORCE_RECLAIM_DAYS`).
 fn force_reclaim_age_days() -> i64 {
-    std::env::var("AGEND_WORKTREE_FORCE_RECLAIM_DAYS")
-        .ok()
-        .and_then(|v| v.parse::<i64>().ok())
-        .filter(|d| *d > 0)
-        .unwrap_or(7)
+    crate::env_util::env_parse_min::<i64>("AGEND_WORKTREE_FORCE_RECLAIM_DAYS", 7, 1)
 }
 
 /// reviewer-2 #5: force-reclaim post-boot grace (seconds). After a daemon restart

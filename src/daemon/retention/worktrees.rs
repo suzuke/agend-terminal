@@ -46,10 +46,7 @@ fn trash_root(home: &Path) -> PathBuf {
 }
 
 fn trash_retention_days() -> u64 {
-    std::env::var("AGEND_WORKTREE_GC_TRASH_DAYS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(7)
+    crate::env_util::env_parse::<u64>("AGEND_WORKTREE_GC_TRASH_DAYS", 7)
 }
 
 fn archive_ts() -> String {

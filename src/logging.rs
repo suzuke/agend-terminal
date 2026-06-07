@@ -59,11 +59,7 @@ pub const MIGRATION_SUFFIX_PREFIX: &str = "migration.";
 /// rotated files (orthogonal to the `AGEND_LOG_MAX_BYTES` hard cap
 /// enforced by the per-tick cleanup).
 fn retain_days_from_env() -> usize {
-    std::env::var("AGEND_LOG_RETAIN_DAYS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT_RETAIN_DAYS)
+    crate::env_util::env_parse_min::<usize>("AGEND_LOG_RETAIN_DAYS", DEFAULT_RETAIN_DAYS, 1)
 }
 
 /// Stderr-tracing init for CLI commands (`inject`, `list`, `kill`,

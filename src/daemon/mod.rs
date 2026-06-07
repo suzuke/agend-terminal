@@ -222,10 +222,7 @@ fn confirm_shutdown_or_abort_respawn(shutdown: &AtomicBool) -> bool {
 /// it is intentionally absent from the operator-facing tuning docs.
 fn self_respawn_settle() -> std::time::Duration {
     // Test-only override (see doc above); unset/garbage → the 1s prod default.
-    let secs = std::env::var("AGEND_SELF_RESPAWN_SETTLE_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(1);
+    let secs = crate::env_util::env_parse::<u64>("AGEND_SELF_RESPAWN_SETTLE_SECS", 1);
     std::time::Duration::from_secs(secs)
 }
 
@@ -1444,10 +1441,7 @@ fn replay_missed_at_startup(home: &Path, registry: &AgentRegistry) {
 /// reproducible startup-race window). Operators never set it.
 fn spawn_stagger() -> std::time::Duration {
     // test-only seam (see fn doc): prod always falls through to the 500ms default.
-    let ms: u64 = std::env::var("AGEND_SPAWN_STAGGER_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(500);
+    let ms = crate::env_util::env_parse::<u64>("AGEND_SPAWN_STAGGER_MS", 500);
     std::time::Duration::from_millis(ms)
 }
 

@@ -44,10 +44,7 @@ pub(crate) struct ThreadDumpHandler {
 
 impl ThreadDumpHandler {
     pub(crate) fn new() -> Self {
-        let interval = std::env::var("AGEND_DAEMON_THREAD_DUMP_SECS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
+        let interval = crate::env_util::env_parse::<u64>("AGEND_DAEMON_THREAD_DUMP_SECS", 0);
         Self {
             interval_secs: interval,
             last_dump_at: AtomicU64::new(0),
