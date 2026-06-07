@@ -539,7 +539,14 @@ pub fn describe_message(home: &Path, msg_id: &str, instance: &str) -> MessageSta
         if now.signed_duration_since(ts) > chrono::Duration::days(30) {
             return MessageStatus::UnreadExpired;
         }
-        return MessageStatus::NotFound;
+        // #bughunt-r2 #3: a live, not-yet-read message. Previously returned
+        // NotFound (indistinguishable from "no such id") — breaking delivery
+        // audit of an un-drained message. Report it as Unread with its
+        // delivery_mode + correlation_id for correlation tracking.
+        return MessageStatus::Unread {
+            delivery_mode: msg.delivery_mode.clone(),
+            correlation_id: msg.correlation_id.clone(),
+        };
     }
     MessageStatus::NotFound
 }

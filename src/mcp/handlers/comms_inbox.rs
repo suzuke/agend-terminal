@@ -25,6 +25,21 @@ pub fn handle_describe_message(home: &Path, args: &Value, instance_name: &str) -
             }
             resp
         }
+        crate::inbox::MessageStatus::Unread {
+            delivery_mode,
+            correlation_id,
+        } => {
+            // #bughunt-r2 #3: a live, un-drained message — distinct from
+            // not_found so delivery audit sees it was delivered but not yet read.
+            let mut resp = json!({"status": "unread"});
+            if let Some(mode) = delivery_mode {
+                resp["delivery_mode"] = json!(mode);
+            }
+            if let Some(cid) = correlation_id {
+                resp["correlation_id"] = json!(cid);
+            }
+            resp
+        }
         crate::inbox::MessageStatus::UnreadExpired => {
             json!({"status": "unread_expired"})
         }
@@ -42,4 +57,54 @@ pub fn handle_describe_thread(home: &Path, args: &Value) -> Value {
     let instance = args["instance"].as_str();
     let msgs = crate::inbox::get_thread(home, thread_id, instance);
     json!({"thread_id": thread_id, "messages": msgs, "count": msgs.len()})
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// #bughunt-r2 #3: querying a LIVE, un-drained message by id must report
+    /// `status: "unread"` (with its delivery_mode + correlation_id) — NOT
+    /// `not_found`, which previously broke delivery audit of undelivered work.
+    #[test]
+    fn describe_live_unread_message_returns_status_unread() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-bughunt-r2-unread-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let inbox_dir = home.join("inbox");
+        std::fs::create_dir_all(&inbox_dir).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let msg = format!(
+            r#"{{"schema_version":1,"id":"m-live","from":"lead","text":"hi","kind":"task","timestamp":"{now}","delivery_mode":"pty","correlation_id":"t-abc"}}"#
+        );
+        std::fs::write(inbox_dir.join("agent1.jsonl"), format!("{msg}\n")).unwrap();
+
+        let resp = handle_describe_message(
+            &home,
+            &json!({"message_id": "m-live", "instance": "agent1"}),
+            "caller",
+        );
+        assert_eq!(
+            resp["status"], "unread",
+            "live unread must report status=unread, got {resp}"
+        );
+        assert_eq!(resp["delivery_mode"], "pty");
+        assert_eq!(resp["correlation_id"], "t-abc");
+
+        // A genuinely-absent id stays distinct.
+        let nf = handle_describe_message(
+            &home,
+            &json!({"message_id": "m-nope", "instance": "agent1"}),
+            "caller",
+        );
+        assert_eq!(nf["status"], "not_found");
+
+        std::fs::remove_dir_all(&home).ok();
+    }
 }

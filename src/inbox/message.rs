@@ -197,6 +197,13 @@ impl InboxMessage {
 pub enum MessageStatus {
     /// Message was read at the given timestamp.
     ReadAt(String, Option<String>), // (read_at, delivery_mode)
+    /// #bughunt-r2 #3: message exists, is NOT yet read, and is still live
+    /// (within the 30d retention window). The previous code returned
+    /// `NotFound` for this — breaking delivery audit of an un-drained message.
+    Unread {
+        delivery_mode: Option<String>,
+        correlation_id: Option<String>,
+    },
     /// Message exists but has not been read and has expired (>30d).
     UnreadExpired,
     /// Message not found.
