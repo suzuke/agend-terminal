@@ -1374,7 +1374,11 @@ fn pty_read_loop(
     } = ctx;
     let mut buf = [0u8; 8192];
     let mut dismiss_cooldown_until: Option<std::time::Instant> = None;
-    let debug_reads = std::env::var("AGEND_DEBUG_PTY_READ").is_ok();
+    // #t-23: debug-only seam — verbose per-read PTY logging (read counts / byte
+    // totals). Off by default; enable with `AGEND_DEBUG_PTY_READ=1`. Tightened
+    // from presence-based (`is_ok()`: any value, even `=0`, enabled it) to the
+    // literal `"1"` so the value is meaningful.
+    let debug_reads = std::env::var("AGEND_DEBUG_PTY_READ").as_deref() == Ok("1");
     let mut read_count: u64 = 0;
     let mut total_bytes: u64 = 0;
     // #1492-class: count subscriber chunks dropped because a consumer's bounded

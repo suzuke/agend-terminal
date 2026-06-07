@@ -898,22 +898,21 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
     if RESTART_PENDING.load(Ordering::Acquire) {
         let flag = home.join("restart-requested");
         let _ = std::fs::remove_file(&flag);
-        if crate::daemon::restart::self_respawn_enabled() {
-            // #1814: the restart handler already spawned + Phase-1-confirmed a
-            // successor. It is blocked on our flock and promotes the moment we
-            // exit, so exit(0) (not 42) — no external supervisor is required.
-            //
-            // KNOWN/INTENDED Stage-1 race: if an external supervisor (launchd
-            // `KeepAlive=true`, systemd `Restart`, the wrapper) is ALSO active,
-            // our exit triggers BOTH our successor AND an external respawn.
-            // This self-corrects via the flock — whichever process acquires
-            // `.daemon.lock` first becomes the daemon; the loser hits the
-            // singleton attach-reject guard in `bootstrap::prepare` and exits.
-            // Not a bug; flagged here + in the PR so reviewers don't file it as
-            // one. (Stage 2 downgrades `is_restart_supervised` to advisory.)
-            tracing::info!("#1814 self-respawn: successor confirmed healthy — exiting 0");
-            std::process::exit(0);
-        }
+        // #t-23: the self-respawn `exit(0)` that used to live here was
+        // unreachable. The only way out of `'serve` to this post-loop point is
+        // `break 'serve` above, taken when the loop's self-respawn gate
+        // (`RESTART_PENDING && self_respawn_enabled()`) is FALSE.
+        // `self_respawn_enabled()` is a process-constant env read
+        // (`AGEND_RESTART_HANDOFF=="1"`), so reaching here with RESTART_PENDING
+        // still set implies the flag is OFF — under flag-on the healthy exit(0)
+        // already happened inside `'serve` (after `shutdown_sequence`). Keep the
+        // invariant as a debug_assert and take the operator-restart exit, where
+        // an external supervisor (exit-code-42 contract) respawns us.
+        debug_assert!(
+            !crate::daemon::restart::self_respawn_enabled(),
+            "#1814: post-'serve RESTART_PENDING under self-respawn flag-on — the \
+             flag-on exit must occur inside 'serve, never here"
+        );
         tracing::info!("operator-initiated restart: exiting with code 42");
         std::process::exit(42);
     }

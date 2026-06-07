@@ -27,8 +27,9 @@
 //! (binding writes, agent.rs internal sites) require manual grep.
 //!
 //! Gated by `AGEND_DAEMON_THREAD_DUMP_SECS=N` (N >= 1 enables; default
-//! disabled). The env var is cached via `OnceLock<bool>` in
-//! `sync_audit::thread_dump_enabled()` — operator must restart the
+//! disabled). The env var is parsed once via the cached
+//! `sync_audit::thread_dump_interval_secs()` accessor (the bool gate
+//! `thread_dump_enabled()` derives from it) — operator must restart the
 //! daemon to toggle (no live-update support).
 
 use super::{PerTickHandler, TickContext};
@@ -44,9 +45,11 @@ pub(crate) struct ThreadDumpHandler {
 
 impl ThreadDumpHandler {
     pub(crate) fn new() -> Self {
-        let interval = crate::env_util::env_parse::<u64>("AGEND_DAEMON_THREAD_DUMP_SECS", 0);
+        // #t-23: single cached accessor shared with `sync_audit::thread_dump_enabled`.
+        // (#techdebt-#10 env_util did NOT touch this site — superseded by t-23's
+        // cached accessor, which is the better consolidation; kept t-23's.)
         Self {
-            interval_secs: interval,
+            interval_secs: crate::sync_audit::thread_dump_interval_secs(),
             last_dump_at: AtomicU64::new(0),
         }
     }

@@ -54,33 +54,14 @@ pub(super) fn telegram_reply_send_inner(
     if let Some(err) = tests::take_forced_send_error() {
         return Err(err);
     }
-    // If already inside an async runtime, block_on would panic. Spawn
-    // fire-and-forget instead and return a sentinel msg_id. Callers from
-    // the emit path log-and-discard errors, so this is safe.
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        let token = ch.token.clone();
-        let group_id = ch.group_id;
-        let text = text.to_string();
-        let instance_name = instance_name.to_string();
-        handle.spawn(async move {
-            let bot = teloxide::Bot::new(&token);
-            let chat_id = teloxide::types::ChatId(group_id);
-            let res = match topic_id {
-                Some(1) | None => bot.send_message(chat_id, &text).await,
-                Some(tid) => {
-                    bot.send_message(chat_id, &text)
-                        .message_thread_id(teloxide::types::ThreadId(teloxide::types::MessageId(
-                            tid,
-                        )))
-                        .await
-                }
-            };
-            if let Err(e) = res {
-                tracing::warn!(%e, %instance_name, "reply spawn failed");
-            }
-        });
-        return Ok(0);
-    }
+    // #bughunt-r3 #2: AWAIT the send and return its real result. The previous
+    // in-runtime branch spawned the send fire-and-forget and returned `Ok(0)` —
+    // a fake success (msg-id 0) that also swallowed the send error inside the
+    // spawned task, so a stale-topic / supergroup-migration failure NEVER
+    // reached the healing path in `try_telegram_reply_from`. `block_on_value` is
+    // already nested-runtime-safe (it offloads to a scoped thread when a runtime
+    // is current — see `shared_async::block_on_value`), so a single awaited path
+    // works both inside and outside a runtime and surfaces failures to the caller.
     block_on_value(async {
         let bot = teloxide::Bot::new(&ch.token);
         let chat_id = teloxide::types::ChatId(ch.group_id);
