@@ -353,10 +353,11 @@ impl StatePatterns {
     /// genuinely-stuck error has NO in-flight working marker below it → `None`.
     ///
     /// Returns the winning `(state, marker_text)`. The matched marker substring is
-    /// surfaced for the `#1808-flaw2-probe` instrumentation so a caller can log
-    /// *which* on-screen marker overrode a ServerRateLimit (to check empirically
-    /// whether a static bottom-bar chrome — e.g. Agy/Kiro's bare `esc to cancel` —
-    /// is masking a stuck throttle). The state-selection logic is unchanged (same
+    /// surfaced for the `#1809-srl-swallow-probe` instrumentation (formerly the
+    /// Agy/Kiro-scoped `#1808-flaw2-probe`) so a caller can log *which* on-screen
+    /// marker overrode a ServerRateLimit (to check empirically whether a static
+    /// bottom-bar chrome — e.g. a bare `esc to cancel` — is masking a stuck
+    /// throttle). The state-selection logic is unchanged (same
     /// filter + lowest-marker-below-error pick), so detection behavior is identical.
     pub(crate) fn working_state_below<'a>(
         &self,

@@ -1001,46 +1001,79 @@ impl StateTracker {
                                 detected
                             };
                             let working_below = patterns.working_state_below(screen_text, matched);
-                            // #1808-flaw2-probe (instrumentation-only, NO behavior
-                            // change): cheerc claims a static bottom status bar (Agy/
-                            // Kiro Thinking = the bare `esc to cancel` token) can sit
-                            // BELOW the error → `working_state_below` overrides a
-                            // ServerRateLimit → masks a stuck throttle. Record it
-                            // empirically: when such an override actually fires on
-                            // Agy/Kiro, log the winning marker + productive silence. NO
-                            // recent productive output ⇒ the override may be masking a
-                            // genuinely-stuck agent (the suspicious case cheerc
-                            // describes) ⇒ WARN; recent output ⇒ INFO (genuine
-                            // recovery). Scoped to Agy/Kiro + SRL-override only (low
-                            // noise); does NOT alter `landed`.
-                            if let Some((_, marker)) = working_below {
-                                if matches!(detected, AgentState::ServerRateLimit)
-                                    && (self.backend_name == Backend::Agy.name()
-                                        || self.backend_name == Backend::KiroCli.name())
-                                {
-                                    let productive_silent_secs =
-                                        self.productive_silence().as_secs();
-                                    if self.recovered_within(SERVER_RATE_LIMIT_RECOVERY_SILENCE) {
+                            // #1809-srl-swallow-probe (instrumentation-only, NO behavior
+                            // change): when a ServerRateLimit is SWALLOWED (landed != SRL)
+                            // it never latches → no auto-retry → the live stuck-agent bug.
+                            // TWO gates can swallow it; probe BOTH, for ALL backends —
+                            // the old #1808-flaw2-probe was scoped to Agy/Kiro and was
+                            // therefore BLIND to the live claude SRL incident. Record the
+                            // raw `recovered_within` bool + `productive_silent_secs` as
+                            // INDEPENDENT fields (not just the pre-judged WARN/INFO level —
+                            // the level is derived from `recovered_within`, itself one of
+                            // the suspects). `dist_from_bottom` locates the matched error
+                            // line. Does NOT alter `landed`.
+                            if matches!(detected, AgentState::ServerRateLimit) {
+                                let recovered =
+                                    self.recovered_within(SERVER_RATE_LIMIT_RECOVERY_SILENCE);
+                                let productive_silent_secs = self.productive_silence().as_secs();
+                                let dist_from_bottom = srl_match_signature(screen_text, matched).1;
+                                match &working_below {
+                                    // Path A: a working marker renders BELOW the error →
+                                    // `working_state_below` override lands that working
+                                    // state, swallowing the SRL (#1769 positional defeat).
+                                    Some((win_state, marker)) => {
+                                        if recovered {
+                                            tracing::info!(
+                                                target: "state_detection",
+                                                agent = %self.instance_name,
+                                                tag = "#1809-srl-swallow-probe",
+                                                path = "working_state_below",
+                                                backend = %self.backend_name,
+                                                working_marker = %marker,
+                                                landed_state = ?win_state,
+                                                recovered_within = recovered,
+                                                productive_silent_secs,
+                                                dist_from_bottom,
+                                                "ServerRateLimit swallowed by working_state_below override (Path A) with recent productive output — likely genuine recovery"
+                                            );
+                                        } else {
+                                            tracing::warn!(
+                                                target: "state_detection",
+                                                agent = %self.instance_name,
+                                                tag = "#1809-srl-swallow-probe",
+                                                path = "working_state_below",
+                                                backend = %self.backend_name,
+                                                working_marker = %marker,
+                                                landed_state = ?win_state,
+                                                recovered_within = recovered,
+                                                productive_silent_secs,
+                                                dist_from_bottom,
+                                                "ServerRateLimit swallowed by working_state_below override (Path A) with NO recent productive output — possible static-chrome mask of a stuck throttle"
+                                            );
+                                        }
+                                    }
+                                    // Path B: NO working marker below, but the
+                                    // `recovered_within`→Idle fallback swallows the SRL.
+                                    // Previously SILENT — the gap that hid the live claude
+                                    // bug. Only reachable when `recovered` is true (that IS
+                                    // the gate); log the raw silence so we can judge whether
+                                    // `recovered_within` is firing legitimately.
+                                    None if recovered => {
                                         tracing::info!(
                                             target: "state_detection",
                                             agent = %self.instance_name,
-                                            tag = "#1808-flaw2-probe",
+                                            tag = "#1809-srl-swallow-probe",
+                                            path = "recovered_within_idle",
                                             backend = %self.backend_name,
-                                            working_marker = %marker,
+                                            recovered_within = recovered,
                                             productive_silent_secs,
-                                            "working_state_below overrode ServerRateLimit (Agy/Kiro) with recent productive output — likely genuine recovery"
-                                        );
-                                    } else {
-                                        tracing::warn!(
-                                            target: "state_detection",
-                                            agent = %self.instance_name,
-                                            tag = "#1808-flaw2-probe",
-                                            backend = %self.backend_name,
-                                            working_marker = %marker,
-                                            productive_silent_secs,
-                                            "working_state_below overrode ServerRateLimit (Agy/Kiro) with NO recent productive output — possible static-chrome mask of a stuck throttle (cheerc Flaw 2)"
+                                            dist_from_bottom,
+                                            "ServerRateLimit swallowed by recovered_within→Idle fallback (Path B) — no working marker below"
                                         );
                                     }
+                                    // No working marker + NOT recovered → SRL latches
+                                    // normally (auto-retry fires); not a swallow, no probe.
+                                    None => {}
                                 }
                             }
                             working_below.map(|(s, _)| s).unwrap_or(fallback)
@@ -1275,15 +1308,31 @@ impl StateTracker {
         }
         self.last_anchor_suppress_hash = Some(suppress_hash);
         let span_fg: Vec<CellFg> = first_occurrence_span(screen_text, matched, fg);
+        // #1809-trivial: `instance_name` can be empty (tracker built before
+        // `set_instance_name`), which rendered a bare `agent=`. Show a placeholder
+        // so the log line is greppable by who-is-this.
+        let agent_label: &str = if self.instance_name.is_empty() {
+            "<unset>"
+        } else {
+            self.instance_name.as_str()
+        };
         tracing::warn!(
-            agent = %self.instance_name,
+            agent = %agent_label,
             backend = %self.backend_name,
             state = ?detected,
             matched = %matched,
             span_fg = ?span_fg,
             line_context = %line_context,
-            "#1450: HIGH_FP pattern matched but rendered fg not red — suppressing transition. \
-             If this was a real backend error, span_fg shows the actual colors (predicate may be too strict)."
+            // #1809-trivial: wording was stale. Post-#1790 the anchor gate has two
+            // regimes — a RED-SGR anchor (ContextFull / ModelUnsupported) and a
+            // content/error-line anchor (`in_error_line`, for RateLimit /
+            // ServerRateLimit). So a suppression here is NOT necessarily "not red";
+            // it's "the active anchor predicate did not hold".
+            "#1450: HIGH_FP pattern matched but the anchor gate did not hold \
+             (red-SGR anchor for ContextFull/ModelUnsupported, or content/error-line \
+             anchor for RateLimit/ServerRateLimit) — suppressing transition. If this \
+             was a real backend error, span_fg shows the actual colors (predicate may \
+             be too strict)."
         );
     }
 

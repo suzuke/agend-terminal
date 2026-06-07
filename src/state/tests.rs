@@ -2699,6 +2699,103 @@ fn server_rate_limit_stale_productive_past_window_still_latches_badge() {
     );
 }
 
+/// Capture ALL tracing events (any target, TRACE and above) emitted while `f`
+/// runs, returning the formatted log text. `tracing_test::traced_test`'s default
+/// filter is crate-path-scoped and DROPS the `#1809-srl-swallow-probe`'s custom
+/// `target: "state_detection"` (verified empirically), so the probe tests need
+/// an unfiltered subscriber installed for the closure's duration.
+fn capture_all_logs<F: FnOnce()>(f: F) -> String {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    #[derive(Clone)]
+    struct Buf(Arc<Mutex<Vec<u8>>>);
+    impl Write for Buf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("capture buf mutex")
+                .extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+        type Writer = Buf;
+        fn make_writer(&'a self) -> Buf {
+            self.clone()
+        }
+    }
+    let buf = Arc::new(Mutex::new(Vec::new()));
+    let sub = tracing_subscriber::fmt()
+        .with_writer(Buf(buf.clone()))
+        .with_max_level(tracing::Level::TRACE)
+        .with_ansi(false)
+        .without_time()
+        .finish();
+    tracing::subscriber::with_default(sub, f);
+    let bytes = buf.lock().expect("capture buf mutex").clone();
+    String::from_utf8(bytes).expect("capture buf is utf8")
+}
+
+/// #1809-srl-swallow-probe (Path B — the previously-SILENT gate, prime suspect
+/// for the live claude incident): a claude ServerRateLimit that is swallowed by
+/// the `recovered_within`→Idle fallback (NO working marker below the error) must
+/// now emit the probe naming `path = "recovered_within_idle"` together with the
+/// RAW `recovered_within` bool + `productive_silent_secs` — so an investigator
+/// can tell WHICH gate ate the SRL (and whether `recovered_within` fired
+/// legitimately) instead of guessing. Drives the FULL `feed_with_fg` ingress.
+#[test]
+fn srl_swallow_probe_names_recovered_within_idle_gate() {
+    let (mut vt, mut st) = claude_tracker();
+    // Recovered: productive output just now → `recovered_within` is true → the
+    // fallback lands Idle, swallowing the SRL (no working marker below it).
+    st.last_productive_output = Some(std::time::Instant::now());
+    let logs = capture_all_logs(|| {
+        drive_plain_line(&mut vt, &mut st, SRL_LINE);
+    });
+    assert_ne!(
+        st.get_state(),
+        AgentState::ServerRateLimit,
+        "precondition: recovered_within must swallow the SRL (Path B)"
+    );
+    assert!(
+        logs.contains("#1809-srl-swallow-probe")
+            && logs.contains("path=\"recovered_within_idle\"")
+            && logs.contains("recovered_within=true"),
+        "Path B (recovered_within→Idle, previously SILENT) must emit the probe \
+         naming the gate + the raw recovered_within bool. logs:\n{logs}"
+    );
+}
+
+/// #1809-srl-swallow-probe (Path A — now ALL backends, including claude; the old
+/// #1808-flaw2-probe was scoped to Agy/Kiro and blind to claude): a claude
+/// ServerRateLimit swallowed by a `working_state_below` override (a Thinking
+/// marker rendered BELOW the error) must emit the probe naming
+/// `path = "working_state_below"` + the winning marker. Drives `feed_with_fg`.
+#[test]
+fn srl_swallow_probe_names_working_state_below_gate_for_claude() {
+    let (mut vt, mut st) = claude_tracker();
+    // SRL error line with a claude working marker ("thought for Ns" → Thinking)
+    // rendered BELOW it → `working_state_below` overrides the SRL. No productive
+    // history → `recovered_within` false → WARN branch (possible stuck mask).
+    let screen = format!("\x1b[2J\x1b[H{SRL_LINE}\r\nthought for 12s\r\n");
+    let logs = capture_all_logs(|| {
+        drive(&mut vt, &mut st, screen.as_bytes());
+    });
+    assert_ne!(
+        st.get_state(),
+        AgentState::ServerRateLimit,
+        "precondition: working_state_below must override the SRL (Path A)"
+    );
+    assert!(
+        logs.contains("#1809-srl-swallow-probe") && logs.contains("path=\"working_state_below\""),
+        "Path A (working_state_below override) must emit the #1809-srl-swallow-probe \
+         for claude (was scoped to Agy/Kiro). logs:\n{logs}"
+    );
+}
+
 /// RateLimit: a claude 429-rejection error rendered PLAIN fires via content.
 #[test]
 fn rate_limit_plain_error_line_fires_via_content_anchor() {
