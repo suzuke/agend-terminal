@@ -82,7 +82,6 @@ fn agy_profile() -> BackendProfile {
         behavioral: BehavioralConfig {
             silence_thinking_ms: 3000,
             silence_idle_ms: 8000,
-            supports_cursor_query: false,
         },
         productivity: ProductivityConfig {
             markers: crate::behavioral::GEMINI_PRODUCTIVE_MARKERS,
@@ -141,7 +140,6 @@ fn kirocli_profile() -> BackendProfile {
         behavioral: BehavioralConfig {
             silence_thinking_ms: 2500,
             silence_idle_ms: 7000,
-            supports_cursor_query: true,
         },
         productivity: ProductivityConfig {
             markers: crate::behavioral::KIRO_PRODUCTIVE_MARKERS,
@@ -200,7 +198,6 @@ fn opencode_profile() -> BackendProfile {
         behavioral: BehavioralConfig {
             silence_thinking_ms: 3000,
             silence_idle_ms: 8000,
-            supports_cursor_query: false,
         },
         productivity: ProductivityConfig {
             markers: crate::behavioral::OPENCODE_PRODUCTIVE_MARKERS,
@@ -252,7 +249,6 @@ fn codex_profile() -> BackendProfile {
         behavioral: BehavioralConfig {
             silence_thinking_ms: 3000,
             silence_idle_ms: 8000,
-            supports_cursor_query: false,
         },
         productivity: ProductivityConfig {
             markers: crate::behavioral::CODEX_PRODUCTIVE_MARKERS,
@@ -322,7 +318,6 @@ fn claudecode_profile() -> BackendProfile {
         behavioral: BehavioralConfig {
             silence_thinking_ms: 2000,
             silence_idle_ms: 6000,
-            supports_cursor_query: true,
         },
         productivity: ProductivityConfig {
             markers: crate::behavioral::CLAUDE_PRODUCTIVE_MARKERS,

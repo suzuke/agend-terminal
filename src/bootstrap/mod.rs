@@ -92,14 +92,14 @@ pub struct OwnedFleet {
     pub cookie: crate::auth_cookie::Cookie,
     pub telegram: Option<Arc<dyn crate::channel::Channel>>,
     /// Flock guard — drop releases `.daemon.lock`. Kept last so the lock is
-    /// released only after every other resource has been dropped. `Option`
-    /// since #1814: the normal `prepare` path holds `Some(lock)`; the
-    /// successor-handoff path acquires the flock later (after Phase-1, in
-    /// `daemon::run_successor_handoff`) and never constructs an `OwnedFleet`,
-    /// so this stays `Some` for every real `OwnedFleet` today — the `Option`
-    /// only future-proofs a handoff `OwnedFleet` should one ever be built.
+    /// released only after every other resource has been dropped. Every
+    /// `OwnedFleet` is built by `prepare`, which always holds the lock; the
+    /// successor-handoff path acquires the flock later (in
+    /// `daemon::run_successor_handoff`) and never constructs an `OwnedFleet`.
+    /// #t-23: was `Option<DaemonLock>` (always `Some`, YAGNI) — collapsed to
+    /// the unconditional guard.
     #[allow(dead_code)] // RAII guard: drop releases daemon lock
-    pub lock: Option<DaemonLock>,
+    pub lock: DaemonLock,
 }
 
 /// Attached state: an existing daemon owns the run dir. We read its cookie so
@@ -210,7 +210,7 @@ pub fn prepare(home: &Path, fleet_path: &Path, opts: PrepareOptions) -> Result<B
         run_dir,
         cookie,
         telegram,
-        lock: Some(lock),
+        lock,
     })))
 }
 
