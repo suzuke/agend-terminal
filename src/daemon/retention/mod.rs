@@ -38,6 +38,13 @@ impl RetentionSupervisor {
         // (a real dispatch resolves in minutes, never survives 14 days), so it
         // is safe to enable by default — closing the `exceeded`/abandoned leak
         // that has no resolve event and can only be time-GC'd.
+        //
+        // #env-cleanup decouple: `AGEND_RETENTION_CUTOVER` is now the
+        // pending-dispatch kill-switch ONLY (opt-OUT). The decisions sweep used
+        // to share this var with OPPOSITE polarity (opt-IN), which made
+        // `pending-OFF + decisions-ON` unreachable; it now reads its own
+        // `AGEND_RETENTION_DECISIONS_CUTOVER` (see `decisions::sweep`).
+        // Pending-dispatch truth table: `=="0"` → OFF; unset / anything else → ON.
         let cutover = std::env::var("AGEND_RETENTION_CUTOVER").as_deref() != Ok("0");
         let dispatches_swept = pending_dispatches::sweep(home, cutover);
         let worktrees_swept = worktrees::sweep(home);

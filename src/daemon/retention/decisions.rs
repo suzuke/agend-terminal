@@ -77,10 +77,30 @@ pub(crate) fn archive_decision(home: &Path, id: &str) -> anyhow::Result<bool> {
     Ok(archived)
 }
 
-/// Sweep expired decisions. Gated on AGEND_RETENTION_CUTOVER=1.
+/// True when the decisions retention sweep is enabled.
+///
+/// #env-cleanup decouple: the decisions sweep now has its OWN opt-in flag,
+/// `AGEND_RETENTION_DECISIONS_CUTOVER=1`, independent of the pending-dispatch
+/// kill-switch `AGEND_RETENTION_CUTOVER` (read in `retention/mod.rs` with the
+/// OPPOSITE polarity — opt-OUT). Sharing one name made the `pending-OFF +
+/// decisions-ON` combination unreachable (reviewer-2 finding). Legacy fallback
+/// (deprecation window): the old shared `AGEND_RETENTION_CUTOVER=1` STILL
+/// enables the decisions sweep, so operators who already opted in aren't broken
+/// — prefer the new flag going forward.
+///
+/// Decisions-sweep truth table:
+///   `AGEND_RETENTION_DECISIONS_CUTOVER=1`        → ON
+///   else `AGEND_RETENTION_CUTOVER=1` (legacy)    → ON
+///   else                                         → OFF (default)
+fn decisions_cutover_enabled() -> bool {
+    std::env::var("AGEND_RETENTION_DECISIONS_CUTOVER").as_deref() == Ok("1")
+        || std::env::var("AGEND_RETENTION_CUTOVER").as_deref() == Ok("1")
+}
+
+/// Sweep expired decisions. Gated on [`decisions_cutover_enabled`].
 /// Returns number of decisions archived.
 pub(super) fn sweep(home: &Path) -> usize {
-    if std::env::var("AGEND_RETENTION_CUTOVER").as_deref() != Ok("1") {
+    if !decisions_cutover_enabled() {
         return 0;
     }
     let dir = crate::decisions::decisions_dir(home);
@@ -224,9 +244,9 @@ mod tests {
         write_decision(&home, "d-old", 100, &[]);
         write_decision(&home, "d-young", 5, &[]);
 
-        std::env::set_var("AGEND_RETENTION_CUTOVER", "1");
+        std::env::set_var("AGEND_RETENTION_DECISIONS_CUTOVER", "1");
         let archived = sweep(&home);
-        std::env::remove_var("AGEND_RETENTION_CUTOVER");
+        std::env::remove_var("AGEND_RETENTION_DECISIONS_CUTOVER");
 
         assert_eq!(archived, 1);
         let archive = archive_dir(&home);
@@ -253,9 +273,9 @@ mod tests {
         )
         .unwrap();
 
-        std::env::set_var("AGEND_RETENTION_CUTOVER", "1");
+        std::env::set_var("AGEND_RETENTION_DECISIONS_CUTOVER", "1");
         let archived = sweep(&home);
-        std::env::remove_var("AGEND_RETENTION_CUTOVER");
+        std::env::remove_var("AGEND_RETENTION_DECISIONS_CUTOVER");
 
         assert_eq!(archived, 1);
         // Protected decision still in place
@@ -295,9 +315,9 @@ mod tests {
         )
         .unwrap();
 
-        std::env::set_var("AGEND_RETENTION_CUTOVER", "1");
+        std::env::set_var("AGEND_RETENTION_DECISIONS_CUTOVER", "1");
         let archived = sweep(&home);
-        std::env::remove_var("AGEND_RETENTION_CUTOVER");
+        std::env::remove_var("AGEND_RETENTION_DECISIONS_CUTOVER");
 
         assert_eq!(
             archived, 0,
@@ -316,6 +336,52 @@ mod tests {
         // This test exists solely to verify that the pub(crate) upgrade
         // allows cross-module access. If it compiles, the contract holds.
         let _ = archive_decision(&home, "d-nonexistent");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #env-cleanup decouple: legacy fallback — the OLD shared
+    /// `AGEND_RETENTION_CUTOVER=1` must STILL enable the decisions sweep so
+    /// operators who already opted in via the old name aren't broken.
+    #[test]
+    #[serial(retention_cutover)]
+    fn legacy_retention_cutover_still_enables_decisions_sweep() {
+        let home = tmp_home("legacy-cutover");
+        write_decision(&home, "d-old", 100, &[]);
+
+        std::env::remove_var("AGEND_RETENTION_DECISIONS_CUTOVER");
+        std::env::set_var("AGEND_RETENTION_CUTOVER", "1");
+        let archived = sweep(&home);
+        std::env::remove_var("AGEND_RETENTION_CUTOVER");
+
+        assert_eq!(
+            archived, 1,
+            "legacy AGEND_RETENTION_CUTOVER=1 must still enable the decisions sweep"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #env-cleanup decouple: the formerly-unreachable combination
+    /// (reviewer-2 finding). Pending-dispatch kill-switch OFF
+    /// (`AGEND_RETENTION_CUTOVER=0`) while the decisions sweep is ON via its
+    /// own `AGEND_RETENTION_DECISIONS_CUTOVER=1` — the whole point of the
+    /// decouple. The pending `=="0"` must NOT suppress the decisions sweep.
+    #[test]
+    #[serial(retention_cutover)]
+    fn decisions_decoupled_from_pending_killswitch() {
+        let home = tmp_home("decoupled");
+        write_decision(&home, "d-old", 100, &[]);
+
+        std::env::set_var("AGEND_RETENTION_CUTOVER", "0"); // pending OFF
+        std::env::set_var("AGEND_RETENTION_DECISIONS_CUTOVER", "1"); // decisions ON
+        let archived = sweep(&home);
+        std::env::remove_var("AGEND_RETENTION_CUTOVER");
+        std::env::remove_var("AGEND_RETENTION_DECISIONS_CUTOVER");
+
+        assert_eq!(
+            archived, 1,
+            "decisions sweep must run independently of the pending-dispatch \
+             kill-switch (AGEND_RETENTION_CUTOVER=0 must not disable it)"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }

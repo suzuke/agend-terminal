@@ -7,6 +7,8 @@
 
 ### Changed
 
+- **retention sweep 解耦;移除 `AGEND_CTRLC_SENTINEL`(#1812 env-cleanup)** — decisions retention sweep 改讀自己的 opt-in 旗標 **`AGEND_RETENTION_DECISIONS_CUTOVER=1`**,與 pending-dispatch kill-switch `AGEND_RETENTION_CUTOVER` 分離(後者的另一消費者以相反極性讀取,導致「pending 關 + decisions 開」無法達成)。**遷移:** 舊的 `AGEND_RETENTION_CUTOVER=1` 暫時仍會啟用 decisions sweep(棄用緩衝期)—— 請改用新旗標。另外移除內部 Windows 除錯輔助 `AGEND_CTRLC_SENTINEL`(Ctrl+C 時寫 sentinel 檔):無 operator 用途、無自動化消費者。`AGEND_POINTER_ONLY_INJECT` 經檢視後**保留**(是 inbox 注入的實際功能旗標)。
+
 - **重啟監督偵測:改用正向 `AGEND_SUPERVISED` sentinel,移除 `XPC_SERVICE_NAME`(#1812)** — `is_restart_supervised()`(`restart_daemon` 的 #851 fail-closed 防呆)不再信任 `XPC_SERVICE_NAME`。macOS 會把該變數注入 GUI 登入工作階段中的*每一個* process(包含在 Terminal.app 裡裸跑 `agend-terminal start`),導致 macOS 上此防呆永遠回 true,`restart_daemon` 可能 `exit(42)` 後沒有任何程序重啟 daemon。現在改以 `agend-terminal service install` 寫入 launchd plist(`EnvironmentVariables`)與 systemd unit(`Environment=`)的 `AGEND_SUPERVISED=1` 明確 sentinel 判斷;`AGEND_WRAPPED` 與 systemd 的 `INVOCATION_ID` 仍接受。**macOS/Linux 升級遷移:升級後請重跑 `agend-terminal service install`,再重啟 daemon 一次** —— 舊版安裝的 service 設定檔早於此 sentinel,在重新產生前 `restart_daemon` 會 fail-closed 並回傳可操作的錯誤訊息(這是安全方向 —— 拒絕而非把 daemon 卡死)。Windows Task Scheduler 無法攜帶此 sentinel(task XML 沒有環境變數元素),維持裸啟動 fail-closed。
 
 ## [0.7.0] — 2026-05-28
