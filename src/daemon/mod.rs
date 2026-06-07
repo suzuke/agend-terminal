@@ -706,7 +706,13 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
     // handoff path (None on the normal path, where `prepare`'s `OwnedFleet`
     // already holds it).
     let (agents, _handoff_lock) = match source {
-        FleetSource::Resolved { agents, .. } => (agents, None::<crate::bootstrap::DaemonLock>),
+        FleetSource::Resolved { agents, .. } => {
+            // Normal boot: the flock is already held by `prepare`'s `OwnedFleet`,
+            // so the post-lock GC/migration runs here — the same early point as
+            // before the #1814 Stage-2 split (behavior unchanged).
+            init_daemon_services_post_lock(home)?;
+            (agents, None::<crate::bootstrap::DaemonLock>)
+        }
         FleetSource::HandoffDeferred { fleet_path, opts } => {
             write_control_ready(home);
             // §3.9 FIX2 test seam: pass Phase-1 (api stays up to answer STATUS
@@ -743,6 +749,11 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
             tracing::info!(
                 "#1814 successor-handoff: flock acquired — sole daemon, running deferred reconciles + resolve"
             );
+            // #t-27: NOW that the flock is held, run the shared-state GC/migration
+            // that `init_daemon_services` no longer does pre-flock — keeping them
+            // off the predecessor-overlap window. Ordered before the reconciles,
+            // matching the pre-split ordering.
+            init_daemon_services_post_lock(home)?;
             crate::bootstrap::boot_hygiene_sweeps(home);
             let (_config, agents, _telegram) =
                 crate::bootstrap::resolve_fleet_and_reconcile(home, &fleet_path, &opts)?;
@@ -943,43 +954,12 @@ fn init_daemon_services(
         ..crate::daemon_config::DaemonConfig::default()
     });
 
-    // #1814 FIX3 (reviewer-2, non-blocking) TODO(Stage 2): the three shared-
-    // state GC/migration steps below (skills::cleanup_stale_stages,
-    // dedup_state::cleanup_tmp_orphans, tasks::migrate_legacy_tasks_json_to_event_log)
-    // run inside `init_daemon_services`, which on the successor-handoff path
-    // executes PRE-flock (before the predecessor exits) — technically escaping
-    // the "minimal pre-lock" contract. Low risk for now (the first two are
-    // retention-gated; the third is idempotent), so left in place for Stage 1.
-    // Stage 2 should split `init_daemon_services` (as `prepare` was split into
-    // pre/post-lock) so these run only after the handoff successor holds the flock.
-    const SKILLS_STAGE_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
-    crate::bootstrap::time_step("skills::cleanup_stale_stages", || {
-        match crate::skills::cleanup_stale_stages(home, SKILLS_STAGE_RETENTION_SECS, &[]) {
-            Ok(report) => tracing::info!(?report, "skills-stage GC: daemon-init sweep complete"),
-            Err(e) => tracing::warn!(error = %e, "skills-stage GC: daemon-init sweep failed"),
-        }
-    });
-
-    const DEDUP_TMP_RETENTION_SECS: u64 = 24 * 60 * 60;
-    let dedup_report = crate::bootstrap::time_step("dedup_state::cleanup_tmp_orphans", || {
-        crate::daemon::dedup_state::cleanup_tmp_orphans(home, DEDUP_TMP_RETENTION_SECS)
-    });
-    tracing::info!(?dedup_report, "dedup-state GC: daemon-init sweep complete");
-
-    let legacy_migration =
-        crate::bootstrap::time_step("tasks::migrate_legacy_tasks_json_to_event_log", || {
-            crate::tasks::migrate_legacy_tasks_json_to_event_log(home)
-        });
-    match legacy_migration {
-        Ok(rep) => tracing::info!(
-            migrated = rep.migrated,
-            skipped = rep.skipped,
-            "task_events: legacy tasks.json bridge migration complete"
-        ),
-        Err(e) => {
-            return Err(anyhow::anyhow!("task_events: legacy migration failed: {e}"));
-        }
-    }
+    // #1814 Stage-2 (#t-27): the three shared-state GC/migration steps live in
+    // `init_daemon_services_post_lock`, NOT here. On the successor-handoff path
+    // `init_daemon_services` runs PRE-flock (before the predecessor exits), so
+    // running shared-state mutation here would escape the "minimal pre-lock"
+    // contract (d-3). The caller invokes `init_daemon_services_post_lock` only
+    // after the flock is held (normal boot: already held; handoff: post-acquire).
 
     let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
     crate::agent::set_pending_registry(Arc::clone(&registry));
@@ -1025,6 +1005,51 @@ fn init_daemon_services(
         crash_rx,
         shutdown,
     })
+}
+
+/// #1814 Stage-2 (#t-27): the shared-state GC + migration steps that MUST run
+/// only while this process holds the daemon flock. Split out of
+/// [`init_daemon_services`] because that runs PRE-flock on the successor-handoff
+/// path (before the predecessor exits); running shared-state mutation there
+/// overlaps the predecessor and escapes the d-3 "minimal pre-lock" contract.
+///
+/// Callers:
+/// - normal boot — invoked right after `init_daemon_services`, where the flock
+///   is already held by `prepare`'s `OwnedFleet` (behavior unchanged);
+/// - successor handoff — invoked only after `acquire_daemon_lock_blocking`.
+///
+/// The legacy-migration hard-error is preserved: a failed migration aborts boot
+/// (returns `Err`), exactly as before the split.
+fn init_daemon_services_post_lock(home: &Path) -> anyhow::Result<()> {
+    const SKILLS_STAGE_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
+    crate::bootstrap::time_step("skills::cleanup_stale_stages", || {
+        match crate::skills::cleanup_stale_stages(home, SKILLS_STAGE_RETENTION_SECS, &[]) {
+            Ok(report) => tracing::info!(?report, "skills-stage GC: daemon-init sweep complete"),
+            Err(e) => tracing::warn!(error = %e, "skills-stage GC: daemon-init sweep failed"),
+        }
+    });
+
+    const DEDUP_TMP_RETENTION_SECS: u64 = 24 * 60 * 60;
+    let dedup_report = crate::bootstrap::time_step("dedup_state::cleanup_tmp_orphans", || {
+        crate::daemon::dedup_state::cleanup_tmp_orphans(home, DEDUP_TMP_RETENTION_SECS)
+    });
+    tracing::info!(?dedup_report, "dedup-state GC: daemon-init sweep complete");
+
+    let legacy_migration =
+        crate::bootstrap::time_step("tasks::migrate_legacy_tasks_json_to_event_log", || {
+            crate::tasks::migrate_legacy_tasks_json_to_event_log(home)
+        });
+    match legacy_migration {
+        Ok(rep) => tracing::info!(
+            migrated = rep.migrated,
+            skipped = rep.skipped,
+            "task_events: legacy tasks.json bridge migration complete"
+        ),
+        Err(e) => {
+            return Err(anyhow::anyhow!("task_events: legacy migration failed: {e}"));
+        }
+    }
+    Ok(())
 }
 
 fn spawn_fleet_agents(home: &Path, agents: &[AgentDef], ctx: &DaemonContext) {
@@ -1867,6 +1892,72 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).ok();
         dir
+    }
+
+    /// #1814 Stage-2 (#t-27) source-scan invariant: the three shared-state
+    /// GC/migration steps must NOT live in the pre-flock `init_daemon_services`
+    /// (which runs before the predecessor exits on the handoff path), and the
+    /// handoff path must invoke `init_daemon_services_post_lock` only AFTER it
+    /// acquires the flock. Regression-proof: move any of the three back into
+    /// `init_daemon_services`, or call post_lock before the lock, and this fails.
+    #[test]
+    fn handoff_shared_state_init_runs_post_flock_not_pre_t27() {
+        let src = include_str!("mod.rs");
+        const NEEDLES: [&str; 3] = [
+            "migrate_legacy_tasks_json_to_event_log",
+            "cleanup_stale_stages",
+            "cleanup_tmp_orphans",
+        ];
+
+        // Helper: body of a fn from its signature up to the next top-level `fn `.
+        let body_of = |sig: &str| -> String {
+            let start = src.find(sig).unwrap_or_else(|| panic!("{sig} present"));
+            let rest = &src[start..];
+            let end = rest[1..].find("\nfn ").map(|i| i + 1).unwrap_or(rest.len());
+            rest[..end].to_string()
+        };
+
+        // (1) pre-flock init does NOT run any shared-state mutation.
+        let pre = body_of("fn init_daemon_services(");
+        for n in NEEDLES {
+            assert!(
+                !pre.contains(n),
+                "#t-27: pre-flock init_daemon_services must NOT run `{n}` (escapes minimal pre-lock)"
+            );
+        }
+
+        // (2) post-lock init owns all three.
+        let post = body_of("fn init_daemon_services_post_lock(");
+        for n in NEEDLES {
+            assert!(
+                post.contains(n),
+                "#t-27: init_daemon_services_post_lock must run `{n}`"
+            );
+        }
+
+        // (3) on the handoff path, post_lock is invoked AFTER flock acquisition
+        //     (the last post_lock call site is the handoff one; the earlier one
+        //     is the normal-boot arm, which already holds the flock).
+        let acquire = src
+            .find("acquire_daemon_lock_blocking(")
+            .expect("handoff acquires the flock");
+        let handoff_post = src
+            .rfind("init_daemon_services_post_lock(home)")
+            .expect("handoff calls post_lock");
+        assert!(
+            handoff_post > acquire,
+            "#t-27: the handoff path must call init_daemon_services_post_lock AFTER \
+             acquire_daemon_lock_blocking, never pre-flock"
+        );
+    }
+
+    /// #t-27: `init_daemon_services_post_lock` runs end-to-end (all three steps)
+    /// on a clean home — the legacy migration is a no-op success (no tasks.json),
+    /// the GC steps are retention-gated. Exercises the real extracted fn.
+    #[test]
+    fn post_lock_init_ok_on_clean_home_t27() {
+        let home = tmp_home("t27-postlock-clean");
+        init_daemon_services_post_lock(&home).expect("post_lock init must succeed on a clean home");
     }
 
     #[test]
