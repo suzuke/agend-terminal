@@ -811,9 +811,14 @@ fn test_describe_message_status_three_states() {
     let expired_msg = format!(
         r#"{{"schema_version":1,"id":"m-expired","from":"b","text":"expired","kind":null,"timestamp":"{old_ts}"}}"#
     );
+    // State 3 (#bughunt-r2 #3): live unread (<30d), carrying delivery_mode +
+    // correlation_id — must report Unread, NOT NotFound.
+    let live_unread_msg = format!(
+        r#"{{"schema_version":1,"id":"m-live","from":"c","text":"live","kind":null,"timestamp":"{now}","delivery_mode":"pty","correlation_id":"t-xyz"}}"#
+    );
     fs::write(
         inbox_dir.join("agent1.jsonl"),
-        format!("{read_msg}\n{expired_msg}\n"),
+        format!("{read_msg}\n{expired_msg}\n{live_unread_msg}\n"),
     )
     .ok();
 
@@ -829,7 +834,17 @@ fn test_describe_message_status_three_states() {
         MessageStatus::UnreadExpired
     );
 
-    // NotFound
+    // #bughunt-r2 #3: a live un-drained message → Unread (was NotFound), with
+    // its delivery_mode + correlation_id preserved for delivery audit.
+    assert_eq!(
+        describe_message(&home, "m-live", "agent1"),
+        MessageStatus::Unread {
+            delivery_mode: Some("pty".to_string()),
+            correlation_id: Some("t-xyz".to_string()),
+        }
+    );
+
+    // NotFound (genuinely absent id stays distinct from Unread)
     assert_eq!(
         describe_message(&home, "m-nonexistent", "agent1"),
         MessageStatus::NotFound

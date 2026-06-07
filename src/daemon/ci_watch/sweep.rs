@@ -261,6 +261,25 @@ pub fn gc_stale_watches(home: &Path, sweep_origin: &str) -> usize {
         if path.extension().and_then(|s| s.to_str()) != Some("json") {
             continue;
         }
+        // #bughunt-r2 #4: hold the per-watch lock across read → decide → remove.
+        // The poll flush (`registry::flush_watch_state`) read-merge-atomic-writes
+        // the SAME file under THIS lock; without it, gc could read a stale
+        // snapshot, decide to remove, and delete the file *while* a concurrent
+        // flush re-writes (resurrects) it. Acquiring the lock first — and
+        // re-reading under it — serialises gc against the poller so a removed
+        // watch stays removed. `remove_watch` only `remove_file`s (it does not
+        // re-acquire the lock), so holding the guard across it is safe.
+        let lock_path = path.with_extension("lock");
+        let _watch_lock = match crate::store::acquire_file_lock(&lock_path) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!(path = %lock_path.display(), error = %e,
+                    "ci_watch gc: failed to acquire per-watch lock, skipping entry");
+                continue;
+            }
+        };
+        // Re-read UNDER the lock so the TTL decision is on fresh state (a flush
+        // may have landed between the dir scan and the lock acquisition).
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
         };
@@ -771,5 +790,78 @@ mod tests {
         assert!(!json.exists(), "watch .json removed");
         assert!(!lock.exists(), "sibling .lock removed too");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #bughunt-r2 #4: gc must hold the per-watch lock across read→decide→remove
+    /// so it can't delete a watch a concurrent poll flush is re-writing. Drive
+    /// the race deterministically: a holder takes the lock (as `flush_watch_state`
+    /// does), gc runs in another thread and must BLOCK — the expired watch stays
+    /// on disk for the whole window the lock is held; once released, gc removes it.
+    #[test]
+    fn gc_blocks_on_held_watch_lock_then_removes_bughunt_r2() {
+        let dir = tmp_dir("r2-gc-lock-race");
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).unwrap();
+        // An expired watch gc wants to remove.
+        let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let json = ci_dir.join("w.json");
+        std::fs::write(
+            &json,
+            serde_json::json!({"repo":"o/r","branch":"feat","expires_at": past}).to_string(),
+        )
+        .unwrap();
+        let lock_path = json.with_extension("lock");
+
+        // Poller holds the per-watch lock.
+        let held = crate::store::acquire_file_lock(&lock_path).expect("hold watch lock");
+
+        let dir2 = dir.clone();
+        let gc = std::thread::spawn(move || gc_stale_watches(&dir2, "race_test"));
+
+        // While the lock is held, gc cannot remove the watch (it blocks on the
+        // lock). The file must survive the whole hold window.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            json.exists(),
+            "#bughunt-r2 #4: gc must NOT remove a watch while its per-watch lock is held"
+        );
+
+        // Release → gc unblocks and removes the expired watch.
+        drop(held);
+        let removed = gc.join().expect("gc thread");
+        assert!(
+            !json.exists(),
+            "after the lock is released, gc removes the expired watch"
+        );
+        assert_eq!(removed, 1, "exactly the one expired watch removed");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #bughunt-r2 #4 source-scan: in `gc_stale_watches`, `acquire_file_lock`
+    /// must be reached BEFORE any `remove_watch(` call — i.e. the lock guards the
+    /// removal. Backstops a regression that moves/drops the lock acquisition.
+    #[test]
+    fn gc_acquires_lock_before_remove_watch_bughunt_r2() {
+        let src = include_str!("sweep.rs");
+        let start = src
+            .find("pub fn gc_stale_watches(")
+            .expect("gc_stale_watches present");
+        // Scope to the fn — stop at the `#[cfg(test)]` module so the scan can't
+        // reach this test's own `remove_watch(` / `acquire_file_lock` literals.
+        let after = &src[start..];
+        let cfg_test = ["#[cfg(", "test)]"].concat();
+        let body = &after[..after.find(&cfg_test).unwrap_or(after.len())];
+
+        let lock_at = body
+            .find("acquire_file_lock(")
+            .expect("gc must acquire the per-watch lock");
+        let remove_at = body
+            .find("remove_watch(")
+            .expect("gc still removes stale watches");
+        assert!(
+            lock_at < remove_at,
+            "#bughunt-r2 #4: gc_stale_watches must acquire the per-watch lock \
+             BEFORE removing a watch (lock-before-remove serialises against the poll flush)"
+        );
     }
 }
