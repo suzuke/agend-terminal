@@ -28,8 +28,9 @@
 //! Scans the watched-agent's last_active timestamp. When elapsed
 //! exceeds `dev_idle_threshold_secs() = 3600` (60 min), emits an
 //! inbox ping to `lead` so the orchestrator can re-dispatch /
-//! unblock. Default watched agent: `dev`. Tunable via
-//! `AGEND_IDLE_WATCHDOG_AGENT` env var.
+//! unblock. Default watched agent: `dev`. Tunable via fleet.yaml
+//! `watchdog.idle_watchdog_agent` (env `AGEND_IDLE_WATCHDOG_AGENT` is a
+//! deprecated fallback).
 //!
 //! ### #12 — cross-vantage 30min fleet-idle guard (P1)
 //! Scans the entire fleet's last_active timestamps. When EVERY
@@ -37,7 +38,8 @@
 //! (30 min) AND at least one agent has had recent activity (i.e.
 //! a sidecar exists), emits an inbox ping to `lead` (#1563; was
 //! `general`) so the orchestrator surfaces / re-dispatches the
-//! fleet stall. Overridable via `AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT`.
+//! fleet stall. Overridable via fleet.yaml `watchdog.fleet_recipient`
+//! (env `AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT` is a deprecated fallback).
 //! The
 //! "at least one tracked" guard distinguishes "fleet really
 //! stalled" from "fleet not yet started" / "all sidecars stale".
@@ -255,42 +257,6 @@ impl IdleWatchdogTracker {
     }
 }
 
-/// Watched agent for the dev-vantage (#10). Defaults to `dev`;
-/// tunable via env for tests + multi-agent fleets.
-fn watched_dev_agent() -> String {
-    std::env::var("AGEND_IDLE_WATCHDOG_AGENT")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "dev".to_string())
-}
-
-/// Recipient for dev-vantage idle alerts. Defaults to `lead`.
-fn dev_idle_recipient() -> String {
-    std::env::var("AGEND_IDLE_WATCHDOG_DEV_RECIPIENT")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "lead".to_string())
-}
-
-/// Recipient for fleet-vantage idle alerts. Defaults to `lead`.
-///
-/// #1563: the default was `general`, which spammed the general assistant with
-/// fleet-idle alerts overnight (it received them as the hardcoded recipient, not
-/// because it was itself forwarded). Fleet-idle is non-critical *coordination*
-/// signal ("the whole fleet is quiet — does work need dispatching?"), so the
-/// right recipient is the orchestrator `lead` — matching the sibling
-/// [`dev_idle_recipient`] default. Delivery to lead's inbox also *wakes* an idle
-/// lead so it can act. Operator-channel routing was deliberately NOT chosen:
-/// per #1339 the human operator must not be pinged for non-P0 signals.
-/// `AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT` still overrides (e.g. a mode-aware
-/// recipient under a future sleep mode).
-fn fleet_idle_recipient() -> String {
-    std::env::var("AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "lead".to_string())
-}
-
 /// Pure scan logic: detects + emits idle alerts at both vantages.
 /// Exposed for tests so they can invoke without 30-tick wait.
 pub(crate) fn scan_and_emit(
@@ -410,11 +376,13 @@ fn scan_dev_vantage(
     last_alerted: &mut HashMap<(&'static str, String), chrono::DateTime<chrono::Utc>>,
     seeding: bool,
 ) {
-    let env_agent = std::env::var("AGEND_IDLE_WATCHDOG_AGENT")
-        .ok()
-        .filter(|s| !s.trim().is_empty());
+    // #1812-followup: single-agent override now comes from fleet.yaml
+    // `watchdog.idle_watchdog_agent` (env `AGEND_IDLE_WATCHDOG_AGENT` is a
+    // deprecated fallback). `Some` → legacy single-agent mode; `None` → the
+    // modern per-instance iteration below.
+    let single_override = crate::fleet::watchdog::resolve_idle_watchdog_agent(home);
 
-    let agents: Vec<(String, i64)> = if let Some(single) = env_agent {
+    let agents: Vec<(String, i64)> = if let Some(single) = single_override {
         vec![(single, dev_idle_threshold_secs())]
     } else if let Ok(cfg) = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)) {
         // #1438/#1491(C): auto-exempt team orchestrators (leads) from idle
@@ -447,7 +415,9 @@ fn scan_dev_vantage(
             })
             .collect()
     } else {
-        vec![(watched_dev_agent(), dev_idle_threshold_secs())]
+        // fleet.yaml unreadable AND no single-agent override → last-resort
+        // single default. (The override layer above already consulted env.)
+        vec![("dev".to_string(), dev_idle_threshold_secs())]
     };
 
     for (agent, threshold) in &agents {
@@ -476,7 +446,7 @@ fn scan_dev_vantage(
         if !seeding {
             route_idle_alert(
                 home,
-                &dev_idle_recipient(),
+                &crate::fleet::watchdog::resolve_dev_idle_recipient(home),
                 "dev_idle_watchdog",
                 &format!(
                     "[dev_idle_watchdog] agent '{agent}' has been silent for \
@@ -678,7 +648,7 @@ fn scan_fleet_vantage(
     let agent_list: Vec<&str> = pairs.iter().map(|(n, _)| n.as_str()).collect();
     route_idle_alert(
         home,
-        &fleet_idle_recipient(),
+        &crate::fleet::watchdog::resolve_fleet_idle_recipient(home),
         "fleet_idle_watchdog",
         &format!(
             "[fleet_idle_watchdog] all tracked agents silent > {}s \
@@ -1239,39 +1209,51 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    // #1812-followup: env-override + fleet-config precedence for the idle
+    // watchdog recipients/agent now live in `fleet::watchdog` tests (the
+    // resolution logic moved there). The §3.9 real-entry test
+    // `fleet_dev_recipient_routes_idle_alert` below proves the fleet.yaml value
+    // reaches the live scan path.
+
+    /// §3.9 real-entry: a fleet.yaml `watchdog.dev_recipient` (+ single-agent
+    /// `idle_watchdog_agent`) must reach the live `scan_and_emit` → dev-vantage →
+    /// `route_idle_alert` path — the alert lands in the fleet-configured recipient,
+    /// NOT the built-in `lead` default. Proves the config is read at the real call
+    /// site, not just by the resolver in isolation.
     #[test]
-    fn watched_dev_agent_honors_env_override() {
+    fn fleet_dev_recipient_routes_idle_alert() {
         let _g = env_lock();
-        std::env::set_var("AGEND_IDLE_WATCHDOG_AGENT", "custom-dev-name");
-        let agent = watched_dev_agent();
         std::env::remove_var("AGEND_IDLE_WATCHDOG_AGENT");
-        assert_eq!(agent, "custom-dev-name");
-    }
-
-    #[test]
-    fn dev_idle_recipient_honors_env_override() {
-        let _g = env_lock();
-        std::env::set_var("AGEND_IDLE_WATCHDOG_DEV_RECIPIENT", "alice");
-        let r = dev_idle_recipient();
         std::env::remove_var("AGEND_IDLE_WATCHDOG_DEV_RECIPIENT");
-        assert_eq!(r, "alice");
-    }
-
-    /// #1563: unset → `lead` (was `general`, which spammed the general
-    /// assistant with fleet-idle alerts overnight); a set env value is honored.
-    #[test]
-    fn fleet_idle_recipient_defaults_to_lead_and_honors_env_override() {
-        let _g = env_lock();
-        std::env::remove_var("AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT");
+        let home = tmp_home("fleet-dev-route");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "watchdog:\n  idle_watchdog_agent: dev\n  dev_recipient: custom-arbiter\ninstances: {}\n",
+        )
+        .unwrap();
+        let stale = chrono::Utc::now() - chrono::Duration::seconds(dev_idle_threshold_secs() + 60);
+        write_activity_at(&home, "dev", stale);
+        let mut last_alerted = HashMap::new();
+        scan_and_emit(&home, &mut last_alerted, false);
+        let configured = crate::inbox::drain(&home, "custom-arbiter");
         assert_eq!(
-            fleet_idle_recipient(),
-            "lead",
-            "#1563: fleet-idle default recipient must be lead, not general"
+            configured
+                .iter()
+                .filter(|m| m.kind.as_deref() == Some("dev_idle_watchdog"))
+                .count(),
+            1,
+            "fleet-configured dev_recipient must receive the dev idle alert: {configured:?}"
         );
-        std::env::set_var("AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT", "ops-bot");
-        let overridden = fleet_idle_recipient();
-        std::env::remove_var("AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT");
-        assert_eq!(overridden, "ops-bot", "env override must be honored");
+        let default_lead = crate::inbox::drain(&home, "lead");
+        assert_eq!(
+            default_lead
+                .iter()
+                .filter(|m| m.kind.as_deref() == Some("dev_idle_watchdog"))
+                .count(),
+            0,
+            "built-in default `lead` must NOT receive the dev alert once fleet.yaml overrides it"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 
     // ── #1022 ghost-agent cleanup tests ───────────────────────────

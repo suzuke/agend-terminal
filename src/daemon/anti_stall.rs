@@ -157,24 +157,6 @@ fn parse_rfc3339(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
         .map(|dt| dt.with_timezone(&chrono::Utc))
 }
 
-/// Default recipients for stall warnings — broadcast to both lead
-/// (orchestration authority can re-dispatch / unblock) and general
-/// (operator-facing aggregator). Hard-coded matches the lead spec
-/// dispatch language; tunable via `AGEND_TASK_STALL_RECIPIENTS`
-/// env var (comma-separated) for operator override.
-fn stall_recipients() -> Vec<String> {
-    if let Ok(custom) = std::env::var("AGEND_TASK_STALL_RECIPIENTS") {
-        if !custom.trim().is_empty() {
-            return custom
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-        }
-    }
-    vec!["general".to_string(), "lead".to_string()]
-}
-
 /// #event-bus first-pattern: the stall notification text, built from the exact
 /// fields carried by `EventKind::TaskStateChanged`, so the legacy direct enqueue
 /// and the bus subscriber produce a BYTE-IDENTICAL message.
@@ -216,7 +198,7 @@ fn deliver_stall(
     assignee: Option<&str>,
 ) {
     let text = stall_text(task_id, title, reason, started_at, eta_secs, assignee);
-    for recipient in stall_recipients() {
+    for recipient in crate::fleet::watchdog::resolve_task_stall_recipients(home) {
         if let Err(e) = crate::inbox::notify_system(
             home,
             &recipient,
@@ -483,37 +465,64 @@ mod tests {
             .unwrap_or_else(|p| p.into_inner())
     }
 
-    #[test]
-    fn stall_recipients_default_to_general_and_lead() {
-        let _g = env_lock();
-        std::env::remove_var("AGEND_TASK_STALL_RECIPIENTS");
-        let recipients = stall_recipients();
-        assert_eq!(recipients, vec!["general".to_string(), "lead".to_string()]);
-    }
+    // #1812-followup: recipient resolution (default / env / fleet.yaml
+    // precedence + comma-split) moved to `fleet::watchdog` tests. The §3.9
+    // real-entry test `fleet_task_stall_recipients_route_via_bus` below proves a
+    // fleet.yaml `watchdog.task_stall_recipients` value reaches the live emit
+    // path.
 
+    /// §3.9 real-entry: a fleet.yaml `watchdog.task_stall_recipients` list must
+    /// reach the live bus→subscriber→`deliver_stall` path — delivery lands in the
+    /// configured recipients, NOT the built-in `[general, lead]` default. Proves
+    /// the config is read at the real call site, not just by the resolver.
     #[test]
-    fn stall_recipients_honors_env_override() {
+    fn fleet_task_stall_recipients_route_via_bus() {
         let _g = env_lock();
-        std::env::set_var("AGEND_TASK_STALL_RECIPIENTS", "alice, bob, carol");
-        let recipients = stall_recipients();
         std::env::remove_var("AGEND_TASK_STALL_RECIPIENTS");
-        assert_eq!(
-            recipients,
-            vec!["alice".to_string(), "bob".to_string(), "carol".to_string()]
+        let home = tmp_home("fleet-stall-route");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "watchdog:\n  task_stall_recipients:\n    - reviewer\n    - ops\ninstances: {}\n",
+        )
+        .unwrap();
+        let task = make_task(
+            "t-fleet",
+            "in_progress",
+            Some(60),
+            Some("2026-01-01T00:00:00+00:00"),
         );
-    }
-
-    #[test]
-    fn stall_recipients_empty_env_falls_back_to_default() {
-        let _g = env_lock();
-        std::env::set_var("AGEND_TASK_STALL_RECIPIENTS", "  ");
-        let recipients = stall_recipients();
-        std::env::remove_var("AGEND_TASK_STALL_RECIPIENTS");
-        assert_eq!(
-            recipients,
-            vec!["general".to_string(), "lead".to_string()],
-            "whitespace-only env must fall back to default"
+        let bus = crate::daemon::event_bus::EventBus::new();
+        bus.subscribe(handle_event);
+        bus.emit(
+            &home,
+            crate::daemon::event_bus::EventKind::TaskStateChanged {
+                task_id: task.id.clone(),
+                title: task.title.clone(),
+                assignee: task.assignee.clone(),
+                reason: "stalled".to_string(),
+                started_at: task.started_at.clone(),
+                eta_secs: task.eta_secs,
+            },
         );
+        assert_eq!(
+            crate::inbox::drain(&home, "reviewer").len(),
+            1,
+            "fleet-configured recipient `reviewer` must receive"
+        );
+        assert_eq!(
+            crate::inbox::drain(&home, "ops").len(),
+            1,
+            "fleet-configured recipient `ops` must receive"
+        );
+        assert!(
+            crate::inbox::drain(&home, "general").is_empty(),
+            "built-in default `general` must NOT receive once fleet.yaml overrides"
+        );
+        assert!(
+            crate::inbox::drain(&home, "lead").is_empty(),
+            "built-in default `lead` must NOT receive once fleet.yaml overrides"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -738,7 +747,7 @@ mod tests {
         );
 
         let mut delivered = false;
-        for r in stall_recipients() {
+        for r in crate::fleet::watchdog::resolve_task_stall_recipients(&home_legacy) {
             let legacy = drained_payloads(&home_legacy, &r);
             let viabus = drained_payloads(&home_bus, &r);
             assert_eq!(

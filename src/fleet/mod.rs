@@ -1,6 +1,10 @@
 pub(crate) mod merge;
 pub(crate) mod persist;
 mod resolve;
+pub(crate) mod watchdog;
+
+#[allow(unused_imports)]
+pub use watchdog::WatchdogConfig;
 
 #[allow(unused_imports)]
 pub use persist::{
@@ -133,6 +137,13 @@ pub struct FleetConfig {
     /// the agy backend; other backends ignore it. See `crate::agy_workspace`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agy_workspace_link_base: Option<PathBuf>,
+    /// Watchdog topology — which agent the idle watchdog watches and who receives
+    /// each watchdog / anti-stall / decision-timeout notification. Replaces five
+    /// `AGEND_*` env vars (now a deprecated fallback). Omitted block → built-in
+    /// defaults, byte-identical to the pre-migration behaviour. See
+    /// [`watchdog::WatchdogConfig`].
+    #[serde(default)]
+    pub watchdog: WatchdogConfig,
     #[serde(skip)]
     pub(crate) home: Option<PathBuf>,
 }
