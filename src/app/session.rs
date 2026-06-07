@@ -795,11 +795,15 @@ mod tests {
         )
         .expect("read src/app/mod.rs");
 
-        // Find the only `session::save_session(&home, &layout);` call site.
+        // Find the only `session::save_session(home, layout);` call site.
+        // (#14 god-fn split: this moved out of `run_app` into the `app_teardown`
+        // helper, which takes `home`/`layout` by reference — so the call lost the
+        // `&` sigils. The #895 ungated invariant is unchanged: it must still be
+        // the first statement, OUTSIDE any `if !attached_mode` block.)
         let lines: Vec<&str> = source.lines().collect();
         let save_idx = lines
             .iter()
-            .position(|l| l.contains("session::save_session(&home, &layout)"))
+            .position(|l| l.contains("session::save_session(home, layout)"))
             .expect("save_session call must exist in src/app/mod.rs");
 
         // Walk backwards: the most recent `if ... {` or `} else {` or

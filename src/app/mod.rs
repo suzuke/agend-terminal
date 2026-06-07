@@ -195,49 +195,8 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // client (Stage 3.4). `attached_mode` gates every operation that would
     // conflict with the live daemon — session persistence, fleet.yaml sync,
     // supervisor spawn, and agent kill on exit.
-    let opts = crate::bootstrap::PrepareOptions {
-        resolve_agents: false, // app spawns via pane_factory from tabs
-        ..Default::default()
-    };
-    let mut attached_run_dir: Option<PathBuf> = None;
-    let (_api_guard, telegram_state, telegram_status) =
-        match crate::bootstrap::prepare(&home, &fleet_path, opts) {
-            Ok(crate::bootstrap::BootstrapOutcome::Owned(prepared)) => {
-                let telegram = prepared.telegram.clone();
-                let status = if telegram.is_some() {
-                    TelegramStatus::Connected
-                } else {
-                    telegram_hooks::telegram_status_from_config(&prepared.config)
-                };
-                let guard = api_server::start_api_server(prepared, &registry, tui_event_tx);
-                // SIGTERM-only handler: `agend-terminal stop` can cleanly exit
-                // the owned app. SIGINT stays with crossterm so Ctrl+C still
-                // reaches the focused pane's PTY as 0x03.
-                crate::bootstrap::signals::install_term_only();
-                (guard, telegram, status)
-            }
-            Ok(crate::bootstrap::BootstrapOutcome::Attached(attached)) => {
-                tracing::info!(
-                    pid = attached.daemon_pid,
-                    path = %attached.run_dir.display(),
-                    "attached to existing daemon, connecting as remote client"
-                );
-                attached_run_dir = Some(attached.run_dir.clone());
-                (
-                    api_server::noop_guard(),
-                    None,
-                    TelegramStatus::NotConfigured,
-                )
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "bootstrap failed, running TUI without in-process API");
-                (
-                    api_server::noop_guard(),
-                    None,
-                    TelegramStatus::NotConfigured,
-                )
-            }
-        };
+    let (_api_guard, telegram_state, telegram_status, attached_run_dir) =
+        setup_app_bootstrap(&home, &fleet_path, &registry, tui_event_tx);
     let attached_mode = attached_run_dir.is_some();
 
     // SIGINT / SIGHUP are left to their defaults: Ctrl+C must reach the
@@ -767,13 +726,13 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 //   core.state.tick()               → supervisor::spawn (runs in
                 //     owned mode too — supervisor.rs:tick; the old manual call here
                 //     was a benign idempotent double, now removed).
-                let tick_ctx = crate::daemon::per_tick::TickContext {
-                    home: &home,
-                    registry: &registry,
-                    externals: &app_externals,
-                    configs: &app_configs,
-                };
-                crate::daemon::per_tick::run_handlers_with_panic_guard(&app_handlers, &tick_ctx);
+                app_maintenance_tick(
+                    &home,
+                    &registry,
+                    &app_externals,
+                    &app_configs,
+                    &app_handlers,
+                );
             }
             default(std::time::Duration::from_millis(50)) => {
                 // #1479: throttled, change-gated session persistence (every
@@ -893,21 +852,118 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // same reconciliation path Owned mode uses (parameterized over agent
     // source: fleet.yaml for Owned, `runtime::list_agents_with_fallback`
     // for Attached — see #910 for the registry-truth migration).
-    session::save_session(&home, &layout);
+    app_teardown(&home, &layout, &registry, attached_mode);
+
+    Ok(())
+}
+
+/// App startup bootstrap: prepare the fleet (issuing `api.cookie` BEFORE any API
+/// server thread starts — otherwise Telegram's router `api::call(INJECT)` would
+/// silently fail), then either start the in-process API server + the SIGTERM
+/// handler (Owned) or note the run dir to connect to (Attached). Extracted
+/// verbatim from the head of `run_app` (#14 god-fn split) — byte-identical.
+///
+/// Returns `(api_guard, telegram_channel, telegram_status, attached_run_dir)`.
+/// The RAII `ApiGuard` must outlive the TUI loop, so the caller binds it;
+/// `attached_run_dir.is_some()` ⇒ Attached mode.
+fn setup_app_bootstrap(
+    home: &Path,
+    fleet_path: &Path,
+    registry: &AgentRegistry,
+    tui_event_tx: TuiEventSender,
+) -> (
+    api_server::ApiGuard,
+    Option<Arc<dyn crate::channel::Channel>>,
+    TelegramStatus,
+    Option<PathBuf>,
+) {
+    let opts = crate::bootstrap::PrepareOptions {
+        resolve_agents: false, // app spawns via pane_factory from tabs
+        ..Default::default()
+    };
+    let mut attached_run_dir: Option<PathBuf> = None;
+    let (api_guard, telegram_state, telegram_status) =
+        match crate::bootstrap::prepare(home, fleet_path, opts) {
+            Ok(crate::bootstrap::BootstrapOutcome::Owned(prepared)) => {
+                let telegram = prepared.telegram.clone();
+                let status = if telegram.is_some() {
+                    TelegramStatus::Connected
+                } else {
+                    telegram_hooks::telegram_status_from_config(&prepared.config)
+                };
+                let guard = api_server::start_api_server(prepared, registry, tui_event_tx);
+                // SIGTERM-only handler: `agend-terminal stop` can cleanly exit
+                // the owned app. SIGINT stays with crossterm so Ctrl+C still
+                // reaches the focused pane's PTY as 0x03.
+                crate::bootstrap::signals::install_term_only();
+                (guard, telegram, status)
+            }
+            Ok(crate::bootstrap::BootstrapOutcome::Attached(attached)) => {
+                tracing::info!(
+                    pid = attached.daemon_pid,
+                    path = %attached.run_dir.display(),
+                    "attached to existing daemon, connecting as remote client"
+                );
+                attached_run_dir = Some(attached.run_dir.clone());
+                (
+                    api_server::noop_guard(),
+                    None,
+                    TelegramStatus::NotConfigured,
+                )
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "bootstrap failed, running TUI without in-process API");
+                (
+                    api_server::noop_guard(),
+                    None,
+                    TelegramStatus::NotConfigured,
+                )
+            }
+        };
+    (api_guard, telegram_state, telegram_status, attached_run_dir)
+}
+
+/// Periodic owned-mode maintenance: run the full daemon per-tick handler
+/// pipeline once. Extracted verbatim from `run_app`'s tick arm (#14 god-fn
+/// split) — byte-identical, no behaviour change.
+fn app_maintenance_tick(
+    home: &Path,
+    registry: &AgentRegistry,
+    externals: &crate::agent::ExternalRegistry,
+    configs: &crate::api::ConfigRegistry,
+    handlers: &[Box<dyn crate::daemon::per_tick::PerTickHandler>],
+) {
+    let tick_ctx = crate::daemon::per_tick::TickContext {
+        home,
+        registry,
+        externals,
+        configs,
+    };
+    crate::daemon::per_tick::run_handlers_with_panic_guard(handlers, &tick_ctx);
+}
+
+/// App exit teardown: persist the on-screen layout, then (Owned mode only) sync
+/// fleet.yaml + kill every agent PTY. Extracted verbatim from the tail of
+/// `run_app` (#14) — byte-identical.
+///
+/// `save_session` is UNGATED (#895): tab grouping / splits / ratios are
+/// presentation-layer state the app owns even when Attached, so the next attach
+/// can restore the custom layout. `sync_fleet_yaml` + agent-kill STAY gated to
+/// Owned mode — in Attached mode the daemon owns fleet.yaml and the agent PTYs.
+fn app_teardown(home: &Path, layout: &Layout, registry: &AgentRegistry, attached_mode: bool) {
+    session::save_session(home, layout);
     if !attached_mode {
         // Sync fleet.yaml to match current state (Owned-only — daemon owns
         // fleet.yaml in Attached).
-        session::sync_fleet_yaml(&home, &layout);
+        session::sync_fleet_yaml(home, layout);
 
         // Cleanup: kill all agents (Owned-only — daemon owns PTYs in Attached).
         for tab in &layout.tabs {
             for name in tab.root().agent_names() {
-                kill_agent(&home, &registry, &name);
+                kill_agent(home, registry, &name);
             }
         }
     }
-
-    Ok(())
 }
 
 /// Build menu items for new-tab selection.
