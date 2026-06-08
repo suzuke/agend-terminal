@@ -216,6 +216,9 @@ pub fn create(home: &Path, args: &Value) -> Value {
     };
     match crate::fleet::add_team_to_yaml(home, &name, &cfg) {
         Ok(true) => {
+            if cfg.orchestrator.is_some() {
+                cleanup_orchestrator_tasks_for_team(home, &name);
+            }
             let mut result = serde_json::json!({"status": "created", "name": name});
             if !warnings.is_empty() {
                 result["warnings"] = serde_json::json!(warnings);
@@ -225,6 +228,30 @@ pub fn create(home: &Path, args: &Value) -> Value {
         // Race: someone wrote the team between our check and write.
         Ok(false) => serde_json::json!({"error": format!("team '{name}' already exists")}),
         Err(e) => serde_json::json!({"error": format!("{e}")}),
+    }
+}
+
+fn cleanup_orchestrator_tasks_for_team(home: &Path, team_name: &str) {
+    let tasks = crate::tasks::list_all(home);
+    for task in tasks {
+        if task.priority == crate::task_events::TaskPriority::Urgent
+            && task
+                .title
+                .starts_with(&format!("Team '{}' needs new orchestrator", team_name))
+            && task.status != crate::task_events::TaskStatus::Done
+            && task.status != crate::task_events::TaskStatus::Cancelled
+        {
+            crate::tasks::handle(
+                home,
+                "system",
+                &serde_json::json!({
+                    "action": "update",
+                    "id": task.id,
+                    "status": "cancelled",
+                    "reason": format!("Team '{}' was deleted or updated with a valid orchestrator", team_name),
+                }),
+            );
+        }
     }
 }
 
@@ -307,6 +334,7 @@ pub fn delete(home: &Path, args: &Value) -> Value {
     // what disband requested.
     match crate::fleet::remove_team_from_yaml(home, &name) {
         Ok(_) => {
+            cleanup_orchestrator_tasks_for_team(home, &name);
             let mut result = serde_json::json!({
                 "status": "deleted",
                 "name": name,
@@ -449,7 +477,12 @@ pub fn update(home: &Path, args: &Value) -> Value {
         accept_from: new_accept_from,
     };
     match crate::fleet::update_team_in_yaml(home, &name, &cfg) {
-        Ok(true) => serde_json::json!({"status": "updated", "name": name}),
+        Ok(true) => {
+            if cfg.orchestrator.is_some() {
+                cleanup_orchestrator_tasks_for_team(home, &name);
+            }
+            serde_json::json!({"status": "updated", "name": name})
+        }
         // Disappeared between load and write.
         Ok(false) => serde_json::json!({"error": format!("team '{name}' not found")}),
         Err(e) => serde_json::json!({"error": format!("{e}")}),
@@ -475,6 +508,7 @@ pub fn remove_member_from_all(home: &Path, instance_name: &str) {
         if new_members.is_empty() {
             // Last member leaving — drop the team entirely.
             let _ = crate::fleet::remove_team_from_yaml(home, team_name);
+            cleanup_orchestrator_tasks_for_team(home, team_name);
             continue;
         }
         let new_orch = if is_orch {
@@ -1410,5 +1444,101 @@ mod tests {
             vec!["alive-1", "stale-2", "alive-3"],
             "members must remain full team config: {v}"
         );
+    }
+
+    #[test]
+    fn cleanup_orchestrator_tasks_on_disband_and_recreate() {
+        let home = tmp_home("cleanup_stale_tasks");
+
+        // 1. Create a team
+        create(
+            &home,
+            &serde_json::json!({"name": "devs", "members": ["lead", "worker"], "orchestrator": "lead"}),
+        );
+
+        // 2. Remove member "lead" (the orchestrator) -> should trigger urgent task
+        remove_member_from_all(&home, "lead");
+
+        let tasks = crate::tasks::list_all(&home);
+        let urgent: Vec<_> = tasks
+            .iter()
+            .filter(|t| {
+                t.priority == crate::task_events::TaskPriority::Urgent
+                    && t.title.contains("needs new orchestrator")
+                    && t.status != crate::task_events::TaskStatus::Cancelled
+            })
+            .collect();
+        assert_eq!(urgent.len(), 1, "should have active urgent task");
+
+        // 3. Disband (delete) the team -> task should be cancelled
+        delete(&home, &serde_json::json!({"name": "devs"}));
+
+        let tasks = crate::tasks::list_all(&home);
+        let urgent: Vec<_> = tasks
+            .iter()
+            .filter(|t| {
+                t.priority == crate::task_events::TaskPriority::Urgent
+                    && t.title.contains("needs new orchestrator")
+                    && t.status != crate::task_events::TaskStatus::Cancelled
+            })
+            .collect();
+        assert_eq!(urgent.len(), 0, "disband should cancel the urgent task");
+
+        // 4. Test recreation cleanup: recreate team degraded, then create it with orchestrator
+        create(
+            &home,
+            &serde_json::json!({"name": "devs", "members": ["worker"]}), // degraded (no orchestrator)
+        );
+        // Manually create degraded task to simulate
+        crate::tasks::handle(
+            &home,
+            "system",
+            &serde_json::json!({
+                "action": "create",
+                "title": "Team 'devs' needs new orchestrator (lead was deleted)",
+                "priority": "urgent",
+            }),
+        );
+
+        let tasks = crate::tasks::list_all(&home);
+        let urgent: Vec<_> = tasks
+            .iter()
+            .filter(|t| {
+                t.priority == crate::task_events::TaskPriority::Urgent
+                    && t.title.contains("needs new orchestrator")
+                    && t.status != crate::task_events::TaskStatus::Cancelled
+            })
+            .collect();
+        assert_eq!(
+            urgent.len(),
+            1,
+            "should have active urgent task for degraded team"
+        );
+
+        // Disband first
+        delete(&home, &serde_json::json!({"name": "devs"}));
+
+        // Create new team with orchestrator -> should clean up any matching stale task (recreation defense)
+        create(
+            &home,
+            &serde_json::json!({"name": "devs", "members": ["new-lead"], "orchestrator": "new-lead"}),
+        );
+
+        let tasks = crate::tasks::list_all(&home);
+        let urgent: Vec<_> = tasks
+            .iter()
+            .filter(|t| {
+                t.priority == crate::task_events::TaskPriority::Urgent
+                    && t.title.contains("needs new orchestrator")
+                    && t.status != crate::task_events::TaskStatus::Cancelled
+            })
+            .collect();
+        assert_eq!(
+            urgent.len(),
+            0,
+            "creating team with orchestrator should clean up stale task"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
     }
 }
