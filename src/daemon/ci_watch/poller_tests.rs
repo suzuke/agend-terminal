@@ -394,6 +394,7 @@ fn test_repo_with_slash_no_collision() {
 fn test_multi_run_notifies_all_terminal_since_last() {
     let runs = vec![
         CiRun {
+            run_attempt: 1,
             id: 100,
             conclusion: Some("success".into()),
             head_sha: "aaa".into(),
@@ -401,6 +402,7 @@ fn test_multi_run_notifies_all_terminal_since_last() {
             name: String::new(),
         },
         CiRun {
+            run_attempt: 1,
             id: 101,
             conclusion: Some("success".into()),
             head_sha: "bbb".into(),
@@ -408,6 +410,7 @@ fn test_multi_run_notifies_all_terminal_since_last() {
             name: String::new(),
         },
         CiRun {
+            run_attempt: 1,
             id: 102,
             conclusion: None,
             head_sha: "ccc".into(),
@@ -415,7 +418,7 @@ fn test_multi_run_notifies_all_terminal_since_last() {
             name: String::new(),
         },
     ];
-    let selected = select_runs_to_notify(&runs, Some(99), None);
+    let selected = select_runs_to_notify(&runs, Some(99), None, None);
     assert_eq!(
         selected,
         vec![0, 1],
@@ -426,13 +429,14 @@ fn test_multi_run_notifies_all_terminal_since_last() {
 #[test]
 fn test_in_progress_does_not_appear_in_selection() {
     let runs = vec![CiRun {
+        run_attempt: 1,
         id: 200,
         conclusion: None,
         head_sha: "aaa".into(),
         url: String::new(),
         name: String::new(),
     }];
-    let selected = select_runs_to_notify(&runs, None, None);
+    let selected = select_runs_to_notify(&runs, None, None, None);
     assert!(selected.is_empty(), "in-progress run must not be selected");
 }
 
@@ -440,6 +444,7 @@ fn test_in_progress_does_not_appear_in_selection() {
 fn test_mixed_terminal_states_all_notified() {
     let runs = vec![
         CiRun {
+            run_attempt: 1,
             id: 300,
             conclusion: Some("failure".into()),
             head_sha: "a".into(),
@@ -447,6 +452,7 @@ fn test_mixed_terminal_states_all_notified() {
             name: String::new(),
         },
         CiRun {
+            run_attempt: 1,
             id: 301,
             conclusion: Some("cancelled".into()),
             head_sha: "b".into(),
@@ -454,6 +460,7 @@ fn test_mixed_terminal_states_all_notified() {
             name: String::new(),
         },
         CiRun {
+            run_attempt: 1,
             id: 302,
             conclusion: Some("success".into()),
             head_sha: "c".into(),
@@ -461,7 +468,7 @@ fn test_mixed_terminal_states_all_notified() {
             name: String::new(),
         },
     ];
-    let selected = select_runs_to_notify(&runs, Some(299), None);
+    let selected = select_runs_to_notify(&runs, Some(299), None, None);
     assert_eq!(
         selected,
         vec![0, 1, 2],
@@ -473,6 +480,7 @@ fn test_mixed_terminal_states_all_notified() {
 fn test_already_notified_runs_skipped() {
     let runs = vec![
         CiRun {
+            run_attempt: 1,
             id: 400,
             conclusion: Some("success".into()),
             head_sha: "a".into(),
@@ -480,6 +488,7 @@ fn test_already_notified_runs_skipped() {
             name: String::new(),
         },
         CiRun {
+            run_attempt: 1,
             id: 401,
             conclusion: Some("success".into()),
             head_sha: "b".into(),
@@ -493,7 +502,7 @@ fn test_already_notified_runs_skipped() {
     // would legitimately fire (which is the bug fix). Passing
     // Some("success") here preserves the original pre-#786 intent
     // of this test (suppress stable terminal state).
-    let selected = select_runs_to_notify(&runs, Some(400), Some("success"));
+    let selected = select_runs_to_notify(&runs, Some(400), Some("success"), None);
     assert_eq!(
         selected,
         vec![1],
@@ -505,6 +514,7 @@ fn test_already_notified_runs_skipped() {
 fn test_same_head_sha_deduplicates_notification() {
     let runs = vec![
         CiRun {
+            run_attempt: 1,
             id: 500,
             conclusion: Some("failure".into()),
             head_sha: "abc".into(),
@@ -512,6 +522,7 @@ fn test_same_head_sha_deduplicates_notification() {
             name: String::new(),
         },
         CiRun {
+            run_attempt: 1,
             id: 501,
             conclusion: Some("success".into()),
             head_sha: "abc".into(),
@@ -519,8 +530,8 @@ fn test_same_head_sha_deduplicates_notification() {
             name: String::new(),
         },
     ];
-    let selected = select_runs_to_notify(&runs, Some(499), None);
-    let deduped = dedupe_notifications_by_head_sha(&runs, &selected, None, None);
+    let selected = select_runs_to_notify(&runs, Some(499), None, None);
+    let deduped = dedupe_notifications_by_head_sha(&runs, &selected, None, None, None);
     assert_eq!(deduped.len(), 1, "same sha → 1 notification");
     assert_eq!(deduped[0].1, 501, "latest run_id wins");
     assert_eq!(deduped[0].2, "abc");
@@ -530,6 +541,7 @@ fn test_same_head_sha_deduplicates_notification() {
 fn test_dedupe_skips_already_notified_sha() {
     let runs = vec![
         CiRun {
+            run_attempt: 1,
             id: 600,
             conclusion: Some("success".into()),
             head_sha: "aaa".into(),
@@ -537,6 +549,7 @@ fn test_dedupe_skips_already_notified_sha() {
             name: String::new(),
         },
         CiRun {
+            run_attempt: 1,
             id: 601,
             conclusion: Some("success".into()),
             head_sha: "bbb".into(),
@@ -548,8 +561,9 @@ fn test_dedupe_skips_already_notified_sha() {
     // the conclusion match. Passing Some("success") here preserves
     // the pre-#786 intent — a future PR could add a same-sha
     // different-conclusion test (handled by anchor test 5).
-    let selected = select_runs_to_notify(&runs, Some(599), None);
-    let deduped = dedupe_notifications_by_head_sha(&runs, &selected, Some("aaa"), Some("success"));
+    let selected = select_runs_to_notify(&runs, Some(599), None, None);
+    let deduped =
+        dedupe_notifications_by_head_sha(&runs, &selected, Some("aaa"), Some("success"), None);
     assert_eq!(
         deduped.len(),
         1,
@@ -569,6 +583,7 @@ fn test_dedupe_skips_already_notified_sha() {
 fn test_1042_same_sha_same_aggregate_suppresses_rebroadcast() {
     let runs = vec![
         CiRun {
+            run_attempt: 1,
             id: 700,
             conclusion: Some("failure".into()),
             head_sha: "abc".into(),
@@ -576,6 +591,7 @@ fn test_1042_same_sha_same_aggregate_suppresses_rebroadcast() {
             name: String::new(),
         },
         CiRun {
+            run_attempt: 1,
             id: 701,
             conclusion: Some("success".into()),
             head_sha: "abc".into(),
@@ -583,9 +599,10 @@ fn test_1042_same_sha_same_aggregate_suppresses_rebroadcast() {
             name: String::new(),
         },
     ];
-    let selected = select_runs_to_notify(&runs, Some(699), None);
+    let selected = select_runs_to_notify(&runs, Some(699), None, None);
     assert_eq!(selected.len(), 2, "both runs should pass site-1 filter");
-    let deduped = dedupe_notifications_by_head_sha(&runs, &selected, Some("abc"), Some("failure"));
+    let deduped =
+        dedupe_notifications_by_head_sha(&runs, &selected, Some("abc"), Some("failure"), None);
     assert_eq!(
         deduped.len(),
         0,
@@ -600,6 +617,7 @@ fn test_1042_same_sha_same_aggregate_suppresses_rebroadcast() {
 fn test_1042_same_sha_different_aggregate_fires() {
     let runs = vec![
         CiRun {
+            run_attempt: 1,
             id: 800,
             conclusion: Some("success".into()),
             head_sha: "abc".into(),
@@ -607,6 +625,7 @@ fn test_1042_same_sha_different_aggregate_fires() {
             name: String::new(),
         },
         CiRun {
+            run_attempt: 1,
             id: 801,
             conclusion: Some("success".into()),
             head_sha: "abc".into(),
@@ -614,8 +633,9 @@ fn test_1042_same_sha_different_aggregate_fires() {
             name: String::new(),
         },
     ];
-    let selected = select_runs_to_notify(&runs, Some(799), None);
-    let deduped = dedupe_notifications_by_head_sha(&runs, &selected, Some("abc"), Some("failure"));
+    let selected = select_runs_to_notify(&runs, Some(799), None, None);
+    let deduped =
+        dedupe_notifications_by_head_sha(&runs, &selected, Some("abc"), Some("failure"), None);
     assert_eq!(
         deduped.len(),
         1,
@@ -632,6 +652,7 @@ fn test_1042_same_sha_different_aggregate_fires() {
 fn test_1307_rerun_pass_same_sha_fires_notification() {
     let runs = vec![
         CiRun {
+            run_attempt: 1,
             id: 900,
             conclusion: Some("failure".into()),
             head_sha: "abc".into(),
@@ -639,6 +660,7 @@ fn test_1307_rerun_pass_same_sha_fires_notification() {
             name: String::new(),
         },
         CiRun {
+            run_attempt: 1,
             id: 901,
             conclusion: Some("success".into()),
             head_sha: "abc".into(),
@@ -647,11 +669,12 @@ fn test_1307_rerun_pass_same_sha_fires_notification() {
         },
     ];
     // last_run_id=900: gate 1 filters out run 900 (same id, same conclusion)
-    let selected = select_runs_to_notify(&runs, Some(900), Some("failure"));
+    let selected = select_runs_to_notify(&runs, Some(900), Some("failure"), None);
     assert_eq!(selected, vec![1], "only rerun (id=901) should pass gate 1");
     // gate 2: same SHA as last notified, but aggregate should use only
     // to_notify runs (success), not all runs (which includes old failure)
-    let deduped = dedupe_notifications_by_head_sha(&runs, &selected, Some("abc"), Some("failure"));
+    let deduped =
+        dedupe_notifications_by_head_sha(&runs, &selected, Some("abc"), Some("failure"), None);
     assert_eq!(
         deduped.len(),
         1,
@@ -663,6 +686,7 @@ fn test_1307_rerun_pass_same_sha_fires_notification() {
 fn test_different_head_sha_triggers_new_notification() {
     let runs = vec![
         CiRun {
+            run_attempt: 1,
             id: 600,
             conclusion: Some("success".into()),
             head_sha: "aaa".into(),
@@ -670,6 +694,7 @@ fn test_different_head_sha_triggers_new_notification() {
             name: String::new(),
         },
         CiRun {
+            run_attempt: 1,
             id: 601,
             conclusion: Some("success".into()),
             head_sha: "bbb".into(),
@@ -677,8 +702,8 @@ fn test_different_head_sha_triggers_new_notification() {
             name: String::new(),
         },
     ];
-    let selected = select_runs_to_notify(&runs, Some(599), None);
-    let deduped = dedupe_notifications_by_head_sha(&runs, &selected, None, None);
+    let selected = select_runs_to_notify(&runs, Some(599), None, None);
+    let deduped = dedupe_notifications_by_head_sha(&runs, &selected, None, None, None);
     assert_eq!(deduped.len(), 2, "different shas → 2 notifications");
 }
 
@@ -1132,6 +1157,7 @@ fn base_watch() -> serde_json::Value {
 fn mock_success_run_updates_watch_state() {
     let dir = tmp_dir("mock-success");
     let provider = MockCiProvider::with_runs(vec![CiRun {
+        run_attempt: 1,
         id: 100,
         conclusion: Some("success".into()),
         head_sha: "abc".into(),
@@ -1172,6 +1198,7 @@ fn mock_stale_sha_drops_notification_but_advances_tracker() {
     // user is waiting on NEW_HEAD.
     let provider = MockCiProvider::with_runs(vec![
         CiRun {
+            run_attempt: 1,
             id: 301, // NEW_HEAD's run (latest, in-progress)
             conclusion: None,
             head_sha: "newhead".into(),
@@ -1179,6 +1206,7 @@ fn mock_stale_sha_drops_notification_but_advances_tracker() {
             name: String::new(),
         },
         CiRun {
+            run_attempt: 1,
             id: 300, // OLD_HEAD's run (terminal but stale)
             conclusion: Some("success".into()),
             head_sha: "oldhead".into(),
@@ -1223,6 +1251,7 @@ fn mock_stale_sha_does_not_emit_inbox_message() {
     let dir = tmp_dir("mock-stale-sha-inbox");
     let provider = MockCiProvider::with_runs(vec![
         CiRun {
+            run_attempt: 1,
             id: 301,
             conclusion: None,
             head_sha: "newhead".into(),
@@ -1230,6 +1259,7 @@ fn mock_stale_sha_does_not_emit_inbox_message() {
             name: String::new(),
         },
         CiRun {
+            run_attempt: 1,
             id: 300,
             conclusion: Some("success".into()),
             head_sha: "oldhead".into(),
@@ -1256,6 +1286,7 @@ fn mock_stale_sha_does_not_emit_inbox_message() {
 fn mock_single_run_current_head_still_notifies() {
     let dir = tmp_dir("mock-single-current");
     let provider = MockCiProvider::with_runs(vec![CiRun {
+        run_attempt: 1,
         id: 400,
         conclusion: Some("success".into()),
         head_sha: "onlyhead".into(),
@@ -1280,6 +1311,7 @@ fn mock_single_run_current_head_still_notifies() {
 fn mock_failure_run_includes_detail() {
     let dir = tmp_dir("mock-failure");
     let provider = MockCiProvider::with_runs(vec![CiRun {
+        run_attempt: 1,
         id: 200,
         conclusion: Some("failure".into()),
         head_sha: "def".into(),
@@ -1375,6 +1407,7 @@ fn mock_force_push_resets_tracking() {
     watch["head_sha"] = serde_json::json!("old123");
     watch["last_run_id"] = serde_json::json!(50);
     let provider = MockCiProvider::with_runs(vec![CiRun {
+        run_attempt: 1,
         id: 51,
         conclusion: Some("success".into()),
         head_sha: "new456".into(),
@@ -2362,6 +2395,7 @@ fn subscriber_fan_out_notifies_every_member() {
 
     // Mock provider returns one terminal success run.
     let provider = MockCiProvider::with_runs(vec![CiRun {
+        run_attempt: 1,
         id: 7,
         conclusion: Some("success".to_string()),
         head_sha: "deadbeef".to_string(),
@@ -2456,6 +2490,7 @@ fn ci_pass_subscriber_inbox_anti_regression() {
     let watch_path = ci_dir.join(watch_filename("o/r", "feat"));
     std::fs::write(&watch_path, serde_json::to_string_pretty(&watch).unwrap()).unwrap();
     let provider = MockCiProvider::with_runs(vec![CiRun {
+        run_attempt: 1,
         id: 1,
         conclusion: Some("success".to_string()),
         head_sha: "abc1234".to_string(),
@@ -2502,6 +2537,7 @@ fn ci_pass_chain_target_gets_durable_inbox_entry() {
     let watch_path = ci_dir.join(watch_filename("o/r", "feat"));
     std::fs::write(&watch_path, serde_json::to_string_pretty(&watch).unwrap()).unwrap();
     let provider = MockCiProvider::with_runs(vec![CiRun {
+        run_attempt: 1,
         id: 2,
         conclusion: Some("success".to_string()),
         head_sha: "abc1234".to_string(),
@@ -2547,6 +2583,7 @@ fn ci_pass_chain_target_excluded_from_subscriber_loop() {
     let watch_path = ci_dir.join(watch_filename("o/r", "feat"));
     std::fs::write(&watch_path, serde_json::to_string_pretty(&watch).unwrap()).unwrap();
     let provider = MockCiProvider::with_runs(vec![CiRun {
+        run_attempt: 1,
         id: 3,
         conclusion: Some("success".to_string()),
         head_sha: "abc1234".to_string(),
@@ -2604,6 +2641,7 @@ fn ci_pass_no_next_no_subscribers_does_not_forge_ci_ready() {
     let watch_path = ci_dir.join(watch_filename("o/r", "feat"));
     std::fs::write(&watch_path, serde_json::to_string_pretty(&watch).unwrap()).unwrap();
     let provider = MockCiProvider::with_runs(vec![CiRun {
+        run_attempt: 1,
         id: 9,
         conclusion: Some("success".to_string()),
         head_sha: "abc1234".to_string(),
@@ -2695,6 +2733,7 @@ fn ci_ready_for_action_carries_full_head_sha() {
     let watch_path = ci_dir.join(watch_filename("o/r", "feat"));
     std::fs::write(&watch_path, serde_json::to_string_pretty(&watch).unwrap()).unwrap();
     let provider = MockCiProvider::with_runs(vec![CiRun {
+        run_attempt: 1,
         id: 1,
         conclusion: Some("success".to_string()),
         // Use a realistic full 40-char SHA.
@@ -2781,6 +2820,7 @@ fn ci_ready_for_action_carries_pr_number_from_pr_state() {
     let watch_path = ci_dir.join(watch_filename("o/r", "feat"));
     std::fs::write(&watch_path, serde_json::to_string_pretty(&watch).unwrap()).unwrap();
     let provider = MockCiProvider::with_runs(vec![CiRun {
+        run_attempt: 1,
         id: 2,
         conclusion: Some("success".to_string()),
         head_sha: "abc1234567890abcdef1234567890abcdef12345".to_string(),
@@ -2845,6 +2885,7 @@ fn ci_ready_for_action_carries_task_id_from_watch_sidecar() {
     let watch_path = ci_dir.join(watch_filename("o/r", "feat"));
     std::fs::write(&watch_path, serde_json::to_string_pretty(&watch).unwrap()).unwrap();
     let provider = MockCiProvider::with_runs(vec![CiRun {
+        run_attempt: 1,
         id: 3,
         conclusion: Some("success".to_string()),
         head_sha: "abc1234567890abcdef1234567890abcdef12345".to_string(),
@@ -2925,6 +2966,7 @@ fn ci_pass_chain_target_inbox_kind_is_ready_for_action() {
     let watch_path = ci_dir.join(watch_filename("o/r", "feat"));
     std::fs::write(&watch_path, serde_json::to_string_pretty(&watch).unwrap()).unwrap();
     let provider = MockCiProvider::with_runs(vec![CiRun {
+        run_attempt: 1,
         id: 4,
         conclusion: Some("success".to_string()),
         head_sha: "abc1234".to_string(),
@@ -2977,6 +3019,7 @@ fn ci_pass_chain_target_no_double_fire_on_overlap() {
     let watch_path = ci_dir.join(watch_filename("o/r", "feat"));
     std::fs::write(&watch_path, serde_json::to_string_pretty(&watch).unwrap()).unwrap();
     let provider = MockCiProvider::with_runs(vec![CiRun {
+        run_attempt: 1,
         id: 5,
         conclusion: Some("success".to_string()),
         head_sha: "abc1234".to_string(),
@@ -3310,6 +3353,7 @@ fn run_row(branch: &str, sha: &str) -> crate::daemon::ci_watch::provider::RunRow
             head_sha: sha.into(),
             url: String::new(),
             name: "CI".into(),
+            run_attempt: 1,
         },
     }
 }
@@ -3861,6 +3905,7 @@ fn gc_stale_watches_idempotent_on_clean_dir() {
 
 fn make_run(id: u64, sha: &str, conclusion: Option<&str>) -> CiRun {
     CiRun {
+        run_attempt: 1,
         id,
         head_sha: sha.to_string(),
         conclusion: conclusion.map(String::from),
@@ -4036,6 +4081,7 @@ fn rerun_changes_conclusion_fires_notification() {
     let watch = p786_watch_already_notified(100, "failure", "abc");
     // Same run_id, same head_sha, NEW conclusion.
     let provider = MockCiProvider::with_runs(vec![CiRun {
+        run_attempt: 1,
         id: 100,
         conclusion: Some("success".into()),
         head_sha: "abc".into(),
@@ -4079,6 +4125,7 @@ fn dedupe_by_head_sha_does_not_block_conclusion_change() {
     // New scheduled run on same commit: run_id=101 (passes Site 1),
     // same sha (would be dropped by Site 2 pre-impl), new conclusion.
     let provider = MockCiProvider::with_runs(vec![CiRun {
+        run_attempt: 1,
         id: 101,
         conclusion: Some("success".into()),
         head_sha: "abc".into(),
@@ -4110,6 +4157,7 @@ fn same_run_id_same_conclusion_does_not_re_fire() {
     let dir = tmp_dir("p786-no-churn");
     let watch = p786_watch_already_notified(100, "failure", "abc");
     let provider = MockCiProvider::with_runs(vec![CiRun {
+        run_attempt: 1,
         id: 100,
         conclusion: Some("failure".into()),
         head_sha: "abc".into(),
@@ -4153,6 +4201,7 @@ fn new_run_id_fires_regardless_of_prior_conclusion() {
     let dir = tmp_dir("p786-new-run");
     let watch = p786_watch_already_notified(100, "success", "abc");
     let provider = MockCiProvider::with_runs(vec![CiRun {
+        run_attempt: 1,
         id: 200,
         conclusion: Some("success".into()),
         head_sha: "def".into(),
@@ -4196,6 +4245,7 @@ fn missing_last_notified_conclusion_field_handles_first_poll_gracefully() {
         // last_notified_conclusion intentionally absent (pre-#786 shape).
     });
     let provider = MockCiProvider::with_runs(vec![CiRun {
+        run_attempt: 1,
         id: 100,
         conclusion: Some("success".into()),
         head_sha: "abc".into(),
@@ -4266,6 +4316,7 @@ fn pass_dedupe_drops_ci_pass_for_subscriber_who_is_action_target() {
     std::fs::write(&watch_path, serde_json::to_string_pretty(&watch).unwrap()).unwrap();
 
     let provider = MockCiProvider::with_runs(vec![CiRun {
+        run_attempt: 1,
         id: 100,
         conclusion: Some("success".to_string()),
         head_sha: "abc".to_string(),
@@ -4339,6 +4390,7 @@ fn pass_dedupe_failure_does_not_drop_ci_fail_for_action_target() {
     std::fs::write(&watch_path, serde_json::to_string_pretty(&watch).unwrap()).unwrap();
 
     let provider = MockCiProvider::with_runs(vec![CiRun {
+        run_attempt: 1,
         id: 200,
         conclusion: Some("failure".to_string()),
         head_sha: "def".to_string(),
@@ -4406,6 +4458,7 @@ fn pass_dedupe_non_action_target_subscribers_receive_ci_pass() {
     std::fs::write(&watch_path, serde_json::to_string_pretty(&watch).unwrap()).unwrap();
 
     let provider = MockCiProvider::with_runs(vec![CiRun {
+        run_attempt: 1,
         id: 300,
         conclusion: Some("success".to_string()),
         head_sha: "fed".to_string(),
@@ -4772,6 +4825,7 @@ fn test_status_response_has_null_pr_mergeable_state_pre_first_check() {
 fn ci_pass_inbox_message_carries_repo_branch_correlation_id() {
     let dir = tmp_dir("946-ci-pass-corr");
     let provider = MockCiProvider::with_runs(vec![CiRun {
+        run_attempt: 1,
         id: 100,
         conclusion: Some("success".into()),
         head_sha: "abc".into(),
@@ -4795,6 +4849,7 @@ fn ci_stale_sha_does_not_emit_inbox_message_with_correlation_id() {
     let dir = tmp_dir("946-ci-stale-corr");
     let provider = MockCiProvider::with_runs(vec![
         CiRun {
+            run_attempt: 1,
             id: 301,
             conclusion: None,
             head_sha: "newhead".into(),
@@ -4802,6 +4857,7 @@ fn ci_stale_sha_does_not_emit_inbox_message_with_correlation_id() {
             name: String::new(),
         },
         CiRun {
+            run_attempt: 1,
             id: 300,
             conclusion: Some("success".into()),
             head_sha: "oldhead".into(),
@@ -4847,6 +4903,7 @@ fn ci_stale_debounce_persists_sha_without_inbox() {
     let dir = tmp_dir("1026-debounce");
     let provider = MockCiProvider::with_runs(vec![
         CiRun {
+            run_attempt: 1,
             id: 301,
             conclusion: None,
             head_sha: "newhead".into(),
@@ -4854,6 +4911,7 @@ fn ci_stale_debounce_persists_sha_without_inbox() {
             name: String::new(),
         },
         CiRun {
+            run_attempt: 1,
             id: 300,
             conclusion: Some("success".into()),
             head_sha: "oldhead".into(),
@@ -4892,6 +4950,7 @@ fn ci_stale_debounce_updates_sha_for_new_stale() {
     // First poll: SHA-A is stale.
     let provider = MockCiProvider::with_runs(vec![
         CiRun {
+            run_attempt: 1,
             id: 401,
             conclusion: None,
             head_sha: "sha-c".into(),
@@ -4899,6 +4958,7 @@ fn ci_stale_debounce_updates_sha_for_new_stale() {
             name: String::new(),
         },
         CiRun {
+            run_attempt: 1,
             id: 400,
             conclusion: Some("success".into()),
             head_sha: "sha-a".into(),
@@ -4917,6 +4977,7 @@ fn ci_stale_debounce_updates_sha_for_new_stale() {
     // Second poll: SHA-B is stale (different from SHA-A) → debounce SHA updates.
     let provider2 = MockCiProvider::with_runs(vec![
         CiRun {
+            run_attempt: 1,
             id: 501,
             conclusion: None,
             head_sha: "sha-d".into(),
@@ -4924,6 +4985,7 @@ fn ci_stale_debounce_updates_sha_for_new_stale() {
             name: String::new(),
         },
         CiRun {
+            run_attempt: 1,
             id: 500,
             conclusion: Some("success".into()),
             head_sha: "sha-b".into(),
@@ -4959,6 +5021,7 @@ fn ci_stale_debounce_does_not_affect_current_sha_notifications() {
     let mut watch = base_watch();
     watch["last_stale_emitted_sha"] = serde_json::json!("oldhead");
     let provider = MockCiProvider::with_runs(vec![CiRun {
+        run_attempt: 1,
         id: 600,
         conclusion: Some("success".into()),
         head_sha: "currenthead".into(),
@@ -5064,6 +5127,7 @@ fn ci_check_repo_success_no_pty_inject_only_inbox() {
 
     let dir = tmp_dir("1134-t4-e2e-no-inject");
     let provider = MockCiProvider::with_runs(vec![CiRun {
+        run_attempt: 1,
         id: 200,
         conclusion: Some("success".into()),
         head_sha: "def456".into(),
@@ -5128,6 +5192,7 @@ fn ci_check_repo_success_no_pty_inject_only_inbox() {
 fn aggregate_required_checks_ignores_non_required_failure() {
     let runs = vec![
         CiRun {
+            run_attempt: 1,
             id: 1,
             conclusion: Some("success".into()),
             head_sha: "abc".into(),
@@ -5135,6 +5200,7 @@ fn aggregate_required_checks_ignores_non_required_failure() {
             name: "CI".into(),
         },
         CiRun {
+            run_attempt: 1,
             id: 2,
             conclusion: Some("failure".into()),
             head_sha: "abc".into(),
@@ -5196,6 +5262,7 @@ fn tick_cache_dedup_same_repo_branch_single_api_call() {
         inner: Box::new(CountingProvider {
             call_count: std::sync::Arc::clone(&call_count),
             runs: vec![CiRun {
+                run_attempt: 1,
                 id: 1,
                 conclusion: Some("success".into()),
                 head_sha: "aaa".into(),
@@ -5410,6 +5477,7 @@ fn successful_poll_refreshes_expires_at() {
         "last_polled_at": null, "expires_at": old_expires,
     });
     let provider = MockCiProvider::with_runs(vec![CiRun {
+        run_attempt: 1,
         id: 200,
         conclusion: Some("success".into()),
         head_sha: "def456".into(),
@@ -5473,6 +5541,7 @@ fn early_job_failure_sends_notification() {
     use super::CiJob;
     let dir = tmp_dir("early-fail");
     let provider = MockCiProvider::with_runs(vec![CiRun {
+        run_attempt: 1,
         id: 500,
         conclusion: None,
         head_sha: "abc1234".into(),
@@ -5537,6 +5606,7 @@ fn early_job_failure_includes_running_jobs_in_message() {
     use super::CiJob;
     let dir = tmp_dir("early-fail-msg");
     let provider = MockCiProvider::with_runs(vec![CiRun {
+        run_attempt: 1,
         id: 600,
         conclusion: None,
         head_sha: "def5678".into(),
@@ -5584,6 +5654,7 @@ fn early_job_failure_dedup_prevents_repeat_notification() {
         "early_fail_notified_sha": "abc1234",
     });
     let provider = MockCiProvider::with_runs(vec![CiRun {
+        run_attempt: 1,
         id: 700,
         conclusion: None,
         head_sha: "abc1234".into(),
@@ -5613,6 +5684,7 @@ fn no_early_fail_when_all_jobs_passing() {
     use super::CiJob;
     let dir = tmp_dir("early-fail-noop");
     let provider = MockCiProvider::with_runs(vec![CiRun {
+        run_attempt: 1,
         id: 800,
         conclusion: None,
         head_sha: "ghi9999".into(),
@@ -5857,4 +5929,125 @@ fn ci_watch_deliver_matches_legacy_payload() {
     assert_eq!(msgs[0].text, body);
     assert_eq!(msgs[0].correlation_id.as_deref(), Some("o/r@feat"));
     std::fs::remove_dir_all(&home).ok();
+}
+
+// ── #1859 Fix B: rerun (run_attempt) attempt-aware dedup ──────────────────────
+
+fn rerun_run(attempt: u64) -> CiRun {
+    CiRun {
+        id: 7,
+        conclusion: Some("success".into()),
+        head_sha: "s".into(),
+        url: String::new(),
+        name: String::new(),
+        run_attempt: attempt,
+    }
+}
+
+/// #1859 Fix B (gate 1): a same-run_id, same-conclusion run whose `run_attempt`
+/// advanced (a `gh run rerun`) must be selected — NOT suppressed as a stable
+/// terminal state. An equal attempt stays suppressed (anti-over-notify).
+#[test]
+fn select_runs_to_notify_attempt_advance_1859_fixb() {
+    // last notified: run_id 7, success, attempt 1. Same attempt → suppress.
+    assert!(
+        select_runs_to_notify(&[rerun_run(1)], Some(7), Some("success"), Some(1)).is_empty(),
+        "same id+conclusion+attempt → suppress (stable terminal state)"
+    );
+    // Advanced attempt (1→2) at the same conclusion → selected (the rerun).
+    assert_eq!(
+        select_runs_to_notify(&[rerun_run(2)], Some(7), Some("success"), Some(1)),
+        vec![0],
+        "#1859 Fix B: attempt 1→2, same conclusion → select (rerun is a fresh event)"
+    );
+}
+
+/// #1859 Fix B (gate 2): same head_sha + same conclusion + advanced attempt →
+/// NOT filtered; equal attempt → filtered.
+#[test]
+fn dedupe_by_head_sha_attempt_advance_1859_fixb() {
+    assert!(
+        dedupe_notifications_by_head_sha(
+            &[rerun_run(1)],
+            &[0],
+            Some("s"),
+            Some("success"),
+            Some(1)
+        )
+        .is_empty(),
+        "same sha+conclusion+attempt → filtered"
+    );
+    assert_eq!(
+        dedupe_notifications_by_head_sha(
+            &[rerun_run(2)],
+            &[0],
+            Some("s"),
+            Some("success"),
+            Some(1)
+        )
+        .len(),
+        1,
+        "#1859 Fix B: attempt 1→2 → not filtered"
+    );
+}
+
+/// #1859 Fix B (end-to-end via the real `ci_check_repo` entry): a `gh run rerun`
+/// (same run_id + head_sha + conclusion, attempt 1→2) RE-notifies the chain
+/// target exactly once (was silently swallowed pre-fix); a subsequent poll at the
+/// SAME attempt does NOT re-notify (anti-over-notify).
+#[test]
+fn ci_check_repo_rerun_renotifies_once_1859_fixb() {
+    let dir = tmp_dir("1859-fixb-rerun-e2e");
+    let ci_dir = dir.join("ci-watches");
+    std::fs::create_dir_all(&ci_dir).ok();
+    let watch = watch_with_chain(Some("reviewer"));
+    let watch_path = ci_dir.join(watch_filename("o/r", "feat"));
+    std::fs::write(&watch_path, serde_json::to_string_pretty(&watch).unwrap()).unwrap();
+    let registry: AgentRegistry =
+        Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    // One poll at `attempt`: re-loads the persisted state, runs the real entry,
+    // returns how many `[ci-ready-for-action]` the chain target received.
+    let poll = |attempt: u64| -> usize {
+        let run = CiRun {
+            id: 2,
+            conclusion: Some("success".to_string()),
+            head_sha: "abc1234".to_string(),
+            url: String::new(),
+            name: String::new(),
+            run_attempt: attempt,
+        };
+        let provider = MockCiProvider::with_runs(vec![run]);
+        let content = std::fs::read_to_string(&watch_path).unwrap();
+        rt.block_on(ci_check_repo(
+            &dir,
+            &watch_path,
+            serde_json::from_str(&content).unwrap(),
+            vec!["dev".to_string()],
+            &registry,
+            &provider,
+        ))
+        .unwrap();
+        crate::inbox::drain(&dir, "reviewer")
+            .iter()
+            .filter(|m| m.text.contains("[ci-ready-for-action]"))
+            .count()
+    };
+
+    assert_eq!(poll(1), 1, "first attempt notifies the chain target");
+    assert_eq!(
+        poll(2),
+        1,
+        "#1859 Fix B: rerun (attempt 1→2, same conclusion) RE-notifies (filtered pre-fix)"
+    );
+    assert_eq!(
+        poll(2),
+        0,
+        "anti-over-notify: a stable attempt does NOT re-notify on the next poll"
+    );
+    std::fs::remove_dir_all(&dir).ok();
 }

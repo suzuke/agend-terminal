@@ -592,6 +592,7 @@ pub(crate) fn select_runs_to_notify(
     runs: &[CiRun],
     last_run_id: Option<u64>,
     last_notified_conclusion: Option<&str>,
+    last_notified_run_attempt: Option<u64>,
 ) -> Vec<usize> {
     let threshold = last_run_id.unwrap_or(0);
     let mut selected: Vec<(usize, u64)> = runs
@@ -606,10 +607,16 @@ pub(crate) fn select_runs_to_notify(
                 return None;
             }
             if run.id == threshold {
-                // Same run_id as last notified. #786: include only when
-                // conclusion changed (rerun changed outcome). Equal
-                // conclusion → suppress (stable terminal state).
-                if run.conclusion.as_deref() == last_notified_conclusion {
+                // Same run_id as last notified. #786: include when the
+                // conclusion changed (rerun changed outcome). #1859 Fix B: ALSO
+                // include when the `run_attempt` advanced — a `gh run rerun`
+                // keeps the id+conclusion and only bumps the attempt, so an equal
+                // conclusion at a NEW attempt is a fresh event (flake re-run),
+                // not a stable terminal state. Suppress only when BOTH are equal.
+                let same_conclusion = run.conclusion.as_deref() == last_notified_conclusion;
+                let attempt_advanced =
+                    last_notified_run_attempt.is_some_and(|prev| run.run_attempt > prev);
+                if same_conclusion && !attempt_advanced {
                     return None;
                 }
             }
@@ -641,6 +648,7 @@ pub(crate) fn dedupe_notifications_by_head_sha<'a>(
     to_notify: &[usize],
     last_notified_sha: Option<&str>,
     last_notified_conclusion: Option<&str>,
+    last_notified_run_attempt: Option<u64>,
 ) -> Vec<(usize, u64, &'a str)> {
     let mut best: std::collections::HashMap<&str, (usize, u64)> = std::collections::HashMap::new();
     for &idx in to_notify {
@@ -658,13 +666,20 @@ pub(crate) fn dedupe_notifications_by_head_sha<'a>(
     let notify_set: std::collections::HashSet<usize> = to_notify.iter().copied().collect();
     let mut result: Vec<_> = best
         .into_iter()
-        .filter(|(sha, (_idx, _))| {
+        .filter(|(sha, (idx, _))| {
             if last_notified_sha != Some(*sha) {
                 return true;
             }
             // #1307: aggregate only over to_notify runs so stale failed
             // runs (filtered by gate 1) don't poison the conclusion.
-            aggregate_conclusion_for_indices(runs, &notify_set, sha) != last_notified_conclusion
+            let conclusion_changed = aggregate_conclusion_for_indices(runs, &notify_set, sha)
+                != last_notified_conclusion;
+            // #1859 Fix B: a same-sha, same-conclusion run whose `run_attempt`
+            // advanced (a `gh run rerun`) is a fresh notifiable event, not a
+            // stable terminal state to suppress.
+            let attempt_advanced =
+                last_notified_run_attempt.is_some_and(|prev| runs[*idx].run_attempt > prev);
+            conclusion_changed || attempt_advanced
         })
         .map(|(sha, (idx, id))| (idx, id, sha))
         .collect();
@@ -1114,6 +1129,7 @@ struct RunTracking<'a> {
     prev_head_sha: Option<&'a str>,
     last_notified_sha: Option<&'a str>,
     last_notified_conclusion: Option<&'a str>,
+    last_notified_run_attempt: Option<u64>,
     last_stale_emitted_sha: Option<&'a str>,
 }
 
@@ -1127,6 +1143,7 @@ struct NotifyOutcome {
     max_notified_id: u64,
     new_notified_sha: Option<String>,
     new_notified_conclusion: Option<String>,
+    new_notified_run_attempt: Option<u64>,
     new_stale_emitted_sha: Option<String>,
 }
 
@@ -1178,6 +1195,7 @@ async fn ci_check_repo(
         prev_head_sha: prev_head_sha.as_deref(),
         last_notified_sha: last_notified_sha.as_deref(),
         last_notified_conclusion: last_notified_conclusion.as_deref(),
+        last_notified_run_attempt: state.last_notified_run_attempt,
         last_stale_emitted_sha: last_stale_emitted_sha.as_deref(),
     };
     let pr = match poll_ci_runs(&ctx, &tracking, &mut state, provider).await {
@@ -1210,6 +1228,7 @@ async fn ci_check_repo(
         &pr.runs,
         pr.effective_last_run_id,
         tracking.last_notified_conclusion,
+        tracking.last_notified_run_attempt,
     );
     if to_notify.is_empty() {
         if let Some(id) = pr.effective_last_run_id {
@@ -1230,6 +1249,7 @@ async fn ci_check_repo(
         &to_notify,
         tracking.last_notified_sha,
         tracking.last_notified_conclusion,
+        tracking.last_notified_run_attempt,
     );
     let outcome =
         fan_out_notifications(&ctx, &state, &pr, &deduped, &tracking, registry, provider).await;
@@ -1467,6 +1487,7 @@ async fn fan_out_notifications(
     let mut max_notified_id = pr.effective_last_run_id.unwrap_or(0);
     let mut new_notified_sha = tracking.last_notified_sha.map(String::from);
     let mut new_notified_conclusion = tracking.last_notified_conclusion.map(String::from);
+    let mut new_notified_run_attempt = tracking.last_notified_run_attempt;
     let mut new_stale_emitted_sha = tracking.last_stale_emitted_sha.map(String::from);
 
     for (idx, run_id, sha) in deduped {
@@ -1483,6 +1504,7 @@ async fn fan_out_notifications(
             if new_stale_emitted_sha.as_deref() == Some(*sha) {
                 new_notified_sha = Some(sha.to_string());
                 new_notified_conclusion = conclusion.map(String::from);
+                new_notified_run_attempt = Some(run.run_attempt);
                 continue;
             }
             tracing::info!(
@@ -1494,6 +1516,7 @@ async fn fan_out_notifications(
             );
             new_notified_sha = Some(sha.to_string());
             new_notified_conclusion = conclusion.map(String::from);
+            new_notified_run_attempt = Some(run.run_attempt);
             new_stale_emitted_sha = Some(sha.to_string());
             continue;
         }
@@ -1597,12 +1620,14 @@ async fn fan_out_notifications(
         }
         new_notified_sha = Some(sha.to_string());
         new_notified_conclusion = conclusion.map(String::from);
+        new_notified_run_attempt = Some(run.run_attempt);
     }
 
     NotifyOutcome {
         max_notified_id,
         new_notified_sha,
         new_notified_conclusion,
+        new_notified_run_attempt,
         new_stale_emitted_sha,
     }
 }
@@ -1760,6 +1785,9 @@ fn persist_watch_state(
     }
     if let Some(c) = &outcome.new_notified_conclusion {
         state.last_notified_conclusion = Some(c.clone());
+    }
+    if let Some(a) = outcome.new_notified_run_attempt {
+        state.last_notified_run_attempt = Some(a);
     }
     if let Some(s) = &outcome.new_stale_emitted_sha {
         state.last_stale_emitted_sha = Some(s.clone());

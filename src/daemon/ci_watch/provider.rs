@@ -121,6 +121,12 @@ pub struct CiRun {
     /// Workflow name (e.g. "CI", "LOC Overrun Check").
     /// Used by #1151 to filter to required checks only.
     pub name: String,
+    /// #1859 Fix B: GitHub Actions `run_attempt` (1 for the first run, +1 per
+    /// `gh run rerun`). A rerun keeps the SAME `id` (+ head_sha + conclusion) and
+    /// only bumps this, so the dedup gates treat an attempt INCREASE as a new
+    /// notifiable event (otherwise a flake-rerun fail→pass is silently swallowed).
+    /// Providers without an attempt concept (a retry mints a new run id) report 1.
+    pub run_attempt: u64,
 }
 
 /// A single job within a CI run (#1326 job-level early-fail).
@@ -404,6 +410,7 @@ impl CiProvider for GitHubCiProvider {
                             head_sha: r["head_sha"].as_str()?.to_string(),
                             url: r["html_url"].as_str().unwrap_or("").to_string(),
                             name: r["name"].as_str().unwrap_or("").to_string(),
+                            run_attempt: r["run_attempt"].as_u64().unwrap_or(1),
                         })
                     })
                     .collect()
@@ -472,6 +479,7 @@ impl CiProvider for GitHubCiProvider {
                                     head_sha: r["head_sha"].as_str()?.to_string(),
                                     url: r["html_url"].as_str().unwrap_or("").to_string(),
                                     name: r["name"].as_str().unwrap_or("").to_string(),
+                                    run_attempt: r["run_attempt"].as_u64().unwrap_or(1),
                                 },
                             })
                         })
@@ -852,6 +860,8 @@ impl CiProvider for GitLabCiProvider {
                             head_sha: r["sha"].as_str()?.to_string(),
                             url: r["web_url"].as_str().unwrap_or("").to_string(),
                             name: r["name"].as_str().unwrap_or("").to_string(),
+                            // GitLab retries mint a new pipeline id → no attempt concept.
+                            run_attempt: 1,
                         })
                     })
                     .collect()
@@ -1072,6 +1082,8 @@ impl CiProvider for BitbucketCiProvider {
                                 .unwrap_or("")
                                 .to_string(),
                             name: r["pipeline"]["title"].as_str().unwrap_or("").to_string(),
+                            // Bitbucket retries mint a new build number → no attempt concept.
+                            run_attempt: 1,
                         })
                     })
                     .collect()

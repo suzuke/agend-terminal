@@ -264,6 +264,7 @@ pub(super) fn flush_watch_state(watch_path: &Path, state: &super::watch_state::W
     merged.last_terminal_seen_at = state.last_terminal_seen_at.clone();
     merged.last_notified_head_sha = state.last_notified_head_sha.clone();
     merged.last_notified_conclusion = state.last_notified_conclusion.clone();
+    merged.last_notified_run_attempt = state.last_notified_run_attempt;
     merged.last_stale_emitted_sha = state.last_stale_emitted_sha.clone();
     merged.last_mergeable_state = state.last_mergeable_state.clone();
     merged.last_mergeable_check_at = state.last_mergeable_check_at.clone();

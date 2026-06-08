@@ -43,6 +43,12 @@ pub struct WatchState {
     pub last_notified_head_sha: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_notified_conclusion: Option<String>,
+    /// #1859 Fix B: `run_attempt` of the last-notified run. A `gh run rerun`
+    /// keeps the same id/sha/conclusion and only bumps the attempt, so the dedup
+    /// gates notify again when the current attempt EXCEEDS this. `None` on a
+    /// legacy watch (pre-Fix-B) → the first post-upgrade notify seeds it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_notified_run_attempt: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_stale_emitted_sha: Option<String>,
 
