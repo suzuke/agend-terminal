@@ -160,7 +160,43 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
     // the short-circuit does NOT fire and the genuine `git worktree add`
     // conflict error below is preserved. Same-agent DIFFERENT-branch bindings
     // also fall through (branch mismatch), unchanged.
+    //
+    // #1882 (reviewer-2): repo checkout is the THIRD production bind path (besides
+    // the dispatch + bind_self funnel through dispatch_auto_bind_lease). Hold the
+    // SAME per-branch lease flock across its check-then-act (cross-agent scan +
+    // idempotent read + git worktree add + bind_full) so a concurrent dispatch or
+    // another repo checkout can't double-bind the branch. Bind-only (a `--detach`
+    // checkout writes no binding); the guard lives to fn end so it covers bind_full.
+    let _lease_lock = if bind {
+        match crate::binding::acquire_branch_lease_lock(home, branch) {
+            Ok(g) => Some(g),
+            Err(e) => {
+                return json!({
+                    "error": format!("could not acquire branch lease lock for '{branch}': {e}"),
+                    "code": "lease_lock",
+                    "branch": branch,
+                })
+            }
+        }
+    } else {
+        None
+    };
     if bind {
+        // #1882: cross-agent P0-1.5 reject UNDER the lock — another agent holding
+        // this branch is refused (mirrors the dispatch path's scan), rather than
+        // leaning on `git worktree add`'s "already checked out" error. The
+        // same-agent idempotent short-circuit below handles THIS agent re-checkout.
+        if let Some(other) =
+            crate::binding::scan_existing_branch_binding(home, branch, instance_name)
+        {
+            return json!({
+                "error": format!(
+                    "branch '{branch}' already leased by '{other}' — release first or use a different branch"
+                ),
+                "code": "cross_agent_conflict",
+                "branch": branch,
+            });
+        }
         if let Some(existing) = crate::binding::read(home, instance_name) {
             let same_branch = existing.get("branch").and_then(|v| v.as_str()) == Some(branch);
             let live_wt = existing

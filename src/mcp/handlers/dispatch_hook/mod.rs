@@ -359,9 +359,12 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
     // racing to lease the SAME branch both passed the scan (neither had bound yet)
     // and both bound — violating "a branch is held by at most one agent". Keyed on
     // the branch (not the agent): the second racer blocks here, then its scan below
-    // sees the first's binding and rejects. Both bind paths funnel through this fn
-    // (dispatch auto-bind AND bind_self via dispatch_auto_bind_lease_with_source),
-    // so this one lock covers both. Lock order is consistent (per-agent BindGuard
+    // sees the first's binding and rejects. Two of the three production bind paths
+    // funnel through this fn (dispatch auto-bind AND bind_self via
+    // dispatch_auto_bind_lease_with_source); the third — repo checkout
+    // (`ci/mod.rs`, reviewer-2 #1882) — takes the SAME `acquire_branch_lease_lock`
+    // around its own scan + bind_full, so all three serialize on the one branch
+    // lock. Lock order is consistent (per-agent BindGuard
     // above → this branch lock → per-agent binding lock inside bind_full), so no
     // deadlock; different branches use different lock files → no cross-branch
     // contention. Held only across the bind (a short mutex), so release is unaffected.

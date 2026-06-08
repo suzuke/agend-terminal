@@ -819,6 +819,69 @@ fn checkout_bind_true_writes_binding_marker_and_arms_watch() {
     std::fs::remove_dir_all(&parent).ok();
 }
 
+/// §3.9 #1882 (reviewer-2 re-verify): the repo-checkout bind path is the third
+/// production bind site. An end-to-end conflict — agent A checks out + binds a
+/// branch, then agent B repo-checkouts the SAME branch — must end with EXACTLY
+/// one binding: B is rejected (`cross_agent_conflict`) under the shared per-branch
+/// lease lock + scan, NOT double-bound. Regression-proof: pre-fix B had no scan,
+/// so it reached `git worktree add` and failed with a raw "already checked out"
+/// error (different code) or, on a different worktree scheme, double-bound.
+#[test]
+#[cfg(unix)]
+fn checkout_bind_rejects_cross_agent_branch_conflict_1882() {
+    let home = p778_tmp_home("xagent");
+    let parent = p778_tmp_home("xagent-src-parent");
+    let source = p778_setup_source_repo(&parent, "feat/shared");
+
+    // Agent A checks out + binds feat/shared.
+    let a = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "repository_path": source.display().to_string(),
+            "branch": "feat/shared",
+            "bind": true,
+        }),
+        "agent-a",
+    );
+    assert!(
+        a.get("error").is_none(),
+        "agent A checkout must succeed: {a}"
+    );
+    assert_eq!(a["bound"].as_bool(), Some(true));
+
+    // Agent B tries the SAME branch → rejected (cross-agent), not double-bound.
+    let b = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "repository_path": source.display().to_string(),
+            "branch": "feat/shared",
+            "bind": true,
+        }),
+        "agent-b",
+    );
+    assert_eq!(
+        b["code"].as_str(),
+        Some("cross_agent_conflict"),
+        "#1882: a second agent on the same branch must be rejected: {b}"
+    );
+    assert!(
+        !crate::paths::runtime_dir(&home)
+            .join("agent-b")
+            .join("binding.json")
+            .exists(),
+        "#1882: the rejected agent must NOT be bound"
+    );
+    // Exactly one binding holds feat/shared (it is agent-a's).
+    assert_eq!(
+        crate::binding::scan_existing_branch_binding(&home, "feat/shared", ""),
+        Some("agent-a".to_string()),
+        "#1882: exactly one agent must hold the branch after the conflict"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
+
 #[test]
 #[cfg(unix)]
 fn checkout_bind_true_idempotent_when_already_bound_1494() {
