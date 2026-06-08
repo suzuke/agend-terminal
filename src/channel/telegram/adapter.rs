@@ -163,8 +163,19 @@ impl crate::channel::Channel for TelegramChannel {
                     caption.as_deref(),
                 ))?;
                 if needs_separate_text(&msg.text, att) {
-                    let _ =
-                        block_on_value(send_with_topic(&bot, group_id, topic_id, &msg.text, None));
+                    // #1878: do NOT swallow the follow-up text send. Pre-fix this
+                    // discarded its error while still returning Ok(media id) — a
+                    // fake success that delivered the attachment but silently lost
+                    // the message body. Propagate so the caller sees the failure
+                    // (its existing send-error handling: retry / surface),
+                    // consistent with the media send above.
+                    block_on_value(send_with_topic(&bot, group_id, topic_id, &msg.text, None))
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "telegram: media sent (id {msg_id}) but the separate \
+                                 follow-up text failed: {e}"
+                            )
+                        })?;
                 }
                 Ok(crate::channel::MsgRef {
                     binding: build_telegram_msg_binding(topic_id),
@@ -578,5 +589,37 @@ mod tests {
                 "{label}: {err_str}"
             );
         }
+    }
+
+    /// #1878 §3.9 (source invariant): the `send` fn's media+text arm must NOT
+    /// swallow the separate follow-up text send. Pre-fix `let _ = …send_with_topic`
+    /// dropped its error while still returning `Ok(media id)` — a fake success that
+    /// delivered the attachment but silently lost the message body. (No mock-bot
+    /// harness exists to behavior-test "media ok + text fails" — every send test
+    /// hits the bot-uninitialised path before reaching the media arm — so this
+    /// pins the structural fix, same precedent as `handle_message_body_has_no_block_on`.)
+    #[test]
+    fn send_propagates_separate_text_error_1878() {
+        let src = include_str!("adapter.rs");
+        let start = src.find("fn send(").expect("send fn must exist");
+        let rest = &src[start..];
+        let guard = rest
+            .find("needs_separate_text(&msg.text, att)")
+            .expect("media+text path must exist");
+        // The follow-up text send lives between the guard and the arm's
+        // `Ok(crate::channel::MsgRef …)` return.
+        let block_end = rest[guard..]
+            .find("Ok(crate::channel::MsgRef")
+            .expect("media arm must return Ok(MsgRef)");
+        let block = &rest[guard..guard + block_end];
+        assert!(
+            !block.contains("let _ ="),
+            "#1878: the separate follow-up text send must NOT be swallowed (fake \
+             success on a dropped message body)"
+        );
+        assert!(
+            block.contains("send_with_topic") && (block.contains('?') || block.contains("map_err")),
+            "#1878: the separate follow-up text send must be PROPAGATED (? / map_err), not dropped"
+        );
     }
 }
