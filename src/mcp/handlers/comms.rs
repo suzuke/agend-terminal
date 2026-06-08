@@ -356,19 +356,16 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
         &json!({
             "request_id": uuid::Uuid::new_v4().to_string(),
             "method": crate::api::method::SEND,
+            // HIGH-1: forward the dispatch directives the SEND handler reads
+            // (messaging.rs) that this re-marshal dropped (#1833 class; the
+            // sibling forwards them all; `worktree_binding_required` is a gate).
             "params": {
-                "from": sender.as_str(),
-                "target": target,
-                "text": msg,
-                "kind": "task",
-                "task_id": task_id_str,
-                "force_meta": force_meta_json,
-                "provenance": {
-                    "from": sender.as_str(),
-                    "task": task,
-                },
-                "branch": args["branch"].as_str(),
-                "expect_reply_within_secs": args["expect_reply_within_secs"].as_i64(),
+                "from": sender.as_str(), "target": target, "text": msg, "kind": "task",
+                "task_id": task_id_str, "force_meta": force_meta_json,
+                "provenance": { "from": sender.as_str(), "task": task },
+                "branch": args["branch"].as_str(), "expect_reply_within_secs": args["expect_reply_within_secs"].as_i64(),
+                "correlation_id": args["correlation_id"].as_str(), "reviewed_head": args["reviewed_head"].as_str(), "sequencing": args["sequencing"].as_str(), "eta_minutes": args["eta_minutes"].as_u64(), "reporting_cadence": args["reporting_cadence"].as_str(),
+                "worktree_binding_required": args["worktree_binding_required"].as_bool(), "terminal": args["terminal"].as_bool(), "thread_id": args["thread_id"].as_str(), "parent_id": args["parent_id"].as_str(),
             }
         }),
     ) {
@@ -385,6 +382,17 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
                 from: format!("from:{}", sender.as_str()),
                 text: msg.clone(),
                 kind: Some("task".to_string()),
+                // HIGH-1: carry the same dispatch directives so an API-blip
+                // fallback dispatch doesn't silently lose them either.
+                correlation_id: args["correlation_id"].as_str().map(String::from),
+                reviewed_head: args["reviewed_head"].as_str().map(String::from),
+                sequencing: args["sequencing"].as_str().map(String::from),
+                eta_minutes: args["eta_minutes"].as_u64().map(|v| v as u32),
+                reporting_cadence: args["reporting_cadence"].as_str().map(String::from),
+                worktree_binding_required: args["worktree_binding_required"].as_bool(),
+                terminal: args["terminal"].as_bool(),
+                thread_id: args["thread_id"].as_str().map(String::from),
+                parent_id: args["parent_id"].as_str().map(String::from),
                 timestamp: chrono::Utc::now().to_rfc3339(),
                 ..Default::default()
             };

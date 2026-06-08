@@ -1443,6 +1443,61 @@ fn test_delegate_task_force_true_bypasses_busy_gate() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// §3.9 (HIGH-1 bug-hunt): a `send(request_kind=task, …)` carrying dispatch
+/// directives must DELIVER them on the receiver's InboxMessage — they were
+/// silently dropped by `handle_delegate_task`'s SEND re-marshal (same
+/// allowlist-drop class as #1833). Drives the real `send` MCP entry; in tests
+/// the daemon API is unreachable so this exercises the fallback delivery (which
+/// the fix also populates). Regression-proof: revert the field forwards and
+/// these assertions fail (every field is `None`).
+#[test]
+fn delegate_task_forwards_dispatch_directives_high1() {
+    let _g = fleet_test_guard();
+    let (_rec, home) = setup_recorder("delegate-directives");
+
+    let result = handle_tool(
+        "send",
+        &json!({
+            "instance": "target",
+            "task": "impl X",
+            "message": "impl X",
+            "request_kind": "task",
+            "task_id": "t-high1-1",
+            "worktree_binding_required": true,
+            "sequencing": "sequential-merge-only",
+            "correlation_id": "c-high1",
+            "reviewed_head": "abc1234",
+            "eta_minutes": 30,
+            "reporting_cadence": "wave-end",
+            "terminal": true
+        }),
+        "sender",
+    );
+    assert!(is_ok_result(&result), "delegate must succeed: {result}");
+
+    let msgs = crate::inbox::drain(&home, "target");
+    assert!(!msgs.is_empty(), "target must have the dispatched message");
+    let m = &msgs[0];
+    // The delivery gate field — the highest-stakes drop.
+    assert_eq!(
+        m.worktree_binding_required,
+        Some(true),
+        "worktree_binding_required must reach the InboxMessage (delivery gate)"
+    );
+    assert_eq!(m.sequencing.as_deref(), Some("sequential-merge-only"));
+    assert_eq!(m.correlation_id.as_deref(), Some("c-high1"));
+    assert_eq!(m.reviewed_head.as_deref(), Some("abc1234"));
+    assert_eq!(m.eta_minutes, Some(30));
+    assert_eq!(m.reporting_cadence.as_deref(), Some("wave-end"));
+    assert_eq!(m.terminal, Some(true));
+    // Task-specific fields must remain intact (no clash with the new forwards).
+    assert_eq!(m.task_id.as_deref(), Some("t-high1-1"));
+    assert_eq!(m.kind.as_deref(), Some("task"));
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
 #[test]
 fn test_delegate_task_force_true_without_reason_rejected() {
     let _g = fleet_test_guard();
