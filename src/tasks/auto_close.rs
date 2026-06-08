@@ -52,9 +52,14 @@ pub fn auto_close_on_report(
         },
     };
     let emitter = crate::task_events::InstanceName::from("system:auto-close");
-    crate::task_events::append(home, &emitter, event)?;
-    let _ = crate::daemon::dispatch_idle::cleanup_pending_for_task_id(home, correlation_id);
-    Ok(true)
+    // #1873: re-validate →Done UNDER the lock — a concurrent cancel between the
+    // out-of-lock status check above and this append must not be flipped to Done.
+    let closed =
+        crate::task_events::append_done_if_legal(home, &emitter, correlation_id, vec![event])?;
+    if closed {
+        let _ = crate::daemon::dispatch_idle::cleanup_pending_for_task_id(home, correlation_id);
+    }
+    Ok(closed)
 }
 
 #[cfg(test)]
@@ -318,6 +323,62 @@ mod tests {
         assert!(
             !closed,
             "already-cancelled task should return false (idempotent)"
+        );
+    }
+
+    /// #1873 §3.9: `append_done_if_legal` — the in-lock guard BOTH daemon →Done
+    /// paths (auto_close + sweep) now use — REJECTS a →Done on a task that moved
+    /// to a terminal state (a concurrent cancel landing after the out-of-lock
+    /// check), leaving it Cancelled; a legal Claimed task still auto-closes. The
+    /// full auto_close path's happy + already-cancelled cases are covered above.
+    #[test]
+    fn append_done_if_legal_rejects_cancelled_keeps_legal_1873() {
+        let home = tmp_home("1873-guard");
+        let emitter = InstanceName::from("system:auto-close");
+        let mk_done = |id: &str| TaskEvent::Done {
+            task_id: TaskId(id.into()),
+            by: InstanceName::from("dev"),
+            source: crate::task_events::DoneSource::ReportAutoClose {
+                report_summary: "x".into(),
+                closed_at: "2026-06-09T00:00:00+00:00".into(),
+            },
+        };
+
+        // Concurrently-cancelled task → the →Done is SKIPPED, stays Cancelled.
+        seed_cancelled_task(&home, "t-cancel");
+        let closed = crate::task_events::append_done_if_legal(
+            &home,
+            &emitter,
+            "t-cancel",
+            vec![mk_done("t-cancel")],
+        )
+        .unwrap();
+        assert!(
+            !closed,
+            "#1873: a daemon →Done on a Cancelled task must be SKIPPED"
+        );
+        assert_eq!(
+            task_status(&home, "t-cancel"),
+            Some(crate::task_events::TaskStatus::Cancelled),
+            "task must stay Cancelled (not flipped to Done)"
+        );
+
+        // Legal Claimed task → still auto-closes.
+        seed_claimed_task(&home, "t-ok", "dev");
+        let closed_ok = crate::task_events::append_done_if_legal(
+            &home,
+            &emitter,
+            "t-ok",
+            vec![mk_done("t-ok")],
+        )
+        .unwrap();
+        assert!(
+            closed_ok,
+            "#1873: a legal Claimed task must still auto-close"
+        );
+        assert_eq!(
+            task_status(&home, "t-ok"),
+            Some(crate::task_events::TaskStatus::Done)
         );
     }
 }
