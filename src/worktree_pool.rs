@@ -152,8 +152,15 @@ fn cleanup_merged_branch(
         return (false, Some(format!("branch '{branch}' is protected")));
     }
 
-    let remote = crate::git_helpers::primary_remote(source_repo);
-    let _ = crate::git_helpers::git_bypass(source_repo, &["fetch", "--prune", &remote]);
+    // #t-7 (#1824 follow-up): a `git fetch --prune` MUTATES the source repo's
+    // remote-tracking refs (refs/remotes/...), so it must NOT run on a dry-run —
+    // a dry-run release must be observation-only. The non-dry-run path keeps the
+    // fresh fetch so `is_merged` / `is_gone` below are accurate; the dry-run
+    // preview falls back to the existing local refs (best-effort "would delete").
+    if !dry_run {
+        let remote = crate::git_helpers::primary_remote(source_repo);
+        let _ = crate::git_helpers::git_bypass(source_repo, &["fetch", "--prune", &remote]);
+    }
 
     let default = crate::git_helpers::default_branch(source_repo);
     let is_merged = crate::git_helpers::git_bypass(
@@ -2559,6 +2566,74 @@ mod tests {
 
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// §3.9 (#t-7, #1824 follow-up): a dry-run `release_full` must be
+    /// observation-only — it must NOT run the ref-mutating `git fetch --prune`
+    /// inside `cleanup_merged_branch`. Proven by planting a STALE
+    /// remote-tracking ref (`refs/remotes/origin/ghost`, absent on the real
+    /// origin) that a `fetch --prune` WOULD remove, then asserting it survives a
+    /// dry-run. Regression-proof: un-gate the fetch and `ghost` is pruned →
+    /// the ref set differs.
+    #[test]
+    fn dry_run_release_does_not_mutate_remote_tracking_refs_t7() {
+        fn git(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("AGEND_GIT_BYPASS", "1")
+                .output()
+                .expect("git")
+        }
+        fn refs_remotes(dir: &std::path::Path) -> String {
+            String::from_utf8_lossy(&git(dir, &["for-each-ref", "refs/remotes"]).stdout).to_string()
+        }
+
+        let home = tmp_home("t7-dryrun-refs");
+        // A real upstream + a clone (so the clone has an `origin` remote +
+        // refs/remotes/origin/*). `release_full` operates on the clone.
+        let origin = tmp_repo("t7-origin");
+        let source = tmp_home("t7-source");
+        git(
+            std::path::Path::new("/"),
+            &[
+                "clone",
+                &origin.display().to_string(),
+                &source.display().to_string(),
+            ],
+        );
+        // Plant a stale remote-tracking ref that `fetch --prune` would remove.
+        let head = String::from_utf8_lossy(&git(&source, &["rev-parse", "HEAD"]).stdout)
+            .trim()
+            .to_string();
+        git(&source, &["update-ref", "refs/remotes/origin/ghost", &head]);
+
+        // Lease a worktree in the clone (binds source_repo=source); merge state
+        // is irrelevant — the fetch runs BEFORE the merge check.
+        let _l = lease(&home, &source, "agent-t7", "feat/t7").expect("lease");
+
+        let before = refs_remotes(&source);
+        assert!(
+            before.contains("refs/remotes/origin/ghost"),
+            "pre-cond: stale ghost ref planted: {before}"
+        );
+
+        let outcome = release_full(&home, "agent-t7", true); // dry-run
+        assert!(outcome.released, "dry-run reports observation success");
+
+        let after = refs_remotes(&source);
+        assert_eq!(
+            before, after,
+            "dry-run must NOT mutate remote-tracking refs (no fetch --prune)"
+        );
+        assert!(
+            after.contains("refs/remotes/origin/ghost"),
+            "the prune-target stale ref must survive a dry-run: {after}"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&origin).ok();
+        std::fs::remove_dir_all(&source).ok();
     }
 
     #[test]
