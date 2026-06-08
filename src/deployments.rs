@@ -559,9 +559,36 @@ pub fn list(home: &Path) -> Value {
 /// a single per-instance failure doesn't abort the rest of the sweep.
 fn cleanup_deployment_dirs(home: &Path, deployment: &Deployment) {
     let custom_root = std::path::Path::new(&deployment.directory);
+    // MED-4: a branch-mode deploy creates a git worktree per instance via
+    // `git worktree add -b {deploy}/{suffix}` in the deploy directory (which IS
+    // the source repo in branch mode). A bare `remove_dir_all` left a prunable
+    // `.git/worktrees/<seg>` registry entry + the orphan branch behind, so a
+    // same-name re-deploy failed ("already exists" / "already checked out").
+    // When the deploy dir is a git repo, tear the worktree + branch down FIRST,
+    // via the daemon's bypass git (mirrors `worktree_pool::release_full`). All
+    // best-effort: harmless no-ops for a non-branch deploy (subdir isn't a
+    // worktree, branch doesn't exist).
+    let dir_is_repo = crate::worktree::is_git_repo(custom_root);
     for inst in &deployment.instances {
         // Custom-directory branch: deploy()'s `inst_dir = dir.join(&inst_name)`.
         let custom_subdir = custom_root.join(inst);
+        if dir_is_repo {
+            // Instances are named `{deploy_name}-{suffix}`; the worktree branch
+            // is `{deploy_name}/{suffix}` (see prepare_work_dir).
+            let suffix = inst
+                .strip_prefix(&format!("{}-", deployment.name))
+                .unwrap_or(inst);
+            let branch = format!("{}/{}", deployment.name, suffix);
+            let subdir_str = custom_subdir.display().to_string();
+            // worktree remove unregisters + deletes the dir; branch -D drops the
+            // orphan; prune sweeps any dangling entry if the remove failed.
+            let _ = crate::git_helpers::git_bypass(
+                custom_root,
+                &["worktree", "remove", "--force", &subdir_str],
+            );
+            let _ = crate::git_helpers::git_bypass(custom_root, &["branch", "-D", &branch]);
+            let _ = crate::git_helpers::git_bypass(custom_root, &["worktree", "prune"]);
+        }
         if custom_subdir.exists() {
             match std::fs::remove_dir_all(&custom_subdir) {
                 Ok(()) => tracing::info!(
@@ -2004,6 +2031,100 @@ instances: {}
 
         // Must not panic.
         cleanup_deployment_dirs(&home, &dep);
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// §3.9 (MED-4): a branch-mode deploy creates a git worktree + branch per
+    /// instance; teardown must remove BOTH so a same-name re-deploy succeeds.
+    /// Pre-fix, `cleanup_deployment_dirs` only `remove_dir_all`'d the subdir,
+    /// leaking a prunable worktree registry entry + the orphan branch. Drives
+    /// the real `cleanup_deployment_dirs`; the decisive check is that re-creating
+    /// the same worktree+branch succeeds afterward. Regression-proof: revert the
+    /// worktree/branch GC and the re-add fails ("already exists").
+    #[test]
+    fn teardown_removes_branch_mode_worktree_and_orphan_branch_med4() {
+        fn git(dir: &Path, args: &[&str]) -> std::process::Output {
+            crate::git_helpers::git_bypass(dir, args).expect("git")
+        }
+        fn branch_exists(repo: &Path, branch: &str) -> bool {
+            git(repo, &["rev-parse", "--verify", "--quiet", branch])
+                .status
+                .success()
+        }
+
+        let home = tmp_home("med4-worktree");
+        // Branch-mode: the deploy directory IS the source repo.
+        let repo = home.join("srcrepo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        );
+
+        // Mirror prepare_work_dir: worktree `deploy-lead` on branch `deploy/lead`.
+        let inst_dir = repo.join("deploy-lead");
+        let inst_dir_str = inst_dir.display().to_string();
+        assert!(
+            git(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    "deploy/lead",
+                    &inst_dir_str,
+                    "main"
+                ]
+            )
+            .status
+            .success(),
+            "setup: worktree add must succeed"
+        );
+        assert!(
+            inst_dir.join(".git").is_file(),
+            "pre: inst_dir is a worktree"
+        );
+        assert!(branch_exists(&repo, "deploy/lead"), "pre: branch exists");
+
+        cleanup_deployment_dirs(&home, &make_deployment("deploy", &["lead"], &repo));
+
+        assert!(
+            !inst_dir.exists(),
+            "MED-4: the worktree dir must be removed"
+        );
+        assert!(
+            !branch_exists(&repo, "deploy/lead"),
+            "MED-4: the orphan branch must be deleted"
+        );
+        // Decisive: a same-name re-deploy (re-`worktree add -b`) must succeed —
+        // proving no leftover registry entry or branch.
+        assert!(
+            git(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    "deploy/lead",
+                    &inst_dir_str,
+                    "main"
+                ]
+            )
+            .status
+            .success(),
+            "MED-4: same-name re-deploy must succeed after teardown (no orphan)"
+        );
 
         std::fs::remove_dir_all(&home).ok();
     }
