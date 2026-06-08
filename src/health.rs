@@ -1048,6 +1048,17 @@ impl HealthTracker {
 mod tests {
     use super::*;
 
+    /// #1744-H2 windows-safe past `Instant`: built via the wall-clock projection
+    /// (`epoch_ms_to_instant`) instead of `Instant::now() - Duration::from_secs(n)`,
+    /// which UNDERFLOWS (panics) on a freshly-booted VM whose monotonic clock has
+    /// run for < `secs` (the test-side underflow class; production was root-fixed
+    /// in #1836). `epoch_ms_to_instant` uses `checked_sub` → never panics; on a
+    /// normal-uptime runner it is a real `secs`-ago instant, on a sub-`secs`-uptime
+    /// VM it clamps to now.
+    fn ago(secs: u64) -> Instant {
+        epoch_ms_to_instant(crate::daemon::heartbeat_pair::now_ms().saturating_sub(secs * 1000))
+    }
+
     /// #1701 ① + ②: a self-orchestrator crash escalates on the FIRST crash
     /// (unlike `record_crash`'s recent>=2 `should_notify`), and the cooldown
     /// blocks an immediate re-fire so a crash-loop can't spam the operator.
@@ -1087,7 +1098,7 @@ mod tests {
         let window = Duration::from_secs(60);
         let mut h = HealthTracker::new();
         h.state = HealthState::Hung;
-        h.hung_since = Some(Instant::now() - Duration::from_secs(61)); // sustained > window
+        h.hung_since = Some(ago(61)); // sustained > window
         assert!(
             h.hung_escalation_due(window),
             "#1701: Hung sustained past the confirm-window must escalate"
@@ -1118,7 +1129,7 @@ mod tests {
     fn hung_escalation_not_due_when_not_hung_1701() {
         let mut h = HealthTracker::new();
         h.state = HealthState::IdleLong;
-        h.hung_since = Some(Instant::now() - Duration::from_secs(300));
+        h.hung_since = Some(ago(300));
         assert!(
             !h.hung_escalation_due(Duration::from_secs(60)),
             "#1701: only HealthState::Hung escalates (IdleLong is the 348-FP case)"
@@ -1142,7 +1153,7 @@ mod tests {
         );
         // A hung escalation that is due must STILL fire — its cooldown is separate.
         h.state = HealthState::Hung;
-        h.hung_since = Some(Instant::now() - Duration::from_secs(61));
+        h.hung_since = Some(ago(61));
         assert!(
             h.hung_escalation_due(Duration::from_secs(60)),
             "#1744-H3: a recent CRASH page must not suppress a due HUNG page"
@@ -1151,7 +1162,7 @@ mod tests {
         // Symmetric: a hung page must not suppress a crash page.
         let mut h2 = HealthTracker::new();
         h2.state = HealthState::Hung;
-        h2.hung_since = Some(Instant::now() - Duration::from_secs(61));
+        h2.hung_since = Some(ago(61));
         assert!(
             h2.hung_escalation_due(Duration::from_secs(60)),
             "hung fires"
@@ -1169,7 +1180,7 @@ mod tests {
     /// age across a (simulated) restart.
     #[test]
     fn instant_epoch_ms_round_trip_1744_h2() {
-        let original = Instant::now() - Duration::from_secs(120);
+        let original = ago(120);
         let restored = super::epoch_ms_to_instant(super::instant_to_epoch_ms(original));
         let drift = restored
             .elapsed()
@@ -1216,9 +1227,19 @@ mod tests {
             !cooldown_elapsed(after.last_crash_notification),
             "#1744-H2: a cooldown stamped 100s ago must STILL suppress after restart (no duplicate P0)"
         );
+        // #1744-H2: the confirm-window anchor keeps its real age across the
+        // round-trip (NOT reset to 0). Asserted via WALL-CLOCK — re-snapshot the
+        // rehydrated tracker and check the projected epoch age — so it does not
+        // depend on the monotonic clock's ability to represent 45s in the past
+        // (the same property that lets this run on a freshly-booted VM).
+        let resnap = after.escalation_snapshot();
+        let hung_ms = resnap
+            .hung_since_epoch_ms
+            .expect("confirm-window anchor restored, not dropped");
+        let age_ms = crate::daemon::heartbeat_pair::now_ms().saturating_sub(hung_ms);
         assert!(
-            after.hung_since.is_some(),
-            "#1744-H2: the confirm-window anchor is restored, not dropped"
+            age_ms >= 40_000,
+            "#1744-H2: the anchor keeps its ~45s age across snapshot→rehydrate (not reset to 0), got {age_ms}ms"
         );
     }
 
@@ -1297,7 +1318,7 @@ mod tests {
     fn hung_since_survives_reentry_and_clears_on_exit_1744_h2() {
         let mut h = HealthTracker::new();
         // Rehydrated anchor from before the restart (agent spawns Healthy).
-        h.hung_since = Some(Instant::now() - Duration::from_secs(50));
+        h.hung_since = Some(ago(50));
         assert_eq!(h.state, HealthState::Healthy);
 
         // First post-restart Hung detection (E1: silent past threshold + input
