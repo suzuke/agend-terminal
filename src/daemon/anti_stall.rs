@@ -139,7 +139,9 @@ pub(crate) fn check_stalled(
     // skip stall detection (can't compute elapsed without one).
     let last_alive = crate::daemon::task_progress::read_last_progress_at(home, &task.id)
         .or_else(|| task.started_at.as_deref().and_then(parse_rfc3339))?;
-    let elapsed_secs = now.signed_duration_since(last_alive).num_seconds();
+    // #1870-H3: clamp so a backward clock skew (future `last_alive`) can't make
+    // elapsed negative → stall detection silently stop firing.
+    let elapsed_secs = crate::daemon::utils::elapsed_since(now, last_alive).num_seconds();
     let stall_threshold = (eta_secs as f64 * STALL_MULTIPLIER) as i64;
     if elapsed_secs > stall_threshold {
         Some(format!(
@@ -323,6 +325,27 @@ mod tests {
         let result = check_stalled(&home, &task, now);
         assert!(result.is_some(), "must detect stall: {result:?}");
         assert!(result.unwrap().contains("elapsed="), "reason format");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// §3.9 #1870-H3: a `started_at` in the FUTURE relative to `now` (a backward
+    /// clock skew — NTP / VM resume) must NOT wedge stall detection — the clamped
+    /// elapsed reads 0 ("just started"), so the watchdog re-evaluates as the clock
+    /// advances rather than computing a negative age. (Forward-elapsed stall
+    /// detection is unchanged — see `check_stalled_returns_some_when_elapsed_exceeds_1_5x_eta`.)
+    #[test]
+    fn check_stalled_future_started_at_does_not_wedge_1870_h3() {
+        let home = tmp_home("stalled-future-ts");
+        let now = chrono::Utc::now();
+        // started_at 500s in the FUTURE (clock jumped backward), eta=60 → 90s
+        // threshold. Clamped elapsed = 0 < 90 → not stalled (no false alarm and
+        // no negative wedge).
+        let future = (now + chrono::Duration::seconds(500)).to_rfc3339();
+        let task = make_task("t-future", "in_progress", Some(60), Some(&future));
+        assert!(
+            check_stalled(&home, &task, now).is_none(),
+            "#1870-H3: a future started_at must not produce a false stall"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 

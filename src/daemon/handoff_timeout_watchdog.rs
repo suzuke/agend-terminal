@@ -95,7 +95,9 @@ pub(crate) fn scan_and_emit_with<F>(
         std::collections::HashSet::new();
     for target in fleet.instances.keys() {
         for (correlation, sent_at) in crate::inbox::unread_of_kind(home, target, HANDOFF_KIND) {
-            let age_min = now.signed_duration_since(sent_at).num_minutes();
+            // #1870-H3: clamp so a backward clock skew (future `sent_at`) can't
+            // make the age negative → re-nudge / escalation silently stop firing.
+            let age_min = crate::daemon::utils::elapsed_since(*now, sent_at).num_minutes();
             let corr = correlation.unwrap_or_else(|| "<unknown>".to_string());
             let key = (target.clone(), corr.clone());
             active.insert(key.clone());

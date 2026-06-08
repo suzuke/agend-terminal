@@ -167,7 +167,11 @@ pub fn check_schedules(home: &Path) {
     }
     if any_triggered
         || last_check_in_future
-        || now_utc.signed_duration_since(last_check_utc).num_seconds() >= 10
+        // #1870-H3: route the forward-elapsed read through the shared clamp so the
+        // whole #N2 class uses one helper. The dedicated `last_check_in_future`
+        // re-stamp above still owns the backward-skew case (clamp here is a no-op
+        // for it — future last_check → 0 < 10, same as the raw negative).
+        || crate::daemon::utils::elapsed_since(now_utc, last_check_utc).num_seconds() >= 10
     {
         let _ = crate::store::atomic_write(&last_check_path, now_utc.to_rfc3339().as_bytes());
     }
