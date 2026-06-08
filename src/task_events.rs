@@ -1145,6 +1145,45 @@ where
     Ok(Ok(0))
 }
 
+/// #1873: append a DAEMON-originated →Done write (auto-close / sweep) iff the task
+/// can still legally transition to Done UNDER the append lock against fresh
+/// committed state. #1868 hardened the user `done`/`update` handlers, but daemon
+/// auto-close paths still bare-appended — so a daemon racing a peer/operator
+/// `cancel` could flip a Cancelled (terminal) task to Done. `events` is the
+/// →Done batch (the `Done` event alone, or a preceding `Linked` + `Done`).
+/// Returns `Ok(true)` if written, `Ok(false)` if SKIPPED because the task can no
+/// longer transition to Done (logged at info — the operator already holds the
+/// canonical terminal signal; not an error).
+pub fn append_done_if_legal(
+    home: &Path,
+    instance: &InstanceName,
+    task_id: &str,
+    events: Vec<TaskEvent>,
+) -> anyhow::Result<bool> {
+    let tid = TaskId(task_id.to_string());
+    let label = task_id.to_string();
+    let outcome = append_batch_checked(home, instance, events, move |state| {
+        match state.tasks.get(&tid).map(|r| r.status) {
+            Some(status) if status.can_transition_to(TaskStatus::Done) => Ok(()),
+            Some(status) => Err(format!(
+                "task '{label}' is '{status}' — cannot transition to done"
+            )),
+            None => Err(format!("task '{label}' not found")),
+        }
+    })?;
+    match outcome {
+        Ok(_) => Ok(true),
+        Err(reason) => {
+            tracing::info!(
+                target: "task_board",
+                reason = %reason,
+                "#1873: daemon →Done write skipped — task no longer transitionable to done"
+            );
+            Ok(false)
+        }
+    }
+}
+
 /// Tail-scan the hot log for the highest seq# this instance has emitted.
 /// Best-effort: malformed lines are skipped because [`replay`] is the
 /// strict reader; here we just need the high-water mark.

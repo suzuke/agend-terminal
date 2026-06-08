@@ -359,12 +359,18 @@ fn sweep_tick(home: &Path) -> anyhow::Result<()> {
                     },
                 },
             ];
-            task_events::append_batch(home, &emitter, events)?;
-            tracing::info!(
-                pr = pr.number,
-                marker = %marker,
-                "sweep: auto-closed (Linked + Done emitted)"
-            );
+            // #1873: re-validate →Done UNDER the lock. `open_ids` was snapshotted
+            // at sweep start; a marker task cancelled since must NOT be flipped to
+            // Done (the whole Linked+Done batch is skipped — a cancelled task drops
+            // out of `open_ids` next cycle, so no re-attempt).
+            let closed = task_events::append_done_if_legal(home, &emitter, &marker, events)?;
+            if closed {
+                tracing::info!(
+                    pr = pr.number,
+                    marker = %marker,
+                    "sweep: auto-closed (Linked + Done emitted)"
+                );
+            }
         }
     }
 
