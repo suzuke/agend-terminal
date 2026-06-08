@@ -106,6 +106,30 @@ pub(crate) fn clear_failed_escalated(home: &Path, name: &str) {
     }
 }
 
+/// #1870-H2: clear ONLY the `hung_since` anchor for one agent in place,
+/// preserving the crash budget / cooldowns / `failed_escalated` latch. Used by
+/// the `left_hung` persist loop when an agent has a persisted record but has
+/// already left the registry (crashed / deleted between the existence check and
+/// the registry read): it has left Hung AND is gone, so its `hung_since` must
+/// NOT survive to rehydrate a stale anchor on the next restart (which would fire
+/// a false Hung P0 on the first post-restart tick). No-op when no store / no
+/// entry exists. Distinct from `persist` (which needs a live snapshot) precisely
+/// because here the agent is no longer in the registry.
+pub(crate) fn clear_hung_since(home: &Path, name: &str) {
+    let path = store_file(home);
+    if !path.exists() {
+        return;
+    }
+    if let Err(e) = store::mutate_versioned::<EscalationStore, _, _>(&path, |s| {
+        if let Some(entry) = s.agents.get_mut(name) {
+            entry.hung_since_epoch_ms = None;
+        }
+        Ok(())
+    }) {
+        tracing::warn!(agent = %name, error = %e, "escalation_persist: clear_hung_since failed");
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -200,6 +224,55 @@ mod tests {
         clear_failed_escalated(&home, "ghost");
         let empty = tmp_home("clear-empty");
         clear_failed_escalated(&empty, "anyone");
+        assert!(load_for(&empty, "anyone").is_none());
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&empty).ok();
+    }
+
+    /// §3.9 #1870-H2: `clear_hung_since` clears ONLY the `hung_since` anchor,
+    /// preserving the crash budget / cooldowns AND the `failed_escalated` latch —
+    /// it must not over-clear (the "don't wipe a still-Hung agent's other state"
+    /// guard). After the clear, a simulated restart (`load_for`) sees no anchor →
+    /// no false Hung re-escalation.
+    #[test]
+    fn clear_hung_since_clears_only_anchor_preserves_rest_1870_h2() {
+        let home = tmp_home("clear-hung");
+        persist(
+            &home,
+            "orch",
+            &PersistedEscalation {
+                total_crashes: 5,
+                crash_times_epoch_ms: vec![100],
+                last_crash_notification_epoch_ms: Some(200),
+                last_hung_notification_epoch_ms: Some(300),
+                hung_since_epoch_ms: Some(444),
+                failed_escalated: true,
+            },
+        );
+
+        clear_hung_since(&home, "orch");
+
+        let after = load_for(&home, "orch").expect("entry survives the clear");
+        assert!(
+            after.hung_since_epoch_ms.is_none(),
+            "#1870-H2: the stale hung anchor must be cleared (so a restart can't rehydrate it)"
+        );
+        assert!(
+            after.failed_escalated,
+            "#1870-H2: clearing the hung anchor must NOT touch the failed_escalated latch"
+        );
+        assert_eq!(after.total_crashes, 5, "crash budget must be preserved");
+        assert_eq!(
+            after.last_hung_notification_epoch_ms,
+            Some(300),
+            "the hung cooldown must be preserved"
+        );
+
+        // No-op on unknown agent / missing store (no panic, no file creation).
+        clear_hung_since(&home, "ghost");
+        let empty = tmp_home("clear-hung-empty");
+        clear_hung_since(&empty, "anyone");
         assert!(load_for(&empty, "anyone").is_none());
 
         std::fs::remove_dir_all(&home).ok();

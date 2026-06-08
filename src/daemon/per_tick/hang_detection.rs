@@ -159,24 +159,50 @@ impl PerTickHandler for HangDetectionHandler {
         // Hung doesn't spawn a store entry. The snapshot's `hung_since` is now
         // None; its crash budget / cooldowns (which DO matter) are preserved.
         for name in left_hung {
-            // #1744-M7: mirror the fire loop — `Yes`|`Unknown` proceed (clearing a
-            // stale anchor on an indeterminate read is harmless and correct).
-            if crate::teams::self_orch_status(ctx.home, &name) == crate::teams::SelfOrchStatus::No {
-                continue;
-            }
-            if crate::daemon::escalation_persist::load_for(ctx.home, &name).is_none() {
-                continue;
-            }
-            let snapshot = {
-                let reg = agent::lock_registry(ctx.registry);
-                reg.values()
-                    .find(|h| h.name.as_str() == name)
-                    .map(|h| h.core.lock().health.escalation_snapshot())
-            };
-            if let Some(snapshot) = snapshot {
-                crate::daemon::escalation_persist::persist(ctx.home, &name, &snapshot);
-                tracing::debug!(agent = %name, "#1744-H2: persisted cleared hung anchor on Hung exit");
-            }
+            persist_or_clear_left_hung_anchor(ctx, &name);
+        }
+    }
+}
+
+/// #1744-H2 + #1870-H2: persist a left-Hung self-orchestrator's cleared anchor,
+/// or clear it in place if the agent has already left the registry. Extracted
+/// from the `left_hung` loop so the absent-agent (TOCTOU) branch is testable
+/// through a real entry.
+///
+/// - `self_orch_status == No` → peer-relayable, not our concern → skip.
+/// - no persisted store entry → never tracked while Hung → skip (don't spawn one).
+/// - agent in registry → persist its escalation snapshot (`hung_since` is now
+///   `None`; crash budget / cooldowns preserved). (#1744-H2)
+/// - agent ABSENT from the registry (unregistered between the `load_for` check
+///   and this read — the #1870-H2 TOCTOU) → no snapshot to persist, so clear
+///   `hung_since` in place; pre-fix this skipped and LEFT a stale anchor that a
+///   restart rehydrated into a false Hung P0.
+fn persist_or_clear_left_hung_anchor(ctx: &TickContext<'_>, name: &str) {
+    // #1744-M7: `Yes`|`Unknown` proceed (clearing on an indeterminate read is
+    // harmless + correct); only a determinate `No` skips.
+    if crate::teams::self_orch_status(ctx.home, name) == crate::teams::SelfOrchStatus::No {
+        return;
+    }
+    if crate::daemon::escalation_persist::load_for(ctx.home, name).is_none() {
+        return;
+    }
+    let snapshot = {
+        let reg = agent::lock_registry(ctx.registry);
+        reg.values()
+            .find(|h| h.name.as_str() == name)
+            .map(|h| h.core.lock().health.escalation_snapshot())
+    };
+    match snapshot {
+        Some(snapshot) => {
+            crate::daemon::escalation_persist::persist(ctx.home, name, &snapshot);
+            tracing::debug!(agent = %name, "#1744-H2: persisted cleared hung anchor on Hung exit");
+        }
+        None => {
+            crate::daemon::escalation_persist::clear_hung_since(ctx.home, name);
+            tracing::debug!(
+                agent = %name,
+                "#1870-H2: cleared hung anchor for agent absent from registry on Hung exit"
+            );
         }
     }
 }
@@ -260,5 +286,68 @@ mod tests {
     #[test]
     fn name_matches_module() {
         assert_eq!(HangDetectionHandler::new().name(), "hang_detection");
+    }
+
+    /// §3.9 #1870-H2 (real branch): a self-orch with a persisted hung record that
+    /// has LEFT the registry (the TOCTOU end-state — unregistered between the
+    /// `load_for` check and the registry read) gets its `hung_since` cleared in
+    /// place, NOT skipped. Pre-fix this skipped → a restart rehydrated the stale
+    /// anchor → false Hung P0. No teams file → `self_orch_status` = Unknown →
+    /// proceeds (#1744-M7).
+    #[test]
+    fn left_hung_anchor_cleared_when_agent_absent_from_registry_1870_h2() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-h2-absent-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).ok();
+        // Make orch-1 a self-orchestrator (orchestrator of its own team) so the
+        // #1744-M7 gate proceeds (a non-self-orch is peer-relayable → skipped).
+        crate::teams::create(
+            &home,
+            &serde_json::json!({"name": "t", "members": ["orch-1"], "orchestrator": "orch-1"}),
+        );
+        // Persisted hung record (the agent was tracked while Hung).
+        crate::daemon::escalation_persist::persist(
+            &home,
+            "orch-1",
+            &crate::health::PersistedEscalation {
+                hung_since_epoch_ms: Some(1000),
+                ..Default::default()
+            },
+        );
+        assert!(
+            crate::daemon::escalation_persist::load_for(&home, "orch-1")
+                .unwrap()
+                .hung_since_epoch_ms
+                .is_some(),
+            "precondition: a stale anchor is persisted"
+        );
+
+        // Empty registry = the agent is absent (it unregistered).
+        let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let externals: ExternalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let configs = Arc::new(Mutex::new(HashMap::new()));
+        let ctx = TickContext {
+            home: &home,
+            registry: &registry,
+            externals: &externals,
+            configs: &configs,
+        };
+
+        persist_or_clear_left_hung_anchor(&ctx, "orch-1");
+
+        assert!(
+            crate::daemon::escalation_persist::load_for(&home, "orch-1")
+                .unwrap()
+                .hung_since_epoch_ms
+                .is_none(),
+            "#1870-H2: an absent agent's stale hung anchor must be CLEARED, not left for restart rehydrate"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 }
