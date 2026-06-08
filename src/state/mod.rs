@@ -520,6 +520,28 @@ const THROTTLE_DIAG_PHRASES: &[&str] = &[
     "hit a rate limit",
 ];
 
+/// #SRL-phase2: cheap raw single-token pre-filter for the hash-dedup blind-spot
+/// bypass. A settled (static) stuck-SRL pane has an unchanged screen hash, so
+/// `feed_with_fg`'s dedup would skip detection forever and it never recovers. We
+/// only override the skip when one of these distinctive tokens is on screen —
+/// and they are chosen to survive Ink WORD-wrap (each is a single token that sits
+/// intact on one wrapped row), so a hard-wrapped SRL line still trips the
+/// pre-filter even though the full phrase is split across rows. Kept tight to
+/// avoid re-detecting every static idle pane.
+const THROTTLE_HINT_TOKENS: &[&str] = &[
+    "limiting",
+    "Overloaded",
+    "overloaded_error",
+    "rate_limit_error",
+    "RESOURCE_EXHAUSTED",
+    "429",
+    "Rate limited",
+];
+
+fn screen_has_throttle_hint(screen_text: &str) -> bool {
+    THROTTLE_HINT_TOKENS.iter().any(|t| screen_text.contains(t))
+}
+
 /// #1562: rows of the live tail captured into the diagnostic record. Matches
 /// the `ERROR_TAIL_SCAN_LINES` horizon so the captured context lines up with
 /// the bottom-N window the error gates actually look at.
@@ -653,6 +675,39 @@ fn unclassified_throttle_tail(
         ansi_colored_tail(screen_text, fg, UNCLASSIFIED_TAIL_LINES),
         wrap_split,
     ))
+}
+
+/// #SRL-phase2: hard-wrap detection fallback. Ink word-wraps a long
+/// SRL/RateLimit error line into multiple rows joined by REAL `\n` (not an
+/// alacritty soft-wrap), so the single-line `detect_with_match` regex on the raw
+/// screen can't match it — the exact live narrow-pane miss that left the agent
+/// SRL-stuck with 0 detection. Flatten the bottom-N tail (every whitespace run,
+/// incl. `\n`, → one space) and re-detect there.
+///
+/// Guards (scoped TIGHT — this runs only when raw detection already missed):
+/// - **auto-clear throttle states ONLY** (`ServerRateLimit` / `RateLimit`).
+///   NEVER `ModelUnsupported` / `ContextFull`: those don't auto-clear and
+///   suppress hang-check, so a flatten-FP would silently wedge a healthy agent.
+/// - **`in_error_line` on the flattened text** — the prose-FP guard. A multi-row
+///   prose block merged into one line is only accepted if it carries a real
+///   error indicator (`…Error:`, `429`, `RESOURCE_EXHAUSTED`, …). The residual
+///   verbatim-quote FP (a pane literally rendering an error line) is ACCEPTED —
+///   identical to the raw-path policy (mod.rs §anchor-gate): these states
+///   auto-clear and are retry-driven, so a one-off mis-latch self-corrects.
+fn flattened_throttle_detect(
+    patterns: &crate::state::patterns::StatePatterns,
+    screen_text: &str,
+) -> Option<AgentState> {
+    let tail = recent_screen_tail(screen_text, ERROR_TAIL_SCAN_LINES);
+    let flat = tail.split_whitespace().collect::<Vec<_>>().join(" ");
+    let (state, matched) = patterns.detect_with_match(&flat)?;
+    if !matches!(state, AgentState::ServerRateLimit | AgentState::RateLimit) {
+        return None;
+    }
+    if !crate::state::patterns::in_error_line(&flat, matched) {
+        return None;
+    }
+    Some(state)
 }
 
 /// #1562: best-effort append of one JSON record as a single `line\n` to `path`,
@@ -896,9 +951,27 @@ impl StateTracker {
     pub fn feed_with_fg(&mut self, screen_text: &str, fg: &[CellFg]) {
         let hash = hash_screen(screen_text);
         if self.last_screen_hash == Some(hash) {
-            return;
+            // #SRL-phase2 hash-dedup blind spot: a SETTLED (static) stuck-SRL
+            // pane has an UNCHANGED hash, so this dedup early-return would skip
+            // detection forever and the agent never recovers (no further feed
+            // ever re-runs the SRL gates). Override the skip ONLY when the pane
+            // carries a throttle hint AND we are not already latched on a
+            // throttle — then fall through so the hard-wrap fallback (None arm)
+            // can latch it → auto-retry fires. The cheap raw-token pre-filter
+            // keeps the common static-idle pane on the fast skip path.
+            let already_throttle = matches!(
+                self.current,
+                AgentState::ServerRateLimit | AgentState::RateLimit
+            );
+            if already_throttle || !screen_has_throttle_hint(screen_text) {
+                return;
+            }
+            // else: re-detect the static throttle pane. Do NOT re-stamp the hash
+            // (it's unchanged); once we latch, `already_throttle` short-circuits
+            // subsequent identical frames.
+        } else {
+            self.last_screen_hash = Some(hash);
         }
-        self.last_screen_hash = Some(hash);
 
         // Sprint 27 shadow-mode: capture silence duration BEFORE updating
         // last_output, so we measure time since previous feed (not current).
@@ -1170,16 +1243,34 @@ impl StateTracker {
                     }
                 }
                 None => {
-                    // Starting-only structural fallback: if the pattern
-                    // catalog didn't recognize anything but the screen
-                    // contains a generic prompt token (y/n, press enter,
-                    // etc.), this is almost certainly a startup-time
-                    // dialog waiting for the operator. Flag it as
-                    // InteractivePrompt immediately instead of waiting
-                    // on `check_awaiting_operator`'s silence window.
-                    if matches!(self.current, AgentState::Starting)
+                    // #SRL-phase2: hard-wrap fallback. Raw detection missed —
+                    // which is exactly what an Ink-hard-wrapped SRL/RateLimit
+                    // line looks like (the phrase split across rows by real
+                    // `\n`). Retry on the flattened bottom-N tail before the
+                    // structural/expire path. Land via the SAME recovery gate as
+                    // the raw SRL path: recent productive output ⇒ recovered ⇒
+                    // Idle; else latch the throttle so auto-retry fires.
+                    // (working_state_below can't be located in the wrapped raw
+                    // text, so a hard-wrapped throttle with a working marker
+                    // below is not overridden here — accepted; `recovered_within`
+                    // still releases a genuinely-recovered pane.)
+                    if let Some(throttle) = flattened_throttle_detect(patterns, screen_text) {
+                        let landed = if matches!(throttle, AgentState::ServerRateLimit)
+                            && self.recovered_within(SERVER_RATE_LIMIT_RECOVERY_SILENCE)
+                        {
+                            AgentState::Idle
+                        } else {
+                            throttle
+                        };
+                        let gated = self.gate_on_heartbeat(landed);
+                        self.transition(gated);
+                    } else if matches!(self.current, AgentState::Starting)
                         && is_generic_startup_prompt(screen_text)
                     {
+                        // Starting-only structural fallback: a generic prompt
+                        // token (y/n, press enter, …) at startup is almost
+                        // certainly an operator dialog — flag InteractivePrompt
+                        // immediately instead of waiting on the silence window.
                         self.transition(AgentState::InteractivePrompt);
                     } else {
                         self.maybe_expire_latched_state();

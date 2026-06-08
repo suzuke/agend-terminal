@@ -4262,3 +4262,79 @@ fn append_jsonl_appends_one_record_per_line() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ── #SRL-phase2: Ink hard-wrap + hash-dedup blind-spot ───────────────────────
+
+/// #SRL-phase2 (a): a narrow-pane Ink HARD-wrapped ServerRateLimit line (the
+/// phrase split across rows by real `\n`, not an alacritty soft-wrap) must latch
+/// SRL via the flattened-tail fallback. The raw single-line regex misses it
+/// (Phase 1 fails); the flattened bottom-N tail matches + `in_error_line` holds
+/// ("API Error:" on the rejoined line).
+#[test]
+fn hardwrap_srl_latches_via_flattened_tail_phase2() {
+    let (mut vt, mut st) = claude_tracker();
+    // Each word-wrapped row separated by a REAL CRLF (hard wrap).
+    let hw =
+        "API Error: Server is\r\ntemporarily limiting\r\nrequests (not your\r\nusage limit)\r\n";
+    // Sanity: the raw (un-flattened) screen does NOT match the single-line SRL
+    // regex — this is exactly the Phase-1 miss.
+    assert!(
+        patterns::StatePatterns::for_backend(&Backend::ClaudeCode)
+            .detect_with_match(
+                "API Error: Server is\ntemporarily limiting\nrequests (not your\nusage limit)"
+            )
+            .is_none(),
+        "precondition: hard-wrapped SRL must NOT match the raw single-line regex"
+    );
+    drive(&mut vt, &mut st, hw.as_bytes());
+    assert_eq!(
+        st.get_state(),
+        AgentState::ServerRateLimit,
+        "#SRL-phase2: hard-wrapped SRL must latch via the flattened-tail fallback"
+    );
+}
+
+/// #SRL-phase2 (b): a SETTLED (static, unchanged-hash) SRL pane must be
+/// re-detected despite the `feed_with_fg` hash-dedup early-return — otherwise a
+/// stuck SRL pane that was cleared (spuriously) never re-latches and never
+/// recovers. Simulate the clear-while-static blind spot: latch, clear `current`
+/// without changing the screen, feed the IDENTICAL frame → must re-latch.
+#[test]
+fn static_srl_pane_redetected_after_dedup_blindspot_phase2() {
+    let (mut vt, mut st) = claude_tracker();
+    let hw =
+        "API Error: Server is\r\ntemporarily limiting\r\nrequests (not your\r\nusage limit)\r\n";
+    drive(&mut vt, &mut st, hw.as_bytes());
+    assert_eq!(
+        st.get_state(),
+        AgentState::ServerRateLimit,
+        "first feed latches"
+    );
+    // Spurious clear while the pane stays STATIC (same frame ⇒ same hash). The
+    // blind spot: the next identical feed would dedup-skip and never re-latch.
+    st.current = AgentState::Idle;
+    drive(&mut vt, &mut st, hw.as_bytes());
+    assert_eq!(
+        st.get_state(),
+        AgentState::ServerRateLimit,
+        "#SRL-phase2: a static SRL pane must re-detect across the hash-dedup blind spot"
+    );
+}
+
+/// #SRL-phase2 (c) prose-FP: multi-line prose that mentions the SRL phrase but is
+/// NOT an error render (no error indicator on the flattened line) must NOT latch.
+/// The `in_error_line` guard on the flattened text rejects it.
+#[test]
+fn multiline_prose_mentioning_srl_does_not_latch_phase2() {
+    let (mut vt, mut st) = claude_tracker();
+    // Contains the exact SRL phrase (so detect_with_match matches the flattened
+    // tail) but no error indicator (no "API Error:"/"429"/…) → in_error_line
+    // rejects → no latch.
+    let prose = "Docs note: Server is\r\ntemporarily limiting\r\nrequests is the SRL\r\nbanner text, FYI.\r\n";
+    drive(&mut vt, &mut st, prose.as_bytes());
+    assert_ne!(
+        st.get_state(),
+        AgentState::ServerRateLimit,
+        "#SRL-phase2: multi-line prose mentioning the SRL phrase (no error indicator) must NOT latch"
+    );
+}
