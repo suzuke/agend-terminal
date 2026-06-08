@@ -10,13 +10,17 @@
 //! 2. The response wrapping is consistent (ok + result shape)
 //! 3. The 5 representative tools are routed correctly
 
-/// Verify the mcp_proxy handler source calls execute_tool via service boundary.
+/// Verify the mcp_proxy handler routes through execute_tool (the service
+/// boundary). Since the R3#1 candidate-2 refactor, `handle_mcp_tool` passes
+/// `crate::mcp::execute_tool` as the injectable executor to
+/// `handle_mcp_tool_inner` (a fn pointer, not a direct `execute_tool(` call), so
+/// the invariant is "the symbol is referenced as the default executor".
 #[test]
 fn proxy_handler_calls_handle_tool_directly() {
     let src = std::fs::read_to_string("src/api/handlers/mcp_proxy.rs").expect("read mcp_proxy.rs");
     assert!(
-        src.contains("crate::mcp::execute_tool("),
-        "mcp_proxy must call execute_tool (service boundary)"
+        src.contains("crate::mcp::execute_tool"),
+        "mcp_proxy must route through execute_tool (service boundary)"
     );
 }
 
