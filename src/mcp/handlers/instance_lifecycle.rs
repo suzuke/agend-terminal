@@ -146,6 +146,15 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
     // never created). Best-effort like the steps above.
     let _ = std::fs::remove_dir_all(crate::agent::opencode_data_dir(home, name));
 
+    // #1879 (BIND-1): clear the worktree binding (`runtime/<name>/binding.json`
+    // + its HMAC sidecar + the bind-in-flight flag). Every OTHER store above is
+    // cleaned here, but binding was missed — so deleting a bound agent (one that
+    // ran bind_self / repo checkout) without a prior release both leaked the
+    // binding (blocking a same-name re-bind) AND tripped the residual audit below
+    // → the whole teardown returned Err despite otherwise succeeding.
+    crate::binding::unbind(home, name);
+    crate::mcp::handlers::dispatch_hook::clear_bind_in_flight(home, name);
+
     // Sprint 54 P1-B Bug 1 audit: enumerate every store that still holds
     // the name. If any do, surface a loud error instead of returning
     // success — `auto_start_fleet` revival of a half-deleted instance is
@@ -588,5 +597,51 @@ mod tests {
             "ci watch with only the deleted subscriber must be removed"
         );
         std::fs::remove_dir_all(home).ok();
+    }
+
+    /// §3.9 #1879 (BIND-1): deleting a BOUND agent (one that ran bind_self / repo
+    /// checkout) must clear its binding and succeed — pre-fix the binding was the
+    /// one store `full_delete_instance` never cleaned, so the residual audit
+    /// flagged `runtime/<name>/binding.json` and the teardown returned Err while
+    /// also leaking the binding. Regression-proof: revert the `binding::unbind`
+    /// call and the residual audit fails the delete.
+    #[test]
+    fn full_delete_clears_binding_and_succeeds_1879() {
+        let home = tmp_home("1879-bind-delete");
+        // Simulate a bound agent.
+        crate::binding::bind_full(
+            &home,
+            "agent-b",
+            "",
+            "feat/x",
+            std::path::Path::new("/tmp/wt-agent-b"),
+            std::path::Path::new("/tmp/repo-agent-b"),
+        )
+        .expect("bind_full");
+        assert!(
+            crate::binding::read(&home, "agent-b").is_some(),
+            "pre: binding exists"
+        );
+
+        let result = super::full_delete_instance(&home, "agent-b");
+
+        assert!(
+            result.is_ok(),
+            "#1879 BIND-1: teardown of a bound agent must succeed (no residual Err), got: {result:?}"
+        );
+        assert!(
+            crate::binding::read(&home, "agent-b").is_none(),
+            "#1879 BIND-1: the binding must be cleared"
+        );
+        assert!(
+            !home
+                .join("runtime")
+                .join("agent-b")
+                .join("binding.json")
+                .exists(),
+            "#1879 BIND-1: binding.json must be gone"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
     }
 }

@@ -397,6 +397,15 @@ pub fn release_full(home: &Path, agent: &str, dry_run: bool) -> ReleaseOutcome {
                 }
                 WorktreeRemoval::Unmanaged(err) => {
                     out.error = Some(err);
+                    // #1879 (WT-LEAK-2): refusing to delete an UNMANAGED
+                    // (operator-created) worktree protects operator data, but the
+                    // daemon's stale binding to it must STILL be cleared — leaving
+                    // it leaks the binding + blocks a same-agent re-bind. The
+                    // worktree-protection refusal must not also skip binding
+                    // cleanup. (This arm is already the non-dry_run path; the
+                    // dry_run classifier above mutates nothing.)
+                    clear_binding_state(home, agent);
+                    out.binding_removed = true;
                     return out;
                 }
                 WorktreeRemoval::Failed(err) => {
@@ -1459,8 +1468,10 @@ mod tests {
     fn p0x_release_full_unmanaged_worktree_skipped_safely() {
         // R14 safety: if the binding points at a worktree that lacks the
         // .agend-managed marker (operator-created, not daemon-leased), the
-        // release MUST NOT remove it. Binding is also kept so the operator
-        // can investigate the inconsistency rather than be left half-cleaned.
+        // release MUST NOT remove the worktree. #1879 (WT-LEAK-2): the stale
+        // binding IS cleared, though — leaving it leaked the binding and blocked
+        // a same-agent re-bind. The worktree (operator data) survives for
+        // investigation; the daemon's binding to it does not.
         let home = tmp_home("p0x-unmanaged");
         let unmanaged_wt = tmp_home("p0x-unmanaged-wt-target");
         // Hand-craft a binding pointing at an unmanaged path.
@@ -1490,8 +1501,8 @@ mod tests {
             outcome
         );
         assert!(
-            !outcome.binding_removed,
-            "binding must be preserved when worktree is unmanaged (operator visibility)"
+            outcome.binding_removed,
+            "#1879 WT-LEAK-2: the stale binding must be CLEARED even when the unmanaged worktree removal is refused"
         );
         assert!(
             outcome
@@ -1504,8 +1515,8 @@ mod tests {
         );
         assert!(unmanaged_wt.exists(), "operator-created dir must survive");
         assert!(
-            crate::binding::read(&home, "agent-u").is_some(),
-            "binding kept for operator visibility"
+            crate::binding::read(&home, "agent-u").is_none(),
+            "#1879 WT-LEAK-2: the binding must be cleared (no leak / re-bind block)"
         );
 
         std::fs::remove_dir_all(&home).ok();
