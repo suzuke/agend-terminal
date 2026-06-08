@@ -72,10 +72,10 @@ pub(crate) fn def_list_instances() -> Value {
 }
 
 pub(crate) fn def_create_instance() -> Value {
-    json!({"name": "create_instance", "description": "Create agent instance(s). Team modes: (a) homogeneous — count:3, backend:\"claude\", team:\"dev\" → dev-1..dev-3 all claude; (b) heterogeneous — backends:[\"codex\",\"kiro-cli\",\"gemini\"], team:\"mixed\" → mixed-1=codex, mixed-2=kiro-cli, mixed-3=gemini, all grouped in one tab.",
+    json!({"name": "create_instance", "description": "Create agent instance(s). Team modes: (a) homogeneous — count:3, backend:\"claude\", team:\"dev\" → dev-1..dev-3 all claude; (b) heterogeneous — backends:[\"codex\",\"kiro-cli\",\"agy\"], team:\"mixed\" → mixed-1=codex, mixed-2=kiro-cli, mixed-3=agy, all grouped in one tab.",
     "inputSchema": {"type": "object", "properties": {
         "name": {"type": "string", "description": "Instance name (single instance) or base name (ignored when team is set — team name is used as prefix)"},
-        "backend": {"type": "string", "description": "Backend CLI name: claude, gemini, kiro-cli, codex, opencode"},
+        "backend": {"type": "string", "description": "Backend CLI name: claude, agy, kiro-cli, codex, opencode"},
         "args": {"type": "string", "description": "Extra CLI arguments"},
         "model": {"type": "string", "description": "Model override (e.g. --model flag)"},
         "working_directory": {"type": "string"},

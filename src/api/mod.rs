@@ -1993,20 +1993,20 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // spawn_one preset resolution — regression pin for gemini submit_key
+    // spawn_one preset resolution — regression pin for per-backend submit_key
     // -----------------------------------------------------------------------
 
     #[test]
     fn spawn_one_resolves_preset_submit_key() {
         // Verify that Backend::from_command returns the correct preset
         // submit_key for each known backend. spawn_one uses this to avoid
-        // hardcoding "\r" (which broke gemini's "\n\r" requirement).
+        // hardcoding "\r" where a backend needs a different submit sequence.
         use crate::backend::Backend;
         let cases = [
             ("claude", "\r"),
             ("kiro-cli", "\r"),
             ("codex", "\r"),
-            ("gemini", "\r"),
+            ("agy", "\r"),
         ];
         for (cmd, expected) in cases {
             let key = Backend::from_command(cmd)

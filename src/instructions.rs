@@ -627,18 +627,6 @@ mod tests {
     }
 
     #[test]
-    fn generate_gemini_does_not_clobber_user_gemini_md() {
-        let dir = tmp_dir("gen_gemini_preserve");
-        let user_content = "# My Gemini rules\n\nKeep me.\n";
-        std::fs::write(dir.join("GEMINI.md"), user_content).unwrap();
-        generate(&dir, "gemini");
-        let after = std::fs::read_to_string(dir.join("GEMINI.md")).unwrap();
-        assert!(after.contains("Keep me."), "user content lost: {after}");
-        assert!(after.contains("send"));
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
     fn generate_shared_file_is_idempotent_across_spawns() {
         let dir = tmp_dir("gen_shared_idempotent");
         std::fs::write(dir.join("AGENTS.md"), "# user head\n").unwrap();
@@ -709,12 +697,14 @@ mod tests {
     }
 
     #[test]
-    fn generate_agent_init_repo_so_gemini_stops_here() {
-        let dir = tmp_dir("gen_gemini_stops_here");
-        generate(&dir, "gemini");
+    fn generate_agent_init_repo_so_backend_stops_here() {
+        // #1580: git-init on generate() is backend-agnostic — was pinned on
+        // gemini; re-pointed to agy (gemini-cli's successor) after retirement.
+        let dir = tmp_dir("gen_agy_stops_here");
+        generate(&dir, "agy");
         assert!(
             dir.join(".git").exists(),
-            "working_dir should be a git repo after generate() for gemini"
+            "working_dir should be a git repo after generate() for agy"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1049,7 +1039,7 @@ mod tests {
     fn test_all_backends_include_agend_msg_rule() {
         // Generate instructions for each backend and verify [AGEND-MSG] is present.
         let dir = std::env::temp_dir().join(format!("agend-instr-msg-test-{}", std::process::id()));
-        for backend_cmd in ["claude", "kiro-cli", "codex", "gemini"] {
+        for backend_cmd in ["claude", "kiro-cli", "codex"] {
             let work = dir.join(backend_cmd);
             std::fs::create_dir_all(&work).ok();
             generate(&work, backend_cmd);
@@ -1074,7 +1064,7 @@ mod tests {
         // `test_all_backends_include_agend_msg_rule`.
         let dir =
             std::env::temp_dir().join(format!("agend-instr-attach-test-{}", std::process::id()));
-        for backend_cmd in ["claude", "kiro-cli", "codex", "gemini"] {
+        for backend_cmd in ["claude", "kiro-cli", "codex"] {
             let work = dir.join(backend_cmd);
             std::fs::create_dir_all(&work).ok();
             generate(&work, backend_cmd);
@@ -1109,7 +1099,7 @@ mod tests {
             "agend-instr-chan-detect-test-{}",
             std::process::id()
         ));
-        for backend_cmd in ["claude", "kiro-cli", "codex", "gemini", "opencode"] {
+        for backend_cmd in ["claude", "kiro-cli", "codex", "opencode"] {
             let work = dir.join(backend_cmd);
             std::fs::create_dir_all(&work).ok();
             generate(&work, backend_cmd);

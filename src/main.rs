@@ -281,7 +281,7 @@ enum Commands {
     Connect {
         /// Agent name (unique identifier)
         name: String,
-        /// Backend command (claude, kiro-cli, codex, opencode, gemini)
+        /// Backend command (claude, kiro-cli, codex, opencode, agy)
         #[arg(long)]
         backend: String,
         /// Working directory (default: current dir)
@@ -432,7 +432,7 @@ enum AdminCommands {
 enum CaptureAction {
     /// Capture backend output for debugging (existing behaviour)
     Backend {
-        /// Backend name (claude, kiro-cli, codex, opencode, gemini)
+        /// Backend name (claude, kiro-cli, codex, opencode, agy)
         #[arg(long)]
         backend: String,
         /// Capture duration in seconds

@@ -10,15 +10,14 @@ pub fn run(home: &Path) -> anyhow::Result<()> {
     // Step 1: Detect backends
     let backends = detect_backends();
     if backends.is_empty() {
-        // Sprint 56 Track H4 (#525 item 13): list all five supported
-        // backends, not just three. Pre-Track-H4 the message stopped
-        // at three (Claude / codex / gemini-cli) so operators with a
-        // Kiro or OpenCode preference saw "no supported backends" and
-        // had no install hint pointing them at their tool.
+        // Sprint 56 Track H4 (#525 item 13): list the supported backends so
+        // operators with a Kiro or OpenCode preference get an install hint
+        // instead of a bare "no supported backends". #1580: the Gemini CLI line
+        // was dropped — gemini-cli is retired (sunset 2026-06-18); its successor
+        // Agy (Antigravity CLI) is detected by command but has no npm one-liner.
         println!("  No supported backends found. Install one of:");
         println!("    Claude Code   npm install -g @anthropic-ai/claude-code");
         println!("    codex         npm install -g @openai/codex");
-        println!("    Gemini CLI    npm install -g @google/gemini-cli");
         println!("    Kiro CLI      see https://kiro.dev for installer");
         println!("    OpenCode      see https://opencode.ai for installer");
         println!();
@@ -1251,17 +1250,17 @@ mod tests {
         );
     }
 
-    /// Item 13: no-supported-backends list must enumerate all 5
-    /// backends (Claude / codex / Kiro / OpenCode / Gemini). Pre-H4
-    /// the list stopped at three.
+    /// Item 13: no-supported-backends list must enumerate the supported
+    /// backends with an install hint (Claude / codex / Kiro / OpenCode).
+    /// #1580: Gemini CLI dropped — gemini-cli is retired (sunset 2026-06-18);
+    /// its successor Agy has no npm one-liner so it is not listed here.
     #[test]
-    fn no_backends_message_lists_all_five_supported_backends() {
+    fn no_backends_message_lists_supported_backends() {
         const SOURCE: &str = include_str!("quickstart.rs");
-        for backend in ["Claude Code", "codex", "Gemini CLI", "Kiro", "OpenCode"] {
+        for backend in ["Claude Code", "codex", "Kiro", "OpenCode"] {
             assert!(
                 SOURCE.contains(backend),
-                "no-supported-backends message must mention `{backend}` \
-                 — H4 expanded the list from 3 to 5"
+                "no-supported-backends message must mention `{backend}`"
             );
         }
     }

@@ -935,18 +935,6 @@ impl StateTracker {
     /// considered alive and `PermissionPrompt` detection is suppressed.
     const HEARTBEAT_FRESH_WINDOW: Duration = Duration::from_secs(120);
 
-    /// #8 delete-legacy: the fork's fallback for the un-migrated backend (only
-    /// Gemini) and `None`. Reached only when `profile(backend)` is `None` — i.e.
-    /// `Some(Gemini)`→Starting (managed) or `None`→Idle. Shell/Raw now route
-    /// through their profile (initial_state = Idle), so they no longer reach
-    /// here; the prior `Shell|Raw => Ready` (now `Idle`) arm folds into `Some(_) => Starting`.
-    pub(crate) fn legacy_initial_state(backend: Option<&Backend>) -> AgentState {
-        match backend {
-            None => AgentState::Idle,
-            Some(_) => AgentState::Starting,
-        }
-    }
-
     pub fn new(backend: Option<&Backend>) -> Self {
         // Backends without a state pattern catalog (Shell, Raw) skip the
         // `Starting → Idle` handshake. Without this they sat in
@@ -955,17 +943,14 @@ impl StateTracker {
         // `check_awaiting_operator` then flagged every idle shell as
         // "stuck on interactive prompt" after 30s of normal quiet at
         // its own prompt. Managed backends still start in `Starting` so
-        // their onboarding / auth dialogs can pattern-match before
         // Idle is declared.
-        // #8 Phase 2 step-0: migrated backends source their initial state from the
-        // co-located profile; un-migrated (and `None`) fall back to
-        // `legacy_initial_state`. The profile values are byte-identical to legacy
-        // (empty_profile=Idle for Shell/Raw, agy/kiro=Starting), proven by
-        // `profile_configs_byte_identical_to_legacy`, so behavior is unchanged.
-        let initial_state = backend
-            .and_then(crate::backend_profile::profile)
-            .map(|p| p.initial_state)
-            .unwrap_or_else(|| Self::legacy_initial_state(backend));
+        // #1580: every backend sources its initial state from the co-located
+        // profile (empty_profile=Idle for Shell/Raw, agy/kiro/...=Starting). An
+        // unmanaged tracker (`backend == None`) starts Idle.
+        let initial_state = match backend {
+            Some(b) => crate::backend_profile::profile(b).initial_state,
+            None => AgentState::Idle,
+        };
         Self {
             current: initial_state,
             since: Instant::now(),
@@ -977,7 +962,7 @@ impl StateTracker {
             last_screen_hash: None,
             patterns: backend.map(StatePatterns::for_backend),
             context_regex: backend
-                .and_then(crate::backend_profile::profile)
+                .map(crate::backend_profile::profile)
                 .and_then(|p| p.context_pattern)
                 .and_then(|p| regex::Regex::new(p).ok()),
             context_pct: None,
@@ -994,7 +979,7 @@ impl StateTracker {
             // `Backend::should_anchor_on_red`.
             anchor_on_red: backend.is_some_and(|b| b.should_anchor_on_red()),
             input_line_markers: backend
-                .and_then(crate::backend_profile::profile)
+                .map(crate::backend_profile::profile)
                 .map(|p| p.input_line_markers)
                 .unwrap_or(&[]),
             // #1005 A2: oscillation guard starts unarmed — first

@@ -26,7 +26,7 @@ use regex::Regex;
 /// false-negative-free (the #1136 coverage test never listed it either).
 // #8 Phase 2 (KiroCli migration): pub(crate) so the co-located BackendProfile
 // references this shared net-error alternation by the SAME const (not a re-typed
-// copy), keeping byte-identity with the legacy compile_for arm that also uses it.
+// copy). (#1580: the legacy compile_for arm that also used it is now gone.)
 pub(crate) const SERVER_RATE_LIMIT_NET_ERRORS: &str = r"ECONNRESET|ETIMEDOUT|InvalidHTTPResponse|fetch failed|connection reset|socket hang up|proxy.*disconnect";
 
 // #1757's `is_net_error_match` red-anchor EXEMPTION was removed by
@@ -180,7 +180,6 @@ impl StatePatterns {
         static KIRO: OnceLock<StatePatterns> = OnceLock::new();
         static CODEX: OnceLock<StatePatterns> = OnceLock::new();
         static OPENCODE: OnceLock<StatePatterns> = OnceLock::new();
-        static GEMINI: OnceLock<StatePatterns> = OnceLock::new();
         static AGY: OnceLock<StatePatterns> = OnceLock::new();
         static EMPTY: OnceLock<StatePatterns> = OnceLock::new();
 
@@ -189,163 +188,17 @@ impl StatePatterns {
             Backend::KiroCli => &KIRO,
             Backend::Codex => &CODEX,
             Backend::OpenCode => &OPENCODE,
-            Backend::Gemini => &GEMINI,
             Backend::Agy => &AGY,
             Backend::Shell | Backend::Raw(_) => &EMPTY,
         };
-        // #8 Phase 2 step-0: route migrated backends (profile() == Some) through
-        // their co-located BackendProfile; un-migrated backends fall back to the
-        // legacy `compile_for` match. `from_raw_patterns` compiles via the SAME
-        // `Regex::new` pipeline as `compile_for`, and
-        // `profile_patterns_byte_identical_to_legacy` proves the pattern sources
-        // are identical — so this fork is byte-identical detection, not a change.
-        // The per-backend `OnceLock` still owns the compile-once cache (the fork
-        // lives INSIDE `get_or_init`, so each variant compiles exactly once).
-        lock.get_or_init(|| match crate::backend_profile::profile(backend) {
-            Some(p) => Self::from_raw_patterns(&p.patterns),
-            None => Self::compile_for(backend),
+        // #1580: every backend now routes through its co-located BackendProfile —
+        // `profile()` is total, the legacy `compile_for` fork is gone. The
+        // per-backend `OnceLock` still owns the compile-once cache (the
+        // `from_raw_patterns` call lives INSIDE `get_or_init`, so each variant
+        // compiles exactly once).
+        lock.get_or_init(|| {
+            Self::from_raw_patterns(&crate::backend_profile::profile(backend).patterns)
         })
-    }
-
-    // #8 Phase 2: `pub(crate)` so the parity tests can reference the TRUE legacy
-    // compilation directly — after the step-0 reroute, `for_backend` sources
-    // migrated backends from the profile, so it can no longer stand in for
-    // "legacy" in a parity assertion (that would be circular).
-    #[allow(clippy::unwrap_used)]
-    pub(crate) fn compile_for(backend: &Backend) -> Self {
-        let patterns = match backend {
-            // Gemini CLI v0.37.1
-            Backend::Gemini => vec![
-                // [docs] OAuth errors from API
-                (
-                    AgentState::AuthError,
-                    r"OAuth not authenticated|OAuth expired|UNAUTHENTICATED|check API key",
-                ),
-                // #848 PR-B narrowed bare `\b429\b` to specific
-                // gemini-cli verbatim wordings (issues #10722/#8437/
-                // #22545/#2305/#1502). #854 follow-up further drops
-                // the residual bare `rate limit exceeded` alternation
-                // — it was added as defensive insurance against a
-                // "CLI casual wording" case that turned out to have
-                // no empirical anchor in any of the cited issues, and
-                // it false-positive-matched any prose / commit /
-                // discussion containing the 3-word phrase (same class
-                // as the pre-#848 bare `\b429\b` surface).
-                //
-                // All four remaining alternations are anchored on a
-                // `429` numeric or on the distinctive camelCase gRPC
-                // field `rateLimitExceeded`, so a real Gemini
-                // RateLimit display still matches via 4× coverage:
-                //
-                // - `429 RESOURCE_EXHAUSTED` — numeric + gRPC enum
-                // - `rateLimitExceeded` — single distinctive token
-                // - `got status: 429` — verb-anchored numeric
-                // - `429 Too Many Requests` — HTTP status-text numeric
-                //
-                // Negative regression fixture
-                // `gemini-rate-limit-prose-discussion.raw` exercises
-                // the false-positive class this drop closes; the
-                // existing positive fixture
-                // `gemini-rate-limit-typical.raw` exercises detection
-                // survival on the canonical wording (still matches
-                // 4× over after the drop). New positive fixture
-                // `gemini-rate-limit-canonical-429.raw` exercises
-                // detection on a minimal 429-anchored display that
-                // does NOT include the dropped bare phrase, locking
-                // in the post-#854 contract.
-                (
-                    AgentState::RateLimit,
-                    r"429 RESOURCE_EXHAUSTED|rateLimitExceeded|got status: 429|429 Too Many Requests",
-                ),
-                // #1136: network errors — transient, auto-retry safe.
-                (AgentState::ServerRateLimit, SERVER_RATE_LIMIT_NET_ERRORS),
-                // [docs] Usage limit messages
-                // #1125 M4: added `RESOURCE_EXHAUSTED` — the gRPC status
-                // code for quota exhaustion. Positioned AFTER RateLimit so
-                // the more specific `429 RESOURCE_EXHAUSTED` (transient)
-                // matches first; bare `RESOURCE_EXHAUSTED` (permanent
-                // quota) falls through to this pattern. Pre-#1125 this
-                // was only in classify_pty_output's divergent regex set.
-                (
-                    AgentState::UsageLimit,
-                    r"Usage limit reached|Access resets at|RESOURCE_EXHAUSTED",
-                ),
-                // [docs] Token/quota limit
-                (AgentState::ContextFull, r"quota.*exceeded|token.*limit"),
-                // #1559: gemini permission dialog chrome (operator capture
-                // gemini-perm.raw v0.44.1, 2026-06-01). The prior [docs]
-                // alternation `Allow once|Allow for this session|suggest changes`
-                // matched the real dialog but its bare `suggest changes` is
-                // ordinary code-review language (GitHub "suggest changes", any
-                // review/self-analysis pane) → high content-FP. The live frame
-                // is a boxed select: header `Allow execution of [<tool>]?` with
-                // numbered options `1. Allow once` / `2. Allow for this session` /
-                // `3. No, suggest changes (esc)`. Anchor the self-identifying
-                // boxed header `Allow execution of` (prose never asks "Allow
-                // execution of [X]?"); DROP the bare option words. Pair with
-                // `gate_on_heartbeat` + the #1552 live-bottom-N escalation gate.
-                (AgentState::PermissionPrompt, r"Allow execution of"),
-                // Phase A Piece-1: git conflict output (backend-independent).
-                (
-                    AgentState::GitConflict,
-                    r"Automatic merge failed; fix conflicts|CONFLICT \(content\)|Resolve all conflicts manually|Failed to merge submodule|Failed to merge in",
-                ),
-                // #1005 Phase A1 (CRITICAL): the gemini ToolUse
-                // alternation was REMOVED. `✓` (U+2713 CHECK MARK) is
-                // gemini's COMPLETION marker — every prior match
-                // (`✓ ReadFile Cargo.toml`, etc.) was a historical
-                // completion record, never an active execution. The
-                // legacy `tool.*call|MCP.*tool` substrings (intended for
-                // end-of-session "Tool Calls: 1 ✓ 1" summary + MCP
-                // surfaces) ALSO matched post-completion — and were
-                // broad enough to false-positive on prose / docs / commit
-                // messages.
-                //
-                // Gemini's in-flight indicator is the `⠦ Thinking…
-                // (esc to cancel, Ns)` spinner which fires Thinking
-                // (line below). No replacement ToolUse pattern exists
-                // in gemini's current rendering vocabulary.
-                //
-                // FOLLOW-UP RISK (dev-2 cross-audit flag): the existing
-                // gemini-tooluse.raw fixture does NOT exercise an
-                // in-flight tool-call shape distinct from Thinking. If
-                // gemini 0.38.2+ adds a dedicated in-flight banner we
-                // can detect, capture a new fixture + re-introduce a
-                // narrow ToolUse pattern. Until then, gemini tool calls
-                // surface as Thinking — operationally equivalent for
-                // upstream consumers (active vs idle is the load-bearing
-                // distinction).
-                // [measured] Gemini's spinner line ("⠦ Thinking... (esc to
-                // cancel, Ns)") only renders while a request is in flight and
-                // is overwritten in place when streaming completes. Matching
-                // the bare word "Thinking" previously latched the state and
-                // never released — chat history kept the token visible on
-                // screen and detect() kept returning Thinking forever.
-                // F39 risk: prior bare `r"Thinking"` already narrowed to
-                // `esc to cancel` (history note above). Same scrollback
-                // stickiness surface as Kiro pattern; same Scenario A/B/C
-                // taxonomy applies. Further narrow (e.g. require leading
-                // Braille spinner) is a speculative quick-win for a separate
-                // follow-up PR, not committed here.
-                // See docs/HUNG-STATE-TRANSITIONS.md §F39.1
-                (AgentState::Thinking, r"\(esc to cancel,"),
-                // [measured] Input prompt text + YOLO mode (both = idle, ready
-                // for input; the Ready/Idle split was collapsed into Idle).
-                (AgentState::Idle, r"Type your message|YOLO"),
-            ],
-            _ => vec![],
-        };
-
-        let compiled: Vec<_> = patterns
-            .into_iter()
-            .map(|(state, pat)| {
-                let re = Regex::new(pat)
-                    .unwrap_or_else(|e| panic!("BUG: invalid state regex {pat:?}: {e}"));
-                (state, re)
-            })
-            .collect();
-
-        Self { patterns: compiled }
     }
 
     /// Match against state buffer, return highest-priority matching state.
@@ -360,9 +213,9 @@ impl StatePatterns {
         self.detect_with_match(text).map(|(s, _)| s)
     }
 
-    /// #8 Phase 2: compile a raw `(state, regex)` list exactly as `compile_for`
-    /// does (same `Regex::new` pipeline). Step-0 makes this a PROD path —
-    /// `for_backend` uses it to compile a migrated backend's `BackendProfile`
+    /// #8 Phase 2: compile a raw `(state, regex)` list via the standard
+    /// `Regex::new` pipeline. Step-0 makes this a PROD path —
+    /// `for_backend` uses it to compile a backend's `BackendProfile`
     /// patterns; the parity harness uses it too. (Un-gated from `#[cfg(test)]`
     /// when prod started consuming it.)
     #[allow(clippy::unwrap_used)]

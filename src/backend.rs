@@ -12,13 +12,13 @@ pub enum Backend {
     KiroCli,
     Codex,
     OpenCode,
-    Gemini,
+    // #1580: `Gemini` retired (gemini-cli sunset 2026-06-18). Its successor `Agy`
+    // (Google Antigravity CLI) remains and inherits the shared productivity
+    // markers (renamed GEMINI_*→AGY_*).
     /// Google Antigravity CLI (`agy`). Gemini CLI's official successor —
-    /// Google announced gemini-cli sunset for AI Pro / AI Ultra / free-tier
-    /// consumers on 2026-06-18. Shares the same agent engine as the
-    /// Antigravity 2.0 desktop app. Standard `mcpServers` schema + project-
-    /// local config at `<workdir>/.antigravitycli/mcp_config.json`. Added in
-    /// #987.
+    /// shares the same Google agent engine. Standard `mcpServers` schema +
+    /// project-local config at `<workdir>/.antigravitycli/mcp_config.json`.
+    /// Added in #987.
     Agy,
     /// Generic shell (bash/zsh/sh). No preset wiring — inject/ready/resume are
     /// all no-ops. Command defaults to `$SHELL` or the platform default
@@ -35,7 +35,7 @@ impl Backend {
     ///
     /// True for backends that consistently emit red SGR escapes
     /// (`\x1b[31m` / `\x1b[91m`) when rendering errors — ClaudeCode,
-    /// Codex, OpenCode, Gemini. False for Shell + Raw — generic
+    /// Codex, OpenCode, Agy. False for Shell + Raw — generic
     /// shells don't have a uniform color convention and arbitrary
     /// commands may render errors uncolored.
     ///
@@ -47,7 +47,6 @@ impl Backend {
             | Backend::KiroCli
             | Backend::Codex
             | Backend::OpenCode
-            | Backend::Gemini
             | Backend::Agy => true,
             Backend::Shell | Backend::Raw(_) => false,
         }
@@ -73,7 +72,8 @@ impl Backend {
                 "CLAUDE_CODE_OAUTH_TOKEN",
             ],
             Backend::Codex => &["OPENAI_API_KEY"],
-            Backend::Gemini | Backend::Agy => &[
+            // #1580: Gemini retired; Agy (its successor) keeps the Google creds.
+            Backend::Agy => &[
                 "GEMINI_API_KEY",
                 "GOOGLE_API_KEY",
                 "GOOGLE_APPLICATION_CREDENTIALS",
@@ -102,7 +102,7 @@ impl Backend {
             "kiro-cli" | "kiro" => Backend::KiroCli,
             "codex" | "codex-cli" => Backend::Codex,
             "opencode" | "opencode-cli" => Backend::OpenCode,
-            "gemini" | "gemini-cli" => Backend::Gemini,
+            // #1580: "gemini"/"gemini-cli" retired → fall through to Raw.
             "agy" | "antigravity" | "antigravity-cli" => Backend::Agy,
             "shell" | "bash" | "zsh" | "sh" => Backend::Shell,
             _ => Backend::Raw(trimmed.to_string()),
@@ -117,7 +117,6 @@ impl Backend {
             Backend::KiroCli => "kiro-cli",
             Backend::Codex => "codex",
             Backend::OpenCode => "opencode",
-            Backend::Gemini => "gemini",
             // #995: display name is the product short form `antigravity-cli`,
             // not the binary `agy`. Binary command remains `agy` (preset.command);
             // parse_str still accepts the "agy" alias for backward-compat with
@@ -202,7 +201,6 @@ impl Backend {
             | Backend::KiroCli
             | Backend::Codex
             | Backend::OpenCode
-            | Backend::Gemini
             | Backend::Agy => self.preset().command.to_string(),
             Backend::Shell => {
                 std::env::var("SHELL").unwrap_or_else(|_| crate::default_shell().to_string())
@@ -245,8 +243,6 @@ pub enum ResumeMode {
     /// `flag` is the CLI flag to use (e.g., `--continue` for Claude/OpenCode,
     /// `--resume` for Kiro).
     ContinueInCwd { flag: &'static str },
-    /// Fixed args (e.g., Gemini `--resume latest`).
-    Fixed { args: &'static [&'static str] },
     /// Not supported.
     NotSupported,
 }
@@ -256,7 +252,6 @@ impl ResumeMode {
     pub fn args_for(&self) -> Vec<String> {
         match self {
             ResumeMode::ContinueInCwd { flag } => vec![flag.to_string()],
-            ResumeMode::Fixed { args } => args.iter().map(|s| s.to_string()).collect(),
             ResumeMode::NotSupported => vec![],
         }
     }
@@ -580,43 +575,6 @@ impl Backend {
                 fresh_args: None, // same as args (resume is in resume_mode, not args)
                 fleet_mcp_supported: true,
             },
-            Backend::Gemini => BackendPreset {
-                redraw_after_resize: false, // #7: repaints on SIGWINCH — no trigger needed.
-                command: "gemini",
-                args: &["--yolo"],
-                ready_pattern: "Type your message|YOLO",
-                submit_key: "\r",
-                inject_prefix: "\r",
-                typed_inject: true,
-                resume_mode: ResumeMode::Fixed {
-                    args: &["--resume", "latest"],
-                },
-                quit_command: "/exit",
-                instructions_path: "GEMINI.md",
-                instructions_shared: true,
-                inject_instructions_on_ready: false,
-                ready_timeout_secs: 20,
-                // Auto-approve: MCP tools ("3" = all server tools for session),
-                // shell commands ("2" = allow for session).
-                // Issue #468: anchored regex (line start + optional TUI prefix
-                // [^A-Za-z\n]{0,8}). Substring match was false-positiving on
-                // user input and scrollback content that contained the phrase
-                // mid-paragraph, auto-injecting `2\n` / `3\n` without consent.
-                // Gemini's Ink-based TUI renders dialogs with `│ ` prefix at
-                // line start, which the anchor accepts.
-                dismiss_patterns: &[
-                    DismissPattern {
-                        label: r"(?m)^[^A-Za-z\n]{0,8}Allow execution of MCP tool",
-                        sequence: b"3\n",
-                    },
-                    DismissPattern {
-                        label: r"(?m)^[^A-Za-z\n]{0,8}Allow execution of:",
-                        sequence: b"2\n",
-                    },
-                ],
-                fresh_args: None, // same as args (resume is in resume_mode, not args)
-                fleet_mcp_supported: true,
-            },
             Backend::Agy => BackendPreset {
                 redraw_after_resize: false, // #7: repaints on SIGWINCH — no trigger needed.
                 command: "agy",
@@ -711,8 +669,6 @@ impl Backend {
             Some(Backend::Codex)
         } else if basename == "opencode" || basename.starts_with("opencode-") {
             Some(Backend::OpenCode)
-        } else if basename == "gemini" || basename.starts_with("gemini-") {
-            Some(Backend::Gemini)
         } else if basename == "agy" || basename.starts_with("antigravity") {
             // #987: agy (binary name) + antigravity-cli (full product name).
             // basename match handles `/usr/local/bin/agy`; prefix match
@@ -732,10 +688,7 @@ impl Backend {
             Backend::KiroCli,
             Backend::Codex,
             Backend::OpenCode,
-            Backend::Gemini,
-            // #987: agy slots after gemini chronologically — they share
-            // Google's agent engine; gemini-cli sunsets 2026-06-18 and agy
-            // is its official successor.
+            // #1580: Gemini retired; Agy (its successor) carries the Google engine.
             Backend::Agy,
         ]
     }
@@ -786,7 +739,6 @@ impl Backend {
         match self {
             Backend::ClaudeCode => Some("claude"),
             Backend::Codex => Some("codex"),
-            Backend::Gemini => Some("gemini"),
             Backend::OpenCode => Some("opencode"),
             Backend::KiroCli => Some("kiro"),
             Backend::Agy | Backend::Shell | Backend::Raw(_) => None,
@@ -889,7 +841,6 @@ impl Backend {
             Backend::KiroCli => "1.29.6",
             Backend::Codex => "0.118.0",
             Backend::OpenCode => "1.4.0",
-            Backend::Gemini => "0.37.1",
             Backend::Agy => "1.0.0",
             Backend::Shell | Backend::Raw(_) => "n/a",
         }
@@ -1260,7 +1211,7 @@ pub trait BackendBehavior {
     /// #8 Phase 2: the co-located [`crate::backend_profile::BackendProfile`] for
     /// this backend, or `None` while it's still on the legacy match path. The
     /// Phase-2 seam — the migration train routes migrated backends through this.
-    fn profile(&self) -> Option<&'static crate::backend_profile::BackendProfile>;
+    fn profile(&self) -> &'static crate::backend_profile::BackendProfile;
 }
 
 impl BackendBehavior for Backend {
@@ -1276,7 +1227,7 @@ impl BackendBehavior for Backend {
     fn should_anchor_on_red(&self) -> bool {
         Backend::should_anchor_on_red(self)
     }
-    fn profile(&self) -> Option<&'static crate::backend_profile::BackendProfile> {
+    fn profile(&self) -> &'static crate::backend_profile::BackendProfile {
         crate::backend_profile::profile(self)
     }
 }
@@ -1301,7 +1252,6 @@ mod tests {
             Backend::KiroCli,
             Backend::Codex,
             Backend::OpenCode,
-            Backend::Gemini,
             Backend::Agy,
             Backend::Shell,
             Backend::Raw("x".to_string()),
@@ -1342,7 +1292,6 @@ mod tests {
             Backend::ClaudeCode,
             Backend::Codex,
             Backend::OpenCode,
-            Backend::Gemini,
             Backend::Agy,
             Backend::Shell,
             Backend::Raw("x".to_string()),
@@ -1360,7 +1309,8 @@ mod tests {
         assert_eq!(Backend::from_command("kiro-cli"), Some(Backend::KiroCli));
         assert_eq!(Backend::from_command("codex"), Some(Backend::Codex));
         assert_eq!(Backend::from_command("opencode"), Some(Backend::OpenCode));
-        assert_eq!(Backend::from_command("gemini"), Some(Backend::Gemini));
+        // #1580: gemini retired — `gemini` no longer maps to a managed backend.
+        assert_eq!(Backend::from_command("gemini"), None);
         assert_eq!(Backend::from_command("agy"), Some(Backend::Agy));
         // Case insensitive
         assert_eq!(Backend::from_command("Claude"), Some(Backend::ClaudeCode));
@@ -1395,9 +1345,6 @@ mod tests {
         assert!(kiro.args.contains(&"chat"));
         assert!(kiro.args.contains(&"--trust-all-tools"));
 
-        let gemini = Backend::Gemini.preset();
-        assert!(gemini.args.contains(&"--yolo"));
-
         // #987 + #995: agy mirrors the existing preset shape — verify command,
         // args, and the dangerously-skip-permissions flag. #995 added a
         // workspace-trust dismiss_pattern after live-spawn proved the flag
@@ -1430,7 +1377,6 @@ mod tests {
         assert!(Backend::KiroCli.preset().fleet_mcp_supported);
         assert!(Backend::Codex.preset().fleet_mcp_supported);
         assert!(Backend::OpenCode.preset().fleet_mcp_supported);
-        assert!(Backend::Gemini.preset().fleet_mcp_supported);
         // #1547: Agy now loads the bridge via `<workspace>/.agents/mcp_config.json`
         // (official Customization Roots; configure_agy writes it). Was `false`
         // under #995 Bug 3 (agy ignored the old `.antigravitycli/` write).
@@ -1534,10 +1480,6 @@ mod tests {
         );
         assert!(Backend::Codex.preset().resume_mode.args_for().is_empty());
         assert_eq!(
-            Backend::Gemini.preset().resume_mode.args_for(),
-            vec!["--resume", "latest"]
-        );
-        assert_eq!(
             Backend::OpenCode.preset().resume_mode.args_for(),
             vec!["--continue"]
         );
@@ -1554,7 +1496,6 @@ mod tests {
         assert_eq!(Backend::KiroCli.name(), "kiro-cli");
         assert_eq!(Backend::Codex.name(), "codex");
         assert_eq!(Backend::OpenCode.name(), "opencode");
-        assert_eq!(Backend::Gemini.name(), "gemini");
         // #995: agy display name is the product short form, not the binary.
         // The binary (`agy`) is exposed via preset().command instead.
         assert_eq!(Backend::Agy.name(), "antigravity-cli");
@@ -1562,10 +1503,11 @@ mod tests {
     }
 
     #[test]
-    fn all_backends_returns_six() {
-        // #987: bumped from 5 → 6 with Backend::Agy addition (Google
-        // Antigravity CLI as gemini-cli's official successor).
-        assert_eq!(Backend::all().len(), 6);
+    fn all_backends_returns_five() {
+        // #987 bumped 5 → 6 with Backend::Agy (gemini-cli's successor); #1580
+        // drops back to 5 as gemini-cli is retired:
+        // ClaudeCode, KiroCli, Codex, OpenCode, Agy.
+        assert_eq!(Backend::all().len(), 5);
     }
 
     #[test]
@@ -1576,7 +1518,12 @@ mod tests {
         assert_eq!(Backend::parse_str("kiro"), Backend::KiroCli);
         assert_eq!(Backend::parse_str("codex"), Backend::Codex);
         assert_eq!(Backend::parse_str("opencode"), Backend::OpenCode);
-        assert_eq!(Backend::parse_str("gemini"), Backend::Gemini);
+        // #1580: gemini retired — `gemini` now falls through to Raw, not a managed
+        // backend.
+        assert_eq!(
+            Backend::parse_str("gemini"),
+            Backend::Raw("gemini".to_string())
+        );
         // #987: agy + antigravity + antigravity-cli all resolve to Backend::Agy.
         assert_eq!(Backend::parse_str("agy"), Backend::Agy);
         assert_eq!(Backend::parse_str("antigravity"), Backend::Agy);
@@ -1714,17 +1661,6 @@ mod tests {
     }
 
     #[test]
-    fn resume_mode_fixed_args() {
-        let mode = ResumeMode::Fixed {
-            args: &["--resume", "latest"],
-        };
-        assert_eq!(
-            mode.args_for(),
-            vec!["--resume".to_string(), "latest".to_string()]
-        );
-    }
-
-    #[test]
     fn resume_mode_not_supported_args() {
         assert!(ResumeMode::NotSupported.args_for().is_empty());
     }
@@ -1771,10 +1707,6 @@ mod tests {
     #[test]
     fn format_model_arg_other_backends_passthrough() {
         assert_eq!(Backend::ClaudeCode.format_model_arg("opus"), "opus");
-        assert_eq!(
-            Backend::Gemini.format_model_arg("gemini-2.5-pro"),
-            "gemini-2.5-pro"
-        );
         assert_eq!(Backend::Codex.format_model_arg("o3"), "o3");
     }
 
@@ -1976,12 +1908,7 @@ mod tests {
         // Even if random files exist they must not produce flags for these.
         std::fs::write(dir.join("AGENTS.md"), "x").unwrap();
         std::fs::write(dir.join("GEMINI.md"), "x").unwrap();
-        for b in [
-            Backend::KiroCli,
-            Backend::Codex,
-            Backend::OpenCode,
-            Backend::Gemini,
-        ] {
+        for b in [Backend::KiroCli, Backend::Codex, Backend::OpenCode] {
             assert!(
                 b.spawn_flags(&dir).is_empty(),
                 "{b:?} must not emit spawn flags"

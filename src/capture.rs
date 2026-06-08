@@ -734,7 +734,7 @@ mod tests {
         let tmp = tmp_dir("promote-default-desc");
         let (_dest, manifest) = run_promote_in_tmp(
             &tmp,
-            "gemini",
+            "agy",
             "test-default-desc",
             PromoteOptions {
                 scenario_kind: PromoteScenarioKind::SilentStuck,

@@ -1,3 +1,0 @@
-[2J[H[0mWriting docs notes: when Gemini CLI says "rate limit exceeded" in a future hypothetical wording without the 429 status code, our classifier (per #854) deliberately does NOT match — discussion prose containing the bare 3-word phrase must stay non-error. Recording this so the negative fixture intent is self-documenting.
-
-Type your message

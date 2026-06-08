@@ -1617,7 +1617,6 @@ mod tests {
         for b in [
             Backend::ClaudeCode,
             Backend::Codex,
-            Backend::Gemini,
             Backend::KiroCli,
             Backend::OpenCode,
             Backend::Agy,

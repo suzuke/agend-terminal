@@ -37,14 +37,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// 5 backends per dispatch m-20260509214553949181-385. Each backend
-/// has its own conventional skills directory inside the agent's
-/// working tree; the daemon installs a symlink (or copy on Windows)
-/// pointing at the unified source.
+/// Per-backend conventional skills directories inside the agent's working
+/// tree; the daemon installs a symlink (or copy on Windows) pointing at the
+/// unified source. (Originally 5 backends per dispatch
+/// m-20260509214553949181-385; #1580 retired gemini-cli's `.gemini/skills`.)
 pub const BACKEND_SKILL_DIRS: &[(&str, &str)] = &[
     ("claude", ".claude/skills"),
     ("codex", ".codex/skills"),
-    ("gemini", ".gemini/skills"),
     ("opencode", ".opencode/skills"),
     ("kiro", ".kiro/skills"),
 ];

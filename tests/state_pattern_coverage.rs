@@ -15,8 +15,6 @@ const EXPECTED_FIXTURES: &[&str] = &[
     "codex-update.raw",
     "codex-perm.raw",
     "codex-model-unsupported.raw",
-    "gemini-thinking.raw",
-    "gemini-tooluse.raw",
     "kiro-thinking.raw",
     "kiro-tooluse.raw",
     "opencode-thinking.raw",
@@ -24,7 +22,6 @@ const EXPECTED_FIXTURES: &[&str] = &[
     // #1559 — cross-backend permission-dialog chrome captures (operator
     // recorded 2026-06-01). Replayed by `replay_manifest_regression`.
     "kiro-perm.raw",
-    "gemini-perm.raw",
     "opencode-perm.raw",
     // #1579/#1578 — agy (Antigravity CLI) state corpus (operator-recorded
     // 2026-06-01; chrome verified). Thinking/ToolUse/Idle/Permission replayed
@@ -42,16 +39,12 @@ const EXPECTED_FIXTURES: &[&str] = &[
     "claude-overloaded-529.raw",
     "claude-session-limit.raw",
     "claude-discussion-text.raw",
-    // #848 PR-B — OpenCode + Gemini + Kiro classifier fixtures (same
+    // #848 PR-B — OpenCode + Kiro classifier fixtures (same
     // synthetic-from-docs provenance, same in-process replay coverage
     // via `replay_manifest_regression`).
     "opencode-rate-limit-typical.raw",
     "opencode-usage-limit-typical.raw",
     "opencode-discussion-text.raw",
-    "gemini-rate-limit-typical.raw",
-    "gemini-discussion-text.raw",
-    "gemini-rate-limit-canonical-429.raw",
-    "gemini-rate-limit-prose-discussion.raw",
     "kiro-rate-limit-typical.raw",
     "kiro-usage-limit-typical.raw",
     "kiro-discussion-text.raw",

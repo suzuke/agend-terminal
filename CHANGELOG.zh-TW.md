@@ -5,6 +5,9 @@
 
 ## [Unreleased]
 
+### 移除
+- **Gemini CLI backend 退役**（[#1580](https://github.com/suzuke/agend-terminal/issues/1580),完成 [#8](https://github.com/suzuke/agend-terminal/issues/8))。`gemini-cli` 於 2026-06-18 停止服務(免費/Pro/Ultra);其官方後繼者 Antigravity CLI(`agy`)自 [#1547](https://github.com/suzuke/agend-terminal/issues/1547) 起即為支援的 backend。`Backend::Gemini` 變體、其 preset/偵測 patterns、以及 8 個 gemini state-replay fixtures 皆已移除。**操作者注意:** `fleet.yaml` 內指定的 `gemini` / `gemini-cli` 不再解析為受管 backend,改以泛用 `Raw` backend 啟動;請改用 `agy`。移除最後一個 legacy backend 也讓 legacy 偵測骨幹(`compile_for`、`config_for_legacy`、`legacy_initial_state`)得以刪除——每個 backend 現在皆透過其同址的 `BackendProfile` 路由(#8 完成)。
+
 ### Changed
 
 - **operator-mode 授權檔改為 fail-closed(#1576)** — daemon 啟動時僅在 `operator-mode.json` 存在且帶有效 HMAC 簽章時才信任它;檔案缺失、未簽章或遭竄改,會把 #1339 授權閘鎖進限制性的 **Away**,以阻止遭注入的 agent 偷寫 `{"mode":"active"}` 來停用該閘。此鎖定是**通道無關的** —— 在授權閘層強制執行,而非綁定任一 adapter —— 因此會壓制**所有** operator channel 的 operator 互動(目前的 Telegram;以 `--features discord` 編譯時的 Discord;未來的 Slack/Matrix adapter 亦同):從通道送進來的 operator 權威指令不會被當成 operator 處理,且 agent→operator 的通知會被拒絕/排入佇列,直到啟用模式為止。(唯讀與 agent 間的 fleet 協作永不受此閘限制。)**遷移:任何從 #1576 之前(2026-06-02 前)的版本升級上來的安裝,都沒有已簽章的檔,會以 Away 啟動 —— 不論你使用哪一種通道,升級後都請執行一次 `agend-terminal mode active`。** 之後該已簽章檔會跨重啟持續有效。注意:當磁碟上的檔不存在時,`mode get` 仍可能回報記憶體中的 last-known-good 模式,因此請確認磁碟上檔案是否真的存在,而非只看回報的模式。
