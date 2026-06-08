@@ -223,6 +223,26 @@ pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
     if let Some(orch) = params.get("orchestrator").and_then(|v| v.as_str()) {
         team_params["orchestrator"] = json!(orch);
     }
+    // #1833: forward `repository_path` (team source_repo) — same allowlist-drop
+    // class as the orchestrator preservation above. #1329 made `deployments.rs`
+    // set `team_args["repository_path"]` and route through CREATE_TEAM, but this
+    // handler re-marshals `params` into a fresh `team_params` and dropped the
+    // field, so every deploy/`api::call(CREATE_TEAM)` produced a team with
+    // `source_repo=null` regardless of the template/caller (`teams::create`
+    // reads `repository_path`, teams.rs).
+    if let Some(repo) = params.get("repository_path").and_then(|v| v.as_str()) {
+        team_params["repository_path"] = json!(repo);
+    }
+    // #1837 (reviewer-2): `accept_from` is the SAME re-marshal allowlist-drop —
+    // a documented CREATE_TEAM param (mcp/tools.rs cross-team allowlist, "empty =
+    // deny all") that `teams::create` reads from `args["accept_from"]` (teams.rs)
+    // but this handler never forwarded. The main path `team(action=create,
+    // accept_from=[...])` → `api::call(CREATE_TEAM)` → here → dropped → the
+    // operator's cross-team allowlist was silently emptied (fail-closed, but a
+    // real functional loss). Forward it to close the root-cause pattern entirely.
+    if let Some(af) = params.get("accept_from") {
+        team_params["accept_from"] = af.clone();
+    }
     let result = crate::teams::create(ctx.home, &team_params);
 
     if let Some(n) = ctx.notifier {
@@ -243,4 +263,99 @@ pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
         resp["failed"] = json!(failed);
     }
     resp
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use parking_lot::Mutex;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn tmp_home(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static C: AtomicU32 = AtomicU32::new(0);
+        let id = C.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "agend-team-1833-{}-{}-{}",
+            tag,
+            std::process::id(),
+            id
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    }
+
+    fn test_ctx(home: &std::path::Path) -> HandlerCtx<'_> {
+        // Leak empty registries for 'static — acceptable in tests (mirrors the
+        // messaging-handler test scaffold).
+        let registry: &'static crate::agent::AgentRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let configs: &'static crate::api::ConfigRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let externals: &'static crate::agent::ExternalRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        HandlerCtx {
+            registry,
+            configs,
+            externals,
+            notifier: None,
+            home,
+        }
+    }
+
+    /// §3.9 regression (#1833 + #1837): CREATE_TEAM through the real
+    /// `handle_create_team` entry must persist BOTH `repository_path` (→ team
+    /// `source_repo`) and `accept_from` (→ team `accept_from`) into the TEAM
+    /// block. Pre-fix, the handler re-marshaled `params` into a fresh
+    /// `team_params` from an allowlist that dropped both fields, so every deploy
+    /// / `api::call(CREATE_TEAM)` produced `source_repo=null` (a #1329 regression)
+    /// and an emptied cross-team allowlist (#1837 sibling, fail-closed but a real
+    /// functional loss). Regression-proof: delete either forward in
+    /// `handle_create_team` and the matching assertion below FAILS.
+    #[test]
+    fn create_team_persists_repository_path_and_accept_from_to_team_block_1833() {
+        let home = tmp_home("create-srcrepo");
+        // Minimal fleet.yaml so FleetConfig round-trips cleanly.
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances: {}\nteams: {}\n",
+        )
+        .unwrap();
+        let ctx = test_ctx(&home);
+
+        // No `backends`/`count` → no spawn; pre-listed members drive the exact
+        // param-marshaling path the bug lives in (the real CREATE_TEAM entry).
+        let params = json!({
+            "name": "sqdteam",
+            "members": ["sqdteam-1", "sqdteam-2"],
+            "description": "deploy",
+            "repository_path": "/srv/canonical-repo",
+            "accept_from": ["peer-team-a", "peer-team-b"],
+        });
+        let resp = handle_create_team(&params, &ctx);
+        assert_eq!(resp["ok"], true, "create must succeed: {resp}");
+
+        // The TEAM block (not just instances) must carry both fields on disk.
+        let cfg = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+        let team = cfg
+            .teams
+            .get("sqdteam")
+            .expect("team persisted to fleet.yaml");
+        assert_eq!(
+            team.source_repo.as_deref(),
+            Some(std::path::Path::new("/srv/canonical-repo")),
+            "#1833: repository_path must reach the team block's source_repo, got {:?}",
+            team.source_repo
+        );
+        assert_eq!(
+            team.accept_from,
+            vec!["peer-team-a".to_string(), "peer-team-b".to_string()],
+            "#1837: accept_from must reach the team block (not be silently emptied), got {:?}",
+            team.accept_from
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
