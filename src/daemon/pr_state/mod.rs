@@ -2015,6 +2015,82 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// [C1 / #1842] §3.9: a merged PR is announced ONCE even across the
+    /// scan-`remove` → lingering-CI-`_or_create` re-create loop. The recreated
+    /// state file has `ready_emitted_for_sha = None` (the reset that drove the 8×
+    /// re-emit), but the persistent terminal-emit ledger suppresses the replay.
+    #[test]
+    fn c1_merged_not_reemitted_after_delete_recreate_1842() {
+        let mut s = new_state("sha-A", ReviewClass::Single);
+        s.pr_author = String::new();
+        let home = home_with_state("c1-reemit-1842", s);
+        let merged_meta = GhPrMetadata {
+            number: 970,
+            author_login: "dev".into(),
+            head_ref: "feat/test".into(),
+            is_cross_repository: false,
+            is_draft: false,
+            state: GhPrState::Merged,
+            merged_at: Some("2026-05-20T04:17:09Z".to_string()),
+        };
+
+        // Scan 1: observe merged → emit [pr-merged] exactly once.
+        scan_and_emit_with(
+            &home,
+            &empty_registry(),
+            &MockGhPoller::new(vec![Ok(vec![merged_meta.clone()])]),
+        );
+        assert_eq!(
+            crate::inbox::drain(&home, "dev").len(),
+            1,
+            "scan 1 emits [pr-merged] once"
+        );
+
+        // Scan 2: already_emitted (per-file flag) → sweep the terminal file.
+        scan_and_emit_with(
+            &home,
+            &empty_registry(),
+            &MockGhPoller::new(vec![Ok(vec![merged_meta.clone()])]),
+        );
+        assert!(
+            load(&home, "owner/repo", "feat/test").is_none(),
+            "scan 2 sweeps the terminal file"
+        );
+        assert!(
+            crate::inbox::drain(&home, "dev").is_empty(),
+            "scan 2 does not re-emit"
+        );
+
+        // RECREATE: a lingering CI observation re-creates a FRESH Merged state
+        // file with ready_emitted_for_sha=None for the SAME merge identity (the
+        // #1842 loop). Without the ledger this re-emits; with it, suppressed.
+        let mut recreated = new_state("sha-A", ReviewClass::Single);
+        recreated.merge_state = MergeState::Merged {
+            merge_commit: "sha-A".to_string(),
+            merged_at: "2026-05-20T04:17:09Z".to_string(),
+        };
+        recreated.ready_emitted_for_sha = None;
+        save(&home, &recreated).unwrap();
+
+        // Scan 3: per-file flag is reset (None) but the persistent ledger says
+        // emitted → NO replay.
+        scan_and_emit_with(
+            &home,
+            &empty_registry(),
+            &MockGhPoller::new(vec![Ok(vec![merged_meta])]),
+        );
+        assert!(
+            crate::inbox::drain(&home, "dev").is_empty(),
+            "[C1/#1842] recreated merged file must NOT re-emit (ledger survives delete+recreate)"
+        );
+        assert!(
+            load(&home, "owner/repo", "feat/test").is_none(),
+            "scan 3 sweeps the recreated file"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     /// #986 T5 — `gh state=CLOSED + mergedAt=None` fires
     /// ClosedUnmergedObserved → reducer transitions → scanner emits
     /// `[pr-closed-unmerged]`.

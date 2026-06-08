@@ -12,6 +12,55 @@ enum ScanAction {
     Remove,
 }
 
+/// [C1 / #1842] Persistent dedup ensuring a terminal `[pr-merged]` /
+/// `[pr-closed-unmerged]` is announced ONCE per merge identity — even when the
+/// per-PR state file is `remove`d by the scan terminal-cleanup and then
+/// RE-CREATED by a lingering CI observation (`record_ci_result`'s `_or_create`,
+/// mod.rs). That delete→recreate loop reset the per-file `ready_emitted_for_sha`
+/// flag every poll, re-emitting `[pr-merged]` ~once per poll (#1842: 8× for one
+/// merge). Keyed on the terminal-event identity, this ledger survives the file
+/// delete; the per-file flag cannot. Pruned by TTL on each record.
+const TERMINAL_EMIT_LEDGER_TTL_SECS: i64 = 7 * 24 * 60 * 60;
+
+fn terminal_emit_ledger_path(home: &Path) -> std::path::PathBuf {
+    pr_state_dir(home).join(".emitted-terminal.json")
+}
+
+/// True if a `[pr-merged]`/`[pr-closed-unmerged]` for `key` was already emitted
+/// (lock-free read; a missing/corrupt ledger reads as "not emitted").
+fn terminal_already_emitted(home: &Path, key: &str) -> bool {
+    std::fs::read_to_string(terminal_emit_ledger_path(home))
+        .ok()
+        .and_then(|c| serde_json::from_str::<std::collections::HashMap<String, String>>(&c).ok())
+        .is_some_and(|m| m.contains_key(key))
+}
+
+/// Record `key` as emitted (locked RMW), pruning entries older than the TTL.
+fn record_terminal_emitted(home: &Path, key: &str) {
+    let now = chrono::Utc::now();
+    let _ = crate::store::with_json_state_or_create::<
+        std::collections::HashMap<String, String>,
+        _,
+        _,
+        _,
+    >(
+        &terminal_emit_ledger_path(home),
+        std::collections::HashMap::new,
+        |m| {
+            m.retain(|_, ts| {
+                chrono::DateTime::parse_from_rfc3339(ts)
+                    .map(|t| {
+                        now.signed_duration_since(t.with_timezone(&chrono::Utc))
+                            .num_seconds()
+                            < TERMINAL_EMIT_LEDGER_TTL_SECS
+                    })
+                    .unwrap_or(false)
+            });
+            m.insert(key.to_string(), now.to_rfc3339());
+        },
+    );
+}
+
 /// Per-tick scanner: walks `<home>/pr-state/*.json`, emits any newly-
 /// eligible `[pr-ready-for-merge]` events (debounced via
 /// `ready_emitted_for_sha`), and sweeps terminal-state files.
@@ -80,6 +129,23 @@ pub fn scan_and_emit_with(
         // AFTER `with_pr_state` returns so enqueue_with_idle_hint (self-IPC via
         // loopback api::call) runs lock-free (#1617 lock-while-blocking class).
         let mut pending_emits: Vec<(String, crate::inbox::InboxMessage)> = Vec::new();
+        // [C1 / #1842] Terminal-event identity for the persistent emit-dedup
+        // ledger. Checked lock-free here (before the flock) and recorded
+        // post-flock if we emit — so a recreated state file (lingering-CI
+        // `_or_create` after the scan `remove`) cannot re-announce the merge.
+        let terminal_ledger_key: Option<String> = match &snapshot.merge_state {
+            MergeState::Merged { merge_commit, .. } => {
+                Some(format!("merged:{repo}@{branch}:{merge_commit}"))
+            }
+            MergeState::ClosedUnmerged { closed_at } => {
+                Some(format!("closed:{repo}@{branch}:{closed_at}"))
+            }
+            _ => None,
+        };
+        let ledger_says_emitted = terminal_ledger_key
+            .as_deref()
+            .is_some_and(|k| terminal_already_emitted(home, k));
+        let mut emitted_terminal = false;
         let result = with_pr_state(home, &repo, &branch, |state| {
             let mut dirty = false;
 
@@ -124,7 +190,10 @@ pub fn scan_and_emit_with(
                     merge_commit,
                     merged_at,
                 } => {
-                    if !already_emitted {
+                    // [C1] also suppress if the persistent ledger already recorded
+                    // this merge — survives the delete→recreate that resets the
+                    // per-file `ready_emitted_for_sha`.
+                    if !already_emitted && !ledger_says_emitted {
                         // #1344/#bughunt3: defer the worktree auto-release until
                         // AFTER this flock is dropped (the git subprocess +
                         // nested binding flock are the #1617 lock-while-blocking
@@ -147,19 +216,21 @@ pub fn scan_and_emit_with(
                         let msg = build_event_message("pr-merged", &author, state, body);
                         pending_emits.push((author, msg));
                         state.ready_emitted_for_sha = Some(state.head_sha.clone());
+                        emitted_terminal = true; // [C1] record in ledger post-flock
                         dirty = true;
                     } else {
                         tracing::debug!(
                             repo = %state.repo,
                             branch = %state.branch,
                             head = %state.head_sha,
-                            "#1017 pr_state: stale Merged replay suppressed at scan"
+                            ledger_says_emitted,
+                            "#1017/#1842 pr_state: Merged replay suppressed at scan"
                         );
                         return ScanAction::Remove;
                     }
                 }
                 MergeState::ClosedUnmerged { closed_at } => {
-                    if !already_emitted {
+                    if !already_emitted && !ledger_says_emitted {
                         let author = resolve_author(state);
                         let body = format!(
                             "[pr-closed-unmerged] {}@{} (closed_at {})\n\n\
@@ -174,9 +245,10 @@ pub fn scan_and_emit_with(
                         let msg = build_event_message("pr-closed-unmerged", &author, state, body);
                         pending_emits.push((author, msg));
                         state.ready_emitted_for_sha = Some(state.head_sha.clone());
-                        // t-worktree-leak (PR-1): close-unmerged is a terminal PR
-                        // transition → recompute the release invariant post-flock
-                        // (the sweeper applies the conservative close-grace).
+                        emitted_terminal = true; // [C1] record in ledger post-flock
+                                                 // t-worktree-leak (PR-1): close-unmerged is a terminal PR
+                                                 // transition → recompute the release invariant post-flock
+                                                 // (the sweeper applies the conservative close-grace).
                         release_after_unlock = Some((state.branch.clone(), "close_unmerged"));
                         dirty = true;
                     } else {
@@ -184,7 +256,8 @@ pub fn scan_and_emit_with(
                             repo = %state.repo,
                             branch = %state.branch,
                             head = %state.head_sha,
-                            "#1017 pr_state: stale ClosedUnmerged replay suppressed at scan"
+                            ledger_says_emitted,
+                            "#1017/#1842 pr_state: ClosedUnmerged replay suppressed at scan"
                         );
                         return ScanAction::Remove;
                     }
@@ -241,6 +314,14 @@ pub fn scan_and_emit_with(
                 );
             }
             _ => {}
+        }
+        // [C1 / #1842] Record the terminal emit in the persistent ledger AFTER the
+        // flock drops (mirrors the deferred enqueue — keeps file I/O off the
+        // PR-state lock). Done regardless of Saved/Remove: the announce happened.
+        if emitted_terminal {
+            if let Some(k) = &terminal_ledger_key {
+                record_terminal_emitted(home, k);
+            }
         }
         let _ = registry; // reserved for future gh-poll author lookup hook
     }
