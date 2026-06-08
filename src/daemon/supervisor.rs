@@ -552,6 +552,102 @@ fn escalate_self_orch_autherror(
     tracing::info!(agent = %name, "#1595/#1744: self-orchestrator AuthError escalated to operator (all channels)");
 }
 
+/// #1861: persisted usage_limit notify dedup record (one per member). A daemon
+/// restart wipes the in-mem `NotifyTrack` cooldown, so without persistence the
+/// operator is re-notified of the SAME usage limit on every restart (the backend
+/// boots `Starting` → re-detects UsageLimit).
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct UsageNotifyRecord {
+    /// Parsed "HH:MM" unlock string at notify time (None if the pane had no
+    /// parseable reset time).
+    unlock_at: Option<String>,
+    /// When we notified (rfc3339 UTC) — anchors the unlock deadline + the
+    /// null-unlock fallback cooldown.
+    notified_at: String,
+}
+
+fn usage_limit_notify_path(home: &std::path::Path) -> std::path::PathBuf {
+    home.join("usage_limit_notify.json")
+}
+
+/// The UTC instant an `HH:MM` unlock window elapses, anchored to `notified_at`
+/// (the next occurrence of HH:MM at-or-after the notify, treated as UTC since the
+/// pane renders e.g. "Resets at 15:14 UTC"). `None` if unparseable.
+fn unlock_deadline(
+    hhmm: &str,
+    notified_at: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    use chrono::TimeZone;
+    let (h, m) = hhmm.split_once(':')?;
+    let h: u32 = h.trim().parse().ok()?;
+    let m: u32 = m.trim().parse().ok()?;
+    let naive = notified_at.date_naive().and_hms_opt(h, m, 0)?;
+    let candidate = chrono::Utc.from_utc_datetime(&naive);
+    Some(if candidate >= notified_at {
+        candidate
+    } else {
+        candidate + chrono::Duration::days(1)
+    })
+}
+
+/// True ⇒ suppress this usage_limit notify (already notified for the same still-
+/// open window). Lock-free FAIL-OPEN read: a missing/corrupt record ⇒ NOT
+/// suppressed (notify), so a real new limit is never silently swallowed.
+fn usage_limit_notify_suppressed(
+    home: &std::path::Path,
+    name: &str,
+    unlock_at: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let map: std::collections::HashMap<String, UsageNotifyRecord> =
+        std::fs::read_to_string(usage_limit_notify_path(home))
+            .ok()
+            .and_then(|c| serde_json::from_str(&c).ok())
+            .unwrap_or_default();
+    let Some(rec) = map.get(name) else {
+        return false;
+    };
+    let Ok(notified_at) = chrono::DateTime::parse_from_rfc3339(&rec.notified_at) else {
+        return false;
+    };
+    let notified_at = notified_at.with_timezone(&chrono::Utc);
+    match unlock_at {
+        // Different unlock window string ⇒ a NEW limit ⇒ notify.
+        Some(u) if rec.unlock_at.as_deref() != Some(u) => false,
+        // Same window: suppress until its deadline passes (then the limit reset →
+        // notify again). Unparseable deadline ⇒ conservatively suppress (an
+        // identical string is a strong same-window signal).
+        Some(u) => unlock_deadline(u, notified_at).is_none_or(|deadline| now < deadline),
+        // No parseable reset time ⇒ persisted-timestamp cooldown (NOT the
+        // in-session Instant cooldown a restart wipes).
+        None => {
+            now.signed_duration_since(notified_at)
+                < chrono::Duration::from_std(NOTIFY_COOLDOWN)
+                    .unwrap_or_else(|_| chrono::Duration::seconds(60))
+        }
+    }
+}
+
+/// Persist that we notified `name` for `unlock_at` at `now` (locked RMW).
+fn record_usage_limit_notified(
+    home: &std::path::Path,
+    name: &str,
+    unlock_at: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    let record = UsageNotifyRecord {
+        unlock_at: unlock_at.map(String::from),
+        notified_at: now.to_rfc3339(),
+    };
+    let _ = crate::store::with_json_state_or_create(
+        &usage_limit_notify_path(home),
+        std::collections::HashMap::<String, UsageNotifyRecord>::new,
+        |map| {
+            map.insert(name.to_string(), record);
+        },
+    );
+}
+
 /// Decide and dispatch member-state-change notify. Returns true if notify sent.
 /// Production-path-coupled per §3.5.10 — tests call this same function.
 pub(crate) fn maybe_notify_member_state_change(
@@ -616,6 +712,25 @@ pub(crate) fn maybe_notify_member_state_change(
     } else {
         None
     };
+    // #1861: usage_limit notify re-fired on EVERY daemon restart — the in-mem
+    // `tracks` cooldown is Instant-based and wiped on restart, and the backend
+    // boots `Starting` → re-detects UsageLimit → re-transitions. Persist the
+    // "already notified" decision keyed (member, unlock_at) so a restart with the
+    // SAME unlock window stays silent; re-notify only when unlock_at ADVANCES (new
+    // limit) or has PASSED. Scoped to UsageLimit ONLY — other error-class notifies
+    // keep the in-session cooldown unchanged.
+    if new_state == crate::state::AgentState::UsageLimit
+        && usage_limit_notify_suppressed(home, name, unlock_at.as_deref(), chrono::Utc::now())
+    {
+        // Stamp the in-mem track so same-session ticks short-circuit at the
+        // cooldown gate above without re-reading the persisted record each tick.
+        let track = tracks.entry(name.to_string()).or_insert(NotifyTrack {
+            last_at: now,
+            consecutive: 0,
+        });
+        track.last_at = now;
+        return false;
+    }
     let track = tracks.entry(name.to_string()).or_insert(NotifyTrack {
         last_at: now,
         consecutive: 0,
@@ -644,6 +759,11 @@ pub(crate) fn maybe_notify_member_state_change(
             detected_at,
         },
     );
+    // #1861: record the notify so a daemon restart with the SAME unlock window
+    // stays silent (the in-mem track above is wiped on restart).
+    if new_state == crate::state::AgentState::UsageLimit {
+        record_usage_limit_notified(home, name, unlock_at.as_deref(), chrono::Utc::now());
+    }
     true
 }
 
@@ -2804,6 +2924,171 @@ instances:
             "#1744-M7: a non-AuthError state under an unreadable config must NOT escalate"
         );
 
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1861 §3.9: a usage_limit notify must NOT re-fire on daemon restart (fresh
+    /// in-mem tracks) while the SAME unlock window is still open; a NEW unlock
+    /// window (different reset time) must re-notify. Drives the real production
+    /// entry `maybe_notify_member_state_change`.
+    #[test]
+    fn usage_limit_notify_not_refired_across_restart_1861() {
+        let home = tmp_home("1861-restart");
+        std::fs::create_dir_all(home.join("inbox")).ok();
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  dev:\n    backend: claude\n  lead:\n    backend: claude\n\
+             teams:\n  t:\n    members: [dev, lead]\n    orchestrator: lead\n",
+        )
+        .expect("seed fleet");
+        // A parseable reset time well in the future → deadline-not-passed is
+        // wall-clock-robust (avoids a flake if "now" happens to be past a fixed HH:MM).
+        let future = (chrono::Utc::now() + chrono::Duration::hours(3))
+            .format("%H:%M")
+            .to_string();
+        let pane = format!("Usage limit reached. Resets at {future} UTC");
+
+        // First detection → notifies + persists the (member, unlock_at) record.
+        let mut tracks = std::collections::HashMap::new();
+        let sent1 = super::maybe_notify_member_state_change(
+            &home,
+            "dev",
+            crate::state::AgentState::Idle,
+            crate::state::AgentState::UsageLimit,
+            &pane,
+            &mut tracks,
+        );
+        assert!(
+            sent1,
+            "first usage_limit detection notifies the orchestrator"
+        );
+
+        // Simulate daemon RESTART: fresh in-mem tracks; the persisted record stays.
+        let mut tracks_after_restart = std::collections::HashMap::new();
+        let sent2 = super::maybe_notify_member_state_change(
+            &home,
+            "dev",
+            crate::state::AgentState::Idle,
+            crate::state::AgentState::UsageLimit,
+            &pane,
+            &mut tracks_after_restart,
+        );
+        assert!(
+            !sent2,
+            "#1861: the same unlock window after a restart must NOT re-notify"
+        );
+
+        // A NEW limit (different reset time) DOES notify, even after a restart.
+        let later = (chrono::Utc::now() + chrono::Duration::hours(5))
+            .format("%H:%M")
+            .to_string();
+        let pane2 = format!("Usage limit reached. Resets at {later} UTC");
+        let mut tracks3 = std::collections::HashMap::new();
+        let sent3 = super::maybe_notify_member_state_change(
+            &home,
+            "dev",
+            crate::state::AgentState::Idle,
+            crate::state::AgentState::UsageLimit,
+            &pane2,
+            &mut tracks3,
+        );
+        assert!(
+            sent3,
+            "#1861: a new unlock window (different reset time) must re-notify"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1861 §3.9 (helper, deterministic `now`): same unlock_at before its
+    /// deadline → suppress; after the deadline (limit reset) → re-notify;
+    /// different unlock_at (new limit) → re-notify; no record → re-notify.
+    #[test]
+    fn usage_limit_notify_suppressed_logic_1861() {
+        let home = tmp_home("1861-helper");
+        std::fs::create_dir_all(&home).ok();
+        std::fs::write(
+            super::usage_limit_notify_path(&home),
+            r#"{"dev":{"unlock_at":"15:14","notified_at":"2026-06-09T14:00:00+00:00"}}"#,
+        )
+        .expect("seed record");
+        let at = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .expect("valid rfc3339")
+                .with_timezone(&chrono::Utc)
+        };
+        assert!(
+            super::usage_limit_notify_suppressed(
+                &home,
+                "dev",
+                Some("15:14"),
+                at("2026-06-09T14:30:00+00:00")
+            ),
+            "same unlock_at, before the 15:14 deadline → suppress"
+        );
+        assert!(
+            !super::usage_limit_notify_suppressed(
+                &home,
+                "dev",
+                Some("15:14"),
+                at("2026-06-09T16:00:00+00:00")
+            ),
+            "same unlock_at, past the deadline (limit reset) → re-notify"
+        );
+        assert!(
+            !super::usage_limit_notify_suppressed(
+                &home,
+                "dev",
+                Some("18:00"),
+                at("2026-06-09T14:30:00+00:00")
+            ),
+            "different unlock_at (new limit) → re-notify"
+        );
+        assert!(
+            !super::usage_limit_notify_suppressed(
+                &home,
+                "other",
+                Some("15:14"),
+                at("2026-06-09T14:30:00+00:00")
+            ),
+            "no record for this member → re-notify"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1861 §3.9 (helper): an UNPARSEABLE unlock time falls back to a PERSISTED
+    /// timestamp cooldown (NOT the in-session Instant cooldown a restart wipes).
+    #[test]
+    fn usage_limit_null_unlock_fallback_cooldown_1861() {
+        let home = tmp_home("1861-null");
+        std::fs::create_dir_all(&home).ok();
+        std::fs::write(
+            super::usage_limit_notify_path(&home),
+            r#"{"dev":{"unlock_at":null,"notified_at":"2026-06-09T14:00:00+00:00"}}"#,
+        )
+        .expect("seed record");
+        let at = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .expect("valid rfc3339")
+                .with_timezone(&chrono::Utc)
+        };
+        assert!(
+            super::usage_limit_notify_suppressed(
+                &home,
+                "dev",
+                None,
+                at("2026-06-09T14:00:30+00:00")
+            ),
+            "null unlock_at within the persisted cooldown → suppress"
+        );
+        assert!(
+            !super::usage_limit_notify_suppressed(
+                &home,
+                "dev",
+                None,
+                at("2026-06-09T14:05:00+00:00")
+            ),
+            "null unlock_at past the persisted cooldown → re-notify"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
