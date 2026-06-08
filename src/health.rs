@@ -326,6 +326,12 @@ pub struct HealthTracker {
     pub state: HealthState,
     pub crash_times: VecDeque<Instant>,
     pub total_crashes: u32,
+    /// [M1] decay clock for `total_crashes`. Advanced to `now` on every
+    /// `maybe_decay` decrement so decay is genuinely 1 unit per `STABILITY_WINDOW`
+    /// — NOT keyed on `crash_times.back()` alone (which never moves on decrement,
+    /// so once one window elapsed the whole budget drained in consecutive ticks).
+    /// In-memory only (re-derives from `crash_times` on restart; not persisted).
+    crash_decay_at: Option<Instant>,
     max_retries: u32,
     /// #1744-H3: per-class notify cooldown — crash escalations stamp/read THIS,
     /// hung escalations use `last_hung_notification`. Split from the former shared
@@ -474,6 +480,7 @@ impl HealthTracker {
             state: HealthState::Healthy,
             crash_times: VecDeque::new(),
             total_crashes: 0,
+            crash_decay_at: None,
             max_retries: DEFAULT_MAX_RETRIES,
             last_crash_notification: None,
             last_hung_notification: None,
@@ -1003,6 +1010,10 @@ impl HealthTracker {
                 .unwrap_or(false);
             if last_stage2_idle {
                 self.recovery_restart_count = self.recovery_restart_count.saturating_sub(1);
+                // [M1] advance the decay anchor so the NEXT unit needs another full
+                // STABILITY_WINDOW — without this, once one window elapsed every
+                // subsequent tick (~10s) decremented, draining the count in seconds.
+                self.last_stage2_fired_at = Some(now);
             }
         }
         if self.total_crashes == 0 {
@@ -1012,10 +1023,20 @@ impl HealthTracker {
             Some(t) => *t,
             None => return,
         };
-        if now.saturating_duration_since(last_crash) >= STABILITY_WINDOW {
+        // [M1] decay clock = the LATER of the most-recent crash and the last decay.
+        // `crash_times.back()` never moves on decrement, so keying on it alone let
+        // the whole budget drain in consecutive ticks once the first 30-min window
+        // passed; `crash_decay_at` (advanced below) makes it 1 unit per window.
+        let crash_anchor = match self.crash_decay_at {
+            Some(d) if d > last_crash => d,
+            _ => last_crash,
+        };
+        if now.saturating_duration_since(crash_anchor) >= STABILITY_WINDOW {
             self.total_crashes = self.total_crashes.saturating_sub(1);
+            self.crash_decay_at = Some(now); // advance the decay anchor
             if self.total_crashes == 0 {
                 self.crash_times.clear();
+                self.crash_decay_at = None; // budget cleared → reset decay clock
             }
             // Recover from Failed/Unstable if crashes decayed enough.
             // Known limitation: Failed → Recovering with a dead process
@@ -1057,6 +1078,71 @@ mod tests {
     /// VM it clamps to now.
     fn ago(secs: u64) -> Instant {
         epoch_ms_to_instant(crate::daemon::heartbeat_pair::now_ms().saturating_sub(secs * 1000))
+    }
+
+    /// [M1] §3.9: `total_crashes` decay is 1 unit per STABILITY_WINDOW, NOT a
+    /// per-tick burst. `maybe_decay` runs every ~10s; before the fix, once one
+    /// 30-min window elapsed every subsequent call decremented, draining the whole
+    /// budget in seconds (defeating the max-retries crash-loop cap for a
+    /// slow-flapping agent). Repeated calls within ONE window must decay ≤1.
+    /// (Uses `base + offset` — forward Instants never underflow on windows.)
+    #[test]
+    fn crash_decay_one_unit_per_window_not_tick_burst_m1() {
+        let mut h = HealthTracker::new();
+        let base = Instant::now();
+        h.total_crashes = 4;
+        for _ in 0..4 {
+            h.crash_times.push_back(base);
+        }
+        h.state = HealthState::Unstable;
+
+        // Many ticks within the SAME (first) window → at most ONE decay.
+        let t1 = base + Duration::from_secs(31 * 60);
+        for _ in 0..10 {
+            h.maybe_decay_at(t1);
+        }
+        assert_eq!(
+            h.total_crashes, 3,
+            "[M1] repeated ticks within one window decay at most 1 unit (not burst to 0)"
+        );
+
+        // A later window → exactly one more.
+        let t2 = base + Duration::from_secs(62 * 60);
+        for _ in 0..10 {
+            h.maybe_decay_at(t2);
+        }
+        assert_eq!(
+            h.total_crashes, 2,
+            "[M1] the next window decays exactly 1 more"
+        );
+    }
+
+    /// [M1] §3.9: the same 1-unit-per-window discipline for `recovery_restart_count`
+    /// (decay anchored on `last_stage2_fired_at`, advanced on each decrement).
+    #[test]
+    fn recovery_restart_count_decay_one_unit_per_window_m1() {
+        let mut h = HealthTracker::new();
+        let base = Instant::now();
+        h.recovery_restart_count = 3;
+        h.last_stage2_fired_at = Some(base);
+
+        let t1 = base + Duration::from_secs(31 * 60);
+        for _ in 0..10 {
+            h.maybe_decay_at(t1);
+        }
+        assert_eq!(
+            h.recovery_restart_count, 2,
+            "[M1] recovery count decays at most 1 within one window"
+        );
+
+        let t2 = base + Duration::from_secs(62 * 60);
+        for _ in 0..10 {
+            h.maybe_decay_at(t2);
+        }
+        assert_eq!(
+            h.recovery_restart_count, 1,
+            "[M1] the next window decays exactly 1 more"
+        );
     }
 
     /// #1701 ① + ②: a self-orchestrator crash escalates on the FIRST crash
