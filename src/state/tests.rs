@@ -4338,3 +4338,27 @@ fn multiline_prose_mentioning_srl_does_not_latch_phase2() {
         "#SRL-phase2: multi-line prose mentioning the SRL phrase (no error indicator) must NOT latch"
     );
 }
+
+/// #SRL-phase2 (c') reviewer-2 #1857 regression: prose that mentions the SRL
+/// phrase AND has an UNRELATED error indicator on a DIFFERENT (distant) row must
+/// NOT latch. The old `in_error_line(flat, …)` degenerated to "indicator anywhere
+/// in the tail" (flat has no `\n`) → false latch; the proximity-scoped check
+/// rejects the distant indicator.
+#[test]
+fn prose_with_distant_unrelated_error_indicator_does_not_latch_phase2() {
+    let (mut vt, mut st) = claude_tracker();
+    // Row A: an unrelated `TypeError:` (an in_error_line indicator, but NOT an
+    // SRL/RateLimit pattern). Rows of filler push it well past the proximity
+    // window. Last row: the SRL throttle phrase as prose (no adjacent indicator).
+    let frame = "TypeError: cannot read property foo of undefined here\r\n\
+                 filler alpha beta gamma delta epsilon\r\n\
+                 filler zeta eta theta iota kappa\r\n\
+                 more filler lambda mu nu xi omicron\r\n\
+                 Server is temporarily limiting requests is just the banner text FYI\r\n";
+    drive(&mut vt, &mut st, frame.as_bytes());
+    assert_ne!(
+        st.get_state(),
+        AgentState::ServerRateLimit,
+        "#SRL-phase2 #1857: SRL prose + a DISTANT unrelated error indicator must NOT latch"
+    );
+}

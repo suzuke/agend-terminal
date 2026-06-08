@@ -688,12 +688,18 @@ fn unclassified_throttle_tail(
 /// - **auto-clear throttle states ONLY** (`ServerRateLimit` / `RateLimit`).
 ///   NEVER `ModelUnsupported` / `ContextFull`: those don't auto-clear and
 ///   suppress hang-check, so a flatten-FP would silently wedge a healthy agent.
-/// - **`in_error_line` on the flattened text** — the prose-FP guard. A multi-row
-///   prose block merged into one line is only accepted if it carries a real
-///   error indicator (`…Error:`, `429`, `RESOURCE_EXHAUSTED`, …). The residual
-///   verbatim-quote FP (a pane literally rendering an error line) is ACCEPTED —
-///   identical to the raw-path policy (mod.rs §anchor-gate): these states
-///   auto-clear and are retry-driven, so a one-off mis-latch self-corrects.
+/// - **a PROXIMITY-scoped error indicator** — the prose-FP guard. The flattened
+///   tail has NO `\n`, so `in_error_line` (which line-scopes via `\n`) would
+///   degenerate to "an indicator ANYWHERE in the bottom-N tail" — a distant
+///   unrelated `API Error:` on a different row would false-pass (reviewer-2,
+///   #1857). Instead require the indicator within [`THROTTLE_INDICATOR_PROXIMITY`]
+///   chars BEFORE the throttle match: a legit Ink hard-wrap renders the indicator
+///   (`API Error:`) immediately before the throttle phrase, so it falls inside
+///   the window; a stray indicator from an unrelated earlier row is far away and
+///   rejected. The residual verbatim-quote FP (a pane literally rendering
+///   `API Error: <throttle>` adjacent) is ACCEPTED — same as the raw-path policy:
+///   these states auto-clear and are retry-driven, so a one-off mis-latch
+///   self-corrects.
 fn flattened_throttle_detect(
     patterns: &crate::state::patterns::StatePatterns,
     screen_text: &str,
@@ -704,10 +710,37 @@ fn flattened_throttle_detect(
     if !matches!(state, AgentState::ServerRateLimit | AgentState::RateLimit) {
         return None;
     }
-    if !crate::state::patterns::in_error_line(&flat, matched) {
+    if !throttle_indicator_adjacent(&flat, matched) {
         return None;
     }
     Some(state)
+}
+
+/// Chars before a throttle match within which a real error indicator must sit for
+/// the [`flattened_throttle_detect`] prose-FP guard. A hard-wrapped SRL renders
+/// the `API Error:` prefix directly before the throttle phrase (≈10–30 chars); 80
+/// leaves slack for a short row prefix while staying tight enough to exclude an
+/// unrelated indicator on a different (flattened-away) row.
+const THROTTLE_INDICATOR_PROXIMITY: usize = 80;
+
+/// #SRL-phase2 (reviewer-2 #1857 fix): require an error indicator within
+/// `THROTTLE_INDICATOR_PROXIMITY` chars BEFORE `matched` in the flattened tail —
+/// the `\n`-less replacement for `in_error_line`'s line-scoping. The window spans
+/// `[match_start - K, match_end]` so an indicator that IS the match
+/// (`API Error: 5xx`) or sits just before it (`API Error: Server is temporarily
+/// limiting …`) passes, while a distant unrelated indicator does not.
+fn throttle_indicator_adjacent(flat: &str, matched: &str) -> bool {
+    let Some(start) = flat.find(matched) else {
+        return false;
+    };
+    let end = start + matched.len();
+    let raw_win_start = start.saturating_sub(THROTTLE_INDICATOR_PROXIMITY);
+    // Snap to a char boundary at/after the raw start so slicing never panics on
+    // multi-byte content. `start` is always a boundary (it's a `find` result).
+    let win_start = (raw_win_start..=start)
+        .find(|&i| flat.is_char_boundary(i))
+        .unwrap_or(start);
+    crate::state::patterns::line_has_error_indicator(&flat[win_start..end])
 }
 
 /// #1562: best-effort append of one JSON record as a single `line\n` to `path`,

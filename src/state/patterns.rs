@@ -74,10 +74,12 @@ pub(crate) const SERVER_RATE_LIMIT_NET_ERRORS: &str = r"ECONNRESET|ETIMEDOUT|Inv
 /// change the red→content anchor decision (a follow-up pending the operator's
 /// call on keeping/dropping the color signal); today it still gates only the
 /// #1757 net-error exemption at its single call site.
-pub(crate) fn in_error_line(screen_text: &str, matched: &str) -> bool {
-    if matched.is_empty() {
-        return false;
-    }
+/// Does `text` contain a recognised error-line indicator (`…Error:`, `429`,
+/// `resource_exhausted`, JSON error shapes, …)? Pure regex check over the WHOLE
+/// `text` — the caller is responsible for scoping `text` (a single line in
+/// [`in_error_line`]; a tight proximity window in the SRL hard-wrap fallback,
+/// where a fully-flattened tail has no `\n` to line-scope on).
+pub(crate) fn line_has_error_indicator(text: &str) -> bool {
     use std::sync::OnceLock;
     static ERROR_LINE: OnceLock<Regex> = OnceLock::new();
     let re = ERROR_LINE.get_or_init(|| {
@@ -86,6 +88,13 @@ pub(crate) fn in_error_line(screen_text: &str, matched: &str) -> bool {
         )
         .expect("error-line regex")
     });
+    re.is_match(text)
+}
+
+pub(crate) fn in_error_line(screen_text: &str, matched: &str) -> bool {
+    if matched.is_empty() {
+        return false;
+    }
     let mut search = 0;
     while let Some(rel) = screen_text[search..].find(matched) {
         let pos = search + rel;
@@ -93,7 +102,7 @@ pub(crate) fn in_error_line(screen_text: &str, matched: &str) -> bool {
         let line_end = screen_text[pos..]
             .find('\n')
             .map_or(screen_text.len(), |i| pos + i);
-        if re.is_match(&screen_text[line_start..line_end]) {
+        if line_has_error_indicator(&screen_text[line_start..line_end]) {
             return true;
         }
         search = pos + matched.len();
