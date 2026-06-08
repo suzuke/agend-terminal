@@ -362,8 +362,32 @@ fn handle_done(
                 result: result_text,
             }),
     };
-    match crate::task_events::append(home, &emitter, event) {
-        Ok(_) => {
+    // #1868: re-validate the →Done transition UNDER the append lock against FRESH
+    // committed state. The `can_transition_to` check above is a fast-reject; a
+    // concurrent writer (daemon `sweep_overdue_claimed` / `auto_close`, or a peer
+    // update) could have moved the task between that read and this append, and
+    // replay's `apply_done` does NOT re-guard transitions — so this precondition
+    // is the authoritative gate (mirrors `handle_claim`'s `append_checked`).
+    let done_id = id.clone();
+    match crate::task_events::append_checked(home, &emitter, event, |state| {
+        let tv = state
+            .tasks
+            .values()
+            .map(record_to_task)
+            .find(|t| t.id == done_id)
+            .ok_or_else(|| format!("task '{done_id}' not found"))?;
+        if !tv
+            .status
+            .can_transition_to(crate::task_events::TaskStatus::Done)
+        {
+            return Err(format!(
+                "illegal transition: {} → done (task {done_id})",
+                status_to_legacy_str(tv.status)
+            ));
+        }
+        Ok(())
+    }) {
+        Ok(Ok(_)) => {
             // #789: task-completion is a workflow boundary —
             // clean any empty `init` commits the backend has
             // accumulated in the agent's bound worktree since
@@ -412,6 +436,7 @@ fn handle_done(
                 "status": "done",
             })
         }
+        Ok(Err(reason)) => serde_json::json!({"error": reason, "code": "illegal_transition"}),
         Err(e) => serde_json::json!({"error": format!("event log append failed: {e}")}),
     }
 }
@@ -654,10 +679,43 @@ fn handle_update(
     // F1: single atomic append_batch over all the update arm's
     // queued events. Either all land or none do.
     if !pending_events.is_empty() {
-        if let Err(e) = crate::task_events::append_batch(home, &emitter, pending_events) {
-            return serde_json::json!({
-                "error": format!("event log append_batch failed: {e}")
+        // #1868: re-validate the status transition UNDER the append lock against
+        // FRESH committed state (mirrors `handle_claim`/`handle_done`). The
+        // out-of-lock `can_transition_to` check above is a fast-reject; a
+        // concurrent writer could have moved the task since, and replay does not
+        // re-guard transitions. Only a status change is gated — priority/desc/
+        // tags/owner events are last-write-wins metadata.
+        let upd_id = id.clone();
+        let target_status = new_status
+            .as_deref()
+            .and_then(crate::task_events::TaskStatus::from_str);
+        let checked =
+            crate::task_events::append_batch_checked(home, &emitter, pending_events, |state| {
+                if let Some(target) = target_status {
+                    let tv = state
+                        .tasks
+                        .values()
+                        .map(record_to_task)
+                        .find(|t| t.id == upd_id)
+                        .ok_or_else(|| format!("task '{upd_id}' not found"))?;
+                    if !tv.status.can_transition_to(target) {
+                        return Err(format!(
+                            "illegal transition: {} → {} (task {upd_id})",
+                            status_to_legacy_str(tv.status),
+                            status_to_legacy_str(target)
+                        ));
+                    }
+                }
+                Ok(())
             });
+        match checked {
+            Ok(Ok(_)) => {}
+            Ok(Err(reason)) => {
+                return serde_json::json!({"error": reason, "code": "illegal_transition"});
+            }
+            Err(e) => {
+                return serde_json::json!({"error": format!("event log append_batch failed: {e}")});
+            }
         }
         // #1018 (B): mirror the `done` arm's cleanup hook for
         // the `update` arm's done/cancelled transitions.
@@ -1512,6 +1570,155 @@ mod tests {
         assert_eq!(alerts.len(), 1, "gate-off must deliver via legacy path");
         assert_eq!(alerts[0].1.as_deref(), Some("parent_cancelled"));
         assert!(alerts[0].2.contains("t-parent-2") && alerts[0].2.contains("t-child-2"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1868 §3.9: the in-lock precondition `handle_done` now uses
+    /// (`append_checked`) REJECTS a `done` whose out-of-lock read was stale — a
+    /// concurrent sweep/auto_close moved the task to Cancelled. Pre-fix (plain
+    /// `append`) this Done was silently applied (replay's `apply_done` does not
+    /// re-guard transitions).
+    #[test]
+    fn append_checked_rejects_stale_done_after_concurrent_cancel_1868() {
+        let home = tmp_home("1868-done-stale");
+        create_task(&home, "t1");
+        let emitter = crate::task_events::InstanceName::from("dev-agent");
+        handle(
+            &home,
+            "dev-agent",
+            &serde_json::json!({"action": "claim", "id": "t1"}),
+        );
+        // Concurrent sweep/auto_close cancels it → committed state is Cancelled.
+        handle(
+            &home,
+            "dev-agent",
+            &serde_json::json!({"action": "update", "id": "t1", "status": "cancelled"}),
+        );
+
+        // A `done` prepared as-if the caller had still seen Claimed: the in-lock
+        // precondition re-reads the FRESH committed state (Cancelled) and rejects
+        // (Cancelled→Done is illegal).
+        let done = crate::task_events::TaskEvent::Done {
+            task_id: crate::task_events::TaskId("t1".into()),
+            by: crate::task_events::InstanceName::from("dev-agent"),
+            source: crate::task_events::DoneSource::OperatorManual {
+                authored_at: "2026-06-09T00:00:00+00:00".into(),
+                result: None,
+            },
+        };
+        let r = crate::task_events::append_checked(&home, &emitter, done, |state| {
+            let tv = state
+                .tasks
+                .values()
+                .map(record_to_task)
+                .find(|t| t.id == "t1")
+                .ok_or_else(|| "not found".to_string())?;
+            if !tv
+                .status
+                .can_transition_to(crate::task_events::TaskStatus::Done)
+            {
+                return Err("illegal".to_string());
+            }
+            Ok(())
+        });
+        assert!(
+            matches!(r, Ok(Err(_))),
+            "#1868: in-lock guard must REJECT a stale done on a Cancelled task: {r:?}"
+        );
+        assert_eq!(
+            read_task_record(&home, "t1").expect("task exists").status,
+            crate::task_events::TaskStatus::Cancelled,
+            "no Done event must land → task stays Cancelled"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1868 §3.9: same in-lock guard for the multi-event `update` arm via
+    /// `append_batch_checked`.
+    #[test]
+    fn append_batch_checked_rejects_stale_update_after_concurrent_cancel_1868() {
+        let home = tmp_home("1868-update-stale");
+        create_task(&home, "t1");
+        let emitter = crate::task_events::InstanceName::from("dev-agent");
+        handle(
+            &home,
+            "dev-agent",
+            &serde_json::json!({"action": "claim", "id": "t1"}),
+        );
+        handle(
+            &home,
+            "dev-agent",
+            &serde_json::json!({"action": "update", "id": "t1", "status": "cancelled"}),
+        );
+        let ev = crate::task_events::TaskEvent::InProgress {
+            task_id: crate::task_events::TaskId("t1".into()),
+            by: crate::task_events::InstanceName::from("dev-agent"),
+        };
+        let r = crate::task_events::append_batch_checked(&home, &emitter, vec![ev], |state| {
+            let tv = state
+                .tasks
+                .values()
+                .map(record_to_task)
+                .find(|t| t.id == "t1")
+                .ok_or_else(|| "not found".to_string())?;
+            if !tv
+                .status
+                .can_transition_to(crate::task_events::TaskStatus::InProgress)
+            {
+                return Err("illegal".to_string());
+            }
+            Ok(())
+        });
+        assert!(
+            matches!(r, Ok(Err(_))),
+            "#1868: in-lock batch guard must REJECT a stale update on a Cancelled task: {r:?}"
+        );
+        assert_eq!(
+            read_task_record(&home, "t1").expect("task exists").status,
+            crate::task_events::TaskStatus::Cancelled
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1868 §3.9: the normal (uncontended) sequence still succeeds end-to-end
+    /// through the real handlers — no regression from the append→append_checked
+    /// swap.
+    #[test]
+    fn normal_done_and_update_still_succeed_1868() {
+        let home = tmp_home("1868-happy");
+        create_task(&home, "t-done");
+        handle(
+            &home,
+            "dev-agent",
+            &serde_json::json!({"action": "claim", "id": "t-done"}),
+        );
+        let d = handle(
+            &home,
+            "dev-agent",
+            &serde_json::json!({"action": "done", "id": "t-done"}),
+        );
+        assert!(d["error"].is_null(), "legal done must succeed: {d}");
+        assert_eq!(
+            read_task_record(&home, "t-done").expect("exists").status,
+            crate::task_events::TaskStatus::Done
+        );
+
+        create_task(&home, "t-upd");
+        handle(
+            &home,
+            "dev-agent",
+            &serde_json::json!({"action": "claim", "id": "t-upd"}),
+        );
+        let u = handle(
+            &home,
+            "dev-agent",
+            &serde_json::json!({"action": "update", "id": "t-upd", "status": "in_progress"}),
+        );
+        assert!(u["error"].is_null(), "legal update must succeed: {u}");
+        assert_eq!(
+            read_task_record(&home, "t-upd").expect("exists").status,
+            crate::task_events::TaskStatus::InProgress
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }

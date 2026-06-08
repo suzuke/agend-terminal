@@ -1007,6 +1007,74 @@ pub fn append_batch(
     Ok(seqs)
 }
 
+/// Batch variant of [`append_checked`] (#1868): append ALL `events` atomically
+/// iff `precondition` — evaluated under the append lock against a FRESH on-disk
+/// replay — returns `Ok`. Closes the same TOCTOU as [`append_checked`] for the
+/// multi-event `update` arm (a status transition plus priority/desc/tags/owner
+/// events emitted as one batch). On precondition failure NO event is written and
+/// the reason is returned as `Ok(Err(reason))`; the outer `Err` is reserved for
+/// IO / replay failures.
+pub fn append_batch_checked<F>(
+    home: &Path,
+    instance: &InstanceName,
+    events: Vec<TaskEvent>,
+    precondition: F,
+) -> anyhow::Result<Result<Vec<u64>, String>>
+where
+    F: FnOnce(&TaskBoardState) -> Result<(), String>,
+{
+    if events.is_empty() {
+        return Ok(Ok(Vec::new()));
+    }
+    let instance = instance.clone();
+    let count = events.len();
+    let mut seqs: Vec<u64> = Vec::with_capacity(count);
+    let now = chrono::Utc::now().to_rfc3339();
+    let emitter_id = match crate::agent::resolve_instance(home, instance.as_str()) {
+        Ok((id, _)) => Some(id.full()),
+        Err(e) => {
+            tracing::debug!(instance = %instance, error = %e, "emitter ID resolution failed");
+            None
+        }
+    };
+
+    let mut rejection: Option<String> = None;
+    crate::event_log::append_lines_under_lock(home, LOG_NAME, |log_path| {
+        // FRESH replay under the lock — authoritative committed history.
+        let state = replay_uncached(home)?;
+        if let Err(reason) = precondition(&state) {
+            rejection = Some(reason);
+            return Ok(Vec::new()); // empty ⇒ no write
+        }
+        let start_seq = max_seq_for_instance(log_path, &instance)? + 1;
+        let mut lines = Vec::with_capacity(count);
+        for (i, event) in events.into_iter().enumerate() {
+            let seq = start_seq + i as u64;
+            seqs.push(seq);
+            let envelope = TaskEventEnvelope {
+                schema_version: SCHEMA_VERSION,
+                seq,
+                timestamp: now.clone(),
+                instance: instance.clone(),
+                emitter_id: emitter_id.clone(),
+                event,
+            };
+            lines.push(serde_json::to_string(&envelope)?);
+        }
+        Ok(lines)
+    })?;
+
+    if let Some(reason) = rejection {
+        return Ok(Err(reason));
+    }
+    invalidate_replay_cache();
+    if let Some(&last_seq) = seqs.last() {
+        let log_path = home.join(format!("{LOG_NAME}.jsonl"));
+        SEQ_CACHE.lock().insert((log_path, instance), last_seq);
+    }
+    Ok(Ok(seqs))
+}
+
 /// Append `event` atomically iff `precondition` — evaluated under the append
 /// lock against a FRESH on-disk replay — returns `Ok`. This closes the TOCTOU
 /// where a caller validates task state, then appends after a concurrent writer
