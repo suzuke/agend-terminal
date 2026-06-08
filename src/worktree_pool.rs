@@ -903,11 +903,21 @@ fn evaluate_candidate(
             if binding_present {
                 return None;
             }
-            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
-                let age = chrono::Utc::now().signed_duration_since(dt.with_timezone(&chrono::Utc));
-                if age < chrono::Duration::hours(GC_GRACE_HOURS) {
-                    return None; // still within grace
+            match chrono::DateTime::parse_from_rfc3339(ts) {
+                Ok(dt) => {
+                    let age =
+                        chrono::Utc::now().signed_duration_since(dt.with_timezone(&chrono::Utc));
+                    if age < chrono::Duration::hours(GC_GRACE_HOURS) {
+                        return None; // still within grace
+                    }
                 }
+                // #1870 (H1): a malformed `released_at=` (e.g. a partial-write /
+                // crash-truncated marker) MUST NOT be treated as "past grace". The
+                // grace window exists to protect a just-released worktree's WIP, so
+                // fail conservative — keep the worktree, skip GC. (Pre-fix the
+                // parse sat in an `if let Ok` that fell through to an unconditional
+                // CleanRelease candidate, reclaiming it immediately.)
+                Err(_) => return None,
             }
             Some(GcCandidate {
                 path: wt_path.to_path_buf(),
@@ -1705,6 +1715,43 @@ mod tests {
         assert!(
             candidates.is_empty(),
             "fresh worktree within grace must not be candidate"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// §3.9 #1870 (H1): a worktree whose `.agend-managed` `released_at=` is
+    /// MALFORMED (e.g. a partial-write / crash-truncated marker) must NOT be
+    /// reclaimed — the grace window protects just-released WIP, so a parse
+    /// failure fails conservative (skip GC). A valid PAST-grace `released_at`
+    /// still yields a candidate (behavior unchanged). Regression-proof: revert
+    /// the fix and the malformed worktree falls through to a CleanRelease
+    /// candidate, so `bad-ts` appears.
+    #[test]
+    fn gc_candidates_skips_malformed_released_at_1870() {
+        let home = tmp_home("gc-malformed-ts");
+        // Malformed released_at → must be kept (no candidate).
+        let bad = home
+            .join("workspace")
+            .join("repo")
+            .join(".worktrees")
+            .join("bad-ts");
+        std::fs::create_dir_all(&bad).ok();
+        std::fs::write(
+            bad.join(MANAGED_MARKER),
+            "agent=bad-ts\nleased_at=2026-01-01T00:00:00Z\nreleased_at=not-a-timestamp\n",
+        )
+        .ok();
+        // Valid past-grace released_at → still a candidate (unchanged).
+        make_gc_candidate(&home, "good-ts");
+
+        let agents: Vec<String> = gc_candidates(&home).into_iter().map(|c| c.agent).collect();
+        assert!(
+            !agents.iter().any(|a| a == "bad-ts"),
+            "#1870: a malformed released_at must NOT yield a GC candidate (conservative skip), got: {agents:?}"
+        );
+        assert!(
+            agents.iter().any(|a| a == "good-ts"),
+            "#1870: a valid past-grace released_at must STILL yield a candidate (unchanged), got: {agents:?}"
         );
         std::fs::remove_dir_all(&home).ok();
     }
