@@ -2003,6 +2003,43 @@ fn drain_excludes_superseded_messages() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// §3.9 (MED-3): `unread_count` must NOT count a superseded-but-undrained row —
+/// `drain` silently consumes those (never surfaces them), so counting them
+/// inflated the unread count and false-paged `inbox_stuck_watchdog`. Aligns the
+/// count with drain's actionable-unread definition. Regression-proof: revert the
+/// `superseded_by.is_none()` guard and the count is 2.
+#[test]
+fn unread_count_excludes_superseded_rows_med3() {
+    let home = tmp_home("unread_superseded");
+    let agent = "test-agent";
+    let normal = msg()
+        .schema_version(0)
+        .id("normal-1")
+        .sender("from:lead")
+        .text("actionable")
+        .timestamp("2026-01-01T00:00:00Z")
+        .build();
+    let superseded = msg()
+        .schema_version(0)
+        .id("old-ci")
+        .sender("system:ci")
+        .text("[ci-pass] repo@main")
+        .kind("ci-watch")
+        .timestamp("2026-01-01T00:00:01Z")
+        .superseded_by("new-ci")
+        .build();
+    enqueue(&home, agent, normal).unwrap();
+    enqueue(&home, agent, superseded).unwrap();
+    // Both have read_at=None on disk, but only the non-superseded one is
+    // actionable unread (the superseded one drain would consume silently).
+    assert_eq!(
+        unread_count(&home, agent).0,
+        1,
+        "superseded-but-undrained row must not inflate unread_count"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 #[test]
 fn from_id_round_trip() {
     let msg = msg()

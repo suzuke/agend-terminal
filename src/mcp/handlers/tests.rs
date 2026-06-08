@@ -3240,3 +3240,41 @@ fn inbox_clear_via_mcp_clears_terminal_task() {
     std::env::remove_var("AGEND_HOME");
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// §3.9 (MED-5): a `kind=query` send (legacy `kind` alias) that falls back to the
+/// inbox (daemon API unreachable) must carry `kind` through — else its
+/// InboxMessage lands with `kind=None`, `obligation_reason` treats it as noise,
+/// and `inbox action=clear` silently swallows an unanswered query. Proven
+/// transitively: a compact-clear KEEPS the query unread (an obligation). With
+/// the bug it would be cleared (kept_unread=0, cleared=1).
+#[test]
+fn fallback_send_preserves_query_kind_survives_clear_med5() {
+    let _g = fleet_test_guard();
+    let (_rec, home) = setup_recorder("med5-fallback-kind");
+    // No daemon in tests → api::call fails → handle_send_to_instance's inbox
+    // fallback (the fixed path). `kind` (not `request_kind`) routes here.
+    let r = handle_tool(
+        "send",
+        &json!({"instance": "target", "message": "are you there?", "kind": "query"}),
+        "sender",
+    );
+    assert!(is_ok_result(&r), "fallback send must succeed: {r}");
+
+    let clear = handle_tool("inbox", &json!({"action": "clear"}), "target");
+    assert_eq!(
+        clear["kept_unread_count"], 1,
+        "MED-5: a fallback kind=query must be kept UNREAD by clear (obligation): {clear}"
+    );
+    assert_eq!(
+        clear["cleared_count"], 0,
+        "the unanswered query must NOT be cleared as noise: {clear}"
+    );
+    assert_eq!(
+        clear["requires_response"].as_array().map(|a| a.len()),
+        Some(1),
+        "the query must surface in requires_response: {clear}"
+    );
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
