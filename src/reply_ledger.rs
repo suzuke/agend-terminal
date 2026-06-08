@@ -61,6 +61,22 @@ enum WarnReason {
     SilentNoReply,
 }
 
+/// #1813: what the supervisor should do after a [`sweep`]. The #1665 audit
+/// (warn + operator-channel alert) happens inside `sweep`; this is the
+/// ADDITIONAL agent-facing action the supervisor performs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SweepAction {
+    /// Nothing for the supervisor to inject.
+    None,
+    /// The turn ended with a channel-origin input that the agent answered
+    /// WITHOUT the reply tool (`SilentNoReply`) — the operator got nothing.
+    /// The supervisor injects a one-shot `[AGEND-AUTO kind=channel-reply-missing]`
+    /// nudge so the agent re-sends via `reply`. `channel` names the origin so the
+    /// nudge text is accurate (telegram / discord). One-shot: `sweep` clears the
+    /// turn, so the next sweep returns `None` until a new channel input re-arms.
+    NudgeChannelReplyMissing { channel: &'static str },
+}
+
 /// Grace window after arming before a turn is eligible for a silent-drop WARN —
 /// gives the agent time to respond before we cry wolf. Combined with the
 /// `agent_is_busy` gate in [`sweep`], this is the primary false-warn defense
@@ -150,22 +166,37 @@ fn classify(mirror_dispatched_for_turn: bool, turn: &PendingUserTurn) -> Closure
 /// only when the turn has aged past the grace window AND the agent has settled
 /// (not mid-generation) — so a slow-but-working agent never false-warns. Always
 /// clears the turn afterward. Infallible (swallows everything).
-pub fn sweep(home: &std::path::Path, name: &str) {
+pub fn sweep(home: &std::path::Path, name: &str) -> SweepAction {
     let pair = crate::daemon::heartbeat_pair::snapshot_for(name);
     let Some(turn) = pair.pending_user_turn.clone() else {
-        return;
+        return SweepAction::None;
     };
     let now = crate::daemon::heartbeat_pair::now_ms() as i64;
     if now.saturating_sub(turn.armed_at_ms) < GRACE_MS {
-        return; // give the agent time to respond
+        return SweepAction::None; // give the agent time to respond
     }
     if crate::snapshot::agent_is_busy(home, name) {
-        return; // still generating — not a silent drop, don't cry wolf
+        return SweepAction::None; // still generating — not a silent drop, don't cry wolf
     }
-    if let Closure::Warn(reason) = classify(pair.mirror_dispatched_for_turn, &turn) {
-        emit_warn(home, name, &turn, reason);
-    }
-    clear_turn(name);
+    let action = match classify(pair.mirror_dispatched_for_turn, &turn) {
+        Closure::Warn(reason) => {
+            emit_warn(home, name, &turn, reason);
+            // #1813: a `SilentNoReply` is exactly "channel-origin input answered
+            // WITHOUT the reply tool" — nudge the agent to re-send. Gap D
+            // (`ReplySendFailed`) is NOT nudged: the agent DID call reply (it just
+            // failed), so "you didn't reply" would be wrong; the #1665 warn covers it.
+            if reason == WarnReason::SilentNoReply {
+                SweepAction::NudgeChannelReplyMissing {
+                    channel: channel_kind_str(turn.channel),
+                }
+            } else {
+                SweepAction::None
+            }
+        }
+        _ => SweepAction::None,
+    };
+    clear_turn(name); // one-shot: never re-evaluate this turn (no loop)
+    action
 }
 
 /// Production WARN emission: a `tracing::warn!`, an event-log line (always — the
@@ -387,5 +418,102 @@ mod tests {
             |_d| {},
         );
         // reached here ⟹ no block / no panic.
+    }
+
+    // ── #1813 channel-reply-missing nudge: sweep's supervisor verdict ──────
+    //
+    // §3.9: exercises the real turn-end detection path (`sweep`, called per
+    // supervisor tick at supervisor.rs) across the four cases the issue names.
+    // A tmp home with no pane state ⟹ `agent_is_busy` is false (settled), so the
+    // turn is evaluated; `backdate` ages the armed turn past the grace window.
+
+    #[test]
+    fn sweep_nudge_channel_reply_missing_four_cases_1813() {
+        use std::path::PathBuf;
+        fn tmp_home(tag: &str) -> PathBuf {
+            let d =
+                std::env::temp_dir().join(format!("agend-rl-1813-{}-{}", tag, std::process::id()));
+            std::fs::create_dir_all(&d).ok();
+            d
+        }
+        // Age the armed turn past GRACE_MS so `sweep` evaluates it this tick.
+        fn backdate(name: &str) {
+            let past = crate::daemon::heartbeat_pair::now_ms() as i64 - GRACE_MS - 5_000;
+            crate::daemon::heartbeat_pair::update_with(name, |p| {
+                if let Some(t) = p.pending_user_turn.as_mut() {
+                    t.armed_at_ms = past;
+                }
+            });
+        }
+        let home = tmp_home("nudge"); // no pane state → agent settled (not busy)
+
+        // (1) channel-origin + NO reply tool → nudge (the issue's core case).
+        let n1 = "rl1813-chan-noreply";
+        arm(
+            n1,
+            ChannelKind::Telegram,
+            Some("m1".into()),
+            Some("chat1".into()),
+            None,
+        );
+        backdate(n1);
+        assert_eq!(
+            sweep(&home, n1),
+            SweepAction::NudgeChannelReplyMissing {
+                channel: "telegram"
+            },
+            "(1) channel-origin turn answered without reply must nudge"
+        );
+        // (4) one-shot: the turn was cleared, so a second sweep does NOT re-nudge.
+        assert_eq!(
+            sweep(&home, n1),
+            SweepAction::None,
+            "(4) must not re-nudge the same turn — no loop"
+        );
+
+        // (2) channel-origin + reply DELIVERED → no nudge.
+        let n2 = "rl1813-chan-replied";
+        arm(
+            n2,
+            ChannelKind::Telegram,
+            Some("m2".into()),
+            Some("chat2".into()),
+            None,
+        );
+        record_reply_outcome(n2, true);
+        backdate(n2);
+        assert_eq!(
+            sweep(&home, n2),
+            SweepAction::None,
+            "(2) a delivered reply must not nudge"
+        );
+
+        // (3) non-channel input → no turn armed → no nudge.
+        let n3 = "rl1813-nonchannel";
+        assert_eq!(
+            sweep(&home, n3),
+            SweepAction::None,
+            "(3) no armed turn (non-channel input) must not nudge"
+        );
+
+        // (bonus) Gap D: reply attempted but send FAILED is NOT a
+        // channel-reply-missing nudge (the agent DID call reply) — #1665 warns.
+        let n4 = "rl1813-gapd";
+        arm(
+            n4,
+            ChannelKind::Telegram,
+            Some("m4".into()),
+            Some("chat4".into()),
+            None,
+        );
+        record_reply_outcome(n4, false);
+        backdate(n4);
+        assert_eq!(
+            sweep(&home, n4),
+            SweepAction::None,
+            "Gap D (reply send-failed) must not channel-reply-missing-nudge"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
     }
 }

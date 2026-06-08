@@ -942,7 +942,16 @@ fn tick(
         // never hit a clear site (no reply, no mirror, no takeover). Lock-free
         // snapshot read; warns only past the grace window AND when the agent has
         // settled. Infallible — never blocks the supervisor loop.
-        crate::reply_ledger::sweep(home, &name);
+        // #1813: when the swept turn was a channel-origin input the agent
+        // answered WITHOUT the reply tool, additionally inject a one-shot
+        // agent-facing nudge so it re-sends via `reply` (the operator otherwise
+        // gets nothing). `sweep` cleared the turn, so this fires at most once per
+        // offending turn — no loop.
+        if let crate::reply_ledger::SweepAction::NudgeChannelReplyMissing { channel } =
+            crate::reply_ledger::sweep(home, &name)
+        {
+            inject_channel_reply_missing_gated(home, registry, &name, channel);
+        }
         // Mutate state + pull the tail under the core lock, then drop it
         // before running `format!` and the Telegram spawn. `tail_lines`
         // allocates a fresh String, so the lock window is bounded by the
@@ -1427,6 +1436,39 @@ fn inject_continue_gated(
             }
         }
         None => InjectOutcome::AgentGone,
+    }
+}
+
+/// #1813: inject the one-shot channel-reply-missing nudge. Sibling of
+/// [`inject_continue_gated`] (kept separate so the #1680 source-guard on the
+/// continue-inject's literal `CONTINUE_RETRY_PAYLOAD, false, Some(auto_kind)`
+/// stays intact). Same draft-gating (`force=false`) and `[AGEND-AUTO kind=...]`
+/// tagging — only the payload + kind differ. Best-effort: a missing agent /
+/// failed inject is dropped (the #1665 warn already recorded the miss).
+fn inject_channel_reply_missing_gated(
+    home: &std::path::Path,
+    registry: &AgentRegistry,
+    name: &str,
+    channel: &str,
+) {
+    let snap = {
+        let reg = agent::lock_registry(registry);
+        crate::fleet::resolve_uuid(home, name)
+            .and_then(|id| reg.get(&id))
+            .map(agent::InjectTarget::from_handle)
+    };
+    if let Some(tgt) = snap {
+        let payload = format!(
+            "Your last answer went to the TUI only — the input came via {channel}. \
+             Re-send your answer via the reply tool so the operator receives it."
+        );
+        let _ = agent::inject_with_target_gated(
+            &tgt,
+            name,
+            payload.as_bytes(),
+            false,
+            Some("channel-reply-missing"),
+        );
     }
 }
 
