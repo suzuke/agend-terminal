@@ -921,12 +921,27 @@ fn evaluate_candidate(
                     }
                 }
                 // #1870 (H1): a malformed `released_at=` (e.g. a partial-write /
-                // crash-truncated marker) MUST NOT be treated as "past grace". The
-                // grace window exists to protect a just-released worktree's WIP, so
-                // fail conservative — keep the worktree, skip GC. (Pre-fix the
-                // parse sat in an `if let Ok` that fell through to an unconditional
-                // CleanRelease candidate, reclaiming it immediately.)
-                Err(_) => return None,
+                // crash-truncated marker) MUST NOT be treated as "past grace" — the
+                // grace window protects a just-released worktree's WIP. But it is
+                // also `Some(garbage)`, so it never reaches the never-released
+                // force-reclaim arm below → pre-#1882 it leaked FOREVER (both GC
+                // paths skipped it). #1882 (WT-LEAK-1): treat "corrupt released_at ≈
+                // never-released" — hand off to the SAME force-reclaim backstop. Its
+                // liveness + leased_at age-cap guards (NOT the unparseable grace
+                // window) protect a still-used / recently-leased worktree; only an
+                // abandoned (no liveness, leased past the cap) corrupt-marker
+                // worktree is reclaimed. This does NOT reintroduce the H1
+                // WIP-destruction (that was the grace-window bypass).
+                Err(_) => {
+                    return force_reclaim_candidate(
+                        home,
+                        wt_path,
+                        agent_name,
+                        &marker_content,
+                        live_agents,
+                        "malformed released_at marker",
+                    );
+                }
             }
             Some(GcCandidate {
                 path: wt_path.to_path_buf(),
@@ -941,32 +956,56 @@ fn evaluate_candidate(
         // merge/close/task-done event; the 7-day expired-intent path hands off
         // here). liveness-AND-age: ANY live signal → never reclaim (even past the
         // cap); otherwise require the per-agent-jittered age cap.
-        None => {
-            // reviewer-2 #5: suspend force-reclaim during the daemon's post-boot
-            // grace window (the process-liveness signal is still re-establishing).
-            if daemon_within_boot_grace(home) {
-                return None;
-            }
-            if agent_has_liveness(home, &agent_name, live_agents) {
-                return None;
-            }
-            let leased_at = marker_content
-                .lines()
-                .find_map(|l| l.strip_prefix("leased_at="));
-            if !leased_at_force_reclaimable(leased_at, &agent_name) {
-                return None;
-            }
-            Some(GcCandidate {
-                path: wt_path.to_path_buf(),
-                agent: agent_name,
-                reason: format!(
-                    "force-reclaim: never-released lease, no liveness signal, leased >{}d (abandoned)",
-                    force_reclaim_age_days()
-                ),
-                kind: GcKind::ForceReclaim,
-            })
-        }
+        None => force_reclaim_candidate(
+            home,
+            wt_path,
+            agent_name,
+            &marker_content,
+            live_agents,
+            "never-released lease",
+        ),
     }
+}
+
+/// t-worktree-leak PR-2 force-reclaim backstop: reclaim a worktree ONLY when it
+/// is genuinely abandoned — not in the daemon's post-boot grace window (#5), NO
+/// liveness signal for its agent, AND its `leased_at` is past the per-agent
+/// force-reclaim age cap. ANY live signal → never reclaim (even past the cap).
+/// Shared by the never-released (`released_at` absent) arm AND the #1882 WT-LEAK-1
+/// corrupt-`released_at` fall-through. `marker_state` names why we're here, for
+/// the candidate's reason. The liveness + age-cap guards (NOT the grace window)
+/// are what protect a just-leased / just-released worktree from premature reclaim.
+fn force_reclaim_candidate(
+    home: &Path,
+    wt_path: &Path,
+    agent_name: String,
+    marker_content: &str,
+    live_agents: &std::collections::HashSet<String>,
+    marker_state: &str,
+) -> Option<GcCandidate> {
+    // reviewer-2 #5: suspend force-reclaim during the daemon's post-boot grace
+    // window (the process-liveness signal is still re-establishing).
+    if daemon_within_boot_grace(home) {
+        return None;
+    }
+    if agent_has_liveness(home, &agent_name, live_agents) {
+        return None;
+    }
+    let leased_at = marker_content
+        .lines()
+        .find_map(|l| l.strip_prefix("leased_at="));
+    if !leased_at_force_reclaimable(leased_at, &agent_name) {
+        return None;
+    }
+    Some(GcCandidate {
+        path: wt_path.to_path_buf(),
+        agent: agent_name,
+        reason: format!(
+            "force-reclaim: {marker_state}, no liveness signal, leased >{}d (abandoned)",
+            force_reclaim_age_days()
+        ),
+        kind: GcKind::ForceReclaim,
+    })
 }
 
 /// Dry-run: log candidates without deleting. Returns candidate list.
@@ -1740,7 +1779,13 @@ mod tests {
     #[test]
     fn gc_candidates_skips_malformed_released_at_1870() {
         let home = tmp_home("gc-malformed-ts");
-        // Malformed released_at → must be kept (no candidate).
+        // Malformed released_at + a RECENT lease → must be kept. #1870 stopped the
+        // immediate grace-bypass reclaim; #1882 (WT-LEAK-1) then routes a corrupt
+        // marker to the force-reclaim backstop — but its leased_at age-cap still
+        // protects a recently-leased (possibly still-in-use) worktree. So a recent
+        // `leased_at` here stays NOT a candidate (an ABANDONED corrupt marker IS
+        // reclaimed — see force_reclaim_corrupt_marker_* tests).
+        let recent = chrono::Utc::now().to_rfc3339();
         let bad = home
             .join("workspace")
             .join("repo")
@@ -1749,7 +1794,7 @@ mod tests {
         std::fs::create_dir_all(&bad).ok();
         std::fs::write(
             bad.join(MANAGED_MARKER),
-            "agent=bad-ts\nleased_at=2026-01-01T00:00:00Z\nreleased_at=not-a-timestamp\n",
+            format!("agent=bad-ts\nleased_at={recent}\nreleased_at=not-a-timestamp\n"),
         )
         .ok();
         // Valid past-grace released_at → still a candidate (unchanged).
@@ -1758,7 +1803,7 @@ mod tests {
         let agents: Vec<String> = gc_candidates(&home).into_iter().map(|c| c.agent).collect();
         assert!(
             !agents.iter().any(|a| a == "bad-ts"),
-            "#1870: a malformed released_at must NOT yield a GC candidate (conservative skip), got: {agents:?}"
+            "#1870/#1882: a malformed released_at on a RECENT lease must NOT be reclaimed (age-cap protects it), got: {agents:?}"
         );
         assert!(
             agents.iter().any(|a| a == "good-ts"),
@@ -2969,6 +3014,59 @@ mod tests {
             "dead agent, never-released, past cap → force-reclaim candidate"
         );
         assert_eq!(cand.unwrap().kind, GcKind::ForceReclaim);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Append a malformed `released_at=` to a lease's marker and drop its binding
+    /// (a released worktree is unbound) — the #1882 WT-LEAK-1 corrupt-marker shape.
+    fn corrupt_released_at(home: &Path, agent: &str, wt_path: &Path) {
+        crate::binding::unbind(home, agent);
+        let marker = wt_path.join(MANAGED_MARKER);
+        let mut content = std::fs::read_to_string(&marker).unwrap();
+        content.push_str("released_at=not-a-timestamp\n");
+        std::fs::write(&marker, content).unwrap();
+    }
+
+    /// §3.9 #1882 (WT-LEAK-1): a corrupt-`released_at` worktree that is ABANDONED
+    /// (no liveness, leased past the force-reclaim age cap) is now reclaimed via
+    /// the force-reclaim backstop — pre-fix it leaked forever (the clean-release
+    /// path returned None and the never-released arm was unreachable for a
+    /// `Some(garbage)` released_at). Regression-proof: revert the parse-Err
+    /// fall-through and this is None (leaked).
+    #[test]
+    fn force_reclaim_corrupt_marker_abandoned_is_candidate_1882() {
+        let home = tmp_home("fr-corrupt-dead");
+        let repo = tmp_repo("fr-corrupt-dead-repo");
+        let lease = lease(&home, &repo, "dev-corrupt", "feat/x").expect("lease");
+        corrupt_released_at(&home, "dev-corrupt", &lease.path);
+        backdate_lease(&lease.path, force_reclaim_age_days() + 2);
+        let live: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let cand = evaluate_candidate(&home, &lease.path, &live);
+        assert_eq!(
+            cand.map(|c| c.kind),
+            Some(GcKind::ForceReclaim),
+            "#1882: abandoned corrupt-marker worktree (no liveness, past cap) → force-reclaim, not leaked"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// §3.9 #1882 (WT-LEAK-1, no H1 regression): a corrupt-`released_at` worktree
+    /// whose agent has a LIVENESS signal is SPARED even past the age cap — the
+    /// force-reclaim liveness guard (not the unparseable grace window) protects a
+    /// worktree the operator may still be using.
+    #[test]
+    fn force_reclaim_corrupt_marker_spares_live_1882() {
+        let home = tmp_home("fr-corrupt-live");
+        let repo = tmp_repo("fr-corrupt-live-repo");
+        let lease = lease(&home, &repo, "dev-corrupt-live", "feat/x").expect("lease");
+        corrupt_released_at(&home, "dev-corrupt-live", &lease.path);
+        backdate_lease(&lease.path, force_reclaim_age_days() + 2);
+        let live: std::collections::HashSet<String> =
+            ["dev-corrupt-live".to_string()].into_iter().collect();
+        assert!(
+            evaluate_candidate(&home, &lease.path, &live).is_none(),
+            "#1882: a live agent's corrupt-marker worktree must be SPARED (no H1-style WIP destruction)"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
