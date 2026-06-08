@@ -107,6 +107,9 @@ pub(super) fn handle_send_to_instance(
                 correlation_id: args["correlation_id"].as_str().map(String::from),
                 from: format!("from:{}", sender.as_str()),
                 text: text.to_string(),
+                // MED-5: carry `kind` (happy path + sibling fallbacks do) — else a
+                // fallback `kind=query` lands kind=None and `inbox clear` swallows it.
+                kind: kind.map(String::from),
                 timestamp: chrono::Utc::now().to_rfc3339(),
                 delivery_mode: Some("inbox_fallback".to_string()),
                 terminal: args["terminal"].as_bool(),
@@ -356,9 +359,8 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
         &json!({
             "request_id": uuid::Uuid::new_v4().to_string(),
             "method": crate::api::method::SEND,
-            // HIGH-1: forward the dispatch directives the SEND handler reads
-            // (messaging.rs) that this re-marshal dropped (#1833 class; the
-            // sibling forwards them all; `worktree_binding_required` is a gate).
+            // HIGH-1: forward the dispatch directives the SEND handler reads that
+            // this re-marshal dropped (#1833 class; worktree_binding_required gates).
             "params": {
                 "from": sender.as_str(), "target": target, "text": msg, "kind": "task",
                 "task_id": task_id_str, "force_meta": force_meta_json,
@@ -382,8 +384,7 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
                 from: format!("from:{}", sender.as_str()),
                 text: msg.clone(),
                 kind: Some("task".to_string()),
-                // HIGH-1: carry the same dispatch directives so an API-blip
-                // fallback dispatch doesn't silently lose them either.
+                // HIGH-1: carry the dispatch directives so an API-blip fallback doesn't lose them.
                 correlation_id: args["correlation_id"].as_str().map(String::from),
                 reviewed_head: args["reviewed_head"].as_str().map(String::from),
                 sequencing: args["sequencing"].as_str().map(String::from),

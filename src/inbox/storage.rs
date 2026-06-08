@@ -665,7 +665,14 @@ pub fn unread_count(home: &Path, name: &str) -> (usize, Option<chrono::DateTime<
     let mut oldest: Option<chrono::DateTime<chrono::Utc>> = None;
     for line in content.lines() {
         if let Ok(msg) = serde_json::from_str::<InboxMessage>(line) {
-            if msg.read_at.is_none() {
+            // MED-3: a superseded-but-undrained row is NOT actionable unread —
+            // `drain` silently consumes it (stamps `read_at`, never surfaces it).
+            // Counting it here inflated the unread count, so a busy branch whose
+            // CI SHA churns (each `mark_ci_watch_superseded` leaves the prior row
+            // superseded + unread until the next drain) tripped
+            // `inbox_stuck_watchdog` into false-paging a healthy agent. Match
+            // drain's actionable-unread definition.
+            if msg.read_at.is_none() && msg.superseded_by.is_none() {
                 count += 1;
                 if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&msg.timestamp) {
                     let ts_utc = ts.with_timezone(&chrono::Utc);
