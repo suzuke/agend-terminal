@@ -5,8 +5,15 @@ use std::path::Path;
 /// Check schedules and inject messages for due ones.
 ///
 /// Two trigger kinds are handled:
-/// - `Cron` — fires every time the cron expression lands inside the window
-///   `(last_check, now]`, evaluated in the schedule's declared timezone.
+/// - `Cron` — fires AT MOST ONCE per scan tick when ONE OR MORE cron instants
+///   land inside the window `(last_check, now]` (evaluated in the schedule's
+///   declared timezone). Multiple instants in one window are COALESCED to a
+///   single fire — NOT replayed. The fire action injects the schedule's STATIC
+///   reminder `message`; replaying it once per missed instant (a sub-tick cron,
+///   or a post-downtime catch-up window spanning many instants) would deliver a
+///   burst of identical stale reminders — noise, not signal. See
+///   [`is_due_in_tz`]. (#N3: the prior doc said "every time", contradicting the
+///   coalescing impl — the impl is the intended contract for a reminder system.)
 /// - `Once` — fires exactly once when its absolute `at` instant falls into
 ///   the window; after firing (or being detected as missed because the
 ///   daemon was down through `at`), the schedule is auto-disabled so it
@@ -139,7 +146,29 @@ pub fn check_schedules(home: &Path) {
         any_triggered = true;
     }
 
-    if any_triggered || now_utc.signed_duration_since(last_check_utc).num_seconds() >= 10 {
+    // #N2: if the persisted `last_check` is in the FUTURE relative to `now`
+    // (wall-clock jumped backward — NTP correction, VM resume/snapshot restore,
+    // DST), the normal re-stamp gate below never fires: `signed_duration_since`
+    // is negative (< 10) and every cron reads not-due (`after(future)` yields
+    // only instants > now), so `any_triggered` stays false. Without this clamp,
+    // `last_check` is NEVER rewritten and ALL cron firing wedges until real time
+    // naturally surpasses the stale future stamp (minutes/hours) — silently.
+    // Re-stamp to `now` so the next window is sane; no fires are lost (an inverted
+    // window `(future, now]` contained none). Logs once (next tick is no longer
+    // in the future).
+    let last_check_in_future = last_check_utc > now_utc;
+    if last_check_in_future {
+        tracing::warn!(
+            last_check = %last_check_utc.to_rfc3339(),
+            now = %now_utc.to_rfc3339(),
+            "#N2 cron: .schedule_last_check is in the future (backward clock skew?) — \
+             re-stamping to now to avoid wedging all cron firing"
+        );
+    }
+    if any_triggered
+        || last_check_in_future
+        || now_utc.signed_duration_since(last_check_utc).num_seconds() >= 10
+    {
         let _ = crate::store::atomic_write(&last_check_path, now_utc.to_rfc3339().as_bytes());
     }
 }
@@ -401,6 +430,12 @@ pub(crate) fn is_due_in_tz(
 ) -> bool {
     let now_local = now_utc.with_timezone(&tz);
     let last_check_local = last_check_utc.with_timezone(&tz);
+    // #N3: `.take(1)` is the intentional COALESCE — return "due" if the FIRST
+    // cron instant after `last_check` is at/before `now`, regardless of how many
+    // further instants also lie in the window. The caller fires once. This is the
+    // contract for a reminder system: a sub-tick cron or a post-downtime catch-up
+    // window must not replay a burst of identical static reminders. (NOT a bug —
+    // see the `check_schedules` doc.)
     schedule
         .after(&last_check_local)
         .take(1)
@@ -440,6 +475,74 @@ mod tests {
         let last = Utc.with_ymd_and_hms(2026, 4, 19, 8, 58, 0).unwrap();
         let now = Utc.with_ymd_and_hms(2026, 4, 19, 8, 59, 0).unwrap();
         assert!(!is_due_in_tz(&schedule, chrono_tz::UTC, last, now));
+    }
+
+    /// #N3: a window containing MULTIPLE cron instants yields a single "due"
+    /// (coalesced one fire), NOT a per-instant replay — the documented
+    /// fire-once-per-tick contract for a static-reminder schedule.
+    #[test]
+    fn multiple_instants_in_window_coalesce_to_single_due_n3() {
+        // 6-field every-second cron; the 5s window (last, now] holds ~5 instants.
+        let schedule = cron("* * * * * *");
+        let last = Utc.with_ymd_and_hms(2026, 4, 19, 9, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 4, 19, 9, 0, 5).unwrap();
+        // The return is a single bool — it cannot fire per-instant. (A
+        // count-returning impl would be the fire-all alternative we deliberately
+        // did NOT take; replaying 5 identical reminders is noise.)
+        assert!(
+            is_due_in_tz(&schedule, chrono_tz::UTC, last, now),
+            "#N3: ≥1 instant in window → due exactly once (coalesced, not per-instant)"
+        );
+    }
+
+    /// #N2: a `.schedule_last_check` in the FUTURE (backward clock skew —
+    /// NTP/VM-resume/DST) must be re-stamped to ~now by `check_schedules`, NOT
+    /// left to wedge all cron firing until real time catches up.
+    #[test]
+    fn future_last_check_is_restamped_not_wedged_n2() {
+        let home = cron_tmp_home("n2-future-lastcheck");
+        // A plain enabled daily cron (avoid the empty-store early return).
+        let now_s = chrono::Utc::now().to_rfc3339();
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  offline:\n    backend: claude\n",
+        )
+        .unwrap();
+        let store = serde_json::json!({"schema_version": 2, "schedules": [{
+            "id": "s-n2", "message": "remind", "target": "offline",
+            "trigger": {"kind": "cron", "expr": "0 9 * * *"}, "enabled": true,
+            "timezone": "UTC", "label": "r",
+            "created_at": now_s, "updated_at": now_s, "run_history": []
+        }]});
+        std::fs::write(
+            home.join("schedules.json"),
+            serde_json::to_string_pretty(&store).unwrap(),
+        )
+        .unwrap();
+        // Simulate backward clock skew: last_check 1h in the FUTURE.
+        let future = chrono::Utc::now() + chrono::Duration::hours(1);
+        std::fs::write(
+            home.join(".schedule_last_check"),
+            future.to_rfc3339().as_bytes(),
+        )
+        .unwrap();
+
+        check_schedules(&home);
+
+        let restamped = std::fs::read_to_string(home.join(".schedule_last_check")).unwrap();
+        let restamped_t = chrono::DateTime::parse_from_rfc3339(restamped.trim())
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let now = chrono::Utc::now();
+        assert!(
+            restamped_t <= now + chrono::Duration::seconds(5),
+            "#N2: future last_check must be re-stamped to ~now (got {restamped_t}, now {now})"
+        );
+        assert!(
+            restamped_t < future,
+            "#N2: re-stamped value must be earlier than the stale future stamp"
+        );
+        std::fs::remove_dir_all(home).ok();
     }
 
     #[test]
