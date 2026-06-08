@@ -329,6 +329,46 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// [M2] §3.9: a sidecar cleared by `cleanup_pending_for_task_id` (#1018
+    /// task-close) is NOT resurrected by a racing nudge stamp — the second
+    /// sidecar-delete site now also deletes under the lock via
+    /// `delete_sidecar_locked`.
+    #[test]
+    fn cleanup_for_task_id_then_nudge_write_does_not_resurrect() {
+        let home = tmp_home("m2-taskclose");
+        let id = write_exceeded_sidecar(&home, "fixup-lead", "fixup-reviewer", "t-m2task", 700);
+        let path = pending_path(&home, &id);
+        crate::daemon::dispatch_idle::cleanup_pending_for_task_id(&home, "t-m2task");
+        assert!(!path.exists(), "task-close cleanup deleted the sidecar");
+        assert!(
+            !stamp_nudge_sent(&home, &id),
+            "[M2] in-flight nudge must not resurrect a task-close-cleared sidecar"
+        );
+        assert!(!path.exists(), "[M2] still gone after the nudge write");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// [M2] §3.9: a sidecar cleared by `cleanup_pending_for_instance` (#1018
+    /// instance-delete) is NOT resurrected by a racing nudge stamp — the third
+    /// sidecar-delete site now also deletes under the lock.
+    #[test]
+    fn cleanup_for_instance_then_nudge_write_does_not_resurrect() {
+        let home = tmp_home("m2-instdel");
+        let id = write_exceeded_sidecar(&home, "fixup-lead", "fixup-reviewer", "t-m2inst", 700);
+        let path = pending_path(&home, &id);
+        crate::daemon::dispatch_idle::cleanup_pending_for_instance(&home, "fixup-reviewer");
+        assert!(
+            !path.exists(),
+            "instance-delete cleanup deleted the sidecar"
+        );
+        assert!(
+            !stamp_nudge_sent(&home, &id),
+            "[M2] in-flight nudge must not resurrect an instance-delete-cleared sidecar"
+        );
+        assert!(!path.exists(), "[M2] still gone after the nudge write");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     /// 10. Nudge must target the sidecar's `target` field (the
     /// dispatchee), NOT team-wide. Parallel dev-1 + dev-2 dispatches
     /// must not cross-pollinate.
