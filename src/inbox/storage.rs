@@ -3,6 +3,49 @@ use std::path::{Path, PathBuf};
 
 use super::message::{InboxMessage, MessageStatus};
 
+// ── #inbox-gc retention bounds (decision d-20260607081209372642-1, part b) ──
+//
+// Root cause of the unbounded-looking inbox files: read (drained) messages were
+// retained for 7 DAYS, so a high-throughput agent accumulates 1000s of read
+// rows within that window. Two complementary bounds replace the single 7d TTL:
+//
+// 1. A shorter read TTL for the bulk (`update`/`report`/`ci`/`poll` …), and
+// 2. A per-inbox SIZE CAP on retained read rows — the robust bound a TTL alone
+//    can't provide (a burst inside ANY window still blows past the cap).
+//
+// EXEMPTION: drained `query`/`task` rows are "blockers" — they are read by
+// `has_drained_blocker_for_correlation` (ack-absorption / reply-routing, see
+// storage.rs `has_drained_blocker_for_correlation`) for the full task
+// turnaround, which has no finite upper bound (overnight / multi-day tasks).
+// They keep the original 7d window AND are exempt from the size cap so the
+// audit path never regresses. Unread rows (obligations) keep the 30d window.
+
+/// Read (drained) NON-blocker messages expire this many hours after their
+/// timestamp. Lowered from 7 days — these are the high-volume `update`/`report`/
+/// `ci`/`poll` rows that flood the file.
+const READ_TTL_HOURS: i64 = 48;
+
+/// Read (drained) BLOCKER rows (`kind` ∈ {query, task}) keep this longer window
+/// so `has_drained_blocker_for_correlation` can still see a consumed dispatch
+/// when its reply arrives late. Unchanged from the legacy read TTL.
+const READ_TTL_BLOCKER_DAYS: i64 = 7;
+
+/// Unread (obligation) messages expire this many days after their timestamp.
+/// Unchanged — unread rows are work the agent hasn't acknowledged.
+const UNREAD_TTL_DAYS: i64 = 30;
+
+/// Per-inbox cap on retained read NON-blocker rows (most-recent-N kept,
+/// oldest beyond N dropped regardless of age). The hard bound against a burst.
+const READ_ROW_CAP: usize = 300;
+
+/// A drained row that the ack-absorption / reply-routing audit
+/// (`has_drained_blocker_for_correlation`) depends on: `read_at` set AND
+/// `kind` ∈ {query, task}. Such rows are exempt from the short read TTL and
+/// from the size cap.
+fn is_blocker_row(msg: &InboxMessage) -> bool {
+    msg.read_at.is_some() && matches!(msg.kind.as_deref(), Some("query") | Some("task"))
+}
+
 pub(crate) fn inbox_path(home: &Path, name: &str) -> PathBuf {
     home.join("inbox").join(format!("{name}.jsonl"))
 }
@@ -382,6 +425,235 @@ fn read_drain_file(tmp: &Path) -> Vec<InboxMessage> {
     messages
 }
 
+/// One bounded line in a [`ClearCompactResult`] — a COMPACT projection of an
+/// inbox message (never the full [`InboxMessage`], so a clear can never
+/// reintroduce the multi-megabyte blowup that a full-message drain could).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ClearSummary {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    pub from: String,
+    /// Single-line, sanitised, ≤[`CLEAR_PREVIEW_CHARS`] preview of the body.
+    pub preview: String,
+    pub marked_read: bool,
+    /// Why this message was kept unread (obligations) or cleared with a note.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Result of [`clear_compact`] — a quiet, trust-preserving inbox clear.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ClearCompactResult {
+    /// Non-obligation messages whose `read_at` was set this call.
+    pub cleared_count: usize,
+    /// Obligation messages deliberately left UNREAD (still need attention).
+    pub kept_unread_count: usize,
+    /// Bounded sample of CLEARED messages (capped at [`CLEAR_SUMMARY_CAP`]).
+    pub summaries: Vec<ClearSummary>,
+    /// How many cleared summaries were omitted past the cap.
+    pub summaries_omitted: usize,
+    /// EVERY kept-unread obligation — NEVER capped (the trust guarantee:
+    /// clearing must never hide a query you owe a reply to or an open task).
+    pub requires_response: Vec<ClearSummary>,
+}
+
+/// Max chars in a [`ClearSummary::preview`] (single line).
+const CLEAR_PREVIEW_CHARS: usize = 60;
+/// Cap on [`ClearCompactResult::summaries`] (cleared sample). `requires_response`
+/// is intentionally NOT capped.
+const CLEAR_SUMMARY_CAP: usize = 200;
+
+/// Collapse a message body to a single sanitised preview line of ≤N chars.
+fn preview_line(text: &str, max_chars: usize) -> String {
+    let collapsed: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let normalised = collapsed.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalised.chars().count() > max_chars {
+        let truncated: String = normalised.chars().take(max_chars).collect();
+        format!("{truncated}…")
+    } else {
+        normalised
+    }
+}
+
+fn clear_summary_of(msg: &InboxMessage, marked_read: bool, reason: Option<String>) -> ClearSummary {
+    ClearSummary {
+        id: msg.id.clone(),
+        kind: msg.kind.clone(),
+        from: msg.from.clone(),
+        preview: preview_line(&msg.text, CLEAR_PREVIEW_CHARS),
+        marked_read,
+        reason,
+    }
+}
+
+/// Quiet, trust-preserving inbox clear (#inbox-gc part a).
+///
+/// Sibling of [`drain`]: same `with_inbox_lock` + tmp+fsync+rename write-back,
+/// but it sets `read_at` SELECTIVELY (only non-obligation messages) and returns
+/// COMPACT structs instead of full [`InboxMessage`]s.
+///
+/// `obligation`: returns `Some(reason)` when a message MUST stay unread (an
+/// unanswered query, an open task, anything the caller can't prove is settled —
+/// failure mode is noise, never hidden work) and `None` when it is safe to clear
+/// (`update`/`report`/CI/poll/superseded/ambient). The storage layer is policy-
+/// free; the caller (which can read the task board) supplies the predicate.
+///
+/// TRUST: `read_at` here means "non-obligation cleared from attention", NOT
+/// "obligation accepted". Unlike [`drain`], this does NOT arm the reply-ledger
+/// nor touch `heartbeat_pair` — clearing historical channel backlog must never
+/// fabricate a "must-reply" turn. It DOES consume the notification dedup for
+/// cleared rows (they're no longer pending). Never deletes rows (that's
+/// [`sweep_expired`]'s job); only mutates `read_at`.
+pub fn clear_compact(
+    home: &Path,
+    name: &str,
+    obligation: impl Fn(&InboxMessage) -> Option<String>,
+) -> ClearCompactResult {
+    let path = inbox_path_resolved(home, name);
+    if !path.exists() {
+        return ClearCompactResult {
+            cleared_count: 0,
+            kept_unread_count: 0,
+            summaries: Vec::new(),
+            summaries_omitted: 0,
+            requires_response: Vec::new(),
+        };
+    }
+
+    // Phase 1 (locked): read, selectively mark read_at, write back. Collect the
+    // ids of newly-cleared rows for the phase-2 dedup consume.
+    struct Phase1 {
+        cleared_count: usize,
+        kept_unread_count: usize,
+        summaries: Vec<ClearSummary>,
+        summaries_omitted: usize,
+        requires_response: Vec<ClearSummary>,
+        cleared_ids: Vec<String>,
+    }
+    let result = with_inbox_lock(home, name, |path| {
+        let content = std::fs::read_to_string(path).unwrap_or_default();
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut out: Vec<InboxMessage> = Vec::new();
+        let mut p = Phase1 {
+            cleared_count: 0,
+            kept_unread_count: 0,
+            summaries: Vec::new(),
+            summaries_omitted: 0,
+            requires_response: Vec::new(),
+            cleared_ids: Vec::new(),
+        };
+        let mut changed = false;
+
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let mut msg: InboxMessage = match serde_json::from_str(line) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if msg.schema_version > InboxMessage::CURRENT_VERSION {
+                tracing::error!(
+                    found = msg.schema_version,
+                    supported = InboxMessage::CURRENT_VERSION,
+                    "dropping inbox message written by newer schema version"
+                );
+                continue;
+            }
+            // Already-read rows are untouched (and not re-summarised).
+            if msg.read_at.is_some() {
+                out.push(msg);
+                continue;
+            }
+            // Superseded rows are always safe to clear (mirror drain()).
+            let obligation_reason = if msg.superseded_by.is_some() {
+                None
+            } else {
+                obligation(&msg)
+            };
+            match obligation_reason {
+                Some(reason) => {
+                    // Obligation → keep UNREAD, surface in requires_response.
+                    p.kept_unread_count += 1;
+                    p.requires_response
+                        .push(clear_summary_of(&msg, false, Some(reason)));
+                    out.push(msg);
+                }
+                None => {
+                    let reason = msg.superseded_by.as_ref().map(|_| "superseded".to_string());
+                    if p.summaries.len() < CLEAR_SUMMARY_CAP {
+                        p.summaries.push(clear_summary_of(&msg, true, reason));
+                    } else {
+                        p.summaries_omitted += 1;
+                    }
+                    if let Some(ref id) = msg.id {
+                        p.cleared_ids.push(id.clone());
+                    }
+                    msg.read_at = Some(now.clone());
+                    p.cleared_count += 1;
+                    changed = true;
+                    out.push(msg);
+                }
+            }
+        }
+
+        if changed {
+            let write_tmp = path.with_extension("jsonl.tmp");
+            let r = (|| -> anyhow::Result<()> {
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&write_tmp)?;
+                for m in &out {
+                    writeln!(f, "{}", serde_json::to_string(m)?)?;
+                }
+                f.sync_all()?;
+                std::fs::rename(&write_tmp, path)?;
+                Ok(())
+            })();
+            if let Err(e) = r {
+                tracing::warn!(error = %e, "inbox clear_compact write-back failed");
+            }
+        }
+        p
+    });
+
+    let p = match result {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "inbox clear_compact lock failed");
+            return ClearCompactResult {
+                cleared_count: 0,
+                kept_unread_count: 0,
+                summaries: Vec::new(),
+                summaries_omitted: 0,
+                requires_response: Vec::new(),
+            };
+        }
+    };
+
+    // Phase 2 (unlocked): consume notification dedup for cleared rows so they
+    // don't re-nudge. Deliberately NONE of drain()'s channel side effects (no
+    // reply-ledger arming, no turn-state touch) — see the TRUST note above.
+    for id in &p.cleared_ids {
+        crate::daemon::notification_dedup::global().mark_consumed(name, id);
+    }
+
+    ClearCompactResult {
+        cleared_count: p.cleared_count,
+        kept_unread_count: p.kept_unread_count,
+        summaries: p.summaries,
+        summaries_omitted: p.summaries_omitted,
+        requires_response: p.requires_response,
+    }
+}
+
 /// Count unread messages (read_at == None) for an agent.
 pub fn unread_count(home: &Path, name: &str) -> (usize, Option<chrono::DateTime<chrono::Utc>>) {
     let path = inbox_path_resolved(home, name);
@@ -434,9 +706,19 @@ pub fn unread_of_kind(
     out
 }
 
-/// Sweep expired messages from all inbox files.
-/// - read_at.is_some() && elapsed > 7 days → delete
-/// - read_at.is_none() && elapsed > 30 days → delete
+/// Sweep expired messages from all inbox files (#inbox-gc part b).
+///
+/// Two-pass per inbox, both serialised under [`with_inbox_lock`]:
+/// 1. **TTL pass** — drop by age, with three tiers:
+///    - unread (`read_at.is_none()`): age > [`UNREAD_TTL_DAYS`]
+///    - read blocker (`is_blocker_row`): age > [`READ_TTL_BLOCKER_DAYS`]
+///    - read non-blocker: age > [`READ_TTL_HOURS`]
+/// 2. **Size-cap pass** — among the TTL survivors, keep at most
+///    [`READ_ROW_CAP`] read NON-blocker rows (most-recent by timestamp);
+///    drop the oldest beyond the cap. Unread + blocker rows are never counted
+///    nor dropped here (obligations / ack-absorption audit window).
+///
+/// File line order is preserved for survivors.
 pub fn sweep_expired(home: &Path) {
     let inbox_dir = home.join("inbox");
     let entries = match std::fs::read_dir(&inbox_dir) {
@@ -459,7 +741,16 @@ pub fn sweep_expired(home: &Path) {
                 Ok(c) => c,
                 Err(_) => return,
             };
-            let mut kept: Vec<String> = Vec::new();
+
+            // Pass 1 (TTL): retain non-expired lines, recording for each kept
+            // line its timestamp + whether it's a read non-blocker (the only
+            // tier the size cap touches).
+            struct Kept {
+                line: String,
+                ts: chrono::DateTime<chrono::Utc>,
+                read_non_blocker: bool,
+            }
+            let mut kept: Vec<Kept> = Vec::new();
             let mut changed = false;
             for line in content.lines() {
                 if line.trim().is_empty() {
@@ -473,16 +764,60 @@ pub fn sweep_expired(home: &Path) {
                     .map(|dt| dt.with_timezone(&chrono::Utc))
                     .unwrap_or(now);
                 let age = now.signed_duration_since(ts);
+                let blocker = is_blocker_row(&msg);
                 let expired = match &msg.read_at {
-                    Some(_) => age > chrono::Duration::days(7),
-                    None => age > chrono::Duration::days(30),
+                    None => age > chrono::Duration::days(UNREAD_TTL_DAYS),
+                    Some(_) if blocker => age > chrono::Duration::days(READ_TTL_BLOCKER_DAYS),
+                    Some(_) => age > chrono::Duration::hours(READ_TTL_HOURS),
                 };
                 if expired {
                     changed = true;
                 } else {
-                    kept.push(line.to_string());
+                    kept.push(Kept {
+                        line: line.to_string(),
+                        ts,
+                        read_non_blocker: msg.read_at.is_some() && !blocker,
+                    });
                 }
             }
+
+            // Pass 2 (size cap): if read non-blocker survivors exceed the cap,
+            // drop the oldest beyond the most-recent READ_ROW_CAP. Find the
+            // cutoff timestamp by descending sort of just those rows' timestamps.
+            let read_count = kept.iter().filter(|k| k.read_non_blocker).count();
+            if read_count > READ_ROW_CAP {
+                let mut ts_desc: Vec<chrono::DateTime<chrono::Utc>> = kept
+                    .iter()
+                    .filter(|k| k.read_non_blocker)
+                    .map(|k| k.ts)
+                    .collect();
+                ts_desc.sort_unstable_by(|a, b| b.cmp(a));
+                let cutoff = ts_desc[READ_ROW_CAP - 1];
+                // Keep read non-blockers strictly newer than cutoff, plus exactly
+                // enough at-the-cutoff rows to total READ_ROW_CAP (ties broken by
+                // file order, deterministic). Everything else (unread/blocker) is
+                // always retained.
+                let mut at_cutoff_budget =
+                    READ_ROW_CAP - ts_desc.iter().filter(|t| **t > cutoff).count();
+                let before = kept.len();
+                kept.retain(|k| {
+                    if !k.read_non_blocker {
+                        return true;
+                    }
+                    if k.ts > cutoff {
+                        return true;
+                    }
+                    if k.ts == cutoff && at_cutoff_budget > 0 {
+                        at_cutoff_budget -= 1;
+                        return true;
+                    }
+                    false
+                });
+                if kept.len() != before {
+                    changed = true;
+                }
+            }
+
             if changed {
                 if kept.is_empty() {
                     let _ = std::fs::remove_file(path);
@@ -494,8 +829,8 @@ pub fn sweep_expired(home: &Path) {
                             .write(true)
                             .truncate(true)
                             .open(&tmp)?;
-                        for l in &kept {
-                            writeln!(f, "{l}")?;
+                        for k in &kept {
+                            writeln!(f, "{}", k.line)?;
                         }
                         f.sync_all()?;
                         std::fs::rename(&tmp, path)?;

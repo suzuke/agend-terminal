@@ -25,7 +25,7 @@ pub use disk::{check_disk_space, recover_half_writes};
 
 // Storage CRUD (pub)
 pub use storage::{
-    describe_message, drain, enqueue, find_message, get_thread,
+    clear_compact, describe_message, drain, enqueue, find_message, get_thread,
     has_drained_blocker_for_correlation, mark_ci_watch_superseded, sweep_expired, unread_count,
     unread_of_kind,
 };

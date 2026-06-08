@@ -330,7 +330,11 @@ action_adapter!(dispatch_team, "team", [
 //   - else `thread_id` present → describe thread
 //   - else → drain pending
 pub(crate) fn dispatch_inbox(ctx: &HandlerCtx<'_>) -> Value {
-    if ctx
+    if ctx.args.get("action").and_then(|v| v.as_str()) == Some("clear") {
+        // #inbox-gc part a: quiet compact-clear (explicit action — never the
+        // no-arg drain). Obligations stay unread; returns bounded summaries.
+        comms::handle_inbox_clear(ctx.home, ctx.instance_name)
+    } else if ctx
         .args
         .get("message_id")
         .and_then(|v| v.as_str())

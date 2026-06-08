@@ -794,6 +794,305 @@ fn test_sweep_unread_30d() {
     fs::remove_dir_all(&home).ok();
 }
 
+// ── #inbox-gc part b: shortened read TTL + blocker exemption + size cap ──
+
+#[test]
+fn sweep_read_non_blocker_48h() {
+    let home = tmp_home("sweep-48h");
+    let inbox_dir = home.join("inbox");
+    fs::create_dir_all(&inbox_dir).ok();
+    let old = (chrono::Utc::now() - chrono::Duration::hours(50)).to_rfc3339();
+    let fresh = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+    let old_row = format!(
+        r#"{{"schema_version":1,"id":"m-old","from":"a","text":"x","kind":"update","timestamp":"{old}","read_at":"{old}"}}"#
+    );
+    let fresh_row = format!(
+        r#"{{"schema_version":1,"id":"m-fresh","from":"b","text":"x","kind":"update","timestamp":"{fresh}","read_at":"{fresh}"}}"#
+    );
+    fs::write(
+        inbox_dir.join("a1.jsonl"),
+        format!("{old_row}\n{fresh_row}\n"),
+    )
+    .ok();
+    sweep_expired(&home);
+    let content = fs::read_to_string(inbox_dir.join("a1.jsonl")).expect("file");
+    assert!(
+        !content.contains("m-old"),
+        "read non-blocker >48h must be swept (was 7d)"
+    );
+    assert!(
+        content.contains("m-fresh"),
+        "read non-blocker <48h must survive"
+    );
+    fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn sweep_exempts_drained_blocker_until_7d() {
+    let home = tmp_home("sweep-blocker");
+    let inbox_dir = home.join("inbox");
+    fs::create_dir_all(&inbox_dir).ok();
+    // A drained task (blocker) 3d old is past the 48h read TTL but within the
+    // 7d blocker window → MUST survive so has_drained_blocker_for_correlation
+    // still answers when the worker's reply arrives late.
+    let d3 = (chrono::Utc::now() - chrono::Duration::days(3)).to_rfc3339();
+    let d8 = (chrono::Utc::now() - chrono::Duration::days(8)).to_rfc3339();
+    let kept = format!(
+        r#"{{"schema_version":1,"id":"blk-3d","from":"lead","text":"t","kind":"task","timestamp":"{d3}","read_at":"{d3}","correlation_id":"c-keep"}}"#
+    );
+    let gone = format!(
+        r#"{{"schema_version":1,"id":"blk-8d","from":"lead","text":"q","kind":"query","timestamp":"{d8}","read_at":"{d8}","correlation_id":"c-gone"}}"#
+    );
+    fs::write(inbox_dir.join("a1.jsonl"), format!("{kept}\n{gone}\n")).ok();
+    sweep_expired(&home);
+    let content = fs::read_to_string(inbox_dir.join("a1.jsonl")).expect("file");
+    assert!(
+        content.contains("blk-3d"),
+        "drained blocker <7d must survive (ack-absorption audit window)"
+    );
+    assert!(
+        !content.contains("blk-8d"),
+        "drained blocker >7d must be swept"
+    );
+    assert!(
+        has_drained_blocker_for_correlation(&home, "a1", "c-keep"),
+        "ack-absorption audit must still see the surviving blocker"
+    );
+    fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn sweep_size_cap_keeps_recent_n_read_rows() {
+    let home = tmp_home("sweep-cap");
+    let inbox_dir = home.join("inbox");
+    fs::create_dir_all(&inbox_dir).ok();
+    let mut lines = String::new();
+    // 350 FRESH (<48h) read non-blocker rows, staggered so newest = highest i.
+    for i in 0..350 {
+        let ts = (chrono::Utc::now() - chrono::Duration::minutes(350 - i)).to_rfc3339();
+        lines.push_str(&format!(
+            r#"{{"schema_version":1,"id":"r{i}","from":"x","text":"x","kind":"update","timestamp":"{ts}","read_at":"{ts}"}}"#
+        ));
+        lines.push('\n');
+    }
+    // An unread obligation + a drained blocker — neither counted nor evicted.
+    let now = chrono::Utc::now().to_rfc3339();
+    lines.push_str(&format!(
+        r#"{{"schema_version":1,"id":"unread1","from":"x","text":"x","kind":"query","timestamp":"{now}"}}"#
+    ));
+    lines.push('\n');
+    lines.push_str(&format!(
+        r#"{{"schema_version":1,"id":"blk1","from":"x","text":"x","kind":"task","timestamp":"{now}","read_at":"{now}"}}"#
+    ));
+    lines.push('\n');
+    fs::write(inbox_dir.join("a1.jsonl"), lines).ok();
+    sweep_expired(&home);
+    let content = fs::read_to_string(inbox_dir.join("a1.jsonl")).expect("file");
+    let read_kept = content.lines().filter(|l| l.contains(r#""id":"r"#)).count();
+    assert_eq!(
+        read_kept, 300,
+        "size cap must keep exactly READ_ROW_CAP read non-blocker rows"
+    );
+    assert!(
+        content.contains(r#""id":"r349""#) && content.contains(r#""id":"r50""#),
+        "newest read rows kept"
+    );
+    assert!(
+        !content.contains(r#""id":"r0""#) && !content.contains(r#""id":"r49""#),
+        "oldest read rows beyond cap dropped"
+    );
+    assert!(
+        content.contains("unread1"),
+        "unread obligation never evicted by the cap"
+    );
+    assert!(
+        content.contains("blk1"),
+        "drained blocker never evicted by the cap"
+    );
+    fs::remove_dir_all(&home).ok();
+}
+
+// ── #inbox-gc part a: clear_compact (quiet trust-preserving clear) ──────
+
+fn keep_query_and_task(m: &InboxMessage) -> Option<String> {
+    match m.kind.as_deref() {
+        Some("query") => Some("unanswered query".into()),
+        Some("task") => Some("open task".into()),
+        _ => None,
+    }
+}
+
+#[test]
+fn clear_compact_keeps_obligations_clears_rest() {
+    let _g = READONLY_TEST_LOCK.lock();
+    let home = tmp_home("clear-oblig");
+    enqueue(
+        &home,
+        "a1",
+        msg()
+            .sender("lead")
+            .kind("query")
+            .id("q1")
+            .text("q?")
+            .build(),
+    )
+    .unwrap();
+    enqueue(
+        &home,
+        "a1",
+        msg()
+            .sender("lead")
+            .kind("task")
+            .id("t1")
+            .text("do x")
+            .build(),
+    )
+    .unwrap();
+    enqueue(
+        &home,
+        "a1",
+        msg()
+            .sender("lead")
+            .kind("update")
+            .id("u1")
+            .text("fyi")
+            .build(),
+    )
+    .unwrap();
+    enqueue(
+        &home,
+        "a1",
+        msg()
+            .sender("ci")
+            .kind("report")
+            .id("rp1")
+            .text("done")
+            .build(),
+    )
+    .unwrap();
+    enqueue(
+        &home,
+        "a1",
+        msg()
+            .sender("sys")
+            .kind("update")
+            .id("sup1")
+            .text("old")
+            .superseded_by("new")
+            .build(),
+    )
+    .unwrap();
+
+    let r = clear_compact(&home, "a1", keep_query_and_task);
+    assert_eq!(
+        r.cleared_count, 3,
+        "update + report + superseded cleared (3)"
+    );
+    assert_eq!(r.kept_unread_count, 2, "query + task kept unread (2)");
+    assert_eq!(r.requires_response.len(), 2, "both obligations surfaced");
+    assert_eq!(
+        unread_count(&home, "a1").0,
+        2,
+        "obligations remain UNREAD on disk after clear"
+    );
+    fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn clear_compact_summaries_bounded() {
+    let _g = READONLY_TEST_LOCK.lock();
+    let home = tmp_home("clear-bound");
+    for i in 0..250 {
+        enqueue(
+            &home,
+            "a1",
+            msg()
+                .sender("x")
+                .kind("update")
+                .id(&format!("u{i}"))
+                .text("x")
+                .build(),
+        )
+        .unwrap();
+    }
+    let r = clear_compact(&home, "a1", |_| None);
+    assert_eq!(r.cleared_count, 250, "all 250 cleared");
+    assert_eq!(
+        r.summaries.len(),
+        200,
+        "summaries capped at CLEAR_SUMMARY_CAP"
+    );
+    assert_eq!(
+        r.summaries_omitted, 50,
+        "overflow counted, not dropped silently"
+    );
+    fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn clear_compact_preview_single_line_bounded() {
+    let _g = READONLY_TEST_LOCK.lock();
+    let home = tmp_home("clear-preview");
+    let long = format!("line one\nline two\t{}", "z".repeat(200));
+    enqueue(
+        &home,
+        "a1",
+        msg()
+            .sender("x")
+            .kind("update")
+            .id("u1")
+            .text_owned(long)
+            .build(),
+    )
+    .unwrap();
+    let r = clear_compact(&home, "a1", |_| None);
+    let s = &r.summaries[0];
+    assert!(
+        !s.preview.contains('\n') && !s.preview.contains('\t'),
+        "preview must be a sanitised single line, got {:?}",
+        s.preview
+    );
+    assert!(
+        s.preview.chars().count() <= CLEAR_PREVIEW_CHARS_TEST + 1,
+        "preview ≤60 chars (+ellipsis), got {}",
+        s.preview.chars().count()
+    );
+    fs::remove_dir_all(&home).ok();
+}
+
+/// Mirror of the private `CLEAR_PREVIEW_CHARS` const for the bound assertion.
+const CLEAR_PREVIEW_CHARS_TEST: usize = 60;
+
+#[test]
+fn clear_compact_does_not_arm_reply_ledger_source_scan() {
+    // STRUCTURAL invariant (decision d-20260607081209372642-1): a compact-clear
+    // must NEVER arm the reply-ledger or touch heartbeat_pair — else clearing a
+    // historical channel backlog fabricates false "must-reply" turns. The state
+    // lives in a global singleton (behavioural isolation is unreliable across
+    // parallel tests), so we assert structurally on the function body.
+    let src = include_str!("storage.rs");
+    let start = src
+        .find("pub fn clear_compact")
+        .expect("clear_compact present");
+    let body = &src[start..];
+    let end = body
+        .find("\n/// Count unread messages")
+        .unwrap_or(body.len());
+    let body = &body[..end];
+    assert!(
+        !body.contains("reply_ledger"),
+        "clear_compact must NOT arm reply_ledger from backlog"
+    );
+    assert!(
+        !body.contains("heartbeat_pair"),
+        "clear_compact must NOT touch heartbeat_pair"
+    );
+    assert!(
+        body.contains("mark_consumed"),
+        "clear_compact SHOULD consume notification dedup for cleared rows"
+    );
+}
+
 #[test]
 fn test_describe_message_status_three_states() {
     let home = tmp_home("describe-msg");

@@ -3067,3 +3067,121 @@ fn task_id_required_stable_code_on_team_broadcast() {
     std::env::remove_var("AGEND_HOME");
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ── #inbox-gc part a: quiet compact-clear via the real `inbox` MCP entry ──
+
+/// §3.9: a representative multi-kind backlog (query + task[unsettled] + update +
+/// report + superseded) cleared through `handle_tool("inbox", {action:"clear"})`
+/// must KEEP the obligations (query + unsettled task) unread and surface them in
+/// `requires_response`, while clearing the chatter — and never silently swallow
+/// an obligation.
+#[test]
+fn inbox_clear_via_mcp_keeps_obligations() {
+    let _g = fleet_test_guard();
+    let (_rec, home) = setup_recorder("clearcaller");
+    let inbox_dir = home.join("inbox");
+    std::fs::create_dir_all(&inbox_dir).unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    let rows = [
+        format!(
+            r#"{{"schema_version":1,"id":"q1","from":"lead","text":"are you there?","kind":"query","timestamp":"{now}"}}"#
+        ),
+        format!(
+            r#"{{"schema_version":1,"id":"t1","from":"lead","text":"do the thing","kind":"task","timestamp":"{now}","task_id":"t-not-on-board"}}"#
+        ),
+        format!(
+            r#"{{"schema_version":1,"id":"u1","from":"peer","text":"fyi update","kind":"update","timestamp":"{now}"}}"#
+        ),
+        format!(
+            r#"{{"schema_version":1,"id":"rp1","from":"ci","text":"ci pass","kind":"report","timestamp":"{now}"}}"#
+        ),
+        format!(
+            r#"{{"schema_version":1,"id":"s1","from":"sys","text":"stale","kind":"update","timestamp":"{now}","superseded_by":"s2"}}"#
+        ),
+    ];
+    std::fs::write(
+        inbox_dir.join("clearcaller.jsonl"),
+        format!("{}\n", rows.join("\n")),
+    )
+    .unwrap();
+
+    let resp = handle_tool("inbox", &json!({"action": "clear"}), "clearcaller");
+    assert_eq!(
+        resp["cleared_count"], 3,
+        "update + report + superseded cleared: {resp}"
+    );
+    assert_eq!(
+        resp["kept_unread_count"], 2,
+        "query + unsettled task kept unread: {resp}"
+    );
+    let req = resp["requires_response"]
+        .as_array()
+        .expect("requires_response");
+    let kept_ids: Vec<&str> = req.iter().filter_map(|r| r["id"].as_str()).collect();
+    assert!(
+        kept_ids.contains(&"q1") && kept_ids.contains(&"t1"),
+        "both obligations surfaced in requires_response: {resp}"
+    );
+    // On disk: obligations stay UNREAD, chatter is now read.
+    assert_eq!(
+        crate::inbox::describe_message(&home, "q1", "clearcaller"),
+        crate::inbox::MessageStatus::Unread {
+            delivery_mode: None,
+            correlation_id: None
+        },
+        "query must remain unread on disk"
+    );
+    assert!(
+        matches!(
+            crate::inbox::describe_message(&home, "u1", "clearcaller"),
+            crate::inbox::MessageStatus::ReadAt(_, _)
+        ),
+        "update must be marked read on disk"
+    );
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// §3.9: a task whose board entry is TERMINAL (done) is no longer an obligation
+/// → the compact-clear marks it read. Exercises the task-board terminal check
+/// through the real `task` + `inbox` MCP entries end-to-end.
+#[test]
+fn inbox_clear_via_mcp_clears_terminal_task() {
+    let _g = fleet_test_guard();
+    let (_rec, home) = setup_recorder("clearterm");
+    // Create a task owned by the caller, then mark it done (terminal).
+    let created = handle_tool(
+        "task",
+        &json!({"action": "create", "title": "x", "assignee": "clearterm"}),
+        "clearterm",
+    );
+    let tid = created["id"].as_str().expect("created task id").to_string();
+    let done = handle_tool(
+        "task",
+        &json!({"action": "done", "id": tid, "result": "ok"}),
+        "clearterm",
+    );
+    assert_eq!(done["status"], "done", "task must be terminal: {done}");
+
+    let inbox_dir = home.join("inbox");
+    std::fs::create_dir_all(&inbox_dir).unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    let row = format!(
+        r#"{{"schema_version":1,"id":"tt1","from":"lead","text":"do","kind":"task","timestamp":"{now}","task_id":"{tid}"}}"#
+    );
+    std::fs::write(inbox_dir.join("clearterm.jsonl"), format!("{row}\n")).unwrap();
+
+    let resp = handle_tool("inbox", &json!({"action": "clear"}), "clearterm");
+    assert_eq!(
+        resp["cleared_count"], 1,
+        "terminal-task message must be cleared: {resp}"
+    );
+    assert_eq!(
+        resp["kept_unread_count"], 0,
+        "terminal task is not an obligation: {resp}"
+    );
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}

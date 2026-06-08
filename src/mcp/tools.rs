@@ -60,8 +60,9 @@ pub(crate) fn def_send() -> Value {
 }
 
 pub(crate) fn def_inbox() -> Value {
-    json!({"name": "inbox", "description": "Check pending messages, OR look up a single message by ID, OR fetch a thread's messages. No params = drain pending. With message_id = describe message status (read/unread/expired/notfound). With thread_id = fetch all messages in thread ordered by timestamp.",
+    json!({"name": "inbox", "description": "Check pending messages, OR look up a single message by ID, OR fetch a thread's messages, OR quietly clear a backlog. No params = drain pending. With message_id = describe message status (read/unread/expired/notfound). With thread_id = fetch all messages in thread ordered by timestamp. With action=\"clear\" = quiet compact-clear: marks non-obligation messages read and returns a BOUNDED summary {cleared_count, kept_unread_count, summaries[], requires_response[]} — unanswered queries + unsettled tasks stay UNREAD and surface in requires_response (never silently swallowed). Use clear (not drain) to dismiss a large stale backlog without flooding your context.",
     "inputSchema": {"type": "object", "properties": {
+        "action": {"type": "string", "enum": ["clear"], "description": "\"clear\" = quiet compact-clear (obligations kept unread). Omit for normal drain."},
         "message_id": {"type": "string", "description": "Look up message status by ID"},
         "thread_id": {"type": "string", "description": "Fetch all messages in a thread"},
         "instance": {"type": "string", "description": "For message_id: target instance (defaults to caller). For thread_id: filter to a specific instance's inbox (optional, scans all if omitted)"}
