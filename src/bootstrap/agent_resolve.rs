@@ -46,47 +46,6 @@ pub(super) fn resolve(config: &FleetConfig, fleet_dir: &Path, home: &Path) -> Ve
         .collect()
 }
 
-/// #888: pure predicate deciding whether `resolve_one` should
-/// auto-create a worktree for this instance.
-///
-/// Three inputs:
-/// - `worktree: false` is a hard veto regardless of other flags
-///   (Sprint 28 opt-out semantic preserved).
-/// - **`source_repo` OR `git_branch` is the affirmative signal**
-///   (#888). Either one declares the instance as a source-repo-bound
-///   dev / reviewer / task-dispatch worker that legitimately wants a
-///   per-agent worktree.
-/// - Anything else (orchestrator / admin / quickstart-default
-///   instances) → NO auto-worktree. The `workspace/<name>/` dir
-///   stays the project-root, `claude --continue` finds prior
-///   session state across app restarts, Gemini/Codex hierarchical
-///   AGENTS.md scoping still works via
-///   `instructions::ensure_project_root`'s git-init.
-///
-/// Pre-#888 the gate was just "`worktree != Some(false)` AND
-/// working_dir is a git repo". That interacted with
-/// `ensure_project_root` (`src/instructions.rs:63`), which runs
-/// tail-side of `resolve_one`, in a way that triggered the
-/// CONTEXT-LOST bug on every SECOND launch:
-///
-/// 1. First launch: `workspace/<name>/` just created → no `.git`
-///    → no worktree → `ensure_project_root` then runs → leaves
-///    `workspace/<name>/.git` on disk.
-/// 2. Second launch: `workspace/<name>/.git` is present →
-///    `is_git_repo` returns true → `worktree::create` redirects
-///    `working_directory` to `worktrees/<name>/...` → `claude
-///    --continue` finds no prior session at the new path →
-///    operator's conversation history vanishes.
-///
-/// Pure helper so the unit tests can pin the contract directly
-/// without spinning up a real fixture for every variant.
-fn wants_auto_worktree(resolved: &crate::fleet::ResolvedInstance) -> bool {
-    if resolved.worktree == Some(false) {
-        return false;
-    }
-    resolved.source_repo.is_some() || resolved.git_branch.is_some()
-}
-
 /// Resolve a single named instance into a spawn-ready [`AgentDef`].
 ///
 /// Returns `None` if the instance is missing from `config` or cannot be
@@ -100,22 +59,14 @@ fn resolve_one(config: &FleetConfig, ctx: &ResolveContext<'_>, name: &str) -> Op
         std::fs::create_dir_all(base_dir).ok();
     }
 
-    // Auto-create git worktree when working_directory is inside a repo
-    // AND the instance has an explicit `source_repo` or `git_branch`
-    // config (`#888` — see `wants_auto_worktree` for the full rationale).
-    // Redirects `resolved.working_directory` to the worktree path for the
-    // rest of the pipeline. Skipped when `worktree: false` (Sprint 28)
-    // OR when neither `source_repo` nor `git_branch` is set (#888).
-    if wants_auto_worktree(&resolved) {
-        if let Some(ref base_dir) = resolved.working_directory {
-            if crate::worktree::is_git_repo(base_dir) {
-                let custom_branch = resolved.git_branch.as_deref();
-                if let Some(info) = crate::worktree::create(ctx.home, base_dir, name, custom_branch)
-                {
-                    resolved.working_directory = Some(info.path);
-                }
-            }
-        }
+    // Auto-create git worktree when the instance opts in (`source_repo` /
+    // `git_branch`) AND `working_directory` is an explicit real repo — see
+    // `crate::worktree::resolve_auto_worktree`, the single shared gate (#1858)
+    // that both this boot path and `app::pane_factory` (live spawn) call so the
+    // decision can't drift between them. Redirects `resolved.working_directory`
+    // to the worktree path for the rest of the pipeline.
+    if let Some(wt_path) = crate::worktree::resolve_auto_worktree(ctx.home, name, &resolved) {
+        resolved.working_directory = Some(wt_path);
     } else if resolved.worktree == Some(false) {
         if let Some(ref base_dir) = resolved.working_directory {
             // worktree: false — auto-prune existing worktree if present.
@@ -414,6 +365,77 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// §3.9 (a) (#1858): a `source_repo` agent whose `working_directory` is the
+    /// daemon-managed default `workspace/<name>` must NOT drift into a worktree —
+    /// not on launch 1, and crucially not on launch 2 after the dir has become a
+    /// git repo (which `ensure_project_root` does tail-side). Pre-#1858 launch 2
+    /// saw `is_git_repo`=true + the `source_repo` signal and redirected into a
+    /// worktree of the empty workspace. Drives the real boot entry `resolve_one`
+    /// twice. Regression-proof: revert the workspace-default skip and the
+    /// launch-2 assert fails (wd lands under `worktrees/`).
+    #[test]
+    fn resolve_one_source_repo_in_default_workspace_no_drift_1858() {
+        let dir = tmp_dir("1858-a-nodrift");
+        // A real source_repo so the #888 opt-in signal points at something valid.
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        init_git_repo(&src);
+        // working_directory = the daemon-managed default `workspace/<name>`.
+        let work_dir = crate::paths::workspace_dir(&dir).join("dev");
+        std::fs::create_dir_all(&work_dir).unwrap();
+
+        let yaml = format!(
+            "defaults:\n  backend: claude\ninstances:\n  dev:\n    command: /bin/true\n    working_directory: {}\n    source_repo: {}\n",
+            work_dir.display(),
+            src.display(),
+        );
+        let config: FleetConfig = serde_yaml_ng::from_str(&yaml).unwrap();
+        let peers: Vec<(String, Option<String>)> = config
+            .instances
+            .iter()
+            .map(|(n, c)| (n.clone(), c.role.clone()))
+            .collect();
+
+        // LAUNCH 1: workspace dir is not yet a git repo → plain (true pre & post).
+        let ctx = ResolveContext {
+            fleet_dir: &dir,
+            home: &dir,
+            peers: peers.clone(),
+        };
+        let wd1 = resolve_one(&config, &ctx, "dev").unwrap().4.unwrap();
+        assert_eq!(
+            wd1, work_dir,
+            "launch-1 must stay in the plain workspace dir"
+        );
+
+        // Simulate ensure_project_root's tail-side git-init (the #1858 trigger):
+        // make the workspace dir a git repo before the second launch.
+        init_git_repo(&work_dir);
+        assert!(
+            work_dir.join(".git").exists(),
+            "fixture: workspace dir is now a git repo (the launch-2 state)"
+        );
+
+        // LAUNCH 2 (restart / reboot): MUST still be plain — no worktree drift.
+        let ctx2 = ResolveContext {
+            fleet_dir: &dir,
+            home: &dir,
+            peers,
+        };
+        let wd2 = resolve_one(&config, &ctx2, "dev").unwrap().4.unwrap();
+        assert_eq!(
+            wd2, work_dir,
+            "#1858: launch-2 must NOT drift the default workspace dir into a worktree"
+        );
+        assert!(
+            !wd2.to_string_lossy().contains("worktrees"),
+            "#1858: no worktree redirect on restart, got {}",
+            wd2.display()
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Pure unit test on the `wants_auto_worktree` predicate.
     /// Covers all four input shapes without filesystem fixtures.
     #[test]
@@ -443,24 +465,32 @@ mod tests {
             }
         };
         // worktree: false → ALWAYS false regardless of other flags.
-        assert!(!wants_auto_worktree(&mk(
+        assert!(!crate::worktree::wants_auto_worktree(&mk(
             Some(false),
             Some(PathBuf::from("/x")),
             Some("main".into())
         )));
         // No source_repo, no git_branch → false (the #888 fix).
-        assert!(!wants_auto_worktree(&mk(None, None, None)));
-        assert!(!wants_auto_worktree(&mk(Some(true), None, None)));
+        assert!(!crate::worktree::wants_auto_worktree(&mk(None, None, None)));
+        assert!(!crate::worktree::wants_auto_worktree(&mk(
+            Some(true),
+            None,
+            None
+        )));
         // source_repo set → true.
-        assert!(wants_auto_worktree(&mk(
+        assert!(crate::worktree::wants_auto_worktree(&mk(
             None,
             Some(PathBuf::from("/x")),
             None
         )));
         // git_branch set → true.
-        assert!(wants_auto_worktree(&mk(None, None, Some("main".into()))));
+        assert!(crate::worktree::wants_auto_worktree(&mk(
+            None,
+            None,
+            Some("main".into())
+        )));
         // Both set → true.
-        assert!(wants_auto_worktree(&mk(
+        assert!(crate::worktree::wants_auto_worktree(&mk(
             None,
             Some(PathBuf::from("/x")),
             Some("main".into())

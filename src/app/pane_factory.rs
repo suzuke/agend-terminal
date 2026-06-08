@@ -336,23 +336,14 @@ pub(super) fn create_pane_from_resolved(
 
     let mut working_dir = resolved.working_directory.clone();
 
-    // #888: Auto-create git worktree when working_directory is inside a repo
-    // AND the instance has an explicit `source_repo` or `git_branch`
-    // config (mirror logic in bootstrap/agent_resolve.rs).
-    let wants_worktree = resolved.worktree != Some(false)
-        && (resolved.source_repo.is_some() || resolved.git_branch.is_some());
-
-    if wants_worktree {
-        if let Some(ref base_dir) = working_dir {
-            if crate::worktree::is_git_repo(base_dir) {
-                let custom_branch = resolved.git_branch.as_deref();
-                if let Some(info) =
-                    crate::worktree::create(home, base_dir, fleet_name, custom_branch)
-                {
-                    working_dir = Some(info.path);
-                }
-            }
-        }
+    // #1858: auto-worktree decision is the single shared gate in
+    // `crate::worktree::resolve_auto_worktree` — same fn the boot path
+    // (`bootstrap::agent_resolve::resolve_one`) calls, so live-spawn and boot
+    // can't drift. Opts in on `source_repo` / `git_branch` (#888) but only for
+    // an explicit real-repo `working_directory`, never the daemon-managed
+    // `workspace/<name>` default (which `ensure_project_root` git-inits).
+    if let Some(wt_path) = crate::worktree::resolve_auto_worktree(home, fleet_name, resolved) {
+        working_dir = Some(wt_path);
     }
 
     let mut args = resolved.args.clone();

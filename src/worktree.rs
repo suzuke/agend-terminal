@@ -289,6 +289,62 @@ pub fn create(
     }
 }
 
+/// #888 affirmative-signal predicate: does this instance opt into a per-agent
+/// worktree? `worktree: false` is a hard veto; otherwise `source_repo` OR
+/// `git_branch` is the opt-in. Pure (no filesystem) so the truth table can be
+/// pinned directly. The base-dir / is_git_repo decision lives in
+/// [`resolve_auto_worktree`] (the full gate).
+pub fn wants_auto_worktree(resolved: &crate::fleet::ResolvedInstance) -> bool {
+    if resolved.worktree == Some(false) {
+        return false;
+    }
+    resolved.source_repo.is_some() || resolved.git_branch.is_some()
+}
+
+/// #1858: single source of truth for the per-agent auto-worktree decision,
+/// shared by the boot/reload path (`bootstrap::agent_resolve::resolve_one`) and
+/// the live-spawn path (`app::pane_factory`). Returns the redirected
+/// working directory (a freshly-created worktree path) when the instance wants
+/// one, or `None` to keep `resolved.working_directory` as-is.
+///
+/// The gate is the PERSISTED intent only:
+/// - [`wants_auto_worktree`] (the `worktree:false` veto + `source_repo` /
+///   `git_branch` opt-in signal).
+/// - the base dir must be a real git repo **that the operator/deploy explicitly
+///   pointed `working_directory` at** — the daemon-managed default
+///   `workspace_dir(home)/<name>` is NEVER auto-worktree'd.
+///
+/// That last clause kills the #1858 drift: `instructions::ensure_project_root`
+/// `git init`s the workspace dir tail-side of this decision, which used to flip
+/// the old `is_git_repo(base_dir)` gate between launch 1 (plain) and launch 2
+/// (worktree) — silently redirecting the dir into a worktree of the *empty,
+/// git-init'd workspace* (not the real `source_repo`) on every restart/reboot.
+/// Pinning the gate to "explicit non-default working_directory" makes the
+/// decision launch-idempotent: an agent that started plain stays plain, and an
+/// agent the operator pointed at a real repo (or a branch-mode deploy whose
+/// `working_directory` is already a repo) still gets its worktree.
+pub fn resolve_auto_worktree(
+    home: &Path,
+    name: &str,
+    resolved: &crate::fleet::ResolvedInstance,
+) -> Option<PathBuf> {
+    if !wants_auto_worktree(resolved) {
+        return None;
+    }
+    let base_dir = resolved.working_directory.as_ref()?;
+    // #1858: the daemon-managed default workspace dir is never a legitimate
+    // worktree source — it only becomes a "repo" via ensure_project_root's
+    // git-init. Skip it regardless of is_git_repo so the decision can't drift
+    // across launches.
+    if *base_dir == crate::paths::workspace_dir(home).join(name) {
+        return None;
+    }
+    if !is_git_repo(base_dir) {
+        return None;
+    }
+    create(home, base_dir, name, resolved.git_branch.as_deref()).map(|info| info.path)
+}
+
 /// Run `git worktree prune` on a repo to clean stale worktree entries.
 pub fn prune(repo_dir: &Path) {
     if !is_git_repo(repo_dir) {
@@ -770,5 +826,75 @@ mod tests {
 
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&repo).ok();
+    }
+
+    fn mk_resolved(
+        working_directory: PathBuf,
+        source_repo: Option<PathBuf>,
+        git_branch: Option<String>,
+        worktree: Option<bool>,
+    ) -> crate::fleet::ResolvedInstance {
+        crate::fleet::ResolvedInstance {
+            name: "agent".into(),
+            backend_command: "claude".into(),
+            args: vec![],
+            env: std::collections::HashMap::new(),
+            working_directory: Some(working_directory),
+            ready_pattern: None,
+            submit_key: "\r".into(),
+            role: None,
+            cols: None,
+            rows: None,
+            topic_id: None,
+            git_branch,
+            model: None,
+            worktree,
+            instructions: None,
+            source_repo,
+            repo: None,
+        }
+    }
+
+    /// §3.9 (b)+(c) (#1858): the shared auto-worktree gate must (b) still create
+    /// a worktree for an EXPLICIT real-repo `working_directory` + `source_repo`
+    /// (no over-kill of legitimate opt-in), and (c) SKIP the daemon-managed
+    /// default `workspace/<name>` dir even when it has been git-init'd and
+    /// `source_repo` is set (the deploy non-branch shape — `deployments.rs`
+    /// writes exactly `source_repo` + a `workspace/<name>` working_directory).
+    #[test]
+    fn resolve_auto_worktree_skips_workspace_default_allows_explicit_repo_1858() {
+        // (b) explicit real repo as working_directory → worktree still created.
+        let home_b = tmp_repo("1858-b-home");
+        let repo = tmp_repo("1858-b-repo");
+        let resolved_b = mk_resolved(repo.clone(), Some(repo.clone()), None, None);
+        let got_b = resolve_auto_worktree(&home_b, "agent", &resolved_b);
+        assert!(
+            got_b
+                .as_ref()
+                .is_some_and(|p| p.to_string_lossy().contains("worktrees")),
+            "#1858 (b): explicit real-repo working_directory must still auto-worktree, got {got_b:?}"
+        );
+
+        // (c) deploy non-branch shape: source_repo set + working_directory is the
+        // default workspace dir (even git-init'd) → NO worktree.
+        let home_c = tmp_repo("1858-c-home");
+        let work_dir = crate::paths::workspace_dir(&home_c).join("team-dev");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        std::process::Command::new("git")
+            .env("AGEND_GIT_BYPASS", "1")
+            .args(["init", "-b", "main"])
+            .current_dir(&work_dir)
+            .output()
+            .ok();
+        assert!(is_git_repo(&work_dir), "fixture: workspace dir git-init'd");
+        let resolved_c = mk_resolved(work_dir.clone(), Some(home_c.join("realrepo")), None, None);
+        assert!(
+            resolve_auto_worktree(&home_c, "team-dev", &resolved_c).is_none(),
+            "#1858 (c): deploy non-branch (source_repo + default workspace dir) must not auto-worktree"
+        );
+
+        for d in [home_b, repo, home_c] {
+            std::fs::remove_dir_all(&d).ok();
+        }
     }
 }
