@@ -222,6 +222,20 @@ impl DedupCache {
         true
     }
 
+    /// HIGH-2: roll back a [`record_and_check`] claim — remove `key` if present
+    /// (no-op otherwise). Used when the send that the claim guarded ultimately
+    /// FAILED: leaving the key recorded would suppress a legitimate retry of the
+    /// same content within the TTL (returning a synthesized success that gets
+    /// mis-recorded as delivered). Recording stays BEFORE the send so the RC2
+    /// race against a concurrent duplicate is still caught atomically; only a
+    /// terminal failure evicts. A SUCCESSFUL send keeps its key.
+    pub fn evict(&self, key: &DedupKey) {
+        let mut entries = self.entries.lock();
+        if let Some(pos) = entries.iter().position(|e| &e.key == key) {
+            entries.remove(pos);
+        }
+    }
+
     /// Total suppressions observed for the lifetime of this cache.
     /// Surfaced via doctor / debug — operator-visible health signal.
     pub fn suppressed_count(&self) -> u64 {
@@ -313,6 +327,37 @@ mod tests {
         clock.advance(Duration::from_secs(6));
         assert!(cache.record_and_check(k.clone()), "post-TTL: fresh again");
         assert_eq!(cache.suppressed_count(), 1, "counter still 1");
+    }
+
+    /// HIGH-2: `evict` rolls back a claim so a retry-after-failure isn't
+    /// suppressed, while a NON-evicted claim (the success path) stays deduped —
+    /// preserving the RC2 guarantee. Calls are immediate (< the 5s TTL).
+    #[test]
+    fn evict_rolls_back_claim_but_kept_claim_stays_deduped_high2() {
+        let cache = DedupCache::new(5, Box::new(SystemClock));
+        let k = key("agent-A", Some(42), "hello");
+
+        // RC2 preserved: a kept claim (the success path) still suppresses a dup.
+        assert!(cache.record_and_check(k.clone()), "first: fresh");
+        assert!(
+            !cache.record_and_check(k.clone()),
+            "duplicate of a kept claim must be suppressed (RC2)"
+        );
+
+        // The failed-send rollback un-blocks a retry of the same key.
+        cache.evict(&k);
+        assert!(
+            cache.record_and_check(k.clone()),
+            "after evict, a retry must NOT be suppressed"
+        );
+
+        // Evicting an absent key is a harmless no-op.
+        let other = key("agent-A", Some(42), "different");
+        cache.evict(&other);
+        assert!(
+            cache.record_and_check(other),
+            "absent-key evict must not corrupt the cache"
+        );
     }
 
     /// T2: LRU eviction — insert MAX_ENTRIES + 1 distinct keys; assert
