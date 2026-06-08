@@ -82,6 +82,17 @@ pub(crate) fn scan_and_emit_with<F>(
     // (reviewer, branch) forever — a slow leak, since `.get`/`.insert` were the
     // only ops and the dedup windows suppress but never evict.
     let mut active: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    // #1859 reviewer-2: collapse same-scan re-nudge fan-out to TARGET granularity.
+    // The re-nudge pointer is target-level (handoff-agnostic — it just wakes the
+    // agent to drain its inbox), so a target holding K≥2 simultaneously-unread
+    // handoffs needs ONE inject, not K. Without this the per-`(target,corr)`
+    // interval gate fires once per handoff in a single scan, and since the
+    // busy-gate reads a per-tick snapshot (constant within the scan) injects #2..K
+    // lose busy protection — a storm exactly on the headline beneficiary (a
+    // multi-branch orchestrator-as-next_after_ci). The per-key `last_renudged`
+    // still governs the cross-tick interval.
+    let mut renudged_this_scan: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     for target in fleet.instances.keys() {
         for (correlation, sent_at) in crate::inbox::unread_of_kind(home, target, HANDOFF_KIND) {
             let age_min = now.signed_duration_since(sent_at).num_minutes();
@@ -105,9 +116,15 @@ pub(crate) fn scan_and_emit_with<F>(
                     now.signed_duration_since(*prev).num_minutes() >= RENUDGE_INTERVAL_MINS
                 });
                 if due {
-                    let (unread, _) = crate::inbox::unread_count(home, target);
-                    renudge(target, unread);
+                    // Stamp EVERY due key (per-key cross-tick interval honesty —
+                    // so a collapsed key isn't treated as never-nudged next scan,
+                    // which would let the target re-fire inside the interval).
                     last_renudged.insert(key.clone(), *now);
+                    // ...but inject at most ONCE per target per scan.
+                    if renudged_this_scan.insert(target.clone()) {
+                        let (unread, _) = crate::inbox::unread_count(home, target);
+                        renudge(target, unread);
+                    }
                 }
             }
 
@@ -465,6 +482,32 @@ mod tests {
             renudged.is_empty(),
             "last_renudged must be reaped once the handoff is read: {:?}",
             renudged.keys().collect::<Vec<_>>()
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// #1859 reviewer-2 (lens 5): a target holding K≥2 simultaneously-unread
+    /// ci-ready handoffs (distinct corr) must get AT MOST ONE re-nudge per scan
+    /// — the wake pointer is target-level. Pre-fix the per-`(target,corr)` gate
+    /// fired once per handoff (K injects; #2..K bypassed the per-tick busy
+    /// snapshot). This is the storm-on-the-orchestrator case.
+    #[test]
+    fn multiple_unread_handoffs_collapse_to_one_renudge_per_scan() {
+        let home = tmp_home("multi-handoff");
+        write_fleet(&home);
+        seed_handoff(&home, "reviewer", "o/r@feat-a", 15, false);
+        seed_handoff(&home, "reviewer", "o/r@feat-b", 15, false);
+        seed_snapshot(&home, "reviewer", "idle");
+        let nudged = run_watchdog(
+            &home,
+            &chrono::Utc::now(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+        );
+        let count = nudged.iter().filter(|t| t.as_str() == "reviewer").count();
+        assert_eq!(
+            count, 1,
+            "2 unread handoffs for one idle target must collapse to a single re-nudge: {nudged:?}"
         );
         std::fs::remove_dir_all(home).ok();
     }
