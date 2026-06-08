@@ -2520,6 +2520,56 @@ fn fn_red_truecolor_fragmented_fires() {
     assert_eq!(st.get_state(), AgentState::ServerRateLimit);
 }
 
+// ── #1808/#1809 NARROW-pane soft-wrap regression ────────────────────
+
+/// #1808/#1809 NAMED REGRESSION (live repro 2026-06-08, fixup-dev + dev-2,
+/// BOTH in narrow split panes) — would FAIL before the de-wrap fix.
+///
+/// In a NARROW pane alacritty soft-wraps the long SRL line across several
+/// physical grid rows. The detection feed (`tail_lines_with_fg` → the
+/// `feed_with_fg` ingress) used to join EVERY physical row with `\n`,
+/// inserting `\n` MID-PHRASE ("Server is\ntemporarily\nlimiting\nrequests").
+/// The single-line SRL regex (backend_profile.rs) then failed to match across
+/// the `\n` → `detect_with_match` returned None → ServerRateLimit never
+/// latched → no auto-retry → the agent hung. WIDE panes (lead) kept the phrase
+/// on one physical row → matched → recovered: the lead-vs-worker asymmetry
+/// that mystified the whole session. The fix de-wraps soft-wrapped rows
+/// (WRAPLINE-aware) before the regex sees them. Drives the REAL vterm →
+/// `tail_lines_with_fg` → `feed_with_fg` entry (§3.9 — not a hand-fed `\n`
+/// string), at a width that forces alacritty to soft-wrap.
+#[test]
+fn regression_1808_narrow_pane_wrapped_srl_latches() {
+    // 25 cols: "Server is temporarily limiting requests" (39 chars) cannot fit
+    // on one physical row → alacritty soft-wraps the phrase across rows.
+    let mut vt = VTerm::new(25, 24);
+    let mut st = StateTracker::new(Some(&Backend::ClaudeCode));
+    // Render RED like the real Ink error (vterm resolves the SGR off the grid).
+    drive_colored_line(&mut vt, &mut st, RED_16, SRL_LINE);
+    assert_eq!(
+        st.get_state(),
+        AgentState::ServerRateLimit,
+        "#1808: a soft-wrapped SRL line in a narrow pane must latch ServerRateLimit \
+         (pre-fix: physical-row `\\n` joins split the phrase → single-line regex \
+         missed → no detection → autopilot hang)"
+    );
+}
+
+/// #1808 companion — the SAME narrow-pane wrapped SRL line rendered PLAIN
+/// (no red) must ALSO latch via the content-anchor (`in_error_line` sees the
+/// de-wrapped "API Error:" line). Proves the de-wrap — not the color — is what
+/// restores detection, and that the content path survives de-wrap.
+#[test]
+fn regression_1808_narrow_pane_wrapped_srl_plain_content_anchor() {
+    let mut vt = VTerm::new(25, 24);
+    let mut st = StateTracker::new(Some(&Backend::ClaudeCode));
+    drive_plain_line(&mut vt, &mut st, SRL_LINE);
+    assert_eq!(
+        st.get_state(),
+        AgentState::ServerRateLimit,
+        "#1808: de-wrapped SRL line still qualifies via in_error_line content anchor"
+    );
+}
+
 /// #1450 NAMED REGRESSION — would FAIL before the fix.
 ///
 /// Pre-#1450 the raw-byte anchor allow-list knew only 4 sixteen-color
