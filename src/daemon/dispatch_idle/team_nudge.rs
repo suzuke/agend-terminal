@@ -109,11 +109,18 @@ fn emit_nudge(home: &Path, d: &PendingDispatch, team: &str) -> bool {
                 .num_seconds()
         })
         .unwrap_or(0);
-    // Per-team label so the operator sees which team's dispatch stalled.
+    // #1866: informational tone, not an alarm. This fires once per dispatch
+    // (deduped by `nudge_sent_at`) and only after the state-aware gate
+    // (`target_is_working` + `set_waiting_on`) failed to detect activity, so it
+    // is a gentle check-in, NOT a "you're stuck" page. An agent legitimately
+    // heads-down (e.g. waiting on its own long build/CI) can ignore it and keep
+    // working, or call `set_waiting_on(<reason>)` to suppress future nudges while
+    // blocked. Per-team label so the operator sees which team's dispatch is quiet.
     let text = format!(
-        "[{team}-watchdog] dispatched by '{dispatcher}' {elapsed}s ago \
-         (threshold {threshold_secs}s, correlation_id={corr}). \
-         Please status: BUSY / progress / VERIFIED-if-ready.",
+        "[{team}-watchdog] FYI: '{dispatcher}' dispatch has been quiet {elapsed}s \
+         (threshold {threshold_secs}s, correlation_id={corr}). No action needed if \
+         you're mid-task — a status (BUSY / progress / VERIFIED-if-ready) or \
+         set_waiting_on(<reason>) keeps the board accurate.",
         team = team,
         dispatcher = d.dispatcher,
         elapsed = elapsed,

@@ -253,6 +253,41 @@ pub(crate) fn record_dispatch(
     if crate::store::atomic_write(&pending_path(home, &dispatch_id), body.as_bytes()).is_err() {
         return None;
     }
+    // #1866 (b) clear-on-handoff: a NEW dispatch for the same (dispatcher, target)
+    // means any EARLIER still-armed dispatch from that dispatcher to this target is
+    // a stale hand-off — the agent has been re-tasked, so its old idle timer must
+    // not keep nudging for work that's been superseded (#1861 class: dev pushed the
+    // PR + moved on, the old dispatch still fired). Retire those sidecars now.
+    // Boundary (avoid clobbering a genuinely-parallel dispatch): SAME dispatcher +
+    // strictly OLDER `issued_at` + a DIFFERENT `correlation_id`. Gated on the new
+    // dispatch carrying a `correlation_id` — without one we can't tell dispatches
+    // apart (same guard as the in-place dedup above).
+    if let (Some(new_corr), Ok(new_dt)) = (
+        correlation_id,
+        chrono::DateTime::parse_from_rfc3339(&payload.issued_at),
+    ) {
+        for stale in list_pending(home).into_iter().filter(|d| {
+            matches!(d.status, DispatchStatus::Pending | DispatchStatus::Exceeded)
+                && d.dispatcher == dispatcher
+                && d.target == target
+                && d.dispatch_id != dispatch_id
+                && d.correlation_id.as_deref() != Some(new_corr)
+                && chrono::DateTime::parse_from_rfc3339(&d.issued_at)
+                    .map(|t| t < new_dt)
+                    .unwrap_or(false)
+        }) {
+            if delete_sidecar_locked(home, &stale.dispatch_id) {
+                tracing::debug!(
+                    target: "dispatch_idle",
+                    dispatch_id = %stale.dispatch_id,
+                    target = %target,
+                    superseded_by = %dispatch_id,
+                    old_correlation_id = ?stale.correlation_id,
+                    "#1866 retired stale dispatch sidecar — target re-dispatched"
+                );
+            }
+        }
+    }
     Some(dispatch_id)
 }
 
@@ -610,7 +645,7 @@ fn target_is_working(
     target: &str,
     silence_threshold_secs: i64,
 ) -> bool {
-    snapshot
+    let snapshot_working = snapshot
         .and_then(|s| s.agents.iter().find(|a| a.name == target))
         .map(|a| {
             // Working = instantaneous-working state OR active-recovery OR
@@ -630,7 +665,26 @@ fn target_is_working(
                 "thinking" | "tool_use" | "server_rate_limit"
             ) || a.silent_secs < silence_threshold_secs
         })
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if snapshot_working {
+        return true;
+    }
+    // #1866 (a) state-aware: ALSO suppress on the per-agent in-mem activity
+    // timestamps (`heartbeat_pair`, zero-lock, no file read). The snapshot gate
+    // above misses an agent that is engaged via the DAEMON but quiet on the pane:
+    // - `heartbeat_at_ms` advances on the target's MCP activity (send / inbox /
+    //   task / report …) — heads-down inter-agent work the pane doesn't mark.
+    // - `last_input_at_ms` advances when the target is freshly handed input —
+    //   someone is actively interacting, so a "you've gone silent?" nudge is noise.
+    // Recency window = the dispatch threshold. Stale fields (0 / never set /
+    // restart-reset) → a huge delta → NO suppress, so this only ever ADDS
+    // suppression for provably-recent activity and never hides a real stuck: a
+    // wedged agent makes no MCP calls and gets no input → both stale → still fires.
+    let hb = crate::daemon::heartbeat_pair::snapshot_for(target);
+    let now = crate::daemon::heartbeat_pair::now_ms();
+    let window_ms = (silence_threshold_secs.max(0) as u64).saturating_mul(1000);
+    now.saturating_sub(hb.heartbeat_at_ms) < window_ms
+        || now.saturating_sub(hb.last_input_at_ms) < window_ms
 }
 
 /// #absorb-blocked: does `target` have an ACTIVE `waiting_on` — i.e. it called
@@ -1132,6 +1186,140 @@ mod tests {
         assert_eq!(
             dups, 1,
             "exactly ONE sidecar for the re-dispatched correlation"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// §3.9 #1866 (b) clear-on-handoff: re-dispatching the SAME (dispatcher,
+    /// target) to a NEW task (different correlation_id) retires the older still-
+    /// armed sidecar (the #1861 stale-handoff false-nudge), but must NOT clobber
+    /// a different dispatcher's parallel dispatch or a newer sidecar.
+    #[test]
+    fn record_dispatch_retires_stale_handoff_sidecar_1866() {
+        let home = tmp_home("retire-handoff");
+        let now = chrono::Utc::now();
+        let older = now - chrono::Duration::seconds(700);
+        // OLD dispatch (task A) lead→dev — still Pending (the stale handoff).
+        let old_a = write_pending_at(&home, "lead", "dev", Some("t-A"), "task", 600, older);
+        // A DIFFERENT dispatcher's parallel dispatch to dev — must survive.
+        let parallel = write_pending_at(&home, "lead2", "dev", Some("t-A2"), "task", 600, older);
+        // A NEWER lead→dev sidecar (issued after the re-dispatch) — must survive
+        // (the "strictly older" boundary).
+        let newer = write_pending_at(
+            &home,
+            "lead",
+            "dev",
+            Some("t-future"),
+            "task",
+            600,
+            now + chrono::Duration::seconds(60),
+        );
+
+        // Re-dispatch dev to a NEW task B via the real entry point.
+        let new_b = record_dispatch(&home, "lead", "dev", Some("t-B"), "task", 600)
+            .expect("new dispatch recorded");
+
+        let ids: Vec<String> = list_pending(&home)
+            .into_iter()
+            .map(|d| d.dispatch_id)
+            .collect();
+        assert!(
+            !ids.contains(&old_a),
+            "#1866 (b): the stale same-(dispatcher,target) older sidecar (task A) must be retired"
+        );
+        assert!(ids.contains(&new_b), "the new dispatch sidecar must exist");
+        assert!(
+            ids.contains(&parallel),
+            "#1866 (b): a DIFFERENT dispatcher's dispatch must NOT be retired"
+        );
+        assert!(
+            ids.contains(&newer),
+            "#1866 (b): a NEWER sidecar must NOT be retired (older-only boundary)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// §3.9 #1866 (a) state-aware: an overdue dispatch whose target has RECENT
+    /// in-mem activity (heartbeat_at_ms advanced) is SUPPRESSED — past the
+    /// wall-clock threshold it stays Pending instead of firing.
+    #[test]
+    fn scan_suppresses_on_recent_heartbeat_1866() {
+        let home = tmp_home("stateaware-hb");
+        // Unique target → isolated process-global heartbeat_pair entry.
+        let target = "dev-1866-hb";
+        let id = write_pending_at(
+            &home,
+            "lead",
+            target,
+            Some("t-hb"),
+            "task",
+            600,
+            chrono::Utc::now() - chrono::Duration::seconds(700),
+        );
+        // Target made MCP activity just now (heads-down inter-agent work).
+        crate::daemon::heartbeat_pair::update_with(target, |p| {
+            p.heartbeat_at_ms = crate::daemon::heartbeat_pair::now_ms();
+        });
+
+        scan_and_emit(&home);
+
+        let d = list_pending(&home)
+            .into_iter()
+            .find(|d| d.dispatch_id == id)
+            .expect("sidecar must still exist (suppressed, not swept)");
+        assert_eq!(
+            d.status,
+            DispatchStatus::Pending,
+            "#1866 (a): recent heartbeat must suppress the nudge despite the wall-clock threshold"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// §3.9 #1866 (a) the OTHER half: a fully-idle target (no recent heartbeat /
+    /// input, no pane activity) past threshold STILL fires — the new signals only
+    /// ADD suppression for provably-recent activity, never hide a real stuck.
+    #[test]
+    fn scan_still_fires_when_target_fully_idle_1866() {
+        let home = tmp_home("stateaware-idle");
+        let target = "dev-1866-idle"; // unique → stale (0) heartbeat_pair
+                                      // Live fleet + task so the sidecar isn't swept as stale before it fires.
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            format!("instances:\n  {target}:\n    backend: claude\n"),
+        )
+        .unwrap();
+        let task_id = "t-idle-99";
+        let tasks_dir = home.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        std::fs::write(
+            tasks_dir.join(format!("{task_id}.json")),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "id": task_id, "status": "in_progress", "title": "w", "assignee": target
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let id = write_pending_at(
+            &home,
+            "lead",
+            target,
+            Some(task_id),
+            "task",
+            600,
+            chrono::Utc::now() - chrono::Duration::seconds(700),
+        );
+        // NO heartbeat / input set → all activity signals stale → truly idle.
+
+        scan_and_emit(&home);
+
+        let d = list_pending(&home)
+            .into_iter()
+            .find(|d| d.dispatch_id == id)
+            .expect("sidecar present");
+        assert_eq!(
+            d.status,
+            DispatchStatus::Exceeded,
+            "#1866 (a): a fully-idle target (all activity signals stale) must STILL fire"
         );
         std::fs::remove_dir_all(&home).ok();
     }
