@@ -283,13 +283,39 @@ fn persist_to_fleet_yaml(
     })
 }
 
+/// MED-2 (re-marshal allowlist-drop): the binary deploy's Phase-3 SPAWN should
+/// run for `inst_name`. The SPAWN handler runs `params["backend"]` AS the
+/// command, and a template's `command:` override is persisted to fleet.yaml in
+/// Phase 2 (before Phase 3), so resolve via `FleetConfig` —
+/// `resolved.backend_command` honors `command:` over the `backend:` preset,
+/// mirroring every sibling spawn path (start/restart/replace/cold-boot). The
+/// pre-fix code passed raw `entry.backend`, silently ignoring `command:` and
+/// spawning the preset binary on first deploy. Falls back to `entry.backend`
+/// (then `"claude"`) only if the entry can't be resolved.
+fn resolve_spawn_backend(
+    home: &Path,
+    inst_name: &str,
+    entry: &crate::fleet::InstanceYamlEntry,
+) -> String {
+    crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+        .ok()
+        .and_then(|c| c.resolve_instance(inst_name))
+        .map(|r| r.backend_command)
+        .unwrap_or_else(|| {
+            entry
+                .backend
+                .clone()
+                .unwrap_or_else(|| "claude".to_string())
+        })
+}
+
 fn spawn_instances(
     home: &Path,
     yaml_entries: &[(String, crate::fleet::InstanceYamlEntry)],
     directory: &str,
 ) {
     for (inst_name, entry) in yaml_entries {
-        let backend_name = entry.backend.as_deref().unwrap_or("claude");
+        let backend_name = resolve_spawn_backend(home, inst_name, entry);
         let work_dir = entry.working_directory.as_deref().unwrap_or(directory);
         let mut params = serde_json::json!({
             "name": inst_name,
@@ -733,6 +759,42 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).ok();
         dir
+    }
+
+    /// §3.9 (MED-2): the binary deploy's Phase-3 SPAWN must run a template's
+    /// `command:` override, not the `backend:` preset. `resolve_spawn_backend`
+    /// (which feeds `params["backend"]`, run AS the command by the SPAWN handler)
+    /// must return the `command:` for an entry that declares one. Regression-proof:
+    /// revert to raw `entry.backend` and the override assertion fails ("claude").
+    #[test]
+    fn resolve_spawn_backend_honors_command_override_med2() {
+        let home = tmp_home("med2-backend");
+        // The entries are persisted to fleet.yaml in Phase 2 before the spawn.
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  worker:\n    backend: claude\n    command: ./my-runner.sh\n",
+        )
+        .unwrap();
+        // `entry` is only the resolve-failure fallback; the fix resolves via fleet.yaml.
+        let entry = crate::fleet::InstanceYamlEntry {
+            backend: Some("claude".into()),
+            ..Default::default()
+        };
+
+        // Template `command:` override reaches the spawn binary (was: "claude").
+        assert_eq!(
+            resolve_spawn_backend(&home, "worker", &entry),
+            "./my-runner.sh",
+            "MED-2: a template `command:` override must reach the Phase-3 spawn"
+        );
+        // An entry absent from fleet.yaml falls back to its declared backend.
+        assert_eq!(
+            resolve_spawn_backend(&home, "ghost", &entry),
+            "claude",
+            "fallback to entry.backend when the instance can't be resolved"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
