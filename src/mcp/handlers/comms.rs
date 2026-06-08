@@ -299,21 +299,15 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
                 "dispatch_auto_bind_lease skipped (bind: false)"
             );
         } else {
-            let repo_arg = args["repository"].as_str();
-            let next_after_ci_arg = args["next_after_ci"].as_str();
-            // #1877: thread the dual-review directive to the auto-armed watch. A
-            // `second_reviewer=true` dispatch (validated above) must arm a
-            // `review_class=dual` watch; without this the flag was accepted +
-            // validated then silently dropped (CI gated single review).
-            let review_class_arg = if second_reviewer { Some("dual") } else { None };
+            // #1877: second_reviewer → review_class="dual" on the auto-armed watch.
             if let Err(e) = super::dispatch_hook::dispatch_auto_bind_lease_with_chain(
                 home,
                 target,
                 task_id_val,
                 branch,
-                repo_arg,
-                next_after_ci_arg,
-                review_class_arg,
+                args["repository"].as_str(),
+                args["next_after_ci"].as_str(),
+                if second_reviewer { Some("dual") } else { None },
             ) {
                 return json!({"ok": false, "error": format!("dispatch rejected: {e}")});
             }
