@@ -44,15 +44,30 @@ pub(crate) fn register_topic(
     topic_id: i32,
     instance_name: &str,
 ) -> anyhow::Result<()> {
-    let mut reg = load_topic_registry(home);
-    reg.insert(topic_id, instance_name.to_string());
-    save_topic_registry(home, &reg)
+    // #1886 C1: locked read-modify-write — the flock spans load→insert→save so
+    // two concurrent registrations (e.g. team-spawn registering N members) can't
+    // each read the same map and clobber the other's insert. Operate on the
+    // on-disk `topic_id-string → name` form (matches save_topic_registry) so the
+    // round-trip is byte-identical to the prior load/save helpers.
+    crate::store::with_json_state_or_create::<HashMap<String, String>, _, _, _>(
+        &topic_registry_path(home),
+        HashMap::new,
+        |reg| {
+            reg.insert(topic_id.to_string(), instance_name.to_string());
+        },
+    )?;
+    Ok(())
 }
 
 pub(crate) fn unregister_topic(home: &Path, topic_id: i32) {
-    let mut reg = load_topic_registry(home);
-    reg.remove(&topic_id);
-    let _ = save_topic_registry(home, &reg);
+    // #1886 C1: same locked-RMW discipline as register_topic.
+    let _ = crate::store::with_json_state_or_create::<HashMap<String, String>, _, _, _>(
+        &topic_registry_path(home),
+        HashMap::new,
+        |reg| {
+            reg.remove(&topic_id.to_string());
+        },
+    );
 }
 
 /// Reverse-lookup a topic_id for an instance from `topics.json`.
@@ -226,6 +241,55 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).ok();
         dir
+    }
+
+    #[test]
+    fn concurrent_register_topic_no_lost_update_1886() {
+        // #1886 C1 §3.9: N threads each register a DISTINCT topic on the same
+        // topics.json. The locked RMW (flock spans load→insert→save) keeps
+        // every mapping; the prior unlocked load+save would clobber updates
+        // under contention.
+        let home = tmp_home("concurrent-register-1886");
+        const N: i32 = 12;
+        let handles: Vec<_> = (0..N)
+            .map(|i| {
+                let home = home.clone();
+                std::thread::spawn(move || {
+                    register_topic(&home, i, &format!("inst-{i}")).unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let reg = load_topic_registry(&home);
+        assert_eq!(
+            reg.len(),
+            N as usize,
+            "every concurrent registration must survive"
+        );
+        for i in 0..N {
+            assert_eq!(
+                reg.get(&i).map(String::as_str),
+                Some(format!("inst-{i}").as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn register_unregister_rmw_preserves_other_entries_1886() {
+        // #1886 C1: register reloads the on-disk map under the lock and ADDS to
+        // it (not a blind overwrite); unregister removes one and leaves the rest.
+        let home = tmp_home("register-preserve-1886");
+        register_topic(&home, 1, "alpha").unwrap();
+        register_topic(&home, 2, "beta").unwrap();
+        let reg = load_topic_registry(&home);
+        assert_eq!(reg.get(&1).map(String::as_str), Some("alpha"));
+        assert_eq!(reg.get(&2).map(String::as_str), Some("beta"));
+        unregister_topic(&home, 1);
+        let reg = load_topic_registry(&home);
+        assert_eq!(reg.get(&1), None);
+        assert_eq!(reg.get(&2).map(String::as_str), Some("beta"));
     }
 
     #[test]
