@@ -1451,6 +1451,7 @@ fn dispatch_auto_bind_lease_sets_next_after_ci_from_dispatch_hook_931() {
         "feat/931-h5a-chain",
         None,
         Some("reviewer"),
+        None,
     );
     assert!(
         r.is_ok(),
@@ -1472,6 +1473,101 @@ fn dispatch_auto_bind_lease_sets_next_after_ci_from_dispatch_hook_931() {
         "#931 Fix 2 (H5a) GREEN: dispatch chain MUST propagate next_after_ci into auto-armed watch JSON. Got: {watch}"
     );
 
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+/// #1877 §3.9 + regression guard: EVERY MCP-accepted dispatch directive must
+/// reach the auto-armed watch together. This re-marshal-drop class has recurred
+/// 4× — #931 (next_after_ci), #1031 (task_id), #1877 (review_class from a
+/// `second_reviewer=true` dispatch). One dispatch carrying all three pins that
+/// none is silently dropped in the `watch_args` re-marshal.
+#[test]
+#[cfg(unix)]
+fn all_dispatch_directives_reach_armed_watch_1877() {
+    let parent = std::env::temp_dir().join(format!(
+        "agend-1877-all-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let (home, _canonical) =
+        p781_canonical_with_team_source_repo(&parent, "feat/1877-all", true, "val", &["val-dev"]);
+    let r = super::dispatch_auto_bind_lease_with_chain(
+        &home,
+        "val-dev",
+        "T-1877-all",
+        "feat/1877-all",
+        None,
+        Some("reviewer"),
+        Some("dual"),
+    );
+    assert!(r.is_ok(), "dispatch must succeed: {:?}", r.err());
+    let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(
+        crate::daemon::ci_watch::watch_filename("owner/repo", "feat/1877-all"),
+    );
+    let watch: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&watch_path).expect("read watch"))
+            .expect("parse watch");
+    assert_eq!(
+        watch["next_after_ci"].as_str(),
+        Some("reviewer"),
+        "#931: next_after_ci dropped from armed watch. Got: {watch}"
+    );
+    assert_eq!(
+        watch["task_id"].as_str(),
+        Some("T-1877-all"),
+        "#1031: task_id dropped from armed watch. Got: {watch}"
+    );
+    assert_eq!(
+        watch["review_class"].as_str(),
+        Some("dual"),
+        "#1877: review_class (dual-review directive) dropped from armed watch. Got: {watch}"
+    );
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+/// #1877 §3.9: a normal dispatch (no second_reviewer → `review_class=None`) must
+/// NOT over-upgrade — the armed watch leaves `review_class` unset (single).
+#[test]
+#[cfg(unix)]
+fn dispatch_without_review_class_stays_single_1877() {
+    let parent = std::env::temp_dir().join(format!(
+        "agend-1877-single-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let (home, _canonical) = p781_canonical_with_team_source_repo(
+        &parent,
+        "feat/1877-single",
+        true,
+        "val",
+        &["val-dev"],
+    );
+    let r = super::dispatch_auto_bind_lease_with_chain(
+        &home,
+        "val-dev",
+        "T-1877s",
+        "feat/1877-single",
+        None,
+        Some("reviewer"),
+        None,
+    );
+    assert!(r.is_ok(), "dispatch must succeed: {:?}", r.err());
+    let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(
+        crate::daemon::ci_watch::watch_filename("owner/repo", "feat/1877-single"),
+    );
+    let watch: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&watch_path).expect("read watch"))
+            .expect("parse watch");
+    assert!(
+        watch["review_class"].is_null(),
+        "#1877: a normal dispatch must NOT over-upgrade to dual (review_class unset). Got: {watch}"
+    );
     std::fs::remove_dir_all(&parent).ok();
 }
 
@@ -1511,6 +1607,7 @@ fn dispatch_persists_task_id_into_ci_watch_sidecar_1031() {
         "feat/1031-persist",
         None,
         Some("val-reviewer"),
+        None,
     );
     assert!(r.is_ok(), "dispatch must succeed: {:?}", r.err());
 
@@ -1569,6 +1666,7 @@ fn dispatch_no_longer_auto_derives_next_after_ci_pr2() {
         "feat/1037-auto-derive",
         None,
         None, // ← no explicit next_after_ci — the field this test pins.
+        None,
     );
     assert!(
         r.is_ok(),
@@ -1636,6 +1734,7 @@ fn dispatch_auto_derive_no_reviewer_in_team_leaves_next_after_ci_none_1037() {
         "feat/1037-no-reviewer",
         None,
         None,
+        None,
     );
     assert!(r.is_ok(), "dispatch must succeed: {:?}", r.err());
 
@@ -1685,6 +1784,7 @@ fn dispatch_explicit_next_after_ci_overrides_auto_derive_1037() {
         "feat/1037-override",
         None,
         Some("val-lead"),
+        None,
     );
     assert!(r.is_ok(), "dispatch must succeed: {:?}", r.err());
 

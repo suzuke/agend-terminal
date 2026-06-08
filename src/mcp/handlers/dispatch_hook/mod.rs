@@ -220,7 +220,9 @@ pub(crate) fn dispatch_auto_bind_lease(
     branch: &str,
     repo: Option<&str>,
 ) -> Result<DispatchOutcome, DispatchError> {
-    dispatch_auto_bind_lease_with_source_and_chain(home, target, task_id, branch, repo, None, None)
+    dispatch_auto_bind_lease_with_source_and_chain(
+        home, target, task_id, branch, repo, None, None, None,
+    )
 }
 
 /// #931 Fix 2 (H5a): variant that propagates `next_after_ci` so the
@@ -251,6 +253,8 @@ pub(crate) fn dispatch_auto_bind_lease_with_chain(
     branch: &str,
     repo: Option<&str>,
     next_after_ci: Option<&str>,
+    // #1877: dual-review directive ("dual" iff the dispatch set second_reviewer).
+    review_class: Option<&str>,
 ) -> Result<DispatchOutcome, DispatchError> {
     dispatch_auto_bind_lease_with_source_and_chain(
         home,
@@ -260,6 +264,7 @@ pub(crate) fn dispatch_auto_bind_lease_with_chain(
         repo,
         None,
         next_after_ci,
+        review_class,
     )
 }
 
@@ -294,6 +299,7 @@ pub(crate) fn dispatch_auto_bind_lease_with_source(
         repo,
         source_repo_override,
         None,
+        None,
     )
 }
 
@@ -316,6 +322,10 @@ fn auto_watch_arm_error(result: &serde_json::Value) -> Option<(&str, &str)> {
 /// All four convenience entry points (`dispatch_auto_bind_lease`,
 /// `_with_source`, `_with_chain`, this one) route through here so the
 /// auto-watch arming logic has a single source of truth.
+// #1877: the dispatch directives (repo/source/next_after_ci/review_class) are
+// each meaningful and threaded individually; a params struct would obscure the
+// call sites more than it'd help.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
     home: &Path,
     target: &str,
@@ -324,6 +334,11 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
     repo: Option<&str>,
     source_repo_override: Option<&Path>,
     next_after_ci: Option<&str>,
+    // #1877: `review_class` (e.g. "dual" from a `second_reviewer=true` dispatch)
+    // must reach the auto-armed watch — else the dual-review signal accepted at
+    // the MCP boundary (comms.rs) silently evaporates and CI gates single review.
+    // 4th re-marshal-drop of an MCP-accepted dispatch directive.
+    review_class: Option<&str>,
 ) -> Result<DispatchOutcome, DispatchError> {
     let _guard = BindGuard::try_acquire(home, target).map_err(|msg| DispatchError {
         message: msg,
@@ -529,6 +544,13 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
         // false-positive class on the verdict-reply side.
         if !task_id.is_empty() {
             watch_args["task_id"] = serde_json::json!(task_id);
+        }
+        // #1877: propagate the dual-review directive so a `second_reviewer=true`
+        // dispatch arms a `review_class=dual` watch (handle_watch_ci → ci/mod.rs
+        // stores it; the poller's `record_ci_result` then enforces dual review).
+        // Unset (normal dispatch) leaves the watch single — no over-upgrade.
+        if let Some(rc) = review_class.filter(|s| !s.is_empty()) {
+            watch_args["review_class"] = serde_json::json!(rc);
         }
         let watch_result = crate::mcp::handlers::ci::handle_watch_ci(home, &watch_args, target);
         // #1750 A1: `handle_watch_ci` returns `{"error":..,"code":..}` on a failed
