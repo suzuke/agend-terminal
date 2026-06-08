@@ -23,39 +23,98 @@ use std::path::Path;
 const HANDOFF_TIMEOUT_MINS: i64 = 10;
 /// Don't re-escalate the same (target, handoff) more often than this.
 const REALERT_AFTER_MINS: i64 = 30;
+/// #1859 Fix A: a handoff unread for at least this long (minutes) is RE-NUDGED to
+/// the target itself (daemon-side redelivery — earlier + cheaper than the 10-min
+/// lead escalation, and the only recovery when `next_after_ci` IS the orchestrator).
+const RENUDGE_AFTER_MINS: i64 = 2;
+/// #1859 Fix A: don't re-nudge the same (target, handoff) more often than this
+/// (anti-storm). Combined with the idle gate, a busy/working target is retried at
+/// most once per interval and a target that has read the handoff stops entirely.
+const RENUDGE_INTERVAL_MINS: i64 = 2;
 /// Fallback recipient when the target isn't in any team.
 const FALLBACK_RECIPIENT: &str = "lead";
 /// Inbox kind of a CI handoff message.
 const HANDOFF_KIND: &str = "ci-ready-for-action";
 
 /// Scan every fleet instance for `ci-ready-for-action` handoffs it received but
-/// never read, and escalate timed-out ones to the target's team lead.
-/// `last_escalated` (keyed by `(target, correlation)`) is owned by the caller
-/// so dedup survives across ticks; `now` is injected for deterministic tests.
+/// never read; (1) #1859: RE-NUDGE the target itself (daemon-side redelivery) and
+/// (2) escalate timed-out ones to the target's team lead. `last_escalated` /
+/// `last_renudged` (keyed by `(target, correlation)`) are owned by the caller so
+/// dedup survives across ticks; `now` is injected for deterministic tests.
 pub(crate) fn scan_and_emit(
     home: &Path,
     now: &chrono::DateTime<chrono::Utc>,
     last_escalated: &mut HashMap<(String, String), chrono::DateTime<chrono::Utc>>,
+    last_renudged: &mut HashMap<(String, String), chrono::DateTime<chrono::Utc>>,
 ) {
+    scan_and_emit_with(
+        home,
+        now,
+        last_escalated,
+        last_renudged,
+        |target, unread| {
+            crate::inbox::notify::renudge_actionable_unread(home, target, HANDOFF_KIND, unread);
+        },
+    );
+}
+
+/// Test-seam variant: `renudge` is the per-target re-nudge emitter (real path is
+/// the direct PTY inject; tests pass a capturing closure so the daemon API
+/// loopback isn't required). The busy/interval GATING lives here (not in the
+/// emitter) so a test driving the real `scan_and_emit_with` entry can assert
+/// exactly when a re-nudge fires.
+pub(crate) fn scan_and_emit_with<F>(
+    home: &Path,
+    now: &chrono::DateTime<chrono::Utc>,
+    last_escalated: &mut HashMap<(String, String), chrono::DateTime<chrono::Utc>>,
+    last_renudged: &mut HashMap<(String, String), chrono::DateTime<chrono::Utc>>,
+    mut renudge: F,
+) where
+    F: FnMut(&str, usize),
+{
     let Ok(fleet) = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)) else {
         return;
     };
     // #1598-mirror: collect every (target, correlation) key still backed by a
     // pending unread handoff this tick, so the trailing `retain` can reap
-    // `last_escalated` entries whose repo@branch handoff is no longer active
-    // (read/resolved). Without it the map grows one entry per timed-out
+    // `last_escalated` / `last_renudged` entries whose repo@branch handoff is no
+    // longer active (read/resolved). Without it the maps grow one entry per
     // (reviewer, branch) forever — a slow leak, since `.get`/`.insert` were the
-    // only ops and REALERT_AFTER_MINS suppresses but never evicts.
+    // only ops and the dedup windows suppress but never evict.
     let mut active: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
     for target in fleet.instances.keys() {
         for (correlation, sent_at) in crate::inbox::unread_of_kind(home, target, HANDOFF_KIND) {
             let age_min = now.signed_duration_since(sent_at).num_minutes();
-            if age_min < HANDOFF_TIMEOUT_MINS {
-                continue;
-            }
             let corr = correlation.unwrap_or_else(|| "<unknown>".to_string());
             let key = (target.clone(), corr.clone());
             active.insert(key.clone());
+
+            // (1) #1859 Fix A: daemon-side RE-NUDGE of the target itself. The
+            // poller's actionable `[ci-ready-for-action]` wake can be deferred
+            // (mid-token guard) into the `notification_queue`, whose only flush is
+            // the TUI loop — so a busy target's wake strands with no daemon-side
+            // redelivery (Scenario A). Re-fire it here, but ONLY when the target
+            // is idle (busy → skip; THIS watchdog tick is the retry loop, so no
+            // mid-token corruption and no queueing), and at most once per
+            // `RENUDGE_INTERVAL_MINS` (anti-storm). Stops automatically once the
+            // target reads the handoff (drops from the unread scan → reaped). This
+            // also covers the orchestrator-as-`next_after_ci` case below, where
+            // there is no lead to escalate to.
+            if age_min >= RENUDGE_AFTER_MINS && !crate::snapshot::agent_is_busy(home, target) {
+                let due = last_renudged.get(&key).is_none_or(|prev| {
+                    now.signed_duration_since(*prev).num_minutes() >= RENUDGE_INTERVAL_MINS
+                });
+                if due {
+                    let (unread, _) = crate::inbox::unread_count(home, target);
+                    renudge(target, unread);
+                    last_renudged.insert(key.clone(), *now);
+                }
+            }
+
+            // (2) Escalation to the target's lead (detection only; unchanged).
+            if age_min < HANDOFF_TIMEOUT_MINS {
+                continue;
+            }
             if let Some(prev) = last_escalated.get(&key) {
                 if now.signed_duration_since(*prev).num_minutes() < REALERT_AFTER_MINS {
                     continue;
@@ -64,6 +123,10 @@ pub(crate) fn scan_and_emit(
             let recipient = crate::fleet::team_orchestrator_for(home, target)
                 .unwrap_or_else(|| FALLBACK_RECIPIENT.to_string());
             if recipient == *target {
+                // #1859: `next_after_ci` IS the team orchestrator — there is no
+                // higher authority to escalate to. This is no longer a silent
+                // total-skip (the Scenario A bug): the re-nudge above already
+                // redelivers the handoff to the orchestrator itself.
                 continue;
             }
             let text = format!(
@@ -95,9 +158,10 @@ pub(crate) fn scan_and_emit(
         }
     }
     // Reap dedup entries for handoffs that are no longer pending (read/resolved
-    // → absent from this tick's unread scan), bounding the map to the set of
+    // → absent from this tick's unread scan), bounding the maps to the set of
     // currently-active handoffs.
     last_escalated.retain(|k, _| active.contains(k));
+    last_renudged.retain(|k, _| active.contains(k));
 }
 
 #[cfg(test)]
@@ -145,13 +209,46 @@ mod tests {
         crate::inbox::enqueue(home, target, msg).unwrap();
     }
 
+    /// Seed the per-tick snapshot so `agent_is_busy(home, agent)` is
+    /// controllable (`thinking`/`tool_use` = busy; anything else = idle).
+    fn seed_snapshot(home: &Path, agent: &str, state: &str) {
+        crate::snapshot::save(
+            home,
+            &[crate::snapshot::AgentSnapshot {
+                name: agent.to_string(),
+                backend_command: String::new(),
+                args: vec![],
+                working_dir: None,
+                submit_key: String::new(),
+                health_state: String::new(),
+                agent_state: state.to_string(),
+                silent_secs: 0,
+            }],
+        );
+    }
+
+    /// Real watchdog entry with the re-nudge emitter CAPTURED (so the daemon API
+    /// loopback isn't needed). Returns the targets that were re-nudged this scan.
+    fn run_watchdog(
+        home: &Path,
+        now: &chrono::DateTime<chrono::Utc>,
+        last_escalated: &mut HashMap<(String, String), chrono::DateTime<chrono::Utc>>,
+        last_renudged: &mut HashMap<(String, String), chrono::DateTime<chrono::Utc>>,
+    ) -> Vec<String> {
+        let mut nudged = Vec::new();
+        scan_and_emit_with(home, now, last_escalated, last_renudged, |t, _| {
+            nudged.push(t.to_string())
+        });
+        nudged
+    }
+
     #[test]
     fn escalates_unread_handoff_past_timeout() {
         let home = tmp_home("escalate");
         write_fleet(&home);
         seed_handoff(&home, "reviewer", "o/r@feat", 15, false);
         let mut last = HashMap::new();
-        scan_and_emit(&home, &chrono::Utc::now(), &mut last);
+        run_watchdog(&home, &chrono::Utc::now(), &mut last, &mut HashMap::new());
         let msgs = crate::inbox::drain(&home, "lead");
         assert!(
             msgs.iter()
@@ -170,7 +267,12 @@ mod tests {
         let home = tmp_home("fresh");
         write_fleet(&home);
         seed_handoff(&home, "reviewer", "o/r@feat", 3, false);
-        scan_and_emit(&home, &chrono::Utc::now(), &mut HashMap::new());
+        run_watchdog(
+            &home,
+            &chrono::Utc::now(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+        );
         assert!(
             crate::inbox::drain(&home, "lead").is_empty(),
             "a fresh handoff must not escalate"
@@ -179,7 +281,12 @@ mod tests {
         let home2 = tmp_home("read");
         write_fleet(&home2);
         seed_handoff(&home2, "reviewer", "o/r@feat", 30, true);
-        scan_and_emit(&home2, &chrono::Utc::now(), &mut HashMap::new());
+        run_watchdog(
+            &home2,
+            &chrono::Utc::now(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+        );
         assert!(
             crate::inbox::drain(&home2, "lead").is_empty(),
             "a read handoff means the reviewer acted — no escalation"
@@ -195,7 +302,7 @@ mod tests {
         seed_handoff(&home, "reviewer", "o/r@feat", 15, false);
         let now = chrono::Utc::now();
         let mut last = HashMap::new();
-        scan_and_emit(&home, &now, &mut last);
+        run_watchdog(&home, &now, &mut last, &mut HashMap::new());
         assert_eq!(
             crate::inbox::drain(&home, "lead").len(),
             1,
@@ -203,7 +310,12 @@ mod tests {
         );
         // Re-seed (drain cleared inbox) and scan again soon — dedup suppresses.
         seed_handoff(&home, "reviewer", "o/r@feat", 15, false);
-        scan_and_emit(&home, &(now + chrono::Duration::minutes(5)), &mut last);
+        run_watchdog(
+            &home,
+            &(now + chrono::Duration::minutes(5)),
+            &mut last,
+            &mut HashMap::new(),
+        );
         assert!(
             crate::inbox::drain(&home, "lead").is_empty(),
             "re-escalation within the dedup window must be suppressed"
@@ -219,7 +331,7 @@ mod tests {
         seed_handoff(&home, "reviewer", "o/r@gone", 15, false);
         let now = chrono::Utc::now();
         let mut last = HashMap::new();
-        scan_and_emit(&home, &now, &mut last);
+        run_watchdog(&home, &now, &mut last, &mut HashMap::new());
         assert!(
             last.contains_key(&("reviewer".to_string(), "o/r@gone".to_string())),
             "first scan must record a dedup entry for the escalated handoff"
@@ -228,11 +340,131 @@ mod tests {
         // next scan must reap the now-stale (reviewer, o/r@gone) entry rather
         // than accumulating one per dead branch forever (the leak).
         crate::inbox::drain(&home, "reviewer");
-        scan_and_emit(&home, &(now + chrono::Duration::minutes(1)), &mut last);
+        run_watchdog(
+            &home,
+            &(now + chrono::Duration::minutes(1)),
+            &mut last,
+            &mut HashMap::new(),
+        );
         assert!(
             last.is_empty(),
             "a dedup entry whose handoff is no longer pending must be reaped, not leaked: {:?}",
             last.keys().collect::<Vec<_>>()
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// #1859 §3.9 (a): when `next_after_ci` IS the team orchestrator, the old
+    /// `recipient == target` branch silently skipped the WHOLE handoff (no
+    /// escalation AND no re-nudge) — the Scenario A hole. Now the orchestrator's
+    /// own unread handoff is RE-NUDGED (and correctly NOT self-escalated).
+    #[test]
+    fn orchestrator_as_next_after_ci_is_renudged_not_silently_skipped() {
+        let home = tmp_home("orch-renudge");
+        write_fleet(&home); // orchestrator = lead
+        seed_handoff(&home, "lead", "o/r@feat", 15, false);
+        seed_snapshot(&home, "lead", "idle");
+        let nudged = run_watchdog(
+            &home,
+            &chrono::Utc::now(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+        );
+        assert!(
+            nudged.contains(&"lead".to_string()),
+            "orchestrator-as-next_after_ci must be re-nudged, not silently skipped: {nudged:?}"
+        );
+        // No self-escalation (no higher authority above the orchestrator).
+        assert!(
+            crate::inbox::drain(&home, "lead")
+                .iter()
+                .all(|m| !m.text.contains("handoff_timeout_watchdog")),
+            "orchestrator must not be escalated about its own handoff"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// #1859 §3.9 (b): a BUSY (mid-token) target is NOT re-nudged (the watchdog
+    /// tick is the retry loop — no PTY corruption, no queueing); the same target,
+    /// once idle, gets a daemon-side re-nudge WITHOUT relying on the TUI flush.
+    #[test]
+    fn busy_target_skipped_idle_target_renudged() {
+        let home = tmp_home("busy-idle");
+        write_fleet(&home);
+        seed_handoff(&home, "reviewer", "o/r@feat", 15, false);
+
+        seed_snapshot(&home, "reviewer", "tool_use"); // busy → skip
+        let nudged = run_watchdog(
+            &home,
+            &chrono::Utc::now(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+        );
+        assert!(
+            !nudged.contains(&"reviewer".to_string()),
+            "a busy (tool_use) target must not be re-nudged mid-token: {nudged:?}"
+        );
+
+        seed_snapshot(&home, "reviewer", "idle"); // idle → deliver
+        let nudged = run_watchdog(
+            &home,
+            &chrono::Utc::now(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+        );
+        assert!(
+            nudged.contains(&"reviewer".to_string()),
+            "an idle target with an unread handoff must be re-nudged daemon-side: {nudged:?}"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// #1859 anti-storm: within `RENUDGE_INTERVAL_MINS` a second scan must NOT
+    /// re-nudge again (idempotent via `last_renudged`); once the target reads the
+    /// handoff it stops AND the dedup entry is reaped (no leak).
+    #[test]
+    fn renudge_is_interval_gated_and_stops_when_read() {
+        let home = tmp_home("renudge-interval");
+        write_fleet(&home);
+        seed_handoff(&home, "reviewer", "o/r@feat", 15, false);
+        seed_snapshot(&home, "reviewer", "idle");
+        let now = chrono::Utc::now();
+        let mut renudged = HashMap::new();
+
+        let first = run_watchdog(&home, &now, &mut HashMap::new(), &mut renudged);
+        assert!(
+            first.contains(&"reviewer".to_string()),
+            "first re-nudge must fire"
+        );
+
+        // Within the interval → suppressed.
+        let soon = run_watchdog(
+            &home,
+            &(now + chrono::Duration::minutes(1)),
+            &mut HashMap::new(),
+            &mut renudged,
+        );
+        assert!(
+            !soon.contains(&"reviewer".to_string()),
+            "a re-nudge within RENUDGE_INTERVAL_MINS must be suppressed (anti-storm): {soon:?}"
+        );
+
+        // Reviewer reads it → no more re-nudge, and the dedup entry is reaped.
+        crate::inbox::drain(&home, "reviewer");
+        let after_read = run_watchdog(
+            &home,
+            &(now + chrono::Duration::minutes(10)),
+            &mut HashMap::new(),
+            &mut renudged,
+        );
+        assert!(
+            !after_read.contains(&"reviewer".to_string()),
+            "a read handoff must not be re-nudged"
+        );
+        assert!(
+            renudged.is_empty(),
+            "last_renudged must be reaped once the handoff is read: {:?}",
+            renudged.keys().collect::<Vec<_>>()
         );
         std::fs::remove_dir_all(home).ok();
     }

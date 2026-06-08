@@ -13,6 +13,9 @@ pub(crate) struct HandoffTimeoutHandler {
     every_n_ticks: u64,
     counter: AtomicU64,
     last_escalated: Mutex<HashMap<(String, String), chrono::DateTime<chrono::Utc>>>,
+    /// #1859: re-nudge dedup, owned alongside `last_escalated` so the interval
+    /// gate survives across ticks.
+    last_renudged: Mutex<HashMap<(String, String), chrono::DateTime<chrono::Utc>>>,
     /// ≈ daemon boot — drives boot-grace suppression (see [`super::in_boot_grace`]).
     created_at: Instant,
 }
@@ -23,6 +26,7 @@ impl HandoffTimeoutHandler {
             every_n_ticks,
             counter: AtomicU64::new(0),
             last_escalated: Mutex::new(HashMap::new()),
+            last_renudged: Mutex::new(HashMap::new()),
             created_at: Instant::now(),
         }
     }
@@ -33,6 +37,7 @@ impl HandoffTimeoutHandler {
             every_n_ticks,
             counter: AtomicU64::new(0),
             last_escalated: Mutex::new(HashMap::new()),
+            last_renudged: Mutex::new(HashMap::new()),
             created_at,
         }
     }
@@ -62,7 +67,13 @@ impl PerTickHandler for HandoffTimeoutHandler {
         }
         let now = chrono::Utc::now();
         let mut last = self.last_escalated.lock();
-        crate::daemon::handoff_timeout_watchdog::scan_and_emit(ctx.home, &now, &mut last);
+        let mut last_renudged = self.last_renudged.lock();
+        crate::daemon::handoff_timeout_watchdog::scan_and_emit(
+            ctx.home,
+            &now,
+            &mut last,
+            &mut last_renudged,
+        );
     }
 }
 

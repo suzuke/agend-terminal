@@ -590,10 +590,11 @@ pub(crate) fn build_default_handlers(
         // #1491(A): inbox-stuck watchdog — every 30 ticks (~5min). Detects an
         // agent receiving but not draining its inbox; notifies lead (no auto-restart).
         Box::new(per_tick::InboxStuckHandler::new(30)),
-        // #1491(B): next_after_ci handoff-timeout watchdog — every 30 ticks
-        // (~5min). Escalates an unread [ci-ready-for-action] handoff to the
-        // reviewer's lead when it sits unclaimed past the timeout.
-        Box::new(per_tick::HandoffTimeoutHandler::new(30)),
+        // #1491(B): next_after_ci handoff-timeout watchdog. #1859 lowered the
+        // cadence to ~2min (12 ticks) so the daemon-side RE-NUDGE of the target
+        // (Fix A) is timely; the lead ESCALATION stays gated by its own 10min age
+        // + 30min re-alert windows, so the faster scan doesn't escalate sooner.
+        Box::new(per_tick::HandoffTimeoutHandler::new(12)),
         Box::new(per_tick::LogRotationHandler::new(360)),
         Box::new(per_tick::ThreadDumpHandler::new()),
         Box::new(per_tick::GcTickHandler::new(360)),

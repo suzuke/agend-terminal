@@ -501,6 +501,33 @@ pub fn enqueue_with_idle_hint(home: &Path, target: &str, msg: InboxMessage) -> a
     })
 }
 
+/// #1859 Fix A: daemon-side re-nudge of a target that has an UNREAD actionable
+/// handoff still sitting in its inbox. The actionable `[ci-ready-for-action]`
+/// wake from the poller is deferrable (`should_defer_inject`'s mid-token guard)
+/// into the `notification_queue`, whose ONLY flush is the TUI loop
+/// (`app/mod.rs::flush_idle_notifications`) — so when the operator TUI isn't
+/// draining the target's pane, a deferred wake strands (inbox has it, no active
+/// nudge: #1859 Scenario A). This re-fires an actionable PTY pointer directly,
+/// BYPASSING the queue, so the redelivery doesn't depend on the TUI.
+///
+/// It is a pure WAKE pointer (`id="renudge"`), NOT a new inbox row — so it can
+/// never self-amplify into another unread handoff. The CALLER (the handoff
+/// watchdog) gates this on the target being idle AND on a re-nudge interval, so
+/// it never injects mid-token and never storms; `inject_with_submit` is the same
+/// submit-aware PTY path the normal idle-hint uses.
+pub(crate) fn renudge_actionable_unread(
+    home: &Path,
+    target: &str,
+    kind: &str,
+    unread_count: usize,
+) {
+    let now_field = operator_now_field();
+    let pointer = build_pending_pointer("renudge", kind, "system:ci", unread_count, &now_field);
+    if let Err(e) = inject_with_submit(home, target, &pointer) {
+        tracing::debug!(%target, error = %e, "renudge_actionable_unread: inject failed");
+    }
+}
+
 /// #1335: convenience wrapper for the common daemon notification pattern:
 /// `InboxMessage::new_system` + optional `delivery_mode` / `correlation_id` /
 /// `task_id` + `enqueue_with_idle_hint`. Covers ~15 watchdog-class call sites.
