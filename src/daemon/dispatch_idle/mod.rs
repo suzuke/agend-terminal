@@ -426,13 +426,24 @@ pub(crate) fn mark_resolved(home: &Path, correlation_id: &str) -> Option<String>
             && d.correlation_id.as_deref() == Some(correlation_id)
     }) {
         let path = pending_path(home, &d.dispatch_id);
+        let lock_path = dispatch_lock_path(home, &d.dispatch_id);
+        // [M2] Hold the sidecar lock across the delete so it is mutually exclusive
+        // with the team-nudge / L1 locked read-modify-write. Without this, a
+        // concurrent RMW (`with_json_state` / `scan_and_emit`) could re-create
+        // (resurrect) the sidecar between its read and its write — leaking a
+        // resolved dispatch's sidecar forever. `acquire_file_lock` uses the same
+        // `{dispatch_id}.lock` path `with_json_state`'s `path.with_extension` does.
+        let guard = crate::store::acquire_file_lock(&lock_path).ok();
         // DELETE the sidecar rather than flip it to `Resolved` and leave the file
         // to accumulate (the pre-fix primary `pending-dispatches/` leak).
         if std::fs::remove_file(&path).is_ok() {
-            // Best-effort: drop the sidecar's lock file too so it doesn't orphan.
-            let _ = std::fs::remove_file(format!("{}.lock", path.display()));
             first_deleted.get_or_insert(d.dispatch_id);
         }
+        // Release the lock BEFORE removing the lock file (best-effort cleanup of
+        // the correct `{dispatch_id}.lock` — the pre-fix code removed the wrong
+        // `{dispatch_id}.json.lock` name and orphaned the real one).
+        drop(guard);
+        let _ = std::fs::remove_file(&lock_path);
     }
     first_deleted
 }

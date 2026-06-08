@@ -76,12 +76,29 @@ fn dispatcher_team(home: &Path, agent: &str) -> Option<String> {
     crate::teams::find_team_for(home, agent).map(|t| t.name)
 }
 
-fn write_dispatch_sidecar(home: &Path, d: &PendingDispatch) -> bool {
-    let body = match serde_json::to_string_pretty(d) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-    crate::store::atomic_write(&pending_path(home, &d.dispatch_id), body.as_bytes()).is_ok()
+/// [M2] Under the sidecar lock, stamp `nudge_sent_at` iff the sidecar still
+/// exists AND is still `Exceeded` AND not already nudged; returns `true` when
+/// stamped. Replaces the prior unconditional `atomic_write`, which — after the
+/// slow `emit_nudge` — could RECREATE (resurrect) a sidecar that `mark_resolved`
+/// had just deleted (report arrived mid-flight), leaking it forever. `with_json_state`
+/// returns `Ok(None)` for a missing file and NEVER recreates it, and re-reads the
+/// status under the lock (no lost update). Mirrors the L1 `scan_and_emit`
+/// flock+re-read discipline.
+fn stamp_nudge_sent(home: &Path, dispatch_id: &str) -> bool {
+    matches!(
+        crate::store::with_json_state::<PendingDispatch, _, _>(
+            &pending_path(home, dispatch_id),
+            |cur| {
+                if cur.status == DispatchStatus::Exceeded && cur.nudge_sent_at.is_none() {
+                    cur.nudge_sent_at = Some(chrono::Utc::now().to_rfc3339());
+                    true
+                } else {
+                    false
+                }
+            },
+        ),
+        Ok(Some(true))
+    )
 }
 
 fn emit_nudge(home: &Path, d: &PendingDispatch, team: &str) -> bool {
@@ -136,7 +153,7 @@ fn emit_nudge(home: &Path, d: &PendingDispatch, team: &str) -> bool {
 /// Scan exceeded sidecars and emit nudges. Exposed `pub(crate)` for
 /// tests.
 pub(crate) fn scan_and_nudge(home: &Path) {
-    for mut d in list_pending(home) {
+    for d in list_pending(home) {
         if d.status != DispatchStatus::Exceeded {
             continue;
         }
@@ -151,9 +168,15 @@ pub(crate) fn scan_and_nudge(home: &Path) {
         if !emit_nudge(home, &d, &team) {
             continue;
         }
-        d.nudge_sent_at = Some(chrono::Utc::now().to_rfc3339());
-        if !write_dispatch_sidecar(home, &d) {
-            tracing::warn!(dispatch_id = %d.dispatch_id, "team-nudge sidecar write failed");
+        // [M2] Stamp via a LOCKED RMW that bails (and never recreates) if the
+        // sidecar was resolved/deleted during the slow `emit_nudge` above — see
+        // `stamp_nudge_sent`. A failed stamp here is benign (the dispatch was
+        // resolved): the report already arrived, so no nudge will recur.
+        if !stamp_nudge_sent(home, &d.dispatch_id) {
+            tracing::debug!(
+                dispatch_id = %d.dispatch_id,
+                "team-nudge: sidecar resolved or changed before stamp — not resurrected"
+            );
         }
     }
 }
@@ -246,6 +269,62 @@ mod tests {
         assert_eq!(
             second_count, 0,
             "second scan must NOT re-nudge (dedup via nudge_sent_at)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// [M2] §3.9: a sidecar resolved (deleted) before the nudge stamp must NOT be
+    /// resurrected by the locked RMW. Simulates a report arriving (which deletes
+    /// the sidecar) during the in-flight `emit_nudge`, then the stamp write.
+    #[test]
+    fn resolved_sidecar_not_resurrected_by_nudge_write() {
+        let home = tmp_home("m2-resurrect");
+        let id = write_exceeded_sidecar(&home, "fixup-lead", "fixup-reviewer", "t-m2", 700);
+        let path = pending_path(&home, &id);
+        assert!(path.exists(), "precondition: sidecar exists");
+        // Report arrives → sidecar deleted.
+        std::fs::remove_file(&path).unwrap();
+        // In-flight nudge tries to stamp — must NOT recreate the file.
+        assert!(
+            !stamp_nudge_sent(&home, &id),
+            "stamp on a deleted sidecar returns false"
+        );
+        assert!(
+            !path.exists(),
+            "[M2] a resolved sidecar must NOT be resurrected by the nudge write"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// [M2] end-to-end: the real `mark_resolved` delete + a racing nudge stamp
+    /// leaves the sidecar gone (not resurrected).
+    #[test]
+    fn mark_resolved_then_nudge_write_does_not_resurrect() {
+        let home = tmp_home("m2-e2e");
+        let id = write_exceeded_sidecar(&home, "fixup-lead", "fixup-reviewer", "t-m2c", 700);
+        let path = pending_path(&home, &id);
+        crate::daemon::dispatch_idle::mark_resolved(&home, "t-m2c");
+        assert!(!path.exists(), "mark_resolved deleted the sidecar");
+        assert!(
+            !stamp_nudge_sent(&home, &id),
+            "[M2] in-flight nudge stamp must not resurrect a mark_resolved'd sidecar"
+        );
+        assert!(!path.exists(), "[M2] still gone after the nudge write");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// [M2] a live Exceeded sidecar IS stamped (once) by the locked RMW.
+    #[test]
+    fn live_exceeded_sidecar_stamped_once() {
+        let home = tmp_home("m2-stamp");
+        let id = write_exceeded_sidecar(&home, "fixup-lead", "fixup-reviewer", "t-m2b", 700);
+        assert!(stamp_nudge_sent(&home, &id), "first stamp succeeds");
+        let content = std::fs::read_to_string(pending_path(&home, &id)).unwrap();
+        let d: PendingDispatch = serde_json::from_str(&content).unwrap();
+        assert!(d.nudge_sent_at.is_some(), "nudge_sent_at persisted");
+        assert!(
+            !stamp_nudge_sent(&home, &id),
+            "second stamp is a no-op (already nudged)"
         );
         std::fs::remove_dir_all(&home).ok();
     }
