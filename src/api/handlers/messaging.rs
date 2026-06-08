@@ -407,6 +407,19 @@ fn checkout_branch_if_requested<'a>(
     if !crate::worktree::is_git_repo(wd) {
         return None;
     }
+    // #1834: the Claude backend git-inits the agent's metadata workspace stub
+    // (`mcp_config::configure_claude` — "Claude needs a git root to find
+    // .claude/"), so `is_git_repo` is TRUE for it — but the stub is NOT a code
+    // worktree. The real work happens in the daemon worktree (bound separately
+    // under `<home>/worktrees/`, never the working_directory). Checking out the
+    // task branch on the stub just runs `switch -c` from its init commit →
+    // a stray branch per task (accumulation) + a misleading statusline, with no
+    // functional effect. Skip any working_directory under the daemon-managed
+    // workspace; a real source/worktree target (operator working_directory
+    // outside `<home>/workspace/`) still gets the checkout.
+    if wd.starts_with(crate::paths::workspace_dir(home)) {
+        return None;
+    }
     match crate::worktree::checkout_branch(wd, branch) {
         Ok(()) => Some(branch),
         Err(e) => {
@@ -1101,8 +1114,11 @@ mod tests {
     fn send_with_branch_checkout_failure_logs_warn() {
         // B2 boundary invariant (observability): when checkout fails,
         // tracing::warn must fire. Parallel to DESIGN §4 Q4 pattern.
+        // #1834: the checkout target is a REAL source dir OUTSIDE the daemon
+        // workspace (a workspace-stub path would now be skipped before checkout,
+        // so the warn path could never fire there).
         let home = tmp_home("branch-fail");
-        let wd = home.join("workspace/target");
+        let wd = home.join("src-target");
         std::fs::create_dir_all(&wd).ok();
         // Init a git repo so is_git_repo returns true
         let _ = std::process::Command::new("git")
@@ -1136,6 +1152,102 @@ mod tests {
             logs_contain("task.branch checkout failed"),
             "B2 observability invariant: warn must fire on checkout failure"
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn dispatch_branch_skips_metadata_stub_but_checks_out_real_source_1834() {
+        // §3.9 (#1834): `send(kind=task, branch=X)` must NOT check out the task
+        // branch on the daemon-managed metadata workspace stub (git-init'd by the
+        // Claude backend) — that only accumulates stray branches + misleads the
+        // statusline. A REAL source/worktree target (working_directory OUTSIDE
+        // <home>/workspace/) still gets the checkout. Drives the real `handle_send`
+        // entry. Regression-proof: drop the workspace-stub skip and the
+        // no-stray-branch assertion fails.
+        fn git(dir: &std::path::Path, args: &[&str]) {
+            let _ = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output();
+        }
+        fn init_repo(dir: &std::path::Path) {
+            std::fs::create_dir_all(dir).ok();
+            git(dir, &["init", "-b", "main"]);
+            git(
+                dir,
+                &[
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "init",
+                ],
+            );
+        }
+        fn branch_exists(dir: &std::path::Path, branch: &str) -> bool {
+            std::process::Command::new("git")
+                .args(["rev-parse", "--verify", "--quiet", branch])
+                .current_dir(dir)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        }
+
+        let home = tmp_home("branch-stub-vs-real");
+        // (1) Stub target: working_directory UNDER <home>/workspace/ → skipped.
+        let stub_wd = home.join("workspace/stub-agent");
+        init_repo(&stub_wd);
+        // (2) Real target: working_directory OUTSIDE workspace → checked out.
+        let real_wd = home.join("real-src");
+        init_repo(&real_wd);
+
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            format!(
+                "instances:\n  sender:\n    backend: claude\n  stub-agent:\n    backend: claude\n    working_directory: {}\n  real-agent:\n    backend: claude\n    working_directory: {}\n",
+                stub_wd.display(),
+                real_wd.display()
+            ),
+        )
+        .ok();
+        let ctx = test_ctx(&home);
+
+        // Stub dispatch — no checkout, no stray branch.
+        let stub_resp = handle_send(
+            &json!({"from":"sender","target":"stub-agent","text":"task","branch":"feat/stub-x"}),
+            &ctx,
+        );
+        assert_eq!(
+            stub_resp["ok"], true,
+            "send must still succeed: {stub_resp}"
+        );
+        assert!(
+            stub_resp.get("branch_checked_out").is_none(),
+            "stub must NOT report a checkout: {stub_resp}"
+        );
+        assert!(
+            !branch_exists(&stub_wd, "feat/stub-x"),
+            "#1834: no stray branch may be created on the metadata workspace stub"
+        );
+
+        // Real dispatch — branch IS checked out on the real source.
+        let real_resp = handle_send(
+            &json!({"from":"sender","target":"real-agent","text":"task","branch":"feat/real-x"}),
+            &ctx,
+        );
+        assert_eq!(
+            real_resp["branch_checked_out"].as_str(),
+            Some("feat/real-x"),
+            "real source target must still check out the branch: {real_resp}"
+        );
+        assert!(
+            branch_exists(&real_wd, "feat/real-x"),
+            "real source must now have the checked-out branch"
+        );
+
         std::fs::remove_dir_all(&home).ok();
     }
 
