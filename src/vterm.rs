@@ -652,7 +652,11 @@ impl VTerm {
             // be concatenated WITHOUT a `\n` — trimming it would fuse two words
             // ("is" + "temporarily" → "istemporarily"), re-breaking the phrase
             // the de-wrap exists to keep whole.
-            let trimmed = if row_wrapped { line.as_str() } else { line.trim_end() };
+            let trimmed = if row_wrapped {
+                line.as_str()
+            } else {
+                line.trim_end()
+            };
             if collect_fg {
                 fg.truncate(trimmed.chars().count());
             }
