@@ -56,6 +56,33 @@ fn archive_ts() -> String {
     format!("{}-{:09}", d.as_secs(), d.subsec_nanos())
 }
 
+/// [H1] Extract the archive time (unix secs) embedded in a `.trash/worktrees/`
+/// entry's directory NAME. The name is `{agent}-{secs}-{nanos}` (see
+/// [`archive_ts`], which itself contains a `-`), so the last two `-`-segments are
+/// the timestamp stamped atomically at archive time.
+///
+/// This is the only trustworthy archive clock: [`try_archive`] uses `fs::rename`,
+/// which PRESERVES the source worktree's original mtime. A freshly-archived
+/// force-reclaimed worktree (whose source was untouched for days) therefore has a
+/// stale `metadata.modified()`, and keying the retention age on mtime would purge
+/// it the SAME sweep it was archived — defeating the recovery window for exactly
+/// the irrecoverable case. Returns `None` for names that don't match the expected
+/// shape (caller falls back to mtime).
+fn archived_at_secs(dir_name: &str) -> Option<u64> {
+    let mut parts = dir_name.rsplitn(3, '-');
+    let nanos = parts.next()?;
+    let secs = parts.next()?;
+    parts.next()?; // agent segment (may itself contain '-') must be present
+    if nanos.is_empty()
+        || secs.is_empty()
+        || !nanos.bytes().all(|b| b.is_ascii_digit())
+        || !secs.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    secs.parse::<u64>().ok()
+}
+
 /// Recursive copy helper used by the `EXDEV` fallback in `try_archive`.
 /// Only reachable on Unix where `libc::EXDEV` is the cross-filesystem
 /// rename errno; gated to `cfg(unix)` so non-Unix targets don't see it
@@ -198,11 +225,43 @@ pub(crate) fn maybe_remove_candidate(
             };
         }
     };
+    // [M3] FORCE-RECLAIM: hold the SAME binding lock `bind_full()` (binding.rs:67)
+    // and the clean-release GC path (worktree_pool.rs `gc_remove_one`) take, so
+    // the liveness re-validate → archive → unbind below is mutually exclusive
+    // with a concurrent re-lease. Without it, a `bind_full` could interleave
+    // between the liveness check and the `fs::rename`, archiving a freshly-leased
+    // live worktree (which #H1 then purges same-sweep → unrecoverable). Held to
+    // function return. Clean-release archives via this fn only from the retention
+    // `sweep` (the gc_run clean path holds its own lock), so we scope the lock to
+    // the force-reclaim branch to avoid changing clean-release's locking.
+    let _binding_lock = if force_reclaim {
+        let lock_path = crate::paths::runtime_dir(home)
+            .join(agent)
+            .join(".binding.json.lock");
+        match crate::store::acquire_file_lock(&lock_path) {
+            Ok(g) => Some(g),
+            Err(e) => {
+                tracing::warn!(
+                    agent,
+                    error = %e,
+                    "force-reclaim: binding lock acquisition failed, skipping archive"
+                );
+                return RemovalOutcome::Skipped {
+                    reason: format!("binding_lock_failed: {e}"),
+                };
+            }
+        }
+    } else {
+        None
+    };
+
     // #1170 + t-worktree-leak PR-2: re-validate just before archive (TOCTOU /
     // fencing). For a CLEAN release the binding must be gone — a rebind means the
     // lease is live again → skip. For a FORCE-RECLAIM the binding is EXPECTED to be
     // present (never released), so re-check LIVENESS instead: if the agent came
-    // back to life between enumeration and now, spare it.
+    // back to life between enumeration and now, spare it. (Now under the binding
+    // lock above for force-reclaim — the liveness check + archive are atomic vs
+    // bind_full.)
     if force_reclaim {
         if crate::worktree_pool::is_agent_alive(home, agent) {
             tracing::info!(
@@ -363,8 +422,20 @@ pub(super) fn purge_trash(home: &Path) {
             Ok(m) => m,
             Err(_) => continue,
         };
-        let mtime = metadata.modified().unwrap_or(now);
-        let age = now.duration_since(mtime).unwrap_or(Duration::ZERO);
+        // [H1] Age from the archive time embedded in the dir NAME (stamped
+        // atomically at archive), NOT the inherited mtime — `fs::rename` keeps
+        // the source's old mtime, so a fresh archive would look ancient and be
+        // purged the same sweep. Fall back to mtime for legacy / unrecognised
+        // names.
+        let age = match entry.file_name().to_str().and_then(archived_at_secs) {
+            Some(secs) => now
+                .duration_since(UNIX_EPOCH + Duration::from_secs(secs))
+                .unwrap_or(Duration::ZERO),
+            None => {
+                let mtime = metadata.modified().unwrap_or(now);
+                now.duration_since(mtime).unwrap_or(Duration::ZERO)
+            }
+        };
         if age >= cutoff {
             let p = entry.path();
             if let Err(e) = std::fs::remove_dir_all(&p) {
@@ -666,6 +737,111 @@ mod tests {
 
         assert!(!entry.exists(), "TRASH_DAYS=0 purges same-tick entries");
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// [H1] §3.9: a freshly-archived worktree whose INHERITED mtime is ancient
+    /// (the force-reclaim case — `fs::rename` keeps the source's old mtime) must
+    /// SURVIVE the retention window. Age is taken from the archive time embedded
+    /// in the dir name, not the mtime. Under the bug (mtime-based) this entry's
+    /// 30-day-old mtime would purge it the same sweep.
+    #[test]
+    fn purge_uses_embedded_archive_time_not_inherited_mtime_h1() {
+        let _env = gc_trash_env_guard();
+        let dir = tmp_home("h1-archivetime");
+        let trash = trash_root(&dir);
+        std::fs::create_dir_all(&trash).unwrap();
+        // Name embeds NOW (`{agent}-{secs}-{nanos}`); mtime forced 30 days old.
+        let entry = trash.join(format!("dev-fr-{}", archive_ts()));
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(entry.join("data.txt"), b"recoverable").unwrap();
+        let thirty_days_ago = SystemTime::now() - Duration::from_secs(30 * 86400);
+        std::fs::File::open(&entry)
+            .unwrap()
+            .set_modified(thirty_days_ago)
+            .unwrap();
+
+        std::env::set_var("AGEND_WORKTREE_GC_TRASH_DAYS", "7");
+        purge_trash(&dir);
+        std::env::remove_var("AGEND_WORKTREE_GC_TRASH_DAYS");
+
+        assert!(
+            entry.exists(),
+            "[H1] a fresh archive with an OLD inherited mtime must survive the \
+             retention window (age from embedded archive-time, not mtime)"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// [H1] §3.9 complement: an entry whose EMBEDDED archive time is old is purged
+    /// even though its actual mtime is fresh (just created) — proving purge keys on
+    /// the dir-name timestamp, not mtime. Under the bug this fresh-mtime entry
+    /// would be wrongly preserved.
+    #[test]
+    fn purge_deletes_when_embedded_archive_time_is_old_h1() {
+        let _env = gc_trash_env_guard();
+        let dir = tmp_home("h1-oldname");
+        let trash = trash_root(&dir);
+        std::fs::create_dir_all(&trash).unwrap();
+        let old_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 10 * 86400;
+        let entry = trash.join(format!("dev-fr-{old_secs}-000000000"));
+        std::fs::create_dir_all(&entry).unwrap(); // fresh mtime (just created)
+
+        std::env::set_var("AGEND_WORKTREE_GC_TRASH_DAYS", "7");
+        purge_trash(&dir);
+        std::env::remove_var("AGEND_WORKTREE_GC_TRASH_DAYS");
+
+        assert!(
+            !entry.exists(),
+            "[H1] an entry archived 10d ago (per embedded time) is purged despite a fresh mtime"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// [M3] §3.9: a force-reclaim archive must hold the binding lock — while a
+    /// concurrent holder (a re-lease's `bind_full`) holds `.binding.json.lock`,
+    /// the force-reclaim must NOT archive the worktree; it proceeds only after the
+    /// lock is released.
+    #[test]
+    fn force_reclaim_archive_blocked_while_binding_lock_held_m3() {
+        let dir = tmp_home("m3-lock");
+        let repo = setup_git_repo(&dir);
+        let wt = add_worktree(&repo, "wt-m3");
+        write_binding(&dir, "dev-m3", "feat/m3", &wt);
+        let cand = crate::worktree_pool::GcCandidate {
+            path: wt.clone(),
+            agent: "dev-m3".to_string(),
+            reason: "m3 lock test".to_string(),
+            kind: crate::worktree_pool::GcKind::ForceReclaim,
+        };
+        // Hold the SAME binding lock a concurrent re-lease's bind_full would hold.
+        let lock_path = crate::paths::runtime_dir(&dir)
+            .join("dev-m3")
+            .join(".binding.json.lock");
+        let guard = crate::store::acquire_file_lock(&lock_path).expect("acquire test lock");
+
+        let dir2 = dir.clone();
+        let handle = std::thread::spawn(move || maybe_remove_candidate(&dir2, &cand));
+
+        // While the lock is held, the archive cannot proceed.
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            wt.exists(),
+            "[M3] force-reclaim must NOT archive while the binding lock is held"
+        );
+
+        // Release → force-reclaim proceeds and archives.
+        drop(guard);
+        let outcome = handle.join().expect("join");
+        assert!(
+            matches!(outcome, RemovalOutcome::Removed),
+            "[M3] force-reclaim proceeds after lock release: {outcome:?}"
+        );
+        assert!(!wt.exists(), "worktree archived after lock released");
         std::fs::remove_dir_all(&dir).ok();
     }
 
