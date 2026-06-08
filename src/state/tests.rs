@@ -4143,11 +4143,34 @@ the agent kept going after the throttle\n";
 fn unclassified_throttle_logged_on_phrase_plus_nonretryable_state() {
     // Throttle phrase present, classifier landed on Ready (the in-the-wild
     // miss — e.g. anchor suppressed it / wording drifted) → capture.
-    let tail = unclassified_throttle_tail(AgentState::Idle, THROTTLE_SCREEN, &[]);
-    let tail = tail.expect("throttle phrase + non-retryable state must be captured");
+    let captured = unclassified_throttle_tail(AgentState::Idle, THROTTLE_SCREEN, &[]);
+    let (tail, wrap_split) =
+        captured.expect("throttle phrase + non-retryable state must be captured");
     assert!(
         tail.contains("temporarily limiting requests"),
         "captured tail must carry the throttle line, got: {tail:?}"
+    );
+    assert!(
+        !wrap_split,
+        "a contiguous (un-wrapped) phrase must NOT be flagged wrap_split"
+    );
+}
+
+/// #1808: the instrument was BLIND to a LINE-WRAPPED throttle phrase because it
+/// only did a contiguous `str::contains` — the exact reason the live narrow-pane
+/// SRL miss captured nothing. A phrase split by hard `\n` (Ink-style layout) must
+/// now be captured AND flagged `wrap_split` (the Phase 2 soft-vs-hard signal).
+#[test]
+fn unclassified_throttle_captures_hard_wrapped_phrase_with_wrap_split_flag() {
+    // Phrase split across rows by `\n` the way an app word-wrap emits it — NOT
+    // contiguous, so the old `contains` check missed it entirely.
+    let screen = "⏺ API Error:\ntemporarily limiting\nrequests (not your\nusage limit)\n";
+    let captured = unclassified_throttle_tail(AgentState::Idle, screen, &[]);
+    let (_tail, wrap_split) =
+        captured.expect("a hard-`\\n`-wrapped throttle phrase must still be captured (#1808)");
+    assert!(
+        wrap_split,
+        "a phrase found only after whitespace-flatten must be flagged wrap_split (hard-wrap signal)"
     );
 }
 

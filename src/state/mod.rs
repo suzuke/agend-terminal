@@ -604,28 +604,55 @@ fn ansi_colored_tail(screen_text: &str, fg: &[CellFg], n: usize) -> String {
 ///
 /// `None` otherwise. The order is chosen so the common no-phrase case
 /// fast-rejects on a single allocation-free `str::contains` scan.
+/// Returns `Some((raw_tail, wrap_split))`. `wrap_split` is true when the phrase
+/// was found ONLY after whitespace-flattening — i.e. it is LINE-WRAPPED across
+/// rows in `screen_text`. Since the detection feed already de-wraps alacritty
+/// soft-wraps (#1808 Phase 1), a phrase still wrap-split here means the wrap is
+/// a hard `\n` (Ink-emitted layout) the de-wrap cannot merge → the signal that
+/// the Phase 2 flattened-tail fallback is required for this backend's render.
 fn unclassified_throttle_tail(
     current: AgentState,
     screen_text: &str,
     fg: &[CellFg],
-) -> Option<String> {
-    // Fast reject (no allocation): no known throttle phrase anywhere.
-    let phrase = THROTTLE_DIAG_PHRASES
+) -> Option<(String, bool)> {
+    // Fast reject (no allocation on the common path): no known throttle phrase
+    // contiguously on screen. #1808 — the original `contains`-only check was
+    // BLIND to a line-wrapped phrase (the exact reason the live narrow-pane SRL
+    // miss captured nothing), so on a contiguous miss also try a
+    // whitespace-flattened view (every whitespace run incl. `\n` → one space) so
+    // a wrapped "temporarily\nlimiting\nrequests" still matches.
+    let raw_hit = THROTTLE_DIAG_PHRASES
         .iter()
         .copied()
-        .find(|p| screen_text.contains(p))?;
+        .find(|p| screen_text.contains(p));
+    let phrase = match raw_hit {
+        Some(p) => p,
+        None => {
+            let flat = screen_text.split_whitespace().collect::<Vec<_>>().join(" ");
+            THROTTLE_DIAG_PHRASES
+                .iter()
+                .copied()
+                .find(|p| flat.contains(p))?
+        }
+    };
+    let wrap_split = raw_hit.is_none();
     // Classifier landed on a retryable state → throttle phrase was correctly
     // recognized (auto-retry handles it). Nothing to diagnose → no noise.
     if is_throttle_retryable_state(current) {
         return None;
     }
     // Require the phrase in the LIVE bottom-N tail — a copy that only survives
-    // in scrolled-up scrollback is stale, not a current miss.
+    // in scrolled-up scrollback is stale, not a current miss. Check the
+    // flattened tail too so a wrapped live error still qualifies.
     let tail = recent_screen_tail(screen_text.trim_end(), UNCLASSIFIED_TAIL_LINES);
-    if !tail.contains(phrase) {
+    let tail_flat = tail.split_whitespace().collect::<Vec<_>>().join(" ");
+    if !tail.contains(phrase) && !tail_flat.contains(phrase) {
         return None;
     }
-    Some(ansi_colored_tail(screen_text, fg, UNCLASSIFIED_TAIL_LINES))
+    Some((
+        ansi_colored_tail(screen_text, fg, UNCLASSIFIED_TAIL_LINES),
+        wrap_split,
+    ))
 }
 
 /// #1562: best-effort append of one JSON record as a single `line\n` to `path`,
@@ -1355,14 +1382,41 @@ impl StateTracker {
     /// - **Low-noise** — fires only on phrase-present + classified-non-retryable
     ///   + phrase-in-live-tail (a scrolled-up scrollback echo is ignored).
     fn capture_unclassified_throttle(&self, screen_text: &str, fg: &[CellFg]) {
-        let Some(raw_tail) = unclassified_throttle_tail(self.current, screen_text, fg) else {
+        let Some((raw_tail, wrap_split)) =
+            unclassified_throttle_tail(self.current, screen_text, fg)
+        else {
             return;
         };
+        // #1808 Phase-1 upstream instrument: a server-throttle phrase is on a
+        // LIVE non-retryable screen — the detection miss that left agents stuck.
+        // When `wrap_split` (phrase matched only after whitespace-flatten), the
+        // de-wrap of soft-wraps did NOT merge it → the wrap is a hard `\n` (Ink
+        // layout) → WARN with the FULL escaped screen_text so the next real SRL
+        // event is captured verbatim and we can confirm soft-vs-hard wrap before
+        // building the Phase 2 fallback. Contiguous misses (wrap_split=false) are
+        // the already-understood prose-FP class (correctly suppressed by the
+        // line-scoped content anchor) → kept to the JSONL sidecar only, no WARN
+        // noise. The feed-level screen hash-dedup bounds this to once per screen.
+        if wrap_split {
+            let escaped = screen_text.escape_debug().to_string();
+            tracing::warn!(
+                target: "state_detection",
+                agent = %self.instance_name,
+                backend = %self.backend_name,
+                tag = "#1808-srl-detect-miss",
+                classified_state = %self.current.display_name(),
+                wrap_split,
+                screen_text = %escaped,
+                "SRL/throttle phrase present only when whitespace-flattened (hard `\\n` line-wrap) but classifier did NOT latch a retryable state — capturing full screen_text for soft-vs-hard wrap diagnosis (#1808 Phase 2 signal)"
+            );
+        }
         let record = serde_json::json!({
             "ts": chrono::Utc::now().to_rfc3339(),
             "backend": self.backend_name,
             "classified_state": self.current.display_name(),
+            "wrap_split": wrap_split,
             "raw_tail": raw_tail,
+            "screen_text": screen_text,
         });
         let path = crate::home_dir().join("unclassified_errors.jsonl");
         if let Err(e) = append_jsonl(&path, &record) {

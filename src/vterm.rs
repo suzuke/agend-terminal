@@ -599,8 +599,13 @@ impl VTerm {
 
     /// Shared core for [`tail_lines`] / [`tail_lines_with_fg`]. When
     /// `collect_fg` is false the returned `Vec<CellFg>` is empty (no per-cell
-    /// classification cost); the produced `String` is byte-identical either
-    /// way so text-only callers are unaffected.
+    /// classification cost) AND physical rows are joined verbatim with `\n`
+    /// (byte-identical to the legacy output — text-only display/dialog callers
+    /// unaffected). When `collect_fg` is true (the state-detection feed) a
+    /// `WRAPLINE`-soft-wrapped row is DE-WRAPPED — joined to its continuation
+    /// WITHOUT a `\n` — so a single logical line the terminal wrapped across
+    /// rows stays one line for the single-line detection regexes (#1808). The
+    /// fg mask stays aligned 1:1 with the de-wrapped text.
     fn tail_lines_impl(&self, n: usize, collect_fg: bool) -> (String, Vec<CellFg>) {
         let grid = self.term.grid();
         let cols = self.cols as usize;
@@ -608,6 +613,16 @@ impl VTerm {
 
         let mut lines: Vec<String> = Vec::with_capacity(rows);
         let mut line_fgs: Vec<Vec<CellFg>> = Vec::with_capacity(rows);
+        // #1808: per-row soft-wrap flag. alacritty sets `WRAPLINE` on the LAST
+        // cell of a physical row whose logical line CONTINUES on the next row
+        // (its own auto-wrap when text overflows `cols`, NOT a `\n`/cursor-moved
+        // line break). The de-wrap join below consults it so a single logical
+        // line the terminal soft-wrapped across rows is NOT split by a `\n` in
+        // the detection feed — which otherwise inserts `\n` mid-phrase and makes
+        // a single-line state-detection regex miss (the #1808/#1809 SRL bug).
+        // Only the detection path (`collect_fg`) de-wraps; the text-only
+        // `tail_lines` stays byte-identical (display/dialog callers unaffected).
+        let mut wrapped: Vec<bool> = Vec::with_capacity(rows);
         for row in 0..rows {
             let mut line = String::with_capacity(cols);
             let mut fg: Vec<CellFg> = Vec::new();
@@ -625,14 +640,25 @@ impl VTerm {
                 }
                 col += 1;
             }
-            // trim_end drops trailing whitespace chars; truncate the parallel
-            // fg vec to the surviving char count so the two stay aligned.
-            let trimmed = line.trim_end();
+            let row_wrapped = collect_fg
+                && cols > 0
+                && safe_cell(grid, Line(row as i32), cols - 1)
+                    .flags
+                    .contains(Flags::WRAPLINE);
+            // trim_end drops trailing whitespace; truncate the parallel fg vec to
+            // the surviving char count so the two stay aligned. EXCEPT a
+            // soft-wrapped row: its trailing space can be a significant
+            // inter-word space at the wrap column, and the next row is about to
+            // be concatenated WITHOUT a `\n` — trimming it would fuse two words
+            // ("is" + "temporarily" → "istemporarily"), re-breaking the phrase
+            // the de-wrap exists to keep whole.
+            let trimmed = if row_wrapped { line.as_str() } else { line.trim_end() };
             if collect_fg {
                 fg.truncate(trimmed.chars().count());
             }
             lines.push(trimmed.to_string());
             line_fgs.push(fg);
+            wrapped.push(row_wrapped);
         }
 
         // Trim blank lines at both ends so terse output doesn't look padded
@@ -648,18 +674,24 @@ impl VTerm {
             .unwrap_or(first);
         let visible = &lines[first..last];
         let visible_fgs = &line_fgs[first..last];
+        let visible_wrapped = &wrapped[first..last];
 
         let start = visible.len().saturating_sub(n);
         let tail = &visible[start..];
         let tail_fgs = &visible_fgs[start..];
+        let tail_wrapped = &visible_wrapped[start..];
 
         let mut text = String::new();
         let mut fg_out: Vec<CellFg> = Vec::new();
         for (i, line) in tail.iter().enumerate() {
             if i > 0 {
-                text.push('\n');
-                if collect_fg {
-                    fg_out.push(CellFg::Default);
+                // #1808: skip the `\n` (and its filler fg cell) when the PREVIOUS
+                // row soft-wrapped into this one — they are one logical line.
+                if !tail_wrapped[i - 1] {
+                    text.push('\n');
+                    if collect_fg {
+                        fg_out.push(CellFg::Default);
+                    }
                 }
             }
             text.push_str(line);
