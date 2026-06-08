@@ -354,6 +354,26 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
         });
     }
 
+    // #1882: hold a per-BRANCH lease flock across the P0-1.5 scan + the bind_full
+    // below so the check-then-bind is ATOMIC. Without it, two DIFFERENT agents
+    // racing to lease the SAME branch both passed the scan (neither had bound yet)
+    // and both bound — violating "a branch is held by at most one agent". Keyed on
+    // the branch (not the agent): the second racer blocks here, then its scan below
+    // sees the first's binding and rejects. Both bind paths funnel through this fn
+    // (dispatch auto-bind AND bind_self via dispatch_auto_bind_lease_with_source),
+    // so this one lock covers both. Lock order is consistent (per-agent BindGuard
+    // above → this branch lock → per-agent binding lock inside bind_full), so no
+    // deadlock; different branches use different lock files → no cross-branch
+    // contention. Held only across the bind (a short mutex), so release is unaffected.
+    let _lease_lock =
+        crate::binding::acquire_branch_lease_lock(home, branch).map_err(|e| DispatchError {
+            message: format!("could not acquire branch lease lock for '{branch}': {e}"),
+            code: ErrorCode::LeaseConflict,
+            stage: Stage::WorktreeLeaseConflict,
+            fetch_attempted: false,
+            raw: None,
+        })?;
+
     // P0-1.5: central lease registry check — reject if another agent holds this branch.
     if let Some(other) = crate::binding::scan_existing_branch_binding(home, branch, target) {
         return Err(DispatchError {
