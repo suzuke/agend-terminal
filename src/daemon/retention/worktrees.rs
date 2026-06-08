@@ -745,6 +745,14 @@ mod tests {
     /// SURVIVE the retention window. Age is taken from the archive time embedded
     /// in the dir name, not the mtime. Under the bug (mtime-based) this entry's
     /// 30-day-old mtime would purge it the same sweep.
+    ///
+    /// Unix-only: forcing an old mtime needs `File::open` on a DIRECTORY, which
+    /// fails on Windows (`std::fs::File::open` lacks `FILE_FLAG_BACKUP_SEMANTICS`).
+    /// Windows coverage of the name-vs-mtime behaviour is provided by
+    /// `purge_deletes_when_embedded_archive_time_is_old_h1` (old embedded-time +
+    /// fresh mtime → deleted, which only holds under name-based purging). Mirrors
+    /// the existing unix-gated `archive_failure_preserves_worktree`.
+    #[cfg(unix)]
     #[test]
     fn purge_uses_embedded_archive_time_not_inherited_mtime_h1() {
         let _env = gc_trash_env_guard();
