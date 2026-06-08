@@ -882,6 +882,55 @@ fn build_command_sets_git_editor_defaults() {
     }
 }
 
+/// §3.9 (MED-5): the daemon must re-inject AGEND_HOME into every spawned
+/// agent's env. AGEND_HOME is on the env-isolation SENSITIVE deny-list, so under
+/// `AGEND_ENV_ISOLATION=1` the `env_clear` drops it and the passthrough loop
+/// never re-adds it → the agent's in-pane `agend-terminal` subcommands fell back
+/// to the default `~/.agend-terminal`, pointing at the wrong daemon. The fix
+/// re-injects it unconditionally AFTER the clear (like AGEND_INSTANCE_NAME).
+/// Regression-proof: revert the re-inject and `get_env` returns None (the
+/// allowlist excludes AGEND_HOME, so nothing else sets it post-clear).
+#[test]
+fn build_command_reinjects_agend_home_under_env_isolation_med5() {
+    // Serialize the process-global isolation-flag flip; restore before asserting
+    // so a panic can't leak the flag to other tests.
+    static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
+
+    let home = std::path::PathBuf::from("/tmp/agend-med5-distinct-home");
+    let prev = std::env::var("AGEND_ENV_ISOLATION").ok();
+    std::env::set_var("AGEND_ENV_ISOLATION", "1");
+    let config = SpawnConfig {
+        name: "med5-home",
+        backend_command: "echo",
+        args: &[],
+        spawn_mode: crate::backend::SpawnMode::Fresh,
+        cols: 80,
+        rows: 24,
+        env: None,
+        working_dir: None,
+        submit_key: "\r",
+        home: Some(&home),
+        crash_tx: None,
+        shutdown: None,
+    };
+    let built = build_command(&config);
+    match prev {
+        Some(v) => std::env::set_var("AGEND_ENV_ISOLATION", v),
+        None => std::env::remove_var("AGEND_ENV_ISOLATION"),
+    }
+
+    let (cmd, _) = built.expect("build_command");
+    let v = cmd
+        .get_env("AGEND_HOME")
+        .expect("MED-5: AGEND_HOME must survive env_clear under isolation");
+    assert_eq!(
+        v.to_string_lossy(),
+        home.to_string_lossy(),
+        "MED-5: AGEND_HOME must equal the daemon home"
+    );
+}
+
 /// #1597 helper: run `build_command` for an agy backend with the given home +
 /// workspace, returning the resulting cmd and the would-be link path. fleet.yaml
 /// pins `agy_workspace_link_base` inside `home` so tests never touch the real

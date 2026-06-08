@@ -110,22 +110,70 @@ pub fn remove_instances_from_yaml(home: &Path, names: &[String]) -> Result<()> {
     })
 }
 
+fn mapping_is_telegram(m: &serde_yaml_ng::Mapping) -> bool {
+    m.get(serde_yaml_ng::Value::String("type".into()))
+        .and_then(|v| v.as_str())
+        == Some("telegram")
+}
+
+fn set_group_id(m: &mut serde_yaml_ng::Mapping, new_group_id: i64) {
+    m.insert(
+        serde_yaml_ng::Value::String("group_id".into()),
+        serde_yaml_ng::Value::Number(new_group_id.into()),
+    );
+}
+
 pub fn update_channel_telegram_group_id(home: &Path, new_group_id: i64) -> Result<()> {
     mutate_fleet_yaml(home, "", |doc| {
+        // Singular `channel:` form.
         if let Some(channel) = doc.get_mut("channel").and_then(|v| v.as_mapping_mut()) {
-            let is_telegram = channel
-                .get(serde_yaml_ng::Value::String("type".into()))
-                .and_then(|v| v.as_str())
-                == Some("telegram");
-            if is_telegram {
-                channel.insert(
-                    serde_yaml_ng::Value::String("group_id".into()),
-                    serde_yaml_ng::Value::Number(new_group_id.into()),
-                );
+            if mapping_is_telegram(channel) {
+                set_group_id(channel, new_group_id);
                 tracing::info!(new_group_id, "fleet.yaml channel.group_id rewritten");
                 return Ok(true);
             }
         }
+        // MED-3: plural `channels:` form. `normalize()` collapses the first entry
+        // by sorted name into the active channel, so that entry is the telegram
+        // channel the supergroup migration actually applies to. Mirror that
+        // selection and persist `new_group_id` there. Without this branch a
+        // channels-only fleet silently returned Ok(false) (treated as success),
+        // so the new group_id was never written and the stale id reloaded on the
+        // next restart — re-triggering the migration error in a loop.
+        let first_name = doc
+            .get("channels")
+            .and_then(|v| v.as_mapping())
+            .and_then(|m| {
+                let mut names: Vec<&str> = m.keys().filter_map(|k| k.as_str()).collect();
+                names.sort();
+                names.first().map(|s| s.to_string())
+            });
+        if let Some(first) = first_name {
+            if let Some(entry) = doc
+                .get_mut("channels")
+                .and_then(|v| v.as_mapping_mut())
+                .and_then(|m| m.get_mut(serde_yaml_ng::Value::String(first.clone())))
+                .and_then(|v| v.as_mapping_mut())
+            {
+                if mapping_is_telegram(entry) {
+                    set_group_id(entry, new_group_id);
+                    tracing::info!(
+                        new_group_id,
+                        channel = %first,
+                        "fleet.yaml channels.<name>.group_id rewritten"
+                    );
+                    return Ok(true);
+                }
+            }
+        }
+        // No telegram channel matched in either form — surface the miss instead
+        // of returning a silent Ok(false) the caller mistakes for a persisted
+        // migration.
+        tracing::warn!(
+            new_group_id,
+            "update_channel_telegram_group_id: no telegram channel found in fleet.yaml \
+             (`channel:` or `channels:`) — group_id NOT persisted"
+        );
         Ok(false)
     })
 }
@@ -371,4 +419,86 @@ pub fn migrate_teams_json_to_yaml(home: &Path) -> Result<()> {
         "teams.json migration complete, renamed to .migrated"
     );
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn tmp_home(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static C: AtomicU32 = AtomicU32::new(0);
+        let id = C.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "agend-persist-med3-{}-{}-{}",
+            tag,
+            std::process::id(),
+            id
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    }
+
+    /// §3.9 (MED-3): a channels-only (plural) fleet must persist a telegram
+    /// supergroup migration. Pre-fix, `update_channel_telegram_group_id` only
+    /// handled the singular `channel:` form and returned a silent `Ok(false)`
+    /// for `channels:` → the new group_id was never written → the stale id
+    /// reloaded on restart, re-triggering the migration error in a loop.
+    /// Regression-proof: drop the plural branch and the persisted id stays stale.
+    #[test]
+    fn update_group_id_persists_into_channels_plural_med3() {
+        let home = tmp_home("plural");
+        std::fs::write(
+            fleet_yaml_path(&home),
+            "channels:\n  tg:\n    type: telegram\n    group_id: -100111\n\
+             instances:\n  A:\n    backend: claude\n",
+        )
+        .unwrap();
+
+        update_channel_telegram_group_id(&home, -100999).expect("update must succeed");
+
+        // Persisted under channels.tg.group_id (not silently dropped).
+        let doc: serde_yaml_ng::Value =
+            serde_yaml_ng::from_str(&std::fs::read_to_string(fleet_yaml_path(&home)).unwrap())
+                .unwrap();
+        assert_eq!(
+            doc["channels"]["tg"]["group_id"].as_i64(),
+            Some(-100999),
+            "MED-3: channels-only group_id must be rewritten"
+        );
+
+        // And the real loader+normalize surfaces the new id as the active channel
+        // (the on-restart path that previously reloaded the stale id).
+        let cfg = crate::fleet::FleetConfig::load(&fleet_yaml_path(&home)).unwrap();
+        match cfg.channel {
+            Some(crate::fleet::ChannelConfig::Telegram { group_id, .. }) => assert_eq!(
+                group_id, -100999,
+                "MED-3: normalize must surface the persisted id, not the stale one"
+            ),
+            other => panic!("expected a telegram active channel, got {other:?}"),
+        }
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// A fleet with NO telegram channel must not silently report success: the
+    /// helper returns `Ok` (best-effort) but logs a miss and writes nothing.
+    #[test]
+    fn update_group_id_no_telegram_channel_writes_nothing_med3() {
+        let home = tmp_home("none");
+        let yaml = "instances:\n  A:\n    backend: claude\n";
+        std::fs::write(fleet_yaml_path(&home), yaml).unwrap();
+
+        update_channel_telegram_group_id(&home, -100999).expect("best-effort Ok");
+
+        // No channel/channels key was synthesized.
+        let after = std::fs::read_to_string(fleet_yaml_path(&home)).unwrap();
+        assert!(
+            !after.contains("group_id"),
+            "MED-3: no telegram channel → no group_id written, got:\n{after}"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
 }

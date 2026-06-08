@@ -730,6 +730,15 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
     cmd.env("COLORTERM", "truecolor");
     cmd.env("FORCE_COLOR", "1");
     cmd.env("AGEND_INSTANCE_NAME", name);
+    // MED-5: AGEND_HOME is on the env-isolation SENSITIVE deny-list (so
+    // `env_clear` drops it and the fleet passthrough loop never re-adds it), but
+    // the spawned agent's in-pane `agend-terminal` subcommands need it to resolve
+    // the daemon's home — without it they fall back to the default
+    // `~/.agend-terminal`, pointing at the wrong daemon. Re-inject unconditionally
+    // after the clear, exactly like AGEND_INSTANCE_NAME above.
+    if let Some(h) = *home {
+        cmd.env("AGEND_HOME", h);
+    }
 
     // Phase A Piece-3: GIT_EDITOR + friends = `true` (Unix no-op
     // binary that exits 0 without producing output). Prevents git
