@@ -18,6 +18,33 @@ fn index_key(home: &Path, agent: &str) -> String {
     format!("{}:{agent}", home.display())
 }
 
+/// #1882: lock-file path for the per-BRANCH lease flock. Keyed by a hash of the
+/// branch so it is path-safe (branches contain `/`) and collision-free; different
+/// branches never share a lock file.
+fn branch_lease_lock_path(home: &Path, branch: &str) -> PathBuf {
+    let key = crate::daemon::utils::sha256_hex(branch.as_bytes());
+    crate::paths::runtime_dir(home)
+        .join(".lease-locks")
+        .join(format!("{key}.lock"))
+}
+
+/// #1882: acquire the exclusive per-BRANCH lease flock so the cross-agent
+/// "a branch is held by at most one agent" check-then-bind
+/// (`scan_existing_branch_binding` → `bind_full`) is ATOMIC. Two DIFFERENT agents
+/// racing to lease the SAME branch serialize here: the first binds; the second
+/// blocks until the first's guard drops, then its rescan sees the first's binding
+/// and rejects — so neither double-binds. This is a SHORT-LIVED mutex around the
+/// bind operation, NOT a lease-lifetime lock: the persistent lease state is
+/// `binding.json` (which the scan reads), so `release_full` needs no lock cleanup.
+/// Per-branch keying means different branches never contend → normal single-agent
+/// binds are unaffected. Blocking `acquire_file_lock`; released when the guard drops.
+pub fn acquire_branch_lease_lock(
+    home: &Path,
+    branch: &str,
+) -> anyhow::Result<crate::store::FileFlockGuard> {
+    crate::store::acquire_file_lock(&branch_lease_lock_path(home, branch))
+}
+
 /// Write a binding for an agent (task assigned).
 ///
 /// Fail-closed: if lock acquisition or I/O fails, binding.json is NOT
@@ -403,6 +430,51 @@ pub fn reconcile_orphans(home: &Path) {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// §3.9 #1882 (concurrency): the per-branch lease flock SERIALIZES two
+    /// acquirers of the SAME branch (the second blocks until the first drops) but
+    /// lets DIFFERENT branches proceed concurrently (no cross-branch contention).
+    /// This is the atomicity that makes the dispatch `scan → bind_full` a critical
+    /// section so two agents can't both pass the scan and double-bind. Regression-
+    /// proof: it's the lock's defining behavior.
+    #[test]
+    fn branch_lease_lock_serializes_same_branch_allows_different_1882() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let home = tmp_home("lease-lock-1882");
+
+        // Different branches must NOT contend — both acquire while both are held.
+        let g_x = acquire_branch_lease_lock(&home, "feat/x").expect("lock x");
+        let g_y = acquire_branch_lease_lock(&home, "feat/y").expect("lock y must not block on x");
+        drop((g_x, g_y));
+
+        // Same branch: a second acquirer BLOCKS until the first guard drops.
+        let got = Arc::new(AtomicBool::new(false));
+        let g1 = acquire_branch_lease_lock(&home, "feat/z").expect("lock z (holder)");
+        let home2 = home.clone();
+        let got2 = got.clone();
+        let t = std::thread::spawn(move || {
+            // Blocks here until the holder drops g1.
+            let _g2 = acquire_branch_lease_lock(&home2, "feat/z").expect("lock z (waiter)");
+            got2.store(true, Ordering::SeqCst);
+        });
+
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            !got.load(Ordering::SeqCst),
+            "#1882: a second same-branch lock MUST block while the first is held"
+        );
+        drop(g1); // release → the waiter proceeds.
+        t.join().expect("waiter thread");
+        assert!(
+            got.load(Ordering::SeqCst),
+            "#1882: the second same-branch lock must proceed once the first drops"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
 
     fn tmp_home(tag: &str) -> std::path::PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
