@@ -146,8 +146,13 @@ fn dispatch_lock_path(home: &Path, dispatch_id: &str) -> PathBuf {
 ///
 /// Also removes the CORRECT lock file (`{dispatch_id}.lock`); the pre-fix delete
 /// sites removed `{dispatch_id}.json.lock` (wrong name) and orphaned the real
-/// one. Single correct implementation shared by every sidecar-delete site
-/// (`mark_resolved`, `cleanup_pending_for_task_id`, `cleanup_pending_for_instance`).
+/// one. Single correct implementation — ALL sidecar-delete call sites route
+/// through it (verified by grep of `dispatch_idle/` for `remove_file` on a
+/// `pending_path`):
+/// - `mark_resolved` (report-arrival clear)
+/// - `cleanup_pending_for_task_id` (#1018 task-close clear)
+/// - `cleanup_pending_for_instance` (#1018 instance-delete clear)
+/// - `scan_and_emit` (#1018-A tick-time stale-sidecar clear)
 fn delete_sidecar_locked(home: &Path, dispatch_id: &str) -> bool {
     let path = pending_path(home, dispatch_id);
     let lock_path = dispatch_lock_path(home, dispatch_id);
@@ -719,8 +724,9 @@ pub(crate) fn scan_and_emit(home: &Path) {
         // canonical signal via task board / instance lifecycle, no need
         // to surface a second-class "idle threshold" notification.
         if let Some(reason) = stale_sidecar_reason(home, &d) {
-            let path = pending_path(home, &d.dispatch_id);
-            let _ = std::fs::remove_file(&path);
+            // [M2] delete under the sidecar lock (no resurrection race vs a
+            // concurrent team-nudge / L1 RMW; removes the correct `{id}.lock`).
+            delete_sidecar_locked(home, &d.dispatch_id);
             tracing::debug!(
                 target: "dispatch_idle",
                 dispatch_id = %d.dispatch_id,

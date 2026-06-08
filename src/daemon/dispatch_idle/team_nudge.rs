@@ -369,6 +369,50 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// [M2] §3.9: the L1 `scan_and_emit` tick-time stale-sidecar delete (#1018-A,
+    /// the 4th delete site) is NOT resurrected by a racing nudge stamp. Drives the
+    /// real `scan_and_emit` entry with a past-threshold Pending sidecar whose
+    /// target is not in the fleet (→ stale → deleted under the lock).
+    #[test]
+    fn scan_and_emit_stale_delete_then_nudge_does_not_resurrect() {
+        let home = tmp_home("m2-stale");
+        // Fleet exists but does NOT contain the target → `target_not_in_fleet`.
+        write_fleet_with_fixup_member(&home, "fixup-lead");
+        let dir = pending_dir(&home);
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = "disp-test-stale".to_string();
+        // Past-threshold so scan_and_emit progresses to the stale check.
+        let issued = (chrono::Utc::now() - chrono::Duration::seconds(700)).to_rfc3339();
+        let payload = PendingDispatch {
+            schema_version: 1,
+            dispatch_id: id.clone(),
+            dispatcher: "fixup-lead".to_string(),
+            target: "ghost-not-in-fleet".to_string(),
+            correlation_id: Some("t-stale".to_string()),
+            expected_kind: "task".to_string(),
+            threshold_secs: 600,
+            issued_at: issued,
+            status: DispatchStatus::Pending, // scan_and_emit only scans Pending
+            nudge_sent_at: None,
+            not_working_streak: 0,
+        };
+        let path = pending_path(&home, &id);
+        std::fs::write(&path, serde_json::to_string_pretty(&payload).unwrap()).unwrap();
+
+        // Real entry: must stale-delete (target not in fleet) under the lock.
+        crate::daemon::dispatch_idle::scan_and_emit(&home);
+        assert!(
+            !path.exists(),
+            "scan_and_emit must stale-delete the sidecar (target not in fleet)"
+        );
+        assert!(
+            !stamp_nudge_sent(&home, &id),
+            "[M2] in-flight stamp must not resurrect a stale-deleted sidecar"
+        );
+        assert!(!path.exists(), "[M2] still gone after the nudge write");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     /// 10. Nudge must target the sidecar's `target` field (the
     /// dispatchee), NOT team-wide. Parallel dev-1 + dev-2 dispatches
     /// must not cross-pollinate.
