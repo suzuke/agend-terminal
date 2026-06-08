@@ -137,6 +137,27 @@ pub(super) fn spawn_single_instance_impl(
     );
     let target_pane = target_pane_owned.as_deref();
 
+    // #1858: persist the spawn-intent `args` + `model` into the entry so a daemon
+    // RESTART re-resolves the SAME backend invocation as the original spawn. At
+    // boot, `agent_resolve::resolve_one` reads `entry.args` (None → empty argv) and
+    // appends `--model` only from `entry.model` (None → no model flag) — so a
+    // sparse entry boots the instance "less than" spawn (missing the user args and
+    // the model flag → bare / stuck Starting). `instructions` is NOT lost (it is
+    // regenerated from role+peers at boot, agent_resolve.rs); `command` is covered
+    // by `backend`; `ready_pattern` is built-in — so ONLY these two need backfill.
+    // Split matches `handle_spawn`'s `params["args"].split_whitespace()` so boot's
+    // `entry.args` reproduces the create-path SPAWN argv (minus the model flag,
+    // which boot re-derives from `entry.model` — same as create's cmd_args build).
+    let entry_args: Option<Vec<String>> = args
+        .get("args")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.split_whitespace().map(String::from).collect());
+    let entry_model: Option<String> = args
+        .get("model")
+        .and_then(|v| v.as_str())
+        .filter(|m| !m.is_empty())
+        .map(String::from);
     // #964: ADD fleet.yaml entry BEFORE the SPAWN RPC so the instance
     // exists when SPAWN runs. Pre-fix SPAWN-then-add ordering caused
     // silent failures.
@@ -160,8 +181,8 @@ pub(super) fn spawn_single_instance_impl(
         // remote OR fork-vs-upstream disambiguation.
         repo: None,
         github_login: None,
-        args: None,
-        model: None,
+        args: entry_args,
+        model: entry_model,
         env: env_for_entry,
         ready_pattern: None,
         command: None,

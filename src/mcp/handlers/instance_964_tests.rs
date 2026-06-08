@@ -288,3 +288,64 @@ fn t6_topic_binding_invalid_value_treated_as_auto() {
     );
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// #1858: create_instance must PERSIST `args` + `model` into the fleet entry so a
+/// daemon RESTART (re-resolve from disk) reproduces the SAME backend argv as the
+/// original spawn — not a "bare" instance missing the user args and the --model
+/// flag. `instructions` is regenerated from role+peers at boot, so it is not the
+/// lost field; `args`/`model` were left None pre-fix.
+#[test]
+fn create_instance_persists_args_and_model_for_restart_parity_1858() {
+    let home = tmp_home("1858");
+    // Capture the spawn-time argv the backend received (the SPAWN RPC params).
+    let captured = std::cell::RefCell::new(String::new());
+    let spawn_fn = |_h: &Path, req: &Value| -> anyhow::Result<Value> {
+        *captured.borrow_mut() = req["params"]["args"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        Ok(json!({"ok": true, "result": {}}))
+    };
+    let _ = spawn_single_instance_impl(
+        &home,
+        "spawner",
+        &json!({"name": "dev-x", "backend": "claude", "args": "--foo bar", "model": "opus"}),
+        &spawn_fn,
+    );
+
+    // The persisted entry (what a restart re-resolves) must carry args + model.
+    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+    let cfg = fleet
+        .instances
+        .get("dev-x")
+        .expect("instance persisted to fleet.yaml");
+    assert_eq!(
+        cfg.args,
+        vec!["--foo".to_string(), "bar".to_string()],
+        "#1858: user args must persist (was None → bare argv on restart)"
+    );
+    assert_eq!(
+        cfg.model.as_deref(),
+        Some("opus"),
+        "#1858: model must persist (was None → no --model flag on restart)"
+    );
+
+    // Restart parity: boot reconstructs argv = entry.args + a --model flag derived
+    // from entry.model; it must EQUAL the spawn-time argv (not be "less than").
+    let model_token = crate::backend::Backend::from_command("claude")
+        .map(|b| b.format_model_arg("opus"))
+        .unwrap_or_else(|| "opus".to_string());
+    let mut boot_argv = cfg.args.clone();
+    boot_argv.push("--model".to_string());
+    boot_argv.push(model_token);
+    let spawn_argv: Vec<String> = captured
+        .borrow()
+        .split_whitespace()
+        .map(String::from)
+        .collect();
+    assert_eq!(
+        boot_argv, spawn_argv,
+        "#1858: restart re-resolve must reproduce the spawn argv (not bare)"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
