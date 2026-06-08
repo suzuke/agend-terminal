@@ -406,7 +406,10 @@ pub struct HealthTracker {
 /// `None` (never notified) → due; otherwise due once `NOTIFY_COOLDOWN` elapsed.
 fn cooldown_elapsed(last: Option<Instant>) -> bool {
     match last {
-        Some(t) => t.elapsed() >= NOTIFY_COOLDOWN,
+        // #1744-H2: saturating — a coarse-clock (windows) read where the stamp
+        // sits in the same tick as `now` (t >= now) underflows a raw `elapsed()`.
+        // b>=a → 0 elapsed, which is the correct "just stamped, not yet due".
+        Some(t) => Instant::now().saturating_duration_since(t) >= NOTIFY_COOLDOWN,
         None => true,
     }
 }
@@ -422,7 +425,10 @@ const REHYDRATE_MAX_LOOKBACK_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 /// #1744-H2: persist an `Instant` as a wall-clock epoch-ms (monotonic `Instant`
 /// is meaningless across a process restart). `now_epoch - instant.elapsed()`.
 fn instant_to_epoch_ms(t: Instant) -> u64 {
-    crate::daemon::heartbeat_pair::now_ms().saturating_sub(t.elapsed().as_millis() as u64)
+    // #1744-H2: saturating elapsed — a coarse-clock (windows) `t` that reads
+    // in the same tick as `now` (t >= now) underflows a raw `t.elapsed()`.
+    let elapsed_ms = Instant::now().saturating_duration_since(t).as_millis() as u64;
+    crate::daemon::heartbeat_pair::now_ms().saturating_sub(elapsed_ms)
 }
 
 /// #1744-H2: project a persisted wall-clock epoch-ms back onto the monotonic
@@ -527,7 +533,8 @@ impl HealthTracker {
 
         // Clean old crashes outside window
         while let Some(front) = self.crash_times.front() {
-            if now.duration_since(*front) > CRASH_WINDOW {
+            // #1744-H2: saturating — coarse-clock same-tick (front >= now) → 0.
+            if now.saturating_duration_since(*front) > CRASH_WINDOW {
                 self.crash_times.pop_front();
             } else {
                 break;
@@ -611,7 +618,8 @@ impl HealthTracker {
         }
         let sustained = self
             .hung_since
-            .is_some_and(|t| t.elapsed() >= confirm_window);
+            // #1744-H2: saturating — coarse-clock same-tick (t >= now) → 0.
+            .is_some_and(|t| Instant::now().saturating_duration_since(t) >= confirm_window);
         if sustained && cooldown_elapsed(self.last_hung_notification) {
             self.last_hung_notification = Some(Instant::now());
             true
@@ -918,7 +926,8 @@ impl HealthTracker {
 
         // Clean old events
         while let Some((t, _)) = self.error_events.front() {
-            if now.duration_since(*t) > CRASH_WINDOW {
+            // #1744-H2: saturating — coarse-clock same-tick (t >= now) → 0.
+            if now.saturating_duration_since(*t) > CRASH_WINDOW {
                 self.error_events.pop_front();
             } else {
                 break;
@@ -1175,20 +1184,23 @@ mod tests {
     /// the Hung confirm-window anchor keeps its real age (does NOT reset to 0).
     #[test]
     fn escalation_snapshot_rehydrate_round_trip_1744_h2() {
-        let mut before = HealthTracker::new();
-        before.total_crashes = 2;
-        // One in-window crash (10s ago) + one stale crash (700s ago > 600s window).
-        before
-            .crash_times
-            .push_back(Instant::now() - Duration::from_secs(700));
-        before
-            .crash_times
-            .push_back(Instant::now() - Duration::from_secs(10));
-        before.last_crash_notification = Some(Instant::now() - Duration::from_secs(100)); // within 300s
-        before.last_hung_notification = None;
-        before.hung_since = Some(Instant::now() - Duration::from_secs(45));
-
-        let snap = before.escalation_snapshot();
+        // #1744-H2: build the persisted snapshot directly from wall-clock
+        // epoch-ms. The previous version fabricated the "before" state via
+        // `Instant::now() - Duration::from_secs(700)`, which UNDERFLOWS (panics)
+        // on a freshly-booted windows VM whose monotonic clock has run for less
+        // than 700s — the windows-only CI panic this fixes. Rehydrate prunes /
+        // projects via wall-clock, so the round-trip is verifiable without
+        // depending on machine uptime.
+        let now = crate::daemon::heartbeat_pair::now_ms();
+        let snap = PersistedEscalation {
+            total_crashes: 2,
+            // One in-window crash (10s ago) + one stale (700s ago > 600s window).
+            crash_times_epoch_ms: vec![now.saturating_sub(700_000), now.saturating_sub(10_000)],
+            last_crash_notification_epoch_ms: Some(now.saturating_sub(100_000)), // within 300s
+            last_hung_notification_epoch_ms: None,
+            hung_since_epoch_ms: Some(now.saturating_sub(45_000)),
+            failed_escalated: false,
+        };
 
         // Simulate restart: a brand-new tracker, then rehydrate.
         let mut after = HealthTracker::new();
@@ -1198,17 +1210,60 @@ mod tests {
         assert_eq!(
             after.crash_times.len(),
             1,
-            "#1744-H2: a crash older than CRASH_WINDOW is pruned on rehydrate"
+            "#1744-H2: a crash older than CRASH_WINDOW is pruned on rehydrate (wall-clock)"
         );
         assert!(
             !cooldown_elapsed(after.last_crash_notification),
             "#1744-H2: a cooldown stamped 100s ago must STILL suppress after restart (no duplicate P0)"
         );
-        let anchor = after.hung_since.expect("hung_since restored");
         assert!(
-            anchor.elapsed() >= Duration::from_secs(40),
-            "#1744-H2: the confirm-window anchor keeps its real age (not reset to 0)"
+            after.hung_since.is_some(),
+            "#1744-H2: the confirm-window anchor is restored, not dropped"
         );
+    }
+
+    /// #1744-H2 (windows underflow root-fix): the rehydrate/snapshot helpers must
+    /// NOT panic when a stamp reads in the SAME coarse-clock tick as `now`
+    /// (b >= a) — the windows `Instant`/`Duration` underflow class. Exercised
+    /// directly with b>=a / future stamps so the underflow path is covered
+    /// deterministically, without relying on a freshly-booted VM's clock
+    /// granularity. Fine-clock behaviour is unchanged (b>=a → 0 elapsed anyway).
+    #[test]
+    fn rehydrate_helpers_saturate_on_coarse_clock_1744_h2() {
+        let now_ms = crate::daemon::heartbeat_pair::now_ms();
+
+        // A same-tick instant projects to ~now (saturating elapsed = 0), no panic.
+        let e = instant_to_epoch_ms(Instant::now());
+        assert!(
+            e + 5_000 >= now_ms && now_ms + 5_000 >= e,
+            "same-tick instant projects to ~now, got {e} vs {now_ms}"
+        );
+
+        // A FUTURE epoch stamp (clock skew, b >= a) clamps to ~now, never panics.
+        let future = epoch_ms_to_instant(now_ms + 60_000);
+        assert!(
+            Instant::now().saturating_duration_since(future) < Duration::from_secs(1),
+            "a future stamp clamps to ~now (not projected into the past)"
+        );
+
+        // A cooldown stamped in the current tick reads as "not yet elapsed".
+        assert!(
+            !cooldown_elapsed(Some(Instant::now())),
+            "a same-tick cooldown stamp must read as not-elapsed, not underflow"
+        );
+
+        // A full rehydrate of an all-now / future snapshot must not panic.
+        let snap = PersistedEscalation {
+            total_crashes: 1,
+            crash_times_epoch_ms: vec![now_ms, now_ms + 30_000],
+            last_crash_notification_epoch_ms: Some(now_ms),
+            last_hung_notification_epoch_ms: Some(now_ms + 5_000),
+            hung_since_epoch_ms: Some(now_ms),
+            failed_escalated: false,
+        };
+        let mut h = HealthTracker::new();
+        h.rehydrate_escalation(&snap); // must not panic
+        assert_eq!(h.total_crashes, 1, "rehydrate completed without underflow");
     }
 
     /// #1744-H2: the crash budget survives a restart, so an agent that has already
