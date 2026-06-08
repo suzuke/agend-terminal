@@ -112,12 +112,19 @@ pub(super) fn try_telegram_reply_from(
         topic_id.map(i64::from),
         text,
     );
-    if !crate::channel::dedup::global(home).record_and_check(dedup_key) {
+    let dedup = crate::channel::dedup::global(home);
+    if !dedup.record_and_check(dedup_key.clone()) {
         // Synthesized success — caller proceeds; the actual original
         // send already happened or is in flight.
         return Ok((0, ch.group_id));
     }
-    match telegram_reply_send_inner(&ch, instance_name, topic_id, text) {
+    // The claim is recorded BEFORE the send (RC2: a concurrent duplicate is
+    // caught atomically). HIGH-2: but a send that ultimately FAILS must roll the
+    // claim back — otherwise a retry of the same text within the TTL is silently
+    // suppressed (a synthesized `Ok` that `handle_reply` mis-records as
+    // `Delivered`, defeating the #1665/#1813 missing-reply nets). Compute the
+    // outcome, then `evict` on any terminal `Err`; a success keeps the key.
+    let outcome = (|| match telegram_reply_send_inner(&ch, instance_name, topic_id, text) {
         Ok(msg_id) => Ok((msg_id, ch.group_id)),
         Err(e) => {
             // Supergroup migration must be checked before topic-deleted:
@@ -155,7 +162,11 @@ pub(super) fn try_telegram_reply_from(
             }
             Err(e)
         }
+    })();
+    if outcome.is_err() {
+        dedup.evict(&dedup_key);
     }
+    outcome
 }
 
 /// Like [`try_telegram_reply`] but the error branch does NOT run
@@ -322,6 +333,61 @@ instances:
         assert!(
             topics_json.contains("\"B\""),
             "provenance failure unregistered target's topic: {topics_json}"
+        );
+
+        std::env::remove_var("PR57_ROUND2_FAKE_TOKEN");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// §3.9 (HIGH-2): a reply whose first send FAILS, retried with the same text
+    /// within the dedup TTL, must ACTUALLY attempt the send again — not be
+    /// suppressed into a synthesized `Ok` (which `handle_reply` would mis-record
+    /// as `Delivered`, defeating the #1665/#1813 missing-reply nets). The fix
+    /// evicts the dedup claim on a failed send. Regression-proof: drop the
+    /// `evict` and the retry returns `Ok((0, _))` (deduped) → assertion fails.
+    #[test]
+    fn reply_failed_send_then_retry_actually_sends_high2() {
+        let _g = channel_env_test_guard();
+        let home = tmp_home("high2_retry_after_fail");
+        // Channel resolves; instance C has NO topic → the forced error falls to a
+        // terminal Err (no migration / topic-recreate retry path).
+        let yaml = "\
+channel:
+  type: telegram
+  bot_token_env: PR57_ROUND2_FAKE_TOKEN
+  group_id: -100999999
+  mode: topic
+instances:
+  C:
+    command: /bin/true
+";
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).expect("write fleet.yaml");
+        std::env::set_var("PR57_ROUND2_FAKE_TOKEN", "fake");
+
+        // First send: transient failure (not migration / not topic-deleted).
+        set_forced_send_error(anyhow::anyhow!("transient network error"));
+        let first = try_telegram_reply_from(&home, "C", "hello operator");
+        assert!(
+            first.is_err(),
+            "first send must surface the failure: {first:?}"
+        );
+
+        // Retry the SAME text within the TTL. With the fix the dedup claim was
+        // evicted, so this REACHES the send (and fails again on the second forced
+        // error); with the bug it would be deduped into `Ok((0, group_id))`.
+        set_forced_send_error(anyhow::anyhow!("transient network error 2"));
+        let retry = try_telegram_reply_from(&home, "C", "hello operator");
+        assert!(
+            retry.is_err(),
+            "HIGH-2: a retry after a failed send must ACTUALLY send (not be \
+             deduped into a synthesized Ok that mis-records Delivered): {retry:?}"
+        );
+        // The retry truly reached `telegram_reply_send_inner` (it consumed the
+        // second forced error) — a deduped retry would have returned before it.
+        assert!(
+            take_forced_send_error().is_none(),
+            "the retry must have reached the send (consuming the forced error), \
+             proving it was not suppressed by the stale dedup claim"
         );
 
         std::env::remove_var("PR57_ROUND2_FAKE_TOKEN");
