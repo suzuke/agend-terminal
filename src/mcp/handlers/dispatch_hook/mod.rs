@@ -497,16 +497,16 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
                 error = %e,
                 "dispatch auto-bind bind_full failed — rolling back worktree"
             );
-            let _ = std::process::Command::new("git")
-                .args([
+            // #1899: bounded via git_bypass (LOCAL 60s) — best-effort rollback.
+            let _ = crate::git_helpers::git_bypass(
+                &source_repo,
+                &[
                     "worktree",
                     "remove",
                     "--force",
                     &lease.path.display().to_string(),
-                ])
-                .env("AGEND_GIT_BYPASS", "1")
-                .current_dir(&source_repo)
-                .output();
+                ],
+            );
             // #1324: surface rollback as dispatch error instead of silent success
             return Err(DispatchError {
                 message: format!(

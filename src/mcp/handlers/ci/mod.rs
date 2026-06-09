@@ -267,11 +267,11 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                         error = %e,
                         "bind_full failed after worktree add — rolling back worktree"
                     );
-                    let _ = std::process::Command::new("git")
-                        .args(["worktree", "remove", "--force", &worktree_path_str])
-                        .env("AGEND_GIT_BYPASS", "1")
-                        .current_dir(Path::new(&source_path))
-                        .output();
+                    // #1899: bounded via git_bypass (LOCAL 60s) — best-effort rollback.
+                    let _ = crate::git_helpers::git_bypass(
+                        Path::new(&source_path),
+                        &["worktree", "remove", "--force", &worktree_path_str],
+                    );
                     return json!({
                         "error": format!("bind_full failed, worktree rolled back: {e}"),
                         "code": "bind_rollback",
@@ -466,10 +466,19 @@ pub(super) fn handle_release_repo(args: &Value) -> Value {
             p.parent()?.parent()?.parent().map(|pp| pp.to_path_buf())
         });
 
-    match std::process::Command::new("git")
-        .args(["worktree", "remove", "--force", &path_str])
-        .output()
-    {
+    // #1899: bounded via spawn_group_bounded with a BARE Command — this site
+    // deliberately does NOT set AGEND_GIT_BYPASS and does NOT set current_dir
+    // (runs from the daemon cwd, best-effort). Preserve that exact behaviour;
+    // spawn_group_bounded only adds the LOCAL timeout + safe process-group kill,
+    // without forcing the bypass env. (Whether it SHOULD bypass like ci/mod:270
+    // is a separate behaviour question, out of scope for this timeout PR.)
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(["worktree", "remove", "--force", &path_str]);
+    match crate::git_helpers::spawn_group_bounded(
+        cmd,
+        "git worktree remove (cleanup)",
+        crate::git_helpers::LOCAL_GIT_TIMEOUT,
+    ) {
         Ok(o) if o.status.success() => json!({"path": path}),
         Ok(o) => {
             let _ = std::fs::remove_dir_all(&canonical);

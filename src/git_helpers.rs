@@ -68,7 +68,13 @@ pub(crate) fn git_bypass_timeout(
 /// same `Command` minus the binary). Process-group isolation is MANDATORY:
 /// `kill_process_tree` resolves the pgid via `getpgid`, so without isolation the
 /// kill would resolve to the DAEMON's group and kill the daemon.
-fn spawn_group_bounded(
+///
+/// #1899: `pub(crate)` so NON-bypass prod git sites (ones that deliberately do
+/// NOT set `AGEND_GIT_BYPASS`) can pass their own pre-built `Command` to get the
+/// same bound + safe process-group kill while preserving their env/bypass
+/// behaviour — instead of being forced through [`git_bypass_timeout`] (which
+/// always sets the bypass env).
+pub(crate) fn spawn_group_bounded(
     mut cmd: std::process::Command,
     label: &str,
     timeout: Duration,
@@ -187,6 +193,26 @@ mod tests {
         let out = spawn_group_bounded(cmd, "true", Duration::from_secs(10))
             .expect("fast command must return Ok");
         assert!(out.status.success(), "fast command exits 0 with Output");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn spawn_group_bounded_preserves_caller_env_no_bypass_1899() {
+        // #1899: NON-bypass prod sites (e.g. ci/mod's cleanup worktree-remove)
+        // pass a BARE Command. spawn_group_bounded must NOT inject
+        // AGEND_GIT_BYPASS — it only adds the bound + process-group kill, leaving
+        // the caller's env/bypass behaviour intact (the bypass env is set ONLY by
+        // git_bypass_timeout, never here).
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg("printf 'bypass=[%s]' \"$AGEND_GIT_BYPASS\"");
+        let out = spawn_group_bounded(cmd, "sh env-probe", Duration::from_secs(10))
+            .expect("fast command must return Ok");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(
+            stdout, "bypass=[]",
+            "spawn_group_bounded must not inject AGEND_GIT_BYPASS (caller env preserved)"
+        );
     }
 
     #[test]

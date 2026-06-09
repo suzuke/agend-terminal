@@ -77,11 +77,11 @@ pub(super) fn prune_git_metadata_for_agent(
                 continue;
             }
             // Found a matching metadata entry — prune it.
-            let removed = std::process::Command::new("git")
-                .current_dir(&repo)
-                .args(["worktree", "remove", "--force", &entry.path])
-                .env("AGEND_GIT_BYPASS", "1")
-                .output();
+            // #1899: bounded via git_bypass (LOCAL 60s).
+            let removed = crate::git_helpers::git_bypass(
+                &repo,
+                &["worktree", "remove", "--force", &entry.path],
+            );
             let pruned = match removed {
                 Ok(o) if o.status.success() => true,
                 Ok(o) => {
@@ -96,11 +96,8 @@ pub(super) fn prune_git_metadata_for_agent(
                         stderr = %String::from_utf8_lossy(&o.stderr).trim(),
                         "#826 L2: git worktree remove failed; falling back to prune"
                     );
-                    let prune = std::process::Command::new("git")
-                        .current_dir(&repo)
-                        .args(["worktree", "prune"])
-                        .env("AGEND_GIT_BYPASS", "1")
-                        .output();
+                    // #1899: bounded via git_bypass (LOCAL 60s).
+                    let prune = crate::git_helpers::git_bypass(&repo, &["worktree", "prune"]);
                     matches!(prune, Ok(p) if p.status.success())
                 }
                 Err(e) => {
@@ -142,11 +139,8 @@ pub(super) fn prune_git_metadata_for_agent(
 /// from the source repo, so we run it with the shim bypass set
 /// (mirrors the `release_full` precedent at src/worktree_pool.rs:311).
 fn list_worktrees_bypass_shim(repo_root: &Path) -> Vec<crate::worktree_cleanup::WorktreeEntry> {
-    let output = std::process::Command::new("git")
-        .args(["worktree", "list", "--porcelain"])
-        .current_dir(repo_root)
-        .env("AGEND_GIT_BYPASS", "1")
-        .output();
+    // #1899: bounded via git_bypass (LOCAL 60s).
+    let output = crate::git_helpers::git_bypass(repo_root, &["worktree", "list", "--porcelain"]);
     let output = match output {
         Ok(o) if o.status.success() => o,
         _ => return Vec::new(),

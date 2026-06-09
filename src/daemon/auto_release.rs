@@ -592,12 +592,8 @@ fn is_worktree_clean(worktree: &Path) -> bool {
     if !worktree.is_dir() {
         return false;
     }
-    let out = match std::process::Command::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(worktree)
-        .env("AGEND_GIT_BYPASS", "1")
-        .output()
-    {
+    // #1899: bounded via git_bypass (LOCAL 60s) — a stuck git → false fallback.
+    let out = match crate::git_helpers::git_bypass(worktree, &["status", "--porcelain"]) {
         Ok(o) => o,
         Err(_) => return false,
     };

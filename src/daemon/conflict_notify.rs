@@ -292,11 +292,8 @@ pub(crate) fn register_subscriber() {
 /// trimmed of the 3-char prefix (`XY ` → start of path). Empty Vec
 /// on git failure or no conflicts.
 pub(crate) fn discover_conflicted_files(worktree: &Path) -> Vec<String> {
-    let output = std::process::Command::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(worktree)
-        .env("AGEND_GIT_BYPASS", "1")
-        .output();
+    // #1899: bounded via git_bypass (LOCAL 60s) — a stuck git → empty fallback.
+    let output = crate::git_helpers::git_bypass(worktree, &["status", "--porcelain"]);
     let Ok(out) = output else {
         return Vec::new();
     };

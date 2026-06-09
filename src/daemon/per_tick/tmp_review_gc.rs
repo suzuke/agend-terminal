@@ -188,25 +188,23 @@ fn gc_stale_tmp_review_worktrees(
 /// otherwise just `remove_dir_all`. Returns true on success.
 fn remove_tmp_worktree(path: &Path) -> bool {
     if let Some(parent_repo) = worktree_parent_repo(path) {
-        let removed = std::process::Command::new("git")
-            .env("AGEND_GIT_BYPASS", "1")
-            .current_dir(&parent_repo)
-            .args(["worktree", "remove", "--force"])
-            .arg(path)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+        // #1899: bounded via git_bypass (LOCAL 60s) — a stuck `worktree remove`
+        // → not-removed (false), then the remove_dir_all fallback below.
+        let path_str = path.display().to_string();
+        let removed = crate::git_helpers::git_bypass(
+            &parent_repo,
+            &["worktree", "remove", "--force", &path_str],
+        )
+        .map(|o| o.status.success())
+        .unwrap_or(false);
         if removed {
             return true;
         }
         // Fallback: remove the dir directly, then prune so the source repo
         // doesn't keep a dangling worktree registration.
         let rm = std::fs::remove_dir_all(path).is_ok();
-        let _ = std::process::Command::new("git")
-            .env("AGEND_GIT_BYPASS", "1")
-            .current_dir(&parent_repo)
-            .args(["worktree", "prune"])
-            .status();
+        // #1899: bounded via git_bypass (LOCAL 60s) — best-effort prune.
+        let _ = crate::git_helpers::git_bypass(&parent_repo, &["worktree", "prune"]);
         return rm;
     }
     std::fs::remove_dir_all(path).is_ok()

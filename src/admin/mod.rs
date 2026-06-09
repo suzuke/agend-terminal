@@ -25,11 +25,9 @@ pub enum BranchAction {
 
 /// List local branches that are NOT checked out in any worktree.
 fn worktree_branches(repo: &Path) -> std::collections::HashSet<String> {
-    let output = std::process::Command::new("git")
-        .env("AGEND_GIT_BYPASS", "1")
-        .args(["worktree", "list", "--porcelain"])
-        .current_dir(repo)
-        .output();
+    // #1899: bounded via git_bypass (LOCAL 60s) — a stuck local git returns Err
+    // instead of hanging; the empty-set fallback is unchanged.
+    let output = crate::git_helpers::git_bypass(repo, &["worktree", "list", "--porcelain"]);
     let mut branches = std::collections::HashSet::new();
     if let Ok(out) = output {
         let text = String::from_utf8_lossy(&out.stdout);
@@ -44,11 +42,8 @@ fn worktree_branches(repo: &Path) -> std::collections::HashSet<String> {
 
 /// List all local branch names.
 fn local_branches(repo: &Path) -> Vec<String> {
-    let output = std::process::Command::new("git")
-        .env("AGEND_GIT_BYPASS", "1")
-        .args(["branch", "--format=%(refname:short)"])
-        .current_dir(repo)
-        .output();
+    // #1899: bounded via git_bypass (LOCAL 60s).
+    let output = crate::git_helpers::git_bypass(repo, &["branch", "--format=%(refname:short)"]);
     match output {
         Ok(out) => String::from_utf8_lossy(&out.stdout)
             .lines()
@@ -129,11 +124,9 @@ pub fn execute_cleanup(repo: &Path, checks: &[BranchCheck], dry_run: bool) -> (u
                     println!("{msg}");
                     log_lines.push(msg);
                 } else {
-                    let result = std::process::Command::new("git")
-                        .env("AGEND_GIT_BYPASS", "1")
-                        .args(["branch", "-d", &check.branch])
-                        .current_dir(repo)
-                        .output();
+                    // #1899: bounded via git_bypass (LOCAL 60s).
+                    let result =
+                        crate::git_helpers::git_bypass(repo, &["branch", "-d", &check.branch]);
                     match result {
                         Ok(out) if out.status.success() => {
                             let msg = format!("deleted: {} (PR #{})", check.branch, pr_number);

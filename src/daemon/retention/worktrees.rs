@@ -296,11 +296,8 @@ pub(crate) fn maybe_remove_candidate(
             // Best-effort: prune failure is non-fatal — the rename succeeded,
             // so the active worktree set no longer includes this path; a
             // stale `git worktree list` entry self-corrects on next lookup.
-            let prune = std::process::Command::new("git")
-                .args(["worktree", "prune"])
-                .current_dir(&repo)
-                .env("AGEND_GIT_BYPASS", "1")
-                .output();
+            // #1899: bounded via git_bypass (LOCAL 60s) — best-effort prune.
+            let prune = crate::git_helpers::git_bypass(&repo, &["worktree", "prune"]);
             if let Err(e) = prune {
                 tracing::warn!(error = %e, "git worktree prune failed (non-fatal)");
             }

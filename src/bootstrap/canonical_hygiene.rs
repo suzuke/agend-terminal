@@ -114,15 +114,9 @@ pub(crate) fn apply_to_canonical(canonical: &std::path::Path) {
     match decide_canonical_action(&head_state, working_tree_clean) {
         CanonicalAction::NoOp => {}
         CanonicalAction::SwitchToDefault => {
-            let switch_result = std::process::Command::new("git")
-                .args([
-                    "-C",
-                    &canonical.display().to_string(),
-                    "switch",
-                    DEFAULT_BRANCH,
-                ])
-                .env("AGEND_GIT_BYPASS", "1")
-                .output();
+            // #1899: bounded via git_bypass (current_dir == `-C`, LOCAL 60s).
+            let switch_result =
+                crate::git_helpers::git_bypass(canonical, &["switch", DEFAULT_BRANCH]);
             match switch_result {
                 Ok(out) if out.status.success() => {
                     tracing::info!(
@@ -171,15 +165,9 @@ fn apply_stash_and_switch(canonical: &std::path::Path) {
             emit_dirty_detached_warning(canonical);
         }
         Ok(()) => {
-            let switch_result = std::process::Command::new("git")
-                .args([
-                    "-C",
-                    &canonical.display().to_string(),
-                    "switch",
-                    DEFAULT_BRANCH,
-                ])
-                .env("AGEND_GIT_BYPASS", "1")
-                .output();
+            // #1899: bounded via git_bypass (current_dir == `-C`, LOCAL 60s).
+            let switch_result =
+                crate::git_helpers::git_bypass(canonical, &["switch", DEFAULT_BRANCH]);
             match switch_result {
                 Ok(out) if out.status.success() => {
                     tracing::info!(
@@ -231,22 +219,13 @@ fn emit_dirty_detached_warning(canonical: &std::path::Path) {
 /// untracked files so any reviewer-left dirt is captured even when
 /// it hasn't been `git add`-ed.
 fn git_stash_push(canonical: &std::path::Path, message: &str) -> Result<(), String> {
-    let out = match std::process::Command::new("git")
-        .args([
-            "-C",
-            &canonical.display().to_string(),
-            "stash",
-            "push",
-            "-u",
-            "-m",
-            message,
-        ])
-        .env("AGEND_GIT_BYPASS", "1")
-        .output()
-    {
-        Ok(o) => o,
-        Err(e) => return Err(format!("spawn failed: {e}")),
-    };
+    // #1899: bounded via git_bypass (current_dir == `-C`, LOCAL 60s). `stash
+    // push` is a LOCAL stash op (NOT `git push` / network).
+    let out =
+        match crate::git_helpers::git_bypass(canonical, &["stash", "push", "-u", "-m", message]) {
+            Ok(o) => o,
+            Err(e) => return Err(format!("spawn failed: {e}")),
+        };
     if out.status.success() {
         Ok(())
     } else {
@@ -275,10 +254,8 @@ fn notify_operator_of_auto_stash(canonical: &std::path::Path, stash_message: &st
 /// bypass the shim's restrictions on boot), capture trimmed stdout
 /// on success. Returns `None` on spawn failure or non-zero exit.
 fn git_capture(repo: &std::path::Path, args: &[&str]) -> Option<String> {
-    let mut cmd = std::process::Command::new("git");
-    cmd.arg("-C").arg(repo).args(args);
-    cmd.env("AGEND_GIT_BYPASS", "1");
-    let out = match cmd.output() {
+    // #1899: bounded via git_bypass (current_dir == `-C`, LOCAL 60s).
+    let out = match crate::git_helpers::git_bypass(repo, args) {
         Ok(o) => o,
         Err(e) => {
             tracing::debug!(
