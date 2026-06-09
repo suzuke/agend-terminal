@@ -580,6 +580,36 @@ fn usage_limit_notify_path(home: &std::path::Path) -> std::path::PathBuf {
     home.join("usage_limit_notify.json")
 }
 
+/// #1906: drop one agent's usage-limit notify-dedup entry on delete, so a
+/// same-name redeploy does NOT inherit stale suppression and silently eat its
+/// first real usage_limit notify (until the #1894/#1895 stale-unlock window).
+/// Mirrors `escalation_persist::remove` (#1680 stale-state-on-redeploy class).
+/// Locked RMW via `with_json_state`; no-op when the store is absent.
+pub(crate) fn remove_usage_limit_notify(home: &std::path::Path, name: &str) {
+    let path = usage_limit_notify_path(home);
+    if !path.exists() {
+        return;
+    }
+    let _ = crate::store::with_json_state::<
+        std::collections::HashMap<String, UsageNotifyRecord>,
+        _,
+        _,
+    >(&path, |map| {
+        map.remove(name);
+    });
+}
+
+/// #1906: does the usage-limit notify-dedup store still hold `name`? For the
+/// `full_delete_instance` residual audit (this store was a teardown blind spot).
+pub(crate) fn usage_limit_notify_has(home: &std::path::Path, name: &str) -> bool {
+    std::fs::read_to_string(usage_limit_notify_path(home))
+        .ok()
+        .and_then(|s| {
+            serde_json::from_str::<std::collections::HashMap<String, UsageNotifyRecord>>(&s).ok()
+        })
+        .is_some_and(|m| m.contains_key(name))
+}
+
 /// The UTC instant an `HH:MM` unlock window elapses, anchored to `notified_at`
 /// (the next occurrence of HH:MM at-or-after the notify, treated as UTC since the
 /// pane renders e.g. "Resets at 15:14 UTC"). `None` if unparseable.
