@@ -89,7 +89,15 @@ fn spawn_group_bounded(
     }
     let mut child = cmd.spawn()?;
 
+    // #1897: poll with EXPONENTIAL BACKOFF (1ms → 50ms cap). The previous fixed
+    // 200ms poll added up to 200ms of latency per git call vs the old immediate
+    // `.output()`, which PERTURBED timing-sensitive concurrent callers (the
+    // `checkout_bind_true_concurrent_branch_create_race` test flaked ~50%). A
+    // fast git op (the common case — rev-parse / branch / status are sub-100ms)
+    // now returns within a couple ms, matching `.output()` latency; a genuinely
+    // slow op backs off to a cheap 50ms poll.
     let start = std::time::Instant::now();
+    let mut poll = Duration::from_millis(1);
     loop {
         match child.try_wait()? {
             Some(_status) => return child.wait_with_output(),
@@ -101,7 +109,10 @@ fn spawn_group_bounded(
                     format!("{label} timed out after {timeout:?}"),
                 ));
             }
-            None => std::thread::sleep(Duration::from_millis(200)),
+            None => {
+                std::thread::sleep(poll);
+                poll = (poll * 2).min(Duration::from_millis(50));
+            }
         }
     }
 }
