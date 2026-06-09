@@ -261,6 +261,11 @@ impl PerTickHandler for RecoveryDispatcherHandler {
         let targets: Vec<RecoveryTarget> = {
             let reg = agent::lock_registry_tracked(ctx.registry, "recovery_dispatcher");
             reg.values()
+                // #1915 TIER-B2: skip a handle being deleted (deleted flag set in
+                // delete_transaction Step1, handle removed Step4) — don't dispatch
+                // hang-recovery (PTY writes / stage2) to an instance mid-teardown.
+                // Separate concern from the spawn chokepoint.
+                .filter(|h| !h.deleted.load(std::sync::atomic::Ordering::Acquire))
                 .map(|h| RecoveryTarget {
                     name: h.name.to_string(),
                     core: Arc::clone(&h.core),

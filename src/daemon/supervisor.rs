@@ -1091,6 +1091,12 @@ fn tick(
     let handles: Vec<(String, String, _)> = {
         let reg = agent::lock_registry(registry);
         reg.values()
+            // #1915 TIER-B1: skip a handle being deleted (deleted flag set in
+            // delete_transaction Step1, handle removed Step4) — otherwise the
+            // transition-reaction loop below fires spurious orchestrator
+            // notifications (NotifySeverity::Error) about an instance that is
+            // mid-teardown. Separate concern from the spawn chokepoint.
+            .filter(|h| !h.deleted.load(std::sync::atomic::Ordering::Acquire))
             .map(|h| {
                 (
                     h.name.to_string(),

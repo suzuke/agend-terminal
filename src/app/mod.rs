@@ -1496,6 +1496,10 @@ fn scroll_focused(layout: &mut Layout, delta: i32) {
 /// `kill_process_tree` + synchronous wait-for-exit + `take_binding` + event
 /// log, matching the API delete path.
 fn kill_agent(home: &Path, registry: &AgentRegistry, name: &str) {
+    // #1915: app-mode teardown entry — mark "deleting" so a concurrent spawn
+    // (e.g. a crash-respawn triggered by the kill below) cannot resurrect the
+    // instance. Guard held to fn return; Drop un-marks on every path.
+    let _delete_guard = crate::agent::deleting::mark_deleting(home, name);
     crate::daemon::lifecycle::delete_transaction(home, name, registry, None, false);
 }
 

@@ -637,6 +637,50 @@ fn quick_user_exit_still_clean() {
     );
 }
 
+/// #1915 chokepoint: `spawn_agent` refuses an instance that is mid-delete,
+/// BEFORE any side effect (`build_command` / child spawn). Covers the
+/// crash-respawn-worker / stage2-restart / direct-`spawn_agent` resurrection
+/// paths — they all funnel through here. No registry handle is inserted.
+#[test]
+fn spawn_agent_refuses_mid_delete_1915() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static C: AtomicU32 = AtomicU32::new(0);
+    let home = std::env::temp_dir().join(format!(
+        "agend-spawn-del-{}-{}",
+        std::process::id(),
+        C.fetch_add(1, Ordering::Relaxed)
+    ));
+    let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+    // Mark mid-delete, as `full_delete_instance`'s guard would.
+    let _guard = crate::agent::deleting::mark_deleting(&home, "victim");
+    let cfg = SpawnConfig {
+        name: "victim",
+        backend_command: "true",
+        args: &[],
+        spawn_mode: crate::backend::SpawnMode::Fresh,
+        cols: 80,
+        rows: 24,
+        env: None,
+        working_dir: None,
+        submit_key: "\r",
+        home: Some(&home),
+        crash_tx: None,
+        shutdown: None,
+    };
+    let err = match spawn_agent(&cfg, &registry) {
+        Ok(()) => panic!("#1915: a mid-delete spawn must be refused, got Ok"),
+        Err(e) => format!("{e}"),
+    };
+    assert!(
+        err.contains("mid-delete") || err.contains("#1915"),
+        "refusal should name the chokepoint, got: {err}"
+    );
+    assert!(
+        registry.lock().is_empty(),
+        "#1915: bailed before the insert — no handle, no resurrection"
+    );
+}
+
 /// Deleted agent: reaper should not spawn shell fallback when deleted flag is set.
 /// Behavioral test: spawn a short-lived process, set deleted=true, verify
 /// no shell replacement appears in registry after exit.

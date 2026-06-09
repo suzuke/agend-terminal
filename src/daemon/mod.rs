@@ -1502,6 +1502,20 @@ fn spawn_and_register_agent(
     shutdown: &Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<()> {
     let (name, command, args, env, working_dir, submit_key) = def;
+    // #1915 chokepoint (boot path): skip an instance deleted mid-boot BEFORE the
+    // skills-install below re-creates `workspace/<name>`. The boot loop iterates a
+    // fleet snapshot with a ~500ms inter-spawn stagger; a delete in that window
+    // must not be resurrected. Complements the #1918 (b) `instance_is_known`
+    // recheck in the spawn loop — that catches a delete that already removed the
+    // fleet.yaml entry; this deleting-set check covers the in-flight teardown
+    // (entry not yet removed). Leaf-lock check, no registry lock held.
+    if crate::agent::deleting::is_deleting(home, name) {
+        tracing::info!(
+            agent = %name,
+            "skipping spawn — instance is mid-delete (#1915 deleting-set chokepoint)"
+        );
+        return Ok(());
+    }
     let worktree_source = working_dir
         .as_ref()
         .and_then(|wd| crate::worktree::source_repo_of(wd));
@@ -2539,6 +2553,49 @@ mod tests {
         );
 
         kill_registered_child(&registry, "probe-1");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1915 boot-path chokepoint: `spawn_and_register_agent` must SKIP an
+    /// instance that is mid-delete (the boot-stagger resurrection: the loop holds
+    /// a fleet snapshot, an instance deleted during the stagger must not be
+    /// re-spawned + have its `workspace/<name>` re-created by skills-install).
+    /// Also proves the deleting-set does NOT leak the name: after the delete
+    /// completes (guard drop), a re-create of the SAME name spawns normally.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_and_register_agent_skips_mid_delete_1915() {
+        let home = tmp_home("mid_delete");
+        let run_dir = setup_run_dir_with_cookie(&home);
+        seed_fleet_ids(&home, &["victim"]);
+        let (registry, configs, crash_tx, _crash_rx, shutdown) = make_test_registry();
+        let def = make_shell_agent_def("victim");
+
+        // Mark victim mid-delete (as full_delete_instance's guard would).
+        let guard = crate::agent::deleting::mark_deleting(&home, "victim");
+
+        spawn_and_register_agent(&home, &def, &registry, &configs, &crash_tx, &shutdown)
+            .expect("returns Ok (clean skip, not Err)");
+        assert!(
+            crate::ipc::read_port(&run_dir, "victim").is_none(),
+            "#1915: a mid-delete instance must NOT be spawned — no port published"
+        );
+        assert!(
+            registry.lock().is_empty(),
+            "#1915: a mid-delete instance must NOT be registered — no resurrection"
+        );
+
+        // Delete completes → guard drops → name un-marked → re-create succeeds
+        // (deleting-set must not leave the name permanently un-spawnable).
+        drop(guard);
+        spawn_and_register_agent(&home, &def, &registry, &configs, &crash_tx, &shutdown)
+            .expect("re-create after delete spawns");
+        assert!(
+            crate::ipc::read_port(&run_dir, "victim").is_some(),
+            "#1915 no-leak: same name re-creatable once the delete (guard) is done"
+        );
+
+        kill_registered_child(&registry, "victim");
         std::fs::remove_dir_all(&home).ok();
     }
 

@@ -69,6 +69,14 @@ fn remove_empty_dir_tree(dir: &Path) {
 /// is a human-readable string listing the residual stores plus any
 /// per-step error captured during cleanup.
 pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String> {
+    // #1915: mark this instance "deleting" for the ENTIRE teardown — the guard is
+    // held until this fn returns (after workspace cleanup + the residual audit
+    // below), so any concurrent spawn (boot-stagger / crash-respawn worker /
+    // stage2) is refused at the `spawn_agent` / `spawn_and_register_agent`
+    // chokepoints. `DeletingGuard::drop` un-marks on EVERY path (normal return,
+    // early `Err`, panic), so the name is always re-creatable afterwards — a
+    // leaked mark would make it un-spawnable for the daemon's lifetime.
+    let _delete_guard = crate::agent::deleting::mark_deleting(home, name);
     let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok();
     let (topic_id, working_dir) = fleet
         .as_ref()

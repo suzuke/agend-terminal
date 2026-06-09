@@ -18,6 +18,8 @@ use std::sync::Arc;
 mod dismiss;
 pub use dismiss::try_dismiss_dialog;
 
+pub mod deleting;
+
 pub type PtyWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
 /// Core state for one agent — protected by a single Mutex for atomic operations.
@@ -953,6 +955,20 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
         crash_tx,
         shutdown,
     } = config;
+
+    // #1915 chokepoint: refuse to spawn an instance that is mid-delete, BEFORE
+    // any side effect — `build_command` below sets the child cwd and spawns the
+    // child, which re-creates `workspace/<name>`. Covers the crash-respawn
+    // worker / stage2-restart / direct-spawn resurrection paths (the boot path is
+    // gated earlier, in `spawn_and_register_agent`, before skills-install). The
+    // deleting-set is a LEAF lock checked before any `registry.lock()` here.
+    if let Some(home_path) = *home {
+        if deleting::is_deleting(home_path, name) {
+            anyhow::bail!(
+                "#1915: refusing to spawn '{name}' — instance is mid-delete (deleting-set chokepoint)"
+            );
+        }
+    }
 
     let (cmd, detected_backend) = build_command(config)?;
 
