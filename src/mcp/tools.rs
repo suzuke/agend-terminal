@@ -33,8 +33,6 @@ pub(crate) fn def_send() -> Value {
             "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags filter (broadcast mode)"},
             "message": {"type": "string", "description": "Message text (or 'task' for delegate, 'summary' for report, 'question' for query)"},
             "request_kind": {"type": "string", "enum": ["query", "task", "report", "update"], "description": "Message kind (determines behavior). NOTE: kind=task requires task_id (Sprint 58 Wave 4 PR-1 anti-stall contract)."},
-            "requires_reply": {"type": "boolean"},
-            "task_summary": {"type": "string"},
             "success_criteria": {"type": "string", "description": "For task delegation"},
             "context": {"type": "string"},
             "task_id": {"type": "string", "description": "Task board ID for correlation. REQUIRED when request_kind=task — caller must obtain via `task action=create` and reference the resulting `t-...` id, closing the Wave 3 PR-1 dispatch protocol gap."},
@@ -48,7 +46,6 @@ pub(crate) fn def_send() -> Value {
             "reviewed_head": {"type": "string", "description": "Git HEAD SHA at time of review"},
             "artifacts": {"type": "string"},
             "branch": {"type": "string"},
-            "working_directory": {"type": "string"},
             "sequencing": {"type": "string", "enum": ["parallel", "sequential", "sequential-merge-only"], "description": "Task execution order constraint"},
             "eta_minutes": {"type": "integer", "description": "Expected completion time in minutes"},
             "reporting_cadence": {"type": "string", "enum": ["per-pr", "wave-end", "both"], "description": "When implementer should report back"},
@@ -730,5 +727,126 @@ mod tests {
              reason (if internal/deprecated):\n{}",
             violations.join("\n")
         );
+    }
+
+    /// Ghost-directive guard (#1907 follow-up): the COMPLEMENT of #1505's
+    /// Invariant B. #1505 catches a handler READ with no schema declaration;
+    /// this catches a schema DECLARATION with no consumer — a field advertised
+    /// to agents that silently evaporates because no mechanism ever reads it
+    /// (the `working_directory`/`requires_reply`/`task_summary` class removed in
+    /// this PR; originally surfaced by the dispatch-directive-survival audit).
+    ///
+    /// Every `send` schema field must be either:
+    ///   (a) in `CONSUMED` — with a consumption-point cite (file:line + the
+    ///       mechanism). The cite makes the list a living doc and makes "just
+    ///       add it to CONSUMED" require inventing a real cite (caught in
+    ///       review), not a rubber stamp.
+    ///   (b) in `DEFERRED_ALLOWLIST` — with a roadmap ref, so an intentionally-
+    ///       deferred passthrough (#649 sequencing/eta_minutes/reporting_cadence:
+    ///       Phase-1 passthrough by design, Phase-2 consuming mechanism deferred)
+    ///       is HONESTLY recorded rather than dying silently like a ghost.
+    ///
+    /// RED proof: add `"ghost": {"type": "string"}` to the `send` schema (and no
+    /// consumer) → this test fails naming `ghost` as unclassified.
+    #[test]
+    fn send_schema_fields_are_consumed_or_deferred_allowlisted() {
+        use std::collections::BTreeSet;
+
+        // (1) The `send` tool's declared field set — from the BUILT schema JSON
+        //     (robust; not a source-parse of the json! literal).
+        let defs = tool_definitions();
+        let send = defs["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .find(|t| t["name"] == "send")
+            .expect("send tool registered");
+        let fields: BTreeSet<String> = send["inputSchema"]["properties"]
+            .as_object()
+            .expect("send inputSchema.properties")
+            .keys()
+            .cloned()
+            .collect();
+
+        // (2) Fields with a real consumer. The cite points at where the directive
+        //     is CONSUMED by a mechanism (not merely accepted/stored). A new
+        //     CONSUMED row must carry a real consumption-point cite.
+        const CONSUMED: &[(&str, &str)] = &[
+            ("instance", "comms.rs:147 resolve_instance → single-recipient routing"),
+            ("instances", "comms.rs:630 handle_broadcast recipient list"),
+            ("team", "comms.rs:629 handle_broadcast → teams::get_members"),
+            // tags: `is_some()` at comms.rs:19 / anti_stall.rs:42 triggers broadcast
+            // MODE, but the tag VALUE is never read — broadcast resolves recipients
+            // by team/instances only. Consumed as a mode flag, NOT as a target
+            // filter; value-based tag-targeting is NOT implemented.
+            ("tags", "comms.rs:19 is_some() triggers broadcast mode; value-based tag-targeting NOT implemented"),
+            ("message", "comms.rs:169 task body / lift_message for kind=report|query"),
+            ("request_kind", "comms.rs:30 handler routing + auto_close.rs kind gate"),
+            ("success_criteria", "comms.rs:274 appended to delivered message body"),
+            ("context", "comms.rs:277 appended to delivered message body"),
+            ("task_id", "comms.rs:189 enriching-gate + dispatch_hook ci_watch sidecar correlation"),
+            ("correlation_id", "messaging.rs:248 envelope → auto_close_on_report + dispatch_idle"),
+            ("parent_id", "messaging.rs InboxMessage envelope → threading / PTY notify"),
+            ("thread_id", "inbox/storage.rs:933 get_thread grouping"),
+            ("force", "comms.rs:173 busy-gate override"),
+            ("force_reason", "comms.rs:174 force validation + force_meta"),
+            ("second_reviewer", "comms.rs:310 → review_class=\"dual\" on auto-armed watch"),
+            ("second_reviewer_reason", "comms.rs:236 dual-review reason validation"),
+            ("reviewed_head", "messaging.rs:459-480 sha-gate / auto-release verdict"),
+            ("artifacts", "comms.rs:468/491 report body + evidence gate"),
+            ("branch", "comms.rs:302 dispatch_auto_bind_lease → worktree + ci_watch sidecar"),
+            ("worktree_binding_required", "messaging.rs:276 check_worktree_enforcement gate"),
+            ("expect_reply_within_secs", "messaging.rs:497 → dispatch_idle threshold watchdog"),
+            ("next_after_ci", "comms.rs:309 → ci_watch poller fires [ci-ready-for-action]"),
+            ("terminal", "messaging.rs:533 msg.terminal → auto_close_on_report"),
+        ];
+
+        // (3) Deferred-roadmap passthrough: advertised by design; the Phase-2
+        //     consuming mechanism is deferred. MUST carry a roadmap ref so the
+        //     field is honestly documented, not a silent ghost.
+        const DEFERRED_ALLOWLIST: &[(&str, &str)] = &[
+            (
+                "sequencing",
+                "#649 Phase-1 passthrough; Phase-2 task-ordering scheduler deferred",
+            ),
+            (
+                "eta_minutes",
+                "#649 Phase-1 passthrough; Phase-2 ETA scheduler deferred",
+            ),
+            (
+                "reporting_cadence",
+                "#649 Phase-1 passthrough; Phase-2 cadence-reminder scheduler deferred",
+            ),
+        ];
+
+        let consumed: BTreeSet<&str> = CONSUMED.iter().map(|(k, _)| *k).collect();
+        let deferred: BTreeSet<&str> = DEFERRED_ALLOWLIST.iter().map(|(k, _)| *k).collect();
+
+        // (4) Forward: every declared field is classified.
+        let unclassified: Vec<&String> = fields
+            .iter()
+            .filter(|f| !consumed.contains(f.as_str()) && !deferred.contains(f.as_str()))
+            .collect();
+        assert!(
+            unclassified.is_empty(),
+            "#1907-followup: `send` schema field(s) {:?} have no consumer and aren't in \
+             the deferred-roadmap allowlist. A bare schema field with no mechanism is a \
+             GHOST — advertised to agents but silently dropped (the \
+             working_directory/requires_reply/task_summary class). Either (a) wire a \
+             consumer and add it to CONSUMED with a consumption-point cite, or (b) if it \
+             is an intentional deferred-roadmap passthrough, add it to DEFERRED_ALLOWLIST \
+             with an issue/roadmap ref.",
+            unclassified
+        );
+
+        // (5) Reverse: no stale CONSUMED/DEFERRED entry (a listed key that the
+        //     schema no longer declares — e.g. after a field removal).
+        for (k, _) in CONSUMED.iter().chain(DEFERRED_ALLOWLIST.iter()) {
+            assert!(
+                fields.contains(*k),
+                "#1907-followup: `{k}` is listed in CONSUMED/DEFERRED_ALLOWLIST but is no \
+                 longer a `send` schema field — remove the stale entry."
+            );
+        }
     }
 }

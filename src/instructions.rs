@@ -223,7 +223,7 @@ pub(crate) fn build_instructions_body(
         "  - `instance` (single recipient) OR `instances` / `team` / `tags` (broadcast mode)\n",
     );
     content.push_str("  - `request_kind`: `task` (delegation, expects report back) / `report` (results back) / `query` (question, expects reply) / `update` (status) / omit (plain message)\n");
-    content.push_str("  - Task-mode optional fields: `success_criteria`, `task_id`, `force` + `force_reason`, `second_reviewer` + `second_reviewer_reason`, `branch`, `working_directory`\n");
+    content.push_str("  - Task-mode optional fields: `success_criteria`, `task_id`, `force` + `force_reason`, `second_reviewer` + `second_reviewer_reason`, `branch`\n");
     content.push_str(
         "  - Report-mode optional fields: `correlation_id`, `reviewed_head`, `artifacts`\n",
     );
