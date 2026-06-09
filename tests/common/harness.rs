@@ -29,6 +29,10 @@ impl AgendHarness {
     /// fleet.yaml dependency) without requiring fleet.yaml to be
     /// non-empty. Tests passing `instances: {}` continue to work
     /// because `--agents` overrides fleet loading.
+    // `#[allow(dead_code)]` mirrors the cross-binary pattern on `spawn_with` /
+    // `api_call`: a test file (e.g. `e2e_workflow`) that uses only `spawn_with`
+    // would otherwise trip dead_code on this method under `-D warnings`.
+    #[allow(dead_code)]
     pub fn spawn(home: PathBuf, fleet_yaml: &str) -> Result<Self, String> {
         Self::spawn_with_args(
             home,
@@ -385,6 +389,7 @@ pub struct TuiClient {
 }
 
 impl TuiClient {
+    #[allow(dead_code)]
     pub fn new(harness: &AgendHarness, cols: u16, rows: u16) -> Self {
         Self {
             port: harness.api_port,
@@ -522,6 +527,7 @@ fn binary_path() -> PathBuf {
 /// subcommand. The default shell mirrors `default_shell()` in the main
 /// crate (cmd.exe on Windows, /bin/bash elsewhere) so behavior matches
 /// the pre-Wave-1 semantics.
+#[allow(dead_code)]
 fn default_test_shell() -> &'static str {
     if cfg!(windows) {
         "cmd.exe"
