@@ -25,6 +25,16 @@ const TICK: Duration = Duration::from_secs(10);
 const TAIL_LINES: usize = 40;
 /// Debounce cooldown for member-state-change notify (Sprint 43).
 const NOTIFY_COOLDOWN: Duration = Duration::from_secs(60);
+/// #1894: null-unlock_at usage_limit re-notify window. When the pane had no
+/// parseable "try again at <time>" at detection (e.g. it was showing
+/// poll-reminders), `parse_unlock_at` records `unlock_at: null` and the dedup
+/// falls back to a TIMESTAMP cooldown. #1861/#1864 used the 60s `NOTIFY_COOLDOWN`
+/// here, which restarts hours apart trivially exceed → the operator was re-paged
+/// on every boot for the SAME ongoing limit. A real usage-limit episode lasts
+/// hours-to-days, so suppress for a long window: a multi-day limit re-notifies at
+/// most ~once/day instead of once/restart. Parseable-unlock_at suppression
+/// (#1864) is unchanged, and a missing/corrupt record still FAILS OPEN (notify).
+const NULL_UNLOCK_NOTIFY_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// #1552: minimum continuous time in a runtime prompt state before escalating
 /// to AwaitingOperator (stability gate — a transient streaming flicker of the
@@ -618,12 +628,16 @@ fn usage_limit_notify_suppressed(
         // notify again). Unparseable deadline ⇒ conservatively suppress (an
         // identical string is a strong same-window signal).
         Some(u) => unlock_deadline(u, notified_at).is_none_or(|deadline| now < deadline),
-        // No parseable reset time ⇒ persisted-timestamp cooldown (NOT the
-        // in-session Instant cooldown a restart wipes).
+        // No parseable reset time ⇒ persisted-timestamp window (NOT the in-session
+        // Instant cooldown a restart wipes). #1894: use the long
+        // `NULL_UNLOCK_NOTIFY_WINDOW` (24h) instead of the 60s `NOTIFY_COOLDOWN`,
+        // so restarts WITHIN the same ongoing usage-limit episode (which the
+        // operator hit repeatedly) stay silent. A genuinely-new episode > the
+        // window later re-notifies.
         None => {
             now.signed_duration_since(notified_at)
-                < chrono::Duration::from_std(NOTIFY_COOLDOWN)
-                    .unwrap_or_else(|_| chrono::Duration::seconds(60))
+                < chrono::Duration::from_std(NULL_UNLOCK_NOTIFY_WINDOW)
+                    .unwrap_or_else(|_| chrono::Duration::hours(24))
         }
     }
 }
@@ -3055,11 +3069,15 @@ instances:
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// #1861 §3.9 (helper): an UNPARSEABLE unlock time falls back to a PERSISTED
-    /// timestamp cooldown (NOT the in-session Instant cooldown a restart wipes).
+    /// #1894 §3.9 (helper): an UNPARSEABLE unlock time falls back to the long
+    /// `NULL_UNLOCK_NOTIFY_WINDOW` (24h), NOT the 60s cooldown — so restarts hours
+    /// apart WITHIN the same ongoing usage-limit episode stay silent (the operator
+    /// pain). A genuinely-new episode past the window re-notifies. Regression-
+    /// proof: revert to `NOTIFY_COOLDOWN` and the 5h-restart assertion flips to
+    /// re-notify (the #1861/#1864 residual).
     #[test]
-    fn usage_limit_null_unlock_fallback_cooldown_1861() {
-        let home = tmp_home("1861-null");
+    fn usage_limit_null_unlock_long_window_1894() {
+        let home = tmp_home("1894-null");
         std::fs::create_dir_all(&home).ok();
         std::fs::write(
             super::usage_limit_notify_path(&home),
@@ -3078,16 +3096,32 @@ instances:
                 None,
                 at("2026-06-09T14:00:30+00:00")
             ),
-            "null unlock_at within the persisted cooldown → suppress"
+            "null unlock_at, +30s → suppress"
         );
+        // The fix: a restart HOURS later (same ongoing limit) is still suppressed.
+        assert!(
+            super::usage_limit_notify_suppressed(&home, "dev", None, at("2026-06-09T19:00:00+00:00")),
+            "#1894: null unlock_at, +5h restart (same episode) → still suppress (was re-notify at 60s)"
+        );
+        // Past the 24h window (a genuinely-new episode) → re-notify.
         assert!(
             !super::usage_limit_notify_suppressed(
                 &home,
                 "dev",
                 None,
-                at("2026-06-09T14:05:00+00:00")
+                at("2026-06-10T15:00:00+00:00")
             ),
-            "null unlock_at past the persisted cooldown → re-notify"
+            "#1894: null unlock_at, +25h (past window) → re-notify"
+        );
+        // Missing record still FAILS OPEN (notify) — never silently swallowed.
+        assert!(
+            !super::usage_limit_notify_suppressed(
+                &home,
+                "ghost",
+                None,
+                at("2026-06-09T14:00:30+00:00")
+            ),
+            "no record → FAIL-OPEN re-notify (#1864 contract preserved)"
         );
         std::fs::remove_dir_all(&home).ok();
     }
