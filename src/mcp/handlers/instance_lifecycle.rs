@@ -21,6 +21,22 @@ use crate::channel::telegram;
 use serde_json::json;
 use std::path::Path;
 
+/// #1907: remove `dir` and any empty subdirectories bottom-up, stopping at any
+/// non-empty dir. Used to drop a deleted agent's worktree root including the
+/// intermediate dirs a slash-containing branch nests (`worktrees/<name>/feat/x/`),
+/// while preserving a refused unmanaged worktree (its real files keep its dir
+/// non-empty, so it's left for the residual audit to surface).
+fn remove_empty_dir_tree(dir: &Path) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                remove_empty_dir_tree(&entry.path());
+            }
+        }
+    }
+    let _ = std::fs::remove_dir(dir); // succeeds only if now-empty
+}
+
 /// Sprint 53 Smoke 2 r1: shared full single-instance teardown used by both
 /// the MCP `delete_instance` handler and the TUI close path
 /// (`app/overlay.rs::Overlay::ConfirmClose`). Covers everything
@@ -87,16 +103,35 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
     } else {
         tracing::warn!(%name, "no topic_id found for full_delete_instance — possible orphan");
     }
-    if let Some(ref wd) = working_dir {
-        cleanup_working_dir(home, name, wd);
-    }
+    // #1907: default to `workspace/<name>` when the fleet entry has no explicit
+    // `working_directory`. Otherwise the daemon-created default workspace dir
+    // (per-backend skills/config under `$AGEND_HOME/workspace/<name>`) LEAKS on
+    // delete — `cleanup_working_dir` only ran when the resolver returned a path,
+    // but it returns `None` for the (common) entries that never set
+    // `working_directory:` explicitly. `cleanup_working_dir` only `remove_dir_all`s
+    // paths UNDER `$AGEND_HOME/workspace/`, so a user-provided dir is never nuked —
+    // the default fed here is always under workspace/, the path it's safe to remove.
+    let wd = working_dir
+        .clone()
+        .unwrap_or_else(|| crate::paths::workspace_dir(home).join(name));
+    cleanup_working_dir(home, name, &wd);
     // #1157: clean id-based metadata. Fleet.yaml is already removed above,
     // so cleanup_working_dir's best-effort lookup may miss the id path.
     // #1682: construct the id path via agent_ops (fleet.yaml is gone, so the
     // name→id resolver can't be used here — feed the captured id directly).
+    // #1907: also drop the `<…>.lock` flock sidecar that `with_json_state` /
+    // `acquire_file_lock` leaves next to the data file. The data removal above
+    // (and the inbox removal below) left the advisory-lock files behind, and the
+    // whole-home audit correctly flags a `<uuid>.lock` / `<uuid>.jsonl.lock` as a
+    // name/uuid-bearing residual. The lock is stateless (re-acquired on next use),
+    // but a complete teardown leaves nothing name/uuid-keyed on disk.
+    let _ =
+        std::fs::remove_file(crate::agent_ops::metadata_path(home, name).with_extension("lock"));
     if let Some(ref id) = instance_id {
         if let Some(id) = crate::types::InstanceId::parse(id) {
-            let _ = std::fs::remove_file(crate::agent_ops::metadata_path_for_id(home, &id));
+            let mp = crate::agent_ops::metadata_path_for_id(home, &id);
+            let _ = std::fs::remove_file(&mp);
+            let _ = std::fs::remove_file(mp.with_extension("lock"));
         }
     }
     // #1902: delete the inbox file — this step was MISSING entirely, so a deleted
@@ -106,10 +141,14 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
     // the captured id directly (same #1682 name↔UUID-resolution trap the metadata
     // cleanup above sidesteps). The residual audit only saw the name path, so the
     // UUID inbox was leaking even past the audit.
-    let _ = std::fs::remove_file(crate::inbox::storage::inbox_path(home, name));
+    let inbox_name = crate::inbox::storage::inbox_path(home, name);
+    let _ = std::fs::remove_file(&inbox_name);
+    let _ = std::fs::remove_file(inbox_name.with_extension("jsonl.lock")); // #1907 flock sidecar
     if let Some(ref id) = instance_id {
         if let Some(id) = crate::types::InstanceId::parse(id) {
-            let _ = std::fs::remove_file(crate::inbox::storage::inbox_path_for_id(home, &id));
+            let inbox_id = crate::inbox::storage::inbox_path_for_id(home, &id);
+            let _ = std::fs::remove_file(&inbox_id);
+            let _ = std::fs::remove_file(inbox_id.with_extension("jsonl.lock"));
         }
     }
     crate::teams::remove_member_from_all(home, name);
@@ -160,6 +199,10 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
     let _ = crate::dispatch_tracking::cleanup_for_instance(home, name);
     // - ci_watch: drop from subscribers + clear next_after_ci (+ remove empty).
     let _ = crate::daemon::ci_watch::cleanup_watches_for_instance(home, name);
+    // #1907: scrub the deleted instance from pr_state subscriber lists — same
+    // per-instance-residual class as ci_watch above, but this store had no
+    // teardown cleanup before (PR events would route at a vacant/redeployed slot).
+    let _ = crate::daemon::pr_state::cleanup_subscribers_for_instance(home, name);
     // #1519: GC the per-instance opencode data dir ($AGEND_HOME/backend-data/
     // opencode/<name> — the per-instance XDG_DATA_HOME holding its isolated
     // session DB + copied auth). No-op for non-opencode instances (the dir was
@@ -182,12 +225,15 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
     // defensive idempotent no-op for the bound-agent case (still needed for the
     // never-bound / partial-state cases).
     let _ = crate::worktree_pool::release_full(home, name, false);
-    // release_full removes `worktrees/<name>/<branch>/`; drop the now-empty agent
-    // dir `worktrees/<name>/` too so the audit below reads clean. `remove_dir`
-    // (NOT remove_dir_all) only succeeds when empty — a refused unmanaged worktree
-    // stays put and is correctly surfaced by the residual audit.
-    let _ =
-        std::fs::remove_dir(crate::worktree_pool::daemon_managed_worktree_root(home).join(name));
+    // release_full removes the leaf worktree `worktrees/<name>/<branch>/`; drop the
+    // now-empty agent dir `worktrees/<name>/` too so the audit below reads clean.
+    // #1907: a slash-containing branch (e.g. `feat/x`) nests intermediate dirs
+    // (`worktrees/<name>/feat/x/`), so a single `remove_dir` of `<name>/` failed
+    // (still held the empty `feat/`) and leaked the agent dir. `remove_empty_dir_tree`
+    // removes empty dirs bottom-up and STOPS at any non-empty dir — so a refused
+    // unmanaged worktree (real files) stays put and is correctly surfaced by the
+    // residual audit, exactly like the old `remove_dir` intent.
+    remove_empty_dir_tree(&crate::worktree_pool::daemon_managed_worktree_root(home).join(name));
 
     // #1879 (BIND-1): clear the worktree binding (`runtime/<name>/binding.json`
     // + its HMAC sidecar + the bind-in-flight flag). Every OTHER store above is
@@ -197,6 +243,12 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
     // → the whole teardown returned Err despite otherwise succeeding.
     crate::binding::unbind(home, name);
     crate::mcp::handlers::dispatch_hook::clear_bind_in_flight(home, name);
+    // #1907: `unbind` drops binding.json + its HMAC sidecar but leaves the now-empty
+    // `runtime/<name>/` dir + its `.binding.json.lock` flock behind. Remove the whole
+    // dir so teardown is fully clean (the residual audit below now checks it). Safe:
+    // the agent is dead (api::call(DELETE) waited for exit), so no concurrent bind
+    // re-creates it; `runtime/<name>/` holds only this agent's binding artefacts.
+    let _ = std::fs::remove_dir_all(crate::paths::runtime_dir(home).join(name));
 
     // Sprint 54 P1-B Bug 1 audit: enumerate every store that still holds
     // the name. If any do, surface a loud error instead of returning
@@ -313,6 +365,49 @@ pub(crate) fn name_residual_anywhere(
         .exists()
     {
         sources.push("worktree");
+    }
+    // #1907 teardown-completeness: the remaining per-instance stores that
+    // `full_delete_instance` cleans but the audit previously did not check. Each
+    // detector mirrors its cleanup's predicate exactly (see the `has_*` helpers).
+    // Allowlisted/intentional-retention stores (schedules, tasks, deployments,
+    // telegram topics.json) are DELIBERATELY absent — they retain state by design,
+    // so checking them here would make every delete return a false `Err`.
+    if home
+        .join("agent-activity")
+        .join(format!("{name}.json"))
+        .exists()
+    {
+        sources.push("agent-activity");
+    }
+    if crate::daemon::escalation_persist::load_for(home, name).is_some() {
+        sources.push("escalation");
+    }
+    if crate::dispatch_tracking::has_for_instance(home, name) {
+        sources.push("dispatch_tracking");
+    }
+    if crate::daemon::dispatch_idle::has_pending_for_instance(home, name) {
+        sources.push("pending-dispatch");
+    }
+    if crate::daemon::ci_watch::has_instance_anywhere(home, name) {
+        sources.push("ci-watch");
+    }
+    if crate::agent::opencode_data_dir(home, name).exists() {
+        sources.push("opencode-data");
+    }
+    // #1907: the `runtime/<name>/` dir itself (empty dir + `.binding.json.lock`
+    // left behind by `unbind`; full_delete now removes the whole dir).
+    if crate::paths::runtime_dir(home).join(name).exists() {
+        sources.push("runtime-dir");
+    }
+    if crate::daemon::pr_state::has_subscriber(home, name) {
+        sources.push("pr-state");
+    }
+    // #1907: the daemon-created default workspace dir (`workspace/<name>`). Only a
+    // residual when the entry had no explicit `working_directory` AND the cleanup
+    // above failed — a user-provided working dir resolves elsewhere and never
+    // materialises here.
+    if crate::paths::workspace_dir(home).join(name).exists() {
+        sources.push("workspace");
     }
     sources
 }

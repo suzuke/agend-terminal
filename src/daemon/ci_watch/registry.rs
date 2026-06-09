@@ -148,6 +148,36 @@ pub fn cleanup_watches_for_instance(home: &Path, instance: &str) -> usize {
     affected
 }
 
+/// #1907 teardown audit: does any ci-watch still reference `instance` — in its
+/// `subscribers`, the legacy `instance` field, or `next_after_ci`? Mirrors the
+/// three scrub targets of [`cleanup_watches_for_instance`] exactly so the
+/// residual audit and the cleanup never disagree.
+pub fn has_instance_anywhere(home: &Path, instance: &str) -> bool {
+    let dir = ci_watches_dir(home);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(watch) = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|c| serde_json::from_str::<super::watch_state::WatchState>(&c).ok())
+        else {
+            continue;
+        };
+        if watch.subscriber_names().iter().any(|s| s == instance)
+            || watch.instance.as_deref() == Some(instance)
+            || watch.next_after_ci.as_deref() == Some(instance)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Deterministic, collision-resistant filename for a CI watch entry.
 /// Uses SHA-256 of `"{repo}:{branch}"` to avoid path traversal and
 /// collisions when repo names contain `/` (e.g. `owner/repo` vs

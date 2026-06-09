@@ -324,20 +324,27 @@ fn name_residual_anywhere_returns_multi_source_when_several_stores_dirty() {
 
 #[test]
 fn full_delete_instance_returns_err_when_residual_remains_post_cleanup() {
-    // Pre-seed metadata + inbox files before delete; daemon API is
-    // unreachable in the test process, so `api::call` fails
-    // (silently). fleet.yaml removal is also a no-op (no fleet.yaml
-    // present). The post-cleanup audit must surface the
-    // metadata/inbox residual and the fn must return Err.
+    // Pre-seed a notification-queue file before delete. The daemon API is
+    // unreachable in the test process, so `api::call(DELETE)` — the step that
+    // clears the queue via the registry — fails silently, and the disk-cleanup
+    // path in `full_delete_instance` does NOT touch notification-queue. So it
+    // genuinely survives, and the post-cleanup audit must surface it as residual
+    // → Err (the transactional-or-loud contract).
+    //
+    // #1907: the prior `metadata/zombie.json` seed is now correctly cleaned by
+    // `cleanup_working_dir`'s "always clean metadata" tail — which now runs even
+    // for entries with no explicit `working_directory` (previously skipped,
+    // leaking the default-workspace metadata). It can no longer prove the Err
+    // path; notification-queue is the residual that still does.
     let home = tmp_home("full_residual");
-    std::fs::create_dir_all(home.join("metadata")).unwrap();
-    std::fs::write(home.join("metadata").join("zombie.json"), "{}").unwrap();
+    std::fs::create_dir_all(home.join("notification-queue")).unwrap();
+    std::fs::write(home.join("notification-queue").join("zombie.jsonl"), "").unwrap();
     let result = super::full_delete_instance(&home, "zombie");
     let err = result.expect_err(
-        "metadata residual after cleanup must surface as Err — silent-drop class blocked",
+        "notification-queue residual after cleanup must surface as Err — silent-drop class blocked",
     );
     assert!(
-        err.contains("metadata"),
+        err.contains("notification-queue"),
         "Err detail must name the residual store, got: {err:?}"
     );
     std::fs::remove_dir_all(home).ok();

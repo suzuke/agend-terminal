@@ -460,6 +460,16 @@ pub(crate) fn cleanup_pending_for_instance(home: &Path, instance_name: &str) -> 
     count
 }
 
+/// #1907 teardown audit: does any pending-dispatch sidecar still target
+/// `instance_name`? Mirrors [`cleanup_pending_for_instance`]'s `d.target ==`
+/// predicate exactly so the residual audit and the cleanup never disagree.
+pub(crate) fn has_pending_for_instance(home: &Path, instance_name: &str) -> bool {
+    if instance_name.is_empty() {
+        return false;
+    }
+    list_pending(home).iter().any(|d| d.target == instance_name)
+}
+
 /// Resolve a pending dispatch by `correlation_id` (NOT by sender —
 /// decision_timeout's sender-keyed semantic is wrong here because a
 /// single dispatcher can have multiple pending dispatches outstanding,

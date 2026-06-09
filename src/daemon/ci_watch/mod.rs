@@ -47,7 +47,10 @@ pub use provider::{
     MergeableState, PrState,
 };
 #[allow(unused_imports)]
-pub use registry::{ci_watches_dir, cleanup_watches_for_instance, remove_watch, watch_filename};
+pub use registry::{
+    ci_watches_dir, cleanup_watches_for_instance, has_instance_anywhere, remove_watch,
+    watch_filename,
+};
 #[allow(unused_imports)]
 pub use sweep::{gc_stale_watches, startup_sweep};
 pub use watcher::check_ci_watches;

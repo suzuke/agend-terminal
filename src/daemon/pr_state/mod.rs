@@ -514,6 +514,97 @@ pub fn remove(home: &Path, repo: &str, branch: &str) -> std::io::Result<()> {
     }
 }
 
+/// #1907 teardown audit: scrub a deleted instance's name from every pr_state
+/// file's `subscribers` list. A deleted agent left in a subscriber array would
+/// route PR events ([ci-ready]/[pr-ready]) at a vacant or same-name-redeployed
+/// slot — the same per-instance-residual class the other cascade cleanups
+/// (ci_watch / dispatch_tracking) already close. This store had NO per-instance
+/// cleanup before. Best-effort, flock-serialized per file (via [`with_pr_state`]).
+/// Returns the number of files mutated.
+pub fn cleanup_subscribers_for_instance(home: &Path, name: &str) -> usize {
+    let dir = pr_state_dir(home);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    let mut mutated = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        // Value-based, NOT typed `PrState` parse: an audit/cleanup that silently
+        // skips a file it cannot fully deserialize is itself a leak-hiding bug (the
+        // #1902 "the oracle was leaky" lesson) — a schema-drifted or partially-
+        // written pr_state file that still names the deleted instance MUST be
+        // scrubbed. Flock-serialized on the same `<file>.lock` path `with_json_state`
+        // uses, so a concurrent gh-poll RMW cannot race this.
+        let lock_path = path.with_extension("lock");
+        let _lock = match crate::store::acquire_file_lock(&lock_path) {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        let Some(mut v) = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+        else {
+            continue;
+        };
+        let Some(subs) = v.get_mut("subscribers").and_then(|s| s.as_array_mut()) else {
+            continue;
+        };
+        let before = subs.len();
+        subs.retain(|s| s.as_str() != Some(name));
+        if subs.len() == before {
+            continue;
+        }
+        if crate::store::atomic_write(
+            &path,
+            serde_json::to_string_pretty(&v)
+                .unwrap_or_default()
+                .as_bytes(),
+        )
+        .is_ok()
+        {
+            mutated += 1;
+        }
+    }
+    if mutated > 0 {
+        tracing::info!(%name, count = mutated, "#1907: scrubbed deleted instance from pr_state subscribers");
+    }
+    mutated
+}
+
+/// #1907 teardown audit: does any pr_state file still list `name` as a
+/// subscriber? Value-based to mirror [`cleanup_subscribers_for_instance`] — it
+/// must detect the name even in a file that no longer parses as a full `PrState`,
+/// otherwise a malformed-but-name-bearing file is a silent residual.
+pub fn has_subscriber(home: &Path, name: &str) -> bool {
+    let dir = pr_state_dir(home);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let listed = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+            .and_then(|v| {
+                v.get("subscribers")
+                    .and_then(|s| s.as_array())
+                    .map(|arr| arr.iter().any(|s| s.as_str() == Some(name)))
+            })
+            .unwrap_or(false);
+        if listed {
+            return true;
+        }
+    }
+    false
+}
+
 /// Fixed 1h upper bound for "stale terminal state" classification at daemon
 /// boot — see [`suppress_stale_terminal_replay`]. (#env-cleanup: was
 /// env-overridable via `AGEND_PR_STATE_REPLAY_AGE_HOURS`; demoted to YAGNI.)

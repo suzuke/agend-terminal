@@ -178,6 +178,20 @@ pub fn cleanup_for_instance(home: &Path, instance: &str) -> usize {
     removed
 }
 
+/// #1907 teardown audit: does any dispatch_tracking entry still reference
+/// `instance` (as `from` or `to`)? Mirrors [`cleanup_for_instance`]'s retain
+/// predicate exactly so the residual audit and the cleanup never disagree.
+pub fn has_for_instance(home: &Path, instance: &str) -> bool {
+    let store: DispatchStore = crate::store::load_versioned(
+        &store_path(home),
+        <DispatchStore as crate::store::SchemaVersioned>::CURRENT,
+    );
+    store
+        .entries
+        .iter()
+        .any(|e| e.from == instance || e.to == instance)
+}
+
 /// #1488: distinct, still-active (`status != "completed"`) dispatch target
 /// names. The boot orphan sweep uses this to find entries whose `to` instance
 /// no longer exists, then reuses [`cleanup_for_instance`] to remove them —
