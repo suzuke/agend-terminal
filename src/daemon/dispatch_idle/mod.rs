@@ -941,6 +941,14 @@ fn stale_sidecar_reason(home: &Path, d: &PendingDispatch) -> Option<&'static str
     if !target_in_fleet(home, &d.target) {
         return Some("target_not_in_fleet");
     }
+    // #1923 G2: the DISPATCHER left the fleet (deleted / redeployed) → the
+    // pending-dispatch sidecar is an orphan whose idle nudge would route to a
+    // ghost dispatcher (and `dispatcher_team` lookups silently no-op, so the
+    // sidecar never self-cleans → infinite retry). `target_in_fleet` is a generic
+    // "agent in fleet.yaml" check, reused here for the dispatcher.
+    if !target_in_fleet(home, &d.dispatcher) {
+        return Some("dispatcher_not_in_fleet");
+    }
     if let Some(corr) = d.correlation_id.as_deref() {
         if let Some(false) = task_still_live(home, corr) {
             return Some("task_closed");
@@ -1423,7 +1431,9 @@ mod tests {
                                       // Live fleet + task so the sidecar isn't swept as stale before it fires.
         std::fs::write(
             crate::fleet::fleet_yaml_path(&home),
-            format!("instances:\n  {target}:\n    backend: claude\n"),
+            // #1923 G2: seed the dispatcher (`lead`) too — the new
+            // dispatcher-in-fleet stale check requires it (prod always has it).
+            format!("instances:\n  lead:\n    backend: claude\n  {target}:\n    backend: claude\n"),
         )
         .unwrap();
         let task_id = "t-idle-99";
@@ -1927,6 +1937,46 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// #1923 G2: a pending-dispatch sidecar whose DISPATCHER has left the fleet
+    /// (deleted / redeployed) is stale — its idle nudge would route to a ghost
+    /// dispatcher. `stale_sidecar_reason` must flag it `dispatcher_not_in_fleet`
+    /// (mirroring the existing `target_not_in_fleet` check); a live dispatcher is
+    /// not flagged.
+    #[test]
+    fn stale_sidecar_reason_flags_deleted_dispatcher_1923_g2() {
+        let home = tmp_home("g2-dispatcher-stale");
+        // fleet has the TARGET (`dev`) but NOT the dispatcher (it was deleted).
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  dev:\n    command: /bin/cat\n",
+        )
+        .expect("seed fleet.yaml");
+        let mk = |dispatcher: &str| PendingDispatch {
+            schema_version: SCHEMA_VERSION,
+            dispatch_id: "d1".into(),
+            dispatcher: dispatcher.into(),
+            target: "dev".into(),
+            correlation_id: Some("t-realtask".into()),
+            expected_kind: "task".into(),
+            threshold_secs: 600,
+            issued_at: chrono::Utc::now().to_rfc3339(),
+            status: DispatchStatus::Pending,
+            nudge_sent_at: None,
+            not_working_streak: 0,
+        };
+        assert_eq!(
+            stale_sidecar_reason(&home, &mk("ghost-lead")),
+            Some("dispatcher_not_in_fleet"),
+            "#1923 G2: a sidecar whose dispatcher left the fleet is stale"
+        );
+        assert_ne!(
+            stale_sidecar_reason(&home, &mk("dev")),
+            Some("dispatcher_not_in_fleet"),
+            "a live dispatcher must NOT be flagged stale"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     /// Stale filter: resolved / exceeded / cancelled sidecars do NOT
     /// surface. Only `status == "pending"` reaches L3.
     #[test]
@@ -2294,7 +2344,10 @@ mod tests {
         let home = tmp_home("1018-live");
         std::fs::write(
             crate::fleet::fleet_yaml_path(&home),
-            "instances:\n  fixup-dev-2:\n    backend: claude\n",
+            // #1923 G2: seed the DISPATCHER too (not just the target) — the
+            // dispatcher-in-fleet stale check now requires it, and in prod the
+            // dispatcher is always a live fleet agent.
+            "instances:\n  fixup-lead:\n    backend: claude\n  fixup-dev-2:\n    backend: claude\n",
         )
         .unwrap();
         let task_id = "t-live-99";

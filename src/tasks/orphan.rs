@@ -63,6 +63,11 @@ pub fn orphan_tasks_for_owner(home: &Path, owner_name: &str) -> Result<usize, St
     // committed first).
     for id in &affected {
         let _ = crate::daemon::dispatch_idle::reassign_pending_for_task(home, &id.0, None);
+        // #1923 G1/G3: an orphaned task has no owner → also clear the ci-watch
+        // handoff + dispatch-tracking entries for the task (same site as the
+        // dispatch-idle clear, with owner=None).
+        let _ = crate::daemon::ci_watch::reassign_next_after_ci(home, &id.0, None);
+        crate::dispatch_tracking::reassign_to(home, &id.0, None);
     }
     Ok(count)
 }

@@ -738,6 +738,12 @@ fn handle_update(
         if let Some(ref new_owner) = new_assignee {
             let _ =
                 crate::daemon::dispatch_idle::reassign_pending_for_task(home, &id, Some(new_owner));
+            // #1923 G1/G3: re-point the SAME task's ci-watch handoff (next_after_ci)
+            // + dispatch-tracking `to` to the new owner — sibling calls at the same
+            // OwnerAssigned emit site, so a reassigned review hands off / is tracked
+            // against the reviewer who now owns the task, not the stale original.
+            let _ = crate::daemon::ci_watch::reassign_next_after_ci(home, &id, Some(new_owner));
+            crate::dispatch_tracking::reassign_to(home, &id, Some(new_owner));
         }
     }
     // #807 Item 1: see create arm note.

@@ -148,6 +148,60 @@ pub fn cleanup_watches_for_instance(home: &Path, instance: &str) -> usize {
     affected
 }
 
+/// #1923 G1: on task reassignment, re-point the `next_after_ci` of any ci-watch
+/// carrying this `task_id` to the NEW owner, so the post-CI
+/// `[ci-ready-for-action]` handoff routes to the reviewer who now owns the task
+/// instead of the original owner frozen in at dispatch time (the HIGH gap — a
+/// reassigned review handed off to the wrong reviewer). Matched by `task_id`, NOT
+/// instance name (the same flock + atomic-write RMW as
+/// `cleanup_watches_for_instance`). `new_owner=None` (orphan) clears it. Returns
+/// the number of watches updated.
+pub fn reassign_next_after_ci(home: &Path, task_id: &str, new_owner: Option<&str>) -> usize {
+    if task_id.is_empty() {
+        return 0;
+    }
+    let dir = ci_watches_dir(home);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return 0;
+    };
+    let new_val = new_owner.map(|s| s.to_string());
+    let mut affected = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        // flock the watch so a concurrent poll/unwatch doesn't race the RMW.
+        let lock_path = path.with_extension("lock");
+        let _lock = match crate::store::acquire_file_lock(&lock_path) {
+            Ok(l) => l,
+            Err(_) => continue, // contended → skip; the next reassign/boot retries
+        };
+        let mut watch: super::watch_state::WatchState = match std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|c| serde_json::from_str::<super::watch_state::WatchState>(&c).ok())
+        {
+            Some(w) => w,
+            None => continue,
+        };
+        if watch.task_id.as_deref() != Some(task_id) || watch.next_after_ci == new_val {
+            continue;
+        }
+        watch.next_after_ci = new_val.clone();
+        if let Err(e) = crate::store::atomic_write(
+            &path,
+            serde_json::to_string_pretty(&watch)
+                .unwrap_or_default()
+                .as_bytes(),
+        ) {
+            tracing::warn!(path = %path.display(), error = %e, "#1923 G1: next_after_ci reassign write failed");
+            continue;
+        }
+        affected += 1;
+    }
+    affected
+}
+
 /// #1907 teardown audit: does any ci-watch still reference `instance` — in its
 /// `subscribers`, the legacy `instance` field, or `next_after_ci`? Mirrors the
 /// three scrub targets of [`cleanup_watches_for_instance`] exactly so the
@@ -432,6 +486,44 @@ mod tests {
             serde_json::to_string_pretty(ws).unwrap(),
         )
         .unwrap();
+    }
+
+    /// #1923 G1: on reassignment, `reassign_next_after_ci` re-points the
+    /// `next_after_ci` of the ci-watch carrying that `task_id` to the new owner
+    /// (so the post-CI handoff routes to the new reviewer); orphan (None) clears.
+    #[test]
+    fn reassign_next_after_ci_repoints_by_task_id_1923_g1() {
+        let home = std::env::temp_dir().join(format!("agend-1923-g1-{}", std::process::id()));
+        std::fs::remove_dir_all(&home).ok();
+        let ws = super::super::watch_state::WatchState {
+            repo: "o/r".into(),
+            branch: "feat".into(),
+            next_after_ci: Some("old-reviewer".into()),
+            task_id: Some("t-x".into()),
+            ..Default::default()
+        };
+        write_watch(&home, "w", &ws);
+
+        assert_eq!(
+            reassign_next_after_ci(&home, "t-x", Some("new-reviewer")),
+            1,
+            "the watch carrying t-x is re-pointed"
+        );
+        let path = ci_watches_dir(&home).join("w.json");
+        let after: super::super::watch_state::WatchState =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(after.next_after_ci.as_deref(), Some("new-reviewer"));
+
+        // Non-matching task_id → no-op; orphan (None) → clear.
+        assert_eq!(reassign_next_after_ci(&home, "t-other", Some("x")), 0);
+        assert_eq!(reassign_next_after_ci(&home, "t-x", None), 1);
+        let after2: super::super::watch_state::WatchState =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(
+            after2.next_after_ci.is_none(),
+            "orphan clears next_after_ci"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 
     fn sub(name: &str) -> super::super::watch_state::Subscriber {

@@ -72,6 +72,49 @@ pub fn mark_completed(home: &Path, correlation_id: Option<&str>, _to: &str) {
     );
 }
 
+/// #1923 G3: on task reassignment, re-point the dispatch-tracking entry for this
+/// `task_id` to the NEW owner so the stuck-dispatch sweep tracks the agent who
+/// now owns the task (not the stale original `to`, which the sweep would nag /
+/// mis-attribute). Also DEDUPs to a single entry per task (multiple `track_dispatch`
+/// calls — e.g. a re-dispatch — could leave several). `new_owner=None` (orphan)
+/// removes the entries entirely (no owner to track).
+pub fn reassign_to(home: &Path, task_id: &str, new_owner: Option<&str>) {
+    if task_id.is_empty() {
+        return;
+    }
+    persist_or_log!(
+        crate::store::mutate_versioned(&store_path(home), |store: &mut DispatchStore| {
+            match new_owner {
+                // Orphan: no owner to track — drop the rows (mirrors the
+                // dispatch-idle clear path for owner=None).
+                None => store
+                    .entries
+                    .retain(|e| e.task_id.as_deref() != Some(task_id)),
+                Some(owner) => {
+                    // Keep the FIRST entry for this task (re-pointed to the new
+                    // owner), drop any duplicates.
+                    let mut kept = false;
+                    store.entries.retain_mut(|e| {
+                        if e.task_id.as_deref() != Some(task_id) {
+                            return true;
+                        }
+                        if kept {
+                            return false; // dedup
+                        }
+                        kept = true;
+                        e.to = owner.to_string();
+                        e.to_id = None; // original target's id is now stale
+                        e.status = "pending".to_string();
+                        true
+                    });
+                }
+            }
+            Ok(())
+        }),
+        "dispatch_reassign_to"
+    );
+}
+
 /// Sweep for stuck dispatches. Returns (warn_list, ask_list).
 pub fn sweep_stuck(home: &Path) -> (Vec<DispatchEntry>, Vec<DispatchEntry>) {
     let now = chrono::Utc::now();
@@ -293,6 +336,49 @@ mod tests {
         crate::event_log::log(&home, "dispatch_stuck_warn", &warns[0].to, "test");
         let log = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
         assert!(log.contains("dispatch_stuck_warn"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1923 G3: on reassignment, `reassign_to` re-points the task's
+    /// dispatch-tracking entry to the new owner + dedups duplicates; orphan
+    /// (None) drops the entries. Unrelated tasks are untouched.
+    #[test]
+    fn reassign_to_repoints_and_dedups_1923_g3() {
+        let home = tmp_home("g3-reassign");
+        let mk = |task: &str, to: &str| DispatchEntry {
+            task_id: Some(task.into()),
+            from: "lead".into(),
+            to: to.into(),
+            from_id: None,
+            to_id: None,
+            delegated_at: chrono::Utc::now().to_rfc3339(),
+            status: "pending".into(),
+        };
+        // Two entries for the same task (a re-dispatch left a duplicate) + an
+        // unrelated task that must survive untouched.
+        track_dispatch(&home, mk("t-x", "old-owner"));
+        track_dispatch(&home, mk("t-x", "old-owner"));
+        track_dispatch(&home, mk("t-other", "keep"));
+
+        reassign_to(&home, "t-x", Some("new-owner"));
+        let raw = std::fs::read_to_string(store_path(&home)).unwrap();
+        assert!(raw.contains("new-owner"), "t-x re-pointed to the new owner");
+        assert!(!raw.contains("old-owner"), "stale owner removed from t-x");
+        assert!(raw.contains("keep"), "unrelated task t-other untouched");
+        assert_eq!(
+            raw.matches("\"t-x\"").count(),
+            1,
+            "duplicate t-x entries deduped to one"
+        );
+
+        // Orphan (None) removes the entries entirely.
+        reassign_to(&home, "t-x", None);
+        let raw2 = std::fs::read_to_string(store_path(&home)).unwrap();
+        assert!(!raw2.contains("\"t-x\""), "orphan removes t-x entries");
+        assert!(
+            raw2.contains("t-other"),
+            "unrelated task survives orphan-clear"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
