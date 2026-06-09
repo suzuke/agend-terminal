@@ -61,6 +61,58 @@ pub fn orphan_tasks_for_owner(home: &Path, owner_name: &str) -> Result<usize, St
         .map_err(|e| e.to_string())
 }
 
+/// #1903: CANCEL tasks owned by an instance deleted as part of a TEAM DISBAND.
+/// Sibling to [`orphan_tasks_for_owner`] — identical filter (owner ==
+/// `owner_name` AND status ∈ Open/Claimed/InProgress/Blocked) — but emits a
+/// TERMINAL `Cancelled` instead of clearing ownership.
+///
+/// Why cancel (not orphan) on disband: a disband leaves NO survivor to take over
+/// the work, so an orphaned-but-Open task (owner: None) shows up as a ghost open
+/// task to a same-name redeploy. Cancelling makes it terminal so it can't.
+///
+/// Caller ordering (#1903): `teams::delete` calls this BEFORE the per-member
+/// `full_delete_instance` cascade, while `owner` is still set. The cascade's
+/// internal `orphan_tasks_for_owner` then SKIPS these — `Cancelled` is not in its
+/// {Open/Claimed/InProgress/Blocked} filter — giving a SINGLE Cancelled
+/// transition with NO double `OwnerAssigned` event. A single-instance delete
+/// never routes through here, so its orphan → ACL-unlock semantics are preserved.
+pub fn cancel_tasks_for_owner(home: &Path, owner_name: &str) -> Result<usize, String> {
+    use crate::task_events::{InstanceName, TaskEvent, TaskStatus};
+
+    let state = crate::task_events::replay(home).map_err(|e| e.to_string())?;
+    let affected: Vec<crate::task_events::TaskId> = state
+        .tasks
+        .values()
+        .filter(|r| r.owner.as_ref().map(|o| o.0 == owner_name).unwrap_or(false))
+        .filter(|r| {
+            matches!(
+                r.status,
+                TaskStatus::Open
+                    | TaskStatus::Claimed
+                    | TaskStatus::InProgress
+                    | TaskStatus::Blocked
+            )
+        })
+        .map(|r| r.id.clone())
+        .collect();
+    if affected.is_empty() {
+        return Ok(0);
+    }
+    let count = affected.len();
+    let emitter = InstanceName::from("system:team_disband");
+    let events: Vec<TaskEvent> = affected
+        .into_iter()
+        .map(|id| TaskEvent::Cancelled {
+            task_id: id,
+            by: emitter.clone(),
+            reason: "owner instance deleted via team disband".to_string(),
+        })
+        .collect();
+    crate::task_events::append_batch(home, &emitter, events)
+        .map(|_| count)
+        .map_err(|e| e.to_string())
+}
+
 /// Boot orphan sweep (task t-20260526155509233515-8): the STATUS-orphan
 /// analogue of [`scan_orphan_candidates`] (which handles OWNER orphans).
 ///

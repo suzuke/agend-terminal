@@ -99,6 +99,19 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
             let _ = std::fs::remove_file(crate::agent_ops::metadata_path_for_id(home, &id));
         }
     }
+    // #1902: delete the inbox file — this step was MISSING entirely, so a deleted
+    // instance's inbox leaked. Cover BOTH paths: the name-based `inbox/{name}.jsonl`
+    // AND the UUID-based `inbox/{uuid}.jsonl` (the current default). fleet.yaml is
+    // already removed above, so `inbox_path_resolved` can't resolve the UUID — feed
+    // the captured id directly (same #1682 name↔UUID-resolution trap the metadata
+    // cleanup above sidesteps). The residual audit only saw the name path, so the
+    // UUID inbox was leaking even past the audit.
+    let _ = std::fs::remove_file(crate::inbox::storage::inbox_path(home, name));
+    if let Some(ref id) = instance_id {
+        if let Some(id) = crate::types::InstanceId::parse(id) {
+            let _ = std::fs::remove_file(crate::inbox::storage::inbox_path_for_id(home, &id));
+        }
+    }
     crate::teams::remove_member_from_all(home, name);
 
     // #808: orphan tasks whose owner is the deleted instance so the
@@ -231,7 +244,15 @@ pub(crate) fn name_residual_anywhere(
     if metadata_residual {
         sources.push("metadata");
     }
-    if home.join("inbox").join(format!("{name}.jsonl")).exists() {
+    // #1902: name path OR the id-direct path. fleet.yaml is gone at delete-audit
+    // time, so the explicit captured-id check is what keeps a `<uuid>.jsonl`
+    // inbox residual visible — the audit previously checked ONLY the name path
+    // and silently missed UUID inboxes (the current default).
+    let inbox_residual = crate::inbox::storage::inbox_path(home, name).exists()
+        || id
+            .and_then(crate::types::InstanceId::parse)
+            .is_some_and(|id| crate::inbox::storage::inbox_path_for_id(home, &id).exists());
+    if inbox_residual {
         sources.push("inbox");
     }
     if home
@@ -381,6 +402,58 @@ mod tests {
     }
 
     #[test]
+    fn name_residual_anywhere_detects_uuid_inbox_residual_1902() {
+        // #1902: the current inbox is UUID-based, but the audit only checked the
+        // name path → a `<uuid>.jsonl` inbox was a SILENT leak (past the audit).
+        // Write a REAL uuid inbox file (via the id-direct path, NOT a synthetic
+        // name file) and pass the id — the audit must now flag "inbox".
+        let home = tmp_home("uuid_inbox_audit");
+        let id = crate::types::InstanceId::new();
+        let inbox_dir = home.join("inbox");
+        std::fs::create_dir_all(&inbox_dir).unwrap();
+        std::fs::write(crate::inbox::storage::inbox_path_for_id(&home, &id), "").unwrap();
+        // No name-based file exists — pre-#1902 this returned clean (false信心).
+        let sources = name_residual_anywhere(&home, "zombie", Some(&id.full()));
+        assert!(
+            sources.contains(&"inbox"),
+            "uuid inbox residual must be detected, got {sources:?}"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn full_delete_instance_removes_uuid_inbox_1902() {
+        // #1902 §3.9 (a): a single delete must remove the instance's REAL uuid
+        // inbox (driven through inbox::enqueue → inbox_path_resolved, the
+        // production path), not just a name-based file.
+        let home = tmp_home("uuid_inbox_delete");
+        let id = crate::types::InstanceId::new();
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            format!(
+                "instances:\n  doomed:\n    backend: claude\n    id: {}\n",
+                id.full()
+            ),
+        )
+        .unwrap();
+        // Enqueue via the resolver → lands at inbox/<uuid>.jsonl (the prod path).
+        let msg = crate::inbox::InboxMessage::new_system("system:test", "update", "hi".to_string());
+        crate::inbox::enqueue(&home, "doomed", msg).expect("enqueue");
+        let uuid_inbox = crate::inbox::storage::inbox_path_for_id(&home, &id);
+        assert!(
+            uuid_inbox.exists(),
+            "pre: uuid inbox must exist at {uuid_inbox:?}"
+        );
+        let result = super::full_delete_instance(&home, "doomed");
+        assert!(result.is_ok(), "delete must return Ok, got {result:?}");
+        assert!(
+            !uuid_inbox.exists(),
+            "uuid inbox leaked — full_delete_instance must delete it: {uuid_inbox:?}"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
     fn name_residual_anywhere_detects_runtime_binding_residual() {
         let home = tmp_home("binding");
         let dir = crate::paths::runtime_dir(&home).join("zombie");
@@ -509,6 +582,15 @@ mod tests {
             post.assignee.is_none(),
             "owned task must be orphaned after full_delete_instance, got assignee={:?}",
             post.assignee
+        );
+        // #1903 §3.9 (c): a SINGLE delete must leave the task ORPHAN-OPEN (owner
+        // cleared, still Open for re-dispatch) — NOT Cancelled. Cancellation is
+        // reserved for the team-disband path; single delete preserves the
+        // ACL-unlock-but-survivable semantics.
+        assert_eq!(
+            post.status,
+            crate::task_events::TaskStatus::Open,
+            "single delete must keep the task Open (orphan), not cancel it"
         );
         std::fs::remove_dir_all(home).ok();
     }
