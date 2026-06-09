@@ -511,12 +511,11 @@ mod deleted_gate_tests_1913 {
     }
 
     fn total_crashes(reg: &AgentRegistry) -> u32 {
-        let id = InstanceId::parse(VICTIM_UUID).unwrap();
+        let id = InstanceId::parse(VICTIM_UUID).expect("valid uuid");
         let r = reg.lock();
         let handle = r.get(&id).expect("handle present");
         let core = handle.core.lock();
-        let n = core.health.total_crashes;
-        n
+        core.health.total_crashes
     }
 
     /// (a) An intentional delete (deleted=true) must NOT respawn: the gate
@@ -525,8 +524,10 @@ mod deleted_gate_tests_1913 {
     fn delete_does_not_respawn_1913() {
         let home = tmp_home("del");
         let reg: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
-        reg.lock()
-            .insert(InstanceId::parse(VICTIM_UUID).unwrap(), make_handle(true));
+        reg.lock().insert(
+            InstanceId::parse(VICTIM_UUID).expect("valid uuid"),
+            make_handle(true),
+        );
         let ctx = make_ctx(Arc::clone(&reg));
 
         handle_crash_respawn(&home, VICTIM, &ctx);
@@ -547,8 +548,10 @@ mod deleted_gate_tests_1913 {
     fn real_crash_still_respawns_1913() {
         let home = tmp_home("crash");
         let reg: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
-        reg.lock()
-            .insert(InstanceId::parse(VICTIM_UUID).unwrap(), make_handle(false));
+        reg.lock().insert(
+            InstanceId::parse(VICTIM_UUID).expect("valid uuid"),
+            make_handle(false),
+        );
         let ctx = make_ctx(Arc::clone(&reg));
 
         handle_crash_respawn(&home, VICTIM, &ctx);
