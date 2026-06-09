@@ -114,6 +114,42 @@ fn name_residual_anywhere_detects_uuid_metadata_after_fleet_yaml_removed_1682() 
     std::fs::remove_dir_all(home).ok();
 }
 
+/// #1923 G12 (verify-only): `full_delete_instance` removes the escalation-persist
+/// store, so a same-name redeploy does NOT rehydrate the deleted instance's
+/// escalation state. The daemon rehydrates from this store on (re)spawn
+/// (`rehydrate_escalation`); without the delete-time remove a fresh instance
+/// reusing the name would inherit the dead one's crash budget / paged latch.
+/// Confirms the existing `escalation_persist::remove` in `full_delete_instance`
+/// mitigates the gap — no prod change, regression guard.
+#[test]
+fn full_delete_removes_escalation_store_no_stale_rehydrate_1923_g12() {
+    let home = tmp_home("g12_escalation");
+    std::fs::create_dir_all(&home).expect("mkdir home");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  victim:\n    command: /bin/cat\n",
+    )
+    .expect("seed fleet.yaml");
+    crate::daemon::escalation_persist::persist(
+        &home,
+        "victim",
+        &crate::health::PersistedEscalation::default(),
+    );
+    assert!(
+        crate::daemon::escalation_persist::load_for(&home, "victim").is_some(),
+        "precondition: escalation store seeded for victim"
+    );
+
+    let _ = super::full_delete_instance(&home, "victim");
+
+    assert!(
+        crate::daemon::escalation_persist::load_for(&home, "victim").is_none(),
+        "#1923 G12: full_delete_instance must remove the escalation store — else a \
+         same-name redeploy rehydrates the deleted instance's escalation state"
+    );
+    std::fs::remove_dir_all(home).ok();
+}
+
 #[test]
 fn name_residual_anywhere_detects_inbox_residual() {
     let home = tmp_home("inbox");

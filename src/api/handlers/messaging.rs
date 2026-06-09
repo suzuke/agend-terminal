@@ -535,7 +535,14 @@ fn track_dispatch(
             }
         }
     } else if matches!(kind_str, "update" | "query") {
-        if let Some(corr) = msg.correlation_id.as_deref() {
+        // #1923 G8: key the dispatch-idle refresh by the SAME correlation as the
+        // WRITE side above (~:496 records the pending-dispatch sidecar under
+        // `correlation_id.or(task_id)`). A reply carrying only `task_id` (no
+        // explicit `correlation_id`) was refreshed under `correlation_id` (None)
+        // → its sidecar never got refreshed → the dispatch-idle watchdog fired a
+        // FALSE idle nudge despite the reply arriving. Aligning the key is a
+        // superset — behaviour is unchanged when `correlation_id` is set.
+        if let Some(corr) = msg.correlation_id.as_deref().or(msg.task_id.as_deref()) {
             let _ = crate::daemon::dispatch_idle::refresh_issued_at(home, corr);
         }
     }

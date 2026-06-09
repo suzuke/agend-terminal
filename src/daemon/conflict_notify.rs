@@ -68,6 +68,20 @@ pub(crate) struct ConflictNotifyTracker {
 }
 
 impl ConflictNotifyTracker {
+    /// #1923 G5: prune per-agent state for agents no longer in the registry
+    /// (deleted / redeployed). Without this a same-name redeploy inherits the old
+    /// instance's `last_conflict_at` (false-gating its first-observation notify or
+    /// starting the 30-min staleness clock from the dead instance's time) and
+    /// `last_escalated_at` (false-suppressing a real escalation). Mirrors the
+    /// #1470 `retry_tracks` sweep; called per-tick from `run_loop` with the live
+    /// registry agent set.
+    pub(crate) fn retain_active(&mut self, active: &std::collections::HashSet<String>) {
+        self.last_conflict_at
+            .retain(|name, _| active.contains(name));
+        self.last_escalated_at
+            .retain(|name, _| active.contains(name));
+    }
+
     /// Per-tick entry point — runs only every `TICKS_PER_SCAN` ticks
     /// for throttling. Returns true iff the scan body fired this
     /// tick.
@@ -488,6 +502,36 @@ mod tests {
         assert!(
             !tracker.last_conflict_at.contains_key("agent-r"),
             "resolution transition must drop last_conflict_at entry"
+        );
+    }
+
+    /// #1923 G5: `retain_active` prunes per-agent state for agents no longer in
+    /// the live registry set (deleted / redeployed), so a same-name redeploy does
+    /// not inherit the dead instance's conflict-observation / escalation-dedup
+    /// timestamps (which would false-gate its first conflict notify or
+    /// false-suppress a real escalation).
+    #[test]
+    fn retain_active_prunes_deleted_agents_1923_g5() {
+        use std::collections::HashSet;
+        let mut tracker = ConflictNotifyTracker::default();
+        let now = chrono::Utc::now();
+        tracker.last_conflict_at.insert("live".to_string(), now);
+        tracker.last_conflict_at.insert("deleted".to_string(), now);
+        tracker.last_escalated_at.insert("live".to_string(), now);
+        tracker.last_escalated_at.insert("deleted".to_string(), now);
+
+        let live: HashSet<String> = ["live".to_string()].into_iter().collect();
+        tracker.retain_active(&live);
+
+        assert!(tracker.last_conflict_at.contains_key("live"));
+        assert!(tracker.last_escalated_at.contains_key("live"));
+        assert!(
+            !tracker.last_conflict_at.contains_key("deleted"),
+            "#1923 G5: a deleted agent's conflict timestamp must be pruned"
+        );
+        assert!(
+            !tracker.last_escalated_at.contains_key("deleted"),
+            "#1923 G5: a deleted agent's escalation timestamp must be pruned"
         );
     }
 

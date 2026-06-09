@@ -397,6 +397,23 @@ fn run_loop(
             // #842: same eviction cadence for the bridge↔daemon idempotent-
             // retry dedup cache. Sibling sweep, same 10-min TTL window.
             crate::api::request_dedup::global().sweep_expired();
+
+            // #1923 G4/G5: prune per-agent in-memory tracker state for agents no
+            // longer in the registry (deleted / redeployed), mirroring the #1470
+            // retry_tracks sweep in `process_error_recovery`. These maps live in
+            // `run_loop` (not reachable from the cross-thread `full_delete_instance`
+            // delete path), so the per-tick `.retain` IS their cleanup-on-delete:
+            // a deleted agent leaves the registry → drops out of `live_agents` →
+            // its entries are pruned next tick. Without it a same-name redeploy
+            // inherits the old instance's state — a false-SUPPRESSED crash notify
+            // (notify_tracks dedup) or a false-FIRED conflict escalation
+            // (conflict_notify `last_conflict_at`/`last_escalated_at`).
+            let live_agents: std::collections::HashSet<String> = {
+                let reg = agent::lock_registry(&registry);
+                reg.values().map(|h| h.name.to_string()).collect()
+            };
+            notify_tracks.retain(|name, _| live_agents.contains(name));
+            conflict_notify_tracker.retain_active(&live_agents);
         }));
         if let Err(payload) = outcome {
             let msg = if let Some(s) = payload.downcast_ref::<String>() {
