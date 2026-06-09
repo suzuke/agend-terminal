@@ -303,6 +303,32 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
                 }
                 msg.read_at = Some(now.clone());
                 newly_read.push(true);
+                // #1888 instrument-only (zero-behavior): a `ci-ready-for-action`
+                // handoff just transitioned to read on this drain. After this, the
+                // handoff_timeout_watchdog's `unread_of_kind` scan can no longer
+                // find it → it can never re-nudge (the #1860 read-state-coupling
+                // RCA). This trace lets production confirm "read before acted" for a
+                // stranded PR. Read-only — the read-marking above is unchanged.
+                if msg.kind.as_deref() == Some("ci-ready-for-action") {
+                    let age_at_read_secs = chrono::DateTime::parse_from_rfc3339(&msg.timestamp)
+                        .ok()
+                        .map(|t| {
+                            chrono::Utc::now()
+                                .signed_duration_since(t.with_timezone(&chrono::Utc))
+                                .num_seconds()
+                        })
+                        .unwrap_or(-1);
+                    // info!-level so it lands in the production daemon.log (default
+                    // filter is `agend_terminal=info`); rare — only a
+                    // ci-ready-for-action message transitioning to read on a drain.
+                    tracing::info!(
+                        tag = "#1888-ciready-read",
+                        agent = %name,
+                        correlation = msg.correlation_id.as_deref().unwrap_or("<none>"),
+                        age_at_read_secs,
+                        "ci-ready-for-action handoff marked read on drain"
+                    );
+                }
             } else {
                 newly_read.push(false);
             }

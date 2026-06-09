@@ -113,6 +113,34 @@ pub(crate) fn scan_and_emit_with<F>(
             // target reads the handoff (drops from the unread scan → reaped). This
             // also covers the orchestrator-as-`next_after_ci` case below, where
             // there is no lead to escalate to.
+            // #1888 instrument-only (zero-behavior): record WHY this UNREAD handoff
+            // did / didn't get re-nudged this tick, so production can confirm the
+            // #1860 read-state-coupling RCA. A handoff that was already marked read
+            // never enters this loop at all (`unread_of_kind` filters it) — that
+            // case is captured by the `#1888-ciready-read` trace at the drain site.
+            // Read-only: these locals don't feed the byte-identical gate below.
+            {
+                let busy = crate::snapshot::agent_is_busy(home, target);
+                let renudge_due = last_renudged.get(&key).is_none_or(|prev| {
+                    now.signed_duration_since(*prev).num_minutes() >= RENUDGE_INTERVAL_MINS
+                });
+                // info!-level so it lands in the production daemon.log (default
+                // filter is `agend_terminal=info`); bounded — at most once per
+                // UNREAD ci-handoff per tick, and a handoff stops being scanned the
+                // moment it's read.
+                tracing::info!(
+                    tag = "#1888-renudge-decision",
+                    agent = %target,
+                    correlation = %corr,
+                    unread_found = true,
+                    age_min,
+                    agent_is_busy = busy,
+                    renudge_due,
+                    age_ok = age_min >= RENUDGE_AFTER_MINS,
+                    will_fire = age_min >= RENUDGE_AFTER_MINS && !busy && renudge_due,
+                    "ci-handoff re-nudge decision"
+                );
+            }
             if age_min >= RENUDGE_AFTER_MINS && !crate::snapshot::agent_is_busy(home, target) {
                 let due = last_renudged.get(&key).is_none_or(|prev| {
                     now.signed_duration_since(*prev).num_minutes() >= RENUDGE_INTERVAL_MINS
@@ -259,6 +287,54 @@ mod tests {
             nudged.push(t.to_string())
         });
         nudged
+    }
+
+    /// §3.9 #1888 (instrument-only): the re-nudge decision is OBSERVABLE (the
+    /// `#1888-renudge-decision` trace fires for an unread handoff) while the
+    /// surrounding behavior is byte-identical (an unread, past-threshold, idle
+    /// handoff still re-nudges).
+    #[test]
+    #[tracing_test::traced_test]
+    fn renudge_decision_is_instrumented_1888() {
+        let home = tmp_home("1888-renudge-trace");
+        write_fleet(&home);
+        seed_handoff(&home, "reviewer", "owner/repo@br", 5, false); // unread, 5min old
+        seed_snapshot(&home, "reviewer", "idle"); // not busy
+        let nudged = run_watchdog(
+            &home,
+            &chrono::Utc::now(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+        );
+        assert!(
+            logs_contain("#1888-renudge-decision"),
+            "the re-nudge decision must be traced"
+        );
+        assert!(
+            nudged.iter().any(|t| t == "reviewer"),
+            "behavior unchanged: an unread idle past-threshold handoff still re-nudges"
+        );
+    }
+
+    /// §3.9 #1888 (instrument-only): a `ci-ready-for-action` handoff transitioning
+    /// to read on a drain is OBSERVABLE (the `#1888-ciready-read` trace fires)
+    /// while the drain behavior is byte-identical (the message is returned + read).
+    #[test]
+    #[tracing_test::traced_test]
+    fn ciready_read_on_drain_is_instrumented_1888() {
+        let home = tmp_home("1888-ciready-read-trace");
+        seed_handoff(&home, "reviewer", "owner/repo@br", 1, false); // unread ci-ready
+        let drained = crate::inbox::drain(&home, "reviewer");
+        assert!(
+            drained
+                .iter()
+                .any(|m| m.kind.as_deref() == Some("ci-ready-for-action") && m.read_at.is_some()),
+            "behavior unchanged: drain returns the handoff, now marked read"
+        );
+        assert!(
+            logs_contain("#1888-ciready-read"),
+            "the ci-ready read-on-drain must be traced"
+        );
     }
 
     #[test]
