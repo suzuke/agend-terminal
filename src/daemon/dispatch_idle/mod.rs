@@ -419,6 +419,67 @@ pub(crate) fn cleanup_pending_for_task_id(home: &Path, task_id: &str) -> usize {
     count
 }
 
+/// #1916: a task REASSIGN (`OwnerAssigned`) must move the dispatch-idle sidecar to
+/// the new owner — otherwise the watchdog keeps nudging the FORMER owner about a
+/// task they no longer hold. Call-site hook (mirrors `cleanup_pending_for_task_id`;
+/// keeps `task_events` free of a dispatch_idle dependency).
+///
+/// - `Some(new_owner)`: RETARGET every sidecar for `task_id` IN PLACE (same
+///   `dispatch_id` file) → `target = new_owner`, and RESET the idle clock
+///   (`issued_at = now`, `not_working_streak = 0`, revive `Exceeded` → `Pending`,
+///   clear `nudge_sent_at`). The new owner just took over; inheriting the prior
+///   owner's near-threshold clock would nudge them immediately (#1866 principle:
+///   the nudge must reflect the CURRENT owner's idle time, not an inherited age).
+/// - `None` (orphan / #1903 disband-orphan): CLEAR the sidecars — there is no owner
+///   to nudge. Delegates to [`cleanup_pending_for_task_id`] (never sets `target=None`).
+///
+/// In-place RMW preserves the `dispatch_id` file identity, so `record_dispatch`'s
+/// `(dispatcher, target, correlation_id)` dedup key recomputes correctly — a later
+/// re-dispatch to the new owner refreshes THIS sidecar rather than duplicating it,
+/// and nothing is orphaned.
+pub(crate) fn reassign_pending_for_task(
+    home: &Path,
+    task_id: &str,
+    new_owner: Option<&str>,
+) -> usize {
+    if task_id.is_empty() || is_placeholder_correlation(Some(task_id)) {
+        return 0;
+    }
+    let Some(new_owner) = new_owner else {
+        // No owner to nudge → clear (NOT target=None).
+        return cleanup_pending_for_task_id(home, task_id);
+    };
+    let mut count = 0usize;
+    for d in list_pending(home) {
+        if d.correlation_id.as_deref() != Some(task_id) {
+            continue;
+        }
+        if d.target == new_owner {
+            continue; // already targets the new owner — nothing to move
+        }
+        let path = pending_path(home, &d.dispatch_id);
+        let updated = crate::store::with_json_state::<PendingDispatch, _, _>(&path, |cur| {
+            cur.target = new_owner.to_string();
+            cur.issued_at = chrono::Utc::now().to_rfc3339();
+            cur.not_working_streak = 0;
+            cur.nudge_sent_at = None;
+            cur.status = DispatchStatus::Pending;
+            true
+        });
+        if matches!(updated, Ok(Some(true))) {
+            count += 1;
+            tracing::info!(
+                target: "dispatch_idle",
+                dispatch_id = %d.dispatch_id,
+                task_id = %task_id,
+                new_owner = %new_owner,
+                "#1916 retargeted pending sidecar to reassigned owner (idle clock reset)"
+            );
+        }
+    }
+    count
+}
+
 /// #1018 (C) eager cleanup: when an instance is deleted, scan pending
 /// sidecars and delete any whose `target` matches the deleted instance
 /// name. The deleted instance can never deliver a `kind=report`, so
@@ -1196,6 +1257,73 @@ mod tests {
         assert_eq!(
             dups, 1,
             "exactly ONE sidecar for the re-dispatched correlation"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// §3.9 #1916: a task REASSIGN (OwnerAssigned A→B) retargets the dispatch-idle
+    /// sidecar to B AND resets its idle clock — so the watchdog nudges B (the new
+    /// owner), not A, and B is not immediately nudged for a task it just received
+    /// (the #1866 principle: nudge reflects the current owner's idle time).
+    #[test]
+    fn reassign_retargets_sidecar_to_new_owner_and_resets_clock_1916() {
+        let home = tmp_home("1916-retarget");
+        // A's sidecar is already near-threshold (590s of a 600s window).
+        let aged = chrono::Utc::now() - chrono::Duration::seconds(590);
+        write_pending_at(
+            &home,
+            "lead",
+            "agent-a",
+            Some("t-reassign"),
+            "task",
+            600,
+            aged,
+        );
+
+        let moved = reassign_pending_for_task(&home, "t-reassign", Some("agent-b"));
+        assert_eq!(moved, 1, "exactly one sidecar retargeted");
+
+        let pending = list_pending(&home);
+        let s = pending
+            .iter()
+            .find(|p| p.correlation_id.as_deref() == Some("t-reassign"))
+            .expect("#1916: sidecar must SURVIVE a reassign (retargeted, not deleted)");
+        assert_eq!(
+            s.target, "agent-b",
+            "#1916: sidecar must target the reassigned owner B, not the former owner A"
+        );
+        assert_eq!(
+            s.status,
+            DispatchStatus::Pending,
+            "#1916: revived to Pending so B gets a fresh window"
+        );
+        assert_eq!(s.not_working_streak, 0, "#1916: debounce streak reset");
+        let issued = chrono::DateTime::parse_from_rfc3339(&s.issued_at)
+            .expect("issued_at rfc3339")
+            .with_timezone(&chrono::Utc);
+        assert!(
+            chrono::Utc::now().signed_duration_since(issued).num_seconds() < 60,
+            "#1916: idle clock RESET on reassign — B must not inherit A's near-threshold age (#1866)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// §3.9 #1916: an ORPHAN (OwnerAssigned with owner=None — #1903 disband/delete
+    /// orphan) CLEARS the sidecar — there is no owner to nudge. It must NOT leave a
+    /// sidecar with target=None (which would nudge nobody / a placeholder forever).
+    #[test]
+    fn reassign_none_clears_orphaned_sidecar_1916() {
+        let home = tmp_home("1916-orphan");
+        record_dispatch(&home, "lead", "agent-a", Some("t-orphan"), "task", 600)
+            .expect("dispatch recorded");
+
+        let cleared = reassign_pending_for_task(&home, "t-orphan", None);
+        assert_eq!(cleared, 1, "orphan (owner=None) clears the sidecar");
+        assert!(
+            list_pending(&home)
+                .iter()
+                .all(|p| p.correlation_id.as_deref() != Some("t-orphan")),
+            "#1916: orphaned task's sidecar must be removed — nobody to nudge (never target=None)"
         );
         std::fs::remove_dir_all(&home).ok();
     }

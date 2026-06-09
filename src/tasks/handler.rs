@@ -729,6 +729,16 @@ fn handle_update(
                 cascade_cancel_children(home, &id, &emitter);
             }
         }
+        // #1916: a reassign (OwnerAssigned with a new owner) must retarget the
+        // dispatch-idle sidecar to the new owner (+ reset its idle clock), else the
+        // watchdog keeps nudging the FORMER owner about a task they no longer hold.
+        // Mirrors the done/cancelled cleanup hook above; runs only after the append
+        // committed. (The orphan path — OwnerAssigned with owner=None — calls the
+        // same helper with None in orphan_tasks_for_owner, which clears the sidecar.)
+        if let Some(ref new_owner) = new_assignee {
+            let _ =
+                crate::daemon::dispatch_idle::reassign_pending_for_task(home, &id, Some(new_owner));
+        }
     }
     // #807 Item 1: see create arm note.
     let task = read_task_record(home, &id).map(|r| record_to_task(&r));
@@ -1159,6 +1169,53 @@ mod tests {
         )
         .expect("create task");
         let _ = args;
+    }
+
+    /// §3.9 #1916 WIRING (real entry point, not just the helper): a `task update`
+    /// that changes the assignee must retarget the dispatch-idle sidecar to the new
+    /// owner — proving `handle_update` actually calls the reassign hook (an
+    /// injected-input helper test alone wouldn't prove the wiring reaches it).
+    #[test]
+    fn task_reassign_retargets_dispatch_sidecar_through_handle_1916() {
+        let home = tmp_home("1916-wiring");
+        create_task(&home, "t-wire-001"); // owner = dev-agent
+                                          // A dispatch-idle sidecar tracks the task, targeting the original owner.
+        crate::daemon::dispatch_idle::record_dispatch(
+            &home,
+            "lead",
+            "dev-agent",
+            Some("t-wire-001"),
+            "task",
+            600,
+        )
+        .expect("dispatch recorded");
+
+        // REAL entry point: the owner reassigns the task to a new owner.
+        let result = handle(
+            &home,
+            "dev-agent",
+            &serde_json::json!({
+                "action": "update",
+                "id": "t-wire-001",
+                "assignee": "new-owner",
+            }),
+        );
+        assert!(
+            result.get("error").is_none(),
+            "#1916: reassign update should succeed, got {result}"
+        );
+
+        let pending = crate::daemon::dispatch_idle::list_pending(&home);
+        let s = pending
+            .iter()
+            .find(|p| p.correlation_id.as_deref() == Some("t-wire-001"))
+            .expect("#1916: sidecar must survive the reassign");
+        assert_eq!(
+            s.target, "new-owner",
+            "#1916 WIRING: `task update(assignee)` must retarget the dispatch-idle sidecar \
+             via handle_update's hook — else the watchdog keeps nudging the former owner"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]

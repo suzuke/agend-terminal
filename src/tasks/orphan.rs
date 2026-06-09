@@ -48,17 +48,23 @@ pub fn orphan_tasks_for_owner(home: &Path, owner_name: &str) -> Result<usize, St
     let count = affected.len();
     let emitter = InstanceName::from("system:auto_orphan");
     let events: Vec<TaskEvent> = affected
-        .into_iter()
+        .iter()
         .map(|id| TaskEvent::OwnerAssigned {
-            task_id: id,
+            task_id: id.clone(),
             by: emitter.clone(),
             owner: None,
             routed_to: None,
         })
         .collect();
-    crate::task_events::append_batch(home, &emitter, events)
-        .map(|_| count)
-        .map_err(|e| e.to_string())
+    crate::task_events::append_batch(home, &emitter, events).map_err(|e| e.to_string())?;
+    // #1916: an orphaned task has NO owner → clear its dispatch-idle sidecar so the
+    // watchdog stops nudging the (now-removed) former owner. Same helper as the
+    // reassign path, with owner=None. Best-effort, post-append (the orphan is
+    // committed first).
+    for id in &affected {
+        let _ = crate::daemon::dispatch_idle::reassign_pending_for_task(home, &id.0, None);
+    }
+    Ok(count)
 }
 
 /// #1903: CANCEL tasks owned by an instance deleted as part of a TEAM DISBAND.
