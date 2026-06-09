@@ -1,16 +1,16 @@
-# #1784: instrument the fleet-wide windows CI hang hunt.
+# #1784: instrument the fleet-wide CI hang hunt.
 #
 # A real `Command::new("git")` test (worktree_cleanup / branch_sweep build real
-# repos + worktrees) intermittently HANGS on windows-latest, timing the whole CI
-# job out at ~56min with NO attribution — `cargo test` prints a test's name only
-# on COMPLETION, so a hung test is anonymous in the log (which also never
-# finalizes on a job timeout).
+# repos + worktrees) intermittently HANGS, timing the whole CI job out at ~30min
+# with NO attribution — `cargo test` prints a test's name only on COMPLETION, so
+# a hung test is anonymous in the log (which also never finalizes on a job
+# timeout).
 #
-# The windows Tests step runs via nextest with this `ci` profile: it keeps the
-# default parallelism (so the intermittent race still reproduces), but any test
-# still running past the slow-timeout is KILLED and NAMED. That turns a 56-min
-# mystery hang into a fast, attributed failure so we can pinpoint + fix the
-# offending test. mac/ubuntu (green) keep `cargo test` unchanged.
+# #1893: ALL platforms now run the Tests step via nextest with this `ci` profile
+# (previously windows-only; mac/ubuntu used bare `cargo test` and so ran a hung
+# test to the 30-min STEP timeout, anonymous). It keeps the default parallelism
+# but any test still running past the slow-timeout is KILLED and NAMED — a fast,
+# attributed failure instead of a mystery hang.
 [profile.ci]
 # Warn (mark SLOW) at 60s; SIGKILL the test after 2 periods (120s). Normal tests
 # finish in well under a second; a real-git test that takes >120s is wedged.
@@ -18,3 +18,36 @@ slow-timeout = { period = "60s", terminate-after = 2 }
 # Surface the terminated/hung test prominently in the run summary.
 failure-output = "immediate-final"
 final-status-level = "slow"
+
+# #1893: serialize the heavy real-git / worktree / subprocess test cluster.
+# These tests spawn real `git` (worktree add / branch / fetch) and share
+# filesystem + `.git/index.lock` state; at full parallelism they race (index.lock
+# contention, fd pressure) → intermittent hangs/failures (RC1/RC3 of the #1893
+# spike; e.g. `mcp::handlers::ci::tests::checkout_bind_true_concurrent_branch_
+# create_race_idempotent` passes in isolation but fails under load). max-threads=1
+# runs the GROUP one-at-a-time (isolation-equivalent) while the rest of the suite
+# stays parallel. The override is mirrored under both `default` (local runs) and
+# `ci` (CI runs) profiles.
+[test-groups]
+git-subprocess = { max-threads = 1 }
+
+# `*_stress_50_iter_*` do 50 real git branch-creates (~60s locally, slower on CI
+# runners). Listed FIRST so its slow-timeout wins for them: give 3×120s headroom
+# so the suite-wide 120s terminate-after can't FALSE-kill a genuinely-slow (not
+# wedged) stress run on a slow runner — they still join the serial group + still
+# get a generous wedge cap. (mac/ubuntu had NO per-test timeout before #1893, so
+# this preserves their pass behaviour while gaining the hang guard.)
+[[profile.ci.overrides]]
+filter = 'test(/_stress_50_iter_/)'
+test-group = 'git-subprocess'
+slow-timeout = { period = "120s", terminate-after = 3 }
+
+[[profile.ci.overrides]]
+filter = 'test(/^(worktree_pool|mcp::handlers::(ci|dispatch_hook|force_release)|daemon::(retention::worktrees|pr_state))::/)'
+test-group = 'git-subprocess'
+
+# Local `default` profile has no terminate-after, so no false-kill risk — just
+# serialize the same cluster for parity with CI.
+[[profile.default.overrides]]
+filter = 'test(/^(worktree_pool|mcp::handlers::(ci|dispatch_hook|force_release)|daemon::(retention::worktrees|pr_state))::/)'
+test-group = 'git-subprocess'

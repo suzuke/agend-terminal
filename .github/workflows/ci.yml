@@ -92,33 +92,25 @@ jobs:
         timeout-minutes: 15
         run: cargo check --features discord --quiet
 
-      # `--tests` covers unit tests (--bin) + every tests/*.rs integration
-      # file. `--features tray` ensures tray-gated code is tested too.
-      # Previously this was 3 separate steps (unit, unit+tray, integration)
-      # which triggered 2 extra recompilations from feature-flag switching.
+      # Runs unit tests (--bin) + every tests/*.rs integration file with the
+      # tray feature, via nextest on ALL platforms.
       # #1784: a real `Command::new("git")` test (worktree_cleanup / branch_sweep
-      # build real repos + worktrees) intermittently HANGS on windows, timing the
-      # whole job out at ~56min with NO culprit — `cargo test` only prints a test
-      # name on COMPLETION, so a hung test is anonymous. On windows we run via
-      # nextest with a per-test terminate-after (.config/nextest.toml `ci`
-      # profile): parallelism is kept (the intermittent race still reproduces),
-      # but a test still running past the timeout is KILLED and NAMED → a fast,
-      # attributed failure instead of a 56-min mystery. mac/ubuntu keep cargo test.
-      - name: Install nextest (windows hang hunt #1784)
-        if: runner.os == 'Windows'
+      # build real repos + worktrees) intermittently HANGS, timing the whole job
+      # out at ~30min with NO culprit — `cargo test` only prints a test name on
+      # COMPLETION, so a hung test is anonymous and the step never finalizes.
+      # #1893: previously only windows ran nextest (mac/ubuntu used `cargo test`,
+      # so a hung test there ran to the 30-min STEP timeout, anonymous). Now ALL
+      # platforms run nextest with the `ci` profile's per-test terminate-after
+      # (.config/nextest.toml): parallelism is kept, but a test still running past
+      # the slow-timeout is KILLED and NAMED → a fast, attributed failure instead
+      # of a 30-min mystery. The `ci` profile also serializes the heavy real-git
+      # test cluster (`git-subprocess` test-group) so it can't race the suite.
+      - name: Install nextest (#1784/#1893 — per-test terminate-after, all platforms)
         uses: taiki-e/install-action@v2
         with:
           tool: nextest
 
-      - name: Tests (unit + integration + tray)
-        if: runner.os != 'Windows'
-        timeout-minutes: 30
-        env:
-          AGEND_LOCK_AUDIT: "1"
-        run: cargo test --tests --features tray
-
-      - name: Tests (unit + integration + tray) [windows — nextest names a hung test, #1784]
-        if: runner.os == 'Windows'
+      - name: Tests (unit + integration + tray) [nextest — names a hung test, #1784/#1893]
         timeout-minutes: 30
         env:
           AGEND_LOCK_AUDIT: "1"
