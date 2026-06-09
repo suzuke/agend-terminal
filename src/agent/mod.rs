@@ -2050,7 +2050,18 @@ fn inject_with_target(target: &InjectTarget, text: &[u8]) -> crate::error::Resul
     if target.deleted.load(std::sync::atomic::Ordering::Acquire) {
         return Ok(());
     }
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    // Pre-submit settle: let the input box fully commit the just-written line
+    // before `\r` is read as submit. Bulk-inject TUIs (claude's `❯`) commit
+    // instantly, so 50ms is plenty. typed_inject ratatui boxes (codex's `›`,
+    // opencode/gemini/agy) re-render/debounce and need more headroom — 50ms is
+    // enough for codex 0.118 (#1670) but codex 0.138's input box re-renders
+    // slower, so the `\r` arrives before commit and is appended as a newline:
+    // the wake line stacks un-submitted and the agent never wakes. A longer
+    // settle for typed_inject backends fixes 0.138 without affecting 0.118
+    // (the only cost is +200ms latency on an infrequent inject) and is inert
+    // for bulk-inject backends.
+    let settle_ms = if target.typed_inject { 250 } else { 50 };
+    std::thread::sleep(std::time::Duration::from_millis(settle_ms));
     write_with_timeout(&target.pty_writer, submit)?;
     Ok(())
 }
