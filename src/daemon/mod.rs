@@ -1053,6 +1053,25 @@ fn spawn_fleet_agents(home: &Path, agents: &[AgentDef], ctx: &DaemonContext) {
     tracing::info!(count = agents.len(), "starting agents");
     crate::bootstrap::time_step("agent_spawn_loop", || {
         for def in agents {
+            // #1913 (b): re-check fleet membership immediately before each spawn.
+            // The boot loop iterates a SNAPSHOT of `agents` (resolved before the
+            // loop) and `spawn_stagger()` sleeps ~500ms between spawns — a wide
+            // window in which a `delete_instance` can remove an agent from
+            // fleet.yaml. Spawning a just-deleted agent RESURRECTS it: it
+            // re-creates `workspace/<name>` + a registry handle AFTER teardown
+            // cleanup already ran (the intermittent residual that flaked the
+            // #1907/#1909 teardown oracle). `instance_is_known` going false means
+            // the agent was torn down mid-boot — skip it. The check→spawn gap is
+            // not atomic; the load-bearing fix is the `spawn_agent` chokepoint
+            // (#1915, a deleting-set guard that subsumes this), but this closes the
+            // wide stagger window that the oracle actually hit.
+            if !crate::fleet::instance_is_known(home, &def.0) {
+                tracing::info!(
+                    agent = %def.0,
+                    "skipping boot spawn — instance left fleet.yaml during stagger (#1913 spawn-vs-delete)"
+                );
+                continue;
+            }
             if let Err(e) = spawn_and_register_agent(
                 home,
                 def,

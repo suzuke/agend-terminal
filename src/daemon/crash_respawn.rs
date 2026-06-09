@@ -58,6 +58,27 @@ pub(super) fn handle_crash_respawn(home: &Path, crashed_name: &str, ctx: &Daemon
         let reg = agent::lock_registry(&ctx.registry);
         match reg.get(&instance_id) {
             Some(handle) => {
+                // #1913: an INTENTIONAL delete must not be mistaken for a crash.
+                // `delete_transaction` STORES `handle.deleted = true` (lifecycle.rs)
+                // BEFORE it kills the backend process — but it removes the registry
+                // and config entries only AFTER the kill + exit-wait. The kill is
+                // observed here as an exit classified `Crash`, so without this gate
+                // the crash-respawn loop races those removals and RESURRECTS the
+                // just-deleted instance: it re-spawns the process and re-creates
+                // `workspace/<name>`, which re-leaks the per-instance stores teardown
+                // just cleaned (the intermittent residual root of the #1902–#1909
+                // teardown class). Because `deleted` is Stored before the kill, this
+                // Acquire load reliably observes `true` by the time the exit lands,
+                // and once the registry entry IS removed `reg.get` returns `None`
+                // (the `None` arm below) — so this check covers exactly the racy
+                // window. Treat it as a clean exit: no respawn.
+                if handle.deleted.load(std::sync::atomic::Ordering::Acquire) {
+                    tracing::info!(
+                        agent = %crashed_name,
+                        "exit is an intentional delete (deleted flag set) — skipping crash-respawn"
+                    );
+                    return;
+                }
                 let mut core = handle.core.lock();
                 // #1701: decide the self-orch P0 BEFORE record_crash (which may
                 // itself stamp the crash cooldown on its recent>=2 path) — the
@@ -369,5 +390,176 @@ mod tests {
             !should_fire_terminal_p0(false, SelfOrchStatus::Yes, true),
             "#1744-H4 once-off: an already-paged terminal self-orch must not re-page"
         );
+    }
+}
+
+/// #1913: the delete-vs-crash-respawn gate. `delete_transaction` Stores
+/// `handle.deleted = true` BEFORE killing the backend; the resulting exit is
+/// classified `Crash`, so `handle_crash_respawn` must honor the flag and skip
+/// respawn — otherwise it RESURRECTS the just-deleted instance (re-spawns the
+/// process + re-creates `workspace/<name>`, re-leaking teardown-cleaned stores;
+/// the intermittent residual root of the #1902–#1909 teardown class).
+///
+/// These two tests prove the gate is PRECISE — it suppresses respawn ONLY for a
+/// deleted handle, while a genuine crash (deleted=false) still enters the
+/// respawn path (no crash-recovery regression). The observable is the handle's
+/// `health.total_crashes`: `record_crash` runs (and bumps it) only AFTER the
+/// gate, so `0` proves the gate fired and `1` proves it let a real crash through.
+#[cfg(test)]
+mod deleted_gate_tests_1913 {
+    use super::handle_crash_respawn;
+    use super::{AgentConfig, DaemonContext};
+    use crate::agent::{AgentHandle, AgentRegistry};
+    use crate::types::InstanceId;
+    use parking_lot::Mutex;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    const VICTIM: &str = "victim";
+    const VICTIM_UUID: &str = "11111111-2222-3333-4444-555555555555";
+
+    /// Isolated `/tmp` home seeded with a fleet.yaml so `resolve_uuid(home,
+    /// VICTIM)` → VICTIM_UUID (else `handle_crash_respawn` bails before the gate).
+    fn tmp_home(tag: &str) -> PathBuf {
+        static C: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "agend-crashgate-{}-{}-{}",
+            std::process::id(),
+            tag,
+            C.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("fleet.yaml"),
+            format!("instances:\n  {VICTIM}:\n    command: \"true\"\n    id: {VICTIM_UUID}\n"),
+        )
+        .expect("fleet write");
+        dir
+    }
+
+    /// Registry handle for VICTIM pinned to VICTIM_UUID (so `resolve_uuid` and
+    /// `reg.get` align), backed by a real already-exited `true` child PTY.
+    fn make_handle(deleted: bool) -> AgentHandle {
+        use portable_pty::{native_pty_system, PtySize};
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+        let mut cmd = portable_pty::CommandBuilder::new("true");
+        cmd.cwd(std::env::temp_dir());
+        let child = pair.slave.spawn_command(cmd).expect("spawn true");
+        drop(pair.slave);
+        let pty_writer: crate::agent::PtyWriter =
+            Arc::new(Mutex::new(pair.master.take_writer().expect("writer")));
+        let pty_master = Arc::new(Mutex::new(pair.master));
+        let core = Arc::new(crate::sync_audit::CoreMutex::new(crate::agent::AgentCore {
+            vterm: crate::vterm::VTerm::with_pty_writer(80, 24, Arc::clone(&pty_writer)),
+            subscribers: Vec::new(),
+            state: crate::state::StateTracker::new(None),
+            health: crate::health::HealthTracker::new(),
+        }));
+        AgentHandle {
+            id: InstanceId::parse(VICTIM_UUID).expect("uuid"),
+            name: VICTIM.to_string().into(),
+            backend_command: "true".to_string(),
+            pty_writer,
+            pty_master,
+            core,
+            child: Arc::new(Mutex::new(child)),
+            submit_key: "\r".to_string(),
+            inject_prefix: String::new(),
+            typed_inject: false,
+            spawned_at: std::time::Instant::now(),
+            spawned_at_epoch_ms: 0,
+            deleted: Arc::new(AtomicBool::new(deleted)),
+        }
+    }
+
+    fn make_ctx(registry: AgentRegistry) -> DaemonContext {
+        let mut configs = HashMap::new();
+        configs.insert(
+            VICTIM.to_string(),
+            AgentConfig {
+                name: VICTIM.to_string(),
+                backend_command: "true".to_string(),
+                args: vec![],
+                env: None,
+                working_dir: None,
+                worktree_source: None,
+                submit_key: "\r".to_string(),
+            },
+        );
+        let (crash_tx, crash_rx) = crossbeam_channel::unbounded();
+        DaemonContext {
+            registry,
+            externals: Arc::new(Mutex::new(HashMap::new())),
+            configs: Arc::new(Mutex::new(configs)),
+            crash_tx,
+            crash_rx,
+            // shutdown=true: for the deleted=false case the respawn worker thread
+            // aborts after its backoff WITHOUT a real `spawn_agent` — the test
+            // asserts the respawn PATH was entered (record_crash bumped
+            // total_crashes), not that a process actually launched.
+            shutdown: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    fn total_crashes(reg: &AgentRegistry) -> u32 {
+        let id = InstanceId::parse(VICTIM_UUID).unwrap();
+        let r = reg.lock();
+        let handle = r.get(&id).expect("handle present");
+        let core = handle.core.lock();
+        let n = core.health.total_crashes;
+        n
+    }
+
+    /// (a) An intentional delete (deleted=true) must NOT respawn: the gate
+    /// returns before `record_crash`, so the crash budget is untouched.
+    #[test]
+    fn delete_does_not_respawn_1913() {
+        let home = tmp_home("del");
+        let reg: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        reg.lock()
+            .insert(InstanceId::parse(VICTIM_UUID).unwrap(), make_handle(true));
+        let ctx = make_ctx(Arc::clone(&reg));
+
+        handle_crash_respawn(&home, VICTIM, &ctx);
+
+        assert_eq!(
+            total_crashes(&reg),
+            0,
+            "#1913: a deleted handle must skip the respawn path entirely \
+             (record_crash must not run) — the kill is a teardown, not a crash"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// (b) A genuine crash (deleted=false) MUST still respawn: the gate lets it
+    /// through to `record_crash` (crash budget bumped) — proving the #1913 gate
+    /// is precise and did NOT blanket-disable crash recovery.
+    #[test]
+    fn real_crash_still_respawns_1913() {
+        let home = tmp_home("crash");
+        let reg: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        reg.lock()
+            .insert(InstanceId::parse(VICTIM_UUID).unwrap(), make_handle(false));
+        let ctx = make_ctx(Arc::clone(&reg));
+
+        handle_crash_respawn(&home, VICTIM, &ctx);
+
+        assert_eq!(
+            total_crashes(&reg),
+            1,
+            "#1913 regression guard: a real crash (deleted=false) must STILL enter \
+             the respawn path (record_crash runs) — the deleted-gate must not \
+             suppress normal crash recovery"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 }
