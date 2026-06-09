@@ -1164,6 +1164,7 @@ fn inject_with_target_skips_deleted_agent_1146() {
         submit_key: "\r".to_string(),
         typed_inject: false,
         deleted: Arc::clone(&deleted),
+        core: readback_test_core(b""), // #1912: bulk path never reads it
     };
 
     // Inject succeeds when not deleted.
@@ -1174,6 +1175,130 @@ fn inject_with_target_skips_deleted_agent_1146() {
 
     // Inject must return Ok (no-op) without writing.
     assert!(inject_with_target(&target, b"should be skipped").is_ok());
+}
+
+// ── #1912 readback-confirm inject (hermetic, VTerm-driven) ──────────────────
+
+/// #1912: build a throwaway core with a vterm pre-seeded with `feed` (simulating
+/// the backend's echo of typed chars). Lets the readback helpers be tested without
+/// a live backend process.
+fn readback_test_core(feed: &[u8]) -> Arc<CoreMutex<AgentCore>> {
+    let mut vterm = VTerm::new(80, 24);
+    vterm.process(feed);
+    Arc::new(CoreMutex::new(AgentCore {
+        vterm,
+        subscribers: Vec::new(),
+        state: StateTracker::new(None),
+        health: HealthTracker::new(),
+    }))
+}
+
+fn readback_test_target(core: Arc<CoreMutex<AgentCore>>) -> InjectTarget {
+    let writer: PtyWriter = Arc::new(parking_lot::Mutex::new(
+        Box::new(std::io::sink()) as Box<dyn Write + Send>
+    ));
+    InjectTarget {
+        pty_writer: writer,
+        inject_prefix: String::new(),
+        submit_key: "\r".to_string(),
+        typed_inject: true,
+        deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        core,
+    }
+}
+
+#[test]
+fn inject_sentinel_extracts_last_nonblank_line_tail_1912() {
+    assert_eq!(inject_sentinel("hello world"), "hello world");
+    // last NON-EMPTY line (multi-line system header → the line `\r` commits)
+    assert_eq!(inject_sentinel("line one\nline two\n"), "line two");
+    // long line → bounded to the last 24 chars (robust to input-box wrapping)
+    assert_eq!(inject_sentinel(&"x".repeat(50)).len(), 24);
+    // nothing to confirm
+    assert_eq!(inject_sentinel("   \n  "), "");
+    assert_eq!(inject_sentinel(""), "");
+}
+
+#[test]
+fn readback_confirm_returns_true_when_line_rendered_1912() {
+    // vterm shows codex's `›` input line already containing the payload.
+    let payload = "[AGEND-MSG] from=lead kind=task ci-ready wake body";
+    let core = readback_test_core(format!("\u{203a} {payload}").as_bytes());
+    let target = readback_test_target(core);
+    assert!(readback_confirm_typed_with(
+        &target,
+        payload,
+        std::time::Duration::from_secs(1),
+        std::time::Duration::from_millis(5),
+    ));
+}
+
+#[test]
+fn readback_confirm_times_out_fail_open_when_not_rendered_1912() {
+    // Input area shows only the empty `›` prompt — the payload never rendered.
+    let core = readback_test_core("\u{203a} ".as_bytes());
+    let target = readback_test_target(core);
+    let start = std::time::Instant::now();
+    let confirmed = readback_confirm_typed_with(
+        &target,
+        "this text never renders in the input area",
+        std::time::Duration::from_millis(80),
+        std::time::Duration::from_millis(5),
+    );
+    assert!(!confirmed, "unconfirmed within timeout must report false");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(1),
+        "fail-open: must return promptly at timeout, never hang the wake path"
+    );
+}
+
+#[test]
+fn readback_confirm_waits_for_async_echo_then_confirms_1912() {
+    // Mechanism test (deterministic, no daemon/PTY → flake-free): the backend's
+    // echo of the typed line arrives in the vterm AFTER inject starts polling
+    // (mirrors real echo round-trip latency). readback must POLL until it renders
+    // — not give up early, not confirm before the echo lands. This is the heart of
+    // the fix: replace the fixed-sleep guess with "wait for the actual render".
+    let payload = "[AGEND-MSG] from=lead ci-ready wake unique-12345 body tail";
+    let core = readback_test_core("\u{203a} ".as_bytes()); // empty `›` prompt initially
+    let target = readback_test_target(Arc::clone(&core));
+    let c2 = Arc::clone(&core);
+    let echoed = payload.to_string();
+    let echo = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(40)); // echo latency
+        c2.lock()
+            .vterm
+            .process(format!("\u{203a} {echoed}").as_bytes());
+    });
+    let confirmed = readback_confirm_typed_with(
+        &target,
+        payload,
+        std::time::Duration::from_secs(2),
+        std::time::Duration::from_millis(5),
+    );
+    assert!(
+        confirmed,
+        "readback must poll until the async echo renders, then confirm"
+    );
+    echo.join().expect("echo thread");
+}
+
+#[test]
+fn observe_post_submit_detects_screen_change_1912() {
+    let core = readback_test_core("\u{203a} before".as_bytes());
+    let target = readback_test_target(Arc::clone(&core));
+    // Another thread mutates the vterm to simulate the submit's re-render.
+    let c2 = Arc::clone(&core);
+    let h = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        c2.lock().vterm.process(b"\r\nassistant: working on it");
+    });
+    assert!(observe_post_submit_with(
+        &target,
+        std::time::Duration::from_secs(1),
+        std::time::Duration::from_millis(5),
+    ));
+    h.join().expect("mutator thread");
 }
 /// #1144: pty_read_loop error path must trigger handle_pty_close cleanup.
 /// Previously, `Err(e)` broke out of the loop without calling
