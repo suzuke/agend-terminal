@@ -203,9 +203,13 @@ pub fn cleanup_for_instance(home: &Path, instance: &str) -> usize {
     persist_or_log!(
         crate::store::mutate_versioned(&store_path(home), |store: &mut DispatchStore| {
             let before = store.entries.len();
-            store
-                .entries
-                .retain(|e| e.from != instance && e.to != instance);
+            // #1923 G10: only drop entries where the deleted instance is the
+            // ASSIGNEE (`to`). The stuck-sweep nags `.to`, not `.from`, so a
+            // deleted DISPATCHER (`from`) must KEEP the entry — its live assignee
+            // still needs stuck-tracking, and a ghost `from` (audit-only) mis-routes
+            // no nag. Previously `from != instance` over-deleted, silently dropping
+            // a live assignee's stuck-protection when its dispatcher was deleted.
+            store.entries.retain(|e| e.to != instance);
             removed = before - store.entries.len();
             Ok(())
         }),
@@ -631,20 +635,36 @@ mod tests {
         }
     }
 
+    /// #1923 G10: `cleanup_for_instance` drops entries where the deleted instance
+    /// is the ASSIGNEE (`to`) but KEEPS entries where it is only the DISPATCHER
+    /// (`from`) — the stuck-sweep nags `.to` (the live assignee still needs
+    /// tracking; the ghost `from` is audit-only). Previously it over-deleted the
+    /// from-matching entry too, silently losing the live assignee's stuck-protection.
     #[test]
-    fn cleanup_for_instance_removes_from_and_to_keeps_unrelated() {
+    fn cleanup_for_instance_drops_assignee_keeps_deleted_dispatcher_1923_g10() {
         let home = tmp_home("cleanup-inst");
-        track_dispatch(&home, entry("lead", "doomed")); // to == doomed
-        track_dispatch(&home, entry("doomed", "dev")); // from == doomed
-        track_dispatch(&home, entry("lead", "dev")); // unrelated
+        track_dispatch(&home, entry("lead", "doomed")); // to == doomed → removed
+        track_dispatch(&home, entry("doomed", "dev")); // from == doomed → KEPT (dev still tracked)
+        track_dispatch(&home, entry("lead", "dev")); // unrelated → kept
         let removed = cleanup_for_instance(&home, "doomed");
-        assert_eq!(removed, 2, "both from== and to==doomed entries removed");
+        assert_eq!(
+            removed, 1,
+            "only the entry where doomed is the assignee (to) is removed"
+        );
         let store: serde_json::Value =
             crate::store::load(&crate::store::store_path(&home, "dispatch_tracking.json"));
         let entries = store["entries"].as_array().unwrap();
-        assert_eq!(entries.len(), 1, "unrelated entry must survive");
-        assert_eq!(entries[0]["to"], "dev");
-        assert_eq!(entries[0]["from"], "lead");
+        assert_eq!(
+            entries.len(),
+            2,
+            "from==doomed (live assignee dev) + unrelated survive"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e["from"] == "doomed" && e["to"] == "dev"),
+            "#1923 G10: a deleted dispatcher must NOT drop the live assignee's tracking"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 

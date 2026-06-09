@@ -176,6 +176,18 @@ pub(crate) fn scan_and_emit_with<F>(
                 // redelivers the handoff to the orchestrator itself.
                 continue;
             }
+            // #1923 G11: the recipient is the hardcoded `FALLBACK_RECIPIENT`
+            // ("lead") when `team_orchestrator_for` finds no team orchestrator. If
+            // no instance named "lead" exists in this fleet, the escalation would
+            // be written to a GHOST inbox (silently lost). Skip + log instead of
+            // escalating into the void.
+            if !crate::fleet::instance_is_known(home, &recipient) {
+                tracing::warn!(
+                    %target, %recipient, %corr,
+                    "#1923 G11: handoff-timeout escalation recipient not in fleet — skipping (would be a ghost inbox)"
+                );
+                continue;
+            }
             let text = format!(
                 "[handoff_timeout_watchdog] the next_after_ci handoff to '{target}' for {corr} \
                  has been unclaimed for {age_min}min — CI passed and a [ci-ready-for-action] \
@@ -352,6 +364,35 @@ mod tests {
                     && m.text.contains("o/r@feat")),
             "lead must be escalated about the unclaimed handoff: {:?}",
             msgs.iter().map(|m| &m.text).collect::<Vec<_>>()
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// #1923 G11: when the escalation recipient resolves to the hardcoded
+    /// `FALLBACK_RECIPIENT` ("lead") — no team orchestrator for the target — but
+    /// NO instance named "lead" exists in the fleet, the watchdog must SKIP the
+    /// escalation, not write it to a ghost inbox.
+    #[test]
+    fn no_escalation_to_ghost_fallback_recipient_1923_g11() {
+        let home = tmp_home("g11-ghost");
+        // Fleet has the target but no team orchestrator and no "lead" → the
+        // recipient resolves to the "lead" fallback, which does not exist.
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  reviewer:\n    backend: claude\n",
+        )
+        .unwrap();
+        seed_handoff(&home, "reviewer", "o/r@feat", 15, false);
+        run_watchdog(
+            &home,
+            &chrono::Utc::now(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+        );
+        assert!(
+            crate::inbox::drain(&home, "lead").is_empty(),
+            "#1923 G11: escalation must be skipped when the fallback recipient \
+             'lead' is absent from the fleet (no ghost inbox)"
         );
         std::fs::remove_dir_all(home).ok();
     }

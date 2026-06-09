@@ -169,7 +169,16 @@ pub(crate) fn scan_and_nudge(home: &Path) {
         }
         // Nudge for ANY team's dispatch (was gated to the fixup team); a teamless
         // (solo) dispatcher has no orchestration context → skip.
+        // #1923 G6: but STAMP `nudge_sent_at` first so the L2 team-nudge does not
+        // retry this Exceeded sidecar every scan FOREVER (the dispatcher left its
+        // team — or was always solo — so there is no orchestrator to escalate to).
+        // `stamp_nudge_sent` only sets the L2 dedup guard under the sidecar lock;
+        // it does NOT remove the sidecar, so a legitimate solo dispatcher's L1
+        // lifecycle is untouched. (A dispatcher that left the FLEET entirely is
+        // already retired in L1 by the #1923 G2 `dispatcher_not_in_fleet` check;
+        // this covers the narrower "left the team but still in the fleet" window.)
         let Some(team) = dispatcher_team(home, &d.dispatcher) else {
+            stamp_nudge_sent(home, &d.dispatch_id);
             continue;
         };
         if !emit_nudge(home, &d, &team) {
@@ -276,6 +285,33 @@ mod tests {
         assert_eq!(
             second_count, 0,
             "second scan must NOT re-nudge (dedup via nudge_sent_at)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1923 G6: a sidecar whose dispatcher has NO team (solo, or left the team
+    /// but still in the fleet) must have its L2 `nudge_sent_at` STAMPED — else the
+    /// team-nudge scan retries the Exceeded sidecar every scan FOREVER (there is no
+    /// orchestrator to escalate to). The sidecar is NOT removed (a solo dispatcher
+    /// keeps its L1 lifecycle); only the L2 retry is stopped.
+    #[test]
+    fn no_team_dispatcher_stamps_nudge_sent_stops_retry_1923_g6() {
+        let home = tmp_home("g6-no-team");
+        // Dispatcher is in the fleet (so L1 #1923-G2 doesn't retire it) but in NO
+        // team → `dispatcher_team` returns None.
+        std::fs::write(
+            home.join("fleet.yaml"),
+            "schema_version: 1\ninstances:\n  solo-lead:\n    backend: claude\n",
+        )
+        .unwrap();
+        let id = write_exceeded_sidecar(&home, "solo-lead", "dev", "t-g6", 700);
+        scan_and_nudge(&home);
+        let sidecar: PendingDispatch =
+            serde_json::from_str(&std::fs::read_to_string(pending_path(&home, &id)).unwrap())
+                .unwrap();
+        assert!(
+            sidecar.nudge_sent_at.is_some(),
+            "#1923 G6: a no-team dispatcher's sidecar must be stamped to stop the L2 retry"
         );
         std::fs::remove_dir_all(&home).ok();
     }
