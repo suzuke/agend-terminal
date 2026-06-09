@@ -732,7 +732,7 @@ pub(crate) fn ensure_branch_exists(
         let fetch_out = crate::git_helpers::git_bypass_timeout(
             source,
             &["fetch", "origin", branch, "--quiet"],
-            std::time::Duration::from_secs(60),
+            crate::git_helpers::NETWORK_GIT_TIMEOUT,
         );
         let fetched_ok = matches!(&fetch_out, Ok(o) if o.status.success());
         let remote_branch_ref = format!("refs/remotes/origin/{branch}");
@@ -765,7 +765,7 @@ pub(crate) fn ensure_branch_exists(
         let fetch_out = crate::git_helpers::git_bypass_timeout(
             source,
             &["fetch", "origin", remote_branch, "--quiet"],
-            std::time::Duration::from_secs(60),
+            crate::git_helpers::NETWORK_GIT_TIMEOUT,
         );
         create_fetched = matches!(&fetch_out, Ok(o) if o.status.success());
         crate::event_log::log(
@@ -801,7 +801,7 @@ pub(crate) fn ensure_branch_exists(
                 let fetch_out = crate::git_helpers::git_bypass_timeout(
                     source,
                     &["fetch", "origin", "--quiet"],
-                    std::time::Duration::from_secs(60),
+                    crate::git_helpers::NETWORK_GIT_TIMEOUT,
                 );
                 let fetch_ms = fetch_start.elapsed().as_millis();
                 crate::event_log::log(
@@ -1049,11 +1049,16 @@ fn run_git_idempotent(args: &[&str], cwd: &Path) -> std::io::Result<std::process
     const BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
     let mut last: Option<std::process::Output> = None;
     for attempt in 1..=MAX_ATTEMPTS {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .current_dir(cwd)
-            .env("AGEND_GIT_BYPASS", "1")
-            .output()?;
+        // #1897: bounded — these are LOCAL ops (log / diff / reset), so a stuck
+        // git (contended index.lock) returns Err(TimedOut) instead of hanging the
+        // daemon. A timeout is NOT a transient non-zero exit, so it `?`-propagates
+        // immediately (no point retrying a wedge); the retry-on-failure loop below
+        // is preserved for genuine transient git failures (#1787).
+        let out = crate::git_helpers::git_bypass_timeout(
+            cwd,
+            args,
+            crate::git_helpers::LOCAL_GIT_TIMEOUT,
+        )?;
         if out.status.success() {
             return Ok(out);
         }

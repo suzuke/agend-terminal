@@ -1,6 +1,21 @@
 //! Git helper functions — single source of truth for remote/branch detection.
 
 use std::path::Path;
+use std::time::Duration;
+
+/// #1897: bound for LOCAL git ops (branch / worktree add / rev-parse / status /
+/// remote get-url / log / diff / reset). These don't hit the network; a healthy
+/// one is sub-second and the only legitimate slowness is a contended
+/// `.git/index.lock` or a large worktree-add checkout. 60s is far above any real
+/// local op, so it never false-kills a legit op but still fails fast instead of
+/// hanging the daemon forever (the #1893/RC1 root cause).
+pub(crate) const LOCAL_GIT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// #1897: bound for NETWORK git ops (fetch / clone). A large fetch can legitimately
+/// take minutes, so this is generous — strictly wider than the prior hard-coded
+/// 60s at the fetch sites, so it can only ADD tolerance (never newly false-kills a
+/// fetch that passed before) while still capping a wedged network op.
+pub(crate) const NETWORK_GIT_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// #781 Piece 6 — daemon-internal `git` subprocess wrapper that always
 /// sets `AGEND_GIT_BYPASS=1`. Centralizes the bypass-env contract so
@@ -11,43 +26,82 @@ use std::path::Path;
 /// Promoted to `pub(crate)` in `git_helpers` for #781 so both
 /// `handle_checkout_repo` and `dispatch_auto_bind_lease`'s
 /// `ensure_branch_exists` extraction share a single bypass-env helper.
+///
+/// #1897: previously a bare `.output()` (UNBOUNDED) — a git blocked on a
+/// contended `.git/index.lock` hung the daemon forever. Now routes through
+/// [`git_bypass_timeout`] with the generous [`LOCAL_GIT_TIMEOUT`] so a stuck
+/// local git fails fast with a clear `Err(TimedOut)` the caller can handle. The
+/// fast path is byte-identical to before (same captured `Output`).
 pub(crate) fn git_bypass(cwd: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
-    std::process::Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .env("AGEND_GIT_BYPASS", "1")
-        .output()
+    git_bypass_timeout(cwd, args, LOCAL_GIT_TIMEOUT)
 }
 
 /// Like `git_bypass` but with a process-level timeout. Spawns the git
 /// subprocess and polls `try_wait` until either the process exits or the
-/// deadline is reached, at which point the child is killed.
+/// deadline is reached, at which point the git process group is killed.
+///
+/// #1897: two hardening changes (callers' observable contract is unchanged —
+/// still `Ok(Output)` on completion, `Err(TimedOut)` on deadline):
+///  - git runs in its OWN process group (`process_group(0)` /
+///    `CREATE_NEW_PROCESS_GROUP`). This is MANDATORY for the kill below:
+///    `kill_process_tree` resolves the pgid via `getpgid`, so without isolation
+///    it would resolve to the DAEMON's group and kill the daemon.
+///  - on timeout we kill the whole git PROCESS GROUP (git + its sub-helpers like
+///    `git-remote-https` / pack) via `process::kill_process_tree`, not just the
+///    immediate child — so a wedged fetch's network helper can't orphan.
 pub(crate) fn git_bypass_timeout(
     cwd: &Path,
     args: &[&str],
-    timeout: std::time::Duration,
+    timeout: Duration,
 ) -> std::io::Result<std::process::Output> {
-    let mut child = std::process::Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .env("AGEND_GIT_BYPASS", "1")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(args).current_dir(cwd).env("AGEND_GIT_BYPASS", "1");
+    spawn_group_bounded(cmd, &format!("git {:?}", &args[..1]), timeout)
+}
+
+/// #1897: spawn `cmd` in its OWN process group, capture stdout/stderr, and bound
+/// it by `timeout`. On the deadline, kill the whole process group (the child +
+/// its sub-helpers) via `process::kill_process_tree` and return `Err(TimedOut)`.
+///
+/// Extracted from [`git_bypass_timeout`] so the timeout + process-group-kill
+/// mechanism is unit-testable with a `sleep` stub (the git path is identical —
+/// same `Command` minus the binary). Process-group isolation is MANDATORY:
+/// `kill_process_tree` resolves the pgid via `getpgid`, so without isolation the
+/// kill would resolve to the DAEMON's group and kill the daemon.
+fn spawn_group_bounded(
+    mut cmd: std::process::Command,
+    label: &str,
+    timeout: Duration,
+) -> std::io::Result<std::process::Output> {
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // Group isolation only; NOT detached — we keep the captured stdout/stderr.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NEW_PROCESS_GROUP (0x00000200) — group isolation, not DETACHED.
+        cmd.creation_flags(0x0000_0200);
+    }
+    let mut child = cmd.spawn()?;
 
     let start = std::time::Instant::now();
     loop {
         match child.try_wait()? {
             Some(_status) => return child.wait_with_output(),
             None if start.elapsed() >= timeout => {
-                let _ = child.kill();
+                crate::process::kill_process_tree(child.id());
                 let _ = child.wait();
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
-                    format!("git {:?} timed out after {timeout:?}", &args[..1]),
+                    format!("{label} timed out after {timeout:?}"),
                 ));
             }
-            None => std::thread::sleep(std::time::Duration::from_millis(200)),
+            None => std::thread::sleep(Duration::from_millis(200)),
         }
     }
 }
@@ -58,12 +112,9 @@ pub(crate) fn git_bypass_timeout(
 pub fn default_branch(repo_dir: &Path) -> String {
     let remote = primary_remote(repo_dir);
     let ref_path = format!("refs/remotes/{remote}/HEAD");
-    let output = std::process::Command::new("git")
-        .args(["symbolic-ref", &ref_path])
-        .current_dir(repo_dir)
-        .env("AGEND_GIT_BYPASS", "1")
-        .output();
-    match output {
+    // #1897: bounded (was an unbounded `.output()`) — a stuck local git falls
+    // through to the "main" fallback instead of hanging the daemon.
+    match git_bypass_timeout(repo_dir, &["symbolic-ref", &ref_path], LOCAL_GIT_TIMEOUT) {
         Ok(o) if o.status.success() => {
             let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
             let prefix = format!("refs/remotes/{remote}/");
@@ -77,12 +128,9 @@ pub fn default_branch(repo_dir: &Path) -> String {
 /// Returns the first remote listed by `git remote`, typically "origin".
 /// Falls back to "origin" if detection fails.
 pub fn primary_remote(repo_dir: &Path) -> String {
-    let output = std::process::Command::new("git")
-        .args(["remote"])
-        .current_dir(repo_dir)
-        .env("AGEND_GIT_BYPASS", "1")
-        .output();
-    match output {
+    // #1897: bounded (was an unbounded `.output()`) — a stuck local git falls
+    // through to the "origin" fallback instead of hanging the daemon.
+    match git_bypass_timeout(repo_dir, &["remote"], LOCAL_GIT_TIMEOUT) {
         Ok(o) if o.status.success() => {
             let s = String::from_utf8_lossy(&o.stdout);
             s.lines().next().unwrap_or("origin").to_string()
@@ -95,6 +143,71 @@ pub fn primary_remote(repo_dir: &Path) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    // #1897 §3.9: the timeout + process-group-kill mechanism, driven by `sleep`
+    // stubs (unix). The git path is `spawn_group_bounded` with `git` as the
+    // binary, so these exercise the exact prod loop/kill.
+
+    #[test]
+    #[cfg(unix)]
+    fn spawn_group_bounded_times_out_within_slack_1897() {
+        // A slow stub sleeps 30s; a 1s bound must return Err(TimedOut) fast,
+        // NOT hang for 30s (the daemon-hang root cause #1893/RC1).
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30");
+        let start = std::time::Instant::now();
+        let res = spawn_group_bounded(cmd, "sleep 30", Duration::from_secs(1));
+        let elapsed = start.elapsed();
+        let err = res.expect_err("slow stub must time out, not hang");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        // 1s timeout + kill grace (500ms) + poll slack — well under the 30s sleep.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "must return shortly after the timeout, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn spawn_group_bounded_fast_command_unaffected_1897() {
+        // A fast command completes normally and returns its captured Output —
+        // the timeout path must not perturb the success path.
+        let cmd = std::process::Command::new("true");
+        let out = spawn_group_bounded(cmd, "true", Duration::from_secs(10))
+            .expect("fast command must return Ok");
+        assert!(out.status.success(), "fast command exits 0 with Output");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn spawn_group_bounded_kills_whole_process_group_1897() {
+        // The stub backgrounds a grandchild `sleep` (same process group, no
+        // setsid), records its pid, then blocks. On timeout the process-group
+        // kill must reap the GRANDCHILD too — not just the immediate child.
+        let pidfile =
+            std::env::temp_dir().join(format!("agend-1897-pgkill-{}.pid", std::process::id()));
+        let _ = std::fs::remove_file(&pidfile);
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg(format!(
+            "sleep 30 & echo $! > {}; sleep 30",
+            pidfile.display()
+        ));
+        let res = spawn_group_bounded(cmd, "sh tree", Duration::from_secs(2));
+        assert!(res.is_err(), "blocking stub must time out");
+        // kill_process_tree does SIGTERM → 500ms grace → SIGKILL synchronously
+        // before returning; a little extra slack lets the OS finish reaping.
+        std::thread::sleep(Duration::from_millis(800));
+        let gpid: u32 = std::fs::read_to_string(&pidfile)
+            .expect("grandchild pid recorded")
+            .trim()
+            .parse()
+            .expect("pid parses");
+        assert!(
+            !crate::process::is_pid_alive(gpid),
+            "grandchild (pid {gpid}) must be reaped by the process-group kill"
+        );
+        let _ = std::fs::remove_file(&pidfile);
+    }
 
     #[test]
     fn default_branch_fallback_when_no_repo() {
