@@ -193,6 +193,16 @@ pub fn flock_exited() {
     FLOCK_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
 }
 
+/// #1886: this thread's current `acquire_file_lock` flock nesting depth. Used by
+/// the leaf-lock invariant test to assert a `with_json_state` RMW closure runs at
+/// depth 1 (the helper's own lock, no nested file-flock). Test-only — used from
+/// the bin-side `store` test tree, so the lib-test build sees no caller.
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn flock_depth() -> u32 {
+    FLOCK_DEPTH.with(|c| c.get())
+}
+
 /// #1535: a `parking_lot::Mutex` wrapper for the per-agent `AgentCore` that
 /// tracks lock depth via [`CORE_LOCK_DEPTH`]. `.lock()` is API-compatible with
 /// `parking_lot::Mutex::lock` (the returned [`CoreGuard`] `Deref`s to `T`), so
