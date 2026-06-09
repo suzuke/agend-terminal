@@ -217,43 +217,49 @@ pub fn merge_metadata(home: &Path, name: &str, info: &mut Value) {
 
 /// Persist a single metadata key/value for an instance.
 ///
-/// Uses atomic write (temp file + rename) so concurrent readers
-/// (e.g. supervisor tick) never see a half-written file.
+/// #1886 C2: locked read-modify-write (flock spans load→modify→write) so two
+/// concurrent `set_*` on the same instance can't each read the same object and
+/// clobber the other's field. `with_json_state_or_create` also gives the same
+/// atomic write (temp file + rename) the prior code had, so concurrent readers
+/// (e.g. supervisor tick) still never see a half-written file.
 pub fn save_metadata(home: &Path, instance_name: &str, key: &str, value: Value) {
     let meta_dir = home.join("metadata");
     std::fs::create_dir_all(&meta_dir).ok();
     let meta_path = metadata_path_resolved(home, instance_name);
-    let mut meta: Value = std::fs::read_to_string(&meta_path)
-        .map(|c| serde_json::from_str(&c).unwrap_or(json!({})))
-        .unwrap_or(json!({}));
-    meta[key] = value;
-    let content = serde_json::to_string_pretty(&meta).unwrap_or_default();
-    // M1: atomic write with fsync. #1647: log on failure — this metadata is read
-    // back by `merge_metadata`, and the MCP set_* handlers return OK regardless,
-    // so a dropped write was a silent operator-set-but-lost.
+    // #1647: log on failure — this metadata is read back by `merge_metadata`, and
+    // the MCP set_* handlers return OK regardless, so a dropped write was a silent
+    // operator-set-but-lost.
     persist_or_log!(
-        crate::store::atomic_write(&meta_path, content.as_bytes()),
+        crate::store::with_json_state_or_create::<Value, _, _, _>(
+            &meta_path,
+            || json!({}),
+            |meta| {
+                meta[key] = value;
+            },
+        ),
         "save_metadata"
     );
 }
 
-/// Persist multiple metadata key/value pairs in a single atomic write.
-/// Avoids the race condition where two sequential `save_metadata` calls
-/// can interleave on Windows (the second read-modify-write reads stale data).
+/// Persist multiple metadata key/value pairs in a single locked read-modify-write.
+/// #1886 C2: the flock spans the whole load→modify→write (not just the write), so
+/// concurrent `save_metadata`/`save_metadata_batch` on the same instance never read
+/// stale data and lose each other's update (the prior comment's interleave race).
 pub fn save_metadata_batch(home: &Path, instance_name: &str, entries: &[(&str, Value)]) {
     let meta_dir = home.join("metadata");
     std::fs::create_dir_all(&meta_dir).ok();
     let meta_path = metadata_path_resolved(home, instance_name);
-    let mut meta: Value = std::fs::read_to_string(&meta_path)
-        .map(|c| serde_json::from_str(&c).unwrap_or(json!({})))
-        .unwrap_or(json!({}));
-    for (key, value) in entries {
-        meta[*key] = value.clone();
-    }
-    let content = serde_json::to_string_pretty(&meta).unwrap_or_default();
-    // M1: atomic write with fsync. #1647: log on failure — see save_metadata.
+    // #1647: log on failure — see save_metadata.
     persist_or_log!(
-        crate::store::atomic_write(&meta_path, content.as_bytes()),
+        crate::store::with_json_state_or_create::<Value, _, _, _>(
+            &meta_path,
+            || json!({}),
+            |meta| {
+                for (key, value) in entries {
+                    meta[*key] = value.clone();
+                }
+            },
+        ),
         "save_metadata_batch"
     );
 }
@@ -460,6 +466,75 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).ok();
         dir
+    }
+
+    #[test]
+    fn concurrent_save_metadata_no_lost_update_1886() {
+        // #1886 C2 §3.9: N threads each set a DISTINCT key on the SAME instance's
+        // metadata. The locked RMW keeps every field; the prior unlocked
+        // read+atomic_write would lose updates under contention.
+        let home = tmp_home("concurrent-save-meta-1886");
+        const N: usize = 12;
+        let handles: Vec<_> = (0..N)
+            .map(|i| {
+                let home = home.clone();
+                std::thread::spawn(move || {
+                    save_metadata(&home, "agent-x", &format!("key-{i}"), json!(i));
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let content = std::fs::read_to_string(metadata_path_resolved(&home, "agent-x")).unwrap();
+        let meta: Value = serde_json::from_str(&content).unwrap();
+        for i in 0..N {
+            assert_eq!(
+                meta.get(format!("key-{i}")).and_then(|v| v.as_u64()),
+                Some(i as u64),
+                "every concurrent field write must survive"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_save_metadata_clear_vs_set_both_survive_1886() {
+        // #1886 C2 §3.9 (clear-vs-set): one writer clears `waiting_on` while
+        // another sets a different field on the same instance — both updates
+        // survive and an untouched field is preserved (the F7 interleave race,
+        // now closed by the locked RMW).
+        let home = tmp_home("save-meta-clear-set-1886");
+        save_metadata_batch(
+            &home,
+            "agent-y",
+            &[
+                ("waiting_on", json!("reviewer")),
+                ("waiting_on_since", json!(1)),
+            ],
+        );
+        let h1 = {
+            let home = home.clone();
+            std::thread::spawn(move || save_metadata(&home, "agent-y", "waiting_on", json!(null)))
+        };
+        let h2 = {
+            let home = home.clone();
+            std::thread::spawn(move || save_metadata(&home, "agent-y", "extra", json!("set")))
+        };
+        h1.join().unwrap();
+        h2.join().unwrap();
+        let content = std::fs::read_to_string(metadata_path_resolved(&home, "agent-y")).unwrap();
+        let meta: Value = serde_json::from_str(&content).unwrap();
+        assert!(meta["waiting_on"].is_null(), "clear survived");
+        assert_eq!(
+            meta["extra"].as_str(),
+            Some("set"),
+            "concurrent set survived"
+        );
+        assert_eq!(
+            meta["waiting_on_since"].as_u64(),
+            Some(1),
+            "untouched field preserved"
+        );
     }
 
     /// #bughunt2: the last-resort delivery path must surface a dropped enqueue
