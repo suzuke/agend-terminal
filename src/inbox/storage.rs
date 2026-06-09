@@ -50,6 +50,15 @@ pub(crate) fn inbox_path(home: &Path, name: &str) -> PathBuf {
     home.join("inbox").join(format!("{name}.jsonl"))
 }
 
+/// #1902: id-based inbox path (pure — no fleet.yaml lookup, unlike
+/// [`inbox_path_resolved`]). Mirrors `agent_ops::metadata_path_for_id`. For
+/// teardown paths where the `InstanceId` is known directly and fleet.yaml has
+/// already been removed (so the name→id resolver can't run) — e.g.
+/// `full_delete_instance`, whose UUID inbox would otherwise leak silently.
+pub(crate) fn inbox_path_for_id(home: &Path, id: &crate::types::InstanceId) -> PathBuf {
+    home.join("inbox").join(format!("{}.jsonl", id.full()))
+}
+
 /// Sprint 46 P2: resolve inbox path by InstanceId when available.
 /// Migrates legacy name-based files to id-based on first access.
 pub(crate) fn inbox_path_resolved(home: &Path, name: &str) -> PathBuf {

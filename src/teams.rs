@@ -315,6 +315,24 @@ pub fn delete(home: &Path, args: &Value) -> Value {
     let members_count = members.len();
     let mut cascade_warnings: Vec<String> = Vec::new();
     for member in &members {
+        // #1903: CANCEL the member's live tasks BEFORE deleting the instance. A
+        // disband has no survivor to take over, so cancel (terminal) rather than
+        // orphan (Open + owner:None → a same-name redeploy sees a ghost open
+        // task). Ordering is load-bearing: it MUST run before full_delete_instance
+        // — that fn's internal orphan would otherwise null the owner first, leaving
+        // this cancel-by-owner nothing to match. After this cancel, that internal
+        // orphan SKIPS these tasks (Cancelled ∉ its Open/Claimed/InProgress/Blocked
+        // filter) → a single Cancelled transition, no double event. A single
+        // delete_instance never reaches here, so its orphan ACL-unlock is intact.
+        if let Err(e) = crate::tasks::cancel_tasks_for_owner(home, member) {
+            cascade_warnings.push(format!("{member} task cancel: {e}"));
+            tracing::warn!(
+                team = %name,
+                %member,
+                error = %e,
+                "#1903: task cancel failed during team disband"
+            );
+        }
         if let Err(e) = crate::mcp::handlers::instance_lifecycle::full_delete_instance(home, member)
         {
             cascade_warnings.push(format!("{member}: {e}"));
@@ -591,6 +609,62 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).ok();
         dir
+    }
+
+    #[test]
+    fn team_disband_cancels_member_tasks_no_double_event_1903() {
+        // #1903 §3.9 (b): disbanding a team must CANCEL each member's live tasks
+        // (no survivor to take over), and — proving the cancel-BEFORE-cascade
+        // ordering — the task must carry a SINGLE Cancelled transition with NO
+        // `system:auto_orphan` OwnerAssigned event (the internal orphan must SKIP
+        // the already-Cancelled task, not coincidentally miss it).
+        let home = tmp_home("disband_cancel_1903");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  m1:\n    backend: claude\nteams:\n  squad:\n    orchestrator: m1\n    members:\n      - m1\n",
+        )
+        .unwrap();
+        let r = crate::tasks::handle(
+            &home,
+            "m1",
+            &serde_json::json!({"action": "create", "title": "owned", "assignee": "m1"}),
+        );
+        let task_id = r["id"].as_str().expect("task id").to_string();
+
+        let res = super::delete(&home, &serde_json::json!({"name": "squad"}));
+        assert_eq!(res["status"], "deleted", "disband must succeed: {res}");
+
+        // (b1) terminal Cancelled, not Open.
+        let task = crate::tasks::list_all(&home)
+            .into_iter()
+            .find(|t| t.id == task_id)
+            .expect("task still exists");
+        assert_eq!(
+            task.status,
+            crate::task_events::TaskStatus::Cancelled,
+            "disband must cancel the member's task, got {:?}",
+            task.status
+        );
+
+        // (b2) single Cancelled transition + zero auto_orphan double-event.
+        let log = std::fs::read_to_string(home.join("task_events.jsonl")).unwrap();
+        let cancelled = log
+            .lines()
+            .filter(|l| l.contains(&task_id) && l.contains("\"kind\":\"Cancelled\""))
+            .count();
+        let auto_orphan = log
+            .lines()
+            .filter(|l| l.contains(&task_id) && l.contains("system:auto_orphan"))
+            .count();
+        assert_eq!(
+            cancelled, 1,
+            "exactly one Cancelled transition, got {cancelled}"
+        );
+        assert_eq!(
+            auto_orphan, 0,
+            "orphan must NOT double-fire on the already-Cancelled task (cancel-before-cascade), got {auto_orphan}"
+        );
+        std::fs::remove_dir_all(home).ok();
     }
 
     // ── #1744-M7: deterministic + fail-closed self-orch verdict ──
@@ -978,7 +1052,12 @@ mod tests {
             "bob828 must be removed from fleet.yaml instances"
         );
 
-        // All 3 previously-owned tasks are orphaned (owner = None).
+        // #1903: a team DISBAND now CANCELS each member's live tasks (terminal)
+        // rather than orphaning them (Open, owner cleared). A disbanded team has
+        // no survivor to take over, and an orphan-open task would be a ghost for a
+        // same-name redeploy. (This test previously asserted owner==None — that
+        // pinned the orphan-on-disband behaviour #1903 fixes. Single-instance
+        // delete still orphans-open — see full_delete_instance_orphans_owned_tasks.)
         let state = crate::task_events::replay(&home).unwrap();
         for id in &[id1.as_str(), id2.as_str(), id3.as_str()] {
             let task = state
@@ -986,11 +1065,12 @@ mod tests {
                 .values()
                 .find(|t| t.id.0 == *id)
                 .unwrap_or_else(|| panic!("task {id} must exist post-cascade"));
-            assert!(
-                task.owner.is_none(),
-                "task {} must be orphaned post-cascade, has owner={:?}",
+            assert_eq!(
+                task.status,
+                crate::task_events::TaskStatus::Cancelled,
+                "task {} must be CANCELLED post-disband (not orphaned-open), got status={:?}",
                 task.id.0,
-                task.owner
+                task.status
             );
         }
 
