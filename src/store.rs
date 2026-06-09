@@ -348,6 +348,60 @@ mod tests {
     }
 
     #[test]
+    fn with_json_state_closure_is_leaf_lock_1886() {
+        // #1886 follow-up: the metadata/topics RMW (save_metadata, register_topic)
+        // run their mutate closure INSIDE with_json_state_or_create's file-flock.
+        // That flock must be a LEAF — the closure takes no further file-flock —
+        // else a nested flock could deadlock against another lock-ordering path.
+        // Fortifies reviewer-2's structural argument with a concrete assertion:
+        // the closure observes flock depth EXACTLY 1 (the helper's own lock,
+        // nothing nested).
+        let dir = tmp_dir("leaf-lock-1886");
+        let path = dir.join("state.json");
+        let depth_in_closure = std::cell::Cell::new(0u32);
+        with_json_state_or_create::<serde_json::Value, _, _, _>(
+            &path,
+            || serde_json::json!({}),
+            |_v| depth_in_closure.set(crate::sync_audit::flock_depth()),
+        )
+        .expect("rmw");
+        assert_eq!(
+            depth_in_closure.get(),
+            1,
+            "with_json_state RMW closure must run at flock depth 1 (leaf lock); \
+             a nested file-flock inside the closure would make it >1"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn with_json_state_nested_flock_reaches_depth_2_1886() {
+        // #1886 follow-up: prove the leaf-lock assertion above has TEETH — if a
+        // future closure DID nest a second file-flock, the depth would be 2, so
+        // the depth-1 assertion would fail and catch the regression.
+        let dir = tmp_dir("nested-detect-1886");
+        let path = dir.join("a.json");
+        let other_lock = dir.join("b.lock");
+        let nested_depth = std::cell::Cell::new(0u32);
+        with_json_state_or_create::<serde_json::Value, _, _, _>(
+            &path,
+            || serde_json::json!({}),
+            |_v| {
+                let _g = acquire_file_lock(&other_lock).expect("nested lock");
+                nested_depth.set(crate::sync_audit::flock_depth());
+            },
+        )
+        .expect("rmw");
+        assert_eq!(
+            nested_depth.get(),
+            2,
+            "a nested file-flock inside the closure reaches depth 2 — confirms the \
+             leaf-lock test above would catch a future nested-lock regression"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn test_roundtrip() {
         let dir = tmp_dir("roundtrip");
         let path = dir.join("roundtrip.json");

@@ -21,6 +21,26 @@ static DISMISS_REGEX_CACHE: std::sync::LazyLock<
     parking_lot::Mutex<std::collections::HashMap<String, Option<std::sync::Arc<regex::Regex>>>>,
 > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
 
+/// H2: agents with a dismiss thread currently in flight — gates rapid dialog
+/// re-detection to one thread per agent. Hoisted to module scope (#1886
+/// follow-up) so the RAII [`InFlightGuard`] can clear it on drop.
+static DISMISS_IN_FLIGHT: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
+
+/// #1886 follow-up: RAII guard that removes an agent from `DISMISS_IN_FLIGHT` on
+/// drop — including on a panic or early-return of the dismiss thread. Previously
+/// the removal was a trailing statement, so a panic before it left a stale entry
+/// that silently no-op'd every future dismiss for that agent until daemon
+/// restart. Arm it at thread entry; the in-flight slot is freed on any exit.
+struct InFlightGuard(String);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        DISMISS_IN_FLIGHT.lock().remove(&self.0);
+    }
+}
+
 fn compile_dismiss_regex(pattern: &str) -> Option<std::sync::Arc<regex::Regex>> {
     let mut cache = DISMISS_REGEX_CACHE.lock();
     if let Some(slot) = cache.get(pattern) {
@@ -100,11 +120,6 @@ pub fn try_dismiss_dialog(
             // Ink-based TUIs (kiro-cli) to interpret \x1b as "ESC to cancel".
             // H2: bounded dismiss — skip if one already in-flight for this agent.
             // Prevents thread accumulation from rapid dialog re-detection.
-            static DISMISS_IN_FLIGHT: std::sync::LazyLock<
-                parking_lot::Mutex<std::collections::HashSet<String>>,
-            > = std::sync::LazyLock::new(|| {
-                parking_lot::Mutex::new(std::collections::HashSet::new())
-            });
             {
                 let mut inflight = DISMISS_IN_FLIGHT.lock();
                 if inflight.contains(name) {
@@ -116,10 +131,14 @@ pub fn try_dismiss_dialog(
             let keys = key_seq.clone();
             let agent = name.to_string();
             // fire-and-forget: dialog-dismiss keystroke writer is short-lived
-            // (sleep 300ms then write). H2: removes from in-flight set on exit.
+            // (sleep 300ms then write). H2: in-flight slot freed by InFlightGuard
+            // on any exit (incl. panic), armed at thread entry below.
             if std::thread::Builder::new()
                 .name("dismiss-dialog".into())
                 .spawn(move || {
+                    // #1886 follow-up: arm the in-flight removal as a Drop guard at
+                    // thread entry so a panic / early-return still frees the slot.
+                    let _guard = InFlightGuard(agent.clone());
                     std::thread::sleep(std::time::Duration::from_millis(300));
                     // Send keys in chunks split on \r/\n boundaries with delay between,
                     // so TUI frameworks process navigation before confirmation.
@@ -146,8 +165,7 @@ pub fn try_dismiss_dialog(
                         let _ = w.flush();
                     }
                     tracing::debug!(agent = %agent, "dismiss keystrokes sent");
-                    // H2: remove from in-flight set
-                    DISMISS_IN_FLIGHT.lock().remove(&agent);
+                    // H2: in-flight slot freed by `_guard` on scope exit.
                 })
                 .is_err()
             {
@@ -180,6 +198,30 @@ mod tests {
 
     fn test_writer() -> PtyWriter {
         Arc::new(Mutex::new(Box::new(Vec::<u8>::new())))
+    }
+
+    #[test]
+    fn inflight_guard_clears_entry_on_panic_1886() {
+        // #1886 follow-up §3.9: a dismiss thread that panics before its normal
+        // exit must STILL free the in-flight slot (via InFlightGuard's Drop),
+        // else the stale entry permanently no-op's future dismiss for that agent.
+        // Inject a panic after the guard is armed and assert the slot is cleared.
+        DISMISS_IN_FLIGHT
+            .lock()
+            .insert("panic-agent-1886".to_string());
+        let h = std::thread::Builder::new()
+            .name("dismiss-panic-test".into())
+            .spawn(|| {
+                let _guard = InFlightGuard("panic-agent-1886".to_string());
+                panic!("injected panic before normal in-flight removal");
+            })
+            .expect("spawn");
+        // Join the panicking thread (the panic is contained to it).
+        assert!(h.join().is_err(), "the injected panic must propagate");
+        assert!(
+            !DISMISS_IN_FLIGHT.lock().contains("panic-agent-1886"),
+            "InFlightGuard must clear the in-flight slot even when the thread panics"
+        );
     }
 
     #[test]
