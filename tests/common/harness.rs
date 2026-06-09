@@ -515,11 +515,20 @@ fn authed_api_call(
 }
 
 fn binary_path() -> PathBuf {
-    let mut path = std::env::current_exe().expect("current_exe");
-    path.pop(); // strip test binary name
-    path.pop(); // strip deps/
-    path.push("agend-terminal");
-    path
+    // `CARGO_BIN_EXE_<bin>` is set by cargo for integration tests and resolved at
+    // COMPILE TIME, so referencing it both (a) declares this test's dependency on
+    // the `agend-terminal` binary — making cargo/nextest fresh-BUILD it for the
+    // current test profile — and (b) points at that exact build.
+    //
+    // The previous `current_exe()` inference instead spawned whatever
+    // `target/<profile>/agend-terminal` happened to already exist on disk. Under
+    // CI's split (`cargo build --release` for the smoke bin, then `cargo nextest`
+    // running tests in DEBUG), nextest did NOT rebuild the debug bin — current_exe
+    // never declared the dependency — so the harness spawned a STALE debug daemon
+    // missing the PR's own changes. #1909's teardown regression (the first harness
+    // test to assert NEW daemon behavior) caught exactly that: it spawned a daemon
+    // without the PR's workspace-cleanup fix and correctly flagged the residual.
+    PathBuf::from(env!("CARGO_BIN_EXE_agend-terminal"))
 }
 
 /// Wave 1 CLI consolidation: the harness's default spawn now uses
