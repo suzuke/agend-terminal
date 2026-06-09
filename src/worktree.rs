@@ -336,7 +336,15 @@ pub fn resolve_auto_worktree(
     // worktree source — it only becomes a "repo" via ensure_project_root's
     // git-init. Skip it regardless of is_git_repo so the decision can't drift
     // across launches.
-    if *base_dir == crate::paths::workspace_dir(home).join(name) {
+    // #1919: PREFIX match, not exact. A team-deploy nests the per-instance default
+    // under a team subdir (`<home>/workspace/<team>/<instance>`), which the old
+    // exact `== workspace_dir/<name>` check missed → the git-init'd default fell
+    // through to auto-worktree and broke `claude --continue` session resume on
+    // restart. Everything under `<home>/workspace/` is daemon-managed default (a
+    // real user working_directory is explicit-config'd OUTSIDE it) — the same
+    // invariant `agent_ops::cleanup_working_dir` already encodes via
+    // `starts_with(&workspaces)`.
+    if base_dir.starts_with(crate::paths::workspace_dir(home)) {
         return None;
     }
     if !is_git_repo(base_dir) {
@@ -893,7 +901,34 @@ mod tests {
             "#1858 (c): deploy non-branch (source_repo + default workspace dir) must not auto-worktree"
         );
 
-        for d in [home_b, repo, home_c] {
+        // (d) #1919 team-deploy: the per-instance default NESTED under a team subdir
+        // (`<home>/workspace/<team>/<instance>`). The old exact `== workspace/<name>`
+        // check missed this (workspace/member1 ≠ workspace/myteam/member1), so the
+        // git-init'd default fell through to auto-worktree and broke `claude
+        // --continue` session resume on restart. The `starts_with` gate catches the
+        // whole `workspace/` subtree. (This case FAILS on the pre-#1919 exact match.)
+        let home_d = tmp_repo("1919-d-home");
+        let nested = crate::paths::workspace_dir(&home_d)
+            .join("myteam")
+            .join("member1");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::process::Command::new("git")
+            .env("AGEND_GIT_BYPASS", "1")
+            .args(["init", "-b", "main"])
+            .current_dir(&nested)
+            .output()
+            .ok();
+        assert!(
+            is_git_repo(&nested),
+            "fixture: team-nested workspace dir git-init'd"
+        );
+        let resolved_d = mk_resolved(nested.clone(), Some(home_d.join("realrepo")), None, None);
+        assert!(
+            resolve_auto_worktree(&home_d, "member1", &resolved_d).is_none(),
+            "#1919 (d): team-nested default workspace (workspace/<team>/<instance>) must not auto-worktree"
+        );
+
+        for d in [home_b, repo, home_c, home_d] {
             std::fs::remove_dir_all(&d).ok();
         }
     }
