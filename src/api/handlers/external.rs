@@ -23,7 +23,21 @@ pub(crate) fn handle_register_external(params: &Value, ctx: &HandlerCtx) -> Valu
         return json!({"ok": false, "error": format!("agent '{name}' already exists (external)")});
     }
     let backend = params["backend"].as_str().unwrap_or("unknown");
-    let pid = params["pid"].as_u64().unwrap_or(0) as u32;
+    // #1891: `pid` is required for liveness tracking — a missing / null /
+    // non-integer / 0 pid must be REJECTED, not defaulted to 0. On Unix
+    // `is_pid_alive(0)` is `kill(0, 0)` which targets the caller's whole process
+    // group → always reports "alive", so a 0 pid would make the external_liveness
+    // sweep treat the entry as permanently live → an unreapable zombie
+    // registration that squats the name forever.
+    let pid = match params["pid"].as_u64() {
+        Some(p) if p > 0 && p <= u64::from(u32::MAX) => p as u32,
+        _ => {
+            return json!({
+                "ok": false,
+                "error": "missing or invalid 'pid' (required: a positive integer process id)"
+            })
+        }
+    };
     ext.insert(
         name.to_string(),
         agent::ExternalAgentHandle {
@@ -56,5 +70,84 @@ pub(crate) fn handle_deregister_external(params: &Value, ctx: &HandlerCtx) -> Va
         json!({"ok": true})
     } else {
         json!({"ok": false, "error": format!("external agent '{name}' not found")})
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::api::handlers::HandlerCtx;
+    use parking_lot::Mutex;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    fn test_ctx() -> (HandlerCtx<'static>, std::path::PathBuf) {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let home =
+            std::env::temp_dir().join(format!("agend-ext-test-{}-{}", std::process::id(), id));
+        std::fs::create_dir_all(&home).ok();
+        let registry: &'static agent::AgentRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let configs: &'static crate::api::ConfigRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let externals: &'static agent::ExternalRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let home_ref: &'static std::path::Path = Box::leak(home.clone().into_boxed_path());
+        let ctx = HandlerCtx {
+            registry,
+            configs,
+            externals,
+            notifier: None,
+            home: home_ref,
+        };
+        (ctx, home)
+    }
+
+    #[test]
+    fn register_external_missing_pid_rejected_1891() {
+        // #1891: a missing pid must be REJECTED, not defaulted to 0 (which would
+        // be an unreapable zombie). No entry may be inserted.
+        let (ctx, home) = test_ctx();
+        let resp = handle_register_external(&json!({"name": "ext-a", "backend": "claude"}), &ctx);
+        assert_eq!(resp["ok"], json!(false), "missing pid must be rejected");
+        assert!(resp["error"].as_str().unwrap().contains("pid"));
+        assert!(
+            agent::lock_external(ctx.externals).is_empty(),
+            "no zombie entry inserted on rejection"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn register_external_zero_pid_rejected_1891() {
+        let (ctx, home) = test_ctx();
+        let resp = handle_register_external(
+            &json!({"name": "ext-b", "backend": "claude", "pid": 0}),
+            &ctx,
+        );
+        assert_eq!(resp["ok"], json!(false), "pid 0 must be rejected");
+        assert!(agent::lock_external(ctx.externals).is_empty());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn register_external_valid_pid_registers_1891() {
+        let (ctx, home) = test_ctx();
+        let resp = handle_register_external(
+            &json!({"name": "ext-c", "backend": "claude", "pid": 4242}),
+            &ctx,
+        );
+        assert_eq!(resp["ok"], json!(true), "valid pid must register");
+        let ext = agent::lock_external(ctx.externals);
+        assert_eq!(
+            ext.get("ext-c").map(|h| h.pid),
+            Some(4242),
+            "entry tracked with the real pid"
+        );
+        drop(ext);
+        std::fs::remove_dir_all(&home).ok();
     }
 }

@@ -5,6 +5,14 @@ compile_error!("process module requires unix or windows");
 
 /// Check if a process with the given PID is alive.
 pub fn is_pid_alive(pid: u32) -> bool {
+    // #1891 defense-in-depth: pid 0 is never a real tracked process. On Unix
+    // `kill(0, 0)` targets the caller's whole process group (always succeeds →
+    // false-"alive"); treat 0 as dead so a stray 0 pid can't masquerade as a
+    // permanently-live agent. Mirrors the existing `pid == 0` guards below in
+    // this module (kill_process_tree / process_group ops).
+    if pid == 0 {
+        return false;
+    }
     #[cfg(unix)]
     {
         unsafe { libc::kill(pid as i32, 0) == 0 }
@@ -93,6 +101,20 @@ pub fn kill_process_tree(pid: u32) {
 #[cfg(unix)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_pid_alive_zero_is_false_1891() {
+        // #1891: pid 0 must never report alive — `kill(0, 0)` targets the
+        // caller's whole process group (always succeeds), so without the guard a
+        // stray 0 pid would masquerade as a permanently-live agent.
+        assert!(!is_pid_alive(0), "pid 0 must be treated as dead");
+        // Sanity: this test process IS alive at its real pid (guard didn't
+        // over-reach into rejecting valid pids).
+        assert!(
+            is_pid_alive(std::process::id()),
+            "self pid must report alive"
+        );
+    }
 
     #[test]
     #[cfg(unix)]
