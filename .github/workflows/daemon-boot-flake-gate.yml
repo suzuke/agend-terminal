@@ -1,0 +1,79 @@
+# Daemon-boot flake gate (#t-teardown-determinism).
+#
+# The daemon-booting test class (AgendHarness + `start --foreground`) shares the
+# boot path whose race (#1909) bit #1914 as an intermittent CI red. A reviewer
+# can't catch a low-probability boot flake by running a worktree once, so this
+# workflow repeats the daemon-boot subset 20x under the race-exposing `ci` nextest
+# profile and fails on ANY failure — catching a boot-race regression PRE-MERGE.
+#
+# Cost control: PATH-GATED — only runs when daemon-boot-relevant code/tests change
+# (the daemon boot path + the harness + the gated test files), so docs/unrelated
+# PRs pay nothing. The test SET is the single-source list in
+# tests/daemon_boot_gate_filter.txt (drift-guarded by
+# tests/daemon_boot_gate_invariant.rs). nextest 0.9.137 has no native repeat (only
+# `--retries`, which MASKS flakes), so the repeat is an explicit exit-code loop.
+name: Daemon-boot flake gate
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/agent/**'
+      - 'src/daemon/**'
+      - 'src/bootstrap/**'
+      - 'tests/common/harness.rs'
+      - 'tests/daemon_boot_gate_filter.txt'
+      - 'tests/teardown_completeness_regression.rs'
+      - 'tests/e2e_workflow.rs'
+      - 'tests/harness_smoke.rs'
+      - 'tests/migrated_scripts.rs'
+      - 'tests/vte_gotchas.rs'
+      - 'tests/restart_smoke.rs'
+      - 'tests/self_respawn_handoff.rs'
+      - 'tests/ready_marker_invariants.rs'
+      - '.github/workflows/daemon-boot-flake-gate.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  flake-gate:
+    name: Daemon-boot flake gate (20x)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+      - name: Install Linux tray deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - name: Repeat daemon-boot tests 20x (catch boot-race flakes pre-merge)
+        timeout-minutes: 35
+        env:
+          AGEND_LOCK_AUDIT: "1"
+        run: |
+          set -u
+          # Build the nextest filter from the single-source list (drift-guarded).
+          FILTER=$(grep -vE '^\s*#|^\s*$' tests/daemon_boot_gate_filter.txt \
+            | sed 's/.*/binary(&)/' | paste -sd '+' -)
+          echo "daemon-boot filter: $FILTER"
+          # Build once so the 20 runs only pay test wall-time, not compile.
+          cargo nextest run --features tray --profile ci -E "$FILTER" --no-run
+          for i in $(seq 1 20); do
+            echo "::group::daemon-boot run $i/20"
+            if ! cargo nextest run --features tray --profile ci -E "$FILTER"; then
+              echo "::error::daemon-boot flake gate FAILED on run $i/20 — a daemon-boot test is non-deterministic"
+              exit 1
+            fi
+            echo "::endgroup::"
+          done
+          echo "daemon-boot flake gate: 20/20 clean"

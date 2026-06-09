@@ -1,0 +1,22 @@
+# Canonical list of daemon-boot test binaries gated by the daemon-boot flake gate.
+# SINGLE SOURCE OF TRUTH — both consumers read THIS file:
+#   - .github/workflows/daemon-boot-flake-gate.yml builds the nextest `-E binary(..)`
+#     filter from it and repeats the set 20x (catching boot-race flakes pre-merge).
+#   - tests/daemon_boot_gate_invariant.rs enforces that every `AgendHarness`-using
+#     test binary is listed here (drift-guard, #1907/#1911 curated-list class).
+#
+# One test-binary name (the tests/<name>.rs stem) per line; '#' comments + blank
+# lines are ignored.
+#
+# AgendHarness users — AUTO-ENFORCED by the invariant (a new AgendHarness test not
+# listed here turns the invariant RED until added):
+teardown_completeness_regression
+e2e_workflow
+harness_smoke
+migrated_scripts
+vte_gotchas
+# Direct daemon-boot (start --foreground, not via AgendHarness) — manually listed;
+# add a new direct-boot daemon test here when you write one.
+restart_smoke
+self_respawn_handoff
+ready_marker_invariants
