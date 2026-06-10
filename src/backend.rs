@@ -146,6 +146,27 @@ impl Backend {
         }
     }
 
+    /// #1948 v2: the empty-input-box PLACEHOLDER for backends with no stable
+    /// prompt-line marker but a hint string that the TUI shows ONLY while the box
+    /// is empty (and replaces the moment the operator types). The draft-gate
+    /// treats "placeholder visible" as "box empty". `None` = no placeholder probe
+    /// (falls back to `input_prompt_marker`, then the timestamp behavior — fail
+    /// toward draft-protection).
+    ///
+    /// kiro renders ` ask a question or describe a task ↵` when empty (verified
+    /// against a live `pane_snapshot` of a just-cleared kiro pane, 2026-06-10).
+    /// opencode was assessed and INTENTIONALLY left `None`: its `┃`-bordered box
+    /// has no placeholder, and its `┃`-prefixed model/path footer is always
+    /// non-empty, so input-vs-footer geometry can't be distinguished robustly
+    /// (version-coupled) — fail-toward-protection fallback is safer. If a future
+    /// opencode build adds a stable empty-box placeholder, add it here.
+    pub fn input_empty_placeholder(&self) -> Option<&'static str> {
+        match self {
+            Backend::KiroCli => Some("ask a question or describe a task"),
+            _ => None,
+        }
+    }
+
     /// Actual command path to spawn. For [`Backend::Shell`] resolves to
     /// `$SHELL` (falling back to the platform default — `/bin/bash` on Unix,
     /// `cmd.exe` on Windows). For [`Backend::Raw`] returns the literal stored

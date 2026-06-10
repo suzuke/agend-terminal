@@ -173,6 +173,38 @@ pub fn input_box_is_empty(tail: &str, marker: &str) -> Option<bool> {
     Some(after_marker.trim().is_empty())
 }
 
+/// #1948 v2: unified per-backend empty-input-box probe. Tries the prompt-line
+/// `marker` first (claude/codex/agy — content after the marker == non-empty);
+/// if that can't decide (no prompt line found / no marker) AND a `placeholder`
+/// is supplied (kiro), treats the placeholder being VISIBLE in the tail as the
+/// box being empty (the TUI shows it only while empty). Returns:
+/// - `Some(true)` — box verifiably empty (deliver),
+/// - `Some(false)` — box has content (protect),
+/// - `None` — undeterminable → caller FAILS TOWARD PROTECTION (keep deferring).
+///
+/// A backend has at most one of (marker, placeholder); the order is just a safe
+/// precedence. Placeholder ABSENCE returns `None` (not `Some(false)`): it could
+/// mean "typed" OR "agent mid-output / placeholder string changed across
+/// versions" — either way fail toward protection (a placeholder-text change
+/// disables the kiro path without ever risking a clobber of a real draft).
+pub fn input_box_empty_probe(
+    tail: &str,
+    marker: Option<&str>,
+    placeholder: Option<&str>,
+) -> Option<bool> {
+    if let Some(m) = marker {
+        if let Some(empty) = input_box_is_empty(tail, m) {
+            return Some(empty);
+        }
+    }
+    if let Some(p) = placeholder {
+        if tail.contains(p) {
+            return Some(true);
+        }
+    }
+    None
+}
+
 /// #1457: pop and return the single OLDEST queued notification, leaving the
 /// rest queued. The escape valve uses this so an abandoned-draft pane trickles
 /// its backlog one-per-tick instead of clobbering the draft with a full batch.
@@ -489,6 +521,46 @@ mod tests {
         // typed input below a blockquote → non-empty (still the bottom-most)
         let screen3 = "> quoted output\n> my actual draft";
         assert_eq!(input_box_is_empty(screen3, ">"), Some(false));
+    }
+
+    // ── #1948 v2: input_box_empty_probe (marker → placeholder → fallback) ──
+
+    #[test]
+    fn probe_marker_path_decides_directly() {
+        // claude/codex/agy: marker present → decided by content after marker;
+        // placeholder is ignored (None) for these backends.
+        assert_eq!(
+            input_box_empty_probe("out\n❯ ", Some("❯"), None),
+            Some(true)
+        );
+        assert_eq!(
+            input_box_empty_probe("out\n❯ typed", Some("❯"), None),
+            Some(false)
+        );
+        // marker present but no prompt line in the tail (mid-output) → None
+        // (fail-protect), NOT silently falling through to a non-existent placeholder.
+        assert_eq!(input_box_empty_probe("just output", Some("❯"), None), None);
+    }
+
+    #[test]
+    fn probe_placeholder_path_for_kiro() {
+        // kiro: no marker, placeholder VISIBLE → empty (deliver). Uses the real
+        // captured placeholder text (live pane_snapshot of a cleared kiro pane).
+        let ph = "ask a question or describe a task";
+        let empty_screen = "  Kiro · auto · 13%\n\n ask a question or describe a task ↵\n  /copy";
+        assert_eq!(
+            input_box_empty_probe(empty_screen, None, Some(ph)),
+            Some(true)
+        );
+        // typed → placeholder replaced/absent → None (fail toward protection).
+        let typed_screen = "  Kiro · auto · 13%\n\n half-typed reply\n  /copy";
+        assert_eq!(input_box_empty_probe(typed_screen, None, Some(ph)), None);
+    }
+
+    #[test]
+    fn probe_none_when_neither_marker_nor_placeholder() {
+        // Shell/Raw / markerless backend → fall back to timestamp behavior.
+        assert_eq!(input_box_empty_probe("$ ", None, None), None);
     }
 
     /// #1457: submitted (or never-typed) buffer → None → notifications deliver.

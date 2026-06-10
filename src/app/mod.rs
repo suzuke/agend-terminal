@@ -1311,15 +1311,15 @@ where
     // (fail toward draft-protection — never risk clobbering a real draft).
     let raw_state = notification_queue::draft_state(home, &pane.agent_name);
     let buffer_empty = if raw_state == notification_queue::DraftState::Drafting {
-        pane.backend
-            .as_ref()
-            .and_then(|b| b.input_prompt_marker())
-            .and_then(|marker| {
-                notification_queue::input_box_is_empty(
-                    &pane.vterm.tail_lines(DRAFT_INPUT_TAIL_ROWS),
-                    marker,
-                )
-            })
+        pane.backend.as_ref().and_then(|b| {
+            // #1948 v2: marker probe (claude/codex/agy) → placeholder probe (kiro)
+            // → None fallback. pane.vterm is owned (no lock).
+            notification_queue::input_box_empty_probe(
+                &pane.vterm.tail_lines(DRAFT_INPUT_TAIL_ROWS),
+                b.input_prompt_marker(),
+                b.input_empty_placeholder(),
+            )
+        })
     } else {
         None
     };
@@ -1764,12 +1764,13 @@ mod tests {
 
     // ── #1944: buffer-aware draft gate (the operator-facing fix) ──
 
-    /// Build a pane whose live `vterm` renders `screen` (small term so the
-    /// content is within the bottom `DRAFT_INPUT_TAIL_ROWS`) with `backend`.
+    /// Build a pane whose live `vterm` renders `screen` with `backend`. The term
+    /// is `VTerm::new(cols, rows)` — wide enough that input lines don't wrap, and
+    /// few enough rows that the content stays within `DRAFT_INPUT_TAIL_ROWS`.
     fn pane_with_screen(name: &str, backend: Option<Backend>, screen: &str) -> Pane {
         let mut p = pane(name);
         p.backend = backend;
-        p.vterm = crate::vterm::VTerm::new(3, 40);
+        p.vterm = crate::vterm::VTerm::new(80, 6);
         p.vterm.process(screen.as_bytes());
         p
     }
@@ -1862,6 +1863,54 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// #1948 v2 §3.9: kiro has no prompt marker but its empty box shows a
+    /// placeholder — a cleared kiro pane (placeholder visible) must DELIVER.
+    #[test]
+    fn draft_gate_delivers_for_kiro_when_placeholder_visible() {
+        let home = tmp_home("draftgate-kiro-empty");
+        seed_drafting_with_queued(&home, "lead");
+        // cleared kiro box: the real placeholder is visible (no typed content).
+        let mut p = pane_with_screen(
+            "lead",
+            Some(Backend::KiroCli),
+            "Kiro auto\n\n ask a question or describe a task ↵\n /copy",
+        );
+        p.pending_notification_count = notification_queue::pending_count(&home, "lead");
+
+        let mut injected: Vec<String> = Vec::new();
+        flush_notifications_for_pane(&home, &mut p, |t| {
+            injected.push(t.to_string());
+            Ok(())
+        });
+        assert_eq!(
+            injected.len(),
+            1,
+            "kiro cleared (placeholder visible) → stale draft delivered, not held"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1948 v2 §3.9: a kiro pane with a real draft (placeholder replaced by typed
+    /// text) must still DEFER — protection unchanged.
+    #[test]
+    fn draft_gate_defers_for_kiro_when_typed() {
+        let home = tmp_home("draftgate-kiro-typed");
+        seed_drafting_with_queued(&home, "lead");
+        let mut p = pane_with_screen("lead", Some(Backend::KiroCli), "Kiro auto\n\n half typed\n");
+        p.pending_notification_count = notification_queue::pending_count(&home, "lead");
+
+        let mut injected: Vec<String> = Vec::new();
+        flush_notifications_for_pane(&home, &mut p, |t| {
+            injected.push(t.to_string());
+            Ok(())
+        });
+        assert!(
+            injected.is_empty(),
+            "kiro with text (placeholder gone) → keep deferring (protection unchanged)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     #[test]
     fn input_prompt_marker_only_for_verified_backends() {
         assert_eq!(Backend::ClaudeCode.input_prompt_marker(), Some("❯"));
@@ -1869,6 +1918,15 @@ mod tests {
         assert_eq!(Backend::Agy.input_prompt_marker(), Some(">"));
         assert_eq!(Backend::Shell.input_prompt_marker(), None);
         assert_eq!(Backend::OpenCode.input_prompt_marker(), None);
+        // #1948 v2: kiro covered via placeholder, NOT a marker; opencode stays
+        // fully fallback (no marker, no placeholder).
+        assert_eq!(Backend::KiroCli.input_prompt_marker(), None);
+        assert_eq!(
+            Backend::KiroCli.input_empty_placeholder(),
+            Some("ask a question or describe a task")
+        );
+        assert_eq!(Backend::OpenCode.input_empty_placeholder(), None);
+        assert_eq!(Backend::ClaudeCode.input_empty_placeholder(), None);
     }
 
     /// app-mode subscriber-wiring source pin. Owned `agend-terminal app` mode
