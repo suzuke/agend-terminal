@@ -7,11 +7,16 @@
 //! sat for an hour because the reviewer never picked it up and nothing
 //! escalated.
 //!
-//! RCA note: the handoff is *already recorded* — it's the inbox message itself,
-//! carrying its send time (`timestamp`) and the `repo@branch` correlation. So
-//! this watchdog needs no new tracking store: it simply looks for a
-//! `ci-ready-for-action` message that is still UNREAD after the timeout, and
-//! escalates to the reviewer's team lead so they can re-route or nudge.
+//! #1888 phase-2 (decouple from read-state): this watchdog ORIGINALLY scanned
+//! the inbox message itself (`unread_of_kind`) — but ANY inbox drain marks the
+//! handoff read (the drain is kind-blind), so the watchdog went blind the
+//! moment the reviewer ran a routine pending check. Production confirmed the
+//! coupling (14 `#1888-ciready-read` @ 2-7s : 0 `#1888-renudge-decision` in a
+//! full day — the 2-min window never once opened). The scan source is now the
+//! `ci_handoff_track` sidecar: recorded when the poller enqueues the handoff,
+//! resolved on an explicit RESOLUTION signal (the reviewer's report for that
+//! correlation / a PR terminal state / the target claiming the branch / the
+//! 24h backstop) — never on read.
 //!
 //! Detection ONLY — like the inbox-stuck watchdog (#1491A) it never reassigns
 //! automatically; the lead decides.
@@ -72,13 +77,14 @@ pub(crate) fn scan_and_emit_with<F>(
 ) where
     F: FnMut(&str, usize),
 {
-    let Ok(fleet) = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)) else {
-        return;
-    };
+    // #1888 phase-2: backstop sweep BEFORE the scan — an expired track must
+    // neither re-nudge nor escalate this tick.
+    let _ = crate::daemon::ci_handoff_track::sweep_expired(home, now);
+    let tracks = crate::daemon::ci_handoff_track::list(home);
     // #1598-mirror: collect every (target, correlation) key still backed by a
-    // pending unread handoff this tick, so the trailing `retain` can reap
+    // pending TRACK this tick, so the trailing `retain` can reap
     // `last_escalated` / `last_renudged` entries whose repo@branch handoff is no
-    // longer active (read/resolved). Without it the maps grow one entry per
+    // longer active (resolved/expired). Without it the maps grow one entry per
     // (reviewer, branch) forever — a slow leak, since `.get`/`.insert` were the
     // only ops and the dedup windows suppress but never evict.
     let mut active: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
@@ -93,12 +99,24 @@ pub(crate) fn scan_and_emit_with<F>(
     // still governs the cross-tick interval.
     let mut renudged_this_scan: std::collections::HashSet<String> =
         std::collections::HashSet::new();
-    for target in fleet.instances.keys() {
-        for (correlation, sent_at) in crate::inbox::unread_of_kind(home, target, HANDOFF_KIND) {
+    {
+        for track in &tracks {
+            let target = &track.target;
+            // Orphan guard: the target left the fleet — nothing to nudge; the
+            // 24h sweep reaps the file.
+            if !crate::fleet::instance_is_known(home, target) {
+                continue;
+            }
+            // sweep_expired (above) already deleted unparseable sent_at tracks;
+            // a race re-creating one just waits a tick.
+            let Ok(sent_at) = chrono::DateTime::parse_from_rfc3339(&track.sent_at) else {
+                continue;
+            };
+            let sent_at = sent_at.with_timezone(&chrono::Utc);
             // #1870-H3: clamp so a backward clock skew (future `sent_at`) can't
             // make the age negative → re-nudge / escalation silently stop firing.
             let age_min = crate::daemon::utils::elapsed_since(*now, sent_at).num_minutes();
-            let corr = correlation.unwrap_or_else(|| "<unknown>".to_string());
+            let corr = track.correlation.clone();
             let key = (target.clone(), corr.clone());
             active.insert(key.clone());
 
@@ -113,12 +131,13 @@ pub(crate) fn scan_and_emit_with<F>(
             // target reads the handoff (drops from the unread scan → reaped). This
             // also covers the orchestrator-as-`next_after_ci` case below, where
             // there is no lead to escalate to.
-            // #1888 instrument-only (zero-behavior): record WHY this UNREAD handoff
-            // did / didn't get re-nudged this tick, so production can confirm the
-            // #1860 read-state-coupling RCA. A handoff that was already marked read
-            // never enters this loop at all (`unread_of_kind` filters it) — that
-            // case is captured by the `#1888-ciready-read` trace at the drain site.
-            // Read-only: these locals don't feed the byte-identical gate below.
+            // #1888: record WHY this PENDING handoff did / didn't get re-nudged
+            // this tick (tag kept from the phase-1 instrument for log
+            // continuity). Phase-2: the loop now iterates TRACKS, so a handoff
+            // that was merely marked read still shows up here — `track_pending`
+            // replaces the old `unread_found` (which production proved was
+            // always extinguished within seconds).
+            // Read-only: these locals don't feed the gate below.
             {
                 let busy = crate::snapshot::agent_is_busy(home, target);
                 let renudge_due = last_renudged.get(&key).is_none_or(|prev| {
@@ -132,7 +151,7 @@ pub(crate) fn scan_and_emit_with<F>(
                     tag = "#1888-renudge-decision",
                     agent = %target,
                     correlation = %corr,
-                    unread_found = true,
+                    track_pending = true,
                     age_min,
                     agent_is_busy = busy,
                     renudge_due,
@@ -152,8 +171,12 @@ pub(crate) fn scan_and_emit_with<F>(
                     last_renudged.insert(key.clone(), *now);
                     // ...but inject at most ONCE per target per scan.
                     if renudged_this_scan.insert(target.clone()) {
-                        let (unread, _) = crate::inbox::unread_count(home, target);
-                        renudge(target, unread);
+                        // #1888 phase-2: the pointer count is the target's PENDING
+                        // TRACKS — the handoff message itself may already be read
+                        // (that no longer stops the re-nudge), so the unread count
+                        // would say 0 and mislead.
+                        let pending = tracks.iter().filter(|t| &t.target == target).count();
+                        renudge(target, pending);
                     }
                 }
             }
@@ -191,7 +214,8 @@ pub(crate) fn scan_and_emit_with<F>(
             let text = format!(
                 "[handoff_timeout_watchdog] the next_after_ci handoff to '{target}' for {corr} \
                  has been unclaimed for {age_min}min — CI passed and a [ci-ready-for-action] \
-                 message was sent, but '{target}' still hasn't read it. The reviewer may be \
+                 message was sent, but '{target}' still hasn't picked it up (no review report / \
+                 branch claim / PR terminal for that correlation). The reviewer may be \
                  stuck/offline; consider re-routing the review to another reviewer or nudging it."
             );
             if let Err(e) = crate::inbox::notify_system(
@@ -266,6 +290,15 @@ mod tests {
             msg.read_at = Some(chrono::Utc::now().to_rfc3339());
         }
         crate::inbox::enqueue(home, target, msg).unwrap();
+        // #1888 phase-2 production parity: the poller records a TRACK alongside
+        // the enqueue — the watchdog scans tracks, not inbox read-state, so
+        // `read` no longer extinguishes the handoff (that's the fix).
+        crate::daemon::ci_handoff_track::record(
+            home,
+            target,
+            corr,
+            &(chrono::Utc::now() - chrono::Duration::minutes(age_min)).to_rfc3339(),
+        );
     }
 
     /// Seed the per-tick snapshot so `agent_is_busy(home, agent)` is
@@ -413,7 +446,8 @@ mod tests {
             crate::inbox::drain(&home, "lead").is_empty(),
             "a fresh handoff must not escalate"
         );
-        // Old but already READ → reviewer acted → no escalation.
+        // #1888 phase-2: old and already READ but NOT resolved → still
+        // escalates (read used to blind the watchdog — that was the bug).
         let home2 = tmp_home("read");
         write_fleet(&home2);
         seed_handoff(&home2, "reviewer", "o/r@feat", 30, true);
@@ -423,12 +457,29 @@ mod tests {
             &mut HashMap::new(),
             &mut HashMap::new(),
         );
+        assert_eq!(
+            crate::inbox::drain(&home2, "lead").len(),
+            1,
+            "#1888: a read-but-unresolved handoff must STILL escalate"
+        );
+        // RESOLVED (reviewer reported the correlation) → no escalation.
+        let home3 = tmp_home("resolved");
+        write_fleet(&home3);
+        seed_handoff(&home3, "reviewer", "o/r@feat", 30, true);
+        crate::daemon::ci_handoff_track::resolve_by_correlation(&home3, "o/r@feat", "test");
+        run_watchdog(
+            &home3,
+            &chrono::Utc::now(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+        );
         assert!(
-            crate::inbox::drain(&home2, "lead").is_empty(),
-            "a read handoff means the reviewer acted — no escalation"
+            crate::inbox::drain(&home3, "lead").is_empty(),
+            "#1888: a RESOLVED handoff must not escalate"
         );
         std::fs::remove_dir_all(home).ok();
         std::fs::remove_dir_all(home2).ok();
+        std::fs::remove_dir_all(home3).ok();
     }
 
     #[test]
@@ -459,6 +510,41 @@ mod tests {
         std::fs::remove_dir_all(home).ok();
     }
 
+    /// #1888 phase-2: the 24h backstop — a track whose resolution signal never
+    /// arrives is swept at scan start (WARN) and neither re-nudges nor
+    /// escalates. Guarantees "never re-nudge forever".
+    #[test]
+    fn backstop_expired_track_swept_no_nudge_no_escalation_1888() {
+        let home = tmp_home("backstop");
+        write_fleet(&home);
+        seed_snapshot(&home, "reviewer", "idle");
+        crate::daemon::ci_handoff_track::record(
+            &home,
+            "reviewer",
+            "o/r@abandoned",
+            &(chrono::Utc::now() - chrono::Duration::hours(25)).to_rfc3339(),
+        );
+        let nudged = run_watchdog(
+            &home,
+            &chrono::Utc::now(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+        );
+        assert!(
+            !nudged.contains(&"reviewer".to_string()),
+            "#1888: an expired track must not re-nudge"
+        );
+        assert!(
+            crate::inbox::drain(&home, "lead").is_empty(),
+            "#1888: an expired track must not escalate"
+        );
+        assert!(
+            crate::daemon::ci_handoff_track::list(&home).is_empty(),
+            "#1888: the expired track is swept"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
     #[test]
     fn stale_entry_reaped_when_handoff_no_longer_pending() {
         let home = tmp_home("reap");
@@ -472,10 +558,12 @@ mod tests {
             last.contains_key(&("reviewer".to_string(), "o/r@gone".to_string())),
             "first scan must record a dedup entry for the escalated handoff"
         );
-        // Reviewer reads/resolves it → the handoff leaves the unread scan. The
-        // next scan must reap the now-stale (reviewer, o/r@gone) entry rather
-        // than accumulating one per dead branch forever (the leak).
-        crate::inbox::drain(&home, "reviewer");
+        // Reviewer RESOLVES it (verdict report / claim / PR terminal) → the
+        // track is gone. The next scan must reap the now-stale
+        // (reviewer, o/r@gone) entry rather than accumulating one per dead
+        // branch forever (the leak). (#1888 phase-2: a mere READ no longer
+        // ends the handoff — resolution does.)
+        crate::daemon::ci_handoff_track::resolve_by_correlation(&home, "o/r@gone", "test");
         run_watchdog(
             &home,
             &(now + chrono::Duration::minutes(1)),
@@ -559,7 +647,7 @@ mod tests {
     /// re-nudge again (idempotent via `last_renudged`); once the target reads the
     /// handoff it stops AND the dedup entry is reaped (no leak).
     #[test]
-    fn renudge_is_interval_gated_and_stops_when_read() {
+    fn renudge_interval_gated_read_does_not_stop_resolution_does_1888() {
         let home = tmp_home("renudge-interval");
         write_fleet(&home);
         seed_handoff(&home, "reviewer", "o/r@feat", 15, false);
@@ -585,7 +673,10 @@ mod tests {
             "a re-nudge within RENUDGE_INTERVAL_MINS must be suppressed (anti-storm): {soon:?}"
         );
 
-        // Reviewer reads it → no more re-nudge, and the dedup entry is reaped.
+        // #1888 phase-2 CORE regression (read-then-not-act, the stranded-PR
+        // case): the reviewer DRAINS its inbox (marks the handoff read) but
+        // does NOT act — the re-nudge must keep firing. Pre-fix this went
+        // permanently silent (production: 14 reads @ 2-7s, 0 decisions).
         crate::inbox::drain(&home, "reviewer");
         let after_read = run_watchdog(
             &home,
@@ -594,12 +685,26 @@ mod tests {
             &mut renudged,
         );
         assert!(
-            !after_read.contains(&"reviewer".to_string()),
-            "a read handoff must not be re-nudged"
+            after_read.contains(&"reviewer".to_string()),
+            "#1888: a read-but-unresolved handoff must STILL be re-nudged"
+        );
+
+        // RESOLUTION (verdict report / branch claim / PR terminal) stops the
+        // re-nudge and the dedup entry is reaped — never re-nudge forever.
+        crate::daemon::ci_handoff_track::resolve_by_correlation(&home, "o/r@feat", "test");
+        let after_resolve = run_watchdog(
+            &home,
+            &(now + chrono::Duration::minutes(20)),
+            &mut HashMap::new(),
+            &mut renudged,
+        );
+        assert!(
+            !after_resolve.contains(&"reviewer".to_string()),
+            "#1888: a resolved handoff must not be re-nudged"
         );
         assert!(
             renudged.is_empty(),
-            "last_renudged must be reaped once the handoff is read: {:?}",
+            "last_renudged must be reaped once the handoff is resolved: {:?}",
             renudged.keys().collect::<Vec<_>>()
         );
         std::fs::remove_dir_all(home).ok();

@@ -88,6 +88,10 @@ pub fn bind_full(
     worktree: &std::path::Path,
     source_repo: &std::path::Path,
 ) -> Result<(), String> {
+    // #1888 phase-2: the agent claiming a branch is acting on any pending
+    // ci-handoff for it — resolve the track (re-nudge stops). Scoped to this
+    // agent's own tracks; other targets' handoffs for the branch are untouched.
+    let _ = crate::daemon::ci_handoff_track::resolve_claimed(home, agent, branch);
     let dir = crate::paths::runtime_dir(home).join(agent);
     std::fs::create_dir_all(&dir).map_err(|e| format!("create_dir_all {}: {e}", dir.display()))?;
     let path = dir.join("binding.json");

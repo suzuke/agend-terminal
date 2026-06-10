@@ -323,6 +323,19 @@ pub fn scan_and_emit_with(
                 record_terminal_emitted(home, k);
             }
         }
+        // #1888 phase-2: a PR reaching a terminal state (merged / closed)
+        // resolves any pending ci-handoff track for it — the review obligation
+        // is gone, the re-nudge stops. Post-flock (file delete, no locks) and
+        // keyed on the snapshot's terminal state (NOT `emitted_terminal`) so a
+        // replay-suppressed terminal still cleans a lingering track. Idempotent
+        // — usually the reviewer's verdict report already resolved it.
+        if terminal_ledger_key.is_some() {
+            let _ = crate::daemon::ci_handoff_track::resolve_by_correlation(
+                home,
+                &format!("{repo}@{branch}"),
+                "pr_terminal",
+            );
+        }
         let _ = registry; // reserved for future gh-poll author lookup hook
     }
 }
