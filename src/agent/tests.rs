@@ -926,6 +926,50 @@ fn build_command_sets_git_editor_defaults() {
     }
 }
 
+/// #1956: opencode's interactive self-update prompt hangs the whole pane (the
+/// agent can't answer dispatches). There's no `--no-update` flag, so the spawn
+/// injects `OPENCODE_CONFIG_CONTENT` with `autoupdate:false` — MERGED onto the
+/// user's global config (never replacing it; verified via `opencode debug
+/// config`). Gated to OpenCode: other backends must NOT receive the env.
+#[test]
+fn build_command_disables_opencode_autoupdate_only_for_opencode() {
+    let cfg = |backend_command: &'static str| SpawnConfig {
+        name: "autoupdate-test",
+        backend_command,
+        args: &[],
+        spawn_mode: crate::backend::SpawnMode::Fresh,
+        cols: 80,
+        rows: 24,
+        env: None,
+        working_dir: None,
+        submit_key: "\r",
+        home: None,
+        crash_tx: None,
+        shutdown: None,
+    };
+    // OpenCode → OPENCODE_CONFIG_CONTENT is present and valid JSON disabling autoupdate.
+    let (oc, _) = build_command(&cfg("opencode")).expect("build_command opencode");
+    let content = oc
+        .get_env("OPENCODE_CONFIG_CONTENT")
+        .and_then(|v| v.to_str().map(String::from))
+        .expect("opencode spawn env must set OPENCODE_CONFIG_CONTENT");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&content).expect("OPENCODE_CONFIG_CONTENT must be valid JSON");
+    assert_eq!(
+        parsed["autoupdate"],
+        serde_json::json!(false),
+        "must disable opencode autoupdate, got {content}"
+    );
+    // Non-OpenCode backends must NOT receive the env (no cross-backend leakage).
+    for cmd in ["claude", "codex", "echo"] {
+        let (c, _) = build_command(&cfg(cmd)).expect("build_command");
+        assert!(
+            c.get_env("OPENCODE_CONFIG_CONTENT").is_none(),
+            "{cmd} must not receive OPENCODE_CONFIG_CONTENT"
+        );
+    }
+}
+
 /// §3.9 (MED-5): the daemon must re-inject AGEND_HOME into every spawned
 /// agent's env. AGEND_HOME is on the env-isolation SENSITIVE deny-list, so under
 /// `AGEND_ENV_ISOLATION=1` the `env_clear` drops it and the passthrough loop
