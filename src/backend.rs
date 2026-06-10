@@ -128,6 +128,24 @@ impl Backend {
         }
     }
 
+    /// #1944: the rendered input-box prompt marker, used by the draft-gate to
+    /// decide whether the operator's input line is actually EMPTY (vs the
+    /// timestamp-only `draft_state` heuristic, which can read a stale
+    /// type-then-clear as a live draft). `None` = no detectable prompt widget →
+    /// the caller falls back to the timestamp behavior (fail toward
+    /// draft-protection). Only set for backends whose marker is verified against a
+    /// real capture (`tests/fixtures/state-replay`): claude `❯`, codex `›`, agy
+    /// `>`. kiro/opencode/gemini markers are unverified (left `None`); shell/raw
+    /// have no prompt widget.
+    pub fn input_prompt_marker(&self) -> Option<&'static str> {
+        match self {
+            Backend::ClaudeCode => Some("❯"),
+            Backend::Codex => Some("›"),
+            Backend::Agy => Some(">"),
+            _ => None,
+        }
+    }
+
     /// Actual command path to spawn. For [`Backend::Shell`] resolves to
     /// `$SHELL` (falling back to the platform default — `/bin/bash` on Unix,
     /// `cmd.exe` on Windows). For [`Backend::Raw`] returns the literal stored

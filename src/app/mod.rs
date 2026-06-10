@@ -1242,8 +1242,23 @@ fn sync_notification_state(home: &Path, layout: &mut Layout) {
         let pane_ids = tab.root().pane_ids();
         for pane_id in pane_ids {
             if let Some(pane) = tab.root_mut().find_pane_mut(pane_id) {
-                pane.pending_notification_count =
-                    notification_queue::pending_count(home, &pane.agent_name);
+                let prev = pane.pending_notification_count;
+                let now = notification_queue::pending_count(home, &pane.agent_name);
+                // #1944 instrument: the pane-title `[N]` badge renders off this
+                // count (core_render.rs). Log every CHANGE so the "badge
+                // disappeared" report can be located at runtime — the code is
+                // intact, so this catches whether the count actually reaches the
+                // render with N>0 (or is reset to 0 before the next frame).
+                if now != prev {
+                    tracing::info!(
+                        tag = "#1944-badge-state",
+                        agent = %pane.agent_name,
+                        prev,
+                        now,
+                        "pending-notification badge count changed"
+                    );
+                }
+                pane.pending_notification_count = now;
             }
         }
     }
@@ -1270,6 +1285,10 @@ fn flush_idle_notifications(home: &Path, layout: &mut Layout) {
     }
 }
 
+/// #1944: bottom rows of the rendered screen scanned for the input box (prompt +
+/// a few wrapped input rows). Mirrors the #1912 readback `READBACK_TAIL_ROWS`.
+const DRAFT_INPUT_TAIL_ROWS: usize = 8;
+
 fn flush_notifications_for_pane<F>(home: &Path, pane: &mut Pane, mut injector: F)
 where
     F: FnMut(&str) -> anyhow::Result<()>,
@@ -1277,11 +1296,57 @@ where
     if pane.pending_notification_count == 0 {
         return;
     }
-    // #1457: gate on draft state (input-vs-submit order), not the 3s idle
-    // window. Drafting → defer everything; Abandoned → escape valve releases
-    // just the oldest (trickle, no clobbering batch); None (clean buffer) →
-    // drain the whole backlog.
-    match notification_queue::draft_state(home, &pane.agent_name) {
+    // #1457: gate on draft state (input-vs-submit order), not the 3s idle window.
+    // Drafting → defer everything; Abandoned → escape valve releases just the
+    // oldest (trickle); None (clean buffer) → drain the whole backlog.
+    //
+    // #1944: refine `Drafting` with the input box's ACTUAL content. A
+    // type-then-clear (typed then deleted to empty, or typed-but-not-submitted)
+    // leaves `typed_ms > submit_ms` for up to 5 min while the box is visibly
+    // EMPTY — the timestamp-only heuristic mis-read that as a live draft and held
+    // messages until the next real submit. `pane.vterm` is the owned, live
+    // rendered screen (no lock), so reading the input line here is cheap. When the
+    // box is verifiably empty → deliver; a real draft (text in the box) OR an
+    // undeterminable read (no marker / agent mid-output) both keep deferring
+    // (fail toward draft-protection — never risk clobbering a real draft).
+    let raw_state = notification_queue::draft_state(home, &pane.agent_name);
+    let buffer_empty = if raw_state == notification_queue::DraftState::Drafting {
+        pane.backend
+            .as_ref()
+            .and_then(|b| b.input_prompt_marker())
+            .and_then(|marker| {
+                notification_queue::input_box_is_empty(
+                    &pane.vterm.tail_lines(DRAFT_INPUT_TAIL_ROWS),
+                    marker,
+                )
+            })
+    } else {
+        None
+    };
+    let effective_state = if buffer_empty == Some(true) {
+        notification_queue::DraftState::None
+    } else {
+        raw_state
+    };
+    // #1944 instrument: the RCA had ZERO logs on this path. Surface every DEFER
+    // (or buffer-override) decision so the next stranded-message report is
+    // diagnosable. Clean immediate deliveries (None, no draft) are not logged.
+    if effective_state != notification_queue::DraftState::None || buffer_empty.is_some() {
+        let (typed_ms, submit_ms) =
+            notification_queue::read_input_submit_timestamps(home, &pane.agent_name);
+        tracing::info!(
+            tag = "#1944-draftgate-decision",
+            agent = %pane.agent_name,
+            raw_state = ?raw_state,
+            effective_state = ?effective_state,
+            buffer_empty = ?buffer_empty,
+            typed_ms,
+            submit_ms,
+            pending = pane.pending_notification_count,
+            "draft-gate delivery decision"
+        );
+    }
+    match effective_state {
         notification_queue::DraftState::Drafting => {}
         notification_queue::DraftState::Abandoned => {
             if let Some(notification) = notification_queue::drain_one(home, &pane.agent_name) {
@@ -1695,6 +1760,115 @@ mod tests {
              (#982 reviewer #999 verdict) — searched for \
              'inject_notification_with_submit' in src/app/mod.rs"
         );
+    }
+
+    // ── #1944: buffer-aware draft gate (the operator-facing fix) ──
+
+    /// Build a pane whose live `vterm` renders `screen` (small term so the
+    /// content is within the bottom `DRAFT_INPUT_TAIL_ROWS`) with `backend`.
+    fn pane_with_screen(name: &str, backend: Option<Backend>, screen: &str) -> Pane {
+        let mut p = pane(name);
+        p.backend = backend;
+        p.vterm = crate::vterm::VTerm::new(3, 40);
+        p.vterm.process(screen.as_bytes());
+        p
+    }
+
+    /// Set up a recent unsent draft (typed_ms > submit_ms → `Drafting`) and one
+    /// queued notification for `agent` under `home`.
+    fn seed_drafting_with_queued(home: &Path, agent: &str) {
+        let now = chrono::Utc::now().timestamp_millis();
+        crate::agent_ops::save_metadata(
+            home,
+            agent,
+            "last_input_epoch_ms",
+            serde_json::json!(now - 30_000),
+        );
+        crate::agent_ops::save_metadata(
+            home,
+            agent,
+            "last_submit_epoch_ms",
+            serde_json::json!(now - 60_000),
+        );
+        notification_queue::enqueue(home, agent, "[AGEND-MSG-PENDING] peer report")
+            .expect("enqueue test notification");
+    }
+
+    /// #1944 §3.9: a stale type-then-clear draft (typed_ms > submit_ms but the
+    /// input box is EMPTY) must DELIVER — the old timestamp-only gate held it.
+    #[test]
+    fn draft_gate_delivers_when_input_box_empty() {
+        let home = tmp_home("draftgate-empty");
+        seed_drafting_with_queued(&home, "lead");
+        // claude pane, input box empty (`❯ ` with nothing typed).
+        let mut p = pane_with_screen("lead", Some(Backend::ClaudeCode), "❯ ");
+        p.pending_notification_count = notification_queue::pending_count(&home, "lead");
+
+        let mut injected: Vec<String> = Vec::new();
+        flush_notifications_for_pane(&home, &mut p, |t| {
+            injected.push(t.to_string());
+            Ok(())
+        });
+        assert_eq!(
+            injected.len(),
+            1,
+            "empty input box → the stale-draft message must be delivered, not held"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1944 §3.9: a REAL live draft (text in the input box) must still DEFER —
+    /// the draft-protection invariant is unchanged.
+    #[test]
+    fn draft_gate_defers_when_input_box_has_text() {
+        let home = tmp_home("draftgate-typed");
+        seed_drafting_with_queued(&home, "lead");
+        let mut p = pane_with_screen("lead", Some(Backend::ClaudeCode), "❯ half-typed reply");
+        p.pending_notification_count = notification_queue::pending_count(&home, "lead");
+
+        let mut injected: Vec<String> = Vec::new();
+        flush_notifications_for_pane(&home, &mut p, |t| {
+            injected.push(t.to_string());
+            Ok(())
+        });
+        assert!(
+            injected.is_empty(),
+            "a real draft (text in the box) must keep deferring (protection unchanged)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1944 §3.9: a backend with no prompt marker (Shell) → buffer-emptiness is
+    /// undeterminable → fall back to the timestamp behavior (defer), fail toward
+    /// draft-protection. Same outcome for a claude pane mid-output (no prompt in
+    /// the tail) — covered by `input_box_none_when_marker_absent`.
+    #[test]
+    fn draft_gate_falls_back_to_timestamp_for_markerless_backend() {
+        let home = tmp_home("draftgate-shell");
+        seed_drafting_with_queued(&home, "lead");
+        // Shell has no input_prompt_marker → None → keep the raw Drafting defer.
+        let mut p = pane_with_screen("lead", Some(Backend::Shell), "$ ");
+        p.pending_notification_count = notification_queue::pending_count(&home, "lead");
+
+        let mut injected: Vec<String> = Vec::new();
+        flush_notifications_for_pane(&home, &mut p, |t| {
+            injected.push(t.to_string());
+            Ok(())
+        });
+        assert!(
+            injected.is_empty(),
+            "markerless backend → fail toward protection (timestamp-only defer)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn input_prompt_marker_only_for_verified_backends() {
+        assert_eq!(Backend::ClaudeCode.input_prompt_marker(), Some("❯"));
+        assert_eq!(Backend::Codex.input_prompt_marker(), Some("›"));
+        assert_eq!(Backend::Agy.input_prompt_marker(), Some(">"));
+        assert_eq!(Backend::Shell.input_prompt_marker(), None);
+        assert_eq!(Backend::OpenCode.input_prompt_marker(), None);
     }
 
     /// app-mode subscriber-wiring source pin. Owned `agend-terminal app` mode

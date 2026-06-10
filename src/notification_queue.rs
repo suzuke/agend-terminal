@@ -143,6 +143,36 @@ pub fn draft_state(home: &Path, agent_name: &str) -> DraftState {
     }
 }
 
+/// #1944: is the backend's input box (located by its prompt `marker` in the
+/// rendered screen `tail`) actually EMPTY? This refines `draft_state`'s
+/// timestamp-only heuristic, which reads a type-then-clear (typed then deleted
+/// to empty, or typed-but-not-submitted) as a live `Drafting` for up to 5 min
+/// even though the input line is visibly empty.
+///
+/// Returns:
+/// - `Some(true)` — the input prompt is present and nothing non-whitespace
+///   follows the marker → the box is empty (a stale draft; deliver normally).
+/// - `Some(false)` — content follows the marker → a real live draft (protect).
+/// - `None` — no prompt line found (agent mid-output, or a backend with no
+///   marker) → the caller cannot tell, so it FAILS TOWARD PROTECTION (keep
+///   deferring), never risking a clobber of a real draft.
+///
+/// Robustness: the input prompt is the BOTTOM-MOST line whose first non-blank
+/// char is the marker (the input box sits at the screen bottom, below any
+/// conversation/prose), so a `>`/`❯` appearing mid-prose above it is not matched
+/// (the #1944 prose-false-positive guard).
+pub fn input_box_is_empty(tail: &str, marker: &str) -> Option<bool> {
+    let prompt_line = tail
+        .lines()
+        .rev()
+        .find(|l| l.trim_start().starts_with(marker))?;
+    let after_marker = prompt_line
+        .trim_start()
+        .strip_prefix(marker)
+        .unwrap_or_default();
+    Some(after_marker.trim().is_empty())
+}
+
 /// #1457: pop and return the single OLDEST queued notification, leaving the
 /// rest queued. The escape valve uses this so an abandoned-draft pane trickles
 /// its backlog one-per-tick instead of clobbering the draft with a full batch.
@@ -414,6 +444,51 @@ mod tests {
         if submit_ms != 0 {
             agent_ops::save_metadata(home, agent, SUBMIT_METADATA_KEY, json!(submit_ms));
         }
+    }
+
+    // ── #1944: input_box_is_empty (buffer-content draft refinement) ──
+
+    #[test]
+    fn input_box_empty_when_only_prompt_marker() {
+        // claude `❯ ` with nothing typed (real capture: claude-discussion-text.raw
+        // ends in exactly this) → empty.
+        assert_eq!(input_box_is_empty("some output\n❯ ", "❯"), Some(true));
+        assert_eq!(input_box_is_empty("output\n> ", ">"), Some(true));
+        // trailing whitespace / wrapped blank only
+        assert_eq!(input_box_is_empty("❯   \n", "❯"), Some(true));
+    }
+
+    #[test]
+    fn input_box_nonempty_when_text_after_marker() {
+        // a real live draft → protect (defer).
+        assert_eq!(
+            input_box_is_empty("output\n❯ hello world", "❯"),
+            Some(false)
+        );
+        assert_eq!(input_box_is_empty("> draft text", ">"), Some(false));
+    }
+
+    #[test]
+    fn input_box_none_when_marker_absent() {
+        // agent mid-output / no prompt rendered → cannot determine → None
+        // (caller fails toward protection).
+        assert_eq!(input_box_is_empty("just output, no prompt", "❯"), None);
+        assert_eq!(input_box_is_empty("", "❯"), None);
+    }
+
+    #[test]
+    fn input_box_uses_bottom_most_marker_not_prose() {
+        // #1944 prose-FP guard: a `❯`/`>` that appears MID-prose above the input
+        // box must not be matched — only the bottom-most line whose first
+        // non-blank char IS the marker counts as the live input prompt.
+        let screen = "the agent printed ❯ in its output\nmore prose with > inside\n❯ ";
+        assert_eq!(input_box_is_empty(screen, "❯"), Some(true));
+        // a markdown blockquote above, real empty input below
+        let screen2 = "> quoted line from agent output\nplain text\n> ";
+        assert_eq!(input_box_is_empty(screen2, ">"), Some(true));
+        // typed input below a blockquote → non-empty (still the bottom-most)
+        let screen3 = "> quoted output\n> my actual draft";
+        assert_eq!(input_box_is_empty(screen3, ">"), Some(false));
     }
 
     /// #1457: submitted (or never-typed) buffer → None → notifications deliver.
