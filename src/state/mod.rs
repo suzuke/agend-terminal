@@ -1114,7 +1114,7 @@ impl StateTracker {
                         // stays OUT of `is_high_fp_state` → the #1450 red anchor is
                         // unchanged (that decision is ① Step-2, pending the
                         // operator); this is the #1768 working-marker override only.
-                        let landed = if high_fp || matches!(detected, AgentState::UsageLimit) {
+                        let mut landed = if high_fp || matches!(detected, AgentState::UsageLimit) {
                             // #badge-recovery (state-level mirror of #1795): a
                             // ServerRateLimit whose agent produced PRODUCTIVE output
                             // within the recovery window has recovered even though
@@ -1213,26 +1213,27 @@ impl StateTracker {
                         } else {
                             detected
                         };
-                        // #1808-probe0-phantom (instrumentation-only, NO behavior
-                        // change): cheerc Evidence 2 claims a stale SRL error stuck in
-                        // the bottom-N tail keeps re-matching after the agent recovered
-                        // (the screen hash flips when the CLI clock ticks → feed
-                        // re-scans → re-grabs the SAME old error → re-latch → blind
-                        // inject). Record it empirically: signature the matched error
-                        // line `(line_hash, dist_from_bottom)` and compare to the
-                        // previous SRL detection —
+                        // #1808-probe0-phantom + #1809 fix: cheerc Evidence 2 — a stale
+                        // SRL error stuck in the bottom-N tail keeps re-matching after
+                        // the agent recovered (the screen hash flips when the CLI clock
+                        // ticks → feed re-scans → re-grabs the SAME old error → re-latch
+                        // → blind inject). Signature the matched error line
+                        // `(line_hash, dist_from_bottom)` and compare to the previous SRL
+                        // detection —
                         //   • same sig, NO intervening non-SRL state  → in-place
                         //     clock-tick re-scan → `srl_consecutive_rematch++`;
                         //   • same sig, intervening Idle/non-SRL state → `cross_cycle`
                         //     refire (the agent recovered, then the OLD error was
                         //     re-grabbed) = cheerc's exact cross-Idle loop.
                         // `last_srl_match_sig` PERSISTS across Idle so the cross-cycle
-                        // case survives. WARN only when the SRL actually wins
-                        // (`landed == ServerRateLimit` → would latch → inject) AND there
-                        // is no recent productive output (`!recovered`) AND it is a
-                        // re-match. Not backend-scoped (the phantom is the Claude
-                        // `Server is temporarily limiting` re-match — cheerc's `general`
-                        // agent). Telemetry-only; never touches `landed`/transition.
+                        // case survives. WARN when the SRL would win (`landed == SRL` →
+                        // latch → inject) AND no recent productive output (`!recovered`)
+                        // AND it is a re-match. The #1809 fix then OVERRIDES `landed` to
+                        // Idle for the `cross_cycle` sub-case only (the unambiguous
+                        // phantom) — the `consecutive_rematch` (still-SRL) case stays
+                        // telemetry-only so a genuine long throttle keeps retrying. Not
+                        // backend-scoped (the phantom is the Claude `Server is temporarily
+                        // limiting` re-match — cheerc's `general` agent).
                         if matches!(detected, AgentState::ServerRateLimit) {
                             let sig = srl_match_signature(screen_text, matched);
                             let same_sig = self.last_srl_match_sig == Some(sig);
@@ -1269,6 +1270,29 @@ impl StateTracker {
                                     productive_silent_secs = self.productive_silence().as_secs(),
                                     "phantom re-match: same stale ServerRateLimit error re-detected (would latch → inject) with no recent productive output"
                                 );
+                                // #1809 fix (behavioral): a CROSS-CYCLE phantom — the
+                                // agent already LEFT ServerRateLimit (passed through a
+                                // non-SRL landed state) and the SAME stale error line
+                                // (`same_sig`) was re-grabbed with no recent productive
+                                // output. This is cheerc's exact loop: a CLI clock-tick
+                                // flips the screen hash → feed re-scans → re-matches the
+                                // OLD error → re-latch → the supervisor schedules ANOTHER
+                                // auto-retry → blind `continue` inject, repeating every
+                                // ~45s as the recovery window expires. Land Idle instead
+                                // of re-latching: the genuine error already latched +
+                                // retried on its FIRST detection; a genuinely-new error
+                                // has a different signature; genuine productive output
+                                // sets `recovered_now` (→ #badge-recovery lands Idle
+                                // anyway, never reaching here). The IN-PLACE
+                                // `consecutive_rematch` case is deliberately NOT
+                                // suppressed — a still-SRL agent may be a genuine long
+                                // throttle that still needs its retry. (Accepted narrow
+                                // FP: a genuinely-new SRL identical in text AND screen
+                                // position to the just-processed one, with no intervening
+                                // productive output, is ignored — see PR body.)
+                                if cross_cycle {
+                                    landed = AgentState::Idle;
+                                }
                             }
                         }
                         let gated = self.gate_on_heartbeat(landed);

@@ -2732,6 +2732,91 @@ fn server_rate_limit_fresh_agent_no_productive_history_latches_badge() {
     );
 }
 
+/// #1809: a CROSS-CYCLE stale SRL re-match — the agent recovered to a non-SRL
+/// state, then the SAME error line is re-grabbed AFTER the recovery window (a CLI
+/// clock-tick flips the screen hash → feed re-scans the still-present stale error)
+/// — must NOT re-latch ServerRateLimit. Re-latching would schedule another
+/// auto-retry → blind `continue` inject: the ~45s phantom storm cheerc traced.
+#[test]
+fn stale_srl_cross_cycle_rematch_does_not_relatch_1809() {
+    let (mut vt, mut st) = claude_tracker();
+    // 1. SRL appears while the agent is RECOVERED (recent productive output) →
+    //    #badge-recovery lands Idle (not latched) but RECORDS the error signature
+    //    (`last_srl_match_sig`) — the same state the storm leaves behind after the
+    //    genuine episode resolved.
+    st.last_productive_output = Some(std::time::Instant::now());
+    drive_plain_line(&mut vt, &mut st, SRL_LINE);
+    assert_ne!(
+        st.get_state(),
+        AgentState::ServerRateLimit,
+        "recovered SRL lands Idle (badge) and records the error signature"
+    );
+    // 2. Agent passes through a clean non-SRL screen → sets non_srl_since_last_srl.
+    drive_plain_line(&mut vt, &mut st, "> ready");
+    assert_ne!(
+        st.get_state(),
+        AgentState::ServerRateLimit,
+        "a non-SRL state"
+    );
+    // 3. Recovery window expired (no productive output for >45s → recovered=false).
+    st.last_productive_output = None;
+    // 4. The SAME stale error line is re-grabbed (a CLI clock-tick flips the screen
+    //    hash → feed re-scans the still-present old error) → cross-cycle phantom.
+    drive_plain_line(&mut vt, &mut st, SRL_LINE);
+    assert_ne!(
+        st.get_state(),
+        AgentState::ServerRateLimit,
+        "#1809: a cross-cycle stale SRL re-match must NOT re-latch (the phantom storm)"
+    );
+}
+
+/// #1809 no-false-kill: a genuinely-NEW SRL error (DIFFERENT line signature) after
+/// a recovery must STILL latch — the stale-ignore is keyed on the error-line
+/// signature, so a new error is never suppressed.
+#[test]
+fn new_srl_error_after_recovery_still_latches_1809() {
+    let (mut vt, mut st) = claude_tracker();
+    drive_plain_line(&mut vt, &mut st, SRL_LINE);
+    assert_eq!(st.get_state(), AgentState::ServerRateLimit);
+    drive_plain_line(&mut vt, &mut st, "> ready");
+    st.last_productive_output = None;
+    // A DIFFERENT SRL line (still matches the throttle phrase, different content
+    // → different signature).
+    drive_plain_line(
+        &mut vt,
+        &mut st,
+        "API Error: Server is temporarily limiting requests (not your usage limit) — attempt 3",
+    );
+    assert_eq!(
+        st.get_state(),
+        AgentState::ServerRateLimit,
+        "#1809: a genuinely-new SRL error (different signature) must still latch"
+    );
+}
+
+/// #1809 conservatism: an IN-PLACE re-match (same error, agent STAYED in SRL, no
+/// intervening non-SRL state) is `consecutive_rematch`, NOT a cross-cycle phantom —
+/// a genuine long throttle. It must NOT be suppressed (the retry must keep firing).
+#[test]
+fn in_place_srl_rematch_still_latches_1809() {
+    let (mut vt, mut st) = claude_tracker();
+    drive_plain_line(&mut vt, &mut st, SRL_LINE);
+    assert_eq!(
+        st.get_state(),
+        AgentState::ServerRateLimit,
+        "first SRL latches"
+    );
+    st.last_productive_output = None;
+    // Re-feed the SAME error WITHOUT an intervening non-SRL state → consecutive
+    // (not cross-cycle) → a genuine still-throttled agent → must STILL latch.
+    drive_plain_line(&mut vt, &mut st, SRL_LINE);
+    assert_eq!(
+        st.get_state(),
+        AgentState::ServerRateLimit,
+        "#1809: an in-place same-error re-match (still SRL, no recovery) is a genuine throttle — keep latching"
+    );
+}
+
 /// #badge-recovery boundary: an agent that DID produce, but whose last productive
 /// output is PAST the recovery window, is a genuinely-throttled agent → must still
 /// latch ServerRateLimit. Confirms the suppression is BOUNDED (it only suppresses
