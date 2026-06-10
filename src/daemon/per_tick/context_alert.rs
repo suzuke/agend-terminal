@@ -3,15 +3,15 @@
 //! alert goes to the agent's team orchestrator (and the usage is visible via
 //! LIST `context_pct`/`context_source`); nothing is auto-restarted.
 //!
-//! Source resolution per agent (see `StateTracker::resolved_context`):
-//! 1. `pattern` — the agent's own statusline percent, parsed by the PTY
-//!    feed (cheap, in-band). Preferred when fresh.
-//! 2. `transcript` — for Claude agents whose pattern can't be read (narrow
-//!    pane truncation / no statusline), this handler computes the estimate
-//!    from the newest transcript's LAST message usage. That file IO runs
-//!    HERE — on the tick, with no registry/core lock held — never in the
-//!    PTY reader's feed path.
-//! 3. otherwise unknown — no alert, honest `null` in LIST.
+//! Source per agent (see `StateTracker::resolved_context`): the statusline
+//! `pattern` ONLY — a pane whose statusline can't be read is honestly
+//! `unknown` (no alert, `null` in LIST).
+//!
+//! #1945-disable (operator decision, 2026-06-10): the transcript-estimate
+//! fallback is DISABLED — its first live minute fired a triple false 100%
+//! alert (window misjudge). The corrected estimator survives, tested but
+//! uncalled, in `token_cost::estimate_context_pct`; re-enable ONLY after
+//! validating its readings against statusline ground truth.
 //!
 //! Dedup/hysteresis: an alert fires on crossing `>= threshold` while armed;
 //! firing disarms; re-arming requires dropping below `threshold -
@@ -111,36 +111,20 @@ impl PerTickHandler for ContextAlertHandler {
             return;
         }
 
-        // Phase 1 (cheap, locks only): snapshot resolved context per agent;
-        // collect the Claude agents that need a transcript-estimate refresh.
+        // Phase 1 (cheap, locks only): snapshot each agent's resolved context
+        // — statusline pattern only (#1945-disable: no transcript estimate;
+        // an unreadable pane is unknown and never alerts).
         let mut resolved: Vec<(String, f32, &'static str)> = Vec::new();
-        let mut need_estimate = Vec::new();
         {
             let reg = crate::agent::lock_registry(ctx.registry);
             for handle in reg.values() {
-                let name = handle.name.as_str().to_string();
-                match handle.core.lock().state.resolved_context() {
-                    Some((pct, source)) => resolved.push((name, pct, source)),
-                    // The estimator reads Claude transcripts — only Claude
-                    // agents can produce one; everything else stays unknown.
-                    None if handle.backend_command.contains("claude") => {
-                        need_estimate.push((name, std::sync::Arc::clone(&handle.core)));
-                    }
-                    None => {}
+                if let Some((pct, source)) = handle.core.lock().state.resolved_context() {
+                    resolved.push((handle.name.as_str().to_string(), pct, source));
                 }
             }
         }
 
-        // Phase 2 (file IO, NO locks held during the read): refresh estimates,
-        // then store back under a short core lock so LIST surfaces them.
-        for (name, core) in need_estimate {
-            if let Some(pct) = crate::token_cost::estimate_context_pct(ctx.home, &name) {
-                core.lock().state.set_context_estimate(pct);
-                resolved.push((name, pct, "transcript"));
-            }
-        }
-
-        // Phase 3: threshold/hysteresis evaluation + orchestrator notify.
+        // Phase 2: threshold/hysteresis evaluation + orchestrator notify.
         let threshold = alert_threshold();
         let now = Instant::now();
         let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(ctx.home))

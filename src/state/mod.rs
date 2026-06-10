@@ -221,10 +221,6 @@ pub struct StateTracker {
     /// truncate the statusline mid-session; the timestamp lets consumers
     /// judge staleness instead of treating "can't read" as "safe".
     context_pct: Option<(f32, Instant)>,
-    /// Transcript-derived context estimate + its compute instant. Written by
-    /// the daemon's context-alert tick (file IO stays OFF this struct's hot
-    /// path — the PTY reader feeds under the core lock).
-    context_estimate: Option<(f32, Instant)>,
     /// Set to true the moment we enter `InteractivePrompt`; cleared by
     /// `take_interactive_prompt_notice()` once the supervisor has forwarded a
     /// Telegram notice. This deduplicates per-entry: re-entry (e.g. dismissed
@@ -893,7 +889,6 @@ impl StateTracker {
                 .and_then(|p| p.context_pattern)
                 .and_then(|p| regex::Regex::new(p).ok()),
             context_pct: None,
-            context_estimate: None,
             interactive_prompt_pending_notice: false,
             interactive_recovery_pending_notice: false,
             last_heartbeat: None,
@@ -1008,25 +1003,21 @@ impl StateTracker {
         }
     }
 
-    /// Store a transcript-derived context estimate (the context-alert tick's
-    /// fallback source for backends/panes where the pattern can't be read).
-    pub fn set_context_estimate(&mut self, pct: f32) {
-        self.context_estimate = Some((pct.clamp(0.0, 100.0), Instant::now()));
-    }
-
-    /// Resolved context usage as `(percent, source)`. A fresh pattern reading
-    /// (straight off the agent's own statusline) wins over a fresh transcript
-    /// estimate; readings older than [`CONTEXT_FRESH`] are dropped rather than
-    /// trusted — `None` = honestly unknown.
+    /// Resolved context usage as `(percent, source)` — PATTERN ONLY (the
+    /// agent's own statusline). Readings older than [`CONTEXT_FRESH`] are
+    /// dropped rather than trusted — `None` = honestly unknown, no alert.
+    ///
+    /// #1945-disable (operator decision, 2026-06-10): the transcript-estimate
+    /// fallback ("transcript" source) is DISABLED — its first live minute
+    /// produced a triple false 100% alert (window misjudge: transcript model
+    /// ids carry no `[1m]` suffix → 1M sessions resolved against 200k). The
+    /// corrected estimator + its root-cause record live on in
+    /// `token_cost::estimate_context_pct` (tested, uncalled); re-enable ONLY
+    /// after validating its readings against statusline ground truth.
     pub fn resolved_context(&self) -> Option<(f32, &'static str)> {
         if let Some((pct, at)) = self.context_pct {
             if at.elapsed() < CONTEXT_FRESH {
                 return Some((pct, "pattern"));
-            }
-        }
-        if let Some((pct, at)) = self.context_estimate {
-            if at.elapsed() < CONTEXT_FRESH {
-                return Some((pct, "transcript"));
             }
         }
         None

@@ -370,12 +370,18 @@ fn claude_projects_dir() -> Option<PathBuf> {
 
 // ── Context% estimate (transcript fallback for the context-alert tick) ─────
 
-/// Context-window size for a Claude model id. The `[1m]` suffix marks a
-/// 1M-token context variant; current-gen Claude models are otherwise 200k.
-/// Unknown models fall back to 200k — the conservative direction for an
-/// early-warning surface (over-estimates usage → alerts early).
+/// Context-window size for a Claude model id AS IT APPEARS IN TRANSCRIPTS.
+/// ⚠ The CLI's `[1m]` display suffix NEVER reaches the transcript — the live
+/// `message.model` field reads plain `claude-fable-5` (verified against this
+/// fleet's own transcripts, 2026-06-10) — so matching `[1m]` alone made every
+/// fable session resolve to 200k and report 100% (the #1945 live false-alert
+/// triple). Fable runs on the 1M window in this fleet; `[1m]` is kept for
+/// robustness should an id ever carry it. Honest limitation: a plain-200k
+/// fable variant would be indistinguishable here and under-estimate — the
+/// statusline pattern path stays the primary source; the >110% misjudge guard
+/// in the estimator catches the inverse error class.
 fn context_window_for(model: &str) -> u64 {
-    if model.contains("[1m]") {
+    if model.contains("[1m]") || model.contains("fable") {
         1_000_000
     } else {
         200_000
@@ -399,6 +405,17 @@ const CONTEXT_TAIL_BYTES: u64 = 256 * 1024;
 /// latch a permanent false alert. Self-corrects after a compact (the next
 /// message's input drops). Claude transcripts only; `None` = no fresh
 /// attributable transcript (honestly unknown).
+///
+/// ⚠ #1945-disable — DEFERRED, deliberately uncalled (operator decision,
+/// 2026-06-10; NOT a ghost — same annotation pattern as the #649 trio): the
+/// first live minute fired a triple false 100% alert. Root cause (recorded
+/// for re-enable): the transcript `message.model` is plain `claude-fable-5` —
+/// the CLI's `[1m]` suffix never reaches it — so the window resolved to 200k
+/// for 1M sessions (~456k/200k → 228% → clamped to a credible 100). The
+/// window map + the >110% misjudge guard below are FIXED and test-pinned;
+/// re-enable ONLY after validating estimates against statusline ground truth
+/// (compare `context_pct` pattern readings on wide panes).
+#[allow(dead_code)]
 pub(crate) fn estimate_context_pct(home: &Path, instance: &str) -> Option<f32> {
     let projects = claude_projects_dir()?;
     let roots: Vec<(String, Vec<PathBuf>)> = instance_roots(home)
@@ -452,8 +469,28 @@ fn estimate_context_pct_in(projects_dir: &Path, roots: &[(String, Vec<PathBuf>)]
     let tail = read_file_tail(&path, CONTEXT_TAIL_BYTES)?;
     for line in tail.lines().rev() {
         if let Some((_, row)) = parse_line(line, roots, None) {
+            // CLI-generated placeholder rows (`<synthetic>`) and zero-usage
+            // rows carry no real context information — keep scanning.
+            if row.model == "<synthetic>" || row.usage.total_tokens() == 0 {
+                continue;
+            }
             let window = context_window_for(&row.model) as f64;
             let pct = (row.usage.total_tokens() as f64 / window) * 100.0;
+            // A context can't exceed its window — a reading past the small
+            // rounding margin means the WINDOW was misjudged (the #1945
+            // false-alert triple: 1M sessions resolved against 200k → 350%
+            // clamped to a credible-looking 100%). Don't launder that into a
+            // trusted number: log and report honestly-unknown instead.
+            if pct > 110.0 {
+                tracing::warn!(
+                    model = %row.model,
+                    tokens = row.usage.total_tokens(),
+                    assumed_window = window as u64,
+                    pct = pct as u32,
+                    "context estimate exceeds the assumed window — window misjudged, reporting unknown"
+                );
+                return None;
+            }
             return Some(pct.clamp(0.0, 100.0) as f32);
         }
     }
@@ -1894,6 +1931,90 @@ mod context_estimate_tests {
         let pct = estimate_context_pct_in(&projects, &roots_for("dev", "/root/ws/dev"))
             .expect("estimate produced");
         assert!((pct - 50.5).abs() < 0.1, "101k/200k, got {pct}");
+    }
+
+    /// #1945 live false-alert regression (dev/dev-2/reviewer-2 triple): the
+    /// transcript model id is plain `claude-fable-5` — the CLI's `[1m]` display
+    /// suffix never reaches the transcript — so the window must resolve to 1M.
+    /// Live-shape usage (~456k) must read ~46%, NOT 200k-window 228%→clamp 100.
+    #[test]
+    fn estimate_fable_transcript_id_resolves_1m_window_1945() {
+        let projects = tmp("fable-window");
+        let sess = projects.join("-root-ws-dev");
+        std::fs::create_dir_all(&sess).unwrap();
+        // Live-verified shape: model "claude-fable-5", cache_creation-dominated
+        // usage (the real sample read input=131, cache_creation≈440k,
+        // cache_read≈16k, output=37).
+        let line = usage_line("/root/ws/dev", "m1", "claude-fable-5", 131, 37, 16_367).replace(
+            "\"cache_read_input_tokens\":16367",
+            "\"cache_read_input_tokens\":16367,\"cache_creation_input_tokens\":439779",
+        );
+        std::fs::write(sess.join("s.jsonl"), line).unwrap();
+
+        let pct = estimate_context_pct_in(&projects, &roots_for("dev", "/root/ws/dev"))
+            .expect("estimate produced");
+        assert!(
+            (40.0..60.0).contains(&pct),
+            "#1945: fable resolves the 1M window → ~46%, got {pct}"
+        );
+    }
+
+    /// #1945: an estimate past the misjudge margin (>110%) is a window-error
+    /// signal — report honestly-unknown (None), never a credible-looking 100.
+    #[test]
+    fn estimate_over_window_reports_unknown_not_100_1945() {
+        let projects = tmp("over-window");
+        let sess = projects.join("-root-ws-dev");
+        std::fs::create_dir_all(&sess).unwrap();
+        // 700k against a 200k-window model id = 350% — the exact pre-fix shape.
+        let line = usage_line("/root/ws/dev", "m1", "claude-opus-4", 690_000, 5_000, 5_000);
+        std::fs::write(sess.join("s.jsonl"), line).unwrap();
+
+        assert!(
+            estimate_context_pct_in(&projects, &roots_for("dev", "/root/ws/dev")).is_none(),
+            "#1945: window-misjudged estimate must be unknown, not clamped 100"
+        );
+    }
+
+    /// #1945: the 100-110% rounding edge still clamps to 100 (a genuinely-full
+    /// context slightly over the nominal window is real, not a misjudge).
+    #[test]
+    fn estimate_rounding_edge_clamps_to_100_1945() {
+        let projects = tmp("edge-clamp");
+        let sess = projects.join("-root-ws-dev");
+        std::fs::create_dir_all(&sess).unwrap();
+        // 205k / 200k = 102.5% — within the margin.
+        let line = usage_line("/root/ws/dev", "m1", "claude-opus-4", 200_000, 2_500, 2_500);
+        std::fs::write(sess.join("s.jsonl"), line).unwrap();
+
+        let pct = estimate_context_pct_in(&projects, &roots_for("dev", "/root/ws/dev"))
+            .expect("edge estimate produced");
+        assert!(
+            (pct - 100.0).abs() < f32::EPSILON,
+            "clamped to 100, got {pct}"
+        );
+    }
+
+    /// #1945: trailing `<synthetic>` / zero-usage rows (CLI placeholders) are
+    /// skipped — the estimate comes from the last REAL usage row.
+    #[test]
+    fn estimate_skips_synthetic_and_zero_usage_rows_1945() {
+        let projects = tmp("synthetic");
+        let sess = projects.join("-root-ws-dev");
+        std::fs::create_dir_all(&sess).unwrap();
+        let lines = [
+            usage_line("/root/ws/dev", "m1", "claude-opus-4", 100_000, 1_000, 0),
+            usage_line("/root/ws/dev", "m2", "<synthetic>", 1, 1, 0),
+            usage_line("/root/ws/dev", "m3", "claude-opus-4", 0, 0, 0),
+        ];
+        std::fs::write(sess.join("s.jsonl"), lines.join("\n")).unwrap();
+
+        let pct = estimate_context_pct_in(&projects, &roots_for("dev", "/root/ws/dev"))
+            .expect("estimate produced");
+        assert!(
+            (pct - 50.5).abs() < 0.1,
+            "real row wins (101k/200k), got {pct}"
+        );
     }
 
     /// A transcript belonging to ANOTHER instance's cwd must not attribute —

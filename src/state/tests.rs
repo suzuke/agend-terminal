@@ -4542,22 +4542,24 @@ fn context_pct_truncated_statusline_keeps_previous_reading() {
     assert!((pct - 61.0).abs() < f32::EPSILON);
 }
 
-/// Resolution order: a fresh pattern reading wins over a transcript estimate;
-/// the estimate fills in when no pattern reading exists.
+/// #1945-disable: context resolution is PATTERN ONLY — the transcript
+/// estimate is disabled (its first live minute fired a triple false 100%
+/// alert), so an unreadable statusline is honestly unknown (no alert) and a
+/// readable one reports source "pattern". The estimate plumbing
+/// (`set_context_estimate` / the "transcript" source) is REMOVED from the
+/// tracker — this test pins that the disabled path stays disabled.
 #[test]
-fn context_resolution_pattern_wins_over_estimate() {
+fn context_resolution_is_pattern_only_estimate_disabled_1945() {
     let mut t = StateTracker::new(Some(&Backend::ClaudeCode));
-    t.set_context_estimate(42.0);
-    assert_eq!(
-        t.resolved_context().map(|(p, s)| (p as u32, s)),
-        Some((42, "transcript")),
-        "estimate fills in when no pattern reading exists"
+    assert!(
+        t.resolved_context().is_none(),
+        "#1945: no pattern reading → honestly unknown (never an estimate)"
     );
     t.feed(CLAUDE_STATUSLINE_FRAME);
     assert_eq!(
         t.resolved_context().map(|(p, s)| (p as u32, s)),
         Some((61, "pattern")),
-        "fresh pattern reading wins"
+        "pattern reading reports with source \"pattern\""
     );
 }
 
