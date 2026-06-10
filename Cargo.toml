@@ -101,10 +101,16 @@ memchr = "2"
 # SHA-256 crypto-grade hash + hex encoding so reviewers can correlate an
 # event's response_hash against an archived GitHub API response without
 # trusting a non-crypto hash to be collision-resistant.
-sha2 = "0.10"
+# #1934: coordinated RustCrypto upgrade — hmac 0.13 requires `D: EagerHash`,
+# which sha2 0.10's Sha256 does not implement (why dependabot's single-crate
+# bump #1926 failed); sha2 0.11 + digest 0.11 + hmac 0.13 move together.
+sha2 = "0.11"
 # #1576: HMAC-SHA256 keyed-hash integrity for the operator-mode authority file
 # (single-user injection-containment defense-in-depth — pairs with sha2 above).
-hmac = "0.12"
+hmac = "0.13"
+# #1934: explicit digest pin so the trait crate the hmac/sha2 pair resolve
+# against is visible (and bumps with them, not via transitive drift).
+digest = "0.11"
 hex = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"

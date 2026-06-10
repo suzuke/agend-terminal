@@ -11,7 +11,10 @@
 //! Threat model is documented in `config_integrity` (the signer): same-uid
 //! injection-containment defense-in-depth, NOT a security boundary.
 
-use hmac::{Hmac, Mac};
+// #1934 (hmac 0.13): `new_from_slice` moved behind the explicit `KeyInit`
+// trait import (no longer implied by `Mac`). Construction + tag semantics are
+// unchanged — pinned by the cross-version fixture test.
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use std::path::{Path, PathBuf};
 
@@ -58,4 +61,34 @@ pub(crate) fn sign_for_test(home: &Path, content: &[u8]) -> String {
     let mut mac = HmacSha256::new_from_slice(&key).expect("HMAC accepts any key length");
     mac.update(content);
     hex::encode(mac.finalize().into_bytes())
+}
+
+/// #1934 cross-version pin: the HMAC-SHA256 output must be byte-identical
+/// across the RustCrypto stack upgrade (hmac 0.12→0.13, sha2 0.10→0.11,
+/// digest →0.11). The expected tag was generated BEFORE the upgrade and
+/// cross-checked against an independent implementation (python hmac/hashlib)
+/// — a tag change would silently invalidate every existing integrity sidecar
+/// (#1576 fail-closed: all configs would read "not authentic" after deploy).
+#[cfg(test)]
+mod cross_version_pin_1934 {
+    use super::*;
+    use hmac::Mac;
+
+    #[test]
+    fn hmac_sha256_tag_is_stable_across_stack_upgrade() {
+        const KEY: &[u8] = b"agend-1934-cross-version-fixture-key";
+        const CONTENT: &[u8] =
+            b"agend-1934 fixture content: integrity_core HMAC-SHA256 cross-version pin";
+        // Generated on hmac 0.12.1 + sha2 0.10.9 (pre-upgrade), matches
+        // python3 hmac.new(KEY, CONTENT, hashlib.sha256).hexdigest().
+        const EXPECTED: &str = "80af9c21c0615da7849c54f1ba3ff9572061ac329d5f56455406b9317e8cc3fb";
+        let mut mac = HmacSha256::new_from_slice(KEY).expect("HMAC accepts any key length");
+        mac.update(CONTENT);
+        assert_eq!(
+            hex::encode(mac.finalize().into_bytes()),
+            EXPECTED,
+            "#1934: HMAC output changed across the RustCrypto upgrade — every \
+             existing integrity sidecar would fail closed"
+        );
+    }
 }

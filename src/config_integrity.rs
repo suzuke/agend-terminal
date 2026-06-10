@@ -21,7 +21,10 @@
 //! as a hex sidecar next to the file. No key rotation, no asymmetric crypto, no
 //! nonces — none of which a single-user threat model needs.
 
-use hmac::{Hmac, Mac};
+// #1934 (hmac 0.13): `new_from_slice` moved behind the explicit `KeyInit`
+// trait import (no longer implied by `Mac`). Construction + tag semantics are
+// unchanged — pinned by the cross-version fixture test.
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use std::path::Path;
 

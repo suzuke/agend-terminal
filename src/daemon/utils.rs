@@ -46,7 +46,9 @@ pub fn strip_html_comments(body: &str) -> String {
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
+    // #1934 (digest 0.11): the output array no longer implements LowerHex —
+    // hex::encode produces the identical lowercase hex (known-answer pinned).
+    hex::encode(hasher.finalize())
 }
 
 #[cfg(test)]
@@ -64,6 +66,17 @@ mod tests {
     #[test]
     fn strip_html_comments_no_comments() {
         assert_eq!(strip_html_comments("plain text"), "plain text");
+    }
+
+    /// #1934 cross-version pin: known-answer test (FIPS 180-4 vector via
+    /// python hashlib) — the digest must be byte-identical across the
+    /// sha2 0.10→0.11 upgrade.
+    #[test]
+    fn sha256_hex_known_answer_1934() {
+        assert_eq!(
+            sha256_hex(b"hello"),
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
     }
 
     #[test]
