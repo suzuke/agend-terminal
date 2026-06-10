@@ -206,6 +206,12 @@ pub(crate) struct RateLimitRetry {
     /// reaches `MAX_INJECT_FAILURES` is the track exhausted — and then via the
     /// full notification path, never silently.
     pub inject_failures: u32,
+    /// #1946: set when an abort-to-Idle was detected with this retry in flight
+    /// (retry_count > 0, no recent productive output). The track is RETAINED —
+    /// ownership of recovery stays here — and the Idle-state after-abort inject
+    /// continues the SAME tiered backoff budget. Cleared when a fresh
+    /// ServerRateLimit observation resumes the normal retry path.
+    pub abort_pending: bool,
 }
 
 /// Parse unlock time from usage_limit pane output (e.g., "resets at 15:14 UTC").
@@ -1755,8 +1761,21 @@ pub(crate) fn process_error_recovery(
                         next_retry_at: now + delay,
                         exhausted: false,
                         inject_failures: 0,
+                        abort_pending: false,
                     }
                 });
+                // #1946: a fresh ServerRateLimit observation while an abort-recovery
+                // was pending = the throttle re-latched on the detection side. The
+                // normal fresh-SRL retry path resumes ownership; the after-abort
+                // Idle-inject stands down (same track, same budget — single owner).
+                if track.abort_pending {
+                    track.abort_pending = false;
+                    tracing::info!(
+                        agent = %name,
+                        retry_count = track.retry_count,
+                        "#1946: ServerRateLimit re-latched — abort-recovery stands down, normal retry ownership resumes"
+                    );
+                }
                 // Due + not exhausted + outside the anti-thrash MIN_INTERVAL (guards a
                 // ServerRateLimit↔ApiError flicker). A skip here does NOT consume a
                 // retry — next tick re-decides once the agent is still ServerRateLimit.
@@ -1767,43 +1786,72 @@ pub(crate) fn process_error_recovery(
                     srl_to_inject.push(name.to_string());
                 }
             } else if clears_server_rate_limit_retry(state) {
-                // #1713: clear on genuine recovery (Idle) — cross-episode reset
-                // so a later ServerRateLimit episode starts fresh at Phase A. No
-                // suppress window needed: the inject is state-gated above, so a
-                // mid-work Thinking/ToolUse transient neither clears here nor injects.
-                if let Some(cleared) = retry_tracks.remove(name) {
-                    // #1808-flaw1-probe (instrumentation-only, NO behavior change):
-                    // cheerc claims a backend that hits a fatal net error ABORTS to an
-                    // Idle prompt → this unconditional Idle-clear drops the in-flight
-                    // SRL retry track → `continue` never re-injects → the agent freezes
-                    // until waiting_on_stale. The clear itself is unchanged; we only
-                    // SPLIT the log to see empirically whether the suspicious shape ever
-                    // occurs: a track with retries already attempted (`retry_count > 0`)
-                    // reaching Idle with NO recent productive output (`!recovered`) is
-                    // the abort-to-Idle path. A genuine recovery reaches Idle either
-                    // before any retry (`retry_count == 0`) or with recent productive
-                    // output (`recovered`) → INFO. When the WARN fires, cross-check
-                    // whether dispatch_idle then nudges the agent (dev's claimed
-                    // backstop) vs. it sitting frozen.
-                    if cleared.retry_count > 0 && !recovered {
-                        tracing::warn!(
-                            agent = %name,
-                            tag = "#1808-flaw1-probe",
-                            retry_count = cleared.retry_count,
-                            productive_silent_secs = productive_silence.as_secs(),
-                            recovered = false,
-                            "abort-to-Idle cleared an in-flight ServerRateLimit retry with no recent productive output — cheerc's claimed freeze path"
-                        );
-                    } else {
-                        tracing::info!(
-                            agent = %name,
-                            ?state,
-                            retry_count = cleared.retry_count,
-                            recovered,
-                            productive_silent_secs = productive_silence.as_secs(),
-                            "ServerRateLimit retry cleared — agent recovered (Idle)"
-                        );
+                // #1713: Idle = genuine terminal recovery → cross-episode reset…
+                // EXCEPT the #1946 abort shape below.
+                match retry_tracks.get_mut(name) {
+                    // ── #1946 (closes #1808 Flaw 1, production-evidenced by the
+                    // probe fire 2026-06-10 08:59) ──
+                    // An abort-to-Idle with an in-flight retry and NO recent
+                    // productive output is NOT recovery: the backend aborted the
+                    // retry attempt back to its prompt. Post-#1936 the stale-sig
+                    // re-latch is suppressed too, so detection will NOT re-create
+                    // a track — dropping it here left NOBODY owning recovery (the
+                    // agent froze until manual rescue). RETAIN ownership: mark
+                    // abort-pending and keep walking the SAME tiered backoff
+                    // budget via the Idle-state after-abort inject. `recovered`
+                    // cleanly separates this from genuine recovery — failed-retry
+                    // spinners do not count as productive output (probe evidence:
+                    // productive_silent_secs=600 across 4 retries).
+                    Some(track) if track.retry_count > 0 && !track.exhausted && !recovered => {
+                        if !track.abort_pending {
+                            track.abort_pending = true;
+                            let idx = (track.retry_count as usize)
+                                .min(SERVER_RATE_LIMIT_BACKOFF.len() - 1);
+                            track.next_retry_at =
+                                now + Duration::from_secs(SERVER_RATE_LIMIT_BACKOFF[idx]);
+                            tracing::warn!(
+                                agent = %name,
+                                tag = "#1946-abort-retain",
+                                retry_count = track.retry_count,
+                                next_retry_secs = SERVER_RATE_LIMIT_BACKOFF[idx],
+                                productive_silent_secs = productive_silence.as_secs(),
+                                "abort-to-Idle with in-flight ServerRateLimit retry — retaining ownership, delayed retry scheduled (was: track cleared → freeze)"
+                            );
+                        } else {
+                            // After-abort continuation: the ONLY Idle-state inject,
+                            // and deliberately narrow — abort_pending is set solely
+                            // in the probe-confirmed shape above, `!recovered`
+                            // (guard on this arm) keeps a genuinely-working agent
+                            // out, and the tiered schedule + MIN_INTERVAL + the
+                            // shared 12-retry budget all still apply (#1713's
+                            // anti-blind-fire intent holds: never into
+                            // PermissionPrompt/working states).
+                            let min_interval_ok = last_continue_inject.get(name).is_none_or(|t| {
+                                now.duration_since(*t) >= CONTINUE_INJECT_MIN_INTERVAL
+                            });
+                            if now >= track.next_retry_at && min_interval_ok {
+                                srl_to_inject.push(name.to_string());
+                            }
+                        }
                     }
+                    Some(_) => {
+                        // Genuine recovery (recent productive output), a pre-retry
+                        // track (retry_count == 0), or an exhausted track reaching
+                        // Idle — cross-episode reset so a later episode starts
+                        // fresh at Phase A.
+                        if let Some(cleared) = retry_tracks.remove(name) {
+                            tracing::info!(
+                                agent = %name,
+                                ?state,
+                                retry_count = cleared.retry_count,
+                                after_abort = cleared.abort_pending,
+                                recovered,
+                                productive_silent_secs = productive_silence.as_secs(),
+                                "ServerRateLimit retry cleared — agent recovered (Idle)"
+                            );
+                        }
+                    }
+                    None => {}
                 }
             }
 
@@ -1892,13 +1940,21 @@ pub(crate) fn process_error_recovery(
             tracing::info!(agent = %name, "ServerRateLimit: entering retry Phase C (sustained 10-min retry)");
         }
 
-        match inject_continue_gated(home, registry, name, "ratelimit-retry") {
+        // #1946: tag the after-abort continuation distinctly so a pane/log reader
+        // can tell which mechanism injected (and the episode leaves a trace).
+        let auto_kind = if retry.abort_pending {
+            "ratelimit-retry-after-abort"
+        } else {
+            "ratelimit-retry"
+        };
+        match inject_continue_gated(home, registry, name, auto_kind) {
             InjectOutcome::Injected => {
                 retry.inject_failures = 0; // #1742: a success clears the failure streak
                 last_continue_inject.insert(name.clone(), Instant::now());
                 tracing::info!(
                     agent = %name,
                     retry = retry.retry_count,
+                    after_abort = retry.abort_pending,
                     "ServerRateLimit: injected \"continue\" (attempt {})",
                     retry.retry_count
                 );
@@ -2077,6 +2133,7 @@ mod tests {
             next_retry_at: Instant::now(),
             exhausted: false,
             inject_failures: 0,
+            abort_pending: false,
         }
     }
 
@@ -3313,6 +3370,7 @@ instances:
             next_retry_at: std::time::Instant::now(),
             exhausted: false,
             inject_failures: 0,
+            abort_pending: false,
         };
         retry.retry_count += 1;
         assert!(
@@ -3473,6 +3531,7 @@ instances:
                 next_retry_at: Instant::now(),
                 exhausted: false,
                 inject_failures: 0,
+                abort_pending: false,
             },
         );
         let mut last_inject: HashMap<String, Instant> = HashMap::new();
@@ -3510,7 +3569,11 @@ instances:
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// #1325: phase 1 — recovery (Idle) clears retry track.
+    /// #1325/#1946: phase 1 — GENUINE recovery (Idle + recent productive output)
+    /// clears the retry track. (#1946 narrowed the clear: an Idle WITHOUT recent
+    /// productive output and retries in flight is the abort shape and retains —
+    /// see the 1946 tests below — so this genuine-recovery contract now requires
+    /// the productive-output signal it always meant.)
     #[test]
     fn phase1_recovery_clears_retry_track() {
         let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
@@ -3523,10 +3586,13 @@ instances:
                 next_retry_at: Instant::now(),
                 exhausted: false,
                 inject_failures: 0,
+                abort_pending: false,
             },
         );
 
         let (handle, _reader) = mock_agent_handle("test-agent", crate::state::AgentState::Idle);
+        // Genuine recovery: the agent produced real output before idling.
+        handle.core.lock().state.last_productive_output = Some(Instant::now());
         // #1441: registry is UUID-keyed — insert under the handle's own id.
         registry.lock().insert(handle.id, handle);
 
@@ -3541,27 +3607,29 @@ instances:
         );
         assert!(
             !tracks.contains_key("test-agent"),
-            "phase 1 must clear retry track on Idle recovery"
+            "phase 1 must clear retry track on genuine Idle recovery"
         );
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// #1808-flaw1-probe (behavior pin, §3.9 real entry): cheerc claims a backend
-    /// that hits a fatal net error ABORTS to an Idle prompt while a ServerRateLimit
-    /// retry is in flight, and the unconditional Idle-clear then leaves the agent
-    /// "frozen" (no `continue` ever injected). This pins the ACTUAL current
-    /// behavior the Probe-1 WARN instruments: the in-flight track (`retry_count >
-    /// 0`) IS cleared, and — critically — NO `continue` is injected, because the
-    /// inject is state-gated on ServerRateLimit and the agent is now Idle (so
-    /// clearing the track is NOT what suppresses the inject). The SRL retry path
-    /// deliberately does not resume an aborted-to-Idle agent; that recovery belongs
-    /// to dispatch_idle / waiting_on_stale. The probe measures whether this shape
-    /// ever actually occurs in prod.
+    /// #1946 (closes #1808 Flaw 1, production-evidenced 2026-06-10 08:59 probe
+    /// fire + 08:55-08:59 dev-2 freeze): an abort-to-Idle with an in-flight
+    /// ServerRateLimit retry and NO recent productive output must RETAIN the
+    /// track (ownership of recovery stays with the supervisor) and schedule a
+    /// delayed after-abort retry on the SAME tiered backoff — not clear it
+    /// (the pre-#1946 behavior, which froze the agent until manual rescue
+    /// because post-#1936 detection never re-creates a track either).
     #[test]
-    fn abort_to_idle_clears_in_flight_retry_and_does_not_inject_1808() {
-        let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
-        let home = tmp_home("abort-to-idle-1808");
-        // In-flight retry (retry_count > 0) from a ServerRateLimit episode.
+    fn abort_to_idle_retains_track_and_resumes_retry_1946() {
+        // one_agent_registry writes fleet.yaml so the Phase-2 inject can
+        // resolve the agent (a bare registry insert reads as AgentGone).
+        // The agent sits at an Idle prompt with NO recent productive output
+        // (`last_productive_output` defaults to None) — the freeze shape.
+        let (home, registry, _reader) = one_agent_registry(
+            "test-agent",
+            crate::state::AgentState::Idle,
+            "abort-retain-1946",
+        );
         let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
         tracks.insert(
             "test-agent".to_string(),
@@ -3570,35 +3638,197 @@ instances:
                 next_retry_at: Instant::now(),
                 exhausted: false,
                 inject_failures: 0,
+                abort_pending: false,
             },
         );
         let mut last_inject: HashMap<String, Instant> = HashMap::new();
 
-        // Aborted to an Idle prompt with NO recent productive output
-        // (`last_productive_output` defaults to None) — the cheerc freeze shape.
-        let (handle, _reader) = mock_agent_handle("test-agent", crate::state::AgentState::Idle);
-        registry.lock().insert(handle.id, handle);
-
-        for _ in 0..3 {
-            super::process_error_recovery(
-                &home,
-                &registry,
-                &mut tracks,
-                &mut Default::default(),
-                &mut Default::default(),
-                &mut last_inject,
-                past_boot_grace(),
+        // Tick 1: the abort is detected → track retained, abort_pending set,
+        // next retry scheduled on the tiered backoff (BACKOFF[2] = 30s out) —
+        // NOT due yet, so no inject this tick.
+        super::process_error_recovery(
+            &home,
+            &registry,
+            &mut tracks,
+            &mut Default::default(),
+            &mut Default::default(),
+            &mut last_inject,
+            past_boot_grace(),
+        );
+        {
+            let track = tracks
+                .get("test-agent")
+                .expect("#1946: abort-to-Idle must RETAIN the in-flight track, not clear it");
+            assert!(track.abort_pending, "#1946: abort_pending marked");
+            assert!(
+                track.next_retry_at > Instant::now() + Duration::from_secs(20),
+                "#1946: delayed retry continues the tiered schedule (BACKOFF[2]=30s), not immediate"
+            );
+            assert!(
+                !last_inject.contains_key("test-agent"),
+                "#1946: no inject before the delayed retry is due"
             );
         }
 
+        // Make the delayed retry due → tick 2 must inject the after-abort
+        // `continue` (the ONLY Idle-state inject, gated on abort_pending +
+        // !recovered) and keep the track.
+        tracks
+            .get_mut("test-agent")
+            .expect("track retained")
+            .next_retry_at = Instant::now();
+        super::process_error_recovery(
+            &home,
+            &registry,
+            &mut tracks,
+            &mut Default::default(),
+            &mut Default::default(),
+            &mut last_inject,
+            past_boot_grace(),
+        );
+        assert!(
+            last_inject.contains_key("test-agent"),
+            "#1946: due after-abort retry must inject `continue` into the Idle agent"
+        );
+        let track = tracks.get("test-agent").expect("track survives the inject");
+        assert_eq!(
+            track.retry_count, 3,
+            "#1946: after-abort attempts consume the SAME 12-retry budget"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1946: genuine recovery AFTER an abort (productive output appears — e.g.
+    /// the operator dispatched work, or the after-abort `continue` revived the
+    /// agent) clears the retained track; no further inject.
+    #[test]
+    fn abort_pending_recovered_clears_track_1946() {
+        let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = tmp_home("abort-recovered-1946");
+        let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
+        tracks.insert(
+            "test-agent".to_string(),
+            RateLimitRetry {
+                retry_count: 3,
+                next_retry_at: Instant::now(),
+                exhausted: false,
+                inject_failures: 0,
+                abort_pending: true,
+            },
+        );
+        let mut last_inject: HashMap<String, Instant> = HashMap::new();
+
+        let (handle, _reader) = mock_agent_handle("test-agent", crate::state::AgentState::Idle);
+        // Productive output landed after the abort — genuine recovery.
+        handle.core.lock().state.last_productive_output = Some(Instant::now());
+        registry.lock().insert(handle.id, handle);
+
+        super::process_error_recovery(
+            &home,
+            &registry,
+            &mut tracks,
+            &mut Default::default(),
+            &mut Default::default(),
+            &mut last_inject,
+            past_boot_grace(),
+        );
         assert!(
             !tracks.contains_key("test-agent"),
-            "abort-to-Idle clears the in-flight ServerRateLimit retry track (current behavior)"
+            "#1946: genuine recovery after an abort clears the retained track"
         );
         assert!(
             !last_inject.contains_key("test-agent"),
-            "no `continue` is injected into an aborted-to-Idle agent — inject is \
-             state-gated on ServerRateLimit; SRL retry does not resume an Idle agent"
+            "#1946: no `continue` into a recovered agent"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1946: a fresh ServerRateLimit observation while abort-recovery is
+    /// pending hands ownership back to the normal fresh-SRL retry path (same
+    /// track, same budget — structurally a single owner, no double-continue).
+    #[test]
+    fn abort_pending_stands_down_on_srl_relatch_1946() {
+        let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = tmp_home("abort-relatch-1946");
+        let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
+        tracks.insert(
+            "test-agent".to_string(),
+            RateLimitRetry {
+                retry_count: 3,
+                // Not due — proves the stand-down happens on observation, not inject.
+                next_retry_at: Instant::now() + Duration::from_secs(600),
+                exhausted: false,
+                inject_failures: 0,
+                abort_pending: true,
+            },
+        );
+
+        let (handle, _reader) =
+            mock_agent_handle("test-agent", crate::state::AgentState::ServerRateLimit);
+        registry.lock().insert(handle.id, handle);
+
+        super::process_error_recovery(
+            &home,
+            &registry,
+            &mut tracks,
+            &mut Default::default(),
+            &mut Default::default(),
+            &mut Default::default(),
+            past_boot_grace(),
+        );
+        let track = tracks.get("test-agent").expect("track persists");
+        assert!(
+            !track.abort_pending,
+            "#1946: SRL re-latch resumes normal retry ownership (abort-recovery stands down)"
+        );
+        assert_eq!(track.retry_count, 3, "budget carries over, no reset");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1946: the after-abort path consumes the SAME tiered budget — at the
+    /// 12-retry cap the existing exhaustion path (orchestrator inbox notify +
+    /// Error-severity channel alert) finally becomes REACHABLE in a sustained
+    /// outage (pre-#1946 the track died at the first abort, so exhaustion—and
+    /// its escalation—never fired).
+    #[test]
+    fn abort_pending_budget_exhaustion_reachable_1946() {
+        let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = tmp_home("abort-exhaust-1946");
+        let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
+        tracks.insert(
+            "test-agent".to_string(),
+            RateLimitRetry {
+                retry_count: SERVER_RATE_LIMIT_MAX_RETRIES, // budget already burned
+                next_retry_at: Instant::now(),              // due
+                exhausted: false,
+                inject_failures: 0,
+                abort_pending: true,
+            },
+        );
+        let mut last_inject: HashMap<String, Instant> = HashMap::new();
+
+        let (handle, _reader) = mock_agent_handle("test-agent", crate::state::AgentState::Idle);
+        registry.lock().insert(handle.id, handle);
+
+        super::process_error_recovery(
+            &home,
+            &registry,
+            &mut tracks,
+            &mut Default::default(),
+            &mut Default::default(),
+            &mut last_inject,
+            past_boot_grace(),
+        );
+        let track = tracks
+            .get("test-agent")
+            .expect("exhausted track retained this tick");
+        assert!(
+            track.exhausted,
+            "#1946: after-abort attempts walk into the existing exhaustion path"
+        );
+        assert!(
+            !last_inject.contains_key("test-agent"),
+            "no inject past the budget cap"
         );
         std::fs::remove_dir_all(&home).ok();
     }
@@ -3661,6 +3891,7 @@ instances:
                 next_retry_at: Instant::now(), // due now
                 exhausted: false,
                 inject_failures: 0,
+                abort_pending: false,
             },
         );
         let (handle, _reader) =
@@ -3712,6 +3943,7 @@ instances:
                 next_retry_at: Instant::now() + Duration::from_secs(3600),
                 exhausted: false,
                 inject_failures: 0,
+                abort_pending: false,
             },
         );
         let (handle, _reader) =
@@ -3765,6 +3997,7 @@ instances:
                 next_retry_at: Instant::now() - Duration::from_secs(1),
                 exhausted: false,
                 inject_failures: 0,
+                abort_pending: false,
             },
         );
 
@@ -3811,6 +4044,7 @@ instances:
                 next_retry_at: std::time::Instant::now(),
                 exhausted: true,
                 inject_failures: 0,
+                abort_pending: false,
             },
         );
         assert!(tracks.contains_key("agent-loop"));
@@ -3832,6 +4066,7 @@ instances:
                 next_retry_at: Instant::now() + Duration::from_secs(60),
                 exhausted: false,
                 inject_failures: 0,
+                abort_pending: false,
             },
         );
 
@@ -3885,6 +4120,7 @@ instances:
                 next_retry_at: Instant::now() - Duration::from_secs(1),
                 exhausted: false,
                 inject_failures: 0,
+                abort_pending: false,
             },
         );
 
@@ -3968,6 +4204,7 @@ instances:
                 next_retry_at: Instant::now() - Duration::from_secs(1), // due
                 exhausted: false,
                 inject_failures: 0,
+                abort_pending: false,
             },
         );
         let mut last_inject: HashMap<String, Instant> = HashMap::new();
@@ -4023,6 +4260,7 @@ instances:
                 next_retry_at: Instant::now() - Duration::from_secs(1), // due
                 exhausted: false,
                 inject_failures: 2, // one short of MAX_INJECT_FAILURES
+                abort_pending: false,
             },
         );
         super::process_error_recovery(
@@ -4059,6 +4297,7 @@ instances:
                 next_retry_at: std::time::Instant::now(),
                 exhausted: true,
                 inject_failures: 0,
+                abort_pending: false,
             },
         );
         tracks.remove("agent-recover");
@@ -4070,6 +4309,7 @@ instances:
                 next_retry_at: std::time::Instant::now(),
                 exhausted: false,
                 inject_failures: 0,
+                abort_pending: false,
             },
         );
         assert_eq!(tracks["agent-recover"].retry_count, 0);
@@ -4086,6 +4326,7 @@ instances:
                 next_retry_at: std::time::Instant::now(),
                 exhausted: false,
                 inject_failures: 0,
+                abort_pending: false,
             },
         );
         for _ in 0..30 {
@@ -4496,6 +4737,7 @@ instances:
                 next_retry_at: Instant::now(),
                 exhausted: false,
                 inject_failures: 0,
+                abort_pending: false,
             },
         );
         let mut last_inject: HashMap<String, Instant> = HashMap::new();
