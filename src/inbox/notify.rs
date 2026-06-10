@@ -658,6 +658,128 @@ pub fn inject_notification_with_submit(
     inject_with_submit(home, agent_name, notification)
 }
 
+/// #1513: MAX_DEFER anti-starvation caps — once an item has been deferred this
+/// long it is released even while the agent is still busy. Actionable wakes get
+/// a tight cap (work delivery must land fast); ambient can wait longer.
+pub(crate) const ACTIONABLE_MAX_DEFER_MS: i64 = 1_000;
+pub(crate) const AMBIENT_MAX_DEFER_MS: i64 = 7_000;
+
+/// #1513: should this queued item be RELEASED (injected) now vs HELD? Released
+/// when the pane is SETTLED — the agent is not mid-generation AND the operator
+/// isn't mid-keystroke — OR the item is past its MAX_DEFER cap.
+///
+/// #1513 case A: the drain previously held only on `agent_busy`, so the
+/// anti-starvation release could land an inject on the operator's input line
+/// mid-typing. `typing_recent` (the SAME `operator_typing_recent` live-keystroke
+/// signal the inject-time gate uses — one source of truth) now also holds. The
+/// MAX_DEFER cap stays the backstop: a perpetually-busy OR perpetually-typing
+/// operator never traps the queue (actionable work still lands within
+/// `ACTIONABLE_MAX_DEFER_MS`). Pure so the hold/release matrix is unit-testable.
+pub(crate) fn flush_release(
+    item: &crate::notification_queue::QueuedNotification,
+    agent_busy: bool,
+    typing_recent: bool,
+    now_ms: i64,
+) -> bool {
+    let cap = if item.actionable {
+        ACTIONABLE_MAX_DEFER_MS
+    } else {
+        AMBIENT_MAX_DEFER_MS
+    };
+    if now_ms.saturating_sub(item.deferred_since_ms) >= cap {
+        return true; // MAX_DEFER backstop wins, even mid-generation / mid-keystroke.
+    }
+    !agent_busy && !typing_recent
+}
+
+/// Shared deferred-queue flush core — the single gating/delivery path used by
+/// BOTH flushers: the TUI event loop (per visible pane,
+/// `app::flush_notifications_for_pane`) and the daemon's per-tick
+/// `notification_flush` handler (headless `run_core`, where no TUI loop
+/// exists — the gap that stranded deferred operator messages, 2026-06-10).
+///
+/// Gating (#1457/#1513, behavior unchanged from the former app-only flush):
+/// Drafting → defer everything; Abandoned → escape valve releases just the
+/// oldest (trickle, no clobbering batch); None (clean buffer) → drain the
+/// backlog, holding items while the agent is mid-generation or the operator
+/// is mid-keystroke, bounded by the MAX_DEFER anti-starvation caps.
+pub(crate) fn flush_agent_queue<F>(home: &Path, agent_name: &str, injector: F)
+where
+    F: FnMut(&str) -> anyhow::Result<()>,
+{
+    // Raw draft state only: the #1944/#1948 input-box probe needs the rendered
+    // pane (TUI-owned vterm), so the headless caller conservatively honors the
+    // timestamp heuristic — fail toward draft-protection. The TUI wrapper
+    // (`app::flush_notifications_for_pane`) probes and passes the refined
+    // state via `flush_agent_queue_with_state`.
+    let state = crate::notification_queue::draft_state(home, agent_name);
+    flush_agent_queue_with_state(home, agent_name, state, injector)
+}
+
+/// Shared flush core — the SAME gating for the TUI flush and the daemon's
+/// per-tick headless flush: Drafting holds, Abandoned trickles the oldest,
+/// None drains through the busy/typing holds + MAX_DEFER anti-starvation
+/// caps (`flush_release`). The caller supplies the (possibly probe-refined)
+/// draft state.
+pub(crate) fn flush_agent_queue_with_state<F>(
+    home: &Path,
+    agent_name: &str,
+    draft_state: crate::notification_queue::DraftState,
+    mut injector: F,
+) where
+    F: FnMut(&str) -> anyhow::Result<()>,
+{
+    use crate::notification_queue::{self, DraftState};
+    match draft_state {
+        DraftState::Drafting => {}
+        DraftState::Abandoned => {
+            if let Some(notification) = notification_queue::drain_one(home, agent_name) {
+                if injector(&notification.text).is_err() {
+                    notification_queue::requeue_all(home, agent_name, &[notification]);
+                }
+            }
+        }
+        DraftState::None => {
+            let mut queued = notification_queue::drain(home, agent_name);
+            if queued.is_empty() {
+                return;
+            }
+            // #1513: actionable wakes drain FIRST, then ambient (stable by ts).
+            queued.sort_by(|a, b| {
+                b.actionable
+                    .cmp(&a.actionable)
+                    .then_with(|| a.timestamp.cmp(&b.timestamp))
+            });
+            // #1513: if the agent is mid-generation (Thinking/ToolUse), injecting
+            // now would corrupt the PTY stream — HOLD non-expired items and only
+            // release those past their MAX_DEFER cap (anti-starvation). The state
+            // read is lock-free from the snapshot (inject path must not take the
+            // core lock — #1492). Once any inject fails, preserve the remaining
+            // order by holding the rest.
+            let agent_busy = crate::snapshot::agent_is_busy(home, agent_name);
+            // #1513 case A: same live-keystroke signal the inject-time gate uses,
+            // so a queued item is held off the operator's input line at the drain
+            // too (bounded by the MAX_DEFER cap below).
+            let typing_recent = operator_typing_recent(home, agent_name);
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let mut keep: Vec<notification_queue::QueuedNotification> = Vec::new();
+            let mut inject_failed = false;
+            for notification in queued {
+                if inject_failed || !flush_release(&notification, agent_busy, typing_recent, now_ms)
+                {
+                    keep.push(notification);
+                } else if injector(&notification.text).is_err() {
+                    inject_failed = true;
+                    keep.push(notification);
+                }
+            }
+            if !keep.is_empty() {
+                notification_queue::requeue_all(home, agent_name, &keep);
+            }
+        }
+    }
+}
+
 pub(super) fn route_notification<F>(
     home: &Path,
     agent_name: &str,
@@ -677,6 +799,106 @@ where
         return Ok(());
     }
     injector(notification)
+}
+
+#[cfg(test)]
+mod flush_release_tests_1513 {
+    use super::{flush_release, ACTIONABLE_MAX_DEFER_MS};
+    use crate::notification_queue::QueuedNotification;
+
+    fn item(actionable: bool, deferred_since_ms: i64) -> QueuedNotification {
+        QueuedNotification {
+            text: "x".into(),
+            timestamp: String::new(),
+            actionable,
+            deferred_since_ms,
+        }
+    }
+
+    #[test]
+    fn not_busy_not_typing_always_releases() {
+        let now = 10_000;
+        assert!(
+            flush_release(&item(true, now), false, false, now),
+            "settled agent releases actionable"
+        );
+        assert!(
+            flush_release(&item(false, now), false, false, now),
+            "settled agent releases ambient"
+        );
+    }
+
+    #[test]
+    fn busy_holds_then_cap_releases() {
+        let base = 100_000;
+        // fresh defer while busy (not typing) → held
+        assert!(
+            !flush_release(&item(true, base), true, false, base),
+            "busy holds fresh actionable"
+        );
+        assert!(
+            !flush_release(&item(false, base), true, false, base),
+            "busy holds fresh ambient"
+        );
+        // past the actionable cap (1s) but within ambient cap (7s) → actionable releases, ambient holds
+        let mid = base + ACTIONABLE_MAX_DEFER_MS + 1;
+        assert!(
+            flush_release(&item(true, base), true, false, mid),
+            "actionable releases past its 1s cap even while busy"
+        );
+        assert!(
+            !flush_release(&item(false, base), true, false, mid),
+            "ambient still held at ~1s while busy"
+        );
+        // well past ambient cap → ambient releases too
+        let late = base + 8_000;
+        assert!(
+            flush_release(&item(false, base), true, true, late),
+            "ambient releases past its cap even while typing (backstop)"
+        );
+    }
+
+    /// #1513 case A: the operator-typing hold + its MAX_DEFER backstop, across
+    /// the four scenarios in the fix spec.
+    #[test]
+    fn typing_holds_until_cap() {
+        let base = 100_000;
+        // (1) busy + actionable + typing + NOT past cap → defer (no collision).
+        assert!(
+            !flush_release(&item(true, base), true, true, base),
+            "typing holds a fresh actionable wake off the input line"
+        );
+        // also holds when the agent is idle but the operator is mid-keystroke —
+        // the case the old `!agent_busy` early-return missed.
+        assert!(
+            !flush_release(&item(true, base), false, true, base),
+            "typing holds even when the agent is idle"
+        );
+        // (2) same but PAST MAX_DEFER → release (backstop; task dispatch 1s).
+        let past = base + ACTIONABLE_MAX_DEFER_MS + 1;
+        assert!(
+            flush_release(&item(true, base), true, true, past),
+            "actionable releases past its 1s cap despite typing"
+        );
+        // (3) NOT typing → unchanged from before (release when settled).
+        assert!(
+            flush_release(&item(true, base), false, false, base),
+            "not typing + idle → release as before"
+        );
+        assert!(
+            !flush_release(&item(true, base), true, false, base),
+            "not typing + busy + fresh → held as before"
+        );
+        // (4) ambient honors typing too, bounded by its 7s cap.
+        assert!(
+            !flush_release(&item(false, base), false, true, base + 6_000),
+            "ambient held while typing within its cap"
+        );
+        assert!(
+            flush_release(&item(false, base), false, true, base + 7_001),
+            "ambient releases past its 7s cap despite typing"
+        );
+    }
 }
 
 #[cfg(test)]

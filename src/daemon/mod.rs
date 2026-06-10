@@ -597,6 +597,14 @@ pub(crate) fn build_default_handlers(
         // (Fix A) is timely; the lead ESCALATION stays gated by its own 10min age
         // + 30min re-alert windows, so the faster scan doesn't escalate sooner.
         Box::new(per_tick::HandoffTimeoutHandler::new(12)),
+        // Daemon-side deferred-notification flush — every tick (~10s). The
+        // #1513 busy-gate defers notifications into the queue whose only other
+        // flusher is the TUI loop; headless `run_core` (`start --foreground`)
+        // has no TUI, so without this handler deferred operator messages
+        // strand forever (7 stranded Telegram messages, 2026-06-10). Idle
+        // cost per instance: one read_dir of notification-queue/ plus a line
+        // count of any existing queue files — trivial at fleet sizes.
+        Box::new(per_tick::NotificationFlushHandler::new(1)),
         Box::new(per_tick::LogRotationHandler::new(360)),
         Box::new(per_tick::ThreadDumpHandler::new()),
         Box::new(per_tick::GcTickHandler::new(360)),

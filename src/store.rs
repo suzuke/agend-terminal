@@ -183,6 +183,32 @@ pub fn acquire_file_lock(lock_path: &Path) -> anyhow::Result<FileFlockGuard> {
     Ok(FileFlockGuard { _file: f })
 }
 
+/// Non-blocking variant of [`acquire_file_lock`]: `Ok(None)` when the lock is
+/// currently held elsewhere, instead of blocking until it frees. Same
+/// `FLOCK_DEPTH` contract as the blocking form (the #1629 chokepoint extends
+/// to this fn — both live in store.rs, the allowlisted file).
+///
+/// For callers on a periodic cadence (e.g. the per-tick notification-queue
+/// flush) where walking away on contention is load-bearing: blocking inside a
+/// daemon tick would stall every other handler behind a contended lock.
+pub fn try_acquire_file_lock(lock_path: &Path) -> anyhow::Result<Option<FileFlockGuard>> {
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)?;
+    // Trait method explicit — same MSRV rationale as `acquire_file_lock`.
+    if fs4::FileExt::try_lock(&f).is_err() {
+        return Ok(None);
+    }
+    // Bump AFTER the OS lock is held so depth>0 ⟹ lock held.
+    crate::sync_audit::flock_entered();
+    Ok(Some(FileFlockGuard { _file: f }))
+}
+
 /// Helper: build a store path from home + filename.
 pub fn store_path(home: &Path, filename: &str) -> PathBuf {
     home.join(filename)
