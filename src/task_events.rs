@@ -340,6 +340,15 @@ pub enum TaskEvent {
         key: String,
         value: serde_json::Value,
     },
+    /// #1942: link a git branch to a task after creation. The dispatch
+    /// (`send kind=task`) carries `branch=`, but a separately-created task starts
+    /// with `branch: None`; this event fills it in so `auto_close_merged_tasks`
+    /// can find the task↔branch link when the branch merges.
+    BranchLinked {
+        task_id: TaskId,
+        by: InstanceName,
+        branch: String,
+    },
 }
 
 /// Per-task confidence breakdown produced by the legacy-backfill sweep.
@@ -380,7 +389,8 @@ impl TaskEvent {
             | TaskEvent::PriorityChanged { task_id, .. }
             | TaskEvent::DescriptionUpdated { task_id, .. }
             | TaskEvent::TagsSet { task_id, .. }
-            | TaskEvent::MetadataSet { task_id, .. } => task_id,
+            | TaskEvent::MetadataSet { task_id, .. }
+            | TaskEvent::BranchLinked { task_id, .. } => task_id,
         }
     }
 
@@ -405,6 +415,7 @@ impl TaskEvent {
             TaskEvent::DescriptionUpdated { .. } => "description_updated",
             TaskEvent::TagsSet { .. } => "tags_set",
             TaskEvent::MetadataSet { .. } => "metadata_set",
+            TaskEvent::BranchLinked { .. } => "branch_linked",
         }
     }
 }
@@ -760,6 +771,12 @@ impl TaskBoardState {
             TaskEvent::TagsSet { tags, .. } => {
                 if let Some(t) = self.tasks.get_mut(task_id) {
                     t.tags = tags.clone();
+                    t.updated_at = touch_at.to_string();
+                }
+            }
+            TaskEvent::BranchLinked { branch, .. } => {
+                if let Some(t) = self.tasks.get_mut(task_id) {
+                    t.branch = Some(branch.clone());
                     t.updated_at = touch_at.to_string();
                 }
             }
