@@ -257,6 +257,13 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
     // the agent is dead (api::call(DELETE) waited for exit), so no concurrent bind
     // re-creates it; `runtime/<name>/` holds only this agent's binding artefacts.
     let _ = std::fs::remove_dir_all(crate::paths::runtime_dir(home).join(name));
+    // #1935: explicitly remove the per-agent TUI port file `run/<pid>/<name>.port`.
+    // The `api::call(DELETE)` stop-path already calls `remove_port` for a live
+    // agent, but a boot-spawn that published the port without the agent reaching a
+    // stoppable state would leave it behind. Remove it unconditionally before the
+    // audit; the `_delete_guard` held above makes any concurrent publish skip its
+    // `write_port` (tui_bridge.rs), so it stays gone past this point.
+    crate::ipc::remove_port(&crate::daemon::run_dir(home), name);
 
     // Sprint 54 P1-B Bug 1 audit: enumerate every store that still holds
     // the name. If any do, surface a loud error instead of returning
@@ -406,6 +413,14 @@ pub(crate) fn name_residual_anywhere(
     // left behind by `unbind`; full_delete now removes the whole dir).
     if crate::paths::runtime_dir(home).join(name).exists() {
         sources.push("runtime-dir");
+    }
+    // #1935: the per-agent TUI port file `run/<pid>/<name>.port` (daemon-LIFECYCLE
+    // dir — a different family from `runtime/<name>/`, which is why #1907's oracle
+    // missed it). full_delete → remove_port deletes it, but a publish racing
+    // teardown could re-create it; scanning here makes the production delete LOUD
+    // if it lingers, and the #1935 publish deleting-guard closes the write window.
+    if crate::ipc::port_path(&crate::daemon::run_dir(home), name).exists() {
+        sources.push("tui-port");
     }
     if crate::daemon::pr_state::has_subscriber(home, name) {
         sources.push("pr-state");

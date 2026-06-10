@@ -172,6 +172,38 @@ impl AgendHarness {
                         job
                     };
 
+                    // #1935: api.port is published BEFORE the boot-spawn loop runs
+                    // (#922 / #906 reorder); `.ready` is written UNCONDITIONALLY
+                    // after the spawn loop completes (daemon/mod.rs — empty fleet
+                    // still reaches it, 0 iterations). Returning on api.port alone
+                    // let a test seed+delete a victim while its boot-spawn was still
+                    // publishing `run/<pid>/<name>.port`, racing the per-agent port
+                    // write against the test's own teardown (the #1935 flake).
+                    // Wait for `.ready` so every boot-spawn's port is on disk first;
+                    // a failed boot exits early and is caught by try_wait below.
+                    let ready_path = run_dir.join(".ready");
+                    loop {
+                        if start.elapsed() > timeout {
+                            let _ = child.kill();
+                            return Err(
+                                "daemon startup timeout (15s) — .ready never appeared".into()
+                            );
+                        }
+                        match child.try_wait() {
+                            Ok(Some(status)) => {
+                                return Err(format!(
+                                    "daemon exited early (after api.port, before .ready) with {status}"
+                                ));
+                            }
+                            Ok(None) => {}
+                            Err(e) => return Err(format!("try_wait: {e}")),
+                        }
+                        if ready_path.exists() {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+
                     return Ok(Self {
                         home,
                         api_port: port,

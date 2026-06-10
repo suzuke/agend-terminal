@@ -42,6 +42,22 @@ pub(crate) fn prepare_tui_listener_and_publish_port(
     })?;
     let listener = crate::ipc::bind_loopback()?;
     let port = crate::ipc::local_port(&listener);
+    // #1935: refuse the port publish if the instance is mid-delete. `full_delete`
+    // → `remove_port` deletes `run/<pid>/<name>.port`, but a boot-spawn / respawn
+    // publish still in flight would re-create it AFTER the removal (the #1913
+    // writer-vs-teardown race that left a residual the #1907 oracle didn't catch).
+    // The #1915 DeletingGuard already refuses the spawn/register chokepoint; this
+    // closes the narrower window where write_port runs past it. Cheap leaf-lock
+    // read. `home` = run_dir's grandparent (run_dir is always `home/run/<pid>` via
+    // run_dir_for_pid), so the key matches full_delete's `mark_deleting(home, …)`.
+    if let Some(home) = run_dir.parent().and_then(|p| p.parent()) {
+        if crate::agent::deleting::is_deleting(home, name) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                format!("instance '{name}' is being deleted; TUI port publish skipped"),
+            ));
+        }
+    }
     crate::ipc::write_port(run_dir, name, port)?;
     tracing::info!(agent = name, port, "TUI socket ready");
     Ok(TuiListenerMeta { listener, cookie })
@@ -265,5 +281,46 @@ mod tests {
             prod[block_end..].contains(&write_needle),
             "the initial dump must be written via write_frame AFTER the registry lock is dropped"
         );
+    }
+
+    /// #1935 §3.9: `prepare_tui_listener_and_publish_port` must NOT write
+    /// `run/<pid>/<name>.port` while the instance is mid-delete (closes the
+    /// publish-vs-teardown race where a boot-spawn republished the port AFTER
+    /// `full_delete`'s `remove_port`), but MUST write it on a normal publish.
+    #[test]
+    fn publish_port_respects_deleting_guard() {
+        let home = std::env::temp_dir().join(format!("agend-1935-pubguard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        // run_dir MUST be `home/run/<pid>` so the fn derives `home` as its
+        // grandparent (matching full_delete's `mark_deleting(home, …)` key).
+        let run_dir = home.join("run").join(std::process::id().to_string());
+        std::fs::create_dir_all(&run_dir).unwrap();
+        crate::auth_cookie::issue(&run_dir).unwrap();
+        let name = "victim-port";
+        let port_file = crate::ipc::port_path(&run_dir, name);
+
+        // (a) mid-delete → publish refused, no `.port` written.
+        let guard = crate::agent::deleting::mark_deleting(&home, name);
+        let refused = super::prepare_tui_listener_and_publish_port(name, &run_dir);
+        assert!(refused.is_err(), "publish must be refused while deleting");
+        assert!(
+            !port_file.exists(),
+            "no .port may be written while the instance is deleting"
+        );
+        drop(guard);
+
+        // (b) not deleting → publish succeeds, `.port` written.
+        let ok = super::prepare_tui_listener_and_publish_port(name, &run_dir);
+        assert!(
+            ok.is_ok(),
+            "publish must succeed when not deleting (err: {:?})",
+            ok.err()
+        );
+        assert!(
+            port_file.exists(),
+            ".port must be written on a normal (non-deleting) publish"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

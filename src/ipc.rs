@@ -31,7 +31,9 @@ pub fn local_port(listener: &TcpListener) -> u16 {
 }
 
 /// Path for a named port file inside run_dir.
-fn port_path(run_dir: &Path, name: &str) -> std::path::PathBuf {
+/// `pub(crate)` (#1935) so the teardown residual oracle checks the exact path
+/// `write_port`/`remove_port` use.
+pub(crate) fn port_path(run_dir: &Path, name: &str) -> std::path::PathBuf {
     run_dir.join(format!("{name}.port"))
 }
 
