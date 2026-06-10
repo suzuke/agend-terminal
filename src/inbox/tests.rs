@@ -440,29 +440,10 @@ fn notify_source_system_display() {
 // recovery they aimed at is now the bridge same-request_id retry + request_dedup
 // cache, kept reliable by the drain byte cap (see drain_caps_batch_*).
 
-#[test]
-fn drain_read_failure_leaves_file_for_retry() {
-    // If read_to_string fails, .draining must remain on disk so a
-    // subsequent drain has another chance. (Simulating an unreadable
-    // file is awkward cross-platform; we instead assert the
-    // "retain-on-error" invariant by verifying successful drains
-    // DO remove, which is the inverse assertion our prior bug
-    // violated. See drain_recovers_leftover_draining_file.)
-    let home = tmp_home("retain");
-    let inbox_dir = home.join("inbox");
-    fs::create_dir_all(&inbox_dir).ok();
-    let draining = inbox_dir.join("agent1.draining");
-    // Non-UTF8 bytes → read_to_string returns Err.
-    fs::write(&draining, [0xFF, 0xFE, 0xFD]).expect("write");
-
-    let msgs = drain(&home, "agent1");
-    assert!(msgs.is_empty(), "unreadable batch yields no messages");
-    assert!(
-        draining.exists(),
-        ".draining must be retained after read failure for next retry"
-    );
-    fs::remove_dir_all(&home).ok();
-}
+// #1940: `drain_read_failure_leaves_file_for_retry` was REMOVED with the rest of
+// the `.draining` snapshot/recovery path it exercised — drain() no longer reads
+// or writes `.draining`, so the test was vacuous-passing (both asserts held only
+// because drain never touched the file).
 
 #[test]
 fn notify_agent_does_not_append_submit_key() {
