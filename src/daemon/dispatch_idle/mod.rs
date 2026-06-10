@@ -916,6 +916,35 @@ pub(crate) fn scan_and_emit(home: &Path) {
             Some(current)
         };
         if let Some(current) = to_emit {
+            // #1961 phase-1 instrument (ZERO behavior change): the dispatch is
+            // ABOUT TO FIRE — re-read the SAME three work-aware suppress signals
+            // `target_is_working` consulted (snapshot agent_state + silent_secs,
+            // and the heartbeat_pair deltas) and log them, so the next production
+            // false-fire (heads-down agent nudged mid-work) shows WHICH of the
+            // three signals slipped at fire time. Read-only: no gate, no
+            // control-flow change — just one info line before the emit that was
+            // already going to happen. The real fix waits on this evidence.
+            let snap_agent = snapshot
+                .as_ref()
+                .and_then(|s| s.agents.iter().find(|a| a.name == d.target));
+            let hb = crate::daemon::heartbeat_pair::snapshot_for(&d.target);
+            let now_ms = crate::daemon::heartbeat_pair::now_ms();
+            tracing::info!(
+                tag = "#1961-fire-signals",
+                dispatch_id = %d.dispatch_id,
+                target = %d.target,
+                correlation_id = ?d.correlation_id,
+                elapsed_secs,
+                threshold_secs = d.threshold_secs,
+                not_working_streak = d.not_working_streak.saturating_add(1),
+                agent_state = snap_agent
+                    .map(|a| a.agent_state.as_str())
+                    .unwrap_or("<no-snapshot>"),
+                silent_secs = ?snap_agent.map(|a| a.silent_secs),
+                heartbeat_age_ms = now_ms.saturating_sub(hb.heartbeat_at_ms),
+                last_input_age_ms = now_ms.saturating_sub(hb.last_input_at_ms),
+                "#1961: dispatch_idle firing — work-aware suppress signals at fire time (diagnose which slipped)"
+            );
             emit_exceeded_event(home, &current, elapsed_secs);
         }
     }
@@ -1468,6 +1497,62 @@ mod tests {
             d.status,
             DispatchStatus::Exceeded,
             "#1866 (a): a fully-idle target (all activity signals stale) must STILL fire"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// §3.9 #1961 (instrument-only): when a dispatch fires, the `#1961-fire-signals`
+    /// diagnostic is emitted at the fire point (so production can see which
+    /// work-aware suppress signal slipped) WHILE the fire behavior is byte-identical
+    /// (the dispatch still flips to Exceeded). Drops the instrument → the log
+    /// assertion fails; changes a gate → the Exceeded assertion fails.
+    #[test]
+    #[tracing_test::traced_test]
+    fn fire_signals_instrumented_zero_behavior_1961() {
+        let home = tmp_home("1961-instrument");
+        let target = "dev-1961-idle"; // unique → stale heartbeat_pair → idle
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            format!("instances:\n  lead:\n    backend: claude\n  {target}:\n    backend: claude\n"),
+        )
+        .unwrap();
+        let task_id = "t-idle-1961";
+        let tasks_dir = home.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        std::fs::write(
+            tasks_dir.join(format!("{task_id}.json")),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "id": task_id, "status": "in_progress", "title": "w", "assignee": target
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let id = write_pending_at(
+            &home,
+            "lead",
+            target,
+            Some(task_id),
+            "task",
+            600,
+            chrono::Utc::now() - chrono::Duration::seconds(700),
+        );
+
+        scan_and_emit(&home);
+
+        // Behavior unchanged: the dispatch still fires (flips to Exceeded).
+        let d = list_pending(&home)
+            .into_iter()
+            .find(|d| d.dispatch_id == id)
+            .expect("sidecar present");
+        assert_eq!(
+            d.status,
+            DispatchStatus::Exceeded,
+            "#1961: the instrument must NOT change the fire behavior"
+        );
+        // Instrument live: the fire-signals diagnostic is emitted at the fire point.
+        assert!(
+            logs_contain("#1961-fire-signals"),
+            "#1961: the fire-signals diagnostic must be logged when a dispatch fires"
         );
         std::fs::remove_dir_all(&home).ok();
     }
