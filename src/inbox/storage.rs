@@ -349,12 +349,13 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
                 budget_used += sz;
                 msg.read_at = Some(now.clone());
                 changed = true;
-                // #1888 instrument-only (zero-behavior): a `ci-ready-for-action`
-                // handoff just transitioned to read on this drain. After this, the
-                // handoff_timeout_watchdog's `unread_of_kind` scan can no longer
-                // find it → it can never re-nudge (the #1860 read-state-coupling
-                // RCA). This trace lets production confirm "read before acted" for a
-                // stranded PR. Read-only — the read-marking above is unchanged.
+                // #1888: a `ci-ready-for-action` handoff just transitioned to
+                // read on this drain. Phase-1 this trace PROVED the read-state
+                // coupling (production: every handoff read within seconds, the
+                // watchdog blind). Phase-2 the watchdog scans the
+                // `ci_handoff_track` sidecar instead, so this read no longer
+                // blinds anything — the trace stays as the read-vs-resolution
+                // timeline marker. Read-only — the read-marking is unchanged.
                 if msg.kind.as_deref() == Some("ci-ready-for-action") {
                     let age_at_read_secs = chrono::DateTime::parse_from_rfc3339(&msg.timestamp)
                         .ok()
@@ -720,33 +721,6 @@ pub fn unread_count(home: &Path, name: &str) -> (usize, Option<chrono::DateTime<
         }
     }
     (count, oldest)
-}
-
-/// #1491: unread messages of a given `kind` in `name`'s inbox, returned as
-/// `(correlation_id, timestamp)`. Used by the handoff-timeout watchdog to find
-/// `ci-ready-for-action` handoffs an agent received but never read. Messages
-/// with an unparseable timestamp are skipped.
-pub fn unread_of_kind(
-    home: &Path,
-    name: &str,
-    kind: &str,
-) -> Vec<(Option<String>, chrono::DateTime<chrono::Utc>)> {
-    let path = inbox_path_resolved(home, name);
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for line in content.lines() {
-        let Ok(msg) = serde_json::from_str::<InboxMessage>(line) else {
-            continue;
-        };
-        if msg.read_at.is_none() && msg.kind.as_deref() == Some(kind) {
-            if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&msg.timestamp) {
-                out.push((msg.correlation_id.clone(), ts.with_timezone(&chrono::Utc)));
-            }
-        }
-    }
-    out
 }
 
 /// Sweep expired messages from all inbox files (#inbox-gc part b).

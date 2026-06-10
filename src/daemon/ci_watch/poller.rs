@@ -1735,6 +1735,16 @@ fn persist_watch_state(
                         "ci_watch_chain",
                         next
                     );
+                    // #1888 phase-2: track the handoff until RESOLUTION (report /
+                    // PR terminal / target claims the branch), decoupled from the
+                    // inbox read-state the watchdog used to scan (any drain marked
+                    // it read within seconds and blinded the re-nudge).
+                    crate::daemon::ci_handoff_track::record(
+                        ctx.home,
+                        next,
+                        &repo_branch_key,
+                        &chrono::Utc::now().to_rfc3339(),
+                    );
                 }
                 None if state.subscriber_names().is_empty() => {
                     tracing::warn!(

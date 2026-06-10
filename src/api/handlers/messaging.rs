@@ -523,6 +523,15 @@ fn track_dispatch(
         // target goes Idle (#1516's working-state gate does not cover that).
         if let Some(corr) = msg.correlation_id.as_deref().or(msg.task_id.as_deref()) {
             let _ = crate::daemon::dispatch_idle::mark_resolved(home, corr);
+            // #1888 phase-2: a report carrying the handoff's `repo@branch`
+            // correlation (reviewer verdicts do) RESOLVES the ci-handoff track —
+            // the re-nudge stops on this signal, not on inbox read. A task-id
+            // correlation simply matches no track (no-op).
+            let _ = crate::daemon::ci_handoff_track::resolve_by_correlation(
+                home,
+                corr,
+                "report_arrived",
+            );
             if corr.starts_with("t-") {
                 let _ = crate::tasks::auto_close::auto_close_on_report(
                     home,
