@@ -13,11 +13,16 @@ pub(crate) fn handle_list(_params: &Value, ctx: &HandlerCtx) -> Value {
         .values()
         .map(|handle| {
             let name = handle.name.as_str();
-            let (agent_state, health_state) = {
+            let (agent_state, health_state, blocked_reason, blocked_note) = {
                 let c = handle.core.lock();
                 (
                     c.state.get_state().display_name().to_string(),
                     c.health.state.display_name().to_string(),
+                    // #1933: surface the self-reported blocked reason + its
+                    // operator-readable note so an operator can see WHY an agent is
+                    // blocked and its free-text annotation (previously internal-only).
+                    c.health.current_reason.as_ref().map(|r| r.to_string()),
+                    c.health.current_note.clone(),
                 )
             };
             let (dispatched_waiting_for, pending_response_to) =
@@ -29,6 +34,8 @@ pub(crate) fn handle_list(_params: &Value, ctx: &HandlerCtx) -> Value {
                 "inject_prefix": handle.inject_prefix,
                 "agent_state": agent_state,
                 "health_state": health_state,
+                "blocked_reason": blocked_reason,
+                "blocked_note": blocked_note,
                 "kind": "managed",
                 "dispatched_waiting_for": dispatched_waiting_for,
                 "pending_response_to": pending_response_to,

@@ -600,7 +600,10 @@ pub(super) fn handle_report_health(
             "params": {
                 "name": instance_name,
                 "reason": reason,
-                "retry_after_secs": args.get("retry_after_secs")
+                "retry_after_secs": args.get("retry_after_secs"),
+                // #1933: forward the operator-readable note (was dropped here — the
+                // schema advertised it but no mechanism consumed it).
+                "note": args.get("note")
             }
         }),
     ) {

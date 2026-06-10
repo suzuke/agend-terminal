@@ -207,7 +207,9 @@ pub(crate) fn def_task() -> Value {
             "audit_reason": {"type": "string", "description": "#806 sweep apply=true: required audit text recorded in event-log.jsonl + per-task Cancelled.reason."},
             "repository": {"type": "string", "description": "#806 sweep: override GitHub `owner/repo` slug for PR-state queries (defaults to task_sweep.json's repo)."},
             "metadata_key": {"type": "string", "description": "Key for metadata_set action."},
-            "metadata_value": {"description": "Value for metadata_set action (any JSON type)."}
+            "metadata_value": {"description": "Value for metadata_set action (any JSON type)."},
+            "bind": {"type": "boolean", "description": "#1933: create only — opt OUT of the daemon's auto-bind-on-dispatch (default true). Set false to leave the assignee unbound. Consumed in tasks/handler.rs (TaskEvent::Created.bind)."},
+            "eta_secs": {"type": "integer", "description": "#1933: create only — task stall-watchdog ETA in seconds; the daemon flags the task as stalled once this budget elapses. Consumed in tasks/handler.rs (TaskEvent::Created.eta_secs)."}
         }, "required": ["action"]}})
 }
 
@@ -354,7 +356,8 @@ pub(crate) fn def_bind_self() -> Value {
 pub(crate) fn def_release_worktree() -> Value {
     json!({"name": "release_worktree", "description": "Release the daemon-managed worktree and clear the binding for the given agent. Idempotent. Only removes worktrees carrying the `.agend-managed` marker — operator-created worktrees are left alone.",
         "inputSchema": {"type": "object", "properties": {
-            "instance": {"type": "string", "description": "Name of the existing instance whose worktree + binding to release"}
+            "instance": {"type": "string", "description": "Name of the existing instance whose worktree + binding to release"},
+            "dry_run": {"type": "boolean", "description": "#1933: when true, preview what would be released WITHOUT releasing (no binding/worktree mutation). Default false. Consumed at mcp/handlers/worktree.rs."}
         }, "required": ["instance"]}})
 }
 
@@ -644,8 +647,11 @@ mod tests {
     /// check is the deterministic zero-FP subset that still catches the
     /// high-value case: a read no schema declares at all.
     ///
+    /// SCANNED (#1933): `src/mcp/` + `src/tasks/` + `src/{schedules,teams,decisions,
+    /// deployments}.rs` — the coordination-tool handlers that live outside src/mcp/.
+    ///
     /// RED proof: add a non-comment `args["__bogus_undeclared__"]` read to any
-    /// non-test source under `src/mcp/` → this test fails naming the file:line.
+    /// non-test source under the scanned dirs → this test fails naming the file:line.
     #[test]
     fn mcp_handler_arg_reads_are_declared_or_allowlisted() {
         use std::collections::BTreeSet;
@@ -680,15 +686,45 @@ mod tests {
             // when `request_kind` is absent. The current schema name is
             // `request_kind`; `kind` stays undeclared on purpose.
             ("kind", "deprecated back-compat alias for `request_kind`"),
+            // #1933: task `done` honors a caller-provided `done_source` for the
+            // audit trail (tasks/handler.rs:358/568), but it is a daemon/audit
+            // concern — agent-FORGEABLE source would be an audit-integrity hole, so
+            // it stays INTERNAL-only (deliberately undeclared). Read multi-line
+            // (`args\n.get("done_source")`) so the line-oriented extractor does not
+            // currently flag it; allow-listed defensively against a future reflow.
+            (
+                "done_source",
+                "internal: daemon-set audit source; agent-forgeable = integrity risk (#1933)",
+            ),
+            // NOTE: bind_self's `task_id` (mcp/handlers/worktree.rs) is dispatch-path-
+            // set and intentionally NOT a bind_self schema field; it needs no entry
+            // here because `task_id` IS declared on the `task`/`send` tools, so the
+            // union check already passes it (kept undeclared on bind_self by design).
         ];
         let allow: BTreeSet<&str> = ALLOWLIST.iter().map(|(k, _)| *k).collect();
 
-        // (3) Read sites: scan non-test source under src/mcp/ for top-level arg
-        //     reads.
-        let mcp_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/mcp");
+        // (3) Read sites: scan non-test source under src/mcp/ AND the coordination-
+        //     tool handler modules that live OUTSIDE src/mcp/ (#1933: src/mcp/ alone
+        //     missed task/schedule/team/decision/deployment handlers — the
+        //     eta_secs/done_source-class undeclared-read blind spot from the
+        //     #1911-followup audit).
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let mut files = Vec::new();
-        collect_rs_files(&mcp_dir, &mut files);
-        assert!(!files.is_empty(), "no .rs files under src/mcp/");
+        for dir in ["src/mcp", "src/tasks"] {
+            collect_rs_files(&manifest.join(dir), &mut files);
+        }
+        for file in [
+            "src/schedules.rs",
+            "src/teams.rs",
+            "src/decisions.rs",
+            "src/deployments.rs",
+        ] {
+            files.push(manifest.join(file));
+        }
+        assert!(
+            !files.is_empty(),
+            "no .rs files under the scanned handler dirs"
+        );
 
         let mut violations = Vec::new();
         for f in &files {
@@ -729,123 +765,336 @@ mod tests {
         );
     }
 
-    /// Ghost-directive guard (#1907 follow-up): the COMPLEMENT of #1505's
-    /// Invariant B. #1505 catches a handler READ with no schema declaration;
-    /// this catches a schema DECLARATION with no consumer — a field advertised
-    /// to agents that silently evaporates because no mechanism ever reads it
-    /// (the `working_directory`/`requires_reply`/`task_summary` class removed in
-    /// this PR; originally surfaced by the dispatch-directive-survival audit).
+    /// #1933 generalized ghost-directive guard (the #1911 send-only guard,
+    /// extended to ALL coordination tools). The COMPLEMENT of #1505's Invariant B:
+    /// #1505 catches a handler READ with no schema declaration; this catches a
+    /// schema DECLARATION with no consumer — a field advertised to agents that
+    /// silently evaporates because no mechanism reads it (the
+    /// `working_directory`/`requires_reply`/`task_summary` class, and the
+    /// `health.note` ghost surfaced by the #1933 schema-consumption audit).
     ///
-    /// Every `send` schema field must be either:
-    ///   (a) in `CONSUMED` — with a consumption-point cite (file:line + the
-    ///       mechanism). The cite makes the list a living doc and makes "just
-    ///       add it to CONSUMED" require inventing a real cite (caught in
-    ///       review), not a rubber stamp.
-    ///   (b) in `DEFERRED_ALLOWLIST` — with a roadmap ref, so an intentionally-
-    ///       deferred passthrough (#649 sequencing/eta_minutes/reporting_cadence:
-    ///       Phase-1 passthrough by design, Phase-2 consuming mechanism deferred)
-    ///       is HONESTLY recorded rather than dying silently like a ghost.
+    /// Every coordination tool's schema field must be either:
+    ///   (a) `CONSUMED` — with a consumption-point cite (a real read site). The
+    ///       cite makes the table a living doc and forces a real cite on additions.
+    ///   (b) `DEFERRED` — an intentionally-deferred passthrough with a roadmap ref
+    ///       (#649 trio), honestly recorded rather than dying silently like a ghost.
+    /// And every tool in `tool_definitions()` must be either a classified
+    /// coordination tool OR in `NON_COORDINATION` (simple query/display/control
+    /// tools, not directive-bearing) — so a NEW tool can't escape classification
+    /// (the #1907/#1911 curated-list-drift guard).
     ///
-    /// RED proof: add `"ghost": {"type": "string"}` to the `send` schema (and no
-    /// consumer) → this test fails naming `ghost` as unclassified.
+    /// RED proof: add a `"ghost"` field to any coordination tool's schema (and no
+    /// consumer) → this test fails naming `<tool>.ghost` as unclassified.
     #[test]
-    fn send_schema_fields_are_consumed_or_deferred_allowlisted() {
+    fn coordination_tool_schema_fields_are_consumed_or_deferred() {
         use std::collections::BTreeSet;
 
-        // (1) The `send` tool's declared field set — from the BUILT schema JSON
-        //     (robust; not a source-parse of the json! literal).
-        let defs = tool_definitions();
-        let send = defs["tools"]
-            .as_array()
-            .expect("tools array")
-            .iter()
-            .find(|t| t["name"] == "send")
-            .expect("send tool registered");
-        let fields: BTreeSet<String> = send["inputSchema"]["properties"]
-            .as_object()
-            .expect("send inputSchema.properties")
-            .keys()
-            .cloned()
-            .collect();
-
-        // (2) Fields with a real consumer. The cite points at where the directive
-        //     is CONSUMED by a mechanism (not merely accepted/stored). A new
-        //     CONSUMED row must carry a real consumption-point cite.
-        const CONSUMED: &[(&str, &str)] = &[
-            ("instance", "comms.rs:147 resolve_instance → single-recipient routing"),
-            ("instances", "comms.rs:630 handle_broadcast recipient list"),
-            ("team", "comms.rs:629 handle_broadcast → teams::get_members"),
-            // tags: `is_some()` at comms.rs:19 / anti_stall.rs:42 triggers broadcast
-            // MODE, but the tag VALUE is never read — broadcast resolves recipients
-            // by team/instances only. Consumed as a mode flag, NOT as a target
-            // filter; value-based tag-targeting is NOT implemented.
-            ("tags", "comms.rs:19 is_some() triggers broadcast mode; value-based tag-targeting NOT implemented"),
-            ("message", "comms.rs:169 task body / lift_message for kind=report|query"),
-            ("request_kind", "comms.rs:30 handler routing + auto_close.rs kind gate"),
-            ("success_criteria", "comms.rs:274 appended to delivered message body"),
-            ("context", "comms.rs:277 appended to delivered message body"),
-            ("task_id", "comms.rs:189 enriching-gate + dispatch_hook ci_watch sidecar correlation"),
-            ("correlation_id", "messaging.rs:248 envelope → auto_close_on_report + dispatch_idle"),
-            ("parent_id", "messaging.rs InboxMessage envelope → threading / PTY notify"),
-            ("thread_id", "inbox/storage.rs:933 get_thread grouping"),
-            ("force", "comms.rs:173 busy-gate override"),
-            ("force_reason", "comms.rs:174 force validation + force_meta"),
-            ("second_reviewer", "comms.rs:310 → review_class=\"dual\" on auto-armed watch"),
-            ("second_reviewer_reason", "comms.rs:236 dual-review reason validation"),
-            ("reviewed_head", "messaging.rs:459-480 sha-gate / auto-release verdict"),
-            ("artifacts", "comms.rs:468/491 report body + evidence gate"),
-            ("branch", "comms.rs:302 dispatch_auto_bind_lease → worktree + ci_watch sidecar"),
-            ("worktree_binding_required", "messaging.rs:276 check_worktree_enforcement gate"),
-            ("expect_reply_within_secs", "messaging.rs:497 → dispatch_idle threshold watchdog"),
-            ("next_after_ci", "comms.rs:309 → ci_watch poller fires [ci-ready-for-action]"),
-            ("terminal", "messaging.rs:533 msg.terminal → auto_close_on_report"),
+        // (tool, field, consumption-point cite). `send` keeps the #1911 per-field
+        // cites (its consumption is field-specific); other tools route all declared
+        // fields through one action-dispatch handler, so the handler is the cite.
+        const CONSUMED: &[(&str, &str, &str)] = &[
+            // ── send (verbatim from #1911) ──
+            ("send", "instance", "comms.rs resolve_instance → single-recipient routing"),
+            ("send", "instances", "comms.rs handle_broadcast recipient list"),
+            ("send", "team", "comms.rs handle_broadcast → teams::get_members"),
+            ("send", "tags", "comms.rs is_some() triggers broadcast MODE; value-based tag-targeting NOT implemented"),
+            ("send", "message", "comms.rs task body / lift_message for kind=report|query"),
+            ("send", "request_kind", "comms.rs handler routing + auto_close kind gate"),
+            ("send", "success_criteria", "comms.rs appended to delivered message body"),
+            ("send", "context", "comms.rs appended to delivered message body"),
+            ("send", "task_id", "comms.rs enriching-gate + dispatch_hook ci_watch correlation"),
+            ("send", "correlation_id", "messaging.rs envelope → auto_close_on_report + dispatch_idle"),
+            ("send", "parent_id", "messaging.rs InboxMessage envelope → threading"),
+            ("send", "thread_id", "inbox/storage.rs get_thread grouping"),
+            ("send", "force", "comms.rs busy-gate override"),
+            ("send", "force_reason", "comms.rs force validation + force_meta"),
+            ("send", "second_reviewer", "comms.rs → review_class=dual on auto-armed watch"),
+            ("send", "second_reviewer_reason", "comms.rs dual-review reason validation"),
+            ("send", "reviewed_head", "messaging.rs sha-gate / auto-release verdict"),
+            ("send", "artifacts", "comms.rs report body + evidence gate"),
+            ("send", "branch", "comms.rs dispatch_auto_bind_lease → worktree + ci_watch"),
+            ("send", "worktree_binding_required", "messaging.rs check_worktree_enforcement gate"),
+            ("send", "expect_reply_within_secs", "messaging.rs → dispatch_idle threshold watchdog"),
+            ("send", "next_after_ci", "comms.rs → ci_watch poller fires [ci-ready-for-action]"),
+            ("send", "terminal", "messaging.rs msg.terminal → auto_close_on_report"),
+            // ── task (all fields consumed per action; #1933 audit) ──
+            ("task", "action", "tasks/handler.rs action routing"),
+            ("task", "title", "tasks/handler.rs handle_create"),
+            ("task", "description", "tasks/handler.rs create/update"),
+            ("task", "priority", "tasks/handler.rs create/update"),
+            ("task", "assignee", "tasks/handler.rs create/update owner + routed_to"),
+            ("task", "depends_on", "tasks/handler.rs create dep-blocking"),
+            ("task", "parent_id", "tasks/handler.rs create subtask composition"),
+            ("task", "id", "tasks/handler.rs claim/done/update/metadata target"),
+            ("task", "result", "tasks/handler.rs handle_done"),
+            ("task", "status", "tasks/handler.rs update transition gate"),
+            ("task", "filter_assignee", "tasks/handler.rs list filter"),
+            ("task", "filter_status", "tasks/handler.rs list filter"),
+            ("task", "filter_tag", "tasks/handler.rs list filter"),
+            ("task", "tags", "tasks/handler.rs create/update"),
+            ("task", "include_history", "tasks/handler.rs list opt-in"),
+            ("task", "limit", "tasks/handler.rs list cap"),
+            ("task", "due_at", "tasks/handler.rs create deadline"),
+            ("task", "branch", "tasks/handler.rs create event"),
+            ("task", "force", "tasks/handler.rs done/update ACL bypass"),
+            ("task", "force_reason", "tasks/handler.rs force audit"),
+            ("task", "apply", "tasks/sweep.rs dry-run vs apply"),
+            ("task", "confirm_ids", "tasks/sweep.rs apply subset"),
+            ("task", "audit_reason", "tasks/sweep.rs apply audit"),
+            ("task", "repository", "tasks/sweep.rs PR-state repo override"),
+            ("task", "metadata_key", "tasks/handler.rs metadata_set"),
+            ("task", "metadata_value", "tasks/handler.rs metadata_set"),
+            ("task", "bind", "tasks/handler.rs create → TaskEvent::Created.bind (#1933 declared)"),
+            ("task", "eta_secs", "tasks/handler.rs create → TaskEvent::Created.eta_secs (#1933 declared)"),
+            // ── decision ──
+            ("decision", "action", "decisions.rs routing"),
+            ("decision", "title", "decisions.rs post"),
+            ("decision", "content", "decisions.rs post/update"),
+            ("decision", "scope", "decisions.rs post"),
+            ("decision", "tags", "decisions.rs post/list-filter/update"),
+            ("decision", "ttl_days", "decisions.rs post/update"),
+            ("decision", "supersedes", "decisions.rs post archives prior"),
+            ("decision", "id", "decisions.rs update target"),
+            ("decision", "archive", "decisions.rs update flag"),
+            ("decision", "include_archived", "decisions.rs list"),
+            // ── team ──
+            ("team", "action", "teams.rs routing"),
+            ("team", "name", "teams.rs create/delete/update target"),
+            ("team", "members", "teams.rs create"),
+            ("team", "orchestrator", "teams.rs create/update validated member"),
+            ("team", "description", "teams.rs create/update"),
+            ("team", "repository_path", "teams.rs create/update source_repo"),
+            ("team", "accept_from", "teams.rs create/update cross-team allowlist"),
+            ("team", "add", "teams.rs update add-members"),
+            ("team", "remove", "teams.rs update remove-members"),
+            // ── schedule ──
+            ("schedule", "action", "schedules.rs routing"),
+            ("schedule", "id", "schedules.rs update/delete target"),
+            ("schedule", "cron", "schedules.rs trigger_from_args"),
+            ("schedule", "run_at", "schedules.rs trigger_from_args one-shot"),
+            ("schedule", "message", "schedules.rs create/update"),
+            ("schedule", "instance", "schedules.rs create target / list filter"),
+            ("schedule", "label", "schedules.rs create/update"),
+            ("schedule", "timezone", "schedules.rs cron eval zone"),
+            ("schedule", "enabled", "schedules.rs update"),
+            ("schedule", "fire_strategy", "schedules.rs create/update (#1521)"),
+            ("schedule", "linked_task_id", "schedules.rs until_success gate (#1521)"),
+            // ── deployment ──
+            ("deployment", "action", "deployments.rs routing"),
+            ("deployment", "template", "deployments.rs validate_deploy_args"),
+            ("deployment", "directory", "deployments.rs working-dir override"),
+            ("deployment", "name", "deployments.rs deployment name"),
+            ("deployment", "branch", "deployments.rs per-instance worktree"),
+            // ── ci ──
+            ("ci", "action", "ci/mod.rs routing"),
+            ("ci", "repository", "ci/mod.rs watch/unwatch/status"),
+            ("ci", "branch", "ci/mod.rs handle_watch_ci"),
+            ("ci", "interval_secs", "ci/mod.rs poll interval"),
+            ("ci", "next_after_ci", "ci/mod.rs persisted to watch sidecar"),
+            ("ci", "review_class", "ci/mod.rs dual-review gate (#972)"),
+            ("ci", "ci_provider", "ci/mod.rs provider override"),
+            ("ci", "ci_provider_url", "ci/mod.rs self-hosted base URL"),
+            // ── repo ──
+            ("repo", "action", "ci/mod.rs routing"),
+            ("repo", "pr", "ci/mod.rs handle_merge_repo"),
+            ("repo", "repository", "ci/mod.rs merge slug"),
+            ("repo", "repository_path", "ci/mod.rs checkout source"),
+            ("repo", "branch", "ci/mod.rs checkout worktree target"),
+            ("repo", "path", "ci/mod.rs handle_release_repo (release path)"),
+            ("repo", "instance", "ci/mod.rs cleanup_init_commits target"),
+            ("repo", "bind", "ci/mod.rs checkout atomic-bind gate"),
+            ("repo", "base", "ci/mod.rs cleanup_merged_branches compare ref"),
+            ("repo", "min_age_days", "ci/mod.rs stale_idle threshold"),
+            ("repo", "apply", "ci/mod.rs cleanup_merged dry-run/apply"),
+            ("repo", "confirm_ids", "ci/mod.rs cleanup_merged subset"),
+            ("repo", "audit_reason", "ci/mod.rs cleanup_merged audit"),
+            ("repo", "from_ref", "ci/mod.rs checkout auto-create base"),
+            // ── bind_self ──
+            ("bind_self", "repository_path", "mcp/handlers/worktree.rs preferred source"),
+            ("bind_self", "repository", "mcp/handlers/worktree.rs legacy slug"),
+            ("bind_self", "branch", "mcp/handlers/worktree.rs validated bind branch"),
+            ("bind_self", "rebase_mode", "mcp/handlers/worktree.rs recover-and-bind gate"),
+            // ── release_worktree / force_release_worktree ──
+            ("release_worktree", "instance", "mcp/handlers/worktree.rs release target"),
+            ("release_worktree", "dry_run", "mcp/handlers/worktree.rs preview gate (#1933 declared)"),
+            ("force_release_worktree", "instance", "force_release/mod.rs worktree owner"),
+            ("force_release_worktree", "branch", "force_release/mod.rs worktree subdir"),
+            ("force_release_worktree", "repository_path", "force_release/mod.rs GC enumeration hint"),
+            // ── health ──
+            ("health", "action", "instance.rs report/clear routing"),
+            ("health", "reason", "instance.rs handle_report_health → set_blocked_reason"),
+            ("health", "retry_after_secs", "instance.rs parse_kind → BlockedReason"),
+            ("health", "note", "instance.rs set_blocked_note + query.rs blocked_note (#1933 wired)"),
+            ("health", "instance", "instance.rs handle_clear_blocked_reason target"),
+            // ── set_waiting_on ──
+            ("set_waiting_on", "condition", "api/handlers/instance.rs waiting_on store/clear"),
+            // ── create_instance ──
+            ("create_instance", "name", "instance_spawn.rs spawn name"),
+            ("create_instance", "backend", "instance_spawn.rs spawn backend"),
+            ("create_instance", "args", "instance_spawn.rs extra cmd args"),
+            ("create_instance", "model", "instance_spawn.rs --model flag"),
+            ("create_instance", "working_directory", "instance_spawn.rs validated wd"),
+            ("create_instance", "branch", "instance_spawn.rs worktree::create"),
+            ("create_instance", "task", "instance_spawn.rs delayed inject"),
+            ("create_instance", "layout", "instance_spawn.rs resolve_team_layout"),
+            ("create_instance", "target_pane", "instance_spawn.rs resolve_team_layout"),
+            ("create_instance", "count", "mcp/handlers/instance.rs team-mode count"),
+            ("create_instance", "team", "mcp/handlers/instance.rs team-mode prefix"),
+            ("create_instance", "backends", "mcp/handlers/instance.rs per-member backends"),
+            ("create_instance", "command", "instance_spawn.rs deprecated backend alias"),
+            ("create_instance", "role", "instance_spawn.rs fleet.yaml role"),
+            ("create_instance", "env", "instance_spawn.rs per-instance env (#900)"),
+            ("create_instance", "topic_binding", "instance_spawn.rs telegram topic binding"),
+            // ── replace_instance / restart_instance ──
+            ("replace_instance", "instance", "mcp/handlers/instance.rs replace target"),
+            ("replace_instance", "reason", "mcp/handlers/instance.rs handover message + event"),
+            ("restart_instance", "instance", "mcp/handlers/instance.rs restart target"),
+            ("restart_instance", "mode", "mcp/handlers/instance.rs restart_spawn_params --continue/--resume"),
+            ("restart_instance", "reason", "mcp/handlers/instance.rs restart event"),
+            // ── watchdog / config / mode ──
+            ("watchdog", "action", "mcp/handlers/dispatch.rs snooze/resume/status/ack"),
+            ("watchdog", "duration", "mcp/handlers/dispatch.rs parse_duration_secs (snooze)"),
+            ("config", "action", "mcp/handlers/dispatch.rs get/set/list"),
+            ("config", "key", "mcp/handlers/dispatch.rs runtime_config::get_key/set"),
+            ("config", "value", "mcp/handlers/dispatch.rs runtime_config::set"),
+            ("mode", "action", "mcp/handlers/dispatch.rs get (read-only #1339)"),
         ];
 
-        // (3) Deferred-roadmap passthrough: advertised by design; the Phase-2
-        //     consuming mechanism is deferred. MUST carry a roadmap ref so the
-        //     field is honestly documented, not a silent ghost.
-        const DEFERRED_ALLOWLIST: &[(&str, &str)] = &[
+        // Intentionally-deferred passthrough: advertised by design, Phase-2
+        // consuming mechanism deferred. MUST carry a roadmap ref.
+        const DEFERRED: &[(&str, &str, &str)] = &[
             (
+                "send",
                 "sequencing",
                 "#649 Phase-1 passthrough; Phase-2 task-ordering scheduler deferred",
             ),
             (
+                "send",
                 "eta_minutes",
                 "#649 Phase-1 passthrough; Phase-2 ETA scheduler deferred",
             ),
             (
+                "send",
                 "reporting_cadence",
-                "#649 Phase-1 passthrough; Phase-2 cadence-reminder scheduler deferred",
+                "#649 Phase-1 passthrough; Phase-2 cadence scheduler deferred",
             ),
         ];
 
-        let consumed: BTreeSet<&str> = CONSUMED.iter().map(|(k, _)| *k).collect();
-        let deferred: BTreeSet<&str> = DEFERRED_ALLOWLIST.iter().map(|(k, _)| *k).collect();
+        // The coordination tools this guard enforces (every declared field must be
+        // classified above).
+        const COORDINATION_TOOLS: &[&str] = &[
+            "send",
+            "task",
+            "decision",
+            "team",
+            "schedule",
+            "deployment",
+            "ci",
+            "repo",
+            "bind_self",
+            "release_worktree",
+            "force_release_worktree",
+            "health",
+            "set_waiting_on",
+            "create_instance",
+            "replace_instance",
+            "restart_instance",
+            "watchdog",
+            "config",
+            "mode",
+        ];
 
-        // (4) Forward: every declared field is classified.
-        let unclassified: Vec<&String> = fields
+        // Simple query/display/control tools — not directive-bearing, so their
+        // fields are not classified here. A NEW tool must be added to EXACTLY ONE
+        // of COORDINATION_TOOLS or NON_COORDINATION (drift guard below).
+        const NON_COORDINATION: &[&str] = &[
+            "reply",
+            "download_attachment",
+            "inbox",
+            "list_instances",
+            "delete_instance",
+            "start_instance",
+            "tokens",
+            "interrupt",
+            "set_display_name",
+            "set_description",
+            "move_pane",
+            "pane_snapshot",
+            "tui_screenshot",
+            "restart_daemon",
+            "task_sweep_config",
+            "binding_state",
+            "gc_dry_run",
+        ];
+
+        let defs = tool_definitions();
+        let tools = defs["tools"].as_array().expect("tools array");
+
+        // Drift guard: every registered tool is classified or explicitly excluded.
+        let all_tool_names: BTreeSet<&str> =
+            tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        let classified: BTreeSet<&str> = COORDINATION_TOOLS
             .iter()
-            .filter(|f| !consumed.contains(f.as_str()) && !deferred.contains(f.as_str()))
+            .chain(NON_COORDINATION.iter())
+            .copied()
+            .collect();
+        let unclassified_tools: Vec<&str> = all_tool_names
+            .iter()
+            .filter(|t| !classified.contains(*t))
+            .copied()
             .collect();
         assert!(
-            unclassified.is_empty(),
-            "#1907-followup: `send` schema field(s) {:?} have no consumer and aren't in \
-             the deferred-roadmap allowlist. A bare schema field with no mechanism is a \
-             GHOST — advertised to agents but silently dropped (the \
-             working_directory/requires_reply/task_summary class). Either (a) wire a \
-             consumer and add it to CONSUMED with a consumption-point cite, or (b) if it \
-             is an intentional deferred-roadmap passthrough, add it to DEFERRED_ALLOWLIST \
-             with an issue/roadmap ref.",
-            unclassified
+            unclassified_tools.is_empty(),
+            "#1933: new tool(s) {unclassified_tools:?} are in neither COORDINATION_TOOLS nor \
+             NON_COORDINATION. Add to COORDINATION_TOOLS (and classify every field in CONSUMED/\
+             DEFERRED) if directive-bearing, else NON_COORDINATION."
         );
 
-        // (5) Reverse: no stale CONSUMED/DEFERRED entry (a listed key that the
-        //     schema no longer declares — e.g. after a field removal).
-        for (k, _) in CONSUMED.iter().chain(DEFERRED_ALLOWLIST.iter()) {
+        let consumed: BTreeSet<(&str, &str)> = CONSUMED.iter().map(|(t, f, _)| (*t, *f)).collect();
+        let deferred: BTreeSet<(&str, &str)> = DEFERRED.iter().map(|(t, f, _)| (*t, *f)).collect();
+
+        // Forward: every declared field of every coordination tool is classified.
+        let mut ghosts = Vec::new();
+        for tool in tools {
+            let Some(name) = tool["name"].as_str() else {
+                continue;
+            };
+            if !COORDINATION_TOOLS.contains(&name) {
+                continue;
+            }
+            if let Some(props) = tool["inputSchema"]["properties"].as_object() {
+                for field in props.keys() {
+                    let key = (name, field.as_str());
+                    if !consumed.contains(&key) && !deferred.contains(&key) {
+                        ghosts.push(format!("{name}.{field}"));
+                    }
+                }
+            }
+        }
+        assert!(
+            ghosts.is_empty(),
+            "#1933 ghost-guard: coordination-tool schema field(s) {ghosts:?} have no consumer and \
+             aren't deferred-allowlisted — advertised to agents but silently dropped (the \
+             health.note class). Wire a consumer + add to CONSUMED with a cite, or add to DEFERRED \
+             with a roadmap ref."
+        );
+
+        // Reverse: no stale CONSUMED/DEFERRED entry (a classified field the schema
+        // no longer declares).
+        let declared: BTreeSet<(String, String)> = tools
+            .iter()
+            .filter_map(|t| {
+                let name = t["name"].as_str()?;
+                let props = t["inputSchema"]["properties"].as_object()?;
+                Some(props.keys().map(move |f| (name.to_string(), f.clone())))
+            })
+            .flatten()
+            .collect();
+        for (t, f, _) in CONSUMED.iter().chain(DEFERRED.iter()) {
             assert!(
-                fields.contains(*k),
-                "#1907-followup: `{k}` is listed in CONSUMED/DEFERRED_ALLOWLIST but is no \
-                 longer a `send` schema field — remove the stale entry."
+                declared.contains(&(t.to_string(), f.to_string())),
+                "#1933: `{t}.{f}` is classified but no longer a declared schema field — remove the \
+                 stale entry."
             );
         }
     }
