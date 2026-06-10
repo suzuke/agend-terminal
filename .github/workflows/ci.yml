@@ -235,6 +235,13 @@ jobs:
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          # The action gate still BLOCKS on any real vulnerability — these are
+          # only the WARNING-class advisories with no usable fix (so the PR-UI
+          # audit report stays focused on actionable items). MIRRORS the
+          # rationale in `.cargo/audit.toml` (which the action does NOT read —
+          # it only honors this input — but which keeps local `cargo audit`
+          # consistent). Keep the two lists in sync.
+          ignore: RUSTSEC-2024-0411,RUSTSEC-2024-0412,RUSTSEC-2024-0413,RUSTSEC-2024-0414,RUSTSEC-2024-0415,RUSTSEC-2024-0416,RUSTSEC-2024-0418,RUSTSEC-2024-0419,RUSTSEC-2024-0420,RUSTSEC-2024-0429,RUSTSEC-2024-0370,RUSTSEC-2026-0173
 
   # #686 (F11): maintainer-side QA infrastructure. Runs cargo-llvm-cov on
   # Ubuntu only (cross-platform consistency comes from `check` job; coverage

@@ -1,0 +1,32 @@
+# cargo-audit config (RustSec) for LOCAL `cargo audit` runs. NOTE: the CI
+# `audit` job uses `rustsec/audit-check`, which does NOT read this file — it
+# only honors its own `ignore:` input, so the SAME list is mirrored there
+# (ci.yml, `audit` job). Keep the two in sync. Neither weakens the gate: both
+# still BLOCK on any real vulnerability — these ignores only suppress
+# WARNING-class advisories that have NO usable fix for us, so the audit output
+# stays focused on actionable items. Re-review when the GTK3 stack upgrades.
+
+[advisories]
+ignore = [
+    # ── gtk-rs GTK3 bindings: "no longer maintained", NO fixed version. Pulled
+    #    in only by the `tray` feature (tray-icon / tao GUI stack). Unmaintained,
+    #    not a vulnerability; replacing GTK3 is a separate GUI-stack upgrade task.
+    "RUSTSEC-2024-0411", # gdkwayland-sys — gtk-rs GTK3 unmaintained, no fix (tray-only)
+    "RUSTSEC-2024-0412", # gdk — gtk-rs GTK3 unmaintained, no fix (tray-only)
+    "RUSTSEC-2024-0413", # atk — gtk-rs GTK3 unmaintained, no fix (tray-only)
+    "RUSTSEC-2024-0414", # gdkx11-sys — gtk-rs GTK3 unmaintained, no fix (tray-only)
+    "RUSTSEC-2024-0415", # gtk — gtk-rs GTK3 unmaintained, no fix (tray-only)
+    "RUSTSEC-2024-0416", # atk-sys — gtk-rs GTK3 unmaintained, no fix (tray-only)
+    "RUSTSEC-2024-0418", # gdk-sys — gtk-rs GTK3 unmaintained, no fix (tray-only)
+    "RUSTSEC-2024-0419", # gtk3-macros — gtk-rs GTK3 unmaintained, no fix (tray-only)
+    "RUSTSEC-2024-0420", # gtk-sys — gtk-rs GTK3 unmaintained, no fix (tray-only)
+    # ── glib unsoundness in VariantStrIter. A fix exists (>=0.20.0) but glib is
+    #    pinned to 0.18 by the GTK3 stack above; bumping it requires upgrading the
+    #    whole gtk-rs line to 0.20 → a GUI-stack upgrade task, not isolated-fixable.
+    #    Tray-feature-only. Re-review when GTK3 → 0.20.
+    "RUSTSEC-2024-0429", # glib 0.18 VariantStrIter unsound — fix needs gtk-rs 0.20 (tray-only)
+    # ── proc-macro-error family: unmaintained, NO fixed version. Build-time macro
+    #    dependencies (transitive); no runtime surface. Benign.
+    "RUSTSEC-2024-0370", # proc-macro-error — unmaintained, no fix (build-time, benign)
+    "RUSTSEC-2026-0173", # proc-macro-error2 — unmaintained, no fix (build-time, benign)
+]
