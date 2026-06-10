@@ -174,6 +174,24 @@ impl Backend {
         }
     }
 
+    /// #1948(b): the prompt marker for backends whose EMPTY box renders a
+    /// rotating ghost phrase after the marker in the DIM attribute (so a plain
+    /// `input_prompt_marker` probe mis-reads the ghost as typed content). The
+    /// draft-gate routes these through `input_box_dim_aware_empty`, which uses the
+    /// per-char DIM mask to tell the ghost (dim) from real input (normal).
+    ///
+    /// codex `›`: verified against a raw PTY capture (2026-06-10) — the prompt is
+    /// `ESC[1m›` (bold) and the ghost (`Use /skills …`, `Explain this codebase`,
+    /// …) is `ESC[2m` (dim) on the default colour. Operator confirmed the ghost is
+    /// visually dim and real input is normal/bright, so the dim signal can't
+    /// false-deliver on a real draft. `None` for everyone else.
+    pub fn input_dim_ghost_marker(&self) -> Option<&'static str> {
+        match self {
+            Backend::Codex => Some("›"),
+            _ => None,
+        }
+    }
+
     /// Actual command path to spawn. For [`Backend::Shell`] resolves to
     /// `$SHELL` (falling back to the platform default — `/bin/bash` on Unix,
     /// `cmd.exe` on Windows). For [`Backend::Raw`] returns the literal stored

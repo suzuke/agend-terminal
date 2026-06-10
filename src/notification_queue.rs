@@ -205,6 +205,46 @@ pub fn input_box_empty_probe(
     None
 }
 
+/// #1948(b): empty-box check for a backend (codex) whose EMPTY box renders a
+/// rotating ghost/placeholder phrase after `marker` in the DIM attribute — which
+/// a plain marker probe mis-reads as typed content (the v1 codex blind spot).
+/// `text`/`dim` come from [`crate::vterm::VTerm::tail_lines_with_dim`] and are
+/// 1:1 char-aligned. The marker's own glyph is excluded (codex renders `›` BOLD,
+/// the ghost DIM; the operator's real input is normal intensity).
+///
+/// Returns `Some(true)` if the BOTTOM-MOST marker line has, after the marker,
+/// only whitespace OR only DIM text (ghost → box empty); `Some(false)` if ANY
+/// non-whitespace non-DIM glyph follows (a real live draft → protect); `None` if
+/// no marker line is present (agent mid-output → fail toward protection).
+pub fn input_box_dim_aware_empty(text: &str, dim: &[bool], marker: &str) -> Option<bool> {
+    let chars: Vec<char> = text.chars().collect();
+    // Find the BOTTOM-MOST line whose first non-blank char is the marker, and the
+    // char range of its content AFTER the marker. Char indices align 1:1 with
+    // `dim` (each `\n` contributes one char + one `dim` entry).
+    let mut line_start = 0usize;
+    let mut after_marker: Option<(usize, usize)> = None;
+    for line in text.split('\n') {
+        let line_len = line.chars().count();
+        let line_end = line_start + line_len;
+        if line.trim_start().starts_with(marker) {
+            let leading_ws = line.chars().take_while(|c| c.is_whitespace()).count();
+            let start = line_start + leading_ws + marker.chars().count();
+            after_marker = Some((start, line_end));
+        }
+        line_start = line_end + 1; // +1 for the '\n' separator char
+    }
+    let (start, end) = after_marker?;
+    for i in start..end {
+        if chars.get(i).copied().unwrap_or(' ').is_whitespace() {
+            continue;
+        }
+        if !dim.get(i).copied().unwrap_or(false) {
+            return Some(false); // a normal-intensity glyph after the marker = real input
+        }
+    }
+    Some(true) // only whitespace / only DIM ghost after the marker
+}
+
 /// #1457: pop and return the single OLDEST queued notification, leaving the
 /// rest queued. The escape valve uses this so an abandoned-draft pane trickles
 /// its backlog one-per-tick instead of clobbering the draft with a full batch.
@@ -561,6 +601,53 @@ mod tests {
     fn probe_none_when_neither_marker_nor_placeholder() {
         // Shell/Raw / markerless backend → fall back to timestamp behavior.
         assert_eq!(input_box_empty_probe("$ ", None, None), None);
+    }
+
+    // ── #1948(b): input_box_dim_aware_empty (codex DIM-ghost) ──
+
+    #[test]
+    fn dim_aware_empty_when_ghost_is_dim() {
+        // codex empty box: `› <dim ghost>` — the prompt is bold (idx 0, not dim),
+        // every non-ws char after it is the DIM ghost → box empty (deliver).
+        let text = "› Use /skills to list available skills";
+        let n = text.chars().count();
+        let dim: Vec<bool> = (0..n).map(|i| i != 0).collect();
+        assert_eq!(input_box_dim_aware_empty(text, &dim, "›"), Some(true));
+    }
+
+    #[test]
+    fn dim_aware_nonempty_when_input_is_normal_intensity() {
+        // a real draft: `› my draft` rendered at NORMAL intensity (no dim) → a
+        // non-dim glyph after the marker → real input (protect).
+        let text = "› my half-typed reply";
+        let dim = vec![false; text.chars().count()];
+        assert_eq!(input_box_dim_aware_empty(text, &dim, "›"), Some(false));
+    }
+
+    #[test]
+    fn dim_aware_empty_when_only_whitespace_after_marker() {
+        let text = "some output\n› ";
+        let dim = vec![false; text.chars().count()];
+        assert_eq!(input_box_dim_aware_empty(text, &dim, "›"), Some(true));
+    }
+
+    #[test]
+    fn dim_aware_none_when_no_marker_line() {
+        let text = "just output, no prompt";
+        let dim = vec![false; text.chars().count()];
+        assert_eq!(input_box_dim_aware_empty(text, &dim, "›"), None);
+    }
+
+    #[test]
+    fn dim_aware_uses_bottom_most_marker_line() {
+        // a `›` in DIM prose above + the real input box below at NORMAL intensity
+        // → the bottom-most marker line (real input) decides → Some(false).
+        let text = "› a dim quote in output\n› my real draft";
+        let n = text.chars().count();
+        let nl_char = text.split('\n').next().unwrap_or("").chars().count();
+        // first line (+ its `\n`) dim; second line (real input) normal.
+        let dim: Vec<bool> = (0..n).map(|i| i <= nl_char).collect();
+        assert_eq!(input_box_dim_aware_empty(text, &dim, "›"), Some(false));
     }
 
     /// #1457: submitted (or never-typed) buffer → None → notifications deliver.

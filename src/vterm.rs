@@ -586,6 +586,16 @@ impl VTerm {
         self.tail_lines_impl(n, false).0
     }
 
+    /// #1948(b): the last `n` rows + a per-character DIM-attribute mask aligned
+    /// 1:1 with the returned `String` (a `false` for each `\n` separator). The
+    /// draft-gate uses this to tell codex's DIM empty-box ghost text apart from
+    /// the operator's normal-intensity input — colour-only [`CellFg`] can't,
+    /// because the ghost is dim on the DEFAULT foreground colour.
+    pub fn tail_lines_with_dim(&self, n: usize) -> (String, Vec<bool>) {
+        let (text, _fg, dim) = self.tail_lines_impl(n, true);
+        (text, dim)
+    }
+
     /// #1450: like [`tail_lines`], but also returns a per-character
     /// foreground classification ([`CellFg`]) aligned 1:1 with the `chars()`
     /// of the returned `String` — including a [`CellFg::Default`] entry for
@@ -594,7 +604,8 @@ impl VTerm {
     /// the phrase is rendered red. Building both in one pass guarantees the
     /// mask and the text can never drift out of alignment.
     pub fn tail_lines_with_fg(&self, n: usize) -> (String, Vec<CellFg>) {
-        self.tail_lines_impl(n, true)
+        let (text, fg, _dim) = self.tail_lines_impl(n, true);
+        (text, fg)
     }
 
     /// Shared core for [`tail_lines`] / [`tail_lines_with_fg`]. When
@@ -606,13 +617,19 @@ impl VTerm {
     /// WITHOUT a `\n` — so a single logical line the terminal wrapped across
     /// rows stays one line for the single-line detection regexes (#1808). The
     /// fg mask stays aligned 1:1 with the de-wrapped text.
-    fn tail_lines_impl(&self, n: usize, collect_fg: bool) -> (String, Vec<CellFg>) {
+    fn tail_lines_impl(&self, n: usize, collect_fg: bool) -> (String, Vec<CellFg>, Vec<bool>) {
         let grid = self.term.grid();
         let cols = self.cols as usize;
         let rows = self.rows as usize;
 
         let mut lines: Vec<String> = Vec::with_capacity(rows);
         let mut line_fgs: Vec<Vec<CellFg>> = Vec::with_capacity(rows);
+        // #1948(b): per-char DIM-attribute (`Flags::DIM`) mask, collected
+        // alongside the fg mask (same gate, same alignment). codex renders its
+        // empty-box ghost/placeholder text DIM on the default colour, which the
+        // colour-only `CellFg` can't see — the draft-gate uses this to tell the
+        // ghost apart from the operator's normal-intensity input.
+        let mut line_dims: Vec<Vec<bool>> = Vec::with_capacity(rows);
         // #1808: per-row soft-wrap flag. alacritty sets `WRAPLINE` on the LAST
         // cell of a physical row whose logical line CONTINUES on the next row
         // (its own auto-wrap when text overflows `cols`, NOT a `\n`/cursor-moved
@@ -626,6 +643,7 @@ impl VTerm {
         for row in 0..rows {
             let mut line = String::with_capacity(cols);
             let mut fg: Vec<CellFg> = Vec::new();
+            let mut dim: Vec<bool> = Vec::new();
             let mut col = 0;
             while col < cols {
                 let cell = safe_cell(grid, Line(row as i32), col);
@@ -637,6 +655,7 @@ impl VTerm {
                 line.push(ch);
                 if collect_fg {
                     fg.push(classify_fg(cell.fg));
+                    dim.push(cell.flags.contains(Flags::DIM));
                 }
                 col += 1;
             }
@@ -659,9 +678,11 @@ impl VTerm {
             };
             if collect_fg {
                 fg.truncate(trimmed.chars().count());
+                dim.truncate(trimmed.chars().count());
             }
             lines.push(trimmed.to_string());
             line_fgs.push(fg);
+            line_dims.push(dim);
             wrapped.push(row_wrapped);
         }
 
@@ -678,32 +699,37 @@ impl VTerm {
             .unwrap_or(first);
         let visible = &lines[first..last];
         let visible_fgs = &line_fgs[first..last];
+        let visible_dims = &line_dims[first..last];
         let visible_wrapped = &wrapped[first..last];
 
         let start = visible.len().saturating_sub(n);
         let tail = &visible[start..];
         let tail_fgs = &visible_fgs[start..];
+        let tail_dims = &visible_dims[start..];
         let tail_wrapped = &visible_wrapped[start..];
 
         let mut text = String::new();
         let mut fg_out: Vec<CellFg> = Vec::new();
+        let mut dim_out: Vec<bool> = Vec::new();
         for (i, line) in tail.iter().enumerate() {
             if i > 0 {
-                // #1808: skip the `\n` (and its filler fg cell) when the PREVIOUS
-                // row soft-wrapped into this one — they are one logical line.
+                // #1808: skip the `\n` (and its filler fg/dim cell) when the
+                // PREVIOUS row soft-wrapped into this one — they are one line.
                 if !tail_wrapped[i - 1] {
                     text.push('\n');
                     if collect_fg {
                         fg_out.push(CellFg::Default);
+                        dim_out.push(false);
                     }
                 }
             }
             text.push_str(line);
             if collect_fg {
                 fg_out.extend_from_slice(&tail_fgs[i]);
+                dim_out.extend_from_slice(&tail_dims[i]);
             }
         }
-        (text, fg_out)
+        (text, fg_out, dim_out)
     }
 
     /// Dump current screen as ANSI escape sequences for full redraw.
@@ -1930,6 +1956,19 @@ mod tests {
         vt.render_to_buffer(&mut buf, area, 0, false);
         assert_eq!(buf[(0, 0)].symbol(), "中", "wide char preserved");
         assert_eq!(buf[(1, 0)].symbol(), " ", "spacer blanked per #819");
+    }
+
+    /// #1948(b): the per-char DIM mask tracks the SGR 2 (faint) attribute and
+    /// stays aligned 1:1 with the returned text. This is what lets the draft-gate
+    /// tell codex's dim empty-box ghost apart from normal-intensity input.
+    #[test]
+    fn tail_lines_with_dim_tracks_faint_attribute() {
+        let mut vt = VTerm::new(40, 1);
+        // AB normal, CD dim (SGR 2), EF normal again (SGR 22 clears intensity).
+        vt.process(b"AB\x1b[2mCD\x1b[22mEF");
+        let (text, dim) = vt.tail_lines_with_dim(1);
+        assert_eq!(text, "ABCDEF");
+        assert_eq!(dim, vec![false, false, true, true, false, false]);
     }
 
     /// T6 (#1064, optional dev-2 nit): non-zero area origin still works.
