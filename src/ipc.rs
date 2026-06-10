@@ -82,13 +82,25 @@ pub fn connect_run_dir_api(run_dir: &Path) -> Result<TcpStream> {
     connect_port(port).map_err(Into::into)
 }
 
-/// Connect to a named agent's TUI port.
-pub fn connect_agent(home: &Path, name: &str) -> Result<TcpStream> {
+/// Connect to a named agent's TUI port with a bounded connect timeout. A
+/// crashed / wedged daemon whose port file lingers must not hang the caller —
+/// the attached-mode bridge's 2s agent-roster sync loop would otherwise stall
+/// for the OS-default connect timeout while the daemon is down. Resolves the
+/// active run dir + the agent's port file, then connects with `set_nodelay`.
+pub fn connect_agent_timeout(home: &Path, name: &str, timeout: Duration) -> Result<TcpStream> {
     let run =
         crate::daemon::find_active_run_dir(home).context("no active daemon (run dir not found)")?;
     let port = read_port(&run, name)
         .with_context(|| format!("agent '{name}' port file missing or invalid"))?;
-    connect_port(port).map_err(Into::into)
+    connect_port_timeout(port, timeout).map_err(Into::into)
+}
+
+/// Connect a TcpStream to `127.0.0.1:port` with a bounded connect timeout,
+/// applying TCP_NODELAY. The bounded sibling of [`connect_port`].
+fn connect_port_timeout(port: u16, timeout: Duration) -> io::Result<TcpStream> {
+    let stream = TcpStream::connect_timeout(&SocketAddr::from((LOOPBACK, port)), timeout)?;
+    let _ = stream.set_nodelay(true);
+    Ok(stream)
 }
 
 /// Enumerate agent names whose `*.port` files exist in `run`, excluding the
