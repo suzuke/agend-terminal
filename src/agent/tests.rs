@@ -931,13 +931,21 @@ fn build_command_sets_git_editor_defaults() {
 /// injects `OPENCODE_CONFIG_CONTENT` with `autoupdate:false` — MERGED onto the
 /// user's global config (never replacing it; verified via `opencode debug
 /// config`). Gated to OpenCode: other backends must NOT receive the env.
+///
+/// #1970: the config injection turned out to cover FRESH spawns only — the
+/// daemon-restart respawn (`opencode --continue`) re-popped the modal because
+/// the resume path's `getGlobal()` config does not reflect
+/// OPENCODE_CONFIG_CONTENT. `OPENCODE_DISABLE_AUTOUPDATE` reads a process.env
+/// snapshot taken at opencode startup (binary-verified: same gate, env side
+/// independent of config/session loading), so it covers resume. BOTH spawn
+/// modes must carry BOTH envs.
 #[test]
 fn build_command_disables_opencode_autoupdate_only_for_opencode() {
-    let cfg = |backend_command: &'static str| SpawnConfig {
+    let cfg = |backend_command: &'static str, mode: crate::backend::SpawnMode| SpawnConfig {
         name: "autoupdate-test",
         backend_command,
         args: &[],
-        spawn_mode: crate::backend::SpawnMode::Fresh,
+        spawn_mode: mode,
         cols: 80,
         rows: 24,
         env: None,
@@ -947,25 +955,45 @@ fn build_command_disables_opencode_autoupdate_only_for_opencode() {
         crash_tx: None,
         shutdown: None,
     };
-    // OpenCode → OPENCODE_CONFIG_CONTENT is present and valid JSON disabling autoupdate.
-    let (oc, _) = build_command(&cfg("opencode")).expect("build_command opencode");
-    let content = oc
-        .get_env("OPENCODE_CONFIG_CONTENT")
-        .and_then(|v| v.to_str().map(String::from))
-        .expect("opencode spawn env must set OPENCODE_CONFIG_CONTENT");
-    let parsed: serde_json::Value =
-        serde_json::from_str(&content).expect("OPENCODE_CONFIG_CONTENT must be valid JSON");
-    assert_eq!(
-        parsed["autoupdate"],
-        serde_json::json!(false),
-        "must disable opencode autoupdate, got {content}"
-    );
-    // Non-OpenCode backends must NOT receive the env (no cross-backend leakage).
+    // OpenCode, BOTH spawn modes (#1970: the restart respawn is Resume —
+    // `--continue` — and is exactly the path the modal recurred on):
+    // OPENCODE_CONFIG_CONTENT valid JSON disabling autoupdate AND the
+    // resume-proof OPENCODE_DISABLE_AUTOUPDATE=1.
+    for mode in [
+        crate::backend::SpawnMode::Fresh,
+        crate::backend::SpawnMode::Resume,
+    ] {
+        let (oc, _) = build_command(&cfg("opencode", mode)).expect("build_command opencode");
+        let content = oc
+            .get_env("OPENCODE_CONFIG_CONTENT")
+            .and_then(|v| v.to_str().map(String::from))
+            .expect("opencode spawn env must set OPENCODE_CONFIG_CONTENT");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&content).expect("OPENCODE_CONFIG_CONTENT must be valid JSON");
+        assert_eq!(
+            parsed["autoupdate"],
+            serde_json::json!(false),
+            "must disable opencode autoupdate, got {content}"
+        );
+        assert_eq!(
+            oc.get_env("OPENCODE_DISABLE_AUTOUPDATE")
+                .and_then(|v| v.to_str()),
+            Some("1"),
+            "#1970: {mode:?} spawn must carry OPENCODE_DISABLE_AUTOUPDATE=1 (the \
+             resume-proof gate)"
+        );
+    }
+    // Non-OpenCode backends must NOT receive either env (no cross-backend leakage).
     for cmd in ["claude", "codex", "echo"] {
-        let (c, _) = build_command(&cfg(cmd)).expect("build_command");
+        let (c, _) =
+            build_command(&cfg(cmd, crate::backend::SpawnMode::Fresh)).expect("build_command");
         assert!(
             c.get_env("OPENCODE_CONFIG_CONTENT").is_none(),
             "{cmd} must not receive OPENCODE_CONFIG_CONTENT"
+        );
+        assert!(
+            c.get_env("OPENCODE_DISABLE_AUTOUPDATE").is_none(),
+            "{cmd} must not receive OPENCODE_DISABLE_AUTOUPDATE"
         );
     }
 }

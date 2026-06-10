@@ -830,6 +830,19 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
     // to OpenCode (same self-modification-footgun discipline as the XDG block).
     if matches!(detected_backend, Some(Backend::OpenCode)) {
         cmd.env("OPENCODE_CONFIG_CONTENT", r#"{"autoupdate":false}"#);
+        // #1970: the config injection above covers FRESH spawns but NOT the
+        // daemon-restart respawn (`opencode --continue`): on the resume path
+        // the update-check's `getGlobal()` config does not reflect
+        // OPENCODE_CONFIG_CONTENT, so the modal came back on every daemon
+        // restart. Binary-verified (opencode 1.15.13): the check is a single
+        // function gated `if (config.autoupdate === false ||
+        // env.OPENCODE_DISABLE_AUTOUPDATE) return;`, the env side reads a
+        // process.env snapshot taken at startup (independent of config/session
+        // loading), and the update modal is driven exclusively by the
+        // `installation.update-available` event emitted AFTER that gate — so
+        // the env covers resume where the config side could not. Keep BOTH:
+        // config as the documented belt, env as the resume-proof suspenders.
+        cmd.env("OPENCODE_DISABLE_AUTOUPDATE", "1");
     }
 
     // Add agend-terminal binary + $AGEND_HOME/bin (shim) to PATH.
