@@ -228,6 +228,11 @@ mod tests {
         with_env_and_reset(
             &[],
             &[
+                // #1964 drive-by (env false-fail): AGEND_RESTART_HANDOFF is now
+                // set fleet-wide (#1814 Stage 1 deployed) — without clearing it
+                // this test takes the self-respawn branch instead of the
+                // fail-closed one and fake-FAILs on every fleet agent.
+                "AGEND_RESTART_HANDOFF",
                 "AGEND_WRAPPED",
                 "AGEND_SUPERVISED",
                 "INVOCATION_ID",

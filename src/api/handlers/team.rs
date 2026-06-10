@@ -44,6 +44,45 @@ pub(crate) fn handle_update_team(params: &Value, ctx: &HandlerCtx) -> Value {
     json!({"ok": true, "result": result})
 }
 
+/// #1964 Bug 1: plan `count` member names for `team` as `<team>-N`. Names
+/// were index-based (`{team}-{i+1}`), restarting at 1 on EVERY call — a second
+/// `create_instance(team=X)` re-picked X-1 and failed "agent already exists"
+/// instead of incrementing. Numbering starts at one past the max existing
+/// `<team>-N` in fleet.yaml (never re-filling gaps, so a freed number is not
+/// resurrected) and skips any candidate still held by fleet.yaml (an entry
+/// that exists but is not running would be silently overwritten by
+/// `add_instances_to_yaml`) or by the live registry (`taken`, #1441
+/// UUID-keyed).
+fn plan_member_names(
+    fleet: &crate::fleet::FleetConfig,
+    team: &str,
+    count: usize,
+    taken: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    let prefix = format!("{team}-");
+    let mut next_n: u64 = fleet
+        .instances
+        .keys()
+        .filter_map(|k| k.strip_prefix(&prefix)?.parse::<u64>().ok())
+        .max()
+        .map_or(1, |m| m + 1);
+    let mut names = Vec::with_capacity(count);
+    while names.len() < count {
+        let candidate = format!("{team}-{next_n}");
+        next_n += 1;
+        if fleet.instances.contains_key(&candidate) || taken(&candidate) {
+            tracing::info!(
+                team,
+                member = %candidate,
+                "CREATE_TEAM: name taken — advancing to the next number (#1964)"
+            );
+            continue;
+        }
+        names.push(candidate);
+    }
+    names
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
     let team_name = match params["name"].as_str() {
@@ -69,26 +108,31 @@ pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
         "CREATE_TEAM begin"
     );
 
+    // #1964: snapshot fleet.yaml once — Bug-1 numbering scans its instance
+    // names, Bug-2 roster routing checks team existence against it.
+    let fleet_snapshot = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(ctx.home))
+        .unwrap_or_default();
+    let team_already_exists = fleet_snapshot.teams.contains_key(team_name);
+
     // Phase 1 — plan every member's fleet.yaml entry (name, backend, dir)
     // before any spawn happens. The full list is written to fleet.yaml
     // before Phase 2 so prepare_instructions sees the complete peer set
     // when generating each member's agend.md.
+    //
+    // #1964 Bug 1: member names were index-based (`{team}-{i+1}`), restarting
+    // at 1 on EVERY call — a second `create_instance(team=X)` re-picked X-1
+    // and failed "agent already exists" instead of incrementing. Start from
+    // (max existing `<team>-N` in fleet.yaml) + 1 and skip any name still
+    // held by fleet.yaml (an entry that exists but isn't running would be
+    // silently overwritten by add_instances_to_yaml) or by the live registry
+    // (#1441: UUID-keyed, resolve via fleet.yaml).
+    let names = plan_member_names(&fleet_snapshot, team_name, per_member_backends.len(), |c| {
+        crate::fleet::resolve_uuid(ctx.home, c)
+            .is_some_and(|id| crate::agent::lock_registry(ctx.registry).contains_key(&id))
+    });
     let mut planned: Vec<(String, String, std::path::PathBuf)> = Vec::new(); // (name, backend, work_dir)
     let mut failed: Vec<String> = Vec::new();
-    for (i, backend) in per_member_backends.iter().enumerate() {
-        let inst_name = format!("{team_name}-{}", i + 1);
-        // Dedup: re-creating a team with an existing name would otherwise
-        // overwrite the registry entry and orphan the previous tab's PTY
-        // subscription.
-        // #1441: registry is UUID-keyed; resolve name via fleet.yaml to detect
-        // an existing-member collision.
-        if crate::fleet::resolve_uuid(ctx.home, &inst_name)
-            .is_some_and(|id| crate::agent::lock_registry(ctx.registry).contains_key(&id))
-        {
-            tracing::warn!(team = team_name, member = %inst_name, "CREATE_TEAM skip: name already exists");
-            failed.push(format!("{inst_name}: agent already exists"));
-            continue;
-        }
+    for (inst_name, backend) in names.into_iter().zip(per_member_backends.iter()) {
         let work_dir = crate::paths::workspace_dir(ctx.home).join(&inst_name);
         planned.push((inst_name, backend.clone(), work_dir));
     }
@@ -243,10 +287,54 @@ pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
     if let Some(af) = params.get("accept_from") {
         team_params["accept_from"] = af.clone();
     }
-    let result = crate::teams::create(ctx.home, &team_params);
+    // #1964 Bug 2: when the team ALREADY exists (the create_instance(team=X)
+    // grow-the-team use case), `teams::create` errors "team already exists" —
+    // and that error was swallowed into `result` while the members had ALREADY
+    // spawned: named `X-N` but never written to the roster, so
+    // `find_team_for` read team=None and the send policy cross-team-blocked
+    // same-team traffic. Route the roster write through `teams::update(add)`
+    // instead (same fleet.yaml `teams:` store the send policy reads — one
+    // write path, one read path). New-team creation is unchanged.
+    let result = if team_already_exists {
+        tracing::info!(
+            team = team_name,
+            adding = ?all_members,
+            "CREATE_TEAM: team exists — extending roster (#1964)"
+        );
+        let mut update_params = json!({
+            "name": team_name,
+            "add": all_members,
+        });
+        if let Some(orch) = params.get("orchestrator").and_then(|v| v.as_str()) {
+            update_params["orchestrator"] = json!(orch);
+        }
+        crate::teams::update(ctx.home, &update_params)
+    } else {
+        crate::teams::create(ctx.home, &team_params)
+    };
+    // Surface a roster-write failure honestly: the members are spawned but
+    // team-less (the exact #1964 silent shape) — ok:false lets the caller see
+    // it instead of a fake success.
+    if let Some(err) = result.get("error").and_then(|e| e.as_str()) {
+        tracing::warn!(team = team_name, error = %err, "CREATE_TEAM roster write failed — spawned members are NOT on the team roster");
+        return json!({
+            "ok": false,
+            "error": format!("members spawned but roster write failed: {err}"),
+            "spawned": &spawned_names,
+        });
+    }
 
     if let Some(n) = ctx.notifier {
-        if !all_members.is_empty() {
+        if team_already_exists {
+            if !spawned_names.is_empty() {
+                tracing::info!(team = team_name, added = ?spawned_names, "CREATE_TEAM emitting TeamMembersChanged (extend)");
+                n.notify(ApiEvent::TeamMembersChanged {
+                    name: team_name.to_string(),
+                    added: spawned_names.clone(),
+                    removed: Vec::new(),
+                });
+            }
+        } else if !all_members.is_empty() {
             tracing::info!(team = team_name, members = ?all_members, "CREATE_TEAM emitting TeamCreated");
             n.notify(ApiEvent::TeamCreated {
                 name: team_name.to_string(),
@@ -356,6 +444,146 @@ mod tests {
             team.accept_from
         );
 
+        std::fs::remove_dir_all(&home).ok();
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests_1964 {
+    use super::*;
+    use parking_lot::Mutex;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn tmp_home(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static C: AtomicU32 = AtomicU32::new(0);
+        let id = C.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("agend-1964-{}-{}-{}", tag, std::process::id(), id));
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    }
+
+    fn test_ctx(home: &std::path::Path) -> HandlerCtx<'_> {
+        let registry: &'static crate::agent::AgentRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let configs: &'static crate::api::ConfigRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let externals: &'static crate::agent::ExternalRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        HandlerCtx {
+            registry,
+            configs,
+            externals,
+            notifier: None,
+            home,
+        }
+    }
+
+    /// #1964 Bug 1: numbering starts past the max existing `<team>-N` in
+    /// fleet.yaml (no per-call restart at 1), never re-fills gaps (a freed
+    /// number is not resurrected), skips registry-held names, and ignores
+    /// non-numeric member names.
+    #[test]
+    fn plan_member_names_increments_past_existing_1964() {
+        let mut fleet = crate::fleet::FleetConfig::default();
+        for existing in ["sqd-1", "sqd-7", "sqd-lead", "other-3"] {
+            fleet.instances.insert(
+                existing.to_string(),
+                crate::fleet::InstanceConfig::default(),
+            );
+        }
+        // Consecutive two-member plan: 8, 9 (max=7 → +1; the gap 2-6 is NOT
+        // reused; "sqd-lead"/"other-3" don't poison the parse).
+        let names = plan_member_names(&fleet, "sqd", 2, |_| false);
+        assert_eq!(names, vec!["sqd-8".to_string(), "sqd-9".to_string()]);
+
+        // A registry-held (running but yaml-less) candidate is skipped too.
+        let names = plan_member_names(&fleet, "sqd", 1, |c| c == "sqd-8");
+        assert_eq!(names, vec!["sqd-9".to_string()]);
+
+        // Fresh team: starts at 1 and increments WITHIN one call.
+        let names = plan_member_names(&fleet, "fresh", 2, |_| false);
+        assert_eq!(names, vec!["fresh-1".to_string(), "fresh-2".to_string()]);
+    }
+
+    /// #1964 Bug 2 (the live repro shape): CREATE_TEAM on an EXISTING team
+    /// extends the roster via teams::update(add) — the member lands where the
+    /// send policy reads (`teams::find_team_for` over the same fleet.yaml
+    /// `teams:` block), so same-team direct send is no longer cross-team
+    /// blocked. Pre-fix `teams::create` errored "already exists", the error
+    /// was swallowed, and the member stayed team=None. Real fleet.yaml WITH
+    /// ids (#1680 lesson: an id-less home lets split read/write paths
+    /// converge and hide).
+    #[test]
+    fn create_team_on_existing_team_extends_roster_1964() {
+        let home = tmp_home("extend");
+        let lead_id = crate::types::InstanceId::new();
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            format!(
+                "instances:\n  sqd-lead:\n    id: {}\nteams:\n  sqd:\n    members: [sqd-lead]\n    orchestrator: sqd-lead\n",
+                lead_id.full()
+            ),
+        )
+        .unwrap();
+        let ctx = test_ctx(&home);
+
+        // count=0 + pre-listed member = the no-spawn seam the #1833 test uses;
+        // the roster-routing under test is identical for spawned members
+        // (all_members = existing ++ spawned).
+        let resp = handle_create_team(&json!({"name": "sqd", "members": ["sqd-9"]}), &ctx);
+        assert_eq!(resp["ok"], true, "extend must succeed: {resp}");
+
+        // The send policy's read path (find_team_for over fleet.yaml teams)
+        // must see the new member on the SAME team as the lead.
+        let member_team = crate::teams::find_team_for(&home, "sqd-9")
+            .expect("#1964: extended member must be on a team (was team=None)");
+        assert_eq!(member_team.name, "sqd");
+        let lead_team = crate::teams::find_team_for(&home, "sqd-lead").unwrap();
+        assert_eq!(
+            lead_team.name, member_team.name,
+            "#1964: lead and new member same team → same-team send not blocked"
+        );
+        // Existing roster untouched (extend, not clobber).
+        assert!(member_team.members.contains(&"sqd-lead".to_string()));
+        assert_eq!(
+            member_team.orchestrator.as_deref(),
+            Some("sqd-lead"),
+            "existing orchestrator preserved"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1964: a roster-write failure no longer masquerades as success — the
+    /// handler returns ok:false naming the spawned-but-rosterless members
+    /// (pre-fix: ok:true with the error buried in `result`, which the MCP
+    /// layer then dropped entirely).
+    #[test]
+    fn create_team_roster_write_failure_surfaces_1964() {
+        let home = tmp_home("surface");
+        // Member already on ANOTHER team → teams::update(add) rejects
+        // (one-agent-one-team) → the handler must surface ok:false.
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances: {}\nteams:\n  sqd:\n    members: []\n  rival:\n    members: [taken-1]\n",
+        )
+        .unwrap();
+        let ctx = test_ctx(&home);
+        let resp = handle_create_team(&json!({"name": "sqd", "members": ["taken-1"]}), &ctx);
+        assert_eq!(
+            resp["ok"], false,
+            "#1964: roster-write failure must not report success: {resp}"
+        );
+        assert!(
+            resp["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("roster write failed"),
+            "error names the failure: {resp}"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }
