@@ -315,6 +315,7 @@ mod tests {
                 health_state: String::new(),
                 agent_state: state.to_string(),
                 silent_secs: 0,
+                output_silent_secs: 0,
             }],
         );
     }

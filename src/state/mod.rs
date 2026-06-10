@@ -1927,6 +1927,16 @@ impl StateTracker {
     /// (`last_productive_output == None`), the baseline is `created_at` — i.e. it
     /// has been productive-silent since it started. This preserves the pre-Option
     /// behavior exactly (the field used to be stamped `now()` at creation).
+    /// #1961 phase-2: seconds since the pane CONTENT last changed (raw screen
+    /// hash delta — `last_output` is bumped only when `feed`'s screen hash
+    /// differs, so cursor-blink/no-op chatter does NOT reset it, but token
+    /// streaming / spinner frames / tool output DO). Classification-free: this
+    /// is the activity signal that survives a state-detector mis-read (the
+    /// #1961 false-fire put a code-writing agent at agent_state=idle).
+    pub fn output_silence(&self) -> Duration {
+        self.last_output.elapsed()
+    }
+
     pub fn productive_silence(&self) -> Duration {
         self.last_productive_output
             .unwrap_or(self.created_at)

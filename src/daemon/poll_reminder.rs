@@ -371,6 +371,7 @@ mod tests {
                 health_state: "Healthy".to_string(),
                 agent_state: "thinking".to_string(),
                 silent_secs: 0,
+                output_silent_secs: 0,
             }],
         );
     }

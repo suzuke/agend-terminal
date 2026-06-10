@@ -735,6 +735,22 @@ fn target_is_working(
                 a.agent_state.as_str(),
                 "thinking" | "tool_use" | "server_rate_limit"
             ) || a.silent_secs < silence_threshold_secs
+                // #1961 phase-2 (4th OR, fail-toward-suppress): the pane
+                // CONTENT changed within the window (raw screen-hash delta,
+                // `output_silent_secs`) — an activity signal that does NOT
+                // depend on state classification. The production false-fire
+                // had agent_state="idle" (detector mis-read a code-writing
+                // claude 3 scans straight), silent_secs=i64::MAX (productive
+                // markers missed), heartbeat 734s — all three gates slipped
+                // because all three sit on the same fragile classification;
+                // a streaming/working pane keeps changing regardless.
+                // Spinner-vs-hung: a spinner animating = the backend is still
+                // running = dispatch-idle ("you've gone silent, status?")
+                // correctly stays quiet; a genuinely HUNG agent is the
+                // hang_detector's job (productive-silence), not this
+                // watchdog's. Old-format snapshots default the field to MAX →
+                // no suppression (fail-open to firing, same as silent_secs).
+                || a.output_silent_secs < silence_threshold_secs
         })
         .unwrap_or(false);
     if snapshot_working {
@@ -941,8 +957,15 @@ pub(crate) fn scan_and_emit(home: &Path) {
                     .map(|a| a.agent_state.as_str())
                     .unwrap_or("<no-snapshot>"),
                 silent_secs = ?snap_agent.map(|a| a.silent_secs),
-                heartbeat_age_ms = now_ms.saturating_sub(hb.heartbeat_at_ms),
-                last_input_age_ms = now_ms.saturating_sub(hb.last_input_at_ms),
+                output_silent_secs = ?snap_agent.map(|a| a.output_silent_secs),
+                // #1961 phase-2 instrument fix: an unset pair field is 0, and
+                // `now - 0` printed as an "age" reads like an absolute
+                // epoch-ms timestamp (the phase-1 readout confusion). Print
+                // None for never-set instead of a bogus huge age.
+                heartbeat_age_ms = ?(hb.heartbeat_at_ms != 0)
+                    .then(|| now_ms.saturating_sub(hb.heartbeat_at_ms)),
+                last_input_age_ms = ?(hb.last_input_at_ms != 0)
+                    .then(|| now_ms.saturating_sub(hb.last_input_at_ms)),
                 "#1961: dispatch_idle firing — work-aware suppress signals at fire time (diagnose which slipped)"
             );
             emit_exceeded_event(home, &current, elapsed_secs);
@@ -2682,6 +2705,19 @@ mod tests {
         agent_state: &str,
         silent_secs: i64,
     ) -> crate::snapshot::AgentSnapshot {
+        // #1961 phase-2: pane-change signal FAIL-CLOSED (no recent change) in
+        // the legacy fixtures so every pre-existing gate test exercises the
+        // original three signals unchanged; pane-delta tests use
+        // [`mk_agent_snapshot_pane`].
+        mk_agent_snapshot_pane(name, agent_state, silent_secs, i64::MAX)
+    }
+
+    fn mk_agent_snapshot_pane(
+        name: &str,
+        agent_state: &str,
+        silent_secs: i64,
+        output_silent_secs: i64,
+    ) -> crate::snapshot::AgentSnapshot {
         crate::snapshot::AgentSnapshot {
             name: name.to_string(),
             backend_command: "opencode".to_string(),
@@ -2691,7 +2727,64 @@ mod tests {
             health_state: "healthy".to_string(),
             agent_state: agent_state.to_string(),
             silent_secs,
+            output_silent_secs,
         }
+    }
+
+    /// #1961 phase-2 — THE production false-fire shape: the state-detector
+    /// mis-reads a code-writing agent as "idle", productive markers missed
+    /// (silent_secs=MAX), no MCP heartbeat — all three legacy gates slip. The
+    /// pane CONTENT is changing (token streaming → screen-hash delta), so the
+    /// classification-free 4th signal must suppress.
+    #[test]
+    fn pane_change_suppresses_when_all_state_signals_slip_1961() {
+        const T: i64 = 600;
+        let snap = crate::snapshot::FleetSnapshot {
+            timestamp: "t".to_string(),
+            agents: vec![mk_agent_snapshot_pane(
+                "misread",
+                "idle",
+                i64::MAX, // detector says idle, markers missed
+                10,       // …but the pane changed 10s ago (streaming)
+            )],
+        };
+        assert!(
+            target_is_working(Some(&snap), "misread", T),
+            "#1961: a recently-changing pane must suppress even when every \
+             classification-based signal reads idle/silent"
+        );
+    }
+
+    /// #1961 phase-2 fail-toward-fire: a genuinely idle agent — pane completely
+    /// static past the window, all other signals idle — must STILL fire (the
+    /// new signal only ADDS suppression, never blocks a real stuck).
+    #[test]
+    fn truly_static_pane_still_fires_1961() {
+        const T: i64 = 600;
+        let snap = crate::snapshot::FleetSnapshot {
+            timestamp: "t".to_string(),
+            agents: vec![mk_agent_snapshot_pane(
+                "stuck",
+                "idle",
+                i64::MAX, // not productive
+                i64::MAX, // pane has not changed at all
+            )],
+        };
+        assert!(
+            !target_is_working(Some(&snap), "stuck", T),
+            "#1961: a fully-static pane keeps firing — the pane signal must not \
+             hide a real stuck"
+        );
+        // Old-format snapshot (field missing → serde default MAX) behaves the
+        // same: fail-open to firing.
+        let legacy = crate::snapshot::FleetSnapshot {
+            timestamp: "t".to_string(),
+            agents: vec![mk_agent_snapshot_silence("legacy", "idle", i64::MAX)],
+        };
+        assert!(
+            !target_is_working(Some(&legacy), "legacy", T),
+            "fail-closed fixture (= old-format default) must not suppress"
+        );
     }
 
     /// #1694②: the gate reads the productive-SILENCE clock, not the

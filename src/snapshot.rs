@@ -27,6 +27,14 @@ pub struct AgentSnapshot {
     /// fires rather than silently suppressing a possible stuck.
     #[serde(default = "default_silent_secs")]
     pub silent_secs: i64,
+    /// #1961 phase-2: seconds since the pane CONTENT last changed (raw screen
+    /// hash delta, `StateTracker::output_silence` — classification-free). The
+    /// dispatch-idle suppress reads this as its state-detector-independent
+    /// activity signal: a streaming/working pane keeps changing even when the
+    /// detector mis-classifies the agent as idle (the #1961 false-fire).
+    /// `serde(default)` fails OPEN (huge value = "no recent change" → fire).
+    #[serde(default = "default_silent_secs")]
+    pub output_silent_secs: i64,
 }
 
 /// Fail-open default for a snapshot missing `silent_secs` (old-format / boot
@@ -99,6 +107,7 @@ mod tests {
             health_state: "healthy".to_string(),
             agent_state: state.to_string(),
             silent_secs: 0,
+            output_silent_secs: 0,
         }
     }
 

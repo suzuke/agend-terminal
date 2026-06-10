@@ -37,7 +37,7 @@ impl PerTickHandler for SnapshotRotationHandler {
         let snapshots: Vec<_> = reg
             .values()
             .map(|handle| {
-                let (agent_state, health_state, silent_secs) = {
+                let (agent_state, health_state, silent_secs, output_silent_secs) = {
                     let c = handle.core.lock();
                     (
                         c.state.get_state().display_name().to_string(),
@@ -45,6 +45,10 @@ impl PerTickHandler for SnapshotRotationHandler {
                         // #1694②: productive-silence for the dispatch-idle
                         // silence-clock (marker/heartbeat-gated, spinner-resistant).
                         c.state.productive_silence().as_secs() as i64,
+                        // #1961 phase-2: raw pane-change silence (screen-hash
+                        // delta, classification-free) for the dispatch-idle
+                        // pane-activity suppress.
+                        c.state.output_silence().as_secs() as i64,
                     )
                 };
                 let cfg = cfgs.get(handle.name.as_str());
@@ -59,6 +63,7 @@ impl PerTickHandler for SnapshotRotationHandler {
                     health_state,
                     agent_state,
                     silent_secs,
+                    output_silent_secs,
                 }
             })
             .collect();
