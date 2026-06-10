@@ -817,6 +817,21 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
         cmd.env("XDG_DATA_HOME", &data_dir);
     }
 
+    // #1956: disable opencode's interactive self-update prompt. opencode pops a
+    // "A newer release is available. Would you like to update now?" modal on
+    // startup/idle when a newer release exists — it hangs the ENTIRE pane (the
+    // agent can't receive or answer any dispatch; an ESC mis-fires Confirm and
+    // self-updates mid-session). There is no `--no-update` CLI flag, but opencode
+    // MERGES `OPENCODE_CONFIG_CONTENT` on top of the user's global
+    // `~/.config/opencode/opencode.json` (verified MERGE, not replace, via
+    // `opencode debug config` — the user's provider/auth config is preserved),
+    // and its config schema has an `autoupdate` field. Inject it inline so
+    // nothing lands on disk and the user's global config is never touched. Gated
+    // to OpenCode (same self-modification-footgun discipline as the XDG block).
+    if matches!(detected_backend, Some(Backend::OpenCode)) {
+        cmd.env("OPENCODE_CONFIG_CONTENT", r#"{"autoupdate":false}"#);
+    }
+
     // Add agend-terminal binary + $AGEND_HOME/bin (shim) to PATH.
     // Shim dir goes first so agend-git shadows /usr/bin/git.
     if let Ok(exe) = std::env::current_exe() {
