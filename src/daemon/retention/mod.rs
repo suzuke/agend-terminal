@@ -51,12 +51,18 @@ impl RetentionSupervisor {
         // Drop terminal dispatch_tracking rows (completed/orphaned) each cycle so
         // they don't accumulate until the 30-day gc_old_entries backstop.
         let tracking_swept = crate::dispatch_tracking::sweep_terminal_entries(home);
+        // #1969: passively GC the ci-handoff per-key `.lock` (never unlinked on
+        // resolve — keys are reused → unlink-on-resolve is a flock race) and
+        // crash-leftover `.tmp` sidecars, by mtime + orphan check.
+        let ci_handoff_swept =
+            crate::daemon::ci_handoff_track::gc_orphan_sidecars(home, std::time::SystemTime::now());
 
         tracing::info!(
             decisions = decisions_swept,
             dispatches = dispatches_swept,
             tracking = tracking_swept,
             worktrees = worktrees_swept,
+            ci_handoff = ci_handoff_swept,
             "retention sweep: cycle complete"
         );
         crate::event_log::log(
@@ -64,7 +70,7 @@ impl RetentionSupervisor {
             "retention_sweep",
             "supervisor",
             &format!(
-                "decisions={decisions_swept} dispatches={dispatches_swept} tracking={tracking_swept} worktrees={worktrees_swept}"
+                "decisions={decisions_swept} dispatches={dispatches_swept} tracking={tracking_swept} worktrees={worktrees_swept} ci_handoff={ci_handoff_swept}"
             ),
         );
     }

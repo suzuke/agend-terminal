@@ -100,7 +100,7 @@ pub(crate) fn scan_and_emit_with<F>(
     let mut renudged_this_scan: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     {
-        for track in &tracks {
+        for (_path, track) in &tracks {
             let target = &track.target;
             // Orphan guard: the target left the fleet — nothing to nudge; the
             // 24h sweep reaps the file.
@@ -175,7 +175,7 @@ pub(crate) fn scan_and_emit_with<F>(
                         // TRACKS — the handoff message itself may already be read
                         // (that no longer stops the re-nudge), so the unread count
                         // would say 0 and mislead.
-                        let pending = tracks.iter().filter(|t| &t.target == target).count();
+                        let pending = tracks.iter().filter(|(_, t)| &t.target == target).count();
                         renudge(target, pending);
                     }
                 }

@@ -73,24 +73,50 @@ fn dir(home: &Path) -> PathBuf {
     home.join("ci-handoff-tracks")
 }
 
-/// Filename-safe key: one file per `(target, correlation)`.
+/// Filename-safe key: one file per `(target, correlation)`. #1969: a trailing
+/// `--<8 hex of sha256(target\0correlation)>` disambiguates keys that the lossy
+/// sanitize would otherwise collapse to the SAME name (e.g. `a/b` vs `a_b` both
+/// sanitize to `a_b`), so distinct keys never share a track / lock / tmp file.
+/// The sanitized parts stay for operator readability; the hash guarantees
+/// injectivity. (NOTE: `resolve`/`sweep` delete the ACTUAL `list()`-supplied
+/// path, not a `file_for` reconstruction — #1969 (X) — so a track written under
+/// an OLDER filename encoding is still resolvable after this change; `file_for`
+/// only names NEW writes + the per-key lock.)
 fn file_for(home: &Path, target: &str, correlation: &str) -> PathBuf {
-    let sanitize = |s: &str| {
-        s.chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect::<String>()
-    };
     dir(home).join(format!(
-        "{}--{}.json",
-        sanitize(target),
-        sanitize(correlation)
+        "{}--{}--{}.json",
+        sanitize_component(target),
+        sanitize_component(correlation),
+        key_hash(target, correlation)
     ))
+}
+
+/// Map an arbitrary key part to a filename-safe, human-readable component.
+/// Lossy (collisions possible) — `file_for` adds [`key_hash`] for injectivity.
+fn sanitize_component(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// #1969: 8-hex sha256 of the RAW (un-sanitized) `(target, correlation)`, joined
+/// with a NUL byte (which can't appear in an agent name or `owner/repo@branch`)
+/// so the digest is an injective per-key disambiguator for [`file_for`]. sha2 is
+/// already a dependency (blake3 is not) — 32 bits is ample for the handful of
+/// in-flight CI handoffs, and it only has to break ties the sanitize created.
+fn key_hash(target: &str, correlation: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(target.as_bytes());
+    h.update([0u8]);
+    h.update(correlation.as_bytes());
+    hex::encode(&h.finalize()[..4])
 }
 
 /// #1963: per-key lock sidecar — a SEPARATE file from the track. `record`'s
@@ -132,16 +158,25 @@ fn atomic_write_track(path: &Path, track: &CiHandoffTrack) -> std::io::Result<()
 /// no TOCTOU. Returns true iff a matching track was removed. Lock-acquire failure
 /// → `false` (skip the delete rather than risk an unsynchronized one — a missed
 /// resolution just leaves the track for the next signal / 24h backstop).
-fn remove_if_unchanged(home: &Path, target: &str, correlation: &str, expect_sent_at: &str) -> bool {
+fn remove_if_unchanged(
+    home: &Path,
+    path: &Path,
+    target: &str,
+    correlation: &str,
+    expect_sent_at: &str,
+) -> bool {
     let Ok(_lock) = crate::store::acquire_file_lock(&lock_for(home, target, correlation)) else {
         return false;
     };
-    let path = file_for(home, target, correlation);
-    let current = std::fs::read(&path)
+    // #1969 (X): re-read + remove the ACTUAL `list()`-supplied `path`, not a
+    // `file_for` reconstruction — so a track written under an older filename
+    // encoding stays resolvable. The per-key lock (keyed by target/correlation,
+    // encoding-independent) still serializes this against `record`'s write.
+    let current = std::fs::read(path)
         .ok()
         .and_then(|b| serde_json::from_slice::<CiHandoffTrack>(&b).ok());
     match current {
-        Some(t) if t.sent_at == expect_sent_at => std::fs::remove_file(&path).is_ok(),
+        Some(t) if t.sent_at == expect_sent_at => std::fs::remove_file(path).is_ok(),
         // re-recorded (new sent_at) / torn / absent → leave it (the fresh episode
         // must keep its track; a torn read self-heals on the next tick).
         _ => false,
@@ -179,9 +214,11 @@ pub(crate) fn record(home: &Path, target: &str, correlation: &str, sent_at: &str
     );
 }
 
-/// All currently-pending tracks. Unparseable files are skipped (and logged) —
-/// never panic the watchdog tick.
-pub(crate) fn list(home: &Path) -> Vec<CiHandoffTrack> {
+/// All currently-pending tracks, each paired with its ACTUAL on-disk path.
+/// Unparseable files are skipped (and logged) — never panic the watchdog tick.
+/// #1969 (X): callers delete the supplied path directly (no `file_for`
+/// reconstruction), so a track under an older filename encoding stays resolvable.
+pub(crate) fn list(home: &Path) -> Vec<(PathBuf, CiHandoffTrack)> {
     let mut out = Vec::new();
     for entry in std::fs::read_dir(dir(home)).into_iter().flatten().flatten() {
         let path = entry.path();
@@ -192,7 +229,7 @@ pub(crate) fn list(home: &Path) -> Vec<CiHandoffTrack> {
             .ok()
             .and_then(|b| serde_json::from_slice::<CiHandoffTrack>(&b).ok())
         {
-            Some(t) => out.push(t),
+            Some(t) => out.push((path, t)),
             None => {
                 tracing::warn!(path = %path.display(), "#1888: unparseable ci-handoff track skipped");
             }
@@ -205,9 +242,15 @@ pub(crate) fn list(home: &Path) -> Vec<CiHandoffTrack> {
 /// how many were resolved. `reason` is for the log only.
 pub(crate) fn resolve_by_correlation(home: &Path, correlation: &str, reason: &str) -> usize {
     let mut resolved = 0;
-    for track in list(home) {
+    for (path, track) in list(home) {
         if track.correlation == correlation
-            && remove_if_unchanged(home, &track.target, &track.correlation, &track.sent_at)
+            && remove_if_unchanged(
+                home,
+                &path,
+                &track.target,
+                &track.correlation,
+                &track.sent_at,
+            )
         {
             resolved += 1;
             tracing::info!(
@@ -228,10 +271,16 @@ pub(crate) fn resolve_by_correlation(home: &Path, correlation: &str, reason: &st
 pub(crate) fn resolve_claimed(home: &Path, agent: &str, branch: &str) -> usize {
     let suffix = format!("@{branch}");
     let mut resolved = 0;
-    for track in list(home) {
+    for (path, track) in list(home) {
         if track.target == agent
             && track.correlation.ends_with(&suffix)
-            && remove_if_unchanged(home, &track.target, &track.correlation, &track.sent_at)
+            && remove_if_unchanged(
+                home,
+                &path,
+                &track.target,
+                &track.correlation,
+                &track.sent_at,
+            )
         {
             resolved += 1;
             tracing::info!(
@@ -251,13 +300,21 @@ pub(crate) fn resolve_claimed(home: &Path, agent: &str, branch: &str) -> usize {
 /// swept. Called from the watchdog tick.
 pub(crate) fn sweep_expired(home: &Path, now: &chrono::DateTime<chrono::Utc>) -> usize {
     let mut swept = 0;
-    for track in list(home) {
+    for (path, track) in list(home) {
         let expired = chrono::DateTime::parse_from_rfc3339(&track.sent_at)
             .map(|t| now.signed_duration_since(t.with_timezone(&chrono::Utc)) >= TRACK_MAX_AGE)
             // Unparseable sent_at → treat as expired (a broken track must not
             // re-nudge forever either).
             .unwrap_or(true);
-        if expired && remove_if_unchanged(home, &track.target, &track.correlation, &track.sent_at) {
+        if expired
+            && remove_if_unchanged(
+                home,
+                &path,
+                &track.target,
+                &track.correlation,
+                &track.sent_at,
+            )
+        {
             swept += 1;
             tracing::warn!(
                 tag = "#1888-track-expired",
@@ -269,6 +326,71 @@ pub(crate) fn sweep_expired(home: &Path, now: &chrono::DateTime<chrono::Utc>) ->
         }
     }
     swept
+}
+
+/// #1969: passive hygiene GC for the orphan sidecars the per-key-lock design
+/// leaves behind. Every key keeps a 0-byte `<key>.json.lock` that is
+/// deliberately NEVER unlinked on resolve — ci-handoff keys are REUSED (a new CI
+/// pass on the same branch), and unlink-on-resolve would open a
+/// flock-on-unlinked-inode double-hold race (the #1968 review's reason NOT to
+/// copy `dispatch_idle`'s `delete_sidecar_locked`). A crashed `record` can also
+/// leave a `<key>.json.tmp`. Hooked into the hourly retention sweep; returns the
+/// count removed.
+///
+/// SAFETY — never mis-delete a LIVE lock: `acquire_file_lock` opens with
+/// `create + truncate(false)` and never writes, so a `.lock`'s mtime is its
+/// CREATE time, NOT last-use — a long-lived branch's lock can be old yet live. So
+/// a `.lock` is removed ONLY when it is an ORPHAN (no sibling `.json` track → no
+/// pending handoff for that key) AND older than [`LOCK_ORPHAN_MIN_AGE`] (a track
+/// resolves within the 24h backstop, so a track-less lock past 48h is settled).
+/// A `.tmp` is a transient write artifact created under the lock, so any `.tmp`
+/// past [`TMP_MIN_AGE`] is a crash leftover (the next `record` overwrites it
+/// regardless). `.json` tracks are NEVER touched here — `resolve_*` /
+/// `sweep_expired` own their lifecycle.
+pub(crate) fn gc_orphan_sidecars(home: &Path, now: std::time::SystemTime) -> usize {
+    /// A track-less `.lock` older than this is a settled orphan (tracks resolve
+    /// within the 24h backstop, so 48h is a safe margin past any live handoff).
+    const LOCK_ORPHAN_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(48 * 3600);
+    /// A `.tmp` is only ever a transient under-lock write; older than this = a
+    /// crashed `record` leftover.
+    const TMP_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+
+    let mut removed = 0;
+    for entry in std::fs::read_dir(dir(home)).into_iter().flatten().flatten() {
+        let path = entry.path();
+        let min_age = match path.extension().and_then(|e| e.to_str()) {
+            Some("lock") => LOCK_ORPHAN_MIN_AGE,
+            Some("tmp") => TMP_MIN_AGE,
+            // never touch the `.json` tracks (resolve/sweep_expired own them).
+            _ => continue,
+        };
+        let age = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|mt| now.duration_since(mt).ok())
+            .unwrap_or(std::time::Duration::ZERO);
+        if age < min_age {
+            continue;
+        }
+        // A `.lock` is removed ONLY if its `<key>.json` track is gone (orphan) —
+        // a present track means the key is live, and its lock (old-mtime but
+        // in-use) must not be unlinked under a concurrent flock.
+        if path.extension().and_then(|e| e.to_str()) == Some("lock")
+            && path.with_extension("").exists()
+        {
+            continue;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+            tracing::debug!(
+                tag = "#1969-sidecar-gc",
+                path = %path.display(),
+                "ci-handoff orphan sidecar swept"
+            );
+        }
+    }
+    removed
 }
 
 #[cfg(test)]
@@ -302,7 +424,7 @@ mod tests {
         assert_eq!(tracks.len(), 2, "refresh must not duplicate");
         assert!(tracks
             .iter()
-            .any(|t| t.correlation == "o/r@b1" && t.sent_at == "2026-06-10T01:00:00Z"));
+            .any(|(_, t)| t.correlation == "o/r@b1" && t.sent_at == "2026-06-10T01:00:00Z"));
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -315,7 +437,7 @@ mod tests {
         assert_eq!(resolve_by_correlation(&home, "o/r@b", "test"), 2);
         let left = list(&home);
         assert_eq!(left.len(), 1);
-        assert_eq!(left[0].correlation, "o/r@other");
+        assert_eq!(left[0].1.correlation, "o/r@other");
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -327,7 +449,7 @@ mod tests {
         assert_eq!(resolve_claimed(&home, "reviewer", "fix/x"), 1);
         let left = list(&home);
         assert_eq!(left.len(), 1, "other target's track untouched");
-        assert_eq!(left[0].target, "other");
+        assert_eq!(left[0].1.target, "other");
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -343,7 +465,7 @@ mod tests {
         assert_eq!(sweep_expired(&home, &now), 2, "old + broken swept");
         let left = list(&home);
         assert_eq!(left.len(), 1);
-        assert_eq!(left[0].correlation, "o/r@fresh");
+        assert_eq!(left[0].1.correlation, "o/r@fresh");
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -357,9 +479,11 @@ mod tests {
     fn remove_if_unchanged_refuses_stale_delete_1963() {
         let home = tmp_home("cas");
         record(&home, "reviewer", "o/r@b", "2026-06-10T00:00:00Z");
+        let path = file_for(&home, "reviewer", "o/r@b");
         // Same episode → delete succeeds.
         assert!(remove_if_unchanged(
             &home,
+            &path,
             "reviewer",
             "o/r@b",
             "2026-06-10T00:00:00Z"
@@ -374,13 +498,13 @@ mod tests {
         record(&home, "reviewer", "o/r@b", "2026-06-10T00:00:00Z"); // S1
         record(&home, "reviewer", "o/r@b", "2026-06-10T09:00:00Z"); // S2
         assert!(
-            !remove_if_unchanged(&home, "reviewer", "o/r@b", "2026-06-10T00:00:00Z"),
+            !remove_if_unchanged(&home, &path, "reviewer", "o/r@b", "2026-06-10T00:00:00Z"),
             "#1963: a delete carrying the STALE listed sent_at must be refused"
         );
         let tracks = list(&home);
         assert_eq!(tracks.len(), 1, "the fresh episode's track must survive");
         assert_eq!(
-            tracks[0].sent_at, "2026-06-10T09:00:00Z",
+            tracks[0].1.sent_at, "2026-06-10T09:00:00Z",
             "the SURVIVING track is the new episode (S2)"
         );
         std::fs::remove_dir_all(&home).ok();
@@ -397,7 +521,7 @@ mod tests {
         record(&home, "reviewer", "o/r@b", "2026-06-10T00:00:00Z");
         let tracks = list(&home);
         assert_eq!(tracks.len(), 1);
-        assert_eq!(tracks[0].correlation, "o/r@b");
+        assert_eq!(tracks[0].1.correlation, "o/r@b");
         // The per-key lock sidecar exists (record took the lock) but is NOT a track.
         assert!(
             lock_for(&home, "reviewer", "o/r@b").exists(),
@@ -413,6 +537,130 @@ mod tests {
             1,
             "#1963: .tmp / .lock sidecars must not appear as tracks"
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1969: two keys the lossy sanitize collapses to the same name (`a/b` vs
+    /// `a_b` both → `a_b`) must map to DISTINCT files (the `key_hash` suffix), so
+    /// one key's track can never clobber the other's.
+    #[test]
+    fn sanitize_colliding_keys_get_distinct_files_1969() {
+        let home = tmp_home("collide");
+        record(&home, "reviewer", "o/r@a/b", "2026-06-10T00:00:00Z");
+        record(&home, "reviewer", "o/r@a_b", "2026-06-10T00:00:00Z");
+        let tracks = list(&home);
+        assert_eq!(
+            tracks.len(),
+            2,
+            "#1969: sanitize-colliding keys must NOT share a file"
+        );
+        let corrs: Vec<_> = tracks.iter().map(|(_, t)| t.correlation.as_str()).collect();
+        assert!(
+            corrs.contains(&"o/r@a/b") && corrs.contains(&"o/r@a_b"),
+            "both distinct keys present: {corrs:?}"
+        );
+        assert_ne!(
+            file_for(&home, "reviewer", "o/r@a/b"),
+            file_for(&home, "reviewer", "o/r@a_b"),
+            "the two keys' files differ by the hash suffix"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1969: the orphan-sidecar GC removes a track-less old `.lock` + a crash
+    /// `.tmp`, but must NEVER remove a LIVE key's lock — even when its mtime is
+    /// old (the lock's mtime is its CREATE time, not last-use). The presence of
+    /// the sibling `.json` track is the liveness guard.
+    #[test]
+    fn gc_orphan_sidecars_keeps_live_lock_removes_orphans_1969() {
+        use std::time::{Duration, SystemTime};
+        let home = tmp_home("gc");
+        // (1) LIVE key → a `.json` track + its `.lock`.
+        record(&home, "reviewer", "o/r@active", "2026-06-10T00:00:00Z");
+        let active_lock = lock_for(&home, "reviewer", "o/r@active");
+        assert!(active_lock.exists());
+        // (2) ORPHAN lock — no `.json` track (resolved long ago).
+        let orphan_lock = lock_for(&home, "reviewer", "o/r@orphan");
+        std::fs::write(&orphan_lock, b"").unwrap();
+        // (3) crash `.tmp` leftover.
+        let crash = file_for(&home, "reviewer", "o/r@crash");
+        let mut tmp_name = crash.file_name().unwrap().to_os_string();
+        tmp_name.push(".tmp");
+        let crash_tmp = crash.with_file_name(tmp_name);
+        std::fs::write(&crash_tmp, b"{partial").unwrap();
+
+        // Sweep with `now` far in the future so every file clears the age window.
+        let future = SystemTime::now() + Duration::from_secs(100 * 3600);
+        let removed = gc_orphan_sidecars(&home, future);
+
+        assert!(
+            active_lock.exists(),
+            "#1969: a LIVE key's lock (has a .json track) must NOT be GC'd even when old"
+        );
+        assert!(
+            !orphan_lock.exists(),
+            "#1969: an orphan lock past the age window must be GC'd"
+        );
+        assert!(
+            !crash_tmp.exists(),
+            "#1969: a crash .tmp past the age window must be GC'd"
+        );
+        assert_eq!(
+            list(&home).len(),
+            1,
+            "the live .json track is never touched by the sidecar GC"
+        );
+        assert_eq!(removed, 2, "orphan lock + crash tmp");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1969: a FRESH orphan `.lock` (within the age window) is kept — only
+    /// settled orphans are GC'd, so a lock created moments before a re-record is
+    /// not whipped out from under it.
+    #[test]
+    fn gc_respects_age_window_1969() {
+        let home = tmp_home("gc-age");
+        std::fs::create_dir_all(dir(&home)).unwrap();
+        let fresh_orphan = lock_for(&home, "reviewer", "o/r@fresh-orphan");
+        std::fs::write(&fresh_orphan, b"").unwrap();
+        assert_eq!(
+            gc_orphan_sidecars(&home, std::time::SystemTime::now()),
+            0,
+            "#1969: a fresh orphan lock is within the age window → kept"
+        );
+        assert!(fresh_orphan.exists());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1969 (X) — the migration-safety keystone: a track written under the OLD
+    /// filename encoding (no `key_hash` suffix) must still be resolvable, because
+    /// `resolve_*` delete the ACTUAL `list()`-supplied path, NOT a `file_for`
+    /// reconstruction (which would now compute the new hashed name and miss it).
+    #[test]
+    fn old_encoding_track_still_resolvable_1969() {
+        let home = tmp_home("migrate");
+        std::fs::create_dir_all(dir(&home)).unwrap();
+        // Pre-#1969 name format: `<target>--<corr>.json`, no hash suffix.
+        let old_path = dir(&home).join("reviewer--o_r_b.json");
+        let track = CiHandoffTrack {
+            schema_version: SCHEMA_VERSION,
+            target: "reviewer".into(),
+            correlation: "o/r@b".into(),
+            sent_at: "2026-06-10T00:00:00Z".into(),
+        };
+        std::fs::write(&old_path, serde_json::to_vec(&track).unwrap()).unwrap();
+        assert_eq!(
+            list(&home).len(),
+            1,
+            "list() reads the old-encoding file by content"
+        );
+        assert_eq!(
+            resolve_by_correlation(&home, "o/r@b", "migration"),
+            1,
+            "#1969 (X): an old-encoding track must still resolve (delete the listed path)"
+        );
+        assert!(list(&home).is_empty(), "the old-encoding track is gone");
+        assert!(!old_path.exists());
         std::fs::remove_dir_all(&home).ok();
     }
 }
