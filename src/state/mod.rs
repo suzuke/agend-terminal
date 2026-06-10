@@ -292,6 +292,18 @@ pub struct StateTracker {
     /// cross-Idle phantom loop in cheerc's #1808 Evidence 2) is still detected.
     /// Read/written only for the phantom probe log; never affects transitions.
     last_srl_match_sig: Option<(u64, usize)>,
+    /// #1955: when the current UsageLimit episode auto-releases. Anchored on
+    /// the banner's own unlock hint parsed at latch time ("resets 4am" /
+    /// "try again at 15:14", assumed daemon-local TZ — Claude prints the
+    /// user's own zone); [`Self::USAGE_LIMIT_EXPIRY`] when unparseable.
+    usage_limit_release_at: Option<Instant>,
+    /// #1955: signature (bottom-most banner line hash + dist-from-bottom) of
+    /// a RELEASED UsageLimit episode. The banner is level-triggered and can
+    /// sit in the visible tail forever on an idle pane, so without this the
+    /// next feed would simply re-latch what the expiry just released. A
+    /// genuinely-new limit hit renders fresh at the bottom (different
+    /// position, usually a different reset time) → different sig → latches.
+    usage_limit_expired_sig: Option<(u64, usize)>,
     /// #1808-probe0-phantom (instrumentation-only): how many CONSECUTIVE feed
     /// ticks the same SRL error re-matched with NO intervening non-SRL state
     /// (the in-place clock-tick re-scan). Resets on a different signature or a
@@ -438,6 +450,66 @@ fn hash_screen(text: &str) -> u64 {
     hasher.finish()
 }
 
+/// #1955: the (bottom-most) screen line containing `matched` — the UsageLimit
+/// banner line, so the unlock hint that follows the matched phrase on the same
+/// line ("… · resets 4am (Asia/Taipei)") can be parsed.
+fn line_containing<'a>(screen_text: &'a str, matched: &str) -> Option<&'a str> {
+    let pos = screen_text.rfind(matched)?;
+    let start = screen_text[..pos].rfind('\n').map_or(0, |i| i + 1);
+    let end = screen_text[pos..]
+        .find('\n')
+        .map_or(screen_text.len(), |i| pos + i);
+    Some(&screen_text[start..end])
+}
+
+/// #1955: duration until the banner's own unlock hint. Live forms: claude
+/// `resets 4am (Asia/Taipei)` / `resets at 11:59pm`, codex `try again at
+/// 15:14`. The banner prints the USER's timezone, which matches the daemon's
+/// local clock on a single-operator host — so the target is resolved against
+/// local time (next occurrence of that wall-clock time). A bare hour with no
+/// am/pm and no `:MM` is too ambiguous to anchor on → `None` (the caller
+/// falls back to the conservative window). Result capped at 24h — the hint
+/// only encodes a time-of-day; a multi-day window self-corrects on the next
+/// genuine re-latch (fresh banner → fresh anchor).
+fn parse_usage_limit_release(line: &str) -> Option<Duration> {
+    use std::sync::OnceLock;
+    static UNLOCK: OnceLock<regex::Regex> = OnceLock::new();
+    let re = UNLOCK.get_or_init(|| {
+        #[allow(clippy::unwrap_used)] // const pattern — compile failure is a code bug
+        regex::Regex::new(
+            r"(?i)\b(?:resets?|try again)(?:\s+at)?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?",
+        )
+        .unwrap()
+    });
+    let caps = re.captures(line)?;
+    let mut hour: u32 = caps[1].parse().ok()?;
+    let minute: u32 = caps
+        .get(2)
+        .map(|m| m.as_str().parse().ok())
+        .unwrap_or(Some(0))?;
+    let ampm = caps.get(3).map(|m| m.as_str().to_ascii_lowercase());
+    if ampm.is_none() && caps.get(2).is_none() {
+        return None; // bare "resets 4" — ambiguous
+    }
+    match ampm.as_deref() {
+        Some("pm") if hour < 12 => hour += 12,
+        Some("am") if hour == 12 => hour = 0,
+        _ => {}
+    }
+    if hour > 23 || minute > 59 {
+        return None;
+    }
+    let now = chrono::Local::now().naive_local();
+    let target_today = now.date().and_hms_opt(hour, minute, 0)?;
+    let target = if target_today > now {
+        target_today
+    } else {
+        target_today + chrono::Duration::days(1)
+    };
+    let until = (target - now).to_std().ok()?;
+    Some(until.min(Duration::from_secs(24 * 3600)))
+}
+
 /// #1808-probe0-phantom (instrumentation-only): a stable signature of the
 /// bottom-most occurrence of an SRL error line — `(line_hash, dist_from_bottom)`.
 /// `dist_from_bottom` is the byte distance from the error line's start to the end
@@ -563,6 +635,17 @@ const THROTTLE_HINT_TOKENS: &[&str] = &[
     "RESOURCE_EXHAUSTED",
     "429",
     "Rate limited",
+    // #1955: usage-limit banners — a static stuck-UsageLimit pane must also
+    // re-evaluate so the release anchor / expired-sig suppression can run
+    // (UsageLimit is deliberately NOT in `already_throttle`, so re-detection
+    // proceeds). Substrings cover the claude trio ("You've hit your …
+    // limit"), codex ("hit your usage limit"), kiro ("you have reached the
+    // limit" / ServiceQuotaExceeded), and the credit-balance forms.
+    "hit your",
+    "reached the limit",
+    "ServiceQuotaExceeded",
+    "Credit balance",
+    "credit_balance_too_low",
 ];
 
 fn screen_has_throttle_hint(screen_text: &str) -> bool {
@@ -839,6 +922,15 @@ impl StateTracker {
     /// while preventing hours-long false positives (PR #319 incident).
     const RATE_LIMIT_EXPIRY: Duration = Duration::from_secs(300);
 
+    /// #1955: conservative UsageLimit release window when the banner carries
+    /// no parseable unlock hint ("resets 4am" / "try again at 15:14"). Long
+    /// enough to not flap on a real limit, short enough that an idle agent is
+    /// never stranded for days (the `general` incident): after release the
+    /// agent degrades to Idle; if it is dispatched while genuinely still
+    /// limited, the attempt re-renders a FRESH banner at the bottom → a new
+    /// signature → re-latch with a re-parsed anchor (self-correcting).
+    const USAGE_LIMIT_EXPIRY: Duration = Duration::from_secs(30 * 60);
+
     /// If the last MCP heartbeat is within this window, the agent is
     /// considered alive and `PermissionPrompt` detection is suppressed.
     const HEARTBEAT_FRESH_WINDOW: Duration = Duration::from_secs(120);
@@ -914,6 +1006,8 @@ impl StateTracker {
             dropped_transition_count: 0,
             // #1808-probe0-phantom: no SRL seen yet.
             last_srl_match_sig: None,
+            usage_limit_release_at: None,
+            usage_limit_expired_sig: None,
             srl_consecutive_rematch: 0,
             non_srl_since_last_srl: false,
         }
@@ -1140,12 +1234,29 @@ impl StateTracker {
                     // submitted user-message line) — operator-typed / quoted
                     // error strings are prose, not CLI error output
                     // (operator-reproduced live FP, 2026-06-10).
+                    let usage_limit = matches!(detected, AgentState::UsageLimit);
                     let anchor_fail = if requires_red_anchor(detected) {
                         self.anchor_on_red
                             && !fg.is_empty()
                             && !matched_span_has_red(screen_text, matched, fg)
                     } else if high_fp {
                         !crate::state::patterns::in_error_line_excluding_input(
+                            screen_text,
+                            matched,
+                            self.input_line_markers,
+                        )
+                    } else if usage_limit {
+                        // #1955 self-poisoning: an agent QUOTING the banner
+                        // ("You've hit your weekly limit" in an RCA / dispatch)
+                        // latched itself. Input-line exclusion is the
+                        // right-sized anchor here — the REAL banner carries no
+                        // error indicator (`⎿ You've hit your weekly limit ·
+                        // resets 4am`), so the error-line content anchor would
+                        // false-negative it, and its rendering isn't reliably
+                        // red. Prose mentions in agent OUTPUT are bounded by
+                        // the position gate below + the #1777 working-marker
+                        // override + the #1955 release anchor.
+                        !crate::state::patterns::any_match_off_input_lines(
                             screen_text,
                             matched,
                             self.input_line_markers,
@@ -1161,7 +1272,10 @@ impl StateTracker {
                     // the retry storm). Scoped to HIGH_FP/error states ONLY:
                     // Idle and modal/interactive prompts keep full-screen
                     // scanning, because a modal can legitimately sit above the tail.
-                    let stale_position = high_fp
+                    // #1955: UsageLimit joins the position gate — a banner
+                    // quote buried in deep scrollback is discussion, not a
+                    // live limit (same staleness logic as the HIGH_FP set).
+                    let stale_position = (high_fp || usage_limit)
                         && !matched_span_in_recent_tail(
                             screen_text,
                             matched,
@@ -1393,6 +1507,54 @@ impl StateTracker {
                                 if cross_cycle {
                                     landed = AgentState::Idle;
                                 }
+                            }
+                        }
+                        // #1955: UsageLimit episode lifecycle. The match is
+                        // level-triggered and a silent pane never scrolls the
+                        // banner away (the `general` incident: stuck for DAYS
+                        // past the account reset), so the state machine — not
+                        // new output — must provide the exit:
+                        //  • fresh latch → anchor a release deadline on the
+                        //    banner's own unlock hint (conservative fallback);
+                        //  • in-episode re-match past the deadline → release
+                        //    to Idle and remember the banner's signature;
+                        //  • re-match of that SAME released signature →
+                        //    suppress (mirror of the #1809 cross-cycle
+                        //    suppression) — a genuinely-new limit renders
+                        //    fresh at the bottom → new sig → latches again.
+                        if matches!(detected, AgentState::UsageLimit)
+                            && matches!(landed, AgentState::UsageLimit)
+                        {
+                            let sig = srl_match_signature(screen_text, matched);
+                            if self.usage_limit_expired_sig == Some(sig) {
+                                landed = AgentState::Idle;
+                            } else if self.current == AgentState::UsageLimit {
+                                if self
+                                    .usage_limit_release_at
+                                    .is_some_and(|at| Instant::now() >= at)
+                                {
+                                    self.usage_limit_expired_sig = Some(sig);
+                                    self.usage_limit_release_at = None;
+                                    tracing::info!(
+                                        target: "state_detection",
+                                        agent = %self.instance_name,
+                                        dist_from_bottom = sig.1,
+                                        "#1955: UsageLimit released — unlock anchor passed; suppressing the stale banner re-latch"
+                                    );
+                                    landed = AgentState::Idle;
+                                }
+                            } else {
+                                let release_in = line_containing(screen_text, matched)
+                                    .and_then(parse_usage_limit_release)
+                                    .unwrap_or(Self::USAGE_LIMIT_EXPIRY);
+                                self.usage_limit_release_at = Some(Instant::now() + release_in);
+                                self.usage_limit_expired_sig = None;
+                                tracing::info!(
+                                    target: "state_detection",
+                                    agent = %self.instance_name,
+                                    release_in_secs = release_in.as_secs(),
+                                    "#1955: UsageLimit latched — release anchored on the banner's unlock hint (or conservative fallback)"
+                                );
                             }
                         }
                         let gated = self.gate_on_heartbeat(landed);
@@ -1718,6 +1880,25 @@ impl StateTracker {
         if rate_limit_expiring && self.since.elapsed() >= Self::RATE_LIMIT_EXPIRY {
             self.transition(AgentState::Idle);
             return;
+        }
+        // #1955: UsageLimit expires on its release deadline (anchored on the
+        // banner's own unlock hint at latch time, else the conservative
+        // window). This arm covers the banner-scrolled-away case (detection
+        // returns None); a still-visible banner releases at the detection
+        // override instead (the level-triggered re-match never reaches here).
+        // A pre-#1955 latch carries no deadline → conservative window from
+        // `since`.
+        if matches!(self.current, AgentState::UsageLimit) {
+            let deadline_passed = self
+                .usage_limit_release_at
+                .map_or(self.since.elapsed() >= Self::USAGE_LIMIT_EXPIRY, |at| {
+                    Instant::now() >= at
+                });
+            if deadline_passed {
+                self.usage_limit_release_at = None;
+                self.transition(AgentState::Idle);
+                return;
+            }
         }
         // Prompt states (InteractivePrompt / PermissionPrompt) expire on
         // the longer window. When the screen goes stable after the

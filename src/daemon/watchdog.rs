@@ -95,7 +95,20 @@ pub fn run_watchdog_pass(
     }
 
     if let Some(reason) = reason {
-        health.set_blocked_reason(reason);
+        // #1955 self-poisoning fix (mirrors the #1634 pattern above): drive the
+        // QuotaExceeded latch from the GATED live `AgentState`, not the raw
+        // colorless `classify_pty_output` — an agent QUOTING the banner in an
+        // RCA latched its own `blocked_reason` while `agent_state` was still
+        // `thinking` (claude-f9af90, issue #1955). The StateTracker's
+        // UsageLimit carries the input-line + tail-position + working-marker
+        // gates and the release anchor; only latch quota when IT says so.
+        if matches!(reason, crate::health::BlockedReason::QuotaExceeded)
+            && current_state != AgentState::UsageLimit
+        {
+            // prose/quoted mention only — not a live limit
+        } else {
+            health.set_blocked_reason(reason);
+        }
     }
 }
 
@@ -179,6 +192,34 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// #1955 self-poisoning pin (claude-f9af90): an agent QUOTING the banner
+    /// in its output (writing an RCA) makes `classify_pty_output` return
+    /// QuotaExceeded — but the gated live state is `Thinking`, so the latch
+    /// must NOT be set. Only a state-machine-confirmed UsageLimit latches.
+    #[test]
+    fn quoted_banner_while_thinking_does_not_latch_quota_1955() {
+        let home = tmp_home("quota-quote-1955");
+        let mut health = HealthTracker::new();
+        let backend = Backend::ClaudeCode;
+
+        run_watchdog_pass(
+            &home,
+            "test-agent",
+            &backend,
+            "writing the RCA: the banner says You've hit your weekly limit · resets 4am",
+            &mut health,
+            false, // live
+            AgentState::Thinking,
+        );
+
+        assert!(
+            health.current_reason.is_none(),
+            "#1955: a quoted banner with gated state Thinking must not latch QuotaExceeded, got: {:?}",
+            health.current_reason
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     #[test]
     fn test_watchdog_live_env_unset_sets_reason() {
         let home = tmp_home("live");
@@ -192,9 +233,12 @@ mod tests {
             "ServiceQuotaExceededException: You have exceeded your quota",
             &mut health,
             false, // live
-            // Agent still showing the quota banner → not recovered, so the
-            // bughunt2 auto-clear stays inert and the set is observed.
-            AgentState::RateLimit,
+            // #1955: the QuotaExceeded latch now requires the GATED live state
+            // to agree (the raw classify alone self-poisoned on quoted banner
+            // text) — so model the realistic shape: the state machine latched
+            // UsageLimit from the same banner. Not in the recovered set, so
+            // the bughunt2 auto-clear stays inert and the set is observed.
+            AgentState::UsageLimit,
         );
 
         assert!(

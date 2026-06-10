@@ -130,6 +130,37 @@ pub(crate) fn in_error_line_excluding_input(
     false
 }
 
+/// #1955: does ANY on-screen occurrence of `matched` sit on a line that is
+/// NOT an input / user-message line? The UsageLimit anchor: the real banner
+/// carries no error indicator (`⎿  You've hit your weekly limit · resets
+/// 4am`), so the error-line content anchor would false-negative it —
+/// input-line exclusion alone is the right-sized gate (fail-toward-detection:
+/// anything not typed/quoted at the prompt still latches; prose mentions in
+/// agent output are bounded by the position gate + working-marker override +
+/// the #1955 release anchor).
+pub(crate) fn any_match_off_input_lines(
+    screen_text: &str,
+    matched: &str,
+    input_markers: &[&str],
+) -> bool {
+    if matched.is_empty() {
+        return false;
+    }
+    let mut search = 0;
+    while let Some(rel) = screen_text[search..].find(matched) {
+        let pos = search + rel;
+        let line_start = screen_text[..pos].rfind('\n').map_or(0, |i| i + 1);
+        let line_end = screen_text[pos..]
+            .find('\n')
+            .map_or(screen_text.len(), |i| pos + i);
+        if !is_input_line(&screen_text[line_start..line_end], input_markers) {
+            return true;
+        }
+        search = pos + matched.len();
+    }
+    false
+}
+
 /// Compiled patterns for one backend.
 pub struct StatePatterns {
     /// (state, regex) pairs in priority order (highest priority first).

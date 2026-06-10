@@ -4710,3 +4710,196 @@ fn flatten_fallback_excludes_input_lines_1947() {
         "#1947: a genuine bare hard-wrapped SRL still detects"
     );
 }
+
+// ── #1955: UsageLimit episode lifecycle + self-poisoning gates ──────────────
+
+/// Live banner shape (the `general` incident pane): banner parked in the tail
+/// above a clean idle prompt.
+const CLAUDE_USAGE_LIMIT_FRAME: &str = "⏺ some earlier work\n\
+     ⎿  You've hit your weekly limit · resets 4am (Asia/Taipei)\n\
+     \n\
+     ❯ \n\
+     ────────────";
+
+/// #1955 fail-toward-detection: the real banner above an idle prompt still
+/// latches UsageLimit, and the latch anchors a release deadline parsed from
+/// the banner's own unlock hint.
+#[test]
+fn usage_limit_real_banner_latches_with_release_anchor_1955() {
+    let mut t = StateTracker::new(Some(&Backend::ClaudeCode));
+    t.feed(CLAUDE_USAGE_LIMIT_FRAME);
+    assert_eq!(t.get_state(), AgentState::UsageLimit, "real banner latches");
+    let release = t.usage_limit_release_at.expect("release deadline anchored");
+    assert!(
+        release <= Instant::now() + Duration::from_secs(24 * 3600),
+        "anchor bounded at 24h"
+    );
+}
+
+/// #1955 the `general` repro: once the release deadline passes, the SAME
+/// stale banner (level-triggered, never scrolls on a silent pane) must
+/// release to Idle instead of re-latching — and STAY released on further
+/// re-scans of the identical screen (expired-sig suppression). The re-scan
+/// rides the throttle-hint static-pane bypass (same-hash feeds).
+#[test]
+fn usage_limit_stale_banner_releases_after_deadline_1955() {
+    let mut t = StateTracker::new(Some(&Backend::ClaudeCode));
+    t.feed(CLAUDE_USAGE_LIMIT_FRAME);
+    assert_eq!(t.get_state(), AgentState::UsageLimit);
+
+    // Deadline passes (account reset). The pane is SILENT: the identical
+    // frame re-feeds (claude clock-tick / static-pane hint bypass).
+    t.usage_limit_release_at = Some(Instant::now());
+    // transition() only allows a priority DROP after a 2s min-hold; the real
+    // incident latch is days old. Backdate safely (checked_sub — windows-safe).
+    t.since = Instant::now()
+        .checked_sub(Duration::from_secs(3))
+        .unwrap_or_else(Instant::now);
+    t.feed(CLAUDE_USAGE_LIMIT_FRAME);
+    assert_eq!(
+        t.get_state(),
+        AgentState::Idle,
+        "#1955: past the release deadline the stale banner must release to Idle"
+    );
+
+    // Further re-scans of the SAME banner stay Idle (no enter-only latch).
+    t.feed(CLAUDE_USAGE_LIMIT_FRAME);
+    assert_eq!(
+        t.get_state(),
+        AgentState::Idle,
+        "#1955: the released banner signature must not re-latch"
+    );
+}
+
+/// #1955: a genuinely-NEW limit hit AFTER a release renders fresh (different
+/// position → different signature) and must latch again — the suppression is
+/// scoped to the released episode, not to usage limits in general.
+#[test]
+fn usage_limit_new_banner_after_release_relatches_1955() {
+    let mut t = StateTracker::new(Some(&Backend::ClaudeCode));
+    t.feed(CLAUDE_USAGE_LIMIT_FRAME);
+    t.usage_limit_release_at = Some(Instant::now());
+    // transition() only allows a priority DROP after a 2s min-hold; the real
+    // incident latch is days old. Backdate safely (checked_sub — windows-safe).
+    t.since = Instant::now()
+        .checked_sub(Duration::from_secs(3))
+        .unwrap_or_else(Instant::now);
+    t.feed(CLAUDE_USAGE_LIMIT_FRAME);
+    assert_eq!(t.get_state(), AgentState::Idle, "released");
+
+    // A new attempt re-renders the banner at a DIFFERENT screen position.
+    let fresh = "⏺ retrying the dispatch\n\
+         output line\n\
+         more output\n\
+         ⎿  You've hit your weekly limit · resets 4am (Asia/Taipei)\n\
+         ❯ ";
+    t.feed(fresh);
+    assert_eq!(
+        t.get_state(),
+        AgentState::UsageLimit,
+        "#1955: a fresh banner (new signature) must latch a new episode"
+    );
+    assert!(
+        t.usage_limit_release_at.is_some(),
+        "new episode re-anchors its release"
+    );
+}
+
+/// #1955: banner scrolled away (detection None) while latched → the
+/// maybe_expire arm releases on the deadline.
+#[test]
+fn usage_limit_expires_via_maybe_expire_when_banner_gone_1955() {
+    let mut t = StateTracker::new(Some(&Backend::ClaudeCode));
+    t.feed(CLAUDE_USAGE_LIMIT_FRAME);
+    assert_eq!(t.get_state(), AgentState::UsageLimit);
+    t.usage_limit_release_at = Some(Instant::now());
+    // transition() only allows a priority DROP after a 2s min-hold; the real
+    // incident latch is days old. Backdate safely (checked_sub — windows-safe).
+    t.since = Instant::now()
+        .checked_sub(Duration::from_secs(3))
+        .unwrap_or_else(Instant::now);
+    // A screen with NO matching pattern at all (banner scrolled, no prompt).
+    t.feed("plain output text with nothing recognisable\nsecond line");
+    assert_eq!(
+        t.get_state(),
+        AgentState::Idle,
+        "#1955: deadline-passed UsageLimit must expire even with the banner gone"
+    );
+}
+
+/// #1955 self-poisoning: the banner string typed/quoted on the input line
+/// must not latch (input-line exclusion — same #1950 technique).
+#[test]
+fn usage_limit_quote_on_input_line_does_not_latch_1955() {
+    let mut t = StateTracker::new(Some(&Backend::ClaudeCode));
+    t.feed(
+        "⏺ analysing the incident\n\
+         ❯ the pane showed You've hit your weekly limit · resets 4am yesterday",
+    );
+    assert_ne!(
+        t.get_state(),
+        AgentState::UsageLimit,
+        "#1955: a quoted banner on the ❯ input line must not latch"
+    );
+}
+
+/// #1955 self-poisoning: a banner quote buried in DEEP scrollback (outside
+/// the bottom-N tail) is discussion, not a live limit (position gate).
+#[test]
+fn usage_limit_deep_scrollback_quote_does_not_latch_1955() {
+    let mut t = StateTracker::new(Some(&Backend::ClaudeCode));
+    let mut screen = String::from("⏺ RCA: You've hit your weekly limit was the banner\n");
+    for i in 0..16 {
+        screen.push_str(&format!("filler line {i}\n"));
+    }
+    screen.push_str("❯ ");
+    t.feed(&screen);
+    assert_ne!(
+        t.get_state(),
+        AgentState::UsageLimit,
+        "#1955: a banner quote outside the live tail must not latch"
+    );
+}
+
+/// #1955 multi-backend: the codex usage-limit banner walks the same lifecycle
+/// (latch + unlock-hint anchor from "Try again at HH:MM").
+#[test]
+fn usage_limit_codex_banner_same_path_1955() {
+    let mut t = StateTracker::new(Some(&Backend::Codex));
+    t.feed(
+        "You've hit your usage limit. Try again at 15:14.\n\
+         › ",
+    );
+    assert_eq!(
+        t.get_state(),
+        AgentState::UsageLimit,
+        "codex banner latches"
+    );
+    assert!(
+        t.usage_limit_release_at.is_some(),
+        "codex unlock hint anchors the release"
+    );
+}
+
+/// #1955: unlock-hint parser — live forms anchor within 24h; ambiguous /
+/// absent hints fall back (None).
+#[test]
+fn parse_usage_limit_release_forms_1955() {
+    let day = Duration::from_secs(24 * 3600);
+    for line in [
+        "⎿  You've hit your weekly limit · resets 4am (Asia/Taipei)",
+        "You've hit your session limit · resets at 11:59pm",
+        "You've hit your usage limit. Try again at 15:14.",
+    ] {
+        let dur = parse_usage_limit_release(line).unwrap_or_else(|| panic!("must parse: {line}"));
+        assert!(dur <= day, "bounded at 24h: {line}");
+    }
+    assert!(
+        parse_usage_limit_release("You've hit your weekly limit · resets 4").is_none(),
+        "bare hour without am/pm or :MM is ambiguous"
+    );
+    assert!(
+        parse_usage_limit_release("You've hit your weekly limit").is_none(),
+        "no hint → conservative fallback path"
+    );
+}
