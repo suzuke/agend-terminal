@@ -133,14 +133,21 @@ impl Backend {
     /// timestamp-only `draft_state` heuristic, which can read a stale
     /// type-then-clear as a live draft). `None` = no detectable prompt widget →
     /// the caller falls back to the timestamp behavior (fail toward
-    /// draft-protection). Only set for backends whose marker is verified against a
-    /// real capture (`tests/fixtures/state-replay`): claude `❯`, codex `›`, agy
-    /// `>`. kiro/opencode/gemini markers are unverified (left `None`); shell/raw
-    /// have no prompt widget.
+    /// draft-protection). Set only for backends whose EMPTY-box render is a clean
+    /// `<marker> ` with nothing after it, verified against a real capture:
+    /// claude `❯` and agy `>` (live `pane_snapshot`, `tests/fixtures/state-replay`).
+    ///
+    /// codex is INTENTIONALLY excluded (#1948 follow-up): its empty box renders a
+    /// rotating GHOST/placeholder phrase after the `›` (`› Explain this codebase`,
+    /// `› Write tests for @filename`, …), so the marker probe reads the ghost as
+    /// typed content → always defers (the v1 `Some("›")` claim was non-functional:
+    /// fail-protect-safe but never delivered on an empty box). codex therefore
+    /// falls back to the timestamp behavior until a colour/dim-based empty-box
+    /// signal lands (the ghost is dim — see the #1948 codex spike). Operator live
+    /// test (codex-44cea9, 2026-06-10) surfaced this.
     pub fn input_prompt_marker(&self) -> Option<&'static str> {
         match self {
             Backend::ClaudeCode => Some("❯"),
-            Backend::Codex => Some("›"),
             Backend::Agy => Some(">"),
             _ => None,
         }

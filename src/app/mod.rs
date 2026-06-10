@@ -1914,8 +1914,13 @@ mod tests {
     #[test]
     fn input_prompt_marker_only_for_verified_backends() {
         assert_eq!(Backend::ClaudeCode.input_prompt_marker(), Some("❯"));
-        assert_eq!(Backend::Codex.input_prompt_marker(), Some("›"));
         assert_eq!(Backend::Agy.input_prompt_marker(), Some(">"));
+        // #1948 codex follow-up: codex is NOT marker-covered — its empty box shows
+        // a rotating ghost phrase after `›`, which the marker probe would mis-read
+        // as typed content. It falls back to the timestamp behavior until a
+        // colour/dim empty-box signal lands.
+        assert_eq!(Backend::Codex.input_prompt_marker(), None);
+        assert_eq!(Backend::Codex.input_empty_placeholder(), None);
         assert_eq!(Backend::Shell.input_prompt_marker(), None);
         assert_eq!(Backend::OpenCode.input_prompt_marker(), None);
         // #1948 v2: kiro covered via placeholder, NOT a marker; opencode stays
