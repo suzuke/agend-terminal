@@ -27,6 +27,28 @@ pub enum MovePlacement {
     NewTab { name: String },
 }
 
+/// #1939: full placement of an agent's pane at removal time. Extends the
+/// #1431 tab-name-only memory so a `SameTab` respawn (replace_instance /
+/// restart_instance) restores the pane's position, not just its tab.
+pub struct RemovedPanePlacement {
+    pub tab_name: String,
+    /// Index the tab occupied — re-inserts a recreated tab in place when the
+    /// whole tab was closed (single-pane case) instead of appending.
+    pub tab_idx: usize,
+    /// Within-tab geometry. `None` when the pane was the tab's only pane.
+    pub split: Option<RemovedSplit>,
+}
+
+/// #1939: the parent split of a removed pane.
+pub struct RemovedSplit {
+    pub dir: SplitDir,
+    pub ratio: f32,
+    /// Whether the removed pane was the `first` child of its parent split.
+    pub was_first: bool,
+    /// Agents of the sibling subtree at removal time (restore anchors).
+    pub sibling_agents: Vec<String>,
+}
+
 /// Top-level layout.
 pub struct Layout {
     pub tabs: Vec<Tab>,
@@ -36,11 +58,12 @@ pub struct Layout {
     pub tab_reorder_source: Option<usize>,
     /// Drop target tab index during tab reorder drag.
     pub tab_reorder_target: Option<usize>,
-    /// #1431: tab name an agent's pane occupied at removal time, keyed by
-    /// agent name. Recorded on pane removal and consumed by a subsequent
-    /// `LayoutHint::SameTab` spawn (replace_instance) so the new pane returns
-    /// to its original tab. Bounded by distinct agent names.
-    removed_tab_memory: HashMap<String, String>,
+    /// #1431/#1939: placement an agent's pane occupied at removal time, keyed
+    /// by agent name. Recorded on pane removal and consumed by a subsequent
+    /// `LayoutHint::SameTab` spawn (replace_instance / restart_instance) so
+    /// the new pane returns to its original position. Bounded by distinct
+    /// agent names.
+    removed_pane_memory: HashMap<String, RemovedPanePlacement>,
 }
 
 pub const TAB_BAR_HEIGHT: u16 = 1;
@@ -58,19 +81,55 @@ impl Layout {
             next_pane_id: 0,
             tab_reorder_source: None,
             tab_reorder_target: None,
-            removed_tab_memory: HashMap::new(),
+            removed_pane_memory: HashMap::new(),
         }
     }
 
-    /// #1431: remember which tab `agent`'s pane occupied, so a later
-    /// `SameTab` spawn can return its replacement to the same tab.
-    pub fn remember_removed_tab(&mut self, agent: &str, tab_name: String) {
-        self.removed_tab_memory.insert(agent.to_string(), tab_name);
+    /// #1431/#1939: record where `agent`'s pane currently sits (tab + parent
+    /// split geometry) so a later `SameTab` spawn can restore it. Call BEFORE
+    /// removing the pane; no-op if the agent has no pane.
+    pub fn remember_removed_pane(&mut self, agent: &str) {
+        if let Some((tab_idx, pane_id)) = self.find_agent_pane(agent) {
+            let tab = &self.tabs[tab_idx];
+            self.removed_pane_memory.insert(
+                agent.to_string(),
+                RemovedPanePlacement {
+                    tab_name: tab.name.clone(),
+                    tab_idx,
+                    split: tree::parent_split_of(tab.root(), pane_id),
+                },
+            );
+        }
     }
 
-    /// #1431: take (and forget) the remembered tab name for `agent`.
-    pub fn take_removed_tab(&mut self, agent: &str) -> Option<String> {
-        self.removed_tab_memory.remove(agent)
+    /// #1431: take (and forget) the remembered placement for `agent`.
+    pub fn take_removed_pane(&mut self, agent: &str) -> Option<RemovedPanePlacement> {
+        self.removed_pane_memory.remove(agent)
+    }
+
+    /// #1939: place a `SameTab` respawn back at its remembered position.
+    /// Fallback chain: remembered split next to the surviving siblings (exact
+    /// slot) → focused split in the same tab (pre-#1939 behavior) → recreate
+    /// the tab at its remembered index.
+    pub fn restore_removed_pane(&mut self, placement: &RemovedPanePlacement, pane: Pane) {
+        match self.tabs.iter().position(|t| t.name == placement.tab_name) {
+            Some(idx) => {
+                let pane = match &placement.split {
+                    Some(split) => match self.tabs[idx].restore_split(split, pane) {
+                        None => return,
+                        Some(p) => p, // siblings gone → best-effort fallback
+                    },
+                    None => pane,
+                };
+                self.tabs[idx].split_focused(SplitDir::Horizontal, pane);
+            }
+            None => {
+                self.insert_tab(
+                    placement.tab_idx,
+                    Tab::new(placement.tab_name.clone(), pane),
+                );
+            }
+        }
     }
 
     pub fn next_pane_id(&mut self) -> usize {
@@ -82,6 +141,14 @@ impl Layout {
     pub fn add_tab(&mut self, tab: Tab) {
         self.switch_active(self.tabs.len());
         self.tabs.push(tab);
+    }
+
+    /// #1939: `add_tab` at a position — insert `tab` at `idx` (clamped to the
+    /// current tab count) and focus it.
+    pub fn insert_tab(&mut self, idx: usize, tab: Tab) {
+        let idx = idx.min(self.tabs.len());
+        self.switch_active(idx);
+        self.tabs.insert(idx, tab);
     }
 
     /// Append a tab without changing the active index. Used by the Attached
@@ -450,6 +517,175 @@ mod tests {
         assert!(layout.tabs[1].root().has_agent("b"));
         assert_eq!(layout.active, 1);
     }
+    /// #1939: a restart of one pane in a 2-pane tab restores the exact slot —
+    /// same side, same split direction, same ratio (not split_focused noise).
+    #[test]
+    fn restore_2pane_exact_side_dir_ratio_1939() {
+        let mut layout = Layout::new();
+        let root = PaneNode::Split {
+            dir: SplitDir::Horizontal,
+            ratio: 0.3,
+            first: Box::new(PaneNode::Leaf(Box::new(leaf(1, "dev")))),
+            second: Box::new(PaneNode::Leaf(Box::new(leaf(2, "dev2")))),
+        };
+        layout.add_tab(Tab::with_root("team".into(), root));
+
+        layout.remember_removed_pane("dev");
+        layout.tabs[0].close_pane_by_id(1);
+
+        let placement = layout.take_removed_pane("dev").unwrap();
+        let split = placement.split.as_ref().expect("parent split recorded");
+        assert_eq!(split.dir, SplitDir::Horizontal);
+        assert!((split.ratio - 0.3).abs() < f32::EPSILON);
+        assert!(split.was_first, "dev was the first child");
+        assert_eq!(split.sibling_agents, vec!["dev2".to_string()]);
+
+        layout.restore_removed_pane(&placement, leaf(9, "dev"));
+        match layout.tabs[0].root() {
+            PaneNode::Split {
+                dir,
+                ratio,
+                first,
+                second,
+            } => {
+                assert_eq!(*dir, SplitDir::Horizontal);
+                assert!((ratio - 0.3).abs() < f32::EPSILON, "ratio restored");
+                assert!(
+                    matches!(&**first, PaneNode::Leaf(p) if p.agent_name.as_str() == "dev" && p.id == 9),
+                    "respawned dev back on the first side"
+                );
+                assert!(matches!(&**second, PaneNode::Leaf(p) if p.agent_name.as_str() == "dev2"));
+            }
+            PaneNode::Leaf(_) => panic!("expected a split root after restore"),
+        }
+    }
+
+    /// #1939: when the removed pane's sibling was a SUBTREE (nested splits),
+    /// the restore wraps that whole subtree — the original tree shape comes
+    /// back, not a split against a single leaf inside it.
+    #[test]
+    fn restore_nested_sibling_subtree_shape_1939() {
+        let mut layout = Layout::new();
+        let sibling = PaneNode::Split {
+            dir: SplitDir::Vertical,
+            ratio: 0.6,
+            first: Box::new(PaneNode::Leaf(Box::new(leaf(2, "dev2")))),
+            second: Box::new(PaneNode::Leaf(Box::new(leaf(3, "reviewer")))),
+        };
+        let root = PaneNode::Split {
+            dir: SplitDir::Horizontal,
+            ratio: 0.5,
+            first: Box::new(PaneNode::Leaf(Box::new(leaf(1, "dev")))),
+            second: Box::new(sibling),
+        };
+        layout.add_tab(Tab::with_root("team".into(), root));
+
+        layout.remember_removed_pane("dev");
+        layout.tabs[0].close_pane_by_id(1);
+
+        let placement = layout.take_removed_pane("dev").unwrap();
+        layout.restore_removed_pane(&placement, leaf(9, "dev"));
+
+        match layout.tabs[0].root() {
+            PaneNode::Split {
+                dir, first, second, ..
+            } => {
+                assert_eq!(*dir, SplitDir::Horizontal);
+                assert!(
+                    matches!(&**first, PaneNode::Leaf(p) if p.agent_name.as_str() == "dev"),
+                    "dev back as first child of the root split"
+                );
+                match &**second {
+                    PaneNode::Split {
+                        dir, first, second, ..
+                    } => {
+                        assert_eq!(*dir, SplitDir::Vertical, "sibling subtree intact");
+                        assert!(
+                            matches!(&**first, PaneNode::Leaf(p) if p.agent_name.as_str() == "dev2")
+                        );
+                        assert!(
+                            matches!(&**second, PaneNode::Leaf(p) if p.agent_name.as_str() == "reviewer")
+                        );
+                    }
+                    PaneNode::Leaf(_) => panic!("sibling subtree must stay a split"),
+                }
+            }
+            PaneNode::Leaf(_) => panic!("expected a split root after restore"),
+        }
+    }
+
+    /// #1939: a single-pane tab (closed on delete) is recreated at its
+    /// original tab index on respawn, not appended to the end.
+    #[test]
+    fn restore_recreates_closed_tab_at_original_index_1939() {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("t0".into(), leaf(1, "a")));
+        layout.add_tab(Tab::new("mid".into(), leaf(2, "dev")));
+        layout.add_tab(Tab::new("t2".into(), leaf(3, "c")));
+
+        layout.remember_removed_pane("dev");
+        layout.close_tab(1);
+        assert_eq!(layout.tabs.len(), 2);
+
+        let placement = layout.take_removed_pane("dev").unwrap();
+        assert_eq!(placement.tab_idx, 1);
+        assert!(placement.split.is_none(), "sole pane has no parent split");
+
+        layout.restore_removed_pane(&placement, leaf(9, "dev"));
+        assert_eq!(layout.tabs.len(), 3);
+        assert_eq!(
+            layout
+                .tabs
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["t0", "mid", "t2"],
+            "tab recreated in place, original order restored"
+        );
+        assert!(layout.tabs[1].root().has_agent("dev"));
+        assert_eq!(layout.active, 1, "recreated tab focused (add_tab parity)");
+    }
+
+    /// #1939: all remembered sibling agents gone by respawn time → fall back
+    /// to the pre-#1939 behavior (split the tab's focused pane); no panic.
+    #[test]
+    fn restore_falls_back_when_siblings_gone_1939() {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("team".into(), leaf(5, "newcomer")));
+        let placement = RemovedPanePlacement {
+            tab_name: "team".into(),
+            tab_idx: 0,
+            split: Some(RemovedSplit {
+                dir: SplitDir::Vertical,
+                ratio: 0.5,
+                was_first: false,
+                sibling_agents: vec!["dev2".into()],
+            }),
+        };
+        layout.restore_removed_pane(&placement, leaf(9, "dev"));
+        assert_eq!(layout.tabs.len(), 1, "no new tab");
+        assert_eq!(layout.tabs[0].root().pane_count(), 2);
+        assert!(layout.tabs[0].root().has_agent("dev"));
+        assert!(layout.tabs[0].root().has_agent("newcomer"));
+    }
+
+    /// #1939: remembered tab gone AND its index now out of range → the
+    /// recreated tab is clamped to the end; no panic.
+    #[test]
+    fn restore_clamps_out_of_range_tab_idx_1939() {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("t0".into(), leaf(1, "a")));
+        let placement = RemovedPanePlacement {
+            tab_name: "gone".into(),
+            tab_idx: 7,
+            split: None,
+        };
+        layout.restore_removed_pane(&placement, leaf(9, "dev"));
+        assert_eq!(layout.tabs.len(), 2);
+        assert_eq!(layout.tabs[1].name, "gone", "clamped to append");
+        assert!(layout.tabs[1].root().has_agent("dev"));
+    }
+
     #[test]
     fn find_agent_pane_returns_location() {
         let mut layout = Layout::new();

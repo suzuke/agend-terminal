@@ -5,7 +5,7 @@
 //! the layout accordingly — auto-creating or removing tabs/panes.
 
 use crate::agent::{self, AgentRegistry};
-use crate::layout::{Layout, MovePlacement, Pane, SplitDir, Tab};
+use crate::layout::{Layout, MovePlacement, SplitDir, Tab};
 
 /// Events sent from the API server to the TUI event loop when agents or teams
 /// are created/deleted via MCP tools. The TUI reacts by auto-creating or
@@ -344,10 +344,11 @@ fn handle_instance_created(
             }
         }
         None => match hint {
-            // #1431: a replace_instance re-spawn returns to the tab the old
-            // same-named pane occupied (recorded on its removal).
-            LayoutHint::SameTab => match layout.take_removed_tab(name) {
-                Some(tab_name) => place_in_remembered_tab(layout, &tab_name, pane),
+            // #1431/#1939: a replace_instance / restart_instance re-spawn
+            // returns to the position the old same-named pane occupied
+            // (recorded on its removal).
+            LayoutHint::SameTab => match layout.take_removed_pane(name) {
+                Some(placement) => layout.restore_removed_pane(&placement, pane),
                 None => layout.add_tab(Tab::new(name.to_string(), pane)),
             },
             _ => layout.add_tab(Tab::new(name.to_string(), pane)),
@@ -355,26 +356,11 @@ fn handle_instance_created(
     }
 }
 
-/// #1431: place a replacement pane into the tab named `tab_name`. Splits the
-/// tab's focused pane if the tab still exists, otherwise recreates a tab with
-/// that name. Same tab is guaranteed; the exact split slot is best-effort —
-/// the original leaf was destroyed when the replaced pane was removed.
-fn place_in_remembered_tab(layout: &mut Layout, tab_name: &str, pane: Pane) {
-    match layout.tabs.iter().position(|t| t.name == tab_name) {
-        Some(idx) => {
-            layout.tabs[idx].split_focused(SplitDir::Horizontal, pane);
-        }
-        None => layout.add_tab(Tab::new(tab_name.to_string(), pane)),
-    }
-}
-
 fn handle_instance_deleted(name: &str, layout: &mut Layout) {
-    // #1431: remember the tab this agent occupied so a replace_instance
-    // re-spawn (LayoutHint::SameTab) can return the new pane to the same tab.
-    if let Some((tab_idx, _)) = layout.find_agent_pane(name) {
-        let tab_name = layout.tabs[tab_idx].name.clone();
-        layout.remember_removed_tab(name, tab_name);
-    }
+    // #1431/#1939: remember the placement (tab + split position) this agent
+    // occupied so a replace/restart re-spawn (LayoutHint::SameTab) can return
+    // the new pane to the same spot.
+    layout.remember_removed_pane(name);
     remove_agent_pane(name, layout);
 }
 
@@ -796,12 +782,12 @@ mod tests {
         handle_instance_deleted("dev", &mut layout);
         assert_eq!(layout.tabs.len(), 0, "single-pane tab closes on delete");
 
-        let tab_name = layout
-            .take_removed_tab("dev")
-            .expect("delete must record the agent's tab");
-        assert_eq!(tab_name, "work");
+        let placement = layout
+            .take_removed_pane("dev")
+            .expect("delete must record the agent's placement");
+        assert_eq!(placement.tab_name, "work");
 
-        place_in_remembered_tab(&mut layout, &tab_name, leaf(2, "dev"));
+        layout.restore_removed_pane(&placement, leaf(2, "dev"));
         assert_eq!(layout.tabs.len(), 1);
         assert_eq!(
             layout.tabs[0].name, "work",
@@ -823,10 +809,10 @@ mod tests {
 
         handle_instance_deleted("dev", &mut layout);
         assert_eq!(layout.tabs.len(), 1, "multi-pane tab survives delete");
-        let tab_name = layout.take_removed_tab("dev").expect("tab recorded");
-        assert_eq!(tab_name, "team");
+        let placement = layout.take_removed_pane("dev").expect("placement recorded");
+        assert_eq!(placement.tab_name, "team");
 
-        place_in_remembered_tab(&mut layout, &tab_name, leaf(3, "dev"));
+        layout.restore_removed_pane(&placement, leaf(3, "dev"));
         assert_eq!(layout.tabs.len(), 1, "no new tab created");
         assert_eq!(layout.tabs[0].name, "team");
         assert!(layout.tabs[0].root().has_agent("dev"));
@@ -853,13 +839,13 @@ mod tests {
             1,
             "shared tab survives one pane's delete"
         );
-        let tab_name = layout
-            .take_removed_tab("fixup-dev")
-            .expect("delete records the agent's tab");
-        assert_eq!(tab_name, "fixup");
+        let placement = layout
+            .take_removed_pane("fixup-dev")
+            .expect("delete records the agent's placement");
+        assert_eq!(placement.tab_name, "fixup");
 
         // ... then the SameTab respawn splits back into the shared tab.
-        place_in_remembered_tab(&mut layout, &tab_name, leaf(3, "fixup-dev"));
+        layout.restore_removed_pane(&placement, leaf(3, "fixup-dev"));
         assert_eq!(layout.tabs.len(), 1, "no new tab — pane stays in 'fixup'");
         assert_eq!(layout.tabs[0].name, "fixup");
         assert!(layout.tabs[0].root().has_agent("fixup-dev"));
@@ -876,10 +862,10 @@ mod tests {
         assert!(resolve_split_anchor(LayoutHint::SameTab, Some("a"), Some("a"), &layout).is_none());
     }
 
-    /// #1431: take_removed_tab yields None for an agent that was never removed.
+    /// #1431: take_removed_pane yields None for an agent that was never removed.
     #[test]
-    fn take_removed_tab_none_for_unrecorded_agent() {
+    fn take_removed_pane_none_for_unrecorded_agent() {
         let mut layout = Layout::new();
-        assert!(layout.take_removed_tab("never-seen").is_none());
+        assert!(layout.take_removed_pane("never-seen").is_none());
     }
 }

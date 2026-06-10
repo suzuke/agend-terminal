@@ -222,6 +222,27 @@ impl Tab {
         remaining.is_none()
     }
 
+    /// #1939: restore `pane` to its remembered split position — wrap the
+    /// minimal subtree containing the still-present sibling agents in a split
+    /// of the remembered direction/ratio, with the pane on its remembered
+    /// side. Returns the pane back when none of the sibling agents are
+    /// displayed in this tab (caller picks a fallback placement).
+    pub fn restore_split(&mut self, split: &super::RemovedSplit, pane: Pane) -> Option<Pane> {
+        let anchors: std::collections::HashSet<usize> = split
+            .sibling_agents
+            .iter()
+            .filter_map(|a| self.root().find_pane_id_by_agent(a))
+            .collect();
+        if anchors.is_empty() {
+            return Some(pane);
+        }
+        let root = self.root.take().expect("root is always Some");
+        let (new_root, leftover) =
+            super::tree::wrap_subtree_with_split(root, &anchors, split, pane);
+        self.root = Some(new_root);
+        leftover
+    }
+
     /// Pane ID whose rect contains (col, row), if any.
     pub fn pane_at(&self, col: u16, row: u16) -> Option<usize> {
         self.pane_rects

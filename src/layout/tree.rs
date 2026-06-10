@@ -151,6 +151,39 @@ impl PaneNode {
     }
 }
 
+/// #1939: geometry of the parent split holding the leaf `pane_id`: direction,
+/// ratio, which side the leaf sits on, and the sibling subtree's agents.
+/// `None` when the pane is the tab's root (no parent split) or absent.
+pub(super) fn parent_split_of(node: &PaneNode, pane_id: usize) -> Option<super::RemovedSplit> {
+    let PaneNode::Split {
+        dir,
+        ratio,
+        first,
+        second,
+    } = node
+    else {
+        return None;
+    };
+    let is_target = |n: &PaneNode| matches!(n, PaneNode::Leaf(p) if p.id == pane_id);
+    if is_target(first) {
+        return Some(super::RemovedSplit {
+            dir: *dir,
+            ratio: *ratio,
+            was_first: true,
+            sibling_agents: second.agent_names(),
+        });
+    }
+    if is_target(second) {
+        return Some(super::RemovedSplit {
+            dir: *dir,
+            ratio: *ratio,
+            was_first: false,
+            sibling_agents: first.agent_names(),
+        });
+    }
+    parent_split_of(first, pane_id).or_else(|| parent_split_of(second, pane_id))
+}
+
 // --- Ownership-based tree transforms ---
 
 pub(super) fn split_in_tree(
@@ -251,6 +284,97 @@ pub(super) fn remove_from_tree(node: PaneNode, target_id: usize) -> (PaneNode, O
                 removed,
             )
         }
+    }
+}
+
+/// #1939: re-insert a removed pane at its remembered position by wrapping the
+/// minimal subtree containing all `anchors` (the still-present panes of the
+/// removed pane's former sibling subtree) in a split of the remembered
+/// direction/ratio, with the new pane on its remembered side. Returns the
+/// pane back when no anchor is present in the tree (caller falls back).
+pub(super) fn wrap_subtree_with_split(
+    node: PaneNode,
+    anchors: &std::collections::HashSet<usize>,
+    split: &super::RemovedSplit,
+    new_pane: Pane,
+) -> (PaneNode, Option<Pane>) {
+    let total = count_anchor_panes(&node, anchors);
+    if total == 0 {
+        return (node, Some(new_pane));
+    }
+    (wrap_minimal(node, anchors, total, split, new_pane), None)
+}
+
+fn count_anchor_panes(node: &PaneNode, anchors: &std::collections::HashSet<usize>) -> usize {
+    match node {
+        PaneNode::Leaf(p) => usize::from(anchors.contains(&p.id)),
+        PaneNode::Split { first, second, .. } => {
+            count_anchor_panes(first, anchors) + count_anchor_panes(second, anchors)
+        }
+    }
+}
+
+/// Descend toward the smallest subtree containing all `total` anchors, then
+/// wrap it. A leaf or a split whose anchors straddle both children is the
+/// minimal containing subtree.
+fn wrap_minimal(
+    node: PaneNode,
+    anchors: &std::collections::HashSet<usize>,
+    total: usize,
+    split: &super::RemovedSplit,
+    new_pane: Pane,
+) -> PaneNode {
+    if let PaneNode::Split {
+        dir,
+        ratio,
+        first,
+        second,
+    } = node
+    {
+        let in_first = count_anchor_panes(&first, anchors);
+        if in_first == total {
+            return PaneNode::Split {
+                dir,
+                ratio,
+                first: Box::new(wrap_minimal(*first, anchors, total, split, new_pane)),
+                second,
+            };
+        }
+        if in_first == 0 {
+            return PaneNode::Split {
+                dir,
+                ratio,
+                first,
+                second: Box::new(wrap_minimal(*second, anchors, total, split, new_pane)),
+            };
+        }
+        return wrap_node(
+            PaneNode::Split {
+                dir,
+                ratio,
+                first,
+                second,
+            },
+            split,
+            new_pane,
+        );
+    }
+    wrap_node(node, split, new_pane)
+}
+
+fn wrap_node(node: PaneNode, split: &super::RemovedSplit, new_pane: Pane) -> PaneNode {
+    let new_leaf = Box::new(PaneNode::Leaf(Box::new(new_pane)));
+    let existing = Box::new(node);
+    let (first, second) = if split.was_first {
+        (new_leaf, existing)
+    } else {
+        (existing, new_leaf)
+    };
+    PaneNode::Split {
+        dir: split.dir,
+        ratio: split.ratio,
+        first,
+        second,
     }
 }
 
