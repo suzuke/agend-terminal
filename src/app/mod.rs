@@ -1312,13 +1312,21 @@ where
     let raw_state = notification_queue::draft_state(home, &pane.agent_name);
     let buffer_empty = if raw_state == notification_queue::DraftState::Drafting {
         pane.backend.as_ref().and_then(|b| {
-            // #1948 v2: marker probe (claude/codex/agy) → placeholder probe (kiro)
-            // → None fallback. pane.vterm is owned (no lock).
-            notification_queue::input_box_empty_probe(
-                &pane.vterm.tail_lines(DRAFT_INPUT_TAIL_ROWS),
-                b.input_prompt_marker(),
-                b.input_empty_placeholder(),
-            )
+            // #1948(b): codex's empty box shows DIM ghost text after `›`, which a
+            // plain marker probe mis-reads as typed content — route it through the
+            // DIM-aware check (needs the per-char dim mask). Everyone else uses the
+            // text-only probe: marker (claude/agy) → placeholder (kiro) → fallback.
+            // pane.vterm is owned (no lock).
+            if let Some(marker) = b.input_dim_ghost_marker() {
+                let (text, dim) = pane.vterm.tail_lines_with_dim(DRAFT_INPUT_TAIL_ROWS);
+                notification_queue::input_box_dim_aware_empty(&text, &dim, marker)
+            } else {
+                notification_queue::input_box_empty_probe(
+                    &pane.vterm.tail_lines(DRAFT_INPUT_TAIL_ROWS),
+                    b.input_prompt_marker(),
+                    b.input_empty_placeholder(),
+                )
+            }
         })
     } else {
         None
@@ -1911,16 +1919,66 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// #1948(b) §3.9: codex's empty box shows DIM ghost text after `›` (SGR 2) —
+    /// the dim-aware path must DELIVER (the v1 plain-marker path mis-read the ghost
+    /// as typed content and held). The vterm processes the real SGR so the dim
+    /// flag is set exactly as codex emits it.
+    #[test]
+    fn draft_gate_delivers_for_codex_when_ghost_is_dim() {
+        let home = tmp_home("draftgate-codex-ghost");
+        seed_drafting_with_queued(&home, "lead");
+        // `ESC[1m›` (bold prompt) + `ESC[2m…` (dim ghost) — codex's real encoding.
+        let screen = "\u{1b}[1m›\u{1b}[22m\u{1b}[2m Use /skills to list available skills\u{1b}[0m";
+        let mut p = pane_with_screen("lead", Some(Backend::Codex), screen);
+        p.pending_notification_count = notification_queue::pending_count(&home, "lead");
+
+        let mut injected: Vec<String> = Vec::new();
+        flush_notifications_for_pane(&home, &mut p, |t| {
+            injected.push(t.to_string());
+            Ok(())
+        });
+        assert_eq!(
+            injected.len(),
+            1,
+            "codex empty box (dim ghost after ›) → stale draft delivered, not held"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1948(b) §3.9: a real codex draft (normal-intensity text after `›`) must
+    /// still DEFER — the dim signal must not false-deliver on a real draft.
+    #[test]
+    fn draft_gate_defers_for_codex_when_input_normal_intensity() {
+        let home = tmp_home("draftgate-codex-typed");
+        seed_drafting_with_queued(&home, "lead");
+        // `ESC[1m›` then NORMAL intensity input (no SGR 2).
+        let screen = "\u{1b}[1m›\u{1b}[22m my actual draft reply\u{1b}[0m";
+        let mut p = pane_with_screen("lead", Some(Backend::Codex), screen);
+        p.pending_notification_count = notification_queue::pending_count(&home, "lead");
+
+        let mut injected: Vec<String> = Vec::new();
+        flush_notifications_for_pane(&home, &mut p, |t| {
+            injected.push(t.to_string());
+            Ok(())
+        });
+        assert!(
+            injected.is_empty(),
+            "codex with normal-intensity input → keep deferring (protection unchanged)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     #[test]
     fn input_prompt_marker_only_for_verified_backends() {
         assert_eq!(Backend::ClaudeCode.input_prompt_marker(), Some("❯"));
         assert_eq!(Backend::Agy.input_prompt_marker(), Some(">"));
         // #1948 codex follow-up: codex is NOT marker-covered — its empty box shows
-        // a rotating ghost phrase after `›`, which the marker probe would mis-read
-        // as typed content. It falls back to the timestamp behavior until a
-        // colour/dim empty-box signal lands.
+        // a rotating ghost phrase after `›`, which the PLAIN marker probe mis-reads
+        // as typed content. #1948(b): codex is instead covered via the DIM-aware
+        // path (`input_dim_ghost_marker`) — the ghost is dim, real input is normal.
         assert_eq!(Backend::Codex.input_prompt_marker(), None);
         assert_eq!(Backend::Codex.input_empty_placeholder(), None);
+        assert_eq!(Backend::Codex.input_dim_ghost_marker(), Some("›"));
         assert_eq!(Backend::Shell.input_prompt_marker(), None);
         assert_eq!(Backend::OpenCode.input_prompt_marker(), None);
         // #1948 v2: kiro covered via placeholder, NOT a marker; opencode stays
@@ -1932,6 +1990,10 @@ mod tests {
         );
         assert_eq!(Backend::OpenCode.input_empty_placeholder(), None);
         assert_eq!(Backend::ClaudeCode.input_empty_placeholder(), None);
+        // dim-ghost is codex-only: the marker-backends and kiro are NOT dim-aware.
+        assert_eq!(Backend::ClaudeCode.input_dim_ghost_marker(), None);
+        assert_eq!(Backend::Agy.input_dim_ghost_marker(), None);
+        assert_eq!(Backend::KiroCli.input_dim_ghost_marker(), None);
     }
 
     /// app-mode subscriber-wiring source pin. Owned `agend-terminal app` mode
