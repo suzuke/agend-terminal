@@ -158,6 +158,67 @@ fn drain_empties_inbox() {
 }
 
 #[test]
+fn drain_caps_batch_under_budget_leaving_remainder_unread() {
+    // #1940 (d): a backlog that would exceed the dedup per-entry cap (64 KiB) is
+    // returned as a byte-capped batch so the MCP response stays dedup-cacheable
+    // (the bridge same-request_id retry can then recover a lost transport). The
+    // remainder MUST stay UNREAD and surface on the next drain — capped, never
+    // lost, never duplicated, never split.
+    let home = tmp_home("drain-cap");
+    let big = "x".repeat(20 * 1024); // ~20 KiB body each → 3 exceed the 48 KiB budget
+    for i in 0..3 {
+        enqueue(&home, "agent1", make_msg(&format!("a{i}"), &big)).ok();
+    }
+
+    let first = drain(&home, "agent1");
+    assert!(!first.is_empty(), "at least one message is always returned");
+    assert!(
+        first.len() < 3,
+        "batch capped below the full 3-message backlog, got {}",
+        first.len()
+    );
+    let batch_bytes: usize = first
+        .iter()
+        .map(|m| serde_json::to_string(m).unwrap().len())
+        .sum();
+    assert!(
+        batch_bytes <= super::storage::DRAIN_BATCH_BUDGET_BYTES,
+        "returned batch {batch_bytes}B must be ≤ the drain budget (dedup-cacheable)"
+    );
+    let (unread, _) = unread_count(&home, "agent1");
+    assert_eq!(unread, 3 - first.len(), "the remainder stays unread");
+
+    // Next drain returns exactly the rest — total 3, no loss, no duplicate.
+    let second = drain(&home, "agent1");
+    assert_eq!(
+        first.len() + second.len(),
+        3,
+        "all 3 messages delivered across the paginated drains"
+    );
+
+    fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn drain_returns_single_oversized_message_alone() {
+    // #1940 (d): a single message larger than the budget can't be split — it is
+    // still returned (progress guaranteed: a drain always yields ≥1 message),
+    // as its own batch, rather than being stranded.
+    let home = tmp_home("drain-oversized-single");
+    let huge = "y".repeat(60 * 1024); // > the 48 KiB budget
+    enqueue(&home, "agent1", make_msg("big", &huge)).ok();
+
+    let msgs = drain(&home, "agent1");
+    assert_eq!(
+        msgs.len(),
+        1,
+        "the oversized message is returned alone, never stranded"
+    );
+
+    fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn drain_nonexistent_returns_empty() {
     let home = tmp_home("no-inbox");
     let msgs = drain(&home, "nonexistent");
@@ -372,58 +433,12 @@ fn notify_source_system_display() {
     assert!(s.reply_hint().is_empty());
 }
 
-#[test]
-fn drain_recovers_leftover_draining_file() {
-    // Simulates a crash between rename() and read: pending messages
-    // sit in `{name}.draining`. A second drain() must surface them,
-    // not drop them.
-    let home = tmp_home("recover");
-    let inbox_dir = home.join("inbox");
-    fs::create_dir_all(&inbox_dir).ok();
-    let draining = inbox_dir.join("agent1.draining");
-    let msg = serde_json::to_string(&make_msg("crashed", "pending")).expect("ser");
-    fs::write(&draining, format!("{msg}\n")).expect("write leftover");
-
-    let msgs = drain(&home, "agent1");
-    assert_eq!(msgs.len(), 1, "crashed batch must be recovered");
-    assert_eq!(msgs[0].from, "crashed");
-    assert_eq!(msgs[0].text, "pending");
-    // After successful read, leftover is cleared.
-    assert!(
-        !draining.exists(),
-        ".draining must be removed after successful drain"
-    );
-    fs::remove_dir_all(&home).ok();
-}
-
-#[test]
-fn drain_does_not_overwrite_leftover_draining() {
-    // If a .draining file exists from a prior crash AND a new live
-    // inbox has arrived, the live file must be preserved — the new
-    // messages are picked up on the next drain cycle, not lost by a
-    // rename that overwrites the pending batch.
-    let home = tmp_home("no_overwrite");
-    let inbox_dir = home.join("inbox");
-    fs::create_dir_all(&inbox_dir).ok();
-
-    let draining = inbox_dir.join("agent1.draining");
-    let old_msg = serde_json::to_string(&make_msg("old", "from_crashed_batch")).expect("ser");
-    fs::write(&draining, format!("{old_msg}\n")).expect("write leftover");
-
-    enqueue(&home, "agent1", make_msg("new", "fresh")).ok();
-
-    // First drain: returns the crashed batch only.
-    let first = drain(&home, "agent1");
-    assert_eq!(first.len(), 1);
-    assert_eq!(first[0].from, "old");
-
-    // Second drain: picks up the new message now that .draining is gone.
-    let second = drain(&home, "agent1");
-    assert_eq!(second.len(), 1, "fresh message must survive recovery");
-    assert_eq!(second[0].from, "new");
-
-    fs::remove_dir_all(&home).ok();
-}
+// #1940: `drain_recovers_leftover_draining_file` + `drain_does_not_overwrite_
+// leftover_draining` were REMOVED with the `.draining` snapshot/recovery path
+// they exercised (see storage.rs::drain — zero-creator dead code, and a real
+// re-serve snapshot was rejected as exactly-once-breaking). The delivery-loss
+// recovery they aimed at is now the bridge same-request_id retry + request_dedup
+// cache, kept reliable by the drain byte cap (see drain_caps_batch_*).
 
 #[test]
 fn drain_read_failure_leaves_file_for_retry() {
@@ -1228,23 +1243,21 @@ fn test_enqueue_vs_drain_no_lost_msg() {
 }
 
 #[test]
-fn test_concurrent_drain_no_duplicate_recovery() {
+fn test_concurrent_drain_no_duplicates() {
     let _guard = READONLY_TEST_LOCK.lock();
-    // Pre-write a stale .draining file with 3 messages.
-    // Spawn 2 threads that both call drain simultaneously.
-    // Total recovered messages must be exactly 3 (no duplicates).
-    let home = tmp_home("concurrent-recovery");
-    let inbox_dir = home.join("inbox");
-    fs::create_dir_all(&inbox_dir).ok();
-
-    let draining = inbox_dir.join("agent1.draining");
-    let mut content = String::new();
+    // #1940: two threads drain the same inbox simultaneously; the inbox lock
+    // must serialize them so each of the 3 messages is returned EXACTLY ONCE
+    // (no duplicate delivery under contention) — the exactly-once contract a
+    // re-serve snapshot would have broken.
+    let home = tmp_home("concurrent-drain");
     for i in 0..3 {
-        let msg = make_msg(&format!("recover{i}"), &format!("msg{i}"));
-        content.push_str(&serde_json::to_string(&msg).unwrap());
-        content.push('\n');
+        enqueue(
+            &home,
+            "agent1",
+            make_msg(&format!("m{i}"), &format!("msg{i}")),
+        )
+        .ok();
     }
-    fs::write(&draining, &content).ok();
 
     let home_a = std::sync::Arc::new(home.clone());
     let home_b = home_a.clone();
@@ -1258,7 +1271,7 @@ fn test_concurrent_drain_no_duplicate_recovery() {
     assert_eq!(
         all.len(),
         3,
-        "exactly 3 recovered messages expected (no duplicates), got {}",
+        "each message drained exactly once (no duplicates), got {}",
         all.len()
     );
 

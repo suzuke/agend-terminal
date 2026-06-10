@@ -260,24 +260,39 @@ pub fn mark_ci_watch_superseded(
 ///
 /// Soft-delete semantics: messages stay in the JSONL file with `read_at`
 /// set; [`sweep_expired`] removes them later based on TTL rules.
+/// #1940: byte budget for one drain's returned batch — kept under
+/// `request_dedup::PER_ENTRY_CAP_BYTES` (64 KiB) so the response is always
+/// dedup-cacheable (never `Oversized`). That is the whole fix: the bridge (#842)
+/// retries a lost transport with the SAME `request_id`, and `request_dedup`
+/// returns the cached response — but only if it was cacheable. An uncapped drain
+/// that exceeded 64 KiB was cached as `Oversized`, so the retry got a
+/// deterministic error and the (already `read_at`-set) content was lost.
+pub(crate) const DRAIN_BATCH_BUDGET_BYTES: usize = 48 * 1024;
+
+/// Drain unread messages: mark `read_at` and write back.
 /// Uses atomic tmp+fsync+rename for crash safety.
+///
+/// #1940 (mark-read ≠ delivered — the #1888 class on the DELIVERY side): the MCP
+/// response can be lost AFTER drain() has persisted `read_at`. The recovery is
+/// the bridge's same-`request_id` retry + `request_dedup` cache, which is
+/// already in place; the ONLY hole was that an oversized (>64 KiB) response was
+/// cached as `Oversized` and could not be re-served. So (d): cap the returned
+/// batch under the dedup per-entry cap, leaving the remainder UNREAD for the next
+/// drain (a message is never split — at least one is always returned). A
+/// per-agent `.draining` re-serve snapshot was evaluated and REJECTED: it cannot
+/// distinguish a timeout-retry from a normal next poll without a client cursor,
+/// so it either starves new messages (re-serve within a TTL) or double-delivers
+/// (re-serve once / concurrent) — both break the inbox's exactly-once contract.
 pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
     let path = inbox_path_resolved(home, name);
 
-    if !path.exists() && !path.with_extension("draining").exists() {
+    if !path.exists() {
         return Vec::new();
     }
 
-    // Phase 1 (locked): read file, mark read_at, write back.
-    // Side effects (dedup, heartbeat) are deferred to phase 2.
-    let (all_messages, newly_read) = match with_inbox_lock(home, name, |path| {
-        let tmp = path.with_extension("draining");
-        if tmp.exists() {
-            let msgs = read_drain_file(&tmp);
-            let flags = vec![true; msgs.len()];
-            return (msgs, flags);
-        }
-
+    // Phase 1 (locked): run a byte-capped drain.
+    // Returns (messages_to_return, newly_read_subset).
+    let (to_return, newly_read_msgs) = match with_inbox_lock(home, name, |path| {
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
             Err(_) => return (Vec::new(), Vec::new()),
@@ -285,7 +300,11 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
 
         let now = chrono::Utc::now().to_rfc3339();
         let mut all_messages: Vec<InboxMessage> = Vec::new();
-        let mut newly_read: Vec<bool> = Vec::new();
+        let mut batch: Vec<InboxMessage> = Vec::new(); // returned this drain
+        let mut newly_read: Vec<InboxMessage> = Vec::new(); // batch minus superseded
+        let mut budget_used = 0usize;
+        let mut budget_closed = false; // (d): once closed, remaining stay unread
+        let mut changed = false;
 
         for line in content.lines() {
             if line.trim().is_empty() {
@@ -305,13 +324,31 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
             }
             if msg.read_at.is_none() {
                 if msg.superseded_by.is_some() {
+                    // superseded obligations are retired (marked read) but never
+                    // returned — unchanged from the pre-#1940 behavior.
                     msg.read_at = Some(now.clone());
-                    newly_read.push(false);
+                    changed = true;
                     all_messages.push(msg);
                     continue;
                 }
+                if budget_closed {
+                    // (d): budget already hit — leave this (and the rest) UNREAD.
+                    all_messages.push(msg);
+                    continue;
+                }
+                let sz = serde_json::to_string(&msg)
+                    .map(|s| s.len())
+                    .unwrap_or(line.len());
+                // Always take ≥1 message (progress); otherwise only while the
+                // running batch stays under budget. A message is never split.
+                if !batch.is_empty() && budget_used + sz > DRAIN_BATCH_BUDGET_BYTES {
+                    budget_closed = true;
+                    all_messages.push(msg);
+                    continue;
+                }
+                budget_used += sz;
                 msg.read_at = Some(now.clone());
-                newly_read.push(true);
+                changed = true;
                 // #1888 instrument-only (zero-behavior): a `ci-ready-for-action`
                 // handoff just transitioned to read on this drain. After this, the
                 // handoff_timeout_watchdog's `unread_of_kind` scan can no longer
@@ -338,14 +375,15 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
                         "ci-ready-for-action handoff marked read on drain"
                     );
                 }
+                batch.push(msg.clone());
+                newly_read.push(msg.clone());
+                all_messages.push(msg);
             } else {
-                newly_read.push(false);
+                all_messages.push(msg);
             }
-            all_messages.push(msg);
         }
 
-        let has_unread = newly_read.iter().any(|&b| b);
-        if has_unread {
+        if changed {
             let write_tmp = path.with_extension("jsonl.tmp");
             let result = (|| -> anyhow::Result<()> {
                 let mut f = std::fs::OpenOptions::new()
@@ -365,7 +403,7 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
             }
         }
 
-        (all_messages, newly_read)
+        (batch, newly_read)
     }) {
         Ok(pair) => pair,
         Err(e) => {
@@ -374,22 +412,15 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
         }
     };
 
-    // Phase 2 (unlocked): side effects that don't need file exclusion.
-    for (msg, &is_new) in all_messages.iter().zip(&newly_read) {
-        if is_new {
-            if let Some(ref id) = msg.id {
-                crate::daemon::notification_dedup::global().mark_consumed(name, id);
-            }
+    // Phase 2 (unlocked): side effects only for messages newly read THIS drain
+    // (empty on a snapshot re-serve — those already ran on the original drain).
+    for msg in &newly_read_msgs {
+        if let Some(ref id) = msg.id {
+            crate::daemon::notification_dedup::global().mark_consumed(name, id);
         }
     }
 
-    if let Some(channel_msg) = all_messages
-        .iter()
-        .zip(newly_read.iter())
-        .rev()
-        .find(|(m, &nr)| nr && m.channel.is_some())
-        .map(|(m, _)| m)
-    {
+    if let Some(channel_msg) = newly_read_msgs.iter().rev().find(|m| m.channel.is_some()) {
         let channel_name = match channel_msg.channel.as_ref().expect("checked") {
             crate::channel::ChannelKind::Telegram => "telegram",
             crate::channel::ChannelKind::Discord => "discord",
@@ -414,51 +445,21 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
         );
     }
 
-    all_messages
-        .into_iter()
-        .zip(newly_read)
-        .filter_map(|(msg, nr)| nr.then_some(msg))
-        .collect()
+    to_return
 }
 
-fn read_drain_file(tmp: &Path) -> Vec<InboxMessage> {
-    let content = match std::fs::read_to_string(tmp) {
-        Ok(c) => c,
-        // Leave `.draining` in place so the next drain call retries; the
-        // previous implementation early-returned without removing, but also
-        // returned empty even on success when read_to_string returned Err
-        // after the earlier remove had run — which was impossible to recover.
-        Err(e) => {
-            tracing::warn!(
-                path = %tmp.display(),
-                error = %e,
-                "inbox drain read failed; .draining retained for retry"
-            );
-            return Vec::new();
-        }
-    };
-    let messages: Vec<InboxMessage> = content
-        .lines()
-        .filter_map(|l| {
-            let msg: InboxMessage = serde_json::from_str(l).ok()?;
-            if msg.schema_version > InboxMessage::CURRENT_VERSION {
-                tracing::error!(
-                    found = msg.schema_version,
-                    supported = InboxMessage::CURRENT_VERSION,
-                    "dropping inbox message written by newer schema version"
-                );
-                return None;
-            }
-            Some(msg)
-        })
-        .collect();
-    // Remove only AFTER a successful read+parse so crashes between read and
-    // remove still leave the data on disk for the next drain to recover.
-    if let Err(e) = std::fs::remove_file(tmp) {
-        tracing::warn!(path = %tmp.display(), error = %e, "inbox drain cleanup failed");
-    }
-    messages
-}
+// #1940: the pre-existing `.draining` snapshot READ/recovery path
+// (`read_drain_file` + the `<name>.draining` existence check) was REMOVED here.
+// It was zero-creator dead code (nothing wrote `.draining` since an earlier
+// refactor dropped the creation half), and completing it into a real re-serve
+// snapshot was evaluated and REJECTED for #1940: without a client cursor a
+// snapshot cannot tell a timeout-retry from a normal next poll, so it either
+// starves new messages (re-serve within a TTL — a rapid drain loop never
+// advances) or double-delivers (re-serve once / concurrent drains), both of
+// which break the inbox's exactly-once contract. The bridge's same-`request_id`
+// retry + `request_dedup` cache already recovers a lost transport correctly;
+// the (d) byte cap above is what keeps that recovery from being defeated by an
+// `Oversized` response.
 
 /// One bounded line in a [`ClearCompactResult`] — a COMPACT projection of an
 /// inbox message (never the full [`InboxMessage`], so a clear can never
