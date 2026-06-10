@@ -521,6 +521,14 @@ fn restore_node_reconciled(
             first,
             second,
         } => {
+            // Depth-safety invariant (no explicit max-depth guard needed):
+            // `apply_session_layout` parses session.json with `serde_json::from_str`,
+            // whose default `recursion_limit` (128) rejects a pathologically deep
+            // document AT PARSE TIME (→ `None` → fleet.yaml rebuild fallback) before
+            // it ever becomes a `SessionNode` tree — so this recursion can never
+            // receive a degenerate depth. If a NON-serde tree-feed path is ever
+            // added, or `disable_recursion_limit` is set anywhere, add an explicit
+            // depth guard here.
             let f = restore_node_reconciled(first, agent_source, pane_builder, layout, placed);
             let s = restore_node_reconciled(second, agent_source, pane_builder, layout, placed);
             match (f, s) {
