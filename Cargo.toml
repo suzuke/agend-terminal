@@ -104,7 +104,7 @@ memchr = "2"
 sha2 = "0.10"
 # #1576: HMAC-SHA256 keyed-hash integrity for the operator-mode authority file
 # (single-user injection-containment defense-in-depth — pairs with sha2 above).
-hmac = "0.12"
+hmac = "0.13"
 hex = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
