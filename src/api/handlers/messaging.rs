@@ -512,6 +512,17 @@ fn track_dispatch(
                 threshold,
             );
         }
+        // #1942: link the dispatched branch to the correlated task. The lead
+        // dispatches `kind=task` with `branch=`, but the task is often created
+        // separately with `branch: None` — so without this the task↔branch link
+        // never exists and `auto_close_merged_tasks` can't auto-close on merge
+        // (the lead-merges strand). Idempotent + no-op if no branch / no task.
+        if let (Some(branch), Some(corr)) = (
+            params["branch"].as_str().filter(|b| !b.is_empty()),
+            outbound_corr,
+        ) {
+            let _ = crate::tasks::link_branch_to_task(home, corr, branch);
+        }
     } else if kind_str == "report" {
         // #1525: clear the dispatch-idle sidecar with the SAME key the record
         // path uses — `correlation_id.or(task_id)` (see the kind=task branch

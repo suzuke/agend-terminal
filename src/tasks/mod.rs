@@ -230,6 +230,41 @@ pub fn list_all(home: &Path) -> Vec<Task> {
     tasks
 }
 
+/// #1942: link a git `branch` to an existing task by emitting a `BranchLinked`
+/// event. Called from the dispatch path (`send kind=task` carrying `branch=`)
+/// so a separately-created task — which starts with `branch: None` — gains the
+/// task↔branch link that `auto_close_merged_tasks` needs to auto-close the task
+/// when the branch merges (the #1942 lead-merges gap).
+///
+/// Returns `Ok(true)` if a `BranchLinked` event was emitted, `Ok(false)` if it
+/// was a no-op (task absent, empty branch, or the branch is already linked —
+/// idempotent so a re-dispatch of the same branch doesn't churn the log).
+pub fn link_branch_to_task(home: &Path, task_id: &str, branch: &str) -> anyhow::Result<bool> {
+    if branch.is_empty() || !task_id.starts_with("t-") {
+        return Ok(false);
+    }
+    let state = crate::task_events::replay(home).unwrap_or_default();
+    let tid = crate::task_events::TaskId(task_id.to_string());
+    let Some(record) = state.tasks.get(&tid) else {
+        return Ok(false);
+    };
+    if record.branch.as_deref() == Some(branch) {
+        return Ok(false);
+    }
+    let emitter = crate::task_events::InstanceName::from("system:branch-link");
+    crate::task_events::append_batch(
+        home,
+        &emitter,
+        vec![crate::task_events::TaskEvent::BranchLinked {
+            task_id: tid,
+            by: emitter.clone(),
+            branch: branch.to_string(),
+        }],
+    )?;
+    tracing::info!(task_id, branch, "linked branch to task (#1942)");
+    Ok(true)
+}
+
 /// Sweep overdue claimed tasks back to open by **emitting `Released`
 /// events** (PR3 cutover from tasks.json mutation). `Released` is
 /// distinct from `Reopened`: it clears the owner (claim is gone),

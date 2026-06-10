@@ -140,7 +140,12 @@ pub fn auto_close_merged_tasks(home: &Path, branch: &str) {
         .iter()
         .filter(|t| t.status == TaskStatus::Verified)
         .filter(|t| {
-            contains_as_token(&t.description, branch) || contains_as_token(&t.title, branch)
+            // #1942: the structured `branch` field is the canonical link (set by
+            // `link_branch_to_task` on dispatch); the description/title token
+            // match stays as the legacy fallback for branches embedded in text.
+            t.branch.as_deref() == Some(branch)
+                || contains_as_token(&t.description, branch)
+                || contains_as_token(&t.title, branch)
         })
         .collect();
 
@@ -307,6 +312,74 @@ mod tests {
             task.status,
             TaskStatus::Done,
             "unverified task must NOT be auto-closed"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn auto_close_finds_task_via_linked_branch_field_1942() {
+        // #1942: the canonical task↔branch link is the structured `branch` field
+        // (set by `link_branch_to_task` at dispatch), NOT the description text.
+        // A Verified task whose branch field == the merged branch must auto-close
+        // even though the branch name appears NOWHERE in its title/description.
+        use crate::task_events::{append_batch, InstanceName, TaskEvent, TaskId};
+        let dir = std::env::temp_dir().join(format!("agend-autoclose-1942-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let tid = "t-1942-link-001";
+        append_batch(
+            &dir,
+            &InstanceName::from("test:seed"),
+            vec![
+                TaskEvent::Created {
+                    task_id: TaskId(tid.into()),
+                    title: "impl widget".into(),
+                    description: "do the thing".into(),
+                    priority: "normal".into(),
+                    owner: None,
+                    due_at: None,
+                    depends_on: Vec::new(),
+                    routed_to: None,
+                    branch: None,
+                    bind: None,
+                    eta_secs: None,
+                    tags: vec![],
+                    parent_id: None,
+                },
+                TaskEvent::Verified {
+                    task_id: TaskId(tid.into()),
+                    by_reviewer: InstanceName::from("reviewer"),
+                    verdict: "VERIFIED".into(),
+                },
+            ],
+        )
+        .expect("seed verified task");
+        // Dispatch-time linkage (the #1942 fix).
+        assert!(
+            crate::tasks::link_branch_to_task(&dir, tid, "fix/1942-widget").unwrap(),
+            "branch should link to the task"
+        );
+        // Idempotent: re-linking the same branch is a no-op.
+        assert!(
+            !crate::tasks::link_branch_to_task(&dir, tid, "fix/1942-widget").unwrap(),
+            "re-linking the same branch must be a no-op"
+        );
+        let task = crate::tasks::list_all(&dir)
+            .into_iter()
+            .find(|t| t.id.as_str() == tid)
+            .expect("task present");
+        assert_eq!(task.branch.as_deref(), Some("fix/1942-widget"));
+        assert_eq!(task.status, TaskStatus::Verified);
+        // Branch merges → auto-close finds the task via the structured field
+        // (no branch token in title/description).
+        auto_close_merged_tasks(&dir, "fix/1942-widget");
+        let task = crate::tasks::list_all(&dir)
+            .into_iter()
+            .find(|t| t.id.as_str() == tid)
+            .expect("task present");
+        assert_eq!(
+            task.status,
+            TaskStatus::Done,
+            "#1942: a merged linked-branch must auto-close the verified task"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

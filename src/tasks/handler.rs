@@ -1029,6 +1029,9 @@ fn summarize_event(env: &crate::task_events::TaskEventEnvelope) -> (&str, String
         ),
         TaskEvent::MovedToBacklog { .. } => ("moved_to_backlog", actor, "→ backlog".to_string()),
         TaskEvent::MovedToReview { .. } => ("moved_to_review", actor, "→ in_review".to_string()),
+        TaskEvent::BranchLinked { branch, by, .. } => {
+            ("branch_linked", by.0.clone(), format!("branch → {branch}"))
+        }
     }
 }
 

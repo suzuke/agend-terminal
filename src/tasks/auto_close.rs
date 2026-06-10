@@ -27,9 +27,18 @@ pub fn auto_close_on_report(
         return Ok(false);
     };
     use crate::task_events::TaskStatus;
+    // #1942: `InReview` was added in #1265 but never added to this whitelist, so
+    // a terminal report on a task the lead promoted to `in_review` was silently
+    // dropped → task stranded open → next dispatch blocked busy. `InReview→Done`
+    // is a legal transition (`can_transition_to`), so a terminal report from the
+    // assignee closes an `in_review` task just as it closes an `in_progress` one.
     if !matches!(
         record.status,
-        TaskStatus::Open | TaskStatus::Claimed | TaskStatus::InProgress | TaskStatus::Blocked
+        TaskStatus::Open
+            | TaskStatus::Claimed
+            | TaskStatus::InProgress
+            | TaskStatus::Blocked
+            | TaskStatus::InReview
     ) {
         return Ok(false);
     }
@@ -378,6 +387,46 @@ mod tests {
         );
         assert_eq!(
             task_status(&home, "t-ok"),
+            Some(crate::task_events::TaskStatus::Done)
+        );
+    }
+
+    #[test]
+    fn assignee_terminal_report_closes_in_review_task_1942() {
+        // #1942: a task the lead promoted to `in_review` (code-review flow) must
+        // still auto-close on the assignee's terminal report. `InReview` was
+        // missing from the whitelist, so the report was silently dropped and the
+        // task stranded open → next dispatch blocked busy.
+        let home = tmp_home("in_review_close");
+        seed_claimed_task(&home, "t-1942-ir", "dev-agent");
+        crate::task_events::append_batch(
+            &home,
+            &InstanceName::from("test:lead"),
+            vec![TaskEvent::MovedToReview {
+                task_id: TaskId("t-1942-ir".into()),
+            }],
+        )
+        .expect("promote to in_review");
+        assert_eq!(
+            task_status(&home, "t-1942-ir"),
+            Some(crate::task_events::TaskStatus::InReview),
+            "precondition: task is in_review"
+        );
+        let closed = auto_close_on_report(
+            &home,
+            "report",
+            "t-1942-ir",
+            "dev-agent",
+            "review done",
+            true,
+        )
+        .unwrap();
+        assert!(
+            closed,
+            "#1942: a terminal report must auto-close an in_review task"
+        );
+        assert_eq!(
+            task_status(&home, "t-1942-ir"),
             Some(crate::task_events::TaskStatus::Done)
         );
     }
