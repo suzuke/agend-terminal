@@ -27,7 +27,7 @@ const STUCK_AFTER_MINS: i64 = 30;
 const REALERT_AFTER_MINS: i64 = 60;
 /// Fallback alert recipient when the stuck agent isn't in any team (so no
 /// orchestrator can be resolved). Matches the idle watchdog's default.
-const FALLBACK_RECIPIENT: &str = "lead";
+pub(crate) const FALLBACK_RECIPIENT: &str = "lead";
 
 /// Scan every fleet instance and alert the lead about any that is sitting on a
 /// pile of unread inbox messages. `last_alerted` is owned by the caller (the
@@ -95,7 +95,7 @@ pub(crate) fn scan_and_emit(
 }
 
 /// The orchestrator of the first team that lists `agent` as a member.
-fn orchestrator_for(fleet: &crate::fleet::FleetConfig, agent: &str) -> Option<String> {
+pub(crate) fn orchestrator_for(fleet: &crate::fleet::FleetConfig, agent: &str) -> Option<String> {
     fleet
         .teams
         .values()

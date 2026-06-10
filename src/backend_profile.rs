@@ -38,7 +38,26 @@ pub struct BackendProfile {
     pub behavioral: BehavioralConfig,
     pub productivity: ProductivityConfig,
     pub initial_state: AgentState,
+    /// Context% telemetry: regex whose capture group 1 extracts the backend's
+    /// self-reported context usage percent from the BOTTOM status rows of the
+    /// rendered screen (`None` = backend displays no usable percent). Scanned
+    /// only over the bottom status rows — NOT the error tail window — because
+    /// agents routinely DISCUSS context% in conversation text (prose-FP).
+    pub context_pattern: Option<&'static str>,
 }
+
+/// ClaudeCode context% — matches the fleet statusline's used-form as rendered
+/// live (`Model: Fable 5 | Ctx Used: 61.0% | ⎇ branch | (+0,-0)`); the value
+/// can be fractional. TODO(left-form): a default Claude Code install without a
+/// statusline only shows `Context left until auto-compact: N%` near the
+/// threshold — REMAINING semantics, needs inversion; deliberately not matched
+/// in v1 (this fleet always runs the custom statusline).
+pub const CLAUDE_CONTEXT_PATTERN: &str = r"(?i)\bctx\s+used:\s*(\d+(?:\.\d+)?)\s*%";
+
+/// KiroCli context% — matches the footer as rendered live
+/// (`Kiro · auto · ◔ 10%`). The ◔ glyph is kiro's context gauge and never
+/// appears in prose.
+pub const KIRO_CONTEXT_PATTERN: &str = r"◔\s*(\d+(?:\.\d+)?)\s*%";
 
 /// The single dispatch: `Backend → &'static BackendProfile`, lazy-cached
 /// (compile-once, mirroring `StatePatterns::for_backend`'s `OnceLock`). Returns
@@ -89,6 +108,7 @@ fn agy_profile() -> BackendProfile {
             heartbeat_fresh_window_ms: 10_000,
             cache_id: Some(MarkerCacheId::Gemini),
         },
+        context_pattern: None,
         initial_state: AgentState::Starting,
     }
 }
@@ -147,6 +167,7 @@ fn kirocli_profile() -> BackendProfile {
             heartbeat_fresh_window_ms: 10_000,
             cache_id: Some(MarkerCacheId::Kiro),
         },
+        context_pattern: Some(KIRO_CONTEXT_PATTERN),
         initial_state: AgentState::Starting,
     }
 }
@@ -205,6 +226,7 @@ fn opencode_profile() -> BackendProfile {
             heartbeat_fresh_window_ms: 10_000,
             cache_id: Some(MarkerCacheId::OpenCode),
         },
+        context_pattern: None,
         initial_state: AgentState::Starting,
     }
 }
@@ -256,6 +278,7 @@ fn codex_profile() -> BackendProfile {
             heartbeat_fresh_window_ms: 10_000,
             cache_id: Some(MarkerCacheId::Codex),
         },
+        context_pattern: None,
         initial_state: AgentState::Starting,
     }
 }
@@ -325,6 +348,7 @@ fn claudecode_profile() -> BackendProfile {
             heartbeat_fresh_window_ms: 10_000,
             cache_id: Some(MarkerCacheId::Claude),
         },
+        context_pattern: Some(CLAUDE_CONTEXT_PATTERN),
         initial_state: AgentState::Starting,
     }
 }
@@ -341,6 +365,7 @@ fn empty_profile() -> BackendProfile {
             heartbeat_fresh_window_ms: 0,
             cache_id: Some(MarkerCacheId::Generic),
         },
+        context_pattern: None,
         initial_state: AgentState::Idle,
     }
 }
@@ -432,5 +457,44 @@ mod tests {
                  wired into profile() yet missing from migrated() is SILENTLY un-parity-tested."
             );
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod context_pattern_tests {
+    use super::*;
+
+    /// Pin which backends advertise a context% pattern: Claude + Kiro display
+    /// a usable percent (live-verified 2026-06-10); the rest are honestly
+    /// None (codex would require editing the user's global ~/.codex/config.toml
+    /// to display one; opencode/agy show none).
+    #[test]
+    fn context_pattern_presence_per_backend() {
+        let has = |b: &Backend| profile(b).and_then(|p| p.context_pattern).is_some();
+        assert!(has(&Backend::ClaudeCode));
+        assert!(has(&Backend::KiroCli));
+        assert!(!has(&Backend::Codex));
+        assert!(!has(&Backend::OpenCode));
+        assert!(!has(&Backend::Agy));
+        assert!(!has(&Backend::Shell));
+        assert!(!has(&Backend::Raw("x".into())));
+    }
+
+    /// Both patterns compile and extract the percent (capture group 1) from
+    /// the live-captured renders they were written against.
+    #[test]
+    fn context_patterns_capture_live_renders() {
+        let claude = regex::Regex::new(CLAUDE_CONTEXT_PATTERN).unwrap();
+        let caps = claude
+            .captures("  Model: Fable 5 | Ctx Used: 61.0% | ⎇ fix/879 | (+0,-0)")
+            .expect("claude live render matches");
+        assert_eq!(&caps[1], "61.0");
+
+        let kiro = regex::Regex::new(KIRO_CONTEXT_PATTERN).unwrap();
+        let caps = kiro
+            .captures("Kiro · auto · ◔ 10%        ~/.agend-terminal/workspace/kiro")
+            .expect("kiro live render matches");
+        assert_eq!(&caps[1], "10");
     }
 }

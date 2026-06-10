@@ -602,6 +602,11 @@ pub(crate) fn build_default_handlers(
         // > 2d). Same 360-tick cadence as the other GC siblings; runs in app mode
         // (not allowlisted out) since the live daemon is app-mode.
         Box::new(per_tick::TmpReviewGcHandler::new(360)),
+        // Context% alert (operator-directed): every 6 ticks (~1min) refresh +
+        // ≥80% orchestrator alert. The transcript-estimate file IO lives in
+        // this handler's tick (lock-free during the read), NOT in the PTY
+        // feed path. Runs in app mode (the live daemon is app-mode).
+        Box::new(per_tick::ContextAlertHandler::new(6)),
     ]
 }
 

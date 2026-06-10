@@ -368,6 +368,143 @@ fn claude_projects_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude").join("projects"))
 }
 
+// ── Context% estimate (transcript fallback for the context-alert tick) ─────
+
+/// Context-window size for a Claude model id. The `[1m]` suffix marks a
+/// 1M-token context variant; current-gen Claude models are otherwise 200k.
+/// Unknown models fall back to 200k — the conservative direction for an
+/// early-warning surface (over-estimates usage → alerts early).
+fn context_window_for(model: &str) -> u64 {
+    if model.contains("[1m]") {
+        1_000_000
+    } else {
+        200_000
+    }
+}
+
+/// How recently a transcript must have been written to count as the
+/// instance's LIVE session for the context estimate. Anything older is a
+/// finished/stale session — estimating from it would report a dead context.
+const CONTEXT_ESTIMATE_HORIZON: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Tail bytes read from the newest transcript when estimating — the last
+/// assistant message is always within the final few KB; a full read of a
+/// multi-MB transcript every refresh would be wasted IO.
+const CONTEXT_TAIL_BYTES: u64 = 256 * 1024;
+
+/// Estimate `instance`'s CURRENT context usage percent from its newest Claude
+/// transcript. Uses the LAST assistant message's usage (input + cache reads +
+/// cache writes + output ≈ the context the next turn resumes from) — NOT the
+/// session-cumulative sum, which keeps growing across compacts and would
+/// latch a permanent false alert. Self-corrects after a compact (the next
+/// message's input drops). Claude transcripts only; `None` = no fresh
+/// attributable transcript (honestly unknown).
+pub(crate) fn estimate_context_pct(home: &Path, instance: &str) -> Option<f32> {
+    let projects = claude_projects_dir()?;
+    let roots: Vec<(String, Vec<PathBuf>)> = instance_roots(home)
+        .into_iter()
+        .filter(|(name, _)| name == instance)
+        .collect();
+    estimate_context_pct_in(&projects, &roots)
+}
+
+/// Testable core of [`estimate_context_pct`]: injected projects dir + roots.
+fn estimate_context_pct_in(projects_dir: &Path, roots: &[(String, Vec<PathBuf>)]) -> Option<f32> {
+    if roots.is_empty() {
+        return None;
+    }
+    let now = std::time::SystemTime::now();
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    let session_dirs = std::fs::read_dir(projects_dir)
+        .into_iter()
+        .flatten()
+        .flatten();
+    for dir in session_dirs {
+        let p = dir.path();
+        if !p.is_dir() {
+            continue;
+        }
+        for f in std::fs::read_dir(&p).into_iter().flatten().flatten() {
+            let fp = f.path();
+            if fp.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(mtime) = std::fs::metadata(&fp).ok().and_then(|m| m.modified().ok()) else {
+                continue;
+            };
+            // Stale session → not the live context. (A future mtime is fresh.)
+            if now
+                .duration_since(mtime)
+                .map(|age| age > CONTEXT_ESTIMATE_HORIZON)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            if newest.as_ref().is_some_and(|(t, _)| *t >= mtime) {
+                continue;
+            }
+            if transcript_attributes_to(&fp, roots) {
+                newest = Some((mtime, fp));
+            }
+        }
+    }
+    let (_, path) = newest?;
+    let tail = read_file_tail(&path, CONTEXT_TAIL_BYTES)?;
+    for line in tail.lines().rev() {
+        if let Some((_, row)) = parse_line(line, roots, None) {
+            let window = context_window_for(&row.model) as f64;
+            let pct = (row.usage.total_tokens() as f64 / window) * 100.0;
+            return Some(pct.clamp(0.0, 100.0) as f32);
+        }
+    }
+    None
+}
+
+/// Cheap attribution probe: does one of the file's first lines carry a `cwd`
+/// belonging to the instance's roots? Reads only the head — full-content
+/// attribution is the estimator's tail read.
+fn transcript_attributes_to(path: &Path, roots: &[(String, Vec<PathBuf>)]) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut buf = vec![0u8; 8192];
+    let n = f.read(&mut buf).unwrap_or(0);
+    let head = String::from_utf8_lossy(&buf[..n]);
+    head.lines().take(5).any(|line| {
+        serde_json::from_str::<Value>(line)
+            .ok()
+            .and_then(|v| {
+                v.get("cwd")
+                    .and_then(Value::as_str)
+                    .map(|cwd| attribute(Path::new(cwd), roots).is_some())
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Last `max_bytes` of a file as lossy UTF-8, with any partial first line
+/// dropped when the read started mid-file.
+fn read_file_tail(path: &Path, max_bytes: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let start = len.saturating_sub(max_bytes);
+    f.seek(SeekFrom::Start(start)).ok()?;
+    let mut bytes = Vec::new();
+    f.read_to_end(&mut bytes).ok()?;
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if start > 0 {
+        match text.find('\n') {
+            Some(i) => {
+                text.drain(..=i);
+            }
+            None => return None,
+        }
+    }
+    Some(text)
+}
+
 // ── #1077 Phase 2: Codex collector ─────────────────────────────────────────
 //
 // Source: `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`. Each session file
@@ -1658,5 +1795,124 @@ mod tests {
             "no per-task key in default view"
         );
         assert_eq!(pi["input"], json!(10));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod context_estimate_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn usage_line(cwd: &str, id: &str, model: &str, inp: u64, out: u64, cr: u64) -> String {
+        json!({
+            "type": "assistant",
+            "cwd": cwd,
+            "timestamp": "2026-06-10T00:00:00.000Z",
+            "message": {
+                "id": id,
+                "model": model,
+                "usage": {
+                    "input_tokens": inp,
+                    "output_tokens": out,
+                    "cache_read_input_tokens": cr,
+                }
+            }
+        })
+        .to_string()
+    }
+
+    fn tmp(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("agend-ctx-est-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn roots_for(instance: &str, cwd: &str) -> Vec<(String, Vec<PathBuf>)> {
+        vec![(instance.to_string(), vec![PathBuf::from(cwd)])]
+    }
+
+    /// The estimate uses the LAST assistant message's usage — the
+    /// post-compact context — NOT the session-cumulative sum (which would
+    /// latch a permanent ≥threshold false alert after the first compact).
+    #[test]
+    fn estimate_uses_last_message_not_cumulative() {
+        let projects = tmp("last-msg");
+        let sess = projects.join("-root-ws-dev");
+        std::fs::create_dir_all(&sess).unwrap();
+        // Pre-compact turn at 180k, then a compact dropped the next turn to
+        // 40k+10k+1k = 51k. Cumulative would be ~231k (>100% of 200k).
+        let lines = [
+            usage_line("/root/ws/dev", "m1", "claude-opus-4", 170_000, 2_000, 8_000),
+            usage_line("/root/ws/dev", "m2", "claude-opus-4", 40_000, 1_000, 10_000),
+        ];
+        std::fs::write(sess.join("s.jsonl"), lines.join("\n")).unwrap();
+
+        let pct = estimate_context_pct_in(&projects, &roots_for("dev", "/root/ws/dev"))
+            .expect("estimate produced");
+        // 51k / 200k = 25.5%
+        assert!((pct - 25.5).abs() < 0.1, "last-message estimate, got {pct}");
+    }
+
+    /// A `[1m]` model id resolves against the 1M context window.
+    #[test]
+    fn estimate_respects_1m_context_window() {
+        let projects = tmp("1m-window");
+        let sess = projects.join("-root-ws-dev");
+        std::fs::create_dir_all(&sess).unwrap();
+        let line = usage_line(
+            "/root/ws/dev",
+            "m1",
+            "claude-fable-5[1m]",
+            400_000,
+            10_000,
+            90_000,
+        );
+        std::fs::write(sess.join("s.jsonl"), line).unwrap();
+
+        let pct = estimate_context_pct_in(&projects, &roots_for("dev", "/root/ws/dev"))
+            .expect("estimate produced");
+        // 500k / 1M = 50% (would be clamped 100% under a 200k window)
+        assert!((pct - 50.0).abs() < 0.1, "1M window respected, got {pct}");
+    }
+
+    /// Trailing non-assistant lines (tool events, user turns) are skipped —
+    /// the reversed scan finds the last USAGE-carrying line.
+    #[test]
+    fn estimate_skips_trailing_non_usage_lines() {
+        let projects = tmp("trailing");
+        let sess = projects.join("-root-ws-dev");
+        std::fs::create_dir_all(&sess).unwrap();
+        let lines = [
+            usage_line("/root/ws/dev", "m1", "claude-opus-4", 100_000, 1_000, 0),
+            json!({"type": "user", "cwd": "/root/ws/dev", "message": {"role": "user"}}).to_string(),
+            json!({"type": "system", "subtype": "tool_result"}).to_string(),
+        ];
+        std::fs::write(sess.join("s.jsonl"), lines.join("\n")).unwrap();
+
+        let pct = estimate_context_pct_in(&projects, &roots_for("dev", "/root/ws/dev"))
+            .expect("estimate produced");
+        assert!((pct - 50.5).abs() < 0.1, "101k/200k, got {pct}");
+    }
+
+    /// A transcript belonging to ANOTHER instance's cwd must not attribute —
+    /// honest None instead of a cross-agent reading.
+    #[test]
+    fn estimate_none_when_no_transcript_attributes() {
+        let projects = tmp("foreign");
+        let sess = projects.join("-somewhere-else");
+        std::fs::create_dir_all(&sess).unwrap();
+        let line = usage_line("/somewhere/else", "m1", "claude-opus-4", 150_000, 1_000, 0);
+        std::fs::write(sess.join("s.jsonl"), line).unwrap();
+
+        assert!(
+            estimate_context_pct_in(&projects, &roots_for("dev", "/root/ws/dev")).is_none(),
+            "foreign transcript must not attribute"
+        );
+        assert!(
+            estimate_context_pct_in(&projects, &[]).is_none(),
+            "no roots → None"
+        );
     }
 }

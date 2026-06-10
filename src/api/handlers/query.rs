@@ -13,7 +13,7 @@ pub(crate) fn handle_list(_params: &Value, ctx: &HandlerCtx) -> Value {
         .values()
         .map(|handle| {
             let name = handle.name.as_str();
-            let (agent_state, health_state, blocked_reason, blocked_note) = {
+            let (agent_state, health_state, blocked_reason, blocked_note, context) = {
                 let c = handle.core.lock();
                 (
                     c.state.get_state().display_name().to_string(),
@@ -23,6 +23,10 @@ pub(crate) fn handle_list(_params: &Value, ctx: &HandlerCtx) -> Value {
                     // blocked and its free-text annotation (previously internal-only).
                     c.health.current_reason.as_ref().map(|r| r.to_string()),
                     c.health.current_note.clone(),
+                    // Context% telemetry: resolved usage + producing source
+                    // ("pattern" = the agent's own statusline, "transcript" =
+                    // token-usage estimate). Absent = honestly unknown.
+                    c.state.resolved_context(),
                 )
             };
             let (dispatched_waiting_for, pending_response_to) =
@@ -36,6 +40,8 @@ pub(crate) fn handle_list(_params: &Value, ctx: &HandlerCtx) -> Value {
                 "health_state": health_state,
                 "blocked_reason": blocked_reason,
                 "blocked_note": blocked_note,
+                "context_pct": context.map(|(pct, _)| pct),
+                "context_source": context.map(|(_, source)| source),
                 "kind": "managed",
                 "dispatched_waiting_for": dispatched_waiting_for,
                 "pending_response_to": pending_response_to,

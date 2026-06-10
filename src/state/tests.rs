@@ -4447,3 +4447,135 @@ fn prose_with_distant_unrelated_error_indicator_does_not_latch_phase2() {
         "#SRL-phase2 #1857: SRL prose + a DISTANT unrelated error indicator must NOT latch"
     );
 }
+
+// ── Context% telemetry (operator-directed context-usage detection) ──────────
+
+/// Live-capture fixture: the fleet Claude statusline as rendered 2026-06-10
+/// (`pane_snapshot` of a real pane). The percent is fractional.
+const CLAUDE_STATUSLINE_FRAME: &str = "⏺ working on the thing\n\
+     some conversation text\n\
+     ❯\n\
+     ────────────\n\
+       Model: Fable 5 | Ctx Used: 61.0% | ⎇ fix/879-v4-daemon-reorder | (+0,-0)\n\
+       ⏵⏵ bypass permissions on (shift+tab to cycle)";
+
+#[test]
+fn claude_context_pct_extracted_from_statusline() {
+    let mut t = StateTracker::new(Some(&Backend::ClaudeCode));
+    t.feed(CLAUDE_STATUSLINE_FRAME);
+    let (pct, source) = t.resolved_context().expect("statusline percent extracted");
+    assert!((pct - 61.0).abs() < f32::EPSILON);
+    assert_eq!(source, "pattern");
+}
+
+/// A stale frame can leave an OLD statusline copy above the live one (seen in
+/// the live capture) — the LAST matching row must win.
+#[test]
+fn claude_context_pct_duplicate_statusline_last_wins() {
+    let mut t = StateTracker::new(Some(&Backend::ClaudeCode));
+    t.feed(
+        "  Model: Fable 5 | Ctx Used: 55.0% | ⎇ b | (+0,-0)\n\
+         ──⏵⏵─bypass─permissions─on──────\n\
+         ❯\n\
+         ────────────\n\
+           Model: Fable 5 | Ctx Used: 61.0% | ⎇ b | (+0,-0)\n\
+           ⏵⏵ bypass permissions on (shift+tab to cycle)",
+    );
+    let (pct, _) = t.resolved_context().expect("reading present");
+    assert!(
+        (pct - 61.0).abs() < f32::EPSILON,
+        "last (live) statusline wins, got {pct}"
+    );
+}
+
+/// Live-capture fixture: the kiro footer (`Kiro · auto · ◔ 10%`) sits a few
+/// rows above the bottom (input hint + key help below it).
+#[test]
+fn kiro_context_pct_extracted_from_footer() {
+    let mut t = StateTracker::new(Some(&Backend::KiroCli));
+    t.feed(
+        "conversation text above\n\
+         ────────────\n\
+         Kiro · auto · ◔ 10%                    ~/.agend-terminal/workspace/kiro\n\
+         \n\
+          ask a question or describe a task ↵\n\
+         \n\
+                                       /copy to clipboard",
+    );
+    let (pct, source) = t.resolved_context().expect("footer percent extracted");
+    assert!((pct - 10.0).abs() < f32::EPSILON);
+    assert_eq!(source, "pattern");
+}
+
+/// Prose-FP guard: agents routinely DISCUSS context% in conversation text.
+/// A mention ABOVE the bottom status rows must not produce a reading, and a
+/// bare "NN% context" phrase (no statusline form) must not match at all.
+#[test]
+fn context_pct_prose_mention_does_not_match() {
+    let mut t = StateTracker::new(Some(&Backend::ClaudeCode));
+    t.feed(
+        "⏺ 報告:lead 的 pane 顯示 Ctx Used: 95.0% 需要重啟\n\
+         filler line one\n\
+         filler line two\n\
+         filler line three\n\
+         filler line four\n\
+         filler line five\n\
+         filler line six\n\
+         ❯ discussing that we are at 80% context now\n\
+         ────────────\n\
+         (no statusline rendered — narrow pane)",
+    );
+    assert!(
+        t.resolved_context().is_none(),
+        "prose mentions (above the status rows / non-statusline form) must not read"
+    );
+}
+
+/// A pane that stops rendering the statusline (narrow-pane truncation) keeps
+/// the previous reading — "can't read" must not erase what we knew.
+#[test]
+fn context_pct_truncated_statusline_keeps_previous_reading() {
+    let mut t = StateTracker::new(Some(&Backend::ClaudeCode));
+    t.feed(CLAUDE_STATUSLINE_FRAME);
+    t.feed("totally different screen\nwith no statusline at all\n❯");
+    let (pct, _) = t.resolved_context().expect("previous reading retained");
+    assert!((pct - 61.0).abs() < f32::EPSILON);
+}
+
+/// Resolution order: a fresh pattern reading wins over a transcript estimate;
+/// the estimate fills in when no pattern reading exists.
+#[test]
+fn context_resolution_pattern_wins_over_estimate() {
+    let mut t = StateTracker::new(Some(&Backend::ClaudeCode));
+    t.set_context_estimate(42.0);
+    assert_eq!(
+        t.resolved_context().map(|(p, s)| (p as u32, s)),
+        Some((42, "transcript")),
+        "estimate fills in when no pattern reading exists"
+    );
+    t.feed(CLAUDE_STATUSLINE_FRAME);
+    assert_eq!(
+        t.resolved_context().map(|(p, s)| (p as u32, s)),
+        Some((61, "pattern")),
+        "fresh pattern reading wins"
+    );
+}
+
+/// Backends without a context display stay honestly unknown even when the
+/// screen happens to carry a Claude-style statusline string.
+#[test]
+fn context_pct_unknown_for_backends_without_pattern() {
+    for backend in [
+        Backend::Codex,
+        Backend::OpenCode,
+        Backend::Agy,
+        Backend::Shell,
+    ] {
+        let mut t = StateTracker::new(Some(&backend));
+        t.feed("  Model: X | Ctx Used: 61.0% | done\n❯");
+        assert!(
+            t.resolved_context().is_none(),
+            "{backend:?} has no context_pattern → unknown"
+        );
+    }
+}

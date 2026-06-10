@@ -35,6 +35,7 @@ use std::sync::Arc;
 
 pub(crate) mod check_schedules;
 pub(crate) mod ci_watch_poll;
+pub(crate) mod context_alert;
 pub(crate) mod external_liveness;
 pub(crate) mod gc_tick;
 pub(crate) mod handoff_timeout;
@@ -52,6 +53,7 @@ pub(crate) mod watchdog;
 
 pub(crate) use check_schedules::CheckSchedulesHandler;
 pub(crate) use ci_watch_poll::CiWatchPollHandler;
+pub(crate) use context_alert::ContextAlertHandler;
 pub(crate) use external_liveness::ExternalLivenessHandler;
 pub(crate) use gc_tick::GcTickHandler;
 pub(crate) use handoff_timeout::HandoffTimeoutHandler;
