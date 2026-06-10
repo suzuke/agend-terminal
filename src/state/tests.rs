@@ -3714,7 +3714,7 @@ fn net_error_prose_mention_does_not_latch_1768() {
 /// error fields — while still REJECTING bare prose / source mentions.
 #[test]
 fn in_error_line_matches_corpus_errors_rejects_prose_step1() {
-    use crate::state::patterns::in_error_line;
+    use crate::state::patterns::in_error_line_excluding_input;
 
     // (line, a token on that line) — must read as a real backend error line.
     let real: &[(&str, &str)] = &[
@@ -3758,7 +3758,7 @@ fn in_error_line_matches_corpus_errors_rejects_prose_step1() {
     ];
     for (line, tok) in real {
         assert!(
-            in_error_line(line, tok),
+            in_error_line_excluding_input(line, tok, &[]),
             "must read as an error line: {line:?} (token {tok:?})"
         );
     }
@@ -3790,7 +3790,7 @@ fn in_error_line_matches_corpus_errors_rejects_prose_step1() {
     ];
     for (line, tok) in prose {
         assert!(
-            !in_error_line(line, tok),
+            !in_error_line_excluding_input(line, tok, &[]),
             "prose/source mention must NOT read as an error line: {line:?} (token {tok:?})"
         );
     }
@@ -4578,4 +4578,133 @@ fn context_pct_unknown_for_backends_without_pattern() {
             "{backend:?} has no context_pattern → unknown"
         );
     }
+}
+
+// ── #1947: input-line exclusion — operator-typed / quoted error strings ─────
+
+/// #1947 (operator-reproduced live, 2026-06-10): typing the SRL error string
+/// into the claude input line must NOT latch — the line self-satisfies
+/// `line_has_error_indicator` ("…Error:"), so pre-#1947 the content anchor
+/// passed and a false ServerRateLimit latched (→ spurious AUTO-retry).
+#[test]
+fn typed_srl_quote_on_claude_input_line_does_not_latch_1947() {
+    let mut t = StateTracker::new(Some(&Backend::ClaudeCode));
+    t.feed(
+        "⏺ some earlier assistant output\n\
+         ❯ API Error: Server is temporarily limiting requests (not your usage limit)",
+    );
+    assert_ne!(
+        t.get_state(),
+        AgentState::ServerRateLimit,
+        "#1947: operator-typed SRL quote on the ❯ input line must not latch"
+    );
+}
+
+/// #1947: a SUBMITTED user message quoting the error (e.g. a dispatch message
+/// discussing an SRL incident) renders with the same `❯` prefix — excluded.
+#[test]
+fn submitted_dispatch_quote_does_not_latch_1947() {
+    let mut t = StateTracker::new(Some(&Backend::ClaudeCode));
+    t.feed(
+        "❯ 處理這個 issue:API Error: Server is temporarily limiting requests 的 retry storm\n\
+         ⏺ 收到,開始分析",
+    );
+    assert_ne!(
+        t.get_state(),
+        AgentState::ServerRateLimit,
+        "#1947: a submitted message quoting the SRL string must not latch"
+    );
+}
+
+/// #1947 FN guard: the REAL claude SRL error block renders BARE at line start
+/// (claude-server-throttle.raw fixture — note: no `⏺` prefix, which is why the
+/// v2 line-start anchor needs the corpus gate). It must still latch with the
+/// input prompt right below it.
+#[test]
+fn real_srl_error_with_prompt_below_still_latches_1947() {
+    let mut t = StateTracker::new(Some(&Backend::ClaudeCode));
+    t.feed(
+        "API Error: Server is temporarily limiting requests (not your usage limit) · check status.claude.com\n\
+         Retrying automatically...\n\
+         ❯ ",
+    );
+    assert_eq!(
+        t.get_state(),
+        AgentState::ServerRateLimit,
+        "#1947: the real (bare, line-start) SRL error block must still latch"
+    );
+}
+
+/// #1947 multi-backend: codex echoes submitted input as `› <text>` — a quoted
+/// rate-limit string there must not latch; the real bare error still does
+/// (codex-rate-limit-typical.raw shapes).
+#[test]
+fn codex_input_echo_quote_excluded_real_error_latches_1947() {
+    let mut quoted = StateTracker::new(Some(&Backend::Codex));
+    quoted.feed("OpenAI Codex v0.135.0\n› look into rate_limit_exceeded: Rate limit reached\n› ");
+    assert_ne!(
+        quoted.get_state(),
+        AgentState::RateLimit,
+        "#1947: a quoted rate-limit string on the › input echo must not latch"
+    );
+
+    let mut real = StateTracker::new(Some(&Backend::Codex));
+    real.feed(
+        "› run the migration\n\
+         stream error: rate_limit_exceeded: Rate limit reached for requests. Please try again in 60s.\n\
+         › ",
+    );
+    assert_eq!(
+        real.get_state(),
+        AgentState::RateLimit,
+        "#1947: the real bare codex rate-limit error must still latch"
+    );
+}
+
+/// #1947 multi-backend: kiro's input prompt is `> ` — a typed quote there must
+/// not latch; the real bare `ThrottlingException:` still does
+/// (kiro-rate-limit-typical.raw shapes).
+#[test]
+fn kiro_typed_quote_excluded_real_error_latches_1947() {
+    let mut quoted = StateTracker::new(Some(&Backend::KiroCli));
+    quoted.feed("conversation above\n> debugging ThrottlingException: Rate exceeded handling");
+    assert_ne!(
+        quoted.get_state(),
+        AgentState::RateLimit,
+        "#1947: a typed throttle quote on the kiro > input line must not latch"
+    );
+
+    let mut real = StateTracker::new(Some(&Backend::KiroCli));
+    real.feed(
+        "ThrottlingException: Rate exceeded for this AWS account\n\
+         Waiting before retry...\n\
+         > ",
+    );
+    assert_eq!(
+        real.get_state(),
+        AgentState::RateLimit,
+        "#1947: the real bare kiro throttle error must still latch"
+    );
+}
+
+/// #1947: the hard-wrap flatten fallback drops input/user-message lines BEFORE
+/// flattening — a typed SRL quote can't flatten into a legit-looking
+/// `API Error: <throttle>` adjacency; a genuine bare hard-wrap still detects.
+#[test]
+fn flatten_fallback_excludes_input_lines_1947() {
+    let patterns = StatePatterns::for_backend(&Backend::ClaudeCode);
+    let typed = "❯ API Error: Server is temporarily\n❯ limiting requests (not your usage limit)";
+    assert_eq!(
+        flattened_throttle_detect(patterns, typed, &["❯", ">"]),
+        None,
+        "#1947: input-marked lines are dropped before flattening"
+    );
+    // The same content WITHOUT the input markers (a real hard-wrapped error)
+    // still detects through the flatten fallback.
+    let real = "API Error: Server is temporarily\nlimiting requests (not your usage limit)";
+    assert_eq!(
+        flattened_throttle_detect(patterns, real, &["❯", ">"]),
+        Some(AgentState::ServerRateLimit),
+        "#1947: a genuine bare hard-wrapped SRL still detects"
+    );
 }

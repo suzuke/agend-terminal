@@ -258,6 +258,11 @@ pub struct StateTracker {
     /// open (pre-#919 behavior: a HIGH_FP pattern match fires the
     /// transition unconditionally).
     anchor_on_red: bool,
+    /// #1947: the backend's input-line prompt markers, cached from
+    /// `BackendProfile::input_line_markers` at construction (legacy/profile-None
+    /// backends → empty = exclusion unavailable). The content anchor uses these
+    /// to reject error patterns matched on operator-typed / quoted input lines.
+    input_line_markers: &'static [&'static str],
     /// #1005 Phase A2: most-recent priority-up transition target +
     /// timestamp. Set on every successful priority-up in `transition()`.
     /// Cleared (set to None) on explicit Idle / lower-priority drops
@@ -387,7 +392,7 @@ fn oscillation_guard_window() -> Duration {
 /// / JSON dumps, so they get the extra FP defenses (the #1518 position gate + the
 /// #1769 working-marker override + an anchor gate). The ANCHOR gate splits by
 /// [`requires_red_anchor`] — RateLimit/ServerRateLimit now use a content anchor
-/// (`in_error_line`), only ContextFull/ModelUnsupported still require red. This
+/// (`in_error_line_excluding_input`), only ContextFull/ModelUnsupported still require red. This
 /// predicate stays the full set because position + working-marker apply to all
 /// four regardless of which anchor regime they use.
 /// Per #919 spike + dev-2 cross-audit:
@@ -414,7 +419,7 @@ fn is_high_fp_state(state: AgentState) -> bool {
 
 /// t-coloranchor-remove-ratelimit (operator-approved after the corpus gate):
 /// which HIGH_FP states still require the #1450 RED-SGR anchor vs the content
-/// anchor (`in_error_line`).
+/// anchor (`in_error_line_excluding_input`).
 ///
 /// - **`true`** — ContextFull, ModelUnsupported: keep RED. ContextFull has no
 ///   fixture corpus to prove a content path; ModelUnsupported never auto-clears
@@ -729,9 +734,20 @@ fn unclassified_throttle_tail(
 fn flattened_throttle_detect(
     patterns: &crate::state::patterns::StatePatterns,
     screen_text: &str,
+    input_line_markers: &[&str],
 ) -> Option<AgentState> {
     let tail = recent_screen_tail(screen_text, ERROR_TAIL_SCAN_LINES);
-    let flat = tail.split_whitespace().collect::<Vec<_>>().join(" ");
+    // #1947: drop input / user-message lines BEFORE flattening — flattening
+    // destroys the line structure the input-line exclusion needs, so an
+    // operator-typed error string would otherwise flatten into a legit-looking
+    // `API Error: <throttle>` adjacency. (A hard-wrapped typed line's
+    // continuation rows lack the marker — same accepted edge as the raw path.)
+    let flat = tail
+        .lines()
+        .filter(|line| !crate::state::patterns::is_input_line(line, input_line_markers))
+        .flat_map(str::split_whitespace)
+        .collect::<Vec<_>>()
+        .join(" ");
     let (state, matched) = patterns.detect_with_match(&flat)?;
     if !matches!(state, AgentState::ServerRateLimit | AgentState::RateLimit) {
         return None;
@@ -751,7 +767,7 @@ const THROTTLE_INDICATOR_PROXIMITY: usize = 80;
 
 /// #SRL-phase2 (reviewer-2 #1857 fix): require an error indicator within
 /// `THROTTLE_INDICATOR_PROXIMITY` chars BEFORE `matched` in the flattened tail —
-/// the `\n`-less replacement for `in_error_line`'s line-scoping. The window spans
+/// the `\n`-less replacement for `in_error_line_excluding_input`'s line-scoping. The window spans
 /// `[match_start - K, match_end]` so an indicator that IS the match
 /// (`API Error: 5xx`) or sits just before it (`API Error: Server is temporarily
 /// limiting …`) passes, while a distant unrelated indicator does not.
@@ -890,6 +906,10 @@ impl StateTracker {
             // KiroCli), false for Shell/Raw — see
             // `Backend::should_anchor_on_red`.
             anchor_on_red: backend.is_some_and(|b| b.should_anchor_on_red()),
+            input_line_markers: backend
+                .and_then(crate::backend_profile::profile)
+                .map(|p| p.input_line_markers)
+                .unwrap_or(&[]),
             // #1005 A2: oscillation guard starts unarmed — first
             // legitimate priority-up records into it; subsequent
             // priority-ups within the window check against it.
@@ -1113,7 +1133,7 @@ impl StateTracker {
                     //   FP would silently disable a healthy agent (cost too high).
                     //
                     // - **content-anchor** {RateLimit, ServerRateLimit}: the marker
-                    //   must sit on an error-line-shaped line (`in_error_line`) —
+                    //   must sit on an error-line-shaped line (`in_error_line_excluding_input`) —
                     //   corpus-proven safe (5/5 prose suppressed via pattern-narrow
                     //   + #1518 position + #1769 working-marker; FN-covered incl.
                     //   kiro `ThrottlingException` via #1789). NO red required, so a
@@ -1124,12 +1144,21 @@ impl StateTracker {
                     //   the live tail with no working-marker below) is ACCEPTED for
                     //   these two: both auto-clear and are retry-driven, so a
                     //   one-off mis-latch self-corrects (unlike ModelUnsupported).
+                    // #1947: the content anchor additionally rejects matches
+                    // sitting on the backend's INPUT line (or an echoed /
+                    // submitted user-message line) — operator-typed / quoted
+                    // error strings are prose, not CLI error output
+                    // (operator-reproduced live FP, 2026-06-10).
                     let anchor_fail = if requires_red_anchor(detected) {
                         self.anchor_on_red
                             && !fg.is_empty()
                             && !matched_span_has_red(screen_text, matched, fg)
                     } else if high_fp {
-                        !crate::state::patterns::in_error_line(screen_text, matched)
+                        !crate::state::patterns::in_error_line_excluding_input(
+                            screen_text,
+                            matched,
+                            self.input_line_markers,
+                        )
                     } else {
                         false
                     };
@@ -1391,7 +1420,9 @@ impl StateTracker {
                     // text, so a hard-wrapped throttle with a working marker
                     // below is not overridden here — accepted; `recovered_within`
                     // still releases a genuinely-recovered pane.)
-                    if let Some(throttle) = flattened_throttle_detect(patterns, screen_text) {
+                    if let Some(throttle) =
+                        flattened_throttle_detect(patterns, screen_text, self.input_line_markers)
+                    {
                         let landed = if matches!(throttle, AgentState::ServerRateLimit)
                             && self.recovered_within(SERVER_RATE_LIMIT_RECOVERY_SILENCE)
                         {

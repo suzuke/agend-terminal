@@ -44,6 +44,12 @@ pub struct BackendProfile {
     /// only over the bottom status rows — NOT the error tail window — because
     /// agents routinely DISCUSS context% in conversation text (prose-FP).
     pub context_pattern: Option<&'static str>,
+    /// #1947: prompt markers identifying the backend's INPUT line (and echoed /
+    /// submitted user-message lines). An error pattern matched on a line whose
+    /// trimmed start is one of these is operator-typed / quoted text, not CLI
+    /// error output — the content anchor excludes it. Empty = no stable prompt
+    /// prefix (opencode / agy): input-line exclusion honestly unavailable.
+    pub input_line_markers: &'static [&'static str],
 }
 
 /// ClaudeCode context% — matches the fleet statusline's used-form as rendered
@@ -109,6 +115,7 @@ fn agy_profile() -> BackendProfile {
             cache_id: Some(MarkerCacheId::Gemini),
         },
         context_pattern: None,
+        input_line_markers: &[],
         initial_state: AgentState::Starting,
     }
 }
@@ -168,6 +175,7 @@ fn kirocli_profile() -> BackendProfile {
             cache_id: Some(MarkerCacheId::Kiro),
         },
         context_pattern: Some(KIRO_CONTEXT_PATTERN),
+        input_line_markers: &[">"],
         initial_state: AgentState::Starting,
     }
 }
@@ -227,6 +235,7 @@ fn opencode_profile() -> BackendProfile {
             cache_id: Some(MarkerCacheId::OpenCode),
         },
         context_pattern: None,
+        input_line_markers: &[],
         initial_state: AgentState::Starting,
     }
 }
@@ -279,6 +288,7 @@ fn codex_profile() -> BackendProfile {
             cache_id: Some(MarkerCacheId::Codex),
         },
         context_pattern: None,
+        input_line_markers: &["›"],
         initial_state: AgentState::Starting,
     }
 }
@@ -349,6 +359,7 @@ fn claudecode_profile() -> BackendProfile {
             cache_id: Some(MarkerCacheId::Claude),
         },
         context_pattern: Some(CLAUDE_CONTEXT_PATTERN),
+        input_line_markers: &["❯", ">"],
         initial_state: AgentState::Starting,
     }
 }
@@ -366,6 +377,7 @@ fn empty_profile() -> BackendProfile {
             cache_id: Some(MarkerCacheId::Generic),
         },
         context_pattern: None,
+        input_line_markers: &[],
         initial_state: AgentState::Idle,
     }
 }

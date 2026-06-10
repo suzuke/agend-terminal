@@ -31,7 +31,7 @@ pub(crate) const SERVER_RATE_LIMIT_NET_ERRORS: &str = r"ECONNRESET|ETIMEDOUT|Inv
 
 // #1757's `is_net_error_match` red-anchor EXEMPTION was removed by
 // t-coloranchor-remove-ratelimit: ServerRateLimit now uses the general content
-// anchor (`in_error_line`) instead of the red anchor, so the net-error special
+// anchor (`in_error_line_excluding_input`) instead of the red anchor, so the net-error special
 // case (net faults render grey → exempt from red) is subsumed — a grey net-error
 // on an error-line-shaped line latches via content, and a bare prose mention is
 // suppressed by content + #1518 position. The shared const above stays: it is
@@ -77,7 +77,7 @@ pub(crate) const SERVER_RATE_LIMIT_NET_ERRORS: &str = r"ECONNRESET|ETIMEDOUT|Inv
 /// Does `text` contain a recognised error-line indicator (`…Error:`, `429`,
 /// `resource_exhausted`, JSON error shapes, …)? Pure regex check over the WHOLE
 /// `text` — the caller is responsible for scoping `text` (a single line in
-/// [`in_error_line`]; a tight proximity window in the SRL hard-wrap fallback,
+/// [`in_error_line_excluding_input`]; a tight proximity window in the SRL hard-wrap fallback,
 /// where a fully-flattened tail has no `\n` to line-scope on).
 pub(crate) fn line_has_error_indicator(text: &str) -> bool {
     use std::sync::OnceLock;
@@ -91,7 +91,26 @@ pub(crate) fn line_has_error_indicator(text: &str) -> bool {
     re.is_match(text)
 }
 
-pub(crate) fn in_error_line(screen_text: &str, matched: &str) -> bool {
+/// #1947: true when `line` is the backend's INPUT line or an echoed/submitted
+/// user-message line — trimmed, it starts with one of the backend's prompt
+/// markers (claude `❯`, codex `›`, kiro `>`). An error pattern matched on such
+/// a line is operator-typed / quoted text, not CLI error output (real error
+/// blocks render bare at line start across the fixture corpus).
+pub(crate) fn is_input_line(line: &str, input_markers: &[&str]) -> bool {
+    let trimmed = line.trim_start();
+    input_markers.iter().any(|m| trimmed.starts_with(m))
+}
+
+/// #1947: `in_error_line` with input-line exclusion — at least one occurrence
+/// of `matched` must sit on an error-indicator line that is NOT an input /
+/// user-message line. With empty `input_markers` this is exactly the original
+/// content anchor (backends without a stable prompt prefix — opencode / agy —
+/// keep the pre-#1947 behavior, honestly uncovered).
+pub(crate) fn in_error_line_excluding_input(
+    screen_text: &str,
+    matched: &str,
+    input_markers: &[&str],
+) -> bool {
     if matched.is_empty() {
         return false;
     }
@@ -102,7 +121,8 @@ pub(crate) fn in_error_line(screen_text: &str, matched: &str) -> bool {
         let line_end = screen_text[pos..]
             .find('\n')
             .map_or(screen_text.len(), |i| pos + i);
-        if line_has_error_indicator(&screen_text[line_start..line_end]) {
+        let line = &screen_text[line_start..line_end];
+        if line_has_error_indicator(line) && !is_input_line(line, input_markers) {
             return true;
         }
         search = pos + matched.len();
