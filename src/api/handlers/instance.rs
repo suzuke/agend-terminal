@@ -342,6 +342,14 @@ pub(crate) fn handle_set_blocked_reason(params: &Value, ctx: &HandlerCtx) -> Val
             let mut core = handle.core.lock();
             let state = core.state.get_state().display_name().to_string();
             core.health.set_blocked_reason(reason);
+            // #1933: attach the optional operator-readable note (set_blocked_reason
+            // above reset it). Empty/absent → no annotation.
+            core.health.set_blocked_note(
+                params["note"]
+                    .as_str()
+                    .filter(|n| !n.is_empty())
+                    .map(str::to_string),
+            );
             json!({"ok": true, "status": "reason_set", "reason": reason_str, "current_state": state})
         }
         None => json!({"ok": false, "error": format!("instance '{name}' not found")}),
@@ -551,6 +559,72 @@ mod tests {
         drop(reg);
 
         cleanup_agent(&ctx, "health-clear");
+    }
+
+    /// #1933 §3.9: the operator-readable `note` round-trips report → operator-
+    /// visible `handle_list` and is cleared with the reason. Pre-#1933,
+    /// `handle_report_health` dropped `note` before it reached SET_BLOCKED_REASON,
+    /// so it was a ghost — advertised in the schema, silently discarded.
+    #[test]
+    fn test_blocked_note_round_trips_to_list_and_clears() {
+        let (ctx, _home) = test_ctx_with_agent("health-note");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // Report a blocked reason WITH a free-text note (the SET_BLOCKED_REASON
+        // path that handle_report_health forwards to).
+        let result = handle_set_blocked_reason(
+            &json!({
+                "name": "health-note",
+                "reason": "rate_limit",
+                "note": "API quota resets 15:00 UTC"
+            }),
+            &ctx,
+        );
+        assert_eq!(result["ok"], true);
+
+        // (a) stored on the tracker.
+        {
+            let reg = agent::lock_registry(ctx.registry);
+            let handle = reg
+                .values()
+                .find(|h| h.name.as_str() == "health-note")
+                .expect("agent exists");
+            let core = handle.core.lock();
+            assert_eq!(
+                core.health.current_note.as_deref(),
+                Some("API quota resets 15:00 UTC")
+            );
+        }
+
+        // (b) operator-visible via handle_list: blocked_reason + blocked_note.
+        let list = crate::api::handlers::query::handle_list(&json!({}), &ctx);
+        let agents = list["result"]["agents"].as_array().expect("agents array");
+        let me = agents
+            .iter()
+            .find(|a| a["name"] == "health-note")
+            .expect("agent listed");
+        assert_eq!(me["blocked_note"], "API quota resets 15:00 UTC");
+        assert!(
+            me["blocked_reason"].as_str().is_some(),
+            "blocked_reason surfaced alongside the note"
+        );
+
+        // (c) clear removes the note with the reason (no stale annotation).
+        let _ = handle_clear_blocked_reason(&json!({"name": "health-note"}), &ctx);
+        {
+            let reg = agent::lock_registry(ctx.registry);
+            let handle = reg
+                .values()
+                .find(|h| h.name.as_str() == "health-note")
+                .expect("agent exists");
+            let core = handle.core.lock();
+            assert!(
+                core.health.current_note.is_none(),
+                "note cleared with the reason"
+            );
+        }
+
+        cleanup_agent(&ctx, "health-note");
     }
 
     /// §3.5.10 wire-format: pane_snapshot success-path response shape

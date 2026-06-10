@@ -359,6 +359,11 @@ pub struct HealthTracker {
     error_events: VecDeque<(Instant, AgentState)>,
     pub last_output: Instant,
     pub current_reason: Option<BlockedReason>,
+    /// #1933: free-text operator-readable annotation accompanying `current_reason`
+    /// (the `note` arg of `health action=report`). Orthogonal to the reason KIND,
+    /// so it lives alongside `current_reason` rather than inside the enum. Reset
+    /// when a new reason is set and cleared with the reason.
+    pub current_note: Option<String>,
     /// `#685` sub-task 7a: per-agent recovery dispatcher state machine.
     /// Mutated only by `src/daemon/per_tick/recovery_dispatcher.rs`;
     /// `health.rs` ships it as a field to keep all per-agent state in
@@ -489,6 +494,7 @@ impl HealthTracker {
             error_events: VecDeque::new(),
             last_output: Instant::now(),
             current_reason: None,
+            current_note: None,
             recovery_stage_state: RecoveryStageState::None,
             last_stage1_fired_at: None,
             recovery_restart_count: 0,
@@ -918,11 +924,21 @@ impl HealthTracker {
     /// misdiagnosing expected waits as hangs.
     pub fn set_blocked_reason(&mut self, reason: BlockedReason) {
         self.current_reason = Some(reason);
+        // #1933: a fresh reason resets any prior annotation (an auto-detected
+        // reason from the supervisor carries no note). The report path sets the
+        // note right after via `set_blocked_note`.
+        self.current_note = None;
+    }
+
+    /// #1933: attach the operator-readable annotation to the current blocked reason.
+    pub fn set_blocked_note(&mut self, note: Option<String>) {
+        self.current_note = note;
     }
 
     /// Clear the current blocked reason, resuming normal hang detection.
     pub fn clear_blocked_reason(&mut self) {
         self.current_reason = None;
+        self.current_note = None;
     }
 
     /// Record an error state. Returns true if error loop detected (3x in 10min).
