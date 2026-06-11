@@ -224,10 +224,35 @@ pub(super) fn spawn_single_instance_impl(
                     .name("task_inject".into())
                     .spawn(move || {
                         std::thread::sleep(std::time::Duration::from_secs(3));
-                        let _ = crate::api::call(
+                        // #2004: a swallowed INJECT failure left a slow-starting
+                        // member idle with ZERO task context, invisibly. Pure
+                        // surfacing — the spawn itself already succeeded, so a
+                        // failed inject stays non-fatal (operator re-injects).
+                        let resp = crate::api::call(
                             &h,
                             &json!({"method": crate::api::method::INJECT, "params": {"name": n, "data": task_text}}),
                         );
+                        let failed = match &resp {
+                            Ok(v) => v["ok"].as_bool() != Some(true),
+                            Err(_) => true,
+                        };
+                        if failed {
+                            let detail = match resp {
+                                Ok(v) => v.to_string(),
+                                Err(e) => e.to_string(),
+                            };
+                            tracing::warn!(
+                                agent = %n,
+                                error = %detail,
+                                "team-spawn task INJECT failed — member started without its task text (re-inject manually)"
+                            );
+                            crate::event_log::log(
+                                &h,
+                                "team_spawn_inject_failed",
+                                &n,
+                                &format!("task text inject failed after spawn: {detail}"),
+                            );
+                        }
                     })
                     .ok();
             }
