@@ -311,6 +311,53 @@ pub fn gc_stale_watches(home: &Path, sweep_origin: &str) -> usize {
             continue;
         }
 
+        // #1991 P6 (lead adjudication): an unwatch TOMBSTONE (auto_arm_optout,
+        // no subscribers) survives the TTL/inactivity reaps below — unwatch is
+        // an EXPLICIT decision, and a TTL-reap → PR-3 re-arm is the same
+        // betrayal as the 60-second re-arm #1991 fixed, only slower (#1713:
+        // observation must not override decision). A tombstone is never polled
+        // (zero API budget), so keeping it is free. End-of-life, in order:
+        //   1. PR terminal — `is_branch_open` reads the SAME pr_state store
+        //      PR-3 auto-arm keys on, so "safe to remove" and "won't re-arm"
+        //      are consistent by construction (no PR / merged / closed → PR-3
+        //      would not re-arm → the tombstone's job is done).
+        //   2. Age cap on `unwatched_at` — final backstop so an orphan
+        //      tombstone whose pr_state never goes terminal can't live
+        //      forever. If the PR is somehow STILL open past the cap, the
+        //      removal costs a single PR-3 re-arm — accepted narrow edge.
+        let tombstone = watch.auto_arm_optout == Some(true) && watch.subscriber_names().is_empty();
+        if tombstone {
+            let pr_open = crate::daemon::pr_state::is_branch_open(home, repo, branch);
+            let over_age = watch
+                .unwatched_at
+                .as_deref()
+                .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+                .is_some_and(|ts| {
+                    now_utc.signed_duration_since(ts.with_timezone(&chrono::Utc))
+                        > chrono::Duration::hours(MAX_WATCH_AGE_HOURS)
+                });
+            if !pr_open || over_age {
+                let reason = if pr_open {
+                    "tombstone_max_age"
+                } else {
+                    "tombstone_pr_terminal"
+                };
+                remove_watch(
+                    home,
+                    &path,
+                    &audit_label,
+                    repo,
+                    branch,
+                    &format!("{sweep_origin}_{reason}"),
+                );
+                tracing::info!(repo = %repo, branch = %branch, reason = %reason,
+                    sweep = %sweep_origin,
+                    "ci_watch tombstone removed (#1991 end-of-life)");
+                removed += 1;
+            }
+            continue;
+        }
+
         // (1) absolute TTL.
         if let Some(expires_at) = watch.expires_at.as_deref() {
             if let Ok(exp) = chrono::DateTime::parse_from_rfc3339(expires_at) {
@@ -715,6 +762,132 @@ mod tests {
     /// OPEN is EXEMPT from the absolute age-cap (it should keep notifying on CI,
     /// and the auto-arm would re-create it anyway). A same-age watch whose PR is
     /// MERGED still ages out — proving the exemption is open-specific.
+    /// #1991 P6: an unwatch tombstone for a STILL-OPEN PR survives both the
+    /// absolute TTL and the inactivity reap — unwatch is an explicit decision;
+    /// reaping it would let PR-3 re-arm (the same betrayal as the 60s storm,
+    /// only slower). This is the reader that keeps `auto_arm_optout` alive.
+    #[test]
+    fn gc_tombstone_survives_ttl_reaps_while_pr_open_1991() {
+        use crate::daemon::pr_state::gh_poll::{GhPrMetadata, GhPrState};
+        use crate::daemon::pr_state::{new_for_branch, save, ReviewClass};
+
+        let dir = tmp_dir("1991-tombstone-survives");
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).unwrap();
+        let expired = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let ancient =
+            (chrono::Utc::now() - chrono::Duration::hours(WATCH_TTL_HOURS + 10)).to_rfc3339();
+        let w = serde_json::json!({
+            "repo": "o/r", "branch": "feat/ts",
+            "subscribers": [], "auto_arm_optout": true,
+            "unwatched_at": chrono::Utc::now().to_rfc3339(),
+            // BOTH reap triggers armed: expired TTL + ancient inactivity.
+            "expires_at": expired, "last_terminal_seen_at": ancient,
+        });
+        std::fs::write(
+            ci_dir.join("ts.json"),
+            serde_json::to_string_pretty(&w).unwrap(),
+        )
+        .unwrap();
+        let mut st = new_for_branch("o/r", "feat/ts", "deadbeef", ReviewClass::Single);
+        st.last_gh_state = Some(GhPrMetadata {
+            number: 9,
+            author_login: "suzuke".to_string(),
+            head_ref: "feat/ts".to_string(),
+            is_cross_repository: false,
+            is_draft: false,
+            state: GhPrState::Open,
+            merged_at: None,
+        });
+        save(&dir, &st).unwrap();
+
+        let removed = gc_stale_watches(&dir, "test");
+        assert!(
+            ci_dir.join("ts.json").exists(),
+            "open-PR tombstone must survive TTL + inactivity reaps"
+        );
+        assert_eq!(removed, 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #1991 P6: tombstone end-of-life №1 — PR not open (merged / closed / no
+    /// pr_state at all) → gc removes it. Safe by construction: PR-3 auto-arm
+    /// keys on the SAME pr_state store, so "not open" here means it would not
+    /// re-arm either.
+    #[test]
+    fn gc_tombstone_reaped_when_pr_not_open_1991() {
+        let dir = tmp_dir("1991-tombstone-terminal");
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).unwrap();
+        let w = serde_json::json!({
+            "repo": "o/r", "branch": "feat/done",
+            "subscribers": [], "auto_arm_optout": true,
+            "unwatched_at": chrono::Utc::now().to_rfc3339(),
+            "expires_at": (chrono::Utc::now() + chrono::Duration::hours(48)).to_rfc3339(),
+        });
+        std::fs::write(
+            ci_dir.join("done.json"),
+            serde_json::to_string_pretty(&w).unwrap(),
+        )
+        .unwrap();
+        // No pr_state written → is_branch_open = false (untracked == terminal
+        // for tombstone purposes; auto-arm would not re-arm an untracked branch).
+        let removed = gc_stale_watches(&dir, "test");
+        assert!(
+            !ci_dir.join("done.json").exists(),
+            "tombstone must be reaped once the PR is not open"
+        );
+        assert_eq!(removed, 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #1991 P6: tombstone end-of-life №2 — the `unwatched_at` age cap is the
+    /// final backstop (an orphan tombstone whose pr_state stays Open forever
+    /// must not be immortal). The single PR-3 re-arm this can cause on a
+    /// genuinely still-open PR is the accepted narrow edge.
+    #[test]
+    fn gc_tombstone_age_cap_backstop_1991() {
+        use crate::daemon::pr_state::gh_poll::{GhPrMetadata, GhPrState};
+        use crate::daemon::pr_state::{new_for_branch, save, ReviewClass};
+
+        let dir = tmp_dir("1991-tombstone-agecap");
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).unwrap();
+        let over_age =
+            (chrono::Utc::now() - chrono::Duration::hours(MAX_WATCH_AGE_HOURS + 1)).to_rfc3339();
+        let w = serde_json::json!({
+            "repo": "o/r", "branch": "feat/orphan",
+            "subscribers": [], "auto_arm_optout": true,
+            "unwatched_at": over_age,
+            "expires_at": (chrono::Utc::now() + chrono::Duration::hours(48)).to_rfc3339(),
+        });
+        std::fs::write(
+            ci_dir.join("orphan.json"),
+            serde_json::to_string_pretty(&w).unwrap(),
+        )
+        .unwrap();
+        // PR still OPEN — the age cap must reap anyway (backstop beats open-PR).
+        let mut st = new_for_branch("o/r", "feat/orphan", "cafef00d", ReviewClass::Single);
+        st.last_gh_state = Some(GhPrMetadata {
+            number: 10,
+            author_login: "suzuke".to_string(),
+            head_ref: "feat/orphan".to_string(),
+            is_cross_repository: false,
+            is_draft: false,
+            state: GhPrState::Open,
+            merged_at: None,
+        });
+        save(&dir, &st).unwrap();
+
+        let removed = gc_stale_watches(&dir, "test");
+        assert!(
+            !ci_dir.join("orphan.json").exists(),
+            "over-age tombstone must be reaped even with an open PR (backstop)"
+        );
+        assert_eq!(removed, 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn gc_max_age_cap_exempts_open_pr_pr3() {
         use crate::daemon::pr_state::gh_poll::{GhPrMetadata, GhPrState};

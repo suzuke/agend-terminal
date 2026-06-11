@@ -297,8 +297,9 @@ fn ci_unwatch_last_subscriber_leaves_tombstone_not_delete() {
     // file is absent, so the delete re-subscribed the just-unwatched agent
     // ~60s later. The last unwatch now leaves a subscriber-less TOMBSTONE:
     // never polled (prepare_poll_context skips empty-subscriber watches, so
-    // the rate-limit budget is still protected), never re-armed, reaped by
-    // sweep GC via the existing TTL / PR-terminal paths.
+    // the rate-limit budget is still protected), never re-armed, and reaped
+    // by gc only at PR-terminal or the unwatched_at age-cap (P6: it survives
+    // the TTL/inactivity reaps — unwatch is an explicit decision).
     let home = std::env::temp_dir().join(format!("agend-unwatch-delete-{}", std::process::id()));
     std::fs::create_dir_all(&home).ok();
     let args = serde_json::json!({"repository": "owner/repo", "branch": "feat-test"});

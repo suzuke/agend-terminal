@@ -855,13 +855,18 @@ pub(crate) fn handle_unwatch_ci(home: &Path, args: &Value) -> Value {
         // auto-arm (`pr_state::auto_arm`) re-arms any open PR whose watch file
         // is ABSENT — deleting here re-subscribed the very agent that just
         // unwatched, ~60s later (the #1991 storm: unwatch → file gone → next
-        // pr_state scan auto-arms → notifications resume). A subscriber-less
-        // watch is never polled (`prepare_poll_context` → SkipReason::Invalid)
-        // and sweep GC reaps it via the existing TTL / PR-terminal paths; an
-        // explicit `ci watch` clears the flag (handle_watch_ci).
+        // pr_state scan auto-arms → notifications resume). Unwatch is an
+        // EXPLICIT decision: the tombstone suppresses auto-arm until the PR
+        // goes terminal or someone explicitly re-watches (handle_watch_ci
+        // clears the flag). It is never polled (`prepare_poll_context` →
+        // SkipReason::Invalid, zero API budget) and gc exempts it from the
+        // TTL/inactivity reaps (P6: a TTL-reap → re-arm is the same betrayal,
+        // only slower); end-of-life = PR-terminal gc or the unwatched_at
+        // age-cap backstop.
         watch["subscribers"] = json!([]);
         watch["instance"] = json!("");
         watch["auto_arm_optout"] = json!(true);
+        watch["unwatched_at"] = json!(chrono::Utc::now().to_rfc3339());
         if let Err(e) = crate::store::atomic_write(
             &path,
             serde_json::to_string_pretty(&watch)

@@ -120,13 +120,24 @@ pub struct WatchState {
     /// kept as a TOMBSTONE instead of being deleted — PR-3 auto-arm re-arms
     /// any open PR whose watch file is ABSENT, so deleting here re-subscribed
     /// the very agent that just unwatched (the #1991 notification storm).
-    /// A subscriber-less watch is never polled (`prepare_poll_context` skips
-    /// it), and sweep GC reaps it via the existing TTL / PR-terminal paths.
+    /// Semantics (P6 lead adjudication): unwatch is an EXPLICIT decision that
+    /// suppresses auto-arm for the PR's whole lifetime — the tombstone is
+    /// never polled (`prepare_poll_context` skips it, zero API budget) and
+    /// `gc_stale_watches` exempts it from the TTL/inactivity reaps (a
+    /// TTL-reap → re-arm is the 60s betrayal, only slower). End-of-life:
+    /// PR terminal (gc removes once `is_branch_open` is false — the same
+    /// pr_state store auto-arm keys on, so removal and won't-re-arm are
+    /// consistent by construction) or the `unwatched_at` age-cap backstop.
     /// An explicit `ci watch` clears the flag (a human decision overrides).
     /// Typed (not a raw JSON key) so typed read-modify-write paths
     /// (`stamp_repo_backoff`, `flush_watch_state`) can't silently drop it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_arm_optout: Option<bool>,
+    /// #1991: when the tombstone was created (last subscriber unwatched).
+    /// Anchor for the gc age-cap backstop — a tombstone has no subscribers,
+    /// so `earliest_subscribed_at` (the normal age anchor) is None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unwatched_at: Option<String>,
 }
 
 fn default_branch() -> String {
