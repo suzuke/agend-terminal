@@ -1138,6 +1138,10 @@ fn build_tick_infrastructure(
     crate::instance_monitor::spawn_monitor_tick(home.to_path_buf(), Arc::clone(&ctx.registry));
 
     crate::inbox::recover_half_writes(home);
+    // #1988: same half-write recovery for the task-event log — quarantine a
+    // crash-torn tail line and rewrite the hot log with the good events only,
+    // so a single bad byte cannot brick the whole task board on replay.
+    crate::task_events::recover_half_writes(home);
     replay_missed_at_startup(home, &ctx.registry);
     crate::daemon::ci_watch::startup_sweep(home);
     // #1488: GC bindings (schedules/dispatch_tracking/ci_watch) left orphaned

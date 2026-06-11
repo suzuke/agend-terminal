@@ -1434,25 +1434,154 @@ fn read_envelopes_strict(path: &Path, out: &mut Vec<TaskEventEnvelope>) -> anyho
         if line.trim().is_empty() {
             continue;
         }
-        let env: TaskEventEnvelope = serde_json::from_str(line).map_err(|e| {
+        // #1988: distinguish three failure shapes by their *cause* — only the
+        // first is skippable; the other two stay deliberately fail-closed.
+        //
+        // (1) CORRUPT line — not even valid JSON: a torn/half-written tail from a
+        //     crash mid-append (`append_lines_under_lock` appends in place), or a
+        //     disk glitch. It carries no recoverable event, so SKIP it and keep
+        //     replaying the rest — one bad byte must not brick the whole task
+        //     board (the old behaviour aborted the entire replay → board
+        //     unreadable). Warned here on every replay and, at boot, quarantined
+        //     + rewritten out of the log by `recover_half_writes`, so it is
+        //     neither accumulated nor silently lost. Mirrors `inbox`'s read
+        //     paths, which already skip unparseable lines.
+        let value: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    line = lineno + 1,
+                    error = %e,
+                    "#1988: skipping corrupt (non-JSON) task-event line (half-write/disk glitch) — replay continues"
+                );
+                continue;
+            }
+        };
+        // (2) FUTURE-VERSION line — valid JSON, but `schema_version` exceeds what
+        //     this binary understands: a VALID event a NEWER daemon wrote. Keep
+        //     the WHOLE-FILE fail-closed ABORT (deliberately NOT a per-record
+        //     skip): if this older daemon operated on the partial board it had
+        //     skipped, a later `compact()` would rewrite the hot log WITHOUT those
+        //     newer events → permanent loss of the newer daemon's task state.
+        //     Aborting refuses to operate at all, forcing the operator back to the
+        //     newer binary. This is the intended forward-compat protection.
+        let version = value
+            .get("schema_version")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        if version > SCHEMA_VERSION as u64 {
+            anyhow::bail!(
+                "{}:{}: schema_version {} > supported {} (forward-compat fail-closed — a newer daemon wrote this log; refusing to operate on a partial board)",
+                path.display(),
+                lineno + 1,
+                version,
+                SCHEMA_VERSION
+            );
+        }
+        // (3) WELL-FORMED-but-undeserializable line — valid JSON at a supported
+        //     version that still won't decode into a `TaskEventEnvelope`: an
+        //     unknown event `kind` or a missing required field (a newer daemon
+        //     that added an event variant WITHOUT bumping the version, or a
+        //     hand-edit). This is the SAME hazard as case (2) — a real event we
+        //     cannot apply — so ABORT, do NOT skip (skipping would let compaction
+        //     silently drop it). Garbage from a half-write fails case (1)'s JSON
+        //     parse first and never reaches here.
+        let env: TaskEventEnvelope = serde_json::from_value(value).map_err(|e| {
             anyhow::anyhow!(
-                "{}:{}: replay aborts on unparseable envelope (forward-compat fail-closed): {e}",
+                "{}:{}: replay aborts on undeserializable envelope at supported schema (fail-closed): {e}",
                 path.display(),
                 lineno + 1
             )
         })?;
-        if env.schema_version > SCHEMA_VERSION {
-            anyhow::bail!(
-                "{}:{}: schema_version {} > supported {} (forward-compat fail-closed)",
-                path.display(),
-                lineno + 1,
-                env.schema_version,
-                SCHEMA_VERSION
-            );
-        }
         out.push(env);
     }
     Ok(())
+}
+
+/// #1988: scan the live `task_events.jsonl` for corrupt (unparseable) lines — a
+/// torn/half-written tail from a crash mid-append (`append_lines_under_lock`
+/// appends in place, not via tmp+rename) — quarantine them under
+/// `task_events.recovery/<ts>/` and rewrite the log keeping only the good lines.
+/// Mirrors [`crate::inbox::recover_half_writes`]; call once at daemon startup.
+///
+/// "Corrupt" here means strictly NON-JSON (a half-write tail or disk glitch) —
+/// the only case [`read_envelopes_strict`] skips. A future-version or unknown
+/// event-variant line is still valid JSON and is KEPT, so the fail-closed gate
+/// in [`read_envelopes_strict`] keeps owning those cases (recovery must never
+/// auto-drop a newer daemon's events). Only the live log is scanned: archives
+/// under `task_events_archive/` are written atomically (tmp+rename) so they
+/// cannot hold a half-write, and the read-path skip is the backstop for any
+/// other archive corruption.
+pub fn recover_half_writes(home: &Path) {
+    use std::io::Write;
+    let path = log_path(home);
+    if !path.exists() {
+        return;
+    }
+    // Same lock `append` takes for this physical log (event_log derives
+    // `<log>.jsonl.lock`), so a concurrent early-boot append cannot race the
+    // rewrite.
+    let lock_path = path.with_extension("jsonl.lock");
+    let Ok(_lock) = crate::store::acquire_file_lock(&lock_path) else {
+        return;
+    };
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let mut kept: Vec<&str> = Vec::new();
+    let mut bad: Vec<&str> = Vec::new();
+    for l in content.lines() {
+        // Keep anything that is valid JSON (incl. future-version / unknown-variant
+        // lines — those are owned by the read-path fail-closed gate). Quarantine
+        // only true non-JSON garbage (half-write tails, disk glitches).
+        if l.trim().is_empty() || serde_json::from_str::<serde_json::Value>(l).is_ok() {
+            kept.push(l);
+        } else {
+            bad.push(l);
+        }
+    }
+    if bad.is_empty() {
+        return;
+    }
+    // Forensics: quarantine only the corrupt line(s) — never silently destroy.
+    let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let recovery_dir = home.join("task_events.recovery").join(&ts);
+    let _ = std::fs::create_dir_all(&recovery_dir);
+    if let Ok(mut rf) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(recovery_dir.join(format!("{LOG_NAME}.jsonl")))
+    {
+        for l in &bad {
+            let _ = writeln!(rf, "{l}");
+        }
+    }
+    // Rewrite the hot log with only the good lines via tmp + fsync + atomic
+    // rename (mirrors compaction's write-back) so every valid event survives.
+    let tmp = path.with_extension("jsonl.tmp");
+    let rewrite = (|| -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?;
+        for l in &kept {
+            writeln!(f, "{l}")?;
+        }
+        f.sync_all()?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    })();
+    if rewrite.is_ok() {
+        tracing::warn!(
+            tag = "#1988-task-events-recovered",
+            quarantined = bad.len(),
+            kept = kept.len(),
+            recovery_dir = %recovery_dir.display(),
+            "recovered corrupt task-event line(s) — quarantined + hot log rewritten with good lines only"
+        );
+    }
 }
 
 // ── Compaction ─────────────────────────────────────────────────────
@@ -1652,6 +1781,177 @@ mod tests {
         fs::write(&log, format!("{line}\n")).unwrap();
         let err = replay(&home).expect_err("must fail-closed on unknown variant");
         assert!(err.to_string().contains("replay aborts"), "got: {err}");
+        fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #1988: corrupt-line resilience ──────────────────────────────────
+
+    /// #1988 shape 1 — a CORRUPT (non-JSON) line in the MIDDLE of a real board
+    /// lifecycle (create → claim → update → done) must be SKIPPED, not abort the
+    /// whole replay. Goes through the real producer (`append`) for the good lines
+    /// and the real consumer (`replay`) — not a unit-injected `read_envelopes_strict`.
+    #[test]
+    fn replay_skips_corrupt_midfile_line_keeps_full_lifecycle() {
+        let home = tmp_home("corrupt-skip");
+        let inst = InstanceName::from("dev-impl-1");
+        let log = home.join("task_events.jsonl");
+
+        append(&home, &inst, sample_event("t-X")).unwrap();
+        append(
+            &home,
+            &inst,
+            TaskEvent::Claimed {
+                task_id: "t-X".into(),
+                by: "agent".into(),
+            },
+        )
+        .unwrap();
+        // Simulate a crash-torn / disk-glitched line landing mid-log.
+        {
+            use std::io::Write;
+            let mut f = fs::OpenOptions::new().append(true).open(&log).unwrap();
+            writeln!(f, "this is not valid json {{{{ truncated").unwrap();
+        }
+        append(
+            &home,
+            &inst,
+            TaskEvent::DescriptionUpdated {
+                task_id: "t-X".into(),
+                by: "agent".into(),
+                description: "updated desc".into(),
+            },
+        )
+        .unwrap();
+        append(
+            &home,
+            &inst,
+            TaskEvent::Done {
+                task_id: "t-X".into(),
+                by: "agent".into(),
+                source: DoneSource::OperatorManual {
+                    authored_at: chrono::Utc::now().to_rfc3339(),
+                    result: Some("ok".into()),
+                },
+            },
+        )
+        .unwrap();
+
+        // The garbage really is in the log...
+        let raw = fs::read_to_string(&log).unwrap();
+        assert!(
+            raw.contains("not valid json"),
+            "fixture must contain the bad line"
+        );
+        // ...yet replay folds the full lifecycle, skipping it (no abort).
+        let state = replay(&home).expect("corrupt mid-line must NOT brick replay");
+        let task = state
+            .tasks
+            .get(&TaskId::from("t-X"))
+            .expect("task survives the corrupt line");
+        assert_eq!(task.status, TaskStatus::Done);
+        fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1988 shape 2 — a half-written TAIL line (crash mid-append) is quarantined
+    /// and rewritten out of the hot log by `recover_half_writes` (the real boot
+    /// entry), preserving every good event and leaving a forensic copy.
+    #[test]
+    fn recover_half_writes_quarantines_torn_tail() {
+        let home = tmp_home("recover-tail");
+        let inst = InstanceName::from("u");
+        let log = home.join("task_events.jsonl");
+
+        append(&home, &inst, sample_event("t-Y")).unwrap();
+        append(
+            &home,
+            &inst,
+            TaskEvent::Done {
+                task_id: "t-Y".into(),
+                by: "agent".into(),
+                source: DoneSource::OperatorManual {
+                    authored_at: chrono::Utc::now().to_rfc3339(),
+                    result: None,
+                },
+            },
+        )
+        .unwrap();
+        // A torn trailing fragment from a crash mid-append (not valid JSON).
+        {
+            use std::io::Write;
+            let mut f = fs::OpenOptions::new().append(true).open(&log).unwrap();
+            // Unique sentinel — a generic fragment like "timesta" is a substring
+            // of the good lines' "timestamp" field and would give a false match.
+            write!(f, "{{\"schema_version\":2,\"seq\":99,\"TORN_SENTINEL_ZZ").unwrap();
+        }
+
+        recover_half_writes(&home);
+
+        // The torn line is gone from the hot log; every remaining line is valid JSON.
+        let rewritten = fs::read_to_string(&log).unwrap();
+        assert!(
+            !rewritten.contains("TORN_SENTINEL_ZZ"),
+            "torn tail must be removed"
+        );
+        for l in rewritten.lines().filter(|l| !l.trim().is_empty()) {
+            serde_json::from_str::<serde_json::Value>(l).expect("every kept line is valid JSON");
+        }
+        // It is quarantined, not silently destroyed.
+        let rec_root = home.join("task_events.recovery");
+        let sub = fs::read_dir(&rec_root)
+            .unwrap()
+            .next()
+            .expect("a recovery subdir exists")
+            .unwrap()
+            .path();
+        let quarantined = fs::read_to_string(sub.join("task_events.jsonl")).unwrap();
+        assert!(
+            quarantined.contains("TORN_SENTINEL_ZZ"),
+            "torn tail preserved for forensics"
+        );
+        // The board still replays cleanly with the good events.
+        let state = replay(&home).expect("replay clean after recovery");
+        assert_eq!(
+            state.tasks.get(&TaskId::from("t-Y")).unwrap().status,
+            TaskStatus::Done
+        );
+        fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1988 shape 3 — recovery must NOT auto-drop a newer daemon's events: a
+    /// FUTURE-VERSION line is valid JSON, so `recover_half_writes` KEEPS it and the
+    /// read-path fail-closed gate still fires on replay. (Proves the corrupt-skip
+    /// and forward-compat-abort responsibilities stay cleanly separated.)
+    #[test]
+    fn recover_keeps_future_version_line_replay_still_fail_closed() {
+        let home = tmp_home("recover-future");
+        let inst = InstanceName::from("u");
+        let log = home.join("task_events.jsonl");
+        append(&home, &inst, sample_event("t-Z")).unwrap();
+        let future = serde_json::json!({
+            "schema_version": 999,
+            "seq": 2,
+            "timestamp": "2026-04-27T00:00:00Z",
+            "instance": "newer-daemon",
+            "event": {"kind": "Unblocked", "task_id": "t-Z"}
+        });
+        {
+            use std::io::Write;
+            let mut f = fs::OpenOptions::new().append(true).open(&log).unwrap();
+            writeln!(f, "{future}").unwrap();
+        }
+
+        recover_half_writes(&home);
+
+        let after = fs::read_to_string(&log).unwrap();
+        assert!(
+            after.contains("\"schema_version\":999"),
+            "recovery must keep the future-version line (it is valid JSON, not garbage)"
+        );
+        let err = replay(&home).expect_err("future-version still fail-closed after recovery");
+        assert!(
+            err.to_string().contains("forward-compat fail-closed"),
+            "got: {err}"
+        );
         fs::remove_dir_all(&home).ok();
     }
 
