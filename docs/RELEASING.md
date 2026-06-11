@@ -50,6 +50,11 @@ gate ──► build (5 targets) ──┐
      restricted to this crate), then `Settings → Secrets and variables →
      Actions → New repository secret → CRATES_IO_TOKEN`.
    - **Never runs for pre-release tags** (any tag containing `-`).
+   - `cargo publish` fails if the version already exists on crates.io.
+     That's expected protection, not a bug: the job only runs on a freshly
+     pushed tag, and the gate already proved the tag matches `Cargo.toml` —
+     hitting it means the version was published out-of-band (re-run the
+     release with the next patch version instead).
 
 ## Pre-releases
 

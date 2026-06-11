@@ -71,8 +71,11 @@ jobs:
 
       # SemVer report — SOFT-FAIL pre-1.0 (prints the report for the human
       # release decision; 0.x bump rules are understood by the tool). Promote
-      # to hard-fail post-1.0. Baseline = previous git tag, NOT the action's
-      # default (latest crates.io version — the crate isn't published yet).
+      # to hard-fail post-1.0. Baseline = previous git tag by deliberate
+      # choice over the action's default (latest crates.io version):
+      # self-contained, no dependency on crates.io availability, and the
+      # git tag set is the more complete history (crates.io is missing
+      # 0.3.2 / 0.4.0 / 0.6.1).
       - name: Determine semver baseline (previous tag)
         id: prev
         run: |
