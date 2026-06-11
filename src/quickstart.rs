@@ -4,7 +4,10 @@ use crate::backend::Backend;
 use std::io::{self, Write};
 use std::path::Path;
 
-pub fn run(home: &Path) -> anyhow::Result<()> {
+pub fn run(home: &Path, unattended: bool) -> anyhow::Result<()> {
+    if unattended {
+        return run_unattended(home);
+    }
     println!("\n  AgEnD Terminal — Quickstart\n");
 
     // Step 1: Detect backends
@@ -98,17 +101,187 @@ pub fn run(home: &Path) -> anyhow::Result<()> {
 
     // Save .env + fleet.yaml
     if !token.is_empty() {
-        save_env_token(home, &token)?;
+        save_env_token(home, &token, false)?;
     }
     generate_fleet_yaml(
         home,
         &selected,
         group_id,
         if token.is_empty() { None } else { Some(&token) },
+        false,
     )?;
 
     print_next_steps(home);
     Ok(())
+}
+
+/// Non-interactive setup for CI / scripted installs (`quickstart
+/// --unattended`). Hard guarantees, both structural (nothing in this call
+/// graph reads stdin or talks to the network):
+///   - NEVER reads stdin — a missing required input is a clear error +
+///     non-zero exit, not a hang (the CI killer the flag exists to avoid).
+///   - NEVER waits on the network — no `detect_group` (3-min wait) and no
+///     `verify_bot`; an env-provided token is stored UNVERIFIED (noted in
+///     the output; the daemon surfaces a bad token at startup).
+///
+/// Inputs: backend = first detected (no hardcoded assumption that any
+/// specific backend is installed — zero detected is the one hard error);
+/// Telegram from `AGEND_TELEGRAM_BOT_TOKEN` / `AGEND_TELEGRAM_GROUP_ID` env
+/// (explicit per-invocation instruction, wins over `.env`), falling back to
+/// an existing `.env` / fleet.yaml, else skipped (Telegram is optional).
+/// An existing fleet.yaml is kept untouched → idempotent re-runs.
+fn run_unattended(home: &Path) -> anyhow::Result<()> {
+    println!("\n  AgEnD Terminal — Quickstart (unattended)\n");
+
+    let backends = detect_backends();
+    let Some(selected) = backends.first().cloned() else {
+        eprintln!("  ✗ No supported backend found on PATH. Install one of:");
+        eprintln!("      Claude Code   npm install -g @anthropic-ai/claude-code");
+        eprintln!("      codex         npm install -g @openai/codex");
+        eprintln!("      Kiro CLI      see https://kiro.dev for installer");
+        eprintln!("      OpenCode      see https://opencode.ai for installer");
+        anyhow::bail!("unattended quickstart: no supported backend detected");
+    };
+    println!(
+        "  ✓ Backend: {} (first of {} detected)",
+        selected.name(),
+        backends.len()
+    );
+
+    // Existing state (the same sources the interactive flow reads).
+    let env_path = home.join(".env");
+    let env_file_token = std::fs::read_to_string(&env_path)
+        .ok()
+        .and_then(|content| {
+            content
+                .lines()
+                .find_map(extract_env_token)
+                .map(str::to_string)
+        })
+        .filter(|t| !t.is_empty());
+    let fleet_path = crate::fleet::fleet_yaml_path(home);
+    let fleet_group_id = std::fs::read_to_string(&fleet_path)
+        .ok()
+        .and_then(|content| serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&content).ok())
+        .and_then(|config| config["channel"]["group_id"].as_i64());
+
+    let resolved = resolve_unattended_telegram(
+        env_file_token,
+        fleet_group_id,
+        std::env::var("AGEND_TELEGRAM_BOT_TOKEN")
+            .ok()
+            .filter(|t| !t.trim().is_empty()),
+        std::env::var("AGEND_TELEGRAM_GROUP_ID").ok(),
+    );
+    for note in &resolved.notes {
+        println!("  · {note}");
+    }
+
+    if let Some(token) = &resolved.token {
+        save_env_token(home, token, true)?;
+    }
+    generate_fleet_yaml(
+        home,
+        &selected,
+        resolved.group_id,
+        resolved.token.as_deref(),
+        true,
+    )?;
+
+    print_next_steps(home);
+    Ok(())
+}
+
+/// Decision record for the unattended Telegram resolution — pure so the
+/// precedence matrix is unit-testable without env/process state.
+struct UnattendedTelegram {
+    token: Option<String>,
+    group_id: Option<i64>,
+    /// Human-readable decisions for the CI log (what was used, what was
+    /// skipped and why).
+    notes: Vec<String>,
+}
+
+/// Precedence: an env var is an explicit per-invocation instruction and wins
+/// over state left by a previous run (`.env` token / fleet.yaml group_id).
+/// No input at all → Telegram is skipped (it is optional; the fleet is
+/// generated with a commented channel block).
+fn resolve_unattended_telegram(
+    env_file_token: Option<String>,
+    fleet_group_id: Option<i64>,
+    env_var_token: Option<String>,
+    env_var_group_id: Option<String>,
+) -> UnattendedTelegram {
+    let mut notes = Vec::new();
+
+    let token = match (env_var_token, env_file_token) {
+        (Some(t), _) => {
+            notes.push(
+                "Telegram token: from AGEND_TELEGRAM_BOT_TOKEN env (stored unverified — \
+                 network checks are skipped in unattended mode)"
+                    .to_string(),
+            );
+            Some(t)
+        }
+        (None, Some(t)) => {
+            notes.push(format!(
+                "Telegram token: existing .env ({})",
+                mask_token(&t)
+            ));
+            Some(t)
+        }
+        (None, None) => {
+            notes.push(
+                "Telegram: skipped (no AGEND_TELEGRAM_BOT_TOKEN env and no existing .env token)"
+                    .to_string(),
+            );
+            None
+        }
+    };
+
+    let group_id = if token.is_none() {
+        None
+    } else {
+        match env_var_group_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.parse::<i64>())
+        {
+            Some(Ok(gid)) => {
+                notes.push(format!(
+                    "Telegram group: {gid} (from AGEND_TELEGRAM_GROUP_ID env)"
+                ));
+                Some(gid)
+            }
+            Some(Err(_)) => {
+                notes.push(
+                    "Telegram group: AGEND_TELEGRAM_GROUP_ID is not a valid integer — \
+                     ignored (channel block left commented)"
+                        .to_string(),
+                );
+                fleet_group_id
+            }
+            None => {
+                if let Some(gid) = fleet_group_id {
+                    notes.push(format!("Telegram group: {gid} (existing fleet.yaml)"));
+                } else {
+                    notes.push(
+                        "Telegram group: none (group detection needs interactive mode — \
+                         channel block left commented)"
+                            .to_string(),
+                    );
+                }
+                fleet_group_id
+            }
+        }
+    };
+
+    UnattendedTelegram {
+        token,
+        group_id,
+        notes,
+    }
 }
 
 /// Sprint 56 Track H3 (#525 items 7 + 16 + 17): operator response to
@@ -481,6 +654,7 @@ fn generate_fleet_yaml(
     backend: &Backend,
     group_id: Option<i64>,
     _token: Option<&str>,
+    unattended: bool,
 ) -> anyhow::Result<()> {
     let fleet_path = crate::fleet::fleet_yaml_path(home);
 
@@ -490,6 +664,13 @@ fn generate_fleet_yaml(
             check_compatibility(&content, backend, group_id);
         }
 
+        // Unattended: NEVER overwrite an existing fleet.yaml (same answer as
+        // the interactive default `N` — destructive prompts fail safe), which
+        // also makes unattended re-runs idempotent.
+        if unattended {
+            println!("  Keeping existing fleet.yaml (unattended never overwrites).\n");
+            return Ok(());
+        }
         let answer = prompt("  fleet.yaml already exists. Overwrite? (y/N): ")?;
         if !answer.trim().eq_ignore_ascii_case("y") {
             println!("  Keeping existing fleet.yaml.\n");
@@ -564,7 +745,7 @@ fn is_telegram_token_line(line: &str) -> bool {
 /// Save the Telegram bot token to .env under the canonical
 /// `AGEND_TELEGRAM_BOT_TOKEN` key, preserving other variables (and migrating
 /// any legacy `AGEND_BOT_TOKEN` line out).
-fn save_env_token(home: &Path, token: &str) -> anyhow::Result<()> {
+fn save_env_token(home: &Path, token: &str, unattended: bool) -> anyhow::Result<()> {
     let env_path = home.join(".env");
     let existing = std::fs::read_to_string(&env_path).unwrap_or_default();
     let existing_token = existing.lines().find_map(extract_env_token);
@@ -575,16 +756,25 @@ fn save_env_token(home: &Path, token: &str) -> anyhow::Result<()> {
             return Ok(());
         }
         println!("  .env already has a bot token: {}", mask_token(old));
-        // Sprint 56 Track H4 (#525 item 14): destructive prompts default
-        // to `N` (preserve operator data); non-destructive prompts
-        // default to `Y` (the convenient path). Updating an existing
-        // token overwrites stored credentials → destructive →
-        // (y/N). Only an explicit `y` proceeds; Enter/N/anything-else
-        // keeps the current token.
-        let answer = prompt("  Update token? (y/N): ")?;
-        if !answer.trim().eq_ignore_ascii_case("y") {
-            println!("  Keeping existing token.\n");
-            return Ok(());
+        // Unattended: the differing token can only have come from the
+        // AGEND_TELEGRAM_BOT_TOKEN env var (resolve_unattended_telegram's
+        // .env arm is by definition equal to `old`) — an explicit
+        // per-invocation instruction, e.g. a CI token rotation. Update
+        // without prompting.
+        if unattended {
+            println!("  ✓ Updating from AGEND_TELEGRAM_BOT_TOKEN env (explicit instruction)");
+        } else {
+            // Sprint 56 Track H4 (#525 item 14): destructive prompts default
+            // to `N` (preserve operator data); non-destructive prompts
+            // default to `Y` (the convenient path). Updating an existing
+            // token overwrites stored credentials → destructive →
+            // (y/N). Only an explicit `y` proceeds; Enter/N/anything-else
+            // keeps the current token.
+            let answer = prompt("  Update token? (y/N): ")?;
+            if !answer.trim().eq_ignore_ascii_case("y") {
+                println!("  Keeping existing token.\n");
+                return Ok(());
+            }
         }
     }
 
@@ -1350,7 +1540,7 @@ mod tests {
             std::env::temp_dir().join(format!("agend-quickstart-test-{}", std::process::id()));
         std::fs::create_dir_all(&home).ok();
         let backend = Backend::all()[0].clone();
-        generate_fleet_yaml(&home, &backend, Some(-1001234567890), None).expect("test");
+        generate_fleet_yaml(&home, &backend, Some(-1001234567890), None, false).expect("test");
         let yaml = std::fs::read_to_string(crate::fleet::fleet_yaml_path(&home)).expect("test");
         assert!(
             yaml.contains("user_allowlist"),
@@ -1419,11 +1609,108 @@ mod tests {
         ));
         std::fs::create_dir_all(&home).ok();
         let backend = Backend::all()[0].clone();
-        generate_fleet_yaml(&home, &backend, None, None).expect("test");
+        generate_fleet_yaml(&home, &backend, None, None, false).expect("test");
         let yaml = std::fs::read_to_string(crate::fleet::fleet_yaml_path(&home)).expect("test");
         assert!(
             yaml.contains("user_allowlist"),
             "commented-out channel section must mention user_allowlist; got:\n{yaml}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── quickstart --unattended (產品化第2站) ──
+
+    #[test]
+    fn unattended_env_var_token_wins_over_env_file() {
+        let r = resolve_unattended_telegram(
+            Some("file-token".into()),
+            Some(42),
+            Some("env-token".into()),
+            None,
+        );
+        assert_eq!(r.token.as_deref(), Some("env-token"));
+        assert_eq!(r.group_id, Some(42), "fleet gid is the fallback");
+        assert!(
+            r.notes.iter().any(|n| n.contains("unverified")),
+            "env token must be flagged unverified (no network in unattended): {:?}",
+            r.notes
+        );
+    }
+
+    #[test]
+    fn unattended_falls_back_to_env_file_then_skips() {
+        let r = resolve_unattended_telegram(Some("file-token".into()), None, None, None);
+        assert_eq!(r.token.as_deref(), Some("file-token"));
+        assert_eq!(r.group_id, None);
+
+        let r = resolve_unattended_telegram(None, Some(42), None, None);
+        assert_eq!(r.token, None, "no token → telegram skipped");
+        assert_eq!(
+            r.group_id, None,
+            "gid without token is meaningless — stays off"
+        );
+        assert!(r.notes.iter().any(|n| n.contains("skipped")));
+    }
+
+    #[test]
+    fn unattended_group_id_env_wins_and_invalid_is_ignored() {
+        let r =
+            resolve_unattended_telegram(Some("t".into()), Some(42), None, Some("-1009999".into()));
+        assert_eq!(r.group_id, Some(-1009999), "env gid wins over fleet gid");
+
+        let r = resolve_unattended_telegram(
+            Some("t".into()),
+            Some(42),
+            None,
+            Some("not-a-number".into()),
+        );
+        assert_eq!(
+            r.group_id,
+            Some(42),
+            "invalid env gid → ignored, fleet fallback"
+        );
+        assert!(
+            r.notes.iter().any(|n| n.contains("not a valid integer")),
+            "invalid gid must be called out: {:?}",
+            r.notes
+        );
+    }
+
+    #[test]
+    fn unattended_generate_fleet_never_overwrites_existing() {
+        let home =
+            std::env::temp_dir().join(format!("agend-quickstart-ua-keep-{}", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        let fleet_path = crate::fleet::fleet_yaml_path(&home);
+        std::fs::write(&fleet_path, "# operator-owned\ninstances: {}\n").expect("test");
+        let backend = Backend::all()[0].clone();
+        generate_fleet_yaml(&home, &backend, Some(1), Some("tok"), true).expect("test");
+        let after = std::fs::read_to_string(&fleet_path).expect("test");
+        assert_eq!(
+            after, "# operator-owned\ninstances: {}\n",
+            "unattended must keep an existing fleet.yaml byte-identical (idempotent re-runs)"
+        );
+        assert!(
+            !home.join("fleet.yaml.bak").exists(),
+            "no backup churn when nothing was overwritten"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn unattended_save_env_token_updates_without_prompt() {
+        let home =
+            std::env::temp_dir().join(format!("agend-quickstart-ua-token-{}", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        std::fs::write(home.join(".env"), "AGEND_TELEGRAM_BOT_TOKEN=old-token\n").expect("test");
+        // Differing token in unattended = explicit env instruction → updated
+        // with NO stdin read (a prompt here would hang CI — the test itself
+        // runs with no stdin, so a regression reads EOF → keeps old → fails).
+        save_env_token(&home, "new-token", true).expect("test");
+        let env = std::fs::read_to_string(home.join(".env")).expect("test");
+        assert!(
+            env.contains("AGEND_TELEGRAM_BOT_TOKEN=new-token"),
+            "unattended token update must apply: {env}"
         );
         std::fs::remove_dir_all(&home).ok();
     }

@@ -358,7 +358,15 @@ enum Commands {
     #[cfg(feature = "tray")]
     Tray,
     /// Interactive first-time setup
-    Quickstart,
+    Quickstart {
+        /// Non-interactive setup for CI / scripted installs: never reads
+        /// stdin, never waits on the network. Backend = first detected;
+        /// Telegram from AGEND_TELEGRAM_BOT_TOKEN / AGEND_TELEGRAM_GROUP_ID
+        /// (or an existing .env), otherwise skipped; an existing fleet.yaml
+        /// is kept untouched (idempotent re-runs).
+        #[arg(long, visible_alias = "yes")]
+        unattended: bool,
+    },
     /// Generate a bug report
     Bugreport,
     /// Generate shell completions
@@ -1198,7 +1206,7 @@ fn main() -> anyhow::Result<()> {
         },
         #[cfg(feature = "tray")]
         Some(Commands::Tray) => tray::run(&home)?,
-        Some(Commands::Quickstart) => quickstart::run(&home)?,
+        Some(Commands::Quickstart { unattended }) => quickstart::run(&home, unattended)?,
         Some(Commands::Bugreport) => bugreport::run(&home)?,
         Some(Commands::Completions { shell }) => {
             use clap::CommandFactory;

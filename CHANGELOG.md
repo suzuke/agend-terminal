@@ -11,6 +11,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 ### Added
 
+- **`quickstart --unattended` (alias `--yes`)** — non-interactive setup for CI / scripted installs: never reads stdin (missing input = clear error + non-zero exit, not a hang), never waits on the network. Backend = first detected on PATH; Telegram optionally from `AGEND_TELEGRAM_BOT_TOKEN` / `AGEND_TELEGRAM_GROUP_ID` env (token stored unverified; the daemon validates at startup), otherwise skipped. Idempotent: an existing fleet.yaml is never overwritten; an existing `.env` token is only replaced by an explicit env var.
+
 - **fleet.yaml `schema_version` + compatibility policy (#1989)** — `fleet.yaml` accepts an optional `schema_version:` field (omitted = `1`; existing files unchanged, the daemon never injects it). A file declaring a version newer than the daemon supports loads with a warning instead of being silently misread without trace. `docs/COMPATIBILITY.md` declares the on-disk interface tiers — (a) stable public (fleet.yaml, service templates, instruction blocks, MCP config), (b) internal persisted state, (c) regenerable/ephemeral — and the additive-only change rule for (a)/(b).
 
 - **Release pipeline hardening** — `release.yml` gains a pre-release `gate` job (version==tag, changelog section present, MSRV 1.87 `cargo check`, `cargo-semver-checks` soft-fail report vs the previous tag) that all artifact jobs depend on, and a `publish` job that auto-publishes to crates.io after the GitHub Release succeeds (`--dry-run` first; skips gracefully when the `CRATES_IO_TOKEN` secret is unset; never runs for `-rc.N` pre-release tags). Release procedure is documented in `docs/RELEASING.md`.
