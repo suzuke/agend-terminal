@@ -60,6 +60,22 @@ Coverage is observation-only — not a merge gate. PRs that drop project coverag
    - `merge:` PR-style aggregation (used when landing review rounds)
 4. **PR description** — what changed and why. Tie bug fixes to evidence (stack trace, repro, test that failed before).
 
+## Review Process
+
+Here's what to expect once you open an issue or PR — the aim is fast, concrete feedback, not ceremony.
+
+- **Search first; it gets you the quickest answer.** Before filing, skim the open *and closed* issues and recent commits/PRs in the area (the issue and PR templates carry a prior-art checklist for exactly this). A duplicate or already-decided proposal may be closed; a genuinely *new* angle on a closed topic is welcome — just say what changed. Our fastest-moving outside contributions have opened with a polite, evidence-first RCA — *"here's the symptom, here's the `file:line` I traced it to, here's a proposed direction"* — rather than a large unsolicited patch. That lets a maintainer green-light the direction before you sink time into the code.
+
+- **Reviews come back with a verdict and evidence.** A reviewer replies with one of `VERIFIED` / `REJECTED` / `UNVERIFIED` plus an evidence block — the command they ran (`cargo test`, `clippy`, `gh pr checks`) or a `file:line` citation behind each finding. You won't have to guess what "looks good" means; findings are specific and reproducible. Address them and push — we **aim for same-day review turnaround** (an aim, not an SLA — this is a small project). A `REJECTED` is a concrete to-do list, not a door closing.
+
+- **A factual claim is a claim to verify, not evidence.** A sentence in your PR body or a code comment that asserts *"this can't happen"* / *"this is the only caller"* / *"X is unreachable"* will be checked against the actual code — guards, match arms, call sites — by the reviewer, and you're expected to have checked it yourself first. We catch confident-but-wrong rationales this way regularly (a "compaction would lose this" that named dead code; a "single chokepoint" several call sites bypassed). Trace your claims to the source before you write them down — it saves a review round.
+
+- **Tests prove behavior through the real entry point.** A regression test should drive the code the way production does — through the real function — not by hand-injecting the internal shape it is supposed to compute. A test that mocks the discovery/wiring it claims to cover proves the helper, not the feature. See **Testing Expectations** below for the format-fidelity rule.
+
+- **High-risk areas may get more than one review.** Changes to state detection, concurrency/locking, or command-authority/security can go to two reviewers — sometimes on different AI backends. That is not distrust; it is the standard bar for areas where a line-by-line diff can miss a design-level flaw. More rounds on a sensitive change is normal, not a red flag.
+
+- **Stale PRs: we carry them forward, and your authorship stays yours.** If a review asks for a change and there is no response for about a working day, a maintainer may rebase and carry the PR forward so it doesn't go stale — **your authorship is always preserved** (your commits keep your name) and you can reclaim the PR at any time by commenting. We would rather move a good contribution forward than let it rot; this is an expectation set up front, not a takeover.
+
 ## Scope Discipline
 
 - Don't broaden a PR beyond the stated change. A `fix:` commit should not also rename unrelated types.
