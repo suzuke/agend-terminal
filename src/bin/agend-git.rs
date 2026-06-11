@@ -516,10 +516,27 @@ fn branch_tag_names_ref(subcmd: &str, args: &[String]) -> bool {
         return false;
     }
     args.iter().skip(1).any(|a| {
+        let s = a.as_str();
+        // Create / delete / move / copy a NAMED ref.
         matches!(
-            a.as_str(),
+            s,
             "-d" | "-D" | "--delete" | "-m" | "-M" | "--move" | "-c" | "-C" | "--copy"
-        ) || !a.starts_with('-') // a positional ref name / pattern
+        )
+        // CURRENT-branch mutators that need NO positional (the git-branch upstream /
+        // description ops) — dash-prefixed, so the positional check below misses
+        // them. `--set-upstream-to=<up>` takes the `=` form; `-u <up>` /
+        // `--set-upstream-to <up>` take a following value (itself caught as a
+        // positional, but matched here so the no-value-yet form is covered too).
+        || matches!(
+            s,
+            "-u" | "--set-upstream-to"
+                | "--set-upstream"
+                | "--unset-upstream"
+                | "--edit-description"
+        )
+        || s.starts_with("--set-upstream-to=")
+        // A positional ref name / pattern / flag value.
+        || !s.starts_with('-')
     })
 }
 
@@ -3192,6 +3209,29 @@ mod tests {
             &a(&["branch", "-m", "old", "new"])
         ));
         assert!(branch_tag_names_ref("tag", &a(&["tag", "-d", "v1.0"])));
+        // #2030 (codex): CURRENT-branch mutators with NO positional token — they
+        // write `branch.<cur>.merge` / the description, so a foreign-repo redirect
+        // would still lie. All four forms must name a ref.
+        assert!(branch_tag_names_ref(
+            "branch",
+            &a(&["branch", "--set-upstream-to=origin/main"])
+        ));
+        assert!(branch_tag_names_ref(
+            "branch",
+            &a(&["branch", "--set-upstream-to", "origin/main"])
+        ));
+        assert!(branch_tag_names_ref(
+            "branch",
+            &a(&["branch", "-u", "origin/main"])
+        ));
+        assert!(branch_tag_names_ref(
+            "branch",
+            &a(&["branch", "--unset-upstream"])
+        ));
+        assert!(branch_tag_names_ref(
+            "branch",
+            &a(&["branch", "--edit-description"])
+        ));
         // bare LIST form (no positional, list/inspect flags only) → does NOT name a ref
         assert!(!branch_tag_names_ref("branch", &a(&["branch"])));
         assert!(!branch_tag_names_ref("branch", &a(&["branch", "-a"])));
@@ -3236,6 +3276,17 @@ mod tests {
                 ChdirPass("wt".into()),
                 "tag",
                 &a(&["tag", "v1.0"]),
+                true
+            ),
+            Passthrough
+        );
+        // #2030 (codex): a no-positional current-branch mutator, foreign → Passthrough
+        // (was: ChdirPass wrote branch.<cur>.merge into the worktree, the lie)
+        assert_eq!(
+            apply_foreign_repo_passthrough(
+                ChdirPass("wt".into()),
+                "branch",
+                &a(&["branch", "--set-upstream-to=origin/main"]),
                 true
             ),
             Passthrough
