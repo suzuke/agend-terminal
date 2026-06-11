@@ -184,10 +184,93 @@ fn configure_claude(working_dir: &Path, instance_name: Option<&str>) -> Result<(
     let path = working_dir.join(".claude").join("settings.local.json");
     upsert_mcp_servers(&path, instance_name)?;
 
+    // #hook-state-poc (shadow-mode, flag-gated — default OFF, zero behavior
+    // change): inject lifecycle-hook reporters into the SAME per-workspace
+    // settings file (scope rule honored; user-global ~/.claude is untouched).
+    // Empirically verified (2026-06-11 live fleet spawn): the events fire as
+    // documented, the TUI shows no artifacts (async), and this upsert
+    // preserves pre-existing keys.
+    if std::env::var("AGEND_HOOK_STATE_POC").as_deref() == Ok("1") {
+        if let Some(name) = instance_name {
+            upsert_state_hooks(&path, name)?;
+        }
+    }
+
     // Write standalone mcp-config.json for --mcp-config flag
     let standalone = working_dir.join("mcp-config.json");
     upsert_mcp_servers(&standalone, instance_name)?;
 
+    Ok(())
+}
+
+/// #hook-state-poc: upsert observe-only lifecycle-hook reporters into the
+/// per-workspace Claude settings. Merge-preserving at three levels: other
+/// top-level keys, other hook EVENTS, and other (user/project) hook entries
+/// under the same event — our entry is identified by the
+/// `hook-event --instance` marker and replaced idempotently. Every entry is
+/// `async` (the TUI never waits) and the reporter always exits 0 (exit 2
+/// would block the agent's action — observe-only by contract).
+fn upsert_state_hooks(path: &Path, instance_name: &str) -> Result<()> {
+    /// Events wired for the shadow PoC. Verified live: SessionStart /
+    /// UserPromptSubmit / PreToolUse / PostToolUse / Stop /
+    /// Notification(idle_prompt). Docs-sourced (not yet observed live):
+    /// Notification(permission_prompt) — the fleet runs bypassPermissions so
+    /// permission prompts cannot occur in-fleet; StopFailure / PreCompact /
+    /// PermissionRequest / SessionEnd — shadow data will show whether and
+    /// when they fire.
+    const HOOK_EVENTS: &[&str] = &[
+        "SessionStart",
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PostToolUse",
+        "Stop",
+        "Notification",
+        "PermissionRequest",
+        "StopFailure",
+        "PreCompact",
+        "SessionEnd",
+    ];
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "agend-terminal".to_string());
+    let marker = "hook-event --instance";
+    let command = format!("{exe} hook-event --instance {instance_name}");
+    let our_entry = json!({
+        "hooks": [{
+            "type": "command",
+            "command": command,
+            "async": true,
+            "timeout": 10,
+        }]
+    });
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _lock = crate::store::acquire_file_lock(&config_lock_path(path))?;
+    let mut config: serde_json::Value = if path.exists() {
+        serde_json::from_str(&std::fs::read_to_string(path)?).unwrap_or(json!({}))
+    } else {
+        json!({})
+    };
+    if config.get("hooks").is_none() {
+        config["hooks"] = json!({});
+    }
+    for event in HOOK_EVENTS {
+        let groups = config["hooks"]
+            .as_object_mut()
+            .expect("hooks set above")
+            .entry((*event).to_string())
+            .or_insert_with(|| json!([]));
+        if let Some(arr) = groups.as_array_mut() {
+            // Idempotent replace-by-marker; user/project entries untouched.
+            arr.retain(|g| !g.to_string().contains(marker));
+            arr.push(our_entry.clone());
+        }
+    }
+    let body = serde_json::to_string_pretty(&config)?;
+    crate::store::atomic_write(path, body.as_bytes())?;
+    tracing::debug!(path = %path.display(), "configured state hooks (shadow PoC)");
     Ok(())
 }
 
@@ -1335,5 +1418,108 @@ mod tests {
             entry_none["env"].get("AGEND_INSTANCE_NAME").is_none(),
             "mcp_server_entry(None) must not include AGEND_INSTANCE_NAME"
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod hook_state_poc_tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "agend-hookpoc-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// #hook-state-poc: the hooks upsert is merge-preserving at all three
+    /// levels (top-level keys / other events / foreign entries under the same
+    /// event) and idempotent (re-run replaces our marker entry, no
+    /// duplicates). Observe-only contract pinned: async:true on every entry.
+    #[test]
+    fn upsert_state_hooks_merge_preserving_and_idempotent() {
+        let dir = tmp("merge");
+        let path = dir.join(".claude").join("settings.local.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Pre-existing user content: a foreign top-level key, a foreign hook
+        // event, and a foreign entry under an event we also wire.
+        std::fs::write(
+            &path,
+            serde_json::to_string(&json!({
+                "permissions": {"allow": ["Bash(ls *)"]},
+                "hooks": {
+                    "FileChanged": [{"matcher": "*.rs", "hooks": [{"type": "command", "command": "user-watcher"}]}],
+                    "Stop": [{"hooks": [{"type": "command", "command": "user-stop-bell"}]}],
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        upsert_state_hooks(&path, "agent-x").unwrap();
+        upsert_state_hooks(&path, "agent-x").unwrap(); // idempotent re-run
+
+        let cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        // Foreign top-level key preserved.
+        assert_eq!(cfg["permissions"]["allow"][0], "Bash(ls *)");
+        // Foreign event preserved.
+        assert_eq!(cfg["hooks"]["FileChanged"][0]["matcher"], "*.rs");
+        // Foreign entry under a shared event preserved + exactly ONE of ours.
+        let stop = cfg["hooks"]["Stop"].as_array().unwrap();
+        assert!(stop
+            .iter()
+            .any(|g| g.to_string().contains("user-stop-bell")));
+        assert_eq!(
+            stop.iter()
+                .filter(|g| g.to_string().contains("hook-event --instance"))
+                .count(),
+            1,
+            "idempotent: exactly one of our entries after re-run"
+        );
+        // Observe-only contract: every injected entry is async.
+        for ev in ["PreToolUse", "Notification", "Stop"] {
+            let ours = cfg["hooks"][ev]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|g| g.to_string().contains("hook-event --instance"))
+                .unwrap_or_else(|| panic!("our entry present for {ev}"));
+            assert_eq!(ours["hooks"][0]["async"], true, "{ev} must be async");
+            assert!(
+                ours["hooks"][0]["command"]
+                    .as_str()
+                    .unwrap()
+                    .contains("--instance agent-x"),
+                "instance embedded for attribution"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #hook-state-poc: flag OFF (default) → configure_claude writes NO hooks
+    /// key at all — zero behavior change without AGEND_HOOK_STATE_POC=1.
+    #[test]
+    fn hooks_not_injected_without_flag() {
+        let dir = tmp("flag-off");
+        // configure_claude needs a git repo; it git-inits itself.
+        configure_claude(&dir, Some("agent-y")).unwrap();
+        let cfg: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join(".claude/settings.local.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            cfg.get("hooks").is_none(),
+            "no hooks without the PoC flag, got {cfg}"
+        );
+        assert!(cfg.get("mcpServers").is_some(), "mcp config still written");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

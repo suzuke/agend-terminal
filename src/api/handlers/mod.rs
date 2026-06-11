@@ -4,6 +4,7 @@
 //! `HandlerCtx` bundles the session-scoped state that handlers need.
 
 pub(crate) mod external;
+pub(crate) mod hook_event;
 pub(crate) mod instance;
 pub(crate) mod mcp_proxy;
 pub(crate) mod messaging;

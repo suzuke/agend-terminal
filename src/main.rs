@@ -234,6 +234,21 @@ enum Commands {
         #[arg(default_value = "shell")]
         name: String,
     },
+    /// #hook-state-poc (hidden): backend lifecycle-hook reporter. Invoked by
+    /// the hook entries `mcp_config.rs` injects into the per-workspace Claude
+    /// settings under `AGEND_HOOK_STATE_POC=1`. Reads the hook payload JSON
+    /// from stdin, forwards `{name, hook_event_name, notification_type,
+    /// tool_name}` to the daemon's HOOK_EVENT method, and ALWAYS exits 0 with
+    /// an empty stdout: a non-zero exit (2) would BLOCK the agent's action,
+    /// and stdout is context-injected by some hook types — both must never
+    /// happen from an observe-only reporter.
+    #[command(hide = true, name = "hook-event")]
+    HookEvent {
+        /// Fleet instance name (embedded at settings-write time — solves
+        /// session↔agent attribution without a session-id map).
+        #[arg(long)]
+        instance: String,
+    },
     /// Send input to an agent
     Inject {
         /// Agent name
@@ -733,6 +748,31 @@ fn main() -> anyhow::Result<()> {
                     return Err(e);
                 }
             }
+        }
+        Some(Commands::HookEvent { instance }) => {
+            // Observe-only contract: NEVER block the agent — exit 0 on every
+            // path, keep stdout empty (stderr is fine; hooks ignore it on 0).
+            let mut payload = String::new();
+            use std::io::Read;
+            // Bounded read: hook payloads are small JSON; a runaway stdin must
+            // not wedge the reporter (the hook has its own timeout anyway).
+            let _ = std::io::stdin()
+                .take(64 * 1024)
+                .read_to_string(&mut payload);
+            let v: serde_json::Value = serde_json::from_str(&payload).unwrap_or_default();
+            let req = serde_json::json!({
+                "method": api::method::HOOK_EVENT,
+                "params": {
+                    "name": instance,
+                    "hook_event_name": v["hook_event_name"],
+                    "notification_type": v["notification_type"],
+                    "tool_name": v["tool_name"],
+                },
+            });
+            if let Err(e) = api::call(&home, &req) {
+                eprintln!("hook-event: daemon unreachable ({e}) — event dropped (shadow-mode)");
+            }
+            return Ok(());
         }
         Some(Commands::Inject { name, text }) => {
             let text = text.join(" ");

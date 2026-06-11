@@ -190,6 +190,9 @@ pub mod method {
     pub const REGISTER_EXTERNAL: &str = "register_external";
     pub const DEREGISTER_EXTERNAL: &str = "deregister_external";
     pub const CREATE_TEAM: &str = "create_team";
+    /// #hook-state-poc: lifecycle-hook event report from a backend hook
+    /// command (`agend-terminal hook-event`). Shadow-mode only.
+    pub const HOOK_EVENT: &str = "hook_event";
     pub const UPDATE_TEAM: &str = "update_team";
     pub const MOVE_PANE: &str = "move_pane";
     pub const SHUTDOWN: &str = "shutdown";
@@ -560,6 +563,7 @@ fn handle_session(
                         handlers::external::handle_deregister_external(params, &ctx)
                     }
                     method::CREATE_TEAM => handlers::team::handle_create_team(params, &ctx),
+                    method::HOOK_EVENT => handlers::hook_event::handle_hook_event(params, &ctx),
                     method::UPDATE_TEAM => handlers::team::handle_update_team(params, &ctx),
                     method::MOVE_PANE => handlers::instance::handle_move_pane(params, &ctx),
                     method::PANE_SNAPSHOT => handlers::instance::handle_pane_snapshot(params, &ctx),
