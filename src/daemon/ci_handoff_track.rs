@@ -67,6 +67,13 @@ pub(crate) struct CiHandoffTrack {
     pub correlation: String,
     /// RFC3339 — when the handoff was enqueued (the re-nudge age anchor).
     pub sent_at: String,
+    /// #2008: the branch head (`pr.current_sha`) at record time. `#[serde(default)]`
+    /// → a pre-#2008 track reads back as `None`, which [`resolve_head_advanced`]
+    /// treats as "head-unknown, do not invalidate" (backward-compatible — the
+    /// other resolve exits + 24h backstop still apply). Additive (COMPATIBILITY
+    /// tier-b) — no `schema_version` bump.
+    #[serde(default)]
+    pub head_sha: Option<String>,
 }
 
 fn dir(home: &Path) -> PathBuf {
@@ -185,12 +192,19 @@ fn remove_if_unchanged(
 
 /// Record (or refresh — a NEW CI pass on the same branch restarts the age
 /// anchor) the pending handoff for `(target, correlation)`.
-pub(crate) fn record(home: &Path, target: &str, correlation: &str, sent_at: &str) {
+pub(crate) fn record(
+    home: &Path,
+    target: &str,
+    correlation: &str,
+    sent_at: &str,
+    head_sha: Option<&str>,
+) {
     let track = CiHandoffTrack {
         schema_version: SCHEMA_VERSION,
         target: target.to_string(),
         correlation: correlation.to_string(),
         sent_at: sent_at.to_string(),
+        head_sha: head_sha.map(String::from),
     };
     let path = file_for(home, target, correlation);
     if let Err(e) = std::fs::create_dir_all(dir(home)) {
@@ -289,6 +303,44 @@ pub(crate) fn resolve_claimed(home: &Path, agent: &str, branch: &str) -> usize {
                 correlation = %track.correlation,
                 reason = "target_claimed_branch",
                 "ci-handoff track resolved"
+            );
+        }
+    }
+    resolved
+}
+
+/// #2008: resolve every track for `correlation` whose recorded `head_sha` no
+/// longer matches the branch's CURRENT head — the ci-ready obligation was for a
+/// head that has since been superseded (a new push / force-push), so without this
+/// the handoff watchdog re-nudges a dead head every ~2 min until merge or the 24h
+/// backstop (the operator-observed renudge loop, #2008). A track with NO recorded
+/// `head_sha` (written before #2008) is LEFT ALONE — we can't tell whether it is
+/// stale, so the pre-#2008 behavior (other resolve exits + 24h backstop) is
+/// preserved (no mis-kill on upgrade). This ADDS a resolve condition; it
+/// introduces no new re-send path. Returns how many were resolved. Called from
+/// the ci-watch poll, which already holds the current head.
+pub(crate) fn resolve_head_advanced(home: &Path, correlation: &str, current_head: &str) -> usize {
+    let mut resolved = 0;
+    for (path, track) in list(home) {
+        let head_advanced = matches!(&track.head_sha, Some(h) if h != current_head);
+        if track.correlation == correlation
+            && head_advanced
+            && remove_if_unchanged(
+                home,
+                &path,
+                &track.target,
+                &track.correlation,
+                &track.sent_at,
+            )
+        {
+            resolved += 1;
+            tracing::info!(
+                tag = "#2008-track-head-advanced",
+                agent = %track.target,
+                correlation = %track.correlation,
+                recorded_head = ?track.head_sha,
+                current_head = %current_head,
+                "ci-handoff track resolved — branch head advanced past the recorded head; stale ci-ready obligation cleared (no more re-nudges for a dead head)"
             );
         }
     }
@@ -415,11 +467,11 @@ mod tests {
     #[test]
     fn record_list_roundtrip_and_refresh() {
         let home = tmp_home("roundtrip");
-        record(&home, "reviewer", "o/r@b1", "2026-06-10T00:00:00Z");
-        record(&home, "reviewer", "o/r@b2", "2026-06-10T00:00:00Z");
+        record(&home, "reviewer", "o/r@b1", "2026-06-10T00:00:00Z", None);
+        record(&home, "reviewer", "o/r@b2", "2026-06-10T00:00:00Z", None);
         assert_eq!(list(&home).len(), 2);
         // Re-record same key = refresh (no duplicate file).
-        record(&home, "reviewer", "o/r@b1", "2026-06-10T01:00:00Z");
+        record(&home, "reviewer", "o/r@b1", "2026-06-10T01:00:00Z", None);
         let tracks = list(&home);
         assert_eq!(tracks.len(), 2, "refresh must not duplicate");
         assert!(tracks
@@ -431,9 +483,9 @@ mod tests {
     #[test]
     fn resolve_by_correlation_clears_all_targets() {
         let home = tmp_home("resolve-corr");
-        record(&home, "reviewer", "o/r@b", "2026-06-10T00:00:00Z");
-        record(&home, "reviewer-2", "o/r@b", "2026-06-10T00:00:00Z");
-        record(&home, "reviewer", "o/r@other", "2026-06-10T00:00:00Z");
+        record(&home, "reviewer", "o/r@b", "2026-06-10T00:00:00Z", None);
+        record(&home, "reviewer-2", "o/r@b", "2026-06-10T00:00:00Z", None);
+        record(&home, "reviewer", "o/r@other", "2026-06-10T00:00:00Z", None);
         assert_eq!(resolve_by_correlation(&home, "o/r@b", "test"), 2);
         let left = list(&home);
         assert_eq!(left.len(), 1);
@@ -444,8 +496,8 @@ mod tests {
     #[test]
     fn resolve_claimed_scopes_to_target_and_branch() {
         let home = tmp_home("resolve-claim");
-        record(&home, "reviewer", "o/r@fix/x", "2026-06-10T00:00:00Z");
-        record(&home, "other", "o/r@fix/x", "2026-06-10T00:00:00Z");
+        record(&home, "reviewer", "o/r@fix/x", "2026-06-10T00:00:00Z", None);
+        record(&home, "other", "o/r@fix/x", "2026-06-10T00:00:00Z", None);
         assert_eq!(resolve_claimed(&home, "reviewer", "fix/x"), 1);
         let left = list(&home);
         assert_eq!(left.len(), 1, "other target's track untouched");
@@ -459,9 +511,9 @@ mod tests {
         let now = chrono::Utc::now();
         let old = (now - chrono::Duration::hours(25)).to_rfc3339();
         let fresh = now.to_rfc3339();
-        record(&home, "reviewer", "o/r@old", &old);
-        record(&home, "reviewer", "o/r@fresh", &fresh);
-        record(&home, "reviewer", "o/r@broken", "not-a-timestamp");
+        record(&home, "reviewer", "o/r@old", &old, None);
+        record(&home, "reviewer", "o/r@fresh", &fresh, None);
+        record(&home, "reviewer", "o/r@broken", "not-a-timestamp", None);
         assert_eq!(sweep_expired(&home, &now), 2, "old + broken swept");
         let left = list(&home);
         assert_eq!(left.len(), 1);
@@ -478,7 +530,7 @@ mod tests {
     #[test]
     fn remove_if_unchanged_refuses_stale_delete_1963() {
         let home = tmp_home("cas");
-        record(&home, "reviewer", "o/r@b", "2026-06-10T00:00:00Z");
+        record(&home, "reviewer", "o/r@b", "2026-06-10T00:00:00Z", None);
         let path = file_for(&home, "reviewer", "o/r@b");
         // Same episode → delete succeeds.
         assert!(remove_if_unchanged(
@@ -495,8 +547,8 @@ mod tests {
 
         // Re-record a NEW episode (new sent_at = a new CI pass), then a deleter
         // carrying the STALE listed sent_at must NOT delete it (the race).
-        record(&home, "reviewer", "o/r@b", "2026-06-10T00:00:00Z"); // S1
-        record(&home, "reviewer", "o/r@b", "2026-06-10T09:00:00Z"); // S2
+        record(&home, "reviewer", "o/r@b", "2026-06-10T00:00:00Z", None); // S1
+        record(&home, "reviewer", "o/r@b", "2026-06-10T09:00:00Z", None); // S2
         assert!(
             !remove_if_unchanged(&home, &path, "reviewer", "o/r@b", "2026-06-10T00:00:00Z"),
             "#1963: a delete carrying the STALE listed sent_at must be refused"
@@ -518,7 +570,7 @@ mod tests {
     #[test]
     fn atomic_write_and_sidecars_excluded_from_list_1963() {
         let home = tmp_home("atomic");
-        record(&home, "reviewer", "o/r@b", "2026-06-10T00:00:00Z");
+        record(&home, "reviewer", "o/r@b", "2026-06-10T00:00:00Z", None);
         let tracks = list(&home);
         assert_eq!(tracks.len(), 1);
         assert_eq!(tracks[0].1.correlation, "o/r@b");
@@ -546,8 +598,8 @@ mod tests {
     #[test]
     fn sanitize_colliding_keys_get_distinct_files_1969() {
         let home = tmp_home("collide");
-        record(&home, "reviewer", "o/r@a/b", "2026-06-10T00:00:00Z");
-        record(&home, "reviewer", "o/r@a_b", "2026-06-10T00:00:00Z");
+        record(&home, "reviewer", "o/r@a/b", "2026-06-10T00:00:00Z", None);
+        record(&home, "reviewer", "o/r@a_b", "2026-06-10T00:00:00Z", None);
         let tracks = list(&home);
         assert_eq!(
             tracks.len(),
@@ -576,7 +628,13 @@ mod tests {
         use std::time::{Duration, SystemTime};
         let home = tmp_home("gc");
         // (1) LIVE key → a `.json` track + its `.lock`.
-        record(&home, "reviewer", "o/r@active", "2026-06-10T00:00:00Z");
+        record(
+            &home,
+            "reviewer",
+            "o/r@active",
+            "2026-06-10T00:00:00Z",
+            None,
+        );
         let active_lock = lock_for(&home, "reviewer", "o/r@active");
         assert!(active_lock.exists());
         // (2) ORPHAN lock — no `.json` track (resolved long ago).
@@ -647,6 +705,7 @@ mod tests {
             target: "reviewer".into(),
             correlation: "o/r@b".into(),
             sent_at: "2026-06-10T00:00:00Z".into(),
+            head_sha: None,
         };
         std::fs::write(&old_path, serde_json::to_vec(&track).unwrap()).unwrap();
         assert_eq!(
@@ -661,6 +720,104 @@ mod tests {
         );
         assert!(list(&home).is_empty(), "the old-encoding track is gone");
         assert!(!old_path.exists());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #2008: head-aware invalidation ──────────────────────────────────
+
+    /// #2008 §3.9: the branch head advanced past what the track recorded → the
+    /// stale ci-ready obligation is resolved, so the watchdog stops re-nudging.
+    #[test]
+    fn head_advanced_resolves_track() {
+        let home = tmp_home("head-adv");
+        record(
+            &home,
+            "reviewer",
+            "o/r@b",
+            "2026-06-10T00:00:00Z",
+            Some("HEAD_OLD"),
+        );
+        assert_eq!(list(&home).len(), 1);
+        let resolved = resolve_head_advanced(&home, "o/r@b", "HEAD_NEW");
+        assert_eq!(
+            resolved, 1,
+            "a track for a superseded head must be resolved"
+        );
+        assert!(
+            list(&home).is_empty(),
+            "no track remains to re-nudge a dead head"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2008 §3.9: the head has NOT moved → the obligation is still live, keep the
+    /// track (the normal re-nudge / resolve exits still apply).
+    #[test]
+    fn head_unchanged_keeps_track() {
+        let home = tmp_home("head-same");
+        record(
+            &home,
+            "reviewer",
+            "o/r@b",
+            "2026-06-10T00:00:00Z",
+            Some("HEAD_X"),
+        );
+        let resolved = resolve_head_advanced(&home, "o/r@b", "HEAD_X");
+        assert_eq!(resolved, 0, "an unchanged head must keep the track");
+        assert_eq!(list(&home).len(), 1, "the live track remains");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2008 §3.9 backward-compat: a pre-#2008 track (no `head_sha` field on disk)
+    /// must NOT be invalidated by a head move — we can't tell if it is stale, so
+    /// preserve the old behavior (other resolve exits + 24h backstop still apply).
+    #[test]
+    fn pre_2008_track_without_head_sha_not_invalidated() {
+        let home = tmp_home("oldfield");
+        std::fs::create_dir_all(dir(&home)).unwrap();
+        // A pre-#2008 track on disk: the `head_sha` field is absent entirely.
+        std::fs::write(
+            dir(&home).join("legacy.json"),
+            r#"{"schema_version":1,"target":"reviewer","correlation":"o/r@b","sent_at":"2026-06-10T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let resolved = resolve_head_advanced(&home, "o/r@b", "any-new-head");
+        assert_eq!(
+            resolved, 0,
+            "a pre-#2008 track (no head_sha) must NOT be invalidated by a head move"
+        );
+        assert_eq!(
+            list(&home).len(),
+            1,
+            "the legacy track survives (no mis-kill on upgrade)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2008: invalidation is scoped to the matching correlation — a head move on
+    /// one branch must not resolve another branch's track.
+    #[test]
+    fn head_advanced_only_affects_matching_correlation() {
+        let home = tmp_home("head-corr");
+        record(
+            &home,
+            "reviewer",
+            "o/r@b1",
+            "2026-06-10T00:00:00Z",
+            Some("HEAD_OLD"),
+        );
+        record(
+            &home,
+            "reviewer",
+            "o/r@b2",
+            "2026-06-10T00:00:00Z",
+            Some("HEAD_OLD"),
+        );
+        let resolved = resolve_head_advanced(&home, "o/r@b1", "HEAD_NEW");
+        assert_eq!(resolved, 1, "only b1's track is for the moved head");
+        let remaining = list(&home);
+        assert_eq!(remaining.len(), 1, "b2's track is untouched");
+        assert!(remaining.iter().all(|(_, t)| t.correlation == "o/r@b2"));
         std::fs::remove_dir_all(&home).ok();
     }
 }

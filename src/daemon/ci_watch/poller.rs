@@ -1220,6 +1220,19 @@ async fn ci_check_repo(
             return Err(e);
         }
     };
+    // #2008: head-aware ci-handoff invalidation. The poll has the branch's CURRENT
+    // head (`pr.current_sha`); if a pending ci-handoff track recorded an OLDER head
+    // (a push/force-push has since moved the branch), its ci-ready obligation is
+    // stale — resolve it so the handoff watchdog stops re-nudging a dead head until
+    // merge/24h (the operator-observed renudge loop). Pre-#2008 tracks (no recorded
+    // head) are left alone. This only ADDS a resolve condition — no new re-send path.
+    if !pr.current_sha.is_empty() {
+        crate::daemon::ci_handoff_track::resolve_head_advanced(
+            ctx.home,
+            &format!("{}@{}", ctx.repo, ctx.branch),
+            &pr.current_sha,
+        );
+    }
     // #1326: check in-progress runs for early job-level failures before
     // the terminal-only notification gates below.
     check_early_job_failures(&ctx, &mut state, &pr, provider).await;
@@ -1744,6 +1757,9 @@ fn persist_watch_state(
                         next,
                         &repo_branch_key,
                         &chrono::Utc::now().to_rfc3339(),
+                        // #2008: anchor the track to the head it was recorded for so
+                        // a later head move can invalidate it (head-aware resolve).
+                        Some(&pr.current_sha),
                     );
                 }
                 None if state.subscriber_names().is_empty() => {
