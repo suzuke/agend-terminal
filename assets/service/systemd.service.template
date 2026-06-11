@@ -28,6 +28,7 @@ Environment=AGEND_HOME=__HOME__
 # systemd Restart=on-failure unit. (INVOCATION_ID, set by systemd at
 # runtime, remains a belt-and-suspenders signal.)
 Environment=AGEND_SUPERVISED=1
+Environment=PATH=__PATH__
 # Sprint 57 Wave 3 PR-2 (#548 Q3): the daemon does NOT supervise itself.
 # systemd is the supervisor of last resort. Restart=on-failure ensures
 # operator-visible crashes get respawned by systemd, but Q6 graceful
