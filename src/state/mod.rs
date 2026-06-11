@@ -169,6 +169,20 @@ use crate::vterm::CellFg;
 use patterns::is_generic_startup_prompt;
 pub use patterns::{classify_pty_output, StatePatterns};
 
+/// #2033: gate inputs for the "recovered from blocked state" Telegram notice,
+/// captured when a blocked episode (InteractivePrompt / AwaitingOperator) ends.
+/// The supervisor emits the notice only when it is actionable — the operator was
+/// actually told about the block AND it lasted long enough that they might be
+/// reacting (#2008 actionable-or-silent). A self-resolving / never-notified block
+/// produces a `notice_sent=false` (or sub-threshold) episode → log-only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RecoveryEpisode {
+    /// How long the episode stayed in a blocked state.
+    pub block_duration: Duration,
+    /// Whether a Telegram blocked (`Stall`) notice was forwarded for this episode.
+    pub notice_sent: bool,
+}
+
 pub struct StateTracker {
     pub current: AgentState,
     pub(crate) since: Instant,
@@ -233,6 +247,24 @@ pub struct StateTracker {
     /// "ready again" notice. Pairs with `interactive_prompt_pending_notice`
     /// so operators get symmetrical enter/exit signals.
     interactive_recovery_pending_notice: bool,
+    /// #2033: when the CURRENT blocked episode began (first entry into a
+    /// `wants_raw_keystrokes` state from a non-blocked one). `None` outside a
+    /// blocked episode. Spans intra-block transitions (InteractivePrompt →
+    /// AwaitingOperator), so it measures the FULL operator-facing block duration.
+    blocked_since: Option<Instant>,
+    /// #2033: whether a Telegram blocked notice (the `Stall` action) was actually
+    /// emitted for the current blocked episode. The recovery-notice gate keys on
+    /// this — a block the operator was never told about must not produce a
+    /// non-actionable "recovered" notice (#2008 actionable-or-silent). Reset on
+    /// each fresh blocked-episode entry; the supervisor sets it via
+    /// [`Self::mark_blocked_notice_sent`] when it forwards the Stall.
+    blocked_notice_sent: bool,
+    /// #2033: the just-ended blocked episode's gate inputs, captured on the
+    /// leaving-block transition and consumed by `take_recovery_notice()`. Carries
+    /// the block duration + whether it was notified, so the supervisor can decide
+    /// actionable-or-silent without reaching back into per-episode state that the
+    /// recovery tick (a later tick) would already have cleared.
+    recovery_episode: Option<RecoveryEpisode>,
     /// Last MCP heartbeat instant. Updated by supervisor tick from metadata.
     /// `None` before first heartbeat. Used by `gate_on_heartbeat` to suppress
     /// false-positive `PermissionPrompt` when the agent is alive (A5 fix).
@@ -968,6 +1000,9 @@ impl StateTracker {
             context_pct: None,
             interactive_prompt_pending_notice: false,
             interactive_recovery_pending_notice: false,
+            blocked_since: None,
+            blocked_notice_sent: false,
+            recovery_episode: None,
             last_heartbeat: None,
             behavioral_config: backend.map(crate::behavioral::config_for),
             productivity_config: backend.map(crate::behavioral::config_for_productivity),
@@ -1023,18 +1058,38 @@ impl StateTracker {
         }
     }
 
-    /// Returns true at most once per recovery from a blocked state
+    /// Returns `Some(episode)` at most once per recovery from a blocked state
     /// (InteractivePrompt / AwaitingOperator → non-blocked). The supervisor
-    /// calls this each tick; it returns true only on the first tick after the
-    /// recovery transition so Telegram sees one "ready again" notice, not
-    /// one per tick.
-    pub fn take_recovery_notice(&mut self) -> bool {
+    /// calls this each tick; it returns `Some` only on the first tick after the
+    /// recovery transition so Telegram sees one "ready again" decision, not one
+    /// per tick. #2033: the returned [`RecoveryEpisode`] carries the gate inputs
+    /// (was-notified + duration) so the supervisor can pick actionable-or-silent.
+    /// A defensive default episode (`notice_sent=false`) is returned if the flag
+    /// armed without a captured episode → the gate treats it as non-actionable.
+    ///
+    /// KNOWN LIMITATION (#2033, reviewer-2 non-blocking): the per-episode state
+    /// (`blocked_since` / `blocked_notice_sent`) is in-memory, so a daemon restart
+    /// mid-block loses it. If the agent then recovers BEFORE the supervisor
+    /// re-detects + re-notifies the block, its recovery episode defaults to
+    /// `notice_sent=false` and the all-clear is suppressed — one missed recovery
+    /// notice per restart-straddling block. Deliberately the safe direction
+    /// (err-silent over false-notify); persisting the episode across restarts is
+    /// not worth the complexity for this narrow window.
+    pub fn take_recovery_notice(&mut self) -> Option<RecoveryEpisode> {
         if self.interactive_recovery_pending_notice {
             self.interactive_recovery_pending_notice = false;
-            true
+            Some(self.recovery_episode.take().unwrap_or_default())
         } else {
-            false
+            None
         }
+    }
+
+    /// #2033: record that a Telegram blocked (`Stall`) notice was forwarded for
+    /// the current blocked episode. Called by the supervisor at the moment it
+    /// commits to the notice, so the paired recovery notice knows the operator
+    /// was actually told. No-op if not currently in a blocked episode.
+    pub fn mark_blocked_notice_sent(&mut self) {
+        self.blocked_notice_sent = true;
     }
 
     /// If detected state is `PermissionPrompt` but a fresh heartbeat exists,
@@ -1993,6 +2048,24 @@ impl StateTracker {
             to: new_state,
             ts: chrono::Utc::now().to_rfc3339(),
         });
+        // #2033: blocked-episode tracking for the recovery-notice gate. record_set
+        // is the SINGLE funnel for every `current` mutation (incl. the
+        // `set_awaiting_operator` bypass), so entry/exit are caught here regardless
+        // of which path drove the transition.
+        let from = self.current;
+        if !from.wants_raw_keystrokes() && new_state.wants_raw_keystrokes() {
+            // entering a fresh blocked episode
+            self.blocked_since = Some(Instant::now());
+            self.blocked_notice_sent = false;
+        } else if from.wants_raw_keystrokes() && !new_state.wants_raw_keystrokes() {
+            // leaving — snapshot the gate inputs for the paired recovery notice
+            self.recovery_episode = Some(RecoveryEpisode {
+                block_duration: self.blocked_since.map(|t| t.elapsed()).unwrap_or_default(),
+                notice_sent: self.blocked_notice_sent,
+            });
+            self.blocked_since = None;
+            self.blocked_notice_sent = false;
+        }
         self.current = new_state;
         self.since = Instant::now();
     }

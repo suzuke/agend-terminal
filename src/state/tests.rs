@@ -1097,14 +1097,14 @@ fn interactive_prompt_notice_rearms_on_reentry() {
 fn recovery_notice_armed_when_leaving_interactive_prompt() {
     // Use tracker_at to place the tracker directly into InteractivePrompt.
     let mut t = tracker_at(&Backend::Codex, AgentState::Starting, 0);
-    assert!(!t.take_recovery_notice());
+    assert!(t.take_recovery_notice().is_none());
 
     // Enter InteractivePrompt.
     t.transition(AgentState::InteractivePrompt);
     assert_eq!(t.get_state(), AgentState::InteractivePrompt);
     // Still nothing to report — we only arm when we LEAVE the blocked
     // state, not when we enter it.
-    assert!(!t.take_recovery_notice());
+    assert!(t.take_recovery_notice().is_none());
 
     // Dismiss → Ready.
     t.since = std::time::Instant::now() - std::time::Duration::from_secs(3);
@@ -1113,9 +1113,12 @@ fn recovery_notice_armed_when_leaving_interactive_prompt() {
 
     // First take fires; subsequent ticks within the same Ready don't
     // re-spam.
-    assert!(t.take_recovery_notice(), "recovery must arm on exit");
     assert!(
-        !t.take_recovery_notice(),
+        t.take_recovery_notice().is_some(),
+        "recovery must arm on exit"
+    );
+    assert!(
+        t.take_recovery_notice().is_none(),
         "supervisor ticks after the first must not re-arm"
     );
 }
@@ -1129,14 +1132,14 @@ fn recovery_notice_armed_when_leaving_awaiting_operator() {
     let mut st = StateTracker::new(Some(&Backend::Codex));
     st.set_awaiting_operator();
     assert_eq!(st.get_state(), AgentState::AwaitingOperator);
-    assert!(!st.take_recovery_notice());
+    assert!(st.take_recovery_notice().is_none());
 
     // Fresh Ready banner appears. Ready (prio 3) > AwaitingOperator
     // (prio 2) so the transition is immediate.
     drive(&mut vt, &mut st, b"\x1b[2J\x1b[HOpenAI Codex v0.120.0\r\n");
     assert_eq!(st.get_state(), AgentState::Idle);
     assert!(
-        st.take_recovery_notice(),
+        st.take_recovery_notice().is_some(),
         "recovery must arm on AwaitingOperator → Ready"
     );
 }
@@ -1153,7 +1156,78 @@ fn recovery_notice_not_armed_for_unrelated_transitions() {
     st.since = std::time::Instant::now() - std::time::Duration::from_secs(10);
     st.transition(AgentState::Idle);
     assert_eq!(st.get_state(), AgentState::Idle);
-    assert!(!st.take_recovery_notice());
+    assert!(st.take_recovery_notice().is_none());
+}
+
+// ── #2033: recovery-notice episode gate inputs ──
+
+/// A notified, long-enough block produces an episode the supervisor gate treats
+/// as actionable (notice_sent + full duration captured).
+#[test]
+fn recovery_episode_captures_notified_long_block_2033() {
+    let mut t = tracker_at(&Backend::Codex, AgentState::Starting, 0);
+    t.transition(AgentState::InteractivePrompt);
+    assert_eq!(t.get_state(), AgentState::InteractivePrompt);
+    // Operator was told about the block (supervisor forwarded the Stall).
+    t.mark_blocked_notice_sent();
+    // Simulate a block that lasted well past the recovery threshold.
+    t.blocked_since = Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
+    // Leave the blocked state.
+    t.since = std::time::Instant::now() - std::time::Duration::from_secs(3);
+    t.transition(AgentState::Idle);
+    let ep = t
+        .take_recovery_notice()
+        .expect("recovery must arm on leaving a blocked state");
+    assert!(
+        ep.notice_sent,
+        "#2033: episode records the block WAS notified"
+    );
+    assert!(
+        ep.block_duration >= std::time::Duration::from_secs(60),
+        "#2033: episode spans the full block duration, got {:?}",
+        ep.block_duration
+    );
+}
+
+/// A self-resolving block the operator was NEVER told about produces an episode
+/// with `notice_sent=false` — the supervisor gate makes the recovery log-only.
+#[test]
+fn recovery_episode_unnotified_block_2033() {
+    let mut t = tracker_at(&Backend::Codex, AgentState::Starting, 0);
+    t.transition(AgentState::InteractivePrompt);
+    // NO mark_blocked_notice_sent — e.g. role-gated forward, or a transient block.
+    t.since = std::time::Instant::now() - std::time::Duration::from_secs(3);
+    t.transition(AgentState::Idle);
+    let ep = t
+        .take_recovery_notice()
+        .expect("recovery flag still arms on leaving");
+    assert!(
+        !ep.notice_sent,
+        "#2033: an un-notified block must record notice_sent=false (recovery → silent)"
+    );
+}
+
+/// A second blocked episode must NOT inherit the first's `notice_sent` — the
+/// per-episode latch resets on each fresh blocked-state entry.
+#[test]
+fn blocked_episode_resets_notice_sent_on_reentry_2033() {
+    let mut t = tracker_at(&Backend::Codex, AgentState::Starting, 0);
+    // Episode 1: notified.
+    t.transition(AgentState::InteractivePrompt);
+    t.mark_blocked_notice_sent();
+    t.since = std::time::Instant::now() - std::time::Duration::from_secs(3);
+    t.transition(AgentState::Idle);
+    let _ = t.take_recovery_notice();
+    // Episode 2: NOT notified — must not carry over episode 1's flag.
+    t.since = std::time::Instant::now() - std::time::Duration::from_secs(3);
+    t.transition(AgentState::InteractivePrompt);
+    t.since = std::time::Instant::now() - std::time::Duration::from_secs(3);
+    t.transition(AgentState::Idle);
+    let ep = t.take_recovery_notice().expect("episode 2 arms");
+    assert!(
+        !ep.notice_sent,
+        "#2033: re-entry resets notice_sent — no stale notified flag from a prior episode"
+    );
 }
 
 #[test]
