@@ -238,6 +238,14 @@ pub(crate) fn record_dispatch(
             existing.nudge_sent_at = None;
             existing.not_working_streak = 0;
             existing.threshold_secs = threshold_secs;
+            // #2008-p2 (codex review): a re-dispatch of the SAME correlation is a
+            // NEW episode — reset the extension cap + escalation latch too. Without
+            // this, a correlation already long-running-escalated is reborn at
+            // refresh_count >= CAP with the latch set, so scan_and_emit neither
+            // extends nor re-escalates and the fresh dispatch-intent's protection
+            // is silently eaten by the stale latch.
+            existing.refresh_count = 0;
+            existing.long_running_escalated = false;
             if let Ok(body) = serde_json::to_string_pretty(&existing) {
                 if crate::store::atomic_write(
                     &pending_path(home, &existing.dispatch_id),
@@ -1728,6 +1736,49 @@ mod tests {
             elog2.matches("dispatch_idle_long_running").count(),
             1,
             "escalate-don't-repeat: still exactly one after a second scan: {elog2}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// §3.9 #2008-p2 (codex review): a re-dispatch of the SAME correlation is a NEW
+    /// episode — the in-place refresh must reset BOTH the extension cap counter and
+    /// the escalation latch, or the reborn dispatch inherits a stale
+    /// "already long-running, don't protect" state and is silently unguarded.
+    #[test]
+    fn redispatch_same_correlation_resets_cap_and_latch() {
+        let home = tmp_home("p2-redispatch-reset");
+        let id =
+            record_dispatch(&home, "lead", "dev", Some("t-redisp"), "task", 600).expect("first");
+        // Drive it to the latched, capped state (as a long-running escalation does).
+        for _ in 0..REFRESH_CAP {
+            bump_refresh_count(&home, &id);
+        }
+        set_long_running_escalated(&home, &id);
+        let before = list_pending(&home)
+            .into_iter()
+            .find(|d| d.dispatch_id == id)
+            .expect("sidecar");
+        assert!(
+            before.refresh_count >= REFRESH_CAP && before.long_running_escalated,
+            "precondition: capped + latched"
+        );
+
+        // Re-dispatch the SAME correlation → in-place refresh.
+        let id2 = record_dispatch(&home, "lead", "dev", Some("t-redisp"), "task", 600)
+            .expect("redispatch");
+        assert_eq!(id2, id, "same correlation refreshes in place (one sidecar)");
+
+        let after = list_pending(&home)
+            .into_iter()
+            .find(|d| d.dispatch_id == id)
+            .expect("sidecar");
+        assert_eq!(
+            after.refresh_count, 0,
+            "re-dispatch resets the extension cap counter"
+        );
+        assert!(
+            !after.long_running_escalated,
+            "re-dispatch clears the escalation latch (fresh episode is protected again)"
         );
         std::fs::remove_dir_all(&home).ok();
     }
