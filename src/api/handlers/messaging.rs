@@ -505,19 +505,24 @@ fn track_dispatch(
             let outbound_corr = outbound_corr.map(String::from);
             // #2004: a swallowed record failure means this dispatch never gets
             // its idle-timeout nudge — surface it (non-fatal: the dispatch
-            // itself succeeded). At THIS call site every legit-skip arm of
-            // `record_dispatch` is already excluded (kind=task branch, non-empty
-            // names, threshold>0 from the resolver), so `None` = disk failure.
-            if crate::daemon::dispatch_idle::record_dispatch(
+            // itself succeeded). This branch handles task AND query, but
+            // `record_dispatch` deliberately returns None for every
+            // non-"task" kind (queries never get a sidecar — pinned by the
+            // kind-contract test in dispatch_idle) — so the warn is gated to
+            // kind=task, where the remaining None arms (non-empty names,
+            // resolver-positive threshold already hold here) mean disk
+            // failure. Warning on a query's designed skip would false-alarm
+            // on every ordinary query dispatch (codex P1 on the first
+            // #2004 review).
+            let recorded = crate::daemon::dispatch_idle::record_dispatch(
                 home,
                 from,
                 target,
                 outbound_corr.as_deref(),
                 kind_str,
                 threshold,
-            )
-            .is_none()
-            {
+            );
+            if kind_str == "task" && recorded.is_none() {
                 tracing::warn!(
                     from = %from,
                     target = %target,
@@ -1061,6 +1066,36 @@ mod tests {
         assert!(
             logs_contain("provenance injection failed"),
             "DESIGN §4 Q4: provenance failure warn must be emitted at API boundary"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2004 codex P1 negative pin: a kind=query dispatch must NOT emit the
+    /// record_dispatch failure warn — `record_dispatch` returns None for
+    /// non-task kinds BY DESIGN (queries never get an idle-nudge sidecar;
+    /// the kind contract itself is pinned in dispatch_idle). The existing
+    /// contract test pins "no sidecar"; this pins "no warn" — the first
+    /// #2004 revision warned on the designed skip and false-alarmed on
+    /// every ordinary query.
+    #[test]
+    #[tracing_test::traced_test]
+    fn query_dispatch_emits_no_record_failure_warn_2004() {
+        let home = tmp_home("query-no-warn");
+        setup_team_env(&home, &["sender", "target"], &[]);
+        let ctx = test_ctx(&home);
+        let _ = handle_send(
+            &json!({
+                "from": "sender",
+                "target": "target",
+                "text": "what is the status?",
+                "kind": "query",
+                "expect_reply_within_secs": 600
+            }),
+            &ctx,
+        );
+        assert!(
+            !logs_contain("record_dispatch failed"),
+            "kind=query: record_dispatch's None is a designed skip, not a failure — no warn"
         );
         std::fs::remove_dir_all(&home).ok();
     }

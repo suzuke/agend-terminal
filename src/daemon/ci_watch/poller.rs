@@ -1829,6 +1829,9 @@ fn refresh_expires_at(watch_path: &Path) {
             .unwrap_or_default()
             .as_bytes(),
     ) {
+        // If this proves noisy in production (it fires per poll while the
+        // write keeps failing), add a once-per-watch latch — visibility
+        // first, rate-limit on evidence (#2008 discipline).
         tracing::warn!(path = %watch_path.display(), error = %e,
             "ci-watch expires_at refresh write failed — watch may expire early (non-PR branches lose coverage without auto-rearm)");
     }
