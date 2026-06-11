@@ -22,9 +22,23 @@ use std::path::Path;
 use super::{list_pending, pending_path, DispatchStatus, PendingDispatch};
 
 /// Default dispatch-idle threshold for ANY team member when no explicit
-/// `expect_reply_within_secs` is set on the dispatch. 600s (10 min) per the
-/// original watchdog spec. Per-team override is a deferred follow-up.
-pub(crate) const DEFAULT_DISPATCH_THRESHOLD_SECS: i64 = 600;
+/// `expect_reply_within_secs` is set on the dispatch. #2031: raised 600 → 1800s
+/// (30 min). The 600s default was tuned for the dispatch→quick-ack era; modern
+/// tasks run 10–40+ min with bursty activity (today's median ~15 min to report),
+/// so 600s false-fired on between-turns gaps even with the full #1975/#1866/#2022
+/// activity-gate stack deployed. Explicit `expect_reply_within_secs` still
+/// overrides per-dispatch (the lead's long-task practice: set ~1800–2400s).
+/// Per-team override is a deferred follow-up.
+pub(crate) const DEFAULT_DISPATCH_THRESHOLD_SECS: i64 = 1800;
+
+/// #2031: escalation tiering. The agent `dispatch_idle_nudge` — the costlier
+/// message (it interrupts the agent into a BUSY-reply turn) — is the SECOND
+/// escalation rung. After L1 notifies the DISPATCHER (`..._exceeded`, stamping
+/// [`PendingDispatch::exceeded_at`]), L2 waits this many seconds before injecting
+/// the agent nudge, giving the dispatcher a window to act first (re-dispatch /
+/// resolve / `set_waiting_on`). ~600s (10 min) — the second rung of the
+/// escalate-don't-repeat ladder (#2008 principles).
+pub(crate) const ESCALATE_TO_AGENT_AFTER_SECS: i64 = 600;
 
 /// Scan throttle: 6 ticks × 10s = ~60s — matches L1 cadence.
 pub(crate) const TICKS_PER_SCAN: u64 = 6;
@@ -167,6 +181,21 @@ pub(crate) fn scan_and_nudge(home: &Path) {
         if d.nudge_sent_at.is_some() {
             continue;
         }
+        // #2031: escalation tiering — the agent nudge is the SECOND rung. Defer it
+        // until ESCALATE_TO_AGENT_AFTER_SECS past `exceeded_at` (when L1 already
+        // notified the dispatcher), so the dispatcher gets a window to act before
+        // the costlier agent interrupt. A MISSING stamp (legacy / pre-#2031 sidecar)
+        // fails OPEN to immediate nudge — never SUPPRESS a real nudge on absence.
+        if let Some(ref ea) = d.exceeded_at {
+            if let Ok(t) = chrono::DateTime::parse_from_rfc3339(ea) {
+                let since = chrono::Utc::now()
+                    .signed_duration_since(t.with_timezone(&chrono::Utc))
+                    .num_seconds();
+                if since < ESCALATE_TO_AGENT_AFTER_SECS {
+                    continue; // second window not yet elapsed — dispatcher's turn
+                }
+            }
+        }
         // Nudge for ANY team's dispatch (was gated to the fixup team); a teamless
         // (solo) dispatcher has no orchestration context → skip.
         // #1923 G6: but STAMP `nudge_sent_at` first so the L2 team-nudge does not
@@ -257,6 +286,14 @@ mod tests {
             not_working_streak: 0,
             refresh_count: 0,
             long_running_escalated: false,
+            // Exceeded LONG enough ago that the #2031 second escalation window has
+            // elapsed — so these mechanics tests (dedup / targeting / multiteam /
+            // correlation) still see the nudge fire. The window-timing itself is
+            // covered by the dedicated #2031 tests.
+            exceeded_at: Some(
+                (chrono::Utc::now() - chrono::Duration::seconds(ESCALATE_TO_AGENT_AFTER_SECS + 60))
+                    .to_rfc3339(),
+            ),
         };
         std::fs::write(
             pending_path(home, &id),
@@ -287,6 +324,130 @@ mod tests {
         assert_eq!(
             second_count, 0,
             "second scan must NOT re-nudge (dedup via nudge_sent_at)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #2031: escalation tiering + threshold rebalance ──
+
+    /// Write an Exceeded sidecar with an EXPLICIT `exceeded_at` stamp, to drive
+    /// the L2 second-window escalation gate at a controlled point in time.
+    fn write_exceeded_with_stamp(
+        home: &Path,
+        dispatcher: &str,
+        target: &str,
+        correlation_id: &str,
+        exceeded_at: Option<String>,
+    ) -> String {
+        let dir = pending_dir(home);
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = format!("disp-stamp-{correlation_id}");
+        let payload = PendingDispatch {
+            schema_version: 1,
+            dispatch_id: id.clone(),
+            dispatcher: dispatcher.to_string(),
+            target: target.to_string(),
+            correlation_id: Some(correlation_id.to_string()),
+            expected_kind: "task".to_string(),
+            threshold_secs: 1800,
+            issued_at: (chrono::Utc::now() - chrono::Duration::seconds(2000)).to_rfc3339(),
+            status: DispatchStatus::Exceeded,
+            nudge_sent_at: None,
+            not_working_streak: 0,
+            refresh_count: 0,
+            long_running_escalated: false,
+            exceeded_at,
+        };
+        std::fs::write(
+            pending_path(home, &id),
+            serde_json::to_string_pretty(&payload).unwrap(),
+        )
+        .unwrap();
+        id
+    }
+
+    fn nudge_count(home: &Path, target: &str) -> usize {
+        crate::inbox::drain(home, target)
+            .iter()
+            .filter(|m| m.kind.as_deref() == Some("dispatch_idle_nudge"))
+            .count()
+    }
+
+    /// #2031 §3.9 — tiering timing (first rung only): the agent nudge is DEFERRED
+    /// while the second escalation window has not elapsed since `exceeded_at` (L1
+    /// just notified the dispatcher). The dispatcher gets its window first.
+    #[test]
+    fn agent_nudge_deferred_within_second_window_2031() {
+        let home = tmp_home("2031-deferred");
+        write_fleet_with_fixup_member(&home, "fixup-lead");
+        let recent = chrono::Utc::now().to_rfc3339();
+        write_exceeded_with_stamp(
+            &home,
+            "fixup-lead",
+            "fixup-reviewer",
+            "t-defer",
+            Some(recent),
+        );
+        scan_and_nudge(&home);
+        assert_eq!(
+            nudge_count(&home, "fixup-reviewer"),
+            0,
+            "#2031: agent nudge must be deferred within the second window"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2031 §3.9 — tiering timing (second rung): once the second window has
+    /// elapsed past `exceeded_at` (dispatcher had its window and didn't act), the
+    /// agent nudge fires.
+    #[test]
+    fn agent_nudge_fires_after_second_window_2031() {
+        let home = tmp_home("2031-fires");
+        write_fleet_with_fixup_member(&home, "fixup-lead");
+        let old = (chrono::Utc::now()
+            - chrono::Duration::seconds(ESCALATE_TO_AGENT_AFTER_SECS + 60))
+        .to_rfc3339();
+        write_exceeded_with_stamp(&home, "fixup-lead", "fixup-reviewer", "t-fire", Some(old));
+        scan_and_nudge(&home);
+        assert_eq!(
+            nudge_count(&home, "fixup-reviewer"),
+            1,
+            "#2031: agent nudge fires after the second window elapses"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2031 §3.9 — fail-open: a MISSING `exceeded_at` (legacy / pre-#2031 sidecar)
+    /// nudges immediately. A missing stamp must NEVER suppress a real nudge.
+    #[test]
+    fn missing_exceeded_at_fails_open_to_immediate_nudge_2031() {
+        let home = tmp_home("2031-failopen");
+        write_fleet_with_fixup_member(&home, "fixup-lead");
+        write_exceeded_with_stamp(&home, "fixup-lead", "fixup-reviewer", "t-legacy", None);
+        scan_and_nudge(&home);
+        assert_eq!(
+            nudge_count(&home, "fixup-reviewer"),
+            1,
+            "#2031: missing exceeded_at fails open to immediate nudge"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2031 §3.9 — threshold rebalance: the team default is now 1800s; an explicit
+    /// `expect_reply_within_secs` still overrides it per-dispatch.
+    #[test]
+    fn team_default_threshold_1800_explicit_overrides_2031() {
+        let home = tmp_home("2031-threshold");
+        write_fleet_with_fixup_member(&home, "fixup-lead");
+        assert_eq!(
+            resolve_threshold_for_dispatch(&home, "fixup-lead", None),
+            Some(1800),
+            "#2031: team-member default threshold is 1800s"
+        );
+        assert_eq!(
+            resolve_threshold_for_dispatch(&home, "fixup-lead", Some(2400)),
+            Some(2400),
+            "explicit expect_reply_within_secs still overrides the default"
         );
         std::fs::remove_dir_all(&home).ok();
     }
@@ -442,6 +603,7 @@ mod tests {
             not_working_streak: 0,
             refresh_count: 0,
             long_running_escalated: false,
+            exceeded_at: None,
         };
         let path = pending_path(&home, &id);
         std::fs::write(&path, serde_json::to_string_pretty(&payload).unwrap()).unwrap();
@@ -580,6 +742,14 @@ mod tests {
             not_working_streak: 0,
             refresh_count: 0,
             long_running_escalated: false,
+            // Exceeded LONG enough ago that the #2031 second escalation window has
+            // elapsed — so these mechanics tests (dedup / targeting / multiteam /
+            // correlation) still see the nudge fire. The window-timing itself is
+            // covered by the dedicated #2031 tests.
+            exceeded_at: Some(
+                (chrono::Utc::now() - chrono::Duration::seconds(ESCALATE_TO_AGENT_AFTER_SECS + 60))
+                    .to_rfc3339(),
+            ),
         };
         std::fs::write(
             pending_path(home, &id),

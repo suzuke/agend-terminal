@@ -51,11 +51,24 @@ This creates a dispatch idle sidecar. After 600 seconds (10 minutes), the
 daemon checks whether a matching `kind=report` (by `correlation_id`) has been
 received.
 
-### Fixup Team Defaults
+### Team Defaults
 
-For the fixup team, `kind=task` and `kind=query` dispatches automatically
-inherit a 10-minute idle tracking window. No manual `expect_reply_within_secs`
-is needed. Other teams must specify it explicitly.
+For any team member, `kind=task` and `kind=query` dispatches automatically
+inherit a **30-minute** idle tracking window (`DEFAULT_DISPATCH_THRESHOLD_SECS`).
+No manual `expect_reply_within_secs` is needed; an explicit value still overrides
+it per-dispatch. Teamless (solo) dispatchers are not tracked. (#2031 raised the
+default from 10 → 30 minutes: modern tasks run 10–40+ min with bursty activity,
+so the 10-minute default false-fired on between-turns gaps.)
+
+### Escalation tiering (#2031)
+
+The two notifications are SEQUENCED, not simultaneous:
+
+1. At `threshold_secs`, the **dispatcher** receives `dispatch_idle_threshold_exceeded`
+   (cheap — a lead pane-check). The sidecar is stamped `exceeded_at`.
+2. Only if the dispatch is still unresolved `ESCALATE_TO_AGENT_AFTER_SECS` (10 min)
+   later does the **agent** receive the `dispatch_idle_nudge` interrupt — the
+   costlier message, deferred so the dispatcher has a window to act first.
 
 ### Parameter Reference
 
@@ -177,17 +190,20 @@ Expired, cleaned-up, or report-dismissed sidecars do not appear.
 
 ## Configuration
 
-### Environment Variables
+The thresholds are compile-time constants (no environment override); tune a
+single dispatch with `expect_reply_within_secs` instead.
 
-| Variable | Default | Description |
+| Constant | Default | Description |
 |----------|---------|-------------|
-| `AGEND_DISPATCH_IDLE_THRESHOLD_SECS` | 600 | Default timeout for the fixup team |
+| `DEFAULT_DISPATCH_THRESHOLD_SECS` | 1800 (30 min) | L1: team dispatch idle window when `expect_reply_within_secs` is unset |
+| `ESCALATE_TO_AGENT_AFTER_SECS` | 600 (10 min) | L2: extra wait past `exceeded_at` before the agent nudge fires |
 
 ### Behavioral Details
 
 - Scan frequency: every 60 seconds (synced with the daemon tick cycle).
 - Each sidecar triggers at most one L1 exceeded notification and one L2 nudge.
-- L1 notification target: dispatcher.
+- L1 notification target: dispatcher; L2 nudge target: the dispatchee (agent),
+  deferred to the second escalation window (#2031).
 - L2 nudge target: target (recipient).
 - Tracking dismissal uses `correlation_id`, not sender or target identity.
 

@@ -100,13 +100,22 @@ pub(crate) struct PendingDispatch {
     /// fired (escalate-don't-repeat). Cleared with the sidecar on resolution.
     #[serde(default)]
     pub(crate) long_running_escalated: bool,
+    /// #2031: timestamp L1 flipped `status` to `Exceeded` (i.e. when the DISPATCHER
+    /// was notified via `..._exceeded`). L2 reads it to TIER the escalation: the
+    /// agent `..._nudge` — the costlier interrupt — is the SECOND rung, deferred
+    /// until [`team_nudge::ESCALATE_TO_AGENT_AFTER_SECS`] past this stamp so the
+    /// dispatcher gets a window to act first. `None` (legacy / pre-#2031 sidecar)
+    /// fails OPEN to the old immediate-nudge behavior — a missing stamp must never
+    /// SUPPRESS a real nudge.
+    #[serde(default)]
+    pub(crate) exceeded_at: Option<String>,
 }
 
 /// #2008-p2: max activity-based deadline extensions before the watchdog escalates
 /// ONCE with a "long-running — confirm expected" notice instead of refreshing
-/// forever. 3 × the dispatch threshold (≈30min at the 600s default) — long enough
-/// that a genuine long task isn't pestered, short enough that a stuck-in-loop
-/// agent surfaces for an operator confirm within a bounded window.
+/// forever. 3 × the dispatch threshold (≈90min at the #2031 1800s default) — long
+/// enough that a genuine long task isn't pestered, short enough that a
+/// stuck-in-loop agent surfaces for an operator confirm within a bounded window.
 const REFRESH_CAP: u32 = 3;
 
 /// #1658: how many consecutive not-working `scan_and_emit` ticks (past
@@ -114,10 +123,19 @@ const REFRESH_CAP: u32 = 3;
 /// single brief idle gap during active work is the common false-fire; requiring
 /// a short streak filters it. Cost to a genuinely-stuck agent is at most
 /// `(DEBOUNCE_SCANS - 1) * scan-cadence` of extra delay — negligible vs the
-/// 600s threshold. NOTE: this debounces the EXISTING #1516 gate; it does not
+/// dispatch threshold. NOTE: this debounces the EXISTING #1516 gate; it does not
 /// add a missing gate. The structurally-correct fix (gate on output-recency, not
 /// instantaneous state — `AgentSnapshot` has no activity timestamp today) is a
 /// documented follow-up if the residual is still annoying after this + #1657.
+///
+/// #2031 direction-3 (count "any completed turn since dispatch" as progress) was
+/// SPIKED and DEFERRED to this same follow-up: the only turn-end signal is the
+/// Stop hook event, which today lives only in the `AGEND_HOOK_STATE_POC`-gated,
+/// claude-only hook_shadow layer (#1523/#2014) — not cheaply in the per-tick
+/// snapshot. Folding it in is the "太繞" path; #2031 ships directions 1+2 (1800s
+/// default + tiered escalation) instead, which already require ≥40min of genuine
+/// silence before the costly agent interrupt. Revisit once hook state is promoted
+/// past the POC flag and a turn-end timestamp lands in `AgentSnapshot` (#2008).
 const DEBOUNCE_SCANS: u32 = 3;
 
 /// #1636: lifecycle of a dispatch-idle sidecar, replacing the stringly-typed
@@ -246,6 +264,10 @@ pub(crate) fn record_dispatch(
             // is silently eaten by the stale latch.
             existing.refresh_count = 0;
             existing.long_running_escalated = false;
+            // #2031: a revived (Exceeded→Pending) sidecar's escalation stamp is now
+            // stale — clear it so L2's second-window timer restarts from the next
+            // real Exceeded transition (L1 re-stamps `exceeded_at` then).
+            existing.exceeded_at = None;
             if let Ok(body) = serde_json::to_string_pretty(&existing) {
                 if crate::store::atomic_write(
                     &pending_path(home, &existing.dispatch_id),
@@ -274,6 +296,7 @@ pub(crate) fn record_dispatch(
         not_working_streak: 0,
         refresh_count: 0,
         long_running_escalated: false,
+        exceeded_at: None,
     };
     let body = match serde_json::to_string_pretty(&payload) {
         Ok(s) => s,
@@ -493,6 +516,9 @@ pub(crate) fn reassign_pending_for_task(
             cur.not_working_streak = 0;
             cur.nudge_sent_at = None;
             cur.status = DispatchStatus::Pending;
+            // #2031: revived for a new owner — drop the prior owner's escalation
+            // stamp so L2's second window restarts from the next Exceeded.
+            cur.exceeded_at = None;
             true
         });
         if matches!(updated, Ok(Some(true))) {
@@ -964,7 +990,7 @@ pub(crate) fn scan_and_emit(home: &Path) {
         // the growing streak and defer; the busy-branch above resets it the
         // moment the target produces output. A genuinely idle/stuck target keeps
         // accumulating → fires once the streak reaches the cap (≤ a couple
-        // scan-cadences of extra delay vs the 600s threshold).
+        // scan-cadences of extra delay vs the dispatch threshold).
         //
         // Only debounce when a snapshot EXISTS to judge work-state against —
         // debouncing snapshot noise is meaningless without one. No snapshot
@@ -1004,6 +1030,9 @@ pub(crate) fn scan_and_emit(home: &Path) {
                 continue;
             }
             current.status = DispatchStatus::Exceeded;
+            // #2031: stamp when the dispatcher was notified — L2 defers the agent
+            // nudge to a second window past this (escalation tiering).
+            current.exceeded_at = Some(now.to_rfc3339());
             if !write_dispatch(home, &current) {
                 tracing::warn!(dispatch_id = %d.dispatch_id, "dispatch-idle exceeded status write failed");
             }
@@ -1391,6 +1420,7 @@ mod tests {
             not_working_streak: 0,
             refresh_count: 0,
             long_running_escalated: false,
+            exceeded_at: None,
         };
         std::fs::write(
             pending_path(home, &id),
@@ -1654,6 +1684,54 @@ mod tests {
             d.status,
             DispatchStatus::Exceeded,
             "#1866 (a): a fully-idle target (all activity signals stale) must STILL fire"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2031: L1 must STAMP `exceeded_at` when it flips a sidecar to `Exceeded`.
+    /// This is the signal L2's second-window tiering reads — if L1 stopped
+    /// stamping, L2 would fail-open to an immediate nudge and silently regress the
+    /// tiering, so pin it explicitly.
+    #[test]
+    fn scan_and_emit_stamps_exceeded_at_2031() {
+        let home = tmp_home("2031-l1-stamp");
+        let target = "dev-2031-stamp";
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            format!("instances:\n  lead:\n    backend: claude\n  {target}:\n    backend: claude\n"),
+        )
+        .unwrap();
+        let task_id = "t-stamp-2031";
+        let tasks_dir = home.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        std::fs::write(
+            tasks_dir.join(format!("{task_id}.json")),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "id": task_id, "status": "in_progress", "title": "w", "assignee": target
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let id = write_pending_at(
+            &home,
+            "lead",
+            target,
+            Some(task_id),
+            "task",
+            600,
+            chrono::Utc::now() - chrono::Duration::seconds(700),
+        );
+        // No snapshot → debounce fails open → fires on this single scan.
+        scan_and_emit(&home);
+
+        let d = list_pending(&home)
+            .into_iter()
+            .find(|d| d.dispatch_id == id)
+            .expect("sidecar present");
+        assert_eq!(d.status, DispatchStatus::Exceeded, "precondition: fired");
+        assert!(
+            d.exceeded_at.is_some(),
+            "#2031: L1 must stamp exceeded_at on the Exceeded transition (L2 tiering depends on it)"
         );
         std::fs::remove_dir_all(&home).ok();
     }
@@ -2332,6 +2410,7 @@ mod tests {
             not_working_streak: 0,
             refresh_count: 0,
             long_running_escalated: false,
+            exceeded_at: None,
         };
         assert_eq!(
             stale_sidecar_reason(&home, &mk("ghost-lead")),

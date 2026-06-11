@@ -1856,8 +1856,9 @@ mod tests {
         assert_eq!(entry.dispatcher, "fixup-lead");
         assert_eq!(entry.target, "fixup-reviewer");
         assert_eq!(
-            entry.threshold_secs, 600,
-            "L2 must inject the 600s fixup default"
+            entry.threshold_secs,
+            crate::daemon::dispatch_idle::team_nudge::DEFAULT_DISPATCH_THRESHOLD_SECS,
+            "L2 must inject the team default threshold (#2031: 1800s)"
         );
         std::fs::remove_dir_all(&home).ok();
     }
