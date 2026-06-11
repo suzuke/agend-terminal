@@ -1065,8 +1065,16 @@ impl StateTracker {
     /// per tick. #2033: the returned [`RecoveryEpisode`] carries the gate inputs
     /// (was-notified + duration) so the supervisor can pick actionable-or-silent.
     /// A defensive default episode (`notice_sent=false`) is returned if the flag
-    /// armed without a captured episode (e.g. daemon restart mid-block) → the
-    /// gate treats it as non-actionable, erring silent.
+    /// armed without a captured episode → the gate treats it as non-actionable.
+    ///
+    /// KNOWN LIMITATION (#2033, reviewer-2 non-blocking): the per-episode state
+    /// (`blocked_since` / `blocked_notice_sent`) is in-memory, so a daemon restart
+    /// mid-block loses it. If the agent then recovers BEFORE the supervisor
+    /// re-detects + re-notifies the block, its recovery episode defaults to
+    /// `notice_sent=false` and the all-clear is suppressed — one missed recovery
+    /// notice per restart-straddling block. Deliberately the safe direction
+    /// (err-silent over false-notify); persisting the episode across restarts is
+    /// not worth the complexity for this narrow window.
     pub fn take_recovery_notice(&mut self) -> Option<RecoveryEpisode> {
         if self.interactive_recovery_pending_notice {
             self.interactive_recovery_pending_notice = false;
