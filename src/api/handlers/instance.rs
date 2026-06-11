@@ -192,7 +192,16 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
             args = r.args.clone();
         }
     }
-    if let Some(model) = fleet_resolved.as_ref().and_then(|r| r.model.as_deref()) {
+    // Model precedence: an explicit `--model` in args (create_instance
+    // pre-formats it there) > `params.model` (deploy Phase 3 sends the
+    // template's model on the wire — pre-#2038 this field was silently
+    // ignored) > the fleet entry's resolved model. push_model_arg enforces
+    // the first tier by never duplicating an existing flag.
+    if let Some(model) = params["model"]
+        .as_str()
+        .filter(|m| !m.is_empty())
+        .or_else(|| fleet_resolved.as_ref().and_then(|r| r.model.as_deref()))
+    {
         crate::backend::Backend::push_model_arg(&mut args, command, model);
     }
     let requested_work_dir = params["working_directory"]
@@ -1267,6 +1276,128 @@ mod tests {
         assert_eq!(
             argv, "--model model-2038-explicit",
             "caller-passed --model MUST win over fleet.yaml model with no duplicate flag"
+        );
+    }
+
+    /// #2038 ingress 3 (deploy Phase-3 shape) — SPAWN params carry an explicit
+    /// `model` field (deployments.rs sends the template's model on the wire).
+    /// Pre-#2038 handle_spawn silently ignored it; now it MUST be honoured and
+    /// it wins over a diverging fleet entry (params are the caller's explicit
+    /// intent, same precedence rule as params.env over fleet env in #900).
+    #[cfg(unix)]
+    #[test]
+    fn handle_spawn_params_model_wins_over_fleet_2038() {
+        let (ctx, home) = env_test_ctx("handle-spawn-params-model");
+        let sentinel = home.join("sentinel.txt");
+        let script = write_argv_capture_script(&home, &sentinel);
+
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  params-model-test:\n    backend: shell\n    model: model-2038-fleet-loser\n",
+        )
+        .expect("write fleet.yaml");
+
+        let result = handle_spawn(
+            &json!({
+                "name": "params-model-test",
+                "backend": "/bin/sh",
+                "args": script.display().to_string(),
+                "model": "model-2038-params",
+            }),
+            &ctx,
+        );
+        assert_eq!(result["ok"], true, "spawn must succeed: {result}");
+
+        let actual = await_sentinel_nonempty(&sentinel);
+        cleanup_agent(&ctx, "params-model-test");
+        let _ = std::fs::remove_dir_all(&home);
+
+        assert_eq!(
+            actual.as_deref(),
+            Some("--model model-2038-params"),
+            "params.model MUST be honoured and win over the fleet entry's model"
+        );
+    }
+
+    /// #2038 precedence (resolve chain) — per-instance `model:` overrides
+    /// `defaults.model`, proven at the SPAWN entry point (not just at the
+    /// `resolve_instance` unit level): the spawned argv carries the instance
+    /// value, never the default.
+    #[cfg(unix)]
+    #[test]
+    fn handle_spawn_instance_model_overrides_defaults_2038() {
+        let (ctx, home) = env_test_ctx("handle-spawn-inst-vs-defaults");
+        let sentinel = home.join("sentinel.txt");
+        let script = write_argv_capture_script(&home, &sentinel);
+
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "defaults:\n  model: model-2038-default-loser\ninstances:\n  inst-model-test:\n    backend: shell\n    model: model-2038-inst-wins\n",
+        )
+        .expect("write fleet.yaml");
+
+        let result = handle_spawn(
+            &json!({
+                "name": "inst-model-test",
+                "backend": "/bin/sh",
+                "args": script.display().to_string(),
+            }),
+            &ctx,
+        );
+        assert_eq!(result["ok"], true, "spawn must succeed: {result}");
+
+        let actual = await_sentinel_nonempty(&sentinel);
+        cleanup_agent(&ctx, "inst-model-test");
+        let _ = std::fs::remove_dir_all(&home);
+
+        assert_eq!(
+            actual.as_deref(),
+            Some("--model model-2038-inst-wins"),
+            "per-instance model MUST override defaults.model at the SPAWN entry"
+        );
+    }
+
+    /// #2038 ingress 4 (CREATE_TEAM Phase-2) — team members spawn through
+    /// `spawn_one` directly (not handle_spawn), so the team handler needs its
+    /// own boot-parity proof: with `defaults.model` (and `defaults.args`
+    /// carrying the capture script) in fleet.yaml, the real CREATE_TEAM entry
+    /// point MUST spawn the member with `--model` in its argv. Pre-#2038 the
+    /// member spawned with empty args (`&[]`), dropping both.
+    #[cfg(unix)]
+    #[test]
+    fn create_team_spawns_members_with_defaults_model_2038() {
+        let (ctx, home) = env_test_ctx("create-team-defaults-model");
+        let sentinel = home.join("sentinel.txt");
+        let script = write_argv_capture_script(&home, &sentinel);
+
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            format!(
+                "defaults:\n  args:\n    - {}\n  model: model-2038-team\ninstances: {{}}\n",
+                script.display()
+            ),
+        )
+        .expect("write fleet.yaml");
+
+        let result = crate::api::handlers::team::handle_create_team(
+            &json!({
+                "name": "team2038",
+                "count": 1,
+                "backend": "/bin/sh",
+            }),
+            &ctx,
+        );
+        assert_eq!(result["ok"], true, "create_team must succeed: {result}");
+
+        let actual = await_sentinel_nonempty(&sentinel);
+        cleanup_agent(&ctx, "team2038-1");
+        let _ = std::fs::remove_dir_all(&home);
+
+        assert_eq!(
+            actual.as_deref(),
+            Some("--model model-2038-team"),
+            "CREATE_TEAM Phase-2 member spawn MUST carry defaults.model (and \
+             defaults.args) — pre-#2038 it spawned with empty argv"
         );
     }
 }
