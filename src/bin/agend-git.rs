@@ -120,6 +120,7 @@ fn main() {
             is_agent_caller,
         ),
         subcommand,
+        &args,
         cwd_is_foreign_repo(&binding),
     );
 
@@ -494,13 +495,51 @@ fn is_mutating_local(subcmd: &str) -> bool {
     )
 }
 
-/// #1463 (A): convert a bound-agent `ChdirPass` into `Passthrough` when the
-/// command is a local mutating one AND cwd is a foreign repo. Pure so the
-/// matrix is unit-testable; everything else (push/checkout ChdirPass, Deny,
-/// already-Passthrough) is returned unchanged.
-fn apply_foreign_repo_passthrough(action: Action, subcmd: &str, cwd_foreign: bool) -> Action {
+/// #2027: a `git branch` / `git tag` invocation that NAMES a ref — it creates,
+/// deletes, moves, or inspects a SPECIFIC ref (a positional ref name, or a
+/// `-d`/`-D`/`-m`/`-M`/`-c`/`-C`/`--delete`/`--move`/`--copy` flag) — as opposed to
+/// the bare `git branch` LIST form. `classify` groups `branch`/`tag` with the
+/// read-only commands (they DEFAULT to listing), so a bound agent's
+/// `git branch <name>` is `ChdirPass`'d into the worktree. In a FOREIGN repo that
+/// is the #2027 success-lie: `git branch <new>` runs against the worktree, so the
+/// foreign repo silently gets nothing yet exits 0; a name the worktree already
+/// holds reports `fatal: already exists` from the wrong repo. A ref-naming
+/// branch/tag in a foreign repo must run against THAT repo (passthrough).
+///
+/// Conservative by design: over-classifying (e.g. `git branch --list <pattern>`)
+/// only adds the CORRECT foreign-passthrough (the pattern list should run on the
+/// foreign repo too); under-classifying is the bug. Only `args[0]` (the
+/// subcommand) is skipped — `args[1..]` are scanned for a ref-mutating flag or a
+/// positional ref name.
+fn branch_tag_names_ref(subcmd: &str, args: &[String]) -> bool {
+    if !matches!(subcmd, "branch" | "tag") {
+        return false;
+    }
+    args.iter().skip(1).any(|a| {
+        matches!(
+            a.as_str(),
+            "-d" | "-D" | "--delete" | "-m" | "-M" | "--move" | "-c" | "-C" | "--copy"
+        ) || !a.starts_with('-') // a positional ref name / pattern
+    })
+}
+
+/// #1463 (A) + #2027: convert a bound-agent `ChdirPass` into `Passthrough` when
+/// cwd is a foreign repo AND the command is a local mutating one (#1463) or a
+/// ref-naming `branch`/`tag` (#2027). Pure so the matrix is unit-testable;
+/// everything else (push/checkout ChdirPass, Deny, already-Passthrough) is
+/// returned unchanged.
+fn apply_foreign_repo_passthrough(
+    action: Action,
+    subcmd: &str,
+    args: &[String],
+    cwd_foreign: bool,
+) -> Action {
     match action {
-        Action::ChdirPass(_) if cwd_foreign && is_mutating_local(subcmd) => Action::Passthrough,
+        Action::ChdirPass(_)
+            if cwd_foreign && (is_mutating_local(subcmd) || branch_tag_names_ref(subcmd, args)) =>
+        {
+            Action::Passthrough
+        }
         other => other,
     }
 }
@@ -1685,6 +1724,30 @@ mod tests {
             action,
             Action::ChdirPass("/tmp/.worktrees/dev".into()),
             "bound read-tree must route to the private worktree, not deny"
+        );
+    }
+
+    /// #2027 chain precondition: a BOUND agent's ref-naming `git branch <name>`
+    /// lands in the read-only group → `ChdirPass(worktree)`. That ChdirPass is the
+    /// exact input `apply_foreign_repo_passthrough` must flip to `Passthrough` in a
+    /// foreign repo — pinning the full classify→apply chain that produced the
+    /// success-lie (the redirect ran the create against the worktree, so the
+    /// foreign repo silently got nothing yet the shim exited 0).
+    #[test]
+    fn bound_branch_create_classifies_to_chdirpass_2027() {
+        let action = classify(
+            "branch",
+            &["branch".into(), "feat-x".into()],
+            &bound_binding("feat/x", "/tmp/.worktrees/dev"),
+            false,
+            false,
+            true,
+        );
+        assert_eq!(
+            action,
+            Action::ChdirPass("/tmp/.worktrees/dev".into()),
+            "bound `git branch <name>` must classify to the read-only group's \
+             ChdirPass — the #2027 redirect apply_foreign_repo_passthrough flips"
         );
     }
 
@@ -3063,37 +3126,134 @@ mod tests {
     #[test]
     fn foreign_passthrough_action_matrix_1463() {
         use Action::*;
+        let a = |toks: &[&str]| toks.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         // local mutating + foreign → Passthrough
         assert_eq!(
-            apply_foreign_repo_passthrough(ChdirPass("wt".into()), "commit", true),
+            apply_foreign_repo_passthrough(ChdirPass("wt".into()), "commit", &a(&["commit"]), true),
             Passthrough
         );
         assert_eq!(
-            apply_foreign_repo_passthrough(ChdirPass("wt".into()), "add", true),
+            apply_foreign_repo_passthrough(ChdirPass("wt".into()), "add", &a(&["add"]), true),
             Passthrough
         );
         // local mutating + NOT foreign → unchanged ChdirPass
         assert_eq!(
-            apply_foreign_repo_passthrough(ChdirPass("wt".into()), "commit", false),
+            apply_foreign_repo_passthrough(
+                ChdirPass("wt".into()),
+                "commit",
+                &a(&["commit"]),
+                false
+            ),
             ChdirPass("wt".into())
         );
         // push / checkout are NOT local-mutating → stay ChdirPass even if foreign
         assert_eq!(
-            apply_foreign_repo_passthrough(ChdirPass("wt".into()), "push", true),
+            apply_foreign_repo_passthrough(ChdirPass("wt".into()), "push", &a(&["push"]), true),
             ChdirPass("wt".into())
         );
         assert_eq!(
-            apply_foreign_repo_passthrough(ChdirPass("wt".into()), "checkout", true),
+            apply_foreign_repo_passthrough(
+                ChdirPass("wt".into()),
+                "checkout",
+                &a(&["checkout"]),
+                true
+            ),
             ChdirPass("wt".into())
         );
         // non-ChdirPass inputs are returned verbatim
         assert_eq!(
-            apply_foreign_repo_passthrough(Deny("x".into()), "commit", true),
+            apply_foreign_repo_passthrough(Deny("x".into()), "commit", &a(&["commit"]), true),
             Deny("x".into())
         );
         assert_eq!(
-            apply_foreign_repo_passthrough(Passthrough, "commit", true),
+            apply_foreign_repo_passthrough(Passthrough, "commit", &a(&["commit"]), true),
             Passthrough
+        );
+    }
+
+    // #2027 (§3.9): a ref-naming `branch`/`tag` in a FOREIGN repo must pass through
+    // (run against THAT repo), never be ChdirPass'd into the worktree — the
+    // worktree-redirect is the success-lie (silent no-op + exit 0 for a create; a
+    // fake `already exists` for a name the worktree already holds). Mirrors the
+    // issue's deterministic 3-shape repro matrix.
+    #[test]
+    fn branch_tag_names_ref_classifier_2027() {
+        let a = |toks: &[&str]| toks.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // create: positional ref name → names a ref
+        assert!(branch_tag_names_ref("branch", &a(&["branch", "feat-x"])));
+        assert!(branch_tag_names_ref("tag", &a(&["tag", "v1.0"])));
+        // delete / move / copy flags → name a ref
+        assert!(branch_tag_names_ref(
+            "branch",
+            &a(&["branch", "-d", "feat-x"])
+        ));
+        assert!(branch_tag_names_ref(
+            "branch",
+            &a(&["branch", "-m", "old", "new"])
+        ));
+        assert!(branch_tag_names_ref("tag", &a(&["tag", "-d", "v1.0"])));
+        // bare LIST form (no positional, list/inspect flags only) → does NOT name a ref
+        assert!(!branch_tag_names_ref("branch", &a(&["branch"])));
+        assert!(!branch_tag_names_ref("branch", &a(&["branch", "-a"])));
+        assert!(!branch_tag_names_ref("branch", &a(&["branch", "-v", "-v"])));
+        assert!(!branch_tag_names_ref("tag", &a(&["tag", "-l"])));
+        // non-branch/tag subcommands are never ref-naming here (handled elsewhere)
+        assert!(!branch_tag_names_ref("commit", &a(&["commit", "-m", "x"])));
+        assert!(!branch_tag_names_ref("status", &a(&["status"])));
+    }
+
+    // #2027 (§3.9): the end-to-end conversion — bound-agent `git branch <name>` in
+    // a foreign repo flips ChdirPass→Passthrough (no lie); fleet (non-foreign) and
+    // the bare LIST form stay ChdirPass byte-identical.
+    #[test]
+    fn foreign_passthrough_branch_tag_matrix_2027() {
+        use Action::*;
+        let a = |toks: &[&str]| toks.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // Shape 1 — never-seen create name, foreign → Passthrough (was: silent no-op exit 0)
+        assert_eq!(
+            apply_foreign_repo_passthrough(
+                ChdirPass("wt".into()),
+                "branch",
+                &a(&["branch", "zz-new"]),
+                true
+            ),
+            Passthrough
+        );
+        // Shape 2 — name the worktree already holds, foreign → Passthrough
+        // (was: fake `already exists` exit 128 from the worktree)
+        assert_eq!(
+            apply_foreign_repo_passthrough(
+                ChdirPass("wt".into()),
+                "branch",
+                &a(&["branch", "feat-x"]),
+                true
+            ),
+            Passthrough
+        );
+        // tag create, foreign → Passthrough
+        assert_eq!(
+            apply_foreign_repo_passthrough(
+                ChdirPass("wt".into()),
+                "tag",
+                &a(&["tag", "v1.0"]),
+                true
+            ),
+            Passthrough
+        );
+        // FLEET (non-foreign) ref-naming branch → unchanged ChdirPass (byte-identical)
+        assert_eq!(
+            apply_foreign_repo_passthrough(
+                ChdirPass("wt".into()),
+                "branch",
+                &a(&["branch", "feat-x"]),
+                false
+            ),
+            ChdirPass("wt".into())
+        );
+        // bare LIST form, even foreign → unchanged ChdirPass (read-only, no lie)
+        assert_eq!(
+            apply_foreign_repo_passthrough(ChdirPass("wt".into()), "branch", &a(&["branch"]), true),
+            ChdirPass("wt".into())
         );
     }
 
