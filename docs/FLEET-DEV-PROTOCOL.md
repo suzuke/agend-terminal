@@ -61,6 +61,8 @@ Every review report must include: `scope_source`, `audit_mode`, `reviewed_head`,
 
 The daemon HARD-gates this at report time: a `VERIFIED`/`REJECTED` with **no recognizable evidence token** (a `cargo`/`gh`/`clippy`/`grep` command line, or a `path:line` cite) is rejected back to the reviewer. The gate is deliberately **lenient** — it accepts any one recognized token and rejects only on total absence; it does NOT enforce a fixed format. (The §3.21 risk-tier review DEPTH remains lead/reviewer judgment — not daemon-enforced.)
 
+**Comments and prose are claims, not evidence (#2018).** Every factual assertion in a code comment, doc, or PR body is a claim to VERIFY against the code, never evidence in itself. Reachability / scope / "cannot happen" / "single chokepoint" claims must be proven from the actual guards and match arms in the source — author and reviewer alike. (2026-06-11 surfaced four in one day: a compaction-loss rationale that named dead code, a "single chokepoint" that several call sites bypassed, an "agy is a hook backend" that emitted zero events, and an "EXDEV" fallback on a same-directory rename.)
+
 ### 3.3.1 CI Verification Gate (Sprint 61)
 Before approving merge, orchestrator/reviewer MUST independently verify CI:
 

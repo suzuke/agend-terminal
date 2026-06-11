@@ -29,14 +29,30 @@ pub(crate) fn handle_hook_event(params: &Value, ctx: &HandlerCtx) -> Value {
     // Shadow comparison: the screen-heuristic state at event receipt. This is
     // the PoC's primary output — production promotion is gated on this
     // agreement data.
-    let screen_state = {
+    let (screen_state, backend) = {
         let reg = agent::lock_registry(ctx.registry);
-        crate::fleet::resolve_uuid(ctx.home, name)
-            .and_then(|id| reg.get(&id).map(|h| h.core.lock().state.get_state()))
+        match crate::fleet::resolve_uuid(ctx.home, name).and_then(|id| {
+            reg.get(&id)
+                .map(|h| (h.core.lock().state.get_state(), h.backend_command.clone()))
+        }) {
+            Some((s, b)) => (Some(s), Some(b)),
+            None => (None, None),
+        }
     };
     let agree = match (derived, screen_state) {
         (Some(d), Some(s)) => Some(d == s),
         _ => None,
+    };
+    // #2016: #1523 promoted hooks to authoritative, so the static "shadow-mode —
+    // heuristic still drives" line is no longer true for a promoted backend.
+    // Reflect the LIVE disposition (fields unchanged — text only).
+    let drive = if backend
+        .as_deref()
+        .is_some_and(crate::daemon::hook_shadow::is_promoted)
+    {
+        "authoritative for this backend"
+    } else {
+        "shadow — heuristic drives"
     };
     tracing::info!(
         tag = "#hook-shadow",
@@ -47,7 +63,7 @@ pub(crate) fn handle_hook_event(params: &Value, ctx: &HandlerCtx) -> Value {
         hook_state = ?derived,
         screen_state = ?screen_state,
         agree = ?agree,
-        "hook event received (shadow-mode — heuristic still drives)"
+        "hook event received ({drive})"
     );
     json!({"ok": true, "derived_state": derived.map(|s| format!("{s:?}"))})
 }

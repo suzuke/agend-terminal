@@ -109,6 +109,13 @@ fn promotion_enabled() -> bool {
     std::env::var("AGEND_HOOK_STATE_POC").as_deref() == Ok("1")
 }
 
+/// #2016: is THIS backend's snapshot state currently DRIVEN by hooks (promoted),
+/// vs still shadow-only? Same gate `authoritative_state` applies — for the
+/// `#hook-shadow` log to describe the live disposition honestly.
+pub fn is_promoted(backend_command: &str) -> bool {
+    promotion_enabled() && crate::backend::Backend::parse_str(backend_command).has_state_hooks()
+}
+
 /// #1523 PROMOTION (phased v1): the authoritative `AgentState` written to the
 /// daemon's per-tick SNAPSHOT (`snapshot.json`).
 ///
