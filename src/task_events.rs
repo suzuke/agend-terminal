@@ -1288,6 +1288,54 @@ pub fn invalidate_replay_cache() {
 /// and any line that fails to deserialize as a known [`TaskEvent`]
 /// variant aborts (per dev-reviewer-2 must-have: replay must NOT silently
 /// skip unknown envelopes).
+/// #1990 item 4: process-global once-per-boot latch. The per-tick task-board
+/// readers (cron gate in `cron_tick.rs`, idle watchdog) swallow a fail-closed
+/// replay error into a read-gate, so without this the board silently freezes and
+/// the operator has no cause to look at. Boot-scoped (a restart re-alerts — the
+/// cause either healed or still blocks).
+static REPLAY_FAILCLOSED_EVENT_EMITTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// #1990 item 4 (follows the #1972 crash-budget surface pattern): when [`replay`]
+/// fail-closes on a forward-incompatible record (#1992 — a future-version or
+/// unknown-variant envelope), make it OPERATOR-VISIBLE. The daemon keeps running
+/// while the per-tick callers swallow the `Err`, so an operator otherwise sees a
+/// frozen task board with no explanation. The fix is dual: ERROR-log every
+/// occurrence (greppable) and emit ONE `event_log` entry per boot (latched so
+/// per-tick callers can't spam). Observation only: the fail-closed `Err` still
+/// propagates unchanged, so no recovery semantics change (same discipline as
+/// #1972). A transient IO error (not the "fail-closed" class) is left alone.
+///
+/// Classification is by the `"fail-closed"` substring of the error — a contract
+/// pinned at `read_envelopes_strict`'s two `bail!` sites; keep them in lockstep.
+/// Known limitation (#1990 item 4, reviewer-2 minor 2): only failures that flow
+/// through [`replay`] are surfaced; the timeline queries `envelopes_for_task` /
+/// `stream_envelopes` fail-close without surfacing. The board-freeze alert here
+/// is the primary operator signal, so that narrower timeline-query gap is
+/// accepted rather than expanding scope.
+fn surface_failclosed_replay_once(home: &Path, err: &anyhow::Error) {
+    let msg = err.to_string();
+    if !msg.contains("fail-closed") {
+        return;
+    }
+    tracing::error!(
+        error = %msg,
+        "task-board replay FAIL-CLOSED — the board will not advance until resolved (upgrade the daemon to a version that understands this log, or quarantine the offending record)"
+    );
+    if !REPLAY_FAILCLOSED_EVENT_EMITTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        crate::event_log::log(
+            home,
+            "task_replay_fail_closed",
+            "task-board",
+            &format!(
+                "task-board replay fail-closed — the board is frozen until resolved: {msg}. \
+                 Fix: upgrade the daemon to a version that understands this log, or quarantine \
+                 the offending record. Further failures this boot log at error level only."
+            ),
+        );
+    }
+}
+
 pub fn replay(home: &Path) -> anyhow::Result<TaskBoardState> {
     let key = replay_cache_key(home);
     {
@@ -1299,7 +1347,15 @@ pub fn replay(home: &Path) -> anyhow::Result<TaskBoardState> {
         }
     }
 
-    let state = replay_uncached(home)?;
+    let state = match replay_uncached(home) {
+        Ok(s) => s,
+        Err(e) => {
+            // #1990 item 4: surface the fail-closed stall before the per-tick
+            // caller swallows the Err into a read-gate.
+            surface_failclosed_replay_once(home, &e);
+            return Err(e);
+        }
+    };
 
     *REPLAY_CACHE.lock() = Some(ReplayCacheEntry {
         key,
@@ -1436,6 +1492,13 @@ fn read_envelopes_strict(path: &Path, out: &mut Vec<TaskEventEnvelope>) -> anyho
         }
         // #1988: distinguish three failure shapes by their *cause* — only the
         // first is skippable; the other two stay deliberately fail-closed.
+        //
+        // #1990 item 4 CONTRACT: both fail-closed `bail!` messages below MUST
+        // contain the substring "fail-closed". `surface_failclosed_replay_once`
+        // classifies a replay error as the operator-surfaceable forward-incompat
+        // class by exactly that substring (so a frozen board raises an alert,
+        // while a transient IO error does not). Reword these messages only in
+        // lockstep with that classifier, or the board-freeze alert goes silent.
         //
         // (1) CORRUPT line — not even valid JSON: a torn/half-written tail from a
         //     crash mid-append (`append_lines_under_lock` appends in place), or a
@@ -1638,6 +1701,7 @@ pub fn compact(home: &Path) -> anyhow::Result<()> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::fs;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -1753,6 +1817,7 @@ mod tests {
     /// envelopes (k>0) rather than dropping unknown fields. Operators
     /// running an older binary against a newer log fail loud.
     #[test]
+    #[serial(task_replay_latch)] // #1990 item 4: shares the global fail-closed-emit latch
     fn invariant_4_forward_compat_fail_closed() {
         let home = tmp_home("future");
         let log = home.join("task_events.jsonl");
@@ -1774,6 +1839,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(task_replay_latch)] // #1990 item 4: shares the global fail-closed-emit latch
     fn replay_rejects_unknown_event_variant() {
         let home = tmp_home("unknown");
         let log = home.join("task_events.jsonl");
@@ -1928,6 +1994,7 @@ mod tests {
     /// read-path fail-closed gate still fires on replay. (Proves the corrupt-skip
     /// and forward-compat-abort responsibilities stay cleanly separated.)
     #[test]
+    #[serial(task_replay_latch)] // #1990 item 4: shares the global fail-closed-emit latch
     fn recover_keeps_future_version_line_replay_still_fail_closed() {
         let home = tmp_home("recover-future");
         let inst = InstanceName::from("u");
@@ -1957,6 +2024,60 @@ mod tests {
         assert!(
             err.to_string().contains("forward-compat fail-closed"),
             "got: {err}"
+        );
+        fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1990 item 4: a fail-closed replay (the board freezes while the per-tick
+    /// callers swallow the Err) must surface ONE operator-visible event_log entry
+    /// per boot — and a second fail-closed replay in the same boot must NOT emit a
+    /// duplicate (latched). Serialized with the other latch-tripping tests so the
+    /// process-global latch reset is uninterrupted.
+    #[test]
+    #[serial(task_replay_latch)]
+    fn replay_fail_closed_surfaces_operator_event_once() {
+        let home = tmp_home("failclosed-visible");
+        REPLAY_FAILCLOSED_EVENT_EMITTED.store(false, std::sync::atomic::Ordering::Relaxed);
+        // A future-version record → replay fail-closes (#1992 forward-compat).
+        let line = serde_json::json!({
+            "schema_version": 999,
+            "seq": 1,
+            "timestamp": "2026-04-27T00:00:00Z",
+            "instance": "newer-daemon",
+            "event": {"kind": "Unblocked", "task_id": "t-X"}
+        });
+        fs::write(home.join("task_events.jsonl"), format!("{line}\n")).unwrap();
+        // Two fail-closed replays in the same boot (Err is not cached, so both
+        // re-run replay_uncached and reach the surface helper).
+        assert!(replay(&home).is_err());
+        assert!(replay(&home).is_err());
+        // Exactly one operator event was emitted (latched).
+        let elog = fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
+        assert_eq!(
+            elog.matches("task_replay_fail_closed").count(),
+            1,
+            "fail-closed replay must surface exactly one operator event per boot, got: {elog}"
+        );
+        fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1990 item 4 (reviewer-2 minor 1): the boundary that keeps disk jitter from
+    /// becoming a false alarm — a transient IO-class replay error (no "fail-closed"
+    /// substring) must NOT surface an operator event. Guards the substring
+    /// classifier against over-firing.
+    #[test]
+    #[serial(task_replay_latch)]
+    fn transient_io_error_does_not_surface_operator_event() {
+        let home = tmp_home("io-no-surface");
+        REPLAY_FAILCLOSED_EVENT_EMITTED.store(false, std::sync::atomic::Ordering::Relaxed);
+        // A bare IO-class error (what a vanished/locked file yields) — not the
+        // forward-compat "fail-closed" class.
+        let io_err = anyhow::anyhow!("No such file or directory (os error 2)");
+        surface_failclosed_replay_once(&home, &io_err);
+        let elog = fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
+        assert!(
+            !elog.contains("task_replay_fail_closed"),
+            "a transient IO error must NOT surface an operator event (false-alarm guard): {elog}"
         );
         fs::remove_dir_all(&home).ok();
     }

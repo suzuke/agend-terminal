@@ -28,6 +28,36 @@ agend-terminal quickstart    # Interactive setup in 2 minutes
 agend-terminal start         # Launch the fleet
 ```
 
+### Unattended setup (CI / scripts)
+
+`quickstart --unattended` never reads stdin and never waits on the network —
+missing required input is a clear error and a non-zero exit, not a hang.
+The backend is the first one detected on `PATH` (errors out listing install
+commands if none); Telegram is optional and comes from the environment:
+
+```bash
+# Minimal (no Telegram — channel block is generated commented-out):
+agend-terminal quickstart --unattended
+
+# With Telegram (token is stored unverified; the daemon validates at startup):
+AGEND_TELEGRAM_BOT_TOKEN=123:abc \
+AGEND_TELEGRAM_GROUP_ID=-1001234567890 \
+agend-terminal quickstart --unattended
+```
+
+Re-runs are idempotent: an existing `fleet.yaml` is never overwritten, and an
+existing `.env` token is only replaced when `AGEND_TELEGRAM_BOT_TOKEN` is
+explicitly set (e.g. a CI token rotation). Example GitHub Actions step:
+
+```yaml
+- name: Bootstrap agend-terminal
+  env:
+    AGEND_TELEGRAM_BOT_TOKEN: ${{ secrets.AGEND_TELEGRAM_BOT_TOKEN }}
+  run: |
+    cargo install agend-terminal
+    agend-terminal quickstart --unattended
+```
+
 ## Architecture
 
 ```mermaid

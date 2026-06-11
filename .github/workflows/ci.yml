@@ -277,7 +277,9 @@ jobs:
           AGEND_LOCK_AUDIT: "1"
         # #1452: Coverage (non-required) can flake on transient llvm-profdata
         # profraw corruption under llvm-cov's slow parallel run — that passes on a
-        # clean rerun, so retry once.
+        # clean rerun, so retry (signature-gated, max 2 retries: double-flakes of
+        # the same signature in one run became frequent — 3 on 2026-06-11 alone —
+        # and each manual `gh run rerun` costs an operator round-trip).
         #
         # SMART RETRY: a plain `test ... FAILED` is a REAL, deterministic failure.
         # The old loop retried it unconditionally AND labelled it "likely flake" —
@@ -293,12 +295,12 @@ jobs:
             if cargo llvm-cov --workspace --tests --features tray --lcov --output-path coverage.lcov 2>&1 | tee cov-attempt.log; then
               exit 0
             fi
-            if [ "$attempt" -ge 2 ]; then
-              echo "::error::coverage failed again after retrying the profraw flake"
+            if [ "$attempt" -ge 3 ]; then
+              echo "::error::coverage failed after 2 signature-gated profraw-flake retries"
               exit 1
             fi
             if grep -qiE 'profdata|\.profraw|malformed instrumentation|raw profile|invalid instrumentation profile|failed to (load|merge).*profile|no profile can be merged' cov-attempt.log; then
-              echo "::warning::coverage attempt $attempt hit an llvm-cov profraw/profdata corruption flake; cleaning + retrying once"
+              echo "::warning::coverage attempt $attempt hit an llvm-cov profraw/profdata corruption flake; cleaning + retrying (max 2 retries)"
               cargo llvm-cov clean --workspace || true
               attempt=$((attempt + 1))
               continue
