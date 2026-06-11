@@ -130,9 +130,11 @@ pub fn post(home: &Path, author: &str, args: &Value) -> Value {
         Some(t) => t,
         None => return serde_json::json!({"error": "missing 'title'"}),
     };
-    let content = match args["content"].as_str() {
+    // #2037 (3): `text` accepted as alias — `send` calls its body `message`,
+    // inbox renders `text`; `content` stays canonical for decisions.
+    let content = match args["content"].as_str().or_else(|| args["text"].as_str()) {
         Some(c) => c,
-        None => return serde_json::json!({"error": "missing 'content'"}),
+        None => return serde_json::json!({"error": "missing 'content' (alias: text)"}),
     };
     let scope = args["scope"].as_str().unwrap_or("project");
     let tags: Vec<String> = args["tags"]

@@ -547,6 +547,13 @@ fn next_fire_at(schedule: &Schedule) -> Option<String> {
 pub fn list(home: &Path, args: &Value) -> Value {
     let store = load(home);
     let target_filter = args["instance"].as_str();
+    // #2037 (2): the store caps run_history at 50 PER SCHEDULE — serializing
+    // it whole made `list` responses balloon (operator hit: most of the
+    // payload was history nobody asked for). Default to the newest
+    // RUN_HISTORY_LIST_CAP entries; `full_history=true` opts back in. The
+    // truncated row carries `runs_total` so the cut is visible.
+    const RUN_HISTORY_LIST_CAP: usize = 3;
+    let full_history = args["full_history"].as_bool().unwrap_or(false);
     // #1720 ③: each row carries a computed `next_scheduled_fire_at` (not stored)
     // so operators can see when it next fires.
     let schedules: Vec<Value> = store
@@ -560,6 +567,17 @@ pub fn list(home: &Path, args: &Value) -> Value {
                     "next_scheduled_fire_at".to_string(),
                     next_fire_at(s).map_or(Value::Null, Value::String),
                 );
+                if !full_history {
+                    let total = s.run_history.len();
+                    map.insert("runs_total".to_string(), serde_json::json!(total));
+                    if total > RUN_HISTORY_LIST_CAP {
+                        let tail: Vec<Value> = s.run_history[total - RUN_HISTORY_LIST_CAP..]
+                            .iter()
+                            .map(|r| serde_json::to_value(r).unwrap_or(Value::Null))
+                            .collect();
+                        map.insert("run_history".to_string(), Value::Array(tail));
+                    }
+                }
             }
             v
         })
@@ -1403,5 +1421,60 @@ mod tests {
             "idempotent: run_history must not grow on repeated sweeps"
         );
         std::fs::remove_dir_all(home).ok();
+    }
+
+    // ── #2037 (2): list run_history cap ──
+
+    /// Default list trims run_history to the newest 3 with `runs_total`;
+    /// `full_history=true` returns everything stored.
+    #[test]
+    fn list_caps_run_history_with_optin_2037() {
+        let home = tmp_home("2037-history-cap");
+        let resp = create(
+            &home,
+            "lead",
+            &serde_json::json!({"cron": "0 0 * * *", "message": "m", "instance": "dev"}),
+        );
+        let id = resp["id"].as_str().expect("created").to_string();
+        // Seed 6 runs directly through the store (the list cap is the unit
+        // under test, not the runner).
+        crate::store::mutate_versioned(&store_path(&home), |store: &mut ScheduleStore| {
+            let sched = store
+                .schedules
+                .iter_mut()
+                .find(|s| s.id == id)
+                .expect("schedule");
+            for i in 0..6 {
+                sched.run_history.push(ScheduleRun {
+                    triggered_at: format!("2026-06-11T00:0{i}:00Z"),
+                    status: "ok".to_string(),
+                });
+            }
+            Ok(())
+        })
+        .expect("seed runs");
+        let trimmed = list(&home, &serde_json::json!({}));
+        let row = &trimmed["schedules"][0];
+        assert_eq!(row["runs_total"].as_u64(), Some(6), "{row}");
+        assert_eq!(
+            row["run_history"].as_array().expect("array").len(),
+            3,
+            "default trims to newest 3: {row}"
+        );
+        assert_eq!(
+            row["run_history"][2]["triggered_at"].as_str(),
+            Some("2026-06-11T00:05:00Z"),
+            "kept entries are the NEWEST tail"
+        );
+        let full = list(&home, &serde_json::json!({"full_history": true}));
+        assert_eq!(
+            full["schedules"][0]["run_history"]
+                .as_array()
+                .expect("array")
+                .len(),
+            6,
+            "full_history opt-in returns all stored runs"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 }
