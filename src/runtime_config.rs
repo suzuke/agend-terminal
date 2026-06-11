@@ -225,9 +225,26 @@ pub fn set(home: &Path, key: &str, value: &str) -> Result<String, String> {
         }
         _ => return Err(format!("unknown config key: {key}")),
     }
+    let path = home.join("runtime-config.json");
+    // #1990 (reviewer-2 P1): `config` comes from in-memory `get()` (the
+    // keep-last-good snapshot), NOT the disk file — so a blind write here would
+    // CLOBBER a future-version file a newer daemon wrote, downgrading it. Reads
+    // are protected by keep-last-good; the write path needs its own guard. Check
+    // the on-disk version first and refuse with a visible error (mirrors the
+    // decisions-update fail-closed) rather than silently overwriting.
+    if let Ok(disk) = std::fs::read_to_string(&path) {
+        if let Ok(existing) = serde_json::from_str::<RuntimeConfig>(&disk) {
+            if existing.schema_version > RuntimeConfig::CURRENT {
+                return Err(format!(
+                    "runtime-config.json was written by a newer schema version ({} > {}); refusing to overwrite — upgrade the daemon",
+                    existing.schema_version,
+                    RuntimeConfig::CURRENT
+                ));
+            }
+        }
+    }
     // #1990: stamp the current schema version on every write.
     config.schema_version = RuntimeConfig::CURRENT;
-    let path = home.join("runtime-config.json");
     let json = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
     std::fs::write(&path, json).map_err(|e| e.to_string())?;
     *global().write() = config.clone();
@@ -416,6 +433,32 @@ mod tests {
             get_key("dev_idle_threshold_secs").unwrap(),
             "5555",
             "a future-schema config must be rejected, keeping last-known-good (not adopting 1)"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #1990 (reviewer-2 P1): `set` writes from the in-memory keep-last-good
+    /// snapshot, so a blind write would clobber a future-version file on disk.
+    /// It must refuse instead, leaving the newer daemon's file intact.
+    #[test]
+    #[serial(runtime_config)]
+    fn set_refuses_to_overwrite_future_version_file() {
+        let dir = std::env::temp_dir().join("agend-test-runtime-config-setfuture");
+        std::fs::create_dir_all(&dir).ok();
+        std::fs::write(
+            dir.join("runtime-config.json"),
+            r#"{"schema_version": 999, "dev_idle_threshold_secs": 1}"#,
+        )
+        .unwrap();
+        let r = set(&dir, "dev_idle_threshold_secs", "7200");
+        assert!(
+            r.is_err(),
+            "set must refuse to overwrite a future-version config: {r:?}"
+        );
+        let disk = std::fs::read_to_string(dir.join("runtime-config.json")).unwrap();
+        assert!(
+            disk.contains("999"),
+            "the future-version file must be left intact, not downgraded: {disk}"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

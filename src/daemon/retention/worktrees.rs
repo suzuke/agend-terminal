@@ -273,11 +273,15 @@ pub(crate) fn maybe_remove_candidate(
                 reason: "agent_alive_at_archive".to_string(),
             };
         }
-    } else if crate::binding::read(home, agent).is_some() {
+    } else if crate::binding::present_including_future(home, agent) {
+        // #1990 (reviewer-2 P2b): use `present_including_future`, NOT `read` —
+        // `read` returns None for a binding a NEWER daemon wrote, which here
+        // (a destructive archive) would mistake a live future-version rebind for
+        // "absent" and reclaim it. "future ≠ absent" at destructive sites.
         tracing::info!(
             agent,
             path = %path.display(),
-            "worktree rebound since GC enumeration, skipping archive"
+            "worktree rebound since GC enumeration (current or future-version binding), skipping archive"
         );
         return RemovalOutcome::Skipped {
             reason: "rebound_since_enumeration".to_string(),

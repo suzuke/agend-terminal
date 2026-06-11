@@ -44,9 +44,11 @@ than the tier floor). Either way: never a crash, never a silent drop.
 `runtime-config.json`, the decision log (`decisions/*.json`), and
 `binding.json` carry an explicit `schema_version` (#1990): an older file
 without it reads normally; a newer-than-supported file is fail-closed
-(runtime-config keeps the last-known-good per #1576; a decision is skipped on
-read and refused for update; a binding reads as absent, so the git-shim push
-gate denies).
+(runtime-config keeps the last-known-good per #1576 and refuses an overwriting
+write; a decision is skipped on read and refused for update; a binding reads as
+absent to **daemon-side** readers — the git shim has its own reader that
+HMAC-verifies and treats a parseable future binding as bound, so the agent stays
+restricted to its own worktree).
 
 **Two tier (b) stores are unversioned free-form key-value bags** that cannot
 carry a `schema_version` without a breaking shape change: `topics.json` (the
