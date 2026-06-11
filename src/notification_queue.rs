@@ -256,15 +256,39 @@ pub fn input_box_dim_aware_empty(text: &str, dim: &[bool], marker: &str) -> Opti
 /// Routes through the claim-atomic `drain` (then requeues the tail) so a
 /// concurrent flusher can never read the same lines mid-rewrite.
 pub fn drain_one(home: &Path, agent_name: &str) -> Option<QueuedNotification> {
-    let mut all = drain(home, agent_name);
-    if all.is_empty() {
-        return None;
+    // #2028: drain_one is a SINGLE-SHOT caller (the Abandoned-trickle path and
+    // tests) — unlike the flushers it has no "next tick" to absorb a transient
+    // false-empty, so a lock/claim hiccup must be retried, not reported as
+    // "queue empty". Bounded (no double-drain dead-wait regression): a live
+    // peer holds the drain lock for microseconds (rename + read), so a few
+    // short retries comfortably outlast any healthy contention window.
+    const RETRIES: u32 = 5;
+    const RETRY_SLEEP: std::time::Duration = std::time::Duration::from_millis(10);
+    for attempt in 0..=RETRIES {
+        match try_drain_with_stale_threshold(home, agent_name, STALE_DRAINING_MS) {
+            DrainAttempt::Drained(mut all) => {
+                if all.is_empty() {
+                    return None; // TRUE empty — claim succeeded, nothing queued.
+                }
+                let oldest = all.remove(0);
+                if !all.is_empty() {
+                    requeue_all(home, agent_name, &all);
+                }
+                return Some(oldest);
+            }
+            DrainAttempt::Unavailable => {
+                if attempt < RETRIES {
+                    std::thread::sleep(RETRY_SLEEP);
+                }
+            }
+        }
     }
-    let oldest = all.remove(0);
-    if !all.is_empty() {
-        requeue_all(home, agent_name, &all);
-    }
-    Some(oldest)
+    tracing::warn!(
+        agent = agent_name,
+        "#2028: drain_one gave up after {RETRIES} contended attempts — \
+         deferring to the next trickle cycle (not claiming empty)"
+    );
+    None
 }
 
 pub fn enqueue(home: &Path, agent_name: &str, text: &str) -> anyhow::Result<()> {
@@ -401,22 +425,50 @@ pub fn drain(home: &Path, agent_name: &str) -> Vec<QueuedNotification> {
     drain_with_stale_threshold(home, agent_name, STALE_DRAINING_MS)
 }
 
+/// #2028: outcome of one drain attempt. The flusher callers collapse
+/// `Unavailable` to empty (they retry next tick — unchanged behavior);
+/// single-shot callers (`drain_one`) retry instead of trusting a transient
+/// hiccup as "queue empty".
+pub(crate) enum DrainAttempt {
+    Drained(Vec<QueuedNotification>),
+    /// Could not claim: drain lock held/unopenable, or the queue file exists
+    /// but the claim rename failed. "Not sure" — NEVER "empty".
+    Unavailable,
+}
+
 /// `stale_ms` injected for deterministic tests (0 = recover any leftover now).
+/// Flusher-facing wrapper: `Unavailable` collapses to empty (the holder
+/// delivers; this caller retries next tick).
 pub(crate) fn drain_with_stale_threshold(
     home: &Path,
     agent_name: &str,
     stale_ms: u128,
 ) -> Vec<QueuedNotification> {
-    // #1629: routed through the store chokepoint so the flock bumps
-    // FLOCK_DEPTH for the self-IPC deadlock guard. Non-blocking on purpose:
-    // `None` (held by a peer flusher) and `Err` (lock file unusable) both walk
-    // away empty — the holder delivers, and our caller retries next tick.
-    // No inject/self-IPC happens while the guard is held: drain only touches
-    // files and returns; injection runs after the guard drops.
+    match try_drain_with_stale_threshold(home, agent_name, stale_ms) {
+        DrainAttempt::Drained(v) => v,
+        DrainAttempt::Unavailable => Vec::new(),
+    }
+}
+
+/// #1629: routed through the store chokepoint so the flock bumps
+/// FLOCK_DEPTH for the self-IPC deadlock guard. Non-blocking on purpose:
+/// a held lock means a live peer flusher is mid-delivery — we must not
+/// dead-wait on it. #2028 made the non-blocking outcome HONEST: lock
+/// unavailable (or unopenable, or a failed claim rename over an existing
+/// queue) is `Unavailable`, not an empty vec — under llvm-cov-grade load a
+/// transient open/lock hiccup was reported as "queue empty" and single-shot
+/// callers believed it. No inject/self-IPC happens while the guard is held:
+/// drain only touches files and returns; injection runs after the guard
+/// drops.
+pub(crate) fn try_drain_with_stale_threshold(
+    home: &Path,
+    agent_name: &str,
+    stale_ms: u128,
+) -> DrainAttempt {
     let Ok(Some(_drain_lock)) =
         crate::store::try_acquire_file_lock(&drain_lock_path(home, agent_name))
     else {
-        return Vec::new();
+        return DrainAttempt::Unavailable;
     };
     let mut out = Vec::new();
     for leftover in list_draining_files(home, agent_name) {
@@ -427,19 +479,39 @@ pub(crate) fn drain_with_stale_threshold(
     let path = queue_path(home, agent_name);
     if path.exists() {
         let claim = draining_claim_path(home, agent_name);
-        if std::fs::rename(&path, &claim).is_ok() {
-            out.extend(read_drain_file(&claim));
+        match std::fs::rename(&path, &claim) {
+            Ok(()) => out.extend(read_drain_file(&claim)),
+            Err(_) if path.exists() => {
+                // The queue is RIGHT THERE but we couldn't claim it. Stale
+                // leftovers (if any) were already consumed above and must be
+                // DELIVERED, not dropped — so this is Unavailable only when
+                // we'd otherwise return a false "empty".
+                if out.is_empty() {
+                    return DrainAttempt::Unavailable;
+                }
+            }
+            Err(_) => {} // queue vanished mid-claim — genuinely nothing left for us
         }
     }
     // `_drain_lock` drops here → OS lock released + FLOCK_DEPTH decremented.
-    out
+    DrainAttempt::Drained(out)
 }
 
 pub fn requeue_all(home: &Path, agent_name: &str, notifications: &[QueuedNotification]) {
     for notification in notifications {
         // #1513: preserve actionable + deferred_since_ms verbatim so the
         // MAX_DEFER cap keeps counting from the original defer.
-        let _ = append_queued(home, agent_name, notification);
+        // #2028: a swallowed append here is MESSAGE LOSS (the items were
+        // already claimed out of the queue) — surface it loudly; the next
+        // drain honestly reports the smaller queue either way.
+        if let Err(e) = append_queued(home, agent_name, notification) {
+            tracing::error!(
+                agent = agent_name,
+                error = %e,
+                text = %notification.text.chars().take(80).collect::<String>(),
+                "notification requeue FAILED — this queued message is LOST"
+            );
+        }
     }
 }
 
@@ -959,6 +1031,90 @@ mod tests {
             all.len(),
             ITEMS,
             "every enqueued line must be delivered exactly once"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    // ── #2028: false-empty under contention — single-shot caller honesty ──
+
+    /// Lock held by a peer → `Unavailable`, NEVER `Drained(empty)`. The
+    /// pre-#2028 collapse to an empty vec is what made `drain_one` report
+    /// "queue empty" under llvm-cov-grade load.
+    #[test]
+    fn try_drain_reports_unavailable_while_lock_held_2028() {
+        let home = tmp_home("unavail-lock");
+        enqueue(&home, "a", "queued").expect("enqueue");
+        let guard = crate::store::try_acquire_file_lock(&drain_lock_path(&home, "a"))
+            .expect("lock open")
+            .expect("lock acquired");
+        assert!(
+            matches!(
+                try_drain_with_stale_threshold(&home, "a", STALE_DRAINING_MS),
+                DrainAttempt::Unavailable
+            ),
+            "held lock must read as Unavailable, not empty"
+        );
+        drop(guard);
+        match try_drain_with_stale_threshold(&home, "a", STALE_DRAINING_MS) {
+            DrainAttempt::Drained(v) => {
+                assert_eq!(v.len(), 1, "after release the claim drains the queue")
+            }
+            DrainAttempt::Unavailable => panic!("lock released — must drain"),
+        }
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// Flusher contract UNCHANGED: `drain` (the next-tick-tolerant API)
+    /// still collapses contention to an empty vec — the holder delivers.
+    #[test]
+    fn flusher_drain_still_collapses_contention_to_empty_2028() {
+        let home = tmp_home("flusher-collapse");
+        enqueue(&home, "a", "queued").expect("enqueue");
+        let _guard = crate::store::try_acquire_file_lock(&drain_lock_path(&home, "a"))
+            .expect("lock open")
+            .expect("lock acquired");
+        assert!(
+            drain(&home, "a").is_empty(),
+            "flusher API keeps the walk-away-empty semantics"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// drain_one outlasts a SHORT contention window (the healthy-peer shape:
+    /// a live flusher holds the lock for the duration of a rename+read). The
+    /// hold here (15ms) is well inside drain_one's retry budget (5×10ms), so
+    /// margins are wide, not timing-fragile.
+    #[test]
+    fn drain_one_retries_through_short_contention_2028() {
+        let home = tmp_home("drain-one-retry");
+        enqueue(&home, "a", "the-item").expect("enqueue");
+        let guard = crate::store::try_acquire_file_lock(&drain_lock_path(&home, "a"))
+            .expect("lock open")
+            .expect("lock acquired");
+        let h = home.clone();
+        let worker = std::thread::spawn(move || drain_one(&h, "a"));
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        drop(guard);
+        let popped = worker.join().expect("join");
+        assert_eq!(
+            popped
+                .expect("must retry past the contention, not report empty")
+                .text,
+            "the-item"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// True-empty stays a fast None — the retry loop only engages on
+    /// Unavailable, an actually-empty queue answers immediately.
+    #[test]
+    fn drain_one_true_empty_is_immediate_none_2028() {
+        let home = tmp_home("drain-one-empty");
+        let start = std::time::Instant::now();
+        assert!(drain_one(&home, "a").is_none());
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(40),
+            "true empty must not burn the retry budget"
         );
         std::fs::remove_dir_all(home).ok();
     }
