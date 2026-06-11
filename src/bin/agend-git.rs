@@ -524,17 +524,19 @@ fn branch_tag_names_ref(subcmd: &str, args: &[String]) -> bool {
         )
         // CURRENT-branch mutators that need NO positional (the git-branch upstream /
         // description ops) — dash-prefixed, so the positional check below misses
-        // them. `--set-upstream-to=<up>` takes the `=` form; `-u <up>` /
-        // `--set-upstream-to <up>` take a following value (itself caught as a
-        // positional, but matched here so the no-value-yet form is covered too).
+        // them. `--set-upstream-to=<up>` takes the `=` form; `--set-upstream-to <up>`
+        // takes a following value (caught as a positional, but matched here so the
+        // no-value-yet form is covered too).
         || matches!(
             s,
-            "-u" | "--set-upstream-to"
-                | "--set-upstream"
-                | "--unset-upstream"
-                | "--edit-description"
+            "--set-upstream-to" | "--set-upstream" | "--unset-upstream" | "--edit-description"
         )
         || s.starts_with("--set-upstream-to=")
+        // `-u <up>` (separate, value caught as positional) AND the GLUED short form
+        // `-u<up>` (e.g. `-uorigin/main`, value attached in one dash-prefixed token —
+        // missed by both the exact `== "-u"` and the positional check). codex r2.
+        || s == "-u"
+        || (s.starts_with("-u") && s.len() > 2)
         // A positional ref name / pattern / flag value.
         || !s.starts_with('-')
     })
@@ -3224,6 +3226,12 @@ mod tests {
             "branch",
             &a(&["branch", "-u", "origin/main"])
         ));
+        // codex r2: the GLUED short form `-u<up>` (value attached, one token) —
+        // missed by both the exact `-u` match and the positional check.
+        assert!(branch_tag_names_ref(
+            "branch",
+            &a(&["branch", "-uorigin/main"])
+        ));
         assert!(branch_tag_names_ref(
             "branch",
             &a(&["branch", "--unset-upstream"])
@@ -3287,6 +3295,16 @@ mod tests {
                 ChdirPass("wt".into()),
                 "branch",
                 &a(&["branch", "--set-upstream-to=origin/main"]),
+                true
+            ),
+            Passthrough
+        );
+        // #2030 codex r2: the glued short form `-u<up>`, foreign → Passthrough
+        assert_eq!(
+            apply_foreign_repo_passthrough(
+                ChdirPass("wt".into()),
+                "branch",
+                &a(&["branch", "-uorigin/main"]),
                 true
             ),
             Passthrough
