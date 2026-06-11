@@ -8,7 +8,34 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
+/// #1990: on-disk schema version for `binding.json`. The file has always carried
+/// a bare `version` field (written by [`bind_full`]) but did NOT go through the
+/// `SchemaVersioned` trait, so it had no future-version guard — this const is
+/// that guard (see [`parse_binding_guarded`]). Additive field adds don't need a
+/// bump; only a non-additive change to an existing field does.
+const BINDING_SCHEMA_VERSION: u64 = 1;
+
 static INDEX: OnceLock<RwLock<HashMap<String, serde_json::Value>>> = OnceLock::new();
+
+/// #1990: parse a `binding.json` body, rejecting one a NEWER daemon wrote
+/// (`version` > [`BINDING_SCHEMA_VERSION`]). A future-version binding reads as
+/// `None` — i.e. treated as ABSENT, which every consumer (git shim push gate,
+/// lease checks) already fail-closes on (deny). This keeps an older daemon from
+/// acting on a binding shape it can't fully understand, and leaves the
+/// missing-signature fail-closed path unchanged.
+fn parse_binding_guarded(content: &str) -> Option<serde_json::Value> {
+    let v: serde_json::Value = serde_json::from_str(content).ok()?;
+    let found = v.get("version").and_then(|x| x.as_u64()).unwrap_or(0);
+    if found > BINDING_SCHEMA_VERSION {
+        tracing::warn!(
+            found,
+            supported = BINDING_SCHEMA_VERSION,
+            "binding.json written by a newer schema version — treating as absent (fail-closed)"
+        );
+        return None;
+    }
+    Some(v)
+}
 
 fn binding_index() -> &'static RwLock<HashMap<String, serde_json::Value>> {
     INDEX.get_or_init(|| RwLock::new(HashMap::new()))
@@ -101,7 +128,7 @@ pub fn bind_full(
     let wt_str = worktree.display().to_string();
     let src_str = source_repo.display().to_string();
     let mut binding = json!({
-        "version": 1,
+        "version": BINDING_SCHEMA_VERSION,
         "agent": agent,
         "task_id": task_id,
         "branch": branch,
@@ -256,13 +283,13 @@ pub fn read(home: &Path, agent: &str) -> Option<serde_json::Value> {
         }
         let v: serde_json::Value = std::fs::read_to_string(path)
             .ok()
-            .and_then(|c| serde_json::from_str(&c).ok())?;
+            .and_then(|c| parse_binding_guarded(&c))?;
         map.insert(key, v.clone());
         return Some(v);
     }
     std::fs::read_to_string(path)
         .ok()
-        .and_then(|c| serde_json::from_str(&c).ok())
+        .and_then(|c| parse_binding_guarded(&c))
 }
 
 /// Check if an agent is bound in a daemon-managed worktree.
@@ -536,6 +563,27 @@ mod tests {
         assert_eq!(binding["branch"], "feature-x");
         assert_eq!(binding["version"], 1);
         assert!(binding["issued_at"].as_str().is_some());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1990: a binding.json a NEWER daemon wrote (version > current) reads as
+    /// `None` — treated as ABSENT so every consumer (git shim push gate, lease
+    /// checks) fail-closes, rather than acting on a shape this binary may not
+    /// fully understand. The missing-signature fail-closed path is unchanged.
+    #[test]
+    fn future_version_binding_reads_as_absent() {
+        let home = tmp_home("future-binding");
+        let dir = crate::paths::runtime_dir(&home).join("ag");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("binding.json"),
+            r#"{"version":999,"agent":"ag","task_id":"T-1","branch":"main"}"#,
+        )
+        .unwrap();
+        assert!(
+            read(&home, "ag").is_none(),
+            "a future-version binding.json must read as absent (fail-closed)"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 

@@ -41,6 +41,24 @@ keeps serving the rest (degrade); the task-events store fail-closes on the
 whole file (deliberate — board integrity outranks availability, stricter
 than the tier floor). Either way: never a crash, never a silent drop.
 
+`runtime-config.json`, the decision log (`decisions/*.json`), and
+`binding.json` carry an explicit `schema_version` (#1990): an older file
+without it reads normally; a newer-than-supported file is fail-closed
+(runtime-config keeps the last-known-good per #1576; a decision is skipped on
+read and refused for update; a binding reads as absent, so the git-shim push
+gate denies).
+
+**Two tier (b) stores are unversioned free-form key-value bags** that cannot
+carry a `schema_version` without a breaking shape change: `topics.json` (the
+telegram topic registry — a bare `topic_id → instance` map) and
+`metadata/*.json` (per-instance operator metadata — an open KV bag). Their
+compatibility rule is narrower and explicit: **only new keys may be added;
+existing keys are never renamed, retyped, or repurposed.** Versioning them is
+deferred (#1990) until a non-additive change actually needs it — wrapping a
+bag in a versioned envelope is itself a breaking change, and both are low
+risk (topics self-heals via the boot orphan-sweep; metadata is
+operator-cosmetic).
+
 ## Tier (c) — regenerable / ephemeral (no commitment)
 
 Caches, lock files, PTY transcripts, logs, runtime sockets/PID files, and

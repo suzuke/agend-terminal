@@ -4,6 +4,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
 
+/// #1990: on-disk schema version for a decision record (per-file store, so this
+/// follows the per-record `task_progress` pattern — a module const + an explicit
+/// read guard — rather than the whole-file `SchemaVersioned` trait). Stamped on
+/// every write; a record with `schema_version > SCHEMA_VERSION` was written by a
+/// newer daemon and is fail-closed on read (skipped in listings, refused for
+/// update) rather than silently downgraded. Additive field adds (new fields with
+/// serde defaults) do NOT need a bump.
+const SCHEMA_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Decision {
     pub id: String,
@@ -18,6 +27,10 @@ pub struct Decision {
     pub archived: bool,
     pub supersedes: Option<String>,
     pub working_directory: Option<String>,
+    /// #1990: see [`SCHEMA_VERSION`]. `#[serde(default)]` → a pre-#1990 record
+    /// (no field) reads back as 0 (≤ current, loads normally).
+    #[serde(default)]
+    pub schema_version: u32,
 }
 
 pub(crate) fn decisions_dir(home: &Path) -> std::path::PathBuf {
@@ -56,6 +69,18 @@ fn load_all(home: &Path) -> Vec<Decision> {
             if entry.path().extension().and_then(|e| e.to_str()) == Some("json") {
                 if let Ok(content) = std::fs::read_to_string(entry.path()) {
                     if let Ok(d) = serde_json::from_str::<Decision>(&content) {
+                        // #1990: skip a record a newer daemon wrote — we cannot
+                        // be sure we understand all its fields, so don't surface
+                        // (or risk re-saving and downgrading) it.
+                        if d.schema_version > SCHEMA_VERSION {
+                            tracing::warn!(
+                                id = %d.id,
+                                found = d.schema_version,
+                                supported = SCHEMA_VERSION,
+                                "skipping decision written by a newer schema version"
+                            );
+                            continue;
+                        }
                         decisions.push(d);
                     }
                 }
@@ -149,8 +174,14 @@ pub fn post(home: &Path, author: &str, args: &Value) -> Value {
             let Ok(mut old) = serde_json::from_str::<Decision>(&content) else {
                 return;
             };
+            // #1990: don't archive (and thereby re-save/downgrade) a record a
+            // newer daemon wrote.
+            if old.schema_version > SCHEMA_VERSION {
+                return;
+            }
             old.archived = true;
             old.updated_at = now_c;
+            old.schema_version = SCHEMA_VERSION;
             // Write inline; save() re-acquires the same (non-reentrant)
             // flock and would deadlock.
             if let Err(e) = crate::store::save_atomic(&path, &old) {
@@ -176,6 +207,7 @@ pub fn post(home: &Path, author: &str, args: &Value) -> Value {
         archived: false,
         supersedes,
         working_directory: working_dir,
+        schema_version: SCHEMA_VERSION,
     };
 
     match save(home, &decision) {
@@ -233,6 +265,16 @@ pub fn update(home: &Path, caller: &str, args: &Value) -> Value {
                 return serde_json::json!({"error": format!("decision '{id}' corrupted: {e}")})
             }
         };
+        // #1990: refuse to mutate a record a newer daemon wrote — re-saving it
+        // here would downgrade it / drop fields we don't understand.
+        if decision.schema_version > SCHEMA_VERSION {
+            return serde_json::json!({
+                "error": format!(
+                    "decision '{id}' was written by a newer schema version ({} > {SCHEMA_VERSION}); update with a newer daemon",
+                    decision.schema_version
+                )
+            });
+        }
 
         // Cascade auth gate (Sprint 21 Phase 2 D1) — reject non-author
         // callers so prompt-injected agents cannot silently archive operator
@@ -262,6 +304,7 @@ pub fn update(home: &Path, caller: &str, args: &Value) -> Value {
             decision.archived = true;
         }
         decision.updated_at = chrono::Utc::now().to_rfc3339();
+        decision.schema_version = SCHEMA_VERSION;
 
         // Inline write — save() would try to re-acquire this same lock.
         match crate::store::save_atomic(&path, &decision) {
@@ -473,6 +516,7 @@ mod tests {
             archived: false,
             supersedes: None,
             working_directory: None,
+            schema_version: SCHEMA_VERSION,
         }
     }
 
@@ -573,6 +617,53 @@ mod tests {
 
         let listed = list(&home, &serde_json::json!({}));
         assert_eq!(listed["decisions"][0]["content"], "v2");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1990 additive: a pre-#1990 decision file (no `schema_version`) must still
+    /// load (the field defaults to 0 ≤ current).
+    #[test]
+    fn old_decision_without_schema_version_is_listed() {
+        let home = tmp_home("dec_oldver");
+        let dir = decisions_dir(&home);
+        std::fs::create_dir_all(&dir).ok();
+        std::fs::write(
+            dir.join("d-old.json"),
+            r#"{"id":"d-old","title":"T","content":"c","scope":"fleet","author":"a","tags":[],"ttl_days":null,"created_at":"2026-04-27T00:00:00Z","updated_at":"2026-04-27T00:00:00Z","archived":false,"supersedes":null,"working_directory":null}"#,
+        )
+        .expect("write old fixture");
+        assert!(
+            list_all(&home).iter().any(|d| d.id == "d-old"),
+            "a pre-#1990 decision (no schema_version) must still load"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1990 fail-closed: a decision a newer daemon wrote (schema_version > current)
+    /// is skipped on read and refused for update — never silently downgraded.
+    #[test]
+    fn future_schema_version_decision_skipped_and_update_refused() {
+        let home = tmp_home("dec_futurever");
+        let dir = decisions_dir(&home);
+        std::fs::create_dir_all(&dir).ok();
+        std::fs::write(
+            dir.join("d-future.json"),
+            r#"{"id":"d-future","title":"T","content":"c","scope":"fleet","author":"a","tags":[],"ttl_days":null,"created_at":"2026-04-27T00:00:00Z","updated_at":"2026-04-27T00:00:00Z","archived":false,"supersedes":null,"working_directory":null,"schema_version":999}"#,
+        )
+        .expect("write future fixture");
+        assert!(
+            list_all(&home).iter().all(|d| d.id != "d-future"),
+            "a future-schema decision must be skipped, not listed"
+        );
+        let resp = update(
+            &home,
+            "a",
+            &serde_json::json!({"id":"d-future","content":"x"}),
+        );
+        assert!(
+            resp.get("error").is_some(),
+            "updating a future-schema decision must be refused: {resp}"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }
