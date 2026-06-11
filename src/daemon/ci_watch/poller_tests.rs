@@ -1183,6 +1183,69 @@ fn mock_success_run_updates_watch_state() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// #2008 (codex review): poller-LEVEL regression — proves the real wiring
+/// (correlation-key construction `repo@branch`, the poll gate, provider PR data)
+/// that the direct `resolve_head_advanced` unit tests can't. A pending ci-handoff
+/// track recorded at an OLD head is invalidated when a REAL poll observes the
+/// branch head has advanced.
+#[test]
+fn poll_with_advanced_head_resolves_stale_handoff_track() {
+    let dir = tmp_dir("poll-head-advance");
+    // A pending handoff track for o/r@feat, anchored to an OLD head.
+    crate::daemon::ci_handoff_track::record(
+        &dir,
+        "reviewer",
+        "o/r@feat",
+        "2026-06-10T00:00:00Z",
+        Some("OLDHEAD"),
+    );
+    assert_eq!(crate::daemon::ci_handoff_track::list(&dir).len(), 1);
+    // A real poll observes the branch head has advanced to NEWHEAD.
+    let provider = MockCiProvider::with_runs(vec![CiRun {
+        run_attempt: 1,
+        id: 100,
+        conclusion: Some("success".into()),
+        head_sha: "NEWHEAD".into(),
+        url: "https://example.com/100".into(),
+        name: String::new(),
+    }]);
+    run_ci_check(&dir, &base_watch(), &provider).unwrap();
+    assert!(
+        crate::daemon::ci_handoff_track::list(&dir).is_empty(),
+        "a poll observing an advanced head must resolve the stale ci-handoff track (real wiring)"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// #2008 (codex review): the negative through the real poll path — an UNCHANGED
+/// head must KEEP the live track (the obligation is still owed).
+#[test]
+fn poll_with_unchanged_head_keeps_handoff_track() {
+    let dir = tmp_dir("poll-head-same");
+    crate::daemon::ci_handoff_track::record(
+        &dir,
+        "reviewer",
+        "o/r@feat",
+        "2026-06-10T00:00:00Z",
+        Some("abc"),
+    );
+    let provider = MockCiProvider::with_runs(vec![CiRun {
+        run_attempt: 1,
+        id: 100,
+        conclusion: Some("success".into()),
+        head_sha: "abc".into(),
+        url: "https://example.com/100".into(),
+        name: String::new(),
+    }]);
+    run_ci_check(&dir, &base_watch(), &provider).unwrap();
+    assert_eq!(
+        crate::daemon::ci_handoff_track::list(&dir).len(),
+        1,
+        "an unchanged head must keep the live track (real poll path)"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Issue #745 regression guard: when an older run's SHA no longer
 /// matches the branch head (a newer commit has been pushed since the
 /// run was triggered), the notification must be dropped — but the

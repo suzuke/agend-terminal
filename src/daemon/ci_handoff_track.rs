@@ -319,6 +319,13 @@ pub(crate) fn resolve_claimed(home: &Path, agent: &str, branch: &str) -> usize {
 /// preserved (no mis-kill on upgrade). This ADDS a resolve condition; it
 /// introduces no new re-send path. Returns how many were resolved. Called from
 /// the ci-watch poll, which already holds the current head.
+///
+/// KNOWN LIMITATION (codex #2013 review): this is driven from the ci-watch poll,
+/// so a branch whose watch is not being polled gets no head-advanced cleanup —
+/// notably a watch the poller skips (e.g. no subscribers and no `next_after_ci`).
+/// Such a stale track falls back to the OTHER resolve exits (report arrival /
+/// branch claim / PR-terminal) and the 24h backstop. The head-advanced path is an
+/// optimization for the common (actively-polled) case, not the sole guarantee.
 pub(crate) fn resolve_head_advanced(home: &Path, correlation: &str, current_head: &str) -> usize {
     let mut resolved = 0;
     for (path, track) in list(home) {
