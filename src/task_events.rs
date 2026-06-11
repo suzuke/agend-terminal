@@ -1305,6 +1305,14 @@ static REPLAY_FAILCLOSED_EVENT_EMITTED: std::sync::atomic::AtomicBool =
 /// per-tick callers can't spam). Observation only: the fail-closed `Err` still
 /// propagates unchanged, so no recovery semantics change (same discipline as
 /// #1972). A transient IO error (not the "fail-closed" class) is left alone.
+///
+/// Classification is by the `"fail-closed"` substring of the error — a contract
+/// pinned at `read_envelopes_strict`'s two `bail!` sites; keep them in lockstep.
+/// Known limitation (#1990 item 4, reviewer-2 minor 2): only failures that flow
+/// through [`replay`] are surfaced; the timeline queries `envelopes_for_task` /
+/// `stream_envelopes` fail-close without surfacing. The board-freeze alert here
+/// is the primary operator signal, so that narrower timeline-query gap is
+/// accepted rather than expanding scope.
 fn surface_failclosed_replay_once(home: &Path, err: &anyhow::Error) {
     let msg = err.to_string();
     if !msg.contains("fail-closed") {
@@ -1484,6 +1492,13 @@ fn read_envelopes_strict(path: &Path, out: &mut Vec<TaskEventEnvelope>) -> anyho
         }
         // #1988: distinguish three failure shapes by their *cause* — only the
         // first is skippable; the other two stay deliberately fail-closed.
+        //
+        // #1990 item 4 CONTRACT: both fail-closed `bail!` messages below MUST
+        // contain the substring "fail-closed". `surface_failclosed_replay_once`
+        // classifies a replay error as the operator-surfaceable forward-incompat
+        // class by exactly that substring (so a frozen board raises an alert,
+        // while a transient IO error does not). Reword these messages only in
+        // lockstep with that classifier, or the board-freeze alert goes silent.
         //
         // (1) CORRUPT line — not even valid JSON: a torn/half-written tail from a
         //     crash mid-append (`append_lines_under_lock` appends in place), or a
@@ -2042,6 +2057,27 @@ mod tests {
             elog.matches("task_replay_fail_closed").count(),
             1,
             "fail-closed replay must surface exactly one operator event per boot, got: {elog}"
+        );
+        fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1990 item 4 (reviewer-2 minor 1): the boundary that keeps disk jitter from
+    /// becoming a false alarm — a transient IO-class replay error (no "fail-closed"
+    /// substring) must NOT surface an operator event. Guards the substring
+    /// classifier against over-firing.
+    #[test]
+    #[serial(task_replay_latch)]
+    fn transient_io_error_does_not_surface_operator_event() {
+        let home = tmp_home("io-no-surface");
+        REPLAY_FAILCLOSED_EVENT_EMITTED.store(false, std::sync::atomic::Ordering::Relaxed);
+        // A bare IO-class error (what a vanished/locked file yields) — not the
+        // forward-compat "fail-closed" class.
+        let io_err = anyhow::anyhow!("No such file or directory (os error 2)");
+        surface_failclosed_replay_once(&home, &io_err);
+        let elog = fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
+        assert!(
+            !elog.contains("task_replay_fail_closed"),
+            "a transient IO error must NOT surface an operator event (false-alarm guard): {elog}"
         );
         fs::remove_dir_all(&home).ok();
     }
