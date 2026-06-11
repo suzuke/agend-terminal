@@ -3059,3 +3059,18 @@ fn drain_marks_read_and_preserves_order_after_lock_shrink() {
     assert!(second.is_empty(), "second drain must return empty");
     fs::remove_dir_all(&home).ok();
 }
+
+#[test]
+fn test_custom_disk_threshold_env() {
+    // Check that get_low_disk_threshold_bytes reads from env
+    let default_val = 1024 * 1024 * 1024; // 1 GiB
+
+    std::env::set_var("AGEND_LOW_DISK_THRESHOLD", "536870912"); // 500 MiB
+    assert_eq!(super::disk::get_low_disk_threshold_bytes(), 536870912);
+
+    std::env::set_var("AGEND_LOW_DISK_THRESHOLD", "invalid");
+    assert_eq!(super::disk::get_low_disk_threshold_bytes(), default_val);
+
+    std::env::remove_var("AGEND_LOW_DISK_THRESHOLD");
+    assert_eq!(super::disk::get_low_disk_threshold_bytes(), default_val); // default
+}
