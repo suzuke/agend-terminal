@@ -609,6 +609,11 @@ pub(crate) fn build_default_handlers(
         // this handler's tick (lock-free during the read), NOT in the PTY
         // feed path. Runs in app mode (the live daemon is app-mode).
         Box::new(per_tick::ContextAlertHandler::new(6)),
+        // #2007 context-full safety net: every 6 ticks (~1min) — 85% one-shot
+        // [AGEND-AUTO kind=context-handoff] injection to the agent itself,
+        // 92% one-shot operator escalation. Noise-budgeted (per-episode
+        // latch + hysteresis re-arm). Runs in app mode (live daemon).
+        Box::new(per_tick::ContextHandoffHandler::new(6)),
     ]
 }
 
