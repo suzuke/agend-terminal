@@ -35,8 +35,11 @@ task-board entries and events, decision log, and the sidecar stores
 either carry an explicit `schema_version` field or evolve additive-only
 under the same rule as tier (a). Hand-editing these is unsupported; an
 upgraded daemon must read state written by any prior release of the same
-major version, and unknown *newer* records degrade to a logged warning,
-never a crash or silent drop.
+major version. How a store treats *newer*-than-supported records is
+per-store (#1992): the inbox skips the unknown record with a warning and
+keeps serving the rest (degrade); the task-events store fail-closes on the
+whole file (deliberate — board integrity outranks availability, stricter
+than the tier floor). Either way: never a crash, never a silent drop.
 
 ## Tier (c) — regenerable / ephemeral (no commitment)
 
