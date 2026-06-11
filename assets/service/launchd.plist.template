@@ -37,6 +37,8 @@ Placeholders (substituted at install time by service::install):
              ambient XPC_SERVICE_NAME false-positive). -->
         <key>AGEND_SUPERVISED</key>
         <string>1</string>
+        <key>PATH</key>
+        <string>__PATH__</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>

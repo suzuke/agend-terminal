@@ -35,11 +35,13 @@ pub(super) fn install(home: &Path, exe: &Path) -> Result<PathBuf, String> {
     // Paths without special chars round-trip unchanged.
     let exe_quoted = systemd_quote(&exe.display().to_string());
     let home_quoted = systemd_quote(&home.display().to_string());
+    let path_quoted = systemd_quote(&std::env::var("PATH").unwrap_or_default());
     let resolved = apply_substitutions(
         SYSTEMD_TEMPLATE,
         &[
             ("__EXECUTABLE__", exe_quoted.as_str()),
             ("__HOME__", home_quoted.as_str()),
+            ("__PATH__", path_quoted.as_str()),
         ],
     );
     if let Some(parent) = unit.parent() {

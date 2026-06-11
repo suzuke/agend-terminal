@@ -38,12 +38,14 @@ pub(super) fn install(home: &Path, exe: &Path) -> Result<PathBuf, String> {
     let exe_escaped = xml_escape(&exe.display().to_string());
     let home_escaped = xml_escape(&home.display().to_string());
     let label_escaped = xml_escape(SERVICE_LABEL);
+    let path_escaped = xml_escape(&std::env::var("PATH").unwrap_or_default());
     let resolved = apply_substitutions(
         LAUNCHD_TEMPLATE,
         &[
             ("__LABEL__", label_escaped.as_str()),
             ("__EXECUTABLE__", exe_escaped.as_str()),
             ("__HOME__", home_escaped.as_str()),
+            ("__PATH__", path_escaped.as_str()),
         ],
     );
     if let Some(parent) = plist.parent() {
