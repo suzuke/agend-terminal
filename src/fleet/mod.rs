@@ -88,8 +88,23 @@ pub fn team_orchestrator_for(home: &Path, member: &str) -> Option<String> {
         })
 }
 
+/// #1989: the fleet.yaml schema version this daemon reads and writes. Bump
+/// ONLY on a breaking (non-additive) change — additive optional fields with
+/// serde defaults do NOT bump it (`docs/COMPATIBILITY.md`).
+pub const FLEET_SCHEMA_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FleetConfig {
+    /// #1989: fleet.yaml schema version. Omitted = version 1 (every
+    /// pre-#1989 file). `Option` (not `u32` + serde default fn) so the
+    /// derived `Default` and the serde default can't disagree — both land
+    /// on `None`, resolved to 1 by [`FleetConfig::effective_schema_version`].
+    /// A version newer than [`FLEET_SCHEMA_VERSION`] WARNs at load (fields
+    /// this daemon doesn't know are silently dropped by serde) instead of
+    /// refusing — a refuse would brick the daemon on a hand-edit typo.
+    /// Compatibility policy: `docs/COMPATIBILITY.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<u32>,
     #[serde(default)]
     pub defaults: InstanceDefaults,
     #[serde(default)]
@@ -442,11 +457,26 @@ impl FleetConfig {
         Ok(config)
     }
 
+    /// #1989: resolved schema version — an omitted `schema_version:` means 1.
+    pub fn effective_schema_version(&self) -> u32 {
+        self.schema_version.unwrap_or(1)
+    }
+
     fn load_uncached(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read fleet config: {}", path.display()))?;
         let mut config: FleetConfig = serde_yaml_ng::from_str(&content)
             .with_context(|| format!("Failed to parse fleet config: {}", path.display()))?;
+        if config.effective_schema_version() > FLEET_SCHEMA_VERSION {
+            tracing::warn!(
+                file_version = config.effective_schema_version(),
+                supported = FLEET_SCHEMA_VERSION,
+                path = %path.display(),
+                "fleet.yaml schema_version is newer than this daemon supports — \
+                 unknown fields are silently ignored and the config may be \
+                 misread; upgrade the daemon (docs/COMPATIBILITY.md)"
+            );
+        }
         config.normalize();
         config.home = path.parent().map(|p| p.to_path_buf());
         // Sprint 46 P1: backfill instance IDs + reserved-name warnings
@@ -721,6 +751,65 @@ mod tests {
         let path = dir.join("fleet.yaml");
         fs::write(&path, yaml).expect("write fleet.yaml");
         path
+    }
+
+    // #1989: schema_version regression pins — omitted field must stay
+    // version-1 (every pre-#1989 fleet.yaml), explicit + newer-than-supported
+    // values must parse (warn-not-refuse), and the derived Default must agree
+    // with the serde default (both None -> effective 1).
+    #[test]
+    fn schema_version_omitted_resolves_to_one() {
+        let config: FleetConfig = serde_yaml_ng::from_str("instances: {}").expect("parse");
+        assert_eq!(config.schema_version, None);
+        assert_eq!(config.effective_schema_version(), 1);
+    }
+
+    #[test]
+    fn schema_version_explicit_parses() {
+        let config: FleetConfig = serde_yaml_ng::from_str(
+            "schema_version: 1
+instances: {}",
+        )
+        .expect("parse");
+        assert_eq!(config.effective_schema_version(), 1);
+    }
+
+    #[test]
+    fn schema_version_newer_than_supported_still_loads() {
+        // Forward-compat contract: a v2 file on a v1 daemon WARNs but loads —
+        // refusing would brick the whole daemon on a hand-edit typo.
+        let dir = std::env::temp_dir().join(format!(
+            "agend-fleet-schema-ver-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let path = write_fleet(
+            &dir,
+            "schema_version: 99\ndefaults:\n  backend: claude\ninstances: {}\n",
+        );
+        let config = FleetConfig::load(&path).expect("v99 file must still load");
+        assert_eq!(config.effective_schema_version(), 99);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn schema_version_default_derive_matches_serde_default() {
+        // Two-defaults-disagree trap: derived Default must resolve to the
+        // same effective version as an omitted field in YAML.
+        assert_eq!(FleetConfig::default().effective_schema_version(), 1);
+        assert_eq!(FLEET_SCHEMA_VERSION, 1);
+    }
+
+    #[test]
+    fn schema_version_none_round_trips_without_emitting_field() {
+        // skip_serializing_if: re-serializing a pre-#1989 config must not
+        // inject `schema_version:` into the user's file.
+        let config: FleetConfig = serde_yaml_ng::from_str("instances: {}").expect("parse");
+        let out = serde_yaml_ng::to_string(&config).expect("serialize");
+        assert!(
+            !out.contains("schema_version"),
+            "None must not serialize: {out}"
+        );
     }
 
     #[test]
