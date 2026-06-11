@@ -36,7 +36,7 @@ gate ──► build (5 targets) ──┐
 1. **gate** — fails the release before any artifact is built when:
    - `Cargo.toml version` ≠ tag (strip the `v`),
    - `CHANGELOG.md` has no `## [X.Y.Z]` section,
-   - the crate no longer compiles on the declared MSRV (`rust-version = "1.87"`).
+   - the crate no longer compiles on the declared MSRV (`rust-version = "1.88"`).
    - `cargo-semver-checks` also runs here but is **soft-fail while pre-1.0**:
      it prints a breaking-change report for human judgment without blocking.
      Promote it to hard-fail when 1.0 ships.
@@ -97,6 +97,6 @@ release through the normal flow — never reuse or move a published tag.
 ## MSRV bumps
 
 `rust-version` in `Cargo.toml` is the source of truth; the gate's
-`cargo +1.87 check` pin must be updated in the same PR that bumps it
-(grep release.yml for `1.87`). Treat an MSRV bump as a minor-version event
+`cargo +1.88 check` pin must be updated in the same PR that bumps it
+(grep release.yml for `1.88`). Treat an MSRV bump as a minor-version event
 and call it out in the changelog.

@@ -55,19 +55,19 @@ jobs:
           fi
           echo "changelog ok: [${BASE}]"
 
-      # MSRV — Cargo.toml declares rust-version 1.87; the gate proves it
+      # MSRV — Cargo.toml declares rust-version 1.88; the gate proves it
       # still compiles there (a dep bump silently raising MSRV fails HERE,
       # not on a user's machine). Default features only: `tray` needs GTK
       # dev libs and is exercised by the build matrix, not the gate.
-      - name: Install MSRV toolchain (1.87)
+      - name: Install MSRV toolchain (1.88)
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.87"
+          toolchain: "1.88"
       - uses: Swatinem/rust-cache@v2
         with:
-          key: gate-msrv-1.87
-      - name: MSRV check (1.87)
-        run: cargo +1.87 check --locked
+          key: gate-msrv-1.88
+      - name: MSRV check (1.88)
+        run: cargo +1.88 check --locked
 
       # SemVer report — SOFT-FAIL pre-1.0 (prints the report for the human
       # release decision; 0.x bump rules are understood by the tool). Promote

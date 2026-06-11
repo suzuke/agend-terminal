@@ -5,6 +5,10 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 ## [Unreleased]
 
+### Changed
+
+- **MSRV: declared `rust-version` corrected to 1.88 (#1994)** — the previous declaration (1.87) was false: the locked dependency set required up to rustc 1.95 (`sysinfo 0.39.3`), so `cargo install agend-terminal --locked` broke for anyone on 1.87–1.94 who trusted it. `sysinfo` is pinned to `0.38` (MSRV 1.88, no code changes — caught by the #1987 release gate on its first run, which now enforces the floor). Builders need rustc ≥ 1.88.
+
 ### Added
 
 - **Release pipeline hardening** — `release.yml` gains a pre-release `gate` job (version==tag, changelog section present, MSRV 1.87 `cargo check`, `cargo-semver-checks` soft-fail report vs the previous tag) that all artifact jobs depend on, and a `publish` job that auto-publishes to crates.io after the GitHub Release succeeds (`--dry-run` first; skips gracefully when the `CRATES_IO_TOKEN` secret is unset; never runs for `-rc.N` pre-release tags). Release procedure is documented in `docs/RELEASING.md`.
