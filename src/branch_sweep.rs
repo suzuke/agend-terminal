@@ -405,6 +405,19 @@ pub(crate) fn emit_delete_batch(
     confirm_ids: &std::collections::HashSet<String>,
     audit_reason: &str,
 ) -> Result<usize, String> {
+    // #2011: prune orphaned worktree REGISTRATIONS first, in the same
+    // transaction as the branch deletions. A worktree whose physical
+    // directory is gone (crashed release, manual rm, pre-prune-era leak)
+    // keeps its branch "checked out" in git's eyes → `branch -D` refuses →
+    // branches pile up forever (live: 14 stale branches behind 9 prunable
+    // registrations, 2026-06-11). Prune is idempotent and cheap; doing it
+    // HERE — rather than only at each deletion site — closes the gap
+    // regardless of which path leaked the registration (chokepoint
+    // principle). Best-effort: a prune failure just leaves the per-branch
+    // refusal behavior unchanged (logged below as before).
+    if let Err(e) = crate::git_helpers::git_bypass(repo, &["worktree", "prune"]) {
+        tracing::warn!(error = %e, "#2011: git worktree prune before branch sweep failed (non-fatal)");
+    }
     let mut name_to_candidate: std::collections::HashMap<&str, &Candidate> =
         std::collections::HashMap::new();
     for cand in categories
@@ -737,6 +750,58 @@ mod tests {
     }
 
     // ── #817 apply-path tests ──
+
+    /// #2011 regression: a branch checked out in a worktree whose physical
+    /// directory is GONE (crashed release / manual rm / pre-prune-era leak)
+    /// must still be deletable by the sweep — git counts it "checked out"
+    /// until the registration is pruned, and 14 such branches piled up live
+    /// on 2026-06-11. emit_delete_batch now prunes orphaned registrations in
+    /// the same transaction (delete dir → registration goes → branch
+    /// deletable). Pre-#2011 this test fails: `branch -D` refuses with
+    /// "checked out at".
+    #[test]
+    fn test_orphaned_worktree_registration_does_not_block_delete_2011() {
+        let repo = setup_repo("orphan_wt_reg");
+        let home = repo.parent().unwrap().to_path_buf();
+        create_branch_with_commit(&repo, "feat-orphan", "feat: orphan");
+        git_run(
+            &repo,
+            &["merge", "--no-ff", "-m", "merge feat-orphan", "feat-orphan"],
+        );
+        // Check the branch out in a worktree, then vaporize ONLY the
+        // physical directory — the registration survives (the leak shape).
+        let wt_dir = repo.parent().unwrap().join("orphan-wt-dir");
+        std::fs::remove_dir_all(&wt_dir).ok(); // stale residue from a prior run
+        let wt_str = wt_dir.display().to_string();
+        let out = git_run(&repo, &["worktree", "add", &wt_str, "feat-orphan"]);
+        assert!(
+            out.status.success(),
+            "worktree add must succeed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::fs::remove_dir_all(&wt_dir).expect("rm worktree dir");
+        // Precondition pin: the registration is still there (prunable).
+        let list = git_run(&repo, &["worktree", "list", "--porcelain"]);
+        assert!(
+            String::from_utf8_lossy(&list.stdout).contains("orphan-wt-dir"),
+            "leak shape precondition: registration must survive the rm"
+        );
+
+        let now = chrono::Utc::now();
+        let cats = scan(&repo, "main", STALE_IDLE_DEFAULT_DAYS, now).expect("scan");
+        let mut confirm = std::collections::HashSet::new();
+        confirm.insert("feat-orphan".to_string());
+        let applied = emit_delete_batch(&home, &repo, &cats, &confirm, "#2011 test").expect("emit");
+        assert_eq!(
+            applied, 1,
+            "orphaned registration must not block the branch delete"
+        );
+        let post = enumerate_branches(&repo).expect("enumerate");
+        assert!(
+            !post.iter().any(|b| b.name == "feat-orphan"),
+            "feat-orphan must be deleted after the in-transaction prune"
+        );
+    }
 
     #[test]
     fn test_branch_sweep_apply_deletes_confirmed_subset() {
