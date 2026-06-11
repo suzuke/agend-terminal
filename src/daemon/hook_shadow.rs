@@ -68,15 +68,68 @@ pub enum HookResolution {
 /// only when a state-mapped event arrived within [`HOOK_FRESHNESS`]; stale or
 /// unmapped observations resolve `Stale` (fall back to heuristic) — a
 /// boot-time `Starting` is never carried as the current state hours later.
-#[allow(dead_code)] // deferred consumer: the production promotion layer (shadow gate first)
+///
+/// #1523 (decision d-20260611051442661249-0): `ToolUse` is the ONE EXCEPTION —
+/// it is EVENT-PAIR-closed, not freshness-bounded. `PreToolUse` opens the tool;
+/// only the NEXT hook event (`PostToolUse`→Thinking / `Stop`→Idle) closes it, by
+/// OVERWRITING this snapshot. So while the snapshot still reads `ToolUse`, the
+/// tool is genuinely still running — a long (>HOOK_FRESHNESS) tool must NOT be
+/// demoted back to the screen heuristic, which is exactly the #1985 nudge class
+/// the promotion exists to fix. A crashed-mid-tool agent (no closing event ever)
+/// is reaped by the liveness watchdog independently, so leaving `ToolUse` open is
+/// safe; the bound is the event, not the clock.
 pub fn resolved_state_for(name: &str) -> HookResolution {
+    use crate::state::AgentState;
     let Some(snap) = snapshot_for(name) else {
         return HookResolution::Unknown;
     };
     let age_ms = now_ms().saturating_sub(snap.at_ms);
     match snap.derived_state {
+        // ToolUse: valid until the PostToolUse/Stop event overwrites it (above).
+        Some(AgentState::ToolUse) => HookResolution::Fresh(AgentState::ToolUse),
         Some(state) if age_ms <= HOOK_FRESHNESS.as_millis() as u64 => HookResolution::Fresh(state),
         _ => HookResolution::Stale,
+    }
+}
+
+/// #1523: is the hook→authoritative promotion enabled? Gated on the same flag
+/// that injects the hooks, so promotion can never read hooks that aren't wired.
+fn promotion_enabled() -> bool {
+    std::env::var("AGEND_HOOK_STATE_POC").as_deref() == Ok("1")
+}
+
+/// #1523 PROMOTION: the authoritative `AgentState` for the daemon's snapshot.
+///
+/// When the flag is on AND `backend_command` is a STRONG (hook-instrumented)
+/// backend, a `Fresh` hook resolution WINS over the screen `heuristic`;
+/// `Stale`/`Unknown` (or flag-off / a non-hook backend) fall back to `heuristic`
+/// — **byte-identical** to pre-promotion. Hooks ENHANCE; the heuristic remains
+/// the complete fallback path, so a backend without hooks (or a stale window) is
+/// never worse off than before. This is the single chokepoint
+/// (`per_tick::snapshot`) so every downstream consumer (`agent_state_of`,
+/// watchdogs, pane badge) inherits the authoritative state from one place.
+pub fn authoritative_state(
+    backend_command: &str,
+    name: &str,
+    heuristic: crate::state::AgentState,
+) -> crate::state::AgentState {
+    authoritative_state_inner(promotion_enabled(), backend_command, name, heuristic)
+}
+
+/// Promotion core, split out so tests exercise the flag/backend/freshness logic
+/// without mutating the process-global `AGEND_HOOK_STATE_POC` env var.
+fn authoritative_state_inner(
+    enabled: bool,
+    backend_command: &str,
+    name: &str,
+    heuristic: crate::state::AgentState,
+) -> crate::state::AgentState {
+    if !enabled || !crate::backend::Backend::parse_str(backend_command).has_state_hooks() {
+        return heuristic;
+    }
+    match resolved_state_for(name) {
+        HookResolution::Fresh(state) => state,
+        HookResolution::Stale | HookResolution::Unknown => heuristic,
     }
 }
 
@@ -211,6 +264,85 @@ mod tests {
         assert_eq!(
             resolved_state_for("never-recorded-agent"),
             HookResolution::Unknown
+        );
+    }
+
+    // ── #1523 promotion §3.9 ────────────────────────────────────────────
+
+    /// ToolUse is EVENT-PAIR-closed: a long tool (PreToolUse, then no event past
+    /// HOOK_FRESHNESS) stays Fresh(ToolUse) — NOT demoted to the heuristic (the
+    /// #1985 nudge class). Only PostToolUse/Stop closes it (by overwriting).
+    #[test]
+    fn long_tool_stays_tooluse_past_freshness() {
+        record_event("longtool", "PreToolUse", None);
+        backdate_for_test("longtool", HOOK_FRESHNESS.as_millis() as u64 + 600_000); // +10min past window
+        assert_eq!(
+            resolved_state_for("longtool"),
+            HookResolution::Fresh(AgentState::ToolUse),
+            "a long tool stays ToolUse until PostToolUse/Stop — never freshness-stale"
+        );
+        assert_eq!(
+            authoritative_state_inner(true, "claude", "longtool", AgentState::Idle),
+            AgentState::ToolUse,
+            "the still-open tool wins over a (wrong) heuristic"
+        );
+        // PostToolUse closes the pair (→ Thinking; freshness applies again).
+        record_event("longtool", "PostToolUse", None);
+        assert_eq!(
+            resolved_state_for("longtool"),
+            HookResolution::Fresh(AgentState::Thinking)
+        );
+    }
+
+    /// §3.9: flag OFF → byte-identical to the heuristic, even with a fresh hook.
+    #[test]
+    fn flag_off_is_byte_identical_to_heuristic() {
+        record_event("flagoff", "UserPromptSubmit", None); // → Thinking, fresh
+        assert_eq!(
+            authoritative_state_inner(false, "claude", "flagoff", AgentState::Idle),
+            AgentState::Idle,
+            "flag off must return the heuristic verbatim"
+        );
+    }
+
+    /// §3.9: flag ON + STRONG backend + Fresh hook → the hook state is authoritative.
+    #[test]
+    fn claude_fresh_hook_wins_over_heuristic() {
+        record_event("claude-fresh", "UserPromptSubmit", None); // → Thinking, fresh
+        assert_eq!(
+            authoritative_state_inner(true, "claude", "claude-fresh", AgentState::Idle),
+            AgentState::Thinking,
+            "a fresh hook state wins over the heuristic"
+        );
+    }
+
+    /// §3.9: flag ON + STRONG backend but STALE hook → fall back to the heuristic.
+    #[test]
+    fn stale_hook_falls_back_to_heuristic() {
+        record_event("claude-stale", "SessionStart", None); // → Starting
+        backdate_for_test("claude-stale", HOOK_FRESHNESS.as_millis() as u64 + 1_000);
+        assert_eq!(
+            authoritative_state_inner(true, "claude", "claude-stale", AgentState::Idle),
+            AgentState::Idle,
+            "a stale hook state falls back to the heuristic (the floor)"
+        );
+    }
+
+    /// §3.9: a non-STRONG backend (no hooks fire) always uses the heuristic; agy
+    /// IS strong.
+    #[test]
+    fn backend_strength_gates_promotion() {
+        record_event("codex-agent", "UserPromptSubmit", None); // → Thinking, fresh
+        assert_eq!(
+            authoritative_state_inner(true, "codex", "codex-agent", AgentState::Idle),
+            AgentState::Idle,
+            "codex is not a hook backend — heuristic only"
+        );
+        record_event("agy-agent", "UserPromptSubmit", None);
+        assert_eq!(
+            authoritative_state_inner(true, "agy", "agy-agent", AgentState::Idle),
+            AgentState::Thinking,
+            "agy is a STRONG backend — its fresh hook wins"
         );
     }
 

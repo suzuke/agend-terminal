@@ -52,6 +52,16 @@ impl Backend {
         }
     }
 
+    /// #1523: STRONG backends — those whose lifecycle hooks `mcp_config` injects
+    /// and that therefore emit authoritative `hook_shadow` state events. Only
+    /// these have hook data to PROMOTE over the screen heuristic; every other
+    /// backend always uses the heuristic (no hooks fire, so `resolved_state_for`
+    /// stays `Unknown` → heuristic fallback). claude + agy (claude-family
+    /// settings consumers).
+    pub fn has_state_hooks(&self) -> bool {
+        matches!(self, Backend::ClaudeCode | Backend::Agy)
+    }
+
     /// #1440: credential env-var names this backend legitimately needs to
     /// authenticate to its LLM provider. Under `AGEND_ENV_ISOLATION`, only
     /// these (plus the base runtime allowlist + operator `passthrough_env`)

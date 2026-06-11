@@ -39,8 +39,19 @@ impl PerTickHandler for SnapshotRotationHandler {
             .map(|handle| {
                 let (agent_state, health_state, silent_secs, output_silent_secs) = {
                     let c = handle.core.lock();
+                    // #1523: hook→authoritative promotion. For a STRONG backend
+                    // with a Fresh hook resolution this returns the hook state;
+                    // otherwise (flag off / non-hook backend / stale window) it
+                    // returns the screen heuristic unchanged — byte-identical.
+                    // Single chokepoint: every downstream agent_state consumer
+                    // reads this snapshot.
+                    let agent_state = crate::daemon::hook_shadow::authoritative_state(
+                        &handle.backend_command,
+                        &handle.name,
+                        c.state.get_state(),
+                    );
                     (
-                        c.state.get_state().display_name().to_string(),
+                        agent_state.display_name().to_string(),
                         c.health.state.display_name().to_string(),
                         // #1694②: productive-silence for the dispatch-idle
                         // silence-clock (marker/heartbeat-gated, spinner-resistant).
