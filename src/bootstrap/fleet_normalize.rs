@@ -123,6 +123,7 @@ mod tests {
 
     fn minimal_with_channel() -> FleetConfig {
         let mut c = FleetConfig {
+            schema_version: None,
             defaults: crate::fleet::InstanceDefaults {
                 backend: Some(Backend::ClaudeCode),
                 ..Default::default()
