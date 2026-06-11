@@ -39,8 +39,22 @@ impl PerTickHandler for SnapshotRotationHandler {
             .map(|handle| {
                 let (agent_state, health_state, silent_secs, output_silent_secs) = {
                     let c = handle.core.lock();
+                    // #1523: hook→authoritative promotion (phased v1). For a
+                    // STRONG backend with a Fresh hook resolution this returns the
+                    // hook state; otherwise (flag off / non-hook backend / stale
+                    // window) it returns the screen heuristic unchanged —
+                    // byte-identical. Scope is the SNAPSHOT and its consumers
+                    // (dispatch_idle / pane badge / agent_state_of — the #1985
+                    // surface); per-tick deciders that read the raw heuristic
+                    // directly (supervisor/hang/recovery/watchdog/conflict_notify/
+                    // query API) are unchanged in v1 — see authoritative_state.
+                    let agent_state = crate::daemon::hook_shadow::authoritative_state(
+                        &handle.backend_command,
+                        &handle.name,
+                        c.state.get_state(),
+                    );
                     (
-                        c.state.get_state().display_name().to_string(),
+                        agent_state.display_name().to_string(),
                         c.health.state.display_name().to_string(),
                         // #1694②: productive-silence for the dispatch-idle
                         // silence-clock (marker/heartbeat-gated, spinner-resistant).

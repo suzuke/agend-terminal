@@ -1409,9 +1409,12 @@ mod hook_state_poc_tests {
     /// AGEND_RESTART_HANDOFF fix in #1964 (a fleet agent's inherited env must
     /// not flip the contract under test).
     #[test]
+    #[serial_test::serial(hook_state_poc)] // #2014: shares AGEND_HOOK_STATE_POC with hook_shadow's env test
     fn hooks_not_injected_without_flag() {
         // Serialize the process-global env flip; restore before asserting so
-        // a panic can't leak the cleared flag to other tests.
+        // a panic can't leak the cleared flag to other tests. The named serial
+        // group above coordinates this with hook_shadow's promotion env test
+        // (which mutates the SAME var); the local mutex is the in-module backstop.
         static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var("AGEND_HOOK_STATE_POC").ok();
