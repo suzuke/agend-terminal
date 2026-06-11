@@ -648,7 +648,7 @@ const THROTTLE_HINT_TOKENS: &[&str] = &[
     "credit_balance_too_low",
 ];
 
-fn screen_has_throttle_hint(screen_text: &str) -> bool {
+pub(crate) fn screen_has_throttle_hint(screen_text: &str) -> bool {
     THROTTLE_HINT_TOKENS.iter().any(|t| screen_text.contains(t))
 }
 

@@ -1717,11 +1717,14 @@ pub(crate) fn process_error_recovery(
             // produced (`last_productive_output == None`) is NOT recovery, so it
             // latches + injects normally (the fresh-agent edge the creation stamp
             // used to mis-suppress). `productive_silence` is for the log only.
-            let (state, recovered, productive_silence) = {
+            let (state, recovered, has_throttle_hint, productive_silence) = {
                 let core = handle.core.lock();
+                let has_hint =
+                    crate::state::screen_has_throttle_hint(&core.vterm.tail_lines(TAIL_LINES));
                 (
                     core.state.current,
                     core.state.recovered_within(RECOVERY_SILENCE),
+                    has_hint,
                     core.state.productive_silence(),
                 )
             };
@@ -1802,7 +1805,12 @@ pub(crate) fn process_error_recovery(
                     // cleanly separates this from genuine recovery — failed-retry
                     // spinners do not count as productive output (probe evidence:
                     // productive_silent_secs=600 across 4 retries).
-                    Some(track) if track.retry_count > 0 && !track.exhausted && !recovered => {
+                    Some(track)
+                        if track.retry_count > 0
+                            && !track.exhausted
+                            && !recovered
+                            && has_throttle_hint =>
+                    {
                         if !track.abort_pending {
                             track.abort_pending = true;
                             let idx = (track.retry_count as usize)
@@ -1840,15 +1848,27 @@ pub(crate) fn process_error_recovery(
                         // Idle — cross-episode reset so a later episode starts
                         // fresh at Phase A.
                         if let Some(cleared) = retry_tracks.remove(name) {
-                            tracing::info!(
-                                agent = %name,
-                                ?state,
-                                retry_count = cleared.retry_count,
-                                after_abort = cleared.abort_pending,
-                                recovered,
-                                productive_silent_secs = productive_silence.as_secs(),
-                                "ServerRateLimit retry cleared — agent recovered (Idle)"
-                            );
+                            if cleared.retry_count > 0 && !recovered {
+                                tracing::warn!(
+                                    agent = %name,
+                                    tag = "#1946-abort-clear-no-evidence",
+                                    retry_count = cleared.retry_count,
+                                    next_retry_at = ?cleared.next_retry_at,
+                                    secs_until_retry = cleared.next_retry_at.saturating_duration_since(now).as_secs(),
+                                    productive_silent_secs = productive_silence.as_secs(),
+                                    "abort-to-Idle cleared — no throttle error visible on screen (likely scrolled off or recovered)"
+                                );
+                            } else {
+                                tracing::info!(
+                                    agent = %name,
+                                    ?state,
+                                    retry_count = cleared.retry_count,
+                                    after_abort = cleared.abort_pending,
+                                    recovered,
+                                    productive_silent_secs = productive_silence.as_secs(),
+                                    "ServerRateLimit retry cleared — agent recovered (Idle)"
+                                );
+                            }
                         }
                     }
                     None => {}
@@ -3423,11 +3443,20 @@ instances:
         name: &str,
         state: crate::state::AgentState,
     ) -> (crate::agent::AgentHandle, Box<dyn std::io::Read + Send>) {
+        mock_agent_handle_with_size(name, state, 10, 80)
+    }
+
+    fn mock_agent_handle_with_size(
+        name: &str,
+        state: crate::state::AgentState,
+        rows: u16,
+        cols: u16,
+    ) -> (crate::agent::AgentHandle, Box<dyn std::io::Read + Send>) {
         let pty_system = portable_pty::native_pty_system();
         let pair = pty_system
             .openpty(portable_pty::PtySize {
-                rows: 10,
-                cols: 80,
+                rows,
+                cols,
                 pixel_width: 0,
                 pixel_height: 0,
             })
@@ -3450,18 +3479,12 @@ instances:
         let writer = pair.master.take_writer().expect("take writer");
         let pty_writer: crate::agent::PtyWriter = Arc::new(parking_lot::Mutex::new(writer));
         let core = Arc::new(crate::sync_audit::CoreMutex::new(crate::agent::AgentCore {
-            vterm: crate::vterm::VTerm::with_pty_writer(80, 10, Arc::clone(&pty_writer)),
+            vterm: crate::vterm::VTerm::with_pty_writer(cols, rows, Arc::clone(&pty_writer)),
             subscribers: Vec::new(),
             state: crate::state::StateTracker::new(None),
             health: crate::health::HealthTracker::new(),
         }));
         core.lock().state.current = state;
-        // A fresh `StateTracker` now defaults `last_productive_output` to `None`
-        // (never produced) — exactly the stuck/just-spawned agent a
-        // ServerRateLimit-retry test models, so `recovered_within` is false → the
-        // retry latches + injects. No stale-Instant stamp needed (the old
-        // `checked_sub(3600s)` underflowed on windows). The recovery test instead
-        // stamps `Some(now())` to model an agent that DID just produce.
         let handle = crate::agent::AgentHandle {
             id: crate::types::InstanceId::default(),
             name: name.to_string().into(),
@@ -3629,6 +3652,15 @@ instances:
             crate::state::AgentState::Idle,
             "abort-retain-1946",
         );
+        {
+            let reg = registry.lock();
+            let handle = reg.values().next().unwrap();
+            handle
+                .core
+                .lock()
+                .vterm
+                .process(b"\r\nAPI Error: Server is temporarily limiting requests\r\n");
+        }
         let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
         tracks.insert(
             "test-agent".to_string(),
@@ -3742,6 +3774,46 @@ instances:
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// #1946 / #1808: when the rate limit error has scrolled off the screen
+    /// (the vterm no longer contains the throttle hint), the abort-pending retry track must be cleared
+    /// even if the agent hasn't produced new output within the silence window.
+    #[test]
+    fn abort_pending_scrolled_off_clears_track_1946() {
+        let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = tmp_home("abort-scrolled-off-1946");
+        let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
+        tracks.insert(
+            "test-agent".to_string(),
+            RateLimitRetry {
+                retry_count: 3,
+                next_retry_at: Instant::now(),
+                exhausted: false,
+                inject_failures: 0,
+                abort_pending: true,
+            },
+        );
+
+        let (handle, _reader) = mock_agent_handle("test-agent", crate::state::AgentState::Idle);
+        // core.vterm is empty by default, so screen_has_throttle_hint returns false (scrolled off).
+        registry.lock().insert(handle.id, handle);
+
+        super::process_error_recovery(
+            &home,
+            &registry,
+            &mut tracks,
+            &mut Default::default(),
+            &mut Default::default(),
+            &mut Default::default(),
+            past_boot_grace(),
+        );
+
+        assert!(
+            !tracks.contains_key("test-agent"),
+            "scrolled off error must clear the abort-pending retry track"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     /// #1946: a fresh ServerRateLimit observation while abort-recovery is
     /// pending hands ownership back to the normal fresh-SRL retry path (same
     /// track, same budget — structurally a single owner, no double-continue).
@@ -3807,6 +3879,11 @@ instances:
         let mut last_inject: HashMap<String, Instant> = HashMap::new();
 
         let (handle, _reader) = mock_agent_handle("test-agent", crate::state::AgentState::Idle);
+        handle
+            .core
+            .lock()
+            .vterm
+            .process(b"\r\nAPI Error: Server is temporarily limiting requests\r\n");
         registry.lock().insert(handle.id, handle);
 
         super::process_error_recovery(
@@ -3828,6 +3905,105 @@ instances:
         assert!(
             !last_inject.contains_key("test-agent"),
             "no inject past the budget cap"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Verify that if the throttle error is sitting in rows 16–40 (e.g. at row 20 on a 50-row screen),
+    /// the track is retained (proving the TAIL_LINES window correctly scans up to 40 rows).
+    #[test]
+    fn abort_pending_retains_track_when_error_in_rows_16_to_40() {
+        let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = tmp_home("abort-rows-16-40-1946");
+        let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
+        tracks.insert(
+            "test-agent".to_string(),
+            RateLimitRetry {
+                retry_count: 3,
+                next_retry_at: Instant::now(),
+                exhausted: false,
+                inject_failures: 0,
+                abort_pending: true,
+            },
+        );
+
+        let (handle, _reader) =
+            mock_agent_handle_with_size("test-agent", crate::state::AgentState::Idle, 50, 80);
+
+        // Write the error message, then write 20 empty lines so the error is pushed to row 20 from bottom.
+        {
+            let mut core_lock = handle.core.lock();
+            core_lock
+                .vterm
+                .process(b"API Error: Server is temporarily limiting requests\r\n");
+            for _ in 0..20 {
+                core_lock.vterm.process(b"\r\n");
+            }
+        }
+
+        registry.lock().insert(handle.id, handle);
+
+        super::process_error_recovery(
+            &home,
+            &registry,
+            &mut tracks,
+            &mut Default::default(),
+            &mut Default::default(),
+            &mut Default::default(),
+            past_boot_grace(),
+        );
+
+        assert!(
+            tracks.contains_key("test-agent"),
+            "error at row 20 (within 40-row TAIL_LINES window) must retain the abort-pending retry track"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1985 / Item 4: Document the soft-wrap split edge case. If the throttle hint
+    /// is split across a soft-wrap boundary, it won't match, and the track is cleared.
+    #[test]
+    fn abort_pending_split_wrap_clears_track_1946() {
+        let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = tmp_home("abort-split-wrap-1946");
+        let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
+        tracks.insert(
+            "test-agent".to_string(),
+            RateLimitRetry {
+                retry_count: 3,
+                next_retry_at: Instant::now(),
+                exhausted: false,
+                inject_failures: 0,
+                abort_pending: true,
+            },
+        );
+
+        let (handle, _reader) =
+            mock_agent_handle_with_size("test-agent", crate::state::AgentState::Idle, 10, 38);
+
+        // Write the error message. Because cols is 38, "limiting" is soft-wrapped across lines.
+        {
+            let mut core_lock = handle.core.lock();
+            core_lock
+                .vterm
+                .process(b"API Error: Server is temporarily limiting requests\r\n");
+        }
+
+        registry.lock().insert(handle.id, handle);
+
+        super::process_error_recovery(
+            &home,
+            &registry,
+            &mut tracks,
+            &mut Default::default(),
+            &mut Default::default(),
+            &mut Default::default(),
+            past_boot_grace(),
+        );
+
+        assert!(
+            !tracks.contains_key("test-agent"),
+            "soft-wrapped split error token does not match in tail_lines, so track is cleared"
         );
         std::fs::remove_dir_all(&home).ok();
     }
