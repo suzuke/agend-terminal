@@ -1,6 +1,7 @@
 //! Telegram credential resolution — loads bot token + group id from fleet.yaml.
 
 /// Resolved Telegram channel credentials — avoids repeated fleet.yaml loads.
+#[derive(Debug)]
 pub(crate) struct TelegramCreds {
     pub(crate) token: String,
     pub(crate) group_id: i64,
@@ -10,7 +11,9 @@ pub(super) fn resolve_channel() -> anyhow::Result<(TelegramCreds, crate::fleet::
     resolve_channel_from(&crate::home_dir())
 }
 
-pub(super) fn resolve_channel_from(
+// pub(crate): the #2005 regression tests (quickstart) exercise the REAL
+// resolve entry against quickstart-generated fleet.yaml shapes.
+pub(crate) fn resolve_channel_from(
     home: &std::path::Path,
 ) -> anyhow::Result<(TelegramCreds, crate::fleet::FleetConfig)> {
     let config = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))?;
@@ -20,15 +23,38 @@ pub(super) fn resolve_channel_from(
             group_id,
             ..
         }) => {
+            // #2005: SYMMETRIC fallback. Pre-#2005 the only fallback was
+            // legacy-ward (`AGEND_BOT_TOKEN`) — dead code whenever
+            // `bot_token_env` already WAS the legacy name (exactly the pair
+            // the old quickstart template generated: fleet pinned the legacy
+            // name while `.env` was written under the canonical key, so a
+            // fresh install failed to resolve at startup). Order: the
+            // configured name first, then whichever of canonical/legacy it
+            // isn't — covering both drift directions (old fleet template +
+            // migrated `.env`, new template + legacy `.env`).
+            const CANONICAL: &str = "AGEND_TELEGRAM_BOT_TOKEN";
+            const LEGACY: &str = "AGEND_BOT_TOKEN";
             let token = std::env::var(bot_token_env)
                 .or_else(|_| {
-                    let legacy = std::env::var("AGEND_BOT_TOKEN");
-                    if legacy.is_ok() {
-                        tracing::warn!(
-                            "AGEND_BOT_TOKEN is deprecated — migrate to {bot_token_env}"
-                        );
+                    let fallback_name = if bot_token_env == CANONICAL {
+                        LEGACY
+                    } else {
+                        CANONICAL
+                    };
+                    let fallback = std::env::var(fallback_name);
+                    if fallback.is_ok() {
+                        if fallback_name == LEGACY {
+                            tracing::warn!(
+                                "AGEND_BOT_TOKEN is deprecated — migrate to {bot_token_env}"
+                            );
+                        } else {
+                            tracing::warn!(
+                                "fleet.yaml bot_token_env '{bot_token_env}' is not set; using \
+                                 {CANONICAL} — update bot_token_env to the canonical name"
+                            );
+                        }
                     }
-                    legacy
+                    fallback
                 })
                 .map_err(|_| anyhow::anyhow!("bot token env '{bot_token_env}' not set"))?;
             Ok((

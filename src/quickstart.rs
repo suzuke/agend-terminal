@@ -509,14 +509,14 @@ fn generate_fleet_yaml(
             r#"
 channel:
   type: telegram
-  bot_token_env: AGEND_BOT_TOKEN
+  bot_token_env: AGEND_TELEGRAM_BOT_TOKEN
   group_id: {gid}
   mode: topic
   user_allowlist: []  # add your Telegram user_id (message @userinfobot to get it)
 "#
         )
     } else {
-        "\n# channel:\n#   type: telegram\n#   bot_token_env: AGEND_BOT_TOKEN\n#   group_id: YOUR_GROUP_ID\n#   user_allowlist: [YOUR_USER_ID]\n".to_string()
+        "\n# channel:\n#   type: telegram\n#   bot_token_env: AGEND_TELEGRAM_BOT_TOKEN\n#   group_id: YOUR_GROUP_ID\n#   user_allowlist: [YOUR_USER_ID]\n".to_string()
     };
 
     let workspace_dir = crate::paths::workspace_dir(home).join("general");
@@ -1424,6 +1424,106 @@ mod tests {
         assert!(
             yaml.contains("user_allowlist"),
             "commented-out channel section must mention user_allowlist; got:\n{yaml}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #2005: bot_token_env canonical/legacy resolution — REAL entry pins ──
+
+    /// Serialize env mutation across the #2005 tests (process-global vars).
+    fn token_env_guard() -> std::sync::MutexGuard<'static, ()> {
+        static G: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        G.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn clear_token_envs() {
+        std::env::remove_var("AGEND_TELEGRAM_BOT_TOKEN");
+        std::env::remove_var("AGEND_BOT_TOKEN");
+    }
+
+    /// Fresh-install shape: the NEW quickstart template (canonical
+    /// bot_token_env) + a `.env`-style canonical env var → the real resolve
+    /// entry must succeed. Pre-#2005 the template pinned the legacy name and
+    /// this exact shape failed at daemon startup.
+    #[test]
+    fn fresh_install_channel_resolves_2005() {
+        let _g = token_env_guard();
+        clear_token_envs();
+        let home = std::env::temp_dir().join(format!("agend-2005-fresh-{}", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        let backend = Backend::all()[0].clone();
+        generate_fleet_yaml(&home, &backend, Some(-100123), Some("t")).expect("gen");
+        let yaml = std::fs::read_to_string(crate::fleet::fleet_yaml_path(&home)).expect("read");
+        assert!(
+            yaml.contains("bot_token_env: AGEND_TELEGRAM_BOT_TOKEN"),
+            "template must pin the CANONICAL env name (what save_env_token writes): {yaml}"
+        );
+        std::env::set_var("AGEND_TELEGRAM_BOT_TOKEN", "123:fresh");
+        let res = crate::channel::telegram::creds::resolve_channel_from(&home);
+        clear_token_envs();
+        let (creds, _) = res.expect("fresh install (canonical fleet + canonical env) must resolve");
+        assert_eq!(creds.token, "123:fresh");
+        assert_eq!(creds.group_id, -100123);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Old-install shape: new template + an old `.env` still carrying the
+    /// LEGACY key → resolves via the legacy fallback (deprecation warn).
+    #[test]
+    fn old_install_legacy_env_still_resolves_2005() {
+        let _g = token_env_guard();
+        clear_token_envs();
+        let home = std::env::temp_dir().join(format!("agend-2005-legacy-{}", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        let backend = Backend::all()[0].clone();
+        generate_fleet_yaml(&home, &backend, Some(-100123), Some("t")).expect("gen");
+        std::env::set_var("AGEND_BOT_TOKEN", "123:legacy");
+        let res = crate::channel::telegram::creds::resolve_channel_from(&home);
+        clear_token_envs();
+        let (creds, _) = res.expect("legacy .env key must keep working (old installs)");
+        assert_eq!(creds.token, "123:legacy");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// THE #2005 bug pin: an old-template fleet.yaml (bot_token_env pinned to
+    /// the LEGACY name) + a migrated/canonical-only env. Pre-#2005 the
+    /// fallback retried the SAME legacy name (dead code) and resolution
+    /// failed; the symmetric fallback must now find the canonical var.
+    #[test]
+    fn old_template_fleet_with_canonical_env_resolves_2005() {
+        let _g = token_env_guard();
+        clear_token_envs();
+        let home = std::env::temp_dir().join(format!("agend-2005-oldtmpl-{}", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "defaults:\n  backend: claude\nchannel:\n  type: telegram\n  bot_token_env: AGEND_BOT_TOKEN\n  group_id: -100456\ninstances: {}\n",
+        )
+        .expect("write");
+        std::env::set_var("AGEND_TELEGRAM_BOT_TOKEN", "123:canon");
+        let res = crate::channel::telegram::creds::resolve_channel_from(&home);
+        clear_token_envs();
+        let (creds, _) = res
+            .expect("old fleet template + canonical-only env must resolve via symmetric fallback");
+        assert_eq!(creds.token, "123:canon");
+        assert_eq!(creds.group_id, -100456);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Negative: neither env set → clear error naming the configured var.
+    #[test]
+    fn no_token_env_errors_clearly_2005() {
+        let _g = token_env_guard();
+        clear_token_envs();
+        let home = std::env::temp_dir().join(format!("agend-2005-none-{}", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        let backend = Backend::all()[0].clone();
+        generate_fleet_yaml(&home, &backend, Some(-1), Some("t")).expect("gen");
+        let err = crate::channel::telegram::creds::resolve_channel_from(&home)
+            .expect_err("no env set must error");
+        assert!(
+            err.to_string().contains("AGEND_TELEGRAM_BOT_TOKEN"),
+            "error must name the configured var: {err}"
         );
         std::fs::remove_dir_all(&home).ok();
     }
