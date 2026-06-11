@@ -40,6 +40,14 @@ const NULL_UNLOCK_NOTIFY_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 /// to AwaitingOperator (stability gate — a transient streaming flicker of the
 /// permission chrome never holds this long).
 const AWAITING_STABILITY: Duration = Duration::from_secs(8);
+/// #2033: minimum blocked-episode duration for the "recovered from blocked state"
+/// Telegram notice to be actionable. Set to the AwaitingOperator silence floor
+/// (30s) — an episode that reached genuine operator-attention territory. Below it
+/// is an InteractivePrompt that self-resolved before the operator could plausibly
+/// engage, so the recovery notice would be non-actionable noise. The common
+/// AwaitingOperator path always clears this bar: the ≥30s silence accrues while
+/// already in (raw) InteractivePrompt, which the episode clock counts.
+const RECOVERY_NOTICE_MIN_BLOCK: Duration = Duration::from_secs(30);
 /// #1552: how many live bottom rows the permission chrome must render in for
 /// the escalation position gate. A scrollback footer (the meta-FP: a working
 /// agent whose pane merely echoes the chrome) scrolls above this and fails.
@@ -1325,6 +1333,9 @@ fn tick(
                         prev_state = agent_state.display_name(),
                         "awaiting operator (stalled on prompt) — escalating"
                     );
+                    // #2033: pair this blocked notice with the recovery notice —
+                    // record that the operator was actually told about the block.
+                    core.state.mark_blocked_notice_sent();
                     Some(NoticeAction::Stall {
                         tail: core.vterm.tail_lines(TAIL_LINES),
                         silent_secs: Some(silent.as_secs()),
@@ -1348,29 +1359,49 @@ fn tick(
                     "interactive prompt detected — forwarding to telegram"
                 );
                 let _ = core.state.take_recovery_notice();
+                // #2033: pair this blocked notice with the recovery notice.
+                core.state.mark_blocked_notice_sent();
                 Some(NoticeAction::Stall {
                     tail: core.vterm.tail_lines(TAIL_LINES),
                     silent_secs: None,
                 })
-            } else if core.state.take_recovery_notice() {
+            } else if let Some(episode) = core.state.take_recovery_notice() {
                 // Symmetric "ready again" signal: armed on the transition
-                // out of InteractivePrompt / AwaitingOperator. Silent push so
-                // operators aren't vibrated twice per interactive cycle.
+                // out of InteractivePrompt / AwaitingOperator.
                 // #1552: clear the AwaitingOperator health reason on recovery so
                 // `check_hang` is no longer exempt and a future stall can
                 // re-notify (the once-per-episode dedup re-arms). #1638: the
                 // operator-resolution clear-policy is now on the type, so this
                 // never clears a different blocked reason (RateLimit / etc.).
+                // This health cleanup runs REGARDLESS of whether we forward the
+                // telegram notice below — it is internal state, not operator-facing.
                 if core.health.current_reason.as_ref().is_some_and(|r| {
                     r.auto_clears_on(crate::health::RecoverySignal::OperatorResolved)
                 }) {
                     core.health.clear_blocked_reason();
                 }
-                tracing::info!(
-                    agent = %name,
-                    "recovered from blocked state — notifying telegram"
-                );
-                Some(NoticeAction::Recovered)
+                // #2033: actionable-or-silent (#2008). A "recovered" notice is only
+                // useful when the operator was actually told about the block AND it
+                // lasted long enough that they might be reacting. A self-resolving /
+                // never-notified block (the operator-flagged noise, e.g. the #2020
+                // false AwaitingOperator) is log-only.
+                if recovery_notice_is_actionable(episode) {
+                    tracing::info!(
+                        agent = %name,
+                        block_secs = episode.block_duration.as_secs(),
+                        "recovered from blocked state — notifying telegram"
+                    );
+                    Some(NoticeAction::Recovered)
+                } else {
+                    tracing::debug!(
+                        agent = %name,
+                        block_secs = episode.block_duration.as_secs(),
+                        notice_sent = episode.notice_sent,
+                        "recovered from blocked state — log-only (#2033: block not \
+                         notified or under threshold, recovery notice non-actionable)"
+                    );
+                    None
+                }
             } else {
                 None
             }
@@ -2108,6 +2139,16 @@ fn format_recovery_notice(name: &str) -> String {
     format!("✅ {name} 已就緒，可以繼續對話")
 }
 
+/// #2033: gate the "recovered from blocked state" Telegram notice on the
+/// actionable-or-silent principle (#2008). It is operator-useful ONLY when both:
+/// (a) the operator was actually told about the block (a Stall notice went out
+/// this episode), and (b) the block lasted past [`RECOVERY_NOTICE_MIN_BLOCK`], so
+/// they might be mid-reaction. A never-notified or self-resolving block (e.g. the
+/// #2020 false AwaitingOperator the operator flagged) fails this → log-only.
+fn recovery_notice_is_actionable(episode: crate::state::RecoveryEpisode) -> bool {
+    episode.notice_sent && episode.block_duration >= RECOVERY_NOTICE_MIN_BLOCK
+}
+
 /// Read `last_heartbeat` from the agent's metadata file and return the age
 /// as a `Duration`. Returns `None` if the file is missing, unparseable, or
 /// the timestamp is in the future.
@@ -2162,6 +2203,30 @@ fn clear_waiting_on_if_stale(home: &std::path::Path, name: &str, is_stale: bool)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2033: the recovery-notice gate — actionable iff the operator was told
+    /// about the block AND it lasted past the threshold (actionable-or-silent).
+    #[test]
+    fn recovery_notice_gate_actionable_or_silent_2033() {
+        use crate::state::RecoveryEpisode;
+        let ep = |secs, notice_sent| RecoveryEpisode {
+            block_duration: Duration::from_secs(secs),
+            notice_sent,
+        };
+        // notified + long enough → fire
+        assert!(recovery_notice_is_actionable(ep(60, true)));
+        // notified but self-resolved fast → silent (the InteractivePrompt noise)
+        assert!(!recovery_notice_is_actionable(ep(5, true)));
+        // long but NEVER notified → silent (the #2020 false-AwaitingOperator class)
+        assert!(!recovery_notice_is_actionable(ep(300, false)));
+        // neither → silent
+        assert!(!recovery_notice_is_actionable(ep(2, false)));
+        // boundary: exactly the threshold is actionable (>=)
+        assert!(recovery_notice_is_actionable(RecoveryEpisode {
+            block_duration: RECOVERY_NOTICE_MIN_BLOCK,
+            notice_sent: true,
+        }));
+    }
 
     fn fresh_retry() -> RateLimitRetry {
         RateLimitRetry {
