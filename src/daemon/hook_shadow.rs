@@ -383,7 +383,7 @@ mod tests {
     /// reading `AGEND_HOOK_STATE_POC`. `#[serial]` + an RAII guard handle the
     /// process-global env var (restored even on panic).
     #[test]
-    #[serial]
+    #[serial(hook_state_poc)] // shares the AGEND_HOOK_STATE_POC env with mcp_config's flag test
     fn env_flag_gates_promotion_end_to_end() {
         struct EnvGuard(Option<String>);
         impl Drop for EnvGuard {
