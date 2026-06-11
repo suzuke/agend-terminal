@@ -742,6 +742,28 @@ impl Backend {
         }
     }
 
+    /// #2038: append `--model <formatted>` to an argv unless the caller
+    /// already passed a `--model` flag (explicit caller args win —
+    /// `create_instance` pre-formats the flag into its SPAWN args, and a
+    /// double `--model` must never reach the backend CLI). Formatting goes
+    /// through [`Backend::format_model_arg`] when `backend_command` maps to a
+    /// known backend (OpenCode needs a provider prefix); unknown commands get
+    /// the model string verbatim. Empty model is a no-op.
+    pub fn push_model_arg(args: &mut Vec<String>, backend_command: &str, model: &str) {
+        if model.is_empty()
+            || args
+                .iter()
+                .any(|a| a == "--model" || a.starts_with("--model="))
+        {
+            return;
+        }
+        let model_val = Backend::from_command(backend_command)
+            .map(|b| b.format_model_arg(model))
+            .unwrap_or_else(|| model.to_string());
+        args.push("--model".to_string());
+        args.push(model_val);
+    }
+
     /// Display name matching the CLI command. For [`Backend::Raw`] returns the
     /// stored path verbatim (borrow tied to self).
     pub fn name(&self) -> &str {
@@ -1723,6 +1745,40 @@ mod tests {
     fn format_model_arg_other_backends_passthrough() {
         assert_eq!(Backend::ClaudeCode.format_model_arg("opus"), "opus");
         assert_eq!(Backend::Codex.format_model_arg("o3"), "o3");
+    }
+
+    /// #2038: `push_model_arg` appends the formatted flag pair and respects
+    /// an existing caller-supplied `--model` (separate or `=`-glued form).
+    #[test]
+    fn push_model_arg_appends_and_dedupes_2038() {
+        let mut args = vec!["--continue".to_string()];
+        Backend::push_model_arg(&mut args, "claude", "claude-opus-4-8");
+        assert_eq!(args, vec!["--continue", "--model", "claude-opus-4-8"]);
+
+        // OpenCode gets the provider prefix via format_model_arg.
+        let mut args = Vec::new();
+        Backend::push_model_arg(&mut args, "opencode", "opus");
+        assert_eq!(args, vec!["--model", "anthropic/opus"]);
+
+        // Unknown command: model passes through verbatim.
+        let mut args = Vec::new();
+        Backend::push_model_arg(&mut args, "/bin/sh", "m1");
+        assert_eq!(args, vec!["--model", "m1"]);
+
+        // Caller already passed --model (separate form) — no duplicate.
+        let mut args = vec!["--model".to_string(), "explicit".to_string()];
+        Backend::push_model_arg(&mut args, "claude", "from-fleet");
+        assert_eq!(args, vec!["--model", "explicit"]);
+
+        // Glued form counts too.
+        let mut args = vec!["--model=explicit".to_string()];
+        Backend::push_model_arg(&mut args, "claude", "from-fleet");
+        assert_eq!(args, vec!["--model=explicit"]);
+
+        // Empty model is a no-op.
+        let mut args = vec!["--continue".to_string()];
+        Backend::push_model_arg(&mut args, "claude", "");
+        assert_eq!(args, vec!["--continue"]);
     }
 
     fn tmp_dir(tag: &str) -> std::path::PathBuf {

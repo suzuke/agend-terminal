@@ -187,16 +187,28 @@ pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
         // operator hand-edits and downstream replace_instance flows
         // can populate env on the entry between the write and this
         // re-read — we honour whatever the disk says.
-        let resolved_env =
-            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(ctx.home))
-                .ok()
-                .and_then(|f| f.resolve_instance(inst_name).map(|r| r.env));
+        let resolved = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(ctx.home))
+            .ok()
+            .and_then(|f| f.resolve_instance(inst_name));
+        let resolved_env = resolved.as_ref().map(|r| r.env.clone());
+        // #2038: boot parity for args + model, same rule as handle_spawn's
+        // fleet fallback. CREATE_TEAM-time entries are written with
+        // args/model: None (Phase 1 above), but `defaults.args` /
+        // `defaults.model` and operator hand-edits between the write and
+        // this re-read merge in via resolve_instance.
+        let mut member_args = resolved
+            .as_ref()
+            .map(|r| r.args.clone())
+            .unwrap_or_default();
+        if let Some(model) = resolved.as_ref().and_then(|r| r.model.as_deref()) {
+            crate::backend::Backend::push_model_arg(&mut member_args, backend, model);
+        }
         match crate::api::spawn_one(
             ctx.home,
             ctx.registry,
             inst_name,
             backend,
-            &[],
+            &member_args,
             crate::backend::SpawnMode::Fresh,
             work_dir,
             size,
