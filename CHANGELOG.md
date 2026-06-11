@@ -3,7 +3,7 @@
 All notable changes to this project are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); project follows [SemVer](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.0] — Unreleased
 
 ### Changed
 
@@ -15,6 +15,22 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 - **Fresh Telegram setup resolves at startup (#2005)** — the quickstart fleet.yaml template pinned the legacy `bot_token_env: AGEND_BOT_TOKEN` while `.env` was written under the canonical `AGEND_TELEGRAM_BOT_TOKEN`, and the credentials fallback retried the same legacy name — so a fresh install's Telegram channel failed to resolve at daemon startup (old installs were masked by leftover legacy `.env` keys). The template now pins the canonical name and the fallback is symmetric (configured name → the other of canonical/legacy), so all four fleet/.env drift combinations resolve; legacy use still warns.
 
+- **Dispatch-idle false alarms on healthy long work (#2022, #2032)** — the "dispatch has gone quiet" watchdog no longer fires on agents doing slow-but-progressing work. The deadline auto-extension is capped with a single "long-running — confirm expected" escalation instead of nagging every couple of minutes; the default idle window is raised 10 → 30 min to match real task length; and the escalation is tiered — the dispatcher is notified first, and the agent itself is only interrupted if the dispatch is still unresolved a second window later.
+
+- **CI-watch false-storm suite (#2001, #2013)** — CI-watch now takes the verdict from the latest attempt per workflow (a rerun no longer leaves a stale failure latched), an unwatch writes a tombstone so the PR-state aggregator cannot immediately re-arm the same watch, and the handoff track is invalidated head-aware so a force-push stops re-nudging a dead commit.
+
+- **Task board survives a corrupt event-log line (#1992)** — a single malformed line in `task-events.jsonl` no longer aborts the whole board replay; the bad line is skipped and quarantined, while a forward-incompatible (newer-schema) line still fails closed so an old daemon never acts on a board it cannot fully read.
+
+- **Corrupt internal store is backed up, not silently overwritten (#2017)** — when a versioned store file fails to parse, the daemon moves it aside to a `.corrupt` backup and surfaces the event once per boot instead of clobbering it.
+
+- **Git shim no longer fakes success in non-fleet repos (#2030)** — `git branch <name>` (and the other ref-naming `branch`/`tag` forms) run by a bound agent inside a repo the fleet does not manage now pass through to real git, instead of being silently redirected into the agent's worktree — which previously returned exit 0 while creating nothing, or a spurious `already exists` from the wrong repo.
+
+- **Deferred notifications no longer strand under a headless daemon (#1978)** — a daemon-side per-tick flush delivers queued operator notifications even when no TUI is attached. (credit: @yujunchao)
+
+- **Background services inherit `PATH` (#1984)** — `agend-terminal service install` now propagates `PATH` into the launchd/systemd service environment, so a service-started daemon can find `git`, `gh`, and the backend CLIs. (credit: @cheerc)
+
+- **Rate-limit retry nudge requires an on-screen signal (#1999)** — the after-abort ServerRateLimit retry nudge now fires only when the rate-limit banner is actually on screen, closing a false re-nudge after the agent had already recovered. (credit: @cheerc)
+
 ### Added
 
 - **Context-full safety net (#2007, Plan A)** — the daemon watches each agent's context usage (statusline pattern; claude-only today — other backends have no passive signal and are never injected) and at 85% injects ONE `[AGEND-AUTO kind=context-handoff]` nudge telling the agent to write `SESSION-HANDOFF.md` + annotate its task. Noise-budgeted: one injection per episode (hysteresis re-arm on compact/restart, never timer-repeated), one optional operator escalation at 92% if no handoff file appeared, silent auto-resolve, idle agents marked in the event log instead of injected. Thresholds: `AGEND_CONTEXT_HANDOFF_PCT` / `AGEND_CONTEXT_HANDOFF_ESCALATE_PCT`. Restart remains human/lead-driven (Plan B deferred).
@@ -24,6 +40,10 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 - **fleet.yaml `schema_version` + compatibility policy (#1989)** — `fleet.yaml` accepts an optional `schema_version:` field (omitted = `1`; existing files unchanged, the daemon never injects it). A file declaring a version newer than the daemon supports loads with a warning instead of being silently misread without trace. `docs/COMPATIBILITY.md` declares the on-disk interface tiers — (a) stable public (fleet.yaml, service templates, instruction blocks, MCP config), (b) internal persisted state, (c) regenerable/ephemeral — and the additive-only change rule for (a)/(b).
 
 - **Release pipeline hardening** — `release.yml` gains a pre-release `gate` job (version==tag, changelog section present, MSRV 1.87 `cargo check`, `cargo-semver-checks` soft-fail report vs the previous tag) that all artifact jobs depend on, and a `publish` job that auto-publishes to crates.io after the GitHub Release succeeds (`--dry-run` first; skips gracefully when the `CRATES_IO_TOKEN` secret is unset; never runs for `-rc.N` pre-release tags). Release procedure is documented in `docs/RELEASING.md`.
+
+- **Schema versioning for internal stores (#2000)** — `runtime-config.json`, `decisions.json`, and per-agent `binding.json` gain an optional `schema_version` (omitted = `1`; existing files unchanged), so a file declaring a version newer than the daemon supports loads with a warning instead of being silently misread — extending the #1989 compatibility policy to the (b)-tier internal persisted state.
+
+- **CONTRIBUTING Review Process + PR compatibility self-check (#2024)** — `CONTRIBUTING.md` documents the search-first / RCA-first review flow, the VERIFIED-with-Evidence bar, the "comments and prose are claims, not evidence" rule, dual review for sensitive areas, and stale-PR carry-forward (authorship preserved); the PR template adds a self-check against the `docs/COMPATIBILITY.md` on-disk-format tiers.
 
 ### Removed
 - **Gemini CLI backend retired** ([#1580](https://github.com/suzuke/agend-terminal/issues/1580), completes [#8](https://github.com/suzuke/agend-terminal/issues/8)). `gemini-cli` sunsets 2026-06-18 (free/Pro/Ultra); its official successor Antigravity CLI (`agy`) has been a supported backend since [#1547](https://github.com/suzuke/agend-terminal/issues/1547). The `Backend::Gemini` variant, its preset/detection patterns, and the 8 gemini state-replay fixtures are removed. **Operator note:** a `gemini` / `gemini-cli` backend named in `fleet.yaml` no longer resolves to a managed backend — it now spawns as a generic `Raw` backend. Switch such entries to `agy`. Removing the last legacy backend also let the legacy detection spine (`compile_for`, `config_for_legacy`, `legacy_initial_state`) be deleted — every backend now routes through its co-located `BackendProfile` (#8 complete).
@@ -35,6 +55,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 - **Retention sweeps decoupled; `AGEND_CTRLC_SENTINEL` removed (#1812 env-cleanup)** — the decisions retention sweep now reads its own opt-in flag **`AGEND_RETENTION_DECISIONS_CUTOVER=1`**, separate from the pending-dispatch kill-switch `AGEND_RETENTION_CUTOVER` (which a co-consumer read with the opposite polarity, so "pending-off + decisions-on" was unreachable). **Migration:** the legacy `AGEND_RETENTION_CUTOVER=1` still enables the decisions sweep for now (deprecation window) — prefer the new flag. Separately, the internal Windows-debug aid `AGEND_CTRLC_SENTINEL` (wrote a sentinel file on Ctrl+C) was removed: no operator use, no automated consumer. `AGEND_POINTER_ONLY_INJECT` was reviewed and **kept** (a live inbox-injection feature flag).
 
 - **Restart-supervisor detection: positive `AGEND_SUPERVISED` sentinel, `XPC_SERVICE_NAME` dropped (#1812)** — `is_restart_supervised()` (the #851 fail-closed guard for `restart_daemon`) no longer trusts `XPC_SERVICE_NAME`. macOS exports that variable into *every* process in a GUI login session (including a bare `agend-terminal start` from Terminal.app), so on macOS the guard returned true unconditionally and `restart_daemon` could `exit(42)` with nothing to respawn the daemon. The check now keys on an explicit `AGEND_SUPERVISED=1` sentinel that `agend-terminal service install` writes into the launchd plist (`EnvironmentVariables`) and systemd unit (`Environment=`). `AGEND_WRAPPED` and systemd's `INVOCATION_ID` remain accepted. **macOS/Linux migration: re-run `agend-terminal service install` after upgrading, then restart the daemon once** — an existing service config installed on an earlier build predates the sentinel, so until it is regenerated `restart_daemon` fails-closed with an actionable error (the safe direction — it refuses rather than bricking). Windows Task Scheduler cannot carry the sentinel (its task XML has no env element) and stays fail-closed on bare-start as before.
+
+<!-- pending: final A-queue items (e.g. recovery-notice gate #2033) land here before the v0.8.0 tag -->
 
 ## [0.7.0] — 2026-05-28
 
@@ -518,7 +540,7 @@ Substantial work has landed on `main` since `0.3.0`. Highlights, grouped by area
 
 ---
 
-[Unreleased]: https://github.com/suzuke/agend-terminal/compare/v0.7.0...HEAD
+[0.8.0]: https://github.com/suzuke/agend-terminal/compare/v0.7.0...HEAD
 [0.7.0]: https://github.com/suzuke/agend-terminal/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/suzuke/agend-terminal/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/suzuke/agend-terminal/compare/v0.5.0...v0.6.0
