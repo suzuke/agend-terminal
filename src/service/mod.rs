@@ -143,6 +143,12 @@ pub fn systemd_quote(value: &str) -> String {
         match ch {
             '\\' => out.push_str(r"\\"),
             '"' => out.push_str(r#"\""#),
+            // #1986: systemd performs SPECIFIER expansion (%h, %i, …) inside
+            // Environment=/ExecStart= values and quoting does NOT suppress it —
+            // a literal `%` must be doubled or e.g. `%h` silently becomes the
+            // home dir. Input is installer-controlled (no injection), pure
+            // correctness for exe/home/PATH values that contain `%`.
+            '%' => out.push_str("%%"),
             other => out.push(other),
         }
     }
@@ -558,5 +564,72 @@ mod tests {
         // loudly via the previous round-trip tests).
         let weird = "this &nbsp; is not in our escape set";
         assert_eq!(xml_unescape(weird), weird);
+    }
+
+    // ── #1986: per-template render round-trips — no leftover placeholder ──
+    //
+    // `apply_substitutions` is generic; nothing asserted that a RENDERED
+    // template has no remaining `__*__` token. If a future template edit
+    // adds a placeholder the per-platform substitution array misses, the
+    // service silently installs with a literal `__NEW_THING__` inside.
+    // One test per template, using the EXACT key set the production
+    // installer passes (linux.rs / macos.rs / windows.rs).
+
+    fn assert_no_residual_placeholder(rendered: &str, which: &str) {
+        assert!(
+            !rendered.contains("__"),
+            "{which}: rendered template still contains a placeholder: {rendered}"
+        );
+    }
+
+    #[test]
+    fn systemd_template_renders_without_residual_placeholders() {
+        let rendered = apply_substitutions(
+            SYSTEMD_TEMPLATE,
+            &[
+                ("__EXECUTABLE__", "/opt/bin/agend-terminal"),
+                ("__HOME__", "/home/u/.agend"),
+                ("__PATH__", "/usr/bin:/bin"),
+            ],
+        );
+        assert_no_residual_placeholder(&rendered, "systemd");
+    }
+
+    #[test]
+    fn launchd_template_renders_without_residual_placeholders() {
+        let rendered = apply_substitutions(
+            LAUNCHD_TEMPLATE,
+            &[
+                ("__LABEL__", "dev.agend.terminal"),
+                ("__EXECUTABLE__", "/opt/bin/agend-terminal"),
+                ("__HOME__", "/Users/u/.agend"),
+                ("__PATH__", "/usr/bin:/bin"),
+            ],
+        );
+        assert_no_residual_placeholder(&rendered, "launchd");
+    }
+
+    #[test]
+    fn windows_template_renders_without_residual_placeholders() {
+        let rendered = apply_substitutions(
+            WINDOWS_TEMPLATE,
+            &[
+                ("__EXECUTABLE__", "C:\\bin\\agend-terminal.exe"),
+                ("__HOME__", "C:\\Users\\u\\.agend"),
+                ("__USER__", "u"),
+            ],
+        );
+        assert_no_residual_placeholder(&rendered, "windows");
+    }
+
+    /// #1986: literal `%` must double to `%%` — systemd expands specifiers
+    /// inside quoted values too (`%h` → home dir), so an unescaped percent
+    /// in PATH/exe/home is silently mis-expanded.
+    #[test]
+    fn systemd_quote_doubles_percent_1986() {
+        assert_eq!(systemd_quote("/odd%path/%h"), r#""/odd%%path/%%h""#);
+        // And a value that is only unsafe BECAUSE of the percent still
+        // routes through quoting (percent is outside the safe set).
+        assert_eq!(systemd_quote("a%b"), r#""a%%b""#);
     }
 }
