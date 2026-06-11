@@ -593,8 +593,18 @@ pub(crate) fn select_runs_to_notify(
     last_run_id: Option<u64>,
     last_notified_conclusion: Option<&str>,
     last_notified_run_attempt: Option<u64>,
+    last_notified_run_conclusion: Option<&str>,
 ) -> Vec<usize> {
     let threshold = last_run_id.unwrap_or(0);
+    // #1991: the anchor run's own conclusion is the correct baseline for the
+    // id==threshold comparison below. `last_notified_conclusion` is the per-sha
+    // AGGREGATE — when the two legitimately differ (the max-id run succeeded
+    // while a sibling workflow at the same sha carried the verdict), comparing
+    // the run against the aggregate never matches, so the same terminal run
+    // re-selected every poll (the #1991 ~60s storm). Legacy watch files
+    // (pre-#1991, field absent) fall back to the aggregate — the old behavior —
+    // and self-heal on the first notify that persists the new field.
+    let per_run_baseline = last_notified_run_conclusion.or(last_notified_conclusion);
     let mut selected: Vec<(usize, u64)> = runs
         .iter()
         .enumerate()
@@ -613,7 +623,7 @@ pub(crate) fn select_runs_to_notify(
                 // keeps the id+conclusion and only bumps the attempt, so an equal
                 // conclusion at a NEW attempt is a fresh event (flake re-run),
                 // not a stable terminal state. Suppress only when BOTH are equal.
-                let same_conclusion = run.conclusion.as_deref() == last_notified_conclusion;
+                let same_conclusion = run.conclusion.as_deref() == per_run_baseline;
                 let attempt_advanced =
                     last_notified_run_attempt.is_some_and(|prev| run.run_attempt > prev);
                 if same_conclusion && !attempt_advanced {
@@ -716,6 +726,52 @@ pub(crate) fn aggregate_conclusion_for_sha<'a>(runs: &'a [CiRun], sha: &str) -> 
     aggregate_conclusion_for_sha_filtered(runs, sha, None)
 }
 
+/// #1991: reduce a set of runs to ONE per workflow name — the latest attempt
+/// (max `(id, run_attempt)`). GitHub keeps superseded runs visible at the same
+/// sha (a concurrency-cancelled duplicate dispatch, an older attempt of a
+/// rerun); letting them vote in the verdict reported a `cancelled` branch
+/// verdict for an all-green head (the #1991 incident). Only the newest run of
+/// each workflow speaks for that workflow.
+fn latest_run_per_workflow<'a, I: IntoIterator<Item = &'a CiRun>>(runs: I) -> Vec<&'a CiRun> {
+    let mut best: std::collections::HashMap<&str, &CiRun> = std::collections::HashMap::new();
+    let mut unnamed: Vec<&CiRun> = Vec::new();
+    for r in runs {
+        if r.name.is_empty() {
+            // An empty workflow name is UNKNOWN provenance — two unnamed runs
+            // cannot be assumed to be the same workflow, so each keeps its
+            // voice (the pre-#1991 behavior). GitHub always names runs; this
+            // guards other providers / degraded parses against collapsing
+            // unrelated runs into one.
+            unnamed.push(r);
+            continue;
+        }
+        best.entry(r.name.as_str())
+            .and_modify(|e| {
+                if (r.id, r.run_attempt) > (e.id, e.run_attempt) {
+                    *e = r;
+                }
+            })
+            .or_insert(r);
+    }
+    let mut out: Vec<&CiRun> = best.into_values().collect();
+    out.extend(unnamed);
+    out
+}
+
+/// #1991: pick the run that should REPRESENT an aggregate verdict in the
+/// notification (URL, failure-log fetch). Must agree with the reported
+/// conclusion — pre-#1991 the body always linked the highest-id run, which
+/// produced "conclusion: cancelled" notifications linking a success run.
+/// Highest `(id, run_attempt)` among latest-per-workflow runs whose own
+/// conclusion equals the aggregate; None when nothing matches (caller keeps
+/// its anchor run as fallback).
+fn representative_run<'a>(runs: &'a [CiRun], sha: &str, aggregate: &str) -> Option<&'a CiRun> {
+    latest_run_per_workflow(runs.iter().filter(|r| r.head_sha == sha))
+        .into_iter()
+        .filter(|r| r.conclusion.as_deref() == Some(aggregate))
+        .max_by_key(|r| (r.id, r.run_attempt))
+}
+
 /// #1151: when `required_checks` is Some, only runs whose `name` matches
 /// (case-insensitive) are considered. Non-matching runs are ignored entirely.
 /// When None, all runs must pass (backward compat).
@@ -724,15 +780,13 @@ pub(crate) fn aggregate_conclusion_for_sha_filtered<'a>(
     sha: &str,
     required_checks: Option<&[String]>,
 ) -> Option<&'a str> {
-    let matching: Vec<&CiRun> = runs
-        .iter()
-        .filter(|r| r.head_sha == sha)
-        .filter(|r| {
+    // #1991: one voice per workflow — latest attempt only.
+    let matching: Vec<&CiRun> =
+        latest_run_per_workflow(runs.iter().filter(|r| r.head_sha == sha).filter(|r| {
             required_checks
                 .map(|checks| checks.iter().any(|c| c.eq_ignore_ascii_case(&r.name)))
                 .unwrap_or(true)
-        })
-        .collect();
+        }));
     if matching.is_empty() {
         return None;
     }
@@ -764,12 +818,13 @@ fn aggregate_conclusion_for_indices<'a>(
     indices: &std::collections::HashSet<usize>,
     sha: &str,
 ) -> Option<&'a str> {
-    let matching: Vec<&CiRun> = runs
-        .iter()
-        .enumerate()
-        .filter(|(i, r)| indices.contains(i) && r.head_sha == sha)
-        .map(|(_, r)| r)
-        .collect();
+    // #1991: same latest-attempt-per-workflow reduction as the sha aggregate.
+    let matching: Vec<&CiRun> = latest_run_per_workflow(
+        runs.iter()
+            .enumerate()
+            .filter(|(i, r)| indices.contains(i) && r.head_sha == sha)
+            .map(|(_, r)| r),
+    );
     if matching.is_empty() {
         return None;
     }
@@ -1130,6 +1185,8 @@ struct RunTracking<'a> {
     last_notified_sha: Option<&'a str>,
     last_notified_conclusion: Option<&'a str>,
     last_notified_run_attempt: Option<u64>,
+    // #1991: anchor run's own conclusion (vs the aggregate above).
+    last_notified_run_conclusion: Option<&'a str>,
     last_stale_emitted_sha: Option<&'a str>,
 }
 
@@ -1144,6 +1201,8 @@ struct NotifyOutcome {
     new_notified_sha: Option<String>,
     new_notified_conclusion: Option<String>,
     new_notified_run_attempt: Option<u64>,
+    // #1991: anchor run's own conclusion at notify time.
+    new_notified_run_conclusion: Option<String>,
     new_stale_emitted_sha: Option<String>,
 }
 
@@ -1190,12 +1249,14 @@ async fn ci_check_repo(
     let last_notified_sha = state.last_notified_head_sha.clone();
     let last_notified_conclusion = state.last_notified_conclusion.clone();
     let last_stale_emitted_sha = state.last_stale_emitted_sha.clone();
+    let last_notified_run_conclusion = state.last_notified_run_conclusion.clone();
     let tracking = RunTracking {
         last_run_id: state.last_run_id,
         prev_head_sha: prev_head_sha.as_deref(),
         last_notified_sha: last_notified_sha.as_deref(),
         last_notified_conclusion: last_notified_conclusion.as_deref(),
         last_notified_run_attempt: state.last_notified_run_attempt,
+        last_notified_run_conclusion: last_notified_run_conclusion.as_deref(),
         last_stale_emitted_sha: last_stale_emitted_sha.as_deref(),
     };
     let pr = match poll_ci_runs(&ctx, &tracking, &mut state, provider).await {
@@ -1229,19 +1290,37 @@ async fn ci_check_repo(
         pr.effective_last_run_id,
         tracking.last_notified_conclusion,
         tracking.last_notified_run_attempt,
+        tracking.last_notified_run_conclusion,
     );
     if to_notify.is_empty() {
+        // #1991: did anything actually change this cycle? A branch whose runs
+        // are all terminal and all already-notified produces an UNCHANGED
+        // quiet poll — pre-#1991 it still re-stamped `last_terminal_seen_at`
+        // and re-pushed `expires_at` +72h EVERY cycle, so a finished PR-less
+        // branch (spike/audit) polled forever (the #1991 quota burn: 7 stale
+        // watches × 60s). In-progress runs at the head keep the watch alive.
+        let head_in_progress = pr
+            .runs
+            .iter()
+            .any(|r| r.head_sha == pr.current_sha && r.conclusion.is_none());
+        let activity = head_in_progress
+            || state.last_run_id != pr.effective_last_run_id
+            || state.head_sha.as_deref() != Some(pr.current_sha.as_str());
         if let Some(id) = pr.effective_last_run_id {
             state.last_run_id = Some(id);
             if !pr.current_sha.is_empty() {
                 state.head_sha = Some(pr.current_sha.clone());
             }
-            state.last_terminal_seen_at = Some(chrono::Utc::now().to_rfc3339());
+            if activity {
+                state.last_terminal_seen_at = Some(chrono::Utc::now().to_rfc3339());
+            }
         }
         if state != snapshot {
             flush_watch_state(watch_path, &state);
         }
-        refresh_expires_at(watch_path);
+        if activity {
+            refresh_expires_at(watch_path);
+        }
         return Ok(());
     }
     let deduped = dedupe_notifications_by_head_sha(
@@ -1488,6 +1567,7 @@ async fn fan_out_notifications(
     let mut new_notified_sha = tracking.last_notified_sha.map(String::from);
     let mut new_notified_conclusion = tracking.last_notified_conclusion.map(String::from);
     let mut new_notified_run_attempt = tracking.last_notified_run_attempt;
+    let mut new_notified_run_conclusion = tracking.last_notified_run_conclusion.map(String::from);
     let mut new_stale_emitted_sha = tracking.last_stale_emitted_sha.map(String::from);
 
     for (idx, run_id, sha) in deduped {
@@ -1505,6 +1585,7 @@ async fn fan_out_notifications(
                 new_notified_sha = Some(sha.to_string());
                 new_notified_conclusion = conclusion.map(String::from);
                 new_notified_run_attempt = Some(run.run_attempt);
+                new_notified_run_conclusion = run.conclusion.clone();
                 continue;
             }
             tracing::info!(
@@ -1517,6 +1598,7 @@ async fn fan_out_notifications(
             new_notified_sha = Some(sha.to_string());
             new_notified_conclusion = conclusion.map(String::from);
             new_notified_run_attempt = Some(run.run_attempt);
+            new_notified_run_conclusion = run.conclusion.clone();
             new_stale_emitted_sha = Some(sha.to_string());
             continue;
         }
@@ -1524,8 +1606,16 @@ async fn fan_out_notifications(
         if let Some(headline) =
             ci_notification_message(ctx.repo, ctx.branch, conclusion, None, Some(sha))
         {
+            // #1991: the linked URL / fetched failure logs must come from a run
+            // whose own conclusion matches the verdict being reported. The
+            // anchor (`run`, highest id at the sha) can be e.g. a success run
+            // while a sibling workflow carried the failure — pre-#1991 the body
+            // linked the wrong run (and fetched failure logs from a green run).
+            let rep = conclusion
+                .and_then(|c| representative_run(&pr.runs, sha, c))
+                .unwrap_or(run);
             let failure_detail = if conclusion == Some("failure") {
-                Some(provider.fetch_failure_summary(ctx.repo, *run_id).await)
+                Some(provider.fetch_failure_summary(ctx.repo, rep.id).await)
             } else {
                 None
             };
@@ -1534,9 +1624,7 @@ async fn fan_out_notifications(
             // ci runtime (the provider impl uses `gh … --log-failed` via
             // tokio::process — never block_on the shared runtime, #1476).
             let log_tail = if conclusion == Some("failure") {
-                provider
-                    .fetch_failure_log_tail(ctx.repo, *run_id, 120)
-                    .await
+                provider.fetch_failure_log_tail(ctx.repo, rep.id, 120).await
             } else {
                 None
             };
@@ -1544,8 +1632,8 @@ async fn fan_out_notifications(
                 &headline,
                 conclusion.unwrap_or(""),
                 failure_detail.as_deref(),
-                &run.url,
-                Some(*run_id),
+                &rep.url,
+                Some(rep.id),
                 log_tail.as_deref(),
             );
 
@@ -1621,6 +1709,10 @@ async fn fan_out_notifications(
         new_notified_sha = Some(sha.to_string());
         new_notified_conclusion = conclusion.map(String::from);
         new_notified_run_attempt = Some(run.run_attempt);
+        // #1991: persist the ANCHOR run's own conclusion — gate 1 compares the
+        // id==threshold run against this (per-run vs per-run), not against the
+        // aggregate (the pre-#1991 oscillation).
+        new_notified_run_conclusion = run.conclusion.clone();
     }
 
     NotifyOutcome {
@@ -1628,6 +1720,7 @@ async fn fan_out_notifications(
         new_notified_sha,
         new_notified_conclusion,
         new_notified_run_attempt,
+        new_notified_run_conclusion,
         new_stale_emitted_sha,
     }
 }
@@ -1798,6 +1891,9 @@ fn persist_watch_state(
     }
     if let Some(a) = outcome.new_notified_run_attempt {
         state.last_notified_run_attempt = Some(a);
+    }
+    if let Some(c) = &outcome.new_notified_run_conclusion {
+        state.last_notified_run_conclusion = Some(c.clone());
     }
     if let Some(s) = &outcome.new_stale_emitted_sha {
         state.last_stale_emitted_sha = Some(s.clone());

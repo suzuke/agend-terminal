@@ -291,10 +291,14 @@ fn ci_unwatch_removes_caller_only_when_others_remain() {
 }
 
 #[test]
-fn ci_unwatch_deletes_file_when_subscribers_empty() {
-    // Hard contract item 5 (b): only the LAST unwatch deletes the
-    // file. Without this, the watch leaks rate-limit budget on a
-    // branch nobody cares about anymore.
+fn ci_unwatch_last_subscriber_leaves_tombstone_not_delete() {
+    // Hard contract item 5 (b), REVISED by #1991: the LAST unwatch used to
+    // DELETE the file — but PR-3 auto-arm re-arms any open PR whose watch
+    // file is absent, so the delete re-subscribed the just-unwatched agent
+    // ~60s later. The last unwatch now leaves a subscriber-less TOMBSTONE:
+    // never polled (prepare_poll_context skips empty-subscriber watches, so
+    // the rate-limit budget is still protected), never re-armed, reaped by
+    // sweep GC via the existing TTL / PR-terminal paths.
     let home = std::env::temp_dir().join(format!("agend-unwatch-delete-{}", std::process::id()));
     std::fs::create_dir_all(&home).ok();
     let args = serde_json::json!({"repository": "owner/repo", "branch": "feat-test"});
@@ -311,7 +315,13 @@ fn ci_unwatch_deletes_file_when_subscribers_empty() {
     let resp = handle_unwatch_ci(&home, &unwatch_args);
 
     assert_eq!(resp["watching"].as_bool(), Some(false));
-    assert!(!path.exists(), "last subscriber unwatch must delete file");
+    assert!(
+        path.exists(),
+        "#1991: last unwatch leaves a tombstone (deletion re-armed via PR-3)"
+    );
+    let v = read_watch(&path);
+    assert_eq!(v["auto_arm_optout"], true);
+    assert!(crate::daemon::ci_watch::parse_subscribers(&v).is_empty());
     std::fs::remove_dir_all(&home).ok();
 }
 
@@ -2400,4 +2410,66 @@ fn merge_view_unconfirmed_when_merged_state_but_no_commit() {
         super::classify_merge_summary(&summary),
         super::MergeVerdict::Unconfirmed { .. }
     ));
+}
+
+// ── #1991: unwatch tombstone — explicit unwatch must STICK against PR-3 auto-arm ──
+
+#[test]
+fn unwatch_to_empty_leaves_tombstone_1991() {
+    let home = watch_test_home("1991-tombstone");
+    super::handle_watch_ci(
+        &home,
+        &serde_json::json!({"repository": "o/r", "branch": "feat/x"}),
+        "dev-1",
+    );
+    let resp = super::handle_unwatch_ci(
+        &home,
+        &serde_json::json!({"repository": "o/r", "branch": "feat/x", "instance": "dev-1"}),
+    );
+    assert_eq!(resp["watching"], false);
+    assert_eq!(resp["tombstone"], true);
+
+    let path = watch_path_for(&home, "o/r", "feat/x");
+    assert!(
+        path.exists(),
+        "#1991: the watch file must remain as a tombstone — deleting it lets \
+         PR-3 auto-arm re-subscribe the agent that just unwatched"
+    );
+    let v = read_watch(&path);
+    assert_eq!(v["auto_arm_optout"], true);
+    assert!(
+        crate::daemon::ci_watch::parse_subscribers(&v).is_empty(),
+        "tombstone carries no subscribers"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn rewatch_clears_tombstone_optout_1991() {
+    let home = watch_test_home("1991-rewatch");
+    super::handle_watch_ci(
+        &home,
+        &serde_json::json!({"repository": "o/r", "branch": "feat/x"}),
+        "dev-1",
+    );
+    super::handle_unwatch_ci(
+        &home,
+        &serde_json::json!({"repository": "o/r", "branch": "feat/x", "instance": "dev-1"}),
+    );
+    // Explicit re-watch: the human decision overrides the optout.
+    super::handle_watch_ci(
+        &home,
+        &serde_json::json!({"repository": "o/r", "branch": "feat/x"}),
+        "dev-2",
+    );
+    let v = read_watch(&watch_path_for(&home, "o/r", "feat/x"));
+    assert!(
+        v.get("auto_arm_optout").is_none(),
+        "explicit re-watch must clear the optout: {v}"
+    );
+    assert_eq!(
+        crate::daemon::ci_watch::parse_subscribers(&v),
+        vec!["dev-2".to_string()]
+    );
+    std::fs::remove_dir_all(&home).ok();
 }

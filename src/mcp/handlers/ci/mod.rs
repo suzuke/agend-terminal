@@ -689,6 +689,11 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
     // files can still read SOMEONE. Set to first subscriber, removed
     // Sprint 55. Post-r0 daemons read `subscribers` first.
     watch["instance"] = json!(subscribers.first().cloned().unwrap_or_default());
+    // #1991: an explicit (re-)watch overrides a prior unwatch tombstone —
+    // the human/agent decision to watch again clears the auto-arm optout.
+    if let Some(obj) = watch.as_object_mut() {
+        obj.remove("auto_arm_optout");
+    }
     // Refresh expires_at on each subscribe — keeps the watch alive
     // as long as at least one agent stays interested.
     watch["expires_at"] = json!((chrono::Utc::now()
@@ -806,7 +811,9 @@ fn compute_next_poll_eta(watch: &Value) -> Option<i64> {
 /// Sprint 54 P0-1: only the caller is removed from the `subscribers`
 /// array. The watch file is deleted only when the array becomes empty
 /// (no other agent is still interested in this branch).
-pub(super) fn handle_unwatch_ci(home: &Path, args: &Value) -> Value {
+// pub(crate): the #1991 auto-arm tombstone regression test (pr_state::auto_arm)
+// exercises the real unwatch → tombstone → no-re-arm chain.
+pub(crate) fn handle_unwatch_ci(home: &Path, args: &Value) -> Value {
     let repo = match args["repository"].as_str() {
         Some(r) => r,
         None => return json!({"error": "missing 'repository'"}),
@@ -844,11 +851,33 @@ pub(super) fn handle_unwatch_ci(home: &Path, args: &Value) -> Value {
     }
 
     if subscribers.is_empty() {
-        let _ = std::fs::remove_file(&path);
+        // #1991: keep the file as a TOMBSTONE instead of deleting it. PR-3
+        // auto-arm (`pr_state::auto_arm`) re-arms any open PR whose watch file
+        // is ABSENT — deleting here re-subscribed the very agent that just
+        // unwatched, ~60s later (the #1991 storm: unwatch → file gone → next
+        // pr_state scan auto-arms → notifications resume). A subscriber-less
+        // watch is never polled (`prepare_poll_context` → SkipReason::Invalid)
+        // and sweep GC reaps it via the existing TTL / PR-terminal paths; an
+        // explicit `ci watch` clears the flag (handle_watch_ci).
+        watch["subscribers"] = json!([]);
+        watch["instance"] = json!("");
+        watch["auto_arm_optout"] = json!(true);
+        if let Err(e) = crate::store::atomic_write(
+            &path,
+            serde_json::to_string_pretty(&watch)
+                .unwrap_or_default()
+                .as_bytes(),
+        ) {
+            return json!({
+                "error": format!("failed to persist unwatch tombstone: {e}"),
+                "code": "unwatch_write_failed",
+            });
+        }
         return json!({
             "repo": repo,
             "watching": false,
             "subscribers": Vec::<String>::new(),
+            "tombstone": true,
         });
     }
 

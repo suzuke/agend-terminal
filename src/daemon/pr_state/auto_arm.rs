@@ -233,6 +233,43 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// #1991: an explicit `ci unwatch` leaves a TOMBSTONE (empty-subscriber
+    /// watch file with `auto_arm_optout`) precisely so this sweep does NOT
+    /// re-arm it. Pre-#1991 unwatch DELETED the file, the next pr_state scan
+    /// re-armed the open PR, and the just-unwatched agent was re-subscribed
+    /// ~60s later (the #1991 storm's unstoppable-from-agent-side half).
+    #[test]
+    fn unwatch_tombstone_is_not_rearmed_1991() {
+        let home = tmp_home("tombstone");
+        bind(&home, "dev-x", "feat/x");
+        // Arm, then explicitly unwatch to a tombstone.
+        crate::mcp::handlers::ci::handle_watch_ci(
+            &home,
+            &serde_json::json!({"repository": REPO, "branch": "feat/x"}),
+            "dev-x",
+        );
+        crate::mcp::handlers::ci::handle_unwatch_ci(
+            &home,
+            &serde_json::json!({"repository": REPO, "branch": "feat/x", "instance": "dev-x"}),
+        );
+        assert!(
+            watch_exists(&home, "feat/x"),
+            "precondition: unwatch leaves a tombstone file"
+        );
+        // The PR is still open and the agent still bound — the exact shape
+        // that pre-#1991 re-armed every scan.
+        auto_arm_unwatched_open_prs(
+            &home,
+            REPO,
+            &[meta("feat/x", GhPrState::Open, false, false)],
+        );
+        assert!(
+            watch_subscribers(&home, "feat/x").is_empty(),
+            "auto-arm must respect the unwatch tombstone (no re-subscribe)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     #[test]
     fn open_pr_no_bound_agent_fails_loud_no_arm() {
         let home = tmp_home("failloud");

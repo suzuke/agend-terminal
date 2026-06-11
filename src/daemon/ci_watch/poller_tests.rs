@@ -418,7 +418,7 @@ fn test_multi_run_notifies_all_terminal_since_last() {
             name: String::new(),
         },
     ];
-    let selected = select_runs_to_notify(&runs, Some(99), None, None);
+    let selected = select_runs_to_notify(&runs, Some(99), None, None, None);
     assert_eq!(
         selected,
         vec![0, 1],
@@ -436,7 +436,7 @@ fn test_in_progress_does_not_appear_in_selection() {
         url: String::new(),
         name: String::new(),
     }];
-    let selected = select_runs_to_notify(&runs, None, None, None);
+    let selected = select_runs_to_notify(&runs, None, None, None, None);
     assert!(selected.is_empty(), "in-progress run must not be selected");
 }
 
@@ -468,7 +468,7 @@ fn test_mixed_terminal_states_all_notified() {
             name: String::new(),
         },
     ];
-    let selected = select_runs_to_notify(&runs, Some(299), None, None);
+    let selected = select_runs_to_notify(&runs, Some(299), None, None, None);
     assert_eq!(
         selected,
         vec![0, 1, 2],
@@ -502,7 +502,7 @@ fn test_already_notified_runs_skipped() {
     // would legitimately fire (which is the bug fix). Passing
     // Some("success") here preserves the original pre-#786 intent
     // of this test (suppress stable terminal state).
-    let selected = select_runs_to_notify(&runs, Some(400), Some("success"), None);
+    let selected = select_runs_to_notify(&runs, Some(400), Some("success"), None, None);
     assert_eq!(
         selected,
         vec![1],
@@ -530,7 +530,7 @@ fn test_same_head_sha_deduplicates_notification() {
             name: String::new(),
         },
     ];
-    let selected = select_runs_to_notify(&runs, Some(499), None, None);
+    let selected = select_runs_to_notify(&runs, Some(499), None, None, None);
     let deduped = dedupe_notifications_by_head_sha(&runs, &selected, None, None, None);
     assert_eq!(deduped.len(), 1, "same sha → 1 notification");
     assert_eq!(deduped[0].1, 501, "latest run_id wins");
@@ -561,7 +561,7 @@ fn test_dedupe_skips_already_notified_sha() {
     // the conclusion match. Passing Some("success") here preserves
     // the pre-#786 intent — a future PR could add a same-sha
     // different-conclusion test (handled by anchor test 5).
-    let selected = select_runs_to_notify(&runs, Some(599), None, None);
+    let selected = select_runs_to_notify(&runs, Some(599), None, None, None);
     let deduped =
         dedupe_notifications_by_head_sha(&runs, &selected, Some("aaa"), Some("success"), None);
     assert_eq!(
@@ -599,7 +599,7 @@ fn test_1042_same_sha_same_aggregate_suppresses_rebroadcast() {
             name: String::new(),
         },
     ];
-    let selected = select_runs_to_notify(&runs, Some(699), None, None);
+    let selected = select_runs_to_notify(&runs, Some(699), None, None, None);
     assert_eq!(selected.len(), 2, "both runs should pass site-1 filter");
     let deduped =
         dedupe_notifications_by_head_sha(&runs, &selected, Some("abc"), Some("failure"), None);
@@ -633,7 +633,7 @@ fn test_1042_same_sha_different_aggregate_fires() {
             name: String::new(),
         },
     ];
-    let selected = select_runs_to_notify(&runs, Some(799), None, None);
+    let selected = select_runs_to_notify(&runs, Some(799), None, None, None);
     let deduped =
         dedupe_notifications_by_head_sha(&runs, &selected, Some("abc"), Some("failure"), None);
     assert_eq!(
@@ -669,7 +669,7 @@ fn test_1307_rerun_pass_same_sha_fires_notification() {
         },
     ];
     // last_run_id=900: gate 1 filters out run 900 (same id, same conclusion)
-    let selected = select_runs_to_notify(&runs, Some(900), Some("failure"), None);
+    let selected = select_runs_to_notify(&runs, Some(900), Some("failure"), None, None);
     assert_eq!(selected, vec![1], "only rerun (id=901) should pass gate 1");
     // gate 2: same SHA as last notified, but aggregate should use only
     // to_notify runs (success), not all runs (which includes old failure)
@@ -702,7 +702,7 @@ fn test_different_head_sha_triggers_new_notification() {
             name: String::new(),
         },
     ];
-    let selected = select_runs_to_notify(&runs, Some(599), None, None);
+    let selected = select_runs_to_notify(&runs, Some(599), None, None, None);
     let deduped = dedupe_notifications_by_head_sha(&runs, &selected, None, None, None);
     assert_eq!(deduped.len(), 2, "different shas → 2 notifications");
 }
@@ -5951,12 +5951,12 @@ fn rerun_run(attempt: u64) -> CiRun {
 fn select_runs_to_notify_attempt_advance_1859_fixb() {
     // last notified: run_id 7, success, attempt 1. Same attempt → suppress.
     assert!(
-        select_runs_to_notify(&[rerun_run(1)], Some(7), Some("success"), Some(1)).is_empty(),
+        select_runs_to_notify(&[rerun_run(1)], Some(7), Some("success"), Some(1), None).is_empty(),
         "same id+conclusion+attempt → suppress (stable terminal state)"
     );
     // Advanced attempt (1→2) at the same conclusion → selected (the rerun).
     assert_eq!(
-        select_runs_to_notify(&[rerun_run(2)], Some(7), Some("success"), Some(1)),
+        select_runs_to_notify(&[rerun_run(2)], Some(7), Some("success"), Some(1), None),
         vec![0],
         "#1859 Fix B: attempt 1→2, same conclusion → select (rerun is a fresh event)"
     );
@@ -6048,6 +6048,285 @@ fn ci_check_repo_rerun_renotifies_once_1859_fixb() {
         poll(2),
         0,
         "anti-over-notify: a stable attempt does NOT re-notify on the next poll"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ── #1991: superseded-run verdict poisoning + dedup oscillation + hygiene ──
+//
+// Incident (first-hand, 2026-06-11): a branch head with three runs — an older
+// concurrency-cancelled duplicate "LOC" run, the newer success "LOC" run, and a
+// success "CI" run — was reported as `[ci-ended] cancelled` (linking the SUCCESS
+// run's URL), re-fired every ~60s, and survived subscriber-side unwatch because
+// PR-3 auto-arm re-created the deleted watch file.
+
+fn run_1991(id: u64, name: &str, conclusion: Option<&str>, sha: &str) -> CiRun {
+    CiRun {
+        run_attempt: 1,
+        id,
+        conclusion: conclusion.map(String::from),
+        head_sha: sha.into(),
+        url: format!("https://example/run/{id}"),
+        name: name.into(),
+    }
+}
+
+/// The incident's run set, verbatim shape.
+fn incident_runs_1991() -> Vec<CiRun> {
+    vec![
+        run_1991(45, "LOC Overrun Check", Some("cancelled"), "e7ca3d9"),
+        run_1991(146, "CI", Some("success"), "e7ca3d9"),
+        run_1991(148, "LOC Overrun Check", Some("success"), "e7ca3d9"),
+    ]
+}
+
+/// Verdict: a superseded duplicate run at the same sha must not vote — only
+/// the latest attempt per workflow speaks. Pre-#1991 this aggregated to
+/// `cancelled` on an all-green head.
+#[test]
+fn aggregate_ignores_superseded_duplicate_run_1991() {
+    let runs = incident_runs_1991();
+    assert_eq!(
+        aggregate_conclusion_for_sha(&runs, "e7ca3d9"),
+        Some("success"),
+        "older cancelled duplicate of LOC must not poison the verdict"
+    );
+}
+
+/// A GENUINE cancel (the workflow's latest run is the cancelled one) must
+/// still be reported — the reduction keys on latest-per-workflow, it does not
+/// blanket-drop cancelled runs.
+#[test]
+fn aggregate_genuine_cancel_still_reported_1991() {
+    let runs = vec![
+        run_1991(146, "CI", Some("success"), "abc"),
+        run_1991(150, "LOC Overrun Check", Some("cancelled"), "abc"),
+    ];
+    assert_eq!(
+        aggregate_conclusion_for_sha(&runs, "abc"),
+        Some("cancelled"),
+        "latest run of a workflow being cancelled IS the verdict"
+    );
+}
+
+/// Fail-fast must survive the reduction: latest attempt of one workflow
+/// failing → failure, regardless of green duplicates elsewhere.
+#[test]
+fn aggregate_fail_fast_with_duplicates_unaffected_1991() {
+    let runs = vec![
+        run_1991(45, "CI", Some("success"), "abc"), // superseded CI success
+        run_1991(146, "CI", Some("failure"), "abc"), // latest CI failed
+        run_1991(148, "LOC Overrun Check", Some("success"), "abc"),
+    ];
+    assert_eq!(aggregate_conclusion_for_sha(&runs, "abc"), Some("failure"));
+}
+
+/// A superseded run that was terminal while the LATEST attempt is still
+/// in-progress must read as in-progress (None), not as the stale terminal.
+#[test]
+fn aggregate_waits_on_latest_in_progress_1991() {
+    let runs = vec![
+        run_1991(45, "CI", Some("failure"), "abc"), // old attempt failed
+        run_1991(146, "CI", None, "abc"),           // rerun in flight
+    ];
+    assert_eq!(
+        aggregate_conclusion_for_sha(&runs, "abc"),
+        None,
+        "latest attempt in-progress → wait, the superseded failure must not fail-fast"
+    );
+}
+
+/// URL/conclusion consistency: the representative run must carry the SAME
+/// conclusion as the reported verdict. Pre-#1991 the body linked the
+/// highest-id run unconditionally (a success URL under a `cancelled`
+/// headline; failure logs fetched from a green run).
+#[test]
+fn representative_run_matches_reported_verdict_1991() {
+    let runs = incident_runs_1991();
+    let rep = representative_run(&runs, "e7ca3d9", "success").expect("rep");
+    assert_eq!(rep.conclusion.as_deref(), Some("success"));
+    assert_eq!(rep.id, 148, "highest-id run matching the verdict");
+
+    // Failure verdict → the FAILING run is linked, not the higher-id green one.
+    let runs = vec![
+        run_1991(146, "CI", Some("failure"), "abc"),
+        run_1991(148, "LOC Overrun Check", Some("success"), "abc"),
+    ];
+    let rep = representative_run(&runs, "abc", "failure").expect("rep");
+    assert_eq!(rep.id, 146, "failure verdict must link the failing run");
+}
+
+/// Gate 1 oscillation (the ~60s storm): once notified, an UNCHANGED terminal
+/// run set must select nothing on the next cycle. The per-run baseline
+/// (`last_notified_run_conclusion`) is what breaks the loop — pre-#1991 the
+/// anchor run's `success` was compared against the persisted AGGREGATE
+/// (`cancelled`), never matched, and re-selected forever.
+#[test]
+fn select_runs_per_run_baseline_suppresses_stable_state_1991() {
+    let runs = incident_runs_1991();
+    // Post-notify persisted state: last_run_id=148 (anchor), aggregate
+    // conclusion "success" (post-fix), anchor's own conclusion "success".
+    let selected =
+        select_runs_to_notify(&runs, Some(148), Some("success"), Some(1), Some("success"));
+    assert!(
+        selected.is_empty(),
+        "unchanged terminal set must not re-select: {selected:?}"
+    );
+
+    // Pre-#1991 persisted shape (aggregate `cancelled`, per-run field ABSENT —
+    // a legacy watch file): the legacy fallback compares against the aggregate
+    // and re-selects once; the notify then persists the per-run field and the
+    // NEXT cycle (above) is quiet. Pin the self-healing single re-fire.
+    let selected = select_runs_to_notify(&runs, Some(148), Some("cancelled"), Some(1), None);
+    assert_eq!(
+        selected.len(),
+        1,
+        "legacy fallback: one self-healing re-selection, then the new field takes over"
+    );
+}
+
+/// End-to-end storm regression: two consecutive poll cycles over the incident
+/// run set deliver exactly ONE notification — and it is a PASS (the duplicate
+/// cancelled run neither poisons the verdict nor re-fires).
+#[test]
+fn storm_regression_two_cycles_notify_once_1991() {
+    let dir = tmp_dir("1991-storm");
+    let ci_dir = dir.join("ci-watches");
+    std::fs::create_dir_all(&ci_dir).ok();
+    let watch = serde_json::json!({
+        "repo": "o/r", "branch": "feat", "interval_secs": 60,
+        "instance": "agent1", "last_run_id": null, "head_sha": null,
+        "last_polled_at": null, "last_notified_head_sha": null,
+    });
+    let provider = MockCiProvider::with_runs(incident_runs_1991());
+
+    // Cycle 1: notifies once.
+    run_ci_check(&dir, &watch, &provider).unwrap();
+    let msgs = crate::inbox::drain(&dir, "agent1");
+    assert_eq!(
+        msgs.iter().filter(|m| m.text.contains("o/r@feat")).count(),
+        1,
+        "cycle 1 must notify exactly once: {msgs:?}"
+    );
+    assert!(
+        msgs.iter().any(|m| m.text.contains("[ci-pass]")),
+        "verdict must be PASS (duplicate cancelled run must not poison): {msgs:?}"
+    );
+
+    // Cycle 2: same runs, persisted state — must be SILENT.
+    let watch_path = ci_dir.join(watch_filename("o/r", "feat"));
+    let persisted: WatchState =
+        serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();
+    assert_eq!(
+        persisted.last_notified_run_conclusion.as_deref(),
+        Some("success"),
+        "anchor run's own conclusion must be persisted"
+    );
+    let registry: AgentRegistry =
+        Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    // MockCiProvider is single-shot (poll_runs take()s) — fresh one per cycle.
+    let provider2 = MockCiProvider::with_runs(incident_runs_1991());
+    rt.block_on(ci_check_repo(
+        &dir,
+        &watch_path,
+        persisted,
+        vec!["agent1".to_string()],
+        &registry,
+        &provider2,
+    ))
+    .unwrap();
+    let msgs2 = crate::inbox::drain(&dir, "agent1");
+    assert!(
+        msgs2.is_empty(),
+        "cycle 2 must not re-notify the unchanged terminal state (the #1991 storm): {msgs2:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Hygiene: a quiet poll over an unchanged, fully-terminal run set must NOT
+/// refresh `expires_at` (nor `last_terminal_seen_at`) — pre-#1991 every such
+/// cycle pushed expiry +72h, keeping finished PR-less branches polling
+/// forever. An in-progress run at head still refreshes.
+#[test]
+fn quiet_terminal_poll_does_not_refresh_expires_1991() {
+    let dir = tmp_dir("1991-quiet-expiry");
+    let ci_dir = dir.join("ci-watches");
+    std::fs::create_dir_all(&ci_dir).ok();
+    let watch = serde_json::json!({
+        "repo": "o/r", "branch": "feat", "interval_secs": 60,
+        "instance": "agent1",
+    });
+    let provider = MockCiProvider::with_runs(incident_runs_1991());
+    // Cycle 1 (notifies → refreshes, expected).
+    run_ci_check(&dir, &watch, &provider).unwrap();
+    crate::inbox::drain(&dir, "agent1");
+
+    // Pin expires_at to a recognizable value, then run a QUIET cycle.
+    let watch_path = ci_dir.join(watch_filename("o/r", "feat"));
+    let mut persisted: WatchState =
+        serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();
+    let pinned = (chrono::Utc::now() + chrono::Duration::hours(24)).to_rfc3339();
+    persisted.expires_at = Some(pinned.clone());
+    let pinned_seen = persisted.last_terminal_seen_at.clone();
+    std::fs::write(
+        &watch_path,
+        serde_json::to_string_pretty(&persisted).unwrap(),
+    )
+    .unwrap();
+    let registry: AgentRegistry =
+        Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    // MockCiProvider is single-shot (poll_runs take()s) — fresh one per cycle.
+    let provider2 = MockCiProvider::with_runs(incident_runs_1991());
+    rt.block_on(ci_check_repo(
+        &dir,
+        &watch_path,
+        persisted,
+        vec!["agent1".to_string()],
+        &registry,
+        &provider2,
+    ))
+    .unwrap();
+    let after: WatchState =
+        serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();
+    assert_eq!(
+        after.expires_at.as_deref(),
+        Some(pinned.as_str()),
+        "quiet terminal cycle must not refresh expires_at"
+    );
+    assert_eq!(
+        after.last_terminal_seen_at, pinned_seen,
+        "quiet terminal cycle must not re-stamp last_terminal_seen_at"
+    );
+
+    // Contrast: an in-progress run at head IS activity → refresh.
+    let mut runs = incident_runs_1991();
+    runs.push(run_1991(200, "Coverage", None, "e7ca3d9"));
+    let provider_active = MockCiProvider::with_runs(runs);
+    let persisted: WatchState =
+        serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();
+    rt.block_on(ci_check_repo(
+        &dir,
+        &watch_path,
+        persisted,
+        vec!["agent1".to_string()],
+        &registry,
+        &provider_active,
+    ))
+    .unwrap();
+    let after: WatchState =
+        serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();
+    assert_ne!(
+        after.expires_at.as_deref(),
+        Some(pinned.as_str()),
+        "in-progress run at head must refresh expires_at (watch is alive)"
     );
     std::fs::remove_dir_all(&dir).ok();
 }
