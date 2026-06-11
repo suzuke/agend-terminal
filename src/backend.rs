@@ -56,10 +56,15 @@ impl Backend {
     /// and that therefore emit authoritative `hook_shadow` state events. Only
     /// these have hook data to PROMOTE over the screen heuristic; every other
     /// backend always uses the heuristic (no hooks fire, so `resolved_state_for`
-    /// stays `Unknown` → heuristic fallback). claude + agy (claude-family
-    /// settings consumers).
+    /// stays `Unknown` → heuristic fallback).
+    ///
+    /// **claude-only in v1.** `configure_agy` does NOT inject the hooks, and
+    /// production data confirmed it (2026-06-11: ai-scout/agy emitted **0** hook
+    /// events all day, including during a real 16:14 task run; all 3,490 events
+    /// came from claude). Re-adding Agy requires the injection implementation AND
+    /// shadow-data evidence that its hooks fire — not just the enum membership.
     pub fn has_state_hooks(&self) -> bool {
-        matches!(self, Backend::ClaudeCode | Backend::Agy)
+        matches!(self, Backend::ClaudeCode)
     }
 
     /// #1440: credential env-var names this backend legitimately needs to
