@@ -1461,11 +1461,13 @@ fn read_envelopes_strict(path: &Path, out: &mut Vec<TaskEventEnvelope>) -> anyho
         // (2) FUTURE-VERSION line — valid JSON, but `schema_version` exceeds what
         //     this binary understands: a VALID event a NEWER daemon wrote. Keep
         //     the WHOLE-FILE fail-closed ABORT (deliberately NOT a per-record
-        //     skip): if this older daemon operated on the partial board it had
-        //     skipped, a later `compact()` would rewrite the hot log WITHOUT those
-        //     newer events → permanent loss of the newer daemon's task state.
-        //     Aborting refuses to operate at all, forcing the operator back to the
-        //     newer binary. This is the intended forward-compat protection.
+        //     skip) on CORRECTNESS grounds: an event we cannot decode may change
+        //     task state in ways we cannot see (a newer done/reassign/close
+        //     variant), so skipping it and serving the rest would have this
+        //     daemon act on a PARTIAL, MISREAD board — e.g. re-dispatching a task
+        //     a newer event already closed. Aborting refuses to operate until the
+        //     operator runs a binary new enough to read the whole log. This is
+        //     the intended forward-compat protection.
         let version = value
             .get("schema_version")
             .and_then(|v| v.as_u64())
@@ -1483,10 +1485,10 @@ fn read_envelopes_strict(path: &Path, out: &mut Vec<TaskEventEnvelope>) -> anyho
         //     version that still won't decode into a `TaskEventEnvelope`: an
         //     unknown event `kind` or a missing required field (a newer daemon
         //     that added an event variant WITHOUT bumping the version, or a
-        //     hand-edit). This is the SAME hazard as case (2) — a real event we
-        //     cannot apply — so ABORT, do NOT skip (skipping would let compaction
-        //     silently drop it). Garbage from a half-write fails case (1)'s JSON
-        //     parse first and never reaches here.
+        //     hand-edit). Same hazard as case (2) — a real event we cannot apply
+        //     — so ABORT, not skip: serving a board that silently omits it is the
+        //     same partial/misread-state risk. Garbage from a half-write fails
+        //     case (1)'s JSON parse first and never reaches here.
         let env: TaskEventEnvelope = serde_json::from_value(value).map_err(|e| {
             anyhow::anyhow!(
                 "{}:{}: replay aborts on undeserializable envelope at supported schema (fail-closed): {e}",
@@ -1556,6 +1558,10 @@ pub fn recover_half_writes(home: &Path) {
         for l in &bad {
             let _ = writeln!(rf, "{l}");
         }
+        // fsync the forensic copy before the hot log is rewritten below: if we
+        // crash between the two, the quarantined line must already be durable or
+        // it is lost for good (the rewrite drops it from the live log).
+        let _ = rf.sync_all();
     }
     // Rewrite the hot log with only the good lines via tmp + fsync + atomic
     // rename (mirrors compaction's write-back) so every valid event survives.
