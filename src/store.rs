@@ -5,6 +5,80 @@
 use serde::{de::DeserializeOwned, Serialize};
 use std::path::{Path, PathBuf};
 
+/// #1990 item 2: paths already surfaced this boot, so a corrupt store emits ONE
+/// operator-visible `event_log` entry per (boot, path) rather than one per tick.
+/// Boot-scoped (a restart re-surfaces — the corruption either healed or persists).
+static CORRUPT_SURFACED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+    std::sync::OnceLock::new();
+
+/// #2008 #8: move a corrupt store file to `backup` before the caller falls back
+/// to DEFAULT. Prefer an atomic `rename` — it takes the corrupt bytes OFF the
+/// live path, so the next `save` cannot race-overwrite them; fall back to `copy`
+/// across filesystems (EXDEV). Returns whether the bytes were preserved. The
+/// prior `let _ = std::fs::copy(...)` swallowed the failure, making the "backing
+/// up" warn a LIE and letting the next save destroy the only copy — so a total
+/// failure now logs at ERROR.
+fn backup_corrupt_file(path: &Path, backup: &Path) -> bool {
+    if std::fs::rename(path, backup).is_ok() {
+        return true;
+    }
+    match std::fs::copy(path, backup) {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::error!(
+                path = %path.display(),
+                backup = %backup.display(),
+                error = %e,
+                "store load: FAILED to back up corrupt file (rename + copy both failed) — it may be lost on the next save"
+            );
+            false
+        }
+    }
+}
+
+/// #1990 item 2: back up a corrupt store and SURFACE it to the operator before
+/// the caller returns DEFAULT (empty) state. The loss semantics are unchanged —
+/// the whole store still resets (per-record rescue is deferred) — but it is no
+/// longer SILENT: ERROR-log every occurrence (greppable) + one `event_log` entry
+/// per (boot, path) [the #1972/#2002 latch], so an operator sees "store X corrupt,
+/// backed up to Y, running empty" instead of a store mysteriously emptying.
+fn handle_corrupt_store(path: &Path, error: &str) {
+    let backup = path.with_extension(format!(
+        "corrupt.{}",
+        chrono::Utc::now().format("%Y%m%d%H%M%S")
+    ));
+    let backed_up = backup_corrupt_file(path, &backup);
+    tracing::error!(
+        path = %path.display(),
+        backup = %backup.display(),
+        backed_up,
+        error,
+        "store load: corrupt JSON — running with DEFAULT (empty) state until the next write"
+    );
+    let surfaced = CORRUPT_SURFACED.get_or_init(Default::default);
+    let first = surfaced
+        .lock()
+        .map(|mut s| s.insert(path.to_path_buf()))
+        .unwrap_or(false);
+    if !first {
+        return;
+    }
+    // The versioned stores live directly under $AGEND_HOME, so the parent dir is
+    // the home `event_log` writes its `event-log.jsonl` into.
+    if let Some(home) = path.parent() {
+        crate::event_log::log(
+            home,
+            "store_corrupt",
+            &path.display().to_string(),
+            &format!(
+                "corrupt store reset to DEFAULT (empty) state until the next write; the corrupt file {} backed up to {}",
+                if backed_up { "was" } else { "could NOT be" },
+                backup.display()
+            ),
+        );
+    }
+}
+
 /// Load a JSON file into a typed struct, returning default if missing or invalid.
 pub fn load<T: DeserializeOwned + Default>(path: &Path) -> T {
     let content = match std::fs::read_to_string(path) {
@@ -17,17 +91,8 @@ pub fn load<T: DeserializeOwned + Default>(path: &Path) -> T {
     match serde_json::from_str(&content) {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!(
-                path = %path.display(),
-                error = %e,
-                "store load: corrupt JSON, returning default — backing up corrupt file"
-            );
-            // M1: backup corrupt file so operator can inspect/recover
-            let backup = path.with_extension(format!(
-                "corrupt.{}",
-                chrono::Utc::now().format("%Y%m%d%H%M%S")
-            ));
-            let _ = std::fs::copy(path, &backup);
+            // #1990 item 2 + #2008 #8: back up (robustly) + surface, then default.
+            handle_corrupt_store(path, &e.to_string());
             T::default()
         }
     }
@@ -220,16 +285,8 @@ pub fn load_versioned<T: DeserializeOwned + Default>(path: &Path, current_versio
     let peek: serde_json::Value = match serde_json::from_str(&content) {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!(
-                path = %path.display(),
-                error = %e,
-                "load_versioned: corrupt JSON, returning default — backing up corrupt file"
-            );
-            let backup = path.with_extension(format!(
-                "corrupt.{}",
-                chrono::Utc::now().format("%Y%m%d%H%M%S")
-            ));
-            let _ = std::fs::copy(path, &backup);
+            // #1990 item 2 + #2008 #8: back up (robustly) + surface, then default.
+            handle_corrupt_store(path, &e.to_string());
             return T::default();
         }
     };
@@ -724,6 +781,65 @@ mod tests {
                 .flatten()
                 .map(|e| e.file_name())
                 .collect::<Vec<_>>()
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #1990 item 2 + #2008 #8 §3.9: a corrupt versioned store RENAMES its bytes
+    /// to a backup (off the live path) AND surfaces one operator-visible event.
+    #[test]
+    fn corrupt_versioned_store_renames_backup_and_surfaces() {
+        let dir = tmp_dir("corrupt_surface");
+        let path = dir.join("schedules.json");
+        fs::write(&path, "totally not json {{{").expect("write");
+
+        let got: VersionedTestStore = load_versioned(&path, VersionedTestStore::CURRENT);
+        assert_eq!(got, VersionedTestStore::default(), "corrupt → default");
+
+        // #2008 #8: corrupt bytes RENAMED to a backup (atomic move off the live path).
+        let backups: Vec<_> = fs::read_dir(&dir)
+            .expect("read")
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("schedules.corrupt.")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1, "exactly one backup");
+        assert!(
+            !path.exists(),
+            "original moved off the live path (rename, not copy)"
+        );
+
+        // #1990 item 2: surfaced to the operator via event_log (once per path).
+        let elog = fs::read_to_string(dir.join("event-log.jsonl")).unwrap_or_default();
+        assert!(
+            elog.contains("store_corrupt") && elog.contains("schedules.json"),
+            "corrupt store must surface one operator event: {elog}"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #2008 #8 §3.9: when the backup CANNOT be written (rename + copy both fail),
+    /// `backup_corrupt_file` returns false and LEAVES the original in place — the
+    /// load path never overwrites it (no silent loss; the warn is honest).
+    #[test]
+    fn backup_corrupt_file_total_failure_keeps_original() {
+        let dir = tmp_dir("backup_fail");
+        let path = dir.join("data.json");
+        fs::write(&path, "corrupt bytes").expect("write");
+        // A DIRECTORY at the backup target makes both rename and copy fail.
+        let backup = dir.join("blocked");
+        fs::create_dir_all(&backup).expect("mkdir");
+
+        assert!(
+            !backup_corrupt_file(&path, &backup),
+            "rename + copy onto a directory must both fail"
+        );
+        assert!(
+            path.exists(),
+            "on backup failure the original is left in place (not lost by load)"
         );
         fs::remove_dir_all(&dir).ok();
     }
