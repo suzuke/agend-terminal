@@ -3654,7 +3654,7 @@ instances:
         );
         {
             let reg = registry.lock();
-            let handle = reg.values().next().unwrap();
+            let handle = reg.values().next().expect("agent handle exists");
             handle
                 .core
                 .lock()
