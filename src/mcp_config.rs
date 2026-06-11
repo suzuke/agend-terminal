@@ -1506,11 +1506,26 @@ mod hook_state_poc_tests {
 
     /// #hook-state-poc: flag OFF (default) → configure_claude writes NO hooks
     /// key at all — zero behavior change without AGEND_HOOK_STATE_POC=1.
+    /// The flag is now deployed FLEET-WIDE (the shadow experiment), so the
+    /// test must clear it explicitly — same env-false-fail class as the
+    /// AGEND_RESTART_HANDOFF fix in #1964 (a fleet agent's inherited env must
+    /// not flip the contract under test).
     #[test]
     fn hooks_not_injected_without_flag() {
+        // Serialize the process-global env flip; restore before asserting so
+        // a panic can't leak the cleared flag to other tests.
+        static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("AGEND_HOOK_STATE_POC").ok();
+        std::env::remove_var("AGEND_HOOK_STATE_POC");
+
         let dir = tmp("flag-off");
         // configure_claude needs a git repo; it git-inits itself.
-        configure_claude(&dir, Some("agent-y")).unwrap();
+        let result = configure_claude(&dir, Some("agent-y"));
+        if let Some(v) = prev {
+            std::env::set_var("AGEND_HOOK_STATE_POC", v);
+        }
+        result.unwrap();
         let cfg: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(dir.join(".claude/settings.local.json")).unwrap(),
         )
