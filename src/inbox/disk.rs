@@ -4,22 +4,27 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// Global readonly flag — set when available disk space drops below threshold.
 pub(super) static DISK_READONLY: AtomicBool = AtomicBool::new(false);
 
-/// Minimum free-space ratio before entering readonly mode.
-const LOW_DISK_THRESHOLD: f64 = 0.05;
+/// Default minimum free disk space floor (1 GiB) before entering readonly mode.
+const DEFAULT_LOW_DISK_FLOOR_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Get the low disk space threshold in bytes from `AGEND_LOW_DISK_THRESHOLD` environment variable,
+/// falling back to 1 GiB.
+pub(super) fn get_low_disk_threshold_bytes() -> u64 {
+    std::env::var("AGEND_LOW_DISK_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_LOW_DISK_FLOOR_BYTES)
+}
 
 /// Check available disk space at `path`. Returns true if below threshold.
 fn is_disk_low(path: &Path) -> bool {
     use fs4::available_space;
-    use fs4::total_space;
     let avail = match available_space(path) {
         Ok(s) => s,
         Err(_) => return false, // can't check → assume OK
     };
-    let total = match total_space(path) {
-        Ok(s) if s > 0 => s,
-        _ => return false,
-    };
-    (avail as f64 / total as f64) < LOW_DISK_THRESHOLD
+    let limit = get_low_disk_threshold_bytes();
+    avail < limit
 }
 
 /// Update the global readonly flag based on disk space at `home`.
@@ -28,7 +33,20 @@ pub fn check_disk_space(home: &Path) {
     let readonly = is_disk_low(home);
     let was = DISK_READONLY.swap(readonly, Ordering::Relaxed);
     if readonly && !was {
-        tracing::warn!("inbox entering readonly mode — disk space < 5%");
+        let limit = get_low_disk_threshold_bytes();
+        let limit_gb = limit as f64 / (1024.0 * 1024.0 * 1024.0);
+        if limit_gb >= 0.1 {
+            tracing::warn!(
+                "inbox entering readonly mode — available disk space < {:.1} GB",
+                limit_gb
+            );
+        } else {
+            let limit_mb = limit as f64 / (1024.0 * 1024.0);
+            tracing::warn!(
+                "inbox entering readonly mode — available disk space < {:.0} MB",
+                limit_mb
+            );
+        }
     } else if !readonly && was {
         tracing::info!("inbox leaving readonly mode — disk space recovered");
     }

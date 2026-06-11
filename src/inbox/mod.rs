@@ -3,7 +3,7 @@
 //! Messages stored as one JSON object per line in {home}/inbox/{name}.jsonl.
 //!
 //! Resilience layers:
-//! - **Readonly mode**: when available disk space < 5%, enqueue returns an
+//! - **Readonly mode**: when available disk space < 1 GiB (customizable via AGEND_LOW_DISK_THRESHOLD in bytes), enqueue returns an
 //!   error while drain continues to work (let agents consume backlog).
 //! - **Atomic append**: each enqueue writes to a temp file, fsyncs, then
 //!   renames — no half-written lines on crash.
