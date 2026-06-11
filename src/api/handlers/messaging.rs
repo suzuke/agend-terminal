@@ -503,14 +503,27 @@ fn track_dispatch(
             )
         {
             let outbound_corr = outbound_corr.map(String::from);
-            let _ = crate::daemon::dispatch_idle::record_dispatch(
+            // #2004: a swallowed record failure means this dispatch never gets
+            // its idle-timeout nudge — surface it (non-fatal: the dispatch
+            // itself succeeded). At THIS call site every legit-skip arm of
+            // `record_dispatch` is already excluded (kind=task branch, non-empty
+            // names, threshold>0 from the resolver), so `None` = disk failure.
+            if crate::daemon::dispatch_idle::record_dispatch(
                 home,
                 from,
                 target,
                 outbound_corr.as_deref(),
                 kind_str,
                 threshold,
-            );
+            )
+            .is_none()
+            {
+                tracing::warn!(
+                    from = %from,
+                    target = %target,
+                    "dispatch_idle record_dispatch failed (sidecar not written) — this dispatch will get NO idle-timeout nudge"
+                );
+            }
         }
         // #1942: link the dispatched branch to the correlated task. The lead
         // dispatches `kind=task` with `branch=`, but the task is often created
@@ -533,6 +546,11 @@ fn track_dispatch(
         // fires a spurious `dispatch_idle_threshold_exceeded` nudge once the
         // target goes Idle (#1516's working-state gate does not cover that).
         if let Some(corr) = msg.correlation_id.as_deref().or(msg.task_id.as_deref()) {
+            // #2004: `None` here is NORMAL (a report whose correlation has no
+            // pending sidecar — most reports). The real swallowed failure —
+            // a matching sidecar whose DELETE fails, leaving it to fire a
+            // spurious idle nudge later — warns inside `mark_resolved` at the
+            // actual failure point, where the dispatch_id is known.
             let _ = crate::daemon::dispatch_idle::mark_resolved(home, corr);
             // #1888 phase-2: a report carrying the handoff's `repo@branch`
             // correlation (reviewer verdicts do) RESOLVES the ci-handoff track —

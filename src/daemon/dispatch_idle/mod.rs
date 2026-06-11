@@ -562,6 +562,16 @@ pub(crate) fn mark_resolved(home: &Path, correlation_id: &str) -> Option<String>
         // UNDER its lock, so a concurrent team-nudge / L1 RMW can't resurrect it.
         if delete_sidecar_locked(home, &d.dispatch_id) {
             first_deleted.get_or_insert(d.dispatch_id);
+        } else {
+            // #2004: a matching sidecar whose delete failed WILL fire a
+            // spurious idle nudge once the target goes Idle — surface the
+            // swallowed failure (non-fatal: the next resolve attempt or the
+            // sweep can still clear it).
+            tracing::warn!(
+                dispatch_id = %d.dispatch_id,
+                correlation = %correlation_id,
+                "dispatch_idle resolve: sidecar delete failed — stale sidecar may fire a spurious idle nudge"
+            );
         }
     }
     first_deleted

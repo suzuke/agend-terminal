@@ -1820,12 +1820,18 @@ fn refresh_expires_at(watch_path: &Path) {
     };
     watch.expires_at =
         Some((chrono::Utc::now() + chrono::Duration::hours(WATCH_TTL_HOURS)).to_rfc3339());
-    let _ = crate::store::atomic_write(
+    // #2004: a swallowed write here silently lets the watch expire early —
+    // PR branches self-heal via PR-3 auto-arm, but non-PR branches genuinely
+    // lose CI coverage. Surface it (non-fatal: next successful poll retries).
+    if let Err(e) = crate::store::atomic_write(
         watch_path,
         serde_json::to_string_pretty(&watch)
             .unwrap_or_default()
             .as_bytes(),
-    );
+    ) {
+        tracing::warn!(path = %watch_path.display(), error = %e,
+            "ci-watch expires_at refresh write failed — watch may expire early (non-PR branches lose coverage without auto-rearm)");
+    }
 }
 
 #[cfg(test)]

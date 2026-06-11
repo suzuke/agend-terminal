@@ -159,7 +159,29 @@ fn cleanup_merged_branch(
     // preview falls back to the existing local refs (best-effort "would delete").
     if !dry_run {
         let remote = crate::git_helpers::primary_remote(source_repo);
-        let _ = crate::git_helpers::git_bypass(source_repo, &["fetch", "--prune", &remote]);
+        // #2004: fail-direction is safe (stale remote refs → `is_gone` stays
+        // false → branch kept, self-heals on the next successful fetch), but a
+        // persistently failing fetch accumulates undeletable branches invisibly
+        // — surface it. Pure logging, the cleanup proceeds on local refs.
+        match crate::git_helpers::git_bypass(source_repo, &["fetch", "--prune", &remote]) {
+            Ok(o) if !o.status.success() => {
+                tracing::warn!(
+                    repo = %source_repo.display(),
+                    remote = %remote,
+                    stderr = %String::from_utf8_lossy(&o.stderr).trim(),
+                    "fetch --prune failed during merged-branch cleanup — merge/gone checks run on possibly-stale local refs (branch kept = safe direction)"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    repo = %source_repo.display(),
+                    remote = %remote,
+                    error = %e,
+                    "fetch --prune could not run during merged-branch cleanup — merge/gone checks run on possibly-stale local refs (branch kept = safe direction)"
+                );
+            }
+            Ok(_) => {}
+        }
     }
 
     let default = crate::git_helpers::default_branch(source_repo);
