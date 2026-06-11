@@ -13,8 +13,11 @@ static CORRUPT_SURFACED: std::sync::OnceLock<std::sync::Mutex<std::collections::
 
 /// #2008 #8: move a corrupt store file to `backup` before the caller falls back
 /// to DEFAULT. Prefer an atomic `rename` — it takes the corrupt bytes OFF the
-/// live path, so the next `save` cannot race-overwrite them; fall back to `copy`
-/// across filesystems (EXDEV). Returns whether the bytes were preserved. The
+/// live path, so the next `save` cannot race-overwrite them. `copy` is a
+/// best-effort second shot for a generic rename failure: `backup` is the original
+/// path with a swapped extension (same directory → same filesystem), so EXDEV
+/// can't happen — a rename failure here is a permission / I/O error, which the
+/// copy may or may not survive. Returns whether the bytes were preserved. The
 /// prior `let _ = std::fs::copy(...)` swallowed the failure, making the "backing
 /// up" warn a LIE and letting the next save destroy the only copy — so a total
 /// failure now logs at ERROR.
@@ -824,6 +827,10 @@ mod tests {
     /// #2008 #8 §3.9: when the backup CANNOT be written (rename + copy both fail),
     /// `backup_corrupt_file` returns false and LEAVES the original in place — the
     /// load path never overwrites it (no silent loss; the warn is honest).
+    /// NOTE: the directory-name collision is a TEST SUBSTITUTE to force both ops
+    /// to fail portably — the real production trigger is disk-full / permission —
+    /// but the failure CODE PATH it exercises (return false, original untouched)
+    /// is identical, which is what matters here.
     #[test]
     fn backup_corrupt_file_total_failure_keeps_original() {
         let dir = tmp_dir("backup_fail");
