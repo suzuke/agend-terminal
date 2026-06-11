@@ -16,8 +16,87 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Pre-release gate — every release artifact job `needs` this. Runs on BOTH
+  # triggers so `workflow_dispatch` pre-tag validation keeps working (a
+  # tag-only gate would skip and cascade-skip every `needs: gate` job); the
+  # tag-coupled checks (version==tag, changelog section) are step-gated to
+  # tag refs, while MSRV + semver-checks add value on dispatch runs too.
+  gate:
+    name: Pre-release gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # cargo-semver-checks baselines against the previous tag.
+          fetch-depth: 0
+
+      - name: Version matches tag
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          if [ "$TAG" != "$CARGO_VERSION" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${CARGO_VERSION} — bump Cargo.toml (and Cargo.lock via 'cargo update -w') before tagging"
+            exit 1
+          fi
+          echo "version ok: ${CARGO_VERSION}"
+
+      - name: Changelog section exists
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME#v}"
+          # Pre-release tags (vX.Y.Z-rc.N) gate on the base X.Y.Z section.
+          BASE="${TAG%%-*}"
+          if ! grep -qE "^## \[${BASE}\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [${BASE}]' section — add the release notes before tagging"
+            exit 1
+          fi
+          echo "changelog ok: [${BASE}]"
+
+      # MSRV — Cargo.toml declares rust-version 1.87; the gate proves it
+      # still compiles there (a dep bump silently raising MSRV fails HERE,
+      # not on a user's machine). Default features only: `tray` needs GTK
+      # dev libs and is exercised by the build matrix, not the gate.
+      - name: Install MSRV toolchain (1.87)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.87"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: gate-msrv-1.87
+      - name: MSRV check (1.87)
+        run: cargo +1.87 check --locked
+
+      # SemVer report — SOFT-FAIL pre-1.0 (prints the report for the human
+      # release decision; 0.x bump rules are understood by the tool). Promote
+      # to hard-fail post-1.0. Baseline = previous git tag, NOT the action's
+      # default (latest crates.io version — the crate isn't published yet).
+      - name: Determine semver baseline (previous tag)
+        id: prev
+        run: |
+          set -euo pipefail
+          PREV="$(git describe --tags --abbrev=0 "${GITHUB_SHA}^" 2>/dev/null || true)"
+          echo "tag=${PREV}" >> "$GITHUB_OUTPUT"
+          echo "semver baseline: ${PREV:-<none — skipping semver-checks>}"
+      - name: cargo-semver-checks (soft-fail pre-1.0)
+        if: steps.prev.outputs.tag != ''
+        id: semver
+        continue-on-error: true
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          baseline-rev: ${{ steps.prev.outputs.tag }}
+          rust-toolchain: stable
+      - name: SemVer soft-fail notice
+        if: steps.semver.outcome == 'failure'
+        run: |
+          echo "::warning::cargo-semver-checks reported breaking changes — review the report above (soft-fail while pre-1.0)"
+          echo "### cargo-semver-checks: REPORTED ISSUES (soft-fail pre-1.0) — see the gate job log" >> "$GITHUB_STEP_SUMMARY"
+
   build:
     name: Build (${{ matrix.target }})
+    needs: gate
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -106,6 +185,7 @@ jobs:
 
   appimage:
     name: Build AppImage (x86_64)
+    needs: gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -236,3 +316,33 @@ jobs:
             artifacts/*.zip
             artifacts/*.AppImage
             artifacts/SHA256SUMS
+
+  # crates.io publish — runs only after the GitHub Release succeeded, never
+  # for pre-release tags (vX.Y.Z-rc.N). Gracefully SKIPS (green, annotated)
+  # when the CRATES_IO_TOKEN secret is not configured yet — a missing token
+  # must not redden an otherwise-good release.
+  publish:
+    name: Publish to crates.io
+    needs: release
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/') && !contains(github.ref_name, '-')
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: publish
+
+      - name: Publish (graceful skip without token)
+        env:
+          CRATES_IO_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CRATES_IO_TOKEN}" ]; then
+            echo "::warning::CRATES_IO_TOKEN secret not configured — skipping crates.io publish"
+            echo "### crates.io publish: SKIPPED — no CRATES_IO_TOKEN secret (see docs/RELEASING.md)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          cargo publish --dry-run --locked
+          cargo publish --locked --token "${CRATES_IO_TOKEN}"
+          echo "### crates.io publish: OK (${GITHUB_REF_NAME})" >> "$GITHUB_STEP_SUMMARY"

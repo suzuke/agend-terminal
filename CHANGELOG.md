@@ -5,6 +5,10 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 ## [Unreleased]
 
+### Added
+
+- **Release pipeline hardening** — `release.yml` gains a pre-release `gate` job (version==tag, changelog section present, MSRV 1.87 `cargo check`, `cargo-semver-checks` soft-fail report vs the previous tag) that all artifact jobs depend on, and a `publish` job that auto-publishes to crates.io after the GitHub Release succeeds (`--dry-run` first; skips gracefully when the `CRATES_IO_TOKEN` secret is unset; never runs for `-rc.N` pre-release tags). Release procedure is documented in `docs/RELEASING.md`.
+
 ### Removed
 - **Gemini CLI backend retired** ([#1580](https://github.com/suzuke/agend-terminal/issues/1580), completes [#8](https://github.com/suzuke/agend-terminal/issues/8)). `gemini-cli` sunsets 2026-06-18 (free/Pro/Ultra); its official successor Antigravity CLI (`agy`) has been a supported backend since [#1547](https://github.com/suzuke/agend-terminal/issues/1547). The `Backend::Gemini` variant, its preset/detection patterns, and the 8 gemini state-replay fixtures are removed. **Operator note:** a `gemini` / `gemini-cli` backend named in `fleet.yaml` no longer resolves to a managed backend — it now spawns as a generic `Raw` backend. Switch such entries to `agy`. Removing the last legacy backend also let the legacy detection spine (`compile_for`, `config_for_legacy`, `legacy_initial_state`) be deleted — every backend now routes through its co-located `BackendProfile` (#8 complete).
 
@@ -498,7 +502,11 @@ Substantial work has landed on `main` since `0.3.0`. Highlights, grouped by area
 
 ---
 
-[Unreleased]: https://github.com/suzuke/agend-terminal/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/suzuke/agend-terminal/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/suzuke/agend-terminal/compare/v0.6.1...v0.7.0
+[0.6.1]: https://github.com/suzuke/agend-terminal/compare/v0.6.0...v0.6.1
+[0.6.0]: https://github.com/suzuke/agend-terminal/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/suzuke/agend-terminal/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/suzuke/agend-terminal/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/suzuke/agend-terminal/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/suzuke/agend-terminal/compare/v0.3.1...v0.3.2
