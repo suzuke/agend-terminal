@@ -11,6 +11,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 ### Fixed
 
+- **False AwaitingOperator after daemon restart (#2020)** — two restart shapes forced a healthy agent into `AwaitingOperator`: an idle respawned opencode pane resuming a session renders no `Ask anything` placeholder (the Idle pattern never matched → `Starting` lingered → the startup-stall fallback fired, 3× live), and a busy respawned agent injected work immediately never renders the clean ready-prompt (same fallback during a silence window). Fixes: the opencode profile gains a lowest-priority Idle pattern on the persistent statusline hint (`ctrl+p commands`; working/error patterns still win first-match — verified against the full opencode replay-fixture suite), and the startup-stall arm is vetoed when the agent has rendered backend productive markers since this spawn (a real login prompt never renders tool chrome, so the fallback's actual job is preserved; echoed injected text does not count).
+
 - **Fresh Telegram setup resolves at startup (#2005)** — the quickstart fleet.yaml template pinned the legacy `bot_token_env: AGEND_BOT_TOKEN` while `.env` was written under the canonical `AGEND_TELEGRAM_BOT_TOKEN`, and the credentials fallback retried the same legacy name — so a fresh install's Telegram channel failed to resolve at daemon startup (old installs were masked by leftover legacy `.env` keys). The template now pins the canonical name and the fallback is symmetric (configured name → the other of canonical/legacy), so all four fleet/.env drift combinations resolve; legacy use still warns.
 
 ### Added

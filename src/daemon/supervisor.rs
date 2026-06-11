@@ -1041,6 +1041,7 @@ fn reaction_kinds(to: crate::state::AgentState, propagation_enabled: bool) -> Ve
 /// position-gate). The runtime prompt states require all three gates; the real
 /// dialog satisfies all three, the meta-FP fails ≥1. Pure (file/now values are
 /// passed in) so it is unit-testable without a daemon.
+#[allow(clippy::too_many_arguments)] // pure decision fn — every gate input passed explicitly for testability
 fn awaiting_escalation_allowed(
     state: crate::state::AgentState,
     state_held: Duration,
@@ -1049,6 +1050,7 @@ fn awaiting_escalation_allowed(
     operator_typed_ms: i64,
     now_ms: i64,
     idle_expectation: crate::fleet::IdleExpectation,
+    produced_productive_output: bool,
 ) -> bool {
     use crate::state::AgentState;
     match state {
@@ -1059,7 +1061,20 @@ fn awaiting_escalation_allowed(
         // startup-stall fallback by role. (Part-B below role-gates
         // `InteractivePrompt` too — same prose-FP root — while `PermissionPrompt`
         // stays role-blind so a real permission dialog still escalates, #1552.)
-        AgentState::Starting => idle_expectation == crate::fleet::IdleExpectation::Active,
+        // #2020 veto: an agent that has rendered backend PRODUCTIVE MARKERS
+        // since this spawn is demonstrably working, not stalled at a login
+        // prompt — a busy respawned agent (injected work immediately, never
+        // renders the clean ready-prompt) hit a >30s silence window in
+        // `Starting` and was forced to a false AwaitingOperator (live:
+        // fixup-lead, 2026-06-11 20:09). Markers (tool-use chrome) are
+        // chosen over "any output after an inject" deliberately: a REAL
+        // login prompt can echo injected text (output!) but never renders
+        // tool chrome — so the veto can't blind the fallback's actual job.
+        // In-memory per spawn (StateTracker resets on respawn), so evidence
+        // from a previous life can't leak in.
+        AgentState::Starting => {
+            idle_expectation == crate::fleet::IdleExpectation::Active && !produced_productive_output
+        }
         AgentState::PermissionPrompt | AgentState::InteractivePrompt => {
             // #1563 part-B: split the role policy across the two prompt states.
             // `PermissionPrompt` is chrome-anchored (#1546, near-zero FP), so a
@@ -1279,6 +1294,7 @@ fn tick(
                     typed_ms,
                     crate::daemon::heartbeat_pair::now_ms() as i64,
                     idle_expectation,
+                    core.state.last_productive_output.is_some(),
                 )
             } {
                 // #1552 Half-1 #3: set the HEALTH reason — `check_hang` exempts
@@ -2464,6 +2480,7 @@ mod tests {
             0,
             0,
             crate::fleet::IdleExpectation::Active,
+            false,
         ));
     }
 
@@ -2479,6 +2496,7 @@ mod tests {
             0,
             0,
             crate::fleet::IdleExpectation::OnDemand,
+            false,
         ));
     }
 
@@ -2492,6 +2510,7 @@ mod tests {
             0,           // operator never typed
             10_000,
             crate::fleet::IdleExpectation::Active,
+            false,
         ));
     }
 
@@ -2509,6 +2528,7 @@ mod tests {
             0,
             10_000,
             crate::fleet::IdleExpectation::OnDemand,
+            false,
         ));
     }
 
@@ -2533,6 +2553,7 @@ mod tests {
             0,
             10_000,
             crate::fleet::IdleExpectation::OnDemand,
+            false,
         ));
     }
 
@@ -2548,6 +2569,7 @@ mod tests {
             0,
             10_000,
             crate::fleet::IdleExpectation::Active,
+            false,
         ));
     }
 
@@ -2563,6 +2585,7 @@ mod tests {
             0,
             10_000,
             crate::fleet::IdleExpectation::Active,
+            false,
         ));
     }
 
@@ -2616,6 +2639,44 @@ instances:
             0,
             10_000,
             crate::fleet::IdleExpectation::Active,
+            false,
+        ));
+    }
+
+    /// #2020 live shape 2 (fixup-lead, 2026-06-11 20:09): a respawned agent
+    /// that was injected work immediately never renders the clean
+    /// ready-prompt — heuristic stays `Starting` — but it HAS rendered
+    /// productive markers. The startup-stall arm must veto: demonstrably
+    /// working ≠ stalled at a login prompt.
+    #[test]
+    fn starting_stall_vetoed_by_productive_output_2020() {
+        assert!(!awaiting_escalation_allowed(
+            crate::state::AgentState::Starting,
+            Duration::from_secs(120),
+            Some(crate::backend::Backend::ClaudeCode),
+            "tail irrelevant for the Starting arm",
+            0,
+            10_000,
+            crate::fleet::IdleExpectation::Active,
+            true, // productive markers seen since this spawn
+        ));
+    }
+
+    /// #2020 guard on the guard: with NO productive output since spawn the
+    /// startup-stall fallback must still fire — a real login-prompt stall
+    /// (the fallback's actual job) renders no tool chrome, and echoed
+    /// injected text doesn't count (markers, not raw output).
+    #[test]
+    fn starting_stall_still_fires_without_productive_output_2020() {
+        assert!(awaiting_escalation_allowed(
+            crate::state::AgentState::Starting,
+            Duration::from_secs(120),
+            Some(crate::backend::Backend::ClaudeCode),
+            "Please log in to continue",
+            0,
+            10_000,
+            crate::fleet::IdleExpectation::Active,
+            false,
         ));
     }
 
@@ -2630,6 +2691,7 @@ instances:
             0,
             10_000,
             crate::fleet::IdleExpectation::Active,
+            false,
         ));
     }
 
@@ -2645,6 +2707,7 @@ instances:
             now - 2_000,
             now,
             crate::fleet::IdleExpectation::Active,
+            false,
         ));
     }
 
@@ -2664,6 +2727,7 @@ instances:
                     0,
                     10_000,
                     crate::fleet::IdleExpectation::Active,
+                    false,
                 ),
                 "{s:?} must never escalate via this path"
             );

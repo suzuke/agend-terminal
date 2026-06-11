@@ -227,6 +227,17 @@ fn opencode_profile() -> BackendProfile {
             ),
             (AgentState::Idle, r"Ask anything"),
             (AgentState::Idle, r"Ask anything|tab agents"),
+            // #2020: a RESPAWNED opencode pane resuming a session renders NO
+            // "Ask anything" placeholder (the input box is bare `┃` lines) —
+            // the only stable idle chrome is the bottom statusline hint. Listed
+            // LAST so every working/error pattern above wins first-match (the
+            // statusline persists during Thinking/ToolUse/PermissionPrompt —
+            // `esc interrupt` / tool markers / perm chrome match first; grid
+            // validation = the opencode replay fixtures, #1559 discipline).
+            // Without this, a restarted idle opencode agent never leaves
+            // Starting and the startup-stall fallback forces a false
+            // AwaitingOperator (live: fixup-reviewer-3, 3× on 2026-06-11).
+            (AgentState::Idle, r"ctrl\+p commands"),
         ],
         behavioral: BehavioralConfig {
             silence_thinking_ms: 3000,
@@ -424,5 +435,42 @@ mod context_pattern_tests {
             .captures("Kiro · auto · ◔ 10%        ~/.agend-terminal/workspace/kiro")
             .expect("kiro live render matches");
         assert_eq!(&caps[1], "10");
+    }
+}
+
+#[cfg(test)]
+mod opencode_resumed_idle_2020 {
+    use super::*;
+
+    /// #2020 live shape 1 (fixup-reviewer-3, 3× on 2026-06-11): the tail of a
+    /// RESPAWNED opencode pane resuming a session — captured verbatim from the
+    /// stuck agent's live pane. No "Ask anything" placeholder anywhere; the
+    /// statusline hint is the only idle chrome. Must detect Idle, or the
+    /// agent never leaves Starting and the stall fallback fires.
+    const RESUMED_IDLE_TAIL: &str = "  ┃\n  ┃\n  ┃  Build · DeepSeek V4 Pro OpenCode Go\n\n          270.3K (27%) · $2.23  ctrl+p commands";
+
+    #[test]
+    fn resumed_idle_pane_detects_idle() {
+        let patterns = crate::state::StatePatterns::for_backend(&Backend::OpenCode);
+        assert_eq!(
+            patterns.detect(RESUMED_IDLE_TAIL),
+            Some(AgentState::Idle),
+            "resumed-session idle pane (no 'Ask anything') must read Idle"
+        );
+    }
+
+    /// Order pin: the statusline hint persists during WORK — a working pane
+    /// (with `esc interrupt`) must still detect Thinking, because the
+    /// working patterns precede the statusline Idle pattern (first match
+    /// wins). The opencode replay fixtures re-verify this on full captures.
+    #[test]
+    fn working_pane_with_statusline_still_detects_thinking() {
+        let working = format!("  working...  esc interrupt\n{RESUMED_IDLE_TAIL}");
+        let patterns = crate::state::StatePatterns::for_backend(&Backend::OpenCode);
+        assert_eq!(
+            patterns.detect(&working),
+            Some(AgentState::Thinking),
+            "statusline must not outrank the working marker"
+        );
     }
 }
