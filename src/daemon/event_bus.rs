@@ -52,6 +52,11 @@ pub enum EventKind {
         expected_kind: String,
         threshold_secs: i64,
         correlation_id: Option<String>,
+        /// #2008-p2: this is the "long-running WITH ACTIVITY — confirm expected"
+        /// escalation (the auto-extension CAP was hit while the target kept showing
+        /// activity), NOT the "went silent / stuck" alarm. Same delivery shape; the
+        /// subscriber branches the message text so the dispatcher tells them apart.
+        long_running: bool,
     },
     // #event-bus pattern #9 (supervisor member-state-change): the structured
     // {agent, team, from/to display} PLUS the fields the shared deliver needs to
@@ -519,6 +524,7 @@ mod tests {
                 expected_kind: "task".into(),
                 threshold_secs: 300,
                 correlation_id: Some("t-1".into()),
+                long_running: false,
             },
             EventKind::MemberStateChanged {
                 agent: "dev".into(),

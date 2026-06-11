@@ -88,7 +88,26 @@ pub(crate) struct PendingDispatch {
     /// target is observed working again.
     #[serde(default)]
     pub(crate) not_working_streak: u32,
+    /// #2008-p2: how many times the deadline has been auto-EXTENDED because the
+    /// target showed activity past threshold (the `target_is_working`/`waiting_on`
+    /// suppress path calls `refresh_issued_at`). Bounds the otherwise-unlimited
+    /// extension: at [`REFRESH_CAP`] the watchdog escalates ONCE
+    /// (`long_running_escalated`) instead of refreshing forever — a stuck-in-loop
+    /// agent whose pane keeps churning must not stay invisible.
+    #[serde(default)]
+    pub(crate) refresh_count: u32,
+    /// #2008-p2: latch — the one-time "long-running, confirm expected" escalation
+    /// fired (escalate-don't-repeat). Cleared with the sidecar on resolution.
+    #[serde(default)]
+    pub(crate) long_running_escalated: bool,
 }
+
+/// #2008-p2: max activity-based deadline extensions before the watchdog escalates
+/// ONCE with a "long-running — confirm expected" notice instead of refreshing
+/// forever. 3 × the dispatch threshold (≈30min at the 600s default) — long enough
+/// that a genuine long task isn't pestered, short enough that a stuck-in-loop
+/// agent surfaces for an operator confirm within a bounded window.
+const REFRESH_CAP: u32 = 3;
 
 /// #1658: how many consecutive not-working `scan_and_emit` ticks (past
 /// threshold) the target must show before the dispatch-idle signal fires. A
@@ -245,6 +264,8 @@ pub(crate) fn record_dispatch(
         status: DispatchStatus::Pending,
         nudge_sent_at: None,
         not_working_streak: 0,
+        refresh_count: 0,
+        long_running_escalated: false,
     };
     let body = match serde_json::to_string_pretty(&payload) {
         Ok(s) => s,
@@ -617,6 +638,30 @@ fn set_not_working_streak(home: &Path, dispatch_id: &str, val: u32) {
     });
 }
 
+/// #2008-p2: increment the activity-extension counter on a Pending sidecar (RMW
+/// under the store lock). No-op if the sidecar is gone / no longer Pending.
+fn bump_refresh_count(home: &Path, dispatch_id: &str) {
+    let path = pending_path(home, dispatch_id);
+    let _ = crate::store::with_json_state::<PendingDispatch, _, _>(&path, |cur| {
+        if cur.status == DispatchStatus::Pending {
+            cur.refresh_count = cur.refresh_count.saturating_add(1);
+        }
+        Some(())
+    });
+}
+
+/// #2008-p2: latch the one-time long-running escalation on a Pending sidecar
+/// (escalate-don't-repeat). No-op if the sidecar is gone / no longer Pending.
+fn set_long_running_escalated(home: &Path, dispatch_id: &str) {
+    let path = pending_path(home, dispatch_id);
+    let _ = crate::store::with_json_state::<PendingDispatch, _, _>(&path, |cur| {
+        if cur.status == DispatchStatus::Pending {
+            cur.long_running_escalated = true;
+        }
+        Some(())
+    });
+}
+
 /// PR2 L3 visibility — per-instance dispatch metadata view.
 /// Pending sidecars where this instance is the **dispatcher**: outbound
 /// dispatches it's still waiting for replies on.
@@ -863,8 +908,23 @@ pub(crate) fn scan_and_emit(home: &Path) {
             if d.not_working_streak != 0 {
                 set_not_working_streak(home, &d.dispatch_id, 0);
             }
-            if let Some(corr) = d.correlation_id.as_deref() {
-                let _ = refresh_issued_at(home, corr);
+            // #2008-p2: bound the auto-extension. Below the cap, refresh the
+            // deadline (the existing activity-suppress). At the cap, escalate ONCE
+            // with a DISTINCT "long-running — confirm expected" notice and STOP
+            // refreshing — so a stuck-in-loop agent (pane churning → suppressed by
+            // the gate) can't stay invisible forever, while a genuinely long task
+            // is surfaced for one confirm, not nagged every ~2 min. Past the
+            // cap+escalation it just suppresses (deadline frozen): if the target
+            // later goes truly idle, the next scan falls through to the stuck-alarm
+            // path below.
+            if d.refresh_count < REFRESH_CAP {
+                if let Some(corr) = d.correlation_id.as_deref() {
+                    let _ = refresh_issued_at(home, corr);
+                }
+                bump_refresh_count(home, &d.dispatch_id);
+            } else if !d.long_running_escalated {
+                emit_long_running_event(home, &d, elapsed_secs);
+                set_long_running_escalated(home, &d.dispatch_id);
             }
             continue;
         }
@@ -1023,6 +1083,7 @@ fn stale_sidecar_reason(home: &Path, d: &PendingDispatch) -> Option<&'static str
 /// the exact fields carried by `EventKind::DispatchIdleExceeded`, so the legacy
 /// direct enqueue and the bus subscriber produce a BYTE-IDENTICAL message
 /// (overshoot is derived from elapsed - threshold).
+#[allow(clippy::too_many_arguments)]
 fn dispatch_idle_text(
     dispatch_id: &str,
     dispatcher: &str,
@@ -1031,7 +1092,26 @@ fn dispatch_idle_text(
     correlation_id: Option<&str>,
     elapsed_secs: i64,
     threshold_secs: i64,
+    long_running: bool,
 ) -> String {
+    let corr = correlation_id.unwrap_or("");
+    // #2008-p2: the long-running escalation is DELIBERATELY worded to read nothing
+    // like the stuck alarm — "active, just long, confirm" vs "went silent, may be
+    // stuck/crashed" — so the dispatcher tells them apart at a glance.
+    if long_running {
+        return format!(
+            "[dispatch_idle_long_running] dispatch {dispatch_id} from '{dispatcher}' → '{target}' \
+             (kind={expected_kind}, correlation_id={corr}) has been ACTIVE but unreplied for {elapsed_secs}s \
+             (past {cap}× the {threshold_secs}s threshold).\n\n\
+             This is NOT a stuck/silent alarm — '{target}' is still showing activity (e.g. a long tool run / \
+             heads-down work), just taking a while. The auto-extension cap was hit, so this is ONE heads-up \
+             (no repeats):\n\
+             - Long run EXPECTED → no action; it resolves when the report arrives.\n\
+             - Looks wrong → pane-check. A genuinely-stuck target will later go silent and fire the normal \
+             '…threshold_exceeded' alarm.",
+            cap = REFRESH_CAP,
+        );
+    }
     let overshoot = elapsed_secs - threshold_secs;
     format!(
         "[dispatch_idle_threshold_exceeded] dispatch {dispatch_id} from '{dispatcher}' → '{target}' \
@@ -1046,7 +1126,7 @@ fn dispatch_idle_text(
         dispatcher = dispatcher,
         target = target,
         expected_kind = expected_kind,
-        corr = correlation_id.unwrap_or(""),
+        corr = corr,
         elapsed_secs = elapsed_secs,
         threshold_secs = threshold_secs,
         overshoot = overshoot,
@@ -1068,6 +1148,7 @@ fn deliver_dispatch_idle(
     correlation_id: Option<&str>,
     elapsed_secs: i64,
     threshold_secs: i64,
+    long_running: bool,
 ) {
     let text = dispatch_idle_text(
         dispatch_id,
@@ -1077,6 +1158,7 @@ fn deliver_dispatch_idle(
         correlation_id,
         elapsed_secs,
         threshold_secs,
+        long_running,
     );
     // #947: fall back to dispatch_id when upstream correlation_id is None so the
     // nudge is always traceable to its source sidecar.
@@ -1087,7 +1169,13 @@ fn deliver_dispatch_idle(
         home,
         dispatcher,
         "system:dispatch_idle",
-        "dispatch_idle_threshold_exceeded",
+        // #2008-p2: a distinct subtype so the dispatcher's inbox tooling can tell a
+        // "still active, just long" confirm from a "went silent" stuck alarm.
+        if long_running {
+            "dispatch_idle_long_running"
+        } else {
+            "dispatch_idle_threshold_exceeded"
+        },
         text,
         Some(&corr),
         correlation_id,
@@ -1107,6 +1195,7 @@ fn handle_event(event: &crate::daemon::event_bus::Event) -> bool {
         expected_kind,
         threshold_secs,
         correlation_id,
+        long_running,
     } = &event.kind
     {
         deliver_dispatch_idle(
@@ -1118,6 +1207,7 @@ fn handle_event(event: &crate::daemon::event_bus::Event) -> bool {
             correlation_id.as_deref(),
             *elapsed_secs,
             *threshold_secs,
+            *long_running,
         );
         true
     } else {
@@ -1132,18 +1222,41 @@ pub fn register_subscriber() {
 }
 
 fn emit_exceeded_event(home: &Path, d: &PendingDispatch, elapsed_secs: i64) {
+    emit_dispatch_idle_event(home, d, elapsed_secs, false);
+}
+
+/// #2008-p2: the "long-running WITH ACTIVITY — confirm expected" escalation fired
+/// once when the auto-extension cap is hit while the target is still active. Same
+/// delivery shape (`long_running = true`); the subscriber renders the confirm
+/// wording. Does NOT flip the sidecar to Exceeded — the target is working, not
+/// stuck, so the stuck-alarm path still owns a later genuine idle.
+fn emit_long_running_event(home: &Path, d: &PendingDispatch, elapsed_secs: i64) {
+    emit_dispatch_idle_event(home, d, elapsed_secs, true);
+}
+
+fn emit_dispatch_idle_event(
+    home: &Path,
+    d: &PendingDispatch,
+    elapsed_secs: i64,
+    long_running: bool,
+) {
     // Observability log runs regardless of the gate (it is not the notification).
     crate::event_log::log(
         home,
-        "dispatch_idle_threshold_exceeded",
+        if long_running {
+            "dispatch_idle_long_running"
+        } else {
+            "dispatch_idle_threshold_exceeded"
+        },
         &d.dispatcher,
         &format!(
-            "dispatch_id={} target={} corr={} elapsed_secs={} threshold_secs={}",
+            "dispatch_id={} target={} corr={} elapsed_secs={} threshold_secs={} long_running={}",
             d.dispatch_id,
             d.target,
             d.correlation_id.as_deref().unwrap_or(""),
             elapsed_secs,
             d.threshold_secs,
+            long_running,
         ),
     );
     // #event-bus Step 2 (legacy-zero): the bus is the sole delivery path. The
@@ -1158,6 +1271,7 @@ fn emit_exceeded_event(home: &Path, d: &PendingDispatch, elapsed_secs: i64) {
             expected_kind: d.expected_kind.clone(),
             threshold_secs: d.threshold_secs,
             correlation_id: d.correlation_id.clone(),
+            long_running,
         },
     );
 }
@@ -1267,6 +1381,8 @@ mod tests {
             status: DispatchStatus::Pending,
             nudge_sent_at: None,
             not_working_streak: 0,
+            refresh_count: 0,
+            long_running_escalated: false,
         };
         std::fs::write(
             pending_path(home, &id),
@@ -1530,6 +1646,88 @@ mod tests {
             d.status,
             DispatchStatus::Exceeded,
             "#1866 (a): a fully-idle target (all activity signals stale) must STILL fire"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// §3.9 #2008-p2: below the auto-extension cap, an ACTIVE target's deadline is
+    /// extended (refresh_count++) with NO alarm of any kind — the existing
+    /// activity-suppress, now counted toward the cap.
+    #[test]
+    fn below_cap_extends_active_target_without_alarm() {
+        let home = tmp_home("p2-below-cap");
+        let issued = chrono::Utc::now() - chrono::Duration::seconds(700);
+        let id = write_pending_at(&home, "lead", "dev", Some("t-below"), "task", 600, issued);
+        write_target_snapshot(&home, "dev", "tool_use"); // target_is_working
+
+        scan_and_emit(&home);
+
+        let d = list_pending(&home)
+            .into_iter()
+            .find(|d| d.dispatch_id == id)
+            .expect("sidecar");
+        assert_eq!(d.refresh_count, 1, "one activity-based extension counted");
+        assert!(!d.long_running_escalated);
+        assert_eq!(
+            d.status,
+            DispatchStatus::Pending,
+            "still pending, not fired"
+        );
+        let elog = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
+        assert!(
+            !elog.contains("dispatch_idle_long_running")
+                && !elog.contains("dispatch_idle_threshold_exceeded"),
+            "no alarm of any kind while extending an active target: {elog}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// §3.9 #2008-p2: at the cap, a still-ACTIVE target gets ONE "long-running —
+    /// confirm expected" escalation (latched) — NOT the stuck/Exceeded alarm, and
+    /// NOT repeated on the next scan (escalate-don't-repeat).
+    #[test]
+    fn cap_reached_escalates_long_running_once_then_latches() {
+        let home = tmp_home("p2-cap-escalate");
+        let issued = chrono::Utc::now() - chrono::Duration::seconds(700);
+        let id = write_pending_at(&home, "lead", "dev", Some("t-cap"), "task", 600, issued);
+        for _ in 0..REFRESH_CAP {
+            bump_refresh_count(&home, &id); // already AT the extension cap
+        }
+        write_target_snapshot(&home, "dev", "tool_use"); // still working
+
+        scan_and_emit(&home);
+
+        let d = list_pending(&home)
+            .into_iter()
+            .find(|d| d.dispatch_id == id)
+            .expect("sidecar");
+        assert!(
+            d.long_running_escalated,
+            "cap → the escalate-once latch is set"
+        );
+        assert_eq!(
+            d.status,
+            DispatchStatus::Pending,
+            "long-running is NOT the stuck/Exceeded path — the target is working"
+        );
+        let elog = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
+        assert_eq!(
+            elog.matches("dispatch_idle_long_running").count(),
+            1,
+            "exactly one long-running escalation: {elog}"
+        );
+        assert!(
+            !elog.contains("dispatch_idle_threshold_exceeded"),
+            "no stuck alarm for a working target: {elog}"
+        );
+
+        // A second scan must NOT re-escalate (latched).
+        scan_and_emit(&home);
+        let elog2 = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
+        assert_eq!(
+            elog2.matches("dispatch_idle_long_running").count(),
+            1,
+            "escalate-don't-repeat: still exactly one after a second scan: {elog2}"
         );
         std::fs::remove_dir_all(&home).ok();
     }
@@ -2081,6 +2279,8 @@ mod tests {
             status: DispatchStatus::Pending,
             nudge_sent_at: None,
             not_working_streak: 0,
+            refresh_count: 0,
+            long_running_escalated: false,
         };
         assert_eq!(
             stale_sidecar_reason(&home, &mk("ghost-lead")),
@@ -3261,6 +3461,7 @@ mod tests {
             corr,
             elapsed,
             threshold,
+            false,
         );
 
         // Bus emit→subscriber delivery (the gate-ON path) — real fan-out.
@@ -3277,6 +3478,7 @@ mod tests {
                 expected_kind: expected_kind.to_string(),
                 threshold_secs: threshold,
                 correlation_id: corr.map(String::from),
+                long_running: false,
             },
         );
 

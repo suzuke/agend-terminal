@@ -255,6 +255,8 @@ mod tests {
             status: DispatchStatus::Exceeded,
             nudge_sent_at: None,
             not_working_streak: 0,
+            refresh_count: 0,
+            long_running_escalated: false,
         };
         std::fs::write(
             pending_path(home, &id),
@@ -438,6 +440,8 @@ mod tests {
             status: DispatchStatus::Pending, // scan_and_emit only scans Pending
             nudge_sent_at: None,
             not_working_streak: 0,
+            refresh_count: 0,
+            long_running_escalated: false,
         };
         let path = pending_path(&home, &id);
         std::fs::write(&path, serde_json::to_string_pretty(&payload).unwrap()).unwrap();
@@ -574,6 +578,8 @@ mod tests {
             status: DispatchStatus::Exceeded,
             nudge_sent_at: None,
             not_working_streak: 0,
+            refresh_count: 0,
+            long_running_escalated: false,
         };
         std::fs::write(
             pending_path(home, &id),
