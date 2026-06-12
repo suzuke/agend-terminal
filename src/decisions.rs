@@ -288,7 +288,9 @@ pub fn update(home: &Path, caller: &str, args: &Value) -> Value {
             });
         }
 
-        if let Some(content) = args["content"].as_str() {
+        // #2037 (3): same content|text alias as `post` — the schema declares
+        // `text` tool-wide, so update honoring only `content` was a silent lie.
+        if let Some(content) = args["content"].as_str().or_else(|| args["text"].as_str()) {
             decision.content = content.to_string();
         }
         if let Some(tags) = args["tags"].as_array() {
