@@ -4,7 +4,7 @@
 //! Port is published to `{run_dir}/api.port`; see `ipc.rs` for the port
 //! registry and loopback-binding rules.
 
-use crate::agent::{self, AgentRegistry, ExternalRegistry};
+use crate::agent::{AgentRegistry, ExternalRegistry};
 use anyhow::Context;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
@@ -649,100 +649,6 @@ fn spawn_peer_pid_watcher(pid: u32, stream: std::net::TcpStream) {
             }
         })
         .ok();
-}
-
-/// Spawn a single agent, register it, and start its TUI socket thread.
-/// Shared by the SPAWN and CREATE_TEAM API handlers.
-///
-/// `env` carries the resolved process env to apply on top of inherited
-/// vars (post sensitive-env deny-list filter; see
-/// `agent::is_sensitive_env_key`). Callers are expected to resolve from
-/// `params.env` or `FleetConfig::resolve_instance(name).env` BEFORE
-/// invoking — `spawn_one` is a pure data consumer here, not a re-resolver,
-/// so a single canonical resolve site at the handler boundary stays
-/// authoritative (#900 hybrid (b)+(c) design).
-#[allow(clippy::too_many_arguments)]
-fn spawn_one(
-    home: &Path,
-    registry: &AgentRegistry,
-    name: &str,
-    backend: &str,
-    args: &[String],
-    spawn_mode: crate::backend::SpawnMode,
-    work_dir: &Path,
-    size: (u16, u16),
-    env: Option<&std::collections::HashMap<String, String>>,
-) -> anyhow::Result<crate::backend::SpawnMode> {
-    std::fs::create_dir_all(work_dir).ok();
-    // #1080: skills auto-install for dynamically spawned instances.
-    // spawn_one is the SPAWN-RPC choke point — without this, instances
-    // created via create_instance / start_instance / replace_instance
-    // never get skill symlinks (only cold-boot spawn_and_register_agent
-    // called install_for_agent). Respects fleet.yaml `instance.<name>.skills:`
-    // allowlist, same as cold-boot path.
-    let skills_filter: Option<Vec<String>> =
-        crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
-            .ok()
-            .and_then(|c| c.instances.get(name).and_then(|i| i.skills.clone()));
-    let backend_skill =
-        crate::backend::Backend::from_command(backend).and_then(|b| b.skill_dir_name());
-    match crate::skills::install_for_agent_backend(
-        home,
-        work_dir,
-        skills_filter.as_deref(),
-        backend_skill,
-    ) {
-        Ok(outcomes) => {
-            let modes: Vec<(&str, crate::skills::InstallMode)> = outcomes
-                .iter()
-                .map(|o| (o.backend.as_str(), o.mode))
-                .collect();
-            tracing::info!(agent = %name, ?modes, "spawn_one skills auto-install complete");
-        }
-        Err(e) => {
-            tracing::warn!(agent = %name, error = %e, "spawn_one skills auto-install failed, proceeding");
-        }
-    }
-    // Sprint 34: clear stale metadata from a previous instance with the
-    // same name. spawn_one is the true choke point — both handle_spawn
-    // (direct) and team.rs (team-spawn) flow through here.
-    // #1682: clear BOTH the legacy name file and the id-resolved file — post-#1680
-    // readers use `<uuid>.json`, which the old name-only remove left stale.
-    crate::agent_ops::remove_metadata(home, name);
-    let preset_submit_key = crate::backend::Backend::from_command(backend)
-        .map(|b| b.preset().submit_key)
-        .unwrap_or("\r");
-    // No-op when caller already passed Fresh; downgrades Resume → Fresh when
-    // there is no resumable session in `work_dir` (see
-    // `SpawnMode::downgraded_for`). Returned so callers (e.g. the
-    // `create_instance` API handler) can see the actual mode used and gate
-    // post-spawn behavior like the "skip broadcast on Resume" rule.
-    let spawn_mode = spawn_mode.downgraded_for(backend, Some(work_dir));
-    agent::spawn_agent(
-        &agent::SpawnConfig {
-            name,
-            backend_command: backend,
-            args,
-            spawn_mode,
-            cols: size.0,
-            rows: size.1,
-            env,
-            working_dir: Some(work_dir),
-            submit_key: preset_submit_key,
-            home: Some(home),
-            crash_tx: None,
-            shutdown: None,
-        },
-        registry,
-    )?;
-    let rdir = crate::daemon::run_dir(home);
-    let reg = Arc::clone(registry);
-    let n = name.to_string();
-    std::thread::Builder::new()
-        .name(format!("{n}_tui"))
-        .spawn(move || crate::daemon::serve_agent_tui(&n, &rdir, &reg))
-        .ok();
-    Ok(spawn_mode)
 }
 
 /// Send a request to the daemon API and read one NDJSON response.
