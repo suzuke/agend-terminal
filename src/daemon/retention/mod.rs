@@ -56,6 +56,11 @@ impl RetentionSupervisor {
         // crash-leftover `.tmp` sidecars, by mtime + orphan check.
         let ci_handoff_swept =
             crate::daemon::ci_handoff_track::gc_orphan_sidecars(home, std::time::SystemTime::now());
+        // #2059 #2(c): drop verdict-buffer entries whose SHA never became a
+        // branch head within 24h (abandoned PR / force-push past it) so a
+        // never-resolving buffered verdict can't leak.
+        let verdict_buffer_swept =
+            crate::daemon::pr_state::verdict_buffer::sweep_expired(home, chrono::Utc::now());
 
         tracing::info!(
             decisions = decisions_swept,
@@ -63,6 +68,7 @@ impl RetentionSupervisor {
             tracking = tracking_swept,
             worktrees = worktrees_swept,
             ci_handoff = ci_handoff_swept,
+            verdict_buffer = verdict_buffer_swept,
             "retention sweep: cycle complete"
         );
         crate::event_log::log(

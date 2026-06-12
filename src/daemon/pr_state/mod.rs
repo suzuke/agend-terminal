@@ -51,6 +51,7 @@ pub mod auto_arm;
 pub mod gh_poll;
 mod remote_gc;
 mod scanner;
+pub(crate) mod verdict_buffer;
 // #986: the production per-tick handler drives the scanner with an explicit
 // (snapshot) poller via `scan_and_emit_with` — the old `scan_and_emit` wrapper
 // (hardcoded `CliGhPoller`, synchronous on the scanner thread) is gone.
@@ -822,6 +823,31 @@ pub fn record_ci_result(
                     observed_at: chrono::Utc::now().to_rfc3339(),
                 },
             );
+            // #2059 #2(c): the state's head_sha is now established at `head_sha`.
+            // Drain + replay any verdicts that were buffered for this SHA before
+            // the state existed (the #2058 verdict-before-CI ordering gap). They
+            // apply against the current head, so a VERIFIED here can flip the PR
+            // merge-ready on the next scan tick — closing the dead zone. The
+            // buffer drain touches a SEPARATE dir (verdict-buffer/), not this
+            // file's flock, so there is no self-deadlock.
+            for v in verdict_buffer::drain_for_head(home, head_sha) {
+                tracing::info!(
+                    repo = %repo,
+                    branch = %branch,
+                    head = %head_sha,
+                    reviewer = %v.reviewer,
+                    kind = %v.kind,
+                    "#2059 verdict_buffer: replaying buffered verdict onto newly-observed state"
+                );
+                apply(
+                    state,
+                    Event::VerdictObserved {
+                        reviewer: &v.reviewer,
+                        reviewed_head: head_sha,
+                        kind: v.verdict_kind(),
+                    },
+                );
+            }
         },
     ) {
         tracing::warn!(
@@ -834,17 +860,16 @@ pub fn record_ci_result(
 }
 
 /// Verdict ingestion entry point — called from
-/// `api::handlers::messaging::handle_send` after the existing
-/// `auto_release::enqueue_intent` hook. `task_id` is the verdict's
-/// correlation_id. We look up the task's branch on the task board
-/// and apply the verdict to the matching pr_state file.
+/// `api::handlers::messaging::handle_send`. `task_id` is the verdict's
+/// correlation_id, kept only for logging.
 ///
-/// Best-effort: if the task can't be found, or no pr_state file
-/// exists for the task's branch yet, the verdict is silently
-/// dropped (auto_release still handles it; pr_state will pick up
-/// the verdict on next CI tick when the file is created — TODO
-/// for v2: persist orphan verdicts in a sidecar so they apply on
-/// next file-create).
+/// #2059 #2(c): keyed on `reviewed_head` (the SHA the reviewer asserts they
+/// reviewed), not the task→branch chain. Applies the verdict to the pr-state
+/// whose `head_sha == reviewed_head`; if none exists yet (the verdict preceded
+/// the first CI/gh-poll observation — the #2058 dead zone), the verdict is
+/// BUFFERED keyed by the SHA and replayed by [`record_ci_result`] when it
+/// creates/observes a branch state at that head (see [`verdict_buffer`]).
+/// Best-effort throughout — a failure never propagates into the verdict path.
 pub fn record_verdict(
     home: &Path,
     task_id: &str,
@@ -868,45 +893,39 @@ pub fn record_verdict(
         );
         return;
     };
-    let Some(task) = crate::tasks::load_by_id(home, task_id) else {
-        tracing::info!(
-            task_id,
-            reviewer,
-            "#1002 record_verdict skipped (gate B) — task not found in task board; \
-             correlation_id likely mismatched (e.g. used review-task id instead of impl-task id)"
-        );
-        return;
+    // #2059 #2(c): key on `reviewed_head` (the SHA the reviewer asserts they
+    // reviewed), NOT the task→branch chain. Gates B (task lookup) and C
+    // (task.branch) are GONE: a review task usually carries no branch (the
+    // #2058 dead zone), and the SHA is self-describing + branch-independent
+    // (survives fork PRs, missing tasks, multi-reviewer). The owned kind
+    // metadata is extracted up front so it can both drive the live apply and
+    // be buffered verbatim if no pr-state exists at this SHA yet.
+    let (kind_str, kind_reason): (&str, Option<&str>) = match kind {
+        VerdictKind::Verified => ("verified", None),
+        VerdictKind::Rejected { reason } => ("rejected", reason),
+        VerdictKind::Unverified => ("unverified", None),
     };
-    let branch = match task.branch {
-        Some(b) if !b.is_empty() => b,
-        _ => {
-            tracing::info!(
-                task_id,
-                reviewer,
-                "#1002 record_verdict skipped (gate C) — task.branch field empty; \
-                 task was created without a branch hint"
-            );
-            return;
-        }
-    };
-    // We don't always know the repo from the task. Walk the pr-state
-    // directory and find the file whose branch matches. (Typically 1
-    // pr per branch; ambiguity unlikely.)
+    // Walk the pr-state directory and find the file whose head_sha matches the
+    // reviewed_head (typically 0 or 1; one PR per branch). A missing/unreadable
+    // dir (no pr-state has ever been created — the verdict-before-anything case)
+    // is NOT a hard error: it just means zero matches, so we fall through to the
+    // buffer below rather than dropping the verdict (the gate-D early-return was
+    // the second half of the #2058 dead zone — the dir often doesn't exist yet
+    // when an early reviewer verdicts).
     let dir = pr_state_dir(home);
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::warn!(
+    let mut matched_any = false;
+    let read = std::fs::read_dir(&dir);
+    if let Err(ref e) = read {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::debug!(
                 task_id,
                 dir = %dir.display(),
                 error = %e,
-                "#1002 record_verdict skipped (gate D) — pr-state dir read failed"
+                "#2059 record_verdict: pr-state dir read failed — treating as no match, buffering"
             );
-            return;
         }
-    };
-    let mut matched_any = false;
-    for entry in entries.flatten() {
+    }
+    for entry in read.into_iter().flatten().flatten() {
         let path = entry.path();
         if !is_pr_state_file(&path) {
             continue; // #2059: skip .emitted-terminal.json ledger + .lock sidecars
@@ -917,11 +936,12 @@ pub fn record_verdict(
         let Ok(state): Result<PrState, _> = serde_json::from_str(&content) else {
             continue;
         };
-        if state.branch != branch {
+        if state.head_sha != reviewed_head {
             continue;
         }
         matched_any = true;
         let repo = state.repo.clone();
+        let branch = state.branch.clone();
         let label = verdict_label(&kind);
         // #2 (t-verdict-to-author-routing): capture the verdict notification under
         // the flock, enqueue it AFTER `with_pr_state` returns (self-IPC safety —
@@ -974,13 +994,14 @@ pub fn record_verdict(
         }
     }
     if !matched_any {
-        tracing::info!(
-            task_id,
-            branch = %branch,
-            reviewer,
-            "#1002 record_verdict noop (gate E) — no pr-state file matched task branch; \
-             CI watch may not have created the file yet for this branch"
-        );
+        // #2059 #2(c): the verdict-before-CI ordering gap (gate E) — no pr-state
+        // exists at this SHA yet (the verdict preceded the first gh-poll
+        // observation, the #2058 case). Instead of dropping it, BUFFER it keyed
+        // by `reviewed_head`; `record_ci_result` drains + replays it the moment
+        // it creates/observes a branch state at this head. The #1888
+        // track-until-resolution pattern — a signal that precedes its consumer
+        // is persisted and replayed, never silently lost.
+        verdict_buffer::buffer(home, reviewed_head, reviewer, kind_str, kind_reason);
     }
 }
 
@@ -1727,6 +1748,205 @@ mod tests {
         );
         let s = load(&dir, "owner/repo", "feat/x").expect("reloaded");
         assert!(matches!(s.ci_state, CiState::Green { .. }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── #2059 #2(c) §3.9 — SHA-key + create-or-buffer, the 5 edge cases ──
+    // All drive the REAL entry points (record_verdict + record_ci_result), no
+    // binding and no task board — proving the SHA key needs neither.
+
+    fn vbuf_home(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static C: AtomicU32 = AtomicU32::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "agend-2059c-{}-{}-{}",
+            tag,
+            std::process::id(),
+            C.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// EDGE 1 (review-before-impl — the #2058 dead zone) + EDGE 2 (no-binding):
+    /// a verdict that PRECEDES the pr-state is buffered, then replayed when
+    /// `record_ci_result` first observes that SHA, flipping the PR merge-ready.
+    /// No binding and no task board are involved — the SHA carries everything.
+    #[test]
+    fn buffered_verdict_replays_on_ci_observe_2059() {
+        let dir = vbuf_home("replay");
+        // Verdict arrives first — no pr-state exists yet (gate E / #2058).
+        record_verdict(
+            &dir,
+            "t-review-task",
+            "reviewer-1",
+            Some("sha-A"),
+            VerdictKind::Verified,
+        );
+        assert!(
+            load(&dir, "owner/repo", "feat/x").is_none(),
+            "a verdict must NOT itself create a pr-state — it buffers"
+        );
+        // CI observes sha-A green → creates the state + drains/replays the buffer.
+        record_ci_result(
+            &dir,
+            "owner/repo",
+            "feat/x",
+            "sha-A",
+            CiConclusion::Green,
+            vec!["dev".to_string()],
+            ReviewClass::Single,
+        );
+        let s = load(&dir, "owner/repo", "feat/x").expect("created");
+        assert!(
+            is_merge_ready(&s),
+            "buffered VERIFIED + CI green at the same SHA → merge-ready (#2058 closed)"
+        );
+        // The buffer entry was consumed.
+        assert!(
+            verdict_buffer::drain_for_head(&dir, "sha-A").is_empty(),
+            "the buffered verdict was drained on observe"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// EDGE 3 (fork PR — same branch NAME, different SHA): a verdict for sha-A
+    /// lands only on the sha-A state, never the same-named fork at sha-B.
+    #[test]
+    fn verdict_keys_by_sha_not_branch_name_fork_2059() {
+        let dir = vbuf_home("fork");
+        record_ci_result(
+            &dir,
+            "owner/repo",
+            "feat/x",
+            "sha-A",
+            CiConclusion::Green,
+            vec!["dev".into()],
+            ReviewClass::Single,
+        );
+        // A fork's PR: identical branch name, different repo + head SHA.
+        record_ci_result(
+            &dir,
+            "fork/repo",
+            "feat/x",
+            "sha-B",
+            CiConclusion::Green,
+            vec!["dev".into()],
+            ReviewClass::Single,
+        );
+        // Verdict for sha-A.
+        record_verdict(
+            &dir,
+            "t",
+            "reviewer-1",
+            Some("sha-A"),
+            VerdictKind::Verified,
+        );
+        assert!(
+            is_merge_ready(&load(&dir, "owner/repo", "feat/x").unwrap()),
+            "the sha-A PR is merge-ready"
+        );
+        assert!(
+            !is_merge_ready(&load(&dir, "fork/repo", "feat/x").unwrap()),
+            "the same-named fork at a DIFFERENT sha must be untouched (SHA-keyed, not branch-keyed)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// EDGE 4 (multi-reviewer, dual class): two DISTINCT verdicts on the same SHA
+    /// accumulate; merge-ready only after the quorum (not collapsed to one row).
+    #[test]
+    fn multi_reviewer_dual_quorum_on_sha_2059() {
+        let dir = vbuf_home("multi");
+        record_ci_result(
+            &dir,
+            "owner/repo",
+            "feat/d",
+            "sha-A",
+            CiConclusion::Green,
+            vec!["dev".into()],
+            ReviewClass::Dual,
+        );
+        record_verdict(
+            &dir,
+            "t",
+            "reviewer-1",
+            Some("sha-A"),
+            VerdictKind::Verified,
+        );
+        assert!(
+            !is_merge_ready(&load(&dir, "owner/repo", "feat/d").unwrap()),
+            "1 of 2 verified — not yet merge-ready under dual class"
+        );
+        record_verdict(
+            &dir,
+            "t",
+            "reviewer-2",
+            Some("sha-A"),
+            VerdictKind::Verified,
+        );
+        assert!(
+            is_merge_ready(&load(&dir, "owner/repo", "feat/d").unwrap()),
+            "2 distinct reviewers on the SHA → dual quorum met"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// EDGE 5 (stale force-push): after the head advances, neither the cleared
+    /// old-SHA verdict nor a LATE verdict for the stale SHA flips the new head
+    /// merge-ready (the §4.2 staleness invariant + SHA-keyed buffer).
+    #[test]
+    fn stale_forcepush_verdict_does_not_flip_2059() {
+        let dir = vbuf_home("stale");
+        record_ci_result(
+            &dir,
+            "owner/repo",
+            "feat/x",
+            "sha-A",
+            CiConclusion::Green,
+            vec!["dev".into()],
+            ReviewClass::Single,
+        );
+        record_verdict(
+            &dir,
+            "t",
+            "reviewer-1",
+            Some("sha-A"),
+            VerdictKind::Verified,
+        );
+        assert!(
+            is_merge_ready(&load(&dir, "owner/repo", "feat/x").unwrap()),
+            "baseline: CI green + VERIFIED at sha-A → merge-ready"
+        );
+        // Force-push: CI now observes a NEW head sha-B. CiObserved clears the
+        // accumulated sha-A verdict.
+        record_ci_result(
+            &dir,
+            "owner/repo",
+            "feat/x",
+            "sha-B",
+            CiConclusion::Green,
+            vec![],
+            ReviewClass::Single,
+        );
+        assert!(
+            !is_merge_ready(&load(&dir, "owner/repo", "feat/x").unwrap()),
+            "head advanced to sha-B; the sha-A verdict no longer applies"
+        );
+        // A LATE verdict still asserting the stale sha-A: no state is at sha-A
+        // now → it buffers, and is never drained for sha-B → can't resurrect.
+        record_verdict(
+            &dir,
+            "t",
+            "reviewer-1",
+            Some("sha-A"),
+            VerdictKind::Verified,
+        );
+        assert!(
+            !is_merge_ready(&load(&dir, "owner/repo", "feat/x").unwrap()),
+            "a stale-SHA verdict must not flip the advanced head merge-ready"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
