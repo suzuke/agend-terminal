@@ -1206,29 +1206,15 @@ impl StateTracker {
     /// `anchor_on_red == false` (Shell/Raw) OR `fg` is empty (text-only
     /// callers / cold paths) — matching pre-#919 unconditional behavior.
     pub fn feed_with_fg(&mut self, screen_text: &str, fg: &[CellFg]) {
+        // Gate sequence (order-critical — read top-to-bottom):
+        //   1. hash-dedup gate        — skip unchanged frames (throttle-hint override)
+        //   2. classify + transition  — anchor/position suppression → landing
+        //                               pipeline → heartbeat gate → transition
+        //   3. post-classify instrumentation (zero behavior): unclassified-throttle
+        //      capture, shadow telemetry, F9 productive-output detection
         let hash = hash_screen(screen_text);
-        if self.last_screen_hash == Some(hash) {
-            // #SRL-phase2 hash-dedup blind spot: a SETTLED (static) stuck-SRL
-            // pane has an UNCHANGED hash, so this dedup early-return would skip
-            // detection forever and the agent never recovers (no further feed
-            // ever re-runs the SRL gates). Override the skip ONLY when the pane
-            // carries a throttle hint AND we are not already latched on a
-            // throttle — then fall through so the hard-wrap fallback (None arm)
-            // can latch it → auto-retry fires. The cheap raw-token pre-filter
-            // keeps the common static-idle pane on the fast skip path.
-            let already_throttle = matches!(
-                self.current,
-                AgentState::ServerRateLimit | AgentState::RateLimit
-            );
-            if already_throttle || !screen_has_throttle_hint(screen_text) {
-                return;
-            }
-            // else: re-detect the static throttle pane. Do NOT re-stamp the hash
-            // (it's unchanged); once we latch, `already_throttle` short-circuits
-            // subsequent identical frames.
-        } else {
-            self.last_screen_hash = Some(hash);
-            self.scan_context_pct(screen_text);
+        if self.apply_hash_dedup_gate(screen_text, hash) {
+            return;
         }
 
         // Sprint 27 shadow-mode: capture silence duration BEFORE updating
@@ -1247,396 +1233,56 @@ impl StateTracker {
             match patterns.detect_with_match(screen_text) {
                 Some((detected, matched)) => {
                     let high_fp = is_high_fp_state(detected);
-                    // Anchor gate — two regimes (t-coloranchor-remove-ratelimit,
-                    // operator-approved after the corpus gate's go/no-go):
-                    //
-                    // - **`requires_red_anchor`** {ContextFull, ModelUnsupported}:
-                    //   keep the #1450 RED anchor — a marker needs ≥1 red rendered
-                    //   cell, else it's prose not a state. ContextFull has no
-                    //   corpus to prove a content path; ModelUnsupported never
-                    //   auto-clears AND suppresses hang-check, so a verbatim-quote
-                    //   FP would silently disable a healthy agent (cost too high).
-                    //
-                    // - **content-anchor** {RateLimit, ServerRateLimit}: the marker
-                    //   must sit on an error-line-shaped line (`in_error_line_excluding_input`) —
-                    //   corpus-proven safe (5/5 prose suppressed via pattern-narrow
-                    //   + #1518 position + #1769 working-marker; FN-covered incl.
-                    //   kiro `ThrottlingException` via #1789). NO red required, so a
-                    //   real fault rendered in DEFAULT/grey (codex/gemini net
-                    //   errors) latches — the old #1757 net-error red-exemption is
-                    //   now the GENERAL rule, not a special case. The residual
-                    //   verbatim-quote FP (an agent pasting a real error line into
-                    //   the live tail with no working-marker below) is ACCEPTED for
-                    //   these two: both auto-clear and are retry-driven, so a
-                    //   one-off mis-latch self-corrects (unlike ModelUnsupported).
-                    // #1947: the content anchor additionally rejects matches
-                    // sitting on the backend's INPUT line (or an echoed /
-                    // submitted user-message line) — operator-typed / quoted
-                    // error strings are prose, not CLI error output
-                    // (operator-reproduced live FP, 2026-06-10).
                     let usage_limit = matches!(detected, AgentState::UsageLimit);
-                    let anchor_fail = if requires_red_anchor(detected) {
-                        self.anchor_on_red
-                            && !fg.is_empty()
-                            && !matched_span_has_red(screen_text, matched, fg)
-                    } else if high_fp {
-                        !crate::state::patterns::in_error_line_excluding_input(
-                            screen_text,
-                            matched,
-                            self.input_line_markers,
-                        )
-                    } else if usage_limit {
-                        // #1955 self-poisoning: an agent QUOTING the banner
-                        // ("You've hit your weekly limit" in an RCA / dispatch)
-                        // latched itself. Input-line exclusion is the
-                        // right-sized anchor here — the REAL banner carries no
-                        // error indicator (`⎿ You've hit your weekly limit ·
-                        // resets 4am`), so the error-line content anchor would
-                        // false-negative it, and its rendering isn't reliably
-                        // red. Prose mentions in agent OUTPUT are bounded by
-                        // the position gate below + the #1777 working-marker
-                        // override + the #1955 release anchor.
-                        !crate::state::patterns::any_match_off_input_lines(
-                            screen_text,
-                            matched,
-                            self.input_line_markers,
-                        )
-                    } else {
-                        false
-                    };
-                    // #1518 position gate: a HIGH_FP marker that has scrolled out
-                    // of the live bottom-N rows (e.g. an ApiError / ServerRateLimit
-                    // line pushed up by the post-recovery `continue` output) is
-                    // stale — the agent has moved on, so it must NOT keep re-firing
-                    // the error transition (the level-triggered re-match that drove
-                    // the retry storm). Scoped to HIGH_FP/error states ONLY:
-                    // Idle and modal/interactive prompts keep full-screen
-                    // scanning, because a modal can legitimately sit above the tail.
-                    // #1955: UsageLimit joins the position gate — a banner
-                    // quote buried in deep scrollback is discussion, not a
-                    // live limit (same staleness logic as the HIGH_FP set).
-                    let stale_position = (high_fp || usage_limit)
-                        && !matched_span_in_recent_tail(
-                            screen_text,
-                            matched,
-                            ERROR_TAIL_SCAN_LINES,
-                        );
+                    // Suppression gates — run BEFORE the landing pipeline. A
+                    // detection that fails the anchor gate OR has scrolled out of
+                    // the live tail (position gate) is treated as no-match and
+                    // falls through to structural fallback / latch maintenance.
+                    let anchor_fail = self.apply_anchor_gate(
+                        detected,
+                        matched,
+                        screen_text,
+                        fg,
+                        high_fp,
+                        usage_limit,
+                    );
+                    let stale_position =
+                        self.apply_position_gate(matched, screen_text, high_fp, usage_limit);
                     if anchor_fail || stale_position {
-                        if anchor_fail {
-                            self.log_anchor_suppress(detected, matched, screen_text, fg);
-                        } else {
-                            tracing::debug!(
-                                target: "state_detection",
-                                agent = %self.instance_name,
-                                state = ?detected,
-                                tail_rows = ERROR_TAIL_SCAN_LINES,
-                                "#1518: HIGH_FP marker scrolled out of the live tail — suppressing stale error transition"
-                            );
-                        }
-                        // Treat as no detection — fall through to
-                        // structural fallback / latch maintenance.
-                        if matches!(self.current, AgentState::Starting)
-                            && is_generic_startup_prompt(screen_text)
-                        {
-                            self.transition(AgentState::InteractivePrompt);
-                        } else {
-                            self.maybe_expire_latched_state();
-                        }
+                        self.handle_suppressed_detection(
+                            detected,
+                            matched,
+                            screen_text,
+                            fg,
+                            anchor_fail,
+                        );
                     } else {
-                        // #1768: a HIGH_FP error wins the priority race even after
-                        // it scrolled up and the agent RESUMED WORK below it
-                        // (ServerRateLimit > Thinking by pattern order), so it keeps
-                        // re-latching → `clears_server_rate_limit_retry` (Idle-only,
-                        // #1713) never fires → supervisor re-injects `continue` into
-                        // a working agent (the #1768 retry storm; the latched
-                        // ServerRateLimit also doesn't auto-expire). If a
-                        // Thinking/ToolUse marker is rendered BELOW the error, the
-                        // agent recovered → land on that working state instead of the
-                        // stale error. A genuinely-stuck error has NO in-flight
-                        // working marker below it → `landed` stays `detected` → still
-                        // latches → auto-retry fires. Detection-side only;
-                        // `clears_server_rate_limit_retry` untouched → no #1713
-                        // flicker-reset regression.
-                        //
-                        // #1777 (cheerc, "Sticky UsageLimit"): UsageLimit (prio 11)
-                        // is the same kind of sticky error — it outranks
-                        // Thinking/ToolUse and never auto-expires (no
-                        // `maybe_expire_latched_state` arm), so a stale UsageLimit
-                        // line keeps re-latching after the agent resumed work below
-                        // it (status stuck on `[UsageLimit]` until the line scrolls
-                        // off). Extend the same recovery override to it. UsageLimit
-                        // stays OUT of `is_high_fp_state` → the #1450 red anchor is
-                        // unchanged (that decision is ① Step-2, pending the
-                        // operator); this is the #1768 working-marker override only.
-                        let mut landed = if high_fp || matches!(detected, AgentState::UsageLimit) {
-                            // #badge-recovery (state-level mirror of #1795): a
-                            // ServerRateLimit whose agent produced PRODUCTIVE output
-                            // within the recovery window has recovered even though
-                            // the stale error still matches and working_state_below
-                            // can't see a marker below the bottom-most (re-injected)
-                            // error line. Land Idle instead of re-latching the badge.
-                            // `recovered_within` is None-safe: a fresh / just-spawned
-                            // agent (never produced) is NOT recovery → falls through
-                            // to `detected` → latches + nudges normally. Scoped to
-                            // ServerRateLimit (the #1795 storm's state); other HIGH_FP
-                            // / UsageLimit keep re-latching as before.
-                            let fallback = if matches!(detected, AgentState::ServerRateLimit)
-                                && self.recovered_within(SERVER_RATE_LIMIT_RECOVERY_SILENCE)
-                            {
-                                AgentState::Idle
-                            } else {
-                                detected
-                            };
-                            let working_below = patterns.working_state_below(screen_text, matched);
-                            // #1809-srl-swallow-probe (instrumentation-only, NO behavior
-                            // change): when a ServerRateLimit is SWALLOWED (landed != SRL)
-                            // it never latches → no auto-retry → the live stuck-agent bug.
-                            // TWO gates can swallow it; probe BOTH, for ALL backends —
-                            // the old #1808-flaw2-probe was scoped to Agy/Kiro and was
-                            // therefore BLIND to the live claude SRL incident. Record the
-                            // raw `recovered_within` bool + `productive_silent_secs` as
-                            // INDEPENDENT fields (not just the pre-judged WARN/INFO level —
-                            // the level is derived from `recovered_within`, itself one of
-                            // the suspects). `dist_from_bottom` locates the matched error
-                            // line. Does NOT alter `landed`.
-                            if matches!(detected, AgentState::ServerRateLimit) {
-                                let recovered =
-                                    self.recovered_within(SERVER_RATE_LIMIT_RECOVERY_SILENCE);
-                                let productive_silent_secs = self.productive_silence().as_secs();
-                                let dist_from_bottom = srl_match_signature(screen_text, matched).1;
-                                match &working_below {
-                                    // Path A: a working marker renders BELOW the error →
-                                    // `working_state_below` override lands that working
-                                    // state, swallowing the SRL (#1769 positional defeat).
-                                    Some((win_state, marker)) => {
-                                        if recovered {
-                                            tracing::info!(
-                                                target: "state_detection",
-                                                agent = %self.instance_name,
-                                                tag = "#1809-srl-swallow-probe",
-                                                path = "working_state_below",
-                                                backend = %self.backend_name,
-                                                working_marker = %marker,
-                                                landed_state = ?win_state,
-                                                recovered_within = recovered,
-                                                productive_silent_secs,
-                                                dist_from_bottom,
-                                                "ServerRateLimit swallowed by working_state_below override (Path A) with recent productive output — likely genuine recovery"
-                                            );
-                                        } else {
-                                            tracing::warn!(
-                                                target: "state_detection",
-                                                agent = %self.instance_name,
-                                                tag = "#1809-srl-swallow-probe",
-                                                path = "working_state_below",
-                                                backend = %self.backend_name,
-                                                working_marker = %marker,
-                                                landed_state = ?win_state,
-                                                recovered_within = recovered,
-                                                productive_silent_secs,
-                                                dist_from_bottom,
-                                                "ServerRateLimit swallowed by working_state_below override (Path A) with NO recent productive output — possible static-chrome mask of a stuck throttle"
-                                            );
-                                        }
-                                    }
-                                    // Path B: NO working marker below, but the
-                                    // `recovered_within`→Idle fallback swallows the SRL.
-                                    // Previously SILENT — the gap that hid the live claude
-                                    // bug. Only reachable when `recovered` is true (that IS
-                                    // the gate); log the raw silence so we can judge whether
-                                    // `recovered_within` is firing legitimately.
-                                    None if recovered => {
-                                        tracing::info!(
-                                            target: "state_detection",
-                                            agent = %self.instance_name,
-                                            tag = "#1809-srl-swallow-probe",
-                                            path = "recovered_within_idle",
-                                            backend = %self.backend_name,
-                                            recovered_within = recovered,
-                                            productive_silent_secs,
-                                            dist_from_bottom,
-                                            "ServerRateLimit swallowed by recovered_within→Idle fallback (Path B) — no working marker below"
-                                        );
-                                    }
-                                    // No working marker + NOT recovered → SRL latches
-                                    // normally (auto-retry fires); not a swallow, no probe.
-                                    None => {}
-                                }
-                            }
-                            working_below.map(|(s, _)| s).unwrap_or(fallback)
-                        } else {
-                            detected
-                        };
-                        // #1808-probe0-phantom + #1809 fix: cheerc Evidence 2 — a stale
-                        // SRL error stuck in the bottom-N tail keeps re-matching after
-                        // the agent recovered (the screen hash flips when the CLI clock
-                        // ticks → feed re-scans → re-grabs the SAME old error → re-latch
-                        // → blind inject). Signature the matched error line
-                        // `(line_hash, dist_from_bottom)` and compare to the previous SRL
-                        // detection —
-                        //   • same sig, NO intervening non-SRL state  → in-place
-                        //     clock-tick re-scan → `srl_consecutive_rematch++`;
-                        //   • same sig, intervening Idle/non-SRL state → `cross_cycle`
-                        //     refire (the agent recovered, then the OLD error was
-                        //     re-grabbed) = cheerc's exact cross-Idle loop.
-                        // `last_srl_match_sig` PERSISTS across Idle so the cross-cycle
-                        // case survives. WARN when the SRL would win (`landed == SRL` →
-                        // latch → inject) AND no recent productive output (`!recovered`)
-                        // AND it is a re-match. The #1809 fix then OVERRIDES `landed` to
-                        // Idle for the `cross_cycle` sub-case only (the unambiguous
-                        // phantom) — the `consecutive_rematch` (still-SRL) case stays
-                        // telemetry-only so a genuine long throttle keeps retrying. Not
-                        // backend-scoped (the phantom is the Claude `Server is temporarily
-                        // limiting` re-match — cheerc's `general` agent).
-                        if matches!(detected, AgentState::ServerRateLimit) {
-                            let sig = srl_match_signature(screen_text, matched);
-                            let same_sig = self.last_srl_match_sig == Some(sig);
-                            let cross_cycle = same_sig && self.non_srl_since_last_srl;
-                            self.srl_consecutive_rematch =
-                                if same_sig && !self.non_srl_since_last_srl {
-                                    self.srl_consecutive_rematch.saturating_add(1)
-                                } else {
-                                    0
-                                };
-                            self.last_srl_match_sig = Some(sig);
-                            self.non_srl_since_last_srl = false;
-
-                            let would_latch = matches!(landed, AgentState::ServerRateLimit);
-                            let recovered_now =
-                                self.recovered_within(SERVER_RATE_LIMIT_RECOVERY_SILENCE);
-                            if would_latch
-                                && !recovered_now
-                                && (self.srl_consecutive_rematch > 0 || cross_cycle)
-                            {
-                                let kind = if cross_cycle {
-                                    "cross_cycle_refire"
-                                } else {
-                                    "consecutive_rematch"
-                                };
-                                tracing::warn!(
-                                    target: "state_detection",
-                                    agent = %self.instance_name,
-                                    tag = "#1808-probe0-phantom",
-                                    kind,
-                                    consecutive_rematch = self.srl_consecutive_rematch,
-                                    cross_cycle_refire = cross_cycle,
-                                    dist_from_bottom = sig.1,
-                                    productive_silent_secs = self.productive_silence().as_secs(),
-                                    "phantom re-match: same stale ServerRateLimit error re-detected (would latch → inject) with no recent productive output"
-                                );
-                                // #1809 fix (behavioral): a CROSS-CYCLE phantom — the
-                                // agent already LEFT ServerRateLimit (passed through a
-                                // non-SRL landed state) and the SAME stale error line
-                                // (`same_sig`) was re-grabbed with no recent productive
-                                // output. This is cheerc's exact loop: a CLI clock-tick
-                                // flips the screen hash → feed re-scans → re-matches the
-                                // OLD error → re-latch → the supervisor schedules ANOTHER
-                                // auto-retry → blind `continue` inject, repeating every
-                                // ~45s as the recovery window expires. Land Idle instead
-                                // of re-latching: the genuine error already latched +
-                                // retried on its FIRST detection; a genuinely-new error
-                                // has a different signature; genuine productive output
-                                // sets `recovered_now` (→ #badge-recovery lands Idle
-                                // anyway, never reaching here). The IN-PLACE
-                                // `consecutive_rematch` case is deliberately NOT
-                                // suppressed — a still-SRL agent may be a genuine long
-                                // throttle that still needs its retry. (Accepted narrow
-                                // FP: a genuinely-new SRL identical in text AND screen
-                                // position to the just-processed one, with no intervening
-                                // productive output, is ignored — see PR body.)
-                                if cross_cycle {
-                                    landed = AgentState::Idle;
-                                }
-                            }
-                        }
-                        // #1955: UsageLimit episode lifecycle. The match is
-                        // level-triggered and a silent pane never scrolls the
-                        // banner away (the `general` incident: stuck for DAYS
-                        // past the account reset), so the state machine — not
-                        // new output — must provide the exit:
-                        //  • fresh latch → anchor a release deadline on the
-                        //    banner's own unlock hint (conservative fallback);
-                        //  • in-episode re-match past the deadline → release
-                        //    to Idle and remember the banner's signature;
-                        //  • re-match of that SAME released signature →
-                        //    suppress (mirror of the #1809 cross-cycle
-                        //    suppression) — a genuinely-new limit renders
-                        //    fresh at the bottom → new sig → latches again.
-                        if matches!(detected, AgentState::UsageLimit)
-                            && matches!(landed, AgentState::UsageLimit)
-                        {
-                            let sig = srl_match_signature(screen_text, matched);
-                            if self.usage_limit_expired_sig == Some(sig) {
-                                landed = AgentState::Idle;
-                            } else if self.current == AgentState::UsageLimit {
-                                if self
-                                    .usage_limit_release_at
-                                    .is_some_and(|at| Instant::now() >= at)
-                                {
-                                    self.usage_limit_expired_sig = Some(sig);
-                                    self.usage_limit_release_at = None;
-                                    tracing::info!(
-                                        target: "state_detection",
-                                        agent = %self.instance_name,
-                                        dist_from_bottom = sig.1,
-                                        "#1955: UsageLimit released — unlock anchor passed; suppressing the stale banner re-latch"
-                                    );
-                                    landed = AgentState::Idle;
-                                }
-                            } else {
-                                let release_in = line_containing(screen_text, matched)
-                                    .and_then(parse_usage_limit_release)
-                                    .unwrap_or(Self::USAGE_LIMIT_EXPIRY);
-                                self.usage_limit_release_at = Some(Instant::now() + release_in);
-                                self.usage_limit_expired_sig = None;
-                                tracing::info!(
-                                    target: "state_detection",
-                                    agent = %self.instance_name,
-                                    release_in_secs = release_in.as_secs(),
-                                    "#1955: UsageLimit latched — release anchored on the banner's unlock hint (or conservative fallback)"
-                                );
-                            }
-                        }
+                        // Landing pipeline — order-critical, encoded here in ONE
+                        // place. Each gate may override the previous `landed`:
+                        //   1. working-marker override (#1768/#1777/#badge-recovery)
+                        //   2. SRL phantom gate (#1808/#1809)    — cross-cycle → Idle
+                        //   3. UsageLimit lifecycle gate (#1955) — past release → Idle
+                        // The heartbeat gate then has the final say before transition.
+                        let mut landed = self.apply_working_marker_override(
+                            patterns,
+                            detected,
+                            matched,
+                            screen_text,
+                            high_fp,
+                        );
+                        landed =
+                            self.apply_srl_phantom_gate(detected, matched, screen_text, landed);
+                        landed = self.apply_usage_limit_lifecycle_gate(
+                            detected,
+                            matched,
+                            screen_text,
+                            landed,
+                        );
                         let gated = self.gate_on_heartbeat(landed);
                         self.transition(gated);
                     }
                 }
-                None => {
-                    // #SRL-phase2: hard-wrap fallback. Raw detection missed —
-                    // which is exactly what an Ink-hard-wrapped SRL/RateLimit
-                    // line looks like (the phrase split across rows by real
-                    // `\n`). Retry on the flattened bottom-N tail before the
-                    // structural/expire path. Land via the SAME recovery gate as
-                    // the raw SRL path: recent productive output ⇒ recovered ⇒
-                    // Idle; else latch the throttle so auto-retry fires.
-                    // (working_state_below can't be located in the wrapped raw
-                    // text, so a hard-wrapped throttle with a working marker
-                    // below is not overridden here — accepted; `recovered_within`
-                    // still releases a genuinely-recovered pane.)
-                    if let Some(throttle) =
-                        flattened_throttle_detect(patterns, screen_text, self.input_line_markers)
-                    {
-                        let landed = if matches!(throttle, AgentState::ServerRateLimit)
-                            && self.recovered_within(SERVER_RATE_LIMIT_RECOVERY_SILENCE)
-                        {
-                            AgentState::Idle
-                        } else {
-                            throttle
-                        };
-                        let gated = self.gate_on_heartbeat(landed);
-                        self.transition(gated);
-                    } else if matches!(self.current, AgentState::Starting)
-                        && is_generic_startup_prompt(screen_text)
-                    {
-                        // Starting-only structural fallback: a generic prompt
-                        // token (y/n, press enter, …) at startup is almost
-                        // certainly an operator dialog — flag InteractivePrompt
-                        // immediately instead of waiting on the silence window.
-                        self.transition(AgentState::InteractivePrompt);
-                    } else {
-                        self.maybe_expire_latched_state();
-                    }
-                }
+                None => self.handle_no_raw_match(patterns, screen_text),
             }
 
             // #1808-probe0-phantom (instrumentation-only): record that the tracker
@@ -1657,9 +1303,48 @@ impl StateTracker {
         // never touches `self.current`/retry).
         self.capture_unclassified_throttle(screen_text, fg);
 
-        // Sprint 27 shadow-mode: log behavioral signal alongside regex state.
-        // Zero state change — telemetry only. Phase 2 (Sprint 28+) promotes
-        // behavioral to tiebreaker/primary.
+        // Instrumentation 2 — Sprint 27 shadow-mode behavioral telemetry.
+        self.record_shadow_telemetry(silence_since_last_feed);
+
+        // F9 (#685 sub-task 4): productive-output detection (zero behavior).
+        self.detect_productive_output(screen_text);
+    }
+
+    /// Gate 1 — hash-dedup. Returns `true` when this frame is a duplicate
+    /// that should skip the whole feed.
+    ///
+    /// #SRL-phase2 hash-dedup blind spot: a SETTLED (static) stuck-SRL pane
+    /// has an UNCHANGED hash, so this dedup early-return would skip detection
+    /// forever and the agent never recovers (no further feed ever re-runs the
+    /// SRL gates). Override the skip ONLY when the pane carries a throttle hint
+    /// AND we are not already latched on a throttle — then fall through so the
+    /// hard-wrap fallback (None arm) can latch it → auto-retry fires. The cheap
+    /// raw-token pre-filter keeps the common static-idle pane on the fast skip
+    /// path.
+    fn apply_hash_dedup_gate(&mut self, screen_text: &str, hash: u64) -> bool {
+        if self.last_screen_hash == Some(hash) {
+            let already_throttle = matches!(
+                self.current,
+                AgentState::ServerRateLimit | AgentState::RateLimit
+            );
+            if already_throttle || !screen_has_throttle_hint(screen_text) {
+                return true;
+            }
+            // Re-detect the static throttle pane. Do NOT re-stamp the hash
+            // (it's unchanged); once we latch, `already_throttle` short-circuits
+            // subsequent identical frames.
+            false
+        } else {
+            self.last_screen_hash = Some(hash);
+            self.scan_context_pct(screen_text);
+            false
+        }
+    }
+
+    /// Instrumentation — Sprint 27 shadow-mode: log behavioral signal alongside
+    /// regex state. Zero state change — telemetry only. Phase 2 (Sprint 28+)
+    /// promotes behavioral to tiebreaker/primary.
+    fn record_shadow_telemetry(&self, silence_since_last_feed: Duration) {
         if let Some(ref config) = self.behavioral_config {
             let signal = crate::behavioral::infer_from_silence(config, silence_since_last_feed);
             crate::behavioral::log_shadow_telemetry(
@@ -1675,30 +1360,30 @@ impl StateTracker {
                 self.current.display_name(),
             );
         }
+    }
 
-        // F9 (#685 sub-task 4): productive-output detection. Bumps
-        // `last_productive_output` only on a Productive signal. The bump
-        // affects nothing about Hung classification directly — the daemon
-        // supervisor reads `last_productive_output.elapsed()` and passes it
-        // to `check_hang` as the dual-path signal. Activation of the new
-        // classification branch is gated on `AGEND_PRODUCTIVE_GATE=1` in
-        // `check_hang` (shadow-mode default). See
-        // `docs/F9-PRODUCTIVE-OUTPUT-GATE.md` §F9.5.
-        //
-        // #685 PR-2 (reviewer #1009 / #1005 same-class flag): scan ONLY
-        // the recent tail (last MARKER_SCAN_TAIL_LINES rows) — historical
-        // completion markers visible in scrollback (e.g. `Saved to /tmp/
-        // foo.txt` left at row 5 from a 5-min-old write) MUST NOT keep
-        // refreshing `last_productive_output` on every cursor-blink tick.
-        //
-        // #685 PR-2 RC1 (reviewer #1013 verdict): dedup hash scope
-        // narrowed from "entire recent tail" → "matched marker
-        // substring". Pre-RC1 a stale marker that stayed visible in
-        // the tail while an adjacent spinner ticked produced a
-        // DIFFERENT tail hash on every tick — the dedup-hash never
-        // matched, `last_productive_output` re-fired despite no new
-        // productive evidence. Hashing the matched substring directly
-        // captures evidence identity, not surrounding-context noise.
+    /// F9 (#685 sub-task 4): productive-output detection. Bumps
+    /// `last_productive_output` only on a Productive signal. The bump affects
+    /// nothing about Hung classification directly — the daemon supervisor reads
+    /// `last_productive_output.elapsed()` and passes it to `check_hang` as the
+    /// dual-path signal. Activation of the new classification branch is gated on
+    /// `AGEND_PRODUCTIVE_GATE=1` in `check_hang` (shadow-mode default). See
+    /// `docs/F9-PRODUCTIVE-OUTPUT-GATE.md` §F9.5.
+    ///
+    /// #685 PR-2 (reviewer #1009 / #1005 same-class flag): scan ONLY the recent
+    /// tail (last MARKER_SCAN_TAIL_LINES rows) — historical completion markers
+    /// visible in scrollback (e.g. `Saved to /tmp/foo.txt` left at row 5 from a
+    /// 5-min-old write) MUST NOT keep refreshing `last_productive_output` on
+    /// every cursor-blink tick.
+    ///
+    /// #685 PR-2 RC1 (reviewer #1013 verdict): dedup hash scope narrowed from
+    /// "entire recent tail" → "matched marker substring". Pre-RC1 a stale marker
+    /// that stayed visible in the tail while an adjacent spinner ticked produced
+    /// a DIFFERENT tail hash on every tick — the dedup-hash never matched,
+    /// `last_productive_output` re-fired despite no new productive evidence.
+    /// Hashing the matched substring directly captures evidence identity, not
+    /// surrounding-context noise.
+    fn detect_productive_output(&mut self, screen_text: &str) {
         if let Some(ref pconfig) = self.productivity_config {
             let heartbeat_age = self
                 .last_heartbeat
@@ -1717,11 +1402,10 @@ impl StateTracker {
                     },
                     Some(matched),
                 ) => {
-                    // Marker source: dedup against the matched
-                    // substring text. Same substring across feeds =
-                    // same evidence, suppress refresh — even when
-                    // adjacent content (spinner ticks, status line
-                    // edits) changes around it.
+                    // Marker source: dedup against the matched substring text.
+                    // Same substring across feeds = same evidence, suppress
+                    // refresh — even when adjacent content (spinner ticks,
+                    // status line edits) changes around it.
                     let marker_hash = hash_screen(matched);
                     if self.last_productive_marker_hash != Some(marker_hash) {
                         self.last_productive_output = Some(Instant::now());
@@ -1741,9 +1425,8 @@ impl StateTracker {
                     self.last_productive_marker_hash = None;
                 }
                 _ => {
-                    // No marker visible in the recent tail → clear the
-                    // dedup hash so a fresh-after-silence marker
-                    // re-fires the refresh.
+                    // No marker visible in the recent tail → clear the dedup
+                    // hash so a fresh-after-silence marker re-fires the refresh.
                     self.last_productive_marker_hash = None;
                 }
             }
@@ -1754,6 +1437,418 @@ impl StateTracker {
                 &signal,
             );
         }
+    }
+
+    /// Gate 2a — anchor. Returns `true` when the detection should be SUPPRESSED
+    /// (treated as no-match). Two regimes (t-coloranchor-remove-ratelimit,
+    /// operator-approved after the corpus gate's go/no-go):
+    ///
+    /// - **`requires_red_anchor`** {ContextFull, ModelUnsupported}: keep the
+    ///   #1450 RED anchor — a marker needs ≥1 red rendered cell, else it's prose
+    ///   not a state. ContextFull has no corpus to prove a content path;
+    ///   ModelUnsupported never auto-clears AND suppresses hang-check, so a
+    ///   verbatim-quote FP would silently disable a healthy agent (cost too high).
+    /// - **content-anchor** {RateLimit, ServerRateLimit}: the marker must sit on
+    ///   an error-line-shaped line (`in_error_line_excluding_input`) —
+    ///   corpus-proven safe (5/5 prose suppressed via pattern-narrow + #1518
+    ///   position + #1769 working-marker; FN-covered incl. kiro
+    ///   `ThrottlingException` via #1789). NO red required, so a real fault
+    ///   rendered in DEFAULT/grey (codex/gemini net errors) latches — the old
+    ///   #1757 net-error red-exemption is now the GENERAL rule, not a special
+    ///   case. The residual verbatim-quote FP (an agent pasting a real error line
+    ///   into the live tail with no working-marker below) is ACCEPTED for these
+    ///   two: both auto-clear and are retry-driven, so a one-off mis-latch
+    ///   self-corrects (unlike ModelUnsupported).
+    ///
+    /// #1947: the content anchor additionally rejects matches sitting on the
+    /// backend's INPUT line (or an echoed / submitted user-message line) —
+    /// operator-typed / quoted error strings are prose, not CLI error output
+    /// (operator-reproduced live FP, 2026-06-10).
+    ///
+    /// #1955 self-poisoning (UsageLimit arm): an agent QUOTING the banner
+    /// ("You've hit your weekly limit" in an RCA / dispatch) latched itself.
+    /// Input-line exclusion is the right-sized anchor here — the REAL banner
+    /// carries no error indicator (`⎿ You've hit your weekly limit · resets 4am`),
+    /// so the error-line content anchor would false-negative it, and its
+    /// rendering isn't reliably red. Prose mentions in agent OUTPUT are bounded by
+    /// the position gate + the #1777 working-marker override + the #1955 release
+    /// anchor.
+    fn apply_anchor_gate(
+        &self,
+        detected: AgentState,
+        matched: &str,
+        screen_text: &str,
+        fg: &[CellFg],
+        high_fp: bool,
+        usage_limit: bool,
+    ) -> bool {
+        if requires_red_anchor(detected) {
+            self.anchor_on_red && !fg.is_empty() && !matched_span_has_red(screen_text, matched, fg)
+        } else if high_fp {
+            !crate::state::patterns::in_error_line_excluding_input(
+                screen_text,
+                matched,
+                self.input_line_markers,
+            )
+        } else if usage_limit {
+            !crate::state::patterns::any_match_off_input_lines(
+                screen_text,
+                matched,
+                self.input_line_markers,
+            )
+        } else {
+            false
+        }
+    }
+
+    /// Gate 2b — position. Returns `true` when a HIGH_FP / UsageLimit marker has
+    /// scrolled out of the live bottom-N rows (e.g. an ApiError / ServerRateLimit
+    /// line pushed up by the post-recovery `continue` output) and is therefore
+    /// stale — the agent has moved on, so it must NOT keep re-firing the error
+    /// transition (the level-triggered re-match that drove the retry storm).
+    /// Scoped to HIGH_FP/error states ONLY: Idle and modal/interactive prompts
+    /// keep full-screen scanning, because a modal can legitimately sit above the
+    /// tail. #1955: UsageLimit joins the position gate — a banner quote buried in
+    /// deep scrollback is discussion, not a live limit (same staleness logic).
+    fn apply_position_gate(
+        &self,
+        matched: &str,
+        screen_text: &str,
+        high_fp: bool,
+        usage_limit: bool,
+    ) -> bool {
+        (high_fp || usage_limit)
+            && !matched_span_in_recent_tail(screen_text, matched, ERROR_TAIL_SCAN_LINES)
+    }
+
+    /// Suppression handler — a detection that failed the anchor/position gates is
+    /// treated as no detection: log why (anchor → #1450 observability,
+    /// otherwise → #1518 stale-position), then fall through to structural
+    /// fallback (Starting → InteractivePrompt on a generic startup prompt) or
+    /// latch maintenance.
+    fn handle_suppressed_detection(
+        &mut self,
+        detected: AgentState,
+        matched: &str,
+        screen_text: &str,
+        fg: &[CellFg],
+        anchor_fail: bool,
+    ) {
+        if anchor_fail {
+            self.log_anchor_suppress(detected, matched, screen_text, fg);
+        } else {
+            tracing::debug!(
+                target: "state_detection",
+                agent = %self.instance_name,
+                state = ?detected,
+                tail_rows = ERROR_TAIL_SCAN_LINES,
+                "#1518: HIGH_FP marker scrolled out of the live tail — suppressing stale error transition"
+            );
+        }
+        if matches!(self.current, AgentState::Starting) && is_generic_startup_prompt(screen_text) {
+            self.transition(AgentState::InteractivePrompt);
+        } else {
+            self.maybe_expire_latched_state();
+        }
+    }
+
+    /// No-raw-match handler (the `detect_with_match` → `None` arm).
+    ///
+    /// #SRL-phase2: hard-wrap fallback. Raw detection missed — which is exactly
+    /// what an Ink-hard-wrapped SRL/RateLimit line looks like (the phrase split
+    /// across rows by real `\n`). Retry on the flattened bottom-N tail before the
+    /// structural/expire path. Land via the SAME recovery gate as the raw SRL
+    /// path: recent productive output ⇒ recovered ⇒ Idle; else latch the throttle
+    /// so auto-retry fires. (working_state_below can't be located in the wrapped
+    /// raw text, so a hard-wrapped throttle with a working marker below is not
+    /// overridden here — accepted; `recovered_within` still releases a
+    /// genuinely-recovered pane.)
+    fn handle_no_raw_match(&mut self, patterns: &'static StatePatterns, screen_text: &str) {
+        if let Some(throttle) =
+            flattened_throttle_detect(patterns, screen_text, self.input_line_markers)
+        {
+            let landed = if matches!(throttle, AgentState::ServerRateLimit)
+                && self.recovered_within(SERVER_RATE_LIMIT_RECOVERY_SILENCE)
+            {
+                AgentState::Idle
+            } else {
+                throttle
+            };
+            let gated = self.gate_on_heartbeat(landed);
+            self.transition(gated);
+        } else if matches!(self.current, AgentState::Starting)
+            && is_generic_startup_prompt(screen_text)
+        {
+            // Starting-only structural fallback: a generic prompt token (y/n,
+            // press enter, …) at startup is almost certainly an operator dialog —
+            // flag InteractivePrompt immediately instead of waiting on the
+            // silence window.
+            self.transition(AgentState::InteractivePrompt);
+        } else {
+            self.maybe_expire_latched_state();
+        }
+    }
+
+    /// Landing gate 1 — working-marker override. Computes the INITIAL `landed`
+    /// state for a non-suppressed HIGH_FP / UsageLimit detection.
+    ///
+    /// #1768: a HIGH_FP error wins the priority race even after it scrolled up
+    /// and the agent RESUMED WORK below it (ServerRateLimit > Thinking by pattern
+    /// order), so it keeps re-latching → `clears_server_rate_limit_retry`
+    /// (Idle-only, #1713) never fires → supervisor re-injects `continue` into a
+    /// working agent (the #1768 retry storm; the latched ServerRateLimit also
+    /// doesn't auto-expire). If a Thinking/ToolUse marker is rendered BELOW the
+    /// error, the agent recovered → land on that working state instead of the
+    /// stale error. A genuinely-stuck error has NO in-flight working marker below
+    /// it → `landed` stays `detected` → still latches → auto-retry fires.
+    /// Detection-side only; `clears_server_rate_limit_retry` untouched → no #1713
+    /// flicker-reset regression.
+    ///
+    /// #1777 (cheerc, "Sticky UsageLimit"): UsageLimit (prio 11) is the same kind
+    /// of sticky error — it outranks Thinking/ToolUse and never auto-expires (no
+    /// `maybe_expire_latched_state` arm), so a stale UsageLimit line keeps
+    /// re-latching after the agent resumed work below it. Extend the same
+    /// recovery override to it. UsageLimit stays OUT of `is_high_fp_state` → the
+    /// #1450 red anchor is unchanged; this is the #1768 working-marker override
+    /// only.
+    ///
+    /// #badge-recovery (state-level mirror of #1795): a ServerRateLimit whose
+    /// agent produced PRODUCTIVE output within the recovery window has recovered
+    /// even though the stale error still matches and `working_state_below` can't
+    /// see a marker below the bottom-most (re-injected) error line. Land Idle
+    /// instead of re-latching the badge. `recovered_within` is None-safe: a fresh
+    /// / just-spawned agent (never produced) is NOT recovery → falls through to
+    /// `detected` → latches + nudges normally. Scoped to ServerRateLimit (the
+    /// #1795 storm's state); other HIGH_FP / UsageLimit keep re-latching as before.
+    ///
+    /// #1809-srl-swallow-probe (instrumentation-only, NO behavior change): when a
+    /// ServerRateLimit is SWALLOWED (landed != SRL) it never latches → no
+    /// auto-retry → the live stuck-agent bug. TWO gates can swallow it; probe
+    /// BOTH, for ALL backends — the old #1808-flaw2-probe was scoped to Agy/Kiro
+    /// and was therefore BLIND to the live claude SRL incident. Records the raw
+    /// `recovered_within` bool + `productive_silent_secs` as INDEPENDENT fields;
+    /// `dist_from_bottom` locates the matched error line. Does NOT alter `landed`.
+    fn apply_working_marker_override(
+        &self,
+        patterns: &'static StatePatterns,
+        detected: AgentState,
+        matched: &str,
+        screen_text: &str,
+        high_fp: bool,
+    ) -> AgentState {
+        if high_fp || matches!(detected, AgentState::UsageLimit) {
+            let fallback = if matches!(detected, AgentState::ServerRateLimit)
+                && self.recovered_within(SERVER_RATE_LIMIT_RECOVERY_SILENCE)
+            {
+                AgentState::Idle
+            } else {
+                detected
+            };
+            let working_below = patterns.working_state_below(screen_text, matched);
+            if matches!(detected, AgentState::ServerRateLimit) {
+                let recovered = self.recovered_within(SERVER_RATE_LIMIT_RECOVERY_SILENCE);
+                let productive_silent_secs = self.productive_silence().as_secs();
+                let dist_from_bottom = srl_match_signature(screen_text, matched).1;
+                match &working_below {
+                    // Path A: a working marker renders BELOW the error →
+                    // `working_state_below` override lands that working state,
+                    // swallowing the SRL (#1769 positional defeat).
+                    Some((win_state, marker)) => {
+                        if recovered {
+                            tracing::info!(
+                                target: "state_detection",
+                                agent = %self.instance_name,
+                                tag = "#1809-srl-swallow-probe",
+                                path = "working_state_below",
+                                backend = %self.backend_name,
+                                working_marker = %marker,
+                                landed_state = ?win_state,
+                                recovered_within = recovered,
+                                productive_silent_secs,
+                                dist_from_bottom,
+                                "ServerRateLimit swallowed by working_state_below override (Path A) with recent productive output — likely genuine recovery"
+                            );
+                        } else {
+                            tracing::warn!(
+                                target: "state_detection",
+                                agent = %self.instance_name,
+                                tag = "#1809-srl-swallow-probe",
+                                path = "working_state_below",
+                                backend = %self.backend_name,
+                                working_marker = %marker,
+                                landed_state = ?win_state,
+                                recovered_within = recovered,
+                                productive_silent_secs,
+                                dist_from_bottom,
+                                "ServerRateLimit swallowed by working_state_below override (Path A) with NO recent productive output — possible static-chrome mask of a stuck throttle"
+                            );
+                        }
+                    }
+                    // Path B: NO working marker below, but the
+                    // `recovered_within`→Idle fallback swallows the SRL.
+                    // Previously SILENT — the gap that hid the live claude bug.
+                    // Only reachable when `recovered` is true (that IS the gate);
+                    // log the raw silence so we can judge whether
+                    // `recovered_within` is firing legitimately.
+                    None if recovered => {
+                        tracing::info!(
+                            target: "state_detection",
+                            agent = %self.instance_name,
+                            tag = "#1809-srl-swallow-probe",
+                            path = "recovered_within_idle",
+                            backend = %self.backend_name,
+                            recovered_within = recovered,
+                            productive_silent_secs,
+                            dist_from_bottom,
+                            "ServerRateLimit swallowed by recovered_within→Idle fallback (Path B) — no working marker below"
+                        );
+                    }
+                    // No working marker + NOT recovered → SRL latches normally
+                    // (auto-retry fires); not a swallow, no probe.
+                    None => {}
+                }
+            }
+            working_below.map(|(s, _)| s).unwrap_or(fallback)
+        } else {
+            detected
+        }
+    }
+
+    /// Landing gate 2 — SRL phantom re-match (#1808-probe0-phantom + #1809 fix).
+    ///
+    /// cheerc Evidence 2 — a stale SRL error stuck in the bottom-N tail keeps
+    /// re-matching after the agent recovered (the screen hash flips when the CLI
+    /// clock ticks → feed re-scans → re-grabs the SAME old error → re-latch →
+    /// blind inject). Signature the matched error line `(line_hash,
+    /// dist_from_bottom)` and compare to the previous SRL detection —
+    ///   • same sig, NO intervening non-SRL state  → in-place clock-tick re-scan
+    ///     → `srl_consecutive_rematch++`;
+    ///   • same sig, intervening Idle/non-SRL state → `cross_cycle` refire (the
+    ///     agent recovered, then the OLD error was re-grabbed) = cheerc's exact
+    ///     cross-Idle loop.
+    /// `last_srl_match_sig` PERSISTS across Idle so the cross-cycle case survives.
+    /// WARN when the SRL would win (`landed == SRL` → latch → inject) AND no
+    /// recent productive output (`!recovered`) AND it is a re-match. The #1809
+    /// fix then OVERRIDES `landed` to Idle for the `cross_cycle` sub-case only
+    /// (the unambiguous phantom) — the `consecutive_rematch` (still-SRL) case
+    /// stays telemetry-only so a genuine long throttle keeps retrying. Not
+    /// backend-scoped (the phantom is the Claude `Server is temporarily limiting`
+    /// re-match — cheerc's `general` agent).
+    fn apply_srl_phantom_gate(
+        &mut self,
+        detected: AgentState,
+        matched: &str,
+        screen_text: &str,
+        mut landed: AgentState,
+    ) -> AgentState {
+        if matches!(detected, AgentState::ServerRateLimit) {
+            let sig = srl_match_signature(screen_text, matched);
+            let same_sig = self.last_srl_match_sig == Some(sig);
+            let cross_cycle = same_sig && self.non_srl_since_last_srl;
+            self.srl_consecutive_rematch = if same_sig && !self.non_srl_since_last_srl {
+                self.srl_consecutive_rematch.saturating_add(1)
+            } else {
+                0
+            };
+            self.last_srl_match_sig = Some(sig);
+            self.non_srl_since_last_srl = false;
+
+            let would_latch = matches!(landed, AgentState::ServerRateLimit);
+            let recovered_now = self.recovered_within(SERVER_RATE_LIMIT_RECOVERY_SILENCE);
+            if would_latch && !recovered_now && (self.srl_consecutive_rematch > 0 || cross_cycle) {
+                let kind = if cross_cycle {
+                    "cross_cycle_refire"
+                } else {
+                    "consecutive_rematch"
+                };
+                tracing::warn!(
+                    target: "state_detection",
+                    agent = %self.instance_name,
+                    tag = "#1808-probe0-phantom",
+                    kind,
+                    consecutive_rematch = self.srl_consecutive_rematch,
+                    cross_cycle_refire = cross_cycle,
+                    dist_from_bottom = sig.1,
+                    productive_silent_secs = self.productive_silence().as_secs(),
+                    "phantom re-match: same stale ServerRateLimit error re-detected (would latch → inject) with no recent productive output"
+                );
+                // #1809 fix (behavioral): a CROSS-CYCLE phantom — the agent
+                // already LEFT ServerRateLimit (passed through a non-SRL landed
+                // state) and the SAME stale error line (`same_sig`) was re-grabbed
+                // with no recent productive output. This is cheerc's exact loop: a
+                // CLI clock-tick flips the screen hash → feed re-scans → re-matches
+                // the OLD error → re-latch → the supervisor schedules ANOTHER
+                // auto-retry → blind `continue` inject, repeating every ~45s as the
+                // recovery window expires. Land Idle instead of re-latching: the
+                // genuine error already latched + retried on its FIRST detection; a
+                // genuinely-new error has a different signature; genuine productive
+                // output sets `recovered_now` (→ #badge-recovery lands Idle anyway,
+                // never reaching here). The IN-PLACE `consecutive_rematch` case is
+                // deliberately NOT suppressed — a still-SRL agent may be a genuine
+                // long throttle that still needs its retry. (Accepted narrow FP: a
+                // genuinely-new SRL identical in text AND screen position to the
+                // just-processed one, with no intervening productive output, is
+                // ignored — see PR body.)
+                if cross_cycle {
+                    landed = AgentState::Idle;
+                }
+            }
+        }
+        landed
+    }
+
+    /// Landing gate 3 — UsageLimit episode lifecycle (#1955). The match is
+    /// level-triggered and a silent pane never scrolls the banner away (the
+    /// `general` incident: stuck for DAYS past the account reset), so the state
+    /// machine — not new output — must provide the exit:
+    ///  • fresh latch → anchor a release deadline on the banner's own unlock hint
+    ///    (conservative fallback);
+    ///  • in-episode re-match past the deadline → release to Idle and remember
+    ///    the banner's signature;
+    ///  • re-match of that SAME released signature → suppress (mirror of the
+    ///    #1809 cross-cycle suppression) — a genuinely-new limit renders fresh at
+    ///    the bottom → new sig → latches again.
+    fn apply_usage_limit_lifecycle_gate(
+        &mut self,
+        detected: AgentState,
+        matched: &str,
+        screen_text: &str,
+        mut landed: AgentState,
+    ) -> AgentState {
+        if matches!(detected, AgentState::UsageLimit) && matches!(landed, AgentState::UsageLimit) {
+            let sig = srl_match_signature(screen_text, matched);
+            if self.usage_limit_expired_sig == Some(sig) {
+                landed = AgentState::Idle;
+            } else if self.current == AgentState::UsageLimit {
+                if self
+                    .usage_limit_release_at
+                    .is_some_and(|at| Instant::now() >= at)
+                {
+                    self.usage_limit_expired_sig = Some(sig);
+                    self.usage_limit_release_at = None;
+                    tracing::info!(
+                        target: "state_detection",
+                        agent = %self.instance_name,
+                        dist_from_bottom = sig.1,
+                        "#1955: UsageLimit released — unlock anchor passed; suppressing the stale banner re-latch"
+                    );
+                    landed = AgentState::Idle;
+                }
+            } else {
+                let release_in = line_containing(screen_text, matched)
+                    .and_then(parse_usage_limit_release)
+                    .unwrap_or(Self::USAGE_LIMIT_EXPIRY);
+                self.usage_limit_release_at = Some(Instant::now() + release_in);
+                self.usage_limit_expired_sig = None;
+                tracing::info!(
+                    target: "state_detection",
+                    agent = %self.instance_name,
+                    release_in_secs = release_in.as_secs(),
+                    "#1955: UsageLimit latched — release anchored on the banner's unlock hint (or conservative fallback)"
+                );
+            }
+        }
+        landed
     }
 
     /// #1450 observability: a HIGH_FP pattern matched but no on-screen
