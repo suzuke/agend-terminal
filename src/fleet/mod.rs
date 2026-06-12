@@ -163,12 +163,19 @@ pub struct FleetConfig {
     pub(crate) home: Option<PathBuf>,
 }
 
-/// An entry in the Telegram `user_allowlist`. Accepts either a bare numeric
-/// Telegram user id (legacy: `- 12345`) or a `{ id, name }` map that also
-/// records a display name. The name is surfaced as `[user:NAME via telegram]`
-/// in agent inboxes when the sender has no public Telegram @username (so the
-/// operator no longer shows up as `unknown`). Backward compatible via
-/// `#[serde(untagged)]` — old bare-id lists still parse.
+/// An entry in a channel's `user_allowlist`. **Channel-agnostic by design** —
+/// used by Telegram today, and intended for any future channel adapter
+/// (Discord, Slack, …): when their inbound handlers land they should give their
+/// `user_allowlist` this same `Option<Vec<AllowlistEntry>>` type and resolve the
+/// sender name the same way (see `TelegramState::username_for` +
+/// `NotifySource::Channel`, which already renders `user:NAME via {channel}` for
+/// any `ChannelKind`).
+///
+/// Accepts either a bare numeric user id (legacy: `- 12345`) or a `{ id, name }`
+/// map that also records a display name. The name is surfaced as
+/// `[user:NAME via <channel>]` in agent inboxes when the sender has no public
+/// platform username (so the operator no longer shows up as `unknown`).
+/// Backward compatible via `#[serde(untagged)]` — old bare-id lists still parse.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum AllowlistEntry {
