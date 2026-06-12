@@ -263,13 +263,23 @@ fn releasable_by_invariant(home: &Path, repo: &str, branch: &str) -> (bool, PrCo
 
 /// True iff `role` (the verdict sender's resolved fleet.yaml role) is a reviewer
 /// role. Structural — sourced from the operator-set `role:` config, never from
-/// message text. Matches both role shapes in use: the short fixup-team tag
-/// (`reviewer`) and the descriptive template role (`Code reviewer — independent
-/// review…`), via a case-insensitive `"review"` substring. Implementer
-/// (`Implementer — …` / `null`) and orchestrator roles never contain it.
+/// message text. Matches the two reviewer role shapes in production by EXACT
+/// form, not a loose substring:
+///   - the short fixup-team tag `reviewer` (exact, case-insensitive);
+///   - the descriptive template role `Code reviewer — …` (prefix).
+///
+/// #2010 codex-r2: a bare `contains("review")` was too wide. `description` is a
+/// serde alias for `role` (fleet/mod.rs), so a perfectly normal IMPLEMENTER
+/// description such as "Implementer — build features and submit changes for
+/// review" contains "review" and would re-open the self-verdict bypass. The
+/// exact tag + `code reviewer` prefix admit every real reviewer (the three live
+/// fixup reviewers are exactly `reviewer`; the deploy template is `Code reviewer
+/// — …`) while rejecting any implementer/orchestrator description that merely
+/// mentions a review ACTIVITY.
 fn is_reviewer_role(role: Option<&str>) -> bool {
-    role.map(|r| r.to_lowercase().contains("review"))
-        .unwrap_or(false)
+    let Some(r) = role else { return false };
+    let t = r.trim().to_lowercase();
+    t == "reviewer" || t.starts_with("code reviewer")
 }
 
 /// #2010 2a: the reviewer-binding-release bypass. A reviewer that ran a full
@@ -989,21 +999,56 @@ mod tests {
             ),
             "implementer role string must NOT satisfy the reviewer gate"
         );
+        // #2010 codex-r2: an implementer whose description (serde alias for role)
+        // MENTIONS a review activity must still be rejected — the old
+        // contains("review") gate let exactly this revive the bypass.
+        assert!(
+            !reviewer_binding_release_bypass(
+                &intent,
+                Some(&self_done),
+                "dev-1",
+                Some("Implementer — build features and submit changes for review")
+            ),
+            "an implementer description mentioning 'review' must NOT bypass (codex-r2)"
+        );
     }
 
-    /// `is_reviewer_role` matches both fleet-team and template role shapes, and
-    /// rejects implementer / orchestrator / absent roles.
+    /// `is_reviewer_role` matches both production reviewer role shapes by exact
+    /// form and rejects implementer / orchestrator / absent roles — INCLUDING an
+    /// implementer description that merely MENTIONS a review activity (the #2010
+    /// codex-r2 counter-probe: a bare `contains("review")` let it through).
     #[test]
-    fn is_reviewer_role_matches_both_shapes_2010_r1() {
+    fn is_reviewer_role_exact_forms_only_2010_r2() {
+        // Accept: the two real reviewer shapes (the 3 live fixup reviewers are
+        // exactly `reviewer`; the deploy template is `Code reviewer — …`).
         assert!(is_reviewer_role(Some("reviewer")), "fixup-team short tag");
-        assert!(
-            is_reviewer_role(Some("Code reviewer — independent review")),
-            "template descriptive role"
-        );
         assert!(is_reviewer_role(Some("REVIEWER")), "case-insensitive");
-        assert!(!is_reviewer_role(Some("Implementer — build features")));
-        assert!(!is_reviewer_role(Some("Team orchestrator — dispatch")));
+        assert!(is_reviewer_role(Some("  reviewer  ")), "trimmed");
+        assert!(
+            is_reviewer_role(Some(
+                "Code reviewer — independent review from a non-Claude vantage, \
+                 verdicts VERIFIED/REJECTED/UNVERIFIED"
+            )),
+            "template descriptive role (exact production string)"
+        );
+
+        // Reject: implementer / orchestrator, incl. ones that mention review.
+        assert!(
+            !is_reviewer_role(Some(
+                "Implementer — build features and submit changes for review"
+            )),
+            "#2010 codex-r2: an implementer description mentioning a review \
+             ACTIVITY must NOT pass (this revived the self-verdict bypass under \
+             the old contains(\"review\") gate)"
+        );
+        assert!(!is_reviewer_role(Some(
+            "Implementer — pick up tasks from the board, build features, run tests"
+        )));
+        assert!(!is_reviewer_role(Some(
+            "Team orchestrator — break work into tasks, dispatch, gate merges after reviewer approval"
+        )));
         assert!(!is_reviewer_role(None), "no role → not a reviewer");
+        assert!(!is_reviewer_role(Some("")), "empty role → not a reviewer");
     }
 
     /// `enqueue_intent` is atomic: temp file is renamed into place;
