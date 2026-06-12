@@ -25,30 +25,33 @@
 //! safe. A site that genuinely must inherit the terminal can carry a
 //! `// tty-inherit-allowed: <reason>` marker.
 //!
-//! ## Scope + evasion limit (documented, per the invariant-completeness rule)
+//! ## Scope
 //!
-//! Scope is per-slice: the modules with a confirmed app-mode-reachable git
-//! spawn (grow the list as more are found/migrated). The scanner reads the
-//! contiguous fluent git `Command` builder chain up to its terminator; it does
-//! NOT catch a chain split across a `let cmd = <git Command>; …; cmd.status()`
-//! binding, nor non-git subprocesses. Those are out of this
-//! guard's reach by design — it pins the concrete #2071 shape, not every
-//! conceivable TTY inheritance.
+//! ALL of `src/` production code (every `.rs`, each scanned up to its first
+//! `#[cfg(test)]`), EXCEPT `src/bin/` — those are standalone exec'd binaries
+//! (notably the `agend-git` shim, whose entire job is to BE git and pass git's
+//! output through to its caller's stdio); they never run in the in-process
+//! TUI/daemon, so terminal inheritance there is correct by design, not a leak.
+//!
+//! ## Evasion limit (documented, per the invariant-completeness rule)
+//!
+//! The scanner reads forward from each literal git-`Command` constructor (the
+//! `GIT_CMD` pattern) to its first terminator within a 30-line window — so a
+//! rebound builder
+//! (`let cmd = …; cmd.stdout(..); cmd.status();`) within that window IS
+//! covered (its redirect lands in the accumulated chain). What it does NOT
+//! catch: (a) a non-literal program name (`Command::new(git_var)`), (b) a
+//! `Command` returned from a helper and terminated at a distant call site that
+//! has no git-`Command` constructor on it, and (c) a terminator more than 30 lines
+//! after the constructor. It pins the concrete #2071 shape — a direct git
+//! spawn — not every conceivable TTY inheritance.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const SRC_DIR: &str = "src";
 const CFG_TEST: &str = "#[cfg(test)]";
 const GIT_CMD: &str = "Command::new(\"git\")";
 const ALLOW_MARKER: &str = "tty-inherit-allowed:";
-
-/// Modules with a confirmed app-mode-reachable raw git spawn (#2071). GROW
-/// this list as further leak sites are found; never shrink it.
-const MODULE_SCOPE: &[&str] = &[
-    "mcp/handlers/dispatch_hook/mod.rs",
-    "skills.rs",
-    "instructions.rs",
-];
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Violation {
@@ -128,33 +131,68 @@ pub fn scan_file(path: &str, content: &str) -> Vec<Violation> {
     violations
 }
 
-fn read_module(rel: &str) -> Option<String> {
-    let direct = Path::new(SRC_DIR).join(rel);
-    std::fs::read_to_string(&direct)
-        .or_else(|_| std::fs::read_to_string(Path::new("agend-terminal").join(SRC_DIR).join(rel)))
-        .ok()
+/// Locate the crate `src/` dir (cwd is the crate root under nextest, but fall
+/// back to the workspace-nested path the way other repo invariants do).
+fn src_root() -> PathBuf {
+    let direct = PathBuf::from(SRC_DIR);
+    if direct.is_dir() {
+        return direct;
+    }
+    PathBuf::from("agend-terminal").join(SRC_DIR)
+}
+
+/// Recursively collect every `.rs` under `dir`, skipping any `bin/` subtree
+/// (standalone exec'd binaries — see the module-doc Scope note).
+fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if path.file_name().and_then(|n| n.to_str()) == Some("bin") {
+                continue;
+            }
+            collect_rs_files(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            // Skip split test-module files (`#[cfg(test)] mod tests;` → a
+            // sibling `tests.rs` with no inline `#[cfg(test)]`, so the
+            // prod-boundary heuristic can't see it's test-only).
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            if stem == "tests" || stem == "test" {
+                continue;
+            }
+            out.push(path);
+        }
+    }
 }
 
 #[test]
 fn app_reachable_git_spawns_redirect_stdio_2071() {
+    let root = src_root();
+    assert!(
+        root.is_dir(),
+        "could not locate src/ (cwd-relative) — got {}",
+        root.display()
+    );
+    let mut files = Vec::new();
+    collect_rs_files(&root, &mut files);
+    files.sort();
+    assert!(!files.is_empty(), "scanned zero src files — path bug?");
+
     let mut violations = Vec::new();
-    for rel in MODULE_SCOPE {
-        let Some(content) = read_module(rel) else {
-            violations.push(Violation {
-                file: (*rel).to_string(),
-                line: 0,
-                snippet: format!("MODULE_SCOPE entry not found: {rel}"),
-            });
-            continue;
-        };
-        violations.extend(scan_file(rel, &content));
+    for path in &files {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            violations.extend(scan_file(&path.display().to_string(), &content));
+        }
     }
     assert!(
         violations.is_empty(),
-        "#2071 TTY-leak invariant FAILED — {} git `.status()`/`.spawn()` site(s) reachable in \
-         app mode lack a stdout+stderr redirect, so the child inherits the TUI's terminal and \
-         garbles the frame. Fix: add `.stdout(Stdio::null()).stderr(Stdio::null())` (or capture \
-         via `.output()`), or justify with a `// {ALLOW_MARKER} <reason>` marker:\n{}",
+        "#2071 TTY-leak invariant FAILED — {} git `.status()`/`.spawn()` site(s) in src/ \
+         production lack a stdout+stderr redirect, so (when reachable in app mode) the child \
+         inherits the TUI's terminal and garbles the frame. Fix: add \
+         `.stdout(Stdio::null()).stderr(Stdio::null())` (or capture via `.output()`), or justify \
+         with a `// {ALLOW_MARKER} <reason>` marker:\n{}",
         violations.len(),
         violations
             .iter()
