@@ -23,6 +23,16 @@
 //! suppresses it). Without this, N delivery ids per logical message meant a
 //! reply settled one id and the rest went stale → false no-reply escalations.
 //!
+//! Content-hash trade-off: a user sending the SAME text for a genuinely NEW
+//! event within the TTL is theoretically settled-suppressed (review r1 scanned
+//! 166 historical operator messages: zero such cases; the real duplicates it
+//! merged were all true duplicates). The blast radius is capped at one missing
+//! stage-1 nudge — the message itself is still delivered to the agent.
+//! Scope: the settled-groups memory is in-memory (`HeartbeatPair`), so the
+//! suppression covers channel-reconnect replay within ONE daemon lifetime; a
+//! replay arriving after a daemon restart re-opens the obligation, with the
+//! same capped consequence (one redundant nudge, not an operator page).
+//!
 //! It is an AUDIT, not a second delivery path: it never re-delivers the
 //! agent's missing reply, and — the IRON RULE — it never blocks/rejects the
 //! agent. Every ledger op is infallible (a lock update) or swallows its error.
@@ -331,6 +341,12 @@ fn classify(mirror_dispatched_for_turn: bool, turn: &PendingUserTurn) -> Closure
 /// Infallible (swallows everything). The Phase-1 WARN (tracing + event-log)
 /// fires once at stage 1 — the audit record stays in the logs (#2042 keeps
 /// WARN in log); the operator channel is only touched at stage 3.
+///
+/// Stage-1 delivery is fire-and-forget: the stage advances when the action is
+/// RETURNED, not when the supervisor's inject succeeds — a failed/deferred
+/// inject is NOT retried at this rung. That is deliberate: the ladder itself
+/// is the retry (the lead is escalated `STAGE_FOLLOWUP_MS` later, and its
+/// message carries the msg id so the obligation stays traceable).
 pub fn sweep(
     home: &std::path::Path,
     name: &str,
