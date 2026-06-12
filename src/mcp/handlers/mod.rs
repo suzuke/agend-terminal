@@ -71,6 +71,12 @@ use instance::resolve_team_layout;
 
 pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
     let home = crate::home_dir();
+    // #2055 step 1: instrument-only usage stats — record THAT this tool was
+    // called + which optional params it carried, into <home>/mcp-usage-stats.jsonl.
+    // Best-effort, zero behaviour change: it never touches `args` or the result
+    // and swallows all errors. This is the single dispatch chokepoint, so every
+    // tool call is observed exactly once.
+    crate::mcp::usage_stats::record(&home, tool, args);
     // Explicit arg beats env var. Cross-instance arms require `Some`;
     // anonymous/standalone arms tolerate the empty `&str` view.
     let sender: Option<Sender> = Sender::new(instance_name).or_else(Sender::from_env);

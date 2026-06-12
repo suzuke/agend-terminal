@@ -9,6 +9,7 @@
 pub mod handlers;
 pub(crate) mod registry;
 pub mod tools;
+pub mod usage_stats;
 
 use serde_json::Value;
 
