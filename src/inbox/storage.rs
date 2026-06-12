@@ -433,16 +433,24 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
             p.mirror_dispatched_for_turn = false;
             p.mirror_skip_until_next_turn = false;
         });
-        // #1665 reply-ledger: arm the delivery-closure audit for this user
-        // channel message. `m.channel.is_some()` above is exactly the
-        // "[user:… via channel] inbound" eligibility gate. Arming overwrites
-        // any prior in-flight turn (supersede — the user moved on, never warn).
+    }
+
+    // #1665/#2042 reply-ledger: arm the delivery-closure audit for EVERY user
+    // channel message in this drain, in arrival order. `m.channel.is_some()`
+    // is exactly the "[user:… via channel] inbound" eligibility gate. Inside
+    // `arm`: a duplicate of the CURRENT obligation (same sender + normalized
+    // content) group-joins it instead of superseding; a redelivery of an
+    // already-SETTLED message opens no new obligation; genuinely new content
+    // supersedes (the user moved on, never escalate the old turn).
+    for m in newly_read_msgs.iter().filter(|m| m.channel.is_some()) {
         crate::reply_ledger::arm(
             name,
-            *channel_msg.channel.as_ref().expect("checked"),
-            channel_msg.id.clone(),
-            channel_msg.thread_id.clone(),
-            channel_msg.kind.clone(),
+            *m.channel.as_ref().expect("checked"),
+            m.id.clone(),
+            m.thread_id.clone(),
+            m.kind.clone(),
+            Some(&m.from),
+            Some(&m.text),
         );
     }
 

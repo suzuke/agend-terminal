@@ -301,6 +301,8 @@ fn no_fleet_yaml_reply_exit_records_send_failed_gap_d_1665() {
         Some("m-1".into()),
         None,
         None,
+        Some("user:op"),
+        Some("hi"),
     );
     let result = super::handle_reply(&home, &serde_json::json!({"message": "hi"}), agent);
     assert!(

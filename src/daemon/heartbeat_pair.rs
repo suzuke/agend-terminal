@@ -86,6 +86,11 @@ pub struct HeartbeatPair {
     /// message), cleared at the turn boundary / supervisor sweep. Hangs here
     /// (existing turn state) rather than a new lifecycle file (#922).
     pub pending_user_turn: Option<crate::reply_ledger::PendingUserTurn>,
+    /// #2042 reply-ledger group settlement: recently settled obligation-group
+    /// keys (`sender|content-hash`, settled-at epoch ms). A duplicate delivery
+    /// / redelivery of an already-answered logical message matches here and is
+    /// NOT re-armed as a fresh obligation. Bounded + TTL'd by the ledger.
+    pub settled_reply_groups: Vec<(String, i64)>,
 }
 
 /// Per-instance lock registry. Keys are agent names (per

@@ -49,6 +49,10 @@ impl TestMsgBuilder {
         self.0.kind = Some(v.into());
         self
     }
+    fn channel(mut self, v: crate::channel::ChannelKind) -> Self {
+        self.0.channel = Some(v);
+        self
+    }
     fn id(mut self, v: &str) -> Self {
         self.0.id = Some(v.into());
         self
@@ -213,6 +217,78 @@ fn drain_returns_single_oversized_message_alone() {
         msgs.len(),
         1,
         "the oversized message is returned alone, never stranded"
+    );
+
+    fs::remove_dir_all(&home).ok();
+}
+
+/// #2042 entry-level: the REAL drain entry point arms the reply-ledger for
+/// every user channel message, and duplicate deliveries of the same logical
+/// message (same sender + normalized content) GROUP-JOIN one obligation —
+/// replying once then settles all their ids, and a post-settlement redelivery
+/// drained later opens no new obligation.
+#[test]
+fn drain_groups_duplicate_channel_msgs_and_suppresses_redelivery_2042() {
+    let home = tmp_home("rl-drain-2042");
+    let agent = "rl-drain-entry-2042";
+
+    // Two deliveries of the same logical message (operator double-send).
+    enqueue(
+        &home,
+        agent,
+        msg()
+            .sender("user:op")
+            .text("deploy the fix")
+            .channel(crate::channel::ChannelKind::Telegram)
+            .build(),
+    )
+    .ok();
+    enqueue(
+        &home,
+        agent,
+        msg()
+            .sender("user:op")
+            .text("deploy   the FIX") // same content modulo whitespace/case
+            .channel(crate::channel::ChannelKind::Telegram)
+            .build(),
+    )
+    .ok();
+
+    let msgs = drain(&home, agent);
+    assert_eq!(msgs.len(), 2);
+    let turn = crate::daemon::heartbeat_pair::snapshot_for(agent)
+        .pending_user_turn
+        .expect("drain must arm the ledger for user channel messages");
+    let expected_ids: Vec<String> = msgs.iter().filter_map(|m| m.id.clone()).collect();
+    assert_eq!(
+        turn.group_msg_ids, expected_ids,
+        "duplicate deliveries in one drain must group-join a single obligation"
+    );
+
+    // Reply settles the WHOLE group…
+    crate::reply_ledger::record_reply_outcome(agent, true);
+    // …and a redelivery of the same content drained later does not re-arm.
+    enqueue(
+        &home,
+        agent,
+        msg()
+            .sender("user:op")
+            .text("deploy the fix")
+            .channel(crate::channel::ChannelKind::Telegram)
+            .build(),
+    )
+    .ok();
+    let redelivered = drain(&home, agent);
+    assert_eq!(
+        redelivered.len(),
+        1,
+        "redelivery is still DELIVERED to the agent"
+    );
+    assert!(
+        crate::daemon::heartbeat_pair::snapshot_for(agent)
+            .pending_user_turn
+            .is_none(),
+        "a redelivery of a settled message must not open a new reply obligation"
     );
 
     fs::remove_dir_all(&home).ok();

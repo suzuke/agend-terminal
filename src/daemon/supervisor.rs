@@ -1154,19 +1154,55 @@ fn tick(
     };
 
     for (name, backend_command, core) in handles {
-        // #1665 reply-ledger: TTL/settled fallback for a user-message turn that
-        // never hit a clear site (no reply, no mirror, no takeover). Lock-free
-        // snapshot read; warns only past the grace window AND when the agent has
-        // settled. Infallible — never blocks the supervisor loop.
-        // #1813: when the swept turn was a channel-origin input the agent
-        // answered WITHOUT the reply tool, additionally inject a one-shot
-        // agent-facing nudge so it re-sends via `reply` (the operator otherwise
-        // gets nothing). `sweep` cleared the turn, so this fires at most once per
-        // offending turn — no loop.
-        if let crate::reply_ledger::SweepAction::NudgeChannelReplyMissing { channel } =
-            crate::reply_ledger::sweep(home, &name)
-        {
-            inject_channel_reply_missing_gated(home, registry, &name, channel);
+        // #1665/#2042 reply-ledger: TTL/settled fallback for a user-message
+        // turn that never hit a clear site (no reply, no mirror, no takeover).
+        // Lock-free snapshot read; acts only past the grace window AND when the
+        // agent has settled. Infallible — never blocks the supervisor loop.
+        // The #2042 ladder routes the obligation to the actionable party, each
+        // stage at most once per obligation (escalate-don't-repeat): nudge the
+        // owing agent (with the message id + reply-tool instruction) → its lead
+        // on the second miss → the operator only as last resort, phrased for
+        // humans. The audit WARN stays in the logs (emitted inside `sweep`).
+        match crate::reply_ledger::sweep(home, &name, &|n| {
+            crate::teams::find_team_for(home, n).and_then(|t| t.orchestrator)
+        }) {
+            crate::reply_ledger::SweepAction::None => {}
+            crate::reply_ledger::SweepAction::NudgeAgent {
+                channel,
+                msg_id,
+                gap_d,
+            } => {
+                inject_channel_reply_missing_gated(
+                    home,
+                    registry,
+                    &name,
+                    channel,
+                    msg_id.as_deref(),
+                    gap_d,
+                );
+            }
+            crate::reply_ledger::SweepAction::EscalateLead {
+                lead,
+                channel,
+                msg_id,
+                armed_at_ms,
+            } => {
+                enqueue_reply_ledger_lead_escalation(
+                    home,
+                    &name,
+                    &lead,
+                    channel,
+                    msg_id.as_deref(),
+                    armed_at_ms,
+                );
+            }
+            crate::reply_ledger::SweepAction::NotifyOperator {
+                channel,
+                msg_id: _,
+                armed_at_ms,
+            } => {
+                crate::reply_ledger::notify_operator_last_resort(home, &name, channel, armed_at_ms);
+            }
         }
         // Mutate state + pull the tail under the core lock, then drop it
         // before running `format!` and the Telegram spawn. `tail_lines`
@@ -1690,6 +1726,8 @@ fn inject_channel_reply_missing_gated(
     registry: &AgentRegistry,
     name: &str,
     channel: &str,
+    msg_id: Option<&str>,
+    gap_d: bool,
 ) {
     let snap = {
         let reg = agent::lock_registry(registry);
@@ -1698,16 +1736,67 @@ fn inject_channel_reply_missing_gated(
             .map(agent::InjectTarget::from_handle)
     };
     if let Some(tgt) = snap {
-        let payload = format!(
-            "Your last answer went to the TUI only — the input came via {channel}. \
-             Re-send your answer via the reply tool so the operator receives it."
-        );
+        // #2042: the payload names the owed message id and the reply tool;
+        // Gap D (reply send FAILED) gets retry wording instead of a false
+        // "you didn't reply".
+        let payload = crate::reply_ledger::nudge_text(channel, msg_id, gap_d);
         let _ = agent::inject_with_target_gated(
             &tgt,
             name,
             payload.as_bytes(),
             false,
             Some("channel-reply-missing"),
+        );
+    }
+}
+
+/// #2042 ladder stage 2: notify the owing agent's lead via its inbox (kind
+/// `update` — informational, the lead acts at its discretion; no reply loop).
+/// Best-effort: an enqueue failure logs and never blocks the supervisor.
+fn enqueue_reply_ledger_lead_escalation(
+    home: &std::path::Path,
+    agent_name: &str,
+    lead: &str,
+    channel: &str,
+    msg_id: Option<&str>,
+    armed_at_ms: i64,
+) {
+    let text = crate::reply_ledger::lead_text(agent_name, channel, msg_id, armed_at_ms);
+    let msg = crate::inbox::InboxMessage {
+        schema_version: 0,
+        id: None,
+        read_at: None,
+        thread_id: None,
+        parent_id: None,
+        task_id: None,
+        force_meta: None,
+        correlation_id: None,
+        reviewed_head: None,
+        from: "system:reply-ledger".to_string(),
+        text,
+        kind: Some("update".to_string()),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        channel: None,
+        delivery_mode: None,
+        attachments: vec![],
+        in_reply_to_msg_id: None,
+        in_reply_to_excerpt: None,
+        superseded_by: None,
+        from_id: None,
+        broadcast_context: None,
+        sequencing: None,
+        eta_minutes: None,
+        reporting_cadence: None,
+        worktree_binding_required: None,
+        pr_number: None,
+        terminal: None,
+    };
+    if let Err(e) = crate::inbox::enqueue(home, lead, msg) {
+        tracing::warn!(
+            agent = %agent_name,
+            lead = %lead,
+            error = %e,
+            "reply-ledger lead escalation enqueue failed"
         );
     }
 }
