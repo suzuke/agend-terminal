@@ -96,7 +96,7 @@ pub fn render(
         .split(frame.area());
 
     let snapshot = build_agent_state_snapshot(layout, registry);
-    render_pane_tree(frame, chunks[1], layout, repeat_mode, &snapshot);
+    render_pane_tree(frame, chunks[1], layout, repeat_mode, registry, &snapshot);
     render_tab_bar(frame, chunks[0], layout, &snapshot);
     render_status_bar(frame, chunks[2], layout, telegram, binary_stale);
 }
@@ -218,6 +218,7 @@ fn render_pane_tree(
     area: Rect,
     layout: &mut Layout,
     repeat_mode: bool,
+    registry: &AgentRegistry,
     snapshot: &HashMap<String, AgentState>,
 ) {
     let tab = match layout.tabs.get_mut(layout.active) {
@@ -238,7 +239,9 @@ fn render_pane_tree(
 
     if tab.zoomed {
         if let Some(pane) = tab.root_mut().find_pane_mut(focus_id) {
-            let info = render_pane(frame, area, pane, true, false, snapshot, false, false);
+            let info = render_pane(
+                frame, area, pane, true, false, registry, snapshot, false, false,
+            );
             let infos = vec![info];
             render_border_grid(frame, &infos);
             render_pane_titles(frame, &infos);
@@ -261,6 +264,7 @@ fn render_pane_tree(
         &mut rects,
         &mut border_infos,
         repeat_mode,
+        registry,
         snapshot,
         drag_source,
         drag_target,
@@ -279,6 +283,7 @@ fn render_node(
     rects: &mut std::collections::HashMap<usize, (u16, u16, u16, u16)>,
     border_infos: &mut Vec<PaneBorderInfo>,
     repeat_mode: bool,
+    registry: &AgentRegistry,
     snapshot: &HashMap<String, AgentState>,
     drag_source: Option<usize>,
     drag_target: Option<usize>,
@@ -295,6 +300,7 @@ fn render_node(
                 pane,
                 focused,
                 repeat_mode,
+                registry,
                 snapshot,
                 is_drag_source,
                 is_drag_target,
@@ -316,6 +322,7 @@ fn render_node(
                 rects,
                 border_infos,
                 repeat_mode,
+                registry,
                 snapshot,
                 drag_source,
                 drag_target,
@@ -328,6 +335,7 @@ fn render_node(
                 rects,
                 border_infos,
                 repeat_mode,
+                registry,
                 snapshot,
                 drag_source,
                 drag_target,
@@ -351,6 +359,7 @@ fn render_pane(
     pane: &mut crate::layout::Pane,
     focused: bool,
     repeat_mode: bool,
+    registry: &AgentRegistry,
     snapshot: &HashMap<String, AgentState>,
     is_drag_source: bool,
     is_drag_target: bool,
@@ -424,6 +433,10 @@ fn render_pane(
             title_segments,
             priority,
         };
+    }
+    if inner.width != pane.vterm.cols() || inner.height != pane.vterm.rows() {
+        pane.vterm.resize(inner.width, inner.height);
+        pane.resize_pty(registry, inner.width, inner.height);
     }
     let render_offset = pane.scroll_offset;
     pane.vterm
@@ -755,6 +768,59 @@ mod tests {
         let snapshot = HashMap::new();
         let result = highest_priority_state(&tab, &snapshot);
         assert_eq!(result, AgentState::Idle);
+    }
+
+    #[test]
+    fn render_resizes_vterm_to_pane_content_rows_2046() {
+        let backend = ratatui::backend::TestBackend::new(40, 20);
+        let mut terminal =
+            ratatui::Terminal::new(backend).expect("test terminal creation should succeed");
+        let registry: AgentRegistry =
+            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+        let pane = Pane {
+            agent_name: "agent".into(),
+            instance_id: crate::types::InstanceId::default(),
+            // 40x20 frame -> pane tree is 40x18 after tab/status chrome, and
+            // pane border leaves a 38x16 terminal content area. Start 5 rows
+            // short to reproduce #2046's floating backend footer symptom.
+            vterm: VTerm::new(38, 11),
+            rx: crossbeam_channel::bounded(1).1,
+            id: 1,
+            backend: None,
+            working_dir: None,
+            display_name: None,
+            scroll_offset: 0,
+            has_notification: false,
+            fleet_instance_name: None,
+            last_input_at: None,
+            pending_notification_count: 0,
+            selection: None,
+            source: PaneSource::Local,
+        };
+        let mut layout = Layout::new();
+        layout.add_tab(crate::layout::Tab::new("agent".to_string(), pane));
+
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    &mut layout,
+                    false,
+                    &registry,
+                    TelegramStatus::NotConfigured,
+                    false,
+                );
+            })
+            .expect("test terminal draw should succeed");
+
+        let pane = layout.active_tab().unwrap().focused_pane().unwrap();
+        assert_eq!(pane.vterm.cols(), 38);
+        assert_eq!(
+            pane.vterm.rows(),
+            16,
+            "render must keep the VTerm/PTY rows equal to pane content rows"
+        );
     }
 
     #[test]
