@@ -671,6 +671,9 @@ pub fn suppress_stale_terminal_replay_with(home: &Path, threshold: std::time::Du
     let mut suppressed = 0usize;
     for entry in entries.flatten() {
         let path = entry.path();
+        if !is_pr_state_file(&path) {
+            continue; // #2059: skip .emitted-terminal.json ledger + .lock sidecars
+        }
         let Ok(meta) = entry.metadata() else { continue };
         let Ok(mtime) = meta.modified() else { continue };
         let Ok(age) = mtime.elapsed() else { continue };
@@ -905,6 +908,9 @@ pub fn record_verdict(
     let mut matched_any = false;
     for entry in entries.flatten() {
         let path = entry.path();
+        if !is_pr_state_file(&path) {
+            continue; // #2059: skip .emitted-terminal.json ledger + .lock sidecars
+        }
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
         };
