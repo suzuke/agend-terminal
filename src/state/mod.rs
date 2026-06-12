@@ -1206,29 +1206,15 @@ impl StateTracker {
     /// `anchor_on_red == false` (Shell/Raw) OR `fg` is empty (text-only
     /// callers / cold paths) — matching pre-#919 unconditional behavior.
     pub fn feed_with_fg(&mut self, screen_text: &str, fg: &[CellFg]) {
+        // Gate sequence (order-critical — read top-to-bottom):
+        //   1. hash-dedup gate        — skip unchanged frames (throttle-hint override)
+        //   2. classify + transition  — anchor/position suppression → landing
+        //                               pipeline → heartbeat gate → transition
+        //   3. post-classify instrumentation (zero behavior): unclassified-throttle
+        //      capture, shadow telemetry, F9 productive-output detection
         let hash = hash_screen(screen_text);
-        if self.last_screen_hash == Some(hash) {
-            // #SRL-phase2 hash-dedup blind spot: a SETTLED (static) stuck-SRL
-            // pane has an UNCHANGED hash, so this dedup early-return would skip
-            // detection forever and the agent never recovers (no further feed
-            // ever re-runs the SRL gates). Override the skip ONLY when the pane
-            // carries a throttle hint AND we are not already latched on a
-            // throttle — then fall through so the hard-wrap fallback (None arm)
-            // can latch it → auto-retry fires. The cheap raw-token pre-filter
-            // keeps the common static-idle pane on the fast skip path.
-            let already_throttle = matches!(
-                self.current,
-                AgentState::ServerRateLimit | AgentState::RateLimit
-            );
-            if already_throttle || !screen_has_throttle_hint(screen_text) {
-                return;
-            }
-            // else: re-detect the static throttle pane. Do NOT re-stamp the hash
-            // (it's unchanged); once we latch, `already_throttle` short-circuits
-            // subsequent identical frames.
-        } else {
-            self.last_screen_hash = Some(hash);
-            self.scan_context_pct(screen_text);
+        if self.apply_hash_dedup_gate(screen_text, hash) {
+            return;
         }
 
         // Sprint 27 shadow-mode: capture silence duration BEFORE updating
@@ -1657,9 +1643,48 @@ impl StateTracker {
         // never touches `self.current`/retry).
         self.capture_unclassified_throttle(screen_text, fg);
 
-        // Sprint 27 shadow-mode: log behavioral signal alongside regex state.
-        // Zero state change — telemetry only. Phase 2 (Sprint 28+) promotes
-        // behavioral to tiebreaker/primary.
+        // Instrumentation 2 — Sprint 27 shadow-mode behavioral telemetry.
+        self.record_shadow_telemetry(silence_since_last_feed);
+
+        // F9 (#685 sub-task 4): productive-output detection (zero behavior).
+        self.detect_productive_output(screen_text);
+    }
+
+    /// Gate 1 — hash-dedup. Returns `true` when this frame is a duplicate
+    /// that should skip the whole feed.
+    ///
+    /// #SRL-phase2 hash-dedup blind spot: a SETTLED (static) stuck-SRL pane
+    /// has an UNCHANGED hash, so this dedup early-return would skip detection
+    /// forever and the agent never recovers (no further feed ever re-runs the
+    /// SRL gates). Override the skip ONLY when the pane carries a throttle hint
+    /// AND we are not already latched on a throttle — then fall through so the
+    /// hard-wrap fallback (None arm) can latch it → auto-retry fires. The cheap
+    /// raw-token pre-filter keeps the common static-idle pane on the fast skip
+    /// path.
+    fn apply_hash_dedup_gate(&mut self, screen_text: &str, hash: u64) -> bool {
+        if self.last_screen_hash == Some(hash) {
+            let already_throttle = matches!(
+                self.current,
+                AgentState::ServerRateLimit | AgentState::RateLimit
+            );
+            if already_throttle || !screen_has_throttle_hint(screen_text) {
+                return true;
+            }
+            // Re-detect the static throttle pane. Do NOT re-stamp the hash
+            // (it's unchanged); once we latch, `already_throttle` short-circuits
+            // subsequent identical frames.
+            false
+        } else {
+            self.last_screen_hash = Some(hash);
+            self.scan_context_pct(screen_text);
+            false
+        }
+    }
+
+    /// Instrumentation — Sprint 27 shadow-mode: log behavioral signal alongside
+    /// regex state. Zero state change — telemetry only. Phase 2 (Sprint 28+)
+    /// promotes behavioral to tiebreaker/primary.
+    fn record_shadow_telemetry(&self, silence_since_last_feed: Duration) {
         if let Some(ref config) = self.behavioral_config {
             let signal = crate::behavioral::infer_from_silence(config, silence_since_last_feed);
             crate::behavioral::log_shadow_telemetry(
@@ -1675,30 +1700,30 @@ impl StateTracker {
                 self.current.display_name(),
             );
         }
+    }
 
-        // F9 (#685 sub-task 4): productive-output detection. Bumps
-        // `last_productive_output` only on a Productive signal. The bump
-        // affects nothing about Hung classification directly — the daemon
-        // supervisor reads `last_productive_output.elapsed()` and passes it
-        // to `check_hang` as the dual-path signal. Activation of the new
-        // classification branch is gated on `AGEND_PRODUCTIVE_GATE=1` in
-        // `check_hang` (shadow-mode default). See
-        // `docs/F9-PRODUCTIVE-OUTPUT-GATE.md` §F9.5.
-        //
-        // #685 PR-2 (reviewer #1009 / #1005 same-class flag): scan ONLY
-        // the recent tail (last MARKER_SCAN_TAIL_LINES rows) — historical
-        // completion markers visible in scrollback (e.g. `Saved to /tmp/
-        // foo.txt` left at row 5 from a 5-min-old write) MUST NOT keep
-        // refreshing `last_productive_output` on every cursor-blink tick.
-        //
-        // #685 PR-2 RC1 (reviewer #1013 verdict): dedup hash scope
-        // narrowed from "entire recent tail" → "matched marker
-        // substring". Pre-RC1 a stale marker that stayed visible in
-        // the tail while an adjacent spinner ticked produced a
-        // DIFFERENT tail hash on every tick — the dedup-hash never
-        // matched, `last_productive_output` re-fired despite no new
-        // productive evidence. Hashing the matched substring directly
-        // captures evidence identity, not surrounding-context noise.
+    /// F9 (#685 sub-task 4): productive-output detection. Bumps
+    /// `last_productive_output` only on a Productive signal. The bump affects
+    /// nothing about Hung classification directly — the daemon supervisor reads
+    /// `last_productive_output.elapsed()` and passes it to `check_hang` as the
+    /// dual-path signal. Activation of the new classification branch is gated on
+    /// `AGEND_PRODUCTIVE_GATE=1` in `check_hang` (shadow-mode default). See
+    /// `docs/F9-PRODUCTIVE-OUTPUT-GATE.md` §F9.5.
+    ///
+    /// #685 PR-2 (reviewer #1009 / #1005 same-class flag): scan ONLY the recent
+    /// tail (last MARKER_SCAN_TAIL_LINES rows) — historical completion markers
+    /// visible in scrollback (e.g. `Saved to /tmp/foo.txt` left at row 5 from a
+    /// 5-min-old write) MUST NOT keep refreshing `last_productive_output` on
+    /// every cursor-blink tick.
+    ///
+    /// #685 PR-2 RC1 (reviewer #1013 verdict): dedup hash scope narrowed from
+    /// "entire recent tail" → "matched marker substring". Pre-RC1 a stale marker
+    /// that stayed visible in the tail while an adjacent spinner ticked produced
+    /// a DIFFERENT tail hash on every tick — the dedup-hash never matched,
+    /// `last_productive_output` re-fired despite no new productive evidence.
+    /// Hashing the matched substring directly captures evidence identity, not
+    /// surrounding-context noise.
+    fn detect_productive_output(&mut self, screen_text: &str) {
         if let Some(ref pconfig) = self.productivity_config {
             let heartbeat_age = self
                 .last_heartbeat
@@ -1717,11 +1742,10 @@ impl StateTracker {
                     },
                     Some(matched),
                 ) => {
-                    // Marker source: dedup against the matched
-                    // substring text. Same substring across feeds =
-                    // same evidence, suppress refresh — even when
-                    // adjacent content (spinner ticks, status line
-                    // edits) changes around it.
+                    // Marker source: dedup against the matched substring text.
+                    // Same substring across feeds = same evidence, suppress
+                    // refresh — even when adjacent content (spinner ticks,
+                    // status line edits) changes around it.
                     let marker_hash = hash_screen(matched);
                     if self.last_productive_marker_hash != Some(marker_hash) {
                         self.last_productive_output = Some(Instant::now());
@@ -1741,9 +1765,8 @@ impl StateTracker {
                     self.last_productive_marker_hash = None;
                 }
                 _ => {
-                    // No marker visible in the recent tail → clear the
-                    // dedup hash so a fresh-after-silence marker
-                    // re-fires the refresh.
+                    // No marker visible in the recent tail → clear the dedup
+                    // hash so a fresh-after-silence marker re-fires the refresh.
                     self.last_productive_marker_hash = None;
                 }
             }
