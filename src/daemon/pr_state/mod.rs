@@ -1057,8 +1057,10 @@ pub fn resolve_notify_recipient(home: &Path, state: &PrState) -> String {
 /// Candidate members, fleet-name sources first (the gh-login `pr_author` is the
 /// least reliable under the shared account, so it's last): the reviewers (from
 /// the recorded verdict), then the watch subscribers, then `pr_author`. The
-/// first whose team has an orchestrator wins; else the explicit `fixup-lead`
-/// fallback (same terminal default as `resolve_author`).
+/// first whose team has an orchestrator wins; else (no team for anyone — a
+/// single-agent deployment) the author self-notifies, since they merge their
+/// own PR; `fixup-lead` remains only as the last-ditch when the author is
+/// unknown.
 pub fn resolve_merge_authority(home: &Path, state: &PrState) -> String {
     let mut candidates: Vec<&str> = Vec::new();
     match &state.verdict_state {
@@ -1081,6 +1083,16 @@ pub fn resolve_merge_authority(home: &Path, state: &PrState) -> String {
         {
             return orch;
         }
+    }
+    // No candidate belongs to a team with an orchestrator — a single-agent /
+    // no-team deployment. There is no separate merge authority to route to, so
+    // self-notify the AUTHOR (they merge their own PR). A literal "fixup-lead"
+    // here would route into the void on any deployment that has no fixup-lead
+    // instance — the #2058 dead-zone recurring on someone else's machine
+    // (de-hardcode follow-up to #2063). "fixup-lead" stays only as the
+    // last-ditch when even the author is unknown.
+    if !state.pr_author.is_empty() {
+        return state.pr_author.clone();
     }
     "fixup-lead".to_string()
 }
@@ -3169,9 +3181,12 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// #2059-#3: no team for any member → explicit fixup-lead fallback.
+    /// #2063 de-hardcode follow-up: no team for any member (a single-agent /
+    /// no-team deployment) → the AUTHOR self-notifies (they merge their own PR),
+    /// NOT a literal `fixup-lead` that would route into the void on a deployment
+    /// with no fixup-lead instance.
     #[test]
-    fn resolve_merge_authority_fallback_fixup_lead_2059() {
+    fn resolve_merge_authority_no_team_self_notifies_author_2059() {
         let home = tmp_home_for_1002("merge-auth-fallback");
         // No fleet.yaml teams written → find_team_for returns None for all.
         let mut s = new_state("sha-C", ReviewClass::Single);
@@ -3179,8 +3194,26 @@ mod tests {
         s.subscribers = vec!["stranger".to_string()];
         assert_eq!(
             resolve_merge_authority(&home, &s),
+            "stranger",
+            "no resolvable team → self-notify the author, not the void"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2063 de-hardcode follow-up: no team AND no known author → the last-ditch
+    /// `fixup-lead` default still applies (nothing better to route to).
+    #[test]
+    fn resolve_merge_authority_no_team_no_author_last_ditch_fixup_lead_2059() {
+        let home = tmp_home_for_1002("merge-auth-lastditch");
+        let mut s = new_state("sha-D", ReviewClass::Single);
+        // Empty author + no subscribers + no verdict + no teams → nothing to
+        // route to but the last-ditch default.
+        s.pr_author = String::new();
+        s.subscribers = vec![];
+        assert_eq!(
+            resolve_merge_authority(&home, &s),
             "fixup-lead",
-            "no resolvable team → explicit fixup-lead fallback"
+            "no team and no author → last-ditch fixup-lead default"
         );
         std::fs::remove_dir_all(&home).ok();
     }
