@@ -20,7 +20,7 @@
 //! `src/mcp/handlers/instance.rs`. Same precedent as
 //! `channel_p0a_tests.rs`, `p0b_tests.rs`, `comms_p0c_tests.rs`.
 
-use super::instance_spawn::spawn_single_instance_impl;
+use super::instance_state::spawn::spawn_single_instance_impl;
 use serde_json::{json, Value};
 use std::path::Path;
 

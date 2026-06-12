@@ -1,13 +1,11 @@
-//! Sprint 54 P1-B Bug 1: instance-deletion lifecycle + residual-store
-//! audit. Extracted from `src/mcp/handlers/instance.rs` to keep the
-//! parent file under the `tests/file_size_invariant.rs` 700-LOC ceiling
-//! — the audit + transactional-or-loud refactor pushed instance.rs over
-//! the limit, and a sibling module is the proper response per that
-//! invariant's design intent (split, don't bypass).
+//! Instance-deletion lifecycle + residual-store audit (Sprint 54 P1-B
+//! Bug 1). The `lifecycle` submodule of the `instance_state` concept:
+//! the transactional-or-loud teardown that `handle_delete_instance`
+//! delegates to, kept beside its sibling `spawn` submodule.
 //!
-//! Public surface re-exported here:
+//! Public surface:
 //! - `full_delete_instance` — used by the MCP `delete_instance` handler
-//!   (`super::instance::handle_delete_instance`) and the TUI close
+//!   (`super::handle_delete_instance`) and the TUI close
 //!   path (`crate::app::overlay`). Returns `Result<(), String>`; `Err`
 //!   carries the residual-store audit so callers can surface partial
 //!   state instead of letting `auto_start_fleet` resurrect the
@@ -436,5 +434,5 @@ pub(crate) fn name_residual_anywhere(
 }
 
 #[cfg(test)]
-#[path = "instance_lifecycle/tests.rs"]
+#[path = "lifecycle_tests.rs"]
 mod tests;

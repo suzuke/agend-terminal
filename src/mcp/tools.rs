@@ -643,7 +643,7 @@ mod tests {
     /// GLOBAL UNION of all tools' declared keys, NOT per-tool. It does not catch
     /// a key declared in tool X but read by tool Y. Precise per-tool attribution
     /// would need a source-level call graph — handlers read args in shared
-    /// helpers (`instance_spawn`, `checkout_source`, `lift_message`) that serve
+    /// helpers (`instance_state::spawn`, `checkout_source`, `lift_message`) that serve
     /// multiple tools — which is brittle and false-positive-prone. The union
     /// check is the deterministic zero-FP subset that still catches the
     /// high-value case: a read no schema declares at all.
@@ -934,22 +934,22 @@ mod tests {
             // ── set_waiting_on ──
             ("set_waiting_on", "condition", "api/handlers/instance.rs waiting_on store/clear"),
             // ── create_instance ──
-            ("create_instance", "name", "instance_spawn.rs spawn name"),
-            ("create_instance", "backend", "instance_spawn.rs spawn backend"),
-            ("create_instance", "args", "instance_spawn.rs extra cmd args"),
-            ("create_instance", "model", "instance_spawn.rs --model flag"),
-            ("create_instance", "working_directory", "instance_spawn.rs validated wd"),
-            ("create_instance", "branch", "instance_spawn.rs worktree::create"),
-            ("create_instance", "task", "instance_spawn.rs delayed inject"),
-            ("create_instance", "layout", "instance_spawn.rs resolve_team_layout"),
-            ("create_instance", "target_pane", "instance_spawn.rs resolve_team_layout"),
+            ("create_instance", "name", "instance_state/spawn.rs spawn name"),
+            ("create_instance", "backend", "instance_state/spawn.rs spawn backend"),
+            ("create_instance", "args", "instance_state/spawn.rs extra cmd args"),
+            ("create_instance", "model", "instance_state/spawn.rs --model flag"),
+            ("create_instance", "working_directory", "instance_state/spawn.rs validated wd"),
+            ("create_instance", "branch", "instance_state/spawn.rs worktree::create"),
+            ("create_instance", "task", "instance_state/spawn.rs delayed inject"),
+            ("create_instance", "layout", "instance_state/spawn.rs resolve_team_layout"),
+            ("create_instance", "target_pane", "instance_state/spawn.rs resolve_team_layout"),
             ("create_instance", "count", "mcp/handlers/instance.rs team-mode count"),
             ("create_instance", "team", "mcp/handlers/instance.rs team-mode prefix"),
             ("create_instance", "backends", "mcp/handlers/instance.rs per-member backends"),
-            ("create_instance", "command", "instance_spawn.rs deprecated backend alias"),
-            ("create_instance", "role", "instance_spawn.rs fleet.yaml role"),
-            ("create_instance", "env", "instance_spawn.rs per-instance env (#900)"),
-            ("create_instance", "topic_binding", "instance_spawn.rs telegram topic binding"),
+            ("create_instance", "command", "instance_state/spawn.rs deprecated backend alias"),
+            ("create_instance", "role", "instance_state/spawn.rs fleet.yaml role"),
+            ("create_instance", "env", "instance_state/spawn.rs per-instance env (#900)"),
+            ("create_instance", "topic_binding", "instance_state/spawn.rs telegram topic binding"),
             // ── replace_instance / restart_instance ──
             ("replace_instance", "instance", "mcp/handlers/instance.rs replace target"),
             ("replace_instance", "reason", "mcp/handlers/instance.rs handover message + event"),

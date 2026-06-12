@@ -2,8 +2,8 @@
 //!
 //! Located in this sibling file (loaded via `#[path]` from comms.rs) to
 //! keep src/mcp/handlers/comms.rs under the file_size_invariant 700 LOC
-//! ceiling. Same module layout pattern as Sprint 54 PR #517's
-//! `instance_lifecycle.rs` split.
+//! ceiling. Same module layout pattern as the
+//! `instance_state::lifecycle` split.
 
 use super::dispatch_should_skip_auto_bind;
 use serde_json::json;

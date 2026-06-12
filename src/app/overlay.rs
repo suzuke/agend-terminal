@@ -396,7 +396,7 @@ pub(super) fn handle_key(
                     std::thread::spawn(move || {
                         for name in &names {
                             if let Err(detail) =
-                                crate::mcp::handlers::instance_lifecycle::full_delete_instance(
+                                crate::mcp::handlers::instance_state::lifecycle::full_delete_instance(
                                     &home, name,
                                 )
                             {

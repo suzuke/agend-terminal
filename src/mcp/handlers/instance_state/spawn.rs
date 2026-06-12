@@ -1,12 +1,12 @@
 //! `spawn_single_instance` — the MCP-side caller path that adds a fleet.yaml
-//! entry then issues the `SPAWN` RPC. Extracted from
-//! `mcp/handlers/instance.rs` per the 750-LOC file_size_invariant.
+//! entry then issues the `SPAWN` RPC. The `spawn` submodule of the
+//! `instance_state` concept, beside its sibling `lifecycle`.
 //!
-//! The function is exported `pub(super)` so `handle_create_instance` in
-//! `instance.rs` can call it, and the test mock entry point
-//! `spawn_single_instance_impl` is exported so
-//! `mcp/handlers/instance_964_tests.rs` can inject a stub `spawn_fn` for
-//! the #964 caller-path regression tests.
+//! `spawn_single_instance` is `pub(super)` so `handle_create_instance` in
+//! the parent `instance_state` module can call it; the test mock entry point
+//! `spawn_single_instance_impl` is exported to `mcp::handlers` so
+//! `mcp/handlers/instance_964_tests.rs` can inject a stub `spawn_fn` for the
+//! #964 caller-path regression tests.
 
 use crate::agent_ops::validate_branch;
 use serde_json::{json, Value};
@@ -18,7 +18,7 @@ pub(super) fn spawn_single_instance(home: &Path, instance_name: &str, args: &Val
 
 /// Inner impl of [`spawn_single_instance`] parameterized on the SPAWN RPC for
 /// `instance_964_tests`. Production passes [`crate::api::call`].
-pub(super) fn spawn_single_instance_impl(
+pub(in crate::mcp::handlers) fn spawn_single_instance_impl(
     home: &Path,
     instance_name: &str,
     args: &Value,
@@ -129,12 +129,8 @@ pub(super) fn spawn_single_instance_impl(
                     .collect()
             })
         });
-    let (layout, target_pane_owned) = super::instance::resolve_team_layout(
-        home,
-        name,
-        args.get("layout"),
-        args.get("target_pane"),
-    );
+    let (layout, target_pane_owned) =
+        super::resolve_team_layout(home, name, args.get("layout"), args.get("target_pane"));
     let target_pane = target_pane_owned.as_deref();
 
     // #1858: persist the spawn-intent `args` + `model` into the entry so a daemon
