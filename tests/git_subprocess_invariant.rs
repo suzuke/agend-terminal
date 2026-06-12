@@ -66,13 +66,17 @@ fn rs_files_under(root: &Path) -> Vec<PathBuf> {
 /// True iff this file is exempt from the lint:
 /// - The lint itself (`git_subprocess_invariant.rs`) — its probe
 ///   fixtures naturally contain the offending pattern as test data.
+/// - `daemon_git_helper_invariant.rs` (W1.2) — the production-`src/`
+///   sibling lint; it has the identical reason for exemption: its
+///   scanner RED/GREEN fixtures embed the literal `Command::new("git")`
+///   as test data, never as a real subprocess.
 /// - The helper module `tests/common/git_isolated.rs` — the
 ///   canonical authority is allowed to use the raw subprocess.
 fn is_exempt_file(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
-    if name == "git_subprocess_invariant.rs" {
+    if name == "git_subprocess_invariant.rs" || name == "daemon_git_helper_invariant.rs" {
         return true;
     }
     let parent = path
