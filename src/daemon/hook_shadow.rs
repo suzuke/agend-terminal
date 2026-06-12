@@ -35,6 +35,13 @@ pub struct HookShadow {
     pub derived_state: Option<crate::state::AgentState>,
     /// Receipt time (daemon clock, epoch ms).
     pub at_ms: u64,
+    /// #2044: STICKY timestamp of the last `UserPromptSubmit` — NOT overwritten
+    /// by later events (unlike `at_ms`/`last_event`, which `record_event`
+    /// replaces wholesale). A submitted prompt is the proof a daemon inject
+    /// physically reached the prompt (a dialog-swallowed inject submits
+    /// nothing → no `UserPromptSubmit`), so the inject-delivery watchdog needs
+    /// it to survive the PreToolUse/Stop events that follow within its window.
+    pub last_user_prompt_submit_ms: Option<u64>,
 }
 
 fn store() -> &'static Mutex<HashMap<String, HookShadow>> {
@@ -219,15 +226,37 @@ pub fn record_event(
     notification_type: Option<&str>,
 ) -> Option<crate::state::AgentState> {
     let derived = derive_state(hook_event_name, notification_type);
-    store().lock().insert(
+    let now = now_ms();
+    let mut guard = store().lock();
+    // #2044: carry the sticky UserPromptSubmit timestamp forward across the
+    // wholesale overwrite, refreshing it only on a UserPromptSubmit event.
+    let prior_ups = guard.get(name).and_then(|s| s.last_user_prompt_submit_ms);
+    let last_user_prompt_submit_ms = if hook_event_name == "UserPromptSubmit" {
+        Some(now)
+    } else {
+        prior_ups
+    };
+    guard.insert(
         name.to_string(),
         HookShadow {
             last_event: hook_event_name.to_string(),
             derived_state: derived,
-            at_ms: now_ms(),
+            at_ms: now,
+            last_user_prompt_submit_ms,
         },
     );
     derived
+}
+
+/// #2044: the sticky timestamp (epoch ms) of `name`'s last `UserPromptSubmit`,
+/// or `None` if none recorded (no hook history / non-hook backend). The
+/// inject-delivery watchdog compares it against an inject time to confirm the
+/// inject reached the prompt.
+pub fn last_user_prompt_submit_for(name: &str) -> Option<u64> {
+    store()
+        .lock()
+        .get(name)
+        .and_then(|s| s.last_user_prompt_submit_ms)
 }
 
 /// Test seam: age `name`'s observation by `ms` (freshness-expiry tests).
@@ -236,6 +265,21 @@ pub(crate) fn backdate_for_test(name: &str, ms: u64) {
     if let Some(snap) = store().lock().get_mut(name) {
         snap.at_ms = snap.at_ms.saturating_sub(ms);
     }
+}
+
+/// Test seam (#2044): pin `name`'s sticky last-UserPromptSubmit to an explicit
+/// epoch-ms — lets the inject-delivery tests place the UPS deterministically
+/// before/after a controlled inject time without clock-collision fragility.
+#[cfg(test)]
+pub(crate) fn set_user_prompt_submit_for_test(name: &str, ms: u64) {
+    let mut guard = store().lock();
+    let entry = guard.entry(name.to_string()).or_insert(HookShadow {
+        last_event: "UserPromptSubmit".to_string(),
+        derived_state: Some(crate::state::AgentState::Thinking),
+        at_ms: ms,
+        last_user_prompt_submit_ms: Some(ms),
+    });
+    entry.last_user_prompt_submit_ms = Some(ms);
 }
 
 /// Latest hook observation for `name` (shadow consumers / tests). Deferred:
