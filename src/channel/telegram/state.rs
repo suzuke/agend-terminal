@@ -197,6 +197,34 @@ impl TelegramState {
     }
 }
 
+/// Cap (in chars) for an operator-configured display name. 32 matches the
+/// Telegram @username length limit — long enough for any real name, short
+/// enough to keep the notification header readable.
+const DISPLAY_NAME_MAX_CHARS: usize = 32;
+
+/// Sanitize an operator-configured allowlist display name before it is stored
+/// and later surfaced in the line-oriented `[user:NAME via telegram]`
+/// notification header. The name is operator-trust input (it never participates
+/// in authorization — only the id projection does), so this is header-hygiene,
+/// not a privilege boundary: a control character or newline in a name would
+/// garble the single-line header parsing. Strips ASCII/Unicode control
+/// characters, trims surrounding whitespace, and caps the length. Returns
+/// `None` when nothing usable remains, so the caller drops the entry and the
+/// sender falls back to `unknown` rather than rendering an empty name.
+pub(crate) fn sanitize_display_name(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(DISPLAY_NAME_MAX_CHARS)
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -330,6 +358,30 @@ mod tests {
         assert_eq!(list[0].name(), None);
         assert_eq!(list[1].id(), 67890);
         assert_eq!(list[1].name(), Some("Alice"));
+    }
+
+    // #2045 review add 1: the configured display name is sanitized before it can
+    // reach the line-oriented `[user:NAME via telegram]` notification header.
+    #[test]
+    fn sanitize_display_name_strips_control_chars_and_caps_length() {
+        // Plain name passes through unchanged.
+        assert_eq!(sanitize_display_name("Yu"), Some("Yu".to_string()));
+        // Newline / CR / tab (the header-garbling chars) are stripped.
+        assert_eq!(
+            sanitize_display_name("Al\nice\r\tBob"),
+            Some("AliceBob".to_string()),
+            "control chars (incl. newline/CR/tab) must be removed so the \
+             single-line notification header can't be garbled"
+        );
+        // Surrounding whitespace is trimmed.
+        assert_eq!(sanitize_display_name("  Yu  "), Some("Yu".to_string()));
+        // Length is capped at DISPLAY_NAME_MAX_CHARS (32).
+        let long = "x".repeat(50);
+        assert_eq!(sanitize_display_name(&long).map(|s| s.len()), Some(32));
+        // A name that sanitizes to nothing → None (caller falls back to "unknown").
+        assert_eq!(sanitize_display_name("\n\r\t"), None);
+        assert_eq!(sanitize_display_name("   "), None);
+        assert_eq!(sanitize_display_name(""), None);
     }
 
     #[test]

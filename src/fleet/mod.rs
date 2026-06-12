@@ -1042,6 +1042,74 @@ instances:
         fs::remove_dir_all(&dir).ok();
     }
 
+    // #2045: the `{ id, name }` allowlist form parses through the REAL fleet load
+    // entry (FleetConfig::load), alongside a legacy bare id — the happy path the
+    // deny test below guards.
+    #[test]
+    fn user_allowlist_named_entry_loads_via_real_fleet() {
+        let dir = std::env::temp_dir().join(format!("agend-fleet-allow-ok-{}", std::process::id()));
+        let path = write_fleet(
+            &dir,
+            r#"
+channel:
+  type: telegram
+  bot_token_env: MY_BOT_TOKEN
+  group_id: -100
+  user_allowlist:
+    - 12345
+    - { id: 67890, name: "Alice" }
+instances: {}
+"#,
+        );
+        let config = FleetConfig::load(&path).expect("named + bare allowlist must load");
+        match config.channel {
+            Some(ChannelConfig::Telegram {
+                ref user_allowlist, ..
+            }) => {
+                let list = user_allowlist.as_ref().expect("allowlist present");
+                assert_eq!(list[0].id(), 12345);
+                assert_eq!(list[0].name(), None);
+                assert_eq!(list[1].id(), 67890);
+                assert_eq!(list[1].name(), Some("Alice"));
+            }
+            other => panic!("expected telegram channel, got {other:?}"),
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // #2045 review add 2 (the authz-surface invariant): a MALFORMED allowlist
+    // entry must FAIL-CLOSED at the real fleet load entry — `FleetConfig::load`
+    // returns `Err`, so the daemon refuses to boot with a half-parsed allowlist
+    // rather than silently dropping the bad entry and accepting whatever remains.
+    // The `#[serde(untagged)]` enum has no fallthrough: an entry that is neither a
+    // bare integer nor a complete `{ id: i64, name: String }` matches no variant.
+    #[test]
+    fn user_allowlist_malformed_entry_fails_closed_via_real_fleet() {
+        // A `{ id, name }` map whose id is a quoted string — matches neither
+        // `Id(i64)` (it's a map) nor `Named { id: i64, .. }` (id is not i64).
+        let dir =
+            std::env::temp_dir().join(format!("agend-fleet-allow-bad-{}", std::process::id()));
+        let path = write_fleet(
+            &dir,
+            r#"
+channel:
+  type: telegram
+  bot_token_env: MY_BOT_TOKEN
+  group_id: -100
+  user_allowlist:
+    - 12345
+    - { id: "not_a_number", name: "Mallory" }
+instances: {}
+"#,
+        );
+        assert!(
+            FleetConfig::load(&path).is_err(),
+            "a malformed allowlist entry must fail the whole fleet load (fail-closed \
+             authz surface), not be silently dropped"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn test_channels_plural_single_entry_collapses_to_singular() {
         // `channels:` (plural) with one entry normalizes into `channel:`

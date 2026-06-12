@@ -69,11 +69,19 @@ pub fn init_from_config(
     let allowlist_ids: Option<Vec<i64>> = user_allowlist
         .as_ref()
         .map(|l| l.iter().map(|e| e.id()).collect());
+    // Sanitize each configured name at ingestion (the single chokepoint): the
+    // stored map — and therefore every consumer via `username_for` (both inbound
+    // paths + status-summary) — holds only header-safe names. A name that
+    // sanitizes to empty is dropped, so its sender falls back to `unknown`.
     let user_names: HashMap<i64, String> = user_allowlist
         .as_ref()
         .map(|l| {
             l.iter()
-                .filter_map(|e| e.name().map(|n| (e.id(), n.to_string())))
+                .filter_map(|e| {
+                    e.name()
+                        .and_then(super::state::sanitize_display_name)
+                        .map(|n| (e.id(), n))
+                })
                 .collect()
         })
         .unwrap_or_default();

@@ -204,12 +204,16 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
         );
         // Also notify agent PTY so it picks up the summary
         let sid = msg.from.as_ref().map(|u| u.id.0 as i64);
-        let allowlist_name: Option<String> =
-            if msg.from.as_ref().and_then(|u| u.username.as_deref()).is_none() {
-                sid.and_then(|id| lock_state(state).username_for(id).map(str::to_string))
-            } else {
-                None
-            };
+        let allowlist_name: Option<String> = if msg
+            .from
+            .as_ref()
+            .and_then(|u| u.username.as_deref())
+            .is_none()
+        {
+            sid.and_then(|id| lock_state(state).username_for(id).map(str::to_string))
+        } else {
+            None
+        };
         let username = msg
             .from
             .as_ref()
@@ -326,12 +330,16 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
     // Display name: prefer the public @username; if absent, fall back to the
     // configured allowlist name (`{ id, name }` in fleet.yaml) so the operator
     // shows as their name instead of `unknown`; else "unknown".
-    let allowlist_name: Option<String> =
-        if msg.from.as_ref().and_then(|u| u.username.as_deref()).is_none() {
-            sender_id.and_then(|id| lock_state(state).username_for(id).map(str::to_string))
-        } else {
-            None
-        };
+    let allowlist_name: Option<String> = if msg
+        .from
+        .as_ref()
+        .and_then(|u| u.username.as_deref())
+        .is_none()
+    {
+        sender_id.and_then(|id| lock_state(state).username_for(id).map(str::to_string))
+    } else {
+        None
+    };
     let username = msg
         .from
         .as_ref()
