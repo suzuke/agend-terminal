@@ -136,16 +136,35 @@ pub fn parse_task_entry(text: &str) -> Option<&str> {
 /// (v1.2 §10.3 lifecycle: verified → done). Skips ambiguous matches.
 pub fn auto_close_merged_tasks(home: &Path, branch: &str) {
     let tasks = crate::tasks::list_all(home);
+    // #2037 (5): the Verified-only status filter was the zombie-task gap —
+    // a dispatch task stays `claimed`/`in_progress` on the board while the
+    // reviewer's VERIFIED verdict lives in messages, so "PR merged but task
+    // open" recurred daily. Split by link strength:
+    //   - STRUCTURED link (t.branch == merged branch, set by
+    //     link_branch_to_task and OVERWRITTEN on re-dispatch — so a stale
+    //     earlier branch stops matching once a newer one is linked): any
+    //     active status closes. The merge of the explicitly-bound branch IS
+    //     the work landing.
+    //   - text-token fallback (branch mentioned in title/description):
+    //     stays Verified-only — a loose match must not close live work.
+    let active = |st: &TaskStatus| {
+        matches!(
+            st,
+            TaskStatus::Open
+                | TaskStatus::Claimed
+                | TaskStatus::InProgress
+                | TaskStatus::InReview
+                | TaskStatus::Blocked
+                | TaskStatus::Verified
+        )
+    };
     let candidates: Vec<_> = tasks
         .iter()
-        .filter(|t| t.status == TaskStatus::Verified)
         .filter(|t| {
-            // #1942: the structured `branch` field is the canonical link (set by
-            // `link_branch_to_task` on dispatch); the description/title token
-            // match stays as the legacy fallback for branches embedded in text.
-            t.branch.as_deref() == Some(branch)
-                || contains_as_token(&t.description, branch)
-                || contains_as_token(&t.title, branch)
+            let structured = t.branch.as_deref() == Some(branch);
+            let text_fallback =
+                contains_as_token(&t.description, branch) || contains_as_token(&t.title, branch);
+            (structured && active(&t.status)) || (text_fallback && t.status == TaskStatus::Verified)
         })
         .collect();
 
@@ -164,7 +183,10 @@ pub fn auto_close_merged_tasks(home: &Path, branch: &str) {
     }
 
     let task = candidates[0];
-    let result = format!("auto-closed: branch '{}' merged", branch);
+    let result = format!(
+        "auto-closed: branch '{}' merged (status at close: {})",
+        branch, task.status
+    );
     // M4: use system:auto_close identity (in ACL allow-list) through
     // tasks::handle() to get state-machine validation + proper ACL.
     let resp = crate::tasks::handle(
@@ -312,6 +334,106 @@ mod tests {
             task.status,
             TaskStatus::Done,
             "unverified task must NOT be auto-closed"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #2037 (5): a CLAIMED/IN_PROGRESS task with a STRUCTURED branch link
+    /// auto-closes when that branch merges — the Verified-only filter was the
+    /// daily zombie-task gap (the reviewer verdict lives in messages, the
+    /// board status stays claimed).
+    #[test]
+    fn auto_close_closes_active_task_with_structured_link_2037() {
+        use crate::task_events::{append_batch, InstanceName, TaskEvent, TaskId};
+        let dir =
+            std::env::temp_dir().join(format!("agend-autoclose-2037a-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let tid = "t-2037-active-001";
+        append_batch(
+            &dir,
+            &InstanceName::from("test:seed"),
+            vec![
+                TaskEvent::Created {
+                    task_id: TaskId(tid.into()),
+                    title: "impl thing".into(),
+                    description: "work".into(),
+                    priority: "normal".into(),
+                    owner: None,
+                    due_at: None,
+                    depends_on: Vec::new(),
+                    routed_to: None,
+                    branch: None,
+                    bind: None,
+                    eta_secs: None,
+                    tags: vec![],
+                    parent_id: None,
+                },
+                TaskEvent::Claimed {
+                    task_id: TaskId(tid.into()),
+                    by: InstanceName::from("dev"),
+                },
+            ],
+        )
+        .expect("seed claimed task");
+        crate::tasks::link_branch_to_task(&dir, tid, "fix/2037-thing").expect("link");
+        auto_close_merged_tasks(&dir, "fix/2037-thing");
+        let task = crate::tasks::list_all(&dir)
+            .into_iter()
+            .find(|t| t.id.as_str() == tid)
+            .expect("task present");
+        assert_eq!(
+            task.status,
+            TaskStatus::Done,
+            "structured-link claimed task must auto-close on merge"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #2037 (5) guard: a TEXT-fallback match (branch token in description,
+    /// no structured link) stays Verified-only — a loose match must never
+    /// close live work.
+    #[test]
+    fn auto_close_text_fallback_stays_verified_only_2037() {
+        use crate::task_events::{append_batch, InstanceName, TaskEvent, TaskId};
+        let dir =
+            std::env::temp_dir().join(format!("agend-autoclose-2037b-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let tid = "t-2037-text-001";
+        append_batch(
+            &dir,
+            &InstanceName::from("test:seed"),
+            vec![
+                TaskEvent::Created {
+                    task_id: TaskId(tid.into()),
+                    title: "impl other".into(),
+                    description: "working on fix/2037-other today".into(),
+                    priority: "normal".into(),
+                    owner: None,
+                    due_at: None,
+                    depends_on: Vec::new(),
+                    routed_to: None,
+                    branch: None,
+                    bind: None,
+                    eta_secs: None,
+                    tags: vec![],
+                    parent_id: None,
+                },
+                TaskEvent::Claimed {
+                    task_id: TaskId(tid.into()),
+                    by: InstanceName::from("dev"),
+                },
+            ],
+        )
+        .expect("seed");
+        auto_close_merged_tasks(&dir, "fix/2037-other");
+        let task = crate::tasks::list_all(&dir)
+            .into_iter()
+            .find(|t| t.id.as_str() == tid)
+            .expect("task present");
+        assert_ne!(
+            task.status,
+            TaskStatus::Done,
+            "text-fallback must NOT close a non-verified task"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

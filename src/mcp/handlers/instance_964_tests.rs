@@ -349,3 +349,35 @@ fn create_instance_persists_args_and_model_for_restart_parity_1858() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// #2037 (6): explicit `name` + `team` with count>1/backends is ambiguous —
+/// loud error instead of the pre-#2037 silent rename to `<team>-N`.
+#[test]
+fn create_instance_name_plus_team_count_conflict_errors_2037() {
+    let home = tmp_home("2037-name-team");
+    let resp = super::instance::handle_create_instance(
+        &home,
+        &serde_json::json!({"name": "exact-name", "team": "squad", "count": 3}),
+        "lead",
+    );
+    assert!(
+        resp["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ambiguous"),
+        "count>1 + name must be a loud error, not a silent rename: {resp}"
+    );
+    let resp = super::instance::handle_create_instance(
+        &home,
+        &serde_json::json!({"name": "exact-name", "team": "squad", "backends": ["claude", "codex"]}),
+        "lead",
+    );
+    assert!(
+        resp["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ambiguous"),
+        "backends + name must be a loud error: {resp}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}

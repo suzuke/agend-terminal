@@ -39,6 +39,40 @@ pub(super) fn handle_list_instances(home: &Path, args: &Value, instance_name: &s
 }
 
 pub(super) fn handle_create_instance(home: &Path, args: &Value, instance_name: &str) -> Value {
+    // #2037 (6): name + team = spawn THIS name, then join the team — team-mode
+    // used to silently rename to `<team>-N` (the fixup-1 incident). With
+    // count>1/backends the names are generated, so an explicit name errors.
+    if let (Some(team_name), Some(explicit)) = (
+        args.get("team").and_then(|v| v.as_str()),
+        args.get("name")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty()),
+    ) {
+        if args.get("count").and_then(|v| v.as_u64()).unwrap_or(1) > 1
+            || args.get("backends").is_some()
+        {
+            return json!({"error": "explicit 'name' with count>1/backends is ambiguous — drop 'name' (generated <team>-N names) or spawn one instance at a time"});
+        }
+        // Normal single path keeps the explicit name + all single-spawn behavior.
+        let mut single = args.clone();
+        if let Some(obj) = single.as_object_mut() {
+            obj.remove("team");
+            obj.remove("count");
+        }
+        let mut spawned = handle_create_instance(home, &single, instance_name);
+        if spawned.get("error").is_some() {
+            return spawned;
+        }
+        let team_resp = crate::teams::update(home, &json!({"name": team_name, "add": [explicit]}));
+        if team_resp.get("error").is_some() {
+            // Instance EXISTS — surface the partial state honestly.
+            return json!({"name": explicit, "spawned": true, "team": team_name,
+                "team_join_error": team_resp["error"].clone()});
+        }
+        spawned["team"] = json!(team_name);
+        spawned["joined_team"] = json!(true);
+        return spawned;
+    }
     // Team mode: spawn count instances and group them
     if let Some(team_name) = args.get("team").and_then(|v| v.as_str()) {
         let default_backend = args["backend"]
