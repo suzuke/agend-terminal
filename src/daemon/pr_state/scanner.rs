@@ -2,7 +2,7 @@ use std::path::Path;
 
 use super::gh_poll;
 use super::{
-    apply, format_ready_body, pr_state_dir, remove, resolve_author, resolve_notify_recipient,
+    apply, format_ready_body, pr_state_dir, remove, resolve_author, resolve_merge_authority,
     with_pr_state, DraftState, Event, MergeState, PrState,
 };
 
@@ -153,12 +153,17 @@ pub fn scan_and_emit_with(
             if matches!(state.merge_state, MergeState::MergeReady)
                 && state.ready_emitted_for_sha.as_deref() != Some(state.head_sha.as_str())
             {
-                // #2 (t-verdict-to-author-routing) Gap C: route to the BINDING-
-                // resolved author (shared-account-proof), not `resolve_author`'s
-                // gh-login chain whose last resort is a hard-coded "fixup-lead".
-                let author = resolve_notify_recipient(home, state);
+                // #2059-#3: ready-for-MERGE routes to the MERGE AUTHORITY (the
+                // team orchestrator via durable fleet.yaml teams), NOT the
+                // binding-resolved author — the implementer releases the
+                // worktree post-push, so the binding-first `resolve_notify_
+                // recipient` falls through to the author by merge-ready time
+                // (the PR #2058 mis-route). `[review-verdict]` keeps the
+                // author-facing resolver; only this terminal signal changes
+                // audience.
+                let recipient = resolve_merge_authority(home, state);
                 let body = format_ready_body(state);
-                let msg = build_event_message("pr-ready-for-merge", &author, state, body);
+                let msg = build_event_message("pr-ready-for-merge", &recipient, state, body);
                 // #1629: defer the enqueue (see top of fn). Set the dedup flag
                 // optimistically under the flock. NOTE: this is a behavior change
                 // for the pr-ready arm — previously the flag was set only on
@@ -176,10 +181,10 @@ pub fn scan_and_emit_with(
                     repo = %state.repo,
                     branch = %state.branch,
                     head = %state.head_sha,
-                    author = %author,
+                    recipient = %recipient,
                     "#972 pr_state: [pr-ready-for-merge] queued (emit after flock drop)"
                 );
-                pending_emits.push((author, msg));
+                pending_emits.push((recipient, msg));
             }
 
             // Terminal-state sweep.
