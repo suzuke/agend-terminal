@@ -123,6 +123,65 @@ pub(crate) fn spawn_group_bounded(
     }
 }
 
+/// W1.2 (#REFACTOR-PLAN): a structured failure from [`git_cmd`]. Distinguishes a
+/// spawn/timeout failure (git never produced a status) from a non-zero exit (git
+/// ran and rejected). Carries the exit code + trimmed stderr so a caller that
+/// branched on `output.status.code()` / stderr keeps the same information —
+/// migration preserves error-branch semantics, only the shape is more structured.
+#[derive(Debug)]
+pub(crate) enum GitError {
+    /// git failed to spawn, or the bounded wait errored (incl. `TimedOut`).
+    Spawn(std::io::Error),
+    /// git ran but exited non-zero. `code` is `None` for a signal-kill.
+    NonZero { code: Option<i32>, stderr: String },
+}
+
+impl std::fmt::Display for GitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GitError::Spawn(e) => write!(f, "git spawn failed: {e}"),
+            GitError::NonZero { code, stderr } => write!(
+                f,
+                "git exited {}: {}",
+                code.map(|c| c.to_string())
+                    .unwrap_or_else(|| "signal".to_string()),
+                stderr
+            ),
+        }
+    }
+}
+
+impl std::error::Error for GitError {}
+
+/// W1.2: THE ergonomic entry point for a daemon-internal LOCAL git command.
+/// Always `AGEND_GIT_BYPASS` + bounded by `LOCAL_GIT_TIMEOUT` (both via
+/// [`git_bypass`]), returns **trimmed stdout** on success or a structured
+/// [`GitError`] on spawn-failure / non-zero exit. A caller routed through this
+/// CANNOT forget the bypass env or the timeout — that's what W1.2 makes
+/// structurally impossible (enforced by a grep invariant). For a "did it
+/// succeed?" check that discards the output, use [`git_ok`].
+pub(crate) fn git_cmd(cwd: &Path, args: &[&str]) -> Result<String, GitError> {
+    let out = git_bypass(cwd, args).map_err(GitError::Spawn)?;
+    if !out.status.success() {
+        return Err(GitError::NonZero {
+            code: out.status.code(),
+            stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// W1.2: the boolean form of [`git_cmd`] — `true` iff git spawned AND exited 0.
+/// Swallows the output and any spawn/timeout error (→ `false`), matching the
+/// ubiquitous daemon idiom
+/// `Command::new("git")…output().map(|o| o.status.success()).unwrap_or(false)`
+/// that this absorbs (same bypass env, plus the `LOCAL_GIT_TIMEOUT` bound).
+pub(crate) fn git_ok(cwd: &Path, args: &[&str]) -> bool {
+    git_bypass(cwd, args)
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// Detect the default branch of a repository.
 /// Reads `refs/remotes/origin/HEAD` → extracts branch name.
 /// Falls back to "main" if detection fails.
@@ -160,6 +219,87 @@ pub fn primary_remote(repo_dir: &Path) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// A real, isolated git repo (one empty commit on `main`), built through the
+    /// shim bypass so a fleet-agent test run isn't ChdirPass'd (#1463).
+    fn tmp_repo(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static C: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "agend-gitcmd-{}-{}-{}",
+            tag,
+            std::process::id(),
+            C.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec![
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        ] {
+            std::process::Command::new("git")
+                .env("AGEND_GIT_BYPASS", "1")
+                .args(&args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+        }
+        dir
+    }
+
+    /// W1.2 §3.9: `git_cmd` returns TRIMMED stdout on success, a structured
+    /// `GitError::NonZero` (with code + stderr) on a non-zero exit, and never
+    /// leaks the bypass-env / timeout wiring to the caller.
+    #[test]
+    fn git_cmd_trims_stdout_and_structures_errors_w1_2() {
+        let repo = tmp_repo("ok");
+        // Success → trimmed (no trailing newline).
+        let head = git_cmd(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
+        assert_eq!(head, "main", "stdout must be trimmed, no newline");
+        // Non-zero exit → structured NonZero, code present, stderr captured.
+        let err = git_cmd(&repo, &["rev-parse", "definitely-no-such-ref"]).unwrap_err();
+        match err {
+            GitError::NonZero { code, stderr } => {
+                assert_eq!(code, Some(128), "git's usage/ref error exit code");
+                assert!(!stderr.is_empty(), "stderr captured for the caller");
+            }
+            GitError::Spawn(e) => panic!("expected NonZero, got spawn error: {e}"),
+        }
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// W1.2 §3.9: `git_ok` is `true` on exit-0, `false` on non-zero — the
+    /// boolean idiom this absorbs.
+    #[test]
+    fn git_ok_reflects_exit_status_w1_2() {
+        let repo = tmp_repo("bool");
+        assert!(
+            git_ok(&repo, &["rev-parse", "--git-dir"]),
+            "valid repo → true"
+        );
+        assert!(
+            !git_ok(&repo, &["rev-parse", "definitely-no-such-ref"]),
+            "non-zero exit → false"
+        );
+        // A non-repo dir → git errors → false (matches the `.unwrap_or(false)` idiom).
+        let nonrepo =
+            std::env::temp_dir().join(format!("agend-gitcmd-nonrepo-{}", std::process::id()));
+        std::fs::create_dir_all(&nonrepo).ok();
+        assert!(
+            !git_ok(&nonrepo, &["rev-parse", "--git-dir"]),
+            "non-repo → false"
+        );
+        std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&nonrepo).ok();
+    }
 
     // #1897 §3.9: the timeout + process-group-kill mechanism, driven by `sleep`
     // stubs (unix). The git path is `spawn_group_bounded` with `git` as the
