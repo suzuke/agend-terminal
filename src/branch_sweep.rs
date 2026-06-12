@@ -216,13 +216,11 @@ fn is_squash_merged_cherry(repo: &Path, base: &str, branch: &str) -> bool {
 /// branch name reuse.
 fn is_squash_merged_diff(repo: &Path, base: &str, branch: &str) -> bool {
     // Resolve owner/repo from git remote origin.
-    let remote = std::process::Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .current_dir(repo)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    // W1.2 class-2: BEHAVIOR DELTA — adds AGEND_GIT_BYPASS (this site previously
+    // ran raw `git` with NO bypass env). Daemon-side git over a fleet repo is the
+    // forgot-bypass latent class (#821/#1463); always-bypass is the intended fix.
+    // git_cmd trims stdout → identical to the prior `.trim().to_string()`.
+    let remote = crate::git_helpers::git_cmd(repo, &["remote", "get-url", "origin"]).ok();
     let Some(remote_url) = remote else {
         return false;
     };
@@ -231,13 +229,9 @@ fn is_squash_merged_diff(repo: &Path, base: &str, branch: &str) -> bool {
         return false;
     };
     // Get local branch tip SHA.
-    let local_sha = std::process::Command::new("git")
-        .args(["rev-parse", branch])
-        .current_dir(repo)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    // W1.2 class-2: BEHAVIOR DELTA — adds AGEND_GIT_BYPASS (was raw, no bypass).
+    // Same forgot-bypass class as the remote read above; git_cmd trims → identical.
+    let local_sha = crate::git_helpers::git_cmd(repo, &["rev-parse", branch]).ok();
     let Some(local_sha) = local_sha else {
         return false;
     };

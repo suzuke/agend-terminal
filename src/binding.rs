@@ -349,10 +349,14 @@ pub fn install_hooks(home: &Path, worktree: &Path) {
     let _ = std::fs::write(&ps_path, ps_hook);
 
     // Set core.hooksPath on the worktree.
-    let _ = std::process::Command::new("git")
-        .args(["config", "core.hooksPath", &hooks_dir.display().to_string()])
-        .current_dir(worktree)
-        .output();
+    // W1.2 class-2: BEHAVIOR DELTA — adds AGEND_GIT_BYPASS (this site previously
+    // ran raw `git` with NO bypass env). `git config` against a fleet-managed
+    // worktree is exactly the forgot-bypass latent class (#821/#1463): a daemon
+    // git mutation should always bypass the agend-git shim. Intended fix.
+    let _ = crate::git_helpers::git_ok(
+        worktree,
+        &["config", "core.hooksPath", &hooks_dir.display().to_string()],
+    );
 }
 
 /// Install hooks on all existing worktrees (daemon startup reconcile).
