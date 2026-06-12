@@ -20,6 +20,19 @@ const SILENCE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Maximum mirror text length (chars) to dispatch.
 const MAX_MIRROR_LEN: usize = 4000;
 
+/// Byte index at which to start draining the mirror buffer to keep it under
+/// `MAX_MIRROR_LEN`, snapped forward to the next char boundary so we never slice
+/// a multi-byte UTF-8 char (e.g. Chinese) mid-character. `String::drain(..n)`
+/// panics when `n` is not a char boundary (router.rs char_boundary panics on
+/// long Chinese turns, 2026-06-12).
+fn mirror_drain_start(buf: &str) -> usize {
+    let mut drain = buf.len().saturating_sub(MAX_MIRROR_LEN);
+    while drain < buf.len() && !buf.is_char_boundary(drain) {
+        drain += 1;
+    }
+    drain
+}
+
 /// Registration message: agent name + PTY output receiver.
 pub struct AgentSubscription {
     pub name: String,
@@ -99,7 +112,7 @@ fn run_loop(home: PathBuf, reg_rx: crossbeam_channel::Receiver<AgentSubscription
                     let text = String::from_utf8_lossy(&data);
                     buf.buffer.push_str(&text);
                     if buf.buffer.len() > MAX_MIRROR_LEN * 2 {
-                        let drain = buf.buffer.len() - MAX_MIRROR_LEN;
+                        let drain = mirror_drain_start(&buf.buffer);
                         buf.buffer.drain(..drain);
                     }
                 } else {
@@ -259,6 +272,28 @@ mod tests {
     #[test]
     fn max_mirror_len_is_4000() {
         assert_eq!(MAX_MIRROR_LEN, 4000);
+    }
+
+    #[test]
+    fn mirror_drain_start_never_splits_multibyte_char() {
+        // 3-byte chars; buffer well over 2*MAX_MIRROR_LEN so the trim branch runs.
+        let s: String = "界".repeat(MAX_MIRROR_LEN); // 12000 bytes
+        let start = mirror_drain_start(&s);
+        // Raw byte target 12000-4000=8000 is NOT a char boundary (8000 % 3 != 0);
+        // the fix must snap it forward to one.
+        assert!(
+            s.is_char_boundary(start),
+            "drain start must be a char boundary"
+        );
+        let mut owned = s.clone();
+        owned.drain(..start); // must not panic (regression: assertion failed is_char_boundary)
+        assert!(owned.len() <= MAX_MIRROR_LEN + 3);
+    }
+
+    #[test]
+    fn mirror_drain_start_is_zero_when_short() {
+        let s = "界界界".to_string();
+        assert_eq!(mirror_drain_start(&s), 0);
     }
 
     // ── #1102 prefer-chain tests ──────────────────────────────────────
