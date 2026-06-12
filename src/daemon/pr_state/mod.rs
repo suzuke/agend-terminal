@@ -417,6 +417,21 @@ pub fn pr_state_dir(home: &Path) -> PathBuf {
     home.join("pr-state")
 }
 
+/// #2059: true iff `path` is a per-branch `PrState` document — a `*.json` file
+/// that is NOT a dotfile. The pr-state dir also holds the `.emitted-terminal.json`
+/// terminal-latch ledger (a different schema) and `.lock` files; both share the
+/// `.json`/no-extension space but are not `PrState`. Parsing `.emitted-terminal.json`
+/// as `PrState` spammed a `missing field 'repo'` WARN on every gh-poll + scan tick
+/// (~every 10 s). Every dir-scan that deserializes entries as `PrState` routes
+/// through this predicate so the ledger/locks are skipped uniformly.
+pub(crate) fn is_pr_state_file(path: &Path) -> bool {
+    let is_dotfile = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with('.'));
+    !is_dotfile && path.extension().and_then(|e| e.to_str()) == Some("json")
+}
+
 /// Canonical filename for a (repo, branch) PR state file. Keyed by
 /// branch (not pr_number) because ci_watch — the primary writer —
 /// knows the branch but not the PR number; `pr_number` is filled in
@@ -530,7 +545,7 @@ pub fn cleanup_subscribers_for_instance(home: &Path, name: &str) -> usize {
     let mut mutated = 0usize;
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+        if !is_pr_state_file(&path) {
             continue;
         }
         // Value-based, NOT typed `PrState` parse: an audit/cleanup that silently
@@ -586,7 +601,7 @@ pub fn has_subscriber(home: &Path, name: &str) -> bool {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+        if !is_pr_state_file(&path) {
             continue;
         }
         let listed = std::fs::read_to_string(&path)
@@ -1062,6 +1077,25 @@ pub fn format_ready_body(state: &PrState) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// #2059: the dir-scan predicate accepts per-branch `*.json` PrState files
+    /// and rejects the dotfile companions (`.emitted-terminal.json` ledger,
+    /// `*.lock`) that share the pr-state dir — parsing those as PrState spammed a
+    /// `missing field 'repo'` WARN every ~10 s.
+    #[test]
+    fn is_pr_state_file_skips_dotfiles_2059() {
+        assert!(is_pr_state_file(Path::new(
+            "/h/pr-state/suzuke_agend-terminal__feat_x.json"
+        )));
+        assert!(
+            !is_pr_state_file(Path::new("/h/pr-state/.emitted-terminal.json")),
+            "the terminal-latch ledger is a dotfile .json — must be skipped"
+        );
+        assert!(!is_pr_state_file(Path::new(
+            "/h/pr-state/suzuke_agend-terminal__feat_x.lock"
+        )));
+        assert!(!is_pr_state_file(Path::new("/h/pr-state/.something.lock")));
+    }
 
     fn now() -> String {
         chrono::Utc::now().to_rfc3339()

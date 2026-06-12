@@ -466,7 +466,13 @@ fn process_verdicts(home: &Path, from: &str, msg: &crate::inbox::InboxMessage) {
     // staleness gate (a head-less VERIFIED must not flip the merge gate);
     // REJECTED/UNVERIFIED record regardless (UNVERIFIED is evidence-exempt).
     if msg.kind.as_deref() == Some("report") && msg.correlation_id.is_some() {
-        let text = msg.text.trim_start();
+        // #2059: strip the `[report_result] ` wrapper (added by
+        // comms::handle_report_result) via the SHARED helper, so the verdict-word
+        // check sees the bare word — the same strip `is_terminal_verdict_text`
+        // uses, so the two verdict consumers never drift. Without this, the
+        // wrapped real wire text never matched and record_verdict was never
+        // called (the pipeline-wide silence #2059 RCA'd).
+        let text = crate::daemon::auto_release::strip_report_wrapper(&msg.text);
         let task_id = msg.correlation_id.as_deref().unwrap_or("");
         if text.starts_with("VERIFIED") {
             if msg.reviewed_head.is_some() {

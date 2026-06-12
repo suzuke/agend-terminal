@@ -1,6 +1,31 @@
 use serde_json::{json, Value};
 use std::path::Path;
 
+/// #2059: the canonical report-message text producer. Prepends the
+/// `[report_result] ` wrapper to the summary and appends the optional
+/// `correlation_id:` / `Artifacts:` lines. The single builder that BOTH
+/// production (`comms::handle_report_result`) and the verdict-matcher tests
+/// route through — the #1493 producer-fed-fixture discipline that keeps the
+/// downstream verdict detector
+/// ([`crate::daemon::auto_release::is_terminal_verdict_text`]) tested against
+/// the REAL wire text (incl. the wrapper that previously defeated it, #2059).
+/// Lives here (a `comms.rs` overflow sibling) because that file is at the
+/// 750-LOC handler cap.
+pub(crate) fn build_report_text(
+    summary: &str,
+    correlation_id: Option<&str>,
+    artifacts: Option<&str>,
+) -> String {
+    let mut msg = format!("[report_result] {summary}");
+    if let Some(cid) = correlation_id {
+        msg.push_str(&format!("\ncorrelation_id: {cid}"));
+    }
+    if let Some(artifacts) = artifacts {
+        msg.push_str(&format!("\nArtifacts: {artifacts}"));
+    }
+    msg
+}
+
 pub fn handle_describe_message(home: &Path, args: &Value, instance_name: &str) -> Value {
     let msg_id = match args["message_id"].as_str() {
         Some(id) => id,
@@ -106,6 +131,45 @@ fn obligation_reason(home: &Path, msg: &crate::inbox::InboxMessage) -> Option<St
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// #2059 §3.9 — the PRODUCER-FED FIXTURE (#1493 discipline). Routes the REAL
+    /// producer output (`build_report_text`, the exact builder
+    /// `handle_report_result` uses on the wire) through the downstream verdict
+    /// matcher (`auto_release::is_terminal_verdict_text`). Pre-#2059 the matcher
+    /// checked `starts_with("VERIFIED")` on the wrapped text → false →
+    /// record_verdict never fired (the pipeline-wide silence). The point of
+    /// co-locating producer + fixture is that the matcher can never again be
+    /// tested against a hand-crafted `"VERIFIED …"` the wire never sends.
+    #[test]
+    fn matcher_sees_through_report_result_wrapper_producer_fed_2059() {
+        use crate::daemon::auto_release::is_terminal_verdict_text;
+        for verdict in ["VERIFIED", "REJECTED", "UNVERIFIED"] {
+            let summary = format!("{verdict} — ran: cargo test → 3702 passed");
+            // Bare wrapper (no suffix).
+            let wire = build_report_text(&summary, None, None);
+            assert!(
+                is_terminal_verdict_text(&wire),
+                "{verdict}: producer-wrapped text must be detected (got {wire:?})"
+            );
+            // With correlation_id + Artifacts suffix lines — the verdict is still
+            // at the start, the suffix must not break detection.
+            let wire2 = build_report_text(
+                &summary,
+                Some("t-20260612055508677007-13"),
+                Some("https://github.com/suzuke/agend-terminal/pull/2058"),
+            );
+            assert!(
+                is_terminal_verdict_text(&wire2),
+                "{verdict}: wrapped + suffixed producer text must be detected"
+            );
+        }
+        // A non-verdict report produced the same way must NOT be a false verdict.
+        let progress = build_report_text("Done — pushed PR #2058, CI running", None, None);
+        assert!(
+            !is_terminal_verdict_text(&progress),
+            "a non-verdict report must not read as a verdict (got {progress:?})"
+        );
+    }
 
     /// #bughunt-r2 #3: querying a LIVE, un-drained message by id must report
     /// `status: "unread"` (with its delivery_mode + correlation_id) — NOT

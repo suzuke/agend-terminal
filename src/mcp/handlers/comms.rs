@@ -461,13 +461,11 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
         Some(s) => s,
         None => return json!({"error": "missing 'summary'"}),
     };
-    let mut msg = format!("[report_result] {summary}");
-    if let Some(cid) = args["correlation_id"].as_str() {
-        msg.push_str(&format!("\ncorrelation_id: {cid}"));
-    }
-    if let Some(artifacts) = args["artifacts"].as_str() {
-        msg.push_str(&format!("\nArtifacts: {artifacts}"));
-    }
+    let msg = comms_inbox::build_report_text(
+        summary,
+        args["correlation_id"].as_str(),
+        args["artifacts"].as_str(),
+    );
     let result = {
         let correlation_id = args["correlation_id"].as_str();
         let reviewed_head = args["reviewed_head"].as_str();

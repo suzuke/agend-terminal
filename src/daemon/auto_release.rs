@@ -405,11 +405,30 @@ pub(crate) fn enqueue_intent(home: &Path, intent: &AutoReleaseIntent) -> std::io
     Ok(())
 }
 
-/// The three terminal review verdicts. A reviewer's report opens with exactly
-/// one of these (§3.12 / #1666 §3.3). True iff `text` (already the message body)
-/// begins with one of them.
-pub(crate) fn is_terminal_verdict_text(text: &str) -> bool {
+/// #2059: strip the `[report_result] ` wrapper that
+/// `comms::handle_report_result` prepends, so verdict detection sees the bare
+/// verdict word. The reviewer's verdict is sent via `send request_kind=report`,
+/// which routes through `handle_report_result` and wraps the summary — so the
+/// downstream `msg.text` is `"[report_result] VERIFIED …"`, NOT `"VERIFIED …"`.
+/// Without this strip, every `starts_with("VERIFIED")`-style check is dead
+/// against real wire text (the pipeline-wide silence #2059 RCA'd). Idempotent on
+/// already-bare text (a raw `send` report), so both shapes resolve.
+///
+/// This is the SINGLE strip mechanism — both verdict consumers
+/// (`is_terminal_verdict_text` here, and `process_verdicts` in
+/// `api/handlers/messaging.rs`) route through it, so the two never drift.
+pub(crate) fn strip_report_wrapper(text: &str) -> &str {
     let t = text.trim_start();
+    t.strip_prefix("[report_result] ")
+        .map(str::trim_start)
+        .unwrap_or(t)
+}
+
+/// The three terminal review verdicts. A reviewer's report opens with exactly
+/// one of these (§3.12 / #1666 §3.3). True iff `text` (the message body, with or
+/// without the `[report_result] ` wrapper) begins with one of them.
+pub(crate) fn is_terminal_verdict_text(text: &str) -> bool {
+    let t = strip_report_wrapper(text);
     t.starts_with("VERIFIED") || t.starts_with("REJECTED") || t.starts_with("UNVERIFIED")
 }
 
@@ -859,6 +878,28 @@ mod tests {
             m.text = format!("   {verdict} — indented");
             assert!(is_verdict_message(&m), "{verdict} with indent must match");
         }
+    }
+
+    /// #2059: the strip is idempotent — a BARE verdict (a raw `send` report with
+    /// no `[report_result] ` wrapper) still matches, and a non-verdict report is
+    /// NOT a false positive. (The PRODUCER-FED fixture — feeding the real
+    /// `build_report_text` output through this matcher — lives in
+    /// `comms_inbox.rs` next to the producer, #1493 discipline.)
+    #[test]
+    fn strip_report_wrapper_idempotent_and_no_false_positive_2059() {
+        // Bare verdict (unwrapped) still resolves.
+        assert!(is_terminal_verdict_text("VERIFIED — all green"));
+        assert_eq!(strip_report_wrapper("VERIFIED — x"), "VERIFIED — x");
+        // Wrapper stripped to the bare word (incl. the trailing space).
+        assert_eq!(
+            strip_report_wrapper("[report_result] VERIFIED — x"),
+            "VERIFIED — x"
+        );
+        // A non-verdict report must NOT be a false positive (wrapped or bare).
+        assert!(!is_terminal_verdict_text(
+            "[report_result] Done — pushed PR #2058"
+        ));
+        assert!(!is_terminal_verdict_text("just a plain message"));
     }
 
     /// Non-verdict text, non-report kinds, or missing reviewed_head /
