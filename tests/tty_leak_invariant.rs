@@ -18,7 +18,7 @@
 //! ## What it checks
 //!
 //! For each module in `MODULE_SCOPE`, scan the PRODUCTION portion only (up to
-//! the first `#[cfg(test)]`). Each `Command::new("git")` builder that
+//! the first `#[cfg(test)]`). Each git `Command` builder that
 //! terminates in `.status()` or `.spawn()` MUST redirect BOTH stdout and
 //! stderr (`.stdout(..).stderr(..)`, typically `Stdio::null()`). A chain that
 //! ends in `.output()` is inherently captured (pipes both streams) and is
@@ -29,9 +29,9 @@
 //!
 //! Scope is per-slice: the modules with a confirmed app-mode-reachable git
 //! spawn (grow the list as more are found/migrated). The scanner reads the
-//! contiguous fluent builder chain `Command::new("git")…terminator`; it does
-//! NOT catch a chain split across a `let cmd = Command::new("git"); …;
-//! cmd.status()` binding, nor non-git subprocesses. Those are out of this
+//! contiguous fluent git `Command` builder chain up to its terminator; it does
+//! NOT catch a chain split across a `let cmd = <git Command>; …; cmd.status()`
+//! binding, nor non-git subprocesses. Those are out of this
 //! guard's reach by design — it pins the concrete #2071 shape, not every
 //! conceivable TTY inheritance.
 
