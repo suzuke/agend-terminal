@@ -139,8 +139,23 @@ pub(crate) fn verify_pass(home: &Path) {
 mod tests {
     use super::*;
 
-    fn clear() {
-        store().lock().clear();
+    /// #2044 test isolation: these tests share the process-global `store()`
+    /// AND drive `verify_pass`, which is a PRODUCTION whole-store pass
+    /// (`retain` over every agent). Under plain `cargo test` (in-process
+    /// parallel — the Coverage job's mode, run 27396184642), two tests'
+    /// `verify_pass` calls interleave on the shared map and mutate each
+    /// other's entries → the flaky `left:None right:Some(true)`. A unique
+    /// agent name per test is NOT enough (verify_pass touches all agents), so
+    /// serialize the whole group; nextest is unaffected (per-test process).
+    fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static G: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        G.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Remove ONLY this test's own agent (never a global wipe that would nuke
+    /// a sibling's in-flight pending).
+    fn forget(agent: &str) {
+        store().lock().remove(agent);
     }
 
     /// Test seam: arm with an EXPLICIT inject time so the verify window + the
@@ -171,23 +186,25 @@ mod tests {
     /// never tracked, so it can never be falsely re-injected.
     #[test]
     fn arm_noop_without_hook_history() {
-        clear();
+        let _g = test_guard();
         let agent = "no-hooks-2044";
+        forget(agent);
         super::arm(agent, "wake");
         assert!(
             store().lock().get(agent).is_none(),
             "no hook history → not armed"
         );
-        clear();
+        forget(agent);
     }
 
     /// A UserPromptSubmit recorded AFTER the inject clears the pending silently
     /// — even when the window has elapsed (delivery beats the timeout).
     #[test]
     fn delivered_clears_without_redelivery() {
-        clear();
+        let _g = test_guard();
         let home = tmp_home("delivered");
         let agent = "deliv-2044";
+        forget(agent);
         let now = now_ms();
         let injected = now - VERIFY_WINDOW_MS - 1_000; // window already elapsed
         arm_at(agent, "wake", injected);
@@ -198,7 +215,7 @@ mod tests {
             store().lock().get(agent).is_none(),
             "UserPromptSubmit after inject ⇒ delivered, cleared (no re-delivery)"
         );
-        clear();
+        forget(agent);
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -206,9 +223,10 @@ mod tests {
     /// (still unconfirmed) give up — never a storm.
     #[test]
     fn unconfirmed_redelivers_once_then_gives_up() {
-        clear();
+        let _g = test_guard();
         let home = tmp_home("unconfirmed");
         let agent = "unconf-2044";
+        forget(agent);
         let now = now_ms();
         // Fresh inject (inside the window) → no action yet.
         arm_at(agent, "wake", now);
@@ -229,7 +247,7 @@ mod tests {
             store().lock().get(agent).is_none(),
             "gave up after the single re-delivery — no storm"
         );
-        clear();
+        forget(agent);
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -237,9 +255,10 @@ mod tests {
     /// (a stale earlier submit must not mask a swallowed new inject).
     #[test]
     fn stale_prior_user_prompt_submit_does_not_confirm() {
-        clear();
+        let _g = test_guard();
         let home = tmp_home("stale-ups");
         let agent = "stale-2044";
+        forget(agent);
         let now = now_ms();
         let injected = now - VERIFY_WINDOW_MS - 1_000; // window elapsed
                                                        // UserPromptSubmit BEFORE the inject (stale).
@@ -251,7 +270,7 @@ mod tests {
             Some(true),
             "the pre-inject UserPromptSubmit must not confirm the new inject"
         );
-        clear();
+        forget(agent);
         std::fs::remove_dir_all(&home).ok();
     }
 
