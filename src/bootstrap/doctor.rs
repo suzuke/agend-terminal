@@ -218,7 +218,8 @@ mod tests {
             bot_token_env: "AGEND_TELEGRAM_BOT_TOKEN".into(),
             group_id: -100123,
             mode: "topic".into(),
-            user_allowlist,
+            user_allowlist: user_allowlist
+                .map(|v| v.into_iter().map(crate::fleet::AllowlistEntry::Id).collect()),
             fleet_binding: None,
         }
     }

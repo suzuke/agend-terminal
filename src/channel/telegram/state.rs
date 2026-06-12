@@ -92,6 +92,11 @@ pub struct TelegramState {
     /// config's `fleet_binding` block plus the on-disk topic registry
     /// sentinel `"__fleet__"`.
     pub fleet_binding_topic_id: Option<i32>,
+    /// Display names for allowlisted Telegram user ids (from the `{ id, name }`
+    /// form of `user_allowlist`). Used to render `[user:NAME via telegram]` when
+    /// the sender has no public @username. Set post-bootstrap in
+    /// [`init_from_config`]; empty when no names are configured.
+    pub user_names: HashMap<i64, String>,
 }
 
 impl TelegramState {
@@ -117,6 +122,7 @@ impl TelegramState {
             user_allowlist,
             registry: None,
             fleet_binding_topic_id: None,
+            user_names: HashMap::new(),
         }
     }
 
@@ -150,6 +156,7 @@ impl TelegramState {
             user_allowlist,
             registry: None,
             fleet_binding_topic_id: None,
+            user_names: HashMap::new(),
         }
     }
 
@@ -166,6 +173,13 @@ impl TelegramState {
     /// Telegram" section for the migration steps.
     pub fn is_user_allowed(&self, user_id: i64) -> bool {
         crate::channel::auth::is_authorized_recipient(&self.user_allowlist, user_id)
+    }
+
+    /// Configured display name for a Telegram user id, if any (from the
+    /// `{ id, name }` form of `user_allowlist`). Used to resolve the sender
+    /// shown in agent inboxes when the account has no public @username.
+    pub fn username_for(&self, user_id: i64) -> Option<&str> {
+        self.user_names.get(&user_id).map(String::as_str)
     }
 
     /// Send a message to an instance's Telegram topic.
@@ -286,6 +300,36 @@ mod tests {
         assert!(state.is_user_allowed(100));
         assert!(!state.is_user_allowed(41));
         assert!(!state.is_user_allowed(0));
+    }
+
+    #[test]
+    fn username_for_resolves_configured_name() {
+        let mut state = TelegramState::new(
+            "tok",
+            -1,
+            HashMap::new(),
+            PathBuf::from("/tmp"),
+            HashMap::new(),
+            Some(vec![42, 100]),
+        );
+        state.user_names.insert(42, "Alice".to_string());
+        // configured name → resolved
+        assert_eq!(state.username_for(42), Some("Alice"));
+        // allowlisted but no name → None (caller falls back to "unknown")
+        assert_eq!(state.username_for(100), None);
+        // unknown id → None
+        assert_eq!(state.username_for(999), None);
+    }
+
+    #[test]
+    fn allowlist_entry_untagged_accepts_bare_id_and_named() {
+        use crate::fleet::AllowlistEntry;
+        let yaml = "- 12345\n- { id: 67890, name: \"Alice\" }\n";
+        let list: Vec<AllowlistEntry> = serde_yaml_ng::from_str(yaml).expect("parse");
+        assert_eq!(list[0].id(), 12345);
+        assert_eq!(list[0].name(), None);
+        assert_eq!(list[1].id(), 67890);
+        assert_eq!(list[1].name(), Some("Alice"));
     }
 
     #[test]

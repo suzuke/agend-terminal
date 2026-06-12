@@ -63,7 +63,20 @@ pub fn init_from_config(
         }
         Some(list) => tracing::info!(count = list.len(), "telegram user_allowlist active"),
     }
-    let allowlist = user_allowlist.clone();
+    // Split the allowlist into the bare-id list (authz, unchanged downstream)
+    // and an id→name map (display: surfaced as `[user:NAME via telegram]` when
+    // the sender has no public @username).
+    let allowlist_ids: Option<Vec<i64>> = user_allowlist
+        .as_ref()
+        .map(|l| l.iter().map(|e| e.id()).collect());
+    let user_names: HashMap<i64, String> = user_allowlist
+        .as_ref()
+        .map(|l| {
+            l.iter()
+                .filter_map(|e| e.name().map(|n| (e.id(), n.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
 
     // Clean up orphaned topics
     let mut reg = load_topic_registry(home);
@@ -146,9 +159,10 @@ pub fn init_from_config(
         topic_map,
         home.to_path_buf(),
         submit_keys,
-        allowlist,
+        allowlist_ids,
     );
     raw_state.fleet_binding_topic_id = fleet_binding_topic_id;
+    raw_state.user_names = user_names;
     let state = Arc::new(Mutex::new(raw_state));
     start_polling(Arc::clone(&state));
     Some(state)
