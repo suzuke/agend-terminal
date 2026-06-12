@@ -399,6 +399,10 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     let app_configs: crate::api::ConfigRegistry = Arc::new(Mutex::new(HashMap::new()));
     let app_handlers = app_tick_handlers();
 
+    // #2057: read the size-probe env gate ONCE (it can't change mid-run) — keep
+    // the per-frame draw loop's hot path at zero env-lookup cost (codex #2060).
+    let size_debug = std::env::var("AGEND_TUI_SIZE_DEBUG").as_deref() == Ok("1");
+
     loop {
         if crate::bootstrap::signals::term_requested() {
             tracing::info!("app: SIGTERM received, exiting main loop");
@@ -452,6 +456,27 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
 
         let repeat_mode = key_handler.in_repeat();
 
+        // #2057 instrumentation (env-gated, AGEND_TUI_SIZE_DEBUG=1): the
+        // operator sees ~3 blank rows below the status bar (frame shorter than
+        // the window) and it follows the home dir, but the static trace found
+        // NO stored size anywhere — every size source is live crossterm. Log
+        // the actual numbers per draw so a repro says which one is short.
+        if size_debug {
+            let cross = crossterm::terminal::size().unwrap_or((0, 0));
+            let term_sz = terminal
+                .size()
+                .map(|s| (s.width, s.height))
+                .unwrap_or((0, 0));
+            tracing::info!(
+                tag = "#2057-size",
+                crossterm_cols = cross.0,
+                crossterm_rows = cross.1,
+                terminal_size = ?term_sz,
+                tabs = layout.tabs.len(),
+                "TUI draw size probe"
+            );
+        }
+
         terminal.draw(|frame| {
             // #1027: snapshot the shared daemon-binary-stale flag once
             // per frame so the render path sees a consistent value.
@@ -459,6 +484,18 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
             // state needed; the supervisor's SeqCst store will always
             // be visible to this load before the next paint tick.
             let binary_stale = daemon_binary_stale.load(std::sync::atomic::Ordering::Relaxed);
+            // #2057: the area render actually fills — compare to crossterm above.
+            if size_debug {
+                let a = frame.area();
+                tracing::info!(
+                    tag = "#2057-area",
+                    x = a.x,
+                    y = a.y,
+                    w = a.width,
+                    h = a.height,
+                    "frame.area() in draw"
+                );
+            }
             render::render(
                 frame,
                 &mut layout,
