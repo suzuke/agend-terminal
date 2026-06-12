@@ -1233,101 +1233,29 @@ impl StateTracker {
             match patterns.detect_with_match(screen_text) {
                 Some((detected, matched)) => {
                     let high_fp = is_high_fp_state(detected);
-                    // Anchor gate — two regimes (t-coloranchor-remove-ratelimit,
-                    // operator-approved after the corpus gate's go/no-go):
-                    //
-                    // - **`requires_red_anchor`** {ContextFull, ModelUnsupported}:
-                    //   keep the #1450 RED anchor — a marker needs ≥1 red rendered
-                    //   cell, else it's prose not a state. ContextFull has no
-                    //   corpus to prove a content path; ModelUnsupported never
-                    //   auto-clears AND suppresses hang-check, so a verbatim-quote
-                    //   FP would silently disable a healthy agent (cost too high).
-                    //
-                    // - **content-anchor** {RateLimit, ServerRateLimit}: the marker
-                    //   must sit on an error-line-shaped line (`in_error_line_excluding_input`) —
-                    //   corpus-proven safe (5/5 prose suppressed via pattern-narrow
-                    //   + #1518 position + #1769 working-marker; FN-covered incl.
-                    //   kiro `ThrottlingException` via #1789). NO red required, so a
-                    //   real fault rendered in DEFAULT/grey (codex/gemini net
-                    //   errors) latches — the old #1757 net-error red-exemption is
-                    //   now the GENERAL rule, not a special case. The residual
-                    //   verbatim-quote FP (an agent pasting a real error line into
-                    //   the live tail with no working-marker below) is ACCEPTED for
-                    //   these two: both auto-clear and are retry-driven, so a
-                    //   one-off mis-latch self-corrects (unlike ModelUnsupported).
-                    // #1947: the content anchor additionally rejects matches
-                    // sitting on the backend's INPUT line (or an echoed /
-                    // submitted user-message line) — operator-typed / quoted
-                    // error strings are prose, not CLI error output
-                    // (operator-reproduced live FP, 2026-06-10).
                     let usage_limit = matches!(detected, AgentState::UsageLimit);
-                    let anchor_fail = if requires_red_anchor(detected) {
-                        self.anchor_on_red
-                            && !fg.is_empty()
-                            && !matched_span_has_red(screen_text, matched, fg)
-                    } else if high_fp {
-                        !crate::state::patterns::in_error_line_excluding_input(
-                            screen_text,
-                            matched,
-                            self.input_line_markers,
-                        )
-                    } else if usage_limit {
-                        // #1955 self-poisoning: an agent QUOTING the banner
-                        // ("You've hit your weekly limit" in an RCA / dispatch)
-                        // latched itself. Input-line exclusion is the
-                        // right-sized anchor here — the REAL banner carries no
-                        // error indicator (`⎿ You've hit your weekly limit ·
-                        // resets 4am`), so the error-line content anchor would
-                        // false-negative it, and its rendering isn't reliably
-                        // red. Prose mentions in agent OUTPUT are bounded by
-                        // the position gate below + the #1777 working-marker
-                        // override + the #1955 release anchor.
-                        !crate::state::patterns::any_match_off_input_lines(
-                            screen_text,
-                            matched,
-                            self.input_line_markers,
-                        )
-                    } else {
-                        false
-                    };
-                    // #1518 position gate: a HIGH_FP marker that has scrolled out
-                    // of the live bottom-N rows (e.g. an ApiError / ServerRateLimit
-                    // line pushed up by the post-recovery `continue` output) is
-                    // stale — the agent has moved on, so it must NOT keep re-firing
-                    // the error transition (the level-triggered re-match that drove
-                    // the retry storm). Scoped to HIGH_FP/error states ONLY:
-                    // Idle and modal/interactive prompts keep full-screen
-                    // scanning, because a modal can legitimately sit above the tail.
-                    // #1955: UsageLimit joins the position gate — a banner
-                    // quote buried in deep scrollback is discussion, not a
-                    // live limit (same staleness logic as the HIGH_FP set).
-                    let stale_position = (high_fp || usage_limit)
-                        && !matched_span_in_recent_tail(
-                            screen_text,
-                            matched,
-                            ERROR_TAIL_SCAN_LINES,
-                        );
+                    // Suppression gates — run BEFORE the landing pipeline. A
+                    // detection that fails the anchor gate OR has scrolled out of
+                    // the live tail (position gate) is treated as no-match and
+                    // falls through to structural fallback / latch maintenance.
+                    let anchor_fail = self.apply_anchor_gate(
+                        detected,
+                        matched,
+                        screen_text,
+                        fg,
+                        high_fp,
+                        usage_limit,
+                    );
+                    let stale_position =
+                        self.apply_position_gate(matched, screen_text, high_fp, usage_limit);
                     if anchor_fail || stale_position {
-                        if anchor_fail {
-                            self.log_anchor_suppress(detected, matched, screen_text, fg);
-                        } else {
-                            tracing::debug!(
-                                target: "state_detection",
-                                agent = %self.instance_name,
-                                state = ?detected,
-                                tail_rows = ERROR_TAIL_SCAN_LINES,
-                                "#1518: HIGH_FP marker scrolled out of the live tail — suppressing stale error transition"
-                            );
-                        }
-                        // Treat as no detection — fall through to
-                        // structural fallback / latch maintenance.
-                        if matches!(self.current, AgentState::Starting)
-                            && is_generic_startup_prompt(screen_text)
-                        {
-                            self.transition(AgentState::InteractivePrompt);
-                        } else {
-                            self.maybe_expire_latched_state();
-                        }
+                        self.handle_suppressed_detection(
+                            detected,
+                            matched,
+                            screen_text,
+                            fg,
+                            anchor_fail,
+                        );
                     } else {
                         // #1768: a HIGH_FP error wins the priority race even after
                         // it scrolled up and the agent RESUMED WORK below it
@@ -1587,42 +1515,7 @@ impl StateTracker {
                         self.transition(gated);
                     }
                 }
-                None => {
-                    // #SRL-phase2: hard-wrap fallback. Raw detection missed —
-                    // which is exactly what an Ink-hard-wrapped SRL/RateLimit
-                    // line looks like (the phrase split across rows by real
-                    // `\n`). Retry on the flattened bottom-N tail before the
-                    // structural/expire path. Land via the SAME recovery gate as
-                    // the raw SRL path: recent productive output ⇒ recovered ⇒
-                    // Idle; else latch the throttle so auto-retry fires.
-                    // (working_state_below can't be located in the wrapped raw
-                    // text, so a hard-wrapped throttle with a working marker
-                    // below is not overridden here — accepted; `recovered_within`
-                    // still releases a genuinely-recovered pane.)
-                    if let Some(throttle) =
-                        flattened_throttle_detect(patterns, screen_text, self.input_line_markers)
-                    {
-                        let landed = if matches!(throttle, AgentState::ServerRateLimit)
-                            && self.recovered_within(SERVER_RATE_LIMIT_RECOVERY_SILENCE)
-                        {
-                            AgentState::Idle
-                        } else {
-                            throttle
-                        };
-                        let gated = self.gate_on_heartbeat(landed);
-                        self.transition(gated);
-                    } else if matches!(self.current, AgentState::Starting)
-                        && is_generic_startup_prompt(screen_text)
-                    {
-                        // Starting-only structural fallback: a generic prompt
-                        // token (y/n, press enter, …) at startup is almost
-                        // certainly an operator dialog — flag InteractivePrompt
-                        // immediately instead of waiting on the silence window.
-                        self.transition(AgentState::InteractivePrompt);
-                    } else {
-                        self.maybe_expire_latched_state();
-                    }
-                }
+                None => self.handle_no_raw_match(patterns, screen_text),
             }
 
             // #1808-probe0-phantom (instrumentation-only): record that the tracker
@@ -1776,6 +1669,156 @@ impl StateTracker {
                 self.current.display_name(),
                 &signal,
             );
+        }
+    }
+
+    /// Gate 2a — anchor. Returns `true` when the detection should be SUPPRESSED
+    /// (treated as no-match). Two regimes (t-coloranchor-remove-ratelimit,
+    /// operator-approved after the corpus gate's go/no-go):
+    ///
+    /// - **`requires_red_anchor`** {ContextFull, ModelUnsupported}: keep the
+    ///   #1450 RED anchor — a marker needs ≥1 red rendered cell, else it's prose
+    ///   not a state. ContextFull has no corpus to prove a content path;
+    ///   ModelUnsupported never auto-clears AND suppresses hang-check, so a
+    ///   verbatim-quote FP would silently disable a healthy agent (cost too high).
+    /// - **content-anchor** {RateLimit, ServerRateLimit}: the marker must sit on
+    ///   an error-line-shaped line (`in_error_line_excluding_input`) —
+    ///   corpus-proven safe (5/5 prose suppressed via pattern-narrow + #1518
+    ///   position + #1769 working-marker; FN-covered incl. kiro
+    ///   `ThrottlingException` via #1789). NO red required, so a real fault
+    ///   rendered in DEFAULT/grey (codex/gemini net errors) latches — the old
+    ///   #1757 net-error red-exemption is now the GENERAL rule, not a special
+    ///   case. The residual verbatim-quote FP (an agent pasting a real error line
+    ///   into the live tail with no working-marker below) is ACCEPTED for these
+    ///   two: both auto-clear and are retry-driven, so a one-off mis-latch
+    ///   self-corrects (unlike ModelUnsupported).
+    ///
+    /// #1947: the content anchor additionally rejects matches sitting on the
+    /// backend's INPUT line (or an echoed / submitted user-message line) —
+    /// operator-typed / quoted error strings are prose, not CLI error output
+    /// (operator-reproduced live FP, 2026-06-10).
+    ///
+    /// #1955 self-poisoning (UsageLimit arm): an agent QUOTING the banner
+    /// ("You've hit your weekly limit" in an RCA / dispatch) latched itself.
+    /// Input-line exclusion is the right-sized anchor here — the REAL banner
+    /// carries no error indicator (`⎿ You've hit your weekly limit · resets 4am`),
+    /// so the error-line content anchor would false-negative it, and its
+    /// rendering isn't reliably red. Prose mentions in agent OUTPUT are bounded by
+    /// the position gate + the #1777 working-marker override + the #1955 release
+    /// anchor.
+    fn apply_anchor_gate(
+        &self,
+        detected: AgentState,
+        matched: &str,
+        screen_text: &str,
+        fg: &[CellFg],
+        high_fp: bool,
+        usage_limit: bool,
+    ) -> bool {
+        if requires_red_anchor(detected) {
+            self.anchor_on_red && !fg.is_empty() && !matched_span_has_red(screen_text, matched, fg)
+        } else if high_fp {
+            !crate::state::patterns::in_error_line_excluding_input(
+                screen_text,
+                matched,
+                self.input_line_markers,
+            )
+        } else if usage_limit {
+            !crate::state::patterns::any_match_off_input_lines(
+                screen_text,
+                matched,
+                self.input_line_markers,
+            )
+        } else {
+            false
+        }
+    }
+
+    /// Gate 2b — position. Returns `true` when a HIGH_FP / UsageLimit marker has
+    /// scrolled out of the live bottom-N rows (e.g. an ApiError / ServerRateLimit
+    /// line pushed up by the post-recovery `continue` output) and is therefore
+    /// stale — the agent has moved on, so it must NOT keep re-firing the error
+    /// transition (the level-triggered re-match that drove the retry storm).
+    /// Scoped to HIGH_FP/error states ONLY: Idle and modal/interactive prompts
+    /// keep full-screen scanning, because a modal can legitimately sit above the
+    /// tail. #1955: UsageLimit joins the position gate — a banner quote buried in
+    /// deep scrollback is discussion, not a live limit (same staleness logic).
+    fn apply_position_gate(
+        &self,
+        matched: &str,
+        screen_text: &str,
+        high_fp: bool,
+        usage_limit: bool,
+    ) -> bool {
+        (high_fp || usage_limit)
+            && !matched_span_in_recent_tail(screen_text, matched, ERROR_TAIL_SCAN_LINES)
+    }
+
+    /// Suppression handler — a detection that failed the anchor/position gates is
+    /// treated as no detection: log why (anchor → #1450 observability,
+    /// otherwise → #1518 stale-position), then fall through to structural
+    /// fallback (Starting → InteractivePrompt on a generic startup prompt) or
+    /// latch maintenance.
+    fn handle_suppressed_detection(
+        &mut self,
+        detected: AgentState,
+        matched: &str,
+        screen_text: &str,
+        fg: &[CellFg],
+        anchor_fail: bool,
+    ) {
+        if anchor_fail {
+            self.log_anchor_suppress(detected, matched, screen_text, fg);
+        } else {
+            tracing::debug!(
+                target: "state_detection",
+                agent = %self.instance_name,
+                state = ?detected,
+                tail_rows = ERROR_TAIL_SCAN_LINES,
+                "#1518: HIGH_FP marker scrolled out of the live tail — suppressing stale error transition"
+            );
+        }
+        if matches!(self.current, AgentState::Starting) && is_generic_startup_prompt(screen_text) {
+            self.transition(AgentState::InteractivePrompt);
+        } else {
+            self.maybe_expire_latched_state();
+        }
+    }
+
+    /// No-raw-match handler (the `detect_with_match` → `None` arm).
+    ///
+    /// #SRL-phase2: hard-wrap fallback. Raw detection missed — which is exactly
+    /// what an Ink-hard-wrapped SRL/RateLimit line looks like (the phrase split
+    /// across rows by real `\n`). Retry on the flattened bottom-N tail before the
+    /// structural/expire path. Land via the SAME recovery gate as the raw SRL
+    /// path: recent productive output ⇒ recovered ⇒ Idle; else latch the throttle
+    /// so auto-retry fires. (working_state_below can't be located in the wrapped
+    /// raw text, so a hard-wrapped throttle with a working marker below is not
+    /// overridden here — accepted; `recovered_within` still releases a
+    /// genuinely-recovered pane.)
+    fn handle_no_raw_match(&mut self, patterns: &'static StatePatterns, screen_text: &str) {
+        if let Some(throttle) =
+            flattened_throttle_detect(patterns, screen_text, self.input_line_markers)
+        {
+            let landed = if matches!(throttle, AgentState::ServerRateLimit)
+                && self.recovered_within(SERVER_RATE_LIMIT_RECOVERY_SILENCE)
+            {
+                AgentState::Idle
+            } else {
+                throttle
+            };
+            let gated = self.gate_on_heartbeat(landed);
+            self.transition(gated);
+        } else if matches!(self.current, AgentState::Starting)
+            && is_generic_startup_prompt(screen_text)
+        {
+            // Starting-only structural fallback: a generic prompt token (y/n,
+            // press enter, …) at startup is almost certainly an operator dialog —
+            // flag InteractivePrompt immediately instead of waiting on the
+            // silence window.
+            self.transition(AgentState::InteractivePrompt);
+        } else {
+            self.maybe_expire_latched_state();
         }
     }
 
