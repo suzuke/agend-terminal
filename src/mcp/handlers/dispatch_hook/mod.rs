@@ -736,11 +736,20 @@ pub(crate) fn ensure_branch_exists(
             raw: None,
         });
     }
-    // #2010 (cheerc RCA): resolve which remote `from_ref` names ONCE and use it
-    // consistently at all three network sites below — they were hard-coded to
+    // #2010 (cheerc RCA): resolve which remote `from_ref` (the BASE ref) names
+    // ONCE, for the two BASE-ref network sites below — the pre-create fetch +
+    // create and its unresolved-ref fallback fetch. Those were hard-coded to
     // `origin`, so a fork / multi-remote `from_ref` (e.g. `upstream/main` via a
-    // free-form `repo checkout`) fetched/refreshed/fell-back against the wrong
-    // remote. `origin/<x>` stays byte-identical (resolve returns origin).
+    // free-form `repo checkout`) fetched the wrong remote. `origin/<x>` stays
+    // byte-identical (resolve returns origin).
+    //
+    // NOT the EXISTS-path refresh below (reviewer-2 #2047 scope fix): that
+    // refreshes the WORKING branch's remote-tracking ref, and the working
+    // branch lives on the PUSH remote — `origin` — NOT on `from_ref`'s base
+    // remote. Pointing it at `from_ref`'s remote would make a fork re-dispatch
+    // run `fetch upstream <work-branch>`, which fails (the work branch isn't on
+    // upstream) → the ref never refreshes → a stale SHA enters the lease = #869
+    // reopened on the fork path. The EXISTS path stays `origin`.
     let (remote, from_ref_branch) = resolve_from_ref_remote(source, from_ref);
     let branch_ref = format!("refs/heads/{branch}");
     let branch_exists =
@@ -770,13 +779,15 @@ pub(crate) fn ensure_branch_exists(
         // and the local ref is left untouched — dispatch then falls
         // through to lease with the existing local SHA, matching the
         // pre-fix behaviour for that edge case.
+        // #2047 scope fix: the WORKING branch lives on the push remote
+        // (`origin`), independent of `from_ref`'s base remote — keep origin here.
         let fetch_out = crate::git_helpers::git_bypass_timeout(
             source,
-            &["fetch", &remote, branch, "--quiet"],
+            &["fetch", "origin", branch, "--quiet"],
             crate::git_helpers::NETWORK_GIT_TIMEOUT,
         );
         let fetched_ok = matches!(&fetch_out, Ok(o) if o.status.success());
-        let remote_branch_ref = format!("refs/remotes/{remote}/{branch}");
+        let remote_branch_ref = format!("refs/remotes/origin/{branch}");
         let remote_exists =
             crate::git_helpers::git_bypass(source, &["rev-parse", "--verify", &remote_branch_ref])
                 .map(|o| o.status.success())

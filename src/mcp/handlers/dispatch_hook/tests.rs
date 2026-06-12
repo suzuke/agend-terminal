@@ -2790,3 +2790,105 @@ fn ensure_branch_exists_creates_from_non_origin_remote_2010() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// #2047 (reviewer-2 scope fix): the EXISTS-path refresh targets the WORKING
+/// branch's remote (`origin`, the push remote), NOT `from_ref`'s base remote.
+/// With a non-origin `from_ref` (`upstream/main`) and an already-existing work
+/// branch that lives on origin, the refresh must still fetch ORIGIN and
+/// fast-forward the stale local ref — if it (wrongly) fetched upstream, the
+/// work branch isn't there, the ref stays stale, and #869 reopens on forks.
+#[test]
+fn ensure_branch_exists_refresh_uses_origin_not_from_ref_remote_2047() {
+    let home = std::env::temp_dir().join(format!("agend-2047-exists-{}", std::process::id()));
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::create_dir_all(&home).ok();
+    let workspace = crate::paths::workspace_dir(&home);
+    std::fs::create_dir_all(&workspace).ok();
+    let origin = workspace.join("o.git");
+    let upstream = workspace.join("up.git");
+    let repo = workspace.join("agent");
+
+    let git = |args: &[&str], dir: &std::path::Path| -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git spawn");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    std::fs::create_dir_all(&origin).ok();
+    git(&["init", "--bare", "-b", "main"], &origin);
+    std::fs::create_dir_all(&upstream).ok();
+    git(&["init", "--bare", "-b", "main"], &upstream);
+    std::fs::create_dir_all(&repo).ok();
+    git(&["init", "-b", "main"], &repo);
+    git(
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+        &repo,
+    );
+    git(
+        &["remote", "add", "upstream", upstream.to_str().unwrap()],
+        &repo,
+    );
+
+    // A work branch that lives on ORIGIN: create + push at A, then advance
+    // origin's copy to B and force the LOCAL tracking ref stale back to A.
+    git(
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "A",
+        ],
+        &repo,
+    );
+    git(&["branch", "feat/w"], &repo);
+    git(&["push", "-q", "origin", "feat/w"], &repo);
+    let sha_a = git(&["rev-parse", "feat/w"], &repo);
+    git(&["checkout", "-q", "feat/w"], &repo);
+    git(
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "B",
+        ],
+        &repo,
+    );
+    let sha_b = git(&["rev-parse", "HEAD"], &repo);
+    git(&["push", "-q", "origin", "feat/w"], &repo);
+    // Force BOTH the local branch and its origin tracking ref stale to A.
+    git(&["checkout", "-q", "main"], &repo);
+    git(&["branch", "-f", "feat/w", &sha_a], &repo);
+    git(&["update-ref", "refs/remotes/origin/feat/w", &sha_a], &repo);
+    assert_ne!(sha_a, sha_b);
+
+    // EXISTS path with a NON-ORIGIN from_ref. The refresh must fetch origin
+    // (where feat/w lives) and fast-forward the local ref to B.
+    let (created, _fetched) =
+        super::ensure_branch_exists(&home, &repo, "feat/w", "upstream/main", "agent")
+            .expect("ensure_branch_exists must succeed on the EXISTS path");
+    assert!(!created, "branch already existed");
+    assert_eq!(
+        git(&["rev-parse", "feat/w"], &repo),
+        sha_b,
+        "EXISTS-path refresh must advance the work branch via ORIGIN (its push \
+         remote), not from_ref's upstream — else #869 reopens on forks"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
