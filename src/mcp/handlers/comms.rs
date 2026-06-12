@@ -224,7 +224,7 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
             return json!({
                 "busy": true,
                 "current_task": {"id": current.id, "title": current.title, "age_seconds": age_secs},
-                "options": ["force=true (with force_reason)", "queue=true"],
+                "options": ["force=true (with force_reason)"],
                 "suggestion": format!("target busy on task {} ({}s old). Use force=true with force_reason to override.", current.id, age_secs)
             });
         }

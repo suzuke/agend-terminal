@@ -44,6 +44,16 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
     }
 }
 
+/// #2037 (3): `id` is canonical, `task_id` accepted as alias — `send` calls it
+/// `task_id`, so the most common cross-tool slip is forgiving. Error messages
+/// name both.
+fn id_arg(args: &Value) -> Option<&str> {
+    args["id"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .or_else(|| args["task_id"].as_str().filter(|s| !s.is_empty()))
+}
+
 fn handle_create(home: &Path, emitter: crate::task_events::InstanceName, args: &Value) -> Value {
     let title = match args["title"].as_str() {
         Some(t) => t,
@@ -138,9 +148,17 @@ fn handle_create(home: &Path, emitter: crate::task_events::InstanceName, args: &
 }
 
 fn handle_list(home: &Path, args: &Value) -> Value {
-    let filter_assignee = args["filter_assignee"].as_str();
-    let filter_status = args["filter_status"].as_str();
-    let filter_tag = args["filter_tag"].as_str();
+    // #2037 ①: accept the natural names as aliases of the filter_* params —
+    // `status`/`assignee` are create/update params elsewhere, but on the
+    // `list` action they can only mean filtering (three real mis-calls in
+    // one day by the heaviest caller). filter_* stays canonical.
+    let filter_assignee = args["filter_assignee"]
+        .as_str()
+        .or_else(|| args["assignee"].as_str());
+    let filter_status = args["filter_status"]
+        .as_str()
+        .or_else(|| args["status"].as_str());
+    let filter_tag = args["filter_tag"].as_str().or_else(|| args["tag"].as_str());
     // #806: default trim to actionable statuses unless caller
     // opts in to history. `filtered_default=true` on the
     // response signals callers (audit / forensics) that the
@@ -201,9 +219,9 @@ fn handle_claim(
     emitter: crate::task_events::InstanceName,
     args: &Value,
 ) -> Value {
-    let id = match args["id"].as_str() {
+    let id = match id_arg(args) {
         Some(i) => i.to_string(),
-        None => return serde_json::json!({"error": "missing 'id'"}),
+        None => return serde_json::json!({"error": "missing 'id' (alias: task_id)"}),
     };
     let iname = instance_name.to_string();
     if !instance_exists(home, &iname) {
@@ -274,9 +292,9 @@ fn handle_done(
     emitter: crate::task_events::InstanceName,
     args: &Value,
 ) -> Value {
-    let id = match args["id"].as_str() {
+    let id = match id_arg(args) {
         Some(i) => i.to_string(),
-        None => return serde_json::json!({"error": "missing 'id'"}),
+        None => return serde_json::json!({"error": "missing 'id' (alias: task_id)"}),
     };
     let result_text = args["result"].as_str().map(String::from);
     let caller = instance_name.to_string();
@@ -447,9 +465,9 @@ fn handle_update(
     emitter: crate::task_events::InstanceName,
     args: &Value,
 ) -> Value {
-    let id = match args["id"].as_str() {
+    let id = match id_arg(args) {
         Some(i) => i.to_string(),
-        None => return serde_json::json!({"error": "missing 'id'"}),
+        None => return serde_json::json!({"error": "missing 'id' (alias: task_id)"}),
     };
     let new_status = args["status"].as_str().map(String::from);
     let new_priority = args["priority"].as_str();
@@ -859,9 +877,9 @@ fn handle_health(home: &Path) -> Value {
 }
 
 fn handle_activity(home: &Path, args: &Value) -> Value {
-    let task_id = match args["id"].as_str().filter(|s| !s.is_empty()) {
+    let task_id = match id_arg(args) {
         Some(id) => id,
-        None => return serde_json::json!({"error": "missing 'id'"}),
+        None => return serde_json::json!({"error": "missing 'id' (alias: task_id)"}),
     };
     activity_timeline(home, task_id)
 }
@@ -872,9 +890,9 @@ fn handle_metadata_set(
     emitter: crate::task_events::InstanceName,
     args: &Value,
 ) -> Value {
-    let id = match args["id"].as_str() {
+    let id = match id_arg(args) {
         Some(i) => i,
-        None => return serde_json::json!({"error": "missing 'id'"}),
+        None => return serde_json::json!({"error": "missing 'id' (alias: task_id)"}),
     };
     let key = match args["metadata_key"].as_str() {
         Some(k) => k,
@@ -911,9 +929,9 @@ fn handle_metadata_set(
 }
 
 fn handle_metadata_get(home: &Path, args: &Value) -> Value {
-    let id = match args["id"].as_str() {
+    let id = match id_arg(args) {
         Some(i) => i,
-        None => return serde_json::json!({"error": "missing 'id'"}),
+        None => return serde_json::json!({"error": "missing 'id' (alias: task_id)"}),
     };
     match read_task_record(home, id) {
         Some(r) => {

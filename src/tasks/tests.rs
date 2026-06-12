@@ -2951,3 +2951,73 @@ fn activity_timeline_returns_events_for_task() {
     assert_eq!(events[1]["actor"].as_str(), Some("dev"));
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ── #2037: param aliases + list filter aliases ──
+
+/// #2037 (3): `task_id` accepted wherever `id` is canonical (send calls it
+/// task_id — the highest-frequency cross-tool slip).
+#[test]
+fn task_id_alias_accepted_2037() {
+    let home = tmp_home("2037-id-alias");
+    let create = crate::tasks::handle(
+        &home,
+        "lead",
+        &serde_json::json!({"action": "create", "title": "t"}),
+    );
+    let id = create["task"]["id"].as_str().expect("created").to_string();
+    let claimed = crate::tasks::handle(
+        &home,
+        "dev",
+        &serde_json::json!({"action": "claim", "task_id": id}),
+    );
+    assert_eq!(
+        claimed["event"].as_str(),
+        Some("claimed"),
+        "task_id alias must work for claim: {claimed}"
+    );
+    // Missing both → error names the alias.
+    let err = crate::tasks::handle(&home, "dev", &serde_json::json!({"action": "claim"}));
+    assert!(
+        err["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("alias: task_id"),
+        "error must teach the alias: {err}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2037 (1): `status`/`assignee` accepted as list-filter aliases of
+/// `filter_status`/`filter_assignee`.
+#[test]
+fn list_filter_aliases_2037() {
+    let home = tmp_home("2037-list-alias");
+    for (t, who) in [("a", "alice"), ("b", "bob")] {
+        let c = crate::tasks::handle(
+            &home,
+            "lead",
+            &serde_json::json!({"action": "create", "title": t, "assignee": who}),
+        );
+        assert!(c["task"]["id"].is_string(), "{c}");
+    }
+    let by_alias = crate::tasks::handle(
+        &home,
+        "lead",
+        &serde_json::json!({"action": "list", "assignee": "alice"}),
+    );
+    let tasks = by_alias["tasks"].as_array().expect("tasks array");
+    assert_eq!(tasks.len(), 1, "assignee alias filters: {by_alias}");
+    assert_eq!(tasks[0]["assignee"].as_str(), Some("alice"));
+
+    let by_status = crate::tasks::handle(
+        &home,
+        "lead",
+        &serde_json::json!({"action": "list", "status": "open"}),
+    );
+    assert_eq!(
+        by_status["tasks"].as_array().expect("array").len(),
+        2,
+        "status alias filters: {by_status}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
