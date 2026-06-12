@@ -463,7 +463,13 @@ pub fn global() -> &'static DedupCache {
 /// this map degrades to a longer-than-needed wait rather than a panic
 /// or hang.
 pub fn method_wait_timeout(method: &str, params: &Value) -> Duration {
+    use crate::api::handlers::mcp_proxy::{
+        DEFAULT_TOOL_TIMEOUT, FAST_TOOL_TIMEOUT, SLOW_TOOL_TIMEOUT,
+    };
     use crate::api::method as m;
+    // #2050 W1.3①: the band durations are the SAME 5s/30s/60s bands
+    // `mcp_proxy::tool_timeout` uses — reference the shared constants rather
+    // than re-hardcoding `from_secs(..)` so the two budgets can't drift.
     match method {
         // Fast read-only / atomic-flip operations.
         m::LIST
@@ -475,10 +481,10 @@ pub fn method_wait_timeout(method: &str, params: &Value) -> Duration {
         | m::CLEAR_BLOCKED_REASON
         | m::REGISTER_EXTERNAL
         | m::DEREGISTER_EXTERNAL
-        | m::MOVE_PANE => Duration::from_secs(5),
+        | m::MOVE_PANE => FAST_TOOL_TIMEOUT,
 
         // Slow operations that spawn processes / write a lot of state.
-        m::SPAWN | m::CREATE_TEAM | m::UPDATE_TEAM => Duration::from_secs(60),
+        m::SPAWN | m::CREATE_TEAM | m::UPDATE_TEAM => SLOW_TOOL_TIMEOUT,
 
         // `mcp_tool` dispatches the actual tool inside the daemon with
         // its OWN per-tool budget (see `mcp_proxy::tool_timeout`).
@@ -491,7 +497,7 @@ pub fn method_wait_timeout(method: &str, params: &Value) -> Duration {
 
         // Middle band — covers `send`, `inject`, `kill`, `delete`,
         // `verify_push`, and any future method not yet classified.
-        m::SEND | m::INJECT | m::KILL | m::DELETE | m::VERIFY_PUSH => Duration::from_secs(30),
+        m::SEND | m::INJECT | m::KILL | m::DELETE | m::VERIFY_PUSH => DEFAULT_TOOL_TIMEOUT,
 
         // Unknown / unmapped — fall back to the conservative default.
         _ => DEFAULT_WAIT_TIMEOUT,

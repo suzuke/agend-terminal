@@ -11,29 +11,59 @@ use std::time::Duration;
 
 use super::HandlerCtx;
 
-/// Per-tool timeout in milliseconds. Fast read-only tools get a short
-/// timeout; slow spawn/deploy tools get a longer one.
+/// Per-tool dispatch timeout bands. Fast read-only / atomic-flip tools get a
+/// short budget; tools with a process-spawning / network action get the long
+/// upper-bound budget. Per-tool granularity (no per-action timeout — YAGNI):
+/// a multi-action tool like `repo` or `deployment` takes its SLOWEST action's
+/// band, which is a harmless upper bound for its fast actions.
 ///
-/// Made `pub(crate)` for `request_dedup::method_wait_timeout` to reuse
-/// the same mapping when the API method is `mcp_tool` — shared source
-/// of truth keeps the dispatch budget and the dedup wait budget in lock-step.
+/// The band constants are `pub(crate)` so `request_dedup::method_wait_timeout`
+/// reuses them — one source of truth keeps the dispatch budget and the dedup
+/// wait budget in lock-step.
+pub(crate) const FAST_TOOL_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const SLOW_TOOL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Fast read-only / atomic-flip tools (~5s). Every name is a registered MCP
+/// tool — `tool_timeout_keys_are_registered_tools` pins this against
+/// `registry::all()` so a consolidation/rename can't silently leave a stale
+/// (never-matching) entry here again.
+const FAST_TOOLS: &[&str] = &[
+    "inbox",
+    "list_instances",
+    "set_waiting_on",
+    "set_display_name",
+    "set_description",
+    "health",
+];
+
+/// Tools whose slowest action spawns a process / does network I/O (~60s).
+///
+/// #2050 W1.3①: `deployment` / `ci` / `repo` are the action-consolidated
+/// successors of the old `deploy_template` / `watch_ci` / `checkout_repo`
+/// names. Those stale names stopped matching after the consolidation, so these
+/// genuinely-long operations (deploy, CI watch, repo checkout/merge) were
+/// silently falling back to the 30s default — a false-timeout risk this fix
+/// closes. #1814: `restart_daemon` spawns a successor + runs a ≤30s Phase-1
+/// gate. `team` (create) spawns agents like `create_instance` (and mirrors the
+/// `method_wait_timeout` CREATE_TEAM 60s band).
+const SLOW_TOOLS: &[&str] = &[
+    "create_instance",
+    "replace_instance",
+    "restart_daemon",
+    "deployment",
+    "ci",
+    "repo",
+    "team",
+];
+
 pub(crate) fn tool_timeout(tool: &str) -> Duration {
-    match tool {
-        // Fast read-only tools (~5s)
-        "inbox" | "describe_message" | "describe_thread" | "list_instances"
-        | "describe_instance" | "list_teams" | "list_decisions" | "list_schedules"
-        | "list_deployments" | "set_waiting_on" | "set_display_name" | "set_description"
-        | "react" | "report_health" => Duration::from_secs(5),
-
-        // Slow tools that spawn processes or do network I/O (~60s).
-        // #1814: restart_daemon (self-respawn) spawns a successor + runs a
-        // ≤30s Phase-1 health gate before returning — give it the 60s budget so
-        // the gate can't collide with the default 30s tool timeout.
-        "create_instance" | "deploy_template" | "replace_instance" | "watch_ci"
-        | "checkout_repo" | "restart_daemon" => Duration::from_secs(60),
-
-        // Default for everything else (~30s)
-        _ => Duration::from_secs(30),
+    if FAST_TOOLS.contains(&tool) {
+        FAST_TOOL_TIMEOUT
+    } else if SLOW_TOOLS.contains(&tool) {
+        SLOW_TOOL_TIMEOUT
+    } else {
+        DEFAULT_TOOL_TIMEOUT
     }
 }
 
@@ -208,20 +238,46 @@ mod tests {
     fn fast_tools_get_short_timeout() {
         assert_eq!(tool_timeout("inbox"), Duration::from_secs(5));
         assert_eq!(tool_timeout("list_instances"), Duration::from_secs(5));
-        assert_eq!(tool_timeout("describe_message"), Duration::from_secs(5));
+        assert_eq!(tool_timeout("health"), Duration::from_secs(5));
     }
 
     #[test]
     fn slow_tools_get_long_timeout() {
         assert_eq!(tool_timeout("create_instance"), Duration::from_secs(60));
-        assert_eq!(tool_timeout("deploy_template"), Duration::from_secs(60));
+        // #2050 W1.3①: the action-consolidated successors of the old stale
+        // names (deploy_template / watch_ci / checkout_repo) — these were the
+        // false-timeout bug (long ops silently getting the 30s default).
+        assert_eq!(tool_timeout("deployment"), Duration::from_secs(60));
+        assert_eq!(tool_timeout("ci"), Duration::from_secs(60));
+        assert_eq!(tool_timeout("repo"), Duration::from_secs(60));
     }
 
     #[test]
     fn default_tools_get_30s() {
-        assert_eq!(tool_timeout("send_to_instance"), Duration::from_secs(30));
-        assert_eq!(tool_timeout("delegate_task"), Duration::from_secs(30));
+        assert_eq!(tool_timeout("send"), Duration::from_secs(30));
+        assert_eq!(tool_timeout("task"), Duration::from_secs(30));
         assert_eq!(tool_timeout("unknown_tool"), Duration::from_secs(30));
+    }
+
+    /// #2050 W1.3① coverage invariant: every tool the timeout map classifies
+    /// MUST be a registered MCP tool. This is the closure that prevents the
+    /// stale-name drift this PR fixed (`deploy_template`/`watch_ci`/
+    /// `checkout_repo`/`describe_*`/`list_*`/`react`/`report_health` had all
+    /// gone stale after consolidation, silently degrading their tools to the
+    /// 30s default). A future rename/removal now fails CI here instead.
+    #[test]
+    fn tool_timeout_keys_are_registered_tools() {
+        use std::collections::HashSet;
+        let registered: HashSet<&str> =
+            crate::mcp::registry::all().iter().map(|t| t.name).collect();
+        for &t in FAST_TOOLS.iter().chain(SLOW_TOOLS.iter()) {
+            assert!(
+                registered.contains(t),
+                "tool_timeout classifies '{t}' but it is not a registered MCP tool \
+                 (registry::all) — stale after a tool consolidation/rename? Update the \
+                 name (or add a documented retired-allowlist). #2050 W1.3①"
+            );
+        }
     }
 
     // ── R3#1 candidate 2: timeout → accepted_in_progress for side-effect tools ──
