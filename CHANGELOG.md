@@ -3,7 +3,7 @@
 All notable changes to this project are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); project follows [SemVer](https://semver.org/spec/v2.0.0.html).
 
-## [0.8.0] — Unreleased
+## [0.8.0] — 2026-06-12
 
 ### Changed
 
@@ -560,7 +560,7 @@ Substantial work has landed on `main` since `0.3.0`. Highlights, grouped by area
 
 ---
 
-[0.8.0]: https://github.com/suzuke/agend-terminal/compare/v0.7.0...HEAD
+[0.8.0]: https://github.com/suzuke/agend-terminal/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/suzuke/agend-terminal/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/suzuke/agend-terminal/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/suzuke/agend-terminal/compare/v0.5.0...v0.6.0
