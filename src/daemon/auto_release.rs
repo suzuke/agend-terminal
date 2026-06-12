@@ -261,34 +261,55 @@ fn releasable_by_invariant(home: &Path, repo: &str, branch: &str) -> (bool, PrCo
     (releasable, confidence)
 }
 
+/// True iff `role` (the verdict sender's resolved fleet.yaml role) is a reviewer
+/// role. Structural — sourced from the operator-set `role:` config, never from
+/// message text. Matches both role shapes in use: the short fixup-team tag
+/// (`reviewer`) and the descriptive template role (`Code reviewer — independent
+/// review…`), via a case-insensitive `"review"` substring. Implementer
+/// (`Implementer — …` / `null`) and orchestrator roles never contain it.
+fn is_reviewer_role(role: Option<&str>) -> bool {
+    role.map(|r| r.to_lowercase().contains("review"))
+        .unwrap_or(false)
+}
+
 /// #2010 2a: the reviewer-binding-release bypass. A reviewer that ran a full
 /// (worktree-align) inspection binds to the branch; once it submits a terminal
 /// verdict AND its review task is terminal, its binding must be released even
 /// though the PR is still open — otherwise `releasable_by_invariant`'s open-PR
 /// gate holds the binding to PR-terminal and the lead's rework re-dispatch hits
 /// a lease conflict. This bypass is the ONLY way the open-PR invariant is
-/// skipped, and it is scoped with three independent conditions so it can never
+/// skipped, and it is scoped with FOUR independent conditions so it can never
 /// release an implementer's worktree (which legitimately waits for the terminal
 /// PR per t-worktree-leak PR-1):
 ///
 ///   1. the intent was enqueued by a terminal verdict (`event_kind == "verdict"`);
 ///   2. the bound agent IS the verdict sender (`intent.reviewer == assignee`) —
-///      the structural reviewer-vs-implementer discriminator. The intent is
-///      keyed to the review task whose assignee is the reviewer, so a verdict
-///      correlated to anyone else's task (assignee ≠ sender) is NOT bypassed;
-///   3. the review task itself is terminal (Done | Cancelled).
+///      scopes the release strictly to the verdict-sender's own binding;
+///   3. the review task itself is terminal (Done | Cancelled);
+///   4. the verdict sender's fleet ROLE is a reviewer (`is_reviewer_role`).
 ///
-/// Cleanliness (the lead's third condition) is enforced downstream by
+/// #2010 codex-r1: condition 2 alone is NOT a reviewer-vs-implementer
+/// discriminator — an IMPLEMENTER that opens a report with "VERIFIED" on its
+/// OWN task satisfies `intent.reviewer == assignee` (self-verdict), and the
+/// #1228 reporter==assignee auto-close marks that task Done in the SAME message,
+/// so conditions 1–3 all pass and the implementer's binding would release on an
+/// open PR. Condition 4 (the structural fleet-role gate) closes that hole: an
+/// implementer's role never reads as a reviewer, so its self-verdict never
+/// bypasses. `sender_role` is resolved by the caller from fleet.yaml.
+///
+/// Cleanliness (the lead's clean-only condition) is enforced downstream by
 /// [`decide_release`]'s `SkipDirtyWorktree` arm: a dirty reviewer worktree
 /// retries (binding held) rather than releasing, protecting in-flight review WIP.
 fn reviewer_binding_release_bypass(
     intent: &AutoReleaseIntent,
     task: Option<&crate::tasks::Task>,
     assignee: &str,
+    sender_role: Option<&str>,
 ) -> bool {
     use crate::task_events::TaskStatus;
     intent.event_kind.as_deref() == Some("verdict")
         && intent.reviewer == assignee
+        && is_reviewer_role(sender_role)
         && matches!(
             task.map(|t| &t.status),
             Some(TaskStatus::Done | TaskStatus::Cancelled)
@@ -574,10 +595,19 @@ fn process_intent(home: &Path, intent: &AutoReleaseIntent) -> IntentOutcome {
         // it must NOT hold a REVIEWER's binding once the reviewer's own review
         // task is terminal — that leaks the binding and makes the lead's rework
         // re-dispatch hit a lease conflict. Bypass the invariant ONLY for the
-        // verdict-sender's own binding with its review task terminal; the dirty
-        // gate below still protects review WIP (dirty → retry, not release).
-        if reviewer_binding_release_bypass(intent, task.as_ref(), &assignee) {
-            tracing::info!(agent = %assignee, repo = %repo, branch = %branch, event, ?confidence, "auto_release: reviewer-binding bypass — verdict sent + review task terminal, releasing if clean (#2010 2a)");
+        // verdict-sender's own binding when it is a REVIEWER (fleet role) with
+        // its review task terminal; the dirty gate below still protects review
+        // WIP (dirty → retry, not release). The role gate (#2010 codex-r1) is
+        // the structural reviewer-vs-implementer discriminator that stops an
+        // implementer's self-"VERIFIED" + #1228 auto-close from releasing its
+        // own binding on an open PR.
+        let sender_role = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+            .ok()
+            .and_then(|f| f.resolve_instance(&assignee))
+            .and_then(|r| r.role);
+        if reviewer_binding_release_bypass(intent, task.as_ref(), &assignee, sender_role.as_deref())
+        {
+            tracing::info!(agent = %assignee, repo = %repo, branch = %branch, event, ?confidence, role = ?sender_role, "auto_release: reviewer-binding bypass — reviewer verdict + review task terminal, releasing if clean (#2010 2a)");
         } else {
             tracing::debug!(agent = %assignee, repo = %repo, branch = %branch, event, ?confidence, "auto_release: invariant not yet satisfied — retaining for retry");
             return IntentOutcome::Retry;
@@ -852,61 +882,128 @@ mod tests {
         );
     }
 
-    /// #2010 2a §3.9 — the reviewer-binding release bypass: all three conditions
-    /// (verdict intent + bound agent IS the verdict sender + review task
-    /// terminal) must hold; dropping any one keeps the binding (no bypass).
+    /// #2010 2a §3.9 — the reviewer-binding release bypass: all FOUR conditions
+    /// (verdict intent + bound agent IS the verdict sender + reviewer fleet role
+    /// + review task terminal) must hold; dropping any one keeps the binding.
     #[test]
-    fn reviewer_binding_bypass_requires_all_three_conditions_2010() {
+    fn reviewer_binding_bypass_requires_all_four_conditions_2010() {
         use crate::task_events::TaskStatus;
         let mut intent = sample_intent("t-rev");
         intent.event_kind = Some("verdict".to_string());
         intent.reviewer = "reviewer-1".to_string();
+        let rev = Some("reviewer"); // fleet role of the verdict sender
 
         let mut done_task = sample_task("t-rev", Some("reviewer-1"));
         done_task.status = TaskStatus::Done;
-        // All three hold → bypass (REJECTED/UNVERIFIED/VERIFIED all enqueue a
+        // All four hold → bypass (REJECTED/UNVERIFIED/VERIFIED all enqueue a
         // "verdict" intent, so the kind is irrelevant here).
         assert!(
-            reviewer_binding_release_bypass(&intent, Some(&done_task), "reviewer-1"),
-            "all three conditions → bypass the open-PR invariant"
+            reviewer_binding_release_bypass(&intent, Some(&done_task), "reviewer-1", rev),
+            "all four conditions → bypass the open-PR invariant"
         );
-        // Cancelled is also terminal.
+        // Cancelled is also terminal; descriptive template role still counts.
         let mut cancelled = done_task.clone();
         cancelled.status = TaskStatus::Cancelled;
         assert!(
-            reviewer_binding_release_bypass(&intent, Some(&cancelled), "reviewer-1"),
-            "cancelled review task is terminal → bypass"
+            reviewer_binding_release_bypass(
+                &intent,
+                Some(&cancelled),
+                "reviewer-1",
+                Some("Code reviewer — independent review")
+            ),
+            "cancelled review task + descriptive reviewer role → bypass"
         );
 
         // (1) not a verdict intent (merge/task_done event) → no bypass.
         let mut merge_intent = intent.clone();
         merge_intent.event_kind = Some("merge".to_string());
         assert!(
-            !reviewer_binding_release_bypass(&merge_intent, Some(&done_task), "reviewer-1"),
+            !reviewer_binding_release_bypass(&merge_intent, Some(&done_task), "reviewer-1", rev),
             "non-verdict event must not bypass (only the verdict-sender path does)"
         );
 
-        // (2) bound agent is NOT the verdict sender → no bypass. This is the
-        // implementer-protection gate: an intent whose bound agent differs from
-        // the verdict sender (e.g. correlated to the dev's task) keeps the
-        // PR-terminal wait untouched.
+        // (2) bound agent is NOT the verdict sender → no bypass.
         assert!(
-            !reviewer_binding_release_bypass(&intent, Some(&done_task), "dev-implementer"),
-            "implementer binding (assignee != verdict sender) must NOT bypass"
+            !reviewer_binding_release_bypass(&intent, Some(&done_task), "other-agent", rev),
+            "binding whose agent != verdict sender must NOT bypass"
         );
 
-        // (3) review task not terminal (still claimed/in_review) → no bypass yet
-        // (the sweeper retries until the reviewer's task closes).
+        // (4) verdict sender's role is NOT a reviewer → no bypass. This is the
+        // #2010 codex-r1 gate: an implementer's self-verdict never bypasses.
+        assert!(
+            !reviewer_binding_release_bypass(&intent, Some(&done_task), "reviewer-1", None),
+            "no role → not a reviewer → no bypass"
+        );
+        assert!(
+            !reviewer_binding_release_bypass(
+                &intent,
+                Some(&done_task),
+                "reviewer-1",
+                Some("Implementer — build features")
+            ),
+            "implementer role must NOT bypass"
+        );
+
+        // (3) review task not terminal (still claimed/in_review) → no bypass yet.
         let claimed = sample_task("t-rev", Some("reviewer-1")); // default Claimed
         assert!(
-            !reviewer_binding_release_bypass(&intent, Some(&claimed), "reviewer-1"),
+            !reviewer_binding_release_bypass(&intent, Some(&claimed), "reviewer-1", rev),
             "non-terminal review task must not bypass (retry until done)"
         );
         // Missing task → no bypass.
         assert!(
-            !reviewer_binding_release_bypass(&intent, None, "reviewer-1"),
+            !reviewer_binding_release_bypass(&intent, None, "reviewer-1", rev),
             "missing task must not bypass"
         );
+    }
+
+    /// #2010 codex-r1 §3.9 — the implementer self-verdict EXPLOIT must not
+    /// bypass. An implementer opens a report with "VERIFIED" on its OWN task
+    /// (correlation = own task); the #1228 reporter==assignee auto-close marks
+    /// that task Done in the same message — so conditions 1 (verdict intent),
+    /// 2 (`intent.reviewer == assignee`, since the implementer verdicts its own
+    /// task) and 3 (task Done) ALL hold. Only condition 4 (the fleet role gate)
+    /// stops the implementer's binding from releasing on an open PR.
+    #[test]
+    fn implementer_self_verdict_does_not_bypass_2010_r1() {
+        use crate::task_events::TaskStatus;
+        let mut intent = sample_intent("t-dev");
+        intent.event_kind = Some("verdict".to_string());
+        intent.reviewer = "dev-1".to_string(); // the verdict SENDER is the implementer
+
+        let mut self_done = sample_task("t-dev", Some("dev-1")); // own task, assignee == sender
+        self_done.status = TaskStatus::Done; // #1228 auto-closed it
+
+        // Conditions 1–3 all hold (the exploit shape). Role gate must veto it.
+        assert!(
+            !reviewer_binding_release_bypass(&intent, Some(&self_done), "dev-1", None),
+            "implementer self-verdict (no reviewer role) must NOT release its own \
+             binding on an open PR"
+        );
+        assert!(
+            !reviewer_binding_release_bypass(
+                &intent,
+                Some(&self_done),
+                "dev-1",
+                Some("Implementer — build features, run tests")
+            ),
+            "implementer role string must NOT satisfy the reviewer gate"
+        );
+    }
+
+    /// `is_reviewer_role` matches both fleet-team and template role shapes, and
+    /// rejects implementer / orchestrator / absent roles.
+    #[test]
+    fn is_reviewer_role_matches_both_shapes_2010_r1() {
+        assert!(is_reviewer_role(Some("reviewer")), "fixup-team short tag");
+        assert!(
+            is_reviewer_role(Some("Code reviewer — independent review")),
+            "template descriptive role"
+        );
+        assert!(is_reviewer_role(Some("REVIEWER")), "case-insensitive");
+        assert!(!is_reviewer_role(Some("Implementer — build features")));
+        assert!(!is_reviewer_role(Some("Team orchestrator — dispatch")));
+        assert!(!is_reviewer_role(None), "no role → not a reviewer");
     }
 
     /// `enqueue_intent` is atomic: temp file is renamed into place;
