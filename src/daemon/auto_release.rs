@@ -261,6 +261,40 @@ fn releasable_by_invariant(home: &Path, repo: &str, branch: &str) -> (bool, PrCo
     (releasable, confidence)
 }
 
+/// #2010 2a: the reviewer-binding-release bypass. A reviewer that ran a full
+/// (worktree-align) inspection binds to the branch; once it submits a terminal
+/// verdict AND its review task is terminal, its binding must be released even
+/// though the PR is still open — otherwise `releasable_by_invariant`'s open-PR
+/// gate holds the binding to PR-terminal and the lead's rework re-dispatch hits
+/// a lease conflict. This bypass is the ONLY way the open-PR invariant is
+/// skipped, and it is scoped with three independent conditions so it can never
+/// release an implementer's worktree (which legitimately waits for the terminal
+/// PR per t-worktree-leak PR-1):
+///
+///   1. the intent was enqueued by a terminal verdict (`event_kind == "verdict"`);
+///   2. the bound agent IS the verdict sender (`intent.reviewer == assignee`) —
+///      the structural reviewer-vs-implementer discriminator. The intent is
+///      keyed to the review task whose assignee is the reviewer, so a verdict
+///      correlated to anyone else's task (assignee ≠ sender) is NOT bypassed;
+///   3. the review task itself is terminal (Done | Cancelled).
+///
+/// Cleanliness (the lead's third condition) is enforced downstream by
+/// [`decide_release`]'s `SkipDirtyWorktree` arm: a dirty reviewer worktree
+/// retries (binding held) rather than releasing, protecting in-flight review WIP.
+fn reviewer_binding_release_bypass(
+    intent: &AutoReleaseIntent,
+    task: Option<&crate::tasks::Task>,
+    assignee: &str,
+) -> bool {
+    use crate::task_events::TaskStatus;
+    intent.event_kind.as_deref() == Some("verdict")
+        && intent.reviewer == assignee
+        && matches!(
+            task.map(|t| &t.status),
+            Some(TaskStatus::Done | TaskStatus::Cancelled)
+        )
+}
+
 /// Outcome of [`decide_release`] — pure helper unit-tested without
 /// touching disk / subprocess. The tracker dispatches by variant; the
 /// `Skip` variants distinguish operator-visible reasons in the audit
@@ -340,13 +374,31 @@ pub(crate) fn enqueue_intent(home: &Path, intent: &AutoReleaseIntent) -> std::io
     Ok(())
 }
 
-/// Predicate helper used by the `handle_send` hook to decide whether
-/// the message represents an actionable VERIFIED verdict. Pulled out
-/// so the unit test can assert the matching contract without spinning
-/// up the full handler stack.
+/// The three terminal review verdicts. A reviewer's report opens with exactly
+/// one of these (§3.12 / #1666 §3.3). True iff `text` (already the message body)
+/// begins with one of them.
+pub(crate) fn is_terminal_verdict_text(text: &str) -> bool {
+    let t = text.trim_start();
+    t.starts_with("VERIFIED") || t.starts_with("REJECTED") || t.starts_with("UNVERIFIED")
+}
+
+/// Predicate helper used by the `handle_send` hook to decide whether the
+/// message represents an actionable terminal verdict that should enqueue a
+/// release intent. Pulled out so the unit test can assert the matching
+/// contract without spinning up the full handler stack.
+///
+/// #2010 2a: widened from `VERIFIED`-only to ALL THREE terminal verdicts. A
+/// REJECTED / UNVERIFIED reviewer holds the same kind of worktree binding (from
+/// a worktree-align inspection) and must be able to release it the same way once
+/// their review task is terminal — pre-fix the non-VERIFIED cases never even
+/// enqueued an intent, so `releasable_by_invariant`'s open-PR gate held the
+/// reviewer's binding to PR-terminal (the lease-conflict the lead re-dispatch
+/// then hit). The `reviewed_head` gate is kept: we only ever release a binding
+/// tied to an actually-reviewed head (UNVERIFIED that couldn't run/cite carries
+/// no head and never worktree-aligned, so there is no binding to leak).
 pub(crate) fn is_verdict_message(msg: &crate::inbox::InboxMessage) -> bool {
     msg.kind.as_deref() == Some("report")
-        && msg.text.trim_start().starts_with("VERIFIED")
+        && is_terminal_verdict_text(&msg.text)
         && msg.reviewed_head.is_some()
         && msg.correlation_id.is_some()
 }
@@ -517,8 +569,19 @@ fn process_intent(home: &Path, intent: &AutoReleaseIntent) -> IntentOutcome {
     }
     let (releasable, confidence) = releasable_by_invariant(home, &repo, &branch);
     if !releasable {
-        tracing::debug!(agent = %assignee, repo = %repo, branch = %branch, event, ?confidence, "auto_release: invariant not yet satisfied — retaining for retry");
-        return IntentOutcome::Retry;
+        // #2010 2a: the open-PR invariant holds an IMPLEMENTER's worktree until
+        // the PR is terminal (correct — it may be needed for rework/merge), but
+        // it must NOT hold a REVIEWER's binding once the reviewer's own review
+        // task is terminal — that leaks the binding and makes the lead's rework
+        // re-dispatch hit a lease conflict. Bypass the invariant ONLY for the
+        // verdict-sender's own binding with its review task terminal; the dirty
+        // gate below still protects review WIP (dirty → retry, not release).
+        if reviewer_binding_release_bypass(intent, task.as_ref(), &assignee) {
+            tracing::info!(agent = %assignee, repo = %repo, branch = %branch, event, ?confidence, "auto_release: reviewer-binding bypass — verdict sent + review task terminal, releasing if clean (#2010 2a)");
+        } else {
+            tracing::debug!(agent = %assignee, repo = %repo, branch = %branch, event, ?confidence, "auto_release: invariant not yet satisfied — retaining for retry");
+            return IntentOutcome::Retry;
+        }
     }
 
     // ── final gate (dirty / opt-out / bound), must-fix #6 — unchanged decide_release.
@@ -739,17 +802,34 @@ mod tests {
         assert!(is_verdict_message(&msg), "leading whitespace tolerated");
     }
 
-    /// REJECTED, UNVERIFIED, kind=task / update / query, missing
-    /// reviewed_head, or missing correlation_id all skip detection.
+    /// #2010 2a: REJECTED and UNVERIFIED reports (with reviewed_head +
+    /// correlation) NOW match — the gate was widened from VERIFIED-only so the
+    /// non-VERIFIED reviewer's binding also gets a release intent.
+    #[test]
+    fn all_terminal_verdicts_match_2010() {
+        let base = canonical_verdict_message();
+        for verdict in ["VERIFIED", "REJECTED", "UNVERIFIED"] {
+            let mut m = base.clone();
+            m.text = format!("{verdict} — evidence block follows");
+            assert!(
+                is_verdict_message(&m),
+                "{verdict} report must enqueue a release intent (#2010 2a)"
+            );
+            // Leading whitespace tolerated via trim_start.
+            m.text = format!("   {verdict} — indented");
+            assert!(is_verdict_message(&m), "{verdict} with indent must match");
+        }
+    }
+
+    /// Non-verdict text, non-report kinds, or missing reviewed_head /
+    /// correlation_id still skip detection — the widening (2010 2a) only added
+    /// the two extra verdict WORDS, not a relaxation of the other gates.
     #[test]
     fn non_verdict_kinds_skip_detection() {
         let base = canonical_verdict_message();
         let mut m = base.clone();
-        m.text = "REJECTED — r1 needed".into();
-        assert!(!is_verdict_message(&m), "REJECTED must not match");
-        m = base.clone();
-        m.text = "UNVERIFIED — re-run CI".into();
-        assert!(!is_verdict_message(&m), "UNVERIFIED must not match");
+        m.text = "looks good to me, merging".into();
+        assert!(!is_verdict_message(&m), "non-verdict prose must not match");
         m = base.clone();
         m.kind = Some("task".into());
         assert!(!is_verdict_message(&m), "kind=task must not match");
@@ -757,16 +837,75 @@ mod tests {
         m.kind = Some("update".into());
         assert!(!is_verdict_message(&m), "kind=update must not match");
         m = base.clone();
+        m.text = "REJECTED — r1 needed".into();
         m.reviewed_head = None;
         assert!(
             !is_verdict_message(&m),
-            "missing reviewed_head must not match"
+            "missing reviewed_head must not match even for a terminal verdict"
         );
         m = base.clone();
+        m.text = "UNVERIFIED — re-run CI".into();
         m.correlation_id = None;
         assert!(
             !is_verdict_message(&m),
             "missing correlation_id must not match"
+        );
+    }
+
+    /// #2010 2a §3.9 — the reviewer-binding release bypass: all three conditions
+    /// (verdict intent + bound agent IS the verdict sender + review task
+    /// terminal) must hold; dropping any one keeps the binding (no bypass).
+    #[test]
+    fn reviewer_binding_bypass_requires_all_three_conditions_2010() {
+        use crate::task_events::TaskStatus;
+        let mut intent = sample_intent("t-rev");
+        intent.event_kind = Some("verdict".to_string());
+        intent.reviewer = "reviewer-1".to_string();
+
+        let mut done_task = sample_task("t-rev", Some("reviewer-1"));
+        done_task.status = TaskStatus::Done;
+        // All three hold → bypass (REJECTED/UNVERIFIED/VERIFIED all enqueue a
+        // "verdict" intent, so the kind is irrelevant here).
+        assert!(
+            reviewer_binding_release_bypass(&intent, Some(&done_task), "reviewer-1"),
+            "all three conditions → bypass the open-PR invariant"
+        );
+        // Cancelled is also terminal.
+        let mut cancelled = done_task.clone();
+        cancelled.status = TaskStatus::Cancelled;
+        assert!(
+            reviewer_binding_release_bypass(&intent, Some(&cancelled), "reviewer-1"),
+            "cancelled review task is terminal → bypass"
+        );
+
+        // (1) not a verdict intent (merge/task_done event) → no bypass.
+        let mut merge_intent = intent.clone();
+        merge_intent.event_kind = Some("merge".to_string());
+        assert!(
+            !reviewer_binding_release_bypass(&merge_intent, Some(&done_task), "reviewer-1"),
+            "non-verdict event must not bypass (only the verdict-sender path does)"
+        );
+
+        // (2) bound agent is NOT the verdict sender → no bypass. This is the
+        // implementer-protection gate: an intent whose bound agent differs from
+        // the verdict sender (e.g. correlated to the dev's task) keeps the
+        // PR-terminal wait untouched.
+        assert!(
+            !reviewer_binding_release_bypass(&intent, Some(&done_task), "dev-implementer"),
+            "implementer binding (assignee != verdict sender) must NOT bypass"
+        );
+
+        // (3) review task not terminal (still claimed/in_review) → no bypass yet
+        // (the sweeper retries until the reviewer's task closes).
+        let claimed = sample_task("t-rev", Some("reviewer-1")); // default Claimed
+        assert!(
+            !reviewer_binding_release_bypass(&intent, Some(&claimed), "reviewer-1"),
+            "non-terminal review task must not bypass (retry until done)"
+        );
+        // Missing task → no bypass.
+        assert!(
+            !reviewer_binding_release_bypass(&intent, None, "reviewer-1"),
+            "missing task must not bypass"
         );
     }
 

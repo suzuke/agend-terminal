@@ -152,14 +152,54 @@ pub fn create(
                 }
             });
         if actual.as_deref() != Some(branch.as_str()) {
-            tracing::warn!(
-                instance = instance_name,
-                requested = %branch,
-                actual = ?actual,
-                path = %wt_dir.display(),
-                "lease conflict: worktree exists on a different branch — rejecting"
-            );
-            return None;
+            // #2010 2b: the worktree exists at this branch-keyed path but its HEAD
+            // drifted off the requested branch — most commonly a DETACHED HEAD,
+            // where `git branch --show-current` yields `Some("")` (not `None`),
+            // e.g. a reviewer that did a detached `repo checkout` for inspection.
+            // Pre-fix this ALWAYS returned None → LeaseConflict, forcing a manual
+            // release before the lead could re-dispatch to the same branch.
+            // Clean-guarded reattach: when the worktree has no uncommitted changes
+            // we check the requested branch back out and REUSE the worktree; a
+            // DIRTY drift still conflicts (protects in-flight review WIP — the
+            // reviewer's normal detached form is only reattached at the moment a
+            // NEW lease for this branch is requested, i.e. right here).
+            if has_uncommitted_changes(&wt_dir) {
+                tracing::warn!(
+                    instance = instance_name,
+                    requested = %branch,
+                    actual = ?actual,
+                    path = %wt_dir.display(),
+                    "lease conflict: worktree drifted off the requested branch and is dirty — rejecting (protecting WIP)"
+                );
+                return None;
+            }
+            match checkout_branch(&wt_dir, &branch) {
+                Ok(()) => {
+                    tracing::info!(
+                        instance = instance_name,
+                        requested = %branch,
+                        previous = ?actual,
+                        path = %wt_dir.display(),
+                        "reattached clean drifted/detached worktree to requested branch — reusing (#2010 2b)"
+                    );
+                    return Some(WorktreeInfo {
+                        path: wt_dir,
+                        source_repo: repo_dir.to_path_buf(),
+                        branch,
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        instance = instance_name,
+                        requested = %branch,
+                        actual = ?actual,
+                        path = %wt_dir.display(),
+                        error = %e,
+                        "lease conflict: clean reattach to requested branch failed — rejecting"
+                    );
+                    return None;
+                }
+            }
         }
         tracing::info!(
             instance = instance_name,
@@ -739,6 +779,122 @@ mod tests {
             create(&home, &repo, "agent1", Some("feat/X")).expect("second lease idempotent");
         assert_eq!(first.path, second.path);
         assert_eq!(second.branch, "feat/X");
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    // ── #2010 2b: clean-guarded detached-HEAD reattach on reuse ──────────
+
+    /// Commit a `.gitignore` that ignores the `.agend-managed` lease marker.
+    /// `create()` writes that marker into every worktree (worktree.rs ~255), and
+    /// every REAL source repo gitignores it (this repo's own .gitignore line 29),
+    /// so production worktrees read CLEAN. Without it the marker shows as an
+    /// untracked `??` and a freshly-created worktree would falsely read "dirty" —
+    /// the fixture must represent production (representative-fixture rule). Adds
+    /// one commit on top of `tmp_repo`'s init, before any worktree is created.
+    fn commit_marker_gitignore(repo: &std::path::Path) {
+        std::fs::write(repo.join(".gitignore"), ".agend-managed\n").unwrap();
+        for args in [
+            vec!["add", ".gitignore"],
+            vec![
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-m",
+                "gitignore marker",
+            ],
+        ] {
+            std::process::Command::new("git")
+                .env("AGEND_GIT_BYPASS", "1")
+                .args(&args)
+                .current_dir(repo)
+                .output()
+                .expect("git");
+        }
+    }
+
+    /// Detach the worktree's HEAD (the `git branch --show-current` ⇒ `Some("")`
+    /// shape the issue describes — e.g. a reviewer's detached `repo checkout`).
+    fn detach_head(wt: &std::path::Path) {
+        std::process::Command::new("git")
+            .env("AGEND_GIT_BYPASS", "1")
+            .args(["checkout", "--detach", "HEAD"])
+            .current_dir(wt)
+            .output()
+            .expect("detach HEAD");
+    }
+
+    /// §3.9: a CLEAN detached worktree is reattached to the requested branch and
+    /// REUSED — pre-#2010 the empty `branch --show-current` mismatched and
+    /// returned None (LeaseConflict), forcing a manual release before re-dispatch.
+    #[test]
+    fn reuse_reattaches_clean_detached_worktree_2010() {
+        let home = tmp_home("reattach-clean");
+        let repo = tmp_repo("reattach-clean");
+        commit_marker_gitignore(&repo); // representative: marker is gitignored in prod
+        let first = create(&home, &repo, "agent1", Some("feat/X")).expect("first lease");
+        // Sanity: it really is on feat/X before we detach.
+        detach_head(&first.path);
+        let cur = std::process::Command::new("git")
+            .env("AGEND_GIT_BYPASS", "1")
+            .args(["branch", "--show-current"])
+            .current_dir(&first.path)
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&cur.stdout).trim().is_empty(),
+            "precondition: HEAD is detached (empty show-current)"
+        );
+
+        // Re-lease the same (agent, branch): clean-guarded reattach → reuse.
+        let second = create(&home, &repo, "agent1", Some("feat/X"))
+            .expect("clean detached worktree must reattach + reuse (#2010 2b)");
+        assert_eq!(second.path, first.path, "same worktree reused");
+        assert_eq!(second.branch, "feat/X");
+        // HEAD is back on the requested branch.
+        let after = std::process::Command::new("git")
+            .env("AGEND_GIT_BYPASS", "1")
+            .args(["branch", "--show-current"])
+            .current_dir(&second.path)
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&after.stdout).trim(),
+            "feat/X",
+            "reattach must put HEAD back on the requested branch"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// §3.9: a DIRTY detached worktree still conflicts (returns None) — the
+    /// clean-guard protects in-flight review WIP, unchanged from pre-#2010.
+    #[test]
+    fn reuse_rejects_dirty_detached_worktree_2010() {
+        let home = tmp_home("reattach-dirty");
+        let repo = tmp_repo("reattach-dirty");
+        commit_marker_gitignore(&repo); // representative: marker is gitignored in prod
+        let first = create(&home, &repo, "agent1", Some("feat/X")).expect("first lease");
+        detach_head(&first.path);
+        // A REAL uncommitted change (not the gitignored marker) → dirty.
+        std::fs::write(first.path.join("wip.txt"), "review notes in progress").unwrap();
+        assert!(
+            has_uncommitted_changes(&first.path),
+            "precondition: worktree is dirty"
+        );
+
+        let second = create(&home, &repo, "agent1", Some("feat/X"));
+        assert!(
+            second.is_none(),
+            "dirty detached worktree must still conflict (protect review WIP)"
+        );
+        // And the WIP is untouched.
+        assert!(
+            first.path.join("wip.txt").exists(),
+            "the dirty WIP file must be left intact"
+        );
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&repo).ok();
     }
