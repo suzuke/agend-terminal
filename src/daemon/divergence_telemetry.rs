@@ -155,12 +155,14 @@ fn append_line(path: &Path, line: &Value) -> std::io::Result<()> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     fn reset() {
         *WINDOW.lock() = None;
     }
 
     #[test]
+    #[serial(divergence_window)] // shares the global WINDOW accumulator
     fn record_buckets_agree_disagree_no_signal() {
         reset();
         // Fresh + same state → agree.
@@ -234,6 +236,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(divergence_window)] // shares the global WINDOW accumulator
     fn flush_takes_and_resets_window_and_writes_jsonl() {
         reset();
         let home = std::env::temp_dir().join(format!("agend-div-tel-{}", std::process::id()));
