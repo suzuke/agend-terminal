@@ -434,5 +434,5 @@ pub(crate) fn name_residual_anywhere(
 }
 
 #[cfg(test)]
-#[path = "lifecycle_tests.rs"]
+#[path = "lifecycle/tests.rs"]
 mod tests;
