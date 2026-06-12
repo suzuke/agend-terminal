@@ -156,9 +156,11 @@ const APP_TICK_ALLOWLIST: &[&str] = &["snapshot_rotation", "thread_dump"];
 /// `stage2_dispatch_available = false` — `RecoveryDispatcherHandler` now RUNS
 /// (no longer allowlisted out) and its Stage2 path escalates to Stage3 rather
 /// than emit onto the consumerless channel.
-fn app_tick_handlers() -> Vec<Box<dyn crate::daemon::per_tick::PerTickHandler>> {
+fn app_tick_handlers(
+    daemon_binary_stale: crate::daemon::mcp_registry_watcher::DaemonBinaryStale,
+) -> Vec<Box<dyn crate::daemon::per_tick::PerTickHandler>> {
     let (crash_tx, _crash_rx) = crossbeam_channel::bounded(1);
-    let mut handlers = crate::daemon::build_default_handlers(crash_tx, false);
+    let mut handlers = crate::daemon::build_default_handlers(crash_tx, false, daemon_binary_stale);
     handlers.retain(|h| !APP_TICK_ALLOWLIST.contains(&h.name()));
     handlers
 }
@@ -212,11 +214,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // the daemon already runs its own supervisor against the real registry, so
     // the app must not also poll a disjoint (empty) registry.
     if !attached_mode {
-        crate::daemon::supervisor::spawn(
-            home.clone(),
-            Arc::clone(&registry),
-            Arc::clone(&daemon_binary_stale),
-        );
+        crate::daemon::supervisor::spawn(home.clone(), Arc::clone(&registry));
         crate::instance_monitor::spawn_monitor_tick(home.clone(), Arc::clone(&registry));
         // Attached mode stays unwired: that process never owns the registry,
         // and the Telegram bot (if any) runs under the other daemon which
@@ -397,7 +395,11 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // harmlessly unused.
     let app_externals: crate::agent::ExternalRegistry = Arc::new(Mutex::new(HashMap::new()));
     let app_configs: crate::api::ConfigRegistry = Arc::new(Mutex::new(HashMap::new()));
-    let app_handlers = app_tick_handlers();
+    // W1.1 (#2050): the `mcp_registry` tracker (now a handler) flips this same
+    // `daemon_binary_stale` flag the render loop reads (line ~186); hand it the
+    // shared `Arc` so the status-bar warning still surfaces after the tracker
+    // moved off the supervisor thread.
+    let app_handlers = app_tick_handlers(Arc::clone(&daemon_binary_stale));
 
     // #2057: read the size-probe env gate ONCE (it can't change mid-run) — keep
     // the per-frame draw loop's hot path at zero env-lookup cost (codex #2060).
@@ -1518,11 +1520,17 @@ mod tests {
     fn app_tick_handlers_cover_every_non_allowlisted_daemon_handler() {
         use std::collections::HashSet;
         let (crash_tx, _rx) = crossbeam_channel::bounded(1);
-        let all: HashSet<&str> = crate::daemon::build_default_handlers(crash_tx, true)
+        let stale: crate::daemon::mcp_registry_watcher::DaemonBinaryStale =
+            Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let all: HashSet<&str> = crate::daemon::build_default_handlers(crash_tx, true, stale)
             .iter()
             .map(|h| h.name())
             .collect();
-        let app: HashSet<&str> = app_tick_handlers().iter().map(|h| h.name()).collect();
+        let app: HashSet<&str> =
+            app_tick_handlers(Arc::new(std::sync::atomic::AtomicBool::new(false)))
+                .iter()
+                .map(|h| h.name())
+                .collect();
 
         // Positive: every non-allowlisted daemon handler must run in app.
         let missing: Vec<&str> = all
@@ -1555,7 +1563,11 @@ mod tests {
     /// (the #1720 / #1002 class). This pins it back IN the app run set.
     #[test]
     fn recovery_dispatcher_runs_in_app_mode_1694a() {
-        let names: Vec<&str> = app_tick_handlers().iter().map(|h| h.name()).collect();
+        let names: Vec<&str> =
+            app_tick_handlers(Arc::new(std::sync::atomic::AtomicBool::new(false)))
+                .iter()
+                .map(|h| h.name())
+                .collect();
         assert!(
             names.contains(&"recovery_dispatcher"),
             "recovery_dispatcher must RUN in app mode (#1694a) — got {names:?}"
@@ -1583,7 +1595,7 @@ mod tests {
             externals: &externals,
             configs: &configs,
         };
-        for h in app_tick_handlers() {
+        for h in app_tick_handlers(Arc::new(std::sync::atomic::AtomicBool::new(false))) {
             h.run(&ctx); // panic here = test failure
         }
         std::fs::remove_dir_all(&home).ok();

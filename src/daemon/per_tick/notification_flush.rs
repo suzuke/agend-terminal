@@ -232,7 +232,9 @@ mod tests {
     #[test]
     fn registered_in_default_daemon_pipeline() {
         let (crash_tx, _crash_rx) = crossbeam_channel::bounded(1);
-        let handlers = crate::daemon::build_default_handlers(crash_tx, false);
+        let stale: crate::daemon::mcp_registry_watcher::DaemonBinaryStale =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handlers = crate::daemon::build_default_handlers(crash_tx, false, stale);
         assert!(
             handlers.iter().any(|h| h.name() == "notification_flush"),
             "NotificationFlushHandler must run in headless run_core — \

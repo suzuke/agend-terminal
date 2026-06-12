@@ -573,6 +573,7 @@ pub(crate) fn register_event_subscribers(registry: &AgentRegistry) {
 pub(crate) fn build_default_handlers(
     crash_tx: crossbeam_channel::Sender<crate::agent::AgentExitEvent>,
     stage2_dispatch_available: bool,
+    daemon_binary_stale: crate::daemon::mcp_registry_watcher::DaemonBinaryStale,
 ) -> Vec<Box<dyn per_tick::PerTickHandler>> {
     let watchdog_dry_run = watchdog::watchdog_dry_run_from_env();
     // Vec order MUST match the pre-extraction call order (zero-behavior-change guarantee).
@@ -628,6 +629,26 @@ pub(crate) fn build_default_handlers(
         // + WARN if a dialog swallowed it. Cheap (iterates a usually-empty
         // map); claude-only in practice (arm self-gates on hook history).
         Box::new(per_tick::InjectDeliveryHandler::new(1)),
+        // ── W1.1 (#2050): the 12 trackers migrated from the supervisor
+        // `run_loop` (supervisor.rs:384-395). Appended in their original
+        // relative order; each self-throttles internally (TICKS_PER_SCAN), so
+        // running them every tick here is the same cadence the supervisor ran.
+        // They previously executed on the supervisor thread; the main loop
+        // ticks at the identical 10s interval and holds no lock across them, so
+        // this is behavior-preserving on unix (both run_core and app mode).
+        // Cadence-hoist to the handler (`should_fire`) is W2.4, not W1.1.
+        Box::new(per_tick::AntiStallHandler::new()),
+        Box::new(per_tick::IdleWatchdogHandler::new()),
+        Box::new(per_tick::DecisionTimeoutHandler::new()),
+        Box::new(per_tick::HelperStalenessHandler::new()),
+        Box::new(per_tick::McpRegistryHandler::new(daemon_binary_stale)),
+        Box::new(per_tick::WaitingOnStaleHandler::new()),
+        Box::new(per_tick::ConflictNotifyHandler::new()),
+        Box::new(per_tick::CanonicalDriftHandler::new()),
+        Box::new(per_tick::AutoReleaseHandler::new()),
+        Box::new(per_tick::DispatchIdleHandler::new()),
+        Box::new(per_tick::DispatchIdleNudgeHandler::new()),
+        Box::new(per_tick::RetentionHandler::new()),
     ]
 }
 
@@ -1145,13 +1166,7 @@ fn build_tick_infrastructure(
 
     #[cfg(unix)]
     {
-        let daemon_binary_stale: crate::daemon::mcp_registry_watcher::DaemonBinaryStale =
-            Arc::new(AtomicBool::new(false));
-        supervisor::spawn(
-            home.to_path_buf(),
-            Arc::clone(&ctx.registry),
-            daemon_binary_stale,
-        );
+        supervisor::spawn(home.to_path_buf(), Arc::clone(&ctx.registry));
     }
     router::spawn(home.to_path_buf(), Arc::clone(&ctx.registry));
     crate::instance_monitor::spawn_monitor_tick(home.to_path_buf(), Arc::clone(&ctx.registry));
@@ -1168,8 +1183,13 @@ fn build_tick_infrastructure(
     crate::daemon::orphan_sweep::run(home);
 
     // #1694(a): run_core wires `crash_rx` → `handle_crash_respawn`, so Stage2
-    // restarts have a live consumer here (true).
-    let handlers = build_default_handlers(ctx.crash_tx.clone(), true);
+    // restarts have a live consumer here (true). `run_core` is headless (no
+    // TUI), so the `DaemonBinaryStale` flag the `mcp_registry` handler flips is
+    // a throwaway here — nothing surfaces it, exactly as the pre-W1.1
+    // supervisor-side flag was in run_core.
+    let daemon_binary_stale: crate::daemon::mcp_registry_watcher::DaemonBinaryStale =
+        Arc::new(AtomicBool::new(false));
+    let handlers = build_default_handlers(ctx.crash_tx.clone(), true, daemon_binary_stale);
 
     let tick_rx = {
         let (tx, rx) = crossbeam_channel::bounded(1);

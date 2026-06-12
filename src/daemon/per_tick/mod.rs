@@ -50,6 +50,7 @@ pub(crate) mod poll_reminder;
 pub(crate) mod pr_state_scan;
 pub(crate) mod recovery_dispatcher;
 pub(crate) mod snapshot;
+pub(crate) mod supervisor_trackers;
 pub(crate) mod thread_dump;
 pub(crate) mod tmp_review_gc;
 pub(crate) mod watchdog;
@@ -71,6 +72,11 @@ pub(crate) use poll_reminder::PollReminderHandler;
 pub(crate) use pr_state_scan::PrStateScanHandler;
 pub(crate) use recovery_dispatcher::RecoveryDispatcherHandler;
 pub(crate) use snapshot::SnapshotRotationHandler;
+pub(crate) use supervisor_trackers::{
+    AntiStallHandler, AutoReleaseHandler, CanonicalDriftHandler, ConflictNotifyHandler,
+    DecisionTimeoutHandler, DispatchIdleHandler, DispatchIdleNudgeHandler, HelperStalenessHandler,
+    IdleWatchdogHandler, McpRegistryHandler, RetentionHandler, WaitingOnStaleHandler,
+};
 pub(crate) use thread_dump::ThreadDumpHandler;
 pub(crate) use tmp_review_gc::TmpReviewGcHandler;
 pub(crate) use watchdog::WatchdogHandler;

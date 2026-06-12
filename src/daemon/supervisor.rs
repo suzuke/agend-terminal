@@ -243,16 +243,13 @@ fn parse_unlock_at(pane_text: &str) -> Option<String> {
 /// Spawn the supervisor thread. Idempotent per process is the caller's
 /// responsibility — in practice each entry point calls it exactly once.
 ///
-/// `daemon_binary_stale` is the shared TUI status-bar flag the
-/// mcp_registry_watcher tracker flips when a post-startup binary
-/// refresh is detected (#1027). Callers without a TUI (headless daemon
-/// mode) pass a throwaway `Arc<AtomicBool>` — the flag still gets set
-/// but nothing is wired to surface it.
-pub fn spawn(
-    home: PathBuf,
-    registry: AgentRegistry,
-    daemon_binary_stale: crate::daemon::mcp_registry_watcher::DaemonBinaryStale,
-) {
+/// W1.1 (#2050): the 12 periodic trackers that used to run inline in this
+/// loop (anti_stall … retention) moved to `PerTickHandler`s in
+/// `build_default_handlers`. The `mcp_registry` tracker owned the only
+/// external dependency this thread needed (the `DaemonBinaryStale` TUI flag),
+/// so with it gone the supervisor no longer takes that argument — the handler
+/// now holds the flag.
+pub fn spawn(home: PathBuf, registry: AgentRegistry) {
     // fire-and-forget: supervisor tick loop runs for the process lifetime
     // (per module-doc rationale at lines 6-8 — "shutdown is implicit: when
     // the hosting process exits, this thread dies with it"). 10s tick
@@ -260,14 +257,10 @@ pub fn spawn(
     // (per-tick metadata read + occasional channel notify).
     let _ = thread::Builder::new()
         .name("supervisor".into())
-        .spawn(move || run_loop(home, registry, daemon_binary_stale));
+        .spawn(move || run_loop(home, registry));
 }
 
-fn run_loop(
-    home: PathBuf,
-    registry: AgentRegistry,
-    daemon_binary_stale: crate::daemon::mcp_registry_watcher::DaemonBinaryStale,
-) {
+fn run_loop(home: PathBuf, registry: AgentRegistry) {
     let mut notify_tracks: HashMap<String, NotifyTrack> = HashMap::new();
     // #1523: deferred AuthError member-notifies awaiting stability confirmation.
     let mut pending_auth: HashMap<String, PendingAuthError> = HashMap::new();
@@ -285,66 +278,15 @@ fn run_loop(
         std::collections::HashMap::new();
     let mut last_continue_inject: HashMap<String, Instant> = HashMap::new();
     let mut pane_input_tracks: HashMap<String, PaneInputTrack> = HashMap::new();
-    // Sprint 59 Wave 1 PR-1 (#9 task stall watchdog): per-task ETA
-    // scanner, throttled to 5min via TICKS_PER_SCAN.
-    let mut anti_stall_tracker = crate::daemon::anti_stall::AntiStallTracker::default();
-    // Sprint 59 Wave 1 PR-2 (#10+#12 watchdog cluster): per-agent +
-    // fleet-wide idle thresholds, throttled to 5min scans.
-    let mut idle_watchdog_tracker = crate::daemon::idle_watchdog::IdleWatchdogTracker::default();
-    // #1022: purge activity sidecars for instances not in fleet.yaml
-    // so ghost agents from prior runs don't pollute the tracking list.
+    // W1.1 (#2050): the 12 periodic trackers (anti_stall, idle_watchdog,
+    // decision_timeout, helper_staleness, mcp_registry, waiting_on_stale,
+    // conflict_notify, canonical_drift, auto_release, dispatch_idle,
+    // dispatch_idle_nudge, retention) that used to be declared here and scanned
+    // inline below moved to `PerTickHandler`s in `build_default_handlers`. This
+    // one-shot boot purge is NOT a per-tick scan — it ran exactly once at
+    // supervisor start, before the loop — so it stays here, unchanged (#1022:
+    // drop ghost activity sidecars for instances no longer in fleet.yaml).
     crate::daemon::idle_watchdog::gc_stale_activity_sidecars(&home);
-    // Sprint 59 Wave 1 PR-4-recover ((B) decision default with
-    // timeout): tracks pending operator decisions, fires auto-default
-    // on timeout. 5min throttle matches anti-stall cadence.
-    let mut decision_timeout_tracker =
-        crate::daemon::decision_timeout::DecisionTimeoutTracker::default();
-    // Sprint 59 Wave 2 PR-3 (#13 deployment-cadence proactive helper-
-    // staleness): periodically reuses cli::classify_helper_staleness
-    // and pings general+lead when a helper goes stale, closing the
-    // operator-pull gap from Sprint 58 PR-1 #11.
-    let mut helper_staleness_tracker =
-        crate::daemon::helper_staleness_watchdog::HelperStalenessWatchdogTracker::default();
-    // Sprint 60 W1 PR-2 (#P0-2 daemon hot-reload tool registry): 5th
-    // tracker. Detects when the daemon binary at current_exe() has
-    // been refreshed AFTER the running process started — running
-    // process's MCP tool registry then lags the on-disk binary's
-    // compiled-in registry. Closes the PR-5 → PR-4 chicken-and-egg loop.
-    let mut mcp_registry_tracker =
-        crate::daemon::mcp_registry_watcher::McpRegistryWatcherTracker::default();
-    let mut waiting_on_stale_tracker =
-        crate::daemon::waiting_on_stale::WaitingOnStaleTracker::default();
-    // Phase A Piece-1+2: per-tick git conflict observation + 30min
-    // escalation. Sibling to waiting_on_stale (same TICKS_PER_SCAN
-    // cadence, same REALERT_INTERVAL_SECS dedup window). No new
-    // spawn site — supervisor's per-tick loop hosts the scan.
-    let mut conflict_notify_tracker =
-        crate::daemon::conflict_notify::ConflictNotifyTracker::default();
-    // #852 residual PR-B: per-tick canonical-drift scan. Sibling to
-    // waiting_on_stale + conflict_notify (same TICKS_PER_SCAN cadence,
-    // same supervisor-hosted no-new-spawn-site pattern). Catches
-    // detached-HEAD residue accrued AFTER daemon boot for long-lived
-    // daemons; reuses the boot-time canonical_hygiene helper.
-    let mut canonical_drift_tracker =
-        crate::daemon::canonical_drift::CanonicalDriftTracker::default();
-    // #870: per-tick auto-release scan. Sibling pattern; faster
-    // cadence (TICKS_PER_SCAN=3 ≈ 30s) than the 30-tick siblings
-    // because release latency directly gates the next-cycle lease-
-    // conflict surface this module exists to eliminate. No new spawn
-    // site — supervisor's per-tick loop hosts the scan.
-    let mut auto_release_tracker = crate::daemon::auto_release::AutoReleaseTracker::default();
-    // PR1 watchdog L1: cross-team-safe dispatch-idle scan. Sibling
-    // pattern; TICKS_PER_SCAN=6 (~60s) because the threshold this
-    // gates (single-digit-minute orchestrator dispatches) demands
-    // sub-minute fire-time accuracy. No new spawn site — supervisor's
-    // per-tick loop hosts the scan.
-    let mut dispatch_idle_tracker = crate::daemon::dispatch_idle::DispatchIdleTracker::default();
-    // PR1 watchdog L2: generic per-team auto-nudge on exceeded dispatches. Same
-    // cadence as L1; fires for ANY team (t-dehardcode-fixup-nudge-multiteam — was
-    // hard-coded to the fixup team).
-    let mut dispatch_idle_nudge_tracker =
-        crate::daemon::dispatch_idle::team_nudge::DispatchIdleNudgeTracker::default();
-    let mut retention_supervisor = crate::daemon::retention::RetentionSupervisor::default();
     // #1741 boot-grace anchor: this Instant ≈ supervisor/daemon boot (set once,
     // never reset). It gates the every-tick pane-input diagnostic so a restart's
     // freshly-empty `pane_input_tracks` dedup map can't re-emit for inputs typed
@@ -381,18 +323,11 @@ fn run_loop(
                 &mut pane_input_tracks,
                 loop_started_at,
             );
-            anti_stall_tracker.maybe_scan(&home);
-            idle_watchdog_tracker.maybe_scan(&home);
-            decision_timeout_tracker.maybe_scan(&home);
-            helper_staleness_tracker.maybe_scan(&home);
-            mcp_registry_tracker.maybe_scan(&daemon_binary_stale);
-            waiting_on_stale_tracker.maybe_scan(&home);
-            conflict_notify_tracker.maybe_scan(&home, &registry);
-            canonical_drift_tracker.maybe_scan(&home);
-            auto_release_tracker.maybe_scan(&home);
-            dispatch_idle_tracker.maybe_scan(&home);
-            dispatch_idle_nudge_tracker.maybe_scan(&home);
-            retention_supervisor.maybe_sweep(&home);
+            // W1.1 (#2050): the 12 inline tracker scans that ran here
+            // (anti_stall … retention) moved to `PerTickHandler`s in
+            // `build_default_handlers`, which the main loop runs at the same
+            // 10s cadence. The trackers keep their internal TICKS_PER_SCAN
+            // throttle, so the effective scan cadence is unchanged.
             // #986: the supervisor loop NO LONGER scans pr_state directly. The
             // `PrStateScanHandler` per-tick handler is the SINGLE scanner in ALL
             // modes — it runs in run_core's handler vec (daemon) AND in
@@ -414,20 +349,21 @@ fn run_loop(
 
             // #1923 G4/G5: prune per-agent in-memory tracker state for agents no
             // longer in the registry (deleted / redeployed), mirroring the #1470
-            // retry_tracks sweep in `process_error_recovery`. These maps live in
-            // `run_loop` (not reachable from the cross-thread `full_delete_instance`
-            // delete path), so the per-tick `.retain` IS their cleanup-on-delete:
-            // a deleted agent leaves the registry → drops out of `live_agents` →
-            // its entries are pruned next tick. Without it a same-name redeploy
-            // inherits the old instance's state — a false-SUPPRESSED crash notify
-            // (notify_tracks dedup) or a false-FIRED conflict escalation
-            // (conflict_notify `last_conflict_at`/`last_escalated_at`).
+            // retry_tracks sweep in `process_error_recovery`. `notify_tracks`
+            // lives in `run_loop` (not reachable from the cross-thread
+            // `full_delete_instance` delete path), so the per-tick `.retain` IS
+            // its cleanup-on-delete: a deleted agent leaves the registry → drops
+            // out of `live_agents` → its entries are pruned next tick. Without
+            // it a same-name redeploy inherits the old instance's state — a
+            // false-SUPPRESSED crash notify (notify_tracks dedup).
+            // W1.1 (#2050): the sibling `conflict_notify_tracker.retain_active`
+            // prune moved into `ConflictNotifyHandler::run` alongside the
+            // tracker it cleans (its state now lives in that handler).
             let live_agents: std::collections::HashSet<String> = {
                 let reg = agent::lock_registry(&registry);
                 reg.values().map(|h| h.name.to_string()).collect()
             };
             notify_tracks.retain(|name, _| live_agents.contains(name));
-            conflict_notify_tracker.retain_active(&live_agents);
         }));
         if let Err(payload) = outcome {
             let msg = if let Some(s) = payload.downcast_ref::<String>() {
