@@ -174,6 +174,27 @@ fn app_tick_handlers(
 /// that the event loop needs in every iteration. Splitting would require
 /// passing all state as a context struct, adding complexity without
 /// reducing cognitive load. Revisit if the function grows further.
+/// #2057 instrument (gated on `AGEND_TUI_SIZE_DEBUG=1`): log the controlling
+/// TTY's kernel winsize (crossterm reads fd 1) at a named STARTUP milestone.
+/// The operator A/B showed fd-1 rows drop 56→53 only in the default home (12
+/// agents / 7 tabs) — somewhere in startup a phase shrinks the TUI's OWN
+/// terminal. Bracketing the phases (baseline → post-fleet-spawn → pre-loop)
+/// pins which one; the per-frame loop probe (`#2057-size`) shows the loop only
+/// ever observes the post-shrink value, so the culprit is pre-loop.
+fn trace_tty_size(enabled: bool, phase: &str) {
+    if !enabled {
+        return;
+    }
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((0, 0));
+    tracing::info!(
+        tag = "#2057-startup",
+        phase,
+        cols,
+        rows,
+        "controlling-TTY kernel winsize at startup milestone"
+    );
+}
+
 fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Result<()> {
     let home = crate::home_dir();
     let fleet_path = fleet_override
@@ -243,7 +264,15 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
 
     let (wakeup_tx, wakeup_rx) = crossbeam_channel::unbounded::<usize>();
 
+    // #2057: size-probe env gate, read ONCE here (hoisted from its old spot
+    // below the spawn block) so the startup-milestone traces + the per-frame
+    // loop probe share it — zero per-frame env-lookup cost (codex #2060).
+    let size_debug = std::env::var("AGEND_TUI_SIZE_DEBUG").as_deref() == Ok("1");
     let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
+    // #2057 milestone 1: BEFORE the default-home-extra work (supervisor +
+    // telegram already ran above and are reflected here; this baseline is the
+    // 56 in the fresh-vs-default A/B).
+    trace_tty_size(size_debug, "startup-baseline");
     let pane_rows = rows.saturating_sub(4);
     let pane_cols = cols.saturating_sub(2);
 
@@ -321,6 +350,13 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
             )?;
         }
     }
+
+    // #2057 milestone 2: AFTER session restore + the per-tab agent PTY spawns
+    // (the default-home-extra work that scales with #agents/#tabs — the prime
+    // suspect). If rows here < the baseline, a spawn/restore step shrank the
+    // controlling TTY (e.g. a winsize written to fd 0/1 instead of a pane's
+    // pty master).
+    trace_tty_size(size_debug, "post-fleet-spawn");
 
     // Flag to trigger resize pass after layout changes (split, close, zoom, tab switch).
     // Start true so restored split panes get correct sizes before first draw.
@@ -401,9 +437,12 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // moved off the supervisor thread.
     let app_handlers = app_tick_handlers(Arc::clone(&daemon_binary_stale));
 
-    // #2057: read the size-probe env gate ONCE (it can't change mid-run) — keep
-    // the per-frame draw loop's hot path at zero env-lookup cost (codex #2060).
-    let size_debug = std::env::var("AGEND_TUI_SIZE_DEBUG").as_deref() == Ok("1");
+    // #2057 milestone 3: just BEFORE the render loop. If this is < the baseline,
+    // a startup phase shrank the controlling TTY; milestone 2 brackets whether
+    // it was the fleet spawn/restore vs the post-spawn wiring (subscribers /
+    // tick threads). The per-frame `#2057-size` probe below only ever sees this
+    // post-shrink value (confirmed by the operator A/B), so the cause is here.
+    trace_tty_size(size_debug, "pre-render-loop");
 
     loop {
         if crate::bootstrap::signals::term_requested() {
