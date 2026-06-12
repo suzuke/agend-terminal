@@ -64,13 +64,12 @@ fn list_worktrees(repo_root: &Path) -> Vec<WorktreeEntry> {
 /// Check if a branch is merged into the default branch (local check, no API needed).
 fn is_branch_merged(repo_root: &Path, branch: &str) -> bool {
     let default = crate::git_helpers::default_branch(repo_root);
-    Command::new("git")
-        .args(["merge-base", "--is-ancestor", branch, &default])
-        .current_dir(repo_root)
-        .env("AGEND_GIT_BYPASS", "1")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    // W1.2: git_ok = always-bypass + bounded, true iff exit-0 (the
+    // `output().map(success).unwrap_or(false)` idiom, byte-for-byte).
+    crate::git_helpers::git_ok(
+        repo_root,
+        &["merge-base", "--is-ancestor", branch, &default],
+    )
 }
 
 /// Check if a branch's remote tracking ref has been deleted (i.e. the PR was
@@ -127,13 +126,10 @@ fn remove_worktree(repo_root: &Path, worktree_path: &str, branch: &str) -> bool 
         if attempt > 0 {
             std::thread::sleep(std::time::Duration::from_millis(100 * (1 << attempt)));
         }
-        wt_ok = Command::new("git")
-            .args(["worktree", "remove", "--force", worktree_path])
-            .current_dir(repo_root)
-            .env("AGEND_GIT_BYPASS", "1")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+        wt_ok = crate::git_helpers::git_ok(
+            repo_root,
+            &["worktree", "remove", "--force", worktree_path],
+        );
         if wt_ok {
             break;
         }
@@ -326,13 +322,7 @@ fn prune_orphaned_branches(repo_root: &Path) -> Vec<String> {
         if !merged && !gone && !squash {
             continue;
         }
-        let ok = Command::new("git")
-            .args(["branch", "-D", branch])
-            .current_dir(repo_root)
-            .env("AGEND_GIT_BYPASS", "1")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+        let ok = crate::git_helpers::git_ok(repo_root, &["branch", "-D", branch]);
         if ok {
             let reason = if merged {
                 "merged"
