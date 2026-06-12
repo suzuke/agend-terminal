@@ -40,6 +40,10 @@ class). Preserve relative order — handler order is load-bearing
 (daemon/mod.rs:577-579).
 **Effort** ~1 day · **Risk** low (each tracker already self-contained) ·
 **Source** survey 01-R2 / 06-A. Best value-to-risk in the plan; do first.
+**Status** ✅ Done — PR #2065. All 12 trackers wrapped as `PerTickHandler`s
+and appended to `build_default_handlers` (now 32 handlers) in their original
+relative order; supervisor inline calls deleted; completeness invariant
+`all_twelve_supervisor_trackers_registered_in_order` pins the full set.
 
 ### W1.2 `git_cmd` helper — absorb daemon-side raw-git boilerplate
 `git_cmd(dir, args) -> Result<String>` (always-bypass, trimmed stdout,
@@ -51,6 +55,14 @@ wanting raw control. Makes "forgot `AGEND_GIT_BYPASS`" structurally
 impossible daemon-side and kills a flaky-test class.
 **Effort** 0.5–1 day · **Risk** low, mechanical, reviewable per call-site ·
 **Source** survey 05-R1.
+**Status** ✅ First slice done — PR #2068. `git_cmd`/`git_ok` landed; 4 modules
+migrated + sealed (`branch_sweep`, `worktree_cleanup`, `worktree_pool`,
+`binding`) by the `tests/daemon_git_helper_invariant.rs` per-slice
+`MODULE_SCOPE` scanner (FAILs CI on an unmarked raw `Command::new("git")` in a
+sealed module). **Scope correction**: the daemon has **~150** raw git sites
+across **~25** modules (not the ~51 estimate above); `MODULE_SCOPE` grows
+monotonically as each later slice adds its module, so the seal never claims
+unearned coverage. Remaining-module migration is the backlog: task `t-…766-17`.
 
 ### W1.3 Quick wins (one small PR each)
 - Unify the duplicated tool-timeout maps (`request_dedup.rs:465` ↔
@@ -59,6 +71,18 @@ impossible daemon-side and kills a flaky-test class.
   out of the api server file into `agent_ops`. (survey 02-#4)
 - Fix `skills.rs` doc drift (says 5 backends, code has 4 — Gemini
   retired). (survey 06-E)
+
+**Status** ✅ Done — three PRs: #2066 (skills doc 5→4 backends), #2067
+(`spawn_one` → `agent_ops`, + a `// fire-and-forget:` rationale upgrade off
+`api/mod.rs`'s legacy spawn-audit exemption), #2069 (tool-timeout). NOTE: the
+tool-timeout item was **not** a duplicate-map merge — there is one per-tool map
+(`mcp_proxy::tool_timeout`); `request_dedup::method_wait_timeout` already
+delegates to it. The premise-check turned it into a **behavior-fix**: stale
+post-consolidation names (`deploy_template`/`watch_ci`/`checkout_repo`) had
+stopped matching, silently degrading `deployment`/`ci`/`repo` to the 30s
+default (a latent false-timeout on long ops). #2069 restores the intended 60s,
+adds a registry-coverage invariant (`tool_timeout_keys_are_registered_tools`,
+the #2055 add/remove-tool closure), and de-dups the 5/30/60s band constants.
 
 ## Wave 2 — cap relief & mechanical decomposition
 

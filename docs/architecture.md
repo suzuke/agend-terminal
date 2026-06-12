@@ -35,18 +35,19 @@ The heart: observe each agent's state machine, react, recover.
 
 | Module | LOC | Role |
 |---|---|---|
-| `daemon/supervisor.rs` | 5408 | Per-agent state OBSERVATION + reaction emission + error recovery (SRL/ApiError) + 12 inline slow-tracker scans |
-| `daemon/mod.rs` | 2764 | Entry/init/shutdown; builds the per-tick handler set (`build_default_handlers` → 20 handlers) |
-| `daemon/per_tick/` | — | `PerTickHandler` trait + 20 handler impls, panic-guarded dispatch, boot-grace gate |
+| `daemon/supervisor.rs` | 5408 | Per-agent state OBSERVATION + reaction emission + error recovery (SRL/ApiError). The 12 inline slow-tracker scans moved to `PerTickHandler`s in W1.1 (#2065) |
+| `daemon/mod.rs` | 2764 | Entry/init/shutdown; builds the per-tick handler set (`build_default_handlers` → 32 handlers) |
+| `daemon/per_tick/` | — | `PerTickHandler` trait + 32 handler impls, panic-guarded dispatch, boot-grace gate |
 | `daemon/crash_respawn.rs` | 568 | Crash→respawn decision: health budget, escalation persist, respawn worker |
 | `health.rs` | 2385 | Per-agent hang/crash budgets, blocked-reason, escalation persist+rehydrate |
 | `state/mod.rs` | 2176 | Per-agent `StateTracker` — screen-heuristic state machine (see 2.4) |
 
-Two periodic-work mechanisms coexist (see §6.1): the supervisor `run_loop`
-(every 10s) hosts 12 inline `*_tracker.maybe_scan/sweep` calls
-(supervisor.rs:266), while the daemon loop dispatches the 20 extracted
-`PerTickHandler`s with per-handler `catch_unwind` + timing
-(per_tick/mod.rs:182-214).
+Periodic work is now a single pipeline (W1.1 / #2065, see §6.1): the daemon
+loop dispatches all 32 `PerTickHandler`s with per-handler `catch_unwind` +
+timing (per_tick/mod.rs:182-214). The 12 trackers that used to run inline in
+the supervisor `run_loop` were wrapped as handlers and appended in their
+original relative order; the supervisor `run_loop` now hosts only `tick()` /
+`process_error_recovery()` / a boot-time sidecar GC (still its own 10s thread).
 
 ### 2.2 MCP layer + inter-agent comms (~22K LOC)
 
@@ -219,9 +220,10 @@ supervisor refactor.
 These are the deliberate or accreted dual-paths. Each is a REFACTOR-PLAN
 entry; none is free to "just clean up" without the listed care.
 
-1. **Two periodic-work mechanisms** (§2.1): 20 extracted `PerTickHandler`s
-   vs 12 inline supervisor `maybe_scan` trackers — one concept, two
-   mechanisms, two mental models. Finish-the-extraction is W1 work.
+1. **Two periodic-work mechanisms** (§2.1): ✅ RESOLVED by W1.1 (#2065). The 12
+   inline supervisor `maybe_scan` trackers are now `PerTickHandler`s in the one
+   `build_default_handlers` pipeline (32 handlers); a completeness invariant
+   pins the full set so the two-mechanism split can't silently reappear.
 2. **Heuristic vs hook state, dual readers** (§2.4): the snapshot path is
    promoted (hook-aware), but hang/watchdog/recovery/supervisor escalation
    still read raw heuristic — in a single tick, dispatch_idle can suppress
@@ -229,9 +231,15 @@ entry; none is free to "just clean up" without the listed care.
    (raw=heuristic-Idle). Bounded today by the #1999 escalation throttle.
    Convergence = #1523 phase-2 (W3; lock-ordering design required — a
    naive shared cache inverts registry⨯core order).
-3. **Raw `Command::new("git")` vs `git_bypass`**: 209 raw sites; any site
-   that forgets `AGEND_GIT_BYPASS=1` silently hits the shim (a whole
-   flaky-test class). W1 makes this structurally impossible daemon-side.
+3. **Raw `Command::new("git")` vs `git_bypass`**: ~150 daemon raw git sites
+   across ~25 modules; any site that forgets `AGEND_GIT_BYPASS=1` silently hits
+   the shim (a whole flaky-test class). W1.2 (#2068) landed `git_cmd`/`git_ok`
+   and SEALED its first 4 modules (`branch_sweep`, `worktree_cleanup`,
+   `worktree_pool`, `binding`) behind `tests/daemon_git_helper_invariant.rs`, a
+   per-slice `MODULE_SCOPE` scanner that grows monotonically as each later
+   slice migrates its module. The remaining modules are the backlog
+   (`t-…766-17`) — the seal makes regression structurally impossible only for
+   already-migrated modules, never claiming unearned coverage.
 4. **Size-driven extraction at the MCP cap**: `instance.rs`/`comms.rs` at
    the 750-LOC cap with "extracted for file_size_invariant" cross-file
    seams; `handle_delegate_task` is a 317-LOC god-fn with gates inlined.
@@ -250,7 +258,9 @@ CI: 3-platform Check + LOC-overrun gate + cargo audit (required);
 Coverage + daemon-boot flake-gate (non-required). Architecture-level
 invariants are pinned by dedicated tests: `file_size_invariant` (750-LOC
 handler cap), `tick_emitters_run_after_core_lock_drops` (#1644),
-heartbeat-pair atomicity audit, spawn-rationale invariant (Phase 5b).
+heartbeat-pair atomicity audit, spawn-rationale invariant (Phase 5b),
+`daemon_git_helper_invariant` (#2068 — per-slice `MODULE_SCOPE` seal: no
+unmarked raw `Command::new("git")` in a migrated module).
 Worktree-side test runs need `AGEND_GIT_BYPASS=1` (the shim intercepts
 raw-git subprocesses in managed worktrees). Review discipline §3.9: tests
 enter through real entry points with representative fixtures — synthetic
