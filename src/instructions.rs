@@ -80,6 +80,12 @@ pub(crate) fn ensure_project_root(dir: &Path) {
 
     let init_ok = std::process::Command::new("git")
         .args(["-C", &dir.display().to_string(), "init", "--quiet"])
+        // #2071: discard stdout/stderr. In app mode this runs in the TUI
+        // process; an un-redirected child inherits the TUI's TTY and `git
+        // init`'s hints/warnings (not all silenced by --quiet) would garble
+        // the ratatui frame. We only read the exit status.
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()
         .map(|s| s.success())
         .unwrap_or(false);

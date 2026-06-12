@@ -194,6 +194,13 @@ pub fn add(home: &Path, source: &str) -> Result<Skill> {
                 let status = std::process::Command::new("git")
                     .args(["clone", "--depth=1", url.as_str()])
                     .arg(&tmp)
+                    // #2071: discard git clone's progress output. Skills install
+                    // runs in the `spawn_one` path, which in app mode executes
+                    // in the TUI process — an un-redirected child inherits the
+                    // TUI's TTY and `git clone`'s "Receiving objects…" progress
+                    // garbles the ratatui frame. We only read the exit status.
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
                     .status()
                     .context("spawn git clone")?;
                 if !status.success() {
@@ -222,6 +229,10 @@ pub fn add(home: &Path, source: &str) -> Result<Skill> {
                 let status = std::process::Command::new("git")
                     .args(["clone", "--depth=1", url.as_str()])
                     .arg(&dest)
+                    // #2071: discard git clone's progress (see the subdir-clone
+                    // site above) — keep it off the TUI's inherited TTY.
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
                     .status()
                     .context("spawn git clone")?;
                 if !status.success() {

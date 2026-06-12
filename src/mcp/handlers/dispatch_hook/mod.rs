@@ -1273,6 +1273,14 @@ pub(crate) fn clean_empty_init_commits(worktree: &Path) -> Result<usize, String>
         .current_dir(worktree)
         .env("AGEND_GIT_BYPASS", "1")
         .env("GIT_SEQUENCE_EDITOR", format!("sed -i.bak '{sed_script}'"))
+        // #2071: discard git's stdout/stderr. In app mode the daemon runs
+        // in-process with the TUI, so an un-redirected `.status()` child
+        // inherits the TUI's controlling terminal — `rebase`'s progress/result
+        // text writes straight onto the ratatui frame, which ratatui's
+        // previous-buffer diff never repaints (whole-screen garble until a
+        // forced full redraw / tab switch). We only read the exit status.
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status();
     match status {
         Ok(s) if s.success() => {
@@ -1291,6 +1299,10 @@ pub(crate) fn clean_empty_init_commits(worktree: &Path) -> Result<usize, String>
                 .args(["rebase", "--abort"])
                 .current_dir(worktree)
                 .env("AGEND_GIT_BYPASS", "1")
+                // #2071: discard stdout/stderr (see the rebase site above) —
+                // don't let the abort's output leak onto the TUI's TTY.
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
                 .status();
             match &abort {
                 Ok(s) if !s.success() => {
