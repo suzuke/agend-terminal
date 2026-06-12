@@ -120,6 +120,19 @@ forget the boot-grace gate (today it is hand-wired per handler).
 Do after W1.1 so the latch sites are all in handler form first.
 **Effort** 0.5 day · **Risk** low, churns many files — keep it its own PR ·
 **Source** survey 01-R3.
+**Status** ✅ Done (scope-trimmed) — PR #2080. `CadenceGate` shipped: unifies
+the ~23 hand-rolled cadence counters (11 handlers via `new`, 12 supervisor
+trackers via `new_interval`) AND structurally bundles the notification-watchdog
+boot-grace (`new_with_boot_grace`) — survey S6's real goal, so a new watchdog
+gets boot-grace from the constructor, impossible to forget. **`PerAgentLatch`
+was CANCELLED after survey**: its boot-grace closure is already delivered by
+`CadenceGate::new_with_boot_grace`, and its "built-in prune" was a
+dead-API-or-behaviour-change dilemma (the 3 `Mutex<HashMap>` latch sites never
+prune today; adding prune changes same-name-redeploy state — a behaviour-fix,
+not a refactor). Remaining value was below the churn cost (#1561
+default-don't-build). The real in-mem leak (latches not pruning deleted agents)
+is a separate behaviour-fix backlog item (the #1923 G5 cleanup-on-delete class);
+`handoff_timeout`'s tuple-keyed latches stay as-is.
 
 ### W2.5 Backend preset factory collapse
 `backend.rs preset()` 300-LOC 6-arm factory with repeated fields → table /
