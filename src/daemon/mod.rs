@@ -21,6 +21,7 @@ pub(crate) mod helper_staleness_watchdog;
 pub mod hook_shadow;
 pub(crate) mod idle_watchdog;
 pub(crate) mod inbox_stuck_watchdog;
+pub(crate) mod inject_delivery;
 pub(crate) mod lifecycle;
 pub(crate) mod mcp_registry_watcher;
 pub(crate) mod notification_dedup;
@@ -622,6 +623,11 @@ pub(crate) fn build_default_handlers(
         // 92% one-shot operator escalation. Noise-budgeted (per-episode
         // latch + hysteresis re-arm). Runs in app mode (live daemon).
         Box::new(per_tick::ContextHandoffHandler::new(6)),
+        // #2044 inject-delivery watchdog: every tick (~10s) verify that an
+        // armed actionable wake produced a UserPromptSubmit; re-deliver once
+        // + WARN if a dialog swallowed it. Cheap (iterates a usually-empty
+        // map); claude-only in practice (arm self-gates on hook history).
+        Box::new(per_tick::InjectDeliveryHandler::new(1)),
     ]
 }
 

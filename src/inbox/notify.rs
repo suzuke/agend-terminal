@@ -348,6 +348,11 @@ pub fn compose_aware_inject(home: &Path, agent_name: &str, notification: &str) {
     // defers it. Ambient stays behind the #1457 draft gate in route_notification.
     if actionable {
         let _ = inject_with_submit(home, agent_name, notification);
+        // #2044: arm delivery-verification — if this actionable wake is
+        // swallowed by an open operator dialog (no UserPromptSubmit follows),
+        // the per-tick watchdog re-delivers it once. No-op for non-hook
+        // backends (arm self-gates on hook history).
+        crate::daemon::inject_delivery::arm(agent_name, notification);
         return;
     }
     let _ = route_notification(home, agent_name, notification, |msg| {

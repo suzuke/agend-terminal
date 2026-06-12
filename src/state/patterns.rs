@@ -337,6 +337,20 @@ pub fn classify_pty_output(
 ///   `InteractivePrompt` immediately (no waiting on a silence window).
 /// - Unknown prompts that happen not to use any of these tokens still fall
 ///   through to the silence fallback in `daemon::supervisor`.
+///
+/// #2044 (model-picker gap, deliberately NOT patched here): an OPERATOR-opened
+/// runtime dialog like claude's `/model` picker (an arrow-key selection menu)
+/// matches NEITHER this token set NOR the PermissionPrompt chrome, so it isn't
+/// classified — and that's the right call for two reasons. (1) Adding a pattern
+/// without a grid-validated capture of the real picker is the #1559 hazard (a
+/// "remembered" string that's absent on the rendered grid); we have no such
+/// capture. (2) The actual harm (#2044) was an injected dispatch SWALLOWED by
+/// the open dialog — and the fix for that is the dialog-shape-AGNOSTIC
+/// inject-delivery watchdog (`daemon::inject_delivery`): it detects a swallowed
+/// inject via the absent `UserPromptSubmit` hook regardless of WHICH dialog
+/// ate it, covering the model-picker and every future operator dialog at once.
+/// Per-dialog pattern-chasing is strictly weaker. If a recognized picker state
+/// is ever wanted in the badge, capture the real grid first (replay fixture).
 pub(super) fn is_generic_startup_prompt(text: &str) -> bool {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     let re = RE.get_or_init(|| {
