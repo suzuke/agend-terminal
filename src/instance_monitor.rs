@@ -127,16 +127,55 @@ pub fn collect(home: &std::path::Path, registry: &crate::agent::AgentRegistry) {
     *cache().lock() = metrics;
 }
 
-/// Recursively sum RSS for a process and all its descendants.
+/// One node of the process table used for the descendant-RSS walk.
+struct ProcNode {
+    mem: u64,
+    parent: Option<u32>,
+}
+
+/// Sum RSS for `root` and all its descendants, cycle-safe and iterative.
+///
+/// Windows reuses PIDs aggressively, so the parent-PID graph can contain a
+/// cycle (A's parent is B, B's parent is A). The previous recursive walk would
+/// then recurse forever and overflow the stack (monitor_tick thread crash,
+/// 2026-06-12 15:13, ~18k frames). The `visited` set breaks cycles and also
+/// guarantees each process is counted at most once.
+fn sum_tree_rss(root: u32, table: &std::collections::HashMap<u32, ProcNode>) -> u64 {
+    let mut visited = std::collections::HashSet::new();
+    let mut stack = vec![root];
+    let mut total = 0u64;
+    while let Some(pid) = stack.pop() {
+        if !visited.insert(pid) {
+            continue; // already counted / cycle guard
+        }
+        if let Some(node) = table.get(&pid) {
+            total = total.saturating_add(node.mem);
+        }
+        for (&cpid, node) in table {
+            if node.parent == Some(pid) && !visited.contains(&cpid) {
+                stack.push(cpid);
+            }
+        }
+    }
+    total
+}
+
+/// Process-tree RSS: total memory of a process plus all descendants.
 fn tree_rss(sys: &sysinfo::System, root: sysinfo::Pid) -> u64 {
-    let own = sys.process(root).map(|p| p.memory()).unwrap_or(0);
-    let children_sum: u64 = sys
+    let table: std::collections::HashMap<u32, ProcNode> = sys
         .processes()
         .values()
-        .filter(|p| p.parent() == Some(root))
-        .map(|p| tree_rss(sys, p.pid()))
-        .sum();
-    own + children_sum
+        .map(|p| {
+            (
+                p.pid().as_u32(),
+                ProcNode {
+                    mem: p.memory(),
+                    parent: p.parent().map(|pp| pp.as_u32()),
+                },
+            )
+        })
+        .collect();
+    sum_tree_rss(root.as_u32(), &table)
 }
 
 /// Read heartbeat lag and pending pickup count from metadata JSON.
@@ -181,6 +220,37 @@ mod tests {
         // May or may not be empty depending on test ordering,
         // but should not panic.
         let _ = m;
+    }
+
+    fn node(mem: u64, parent: Option<u32>) -> ProcNode {
+        ProcNode { mem, parent }
+    }
+
+    #[test]
+    fn sum_tree_rss_sums_root_and_descendants() {
+        let mut t = std::collections::HashMap::new();
+        t.insert(1, node(10, None));
+        t.insert(2, node(20, Some(1)));
+        t.insert(3, node(30, Some(2)));
+        t.insert(9, node(99, None)); // unrelated tree, must not be counted
+        assert_eq!(sum_tree_rss(1, &t), 60);
+    }
+
+    #[test]
+    fn sum_tree_rss_survives_parent_cycle() {
+        // Windows PID reuse: A's parent is B, B's parent is A. The old recursive
+        // walk overflowed the stack here; this must terminate and count each once.
+        let mut t = std::collections::HashMap::new();
+        t.insert(1, node(100, Some(2)));
+        t.insert(2, node(200, Some(1)));
+        assert_eq!(sum_tree_rss(1, &t), 300);
+    }
+
+    #[test]
+    fn sum_tree_rss_survives_self_parent() {
+        let mut t = std::collections::HashMap::new();
+        t.insert(1, node(50, Some(1)));
+        assert_eq!(sum_tree_rss(1, &t), 50);
     }
 
     #[test]
