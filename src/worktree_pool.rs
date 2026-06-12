@@ -305,6 +305,13 @@ fn remove_worktree(agent: &str, wt_path: &Path, source_repo: &Path) -> WorktreeR
 
     let wt_str = wt_path.display().to_string();
     let result = if source_repo.as_os_str().is_empty() {
+        // git-raw-allowed: empty source_repo → this arm intentionally runs with
+        // NO `current_dir`, so `git` resolves the repo from `--force <abs wt>`
+        // itself. `git_cmd`/`git_bypass` both REQUIRE a cwd; passing `wt_path
+        // .parent()` is wrong (it's the worktrees-pool dir `~/.agend-terminal/
+        // worktrees/<agent>/`, outside the repo tree, per lead ruling). Keep raw.
+        // TODO(W1.2): audit whether the empty-source_repo branch is still
+        // reachable in practice; if dead, delete this arm rather than migrate it.
         std::process::Command::new("git")
             .args(["worktree", "remove", "--force", &wt_str])
             .env("AGEND_GIT_BYPASS", "1")
@@ -1160,6 +1167,11 @@ fn gc_remove_one(home: &Path, candidate: &GcCandidate) -> GcResult {
         error: None,
     };
 
+    // git-raw-allowed: `source_repo` may be None, in which case this runs with
+    // NO `current_dir` and git resolves the repo from the absolute worktree path.
+    // `git_cmd`/`git_bypass` both REQUIRE a cwd; there is no repo-tree dir to pass
+    // when source_repo is None (wt_path's parent is the worktrees-pool dir, per
+    // lead ruling). The conditional `current_dir` is the whole point — keep raw.
     let mut cmd = std::process::Command::new("git");
     cmd.args([
         "worktree",
@@ -1186,11 +1198,8 @@ fn gc_remove_one(home: &Path, candidate: &GcCandidate) -> GcResult {
             let _ = std::fs::remove_dir_all(wt_path);
             if !wt_path.exists() {
                 if let Some(ref sr) = source_repo {
-                    let _ = std::process::Command::new("git")
-                        .current_dir(sr)
-                        .args(["worktree", "prune"])
-                        .env("AGEND_GIT_BYPASS", "1")
-                        .output();
+                    // W1.2: best-effort prune (result already ignored).
+                    let _ = crate::git_helpers::git_ok(sr, &["worktree", "prune"]);
                 }
                 result.removed = true;
             } else {

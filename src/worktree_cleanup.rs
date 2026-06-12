@@ -30,12 +30,18 @@ pub struct WorktreeEntry {
 
 /// List all git worktrees (excluding the main worktree).
 fn list_worktrees(repo_root: &Path) -> Vec<WorktreeEntry> {
-    let output = Command::new("git")
+    // git-raw-allowed: TRIM-SENSITIVE parser. `--porcelain` terminates each
+    // worktree record with a blank line; the loop below flushes a pending entry
+    // on that blank line. `git_cmd` trims trailing whitespace → the final record's
+    // terminator is dropped → the last (often only) worktree is never pushed →
+    // the sweep silently finds nothing. Must read raw, untrimmed stdout.
+    // (Already AGEND_GIT_BYPASS.)
+    let output = match Command::new("git")
         .args(["worktree", "list", "--porcelain"])
         .current_dir(repo_root)
         .env("AGEND_GIT_BYPASS", "1")
-        .output();
-    let output = match output {
+        .output()
+    {
         Ok(o) if o.status.success() => o,
         _ => return Vec::new(),
     };
@@ -78,41 +84,45 @@ fn is_branch_merged(repo_root: &Path, branch: &str) -> bool {
 /// rewrites the commit hash.
 fn is_remote_gone(repo_root: &Path, branch: &str) -> bool {
     // Read upstream tracking remote name
-    let output = Command::new("git")
-        .args(["config", &format!("branch.{branch}.remote")])
-        .current_dir(repo_root)
-        .env("AGEND_GIT_BYPASS", "1")
-        .output();
-    let remote = output
-        .as_ref()
-        .ok()
-        .filter(|o| o.status.success() && !o.stdout.is_empty())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    // W1.2: git_cmd → trimmed stdout on success; the `success && !stdout.is_empty()`
+    // filter becomes Ok-then-non-empty.
+    let remote =
+        crate::git_helpers::git_cmd(repo_root, &["config", &format!("branch.{branch}.remote")])
+            .ok()
+            .filter(|s| !s.is_empty());
     let Some(remote) = remote else {
         // No remote configured — not a remote-tracking branch, don't treat as "gone"
         return false;
     };
     // Check if the remote ref still exists
     let remote_ref = format!("refs/remotes/{remote}/{branch}");
+    // git-raw-allowed: error→EXISTS (`unwrap_or(true)`) is a deliberate safe
+    // default — a transient git error must NOT be read as "remote gone" (which
+    // would auto-delete a live branch). `git_ok`'s error→false would INVERT this,
+    // so do not "tidy" this into git_ok. (Already AGEND_GIT_BYPASS.)
     let exists = Command::new("git")
         .args(["rev-parse", "--verify", &remote_ref])
         .current_dir(repo_root)
         .env("AGEND_GIT_BYPASS", "1")
         .output()
         .map(|o| o.status.success())
-        .unwrap_or(true); // assume exists on error (safe default)
+        .unwrap_or(true);
     !exists
 }
 
 /// Check if a worktree has uncommitted changes.
 fn is_worktree_dirty(worktree_path: &Path) -> bool {
+    // git-raw-allowed: error→DIRTY (`unwrap_or(true)`) is a deliberate safe
+    // default — a git error must protect uncommitted work, not let it be swept.
+    // `git_ok`'s error→false would invert this (also: needs `!stdout.is_empty()`,
+    // not exit-status). (Already AGEND_GIT_BYPASS.)
     Command::new("git")
         .args(["status", "--porcelain"])
         .current_dir(worktree_path)
         .env("AGEND_GIT_BYPASS", "1")
         .output()
         .map(|o| !o.stdout.is_empty())
-        .unwrap_or(true) // assume dirty on error (safe default)
+        .unwrap_or(true)
 }
 
 /// Remove a worktree and delete its branch.
@@ -135,11 +145,8 @@ fn remove_worktree(repo_root: &Path, worktree_path: &str, branch: &str) -> bool 
         }
     }
     if wt_ok {
-        let _ = Command::new("git")
-            .args(["branch", "-D", branch])
-            .current_dir(repo_root)
-            .env("AGEND_GIT_BYPASS", "1")
-            .output();
+        // W1.2: best-effort branch delete (result was already ignored).
+        let _ = crate::git_helpers::git_ok(repo_root, &["branch", "-D", branch]);
     }
     wt_ok
 }
@@ -197,6 +204,10 @@ pub fn sweep_from_registry(
     for repo in &repos {
         // Prune stale remote refs before remote-gone detection
         let remote = crate::git_helpers::primary_remote(repo);
+        // git-raw-allowed: NETWORK op — `git_cmd` hardcodes LOCAL_GIT_TIMEOUT (60s),
+        // too tight for a fetch; use the raw form (already AGEND_GIT_BYPASS) rather
+        // than shoehorn a network op through the local helper. (A `git_cmd_network`
+        // variant is YAGNI for this single fire-and-forget fetch.)
         let _ = Command::new("git")
             .args(["fetch", "--prune", &remote])
             .current_dir(repo)
@@ -257,16 +268,10 @@ const SQUASH_GC_MIN_TIP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 /// #1750-B3: age of `branch`'s tip commit (committer date), or `None` if it
 /// can't be resolved. `%ct` is a unix timestamp (seconds), so no date parsing.
 fn branch_tip_age(repo_root: &Path, branch: &str) -> Option<Duration> {
-    let out = Command::new("git")
-        .args(["log", "-1", "--format=%ct", branch])
-        .current_dir(repo_root)
-        .env("AGEND_GIT_BYPASS", "1")
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let ts: u64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+    // W1.2: git_cmd → trimmed stdout; spawn-error + non-zero both collapse to `None`.
+    let ts_str =
+        crate::git_helpers::git_cmd(repo_root, &["log", "-1", "--format=%ct", branch]).ok()?;
+    let ts: u64 = ts_str.parse().ok()?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
@@ -294,19 +299,16 @@ fn prune_orphaned_branches(repo_root: &Path) -> Vec<String> {
         .map(|e| e.branch)
         .collect();
 
-    let output = Command::new("git")
-        .args(["branch", "--format=%(refname:short)"])
-        .current_dir(repo_root)
-        .env("AGEND_GIT_BYPASS", "1")
-        .output();
-    let branches: Vec<String> = match output {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
-            .lines()
-            .filter(|b| *b != default.as_str())
-            .map(String::from)
-            .collect(),
-        _ => return Vec::new(),
-    };
+    // W1.2: git_cmd → trimmed stdout on success; spawn-error + non-zero collapse to `Err → []`.
+    let branches: Vec<String> =
+        match crate::git_helpers::git_cmd(repo_root, &["branch", "--format=%(refname:short)"]) {
+            Ok(stdout) => stdout
+                .lines()
+                .filter(|b| *b != default.as_str())
+                .map(String::from)
+                .collect(),
+            _ => return Vec::new(),
+        };
 
     let mut pruned = Vec::new();
     for branch in &branches {
@@ -340,11 +342,8 @@ fn prune_orphaned_branches(repo_root: &Path) -> Vec<String> {
 
 /// Run `git worktree prune` to clean stale worktree bookkeeping entries.
 fn prune_stale_worktrees(repo_root: &Path) {
-    let _ = Command::new("git")
-        .args(["worktree", "prune"])
-        .current_dir(repo_root)
-        .env("AGEND_GIT_BYPASS", "1")
-        .output();
+    // W1.2: best-effort prune (result was already ignored).
+    let _ = crate::git_helpers::git_ok(repo_root, &["worktree", "prune"]);
 }
 
 #[cfg(test)]
