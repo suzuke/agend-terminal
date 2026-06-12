@@ -22,7 +22,6 @@
 use super::{PerTickHandler, TickContext};
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Default alert threshold (percent). Override: `AGEND_CONTEXT_ALERT_PCT`.
@@ -79,25 +78,16 @@ fn decide(state: &mut AlertState, pct: f32, threshold: f32, now: Instant) -> boo
 }
 
 pub(crate) struct ContextAlertHandler {
-    every_n_ticks: u64,
-    counter: AtomicU64,
+    gate: crate::daemon::cadence_gate::CadenceGate,
     states: Mutex<HashMap<String, AlertState>>,
 }
 
 impl ContextAlertHandler {
     pub(crate) fn new(every_n_ticks: u64) -> Self {
         Self {
-            every_n_ticks,
-            counter: AtomicU64::new(0),
+            gate: crate::daemon::cadence_gate::CadenceGate::new(every_n_ticks),
             states: Mutex::new(HashMap::new()),
         }
-    }
-
-    /// Fires at tick indices 0, N, 2N, … (matches `InboxStuckHandler`).
-    fn should_fire(&self) -> bool {
-        self.counter
-            .fetch_add(1, Ordering::Relaxed)
-            .is_multiple_of(self.every_n_ticks)
     }
 }
 
@@ -107,7 +97,7 @@ impl PerTickHandler for ContextAlertHandler {
     }
 
     fn run(&self, ctx: &TickContext<'_>) {
-        if !self.should_fire() {
+        if !self.gate.fire() {
             return;
         }
 

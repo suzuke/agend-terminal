@@ -3,25 +3,16 @@
 //! Also cleans up stale ci-watch lock files.
 
 use super::{PerTickHandler, TickContext};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) struct GcTickHandler {
-    every_n_ticks: u64,
-    counter: AtomicU64,
+    gate: crate::daemon::cadence_gate::CadenceGate,
 }
 
 impl GcTickHandler {
     pub(crate) fn new(every_n_ticks: u64) -> Self {
         Self {
-            every_n_ticks,
-            counter: AtomicU64::new(0),
+            gate: crate::daemon::cadence_gate::CadenceGate::new(every_n_ticks),
         }
-    }
-
-    fn should_fire(&self) -> bool {
-        self.counter
-            .fetch_add(1, Ordering::Relaxed)
-            .is_multiple_of(self.every_n_ticks)
     }
 }
 
@@ -31,7 +22,7 @@ impl PerTickHandler for GcTickHandler {
     }
 
     fn run(&self, ctx: &TickContext<'_>) {
-        if !self.should_fire() {
+        if !self.gate.fire() {
             return;
         }
         let results = crate::worktree_pool::gc_run(ctx.home);
@@ -56,10 +47,10 @@ mod tests {
     #[test]
     fn should_fire_respects_every_n_ticks() {
         let handler = GcTickHandler::new(3);
-        assert!(handler.should_fire()); // tick 0
-        assert!(!handler.should_fire()); // tick 1
-        assert!(!handler.should_fire()); // tick 2
-        assert!(handler.should_fire()); // tick 3
-        assert!(!handler.should_fire()); // tick 4
+        assert!(handler.gate.fire()); // tick 0
+        assert!(!handler.gate.fire()); // tick 1
+        assert!(!handler.gate.fire()); // tick 2
+        assert!(handler.gate.fire()); // tick 3
+        assert!(!handler.gate.fire()); // tick 4
     }
 }

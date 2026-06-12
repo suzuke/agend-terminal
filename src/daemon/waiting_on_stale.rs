@@ -21,9 +21,10 @@ const REALERT_INTERVAL_SECS: i64 = 30 * 60;
 /// watchdogs).
 const TICKS_PER_SCAN: u64 = 30;
 
-#[derive(Debug, Default)]
 pub(crate) struct WaitingOnStaleTracker {
-    tick_count: u64,
+    /// Cadence gate — throttles scans to once per [`TICKS_PER_SCAN`]
+    /// supervisor ticks (fire-on-Nth).
+    gate: crate::daemon::cadence_gate::CadenceGate,
     /// agent → last alert timestamp (dedup guard).
     last_alerted_at: HashMap<String, chrono::DateTime<chrono::Utc>>,
     /// #1739 boot-seed latch. The first scan after a fresh daemon start seeds
@@ -33,13 +34,21 @@ pub(crate) struct WaitingOnStaleTracker {
     seeded: bool,
 }
 
+impl Default for WaitingOnStaleTracker {
+    fn default() -> Self {
+        Self {
+            gate: crate::daemon::cadence_gate::CadenceGate::new_interval(TICKS_PER_SCAN),
+            last_alerted_at: HashMap::new(),
+            seeded: false,
+        }
+    }
+}
+
 impl WaitingOnStaleTracker {
     pub(crate) fn maybe_scan(&mut self, home: &Path) -> bool {
-        self.tick_count = self.tick_count.saturating_add(1);
-        if self.tick_count < TICKS_PER_SCAN {
+        if !self.gate.fire() {
             return false;
         }
-        self.tick_count = 0;
         let seeding = !self.seeded;
         self.seeded = true;
         scan_and_emit(home, &mut self.last_alerted_at, seeding);

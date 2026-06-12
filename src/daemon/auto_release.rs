@@ -453,9 +453,18 @@ pub(crate) fn is_verdict_message(msg: &crate::inbox::InboxMessage) -> bool {
         && msg.correlation_id.is_some()
 }
 
-#[derive(Debug, Default)]
 pub(crate) struct AutoReleaseTracker {
-    tick_count: u64,
+    /// Cadence gate — throttles scans to once per [`TICKS_PER_SCAN`]
+    /// supervisor ticks (fire-on-Nth).
+    gate: crate::daemon::cadence_gate::CadenceGate,
+}
+
+impl Default for AutoReleaseTracker {
+    fn default() -> Self {
+        Self {
+            gate: crate::daemon::cadence_gate::CadenceGate::new_interval(TICKS_PER_SCAN),
+        }
+    }
 }
 
 impl AutoReleaseTracker {
@@ -463,11 +472,9 @@ impl AutoReleaseTracker {
     /// (test signal); `false` for pre-throttle ticks and the post-fire
     /// reset.
     pub(crate) fn maybe_scan(&mut self, home: &Path) -> bool {
-        self.tick_count = self.tick_count.saturating_add(1);
-        if self.tick_count < TICKS_PER_SCAN {
+        if !self.gate.fire() {
             return false;
         }
-        self.tick_count = 0;
         drain_queue(home);
         true
     }

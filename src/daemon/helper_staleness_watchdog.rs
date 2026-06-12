@@ -47,9 +47,10 @@ const RECIPIENTS: &[&str] = &["general", "lead"];
 /// proactive scanner.
 const TRACKED_HELPERS: &[&str] = &["agend-git", "agend-mcp-bridge"];
 
-#[derive(Debug, Default)]
 pub(crate) struct HelperStalenessWatchdogTracker {
-    tick_count: u64,
+    /// Cadence gate — throttles scans to once per [`TICKS_PER_STALENESS_SCAN`]
+    /// supervisor ticks (fire-on-Nth).
+    gate: crate::daemon::cadence_gate::CadenceGate,
     /// Per-helper last-alert timestamp. Per-helper (not per-recipient)
     /// so a sequential rebuild that fixes one helper but not the other
     /// still produces fresh alerts for the lagging one.
@@ -61,15 +62,23 @@ pub(crate) struct HelperStalenessWatchdogTracker {
     seeded: bool,
 }
 
+impl Default for HelperStalenessWatchdogTracker {
+    fn default() -> Self {
+        Self {
+            gate: crate::daemon::cadence_gate::CadenceGate::new_interval(TICKS_PER_STALENESS_SCAN),
+            last_alerted_at: HashMap::new(),
+            seeded: false,
+        }
+    }
+}
+
 impl HelperStalenessWatchdogTracker {
     /// Increment tick counter and run the scan every
     /// [`TICKS_PER_STALENESS_SCAN`] calls.
     pub(crate) fn maybe_scan(&mut self, home: &Path) -> bool {
-        self.tick_count = self.tick_count.saturating_add(1);
-        if self.tick_count < TICKS_PER_STALENESS_SCAN {
+        if !self.gate.fire() {
             return false;
         }
-        self.tick_count = 0;
         let daemon_exe = std::env::current_exe().ok();
         let seeding = !self.seeded;
         self.seeded = true;

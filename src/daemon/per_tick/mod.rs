@@ -287,8 +287,9 @@ mod tests {
                 .or_else(|_| std::fs::read_to_string(format!("agend-terminal/{file}")))
                 .unwrap_or_else(|_| panic!("source must be readable: {file}"));
             assert!(
-                src.contains("in_boot_grace(self.created_at)"),
-                "{file} must gate firing on in_boot_grace (boot-suppress) — #t-watchdog-boot-suppress"
+                src.contains("new_with_boot_grace("),
+                "{file} must build its cadence gate via CadenceGate::new_with_boot_grace \
+                 (which bundles the boot-suppress window) — #t-watchdog-boot-suppress"
             );
         }
     }

@@ -64,9 +64,10 @@ pub(crate) const TICKS_PER_REGISTRY_SCAN: u64 = 30;
 /// Per-supervisor-loop tracker — captures the process-start time on
 /// first init so subsequent scans can detect a daemon binary that has
 /// been replaced post-startup.
-#[derive(Debug)]
 pub(crate) struct McpRegistryWatcherTracker {
-    tick_count: u64,
+    /// Cadence gate — throttles scans to once per [`TICKS_PER_REGISTRY_SCAN`]
+    /// supervisor ticks (fire-on-Nth).
+    gate: crate::daemon::cadence_gate::CadenceGate,
     /// Process start time. Captured at tracker init so the comparison
     /// against the daemon binary's mtime reflects "has the binary
     /// been refreshed since this process started".
@@ -76,7 +77,7 @@ pub(crate) struct McpRegistryWatcherTracker {
 impl Default for McpRegistryWatcherTracker {
     fn default() -> Self {
         Self {
-            tick_count: 0,
+            gate: crate::daemon::cadence_gate::CadenceGate::new_interval(TICKS_PER_REGISTRY_SCAN),
             started_at: SystemTime::now(),
         }
     }
@@ -86,11 +87,9 @@ impl McpRegistryWatcherTracker {
     /// Increment tick counter and run the scan every
     /// [`TICKS_PER_REGISTRY_SCAN`] calls.
     pub(crate) fn maybe_scan(&mut self, binary_stale: &AtomicBool) -> bool {
-        self.tick_count = self.tick_count.saturating_add(1);
-        if self.tick_count < TICKS_PER_REGISTRY_SCAN {
+        if !self.gate.fire() {
             return false;
         }
-        self.tick_count = 0;
         let daemon_exe = std::env::current_exe().ok();
         scan_and_set_flag(daemon_exe.as_deref(), self.started_at, binary_stale);
         true

@@ -49,9 +49,10 @@ pub(crate) const TICKS_PER_SCAN: u64 = 30;
 
 /// Per-tick conflict-notify tracker. Mirrors
 /// [`crate::daemon::waiting_on_stale::WaitingOnStaleTracker`].
-#[derive(Debug, Default)]
 pub(crate) struct ConflictNotifyTracker {
-    tick_count: u64,
+    /// Cadence gate — throttles scans to once per [`TICKS_PER_SCAN`]
+    /// supervisor ticks (fire-on-Nth).
+    gate: crate::daemon::cadence_gate::CadenceGate,
     /// agent → moment of first conflict observation (for stale gate).
     last_conflict_at: HashMap<String, chrono::DateTime<chrono::Utc>>,
     /// agent → last telegram-escalation timestamp (dedup guard).
@@ -65,6 +66,17 @@ pub(crate) struct ConflictNotifyTracker {
     /// escalation dedup itself (`last_escalated_at`) is out of scope here (#1739
     /// ②, persisted separately).
     seeded: bool,
+}
+
+impl Default for ConflictNotifyTracker {
+    fn default() -> Self {
+        Self {
+            gate: crate::daemon::cadence_gate::CadenceGate::new_interval(TICKS_PER_SCAN),
+            last_conflict_at: HashMap::new(),
+            last_escalated_at: HashMap::new(),
+            seeded: false,
+        }
+    }
 }
 
 impl ConflictNotifyTracker {
@@ -102,11 +114,9 @@ impl ConflictNotifyTracker {
         home: &Path,
         registry: &crate::agent::AgentRegistry,
     ) -> bool {
-        self.tick_count = self.tick_count.saturating_add(1);
-        if self.tick_count < TICKS_PER_SCAN {
+        if !self.gate.fire() {
             return false;
         }
-        self.tick_count = 0;
         let seeding = !self.seeded;
         self.seeded = true;
 

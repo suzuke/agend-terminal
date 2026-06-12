@@ -9,25 +9,16 @@
 //! boundaries.
 
 use super::{PerTickHandler, TickContext};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) struct LogRotationHandler {
-    every_n_ticks: u64,
-    counter: AtomicU64,
+    gate: crate::daemon::cadence_gate::CadenceGate,
 }
 
 impl LogRotationHandler {
     pub(crate) fn new(every_n_ticks: u64) -> Self {
         Self {
-            every_n_ticks,
-            counter: AtomicU64::new(0),
+            gate: crate::daemon::cadence_gate::CadenceGate::new(every_n_ticks),
         }
-    }
-
-    fn should_fire(&self) -> bool {
-        self.counter
-            .fetch_add(1, Ordering::Relaxed)
-            .is_multiple_of(self.every_n_ticks)
     }
 }
 
@@ -37,7 +28,7 @@ impl PerTickHandler for LogRotationHandler {
     }
 
     fn run(&self, ctx: &TickContext<'_>) {
-        if !self.should_fire() {
+        if !self.gate.fire() {
             return;
         }
         let max_bytes = std::env::var("AGEND_LOG_MAX_BYTES")
@@ -64,7 +55,7 @@ mod tests {
     #[test]
     fn fires_on_first_tick_then_every_n() {
         let h = LogRotationHandler::new(4);
-        let fires: Vec<bool> = (0..9).map(|_| h.should_fire()).collect();
+        let fires: Vec<bool> = (0..9).map(|_| h.gate.fire()).collect();
         assert_eq!(
             fires,
             vec![true, false, false, false, true, false, false, false, true]

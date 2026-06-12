@@ -66,18 +66,25 @@ pub(crate) fn resolve_threshold_for_dispatch(
 }
 
 /// Per-loop scheduler state for the auto-nudge tracker.
-#[derive(Debug, Default)]
 pub(crate) struct DispatchIdleNudgeTracker {
-    tick_count: u64,
+    /// Cadence gate — throttles scans to once per [`TICKS_PER_SCAN`]
+    /// supervisor ticks (fire-on-Nth).
+    gate: crate::daemon::cadence_gate::CadenceGate,
+}
+
+impl Default for DispatchIdleNudgeTracker {
+    fn default() -> Self {
+        Self {
+            gate: crate::daemon::cadence_gate::CadenceGate::new_interval(TICKS_PER_SCAN),
+        }
+    }
 }
 
 impl DispatchIdleNudgeTracker {
     pub(crate) fn maybe_scan(&mut self, home: &Path) -> bool {
-        self.tick_count = self.tick_count.saturating_add(1);
-        if self.tick_count < TICKS_PER_SCAN {
+        if !self.gate.fire() {
             return false;
         }
-        self.tick_count = 0;
         scan_and_nudge(home);
         true
     }

@@ -4,6 +4,7 @@
 pub(crate) mod anti_stall;
 pub(crate) mod auto_release;
 pub(crate) mod boot_sweep;
+pub(crate) mod cadence_gate;
 pub(crate) mod canonical_drift;
 pub(crate) mod ci_handoff_track;
 pub(crate) mod ci_watch;

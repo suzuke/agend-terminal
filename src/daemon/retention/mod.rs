@@ -14,16 +14,25 @@ use std::time::Instant;
 
 const TICKS_PER_SCAN: u64 = 360; // ~1 hour at 10s tick rate
 
-#[derive(Default)]
 pub(crate) struct RetentionSupervisor {
-    tick_count: u64,
+    /// Cadence gate — throttles sweeps to once per [`TICKS_PER_SCAN`]
+    /// supervisor ticks (fire-on-Nth).
+    gate: crate::daemon::cadence_gate::CadenceGate,
     last_run_at: Option<Instant>,
+}
+
+impl Default for RetentionSupervisor {
+    fn default() -> Self {
+        Self {
+            gate: crate::daemon::cadence_gate::CadenceGate::new_interval(TICKS_PER_SCAN),
+            last_run_at: None,
+        }
+    }
 }
 
 impl RetentionSupervisor {
     pub(crate) fn maybe_sweep(&mut self, home: &Path) {
-        self.tick_count += 1;
-        if !self.tick_count.is_multiple_of(TICKS_PER_SCAN) {
+        if !self.gate.fire() {
             return;
         }
         let now = Instant::now();

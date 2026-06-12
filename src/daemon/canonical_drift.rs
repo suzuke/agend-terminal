@@ -22,9 +22,10 @@ use std::path::{Path, PathBuf};
 /// `waiting_on_stale` + `conflict_notify`).
 const TICKS_PER_SCAN: u64 = 30;
 
-#[derive(Debug, Default)]
 pub(crate) struct CanonicalDriftTracker {
-    tick_count: u64,
+    /// Cadence gate — throttles scans to once per [`TICKS_PER_SCAN`]
+    /// supervisor ticks (fire-on-Nth).
+    gate: crate::daemon::cadence_gate::CadenceGate,
     /// Per-canonical-path last-action timestamp. Reserved for future
     /// per-path dedup / re-alert suppression (mirror of
     /// `waiting_on_stale::WaitingOnStaleTracker::last_alerted_at`).
@@ -36,16 +37,23 @@ pub(crate) struct CanonicalDriftTracker {
     last_action_at: HashMap<PathBuf, chrono::DateTime<chrono::Utc>>,
 }
 
+impl Default for CanonicalDriftTracker {
+    fn default() -> Self {
+        Self {
+            gate: crate::daemon::cadence_gate::CadenceGate::new_interval(TICKS_PER_SCAN),
+            last_action_at: HashMap::new(),
+        }
+    }
+}
+
 impl CanonicalDriftTracker {
     /// Per-tick entry. Increments the tick counter; on the throttled
     /// boundary, fires a drift scan and returns `true`. Returns `false`
     /// otherwise (pre-throttle tick OR post-fire reset).
     pub(crate) fn maybe_scan(&mut self, home: &Path) -> bool {
-        self.tick_count = self.tick_count.saturating_add(1);
-        if self.tick_count < TICKS_PER_SCAN {
+        if !self.gate.fire() {
             return false;
         }
-        self.tick_count = 0;
         run_drift_scan(home);
         true
     }

@@ -19,26 +19,16 @@
 
 use super::{PerTickHandler, TickContext};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) struct NotificationFlushHandler {
-    every_n_ticks: u64,
-    counter: AtomicU64,
+    gate: crate::daemon::cadence_gate::CadenceGate,
 }
 
 impl NotificationFlushHandler {
     pub(crate) fn new(every_n_ticks: u64) -> Self {
         Self {
-            every_n_ticks,
-            counter: AtomicU64::new(0),
+            gate: crate::daemon::cadence_gate::CadenceGate::new(every_n_ticks),
         }
-    }
-
-    /// Fires at tick indices 0, N, 2N, … (matches `PollReminderHandler`).
-    fn should_fire(&self) -> bool {
-        self.counter
-            .fetch_add(1, Ordering::Relaxed)
-            .is_multiple_of(self.every_n_ticks)
     }
 }
 
@@ -48,7 +38,7 @@ impl PerTickHandler for NotificationFlushHandler {
     }
 
     fn run(&self, ctx: &TickContext<'_>) {
-        if !self.should_fire() {
+        if !self.gate.fire() {
             return;
         }
         flush_all(ctx.home);
@@ -245,7 +235,7 @@ mod tests {
     #[test]
     fn fires_at_expected_cadence() {
         let h = NotificationFlushHandler::new(3);
-        let fires: Vec<bool> = (0..7).map(|_| h.should_fire()).collect();
+        let fires: Vec<bool> = (0..7).map(|_| h.gate.fire()).collect();
         assert_eq!(fires, vec![true, false, false, true, false, false, true]);
     }
 

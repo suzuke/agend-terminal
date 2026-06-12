@@ -229,9 +229,10 @@ fn enumerate_agent_activity(home: &Path) -> Vec<(String, chrono::DateTime<chrono
 }
 
 /// Per-loop watchdog state — throttles scans + dedups alerts.
-#[derive(Debug, Default)]
 pub(crate) struct IdleWatchdogTracker {
-    tick_count: u64,
+    /// Cadence gate — throttles scans to once per [`TICKS_PER_IDLE_SCAN`]
+    /// supervisor ticks (fire-on-Nth).
+    gate: crate::daemon::cadence_gate::CadenceGate,
     /// (vantage, agent_or_fleet_marker) → last alert ts.
     last_alerted_at: HashMap<(&'static str, String), chrono::DateTime<chrono::Utc>>,
     /// #1739 boot-seed latch for the DEV vantage. First scan seeds the dev
@@ -241,15 +242,23 @@ pub(crate) struct IdleWatchdogTracker {
     seeded: bool,
 }
 
+impl Default for IdleWatchdogTracker {
+    fn default() -> Self {
+        Self {
+            gate: crate::daemon::cadence_gate::CadenceGate::new_interval(TICKS_PER_IDLE_SCAN),
+            last_alerted_at: HashMap::new(),
+            seeded: false,
+        }
+    }
+}
+
 impl IdleWatchdogTracker {
     /// Increment tick counter and run scans every
     /// [`TICKS_PER_IDLE_SCAN`] calls.
     pub(crate) fn maybe_scan(&mut self, home: &Path) -> bool {
-        self.tick_count = self.tick_count.saturating_add(1);
-        if self.tick_count < TICKS_PER_IDLE_SCAN {
+        if !self.gate.fire() {
             return false;
         }
-        self.tick_count = 0;
         let seeding = !self.seeded;
         self.seeded = true;
         scan_and_emit(home, &mut self.last_alerted_at, seeding);

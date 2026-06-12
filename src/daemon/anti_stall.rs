@@ -37,11 +37,10 @@ pub(crate) const TICKS_PER_SCAN: u64 = 30;
 /// Per-task dedup state: when did we last emit a stall warning.
 /// Suppresses re-emit until the next stall-window-equivalent has
 /// passed (re-warn after the operator has had a chance to act).
-#[derive(Debug, Default)]
 pub(crate) struct AntiStallTracker {
-    /// Tick counter — used to gate scans to once per
-    /// [`TICKS_PER_SCAN`] supervisor ticks.
-    tick_count: u64,
+    /// Cadence gate — throttles scans to once per [`TICKS_PER_SCAN`]
+    /// supervisor ticks (fire-on-Nth).
+    gate: crate::daemon::cadence_gate::CadenceGate,
     /// Per-task last-emitted-at timestamp. In-memory only. #1739: the first
     /// scan after a fresh daemon start *seeds* this map with every
     /// currently-stalled task (stamped now) WITHOUT emitting — restart-existing
@@ -56,16 +55,24 @@ pub(crate) struct AntiStallTracker {
     seeded: bool,
 }
 
+impl Default for AntiStallTracker {
+    fn default() -> Self {
+        Self {
+            gate: crate::daemon::cadence_gate::CadenceGate::new_interval(TICKS_PER_SCAN),
+            last_emitted_at: HashMap::new(),
+            seeded: false,
+        }
+    }
+}
+
 impl AntiStallTracker {
     /// Increment the tick counter and run the scan if we've reached
     /// [`TICKS_PER_SCAN`]. Called from the supervisor's main loop
     /// every TICK. Returns whether a scan ran (for tests).
     pub(crate) fn maybe_scan(&mut self, home: &Path) -> bool {
-        self.tick_count = self.tick_count.saturating_add(1);
-        if self.tick_count < TICKS_PER_SCAN {
+        if !self.gate.fire() {
             return false;
         }
-        self.tick_count = 0;
         let seeding = !self.seeded;
         self.seeded = true;
         scan_and_emit(home, &mut self.last_emitted_at, seeding);

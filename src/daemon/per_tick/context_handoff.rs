@@ -32,7 +32,6 @@
 use super::{PerTickHandler, TickContext};
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Handoff-injection threshold (percent). Override: `AGEND_CONTEXT_HANDOFF_PCT`.
 const DEFAULT_HANDOFF_PCT: f32 = 85.0;
@@ -199,24 +198,16 @@ fn handoff_written_since(working_dir: Option<&std::path::Path>, since_ms: i64) -
 }
 
 pub(crate) struct ContextHandoffHandler {
-    every_n_ticks: u64,
-    counter: AtomicU64,
+    gate: crate::daemon::cadence_gate::CadenceGate,
     states: Mutex<HashMap<String, EpisodeState>>,
 }
 
 impl ContextHandoffHandler {
     pub(crate) fn new(every_n_ticks: u64) -> Self {
         Self {
-            every_n_ticks,
-            counter: AtomicU64::new(0),
+            gate: crate::daemon::cadence_gate::CadenceGate::new(every_n_ticks),
             states: Mutex::new(HashMap::new()),
         }
-    }
-
-    fn should_fire(&self) -> bool {
-        self.counter
-            .fetch_add(1, Ordering::Relaxed)
-            .is_multiple_of(self.every_n_ticks)
     }
 }
 
@@ -226,7 +217,7 @@ impl PerTickHandler for ContextHandoffHandler {
     }
 
     fn run(&self, ctx: &TickContext<'_>) {
-        if !self.should_fire() {
+        if !self.gate.fire() {
             return;
         }
 

@@ -34,7 +34,6 @@
 
 use super::{PerTickHandler, TickContext};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 /// Minimum `mtime`-age before a review-pattern `/tmp` dir is GC-eligible.
@@ -45,23 +44,14 @@ use std::time::{Duration, SystemTime};
 const MIN_AGE: Duration = Duration::from_secs(2 * 24 * 60 * 60);
 
 pub(crate) struct TmpReviewGcHandler {
-    every_n_ticks: u64,
-    counter: AtomicU64,
+    gate: crate::daemon::cadence_gate::CadenceGate,
 }
 
 impl TmpReviewGcHandler {
     pub(crate) fn new(every_n_ticks: u64) -> Self {
         Self {
-            every_n_ticks,
-            counter: AtomicU64::new(0),
+            gate: crate::daemon::cadence_gate::CadenceGate::new(every_n_ticks),
         }
-    }
-
-    /// `fetch_add` returns the prev value, so the first tick (counter=0) fires.
-    fn should_fire(&self) -> bool {
-        self.counter
-            .fetch_add(1, Ordering::Relaxed)
-            .is_multiple_of(self.every_n_ticks)
     }
 }
 
@@ -71,7 +61,7 @@ impl PerTickHandler for TmpReviewGcHandler {
     }
 
     fn run(&self, ctx: &TickContext<'_>) {
-        if !self.should_fire() {
+        if !self.gate.fire() {
             return;
         }
         let removed = gc_stale_tmp_review_worktrees(
