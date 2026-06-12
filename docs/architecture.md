@@ -35,7 +35,7 @@ The heart: observe each agent's state machine, react, recover.
 
 | Module | LOC | Role |
 |---|---|---|
-| `daemon/supervisor.rs` | 5408 | Per-agent state OBSERVATION + reaction emission + error recovery (SRL/ApiError) + 13 inline slow-tracker scans |
+| `daemon/supervisor.rs` | 5408 | Per-agent state OBSERVATION + reaction emission + error recovery (SRL/ApiError) + 12 inline slow-tracker scans |
 | `daemon/mod.rs` | 2764 | Entry/init/shutdown; builds the per-tick handler set (`build_default_handlers` → 20 handlers) |
 | `daemon/per_tick/` | — | `PerTickHandler` trait + 20 handler impls, panic-guarded dispatch, boot-grace gate |
 | `daemon/crash_respawn.rs` | 568 | Crash→respawn decision: health budget, escalation persist, respawn worker |
@@ -43,7 +43,7 @@ The heart: observe each agent's state machine, react, recover.
 | `state/mod.rs` | 2176 | Per-agent `StateTracker` — screen-heuristic state machine (see 2.4) |
 
 Two periodic-work mechanisms coexist (see §6.1): the supervisor `run_loop`
-(every 10s) hosts 13 inline `*_tracker.maybe_scan/sweep` calls
+(every 10s) hosts 12 inline `*_tracker.maybe_scan/sweep` calls
 (supervisor.rs:266), while the daemon loop dispatches the 20 extracted
 `PerTickHandler`s with per-handler `catch_unwind` + timing
 (per_tick/mod.rs:182-214).
@@ -220,7 +220,7 @@ These are the deliberate or accreted dual-paths. Each is a REFACTOR-PLAN
 entry; none is free to "just clean up" without the listed care.
 
 1. **Two periodic-work mechanisms** (§2.1): 20 extracted `PerTickHandler`s
-   vs 13 inline supervisor `maybe_scan` trackers — one concept, two
+   vs 12 inline supervisor `maybe_scan` trackers — one concept, two
    mechanisms, two mental models. Finish-the-extraction is W1 work.
 2. **Heuristic vs hook state, dual readers** (§2.4): the snapshot path is
    promoted (hook-aware), but hang/watchdog/recovery/supervisor escalation

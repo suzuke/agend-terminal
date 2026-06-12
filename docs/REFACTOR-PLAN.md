@@ -29,7 +29,7 @@
 ## Wave 1 — finish the extraction (low risk, high yield)
 
 ### W1.1 Unify periodic work under `PerTickHandler`
-Wrap the 13 inline supervisor `run_loop` trackers (anti_stall,
+Wrap the 12 inline supervisor `run_loop` trackers (anti_stall,
 idle_watchdog, decision_timeout, helper_staleness, mcp_registry,
 waiting_on_stale, conflict_notify, canonical_drift, auto_release,
 dispatch_idle, dispatch_idle_nudge, retention_supervisor;
