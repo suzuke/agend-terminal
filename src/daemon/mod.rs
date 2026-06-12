@@ -13,6 +13,7 @@ pub(crate) mod cron_tick;
 pub(crate) mod decision_timeout;
 pub(crate) mod dedup_state;
 pub(crate) mod dispatch_idle;
+pub(crate) mod divergence_telemetry;
 pub(crate) mod escalation_persist;
 pub(crate) mod event_bus;
 pub(crate) mod handoff_timeout_watchdog;
@@ -649,6 +650,12 @@ pub(crate) fn build_default_handlers(
         Box::new(per_tick::DispatchIdleHandler::new()),
         Box::new(per_tick::DispatchIdleNudgeHandler::new()),
         Box::new(per_tick::RetentionHandler::new()),
+        // #1523 phase-2 prerequisite: heuristic⨯hook divergence telemetry
+        // (instrument-only, shadow-mode). Records every tick, flushes hourly
+        // (360 ticks × 10s) one JSONL line + INFO. Zero behaviour — gates
+        // nothing; runs in app mode (the live daemon) so the data accrues for
+        // the phase-2 go/no-go.
+        Box::new(per_tick::DivergenceTelemetryHandler::new(360)),
     ]
 }
 
