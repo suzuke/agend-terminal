@@ -999,6 +999,50 @@ pub fn resolve_notify_recipient(home: &Path, state: &PrState) -> String {
         .unwrap_or_else(|| resolve_author(state))
 }
 
+/// #2059-#3: resolve the MERGE AUTHORITY for `[pr-ready-for-merge]` — a
+/// distinct audience from the author-facing `[review-verdict]` signal.
+/// Ready-for-MERGE must reach whoever merges (the team orchestrator), NOT the
+/// last CI-chain hop or the author.
+///
+/// Resolution is via the DURABLE fleet.yaml teams config, deliberately NOT the
+/// branch binding: `resolve_notify_recipient` is binding-first, but the
+/// implementer RELEASES their worktree right after pushing, so by merge-ready
+/// time the binding is usually gone and that resolver falls through to the
+/// author — the exact mis-route that left PR #2058 stranded (#2059). Map a
+/// known fleet member on this PR → its team's orchestrator. fleet.yaml survives
+/// the binding release, so the route is stable across the whole PR lifetime.
+///
+/// Candidate members, fleet-name sources first (the gh-login `pr_author` is the
+/// least reliable under the shared account, so it's last): the reviewers (from
+/// the recorded verdict), then the watch subscribers, then `pr_author`. The
+/// first whose team has an orchestrator wins; else the explicit `fixup-lead`
+/// fallback (same terminal default as `resolve_author`).
+pub fn resolve_merge_authority(home: &Path, state: &PrState) -> String {
+    let mut candidates: Vec<&str> = Vec::new();
+    match &state.verdict_state {
+        VerdictState::Verified { reviewers } => {
+            candidates.extend(reviewers.iter().map(|(r, _)| r.as_str()));
+        }
+        VerdictState::Rejected { reviewer, .. } | VerdictState::Unverified { reviewer, .. } => {
+            candidates.push(reviewer.as_str());
+        }
+        VerdictState::None | VerdictState::Pending => {}
+    }
+    candidates.extend(state.subscribers.iter().map(String::as_str));
+    if !state.pr_author.is_empty() {
+        candidates.push(state.pr_author.as_str());
+    }
+    for member in candidates {
+        if let Some(orch) = crate::teams::find_team_for(home, member)
+            .and_then(|t| t.orchestrator)
+            .filter(|o| !o.is_empty())
+        {
+            return orch;
+        }
+    }
+    "fixup-lead".to_string()
+}
+
 /// t-verdict-to-author-routing-design (#2): the wire label for a verdict kind.
 fn verdict_label(kind: &VerdictKind) -> &'static str {
     match kind {
@@ -1546,6 +1590,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         // Inbox needs the inbox dir to exist.
         std::fs::create_dir_all(dir.join("inbox")).ok();
+        // #2059-#3: ready events route to the team orchestrator (merge
+        // authority). "dev" (the pr_author) is a team member; "lead-w" merges.
+        write_team_fleet(&dir, "lead-w", &["dev"]);
 
         // Build a MergeReady state on disk.
         let mut s = new_state("sha-A", ReviewClass::Single);
@@ -1568,7 +1615,7 @@ mod tests {
             &registry,
             &crate::daemon::pr_state::gh_poll::CliGhPoller,
         );
-        let inbox_msgs = crate::inbox::drain(&dir, "dev");
+        let inbox_msgs = crate::inbox::drain(&dir, "lead-w");
         assert_eq!(inbox_msgs.len(), 1, "expected one [pr-ready-for-merge]");
         assert_eq!(inbox_msgs[0].kind.as_deref(), Some("pr-ready-for-merge"));
         // Default fixture has pr_number=100 — body uses `owner/repo#100` form.
@@ -1595,7 +1642,7 @@ mod tests {
             &registry,
             &crate::daemon::pr_state::gh_poll::CliGhPoller,
         );
-        let inbox_msgs = crate::inbox::drain(&dir, "dev");
+        let inbox_msgs = crate::inbox::drain(&dir, "lead-w");
         assert!(
             inbox_msgs.is_empty(),
             "second scan must not re-emit; got {} message(s)",
@@ -1707,6 +1754,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::create_dir_all(dir.join("inbox")).ok();
+        // #2059-#3: ready events route to the team orchestrator (merge
+        // authority). "dev" is a team member; "lead-v" merges.
+        write_team_fleet(&dir, "lead-v", &["dev"]);
 
         // First CI observation arms the file with Dual.
         record_ci_result(
@@ -1744,7 +1794,7 @@ mod tests {
             &crate::daemon::pr_state::gh_poll::CliGhPoller,
         );
         assert!(
-            crate::inbox::drain(&dir, "dev").is_empty(),
+            crate::inbox::drain(&dir, "lead-v").is_empty(),
             "no [pr-ready-for-merge] until second verdict"
         );
 
@@ -1767,7 +1817,7 @@ mod tests {
             &registry,
             &crate::daemon::pr_state::gh_poll::CliGhPoller,
         );
-        let msgs = crate::inbox::drain(&dir, "dev");
+        let msgs = crate::inbox::drain(&dir, "lead-v");
         assert_eq!(msgs.len(), 1, "second verdict unlocks the merge gate");
         assert_eq!(msgs[0].kind.as_deref(), Some("pr-ready-for-merge"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2269,9 +2319,13 @@ mod tests {
         // to win via tier 2 name match. Set up a fleet.yaml with a
         // "suzuke" instance that matches the gh author.login.
         let home = home_with_state("ready-promote", s);
+        // gh author "suzuke" matches the fleet instance via tier-2 name match
+        // (drives pr_author resolution); the team's orchestrator "lead-z" is
+        // the #2059-#3 merge authority that the ready event routes to.
         std::fs::write(
             crate::fleet::fleet_yaml_path(&home),
-            "instances:\n  suzuke:\n    backend: claude\n",
+            "instances:\n  suzuke:\n    backend: claude\n  lead-z:\n    backend: claude\n\
+             teams:\n  squad:\n    orchestrator: lead-z\n    members:\n      - suzuke\n",
         )
         .unwrap();
         std::fs::create_dir_all(home.join("inbox")).ok();
@@ -2292,14 +2346,14 @@ mod tests {
             "pr_author resolved via tier-2 name match against fleet.yaml"
         );
 
-        // [pr-ready-for-merge] enqueued to the RESOLVED author (suzuke,
-        // NOT subscribers[0]'s "dev"). Body must include the gh-poll
-        // PR number (repo#990) NOT the placeholder repo@branch form.
-        let msgs = crate::inbox::drain(&home, "suzuke");
+        // #2059-#3: [pr-ready-for-merge] routes to the MERGE AUTHORITY
+        // (the team orchestrator lead-z), NOT the resolved author. Body must
+        // include the gh-poll PR number (repo#990) NOT the @branch placeholder.
+        let msgs = crate::inbox::drain(&home, "lead-z");
         assert_eq!(
             msgs.len(),
             1,
-            "exactly one [pr-ready-for-merge] to resolved author"
+            "exactly one [pr-ready-for-merge] to the team orchestrator (merge authority)"
         );
         assert_eq!(msgs[0].kind.as_deref(), Some("pr-ready-for-merge"));
         assert!(
@@ -2308,12 +2362,15 @@ mod tests {
             msgs[0].text
         );
 
-        // Subscriber["dev"] inbox should be empty — gh-poll's resolved
-        // author won over the legacy subscribers[0] fallback.
-        let dev_msgs = crate::inbox::drain(&home, "dev");
+        // The resolved author (suzuke) and subscribers[0] ("dev") must NOT
+        // receive the ready event — merge routing is decoupled from authorship.
         assert!(
-            dev_msgs.is_empty(),
-            "subscribers[0] fallback must NOT fire when gh-poll resolves a different author"
+            crate::inbox::drain(&home, "suzuke").is_empty(),
+            "resolved author must NOT receive [pr-ready-for-merge] (merge authority routing)"
+        );
+        assert!(
+            crate::inbox::drain(&home, "dev").is_empty(),
+            "subscribers[0] fallback must NOT fire — routing goes to merge authority"
         );
 
         let _ = std::fs::remove_dir_all(&home);
@@ -2621,12 +2678,15 @@ mod tests {
     }
 
     #[test]
-    fn pr_ready_for_merge_routes_to_bound_agent_gap_c() {
+    fn pr_ready_for_merge_routes_to_merge_authority_2059() {
         let home = verdict_home("prready-recipient");
         seed_task_with_branch(&home, "t-p", "feat/x");
         bind_author(&home, "dev-x", "feat/x");
+        // #2059-#3: a team whose orchestrator is the merge authority. The bound
+        // agent (dev-x) + the reviewer are members; the orchestrator (lead-x)
+        // is who merges.
+        write_team_fleet(&home, "lead-x", &["dev-x", "fixup-reviewer"]);
         write_verdict_state(&home, "feat/x", "headsha", true); // green, pr_author="suzuke"
-                                                               // record VERIFIED → merge_state becomes MergeReady (no [review-verdict] — dedup).
         record_verdict(
             &home,
             "t-p",
@@ -2634,14 +2694,23 @@ mod tests {
             Some("headsha"),
             VerdictKind::Verified,
         );
-        // The scanner emits [pr-ready-for-merge] for the merge-ready state.
         let poller = MockGhPoller::new(vec![Ok(vec![])]);
         scan_and_emit_with(&home, &empty_registry(), &poller);
+        // #2059-#3: merge-ready routes to the MERGE AUTHORITY (orchestrator),
+        // NOT the bound agent — the old bound-agent routing (gap C) was the
+        // PR #2058 mis-route (the implementer's binding is released post-push,
+        // and even live it's the author, not the merge actor).
         assert!(
-            crate::inbox::drain(&home, "dev-x")
+            crate::inbox::drain(&home, "lead-x")
                 .iter()
                 .any(|m| m.text.contains("[pr-ready-for-merge]")),
-            "[pr-ready-for-merge] must route to the BOUND agent (Gap C)"
+            "[pr-ready-for-merge] must route to the team orchestrator (merge authority)"
+        );
+        assert!(
+            !crate::inbox::drain(&home, "dev-x")
+                .iter()
+                .any(|m| m.text.contains("[pr-ready-for-merge]")),
+            "[pr-ready-for-merge] must NOT route to the bound implementer (the #2058 mis-route)"
         );
         assert!(
             !crate::inbox::drain(&home, "suzuke")
@@ -2775,5 +2844,84 @@ mod tests {
     #[test]
     fn t20_1017_replay_age_threshold_is_fixed_1h() {
         assert_eq!(replay_age_threshold(), std::time::Duration::from_secs(3600));
+    }
+
+    /// #2059-#3: write a fleet.yaml team so `find_team_for` resolves.
+    fn write_team_fleet(home: &std::path::Path, orch: &str, members: &[&str]) {
+        let mut y = String::from("instances:\n");
+        for m in members {
+            y.push_str(&format!("  {m}:\n    backend: claude\n"));
+        }
+        y.push_str(&format!(
+            "teams:\n  squad:\n    orchestrator: {orch}\n    members:\n"
+        ));
+        for m in members {
+            y.push_str(&format!("      - {m}\n"));
+        }
+        std::fs::write(crate::fleet::fleet_yaml_path(home), y).expect("write fleet.yaml");
+    }
+
+    /// #2059-#3: ready-for-merge resolves to the team ORCHESTRATOR via the
+    /// durable fleet.yaml teams config — from a reviewer / subscriber member,
+    /// NOT the branch binding.
+    #[test]
+    fn resolve_merge_authority_routes_to_orchestrator_2059() {
+        let home = tmp_home_for_1002("merge-auth-orch");
+        write_team_fleet(&home, "lead-x", &["dev-x", "rev-x"]);
+        let mut s = new_state("sha-A", ReviewClass::Single);
+        s.pr_author = "dev-x".to_string();
+        s.subscribers = vec!["dev-x".to_string()];
+        s.verdict_state = VerdictState::Verified {
+            reviewers: vec![("rev-x".to_string(), "sha-A".to_string())],
+        };
+        assert_eq!(
+            resolve_merge_authority(&home, &s),
+            "lead-x",
+            "merge-ready must route to the team orchestrator, not the author/reviewer"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2059-#3 CORE: with NO branch binding present (the implementer released
+    /// the worktree post-push — the PR #2058 case), merge-authority STILL
+    /// resolves to the orchestrator via teams; contrast `resolve_notify_
+    /// recipient`, which would fall through to the author here.
+    #[test]
+    fn resolve_merge_authority_no_binding_still_routes_2059() {
+        let home = tmp_home_for_1002("merge-auth-nobind");
+        write_team_fleet(&home, "lead-y", &["dev-y"]);
+        let mut s = new_state("sha-B", ReviewClass::Single);
+        s.branch = "feat/released".to_string();
+        s.pr_author = "dev-y".to_string();
+        s.subscribers = vec!["dev-y".to_string()];
+        // No binding for feat/released → resolve_notify_recipient = author (dev-y);
+        // resolve_merge_authority = orchestrator (lead-y).
+        assert_eq!(
+            resolve_notify_recipient(&home, &s),
+            "dev-y",
+            "control: author-facing falls to author"
+        );
+        assert_eq!(
+            resolve_merge_authority(&home, &s),
+            "lead-y",
+            "merge-authority must NOT mis-route to the author when the binding is gone"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2059-#3: no team for any member → explicit fixup-lead fallback.
+    #[test]
+    fn resolve_merge_authority_fallback_fixup_lead_2059() {
+        let home = tmp_home_for_1002("merge-auth-fallback");
+        // No fleet.yaml teams written → find_team_for returns None for all.
+        let mut s = new_state("sha-C", ReviewClass::Single);
+        s.pr_author = "stranger".to_string();
+        s.subscribers = vec!["stranger".to_string()];
+        assert_eq!(
+            resolve_merge_authority(&home, &s),
+            "fixup-lead",
+            "no resolvable team → explicit fixup-lead fallback"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 }
