@@ -242,7 +242,7 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
     };
     let env_for_spawn = env_from_params.as_ref().or(env_from_fleet.as_ref());
 
-    match crate::api::spawn_one(
+    match crate::agent_ops::spawn_one(
         ctx.home,
         ctx.registry,
         name,
@@ -797,7 +797,7 @@ mod tests {
         let size = (80u16, 24u16);
         let work_dir = crate::paths::workspace_dir(&home).join("team-meta");
         std::fs::create_dir_all(&work_dir).ok();
-        let result = crate::api::spawn_one(
+        let result = crate::agent_ops::spawn_one(
             ctx.home,
             ctx.registry,
             "team-meta",

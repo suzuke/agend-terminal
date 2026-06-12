@@ -203,7 +203,7 @@ pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
         if let Some(model) = resolved.as_ref().and_then(|r| r.model.as_deref()) {
             crate::backend::Backend::push_model_arg(&mut member_args, backend, model);
         }
-        match crate::api::spawn_one(
+        match crate::agent_ops::spawn_one(
             ctx.home,
             ctx.registry,
             inst_name,
