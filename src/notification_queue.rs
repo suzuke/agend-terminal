@@ -542,12 +542,43 @@ mod tests {
         dir
     }
 
+    /// Retry-accumulate `drain` to absorb #2028's transient `Unavailable→empty`.
+    /// `drain()` is contractually allowed to return an empty vec when
+    /// `try_acquire_file_lock` hits a transient open/lock hiccup under heavy
+    /// parallel load (llvm-cov-grade fd pressure) — production's flusher simply
+    /// retries next tick, so a one-shot drain is NOT authoritative. A test that
+    /// trusts it indexes an empty vec → index panic (the #2072 coverage flake,
+    /// notification_queue.rs `again[0]`). This helper models the retry: it keeps
+    /// draining (accumulating, since `drain` is destructive) until it has `want`
+    /// items or the bounded budget elapses. The happy path returns on the first
+    /// attempt — zero behavior change when the drain succeeds immediately.
+    fn drain_settled(home: &Path, agent_name: &str, want: usize) -> Vec<QueuedNotification> {
+        drain_settled_with_stale(home, agent_name, want, STALE_DRAINING_MS)
+    }
+
+    fn drain_settled_with_stale(
+        home: &Path,
+        agent_name: &str,
+        want: usize,
+        stale_ms: u128,
+    ) -> Vec<QueuedNotification> {
+        let mut acc = Vec::new();
+        for _ in 0..200 {
+            acc.extend(drain_with_stale_threshold(home, agent_name, stale_ms));
+            if acc.len() >= want {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        acc
+    }
+
     #[test]
     fn enqueue_classified_round_trips_actionable_and_deferred_since_1513() {
         let home = tmp_home("classified");
         enqueue_classified(&home, "a", "work", true).expect("enqueue actionable");
         enqueue(&home, "a", "ambient").expect("enqueue ambient"); // actionable=false default
-        let drained = drain(&home, "a");
+        let drained = drain_settled(&home, "a", 2);
         assert_eq!(drained.len(), 2);
         let actionable = drained
             .iter()
@@ -566,11 +597,58 @@ mod tests {
         // requeue preserves the original deferred_since (cap counts from first defer)
         let since = actionable.deferred_since_ms;
         requeue_all(&home, "a", std::slice::from_ref(actionable));
-        let again = drain(&home, "a");
+        let again = drain_settled(&home, "a", 1);
         assert_eq!(
             again[0].deferred_since_ms, since,
             "requeue preserves deferred_since"
         );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn drain_settled_retries_through_transient_lock_contention_2072() {
+        // Deterministic reproduction of the #2072 coverage-flake MECHANISM:
+        // while a peer holds the drain lock, a one-shot `drain()` returns empty
+        // (#2028 `Unavailable→empty`), so a test that trusts it indexes an empty
+        // vec → index panic (the live failure at `again[0]`). `drain_settled`
+        // must RETRY across the contention window and recover the item once the
+        // lock frees — exactly what the production flusher does next tick.
+        use std::sync::mpsc;
+        let home = tmp_home("transient_lock_2072");
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::create_dir_all(&home).ok();
+        enqueue(&home, "a", "delayed").expect("enqueue");
+
+        let (held_tx, held_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let lock_path = drain_lock_path(&home, "a");
+        let peer = std::thread::spawn(move || {
+            let guard = crate::store::try_acquire_file_lock(&lock_path)
+                .expect("lock op")
+                .expect("peer acquires drain lock");
+            held_tx.send(()).expect("signal held");
+            // Hold until the test has observed the contention, then release
+            // inside `drain_settled`'s retry window.
+            go_rx.recv().expect("await go");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            drop(guard);
+        });
+
+        held_rx.recv().expect("peer holds the lock");
+        // A one-shot drain while the lock is held is empty — the exact trap.
+        assert!(
+            drain(&home, "a").is_empty(),
+            "one-shot drain under contention returns empty (#2028 Unavailable→empty)"
+        );
+        go_tx.send(()).expect("let the peer schedule its release");
+        let got = drain_settled(&home, "a", 1);
+        peer.join().ok();
+        assert_eq!(
+            got.len(),
+            1,
+            "drain_settled recovers the item after the lock frees"
+        );
+        assert_eq!(got[0].text, "delayed");
         std::fs::remove_dir_all(home).ok();
     }
 
@@ -588,7 +666,7 @@ mod tests {
         let home = tmp_home("drain");
         enqueue(&home, "agent1", "a").expect("enqueue a");
         enqueue(&home, "agent1", "b").expect("enqueue b");
-        let drained = drain(&home, "agent1");
+        let drained = drain_settled(&home, "agent1", 2);
         assert_eq!(drained.len(), 2);
         assert_eq!(drained[0].text, "a");
         assert_eq!(pending_count(&home, "agent1"), 0);
@@ -964,7 +1042,7 @@ mod tests {
         enqueue(&home, "a", "crashed-claim").expect("enqueue");
         std::fs::rename(queue_path(&home, "a"), draining_path(&home, "a"))
             .expect("simulate crashed drainer's leftover claim");
-        let got = drain_with_stale_threshold(&home, "a", 0);
+        let got = drain_settled_with_stale(&home, "a", 1, 0);
         assert_eq!(got.len(), 1, "stale leftover must be recovered");
         assert_eq!(got[0].text, "crashed-claim");
         assert_eq!(pending_count(&home, "a"), 0, "leftover consumed");
