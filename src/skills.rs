@@ -1,6 +1,7 @@
-//! Sprint 60 W2 PR-1 (#P1-1 Skills System Plan IMPL) — 5-backend
+//! Sprint 60 W2 PR-1 (#P1-1 Skills System Plan IMPL) — 4-backend
 //! community skill discovery via unified source + symlink (Windows
-//! copy fallback).
+//! copy fallback). (Originally 5 backends; #1580 retired gemini-cli —
+//! see `BACKEND_SKILL_DIRS`.)
 //!
 //! ## Architecture
 //!
@@ -13,12 +14,11 @@
 //! agent-working-dir/
 //!   ├── .claude/skills/  → symlink → ~/.agend-terminal/skills/
 //!   ├── .codex/skills/   → symlink → ~/.agend-terminal/skills/
-//!   ├── .gemini/skills/  → symlink → ~/.agend-terminal/skills/
 //!   ├── .opencode/skills/→ symlink → ~/.agend-terminal/skills/
 //!   └── .kiro/skills/    → symlink → ~/.agend-terminal/skills/
 //! ```
 //!
-//! Unified source means: one skill file, all 5 backends discover.
+//! Unified source means: one skill file, all 4 backends discover.
 //! No file copies on Unix (symlink = zero maintenance). Windows
 //! falls back to copy with hash-compare staleness detection on
 //! subsequent installs (file-watch infra is out of scope per
@@ -1010,7 +1010,7 @@ mod tests {
     #[test]
     fn install_for_agent_succeeds_with_empty_source_root() {
         // Empty source: install_for_agent ensures the source root exists
-        // (via ensure_skills_root) then iterates 5 backends; each install
+        // (via ensure_skills_root) then iterates 4 backends; each install
         // creates an empty symlink/copy target with the marker. The
         // outcomes vec has one entry per backend, all in Symlink/Copy
         // mode (no Skipped from missing source). This is the daemon's
