@@ -685,6 +685,41 @@ fn resolve_source_repo(
 /// `actor` is the agent / instance name used as `event_log` identifier
 /// for the fetch-duration breadcrumb (helps post-mortem who triggered
 /// the network I/O).
+/// #2010 (cheerc RCA): resolve which git remote a `from_ref` names, by
+/// LONGEST-PREFIX match against the repo's actual remote list. Branch names can
+/// contain `/`, so a naive `split('/')` mis-parses `upstream/feat/x`; matching
+/// against the real remotes (longest name first, so `forkpa` wins over `fork`
+/// on `forkpa/x`) is the only correct split. Returns the remote name and the
+/// branch portion with that remote's prefix stripped — `None` branch when
+/// `from_ref` carries no remote prefix (a bare local ref). Falls back to
+/// `("origin", None)` when nothing matches (origin-only setups unaffected).
+///
+/// Documented ambiguity (§3.9 case 4): when a branch's first segment equals a
+/// remote name — remote `fork` + a literal `from_ref` of `fork/feature` —
+/// longest-prefix treats it as remote-qualified (remote=`fork`, branch=
+/// `feature`). Fully-qualify (`origin/fork/feature`) to force the other reading.
+fn resolve_from_ref_remote(source: &Path, from_ref: &str) -> (String, Option<String>) {
+    let mut remotes: Vec<String> = crate::git_helpers::git_bypass(source, &["remote"])
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    // Longest remote name first so a longer name wins the prefix race.
+    remotes.sort_by_key(|r| std::cmp::Reverse(r.len()));
+    for r in &remotes {
+        if let Some(rest) = from_ref.strip_prefix(&format!("{r}/")) {
+            return (r.clone(), Some(rest.to_string()));
+        }
+    }
+    ("origin".to_string(), None)
+}
+
 pub(crate) fn ensure_branch_exists(
     home: &Path,
     source: &Path,
@@ -701,6 +736,12 @@ pub(crate) fn ensure_branch_exists(
             raw: None,
         });
     }
+    // #2010 (cheerc RCA): resolve which remote `from_ref` names ONCE and use it
+    // consistently at all three network sites below — they were hard-coded to
+    // `origin`, so a fork / multi-remote `from_ref` (e.g. `upstream/main` via a
+    // free-form `repo checkout`) fetched/refreshed/fell-back against the wrong
+    // remote. `origin/<x>` stays byte-identical (resolve returns origin).
+    let (remote, from_ref_branch) = resolve_from_ref_remote(source, from_ref);
     let branch_ref = format!("refs/heads/{branch}");
     let branch_exists =
         crate::git_helpers::git_bypass(source, &["rev-parse", "--verify", &branch_ref])
@@ -731,11 +772,11 @@ pub(crate) fn ensure_branch_exists(
         // pre-fix behaviour for that edge case.
         let fetch_out = crate::git_helpers::git_bypass_timeout(
             source,
-            &["fetch", "origin", branch, "--quiet"],
+            &["fetch", &remote, branch, "--quiet"],
             crate::git_helpers::NETWORK_GIT_TIMEOUT,
         );
         let fetched_ok = matches!(&fetch_out, Ok(o) if o.status.success());
-        let remote_branch_ref = format!("refs/remotes/origin/{branch}");
+        let remote_branch_ref = format!("refs/remotes/{remote}/{branch}");
         let remote_exists =
             crate::git_helpers::git_bypass(source, &["rev-parse", "--verify", &remote_branch_ref])
                 .map(|o| o.status.success())
@@ -760,11 +801,11 @@ pub(crate) fn ensure_branch_exists(
     // `fetch_attempted` reports SUCCESS (matches #869's `fetched_ok`), so the
     // no-remote test fixtures keep reporting `false`.
     let mut create_fetched = false;
-    if let Some(remote_branch) = from_ref.strip_prefix("origin/") {
+    if let Some(remote_branch) = from_ref_branch.as_deref() {
         let fetch_start = std::time::Instant::now();
         let fetch_out = crate::git_helpers::git_bypass_timeout(
             source,
-            &["fetch", "origin", remote_branch, "--quiet"],
+            &["fetch", &remote, remote_branch, "--quiet"],
             crate::git_helpers::NETWORK_GIT_TIMEOUT,
         );
         create_fetched = matches!(&fetch_out, Ok(o) if o.status.success());
@@ -800,7 +841,7 @@ pub(crate) fn ensure_branch_exists(
                 let fetch_start = std::time::Instant::now();
                 let fetch_out = crate::git_helpers::git_bypass_timeout(
                     source,
-                    &["fetch", "origin", "--quiet"],
+                    &["fetch", &remote, "--quiet"],
                     crate::git_helpers::NETWORK_GIT_TIMEOUT,
                 );
                 let fetch_ms = fetch_start.elapsed().as_millis();

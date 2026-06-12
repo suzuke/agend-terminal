@@ -2622,3 +2622,171 @@ fn canonicalize_repo_slug_lowercase_is_load_bearing_for_identity() {
     assert_eq!(b, c);
     assert_eq!(a, "owner/repo");
 }
+
+// ── #2010 (cheerc RCA): from_ref remote resolution (longest-prefix) ──
+
+/// Minimal repo with a chosen set of named remotes (no commits needed —
+/// `resolve_from_ref_remote` only reads `git remote`).
+fn repo_with_remotes(tag: &str, remotes: &[&str]) -> std::path::PathBuf {
+    let repo = std::env::temp_dir().join(format!("agend-2010-{tag}-{}", std::process::id()));
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::create_dir_all(&repo).ok();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git spawn");
+    };
+    git(&["init", "-b", "main"]);
+    for r in remotes {
+        git(&["remote", "add", r, &format!("file:///dev/null/{r}")]);
+    }
+    repo
+}
+
+/// §3.9 case 1 + 3 + the slash-in-branch correctness the naive split misses.
+#[test]
+fn resolve_from_ref_remote_multi_remote_2010() {
+    let repo = repo_with_remotes("resolve-multi", &["origin", "upstream"]);
+    // upstream/main → (upstream, main)
+    assert_eq!(
+        super::resolve_from_ref_remote(&repo, "upstream/main"),
+        ("upstream".to_string(), Some("main".to_string()))
+    );
+    // origin/main → (origin, main) — byte-identical default path.
+    assert_eq!(
+        super::resolve_from_ref_remote(&repo, "origin/main"),
+        ("origin".to_string(), Some("main".to_string()))
+    );
+    // branch name with `/` — the naive split('/') bug: must keep the whole tail.
+    assert_eq!(
+        super::resolve_from_ref_remote(&repo, "upstream/feat/x"),
+        ("upstream".to_string(), Some("feat/x".to_string()))
+    );
+    // bare branch name (no remote prefix) → origin fallback, no strip (case 3).
+    assert_eq!(
+        super::resolve_from_ref_remote(&repo, "main"),
+        ("origin".to_string(), None)
+    );
+    // a remote name that isn't configured → origin fallback (latent until added).
+    assert_eq!(
+        super::resolve_from_ref_remote(&repo, "nope/main"),
+        ("origin".to_string(), None)
+    );
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// §3.9: longest-prefix wins, so a longer remote name isn't shadowed by a
+/// shorter one that is its prefix.
+#[test]
+fn resolve_from_ref_remote_longest_prefix_wins_2010() {
+    let repo = repo_with_remotes("resolve-longest", &["fork", "forkpa"]);
+    assert_eq!(
+        super::resolve_from_ref_remote(&repo, "forkpa/x"),
+        ("forkpa".to_string(), Some("x".to_string())),
+        "forkpa must win over fork on forkpa/x (sorted longest-first)"
+    );
+    assert_eq!(
+        super::resolve_from_ref_remote(&repo, "fork/x"),
+        ("fork".to_string(), Some("x".to_string()))
+    );
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// §3.9 case 4 (documented ambiguity): remote `fork` + a from_ref of
+/// `fork/feature` is read as remote-qualified (remote=fork, branch=feature) —
+/// the branch's first segment colliding with a remote name resolves toward the
+/// remote. The doc comment tells callers to fully-qualify to force the other
+/// reading; this test PINS the chosen resolution so a future change is loud.
+#[test]
+fn resolve_from_ref_remote_branch_segment_collides_with_remote_2010() {
+    let repo = repo_with_remotes("resolve-collide", &["origin", "fork"]);
+    assert_eq!(
+        super::resolve_from_ref_remote(&repo, "fork/feature"),
+        ("fork".to_string(), Some("feature".to_string())),
+        "first-segment==remote-name resolves to that remote (documented)"
+    );
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// §3.9 case 1 end-to-end: with `from_ref = upstream/main` on a multi-remote
+/// repo, the pre-create fetch + branch create target UPSTREAM (not the
+/// hard-coded origin) and the new branch lands on upstream's main.
+#[test]
+fn ensure_branch_exists_creates_from_non_origin_remote_2010() {
+    let home = std::env::temp_dir().join(format!("agend-2010-upstream-{}", std::process::id()));
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::create_dir_all(&home).ok();
+    let workspace = crate::paths::workspace_dir(&home);
+    std::fs::create_dir_all(&workspace).ok();
+    let upstream = workspace.join("up.git");
+    let repo = workspace.join("agent");
+
+    let git = |args: &[&str], dir: &std::path::Path| -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git spawn");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    // Bare upstream with a real main, plus a (dummy) origin so origin is NOT
+    // the only remote — the resolve must actively pick upstream.
+    std::fs::create_dir_all(&upstream).ok();
+    git(&["init", "--bare", "-b", "main"], &upstream);
+    std::fs::create_dir_all(&repo).ok();
+    git(&["init", "-b", "main"], &repo);
+    git(
+        &["remote", "add", "origin", "file:///dev/null/origin-dummy"],
+        &repo,
+    );
+    git(
+        &["remote", "add", "upstream", upstream.to_str().unwrap()],
+        &repo,
+    );
+    for m in ["A", "B"] {
+        git(
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "--allow-empty",
+                "-m",
+                m,
+            ],
+            &repo,
+        );
+    }
+    let upstream_head = git(&["rev-parse", "HEAD"], &repo);
+    git(&["push", "-q", "upstream", "main"], &repo);
+    // Drop the local main + any tracking refs so the create MUST fetch upstream.
+    git(&["update-ref", "-d", "refs/remotes/upstream/main"], &repo);
+
+    let (created, fetched) =
+        super::ensure_branch_exists(&home, &repo, "feat/from-upstream", "upstream/main", "agent")
+            .expect("ensure_branch_exists must resolve upstream");
+    assert!(created, "a fresh branch must be created");
+    assert!(
+        fetched,
+        "the pre-create fetch must hit upstream (real remote)"
+    );
+    // The new branch is based on upstream's HEAD (B), proving the create used
+    // the upstream-resolved ref rather than a missing/stale origin one.
+    let new_sha = git(&["rev-parse", "refs/heads/feat/from-upstream"], &repo);
+    assert_eq!(
+        new_sha, upstream_head,
+        "branch must land on upstream/main HEAD"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
