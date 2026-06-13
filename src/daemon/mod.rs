@@ -202,6 +202,8 @@ fn confirm_shutdown_or_abort_respawn(shutdown: &AtomicBool) -> bool {
     }
     if self_respawn_successor_died() {
         tracing::error!(
+            target: "handoff",
+            event = "abort_stay_alive",
             "#1814 self-respawn: successor died after commit but before predecessor exit — \
              ABORTING restart, staying alive (no brick). Operator may retry restart_daemon."
         );
@@ -938,9 +940,11 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
             std::thread::sleep(self_respawn_settle());
             if self_respawn_successor_died() {
                 tracing::error!(
-                "#1814 self-respawn: successor died DURING predecessor teardown — recovering as \
-                 primary (re-spawning agents, resuming; no brick)."
-            );
+                    target: "handoff",
+                    event = "recover_as_primary",
+                    "#1814 self-respawn: successor died DURING predecessor teardown — recovering as \
+                     primary (re-spawning agents, resuming; no brick)."
+                );
                 RESTART_PENDING.store(false, Ordering::Release);
                 ctx.shutdown.store(false, Ordering::Relaxed);
                 *SELF_RESPAWN_SUCCESSOR

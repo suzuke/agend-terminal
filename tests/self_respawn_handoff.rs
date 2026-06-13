@@ -465,3 +465,130 @@ fn self_respawn_recovers_as_primary_when_successor_dies_during_teardown() {
         "predecessor must re-spawn + keep serving its agent after recover-as-primary"
     );
 }
+
+/// Boot a daemon like `boot` but with stderr PIPED (so the loser's
+/// already-running / lock error is capturable) and self-respawn ON. Shares the
+/// `fleet.yaml` write so concurrent racers resolve the same probe agent.
+fn boot_capturing_stderr(home: &Path) -> Child {
+    std::fs::create_dir_all(home).ok();
+    std::fs::write(
+        home.join("fleet.yaml"),
+        "instances:\n  probe:\n    backend: shell\n    command: /bin/sh\n",
+    )
+    .expect("write fleet.yaml");
+    Command::new(bin())
+        .env("AGEND_HOME", home)
+        .env("AGEND_RESTART_HANDOFF", "1")
+        .env_remove("AGEND_WRAPPED")
+        .env_remove("XPC_SERVICE_NAME")
+        .env_remove("INVOCATION_ID")
+        .env_remove("AGEND_SUCCESSOR_HANDOFF")
+        .args(["start", "--foreground"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("daemon must spawn")
+}
+
+/// #1814 Phase 1 — the spike's biggest UNVERIFIED risk, now pinned: a flag-ON
+/// self-respawn `exit(0)` can race an external supervisor (launchd `KeepAlive`)
+/// respawn. Two daemons must NEVER both bind. This drives the REAL race: two
+/// daemon binaries started near-simultaneously on the SAME `AGEND_HOME` — at
+/// that instant neither's api socket is up yet, so each one's early
+/// `try_attach` finds nothing and BOTH reach `bootstrap::acquire_daemon_lock`,
+/// where the `.daemon.lock` `try_lock` fail-fast lets exactly ONE win. The
+/// loser exits non-zero with the "already running" lock error — it does NOT
+/// become a second daemon. (§3.9: real binaries competing for the real flock,
+/// no mock.)
+#[test]
+fn flag_on_concurrent_respawn_cannot_double_bind_via_flock_1814() {
+    let home = std::env::temp_dir().join(format!("agend-1814-dualbind-{}", std::process::id()));
+    std::fs::create_dir_all(&home).expect("mkdir AGEND_HOME");
+
+    // Two real daemons, same home, fired back-to-back to maximise the flock
+    // race (the launchd-KeepAlive-vs-self-respawn collision the spike flagged).
+    let mut a = boot_capturing_stderr(&home);
+    let mut b = boot_capturing_stderr(&home);
+
+    // Exactly ONE must become the active daemon (the flock winner).
+    let winner = wait_for_single_active(&home, Duration::from_secs(30), pid_alive);
+
+    // The other must EXIT (a daemon stays alive; the flock loser does not).
+    // Poll both for exit within a generous window.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut a_status = None;
+    let mut b_status = None;
+    while Instant::now() < deadline && (a_status.is_none() || b_status.is_none()) {
+        if a_status.is_none() {
+            a_status = a.try_wait().ok().flatten();
+        }
+        if b_status.is_none() {
+            b_status = b.try_wait().ok().flatten();
+        }
+        if a_status.is_some() || b_status.is_some() {
+            // One has exited — the invariant we care about; stop early once the
+            // active-daemon count is confirmed single below.
+            std::thread::sleep(Duration::from_millis(100));
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let active = active_pids(&home);
+    // Capture the loser's stderr for the lock-error assertion before cleanup.
+    let loser_stderr = {
+        let mut s = String::new();
+        for (child, status) in [(&mut a, &a_status), (&mut b, &b_status)] {
+            if status.is_some() {
+                if let Some(mut err) = child.stderr.take() {
+                    use std::io::Read;
+                    let _ = err.read_to_string(&mut s);
+                }
+            }
+        }
+        s
+    };
+
+    // Tear down whichever is still alive (the winner) + reap.
+    let _ = a.kill();
+    let _ = b.kill();
+    let _ = a.wait();
+    let _ = b.wait();
+    cleanup_test_home(&home);
+
+    // ── Load-bearing invariant: NO double-bind ──
+    assert!(
+        winner.is_some(),
+        "exactly one daemon must win the flock and serve — neither came up"
+    );
+    assert_eq!(
+        active.len(),
+        1,
+        "NO double-bind: exactly one active daemon (run dir + api.port + live pid), got {}",
+        active.len()
+    );
+    // The loser must EXIT (a real second daemon stays alive); the winner is
+    // still running (we killed it above). Exactly one should have exited during
+    // the poll window — and with a non-success status (it FAILED to bind, did
+    // not clean-exit as a daemon).
+    let loser_status = a_status.or(b_status);
+    let loser = loser_status.expect("the flock loser must EXIT — neither process exited");
+    assert!(
+        !loser.success(),
+        "the flock loser must exit NON-zero (failed to acquire the lock), got {loser:?}"
+    );
+    // Mechanism confirmation (best-effort): the fail-fast is the `.daemon.lock`
+    // try_lock → "already running (lock held)". Captured from stderr when the
+    // CLI surfaces it there; if the build routes the error only to the rolling
+    // log the non-zero exit + single-active assertions above still prove the
+    // guard, so this is a soft check (logged, asserted only when stderr carried
+    // the error).
+    eprintln!("[1814] flock-loser stderr: {loser_stderr:?}");
+    if !loser_stderr.trim().is_empty() {
+        assert!(
+            loser_stderr.to_lowercase().contains("already running")
+                || loser_stderr.to_lowercase().contains("lock"),
+            "loser stderr present but not the lock fail-fast: {loser_stderr:?}"
+        );
+    }
+}

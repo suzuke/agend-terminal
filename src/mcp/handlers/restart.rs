@@ -8,7 +8,18 @@ pub(super) fn handle_restart_daemon(home: &Path) -> Value {
     // supervisor being correctly detected (retires the #851/#1812 brick class
     // at the root). Flag OFF → the legacy supervisor + exit(42) path below runs
     // byte-identically.
-    if crate::daemon::restart::self_respawn_enabled() {
+    // #1814 observability: record which restart path this request takes so the
+    // pre-soak operator A/B (legacy exit42 vs self-respawn) is greppable on one
+    // tag. `target: "handoff"` + an `event` field make the handoff lifecycle
+    // events countable from the rolling log without a metrics framework.
+    let self_respawn = crate::daemon::restart::self_respawn_enabled();
+    tracing::info!(
+        target: "handoff",
+        event = "restart_requested",
+        path = if self_respawn { "self-respawn" } else { "legacy-exit42" },
+        "#1814 restart_daemon path selected"
+    );
+    if self_respawn {
         return handle_self_respawn(home);
     }
 
@@ -98,6 +109,8 @@ fn handle_self_respawn(home: &Path) -> Value {
         crate::daemon::RESTART_PENDING.store(true, std::sync::atomic::Ordering::Release);
         std::fs::write(home.join("restart-requested"), "").ok();
         tracing::info!(
+            target: "handoff",
+            event = "committed",
             successor_pid = succ_pid,
             "#1814 self-respawn: committed — predecessor exiting"
         );
@@ -113,6 +126,8 @@ fn handle_self_respawn(home: &Path) -> Value {
         // a client to a half-dead successor. The predecessor was NEVER signalled
         // → it stays fully alive with its agents intact.
         tracing::warn!(
+            target: "handoff",
+            event = "abort_phase1_failed",
             successor_pid = succ.pid,
             "#1814 self-respawn: successor FAILED Phase-1 gate — aborting; predecessor stays alive"
         );
@@ -131,7 +146,8 @@ fn handle_self_respawn(home: &Path) -> Value {
 /// cookie-authenticated api round-trip succeeds. Returns false on the
 /// successor dying, the timeout, or a persistently unreachable api.
 fn phase1_gate(succ: &mut crate::bootstrap::daemon_spawn::SuccessorHandle) -> bool {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let started = std::time::Instant::now();
+    let deadline = started + std::time::Duration::from_secs(30);
     let control_ready = succ.run_dir.join(crate::daemon::CONTROL_READY_FILE);
     loop {
         // `try_wait` detects a crash-on-launch immediately AND reaps the child
@@ -139,7 +155,11 @@ fn phase1_gate(succ: &mut crate::bootstrap::daemon_spawn::SuccessorHandle) -> bo
         // as alive). `Ok(Some(_))` = exited.
         if matches!(succ.child.try_wait(), Ok(Some(_))) {
             tracing::warn!(
+                target: "handoff",
+                event = "phase1_failed",
+                reason = "successor_exited",
                 successor_pid = succ.pid,
+                elapsed_ms = started.elapsed().as_millis() as u64,
                 "#1814 Phase-1: successor process exited during startup"
             );
             return false;
@@ -151,11 +171,22 @@ fn phase1_gate(succ: &mut crate::bootstrap::daemon_spawn::SuccessorHandle) -> bo
             )
             .is_ok()
         {
+            tracing::info!(
+                target: "handoff",
+                event = "phase1_passed",
+                successor_pid = succ.pid,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "#1814 Phase-1: successor control-ready + api healthy"
+            );
             return true;
         }
         if std::time::Instant::now() >= deadline {
             tracing::warn!(
+                target: "handoff",
+                event = "phase1_failed",
+                reason = "timeout",
                 successor_pid = succ.pid,
+                elapsed_ms = started.elapsed().as_millis() as u64,
                 "#1814 Phase-1: successor not control-ready within timeout"
             );
             return false;
