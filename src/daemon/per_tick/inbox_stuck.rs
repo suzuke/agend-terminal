@@ -50,8 +50,17 @@ impl PerTickHandler for InboxStuckHandler {
             return;
         }
         let now = chrono::Utc::now();
+        // #latch-prune (cleanup-on-delete, #1923 G5 class): snapshot live agent
+        // names (registry locked then dropped — BEFORE locking the latch, so no
+        // nesting) so the `last_alerted` dedup latch can drop deleted agents
+        // below; else a same-name redeploy inherits a stale re-alert timer.
+        let live: std::collections::HashSet<String> = {
+            let reg = crate::agent::lock_registry(ctx.registry);
+            reg.values().map(|h| h.name.as_str().to_string()).collect()
+        };
         let mut last = self.last_alerted.lock();
         crate::daemon::inbox_stuck_watchdog::scan_and_emit(ctx.home, &now, &mut last);
+        last.retain(|name, _| live.contains(name));
     }
 }
 
@@ -89,5 +98,40 @@ mod tests {
 
         let aged = InboxStuckHandler::new_at(30, past_grace());
         assert!(aged.gate.fire(), "after grace, first tick fires");
+    }
+
+    /// #latch-prune (cleanup-on-delete, #1923 G5 class): a `last_alerted` dedup
+    /// entry for an agent no longer in the registry is dropped on the next
+    /// `run` (real entry, empty registry = deleted; `new_at(.., past_grace())`
+    /// so the boot-grace gate fires) — so a same-name redeploy doesn't inherit
+    /// a stale re-alert timer that swallows its first stuck-inbox alert.
+    #[test]
+    fn deleted_agent_alert_timer_pruned_on_run() {
+        use parking_lot::Mutex as PLMutex;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        let home =
+            std::env::temp_dir().join(format!("agend-inboxstuck-prune-{}", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        let registry: crate::agent::AgentRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let externals: crate::agent::ExternalRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let configs: Arc<PLMutex<HashMap<String, crate::daemon::AgentConfig>>> =
+            Arc::new(PLMutex::new(HashMap::new()));
+        let h = InboxStuckHandler::new_at(1, past_grace()); // past grace → gate fires
+        h.last_alerted
+            .lock()
+            .insert("ghost".to_string(), chrono::Utc::now());
+        let ctx = TickContext {
+            home: &home,
+            registry: &registry,
+            externals: &externals,
+            configs: &configs,
+        };
+        h.run(&ctx);
+        assert!(
+            !h.last_alerted.lock().contains_key("ghost"),
+            "a deleted agent's re-alert timer must be pruned on run (cleanup-on-delete)"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 }

@@ -105,14 +105,21 @@ impl PerTickHandler for ContextAlertHandler {
         // — statusline pattern only (#1945-disable: no transcript estimate;
         // an unreadable pane is unknown and never alerts).
         let mut resolved: Vec<(String, f32, &'static str)> = Vec::new();
-        {
+        // #latch-prune (cleanup-on-delete, #1923 G5 class): capture ALL live
+        // agent names — not just those with a context reading — so the per-agent
+        // `states` latch can drop deleted agents below. Without it a same-name
+        // redeploy inherits a stale armed/alerted latch.
+        let live: std::collections::HashSet<String> = {
             let reg = crate::agent::lock_registry(ctx.registry);
+            let mut live = std::collections::HashSet::new();
             for handle in reg.values() {
+                live.insert(handle.name.as_str().to_string());
                 if let Some((pct, source)) = handle.core.lock().state.resolved_context() {
                     resolved.push((handle.name.as_str().to_string(), pct, source));
                 }
             }
-        }
+            live
+        };
 
         // Phase 2: threshold/hysteresis evaluation + orchestrator notify.
         let threshold = alert_threshold();
@@ -156,6 +163,9 @@ impl PerTickHandler for ContextAlertHandler {
             }
             tracing::info!(agent = %name, %recipient, pct, source, "context_alert: alerted orchestrator");
         }
+        // #latch-prune: drop latch entries for agents gone from the registry
+        // (cleanup-on-delete) so a deleted agent leaves no stale state.
+        states.retain(|name, _| live.contains(name));
     }
 }
 
@@ -228,5 +238,39 @@ mod tests {
         let now = Instant::now();
         assert!(!decide(&mut s, 0.0, T, now));
         assert!(!decide(&mut s, 79.9, T, now));
+    }
+
+    /// #latch-prune (cleanup-on-delete, #1923 G5 class): a latch entry for an
+    /// agent no longer in the registry (deleted) is dropped on the next `run`,
+    /// via the REAL handler entry (empty registry = the agent was deleted) — so
+    /// a same-name redeploy never inherits stale alert state.
+    #[test]
+    fn deleted_agent_latch_pruned_on_run() {
+        use parking_lot::Mutex as PLMutex;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        let home =
+            std::env::temp_dir().join(format!("agend-ctxalert-prune-{}", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        let registry: crate::agent::AgentRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let externals: crate::agent::ExternalRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let configs: Arc<PLMutex<HashMap<String, crate::daemon::AgentConfig>>> =
+            Arc::new(PLMutex::new(HashMap::new()));
+        let h = ContextAlertHandler::new(1); // fire every tick (no boot-grace)
+        h.states
+            .lock()
+            .insert("ghost".to_string(), AlertState::default());
+        let ctx = TickContext {
+            home: &home,
+            registry: &registry,
+            externals: &externals,
+            configs: &configs,
+        };
+        h.run(&ctx); // real entry: live={} from the empty registry → retain
+        assert!(
+            !h.states.lock().contains_key("ghost"),
+            "a deleted agent's latch must be pruned on run (cleanup-on-delete)"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 }
