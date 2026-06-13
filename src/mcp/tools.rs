@@ -225,7 +225,7 @@ pub(crate) fn def_task_sweep_config() -> Value {
 }
 
 pub(crate) fn def_restart_daemon() -> Value {
-    json!({"name": "restart_daemon", "description": "Request graceful daemon restart. Daemon exits with code 42 after shutdown; a supervisor (launchd/systemd/Task Scheduler from `agend-terminal service install`, or `scripts/agend-wrapper.sh` for manual mode) respawns it. Returns ok:false when no supervisor is detected (bare `agend-terminal start`) — operator must install a supervisor before retry. Idempotent.",
+    json!({"name": "restart_daemon", "description": "Request a graceful daemon restart. Default (#1814): the daemon self-respawns — it spawns a successor, health-gates it, and only then exits(0) so the successor takes over; NO external supervisor required. Opt-out `AGEND_RESTART_HANDOFF=0` takes the legacy path (exit code 42 + a launchd/systemd/Task-Scheduler supervisor from `agend-terminal service install`, or `scripts/agend-wrapper.sh`, respawns it; returns ok:false if no supervisor is detected). Returns ok:false in `agend-terminal app` (combined TUI+daemon) mode — that process has no in-process restart consumer, so quit and relaunch the app, or SIGTERM + restart. Idempotent.",
         "inputSchema": {"type": "object", "properties": {}}})
 }
 
