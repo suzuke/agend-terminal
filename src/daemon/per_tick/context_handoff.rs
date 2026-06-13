@@ -507,4 +507,42 @@ mod tests {
         );
         std::fs::remove_dir_all(&home).ok();
     }
+
+    /// #latch-prune reverse-regression (reviewer-2 #2097): a LIVE agent without
+    /// a context reading this tick must KEEP its episode latch — `live.insert`
+    /// must be UNCONDITIONAL, not gated on `resolved_context()`. If it regressed
+    /// to the reading-subset, a working agent's in-progress episode would be
+    /// wrongly dropped (re-arming a duplicate handoff). Real `run()` entry.
+    #[test]
+    fn live_agent_without_context_reading_keeps_episode() {
+        use parking_lot::Mutex as PLMutex;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        let home =
+            std::env::temp_dir().join(format!("agend-ctxhandoff-keep-{}", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        let registry: crate::agent::AgentRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let (handle, _reader) = crate::daemon::per_tick::mock_live_agent_no_context("alive");
+        registry.lock().insert(handle.id, handle);
+        let externals: crate::agent::ExternalRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let configs: Arc<PLMutex<HashMap<String, crate::daemon::AgentConfig>>> =
+            Arc::new(PLMutex::new(HashMap::new()));
+        let h = ContextHandoffHandler::new(1);
+        h.states
+            .lock()
+            .insert("alive".to_string(), EpisodeState::default());
+        let ctx = TickContext {
+            home: &home,
+            registry: &registry,
+            externals: &externals,
+            configs: &configs,
+        };
+        h.run(&ctx);
+        assert!(
+            h.states.lock().contains_key("alive"),
+            "a LIVE agent with no context reading must KEEP its episode latch — `live.insert` \
+             must be UNCONDITIONAL, not gated on resolved_context()"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
 }

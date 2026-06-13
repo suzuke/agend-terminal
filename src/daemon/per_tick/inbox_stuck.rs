@@ -134,4 +134,41 @@ mod tests {
         );
         std::fs::remove_dir_all(&home).ok();
     }
+
+    /// #latch-prune reverse-regression (reviewer-2 #2097): a LIVE agent keeps
+    /// its re-alert timer. inbox_stuck's `live` is already unconditional
+    /// (`reg.values().map(name)`, no `resolved_context()` gate), so there is no
+    /// subset to regress into TODAY — this pins it that way (a future gating
+    /// edit that dropped a live agent would re-fire its stuck alert).
+    #[test]
+    fn live_agent_keeps_alert_timer() {
+        use parking_lot::Mutex as PLMutex;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        let home =
+            std::env::temp_dir().join(format!("agend-inboxstuck-keep-{}", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        let registry: crate::agent::AgentRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let (handle, _reader) = crate::daemon::per_tick::mock_live_agent_no_context("alive");
+        registry.lock().insert(handle.id, handle);
+        let externals: crate::agent::ExternalRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let configs: Arc<PLMutex<HashMap<String, crate::daemon::AgentConfig>>> =
+            Arc::new(PLMutex::new(HashMap::new()));
+        let h = InboxStuckHandler::new_at(1, past_grace());
+        h.last_alerted
+            .lock()
+            .insert("alive".to_string(), chrono::Utc::now());
+        let ctx = TickContext {
+            home: &home,
+            registry: &registry,
+            externals: &externals,
+            configs: &configs,
+        };
+        h.run(&ctx);
+        assert!(
+            h.last_alerted.lock().contains_key("alive"),
+            "a LIVE agent must KEEP its re-alert timer (retain against ALL live agents)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
 }

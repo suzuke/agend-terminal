@@ -246,6 +246,65 @@ fn panic_payload_str(payload: &Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
+/// Test-only: build a LIVE `AgentHandle` (real openpty, child `cat`) with a
+/// default `StateTracker` — so `core.state.resolved_context()` returns `None`
+/// (no context statusline parsed). Used by the #latch-prune reverse-regression
+/// tests: an agent present in the registry but WITHOUT a context reading this
+/// tick must still appear in each handler's `live` set (the latch maps are
+/// retained against ALL live agents, not just those with a reading), so its
+/// latch is NOT wrongly pruned. Returns the master reader for the caller to
+/// keep alive (binding `_reader`). Mirrors `supervisor::tests::mock_agent_handle`.
+#[cfg(test)]
+pub(crate) fn mock_live_agent_no_context(
+    name: &str,
+) -> (crate::agent::AgentHandle, Box<dyn std::io::Read + Send>) {
+    use std::sync::Arc;
+    let pty_system = portable_pty::native_pty_system();
+    let pair = pty_system
+        .openpty(portable_pty::PtySize {
+            rows: 10,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("open pty");
+    #[cfg(not(target_os = "windows"))]
+    let cmd = portable_pty::CommandBuilder::new("cat");
+    #[cfg(target_os = "windows")]
+    let cmd = {
+        let mut c = portable_pty::CommandBuilder::new("cmd");
+        c.args(["/c", "findstr", ".*"]);
+        c
+    };
+    let child = pair.slave.spawn_command(cmd).expect("spawn cat");
+    drop(pair.slave);
+    let reader = pair.master.try_clone_reader().expect("clone reader");
+    let writer = pair.master.take_writer().expect("take writer");
+    let pty_writer: crate::agent::PtyWriter = Arc::new(parking_lot::Mutex::new(writer));
+    let core = Arc::new(crate::sync_audit::CoreMutex::new(crate::agent::AgentCore {
+        vterm: crate::vterm::VTerm::with_pty_writer(80, 10, Arc::clone(&pty_writer)),
+        subscribers: Vec::new(),
+        state: crate::state::StateTracker::new(None),
+        health: crate::health::HealthTracker::new(),
+    }));
+    let handle = crate::agent::AgentHandle {
+        id: crate::types::InstanceId::default(),
+        name: name.to_string().into(),
+        backend_command: "claude".to_string(),
+        pty_writer,
+        pty_master: Arc::new(parking_lot::Mutex::new(pair.master)),
+        core,
+        child: Arc::new(parking_lot::Mutex::new(child)),
+        submit_key: "\r".to_string(),
+        inject_prefix: String::new(),
+        typed_inject: false,
+        spawned_at: std::time::Instant::now(),
+        spawned_at_epoch_ms: 0,
+        deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    (handle, reader)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
