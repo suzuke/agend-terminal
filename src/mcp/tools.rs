@@ -52,7 +52,8 @@ pub(crate) fn def_send() -> Value {
             "worktree_binding_required": {"type": "boolean", "description": "Whether target must bind to a worktree before starting"},
             "expect_reply_within_secs": {"type": "integer", "description": "Opt-in dispatch-idle watchdog (PR1). When set on a kind=task/query send, the daemon records a pending-dispatch sidecar and fires `dispatch_idle_threshold_exceeded` to the dispatcher's inbox if the matching kind=report (correlation_id-keyed) hasn't arrived within this many seconds. Default unset = no tracking (cross-team-safe). Fixup-team dispatches inherit a 10-min default automatically; other teams must opt in explicitly."},
             "next_after_ci": {"type": "string", "description": "#931 Fix 2 (H5a): when dispatching kind=task with a `branch`, set this to the agent that should receive `[ci-ready-for-action]` after CI passes on that branch. The daemon's auto-armed ci-watch carries the chain target so the handoff fires without a manual follow-up `ci action=watch next_after_ci=…`. Example: lead dispatches dev with `next_after_ci=reviewer` — reviewer is auto-notified when dev's PR goes green."},
-            "terminal": {"type": "boolean", "description": "Set true on kind=report to signal task completion. When correlation_id matches a task and reporter is the assignee, the task is auto-closed. Default false — progress reports and review verdicts do not trigger auto-close."}
+            "terminal": {"type": "boolean", "description": "Set true on kind=report to signal task completion. When correlation_id matches a task and reporter is the assignee, the task is auto-closed. Default false — progress reports and review verdicts do not trigger auto-close."},
+            "no_report_expected": {"type": "boolean", "description": "#2099: set true on a fire-and-forget kind=task dispatch that intentionally expects NO kind=report back. The dispatch is recorded with a terminal-like status so the 30-min dispatch-stuck sweep never false-fires a 'dispatch stuck check' for it (the audit row is kept). Default false — every normal dispatch stays stuck-tracked. Distinct from `terminal`, which is the report-side auto-close signal."}
         }, "required": ["message"]}})
 }
 
@@ -818,6 +819,7 @@ mod tests {
             ("send", "expect_reply_within_secs", "messaging.rs → dispatch_idle threshold watchdog"),
             ("send", "next_after_ci", "comms.rs → ci_watch poller fires [ci-ready-for-action]"),
             ("send", "terminal", "messaging.rs msg.terminal → auto_close_on_report"),
+            ("send", "no_report_expected", "comms.rs handle_delegate_task track step → DispatchEntry status=no_report_expected (skipped by sweep_stuck/sweep_orphans)"),
             // ── task (all fields consumed per action; #1933 audit) ──
             ("task", "action", "tasks/handler.rs action routing"),
             ("task", "title", "tasks/handler.rs handle_create"),

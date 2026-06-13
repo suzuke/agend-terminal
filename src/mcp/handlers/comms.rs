@@ -321,6 +321,15 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
     };
     if is_ok_result(&result) {
         let task_id = task_id_str.map(str::to_string);
+        // #2099: a fire-and-forget dispatch (`no_report_expected`) is recorded
+        // with a terminal-like status so the 30-min stuck sweep never false-fires
+        // for it — the audit row is kept, but sweep_stuck/sweep_orphans skip it.
+        // Default (flag absent/false) stays "pending" → normal stuck tracking.
+        let status = if args["no_report_expected"].as_bool().unwrap_or(false) {
+            "no_report_expected"
+        } else {
+            "pending"
+        };
         // Track dispatch for timeout detection
         crate::dispatch_tracking::track_dispatch(
             home,
@@ -335,7 +344,7 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
                     .ok()
                     .map(|(id, _)| id.full()),
                 delegated_at: chrono::Utc::now().to_rfc3339(),
-                status: "pending".to_string(),
+                status: status.to_string(),
             },
         );
         // Sprint 30: log branch hint for operator visibility when

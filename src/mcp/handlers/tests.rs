@@ -1340,6 +1340,57 @@ fn test_delegate_task_busy_returns_structured_response() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #2099: a kind=task dispatch with `no_report_expected=true` records its
+/// dispatch-tracking entry with the terminal-like `no_report_expected` status
+/// (so the 30-min stuck sweep skips it — see
+/// dispatch_tracking::tests::sweep_stuck_skips_no_report_expected_2099); an
+/// unflagged dispatch stays `pending`, proving the default is unchanged.
+#[test]
+fn delegate_task_no_report_expected_records_terminal_status_2099() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("ff-no-report-status");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  target:\n    backend: claude\n  sender:\n    backend: claude\n",
+    )
+    .ok();
+    std::env::set_var("AGEND_HOME", &home);
+
+    let flagged = handle_tool(
+        "send",
+        &json!({"instance": "target", "task": "fire and forget", "message": "fire and forget", "request_kind": "task", "task_id": "t-ff", "no_report_expected": true}),
+        "sender",
+    );
+    assert!(
+        is_ok_result(&flagged),
+        "flagged dispatch must succeed: {flagged}"
+    );
+
+    let normal = handle_tool(
+        "send",
+        &json!({"instance": "target", "task": "normal work", "message": "normal work", "request_kind": "task", "task_id": "t-normal"}),
+        "sender",
+    );
+    assert!(
+        is_ok_result(&normal),
+        "unflagged dispatch must succeed: {normal}"
+    );
+
+    let raw = std::fs::read_to_string(crate::store::store_path(&home, "dispatch_tracking.json"))
+        .unwrap_or_default();
+    assert!(
+        raw.contains("no_report_expected"),
+        "flagged dispatch must record the terminal-like status: {raw}"
+    );
+    assert!(
+        raw.contains("pending"),
+        "unflagged dispatch stays pending (default unchanged): {raw}"
+    );
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
 #[test]
 fn test_delegate_task_enriching_same_task_id_bypasses_busy_gate_1496() {
     // #1496 Option 1: a send(kind=task) whose `task_id` IS the target's current

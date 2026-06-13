@@ -20,7 +20,7 @@ pub struct DispatchEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub to_id: Option<String>,
     pub delegated_at: String,
-    pub status: String, // "pending" | "completed" | "warned" | "asked"
+    pub status: String, // "pending" | "completed" | "warned" | "asked" | "orphaned" | "no_report_expected"
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -134,7 +134,13 @@ pub fn sweep_stuck(home: &Path) -> (Vec<DispatchEntry>, Vec<DispatchEntry>) {
                 // again. (#1488 noted this re-fire but only fixed deleted-instance
                 // entries via `cleanup_for_instance`; this fixes still-existing
                 // targets whose orphaned entries otherwise nag for ~30 days.)
-                if entry.status == "completed" || entry.status == "orphaned" {
+                // #2099: `no_report_expected` is a fire-and-forget dispatch that
+                // intentionally gets no report back — never nag (audit row kept).
+                // Joins the terminal skip set alongside completed/orphaned.
+                if entry.status == "completed"
+                    || entry.status == "orphaned"
+                    || entry.status == "no_report_expected"
+                {
                     continue;
                 }
                 let delegated = match chrono::DateTime::parse_from_rfc3339(&entry.delegated_at) {
@@ -170,7 +176,13 @@ pub fn sweep_orphans(home: &Path) -> Vec<DispatchEntry> {
     persist_or_log!(
         crate::store::mutate_versioned(&store_path(home), |store: &mut DispatchStore| {
             for entry in store.entries.iter_mut() {
-                if entry.status == "completed" || entry.status == "orphaned" {
+                // #2099: skip fire-and-forget entries here too — leaving the
+                // audit row as `no_report_expected` rather than flipping it to
+                // `orphaned` at 24h (both are terminal-skip in sweep_stuck).
+                if entry.status == "completed"
+                    || entry.status == "orphaned"
+                    || entry.status == "no_report_expected"
+                {
                     continue;
                 }
                 let delegated = match chrono::DateTime::parse_from_rfc3339(&entry.delegated_at) {
@@ -410,6 +422,91 @@ mod tests {
         );
         assert_eq!(asks.len(), 1, "31min old dispatch must ask");
         assert_eq!(asks[0].to, "reviewer");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2099: a fire-and-forget dispatch recorded as `no_report_expected` must
+    /// NOT fire the 30-min "dispatch stuck check" — it joins the terminal skip
+    /// set. A sibling UNflagged `pending` dispatch of the same age MUST still
+    /// ask, proving the default is unchanged (no masking of real stuck tasks).
+    #[test]
+    fn sweep_stuck_skips_no_report_expected_2099() {
+        let home = tmp_home("ff-skip-stuck");
+        let past = (chrono::Utc::now() - chrono::Duration::minutes(31)).to_rfc3339();
+        // fire-and-forget — must be skipped
+        track_dispatch(
+            &home,
+            DispatchEntry {
+                task_id: Some("t-ff".into()),
+                from: "lead".into(),
+                to: "scout".into(),
+                from_id: None,
+                to_id: None,
+                delegated_at: past.clone(),
+                status: "no_report_expected".into(),
+            },
+        );
+        // normal dispatch of the same age — must still ask (default unchanged)
+        track_dispatch(
+            &home,
+            DispatchEntry {
+                task_id: Some("t-normal".into()),
+                from: "lead".into(),
+                to: "reviewer".into(),
+                from_id: None,
+                to_id: None,
+                delegated_at: past,
+                status: "pending".into(),
+            },
+        );
+        let (warns, asks) = sweep_stuck(&home);
+        assert!(warns.is_empty(), "31min entries skip warn → ask: {warns:?}");
+        assert_eq!(asks.len(), 1, "only the unflagged dispatch asks: {asks:?}");
+        assert_eq!(
+            asks[0].to, "reviewer",
+            "the asked entry is the unflagged one"
+        );
+        assert!(
+            !asks.iter().any(|e| e.to == "scout"),
+            "fire-and-forget dispatch must never fire a stuck check: {asks:?}"
+        );
+        // Audit row preserved (status untouched, never flipped to "asked").
+        let raw = std::fs::read_to_string(store_path(&home)).unwrap();
+        assert!(
+            raw.contains("no_report_expected"),
+            "fire-and-forget audit row preserved: {raw}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2099: a `no_report_expected` entry past the 24h orphan threshold is NOT
+    /// flipped to `orphaned` — the fire-and-forget audit row stays as-is.
+    #[test]
+    fn sweep_orphans_skips_no_report_expected_2099() {
+        let home = tmp_home("ff-skip-orphan");
+        let past = (chrono::Utc::now() - chrono::Duration::hours(25)).to_rfc3339();
+        track_dispatch(
+            &home,
+            DispatchEntry {
+                task_id: Some("t-ff".into()),
+                from: "lead".into(),
+                to: "scout".into(),
+                from_id: None,
+                to_id: None,
+                delegated_at: past,
+                status: "no_report_expected".into(),
+            },
+        );
+        let orphans = sweep_orphans(&home);
+        assert!(
+            orphans.is_empty(),
+            "fire-and-forget dispatch must not be orphaned: {orphans:?}"
+        );
+        let raw = std::fs::read_to_string(store_path(&home)).unwrap();
+        assert!(
+            raw.contains("no_report_expected") && !raw.contains("orphaned"),
+            "audit row stays no_report_expected, not flipped to orphaned: {raw}"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
