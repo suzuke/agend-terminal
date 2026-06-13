@@ -18,8 +18,9 @@
 //! Stage 1; Windows keeps `exit(42)` + Task Scheduler.
 #![cfg(unix)]
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
+use std::os::unix::io::{FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -598,5 +599,230 @@ fn flag_on_concurrent_respawn_cannot_double_bind_via_flock_1814() {
         "the flock loser MUST exit via the try_lock fail-fast with the exact production lock \
          error (this is the test's sole purpose — proving the double-bind guard fired, not just \
          that some process exited); stderr was: {loser_stderr:?}"
+    );
+}
+
+/// #2098 §3.9: boot a REAL `agend-terminal app` (combined TUI+daemon, `run_app`)
+/// under a libc PTY so its `ratatui::init` TUI setup succeeds without an
+/// interactive terminal, then its in-process api server comes up (run/<pid>/
+/// api.port + api.cookie — IDENTICAL layout to run_core, via the shared
+/// `bootstrap::prepare` → OwnedFleet that also writes `.daemon`). Self-respawn is
+/// the #2094 DEFAULT (AGEND_RESTART_HANDOFF unset) and every external-supervisor
+/// signal is stripped — the exact brick scenario. Returns the child; a DETACHED
+/// thread drains the pty master so the TUI never blocks on a full buffer. The
+/// drain thread is deliberately NOT joined: a surviving child that inherited the
+/// slave fd (e.g. a doomed successor on the pre-fix brick path) would keep the
+/// master open forever, so a join could hang. It is a per-test process, so the
+/// thread + fd are reclaimed on test-process exit.
+fn boot_app_under_pty(home: &Path) -> Child {
+    std::fs::create_dir_all(home).ok();
+    std::fs::write(
+        home.join("fleet.yaml"),
+        "instances:\n  probe:\n    backend: shell\n    command: /bin/sh\n",
+    )
+    .expect("write fleet.yaml");
+
+    // openpty with a non-zero winsize so the TUI has a sane render area.
+    // NB: openpty's `termp`/`winp` are `*mut` on macOS but `*const` on Linux;
+    // a `*mut` coerces to `*const`, so pass `*mut` to compile on both.
+    let mut winsize = libc::winsize {
+        ws_row: 40,
+        ws_col: 120,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let mut master: RawFd = -1;
+    let mut slave: RawFd = -1;
+    // SAFETY: openpty fills master+slave with fresh valid fds on success (rc==0).
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut::<libc::termios>(),
+            &mut winsize as *mut libc::winsize,
+        )
+    };
+    assert_eq!(rc, 0, "openpty must succeed");
+
+    let mut cmd = Command::new(bin());
+    cmd.env("AGEND_HOME", home)
+        // self-respawn is the #2094 DEFAULT — do NOT set AGEND_RESTART_HANDOFF.
+        // Strip ambient supervisor + handoff env so this is the genuine
+        // "app mode, self-respawn default ON, no supervisor" brick scenario.
+        .env_remove("AGEND_RESTART_HANDOFF")
+        .env_remove("AGEND_WRAPPED")
+        .env_remove("AGEND_SUPERVISED")
+        .env_remove("XPC_SERVICE_NAME")
+        .env_remove("INVOCATION_ID")
+        .env_remove("AGEND_SUCCESSOR_HANDOFF")
+        .arg("app");
+    // SAFETY: dup the slave fd for each std stream; std::process owns + closes
+    // the dup'd fds. The child's stdio is therefore a real tty (the pty slave),
+    // so `ratatui::init` / crossterm raw-mode succeed headlessly.
+    unsafe {
+        cmd.stdin(Stdio::from_raw_fd(libc::dup(slave)));
+        cmd.stdout(Stdio::from_raw_fd(libc::dup(slave)));
+        cmd.stderr(Stdio::from_raw_fd(libc::dup(slave)));
+    }
+    let child = cmd.spawn().expect("app must spawn under pty");
+    // Parent no longer needs the slave end (the child holds its own dups).
+    // SAFETY: slave is a valid fd we opened above.
+    unsafe {
+        libc::close(slave);
+    }
+
+    // Drain the master so the TUI's writes never block on a full pty buffer.
+    // DETACHED (not joined — see fn doc): ends on EOF when the child + any
+    // fd-inheriting descendants exit, otherwise on test-process exit.
+    std::thread::spawn(move || {
+        // SAFETY: master is a valid fd owned here; the File closes it on drop.
+        let mut f = unsafe { std::fs::File::from_raw_fd(master) };
+        let mut buf = [0u8; 4096];
+        loop {
+            match f.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    });
+    child
+}
+
+/// Connect to a SPECIFIC daemon's api socket (by pid run dir), do the cookie
+/// handshake, and send a STATUS request — true iff a well-formed reply comes
+/// back within `budget`. A live control plane answers; a bricked one
+/// (RESTART_PENDING latched → the session loop breaks before reading the
+/// request, api/mod.rs:499) completes the handshake but never replies.
+fn api_status_ok_within(home: &Path, pid: u32, budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    while Instant::now() < deadline {
+        if api_status_once(home, pid) == Some(true) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    false
+}
+
+fn api_status_once(home: &Path, pid: u32) -> Option<bool> {
+    let run_dir = home.join("run").join(pid.to_string());
+    let port: u16 = std::fs::read_to_string(run_dir.join("api.port"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    let cookie_bytes = std::fs::read(run_dir.join("api.cookie")).ok()?; // raw 32 bytes
+    let stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    let mut writer = stream.try_clone().ok()?;
+    let mut reader = BufReader::new(stream);
+    writeln!(writer, "{{\"auth\":\"{}\"}}", hex(&cookie_bytes)).ok()?;
+    writer.flush().ok();
+    let mut ack = String::new();
+    reader.read_line(&mut ack).ok()?;
+    let ack: serde_json::Value = serde_json::from_str(ack.trim()).ok()?;
+    if !ack.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) {
+        return Some(false);
+    }
+    writeln!(writer, "{}", serde_json::json!({"method": "status"})).ok()?;
+    writer.flush().ok();
+    let mut line = String::new();
+    if reader.read_line(&mut line).ok()? == 0 {
+        // EOF before a reply = the session loop broke before reading our
+        // request (the brick: RESTART_PENDING latched).
+        return Some(false);
+    }
+    let reply: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    Some(reply.is_object())
+}
+
+/// #2098 §3.9 — `agend-terminal app` (combined TUI+daemon) must NOT brick its
+/// control plane on `restart_daemon`. With self-respawn the DEFAULT (#2094) and
+/// no external supervisor, the pre-fix handler set RESTART_PENDING in the app
+/// process — which has NO run_core consumer — so api/mod.rs broke every session
+/// and the held-flock successor 30s-timed-out and died, latching the brick
+/// permanently. The fix fails CLOSED in app mode: restart_daemon returns
+/// ok:false (actionable) and the app's control plane stays fully alive.
+///
+/// Plugs the dual-review blind spot: the sibling `self_respawn_*` tests boot
+/// `start --foreground` (run_core mode, which DOES consume RESTART_PENDING), so
+/// they never exercised the app-mode brick. Here the predecessor is the REAL
+/// `app` binary (under a PTY so ratatui::init succeeds headlessly). Post-fix the
+/// handler fail-closes BEFORE spawning any successor, so this GREEN run brings up
+/// only the one app process (no successor subprocess).
+#[test]
+fn app_mode_restart_fails_closed_no_brick_2098() {
+    let home = std::env::temp_dir().join(format!("agend-2098-appmode-{}", std::process::id()));
+    std::fs::create_dir_all(&home).expect("mkdir AGEND_HOME");
+
+    let mut child = boot_app_under_pty(&home);
+
+    // The app's in-process api server must come up (run dir + api.port + live pid).
+    let pid = match wait_for_single_active(&home, Duration::from_secs(30), pid_alive) {
+        Some(p) => p,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            cleanup_test_home(&home);
+            panic!("app-mode api server never became the single active daemon");
+        }
+    };
+
+    // Operator gate allows restart only when Active (fresh daemon → Away).
+    set_mode_active(&home);
+
+    // Real restart_daemon over the real app api socket.
+    let resp = trigger_restart(&home, pid);
+
+    // ── Load-bearing: NO BRICK ── a NEW session must STILL be served after
+    // restart_daemon. Pre-fix the app latched RESTART_PENDING → api/mod.rs broke
+    // every session → this STATUS round-trip fails. Post-fix (fail-closed, no
+    // flag set) it succeeds.
+    let still_alive = api_status_ok_within(&home, pid, Duration::from_secs(15));
+    // The SAME app process must remain the single active daemon (no exit, no
+    // successor double-bind).
+    let same_single = active_pids(&home) == vec![pid] && pid_alive(pid);
+
+    // Cleanup BEFORE asserting so a failure never leaks the child. (The drain
+    // thread is detached — see boot_app_under_pty — so there is nothing to join;
+    // cleanup_test_home reaps any spawned successor on the pre-fix brick path.)
+    let _ = child.kill();
+    let _ = child.wait();
+    cleanup_test_home(&home);
+
+    // restart_daemon must report fail-closed (mcp_tool wraps handler output as
+    // {ok:true, result:{...}}; the app-mode refusal is result.ok == false).
+    if let Some(resp) = resp {
+        let result_ok = resp
+            .get("result")
+            .and_then(|r| r.get("ok"))
+            .and_then(|b| b.as_bool());
+        assert_eq!(
+            result_ok,
+            Some(false),
+            "app-mode restart_daemon must report result.ok=false (fail-closed), got {resp}"
+        );
+        let err = resp
+            .get("result")
+            .and_then(|r| r.get("error"))
+            .and_then(|e| e.as_str())
+            .unwrap_or("");
+        assert!(
+            err.contains("app"),
+            "fail-closed error must name `app` mode (actionable) — got {err:?}"
+        );
+    } else {
+        panic!(
+            "app-mode restart must return a reply (the predecessor is never signalled — it stays alive to answer)"
+        );
+    }
+    assert!(
+        still_alive,
+        "app control plane must stay alive after restart_daemon (no brick) — a new STATUS round-trip failed"
+    );
+    assert!(
+        same_single,
+        "the SAME app process must remain the single active daemon (no exit, no double-bind)"
     );
 }

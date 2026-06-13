@@ -157,6 +157,21 @@ pub(crate) static SHUTDOWN_REASON: AtomicU8 = AtomicU8::new(0);
 /// without API-layer plumbing.
 pub(crate) static RESTART_PENDING: AtomicBool = AtomicBool::new(false);
 
+/// #2098: positive "this process's `run_core` loop is the active restart
+/// consumer" marker. Set true at `run_core` entry; stays false in every other
+/// mode — notably `agend-terminal app` (combined TUI+daemon, `run_app`), which
+/// brings up the api server under an `OwnedFleet`/`ApiGuard` but NEVER enters
+/// `run_core`. Only `run_core` consumes `RESTART_PENDING` (the tail
+/// `confirm_shutdown_or_abort_respawn` + post-serve exit/promote); app mode has
+/// NO consumer, so setting `RESTART_PENDING` there bricks the control plane
+/// permanently (api/mod.rs breaks every session, the held-flock successor
+/// 30s-times-out and dies, the flag stays latched). The `restart_daemon` MCP
+/// handler reads this fail-SAFE: it proceeds with the restart machinery ONLY
+/// when run_core is the active loop, and fail-closes otherwise (default-deny —
+/// any future non-run_core mode is blocked without code change). See
+/// `mcp::handlers::restart::handle_restart_daemon`.
+pub(crate) static RUN_CORE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
 /// #1814 FIX2 (reviewer race High): the spawned successor's child handle, parked
 /// by `handle_self_respawn` at commit so the run_core loop can do a FINAL
 /// liveness recheck (`try_wait`, which also reaps) before the irreversible
@@ -736,6 +751,14 @@ fn write_control_ready(home: &Path) {
 
 fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
     let started_at = std::time::Instant::now();
+
+    // #2098: mark run_core as the active restart consumer. Set at entry (before
+    // the api server is brought up below, so it is always true by the time any
+    // `restart_daemon` MCP call can arrive) — once we are in run_core we will
+    // reach the tail that consumes RESTART_PENDING, so an in-process self-respawn
+    // is safe here. The handoff successor also runs through run_core, so it
+    // inherits this and can restart normally in turn.
+    RUN_CORE_ACTIVE.store(true, Ordering::Release);
 
     // For the handoff path, the channel inits post-lock (its registry attaches
     // via the #945 pending-registry bridge that `init_daemon_services` arms),
