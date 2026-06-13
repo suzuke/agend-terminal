@@ -302,11 +302,26 @@ mod tests {
 
     #[test]
     fn launchd_template_carries_keepalive_and_runatload() {
-        // Pin the lifecycle policy: KeepAlive (auto-restart on crash)
-        // + RunAtLoad (start at login). These are the operator-facing
-        // contract — disabling them would silently change behaviour.
+        // Pin the lifecycle policy: KeepAlive + RunAtLoad (start at login).
+        // These are the operator-facing contract — disabling them would
+        // silently change behaviour.
         assert!(LAUNCHD_TEMPLATE.contains("<key>KeepAlive</key>"));
         assert!(LAUNCHD_TEMPLATE.contains("<key>RunAtLoad</key>"));
+        // #1814 Stage 2: KeepAlive MUST be the SuccessfulExit=false dict form,
+        // not a bare `<true/>`. A bare true respawns on the graceful exit(0)
+        // handoff and races the self-respawn successor for the singleton flock
+        // (brick class). Pinned to prevent regressing to the bare form.
+        assert!(
+            LAUNCHD_TEMPLATE.contains("<key>SuccessfulExit</key>")
+                && LAUNCHD_TEMPLATE.contains("<false/>"),
+            "launchd KeepAlive must use the SuccessfulExit=false dict (restart-on-failure-only), \
+             not a bare <true/> — see #1814 Stage 2"
+        );
+        // Negative pin: the bare `<key>KeepAlive</key>` → `<true/>` adjacency must be gone.
+        assert!(
+            !LAUNCHD_TEMPLATE.contains("<key>KeepAlive</key>\n    <true/>"),
+            "launchd KeepAlive must NOT be the bare <true/> form (respawns on graceful exit(0))"
+        );
     }
 
     #[test]
