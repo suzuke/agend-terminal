@@ -2582,6 +2582,17 @@ fn stub_pr_lookup(repo: &str, num: u32) -> Result<sweep::PrState, String> {
     }
 }
 
+/// Stub issue lookup for #2061 stale_open sweep tests — bypasses
+/// `gh issue view`. 100 = open (in-flight → must NOT flag), 101 = closed
+/// (terminal → flaggable); anything else = Unknown (non-terminal → must NOT flag).
+fn stub_issue_lookup(repo: &str, num: u32) -> Result<sweep::IssueState, String> {
+    match (repo, num) {
+        ("test/repo", 100) => Ok(sweep::IssueState::Open),
+        ("test/repo", 101) => Ok(sweep::IssueState::Closed),
+        _ => Ok(sweep::IssueState::Unknown),
+    }
+}
+
 #[test]
 fn test_sweep_scan_identifies_team_disbanded_category() {
     // GREEN 2: scan_categories puts tasks owned by instances NOT
@@ -2599,7 +2610,7 @@ fn test_sweep_scan_identifies_team_disbanded_category() {
     let task_id = r["id"].as_str().expect("id").to_string();
     let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
     let now = chrono::Utc::now() + chrono::Duration::days(60);
-    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, None, now);
+    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now);
     assert_eq!(
         cats.team_disbanded.len(),
         1,
@@ -2637,7 +2648,14 @@ fn test_sweep_scan_identifies_shipped_via_pr_lookup_stub() {
     // the 30d team_disbanded threshold (which wouldn't fire
     // anyway because owner is alive).
     let now = chrono::Utc::now() + chrono::Duration::days(14);
-    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, Some("test/repo"), now);
+    let cats = sweep::scan_categories(
+        &home,
+        &live,
+        &stub_pr_lookup,
+        &stub_issue_lookup,
+        Some("test/repo"),
+        now,
+    );
     assert_eq!(
         cats.shipped.len(),
         1,
@@ -2738,7 +2756,7 @@ fn test_sweep_apply_emits_cancelled_and_logs_audit() {
     let task_id = r["id"].as_str().expect("id").to_string();
     let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
     let now = chrono::Utc::now() + chrono::Duration::days(60);
-    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, None, now);
+    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now);
     assert_eq!(cats.team_disbanded.len(), 1);
     let confirm: std::collections::HashSet<String> = [task_id.clone()].into_iter().collect();
     let count = sweep::emit_cancelled_batch(&home, &cats, &confirm, "post-#806 sweep test fixture")
@@ -2759,6 +2777,245 @@ fn test_sweep_apply_emits_cancelled_and_logs_audit() {
     assert!(
         log.contains("post-#806 sweep test fixture"),
         "event-log.jsonl must carry the audit_reason"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+// ── #2061 stale_open category ──
+
+/// Create one Open task owned by a LIVE agent (so team_disbanded never fires)
+/// and return its id. `title` carries any issue/PR ref.
+fn create_open_task(home: &Path, title: &str) -> String {
+    let r = handle(
+        home,
+        "alive",
+        &serde_json::json!({"action": "create", "title": title, "assignee": "alive"}),
+    );
+    r["id"].as_str().expect("id").to_string()
+}
+
+#[test]
+fn test_sweep_stale_open_all_refs_terminal_flagged() {
+    // #2061: an open task whose only referenced issue is CLOSED (terminal)
+    // lands in stale_open. (#101 → Closed in stub_issue_lookup.)
+    let home = tmp_home("sweep_stale_terminal");
+    write_fleet_yaml(&home, &["alive"]);
+    let id = create_open_task(&home, "follow-up for #101");
+    let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
+    let now = chrono::Utc::now() + chrono::Duration::days(2);
+    let cats = sweep::scan_categories(
+        &home,
+        &live,
+        &stub_pr_lookup,
+        &stub_issue_lookup,
+        Some("test/repo"),
+        now,
+    );
+    assert!(
+        cats.stale_open.iter().any(|c| c.id == id),
+        "task with an all-terminal issue ref must be flagged stale_open, got {cats:?}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn test_sweep_stale_open_open_ref_not_flagged() {
+    // #2061 conservative bias: an OPEN referenced issue means the task may be
+    // in flight — must NOT flag even when very old. (#100 → Open.)
+    let home = tmp_home("sweep_stale_openref");
+    write_fleet_yaml(&home, &["alive"]);
+    let id = create_open_task(&home, "blocked on #100");
+    let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
+    let now = chrono::Utc::now() + chrono::Duration::days(60);
+    let cats = sweep::scan_categories(
+        &home,
+        &live,
+        &stub_pr_lookup,
+        &stub_issue_lookup,
+        Some("test/repo"),
+        now,
+    );
+    assert!(
+        !cats.all_ids().contains(&id),
+        "task with an OPEN issue ref must NOT be flagged (in flight), got {cats:?}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn test_sweep_stale_open_no_ref_old_flagged() {
+    // #2061: a ref-less open task >14d stale lands in stale_open. Fires even
+    // with NO repo (the no-ref fallback needs no GitHub query).
+    let home = tmp_home("sweep_stale_noref_old");
+    write_fleet_yaml(&home, &["alive"]);
+    let id = create_open_task(&home, "plain stale task no refs");
+    let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
+    let now = chrono::Utc::now() + chrono::Duration::days(15);
+    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now);
+    assert!(
+        cats.stale_open.iter().any(|c| c.id == id),
+        "ref-less open task >14d must be flagged stale_open (no repo needed), got {cats:?}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn test_sweep_stale_open_no_ref_fresh_not_flagged() {
+    // #2061: a ref-less open task <14d must NOT be flagged.
+    let home = tmp_home("sweep_stale_noref_fresh");
+    write_fleet_yaml(&home, &["alive"]);
+    let id = create_open_task(&home, "plain fresh task no refs");
+    let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
+    let now = chrono::Utc::now() + chrono::Duration::days(13);
+    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now);
+    assert!(
+        !cats.all_ids().contains(&id),
+        "ref-less open task <14d must NOT be flagged, got {cats:?}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn test_sweep_stale_open_mixed_ref_not_flagged() {
+    // #2061 ALL-quantifier (load-bearing conservative bias): one closed (#101)
+    // + one OPEN (#100) ref — the open ref disqualifies the WHOLE task even
+    // though another ref is terminal.
+    let home = tmp_home("sweep_stale_mixed");
+    write_fleet_yaml(&home, &["alive"]);
+    let id = create_open_task(&home, "done with #101 but still #100");
+    let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
+    let now = chrono::Utc::now() + chrono::Duration::days(30);
+    let cats = sweep::scan_categories(
+        &home,
+        &live,
+        &stub_pr_lookup,
+        &stub_issue_lookup,
+        Some("test/repo"),
+        now,
+    );
+    assert!(
+        !cats.all_ids().contains(&id),
+        "ANY non-terminal ref must disqualify the whole task, got {cats:?}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn test_sweep_stale_open_unknown_ref_not_flagged() {
+    // #2061: an unresolvable ref (#404 → Unknown, e.g. gh query failed / bogus
+    // number) is treated as possibly-live → must NOT flag (fail safe).
+    let home = tmp_home("sweep_stale_unknown");
+    write_fleet_yaml(&home, &["alive"]);
+    let id = create_open_task(&home, "see #404");
+    let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
+    let now = chrono::Utc::now() + chrono::Duration::days(30);
+    let cats = sweep::scan_categories(
+        &home,
+        &live,
+        &stub_pr_lookup,
+        &stub_issue_lookup,
+        Some("test/repo"),
+        now,
+    );
+    assert!(
+        !cats.all_ids().contains(&id),
+        "an Unknown (unresolvable) ref must NOT be flagged (fail safe), got {cats:?}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn test_sweep_stale_open_apply_labels_category() {
+    // #2061: the apply leg labels a stale_open candidate correctly (NOT the
+    // bare validation_leftovers fallback) in both the Cancelled.reason and the
+    // task_sweep_apply audit line.
+    let home = tmp_home("sweep_stale_apply");
+    write_fleet_yaml(&home, &["alive"]);
+    let id = create_open_task(&home, "ref-less stale task to cancel");
+    let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
+    let now = chrono::Utc::now() + chrono::Duration::days(20);
+    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now);
+    assert!(
+        cats.stale_open.iter().any(|c| c.id == id),
+        "precondition: task must be a stale_open candidate, got {cats:?}"
+    );
+    let confirm: std::collections::HashSet<String> = [id.clone()].into_iter().collect();
+    let count = sweep::emit_cancelled_batch(&home, &cats, &confirm, "stale_open sweep test")
+        .expect("emit_cancelled_batch");
+    assert_eq!(count, 1);
+    let log = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
+    assert!(
+        log.contains("category=stale_open"),
+        "audit line must label the category stale_open (not the fallback), got: {log}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn test_sweep_stale_open_overflow_ref_token_not_flagged() {
+    // #2061 conservative bias: a `#N` token that overflows u32 is present-but-
+    // unparseable. It must NOT make the task look ref-less and get age-flagged
+    // (the task DOES reference work); it is skipped (saw_token, no parseable ref).
+    let home = tmp_home("sweep_stale_overflow");
+    write_fleet_yaml(&home, &["alive"]);
+    let id = create_open_task(&home, "tracking upstream #99999999999999999999");
+    let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
+    let now = chrono::Utc::now() + chrono::Duration::days(20);
+    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now);
+    assert!(
+        !cats.all_ids().contains(&id),
+        "an unparseable (overflow) #N ref must NOT be age-flagged as ref-less, got {cats:?}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn test_sweep_stale_open_url_ref_not_flagged() {
+    // #2061 conservative bias: an issue named only by GitHub URL (no `#N`) is a
+    // reference — must NOT be treated as ref-less and age-flagged. Skipped
+    // (saw_token via the URL, no parseable ref to verify).
+    let home = tmp_home("sweep_stale_url");
+    write_fleet_yaml(&home, &["alive"]);
+    let id = create_open_task(
+        &home,
+        "see https://github.com/suzuke/agend-terminal/issues/1234",
+    );
+    let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
+    let now = chrono::Utc::now() + chrono::Duration::days(20);
+    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now);
+    assert!(
+        !cats.all_ids().contains(&id),
+        "an issue referenced only by URL must NOT be age-flagged as ref-less, got {cats:?}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn test_sweep_stale_open_merged_pr_fresh_flagged() {
+    // #2061: an Open task whose merged PR ref is younger than the shipped 7d
+    // grace still lands in stale_open (all-terminal ⇒ done). Pins that the
+    // shipped arm's `continue` does NOT fire for age<7d, and that stale_open has
+    // no age gate on the all-terminal path. (PR #999 = Merged in stub.)
+    let home = tmp_home("sweep_stale_merged_fresh");
+    write_fleet_yaml(&home, &["alive"]);
+    let id = create_open_task(&home, "PR #999 landed, wrapping up");
+    let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
+    let now = chrono::Utc::now() + chrono::Duration::days(3);
+    let cats = sweep::scan_categories(
+        &home,
+        &live,
+        &stub_pr_lookup,
+        &stub_issue_lookup,
+        Some("test/repo"),
+        now,
+    );
+    assert!(
+        cats.shipped.is_empty(),
+        "shipped must NOT fire under its 7d grace, got {cats:?}"
+    );
+    assert!(
+        cats.stale_open.iter().any(|c| c.id == id),
+        "merged-PR open task must land in stale_open regardless of shipped grace, got {cats:?}"
     );
     std::fs::remove_dir_all(&home).ok();
 }

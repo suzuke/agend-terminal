@@ -53,6 +53,16 @@ pub(crate) struct PrSummary {
     pub files: Option<Vec<String>>,
 }
 
+/// A single issue, provider-neutral. Mirrors [`PrSummary`] — only the
+/// `--json` subset requested is populated. For the #2061 task-sweep
+/// `stale_open` category only `state` (OPEN vs CLOSED) is consulted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct IssueSummary {
+    pub number: u64,
+    /// gh's `state`: "OPEN" | "CLOSED".
+    pub state: Option<String>,
+}
+
 /// A single PR CI check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CheckState {
@@ -140,6 +150,9 @@ pub(crate) trait ScmProvider: Send + Sync {
     ) -> anyhow::Result<Vec<PrSummary>>;
     /// `gh pr merge …` — the only WRITE (site 3).
     fn pr_merge(&self, repo: &str, pr: u64, opts: &MergeOpts) -> anyhow::Result<MergeOutcome>;
+    /// `gh issue view <number> --json <fields>` → one issue (#2061 task-sweep
+    /// `stale_open`: resolve whether a referenced issue is CLOSED/terminal).
+    fn issue_view(&self, repo: &str, number: u64, fields: &[&str]) -> anyhow::Result<IssueSummary>;
 }
 
 // ---------------------------------------------------------------------------
@@ -230,6 +243,18 @@ fn pr_merge_args(repo: &str, pr: u64, opts: &MergeOpts) -> Vec<String> {
     a
 }
 
+fn issue_view_args(repo: &str, number: u64, fields: &[&str]) -> Vec<String> {
+    vec![
+        "issue".into(),
+        "view".into(),
+        number.to_string(),
+        "--repo".into(),
+        repo.into(),
+        "--json".into(),
+        fields.join(","),
+    ]
+}
+
 // ---------------------------------------------------------------------------
 // parsers — pure + unit-tested. All gh-schema knowledge lives here, never
 // in the call sites.
@@ -263,6 +288,14 @@ fn parse_pr_summary(v: &Value) -> PrSummary {
                 .filter_map(|f| f["path"].as_str().map(String::from))
                 .collect()
         }),
+    }
+}
+
+/// Parse one `gh issue view --json …` JSON object into an [`IssueSummary`].
+fn parse_issue_summary(v: &Value) -> IssueSummary {
+    IssueSummary {
+        number: v["number"].as_u64().unwrap_or(0),
+        state: v["state"].as_str().map(String::from),
     }
 }
 
@@ -372,6 +405,19 @@ impl ScmProvider for GitHubScmProvider {
             })
         }
     }
+
+    fn issue_view(&self, repo: &str, number: u64, fields: &[&str]) -> anyhow::Result<IssueSummary> {
+        let out = Self::run(&issue_view_args(repo, number, fields), None)?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "gh issue view #{number} ({repo}) exited {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        let v: Value = serde_json::from_slice(&out.stdout)?;
+        Ok(parse_issue_summary(&v))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -410,6 +456,14 @@ macro_rules! not_supported_provider {
                 _pr: u64,
                 _opts: &MergeOpts,
             ) -> anyhow::Result<MergeOutcome> {
+                Err(NotSupported($kind).into())
+            }
+            fn issue_view(
+                &self,
+                _repo: &str,
+                _number: u64,
+                _fields: &[&str],
+            ) -> anyhow::Result<IssueSummary> {
                 Err(NotSupported($kind).into())
             }
         }
@@ -718,7 +772,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn issue_view_args_match_gh_issue_view_call() {
+        // #2061 task-sweep stale_open: `gh issue view <n> --repo R --json state`.
+        assert_eq!(
+            issue_view_args("suzuke/agend-terminal", 2061, &["state"]),
+            vec![
+                "issue",
+                "view",
+                "2061",
+                "--repo",
+                "suzuke/agend-terminal",
+                "--json",
+                "state",
+            ]
+        );
+    }
+
     // ---- parsers ----
+
+    #[test]
+    fn parse_issue_summary_reads_state() {
+        let closed = parse_issue_summary(&serde_json::json!({"number": 2061, "state": "CLOSED"}));
+        assert_eq!(closed.number, 2061);
+        assert_eq!(closed.state.as_deref(), Some("CLOSED"));
+        let open = parse_issue_summary(&serde_json::json!({"number": 7, "state": "OPEN"}));
+        assert_eq!(open.state.as_deref(), Some("OPEN"));
+        // Absent state stays None (caller treats as Unknown → not terminal).
+        let bare = parse_issue_summary(&serde_json::json!({"number": 1}));
+        assert_eq!(bare.state, None);
+    }
 
     #[test]
     fn parse_pr_summary_reads_present_fields() {

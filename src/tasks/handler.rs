@@ -812,8 +812,15 @@ fn handle_sweep(home: &Path, args: &Value) -> Value {
     .unwrap_or_default();
     let now = chrono::Utc::now();
     let pr_lookup: super::sweep::PrLookup = &super::sweep::gh_pr_lookup;
-    let categories =
-        super::sweep::scan_categories(home, &live_instances, pr_lookup, repo_owned.as_deref(), now);
+    let issue_lookup: super::sweep::IssueLookup = &super::sweep::gh_issue_lookup;
+    let categories = super::sweep::scan_categories(
+        home,
+        &live_instances,
+        pr_lookup,
+        issue_lookup,
+        repo_owned.as_deref(),
+        now,
+    );
     if !apply {
         return serde_json::json!({
             "dry_run": true,

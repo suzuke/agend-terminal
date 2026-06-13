@@ -188,7 +188,7 @@ pub(crate) fn def_decision() -> Value {
 }
 
 pub(crate) fn def_task() -> Value {
-    json!({"name": "task", "description": "Manage task board. Actions: create, list, claim, done, update, sweep, health, activity, metadata_set, metadata_get. #806: default list trims to actionable statuses (open/claimed/in_progress/blocked); pass include_history=true to surface done/cancelled. `sweep` is operator-triggered manual hygiene (4 stale-task categories with dry-run + confirm_ids round-trip). #830: `health` is a one-shot board-hygiene snapshot — totals + by_status + ghost_owners + stale_claims + age aggregates + recommendations array.",
+    json!({"name": "task", "description": "Manage task board. Actions: create, list, claim, done, update, sweep, health, activity, metadata_set, metadata_get. #806: default list trims to actionable statuses (open/claimed/in_progress/blocked); pass include_history=true to surface done/cancelled. `sweep` is operator-triggered manual hygiene (5 stale-task categories with dry-run + confirm_ids round-trip). #830: `health` is a one-shot board-hygiene snapshot — totals + by_status + ghost_owners + stale_claims + age aggregates + recommendations array.",
         "inputSchema": {"type": "object", "properties": {
             "action": {"type": "string", "enum": ["create", "list", "claim", "done", "update", "sweep", "health", "activity", "metadata_set", "metadata_get"]},
             "title": {"type": "string"}, "description": {"type": "string"},
