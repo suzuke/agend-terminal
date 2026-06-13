@@ -2269,6 +2269,71 @@ fn claude_server_throttle_fixture_triggers_server_rate_limit() {
     assert_eq!(t.get_state(), AgentState::ServerRateLimit);
 }
 
+/// #2090 P2 shadow — the instrument MUST NOT change classification (zero-behavior):
+/// a narrow-pane hard-wrapped UsageLimit that the raw grid misses stays
+/// mis-classified (the shadow only LOGS a candidate; it does not rescue).
+#[test]
+fn hardwrap_miss_shadow_is_zero_behavior_2090() {
+    // "You've hit your weekly limit" hard-wrapped across narrow rows → the
+    // single-line UsageLimit regex misses it; the ❯ prompt lands Idle.
+    let screen = "⎿ You've hit\n\
+                  your weekly\n\
+                  limit · resets\n\
+                  4am\n\
+                  \n\
+                  ❯\n";
+    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+    t.feed(screen);
+    assert_ne!(
+        t.get_state(),
+        AgentState::UsageLimit,
+        "#2090 P2 shadow is instrument-only — it must NOT rescue/relatch (zero behavior); \
+         the raw grid still misses the hard-wrapped banner"
+    );
+}
+
+/// #2090 P2 shadow — the pure candidate detector fires on a hard-wrapped target
+/// the raw grid missed, and does NOT fire when the raw grid already found it or
+/// on a benign frame.
+#[test]
+fn hardwrap_miss_candidate_detects_wrapped_target_2090() {
+    let patterns = StatePatterns::for_backend(&Backend::ClaudeCode);
+    let markers = crate::backend_profile::profile(&Backend::ClaudeCode).input_line_markers;
+
+    // (1) hard-wrapped UsageLimit, raw misses → candidate.
+    let wrapped_ul = "⎿ You've hit\nyour weekly\nlimit · resets\n4am\n\n❯\n";
+    assert_eq!(
+        hardwrap_miss_candidate(patterns, wrapped_ul, markers).map(|(s, _)| s),
+        Some(AgentState::UsageLimit),
+        "flatten recovers the wrapped UsageLimit banner the raw grid missed"
+    );
+
+    // (2) hard-wrapped ContextFull, raw misses → candidate.
+    let wrapped_cf = "the agent is\ncompacting\ncontext now\n\n❯\n";
+    assert_eq!(
+        hardwrap_miss_candidate(patterns, wrapped_cf, markers).map(|(s, _)| s),
+        Some(AgentState::ContextFull),
+        "flatten recovers the wrapped ContextFull phrase the raw grid missed"
+    );
+
+    // (3) UsageLimit on ONE line — the raw grid already detects it → NOT a
+    // hard-wrap miss (no candidate; the flatten recovered nothing new).
+    let flat_ul = "You've hit your weekly limit · resets 4am\n\n❯\n";
+    assert_eq!(
+        hardwrap_miss_candidate(patterns, flat_ul, markers),
+        None,
+        "raw grid already detects the non-wrapped banner → not a hard-wrap miss"
+    );
+
+    // (4) benign frame mentioning the keyword but not the full phrase → no candidate.
+    let benign = "let me check the rate limit config in the file\n\n❯\n";
+    assert_eq!(
+        hardwrap_miss_candidate(patterns, benign, markers),
+        None,
+        "a bare keyword without the full banner phrase must not be a candidate"
+    );
+}
+
 /// strip CSI/SGR escapes to recover the plain screen_text from an ansi_colored_tail.
 fn strip_ansi_2089(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
