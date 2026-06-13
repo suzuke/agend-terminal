@@ -45,6 +45,37 @@ pub(super) fn gh_pr_lookup(repo: &str, num: u32) -> Result<PrState, String> {
     })
 }
 
+/// State of an issue referenced by a task title/description (#2061
+/// `stale_open`). Only the terminal-vs-live distinction matters.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) enum IssueState {
+    /// Issue is closed — terminal.
+    Closed,
+    /// Issue is still open — task may still be in flight.
+    Open,
+    /// Issue doesn't exist or query failed — treat as possibly-live (skip).
+    Unknown,
+}
+
+/// Function-pointer abstraction over `gh issue view` (mirrors [`PrLookup`]).
+/// Tests inject a stub; production uses [`gh_issue_lookup`].
+pub(super) type IssueLookup<'a> = &'a dyn Fn(&str, u32) -> Result<IssueState, String>;
+
+/// Production issue-state lookup via [`crate::scm::ScmProvider`] (mirrors
+/// [`gh_pr_lookup`]). A non-zero exit / parse failure surfaces as `Err`; the
+/// sole caller maps that to [`IssueState::Unknown`] (never abort the sweep).
+pub(super) fn gh_issue_lookup(repo: &str, num: u32) -> Result<IssueState, String> {
+    let summary = crate::scm::make_scm_provider(repo, None)
+        .issue_view(repo, num as u64, &["state"])
+        .map_err(|e| e.to_string())?;
+    Ok(match summary.state.as_deref() {
+        // CLOSED covers both COMPLETED and NOT_PLANNED — either way terminal.
+        Some("CLOSED") => IssueState::Closed,
+        Some("OPEN") => IssueState::Open,
+        _ => IssueState::Unknown,
+    })
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub(super) struct Candidate {
     pub id: String,
@@ -59,6 +90,9 @@ pub(super) struct Categories {
     pub superseded: Vec<Candidate>,
     pub team_disbanded: Vec<Candidate>,
     pub validation_leftovers: Vec<Candidate>,
+    /// #2061: open/backlog tasks whose referenced issue/PR are ALL terminal,
+    /// or which carry no ref and are >14d stale.
+    pub stale_open: Vec<Candidate>,
 }
 
 impl Categories {
@@ -69,6 +103,7 @@ impl Categories {
             .chain(self.superseded.iter())
             .chain(self.team_disbanded.iter())
             .chain(self.validation_leftovers.iter())
+            .chain(self.stale_open.iter())
             .map(|c| c.id.clone())
             .collect();
         v.sort();
@@ -86,15 +121,17 @@ impl Categories {
             "superseded": self.superseded,
             "team_disbanded": self.team_disbanded,
             "validation_leftovers": self.validation_leftovers,
+            "stale_open": self.stale_open,
         })
     }
 }
 
-/// Scan the task board and bucket non-terminal tasks into the 4
+/// Scan the task board and bucket non-terminal tasks into the 5
 /// hygiene categories. Tasks already in `done`/`cancelled`/
 /// `verified` are skipped — they're already cleaned up. Each task
 /// lands in at most one category (first match wins, order:
-/// validation_leftovers → team_disbanded → shipped/superseded).
+/// validation_leftovers → team_disbanded → shipped/superseded →
+/// stale_open).
 ///
 /// `now` is parameterized so tests can fast-forward age thresholds
 /// without forging event-log timestamps.
@@ -102,12 +139,14 @@ pub(super) fn scan_categories(
     home: &Path,
     live_instances: &HashSet<String>,
     pr_lookup: PrLookup,
+    issue_lookup: IssueLookup,
     repo: Option<&str>,
     now: DateTime<Utc>,
 ) -> Categories {
     let tasks = list_all(home);
     let mut cats = Categories::default();
     let mut pr_cache: HashMap<u32, PrState> = HashMap::new();
+    let mut issue_cache: HashMap<u32, IssueState> = HashMap::new();
     for t in &tasks {
         if matches!(
             t.status,
@@ -155,41 +194,110 @@ pub(super) fn scan_categories(
                 continue;
             }
         }
-        // (3) shipped / (4) superseded — extract PR ref + query.
-        let Some(repo) = repo else { continue };
         let search_text = format!("{}\n{}", t.title, t.description);
-        let Some(pr_num) = extract_pr_number(&search_text) else {
-            continue;
-        };
-        let state = pr_cache
-            .entry(pr_num)
-            .or_insert_with(|| pr_lookup(repo, pr_num).unwrap_or(PrState::Unknown))
-            .clone();
-        match state {
-            PrState::Merged { merged_at } => {
-                if let Some(a) = age {
-                    if a > Duration::days(7) {
-                        cats.shipped.push(Candidate {
+        // (3) shipped / (4) superseded — first PR ref + query. Unchanged
+        // predicates; only a `continue` is added after each push so an
+        // already-bucketed task is not re-examined by the new stale_open arm
+        // below (behaviour-identical: the loop body ended here previously).
+        if let Some(repo) = repo {
+            if let Some(pr_num) = extract_pr_number(&search_text) {
+                let state = pr_cache
+                    .entry(pr_num)
+                    .or_insert_with(|| pr_lookup(repo, pr_num).unwrap_or(PrState::Unknown))
+                    .clone();
+                match state {
+                    PrState::Merged { merged_at } => {
+                        if let Some(a) = age {
+                            if a > Duration::days(7) {
+                                cats.shipped.push(Candidate {
+                                    id: t.id.clone(),
+                                    reason: format!(
+                                        "PR #{pr_num} merged at {merged_at}, task {}d stale",
+                                        a.num_days()
+                                    ),
+                                    owner: t.assignee.clone(),
+                                    pr: Some(pr_num),
+                                });
+                                continue;
+                            }
+                        }
+                    }
+                    PrState::Closed => {
+                        cats.superseded.push(Candidate {
                             id: t.id.clone(),
-                            reason: format!(
-                                "PR #{pr_num} merged at {merged_at}, task {}d stale",
-                                a.num_days()
-                            ),
+                            reason: format!("PR #{pr_num} closed without merge"),
                             owner: t.assignee.clone(),
                             pr: Some(pr_num),
+                        });
+                        continue;
+                    }
+                    PrState::Open | PrState::Unknown => {}
+                }
+            }
+        }
+        // (5) stale_open (#2061) — OPEN/Backlog tasks the shipped/superseded
+        // arms didn't claim. Conservative (under-report): flag ONLY when EVERY
+        // referenced issue/PR resolves terminal, OR there is no ref and the
+        // task is >14d stale. Any non-terminal/unknown ref disqualifies the
+        // whole task. Operator-gated downstream (dry-run + confirm_ids).
+        if !matches!(
+            t.status,
+            crate::task_events::TaskStatus::Open | crate::task_events::TaskStatus::Backlog
+        ) {
+            continue;
+        }
+        let refs = extract_refs(&search_text);
+        if refs.is_empty() {
+            // No PARSEABLE #N / PR #N ref. Take the age-only fallback ONLY when
+            // the task is GENUINELY ref-less (`!saw_token`): no #N / PR #N token
+            // and no GitHub issue|pull URL at all. If a token IS present but
+            // unverifiable here — an unparseable (overflowing) #N, or an
+            // issue/PR named only by URL (which #2061 does not resolve) — the
+            // task references work we cannot confirm is done, so do NOT
+            // age-flag it; skip conservatively (better to MISS than to surface a
+            // live ref-bearing task).
+            if !refs.saw_token {
+                if let Some(a) = age {
+                    if a > Duration::days(14) {
+                        cats.stale_open.push(Candidate {
+                            id: t.id.clone(),
+                            reason: format!("no PR/issue ref, open {}d stale", a.num_days()),
+                            owner: t.assignee.clone(),
+                            pr: None,
                         });
                     }
                 }
             }
-            PrState::Closed => {
-                cats.superseded.push(Candidate {
-                    id: t.id.clone(),
-                    reason: format!("PR #{pr_num} closed without merge"),
-                    owner: t.assignee.clone(),
-                    pr: Some(pr_num),
-                });
-            }
-            PrState::Open | PrState::Unknown => {}
+            continue;
+        }
+        // Has >=1 parseable ref → every one must resolve terminal. (A merged-PR
+        // open task is flagged regardless of the shipped arm's 7d grace: that
+        // grace governs the `shipped` category; for stale_open an all-terminal
+        // ref means the work is done.) Without a repo we cannot verify → skip.
+        let Some(repo) = repo else { continue };
+        let all_terminal = refs.pr_nums.iter().all(|&n| {
+            matches!(
+                pr_cache
+                    .entry(n)
+                    .or_insert_with(|| pr_lookup(repo, n).unwrap_or(PrState::Unknown)),
+                PrState::Merged { .. } | PrState::Closed
+            )
+        }) && refs.issue_nums.iter().all(|&n| {
+            *issue_cache
+                .entry(n)
+                .or_insert_with(|| issue_lookup(repo, n).unwrap_or(IssueState::Unknown))
+                == IssueState::Closed
+        });
+        if all_terminal {
+            cats.stale_open.push(Candidate {
+                id: t.id.clone(),
+                reason: format!(
+                    "all referenced issue/PR terminal (PR {:?}, issue {:?})",
+                    refs.pr_nums, refs.issue_nums
+                ),
+                owner: t.assignee.clone(),
+                pr: refs.pr_nums.first().copied(),
+            });
         }
     }
     cats
@@ -204,6 +312,67 @@ fn extract_pr_number(text: &str) -> Option<u32> {
     re.captures(text)
         .and_then(|c| c.get(1))
         .and_then(|m| m.as_str().parse::<u32>().ok())
+}
+
+/// All issue/PR references in a haystack, for the #2061 stale_open
+/// ALL-quantifier check. PR refs use the same strict `PR #?N` form as
+/// [`extract_pr_number`]; issue refs are bare `#N` MINUS any number already
+/// captured as a PR (so `PR #12` is counted once, as a PR). De-duplicated.
+///
+/// `saw_token` records whether the text contained ANY recognised reference
+/// token — a `#N` / `PR #N`, or a GitHub `/issues/N` / `/pull/N` URL —
+/// INCLUDING tokens we could not turn into a verifiable number (an
+/// absurdly-large `#N` that overflows, or an issue/PR named only by URL, which
+/// #2061 deliberately does not resolve). It distinguishes a *genuinely* ref-less
+/// task (eligible for the no-ref age-only fallback) from one that references
+/// work we cannot fully verify (which must NOT be age-flagged — see
+/// [`scan_categories`]). This is what keeps the sweep conservative: an
+/// unrecognised/unparseable ref makes the sweep MISS a candidate (skip), never
+/// wrongly age-flag a live ref-bearing task.
+#[derive(Debug, Default, PartialEq)]
+struct Refs {
+    pr_nums: Vec<u32>,
+    issue_nums: Vec<u32>,
+    saw_token: bool,
+}
+
+fn extract_refs(text: &str) -> Refs {
+    static PR_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static ISSUE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static URL_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let pr_re = PR_RE.get_or_init(|| regex::Regex::new(r"\bPR #?(\d+)\b").expect("pr regex"));
+    let issue_re = ISSUE_RE.get_or_init(|| regex::Regex::new(r"#(\d+)\b").expect("issue regex"));
+    let url_re =
+        URL_RE.get_or_init(|| regex::Regex::new(r"/(?:issues|pull)/\d+").expect("url regex"));
+    let mut pr_nums: Vec<u32> = pr_re
+        .captures_iter(text)
+        .filter_map(|c| c.get(1).and_then(|m| m.as_str().parse::<u32>().ok()))
+        .collect();
+    pr_nums.sort_unstable();
+    pr_nums.dedup();
+    let mut issue_nums: Vec<u32> = issue_re
+        .captures_iter(text)
+        .filter_map(|c| c.get(1).and_then(|m| m.as_str().parse::<u32>().ok()))
+        .filter(|n| !pr_nums.contains(n))
+        .collect();
+    issue_nums.sort_unstable();
+    issue_nums.dedup();
+    // Token PRESENCE is regex-match (not parse): a `#N` that overflows u32, or a
+    // URL we don't resolve, still means the task references work — so it must
+    // not look ref-less. GitHub numbers fit u32, so a `#N` that fails to parse
+    // is malformed/unverifiable, not a smaller real ref.
+    let saw_token = pr_re.is_match(text) || issue_re.is_match(text) || url_re.is_match(text);
+    Refs {
+        pr_nums,
+        issue_nums,
+        saw_token,
+    }
+}
+
+impl Refs {
+    fn is_empty(&self) -> bool {
+        self.pr_nums.is_empty() && self.issue_nums.is_empty()
+    }
 }
 
 /// Apply phase — emit `Cancelled` events for the `confirm_ids`
@@ -230,6 +399,9 @@ pub(super) fn emit_cancelled_batch(
         }
         if categories.team_disbanded.iter().any(|c| c.id == id) {
             return "team_disbanded";
+        }
+        if categories.stale_open.iter().any(|c| c.id == id) {
+            return "stale_open";
         }
         "validation_leftovers"
     };
