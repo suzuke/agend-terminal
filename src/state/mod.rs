@@ -855,19 +855,51 @@ fn flattened_throttle_detect(
     screen_text: &str,
     input_line_markers: &[&str],
 ) -> Option<AgentState> {
-    // #2089: a long SRL error on a NARROW pane word-wraps across many rows, so its
-    // `⏺ API Error:` indicator prefix sits well above the bottom-`ERROR_TAIL_SCAN_LINES`
-    // window — `throttle_indicator_adjacent` then can't find it and the rescue
-    // wrongly rejects (the fixup-reviewer-2 miss). Flatten a LARGER window so the
-    // wrapped indicator is included; this only widens the LINE span (the visible
-    // grid `tail_lines` produced — never scrollback), and the char-proximity guard
-    // in `throttle_indicator_adjacent` still rejects a distant unrelated indicator.
-    let tail = recent_screen_tail(screen_text, HARD_WRAP_TAIL_LINES);
-    // #1947: drop input / user-message lines BEFORE flattening — flattening
-    // destroys the line structure the input-line exclusion needs, so an
-    // operator-typed error string would otherwise flatten into a legit-looking
-    // `API Error: <throttle>` adjacency. (A hard-wrapped typed line's
-    // continuation rows lack the marker — same accepted edge as the raw path.)
+    // #2090 P1: SRL/RateLimit caller of the shared `flattened_guarded_detect`
+    // skeleton. The SRL-specific config is (a) the `HARD_WRAP_TAIL_LINES` flatten
+    // window, (b) the {ServerRateLimit, RateLimit} accept-set, and (c) the
+    // `throttle_indicator_adjacent` proximity/anchor guard. Byte-identical to the
+    // pre-extraction inline body — SRL is the SOLE caller in P1; P2 adds further
+    // patterns (UsageLimit / ContextFull) each with their own accept-set + guard.
+    flattened_guarded_detect(
+        patterns,
+        screen_text,
+        input_line_markers,
+        HARD_WRAP_TAIL_LINES,
+        |state| matches!(state, AgentState::ServerRateLimit | AgentState::RateLimit),
+        throttle_indicator_adjacent,
+    )
+}
+
+/// #2090 P1: the reusable narrow-pane hard-wrap flatten-rematch skeleton,
+/// extracted from the SRL path (#2089) so P2 can add per-pattern callers.
+///
+/// A long error/status line on a NARROW pane is word-wrapped by the app across
+/// many rows, so the single-line `detect_with_match` over the live grid misses
+/// it. This flattens the bottom `tail_lines` rows — dropping input/user lines
+/// FIRST (#1947: flattening destroys the line structure the input-line
+/// exclusion needs) then space-joining — to recover the wrapped logical line,
+/// re-runs `detect_with_match`, and gates the result on:
+///   - `accept`: the detected state is one this caller rescues (a per-pattern
+///     allow-set — keeps an unrelated state the flatten happened to surface out);
+///   - `anchor`: a caller-supplied proximity/anchor guard `(flat, matched)` that
+///     is the `\n`-less replacement for line-scoped exclusion (flattening
+///     removed the `\n`s the raw path's line-scoping relied on), rejecting a
+///     prose / distant-indicator false positive.
+///
+/// `tail_lines` is widened past `ERROR_TAIL_SCAN_LINES` for SRL because a
+/// hard-wrapped indicator prefix can sit many rows above the throttle phrase;
+/// it only widens the visible-grid LINE span (never scrollback), and the
+/// char-proximity `anchor` still rejects a distant unrelated indicator.
+fn flattened_guarded_detect(
+    patterns: &crate::state::patterns::StatePatterns,
+    screen_text: &str,
+    input_line_markers: &[&str],
+    tail_lines: usize,
+    accept: impl Fn(AgentState) -> bool,
+    anchor: impl Fn(&str, &str) -> bool,
+) -> Option<AgentState> {
+    let tail = recent_screen_tail(screen_text, tail_lines);
     let flat = tail
         .lines()
         .filter(|line| !crate::state::patterns::is_input_line(line, input_line_markers))
@@ -875,10 +907,10 @@ fn flattened_throttle_detect(
         .collect::<Vec<_>>()
         .join(" ");
     let (state, matched) = patterns.detect_with_match(&flat)?;
-    if !matches!(state, AgentState::ServerRateLimit | AgentState::RateLimit) {
+    if !accept(state) {
         return None;
     }
-    if !throttle_indicator_adjacent(&flat, matched) {
+    if !anchor(&flat, matched) {
         return None;
     }
     Some(state)
