@@ -2269,6 +2269,131 @@ fn claude_server_throttle_fixture_triggers_server_rate_limit() {
     assert_eq!(t.get_state(), AgentState::ServerRateLimit);
 }
 
+/// strip CSI/SGR escapes to recover the plain screen_text from an ansi_colored_tail.
+fn strip_ansi_2089(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for x in chars.by_ref() {
+                    if x.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// #2089 — the REAL captured fixup-reviewer-2 screen REPRODUCES the suppression:
+/// a narrow-pane hard-wrapped SRL → single-line `detect_with_match` misses it and
+/// matches the idle `❯` prompt → classified Idle. (This capture is truncated to
+/// the bottom-15 rows the #1562 instrument logs, so it lacks the wrapped
+/// `⏺ API Error:` prefix that lived higher on the real full-height pane — hence
+/// it can't be *rescued* here; the full-pane latch is pinned in the test below.)
+#[test]
+fn srl_narrow_wrap_real_capture_reproduces_idle_suppression_2089() {
+    let raw =
+        std::fs::read_to_string("tests/fixtures/state-replay/claude-srl-narrow-wrap-2089.raw")
+            .expect("real reviewer-2 fixture");
+    let screen = strip_ansi_2089(&raw);
+    let patterns = StatePatterns::for_backend(&Backend::ClaudeCode);
+    assert_ne!(
+        patterns.detect_with_match(&screen).map(|(s, _)| s),
+        Some(AgentState::ServerRateLimit),
+        "#2089: the single-line regex misses the hard-wrapped SRL (this is the miss)"
+    );
+}
+
+/// #2089 dual-control ① — a narrow-pane hard-wrapped SRL with its `⏺ API Error:`
+/// indicator wrapped a few rows above the phrase (the REAL full-height layout)
+/// must LATCH. Pre-fix: `detect_with_match` matched the `❯` idle prompt (the
+/// wrapped SRL is invisible to the single-line regex) → Idle, and the `None`-arm
+/// hard-wrap fallback was unreachable. The fix runs that fallback on the benign
+/// Idle arm too (A) and widens the indicator search window (B).
+#[test]
+fn srl_hard_wrapped_narrow_pane_latches_2089() {
+    // Faithful reconstruction of the reviewer-2 narrow pane (matches the real
+    // capture's wrap pattern): the SRL error hard-wrapped (Ink `\n` per row, NOT
+    // a soft-wrap); `⏺ API Error:` sits ABOVE the bottom-15 window (the real
+    // capture started mid-phrase at "Server is"); a Baked spinner + the live `❯`
+    // input box below.
+    let screen = "⏺ API Error:\n\
+                  Server is\n\
+                  temporarily\n\
+                  limiting\n\
+                  requests (not\n\
+                  your usage\n\
+                  limit) · Rate\n\
+                  limited\n\
+                  \n\
+                  ✻ Baked for 23s\n\
+                  \n\
+                  ────────────────────────\n\
+                  ❯\n\
+                  ────────────────────────\n\
+                  Model: Opus 4.8\n\
+                  bypass permissions\n";
+    let patterns = StatePatterns::for_backend(&Backend::ClaudeCode);
+    // Suppression precondition: single-line detect does NOT see the SRL.
+    assert_ne!(
+        patterns.detect_with_match(screen).map(|(s, _)| s),
+        Some(AgentState::ServerRateLimit),
+        "precondition: the hard-wrapped SRL is invisible to the single-line regex"
+    );
+    // B precondition: the `⏺ API Error:` indicator is OUTSIDE the bottom-15
+    // (ERROR_TAIL_SCAN_LINES) window but INSIDE the widened HARD_WRAP_TAIL_LINES
+    // window — so the rescue only succeeds because B widened the indicator search.
+    assert!(
+        !recent_screen_tail(screen, ERROR_TAIL_SCAN_LINES).contains("API Error"),
+        "B precondition: indicator must be ABOVE the old bottom-15 window"
+    );
+    assert!(
+        recent_screen_tail(screen, HARD_WRAP_TAIL_LINES).contains("API Error"),
+        "B precondition: the widened window must reach the wrapped indicator"
+    );
+    // The fix: full feed rescues it via the flattened hard-wrap fallback.
+    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+    t.feed(screen);
+    assert_eq!(
+        t.get_state(),
+        AgentState::ServerRateLimit,
+        "#2089: a hard-wrapped SRL with an adjacent (wrapped) API Error: indicator must latch"
+    );
+}
+
+/// #2089 dual-control ② — FP guard: a conversation line that merely MENTIONS a
+/// throttle word ("limiting"/"throttle") with NO error indicator nearby must NOT
+/// be misclassified as a throttle — even though (A) now runs the flattened
+/// fallback on benign Idle/Thinking screens. The (B) indicator-adjacency guard
+/// is what holds the line.
+#[test]
+fn prose_throttle_mention_without_indicator_not_misclassified_2089() {
+    let screen = "⏺ I updated the rate limiter so the server stops\n\
+                  limiting requests during the throttle test window.\n\
+                  \n\
+                  ────────────────────────\n\
+                  ❯\n\
+                  ────────────────────────\n";
+    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+    t.feed(screen);
+    assert_ne!(
+        t.get_state(),
+        AgentState::ServerRateLimit,
+        "#2089 FP guard: prose mentioning 'limiting/throttle' with no error indicator must NOT latch"
+    );
+    assert_ne!(
+        t.get_state(),
+        AgentState::RateLimit,
+        "#2089 FP guard: prose mention must not latch RateLimit either"
+    );
+}
+
 /// #2086 SPIKE: reproduce the live incident at the state.feed level — an IDLE
 /// agent, then a static ServerRateLimit screen appears and persists for many
 /// ticks. Does feed() latch (and stay latched)? Instrument every feed.

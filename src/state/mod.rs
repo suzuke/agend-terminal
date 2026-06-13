@@ -396,6 +396,14 @@ pub(crate) const SERVER_RATE_LIMIT_RECOVERY_SILENCE: Duration = Duration::from_s
 /// structural-marker scan) — do not collapse the two.
 const ERROR_TAIL_SCAN_LINES: usize = 15;
 
+/// #2089: window for the hard-wrap throttle fallback's flatten. A long SRL error
+/// on a narrow (~24-col) pane wraps across ~7-9 rows; with the spinner + input
+/// box below, its `⏺ API Error:` indicator prefix lands well above
+/// `ERROR_TAIL_SCAN_LINES`. This wider span captures the wrapped indicator
+/// (still only the visible grid, never scrollback) so `throttle_indicator_adjacent`
+/// can validate the real throttle; the char-proximity guard keeps it FP-safe.
+const HARD_WRAP_TAIL_LINES: usize = 40;
+
 fn recent_screen_tail(screen_text: &str, n: usize) -> String {
     let lines: Vec<&str> = screen_text.lines().collect();
     let start = lines.len().saturating_sub(n);
@@ -847,7 +855,14 @@ fn flattened_throttle_detect(
     screen_text: &str,
     input_line_markers: &[&str],
 ) -> Option<AgentState> {
-    let tail = recent_screen_tail(screen_text, ERROR_TAIL_SCAN_LINES);
+    // #2089: a long SRL error on a NARROW pane word-wraps across many rows, so its
+    // `⏺ API Error:` indicator prefix sits well above the bottom-`ERROR_TAIL_SCAN_LINES`
+    // window — `throttle_indicator_adjacent` then can't find it and the rescue
+    // wrongly rejects (the fixup-reviewer-2 miss). Flatten a LARGER window so the
+    // wrapped indicator is included; this only widens the LINE span (the visible
+    // grid `tail_lines` produced — never scrollback), and the char-proximity guard
+    // in `throttle_indicator_adjacent` still rejects a distant unrelated indicator.
+    let tail = recent_screen_tail(screen_text, HARD_WRAP_TAIL_LINES);
     // #1947: drop input / user-message lines BEFORE flattening — flattening
     // destroys the line structure the input-line exclusion needs, so an
     // operator-typed error string would otherwise flatten into a legit-looking
@@ -1231,6 +1246,22 @@ impl StateTracker {
             // `anchor_on_red` is false (Shell/Raw backends) OR no color mask
             // was supplied (text-only callers).
             match patterns.detect_with_match(screen_text) {
+                Some((detected, matched))
+                    if !is_high_fp_state(detected)
+                        && !matches!(detected, AgentState::UsageLimit)
+                        && screen_has_throttle_hint(screen_text)
+                        && self.try_hard_wrap_throttle(patterns, screen_text) =>
+                {
+                    // #2089: `detect_with_match` landed a BENIGN state (Idle/Thinking
+                    // — the ❯ prompt / a spinner) because a long SRL error
+                    // word-wrapped across a narrow pane and the single-line regex
+                    // missed it. The cheap throttle-hint pre-filter gates the cost;
+                    // `try_hard_wrap_throttle` re-detected the throttle on the
+                    // flattened tail and transitioned to it (overriding the
+                    // idle-prompt chrome). Nothing more to do this arm. `matched` is
+                    // unused on this path.
+                    let _ = matched;
+                }
                 Some((detected, matched)) => {
                     let high_fp = is_high_fp_state(detected);
                     let usage_limit = matches!(detected, AgentState::UsageLimit);
@@ -1563,19 +1594,38 @@ impl StateTracker {
     /// raw text, so a hard-wrapped throttle with a working marker below is not
     /// overridden here — accepted; `recovered_within` still releases a
     /// genuinely-recovered pane.)
-    fn handle_no_raw_match(&mut self, patterns: &'static StatePatterns, screen_text: &str) {
-        if let Some(throttle) =
+    /// #SRL-phase2 / #2089: rescue a hard-wrapped throttle error that the
+    /// single-line `detect_with_match` missed (narrow-pane word-wrap). Runs the
+    /// flattened-tail re-detect; if it finds a throttle, transitions to it (via
+    /// the same recovered→Idle gate as the raw SRL path) and returns `true`.
+    /// Called from BOTH the no-raw-match arm AND the benign-detection arm (#2089:
+    /// a wrapped SRL co-existing with the idle `❯` prompt makes `detect_with_match`
+    /// return `Idle`, so the `None` arm alone was unreachable).
+    fn try_hard_wrap_throttle(
+        &mut self,
+        patterns: &'static StatePatterns,
+        screen_text: &str,
+    ) -> bool {
+        let Some(throttle) =
             flattened_throttle_detect(patterns, screen_text, self.input_line_markers)
+        else {
+            return false;
+        };
+        let landed = if matches!(throttle, AgentState::ServerRateLimit)
+            && self.recovered_within(SERVER_RATE_LIMIT_RECOVERY_SILENCE)
         {
-            let landed = if matches!(throttle, AgentState::ServerRateLimit)
-                && self.recovered_within(SERVER_RATE_LIMIT_RECOVERY_SILENCE)
-            {
-                AgentState::Idle
-            } else {
-                throttle
-            };
-            let gated = self.gate_on_heartbeat(landed);
-            self.transition(gated);
+            AgentState::Idle
+        } else {
+            throttle
+        };
+        let gated = self.gate_on_heartbeat(landed);
+        self.transition(gated);
+        true
+    }
+
+    fn handle_no_raw_match(&mut self, patterns: &'static StatePatterns, screen_text: &str) {
+        if self.try_hard_wrap_throttle(patterns, screen_text) {
+            // hard-wrapped throttle rescued + transitioned.
         } else if matches!(self.current, AgentState::Starting)
             && is_generic_startup_prompt(screen_text)
         {
