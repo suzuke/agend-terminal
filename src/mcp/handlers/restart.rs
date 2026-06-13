@@ -2,12 +2,13 @@ use serde_json::{json, Value};
 use std::path::Path;
 
 pub(super) fn handle_restart_daemon(home: &Path) -> Value {
-    // #1814 Stage 1: flag-gated self-respawn. When AGEND_RESTART_HANDOFF=1 the
-    // daemon owns its own respawn (spawn successor → Phase-1 health gate →
-    // abort-stay-alive on failure), so restart never hinges on an external
-    // supervisor being correctly detected (retires the #851/#1812 brick class
-    // at the root). Flag OFF → the legacy supervisor + exit(42) path below runs
-    // byte-identically.
+    // #1814: self-respawn is the DEFAULT (Stage 4). By default the daemon owns
+    // its own respawn (spawn successor → Phase-1 health gate → abort-stay-alive
+    // on failure), so restart never hinges on an external supervisor being
+    // correctly detected (retires the #851/#1812 brick class at the root). Only
+    // the explicit opt-out `AGEND_RESTART_HANDOFF=0` takes the legacy supervisor
+    // + exit(42) path below (byte-identical to pre-#1814). See
+    // `daemon::restart::self_respawn_enabled` + `docs/env-vars.md`.
     // #1814 observability: record which restart path this request takes so the
     // pre-soak operator A/B (legacy exit42 vs self-respawn) is greppable on one
     // tag. `target: "handoff"` + an `event` field make the handoff lifecycle
