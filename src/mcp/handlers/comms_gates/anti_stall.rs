@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 ///
 /// Folding all behaviors into one helper keeps the comms.rs call
 /// site a single line under the 700 LOC handler invariant.
-pub(super) fn enforce_send_invariants(
+pub(crate) fn enforce_send_invariants(
     home: &std::path::Path,
     args: &Value,
     sender: &Option<Sender>,

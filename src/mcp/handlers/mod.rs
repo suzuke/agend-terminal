@@ -1,13 +1,12 @@
 //! MCP tool dispatch — handle_tool() routes tool calls to implementations.
 
-mod anti_stall;
 mod binding_state;
 mod channel;
 pub(crate) mod ci;
 mod comms;
+pub(crate) mod comms_gates;
 pub(crate) mod dispatch;
 pub(crate) mod dispatch_hook;
-pub(crate) mod evidence_gate;
 mod force_release;
 pub(crate) mod instance;
 mod instance_metadata;
@@ -15,7 +14,6 @@ mod instance_queries;
 pub(crate) mod instance_state;
 mod restart;
 mod schedule;
-pub(crate) mod sha_gate;
 mod task;
 mod worktree;
 

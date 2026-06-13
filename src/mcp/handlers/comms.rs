@@ -5,7 +5,7 @@ use crate::identity::Sender;
 use serde_json::{json, Value};
 use std::path::Path;
 
-use super::{anti_stall::enforce_send_invariants, err_needs_identity, is_ok_result};
+use super::{comms_gates::enforce_send_invariants, err_needs_identity, is_ok_result};
 
 /// Sprint 30: unified `send` handler. Routes to existing handlers based on
 /// `request_kind` or infers from args (targets/team → broadcast, task field
@@ -170,100 +170,19 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
         None => return json!({"error": "missing 'task'"}),
     };
 
-    let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
-    let force_reason = args.get("force_reason").and_then(|v| v.as_str());
-    let claimed_tasks: Vec<_> = crate::tasks::list_all(home)
-        .into_iter()
-        .filter(|t| {
-            t.assignee.as_deref() == Some(target)
-                && (t.status == crate::task_events::TaskStatus::Claimed
-                    || t.status == crate::task_events::TaskStatus::InProgress)
-        })
-        .collect();
-    // #1496 Option 1: a send(kind=task) whose `task_id` is already one of the
-    // target's active tasks is ENRICHING that in-flight dispatch (finally
-    // delivering its context), not opening a competing one — let it through the
-    // busy-gate. Pairs with dropping task(create)'s premature auto-notify so the
-    // create→send dispatch sequence no longer needs force=true (#1496 spike).
-    let enriching_active = args["task_id"]
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .is_some_and(|tid| claimed_tasks.iter().any(|t| t.id.as_str() == tid));
-    // #1286: branch-specific dispatch dedup — reject if target already has
-    // an active task on the same branch (more specific than generic busy).
-    if !force && !enriching_active {
-        if let Some(branch) = args["branch"].as_str() {
-            if let Some(dup) = claimed_tasks
-                .iter()
-                .find(|t| t.branch.as_deref() == Some(branch))
-            {
-                return json!({
-                    "error": format!(
-                        "dispatch rejected: {} already has active task {} on branch {}",
-                        target, dup.id, branch
-                    )
-                });
-            }
-        }
-    }
-    if !claimed_tasks.is_empty() && !enriching_active {
-        if force {
-            if force_reason.is_none() || force_reason == Some("") {
-                return json!({"error": "force=true requires a non-empty 'force_reason'"});
-            }
-        } else {
-            let current = &claimed_tasks[0];
-            let age_secs = chrono::DateTime::parse_from_rfc3339(&current.updated_at)
-                .ok()
-                .map(|dt| {
-                    chrono::Utc::now()
-                        .signed_duration_since(dt.with_timezone(&chrono::Utc))
-                        .num_seconds()
-                })
-                .unwrap_or(0);
-            return json!({
-                "busy": true,
-                "current_task": {"id": current.id, "title": current.title, "age_seconds": age_secs},
-                "options": ["force=true (with force_reason)"],
-                "suggestion": format!("target busy on task {} ({}s old). Use force=true with force_reason to override.", current.id, age_secs)
-            });
-        }
-    }
-
-    // Second reviewer flag validation (§3.5 dual review)
-    let second_reviewer = args["second_reviewer"].as_bool().unwrap_or(false);
-    if second_reviewer {
-        let sr_reason = args["second_reviewer_reason"].as_str().unwrap_or("");
-        if sr_reason.is_empty() {
-            return json!({"error": "second_reviewer=true requires non-empty second_reviewer_reason"});
-        }
-    }
-
-    // #812: dispatch-time test-name validation. Extends §4.3
-    // hallucinated-fn check to the dispatch path so `cargo test`
-    // invocations naming a test that doesn't exist in the PR tree
-    // are rejected BEFORE the reviewer wastes a cycle on
-    // `no test matched`. Tree resolution priority: sender's bound
-    // worktree → recipient's daemon-managed path. None → fail-open
-    // with warn-log (don't block when only operator has the tree).
-    let branch = args["branch"].as_str();
-    if let Some(tree) =
-        crate::claim_verifier::resolve_dispatch_tree(home, sender.as_str(), Some(target), branch)
+    // Pre-send gates (busy / #1286 branch-dedup / #1496 enrich / §3.5
+    // second-reviewer / #812 test-name) — side-effect-free, short-circuit in
+    // order; see comms_gates::dispatch. The returned scalars (force /
+    // force_reason / second_reviewer) feed the message build, force_meta, and
+    // lease stages below, so they are derived exactly once.
+    let checks = match super::comms_gates::run_dispatch_pre_checks(home, sender, args, target, task)
     {
-        if let Err(detail) = crate::claim_verifier::validate_dispatch_test_names(task, &tree) {
-            return json!({
-                "error": detail,
-                "code": "test_name_not_found",
-            });
-        }
-    } else {
-        tracing::warn!(
-            sender = %sender.as_str(),
-            target = %target,
-            branch = ?branch,
-            "#812 dispatch test-name check skipped — no resolvable PR tree (sender unbound + no daemon worktree)"
-        );
-    }
+        Ok(checks) => checks,
+        Err(rejection) => return rejection,
+    };
+    let force = checks.force;
+    let force_reason = checks.force_reason.as_deref();
+    let second_reviewer = checks.second_reviewer;
 
     let mut msg = format!("[delegate_task] {task}");
     if force {
@@ -472,9 +391,11 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
 
         // M3: SHA-staleness gate — if reviewed_head is provided, verify against PR HEAD.
         if let Some(rh) = reviewed_head {
-            if let Err(e) =
-                super::sha_gate::check_sha_gate(rh, summary, super::sha_gate::fetch_pr_head_sha)
-            {
+            if let Err(e) = super::comms_gates::check_sha_gate(
+                rh,
+                summary,
+                super::comms_gates::fetch_pr_head_sha,
+            ) {
                 return json!({"error": e});
             }
         }
@@ -485,18 +406,18 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
         // REJECTED must carry an evidence token; UNVERIFIED is exempt. Scans
         // summary + artifacts (evidence may live in either) and reuses the
         // sha_gate reject path (`json!({"error"})` → back to the reviewer).
-        if let Some(verdict) = super::evidence_gate::detect_verdict(summary) {
+        if let Some(verdict) = super::comms_gates::detect_verdict(summary) {
             let evidence_body = match args["artifacts"].as_str() {
                 Some(a) => format!("{summary}\n{a}"),
                 None => summary.to_string(),
             };
-            if let Err(e) = super::evidence_gate::check_evidence_gate(&evidence_body, verdict) {
+            if let Err(e) = super::comms_gates::check_evidence_gate(&evidence_body, verdict) {
                 return json!({"error": e});
             }
 
             // #1666 Phase B (WARN-first): cross-check the checkable evidence and
             // LOG (never reject) — measures the false-positive rate. See the fn.
-            super::evidence_gate::cross_check_and_log(
+            super::comms_gates::cross_check_and_log(
                 home,
                 sender.as_str(),
                 summary,
