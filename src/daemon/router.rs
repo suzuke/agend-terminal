@@ -33,6 +33,18 @@ fn mirror_drain_start(buf: &str) -> usize {
     drain
 }
 
+/// Cap the mirror buffer in place: once it grows past `2 * MAX_MIRROR_LEN`,
+/// drain the front back under the cap, starting at the char-boundary-snapped
+/// index from [`mirror_drain_start`] so a multi-byte char is never split (the
+/// #2084 `drain(..n)` panic on a non-boundary `n`). Extracted verbatim from the
+/// run-loop per-event consume so the cap-drain path is directly unit-testable.
+fn apply_mirror_cap(buf: &mut String) {
+    if buf.len() > MAX_MIRROR_LEN * 2 {
+        let drain = mirror_drain_start(buf);
+        buf.drain(..drain);
+    }
+}
+
 /// Registration message: agent name + PTY output receiver.
 pub struct AgentSubscription {
     pub name: String,
@@ -111,10 +123,7 @@ fn run_loop(home: PathBuf, reg_rx: crossbeam_channel::Receiver<AgentSubscription
                     buf.input_id = pair.reply_to_input_id;
                     let text = String::from_utf8_lossy(&data);
                     buf.buffer.push_str(&text);
-                    if buf.buffer.len() > MAX_MIRROR_LEN * 2 {
-                        let drain = mirror_drain_start(&buf.buffer);
-                        buf.buffer.drain(..drain);
-                    }
+                    apply_mirror_cap(&mut buf.buffer);
                 } else {
                     buf.active = false;
                     buf.buffer.clear();
@@ -294,6 +303,39 @@ mod tests {
     fn mirror_drain_start_is_zero_when_short() {
         let s = "界界界".to_string();
         assert_eq!(mirror_drain_start(&s), 0);
+    }
+
+    #[test]
+    fn run_loop_cap_drain_never_panics_on_oversized_cjk() {
+        // §3.9 real-entry regression for #2084/#2085: drive the run-loop
+        // per-event consume+cap path (router.rs L113-117) — repeated `push_str`
+        // of 3-byte CJK well past 2*MAX_MIRROR_LEN, capping after each push
+        // exactly as the run-loop does. The original panic was
+        // `buf.drain(..n)` on a non-char-boundary `n` (12000-byte buffer →
+        // raw target 8000, and 8000 % 3 != 0). `apply_mirror_cap` must never
+        // panic and must hold the buffer at or under 2*MAX_MIRROR_LEN.
+        //
+        // Distinct from the existing pins: `mirror_drain_start_never_splits_*`
+        // exercises only the index helper + a manual drain;
+        // `mirror_truncation_safe_on_multibyte_utf8` drives the
+        // `try_dispatch_mirror` slice path (:184). Neither calls this drain.
+        //
+        // RED proof: reverting `mirror_drain_start` to the raw byte index
+        // (`buf.len().saturating_sub(MAX_MIRROR_LEN)` without the
+        // char-boundary while-snap) makes the first `apply_mirror_cap` below
+        // panic ("byte index … is not a char boundary").
+        let mut buf = String::new();
+        for _ in 0..10 {
+            buf.push_str(&"界".repeat(MAX_MIRROR_LEN)); // 12000 bytes/push (> 2*cap)
+            apply_mirror_cap(&mut buf); // must not panic on the drain
+            assert!(
+                buf.len() <= MAX_MIRROR_LEN * 2,
+                "cap must hold buffer <= 2*MAX_MIRROR_LEN, got {}",
+                buf.len()
+            );
+        }
+        // Drain never split a char → buffer ends on a valid char boundary.
+        assert!(buf.is_char_boundary(buf.len()));
     }
 
     // ── #1102 prefer-chain tests ──────────────────────────────────────
