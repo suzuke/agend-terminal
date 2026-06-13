@@ -121,6 +121,32 @@ static DIVERGENCE: parking_lot::Mutex<Option<std::collections::HashMap<String, D
     parking_lot::Mutex::new(None);
 
 /// Record a tick where behavioral and regex states are compared.
+///
+/// ## TWO divergence axes — do NOT conflate (survey 04 §6 recurrence guard)
+///
+/// This is the **silence×regex** axis (Sprint 27 shadow probe): it compares the
+/// silence-based `BehavioralSignal` (`thinking`/`idle`, produced by
+/// `infer_from_silence`) against the regex-detected screen state, and accumulates
+/// per-backend agree/diverge counts in `DivergenceStats`. `record_divergence` is
+/// invoked from the live state tracker (`state/mod.rs`); its *reader*,
+/// `divergence_report`, is retained but unconsumed in production (the
+/// `state-divergence-report` CLI was removed — operator decision
+/// `d-20260507155456191111-0`).
+///
+/// This is a DIFFERENT axis from the **heuristic×hook** divergence telemetry in
+/// `crate::daemon::divergence_telemetry` (the #1523 phase-2 prerequisite), which
+/// compares the raw screen *heuristic* state against the *hook-authoritative*
+/// state, with a per-state-pair breakdown (`disagree_pairs`) this older
+/// agree/diverge counter lacks.
+///
+/// survey 04 §6 mistakenly treated THIS (silence×regex) telemetry as #1523
+/// phase-2 material — it is not, and the two must not be wired together. #1523
+/// phase-2 work (promoting hang/recovery/watchdog/conflict_notify deciders from
+/// heuristic → hook) must use `crate::daemon::divergence_telemetry`, NOT this:
+/// silence-vs-regex measures the behavioral *shadow probe*; heuristic-vs-hook
+/// measures the #1523 *decider flip*. (Removing this unused silence×regex data
+/// layer is a separate decision that needs operator sign-off —
+/// dead-code-may-be-roadmap — not part of documenting the distinction.)
 pub fn record_divergence(backend: &str, behavioral: BehavioralSignal, regex_state: &str) {
     let mut guard = DIVERGENCE.lock();
     let map = guard.get_or_insert_with(std::collections::HashMap::new);
