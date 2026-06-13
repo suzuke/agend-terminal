@@ -1,7 +1,14 @@
 //! #851 restart-supervisor detection.
 //!
-//! `restart_daemon` MCP triggers a graceful shutdown + `exit(42)`. The
-//! exit code is meaningful ONLY when something supervises the daemon
+//! NOTE (#1814 Stage 4): `restart_daemon`'s DEFAULT is now in-process
+//! self-respawn (the daemon spawns + health-gates its own successor, then
+//! `exit(0)`) — see the `#1814 self-respawn` section + [`self_respawn_enabled`]
+//! below. The `is_restart_supervised()` + `exit(42)` machinery described in this
+//! module doc is the LEGACY path, now reached only via the explicit opt-out
+//! `AGEND_RESTART_HANDOFF=0`.
+//!
+//! `restart_daemon` MCP (legacy path) triggers a graceful shutdown + `exit(42)`.
+//! The exit code is meaningful ONLY when something supervises the daemon
 //! process and respawns on exit (launchd's `KeepAlive`, systemd's
 //! `Restart=on-failure`, Windows Task Scheduler, or the bash wrapper
 //! script at `scripts/agend-wrapper.sh`). When the daemon was started
@@ -118,22 +125,25 @@ fn has_env(name: &str) -> bool {
     std::env::var_os(name).is_some()
 }
 
-// ── #1814 Stage 1: self-respawn (flag-gated successor handoff) ──────────
+// ── #1814 self-respawn (successor handoff) — DEFAULT ON since Stage 4 ────
 //
-// When `AGEND_RESTART_HANDOFF=1`, `restart_daemon` no longer relies on an
-// external supervisor + `exit(42)`. Instead the running daemon spawns its
-// OWN successor, confirms it is healthy (Phase-1 gate), and only then exits
-// (0). If the successor fails the gate, the old daemon never shuts down — it
-// stays alive with its agents intact (abort-stay-alive). This retires the
-// supervision-detection brick class (#851/#1812) at the root: restart no
-// longer hinges on a static env-var guess about whether something will
-// respawn the process. See decision d-20260606104934346030-2.
+// By default `restart_daemon` no longer relies on an external supervisor +
+// `exit(42)`. Instead the running daemon spawns its OWN successor, confirms it
+// is healthy (Phase-1 gate), and only then exits(0). If the successor fails the
+// gate, the old daemon never shuts down — it stays alive with its agents intact
+// (abort-stay-alive). This retires the supervision-detection brick class
+// (#851/#1812) at the root: restart no longer hinges on a static env-var guess
+// about whether something will respawn the process. See decision
+// d-20260606104934346030-2.
 //
-// Flag OFF (default) → behaviour is byte-identical to the pre-#1814
-// `is_restart_supervised()` + `exit(42)` path. Stage 1 is opt-in.
+// `AGEND_RESTART_HANDOFF=0` is the explicit opt-OUT → byte-identical to the
+// pre-#1814 `is_restart_supervised()` + `exit(42)` legacy path. Stage 4
+// (#1814) flipped the default from opt-in to opt-out after Stage 2 aligned the
+// launchd `KeepAlive` to `SuccessfulExit=false` (so a supervisor relaunch can't
+// race the self-respawn successor for the flock).
 
-/// Env flag enabling #1814 self-respawn. `"1"` activates; anything else (or
-/// unset) keeps the legacy supervisor + `exit(42)` path.
+/// Env flag for #1814 self-respawn. DEFAULT ON: only the literal `"0"` opts out
+/// (legacy supervisor + `exit(42)`); unset / `"1"` / anything else ⇒ self-respawn.
 pub const RESTART_HANDOFF_ENV: &str = "AGEND_RESTART_HANDOFF";
 
 /// Env marker the old daemon sets on the successor it spawns:
@@ -144,10 +154,17 @@ pub const RESTART_HANDOFF_ENV: &str = "AGEND_RESTART_HANDOFF";
 /// reconciles that MUST NOT run in a two-daemon overlap window).
 pub const SUCCESSOR_HANDOFF_ENV: &str = "AGEND_SUCCESSOR_HANDOFF";
 
-/// True iff `AGEND_RESTART_HANDOFF=1`. Read at restart time (handler) and at
+/// True unless `AGEND_RESTART_HANDOFF=0`. Read at restart time (handler) and at
 /// daemon exit (to choose `exit(0)` vs `exit(42)`).
+///
+/// #1814 Stage 4: default ON (unset ⇒ in-process self-respawn). Legacy
+/// supervisor + `exit(42)` is opt-OUT via the literal `=0`; any other value
+/// (`1`, empty, …) ⇒ self-respawn. The four fallbacks (spawn-fail→stay-alive,
+/// phase1-fail→no-commit, commit→exit-window recover-as-primary, post-shutdown
+/// final recover-as-primary) make the worst case a restart no-op, never a brick
+/// — so ON-by-default is safe even with no external supervisor.
 pub fn self_respawn_enabled() -> bool {
-    std::env::var(RESTART_HANDOFF_ENV).as_deref() == Ok("1")
+    std::env::var(RESTART_HANDOFF_ENV).as_deref() != Ok("0")
 }
 
 /// Parse a legitimate successor-handoff marker into `(old_pid, token)`.
@@ -517,19 +534,29 @@ mod tests {
 
     // ── #1814 self-respawn helpers ──────────────────────────────────────
 
+    /// #1814 Stage 4: default ON — only the literal `"0"` opts out.
     #[test]
-    fn self_respawn_enabled_only_for_exactly_one() {
+    fn self_respawn_enabled_default_on_opt_out_only_with_zero() {
+        with_env(&[], &[RESTART_HANDOFF_ENV], || {
+            assert!(self_respawn_enabled(), "unset = ON (Stage 4 default)");
+        });
         with_env(&[(RESTART_HANDOFF_ENV, "1")], &[], || {
-            assert!(self_respawn_enabled(), "AGEND_RESTART_HANDOFF=1 enables");
+            assert!(self_respawn_enabled(), "=1 = ON");
         });
         with_env(&[(RESTART_HANDOFF_ENV, "0")], &[], || {
-            assert!(!self_respawn_enabled(), "0 does not enable");
+            assert!(
+                !self_respawn_enabled(),
+                "=0 is the ONLY opt-out (legacy exit42)"
+            );
         });
         with_env(&[(RESTART_HANDOFF_ENV, "true")], &[], || {
-            assert!(!self_respawn_enabled(), "only the literal \"1\" enables");
+            assert!(
+                self_respawn_enabled(),
+                "any non-\"0\" value = ON (only the literal \"0\" opts out)"
+            );
         });
-        with_env(&[], &[RESTART_HANDOFF_ENV], || {
-            assert!(!self_respawn_enabled(), "unset = off (flag-off default)");
+        with_env(&[(RESTART_HANDOFF_ENV, "")], &[], || {
+            assert!(self_respawn_enabled(), "empty (non-\"0\") = ON");
         });
     }
 
