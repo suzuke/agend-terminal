@@ -2732,4 +2732,91 @@ mod tests {
         );
         std::fs::remove_dir_all(&home).ok();
     }
+
+    // ── #2079: short-SHA reviewed_head must still flip merge-ready ──
+    //
+    // §3.9 + #1493 producer-fed: drive a REAL verdict-report `InboxMessage`
+    // carrying an ABBREVIATED `reviewed_head` (the #2078 `7e1d422` shape)
+    // through the REAL ingestion entry (`process_verdicts`), not a synthetic
+    // `record_verdict` call — a representative fixture is what catches the
+    // wiring gap. Pre-fix the exact `==` missed the short SHA → silent buffer →
+    // 24h TTL.
+
+    const FULL_HEAD_2079: &str = "7e1d4228bea3cf7fe2d72aab66015297308b48bc";
+    const SHORT_HEAD_2079: &str = "7e1d422"; // 7-char hex prefix of FULL_HEAD_2079
+
+    fn verdict_report_msg(corr: &str, reviewed_head: &str) -> crate::inbox::InboxMessage {
+        crate::inbox::InboxMessage::new_system("system:reviewer", "report", "VERIFIED looks good")
+            .with_correlation_id(corr.to_string())
+            .with_reviewed_head(reviewed_head.to_string())
+    }
+
+    #[test]
+    fn short_sha_verdict_flips_merge_ready_via_real_ingestion_2079() {
+        use crate::daemon::pr_state;
+        let home = tmp_home("2079-shortsha-flip");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+
+        // CI observed green at the FULL head_sha (single-review gate).
+        pr_state::record_ci_result(
+            &home,
+            "owner/repo",
+            "feat/x",
+            FULL_HEAD_2079,
+            pr_state::CiConclusion::Green,
+            vec!["dev".to_string()],
+            pr_state::ReviewClass::Single,
+        );
+
+        // Reviewer's report carries the ABBREVIATED head — real ingestion entry.
+        process_verdicts(
+            &home,
+            "fixup-reviewer",
+            &verdict_report_msg("owner/repo@feat/x", SHORT_HEAD_2079),
+        );
+
+        let state = pr_state::load(&home, "owner/repo", "feat/x").expect("state exists");
+        assert!(
+            pr_state::is_merge_ready(&state),
+            "#2079: a VERIFIED carrying a 7-char reviewed_head must flip merge-ready against the \
+             full canonical head_sha (prefix-match), not silently buffer; state={state:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn short_sha_verdict_before_ci_drains_from_buffer_2079() {
+        use crate::daemon::pr_state;
+        let home = tmp_home("2079-shortsha-buffer");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+
+        // Verdict arrives FIRST (no pr-state yet) with a short head → buffered.
+        process_verdicts(
+            &home,
+            "fixup-reviewer",
+            &verdict_report_msg("owner/repo@feat/x", SHORT_HEAD_2079),
+        );
+
+        // Then CI observes the branch at the FULL head → drain must prefix-match
+        // the buffered short verdict and replay it onto the new state.
+        pr_state::record_ci_result(
+            &home,
+            "owner/repo",
+            "feat/x",
+            FULL_HEAD_2079,
+            pr_state::CiConclusion::Green,
+            vec!["dev".to_string()],
+            pr_state::ReviewClass::Single,
+        );
+
+        let state = pr_state::load(&home, "owner/repo", "feat/x").expect("state exists");
+        assert!(
+            pr_state::is_merge_ready(&state),
+            "#2079: a short-SHA verdict buffered BEFORE CI must drain (prefix-match) when the full \
+             head is observed and flip merge-ready; state={state:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
 }

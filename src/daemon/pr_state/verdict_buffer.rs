@@ -133,7 +133,12 @@ pub(crate) fn drain_for_head(home: &Path, head: &str) -> Vec<BufferedVerdict> {
         let Ok(v) = serde_json::from_str::<BufferedVerdict>(&content) else {
             continue;
         };
-        if v.reviewed_head == head {
+        // #2079: prefix-tolerant — a buffered verdict whose `reviewed_head` is an
+        // abbreviated SHA (e.g. `7e1d422`) drains when the full canonical `head`
+        // is observed (the #2078 silent-buffer bug: short reviewed_head never met
+        // the full-SHA drain key). `head` is canonical-full; `v.reviewed_head` is
+        // what the reviewer asserted.
+        if super::sha_prefix_match(head, &v.reviewed_head) {
             let _ = std::fs::remove_file(&path);
             out.push(v);
         }

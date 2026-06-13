@@ -382,6 +382,29 @@ pub fn apply(state: &mut PrState, event: Event<'_>) {
     }
 }
 
+/// #2079: match a reviewer-asserted SHA against a full canonical head SHA,
+/// tolerating an ABBREVIATED prefix. `full` is the canonical head (gh-poll /
+/// CI always supply the 40-char SHA); `asserted` is what a reviewer's report
+/// carried — gh and humans routinely abbreviate to 7–12 chars (the #2078 case:
+/// `7e1d422` silently buffered to its 24h TTL because the exact `==` never met
+/// the full-SHA-keyed drain).
+///
+/// Exact equality when the strings match. Otherwise `asserted` must be a HEX
+/// prefix of `full`, ≥7 chars (git's abbreviation floor; collisions across a
+/// single repo's PR set are negligible — noted in #2079). A non-hex or
+/// <7-char `asserted` (e.g. a test's `"sha-A"`) gets NO loosening — it falls
+/// back to exact equality, so this can never widen a non-SHA comparison.
+pub(crate) fn sha_prefix_match(full: &str, asserted: &str) -> bool {
+    if full == asserted {
+        return true;
+    }
+    let n = asserted.len();
+    (7..40).contains(&n)
+        && asserted.bytes().all(|b| b.is_ascii_hexdigit())
+        && full.len() > n
+        && full.starts_with(asserted)
+}
+
 /// §4.2 stale-head invariant — CI's green SHA AND every reviewer's
 /// reviewed_head MUST equal the current PR head_sha. If `head_sha`
 /// advanced after VERIFIED, the verdict is stale; refuse to fire
@@ -406,9 +429,11 @@ pub fn is_merge_ready(state: &PrState) -> bool {
     if reviewers.len() < state.review_class.required_verified_count() {
         return false;
     }
+    // #2079: prefix-tolerant — a reviewer that asserted an abbreviated SHA
+    // (e.g. `7e1d422`) still counts toward merge-ready against the full head.
     reviewers
         .iter()
-        .all(|(_, reviewed)| reviewed == &state.head_sha)
+        .all(|(_, reviewed)| sha_prefix_match(&state.head_sha, reviewed))
 }
 
 // ─── storage ───────────────────────────────────────────────────────────
@@ -936,7 +961,10 @@ pub fn record_verdict(
         let Ok(state): Result<PrState, _> = serde_json::from_str(&content) else {
             continue;
         };
-        if state.head_sha != reviewed_head {
+        // #2079: prefix-tolerant — a reviewer's abbreviated `reviewed_head`
+        // (e.g. `7e1d422`) matches the PR state's full canonical head_sha,
+        // instead of silently falling through to the 24h-TTL buffer.
+        if !sha_prefix_match(&state.head_sha, reviewed_head) {
             continue;
         }
         matched_any = true;
