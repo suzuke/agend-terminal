@@ -1637,24 +1637,24 @@ impl StateTracker {
         high_fp: bool,
     ) -> AgentState {
         if high_fp || matches!(detected, AgentState::UsageLimit) {
-            let fallback = if matches!(detected, AgentState::ServerRateLimit)
-                && self.recovered_within(SERVER_RATE_LIMIT_RECOVERY_SILENCE)
-            {
+            let is_srl = matches!(detected, AgentState::ServerRateLimit);
+            let recovered = is_srl && self.recovered_within(SERVER_RATE_LIMIT_RECOVERY_SILENCE);
+            let fallback = if recovered {
                 AgentState::Idle
             } else {
                 detected
             };
             let working_below = patterns.working_state_below(screen_text, matched);
-            if matches!(detected, AgentState::ServerRateLimit) {
-                let recovered = self.recovered_within(SERVER_RATE_LIMIT_RECOVERY_SILENCE);
+            if is_srl {
                 let productive_silent_secs = self.productive_silence().as_secs();
                 let dist_from_bottom = srl_match_signature(screen_text, matched).1;
                 match &working_below {
-                    // Path A: a working marker renders BELOW the error →
-                    // `working_state_below` override lands that working state,
-                    // swallowing the SRL (#1769 positional defeat).
+                    // Path A: a working marker renders BELOW the error.
                     Some((win_state, marker)) => {
                         if recovered {
+                            // Recent productive output → genuine recovery; the
+                            // #1769 working_state_below override lands the working
+                            // state (SRL was stale).
                             tracing::info!(
                                 target: "state_detection",
                                 agent = %self.instance_name,
@@ -1666,30 +1666,36 @@ impl StateTracker {
                                 recovered_within = recovered,
                                 productive_silent_secs,
                                 dist_from_bottom,
-                                "ServerRateLimit swallowed by working_state_below override (Path A) with recent productive output — likely genuine recovery"
+                                "ServerRateLimit yields to working_state_below override (Path A) with recent productive output — genuine recovery"
                             );
                         } else {
+                            // #2086 fix: NO recent productive output → the working
+                            // marker below the error is claude's STUCK
+                            // rate-limited retry spinner ("· Stewing…"), NOT
+                            // recovery. Do NOT let it swallow the SRL — keep it
+                            // latched so the supervisor's SRL backoff retry fires.
+                            // This promotes the #1809-srl-swallow-probe's
+                            // `recovered_within` discriminator from log to decision
+                            // (the WARN here used to fire on the silent swallow that
+                            // stranded the agent for ~26 min, #2086).
                             tracing::warn!(
                                 target: "state_detection",
                                 agent = %self.instance_name,
-                                tag = "#1809-srl-swallow-probe",
+                                tag = "#2086-srl-keep-latched",
                                 path = "working_state_below",
                                 backend = %self.backend_name,
                                 working_marker = %marker,
-                                landed_state = ?win_state,
+                                masked_working_state = ?win_state,
                                 recovered_within = recovered,
                                 productive_silent_secs,
                                 dist_from_bottom,
-                                "ServerRateLimit swallowed by working_state_below override (Path A) with NO recent productive output — possible static-chrome mask of a stuck throttle"
+                                "ServerRateLimit KEPT latched — a working marker below the error with NO recent productive output is a stuck-retry spinner, not recovery (was swallowed pre-#2086)"
                             );
                         }
                     }
                     // Path B: NO working marker below, but the
-                    // `recovered_within`→Idle fallback swallows the SRL.
-                    // Previously SILENT — the gap that hid the live claude bug.
-                    // Only reachable when `recovered` is true (that IS the gate);
-                    // log the raw silence so we can judge whether
-                    // `recovered_within` is firing legitimately.
+                    // `recovered_within`→Idle fallback swallows the SRL. Only
+                    // reachable when `recovered` is true (that IS the gate).
                     None if recovered => {
                         tracing::info!(
                             target: "state_detection",
@@ -1700,7 +1706,7 @@ impl StateTracker {
                             recovered_within = recovered,
                             productive_silent_secs,
                             dist_from_bottom,
-                            "ServerRateLimit swallowed by recovered_within→Idle fallback (Path B) — no working marker below"
+                            "ServerRateLimit yields to recovered_within→Idle fallback (Path B) — no working marker below"
                         );
                     }
                     // No working marker + NOT recovered → SRL latches normally
@@ -1708,7 +1714,15 @@ impl StateTracker {
                     None => {}
                 }
             }
-            working_below.map(|(s, _)| s).unwrap_or(fallback)
+            // #2086: for a non-recovered SRL, a working marker below the error is
+            // a stuck-retry spinner — keep the SRL (do NOT swallow). Every other
+            // case is unchanged: recovered SRL / non-SRL HIGH_FP / UsageLimit all
+            // honor the working_state_below override as before.
+            if is_srl && !recovered && working_below.is_some() {
+                detected
+            } else {
+                working_below.map(|(s, _)| s).unwrap_or(fallback)
+            }
         } else {
             detected
         }

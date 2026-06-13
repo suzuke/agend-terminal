@@ -2269,6 +2269,180 @@ fn claude_server_throttle_fixture_triggers_server_rate_limit() {
     assert_eq!(t.get_state(), AgentState::ServerRateLimit);
 }
 
+/// #2086 SPIKE: reproduce the live incident at the state.feed level — an IDLE
+/// agent, then a static ServerRateLimit screen appears and persists for many
+/// ticks. Does feed() latch (and stay latched)? Instrument every feed.
+#[test]
+fn spike_2086_idle_then_static_srl_latches_at_feed_level() {
+    let srl = String::from_utf8_lossy(
+        &std::fs::read("tests/fixtures/state-replay/claude-server-throttle.raw").expect("fixture"),
+    )
+    .to_string();
+    let idle = "│ > Try \"edit <filepath>\" to get started                                    │\n";
+
+    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+    // Phase 1: idle frames (establish a non-throttle last_screen_hash + Idle).
+    for i in 0..3 {
+        t.feed(idle);
+        eprintln!("[2086] idle feed {i}: state={:?}", t.get_state());
+    }
+    // Phase 2: SRL appears (hash changes → first classification).
+    t.feed(&srl);
+    eprintln!("[2086] SRL first feed: state={:?}", t.get_state());
+    let after_first = t.get_state();
+    // Phase 3: static SRL persists (same hash) for many ticks (the 26-min stall).
+    for i in 0..20 {
+        t.feed(&srl);
+        if i < 3 || i == 19 {
+            eprintln!("[2086] static SRL feed {i}: state={:?}", t.get_state());
+        }
+    }
+    eprintln!(
+        "[2086] FINAL after_first={after_first:?} final={:?}",
+        t.get_state()
+    );
+    assert_eq!(
+        after_first,
+        AgentState::ServerRateLimit,
+        "#2086: a static SRL screen appearing while Idle must latch SRL at the feed level"
+    );
+    assert_eq!(
+        t.get_state(),
+        AgentState::ServerRateLimit,
+        "#2086: SRL must STAY latched across static repeats (hash-dedup throttle-hint override)"
+    );
+}
+
+/// #2086 SPIKE: reproduce through the REAL production path — SRL fixture BYTES
+/// → VTerm render → tail_lines_with_fg → feed_with_fg (exactly agent/mod.rs:1490),
+/// NOT the raw fixture string. The fixture starts with `\x1b[2J\x1b[H` so the
+/// SRL line renders at row 1 of a tall terminal with blank rows below.
+#[test]
+fn spike_2086_srl_via_vterm_render_path() {
+    let bytes =
+        std::fs::read("tests/fixtures/state-replay/claude-server-throttle.raw").expect("fixture");
+
+    let mut vt = crate::vterm::VTerm::new(80, 24);
+    vt.process(&bytes);
+    let rows = vt.rows() as usize;
+    let (screen, fg) = vt.tail_lines_with_fg(rows);
+    eprintln!(
+        "[2086] vterm-rendered screen ({} chars), SRL line index from top:",
+        screen.len()
+    );
+    for (i, l) in screen.lines().enumerate() {
+        let t = l.trim_end();
+        if !t.is_empty() {
+            eprintln!("[2086]   row {i}: {t:?}");
+        }
+    }
+    let total = screen.lines().count();
+    let srl_row = screen.lines().position(|l| l.contains("limiting requests"));
+    eprintln!("[2086] total rows={total}, SRL at row={srl_row:?}, ERROR_TAIL_SCAN_LINES=15");
+
+    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+    t.feed_with_fg(&screen, &fg);
+    eprintln!("[2086] state after VTERM-path feed = {:?}", t.get_state());
+    assert_eq!(
+        t.get_state(),
+        AgentState::ServerRateLimit,
+        "#2086: SRL via the real vterm render path must latch (if this FAILS, that IS the bug)"
+    );
+}
+
+/// #2086 SPIKE — FAITHFUL repro of the live incident layout: the real claude
+/// screen renders the SRL error HIGH up, then the live input box (`────`/`❯`) at
+/// the BOTTOM (the state-transitions.jsonl pty_snippet was `────…` = the input
+/// box border, NOT the error). So the SRL match sits ABOVE the bottom-15-row
+/// tail the #1518 position gate scans → suppressed → never latched. (The
+/// synthetic fixture `\x1b[2J`-clears to a 5-row screen with SRL at the bottom,
+/// which is why it latches and never reproduced the bug.)
+#[test]
+fn spike_2086_srl_above_input_box_is_suppressed_by_position_gate() {
+    // 24-row terminal: SRL error at row 1, blanks, input box at rows 22-23.
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"\x1b[2J\x1b[H");
+    bytes.extend_from_slice(b"\x1b[2;1H\x1b[31mAPI Error: Server is temporarily limiting requests (not your usage limit) \xc2\xb7 check status.claude.com\x1b[0m");
+    bytes.extend_from_slice(b"\x1b[4;1HRetrying automatically...");
+    // Live input box at the very bottom (what claude re-renders under the error).
+    bytes.extend_from_slice(b"\x1b[22;1H");
+    bytes.extend_from_slice("─".repeat(80).as_bytes());
+    bytes.extend_from_slice(b"\x1b[23;1H\xe2\x9d\xaf ");
+
+    let mut vt = crate::vterm::VTerm::new(80, 24);
+    vt.process(&bytes);
+    let (screen, fg) = vt.tail_lines_with_fg(vt.rows() as usize);
+    let total = screen.lines().count();
+    let srl_row = screen.lines().position(|l| l.contains("limiting requests"));
+    eprintln!("[2086] tall screen: total_rows={total} SRL_at_row={srl_row:?} tail=bottom-15");
+    let dist = srl_row.map(|r| total.saturating_sub(r));
+    eprintln!("[2086] SRL distance-from-bottom={dist:?} (>15 ⇒ position gate suppresses)");
+
+    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+    t.feed_with_fg(&screen, &fg);
+    // Regression pin (a DISTINCT mechanism from #2086): when the SRL error is
+    // genuinely far above the live tail with NO working marker below it, the
+    // #1518 position gate legitimately suppresses it as a scrolled-off stale
+    // error. This is kept to prove the #2086 working-marker fix did NOT weaken
+    // the position gate's stale-error job (#1518/#919).
+    assert_eq!(
+        t.get_state(),
+        AgentState::Idle,
+        "position gate must still suppress a genuinely scrolled-off SRL (no working marker below)"
+    );
+}
+
+/// #2086 dual-control ① — the REAL incident screen (captured by the #1562
+/// instrument, `unclassified_errors.jsonl` ts=2026-06-13T10:00:55Z, which the
+/// daemon mis-classified as `thinking` for ~26 min). Layout: SRL error, then a
+/// "· Stewing…" spinner (a Thinking marker) BELOW it, then the input box — and
+/// NO "Retrying automatically…" chrome. With NO recent productive output
+/// (`recovered_within=false`) the spinner is a STUCK rate-limited retry, not
+/// recovery → the SRL must STAY latched (pre-#2086 the #1768 working_state_below
+/// override swallowed it → Thinking → never latched → no recovery).
+#[test]
+fn srl_stuck_spinner_below_error_stays_latched_2086() {
+    let bytes = std::fs::read("tests/fixtures/state-replay/claude-srl-stewing-spinner-2086.raw")
+        .expect("real incident fixture");
+    let mut vt = crate::vterm::VTerm::new(120, 40);
+    vt.process(&bytes);
+    let (screen, fg) = vt.tail_lines_with_fg(vt.rows() as usize);
+
+    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+    // recovered_within=false (default: last_productive_output=None).
+    t.feed_with_fg(&screen, &fg);
+    assert_eq!(
+        t.get_state(),
+        AgentState::ServerRateLimit,
+        "#2086: a working spinner below the SRL with NO recent productive output is a \
+         stuck retry — the SRL must stay latched (pre-fix it was swallowed to Thinking)"
+    );
+}
+
+/// #2086 dual-control ② — GENUINE recovery must still win (don't break
+/// #1768/#1769). The SAME screen, but with RECENT productive output
+/// (`recovered_within=true`) → the working marker below the error IS real
+/// recovery → land the working state, NOT SRL.
+#[test]
+fn srl_yields_to_working_marker_when_recently_productive_2086() {
+    let bytes = std::fs::read("tests/fixtures/state-replay/claude-srl-stewing-spinner-2086.raw")
+        .expect("real incident fixture");
+    let mut vt = crate::vterm::VTerm::new(120, 40);
+    vt.process(&bytes);
+    let (screen, fg) = vt.tail_lines_with_fg(vt.rows() as usize);
+
+    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+    // Recent productive output ⇒ recovered_within(SERVER_RATE_LIMIT_RECOVERY_SILENCE)=true.
+    t.last_productive_output = Some(Instant::now());
+    t.feed_with_fg(&screen, &fg);
+    assert_ne!(
+        t.get_state(),
+        AgentState::ServerRateLimit,
+        "#2086: with recent productive output the working marker below IS genuine \
+         recovery (#1768/#1769) — must land the working state, not re-latch the stale SRL"
+    );
+}
+
 /// Individual: the new 529 overload wording must classify as
 /// ServerRateLimit (new alternation in the narrowed pattern).
 /// Pre-#848 this fell through (`overloaded` lowercase didn't match
@@ -2851,30 +3025,31 @@ fn srl_swallow_probe_names_recovered_within_idle_gate() {
     );
 }
 
-/// #1809-srl-swallow-probe (Path A — now ALL backends, including claude; the old
-/// #1808-flaw2-probe was scoped to Agy/Kiro and blind to claude): a claude
-/// ServerRateLimit swallowed by a `working_state_below` override (a Thinking
-/// marker rendered BELOW the error) must emit the probe naming
-/// `path = "working_state_below"` + the winning marker. Drives `feed_with_fg`.
+/// #2086 fix (was the #1809-srl-swallow-probe Path A WARN): a claude
+/// ServerRateLimit with a Thinking marker rendered BELOW it but NO recent
+/// productive output (`recovered_within=false`) is a STUCK rate-limited retry
+/// spinner, NOT recovery → the SRL must be KEPT latched (pre-#2086 the
+/// `working_state_below` override swallowed it → Thinking → 26-min stall). The
+/// #2086 log names `path = "working_state_below"` + the masked working state.
 #[test]
-fn srl_swallow_probe_names_working_state_below_gate_for_claude() {
+fn srl_kept_latched_when_working_marker_below_but_not_recovered_2086() {
     let (mut vt, mut st) = claude_tracker();
     // SRL error line with a claude working marker ("thought for Ns" → Thinking)
-    // rendered BELOW it → `working_state_below` overrides the SRL. No productive
-    // history → `recovered_within` false → WARN branch (possible stuck mask).
+    // rendered BELOW it. No productive history → `recovered_within` false → the
+    // #2086 fix keeps the SRL latched instead of swallowing it.
     let screen = format!("\x1b[2J\x1b[H{SRL_LINE}\r\nthought for 12s\r\n");
     let logs = capture_all_logs(|| {
         drive(&mut vt, &mut st, screen.as_bytes());
     });
-    assert_ne!(
+    assert_eq!(
         st.get_state(),
         AgentState::ServerRateLimit,
-        "precondition: working_state_below must override the SRL (Path A)"
+        "#2086: a working marker below the SRL with NO recent productive output is a \
+         stuck retry — the SRL must stay latched, not be swallowed to the working state"
     );
     assert!(
-        logs.contains("#1809-srl-swallow-probe") && logs.contains("path=\"working_state_below\""),
-        "Path A (working_state_below override) must emit the #1809-srl-swallow-probe \
-         for claude (was scoped to Agy/Kiro). logs:\n{logs}"
+        logs.contains("#2086-srl-keep-latched") && logs.contains("path=\"working_state_below\""),
+        "the keep-latched decision must log #2086-srl-keep-latched naming the gate. logs:\n{logs}"
     );
 }
 
@@ -3542,17 +3717,46 @@ fn retry_storm_recovered_below_error_lands_on_working_state_1768() {
                   ▌ esc to interrupt";
     let n = screen.chars().count();
     let mut t = StateTracker::new(Some(&Backend::Codex));
+    // #2086: GENUINE recovery is now PROVEN by recent productive output, not just
+    // a working-marker spinner below the error (a stuck rate-limited retry shows a
+    // spinner too — the #2086 incident). With productive output recorded,
+    // `recovered_within` is true → the working_state_below override lands the
+    // working state, preserving #1768's no-retry-storm behavior for real recovery.
+    t.last_productive_output = Some(Instant::now());
     t.feed_with_fg(screen, &vec![CellFg::Default; n]);
     assert_ne!(
         t.get_state(),
         AgentState::ServerRateLimit,
-        "#1768: a recovered agent (working-marker below the scrolled-up error) must \
+        "#1768: a recovered agent (working-marker below + recent productive output) must \
          NOT re-latch ServerRateLimit (→ no retry storm)"
     );
     assert_eq!(
         t.get_state(),
         AgentState::Thinking,
         "#1768: it lands on the working state the marker indicates"
+    );
+}
+
+/// #2086 companion to the #1768 test above: the SAME scrolled-up-error +
+/// working-spinner-below layout, but with NO recent productive output, is a
+/// STUCK retry (not recovery) → the SRL must stay latched. This is the
+/// deliberate #2086 semantic change: a working spinner below an SRL error only
+/// defeats it when PROVEN recovered (productive output), never on the spinner
+/// alone (which a stuck rate-limited retry also renders).
+#[test]
+fn srl_with_working_spinner_below_but_no_productive_stays_latched_2086() {
+    let screen = "▌ API Error: InvalidHTTPResponse fetching \"http://127.0.0.1:3456\".\n\
+                  ▌ retrying the request\n\
+                  ▌ esc to interrupt";
+    let n = screen.chars().count();
+    let mut t = StateTracker::new(Some(&Backend::Codex));
+    // recovered_within=false (no productive output) → stuck retry, keep latched.
+    t.feed_with_fg(screen, &vec![CellFg::Default; n]);
+    assert_eq!(
+        t.get_state(),
+        AgentState::ServerRateLimit,
+        "#2086: working spinner below SRL with NO productive output is a stuck retry — \
+         keep SRL latched so the supervisor's backoff retry fires"
     );
 }
 
