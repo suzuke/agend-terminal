@@ -515,13 +515,24 @@ fn track_dispatch(
     if matches!(kind_str, "task" | "query") {
         let outbound_corr = msg.correlation_id.as_deref().or(msg.task_id.as_deref());
         let explicit_threshold = params["expect_reply_within_secs"].as_i64();
-        if let Some(threshold) =
+        // #2099: a fire-and-forget dispatch (`no_report_expected`) records NO
+        // dispatch-idle sidecar, so the ~threshold watchdog never nags the
+        // dispatcher (`dispatch_idle_threshold_exceeded`) nor [team-watchdog]s
+        // the target — this is the SECOND ~30min nag channel (the DispatchEntry
+        // sweep already skips the same flag). read-first: `pending_for_instance`
+        // (query.rs status) then correctly omits a no-reply dispatch, and
+        // `cleanup_pending_for_task_id` no-ops with no sidecar — the nag + that
+        // (correct) observability are the ONLY effects.
+        let threshold = if params["no_report_expected"].as_bool().unwrap_or(false) {
+            None
+        } else {
             crate::daemon::dispatch_idle::team_nudge::resolve_threshold_for_dispatch(
                 home,
                 from,
                 explicit_threshold,
             )
-        {
+        };
+        if let Some(threshold) = threshold {
             let outbound_corr = outbound_corr.map(String::from);
             // #2004: a swallowed record failure means this dispatch never gets
             // its idle-timeout nudge — surface it (non-fatal: the dispatch
@@ -1879,6 +1890,73 @@ mod tests {
             entry.threshold_secs,
             crate::daemon::dispatch_idle::team_nudge::DEFAULT_DISPATCH_THRESHOLD_SECS,
             "L2 must inject the team default threshold (#2031: 1800s)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2099 rework (PR #2108, reviewer-2 catch): close the SECOND ~30min nag
+    /// channel. A fixup-team dispatch auto-arms dispatch_idle at the 1800s team
+    /// default; a fire-and-forget dispatch (`no_report_expected=true`) must
+    /// record NO sidecar, so the watchdog never fires
+    /// `dispatch_idle_threshold_exceeded` (dispatcher) / `[team-watchdog]`
+    /// (target). Channel 1 (the DispatchEntry sweep) is pinned separately by
+    /// `dispatch_tracking::tests::sweep_stuck_skips_no_report_expected_2099`.
+    ///
+    /// REGRESSION-PROOF: drop the `no_report_expected` short-circuit in
+    /// `track_dispatch` → the flagged dispatch seeds a sidecar and the first
+    /// assertion fails.
+    #[test]
+    fn no_report_expected_dispatch_records_no_dispatch_idle_sidecar_2099() {
+        let home = tmp_home("ff-no-dispatch-idle");
+        write_fixup_fleet(&home, &["fixup-lead", "fixup-reviewer"]);
+        let ctx = test_ctx(&home);
+
+        // Flagged fire-and-forget kind=task → NO dispatch_idle sidecar.
+        let flagged = handle_send(
+            &json!({
+                "from": "fixup-lead",
+                "target": "fixup-reviewer",
+                "text": "[delegate_task] fire and forget",
+                "kind": "task",
+                "task_id": "t-ff",
+                "no_report_expected": true,
+            }),
+            &ctx,
+        );
+        assert_eq!(
+            flagged["ok"], true,
+            "flagged dispatch must succeed: {flagged}"
+        );
+        let pending = crate::daemon::dispatch_idle::list_pending(&home);
+        assert!(
+            !pending
+                .iter()
+                .any(|p| p.correlation_id.as_deref() == Some("t-ff")),
+            "fire-and-forget dispatch must NOT seed a dispatch_idle sidecar (no ~1800s nag): {pending:?}"
+        );
+
+        // Control: an UNflagged kind=task to the same team STILL seeds a sidecar
+        // (default unchanged — the 1800s watchdog arms as before).
+        let normal = handle_send(
+            &json!({
+                "from": "fixup-lead",
+                "target": "fixup-reviewer",
+                "text": "[delegate_task] normal work",
+                "kind": "task",
+                "task_id": "t-normal",
+            }),
+            &ctx,
+        );
+        assert_eq!(
+            normal["ok"], true,
+            "unflagged dispatch must succeed: {normal}"
+        );
+        let pending2 = crate::daemon::dispatch_idle::list_pending(&home);
+        assert!(
+            pending2
+                .iter()
+                .any(|p| p.correlation_id.as_deref() == Some("t-normal")),
+            "unflagged dispatch still seeds a sidecar (default unchanged): {pending2:?}"
         );
         std::fs::remove_dir_all(&home).ok();
     }

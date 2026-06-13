@@ -819,7 +819,7 @@ mod tests {
             ("send", "expect_reply_within_secs", "messaging.rs → dispatch_idle threshold watchdog"),
             ("send", "next_after_ci", "comms.rs → ci_watch poller fires [ci-ready-for-action]"),
             ("send", "terminal", "messaging.rs msg.terminal → auto_close_on_report"),
-            ("send", "no_report_expected", "comms.rs handle_delegate_task track step → DispatchEntry status=no_report_expected (skipped by sweep_stuck/sweep_orphans)"),
+            ("send", "no_report_expected", "comms.rs track step → DispatchEntry status=no_report_expected (skips sweep_stuck/sweep_orphans) + messaging.rs track_dispatch skips the dispatch_idle sidecar record"),
             // ── task (all fields consumed per action; #1933 audit) ──
             ("task", "action", "tasks/handler.rs action routing"),
             ("task", "title", "tasks/handler.rs handle_create"),

@@ -287,6 +287,10 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
                 "branch": args["branch"].as_str(), "expect_reply_within_secs": args["expect_reply_within_secs"].as_i64(),
                 "correlation_id": args["correlation_id"].as_str(), "reviewed_head": args["reviewed_head"].as_str(), "sequencing": args["sequencing"].as_str(), "eta_minutes": args["eta_minutes"].as_u64(), "reporting_cadence": args["reporting_cadence"].as_str(),
                 "worktree_binding_required": args["worktree_binding_required"].as_bool(), "terminal": args["terminal"].as_bool(), "thread_id": args["thread_id"].as_str(), "parent_id": args["parent_id"].as_str(),
+                // #2099: forward the fire-and-forget flag so the API-side
+                // dispatch_idle record path (the SECOND ~30min nag channel,
+                // besides the DispatchEntry sweep) can also skip it.
+                "no_report_expected": args["no_report_expected"].as_bool(),
             }
         }),
     ) {
