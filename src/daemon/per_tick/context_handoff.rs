@@ -225,16 +225,23 @@ impl PerTickHandler for ContextHandoffHandler {
         // Agents without a pattern reading (every non-claude backend today)
         // produce nothing here and are never injected.
         let mut snapshot: Vec<(String, f32, bool)> = Vec::new();
-        {
+        // #latch-prune (cleanup-on-delete, #1923 G5 class): capture ALL live
+        // agent names so the per-agent `states` episode-latch can drop deleted
+        // agents below — else a same-name redeploy inherits a stale episode
+        // (e.g. an Injected latch suppressing the new agent's first handoff).
+        let live: std::collections::HashSet<String> = {
             let reg = crate::agent::lock_registry(ctx.registry);
+            let mut live = std::collections::HashSet::new();
             for handle in reg.values() {
+                live.insert(handle.name.as_str().to_string());
                 let core = handle.core.lock();
                 if let Some((pct, _source)) = core.state.resolved_context() {
                     let is_idle = core.state.get_state() == crate::state::AgentState::Idle;
                     snapshot.push((handle.name.as_str().to_string(), pct, is_idle));
                 }
             }
-        }
+            live
+        };
 
         let handoff_pct = handoff_threshold();
         let escalate_pct = escalate_threshold();
@@ -320,6 +327,9 @@ impl PerTickHandler for ContextHandoffHandler {
                 None => {}
             }
         }
+        // #latch-prune: drop episode latches for agents gone from the registry
+        // (cleanup-on-delete) so a deleted agent leaves no stale episode state.
+        states.retain(|name, _| live.contains(name));
     }
 }
 
@@ -461,5 +471,78 @@ mod tests {
             "file older than the injection → false"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #latch-prune (cleanup-on-delete, #1923 G5 class): a per-agent episode
+    /// latch for an agent no longer in the registry is dropped on the next
+    /// `run` (real entry, empty registry = deleted) — so a same-name redeploy
+    /// can't inherit a stale Injected/IdleMarked episode that suppresses its
+    /// first handoff nudge.
+    #[test]
+    fn deleted_agent_episode_pruned_on_run() {
+        use parking_lot::Mutex as PLMutex;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        let home =
+            std::env::temp_dir().join(format!("agend-ctxhandoff-prune-{}", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        let registry: crate::agent::AgentRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let externals: crate::agent::ExternalRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let configs: Arc<PLMutex<HashMap<String, crate::daemon::AgentConfig>>> =
+            Arc::new(PLMutex::new(HashMap::new()));
+        let h = ContextHandoffHandler::new(1); // fire every tick (no boot-grace)
+        h.states
+            .lock()
+            .insert("ghost".to_string(), EpisodeState::default());
+        let ctx = TickContext {
+            home: &home,
+            registry: &registry,
+            externals: &externals,
+            configs: &configs,
+        };
+        h.run(&ctx);
+        assert!(
+            !h.states.lock().contains_key("ghost"),
+            "a deleted agent's episode latch must be pruned on run (cleanup-on-delete)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #latch-prune reverse-regression (reviewer-2 #2097): a LIVE agent without
+    /// a context reading this tick must KEEP its episode latch — `live.insert`
+    /// must be UNCONDITIONAL, not gated on `resolved_context()`. If it regressed
+    /// to the reading-subset, a working agent's in-progress episode would be
+    /// wrongly dropped (re-arming a duplicate handoff). Real `run()` entry.
+    #[test]
+    fn live_agent_without_context_reading_keeps_episode() {
+        use parking_lot::Mutex as PLMutex;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        let home =
+            std::env::temp_dir().join(format!("agend-ctxhandoff-keep-{}", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        let registry: crate::agent::AgentRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let (handle, _reader) = crate::daemon::per_tick::mock_live_agent_no_context("alive");
+        registry.lock().insert(handle.id, handle);
+        let externals: crate::agent::ExternalRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let configs: Arc<PLMutex<HashMap<String, crate::daemon::AgentConfig>>> =
+            Arc::new(PLMutex::new(HashMap::new()));
+        let h = ContextHandoffHandler::new(1);
+        h.states
+            .lock()
+            .insert("alive".to_string(), EpisodeState::default());
+        let ctx = TickContext {
+            home: &home,
+            registry: &registry,
+            externals: &externals,
+            configs: &configs,
+        };
+        h.run(&ctx);
+        assert!(
+            h.states.lock().contains_key("alive"),
+            "a LIVE agent with no context reading must KEEP its episode latch — `live.insert` \
+             must be UNCONDITIONAL, not gated on resolved_context()"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 }
