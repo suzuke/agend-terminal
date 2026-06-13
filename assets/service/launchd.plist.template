@@ -42,8 +42,19 @@ Placeholders (substituted at install time by service::install):
     </dict>
     <key>RunAtLoad</key>
     <true/>
+    <!-- #1814 Stage 2: restart on FAILURE only (matches the autostart plist's
+         long-standing form, src/tray/autostart/macos.rs). A bare KeepAlive=true
+         respawns on ANY exit, including the graceful exit(0) handoff a
+         self-respawning daemon does — launchd's relaunch would then race the
+         self-respawn successor for the singleton flock (brick class). With
+         SuccessfulExit=false: exit(42) legacy-restart → non-success → relaunch;
+         exit(0) handoff → success → NO relaunch (successor is the sole daemon);
+         crash (panic/signal) → non-success → relaunch (crash-recovery intact). -->
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
     <key>StandardOutPath</key>
     <string>/dev/null</string>
     <key>StandardErrorPath</key>

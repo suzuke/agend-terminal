@@ -21,6 +21,36 @@
 //! `{ok: false, error: "..."}` with an actionable hint and the daemon
 //! stays up.
 //!
+//! ## Exit-code × supervisor behavior (#1814 Stage 2)
+//!
+//! What happens after the daemon exits depends on BOTH the exit code and the
+//! supervisor's restart policy. The policies are aligned so a graceful
+//! `exit(0)` handoff (a self-respawned successor is already the live daemon) is
+//! NOT relaunched by the supervisor — otherwise the supervisor's relaunch races
+//! the successor for the singleton flock (the brick class #1814 closes):
+//!
+//! | exit | meaning              | launchd `KeepAlive{SuccessfulExit:false}` | systemd `Restart=on-failure` | Windows schtasks `RestartOnFailure` | none (bare shell) |
+//! |------|----------------------|-------------------------------------------|------------------------------|-------------------------------------|-------------------|
+//! | 0    | graceful handoff     | NOT relaunched (success)                  | NOT relaunched (success)     | NOT relaunched (success)            | process ends      |
+//! | 42   | legacy restart_daemon| relaunched (non-success)                  | relaunched (non-success)     | relaunched (non-zero result)        | brick (no respawn)|
+//! | ≠0 / signal | crash         | relaunched (non-success)                  | relaunched (non-success)     | relaunched (non-zero result)        | process ends      |
+//!
+//! All three real supervisors converge on "restart on FAILURE, not on a graceful
+//! `exit(0)`" — which is exactly what the `exit(0)` handoff needs (the
+//! self-respawned successor is already the sole daemon; a supervisor relaunch
+//! would race it for the singleton flock):
+//! - launchd: the `KeepAlive` `{SuccessfulExit:false}` dict (NOT a bare
+//!   `KeepAlive=true`, which respawns on ANY exit) — the #1814 Stage 2 fix here,
+//!   pinned in `service::tests::launchd_template_carries_keepalive_and_runatload`.
+//! - systemd: `Restart=on-failure` (already correct).
+//! - Windows Task Scheduler: `<RestartOnFailure>` (`scheduler.task.xml.template`)
+//!   restarts only when the action's last result is non-zero — so `exit(0)` is a
+//!   no-op, `exit(42)`/crash relaunch. (Task Scheduler is a logon-triggered
+//!   restart-on-failure supervisor, NOT an unconditional exit-respawn.)
+//!
+//! `none` (bare `agend-terminal start` from a shell) has no supervisor: `exit(42)`
+//! bricks unless the daemon's own self-respawn path runs.
+//!
 //! ## Detection signals
 //!
 //! Composite env-var check. A supervisor signal means SOME process in
