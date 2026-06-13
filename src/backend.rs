@@ -366,23 +366,41 @@ pub struct BackendPreset {
 
 impl Backend {
     pub fn preset(&self) -> BackendPreset {
+        // W2.5: shared defaults. Each arm below specifies ONLY the fields where
+        // it differs from these; struct-update (`..DEFAULTS`) fills the rest, so
+        // adding a new `BackendPreset` field with a common value means editing
+        // just this const (plus the arms that genuinely differ) instead of all 6
+        // arms. Byte-identical to the prior per-arm literals — every backend's
+        // effective field value is unchanged (the value a backend used to write
+        // explicitly is either still written here or equals the default below).
+        const DEFAULTS: BackendPreset = BackendPreset {
+            command: "",
+            args: &[],
+            ready_pattern: "",
+            submit_key: "\r",
+            inject_prefix: "",
+            typed_inject: false,
+            resume_mode: ResumeMode::NotSupported,
+            quit_command: "exit",
+            dismiss_patterns: &[],
+            instructions_path: "",
+            instructions_shared: false,
+            inject_instructions_on_ready: false,
+            ready_timeout_secs: 30,
+            fresh_args: None,
+            fleet_mcp_supported: true,
+            redraw_after_resize: false,
+        };
         match self {
             Backend::ClaudeCode => BackendPreset {
-                redraw_after_resize: false, // #7: repaints on SIGWINCH — no trigger needed.
                 command: "claude",
                 args: &["--dangerously-skip-permissions"],
                 ready_pattern: "bypass permissions|❯",
-                submit_key: "\r",
-                inject_prefix: "",
-                typed_inject: false,
                 resume_mode: ResumeMode::ContinueInCwd { flag: "--continue" },
                 quit_command: "/exit",
                 // Not under `.claude/rules/` to avoid double-loading: we pass this
                 // file explicitly via `--append-system-prompt-file` (see spawn_flags).
                 instructions_path: ".claude/agend.md",
-                instructions_shared: false,
-                inject_instructions_on_ready: false,
-                ready_timeout_secs: 30,
                 // Issue #468: regex anchored to line start + optional TUI prefix
                 // ([^A-Za-z\n]{0,8}) instead of bare substring, so user-typed
                 // text or scrollback containing the phrase mid-line cannot
@@ -419,8 +437,7 @@ impl Backend {
                         sequence: b"\x1b[A\x1b[A\r",
                     },
                 ],
-                fresh_args: None, // same as args (no resume in preset)
-                fleet_mcp_supported: true,
+                ..DEFAULTS
             },
             Backend::KiroCli => BackendPreset {
                 // #7: kiro-cli 2.1.x TUI v2 does not repaint on SIGWINCH, so a
@@ -431,17 +448,12 @@ impl Backend {
                 args: &["chat", "--trust-all-tools"],
                 ready_pattern:
                     "Trust All Tools active|ask a question or describe a task|/quit to exit",
-                submit_key: "\r",
-                inject_prefix: "",
-                typed_inject: false,
                 resume_mode: ResumeMode::ContinueInCwd { flag: "--resume" },
                 quit_command: "/quit",
                 instructions_path: ".kiro/steering/agend.md",
-                instructions_shared: false,
                 // Kiro CLI auto-loads .kiro/steering/*.md as context entries since
-                // its initial release (v1.20.0, 2025-11-17). No injection needed.
-                inject_instructions_on_ready: false,
-                ready_timeout_secs: 30,
+                // its initial release (v1.20.0, 2025-11-17), so no
+                // inject_instructions_on_ready (DEFAULTS = false) is needed.
                 dismiss_patterns: &[
                     // Trust-all-tools confirmation: cursor defaults to "No, exit"
                     // Down moves to "Yes, I accept", Enter confirms
@@ -468,11 +480,9 @@ impl Backend {
                         sequence: b"\x1b[B\r",
                     },
                 ],
-                fresh_args: None, // same as args
-                fleet_mcp_supported: true,
+                ..DEFAULTS
             },
             Backend::Codex => BackendPreset {
-                redraw_after_resize: false, // #7: repaints on SIGWINCH — no trigger needed.
                 command: "codex",
                 // #1626: `-c check_for_update_on_startup=false` disables codex's
                 // blocking startup update modal ("Update available!"). This is a
@@ -489,8 +499,6 @@ impl Backend {
                     "--dangerously-bypass-approvals-and-sandbox",
                 ],
                 ready_pattern: "OpenAI Codex|›",
-                submit_key: "\r",
-                inject_prefix: "",
                 // #1670: paced (typed) inject. codex's `›` input widget
                 // (ratatui-style, re-renders/debounces) does not reliably commit
                 // a BULK-written line before the trailing submit `\r` arrives — the
@@ -507,11 +515,8 @@ impl Backend {
                 // dogfood — next real ci-green→codex handoff after merge+restart —
                 // is the empirical test (can't validate on this PR).
                 typed_inject: true,
-                resume_mode: ResumeMode::NotSupported,
-                quit_command: "exit",
                 instructions_path: "AGENTS.md",
                 instructions_shared: true,
-                inject_instructions_on_ready: false,
                 ready_timeout_secs: 20,
                 dismiss_patterns: &[
                     // Trust directory prompt: "Yes, continue" is pre-selected → Enter.
@@ -550,21 +555,17 @@ impl Backend {
                     "check_for_update_on_startup=false",
                     "--dangerously-bypass-approvals-and-sandbox",
                 ]),
-                fleet_mcp_supported: true,
+                ..DEFAULTS
             },
             Backend::OpenCode => BackendPreset {
-                redraw_after_resize: false, // #7: repaints on SIGWINCH — no trigger needed.
                 command: "opencode",
-                args: &[],
                 ready_pattern: "Ask anything|tab agents",
-                submit_key: "\r",
                 inject_prefix: "\r",
                 typed_inject: true,
                 resume_mode: ResumeMode::ContinueInCwd { flag: "--continue" },
                 quit_command: "/exit",
                 instructions_path: "AGENTS.md",
                 instructions_shared: true,
-                inject_instructions_on_ready: false,
                 ready_timeout_secs: 45,
                 dismiss_patterns: &[
                     // Issue #468: anchored regex (see ClaudeCode comment above).
@@ -587,11 +588,9 @@ impl Backend {
                         sequence: b"\r",
                     },
                 ],
-                fresh_args: None, // same as args (resume is in resume_mode, not args)
-                fleet_mcp_supported: true,
+                ..DEFAULTS
             },
             Backend::Agy => BackendPreset {
-                redraw_after_resize: false, // #7: repaints on SIGWINCH — no trigger needed.
                 command: "agy",
                 args: &["--dangerously-skip-permissions"],
                 // #987: agy's interactive TUI renders an "Antigravity CLI <ver>"
@@ -600,7 +599,6 @@ impl Backend {
                 // covers post-banner "Idle" state matchable variants in case
                 // future TUI iterations rename the banner.
                 ready_pattern: "Antigravity CLI|Type your message",
-                submit_key: "\r",
                 inject_prefix: "\r",
                 typed_inject: true,
                 // agy --continue is the documented resume path (matches the
@@ -614,7 +612,6 @@ impl Backend {
                 // `.agents/` parent. Shared AGENTS.md format.
                 instructions_path: ".agents/AGENTS.md",
                 instructions_shared: true,
-                inject_instructions_on_ready: false,
                 ready_timeout_secs: 20,
                 // #995: --dangerously-skip-permissions auto-approves tool
                 // permission requests (per `agy --help`), but does NOT bypass
@@ -627,7 +624,6 @@ impl Backend {
                     label: r"(?m)^[^A-Za-z\n]{0,8}Yes, I trust",
                     sequence: b"\r",
                 }],
-                fresh_args: None,
                 // #1547: agy loads project-scoped MCP via the official
                 // Customization Roots dir `<workspace>/.agents/mcp_config.json`
                 // (operator-verified: plain + yolo both load
@@ -637,32 +633,20 @@ impl Backend {
                 // supersedes the dead `.antigravitycli/mcp_config.json` write
                 // (#995 Bug 3 — agy ignored that file's `mcpServers`).
                 fleet_mcp_supported: true,
+                ..DEFAULTS
             },
             // Shell and Raw have no preset behavior. `command` is `""` as a
             // sentinel — callers that need the actual spawn path should use
             // [`Backend::command_string`], which resolves Shell to `$SHELL`
             // and Raw to its stored path.
             Backend::Shell | Backend::Raw(_) => BackendPreset {
-                redraw_after_resize: false, // #7: plain shell / raw exec — no TUI redraw quirk.
-                command: "",
-                args: &[],
-                ready_pattern: "",
-                submit_key: "\r",
-                inject_prefix: "",
-                typed_inject: false,
-                resume_mode: ResumeMode::NotSupported,
-                quit_command: "exit",
-                instructions_path: "",
-                instructions_shared: false,
-                inject_instructions_on_ready: false,
                 ready_timeout_secs: 10,
-                dismiss_patterns: &[],
-                fresh_args: None,
                 // Shell / Raw: no MCP discovery; the bridge does not apply.
                 // `false` is the safe sentinel (no warning fires because
                 // these backends don't go through the dispatch warning path
                 // anyway — Backend::from_command returns None for raw paths).
                 fleet_mcp_supported: false,
+                ..DEFAULTS
             },
         }
     }
@@ -1425,6 +1409,72 @@ mod tests {
                 .preset()
                 .fleet_mcp_supported
         );
+    }
+
+    /// W2.5 byte-identity regression guard for the `DEFAULTS` merge. Pins every
+    /// field a backend now INHERITS from the shared `DEFAULTS` (or that the
+    /// default-merge could silently flip). The field-specific tests above cover
+    /// command/args/ready_pattern/dismiss/resume; this table covers the rest, so
+    /// a wrong `DEFAULTS` value (which would change a preset's effective output
+    /// without tripping those) is caught here. The expected column equals the
+    /// pre-refactor per-arm literal — reviewer can read it to verify all 6
+    /// presets stayed equivalent.
+    #[test]
+    fn preset_default_merged_fields_byte_identical_w2_5() {
+        // (backend, submit_key, inject_prefix, typed_inject, quit_command,
+        //  instructions_shared, inject_instructions_on_ready, ready_timeout_secs,
+        //  fresh_args.is_some(), fleet_mcp_supported, redraw_after_resize)
+        // Parallel arrays (aligned to `backends`) of the PRE-refactor per-arm
+        // literal for each default-merged field. A wrong `DEFAULTS` value would
+        // change a backend's effective output without tripping the
+        // field-specific tests above — caught here, reviewer-scannable.
+        let backends = [
+            Backend::ClaudeCode,
+            Backend::KiroCli,
+            Backend::Codex,
+            Backend::OpenCode,
+            Backend::Agy,
+            Backend::Shell,
+            Backend::Raw("/x".to_string()),
+        ];
+        let submit_key = ["\r"; 7];
+        let inject_prefix = ["", "", "", "\r", "\r", "", ""];
+        let typed_inject = [false, false, true, true, true, false, false];
+        let quit_command = ["/exit", "/quit", "exit", "/exit", "/exit", "exit", "exit"];
+        let instructions_shared = [false, false, true, true, true, false, false];
+        let inject_on_ready = [false; 7];
+        let ready_timeout = [30u64, 30, 20, 45, 20, 10, 10];
+        let fresh_some = [false, false, true, false, false, false, false];
+        let fleet_mcp = [true, true, true, true, true, false, false];
+        let redraw = [false, true, false, false, false, false, false];
+        for (i, b) in backends.iter().enumerate() {
+            let p = b.preset();
+            assert_eq!(p.submit_key, submit_key[i], "submit_key {b:?}");
+            assert_eq!(p.inject_prefix, inject_prefix[i], "inject_prefix {b:?}");
+            assert_eq!(p.typed_inject, typed_inject[i], "typed_inject {b:?}");
+            assert_eq!(p.quit_command, quit_command[i], "quit_command {b:?}");
+            assert_eq!(
+                p.instructions_shared, instructions_shared[i],
+                "instructions_shared {b:?}"
+            );
+            assert_eq!(
+                p.inject_instructions_on_ready, inject_on_ready[i],
+                "inject_on_ready {b:?}"
+            );
+            assert_eq!(
+                p.ready_timeout_secs, ready_timeout[i],
+                "ready_timeout_secs {b:?}"
+            );
+            assert_eq!(p.fresh_args.is_some(), fresh_some[i], "fresh_args {b:?}");
+            assert_eq!(
+                p.fleet_mcp_supported, fleet_mcp[i],
+                "fleet_mcp_supported {b:?}"
+            );
+            assert_eq!(
+                p.redraw_after_resize, redraw[i],
+                "redraw_after_resize {b:?}"
+            );
+        }
     }
 
     /// #996 Phase 1: ClaudeCode `Yes, I trust` dismiss must send a single
