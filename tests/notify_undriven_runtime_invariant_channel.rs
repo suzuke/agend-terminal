@@ -33,7 +33,6 @@
 use std::path::PathBuf;
 
 #[test]
-#[ignore = "channel-HIGH-1: red until fix; remove #[ignore] after fix to confirm"]
 fn notify_does_not_fire_and_forget_onto_undriven_runtime_channel() {
     let notify = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/channel/telegram/notify.rs");
     let content = std::fs::read_to_string(&notify)

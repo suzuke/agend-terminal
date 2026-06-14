@@ -15,15 +15,23 @@ pub fn notify_telegram_silent(home: &std::path::Path, instance_name: &str, text:
     let _ = notify_telegram_inner(home, instance_name, text, true);
 }
 
-/// Returns the spawned send's `JoinHandle` (or `None` when nothing was sent:
-/// no telegram channel / dedup-suppressed). The public wrappers discard it;
-/// tests drive it to deterministically observe the send outcome.
+/// Drives the Telegram send to completion synchronously, returning `Some(())`
+/// when a send was attempted or `None` when nothing was sent (no telegram
+/// channel / dedup-suppressed).
+///
+/// H8 (channel-HIGH-1): this MUST drive the send rather than schedule it with
+/// `telegram_runtime().spawn(...)` and drop the `JoinHandle`. `telegram_runtime()`
+/// is a `new_current_thread` runtime with no persistent driver thread, so a
+/// spawned task makes no progress unless some later sync-context `block_on`
+/// happens to cooperatively poll it — otherwise the notification is queued
+/// forever while the dedup claim suppresses a re-emit for the whole TTL. We use
+/// the Handle-guarded `block_on_value` (#1476), mirroring `reply.rs::send_reply`.
 fn notify_telegram_inner(
     home: &std::path::Path,
     instance_name: &str,
     text: &str,
     disable_notification: bool,
-) -> Option<tokio::task::JoinHandle<()>> {
+) -> Option<()> {
     let config = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok()?;
     let (token, group_id, topic_id) = match &config.channel {
         Some(crate::fleet::ChannelConfig::Telegram {
@@ -60,8 +68,11 @@ fn notify_telegram_inner(
     let text = text.to_string();
     let home_owned = home.to_path_buf();
     let instance_owned = instance_name.to_string();
-    // fire-and-forget: losing one notification on shutdown is acceptable.
-    Some(telegram_runtime().spawn(async move {
+    // H8: drive the send to completion on the Telegram runtime via the
+    // Handle-guarded `block_on_value` (#1476) — never fire-and-forget onto the
+    // undriven current_thread runtime (see fn doc). Blocks the caller for one
+    // send, exactly as `reply.rs::send_reply` does.
+    block_on_value(async move {
         use teloxide::payloads::SendMessageSetters;
         use teloxide::prelude::Requester;
         let bot = teloxide::Bot::new(&token);
@@ -139,7 +150,8 @@ fn notify_telegram_inner(
             crate::channel::dedup::global(&home_owned).evict(&dedup_key);
             tracing::warn!(error = %e, "telegram notify failed");
         }
-    }))
+    });
+    Some(())
 }
 
 #[cfg(test)]
@@ -203,11 +215,11 @@ mod tests {
         std::env::set_var("NOTIFY_MED1_TOKEN", "fake");
 
         // First notify: records the dedup claim, then the (forced-failing) send.
+        // H8: `notify_telegram_inner` now drives the send synchronously
+        // (block_on_value), so by the time it returns the failed send has already
+        // evicted the claim — no JoinHandle to drive.
         set_forced_send_error(anyhow::anyhow!("transient network error"));
-        let h1 = notify_telegram_inner(&home, "C", "hello operator", false).expect("send spawned");
-        // Drive the spawned send (+ evict) to completion via the Handle-guarded
-        // helper (#1476: never a raw `telegram_runtime().block_on`).
-        let _ = block_on_value(h1);
+        notify_telegram_inner(&home, "C", "hello operator", false).expect("send driven");
 
         // The failed send must have rolled back the claim: record_and_check is
         // fresh again (would be `false`/suppressed without the evict).
