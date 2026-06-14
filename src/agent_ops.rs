@@ -302,8 +302,18 @@ pub fn validate_branch(branch: &str) -> bool {
 /// extending the set here propagates to every E4.5 enforcement site
 /// (currently `worktree_pool::lease` for worktree leases and
 /// `mcp::handlers::ci::handle_watch_ci` for CI watch subscriptions).
+///
+/// CR-2026-06-14: matched **case-insensitively**. On a case-insensitive
+/// filesystem (darwin/APFS, Windows NTFS) `refs/heads/Main` and
+/// `refs/heads/main` collide — a `branch="Main"` lease passes a case-sensitive
+/// guard, then `git worktree add -b Main` fails ("already exists") and the
+/// fallback `git worktree add <path> Main` checks out the EXISTING `main`, so
+/// the agent commits land on `main` (empirically reproduced on darwin/APFS:
+/// committing on "Main" advanced `main`). `eq_ignore_ascii_case` is a full-
+/// string compare, so substrings like `mainline` / `maintenance` /
+/// `upstream-main` stay unprotected.
 pub fn is_protected_ref(branch: &str) -> bool {
-    matches!(branch, "main" | "master")
+    branch.eq_ignore_ascii_case("main") || branch.eq_ignore_ascii_case("master")
 }
 
 pub fn ensure_not_protected(branch: &str) -> Result<(), String> {
@@ -730,20 +740,30 @@ mod tests {
     }
 
     #[test]
-    fn is_protected_ref_case_sensitive_by_design() {
-        // Git refs ARE case-sensitive on case-sensitive filesystems;
-        // matching the literal lowercase "main"/"master" is intentional.
-        // Anything else (Main, MAIN, Master) is a different ref and not
-        // protected by this invariant.
-        assert!(!is_protected_ref("Main"));
-        assert!(!is_protected_ref("MAIN"));
-        assert!(!is_protected_ref("Master"));
+    fn is_protected_ref_case_insensitive_blocks_case_variants() {
+        // CR-2026-06-14: the prior "case-sensitive by design" stance was
+        // empirically falsified on darwin/APFS — a case-insensitive FS folds
+        // refs/heads/Main onto refs/heads/main, so `branch="Main"` lands the
+        // agent's worktree on `main` (committing on "Main" advanced `main`).
+        // Every case variant of main/master MUST be protected.
+        for v in ["Main", "MAIN", "mAiN", "Master", "MASTER", "mAsTeR"] {
+            assert!(
+                is_protected_ref(v),
+                "case variant {v:?} must be protected (E4.5 case-insensitive)"
+            );
+        }
     }
 
     #[test]
     fn is_protected_ref_rejects_empty_and_substrings() {
+        // eq_ignore_ascii_case is a full-string compare, so a branch that
+        // merely CONTAINS "main"/"master" (or differs by more than case) is
+        // not over-blocked.
         assert!(!is_protected_ref(""));
         assert!(!is_protected_ref("mainline"));
+        assert!(!is_protected_ref("maintenance"));
+        assert!(!is_protected_ref("main-feature"));
+        assert!(!is_protected_ref("Maintenance"));
         assert!(!is_protected_ref("upstream-main"));
         assert!(!is_protected_ref("master/dev"));
     }

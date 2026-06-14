@@ -289,8 +289,12 @@ enum Action {
 /// builds standalone without the full library surface. Sprint 57
 /// Wave 2 Track B introduced the lib-side helper; the literal here
 /// MUST stay in sync.
+///
+/// CR-2026-06-14: matched **case-insensitively** (mirrors the lib-side fix).
+/// A case-insensitive FS folds `Main`→`main`, so a case-sensitive guard would
+/// let `branch="Main"` slip past gh-push protection here.
 fn is_protected_ref(branch: &str) -> bool {
-    matches!(branch, "main" | "master")
+    branch.eq_ignore_ascii_case("main") || branch.eq_ignore_ascii_case("master")
 }
 
 /// #778 Option 3 (originally) + #852 residual PR-A: detect that cwd
@@ -1536,6 +1540,25 @@ fn format_conflict_guidance() -> &'static str {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    // ── CR-2026-06-14: shim is_protected_ref must mirror the lib-side
+    // case-insensitive E4.5 guard (kept in sync; see agent_ops.rs). ──
+    #[test]
+    fn shim_is_protected_ref_case_insensitive() {
+        for v in ["main", "master", "Main", "MAIN", "Master", "MASTER"] {
+            assert!(is_protected_ref(v), "{v:?} must be protected");
+        }
+        // Full-string compare: substrings / case-only-prefix are not over-blocked.
+        for v in [
+            "mainline",
+            "maintenance",
+            "main-feature",
+            "upstream-main",
+            "",
+        ] {
+            assert!(!is_protected_ref(v), "{v:?} must NOT be protected");
+        }
+    }
 
     // ── #1651: binding.json HMAC verify (push-authority integrity) ──
     fn home_1651(tag: &str) -> PathBuf {
