@@ -5,6 +5,7 @@ pub mod core_render;
 pub mod overlay;
 pub mod panels;
 pub mod panels_fleet;
+pub mod resize;
 pub mod scratch;
 
 pub use core_render::render;

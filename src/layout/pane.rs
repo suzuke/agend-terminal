@@ -164,6 +164,13 @@ impl Pane {
     }
 
     /// Resize this pane's underlying PTY / remote agent.
+    ///
+    /// W2.6 resize contract (see [`crate::render::resize`]): this is the shared
+    /// primitive both chokepoints drive. LAYOUT pre-computes `(cols, rows)` from
+    /// the split geometry and calls this before the first frame (an estimate);
+    /// RENDER then recomputes the actual content rect and calls this again as the
+    /// authoritative correction. `(cols, rows)` here is always a
+    /// [`crate::render::resize::PaneContentRect`] dimension.
     pub fn resize_pty(&self, registry: &AgentRegistry, cols: u16, rows: u16) {
         match &self.source {
             PaneSource::Local => {

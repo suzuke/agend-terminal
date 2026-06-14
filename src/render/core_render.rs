@@ -420,13 +420,11 @@ fn render_pane(
         crate::runtime_config::get().show_pane_state,
     );
 
-    let inner = Rect::new(
-        area.x + 1,
-        area.y + 1,
-        area.width.saturating_sub(2),
-        area.height.saturating_sub(2),
-    );
-    if inner.width == 0 || inner.height == 0 {
+    // W2.6: the pane content rect is the authority for the vterm/PTY size, and
+    // render is the authoritative chokepoint that corrects to it (layout
+    // pre-computes an estimate). See `crate::render::resize`.
+    let content = crate::render::resize::PaneContentRect::from_bordered_area(area);
+    if content.is_empty() {
         return PaneBorderInfo {
             area,
             border_style,
@@ -434,9 +432,12 @@ fn render_pane(
             priority,
         };
     }
-    if inner.width != pane.vterm.cols() || inner.height != pane.vterm.rows() {
-        pane.vterm.resize(inner.width, inner.height);
-        pane.resize_pty(registry, inner.width, inner.height);
+    let inner = content.rect();
+    if let Some(d) =
+        crate::render::resize::ResizeDecision::needed(inner, pane.vterm.cols(), pane.vterm.rows())
+    {
+        pane.vterm.resize(d.cols, d.rows);
+        pane.resize_pty(registry, d.cols, d.rows);
     }
     let render_offset = pane.scroll_offset;
     pane.vterm

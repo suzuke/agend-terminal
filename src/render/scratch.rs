@@ -45,9 +45,14 @@ pub fn render_scratch_shell(
 
     pane.drain_output();
 
-    if inner.width != pane.vterm.cols() || inner.height != pane.vterm.rows() {
-        pane.vterm.resize(inner.width, inner.height);
-        pane.resize_pty(registry, inner.width, inner.height);
+    // W2.6: the same render-authoritative resize as `core_render::render_pane`.
+    // `block.inner(oa)` here equals `PaneContentRect::from_bordered_area(oa)`
+    // (the block has `Borders::ALL`); see `crate::render::resize`.
+    if let Some(d) =
+        crate::render::resize::ResizeDecision::needed(inner, pane.vterm.cols(), pane.vterm.rows())
+    {
+        pane.vterm.resize(d.cols, d.rows);
+        pane.resize_pty(registry, d.cols, d.rows);
     }
 
     pane.vterm
