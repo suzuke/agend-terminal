@@ -57,7 +57,11 @@ discord = ["dep:twilight-gateway", "dep:twilight-http", "dep:twilight-model"]
 
 [profile.release]
 strip = true
-lto = true
+# #2090: thin LTO + multi codegen-units parallelizes the final optimization
+# across all cores. Fat `lto = true` ran single-threaded (~6% CPU on 16 cores,
+# ~40min builds); ThinLTO keeps near-identical runtime perf for a daemon.
+lto = "thin"
+codegen-units = 16
 
 [dependencies]
 # PTY
