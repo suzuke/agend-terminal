@@ -32,8 +32,13 @@ fn coremutex_is_sole_agentcore_mutex_wrapper_1535() {
     // `parking_lot::Mutex<T>`, so its own definition never matches these.
     let needles = [
         "Mutex<AgentCore>",
+        // `agent::AgentCore` short-path form — the most idiomatic spelling in
+        // this codebase, previously missed between the bare and fully-qualified
+        // forms.
+        "Mutex<agent::AgentCore>",
         "Mutex<crate::agent::AgentCore>",
         "Mutex::new(AgentCore",
+        "Mutex::new(agent::AgentCore",
         "Mutex::new(crate::agent::AgentCore",
     ];
 
