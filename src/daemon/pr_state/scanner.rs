@@ -764,3 +764,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod review_repro_daemon_ci_pr;

@@ -1015,3 +1015,7 @@ pub(super) fn msg_already_drained_in_jsonl(home: &Path, agent_name: &str, msg_id
         msg.id.as_deref() == Some(msg_id) && msg.read_at.is_some()
     })
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod review_repro_inbox_notify;

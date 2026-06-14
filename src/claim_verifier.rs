@@ -1560,3 +1560,8 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 }
+
+#[cfg(test)]
+mod review_repro_panic_io_extra;
+#[cfg(test)]
+mod review_repro_verify_claim_cost;

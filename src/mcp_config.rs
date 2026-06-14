@@ -1438,3 +1438,6 @@ mod hook_state_poc_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
+#[cfg(test)]
+mod review_repro_bootstrap_config_cli;

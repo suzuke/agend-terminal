@@ -745,3 +745,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "agend-mcp-bridge/review_repro_bootstrap_config_cli.rs"]
+mod review_repro_bootstrap_config_cli;

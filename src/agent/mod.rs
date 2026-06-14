@@ -2366,3 +2366,6 @@ pub fn subscribe_with_dump(agent: &AgentHandle) -> (crossbeam_channel::Receiver<
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod review_repro_agent_binding;

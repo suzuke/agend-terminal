@@ -795,7 +795,7 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
 ///
 /// Pure function — no IO, no global state. Same input shape used by
 /// the `ci status` aggregator below so the two surfaces never disagree.
-fn compute_next_poll_eta(watch: &Value) -> Option<i64> {
+pub(crate) fn compute_next_poll_eta(watch: &Value) -> Option<i64> {
     let last_polled_at = watch["last_polled_at"].as_i64()?;
     let interval_secs = watch["effective_interval_secs"]
         .as_u64()
