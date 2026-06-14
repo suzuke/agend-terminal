@@ -99,6 +99,28 @@ pub(super) fn resolve_current_project(home: &Path, caller: &str) -> String {
         .unwrap_or_else(|| DEFAULT_PROJECT.to_string())
 }
 
+/// #2117 P3a (reviewer-4 #2133 finding): the fail-closed counterpart of
+/// [`resolve_current_project`] for the per-board ACL. `resolve_current_project`
+/// collapses a HARD fleet.yaml read/parse failure into [`DEFAULT_PROJECT`] — right
+/// for `create`/`list` board routing (a missing/unreadable fleet just means
+/// single-project → the `home` board), but WRONG for authorization: an ACL that
+/// reads DEFAULT on a fleet read error would fail-OPEN to the default board.
+///
+/// This distinguishes the two cases the plain resolver conflates, mirroring the
+/// #1744-M7 three-state [`crate::teams::try_load_fleet`] (missing file =
+/// `Ok(default)`, file present but unreadable/corrupt = `Err`):
+/// - hard read/parse failure → `Err` → the ACL denies (fail-closed);
+/// - a *legitimate* no-team / no-`source_repo` caller → `Ok(DEFAULT_PROJECT)` →
+///   the ACL still allows on the default board, so single-project stays
+///   byte-identical (no new denial).
+pub(super) fn resolve_current_project_checked(home: &Path, caller: &str) -> anyhow::Result<String> {
+    let fleet = crate::teams::try_load_fleet(home)?;
+    Ok(crate::teams::find_team_for_in(&fleet, caller)
+        .and_then(|t| t.source_repo)
+        .map(|repo| project_id_from_source_repo(&repo))
+        .unwrap_or_else(|| DEFAULT_PROJECT.to_string()))
+}
+
 /// The project a dispatch **target** acts in — identical
 /// agent→team→`source_repo`→project resolution as [`resolve_current_project`],
 /// but keyed on the dispatch target rather than the caller. The comms

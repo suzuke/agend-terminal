@@ -301,6 +301,30 @@ fn handle_list(home: &Path, caller: &str, args: &Value) -> Value {
     })
 }
 
+/// #2117 P3a (FM5 / board isolation): per-board mutation authority. A task
+/// mutation resolves its board from the task_id, so a caller can name a task that
+/// lives on ANOTHER project's board. Deny unless the caller acts in that board's
+/// project — `super::acl::can_mutate_on_board` (system identities bypass; a hard
+/// fleet read failure fail-closes). `force` — the audited operator override, the
+/// SAME axis as the owner-ACL `can_mutate_record` — bypasses it on the paths that
+/// carry it. Single-project → caller project == task board project (both DEFAULT)
+/// → allow → byte-identical (no new denial). Returns `Some(error)` when denied.
+fn cross_board_denied(home: &Path, caller: &str, id: &str, force: bool) -> Option<Value> {
+    if force {
+        return None;
+    }
+    let board_project = super::board_router::resolve_task_project(home, id);
+    if super::acl::can_mutate_on_board(home, caller, &board_project) {
+        return None;
+    }
+    Some(serde_json::json!({
+        "error": format!(
+            "cross-board mutation denied: task '{id}' lives on the '{board_project}' project \
+             board but caller '{caller}' acts in a different project (board isolation, #2117 P3a)"
+        )
+    }))
+}
+
 fn handle_claim(
     home: &Path,
     instance_name: &str,
@@ -314,6 +338,12 @@ fn handle_claim(
     let iname = instance_name.to_string();
     if !instance_exists(home, &iname) {
         return serde_json::json!({"error": format!("instance '{iname}' not found in fleet.yaml")});
+    }
+    // #2117 P3a: board-isolation gate — a caller may only claim tasks on its own
+    // project's board (claim has no `force`/owner-ACL — an open task is claimable
+    // by anyone, but only within the board). Single-project → allow.
+    if let Some(deny) = cross_board_denied(home, &iname, &id, false) {
+        return deny;
     }
     // #t-21: validate + append in ONE critical section to close the
     // claim race. Pre-fix, the claimable check ran here (against a
@@ -405,6 +435,10 @@ fn handle_done(
         return serde_json::json!({
             "error": "force=true requires a non-empty 'force_reason'"
         });
+    }
+    // #2117 P3a: board-isolation gate (outer boundary, before the owner-ACL).
+    if let Some(deny) = cross_board_denied(home, &caller, &id, force) {
+        return deny;
     }
     if !force && !can_mutate_record(home, &caller, &record) {
         return serde_json::json!({
@@ -591,6 +625,10 @@ fn handle_update(
         return serde_json::json!({
             "error": "force=true requires a non-empty 'force_reason'"
         });
+    }
+    // #2117 P3a: board-isolation gate (outer boundary, before the owner-ACL).
+    if let Some(deny) = cross_board_denied(home, &caller, &id, force) {
+        return deny;
     }
     if !force && !can_mutate_record(home, &caller, &record) {
         return serde_json::json!({
@@ -1017,6 +1055,11 @@ fn handle_metadata_set(
         Some(r) => r,
         None => return serde_json::json!({"error": format!("task not found: {id}")}),
     };
+    // #2117 P3a: board-isolation gate (no force on metadata_set — mirror its
+    // unconditional owner-ACL below).
+    if let Some(deny) = cross_board_denied(home, instance_name, id, false) {
+        return deny;
+    }
     if !can_mutate_record(home, instance_name, &record) {
         return serde_json::json!({"error": "permission denied: caller is not owner/creator"});
     }

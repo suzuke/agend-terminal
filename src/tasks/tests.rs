@@ -1438,6 +1438,137 @@ fn cross_project_parent_id_rejected_at_create_2117_p3a() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #2117 P3a (FM5 / board isolation): a task mutation resolves its board from the
+/// task_id, so the per-board ACL must deny a caller acting in a DIFFERENT project
+/// than the task's board. devA (teamA→projA) cannot `done`/`claim` a task on
+/// teamB's (projB) board; devB (teamB, same board) can. Single-project never
+/// triggers (caller and task both DEFAULT) — see the unchanged existing
+/// done/claim/update tests.
+#[test]
+fn cross_board_mutation_denied_same_board_allowed_2117_p3a() {
+    let home = tmp_home("p3a-board-acl");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        r#"
+instances:
+  devA:
+    backend: claude
+  devB:
+    backend: claude
+teams:
+  teamA:
+    members:
+      - devA
+    source_repo: /repos/orgA/projA
+  teamB:
+    members:
+      - devB
+    source_repo: /repos/orgB/projB
+"#,
+    )
+    .unwrap();
+
+    // A task on teamB's board, created+owned by devB. No explicit `project` — it
+    // resolves from devB's team `source_repo` (/repos/orgB/projB → slug
+    // `orgB_projB`), so the recorded board id is exactly what
+    // `resolve_current_project(devB)` yields (the production-consistent path; an
+    // explicit raw `project: "orgB/projB"` would NOT match the slugged caller id).
+    let tb = handle(
+        &home,
+        "devB",
+        &serde_json::json!({"action": "create", "title": "B", "assignee": "devB"}),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // (a) devA (projA) mutating teamB's (projB) task → cross-board deny, on every
+    // mutation path.
+    for action in ["done", "claim", "update"] {
+        let denied = handle(
+            &home,
+            "devA",
+            &serde_json::json!({"action": action, "id": tb, "status": "blocked"}),
+        );
+        assert!(
+            denied["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("cross-board mutation denied"),
+            "devA must be denied cross-board on {action}: {denied}"
+        );
+    }
+    // Nothing mutated — task still Open on board B (slug `orgB_projB`).
+    let tb_status = super::list_all_at(&crate::task_events::board_root(&home, "orgB_projB"))
+        .into_iter()
+        .find(|t| t.id == tb)
+        .unwrap()
+        .status;
+    assert_eq!(
+        tb_status,
+        crate::task_events::TaskStatus::Open,
+        "a denied cross-board mutation must not change the task"
+    );
+
+    // (b) devB (projB, same board) → allowed (board gate passes; claim succeeds on
+    // the Open task).
+    let ok = handle(
+        &home,
+        "devB",
+        &serde_json::json!({"action": "claim", "id": tb}),
+    );
+    assert_eq!(
+        ok["event"], "claimed",
+        "devB same-board mutation must succeed: {ok}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2117 P3a (reviewer-4 #2133): a HARD fleet.yaml read/parse failure must
+/// fail-CLOSED — the per-board ACL can't determine the caller's project, so it
+/// DENIES rather than fall through to the default board (fail-open). Distinct from
+/// a legitimate no-team caller (missing fleet.yaml = single-project → allow).
+#[test]
+fn fleet_read_failure_denies_mutation_fail_closed_2117_p3a() {
+    let home = tmp_home("p3a-fleet-fail-closed");
+    // Create the task with a VALID single-project fleet (lands on the default board).
+    write_fleet_yaml(&home, &["dev"]);
+    let t = handle(
+        &home,
+        "dev",
+        &serde_json::json!({"action": "create", "title": "t", "assignee": "dev"}),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Now CORRUPT fleet.yaml (file PRESENT but unparseable → try_load_fleet = Err,
+    // NOT the missing-file Ok(default) path).
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "{{{ not: : valid yaml ][",
+    )
+    .unwrap();
+
+    // A non-system caller's mutation fail-closes (without the #2133 hardening the
+    // unchecked resolver would return DEFAULT and ALLOW — fail-open).
+    let denied = handle(
+        &home,
+        "dev",
+        &serde_json::json!({"action": "done", "id": t}),
+    );
+    assert!(
+        denied["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("cross-board mutation denied"),
+        "a fleet.yaml hard read failure must fail-closed deny: {denied}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
 #[test]
 fn test_claim_unknown_instance_rejected() {
     let home = tmp_home("claim-unknown");

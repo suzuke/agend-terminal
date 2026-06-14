@@ -142,7 +142,16 @@ pub(crate) fn can_mutate_on_board(home: &Path, caller: &str, board_project: &str
     if is_system_identity(caller) {
         return true;
     }
-    super::board_router::resolve_current_project(home, caller) == board_project
+    // #2117 P3a (reviewer-4 #2133): use the FAIL-CLOSED resolver. The plain
+    // `resolve_current_project` returns DEFAULT_PROJECT on a hard fleet.yaml read
+    // failure, conflating it with a legitimate no-team caller — an ACL on that
+    // would fail-OPEN to the default board. `_checked` returns `Err` on a hard
+    // read failure (→ deny) while still returning `Ok(DEFAULT)` for a legitimate
+    // no-team caller (→ single-project byte-identical).
+    match super::board_router::resolve_current_project_checked(home, caller) {
+        Ok(project) => project == board_project,
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]
