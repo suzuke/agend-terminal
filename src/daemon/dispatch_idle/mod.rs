@@ -2806,19 +2806,37 @@ mod tests {
         )
         .unwrap();
         let task_id = "t-live-99";
-        let tasks_dir = home.join("tasks");
-        std::fs::create_dir_all(&tasks_dir).unwrap();
-        std::fs::write(
-            tasks_dir.join(format!("{task_id}.json")),
-            serde_json::to_string_pretty(&serde_json::json!({
-                "id": task_id,
-                "status": "in_progress",
-                "title": "live work",
-                "assignee": "fixup-dev-2"
-            }))
-            .unwrap(),
-        )
-        .unwrap();
+        // #1608b: seed a REAL LIVE task on the event-sourced board (the path
+        // `task_still_live` reads via load_by_id → replay), NOT a
+        // `tasks/{id}.json` file — that file is never written, so the old write
+        // was ignored and the test only passed via the missing-task fail-open,
+        // not because the task was recognized as live. A freshly-Created task is
+        // `open`, which is in LIVE_TASK_STATUSES, so `task_still_live` returns
+        // Some(true) and the overdue dispatch must still fire.
+        {
+            use crate::task_events::{append, InstanceName, TaskEvent, TaskId};
+            let emitter = InstanceName::from("test:operator");
+            append(
+                &home,
+                &emitter,
+                TaskEvent::Created {
+                    task_id: TaskId(task_id.into()),
+                    title: "live work".into(),
+                    description: String::new(),
+                    priority: "normal".into(),
+                    owner: Some(InstanceName::from("fixup-dev-2")),
+                    due_at: None,
+                    depends_on: Vec::new(),
+                    routed_to: None,
+                    branch: None,
+                    bind: None,
+                    eta_secs: None,
+                    tags: vec![],
+                    parent_id: None,
+                },
+            )
+            .unwrap();
+        }
         let issued = chrono::Utc::now() - chrono::Duration::seconds(700);
         write_pending_at(
             &home,

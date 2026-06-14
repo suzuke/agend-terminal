@@ -84,17 +84,30 @@ fn script_defines_all_three_ci_matrix_platforms() {
 
 #[test]
 fn script_uses_strict_clippy_invocation() {
-    // Pin: the script must invoke clippy with `-D warnings` to match
-    // CI's strictness. Anything weaker would let warnings through
-    // locally that CI then catches — defeating the gate's purpose.
+    // Pin: the script must invoke clippy with `-D warnings` + `--features tray`
+    // to match CI's strictness. Check the ACTUAL invocation — the
+    // `DEFAULT_CLIPPY_ARGS` array passed to `cargo clippy` — not a whole-file
+    // grep: the script's header comment
+    // (`#  cargo clippy --all-targets --features tray -- -D warnings`) already
+    // contains every substring, so the old whole-file check would stay green
+    // even if the real command were weakened.
     let content = std::fs::read_to_string(script_path()).expect("read");
+    let args_block = content
+        .split_once("DEFAULT_CLIPPY_ARGS=(")
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .map(|(block, _)| block)
+        .expect("script must define a DEFAULT_CLIPPY_ARGS=( ... ) array");
     assert!(
-        content.contains("-D") && content.contains("warnings"),
-        "script must run clippy with -D warnings (matches CI strictness)"
+        args_block.contains("-D") && args_block.contains("warnings"),
+        "DEFAULT_CLIPPY_ARGS must run clippy with -D warnings (matches CI strictness): {args_block}"
     );
     assert!(
-        content.contains("--features") && content.contains("tray"),
-        "script must include the `tray` feature (matches CI matrix coverage)"
+        args_block.contains("--features") && args_block.contains("tray"),
+        "DEFAULT_CLIPPY_ARGS must include the `tray` feature: {args_block}"
+    );
+    assert!(
+        content.contains("cargo clippy") && content.contains("${DEFAULT_CLIPPY_ARGS[@]}"),
+        "the script must actually pass DEFAULT_CLIPPY_ARGS to `cargo clippy`"
     );
 }
 
