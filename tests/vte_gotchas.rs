@@ -1,7 +1,15 @@
 //! Sprint 42 Phase 3 — 7 vte gotchas tests on TuiClient vterm.
 //!
-//! Exercises alacritty_terminal::Term edge cases via the Phase 2
-//! TuiClient harness to verify zero parser divergence with production.
+//! Exercises `alacritty_terminal::Term` parser edge cases (CRLF, SGR, cursor
+//! save/restore, wide chars, resize) via the Phase 2 `TuiClient` harness. NOTE:
+//! these run against the harness's in-process `TestVTerm`, which uses the SAME
+//! `alacritty_terminal` library as production `src/vterm.rs` — so the
+//! parser-level behavior is genuinely exercised — but its screen-EXTRACTION
+//! layer (`tail_lines`, scrollback) is a hand-copy that diverges from
+//! production's (`tail_lines_impl` de-wraps soft-wrap, etc.). So this file does
+//! NOT prove "zero divergence with production"; production VTerm extraction is
+//! covered by the `src/vterm.rs` unit tests. Treat these as parser-edge-case +
+//! harness tests, not production-extraction tests.
 
 mod common;
 
