@@ -293,8 +293,22 @@ pub(crate) fn scan_and_emit(home: &Path) {
                 continue;
             }
             current.status = "timeout".to_string();
-            let _ = write_decision(home, &current);
-            Some(current)
+            // H3: gate the emit on a SUCCESSFUL persist. If the status flip can't
+            // be written (e.g. disk full / read-only dir), the on-disk status
+            // stays "pending", so the next scan re-times-out and re-emits — an
+            // unbounded duplicate notification every tick while disk + memory
+            // never agree. Only emit once the "timeout" status is durably
+            // recorded. The sibling `mark_resolved_for_sender` already gates this
+            // way.
+            if write_decision(home, &current) {
+                Some(current)
+            } else {
+                tracing::warn!(
+                    decision_id = %current.decision_id,
+                    "decision_timeout: persist of 'timeout' status failed; not emitting (retries next scan)"
+                );
+                None
+            }
         };
         if let Some(current) = to_emit {
             emit_timeout_event(home, &current, elapsed_secs);

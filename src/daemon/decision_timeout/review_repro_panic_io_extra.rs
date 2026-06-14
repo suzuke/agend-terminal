@@ -51,7 +51,6 @@ fn set_dir_perms(dir: &Path, mode: u32) {
 /// failed persist emits nothing -> zero events.
 #[test]
 #[serial]
-#[ignore = "decision_timeout-persist-swallowed: red until fix; remove #[ignore] after fix to confirm"]
 fn timeout_emit_gated_on_successful_persist_panic_io_extra() {
     // Default recipient resolution -> "general" when neither fleet config nor the
     // env override is set. Clear the env override for determinism.
