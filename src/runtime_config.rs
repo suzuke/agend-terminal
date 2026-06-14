@@ -236,6 +236,19 @@ pub fn set(home: &Path, key: &str, value: &str) -> Result<String, String> {
                 _ => return Err(format!("invalid boolean: {value} (use true/false)")),
             };
         }
+        "progress_mode" => {
+            // #2090: accept the numeric value or a friendly name.
+            config.progress_mode = match value {
+                "0" | "off" => 0,
+                "1" | "mirror" => 1,
+                "2" | "report" => 2,
+                _ => {
+                    return Err(format!(
+                        "invalid progress_mode: {value} (use 0/off, 1/mirror, 2/report)"
+                    ))
+                }
+            };
+        }
         _ => return Err(format!("unknown config key: {key}")),
     }
     let path = home.join("runtime-config.json");
@@ -275,6 +288,7 @@ pub fn get_key(key: &str) -> Result<String, String> {
         "usage_limit_propagation_enabled" => Ok(config.usage_limit_propagation_enabled.to_string()),
         "idle_watchdog_enabled" => Ok(config.idle_watchdog_enabled.to_string()),
         "show_pane_state" => Ok(config.show_pane_state.to_string()),
+        "progress_mode" => Ok(config.progress_mode.to_string()),
         _ => Err(format!("unknown config key: {key}")),
     }
 }

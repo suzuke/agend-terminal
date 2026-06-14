@@ -148,7 +148,19 @@ fn run_loop(home: PathBuf, reg_rx: crossbeam_channel::Receiver<AgentSubscription
                 && !buf.buffer.is_empty()
                 && buf.last_output_at.elapsed() > SILENCE_TIMEOUT
             {
-                try_dispatch_mirror(&home, name, buf);
+                // #2090: the progress_mode system (0/1/2) supersedes this legacy
+                // PTY-buffer mirror. In mirror mode the clean transcript mirror
+                // (ProgressMirrorHandler) relays structured assistant text;
+                // off/report modes want no PTY mirror. Drain the buffer without
+                // dispatching so it can't grow unbounded. The >2 sentinel keeps the
+                // legacy path callable from its unit tests (which invoke
+                // try_dispatch_mirror directly, bypassing this gate).
+                if crate::runtime_config::get().progress_mode <= 2 {
+                    buf.buffer.clear();
+                    buf.active = false;
+                } else {
+                    try_dispatch_mirror(&home, name, buf);
+                }
             }
         }
 
@@ -170,6 +182,11 @@ fn run_loop(home: PathBuf, reg_rx: crossbeam_channel::Receiver<AgentSubscription
 }
 
 /// Attempt to dispatch accumulated mirror text to the originating channel.
+///
+/// #2090: the call site in the router loop gates this behind `progress_mode`
+/// (the legacy PTY mirror is retired for the supported modes 0/1/2). This
+/// function is still invoked directly by its unit tests to cover the
+/// channel-routing prefer-chain.
 fn try_dispatch_mirror(home: &std::path::Path, name: &str, buf: &mut AgentBuffer) {
     let pair = crate::daemon::heartbeat_pair::snapshot_for(name);
 

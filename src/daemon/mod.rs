@@ -38,6 +38,7 @@ pub(crate) mod supervisor;
 pub(crate) mod task_progress;
 pub(crate) mod task_sweep;
 pub(crate) mod ticker;
+pub(crate) mod transcript_tail;
 mod tui_bridge;
 pub(crate) mod usage_limit;
 pub(crate) mod utils;
@@ -685,6 +686,12 @@ pub(crate) fn build_default_handlers(
         // cost per instance: one read_dir of notification-queue/ plus a line
         // count of any existing queue files — trivial at fleet sizes.
         Box::new(per_tick::NotificationFlushHandler::new(1)),
+        // #2090 M2: smart progress mirror. When progress_mode == 1 (default),
+        // tails each agent's Claude transcript every tick and relays NEW
+        // assistant text blocks to the origin channel (CLI-parity visibility
+        // without PTY/ANSI/tool noise). Self-gates on progress_mode + active
+        // reply_to_channel; cheap (reads only newly-appended transcript bytes).
+        Box::new(per_tick::ProgressMirrorHandler::new()),
         Box::new(per_tick::LogRotationHandler::new(360)),
         Box::new(per_tick::ThreadDumpHandler::new()),
         Box::new(per_tick::GcTickHandler::new(360)),

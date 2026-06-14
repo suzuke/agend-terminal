@@ -874,7 +874,7 @@ impl Backend {
 /// `~/.claude/projects/<encoded-cwd>/<session-uuid>.jsonl`. The encoding is
 /// undocumented but stable in practice: every char that isn't `[A-Za-z0-9-]`
 /// is replaced with `-` (so `/Users/x/.foo/bar` → `-Users-x--foo-bar`).
-mod claude_session {
+pub(crate) mod claude_session {
     use std::io::{BufRead, BufReader};
     use std::path::{Path, PathBuf};
 
@@ -882,7 +882,7 @@ mod claude_session {
     /// `$HOME` is unresolvable — that path almost certainly won't exist and
     /// `has_resumable` will return false, which is the correct conservative
     /// answer.
-    pub fn default_projects_root() -> PathBuf {
+    pub(crate) fn default_projects_root() -> PathBuf {
         dirs::home_dir()
             .unwrap_or_else(std::env::temp_dir)
             .join(".claude")
@@ -908,6 +908,30 @@ mod claude_session {
             .any(|e| jsonl_has_user_entry(&e.path()))
     }
 
+    /// Resolve the project dir for `working_dir` (same canonicalize + encode
+    /// path as [`has_resumable`]) and return the `.jsonl` with the newest
+    /// mtime, or `None` if the dir is missing / has no `.jsonl`. Used by the
+    /// M2 progress-mirror tail (#2090) to locate the agent's live transcript.
+    /// Fail-open: any read/metadata error yields `None`.
+    pub(crate) fn newest_session_jsonl(
+        working_dir: &Path,
+        projects_root: &Path,
+    ) -> Option<PathBuf> {
+        let canonical = canonicalize_for_encode(working_dir);
+        let project_dir = projects_root.join(encode_project_dir(&canonical));
+        let entries = std::fs::read_dir(&project_dir).ok()?;
+        entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
+            .filter_map(|p| {
+                let mtime = std::fs::metadata(&p).and_then(|m| m.modified()).ok()?;
+                Some((p, mtime))
+            })
+            .max_by_key(|(_, mtime)| *mtime)
+            .map(|(p, _)| p)
+    }
+
     /// Canonicalize `working_dir` so the encoded project-dir name matches what
     /// claude CLI's Node `fs.realpathSync.native` produces before writing the
     /// session jsonl. Falls back to the raw input on canonicalize Err so cold
@@ -917,7 +941,7 @@ mod claude_session {
     /// Uses `dunce::canonicalize` rather than `std::fs::canonicalize`: on
     /// Windows the former strips `\\?\` UNC verbatim prefixes when safe,
     /// matching node's behavior; on Unix the two are identical.
-    fn canonicalize_for_encode(working_dir: &Path) -> PathBuf {
+    pub(crate) fn canonicalize_for_encode(working_dir: &Path) -> PathBuf {
         dunce::canonicalize(working_dir).unwrap_or_else(|_| working_dir.to_path_buf())
     }
 
@@ -927,7 +951,7 @@ mod claude_session {
     // storage design (fixup-dev-2's metadata/<agent>.json proposal). Trigger:
     // if a new encode-mismatch class appears that `--continue` newest-wins
     // doesn't cover.
-    fn encode_project_dir(path: &Path) -> String {
+    pub(crate) fn encode_project_dir(path: &Path) -> String {
         path.to_string_lossy()
             .chars()
             .map(|c| {
