@@ -26,7 +26,6 @@
 //! start-time vs the `.daemon` identity) before signalling.
 
 #[test]
-#[ignore = "zombie-kill-toctou: red until fix; remove #[ignore] after fix to confirm"]
 fn cleanup_zombie_daemon_must_recheck_identity_before_signal_bootstrap_config_cli() {
     let path =
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/admin/cleanup_zombies.rs");

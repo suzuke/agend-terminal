@@ -334,9 +334,32 @@ pub fn find_active_run_dir(home: &Path) -> Option<PathBuf> {
             // Verify identity: read .daemon file with start timestamp
             let daemon_file = entry.path().join(".daemon");
             if let Ok(content) = std::fs::read_to_string(&daemon_file) {
-                // Format: "pid:start_time"
-                if let Some((file_pid, _start_time)) = content.trim().split_once(':') {
+                // Format: "pid:boot_unix:start_token" (third field appended
+                // CR-2026-06-14; legacy files have only "pid:boot_unix").
+                let mut fields = content.trim().split(':');
+                if let Some(file_pid) = fields.next() {
                     if file_pid == pid_str {
+                        // DP5: PID matches, but a recycled PID can land on the
+                        // SAME number. If the `.daemon` recorded a start-token
+                        // AND the live process's token can be read, a mismatch
+                        // means this is a different process wearing the old PID
+                        // → PID reused. (Legacy no-token or unreadable token →
+                        // fall back to PID-only accept for back-compat.)
+                        let recorded_token = fields.nth(1).and_then(|t| t.parse::<u64>().ok());
+                        if let (Some(rec), Some(cur)) =
+                            (recorded_token, crate::process::process_start_token(pid))
+                        {
+                            if rec != cur {
+                                tracing::info!(
+                                    pid,
+                                    recorded_token = rec,
+                                    current_token = cur,
+                                    "PID reused (start-token mismatch), cleaning"
+                                );
+                                let _ = std::fs::remove_dir_all(entry.path());
+                                continue;
+                            }
+                        }
                         return Some(entry.path());
                     }
                     // PID alive but .daemon file has different PID → PID was reused
@@ -400,13 +423,24 @@ pub fn sweep_stale_run_dirs(home: &Path) {
 }
 
 /// Write daemon identity file for PID reuse detection.
+///
+/// Format: `{pid}:{boot_unix}:{start_token}`. The third field
+/// (CR-2026-06-14 zombie-kill identity-compare) is the OS process start-time
+/// token (see [`crate::process::process_start_token`]) so a stale `.daemon`
+/// whose PID got recycled onto an unrelated process is detectable: the
+/// recorded token won't match the live process's. Appended (not inserted) so
+/// the existing first/second-field readers keep working. `0` when the
+/// self-token can't be resolved — a recorded `0` will never match a real
+/// live token, so the conservative outcome is fail-closed (never signal),
+/// which is the safe direction.
 pub(crate) fn write_daemon_id(run_dir: &Path) {
     let pid = std::process::id();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let _ = std::fs::write(run_dir.join(".daemon"), format!("{pid}:{now}"));
+    let token = crate::process::process_start_token(pid).unwrap_or(0);
+    let _ = std::fs::write(run_dir.join(".daemon"), format!("{pid}:{now}:{token}"));
 }
 
 /// Read the PID recorded in `{run_dir}/.daemon`. Returns `None` if the file is
@@ -420,14 +454,33 @@ pub(crate) fn read_daemon_pid(run_dir: &Path) -> Option<u32> {
 }
 
 /// Read the boot epoch (unix seconds) recorded in `{run_dir}/.daemon`
-/// (`{pid}:{boot_unix}`). Used by the worktree force-reclaim boot-grace
-/// (reviewer-2 #5). `None` if the file is missing or malformed.
+/// (`{pid}:{boot_unix}:{start_token}`). Used by the worktree force-reclaim
+/// boot-grace (reviewer-2 #5). `None` if the file is missing or malformed.
+///
+/// CR-2026-06-14: splits on `:` and takes field index 1 rather than
+/// `split_once(':').1` — the latter would capture `"{boot_unix}:{start_token}"`
+/// once the third field was appended and fail to parse as a u64.
 pub(crate) fn read_daemon_boot_unix(run_dir: &Path) -> Option<u64> {
     std::fs::read_to_string(run_dir.join(".daemon"))
         .ok()?
         .trim()
-        .split_once(':')
-        .and_then(|(_, ts)| ts.parse().ok())
+        .split(':')
+        .nth(1)
+        .and_then(|ts| ts.parse().ok())
+}
+
+/// Read the OS process start-time token recorded in `{run_dir}/.daemon`
+/// (`{pid}:{boot_unix}:{start_token}`, field index 2). `None` if the file is
+/// missing, malformed, or written by a pre-CR-2026-06-14 daemon (no third
+/// field) — callers MUST treat `None` as "identity unverifiable → fail
+/// closed" per the zombie-kill identity-compare design.
+pub(crate) fn read_daemon_start_token(run_dir: &Path) -> Option<u64> {
+    std::fs::read_to_string(run_dir.join(".daemon"))
+        .ok()?
+        .trim()
+        .split(':')
+        .nth(2)
+        .and_then(|t| t.parse().ok())
 }
 
 /// Agent definition tuple for daemon startup.
@@ -2190,11 +2243,23 @@ mod tests {
         write_daemon_id(&run);
         let content = std::fs::read_to_string(run.join(".daemon")).expect("read .daemon");
         let parts: Vec<&str> = content.split(':').collect();
-        assert_eq!(parts.len(), 2);
+        // CR-2026-06-14: format is now `{pid}:{boot_unix}:{start_token}`.
+        assert_eq!(parts.len(), 3);
         assert_eq!(parts[0], std::process::id().to_string());
         // Timestamp should be a positive number
         let ts: u64 = parts[1].parse().expect("parse timestamp");
         assert!(ts > 0);
+        // Start-token parses; for our own (alive) PID it resolves non-zero.
+        let token: u64 = parts[2].parse().expect("parse start_token");
+        assert_eq!(
+            token,
+            crate::process::process_start_token(std::process::id()).unwrap_or(0),
+            "recorded token must equal the live self start-token"
+        );
+        // The middle-field reader must still parse boot_unix (not "ts:token").
+        assert_eq!(read_daemon_boot_unix(&run), Some(ts));
+        // The new third-field reader returns the recorded token.
+        assert_eq!(read_daemon_start_token(&run), Some(token));
         std::fs::remove_dir_all(&home).ok();
     }
 
