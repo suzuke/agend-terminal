@@ -607,12 +607,9 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
     }
 
     let ci_dir = crate::daemon::ci_watch::ci_watches_dir(home);
-    // #779 P2 Piece 3 site A: pre-#779-P2 swallowed dir-create errors
-    // silently and continued, returning happy-path Value even when the
-    // subsequent atomic_write was destined to fail. Now surface as
-    // structured error matching the existing `{error, code}` shape so
-    // handle_checkout_repo (and direct callers of `ci action=watch`)
-    // observe the partial-failure class.
+    // #779 P2 Piece 3 site A: surface a dir-create failure as a structured
+    // `{error, code}` (pre-#779-P2 swallowed it and returned happy-path even when
+    // the subsequent atomic_write was doomed).
     if let Err(e) = std::fs::create_dir_all(&ci_dir) {
         return json!({
             "error": format!("ci-watches dir create failed: {e}"),
@@ -622,12 +619,14 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
     let filename = crate::daemon::ci_watch::watch_filename(repo, branch);
     let watch_path = ci_dir.join(&filename);
 
+    // H5 (CR-2026-06-14): flock the read→mutate→atomic_write window (mirrors
+    // registry.rs / the poll loop). atomic_write makes each write atomic but not
+    // the read→write gap, so an unlocked MCP RMW loses poll-state/subscriber
+    // updates racing a concurrent poll/unwatch.
+    let _watch_lock = crate::store::acquire_file_lock(&watch_path.with_extension("lock"));
+
     let now_rfc3339 = chrono::Utc::now().to_rfc3339();
 
-    // Read existing watch (if any) to preserve poll state and existing
-    // subscribers. A fresh write would clobber `last_run_id` /
-    // `last_polled_at` / `last_notified_head_sha` and trigger duplicate
-    // notifications on the next poll.
     let mut watch = std::fs::read_to_string(&watch_path)
         .ok()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
@@ -831,6 +830,8 @@ pub(crate) fn handle_unwatch_ci(home: &Path, args: &Value, instance_name: &str) 
         .unwrap_or_else(|| instance_name.to_string());
     let filename = crate::daemon::ci_watch::watch_filename(repo, branch);
     let path = crate::daemon::ci_watch::ci_watches_dir(home).join(&filename);
+    // H5: flock the per-watch read→atomic_write RMW (see handle_watch_ci).
+    let _watch_lock = crate::store::acquire_file_lock(&path.with_extension("lock"));
 
     let mut watch = match std::fs::read_to_string(&path)
         .ok()
@@ -847,8 +848,7 @@ pub(crate) fn handle_unwatch_ci(home: &Path, args: &Value, instance_name: &str) 
     if !caller.is_empty() {
         subscribers.retain(|s| s != &caller);
     } else {
-        // No caller identity supplied — clear ALL subscribers (legacy
-        // behavior). Operator-driven cleanup, e.g. via daemon CLI.
+        // No caller identity (unauthenticated/operator call) — clear ALL.
         subscribers.clear();
     }
 

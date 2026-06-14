@@ -75,7 +75,6 @@ fn fn_body_after(text: &str, signature_needle: &str) -> String {
 }
 
 #[test]
-#[ignore = "mcp-ci-worktree-2: mcp-watch-rmw-missing-flock; red until fix; remove #[ignore] after fix to confirm"]
 fn mcp_ci_watch_handlers_hold_per_watch_flock_mcp_ci_worktree() {
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();
