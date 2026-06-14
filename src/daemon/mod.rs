@@ -692,6 +692,14 @@ pub(crate) fn build_default_handlers(
         // without PTY/ANSI/tool noise). Self-gates on progress_mode + active
         // reply_to_channel; cheap (reads only newly-appended transcript bytes).
         Box::new(per_tick::ProgressMirrorHandler::new()),
+        // #2090 M3: progress backstop watchdog. When progress_mode == 2
+        // (report), the AGENT owns its progress updates; this handler nudges an
+        // agent whose active external-channel turn has run a while with no
+        // user-facing reply yet to self-report (inject
+        // [AGEND-AUTO kind=progress-backstop]). Never sends to the channel
+        // directly. Self-gates on progress_mode + active pending turn; ~30s
+        // cadence + boot-grace + per-agent debounce.
+        Box::new(per_tick::ProgressBackstopHandler::new()),
         Box::new(per_tick::LogRotationHandler::new(360)),
         Box::new(per_tick::ThreadDumpHandler::new()),
         Box::new(per_tick::GcTickHandler::new(360)),
