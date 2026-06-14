@@ -1576,7 +1576,10 @@ fn sweep_child_tree(id: &crate::types::InstanceId, registry: &AgentRegistry) {
 
 /// Handle PTY close: determine if crash, graceful exit, or daemon shutdown.
 /// Exit classification for handle_pty_close dispatch.
-enum ExitKind {
+// pub(crate) + derives so the daemon respawn tests can assert on the real
+// `classify_exit` output instead of re-implementing the match inline.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ExitKind {
     UserExit,
     SignalKill,
     Crash,
@@ -1592,7 +1595,7 @@ fn signal_kill_self_orch_should_escalate(home: &Option<std::path::PathBuf>, name
         .unwrap_or(false)
 }
 
-fn classify_exit(exit_code: Option<i32>) -> ExitKind {
+pub(crate) fn classify_exit(exit_code: Option<i32>) -> ExitKind {
     match exit_code {
         Some(0) | Some(130) => ExitKind::UserExit,
         Some(137) | Some(143) => {
