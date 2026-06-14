@@ -61,13 +61,9 @@ pub fn source_repo_of(working_dir: &Path) -> Option<PathBuf> {
 
 /// Check if a git repo has at least one commit (valid HEAD).
 fn has_commits(repo_dir: &Path) -> bool {
-    std::process::Command::new("git")
-        .env("AGEND_GIT_BYPASS", "1")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(repo_dir)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    // W1.2: LOCAL bool check via git_ok (was bypass+`.map(success).unwrap_or(false)`
+    // — exactly what git_ok absorbs, plus the LOCAL_GIT_TIMEOUT bound).
+    crate::git_helpers::git_ok(repo_dir, &["rev-parse", "HEAD"])
 }
 
 /// Create a worktree for an instance. Returns WorktreeInfo if created,
@@ -96,9 +92,10 @@ pub fn create(
     // Worktree creation requires at least one commit.
     if !has_commits(repo_dir) {
         tracing::info!(repo = %repo_dir.display(), "empty repo, creating initial commit for worktree support");
-        let ok = std::process::Command::new("git")
-            .env("AGEND_GIT_BYPASS", "1")
-            .args([
+        // W1.2: LOCAL bool result via git_ok (was bypass+`.map(success).unwrap_or(false)`).
+        let ok = crate::git_helpers::git_ok(
+            repo_dir,
+            &[
                 "-c",
                 "user.name=agend-terminal",
                 "-c",
@@ -107,11 +104,8 @@ pub fn create(
                 "--allow-empty",
                 "-m",
                 "init (agend-terminal)",
-            ])
-            .current_dir(repo_dir)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+            ],
+        );
         if !ok {
             tracing::warn!(repo = %repo_dir.display(), "failed to create initial commit in empty repo");
             return None;
@@ -138,19 +132,11 @@ pub fn create(
     // branch" (lease conflict). Smoke test 2 caught it: a second dispatch with
     // a different branch silently passed and the message was delivered.
     if wt_dir.exists() {
-        let actual = std::process::Command::new("git")
-            .env("AGEND_GIT_BYPASS", "1")
-            .args(["branch", "--show-current"])
-            .current_dir(&wt_dir)
-            .output()
-            .ok()
-            .and_then(|o| {
-                if o.status.success() {
-                    Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
-                } else {
-                    None
-                }
-            });
+        // W1.2: LOCAL value via git_cmd. git_cmd returns trimmed stdout on success
+        // (matching the prior `.trim().to_string()`) and Err on spawn/non-zero
+        // (matching both prior None branches). Detached HEAD → exit 0 + empty
+        // stdout → Ok("") → Some("") (byte-identical to the prior Some("")).
+        let actual = crate::git_helpers::git_cmd(&wt_dir, &["branch", "--show-current"]).ok();
         if actual.as_deref() != Some(branch.as_str()) {
             // #2010 2b: the worktree exists at this branch-keyed path but its HEAD
             // drifted off the requested branch — most commonly a DETACHED HEAD,
@@ -222,6 +208,11 @@ pub fn create(
     }
 
     // Try creating worktree: first with -b (new branch), fallback without -b (existing branch)
+    // git-raw-allowed: the Ok(non-zero) arm dispatches on raw stderr substrings
+    // ("already exists" / "is already checked out") to choose the fallback path —
+    // load-bearing worktree-creation semantics (see the long comment below). This
+    // needs the raw stderr in control flow, so git_cmd/git_ok do not fit. Kept raw
+    // with the explicit bypass env; this is the byte-identical-critical add path.
     let output = std::process::Command::new("git")
         .env("AGEND_GIT_BYPASS", "1")
         .args([
@@ -278,6 +269,8 @@ pub fn create(
             // would just chase the next git release — the substring
             // check is what we actually want.
             if stderr.contains("already exists") || stderr.contains("is already checked out") {
+                // git-raw-allowed: existing-branch fallback in the same stderr-dispatched
+                // worktree-add chain as the primary add above; kept raw for the same reason.
                 let output2 = std::process::Command::new("git")
                     .env("AGEND_GIT_BYPASS", "1")
                     .args(["worktree", "add", &wt_dir.display().to_string(), &branch])
@@ -398,6 +391,9 @@ pub fn prune(repo_dir: &Path) {
     if !is_git_repo(repo_dir) {
         return;
     }
+    // git-raw-allowed: worktree-lifecycle prune whose 3-way result drives distinct
+    // diagnostics — the Ok(non-zero) arm only warns when the raw stderr is
+    // non-empty. Kept raw (with bypass env) to preserve the exact prune semantics.
     let output = std::process::Command::new("git")
         .env("AGEND_GIT_BYPASS", "1")
         .args(["worktree", "prune"])
@@ -422,6 +418,10 @@ pub fn prune(repo_dir: &Path) {
 /// Check if a worktree directory has uncommitted changes.
 /// Returns true if `git status --porcelain` produces non-empty output.
 pub fn has_uncommitted_changes(worktree_dir: &Path) -> bool {
+    // git-raw-allowed: porcelain `status` whose emptiness gates safety-critical WIP
+    // protection (lease-conflict reattach). The check is on raw `o.stdout` bytes and
+    // is fail-closed (`Err => true`); git_cmd would trim and restructure errors, so
+    // it stays raw to keep the worktree-lifecycle guard byte-identical.
     let output = std::process::Command::new("git")
         .env("AGEND_GIT_BYPASS", "1")
         .args(["status", "--porcelain"])
@@ -453,6 +453,11 @@ pub fn remove_worktree(
         return Ok(()); // already gone
     }
     // git worktree remove --force <path>
+    // git-raw-allowed: worktree-lifecycle remove whose non-zero stderr is returned
+    // structurally in the Err string (like ci/mod's remove). git_cmd's NonZero
+    // stderr is trimmed but the spawn-vs-nonzero error wording here is contracted
+    // ("git worktree remove failed: ..." vs "git worktree remove: ..."); kept raw
+    // to hold those messages + the byte-identical remove path exactly.
     let output = std::process::Command::new("git")
         .env("AGEND_GIT_BYPASS", "1")
         .args(["worktree", "remove", "--force"])
@@ -467,11 +472,9 @@ pub fn remove_worktree(
     // Delete tracking branch agend/<agent> (legacy default-branch shape).
     // Custom branches are not auto-deleted — operator workflow.
     let default_branch = format!("agend/{agent}");
-    let _ = std::process::Command::new("git")
-        .env("AGEND_GIT_BYPASS", "1")
-        .args(["branch", "-D", &default_branch])
-        .current_dir(repo_dir)
-        .output();
+    // W1.2: LOCAL best-effort branch delete via git_ok (result was already
+    // discarded; git_ok keeps that and adds the LOCAL_GIT_TIMEOUT bound).
+    let _ = crate::git_helpers::git_ok(repo_dir, &["branch", "-D", &default_branch]);
     tracing::info!(agent, branch, "auto-pruned worktree + branch");
     Ok(())
 }
@@ -480,30 +483,30 @@ pub fn remove_worktree(
 /// current HEAD if it doesn't exist. Best-effort: returns Ok on success,
 /// Err with message on failure.
 pub fn checkout_branch(worktree_dir: &Path, branch: &str) -> Result<(), String> {
+    use crate::git_helpers::{git_cmd, GitError};
+    // W1.2: both switch attempts via git_cmd. A SPAWN failure propagates as Err
+    // (matching the prior `.map_err(...)?`); a NON-ZERO exit on the first switch
+    // means "branch absent" → fall through to create (matching the prior
+    // `if success { Ok } else { fall through }`). git_cmd's NonZero stderr is
+    // already trimmed, so the final Err string is byte-identical.
     // Try switching to existing branch first
-    let switch = std::process::Command::new("git")
-        .env("AGEND_GIT_BYPASS", "1")
-        .args(["switch", branch])
-        .current_dir(worktree_dir)
-        .output()
-        .map_err(|e| format!("git switch: {e}"))?;
-    if switch.status.success() {
-        tracing::info!(branch, dir = %worktree_dir.display(), "checked out branch");
-        return Ok(());
+    match git_cmd(worktree_dir, &["switch", branch]) {
+        Ok(_) => {
+            tracing::info!(branch, dir = %worktree_dir.display(), "checked out branch");
+            return Ok(());
+        }
+        Err(GitError::Spawn(e)) => return Err(format!("git switch: {e}")),
+        Err(GitError::NonZero { .. }) => {} // branch absent — create below
     }
     // Branch doesn't exist — create from current HEAD
-    let create = std::process::Command::new("git")
-        .env("AGEND_GIT_BYPASS", "1")
-        .args(["switch", "-c", branch])
-        .current_dir(worktree_dir)
-        .output()
-        .map_err(|e| format!("git switch -c: {e}"))?;
-    if create.status.success() {
-        tracing::info!(branch, dir = %worktree_dir.display(), "created and checked out branch");
-        return Ok(());
+    match git_cmd(worktree_dir, &["switch", "-c", branch]) {
+        Ok(_) => {
+            tracing::info!(branch, dir = %worktree_dir.display(), "created and checked out branch");
+            Ok(())
+        }
+        Err(GitError::Spawn(e)) => Err(format!("git switch -c: {e}")),
+        Err(GitError::NonZero { stderr, .. }) => Err(format!("git switch -c {branch}: {stderr}")),
     }
-    let stderr = String::from_utf8_lossy(&create.stderr);
-    Err(format!("git switch -c {branch}: {}", stderr.trim()))
 }
 
 /// Sprint 57 Wave 4 (#546 Item 4): list agent names present under
