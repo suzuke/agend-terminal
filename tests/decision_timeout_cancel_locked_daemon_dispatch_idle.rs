@@ -55,7 +55,6 @@ fn fn_body<'a>(src: &'a str, fn_anchor: &str) -> &'a str {
 }
 
 #[test]
-#[ignore = "daemon-dispatch-idle #1092-cancel-unlocked: red until fix; remove #[ignore] after fix to confirm"]
 fn record_pending_decision_cancel_is_flocked_daemon_dispatch_idle() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("src")
