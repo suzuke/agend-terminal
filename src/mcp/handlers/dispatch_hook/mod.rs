@@ -797,6 +797,56 @@ pub(crate) fn ensure_branch_exists(
                 source,
                 &["update-ref", &branch_ref, &remote_branch_ref],
             );
+        } else {
+            // #2107 (cheerc production repro): origin/<branch> is absent, so the
+            // #869 fast-forward above can't apply and `from_ref` was previously
+            // DEAD CODE on the branch-exists path — an existing branch stayed on
+            // its stale creation base even when the caller asked for a different
+            // `from_ref` (`repo checkout from_ref=origin/dev` landed on
+            // origin/main). Re-align the local ref to `from_ref`.
+            //
+            // FAST-FORWARD-ONLY (the load-bearing safety decision): re-align only
+            // when the current branch tip is an ANCESTOR of from_ref, so a
+            // divergent branch with unpushed work — e.g. an in-flight dispatch
+            // branch combined with the default `from_ref=origin/main` — is left
+            // untouched and never clobbered. A hard rebase of a divergent branch
+            // would need explicit force semantics and is deliberately out of
+            // scope. This also keeps every existing caller byte-identical: they
+            // pass `from_ref=origin/main` for a branch already at origin/main, so
+            // the ff is a no-op (the pre-#2107 "leave local untouched" contract).
+            //
+            // Refresh from_ref's remote ref first (mirrors the #1755 pre-create
+            // fetch) so the re-align lands on the current base, not a stale local
+            // copy. All steps best-effort; the returned `fetched_ok` stays the
+            // #869 working-branch fetch result (this from_ref fetch is internal).
+            if let Some(rb) = from_ref_branch.as_deref() {
+                let _ = crate::git_helpers::git_bypass_timeout(
+                    source,
+                    &["fetch", &remote, rb, "--quiet"],
+                    crate::git_helpers::NETWORK_GIT_TIMEOUT,
+                );
+            }
+            let ff_safe = crate::git_helpers::git_bypass(
+                source,
+                &["merge-base", "--is-ancestor", &branch_ref, from_ref],
+            )
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+            if ff_safe {
+                if let Ok(o) =
+                    crate::git_helpers::git_bypass(source, &["rev-parse", "--verify", from_ref])
+                {
+                    if o.status.success() {
+                        let from_sha = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                        if !from_sha.is_empty() {
+                            let _ = crate::git_helpers::git_bypass(
+                                source,
+                                &["update-ref", &branch_ref, &from_sha],
+                            );
+                        }
+                    }
+                }
+            }
         }
         return Ok((false, fetched_ok));
     }

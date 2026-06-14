@@ -2525,6 +2525,213 @@ fn ensure_branch_exists_leaves_local_untouched_when_no_remote_ref() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #2107 (cheerc production repro): `repo checkout from_ref=origin/dev` when the
+/// branch ALREADY exists must re-align the local ref to from_ref, not leave it on
+/// the branch's stale creation base. RED before the fix (foo stays on
+/// origin/main). The re-align is FAST-FORWARD-ONLY — foo@main is an ancestor of
+/// origin/dev — so it never loses commits (see the divergent-clobber guard
+/// below). origin/<branch> is deliberately ABSENT so the #869 ff path can't
+/// apply and the from_ref re-align is the only thing that can move the ref.
+#[test]
+fn ensure_branch_exists_realigns_existing_branch_to_from_ref_2107() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-2107-realign-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&home).ok();
+    let repo = setup_test_repo(&home, "dev-2107");
+    let bypass = |args: &[&str]| -> std::process::Output {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git spawn")
+    };
+    // origin/main is at A (the initial commit). Build origin/dev one commit AHEAD
+    // at B (A is an ancestor of B), then put HEAD + the new branch back at A.
+    let sha_a = String::from_utf8(bypass(&["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    std::fs::write(repo.join("dev.txt"), "dev-ahead").ok();
+    assert!(bypass(&["add", "dev.txt"]).status.success());
+    assert!(bypass(&[
+        "-c",
+        "user.name=test",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "dev ahead"
+    ])
+    .status
+    .success());
+    let sha_b = String::from_utf8(bypass(&["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_ne!(sha_a, sha_b);
+    assert!(bypass(&["update-ref", "refs/remotes/origin/dev", &sha_b])
+        .status
+        .success());
+    assert!(bypass(&["reset", "--hard", &sha_a]).status.success());
+    let branch = "feat/2107-foo";
+    // foo created at A (== origin/main); origin/<branch> deliberately NOT populated.
+    assert!(bypass(&["branch", branch]).status.success());
+    assert_eq!(
+        String::from_utf8(bypass(&["rev-parse", &format!("refs/heads/{branch}")]).stdout)
+            .unwrap()
+            .trim(),
+        sha_a,
+        "precondition: branch starts on origin/main (A)"
+    );
+
+    let result = super::ensure_branch_exists(&home, &repo, branch, "origin/dev", "dev-2107");
+    assert!(result.is_ok(), "must succeed: {result:?}");
+
+    let post = String::from_utf8(bypass(&["rev-parse", &format!("refs/heads/{branch}")]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(
+        post, sha_b,
+        "#2107: existing branch must re-align to from_ref (origin/dev @ B), not stay on its creation base (origin/main @ A)"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2107 clobber guard: the from_ref re-align is FAST-FORWARD-ONLY. A divergent
+/// existing branch (commits NOT in from_ref — e.g. an in-flight dev branch with
+/// unpushed work + the default `from_ref=origin/main`) must be left UNTOUCHED, so
+/// the fix can never destroy work. Here feat/x is one commit AHEAD of origin/main
+/// (not an ancestor), so the re-align must skip.
+#[test]
+fn ensure_branch_exists_does_not_clobber_divergent_branch_2107() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-2107-noclobber-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&home).ok();
+    let repo = setup_test_repo(&home, "dev-2107-nc");
+    let bypass = |args: &[&str]| -> std::process::Output {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git spawn")
+    };
+    let branch = "feat/2107-work";
+    // feat/x with a unique commit AHEAD of origin/main; origin/<branch> absent.
+    assert!(bypass(&["checkout", "-b", branch]).status.success());
+    std::fs::write(repo.join("work.txt"), "unpushed work").ok();
+    assert!(bypass(&["add", "work.txt"]).status.success());
+    assert!(bypass(&[
+        "-c",
+        "user.name=test",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "unpushed work"
+    ])
+    .status
+    .success());
+    let work_sha =
+        String::from_utf8(bypass(&["rev-parse", &format!("refs/heads/{branch}")]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+    // Default from_ref=origin/main (A). feat/x (work_sha) is NOT an ancestor of A.
+    let result = super::ensure_branch_exists(&home, &repo, branch, "origin/main", "dev-2107-nc");
+    assert!(result.is_ok(), "must succeed: {result:?}");
+
+    let post = String::from_utf8(bypass(&["rev-parse", &format!("refs/heads/{branch}")]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(
+        post, work_sha,
+        "#2107: ff-only re-align must NOT clobber a divergent branch's unpushed work"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2107 companion: the branch-CREATE path already honors from_ref — pin it
+/// alongside the exists-path fix so BOTH paths assert HEAD == from_ref's SHA.
+#[test]
+fn ensure_branch_exists_create_path_uses_from_ref_2107() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-2107-create-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&home).ok();
+    let repo = setup_test_repo(&home, "dev-2107-cr");
+    let bypass = |args: &[&str]| -> std::process::Output {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git spawn")
+    };
+    // Build origin/dev ahead at B, then put HEAD back at A.
+    let sha_a = String::from_utf8(bypass(&["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    std::fs::write(repo.join("dev.txt"), "dev-ahead").ok();
+    assert!(bypass(&["add", "dev.txt"]).status.success());
+    assert!(bypass(&[
+        "-c",
+        "user.name=test",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "dev ahead"
+    ])
+    .status
+    .success());
+    let sha_b = String::from_utf8(bypass(&["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    assert!(bypass(&["update-ref", "refs/remotes/origin/dev", &sha_b])
+        .status
+        .success());
+    assert!(bypass(&["reset", "--hard", &sha_a]).status.success());
+
+    let branch = "feat/2107-fresh"; // does NOT exist → create path
+    let result = super::ensure_branch_exists(&home, &repo, branch, "origin/dev", "dev-2107-cr");
+    assert!(result.is_ok(), "must succeed: {result:?}");
+    let (auto_created, _) = result.unwrap();
+    assert!(auto_created, "fresh branch must be auto-created");
+    let post = String::from_utf8(bypass(&["rev-parse", &format!("refs/heads/{branch}")]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(
+        post, sha_b,
+        "#2107: create path must base the new branch on from_ref (origin/dev @ B)"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// #869 protection: the new sync path must not interfere with the
 /// existing "branch doesn't exist locally → create from origin/main"
 /// flow. After the fix, dispatching a brand-new branch must still
