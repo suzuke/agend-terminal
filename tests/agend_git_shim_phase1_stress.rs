@@ -3,8 +3,6 @@
 //! Gated via `#[ignore]` for fast CI. Run manually before merge:
 //! `cargo test --test agend_git_shim_phase1_stress -- --ignored`
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Concurrent binding writes: 5 threads each bind for unique agents.
@@ -70,64 +68,39 @@ fn stress_hook_trailer_soak() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(60);
+    // Throughput / stability soak of the trailer-injection decision logic.
+    // (Removed the vacuous drift counter: `let should_inject = EXPR;
+    // let would_inject = EXPR;` compared an expression to an identical copy of
+    // itself, so `violations` could never increment and `assert!(drift <
+    // 0.001)` was a tautology. The decision is now black-boxed so the compiler
+    // keeps the work, and only the failable throughput assertion remains.)
     let duration = Duration::from_secs(duration_secs);
     let start = Instant::now();
-
-    let violations = Arc::new(AtomicU64::new(0));
-    let total = Arc::new(AtomicU64::new(0));
+    let mut total: u64 = 0;
     let mut rng_state: u64 = 42;
 
     while start.elapsed() < duration {
         rng_state ^= rng_state << 13;
         rng_state ^= rng_state >> 7;
         rng_state ^= rng_state << 17;
+        total += 1;
 
-        total.fetch_add(1, Ordering::Relaxed);
-
-        // Simulate trailer injection decision logic:
-        // - has binding (task_id set) → inject trailer
-        // - no binding → skip
-        // - merge commit → skip
-        // - existing trailer → skip (idempotent)
+        // Trailer injection decision: inject iff bound (task_id set), not a
+        // merge commit, and no existing trailer (idempotent).
         #[allow(clippy::manual_is_multiple_of)]
         let has_binding = rng_state % 3 != 0; // 66% have binding
         #[allow(clippy::manual_is_multiple_of)]
         let is_merge = rng_state % 10 == 0; // 10% are merges
         #[allow(clippy::manual_is_multiple_of)]
         let has_existing = rng_state % 20 == 0; // 5% already have trailer
-
         let should_inject = has_binding && !is_merge && !has_existing;
-        let would_inject = has_binding && !is_merge && !has_existing;
-
-        // Invariant: decision must be consistent.
-        if should_inject != would_inject {
-            violations.fetch_add(1, Ordering::Relaxed);
-        }
+        std::hint::black_box(should_inject);
     }
 
-    let total_val = total.load(Ordering::Relaxed);
-    let violations_val = violations.load(Ordering::Relaxed);
-    let drift = if total_val > 0 {
-        violations_val as f64 / total_val as f64
-    } else {
-        0.0
-    };
-
-    eprintln!(
-        "hook trailer soak: {} events, {} violations, drift={:.6}% (threshold <0.1%)",
-        total_val,
-        violations_val,
-        drift * 100.0
-    );
-
+    eprintln!("hook trailer soak: {total} iterations in {duration_secs}s budget");
     assert!(
-        drift < 0.001,
-        "trailer drift {:.4}% exceeds 0.1% threshold",
-        drift * 100.0
-    );
-    assert!(
-        total_val > 1_000_000,
-        "must process >1M events (got {total_val})"
+        total > 1_000_000,
+        "must sustain >1M iterations within the {duration_secs}s budget (got {total})"
     );
 }
 

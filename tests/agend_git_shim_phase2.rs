@@ -1,7 +1,5 @@
 //! agend-git-shim Phase 2 invariant + stress tests.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 // ── Invariant tests ─────────────────────────────────────────────────────
@@ -213,42 +211,39 @@ fn stress_phase2_1h_soak() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(60);
+    // Throughput / stability soak of the shim deny decision. (Removed the
+    // vacuous drift counter: `let should_deny = EXPR; let would_deny = EXPR;`
+    // compared an expression to an identical copy of itself, so `violations`
+    // could never increment and `assert!(drift < 0.001)` was a tautology. The
+    // decision is now black-boxed; only the failable throughput assert remains.)
     let duration = Duration::from_secs(duration_secs);
     let start = Instant::now();
-    let violations = Arc::new(AtomicU64::new(0));
-    let total = Arc::new(AtomicU64::new(0));
+    let mut total: u64 = 0;
     let mut rng: u64 = 42;
 
     while start.elapsed() < duration {
         rng ^= rng << 13;
         rng ^= rng >> 7;
         rng ^= rng << 17;
-        total.fetch_add(1, Ordering::Relaxed);
+        total += 1;
 
-        // Simulate shim decision: bound/unbound × read/mutate × bypass.
+        // Shim deny decision: deny iff a mutating op on an unbound path with no
+        // bypass (bound/unbound × read/mutate × bypass).
         #[allow(clippy::manual_is_multiple_of)]
         let bound = rng % 3 != 0;
         #[allow(clippy::manual_is_multiple_of)]
         let mutate = rng % 4 == 0;
         #[allow(clippy::manual_is_multiple_of)]
         let bypass = rng % 50 == 0;
-
         let should_deny = !bypass && !bound && mutate;
-        let would_deny = !bypass && !bound && mutate;
-        if should_deny != would_deny {
-            violations.fetch_add(1, Ordering::Relaxed);
-        }
+        std::hint::black_box(should_deny);
     }
 
-    let t = total.load(Ordering::Relaxed);
-    let v = violations.load(Ordering::Relaxed);
-    let drift = if t > 0 { v as f64 / t as f64 } else { 0.0 };
-    eprintln!(
-        "phase2 soak: {t} events, {v} violations, drift={:.6}%",
-        drift * 100.0
+    eprintln!("phase2 soak: {total} iterations in {duration_secs}s budget");
+    assert!(
+        total > 1_000_000,
+        "must sustain >1M iterations within the {duration_secs}s budget (got {total})"
     );
-    assert!(drift < 0.001, "drift exceeds 0.1%");
-    assert!(t > 1_000_000, "must process >1M events");
 }
 
 #[test]

@@ -1,8 +1,6 @@
 //! agend-git-shim Phase 4 GC stress tests.
 //! Gated via `#[ignore]`. Run: `cargo test --test agend_git_shim_phase4_stress -- --ignored`
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[test]
@@ -88,17 +86,21 @@ fn stress_phase4_1h_soak() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(60);
+    // Throughput / stability soak of the GC candidate decision. (Removed the
+    // vacuous drift counter: `let is_candidate = EXPR; let expected = EXPR;`
+    // compared an expression to an identical copy of itself, so `violations`
+    // could never increment and `assert!(drift < 0.001)` was a tautology. The
+    // decision is now black-boxed; only the failable throughput assert remains.)
     let duration = Duration::from_secs(duration_secs);
     let start = Instant::now();
-    let violations = Arc::new(AtomicU64::new(0));
-    let total = Arc::new(AtomicU64::new(0));
+    let mut total: u64 = 0;
     let mut rng: u64 = 42;
     while start.elapsed() < duration {
         rng ^= rng << 13;
         rng ^= rng >> 7;
         rng ^= rng << 17;
-        total.fetch_add(1, Ordering::Relaxed);
-        // Simulate GC decision: managed + past_grace + not_pinned + no_binding → candidate.
+        total += 1;
+        // GC candidate: managed + past_grace + not_pinned + no_binding.
         #[allow(clippy::manual_is_multiple_of)]
         let managed = rng % 3 != 0;
         #[allow(clippy::manual_is_multiple_of)]
@@ -108,20 +110,13 @@ fn stress_phase4_1h_soak() {
         #[allow(clippy::manual_is_multiple_of)]
         let has_binding = rng % 5 == 0;
         let is_candidate = managed && past_grace && !pinned && !has_binding;
-        let expected = managed && past_grace && !pinned && !has_binding;
-        if is_candidate != expected {
-            violations.fetch_add(1, Ordering::Relaxed);
-        }
+        std::hint::black_box(is_candidate);
     }
-    let t = total.load(Ordering::Relaxed);
-    let v = violations.load(Ordering::Relaxed);
-    let drift = if t > 0 { v as f64 / t as f64 } else { 0.0 };
-    eprintln!(
-        "phase4 soak: {t} events, {v} violations, drift={:.6}%",
-        drift * 100.0
+    eprintln!("phase4 soak: {total} iterations in {duration_secs}s budget");
+    assert!(
+        total > 1_000_000,
+        "must sustain >1M iterations within the {duration_secs}s budget (got {total})"
     );
-    assert!(drift < 0.001);
-    assert!(t > 1_000_000);
 }
 
 #[test]
