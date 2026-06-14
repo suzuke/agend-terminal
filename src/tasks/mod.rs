@@ -18,6 +18,10 @@ use std::path::Path;
 
 pub use handler::handle;
 pub use handler::register_subscriber as register_cascade_subscriber;
+// #2117 P2: resolution helpers for the out-of-`tasks` callers — comms dispatch
+// auto-create (target board) and the per-board task sweep (project id from a
+// team's source_repo).
+pub(crate) use board_router::{project_id_from_source_repo, resolve_target_project};
 pub use orphan::{
     cancel_tasks_for_owner, orphan_tasks_for_owner, reconcile_orphan_owners_with_live,
     release_inprogress_orphans_with_live,

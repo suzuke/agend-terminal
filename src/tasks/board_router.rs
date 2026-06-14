@@ -72,7 +72,7 @@ fn lookup_task_project(home: &Path, task_id: &str) -> Option<String> {
 /// Uses the trailing `owner/repo` segments (`.git` stripped) when present, then
 /// slugs to a safe directory name (the same `project_slug` `board_root` applies,
 /// so the result is idempotent under `board_root`).
-fn project_id_from_source_repo(repo: &Path) -> String {
+pub(crate) fn project_id_from_source_repo(repo: &Path) -> String {
     let segs: Vec<String> = repo
         .components()
         .filter_map(|c| match c {
@@ -97,6 +97,17 @@ pub(super) fn resolve_current_project(home: &Path, caller: &str) -> String {
         .and_then(|t| t.source_repo)
         .map(|repo| project_id_from_source_repo(&repo))
         .unwrap_or_else(|| DEFAULT_PROJECT.to_string())
+}
+
+/// The project a dispatch **target** acts in — identical
+/// agent→team→`source_repo`→project resolution as [`resolve_current_project`],
+/// but keyed on the dispatch target rather than the caller. The comms
+/// auto-create path (#2117 P2) stamps this so the spawned task lands on the
+/// TARGET's board, not the dispatcher's (P1's `create` defaulted to the
+/// *caller's* project — the leak the epic flagged at `comms.rs`). Single-project
+/// → [`DEFAULT_PROJECT`] → the `home` board → byte-identical.
+pub(crate) fn resolve_target_project(home: &Path, target: &str) -> String {
+    resolve_current_project(home, target)
 }
 
 /// The project a task lives in: the `task_index` entry, else a full-board scan

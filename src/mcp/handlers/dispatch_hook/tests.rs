@@ -785,6 +785,77 @@ fn delegate_task_with_repo_creates_ci_watch_via_handle_delegate_task() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #2117 P2: a dispatch from teamA's member to teamB's member auto-creates the
+/// board task on the TARGET's (teamB) board — not the dispatcher's. Pre-P2 the
+/// auto-create called `tasks::handle` with the *sender* as emitter and no
+/// explicit `project`, so the task defaulted to the CALLER's project (teamA) —
+/// the leak the epic flagged at `comms.rs`. The fix stamps
+/// `resolve_target_project(target)` into the create. No `branch` → the lease is
+/// skipped (this test pins the board-routing decision, not the CI-watch path).
+#[test]
+fn dispatch_auto_create_lands_on_target_board_2117_p2() {
+    use crate::identity::Sender;
+    let home = std::env::temp_dir().join(format!(
+        "agend-2117p2-dispatch-target-board-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&home).ok();
+    // Two teams, distinct source_repos → distinct boards. devA dispatches devB.
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        r#"
+instances:
+  devA:
+    backend: claude
+  devB:
+    backend: claude
+teams:
+  teamA:
+    members:
+      - devA
+    source_repo: /repos/orgA/projA
+  teamB:
+    members:
+      - devB
+    source_repo: /repos/orgB/projB
+"#,
+    )
+    .unwrap();
+
+    let args = serde_json::json!({
+        "instance": "devB",
+        "task": "implement feature X",
+        // no task_id → auto-create; no branch → skip the lease/CI-watch path.
+    });
+    let sender = Some(Sender::new("devA").expect("sender"));
+    // `api::call(SEND)` errors in-test (no daemon) but only AFTER the auto-create
+    // commit — we assert which board the task was BORN on, not the send result.
+    let _ = super::super::comms::handle_delegate_task(&home, &args, &sender);
+
+    // Query each board via the P1 `_at` reader (avoids the task_events anti-bypass
+    // invariant on the literal log path). The auto-created task must be on the
+    // TARGET's (teamB) board …
+    let on_board =
+        |proj: &str| crate::tasks::list_all_at(&crate::task_events::board_root(&home, proj));
+    assert_eq!(
+        on_board("orgB_projB").len(),
+        1,
+        "auto-created dispatch task must land on the target's (teamB) board"
+    );
+    // … NOT on the dispatcher's (teamA) board, nor the default/home board (the
+    // pre-P2 leak: create defaulted to the caller's project).
+    assert!(
+        on_board("orgA_projA").is_empty(),
+        "task must NOT land on the dispatcher's (teamA) board — that is the #2117 P2 leak"
+    );
+    assert!(
+        on_board(crate::task_events::DEFAULT_PROJECT).is_empty(),
+        "task must NOT land on the default/home board"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
 // ─────────────────────────────────────────────────────────────────
 // Sprint 58 Wave 1 PR-3 (#15) — explicit post-Wave-4 dispatch-layer
 // guard pins.

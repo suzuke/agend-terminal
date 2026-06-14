@@ -246,12 +246,21 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
                 .chars()
                 .take(80)
                 .collect::<String>();
+            // #2117 P2: route the auto-created task to the TARGET's board, not
+            // the dispatcher's. `handle` is called with `sender` as the emitter,
+            // so without an explicit `project` the create would default to the
+            // *caller's* project (resolve_current_project(sender)) — the P1 leak
+            // the epic flagged. Stamp the target's project so the task is born on
+            // the board the assignee actually works. Single-project → both resolve
+            // to DEFAULT → home board → byte-identical.
+            let target_project = crate::tasks::resolve_target_project(home, target);
             let create_args = json!({
                 "action": "create",
                 "title": auto_title,
                 "assignee": target,
                 "branch": args["branch"].as_str(),
                 "priority": "normal",
+                "project": target_project,
             });
             let task_result = crate::tasks::handle(home, sender.as_str(), &create_args);
             match task_result["id"].as_str() {

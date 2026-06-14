@@ -201,34 +201,130 @@ fn sweep_tick(home: &Path) -> anyhow::Result<()> {
     if cfg.paused {
         return Ok(());
     }
-    let repo = match &cfg.repo {
-        Some(r) if !r.is_empty() => r.clone(),
-        _ => return Ok(()),
-    };
     let api_base = cfg
         .api_base_url
         .as_deref()
         .unwrap_or(DEFAULT_GITHUB_API_BASE);
 
-    let prs = list_recently_merged_prs(&repo, api_base)?;
-    if prs.is_empty() {
+    // #2117 P2: sweep each project board against ITS OWN repo. fleet.yaml teams
+    // contribute their per-project boards; `cfg.repo` is the operator override /
+    // single-project fallback for the DEFAULT (home) board. A merged PR in repo A
+    // is matched ONLY against board A's open tasks, so it can never auto-close a
+    // task that lives on board B (#2105). Single-project deployments (no per-team
+    // `source_repo`) resolve to exactly `[(DEFAULT, cfg.repo)]` → board == home →
+    // byte-identical to the pre-P2 single-repo tick.
+    let boards = resolve_sweep_boards(home, &cfg);
+    if boards.is_empty() {
         return Ok(());
     }
 
-    // Sprint 56 Track F (#496): load fleet config so the authorship gate
-    // below can resolve `task.created_by` / `task.assignee` (agend-local
-    // instance names) into `github_login` GitHub usernames before
-    // comparing against `pr.author_login`. Pre-Track-F the gate compared
-    // disjoint namespaces and silently rejected every cross-namespace
-    // mismatch — see `docs/RCA-issue-496-task-sweep-no-auto-close-2026-05-08.md`.
-    // `Option<FleetConfig>` because a missing/malformed fleet.yaml must
-    // not abort the sweep — fall back to direct compare for compat.
+    // Sprint 56 Track F (#496): load fleet config once so the per-board
+    // authorship gate can resolve `task.created_by` / `task.assignee` (agend-local
+    // instance names) into `github_login` GitHub usernames before comparing
+    // against `pr.author_login`. `Option<FleetConfig>` because a missing/malformed
+    // fleet.yaml must not abort the sweep — fall back to direct compare for compat.
     let fleet_cfg = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok();
 
-    // Snapshot of currently-open tasks. Read from tasks::list_all (the
-    // PR2 bridge-phase legacy reader); PR3 cutover switches this to
-    // `task_events::replay` derived view.
-    let open_tasks = crate::tasks::list_all(home);
+    // The DEFAULT board's scan gates the (unchanged-scope) compliance pass below,
+    // exactly as the pre-P2 single-repo tick did (compliance ran only once both
+    // the PR list AND the open-task set were non-empty).
+    let mut default_scanned = false;
+    for (project_id, repo) in &boards {
+        match sweep_board(
+            home,
+            project_id,
+            repo,
+            api_base,
+            fleet_cfg.as_ref(),
+            cfg.dry_run,
+        ) {
+            Ok(scanned) => {
+                if project_id == crate::task_events::DEFAULT_PROJECT {
+                    default_scanned = scanned;
+                }
+            }
+            // Per-board isolation: a repo-A API/append failure must NOT abort the
+            // repo-B board scan (the #2105 multi-board goal). Log and continue.
+            Err(e) => tracing::warn!(
+                project = %project_id, repo = %repo, error = %e,
+                "task_sweep: board scan failed"
+            ),
+        }
+    }
+
+    // Issue #664: compliance scan stays keyed on the operator's primary repo
+    // (`cfg.repo`) and gated on the DEFAULT board's scan — #2117 P2 covers
+    // auto-close routing, not compliance (out of scope). Byte-identical: in a
+    // single-project deployment the DEFAULT board IS `cfg.repo`.
+    if default_scanned && cfg.compliance_mode != "off" {
+        if let Some(repo) = cfg.repo.as_deref().filter(|s| !s.is_empty()) {
+            let _ = compliance_sweep(home, repo);
+        }
+    }
+
+    Ok(())
+}
+
+/// #2117 P2: the set of `(project_id, github "owner/repo")` boards to sweep.
+///
+/// fleet.yaml teams contribute their per-project boards — each team's
+/// `source_repo` yields the board's `project_id` (the same slug
+/// [`crate::tasks::project_id_from_source_repo`] feeds `board_root`) and its
+/// GitHub slug (`derive_repo_from_remote`). `cfg.repo` contributes the DEFAULT
+/// (home) board as the operator override / single-project fallback. A
+/// `source_repo` with no GitHub `origin` remote (or a non-GitHub remote) is
+/// skipped — the poller only knows GitHub Actions. Order is deterministic
+/// (BTreeMap by project_id); distinct `source_repo`s that collapse to one
+/// project (a project can back multiple teams) dedupe to a single board.
+fn resolve_sweep_boards(home: &Path, cfg: &SweepConfig) -> Vec<(String, String)> {
+    let mut boards: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for team in crate::teams::list_all(home) {
+        let Some(repo_path) = team.source_repo.as_deref() else {
+            continue;
+        };
+        let Some(slug) =
+            crate::mcp::handlers::dispatch_hook::derive_repo_from_remote_pub(repo_path)
+        else {
+            continue;
+        };
+        let project_id = crate::tasks::project_id_from_source_repo(repo_path);
+        boards.entry(project_id).or_insert(slug);
+    }
+    if let Some(repo) = cfg.repo.as_deref().filter(|s| !s.is_empty()) {
+        boards
+            .entry(crate::task_events::DEFAULT_PROJECT.to_string())
+            .or_insert_with(|| repo.to_string());
+    }
+    boards.into_iter().collect()
+}
+
+/// #2117 P2: scan ONE project board against ITS repo for `Closes t-…` markers in
+/// recently-merged PRs and auto-close the matching open tasks. Mutations route to
+/// the board via `append_done_if_legal_at` (the P0/P1 `_at` seam). Returns
+/// `Ok(true)` if a full scan ran (PR list AND open-task set both non-empty),
+/// `Ok(false)` if it short-circuited — the caller uses the DEFAULT board's flag
+/// to gate the compliance pass exactly as the pre-P2 single-repo tick did.
+fn sweep_board(
+    home: &Path,
+    project_id: &str,
+    repo: &str,
+    api_base: &str,
+    fleet_cfg: Option<&crate::fleet::FleetConfig>,
+    dry_run: bool,
+) -> anyhow::Result<bool> {
+    let prs = list_recently_merged_prs(repo, api_base)?;
+    if prs.is_empty() {
+        return Ok(false);
+    }
+
+    // P0/P1 board seam: a single-project deployment resolves `project_id` to
+    // DEFAULT → `board == home` → `list_all_at`/`append_done_if_legal_at` are the
+    // byte-identical home-board paths.
+    let board = crate::task_events::board_root(home, project_id);
+
+    // Snapshot of THIS board's currently-open tasks (read via the P1 `_at`
+    // variant so a merged PR is matched only against tasks on its own board).
+    let open_tasks = crate::tasks::list_all_at(&board);
     let open_ids: std::collections::HashMap<String, &crate::tasks::Task> = open_tasks
         .iter()
         .filter(|t| {
@@ -242,7 +338,7 @@ fn sweep_tick(home: &Path) -> anyhow::Result<()> {
         .map(|t| (t.id.clone(), t))
         .collect();
     if open_ids.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
 
     let emitter = InstanceName::from(SWEEP_EMITTER);
@@ -308,7 +404,7 @@ fn sweep_tick(home: &Path) -> anyhow::Result<()> {
             // pure helper `compute_author_ok` resolves creator/assignee
             // via the fleet's `github_login` mapping with a fall-back to
             // a direct string compare for compat — see helper docs.
-            let author_ok = compute_author_ok(&pr.author_login, task, fleet_cfg.as_ref());
+            let author_ok = compute_author_ok(&pr.author_login, task, fleet_cfg);
             if !author_ok {
                 tracing::warn!(
                     pr = pr.number,
@@ -321,7 +417,7 @@ fn sweep_tick(home: &Path) -> anyhow::Result<()> {
                 continue;
             }
 
-            if cfg.dry_run {
+            if dry_run {
                 tracing::info!(
                     pr = pr.number,
                     marker = %marker,
@@ -363,7 +459,7 @@ fn sweep_tick(home: &Path) -> anyhow::Result<()> {
             // at sweep start; a marker task cancelled since must NOT be flipped to
             // Done (the whole Linked+Done batch is skipped — a cancelled task drops
             // out of `open_ids` next cycle, so no re-attempt).
-            let closed = task_events::append_done_if_legal(home, &emitter, &marker, events)?;
+            let closed = task_events::append_done_if_legal_at(&board, &emitter, &marker, events)?;
             if closed {
                 tracing::info!(
                     pr = pr.number,
@@ -374,12 +470,7 @@ fn sweep_tick(home: &Path) -> anyhow::Result<()> {
         }
     }
 
-    // Issue #664: run compliance checks on merged PRs
-    if cfg.compliance_mode != "off" {
-        let _ = compliance_sweep(home, &repo);
-    }
-
-    Ok(())
+    Ok(true)
 }
 
 // ── PR body sanitisation + marker extraction ─────────────────────────
@@ -829,6 +920,114 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    // ── #2117 P2: per-board sweep enumeration ──────────────────────
+
+    /// Init a git repo at `dir` with a single GitHub `origin` remote so
+    /// `derive_repo_from_remote` resolves a slug (the sweep's board→repo map).
+    fn git_repo_with_origin(dir: &Path, origin: &str) {
+        fs::create_dir_all(dir).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("AGEND_GIT_BYPASS", "1")
+                .output()
+                .ok();
+        };
+        git(&["init", "-b", "main"]);
+        git(&["remote", "add", "origin", origin]);
+    }
+
+    /// #2117 P2: the sweep enumerates ONE board per project — each fleet team's
+    /// `source_repo` board paired with ITS OWN derived GitHub repo, plus the
+    /// DEFAULT (home) board paired with `cfg.repo`. This 1:1 (board, repo)
+    /// pairing is what makes a merged PR in repo A match only board A's tasks
+    /// (#2105): the sweep never scans board B against repo A.
+    #[test]
+    fn resolve_sweep_boards_pairs_each_project_with_its_own_repo_2117_p2() {
+        let home = tmp_home("p2-sweep-boards");
+        let repo_a = home.join("srcA");
+        let repo_b = home.join("srcB");
+        git_repo_with_origin(&repo_a, "https://github.com/orgA/projA.git");
+        git_repo_with_origin(&repo_b, "https://github.com/orgB/projB.git");
+        fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            format!(
+                "instances:\n  devA:\n    backend: claude\n  devB:\n    backend: claude\n\
+                 teams:\n  teamA:\n    members:\n      - devA\n    source_repo: {}\n\
+                 \x20 teamB:\n    members:\n      - devB\n    source_repo: {}\n",
+                repo_a.display(),
+                repo_b.display()
+            ),
+        )
+        .unwrap();
+
+        let cfg = SweepConfig {
+            repo: Some("operator/primary".to_string()),
+            ..Default::default()
+        };
+        let boards: std::collections::HashMap<String, String> =
+            resolve_sweep_boards(&home, &cfg).into_iter().collect();
+
+        // DEFAULT (home) board ← cfg.repo (operator override / single-project
+        // fallback) — NEVER a project repo.
+        assert_eq!(
+            boards
+                .get(crate::task_events::DEFAULT_PROJECT)
+                .map(String::as_str),
+            Some("operator/primary"),
+            "default board must map to cfg.repo: {boards:?}"
+        );
+        // Each project board ← ITS OWN derived (canonical, lowercased) repo.
+        let pa = crate::tasks::project_id_from_source_repo(&repo_a);
+        let pb = crate::tasks::project_id_from_source_repo(&repo_b);
+        assert_eq!(
+            boards.get(&pa).map(String::as_str),
+            Some("orga/proja"),
+            "teamA board must pair with orgA/projA: {boards:?}"
+        );
+        assert_eq!(
+            boards.get(&pb).map(String::as_str),
+            Some("orgb/projb"),
+            "teamB board must pair with orgB/projB: {boards:?}"
+        );
+        assert_eq!(
+            boards.len(),
+            3,
+            "exactly default + 2 project boards: {boards:?}"
+        );
+
+        fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2117 P2 byte-identical: with NO per-team `source_repo` (the
+    /// single-project shape every pre-P2 test assumes), the board set is exactly
+    /// `[(DEFAULT, cfg.repo)]` → board == home → the legacy single-repo tick.
+    #[test]
+    fn resolve_sweep_boards_single_project_is_default_only_2117_p2() {
+        let home = tmp_home("p2-sweep-single");
+        let cfg = SweepConfig {
+            repo: Some("operator/primary".to_string()),
+            ..Default::default()
+        };
+        let boards = resolve_sweep_boards(&home, &cfg);
+        assert_eq!(
+            boards,
+            vec![(
+                crate::task_events::DEFAULT_PROJECT.to_string(),
+                "operator/primary".to_string()
+            )],
+            "single-project must resolve to exactly the DEFAULT board ← cfg.repo"
+        );
+        // And no repo configured at all → empty → tick is a no-op.
+        let empty = resolve_sweep_boards(&home, &SweepConfig::default());
+        assert!(
+            empty.is_empty(),
+            "no repo + no teams → no boards: {empty:?}"
+        );
+        fs::remove_dir_all(&home).ok();
     }
 
     // ── Sprint 56 Track F (#496): authorship gate via github_login ──
