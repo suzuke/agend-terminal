@@ -53,6 +53,12 @@ pub enum KillOutcome {
     /// from `ForceKilled` so operator logs reflect the platform.
     #[allow(dead_code)] // Windows-only constructed; CI lints Linux/macOS test profile
     WindowsTerminated,
+    /// CR-2026-06-14: the live PID's OS start-time token did not match the
+    /// token recorded in `.daemon` (or no token was recorded / it couldn't be
+    /// read). The PID was recycled onto a different process — signalling it
+    /// would TOCTOU-kill an innocent. NO signal was sent; the stale run dir is
+    /// left for the next-boot sweep (fail-closed-skip, DP3).
+    IdentityMismatch,
 }
 
 /// Describes one zombie candidate discovered by [`find_zombie_candidates`].
@@ -63,6 +69,11 @@ pub struct ZombieInfo {
     /// Age computed from `<run_dir>/.daemon` mtime relative to the
     /// caller's `now` parameter (typically `SystemTime::now()`).
     pub age: Duration,
+    /// OS process start-time token recorded in `.daemon` (third field), or
+    /// `None` for a legacy file written before CR-2026-06-14. Passed to
+    /// [`cleanup_zombie_daemon`] so it can verify the live PID is still the
+    /// same process before signalling. `None` → fail-closed-skip.
+    pub start_token: Option<u64>,
 }
 
 /// Cross-platform check: is the process with `pid` still alive?
@@ -119,21 +130,63 @@ pub fn log_zombie_state(pid: u32) {
     }
 }
 
+/// Pure decision core (CR-2026-06-14): may we send a kill signal to a PID?
+///
+/// Returns `true` ONLY when BOTH the start-token recorded in `.daemon`
+/// (`recorded`) AND the live process's current start-token (`current`) are
+/// known AND equal. Every other case fails closed (returns `false`):
+/// - `recorded == None` — legacy `.daemon` with no token / unreadable → can't
+///   prove identity → skip (DP3 fail-closed-skip, next-boot sweep handles it).
+/// - `current == None` — couldn't read the live process's token → skip.
+/// - `recorded != current` — the PID was recycled onto a different process →
+///   signalling it would kill an innocent → skip.
+///
+/// This is the load-bearing core; the kill primitive and the grace poll both
+/// gate on it. Kept pure (no syscalls) so it is exhaustively unit-testable.
+pub fn should_signal(recorded: Option<u64>, current: Option<u64>) -> bool {
+    matches!((recorded, current), (Some(r), Some(c)) if r == c)
+}
+
 /// Core kill primitive. Sends SIGTERM, polls liveness up to `term_grace`,
 /// escalates to SIGKILL on timeout and polls up to `kill_grace`.
 ///
+/// CR-2026-06-14 identity-compare: before EVERY signal the live PID's OS
+/// start-token is compared against `recorded_token` (read from `.daemon`) via
+/// [`should_signal`]. A mismatch — the original daemon exited and the OS
+/// recycled its PID onto an unrelated process — short-circuits to
+/// [`KillOutcome::IdentityMismatch`] with NO signal sent. This closes the
+/// TOCTOU where a stale run-dir PID could be SIGKILLed after the kernel had
+/// reassigned it to an innocent process.
+///
 /// Returns [`KillOutcome::AlreadyExited`] if the PID is already gone at
-/// entry. Returns [`KillOutcome::Graceful(elapsed)`] if SIGTERM landed.
-/// Returns [`KillOutcome::ForceKilled`] if SIGKILL was needed and
-/// succeeded. Returns [`KillOutcome::RefusedToDie`] if both stages
-/// timed out.
+/// entry. Returns [`KillOutcome::IdentityMismatch`] if the token check fails
+/// (no/wrong identity). Returns [`KillOutcome::Graceful(elapsed)`] if SIGTERM
+/// landed. Returns [`KillOutcome::ForceKilled`] if SIGKILL was needed and
+/// succeeded. Returns [`KillOutcome::RefusedToDie`] if both stages timed out.
 ///
 /// Windows: short-circuits to [`KillOutcome::WindowsTerminated`] via
 /// `TerminateProcess` (no SIGTERM equivalent). The two-stage grace is
 /// Unix-only.
-pub fn cleanup_zombie_daemon(pid: u32, term_grace: Duration, kill_grace: Duration) -> KillOutcome {
+pub fn cleanup_zombie_daemon(
+    pid: u32,
+    recorded_token: Option<u64>,
+    term_grace: Duration,
+    kill_grace: Duration,
+) -> KillOutcome {
     if !is_alive(pid) {
         return KillOutcome::AlreadyExited;
+    }
+
+    // Identity gate: verify the live PID is still the process we recorded
+    // BEFORE sending any signal. Fail-closed on no/wrong identity.
+    if !should_signal(recorded_token, crate::process::process_start_token(pid)) {
+        tracing::warn!(
+            pid,
+            recorded_token = ?recorded_token,
+            "#927/CR-2026-06-14 cleanup-zombies: start-token mismatch — skipping kill \
+             (PID recycled or no recorded identity); next-boot sweep will reclaim the dir"
+        );
+        return KillOutcome::IdentityMismatch;
     }
 
     #[cfg(unix)]
@@ -146,12 +199,23 @@ pub fn cleanup_zombie_daemon(pid: u32, term_grace: Duration, kill_grace: Duratio
         unsafe {
             libc::kill(pid as i32, libc::SIGTERM);
         }
-        if !poll_until_dead(pid, term_grace) {
+        if !poll_until_dead_or_recycled(pid, recorded_token, term_grace) {
+            // Re-verify before escalating: the original may have exited during
+            // the SIGTERM grace and the PID been recycled. Never SIGKILL a
+            // freshly-arrived innocent process.
+            if !should_signal(recorded_token, crate::process::process_start_token(pid)) {
+                tracing::warn!(
+                    pid,
+                    "#927/CR-2026-06-14 cleanup-zombies: start-token changed during SIGTERM \
+                     grace — skipping SIGKILL (PID recycled)"
+                );
+                return KillOutcome::IdentityMismatch;
+            }
             // Stage 2: SIGKILL.
             unsafe {
                 libc::kill(pid as i32, libc::SIGKILL);
             }
-            if poll_until_dead(pid, kill_grace) {
+            if poll_until_dead_or_recycled(pid, recorded_token, kill_grace) {
                 return KillOutcome::ForceKilled;
             }
             return KillOutcome::RefusedToDie;
@@ -167,7 +231,7 @@ pub fn cleanup_zombie_daemon(pid: u32, term_grace: Duration, kill_grace: Duratio
         let _ = kill_grace;
         crate::process::terminate(pid);
         // Best-effort wait for the process to actually exit.
-        if poll_until_dead(pid, Duration::from_secs(2)) {
+        if poll_until_dead_or_recycled(pid, recorded_token, Duration::from_secs(2)) {
             KillOutcome::WindowsTerminated
         } else {
             KillOutcome::RefusedToDie
@@ -187,6 +251,12 @@ pub fn cleanup_zombie_daemon(pid: u32, term_grace: Duration, kill_grace: Duratio
 /// - `src/process.rs::test_kill_process_tree_kills_child_subprocess` —
 ///   sibling test with identical race shape
 ///
+/// CR-2026-06-14: the production kill path moved to the identity-aware
+/// [`poll_until_dead_or_recycled`]; the only remaining callers of this plain
+/// variant are `#[cfg(unix)]` tests, so it is gated `#[cfg(all(test, unix))]`
+/// — keeping it out of the non-test bin build (where it would be dead) and
+/// out of the Windows test build (where none of its unix-only callers exist).
+///
 /// ### Deadline guidance (OS-conditional)
 ///
 /// Callers killing a process whose PID they CAN `waitpid` on (it's their
@@ -205,10 +275,41 @@ pub fn cleanup_zombie_daemon(pid: u32, term_grace: Duration, kill_grace: Duratio
 ///
 /// Recommend 5s for self-reaped children, 10s for orphaned grandchildren.
 /// The 100ms poll cadence balances responsiveness vs CPU waste.
+#[cfg(all(test, unix))]
 pub(crate) fn poll_until_dead(pid: u32, timeout: Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     loop {
         if !is_alive(pid) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Identity-aware variant of [`poll_until_dead`] (CR-2026-06-14): returns true
+/// if the PID dies OR its OS start-token stops matching `recorded_token`
+/// mid-poll. The latter means the original process exited and the kernel
+/// recycled its PID onto a different process — the daemon we were reaping IS
+/// gone, so we treat it as dead AND, crucially, the caller will not escalate
+/// to SIGKILL against the innocent newcomer (the kill primitive re-checks
+/// identity before each signal). Reached only after the entry-level identity
+/// gate passed, so `recorded_token` is always `Some` here; a transient
+/// unreadable live token (`current == None`) also returns true (safe
+/// direction — under-kill, never over-kill).
+pub(crate) fn poll_until_dead_or_recycled(
+    pid: u32,
+    recorded_token: Option<u64>,
+    timeout: Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if !is_alive(pid) {
+            return true;
+        }
+        if !should_signal(recorded_token, crate::process::process_start_token(pid)) {
             return true;
         }
         if std::time::Instant::now() >= deadline {
@@ -251,10 +352,12 @@ pub fn find_zombie_candidates(home: &Path, min_age: Duration, now: SystemTime) -
         };
         let age = now.duration_since(mtime).unwrap_or(Duration::from_secs(0));
         if age >= min_age {
+            let start_token = crate::daemon::read_daemon_start_token(&entry.path());
             zombies.push(ZombieInfo {
                 pid,
                 run_dir: entry.path(),
                 age,
+                start_token,
             });
         }
     }
@@ -340,7 +443,10 @@ mod tests {
         // Tiny sleep to ensure the kernel has cleared the entry.
         std::thread::sleep(Duration::from_millis(50));
 
-        let outcome = cleanup_zombie_daemon(pid, Duration::from_secs(1), Duration::from_secs(1));
+        // Dead PID short-circuits to AlreadyExited before the identity gate,
+        // so the recorded token is irrelevant here (pass None).
+        let outcome =
+            cleanup_zombie_daemon(pid, None, Duration::from_secs(1), Duration::from_secs(1));
         assert!(
             matches!(outcome, KillOutcome::AlreadyExited),
             "dead PID must return AlreadyExited, got {outcome:?}"
@@ -387,7 +493,10 @@ mod tests {
         // Default `sh -c sleep 60` exits on SIGTERM (no trap).
         let (pid, reaper) = spawn_with_reaper("sh", &["-c", "sleep 60"]);
 
-        let outcome = cleanup_zombie_daemon(pid, Duration::from_secs(3), Duration::from_secs(2));
+        // Pass the live child's REAL start-token so the identity gate passes.
+        let token = crate::process::process_start_token(pid);
+        let outcome =
+            cleanup_zombie_daemon(pid, token, Duration::from_secs(3), Duration::from_secs(2));
         let _ = reaper.join();
 
         assert!(
@@ -433,9 +542,15 @@ mod tests {
     fn cleanup_zombie_daemon_sigterm_ignored_returns_force_killed() {
         let (pid, reaper, sentinel) = spawn_sigign_with_sentinel(60);
 
+        // Pass the live child's REAL start-token so the identity gate passes.
+        let token = crate::process::process_start_token(pid);
         // 500ms SIGTERM grace (short — SIG_IGN won't release), 3s SIGKILL grace.
-        let outcome =
-            cleanup_zombie_daemon(pid, Duration::from_millis(500), Duration::from_secs(3));
+        let outcome = cleanup_zombie_daemon(
+            pid,
+            token,
+            Duration::from_millis(500),
+            Duration::from_secs(3),
+        );
         let _ = reaper.join();
         let _ = std::fs::remove_file(&sentinel);
 
@@ -443,6 +558,130 @@ mod tests {
             matches!(outcome, KillOutcome::ForceKilled),
             "SIGTERM-ignored process must escalate to SIGKILL, got {outcome:?}"
         );
+    }
+
+    // ── CR-2026-06-14 zombie-kill identity-compare repro ──────────────────
+    //
+    // The TOCTOU finding: `cleanup_zombie_daemon` selected a target purely by
+    // run-dir name + `.daemon` mtime and signalled it after one entry
+    // `is_alive` — so a PID recycled onto an innocent process between selection
+    // and the signal would be killed. The fix gates every signal on
+    // `should_signal(recorded_token, live_token)`.
+    //
+    // These tests simulate PID recycling DETERMINISTICALLY without waiting for
+    // a real recycle: a live cooperative child is the "innocent" process; we
+    // vary only the RECORDED token to model the three cases.
+
+    /// Pure decision core — exhaustive table. This is the load-bearing gate;
+    /// every kill path funnels through it.
+    #[test]
+    fn should_signal_only_when_both_known_and_equal() {
+        assert!(should_signal(Some(7), Some(7)), "match → signal");
+        assert!(
+            !should_signal(Some(7), Some(8)),
+            "recycled (mismatch) → skip"
+        );
+        assert!(!should_signal(None, Some(7)), "legacy no-token → skip");
+        assert!(
+            !should_signal(Some(7), None),
+            "live token unreadable → skip"
+        );
+        assert!(!should_signal(None, None), "nothing known → skip");
+    }
+
+    /// RED→GREEN: a recycled PID (live token ≠ recorded token) must NOT be
+    /// signalled. The pre-fix primitive took only a bare pid and unconditionally
+    /// SIGTERM/SIGKILLed → it would kill this innocent live child. With the fix
+    /// the token mismatch short-circuits to `IdentityMismatch` and the child
+    /// survives untouched (zero signal sent).
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_skips_when_live_token_differs_from_recorded_pid_recycled() {
+        let (pid, reaper) = spawn_with_reaper("sh", &["-c", "sleep 60"]);
+        let live = crate::process::process_start_token(pid).expect("live token");
+        // Recorded token differs from the live process's token → models a
+        // recycled PID: the `.daemon` recorded daemon D's token, but `pid` now
+        // belongs to an unrelated process.
+        let recorded = Some(live.wrapping_add(1));
+
+        let outcome = cleanup_zombie_daemon(
+            pid,
+            recorded,
+            Duration::from_secs(3),
+            Duration::from_secs(2),
+        );
+
+        assert_eq!(
+            outcome,
+            KillOutcome::IdentityMismatch,
+            "recycled PID (token mismatch) must yield IdentityMismatch, got {outcome:?}"
+        );
+        assert!(
+            is_alive(pid),
+            "innocent live process must NOT be signalled when the token mismatches"
+        );
+
+        // Cleanup the still-alive child.
+        unsafe {
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
+        let _ = reaper.join();
+    }
+
+    /// CONTROL: a genuine zombie (live token == recorded token) is still
+    /// killed. This proves the identity gate didn't simply break killing — a
+    /// regression that dropped the gate would pass `cleanup_skips_…` AND this
+    /// one, but a regression that over-tightened (never signals) would fail
+    /// HERE. The pair pins the gate as load-bearing.
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_kills_when_live_token_matches_recorded_real_zombie() {
+        let (pid, reaper) = spawn_with_reaper("sh", &["-c", "sleep 60"]);
+        let recorded = crate::process::process_start_token(pid); // == live token
+
+        let outcome = cleanup_zombie_daemon(
+            pid,
+            recorded,
+            Duration::from_secs(3),
+            Duration::from_secs(2),
+        );
+        let _ = reaper.join();
+
+        assert!(
+            matches!(outcome, KillOutcome::Graceful(_) | KillOutcome::ForceKilled),
+            "matching-identity zombie must be killed, got {outcome:?}"
+        );
+        assert!(
+            poll_until_dead(pid, Duration::from_secs(5)),
+            "matching-identity zombie must be dead after cleanup"
+        );
+    }
+
+    /// BACK-COMPAT: a legacy `.daemon` with no recorded token (`None`) →
+    /// fail-closed-skip (DP3). We do NOT signal when identity can't be proven;
+    /// the next-boot stale-pid sweep reclaims the dir instead.
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_skips_legacy_no_token_fail_closed() {
+        let (pid, reaper) = spawn_with_reaper("sh", &["-c", "sleep 60"]);
+
+        let outcome =
+            cleanup_zombie_daemon(pid, None, Duration::from_secs(3), Duration::from_secs(2));
+
+        assert_eq!(
+            outcome,
+            KillOutcome::IdentityMismatch,
+            "legacy no-token .daemon must fail-closed-skip, got {outcome:?}"
+        );
+        assert!(
+            is_alive(pid),
+            "fail-closed-skip must not signal the process"
+        );
+
+        unsafe {
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
+        let _ = reaper.join();
     }
 
     #[cfg(unix)]

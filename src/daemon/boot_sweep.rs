@@ -134,12 +134,19 @@ pub(crate) fn boot_sweep_impl(
             );
             continue;
         }
-        let outcome = cleanup_zombie_daemon(z.pid, term_grace, kill_grace);
+        let outcome = cleanup_zombie_daemon(z.pid, z.start_token, term_grace, kill_grace);
         let real_kill = matches!(
             outcome,
             KillOutcome::Graceful(_) | KillOutcome::ForceKilled | KillOutcome::WindowsTerminated
         );
         match outcome {
+            KillOutcome::IdentityMismatch => tracing::warn!(
+                pid = z.pid,
+                age_days = z.age.as_secs() / SECONDS_PER_DAY,
+                run_dir = %z.run_dir.display(),
+                "#933/CR-2026-06-14 boot-sweep: start-token mismatch — skipped kill (PID recycled \
+                 or legacy no-token .daemon); leaving dir for next stale-pid sweep"
+            ),
             KillOutcome::RefusedToDie => tracing::warn!(
                 pid = z.pid,
                 age_days = z.age.as_secs() / SECONDS_PER_DAY,
@@ -183,12 +190,18 @@ mod tests {
         dir
     }
 
-    /// Plant `<home>/run/<pid>/.daemon` with `<pid>:0` content (matches
-    /// production `write_daemon_id` shape).
+    /// Plant `<home>/run/<pid>/.daemon` with `<pid>:0:<start_token>` content
+    /// (matches production `write_daemon_id`'s CR-2026-06-14 3-field shape).
+    /// The third field is the live child's REAL OS start-token so the
+    /// identity-compare kill gate ([`super::cleanup_zombie_daemon`] →
+    /// `should_signal`) passes. A 2-field legacy fixture would now
+    /// fail-closed-skip, and every kill-path test below would see 0 killed —
+    /// representative fixtures must carry what production writes.
     fn plant_run_dir(home: &Path, pid: u32) -> PathBuf {
         let run = home.join("run").join(pid.to_string());
         std::fs::create_dir_all(&run).unwrap();
-        std::fs::write(run.join(".daemon"), format!("{pid}:0")).unwrap();
+        let token = crate::process::process_start_token(pid).unwrap_or(0);
+        std::fs::write(run.join(".daemon"), format!("{pid}:0:{token}")).unwrap();
         run
     }
 

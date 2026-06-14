@@ -36,6 +36,89 @@ pub fn is_pid_alive(pid: u32) -> bool {
     }
 }
 
+/// Cross-platform process start-time token: an identifier that is stable for
+/// the lifetime of a single process but (almost certainly) differs from any
+/// later process that the OS happens to recycle the same PID onto. Used to
+/// distinguish "the daemon we recorded" from "an innocent process that landed
+/// on the recycled PID" so a stale kill can't TOCTOU onto the wrong target
+/// (CR-2026-06-14 zombie-kill identity-compare).
+///
+/// Returns `None` when the value can't be obtained (process gone, syscall /
+/// parse failure, unsupported platform). Callers MUST treat `None` as
+/// "identity unknown → fail closed" (do not signal). The absolute value is
+/// opaque; only equality across two reads of the *same PID* is meaningful.
+///
+/// - **Linux**: `/proc/<pid>/stat` field 22 (`starttime`, clock ticks since
+///   boot). The `comm` field (2) can contain spaces and parens, so parse the
+///   tail after the final `)`.
+/// - **macOS**: `proc_pidinfo(PROC_PIDTBSDINFO)` → `proc_bsdinfo.pbi_start_*`
+///   (process start wall-clock, microsecond resolution).
+/// - **Windows**: `GetProcessTimes` creation `FILETIME` (100ns ticks since
+///   1601), the canonical per-process start instant.
+pub fn process_start_token(pid: u32) -> Option<u64> {
+    if pid == 0 {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // `pid (comm) state ppid ...` — comm may embed spaces/parens, so
+        // split AFTER the last ')'. The remainder begins at field 3 (state),
+        // so `starttime` (field 22) is index 22 - 3 = 19 of the tail.
+        let tail = &stat[stat.rfind(')')? + 1..];
+        tail.split_whitespace().nth(19)?.parse::<u64>().ok()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: proc_pidinfo writes at most `size_of::<proc_bsdinfo>()` bytes
+        // into our stack buffer; we pass that exact size and check the return.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        let n = unsafe {
+            libc::proc_pidinfo(
+                pid as libc::c_int,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                &mut info as *mut _ as *mut libc::c_void,
+                size,
+            )
+        };
+        if n != size {
+            return None;
+        }
+        Some(info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+        use windows_sys::Win32::System::Threading::{
+            GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return None;
+        }
+        let mut creation: FILETIME = unsafe { std::mem::zeroed() };
+        let mut exit: FILETIME = unsafe { std::mem::zeroed() };
+        let mut kernel: FILETIME = unsafe { std::mem::zeroed() };
+        let mut user: FILETIME = unsafe { std::mem::zeroed() };
+        let ok =
+            unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
+        unsafe {
+            CloseHandle(handle);
+        }
+        if ok == 0 {
+            return None;
+        }
+        Some(((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 /// Send SIGTERM to a process (Unix) or terminate it (Windows).
 pub fn terminate(pid: u32) {
     if pid == 0 {
@@ -200,5 +283,24 @@ mod tests {
     fn kill_process_tree_with_pid_zero_is_noop() {
         // Should not panic or kill anything
         kill_process_tree(0);
+    }
+
+    #[test]
+    fn process_start_token_self_is_some_and_stable() {
+        // Our own process is alive on a supported OS → token resolves and is
+        // stable across reads (the value is constant for a process lifetime).
+        let a = process_start_token(std::process::id());
+        assert!(
+            a.is_some(),
+            "self start-token must resolve on a supported OS"
+        );
+        let b = process_start_token(std::process::id());
+        assert_eq!(a, b, "start-token must be stable across reads of same PID");
+    }
+
+    #[test]
+    fn process_start_token_pid_zero_is_none() {
+        // pid 0 is never a real tracked process — mirrors is_pid_alive's guard.
+        assert_eq!(process_start_token(0), None);
     }
 }

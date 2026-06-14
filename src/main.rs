@@ -1066,7 +1066,8 @@ fn main() -> anyhow::Result<()> {
                 let mut refused = 0;
                 for z in &zombies {
                     log_zombie_state(z.pid);
-                    let outcome = cleanup_zombie_daemon(z.pid, term_grace, kill_grace);
+                    let outcome =
+                        cleanup_zombie_daemon(z.pid, z.start_token, term_grace, kill_grace);
                     match outcome {
                         KillOutcome::Graceful(d) => {
                             println!("  PID {} reaped gracefully ({}ms)", z.pid, d.as_millis());
@@ -1079,6 +1080,13 @@ fn main() -> anyhow::Result<()> {
                         }
                         KillOutcome::WindowsTerminated => {
                             println!("  PID {} terminated (Windows TerminateProcess)", z.pid);
+                        }
+                        KillOutcome::IdentityMismatch => {
+                            println!(
+                                "  PID {} skipped — start-token mismatch (PID recycled; \
+                                 no signal sent)",
+                                z.pid
+                            );
                         }
                         KillOutcome::RefusedToDie => {
                             eprintln!(
