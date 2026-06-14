@@ -19,11 +19,14 @@
 //!   a single file by design (centralized name→handler mapping + per-tool
 //!   action sub-routing tables), not a handler implementation.
 //! - `KNOWN_OVERSIZED` — pre-existing oversized handler implementations,
-//!   recorded explicitly so the guard still actively prevents *new* files
-//!   and the rest of the tree from regrowing. These are technical debt that
-//!   should be split; remove each from the list once it is back under
-//!   `MAX_LOC`. They are NOT silently skipped: the test asserts each one
-//!   still exists and is still over the limit, so a stale entry fails loud.
+//!   recorded explicitly so the guard still actively prevents *new* files and
+//!   the rest of the tree from regrowing. Each entry carries the file's LOC at
+//!   grandfather time as a per-file CEILING: the file may SHRINK but must not
+//!   grow past it (can-shrink-not-grow), so the debt can only get smaller.
+//!   These are technical debt that should be split; remove each from the list
+//!   once it is back under `MAX_LOC`. They are NOT silently skipped: the test
+//!   asserts each still exists, is still over `MAX_LOC`, and is `<=` its
+//!   ceiling, so a stale or regrown entry fails loud.
 
 use std::path::{Path, PathBuf};
 
@@ -33,11 +36,13 @@ const MAX_LOC: usize = 750;
 /// Files skipped by exact file name (not handler implementations).
 const SKIP_FILES: &[&str] = &["dispatch.rs"];
 
-/// Pre-existing oversized handler implementations, matched by path suffix
-/// relative to the repo root. Technical debt — split and remove from here.
-const KNOWN_OVERSIZED: &[&str] = &[
-    "src/mcp/handlers/ci/mod.rs",
-    "src/mcp/handlers/dispatch_hook/mod.rs",
+/// Pre-existing oversized handler implementations: `(path-suffix, ceiling)`
+/// where `ceiling` is the file's recorded LOC at grandfather time. Technical
+/// debt — each may SHRINK but must not grow past its ceiling (can-shrink-not-
+/// grow), and must be removed once split back under `MAX_LOC`.
+const KNOWN_OVERSIZED: &[(&str, usize)] = &[
+    ("src/mcp/handlers/ci/mod.rs", 1441),
+    ("src/mcp/handlers/dispatch_hook/mod.rs", 1575),
 ];
 
 /// Recursively collect every `*.rs` file under `dir`.
@@ -81,7 +86,7 @@ fn mcp_handler_files_under_max_loc() {
         if file_name.contains("test") || SKIP_FILES.contains(&file_name) {
             continue;
         }
-        if KNOWN_OVERSIZED.iter().any(|s| path_ends_with(path, s)) {
+        if KNOWN_OVERSIZED.iter().any(|(s, _)| path_ends_with(path, s)) {
             continue;
         }
         let loc = loc_of(path);
@@ -97,11 +102,14 @@ fn mcp_handler_files_under_max_loc() {
         violations.join("\n")
     );
 
-    // Keep the grandfather list honest: every KNOWN_OVERSIZED entry must
-    // still exist AND still be over the limit. Once a file is split back
-    // under MAX_LOC, this fails until the entry is removed — preventing the
-    // list from quietly masking a newly-regrown file under an old name.
-    for known in KNOWN_OVERSIZED {
+    // Keep the grandfather list honest AND ratcheted. Each entry records the
+    // file's LOC at grandfather time as a CEILING. Every entry must:
+    //   1. still exist (else remove it),
+    //   2. still be over MAX_LOC (else it was split — remove it so the guard
+    //      re-arms via the main scan above), and
+    //   3. be <= its recorded ceiling (can-shrink-not-grow — a regrown file
+    //      fails here; do NOT raise the number to make it pass).
+    for (known, ceiling) in KNOWN_OVERSIZED {
         let path = Path::new(known);
         assert!(
             path.exists(),
@@ -112,6 +120,12 @@ fn mcp_handler_files_under_max_loc() {
             loc > MAX_LOC,
             "KNOWN_OVERSIZED entry {known} is now {loc} LOC (<= {MAX_LOC}) — it has \
              been split; remove it from KNOWN_OVERSIZED so the guard re-arms for it"
+        );
+        assert!(
+            loc <= *ceiling,
+            "KNOWN_OVERSIZED entry {known} grew from {ceiling} to {loc} LOC — \
+             grandfathered files may shrink but must not grow past their ceiling. \
+             Split it back down; do NOT raise the recorded ceiling."
         );
     }
 }
