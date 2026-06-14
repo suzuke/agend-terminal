@@ -71,15 +71,17 @@ const MODULE_SCOPE: &[&str] = &[
     "mcp/handlers/ci/mod.rs",
     "daemon/auto_release.rs",
     "daemon/retention/worktrees.rs",
-    // W1.2 worktree slice (final substantive W1.2): per-site judgement on
-    // worktree.rs's 11 production sites. Migrated the simple LOCAL ops —
-    // has_commits/empty-commit (→git_ok), branch --show-current (→git_cmd),
-    // branch -D (→git_ok), checkout_branch switch×2 (→git_cmd), prune (→git_cmd,
-    // 3-way map + LOCAL_GIT_TIMEOUT bound). Kept raw via git-raw-allowed (4 sites,
-    // byte-identical-conservative): the two `worktree add` (nested stderr-substring
-    // fallback dispatch), has_uncommitted_changes (porcelain emptiness + fail-closed
-    // WIP guard), remove_worktree (two contracted spawn-vs-non-zero Err strings).
-    // worktree lifecycle stays byte-identical.
+    // W1.2 worktree slice + #2128: worktree.rs is now FULLY migrated — ZERO
+    // production raw `Command::new("git")`. #2126 did the simple LOCAL ops
+    // (has_commits/empty-commit→git_ok, branch --show-current→git_cmd, branch -D→
+    // git_ok, checkout_branch switch×2→git_cmd, prune→git_cmd). #2128 migrated the
+    // last 4 (the prior git-raw-allowed KEEP set), all gaining the LOCAL_GIT_TIMEOUT
+    // bound: the two `worktree add` (nested stderr-substring fallback dispatch via
+    // Err(NonZero{stderr}), byte-identical), has_uncommitted_changes (→git_cmd
+    // .map().unwrap_or(true), fail-closed preserved), remove_worktree (→git_cmd, two
+    // contracted spawn-vs-non-zero Err strings preserved). worktree lifecycle stays
+    // byte-identical (non-wedge); the only behavioural change is the 60s timeout
+    // bound replacing an unbounded index.lock hang.
     "worktree.rs",
 ];
 

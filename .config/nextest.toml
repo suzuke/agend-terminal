@@ -32,7 +32,9 @@ final-status-level = "slow"
 # The filter has two parts (reviewer-2 #1896: cover the FULL real-git set, but
 # don't drag pure-logic tests into max-threads=1):
 #  1. anchored MODULE prefixes — modules that are predominantly real-git/worktree
-#     /subprocess: worktree_pool, admin (worktree + cleanup_zombies process spawn),
+#     /subprocess: worktree (src/worktree.rs lifecycle tests build real worktrees
+#     via the #2128 bounded-git_cmd add path), worktree_pool, admin (worktree +
+#     cleanup_zombies process spawn),
 #     mcp::handlers::{ci,dispatch_hook,force_release,worktree,p0b_tests},
 #     daemon::{retention::worktrees,pr_state,auto_release,conflict_notify,
 #     per_tick::tmp_review_gc}, bootstrap::{agent_resolve,canonical_hygiene}.
@@ -56,11 +58,11 @@ test-group = 'git-subprocess'
 slow-timeout = { period = "120s", terminate-after = 3 }
 
 [[profile.ci.overrides]]
-filter = 'test(/(^(worktree_pool|admin|mcp::handlers::(ci|dispatch_hook|force_release|worktree|p0b_tests)|daemon::(retention::worktrees|pr_state|auto_release|conflict_notify|per_tick::tmp_review_gc)|bootstrap::(agent_resolve|canonical_hygiene))::|checkout_repo_|dispatch_branch_skips_metadata_stub|send_with_branch_checkout_failure|task_done_cleans_post_lease|closes_markers_extract_cleanly_from_actual_main|resolve_sweep_boards_pairs_each_project_with_its_own_repo_2117_p2)/)'
+filter = 'test(/(^(worktree|worktree_pool|admin|mcp::handlers::(ci|dispatch_hook|force_release|worktree|p0b_tests)|daemon::(retention::worktrees|pr_state|auto_release|conflict_notify|per_tick::tmp_review_gc)|bootstrap::(agent_resolve|canonical_hygiene))::|checkout_repo_|dispatch_branch_skips_metadata_stub|send_with_branch_checkout_failure|task_done_cleans_post_lease|closes_markers_extract_cleanly_from_actual_main|resolve_sweep_boards_pairs_each_project_with_its_own_repo_2117_p2)/)'
 test-group = 'git-subprocess'
 
 # Local `default` profile has no terminate-after, so no false-kill risk — just
 # serialize the same cluster for parity with CI.
 [[profile.default.overrides]]
-filter = 'test(/(^(worktree_pool|admin|mcp::handlers::(ci|dispatch_hook|force_release|worktree|p0b_tests)|daemon::(retention::worktrees|pr_state|auto_release|conflict_notify|per_tick::tmp_review_gc)|bootstrap::(agent_resolve|canonical_hygiene))::|checkout_repo_|dispatch_branch_skips_metadata_stub|send_with_branch_checkout_failure|task_done_cleans_post_lease|closes_markers_extract_cleanly_from_actual_main|resolve_sweep_boards_pairs_each_project_with_its_own_repo_2117_p2)/)'
+filter = 'test(/(^(worktree|worktree_pool|admin|mcp::handlers::(ci|dispatch_hook|force_release|worktree|p0b_tests)|daemon::(retention::worktrees|pr_state|auto_release|conflict_notify|per_tick::tmp_review_gc)|bootstrap::(agent_resolve|canonical_hygiene))::|checkout_repo_|dispatch_branch_skips_metadata_stub|send_with_branch_checkout_failure|task_done_cleans_post_lease|closes_markers_extract_cleanly_from_actual_main|resolve_sweep_boards_pairs_each_project_with_its_own_repo_2117_p2)/)'
 test-group = 'git-subprocess'

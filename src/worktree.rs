@@ -207,29 +207,27 @@ pub fn create(
         let _ = std::fs::create_dir_all(parent);
     }
 
-    // Try creating worktree: first with -b (new branch), fallback without -b (existing branch)
-    // git-raw-allowed: byte-identical conservative. The Ok(non-zero) arm dispatches
-    // on stderr substrings ("already exists" / "is already checked out") into a
-    // NESTED -b → fallback control flow (see the long comment below). git_cmd's
-    // Err(NonZero { stderr, .. }) carries the (trimmed) stderr too, so a migration
-    // is *possible* — but it requires restructuring this load-bearing
-    // worktree-creation match. Kept raw to avoid churn on the lifecycle-critical add
-    // path. TODO(#W1.2-followup): migrate for the LOCAL_GIT_TIMEOUT bound once the
-    // nested control flow is refactored.
-    let output = std::process::Command::new("git")
-        .env("AGEND_GIT_BYPASS", "1")
-        .args([
+    // Try creating worktree: first with -b (new branch), fallback without -b (existing branch).
+    // #2128: both attempts route through the bounded `git_cmd` (AGEND_GIT_BYPASS +
+    // LOCAL_GIT_TIMEOUT + process-group-kill) so a `worktree add` wedged on
+    // `.git/index.lock` contention fails in 60s instead of hanging forever. The
+    // nested stderr-substring dispatch ("already exists" / "is already checked out")
+    // is byte-identical on `git_cmd`'s `Err(NonZero { stderr, .. })`: its stderr is
+    // `.trim()`ed but the interior substring survives trim. The ONLY behavioural
+    // change is the timeout bound — a wedged add surfaces as `Err(Spawn(TimedOut))`
+    // → the lock-contention warn below (DP2; see #2128 / #1897).
+    use crate::git_helpers::{git_cmd, GitError};
+    match git_cmd(
+        repo_dir,
+        &[
             "worktree",
             "add",
             "-b",
             &branch,
             &wt_dir.display().to_string(),
-        ])
-        .current_dir(repo_dir)
-        .output();
-
-    match output {
-        Ok(o) if o.status.success() => {
+        ],
+    ) {
+        Ok(_) => {
             tracing::info!(
                 instance = instance_name,
                 path = %wt_dir.display(),
@@ -251,79 +249,79 @@ pub fn create(
                 branch,
             })
         }
-        Ok(o) => {
-            let stderr = String::from_utf8_lossy(&o.stderr);
-            // #781 Piece 2 (Bug B): the prior `o.status.code() == Some(128)`
-            // gate was too strict. `git worktree add -b <existing-branch>`
-            // can exit with code 255 (not 128) when the failure happens
-            // after the "Preparing worktree (new branch …)" progress line
-            // has already been emitted to stderr — observed in macOS git
-            // 2.42+ in the #781 spike (raw capture: exit 255, stderr
-            // "fatal: a branch named '…' already exists"). Exit codes
-            // from `git worktree add` are not contracted in any released
-            // git manpage we could find; the stderr substring is the
-            // load-bearing semantic signal. Rely on it alone.
-            //
-            // Reasoning: across git versions / locales the stderr
-            // wording stays stable (English) for the duplicate-branch
-            // case ("already exists") and the cross-worktree-checkout
-            // case ("is already checked out"); the exit code drift is
-            // version-specific. Adding more codes to the allow-list
-            // would just chase the next git release — the substring
-            // check is what we actually want.
-            if stderr.contains("already exists") || stderr.contains("is already checked out") {
-                // git-raw-allowed: existing-branch fallback in the same nested
-                // stderr-dispatched worktree-add control flow as the primary add
-                // above; kept raw for the same byte-identical-conservative reason
-                // (migratable via git_cmd after the same refactor — see above).
-                let output2 = std::process::Command::new("git")
-                    .env("AGEND_GIT_BYPASS", "1")
-                    .args(["worktree", "add", &wt_dir.display().to_string(), &branch])
-                    .current_dir(repo_dir)
-                    .output();
-                match output2 {
-                    Ok(o2) if o2.status.success() => {
-                        tracing::info!(
-                            instance = instance_name,
-                            %branch,
-                            "created worktree on existing branch"
-                        );
-                        // #1137: write marker immediately (same as primary path above).
-                        let _ = std::fs::write(
-                            wt_dir.join(".agend-managed"),
-                            format!(
-                                "agent={instance_name}\nbranch={branch}\nleased_at={}\n",
-                                chrono::Utc::now().to_rfc3339()
-                            ),
-                        );
-                        Some(WorktreeInfo {
-                            path: wt_dir,
-                            source_repo: repo_dir.to_path_buf(),
-                            branch,
-                        })
-                    }
-                    Ok(o2) => {
-                        tracing::warn!(
-                            instance = instance_name,
-                            error = %String::from_utf8_lossy(&o2.stderr).trim(),
-                            "worktree creation failed"
-                        );
-                        None
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "git not available");
-                        None
-                    }
+        // #781 Piece 2 (Bug B): the prior `o.status.code() == Some(128)` gate was
+        // too strict. `git worktree add -b <existing-branch>` can exit 255 (not 128)
+        // when the failure surfaces after the "Preparing worktree (new branch …)"
+        // progress line (macOS git 2.42+, #781 spike: exit 255, stderr "fatal: a
+        // branch named '…' already exists"). Exit codes from `worktree add` are not
+        // contracted in any released git manpage; the stderr substring is the
+        // load-bearing semantic signal — dispatch on it alone. Across git versions /
+        // locales the wording stays stable (English) for the duplicate-branch
+        // ("already exists") and cross-worktree-checkout ("is already checked out")
+        // cases; the exit-code drift is version-specific.
+        Err(GitError::NonZero { stderr, .. })
+            if stderr.contains("already exists") || stderr.contains("is already checked out") =>
+        {
+            // Existing-branch fallback (no -b): same bounded `git_cmd`.
+            match git_cmd(
+                repo_dir,
+                &["worktree", "add", &wt_dir.display().to_string(), &branch],
+            ) {
+                Ok(_) => {
+                    tracing::info!(
+                        instance = instance_name,
+                        %branch,
+                        "created worktree on existing branch"
+                    );
+                    // #1137: write marker immediately (same as primary path above).
+                    let _ = std::fs::write(
+                        wt_dir.join(".agend-managed"),
+                        format!(
+                            "agent={instance_name}\nbranch={branch}\nleased_at={}\n",
+                            chrono::Utc::now().to_rfc3339()
+                        ),
+                    );
+                    Some(WorktreeInfo {
+                        path: wt_dir,
+                        source_repo: repo_dir.to_path_buf(),
+                        branch,
+                    })
                 }
-            } else {
-                tracing::warn!(instance = instance_name, error = %stderr.trim(), "worktree creation failed");
-                None
+                Err(GitError::NonZero { stderr, .. }) => {
+                    tracing::warn!(
+                        instance = instance_name,
+                        error = %stderr,
+                        "worktree creation failed"
+                    );
+                    None
+                }
+                Err(GitError::Spawn(e)) => {
+                    warn_worktree_add_spawn_err(&e);
+                    None
+                }
             }
         }
-        Err(e) => {
-            tracing::warn!(error = %e, "git not available");
+        Err(GitError::NonZero { stderr, .. }) => {
+            tracing::warn!(instance = instance_name, error = %stderr, "worktree creation failed");
             None
         }
+        Err(GitError::Spawn(e)) => {
+            warn_worktree_add_spawn_err(&e);
+            None
+        }
+    }
+}
+
+/// #2128 DP2: log a `git worktree add` spawn error, distinguishing a
+/// `LOCAL_GIT_TIMEOUT` wedge (index.lock contention — the hang this migration
+/// bounds) from git genuinely missing, so a 60s-timed-out add is observable in
+/// logs instead of looking like an anonymous "git not available". Non-timeout
+/// spawn failures keep the prior "git not available" wording (byte-identical).
+fn warn_worktree_add_spawn_err(e: &std::io::Error) {
+    if e.kind() == std::io::ErrorKind::TimedOut {
+        tracing::warn!(error = %e, "worktree add timed out (lock contention?)");
+    } else {
+        tracing::warn!(error = %e, "git not available");
     }
 }
 
@@ -422,22 +420,17 @@ pub fn prune(repo_dir: &Path) {
 /// Check if a worktree directory has uncommitted changes.
 /// Returns true if `git status --porcelain` produces non-empty output.
 pub fn has_uncommitted_changes(worktree_dir: &Path) -> bool {
-    // git-raw-allowed: byte-identical conservative. This porcelain `status`
-    // emptiness check gates safety-critical WIP protection (lease-conflict
-    // reattach) and is fail-closed (`Err => true`). A git_cmd form
-    // (`.map(|s| !s.is_empty()).unwrap_or(true)`) WOULD be byte-identical here —
-    // trimming can't turn non-empty porcelain output empty — but it routes a
-    // normally-exit-0 command through the non-zero/spawn error mapping. Kept raw on
-    // the raw `o.stdout` bytes to keep this lifecycle WIP guard maximally explicit.
-    let output = std::process::Command::new("git")
-        .env("AGEND_GIT_BYPASS", "1")
-        .args(["status", "--porcelain"])
-        .current_dir(worktree_dir)
-        .output();
-    match output {
-        Ok(o) => !o.stdout.is_empty(),
-        Err(_) => true, // fail-closed: assume dirty if we can't check
-    }
+    // #2128: bounded `git_cmd` (AGEND_GIT_BYPASS + LOCAL_GIT_TIMEOUT) so this
+    // safety-critical WIP guard (lease-conflict reattach) can't wedge on a
+    // contended `.git/index.lock`. Fail-closed (`Err => true`) is preserved AND
+    // strengthened: a spawn failure OR a 60s timeout → assume dirty (don't risk
+    // discarding WIP). Byte-identical for a present worktree — porcelain `status`
+    // exits 0 there, and trimming can't turn non-empty porcelain output empty (a
+    // theoretical non-zero exit, unreachable for a valid worktree, now also maps to
+    // fail-closed `true` rather than the prior raw-bytes `false`).
+    crate::git_helpers::git_cmd(worktree_dir, &["status", "--porcelain"])
+        .map(|s| !s.is_empty())
+        .unwrap_or(true)
 }
 
 /// Remove a worktree and its tracking branch. Returns Ok(()) on success,
@@ -459,25 +452,29 @@ pub fn remove_worktree(
     if !wt_dir.exists() {
         return Ok(()); // already gone
     }
-    // git worktree remove --force <path>
-    // git-raw-allowed: byte-identical conservative. This remove returns two DISTINCT
-    // contracted Err strings — "git worktree remove failed: {e}" for a spawn failure
-    // vs "git worktree remove: {stderr}" for a non-zero exit. git_cmd's
-    // Err(Spawn)/Err(NonZero{stderr}) map onto both, so migration is *possible* — but
-    // git_cmd is bounded, so a (newly) timed-out remove would surface inside the
-    // "...failed: {e}" spawn string that the raw unbounded `.output()` never produces.
-    // Kept raw to hold both contracted messages on the lifecycle-critical remove path
-    // exactly. TODO(#W1.2-followup): migrate for the LOCAL_GIT_TIMEOUT bound.
-    let output = std::process::Command::new("git")
-        .env("AGEND_GIT_BYPASS", "1")
-        .args(["worktree", "remove", "--force"])
-        .arg(&wt_dir)
-        .current_dir(repo_dir)
-        .output()
-        .map_err(|e| format!("git worktree remove failed: {e}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("git worktree remove: {}", stderr.trim()));
+    // #2128: bounded `git_cmd` (AGEND_GIT_BYPASS + LOCAL_GIT_TIMEOUT +
+    // process-group-kill) so a `worktree remove` wedged on `.git/index.lock`
+    // contention fails in 60s instead of hanging. The two DISTINCT contracted Err
+    // strings are preserved: `Err(Spawn)` → "git worktree remove failed: {e}",
+    // `Err(NonZero{stderr})` → "git worktree remove: {stderr}". git_cmd's
+    // NonZero.stderr is already trimmed (matches the prior `stderr.trim()`); a 60s
+    // timeout surfaces as `Err(Spawn)` whose `{e}` carries "timed out after 60s" —
+    // the remove-side timeout signal, for free (DP2).
+    use crate::git_helpers::{git_cmd, GitError};
+    match git_cmd(
+        repo_dir,
+        &[
+            "worktree",
+            "remove",
+            "--force",
+            &wt_dir.display().to_string(),
+        ],
+    ) {
+        Ok(_) => {}
+        Err(GitError::Spawn(e)) => return Err(format!("git worktree remove failed: {e}")),
+        Err(GitError::NonZero { stderr, .. }) => {
+            return Err(format!("git worktree remove: {stderr}"))
+        }
     }
     // Delete tracking branch agend/<agent> (legacy default-branch shape).
     // Custom branches are not auto-deleted — operator workflow.
