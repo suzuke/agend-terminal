@@ -1385,6 +1385,59 @@ teams:
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #2117 P3a: a subtask (`parent_id` = composition, "A is composed of B/C/D")
+/// MUST live in its parent's project — the DP4 board-isolation invariant.
+/// `handle_create` rejects a cross-project `parent_id` fail-closed, so
+/// `cascade_cancel_children` (same-board replay) can never silently orphan a
+/// cross-project child on parent cancel. Same-project composition is allowed.
+/// (`depends_on` — execution-order dependency, a cross-board *reference* the epic
+/// allows — is deliberately NOT guarded here.)
+#[test]
+fn cross_project_parent_id_rejected_at_create_2117_p3a() {
+    let home = tmp_home("p3a-parent-id-guard");
+
+    let parent = handle(
+        &home,
+        "dev",
+        &serde_json::json!({"action": "create", "title": "parent", "project": "orgA/projA"}),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Cross-project subtask → rejected (fail-closed).
+    let bad = handle(
+        &home,
+        "dev",
+        &serde_json::json!({"action": "create", "title": "child", "project": "orgB/projB", "parent_id": parent}),
+    );
+    assert!(
+        bad["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("cross-project parent_id"),
+        "cross-project parent_id must be rejected: {bad}"
+    );
+    // And nothing was written to teamB's board.
+    assert!(
+        super::list_all_at(&crate::task_events::board_root(&home, "orgB/projB")).is_empty(),
+        "rejected subtask must not land on any board"
+    );
+
+    // Same-project subtask → allowed (control).
+    let ok = handle(
+        &home,
+        "dev",
+        &serde_json::json!({"action": "create", "title": "child2", "project": "orgA/projA", "parent_id": parent}),
+    );
+    assert!(
+        ok["id"].is_string(),
+        "same-project subtask must be allowed: {ok}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
 #[test]
 fn test_claim_unknown_instance_rejected() {
     let home = tmp_home("claim-unknown");
