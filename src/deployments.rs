@@ -204,10 +204,14 @@ fn create_instance_entries(
                 role,
                 instructions: yaml_str(inst_val, "instructions"),
                 source_repo,
-                repo: None,
-                // #2104 (cheerc): read from the template stanza (was hardcoded
-                // None → deployed fleet lost github_login → task_sweep D002
-                // false-fired). Mirrors the other yaml_str-read fields above.
+                // #2104 (cheerc): both operator-controlled override fields were
+                // hardcoded None here → templates that set them were silently
+                // dropped. `repo` = explicit owner/name override (else daemon
+                // derives from source_repo); github_login feeds task_sweep's
+                // authorship gate (its absence false-fired D002). Read from the
+                // template stanza like the sibling yaml_str fields above; a
+                // template that omits them still yields None (unchanged).
+                repo: yaml_str(inst_val, "repo"),
                 github_login: yaml_str(inst_val, "github_login"),
                 args: template_args,
                 model: yaml_str(inst_val, "model"),
@@ -968,11 +972,14 @@ templates:
     }
 
     /// #2104 (cheerc): template deployment must carry the template instance's
-    /// `github_login` into the deployed instance — previously hardcoded `None`
-    /// (deployments.rs:208), so a deployed fleet had NO github_login mapping and
-    /// `task_sweep` D002 fired even when the operator set it in the template.
+    /// operator-controlled override fields — `github_login` AND `repo` — into the
+    /// deployed instance. Both were hardcoded `None` at the same site
+    /// (`create_instance_entries`), so a deployed fleet had NO github_login
+    /// mapping (→ `task_sweep` D002 false-fired) and lost any explicit `repo`
+    /// owner/name override (→ daemon fell back to source_repo derivation, wrong
+    /// for non-GitHub remotes / fork disambiguation).
     #[test]
-    fn deploy_persists_github_login_into_fleet_yaml() {
+    fn deploy_persists_github_login_and_repo_into_fleet_yaml() {
         let home = tmp_home("github_login_persist");
         let yaml = r#"
 templates:
@@ -981,6 +988,7 @@ templates:
       impl:
         backend: claude
         github_login: cheerc
+        repo: cheerc/talented-payroll
 "#;
         std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
 
@@ -989,13 +997,16 @@ templates:
 
         let reloaded =
             crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+        let inst = reloaded.instances.get("dev-impl").expect("dev-impl");
         assert_eq!(
-            reloaded
-                .instances
-                .get("dev-impl")
-                .and_then(|i| i.github_login.as_deref()),
+            inst.github_login.as_deref(),
             Some("cheerc"),
             "deployed instance must carry the template's github_login (D002 false-fire root cause)"
+        );
+        assert_eq!(
+            inst.repo.as_deref(),
+            Some("cheerc/talented-payroll"),
+            "deployed instance must carry the template's explicit repo owner/name override"
         );
         std::fs::remove_dir_all(&home).ok();
     }
