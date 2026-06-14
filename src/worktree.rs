@@ -208,11 +208,14 @@ pub fn create(
     }
 
     // Try creating worktree: first with -b (new branch), fallback without -b (existing branch)
-    // git-raw-allowed: the Ok(non-zero) arm dispatches on raw stderr substrings
-    // ("already exists" / "is already checked out") to choose the fallback path —
-    // load-bearing worktree-creation semantics (see the long comment below). This
-    // needs the raw stderr in control flow, so git_cmd/git_ok do not fit. Kept raw
-    // with the explicit bypass env; this is the byte-identical-critical add path.
+    // git-raw-allowed: byte-identical conservative. The Ok(non-zero) arm dispatches
+    // on stderr substrings ("already exists" / "is already checked out") into a
+    // NESTED -b → fallback control flow (see the long comment below). git_cmd's
+    // Err(NonZero { stderr, .. }) carries the (trimmed) stderr too, so a migration
+    // is *possible* — but it requires restructuring this load-bearing
+    // worktree-creation match. Kept raw to avoid churn on the lifecycle-critical add
+    // path. TODO(#W1.2-followup): migrate for the LOCAL_GIT_TIMEOUT bound once the
+    // nested control flow is refactored.
     let output = std::process::Command::new("git")
         .env("AGEND_GIT_BYPASS", "1")
         .args([
@@ -269,8 +272,10 @@ pub fn create(
             // would just chase the next git release — the substring
             // check is what we actually want.
             if stderr.contains("already exists") || stderr.contains("is already checked out") {
-                // git-raw-allowed: existing-branch fallback in the same stderr-dispatched
-                // worktree-add chain as the primary add above; kept raw for the same reason.
+                // git-raw-allowed: existing-branch fallback in the same nested
+                // stderr-dispatched worktree-add control flow as the primary add
+                // above; kept raw for the same byte-identical-conservative reason
+                // (migratable via git_cmd after the same refactor — see above).
                 let output2 = std::process::Command::new("git")
                     .env("AGEND_GIT_BYPASS", "1")
                     .args(["worktree", "add", &wt_dir.display().to_string(), &branch])
@@ -391,25 +396,24 @@ pub fn prune(repo_dir: &Path) {
     if !is_git_repo(repo_dir) {
         return;
     }
-    // git-raw-allowed: worktree-lifecycle prune whose 3-way result drives distinct
-    // diagnostics — the Ok(non-zero) arm only warns when the raw stderr is
-    // non-empty. Kept raw (with bypass env) to preserve the exact prune semantics.
-    let output = std::process::Command::new("git")
-        .env("AGEND_GIT_BYPASS", "1")
-        .args(["worktree", "prune"])
-        .current_dir(repo_dir)
-        .output();
-    match output {
-        Ok(o) if o.status.success() => {
+    // W1.2: LOCAL prune via git_cmd. The prior 3-way match maps exactly onto
+    // git_cmd's Ok / Err(NonZero) / Err(Spawn): Ok(success)→info; Ok(non-zero) with
+    // non-empty stderr→warn (git_cmd's NonZero.stderr is already trimmed, matching
+    // the prior `stderr.trim()`); spawn-failure→warn. Migrating also adds the
+    // LOCAL_GIT_TIMEOUT bound — prune can wedge on a contended `.git/index.lock`,
+    // so the 60s bound is a real reliability win (a wedged timeout surfaces in the
+    // Err(Spawn) arm as the same "git worktree prune failed" warn).
+    use crate::git_helpers::{git_cmd, GitError};
+    match git_cmd(repo_dir, &["worktree", "prune"]) {
+        Ok(_) => {
             tracing::info!(repo = %repo_dir.display(), "pruned stale worktree entries");
         }
-        Ok(o) => {
-            let stderr = String::from_utf8_lossy(&o.stderr);
-            if !stderr.trim().is_empty() {
-                tracing::warn!(warning = %stderr.trim(), "worktree prune warning");
+        Err(GitError::NonZero { stderr, .. }) => {
+            if !stderr.is_empty() {
+                tracing::warn!(warning = %stderr, "worktree prune warning");
             }
         }
-        Err(e) => {
+        Err(GitError::Spawn(e)) => {
             tracing::warn!(repo = %repo_dir.display(), error = %e, "git worktree prune failed");
         }
     }
@@ -418,10 +422,13 @@ pub fn prune(repo_dir: &Path) {
 /// Check if a worktree directory has uncommitted changes.
 /// Returns true if `git status --porcelain` produces non-empty output.
 pub fn has_uncommitted_changes(worktree_dir: &Path) -> bool {
-    // git-raw-allowed: porcelain `status` whose emptiness gates safety-critical WIP
-    // protection (lease-conflict reattach). The check is on raw `o.stdout` bytes and
-    // is fail-closed (`Err => true`); git_cmd would trim and restructure errors, so
-    // it stays raw to keep the worktree-lifecycle guard byte-identical.
+    // git-raw-allowed: byte-identical conservative. This porcelain `status`
+    // emptiness check gates safety-critical WIP protection (lease-conflict
+    // reattach) and is fail-closed (`Err => true`). A git_cmd form
+    // (`.map(|s| !s.is_empty()).unwrap_or(true)`) WOULD be byte-identical here —
+    // trimming can't turn non-empty porcelain output empty — but it routes a
+    // normally-exit-0 command through the non-zero/spawn error mapping. Kept raw on
+    // the raw `o.stdout` bytes to keep this lifecycle WIP guard maximally explicit.
     let output = std::process::Command::new("git")
         .env("AGEND_GIT_BYPASS", "1")
         .args(["status", "--porcelain"])
@@ -453,11 +460,14 @@ pub fn remove_worktree(
         return Ok(()); // already gone
     }
     // git worktree remove --force <path>
-    // git-raw-allowed: worktree-lifecycle remove whose non-zero stderr is returned
-    // structurally in the Err string (like ci/mod's remove). git_cmd's NonZero
-    // stderr is trimmed but the spawn-vs-nonzero error wording here is contracted
-    // ("git worktree remove failed: ..." vs "git worktree remove: ..."); kept raw
-    // to hold those messages + the byte-identical remove path exactly.
+    // git-raw-allowed: byte-identical conservative. This remove returns two DISTINCT
+    // contracted Err strings — "git worktree remove failed: {e}" for a spawn failure
+    // vs "git worktree remove: {stderr}" for a non-zero exit. git_cmd's
+    // Err(Spawn)/Err(NonZero{stderr}) map onto both, so migration is *possible* — but
+    // git_cmd is bounded, so a (newly) timed-out remove would surface inside the
+    // "...failed: {e}" spawn string that the raw unbounded `.output()` never produces.
+    // Kept raw to hold both contracted messages on the lifecycle-critical remove path
+    // exactly. TODO(#W1.2-followup): migrate for the LOCAL_GIT_TIMEOUT bound.
     let output = std::process::Command::new("git")
         .env("AGEND_GIT_BYPASS", "1")
         .args(["worktree", "remove", "--force"])
