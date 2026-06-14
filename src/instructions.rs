@@ -123,6 +123,7 @@ pub(crate) fn sanitize_role_text(s: &str) -> String {
 pub(crate) fn build_instructions_body(
     ctx: Option<&AgentContext>,
     protocol_path: Option<&str>,
+    supports_subagents: bool,
 ) -> String {
     let mut content = String::new();
     content.push_str("# AgEnD — Multi-Agent Coordination\n\n");
@@ -339,6 +340,22 @@ pub(crate) fn build_instructions_body(
     content.push_str("- `mirror` (0 off / 1 mirror, default): the daemon auto-relays your clean text updates back to the origin channel — you still announce and narrate milestones; the daemon handles delivery.\n");
     content.push_str("- `report` (2): you own the updates; the daemon nudges you if an origin-channel turn runs long with no update.\n");
 
+    // #2090: subagent delegation for context hygiene — backend-aware. Codified
+    // here (committed) rather than left to convention (fleet protocol §12.7 /
+    // memory). Capability comes from Backend::supports_subagents().
+    content.push_str("\n## Delegating Long Tasks (context hygiene)\n\n");
+    if supports_subagents {
+        content.push_str("Your backend provides a subagent / Task tool. For work that will heavily consume your context, or that is an independent side-task (a scheduled/recurring report, a broad search, a self-contained build), prefer dispatching it to a subagent instead of doing it inline:\n");
+        content.push_str("- It keeps your own context short and focused on the user's primary task, so small recurring jobs don't crowd out or derail the main thread.\n");
+        content.push_str("- You retain only the subagent's conclusion, not its intermediate steps.\n");
+        content.push_str("- Scheduled / recurring prompts (e.g. hourly reports, periodic syncs) should in particular be handled by a subagent so they never interrupt or bloat your active work.\n");
+        content.push_str("- With `progress_mode` mirror, the daemon still relays the subagent's progress back to the origin channel automatically.\n");
+    } else {
+        content.push_str("Your backend does NOT provide a subagent / Task tool, so you cannot offload work to preserve context. Instead:\n");
+        content.push_str("- Do long or recurring work inline, but interleave brief progress updates (a short reply between steps) so the user is never left in silence and the main task is not interrupted.\n");
+        content.push_str("- When a task will heavily consume your context (where offloading WOULD have helped), tell the user explicitly that your backend has no subagent capability — so they know this agent can't shrink its context the way a Claude Code agent can, and can decide accordingly.\n");
+    }
+
     content
 }
 
@@ -426,7 +443,7 @@ fn generate_agent_instructions(working_dir: &Path, command: &str, ctx: Option<&A
     let home = crate::home_dir();
     let proto = crate::protocol::protocol_path(&home);
     let proto_str = proto.display().to_string();
-    let body = build_instructions_body(ctx, Some(&proto_str));
+    let body = build_instructions_body(ctx, Some(&proto_str), backend.supports_subagents());
 
     // Include fleet.yaml `instructions:` inside the managed block so
     // shared files (AGENTS.md) don't duplicate it on each refresh (#1405).
@@ -772,7 +789,7 @@ mod tests {
             team: None,
             extra_instructions: None,
         };
-        let body = build_instructions_body(Some(&ctx), None);
+        let body = build_instructions_body(Some(&ctx), None, true);
         // After sanitisation the name contains only [A-Za-z0-9_-]. All of
         // `\n`, `#`, space, and ` got stripped, so neither the injected
         // header nor a broken backtick span can appear.
@@ -799,7 +816,7 @@ mod tests {
             team: None,
             extra_instructions: None,
         };
-        let body = build_instructions_body(Some(&ctx), None);
+        let body = build_instructions_body(Some(&ctx), None, true);
         // Role value stays on one line — a newline would let attackers open
         // a new markdown block.
         let role_line = extract_role_line(&body).expect("role line present");
@@ -834,7 +851,7 @@ mod tests {
             team: None,
             extra_instructions: None,
         };
-        let body = build_instructions_body(Some(&ctx), None);
+        let body = build_instructions_body(Some(&ctx), None, true);
         // Structural marker — a new `\n## ` section — must not appear from
         // the Fleet Peers block.
         assert!(
@@ -889,7 +906,7 @@ mod tests {
             team: Some(&team),
             extra_instructions: None,
         };
-        let body = build_instructions_body(Some(&ctx), None);
+        let body = build_instructions_body(Some(&ctx), None, true);
 
         // Team section heading carries the team's name, not "Fleet Peers".
         assert!(
@@ -951,7 +968,7 @@ mod tests {
             team: Some(&team),
             extra_instructions: None,
         };
-        let body = build_instructions_body(Some(&ctx), None);
+        let body = build_instructions_body(Some(&ctx), None, true);
         assert!(
             body.contains("Orchestrator: `dev-lead`"),
             "non-orchestrator member must be pointed at the orchestrator: {body}"
@@ -972,7 +989,7 @@ mod tests {
             team: None,
             extra_instructions: None,
         };
-        let body = build_instructions_body(Some(&ctx), None);
+        let body = build_instructions_body(Some(&ctx), None, true);
         assert!(
             body.contains("## Fleet Peers"),
             "no team means fall back to original Fleet Peers heading: {body}"
@@ -997,7 +1014,7 @@ mod tests {
 
     #[test]
     fn instructions_include_protocol_path() {
-        let body = build_instructions_body(None, Some("/tmp/protocol/FLEET-DEV-PROTOCOL.md"));
+        let body = build_instructions_body(None, Some("/tmp/protocol/FLEET-DEV-PROTOCOL.md"), true);
         assert!(
             body.contains("/tmp/protocol/FLEET-DEV-PROTOCOL.md"),
             "instructions must include protocol path: {body}"
@@ -1012,7 +1029,7 @@ mod tests {
     fn test_instruction_includes_agend_msg_rule() {
         // build_instructions_body is shared by all 4 backends.
         // Verify the [AGEND-MSG] handling section is present.
-        let body = build_instructions_body(None, None);
+        let body = build_instructions_body(None, None, true);
         assert!(
             body.contains("[AGEND-MSG]"),
             "instructions must include [AGEND-MSG] header handling rule"
@@ -1036,7 +1053,7 @@ mod tests {
     fn test_instruction_includes_agend_auto_rule_1769() {
         // #1769: agents must be taught that an injected `[AGEND-AUTO]` line is a
         // daemon auto-nudge, NOT an operator command (the trust-model enforcement).
-        let body = build_instructions_body(None, None);
+        let body = build_instructions_body(None, None, true);
         assert!(
             body.contains("[AGEND-AUTO"),
             "instructions must include the [AGEND-AUTO] daemon-auto-inject rule"
@@ -1155,7 +1172,7 @@ mod tests {
     fn test_instruction_trigger_matches_header_prefix() {
         // Regression: locks the contract between S3-T1 (format_header) and
         // S3-T2 (instruction wording). If either side drifts, this breaks.
-        let body = build_instructions_body(None, None);
+        let body = build_instructions_body(None, None, true);
 
         // S3-T1 header always starts with ANSI prefix + [AGEND-MSG]
         let sample_msg = crate::inbox::InboxMessage {
@@ -1194,7 +1211,7 @@ mod tests {
 
     #[test]
     fn kind_aware_reply_obligation_in_prompt() {
-        let body = build_instructions_body(None, None);
+        let body = build_instructions_body(None, None, true);
         assert!(
             body.contains("Reply obligation depends on"),
             "prompt must contain kind-aware reply guidance"
@@ -1211,7 +1228,7 @@ mod tests {
 
     #[test]
     fn react_tool_mentioned_in_prompt() {
-        let body = build_instructions_body(None, None);
+        let body = build_instructions_body(None, None, true);
         assert!(
             body.contains("do not reply"),
             "prompt must mention ack-without-reply guidance"
@@ -1219,8 +1236,45 @@ mod tests {
     }
 
     #[test]
+    fn long_task_progress_directive_present() {
+        let body = build_instructions_body(None, None, true);
+        assert!(
+            body.contains("## Long-Task Progress Reporting"),
+            "prompt must carry the long-task progress directive"
+        );
+        assert!(
+            body.contains("progress_mode"),
+            "directive must mention the progress_mode toggle"
+        );
+    }
+
+    #[test]
+    fn subagent_delegation_directive_is_backend_aware() {
+        // Backend WITH subagents → tell the agent to offload heavy/scheduled work.
+        let with = build_instructions_body(None, None, true);
+        assert!(
+            with.contains("provides a subagent / Task tool"),
+            "subagent-capable backend should be told to delegate"
+        );
+        assert!(
+            with.contains("Scheduled / recurring prompts"),
+            "delegation directive should cover scheduled prompts"
+        );
+        // Backend WITHOUT subagents → tell the agent to self-insert + report.
+        let without = build_instructions_body(None, None, false);
+        assert!(
+            without.contains("does NOT provide a subagent"),
+            "subagent-less backend should be told it cannot offload"
+        );
+        assert!(
+            without.contains("tell the user explicitly that your backend has no subagent capability"),
+            "subagent-less backend must be told to report the limitation to the user"
+        );
+    }
+
+    #[test]
     fn busy_response_format_in_prompt() {
-        let body = build_instructions_body(None, None);
+        let body = build_instructions_body(None, None, true);
         assert!(
             body.contains("BUSY"),
             "prompt must contain BUSY response guidance"
@@ -1254,7 +1308,7 @@ mod tests {
             fleet_peers: &[],
             extra_instructions: None,
         };
-        let body = build_instructions_body(Some(&ctx), Some("/tmp/protocol.md"));
+        let body = build_instructions_body(Some(&ctx), Some("/tmp/protocol.md"), true);
         assert!(
             !body.contains("<fleet-update>"),
             "instructions must not contain <fleet-update> marker after Sprint 35 removal"

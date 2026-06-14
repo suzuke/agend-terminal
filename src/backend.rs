@@ -67,6 +67,18 @@ impl Backend {
         matches!(self, Backend::ClaudeCode)
     }
 
+    /// #2090: does this backend expose a subagent / sub-task mechanism an agent
+    /// can offload long or independent work to (preserving the main agent's
+    /// context + focus)? **claude-only in v1** — Claude Code's Task/Agent tool is
+    /// the one we rely on. Other backends (Codex, OpenCode, Agy, KiroCli) have no
+    /// equivalent the daemon wires today, so the injected instructions tell those
+    /// agents to interleave brief progress updates themselves AND to report to
+    /// the user that subagent offload isn't available on their backend. Flip a
+    /// variant here when a backend gains (and we wire) a real subagent tool.
+    pub fn supports_subagents(&self) -> bool {
+        matches!(self, Backend::ClaudeCode)
+    }
+
     /// #1440: credential env-var names this backend legitimately needs to
     /// authenticate to its LLM provider. Under `AGEND_ENV_ISOLATION`, only
     /// these (plus the base runtime allowlist + operator `passthrough_env`)
