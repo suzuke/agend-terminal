@@ -405,6 +405,11 @@ pub(super) fn emit_cancelled_batch(
         }
         "validation_leftovers"
     };
+    // Collect (id, category) so the `task_sweep_apply` audit lines are written
+    // only AFTER the cancel actually commits — the in-lock guard below can
+    // reject the batch, and an audit line for a cancel that never happened
+    // would mislead.
+    let mut audit: Vec<(String, &'static str)> = Vec::new();
     for id in confirm_ids {
         let category = lookup_category(id);
         events.push(TaskEvent::Cancelled {
@@ -412,18 +417,50 @@ pub(super) fn emit_cancelled_batch(
             by: emitter.clone(),
             reason: format!("sweep:{category}: {audit_reason}"),
         });
-        crate::event_log::log(
-            home,
-            "task_sweep_apply",
-            "system:task_sweep",
-            &format!("task={id} category={category} reason={audit_reason}"),
-        );
+        audit.push((id.clone(), category));
     }
     let count = events.len();
     if count == 0 {
         return Ok(0);
     }
-    crate::task_events::append_batch(home, &emitter, events)
-        .map(|_| count)
-        .map_err(|e| e.to_string())
+    // CR-2026-06-14 (row232): re-validate UNDER the append lock against FRESH
+    // committed state. The dry-run that produced `confirm_ids` is out-of-lock, so
+    // a task can race to a terminal state (Done/Cancelled) before apply. A bare
+    // `append_batch` would clobber that terminal status (replay does not re-guard
+    // transitions). Fail closed: if ANY confirmed task is no longer cancellable,
+    // reject the whole batch — the operator re-runs the sweep, whose dry-run
+    // re-scans and drops the now-terminal task. The closure only inspects the
+    // replayed state — no `api::call` under the lock (#1629).
+    let checked = crate::task_events::append_batch_checked(home, &emitter, events, |state| {
+        for id in confirm_ids {
+            if let Some(rec) = state.tasks.get(&TaskId(id.clone())) {
+                if !rec
+                    .status
+                    .can_transition_to(crate::task_events::TaskStatus::Cancelled)
+                {
+                    return Err(format!(
+                        "task '{id}' is no longer cancellable (now {}); sweep aborted to avoid \
+                         clobbering a terminal task — re-run the sweep",
+                        super::status_to_legacy_str(rec.status)
+                    ));
+                }
+            }
+        }
+        Ok(())
+    });
+    match checked {
+        Ok(Ok(_)) => {
+            for (id, category) in &audit {
+                crate::event_log::log(
+                    home,
+                    "task_sweep_apply",
+                    "system:task_sweep",
+                    &format!("task={id} category={category} reason={audit_reason}"),
+                );
+            }
+            Ok(count)
+        }
+        Ok(Err(reason)) => Err(reason),
+        Err(e) => Err(e.to_string()),
+    }
 }

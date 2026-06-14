@@ -3061,6 +3061,146 @@ fn test_sweep_apply_emits_cancelled_and_logs_audit() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+// ── CR-2026-06-14 row232 — sweep apply must not clobber a concurrently-Done
+//    task (the dry-run → apply window is a TOCTOU; the in-lock guard fails
+//    closed). ──
+
+/// RED pre-fix: a task confirmed during the out-of-lock dry-run that races to
+/// Done before apply is clobbered back to Cancelled by the bare `append_batch`.
+/// GREEN: the in-lock legality guard rejects the batch and the Done is preserved.
+#[test]
+fn sweep_apply_does_not_clobber_concurrently_done_task_row232() {
+    let home = tmp_home("sweep_row232_clobber");
+    write_fleet_yaml(&home, &["alive"]);
+    let r = handle(
+        &home,
+        "alive",
+        &serde_json::json!({"action":"create","title":"raced task","assignee":"alive"}),
+    );
+    let task_id = r["id"].as_str().expect("id").to_string();
+    // The task races to Done after the operator confirmed it for the sweep.
+    let upd = handle(
+        &home,
+        "alive",
+        &serde_json::json!({"action":"update","id":task_id,"status":"done"}),
+    );
+    assert!(upd.get("error").is_none(), "setup: mark done: {upd}");
+
+    let confirm: std::collections::HashSet<String> = [task_id.clone()].into_iter().collect();
+    let res = sweep::emit_cancelled_batch(
+        &home,
+        &sweep::Categories::default(),
+        &confirm,
+        "row232 clobber fixture",
+    );
+    assert!(
+        res.is_err(),
+        "apply must reject when a confirmed task raced to Done (no clobber)"
+    );
+    assert!(res.unwrap_err().contains("no longer cancellable"));
+
+    let after = list_all(&home)
+        .into_iter()
+        .find(|t| t.id == task_id)
+        .expect("task");
+    assert_eq!(
+        after.status,
+        crate::task_events::TaskStatus::Done,
+        "the concurrently-Done task must NOT be clobbered to Cancelled"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Control: a genuinely-stale, still-cancellable task is still cancelled (the
+/// guard must not over-reject).
+#[test]
+fn sweep_apply_still_cancels_genuinely_stale_task_row232() {
+    let home = tmp_home("sweep_row232_control");
+    write_fleet_yaml(&home, &["alive"]);
+    let r = handle(
+        &home,
+        "alive",
+        &serde_json::json!({"action":"create","title":"stale task","assignee":"alive"}),
+    );
+    let task_id = r["id"].as_str().expect("id").to_string();
+    let confirm: std::collections::HashSet<String> = [task_id.clone()].into_iter().collect();
+    let count = sweep::emit_cancelled_batch(
+        &home,
+        &sweep::Categories::default(),
+        &confirm,
+        "row232 control",
+    )
+    .expect("a still-cancellable task must be swept");
+    assert_eq!(count, 1);
+    let after = list_all(&home)
+        .into_iter()
+        .find(|t| t.id == task_id)
+        .expect("task");
+    assert_eq!(
+        after.status,
+        crate::task_events::TaskStatus::Cancelled,
+        "a genuinely-stale cancellable task must still be cancelled"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Fail-closed is atomic: a batch mixing a cancellable task with a raced-Done
+/// task aborts wholesale — neither is mutated (the operator re-runs the sweep).
+#[test]
+fn sweep_apply_mixed_batch_fails_closed_row232() {
+    let home = tmp_home("sweep_row232_mixed");
+    write_fleet_yaml(&home, &["alive"]);
+    let open_id = handle(
+        &home,
+        "alive",
+        &serde_json::json!({"action":"create","title":"open one","assignee":"alive"}),
+    )["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let done_id = handle(
+        &home,
+        "alive",
+        &serde_json::json!({"action":"create","title":"raced one","assignee":"alive"}),
+    )["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    handle(
+        &home,
+        "alive",
+        &serde_json::json!({"action":"update","id":done_id,"status":"done"}),
+    );
+
+    let confirm: std::collections::HashSet<String> =
+        [open_id.clone(), done_id.clone()].into_iter().collect();
+    let res = sweep::emit_cancelled_batch(
+        &home,
+        &sweep::Categories::default(),
+        &confirm,
+        "row232 mixed",
+    );
+    assert!(
+        res.is_err(),
+        "a batch containing a raced-Done task must fail closed (atomic)"
+    );
+
+    let listed = list_all(&home);
+    let open_after = listed.iter().find(|t| t.id == open_id).expect("open task");
+    let done_after = listed.iter().find(|t| t.id == done_id).expect("done task");
+    assert_eq!(
+        open_after.status,
+        crate::task_events::TaskStatus::Open,
+        "fail-closed: the open task is NOT cancelled (operator re-runs)"
+    );
+    assert_eq!(
+        done_after.status,
+        crate::task_events::TaskStatus::Done,
+        "the Done task is preserved"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 // ── #2061 stale_open category ──
 
 /// Create one Open task owned by a LIVE agent (so team_disbanded never fires)
