@@ -3,7 +3,7 @@ use std::path::Path;
 
 use super::acl::{can_mutate_record, instance_exists};
 use super::orphan::build_health_response;
-use super::{list_all, record_to_task, status_to_legacy_str, Task};
+use super::{record_to_task, status_to_legacy_str, Task};
 
 fn parse_due_at(args: &Value) -> Option<String> {
     let due = args["due_at"].as_str()?;
@@ -15,7 +15,18 @@ fn parse_due_at(args: &Value) -> Option<String> {
 /// `handle`'s mutation arms to validate `(prev_status, transition)`
 /// before emitting an event.
 pub(super) fn read_task_record(home: &Path, id: &str) -> Option<crate::task_events::TaskRecord> {
-    let state = crate::task_events::replay(home).ok()?;
+    // #2117 P1: home IS the default board root (`board_root(home, DEFAULT)`), so
+    // this is byte-identical; routed callers use `read_task_record_at` with the
+    // task's resolved board.
+    read_task_record_at(home, id)
+}
+
+/// #2117 P1: board-root variant of [`read_task_record`].
+pub(super) fn read_task_record_at(
+    board: &Path,
+    id: &str,
+) -> Option<crate::task_events::TaskRecord> {
+    let state = crate::task_events::replay_at(board).ok()?;
     state
         .tasks
         .get(&crate::task_events::TaskId(id.to_string()))
@@ -31,7 +42,7 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
 
     match action {
         "create" => handle_create(home, emitter, args),
-        "list" => handle_list(home, args),
+        "list" => handle_list(home, instance_name, args),
         "claim" => handle_claim(home, instance_name, emitter, args),
         "done" => handle_done(home, instance_name, emitter, args),
         "update" => handle_update(home, instance_name, emitter, args),
@@ -118,9 +129,19 @@ fn handle_create(home: &Path, emitter: crate::task_events::InstanceName, args: &
             .as_str()
             .map(|s| crate::task_events::TaskId(s.to_string())),
     };
-    match crate::task_events::append(home, &emitter, event) {
+    // #2117 P1: route create to the caller's current project board (or an
+    // explicit `project` arg override). Single-project → DEFAULT → board == home
+    // (byte-identical). Record the task→project mapping in the append-only index
+    // so later done/update/claim/activity resolve the board in O(1).
+    let project = args["project"]
+        .as_str()
+        .map(String::from)
+        .unwrap_or_else(|| super::board_router::resolve_current_project(home, emitter.as_str()));
+    let board = crate::task_events::board_root(home, &project);
+    match crate::task_events::append_at(&board, &emitter, event) {
         Ok(_) => {
-            let task = read_task_record(home, &id).map(|r| record_to_task(&r));
+            let _ = super::board_router::record_task_project(home, &id, &project);
+            let task = read_task_record_at(&board, &id).map(|r| record_to_task(&r));
             // #1496 Option 1: `task(action:create)` is a PURE board record
             // with ZERO dispatch side-effects — no inbox enqueue, no
             // dispatch_tracking, no PTY notify. Dispatch (notify + worktree
@@ -147,7 +168,7 @@ fn handle_create(home: &Path, emitter: crate::task_events::InstanceName, args: &
     }
 }
 
-fn handle_list(home: &Path, args: &Value) -> Value {
+fn handle_list(home: &Path, caller: &str, args: &Value) -> Value {
     // #2037 ①: accept the natural names as aliases of the filter_* params —
     // `status`/`assignee` are create/update params elsewhere, but on the
     // `list` action they can only mean filtering (three real mis-calls in
@@ -176,7 +197,33 @@ fn handle_list(home: &Path, args: &Value) -> Value {
     ];
     let now = chrono::Utc::now();
     let done_ttl = chrono::Duration::days(14);
-    let tasks = list_all(home);
+    // #2117 P1: choose the source board(s).
+    //   - `project=all` / `scope=fleet` → aggregate EVERY board (cross-board
+    //     view; each task tagged with its project id in the response).
+    //   - explicit `project=<id>` → that one board.
+    //   - default → the caller's current project board.
+    // Single-project resolves to DEFAULT → `board_root == home` → the source is
+    // exactly `list_all(home)` and the response is byte-identical.
+    let fleet_scope =
+        args["project"].as_str() == Some("all") || args["scope"].as_str() == Some("fleet");
+    let mut project_of: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let tasks: Vec<Task> = if fleet_scope {
+        let mut all = Vec::new();
+        for (project, ts) in super::board_router::list_all_boards(home) {
+            for t in &ts {
+                project_of.insert(t.id.clone(), project.clone());
+            }
+            all.extend(ts);
+        }
+        all
+    } else {
+        let project = args["project"]
+            .as_str()
+            .map(String::from)
+            .unwrap_or_else(|| super::board_router::resolve_current_project(home, caller));
+        super::list_all_at(&crate::task_events::board_root(home, &project))
+    };
     let mut filtered: Vec<Task> = tasks
         .iter()
         .filter(|t| filter_assignee.is_none_or(|a| t.assignee.as_deref() == Some(a)))
@@ -206,6 +253,25 @@ fn handle_list(home: &Path, args: &Value) -> Value {
     if let Some(n) = limit {
         filtered.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         filtered.truncate(n as usize);
+    }
+    // #2117 P1: the default/single-project response is byte-identical; the
+    // fleet aggregate additionally tags each task with its project id.
+    if fleet_scope {
+        let tagged: Vec<Value> = filtered
+            .iter()
+            .map(|t| {
+                let mut v = serde_json::to_value(t).unwrap_or(Value::Null);
+                if let (Some(obj), Some(p)) = (v.as_object_mut(), project_of.get(&t.id)) {
+                    obj.insert("project".to_string(), Value::String(p.clone()));
+                }
+                v
+            })
+            .collect();
+        return serde_json::json!({
+            "tasks": tagged,
+            "filtered_default": filtered_default,
+            "scope": "fleet",
+        });
     }
     serde_json::json!({
         "tasks": filtered,
@@ -246,7 +312,9 @@ fn handle_claim(
         task_id: crate::task_events::TaskId(id.clone()),
         by: crate::task_events::InstanceName(iname.clone()),
     };
-    let result = crate::task_events::append_checked(home, &emitter, event, |state| {
+    // #2117 P1: operate on the task's resolved board (default → home).
+    let board = super::board_router::board_for_task(home, &id);
+    let result = crate::task_events::append_checked_at(&board, &emitter, event, |state| {
         let mut tasks: Vec<Task> = state.tasks.values().map(record_to_task).collect();
         super::apply_dependency_eval_in_memory(&mut tasks);
         let tv = tasks
@@ -270,7 +338,7 @@ fn handle_claim(
             // ("claimed"), but the field is still the action
             // event name semantically — kept as alias for
             // shape consistency.
-            let task = read_task_record(home, &id).map(|r| record_to_task(&r));
+            let task = read_task_record_at(&board, &id).map(|r| record_to_task(&r));
             serde_json::json!({
                 "id": id,
                 "event": "claimed",
@@ -298,7 +366,9 @@ fn handle_done(
     };
     let result_text = args["result"].as_str().map(String::from);
     let caller = instance_name.to_string();
-    let record = match read_task_record(home, &id) {
+    // #2117 P1: operate on the task's resolved board (default → home).
+    let board = super::board_router::board_for_task(home, &id);
+    let record = match read_task_record_at(&board, &id) {
         Some(r) => r,
         None => return serde_json::json!({"error": format!("task '{id}' not found")}),
     };
@@ -387,7 +457,7 @@ fn handle_done(
     // replay's `apply_done` does NOT re-guard transitions — so this precondition
     // is the authoritative gate (mirrors `handle_claim`'s `append_checked`).
     let done_id = id.clone();
-    match crate::task_events::append_checked(home, &emitter, event, |state| {
+    match crate::task_events::append_checked_at(&board, &emitter, event, |state| {
         let tv = state
             .tasks
             .values()
@@ -445,7 +515,7 @@ fn handle_done(
             // work the task board already confirmed done.
             let _ = crate::daemon::dispatch_idle::cleanup_pending_for_task_id(home, &id);
             // #807 Item 1: see create arm note.
-            let task = read_task_record(home, &id).map(|r| record_to_task(&r));
+            let task = read_task_record_at(&board, &id).map(|r| record_to_task(&r));
             serde_json::json!({
                 "id": id,
                 "event": "done",
@@ -482,7 +552,9 @@ fn handle_update(
         None
     };
     let caller = instance_name.to_string();
-    let record = match read_task_record(home, &id) {
+    // #2117 P1: operate on the task's resolved board (default → home).
+    let board = super::board_router::board_for_task(home, &id);
+    let record = match read_task_record_at(&board, &id) {
         Some(r) => r,
         None => return serde_json::json!({"error": format!("task '{id}' not found")}),
     };
@@ -707,8 +779,11 @@ fn handle_update(
         let target_status = new_status
             .as_deref()
             .and_then(crate::task_events::TaskStatus::from_str);
-        let checked =
-            crate::task_events::append_batch_checked(home, &emitter, pending_events, |state| {
+        let checked = crate::task_events::append_batch_checked_at(
+            &board,
+            &emitter,
+            pending_events,
+            |state| {
                 if let Some(target) = target_status {
                     let tv = state
                         .tasks
@@ -725,7 +800,8 @@ fn handle_update(
                     }
                 }
                 Ok(())
-            });
+            },
+        );
         match checked {
             Ok(Ok(_)) => {}
             Ok(Err(reason)) => {
@@ -744,7 +820,7 @@ fn handle_update(
                 let _ = crate::daemon::dispatch_idle::cleanup_pending_for_task_id(home, &id);
             }
             if s == "cancelled" {
-                cascade_cancel_children(home, &id, &emitter);
+                cascade_cancel_children(home, &board, &id, &emitter);
             }
         }
         // #1916: a reassign (OwnerAssigned with a new owner) must retarget the
@@ -765,7 +841,7 @@ fn handle_update(
         }
     }
     // #807 Item 1: see create arm note.
-    let task = read_task_record(home, &id).map(|r| record_to_task(&r));
+    let task = read_task_record_at(&board, &id).map(|r| record_to_task(&r));
     serde_json::json!({
         "id": id,
         "event": "updated",
@@ -913,7 +989,9 @@ fn handle_metadata_set(
     } else {
         return serde_json::json!({"error": "missing 'metadata_value'"});
     };
-    let record = match read_task_record(home, id) {
+    // #2117 P1: operate on the task's resolved board (default → home).
+    let board = super::board_router::board_for_task(home, id);
+    let record = match read_task_record_at(&board, id) {
         Some(r) => r,
         None => return serde_json::json!({"error": format!("task not found: {id}")}),
     };
@@ -926,9 +1004,9 @@ fn handle_metadata_set(
         key: key.to_string(),
         value,
     };
-    match crate::task_events::append(home, &emitter, event) {
+    match crate::task_events::append_at(&board, &emitter, event) {
         Ok(_) => {
-            let task = read_task_record(home, id).map(|r| record_to_task(&r));
+            let task = read_task_record_at(&board, id).map(|r| record_to_task(&r));
             serde_json::json!({"id": id, "event": "metadata_set", "task": task})
         }
         Err(e) => serde_json::json!({"error": format!("{e}")}),
@@ -940,7 +1018,8 @@ fn handle_metadata_get(home: &Path, args: &Value) -> Value {
         Some(i) => i,
         None => return serde_json::json!({"error": "missing 'id' (alias: task_id)"}),
     };
-    match read_task_record(home, id) {
+    let board = super::board_router::board_for_task(home, id);
+    match read_task_record_at(&board, id) {
         Some(r) => {
             serde_json::json!({"id": id, "metadata": r.metadata})
         }
@@ -950,7 +1029,9 @@ fn handle_metadata_get(home: &Path, args: &Value) -> Value {
 
 /// #1147: Build a chronological activity timeline for a task.
 fn activity_timeline(home: &Path, task_id: &str) -> Value {
-    let envelopes = match crate::task_events::envelopes_for_task(home, task_id) {
+    // #2117 P1: read the task's resolved board (default → home).
+    let board = super::board_router::board_for_task(home, task_id);
+    let envelopes = match crate::task_events::envelopes_for_task_at(&board, task_id) {
         Ok(e) => e,
         Err(e) => return serde_json::json!({"error": format!("failed to read task events: {e}")}),
     };
@@ -1062,10 +1143,14 @@ fn summarize_event(env: &crate::task_events::TaskEventEnvelope) -> (&str, String
 
 fn cascade_cancel_children(
     home: &Path,
+    board: &Path,
     parent_id: &str,
     emitter: &crate::task_events::InstanceName,
 ) {
-    let Ok(state) = crate::task_events::replay(home) else {
+    // #2117 P1: a parent's children live on the parent's board — replay + cancel
+    // there. `home` is kept only for the cross-instance cascade NOTIFICATION
+    // (route_cascade_cancel), which is fleet-global. Single-project → board == home.
+    let Ok(state) = crate::task_events::replay_at(board) else {
         return;
     };
     let parent_tid = crate::task_events::TaskId(parent_id.to_string());
@@ -1090,7 +1175,7 @@ fn cascade_cancel_children(
         }
     }
     if !cancel_events.is_empty() {
-        let _ = crate::task_events::append_batch(home, emitter, cancel_events);
+        let _ = crate::task_events::append_batch_at(board, emitter, cancel_events);
     }
     for (child_id, owner) in notify_ids {
         if let Some(ref owner_name) = owner {

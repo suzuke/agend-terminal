@@ -210,7 +210,9 @@ pub(crate) fn def_task() -> Value {
             "metadata_key": {"type": "string", "description": "Key for metadata_set action."},
             "metadata_value": {"description": "Value for metadata_set action (any JSON type)."},
             "bind": {"type": "boolean", "description": "#1933: create only — opt OUT of the daemon's auto-bind-on-dispatch (default true). Set false to leave the assignee unbound. Consumed in tasks/handler.rs (TaskEvent::Created.bind)."},
-            "eta_secs": {"type": "integer", "description": "#1933: create only — task stall-watchdog ETA in seconds; the daemon flags the task as stalled once this budget elapses. Consumed in tasks/handler.rs (TaskEvent::Created.eta_secs)."}
+            "eta_secs": {"type": "integer", "description": "#1933: create only — task stall-watchdog ETA in seconds; the daemon flags the task as stalled once this budget elapses. Consumed in tasks/handler.rs (TaskEvent::Created.eta_secs)."},
+            "project": {"type": "string", "description": "#2117 P1: target project board. create: route the task to this project (default: the caller's current project, derived from its team's source_repo). list: show this project, or `all` to aggregate every board."},
+            "scope": {"type": "string", "enum": ["fleet"], "description": "#2117 P1: list scope. `fleet` aggregates tasks across ALL project boards (each task tagged with its project id). Equivalent to `project=all`."}
         }, "required": ["action"]}})
 }
 

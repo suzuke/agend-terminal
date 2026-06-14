@@ -981,7 +981,7 @@ pub(crate) fn board_root(home: &Path, project_id: &str) -> PathBuf {
 /// canonical `owner__repo` for an `owner/repo` slug; otherwise sanitizes any
 /// remaining path/URL separators. (P0: deterministic + round-trippable enough
 /// for an isolated subtree; P1 may refine the canonicalization.)
-fn project_slug(project_id: &str) -> String {
+pub(crate) fn project_slug(project_id: &str) -> String {
     let trimmed = project_id
         .trim()
         .trim_end_matches('/')
@@ -1100,6 +1100,11 @@ pub(crate) fn append_batch_at(
 /// events emitted as one batch). On precondition failure NO event is written and
 /// the reason is returned as `Ok(Err(reason))`; the outer `Err` is reserved for
 /// IO / replay failures.
+// #2117 P1: every non-test in-tree caller now routes via `append_batch_checked_at`
+// (the task command handlers resolve a board first). This home-default wrapper is
+// retained for the symmetric storage API (home + `_at` pair) and its test callers;
+// `allow(dead_code)` because non-test builds have no remaining caller.
+#[allow(dead_code)]
 pub fn append_batch_checked<F>(
     home: &Path,
     instance: &InstanceName,
@@ -1195,6 +1200,9 @@ where
 /// failures. Replay/append semantics are otherwise unchanged — this reuses
 /// `replay_uncached` (lock-free) for the read and the same seq/cache plumbing
 /// as [`append_batch`].
+// #2117 P1: non-test callers route via `append_checked_at` (board-resolved); this
+// home-default wrapper is retained for the symmetric storage API + test callers.
+#[allow(dead_code)]
 pub fn append_checked<F>(
     home: &Path,
     instance: &InstanceName,
@@ -1532,13 +1540,11 @@ fn replay_uncached(board: &Path) -> anyhow::Result<TaskBoardState> {
     Ok(state)
 }
 
-/// Return all task event envelopes for a given `task_id`, sorted chronologically.
-/// Used by `task action=activity` to build a timeline.
-pub fn envelopes_for_task(home: &Path, task_id: &str) -> anyhow::Result<Vec<TaskEventEnvelope>> {
-    envelopes_for_task_at(&board_root(home, DEFAULT_PROJECT), task_id)
-}
-
-/// #2117 board-root variant of [`envelopes_for_task`].
+/// Return all task event envelopes for a given `task_id` on a board, sorted
+/// chronologically. Used by `task action=activity` to build a timeline. (#2117
+/// P1: the activity handler resolves the task's board and calls this directly,
+/// so the former `home`-default wrapper — which had no other callers — was
+/// removed; `board_root(home, DEFAULT)` is `home` for a default-board read.)
 pub(crate) fn envelopes_for_task_at(
     board: &Path,
     task_id: &str,

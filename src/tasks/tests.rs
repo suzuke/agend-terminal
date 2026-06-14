@@ -1289,6 +1289,102 @@ fn write_fleet_yaml(home: &std::path::Path, instances: &[&str]) {
     std::fs::write(crate::fleet::fleet_yaml_path(home), yaml).ok();
 }
 
+/// #2117 P1: two teams with distinct `source_repo`s get ISOLATED boards. A task
+/// created by teamA's member lands on teamA's board and is invisible to teamB's
+/// default (current-project) `list` — the new cross-board isolation. The
+/// `task_index` routes a later `done` to the right board, and `scope=fleet`
+/// aggregates both.
+#[test]
+fn two_projects_get_isolated_boards_2117() {
+    let home = tmp_home("p1-board-isolation");
+    let yaml = r#"
+instances:
+  devA:
+    backend: claude
+  devB:
+    backend: claude
+teams:
+  teamA:
+    members:
+      - devA
+    source_repo: /repos/orgA/projA
+  teamB:
+    members:
+      - devB
+    source_repo: /repos/orgB/projB
+"#;
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
+
+    let ta = handle(
+        &home,
+        "devA",
+        &serde_json::json!({"action": "create", "title": "TA", "assignee": "devA"}),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let tb = handle(
+        &home,
+        "devB",
+        &serde_json::json!({"action": "create", "title": "TB", "assignee": "devB"}),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let list_ids = |caller: &str, args: serde_json::Value| -> Vec<String> {
+        handle(&home, caller, &args)["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["id"].as_str().map(String::from))
+            .collect()
+    };
+
+    // Default list = caller's current project → isolated.
+    let a_ids = list_ids("devA", serde_json::json!({"action": "list"}));
+    let b_ids = list_ids("devB", serde_json::json!({"action": "list"}));
+    assert!(
+        a_ids.contains(&ta) && !a_ids.contains(&tb),
+        "teamA must see only its own task: {a_ids:?}"
+    );
+    assert!(
+        b_ids.contains(&tb) && !b_ids.contains(&ta),
+        "teamB must see only its own task: {b_ids:?}"
+    );
+
+    // Each task lands on its own board subtree; nothing leaks to the default board.
+    assert!(home.join("boards/orgA_projA/task_events.jsonl").exists());
+    assert!(home.join("boards/orgB_projB/task_events.jsonl").exists());
+    assert!(
+        !home.join("task_events.jsonl").exists(),
+        "no task should land on the default/home board"
+    );
+
+    // scope=fleet aggregates across boards.
+    let all_ids = list_ids(
+        "devA",
+        serde_json::json!({"action": "list", "scope": "fleet"}),
+    );
+    assert!(
+        all_ids.contains(&ta) && all_ids.contains(&tb),
+        "fleet scope must see both boards' tasks: {all_ids:?}"
+    );
+
+    // done routes via task_index to the task's board (cross-board O(1)).
+    let done = handle(
+        &home,
+        "devA",
+        &serde_json::json!({"action": "done", "id": ta}),
+    );
+    assert_eq!(
+        done["event"], "done",
+        "teamA task done must route to its board: {done}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
 #[test]
 fn test_claim_unknown_instance_rejected() {
     let home = tmp_home("claim-unknown");
