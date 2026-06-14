@@ -212,54 +212,37 @@ fn ci_watch_timed_out_notifies() {
 
 #[test]
 fn test_force_push_invalidates_run_id() {
-    // When head_sha changes between polls, the effective last_run_id
-    // should be reset to None so the new run is picked up even if
-    // the run_id hasn't changed yet.
-    let prev_sha = Some("abc123");
-    let current_sha = "def456";
-    // Simulate the logic from ci_check_repo
-    let last_run_id = Some(42u64);
-    let effective = if prev_sha.is_some_and(|prev| prev != current_sha) {
-        None
-    } else {
-        last_run_id
-    };
-    assert_eq!(effective, None, "force push must reset last_run_id");
+    // Drives the PRODUCTION helper `effective_last_run_id` (poller.rs) that
+    // `poll_ci_runs` uses to reset run tracking on a force-push / head move.
+    // Previously this re-implemented the if/else inline and asserted on its
+    // own copy, so a divergence in the real logic would not have been caught.
 
-    // Same SHA → preserve run_id
-    let same_sha = "abc123";
-    let effective2 = if prev_sha.is_some_and(|prev| prev != same_sha) {
-        None
-    } else {
-        last_run_id
-    };
-    assert_eq!(effective2, Some(42), "same SHA must preserve last_run_id");
-}
-
-#[test]
-fn test_pr_merged_clears_watcher() {
-    // When a watch file exists and the PR is terminal, the file
-    // should be removed. We test the update_watch_state + remove
-    // flow by verifying the file lifecycle.
-    let dir = std::env::temp_dir().join(format!("agend-ci-test-merged-{}", std::process::id()));
-    std::fs::create_dir_all(dir.join("ci-watches")).ok();
-    let watch_path = dir.join("ci-watches").join("test.json");
-    std::fs::write(
-        &watch_path,
-        r#"{"repo":"o/r","branch":"feat","last_run_id":null,"head_sha":null}"#,
-    )
-    .ok();
-    assert!(watch_path.exists());
-
-    // Simulate PR terminal → auto-clear
-    let _ = std::fs::remove_file(&watch_path);
-    assert!(
-        !watch_path.exists(),
-        "watcher file must be removed on PR terminal"
+    // Head moved → cached run_id points at a run for the old head → reset.
+    assert_eq!(
+        effective_last_run_id(Some("abc123"), "def456", Some(42)),
+        None,
+        "force push (head_sha changed) must reset last_run_id"
     );
-
-    std::fs::remove_dir_all(&dir).ok();
+    // Same SHA → preserve the cached run_id.
+    assert_eq!(
+        effective_last_run_id(Some("abc123"), "abc123", Some(42)),
+        Some(42),
+        "same SHA must preserve last_run_id"
+    );
+    // No prior head recorded → nothing to invalidate → preserve.
+    assert_eq!(
+        effective_last_run_id(None, "abc123", Some(42)),
+        Some(42),
+        "absent prev_head_sha must preserve last_run_id"
+    );
 }
+
+// Removed `test_pr_merged_clears_watcher`: it wrote a file, deleted it with
+// raw `std::fs::remove_file`, then asserted it was gone — exercising the std
+// library, not the production PR-terminal clear path. The real behavior is
+// covered by `test_remove_watch_on_pr_terminal_logs_event` below, which calls
+// the production `remove_watch(.., reason = "pr_terminal")` and asserts both
+// the file removal and the `ci_watch_removed` event-log entry.
 
 // --- classify_runs_response: silent-rate-limit regression pin ---
 

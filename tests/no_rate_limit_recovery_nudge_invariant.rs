@@ -1,21 +1,23 @@
-//! Pins the post-revert contract that `process_rate_limit_recovery_nudges`
-//! (introduced by #841, hotfixed by #846, reverted 2026-05-16 due to
-//! classifier false-positive amplification) is NOT wired into the daemon
-//! run loop. The feature MUST stay reverted until #848 ships the upstream
-//! classifier fix that prevents false-positive RateLimit states from
-//! triggering the nudge mechanism in the first place.
+//! Pins the contract that `process_rate_limit_recovery_nudges` is NOT wired
+//! into the daemon run loop — the feature is currently intentionally reverted.
 //!
-//! Failure mode this pin defends against: a future PR re-adds the
-//! `process_rate_limit_recovery_nudges` call site to supervisor's
-//! `run_loop` without coordinating with #848. Per operator directive
-//! 2026-05-16: \"先復原再考慮慢慢修根因\" — revert first, only re-enable
-//! after root cause is fixed. This test enforces that workflow gate.
+//! History (this has been re-introduced and re-reverted several times — do not
+//! assume a single linear narrative when reading the diff):
+//!   #841 introduce → #846 hotfix → #849 revert (2026-05-16, classifier
+//!   false-positive amplification) → #886 re-introduce (post-#848 classifier
+//!   fix) → reverted again → re-reverted → reverted. Net current state on
+//!   `main`: ABSENT. `git log -i --grep rate.limit.*nudge` shows the full chain.
 //!
-//! When #848 (state classifier fix) ships AND the rate-limit recovery
-//! nudge is re-introduced through a properly designed path, this test
-//! should be REMOVED in the same PR that re-wires the call site.
-//! Removing the test is the explicit signal that operator approved
-//! re-enablement.
+//! Because the feature has oscillated, this pin guards the *current* decision:
+//! the recovery nudge stays out of supervisor's `run_loop` unless re-enabled
+//! deliberately. The failure mode it defends against is a silent re-add (e.g.
+//! an accidental revert-of-a-revert or cherry-pick) of the
+//! `process_rate_limit_recovery_nudges` call site without an explicit decision.
+//!
+//! NOTE: this is a name-based source pin — it catches re-introduction under the
+//! same identifier, not a rename. If you are deliberately re-enabling the
+//! feature, update/remove this test in the same PR (removal is the explicit
+//! signal that re-enablement was approved).
 
 use std::fs;
 

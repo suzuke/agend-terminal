@@ -1676,11 +1676,17 @@ mod tests {
         let source = std::fs::read_to_string("src/app/mod.rs")
             .or_else(|_| std::fs::read_to_string("agend-terminal/src/app/mod.rs"))
             .expect("source file must be readable from test cwd");
+        // Search only the production region. This assertion's own literal
+        // lives in the #[cfg(test)] module below, so a whole-file substring
+        // check self-matches and would stay green even if the real call were
+        // deleted. Require the call form (with `(`) before the test cutoff.
+        let prod = &source[..source.find("#[cfg(test)]").unwrap_or(source.len())];
         assert!(
-            source.contains("inject_notification_with_submit"),
+            prod.contains("inject_notification_with_submit("),
             "flush_idle_notifications must wire the submit-aware injector \
-             (#982 reviewer #999 verdict) — searched for \
-             'inject_notification_with_submit' in src/app/mod.rs"
+             (#982 reviewer #999 verdict) — no call to \
+             'inject_notification_with_submit(' found in the production region \
+             of src/app/mod.rs"
         );
     }
 
@@ -1926,12 +1932,17 @@ mod tests {
         let source = std::fs::read_to_string("src/app/mod.rs")
             .or_else(|_| std::fs::read_to_string("agend-terminal/src/app/mod.rs"))
             .expect("source file must be readable from test cwd");
+        // Search only the production region. This assertion's own literal
+        // lives in the #[cfg(test)] module below, so a whole-file substring
+        // check self-matches and would stay green even if the real call were
+        // deleted. Require the call form (with `(`) before the test cutoff.
+        let prod = &source[..source.find("#[cfg(test)]").unwrap_or(source.len())];
         assert!(
-            source.contains("register_event_subscribers"),
+            prod.contains("register_event_subscribers("),
             "run_app must call daemon::register_event_subscribers in owned mode \
              (app mode never reaches run_core's registration — #1720 app-mode \
-             silent-drop root fix). Searched for 'register_event_subscribers' in \
-             src/app/mod.rs"
+             silent-drop root fix). No call to 'register_event_subscribers(' \
+             found in the production region of src/app/mod.rs"
         );
     }
 

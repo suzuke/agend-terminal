@@ -146,13 +146,20 @@ fn api_session_spawns_pid_watcher() {
     let cutoff = src.find("#[cfg(test)]").unwrap_or(src.len());
     let prod = &src[..cutoff];
 
+    // Assert the watcher is actually WIRED IN, not merely defined. The fn
+    // definition `fn spawn_peer_pid_watcher(` always exists; the regression
+    // we guard against is deletion of the *call site* in the session loop
+    // (which reintroduces the 30s-TCP-timeout dead-bridge latency). So we
+    // require at least one call beyond the single definition.
+    let total_refs = prod.matches("spawn_peer_pid_watcher(").count();
+    let definitions = prod.matches("fn spawn_peer_pid_watcher(").count();
     assert!(
-        prod.contains("spawn_peer_pid_watcher")
-            || prod.contains("pid_watcher")
-            || prod.contains("is_process_alive"),
-        "src/api/mod.rs must contain a PID watcher spawn site for active \
-         peer death detection (Sprint 25 P3). Without it, dead-bridge \
-         invalidation relies on 30s TCP read timeout instead of ~2s \
-         kill(pid,0) polling."
+        total_refs > definitions,
+        "src/api/mod.rs must CALL spawn_peer_pid_watcher from the session \
+         flow (call site, not just the fn definition) for active peer death \
+         detection (Sprint 25 P3). Found {total_refs} reference(s) and \
+         {definitions} definition(s) — no call site. Without the call, \
+         dead-bridge invalidation relies on the 30s TCP read timeout \
+         instead of ~2s kill(pid,0) polling."
     );
 }

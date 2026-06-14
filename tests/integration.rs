@@ -510,9 +510,19 @@ fn test_shutdown_no_crash_log() {
         .collect::<Vec<_>>()
         .join("\n");
 
+    // A real crash logs `tracing::warn!(exit_code = c, "crash")` (see
+    // src/agent/mod.rs::classify_exit) which renders as a line containing
+    // both the `crash` message and the `exit_code=N` field. The previous
+    // assertion searched for the literal `"exit code"` (with a space), which
+    // the structured `exit_code=` field never produces — so it could never
+    // fire. Match the real rendered form, and exclude the benign signal-kill
+    // line "killed by signal, not crash".
+    let crash_logged = log
+        .lines()
+        .any(|l| l.contains("exit_code=") && l.contains("crash") && !l.contains("not crash"));
     assert!(
-        !log.contains("exit code") || log.contains("stopped (daemon shutdown)"),
-        "shutdown should not show crash messages. log:\n{log}"
+        !crash_logged,
+        "clean shutdown should not log a crash. log:\n{log}"
     );
 }
 

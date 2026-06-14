@@ -1196,6 +1196,24 @@ struct PollResult {
     effective_last_run_id: Option<u64>,
 }
 
+/// Force-push invalidation (pure). When the branch head has moved since the
+/// last poll (`prev_head_sha` is present and differs from `current_sha`), the
+/// cached `last_run_id` points at a run for the OLD head and is stale, so it
+/// must be reset to `None` for the new head's run to be picked up. Otherwise
+/// the cached id is preserved. The production caller (`poll_ci_runs`) layers
+/// the logging / progress-touch side effects on top of this decision.
+pub(crate) fn effective_last_run_id(
+    prev_head_sha: Option<&str>,
+    current_sha: &str,
+    last_run_id: Option<u64>,
+) -> Option<u64> {
+    if prev_head_sha.is_some_and(|prev| prev != current_sha) {
+        None
+    } else {
+        last_run_id
+    }
+}
+
 struct NotifyOutcome {
     max_notified_id: u64,
     new_notified_sha: Option<String>,
@@ -1541,10 +1559,12 @@ async fn poll_ci_runs(
                 .map(|r| r.head_sha.as_str())
                 .unwrap_or("")
                 .to_string();
-            let effective_last_run_id = if tracking
+            let head_moved = tracking
                 .prev_head_sha
-                .is_some_and(|prev| prev != current_sha)
-            {
+                .is_some_and(|prev| prev != current_sha);
+            let effective =
+                effective_last_run_id(tracking.prev_head_sha, &current_sha, tracking.last_run_id);
+            if head_moved {
                 tracing::info!(
                     repo = ctx.repo,
                     branch = ctx.branch,
@@ -1554,14 +1574,11 @@ async fn poll_ci_runs(
                 );
                 let _ =
                     crate::daemon::task_progress::touch_progress_for_branch(ctx.home, ctx.branch);
-                None
-            } else {
-                tracking.last_run_id
-            };
+            }
             Ok(Some(PollResult {
                 runs,
                 current_sha,
-                effective_last_run_id,
+                effective_last_run_id: effective,
             }))
         }
     }

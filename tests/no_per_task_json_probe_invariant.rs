@@ -17,8 +17,13 @@
 use std::path::{Path, PathBuf};
 
 const SRC_DIR: &str = "src";
-/// The forbidden path-build shape: `…join("tasks").join(format!(…))`.
-const FORBIDDEN: &str = "\"tasks\").join(format!";
+/// The forbidden path-build shape: `…join("tasks").join(…)` — a per-task
+/// path under a `tasks/` dir. Broadened from the original
+/// `…join("tasks").join(format!(…))`: the per-task filename need not be built
+/// with `format!` (e.g. `.join("tasks").join(&id)` is equally forbidden), and
+/// the whole-file whitespace-normalized pass below also catches the shape when
+/// rustfmt wraps it across multiple lines.
+const FORBIDDEN: &str = "\"tasks\").join(";
 const ALLOW_MARKER: &str = "allow-tasks-json-probe";
 
 fn rs_files(root: &Path) -> Vec<PathBuf> {
@@ -55,9 +60,26 @@ fn no_per_task_json_filesystem_probe() {
         let Ok(content) = std::fs::read_to_string(&file) else {
             continue;
         };
+        // (1) Line-level scan — precise location + per-line allow-marker.
+        let mut line_hit = false;
         for (i, line) in content.lines().enumerate() {
             if line.contains(FORBIDDEN) && !line.contains(ALLOW_MARKER) {
                 offenders.push(format!("{}:{}  {}", file.display(), i + 1, line.trim()));
+                line_hit = true;
+            }
+        }
+        // (2) Whole-file whitespace-normalized scan — catches the same probe
+        //     shape when rustfmt has wrapped it across multiple lines, which
+        //     the line-level check above cannot see. Reported file-level.
+        if !line_hit && !content.contains(ALLOW_MARKER) {
+            let stripped: String = content.chars().filter(|c| !c.is_whitespace()).collect();
+            let forbidden_stripped: String =
+                FORBIDDEN.chars().filter(|c| !c.is_whitespace()).collect();
+            if stripped.contains(&forbidden_stripped) {
+                offenders.push(format!(
+                    "{} (probe shape wrapped across lines)",
+                    file.display()
+                ));
             }
         }
     }

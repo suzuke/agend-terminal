@@ -851,14 +851,23 @@ mod tests {
             })
             .collect();
 
+        let viewport_rows = 10;
         let full = task_board_columns(&tasks);
-        let partial = task_board_columns_viewport(&tasks, 10);
+        let partial = task_board_columns_viewport(&tasks, viewport_rows);
 
-        assert_eq!(full[3].len(), partial[3].len());
-        let visible = DONE_VISIBLE_MAX.min(full[3].len());
+        // Done is column index 4 ([backlog, ready, working, review, done]).
+        // The previous assertion used index 3 (review), which is empty for an
+        // all-done fixture, so it compared 0 == 0 and the loop never ran.
+        assert_eq!(full[4].len(), partial[4].len());
+
+        // The viewport only guarantees the top `min(viewport_rows,
+        // DONE_VISIBLE_MAX)` done entries are correctly sorted; compare
+        // exactly that visible prefix against the fully-sorted reference.
+        let visible = viewport_rows.min(DONE_VISIBLE_MAX).min(full[4].len());
+        assert!(visible > 0, "visible range must be non-empty");
         for i in 0..visible {
             assert_eq!(
-                full[3][i].id, partial[3][i].id,
+                full[4][i].id, partial[4][i].id,
                 "done column row {i}: partial sort must match full sort in visible range"
             );
         }

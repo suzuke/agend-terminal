@@ -484,19 +484,29 @@ mod tests {
         // may have set it to Live first, in which case THIS test's
         // first call emits the Fallback transition log. Either way,
         // total emissions across 10 calls MUST be ≤ 1.
-        let initial_hits = logs_contain("initial mode resolved");
-        let transition_hits = logs_contain("daemon offline → falling back");
-        assert!(
-            !(initial_hits && transition_hits),
-            "should observe at most one of {{initial, transition}} log kinds — never both per a single test run"
-        );
-
-        // The strongest assertion: count actual log lines that match the
-        // helper's prefix. tracing-test's `logs_contain` returns bool;
-        // for count-precision we'd need direct subscriber introspection.
-        // Bool check above is sufficient to lock the rate-limit contract:
-        // steady-state Fallback → Fallback emits ZERO logs after the
-        // first call, so 10 calls produce at most 1 line.
+        // Count-precision assertion. `logs_contain` only returns a bool, so
+        // it cannot tell "logged once" from "logged on every call" — the old
+        // `!(initial_hits && transition_hits)` check passed even if one log
+        // kind repeated 10×. `logs_assert` exposes the captured lines, so we
+        // count actual helper emissions: every helper log carries the prefix
+        // `list_agents_with_fallback:`. Across 10 steady-state calls at most
+        // ONE such line may appear (the first-call mode-resolution entry);
+        // steady-state Fallback → Fallback hits the silent `_ => {}` arm.
+        logs_assert(|lines: &[&str]| {
+            let helper_logs = lines
+                .iter()
+                .filter(|l| l.contains("list_agents_with_fallback:"))
+                .count();
+            if helper_logs <= 1 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "steady-state must emit at most ONE helper log across 10 \
+                     calls, got {helper_logs}:\n{}",
+                    lines.join("\n")
+                ))
+            }
+        });
 
         fs::remove_dir_all(&home).ok();
     }

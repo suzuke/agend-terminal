@@ -3,7 +3,6 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -46,42 +45,47 @@ fn stress_concurrent_hotspot_query_under_commits() {
 #[test]
 #[ignore]
 fn stress_phase5_1h_soak() {
+    // Throughput / stability soak: drive the per-file hotspot-index hot path
+    // (insert last-toucher + decide hotspot) for a time budget and assert it
+    // sustains a high iteration count without slowing down or wedging.
+    //
+    // Previously this also kept a "drift" counter computed as
+    //   `let is_hotspot = EXPR; let expected = EXPR; if is_hotspot != expected`
+    // where both sides were the IDENTICAL expression — so `violations` could
+    // never increment and `assert!(drift < 0.001)` was a tautology that could
+    // not fail and exercised no real index path. That vacuous machinery is
+    // removed; the soak now drives a real HashMap insert/lookup and keeps only
+    // the genuine, failable throughput assertion.
     let duration_secs: u64 = std::env::var("AGEND_SOAK_DURATION")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(60);
     let duration = Duration::from_secs(duration_secs);
     let start = Instant::now();
-    let violations = Arc::new(AtomicU64::new(0));
-    let total = Arc::new(AtomicU64::new(0));
+    let mut total: u64 = 0;
     let mut rng: u64 = 42;
+    // last toucher per file_id — the real per-file hotspot-index shape.
+    let mut last_toucher: HashMap<u64, u64> = HashMap::new();
 
     while start.elapsed() < duration {
         rng ^= rng << 13;
         rng ^= rng >> 7;
         rng ^= rng << 17;
-        total.fetch_add(1, Ordering::Relaxed);
+        total += 1;
 
-        // Simulate hotspot decision: file touched by other agent = hotspot.
-        let _file_id = rng % 50;
+        let file_id = rng % 50;
         let current_agent = rng % 10;
-        let last_toucher = (rng >> 4) % 10;
-        let is_hotspot = current_agent != last_toucher;
-        let expected = current_agent != last_toucher;
-        if is_hotspot != expected {
-            violations.fetch_add(1, Ordering::Relaxed);
-        }
+        // Hotspot iff a DIFFERENT agent last touched this file. Driven off the
+        // index's prior value, not a copy of the same line, so the work is real.
+        let prev = last_toucher.insert(file_id, current_agent);
+        let _is_hotspot = prev.is_some_and(|p| p != current_agent);
     }
 
-    let t = total.load(Ordering::Relaxed);
-    let v = violations.load(Ordering::Relaxed);
-    let drift = if t > 0 { v as f64 / t as f64 } else { 0.0 };
-    eprintln!(
-        "phase5 soak: {t} events, {v} violations, drift={:.6}%",
-        drift * 100.0
+    eprintln!("phase5 soak: {total} iterations in {duration_secs}s budget");
+    assert!(
+        total > 1_000_000,
+        "soak must sustain >1M iterations within the {duration_secs}s budget, got {total}"
     );
-    assert!(drift < 0.001);
-    assert!(t > 1_000_000);
 }
 
 #[test]
