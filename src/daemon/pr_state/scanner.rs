@@ -562,6 +562,19 @@ fn apply_gh_observations(
     }
 
     // Terminal state transitions.
+    //
+    // #2131: a `state=CLOSED + mergedAt=None` observation is AMBIGUOUS under
+    // squash-merge eventual consistency — gh transiently reports it before the
+    // merge-commit association lands and `mergedAt` flips. Classifying it
+    // ClosedUnmerged on FIRST sight emitted a false (action-bearing)
+    // `[pr-closed-unmerged]` for a merged PR (the emit is latched once-per-identity,
+    // so a later `merged=true` can't retract the inbox signal). So a first
+    // closed-unmerged observation only DEFERS (sets `closed_unmerged_pending`); the
+    // grace block below confirms it only if a SUBSEQUENT poll STILL reports
+    // closed-unmerged. A `MERGED` observation resolves the lag. `was_pending` is
+    // captured BEFORE this poll's processing, so the poll that first sets pending
+    // never confirms in the same pass.
+    let was_pending = state.closed_unmerged_pending;
     if let Some(prev) = state.last_gh_state.as_ref() {
         if prev.state != meta.state {
             match (meta.state, meta.merged_at.as_deref()) {
@@ -579,12 +592,8 @@ fn apply_gh_observations(
                     );
                 }
                 (gh_poll::GhPrState::Closed, _) if meta.merged_at.is_none() => {
-                    apply(
-                        state,
-                        Event::ClosedUnmergedObserved {
-                            closed_at: now.to_string(),
-                        },
-                    );
+                    // #2131: DEFER, don't emit — confirmed by the grace block below.
+                    state.closed_unmerged_pending = true;
                 }
                 _ => {}
             }
@@ -603,15 +612,32 @@ fn apply_gh_observations(
                 );
             }
             (gh_poll::GhPrState::Closed, _) if meta.merged_at.is_none() => {
-                apply(
-                    state,
-                    Event::ClosedUnmergedObserved {
-                        closed_at: now.to_string(),
-                    },
-                );
+                state.closed_unmerged_pending = true;
             }
             _ => {}
         }
+    }
+
+    // #2131: confirm-or-clear the deferred closed-unmerged.
+    let closed_unmerged_now =
+        matches!(meta.state, gh_poll::GhPrState::Closed) && meta.merged_at.is_none();
+    if !closed_unmerged_now {
+        // MERGED / reopened / draft — the lag resolved or the PR isn't closing.
+        state.closed_unmerged_pending = false;
+    } else if was_pending
+        && !matches!(
+            state.merge_state,
+            MergeState::Merged { .. } | MergeState::ClosedUnmerged { .. }
+        )
+    {
+        // Two consecutive closed-unmerged observations → the close is real → emit.
+        apply(
+            state,
+            Event::ClosedUnmergedObserved {
+                closed_at: now.to_string(),
+            },
+        );
+        state.closed_unmerged_pending = false;
     }
 
     state.last_gh_state = Some(meta.clone());

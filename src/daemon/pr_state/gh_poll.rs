@@ -577,6 +577,7 @@ pub(crate) mod tests {
             last_gh_poll_at: None,
             gh_poll_failures: 0,
             last_gh_state: None,
+            closed_unmerged_pending: false,
             created_at: now.clone(),
             updated_at: now,
         }

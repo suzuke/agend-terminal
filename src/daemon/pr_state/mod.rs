@@ -109,6 +109,16 @@ pub struct PrState {
     /// toggle / mergedAt landing). `None` pre-first-poll.
     #[serde(default)]
     pub last_gh_state: Option<gh_poll::GhPrMetadata>,
+    /// #2131: a `state=CLOSED + mergedAt=None` observation is AMBIGUOUS under
+    /// squash-merge eventual consistency — gh transiently reports it before the
+    /// merge-commit association lands (mergedAt flips). Set when the FIRST such
+    /// observation is seen and the classification is DEFERRED one poll; a
+    /// subsequent poll that STILL reports closed-unmerged confirms it (emit), while
+    /// a `MERGED`/reopened observation clears it. Mirrors the merged-terminal
+    /// "two consecutive observations" gate. `#[serde(default)]` = false for state
+    /// files written before this field existed.
+    #[serde(default)]
+    pub closed_unmerged_pending: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -796,6 +806,7 @@ pub fn new_for_branch(
         last_gh_poll_at: None,
         gh_poll_failures: 0,
         last_gh_state: None,
+        closed_unmerged_pending: false,
         created_at: now.clone(),
         updated_at: now,
     }
@@ -1234,6 +1245,7 @@ mod tests {
             last_gh_poll_at: None,
             gh_poll_failures: 0,
             last_gh_state: None,
+            closed_unmerged_pending: false,
             created_at: now(),
             updated_at: now(),
         }
@@ -2534,9 +2546,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// #986 T5 — `gh state=CLOSED + mergedAt=None` fires
-    /// ClosedUnmergedObserved → reducer transitions → scanner emits
-    /// `[pr-closed-unmerged]`.
+    /// #986 T5 + #2131 — `gh state=CLOSED + mergedAt=None` is AMBIGUOUS under
+    /// squash-merge eventual consistency, so the FIRST observation DEFERS (no emit,
+    /// state survives with the pending flag); a SECOND consecutive closed-unmerged
+    /// observation confirms it → reducer transitions → scanner emits
+    /// `[pr-closed-unmerged]`; a THIRD scan removes (already-emitted dedup).
     #[test]
     fn t11_closed_unmerged_observation_fires_event() {
         let mut s = new_state("sha-A", ReviewClass::Single);
@@ -2551,24 +2565,122 @@ mod tests {
             state: GhPrState::Closed,
             merged_at: None,
         };
-        let poller = MockGhPoller::new(vec![Ok(vec![closed_meta.clone()])]);
 
-        scan_and_emit_with(&home, &empty_registry(), &poller);
+        // #2131: first observation DEFERS — no emit, state survives with the
+        // pending flag (it may be a squash-merge mergedAt lag).
+        let poller1 = MockGhPoller::new(vec![Ok(vec![closed_meta.clone()])]);
+        scan_and_emit_with(&home, &empty_registry(), &poller1);
+        let deferred = load(&home, "owner/repo", "feat/test")
+            .expect("#2131: deferred state must survive (not terminal yet)");
+        assert!(
+            deferred.closed_unmerged_pending,
+            "#2131: first closed-unmerged observation must DEFER (set pending)"
+        );
+        assert!(
+            crate::inbox::drain(&home, "dev").is_empty(),
+            "#2131: no [pr-closed-unmerged] on the first (deferred) observation"
+        );
 
-        // #1287: first scan emits + persists with dedup flag.
+        // gh-poll is cadence-gated on `last_gh_poll_at` (scan1 just stamped it);
+        // production polls are periodic so the two observations span two cadence
+        // windows. Clear it so scan2 re-polls (pending flag is preserved).
+        let repoll = |home: &std::path::Path| {
+            let mut st = load(home, "owner/repo", "feat/test").unwrap();
+            st.last_gh_poll_at = None;
+            save(home, &st).unwrap();
+        };
+        repoll(&home);
+
+        // Second consecutive closed observation → confirm → emit + dedup flag.
+        let poller2 = MockGhPoller::new(vec![Ok(vec![closed_meta.clone()])]);
+        scan_and_emit_with(&home, &empty_registry(), &poller2);
         let persisted = load(&home, "owner/repo", "feat/test")
-            .expect("#1287: file must survive first scan with dedup flag");
+            .expect("#1287: file must survive the confirm scan with dedup flag");
         assert_eq!(persisted.ready_emitted_for_sha.as_deref(), Some("sha-A"));
         let msgs = crate::inbox::drain(&home, "dev");
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].kind.as_deref(), Some("pr-closed-unmerged"));
 
-        // Second scan: already_emitted → remove without re-emitting.
-        let poller2 = MockGhPoller::new(vec![Ok(vec![closed_meta])]);
-        scan_and_emit_with(&home, &empty_registry(), &poller2);
+        // Third scan: already_emitted → remove without re-emitting.
+        let poller3 = MockGhPoller::new(vec![Ok(vec![closed_meta])]);
+        scan_and_emit_with(&home, &empty_registry(), &poller3);
         assert!(load(&home, "owner/repo", "feat/test").is_none());
-        let msgs2 = crate::inbox::drain(&home, "dev");
-        assert!(msgs2.is_empty(), "#1287: no duplicate emit on second scan");
+        assert!(
+            crate::inbox::drain(&home, "dev").is_empty(),
+            "#1287: no duplicate emit"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// #2131 regression — the squash-merge eventual-consistency sequence: gh first
+    /// reports `CLOSED + mergedAt=None` (the transient lag), then `MERGED + mergedAt`.
+    /// The scanner must NEVER emit a false `[pr-closed-unmerged]`: the first
+    /// observation DEFERS, and the merged observation resolves the lag (clears
+    /// pending, terminal = Merged). This is the PR #2129 false-signal reproduction.
+    /// (Neuter the #2131 deferral → the first observation emits → this test REDs.)
+    #[test]
+    fn t_2131_closed_then_merged_emits_no_false_closed_unmerged() {
+        let mut s = new_state("sha-A", ReviewClass::Single);
+        s.pr_author = String::new();
+        let home = home_with_state("closed-then-merged", s);
+        let mk = |state: GhPrState, merged_at: Option<&str>| GhPrMetadata {
+            number: 2129,
+            author_login: "dev".into(),
+            head_ref: "feat/test".into(),
+            is_cross_repository: false,
+            is_draft: false,
+            state,
+            merged_at: merged_at.map(String::from),
+        };
+
+        // Scan 1: transient CLOSED+mergedAt=None → DEFER, no emit.
+        scan_and_emit_with(
+            &home,
+            &empty_registry(),
+            &MockGhPoller::new(vec![Ok(vec![mk(GhPrState::Closed, None)])]),
+        );
+        assert!(
+            crate::inbox::drain(&home, "dev").is_empty(),
+            "#2131: must NOT emit on the transient closed-unmerged"
+        );
+        let mut st = load(&home, "owner/repo", "feat/test").unwrap();
+        assert!(
+            st.closed_unmerged_pending,
+            "#2131: first observation must DEFER (pending)"
+        );
+        // Re-poll (clear the cadence stamp; production polls are periodic).
+        st.last_gh_poll_at = None;
+        save(&home, &st).unwrap();
+
+        // Scan 2: mergedAt landed → MERGED. Must clear pending + go terminal=Merged,
+        // and NEVER emit [pr-closed-unmerged].
+        scan_and_emit_with(
+            &home,
+            &empty_registry(),
+            &MockGhPoller::new(vec![Ok(vec![mk(
+                GhPrState::Merged,
+                Some("2026-06-14T08:44:29Z"),
+            )])]),
+        );
+        let kinds: Vec<_> = crate::inbox::drain(&home, "dev")
+            .iter()
+            .filter_map(|m| m.kind.clone())
+            .collect();
+        assert!(
+            !kinds.iter().any(|k| k == "pr-closed-unmerged"),
+            "#2131: must NEVER emit a false [pr-closed-unmerged]; got {kinds:?}"
+        );
+        if let Some(final_st) = load(&home, "owner/repo", "feat/test") {
+            assert!(
+                matches!(final_st.merge_state, MergeState::Merged { .. }),
+                "#2131: terminal state must be Merged, got {:?}",
+                final_st.merge_state
+            );
+            assert!(
+                !final_st.closed_unmerged_pending,
+                "#2131: pending must clear once merged"
+            );
+        }
         let _ = std::fs::remove_dir_all(&home);
     }
 
