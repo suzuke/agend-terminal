@@ -1010,31 +1010,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// #bughunt-r2 #4 source-scan: in `gc_stale_watches`, `acquire_file_lock`
-    /// must be reached BEFORE any `remove_watch(` call — i.e. the lock guards the
-    /// removal. Backstops a regression that moves/drops the lock acquisition.
-    #[test]
-    fn gc_acquires_lock_before_remove_watch_bughunt_r2() {
-        let src = include_str!("sweep.rs");
-        let start = src
-            .find("pub fn gc_stale_watches(")
-            .expect("gc_stale_watches present");
-        // Scope to the fn — stop at the `#[cfg(test)]` module so the scan can't
-        // reach this test's own `remove_watch(` / `acquire_file_lock` literals.
-        let after = &src[start..];
-        let cfg_test = ["#[cfg(", "test)]"].concat();
-        let body = &after[..after.find(&cfg_test).unwrap_or(after.len())];
-
-        let lock_at = body
-            .find("acquire_file_lock(")
-            .expect("gc must acquire the per-watch lock");
-        let remove_at = body
-            .find("remove_watch(")
-            .expect("gc still removes stale watches");
-        assert!(
-            lock_at < remove_at,
-            "#bughunt-r2 #4: gc_stale_watches must acquire the per-watch lock \
-             BEFORE removing a watch (lock-before-remove serialises against the poll flush)"
-        );
-    }
+    // Removed `gc_acquires_lock_before_remove_watch_bughunt_r2`: it was a
+    // source-text ordering check (`acquire_file_lock(` byte-offset < `remove_watch(`
+    // byte-offset via include_str!), which a rename/refactor breaks even when the
+    // logic is correct, and which a non-obvious rewrite could satisfy while the
+    // race exists. The companion `gc_blocks_on_held_watch_lock_then_removes_bughunt_r2`
+    // exercises the actual runtime lock serialisation and is sufficient coverage.
 }

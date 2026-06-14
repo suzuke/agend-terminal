@@ -149,69 +149,10 @@ fn silent_agent_spawn_observable_and_inject_path() {
     std::fs::remove_dir_all(&home).ok();
 }
 
-/// Migrated from: scripts/repro-team-tab-bug.sh
-/// Narrowed to: team creation API returns structured response (spawned
-/// array on success, descriptive error on backend unavailability).
-#[test]
-fn team_creation_returns_structured_response() {
-    let home = tmp_home("team-spawn");
-    let harness = AgendHarness::spawn(home.clone(), "defaults:\n  backend: cat\ninstances: {}\n")
-        .expect("spawn");
-
-    let client = TuiClient::new(&harness, 80, 24);
-
-    // Create a team with 2 members
-    let result = client.call(
-        "mcp_tool",
-        &json!({
-            "tool": "create_instance",
-            "arguments": {"team": "repro-team", "count": 2, "backend": "cat"},
-            "instance": "test-caller"
-        }),
-    );
-    assert!(
-        result.is_ok(),
-        "team creation must not fail: {:?}",
-        result.err()
-    );
-    let resp = result.expect("create response");
-
-    // Hard assertion: response must indicate spawned members or structured error
-    let inner = &resp["result"];
-    // Team creation via mcp_tool returns the tool's result.
-    // On success: {"team": ..., "spawned": [...]}
-    // On API error: {"error": "..."}
-    if inner.get("error").is_some() {
-        // API error (e.g., daemon couldn't spawn backend) — acceptable in CI
-        // where backends may not be installed. The test verifies the API path works.
-        let err = inner["error"].as_str().unwrap_or("unknown");
-        assert!(
-            !err.is_empty(),
-            "team creation error must be descriptive: {inner}"
-        );
-    } else {
-        let spawned = inner
-            .get("spawned")
-            .and_then(|v| v.as_array())
-            .expect("successful team creation must have 'spawned' array");
-        assert!(
-            !spawned.is_empty(),
-            "team creation must spawn at least 1 member: {inner}"
-        );
-    }
-
-    // Hard assertion: list must show agents after team creation
-    let list_resp = client
-        .call("list", &json!({}))
-        .expect("list call must succeed after team creation");
-    let agents = list_resp["result"]["agents"]
-        .as_array()
-        .expect("list must return agents array");
-    assert!(
-        !agents.is_empty(),
-        "agents list must not be empty after team creation: {list_resp}"
-    );
-
-    drop(harness);
-    std::fs::remove_dir_all(&home).ok();
-}
+// Removed `team_creation_returns_structured_response`: its branches passed on
+// EITHER success or a descriptive error, and its `list non-empty` backstop was
+// independently satisfied by the default shell agent that `AgendHarness::spawn`
+// always appends — so a complete break in team-member spawning would not fail
+// it. The stated target (team creation returns a structured spawned-array
+// response) is covered exactly by `team_recreate_extends_roster`, which asserts
+// the specific spawned ids through the same path.

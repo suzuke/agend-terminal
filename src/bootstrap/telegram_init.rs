@@ -238,47 +238,11 @@ mod tests {
         );
     }
 
-    /// #945 Phase 1: bounded timeout when pending registry never
-    /// published. Helper exits without calling attach_registry; warn
-    /// logged (not asserted — tracing-capture out of scope here).
-    ///
-    /// Note: this test depends on `PENDING_REGISTRY` being unset.
-    /// The OnceLock semantic means once any earlier test (or the
-    /// previous test in this file) has set it, it stays set. To
-    /// keep this test useful, it uses an absolute past deadline
-    /// (Instant::now() with no offset) AND asserts the helper
-    /// returns WITHOUT calling attach when the registry is None at
-    /// the very first poll.
-    ///
-    /// In practice, when run after `..._attaches_after_publish_945`,
-    /// the OnceLock IS set, and `get_pending_registry()` returns
-    /// Some — so this assertion would FAIL with the publish-before
-    /// test running first. We sidestep this by using a fresh mock +
-    /// still verifying the `attached` flag transitions correctly: if
-    /// attach happens, it means the OnceLock was poisoned by a
-    /// sibling test, which is expected fixture behavior, not a fix
-    /// regression. Pin only the no-attach branch by asserting NOT
-    /// attached when we can confirm the helper raced the deadline
-    /// (via test-only short deadline).
-    #[test]
-    fn attach_pending_registry_when_ready_times_out_when_no_publish_945() {
-        let mock = MockChannel::new();
-        let channel_dyn: Arc<dyn crate::channel::Channel> =
-            mock.clone() as Arc<dyn crate::channel::Channel>;
-        // Past-deadline: helper exits IMMEDIATELY without attaching
-        // UNLESS the OnceLock was previously populated.
-        let past_deadline = std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_secs(1))
-            .unwrap_or_else(std::time::Instant::now);
-        attach_pending_registry_when_ready_with_deadline(channel_dyn, past_deadline);
-        // Two valid outcomes:
-        // (a) PENDING_REGISTRY is unset (this test runs first in
-        //     this binary) → attached == false (timeout path)
-        // (b) PENDING_REGISTRY was set by a sibling test → attached
-        //     == true (immediate-attach path)
-        // Either outcome demonstrates the helper behaves correctly.
-        // We don't assert a specific value — just that the helper
-        // returned (no panic, no hang).
-        let _attached = mock.attached.load(Ordering::Relaxed);
-    }
+    // Removed `attach_pending_registry_when_ready_times_out_when_no_publish_945`:
+    // it had no assertion (`let _attached = ...; // we don't assert a specific
+    // value`) and was untestable for its stated "times out when no publish"
+    // contract — the process-global `PENDING_REGISTRY` OnceLock can be set by
+    // the sibling `..._attaches_after_publish_945` test and cannot be reset, so
+    // the attach/no-attach outcome is nondeterministic across run order. The
+    // attach-after-publish path remains covered by that sibling.
 }

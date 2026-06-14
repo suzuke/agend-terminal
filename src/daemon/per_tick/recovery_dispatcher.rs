@@ -1235,31 +1235,12 @@ mod tests {
         assert_eq!(tracker.recovery_restart_count, 2);
     }
 
-    #[test]
-    fn stage2_pending_timeout_drives_stage3_eligible_in_unit_form() {
-        // Pin the timeout arithmetic at the helper level: if
-        // `entered_at`'s elapsed time exceeds `timeout_window`,
-        // dispatcher transitions to Stage3Eligible. The full integration
-        // with a registered agent is deferred to a §3.14 production-hook
-        // integration test if shadow telemetry reveals edge cases;
-        // here we verify the elapsed-check predicate.
-        //
-        // Cross-platform `Instant` discipline (PR #775 v2): use
-        // `base + offset` + `saturating_duration_since` rather than
-        // `Instant::now() - offset` so the test never panics on
-        // low-uptime Windows CI VMs.
-        let base = Instant::now();
-        let timeout = Duration::from_secs(30);
-
-        let entered_at = base;
-        let now_after = base + Duration::from_secs(31);
-        assert!(now_after.saturating_duration_since(entered_at) >= timeout);
-
-        // Inverse: still within window → no escalation.
-        let recent = base;
-        let now_recent = base + Duration::from_secs(5);
-        assert!(now_recent.saturating_duration_since(recent) < timeout);
-    }
+    // Removed `stage2_pending_timeout_drives_stage3_eligible_in_unit_form`: its
+    // two assertions reduced to pure arithmetic facts on locally-constructed
+    // values (`31s >= 30s`, `5s < 30s`) and called no production code, so it
+    // could never catch a regression in the real `entered_at.elapsed() >=
+    // stage2_timeout` dispatcher path. The comment itself deferred the actual
+    // integration coverage; this stub added none.
 
     // -------------------------------------------------------------------
     // `#685` sub-task 7c Stage 3 tests. Cover the new dispatcher arm
