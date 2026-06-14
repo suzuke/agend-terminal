@@ -585,6 +585,72 @@ fn handle_done(
     }
 }
 
+/// CR-2026-06-14 (:231) — the in-lock precondition for `handle_update`'s atomic
+/// event batch. Runs under the append lock against FRESH committed `state`, so
+/// it is the AUTHORITATIVE gate the out-of-lock ACL/transition checks only
+/// fast-reject. Fails closed when, since the out-of-lock read:
+/// - the task vanished;
+/// - ownership drifted so `caller` is no longer authorized (`force` bypasses,
+///   mirroring the out-of-lock gate at :633) — this covers BOTH status and
+///   non-status updates (the latter had no in-lock guard at all before);
+/// - the status transition became illegal (the prior #1868 guard); or
+/// - the owner moved out from under a Claimed/InProgress/Done event whose `by`
+///   was baked from the now-stale owner (attribution would be wrong).
+///
+/// Pure decision logic over the supplied `state` (no `api::call` — #1629-safe to
+/// run under the lock) and a directly-testable seam.
+#[allow(clippy::too_many_arguments)]
+fn update_batch_precondition(
+    state: &crate::task_events::TaskBoardState,
+    home: &Path,
+    caller: &str,
+    upd_id: &str,
+    force: bool,
+    target_status: Option<crate::task_events::TaskStatus>,
+    stale_owner: &Option<crate::task_events::InstanceName>,
+) -> Result<(), String> {
+    let fresh = state
+        .tasks
+        .get(&crate::task_events::TaskId(upd_id.to_string()))
+        .ok_or_else(|| format!("task '{upd_id}' not found"))?;
+    // (1) Ownership ACL re-check against fresh state — same `can_mutate_record`
+    //     + force semantics as the out-of-lock gate (:633).
+    if !force && !can_mutate_record(home, caller, fresh) {
+        return Err(format!(
+            "task '{upd_id}' ownership changed since authorization; \
+             caller '{caller}' no longer authorized (retry)"
+        ));
+    }
+    // (2) Status-transition legality (#1868), keyed on the fresh record.
+    if let Some(target) = target_status {
+        if !fresh.status.can_transition_to(target) {
+            return Err(format!(
+                "illegal transition: {} → {} (task {upd_id})",
+                status_to_legacy_str(fresh.status),
+                status_to_legacy_str(target)
+            ));
+        }
+    }
+    // (3) `by`-identity drift: Claimed/InProgress/Done bake `by` from the
+    //     out-of-lock owner. If the owner moved, that attribution is stale →
+    //     reject (we don't rebuild events under the lock).
+    if matches!(
+        target_status,
+        Some(
+            crate::task_events::TaskStatus::Claimed
+                | crate::task_events::TaskStatus::InProgress
+                | crate::task_events::TaskStatus::Done
+        )
+    ) && fresh.owner != *stale_owner
+    {
+        return Err(format!(
+            "task '{upd_id}' owner changed since read; event attribution \
+             would be stale (retry)"
+        ));
+    }
+    Ok(())
+}
+
 fn handle_update(
     home: &Path,
     instance_name: &str,
@@ -839,33 +905,44 @@ fn handle_update(
         let target_status = new_status
             .as_deref()
             .and_then(crate::task_events::TaskStatus::from_str);
+        // CR-2026-06-14 (:231): the ownership ACL (`can_mutate_record` above) and
+        // the `by` field baked into Claimed/InProgress/Done events were BOTH
+        // computed from the OUT-OF-LOCK `record` read. Re-validate under the
+        // append lock against FRESH committed state so a concurrent owner change
+        // can neither (a) slip an unauthorized write past the now-stale ACL, nor
+        // (b) commit an event whose `by` attributes the transition to a former
+        // owner. Fail closed on drift — the caller retries against the new state.
+        // The pre-built events are kept (no in-lock rebuild); the drift check
+        // guarantees their `by` is still correct at commit time.
+        let stale_owner = record.owner.clone();
         let checked = crate::task_events::append_batch_checked_at(
             &board,
             &emitter,
             pending_events,
             |state| {
-                if let Some(target) = target_status {
-                    let tv = state
-                        .tasks
-                        .values()
-                        .map(record_to_task)
-                        .find(|t| t.id == upd_id)
-                        .ok_or_else(|| format!("task '{upd_id}' not found"))?;
-                    if !tv.status.can_transition_to(target) {
-                        return Err(format!(
-                            "illegal transition: {} → {} (task {upd_id})",
-                            status_to_legacy_str(tv.status),
-                            status_to_legacy_str(target)
-                        ));
-                    }
-                }
-                Ok(())
+                update_batch_precondition(
+                    state,
+                    home,
+                    &caller,
+                    &upd_id,
+                    force,
+                    target_status,
+                    &stale_owner,
+                )
             },
         );
         match checked {
             Ok(Ok(_)) => {}
             Ok(Err(reason)) => {
-                return serde_json::json!({"error": reason, "code": "illegal_transition"});
+                // Preserve the legacy `illegal_transition` code for the #1868
+                // transition guard; the new in-lock ACL/owner-drift rejections
+                // (:231) are a distinct, retryable precondition failure.
+                let code = if reason.starts_with("illegal transition") {
+                    "illegal_transition"
+                } else {
+                    "precondition_failed"
+                };
+                return serde_json::json!({"error": reason, "code": code});
             }
             Err(e) => {
                 return serde_json::json!({"error": format!("event log append_batch failed: {e}")});
@@ -1353,6 +1430,123 @@ mod tests {
         )
         .expect("create task");
         let _ = args;
+    }
+
+    /// Simulate a concurrent reassignment landing between handle_update's
+    /// out-of-lock read and its in-lock append.
+    fn reassign(home: &std::path::Path, task_id: &str, new_owner: &str) {
+        crate::task_events::append(
+            home,
+            &crate::task_events::InstanceName::from("lead"),
+            crate::task_events::TaskEvent::OwnerAssigned {
+                task_id: crate::task_events::TaskId(task_id.into()),
+                by: crate::task_events::InstanceName::from("lead"),
+                owner: Some(crate::task_events::InstanceName::from(new_owner)),
+                routed_to: None,
+            },
+        )
+        .expect("reassign");
+    }
+
+    /// CR-2026-06-14 (:231) ②, the core gap — a NON-status update (target=None)
+    /// by an unauthorized caller. Pre-fix the in-lock closure did nothing when
+    /// target_status was None, so the write slipped past the in-lock gate (RED).
+    #[test]
+    fn inlock_precond_rejects_unauthorized_nonstatus_update_231() {
+        let home = tmp_home("231-nonstatus-acl");
+        create_task(&home, "t-231-a"); // owner = dev-agent
+        let state = crate::task_events::replay(&home).unwrap();
+        let res = update_batch_precondition(
+            &state,
+            &home,
+            "intruder",
+            "t-231-a",
+            false,
+            None,
+            &Some(crate::task_events::InstanceName::from("dev-agent")),
+        );
+        assert!(
+            res.is_err(),
+            "unauthorized non-status update must be rejected in-lock"
+        );
+        assert!(res.unwrap_err().contains("no longer authorized"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// CR-2026-06-14 (:231) ① — a status update whose caller WAS authorized at
+    /// the out-of-lock read (stale_owner == caller), but the owner drifted to
+    /// someone else before the in-lock commit. The in-lock ACL must reject.
+    #[test]
+    fn inlock_precond_rejects_status_update_after_owner_reassign_231() {
+        let home = tmp_home("231-reassign");
+        create_task(&home, "t-231-b"); // owner = dev-agent
+        reassign(&home, "t-231-b", "other-owner");
+        let state = crate::task_events::replay(&home).unwrap();
+        let res = update_batch_precondition(
+            &state,
+            &home,
+            "dev-agent",
+            "t-231-b",
+            false,
+            Some(crate::task_events::TaskStatus::InProgress),
+            &Some(crate::task_events::InstanceName::from("dev-agent")),
+        );
+        assert!(
+            res.is_err(),
+            "status update after owner drift must be rejected"
+        );
+        assert!(res.unwrap_err().contains("no longer authorized"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// CR-2026-06-14 (:231) ③ — the done-arm `by` drift. A system identity
+    /// (ACL-bypassed, so the ACL gate alone wouldn't catch this) marks the task
+    /// Done; the Done event's `by` was baked from the stale owner (dev-agent),
+    /// but the task is now owned by new-owner → committing would mis-attribute.
+    #[test]
+    fn inlock_precond_rejects_done_when_by_owner_drifted_231() {
+        let home = tmp_home("231-by-drift");
+        create_task(&home, "t-231-c"); // owner = dev-agent
+        reassign(&home, "t-231-c", "new-owner");
+        let state = crate::task_events::replay(&home).unwrap();
+        let res = update_batch_precondition(
+            &state,
+            &home,
+            "system:task_sweep", // ACL bypassed → only the drift check can reject
+            "t-231-c",
+            false,
+            Some(crate::task_events::TaskStatus::Done),
+            &Some(crate::task_events::InstanceName::from("dev-agent")),
+        );
+        assert!(
+            res.is_err(),
+            "done with drifted by-owner must be rejected fail-closed"
+        );
+        assert!(res.unwrap_err().contains("attribution would be stale"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// CR-2026-06-14 (:231) control — a legitimate authorized update with no
+    /// drift MUST pass (guards against over-rejection from the new in-lock gate).
+    #[test]
+    fn inlock_precond_allows_legitimate_authorized_update_231() {
+        let home = tmp_home("231-control");
+        create_task(&home, "t-231-d"); // owner = dev-agent
+        let state = crate::task_events::replay(&home).unwrap();
+        let res = update_batch_precondition(
+            &state,
+            &home,
+            "dev-agent",
+            "t-231-d",
+            false,
+            Some(crate::task_events::TaskStatus::InProgress),
+            &Some(crate::task_events::InstanceName::from("dev-agent")),
+        );
+        assert!(
+            res.is_ok(),
+            "legitimate authorized non-drift update must pass: {res:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 
     /// §3.9 #1916 WIRING (real entry point, not just the helper): a `task update`
