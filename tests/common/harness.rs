@@ -220,6 +220,19 @@ impl AgendHarness {
         }
     }
 
+    /// The daemon's process-group id (== the daemon pid; `setsid` is run in
+    /// `pre_exec` so the spawned daemon is its own session/group leader).
+    /// Tests capture this BEFORE `drop` to assert the whole group is gone
+    /// afterwards (`kill(-pgid, 0)` → `ESRCH`) — the real "no orphans"
+    /// contract, immune to the ephemeral-port-reuse false-positive that the
+    /// old port-connectability proxy suffered. `#[allow(dead_code)]` mirrors
+    /// `api_call` / `spawn_with`: not every cross-binary test caller uses it.
+    #[cfg(unix)]
+    #[allow(dead_code)]
+    pub fn pgid(&self) -> i32 {
+        self.pgid
+    }
+
     /// Send an API request and get the response.
     #[allow(dead_code)]
     pub fn api_call(&self, request: &serde_json::Value) -> Result<serde_json::Value, String> {
