@@ -775,15 +775,46 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
     // so a hostile template cannot override ANTHROPIC_API_KEY, LD_PRELOAD,
     // AGEND_HOME, etc. with attacker-controlled values inherited by the
     // spawned agent process.
+    //
+    // #2106: EXCEPTION — a sensitive key is allowed through when it is a
+    // credential the detected backend declares (`credential_env_keys`, the same
+    // per-backend override the #1440 isolation path applies in
+    // `resolve_child_env`). Operators legitimately point an instance at a
+    // third-party provider (e.g. an `ANTHROPIC_BASE_URL` proxy +
+    // `ANTHROPIC_AUTH_TOKEN`), and the operator's fleet.yaml is a TRUSTED source
+    // under the single-machine single-user threat model (anyone who can write
+    // fleet.yaml can already run arbitrary code as the user). This stays NARROW:
+    // only THIS backend's own credential keys pass — linker-injection
+    // (`LD_*`/`DYLD_*`), home/identity redirect (`AGEND_HOME`,
+    // `AGEND_INSTANCE_NAME`), and foreign credentials (`AWS_*`, `GITHUB_TOKEN`,
+    // another backend's key) are NOT in this backend's credential set, so they
+    // are still dropped even from fleet.yaml. `is_sensitive_env_key` / the
+    // deny-list itself are unchanged, so every OTHER enforcement point (the
+    // isolation passthrough, etc.) keeps its protection.
+    let backend_creds: &[&str] = detected_backend
+        .as_ref()
+        .map(|b| b.credential_env_keys())
+        .unwrap_or(&[]);
     if let Some(env_map) = *env {
         for (k, v) in env_map {
             if is_sensitive_env_key(k) {
-                tracing::warn!(
-                    instance = %name,
-                    key = %k,
-                    "dropping fleet.yaml env override for sensitive key"
-                );
-                continue;
+                if env_key_in(k, backend_creds) {
+                    // Audit the override (key NAME only — never the secret value).
+                    // One line per spawn of an instance that sets a per-instance
+                    // credential; not a per-tick flood.
+                    tracing::info!(
+                        instance = %name,
+                        key = %k,
+                        "#2106: injecting operator fleet.yaml credential override (backend-declared credential key)"
+                    );
+                } else {
+                    tracing::warn!(
+                        instance = %name,
+                        key = %k,
+                        "dropping fleet.yaml env override for sensitive key"
+                    );
+                    continue;
+                }
             }
             cmd.env(k, v);
         }
