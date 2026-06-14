@@ -2,6 +2,7 @@
 
 mod acl;
 pub mod auto_close;
+mod board_router;
 mod handler;
 pub mod lifecycle;
 mod orphan;
@@ -224,7 +225,14 @@ pub fn load_by_id(home: &Path, task_id: &str) -> Option<Task> {
 /// per m-42); explicit operator-emitted Blocked/Unblocked events are
 /// honoured by replay's `apply()` as before.
 pub fn list_all(home: &Path) -> Vec<Task> {
-    let state = crate::task_events::replay(home).unwrap_or_default();
+    list_all_at(home)
+}
+
+/// #2117 P1: list a specific board's tasks (board-root replay + in-memory dep
+/// eval). `list_all(home)` is exactly `list_all_at(home)` — byte-identical,
+/// since `home` is the default board root (`board_root(home, DEFAULT)`).
+pub(crate) fn list_all_at(board: &Path) -> Vec<Task> {
+    let state = crate::task_events::replay_at(board).unwrap_or_default();
     let mut tasks: Vec<Task> = state.tasks.values().map(record_to_task).collect();
     apply_dependency_eval_in_memory(&mut tasks);
     tasks
