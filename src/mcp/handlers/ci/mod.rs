@@ -145,30 +145,21 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             }
         }
     }
-    // #1494: idempotent bind. When `bind:true` and THIS agent already holds a
-    // binding on the SAME branch whose worktree is live on disk, the branch was
-    // already provisioned — by the dispatch pre-build hook (binding.json +
-    // worktree at `<agent>/<branch>`) or a prior `repo checkout`. The direct
-    // `git worktree add` below would otherwise fail with "is already checked
-    // out" (the same branch is leased at the dispatch path, a DIFFERENT dir
-    // than this handler's `<agent>-<source>` scheme), forcing a manual `cd`.
-    // Return the EXISTING worktree path as success instead — same spirit as
-    // #1465 idempotent-release: operation already at target state = success.
-    //
-    // Cross-agent safety: `binding::read` is keyed per-agent, so a DIFFERENT
-    // agent holding the branch leaves this agent's binding absent/mismatched —
-    // the short-circuit does NOT fire and the genuine `git worktree add`
-    // conflict error below is preserved. Same-agent DIFFERENT-branch bindings
-    // also fall through (branch mismatch), unchanged.
-    //
-    // #1882 (reviewer-2): repo checkout is the THIRD production bind path (besides
-    // the dispatch + bind_self funnel through dispatch_auto_bind_lease). Hold the
-    // SAME per-branch lease flock across its check-then-act (cross-agent scan +
-    // idempotent read + git worktree add + bind_full) so a concurrent dispatch or
-    // another repo checkout can't double-bind the branch. Bind-only (a `--detach`
-    // checkout writes no binding); the guard lives to fn end so it covers bind_full.
-    // #2117 P3b: lease key is (source_repo, branch); `source_canonical` is the
-    // same repo path bind_full persists below, so lock/scan/bind keys agree.
+    // #1494: idempotent bind. If THIS agent already holds a binding on the SAME
+    // branch with a live worktree (provisioned by the dispatch pre-build hook or a
+    // prior `repo checkout`), the `git worktree add` below would fail "is already
+    // checked out" (leased at a DIFFERENT dir than this handler's `<agent>-<source>`
+    // scheme). Return the EXISTING worktree as success (#1465 idempotent-release
+    // spirit). Cross-agent-safe: `binding::read` is per-agent, so a DIFFERENT agent
+    // (or same-agent DIFFERENT branch) does NOT short-circuit — the genuine `git
+    // worktree add` conflict error below is preserved.
+    // #1882 (reviewer-2): repo checkout is the THIRD bind path (besides dispatch +
+    // bind_self via dispatch_auto_bind_lease); hold the per-branch lease flock
+    // across its check-then-act (cross-agent scan + idempotent read + worktree add +
+    // bind_full) so a concurrent dispatch/checkout can't double-bind. Bind-only (a
+    // `--detach` checkout writes no binding); guard lives to fn end (covers bind_full).
+    // #2117 P3b: lease key is (source_repo, branch); `source_canonical` is the same
+    // repo path bind_full persists below, so lock/scan/bind keys agree.
     let source_repo_str = source_canonical.display().to_string();
     let _lease_lock = if bind {
         match crate::binding::acquire_branch_lease_lock(home, &source_repo_str, branch) {
@@ -506,12 +497,6 @@ pub(super) fn handle_release_repo(args: &Value) -> Value {
     }
 }
 
-/// `ci watch` action: subscribe `instance_name` to CI notifications for
-/// `repo@branch`. Sprint 54 P0-1 changes this from last-write-wins
-/// (the previous behavior overwrote the entire watch file, dropping any
-/// other agent's subscription) to APPEND idempotent semantics — the
-/// caller is added to a `subscribers` array if not already present, and
-/// existing poll state (`last_run_id`, `head_sha`, etc.) is preserved.
 /// #1619: resolve the target `owner/repo` for a PR/CI handler.
 ///
 /// Resolution order: explicit `repository` arg (canonicalized) → the
@@ -583,6 +568,9 @@ fn resolve_repo_or_error(home: &Path, instance_name: &str, args: &Value) -> Resu
     }
 }
 
+/// `ci watch` action: APPEND-idempotently subscribe `instance_name` to CI
+/// notifications for `repo@branch` (Sprint 54 P0-1: preserves other agents'
+/// subscriptions + existing poll state, vs the prior last-write-wins overwrite).
 pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) -> Value {
     // Sprint 55 P0-B: when caller omits `repo` arg, auto-derive from
     // sender's binding.json source_repo (set by `bind_self` /

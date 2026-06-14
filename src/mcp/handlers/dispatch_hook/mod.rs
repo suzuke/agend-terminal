@@ -369,22 +369,18 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
         });
     }
 
-    // #1882: hold a per-BRANCH lease flock across the P0-1.5 scan + the bind_full
-    // below so the check-then-bind is ATOMIC. Without it, two DIFFERENT agents
-    // racing to lease the SAME branch both passed the scan (neither had bound yet)
-    // and both bound — violating "a branch is held by at most one agent". Keyed on
-    // the branch (not the agent): the second racer blocks here, then its scan below
-    // sees the first's binding and rejects. Two of the three production bind paths
-    // funnel through this fn (dispatch auto-bind AND bind_self via
-    // dispatch_auto_bind_lease_with_source); the third — repo checkout
-    // (`ci/mod.rs`, reviewer-2 #1882) — takes the SAME `acquire_branch_lease_lock`
-    // around its own scan + bind_full, so all three serialize on the one branch
-    // lock. Lock order is consistent (per-agent BindGuard
-    // above → this branch lock → per-agent binding lock inside bind_full), so no
-    // deadlock; different branches use different lock files → no cross-branch
-    // contention. Held only across the bind (a short mutex), so release is unaffected.
-    // #2117 P3b: the lease key is (source_repo, branch). `source_repo` resolved
-    // above (tier-stubbed when unknown, so non-empty on every production path).
+    // #1882: hold a per-BRANCH lease flock across the P0-1.5 scan + bind_full so
+    // check-then-bind is ATOMIC — else two agents racing the SAME branch both pass
+    // the scan (neither bound yet) and both bind. Keyed on branch: the second racer
+    // blocks here, then its scan below sees the first's binding and rejects. All
+    // THREE production bind paths serialize on this one lock (dispatch auto-bind +
+    // bind_self via dispatch_auto_bind_lease_with_source here; repo checkout
+    // `ci/mod.rs` takes the same `acquire_branch_lease_lock`). Lock order (per-agent
+    // BindGuard above → this branch lock → per-agent binding lock in bind_full) → no
+    // deadlock; per-branch lock files → no cross-branch contention; short mutex held
+    // only across the bind → release unaffected.
+    // #2117 P3b: lease key is (source_repo, branch); `source_repo` resolved above
+    // (tier-stubbed when unknown → non-empty on every production path).
     let source_repo_str = source_repo.display().to_string();
     let _lease_lock = crate::binding::acquire_branch_lease_lock(home, &source_repo_str, branch)
         .map_err(|e| DispatchError {
@@ -657,41 +653,26 @@ fn resolve_source_repo(
     (stub, SourceRepoTier::Stub)
 }
 
-/// #781 Piece 6: shared auto-create-branch helper. Encapsulates the
-/// decision tree previously inlined in
-/// `mcp::handlers::ci::handle_checkout_repo` (introduced in #780). Both
-/// the `repo action=checkout bind:true` MCP tool entry and
-/// `dispatch_auto_bind_lease` now route through this single helper so
-/// the fast path (zero network on missing-branch-with-local-origin/main)
-/// and the lazy fetch fallback live in one place.
+/// #781 Piece 6: shared auto-create-branch helper (decision tree formerly inlined
+/// in `ci::handle_checkout_repo`, #780). Both `repo action=checkout bind:true` and
+/// `dispatch_auto_bind_lease` route through here so the fast path (zero network on
+/// missing-branch-with-local-origin/main) and the lazy-fetch fallback live in one
+/// place. Behavior (mirror #784 / decision d-20260514102305998399-0):
 ///
-/// Behavior (mirror #784 / decision d-20260514102305998399-0):
-/// 1. `rev-parse --verify refs/heads/<branch>` — if exists, **fetch
-///    `origin <branch>` + `update-ref refs/heads/<branch>
-///    refs/remotes/origin/<branch>`** so the (about-to-be-bound)
-///    local ref tracks the remote PR HEAD (#869 fix — stale local
-///    refs from prior cycles were landing the bound worktree at the
-///    wrong SHA). Returns `(auto_created=false, fetch_attempted=N)`
-///    where N reflects whether the fetch actually succeeded.
-///    `update-ref` is no-op when `origin/<branch>` doesn't exist
-///    (newly-pushed branches not yet observed locally) or when the
-///    fetch fails (network outage); in both cases the local ref is
-///    left unchanged and the caller still gets a usable lease.
-/// 2. Else `git branch <branch> <from_ref>`:
-///    - success → `(true, false)`
-///    - stderr `"already exists"` (concurrent race) → `(false, false)`
-///    - stderr `"not a valid object name"` / `"not a valid ref"` →
-///      `git fetch origin --quiet` then retry; success → `(true, true)`;
-///      retry race "already exists" → `(false, true)`; otherwise
-///      structured error.
+/// 1. `rev-parse --verify refs/heads/<branch>` exists → **fetch `origin <branch>`,
+///    then `update-ref refs/heads/<branch> refs/remotes/origin/<branch>`** so the
+///    bound local ref tracks the remote PR HEAD (#869: stale local refs landed the
+///    worktree at the wrong SHA). Returns `(auto_created=false, fetch_attempted=N)`;
+///    the `update-ref` is a no-op when `origin/<branch>` is absent or the fetch
+///    fails (local ref unchanged, lease still usable).
+/// 2. Else `git branch <branch> <from_ref>`: success → `(true,false)`; stderr
+///    `"already exists"` (race) → `(false,false)`; `"not a valid object name/ref"`
+///    → `git fetch origin --quiet` then retry (success `(true,true)`, race
+///    `(false,true)`, else structured error).
 ///
-/// `from_ref` runs through `validate_branch` (defense in depth) to
-/// reject option-injection (`--upload-pack=...`) at the daemon API
-/// boundary — same rule applied to the user-supplied `branch` arg.
-///
-/// `actor` is the agent / instance name used as `event_log` identifier
-/// for the fetch-duration breadcrumb (helps post-mortem who triggered
-/// the network I/O).
+/// `from_ref` runs through `validate_branch` (defense in depth) to reject
+/// option-injection (`--upload-pack=...`) at the daemon API boundary (same as the
+/// `branch` arg). `actor` = the event_log id for the fetch-duration breadcrumb.
 /// #2010 (cheerc RCA): resolve which git remote a `from_ref` names, by
 /// LONGEST-PREFIX match against the repo's actual remote list. Branch names can
 /// contain `/`, so a naive `split('/')` mis-parses `upstream/feat/x`; matching
