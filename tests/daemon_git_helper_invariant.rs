@@ -48,6 +48,12 @@ const MODULE_SCOPE: &[&str] = &[
     "worktree_cleanup.rs",
     "branch_sweep.rs",
     "binding.rs",
+    // W1.2 slice (#2068 follow-up): mcp_config (git init→git_cmd),
+    // instructions (rev-parse/init→git_ok), skills (rev-parse HEAD→git_cmd;
+    // network clones kept raw via git-raw-allowed).
+    "mcp_config.rs",
+    "instructions.rs",
+    "skills.rs",
 ];
 
 /// One violation entry — `(file, line_number, snippet)`.

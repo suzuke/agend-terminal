@@ -64,31 +64,19 @@ pub(crate) fn ensure_project_root(dir: &Path) {
     if !dir.exists() {
         return;
     }
-    let inside = std::process::Command::new("git")
-        .args([
-            "-C",
-            &dir.display().to_string(),
-            "rev-parse",
-            "--is-inside-work-tree",
-        ])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+    // W1.2: cwd=dir replaces `-C dir`; git_ok = spawn-and-exit-0 (bypass env +
+    // local timeout + process-group kill bundled). Local rev-parse.
+    let inside = crate::git_helpers::git_ok(dir, &["rev-parse", "--is-inside-work-tree"]);
     if inside {
         return;
     }
 
-    let init_ok = std::process::Command::new("git")
-        .args(["-C", &dir.display().to_string(), "init", "--quiet"])
-        // #2071: discard stdout/stderr. In app mode this runs in the TUI
-        // process; an un-redirected child inherits the TUI's TTY and `git
-        // init`'s hints/warnings (not all silenced by --quiet) would garble
-        // the ratatui frame. We only read the exit status.
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    // #2071: an un-redirected child in app mode inherits the TUI's TTY and `git
+    // init`'s hints/warnings garble the ratatui frame. git_ok runs git via
+    // git_bypass, which CAPTURES stdout/stderr (pipes — never the inherited TTY),
+    // so the explicit Stdio::null is no longer needed; we only read the exit
+    // status. W1.2: cwd=dir replaces `-C dir`.
+    let init_ok = crate::git_helpers::git_ok(dir, &["init", "--quiet"]);
 
     if init_ok {
         let ignore_path = dir.join(".gitignore");

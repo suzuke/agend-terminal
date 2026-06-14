@@ -191,6 +191,10 @@ pub fn add(home: &Path, source: &str) -> Result<Skill> {
                     std::fs::remove_dir_all(&tmp)
                         .with_context(|| format!("clean clone tmp {}", tmp.display()))?;
                 }
+                // git-raw-allowed: network clone — git_ok/git_cmd impose
+                // LOCAL_GIT_TIMEOUT, which would prematurely kill a large/slow
+                // network clone. Deliberately NOT migrated in W1.2; the explicit
+                // Stdio::null below already keeps progress off the inherited TTY.
                 let status = std::process::Command::new("git")
                     .args(["clone", "--depth=1", url.as_str()])
                     .arg(&tmp)
@@ -226,6 +230,8 @@ pub fn add(home: &Path, source: &str) -> Result<Skill> {
                     .with_context(|| format!("copy subdir {sub} → {}", dest.display()))?;
                 let _ = std::fs::remove_dir_all(&tmp);
             } else {
+                // git-raw-allowed: network clone (see the subdir-clone site
+                // above) — LOCAL_GIT_TIMEOUT would kill a large clone; not migrated.
                 let status = std::process::Command::new("git")
                     .args(["clone", "--depth=1", url.as_str()])
                     .arg(&dest)
@@ -697,15 +703,11 @@ fn git_repo_name(url: &str) -> Option<String> {
 
 fn compute_version(dest: &Path, source: &str) -> String {
     if source.starts_with("http") || source.starts_with("git@") || source.starts_with("ssh://") {
-        // Git source — read HEAD SHA from the cloned tree.
-        std::process::Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(dest)
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default()
+        // Git source — read HEAD SHA from the cloned tree. W1.2: git_cmd returns
+        // the trimmed stdout (the SHA) on success, Err on failure → "" — same
+        // result as the prior output().ok().and_then(utf8).map(trim) chain (local
+        // rev-parse, so the local timeout is ample).
+        crate::git_helpers::git_cmd(dest, &["rev-parse", "HEAD"]).unwrap_or_default()
     } else {
         // Path source — use destination dir mtime as an opaque pin.
         std::fs::metadata(dest)

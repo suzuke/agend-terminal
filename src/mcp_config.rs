@@ -161,22 +161,11 @@ fn configure_claude(working_dir: &Path, instance_name: Option<&str>) -> Result<(
     // Ensure working dir is a git repo (Claude Code needs git root to find .claude/)
     let git_dir = working_dir.join(".git");
     if !git_dir.exists() {
-        match std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(working_dir)
-            .output()
-        {
-            Ok(o) if !o.status.success() => {
-                tracing::warn!(
-                    dir = %working_dir.display(),
-                    stderr = %String::from_utf8_lossy(&o.stderr).trim(),
-                    "git init failed"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(dir = %working_dir.display(), error = %e, "git init failed");
-            }
-            _ => {}
+        // W1.2: git_cmd bundles the bypass env + LOCAL timeout + process-group
+        // kill; its GitError carries the stderr/spawn detail the warn logged by
+        // hand (init is local, so the local timeout is ample).
+        if let Err(e) = crate::git_helpers::git_cmd(working_dir, &["init"]) {
+            tracing::warn!(dir = %working_dir.display(), error = %e, "git init failed");
         }
     }
 
