@@ -304,17 +304,17 @@ mod tests {
     }
 
     #[test]
-    fn reply_to_ephemeral_across_restart() {
-        let name = "test-reply-to-ephemeral";
-        update_with(name, |p| {
-            p.reply_to_channel = Some("telegram".to_string());
-            p.reply_to_input_id = Some(99);
-        });
-        // Simulate restart: clear the global registry (new HeartbeatPair is Default).
+    fn default_heartbeat_pair_reply_to_fields_are_none() {
+        // The reply-to routing fields are EPHEMERAL: a fresh (e.g.
+        // post-restart) HeartbeatPair must default them to None rather than
+        // carry a persisted value. The previous version (named
+        // `reply_to_ephemeral_across_restart`) set registry state via
+        // `update_with` then ignored it, asserting only on `default()`, and
+        // its "simulate restart" comment was inaccurate — nothing was reset.
         let fresh = HeartbeatPair::default();
         assert_eq!(
             fresh.reply_to_channel, None,
-            "default must be None (ephemeral)"
+            "default reply_to_channel must be None (ephemeral)"
         );
         assert_eq!(fresh.reply_to_input_id, None);
     }

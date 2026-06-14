@@ -214,12 +214,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn latest_metrics_empty_on_startup() {
-        // Before any collection, cache is empty.
+    fn latest_metrics_does_not_panic_before_collection() {
+        // `latest_metrics()` reads a process-global cache, so its emptiness is
+        // test-ordering dependent and can't be asserted (the previous name
+        // `latest_metrics_empty_on_startup` over-promised). What IS guaranteed:
+        // reading the cache before/without any collection must not panic and
+        // must return a well-formed Vec.
         let m = latest_metrics();
-        // May or may not be empty depending on test ordering,
-        // but should not panic.
-        let _ = m;
+        // Touch the result so the call can't be optimized away; any panic in
+        // latest_metrics() fails the test.
+        assert!(m.len() <= m.capacity());
     }
 
     fn node(mem: u64, parent: Option<u32>) -> ProcNode {

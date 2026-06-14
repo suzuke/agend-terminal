@@ -487,7 +487,8 @@ mod tests {
     fn boot_sweep_malformed_env_parse_safety() {
         let home = tmp_home("t8-badenv");
         let (pid, reaper) = spawn_sigterm_respecter();
-        let run_dir = plant_run_dir(&home, pid);
+        // Plant a zombie run-dir so the sweep has a candidate to (not) act on.
+        let _run_dir = plant_run_dir(&home, pid);
         // SAFETY: tests serialised via `serial_test::serial`; no other thread
         // mutates these env vars concurrently within a serial scope.
         unsafe {
@@ -502,10 +503,11 @@ mod tests {
             killed, 0,
             "malformed env must NOT trigger destructive sweep"
         );
-        assert!(
-            run_dir.exists() || !run_dir.exists(),
-            "candidate may or may not surface depending on default threshold"
-        );
+        // (Removed a `run_dir.exists() || !run_dir.exists()` tautology here:
+        // whether a freshly-planted dir surfaces as a candidate depends on the
+        // fallback age threshold, so its post-sweep state is genuinely
+        // indeterminate and not worth a vacuous assert. The load-bearing
+        // guarantees — no destructive sweep, child survives — are asserted.)
         assert!(
             crate::process::is_pid_alive(pid),
             "child must remain alive after malformed-env sweep"

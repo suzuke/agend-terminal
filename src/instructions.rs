@@ -1009,8 +1009,13 @@ mod tests {
             "instructions must explain [AGEND-MSG] is a system event"
         );
         assert!(
-            body.contains("inbox") || body.contains("inbox"),
-            "instructions must mention inbox/inbox for size= headers"
+            // The [AGEND-MSG] rule tells agents a `size=` header means the body
+            // is in the inbox (fetch via the inbox tool). The previous
+            // assertion was `body.contains("inbox") || body.contains("inbox")`
+            // — both arms identical, so the `size=` half it claimed to check
+            // was never verified. Require BOTH mentions.
+            body.contains("inbox") && body.contains("size="),
+            "instructions must mention the inbox tool AND the size= header rule"
         );
     }
 

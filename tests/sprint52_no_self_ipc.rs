@@ -47,12 +47,19 @@ fn supervisor_does_not_call_daemon_api() {
 
 #[test]
 fn router_allows_direct_pty_and_heartbeat() {
-    // Positive check: router.rs is allowed to use these patterns.
+    // Positive regression pin: the router keeps the direct-dispatch paths it
+    // is ALLOWED to use (the no-self-ipc rule forbids self-targeting, not
+    // these). The previous version discarded every `contains(...)` into `_`
+    // and only asserted `!src.is_empty()` — vacuous, since `include_str!` of a
+    // non-empty file can never be empty (it would not compile). Assert the
+    // direct paths are actually present so their removal is caught.
     let src = include_str!("../src/daemon/router.rs");
-    // These are allowed (no assertion failure):
-    let _ = src.contains("heartbeat_pair");
-    let _ = src.contains("inject_to_agent");
-    let _ = src.contains("channel::send_from_agent");
-    // Just verify the file is non-empty and parseable.
-    assert!(!src.is_empty(), "router.rs must exist and be non-empty");
+    assert!(
+        src.contains("heartbeat_pair"),
+        "router.rs must keep the direct heartbeat_pair path"
+    );
+    assert!(
+        src.contains("channel::send_from_agent"),
+        "router.rs must keep the direct channel::send_from_agent path"
+    );
 }

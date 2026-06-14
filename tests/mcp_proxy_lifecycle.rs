@@ -102,9 +102,12 @@ fn tcp_drop_mid_session_produces_error() {
     handle.join().expect("mock daemon thread");
 }
 
-/// Test: concurrent callers get correct request_id roundtrip.
+/// Test: sequential requests on a single connection each get the matching
+/// response back (no response interleave / off-by-one). NOTE: despite the old
+/// name, this drives 3 requests SEQUENTIALLY (not concurrently) and matches on
+/// the echoed `tool` field — there is no `request_id` in the protocol here.
 #[test]
-fn concurrent_callers_request_id_roundtrip() {
+fn sequential_calls_tool_field_roundtrip() {
     let (listener, cookie) = mock_daemon();
     let port = listener.local_addr().unwrap().port();
 

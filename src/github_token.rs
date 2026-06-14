@@ -302,11 +302,14 @@ mod tests {
     }
 
     #[test]
-    fn empty_env_falls_through_to_gh() {
-        // Defensive: an env var set to "" or whitespace must NOT count
-        // as a real token. An operator who exports `GITHUB_TOKEN=` (no
-        // value) should still get the gh fallback path, not silently
-        // hit unauthenticated.
+    fn discover_with_treats_nonempty_env_as_authoritative() {
+        // `discover_with` itself does NOT trim or validate: it treats any
+        // `Some(_)` env value as authoritative (even whitespace), choosing
+        // TokenSource::Env over the gh fallback. The previous name
+        // (`empty_env_falls_through_to_gh`) and this comment described the
+        // OPPOSITE of what is asserted — whitespace/blank-as-unset trimming
+        // lives in DefaultEnvReader, covered by the sibling test
+        // `default_env_reader_trims_and_treats_blank_as_unset`.
         let env = StubEnv(Some("   ".to_string()));
         // The DefaultEnvReader strips whitespace — but StubEnv is a
         // direct stub. To exercise the same trim logic we rely on the
