@@ -633,6 +633,21 @@ event that triggers `terminal.clear()`). **Do NOT hunt for a fix in agend's
 `vterm` / `render` layers — both are clean.** If mitigation is ever pursued it
 belongs at the inject-timing / forced-redraw layer, not the render path.
 
+### 10.9 GitHub CLI Authorship Signature (soft convention)
+
+All fleet instances share the operator's GitHub account, so `gh`-authored issues, PRs, and comments carry no instance/model attribution — unlike git commits, which get auto-stamped `Agend-Agent` trailers via the `prepare-commit-msg` hook (§10.7). There is **no** `gh` shim; this is a soft convention, not enforced interception.
+
+When you author a body-bearing `gh` action (`gh issue create`, `gh pr create`, `gh pr comment`, `gh pr review`), append a one-line signature to the body when attribution matters — multi-agent threads, cross-team handoffs, anything an operator may later need to trace to a specific instance:
+
+```
+---
+*<instance-name>* · <backend/model>
+```
+
+Use `$AGEND_INSTANCE_NAME` for the instance and your resolved backend/model. Skip it for trivial passthrough comments where authorship is obvious. Soft requirement — omission is not a gate failure.
+
+↳ 緣由 A-§10.9
+
 ## §11. Tool Quick Reference
 
 | Need | Use | NOT this |
@@ -805,6 +820,9 @@ Pattern caught 2026-05-14 PR #772 v1 → v3 evolution; v1's `cargo --version` ex
 
 ### A-§7.3 — Wedged-Run Recovery
 PR #863 (#852 residual PR-A) hit a `windows-latest` wedge on 2026-05-16. The job stayed `in_progress` for 9+ hours starting at 15:19 UTC; `gh run cancel` was accepted but the job never transitioned. Empty-commit nudge dispatched at 16:14 UTC → fresh CI fired → green within ~10 min → merge proceeded. Operator-authorized, ~5 min total recovery vs. the alternative (wait 6 hours for GH-Actions timeout + manual re-trigger).
+
+### A-§10.9 — GitHub CLI Authorship Signature
+#2109 proposed an `agend-gh` shim (analog to `agend-git`) to auto-inject instance+model into gh bodies. Operator ruled against the shim (2026-06-14): the `agend-git` shim is a behavioral-correctness necessity (worktree redirect, #821/#1463) without which the daemon breaks, whereas gh authorship is observability cosmetics — a second PATH-hijack shim binary for it is over-engineering. Downgraded to the §10.9 soft convention; #2109 closed as a note.
 
 ### A-§13.5 — Bug-Blocks-Its-Own-Fix Exception
 Reference: PR #779 (Sprint 61) Option 1 + Option 3 daemon binding fix shipped under this exception. PR #781 + #800 followed standard ZERO BYPASS workflow.
