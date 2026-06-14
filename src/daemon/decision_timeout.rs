@@ -118,7 +118,21 @@ pub(crate) fn record_pending_decision(
     // ones to timeout-fire unexpectedly.
     for d in list_pending(home) {
         if d.sender == sender && d.status == "pending" {
+            // #1116/H2: delete the prior sidecar UNDER its per-decision flock,
+            // so this cancel is mutually exclusive with `scan_and_emit`'s
+            // read→flip→write window. A bare `remove_file` can land mid-RMW:
+            // scan reads the sidecar, this cancel removes it, then scan's
+            // `write_decision` re-creates it as `status="timeout"` — the
+            // just-cancelled sidecar is RESURRECTED and lingers forever, and a
+            // timeout event fires for a decision the operator was superseding.
+            // Mirrors the same `acquire_file_lock(&decision_lock_path(..))` that
+            // `mark_resolved_for_sender` and `scan_and_emit` already hold.
+            let lock_path = decision_lock_path(home, &d.decision_id);
+            let guard = crate::store::acquire_file_lock(&lock_path).ok();
             let _ = std::fs::remove_file(pending_path(home, &d.decision_id));
+            // Release the OS lock BEFORE removing the lock file itself.
+            drop(guard);
+            let _ = std::fs::remove_file(&lock_path);
         }
     }
     let decision_id = next_decision_id();
