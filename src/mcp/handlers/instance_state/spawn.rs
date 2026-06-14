@@ -97,6 +97,14 @@ pub(in crate::mcp::handlers) fn spawn_single_instance_impl(
         if !validate_branch(branch) {
             return json!({"error": format!("invalid branch name '{branch}'")});
         }
+        // H6 (CR-2026-06-14): validate_branch ALLOWS main/master, so the spawn
+        // path must also fire the E4.5 protected-branch gate — else
+        // create_instance(branch="main") checks a protected branch into an agent
+        // worktree, violating the system-wide "worktree never takes main"
+        // invariant (the same guard bind_self / worktree_pool::lease enforce).
+        if let Err(e) = crate::agent_ops::ensure_not_protected_json(branch) {
+            return e;
+        }
         let wd = std::path::PathBuf::from(&work_dir);
         // Sprint 57 Wave 4 (#546 Item 4): worktree creation now takes
         // `home` so the canonical external layout
