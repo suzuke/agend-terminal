@@ -2,6 +2,13 @@
 pub mod capture;
 pub mod sync_audit;
 
+/// Re-export for integration tests. Same source file as the binary crate's
+/// `invariant_inputs` module (`#[path]`), so the merge-freshness gate and the
+/// `file_size_invariant` cross-check read the identical grandfathered list and
+/// cannot drift. #2140 follow-up A.
+#[path = "invariant_inputs.rs"]
+pub mod invariant_inputs;
+
 /// Re-export for integration tests. The actual implementation lives in the
 /// binary crate's `daemon::heartbeat_pair` module.
 pub mod daemon {

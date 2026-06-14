@@ -44,6 +44,7 @@ mod inbox;
 mod instance_monitor;
 mod instructions;
 mod integrity_core;
+mod invariant_inputs;
 mod ipc;
 mod keybinds;
 mod layout;

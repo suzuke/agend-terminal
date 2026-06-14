@@ -24,15 +24,15 @@ use crate::scm::ScmProvider;
 use serde_json::{json, Value};
 
 /// A whole-tree invariant's INPUT files — the ones whose combined change across
-/// interleaved PRs can violate a tree-wide check. Kept in sync with the
-/// `KNOWN_OVERSIZED` handler paths in `tests/file_size_invariant.rs`, plus every
-/// invariant *test* itself (a PR that tightens an invariant can RED main the same
-/// way a ceiling-setter did).
+/// interleaved PRs can violate a tree-wide check. The grandfathered handler
+/// paths come from the single source of truth in
+/// [`crate::invariant_inputs::GRANDFATHERED_OVERSIZED_HANDLERS`] (the same list
+/// `tests/file_size_invariant.rs::KNOWN_OVERSIZED` records ceilings for), plus
+/// every invariant *test* itself (a PR that tightens an invariant can RED main
+/// the same way a ceiling-setter did).
 pub(super) fn is_invariant_input(path: &str) -> bool {
-    matches!(
-        path,
-        "src/mcp/handlers/ci/mod.rs" | "src/mcp/handlers/dispatch_hook/mod.rs"
-    ) || (path.starts_with("tests/") && path.ends_with("_invariant.rs"))
+    crate::invariant_inputs::GRANDFATHERED_OVERSIZED_HANDLERS.contains(&path)
+        || (path.starts_with("tests/") && path.ends_with("_invariant.rs"))
 }
 
 /// Verdict of the freshness gate. `StaleRisky` carries the offending

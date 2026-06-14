@@ -129,3 +129,29 @@ fn mcp_handler_files_under_max_loc() {
         );
     }
 }
+
+/// #2140 follow-up A: pin `KNOWN_OVERSIZED`'s paths to the merge-freshness gate's
+/// grandfathered list (the shared single source of truth). Without this, adding a
+/// third oversized handler here but forgetting `is_invariant_input` would silently
+/// un-gate that file from the #2140 stale-base merge protection — the very
+/// silent-gate-miss class #2140 closes. Both sides read
+/// `GRANDFATHERED_OVERSIZED_HANDLERS` (the gate via `is_invariant_input`, this
+/// test directly), so any divergence fails CI loud.
+#[test]
+fn known_oversized_paths_match_merge_freshness_inputs() {
+    use std::collections::BTreeSet;
+    let ceiling_paths: BTreeSet<&str> = KNOWN_OVERSIZED.iter().map(|(p, _)| *p).collect();
+    let gate_paths: BTreeSet<&str> =
+        agend_terminal::invariant_inputs::GRANDFATHERED_OVERSIZED_HANDLERS
+            .iter()
+            .copied()
+            .collect();
+    assert_eq!(
+        ceiling_paths, gate_paths,
+        "drift between KNOWN_OVERSIZED and the merge-freshness gate's grandfathered \
+         list (GRANDFATHERED_OVERSIZED_HANDLERS): a grandfathered oversized file must \
+         appear in BOTH, else it is silently un-gated from #2140's stale-base merge \
+         refusal. Add the new path to GRANDFATHERED_OVERSIZED_HANDLERS (gate input) \
+         and KNOWN_OVERSIZED (with its LOC ceiling)."
+    );
+}
