@@ -83,6 +83,7 @@ const SYSTEM_IDENTITIES: &[&str] = &[
     "system:auto_orphan",
     "system:branch_sweep",
     "system:overdue_sweep",
+    "system:reclaim_usage_limit",
     "system:task_sweep",
 ];
 
@@ -117,5 +118,69 @@ pub(super) fn can_mutate_record(
             }
             false
         }
+    }
+}
+
+/// #2127 Phase 1 / #2117 P3 — per-board mutation authority. May `caller` mutate
+/// tasks on the board identified by `board_project`?
+///
+/// Semantics (aligned with [`can_mutate_record`]): a recognized system identity
+/// bypasses; otherwise the caller's resolved project
+/// (agent→team→`source_repo`→project, via
+/// [`super::board_router::resolve_current_project`]) must equal `board_project`,
+/// else **deny (fail-closed)**. A single-project fleet resolves every caller and
+/// task to `DEFAULT_PROJECT`, so this never adds a denial until multi-board
+/// (#2117) lands — byte-identical today.
+///
+/// Shared primitive: #2127's reclaim/reroute authorization (caller = the blocked
+/// task owner, `board_project` = the task's board) and #2117 P3a's explicit
+/// `project=<id>` mutation path both route through this — one ACL, no second
+/// slug/resolution implementation. Re-exported `pub(crate)` via
+/// `tasks::can_mutate_on_board` for callers outside the `tasks` module (the
+/// reclaim per-tick handler).
+pub(crate) fn can_mutate_on_board(home: &Path, caller: &str, board_project: &str) -> bool {
+    if is_system_identity(caller) {
+        return true;
+    }
+    super::board_router::resolve_current_project(home, caller) == board_project
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn tmp_home(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("agend-acl-board-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    }
+
+    #[test]
+    fn can_mutate_on_board_system_identity_bypasses() {
+        let home = tmp_home("sys");
+        // A system identity is authorized on any board, even a non-default one.
+        assert!(can_mutate_on_board(
+            &home,
+            "system:reclaim_usage_limit",
+            "owner/repo"
+        ));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn can_mutate_on_board_default_project_matches_and_mismatches() {
+        let home = tmp_home("default");
+        // No fleet/team → caller resolves to DEFAULT_PROJECT ("default").
+        assert!(
+            can_mutate_on_board(&home, "dev-a", "default"),
+            "same (default) board → allowed (single-project byte-identical)"
+        );
+        assert!(
+            !can_mutate_on_board(&home, "dev-a", "owner/other-repo"),
+            "different board → fail-closed deny"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 }

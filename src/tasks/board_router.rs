@@ -114,7 +114,7 @@ pub(crate) fn resolve_target_project(home: &Path, target: &str) -> String {
 /// that repairs the index on a hit, else [`DEFAULT_PROJECT`] (the `home` board)
 /// when the task is unknown — which keeps a missing/legacy task resolving to the
 /// historical board.
-pub(super) fn resolve_task_project(home: &Path, task_id: &str) -> String {
+pub(crate) fn resolve_task_project(home: &Path, task_id: &str) -> String {
     if let Some(p) = lookup_task_project(home, task_id) {
         return p;
     }

@@ -21,7 +21,12 @@ pub use handler::register_subscriber as register_cascade_subscriber;
 // #2117 P2: resolution helpers for the out-of-`tasks` callers — comms dispatch
 // auto-create (target board) and the per-board task sweep (project id from a
 // team's source_repo).
-pub(crate) use board_router::{project_id_from_source_repo, resolve_target_project};
+pub(crate) use board_router::{
+    project_id_from_source_repo, resolve_target_project, resolve_task_project,
+};
+// #2127 Phase 1 / #2117 P3: shared per-board mutation ACL primitive, re-exported
+// for callers outside the `tasks` module (the reclaim per-tick handler).
+pub(crate) use acl::can_mutate_on_board;
 pub use orphan::{
     cancel_tasks_for_owner, orphan_tasks_for_owner, reconcile_orphan_owners_with_live,
     release_inprogress_orphans_with_live,

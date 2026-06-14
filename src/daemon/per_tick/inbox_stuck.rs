@@ -7,24 +7,45 @@
 use super::{PerTickHandler, TickContext};
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::sync::Arc;
+
+/// #2127 Phase 1: the inbox-stuck dedup latch (agent → last-alert time), shared so
+/// the reclaim handler can drop an agent's entry after reclaiming its board work
+/// (resetting the repeat stuck-alert). `Arc<Mutex<…>>` because the two handlers
+/// are independent `Box<dyn PerTickHandler>` instances and cannot reach each
+/// other directly.
+pub(crate) type AlertLatch = Arc<Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>>;
 
 pub(crate) struct InboxStuckHandler {
     /// Cadence + boot-grace, bundled (see [`super::NOTIFICATION_BOOT_GRACE`]):
     /// suppresses firing within the grace window of construction without
     /// advancing the counter, then fires on tick indices 0, N, 2N, ….
     gate: crate::daemon::cadence_gate::CadenceGate,
-    last_alerted: Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>,
+    last_alerted: AlertLatch,
 }
 
 impl InboxStuckHandler {
     pub(crate) fn new(every_n_ticks: u64) -> Self {
+        Self::with_latch(every_n_ticks, Arc::new(Mutex::new(HashMap::new())))
+    }
+
+    /// Construct sharing an externally-owned [`AlertLatch`] so another handler
+    /// (the #2127 reclaim handler) can clear an agent's entry. Production wiring
+    /// in `build_default_handlers` uses this; `new` keeps a private latch.
+    pub(crate) fn with_latch(every_n_ticks: u64, last_alerted: AlertLatch) -> Self {
         Self {
             gate: crate::daemon::cadence_gate::CadenceGate::new_with_boot_grace(
                 every_n_ticks,
                 super::NOTIFICATION_BOOT_GRACE,
             ),
-            last_alerted: Mutex::new(HashMap::new()),
+            last_alerted,
         }
+    }
+
+    /// A clone of the shared dedup latch, for the reclaim handler to clear an
+    /// agent's repeat-alert entry after reclaim.
+    pub(crate) fn latch(&self) -> AlertLatch {
+        self.last_alerted.clone()
     }
 
     #[cfg(test)]
@@ -35,7 +56,7 @@ impl InboxStuckHandler {
                 created_at,
                 super::NOTIFICATION_BOOT_GRACE,
             ),
-            last_alerted: Mutex::new(HashMap::new()),
+            last_alerted: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }

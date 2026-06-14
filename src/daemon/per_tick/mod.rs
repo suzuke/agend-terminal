@@ -49,6 +49,7 @@ pub(crate) mod log_rotation;
 pub(crate) mod notification_flush;
 pub(crate) mod poll_reminder;
 pub(crate) mod pr_state_scan;
+pub(crate) mod reclaim;
 pub(crate) mod recovery_dispatcher;
 pub(crate) mod snapshot;
 pub(crate) mod supervisor_trackers;
@@ -72,6 +73,7 @@ pub(crate) use log_rotation::LogRotationHandler;
 pub(crate) use notification_flush::NotificationFlushHandler;
 pub(crate) use poll_reminder::PollReminderHandler;
 pub(crate) use pr_state_scan::PrStateScanHandler;
+pub(crate) use reclaim::ReclaimHandler;
 pub(crate) use recovery_dispatcher::RecoveryDispatcherHandler;
 pub(crate) use snapshot::SnapshotRotationHandler;
 pub(crate) use supervisor_trackers::{

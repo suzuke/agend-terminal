@@ -595,6 +595,12 @@ pub(crate) fn build_default_handlers(
     daemon_binary_stale: crate::daemon::mcp_registry_watcher::DaemonBinaryStale,
 ) -> Vec<Box<dyn per_tick::PerTickHandler>> {
     let watchdog_dry_run = watchdog::watchdog_dry_run_from_env();
+    // #2127 Phase 1: the inbox-stuck handler and the new reclaim handler share one
+    // dedup latch so reclaim can clear an agent's repeat-alert entry. Construct the
+    // inbox-stuck handler first, clone its latch, then move it into the vec at its
+    // original position (order preserved).
+    let inbox_stuck = per_tick::InboxStuckHandler::new(30);
+    let work_stuck_latch = inbox_stuck.latch();
     // Vec order MUST match the pre-extraction call order (zero-behavior-change guarantee).
     vec![
         Box::new(per_tick::HangDetectionHandler::new()),
@@ -612,7 +618,7 @@ pub(crate) fn build_default_handlers(
         Box::new(per_tick::PollReminderHandler::new(30)),
         // #1491(A): inbox-stuck watchdog — every 30 ticks (~5min). Detects an
         // agent receiving but not draining its inbox; notifies lead (no auto-restart).
-        Box::new(per_tick::InboxStuckHandler::new(30)),
+        Box::new(inbox_stuck),
         // #1491(B): next_after_ci handoff-timeout watchdog. #1859 lowered the
         // cadence to ~2min (12 ticks) so the daemon-side RE-NUDGE of the target
         // (Fix A) is timely; the lead ESCALATION stays gated by its own 10min age
@@ -674,6 +680,13 @@ pub(crate) fn build_default_handlers(
         // nothing; runs in app mode (the live daemon) so the data accrues for
         // the phase-2 go/no-go.
         Box::new(per_tick::DivergenceTelemetryHandler::new(360)),
+        // #2127 Phase 1: reclaim board tasks from agents stuck in a non-recoverable
+        // usage_limit window (operator decision d-…085112: Phase 1, grace=10min).
+        // Every 30 ticks (~5min). Fires ONLY for UsageLimit/QuotaExceeded with a
+        // remaining window > grace and no recent recovery — releases the agent's
+        // claimed/in_progress tasks back to Open + clears the work-stuck latch.
+        // Runs in both run_core and app mode (live daemon is app-mode).
+        Box::new(per_tick::ReclaimHandler::new(30, work_stuck_latch)),
     ]
 }
 

@@ -597,6 +597,35 @@ fn unlock_deadline(
     })
 }
 
+/// #2127 Phase 1: time until `name`'s usage-limit window unlocks, per the
+/// persisted notify record. `None` when there is no record, no parseable
+/// `unlock_at`, or an unparseable `notified_at` — the reclaim caller then falls
+/// back to a conservative long default (a missing reset time is treated as a long
+/// block). A past deadline clamps to `Duration::ZERO`. Lock-free read; reuses the
+/// same record + `unlock_deadline` math as the notify-suppression path so the two
+/// agree on what "this window" means.
+pub(crate) fn usage_limit_remaining(
+    home: &std::path::Path,
+    name: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<std::time::Duration> {
+    let map: std::collections::HashMap<String, UsageNotifyRecord> =
+        std::fs::read_to_string(usage_limit_notify_path(home))
+            .ok()
+            .and_then(|c| serde_json::from_str(&c).ok())?;
+    let rec = map.get(name)?;
+    let unlock_at = rec.unlock_at.as_deref()?;
+    let notified_at = chrono::DateTime::parse_from_rfc3339(&rec.notified_at)
+        .ok()?
+        .with_timezone(&chrono::Utc);
+    let deadline = unlock_deadline(unlock_at, notified_at)?;
+    Some(
+        (deadline - now)
+            .to_std()
+            .unwrap_or(std::time::Duration::ZERO),
+    )
+}
+
 /// True ⇒ suppress this usage_limit notify (already notified for the same still-
 /// open window). Lock-free FAIL-OPEN read: a missing/corrupt record ⇒ NOT
 /// suppressed (notify), so a real new limit is never silently swallowed.
