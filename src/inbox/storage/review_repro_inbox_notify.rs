@@ -53,7 +53,6 @@ fn write_fleet_with_id(home: &std::path::Path, name: &str, uuid: &str) {
 // fallback reads a nonexistent file and returns `false` unconditionally.
 // ───────────────────────────────────────────────────────────────────────────
 #[test]
-#[ignore = "#911: red until fix; remove #[ignore] after fix to confirm"]
 fn msg_already_drained_reads_resolved_uuid_path_inbox_notify() {
     let home = tmp_home("f1-msg-drained-resolved");
     let name = "idnative";

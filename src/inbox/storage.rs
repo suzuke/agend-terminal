@@ -1004,7 +1004,13 @@ pub fn has_drained_blocker_for_correlation(
 /// Read the agent's inbox JSONL and return `true` iff a message with
 /// the given `msg_id` exists AND has `read_at` set.
 pub(super) fn msg_already_drained_in_jsonl(home: &Path, agent_name: &str, msg_id: &str) -> bool {
-    let path = inbox_path(home, agent_name);
+    // H12 (CR-2026-06-14): read the RESOLVED (UUID-when-id-native) path — the same
+    // one `drain` writes `read_at` to. The old `inbox_path` (raw name) path does
+    // not exist for an id-native instance, so this #911 JSONL dedup fallback read
+    // a nonexistent file and returned `false` unconditionally — a permanent no-op
+    // that let an already-drained message be re-injected after a daemon restart
+    // (when the in-memory `OnceLock` ledger is gone).
+    let path = inbox_path_resolved(home, agent_name);
     let Ok(content) = std::fs::read_to_string(&path) else {
         return false;
     };
