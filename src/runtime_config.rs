@@ -46,6 +46,15 @@ pub struct RuntimeConfig {
     /// the other gates here.
     #[serde(default = "default_true")]
     pub show_pane_state: bool,
+    /// #2090: origin-aware progress-reporting mode. Status flows back to the
+    /// channel a request came from. `0` = off (no daemon relay/backstop),
+    /// `1` = mirror (default — daemon auto-relays the agent's clean text
+    /// updates to the origin channel), `2` = report (agent owns updates, daemon
+    /// nudges on a long origin-channel turn with no update). Hot-reloadable via
+    /// the `config` MCP tool. Additive field → no schema bump (serde default
+    /// fills older configs as `1`).
+    #[serde(default = "default_progress_mode")]
+    pub progress_mode: u8,
     /// #1990: on-disk schema version. `#[serde(default)]` → an older config
     /// written before this field reads back as 0 (≤ CURRENT, loads normally);
     /// a value > CURRENT means a newer daemon wrote it and is fail-closed in
@@ -76,6 +85,9 @@ fn default_fleet_idle() -> i64 {
 fn default_fleet_ack_ttl() -> i64 {
     2700
 }
+fn default_progress_mode() -> u8 {
+    1 // mirror (mode A) by default
+}
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
@@ -87,6 +99,7 @@ impl Default for RuntimeConfig {
             usage_limit_propagation_enabled: false,
             idle_watchdog_enabled: true,
             show_pane_state: true,
+            progress_mode: default_progress_mode(),
             schema_version: RuntimeConfig::CURRENT,
         }
     }
