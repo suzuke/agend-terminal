@@ -383,8 +383,11 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
     // above → this branch lock → per-agent binding lock inside bind_full), so no
     // deadlock; different branches use different lock files → no cross-branch
     // contention. Held only across the bind (a short mutex), so release is unaffected.
-    let _lease_lock =
-        crate::binding::acquire_branch_lease_lock(home, branch).map_err(|e| DispatchError {
+    // #2117 P3b: the lease key is (source_repo, branch). `source_repo` resolved
+    // above (tier-stubbed when unknown, so non-empty on every production path).
+    let source_repo_str = source_repo.display().to_string();
+    let _lease_lock = crate::binding::acquire_branch_lease_lock(home, &source_repo_str, branch)
+        .map_err(|e| DispatchError {
             message: format!("could not acquire branch lease lock for '{branch}': {e}"),
             code: ErrorCode::LeaseConflict,
             stage: Stage::WorktreeLeaseConflict,
@@ -392,8 +395,12 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
             raw: None,
         })?;
 
-    // P0-1.5: central lease registry check — reject if another agent holds this branch.
-    if let Some(other) = crate::binding::scan_existing_branch_binding(home, branch, target) {
+    // P0-1.5: central lease registry check — reject if another agent holds this
+    // (source_repo, branch) lease (legacy bindings without the field fall back to
+    // branch-only exclusion — see `scan_existing_branch_binding`).
+    if let Some(other) =
+        crate::binding::scan_existing_branch_binding(home, &source_repo_str, branch, target)
+    {
         return Err(DispatchError {
             message: format!(
                 "branch '{branch}' already leased by '{other}' — release first or use a different branch"

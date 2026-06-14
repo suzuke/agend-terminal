@@ -884,7 +884,7 @@ fn checkout_bind_rejects_cross_agent_branch_conflict_1882() {
     );
     // Exactly one binding holds feat/shared (it is agent-a's).
     assert_eq!(
-        crate::binding::scan_existing_branch_binding(&home, "feat/shared", ""),
+        crate::binding::scan_existing_branch_binding(&home, "", "feat/shared", ""),
         Some("agent-a".to_string()),
         "#1882: exactly one agent must hold the branch after the conflict"
     );

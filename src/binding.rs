@@ -69,31 +69,46 @@ fn index_key(home: &Path, agent: &str) -> String {
     format!("{}:{agent}", home.display())
 }
 
-/// #1882: lock-file path for the per-BRANCH lease flock. Keyed by a hash of the
-/// branch so it is path-safe (branches contain `/`) and collision-free; different
-/// branches never share a lock file.
-fn branch_lease_lock_path(home: &Path, branch: &str) -> PathBuf {
-    let key = crate::daemon::utils::sha256_hex(branch.as_bytes());
+/// #1882 / #2117 P3b: lock-file path for the per-lease flock. Keyed by a hash of
+/// the **(source_repo, branch)** pair so it is path-safe (branches contain `/`)
+/// and collision-free; a different lease never shares a lock file.
+///
+/// #2117 P3b: keying now includes `source_repo` so the SAME branch name in two
+/// DIFFERENT repos is two independent leases that never contend. An EMPTY
+/// `source_repo` (the test-only `bind()` wrapper; every production lease path
+/// carries a resolved repo) falls back to the legacy branch-only key — so the
+/// single-project world (one repo) keys on `(repo, branch)` consistently and a
+/// rare empty bind keys branch-only, both behaviorally equivalent to pre-P3b.
+fn branch_lease_lock_path(home: &Path, source_repo: &str, branch: &str) -> PathBuf {
+    let key = if source_repo.is_empty() {
+        crate::daemon::utils::sha256_hex(branch.as_bytes())
+    } else {
+        // NUL separator: unambiguous since neither path nor branch contains it.
+        crate::daemon::utils::sha256_hex(format!("{source_repo}\0{branch}").as_bytes())
+    };
     crate::paths::runtime_dir(home)
         .join(".lease-locks")
         .join(format!("{key}.lock"))
 }
 
-/// #1882: acquire the exclusive per-BRANCH lease flock so the cross-agent
-/// "a branch is held by at most one agent" check-then-bind
+/// #1882 / #2117 P3b: acquire the exclusive per-lease flock so the cross-agent
+/// "a (source_repo, branch) is held by at most one agent" check-then-bind
 /// (`scan_existing_branch_binding` → `bind_full`) is ATOMIC. Two DIFFERENT agents
-/// racing to lease the SAME branch serialize here: the first binds; the second
-/// blocks until the first's guard drops, then its rescan sees the first's binding
-/// and rejects — so neither double-binds. This is a SHORT-LIVED mutex around the
-/// bind operation, NOT a lease-lifetime lock: the persistent lease state is
-/// `binding.json` (which the scan reads), so `release_full` needs no lock cleanup.
-/// Per-branch keying means different branches never contend → normal single-agent
-/// binds are unaffected. Blocking `acquire_file_lock`; released when the guard drops.
+/// racing to lease the SAME (repo, branch) serialize here: the first binds; the
+/// second blocks until the first's guard drops, then its rescan sees the first's
+/// binding and rejects — so neither double-binds. This is a SHORT-LIVED mutex
+/// around the bind operation, NOT a lease-lifetime lock: the persistent lease
+/// state is `binding.json` (which the scan reads), so `release_full` needs no lock
+/// cleanup. Per-(repo,branch) keying means different leases never contend → normal
+/// single-agent binds are unaffected. Blocking `acquire_file_lock`; released when
+/// the guard drops. Pass `""` for `source_repo` only on the test-only empty-bind
+/// path (branch-only key).
 pub fn acquire_branch_lease_lock(
     home: &Path,
+    source_repo: &str,
     branch: &str,
 ) -> anyhow::Result<crate::store::FileFlockGuard> {
-    crate::store::acquire_file_lock(&branch_lease_lock_path(home, branch))
+    crate::store::acquire_file_lock(&branch_lease_lock_path(home, source_repo, branch))
 }
 
 /// Write a binding for an agent (task assigned).
@@ -223,10 +238,28 @@ pub fn unbind(home: &Path, agent: &str) {
 // wash-white. (Activating restart: the operator re-dispatches / has running
 // agents `bind_self` once; one-time.)
 
-/// Returns Some(agent_name) if any other agent has bound this branch.
-/// Used by dispatch_auto_bind_lease to enforce cross-agent branch uniqueness.
+/// Returns Some(agent_name) if any other agent holds the lease for this
+/// **(source_repo, branch)**. Used by dispatch_auto_bind_lease / repo-checkout to
+/// enforce cross-agent lease uniqueness.
+///
+/// #2117 P3b: the lease key is now `(source_repo, branch)` — the SAME branch name
+/// in a DIFFERENT repo is a DIFFERENT lease and does not conflict. Pass `""` for
+/// `source_repo` to keep the legacy branch-only semantics (callers that only want
+/// "who holds this branch anywhere", e.g. pr-state / auto-arm / auto-release,
+/// which does its own slug-based repo guard).
+///
+/// **Backward-compat wildcard gate (reviewer-2, the P3b core risk)**: `bind_full`
+/// only writes the `source_repo` field when non-empty, so a pre-P3b "legacy" live
+/// binding can lack it. On rescan after P3b ships, requiring `source_repo`
+/// equality would make `None != Some(repo)` MISS that legacy binding → a second
+/// agent binds the same branch → **double-bind**. To prevent that, a missing/empty
+/// `source_repo` on EITHER side (the scanned binding OR the query) falls back to
+/// **branch-only** exclusion (match-any); only when BOTH carry a non-empty
+/// `source_repo` is the match tightened to `(source_repo, branch)`. Fail-closed:
+/// when in doubt (a field is absent), we still treat the branch as taken.
 pub fn scan_existing_branch_binding(
     home: &Path,
+    source_repo: &str,
     branch: &str,
     exclude_agent: &str,
 ) -> Option<String> {
@@ -244,7 +277,14 @@ pub fn scan_existing_branch_binding(
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) else {
             continue;
         };
-        if v["branch"].as_str() == Some(branch) {
+        if v["branch"].as_str() != Some(branch) {
+            continue;
+        }
+        // Wildcard backward-compat gate: branch-only exclusion unless BOTH the
+        // query and the scanned binding carry a non-empty source_repo.
+        let binding_repo = v["source_repo"].as_str().unwrap_or("");
+        let both_present = !source_repo.is_empty() && !binding_repo.is_empty();
+        if !both_present || binding_repo == source_repo {
             return Some(agent);
         }
     }
@@ -504,34 +544,133 @@ mod tests {
 
         let home = tmp_home("lease-lock-1882");
 
+        let repo = "/repo/a";
         // Different branches must NOT contend — both acquire while both are held.
-        let g_x = acquire_branch_lease_lock(&home, "feat/x").expect("lock x");
-        let g_y = acquire_branch_lease_lock(&home, "feat/y").expect("lock y must not block on x");
+        let g_x = acquire_branch_lease_lock(&home, repo, "feat/x").expect("lock x");
+        let g_y =
+            acquire_branch_lease_lock(&home, repo, "feat/y").expect("lock y must not block on x");
         drop((g_x, g_y));
 
-        // Same branch: a second acquirer BLOCKS until the first guard drops.
+        // #2117 P3b: the SAME branch in a DIFFERENT repo is a DIFFERENT lease and
+        // must NOT contend (the per-repo independence P3b adds).
+        let g_a = acquire_branch_lease_lock(&home, "/repo/a", "feat/shared").expect("lock a");
+        let g_b = acquire_branch_lease_lock(&home, "/repo/b", "feat/shared")
+            .expect("same branch, different repo must not block");
+        drop((g_a, g_b));
+
+        // Same (repo, branch): a second acquirer BLOCKS until the first guard drops.
         let got = Arc::new(AtomicBool::new(false));
-        let g1 = acquire_branch_lease_lock(&home, "feat/z").expect("lock z (holder)");
+        let g1 = acquire_branch_lease_lock(&home, repo, "feat/z").expect("lock z (holder)");
         let home2 = home.clone();
         let got2 = got.clone();
         let t = std::thread::spawn(move || {
             // Blocks here until the holder drops g1.
-            let _g2 = acquire_branch_lease_lock(&home2, "feat/z").expect("lock z (waiter)");
+            let _g2 =
+                acquire_branch_lease_lock(&home2, "/repo/a", "feat/z").expect("lock z (waiter)");
             got2.store(true, Ordering::SeqCst);
         });
 
         std::thread::sleep(Duration::from_millis(150));
         assert!(
             !got.load(Ordering::SeqCst),
-            "#1882: a second same-branch lock MUST block while the first is held"
+            "#1882: a second same-(repo,branch) lock MUST block while the first is held"
         );
         drop(g1); // release → the waiter proceeds.
         t.join().expect("waiter thread");
         assert!(
             got.load(Ordering::SeqCst),
-            "#1882: the second same-branch lock must proceed once the first drops"
+            "#1882: the second same-(repo,branch) lock must proceed once the first drops"
         );
 
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Write a `binding.json` for `agent` directly, controlling whether the
+    /// `source_repo` field is present — to construct a pre-P3b "legacy" binding
+    /// (field absent) that `bind_full` would only write when non-empty.
+    fn write_binding_json(home: &Path, agent: &str, branch: &str, source_repo: Option<&str>) {
+        let dir = crate::paths::runtime_dir(home).join(agent);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut v = json!({
+            "version": BINDING_SCHEMA_VERSION,
+            "agent": agent,
+            "task_id": "T-test",
+            "branch": branch,
+            "issued_at": "2026-01-01T00:00:00+00:00",
+        });
+        if let Some(r) = source_repo {
+            v["source_repo"] = json!(r);
+        }
+        std::fs::write(
+            dir.join("binding.json"),
+            serde_json::to_string_pretty(&v).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// #2117 P3b CORE GATE (reviewer-2): a pre-P3b "legacy" live binding that
+    /// LACKS the `source_repo` field must STILL exclude a new (repo, branch) bind
+    /// on the post-P3b rescan — else `None != Some(repo)` would miss it and a
+    /// second agent double-binds. This is the CI-runnable form of the cross-deploy
+    /// restart smoke: construct a field-less legacy binding fixture, then rescan as
+    /// a post-P3b dispatch would (with a real source_repo). The wildcard fallback
+    /// must match it branch-only. (True end-to-end verification — an operator
+    /// restart carrying a real legacy binding — is the PR's dogfood caveat.)
+    #[test]
+    fn scan_legacy_binding_missing_source_repo_still_excludes_p3b() {
+        let home = tmp_home("p3b-legacy-rescan");
+        write_binding_json(&home, "legacy-agent", "feat/shared", None); // no source_repo field
+        assert_eq!(
+            scan_existing_branch_binding(&home, "/repo/new", "feat/shared", "new-agent"),
+            Some("legacy-agent".to_string()),
+            "legacy binding (missing source_repo) MUST still exclude — no double-bind on P3b rollout"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2117 P3b key semantics: same (repo, branch) conflicts; same branch in a
+    /// DIFFERENT repo is an independent lease; an empty-source_repo query falls
+    /// back to branch-only (byte-identical for the pre-P3b wildcard callers).
+    #[test]
+    fn scan_p3b_lease_key_repo_scoped() {
+        let home = tmp_home("p3b-key");
+        write_binding_json(&home, "holder", "feat/x", Some("/repo/a"));
+        assert_eq!(
+            scan_existing_branch_binding(&home, "/repo/a", "feat/x", "other"),
+            Some("holder".to_string()),
+            "same (repo, branch) is one lease → conflict"
+        );
+        assert_eq!(
+            scan_existing_branch_binding(&home, "/repo/b", "feat/x", "other"),
+            None,
+            "same branch in a different repo is a different lease → no conflict (P3b)"
+        );
+        assert_eq!(
+            scan_existing_branch_binding(&home, "", "feat/x", "other"),
+            Some("holder".to_string()),
+            "empty-source_repo query falls back to branch-only (pre-P3b callers byte-identical)"
+        );
+        // The querying agent's own binding is always excluded.
+        assert_eq!(
+            scan_existing_branch_binding(&home, "/repo/a", "feat/x", "holder"),
+            None,
+            "self-agent binding is excluded"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Reverse of the legacy gate: when BOTH sides carry a non-empty source_repo,
+    /// a DIFFERENT repo must NOT match (the tightening that makes per-repo leases
+    /// independent). Pins that the wildcard is scoped to the missing-field case.
+    #[test]
+    fn scan_both_present_different_repo_does_not_match_p3b() {
+        let home = tmp_home("p3b-both-present");
+        write_binding_json(&home, "holder", "feat/x", Some("/repo/a"));
+        assert_eq!(
+            scan_existing_branch_binding(&home, "/repo/b", "feat/x", "other"),
+            None,
+            "both source_repos present + different → independent leases, no false conflict"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 

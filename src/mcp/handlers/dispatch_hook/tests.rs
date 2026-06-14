@@ -226,25 +226,29 @@ fn main_branch_rejects_dispatch() {
 fn lease_conflict_rejects_dispatch() {
     let home = std::env::temp_dir().join(format!("agend-s53-prod-{}-conflict", std::process::id()));
     std::fs::create_dir_all(&home).ok();
-    // CRITICAL: each agent has its OWN working_directory (production topology).
-    setup_test_repo(&home, "agent-a");
-    setup_test_repo(&home, "agent-b");
+    // #2117 P3b: the lease key is now (source_repo, branch). Production team
+    // topology is a SHARED source_repo (one clone) with per-agent WORKTREES, so two
+    // agents dispatched to the SAME branch in the SAME repo still conflict. Both
+    // agents resolve to one shared source_repo (tier-2 fleet `source_repo`). (The
+    // cross-repo independence P3b adds is covered by
+    // `cross_repo_same_branch_independent_p3b` below.)
+    setup_test_repo(&home, "shared-repo");
+    let shared = crate::paths::workspace_dir(&home).join("shared-repo");
     std::fs::write(
             crate::fleet::fleet_yaml_path(&home),
-            format!("instances:\n  agent-a:\n    backend: claude\n    working_directory: {}\n  agent-b:\n    backend: claude\n    working_directory: {}\n",
-                crate::paths::workspace_dir(&home).join("agent-a").display(),
-                crate::paths::workspace_dir(&home).join("agent-b").display()),
+            format!("instances:\n  agent-a:\n    backend: claude\n    source_repo: {}\n  agent-b:\n    backend: claude\n    source_repo: {}\n",
+                shared.display(), shared.display()),
         ).ok();
 
-    // First dispatch succeeds in agent-a's clone.
+    // First dispatch succeeds (leases (shared, feat/shared) for agent-a).
     let r1 = super::dispatch_auto_bind_lease(&home, "agent-a", "T-1", "feat/shared", None);
     assert!(r1.is_ok(), "first dispatch must succeed: {:?}", r1.err());
 
-    // Second dispatch SAME branch DIFFERENT agent → REJECT via central registry.
+    // Second dispatch SAME (repo, branch) DIFFERENT agent → REJECT via central registry.
     let r2 = super::dispatch_auto_bind_lease(&home, "agent-b", "T-2", "feat/shared", None);
     assert!(
         r2.is_err(),
-        "central registry must REJECT cross-agent same-branch, got: {:?}",
+        "central registry must REJECT cross-agent same-(repo,branch), got: {:?}",
         r2
     );
     let err = r2.expect_err("must err");
@@ -260,6 +264,40 @@ fn lease_conflict_rejects_dispatch() {
     assert!(
         !binding_b.exists(),
         "rejected dispatch must not create binding"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2117 P3b: the SAME branch NAME in two DIFFERENT source_repos is two
+/// INDEPENDENT leases — both dispatches succeed (this is the behavior P3b adds;
+/// pre-P3b the branch-only key wrongly rejected the second). Each agent has its
+/// own repo (tier-3 working_directory), so the lease keys differ.
+#[test]
+fn cross_repo_same_branch_independent_p3b() {
+    let home = std::env::temp_dir().join(format!("agend-p3b-prod-{}-xrepo", std::process::id()));
+    std::fs::create_dir_all(&home).ok();
+    setup_test_repo(&home, "agent-a");
+    setup_test_repo(&home, "agent-b");
+    std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            format!("instances:\n  agent-a:\n    backend: claude\n    source_repo: {}\n  agent-b:\n    backend: claude\n    source_repo: {}\n",
+                crate::paths::workspace_dir(&home).join("agent-a").display(),
+                crate::paths::workspace_dir(&home).join("agent-b").display()),
+        ).ok();
+
+    let r1 = super::dispatch_auto_bind_lease(&home, "agent-a", "T-1", "feat/shared", None);
+    assert!(
+        r1.is_ok(),
+        "agent-a (repo-a) dispatch must succeed: {:?}",
+        r1.err()
+    );
+    // Same branch NAME, DIFFERENT repo → independent lease → must ALSO succeed.
+    let r2 = super::dispatch_auto_bind_lease(&home, "agent-b", "T-2", "feat/shared", None);
+    assert!(
+        r2.is_ok(),
+        "P3b: same branch name in a DIFFERENT repo is an independent lease — must NOT conflict: {:?}",
+        r2.err()
     );
 
     std::fs::remove_dir_all(&home).ok();

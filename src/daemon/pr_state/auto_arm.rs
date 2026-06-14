@@ -48,7 +48,9 @@ pub fn auto_arm_unwatched_open_prs(home: &Path, repo: &str, prs: &[GhPrMetadata]
 
         // Binding-based resolution (shared-account-proof): which agent is bound
         // to this branch? That is the agent who pushed and is waiting.
-        let Some(agent) = crate::binding::scan_existing_branch_binding(home, branch, "") else {
+        // #2117 P3b: branch-only scan (source_repo="") — route CI-pass to whoever
+        // is bound to this branch; repo precision unnecessary for this lookup.
+        let Some(agent) = crate::binding::scan_existing_branch_binding(home, "", branch, "") else {
             // Fail LOUD — never silently drop. We cannot reliably route a
             // `[ci-pass]` for an open PR with no bound agent (released worktree /
             // external PR); notifying the wrong agent is worse than a loud log.

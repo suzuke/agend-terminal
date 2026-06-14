@@ -1065,7 +1065,9 @@ pub fn resolve_author(state: &PrState) -> String {
 /// unchanged. The binding lookup is a plain FS read (no flock / subprocess), so it
 /// is safe inside a `with_pr_state` closure.
 pub fn resolve_notify_recipient(home: &Path, state: &PrState) -> String {
-    crate::binding::scan_existing_branch_binding(home, &state.branch, "")
+    // #2117 P3b: branch-only scan (source_repo="") — "who holds this branch" for
+    // notify routing; cross-repo precision is not needed here.
+    crate::binding::scan_existing_branch_binding(home, "", &state.branch, "")
         .unwrap_or_else(|| resolve_author(state))
 }
 

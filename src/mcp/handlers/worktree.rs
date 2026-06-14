@@ -496,28 +496,32 @@ mod tests {
     #[test]
     fn bind_self_rejects_cross_agent_branch_conflict() {
         // Gate 4: P0-1.5 cross-agent registry — agent A binds, agent B
-        // attempts the same branch → B is rejected.
+        // attempts the same (source_repo, branch) → B is rejected.
+        // #2117 P3b: the lease key is (source_repo, branch). Both agents claim the
+        // SAME repo (via `repository_path`) and branch — the same-repo conflict P3b
+        // preserves. (Cross-repo independence is covered by the dispatch-side
+        // `cross_repo_same_branch_independent_p3b` test.)
         let home =
             std::env::temp_dir().join(format!("agend-p17-self-{}-cross", std::process::id()));
         std::fs::create_dir_all(&home).ok();
-        p17_setup_repo(&home, "agent-A");
-        p17_setup_repo(&home, "agent-B");
+        let shared = p17_setup_repo(&home, "shared-repo");
+        let shared_path = shared.display().to_string();
 
         let r1 = handle_bind_self(
             &home,
-            &json!({"repository": "owner/name", "branch": "feat/cross"}),
+            &json!({"repository_path": shared_path, "branch": "feat/cross"}),
             &sender_for("agent-A"),
         );
         assert_eq!(r1["bound"].as_bool(), Some(true), "A binds first: {r1}");
 
         let r2 = handle_bind_self(
             &home,
-            &json!({"repository": "owner/name", "branch": "feat/cross"}),
+            &json!({"repository_path": shared_path, "branch": "feat/cross"}),
             &sender_for("agent-B"),
         );
         assert!(
             r2.get("error").is_some(),
-            "B must be rejected on shared branch: {r2}"
+            "B must be rejected on the same (repo, branch): {r2}"
         );
         assert_eq!(
             r2["code"].as_str(),

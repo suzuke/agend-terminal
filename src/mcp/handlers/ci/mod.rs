@@ -167,8 +167,11 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
     // idempotent read + git worktree add + bind_full) so a concurrent dispatch or
     // another repo checkout can't double-bind the branch. Bind-only (a `--detach`
     // checkout writes no binding); the guard lives to fn end so it covers bind_full.
+    // #2117 P3b: lease key is (source_repo, branch); `source_canonical` is the
+    // same repo path bind_full persists below, so lock/scan/bind keys agree.
+    let source_repo_str = source_canonical.display().to_string();
     let _lease_lock = if bind {
-        match crate::binding::acquire_branch_lease_lock(home, branch) {
+        match crate::binding::acquire_branch_lease_lock(home, &source_repo_str, branch) {
             Ok(g) => Some(g),
             Err(e) => {
                 return json!({
@@ -186,9 +189,12 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
         // this branch is refused (mirrors the dispatch path's scan), rather than
         // leaning on `git worktree add`'s "already checked out" error. The
         // same-agent idempotent short-circuit below handles THIS agent re-checkout.
-        if let Some(other) =
-            crate::binding::scan_existing_branch_binding(home, branch, instance_name)
-        {
+        if let Some(other) = crate::binding::scan_existing_branch_binding(
+            home,
+            &source_repo_str,
+            branch,
+            instance_name,
+        ) {
             return json!({
                 "error": format!(
                     "branch '{branch}' already leased by '{other}' — release first or use a different branch"

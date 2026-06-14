@@ -743,7 +743,9 @@ fn is_worktree_clean(worktree: &Path) -> bool {
 /// conservative force-reclaim backstop (PR-2).
 pub(crate) fn enqueue_release_recompute(home: &Path, repo: &str, branch: &str, event_kind: &str) {
     let Some(agent) =
-        crate::binding::scan_existing_branch_binding(home, branch, /* exclude */ "")
+        // #2117 P3b: branch-only scan (source_repo="") — this caller does its own
+        // slug-based cross-repo guard below (repo_slug_from_binding vs event repo).
+        crate::binding::scan_existing_branch_binding(home, "", branch, /* exclude */ "")
     else {
         return; // no bound agent → nothing to release.
     };
