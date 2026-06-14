@@ -855,6 +855,8 @@ mod tests {
             ("task", "metadata_value", "tasks/handler.rs metadata_set"),
             ("task", "bind", "tasks/handler.rs create → TaskEvent::Created.bind (#1933 declared)"),
             ("task", "eta_secs", "tasks/handler.rs create → TaskEvent::Created.eta_secs (#1933 declared)"),
+            ("task", "project", "tasks/handler.rs create board route (:136) + list project select (:221) (#2117 P1)"),
+            ("task", "scope", "tasks/handler.rs list fleet_scope aggregate (:208) (#2117 P1)"),
             // ── decision ──
             ("decision", "action", "decisions.rs routing"),
             ("decision", "title", "decisions.rs post"),
