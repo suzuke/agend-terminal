@@ -78,7 +78,6 @@ fn handle_list_body(src: &str) -> Vec<(usize, String)> {
 }
 
 #[test]
-#[ignore = "list-registry-lock-held-across-pending_for_instance-io: red until fix; remove #[ignore] after fix to confirm"]
 fn handle_list_does_not_hold_registry_lock_across_dispatch_idle_io_api() {
     let path = query_rs();
     let src = std::fs::read_to_string(&path).expect("read query.rs");

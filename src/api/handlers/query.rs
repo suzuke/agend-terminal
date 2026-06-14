@@ -8,11 +8,19 @@ use crate::agent;
 use serde_json::{json, Value};
 
 pub(crate) fn handle_list(_params: &Value, ctx: &HandlerCtx) -> Value {
+    // H9: snapshot each managed agent's fields UNDER the tier-1 registry lock,
+    // then drop(reg) BEFORE the per-agent dispatch_idle disk I/O. The original
+    // called `pending_for_instance` (→ `read_dir` + a `read_to_string` +
+    // `serde_json::from_str` per `.json` sidecar) inside the `.map()` while the
+    // lock was still held, so a LIST with N agents performed N dir scans +
+    // N*M file reads/parses entirely under the lock — blocking every other API
+    // handler, the supervisor tick, crash-respawn, hang-detection and the TUI
+    // render path on disk contention. Mirrors the external-agent loop below.
     let reg = agent::lock_registry(ctx.registry);
-    let mut agents: Vec<Value> = reg
+    let snapshot: Vec<(String, Value)> = reg
         .values()
         .map(|handle| {
-            let name = handle.name.as_str();
+            let name = handle.name.to_string();
             let (agent_state, health_state, blocked_reason, blocked_note, context) = {
                 let c = handle.core.lock();
                 (
@@ -29,10 +37,8 @@ pub(crate) fn handle_list(_params: &Value, ctx: &HandlerCtx) -> Value {
                     c.state.resolved_context(),
                 )
             };
-            let (dispatched_waiting_for, pending_response_to) =
-                crate::daemon::dispatch_idle::pending_for_instance(ctx.home, name);
-            json!({
-                "name": name,
+            let entry = json!({
+                "name": name.as_str(),
                 "backend": handle.backend_command,
                 "submit_key": handle.submit_key,
                 "inject_prefix": handle.inject_prefix,
@@ -43,12 +49,26 @@ pub(crate) fn handle_list(_params: &Value, ctx: &HandlerCtx) -> Value {
                 "context_pct": context.map(|(pct, _)| pct),
                 "context_source": context.map(|(_, source)| source),
                 "kind": "managed",
-                "dispatched_waiting_for": dispatched_waiting_for,
-                "pending_response_to": pending_response_to,
-            })
+            });
+            (name, entry)
         })
         .collect();
     drop(reg);
+
+    // Disk I/O now runs WITHOUT the registry lock held.
+    let mut agents: Vec<Value> = Vec::with_capacity(snapshot.len());
+    for (name, mut entry) in snapshot {
+        let (dispatched_waiting_for, pending_response_to) =
+            crate::daemon::dispatch_idle::pending_for_instance(ctx.home, &name);
+        if let Some(obj) = entry.as_object_mut() {
+            obj.insert(
+                "dispatched_waiting_for".into(),
+                json!(dispatched_waiting_for),
+            );
+            obj.insert("pending_response_to".into(), json!(pending_response_to));
+        }
+        agents.push(entry);
+    }
     let ext = agent::lock_external(ctx.externals);
     for (name, handle) in ext.iter() {
         let (dispatched_waiting_for, pending_response_to) =
