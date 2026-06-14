@@ -34,7 +34,6 @@ fn tmp_home(tag: &str) -> std::path::PathBuf {
 }
 
 #[test]
-#[ignore = "deployments-health-teams F1: red until fix; remove #[ignore] after fix to confirm"]
 fn deploy_rejects_duplicate_name_under_lock_deployments_health_teams() {
     let home = tmp_home("dup-name");
     // A two-instance template so the deploy exercises the full path

@@ -32,6 +32,17 @@ fn store_path(home: &Path) -> std::path::PathBuf {
     crate::store::store_path(home, "deployments.json")
 }
 
+/// H14: the JSON error for a duplicate deploy name (used by both the pre-spawn
+/// read-check and the authoritative under-flock re-check in `deploy`).
+fn duplicate_deploy_error(deploy_name: &str) -> Value {
+    serde_json::json!({
+        "error": format!(
+            "a deployment named '{deploy_name}' already exists — teardown it first or deploy a different name"
+        ),
+        "name": deploy_name,
+    })
+}
+
 fn load(home: &Path) -> DeploymentStore {
     crate::store::load_versioned(
         &store_path(home),
@@ -370,9 +381,9 @@ fn create_deployment_team(
     template_def: &serde_yaml_ng::Value,
     template_source_repo: &Option<String>,
     created: &[String],
-) {
+) -> bool {
     if created.len() <= 1 {
-        return;
+        return false;
     }
     let mut team_args = serde_json::json!({
         "name": deploy_name,
@@ -394,14 +405,25 @@ fn create_deployment_team(
             );
         }
     }
+    // H15 (CR-2026-06-14): a daemon REJECTION comes back as `Ok(v)` with
+    // `v["ok"] == false`, NOT as `Err` — the old catch-all Ok no-op arm swallowed
+    // it as success, so `deploy` recorded a `team` that was never created. Inspect
+    // the `ok` field (mirroring `spawn_instances`); on a rejection fall back to a
+    // direct create, same as a transport error. Return whether a team actually
+    // exists so `deploy` records `team: Some(..)` only when one was created.
     match crate::api::call(
         home,
         &serde_json::json!({"method": crate::api::method::CREATE_TEAM, "params": &team_args}),
     ) {
-        Ok(_) => {}
-        Err(_) => {
-            let _ = crate::teams::create(home, &team_args);
+        Ok(ref v) if v.get("ok").and_then(|b| b.as_bool()) == Some(false) => {
+            crate::teams::create(home, &team_args)
+                .get("error")
+                .is_none()
         }
+        Ok(_) => true,
+        Err(_) => crate::teams::create(home, &team_args)
+            .get("error")
+            .is_none(),
     }
 }
 
@@ -410,6 +432,23 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
         Ok(p) => p,
         Err(e) => return e,
     };
+
+    // H14 (CR-2026-06-14): reject a duplicate deploy name BEFORE any side-effect
+    // (fleet.yaml write / spawn), so re-deploying an existing name doesn't re-spawn
+    // + clobber fleet.yaml + push a second record. This is a plain READ, NOT a
+    // flock: #1629 forbids holding ANY flock across the self-IPC `api::call` in
+    // spawn_instances / create_deployment_team below (the FLOCK_DEPTH self-IPC
+    // guard refuses on depth > 0, regardless of which lock is held), and the #1617
+    // invariant forbids taking the store flock before spawn. The AUTHORITATIVE
+    // re-check runs under the store flock at the load-modify-save below, closing
+    // the narrow window where two deploys race before either persists its record.
+    if load(home)
+        .deployments
+        .iter()
+        .any(|d| d.name == params.deploy_name)
+    {
+        return duplicate_deploy_error(&params.deploy_name);
+    }
 
     let (created, yaml_entries) = create_instance_entries(&params);
 
@@ -421,7 +460,7 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
 
     spawn_instances(home, &yaml_entries, &params.directory);
 
-    create_deployment_team(
+    let team_created = create_deployment_team(
         home,
         &params.deploy_name,
         &params.template,
@@ -434,7 +473,7 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
         name: params.deploy_name.to_string(),
         template: params.template.to_string(),
         instances: created.clone(),
-        team: if created.len() > 1 {
+        team: if team_created {
             Some(params.deploy_name.to_string())
         } else {
             None
@@ -454,6 +493,17 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
         Err(e) => return serde_json::json!({"error": format!("deployment lock failed: {e}")}),
     };
     let mut store = load(home);
+    // H14: authoritative duplicate-name re-check UNDER the flock — closes the race
+    // where a concurrent same-name deploy passed the pre-spawn read above and
+    // persisted its record first. The loser drops its record (its spawned instances
+    // share the winner's names; the daemon SPAWN handler rejects duplicate names).
+    if store
+        .deployments
+        .iter()
+        .any(|d| d.name == params.deploy_name)
+    {
+        return duplicate_deploy_error(&params.deploy_name);
+    }
     store.deployments.push(deployment);
     // #bughunt2: a deploy whose record never persisted is NOT "deployed" — the
     // instances are live in fleet.yaml but `teardown <name>` can't find them and
@@ -2711,6 +2761,10 @@ templates:
     fn deploy_api_calls_not_under_flock() {
         let prod = prod_src();
         let body = fn_body(prod, "pub fn deploy(home");
+        // H14: deploy's duplicate-name guard is a plain `load()` READ (no flock)
+        // before spawn — #1629 forbids holding ANY flock across the self-IPC
+        // spawn/team. So the ONLY `acquire_file_lock` in deploy is still the store
+        // flock, and it must come AFTER spawn_instances/create_deployment_team.
         let lock_at = body
             .find(&["acquire_file", "_lock"].concat())
             .expect("deploy locks the store save");

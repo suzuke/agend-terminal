@@ -39,7 +39,6 @@ fn create_deployment_team_body(src: &str) -> String {
 }
 
 #[test]
-#[ignore = "deployments-health-teams F2: red until fix; remove #[ignore] after fix to confirm"]
 fn create_deployment_team_handles_ok_false_deployments_health_teams() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/deployments.rs");
     let src = std::fs::read_to_string(&path).expect("read src/deployments.rs");
