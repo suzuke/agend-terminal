@@ -205,7 +205,10 @@ fn create_instance_entries(
                 instructions: yaml_str(inst_val, "instructions"),
                 source_repo,
                 repo: None,
-                github_login: None,
+                // #2104 (cheerc): read from the template stanza (was hardcoded
+                // None → deployed fleet lost github_login → task_sweep D002
+                // false-fired). Mirrors the other yaml_str-read fields above.
+                github_login: yaml_str(inst_val, "github_login"),
                 args: template_args,
                 model: yaml_str(inst_val, "model"),
                 env: template_env,
@@ -960,6 +963,39 @@ templates:
                 .get("dev-lead")
                 .and_then(|i| i.instructions.as_deref()),
             Some("./instructions/lead.md")
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2104 (cheerc): template deployment must carry the template instance's
+    /// `github_login` into the deployed instance — previously hardcoded `None`
+    /// (deployments.rs:208), so a deployed fleet had NO github_login mapping and
+    /// `task_sweep` D002 fired even when the operator set it in the template.
+    #[test]
+    fn deploy_persists_github_login_into_fleet_yaml() {
+        let home = tmp_home("github_login_persist");
+        let yaml = r#"
+templates:
+  dev:
+    instances:
+      impl:
+        backend: claude
+        github_login: cheerc
+"#;
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
+
+        let args = serde_json::json!({"template": "dev", "directory": home.display().to_string()});
+        let _ = deploy(&home, "caller", &args);
+
+        let reloaded =
+            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+        assert_eq!(
+            reloaded
+                .instances
+                .get("dev-impl")
+                .and_then(|i| i.github_login.as_deref()),
+            Some("cheerc"),
+            "deployed instance must carry the template's github_login (D002 false-fire root cause)"
         );
         std::fs::remove_dir_all(&home).ok();
     }
