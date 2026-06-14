@@ -312,7 +312,27 @@ fn sweep_board(
     fleet_cfg: Option<&crate::fleet::FleetConfig>,
     dry_run: bool,
 ) -> anyhow::Result<bool> {
+    // #2117 P3a: the `list_recently_merged_prs` network fetch is the ONLY thing
+    // this adds over the testable close logic; delegate the rest to
+    // `sweep_board_with_prs` (the injectable seam).
     let prs = list_recently_merged_prs(repo, api_base)?;
+    sweep_board_with_prs(home, project_id, &prs, fleet_cfg, dry_run)
+}
+
+/// #2117 P3a: the close logic of [`sweep_board`] with the PR list INJECTED. Seam
+/// for the close-isolation integration test without a GitHub round-trip — a merged
+/// PR scanned against board A is matched ONLY against board A's open tasks (read
+/// via the P1 `list_all_at` `_at` variant), so it can never auto-close a task that
+/// lives on board B (#2105), even if the PR body's `Closes t-…` marker references
+/// it. Returns `Ok(true)` if a full scan ran (PR list AND open-task set both
+/// non-empty), `Ok(false)` if it short-circuited.
+fn sweep_board_with_prs(
+    home: &Path,
+    project_id: &str,
+    prs: &[PrMeta],
+    fleet_cfg: Option<&crate::fleet::FleetConfig>,
+    dry_run: bool,
+) -> anyhow::Result<bool> {
     if prs.is_empty() {
         return Ok(false);
     }
@@ -344,7 +364,7 @@ fn sweep_board(
     let emitter = InstanceName::from(SWEEP_EMITTER);
     let sweep_id = format!("sweep-{}", chrono::Utc::now().to_rfc3339());
 
-    for pr in &prs {
+    for pr in prs {
         if !pr.merged {
             continue;
         }
@@ -1027,6 +1047,66 @@ mod tests {
             empty.is_empty(),
             "no repo + no teams → no boards: {empty:?}"
         );
+        fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2117 close-isolation e2e (the #2125-review gap reviewer-2+4 both flagged):
+    /// a merged PR swept against board A auto-closes ONLY board A's task, even when
+    /// its body's `Closes t-…` marker also references a task on board B (#2105).
+    /// Exercises the real close path through the `sweep_board_with_prs` seam (no
+    /// GitHub round-trip) with a representative two-board fixture built via the real
+    /// `tasks::handle` create path.
+    #[test]
+    fn sweep_closes_only_same_board_task_2117_close_isolation() {
+        let home = tmp_home("close-isolation");
+        // Two project boards, each with an OPEN task created + assigned to
+        // "test-user" (so the sweep's authorship gate passes via direct-name
+        // compare — `make_pr_meta` stamps `author_login = "test-user"`).
+        let mk = |project: &str| -> String {
+            crate::tasks::handle(
+                &home,
+                "test-user",
+                &serde_json::json!({"action": "create", "title": "t", "assignee": "test-user", "project": project}),
+            )["id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let ta = mk("orgA/projA");
+        let tb = mk("orgB/projB");
+
+        // A merged PR in repo A whose body references BOTH boards' tasks.
+        let pr = make_pr_meta(1, "fix", &format!("Closes {ta}\nCloses {tb}"));
+
+        // Sweep board A only.
+        let scanned =
+            sweep_board_with_prs(&home, "orgA/projA", std::slice::from_ref(&pr), None, false)
+                .unwrap();
+        assert!(
+            scanned,
+            "board A had a merged PR + an open task → full scan ran"
+        );
+
+        let status_on = |project: &str, id: &str| -> crate::task_events::TaskStatus {
+            crate::tasks::list_all_at(&crate::task_events::board_root(&home, project))
+                .into_iter()
+                .find(|t| t.id == id)
+                .unwrap_or_else(|| panic!("task {id} not found on board {project}"))
+                .status
+        };
+        // Board A's task auto-closed; board B's task UNTOUCHED — the sweep matched
+        // the markers only against board A's `open_ids` (#2105 cross-board isolation).
+        assert_eq!(
+            status_on("orgA/projA", &ta),
+            crate::task_events::TaskStatus::Done,
+            "board A's task must auto-close"
+        );
+        assert_ne!(
+            status_on("orgB/projB", &tb),
+            crate::task_events::TaskStatus::Done,
+            "board B's task must NOT be closed by repo A's PR (#2105 isolation)"
+        );
+
         fs::remove_dir_all(&home).ok();
     }
 

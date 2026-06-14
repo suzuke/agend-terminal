@@ -137,6 +137,28 @@ fn handle_create(home: &Path, emitter: crate::task_events::InstanceName, args: &
         .as_str()
         .map(String::from)
         .unwrap_or_else(|| super::board_router::resolve_current_project(home, emitter.as_str()));
+    // #2117 P3a: `parent_id` is subtask COMPOSITION ("A is composed of B/C/D").
+    // DP4 invariant — a subtask MUST live in its parent's project. Cross-project
+    // composition breaks board isolation: `cascade_cancel_children` only replays
+    // the PARENT's board, so a cross-project child would be silently orphaned when
+    // the parent is cancelled. Enforce the invariant at the only write point that
+    // can violate it — reject here, fail-closed, rather than detect it later.
+    // Single-project → `resolve_task_project(parent) == project` always → never
+    // fires → byte-identical. (`depends_on` is execution-order dependency, NOT
+    // composition — cross-board references are allowed there per the epic and are
+    // NOT guarded here.)
+    if let Some(parent_id) = args["parent_id"].as_str() {
+        let parent_project = super::board_router::resolve_task_project(home, parent_id);
+        if parent_project != project {
+            return serde_json::json!({
+                "error": format!(
+                    "cross-project parent_id rejected: parent {parent_id} resolves to project \
+                     '{parent_project}' but this subtask targets project '{project}' — a subtask \
+                     must live in its parent's project (board isolation, #2117 P3a)"
+                )
+            });
+        }
+    }
     let board = crate::task_events::board_root(home, &project);
     match crate::task_events::append_at(&board, &emitter, event) {
         Ok(_) => {
