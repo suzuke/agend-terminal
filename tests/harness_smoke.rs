@@ -1,4 +1,14 @@
 //! Sprint 42 Phase 2 — AgendHarness + TuiClient MVP integration tests.
+//!
+//! SCOPE: these are HARNESS smoke tests. They verify the test *infrastructure*
+//! itself — that `TuiClient::feed`/`screen_text`/`feed_and_extract`/`wait_for`
+//! round-trip correctly through the in-process `TestVTerm`, and that
+//! `AgendHarness` boots a real daemon. They deliberately do NOT assert on
+//! production `src/vterm.rs` behavior; that is covered by `tests/vte_gotchas.rs`
+//! and the `src/vterm.rs` unit tests. A harness that silently breaks would make
+//! every test that depends on it (vte_gotchas, behavioral, etc.) unreliable, so
+//! smoke-testing the harness is the point — not a substitute for production
+//! coverage.
 
 mod common;
 

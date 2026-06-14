@@ -812,25 +812,48 @@ pub(crate) mod tests {
     /// not a call site — and assembles the needle, so it never self-counts.)
     #[test]
     fn exactly_one_gh_poll_worker_spawn_site_986() {
-        let files = [
-            "src/daemon/per_tick/pr_state_scan.rs",
-            "src/daemon/supervisor.rs",
-            "src/daemon/mod.rs",
-            "src/app/mod.rs",
-        ];
+        // Scan the WHOLE src/ tree, not a hardcoded 4-file list: a new call site
+        // added in any other module (e.g. app/commands.rs, a new daemon handler)
+        // would otherwise leave the count at 1 and silently pass. Call sites =
+        // all worker-spawn references minus the single `fn` definition. (This
+        // comment intentionally avoids the literal `spawn_gh_poll_worker` + `(`
+        // sequence so the recursive scan does not count itself.)
+        fn collect(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    collect(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        let root = if std::path::Path::new("src").is_dir() {
+            std::path::PathBuf::from("src")
+        } else {
+            std::path::PathBuf::from("agend-terminal/src")
+        };
+        collect(&root, &mut files);
+        // The needle/def are assembled from fragments so THIS test never
+        // self-counts (its only reference is the split literal below).
         let needle = format!("{}(", "spawn_gh_poll_worker");
-        let count: usize = files
-            .iter()
-            .map(|f| {
-                std::fs::read_to_string(f)
-                    .or_else(|_| std::fs::read_to_string(format!("agend-terminal/{f}")))
-                    .unwrap_or_default()
-            })
-            .map(|src| src.matches(needle.as_str()).count())
-            .sum();
+        let def = format!("fn {}(", "spawn_gh_poll_worker");
+        let mut refs = 0usize;
+        let mut defs = 0usize;
+        for f in &files {
+            let src = std::fs::read_to_string(f).unwrap_or_default();
+            refs += src.matches(needle.as_str()).count();
+            defs += src.matches(def.as_str()).count();
+        }
+        let call_sites = refs - defs;
         assert_eq!(
-            count, 1,
-            "#986: gh-poll worker must be spawned exactly once across all entry points (got {count})"
+            call_sites, 1,
+            "#986: gh-poll worker must be spawned exactly once across ALL of src/ \
+             (found {call_sites} call sites; refs={refs}, defs={defs})"
         );
     }
 
