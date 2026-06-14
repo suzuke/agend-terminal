@@ -900,3 +900,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod review_repro_mcp_dispatch_comms;

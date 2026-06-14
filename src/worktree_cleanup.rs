@@ -744,3 +744,6 @@ mod tests {
         std::fs::remove_dir_all(&repo).ok();
     }
 }
+
+#[cfg(test)]
+mod review_repro_worktree_git;
