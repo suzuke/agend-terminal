@@ -62,6 +62,15 @@ const MODULE_SCOPE: &[&str] = &[
     "claim_verifier.rs",
     "deployments.rs",
     "bootstrap/canonical_hygiene.rs",
+    // W1.2 slice 3: agent_ops (best-effort worktree-remove → git_ok). ci/mod's
+    // worktree-remove is kept raw (deliberate non-bypass, already bounded via
+    // spawn_group_bounded, surfaces stderr in JSON note) via git-raw-allowed.
+    // auto_release + retention/worktrees already do all LOCAL git via git_bypass
+    // (zero raw Command::new in production) — sealed against a future regression.
+    "agent_ops.rs",
+    "mcp/handlers/ci/mod.rs",
+    "daemon/auto_release.rs",
+    "daemon/retention/worktrees.rs",
 ];
 
 /// One violation entry — `(file, line_number, snippet)`.

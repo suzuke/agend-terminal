@@ -390,15 +390,20 @@ pub fn cleanup_working_dir(home: &Path, name: &str, working_dir: &Path) {
         // Clean up worktree if exists
         let wt_dir = working_dir.join(".worktrees").join(name);
         if wt_dir.exists() {
-            let _ = std::process::Command::new("git")
-                .args([
+            // W1.2: LOCAL best-effort worktree-remove via the bypass+bounded
+            // helper (was a raw UNBOUNDED `.output()` whose result was already
+            // discarded). git_ok adds the LOCAL_GIT_TIMEOUT bound so a stuck
+            // remove can't hang teardown; the bypass env is a no-op in the
+            // daemon's shim-free PATH. Result stays discarded → same effect.
+            let _ = crate::git_helpers::git_ok(
+                working_dir,
+                &[
                     "worktree",
                     "remove",
                     "--force",
                     &wt_dir.display().to_string(),
-                ])
-                .current_dir(working_dir)
-                .output();
+                ],
+            );
             tracing::info!(dir = %wt_dir.display(), "removed worktree");
         }
     }

@@ -472,6 +472,9 @@ pub(super) fn handle_release_repo(args: &Value) -> Value {
     // spawn_group_bounded only adds the LOCAL timeout + safe process-group kill,
     // without forcing the bypass env. (Whether it SHOULD bypass like ci/mod:270
     // is a separate behaviour question, out of scope for this timeout PR.)
+    // git-raw-allowed: deliberate non-bypass + no current_dir; already bounded via
+    // spawn_group_bounded; the Ok(non-zero) arm surfaces stderr in the JSON `note`
+    // (git_ok would discard it), so git_cmd/git_ok would not be byte-identical.
     let mut cmd = std::process::Command::new("git");
     cmd.args(["worktree", "remove", "--force", &path_str]);
     match crate::git_helpers::spawn_group_bounded(
