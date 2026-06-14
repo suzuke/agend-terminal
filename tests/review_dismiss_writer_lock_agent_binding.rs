@@ -24,7 +24,6 @@
 use std::path::PathBuf;
 
 #[test]
-#[ignore = "dismiss-unbounded-write: red until fix; remove #[ignore] after fix to confirm"]
 fn dismiss_thread_has_no_raw_unbounded_writer_lock_agent_binding() {
     let file = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/agent/dismiss.rs");
     let text = std::fs::read_to_string(&file).expect("read src/agent/dismiss.rs");

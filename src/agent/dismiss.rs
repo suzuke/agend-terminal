@@ -142,27 +142,28 @@ pub fn try_dismiss_dialog(
                     std::thread::sleep(std::time::Duration::from_millis(300));
                     // Send keys in chunks split on \r/\n boundaries with delay between,
                     // so TUI frameworks process navigation before confirmation.
-                    let mut w = writer.lock();
+                    // H13: route each chunk through `write_with_timeout` (bounded
+                    // worker + 5s deadline) rather than holding the raw shared
+                    // `writer.lock()` across an unbounded `write_all`. A hung agent
+                    // that has stopped draining its PTY input buffer — exactly the
+                    // state that triggers a dismiss — would otherwise pin the writer
+                    // lock forever, wedging every future inject to that agent until
+                    // daemon restart. `write_with_timeout` flushes internally.
                     let mut start = 0;
                     for (i, &b) in keys.iter().enumerate() {
                         if b == b'\r' || b == b'\n' {
                             // Send everything up to (not including) this Enter
                             if start < i {
-                                let _ = w.write_all(&keys[start..i]);
-                                let _ = w.flush();
-                                drop(w);
+                                let _ = write_with_timeout(&writer, &keys[start..i]);
                                 std::thread::sleep(std::time::Duration::from_millis(200));
-                                w = writer.lock();
                             }
                             // Send the Enter
-                            let _ = w.write_all(&keys[i..=i]);
-                            let _ = w.flush();
+                            let _ = write_with_timeout(&writer, &keys[i..=i]);
                             start = i + 1;
                         }
                     }
                     if start < keys.len() {
-                        let _ = w.write_all(&keys[start..]);
-                        let _ = w.flush();
+                        let _ = write_with_timeout(&writer, &keys[start..]);
                     }
                     tracing::debug!(agent = %agent, "dismiss keystrokes sent");
                     // H2: in-flight slot freed by `_guard` on scope exit.
