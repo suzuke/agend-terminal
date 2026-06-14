@@ -308,9 +308,11 @@ instances:
     topic_id: 42
 ";
         std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).expect("write fleet.yaml");
-        std::fs::create_dir_all(home.join("channel")).ok();
-        std::fs::write(home.join("channel").join("topics.json"), "{\"B\":42}")
-            .expect("write topics.json");
+        // Seed the topic registry at the PRODUCTION path (home/topics.json via
+        // topic_registry_path) using the real API. The previous version wrote
+        // home/channel/topics.json — a path production never reads or writes —
+        // so the immutability assertion below was a tautology.
+        register_topic(&home, 42, "B").expect("seed topic registry");
 
         std::env::set_var("PR57_ROUND2_FAKE_TOKEN", "fake");
         set_forced_send_error(anyhow::anyhow!("Bad Request: message thread not found"));
@@ -328,8 +330,10 @@ instances:
             "provenance failure mutated fleet.yaml (removed B): {fleet_yaml}"
         );
 
-        let topics_json =
-            std::fs::read_to_string(home.join("channel").join("topics.json")).unwrap_or_default();
+        let topics_json = std::fs::read_to_string(
+            crate::channel::telegram::topic_registry::topic_registry_path(&home),
+        )
+        .unwrap_or_default();
         assert!(
             topics_json.contains("\"B\""),
             "provenance failure unregistered target's topic: {topics_json}"
