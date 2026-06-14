@@ -951,14 +951,60 @@ impl TaskBoardState {
     }
 }
 
-// ── Append: single + batch ─────────────────────────────────────────
+// ── Board root (#2117 P0 project-isolation seam) ───────────────────
+//
+// The task board's on-disk files (the hot `task_events.jsonl`, the archive,
+// and the replay/seq caches) live under a *board root*. P0 introduces the seam
+// only: every storage fn now has a `_at(board, …)` variant, and the public
+// `fn x(home, …)` delegates to `x_at(&board_root(home, DEFAULT_PROJECT), …)`.
+// For the default/fleet project `board_root` returns `home` UNCHANGED, so the
+// public API, every caller, and every test are byte-identical (P0 has NO
+// multi-board caller — routing is P1). A real project gets its own subtree.
 
-fn log_path(home: &Path) -> PathBuf {
-    home.join(format!("{LOG_NAME}.jsonl"))
+/// Sentinel project id for the single, fleet-wide board — maps to `home`.
+pub(crate) const DEFAULT_PROJECT: &str = "default";
+
+/// Resolve the on-disk root for a project's task board.
+///
+/// `default`/`fleet`/empty → `home` itself (single-project byte-identical).
+/// Any other project id → `home/boards/<slug>/`, where the slug is derived
+/// from the project id (a source_repo / `owner/repo`). P1 owns the routing
+/// that picks a non-default project id; P0 only needs the mapping to exist.
+pub(crate) fn board_root(home: &Path, project_id: &str) -> PathBuf {
+    if project_id.is_empty() || project_id == DEFAULT_PROJECT || project_id == "fleet" {
+        return home.to_path_buf();
+    }
+    home.join("boards").join(project_slug(project_id))
 }
 
-fn archive_dir(home: &Path) -> PathBuf {
-    home.join("task_events_archive")
+/// Derive a filesystem-safe directory name for a project id. Prefers a
+/// canonical `owner__repo` for an `owner/repo` slug; otherwise sanitizes any
+/// remaining path/URL separators. (P0: deterministic + round-trippable enough
+/// for an isolated subtree; P1 may refine the canonicalization.)
+fn project_slug(project_id: &str) -> String {
+    let trimmed = project_id
+        .trim()
+        .trim_end_matches('/')
+        .strip_suffix(".git")
+        .unwrap_or_else(|| project_id.trim().trim_end_matches('/'));
+    trimmed
+        .chars()
+        .map(|c| match c {
+            '/' => '_', // an `owner/repo` becomes `owner_repo` after the pass below
+            c if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') => c,
+            _ => '_',
+        })
+        .collect()
+}
+
+// ── Append: single + batch ─────────────────────────────────────────
+
+fn log_path(board: &Path) -> PathBuf {
+    board.join(format!("{LOG_NAME}.jsonl"))
+}
+
+fn archive_dir(board: &Path) -> PathBuf {
+    board.join("task_events_archive")
 }
 
 /// Append one event, returning the newly assigned monotonic seq#.
@@ -967,7 +1013,16 @@ fn archive_dir(home: &Path) -> PathBuf {
 /// as the write — concurrent appenders observe a totally-ordered seq
 /// stream per instance.
 pub fn append(home: &Path, instance: &InstanceName, event: TaskEvent) -> anyhow::Result<u64> {
-    let seqs = append_batch(home, instance, vec![event])?;
+    append_at(&board_root(home, DEFAULT_PROJECT), instance, event)
+}
+
+/// #2117 board-root variant of [`append`].
+pub(crate) fn append_at(
+    board: &Path,
+    instance: &InstanceName,
+    event: TaskEvent,
+) -> anyhow::Result<u64> {
+    let seqs = append_batch_at(board, instance, vec![event])?;
     Ok(seqs.into_iter().next().unwrap_or(0))
 }
 
@@ -976,6 +1031,20 @@ pub fn append(home: &Path, instance: &InstanceName, event: TaskEvent) -> anyhow:
 /// this emitter.
 pub fn append_batch(
     home: &Path,
+    instance: &InstanceName,
+    events: Vec<TaskEvent>,
+) -> anyhow::Result<Vec<u64>> {
+    append_batch_at(&board_root(home, DEFAULT_PROJECT), instance, events)
+}
+
+/// #2117 board-root variant of [`append_batch`]. The board root carries the hot
+/// log, lock, and seq cache. NOTE (P1 seam): emitter-id resolution + the audit
+/// log are passed the same `board` arg here (byte-identical while
+/// `board == home`); P1 routing decides whether instance-resolution / fleet
+/// audit stay home-scoped — emitter resolution already degrades to `None` (a
+/// best-effort audit field) if the board can't resolve it.
+pub(crate) fn append_batch_at(
+    board: &Path,
     instance: &InstanceName,
     events: Vec<TaskEvent>,
 ) -> anyhow::Result<Vec<u64>> {
@@ -988,7 +1057,7 @@ pub fn append_batch(
     let now = chrono::Utc::now().to_rfc3339();
 
     // Sprint 46 P3: resolve emitter's InstanceId for audit trail.
-    let emitter_id = match crate::agent::resolve_instance(home, instance.as_str()) {
+    let emitter_id = match crate::agent::resolve_instance(board, instance.as_str()) {
         Ok((id, _)) => Some(id.full()),
         Err(e) => {
             tracing::debug!(instance = %instance, error = %e, "emitter ID resolution failed");
@@ -996,7 +1065,7 @@ pub fn append_batch(
         }
     };
 
-    crate::event_log::append_lines_under_lock(home, LOG_NAME, |log_path| {
+    crate::event_log::append_lines_under_lock(board, LOG_NAME, |log_path| {
         let start_seq = max_seq_for_instance(log_path, &instance)? + 1;
         let mut lines = Vec::with_capacity(count);
         for (i, event) in events.into_iter().enumerate() {
@@ -1017,7 +1086,7 @@ pub fn append_batch(
     invalidate_replay_cache();
     // H1: update cached high-water mark after successful append
     if let Some(&last_seq) = seqs.last() {
-        let log_path = home.join(format!("{LOG_NAME}.jsonl"));
+        let log_path = board.join(format!("{LOG_NAME}.jsonl"));
         let key = (log_path, instance);
         SEQ_CACHE.lock().insert(key, last_seq);
     }
@@ -1040,6 +1109,24 @@ pub fn append_batch_checked<F>(
 where
     F: FnOnce(&TaskBoardState) -> Result<(), String>,
 {
+    append_batch_checked_at(
+        &board_root(home, DEFAULT_PROJECT),
+        instance,
+        events,
+        precondition,
+    )
+}
+
+/// #2117 board-root variant of [`append_batch_checked`].
+pub(crate) fn append_batch_checked_at<F>(
+    board: &Path,
+    instance: &InstanceName,
+    events: Vec<TaskEvent>,
+    precondition: F,
+) -> anyhow::Result<Result<Vec<u64>, String>>
+where
+    F: FnOnce(&TaskBoardState) -> Result<(), String>,
+{
     if events.is_empty() {
         return Ok(Ok(Vec::new()));
     }
@@ -1047,7 +1134,7 @@ where
     let count = events.len();
     let mut seqs: Vec<u64> = Vec::with_capacity(count);
     let now = chrono::Utc::now().to_rfc3339();
-    let emitter_id = match crate::agent::resolve_instance(home, instance.as_str()) {
+    let emitter_id = match crate::agent::resolve_instance(board, instance.as_str()) {
         Ok((id, _)) => Some(id.full()),
         Err(e) => {
             tracing::debug!(instance = %instance, error = %e, "emitter ID resolution failed");
@@ -1056,9 +1143,9 @@ where
     };
 
     let mut rejection: Option<String> = None;
-    crate::event_log::append_lines_under_lock(home, LOG_NAME, |log_path| {
+    crate::event_log::append_lines_under_lock(board, LOG_NAME, |log_path| {
         // FRESH replay under the lock — authoritative committed history.
-        let state = replay_uncached(home)?;
+        let state = replay_uncached(board)?;
         if let Err(reason) = precondition(&state) {
             rejection = Some(reason);
             return Ok(Vec::new()); // empty ⇒ no write
@@ -1086,7 +1173,7 @@ where
     }
     invalidate_replay_cache();
     if let Some(&last_seq) = seqs.last() {
-        let log_path = home.join(format!("{LOG_NAME}.jsonl"));
+        let log_path = board.join(format!("{LOG_NAME}.jsonl"));
         SEQ_CACHE.lock().insert((log_path, instance), last_seq);
     }
     Ok(Ok(seqs))
@@ -1117,9 +1204,27 @@ pub fn append_checked<F>(
 where
     F: FnOnce(&TaskBoardState) -> Result<(), String>,
 {
+    append_checked_at(
+        &board_root(home, DEFAULT_PROJECT),
+        instance,
+        event,
+        precondition,
+    )
+}
+
+/// #2117 board-root variant of [`append_checked`].
+pub(crate) fn append_checked_at<F>(
+    board: &Path,
+    instance: &InstanceName,
+    event: TaskEvent,
+    precondition: F,
+) -> anyhow::Result<Result<u64, String>>
+where
+    F: FnOnce(&TaskBoardState) -> Result<(), String>,
+{
     let instance = instance.clone();
     let now = chrono::Utc::now().to_rfc3339();
-    let emitter_id = match crate::agent::resolve_instance(home, instance.as_str()) {
+    let emitter_id = match crate::agent::resolve_instance(board, instance.as_str()) {
         Ok((id, _)) => Some(id.full()),
         Err(e) => {
             tracing::debug!(instance = %instance, error = %e, "emitter ID resolution failed");
@@ -1130,9 +1235,9 @@ where
     let mut assigned_seq: Option<u64> = None;
     let mut rejection: Option<String> = None;
 
-    crate::event_log::append_lines_under_lock(home, LOG_NAME, |log_path| {
+    crate::event_log::append_lines_under_lock(board, LOG_NAME, |log_path| {
         // FRESH replay under the lock — authoritative committed history.
-        let state = replay_uncached(home)?;
+        let state = replay_uncached(board)?;
         if let Err(reason) = precondition(&state) {
             rejection = Some(reason);
             return Ok(Vec::new()); // empty ⇒ no write
@@ -1155,7 +1260,7 @@ where
     }
     invalidate_replay_cache();
     if let Some(seq) = assigned_seq {
-        let log_path = home.join(format!("{LOG_NAME}.jsonl"));
+        let log_path = board.join(format!("{LOG_NAME}.jsonl"));
         SEQ_CACHE.lock().insert((log_path, instance), seq);
         return Ok(Ok(seq));
     }
@@ -1177,9 +1282,24 @@ pub fn append_done_if_legal(
     task_id: &str,
     events: Vec<TaskEvent>,
 ) -> anyhow::Result<bool> {
+    append_done_if_legal_at(
+        &board_root(home, DEFAULT_PROJECT),
+        instance,
+        task_id,
+        events,
+    )
+}
+
+/// #2117 board-root variant of [`append_done_if_legal`].
+pub(crate) fn append_done_if_legal_at(
+    board: &Path,
+    instance: &InstanceName,
+    task_id: &str,
+    events: Vec<TaskEvent>,
+) -> anyhow::Result<bool> {
     let tid = TaskId(task_id.to_string());
     let label = task_id.to_string();
-    let outcome = append_batch_checked(home, instance, events, move |state| {
+    let outcome = append_batch_checked_at(board, instance, events, move |state| {
         match state.tasks.get(&tid).map(|r| r.status) {
             Some(status) if status.can_transition_to(TaskStatus::Done) => Ok(()),
             Some(status) => Err(format!(
@@ -1254,12 +1374,17 @@ struct ReplayCacheEntry {
     state: TaskBoardState,
 }
 
-static REPLAY_CACHE: std::sync::LazyLock<parking_lot::Mutex<Option<ReplayCacheEntry>>> =
-    std::sync::LazyLock::new(|| parking_lot::Mutex::new(None));
+// #2117 P0: per-board-keyed map (was a single global `Option`). The map key is
+// the board root; the entry's `key` field still carries the full freshness tuple
+// (path, generation, len, mtime). Single-board (default) keeps exactly one entry
+// → byte-identical; P1 multi-board can't cross-contaminate state between boards.
+static REPLAY_CACHE: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<PathBuf, ReplayCacheEntry>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
 
-fn replay_cache_key(home: &Path) -> ReplayCacheKey {
+fn replay_cache_key(board: &Path) -> ReplayCacheKey {
     let gen = REPLAY_GENERATION.load(std::sync::atomic::Ordering::Acquire);
-    let log = log_path(home);
+    let log = log_path(board);
     let (log_len, mtime_ns) = std::fs::metadata(&log)
         .ok()
         .map(|m| {
@@ -1273,7 +1398,7 @@ fn replay_cache_key(home: &Path) -> ReplayCacheKey {
             (len, mtime)
         })
         .unwrap_or((0, 0));
-    (home.to_path_buf(), gen, log_len, mtime_ns)
+    (board.to_path_buf(), gen, log_len, mtime_ns)
 }
 
 pub fn invalidate_replay_cache() {
@@ -1313,7 +1438,7 @@ static REPLAY_FAILCLOSED_EVENT_EMITTED: std::sync::atomic::AtomicBool =
 /// `stream_envelopes` fail-close without surfacing. The board-freeze alert here
 /// is the primary operator signal, so that narrower timeline-query gap is
 /// accepted rather than expanding scope.
-fn surface_failclosed_replay_once(home: &Path, err: &anyhow::Error) {
+fn surface_failclosed_replay_once(board: &Path, err: &anyhow::Error) {
     let msg = err.to_string();
     if !msg.contains("fail-closed") {
         return;
@@ -1324,7 +1449,7 @@ fn surface_failclosed_replay_once(home: &Path, err: &anyhow::Error) {
     );
     if !REPLAY_FAILCLOSED_EVENT_EMITTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         crate::event_log::log(
-            home,
+            board,
             "task_replay_fail_closed",
             "task-board",
             &format!(
@@ -1337,38 +1462,46 @@ fn surface_failclosed_replay_once(home: &Path, err: &anyhow::Error) {
 }
 
 pub fn replay(home: &Path) -> anyhow::Result<TaskBoardState> {
-    let key = replay_cache_key(home);
+    replay_at(&board_root(home, DEFAULT_PROJECT))
+}
+
+/// #2117 board-root variant of [`replay`].
+pub(crate) fn replay_at(board: &Path) -> anyhow::Result<TaskBoardState> {
+    let key = replay_cache_key(board);
     {
         let cache = REPLAY_CACHE.lock();
-        if let Some(entry) = cache.as_ref() {
+        if let Some(entry) = cache.get(board) {
             if entry.key == key {
                 return Ok(entry.state.clone());
             }
         }
     }
 
-    let state = match replay_uncached(home) {
+    let state = match replay_uncached(board) {
         Ok(s) => s,
         Err(e) => {
             // #1990 item 4: surface the fail-closed stall before the per-tick
             // caller swallows the Err into a read-gate.
-            surface_failclosed_replay_once(home, &e);
+            surface_failclosed_replay_once(board, &e);
             return Err(e);
         }
     };
 
-    *REPLAY_CACHE.lock() = Some(ReplayCacheEntry {
-        key,
-        state: state.clone(),
-    });
+    REPLAY_CACHE.lock().insert(
+        board.to_path_buf(),
+        ReplayCacheEntry {
+            key,
+            state: state.clone(),
+        },
+    );
 
     Ok(state)
 }
 
-fn replay_uncached(home: &Path) -> anyhow::Result<TaskBoardState> {
+fn replay_uncached(board: &Path) -> anyhow::Result<TaskBoardState> {
     let mut state = TaskBoardState::default();
 
-    let archive_dir = archive_dir(home);
+    let archive_dir = archive_dir(board);
     if archive_dir.is_dir() {
         let mut archives: Vec<PathBuf> = std::fs::read_dir(&archive_dir)?
             .flatten()
@@ -1386,7 +1519,7 @@ fn replay_uncached(home: &Path) -> anyhow::Result<TaskBoardState> {
         }
     }
 
-    let log_path = log_path(home);
+    let log_path = log_path(board);
     if log_path.exists() {
         let mut envelopes = Vec::new();
         read_envelopes_strict(&log_path, &mut envelopes)?;
@@ -1402,10 +1535,18 @@ fn replay_uncached(home: &Path) -> anyhow::Result<TaskBoardState> {
 /// Return all task event envelopes for a given `task_id`, sorted chronologically.
 /// Used by `task action=activity` to build a timeline.
 pub fn envelopes_for_task(home: &Path, task_id: &str) -> anyhow::Result<Vec<TaskEventEnvelope>> {
+    envelopes_for_task_at(&board_root(home, DEFAULT_PROJECT), task_id)
+}
+
+/// #2117 board-root variant of [`envelopes_for_task`].
+pub(crate) fn envelopes_for_task_at(
+    board: &Path,
+    task_id: &str,
+) -> anyhow::Result<Vec<TaskEventEnvelope>> {
     let tid = TaskId(task_id.to_string());
     let mut all = Vec::new();
 
-    let archive = archive_dir(home);
+    let archive = archive_dir(board);
     if archive.is_dir() {
         let mut archives: Vec<std::path::PathBuf> = std::fs::read_dir(&archive)?
             .flatten()
@@ -1420,7 +1561,7 @@ pub fn envelopes_for_task(home: &Path, task_id: &str) -> anyhow::Result<Vec<Task
         }
     }
 
-    let lp = log_path(home);
+    let lp = log_path(board);
     if lp.exists() {
         let mut envs = Vec::new();
         read_envelopes_strict(&lp, &mut envs)?;
@@ -1437,9 +1578,14 @@ pub fn envelopes_for_task(home: &Path, task_id: &str) -> anyhow::Result<Vec<Task
 /// time-join needs to build per-task `[start, end)` windows. Read-only; no
 /// schema change. Fails closed on an unparseable envelope, same as replay.
 pub fn stream_envelopes(home: &Path) -> anyhow::Result<Vec<TaskEventEnvelope>> {
+    stream_envelopes_at(&board_root(home, DEFAULT_PROJECT))
+}
+
+/// #2117 board-root variant of [`stream_envelopes`].
+pub(crate) fn stream_envelopes_at(board: &Path) -> anyhow::Result<Vec<TaskEventEnvelope>> {
     let mut all = Vec::new();
 
-    let archive = archive_dir(home);
+    let archive = archive_dir(board);
     if archive.is_dir() {
         let mut archives: Vec<std::path::PathBuf> = std::fs::read_dir(&archive)?
             .flatten()
@@ -1452,7 +1598,7 @@ pub fn stream_envelopes(home: &Path) -> anyhow::Result<Vec<TaskEventEnvelope>> {
         }
     }
 
-    let lp = log_path(home);
+    let lp = log_path(board);
     if lp.exists() {
         read_envelopes_strict(&lp, &mut all)?;
     }
@@ -1579,8 +1725,13 @@ fn read_envelopes_strict(path: &Path, out: &mut Vec<TaskEventEnvelope>) -> anyho
 /// cannot hold a half-write, and the read-path skip is the backstop for any
 /// other archive corruption.
 pub fn recover_half_writes(home: &Path) {
+    recover_half_writes_at(&board_root(home, DEFAULT_PROJECT))
+}
+
+/// #2117 board-root variant of [`recover_half_writes`].
+pub(crate) fn recover_half_writes_at(board: &Path) {
     use std::io::Write;
-    let path = log_path(home);
+    let path = log_path(board);
     if !path.exists() {
         return;
     }
@@ -1611,7 +1762,7 @@ pub fn recover_half_writes(home: &Path) {
     }
     // Forensics: quarantine only the corrupt line(s) — never silently destroy.
     let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-    let recovery_dir = home.join("task_events.recovery").join(&ts);
+    let recovery_dir = board.join("task_events.recovery").join(&ts);
     let _ = std::fs::create_dir_all(&recovery_dir);
     if let Ok(mut rf) = std::fs::OpenOptions::new()
         .create(true)
@@ -1662,13 +1813,18 @@ pub fn recover_half_writes(home: &Path) {
 /// hot-file at all times.
 #[allow(dead_code)]
 pub fn compact(home: &Path) -> anyhow::Result<()> {
-    let log_path = log_path(home);
+    compact_at(&board_root(home, DEFAULT_PROJECT))
+}
+
+/// #2117 board-root variant of [`compact`].
+pub(crate) fn compact_at(board: &Path) -> anyhow::Result<()> {
+    let log_path = log_path(board);
     if !log_path.exists() {
         return Ok(());
     }
     let suffix = chrono::Utc::now().format("%Y%m%dT%H%M%S%6fZ").to_string();
 
-    crate::event_log::append_lines_under_lock(home, LOG_NAME, |log_path| {
+    crate::event_log::append_lines_under_lock(board, LOG_NAME, |log_path| {
         let content = std::fs::read_to_string(log_path)?;
         let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
         if lines.len() <= COMPACTION_KEEP {
@@ -3543,6 +3699,33 @@ mod tests {
     }
 
     // ── Perf Group 1A: replay cache tests ──────────────────────────
+
+    #[test]
+    fn board_root_default_is_home_real_project_is_subtree() {
+        // #2117 P0 seam: the default/fleet/empty project maps to `home` itself
+        // (this is what makes the whole refactor byte-identical), while a real
+        // project id resolves to its own isolated subtree under `home/boards/`.
+        let home = tmp_home("board-root");
+        assert_eq!(board_root(&home, DEFAULT_PROJECT), home);
+        assert_eq!(board_root(&home, "fleet"), home);
+        assert_eq!(board_root(&home, ""), home);
+
+        let proj = board_root(&home, "owner/repo");
+        assert_ne!(
+            proj, home,
+            "a real project must not collide with the home board"
+        );
+        assert!(proj.starts_with(home.join("boards")));
+        let slug = proj.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            !slug.contains('/'),
+            "slug must be filesystem-safe, got {slug:?}"
+        );
+        // Deterministic / round-trippable: same id → same root; distinct ids → distinct roots.
+        assert_eq!(board_root(&home, "owner/repo"), proj);
+        assert_ne!(board_root(&home, "other/repo"), proj);
+        std::fs::remove_dir_all(&home).ok();
+    }
 
     #[test]
     fn replay_cache_hit_returns_same_result() {
