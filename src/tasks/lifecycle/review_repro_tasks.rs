@@ -1,7 +1,7 @@
 //! Review-repro tests (SCOPEKEY: tasks) attached to `src/tasks/lifecycle.rs`.
 //!
 //! RED against the current (buggy) code; GREEN once the cited finding is fixed.
-//! `#[ignore]`d so CI stays green until the fix lands.
+//! Each test is `#[ignore]`d until its finding is fixed, then un-ignored to confirm.
 
 #![allow(clippy::expect_used)]
 
@@ -62,7 +62,6 @@ fn write_envelope(home: &std::path::Path, seq: u64, ts: &str, event: TaskEvent) 
 /// Cancelled): an aged completed task stays Done in history (or is dropped from
 /// the active board), but must NEVER appear as Cancelled.
 #[test]
-#[ignore = "tasks-archive-flips-done-to-cancelled: red until fix; remove #[ignore] after fix to confirm"]
 fn archive_does_not_flip_completed_task_to_cancelled_tasks() {
     let home = repro_home("archive-done-flip");
     let tid = TaskId::from("t-done-aged");
