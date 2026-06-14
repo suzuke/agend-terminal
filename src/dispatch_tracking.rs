@@ -115,6 +115,38 @@ pub fn reassign_to(home: &Path, task_id: &str, new_owner: Option<&str>) {
     );
 }
 
+/// Terminal dispatch statuses — the sweep skip-set (#2099 + #1488). A terminal
+/// entry is never nagged and is NOT a pending dispatch for #2127 P2 re-route.
+fn is_terminal_status(status: &str) -> bool {
+    matches!(status, "completed" | "orphaned" | "no_report_expected")
+}
+
+/// #2127 Phase 2: atomically REMOVE and RETURN the non-terminal dispatch entries
+/// targeting `agent` — a single locked read-modify-write so there is no
+/// snapshot-then-remove window where a concurrently-added dispatch could be
+/// removed without being notified (reviewer-4). The reclaim handler notifies each
+/// returned entry's dispatcher; removal is the fire-once (next scan finds nothing,
+/// mirroring Phase 1's structural fire-once).
+pub fn take_pending_dispatchers_to(home: &Path, agent: &str) -> Vec<DispatchEntry> {
+    let mut taken = Vec::new();
+    persist_or_log!(
+        crate::store::mutate_versioned(&store_path(home), |store: &mut DispatchStore| {
+            let mut remaining = Vec::with_capacity(store.entries.len());
+            for e in store.entries.drain(..) {
+                if e.to == agent && !is_terminal_status(&e.status) {
+                    taken.push(e);
+                } else {
+                    remaining.push(e);
+                }
+            }
+            store.entries = remaining;
+            Ok(())
+        }),
+        "dispatch_take_pending_to"
+    );
+    taken
+}
+
 /// Sweep for stuck dispatches. Returns (warn_list, ask_list).
 pub fn sweep_stuck(home: &Path) -> (Vec<DispatchEntry>, Vec<DispatchEntry>) {
     let now = chrono::Utc::now();
