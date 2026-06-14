@@ -52,9 +52,24 @@ mod tests {
 
     #[test]
     fn daemon_config_default_returns_expected_values() {
-        let _cfg = DaemonConfig::default();
-        // pointer_only_inject depends on env var; in test context should be false
-        // unless explicitly set
+        let cfg = DaemonConfig::default();
+        // `display_timezone` defaults to None unconditionally.
+        assert_eq!(
+            cfg.display_timezone, None,
+            "display_timezone default is None"
+        );
+        // `pointer_only_inject` is derived from AGEND_POINTER_ONLY_INJECT
+        // (true only when the var is exactly "1"). Compute the expectation the
+        // same way so the assertion is deterministic regardless of the ambient
+        // env, while still pinning that `default()` actually honors the var —
+        // the previous body asserted nothing at all.
+        let expect_pointer = std::env::var("AGEND_POINTER_ONLY_INJECT")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        assert_eq!(
+            cfg.pointer_only_inject, expect_pointer,
+            "pointer_only_inject default must reflect AGEND_POINTER_ONLY_INJECT"
+        );
     }
 
     #[test]
