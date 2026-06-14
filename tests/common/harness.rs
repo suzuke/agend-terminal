@@ -409,6 +409,51 @@ impl TestVTerm {
         };
         tail.join("\n")
     }
+
+    /// Like `tail_lines`, but also reads scrollback HISTORY. `tail_lines`
+    /// only walks the visible rows (`0..rows`); this walks the full grid
+    /// range `topmost_line()..=bottommost_line()`, whose top is negative
+    /// when lines have scrolled into history (the Term is configured with
+    /// `scrolling_history: 10000`). Returns the last `n` non-empty lines.
+    fn history_tail_lines(&self, n: usize) -> String {
+        let grid = self.term.grid();
+        let cols = self.cols as usize;
+        let top = grid.topmost_line().0;
+        let bottom = grid.bottommost_line().0;
+        let mut lines: Vec<String> = Vec::new();
+        let mut row = top;
+        while row <= bottom {
+            let mut line = String::with_capacity(cols);
+            for col in 0..cols {
+                if col < grid.columns() {
+                    let point = Point::new(Line(row), Column(col));
+                    let cell = &grid[point];
+                    if !cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                        let ch = if cell.c == '\0' { ' ' } else { cell.c };
+                        line.push(ch);
+                    }
+                }
+            }
+            lines.push(line.trim_end().to_string());
+            row += 1;
+        }
+        let first = lines
+            .iter()
+            .position(|l| !l.is_empty())
+            .unwrap_or(lines.len());
+        let last = lines
+            .iter()
+            .rposition(|l| !l.is_empty())
+            .map(|i| i + 1)
+            .unwrap_or(first);
+        let visible = &lines[first..last];
+        let tail = if visible.len() > n {
+            &visible[visible.len() - n..]
+        } else {
+            visible
+        };
+        tail.join("\n")
+    }
 }
 
 /// TuiClient — connect to daemon API + in-process vterm for PTY output parsing.
@@ -459,10 +504,12 @@ impl TuiClient {
         self.vterm.tail_lines(lines)
     }
 
-    /// Read scrollback + visible screen as plain text.
+    /// Read scrollback HISTORY + visible screen as plain text. Unlike
+    /// `screen_text` (visible rows only), this includes lines that have
+    /// scrolled out of the visible viewport into history.
     #[allow(dead_code)]
     pub fn read_scrollback(&self, max_lines: usize) -> String {
-        self.vterm.tail_lines(max_lines) // TestVTerm uses tail_lines for both
+        self.vterm.history_tail_lines(max_lines)
     }
 
     /// Feed bytes into vterm and return screen text. Single-pass — does not

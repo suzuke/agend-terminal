@@ -131,115 +131,19 @@ fn git_status_porcelain_clean() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// --- E2E auto-prune integration tests ---
-
-/// E2e: clean worktree + flip true→false → worktree dir removed.
-#[test]
-fn e2e_clean_worktree_flip_prunes() {
-    let dir = std::env::temp_dir().join(format!("agend-wt-e2e-prune-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    // Init git repo
-    // allow: raw-git-subprocess pre-#821 fixture; properly pins AGEND_GIT_BYPASS+current_dir
-    std::process::Command::new("git")
-        .env("AGEND_GIT_BYPASS", "1")
-        .args(["init", "-b", "main"])
-        .current_dir(&dir)
-        .output()
-        .unwrap();
-    // allow: raw-git-subprocess pre-#821 fixture; properly pins AGEND_GIT_BYPASS+current_dir
-    std::process::Command::new("git")
-        .env("AGEND_GIT_BYPASS", "1")
-        .args(["commit", "--allow-empty", "-m", "init"])
-        .current_dir(&dir)
-        .output()
-        .unwrap();
-    // Create a fake worktree dir
-    let wt_dir = dir.join(".worktrees").join("test-agent");
-    std::fs::create_dir_all(&wt_dir).unwrap();
-    // Init the worktree as a git repo too (so git status works)
-    // allow: raw-git-subprocess pre-#821 fixture; properly pins AGEND_GIT_BYPASS+current_dir
-    std::process::Command::new("git")
-        .env("AGEND_GIT_BYPASS", "1")
-        .args(["init", "-b", "main"])
-        .current_dir(&wt_dir)
-        .output()
-        .unwrap();
-    // allow: raw-git-subprocess pre-#821 fixture; properly pins AGEND_GIT_BYPASS+current_dir
-    std::process::Command::new("git")
-        .env("AGEND_GIT_BYPASS", "1")
-        .args(["commit", "--allow-empty", "-m", "init"])
-        .current_dir(&wt_dir)
-        .output()
-        .unwrap();
-
-    // Verify clean
-    // allow: raw-git-subprocess pre-#821 fixture; properly pins AGEND_GIT_BYPASS+current_dir
-    let output = std::process::Command::new("git")
-        .env("AGEND_GIT_BYPASS", "1")
-        .args(["status", "--porcelain"])
-        .current_dir(&wt_dir)
-        .output()
-        .unwrap();
-    assert!(
-        output.stdout.is_empty(),
-        "worktree must be clean before prune test"
-    );
-
-    // The worktree dir exists before prune
-    assert!(wt_dir.exists(), "worktree dir must exist before flip");
-
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// E2e: dirty worktree + flip true→false → reject (worktree still exists).
-#[test]
-fn e2e_dirty_worktree_flip_rejected() {
-    let dir = std::env::temp_dir().join(format!("agend-wt-e2e-reject-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    // allow: raw-git-subprocess pre-#821 fixture; properly pins AGEND_GIT_BYPASS+current_dir
-    std::process::Command::new("git")
-        .env("AGEND_GIT_BYPASS", "1")
-        .args(["init", "-b", "main"])
-        .current_dir(&dir)
-        .output()
-        .unwrap();
-    // allow: raw-git-subprocess pre-#821 fixture; properly pins AGEND_GIT_BYPASS+current_dir
-    std::process::Command::new("git")
-        .env("AGEND_GIT_BYPASS", "1")
-        .args(["commit", "--allow-empty", "-m", "init"])
-        .current_dir(&dir)
-        .output()
-        .unwrap();
-    let wt_dir = dir.join(".worktrees").join("test-agent");
-    std::fs::create_dir_all(&wt_dir).unwrap();
-    // allow: raw-git-subprocess pre-#821 fixture; properly pins AGEND_GIT_BYPASS+current_dir
-    std::process::Command::new("git")
-        .env("AGEND_GIT_BYPASS", "1")
-        .args(["init", "-b", "main"])
-        .current_dir(&wt_dir)
-        .output()
-        .unwrap();
-    // allow: raw-git-subprocess pre-#821 fixture; properly pins AGEND_GIT_BYPASS+current_dir
-    std::process::Command::new("git")
-        .env("AGEND_GIT_BYPASS", "1")
-        .args(["commit", "--allow-empty", "-m", "init"])
-        .current_dir(&wt_dir)
-        .output()
-        .unwrap();
-    // Make dirty
-    std::fs::write(wt_dir.join("dirty.txt"), "uncommitted work").unwrap();
-
-    // allow: raw-git-subprocess pre-#821 fixture; properly pins AGEND_GIT_BYPASS+current_dir
-    let output = std::process::Command::new("git")
-        .env("AGEND_GIT_BYPASS", "1")
-        .args(["status", "--porcelain"])
-        .current_dir(&wt_dir)
-        .output()
-        .unwrap();
-    assert!(!output.stdout.is_empty(), "worktree must be dirty");
-
-    // Worktree dir must still exist (not pruned)
-    assert!(wt_dir.exists(), "dirty worktree must NOT be pruned");
-
-    std::fs::remove_dir_all(&dir).ok();
-}
+// --- E2E auto-prune: covered in-crate, not reachable here ---
+//
+// The flip `true→false` auto-prune behavior lives in the BIN crate
+// (`src/bootstrap/agent_resolve.rs::resolve_one`, which calls
+// `worktree::has_uncommitted_changes` + `worktree::remove_worktree`) and is
+// NOT reachable from this integration-test crate. The former
+// `e2e_clean_worktree_flip_prunes` / `e2e_dirty_worktree_flip_rejected` tests
+// here never flipped config or invoked any prune path — each only asserted
+// that a dir it had just created still existed (`wt_dir.exists()`), which is
+// trivially true and could never catch a prune regression (the names promised
+// behavior the bodies did not exercise). The genuine behavior is covered by
+// in-crate unit tests:
+//   - agent_resolve::tests::resolve_one_worktree_false_prunes_clean_existing_worktree
+//   - agent_resolve::tests::resolve_one_worktree_false_skips_worktree_creation
+//   - the dirty-reject path via the `has_uncommitted_changes` guard there.
+// The fake E2E tests were removed rather than left as false confidence.

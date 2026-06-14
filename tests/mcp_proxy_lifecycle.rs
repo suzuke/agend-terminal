@@ -81,12 +81,23 @@ fn tcp_drop_mid_session_produces_error() {
     .expect("write");
     w.flush().expect("flush");
 
-    // Read response — should be empty (connection dropped) or error
+    // The peer dropped without responding, so the read must terminate cleanly
+    // at EOF — 0 bytes, empty buffer — within the 5s read timeout (i.e. no
+    // hang, no panic, no partial/garbage line). The previous assertion
+    // `bytes == 0 || resp.contains("error") || resp.is_empty()` was
+    // unfalsifiable: on a dropped connection `read_line` always yields EOF (or
+    // a timeout coerced to 0 via `unwrap_or(0)`), so `bytes` is always 0 and
+    // the whole disjunction is always true. Assert the specific observable.
     let mut resp = String::new();
     let bytes = reader.read_line(&mut resp).unwrap_or(0);
-    // Either EOF (0 bytes) or an error response — both are acceptable
-    // The key invariant: no panic, no hang
-    assert!(bytes == 0 || resp.contains("error") || resp.is_empty());
+    assert_eq!(
+        bytes, 0,
+        "dropped mid-session connection must surface as EOF, got {bytes} bytes: {resp:?}"
+    );
+    assert!(
+        resp.is_empty(),
+        "no partial response expected after a mid-session drop, got: {resp:?}"
+    );
 
     handle.join().expect("mock daemon thread");
 }

@@ -7,7 +7,8 @@
 //! nothing prevented a future fn from being introduced into both files
 //! again.
 //!
-//! This test closes that loop: it scans `src/ops.rs` and `src/mcp/handlers.rs`
+//! This test closes that loop: it scans `src/agent_ops.rs` (the Task #12
+//! successor to the deleted `src/ops.rs`) and `src/mcp/handlers/mod.rs`
 //! for top-level fn definitions that share a name across the two files.
 //! - Divergent bodies  → panic (active drift, CI fail).
 //! - Identical bodies  → eprintln warning + pass (dedup hazard; consolidate
@@ -339,14 +340,22 @@ fn compare_fns_from_sources(ops_src: &str, handlers_src: &str) -> (Vec<String>, 
 
 #[test]
 fn no_dual_track_fn_drift_between_ops_and_mcp_handlers() {
+    // Task #12 deleted `src/ops.rs`; the canonical single-source module is now
+    // `src/agent_ops.rs` (the Option C consolidation target). Repointed here so
+    // the guard stays live for the current architecture — previously it read
+    // the deleted `src/ops.rs`, which `unwrap_or_default()` turned into a
+    // permanent empty-source trivial pass (issue: the guard had silently gone
+    // vacuous). Compared against the handlers entrypoint `mod.rs`.
+    //
     // `unwrap_or_default()` (not `.expect()`) so a future reorg that deletes
-    // either file (e.g. Task #12 collapsing `src/ops.rs`) cannot crash the
-    // test. A missing file → empty source → 0 top-level fn → no possible
-    // intersection → trivial pass. Detection remains active for whichever
-    // file does still exist; when both exist the behavior is unchanged.
+    // either file cannot crash the test. A missing file → empty source → 0
+    // top-level fn → no possible intersection → trivial pass. Detection remains
+    // active for whichever file still exists; when both exist behavior is
+    // unchanged. (Handlers are now split across sub-modules; a future
+    // enhancement could scan the whole `src/mcp/handlers/` tree, not just mod.rs.)
     let manifest = env!("CARGO_MANIFEST_DIR");
     let ops_src =
-        std::fs::read_to_string(Path::new(manifest).join("src/ops.rs")).unwrap_or_default();
+        std::fs::read_to_string(Path::new(manifest).join("src/agent_ops.rs")).unwrap_or_default();
     let handlers_src = std::fs::read_to_string(Path::new(manifest).join("src/mcp/handlers/mod.rs"))
         .unwrap_or_default();
 
@@ -355,7 +364,7 @@ fn no_dual_track_fn_drift_between_ops_and_mcp_handlers() {
     if !identical.is_empty() {
         eprintln!(
             "WARNING: dual-track DEDUP HAZARD — fn shared (byte-identical) between \
-             src/ops.rs and src/mcp/handlers.rs:\n  {}\n\
+             src/agent_ops.rs and src/mcp/handlers/mod.rs:\n  {}\n\
              Consolidate into `crate::agent_ops` before bodies diverge \
              (Task #9 Option C precedent).",
             identical.join(", ")
@@ -364,7 +373,7 @@ fn no_dual_track_fn_drift_between_ops_and_mcp_handlers() {
 
     assert!(
         divergent.is_empty(),
-        "dual-track DRIFT between src/ops.rs and src/mcp/handlers.rs — these fn \
+        "dual-track DRIFT between src/agent_ops.rs and src/mcp/handlers/mod.rs — these fn \
          share a name but their bodies differ, indicating silent divergence:\n  {}\n\n\
          Fix: consolidate into `crate::agent_ops` (single source of truth). \
          Root cause reference: 2026-04-14 `cleanup_working_dir` Kiro drift \
