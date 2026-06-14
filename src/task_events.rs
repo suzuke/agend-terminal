@@ -1084,12 +1084,6 @@ pub(crate) fn append_batch_at(
         Ok(lines)
     })?;
     invalidate_replay_cache();
-    // H1: update cached high-water mark after successful append
-    if let Some(&last_seq) = seqs.last() {
-        let log_path = board.join(format!("{LOG_NAME}.jsonl"));
-        let key = (log_path, instance);
-        SEQ_CACHE.lock().insert(key, last_seq);
-    }
     Ok(seqs)
 }
 
@@ -1177,10 +1171,6 @@ where
         return Ok(Err(reason));
     }
     invalidate_replay_cache();
-    if let Some(&last_seq) = seqs.last() {
-        let log_path = board.join(format!("{LOG_NAME}.jsonl"));
-        SEQ_CACHE.lock().insert((log_path, instance), last_seq);
-    }
     Ok(Ok(seqs))
 }
 
@@ -1268,8 +1258,6 @@ where
     }
     invalidate_replay_cache();
     if let Some(seq) = assigned_seq {
-        let log_path = board.join(format!("{LOG_NAME}.jsonl"));
-        SEQ_CACHE.lock().insert((log_path, instance), seq);
         return Ok(Ok(seq));
     }
     Ok(Ok(0))
@@ -1332,19 +1320,23 @@ pub(crate) fn append_done_if_legal_at(
 /// Tail-scan the hot log for the highest seq# this instance has emitted.
 /// Best-effort: malformed lines are skipped because [`replay`] is the
 /// strict reader; here we just need the high-water mark.
-/// H1: Cached high-water map — avoids full-file scan on every append.
-/// Populated on first access per log_path, updated in-memory on append.
-static SEQ_CACHE: std::sync::LazyLock<
-    parking_lot::Mutex<std::collections::HashMap<(std::path::PathBuf, InstanceName), u64>>,
-> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
-
+///
+/// H10 (CR-2026-06-14): ALWAYS scan the on-disk hot log — never short-circuit on
+/// a process-local cache. Every caller runs inside an `append_lines_under_lock`
+/// closure (under the cross-process append flock), but a cache is process-local:
+/// a high-water mark cached before ANOTHER process (e.g. the daemon's
+/// auto_close/sweep/lifecycle vs the MCP `tasks::handle`) appended the same
+/// instance is a STALE high-water → the next append here would mint a seq `<=` an
+/// already-persisted one, and replay's idempotency skip (`seq <= last_seen`)
+/// would SILENTLY DROP the real task transition. The on-disk file is the only
+/// source of truth all appenders share. The scan is cheap because task-event
+/// appends are agent/human-paced (not a hot loop) and batches share one scan —
+/// NOT because the file is bounded: `compact` (which would cap it at
+/// `COMPACTION_KEEP`) is currently dead code with no production caller, so the
+/// hot log grows unbounded. Any cross-process-correct approach must re-read the
+/// file when it changes anyway; the previous cache was O(1) only by trusting
+/// stale cross-process state — the exact bug fixed here.
 fn max_seq_for_instance(log_path: &Path, instance: &InstanceName) -> anyhow::Result<u64> {
-    let key = (log_path.to_path_buf(), instance.clone());
-    let mut cache = SEQ_CACHE.lock();
-    if let Some(&cached) = cache.get(&key) {
-        return Ok(cached);
-    }
-    // First access: scan file once
     let content = match std::fs::read_to_string(log_path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
@@ -1361,7 +1353,6 @@ fn max_seq_for_instance(log_path: &Path, instance: &InstanceName) -> anyhow::Res
             }
         }
     }
-    cache.insert(key, max);
     Ok(max)
 }
 
@@ -1849,12 +1840,9 @@ pub(crate) fn compact_at(board: &Path) -> anyhow::Result<()> {
         let archive_path = archive.join(format!("task_events.{suffix}.jsonl"));
         crate::store::atomic_write(&archive_path, archived.as_bytes())?;
         crate::store::atomic_write(log_path, kept.as_bytes())?;
-        // Invalidate SEQ_CACHE — the hot file was atomically replaced,
-        // so cached high-water marks derived from the old file are stale.
-        // Next append will re-scan the fresh file on cache miss.
-        SEQ_CACHE.lock().retain(|k, _| k.0 != *log_path);
         // We've already rewritten the hot file — return no extra lines
-        // to append.
+        // to append. (H10: no SEQ_CACHE to invalidate — `max_seq_for_instance`
+        // always re-scans the on-disk file, so the atomic replace is observed.)
         Ok(Vec::new())
     })
 }
@@ -3335,18 +3323,13 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// Verifies that compact() clears the SEQ_CACHE so that a subsequent
-    /// cache miss (e.g. process restart) re-scans the hot file correctly.
-    ///
-    /// Bug scenario (pre-fix): Instance A appends many events. Compact
-    /// archives old events but does NOT clear the cache. If the cache entry
-    /// is later evicted (process restart, memory pressure), the next append
-    /// re-scans only the hot file — which is correct here because compact
-    /// keeps the latest events. The defensive clear ensures the cache never
-    /// holds data derived from a file that was atomically replaced.
+    /// H10: after compaction atomically replaces the hot file, the next append
+    /// must still produce the correct monotonic seq and replay must fold both
+    /// events. `max_seq_for_instance` always re-scans the on-disk file, so the
+    /// replace is observed with no stale high-water mark.
     #[test]
-    fn compact_clears_seq_cache_for_post_compact_correctness() {
-        let home = tmp_home("compact-seq-cache");
+    fn append_after_compaction_produces_correct_monotonic_seq() {
+        let home = tmp_home("compact-seq");
         let inst = InstanceName::from("dev");
 
         // Append events past the compaction threshold
@@ -3369,25 +3352,11 @@ mod tests {
         }
         fs::write(&log, &lines).unwrap();
 
-        // Prime the SEQ_CACHE by calling append
         let seq_before = append(&home, &inst, sample_event("t-pre-compact")).unwrap();
         assert_eq!(seq_before, total as u64 + 1);
 
-        // Verify cache is populated
-        let key = (log.clone(), inst.clone());
-        assert!(
-            SEQ_CACHE.lock().contains_key(&key),
-            "cache must be populated after append"
-        );
-
-        // Compact — rewrites hot file, should clear cache
+        // Compact — atomically rewrites the hot file (keeps the latest events).
         compact(&home).unwrap();
-
-        // After fix: cache entry should be cleared
-        assert!(
-            !SEQ_CACHE.lock().contains_key(&key),
-            "compact must clear SEQ_CACHE for the compacted file"
-        );
 
         // Post-compaction append must still produce correct monotonic seq
         let seq_after = append(&home, &inst, sample_event("t-post-compact")).unwrap();

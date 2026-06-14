@@ -1,8 +1,8 @@
 //! Review-repro tests (SCOPEKEY: tasks) attached to `src/task_events.rs`.
 //!
 //! Each test encodes the CORRECT expected behavior so it is RED against the
-//! current (buggy) code and GREEN once the cited finding is fixed. Every test
-//! is `#[ignore]`d so CI stays green until the fix lands.
+//! current (buggy) code and GREEN once the cited finding is fixed. Each test is
+//! `#[ignore]`d until its cited finding is fixed, then un-ignored to confirm GREEN.
 
 #![allow(clippy::expect_used)]
 
@@ -84,7 +84,6 @@ fn raw_append_envelope(home: &std::path::Path, instance: &str, seq: u64, event: 
 /// the on-disk file under the lock): the new event gets seq 3 and survives
 /// replay.
 #[test]
-#[ignore = "tasks-seq-cache-cross-process: red until fix; remove #[ignore] after fix to confirm"]
 fn seq_cache_cross_process_does_not_drop_real_event_tasks() {
     let home = repro_home("seq-cache-xproc");
     let inst = "agentX";
