@@ -56,8 +56,18 @@ impl EventListener for PtyWriteListener {
     fn send_event(&self, event: Event) {
         let Event::PtyWrite(text) = event else { return };
         let Some(writer) = &self.writer else { return };
-        {
-            let mut w = writer.lock();
+        // CR-2026-06-14: `try_lock`, non-blocking. `send_event` fires from
+        // inside `VTerm::process`, which the PTY pump thread runs UNDER the
+        // agent's `core.lock()`. A blocking `writer.lock()` here would, when the
+        // shared `pty_writer` is held by another writer (inject's
+        // `write_with_timeout` worker, or the operator-TUI input forwarder),
+        // block the pump WHILE holding `core.lock` — freezing state detection /
+        // broadcast / readback for the agent and poisoning inject (shared lock),
+        // and blinding the daemon's own hang-recovery (which reads `core.lock`).
+        // A terminal-query response (DSR/DA) is best-effort; skipping it on lock
+        // contention is harmless. We only take the lock when it's free, so we
+        // never wait on a wedged holder.
+        if let Some(mut w) = writer.try_lock() {
             let _ = w.write_all(text.as_bytes());
             let _ = w.flush();
         }
@@ -971,6 +981,87 @@ mod tests {
         let vt = VTerm::new(80, 24);
         assert_eq!(vt.cols, 80);
         assert_eq!(vt.rows, 24);
+    }
+
+    // ── CR-2026-06-14: PTY-writer raw-lock hardening (t-30) ──────────────
+    //
+    // PtyWriteListener::send_event fires under the agent's core.lock (via
+    // VTerm::process on the PTY pump thread) and shares the SAME pty_writer
+    // Arc as the inject path. A blocking lock().write_all there would pin
+    // core.lock + pty_writer when another writer holds the lock — freezing
+    // the agent's PTY processing and poisoning inject. The fix uses try_lock
+    // (skip on contention). These tests pin the non-blocking contract.
+
+    /// Test writer that appends into a shared, inspectable buffer.
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+    impl Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// (b) RED→GREEN: when the shared pty_writer lock is already held (e.g. by
+    /// the inject worker or the operator-TUI forwarder), the listener must NOT
+    /// block — it `try_lock`s and skips the response. A blocking `lock()` here
+    /// would deadlock the PTY pump under core.lock (RED: this thread never
+    /// completes).
+    #[test]
+    fn pty_write_listener_try_lock_skips_when_writer_locked() {
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(Box::new(Vec::new())));
+        let listener = PtyWriteListener::new(Arc::clone(&writer));
+        let held = writer.lock(); // another writer holds the shared lock
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            listener.send_event(Event::PtyWrite("\x1b[1;1R".to_string()));
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(3)).is_ok(),
+            "send_event must not block while the pty_writer lock is held (try_lock skip)"
+        );
+        drop(held);
+    }
+
+    /// CONTROL: with the lock free, the listener still writes the response
+    /// through — proving the try_lock fix didn't break the normal DSR/DA path.
+    #[test]
+    fn pty_write_listener_writes_response_when_unlocked() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> =
+            Arc::new(Mutex::new(Box::new(SharedBuf(Arc::clone(&buf)))));
+        let listener = PtyWriteListener::new(writer);
+        listener.send_event(Event::PtyWrite("\x1b[1;1R".to_string()));
+        assert_eq!(
+            buf.lock().as_slice(),
+            b"\x1b[1;1R",
+            "listener must write the response when the lock is free"
+        );
+    }
+
+    /// (a) The property tui_bridge's input forwarder now relies on: the inject
+    /// path (`write_to_pty` → `write_with_timeout`) must FAIL-FAST (not hang)
+    /// when the shared pty_writer lock is wedged by another holder. A raw
+    /// blocking write would hang forever here.
+    #[test]
+    fn write_to_pty_fail_fasts_when_writer_lock_wedged() {
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(Box::new(Vec::new())));
+        let held = writer.lock(); // wedge the shared lock
+        let start = std::time::Instant::now();
+        let r = crate::agent::write_to_pty(&writer, b"inject");
+        let elapsed = start.elapsed();
+        drop(held);
+        assert!(
+            r.is_err(),
+            "inject must error (timeout), not silently succeed, when the lock is wedged"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(8),
+            "inject must fail-fast within the PTY write timeout, not hang; got {elapsed:?}"
+        );
     }
 
     #[test]

@@ -190,7 +190,18 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
                 loop {
                     match framing::read_tagged_frame(&mut reader) {
                         Ok((TAG_DATA, data)) => {
-                            if pty_writer.lock().write_all(&data).is_err() {
+                            // CR-2026-06-14: route through the bounded
+                            // `write_to_pty` (write_with_timeout) instead of a
+                            // raw `pty_writer.lock().write_all`. This `pty_writer`
+                            // is `Arc::clone(&agent.pty_writer)` — the SAME lock
+                            // the inject path's `write_with_timeout` worker
+                            // acquires. A raw blocking write here on a wedged PTY
+                            // would hold that lock indefinitely, blocking the
+                            // inject worker → leaving WRITE_IN_PROGRESS stuck →
+                            // every subsequent inject to this agent fail-fasts
+                            // (the H13 control-plane harm class). The bounded
+                            // path never holds the lock past the timeout.
+                            if agent::write_to_pty(&pty_writer, &data).is_err() {
                                 break;
                             }
                         }
