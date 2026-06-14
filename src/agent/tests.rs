@@ -926,6 +926,92 @@ fn build_command_sets_git_editor_defaults() {
     }
 }
 
+/// #2106: an operator's per-instance `ANTHROPIC_AUTH_TOKEN` in fleet.yaml
+/// `env:` must reach a claude-backed instance — it is a credential the backend
+/// declares (`credential_env_keys`) — so the operator can point that instance at
+/// a third-party `ANTHROPIC_BASE_URL` proxy (e.g. DeepSeek). The deny-list still
+/// drops a non-credential sensitive key (LD_PRELOAD) from the SAME fleet.yaml
+/// env, and benign keys pass. Drop assertions use `assert_ne!` against a sentinel
+/// value so they hold regardless of the test process's own inherited env.
+#[test]
+fn build_command_allows_operator_backend_credential_2106() {
+    let mut env = std::collections::HashMap::new();
+    env.insert(
+        "ANTHROPIC_AUTH_TOKEN".to_string(),
+        "sk-operator-2106".to_string(),
+    );
+    env.insert("LD_PRELOAD".to_string(), "/tmp/evil-2106.so".to_string());
+    env.insert("MY_BENIGN_2106".to_string(), "ok".to_string());
+    let config = SpawnConfig {
+        name: "cred-2106",
+        backend_command: "claude",
+        args: &[],
+        spawn_mode: crate::backend::SpawnMode::Fresh,
+        cols: 80,
+        rows: 24,
+        env: Some(&env),
+        working_dir: None,
+        submit_key: "\r",
+        home: None,
+        crash_tx: None,
+        shutdown: None,
+    };
+    let (cmd, _) = build_command(&config).expect("build_command");
+    assert_eq!(
+        cmd.get_env("ANTHROPIC_AUTH_TOKEN")
+            .map(|v| v.to_string_lossy().into_owned()),
+        Some("sk-operator-2106".to_string()),
+        "#2106: a backend-declared credential from operator fleet.yaml must inject"
+    );
+    assert_ne!(
+        cmd.get_env("LD_PRELOAD")
+            .map(|v| v.to_string_lossy().into_owned()),
+        Some("/tmp/evil-2106.so".to_string()),
+        "deny-list must still drop a non-credential sensitive key (fleet.yaml value must NOT be injected)"
+    );
+    assert_eq!(
+        cmd.get_env("MY_BENIGN_2106")
+            .map(|v| v.to_string_lossy().into_owned()),
+        Some("ok".to_string()),
+        "benign fleet.yaml env must pass unchanged"
+    );
+}
+
+/// #2106 scope guard: the override is PER-BACKEND (it reuses
+/// `credential_env_keys`). A credential one backend declares must NOT slip
+/// through for a different backend that doesn't — `ANTHROPIC_AUTH_TOKEN` is
+/// claude's, not codex's, so codex still drops it. This proves the fix is not a
+/// blanket sensitive-key allow and preserves cross-backend credential isolation.
+#[test]
+fn build_command_credential_override_is_per_backend_2106() {
+    let mut env = std::collections::HashMap::new();
+    env.insert(
+        "ANTHROPIC_AUTH_TOKEN".to_string(),
+        "sk-codex-2106".to_string(),
+    );
+    let config = SpawnConfig {
+        name: "cred-2106-codex",
+        backend_command: "codex",
+        args: &[],
+        spawn_mode: crate::backend::SpawnMode::Fresh,
+        cols: 80,
+        rows: 24,
+        env: Some(&env),
+        working_dir: None,
+        submit_key: "\r",
+        home: None,
+        crash_tx: None,
+        shutdown: None,
+    };
+    let (cmd, _) = build_command(&config).expect("build_command");
+    assert_ne!(
+        cmd.get_env("ANTHROPIC_AUTH_TOKEN")
+            .map(|v| v.to_string_lossy().into_owned()),
+        Some("sk-codex-2106".to_string()),
+        "#2106: ANTHROPIC_AUTH_TOKEN is not a codex credential → still dropped (per-backend scope)"
+    );
+}
+
 /// #1956: opencode's interactive self-update prompt hangs the whole pane (the
 /// agent can't answer dispatches). There's no `--no-update` flag, so the spawn
 /// injects `OPENCODE_CONFIG_CONTENT` with `autoupdate:false` — MERGED onto the
