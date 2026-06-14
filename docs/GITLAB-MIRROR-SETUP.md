@@ -1,3 +1,5 @@
+[繁體中文](GITLAB-MIRROR-SETUP.zh-TW.md)
+
 # GitLab Mirror Setup Guide
 
 Backup CI channel via GitLab for use when GitHub Actions is degraded. See also [CI-DOWN-SOP.md](CI-DOWN-SOP.md).

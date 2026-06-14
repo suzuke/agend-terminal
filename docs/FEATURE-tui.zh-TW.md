@@ -1,3 +1,5 @@
+[English](FEATURE-tui.md)
+
 # TUI 多 Agent 管理介面
 
 AgEnD Terminal 提供一個類似 tmux 的終端多工介面，讓你在單一畫面中同時管理、監控整個 agent fleet 的狀態與輸出。

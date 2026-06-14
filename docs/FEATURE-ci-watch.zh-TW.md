@@ -1,3 +1,5 @@
+[English](FEATURE-ci-watch.md)
+
 # CI Watch — 自動監控 PR 的 CI 狀態
 
 ## 使用情境

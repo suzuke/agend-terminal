@@ -1,3 +1,5 @@
+[繁體中文](release-smoke-checklist.zh-TW.md)
+
 # Release Smoke-Test Checklist
 
 Copy this file before a release, check each box, and paste the sign-off block at the bottom.  

@@ -1,3 +1,5 @@
+[English](FEATURE-service.md)
+
 # 服務管理：`agend-terminal service`
 
 這份文件說明 `service` 子命令如何把 daemon 交給作業系統管理，

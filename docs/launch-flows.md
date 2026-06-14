@@ -1,3 +1,5 @@
+[繁體中文](launch-flows.zh-TW.md)
+
 # Launch Flows
 
 This doc maps every way to start `agend-terminal`, the daemon lifecycle each

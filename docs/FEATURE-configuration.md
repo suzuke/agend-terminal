@@ -1,3 +1,5 @@
+[繁體中文](FEATURE-configuration.zh-TW.md)
+
 # Configuration Layers: `AGEND_HOME`, `fleet.yaml`, runtime config, and MCP config
 
 This document explains how AgEnD's configuration is layered, who writes each layer, and where you should make a change depending on the type of setting.

@@ -1,3 +1,5 @@
+[繁體中文](RELEASING.zh-TW.md)
+
 # Releasing agend-terminal
 
 Audience: any maintainer cutting a release. The pipeline is fully automated

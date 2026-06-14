@@ -1,3 +1,5 @@
+[繁體中文](CI-DOWN-SOP.zh-TW.md)
+
 # CI-Down SOP: GitHub Actions Degradation Response
 
 Standard operating procedure when GitHub Actions is degraded or experiencing an outage.

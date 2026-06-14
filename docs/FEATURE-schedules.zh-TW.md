@@ -1,3 +1,5 @@
+[English](FEATURE-schedules.md)
+
 # Schedules & Deployments — 定時任務與批次部署
 
 Schedules 讓你設定 cron 定時任務或一次性排程，Deployments 讓你一鍵部署多 agent 團隊。兩者都不需要手動重複操作。
@@ -313,3 +315,51 @@ Daemon 啟動時自動檢查孤兒部署——部署記錄中的 instance 在 `f
 ```
 
 一個指令清理所有 agent、team、工作目錄和 fleet.yaml 記錄。
+
+---
+
+## 何時用 Schedules vs Deployments
+
+當你需要某個訊息或動作在稍後發生時，使用 **Schedules**。
+
+當你需要現在就建立一個可重複使用的團隊配置時，使用 **Deployments**。
+
+一個好用的判斷準則：
+
+- 如果問題是「這件事什麼時候該發生？」用 schedules
+- 如果問題是「現在該存在什麼？」用 deployments
+
+---
+
+## 失效情境
+
+### 無效的 cron
+
+如果 cron 表達式無法解析，建立會立即失敗。重試前請先修正表達式。
+
+### 目標遺失
+
+如果排程應該觸發給特定 agent，但名稱錯誤，訊息就會被路由到沒有用處的地方。請務必對照 fleet 驗證目標名稱。
+
+### 部署範本不符
+
+如果部署範本和 fleet 結構不符，產生的配置可能不完整或只填了一部分。請把範本視為該次部署形狀的真實來源。
+
+---
+
+## Source Pointers
+
+- `src/schedule.rs`：排程儲存與派發
+- `src/deployment.rs`：部署編排
+- `src/main.rs`：CLI 子指令路由
+- `src/mcp/handlers/schedule.rs`：MCP 介面
+- `src/mcp/handlers/deployment.rs`：部署介面
+
+---
+
+## 實務建議
+
+1. 對於有 deadline 驅動的工作，優先使用一次性排程。
+2. 加上幾週後在 log 裡仍看得懂的標籤。
+3. deployments 用於可重複的 fleet 配置，而不是臨時提醒。
+4. 除非有充分理由，否則讓 cron 表達式保持簡單。

@@ -1,3 +1,5 @@
+[繁體中文](env-vars.zh-TW.md)
+
 # Environment Variables Reference
 
 A categorized reference for every `AGEND_*` environment variable read by the

@@ -1,3 +1,5 @@
+[繁體中文](architecture.zh-TW.md)
+
 # AgEnD Terminal — Architecture Map
 
 > Current-state structural map, synthesized from the #2050 architecture pass

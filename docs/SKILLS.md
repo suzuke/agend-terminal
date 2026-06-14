@@ -1,3 +1,5 @@
+[繁體中文](SKILLS.zh-TW.md)
+
 # Skills
 
 Unified community-skill discovery for the five backends agend-terminal supports (Claude Code, Codex, Gemini CLI, OpenCode, Kiro CLI).

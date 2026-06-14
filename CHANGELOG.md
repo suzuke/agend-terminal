@@ -1,3 +1,5 @@
+[繁體中文](CHANGELOG.zh-TW.md)
+
 # Changelog
 
 All notable changes to this project are documented here.

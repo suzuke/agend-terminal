@@ -1,3 +1,5 @@
+[English](FEATURE-teams.md)
+
 # Teams
 
 這份文件說明 team 的設計、如何建立/更新/刪除 team、以及它和

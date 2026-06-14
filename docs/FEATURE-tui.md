@@ -1,3 +1,5 @@
+[繁體中文](FEATURE-tui.zh-TW.md)
+
 # TUI — Multi-Agent Management Interface
 
 AgEnD Terminal provides a tmux-like terminal multiplexer that lets you manage, monitor, and interact with your entire agent fleet from a single screen.

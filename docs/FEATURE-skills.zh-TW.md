@@ -1,3 +1,5 @@
+[English](FEATURE-skills.md)
+
 # Skills 跨 Backend 技能系統
 
 Skills 系統讓你將可重用的技能（prompt、工具定義、參考文件）安裝一次，所有 backend 的 agent 都能自動使用。不需要為每個 backend 分別設定。

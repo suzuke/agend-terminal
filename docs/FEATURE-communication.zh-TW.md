@@ -1,3 +1,5 @@
+[English](FEATURE-communication.md)
+
 # Agent 間通訊系統
 
 AgEnD Terminal 的通訊系統讓 agent 之間能進行結構化的訊息傳遞——委派任務、提出查詢、回報結果、廣播更新。

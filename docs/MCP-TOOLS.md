@@ -1,3 +1,5 @@
+[繁體中文](MCP-TOOLS.zh-TW.md)
+
 # AgEnD MCP Tools Reference (30 tools)
 
 ## Action-based Tools

@@ -1,3 +1,5 @@
+[English](FEATURE-agent-interaction.md)
+
 # Agent Interaction — 與 Agent 的終端互動
 
 ## 使用情境

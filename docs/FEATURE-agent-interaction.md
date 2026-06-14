@@ -1,3 +1,5 @@
+[繁體中文](FEATURE-agent-interaction.zh-TW.md)
+
 # Agent Interaction — Terminal Access to Agents
 
 ## Usage Scenarios

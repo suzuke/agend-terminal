@@ -1,3 +1,5 @@
+[繁體中文](competitor-comparison.zh-TW.md)
+
 # Competitor Comparison: AgEnD-Terminal vs Multica vs OpenAB
 
 ## Overview

@@ -1,3 +1,5 @@
+[繁體中文](GIT-BEHAVIOR.zh-TW.md)
+
 # Git Behavior Modification
 
 agend-terminal does **not** run AI agents against vanilla `git`. To coordinate multiple agents safely on the same repo, the daemon installs a thin shim layer between agents and your real `git` binary. **Read this page before starting the daemon** — once you start it, the modifications below take effect for every spawned agent.

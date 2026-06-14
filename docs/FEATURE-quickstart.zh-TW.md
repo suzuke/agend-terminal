@@ -1,3 +1,5 @@
+[English](FEATURE-quickstart.md)
+
 # Quickstart — 互動式首次設定
 
 ## 使用情境

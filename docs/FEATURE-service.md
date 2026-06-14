@@ -1,3 +1,5 @@
+[繁體中文](FEATURE-service.zh-TW.md)
+
 # Service Management: `agend-terminal service`
 
 This document explains how the `service` subcommand hands daemon lifecycle management to the operating system, and where each supported platform writes its service artifact.

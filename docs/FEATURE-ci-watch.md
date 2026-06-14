@@ -1,3 +1,5 @@
+[繁體中文](FEATURE-ci-watch.zh-TW.md)
+
 # CI Watch — Automated PR CI Monitoring
 
 ## Usage Scenarios

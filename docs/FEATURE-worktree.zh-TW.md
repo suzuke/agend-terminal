@@ -1,3 +1,5 @@
+[English](FEATURE-worktree.md)
+
 # Worktree Management
 
 這份文件說明 git worktree 的建立、綁定、釋放、GC，以及

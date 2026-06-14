@@ -1,3 +1,5 @@
+[English](FEATURE-channels.md)
+
 # Channels — Telegram / Discord 整合
 
 Channels 系統讓操作者直接在 Telegram 或 Discord 中與 agent 互動，不需要開啟終端。每個 agent 對應一個 Telegram forum topic，訊息自動雙向同步。
@@ -104,6 +106,19 @@ agent "reviewer" ← binding → Telegram topic #43
 | 刪除事件 | 否 | 是 |
 
 不支援的功能會靜默降級，不會報錯。
+
+### Topics 與 Registry
+
+daemon 維護一個 topic 的 registry，用來把 Telegram 中實際存在的狀態與磁碟上記錄的狀態對齊。這個 registry 是 topic 路由的事實來源，而 topic 本身則是操作者可見的對話面。
+
+### 收訊與發訊（Inbound vs Outbound）
+
+Channels 處理兩個方向：
+
+- **Inbound**：操作者或外部事件流入 daemon，再進入 agent。
+- **Outbound**：agent 的回覆被同步回同一個 channel 面。
+
+兩側的程式碼路徑對稱，所以無論除錯哪一側，通常都從同一筆 topic 條目與 binding 紀錄開始。
 
 ---
 
@@ -262,6 +277,80 @@ Telegram 群組升級為超級群組時，`group_id` 會改變。系統偵測到
 
 ---
 
+## Telegram 行為
+
+### Topic 建立
+
+如果某個 agent 還沒有 topic，啟用 channel 時 daemon 會自動建立一個。這讓 fleet bootstrap 保持簡單：設定 bot、啟動 daemon，然後讓 registry 自行填充。
+
+### Topic 清理
+
+如果 registry 與 Telegram 的實際狀態漂移，`doctor topics` 可以偵測並選擇性清理孤兒條目。操作者面向的診斷流程請見 `docs/FEATURE-diagnostics.md`。
+
+### 權限邊界
+
+會變更 chat 的 topic 清理需要 bot 具備 `can_manage_topics` 權限。如果缺少這個權限，daemon 會把該 topic 保留在報告中，並跳過 chat 側的刪除。
+
+---
+
+## Discord 註記
+
+文件提到 Discord，是因為 channel 抽象在精神上並非只限 Telegram。目前的實作以 Telegram 為核心，但這些抽象在設計上允許透過實作同一組 trait 介面來新增另一個平台。
+
+如果未來新增 Discord backend，主要的預期是一樣的：
+
+- 每個 agent 都需要一個穩定、可定址的對話目標
+- 訊息必須往返而不遺失 thread identity
+- registry 狀態必須持久化，daemon 才能在重啟後復原
+
+---
+
+## 常見工作流程
+
+### 操作者發送訊息
+
+1. 開啟該 agent 的 topic。
+2. 輸入訊息。
+3. daemon 收到訊息、把它路由到 agent，並把 agent 的回應同步回同一個 topic。
+
+### Agent 回覆操作者
+
+1. agent 透過 channel 層送出回應。
+2. daemon 發送或編輯對應的 Telegram 訊息。
+3. 操作者在脈絡中看到回覆，且 topic 歷史被保留。
+
+### 診斷漂移
+
+如果 topic 看起來在 Telegram 中存在但不在 daemon registry 中：
+
+1. 執行 `agend-terminal doctor topics`。
+2. 檢查條目是 `live` 還是 `orphan`。
+3. 只在你確認動作集之後才使用 `--cleanup`。
+
+---
+
+## 設定範例
+
+一個最小可運作的設定看起來像這樣：
+
+```yaml
+channel:
+  telegram:
+    bot_token_env: AGEND_BOT_TOKEN
+    group_id: -1001234567890
+    user_allowlist: [123456789]
+```
+
+接著匯出 token：
+
+```bash
+export AGEND_BOT_TOKEN="123456:abcdef..."
+```
+
+如果你想讓操作者在群組聊天中看到 topic map，請確認群組已啟用 Topics，且 bot 具備建立與管理 topic 所需的權限。
+
+---
+
 ## 疑難排解
 
 ### Bot 收不到訊息
@@ -287,3 +376,22 @@ channel:
 ```
 
 如果問題持續，檢查是否有多個 daemon 實例同時運行。
+
+---
+
+## 原始碼指引
+
+- `src/channel/telegram.rs`：Telegram channel 實作
+- `src/bootstrap/doctor_topics.rs`：topic 分類與清理邏輯
+- `src/cli.rs`：`doctor topics` CLI 流程
+- `src/main.rs`：subcommand 路由與進入點
+- `src/fleet.rs`：fleet 與 instance metadata，含 topic 欄位
+
+---
+
+## 實務建議
+
+1. 把 topic registry 當作 state，而不是 cache。
+2. 嘗試清理前永遠先驗證權限。
+3. 除非有特定理由，否則維持每個 agent 一個 topic。
+4. 當可見的 chat 狀態與 daemon 的狀態不再一致時，使用 `doctor topics`。

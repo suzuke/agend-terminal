@@ -15,7 +15,7 @@ Declare your entire AI dev team in one `fleet.yaml`. AgEnD Terminal launches eac
 
 - **Fleet-as-code** — One YAML file declares every agent's backend, role, working directory, and team membership. `agend-terminal start` brings the whole fleet up.
 - **5 backends** — Claude Code, Codex, Kiro, OpenCode, and Antigravity CLI. Swap backends by changing one field.
-- **Built-in agent coordination** — Agents delegate tasks, query each other, and broadcast updates through 35 MCP tools. No glue code.
+- **Built-in agent coordination** — Agents delegate tasks, query each other, and broadcast updates through 30 MCP tools. No glue code.
 - **Automatic git worktree isolation** — Each agent works in its own worktree. No merge conflicts between agents, no accidental cross-contamination.
 - **Crash recovery with context handover** — Agents auto-respawn and resume their conversation. Exponential backoff, health monitoring, and hung detection built in.
 - **Remote control** — Drive the fleet through a multi-pane TUI, Telegram, or Discord. Get notifications when agents need attention.
@@ -104,8 +104,9 @@ graph LR
 - [Quick Start Guide](docs/FEATURE-quickstart.md) — First-run walkthrough
 - [Fleet Configuration](docs/FEATURE-fleet.md) — `fleet.yaml` reference
 - [CLI Reference](docs/CLI.md) — All subcommands
-- [MCP Tools](docs/MCP-TOOLS.md) — 35 agent coordination tools
+- [MCP Tools](docs/MCP-TOOLS.md) — 30 agent coordination tools
 - [Known Issues](docs/KNOWN_ISSUES.md) — Intentionally-deferred items; check before filing an issue
+- [**Documentation Index**](docs/README.md) — Full bilingual map of every guide and reference
 
 <details>
 <summary><strong>Feature guides</strong></summary>

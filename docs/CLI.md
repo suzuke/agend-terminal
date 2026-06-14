@@ -1,3 +1,5 @@
+[繁體中文](CLI.zh-TW.md)
+
 # CLI Reference
 
 All commands are dispatched via `clap` from `src/main.rs` (enum `Commands`). Run `agend-terminal --help` for terse help or `<cmd> --help` per subcommand.

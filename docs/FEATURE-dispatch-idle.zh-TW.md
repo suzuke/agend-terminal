@@ -1,3 +1,5 @@
+[English](FEATURE-dispatch-idle.md)
+
 # Dispatch Idle Tracking — 任務回應超時追蹤
 
 ## 使用情境

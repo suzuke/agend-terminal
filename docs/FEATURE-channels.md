@@ -1,3 +1,5 @@
+[繁體中文](FEATURE-channels.zh-TW.md)
+
 # Channels — Telegram / Discord Integration
 
 The Channels system lets operators talk to agents from Telegram or Discord without opening a terminal. Each agent maps to its own Telegram forum topic, and messages are mirrored bidirectionally.
@@ -78,16 +80,33 @@ All channel implementations share one trait interface:
 | `create_topic` | Create a new forum topic |
 | `poll_event` | Poll for incoming events |
 
-The core code only talks to the trait. It never calls Telegram APIs directly. If we add Discord or another backend later, it only needs to implement this trait.
+The core code only talks to the trait. It never calls Telegram APIs directly. If we add Discord or Slack later, it only needs to implement this trait.
 
 ### Binding
 
-A binding links an agent to a channel-specific address such as a Telegram topic ID. The core code treats the binding as opaque.
+A binding links an agent to a channel. Each binding carries platform-specific addressing information (such as a Telegram topic ID), but the core code does not need to know those details — the binding is opaque.
 
-```text
+```
 agent "dev" ← binding → Telegram topic #42
 agent "reviewer" ← binding → Telegram topic #43
 ```
+
+### Capabilities
+
+Each channel declares the features it supports, and the core code uses that to decide its degradation behaviour:
+
+| Capability | Telegram | Discord |
+|---|---|---|
+| Native threads | Yes (forum topics) | Yes (threads) |
+| Markdown | MarkdownV2 | Discord Markdown |
+| Attachment upload | Yes | Yes |
+| Message editing | Yes | Yes |
+| Emoji reactions | Yes | Yes |
+| Typing indicator | Yes | Yes |
+| Message length limit | 4096 bytes | 2000 chars |
+| Delete events | No | Yes |
+
+Unsupported features degrade silently instead of raising an error.
 
 ### Topics and Registry
 
@@ -101,6 +120,161 @@ Channels handles two directions:
 - **Outbound**: the agent's reply is mirrored back to the same channel surface.
 
 The code path is symmetric enough that debugging either side usually starts from the same topic entry and binding record.
+
+---
+
+## Topics Mapping
+
+### topics.json
+
+The mapping between agents and Telegram topics is persisted in `topics.json`:
+
+```json
+{
+  "42": "dev",
+  "43": "reviewer",
+  "100": "general",
+  "500": "__fleet__"
+}
+```
+
+- The key is the Telegram forum topic ID (a stringified number)
+- The value is the agent's instance name
+- `__fleet__` is a reserved sentinel, used for cross-agent team-wide notifications
+
+### Automatic Topic Creation
+
+On startup, for every agent defined in `fleet.yaml` but without a corresponding topic in `topics.json`, the daemon automatically creates a forum topic.
+
+When you add an agent in the TUI via `Ctrl+B c`, a topic is also created and registered automatically.
+
+### Orphan Topic Cleanup
+
+Use the `doctor topics` command to inspect and clean up orphan topics:
+
+```bash
+# Inspect topic status
+agend-terminal doctor topics
+
+# Clean up orphan topics
+agend-terminal doctor topics --cleanup
+```
+
+Topics fall into two categories:
+- **Live**: present in both `topics.json` and `fleet.yaml`
+- **Orphan**: present in `topics.json` but not in `fleet.yaml` (the agent was deleted but the topic was not cleaned up)
+
+---
+
+## Message Flow
+
+### Inbound (Telegram → Agent)
+
+```
+1. A user sends a message in a Telegram forum topic
+2. The polling thread detects the new message and obtains the topic_id
+3. The target agent is resolved through the topic_to_instance mapping
+4. The message is written into the agent's inbox
+5. The agent calls the inbox tool to read the full message
+```
+
+### Outbound (Agent → Telegram)
+
+```
+1. The agent calls the reply MCP tool
+2. Dedup check: identical content is not re-sent within 5 seconds
+3. instance_to_topic is queried to obtain the target topic_id
+4. The message is sent through the Telegram Bot API
+5. The message_id is recorded for later editing/deletion
+```
+
+### Mirror Skip
+
+An agent's reply appears both in the Telegram topic and in the PTY terminal output. To prevent the PTY mirror from forwarding the agent's own reply a second time, the system sets the `mirror_skip_until_next_turn` flag before sending. This flag is reset automatically on the next round of user input.
+
+---
+
+## Deduplication
+
+Prevents duplicate messages caused by the following race conditions:
+
+- The app and the daemon poll CI watch at the same time, each sending one notification
+- The PTY mirror and the reply tool send identical content at the same time
+- Send paths that retry logic does not fully guard
+
+Deduplication uses a content hash + TTL window (default 5 seconds):
+
+```yaml
+# fleet.yaml can adjust the TTL
+channel:
+  dedup_ttl_secs: 5
+```
+
+An identical (instance, topic, content hash) is sent only once within the TTL. The in-memory cap is 1024 entries, using an insertion-order LRU policy.
+
+---
+
+## Notification Gate
+
+An agent's outbound notifications (CI status, task completion, etc.) are disabled by default (fail-closed). You must set `user_allowlist` in `fleet.yaml` to enable them:
+
+```yaml
+channel:
+  telegram:
+    user_allowlist:
+      - 12345678
+```
+
+When it is not set, all outbound notifications are silently dropped without raising an error. This prevents an unconfigured bot from accidentally leaking information to an unauthorized group.
+
+---
+
+## Fleet Binding Topic
+
+The fleet binding is a special topic used to display cross-agent team events:
+
+| Event type | Format |
+|---|---|
+| Task delegation | `[lead → dev] DELEGATE 修復 #1177 (#t-...)` |
+| Result report | `[dev → lead] REPORT PR 已建立 (#t-...)` |
+| Decision publication | `[lead] DECISION 使用 prefix match (#d-...)` |
+| Broadcast | `[lead → 3 agents] BROADCAST merge freeze` |
+
+The operator can see an overview of the whole team's activity in a single topic, instead of checking each agent's topic one by one.
+
+---
+
+## Self-Healing
+
+### Topic Deleted
+
+If a Telegram topic is deleted unexpectedly (an admin action or an API error), the system automatically:
+
+1. Detects the topic-deleted error
+2. Clears the invalid topic mapping
+3. Recreates the topic
+4. Retries the send
+
+### Supergroup Migration
+
+When a Telegram group is upgraded to a supergroup, the `group_id` changes. After the system detects a `MigrateToChatId` error, it:
+
+1. Reads the new chat ID
+2. Updates `group_id` in `fleet.yaml`
+3. Retries the send
+
+Neither case requires operator intervention.
+
+---
+
+## Multi-Channel Support
+
+Telegram is currently supported, with Discord as a reserved interface (feature gate). The architecture is designed to support using multiple channels at once:
+
+- Each channel registers independently in the global registry
+- Each agent can bind to a different channel
+- Inbound events are merged uniformly by the dispatcher
+- Outbound messages are routed to the correct adapter based on the binding's channel kind
 
 ---
 
@@ -180,26 +354,31 @@ If you want the operator to see the topic map in a group chat, make sure the gro
 
 ## Troubleshooting
 
-### The agent never receives messages
+### Bot does not receive messages
 
 Check the following in order:
 
-- `fleet.yaml` has a valid `channel.telegram` block
-- the bot token env var is exported
-- the group ID is correct and the bot is inside the group
-- the topic mapping exists in `topics.json`
-- the daemon is actually running and polling
+1. The bot has joined the group and has read permission
+2. The group has Topics enabled (Settings → Topics → on)
+3. `user_allowlist` includes your Telegram user ID
+4. Check the channel initialization messages in the daemon log
 
-### The topic exists but replies do not appear
+### Topic is not created automatically
 
-This usually means one of two things:
+1. Confirm the bot has `can_manage_topics` permission (set by the group admin)
+2. Run `agend-terminal doctor topics` to check the status
+3. Check the existing mapping in `topics.json`
 
-- the binding points at the wrong topic ID
-- the daemon can receive but cannot post back because of a permission or API failure
+### Duplicate messages
 
-### `doctor topics` reports orphans
+Adjust the dedup TTL:
 
-That means the registry and the live chat state have diverged. Usually the right fix is to run cleanup with the correct permissions, not to hand-edit the registry blindly.
+```yaml
+channel:
+  dedup_ttl_secs: 10    # widen the window
+```
+
+If the problem persists, check whether multiple daemon instances are running at the same time.
 
 ---
 

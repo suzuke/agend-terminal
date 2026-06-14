@@ -1,3 +1,5 @@
+[繁體中文](FEATURE-health.zh-TW.md)
+
 # Health & Monitoring — Agent Health State and Auto-Recovery
 
 ## Usage Scenarios

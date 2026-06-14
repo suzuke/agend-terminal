@@ -1,3 +1,5 @@
+[English](FEATURE-configuration.md)
+
 # 設定層：`AGEND_HOME`、`fleet.yaml`、runtime config、MCP config
 
 這份文件說明 AgEnD 的設定是怎麼分層的、誰能寫哪一層、

@@ -1,3 +1,5 @@
+[English](FEATURE-health.md)
+
 # Health & Monitoring — Agent 健康狀態與自動恢復
 
 ## 使用情境

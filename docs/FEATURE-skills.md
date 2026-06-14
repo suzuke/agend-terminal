@@ -1,3 +1,5 @@
+[繁體中文](FEATURE-skills.zh-TW.md)
+
 # Skills — Cross-Backend Skill System
 
 The Skills system lets you install reusable skills (prompts, tool definitions, reference files) once and have them automatically available to agents on every backend. No need to configure each backend separately.

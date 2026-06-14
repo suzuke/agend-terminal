@@ -1,64 +1,86 @@
 [English](README.md)
 
+[![CI](https://github.com/suzuke/agend-terminal/actions/workflows/ci.yml/badge.svg)](https://github.com/suzuke/agend-terminal/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/agend-terminal)](https://crates.io/crates/agend-terminal)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+![Status: Pre-alpha](https://img.shields.io/badge/Status-Pre--alpha-orange)
+
 # AgEnD Terminal
 
 統籌 AI coding agent——不只是執行它們。
 
-> ⚠️ **Pre-alpha。** API、CLI 旗標和 `fleet.yaml` 結構可能在小版本之間
-> 變動。不適合用於生產環境。請鎖定特定版本，升級前先閱讀 release notes。
+用一份 `fleet.yaml` 宣告你的整個 AI 開發團隊。AgEnD Terminal 會把每個 agent 啟動成長駐的 PTY process，配上各自獨立的 git worktree，透過內建的 MCP 工具串起 agent 之間的溝通，再以自動重啟與上下文移交把整個團隊維持運轉。
 
-```bash
-cargo install agend-terminal
-agend-terminal quickstart    # 互動式設定，2 分鐘完成
-```
+> ⚠️ **Pre-alpha。** API、CLI 旗標與 `fleet.yaml` 結構可能在小版本之間變動，尚不適合用於生產環境。請鎖定特定版本，升級前先讀 release notes。
 
-## ⚠️ Git 行為修改（重要）
+## 功能特色
 
-agend-terminal 會修改被啟動的 agent 的 git 行為（PATH shim、commit
-trailer、deny matrix、daemon 管理的 worktree）。你自己的終端**不受影響**。
-
-**啟動 daemon 前請先閱讀 [`docs/GIT-BEHAVIOR.md`](docs/GIT-BEHAVIOR.md)**——裡面記錄了哪些被修改、為什麼、風險範圍，以及 opt-out 路徑。
-
-## 功能介紹
-
-啟動 AI coding agent（Claude Code、Codex、Kiro、OpenCode、Antigravity）
-作為長駐 PTY process，每個都有獨立的 git worktree。內建 MCP server 讓
-agent 之間可以互相溝通——委派工作、查詢資訊、廣播更新——不需要膠水程式碼。
-Crash 後自動重啟並移交上下文。透過多 tab / 多 pane 的 TUI、Telegram 頻道或
-可選的系統匣來操控整個 fleet。
-
-## 為什麼不用 tmux？
-
-| | tmux + shell scripts | agend-terminal |
-|---|---|---|
-| 輸入注入 | `send-keys` 競態條件 | 原子 PTY 寫入 |
-| 輸出擷取 | 螢幕刮取 | VTerm 狀態追蹤 |
-| Agent 健康 | 手動監控 | 自動重啟 + 狀態偵測 |
-| 多 Agent 通訊 | 自訂 IPC | 內建 MCP 工具 |
-| Git 隔離 | 手動 worktree | 自動 per-agent worktree |
+- **Fleet-as-code** — 一份 YAML 就宣告完每個 agent 的 backend、role、工作目錄與所屬 team。`agend-terminal start` 一次把整個 fleet 拉起來。
+- **5 種 backend** — Claude Code、Codex、Kiro、OpenCode、Antigravity CLI。換 backend 只要改一個欄位。
+- **內建 agent 協調** — agent 之間透過 30 個 MCP 工具委派工作、互相查詢、廣播更新，不需要任何膠水程式碼。
+- **自動 git worktree 隔離** — 每個 agent 在自己的 worktree 裡工作。agent 之間不會有 merge 衝突，也不會意外互相污染。
+- **Crash 後自動復原並移交上下文** — agent 會自動重啟並接續原本的對話。內建指數退避、健康監控與 hung 偵測。
+- **遠端操控** — 透過多 pane 的 TUI、Telegram 或 Discord 操控整個 fleet，agent 需要你介入時會主動通知。
 
 ## 快速開始
 
 ```bash
-# 互動式設定——偵測 backend、可選設定 Telegram、產生 fleet.yaml
-agend-terminal quickstart
-
-# 或手寫一份最小 fleet.yaml 然後啟動 daemon：
-cat > ~/.agend/fleet.yaml << 'YAML'
-defaults:
-  backend: claude
-instances:
-  dev:
-    role: "Developer"
-    working_directory: ~/my-project
-  reviewer:
-    role: "Code reviewer"
-    working_directory: ~/my-project
-YAML
-agend-terminal start
+cargo install agend-terminal
+agend-terminal quickstart    # 互動式設定，2 分鐘完成
+agend-terminal start         # 啟動 fleet
 ```
 
-Telegram 綁定（遠端控制 + 外發通知）請參閱 [`docs/USAGE.md` § Channel: Telegram](docs/USAGE.md#channel-telegram)。
+### 無人值守設定（CI / 腳本）
+
+`quickstart --unattended` 永遠不讀 stdin、不等待網路——缺少必填輸入會是明確的錯誤與非零退出碼，而不是卡住。backend 取 `PATH` 上偵測到的第一個（若都沒有，會列出安裝指令並退出）；Telegram 為選用，從環境變數讀取：
+
+```bash
+# 最小設定（不含 Telegram——產出的 channel 區塊會被註解掉）：
+agend-terminal quickstart --unattended
+
+# 含 Telegram（token 會直接存下不驗證，由 daemon 在啟動時驗證）：
+AGEND_TELEGRAM_BOT_TOKEN=123:abc \
+AGEND_TELEGRAM_GROUP_ID=-1001234567890 \
+agend-terminal quickstart --unattended
+```
+
+重跑具備冪等性：既有的 `fleet.yaml` 永遠不會被覆寫，既有 `.env` 內的 token 只有在明確設定 `AGEND_TELEGRAM_BOT_TOKEN` 時才會被取代（例如 CI 輪換 token）。GitHub Actions 範例步驟：
+
+```yaml
+- name: Bootstrap agend-terminal
+  env:
+    AGEND_TELEGRAM_BOT_TOKEN: ${{ secrets.AGEND_TELEGRAM_BOT_TOKEN }}
+  run: |
+    cargo install agend-terminal
+    agend-terminal quickstart --unattended
+```
+
+## 架構
+
+```mermaid
+graph LR
+    Op[操作者] -->|TUI / Telegram / Discord| D[Daemon]
+    F[fleet.yaml] --> D
+    D --> A1[Agent PTY<br/>Claude Code]
+    D --> A2[Agent PTY<br/>Codex]
+    D --> A3[Agent PTY<br/>Kiro]
+    D --> AN[Agent PTY<br/>...]
+    A1 <-->|MCP bridge| A2
+    A2 <-->|MCP bridge| A3
+    A1 <-->|MCP bridge| A3
+    D ---|每個 agent 一個 worktree| G[(Git repo)]
+    D ---|健康監控<br/>自動重啟| A1
+```
+
+## 為什麼不用 tmux？
+
+| | tmux + shell 腳本 | agend-terminal |
+|---|---|---|
+| 輸入注入 | `send-keys` 競態條件 | 原子 PTY 寫入 |
+| 輸出擷取 | 螢幕刮取 | VTerm 狀態追蹤 |
+| Agent 健康 | 手動監控 | 自動重啟 + 狀態偵測 |
+| 多 agent 通訊 | 自訂 IPC | 內建 MCP 工具 |
+| Git 隔離 | 手動 worktree | 自動 per-agent worktree |
 
 ## Backend 支援
 
@@ -68,22 +90,26 @@ Telegram 綁定（遠端控制 + 外發通知）請參閱 [`docs/USAGE.md` § Ch
 | Kiro CLI | `kiro-cli` | 已測試 |
 | Codex | `codex` | 已測試 |
 | OpenCode | `opencode` | 已測試 |
-| Antigravity CLI | `antigravity-cli`（二進位 `agy`） | 不支援 |
+| Antigravity CLI | `agy` | 已測試 |
 
-> #1580：Gemini CLI 已退役（2026-06-18 起免費/Pro/Ultra 停止服務）。fleet.yaml 內若仍指定 `gemini`/`gemini-cli`,現在會以泛用 `Raw` backend 啟動;請改用 `agy`(其官方後繼者)。
+> Gemini CLI 已於 [#1580](https://github.com/suzuke/agend-terminal/issues/1580) 退役（2026-06-18 起對免費／Pro／Ultra 方案停止服務）。其官方後繼者 Antigravity CLI（`agy`）已是受支援的 Fleet MCP backend（[#1547](https://github.com/suzuke/agend-terminal/issues/1547)）。`fleet.yaml` 內若仍指定 `gemini`，現在會以泛用的 `Raw` backend 啟動。
+> `agy` 會拒絕任何路徑帶有 dot 前綴（隱藏）祖先目錄的 workspace，因此 `~/.agend-terminal` 底下的 daemon agent 原本對它是不可見的。daemon 現在會建立一個非隱藏的連結（`<base>/<instance>` → 真正的隱藏 workspace），並把 agy 的 `$PWD` 指向該連結，藉此通過 agy 的隱藏路徑檢查，而真實檔案仍留在 `$AGEND_HOME` 底下。`configure_agy` 會寫入 project-scoped 的 `.agents/mcp_config.json` + `.agents/AGENTS.md`（agy 官方的 Customization Roots），讓 `agy` 像其他 backend 一樣載入 fleet 的 `send`／`inbox`／`task` 工具。
 
-> `agy` backend 目前**不支援**：除了缺少 Fleet MCP bridge，此 backend 的已知問題暫不進入修正階段。在 project-scoped MCP 被支援（[#1262](https://github.com/suzuke/agend-terminal/issues/1262)）或自家 CLI 工具完成前不會重啟支援。詳見 [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md)（[#1547](https://github.com/suzuke/agend-terminal/issues/1547)）。
+## 文件
 
-## 深入了解
+**從這裡開始：**
+- [快速開始指南](docs/FEATURE-quickstart.zh-TW.md) — 首次啟動逐步教學
+- [Fleet 設定](docs/FEATURE-fleet.zh-TW.md) — `fleet.yaml` 參考
+- [CLI 參考](docs/CLI.zh-TW.md) — 所有子命令
+- [MCP 工具](docs/MCP-TOOLS.zh-TW.md) — 30 個 agent 協調工具
+- [已知問題](docs/KNOWN_ISSUES.zh-TW.md) — 刻意暫緩的項目；開 issue 前請先看
+- [**文件總索引**](docs/README.zh-TW.md) — 所有指南與參考文件的雙語地圖
 
-### 功能指南
+<details>
+<summary><strong>功能指南</strong></summary>
 
-**入門**
-- [快速開始指南](docs/FEATURE-quickstart.zh-TW.md)
-- [Fleet 設定](docs/FEATURE-fleet.zh-TW.md)
+**核心**
 - [Agent 互動](docs/FEATURE-agent-interaction.zh-TW.md)
-
-**日常使用**
 - [TUI 介面](docs/FEATURE-tui.zh-TW.md)
 - [Skills 技能系統](docs/FEATURE-skills.zh-TW.md)
 - [通訊系統](docs/FEATURE-communication.zh-TW.md)
@@ -95,7 +121,7 @@ Telegram 綁定（遠端控制 + 外發通知）請參閱 [`docs/USAGE.md` § Ch
 - [CI 監控](docs/FEATURE-ci-watch.zh-TW.md)
 - [健康與監控](docs/FEATURE-health.zh-TW.md)
 - [Dispatch Idle 追蹤](docs/FEATURE-dispatch-idle.zh-TW.md)
-- [頻道（Telegram/Discord）](docs/FEATURE-channels.zh-TW.md)
+- [頻道（Telegram／Discord）](docs/FEATURE-channels.zh-TW.md)
 - [決策記錄](docs/FEATURE-decisions.zh-TW.md)
 - [排程與部署](docs/FEATURE-schedules.zh-TW.md)
 
@@ -103,16 +129,21 @@ Telegram 綁定（遠端控制 + 外發通知）請參閱 [`docs/USAGE.md` § Ch
 - [服務管理](docs/FEATURE-service.zh-TW.md)
 - [診斷工具](docs/FEATURE-diagnostics.zh-TW.md)
 - [設定](docs/FEATURE-configuration.zh-TW.md)
+</details>
 
-### 參考文件
+<details>
+<summary><strong>參考文件</strong></summary>
 
-- **命令**——[`docs/CLI.md`](docs/CLI.md) 完整子命令參考。
-- **MCP 工具**——[`docs/MCP-TOOLS.md`](docs/MCP-TOOLS.md) 35 個 agent 間協作工具。
-- **已知問題**——[`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md) 暫不處理的已知項；開 issue 前請先確認。
-- **架構**——[`docs/architecture.md`](docs/architecture.md) 涵蓋 git worktree 隔離、健康監控 + 自動重啟、Telegram topic 生命週期，以及 daemon-resident 設計。
-- **秘訣**——[`docs/RECIPE-clean-claude-instance.md`](docs/RECIPE-clean-claude-instance.md) 啟動不含全域指令或 auto-memory 的乾淨 Claude Code instance。
-- **貢獻**——[`CONTRIBUTING.md`](CONTRIBUTING.md)。
-- **發布歷史**——[`CHANGELOG.md`](CHANGELOG.md)。
+- [架構](docs/architecture.zh-TW.md) — worktree 隔離、健康監控、Telegram 生命週期、daemon 設計
+- [Git 行為](docs/GIT-BEHAVIOR.zh-TW.md) — daemon 對被啟動 agent 的 git 環境做了哪些修改
+- [秘訣](docs/RECIPE-clean-claude-instance.zh-TW.md) — 啟動一個乾淨的 Claude Code instance
+- [貢獻指南](CONTRIBUTING.zh-TW.md)
+- [更新日誌](CHANGELOG.zh-TW.md)
+</details>
+
+## Git 行為
+
+agend-terminal 會修改被啟動 agent 的 git 行為（PATH shim、commit trailer、deny matrix、daemon 管理的 worktree）。你自己的終端機**不受影響**。啟動 daemon 前請先讀 [`docs/GIT-BEHAVIOR.zh-TW.md`](docs/GIT-BEHAVIOR.zh-TW.md)。
 
 ## 授權條款
 

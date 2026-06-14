@@ -1,3 +1,5 @@
+[English](FEATURE-task-board.md)
+
 # Task Board
 
 這份文件說明共享任務板的設計目的、資料流、MCP 使用方式、以及

@@ -1,3 +1,5 @@
+[English](FEATURE-fleet.md)
+
 # Fleet Management — 統一管理所有 Agent
 
 ## 使用情境
@@ -172,6 +174,132 @@ channel:
 
 定義可重複使用的 agent 配置模板，供 `fleet deployment deploy` 動態建立
 instance 使用。
+
+#### `watchdog` — Watchdog 拓撲
+
+控制 idle watchdog 監看哪個 agent，以及由誰接收各種 watchdog／
+anti-stall／decision-timeout 通知。這些是 agent／接收者**名稱**
+（fleet 拓撲），所以放在這裡而非 env vars。每個欄位皆為
+選填；省略整個區塊（或某個欄位）時會退回到舊版 `AGEND_*` env var
+（已棄用），再退回到內建預設值。解析優先順序：
+
+**`watchdog:` 值 > `AGEND_*` env var（已棄用，僅警告一次）> 內建預設值。**
+
+```yaml
+watchdog:
+  # Legacy SINGLE-AGENT mode for the dev-vantage idle watchdog. When set, the
+  # watchdog watches ONLY this agent (with the global dev_idle_threshold_secs)
+  # instead of iterating every fleet instance. Omit it (default) to keep the
+  # modern per-instance iteration. Mirrors AGEND_IDLE_WATCHDOG_AGENT.
+  idle_watchdog_agent: dev
+  # Recipient for dev-vantage idle alerts. Default: lead.
+  dev_recipient: lead
+  # Recipient for fleet-vantage idle alerts ("the whole fleet is quiet").
+  # Default: lead (#1563: was general, which over-pinged the general assistant).
+  fleet_recipient: lead
+  # Recipients for task-stall warnings. Default: [general, lead].
+  task_stall_recipients:
+    - general
+    - lead
+  # Recipient for the decision-timeout auto-default (operator-proceed) emission.
+  # Default: general.
+  decision_timeout_recipient: general
+```
+
+對應的 env var（`AGEND_IDLE_WATCHDOG_AGENT`、`AGEND_IDLE_WATCHDOG_DEV_RECIPIENT`、
+`AGEND_IDLE_WATCHDOG_FLEET_RECIPIENT`、`AGEND_TASK_STALL_RECIPIENTS`、
+`AGEND_DECISION_TIMEOUT_RECIPIENT`）皆已**棄用**——它們還能再運作一個
+版本週期，但之後會被移除；參見 `docs/env-vars.md` §8。
+
+### 環境變數
+
+#### 合併優先順序
+
+環境變數依以下順序解析（優先順序最高者勝出）：
+
+1. **執行期 SPAWN 參數**——在 MCP `start_instance` / SPAWN API 呼叫中傳入的 `env` 物件
+2. **Instance `env`**——fleet.yaml 中的 `instances.<name>.env`
+3. **Defaults `env`**——fleet.yaml 中的 `defaults.env`
+4. **Daemon 預設值**——由 daemon 自動注入（見下文）
+
+在 fleet.yaml 內，會先套用 `defaults.env`，再由 `instances.<name>.env` 擴充／覆蓋。如果執行期 SPAWN 呼叫包含 `env` 物件，會完全取代 fleet.yaml 解析出來的 env。
+
+#### Daemon 注入的變數
+
+daemon 會在套用 fleet.yaml env 之前，將以下變數注入每個 agent process：
+
+| 變數 | 值 | 用途 |
+|------|------|------|
+| `AGEND_INSTANCE_NAME` | Agent 名稱 | 向 MCP 工具和 daemon IPC 標識 agent |
+| `TERM` | `xterm-256color` | PTY 渲染所用的終端類型 |
+| `COLORTERM` | `truecolor` | 啟用 24-bit 色彩支援 |
+| `FORCE_COLOR` | `1` | 強制會檢查此變數的工具輸出彩色 |
+| `GIT_EDITOR` | `true` | 避免 git 開啟互動式編輯器 |
+| `GIT_SEQUENCE_EDITOR` | `true` | 避免 `git rebase -i` 開啟編輯器 |
+| `EDITOR` | `true` | 後備編輯器抑制 |
+| `VISUAL` | `true` | 後備編輯器抑制 |
+| `LANG` | `en_US.UTF-8` | 僅在環境中尚未有 `LANG` 時設定 |
+
+`GIT_EDITOR` 系列變數可避免 agent 在 git 操作時卡在互動式編輯器（例如 Vim）。fleet.yaml 的 env 項目會覆蓋這些預設值——設定 `instances.dev.env.GIT_EDITOR: vim` 即可為該 agent 恢復互動式編輯。
+
+#### 敏感金鑰拒絕清單
+
+以下環境變數名稱在 fleet.yaml `env` 中會被**封鎖**，以防止意外洩漏憑證或執行期劫持。嘗試設定這些變數會被靜默丟棄並記錄一筆警告日誌：
+
+| 類別 | 被封鎖的金鑰 |
+|------|-------------|
+| AI backend 憑證 | `ANTHROPIC_API_KEY`、`ANTHROPIC_AUTH_TOKEN`、`OPENAI_API_KEY`、`GOOGLE_API_KEY`、`GEMINI_API_KEY` |
+| 雲端憑證 | `AWS_ACCESS_KEY_ID`、`AWS_SECRET_ACCESS_KEY`、`AWS_SESSION_TOKEN` |
+| Git forge token | `GITHUB_TOKEN`、`GITLAB_TOKEN`、`NPM_TOKEN` |
+| 動態連結器注入 | `LD_PRELOAD`、`LD_LIBRARY_PATH`、`LD_AUDIT`、`DYLD_INSERT_LIBRARIES`、`DYLD_LIBRARY_PATH`、`DYLD_FALLBACK_LIBRARY_PATH` |
+| AgEnD 執行期內部變數 | `AGEND_HOME`、`AGEND_INSTANCE_NAME` |
+
+這些憑證應改在主機 shell 環境或 `.env` 檔中設定——daemon process 會繼承它們並自動傳遞給 agent 子程序。
+
+#### 範例
+
+**Proxy 設定：**
+
+```yaml
+defaults:
+  env:
+    HTTP_PROXY: "http://proxy.corp:8080"
+    HTTPS_PROXY: "http://proxy.corp:8080"
+    NO_PROXY: "localhost,127.0.0.1"
+```
+
+**透過主機環境設定 API 金鑰（建議）：**
+
+```yaml
+# 別把祕密放進 fleet.yaml：
+#   env:
+#     MY_API_KEY: "sk-abc123"    # BAD — checked into git
+#
+# 改在你的 shell profile 或 .env 中設定：
+#   export MY_SERVICE_API_KEY=sk-abc123
+#
+# 然後只在需要改名時才在 fleet.yaml 中引用：
+defaults:
+  env:
+    SERVICE_KEY_ALIAS: "${MY_SERVICE_API_KEY}"
+```
+
+**Per-instance 覆蓋：**
+
+```yaml
+defaults:
+  env:
+    LOG_LEVEL: info
+
+instances:
+  dev:
+    env:
+      LOG_LEVEL: debug        # overrides defaults
+      RUST_BACKTRACE: "1"     # added for this instance only
+  reviewer:
+    role: "Code reviewer"
+    # inherits LOG_LEVEL=info from defaults
+```
 
 ---
 

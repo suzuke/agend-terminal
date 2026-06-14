@@ -1,3 +1,5 @@
+[繁體中文](CONTRIBUTING.zh-TW.md)
+
 # Contributing
 
 Thanks for considering a contribution. This is a Rust CLI + daemon; the workflow below keeps diffs reviewable and CI green.

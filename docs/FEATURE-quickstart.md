@@ -1,3 +1,5 @@
+[繁體中文](FEATURE-quickstart.zh-TW.md)
+
 # Quickstart — Interactive First-Time Setup
 
 ## Usage Scenarios

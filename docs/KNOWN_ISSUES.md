@@ -1,3 +1,5 @@
+[繁體中文](KNOWN_ISSUES.zh-TW.md)
+
 # Known Issues
 
 A living list of issues that are **known and intentionally not being worked on

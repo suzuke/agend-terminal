@@ -1,3 +1,5 @@
+[繁體中文](FEATURE-diagnostics.zh-TW.md)
+
 # Diagnostics and Evidence: `agend-terminal doctor / bugreport / capture`
 
 This document groups the operator-facing tools that help you inspect the system before you change it.

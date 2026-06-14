@@ -1,3 +1,5 @@
+[繁體中文](FEATURE-dispatch-idle.zh-TW.md)
+
 # Dispatch Idle Tracking — Task Response Timeout Monitoring
 
 ## Usage Scenarios

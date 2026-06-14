@@ -1,3 +1,5 @@
+[繁體中文](COMPATIBILITY.zh-TW.md)
+
 # On-Disk Format Compatibility Policy
 
 agend-terminal reads and writes a number of files under `$AGEND_HOME` (and a

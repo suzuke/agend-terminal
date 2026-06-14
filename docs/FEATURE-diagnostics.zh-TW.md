@@ -1,3 +1,5 @@
+[English](FEATURE-diagnostics.md)
+
 # 診斷與取證：`agend-terminal doctor / bugreport / capture`
 
 這份文件整理所有「先觀察、再判斷、最後再修」的診斷入口。

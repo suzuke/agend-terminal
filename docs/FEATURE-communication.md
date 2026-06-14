@@ -1,3 +1,5 @@
+[繁體中文](FEATURE-communication.zh-TW.md)
+
 # Inter-Agent Communication System
 
 AgEnD Terminal's communication system enables structured message passing between agents — delegating tasks, asking questions, reporting results, and broadcasting updates.

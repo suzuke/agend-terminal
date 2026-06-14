@@ -1,3 +1,5 @@
+[繁體中文](LINT-DISCIPLINE.zh-TW.md)
+
 # Lint Discipline (cross-platform pre-push checklist)
 
 **Purpose**: catch the recurring cross-platform lint issues that burned

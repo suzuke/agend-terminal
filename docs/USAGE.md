@@ -1,3 +1,5 @@
+[繁體中文](USAGE.zh-TW.md)
+
 # Usage Guide
 
 ## Binaries

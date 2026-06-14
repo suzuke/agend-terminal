@@ -1,3 +1,5 @@
+[繁體中文](RECIPE-clean-claude-instance.zh-TW.md)
+
 # Recipe: spawn a Claude Code instance without inherited context
 
 Sometimes you want a Claude Code instance that does **not** read the operator's
