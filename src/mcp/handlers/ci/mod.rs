@@ -3,6 +3,10 @@ use crate::git_helpers::git_bypass;
 use serde_json::{json, Value};
 use std::path::Path;
 
+// #2140: the deterministic merge-freshness gate lives in a sibling module so this
+// file (at its LOC ceiling) gains only a single `merge_freshness::gate(...)` call.
+mod merge_freshness;
+
 /// #1447: resolve the checkout source repo from `repository_path` — the
 /// cross-tool standard name used by bind_self / team update. Returns `None`
 /// when absent or empty.
@@ -1043,23 +1047,14 @@ fn build_default_provider(repo: &str) -> Option<Box<dyn crate::daemon::ci_watch:
     provider
 }
 
-/// #817: handle `repo action=cleanup_merged_branches`. Dry-run by
-/// default; apply requires explicit `apply=true` + `confirm_ids`
-/// subset + non-empty `audit_reason`. Mirrors #806 sweep's
-/// double-opt-in contract.
-///
-/// Args:
-/// - `agent` (optional, defaults to caller's `instance_name`) —
-///   used to resolve the operator's bound source_repo via
-///   `binding.json`.
-/// - `base` (optional, default "main") — branch to compare against
-///   for clean_merged / squash_merged detection.
-/// - `min_age_days` (optional, default 90) — stale_idle threshold.
-/// - `apply` (bool, default false) — when false, returns dry-run.
-/// - `confirm_ids` (array<string>) — required when apply=true.
-///   Subset of dry-run's all_ids.
-/// - `audit_reason` (string) — required when apply=true. Logged
-///   to event-log.jsonl per deleted branch.
+/// #817: handle `repo action=cleanup_merged_branches`. Dry-run by default; apply
+/// requires `apply=true` + a `confirm_ids` subset of the dry-run's all_ids +
+/// non-empty `audit_reason` (mirrors #806 sweep's double-opt-in). Args: `agent`
+/// (default caller; resolves the bound source_repo via binding.json), `base`
+/// (default "main"; compare target for clean/squash-merged detection),
+/// `min_age_days` (default 90; stale_idle threshold), `apply` (default false),
+/// `confirm_ids` + `audit_reason` (required when apply=true; the latter logged to
+/// event-log.jsonl per deleted branch).
 pub(crate) fn handle_cleanup_merged_branches(
     home: &Path,
     args: &Value,
@@ -1339,6 +1334,10 @@ pub(super) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
                     "hint": format!("{hint}; or force=true with force_reason for emergency bypass"),
                 });
             }
+        }
+        // #2140: deterministic freshness gate (logic in ci/merge_freshness.rs).
+        if let Some(refusal) = merge_freshness::gate(&repo, pr) {
+            return refusal;
         }
     }
 

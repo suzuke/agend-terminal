@@ -102,6 +102,17 @@ pub(crate) enum MergeOutcome {
     Failed { stderr: String },
 }
 
+/// #2140: result of [`ScmProvider::compare`] — DETERMINISTIC commit-ancestry for
+/// the merge-freshness gate, independent of GitHub's eventually-consistent
+/// `mergeStateStatus`. `behind_by` = how many commits `base` has that `head`
+/// lacks (0 ⇒ up-to-date); `files` = the paths in the `base...head` symmetric diff
+/// (the changes on `head` since the merge-base).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CompareResult {
+    pub behind_by: u64,
+    pub files: Vec<String>,
+}
+
 /// Returned by non-GitHub providers so callers fail LOUD instead of an
 /// auto-merge silently no-opping (§3.7 cross-backend stance). Hand-rolled
 /// (no `thiserror` dependency) — it composes into `anyhow::Error` via the
@@ -153,6 +164,10 @@ pub(crate) trait ScmProvider: Send + Sync {
     /// `gh issue view <number> --json <fields>` → one issue (#2061 task-sweep
     /// `stale_open`: resolve whether a referenced issue is CLOSED/terminal).
     fn issue_view(&self, repo: &str, number: u64, fields: &[&str]) -> anyhow::Result<IssueSummary>;
+    /// #2140: `gh api repos/{repo}/compare/{base}...{head}` → DETERMINISTIC
+    /// commit-ancestry (`behind_by` + changed `files`) for the merge-freshness
+    /// gate, independent of the laggy `mergeStateStatus`.
+    fn compare(&self, repo: &str, base: &str, head: &str) -> anyhow::Result<CompareResult>;
 }
 
 // ---------------------------------------------------------------------------
@@ -255,6 +270,16 @@ fn issue_view_args(repo: &str, number: u64, fields: &[&str]) -> Vec<String> {
     ]
 }
 
+/// #2140: `gh api repos/{repo}/compare/{base}...{head}` argv. The triple-dot
+/// (`...`) yields the symmetric merge-base comparison (`behind_by` = commits
+/// `base` has that `head` lacks; `files` = `head`'s changes since the merge-base).
+fn compare_args(repo: &str, base: &str, head: &str) -> Vec<String> {
+    vec![
+        "api".into(),
+        format!("repos/{repo}/compare/{base}...{head}"),
+    ]
+}
+
 // ---------------------------------------------------------------------------
 // parsers — pure + unit-tested. All gh-schema knowledge lives here, never
 // in the call sites.
@@ -296,6 +321,22 @@ fn parse_issue_summary(v: &Value) -> IssueSummary {
     IssueSummary {
         number: v["number"].as_u64().unwrap_or(0),
         state: v["state"].as_str().map(String::from),
+    }
+}
+
+/// #2140: parse `gh api .../compare/...` → `behind_by` + the changed file paths
+/// (`files[].filename`). A missing field defaults to `0` / empty.
+fn parse_compare(v: &Value) -> CompareResult {
+    CompareResult {
+        behind_by: v["behind_by"].as_u64().unwrap_or(0),
+        files: v["files"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|f| f["filename"].as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -418,6 +459,19 @@ impl ScmProvider for GitHubScmProvider {
         let v: Value = serde_json::from_slice(&out.stdout)?;
         Ok(parse_issue_summary(&v))
     }
+
+    fn compare(&self, repo: &str, base: &str, head: &str) -> anyhow::Result<CompareResult> {
+        let out = Self::run(&compare_args(repo, base, head), None)?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "gh api compare {base}...{head} ({repo}) exited {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        let v: Value = serde_json::from_slice(&out.stdout)?;
+        Ok(parse_compare(&v))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -464,6 +518,14 @@ macro_rules! not_supported_provider {
                 _number: u64,
                 _fields: &[&str],
             ) -> anyhow::Result<IssueSummary> {
+                Err(NotSupported($kind).into())
+            }
+            fn compare(
+                &self,
+                _repo: &str,
+                _base: &str,
+                _head: &str,
+            ) -> anyhow::Result<CompareResult> {
                 Err(NotSupported($kind).into())
             }
         }
