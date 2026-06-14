@@ -57,7 +57,6 @@ fn error_str(v: &Value) -> String {
 /// "successfully" (returns `{"name":...,"backend":...}` with NO `error` key).
 /// After the fix it must return an `error` mentioning the protected branch.
 #[test]
-#[ignore = "mcp-core-surface F1: red until create_instance enforces E4.5 on branch=main; remove #[ignore] after fix to confirm"]
 fn create_instance_branch_main_rejected_e4_5_mcp_core_surface() {
     let home = tmp_home("f1-branch-main");
 
