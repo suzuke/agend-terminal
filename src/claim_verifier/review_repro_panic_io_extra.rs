@@ -25,7 +25,6 @@ use super::{parse_claims, Claim};
 /// GREEN after fix: a same-string offset / `s.get(idx..)` never slices on a
 /// non-boundary; the call returns a `ScopeFollowsDispatchSpec` claim.
 #[test]
-#[ignore = "claim_verifier-non-ascii-slice: red until fix; remove #[ignore] after fix to confirm"]
 fn extract_task_id_non_ascii_prefix_does_not_panic_panic_io_extra() {
     let claim_text = "\u{130} scope follows dispatch spec\u{4e2d}t-1";
 
