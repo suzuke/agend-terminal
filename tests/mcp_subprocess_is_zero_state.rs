@@ -70,6 +70,10 @@ fn rule1_no_state_file_reads() {
         "task_events",
         "inbox",
         "metadata.json",
+        // Merged from the former `rule4_no_state_files`: its other four
+        // patterns (fleet.yaml/topics.json/tasks.json/task_events.jsonl) were
+        // already covered here, so only `agents/` was unique. Consolidated.
+        "agents/",
     ];
     for (num, line) in &lines {
         for pat in &forbidden {
@@ -122,26 +126,11 @@ fn rule3_no_globals() {
     }
 }
 
-/// Rule 4: No state file references.
-#[test]
-fn rule4_no_state_files() {
-    let lines = active_lines(&bridge_source());
-    let forbidden = [
-        "fleet.yaml",
-        "topics.json",
-        "tasks.json",
-        "task_events.jsonl",
-        "agents/",
-    ];
-    for (num, line) in &lines {
-        for pat in &forbidden {
-            assert!(
-                !line.contains(pat),
-                "Rule 4 violation at line {num}: bridge must not reference '{pat}'\n  {line}"
-            );
-        }
-    }
-}
+// Rule 4 (`rule4_no_state_files`) was merged into `rule1_no_state_file_reads`:
+// four of its five forbidden patterns (fleet.yaml/topics.json/tasks.json/
+// task_events.jsonl, the last covered by rule1's `task_events` substring) were
+// already enforced there over the identical line set; only `agents/` was
+// unique, and it now lives in rule1's list.
 
 /// Rule 5: No channel state.
 #[test]
