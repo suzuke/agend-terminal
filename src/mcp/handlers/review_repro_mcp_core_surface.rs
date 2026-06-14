@@ -98,7 +98,6 @@ fn create_instance_branch_main_rejected_e4_5_mcp_core_surface() {
 /// After the fix, `validate_name_or_err!(team_name)` rejects it at the MCP
 /// boundary with a "... invalid characters ..." error BEFORE the RPC.
 #[test]
-#[ignore = "mcp-core-surface F2: red until create_instance validates the team name; remove #[ignore] after fix to confirm"]
 fn create_instance_team_name_traversal_rejected_mcp_core_surface() {
     let home = tmp_home("f2-team-traversal");
 

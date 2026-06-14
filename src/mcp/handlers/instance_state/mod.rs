@@ -14,6 +14,12 @@ pub(super) fn handle_create_instance(home: &Path, args: &Value, instance_name: &
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty()),
     ) {
+        // H7 (high/security): validate the team name at the MCP boundary. It
+        // becomes member names (`<team>-N`) + `workspace_dir(home).join(name)`
+        // downstream; `PathBuf::join` keeps `..`, so an unvalidated traversal
+        // name like "../../tmp/evil" escapes the workspace root. Reject here,
+        // exactly as the single-instance path does.
+        crate::validate_name_or_err!(team_name);
         if args.get("count").and_then(|v| v.as_u64()).unwrap_or(1) > 1
             || args.get("backends").is_some()
         {
@@ -41,6 +47,13 @@ pub(super) fn handle_create_instance(home: &Path, args: &Value, instance_name: &
     }
     // Team mode: spawn count instances and group them
     if let Some(team_name) = args.get("team").and_then(|v| v.as_str()) {
+        // H7 (high/security): validate the team name BEFORE the CREATE_TEAM RPC.
+        // `create_team` derives member names `<team>-N` and `workspace_dir(home)
+        // .join(name)`; `PathBuf::join` preserves `..`, so an unvalidated name
+        // like "../../tmp/evil" creates + registers fleet entries outside the
+        // workspace root. The single-instance path already validates; this
+        // forwarded the raw name straight to the daemon.
+        crate::validate_name_or_err!(team_name);
         let default_backend = args["backend"]
             .as_str()
             .or_else(|| args["command"].as_str())
