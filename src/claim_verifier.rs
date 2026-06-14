@@ -113,9 +113,19 @@ fn extract_paths(s: &str) -> Vec<String> {
 
 /// Extract a task ID from a "scope follows dispatch spec X" claim.
 fn extract_task_id(s: &str) -> Option<String> {
-    let lower = s.to_lowercase();
+    // #CR-2026-06-14 C1: the marker offset MUST be computed on `s` itself. A byte
+    // offset from `s.to_lowercase()` can land mid-char on `s` — `to_lowercase` is
+    // NOT byte-length-preserving (İ→i̇, ß→ss) — so `s[idx..]` panicked on
+    // agent/operator-supplied non-ASCII claim text. The marker is ASCII, so find
+    // it case-insensitively over `s`'s own char boundaries via `get` (an Option,
+    // never panics). For ASCII text the offset is identical to the old path.
     let marker = "scope follows dispatch spec";
-    let idx = lower.find(marker)? + marker.len();
+    let idx = s.char_indices().find_map(|(i, _)| {
+        let end = i + marker.len();
+        s.get(i..end)
+            .filter(|sub| sub.eq_ignore_ascii_case(marker))
+            .map(|_| end)
+    })?;
     let rest = s[idx..].trim();
     // Task ID is the next whitespace-delimited token
     let id = rest.split_whitespace().next()?;
