@@ -27,7 +27,6 @@
 //! simply: never panic on content-controlled bytes).
 
 #[test]
-#[ignore = "daemon-supervisor parse_unlock_at-nonascii-panic: red until fix; remove #[ignore] after fix to confirm"]
 fn parse_unlock_at_does_not_panic_on_nonascii_pane_content_daemon_supervisor() {
     // Silence the default panic hook so the (expected, caught) panics don't
     // spam the test output; restore it after.
@@ -64,7 +63,6 @@ fn parse_unlock_at_does_not_panic_on_nonascii_pane_content_daemon_supervisor() {
 }
 
 #[test]
-#[ignore = "daemon-supervisor parse_unlock_at-nonascii-panic: red until fix; remove #[ignore] after fix to confirm"]
 fn parse_unlock_at_still_extracts_ascii_time_after_fix_daemon_supervisor() {
     // Correct-behavior baselines that ANY valid fix must preserve. These pass
     // today AND after the fix; paired with the panic-vector test above so a fix

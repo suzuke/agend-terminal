@@ -228,11 +228,25 @@ fn parse_unlock_at(pane_text: &str) -> Option<String> {
     for line in pane_text.lines().rev() {
         let lower = line.to_lowercase();
         if lower.contains("reset") || lower.contains("try again") || lower.contains("limit") {
-            // Extract time-like pattern HH:MM
+            // Extract time-like pattern HH:MM. `idx` and the slice must come
+            // from the SAME string: `to_lowercase()` is not byte-length-
+            // preserving (U+212A Kelvin 'K' is 3 bytes, lowercases to ASCII 'k'),
+            // so an offset found in `lower` can land mid-multibyte-char in `line`
+            // and panic. Slice `lower`, and match the HH:MM shape char-by-char
+            // (\d{2}:\d{2}) instead of fixed byte indexing, since `pane_text` is
+            // content-controlled PTY output that may contain multibyte chars.
             if let Some(idx) = lower.find(|c: char| c.is_ascii_digit()) {
-                let rest = &line[idx..];
-                if rest.len() >= 5 && rest.as_bytes()[2] == b':' {
-                    return Some(rest[..5].to_string());
+                let mut chars = lower[idx..].chars();
+                let hhmm: Option<Vec<char>> = (0..5).map(|_| chars.next()).collect();
+                if let Some(hhmm) = hhmm {
+                    if hhmm[0].is_ascii_digit()
+                        && hhmm[1].is_ascii_digit()
+                        && hhmm[2] == ':'
+                        && hhmm[3].is_ascii_digit()
+                        && hhmm[4].is_ascii_digit()
+                    {
+                        return Some(hhmm.into_iter().collect());
+                    }
                 }
             }
         }
