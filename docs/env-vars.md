@@ -44,6 +44,7 @@ The variables below are the **default names** for that indirection.
 | `AGEND_TELEGRAM_BOT_TOKEN` | Default name of the env var holding the Telegram bot token. | Config field defaults to the name `AGEND_TELEGRAM_BOT_TOKEN`; if that var is unset at read time, falls back to legacy `AGEND_BOT_TOKEN` (with deprecation warning). | Telegram bot token string. | `src/fleet/mod.rs:227` (default name); read at `src/channel/telegram/creds.rs:23` | 🔒 Secret. Operator-facing. |
 | `AGEND_DISCORD_BOT_TOKEN` | Default name of the env var holding the Discord bot token. | Token var unset → Discord channel not activated (no-credentials arm). | Discord bot token string. | `src/fleet/mod.rs:230` (default name); deref read at `src/channel/telegram/creds.rs:23` | 🔒 Secret. Operator-facing. Shares the telegram channel's token indirection. |
 | `AGEND_BOT_TOKEN` | **Legacy/fallback** Telegram bot token, read only when the configured `bot_token_env` var is unset; emits a deprecation warning steering operators to `bot_token_env`. | Both unset → "bot token env not set" error; telegram verify test is skipped. | Telegram bot token string. | `src/channel/telegram/creds.rs:25`; `src/channel/telegram/bootstrap.rs:39` | 🔒 Secret. **Deprecated** — read-time fallback only. `quickstart` now writes the canonical `AGEND_TELEGRAM_BOT_TOKEN` (and migrates a legacy line out on re-run); prefer `bot_token_env` in fleet.yaml. |
+| `AGEND_TELEGRAM_GROUP_ID` | Telegram supergroup id `quickstart` reads (when set) to seed the generated fleet.yaml `group_id`, so onboarding can pre-fill the channel binding from the environment. | Unset → `quickstart` leaves `group_id` unseeded (operator fills it in fleet.yaml / via topic binding). | Telegram chat/supergroup id string (e.g. `-100…`). | `src/quickstart.rs:174` | Operator-facing, read only at `quickstart` onboarding time (not on the hot path). Not a secret. |
 
 ---
 
@@ -53,7 +54,7 @@ The variables below are the **default names** for that indirection.
 |------|---------|-----------------|-----------------------|--------|-------|
 | `AGEND_WRAPPED` | Restart-supervisor marker set by `scripts/agend-wrapper.sh` before each daemon start; one signal that a supervisor will respawn the daemon on `exit(42)`, letting `restart_daemon` proceed. | Absent → contributes no supervised signal; if no other signal is present, `is_restart_supervised()` is false and restart fails closed. | **Presence-based** (`var_os(...).is_some()`); any value, even empty, counts. | `src/daemon/restart.rs:55` (`has_env`, lines 62–63) | ⚠️ Security-relevant: fail-closed gate on the destructive `restart_daemon` path. See also external `XPC_SERVICE_NAME` / `INVOCATION_ID` below, and the positive `AGEND_SUPERVISED` sentinel + the `AGEND_RESTART_HANDOFF` / `AGEND_SUCCESSOR_HANDOFF` rows below. |
 | `AGEND_SUPERVISED` | Positive supervisor sentinel written into the generated launchd plist / systemd unit by `service install`; `is_restart_supervised()` accepts it as proof a supervisor will respawn the daemon on `exit(42)`. Replaced the ambient `XPC_SERVICE_NAME` false-positive. | Absent → contributes no supervised signal. | **Presence-based** (`has_env`); the templates write `=1`. | `src/daemon/restart.rs` (`SUPERVISED_ENV`, `is_restart_supervised`) | #1812. ⚠️ Security-relevant (same fail-closed gate as `AGEND_WRAPPED`). |
-| `AGEND_RESTART_HANDOFF` | On/off switch for the #1814 self-healing successor-handoff restart path (spawn a successor, health-gate it, abort-stay-alive on failure) vs the legacy `exit(42)` + external-respawn fallback. | **Unset → ON** (self-respawn) since Stage 4. `=0` → legacy `exit(42)` path (byte-identical to pre-#1814). | **DEFAULT ON**: only the literal `"0"` opts out; unset / `"1"` / anything else ⇒ self-respawn. | `src/daemon/restart.rs` (`self_respawn_enabled`, `RESTART_HANDOFF_ENV`) | #1814 Stage 4 flipped the default from opt-in to opt-OUT (after Stage 2 aligned launchd `KeepAlive` to `SuccessfulExit=false`). |
+| `AGEND_RESTART_HANDOFF` | On/off switch for the #1814 self-healing successor-handoff restart path (spawn a successor, health-gate it, abort-stay-alive on failure) vs the legacy `exit(42)` + external-respawn fallback. | **Unset → ON** (self-respawn) since Stage 4. `=0` → legacy `exit(42)` path (byte-identical to pre-#1814). | **DEFAULT ON**: only the literal `"0"` opts out; unset / `"1"` / anything else ⇒ self-respawn. | `src/daemon/restart.rs` (`self_respawn_enabled`, `RESTART_HANDOFF_ENV`) | #1814 Stage 4 flipped the default from opt-in to opt-OUT (after Stage 2 aligned launchd `KeepAlive` to `SuccessfulExit=false`). **#2098**: independent of this flag, `restart_daemon` fail-closes in `agend-terminal app` (combined TUI+daemon) / any non-`run_core` owned mode — that process has no in-process `RESTART_PENDING` consumer, so an in-process self-respawn would brick the control plane. There: quit + relaunch the app, or SIGTERM + restart. Gated by the positive `RUN_CORE_ACTIVE` marker (`src/daemon/mod.rs`). |
 | `AGEND_SUCCESSOR_HANDOFF` | Internal handoff token (`<old_pid>:<token>`) the predecessor sets on the successor it spawns, so the successor takes the minimal pre-lock handoff boot (bypassing the singleton "another daemon is already running" guard, deferring flock + reconciles). NOT an operator knob. | Unset → normal boot (full `prepare`). | `<u32 pid>:<non-empty token>`; malformed → ignored (normal boot). | `src/daemon/restart.rs` (`successor_handoff_marker`, `SUCCESSOR_HANDOFF_ENV`) | #1814 — internal; set only by `spawn_successor_handoff`. |
 
 ---
@@ -111,6 +112,7 @@ These live in the `agend-git` shim binary (`src/bin/agend-git.rs`). The three
 | `AGEND_DAEMON_THREAD_DUMP_SECS` | Per-tick thread-dump interval (seconds); `N>=1` enables periodic dumps. | `0` / disabled. | `u64` seconds; `0` disables. | `src/sync_audit.rs` (`thread_dump_interval_secs`) | Cached once via `OnceLock` — restart to toggle. Single accessor feeds both the handler interval + the `thread_dump_enabled` gate. |
 | `AGEND_DEBUG_PTY_READ` | In the PTY read loop, enables verbose debug logging of read counts/byte totals. Debug-only seam. | Off. | `"1"` enables; any other value (incl. `0`) is off. | `src/agent/mod.rs` | Internal debug flag. |
 | `AGEND_LOCK_AUDIT` | Enables lock-ordering audit in **release** builds (logs tier violations instead of being a no-op). | Release build → no-op; debug/test builds always audit regardless. | **Presence-based** (`is_err()` check). | `src/sync_audit.rs:43` | Dev/diagnostic; affects release builds only. |
+| `AGEND_TUI_SIZE_DEBUG` | #2057 instrument: logs the controlling TTY's kernel winsize at named app-startup milestones (to trace where the TUI's own render area shrinks). | Off (no size tracing). | Value-based: exactly `"1"` enables; else off. | `src/app/mod.rs:270` | Internal diagnostic (`app` mode only). Read once at startup into a local so there is no per-frame env-lookup cost. |
 
 ---
 
@@ -148,6 +150,7 @@ These live in the `agend-git` shim binary (`src/bin/agend-git.rs`). The three
 
 | Name | Purpose | Default (unset) | Valid values / format | Source | Notes |
 |------|---------|-----------------|-----------------------|--------|-------|
+| `AGEND_HOOK_STATE_POC` | Lifecycle-hook state gate (#1523 epic / #2016 promotion). When on: (a) the MCP-config writer injects hook state-reporters into the agent's per-workspace `.claude/settings` (scope-respecting; user-global `~/.claude` untouched), and (b) for a **hook-instrumented (strong) backend**, a *fresh* hook-derived `AgentState` is **promoted to authoritative** in the daemon's per-tick snapshot — winning over the screen heuristic. | Off (no reporters injected; hook state never promoted; the screen heuristic drives everything — byte-identical). | Value-based: exactly `"1"` enables; else off. | `src/mcp_config.rs:193` (inject); `src/daemon/hook_shadow.rs:115` (`promotion_enabled`), `:148` (`authoritative_state`); `src/daemon/per_tick/snapshot.rs:51` (snapshot adopts it) | Internal feature gate, default-OFF. **Promotion is phased-v1, SNAPSHOT-scoped** (#2014): it drives snapshot consumers — `dispatch_idle`, the pane-state badge, `agent_state_of`/`snapshot.json` (the #1985 surface). A stale/unknown hook window, the flag off, or a non-hook backend ⇒ heuristic fallback (unchanged). Per-tick deciders that read the RAW screen heuristic directly — supervisor, hang detection, recovery dispatcher, idle/anti-stall watchdog, `conflict_notify`, `query`/`list` API — are **not** promoted in v1 (epic phase-2, post-soak). |
 
 ---
 
@@ -166,6 +169,10 @@ These live in the `agend-git` shim binary (`src/bin/agend-git.rs`). The three
 | Name | Purpose | Default (unset) | Valid values / format | Source | Notes |
 |------|---------|-----------------|-----------------------|--------|-------|
 | `AGEND_POINTER_ONLY_INJECT` | When on, PTY inbox injection uses header-only ("pointer") format, forcing agents to call `inbox` for the body. | `false`. | `"1"` enables; else off. | `src/daemon_config.rs:27` (seeds `DaemonConfig::default`); consumed via `src/inbox/notify.rs:14` | Env read only at default-construction; runtime value lives in `DaemonConfig`. |
+| `AGEND_CONTEXT_ALERT_PCT` | Context-window usage percent at which the per-tick context-alert watchdog notifies (with hysteresis + re-alert cadence). | `80.0` (`DEFAULT_ALERT_PCT`). | Float percent; unparseable → default. | `src/daemon/per_tick/context_alert.rs:36` | Tuning knob. Operator-facing. |
+| `AGEND_CONTEXT_HANDOFF_PCT` | Context-window usage percent at which the context-handoff watchdog injects a `SESSION-HANDOFF.md` request to the agent. | `85.0` (`DEFAULT_HANDOFF_PCT`). | Float percent; unparseable → default. | `src/daemon/per_tick/context_handoff.rs:51` | Tuning knob. Should sit above the alert pct. |
+| `AGEND_CONTEXT_HANDOFF_ESCALATE_PCT` | Higher context-window percent at which the handoff watchdog escalates to the operator. | `92.0` (`DEFAULT_ESCALATE_PCT`). | Float percent; unparseable → default. | `src/daemon/per_tick/context_handoff.rs:58` | Tuning knob. Should sit above the handoff pct. |
+| `AGEND_LOW_DISK_THRESHOLD` | Free-space floor (bytes); inbox writes treat available space below this as "low disk". | `1 GiB` (`1024³`, `DEFAULT_LOW_DISK_FLOOR_BYTES`). | `u64` bytes; unparseable → default. | `src/inbox/disk.rs:13` | Tuning knob. Plain byte count (no `K`/`M`/`G` suffix, unlike `AGEND_LOG_MAX_BYTES`). |
 
 ---
 
@@ -255,3 +262,37 @@ allowlist at `src/agent/mod.rs:124`.
 ### Searched but NOT read in `src/`
 
 `GH_TOKEN`, `RUST_LOG` (consumed by `tracing-subscriber` internally, no explicit read), `RUST_BACKTRACE`, `NO_COLOR`, `COLUMNS`/`LINES` (size comes from the PTY), `TERM` (only written, never read), and `XDG_RUNTIME_DIR`/`TMPDIR`/`USER` as direct reads (allowlist passthrough only).
+
+---
+
+## 16. Appendix: `AGEND_*` identifiers that are NOT live env vars
+
+A `grep -rhoE 'AGEND_[A-Z0-9_]+' src/` surfaces identifiers that are **not**
+runtime environment variables, so this reference deliberately omits them from the
+tables above. Listed here so the inventory is provably complete (every grep hit
+is accounted for).
+
+**Demoted to fixed consts (`#env-cleanup`, single-user-dev YAGNI).** Once
+env-overridable, now hard-coded; the name survives only in an explanatory code
+comment, with **no `env::var` read**:
+
+- `AGEND_API_CALL_TIMEOUT_SECS` (`src/api/mod.rs:880`) — now fixed 30 s.
+- `AGEND_API_MAX_CONNS` (`src/api/mod.rs:270`) — now a fixed const.
+- `AGEND_DRAFT_ESCAPE_SECS` (`src/notification_queue.rs:103`).
+- `AGEND_FRAME_LIMIT` (`src/framing.rs:14`).
+- `AGEND_OSCILLATION_GUARD_WINDOW_SECS` (`src/state/mod.rs:453`).
+- `AGEND_PANE_INPUT_THRESHOLD_SECS` (`src/daemon/supervisor.rs:431`).
+- `AGEND_PR_STATE_REPLAY_AGE_HOURS` (`src/daemon/pr_state/mod.rs:651`).
+- `AGEND_WORKTREE_FORCE_RECLAIM_BOOT_GRACE_SECS` (`src/worktree_pool.rs:631`).
+
+**String constants / markers (never an env var):**
+
+- `AGEND_BLOCK_START` / `AGEND_BLOCK_END` (`src/instructions.rs:104`–105) — the
+  `<!-- agend:start -->` / `<!-- agend:end -->` instruction-block markers.
+- `AGEND_GITIGNORE` (`src/instructions.rs:53`) — a `.gitignore` body constant.
+
+**Comment-only (not wired):** `AGEND_RENDER_DEBUG` (`src/render/core_render.rs`) —
+referenced in render diagnostics comments; no `env::var` read exists.
+
+**Test-internal fixture:** `AGEND_TEST_ENV_UTIL_FIXTURE` (`src/env_util.rs:88`) —
+a key used only by `env_util`'s own unit test.
