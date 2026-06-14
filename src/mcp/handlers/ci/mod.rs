@@ -814,20 +814,21 @@ pub(crate) fn compute_next_poll_eta(watch: &Value) -> Option<i64> {
 /// (no other agent is still interested in this branch).
 // pub(crate): the #1991 auto-arm tombstone regression test (pr_state::auto_arm)
 // exercises the real unwatch → tombstone → no-re-arm chain.
-pub(crate) fn handle_unwatch_ci(home: &Path, args: &Value) -> Value {
+pub(crate) fn handle_unwatch_ci(home: &Path, args: &Value, instance_name: &str) -> Value {
     let repo = match args["repository"].as_str() {
         Some(r) => r,
         None => return json!({"error": "missing 'repository'"}),
     };
     let branch = args["branch"].as_str().unwrap_or("main");
-    // Caller identity for selective removal. Falls back to the env-set
-    // identity (the standard sender resolution path) when MCP `instance`
-    // arg is omitted.
+    // Caller identity for selective removal (H4, CR-2026-06-14): the VALIDATED
+    // sender when `instance` arg is absent/empty (`.filter`, mirroring the
+    // sibling cleanup handlers) — NOT a daemon `std::env::var` read (was EMPTY in
+    // the daemon → the empty-caller `subscribers.clear()` path below).
     let caller = args["instance"]
         .as_str()
         .map(String::from)
-        .or_else(|| std::env::var("AGEND_INSTANCE_NAME").ok())
-        .unwrap_or_default();
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| instance_name.to_string());
     let filename = crate::daemon::ci_watch::watch_filename(repo, branch);
     let path = crate::daemon::ci_watch::ci_watches_dir(home).join(&filename);
 

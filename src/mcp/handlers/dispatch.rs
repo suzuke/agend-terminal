@@ -282,7 +282,7 @@ adapter!(dispatch_task, hai, task::handle_task);
 
 action_adapter!(dispatch_ci, "ci", [
     "watch"   => ci::handle_watch_ci,   hai;
-    "unwatch" => ci::handle_unwatch_ci, ha;
+    "unwatch" => ci::handle_unwatch_ci, hai;
     "status"  => ci::handle_status_ci,  hai;
 ]);
 

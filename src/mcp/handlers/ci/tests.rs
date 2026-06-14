@@ -268,7 +268,7 @@ fn ci_unwatch_removes_caller_only_when_others_remain() {
         "branch": "feat-test",
         "instance": "lead",
     });
-    let resp = handle_unwatch_ci(&home, &unwatch_args);
+    let resp = handle_unwatch_ci(&home, &unwatch_args, "lead");
 
     assert_eq!(
         resp["watching"].as_bool(),
@@ -313,7 +313,7 @@ fn ci_unwatch_last_subscriber_leaves_tombstone_not_delete() {
         "branch": "feat-test",
         "instance": "lead",
     });
-    let resp = handle_unwatch_ci(&home, &unwatch_args);
+    let resp = handle_unwatch_ci(&home, &unwatch_args, "lead");
 
     assert_eq!(resp["watching"].as_bool(), Some(false));
     assert!(
@@ -342,7 +342,7 @@ fn ci_unwatch_unknown_caller_is_noop_keeps_watch() {
         "branch": "feat-test",
         "instance": "stranger",
     });
-    handle_unwatch_ci(&home, &unwatch_args);
+    handle_unwatch_ci(&home, &unwatch_args, "stranger");
 
     assert!(
         path.exists(),
@@ -356,6 +356,41 @@ fn ci_unwatch_unknown_caller_is_noop_keeps_watch() {
         .map(|s| s["instance"].as_str().unwrap())
         .collect();
     assert_eq!(subs, vec!["lead"]);
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn ci_unwatch_explicit_empty_instance_keeps_other_subscribers() {
+    // H4 hardening (CR-2026-06-14): an agent-supplied EXPLICIT empty
+    // `instance:""` arg must not reach the empty-caller `subscribers.clear()`
+    // branch (same blast radius as the original H4 bug). The
+    // `.filter(|s| !s.is_empty())` drops the empty arg so resolution falls
+    // through to the validated caller (instance_name) — removing only the
+    // caller. Without the filter, caller="" wipes every other subscriber.
+    let home = std::env::temp_dir().join(format!("agend-unwatch-empty-arg-{}", std::process::id()));
+    std::fs::create_dir_all(&home).ok();
+    let args = serde_json::json!({"repository": "owner/repo", "branch": "feat-test"});
+    handle_watch_ci(&home, &args, "lead");
+    handle_watch_ci(&home, &args, "dev");
+
+    let path = watch_path_for(&home, "owner/repo", "feat-test");
+    // lead unwatches with an EXPLICIT empty instance arg; validated caller = "lead".
+    let unwatch_args = serde_json::json!({
+        "repository": "owner/repo",
+        "branch": "feat-test",
+        "instance": "",
+    });
+    handle_unwatch_ci(&home, &unwatch_args, "lead");
+
+    let subs = crate::daemon::ci_watch::parse_subscribers(&read_watch(&path));
+    assert!(
+        subs.iter().any(|s| s == "dev"),
+        "dev must remain subscribed; an empty instance arg must not clear-all. got {subs:?}"
+    );
+    assert!(
+        !subs.iter().any(|s| s == "lead"),
+        "lead (the validated caller) should be removed. got {subs:?}"
+    );
     std::fs::remove_dir_all(&home).ok();
 }
 
@@ -2426,6 +2461,7 @@ fn unwatch_to_empty_leaves_tombstone_1991() {
     let resp = super::handle_unwatch_ci(
         &home,
         &serde_json::json!({"repository": "o/r", "branch": "feat/x", "instance": "dev-1"}),
+        "dev-1",
     );
     assert_eq!(resp["watching"], false);
     assert_eq!(resp["tombstone"], true);
@@ -2456,6 +2492,7 @@ fn rewatch_clears_tombstone_optout_1991() {
     super::handle_unwatch_ci(
         &home,
         &serde_json::json!({"repository": "o/r", "branch": "feat/x", "instance": "dev-1"}),
+        "dev-1",
     );
     // Explicit re-watch: the human decision overrides the optout.
     super::handle_watch_ci(

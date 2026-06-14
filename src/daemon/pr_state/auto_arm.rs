@@ -253,6 +253,7 @@ mod tests {
         crate::mcp::handlers::ci::handle_unwatch_ci(
             &home,
             &serde_json::json!({"repository": REPO, "branch": "feat/x", "instance": "dev-x"}),
+            "dev-x",
         );
         assert!(
             watch_exists(&home, "feat/x"),

@@ -52,7 +52,6 @@ fn read_watch(path: &Path) -> serde_json::Value {
 // `#[serial]`). RED now: the empty-caller fallback wipes `dev` too.
 // ===========================================================================
 #[test]
-#[ignore = "mcp-ci-worktree-1: ci-unwatch-clears-all-on-empty-caller; red until fix; remove #[ignore] after fix to confirm"]
 #[serial_test::serial]
 fn unwatch_uses_validated_caller_not_clear_all_mcp_ci_worktree() {
     // The bug surfaces only when no `instance` arg is given AND the daemon's
