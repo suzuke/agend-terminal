@@ -237,25 +237,29 @@ fn prepare_work_dir(
 ) -> String {
     if let Some(br) = branch {
         let branch_name = format!("{deploy_name}/{inst_suffix}");
-        match std::process::Command::new("git")
-            .args([
+        // W1.2: LOCAL `git worktree add` via the bypass+bounded helper. The 3-way
+        // match maps onto GitError: NonZero (git ran, rejected) keeps the
+        // stderr-bearing "worktree failed" warn; Spawn (git never produced a
+        // status) keeps the "git not available" warn. GitError's stderr is already
+        // trimmed, matching the prior `.trim()`.
+        match crate::git_helpers::git_cmd(
+            parent_dir,
+            &[
                 "worktree",
                 "add",
                 "-b",
                 &branch_name,
                 &inst_dir.display().to_string(),
                 br,
-            ])
-            .current_dir(parent_dir)
-            .output()
-        {
-            Ok(o) if o.status.success() => {
+            ],
+        ) {
+            Ok(_) => {
                 tracing::info!(%inst_name, %branch_name, "created worktree");
             }
-            Ok(o) => {
-                tracing::warn!(%inst_name, error = %String::from_utf8_lossy(&o.stderr).trim(), "worktree failed");
+            Err(crate::git_helpers::GitError::NonZero { stderr, .. }) => {
+                tracing::warn!(%inst_name, error = %stderr, "worktree failed");
             }
-            Err(e) => {
+            Err(crate::git_helpers::GitError::Spawn(e)) => {
                 tracing::warn!(error = %e, "git not available");
             }
         }

@@ -54,6 +54,14 @@ const MODULE_SCOPE: &[&str] = &[
     "mcp_config.rs",
     "instructions.rs",
     "skills.rs",
+    // W1.2 slice 2: claim_verifier (git diff --name-only / git diff -- path →
+    // git_cmd; git show piped to rustfmt kept raw via git-raw-allowed),
+    // deployments (git worktree add → git_cmd). canonical_hygiene already does
+    // all its LOCAL git via git_bypass (zero raw Command::new in production) —
+    // sealed here to guard against a future raw regression.
+    "claim_verifier.rs",
+    "deployments.rs",
+    "bootstrap/canonical_hygiene.rs",
 ];
 
 /// One violation entry — `(file, line_number, snippet)`.

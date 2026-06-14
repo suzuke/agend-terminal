@@ -392,20 +392,16 @@ pub fn verify(
 
 /// Run `git diff --stat base..head` and return the list of changed file paths.
 fn git_diff_files(repo_dir: &Path, base: &str, head: &str) -> Result<Vec<String>, String> {
-    let output = std::process::Command::new("git")
-        .args(["diff", "--name-only", &format!("{base}..{head}")])
-        .current_dir(repo_dir)
-        .env("AGEND_GIT_BYPASS", "1")
-        .output()
-        .map_err(|e| format!("git diff failed: {e}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "git diff exited {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout)
+    // W1.2: LOCAL diff via the bypass+bounded helper (was a raw `.output()` that
+    // already set AGEND_GIT_BYPASS=1). git_cmd trims trailing whitespace, but
+    // the `filter(!is_empty)` already dropped the trailing blank line, so the
+    // collected path list is byte-identical.
+    let stdout = crate::git_helpers::git_cmd(
+        repo_dir,
+        &["diff", "--name-only", &format!("{base}..{head}")],
+    )
+    .map_err(|e| format!("git diff failed: {e}"))?;
+    Ok(stdout
         .lines()
         .filter(|l| !l.is_empty())
         .map(String::from)
@@ -419,20 +415,13 @@ fn git_diff_path_empty(
     head: &str,
     path: &str,
 ) -> Result<bool, String> {
-    let output = std::process::Command::new("git")
-        .args(["diff", &format!("{base}..{head}"), "--", path])
-        .current_dir(repo_dir)
-        .env("AGEND_GIT_BYPASS", "1")
-        .output()
-        .map_err(|e| format!("git diff failed: {e}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "git diff exited {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    Ok(output.stdout.is_empty())
+    // W1.2: LOCAL diff via the bypass+bounded helper (was a raw `.output()` that
+    // already set AGEND_GIT_BYPASS=1). A real diff has non-empty content and an
+    // unchanged path produces empty output; trimming preserves that
+    // empty-vs-non-empty distinction, so `is_empty()` is byte-identical.
+    crate::git_helpers::git_cmd(repo_dir, &["diff", &format!("{base}..{head}"), "--", path])
+        .map(|s| s.is_empty())
+        .map_err(|e| format!("git diff failed: {e}"))
 }
 
 // --- Individual claim checks ---
@@ -657,6 +646,10 @@ fn check_only_formatting(repo_dir: &Path, base: &str, head: &str) -> ClaimResult
 
 /// Get file content at a given revision and run rustfmt on it.
 fn git_show_and_fmt(repo_dir: &Path, rev: &str, path: &str) -> Result<String, String> {
+    // git-raw-allowed: git_cmd is wrong here on two counts — (1) it trims, but the
+    // raw file bytes must reach rustfmt's stdin unmodified; (2) a non-zero exit is
+    // the NORMAL "path absent at this rev → treat as empty" case below, which
+    // git_cmd would collapse into an Err. Kept raw with the explicit bypass env.
     let show = std::process::Command::new("git")
         .args(["show", &format!("{rev}:{path}")])
         .current_dir(repo_dir)
