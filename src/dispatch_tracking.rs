@@ -271,8 +271,8 @@ pub fn active_target_names(home: &Path) -> Vec<String> {
     names
 }
 
-/// M3: Remove terminal entries (completed/orphaned) older than 30 days.
-/// Prevents unbounded growth of dispatch_tracking.json.
+/// M3: Remove terminal entries (completed/orphaned/no_report_expected) older
+/// than 30 days. Prevents unbounded growth of dispatch_tracking.json.
 pub fn gc_old_entries(home: &Path) {
     const RETENTION_DAYS: i64 = 30;
     let now = chrono::Utc::now();
@@ -281,7 +281,16 @@ pub fn gc_old_entries(home: &Path) {
     // rows, and the next maintenance tick retries. Intentionally not logged.
     let _ = crate::store::mutate_versioned(&store_path(home), |store: &mut DispatchStore| {
         store.entries.retain(|entry| {
-            if entry.status != "completed" && entry.status != "orphaned" {
+            // #2099 follow-up: `no_report_expected` (fire-and-forget) is
+            // terminal-for-GC — it joins this AGE-BASED retention prune so the
+            // row can't linger forever. It is deliberately NOT in
+            // `sweep_terminal_entries` (immediate removal): its audit row is kept
+            // until the 30-day window, unlike completed (dropped at report) /
+            // orphaned (given up at 24h).
+            if entry.status != "completed"
+                && entry.status != "orphaned"
+                && entry.status != "no_report_expected"
+            {
                 return true; // keep active entries
             }
             let delegated = match chrono::DateTime::parse_from_rfc3339(&entry.delegated_at) {
@@ -301,6 +310,10 @@ pub fn gc_old_entries(home: &Path) {
 /// #1727) and would otherwise sit until the 30-day TTL. Called at boot
 /// (`orphan_sweep`) and each retention cycle so terminal rows don't accumulate.
 /// Returns the number removed. Best-effort: a dropped pass just delays pruning.
+///
+/// #2099 follow-up: `no_report_expected` is deliberately NOT swept here — it is
+/// retention-windowed via [`gc_old_entries`], so its audit row must survive to
+/// the 30-day window (this fn removes regardless of age).
 pub fn sweep_terminal_entries(home: &Path) -> usize {
     let mut removed = 0usize;
     let _ = crate::store::mutate_versioned(&store_path(home), |store: &mut DispatchStore| {
@@ -715,6 +728,94 @@ mod tests {
         let entries = store["entries"].as_array().expect("entries");
         assert_eq!(entries.len(), 1, "old entry should be removed: {entries:?}");
         assert_eq!(entries[0]["task_id"], "t-recent");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2099 follow-up: a `no_report_expected` row is terminal-for-GC — pruned
+    /// by gc_old_entries once PAST the 30-day retention window, but KEPT before
+    /// it (the audit row survives the window, mirroring completed/orphaned).
+    #[test]
+    fn gc_prunes_old_no_report_expected_2099() {
+        let home = tmp_home("gc_no_report");
+        track_dispatch(
+            &home,
+            DispatchEntry {
+                task_id: Some("t-old-ff".into()),
+                from: "lead".into(),
+                to: "scout".into(),
+                from_id: None,
+                to_id: None,
+                delegated_at: (chrono::Utc::now() - chrono::Duration::days(31)).to_rfc3339(),
+                status: "no_report_expected".into(),
+            },
+        );
+        track_dispatch(
+            &home,
+            DispatchEntry {
+                task_id: Some("t-recent-ff".into()),
+                from: "lead".into(),
+                to: "scout".into(),
+                from_id: None,
+                to_id: None,
+                delegated_at: chrono::Utc::now().to_rfc3339(),
+                status: "no_report_expected".into(),
+            },
+        );
+        gc_old_entries(&home);
+        let store: serde_json::Value =
+            crate::store::load(&crate::store::store_path(&home, "dispatch_tracking.json"));
+        let entries = store["entries"].as_array().expect("entries");
+        assert_eq!(
+            entries.len(),
+            1,
+            "old fire-and-forget row pruned past window, recent kept: {entries:?}"
+        );
+        assert_eq!(entries[0]["task_id"], "t-recent-ff");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2099 follow-up: `sweep_terminal_entries` (immediate, regardless of age)
+    /// must NOT remove a `no_report_expected` row — that audit row is
+    /// retention-windowed (gc_old_entries owns it). A fresh `completed` row IS
+    /// removed in the same call, proving the deliberate per-status difference.
+    #[test]
+    fn sweep_terminal_keeps_no_report_expected_2099() {
+        let home = tmp_home("sweep_keeps_no_report");
+        track_dispatch(
+            &home,
+            DispatchEntry {
+                task_id: Some("t-ff".into()),
+                from: "lead".into(),
+                to: "scout".into(),
+                from_id: None,
+                to_id: None,
+                delegated_at: chrono::Utc::now().to_rfc3339(),
+                status: "no_report_expected".into(),
+            },
+        );
+        track_dispatch(
+            &home,
+            DispatchEntry {
+                task_id: Some("t-done".into()),
+                from: "lead".into(),
+                to: "dev".into(),
+                from_id: None,
+                to_id: None,
+                delegated_at: chrono::Utc::now().to_rfc3339(),
+                status: "completed".into(),
+            },
+        );
+        let removed = sweep_terminal_entries(&home);
+        assert_eq!(removed, 1, "only the completed row is swept immediately");
+        let store: serde_json::Value =
+            crate::store::load(&crate::store::store_path(&home, "dispatch_tracking.json"));
+        let entries = store["entries"].as_array().expect("entries");
+        assert_eq!(
+            entries.len(),
+            1,
+            "no_report_expected survives the immediate sweep: {entries:?}"
+        );
+        assert_eq!(entries[0]["task_id"], "t-ff");
         std::fs::remove_dir_all(&home).ok();
     }
 
