@@ -893,10 +893,20 @@ mod tests {
         let cmd = config["mcpServers"]["agend-terminal"]["command"]
             .as_str()
             .expect("command str");
-        // In test env, bridge binary doesn't exist → falls back to agend-terminal
+        // Assert on the binary's FILE NAME, not a path substring. `cmd` is an
+        // absolute path; under this repo it always contains "agend-terminal"
+        // (the checkout dir name), so the old `cmd.contains("agend-terminal")`
+        // disjunct was a tautology. The command must be the bridge binary
+        // (`agend-mcp-bridge`) or the `agend-terminal` fallback by filename.
+        let fname = std::path::Path::new(cmd)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("");
+        let stem = fname.strip_suffix(".exe").unwrap_or(fname);
         assert!(
-            cmd.contains("agend-terminal") || cmd.contains("agend-mcp-bridge"),
-            "command must be bridge or fallback, got: {cmd}"
+            stem == "agend-mcp-bridge" || stem == "agend-terminal",
+            "command must be the bridge binary or the agend-terminal fallback, \
+             got filename {fname:?} (full path: {cmd})"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

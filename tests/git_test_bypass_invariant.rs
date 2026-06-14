@@ -28,6 +28,13 @@ const MUTATING: &[&str] = &[
     "\"stash\"",
     "\"rm\"",
     "\"mv\"",
+    // ref-mutating subcommands that go through the shim's ChdirPass redirect —
+    // the canonical bad pattern in tests/common/git_isolated.rs is exactly
+    // `git checkout -b`, which the prior list omitted.
+    "\"checkout\"",
+    "\"switch\"",
+    "\"branch\"",
+    "\"push\"",
 ];
 
 #[test]

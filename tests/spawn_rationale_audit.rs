@@ -259,10 +259,20 @@ fn dispatch_scoped_sweep_sites_have_rationale() {
         ("channel/telegram/inbound.rs", "std::thread::Builder::new()"),
         ("app/telegram_hooks.rs", "std::thread::spawn"),
     ];
-    for (rel_suffix, _expected_substr) in swept_sites {
+    for (rel_suffix, expected_substr) in swept_sites {
         let path = src_root.join(rel_suffix);
         let content = std::fs::read_to_string(&path)
             .unwrap_or_else(|_| panic!("dispatch-scoped file must exist: {}", rel_suffix));
+        // Pin that the spawn site itself is still present (the `_expected_substr`
+        // was previously dead code — never read — so a file could pass on the
+        // strength of an unrelated `fire-and-forget:` comment even after the
+        // tracked spawn was removed).
+        assert!(
+            content.contains(expected_substr),
+            "swept file `{}` must still contain its tracked spawn site `{}`",
+            rel_suffix,
+            expected_substr
+        );
         assert!(
             content.contains("fire-and-forget:"),
             "swept file `{}` must contain at least one `fire-and-forget:` rationale comment",

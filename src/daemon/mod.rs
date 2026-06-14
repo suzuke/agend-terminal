@@ -2340,53 +2340,50 @@ mod tests {
         );
     }
 
+    // These four drive the REAL production `crate::agent::classify_exit` (now
+    // pub(crate)) instead of re-implementing its `match` inline, so a refactor
+    // that reclassifies an exit code is actually caught.
+    use crate::agent::{classify_exit, ExitKind};
+
     #[test]
     fn sigint_130_treated_as_clean_exit() {
         // SIGINT (exit code 130 = 128+2) from /quit in some CLIs must be
         // treated as clean exit, not crash.
-        let exit_code = Some(130_i32);
-        let is_crash = !matches!(exit_code, Some(0) | Some(130));
-        assert!(!is_crash, "exit code 130 (SIGINT) must not be a crash");
-        let is_user_clean = matches!(exit_code, Some(0) | Some(130));
-        assert!(
-            is_user_clean,
-            "exit code 130 must be user-initiated clean exit"
+        assert_eq!(
+            classify_exit(Some(130)),
+            ExitKind::UserExit,
+            "exit code 130 (SIGINT) must be a user-initiated clean exit"
         );
     }
 
     #[test]
     fn sigkill_137_not_clean_exit() {
         // SIGKILL (137) is daemon-initiated, not user /exit.
-        let exit_code = Some(137_i32);
-        let is_user_clean = matches!(exit_code, Some(0) | Some(130));
-        assert!(
-            !is_user_clean,
-            "SIGKILL must NOT be user-initiated clean exit"
+        assert_eq!(
+            classify_exit(Some(137)),
+            ExitKind::SignalKill,
+            "SIGKILL (137) must classify as SignalKill, not a clean UserExit"
         );
     }
 
     #[test]
     fn sigterm_143_not_clean_exit() {
         // SIGTERM (143) is daemon-initiated, not user /exit.
-        let exit_code = Some(143_i32);
-        let is_user_clean = matches!(exit_code, Some(0) | Some(130));
-        assert!(
-            !is_user_clean,
-            "SIGTERM must NOT be user-initiated clean exit"
+        assert_eq!(
+            classify_exit(Some(143)),
+            ExitKind::SignalKill,
+            "SIGTERM (143) must classify as SignalKill, not a clean UserExit"
         );
     }
 
     #[test]
     fn nonzero_exit_is_crash() {
         // Exit code 1 (error) must trigger crash respawn.
-        let exit_code = Some(1_i32);
-        let is_crash = match exit_code {
-            Some(0) | Some(130) => false,
-            Some(137) | Some(143) => false,
-            Some(_) => true,
-            None => true,
-        };
-        assert!(is_crash, "exit code 1 must be a crash");
+        assert_eq!(
+            classify_exit(Some(1)),
+            ExitKind::Crash,
+            "exit code 1 must classify as a crash"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────

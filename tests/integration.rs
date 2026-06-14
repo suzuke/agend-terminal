@@ -701,25 +701,12 @@ fn bridge_rejects_cookie_wrong_permissions() {
     // When permission check is added, this test should verify rejection.
 }
 
-#[test]
-fn bridge_rejects_cookie_mismatch() {
-    // Start daemon, then try to connect with wrong cookie
-    let mut daemon = TestDaemon::start("bridge_mismatch");
-    let port = TestDaemon::find_api_port(&daemon.home).expect("api port");
-    let mut stream =
-        TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).expect("connect");
-    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
-    // Send wrong cookie (all zeros)
-    let fake_hex = "00".repeat(32);
-    writeln!(stream, r#"{{"auth":"{}"}}"#, fake_hex).expect("write");
-    stream.flush().expect("flush");
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    reader.read_line(&mut line).expect("read");
-    let resp: serde_json::Value = serde_json::from_str(line.trim()).expect("parse");
-    assert_eq!(resp["ok"], false, "wrong cookie must be rejected: {resp}");
-    daemon.stop();
-}
+// Removed `bridge_rejects_cookie_mismatch`: it was a strict subset of
+// `test_api_rejects_connection_with_wrong_cookie` (both spawn a daemon, send a
+// valid-hex-but-wrong cookie, and assert `ok == false`, hitting the identical
+// `auth_cookie::server_handshake_ndjson` reject path). The sibling additionally
+// asserts the "auth" error text, so it strictly dominates. Dropped to avoid a
+// redundant daemon spawn.
 
 #[test]
 fn bridge_rejects_malformed_mcp_json() {

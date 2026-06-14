@@ -174,13 +174,13 @@ fn safe_cell_resize_shrink_no_panic() {
     }
     // Shrink terminal — content that was at cols 40-79 is now out of bounds
     client.resize(40, 10);
-    // Read screen after shrink — must not panic
-    let screen = client.screen_text(10);
-    // After resize, some content should still be readable
-    assert!(
-        screen.contains("row") || screen.is_empty(),
-        "screen_text after resize-shrink must not panic and should contain content or be empty: '{screen}'"
-    );
+    // Read screen after shrink — the call itself must not panic on out-of-
+    // bounds cells (the point of this test). The previous assertion here was
+    // `screen.contains("row") || screen.is_empty()` — unfalsifiable (the screen
+    // is always either empty or contains the fed "rowN" content), so it could
+    // never catch a regression; dropped. The no-panic guarantee is the call
+    // completing, and the post-resize functional check is asserted below.
+    let _ = client.screen_text(10);
     // Verify dimensions actually changed by feeding new content
     client.feed(b"after_resize\r\n");
     let screen2 = client.screen_text(5);

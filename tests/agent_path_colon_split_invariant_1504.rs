@@ -22,7 +22,10 @@ fn agent_mod_no_hardcoded_path_colon_split_1504() {
         if t.starts_with("//") || t.starts_with('*') {
             continue;
         }
-        if line.contains(".split(':')") {
+        // Match both the char-literal `.split(':')` and the string-literal
+        // `.split(":")` form — `str::split` takes any Pattern, so the
+        // double-quoted spelling shreds a Windows `C:\...` PATH identically.
+        if line.contains(".split(':')") || line.contains(".split(\":\")") {
             violations.push(format!("{}: {}", i + 1, line.trim()));
         }
     }
