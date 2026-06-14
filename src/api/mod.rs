@@ -547,6 +547,7 @@ fn handle_session(
         } else {
             request_dedup::global().dispatch(
                 request_id,
+                request_dedup::operation_fingerprint(method, params),
                 request_dedup::method_wait_timeout(method, params),
                 || match method {
                     method::LIST => handlers::query::handle_list(params, &ctx),

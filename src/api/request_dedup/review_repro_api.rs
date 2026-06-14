@@ -39,7 +39,7 @@ fn zero_byte_oversized_entries_are_count_bounded_api() {
     const N: usize = 20_000;
     for i in 0..N {
         let id = format!("oversized-{i}");
-        let resp = cache.dispatch(Some(&id), Duration::from_secs(5), || {
+        let resp = cache.dispatch(Some(&id), 0, Duration::from_secs(5), || {
             // Encodes to well over the 10-byte per-entry cap → Oversized.
             json!({"big": "xxxxxxxxxxxxxxxxxxxx"})
         });

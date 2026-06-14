@@ -105,6 +105,12 @@ enum EntryState {
 
 struct Entry {
     state: EntryState,
+    /// Canonical `(method, params)` fingerprint of the operation that
+    /// FIRST registered this `request_id`. A later dispatch reusing the
+    /// same id but carrying a DIFFERENT fingerprint is a request-id
+    /// collision across distinct operations — fail-closed (reject) rather
+    /// than return this entry's stale result. See `operation_fingerprint`.
+    fingerprint: u64,
     /// `None` while the handler is still in flight; set to `Some(now)`
     /// when the in-progress guard transitions the entry to a terminal
     /// state. Drives both TTL eviction and overflow-policy ordering.
@@ -162,7 +168,21 @@ impl DedupCache {
     ///   Condvar (up to `wait_timeout`) and observe the first thread's
     ///   response. Later duplicates within the TTL window return the
     ///   cached response without dispatching.
-    pub fn dispatch<F>(&self, request_id: Option<&str>, wait_timeout: Duration, handler: F) -> Value
+    ///
+    /// `fingerprint` is the caller's canonical `(method, params)` hash
+    /// (see [`operation_fingerprint`]). It guards against a `request_id`
+    /// being reused for a DIFFERENT operation: if the id is already known
+    /// but the fingerprint differs, the call is rejected fail-closed with
+    /// [`dup_mismatch_error`] rather than returning the original (stale)
+    /// operation's cached result. A genuine retry re-sends the SAME
+    /// envelope → identical fingerprint → normal dedup (idempotent #842).
+    pub fn dispatch<F>(
+        &self,
+        request_id: Option<&str>,
+        fingerprint: u64,
+        wait_timeout: Duration,
+        handler: F,
+    ) -> Value
     where
         F: FnOnce() -> Value,
     {
@@ -173,12 +193,13 @@ impl DedupCache {
 
         // First lookup — either we register Fresh (and run the handler),
         // or we observe a terminal state, or we attach as a waiter.
-        let action = self.check_or_register(&id);
+        let action = self.check_or_register(&id, fingerprint);
         match action {
             CheckOutcome::Cached(v) => v,
             CheckOutcome::Oversized => oversized_error(),
             CheckOutcome::Errored(detail) => handler_errored(&detail),
             CheckOutcome::OverCap => in_progress_error(),
+            CheckOutcome::Mismatch => dup_mismatch_error(),
             CheckOutcome::Wait(handle) => self.wait_for(&id, handle, wait_timeout),
             CheckOutcome::Fresh => {
                 let mut guard = InProgressGuard {
@@ -193,7 +214,7 @@ impl DedupCache {
         }
     }
 
-    fn check_or_register(&self, id: &str) -> CheckOutcome {
+    fn check_or_register(&self, id: &str, fingerprint: u64) -> CheckOutcome {
         let mut inner = self.inner.lock().expect("dedup inner mutex");
         match inner.entries.get_mut(id) {
             None => {
@@ -202,12 +223,28 @@ impl DedupCache {
                     id.to_string(),
                     Entry {
                         state: EntryState::InProgress(handle),
+                        fingerprint,
                         completed_at: None,
                         response_bytes: 0,
                         waiter_count: 0,
                     },
                 );
                 CheckOutcome::Fresh
+            }
+            // Fail-closed: a known id whose operation fingerprint differs is
+            // a request-id collision across distinct operations. Reject
+            // rather than serve this entry's stale result OR re-execute the
+            // new operation under the wrong cache slot. Checked BEFORE the
+            // state branch so it covers cached/oversized/errored/in-progress
+            // uniformly (an in-flight mismatch must not attach as a waiter —
+            // it would observe the wrong operation's response).
+            Some(entry) if entry.fingerprint != fingerprint => {
+                tracing::warn!(
+                    request_id = id,
+                    "request_dedup fingerprint mismatch — same request_id reused \
+                     for a different operation; rejecting fail-closed"
+                );
+                CheckOutcome::Mismatch
             }
             Some(entry) => match &entry.state {
                 EntryState::Cached(v) => CheckOutcome::Cached(v.clone()),
@@ -399,6 +436,8 @@ enum CheckOutcome {
     Oversized,
     Errored(String),
     OverCap,
+    /// Known id, different operation fingerprint → fail-closed reject.
+    Mismatch,
 }
 
 // ---------------------------------------------------------------------------
@@ -444,6 +483,67 @@ impl Drop for InProgressGuard<'_> {
 
 fn estimated_bytes(v: &Value) -> usize {
     serde_json::to_string(v).map(|s| s.len()).unwrap_or(0)
+}
+
+/// Canonical structural fingerprint of an operation `(method, params)`.
+///
+/// Used by [`DedupCache::dispatch`] to detect a `request_id` reused across
+/// distinct operations (the bridge generates one UUIDv4 per *logical*
+/// request and re-sends the SAME envelope on retry, so a genuine retry
+/// always yields an identical fingerprint).
+///
+/// Object keys are folded in SORTED order so two params payloads that
+/// differ only in key ordering — e.g. a retry where the bridge
+/// re-serialized `{"a":1,"b":2}` as `{"b":2,"a":1}` — hash identically and
+/// are NOT misclassified as a mismatch. Arrays remain order-sensitive
+/// (element order is semantically significant). A per-variant type tag
+/// guards against cross-type aliasing (string `"1"` vs number `1`, null
+/// vs bool, …). `DefaultHasher` (SipHash, fixed keys) is deterministic for
+/// the daemon's lifetime, which is all the dedup window requires.
+pub fn operation_fingerprint(method: &str, params: &Value) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    method.hash(&mut hasher);
+    hash_value_canonical(params, &mut hasher);
+    hasher.finish()
+}
+
+fn hash_value_canonical<H: std::hash::Hasher>(v: &Value, h: &mut H) {
+    use std::hash::Hash;
+    match v {
+        Value::Null => 0u8.hash(h),
+        Value::Bool(b) => {
+            1u8.hash(h);
+            b.hash(h);
+        }
+        Value::Number(n) => {
+            2u8.hash(h);
+            // `to_string` is the canonical scalar form (handles i64/u64/f64
+            // uniformly and is stable across serde_json's number repr).
+            n.to_string().hash(h);
+        }
+        Value::String(s) => {
+            3u8.hash(h);
+            s.hash(h);
+        }
+        Value::Array(arr) => {
+            4u8.hash(h);
+            arr.len().hash(h);
+            for item in arr {
+                hash_value_canonical(item, h);
+            }
+        }
+        Value::Object(map) => {
+            5u8.hash(h);
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort_unstable();
+            keys.len().hash(h);
+            for k in keys {
+                k.hash(h);
+                hash_value_canonical(&map[k], h);
+            }
+        }
+    }
 }
 
 /// Process-global cache used by `src/api/mod.rs::handle_session`.
@@ -527,6 +627,17 @@ pub(crate) fn handler_errored(detail: &str) -> Value {
     })
 }
 
+/// Fail-closed envelope returned when a `request_id` is reused for an
+/// operation whose fingerprint differs from the one that first registered
+/// it. The new operation is neither served the original's stale result nor
+/// silently re-executed — the caller must resubmit with a fresh id.
+pub(crate) fn dup_mismatch_error() -> Value {
+    json!({
+        "ok": false,
+        "error": "request_id reused for a different operation (fingerprint mismatch); resubmit with a fresh request_id"
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -564,13 +675,13 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
 
         let c1 = Arc::clone(&count);
-        let resp1 = cache.dispatch(Some("req-A"), Duration::from_secs(5), move || {
+        let resp1 = cache.dispatch(Some("req-A"), 0, Duration::from_secs(5), move || {
             c1.fetch_add(1, Ordering::SeqCst);
             json!({"ok": true, "n": 1})
         });
 
         let c2 = Arc::clone(&count);
-        let resp2 = cache.dispatch(Some("req-A"), Duration::from_secs(5), move || {
+        let resp2 = cache.dispatch(Some("req-A"), 0, Duration::from_secs(5), move || {
             c2.fetch_add(1, Ordering::SeqCst);
             json!({"ok": true, "n": 2})
         });
@@ -592,13 +703,13 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
 
         let c1 = Arc::clone(&count);
-        cache.dispatch(Some("req-B1"), Duration::from_secs(5), move || {
+        cache.dispatch(Some("req-B1"), 0, Duration::from_secs(5), move || {
             c1.fetch_add(1, Ordering::SeqCst);
             json!({})
         });
 
         let c2 = Arc::clone(&count);
-        cache.dispatch(Some("req-B2"), Duration::from_secs(5), move || {
+        cache.dispatch(Some("req-B2"), 0, Duration::from_secs(5), move || {
             c2.fetch_add(1, Ordering::SeqCst);
             json!({})
         });
@@ -617,7 +728,7 @@ mod tests {
         let c = Arc::clone(&cache);
         let cnt = Arc::clone(&count);
         let t1 = thread::spawn(move || {
-            c.dispatch(Some("req-C"), Duration::from_secs(5), move || {
+            c.dispatch(Some("req-C"), 0, Duration::from_secs(5), move || {
                 cnt.fetch_add(1, Ordering::SeqCst);
                 thread::sleep(Duration::from_millis(200));
                 json!({"slow": "first"})
@@ -639,7 +750,7 @@ mod tests {
         let c2 = Arc::clone(&cache);
         let cnt2 = Arc::clone(&count);
         let t2 = thread::spawn(move || {
-            c2.dispatch(Some("req-C"), Duration::from_secs(5), move || {
+            c2.dispatch(Some("req-C"), 0, Duration::from_secs(5), move || {
                 cnt2.fetch_add(1, Ordering::SeqCst);
                 json!({"slow": "second-should-not-run"})
             })
@@ -666,7 +777,7 @@ mod tests {
         let c = Arc::clone(&cache);
         let t1 = thread::spawn(move || {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                c.dispatch(Some("req-D"), Duration::from_secs(5), || {
+                c.dispatch(Some("req-D"), 0, Duration::from_secs(5), || {
                     panic!("simulated handler panic");
                 })
             }))
@@ -678,7 +789,7 @@ mod tests {
         let exec_count = Arc::new(AtomicUsize::new(0));
         let ec = Arc::clone(&exec_count);
         let t2 = thread::spawn(move || {
-            c2.dispatch(Some("req-D"), Duration::from_secs(5), move || {
+            c2.dispatch(Some("req-D"), 0, Duration::from_secs(5), move || {
                 ec.fetch_add(1, Ordering::SeqCst);
                 json!({"never": "ran"})
             })
@@ -707,7 +818,7 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
 
         let c1 = Arc::clone(&count);
-        let resp1 = cache.dispatch(Some("req-E"), Duration::from_secs(5), move || {
+        let resp1 = cache.dispatch(Some("req-E"), 0, Duration::from_secs(5), move || {
             c1.fetch_add(1, Ordering::SeqCst);
             json!({"big": "x".repeat(500)})
         });
@@ -718,7 +829,7 @@ mod tests {
         );
 
         let c2 = Arc::clone(&count);
-        let resp2 = cache.dispatch(Some("req-E"), Duration::from_secs(5), move || {
+        let resp2 = cache.dispatch(Some("req-E"), 0, Duration::from_secs(5), move || {
             c2.fetch_add(1, Ordering::SeqCst);
             json!({"never": "ran"})
         });
@@ -742,7 +853,7 @@ mod tests {
 
         for _ in 0..3 {
             let c = Arc::clone(&count);
-            cache.dispatch(None, Duration::from_secs(5), move || {
+            cache.dispatch(None, 0, Duration::from_secs(5), move || {
                 c.fetch_add(1, Ordering::SeqCst);
                 json!({})
             });
@@ -765,8 +876,18 @@ mod tests {
             TOTAL_CAP_BYTES,
             WAITER_CAP,
         );
-        cache.dispatch(Some("old-1"), Duration::from_secs(5), || json!({"k": "v"}));
-        cache.dispatch(Some("old-2"), Duration::from_secs(5), || json!({"k": "v"}));
+        cache.dispatch(
+            Some("old-1"),
+            0,
+            Duration::from_secs(5),
+            || json!({"k": "v"}),
+        );
+        cache.dispatch(
+            Some("old-2"),
+            0,
+            Duration::from_secs(5),
+            || json!({"k": "v"}),
+        );
         assert_eq!(cache.len(), 2);
 
         // Move time forward past TTL.
@@ -792,7 +913,7 @@ mod tests {
         // T1 holding InProgress while T4 dispatches, NOT coordination.
         let c = Arc::clone(&cache);
         let t1 = thread::spawn(move || {
-            c.dispatch(Some("req-cap"), Duration::from_secs(5), || {
+            c.dispatch(Some("req-cap"), 0, Duration::from_secs(5), || {
                 thread::sleep(Duration::from_millis(300));
                 json!({"first": true})
             })
@@ -812,11 +933,11 @@ mod tests {
         // T2 + T3 fill the waiter slots.
         let c2 = Arc::clone(&cache);
         let t2 = thread::spawn(move || {
-            c2.dispatch(Some("req-cap"), Duration::from_secs(5), || json!({}))
+            c2.dispatch(Some("req-cap"), 0, Duration::from_secs(5), || json!({}))
         });
         let c3 = Arc::clone(&cache);
         let t3 = thread::spawn(move || {
-            c3.dispatch(Some("req-cap"), Duration::from_secs(5), || json!({}))
+            c3.dispatch(Some("req-cap"), 0, Duration::from_secs(5), || json!({}))
         });
         // #868 hardening — wait for T2 + T3 to attach as waiters
         // (increment `waiter_count` to the cap) before dispatching T4.
@@ -838,6 +959,7 @@ mod tests {
         let started = Instant::now();
         let resp4 = cache.dispatch(
             Some("req-cap"),
+            0,
             Duration::from_secs(5),
             || json!({"never": "ran"}),
         );
@@ -868,11 +990,11 @@ mod tests {
         // (`{"k":"v"}`), so a per-entry/total budget around 20 bytes is
         // tight enough to trigger eviction on the third insert.
         let cache = DedupCache::with_caps(TTL, 64 * 1024, 20, WAITER_CAP);
-        cache.dispatch(Some("e1"), Duration::from_secs(5), || json!({"k": "v"}));
+        cache.dispatch(Some("e1"), 0, Duration::from_secs(5), || json!({"k": "v"}));
         thread::sleep(Duration::from_millis(2));
-        cache.dispatch(Some("e2"), Duration::from_secs(5), || json!({"k": "v"}));
+        cache.dispatch(Some("e2"), 0, Duration::from_secs(5), || json!({"k": "v"}));
         thread::sleep(Duration::from_millis(2));
-        cache.dispatch(Some("e3"), Duration::from_secs(5), || json!({"k": "v"}));
+        cache.dispatch(Some("e3"), 0, Duration::from_secs(5), || json!({"k": "v"}));
         // After eviction we expect at most 2 entries.
         let len = cache.len();
         assert!(
@@ -943,6 +1065,141 @@ mod tests {
             DEFAULT_WAIT_TIMEOUT,
             "unknown method falls back to DEFAULT_WAIT_TIMEOUT"
         );
+    }
+
+    /// (g) Seam A repro — a `request_id` reused for a DIFFERENT operation
+    /// must be rejected fail-closed, NOT served the first op's stale cached
+    /// result. CR-2026-06-14 finding (api/mod.rs:529-548): pre-fix the cache
+    /// keyed on id alone, so op2 with the same id observed op1's response
+    /// (stale, RED); post-fix the fingerprint mismatch returns a
+    /// deterministic error and op2's handler never runs (GREEN).
+    #[test]
+    fn g_same_id_different_op_rejects_fail_closed() {
+        let cache = DedupCache::default();
+        let fp_op1 = operation_fingerprint("send", &json!({"to": "alice", "msg": "hi"}));
+        let fp_op2 = operation_fingerprint("kill", &json!({"instance": "bob"}));
+        assert_ne!(
+            fp_op1, fp_op2,
+            "distinct operations must fingerprint differently"
+        );
+
+        let op2_ran = Arc::new(AtomicUsize::new(0));
+
+        let resp1 = cache.dispatch(
+            Some("collide"),
+            fp_op1,
+            Duration::from_secs(5),
+            || json!({"ok": true, "op": "send"}),
+        );
+        assert_eq!(resp1["op"], "send");
+
+        let ran = Arc::clone(&op2_ran);
+        let resp2 = cache.dispatch(Some("collide"), fp_op2, Duration::from_secs(5), move || {
+            ran.fetch_add(1, Ordering::SeqCst);
+            json!({"ok": true, "op": "kill"})
+        });
+
+        // Fail-closed: neither op1's stale result nor a silent re-exec of op2.
+        assert_eq!(
+            op2_ran.load(Ordering::SeqCst),
+            0,
+            "mismatched-fingerprint op must NOT execute under the colliding id"
+        );
+        assert_ne!(
+            resp2, resp1,
+            "must NOT return op1's stale cached response (the bug)"
+        );
+        assert_eq!(
+            resp2["ok"],
+            json!(false),
+            "expected fail-closed error envelope, got {resp2:?}"
+        );
+        assert!(
+            resp2["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("fingerprint mismatch"),
+            "expected fingerprint-mismatch error, got {resp2:?}"
+        );
+    }
+
+    /// (h) Control for (g) / #842 — a GENUINE retry re-sends the SAME
+    /// envelope (identical fingerprint), so dedup still fires: the handler
+    /// runs once and the retry observes the cached response. The Seam A
+    /// guard must not break legitimate idempotent retry.
+    #[test]
+    fn h_same_id_same_fp_idempotent_retry_still_cached() {
+        let cache = DedupCache::default();
+        let fp = operation_fingerprint("send", &json!({"to": "alice", "msg": "hi"}));
+        let count = Arc::new(AtomicUsize::new(0));
+
+        let c1 = Arc::clone(&count);
+        let resp1 = cache.dispatch(Some("retry-X"), fp, Duration::from_secs(5), move || {
+            c1.fetch_add(1, Ordering::SeqCst);
+            json!({"ok": true, "n": 1})
+        });
+        let c2 = Arc::clone(&count);
+        let resp2 = cache.dispatch(Some("retry-X"), fp, Duration::from_secs(5), move || {
+            c2.fetch_add(1, Ordering::SeqCst);
+            json!({"ok": true, "n": 2})
+        });
+
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "idempotent retry must run handler exactly once"
+        );
+        assert_eq!(resp1, resp2, "retry must observe the cached response");
+        assert_eq!(resp1["n"], 1);
+    }
+
+    /// (i) Canonical fingerprint — a retry whose params object carries the
+    /// SAME keys in a DIFFERENT order must hash identically (object keys
+    /// folded in sorted order), so it dedupes as the same operation rather
+    /// than tripping a false mismatch.
+    #[test]
+    fn i_key_reorder_same_fingerprint_dedupes() {
+        let a = json!({"alpha": 1, "beta": [1, 2], "gamma": {"x": true, "y": false}});
+        let b = json!({"gamma": {"y": false, "x": true}, "beta": [1, 2], "alpha": 1});
+        let fp_a = operation_fingerprint("update", &a);
+        let fp_b = operation_fingerprint("update", &b);
+        assert_eq!(
+            fp_a, fp_b,
+            "key-reordered params must yield the same fingerprint"
+        );
+
+        let cache = DedupCache::default();
+        let count = Arc::new(AtomicUsize::new(0));
+        let c1 = Arc::clone(&count);
+        cache.dispatch(Some("reorder"), fp_a, Duration::from_secs(5), move || {
+            c1.fetch_add(1, Ordering::SeqCst);
+            json!({"ok": true})
+        });
+        let c2 = Arc::clone(&count);
+        let resp2 = cache.dispatch(Some("reorder"), fp_b, Duration::from_secs(5), move || {
+            c2.fetch_add(1, Ordering::SeqCst);
+            json!({"ok": true})
+        });
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "reordered retry must dedup, not re-run"
+        );
+        assert_eq!(
+            resp2["ok"],
+            json!(true),
+            "reordered retry returns cached success, not a mismatch error"
+        );
+    }
+
+    /// (j) Arrays stay order-sensitive — reordering array elements is a
+    /// semantically different payload and MUST change the fingerprint
+    /// (guards against the canonical-key sort over-collapsing distinct ops).
+    #[test]
+    fn j_array_order_changes_fingerprint() {
+        let fp1 = operation_fingerprint("x", &json!({"items": [1, 2, 3]}));
+        let fp2 = operation_fingerprint("x", &json!({"items": [3, 2, 1]}));
+        assert_ne!(fp1, fp2, "array element order must affect the fingerprint");
     }
 }
 
