@@ -2131,3 +2131,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod review_repro_app_tui;

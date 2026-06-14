@@ -1297,3 +1297,6 @@ mod tests {
         assert_eq!(scroll, 10);
     }
 }
+
+#[cfg(test)]
+mod review_repro_app_tui;

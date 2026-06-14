@@ -136,3 +136,22 @@ mod p0b_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod instance_964_tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod review_repro_mcp_core_surface;
+
+// Re-homed here (not in ci/mod.rs / dispatch_hook/mod.rs) to keep those
+// KNOWN_OVERSIZED handler files under their file_size_invariant ceilings —
+// same precedent as instance_964_tests above. The tests reach the handlers'
+// pub(crate) entry points via absolute `crate::` paths.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "ci/review_repro_mcp_ci_worktree.rs"]
+mod review_repro_mcp_ci_worktree;
+
+// no outer allow here: the file carries its own `#![allow(clippy::expect_used)]`
+// and uses no `.unwrap()`, so an outer dup would trip `duplicated_attributes`.
+#[cfg(test)]
+#[path = "dispatch_hook/review_repro_mcp_dispatch_comms.rs"]
+mod review_repro_mcp_dispatch_hook;

@@ -1255,3 +1255,6 @@ fn is_short_form_repo(repo: &str) -> bool {
         && !repo.contains('.')
         && !repo.contains(':')
 }
+
+#[cfg(test)]
+mod review_repro_daemon_ci_pr;
