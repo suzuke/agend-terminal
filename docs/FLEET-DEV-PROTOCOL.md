@@ -534,6 +534,23 @@ Task state changes emit to Telegram. Instance lifecycle events (non-fleet.yaml o
 ### Supervisor Notify
 Daemon detects agent entering error state (UsageLimit/RateLimit/Hang/Crashed/AuthError/PermissionPrompt) → notifies orchestrator. 60s debounce per agent.
 
+### 9.1 Context-Full Self-Restart (Sprint 63, empirically validated 2026-06-15)
+
+When an agent (especially a lead/orchestrator) detects its own context approaching full (~80-85%; the pane footer shows `N% context used`), it restarts **itself** — the daemon performs the kill+respawn; no second agent is required to trigger it.
+
+- **`mode="fresh"`, never `resume`** — `resume` reloads the full prior context, giving zero relief. Only `restart_instance(instance=<self>, mode="fresh")` starts clean.
+- **Procedure**:
+  1. Land all live state on durable stores **before** restarting — update `SESSION-HANDOFF.md` to current (handoff entry point, in-flight PRs, merge procedure, member status, pending dispatches, decisions), post any open `decision`s, ensure work is on the `task` board. Nothing may depend on in-memory context.
+  2. **Self-schedule a kick** so the fresh instance auto-resumes (a fresh boot otherwise sits idle indefinitely — nothing starts it). Before restarting:
+     `schedule(action="create", instance=<self>, run_at=<now + ~90s, ISO 8601>, message="resume: read SESSION-HANDOFF.md + MEMORY.md and continue", label="self-restart-kick")`.
+     The schedule is daemon-side and keyed by instance name, so it survives the restart; the one-shot fires ~90s after respawn and wakes the fresh self to continue. (Delete it after resuming, or let the one-shot auto-complete.)
+  3. Pick a lull — never mid-merge or mid-step of an irreversible action.
+  4. Call `restart_instance(instance=<self>, mode="fresh", reason="context-full self-restart")`.
+  5. The daemon cleanly kills the process (`delete: child exited cleanly`) and respawns it fresh (Ctx 0.0%). On boot the SessionStart hook auto-loads `MEMORY.md`; the fresh self reads `SESSION-HANDOFF.md` and continues.
+- **The one caveat (and its mitigation)**: the self-restart call's response never returns (the caller's process is gone), so no external party confirms the fresh instance booted. Mitigation: handoff + `MEMORY.md` auto-load make the fresh self self-sufficient. A peer (e.g. `general`) is **optional** for a post-restart liveness confirm but is **no longer required to trigger** the restart — this supersedes the earlier "ask general to fresh-restart you" convention (delegation is now confirm-only, not the trigger path).
+
+**Empirical basis**: validated 2026-06-15 — an agent called `restart_instance(self, mode="fresh")`; daemon logs showed the tool call → `delete: child exited cleanly` → fresh respawn at Ctx 0.0% with no prior-context memory. A second agent is not part of the mechanism. Also validated 2026-06-15 — the fresh instance sat idle ~80s doing nothing, then the self-scheduled one-shot kick fired (`schedule_trigger`) and it resumed, with zero peer involvement.
+
 ## §10. Git Workflow
 
 - Never commit directly to main; always use worktree + branch
