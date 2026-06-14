@@ -752,11 +752,16 @@ fn delegate_task_idempotent_existing_watch() {
     );
     assert!(r2.is_ok(), "re-dispatch must succeed: {:?}", r2.err());
 
-    // ci-watches dir must still contain exactly one entry.
+    // ci-watches dir must still contain exactly one *watch* entry. Count
+    // only `.json` watch files — the `.lock` sidecar that
+    // `handle_watch_ci`'s RMW flock leaves behind (#2165 H5) is a legitimate
+    // co-resident artifact, not a watch (prod registry.rs filters on
+    // `.json` the same way).
     let ci_dir = crate::daemon::ci_watch::ci_watches_dir(&home);
     let entry_count = std::fs::read_dir(&ci_dir)
         .expect("read ci-watches")
         .flatten()
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"))
         .count();
     assert_eq!(entry_count, 1, "must remain exactly one watch entry");
 
