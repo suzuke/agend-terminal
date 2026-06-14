@@ -37,8 +37,10 @@ final-status-level = "slow"
 #     daemon::{retention::worktrees,pr_state,auto_release,conflict_notify,
 #     per_tick::tmp_review_gc}, bootstrap::{agent_resolve,canonical_hygiene}.
 #  2. NAMED tests in otherwise-pure modules (messaging 2/47, tasks::tests 1/78,
-#     task_sweep, mcp::handlers::tests checkout_repo_*) — targeted by name so the
-#     ~200 pure-logic tests around them stay parallel.
+#     task_sweep `closes_markers_…` + `resolve_sweep_boards_pairs_…_2117_p2`
+#     [#2117 P2: builds 2 real git repos for the per-board sweep enumeration],
+#     mcp::handlers::tests checkout_repo_*) — targeted by name so the ~200
+#     pure-logic tests around them stay parallel.
 [test-groups]
 git-subprocess = { max-threads = 1 }
 
@@ -54,11 +56,11 @@ test-group = 'git-subprocess'
 slow-timeout = { period = "120s", terminate-after = 3 }
 
 [[profile.ci.overrides]]
-filter = 'test(/(^(worktree_pool|admin|mcp::handlers::(ci|dispatch_hook|force_release|worktree|p0b_tests)|daemon::(retention::worktrees|pr_state|auto_release|conflict_notify|per_tick::tmp_review_gc)|bootstrap::(agent_resolve|canonical_hygiene))::|checkout_repo_|dispatch_branch_skips_metadata_stub|send_with_branch_checkout_failure|task_done_cleans_post_lease|closes_markers_extract_cleanly_from_actual_main)/)'
+filter = 'test(/(^(worktree_pool|admin|mcp::handlers::(ci|dispatch_hook|force_release|worktree|p0b_tests)|daemon::(retention::worktrees|pr_state|auto_release|conflict_notify|per_tick::tmp_review_gc)|bootstrap::(agent_resolve|canonical_hygiene))::|checkout_repo_|dispatch_branch_skips_metadata_stub|send_with_branch_checkout_failure|task_done_cleans_post_lease|closes_markers_extract_cleanly_from_actual_main|resolve_sweep_boards_pairs_each_project_with_its_own_repo_2117_p2)/)'
 test-group = 'git-subprocess'
 
 # Local `default` profile has no terminate-after, so no false-kill risk — just
 # serialize the same cluster for parity with CI.
 [[profile.default.overrides]]
-filter = 'test(/(^(worktree_pool|admin|mcp::handlers::(ci|dispatch_hook|force_release|worktree|p0b_tests)|daemon::(retention::worktrees|pr_state|auto_release|conflict_notify|per_tick::tmp_review_gc)|bootstrap::(agent_resolve|canonical_hygiene))::|checkout_repo_|dispatch_branch_skips_metadata_stub|send_with_branch_checkout_failure|task_done_cleans_post_lease|closes_markers_extract_cleanly_from_actual_main)/)'
+filter = 'test(/(^(worktree_pool|admin|mcp::handlers::(ci|dispatch_hook|force_release|worktree|p0b_tests)|daemon::(retention::worktrees|pr_state|auto_release|conflict_notify|per_tick::tmp_review_gc)|bootstrap::(agent_resolve|canonical_hygiene))::|checkout_repo_|dispatch_branch_skips_metadata_stub|send_with_branch_checkout_failure|task_done_cleans_post_lease|closes_markers_extract_cleanly_from_actual_main|resolve_sweep_boards_pairs_each_project_with_its_own_repo_2117_p2)/)'
 test-group = 'git-subprocess'
