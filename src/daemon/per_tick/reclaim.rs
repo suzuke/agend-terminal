@@ -30,6 +30,7 @@
 
 use super::{PerTickHandler, TickContext};
 use crate::state::AgentState;
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
@@ -141,6 +142,24 @@ impl ReclaimHandler {
             work_stuck_latch,
         }
     }
+
+    /// Test-only constructor with an explicit `created_at` so the boot-grace gate
+    /// can be put past its window (mirrors `InboxStuckHandler::new_at`).
+    #[cfg(test)]
+    fn new_at(
+        every_n_ticks: u64,
+        work_stuck_latch: super::inbox_stuck::AlertLatch,
+        created_at: std::time::Instant,
+    ) -> Self {
+        Self {
+            gate: crate::daemon::cadence_gate::CadenceGate::new_with_boot_grace_at(
+                every_n_ticks,
+                created_at,
+                super::NOTIFICATION_BOOT_GRACE,
+            ),
+            work_stuck_latch,
+        }
+    }
 }
 
 /// Per-agent reclaim decision + action (the unit the registry loop drives, and
@@ -161,6 +180,111 @@ fn reclaim_if_eligible(
         return 0;
     }
     do_reclaim(home, latch, agent, remaining, now)
+}
+
+/// #2127 Phase 2: re-route the reclaimed agent's pending inbox dispatches by
+/// NOTIFYING each original dispatcher (`from`) — NOT by moving inbox messages
+/// (dialectic d-…082717: avoid new inbox-move plumbing). `dispatch_tracking` is
+/// the authoritative "who dispatched to A" record (task AND query), so no inbox
+/// enumeration is needed. Notify kind is `update` (FYI, DP2 — not `query`, which
+/// would seed a fresh dispatch-stuck nag on the dispatcher). DP3: a dispatcher
+/// that is ITSELF blocked/usage_limit gets its dead inbox SKIPPED — escalate its
+/// team orchestrator (fallback: operator escalation channel). DP4: remove the
+/// entries after notifying (fire-once — next scan re-routes nothing). Returns
+/// (rerouted, escalated). MUST run BEFORE `do_reclaim`'s board-task cascade, which
+/// removes the board-task dispatch_tracking entries.
+fn reroute_dispatches(
+    home: &Path,
+    agent: &str,
+    blocked: &HashSet<String>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (usize, usize) {
+    // DP4: atomically take+remove the pending dispatches in ONE locked RMW —
+    // fire-once and race-free (no snapshot-then-remove window where a concurrent
+    // dispatch is removed without being notified). Notify the returned entries
+    // below; if the daemon dies mid-notify the work is still released by Phase 1.
+    let entries = crate::dispatch_tracking::take_pending_dispatchers_to(home, agent);
+    if entries.is_empty() {
+        return (0, 0);
+    }
+    let mut rerouted = 0usize;
+    let mut escalated = 0usize;
+    for e in &entries {
+        let from = e.from.as_str();
+        let id_ref = match e.task_id.as_deref() {
+            Some(t) => format!("<{t}>"),
+            None => "(query, 無 task_id)".to_string(),
+        };
+        let msg = format!(
+            "#2127 你派給 {agent} 的 dispatch {id_ref} 因 {agent} 進入 usage_limit 已被回收 — \
+             若為 task,已釋回 Open(請重派);若為 query,{agent} 不會回覆(請改問)。\
+             請改派/改問同 role 的 healthy peer。"
+        );
+        if blocked.contains(from) {
+            // DP3: the dispatcher is itself blocked — its inbox is useless. Escalate
+            // its TEAM ORCHESTRATOR (member→team→orchestrator via find_team_for —
+            // `resolve_team_orchestrator` keys on a TEAM name, not an agent, so it
+            // would never resolve a member's orchestrator — reviewer-4 #2142).
+            // Fallback: operator escalation channel.
+            let orch = crate::teams::find_team_for(home, from)
+                .and_then(|t| t.orchestrator)
+                .filter(|o| o != from && !blocked.contains(o));
+            match orch {
+                Some(o) => {
+                    if let Err(err) = crate::inbox::enqueue(
+                        home,
+                        &o,
+                        crate::inbox::InboxMessage::new_system(
+                            "system:reclaim_usage_limit",
+                            "update",
+                            format!("{msg}(原 dispatcher {from} 自身 usage_limit,轉知團隊 orchestrator)"),
+                        ),
+                    ) {
+                        tracing::warn!(orchestrator = %o, error = %err, "#2127 P2 escalate enqueue failed");
+                    }
+                }
+                None => {
+                    crate::channel::notify_all_escalation_channels(
+                        from,
+                        crate::channel::NotifySeverity::Warn,
+                        &msg,
+                        false,
+                    );
+                }
+            }
+            escalated += 1;
+        } else {
+            // Follow-up (b): count `rerouted` only on a SUCCESSFUL enqueue — a
+            // best-effort IO failure is logged, not counted (no false success).
+            match crate::inbox::enqueue(
+                home,
+                from,
+                crate::inbox::InboxMessage::new_system("system:reclaim_usage_limit", "update", msg),
+            ) {
+                Ok(()) => rerouted += 1,
+                Err(err) => {
+                    tracing::warn!(%from, error = %err, "#2127 P2 reroute notify enqueue failed (best-effort, not counted)")
+                }
+            }
+        }
+    }
+    instrument(
+        home,
+        serde_json::json!({
+            "ts": now.to_rfc3339(),
+            "event": "inbox_reroute",
+            "agent": agent,
+            "rerouted": rerouted,
+            "escalated": escalated,
+        }),
+    );
+    tracing::warn!(
+        agent,
+        rerouted,
+        escalated,
+        "#2127 P2 re-routed pending dispatches to original dispatchers"
+    );
+    (rerouted, escalated)
 }
 
 /// Release the agent's claimed/in-progress board tasks back to Open + cascade.
@@ -374,6 +498,9 @@ impl PerTickHandler for ReclaimHandler {
         let recovery_window = crate::state::SERVER_RATE_LIMIT_RECOVERY_SILENCE;
         let mut eligible: Vec<(String, AgentState, bool)> = Vec::new();
         let mut recovered_agents: Vec<String> = Vec::new();
+        // #2127 P2: the set of usage-limit/blocked agents this tick — a dispatcher
+        // in this set has a dead inbox, so re-route escalates instead (DP3).
+        let mut blocked: HashSet<String> = HashSet::new();
         {
             let reg = crate::agent::lock_registry(ctx.registry);
             for handle in reg.values() {
@@ -387,6 +514,7 @@ impl PerTickHandler for ReclaimHandler {
                 let recovered = core.state.recovered_within(recovery_window);
                 drop(core);
                 if (state == AgentState::UsageLimit || quota) && !is_excluded_state(state) {
+                    blocked.insert(name.clone());
                     eligible.push((name, state, quota));
                 } else if recovered {
                     recovered_agents.push(name);
@@ -394,9 +522,13 @@ impl PerTickHandler for ReclaimHandler {
             }
         }
         for (name, state, quota) in eligible {
-            // recovered=false here: an eligible agent that had recovered would have
-            // gone to `recovered_agents`. Re-read recovery defensively is overkill;
-            // the snapshot already excluded recovered agents from `eligible`.
+            // #2127 P2 inbox-dispatch re-route — run BEFORE the board-task reclaim
+            // (do_reclaim's cascade removes the board-task dispatch_tracking entries
+            // this needs to snapshot). Covers dispatches the agent already claimed
+            // AND ones still unclaimed in its inbox.
+            reroute_dispatches(ctx.home, &name, &blocked, now);
+            // Phase 1 board-task reclaim. recovered=false here: an eligible agent
+            // that had recovered would have gone to `recovered_agents`.
             reclaim_if_eligible(
                 ctx.home,
                 &self.work_stuck_latch,
@@ -755,6 +887,185 @@ mod tests {
                 now
             ),
             0
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #2127 Phase 2: inbox-dispatch re-route (notify dispatcher) ────────────
+
+    fn seed_dispatch(home: &Path, from: &str, to: &str, task_id: Option<&str>, status: &str) {
+        crate::dispatch_tracking::track_dispatch(
+            home,
+            crate::dispatch_tracking::DispatchEntry {
+                task_id: task_id.map(String::from),
+                from: from.to_string(),
+                to: to.to_string(),
+                from_id: None,
+                to_id: None,
+                delegated_at: chrono::Utc::now().to_rfc3339(),
+                status: status.to_string(),
+            },
+        );
+    }
+
+    /// Re-route notifies each dispatcher (kind=update, DP2) for BOTH a task (with
+    /// task_id) and a query-style dispatch (no task_id), then removes the entries
+    /// (DP4 fire-once).
+    #[test]
+    fn p2_reroute_notifies_dispatcher_and_removes_entry() {
+        let now = chrono::Utc::now();
+        let home = tmp_home("p2-notify");
+        seed_dispatch(&home, "lead", "dev-x", Some("t-1"), "pending"); // task
+        seed_dispatch(&home, "lead", "dev-x", None, "pending"); // query-style
+        let (rerouted, escalated) = reroute_dispatches(&home, "dev-x", &HashSet::new(), now);
+        assert_eq!(
+            (rerouted, escalated),
+            (2, 0),
+            "both pending dispatches re-routed"
+        );
+        let msgs = crate::inbox::drain(&home, "lead");
+        assert_eq!(
+            msgs.len(),
+            2,
+            "dispatcher gets one notification per dispatch"
+        );
+        assert!(
+            msgs.iter().all(|m| m.kind.as_deref() == Some("update")),
+            "DP2: notification kind must be `update` (FYI), not `query`"
+        );
+        assert!(
+            msgs.iter().any(|m| m.text.contains("usage_limit")),
+            "message must name the reclaim cause"
+        );
+        assert!(
+            crate::dispatch_tracking::take_pending_dispatchers_to(&home, "dev-x").is_empty(),
+            "DP4: entries removed after notify (fire-once)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// DP3 (reviewer-4 #2142): a dispatcher that is ITSELF blocked must NOT get the
+    /// notification in its dead inbox — it escalates to its TEAM ORCHESTRATOR, who
+    /// MUST actually receive it. (The original bug: `resolve_team_orchestrator`
+    /// keys on a team name, so a member's orchestrator never resolved → silent
+    /// operator-only fallback. This asserts the routing TARGET, not just a count.)
+    #[test]
+    fn p2_reroute_blocked_dispatcher_escalates_to_orchestrator() {
+        let now = chrono::Utc::now();
+        let home = tmp_home("p2-blocked-orch");
+        // fleet team: dispatcher `lead` is a member; orchestrator is `boss` (≠ lead).
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "teams:\n  squad:\n    members: [lead, boss]\n    orchestrator: boss\n",
+        )
+        .unwrap();
+        seed_dispatch(&home, "lead", "dev-y", Some("t-2"), "pending");
+        let mut blocked = HashSet::new();
+        blocked.insert("lead".to_string());
+        let (rerouted, escalated) = reroute_dispatches(&home, "dev-y", &blocked, now);
+        assert_eq!(
+            (rerouted, escalated),
+            (0, 1),
+            "blocked dispatcher → escalate"
+        );
+        assert!(
+            crate::inbox::drain(&home, "lead").is_empty(),
+            "DP3: must NOT enqueue to the blocked dispatcher's dead inbox"
+        );
+        // The routing TARGET: the team orchestrator must actually receive it.
+        let orch_msgs = crate::inbox::drain(&home, "boss");
+        assert_eq!(
+            orch_msgs.len(),
+            1,
+            "orchestrator must receive the escalated notification (reviewer-4 #2142)"
+        );
+        assert_eq!(orch_msgs[0].kind.as_deref(), Some("update"));
+        assert!(orch_msgs[0].text.contains("usage_limit"));
+        assert!(
+            crate::dispatch_tracking::take_pending_dispatchers_to(&home, "dev-y").is_empty(),
+            "entries removed after escalate (fire-once)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// DP3 fallback: no team (orchestrator unresolvable) → operator escalation
+    /// channel (no-op here, no channel registered) and the blocked dispatcher's
+    /// dead inbox stays empty.
+    #[test]
+    fn p2_reroute_blocked_dispatcher_no_team_falls_back_to_operator() {
+        let now = chrono::Utc::now();
+        let home = tmp_home("p2-blocked-noteam");
+        seed_dispatch(&home, "lead", "dev-z", Some("t-9"), "pending");
+        let mut blocked = HashSet::new();
+        blocked.insert("lead".to_string());
+        let (rerouted, escalated) = reroute_dispatches(&home, "dev-z", &blocked, now);
+        assert_eq!(
+            (rerouted, escalated),
+            (0, 1),
+            "no team → operator-channel escalation still counts"
+        );
+        assert!(
+            crate::inbox::drain(&home, "lead").is_empty(),
+            "DP3: blocked dispatcher's dead inbox must stay empty"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Terminal dispatches (e.g. no_report_expected) are NOT re-routed; no entries
+    /// at all → no-op (byte-identical when nothing is pending).
+    #[test]
+    fn p2_reroute_skips_terminal_and_noops_when_empty() {
+        let now = chrono::Utc::now();
+        let home = tmp_home("p2-terminal");
+        seed_dispatch(&home, "lead", "dev-t", Some("t-3"), "no_report_expected");
+        let (rr, esc) = reroute_dispatches(&home, "dev-t", &HashSet::new(), now);
+        assert_eq!((rr, esc), (0, 0), "terminal dispatch is not re-routed");
+        // A target with no dispatches at all → no-op.
+        let (rr2, esc2) = reroute_dispatches(&home, "nobody", &HashSet::new(), now);
+        assert_eq!((rr2, esc2), (0, 0));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// reviewer-2 finding a (§3.9 load-bearing): the FULL handler `run()` must
+    /// re-route BEFORE the Phase-1 board cascade removes the board-task
+    /// dispatch_tracking entry — else an ALREADY-CLAIMED dispatcher is silently not
+    /// notified. Seed a UsageLimit agent that OWNS a claimed board task AND has a
+    /// pending dispatch from `lead` for that task; run() must notify `lead` (proving
+    /// reroute ran before the cascade) AND release the task to Open.
+    #[test]
+    fn p2_run_notifies_already_claimed_dispatcher_before_cascade() {
+        use parking_lot::Mutex as PLMutex;
+        use std::sync::Arc;
+        let home = tmp_home("p2-run-order");
+        seed_claimed_task(&home, "t-r", "dev-r");
+        seed_dispatch(&home, "lead", "dev-r", Some("t-r"), "pending");
+        seed_usage_notify(&home, "dev-r", chrono::Utc::now(), 30); // 30min > grace
+        let registry: crate::agent::AgentRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let (handle, _reader) = crate::daemon::per_tick::mock_live_agent_no_context("dev-r");
+        handle.core.lock().state.current = AgentState::UsageLimit;
+        registry.lock().insert(handle.id, handle);
+        let externals: crate::agent::ExternalRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let configs: Arc<PLMutex<HashMap<String, crate::daemon::AgentConfig>>> =
+            Arc::new(PLMutex::new(HashMap::new()));
+        let past = std::time::Instant::now()
+            - super::super::NOTIFICATION_BOOT_GRACE
+            - std::time::Duration::from_secs(1);
+        let h = ReclaimHandler::new_at(1, fresh_latch(), past);
+        let ctx = TickContext {
+            home: &home,
+            registry: &registry,
+            externals: &externals,
+            configs: &configs,
+        };
+        h.run(&ctx);
+        assert!(
+            !crate::inbox::drain(&home, "lead").is_empty(),
+            "run() must notify the already-claimed dispatcher (reroute BEFORE the cascade)"
+        );
+        assert_eq!(
+            task_status(&home, "t-r"),
+            crate::task_events::TaskStatus::Open,
+            "Phase 1 must still release the board task to Open"
         );
         std::fs::remove_dir_all(&home).ok();
     }
