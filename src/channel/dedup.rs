@@ -286,7 +286,9 @@ pub fn global(home: &std::path::Path) -> &'static DedupCache {
 /// all fall through to `None` so caller uses `DEFAULT_TTL_SECS`.
 fn read_ttl_from_fleet_yaml(home: &std::path::Path) -> Option<u64> {
     let path = crate::fleet::fleet_yaml_path(home);
-    let content = std::fs::read_to_string(&path).ok()?;
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return None;
+    };
     let doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(&content).ok()?;
     doc.get("channel")?.get("dedup_ttl_secs")?.as_u64()
 }

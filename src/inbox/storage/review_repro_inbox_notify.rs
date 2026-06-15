@@ -103,7 +103,6 @@ fn msg_already_drained_reads_resolved_uuid_path_inbox_notify() {
 // message is returned TWICE.
 // ───────────────────────────────────────────────────────────────────────────
 #[test]
-#[ignore = "migrated-symlink-double-scan: red until fix; remove #[ignore] after fix to confirm"]
 fn migrated_inbox_thread_not_double_counted_via_symlink_inbox_notify() {
     let home = tmp_home("f3-symlink-double");
     let name = "legacyagent";
@@ -152,7 +151,6 @@ fn migrated_inbox_thread_not_double_counted_via_symlink_inbox_notify() {
 // the sibling did not get the fix.
 // ───────────────────────────────────────────────────────────────────────────
 #[test]
-#[ignore = "unread-count-superseded-drift: red until fix; remove #[ignore] after fix to confirm"]
 fn enqueue_returning_unread_count_excludes_superseded_rows_inbox_notify() {
     let home = tmp_home("f4-superseded-count");
     let name = "countagent";
@@ -205,7 +203,6 @@ fn enqueue_returning_unread_count_excludes_superseded_rows_inbox_notify() {
 // it survives on disk.
 // ───────────────────────────────────────────────────────────────────────────
 #[test]
-#[ignore = "forward-schema-downgrade-loss: red until fix; remove #[ignore] after fix to confirm"]
 fn drain_preserves_forward_schema_version_row_on_disk_inbox_notify() {
     let home = tmp_home("f6-forward-schema");
     let name = "futureagent";

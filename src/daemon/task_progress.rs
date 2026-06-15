@@ -147,7 +147,9 @@ pub(crate) fn read_last_progress_at(
     task_id: &str,
 ) -> Option<chrono::DateTime<chrono::Utc>> {
     let path = progress_path(home, task_id);
-    let content = std::fs::read_to_string(&path).ok()?;
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return None;
+    };
     let sidecar: ProgressSidecar = serde_json::from_str(&content).ok()?;
     if sidecar.schema_version != SCHEMA_VERSION {
         // Forward-compat preservation (Sprint 58 Wave 1 PR-2): a
