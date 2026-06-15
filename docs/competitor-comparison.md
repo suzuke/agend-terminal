@@ -27,7 +27,7 @@ auto-dispatched reviewer) + **git-worktree isolation with a policy gate**
 binaries with file-based state.
 
 The landscape has expanded far past the original doc's two subjects. The market
-now splits into eight categories (§3). The honest tensions: AgEnD's three biggest
+now splits into nine categories (§3). The honest tensions: AgEnD's three biggest
 self-identified gaps — **fragile PTY screen-scraping for state detection**,
 **worktree-only isolation** (shared host FS/deps/network), and **no
 structured-protocol / async-headless mode** — are exactly the areas where a
@@ -68,7 +68,7 @@ graph LR
     D ---|VERIFIED/REJECTED review chain| A2
 ```
 
-## 3. The landscape (eight categories)
+## 3. The landscape (nine categories)
 
 **Bold** = the categories that overlap AgEnD's architecture most directly.
 
@@ -82,6 +82,7 @@ graph LR
 | **Cloud / async coding agents** | Devin (~$26B val), Jules, Cursor Cloud, Copilot coding agent, Factory (~$1.5B), Codex cloud | cloud VM | Set the "assign-issue → PR + headless + mobile trigger" UX expectation |
 | **Interop protocols** | **ACP** (Zed, ~3.4k★, 25+ agents), A2A (Google→Linux Foundation), MCP, AG-UI | n/a (wire format) | ACP is the highest-leverage fix for AgEnD's fragile "eyes" |
 | **Terminal-native / pair** | Warp Oz, Wave (~20k★), tmuxai, Aider (~46k★) | cloud / none | Aider repo-map + tmuxai OSC-133 markers are the standout borrows |
+| **Multi-runtime assistant platforms** | **DuDuClaw** (~22★, Rust + Python + React, Open-Core) | worktree + opt-in container | Closest Rust-daemon peer by primitives (PTY pool + worktree + MCP board), but a chatbot/assistant platform — coding orchestration is off by default; ships an in-band sentinel-framing PTY turn detector worth stealing |
 
 ## 4. Closest architectural peers (deep dive)
 
@@ -153,6 +154,40 @@ chain + recovery; their lessons are concrete and cheap.
   reviewer, advanced on process exit); (d) *per-agent capability negotiation enum*;
   (e) *scoped orchestrator MCP mode* (a deliberately restricted, workspace-scoped
   tool router that strips `delete_workspace`).
+
+### 4.6 DuDuClaw (`zhixuli0406/DuDuClaw`, Rust + Python + React, ~22★, Open-Core)
+- **Model:** the architecturally *closest* peer found. A Rust daemon (21-crate
+  workspace) drives Claude/Codex/Gemini CLIs through a **PTY pool**
+  (`crates/duduclaw-cli-runtime`), isolates work in **per-(agent,task) git
+  worktrees** ("L0", `crates/duduclaw-gateway/src/worktree.rs`) with an opt-in
+  container tier ("L1"), and coordinates through a **SQLite task board** + an **MCP
+  server (80+ tools)**. But its centre of gravity is a **multi-channel AI
+  assistant/chatbot platform** (7 chat channels, persistent memory, personas,
+  voice, local inference, a self-evolution engine, a web dashboard) — coding-agent
+  orchestration is one capability that grew on the side and is **off by default**
+  (`agent.toml [runtime] pty_pool_enabled`). No TUI; cross-agent IPC is a file
+  queue (`bus_queue.jsonl`), not a structured review chain. Young (created
+  2026-03), solo-authored, moving to Open-Core.
+- **Borrowable (the standout): in-band sentinel framing for PTY turn detection**
+  (`crates/duduclaw-cli-runtime/src/envelope.rs`). Rather than scrape scrollback to
+  guess when a CLI turn finished, it injects (via system-prompt) an instruction to
+  wrap the final answer in a unique magic sentinel
+  (`=====DUDUCLAW.RSP.<uuid>.MARK=====`), then `strip_ansi` + buffer-accumulate +
+  pair-match to extract the exact payload, with a chrome filter dropping
+  spinner/status lines. This is a **third path** to fixing AgEnD's #1 weakness (the
+  fragile "eyes"), alongside ACP (§5.6) and stream-json (§4.3) — and the only one
+  that needs **no backend protocol support**, just a system-prompt convention. See
+  §9 Tier 1.1. Hard-won details worth stealing (from their 2026-05 spike): drop the
+  UUID in interactive mode (the Claude TUI eats a char off the opening sentinel) and
+  use positional pairing after draining the buffer each turn; avoid `<…>` delimiters
+  (the TUI markdown renderer treats them as HTML and mangles them); strip the
+  per-character `ESC[1C` cursor-forward codes the TUI interleaves so the sentinel
+  bytes stay contiguous. Other borrows: the PTY-pool cache key includes `model` +
+  `account_id` (they shipped a bug where per-agent model was silently dropped — cf.
+  AgEnD #2038); worktree ceilings (5/agent, 20 total) + adjective-noun branch names
+  (`wt/{agent}/{adj}-{noun}`); an out-of-process PTY worker (`/healthz` + loopback
+  Bearer) that isolates PTY crashes; and the explicit L0-worktree → L1-container
+  layered-isolation framing (cf. §9 Tier 1.2).
 
 ## 5. Adjacent categories — the one thing each teaches
 
@@ -351,7 +386,7 @@ chain + recovery; their lessons are concrete and cheap.
 
 | Gap | Why it bites | Who does it better |
 |---|---|---|
-| **Fragile PTY screen-scraping** for state detection (the "eyes") | regex drifts across backend versions → false hang/idle, false recovery | Crystal (stream-json), OpenHands (event stream), container-use (structural), ACP, tmuxai (OSC-133) |
+| **Fragile PTY screen-scraping** for state detection (the "eyes") | regex drifts across backend versions → false hang/idle, false recovery | Crystal (stream-json), OpenHands (event stream), container-use (structural), ACP, tmuxai (OSC-133), DuDuClaw (sentinel framing) |
 | **Worktree-only isolation** (shared host FS/deps/network) | unsafe for untrusted code; 2026 bar is a microVM | container-use, E2B/Modal/Daytona, cloud agents, Codex (network-off) |
 | **No structured-protocol backend mode** | couples every backend to bespoke scraping | ACP, OpenHands app↔agent split, Vibe Kanban harness |
 | **No async / headless / cloud model** | requires an always-on daemon + present operator | every cloud agent, claude-flow, Warp Oz |
@@ -371,7 +406,11 @@ single-operator, zero-infra, real-time-control, worktree-isolation thesis.
    backend mode *and* adopt ACP's typed state vocabulary as AgEnD's internal
    normalized schema first (zero-infra, makes the scraper a thin adapter). Then feed
    high-confidence signals from stream-json (Crystal) / an ACP harness (Vibe Kanban
-   `acp/harness.rs`). *Sources:* ACP, Crystal, OpenHands, container-use, tmuxai, VK.
+   `acp/harness.rs`). For backends that speak **neither** ACP nor stream-json, the
+   **no-protocol-needed variant** is DuDuClaw's *in-band sentinel framing* (§4.6):
+   inject a system-prompt convention to wrap the final answer in a unique marker,
+   then strip-ANSI + pair-match instead of scraping. *Sources:* ACP, Crystal,
+   OpenHands, container-use, tmuxai, VK, DuDuClaw.
    **Effort high · fit yes.** *Attacks gap #1 — the single highest-leverage change.*
 2. **Opt-in container isolation tier** (`fleet.yaml: isolation: worktree|container`):
    the daemon stays supervisor and puts the PTY child in a container bind-mounted to
