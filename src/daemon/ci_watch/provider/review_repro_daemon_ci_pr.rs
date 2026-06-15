@@ -68,7 +68,6 @@ fn capture_request_path(
 }
 
 #[test]
-#[ignore = "branch-query-encoding: red until fix; remove #[ignore] after fix to confirm"]
 fn github_poll_runs_percent_encodes_branch_in_query_daemon_ci_pr() {
     // A branch name that is a LEGAL git ref but contains query metacharacters.
     // Unencoded, the trailing `&per_page=1` injects a second `per_page` param

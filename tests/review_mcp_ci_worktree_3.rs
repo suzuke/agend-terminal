@@ -73,7 +73,6 @@ fn fn_body_after(text: &str, signature_needle: &str) -> String {
 }
 
 #[test]
-#[ignore = "mcp-ci-worktree-3: release-repo-silent-metadata-leak; red until fix; remove #[ignore] after fix to confirm"]
 fn release_repo_surfaces_unprunable_metadata_leak_mcp_ci_worktree() {
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();

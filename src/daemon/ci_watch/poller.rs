@@ -9,6 +9,40 @@ use super::provider::{
 type PerKeySlot = Arc<tokio::sync::Mutex<Option<CiPollResult>>>;
 type TickCache = Arc<std::sync::Mutex<std::collections::HashMap<(String, String), PerKeySlot>>>;
 
+/// CR-2026-06-14 (xcut-concurrency F3): per-repo in-flight set bounding the
+/// fire-and-forget batch-poll spawns. `check_ci_watches_with_provider` runs once
+/// per tick and spawns one detached task per repo onto the 2-worker shared CI
+/// runtime; under a provider/network stall, each tick could enqueue new repo
+/// tasks faster than the workers drain them, growing the backlog without limit.
+/// A repo's slot is claimed before spawning and released when the task finishes
+/// (via [`RepoInFlightGuard`]'s `Drop`); a tick skips a repo whose prior cycle is
+/// still running, so at most one batch task per repo is ever outstanding.
+static IN_FLIGHT_REPOS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// RAII claim on a repo's in-flight slot. Released on `Drop` (covers EVERY async
+/// return path of the spawned task), so a panicking or early-returning task can't
+/// strand the slot and permanently wedge that repo's polling.
+struct RepoInFlightGuard(String);
+
+impl RepoInFlightGuard {
+    /// Claim the slot for `repo`. Returns `None` if it's already in flight (the
+    /// prior cycle's task hasn't finished) → caller skips spawning this tick.
+    fn try_claim(repo: &str) -> Option<Self> {
+        let mut set = IN_FLIGHT_REPOS.lock().unwrap_or_else(|e| e.into_inner());
+        set.insert(repo.to_string()).then(|| Self(repo.to_string()))
+    }
+}
+
+impl Drop for RepoInFlightGuard {
+    fn drop(&mut self) {
+        IN_FLIGHT_REPOS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.0);
+    }
+}
+
 struct CachedCiProvider {
     inner: Box<dyn CiProvider>,
     poll_cache: TickCache,
@@ -504,6 +538,20 @@ pub(super) fn check_ci_watches_with_provider(
     // ci_check_repo (each hits the prefilled cache, or misses → per-branch fallback).
     let make_provider = std::sync::Arc::new(make_provider);
     for (repo, watches) in by_repo {
+        // CR-2026-06-14 (xcut-concurrency F3): bound the detached spawns. Claim
+        // this repo's in-flight slot; if the prior cycle's batch task is still
+        // running (provider/network stall), skip spawning a new one so the
+        // detached-task backlog on the 2-worker runtime can't grow without limit.
+        let inflight_guard = match RepoInFlightGuard::try_claim(&repo) {
+            Some(g) => g,
+            None => {
+                tracing::debug!(
+                    repo = %repo,
+                    "ci poll: prior cycle's batch task still in flight — skipping this tick to bound the detached-spawn backlog"
+                );
+                continue;
+            }
+        };
         // Union of subscribers across the repo's watches — recipients of the
         // single repo-level stalled/resumed health event.
         let mut subs_union: Vec<String> = Vec::new();
@@ -520,7 +568,10 @@ pub(super) fn check_ci_watches_with_provider(
         let make_provider = Arc::clone(&make_provider);
         let display_timezone = display_timezone.clone();
         // fire-and-forget: one batch-poll-then-fan-out task per repo per poll cycle
+        // — bounded to at most one in-flight per repo by `inflight_guard`, which is
+        // moved in below and released (via Drop) on EVERY return path of this task.
         shared_ci_runtime().spawn(async move {
+            let _inflight_guard = inflight_guard;
             // Batch poll once for the whole repo, pre-populating the per-tick cache.
             // None provider → no prefill (per-branch fallback). Returns false on a
             // repo-level ApiError (backing off) → skip the fan-out this tick.

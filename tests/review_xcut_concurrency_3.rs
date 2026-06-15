@@ -33,7 +33,6 @@ const GUARD_MARKERS: &[&str] = &[
 ];
 
 #[test]
-#[ignore = "xcut-concurrency F3: red until fix; remove #[ignore] after fix to confirm"]
 fn ci_poller_bounds_detached_spawn_with_inflight_guard_xcut_concurrency() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/daemon/ci_watch/poller.rs");
     let text = std::fs::read_to_string(&path)

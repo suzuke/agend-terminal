@@ -19,6 +19,28 @@
 /// agend-terminal push fan-out and stays well under GitHub's 100-cap.
 pub(crate) const POLL_RUNS_PAGE_SIZE: u32 = 20;
 
+/// CR-2026-06-14: percent-encode a string for safe use as a URL QUERY-component
+/// value. Git ref names may legally contain `&`, `=`, spaces, etc.; a branch like
+/// `feat&per_page=1` interpolated raw into `?branch={branch}&…` injects a spurious
+/// query parameter and corrupts the intended `branch=` filter, so the provider
+/// returns unrelated runs → wrong CI verdicts. Encode every byte outside the
+/// RFC 3986 unreserved set (`ALPHA / DIGIT / - . _ ~`), PLUS `/` — which is both
+/// query-legal (RFC 3986: `query = *( pchar / "/" / "?" )`) and ubiquitous in git
+/// ref names (`feat/foo`), so leaving it raw keeps the documented GitHub
+/// `head={owner}:{branch}` filter intact for slash-branches.
+fn percent_encode_query(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for &b in value.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// Auth scheme for CI provider HTTP requests.
 pub(crate) enum CiAuth {
     /// `Authorization: Bearer <token>` (GitHub)
@@ -271,13 +293,24 @@ pub trait CiProvider: Send + Sync {
 
     /// #813: synchronous variant for non-async callers (handler-layer
     /// MCP entry points that need a blocking answer on watch-start).
-    /// Runs the async future on the shared CI runtime in a scoped
-    /// thread — works regardless of whether the caller is already
-    /// inside a tokio runtime.
+    ///
+    /// CR-2026-06-14 (CLAUDE.md "no raw shared-runtime block_on"): runs the
+    /// future on a FRESH current-thread runtime built INSIDE a scoped thread,
+    /// never on the long-lived shared CI runtime. The scoped thread escapes any
+    /// ambient tokio context (so `block_on` can't panic with "runtime within a
+    /// runtime"), and the fresh, non-shared runtime avoids the copy-paste hazard
+    /// `channel::shared_async::block_on_value` centralized away — block_on'ing a
+    /// shared `*_runtime()` accessor.
     fn check_pr_mergeable_blocking(&self, repo: &str, branch: &str) -> MergeableState {
         std::thread::scope(|s| {
             let handle = s.spawn(|| {
-                super::poller::shared_ci_runtime().block_on(self.check_pr_mergeable(repo, branch))
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt.block_on(self.check_pr_mergeable(repo, branch)),
+                    Err(_) => MergeableState::Unknown,
+                }
             });
             handle.join().unwrap_or(MergeableState::Unknown)
         })
@@ -347,7 +380,8 @@ impl CiProvider for GitHubCiProvider {
         let resp = self
             .http
             .get(&format!(
-                "repos/{repo}/actions/runs?branch={branch}&per_page={POLL_RUNS_PAGE_SIZE}"
+                "repos/{repo}/actions/runs?branch={}&per_page={POLL_RUNS_PAGE_SIZE}",
+                percent_encode_query(branch)
             ))
             .send()
             .await?;
@@ -509,7 +543,8 @@ impl CiProvider for GitHubCiProvider {
         let resp: serde_json::Value = match self
             .http
             .get(&format!(
-                "repos/{repo}/pulls?head={owner}:{branch}&state=all&per_page=1"
+                "repos/{repo}/pulls?head={owner}:{}&state=all&per_page=1",
+                percent_encode_query(branch)
             ))
             .send()
             .await
@@ -578,7 +613,8 @@ impl CiProvider for GitHubCiProvider {
         let list: serde_json::Value = match self
             .http
             .get(&format!(
-                "repos/{repo}/pulls?head={owner}:{branch}&state=open&per_page=1"
+                "repos/{repo}/pulls?head={owner}:{}&state=open&per_page=1",
+                percent_encode_query(branch)
             ))
             .send()
             .await
@@ -817,7 +853,8 @@ impl CiProvider for GitLabCiProvider {
         let resp = self
             .http
             .get(&format!(
-                "projects/{project}/pipelines?ref={branch}&per_page={POLL_RUNS_PAGE_SIZE}"
+                "projects/{project}/pipelines?ref={}&per_page={POLL_RUNS_PAGE_SIZE}",
+                percent_encode_query(branch)
             ))
             .send()
             .await?;
@@ -885,7 +922,8 @@ impl CiProvider for GitLabCiProvider {
         let resp: serde_json::Value = match self
             .http
             .get(&format!(
-                "projects/{project}/merge_requests?source_branch={branch}&state=all&per_page=1"
+                "projects/{project}/merge_requests?source_branch={}&state=all&per_page=1",
+                percent_encode_query(branch)
             ))
             .send()
             .await
@@ -1036,7 +1074,8 @@ impl CiProvider for BitbucketCiProvider {
         let resp = self
             .http
             .get(&format!(
-                "repositories/{repo}/pipelines/?target.branch={branch}&pagelen={POLL_RUNS_PAGE_SIZE}&sort=-created_on"
+                "repositories/{repo}/pipelines/?target.branch={}&pagelen={POLL_RUNS_PAGE_SIZE}&sort=-created_on",
+                percent_encode_query(branch)
             ))
             .send()
             .await?;
@@ -1104,7 +1143,8 @@ impl CiProvider for BitbucketCiProvider {
         let resp: serde_json::Value = match self
             .http
             .get(&format!(
-                "repositories/{repo}/pullrequests?q=source.branch.name=\"{branch}\"&pagelen=1"
+                "repositories/{repo}/pullrequests?q=source.branch.name=\"{}\"&pagelen=1",
+                percent_encode_query(branch)
             ))
             .send()
             .await
