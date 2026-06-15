@@ -164,7 +164,6 @@ fn system_identity_may_set_forensic_done_source_tasks() {
 /// process-unique component (pid / uuid / random). RED now (none present);
 /// GREEN once the id format is made globally unique across processes.
 #[test]
-#[ignore = "tasks-id-cross-process-collision: red until fix; split to its own PR — the id-format change needs the sweep Closes-marker regex (task_sweep.rs) + strict validator + doc widened together; un-ignore there"]
 fn task_id_has_process_unique_component_tasks() {
     let src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/tasks/handler.rs");
     let text = std::fs::read_to_string(&src).expect("read handler.rs");

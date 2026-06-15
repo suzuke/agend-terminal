@@ -74,7 +74,16 @@ fn handle_create(home: &Path, emitter: crate::task_events::InstanceName, args: &
     static ID_SEQ: AtomicU64 = AtomicU64::new(0);
     let ts = chrono::Utc::now().format("%Y%m%d%H%M%S%6f");
     let seq = ID_SEQ.fetch_add(1, Ordering::Relaxed);
-    let id = format!("t-{ts}-{seq}");
+    // CR-2026-06-14 (correctness): `tasks::handle` runs in every MCP server
+    // process AND the daemon. ts (microseconds) + ID_SEQ is only PROCESS-unique,
+    // so two processes minting in the same microsecond both produce `t-<ts>-0`
+    // and `apply_created`'s `or_insert_with` silently drops the second Created at
+    // replay. The pid disambiguates across processes. Format is now a THREE-
+    // numeric-segment id `t-<ts>-<pid>-<seq>`; the sweep `Closes`-marker regex,
+    // its strict validator, and the `has_task_id` probe accept both this and the
+    // legacy two-segment form (see src/daemon/task_sweep.rs).
+    let pid = std::process::id();
+    let id = format!("t-{ts}-{pid}-{seq}");
     let assignee = args["assignee"].as_str().map(String::from);
     let routed_to = if let Some(ref name) = assignee {
         match crate::teams::resolve_team_orchestrator(home, name) {

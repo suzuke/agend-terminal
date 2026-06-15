@@ -11,8 +11,9 @@
 //! 1. **HTML-comment injection sanitize** — `<!-- Closes t-victim -->`
 //!    rejected (the regex never sees the directive).
 //! 2. **Non-ASCII codepoint reject** on task-ID match — strict ASCII-digit
-//!    regex `(?m)Closes\s+(t-[0-9]+-[0-9]+)` defeats zero-width-char
-//!    homoglyph attacks.
+//!    regex `(?m)Closes\s+(t-[0-9]+-[0-9]+(?:-[0-9]+)?)` defeats zero-width-char
+//!    homoglyph attacks (accepts the legacy two-segment id and the
+//!    three-segment cross-process-unique `t-<ts>-<pid>-<seq>`).
 //! 3. **PR.user.login authorship ONLY** (not git trailer co-author) —
 //!    defends the pre-PR-220 `update_decision` bug class.
 //! 4. **GitHub API schema-mismatch fail-closed** — missing required
@@ -508,8 +509,13 @@ fn extract_closes_markers(body: &str) -> Vec<String> {
     static MARKER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re = MARKER.get_or_init(|| {
         // Multi-line; case-sensitive on `Closes` to match GitHub's
-        // closing-keyword convention.
-        regex::Regex::new(r"(?m)Closes\s+(t-[0-9]+-[0-9]+)\b").expect("static regex must compile")
+        // closing-keyword convention. CR-2026-06-14: accept BOTH the legacy
+        // two-segment id `t-<ts>-<seq>` and the three-segment cross-process-
+        // unique id `t-<ts>-<pid>-<seq>` (the optional third numeric group). The
+        // trailing `\b` still bounds the marker so it doesn't swallow following
+        // prose.
+        regex::Regex::new(r"(?m)Closes\s+(t-[0-9]+-[0-9]+(?:-[0-9]+)?)\b")
+            .expect("static regex must compile")
     });
     re.captures_iter(body)
         .filter_map(|c| c.get(1).map(|m| m.as_str().to_string()))
@@ -1336,6 +1342,48 @@ mod tests {
         );
     }
 
+    /// CR-2026-06-14 regression pin: a task id minted by the REAL
+    /// `tasks::handle(create)` path (now the three-segment cross-process-unique
+    /// `t-<ts>-<pid>-<seq>`) must round-trip through the `Closes`-marker
+    /// extractor WHOLE. With the pre-fix two-group regex the `\b` truncated it to
+    /// `t-<ts>-<pid>` (≠ the real id) → `open_ids.get(marker)` missed → the
+    /// PR-merge auto-close never fired for any new-format task. The narrow
+    /// id-format unit repro missed this cross-module consumer; this pins it.
+    #[test]
+    fn closes_marker_round_trips_real_minted_three_segment_id() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-sweep-closes-roundtrip-{}-{}",
+            std::process::id(),
+            "rt"
+        ));
+        std::fs::create_dir_all(&home).expect("create temp home");
+        let created = crate::tasks::handle(
+            &home,
+            "operator",
+            &serde_json::json!({ "action": "create", "title": "round-trip me" }),
+        );
+        let id = created["id"]
+            .as_str()
+            .expect("create returns id")
+            .to_string();
+        // Sanity: the minted id is the new three-segment shape.
+        assert_eq!(
+            id.matches('-').count(),
+            3,
+            "expected three-segment id `t-<ts>-<pid>-<seq>`, got {id}"
+        );
+
+        let body = format!("Closes {id}");
+        let markers = extract_closes_markers(&body);
+        assert_eq!(
+            markers,
+            vec![id.clone()],
+            "the extractor must return the WHOLE minted id, not a truncated prefix"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     /// `parse_pr_meta` rejects the PR if `user.login` is missing — our
     /// authorship anchor (must-have #3) requires it. Better to drop the
     /// PR than fall back to git trailer (the bug class we're defending).
@@ -1556,8 +1604,9 @@ mod tests {
         let markers = extract_closes_markers(&text);
         // Every extracted marker MUST conform to strict format. A
         // regression where the extractor accepts (e.g.) `t-foo-1`
-        // surfaces here.
-        let strict = regex::Regex::new(r"^t-[0-9]+-[0-9]+$").unwrap();
+        // surfaces here. CR-2026-06-14: accept both the legacy two-segment id
+        // and the three-segment cross-process-unique id `t-<ts>-<pid>-<seq>`.
+        let strict = regex::Regex::new(r"^t-[0-9]+-[0-9]+(?:-[0-9]+)?$").unwrap();
         for m in &markers {
             assert!(
                 strict.is_match(m),
