@@ -30,7 +30,6 @@
 use std::path::PathBuf;
 
 #[test]
-#[ignore = "channel-LOW-3: red until fix; remove #[ignore] after fix to confirm"]
 fn discord_keepalive_does_not_sleep_before_first_refresh_channel() {
     let discord = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/channel/discord.rs");
     let content = std::fs::read_to_string(&discord)

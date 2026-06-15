@@ -1,8 +1,25 @@
 //! Telegram notification helpers — daemon/supervisor notify to instance topics.
 
+use crate::channel::dedup::DedupKey;
 use crate::channel::telegram::error::*;
 use crate::channel::telegram::send::*;
 use crate::channel::telegram::state::*;
+
+/// CR-2026-06-14: after a successful notify retry to a RECREATED topic, record a
+/// dedup claim keyed on the NEW topic id. The original claim (recorded before the
+/// first send) is keyed on the now-dead OLD topic id, so without this a
+/// concurrent duplicate emission to the recreated topic finds no matching claim
+/// and is NOT suppressed — the "same content to same topic within TTL" dedup
+/// invariant would lapse precisely across the recreate window.
+fn rekey_dedup_for_recreated_topic(
+    home: &std::path::Path,
+    instance: &str,
+    new_tid: i32,
+    text: &str,
+) {
+    let key = DedupKey::new("telegram:notify", instance, Some(i64::from(new_tid)), text);
+    let _ = crate::channel::dedup::global(home).record_and_check(key);
+}
 
 /// Send a notification to Telegram (instance topic or general).
 pub fn notify_telegram(home: &std::path::Path, instance_name: &str, text: &str) {
@@ -140,6 +157,16 @@ fn notify_telegram_inner(
                         // patched twin of the reply.rs HIGH-2 evict-on-failure).
                         if req.await.is_err() {
                             crate::channel::dedup::global(&home_owned).evict(&dedup_key);
+                        } else {
+                            // CR-2026-06-14: retry to the recreated topic succeeded
+                            // — re-key the dedup claim under the NEW topic id so a
+                            // concurrent duplicate to it is still suppressed.
+                            rekey_dedup_for_recreated_topic(
+                                &home_owned,
+                                &instance_owned,
+                                new_tid,
+                                &text,
+                            );
                         }
                         return;
                     }

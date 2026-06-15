@@ -463,7 +463,15 @@ fn handle_session(
     // on the stream (set in `serve`) ensures a silent peer closes out in 30s
     // rather than pinning this worker thread.
     // #680: 5s pre-auth timeout — prevents slow-loris holding a semaphore slot.
-    let _ = writer.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+    // CR-2026-06-14: arm it on the fd that the handshake actually READS from
+    // (`reader`'s inner `cloned` stream), not on `writer`. They only happened to
+    // share `SO_RCVTIMEO` because `try_clone()`/`dup` shares one file
+    // description — an accidental coupling that any future independent-timeout
+    // change (or a platform where dup'd handles don't share the option) would
+    // silently break, removing the slow-loris guard.
+    let _ = reader
+        .get_ref()
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)));
     // Sprint 25 P1 F1: extract optional peer PID for telemetry.
     let peer_pid =
         match crate::auth_cookie::server_handshake_ndjson(&mut reader, &mut writer, &cookie) {
@@ -473,8 +481,9 @@ fn handle_session(
                 return;
             }
         };
-    // Restore no-timeout for authenticated sessions
-    let _ = writer.set_read_timeout(None);
+    // Restore no-timeout for authenticated sessions (on the read fd it was
+    // armed on above — CR-2026-06-14).
+    let _ = reader.get_ref().set_read_timeout(None);
     // Telemetry only — see MCP-DAEMON-PROXY-CONTRACT §peer-PID-telemetry.
     if let Some(pid) = peer_pid {
         tracing::debug!(peer_pid = pid, "API session peer PID");

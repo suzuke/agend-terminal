@@ -24,7 +24,6 @@ use serde_json::json;
 use std::time::Duration;
 
 #[test]
-#[ignore = "dedup-entry-count-ceiling: red until fix; remove #[ignore] after fix to confirm"]
 fn zero_byte_oversized_entries_are_count_bounded_api() {
     // per_entry_cap = 10 bytes → every response below is "oversized" and
     // gets stored as a zero-byte `Oversized` terminal entry that
