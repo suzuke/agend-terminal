@@ -4224,6 +4224,86 @@ fn pending_transitions_bounded_drops_oldest() {
     );
 }
 
+/// #1523 phase-1 — end-to-end regression net for the #1527 wiring, ERROR case.
+/// A real error-triggering screen fed to the read-loop classifier must flow the
+/// whole pipeline: `feed` → `detect` → `transition()` (the instant error branch,
+/// no hysteresis) → `record_set` (source capture) → `drain_pending_transitions`
+/// → `log_state_transition_at` → `state-transitions.jsonl`. Pre-#1527 the
+/// supervisor's prev/new-at-tick comparison silently dropped feed-driven error
+/// transitions (they complete async between two ticks, so prev==new at tick).
+/// The two existing tests cover the ends in isolation —
+/// `record_set_buffers_transitions_fifo_then_drains` is generic (Thinking/Idle)
+/// and `log_state_transition_creates_file` calls `log_state_transition_at`
+/// directly without routing through `record_set` — but neither pins an error
+/// state traversing the full seam, which is exactly what #1527 fixed.
+#[test]
+#[allow(clippy::unwrap_used)]
+fn error_transition_flows_end_to_end_record_set_drain_to_jsonl() {
+    use crate::daemon::usage_limit::log_state_transition_at;
+
+    // Read-loop entry: a canonical Anthropic 429 rejection drives RateLimit, an
+    // error state (instant transition, no hysteresis). `tracker_at` sets
+    // `current` directly (bypassing record_set), so the buffer starts empty and
+    // the feed produces exactly one source-captured transition.
+    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+    t.feed("API Error: Request rejected (429) · this may be a temporary capacity issue");
+    assert_eq!(t.get_state(), AgentState::RateLimit);
+    assert!(
+        t.get_state().is_error(),
+        "guard: the driven state must be an error state for this e2e to be meaningful"
+    );
+
+    // record_set captured the transition at its source (the #1527 funnel).
+    let (recs, dropped) = t.drain_pending_transitions();
+    assert_eq!(dropped, 0);
+    let err = recs
+        .iter()
+        .find(|r| r.to == AgentState::RateLimit)
+        .expect("the feed-driven error transition must be captured at source by record_set");
+    assert_eq!(
+        err.from,
+        AgentState::Idle,
+        "from must be the pre-error state"
+    );
+    assert!(
+        !err.ts.is_empty(),
+        "ts captured at record time, not drain time"
+    );
+
+    // Replay the supervisor's lock-free drain → file-append step into a temp
+    // home (unique dir → no cross-test pollution of the shared jsonl path).
+    let dir = std::env::temp_dir().join("agend-test-error-transition-e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::remove_file(dir.join("state-transitions.jsonl")).ok();
+    log_state_transition_at(
+        &dir,
+        "dev",
+        err.from,
+        err.to,
+        &err.ts,
+        "API Error: Request rejected (429)",
+    );
+
+    let content = std::fs::read_to_string(dir.join("state-transitions.jsonl")).unwrap();
+    assert!(
+        content.contains("\"to\":\"rate_limit\""),
+        "error state must land in state-transitions.jsonl: {content}"
+    );
+    assert!(
+        content.contains("\"from\":\"idle\""),
+        "from recorded: {content}"
+    );
+    assert!(
+        content.contains("\"agent\":\"dev\""),
+        "agent recorded: {content}"
+    );
+    assert!(
+        content.contains(&format!("\"ts\":\"{}\"", err.ts)),
+        "must persist the record-time ts (not drain time): {content}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 // ── #1808-probe0-phantom: SRL re-match signature freshness primitive ──
 
 /// `srl_match_signature` must be STABLE for the same error line at the same
