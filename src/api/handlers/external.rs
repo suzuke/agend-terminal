@@ -5,29 +5,24 @@ use crate::agent;
 use serde_json::{json, Value};
 
 pub(crate) fn handle_register_external(params: &Value, ctx: &HandlerCtx) -> Value {
+    register_external_with_seam(params, ctx, None)
+}
+
+/// `before_managed_recheck_seam`: test-only injection point fired WHILE the
+/// external lock is held but BEFORE the managed re-check + insert — used to
+/// deterministically reproduce a concurrent managed spawn landing in the
+/// register-external window (t-65). `None` in production.
+fn register_external_with_seam(
+    params: &Value,
+    ctx: &HandlerCtx,
+    before_managed_recheck_seam: Option<&dyn Fn()>,
+) -> Value {
     let name = match params["name"].as_str() {
         Some(n) => n,
         None => return json!({"ok": false, "error": "missing name"}),
     };
     if let Err(e) = agent::validate_name(name) {
         return json!({"ok": false, "error": e});
-    }
-    let reg = agent::lock_registry(ctx.registry);
-    // #1441: registry is UUID-keyed; resolve name via fleet.yaml to detect a
-    // managed-name collision.
-    if crate::fleet::resolve_uuid(ctx.home, name).is_some_and(|id| reg.contains_key(&id)) {
-        return json!({"ok": false, "error": format!("agent '{name}' already exists (managed)")});
-    }
-    // CR-2026-06-14 (lock order): release the registry lock BEFORE taking the
-    // external lock — this was the ONLY site nesting external INSIDE registry
-    // (and it even held registry across the `resolve_uuid` disk read). Holding
-    // both established an undocumented registry→external order; a future
-    // external-then-registry holder would deadlock against it. The managed-name
-    // collision check above is the only thing that needs `reg`, so drop it here.
-    drop(reg);
-    let mut ext = agent::lock_external(ctx.externals);
-    if ext.contains_key(name) {
-        return json!({"ok": false, "error": format!("agent '{name}' already exists (external)")});
     }
     let backend = params["backend"].as_str().unwrap_or("unknown");
     // #1891: `pid` is required for liveness tracking — a missing / null /
@@ -45,13 +40,36 @@ pub(crate) fn handle_register_external(params: &Value, ctx: &HandlerCtx) -> Valu
             })
         }
     };
-    ext.insert(
-        name.to_string(),
-        agent::ExternalAgentHandle {
-            backend_command: backend.to_string(),
-            pid,
-        },
-    );
+    // t-65 (TOCTOU) + #2197 (lock order): take the external lock FIRST, then the
+    // registry lock (external→registry — the safe order). #2197 removed every
+    // registry→external nesting (audited across all `lock_external` sites: each
+    // drops the registry first or never holds it), so external→registry has no
+    // AB-BA partner. Holding BOTH across the managed re-check + insert makes
+    // "no managed `name`" + "insert external `name`" atomic w.r.t. a concurrent
+    // managed spawn (which serializes on the registry lock to insert) — closing
+    // the check→insert TOCTOU. The registry lock is NEVER taken before the
+    // external lock here, so this is NOT the registry→external nesting #2197
+    // removed.
+    let mut ext = agent::lock_external(ctx.externals);
+    if ext.contains_key(name) {
+        return json!({"ok": false, "error": format!("agent '{name}' already exists (external)")});
+    }
+    if let Some(seam) = before_managed_recheck_seam {
+        seam();
+    }
+    {
+        let reg = agent::lock_registry(ctx.registry);
+        if crate::fleet::resolve_uuid(ctx.home, name).is_some_and(|id| reg.contains_key(&id)) {
+            return json!({"ok": false, "error": format!("agent '{name}' already exists (managed)")});
+        }
+        ext.insert(
+            name.to_string(),
+            agent::ExternalAgentHandle {
+                backend_command: backend.to_string(),
+                pid,
+            },
+        );
+    }
     drop(ext);
     crate::event_log::log(
         ctx.home,
@@ -154,6 +172,66 @@ mod tests {
             "entry tracked with the real pid"
         );
         drop(ext);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// t-65: a managed agent created in the register-external window — while the
+    /// external lock is held, before the managed re-check + insert — must NOT
+    /// produce a managed/external name collision. The fix re-checks the managed
+    /// registry under the external lock (external→registry) before inserting;
+    /// pre-fix (insert without that re-check) the external entry was written
+    /// despite the managed twin. Deterministic via the
+    /// `before_managed_recheck_seam` hook (no flaky thread timing). `unix`-gated:
+    /// `mk_test_handle` spawns a `true` PTY.
+    #[cfg(unix)]
+    #[test]
+    fn register_external_rejects_managed_created_in_toctou_window_t65() {
+        const ID: &str = "a1a1a1a1-0000-4000-8000-000000000165";
+        let (ctx, home) = test_ctx();
+        let name = "twin";
+
+        // Seam fires in the window (external lock held, before the managed
+        // re-check + insert): land a concurrent managed `twin` in fleet.yaml +
+        // registry so the re-check sees it.
+        let inject = || {
+            let id = crate::types::InstanceId::parse(ID).unwrap();
+            std::fs::write(
+                crate::fleet::fleet_yaml_path(ctx.home),
+                format!("instances:\n  {name}:\n    id: {ID}\n"),
+            )
+            .expect("write fleet.yaml");
+            ctx.registry
+                .lock()
+                .insert(id, agent::mk_test_handle(name, id));
+        };
+
+        let resp = super::register_external_with_seam(
+            &json!({"name": name, "backend": "claude", "pid": 4242}),
+            &ctx,
+            Some(&inject),
+        );
+
+        // Post-fix: external registration must be REJECTED — the managed twin
+        // appeared in the window, so registering it as external would collide.
+        assert_eq!(
+            resp["ok"],
+            json!(false),
+            "must reject — managed twin appeared in the window: {resp:?}"
+        );
+        assert!(
+            resp["error"].as_str().unwrap().contains("managed"),
+            "rejection must cite the managed collision: {resp:?}"
+        );
+        // No external `twin` entry — no managed/external name collision.
+        assert!(
+            !agent::lock_external(ctx.externals).contains_key(name),
+            "no external entry may be inserted for a name now held by a managed agent"
+        );
+
+        // cleanup: kill the throwaway managed child + remove temp home.
+        for h in ctx.registry.lock().values() {
+            let _ = h.child.lock().kill();
+        }
         std::fs::remove_dir_all(&home).ok();
     }
 }
