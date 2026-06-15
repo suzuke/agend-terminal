@@ -79,7 +79,13 @@ const SRL_LINE: &str = "API Error: Server is temporarily limiting requests (not 
 // non-retryable state therefore appends a FULL-screen JSONL record on every
 // PTY read of the SAME screen — unbounded file growth.
 
+// #[serial]: this test mutates the process-global `AGEND_HOME` env var
+// (set_var below). The sibling `state::tests` AGEND_HOME tests are already
+// `#[serial]`; without joining that serial group this test races them on the
+// shared env var under parallel `cargo test` (writes scatter across homes →
+// nondeterministic record count), which surfaced as a flaky Coverage-job RED.
 #[test]
+#[serial_test::serial]
 fn unclassified_throttle_static_screen_logs_once_not_per_tick() {
     // Isolate the on-disk sidecar to a throwaway HOME so we don't touch the
     // operator's real $AGEND_HOME/unclassified_errors.jsonl.
@@ -111,7 +117,17 @@ fn unclassified_throttle_static_screen_logs_once_not_per_tick() {
     }
 
     let contents = std::fs::read_to_string(&path).unwrap_or_default();
-    let records = contents.lines().filter(|l| !l.trim().is_empty()).count();
+    // Count ONLY this test's own records (matched by its distinctive screen
+    // text). `capture_unclassified_throttle` writes to the PROCESS-GLOBAL
+    // `AGEND_HOME`-derived path, so any concurrently-running feed()-driven test
+    // can append to this same file while our `set_var` is in effect — filtering
+    // by our screen makes the assertion immune to that cross-test pollution
+    // (the #[serial] marker prevents it among serial tests; this covers any
+    // non-serial feeder too).
+    let records = contents
+        .lines()
+        .filter(|l| l.contains("Overloaded errors are transient"))
+        .count();
     let _ = std::fs::remove_file(&path);
 
     assert!(
