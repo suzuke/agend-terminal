@@ -88,27 +88,78 @@ fn parse_one(s: &str) -> Claim {
     // `fn name(` shape ("will add fn foo() in a follow-up"). Coercing that into a
     // verifiable FunctionExists claim makes `verify()` hard-reject the push for an
     // fn that legitimately does not exist yet — violating the module's "unknown
-    // phrases pass through" contract. A segment carrying future-intent markers is
-    // left as `Unknown` (pass-through); present-tense assertions ("references fn
-    // x()", "fn x() exists") are unaffected.
-    const FUTURE_INTENT_MARKERS: &[&str] = &[
-        "will ",
-        "would ",
-        "plan to",
-        "planned",
-        "going to",
-        "intend",
-        "follow-up",
-        "followup",
-        "to-do",
-        "todo",
-    ];
-    let is_future_intent = FUTURE_INTENT_MARKERS.iter().any(|m| lower.contains(m));
+    // phrases pass through" contract.
+    //
+    // POSITIONAL heuristic (a blanket future-marker scan was fail-OPEN: a present-
+    // tense claim with a TRAILING modal — "references fn x(), this will help" —
+    // got downgraded to Unknown, so verify() skipped the §4.3 hallucinated-fn
+    // check). A future-intent marker counts ONLY when it appears BEFORE the fn
+    // token (the intent precedes the fn); a marker after it (or none) keeps the
+    // segment a verifiable claim. Word-boundary membership (split on
+    // non-alphanumeric) avoids substring traps (`planned`⊅`plan`, an fn named
+    // `handle_todo`⊅`todo` — the fn name is after the token, never in the prefix).
     let fn_names = extract_fn_names(s);
-    if !fn_names.is_empty() && !is_future_intent {
-        return Claim::FunctionExists { fn_names };
+    if !fn_names.is_empty() {
+        // Compute the prefix on `s` itself, not `lower` — `to_lowercase` is NOT
+        // byte-length-preserving, so an `s`-derived offset into `lower` could
+        // panic / mis-slice on non-ASCII (the #2117-C1 class). Slice `s`, then
+        // lowercase the (now-bounded) prefix.
+        let fn_at = first_fn_token_index(s).unwrap_or(s.len());
+        let prefix_lower = s[..fn_at].to_lowercase();
+        if !prefix_has_future_marker(&prefix_lower) {
+            return Claim::FunctionExists { fn_names };
+        }
     }
     Claim::Unknown(s.to_string())
+}
+
+/// Byte index of the first `fn <name>(` token in `s` (mirrors `extract_fn_names`'
+/// detection). Used to bound the future-intent prefix scan in `parse_one`.
+fn first_fn_token_index(s: &str) -> Option<usize> {
+    let mut search = 0;
+    while let Some(rel) = s[search..].find("fn ") {
+        let idx = search + rel;
+        let after = &s[idx + 3..];
+        let name: String = after
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if !name.is_empty() {
+            if let Some(rest) = after.get(name.len()..) {
+                if rest.trim_start().starts_with('(') {
+                    return Some(idx);
+                }
+            }
+        }
+        search = idx + 3;
+    }
+    None
+}
+
+/// Whether the (already-lowercased) text before an `fn` token carries a
+/// future/intended-work marker. Word-boundary membership so substrings can't
+/// trip it.
+fn prefix_has_future_marker(prefix_lower: &str) -> bool {
+    const FUTURE_WORDS: &[&str] = &[
+        "will",
+        "would",
+        "plan",
+        "plans",
+        "planned",
+        "planning",
+        "intend",
+        "intends",
+        "intending",
+        "going",
+        "todo",
+        "later",
+        "eventually",
+        "soon",
+        "followup",
+    ];
+    prefix_lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|w| FUTURE_WORDS.contains(&w))
 }
 
 /// Extract file paths from a claim string (backtick-delimited or whitespace tokens ending in known extensions).

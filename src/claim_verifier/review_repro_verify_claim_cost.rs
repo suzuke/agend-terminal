@@ -87,3 +87,26 @@ fn deliberate_fn_exists_claim_is_not_unknown_verify_claim_cost() {
          FunctionExists claim, not fall through to Unknown"
     );
 }
+
+/// RED-guard against the fail-OPEN regression that a blanket future-marker scan
+/// introduced (dual-1 REJECT): a PRESENT-TENSE fn claim whose SAME segment also
+/// contains a common modal AFTER the fn reference ("references fn x() — this will
+/// help") must STAY a verifiable FunctionExists. Downgrading it to Unknown would
+/// make `verify()` return passed:true and SKIP the §4.3 hallucinated-fn check —
+/// letting a non-existent fn through (worse than the original over-reject, which
+/// was fail-CLOSED). The positional heuristic (marker must precede the fn token)
+/// keeps this a claim because `will` appears AFTER `fn verify_push(`.
+#[test]
+fn present_tense_fn_claim_with_trailing_modal_stays_function_exists_verify_claim_cost() {
+    let claims = parse_claims("references fn verify_push() — this will help reviewers");
+    assert_eq!(claims.len(), 1, "one segment -> one claim");
+    assert_eq!(
+        claims,
+        vec![Claim::FunctionExists {
+            fn_names: vec!["verify_push".into()]
+        }],
+        "a present-tense fn assertion with a TRAILING modal must remain a \
+         verifiable FunctionExists (the modal is about reviewers, not future \
+         work) — downgrading to Unknown fail-OPENs the hallucinated-fn check"
+    );
+}
