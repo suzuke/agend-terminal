@@ -302,8 +302,24 @@ fn first_member_conflict(
     None
 }
 
-pub fn add_team_to_yaml(home: &Path, name: &str, config: &TeamConfig) -> Result<bool> {
-    let mut inserted = false;
+/// Outcome of a lock-held team write (#t-91 F1/F2). Distinguishes the two
+/// rejection reasons so callers log accurate messages instead of a blanket
+/// "team already exists". `MemberConflict` carries the offending member and the
+/// team it already belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TeamWriteOutcome {
+    /// The team was created (add) or updated (update).
+    Written,
+    /// add only: a team with this name already exists.
+    NameExists,
+    /// update only: no team with this name exists to update.
+    NotFound,
+    /// One-agent-one-team rejection: `member` already belongs to `team`.
+    MemberConflict { member: String, team: String },
+}
+
+pub fn add_team_to_yaml(home: &Path, name: &str, config: &TeamConfig) -> Result<TeamWriteOutcome> {
+    let mut outcome = TeamWriteOutcome::Written;
     mutate_fleet_yaml(home, "teams: {}\n", |doc| {
         if doc.get("teams").is_none() {
             doc["teams"] = serde_yaml_ng::Value::Mapping(serde_yaml_ng::Mapping::new());
@@ -314,6 +330,7 @@ pub fn add_team_to_yaml(home: &Path, name: &str, config: &TeamConfig) -> Result<
             .context("teams is not a mapping")?;
         let key = serde_yaml_ng::Value::String(name.to_string());
         if teams.contains_key(&key) {
+            outcome = TeamWriteOutcome::NameExists;
             return Ok(false);
         }
         // #CR-2026-06-14 (teams.rs:174 TOCTOU): enforce one-agent-one-team INSIDE
@@ -327,17 +344,21 @@ pub fn add_team_to_yaml(home: &Path, name: &str, config: &TeamConfig) -> Result<
                 %member, %existing_team, attempted_team = %name,
                 "team create rejected under lock: member already in another team (one-agent-one-team)"
             );
+            outcome = TeamWriteOutcome::MemberConflict {
+                member,
+                team: existing_team,
+            };
             return Ok(false);
         }
         teams.insert(
             key,
             serde_yaml_ng::Value::Mapping(team_config_to_mapping(config)),
         );
-        inserted = true;
+        outcome = TeamWriteOutcome::Written;
         tracing::info!(%name, "added team to fleet.yaml");
         Ok(true)
     })?;
-    Ok(inserted)
+    Ok(outcome)
 }
 
 pub fn remove_team_from_yaml(home: &Path, name: &str) -> Result<bool> {
@@ -357,8 +378,12 @@ pub fn remove_team_from_yaml(home: &Path, name: &str) -> Result<bool> {
     Ok(removed)
 }
 
-pub fn update_team_in_yaml(home: &Path, name: &str, config: &TeamConfig) -> Result<bool> {
-    let mut existed = false;
+pub fn update_team_in_yaml(
+    home: &Path,
+    name: &str,
+    config: &TeamConfig,
+) -> Result<TeamWriteOutcome> {
+    let mut outcome = TeamWriteOutcome::NotFound;
     mutate_fleet_yaml(home, "", |doc| {
         if let Some(teams) = doc.get_mut("teams").and_then(|v| v.as_mapping_mut()) {
             let key = serde_yaml_ng::Value::String(name.to_string());
@@ -376,18 +401,24 @@ pub fn update_team_in_yaml(home: &Path, name: &str, config: &TeamConfig) -> Resu
                         %member, %existing_team, attempted_team = %name,
                         "team update rejected under lock: member already in another team (one-agent-one-team)"
                     );
+                    outcome = TeamWriteOutcome::MemberConflict {
+                        member,
+                        team: existing_team,
+                    };
                     return Ok(false);
                 }
                 teams.insert(
                     key,
                     serde_yaml_ng::Value::Mapping(team_config_to_mapping(config)),
                 );
-                existed = true;
+                outcome = TeamWriteOutcome::Written;
+                return Ok(true);
             }
         }
-        Ok(existed)
+        // team absent → outcome stays NotFound, no write
+        Ok(false)
     })?;
-    Ok(existed)
+    Ok(outcome)
 }
 
 pub fn migrate_teams_json_to_yaml(home: &Path) -> Result<()> {
@@ -443,7 +474,7 @@ pub fn migrate_teams_json_to_yaml(home: &Path) -> Result<()> {
             accept_from: Vec::new(),
         };
         match add_team_to_yaml(home, &team.name, &cfg) {
-            Ok(true) => {
+            Ok(TeamWriteOutcome::Written) => {
                 tracing::info!(name = %team.name, "migrated team to fleet.yaml");
                 tracing::warn!(
                     name = %team.name,
@@ -460,8 +491,22 @@ pub fn migrate_teams_json_to_yaml(home: &Path) -> Result<()> {
                      set via team(action=update) to avoid Tier 4 stub fallback",
                 );
             }
-            Ok(false) => tracing::info!(name = %team.name,
+            Ok(TeamWriteOutcome::NameExists) => tracing::info!(name = %team.name,
                 "team already in fleet.yaml, skipping migration entry"),
+            // #t-91 F2: accurate message — a member-conflict skip is NOT a
+            // name-collision. (Behavior unchanged: the second team is still
+            // dropped from the migration; the source rows survive in
+            // teams.json.migrated. Making it non-lossy is a separate change.)
+            Ok(TeamWriteOutcome::MemberConflict {
+                member,
+                team: existing,
+            }) => {
+                tracing::warn!(name = %team.name, %member, existing_team = %existing,
+                    "migration skipped team: member already in another team (one-agent-one-team); entry dropped (recoverable from teams.json.migrated)")
+            }
+            // update-only outcome; unreachable on the add path, logged defensively.
+            Ok(TeamWriteOutcome::NotFound) => tracing::warn!(name = %team.name,
+                "unexpected NotFound from add_team_to_yaml during migration"),
             Err(e) => {
                 tracing::warn!(name = %team.name, error = %e,
                     "team migration failed, leaving teams.json in place");

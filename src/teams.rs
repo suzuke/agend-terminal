@@ -215,7 +215,7 @@ pub fn create(home: &Path, args: &Value) -> Value {
         accept_from,
     };
     match crate::fleet::add_team_to_yaml(home, &name, &cfg) {
-        Ok(true) => {
+        Ok(crate::fleet::TeamWriteOutcome::Written) => {
             if cfg.orchestrator.is_some() {
                 cleanup_orchestrator_tasks_for_team(home, &name);
             }
@@ -225,8 +225,18 @@ pub fn create(home: &Path, args: &Value) -> Value {
             }
             result
         }
-        // Race: someone wrote the team between our check and write.
-        Ok(false) => serde_json::json!({"error": format!("team '{name}' already exists")}),
+        // #t-91 F1: distinguish the two lock-held rejection reasons so the error
+        // is accurate (the previous blanket "already exists" mis-described a
+        // member-conflict race).
+        Ok(crate::fleet::TeamWriteOutcome::NameExists) => {
+            serde_json::json!({"error": format!("team '{name}' already exists")})
+        }
+        Ok(crate::fleet::TeamWriteOutcome::MemberConflict { member, team }) => {
+            serde_json::json!({"error": format!("member '{member}' already in team '{team}'")})
+        }
+        Ok(crate::fleet::TeamWriteOutcome::NotFound) => {
+            serde_json::json!({"error": format!("team '{name}' could not be created")})
+        }
         Err(e) => serde_json::json!({"error": format!("{e}")}),
     }
 }
@@ -496,14 +506,24 @@ pub fn update(home: &Path, args: &Value) -> Value {
         accept_from: new_accept_from,
     };
     match crate::fleet::update_team_in_yaml(home, &name, &cfg) {
-        Ok(true) => {
+        Ok(crate::fleet::TeamWriteOutcome::Written) => {
             if cfg.orchestrator.is_some() {
                 cleanup_orchestrator_tasks_for_team(home, &name);
             }
             serde_json::json!({"status": "updated", "name": name})
         }
         // Disappeared between load and write.
-        Ok(false) => serde_json::json!({"error": format!("team '{name}' not found")}),
+        Ok(crate::fleet::TeamWriteOutcome::NotFound) => {
+            serde_json::json!({"error": format!("team '{name}' not found")})
+        }
+        // #t-91 F1: a concurrent add/update double-booked a member — report it
+        // accurately instead of the stale "not found".
+        Ok(crate::fleet::TeamWriteOutcome::MemberConflict { member, team }) => {
+            serde_json::json!({"error": format!("member '{member}' already in team '{team}'")})
+        }
+        Ok(crate::fleet::TeamWriteOutcome::NameExists) => {
+            serde_json::json!({"error": format!("team '{name}' already exists")})
+        }
         Err(e) => serde_json::json!({"error": format!("{e}")}),
     }
 }

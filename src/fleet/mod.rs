@@ -10,7 +10,7 @@ pub use watchdog::WatchdogConfig;
 pub use persist::{
     add_instance_to_yaml, add_instances_to_yaml, add_team_to_yaml, migrate_teams_json_to_yaml,
     remove_instance_from_yaml, remove_instances_from_yaml, remove_team_from_yaml,
-    update_channel_telegram_group_id, update_instance_field, update_team_in_yaml,
+    update_channel_telegram_group_id, update_instance_field, update_team_in_yaml, TeamWriteOutcome,
 };
 
 use crate::backend::Backend;

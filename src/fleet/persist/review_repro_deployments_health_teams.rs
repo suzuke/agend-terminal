@@ -18,7 +18,7 @@
 
 #![allow(clippy::unwrap_used)]
 
-use super::{add_team_to_yaml, update_team_in_yaml};
+use super::{add_team_to_yaml, update_team_in_yaml, TeamWriteOutcome};
 use crate::fleet::{fleet_yaml_path, FleetConfig, TeamConfig};
 
 fn tmp_home(tag: &str) -> std::path::PathBuf {
@@ -54,7 +54,11 @@ fn add_team_to_yaml_enforces_one_agent_one_team_deployments_health_teams() {
     // Establish team 'alpha' owning member 'shared'.
     let inserted_alpha = add_team_to_yaml(&home, "alpha", &team_with_member("shared"))
         .expect("add_team_to_yaml alpha must not error");
-    assert!(inserted_alpha, "team 'alpha' should be newly inserted");
+    assert_eq!(
+        inserted_alpha,
+        TeamWriteOutcome::Written,
+        "team 'alpha' should be newly inserted"
+    );
 
     // Now attempt to add a DIFFERENT team 'beta' that also claims 'shared'.
     // The team-name key is free, so the lock-held closure's name-only re-check
@@ -121,6 +125,45 @@ fn update_team_to_yaml_enforces_one_agent_one_team_t50() {
          re-checked only on a stale snapshot, not under the write lock",
         teams_with_shared.len(),
         teams_with_shared
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// t-91 / #2208 r6 control: a legitimate update that KEEPS the team's own
+/// existing member and ADDS a brand-new (unclaimed) member must NOT be
+/// false-rejected by the one-agent-one-team gate — `exclude_team` must skip the
+/// team being updated so its own members never count as a conflict against
+/// itself. Guards against a regression where the exclude_team logic starts
+/// false-rejecting legitimate self-updates.
+#[test]
+fn update_team_keeping_own_member_plus_new_is_not_false_rejected_t91() {
+    let home = tmp_home("update-control");
+    std::fs::write(fleet_yaml_path(&home), "teams: {}\n").expect("seed fleet.yaml");
+
+    // 'alpha' owns 'a1'; no other team claims 'a2'.
+    add_team_to_yaml(&home, "alpha", &team_with_member("a1")).expect("add alpha must not error");
+
+    // Update 'alpha' to keep 'a1' AND add a brand-new, unclaimed 'a2'.
+    let mut cfg = team_with_member("a1");
+    cfg.members = vec!["a1".to_string(), "a2".to_string()];
+    let outcome =
+        update_team_in_yaml(&home, "alpha", &cfg).expect("update_team_in_yaml must not error");
+    assert_eq!(
+        outcome,
+        TeamWriteOutcome::Written,
+        "a legitimate self-update (keep own member + add a new unclaimed one) must NOT be \
+         rejected by the one-agent-one-team gate; exclude_team must skip the team being \
+         updated. got {outcome:?}"
+    );
+
+    // Both members must have landed.
+    let reload = FleetConfig::load(&fleet_yaml_path(&home)).expect("reload fleet.yaml");
+    let alpha = reload.teams.get("alpha").expect("alpha exists");
+    assert!(
+        alpha.members.iter().any(|m| m == "a1") && alpha.members.iter().any(|m| m == "a2"),
+        "both a1 and a2 must be present after the update: {:?}",
+        alpha.members
     );
 
     std::fs::remove_dir_all(&home).ok();
