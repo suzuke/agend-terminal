@@ -8,14 +8,14 @@ pub(crate) fn handle_register_external(params: &Value, ctx: &HandlerCtx) -> Valu
     register_external_with_seam(params, ctx, None)
 }
 
-/// `after_managed_check_seam`: test-only injection point fired AFTER the managed
-/// fast-path check and BEFORE `lock_external`, used to deterministically
-/// reproduce the register-managed/register-external TOCTOU window (t-65).
-/// `None` in production.
+/// `before_managed_recheck_seam`: test-only injection point fired WHILE the
+/// external lock is held but BEFORE the managed re-check + insert — used to
+/// deterministically reproduce a concurrent managed spawn landing in the
+/// register-external window (t-65). `None` in production.
 fn register_external_with_seam(
     params: &Value,
     ctx: &HandlerCtx,
-    after_managed_check_seam: Option<&dyn Fn()>,
+    before_managed_recheck_seam: Option<&dyn Fn()>,
 ) -> Value {
     let name = match params["name"].as_str() {
         Some(n) => n,
@@ -23,23 +23,6 @@ fn register_external_with_seam(
     };
     if let Err(e) = agent::validate_name(name) {
         return json!({"ok": false, "error": e});
-    }
-    // Fast-path managed-name reject (avoids taking the external lock for an
-    // obvious collision). #1441: registry is UUID-keyed; resolve via fleet.yaml.
-    // NON-authoritative — the binding decision is the re-check UNDER the external
-    // lock below (t-65); this only short-circuits the common case.
-    {
-        let reg = agent::lock_registry(ctx.registry);
-        if crate::fleet::resolve_uuid(ctx.home, name).is_some_and(|id| reg.contains_key(&id)) {
-            return json!({"ok": false, "error": format!("agent '{name}' already exists (managed)")});
-        }
-    }
-    if let Some(seam) = after_managed_check_seam {
-        seam();
-    }
-    let mut ext = agent::lock_external(ctx.externals);
-    if ext.contains_key(name) {
-        return json!({"ok": false, "error": format!("agent '{name}' already exists (external)")});
     }
     let backend = params["backend"].as_str().unwrap_or("unknown");
     // #1891: `pid` is required for liveness tracking — a missing / null /
@@ -57,14 +40,23 @@ fn register_external_with_seam(
             })
         }
     };
-    // t-65 (TOCTOU): re-check the managed registry UNDER the external lock and
-    // hold the registry lock ACROSS the insert. external→registry is the safe
-    // order — #2197 removed the only registry→external nesting, so no AB-BA
-    // partner exists (audited: every `lock_external` site drops the registry
-    // first or never holds it). This makes the managed re-check + external insert
-    // atomic w.r.t. a concurrent managed spawn (which must take the registry lock
-    // to insert), closing the window the prior drop(reg)→lock_external left
-    // between the fast-path check and the insert.
+    // t-65 (TOCTOU) + #2197 (lock order): take the external lock FIRST, then the
+    // registry lock (external→registry — the safe order). #2197 removed every
+    // registry→external nesting (audited across all `lock_external` sites: each
+    // drops the registry first or never holds it), so external→registry has no
+    // AB-BA partner. Holding BOTH across the managed re-check + insert makes
+    // "no managed `name`" + "insert external `name`" atomic w.r.t. a concurrent
+    // managed spawn (which serializes on the registry lock to insert) — closing
+    // the check→insert TOCTOU. The registry lock is NEVER taken before the
+    // external lock here, so this is NOT the registry→external nesting #2197
+    // removed.
+    let mut ext = agent::lock_external(ctx.externals);
+    if ext.contains_key(name) {
+        return json!({"ok": false, "error": format!("agent '{name}' already exists (external)")});
+    }
+    if let Some(seam) = before_managed_recheck_seam {
+        seam();
+    }
     {
         let reg = agent::lock_registry(ctx.registry);
         if crate::fleet::resolve_uuid(ctx.home, name).is_some_and(|id| reg.contains_key(&id)) {
@@ -183,13 +175,14 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// t-65: a managed agent created in the TOCTOU window — between
-    /// register_external's managed fast-path check and its external insert —
-    /// must NOT produce a managed/external name collision. The fix re-checks the
-    /// managed registry under the external lock (external→registry) before
-    /// inserting; pre-fix the external entry was written despite the managed
-    /// twin. Deterministic via the `after_managed_check_seam` hook (no flaky
-    /// thread timing). `unix`-gated: `mk_test_handle` spawns a `true` PTY.
+    /// t-65: a managed agent created in the register-external window — while the
+    /// external lock is held, before the managed re-check + insert — must NOT
+    /// produce a managed/external name collision. The fix re-checks the managed
+    /// registry under the external lock (external→registry) before inserting;
+    /// pre-fix (insert without that re-check) the external entry was written
+    /// despite the managed twin. Deterministic via the
+    /// `before_managed_recheck_seam` hook (no flaky thread timing). `unix`-gated:
+    /// `mk_test_handle` spawns a `true` PTY.
     #[cfg(unix)]
     #[test]
     fn register_external_rejects_managed_created_in_toctou_window_t65() {
@@ -197,9 +190,9 @@ mod tests {
         let (ctx, home) = test_ctx();
         let name = "twin";
 
-        // Seam fires in the window (after the managed fast-path check, before
-        // lock_external): land a concurrent managed `twin` in fleet.yaml +
-        // registry so the post-fix re-check sees it.
+        // Seam fires in the window (external lock held, before the managed
+        // re-check + insert): land a concurrent managed `twin` in fleet.yaml +
+        // registry so the re-check sees it.
         let inject = || {
             let id = crate::types::InstanceId::parse(ID).unwrap();
             std::fs::write(
