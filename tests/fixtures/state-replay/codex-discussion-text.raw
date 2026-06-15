@@ -1,0 +1,5 @@
+[2J[H[0mNotes on codex net-error handling: a transient connection reset is treated as
+ServerRateLimit only when it sits on a real backend fault line. This prose mentions
+connection reset and rate limit in passing and must not latch any state.
+
+› 

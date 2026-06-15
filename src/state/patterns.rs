@@ -27,7 +27,19 @@ use regex::Regex;
 // #8 Phase 2 (KiroCli migration): pub(crate) so the co-located BackendProfile
 // references this shared net-error alternation by the SAME const (not a re-typed
 // copy). (#1580: the legacy compile_for arm that also used it is now gone.)
-pub(crate) const SERVER_RATE_LIMIT_NET_ERRORS: &str = r"ECONNRESET|ETIMEDOUT|InvalidHTTPResponse|fetch failed|connection reset|socket hang up|proxy.*disconnect";
+//
+// #1523 #1470-1: the alternation is wrapped in a scoped case-insensitive group
+// `(?i:…)` so backend-rendered casing variants of the SAME literal phrase match
+// — e.g. `Connection reset by peer` (capital C, the real Node/libc wording) hit
+// the lowercased `connection reset` token, which the previous case-SENSITIVE
+// compile silently missed. The loosening is FP-safe: ServerRateLimit is a
+// `is_high_fp_state` so a const match still has to clear `in_error_line_excluding_input`
+// (the token must sit on a real error-shaped line, not a prose mention) and the
+// #1518 live-bottom-N position gate — case-folding only normalises the SAME
+// token's casing, it does not widen what counts as the token. The `(?i:…)` group
+// is scoped (not a leading `(?i)` flag) so it stays self-contained if the const
+// is ever embedded in a larger pattern.
+pub(crate) const SERVER_RATE_LIMIT_NET_ERRORS: &str = r"(?i:ECONNRESET|ETIMEDOUT|InvalidHTTPResponse|fetch failed|connection reset|socket hang up|proxy.*disconnect)";
 
 // #1757's `is_net_error_match` red-anchor EXEMPTION was removed by
 // t-coloranchor-remove-ratelimit: ServerRateLimit now uses the general content
