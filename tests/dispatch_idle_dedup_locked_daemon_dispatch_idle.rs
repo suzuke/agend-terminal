@@ -56,7 +56,6 @@ fn block_after<'a>(src: &'a str, block_anchor: &str) -> &'a str {
 }
 
 #[test]
-#[ignore = "daemon-dispatch-idle dedup-refresh-unlocked: red until fix; remove #[ignore] after fix to confirm"]
 fn record_dispatch_dedup_refresh_uses_locked_rmw_daemon_dispatch_idle() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("src")

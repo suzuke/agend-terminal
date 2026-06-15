@@ -285,6 +285,20 @@ pub(crate) fn scan_and_emit(
     // own persisted snooze, so it is left as-is.
     scan_dev_vantage(home, &now, last_alerted, seeding);
     scan_fleet_vantage(home, &now, last_alerted);
+
+    // CR-2026-06-14: GC the dedup map so it doesn't grow one stale
+    // `("dev", agent)` entry per distinct agent name ever seen — deleted /
+    // redeployed agents would otherwise linger forever (unbounded growth over a
+    // long-running daemon). Mirror anti_stall.rs's `last_emitted.retain(...)`:
+    // keep the `("fleet", "*")` sentinel and any agent still present in the
+    // current activity scan; drop the rest (a re-appearing agent simply
+    // re-creates its entry on the next alert — losing the dedup stamp for an
+    // absent agent is harmless).
+    let live: HashSet<String> = enumerate_agent_activity(home)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    last_alerted.retain(|(vantage, agent), _| *vantage == "fleet" || live.contains(agent));
 }
 
 /// #1256: check if the task board has any tasks (indicating active use).

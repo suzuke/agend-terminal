@@ -6,9 +6,9 @@
 //! - Runs every 5 minutes via the supervisor's tick loop (10s
 //!   `TICK` × `TICKS_PER_SCAN = 30`).
 //! - Scans `task` board for entries with `status == in_progress`
-//!   AND `eta_secs.is_some()` AND `dispatched_at.is_some()`.
+//!   AND `eta_secs.is_some()` AND `started_at.is_some()`.
 //! - For each, computes elapsed since [`task_progress::read_last_progress_at`]
-//!   (falls back to `dispatched_at` when no progress sidecar exists).
+//!   (falls back to `started_at` when no progress sidecar exists).
 //! - When elapsed > eta_secs * 1.5 → enqueue `kind=task_stalled`
 //!   inbox message to general + lead.
 //! - Per-task dedup: tracks emitted-at timestamp per task to
@@ -17,7 +17,7 @@
 //! Failure modes (all fail-open):
 //! - Inbox enqueue failure: logged, scan continues.
 //! - Task list load failure: scan skipped, retried next tick.
-//! - Missing sidecar: falls back to `dispatched_at` (still valid).
+//! - Missing sidecar: falls back to `started_at` (still valid).
 
 use crate::task_events::TaskStatus;
 use crate::tasks::Task;
@@ -126,7 +126,7 @@ pub(crate) fn scan_and_emit(
 }
 
 /// Returns `Some(human_reason)` when the task has stalled, `None`
-/// otherwise. Encapsulates the eta_secs / dispatched_at /
+/// otherwise. Encapsulates the eta_secs / started_at /
 /// last_progress_at evaluation so [`scan_and_emit`] stays focused
 /// on iteration + emit.
 pub(crate) fn check_stalled(
@@ -142,7 +142,7 @@ pub(crate) fn check_stalled(
         return None;
     }
     // Floor for "when was the task last seen alive": progress
-    // sidecar timestamp if present, else dispatched_at. No anchor →
+    // sidecar timestamp if present, else started_at. No anchor →
     // skip stall detection (can't compute elapsed without one).
     let last_alive = crate::daemon::task_progress::read_last_progress_at(home, &task.id)
         .or_else(|| task.started_at.as_deref().and_then(parse_rfc3339))?;
