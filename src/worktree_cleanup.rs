@@ -125,11 +125,24 @@ fn is_worktree_dirty(worktree_path: &Path) -> bool {
         .unwrap_or(true)
 }
 
-/// Remove a worktree and delete its branch.
+/// Remove a worktree, and delete its branch ONLY when `delete_branch` is set.
+///
+/// CR-2026-06-14 (data-loss): the worktree-DIR removal and the `git branch -D`
+/// are DECOUPLED. Reclaiming the worktree directory is harmless, but deleting
+/// the branch ref is irreversible — a remote-gone branch carrying
+/// committed-but-unpushed local work would lose it. The caller passes
+/// `delete_branch = true` only when the work is preserved in the default branch
+/// (merged or squash-merged); otherwise the branch ref (and its unpushed
+/// commits) survives even though the stale worktree dir is reclaimed.
 ///
 /// On Windows, retries up to 3 times with exponential backoff (200ms, 400ms)
 /// to absorb transient EACCES from file locks held by preceding git processes.
-fn remove_worktree(repo_root: &Path, worktree_path: &str, branch: &str) -> bool {
+fn remove_worktree(
+    repo_root: &Path,
+    worktree_path: &str,
+    branch: &str,
+    delete_branch: bool,
+) -> bool {
     let max_attempts: u32 = if cfg!(windows) { 3 } else { 1 };
     let mut wt_ok = false;
     for attempt in 0..max_attempts {
@@ -144,7 +157,7 @@ fn remove_worktree(repo_root: &Path, worktree_path: &str, branch: &str) -> bool 
             break;
         }
     }
-    if wt_ok {
+    if wt_ok && delete_branch {
         // W1.2: best-effort branch delete (result was already ignored).
         let _ = crate::git_helpers::git_ok(repo_root, &["branch", "-D", branch]);
     }
@@ -214,6 +227,13 @@ pub fn sweep_from_registry(
             .env("AGEND_GIT_BYPASS", "1")
             .output();
 
+        // CR-2026-06-14: needed to decide whether a stale worktree's branch is
+        // safe to `branch -D` (its work is in the default branch) vs must be kept
+        // (committed-but-unpushed local work that a remote-gone signal alone
+        // would otherwise destroy). Mirrors the phase-2 `prune_orphaned_branches`
+        // safety gate.
+        let default = crate::git_helpers::default_branch(repo);
+
         // Phase 1: clean worktrees (existing logic + remote-gone)
         let entries = list_worktrees(repo);
         for entry in &entries {
@@ -235,13 +255,24 @@ pub fn sweep_from_registry(
                 continue;
             }
 
+            // CR-2026-06-14 (data-loss): reclaim the stale worktree DIR on
+            // (merged || gone), but `branch -D` ONLY when the work is preserved
+            // in the default branch — merged (ancestor) or squash-merged. A
+            // remote-gone worktree whose branch is NEITHER carries
+            // committed-but-unpushed local work; deleting the ref would lose it
+            // irrecoverably (phase-1 only skips *dirty* worktrees, not
+            // committed-but-unpushed ones). The worktree dir is still reclaimed.
+            let branch_safe_to_delete =
+                merged || is_squash_gc_eligible(repo, &entry.branch, &default);
+
             tracing::info!(
                 branch = %entry.branch,
                 path = %entry.path,
                 reason = if merged { "merged" } else { "remote-gone" },
+                delete_branch = branch_safe_to_delete,
                 "removing stale worktree"
             );
-            if remove_worktree(repo, &entry.path, &entry.branch) {
+            if remove_worktree(repo, &entry.path, &entry.branch, branch_safe_to_delete) {
                 removed.push((entry.branch.clone(), entry.path.clone()));
             }
         }

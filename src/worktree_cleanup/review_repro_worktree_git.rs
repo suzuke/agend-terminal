@@ -10,10 +10,11 @@
 
 #![allow(clippy::expect_used)]
 
-use super::prune_orphaned_branches;
+use super::{prune_orphaned_branches, sweep_from_registry};
 // `is_in_use` is only exercised by the #[cfg(unix)] symlink-based test below
 #[cfg(unix)]
 use super::is_in_use;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -127,6 +128,106 @@ fn prune_keeps_remote_gone_branch_with_unpushed_commits_worktree_git() {
     assert!(
         branch_exists(&repo, "feat/unpushed"),
         "the branch ref (and its unpushed commits) must survive the prune"
+    );
+
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&remote).ok();
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// t-55 (CR follow-up, data-loss): the PHASE-1 stale-worktree sweep had the same
+// unrecoverable data-loss bug as the phase-2 prune (#2193). `remove_worktree`
+// ran `git worktree remove --force` AND an unconditional `git branch -D`, and
+// the phase-1 gate only skips DIRTY worktrees — a remote-gone worktree whose
+// branch carries committed-but-unpushed local work (clean tree, work not in
+// default) was reaped, destroying the commits. CORRECT (decouple): reclaim the
+// worktree DIR, but keep the branch ref unless its work is in the default branch
+// (merged or squash-merged).
+// ──────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn phase1_remote_gone_worktree_keeps_unpushed_branch_ref_worktree_git() {
+    // A bare "remote" + a clone, so `branch.<name>.remote` is real.
+    let remote = scratch("p1-remote-gone-bare");
+    git(&remote, &["init", "--bare", "-b", "main"]);
+
+    let repo = scratch("p1-remote-gone-clone");
+    std::process::Command::new("git")
+        .args([
+            "clone",
+            &remote.display().to_string(),
+            &repo.display().to_string(),
+        ])
+        .env("AGEND_GIT_BYPASS", "1")
+        .env("GIT_AUTHOR_NAME", "test")
+        .env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "test")
+        .env("GIT_COMMITTER_EMAIL", "t@t")
+        .output()
+        .expect("git clone");
+
+    std::fs::write(repo.join("README.md"), "init").ok();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "init"]);
+    git(&repo, &["push", "-u", "origin", "main"]);
+
+    // Feature branch with REAL committed work (so it is NOT in `main` → neither
+    // merged nor squash-merged): push it (configures upstream), add an unpushed
+    // local commit, then put a worktree on it.
+    git(&repo, &["checkout", "-b", "feat/unpushed-wt"]);
+    std::fs::write(repo.join("feat.txt"), "feature").ok();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "first (pushed)"]);
+    git(&repo, &["push", "-u", "origin", "feat/unpushed-wt"]);
+    std::fs::write(repo.join("feat.txt"), "more local work").ok();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "unpushed local work"]);
+    git(&repo, &["checkout", "main"]);
+
+    let wt = repo.join("wt-unpushed");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            &wt.display().to_string(),
+            "feat/unpushed-wt",
+        ],
+    );
+
+    // Remote head deleted (PR closed / branch removed), then prune so the local
+    // remote-tracking ref disappears → is_remote_gone() == true.
+    git(&remote, &["branch", "-D", "feat/unpushed-wt"]);
+    git(&repo, &["fetch", "--prune"]);
+
+    assert!(
+        branch_exists(&repo, "feat/unpushed-wt"),
+        "precondition: branch must exist before the sweep"
+    );
+
+    // Drive the phase-1 sweep (auto-cleanup is on by default; set explicitly for
+    // determinism — the git-subprocess serialize group prevents an env race).
+    std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
+    let mut configs: HashMap<String, (Option<PathBuf>, Option<PathBuf>)> = HashMap::new();
+    configs.insert(
+        "other".to_string(),
+        (Some(repo.join("other")), Some(repo.clone())),
+    );
+    let removed = sweep_from_registry(&configs, &[]);
+    std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
+
+    // The stale worktree DIR IS still reclaimed (harmless disk cleanup)...
+    assert!(
+        removed.iter().any(|(b, _)| b == "feat/unpushed-wt"),
+        "the stale remote-gone worktree dir must still be reclaimed: {removed:?}"
+    );
+    // ...but the branch ref (and its committed-but-unpushed commits) MUST survive
+    // — phase-1's `branch -D` is gated on merged||squash, not the remote-gone
+    // signal alone. Pre-fix `remove_worktree` force-deleted the branch here.
+    assert!(
+        branch_exists(&repo, "feat/unpushed-wt"),
+        "a remote-gone worktree with committed-but-unpushed local work must keep \
+         its branch ref after the sweep (dir reclaimed, ref + commits survive)"
     );
 
     std::fs::remove_dir_all(&repo).ok();
