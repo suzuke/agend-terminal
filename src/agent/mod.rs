@@ -331,12 +331,19 @@ pub fn resolve_instance(
 
     // 3. Exact name match — HashMap guarantees at most one entry per name.
     if let Some(inst) = fleet.instances.get(name_or_id) {
-        let id = inst
-            .id
-            .as_deref()
-            .and_then(crate::types::InstanceId::parse)
-            .unwrap_or_default();
-        return Ok((id, name_or_id.to_string()));
+        // CR-2026-06-14: an instance whose fleet.yaml `id` is absent or
+        // unparseable has NO stable identity. The prior `.unwrap_or_default()`
+        // minted a FRESH random UUID on every call (`InstanceId::default()` =
+        // `new_v4`) — non-deterministic, silently breaking every id-keyed
+        // correlation (routing / task-event emitter / dedup / audit). Refuse
+        // instead of fabricating, matching the authoritative
+        // `fleet::resolve_uuid` (which returns `None` for the same case).
+        // Callers degrade correctly: task_events → no emitter id; comms → falls
+        // through to name/team routing.
+        return match inst.id.as_deref().and_then(crate::types::InstanceId::parse) {
+            Some(id) => Ok((id, name_or_id.to_string())),
+            None => Err(ResolveError::NotFound(name_or_id.to_string())),
+        };
     }
 
     Err(ResolveError::NotFound(name_or_id.to_string()))
@@ -1610,8 +1617,14 @@ pub(crate) fn classify_exit(exit_code: Option<i32>) -> ExitKind {
             ExitKind::Crash
         }
         None => {
-            tracing::warn!("process didn't exit in 2s, treating as crash");
-            ExitKind::Crash
+            // CR-2026-06-14: a never-observed exit (no code within the 2s poll
+            // window) is reached when the daemon force-kills / sweeps a wedged
+            // process tree — NOT a spontaneous crash. Classifying it as Crash
+            // drove a respawn of a process the daemon deliberately tore down.
+            // Treat it as a SignalKill (daemon-induced teardown), which is not
+            // respawned.
+            tracing::warn!("process didn't exit in 2s — treating as signal-kill (daemon teardown), not a respawnable crash");
+            ExitKind::SignalKill
         }
     }
 }
