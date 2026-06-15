@@ -76,16 +76,18 @@ pub(crate) fn git_bypass_timeout(
 /// behaviour — instead of being forced through [`git_bypass_timeout`] (which
 /// always sets the bypass env).
 ///
-/// CR-2026-06-14 #5 (deadlock-safety): stdout AND stderr are drained on
-/// dedicated reader threads CONCURRENTLY with the wait poll. The OS pipe buffer
-/// is small and fixed (macOS ~16KB, non-growing); a child that emits more than
-/// one buffer's worth (e.g. `gh api .../compare` returning a multi-MB diff JSON,
+/// CR-2026-06-14 #5 (deadlock-safety): stdout AND stderr are drained on dedicated
+/// SCOPED reader threads CONCURRENTLY with the wait poll. The OS pipe buffer is
+/// small and fixed (macOS ~16KB, non-growing); a child that emits more than one
+/// buffer's worth (e.g. `gh api .../compare` returning a multi-MB diff JSON,
 /// reached via `merge_freshness`/`task_sweep`) blocks in `write()` until a reader
 /// drains the pipe. The earlier loop only `try_wait()`d — never reading until
 /// after exit — so such a child never exited, hit the deadline, and was
-/// false-timeout-killed. The reader threads keep both pipes drained so the child
+/// false-timeout-killed. The scoped readers keep both pipes drained so the child
 /// can always make progress to exit (this is what std's `wait_with_output` does
-/// via `read2`, reconstructed here so it composes with the timeout poll).
+/// via `read2`, reconstructed here so it composes with the timeout poll). Scoped
+/// threads are joined for free at scope close, so they cannot leak — §10.5's
+/// graceful-join, compiler-enforced.
 pub(crate) fn spawn_group_bounded(
     mut cmd: std::process::Command,
     label: &str,
@@ -107,65 +109,79 @@ pub(crate) fn spawn_group_bounded(
         cmd.creation_flags(0x0000_0200);
     }
     let mut child = cmd.spawn()?;
-
-    // Drain both pipes concurrently (see the deadlock-safety note above). The
-    // readers run until EOF — which arrives when the child exits normally OR when
-    // the process-group kill below closes the pipes — so they always join.
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
-    let stdout_reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut p) = stdout_pipe {
-            let _ = p.read_to_end(&mut buf);
-        }
-        buf
-    });
-    let stderr_reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut p) = stderr_pipe {
-            let _ = p.read_to_end(&mut buf);
-        }
-        buf
-    });
 
-    // #1897: poll with EXPONENTIAL BACKOFF (1ms → 50ms cap). The previous fixed
-    // 200ms poll added up to 200ms of latency per git call vs the old immediate
-    // `.output()`, which PERTURBED timing-sensitive concurrent callers (the
-    // `checkout_bind_true_concurrent_branch_create_race` test flaked ~50%). A
-    // fast git op (the common case — rev-parse / branch / status are sub-100ms)
-    // now returns within a couple ms, matching `.output()` latency; a genuinely
-    // slow op backs off to a cheap 50ms poll.
-    let start = std::time::Instant::now();
-    let mut poll = Duration::from_millis(1);
-    loop {
-        match child.try_wait()? {
-            Some(status) => {
-                let stdout = stdout_reader.join().unwrap_or_default();
-                let stderr = stderr_reader.join().unwrap_or_default();
-                return Ok(std::process::Output {
-                    status,
-                    stdout,
-                    stderr,
-                });
+    // Drain both pipes concurrently with the wait poll using SCOPED threads. A
+    // scope is GUARANTEED to join every thread it spawned before it returns —
+    // including on early `return` from the closure below — so these readers can
+    // never outlive the call or leak (the §10.5 graceful-join contract, here
+    // compiler-enforced; scoped `s.spawn` is categorically outside the
+    // detached-spawn rule the audit guards). Every non-normal exit path kills the
+    // child FIRST so its pipes close → the readers hit EOF → the scope's implicit
+    // join completes instead of blocking forever.
+    std::thread::scope(|s| {
+        let stdout_reader = s.spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = stdout_pipe {
+                let _ = p.read_to_end(&mut buf);
             }
-            None if start.elapsed() >= timeout => {
-                crate::process::kill_process_tree(child.id());
-                let _ = child.wait();
-                // The kill closed the pipes → the readers hit EOF and finish;
-                // join so they don't outlive the call (output discarded on error).
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!("{label} timed out after {timeout:?}"),
-                ));
+            buf
+        });
+        let stderr_reader = s.spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = stderr_pipe {
+                let _ = p.read_to_end(&mut buf);
             }
-            None => {
-                std::thread::sleep(poll);
-                poll = (poll * 2).min(Duration::from_millis(50));
+            buf
+        });
+
+        // #1897: poll with EXPONENTIAL BACKOFF (1ms → 50ms cap). The previous
+        // fixed 200ms poll added up to 200ms of latency per git call vs the old
+        // immediate `.output()`, which PERTURBED timing-sensitive concurrent
+        // callers (the `checkout_bind_true_concurrent_branch_create_race` test
+        // flaked ~50%). A fast git op (the common case — rev-parse / branch /
+        // status are sub-100ms) now returns within a couple ms, matching
+        // `.output()` latency; a genuinely slow op backs off to a cheap 50ms poll.
+        let start = std::time::Instant::now();
+        let mut poll = Duration::from_millis(1);
+        loop {
+            match child.try_wait() {
+                // Normal exit: the child closed its pipe ends, so the readers
+                // EOF; join them for the captured output.
+                Ok(Some(status)) => {
+                    let stdout = stdout_reader.join().unwrap_or_default();
+                    let stderr = stderr_reader.join().unwrap_or_default();
+                    return Ok(std::process::Output {
+                        status,
+                        stdout,
+                        stderr,
+                    });
+                }
+                Ok(None) if start.elapsed() >= timeout => {
+                    // Kill BEFORE returning so the pipes close and the scope's
+                    // implicit reader-join can complete (output discarded).
+                    crate::process::kill_process_tree(child.id());
+                    let _ = child.wait();
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("{label} timed out after {timeout:?}"),
+                    ));
+                }
+                Ok(None) => {
+                    std::thread::sleep(poll);
+                    poll = (poll * 2).min(Duration::from_millis(50));
+                }
+                // try_wait itself failed (rare). Kill first — same reason as the
+                // timeout path — then surface the error.
+                Err(e) => {
+                    crate::process::kill_process_tree(child.id());
+                    let _ = child.wait();
+                    return Err(e);
+                }
             }
         }
-    }
+    })
 }
 
 /// W1.2 (#REFACTOR-PLAN): a structured failure from [`git_cmd`]. Distinguishes a
