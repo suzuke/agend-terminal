@@ -5,8 +5,11 @@
 //! Resilience layers:
 //! - **Readonly mode**: when available disk space < 1 GiB (customizable via AGEND_LOW_DISK_THRESHOLD in bytes), enqueue returns an
 //!   error while drain continues to work (let agents consume backlog).
-//! - **Atomic append**: each enqueue writes to a temp file, fsyncs, then
-//!   renames — no half-written lines on crash.
+//! - **Append durability**: each enqueue is an in-place flock'd append + fsync
+//!   (NOT tmp+rename — that path is used only by the read-modify-write
+//!   rewriters: drain/sweep/clear/supersede). A crash can leave a half-written
+//!   trailing line, which read paths skip and `recover_half_writes` quarantines
+//!   at startup.
 //! - **Half-write recovery**: on startup, stale `.tmp` files and corrupt
 //!   JSONL lines are moved to `inbox.recovery/` for forensics.
 

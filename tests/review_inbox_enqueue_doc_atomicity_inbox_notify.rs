@@ -18,7 +18,6 @@ fn read_source_file(path: &PathBuf) -> String {
 }
 
 #[test]
-#[ignore = "enqueue-doc-contradicts-impl: red until fix; remove #[ignore] after fix to confirm"]
 fn enqueue_doc_does_not_claim_tmp_rename_atomicity_inbox_notify() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let storage = read_source_file(&root.join("src/inbox/storage.rs"));

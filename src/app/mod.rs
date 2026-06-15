@@ -707,6 +707,12 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                     Event::Resize(cols, rows) => {
                         let pane_area = ratatui::layout::Rect::new(0, 1, cols, rows.saturating_sub(2));
                         crate::layout::resize_panes(pane_area, &mut layout, &registry);
+                        // #1140: an interactive terminal resize reflows pane widths
+                        // (the wide→narrow transition that leaves stale wide-char
+                        // spacer cells in ratatui's Buffer::diff), so force the same
+                        // full clear the needs_resize path performs — otherwise the
+                        // ghost artifacts reappear after the resize.
+                        let _ = terminal.clear();
                     }
                     _ => {}
                 }
@@ -1486,8 +1492,12 @@ fn kill_agent(home: &Path, registry: &AgentRegistry, name: &str) {
 /// Used by the scratch shell overlay to self-close when the user exits the
 /// shell naturally (`exit`, Ctrl+D) or the process crashes. Returns `false`
 /// if the name is no longer registered (already reaped) or `try_wait`
-/// reports the child has exited. A poisoned child mutex is treated as alive
-/// so a spurious poison doesn't auto-dismiss the overlay — Esc still works.
+/// reports the child has exited. `AgentHandle.child` is a `parking_lot::Mutex`
+/// (which never poisons), so a CONTENDED lock is read via `try_lock()` and
+/// treated as alive: this runs on the TUI main loop, and a blocking `.lock()`
+/// would wedge the whole UI if another thread panicked while holding the child
+/// lock (parking_lot leaves it locked). Transient contention just keeps the
+/// overlay open for that tick — Esc still works.
 fn agent_is_alive(registry: &AgentRegistry, name: &str) -> bool {
     let reg = agent::lock_registry(registry);
     // #1441: registry is UUID-keyed; the overlay only knows the display name,
@@ -1498,9 +1508,11 @@ fn agent_is_alive(registry: &AgentRegistry, name: &str) -> bool {
     // Bind to a local so the child-lock's temporary MutexGuard drops
     // before `reg` does — returning the match expression directly trips
     // the borrow checker because temporaries outlive the registry lock.
-    let alive = {
-        let mut child = handle.child.lock();
-        !matches!(child.try_wait(), Ok(Some(_)))
+    let alive = match handle.child.try_lock() {
+        Some(mut child) => !matches!(child.try_wait(), Ok(Some(_))),
+        // Contended → cannot prove the child exited without blocking the main
+        // loop; treat as alive and re-check next tick.
+        None => true,
     };
     alive
 }
