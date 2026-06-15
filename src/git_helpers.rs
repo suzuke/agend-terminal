@@ -75,11 +75,23 @@ pub(crate) fn git_bypass_timeout(
 /// same bound + safe process-group kill while preserving their env/bypass
 /// behaviour — instead of being forced through [`git_bypass_timeout`] (which
 /// always sets the bypass env).
+///
+/// CR-2026-06-14 #5 (deadlock-safety): stdout AND stderr are drained on
+/// dedicated reader threads CONCURRENTLY with the wait poll. The OS pipe buffer
+/// is small and fixed (macOS ~16KB, non-growing); a child that emits more than
+/// one buffer's worth (e.g. `gh api .../compare` returning a multi-MB diff JSON,
+/// reached via `merge_freshness`/`task_sweep`) blocks in `write()` until a reader
+/// drains the pipe. The earlier loop only `try_wait()`d — never reading until
+/// after exit — so such a child never exited, hit the deadline, and was
+/// false-timeout-killed. The reader threads keep both pipes drained so the child
+/// can always make progress to exit (this is what std's `wait_with_output` does
+/// via `read2`, reconstructed here so it composes with the timeout poll).
 pub(crate) fn spawn_group_bounded(
     mut cmd: std::process::Command,
     label: &str,
     timeout: Duration,
 ) -> std::io::Result<std::process::Output> {
+    use std::io::Read;
     cmd.stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     // Group isolation only; NOT detached — we keep the captured stdout/stderr.
@@ -96,6 +108,26 @@ pub(crate) fn spawn_group_bounded(
     }
     let mut child = cmd.spawn()?;
 
+    // Drain both pipes concurrently (see the deadlock-safety note above). The
+    // readers run until EOF — which arrives when the child exits normally OR when
+    // the process-group kill below closes the pipes — so they always join.
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut p) = stdout_pipe {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut p) = stderr_pipe {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    });
+
     // #1897: poll with EXPONENTIAL BACKOFF (1ms → 50ms cap). The previous fixed
     // 200ms poll added up to 200ms of latency per git call vs the old immediate
     // `.output()`, which PERTURBED timing-sensitive concurrent callers (the
@@ -107,10 +139,22 @@ pub(crate) fn spawn_group_bounded(
     let mut poll = Duration::from_millis(1);
     loop {
         match child.try_wait()? {
-            Some(_status) => return child.wait_with_output(),
+            Some(status) => {
+                let stdout = stdout_reader.join().unwrap_or_default();
+                let stderr = stderr_reader.join().unwrap_or_default();
+                return Ok(std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
             None if start.elapsed() >= timeout => {
                 crate::process::kill_process_tree(child.id());
                 let _ = child.wait();
+                // The kill closed the pipes → the readers hit EOF and finish;
+                // join so they don't outlive the call (output discarded on error).
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     format!("{label} timed out after {timeout:?}"),
@@ -385,6 +429,36 @@ mod tests {
             "grandchild (pid {gpid}) must be reaped by the process-group kill"
         );
         let _ = std::fs::remove_file(&pidfile);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn spawn_group_bounded_drains_large_output_no_deadlock_cr20260614() {
+        // CR-2026-06-14 #5 (r2 reject): a child that writes MORE than one OS pipe
+        // buffer (macOS ~16KB, non-growing) must NOT deadlock. With a poll loop
+        // that only `try_wait()`s and reads after exit, the child blocks in
+        // write() once the buffer fills, never exits, and is false-timeout-killed
+        // at the deadline — exactly what would have hung `gh api .../compare`
+        // (multi-MB diff JSON) in merge_freshness. Emit 256KB (16× a macOS pipe
+        // buffer) and require it ALL back, exit-0, well under the bound.
+        let bytes = 256 * 1024;
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!("yes 0123456789abcde | head -c {bytes}"));
+        let start = std::time::Instant::now();
+        let out = spawn_group_bounded(cmd, "big stdout", Duration::from_secs(10))
+            .expect("large-output child must complete, not deadlock + false-timeout");
+        assert!(out.status.success(), "child exits 0");
+        assert_eq!(
+            out.stdout.len(),
+            bytes,
+            "every byte drained (no truncation)"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "must finish well under the 10s bound (no deadlock), took {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]
