@@ -245,12 +245,13 @@ pub(crate) fn record_dispatch(
     // Only when a `correlation_id` is present: without one we can't tell two
     // distinct dispatches apart, so fall through to a fresh sidecar.
     if let Some(corr) = correlation_id {
-        if let Some(mut existing) = list_pending(home).into_iter().find(|d| {
+        let is_same_intent = |d: &PendingDispatch| {
             matches!(d.status, DispatchStatus::Pending | DispatchStatus::Exceeded)
                 && d.dispatcher == dispatcher
                 && d.target == target
                 && d.correlation_id.as_deref() == Some(corr)
-        }) {
+        };
+        if let Some(mut existing) = list_pending(home).into_iter().find(is_same_intent) {
             existing.issued_at = chrono::Utc::now().to_rfc3339();
             existing.status = DispatchStatus::Pending;
             existing.nudge_sent_at = None;
@@ -268,17 +269,26 @@ pub(crate) fn record_dispatch(
             // stale — clear it so L2's second-window timer restarts from the next
             // real Exceeded transition (L1 re-stamps `exceeded_at` then).
             existing.exceeded_at = None;
-            if let Ok(body) = serde_json::to_string_pretty(&existing) {
-                if crate::store::atomic_write(
-                    &pending_path(home, &existing.dispatch_id),
-                    body.as_bytes(),
-                )
-                .is_ok()
-                {
-                    return Some(existing.dispatch_id);
-                }
+            // CR-2026-06-14: persist the refreshed episode under the per-file flock
+            // via with_json_state — NOT a bare unlocked write of the list_pending
+            // snapshot. scan_and_emit concurrently re-reads and flips the SAME
+            // sidecar to Exceeded under that lock; an unlocked write here raced it
+            // (lost update — a just-written Exceeded clobbered, or this Pending
+            // reset clobbered). The mutable state is fully reset above, so
+            // overwriting the locked-current state with `existing` IS the intended
+            // re-dispatch semantics — now serialized against the scan.
+            let dispatch_id = existing.dispatch_id.clone();
+            let refreshed = crate::store::with_json_state::<PendingDispatch, _, _>(
+                &pending_path(home, &dispatch_id),
+                move |cur| {
+                    *cur = existing;
+                },
+            );
+            if matches!(refreshed, Ok(Some(()))) {
+                return Some(dispatch_id);
             }
-            // Refresh write failed → fall through to a fresh sidecar (best effort).
+            // Refresh write failed / sidecar vanished under the lock → fall through
+            // to a fresh sidecar (best effort).
         }
     }
     let dispatch_id = next_dispatch_id();

@@ -24,7 +24,6 @@
 use std::path::PathBuf;
 
 #[test]
-#[ignore = "daemon-dispatch-idle anti-stall-dispatched-at-doc: red until fix; remove #[ignore] after fix to confirm"]
 fn anti_stall_docs_do_not_reference_nonexistent_dispatched_at_daemon_dispatch_idle() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("src")

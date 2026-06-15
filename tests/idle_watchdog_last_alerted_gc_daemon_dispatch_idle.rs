@@ -23,7 +23,6 @@
 use std::path::PathBuf;
 
 #[test]
-#[ignore = "daemon-dispatch-idle idle-watchdog-last-alerted-leak: red until fix; remove #[ignore] after fix to confirm"]
 fn idle_watchdog_last_alerted_map_is_gc_pruned_daemon_dispatch_idle() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("src")
