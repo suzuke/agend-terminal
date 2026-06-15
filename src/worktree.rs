@@ -88,6 +88,19 @@ pub fn create(
         return None;
     }
 
+    // Defense-in-depth (xcut-concurrency F4): validate the AGENT segment too, not
+    // just the branch. `worktree_path` joins `instance_name` into the pool path,
+    // so an unvalidated `..` agent segment paired with a VALID custom branch would
+    // traverse OUT of `<home>/worktrees/`. Mirror the `validate_branch` guard
+    // below; `agent::validate_name` rejects `/` and `.` (hence `..`).
+    if crate::agent::validate_name(instance_name).is_err() {
+        tracing::warn!(
+            instance = %instance_name,
+            "invalid instance name, rejecting worktree creation"
+        );
+        return None;
+    }
+
     // Empty repo (git init without any commits) → HEAD is invalid.
     // Worktree creation requires at least one commit.
     if !has_commits(repo_dir) {

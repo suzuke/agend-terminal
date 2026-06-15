@@ -77,7 +77,6 @@ fn tmp_home(name: &str) -> PathBuf {
 }
 
 #[test]
-#[ignore = "xcut-concurrency F4: red until fix; remove #[ignore] after fix to confirm"]
 fn create_rejects_path_traversal_in_agent_name_xcut_concurrency() {
     let home = tmp_home("traversal");
     let repo = tmp_repo("traversal");

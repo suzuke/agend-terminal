@@ -17,7 +17,6 @@ use super::mask_token;
 /// RED now: `catch_unwind` returns `Err`. GREEN after fix: char-boundary-aware
 /// truncation never panics and preserves the masked "..." shape.
 #[test]
-#[ignore = "quickstart-mask_token-multibyte: red until fix; remove #[ignore] after fix to confirm"]
 fn mask_token_multibyte_does_not_panic_panic_io_extra() {
     let tok = "\u{4e2d}\u{6587}\u{4e2d}";
     assert!(

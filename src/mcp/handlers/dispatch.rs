@@ -528,17 +528,22 @@ fn parse_duration_secs(s: &str) -> Option<i64> {
         } else {
             let n: i64 = num_buf.parse().ok()?;
             num_buf.clear();
-            match ch {
-                'h' => total += n * 3600,
-                'm' => total += n * 60,
-                's' => total += n,
+            // Checked arithmetic: an attacker-controlled digit run (e.g.
+            // "9999999999999999h") parses to a valid i64 whose `* 3600` overflows
+            // i64::MAX — debug builds panic, release wraps to a bogus value.
+            // Reject the overflow as invalid (None) instead.
+            let secs = match ch {
+                'h' => n.checked_mul(3600)?,
+                'm' => n.checked_mul(60)?,
+                's' => n,
                 _ => return None,
-            }
+            };
+            total = total.checked_add(secs)?;
         }
     }
     if !num_buf.is_empty() {
         let n: i64 = num_buf.parse().ok()?;
-        total += n * 60; // bare number = minutes
+        total = total.checked_add(n.checked_mul(60)?)?; // bare number = minutes
     }
     if total > 0 {
         Some(total)

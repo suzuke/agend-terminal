@@ -511,11 +511,42 @@ fn find_run_dir(home: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
         if entry.file_type()?.is_dir() {
             let p = entry.path();
             if p.join("api.port").exists() {
+                // Liveness check: the run dir is named with the daemon PID. Skip a
+                // STALE dir whose PID is dead (crashed daemon not yet swept) —
+                // otherwise the bridge reads a dead daemon's port + cookie and
+                // burns its connect-retry budget (or, if the port was reused,
+                // handshakes against an unrelated process). Mirrors the
+                // daemon-side `find_active_run_dir` liveness contract.
+                let alive = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .map(pid_is_alive)
+                    .unwrap_or(true); // non-PID-named dir: keep prior accept behavior
+                if !alive {
+                    continue;
+                }
                 return Ok(p);
             }
         }
     }
     Err("no active daemon run dir".into())
+}
+
+/// True if `pid` is a live process. Unix uses `kill(pid, 0)`; non-unix has no
+/// portable equivalent here, so it conservatively returns true (the daemon-side
+/// run-dir sweep stays the backstop) — the bug + fix are platform-agnostic but
+/// this liveness primitive is unix-only.
+fn pid_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        pid != 0 && unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
 }
 
 fn read_port_file(run_dir: &Path) -> Result<u16, Box<dyn std::error::Error>> {

@@ -762,11 +762,28 @@ fn git_show_and_fmt(repo_dir: &Path, rev: &str, path: &str) -> Result<String, St
         .map_err(|e| format!("rustfmt spawn failed: {e}"))?;
     if let Some(mut stdin) = fmt.stdin.take() {
         use std::io::Write;
-        let _ = stdin.write_all(&show.stdout);
+        // Propagate the write error instead of discarding it: a partial write /
+        // broken pipe feeds rustfmt a TRUNCATED file, and a truncated format can
+        // silently flip the 'only formatting' verdict. stdin drops at the end of
+        // this block, closing the pipe so rustfmt sees EOF before we wait below.
+        stdin
+            .write_all(&show.stdout)
+            .map_err(|e| format!("rustfmt stdin write failed: {e}"))?;
     }
     let output = fmt
         .wait_with_output()
         .map_err(|e| format!("rustfmt wait failed: {e}"))?;
+    // A non-zero rustfmt exit (e.g. after a truncated stdin, or a file rustfmt
+    // can't parse) must NOT be returned as partial stdout — that partial output
+    // could compare equal and falsely confirm 'only formatting'. Surface as Err;
+    // the caller treats an Err as a non-formatting (conservative) verdict.
+    if !output.status.success() {
+        return Err(format!(
+            "rustfmt exited non-zero ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 

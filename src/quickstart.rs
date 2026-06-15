@@ -587,7 +587,17 @@ async fn bot_api_get(token: &str, method: &str) -> anyhow::Result<serde_json::Va
 
 fn mask_token(tok: &str) -> String {
     if tok.len() > 8 {
-        format!("{}...{}", &tok[..4], &tok[tok.len() - 4..])
+        // Char-boundary-safe prefix/suffix: a raw `&tok[..4]` / `&tok[len-4..]`
+        // panics when byte index 4 (or len-4) splits a multibyte UTF-8 char
+        // (e.g. a CJK token). Clamp to the nearest char boundary instead.
+        let prefix_end = (1..=4)
+            .rev()
+            .find(|&i| tok.is_char_boundary(i))
+            .unwrap_or(0);
+        let suffix_start = (tok.len().saturating_sub(4)..tok.len())
+            .find(|&i| tok.is_char_boundary(i))
+            .unwrap_or(tok.len());
+        format!("{}...{}", &tok[..prefix_end], &tok[suffix_start..])
     } else {
         "****".to_string()
     }

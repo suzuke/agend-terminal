@@ -36,7 +36,6 @@ fn git_show_and_fmt_body(src: &str) -> String {
 }
 
 #[test]
-#[ignore = "verify-claim-cost git_show_and_fmt-swallowed-write: red until fix; remove #[ignore] after fix to confirm"]
 fn git_show_and_fmt_does_not_swallow_stdin_write_error_verify_claim_cost() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("src")

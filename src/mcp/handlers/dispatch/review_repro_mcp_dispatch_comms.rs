@@ -25,7 +25,6 @@
 /// GREEN after fix: with checked arithmetic returning `None` on overflow,
 /// the call returns `Ok(None)` — no panic — and both asserts pass.
 #[test]
-#[ignore = "mcp-dispatch-comms F5: red until parse_duration_secs uses checked arithmetic; remove #[ignore] after fix"]
 fn parse_duration_secs_does_not_overflow_on_huge_input_mcp_dispatch_comms() {
     // Sized so the `i64` parse succeeds but `n * 3600` exceeds i64::MAX.
     let malicious = "9999999999999999h";

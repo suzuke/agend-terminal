@@ -49,7 +49,6 @@ fn dead_pid() -> Option<u32> {
 
 #[cfg(unix)]
 #[test]
-#[ignore = "bridge-find-run-dir-no-liveness: red until fix; remove #[ignore] after fix to confirm"]
 fn find_run_dir_skips_dead_pid_run_dir_bootstrap_config_cli() {
     let Some(dead) = dead_pid() else {
         eprintln!("test fixture: PID recycled in wait()->check gap — skipping");
@@ -93,7 +92,6 @@ fn find_run_dir_skips_dead_pid_run_dir_bootstrap_config_cli() {
 
 #[cfg(not(unix))]
 #[test]
-#[ignore = "bridge-find-run-dir-no-liveness: red until fix; remove #[ignore] after fix to confirm"]
 fn find_run_dir_skips_dead_pid_run_dir_bootstrap_config_cli() {
     // The dead-PID fixture relies on POSIX spawn/reap + kill(0) liveness; the
     // bug and its fix are platform-agnostic but this repro is unix-only.
