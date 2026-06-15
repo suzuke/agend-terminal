@@ -488,6 +488,12 @@ pub(super) fn handle_release_repo(args: &Value) -> Value {
             let _ = std::fs::remove_dir_all(&canonical);
             if let Some(src) = &source_repo {
                 crate::worktree::prune(src);
+            } else {
+                // CR-2026-06-14: force-removed the working tree but could not
+                // resolve its source repo (unreadable `.git` pointer / unresolved
+                // gitdir), so the `<source>/.git/worktrees/<meta>/` metadata can't
+                // be pruned and would otherwise leak SILENTLY. Surface it.
+                tracing::warn!(path = %path_str, "release_repo: removed working tree but source repo unresolved — stale `.git/worktrees` metadata may leak; run force_release / worktree GC to prune");
             }
             json!({"path": path, "note": String::from_utf8_lossy(&o.stderr).to_string()})
         }
@@ -495,6 +501,8 @@ pub(super) fn handle_release_repo(args: &Value) -> Value {
             let _ = std::fs::remove_dir_all(&canonical);
             if let Some(src) = &source_repo {
                 crate::worktree::prune(src);
+            } else {
+                tracing::warn!(path = %path_str, "release_repo: removed working tree but source repo unresolved — stale `.git/worktrees` metadata may leak; run force_release / worktree GC to prune");
             }
             json!({"path": path})
         }
@@ -699,9 +707,21 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
     watch["expires_at"] = json!((chrono::Utc::now()
         + chrono::Duration::hours(crate::daemon::ci_watch::WATCH_TTL_HOURS))
     .to_rfc3339());
-    // Issue #650: store next_after_ci for auto-routing on CI pass
-    if let Some(next) = args["next_after_ci"].as_str().filter(|s| !s.is_empty()) {
-        watch["next_after_ci"] = json!(next);
+    // Issue #650: store next_after_ci for auto-routing on CI pass.
+    // CR-2026-06-14: an EXPLICIT empty `next_after_ci:""` means "re-arm with NO
+    // chaining" → clear any previously-stored target rather than carrying the
+    // stale one over (which would still route [ci-ready-for-action] to it). An
+    // ABSENT arg leaves the stored value untouched.
+    match args.get("next_after_ci").and_then(|v| v.as_str()) {
+        Some(next) if !next.is_empty() => {
+            watch["next_after_ci"] = json!(next);
+        }
+        Some(_) => {
+            if let Some(obj) = watch.as_object_mut() {
+                obj.remove("next_after_ci");
+            }
+        }
+        None => {}
     }
     // #1031: persist dispatch task_id when supplied (by
     // dispatch_auto_bind_lease) so the ci_check_repo emit site can
@@ -804,7 +824,15 @@ pub(crate) fn compute_next_poll_eta(watch: &Value) -> Option<i64> {
         .as_u64()
         .or_else(|| watch["interval_secs"].as_u64())
         .unwrap_or(60);
-    Some(last_polled_at + (interval_secs as i64) * 1000)
+    // CR-2026-06-14: a huge (attacker/buggy) `interval_secs` would overflow
+    // `(interval_secs as i64) * 1000` — a panic in debug builds, a wrapped
+    // (possibly negative) eta in release. Convert with saturation (`try_from`
+    // caps a > i64::MAX value at i64::MAX) and use saturating arithmetic so the
+    // eta is always a finite, sane value rather than a crash or garbage.
+    let interval_ms = i64::try_from(interval_secs)
+        .unwrap_or(i64::MAX)
+        .saturating_mul(1000);
+    Some(last_polled_at.saturating_add(interval_ms))
 }
 
 /// `ci unwatch` action: unsubscribe the caller from `repo@branch`.
