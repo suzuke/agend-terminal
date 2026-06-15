@@ -650,6 +650,71 @@ mod tests {
     }
 
     #[test]
+    fn update_metadata_concurrent_append_and_filter_no_lost_or_resurrected() {
+        // CR-2026-06-14: the pickup-id lost-update race a ONE-SIDED lock could
+        // not close. The two production mutators of `pending_pickup_ids` — the
+        // telegram inbound APPEND and the inbox-drain FILTER — both run as
+        // `update_metadata` locked RMWs. Seed P "processed" ids; concurrently
+        // each filter thread removes one while each append thread adds a fresh
+        // one. Because BOTH sides take the same flock and derive their new value
+        // from the CURRENT on-disk value inside the lock, the operations
+        // serialize: the final set is EXACTLY the appended ids — nothing lost, no
+        // processed id resurrected. (A one-sided unlocked append could write a
+        // stale array back over a concurrent filter, resurrecting a removed id.)
+        let home = tmp_home("update-meta-append-filter");
+        const P: usize = 16;
+        let seed: Vec<Value> = (0..P)
+            .map(|i| json!({ "msg_id": format!("p{i}") }))
+            .collect();
+        save_metadata(&home, "agent-z", "pending_pickup_ids", json!(seed));
+
+        let mut handles = Vec::new();
+        for i in 0..P {
+            // Filter thread: remove processed id pI (mirrors handle_inbox).
+            let home_f = home.clone();
+            handles.push(std::thread::spawn(move || {
+                update_metadata(&home_f, "agent-z", "pending_pickup_ids", |current| {
+                    let remaining: Vec<Value> = current
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|e| e["msg_id"].as_str() != Some(format!("p{i}").as_str()))
+                        .collect();
+                    json!(remaining)
+                });
+            }));
+            // Append thread: add a fresh id aI (mirrors telegram inbound).
+            let home_a = home.clone();
+            handles.push(std::thread::spawn(move || {
+                update_metadata(&home_a, "agent-z", "pending_pickup_ids", |current| {
+                    let mut ids: Vec<Value> = current.as_array().cloned().unwrap_or_default();
+                    ids.push(json!({ "msg_id": format!("a{i}") }));
+                    json!(ids)
+                });
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let content = std::fs::read_to_string(metadata_path_resolved(&home, "agent-z")).unwrap();
+        let meta: Value = serde_json::from_str(&content).unwrap();
+        let final_ids: std::collections::HashSet<String> = meta["pending_pickup_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["msg_id"].as_str().unwrap().to_string())
+            .collect();
+        let expected: std::collections::HashSet<String> = (0..P).map(|i| format!("a{i}")).collect();
+        assert_eq!(
+            final_ids, expected,
+            "after concurrent append+filter the set must be exactly the appended ids \
+             (no processed id resurrected, no append lost)"
+        );
+    }
+
+    #[test]
     fn concurrent_save_metadata_clear_vs_set_both_survive_1886() {
         // #1886 C2 §3.9 (clear-vs-set): one writer clears `waiting_on` while
         // another sets a different field on the same instance — both updates

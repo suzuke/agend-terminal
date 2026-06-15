@@ -73,3 +73,45 @@ fn handle_inbox_pickup_id_rmw_has_no_toctou_lost_update_mcp_dispatch_comms() {
          under the metadata file lock (atomic read-modify-write) so no pickup id is lost."
     );
 }
+
+/// CR-2026-06-14 (dual-2 REJECT follow-up): a lock on ONE side of a read-modify-
+/// write is no mutual exclusion. The inbox-drain FILTER (handle_inbox) is locked
+/// above, but the telegram inbound APPEND (`src/channel/telegram/inbound.rs`)
+/// also read-derive-writes `pending_pickup_ids` — and was using an UNLOCKED
+/// `read_to_string` + `save_metadata` overwrite, which could write a stale array
+/// back over a concurrent filter, resurrecting a just-processed id. BOTH sides
+/// must go through the locked `update_metadata` RMW.
+///
+/// RED if the append site regresses to an unlocked `save_metadata` write of
+/// `pending_pickup_ids`; GREEN once it derives the new value inside
+/// `update_metadata`'s lock.
+#[test]
+fn pending_pickup_id_append_uses_locked_update_metadata_mcp_dispatch_comms() {
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/channel/telegram/inbound.rs");
+    let src = std::fs::read_to_string(&p).expect("read src/channel/telegram/inbound.rs");
+
+    // The append must run as a locked read-modify-write keyed on pending_pickup_ids.
+    let appends_via_locked_rmw =
+        src.contains("update_metadata") && src.contains("\"pending_pickup_ids\"");
+    assert!(
+        appends_via_locked_rmw,
+        "the telegram inbound pickup-id APPEND must use the locked `update_metadata` RMW \
+         (mirroring the inbox-drain FILTER); it was not found in inbound.rs."
+    );
+
+    // ...and must NOT write pending_pickup_ids via the key-overwriting
+    // `save_metadata` (the unlocked-derive path that loses the concurrent filter).
+    // `save_metadata` for OTHER keys (e.g. last_message_id) is fine, so scan a
+    // window around each save_metadata call for the pending_pickup_ids key.
+    let bad_unlocked_write = src.match_indices("save_metadata").any(|(i, _)| {
+        let window_end = (i + 240).min(src.len());
+        src[i..window_end].contains("pending_pickup_ids")
+    });
+    assert!(
+        !bad_unlocked_write,
+        "telegram inbound writes `pending_pickup_ids` via the key-overwriting `save_metadata` \
+         (unlocked read-derive-write) — a stale array written back over a concurrent \
+         handle_inbox filter resurrects a processed id. Use `update_metadata` (locked RMW) so \
+         both the append and the filter serialize on the same flock."
+    );
+}

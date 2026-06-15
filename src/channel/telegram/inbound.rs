@@ -428,27 +428,23 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
             "kind": "telegram",
             "msg_id": msg.id.0.to_string(),
         });
-        let meta_path = crate::agent_ops::metadata_path_resolved(&home, &instance_name);
-        let existing: serde_json::Value = std::fs::read_to_string(&meta_path)
-            .ok()
-            .and_then(|c| serde_json::from_str(&c).ok())
-            .unwrap_or(serde_json::json!({}));
-        let mut ids: Vec<serde_json::Value> = existing
-            .get("pending_pickup_ids")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        ids.push(entry);
-        // M2: cap to prevent unbounded growth (keep newest 100)
-        if ids.len() > 100 {
-            ids = ids.split_off(ids.len() - 100);
-        }
-        crate::agent_ops::save_metadata(
-            &home,
-            &instance_name,
-            "pending_pickup_ids",
-            serde_json::json!(ids),
-        );
+        // CR-2026-06-14 (concurrency): append under the metadata flock (locked
+        // read-modify-write). The prior unlocked read + `save_metadata`
+        // overwrite raced the inbox-drain FILTER (comms.rs handle_inbox): the
+        // append could read a stale set, then write its precomputed array back
+        // AFTER the filter had removed a processed id — resurrecting it (a
+        // processed pickup re-confirmed). Both the append (here) and the filter
+        // now run as `update_metadata` locked RMWs on the same key, so they
+        // serialize and neither clobbers the other.
+        crate::agent_ops::update_metadata(&home, &instance_name, "pending_pickup_ids", |current| {
+            let mut ids: Vec<serde_json::Value> = current.as_array().cloned().unwrap_or_default();
+            ids.push(entry);
+            // M2: cap to prevent unbounded growth (keep newest 100)
+            if ids.len() > 100 {
+                ids = ids.split_off(ids.len() - 100);
+            }
+            serde_json::json!(ids)
+        });
     }
     // Also store as last_message_id for the `react` MCP tool's fallback.
     crate::agent_ops::save_metadata(
