@@ -44,7 +44,6 @@ fn prod_src() -> &'static str {
 /// `with_pr_state` recovery — the `Err` arm only `tracing::warn!`s. GREEN once
 /// the fix wires a recovery / success-gated flag into that region.
 #[test]
-#[ignore = "pr-ready-dedup-lost-on-enqueue-fail: red until fix; remove #[ignore] after fix to confirm"]
 fn pr_ready_dedup_flag_recovers_on_enqueue_failure_daemon_ci_pr() {
     let prod = prod_src();
 
@@ -102,7 +101,6 @@ fn pr_ready_dedup_flag_recovers_on_enqueue_failure_daemon_ci_pr() {
 /// &state.created_at)`. GREEN once the second argument is a head-advance
 /// timestamp instead of `created_at`.
 #[test]
-#[ignore = "stale-snapshot-anchored-on-created_at: red until fix; remove #[ignore] after fix to confirm"]
 fn freshness_gate_not_anchored_on_immutable_created_at_daemon_ci_pr() {
     let prod = prod_src();
 

@@ -129,6 +129,16 @@ pub fn scan_and_emit_with(
         // AFTER `with_pr_state` returns so enqueue_with_idle_hint (self-IPC via
         // loopback api::call) runs lock-free (#1617 lock-while-blocking class).
         let mut pending_emits: Vec<(String, crate::inbox::InboxMessage)> = Vec::new();
+        // The [pr-ready-for-merge] emit is kept SEPARATE from `pending_emits`
+        // because — unlike the terminal (Merged/ClosedUnmerged) emits — it has NO
+        // persistent ledger backstop. Its optimistic dedup flag
+        // (`ready_emitted_for_sha`) must be RESET if the post-flock enqueue fails,
+        // or the signal is lost until head_sha next changes. Carries
+        // (recipient, msg, head_sha) so the reset is guarded on the same head — a
+        // concurrent head advance (which already clears the flag) must not be
+        // clobbered. pr-ready and the terminal arms are mutually exclusive per
+        // scan (distinct merge_state), so this never coexists with pending_emits.
+        let mut pending_ready: Option<(String, crate::inbox::InboxMessage, String)> = None;
         // [C1 / #1842] Terminal-event identity for the persistent emit-dedup
         // ledger. Checked lock-free here (before the flock) and recorded
         // post-flock if we emit — so a recreated state file (lingering-CI
@@ -165,16 +175,14 @@ pub fn scan_and_emit_with(
                 let body = format_ready_body(state);
                 let msg = build_event_message("pr-ready-for-merge", &recipient, state, body);
                 // #1629: defer the enqueue (see top of fn). Set the dedup flag
-                // optimistically under the flock. NOTE: this is a behavior change
-                // for the pr-ready arm — previously the flag was set only on
-                // enqueue success, so a failed enqueue retried next scan. Now a
-                // post-unlock enqueue failure leaves the flag already set → next
-                // scan skips → the pr-ready signal is lost (warn-logged at the
-                // drain, not silent) until head_sha changes. The flag IS the dedup
-                // ledger; it suppresses re-emit, it does not back-stop. Accepted:
-                // enqueue failure is near-zero (local inbox write), this matches
-                // the Merged/ClosedUnmerged arms, and the flock-free emit prevents
-                // the #1617 deadlock.
+                // optimistically under the flock. The pr-ready arm has NO
+                // persistent ledger backstop (unlike the Merged/ClosedUnmerged
+                // arms), so the deferred `pending_ready` drain below RESETS this
+                // flag if the post-flock enqueue fails — otherwise a failed
+                // enqueue would leave the flag set and the signal would be lost
+                // until head_sha next changes. The flock-free emit (the reset is a
+                // separate post-flock `with_pr_state`) preserves the #1617
+                // lock-while-blocking guarantee.
                 state.ready_emitted_for_sha = Some(state.head_sha.clone());
                 dirty = true;
                 tracing::info!(
@@ -184,7 +192,7 @@ pub fn scan_and_emit_with(
                     recipient = %recipient,
                     "#972 pr_state: [pr-ready-for-merge] queued (emit after flock drop)"
                 );
-                pending_emits.push((recipient, msg));
+                pending_ready = Some((recipient, msg, state.head_sha.clone()));
             }
 
             // Terminal-state sweep.
@@ -290,6 +298,25 @@ pub fn scan_and_emit_with(
                 );
             }
         }
+        // pr-ready has no ledger backstop: if its deferred enqueue fails, RESET
+        // the optimistic `ready_emitted_for_sha` dedup flag (guarded on the same
+        // head_sha so a concurrent head advance — which already cleared the flag —
+        // is not clobbered) so the next scan tick re-emits. This is the pr-ready
+        // analogue of the terminal arms' persistent-ledger recovery.
+        if let Some((author, msg, ready_sha)) = pending_ready {
+            if let Err(e) = crate::inbox::enqueue_with_idle_hint(home, &author, msg) {
+                tracing::warn!(
+                    author = %author,
+                    error = %e,
+                    "#1629 pr_state: deferred [pr-ready-for-merge] enqueue failed — resetting dedup flag for retry"
+                );
+                let _ = with_pr_state(home, &repo, &branch, |s| {
+                    if s.ready_emitted_for_sha.as_deref() == Some(ready_sha.as_str()) {
+                        s.ready_emitted_for_sha = None;
+                    }
+                });
+            }
+        }
 
         // #bughunt3 (#1617 class): PR-state flock is now released — run the
         // release-invariant recompute lock-free. t-worktree-leak (PR-1): merge
@@ -355,16 +382,26 @@ pub fn scan_and_emit_with(
 /// would over-suppress); success clears the counter. Idempotent:
 /// re-applying the same metadata is a no-op for the reducer if state
 /// already matches.
-/// #986 Bug A: is a poll taken at `polled_at` fresh enough to confirm "no PR" for
-/// a branch first tracked at `created_at`? True iff the poll happened at/after the
-/// branch became tracked (so the poll would have observed the PR if it existed).
-/// A retained snapshot polled BEFORE the branch existed must not assert "no PR".
-/// Parse failure → conservative `false` (treat as stale → ambiguous, never a false
-/// no-PR).
-fn poll_is_fresh_for(polled_at: &str, created_at: &str) -> bool {
+/// #986 Bug A: is a poll taken at `polled_at` fresh enough to apply against a
+/// state last advanced at `state_advanced_at`? True iff the poll happened at/after
+/// the state's last advance, so the poll would have observed the current head.
+///
+/// The anchor is `updated_at` (bumped on every reducer event, INCLUDING a head
+/// advance), NOT the immutable `created_at`. `created_at` only covers the
+/// cold-start race (a snapshot predating branch tracking); it never moves when
+/// the branch HEAD advances (force-push / head-reuse), so a snapshot polled after
+/// `created_at` but before a head advance would wrongly read as fresh and could
+/// drive a sticky terminal transition (e.g. an old `Closed` for a since-reopened
+/// PR → false release). Anchoring on `updated_at` rejects those head-stale polls.
+/// For a freshly-tracked branch `updated_at == created_at`, so the cold-start
+/// guarantee is preserved unchanged.
+///
+/// Parse failure → conservative `false` (treat as stale → ambiguous, never a
+/// false no-PR / false terminal).
+fn poll_is_fresh_for(polled_at: &str, state_advanced_at: &str) -> bool {
     match (
         chrono::DateTime::parse_from_rfc3339(polled_at),
-        chrono::DateTime::parse_from_rfc3339(created_at),
+        chrono::DateTime::parse_from_rfc3339(state_advanced_at),
     ) {
         (Ok(p), Ok(c)) => p >= c,
         _ => false,
@@ -476,11 +513,11 @@ fn apply_gh_poll(home: &Path, dir: &Path, poller: &dyn gh_poll::GhPoller) {
                     // pre-#986 synchronous poll was always fresh). Stale → leave the
                     // branch due + ambiguous; a fresh poll arrives within ~1 worker
                     // cadence (~15s) and only then applies observations + stamps.
-                    if !poll_is_fresh_for(&polled_at, &state.created_at) {
+                    if !poll_is_fresh_for(&polled_at, &state.updated_at) {
                         tracing::debug!(
                             repo = %repo, branch = %branch,
-                            polled_at = %polled_at, created_at = %state.created_at,
-                            "#986 gh-poll: stale snapshot predates branch tracking — applying nothing, awaiting fresh poll"
+                            polled_at = %polled_at, updated_at = %state.updated_at,
+                            "#986 gh-poll: stale snapshot predates last state advance (head-reuse / cold-start) — applying nothing, awaiting fresh poll"
                         );
                         continue;
                     }
