@@ -370,6 +370,15 @@ fn parse_checks(v: &Value) -> Vec<CheckState> {
 /// carries its own auth (env / `gh auth`) and host, like the inline sites.
 pub(crate) struct GitHubScmProvider;
 
+/// CR-2026-06-14 #5 (perf): network bound for the `gh` CLI. `gh` is reached from
+/// the per-tick worktree-cleanup sweep (`is_squash_merged` → `pr_list`), so a
+/// slow/hanging gh (network stall, auth prompt, rate-limit retry) must not block
+/// the daemon cleanup thread forever. A healthy `gh pr list/view` is a few
+/// seconds; 60s is generous headroom that never false-kills a legit call yet
+/// fails fast instead of hanging. (Purpose-named at this call site, per the
+/// `git_helpers` note left when the old 300s `NETWORK_GIT_TIMEOUT` was removed.)
+const GH_CLI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 impl GitHubScmProvider {
     /// Run `gh` with the given args. `cwd`: when `Some`, set the process
     /// working directory (site 10 runs gh inside the repo dir so gh
@@ -380,8 +389,18 @@ impl GitHubScmProvider {
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
         }
-        cmd.output()
-            .map_err(|e| anyhow::anyhow!("failed to run gh: {e}"))
+        // CR-2026-06-14 #5: bound the `gh` subprocess via the shared
+        // process-group-killing spawner (same machinery as the local git
+        // helpers) — a bare `.output()` is UNBOUNDED and a wedged gh hangs the
+        // per-tick cleanup sweep. The fast path is byte-identical (same captured
+        // `Output`); on the deadline the gh process group is killed and the
+        // caller gets `Err(TimedOut)` to fail fast instead of blocking.
+        crate::git_helpers::spawn_group_bounded(
+            cmd,
+            &format!("gh {:?}", args.first()),
+            GH_CLI_TIMEOUT,
+        )
+        .map_err(|e| anyhow::anyhow!("failed to run gh: {e}"))
     }
 }
 
