@@ -219,6 +219,8 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                         path = %wt_str,
                         "repo checkout bind:true idempotent — agent already bound to this branch, returning existing worktree"
                     );
+                    // #2115: idempotent reuse bypasses worktree::create — force-sync the stale tree to HEAD here too (rationale: sync_worktree_to_head doc).
+                    crate::worktree::sync_worktree_to_head(&wt);
                     return json!({
                         "path": wt_str,
                         "source": source_path,
