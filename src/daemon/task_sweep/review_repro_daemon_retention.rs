@@ -32,7 +32,6 @@ fn pr_with_body(body: &str) -> PrMeta {
 }
 
 #[test]
-#[ignore = "daemon-retention review-verdict-substring: red until fix; remove #[ignore] after fix to confirm"]
 fn unverified_body_is_not_a_passing_review_verdict_daemon_retention() {
     // A review that came back UNVERIFIED must NOT satisfy the verdict gate.
     let unverified = pr_with_body("Review result: UNVERIFIED by reviewer-codex");

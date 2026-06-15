@@ -744,10 +744,52 @@ fn get_pr_changed_files(pr_number: u64, repo: &str) -> Vec<String> {
     }
 }
 
-/// Check 1: PR body contains "VERIFIED" verdict.
+/// Check 1: PR body contains a genuine passing `VERIFIED` verdict.
+///
+/// Word-anchored, NOT a bare substring: `"VERIFIED"` is a substring of
+/// `"UNVERIFIED"` and appears in `"NOT VERIFIED"`, so the old
+/// `to_uppercase().contains("VERIFIED")` passed an explicitly *rejected* review
+/// — the exact rejected-but-merged false-negative Issue #664 exists to surface.
+/// A `VERIFIED` token counts only when it is (a) bounded by non-alphanumeric
+/// chars (rejects `UNVERIFIED` / `VERIFIEDx`) and (b) not immediately preceded
+/// by a `NOT` word (rejects `NOT VERIFIED`). Scans every occurrence so a body
+/// that mentions both (`was UNVERIFIED, now VERIFIED`) still passes on the
+/// genuine one. Mirrors the auto-release word-anchoring (auto_release.rs:432)
+/// rather than a loose substring.
 fn has_review_verdict(pr: &PrMeta) -> bool {
+    const WORD: &str = "VERIFIED";
     let body_upper = pr.body.to_uppercase();
-    body_upper.contains("VERIFIED")
+    let mut from = 0;
+    while let Some(rel) = body_upper[from..].find(WORD) {
+        let start = from + rel;
+        let end = start + WORD.len();
+        let preceded_by_alnum = body_upper[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric());
+        let followed_by_alnum = body_upper[end..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphanumeric());
+        if !preceded_by_alnum && !followed_by_alnum {
+            // Reject an explicit `NOT` negation directly before the token
+            // (the immediately preceding word, ignoring punctuation/space).
+            let prev_word: String = body_upper[..start]
+                .chars()
+                .rev()
+                .skip_while(|c| !c.is_alphanumeric())
+                .take_while(|c| c.is_alphanumeric())
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            if prev_word != "NOT" {
+                return true;
+            }
+        }
+        from = end;
+    }
+    false
 }
 
 /// #PR-C: client-side reproduction of site-6's prior `gh` `--jq`:
