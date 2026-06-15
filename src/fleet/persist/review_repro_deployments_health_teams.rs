@@ -18,7 +18,7 @@
 
 #![allow(clippy::unwrap_used)]
 
-use super::add_team_to_yaml;
+use super::{add_team_to_yaml, update_team_in_yaml};
 use crate::fleet::{fleet_yaml_path, FleetConfig, TeamConfig};
 
 fn tmp_home(tag: &str) -> std::path::PathBuf {
@@ -76,6 +76,49 @@ fn add_team_to_yaml_enforces_one_agent_one_team_deployments_health_teams() {
         "one-agent-one-team must be enforced inside the lock-held mutate closure: \
          member 'shared' ended up in {} teams ({:?}); add_team_to_yaml re-checks only \
          the team-name key, not member exclusivity",
+        teams_with_shared.len(),
+        teams_with_shared
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// t-50 (sibling of #2189, surfaced by r4+r2 review): the `teams::update`
+/// add-member path runs its one-agent-one-team check on a `load_fleet` SNAPSHOT
+/// (`find_team_for_member`), but the lock-held writer `update_team_in_yaml` did
+/// NOT re-validate member exclusivity — so two concurrent updates adding the same
+/// agent to different teams could both pass the stale snapshot and both write.
+/// RED before the in-lock gate (the update double-books `shared` into `beta`);
+/// GREEN once `update_team_in_yaml` rejects a member already in ANOTHER team
+/// (excluding the team being updated).
+#[test]
+fn update_team_to_yaml_enforces_one_agent_one_team_t50() {
+    let home = tmp_home("update-excl");
+    std::fs::write(fleet_yaml_path(&home), "teams: {}\n").expect("seed fleet.yaml");
+
+    // 'alpha' owns 'shared'; 'beta' starts with its own member.
+    add_team_to_yaml(&home, "alpha", &team_with_member("shared"))
+        .expect("add_team_to_yaml alpha must not error");
+    add_team_to_yaml(&home, "beta", &team_with_member("beta-only"))
+        .expect("add_team_to_yaml beta must not error");
+
+    // UPDATE 'beta' to ALSO claim 'shared' (already alpha's). The lock-held
+    // closure must reject this double-book; pre-fix it silently writes 'beta'.
+    let _ = update_team_in_yaml(&home, "beta", &team_with_member("shared"));
+
+    let cfg = FleetConfig::load(&fleet_yaml_path(&home)).expect("reload fleet.yaml");
+    let teams_with_shared: Vec<&String> = cfg
+        .teams
+        .iter()
+        .filter(|(_, t)| t.members.iter().any(|m| m == "shared"))
+        .map(|(name, _)| name)
+        .collect();
+
+    assert!(
+        teams_with_shared.len() <= 1,
+        "one-agent-one-team must be enforced inside update_team_in_yaml's lock-held \
+         closure too: member 'shared' ended up in {} teams ({:?}); the update path \
+         re-checked only on a stale snapshot, not under the write lock",
         teams_with_shared.len(),
         teams_with_shared
     );
