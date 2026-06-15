@@ -953,20 +953,27 @@ pub fn get_thread(home: &Path, thread_id: &str, instance: Option<&str>) -> Vec<I
             Err(_) => return Vec::new(),
         };
         for entry in entries.flatten() {
-            // CR-2026-06-14: skip symlinks. A migrated inbox keeps BOTH
-            // `<name>.jsonl` (real file) and `<uuid>.jsonl` (symlink → name); the
-            // scan would otherwise count every message TWICE. The real file is
-            // always present in this same dir, so skipping the symlink loses no
-            // content (and avoids rewrites clobbering the symlink).
-            if entry.file_type().map(|t| t.is_symlink()).unwrap_or(false) {
-                continue;
-            }
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
             collect_thread_messages(&path, thread_id, &mut msgs);
         }
+        // CR-2026-06-14: a migrated inbox is present under TWO directory entries —
+        // `<name>.jsonl` and `<uuid>.jsonl` — holding the SAME messages, so the
+        // cross-inbox scan double-counts every thread message. The two entries are
+        // a symlink on Unix but a real `fs::copy` duplicate on Windows
+        // (`inbox_path_resolved` migration), so a symlink-type skip only fixes
+        // Unix. Dedup by message `id` instead — portable across both: message ids
+        // are globally unique (`ensure_msg_id`), so the same id appearing in both
+        // files is the migration duplicate, while a thread legitimately spanning
+        // several agents' inboxes carries distinct ids and is preserved. Id-less
+        // (legacy, pre-`ensure_msg_id`) rows are kept as-is (can't dedup safely).
+        let mut seen_ids = std::collections::HashSet::new();
+        msgs.retain(|m| match &m.id {
+            Some(id) => seen_ids.insert(id.clone()),
+            None => true,
+        });
     }
 
     msgs.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
