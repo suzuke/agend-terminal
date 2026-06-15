@@ -987,14 +987,25 @@ pub(crate) fn project_slug(project_id: &str) -> String {
         .trim_end_matches('/')
         .strip_suffix(".git")
         .unwrap_or_else(|| project_id.trim().trim_end_matches('/'));
-    trimmed
+    let slug: String = trimmed
         .chars()
         .map(|c| match c {
             '/' => '_', // an `owner/repo` becomes `owner_repo` after the pass below
             c if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') => c,
             _ => '_',
         })
-        .collect()
+        .collect();
+    // CR-2026-06-14 (security): a project id that sanitizes to a path-special
+    // component (`.`, `..`, or any all-dots string) escapes its subtree —
+    // `board_root` joins it so `home/boards/..` collapses back to `home` and
+    // `home/boards/.` to `home/boards`. A caller-supplied `project` override
+    // could thus redirect a create onto the home/default board. Defang any
+    // all-dots (or empty) slug to a single safe sentinel, matching how the pass
+    // above maps every other unsafe char to `_`.
+    if slug.is_empty() || slug.bytes().all(|b| b == b'.') {
+        return "_".to_string();
+    }
+    slug
 }
 
 // ── Append: single + batch ─────────────────────────────────────────

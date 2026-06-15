@@ -74,7 +74,14 @@ fn handle_create(home: &Path, emitter: crate::task_events::InstanceName, args: &
     static ID_SEQ: AtomicU64 = AtomicU64::new(0);
     let ts = chrono::Utc::now().format("%Y%m%d%H%M%S%6f");
     let seq = ID_SEQ.fetch_add(1, Ordering::Relaxed);
-    let id = format!("t-{ts}-{seq}");
+    // CR-2026-06-14 (correctness): `tasks::handle` runs in every MCP server
+    // process AND the daemon. ts+ID_SEQ alone is only PROCESS-unique, so two
+    // processes minting in the same microsecond both produce `t-<ts>-0` and
+    // `apply_created`'s `or_insert_with` silently drops the second Created at
+    // replay. The pid makes the id globally unique across processes. Stays
+    // within the `t-<ascii-alnum/-/_>` id shape (no positional parser splits it).
+    let pid = std::process::id();
+    let id = format!("t-{ts}-{pid}-{seq}");
     let assignee = args["assignee"].as_str().map(String::from);
     let routed_to = if let Some(ref name) = assignee {
         match crate::teams::resolve_team_orchestrator(home, name) {
@@ -406,6 +413,31 @@ fn handle_claim(
     }
 }
 
+/// CR-2026-06-14 (security): clamp a caller-supplied `done_source` to the only
+/// provenance a caller may legitimately attest — `OperatorManual`. The forensic
+/// variants (`PrMerged` / `LegacyBackfill` / `AutoCloseOnPrMerge` /
+/// `ReportAutoClose`) record what the daemon OBSERVED of GitHub state; a caller
+/// forging one through the MCP `done`/`update` surface would poison the audit
+/// trail's "this is what the daemon actually saw" guarantee. Any forensic (or
+/// unparseable) value falls back to a freshly-stamped `OperatorManual` — the
+/// done still succeeds, the forged provenance is silently downgraded rather than
+/// surfaced as an error. Legitimate forensic closes are constructed directly by
+/// daemon paths (`task_sweep` / `auto_close`) that append the event without
+/// going through this caller surface.
+fn caller_attestable_done_source(
+    done_source_arg: Option<&Value>,
+    fallback_result: Option<String>,
+) -> crate::task_events::DoneSource {
+    use crate::task_events::DoneSource;
+    match done_source_arg.and_then(|v| serde_json::from_value::<DoneSource>(v.clone()).ok()) {
+        Some(src @ DoneSource::OperatorManual { .. }) => src,
+        _ => DoneSource::OperatorManual {
+            authored_at: chrono::Utc::now().to_rfc3339(),
+            result: fallback_result,
+        },
+    }
+}
+
 fn handle_done(
     home: &Path,
     instance_name: &str,
@@ -497,14 +529,9 @@ fn handle_done(
     let event = crate::task_events::TaskEvent::Done {
         task_id: crate::task_events::TaskId(id.clone()),
         by: crate::task_events::InstanceName(by),
-        // B2: honor caller-provided done_source for audit trail
-        source: args
-            .get("done_source")
-            .and_then(|v| serde_json::from_value::<crate::task_events::DoneSource>(v.clone()).ok())
-            .unwrap_or_else(|| crate::task_events::DoneSource::OperatorManual {
-                authored_at: chrono::Utc::now().to_rfc3339(),
-                result: result_text,
-            }),
+        // CR-2026-06-14 (security): forensic done_source is daemon-only; a caller
+        // may only attest OperatorManual. See `caller_attestable_done_source`.
+        source: caller_attestable_done_source(args.get("done_source"), result_text),
     };
     // #1868: re-validate the →Done transition UNDER the append lock against FRESH
     // committed state. The `can_transition_to` check above is a fast-reject; a
@@ -779,16 +806,11 @@ fn handle_update(
                     ),
                 }),
                 (_, "done") => {
-                    // B2: allow caller-provided done_source for audit trail
-                    let source = args
-                        .get("done_source")
-                        .and_then(|v| {
-                            serde_json::from_value::<crate::task_events::DoneSource>(v.clone()).ok()
-                        })
-                        .unwrap_or_else(|| crate::task_events::DoneSource::OperatorManual {
-                            authored_at: chrono::Utc::now().to_rfc3339(),
-                            result: record.result.clone(),
-                        });
+                    // CR-2026-06-14 (security): forensic done_source is daemon-only.
+                    let source = caller_attestable_done_source(
+                        args.get("done_source"),
+                        record.result.clone(),
+                    );
                     Some(crate::task_events::TaskEvent::Done {
                         task_id: crate::task_events::TaskId(id.clone()),
                         by: crate::task_events::InstanceName::from(

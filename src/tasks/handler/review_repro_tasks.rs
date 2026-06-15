@@ -32,7 +32,6 @@ fn repro_home(tag: &str) -> std::path::PathBuf {
 /// operator-attestable variants): a caller forging PrMerged through the MCP
 /// surface must NOT result in a persisted `DoneSource::PrMerged` event.
 #[test]
-#[ignore = "tasks-done-source-forgery: red until fix; remove #[ignore] after fix to confirm"]
 fn caller_cannot_forge_pr_merge_provenance_on_done_tasks() {
     let home = repro_home("done-source-forgery");
 
@@ -105,7 +104,6 @@ fn caller_cannot_forge_pr_merge_provenance_on_done_tasks() {
 /// process-unique component (pid / uuid / random). RED now (none present);
 /// GREEN once the id format is made globally unique across processes.
 #[test]
-#[ignore = "tasks-id-cross-process-collision: red until fix; remove #[ignore] after fix to confirm"]
 fn task_id_has_process_unique_component_tasks() {
     let src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/tasks/handler.rs");
     let text = std::fs::read_to_string(&src).expect("read handler.rs");

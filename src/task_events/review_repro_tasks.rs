@@ -126,7 +126,6 @@ fn seq_cache_cross_process_does_not_drop_real_event_tasks() {
 /// `project_slug`): a path-special project id must NOT resolve to the home
 /// board (or any ancestor of `home/boards`).
 #[test]
-#[ignore = "tasks-board-root-dotdot: red until fix; remove #[ignore] after fix to confirm"]
 fn board_root_dotdot_project_does_not_escape_to_home_tasks() {
     let home = repro_home("board-root-dotdot");
     let boards = home.join("boards");
@@ -137,6 +136,13 @@ fn board_root_dotdot_project_does_not_escape_to_home_tasks() {
     // `home/boards/..`, which IS `home`. A caller-supplied `project=\"..\"`
     // override silently redirects a create back to the fleet/home board.
     let dotdot = board_root(&home, "..");
+    // Materialize the resolved board dir so canonicalize() works regardless of
+    // how the path resolves: on the BUGGY code `dotdot` is `home/boards/..` ==
+    // `home` (already present, create is a no-op); on the FIXED code it is an
+    // isolated sentinel subtree (`home/boards/_`) that no write has created yet.
+    // canonicalize then resolves `..` on the bug path back to `home` (→ RED) and
+    // leaves the isolated subtree distinct from `home` on the fix path (→ GREEN).
+    fs::create_dir_all(&dotdot).ok();
     let canon_home = home.canonicalize().expect("canonicalize home");
     let canon_dotdot = dotdot
         .canonicalize()

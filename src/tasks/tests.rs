@@ -2254,7 +2254,11 @@ fn non_system_identity_rejected() {
 #[test]
 fn done_action_honors_done_source_override() {
     let home = tmp_home("done_source");
-    // Create a task, claim it, then done with custom done_source
+    // Create a task, claim it, then done with a custom OperatorManual
+    // done_source. CR-2026-06-14: only the operator-attestable OperatorManual
+    // variant is honored from a caller (forensic variants are downgraded — see
+    // `caller_cannot_forge_pr_merge_provenance_on_done_tasks`); this asserts the
+    // legitimate override path still persists the caller's authored fields.
     let created = handle(
         &home,
         "dev",
@@ -2273,13 +2277,30 @@ fn done_action_honors_done_source_override() {
             "action": "done",
             "id": id,
             "done_source": {
-                "via": "AutoCloseOnPrMerge",
-                "branch": "feat/test",
-                "merged_at": "2026-05-01T00:00:00Z"
+                "via": "OperatorManual",
+                "authored_at": "2026-05-01T00:00:00Z",
+                "result": "closed by hand"
             }
         }),
     );
     assert_eq!(done["status"], "done", "done should succeed: {done}");
+
+    // The caller-supplied OperatorManual provenance must be persisted verbatim.
+    let envelopes = crate::task_events::stream_envelopes(&home).expect("stream envelopes");
+    let honored = envelopes.iter().any(|e| {
+        matches!(
+            &e.event,
+            crate::task_events::TaskEvent::Done {
+                source: crate::task_events::DoneSource::OperatorManual { authored_at, result },
+                ..
+            } if authored_at == "2026-05-01T00:00:00Z"
+                && result.as_deref() == Some("closed by hand")
+        )
+    });
+    assert!(
+        honored,
+        "OperatorManual done_source override must be persisted with the caller's fields"
+    );
     std::fs::remove_dir_all(&home).ok();
 }
 
