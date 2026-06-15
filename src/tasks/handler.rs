@@ -253,7 +253,7 @@ fn handle_list(home: &Path, caller: &str, args: &Value) -> Value {
             .as_str()
             .map(String::from)
             .unwrap_or_else(|| super::board_router::resolve_current_project(home, caller));
-        super::list_all_at(&crate::task_events::board_root(home, &project))
+        super::list_all_at(home, &crate::task_events::board_root(home, &project))
     };
     let mut filtered: Vec<Task> = tasks
         .iter()
@@ -377,7 +377,10 @@ fn handle_claim(
     let board = super::board_router::board_for_task(home, &id);
     let result = crate::task_events::append_checked_at(&board, &emitter, event, |state| {
         let mut tasks: Vec<Task> = state.tasks.values().map(record_to_task).collect();
-        super::apply_dependency_eval_in_memory(&mut tasks);
+        // #2117 Q2: cross-board dep eval — a claim gate on a task whose
+        // `depends_on` points at another project's board must read that board's
+        // status, not just this one's. Pass home + the task's board.
+        super::apply_dependency_eval_in_memory(&mut tasks, home, &board);
         let tv = tasks
             .iter()
             .find(|t| t.id == claim_id)

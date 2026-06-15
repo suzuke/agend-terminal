@@ -357,7 +357,7 @@ fn sweep_board_with_prs(
 
     // Snapshot of THIS board's currently-open tasks (read via the P1 `_at`
     // variant so a merged PR is matched only against tasks on its own board).
-    let open_tasks = crate::tasks::list_all_at(&board);
+    let open_tasks = crate::tasks::list_all_at(home, &board);
     let open_ids: std::collections::HashMap<String, &crate::tasks::Task> = open_tasks
         .iter()
         .filter(|t| {
@@ -1145,7 +1145,7 @@ mod tests {
         );
 
         let status_on = |project: &str, id: &str| -> crate::task_events::TaskStatus {
-            crate::tasks::list_all_at(&crate::task_events::board_root(&home, project))
+            crate::tasks::list_all_at(&home, &crate::task_events::board_root(&home, project))
                 .into_iter()
                 .find(|t| t.id == id)
                 .unwrap_or_else(|| panic!("task {id} not found on board {project}"))

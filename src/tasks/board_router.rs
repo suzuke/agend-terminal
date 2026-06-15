@@ -400,7 +400,7 @@ pub(super) fn list_all_boards(home: &Path) -> Vec<(String, Vec<Task>)> {
     enumerate_projects(home)
         .into_iter()
         .map(|project| {
-            let tasks = super::list_all_at(&board_root(home, &project));
+            let tasks = super::list_all_at(home, &board_root(home, &project));
             (project, tasks)
         })
         .collect()

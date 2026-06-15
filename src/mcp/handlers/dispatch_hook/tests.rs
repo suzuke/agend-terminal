@@ -879,7 +879,7 @@ teams:
     // invariant on the literal log path). The auto-created task must be on the
     // TARGET's (teamB) board …
     let on_board =
-        |proj: &str| crate::tasks::list_all_at(&crate::task_events::board_root(&home, proj));
+        |proj: &str| crate::tasks::list_all_at(&home, &crate::task_events::board_root(&home, proj));
     assert_eq!(
         on_board("orgB_projB").len(),
         1,

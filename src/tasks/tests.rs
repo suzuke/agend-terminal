@@ -1095,6 +1095,153 @@ fn test_task_auto_unblock_when_all_deps_done() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+// ── #2117 Q2: cross-board depends_on resolution (multi-project) ──
+
+/// Multi-project fleet: teamA(devA)@orgA/projA, teamB(devB)@orgB/projB. A task
+/// created by devA lands on board orgA_projA; by devB on orgB_projB.
+fn cross_board_fleet(home: &std::path::Path) {
+    let yaml = r#"
+instances:
+  devA:
+    backend: claude
+  devB:
+    backend: claude
+teams:
+  teamA:
+    members:
+      - devA
+    source_repo: /repos/orgA/projA
+  teamB:
+    members:
+      - devB
+    source_repo: /repos/orgB/projB
+"#;
+    std::fs::write(crate::fleet::fleet_yaml_path(home), yaml).unwrap();
+}
+
+fn create_on(home: &std::path::Path, caller: &str, title: &str, deps: &[String]) -> String {
+    handle(
+        home,
+        caller,
+        &serde_json::json!({
+            "action": "create", "title": title, "assignee": caller, "depends_on": deps
+        }),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+fn status_via_list(home: &std::path::Path, caller: &str, title: &str) -> String {
+    handle(home, caller, &serde_json::json!({"action": "list"}))["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["title"] == title)
+        .unwrap_or_else(|| panic!("task '{title}' not in {caller}'s list"))["status"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// Manifestation 1 (list display): A@teamA depends_on B@teamB; B open → A blocked.
+/// Pre-#2117-Q2 this was ALSO blocked, but for the wrong reason (dep not found
+/// on the local board) — here the dep genuinely exists and is genuinely open.
+#[test]
+fn cross_board_dep_not_done_blocks_dependent_2117_q2() {
+    let home = tmp_home("xboard-blocked");
+    cross_board_fleet(&home);
+    let b = create_on(&home, "devB", "B", &[]);
+    create_on(&home, "devA", "A", &[b]);
+    assert_eq!(
+        status_via_list(&home, "devA", "A"),
+        "blocked",
+        "A must be blocked by its cross-board dep B (open on teamB)"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Manifestation 2 (auto-unblock): completing B@teamB unblocks A@teamA. This is
+/// the bug the resolver fixes — pre-Q2, A stayed Blocked FOREVER because the
+/// eval never looked at teamB's board to see B was Done.
+#[test]
+fn cross_board_dep_done_unblocks_dependent_2117_q2() {
+    let home = tmp_home("xboard-unblock");
+    cross_board_fleet(&home);
+    let b = create_on(&home, "devB", "B", &[]);
+    create_on(&home, "devA", "A", std::slice::from_ref(&b));
+    assert_eq!(status_via_list(&home, "devA", "A"), "blocked");
+    handle(
+        &home,
+        "devB",
+        &serde_json::json!({"action": "done", "id": b, "result": "ok"}),
+    );
+    assert_eq!(
+        status_via_list(&home, "devA", "A"),
+        "open",
+        "A must auto-unblock once its cross-board dep B is done"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Manifestation 3 (claim gate): A cannot be claimed while B@teamB is open; the
+/// claim precondition must read teamB's board for B's status, not just teamA's.
+#[test]
+fn cross_board_dep_gates_claim_2117_q2() {
+    let home = tmp_home("xboard-claim");
+    cross_board_fleet(&home);
+    let b = create_on(&home, "devB", "B", &[]);
+    let a = create_on(&home, "devA", "A", std::slice::from_ref(&b));
+    let rejected = handle(
+        &home,
+        "devA",
+        &serde_json::json!({"action": "claim", "id": a}),
+    );
+    assert!(
+        rejected["error"].as_str().is_some(),
+        "claim must be rejected while cross-board dep B is open: {rejected}"
+    );
+    handle(
+        &home,
+        "devB",
+        &serde_json::json!({"action": "done", "id": b, "result": "ok"}),
+    );
+    let ok = handle(
+        &home,
+        "devA",
+        &serde_json::json!({"action": "claim", "id": a}),
+    );
+    assert!(
+        ok["error"].is_null(),
+        "claim must succeed after cross-board dep B is done: {ok}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Control (single-board within a multi-project fleet): a same-board dep still
+/// blocks/unblocks via the local-first path — the cross-board machinery does not
+/// alter same-board behavior (the byte-identical local resolution guarantee).
+#[test]
+fn same_board_dep_in_multiproject_fleet_byte_identical_2117_q2() {
+    let home = tmp_home("xboard-control");
+    cross_board_fleet(&home);
+    // Both tasks created by devA → both on teamA's board.
+    let dep = create_on(&home, "devA", "dep", &[]);
+    create_on(&home, "devA", "child", std::slice::from_ref(&dep));
+    assert_eq!(status_via_list(&home, "devA", "child"), "blocked");
+    handle(
+        &home,
+        "devA",
+        &serde_json::json!({"action": "done", "id": dep, "result": "ok"}),
+    );
+    assert_eq!(
+        status_via_list(&home, "devA", "child"),
+        "open",
+        "same-board dep eval unchanged inside a multi-project fleet"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// PR3 — depends_on is set in the Created event and immutable via
 /// the MCP surface (no "depends_on update" event variant). Circular
 /// deps can still arise from migration of a circular legacy
@@ -1420,7 +1567,7 @@ fn cross_project_parent_id_rejected_at_create_2117_p3a() {
     );
     // And nothing was written to teamB's board.
     assert!(
-        super::list_all_at(&crate::task_events::board_root(&home, "orgB/projB")).is_empty(),
+        super::list_all_at(&home, &crate::task_events::board_root(&home, "orgB/projB")).is_empty(),
         "rejected subtask must not land on any board"
     );
 
@@ -1499,7 +1646,7 @@ teams:
         );
     }
     // Nothing mutated — task still Open on board B (slug `orgB_projB`).
-    let tb_status = super::list_all_at(&crate::task_events::board_root(&home, "orgB_projB"))
+    let tb_status = super::list_all_at(&home, &crate::task_events::board_root(&home, "orgB_projB"))
         .into_iter()
         .find(|t| t.id == tb)
         .unwrap()

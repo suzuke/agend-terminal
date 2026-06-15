@@ -124,15 +124,85 @@ fn load(home: &Path) -> TaskStore {
     )
 }
 
-/// Evaluate dependency status for a single task.
-/// Returns the effective status after considering depends_on:
+/// #2117 Q2 cross-board dependency resolver. Resolves a `depends_on` id's
+/// PERSISTED status, reaching beyond the local board when a dep isn't found
+/// locally. Built once per eval pass with a per-board replay cache, so a board
+/// with many cross-board deps replays each foreign board at most once (no
+/// per-dep replay explosion). Single-project / same-board deps resolve from
+/// `local` alone and never touch the filesystem → byte-identical to the
+/// pre-#2117 path.
+///
+/// We only ever ask "is this dep Done". `Done` is a PERSISTED status (never
+/// dep-derived), so a raw cross-board replay is authoritative — no need to
+/// recursively dep-evaluate a foreign task (and no cross-board cycles).
+struct DepResolver<'a> {
+    home: &'a Path,
+    /// The board the current pass's tasks live on. A dep that resolves back to
+    /// this board is, by construction, already covered by `local` (absent here =
+    /// absent there) → skip the redundant replay.
+    local_board: &'a Path,
+    local: std::collections::HashMap<String, crate::task_events::TaskStatus>,
+    /// Memoized `resolve_task_project` per dep_id (its index-miss fallback is a
+    /// full-board scan — resolve each distinct dep at most once per pass).
+    proj_cache: std::collections::HashMap<String, String>,
+    /// Lazily-replayed foreign boards: board path → {task_id → status}.
+    board_cache: std::collections::HashMap<
+        std::path::PathBuf,
+        std::collections::HashMap<String, crate::task_events::TaskStatus>,
+    >,
+}
+
+impl<'a> DepResolver<'a> {
+    fn new(home: &'a Path, local_board: &'a Path, snapshot: &[Task]) -> Self {
+        let local = snapshot.iter().map(|t| (t.id.clone(), t.status)).collect();
+        Self {
+            home,
+            local_board,
+            local,
+            proj_cache: std::collections::HashMap::new(),
+            board_cache: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Persisted status of `dep_id`, or `None` if it exists nowhere reachable
+    /// (treated as not-done → blocking, matching the pre-#2117 missing-dep rule).
+    fn status_of(&mut self, dep_id: &str) -> Option<crate::task_events::TaskStatus> {
+        if let Some(s) = self.local.get(dep_id) {
+            return Some(*s);
+        }
+        let project = self
+            .proj_cache
+            .entry(dep_id.to_string())
+            .or_insert_with(|| board_router::resolve_task_project(self.home, dep_id))
+            .clone();
+        let board = crate::task_events::board_root(self.home, &project);
+        if board.as_path() == self.local_board {
+            // Resolves back to the local board → already covered by `local`
+            // (and definitively absent, since the local check above missed).
+            return None;
+        }
+        let map = self.board_cache.entry(board.clone()).or_insert_with(|| {
+            crate::task_events::replay_at(&board)
+                .map(|st| {
+                    st.tasks
+                        .iter()
+                        .map(|(id, r)| (id.0.clone(), r.status))
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+        map.get(dep_id).copied()
+    }
+}
+
+/// Evaluate dependency status for a single task against a [`DepResolver`].
 /// - open + any dep not done → "blocked"
 /// - blocked + all deps done → "open" (auto-unblock)
 /// - claimed/done/cancelled → unchanged
-///
-/// Uses a visited set to prevent infinite loops on circular deps
-/// (circular → treated as blocked).
-pub fn evaluate_dependency_status(tasks: &[Task], task: &Task) -> crate::task_events::TaskStatus {
+fn evaluate_with_resolver(
+    resolver: &mut DepResolver,
+    task: &Task,
+) -> crate::task_events::TaskStatus {
     use crate::task_events::TaskStatus;
     if task.depends_on.is_empty()
         || matches!(
@@ -142,13 +212,10 @@ pub fn evaluate_dependency_status(tasks: &[Task], task: &Task) -> crate::task_ev
     {
         return task.status;
     }
-    let all_deps_done = task.depends_on.iter().all(|dep_id| {
-        tasks
-            .iter()
-            .find(|t| t.id == *dep_id)
-            .map(|t| t.status == TaskStatus::Done)
-            .unwrap_or(false) // missing dep → not done → blocked
-    });
+    let all_deps_done = task
+        .depends_on
+        .iter()
+        .all(|dep_id| resolver.status_of(dep_id) == Some(TaskStatus::Done));
     if all_deps_done {
         if task.status == TaskStatus::Blocked {
             TaskStatus::Open
@@ -164,10 +231,17 @@ pub fn evaluate_dependency_status(tasks: &[Task], task: &Task) -> crate::task_ev
 /// list-time, **not** persisted as Blocked/Unblocked events. The event
 /// log captures only explicit operator/agent transitions; dep-derived
 /// status is a view-layer concern, not part of the canonical history.
-fn apply_dependency_eval_in_memory(tasks: &mut [Task]) {
+///
+/// #2117 Q2: `home` + `board` enable cross-board dep resolution — a dep on
+/// another project's board is read from that board (cached), so a satisfied
+/// cross-board dependency auto-unblocks and an unsatisfied one blocks. `board`
+/// is the board these `tasks` were replayed from. Single-project → every dep is
+/// local → byte-identical.
+fn apply_dependency_eval_in_memory(tasks: &mut [Task], home: &Path, board: &Path) {
     let snapshot: Vec<Task> = tasks.to_vec();
+    let mut resolver = DepResolver::new(home, board, &snapshot);
     for task in tasks.iter_mut() {
-        let effective = evaluate_dependency_status(&snapshot, task);
+        let effective = evaluate_with_resolver(&mut resolver, task);
         if effective != task.status {
             task.status = effective;
         }
@@ -234,16 +308,21 @@ pub fn load_by_id(home: &Path, task_id: &str) -> Option<Task> {
 /// per m-42); explicit operator-emitted Blocked/Unblocked events are
 /// honoured by replay's `apply()` as before.
 pub fn list_all(home: &Path) -> Vec<Task> {
-    list_all_at(home)
+    list_all_at(home, home)
 }
 
 /// #2117 P1: list a specific board's tasks (board-root replay + in-memory dep
-/// eval). `list_all(home)` is exactly `list_all_at(home)` — byte-identical,
+/// eval). `list_all(home)` is exactly `list_all_at(home, home)` — byte-identical,
 /// since `home` is the default board root (`board_root(home, DEFAULT)`).
-pub(crate) fn list_all_at(board: &Path) -> Vec<Task> {
+///
+/// #2117 Q2: `home` is threaded so the in-memory dep eval can resolve a task's
+/// `depends_on` across project boards (a dep on another board is read from that
+/// board, cached per pass). For single-project deployments every dep is on this
+/// same board → no cross-board read → byte-identical.
+pub(crate) fn list_all_at(home: &Path, board: &Path) -> Vec<Task> {
     let state = crate::task_events::replay_at(board).unwrap_or_default();
     let mut tasks: Vec<Task> = state.tasks.values().map(record_to_task).collect();
-    apply_dependency_eval_in_memory(&mut tasks);
+    apply_dependency_eval_in_memory(&mut tasks, home, board);
     tasks
 }
 
