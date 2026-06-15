@@ -337,11 +337,17 @@ static REGISTRY_HOLDER: parking_lot::Mutex<Option<HolderInfo>> = parking_lot::Mu
 pub fn thread_dump_interval_secs() -> u64 {
     static CACHE: OnceLock<u64> = OnceLock::new();
     *CACHE.get_or_init(|| {
-        std::env::var("AGEND_DAEMON_THREAD_DUMP_SECS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0)
+        parse_thread_dump_interval(std::env::var("AGEND_DAEMON_THREAD_DUMP_SECS").ok())
     })
+}
+
+/// Pure parse of the raw `AGEND_DAEMON_THREAD_DUMP_SECS` value → interval
+/// seconds (`0` = disabled / unset / unparseable). Split out from the cached
+/// accessor above so tests can exercise the unset→0 / set→N mapping
+/// deterministically without depending on the process-global `OnceLock`,
+/// which is seeded once-per-process and cannot be reset by `remove_var`.
+pub fn parse_thread_dump_interval(raw: Option<String>) -> u64 {
+    raw.and_then(|s| s.parse::<u64>().ok()).unwrap_or(0)
 }
 
 /// Whether thread-dump observability is enabled — derived from

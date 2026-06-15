@@ -182,32 +182,50 @@ mod tests {
         dir
     }
 
-    /// Test 1 (#941 mandatory): when `AGEND_DAEMON_THREAD_DUMP_SECS` is
-    /// unset (or 0), constructing the handler captures `interval_secs=0`
-    /// and `should_dump` always returns false. The handler.run() path
-    /// is a no-op past the gate.
+    /// Test 1 (#941 mandatory): an unset / empty / unparseable
+    /// `AGEND_DAEMON_THREAD_DUMP_SECS` maps to `interval_secs=0`, and an
+    /// interval-0 handler never emits.
     ///
-    /// Note: `thread_dump_enabled()` is process-wide cached via OnceLock
-    /// (per dev-2 sharpening #2), so this test must NOT mutate that
-    /// env var — it asserts the per-handler interval=0 gate, not the
-    /// global cache. The global cache test happens in
-    /// `sync_audit::tests` (separate module, separate process when
-    /// run via `cargo test`).
+    /// #t-3 audit: the prior version did `remove_var` then asserted
+    /// `ThreadDumpHandler::new().interval_secs == 0`. That was order-dependent
+    /// — `new()` reads the process-global `OnceLock` cache
+    /// (`sync_audit::thread_dump_interval_secs`), which is seeded once per
+    /// process and CANNOT be reset by `remove_var`; any earlier test that
+    /// seeded a non-zero value would flip this assertion. We now drive the
+    /// real `parse_thread_dump_interval` mapping directly (deterministic, no
+    /// OnceLock dependence) plus the interval-0 gate on a directly-constructed
+    /// handler (same pattern as `handler_gates_emit_at_interval`).
     #[test]
     fn env_unset_no_dump() {
-        // Unset env explicitly in case parent inherited it.
-        unsafe {
-            std::env::remove_var("AGEND_DAEMON_THREAD_DUMP_SECS");
-        }
-        let handler = ThreadDumpHandler::new();
+        use crate::sync_audit::parse_thread_dump_interval;
         assert_eq!(
-            handler.interval_secs, 0,
-            "unset env must produce interval_secs=0"
+            parse_thread_dump_interval(None),
+            0,
+            "unset env → interval 0"
         );
-        // should_dump must short-circuit on interval=0 regardless of
-        // wall-clock state.
+        assert_eq!(
+            parse_thread_dump_interval(Some(String::new())),
+            0,
+            "empty env → interval 0"
+        );
+        assert_eq!(
+            parse_thread_dump_interval(Some("notanumber".into())),
+            0,
+            "unparseable env → interval 0"
+        );
+        // interval=0 → the gate short-circuits regardless of wall-clock.
+        let handler = ThreadDumpHandler {
+            interval_secs: 0,
+            last_dump_at: AtomicU64::new(0),
+        };
         assert!(!handler.should_dump(), "interval=0 must not emit");
         assert!(!handler.should_dump(), "second call still no-op");
+        // Sanity the mapping is non-trivial: a set value parses through.
+        assert_eq!(
+            parse_thread_dump_interval(Some("5".into())),
+            5,
+            "set env → that interval"
+        );
     }
 
     /// Test 2 (#941 mandatory): when env is set, the handler emits at

@@ -2309,12 +2309,27 @@ instances:
         let dir =
             std::env::temp_dir().join(format!("agend-fleet-cache-inv-{}", std::process::id()));
         let path = write_fleet(&dir, "instances:\n  old-agent:\n    backend: claude\n");
+        let mtime_before = std::fs::metadata(&path)
+            .expect("stat")
+            .modified()
+            .expect("mtime");
         let first = FleetConfig::load(&path).expect("first load");
         assert!(first.instances.contains_key("old-agent"));
 
-        // Ensure mtime changes (some filesystems have 1-second granularity)
-        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // `old-agent` and `new-agent` are the same byte length, so size can't
+        // distinguish the rewrite — only mtime can (this test pins the mtime
+        // path; the size path is covered by load_cache_detects_same_mtime_different_size).
+        // #t-3 audit: force a deterministically-different mtime instead of
+        // sleeping 1100ms for the filesystem's mtime granularity — the sleep
+        // was the flake and slowed the suite.
         std::fs::write(&path, "instances:\n  new-agent:\n    backend: claude\n").expect("rewrite");
+        let f = std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("reopen for set_modified");
+        f.set_modified(mtime_before + std::time::Duration::from_secs(2))
+            .expect("set mtime");
+        drop(f);
 
         let second = FleetConfig::load(&path).expect("second load (invalidated)");
         assert!(

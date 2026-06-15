@@ -95,20 +95,13 @@ pub(crate) fn scan_and_emit(
     let now = chrono::Utc::now();
     for task in &tasks {
         if let Some(reason) = check_stalled(home, task, now) {
-            let last = last_emitted.get(&task.id).copied();
             // Per-task dedup: re-emit only after a full
-            // stall-window-equivalent has passed since the prior
-            // warning. Without this, a long-stalled task would
-            // flood general + lead inbox every scan tick.
-            if let Some(prev) = last {
-                let dedup_window_secs = task
-                    .eta_secs
-                    .map(|e| (e as f64 * STALL_MULTIPLIER) as i64)
-                    .unwrap_or(0);
-                let since_emit = now.signed_duration_since(prev).num_seconds();
-                if since_emit < dedup_window_secs {
-                    continue;
-                }
+            // stall-window-equivalent has passed since the prior warning
+            // (extracted to `dedup_allows_emit` for unit-testability —
+            // byte-identical decision). Without this, a long-stalled task
+            // would flood general + lead inbox every scan tick.
+            if !dedup_allows_emit(task, last_emitted, now) {
+                continue;
             }
             if !seeding {
                 emit_stall(home, task, &reason);
@@ -158,6 +151,28 @@ pub(crate) fn check_stalled(
     } else {
         None
     }
+}
+
+/// Per-task dedup decision: returns `true` when a stall warning for `task`
+/// should emit now, given the per-task `last_emitted` map. Suppresses re-emit
+/// until a full stall-window-equivalent (`eta_secs * STALL_MULTIPLIER`) has
+/// elapsed since the prior warning — without this a long-stalled task floods
+/// general + lead inbox every scan. Extracted from [`scan_and_emit`] (byte-
+/// identical decision) so the dedup contract is unit-testable with real inputs.
+pub(crate) fn dedup_allows_emit(
+    task: &Task,
+    last_emitted: &HashMap<String, chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let Some(prev) = last_emitted.get(&task.id).copied() else {
+        return true;
+    };
+    let dedup_window_secs = task
+        .eta_secs
+        .map(|e| (e as f64 * STALL_MULTIPLIER) as i64)
+        .unwrap_or(0);
+    let since_emit = now.signed_duration_since(prev).num_seconds();
+    since_emit >= dedup_window_secs
 }
 
 fn parse_rfc3339(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -648,71 +663,48 @@ mod tests {
 
     #[test]
     fn scan_dedup_suppresses_repeat_emit_within_window() {
-        // Defensive: per-task dedup state in AntiStallTracker
-        // suppresses re-emit until a full stall-window-equivalent
-        // has elapsed since the prior warning. Without dedup, a
-        // long-stalled task floods general+lead every scan.
-        let _g = env_lock();
-        std::env::remove_var("AGEND_TASK_STALL_RECIPIENTS");
+        // Per-task dedup suppresses re-emit until a full stall-window-
+        // equivalent (eta_secs * STALL_MULTIPLIER) has elapsed since the
+        // prior warning. Without dedup a long-stalled task floods
+        // general+lead every scan.
+        //
+        // #t-3 audit: the prior body appended Created/Claimed/InProgress
+        // events (which stamp `started_at ≈ now`, so the task NEVER stalled),
+        // then looped `maybe_scan` and asserted NOTHING — vacuous about its
+        // own name. We now drive the REAL `dedup_allows_emit` decision with a
+        // genuinely-stalled `make_task` fixture.
         let home = tmp_home("ls-dedup");
-        // Seed a fake task on disk via the events log.
         let now = chrono::Utc::now();
-        let dispatched_at = (now - chrono::Duration::seconds(500)).to_rfc3339();
-        let inst = crate::task_events::InstanceName::from("test");
-        crate::task_events::append(
-            &home,
-            &inst,
-            crate::task_events::TaskEvent::Created {
-                task_id: crate::task_events::TaskId::from("t-dedup"),
-                title: "dedup test".into(),
-                description: String::new(),
-                priority: "normal".into(),
-                owner: None,
-                due_at: None,
-                depends_on: Vec::new(),
-                routed_to: None,
-                branch: None,
-                bind: None,
-                eta_secs: Some(60),
-                tags: vec![],
-                parent_id: None,
-            },
-        )
-        .unwrap();
-        crate::task_events::append(
-            &home,
-            &inst,
-            crate::task_events::TaskEvent::Claimed {
-                task_id: crate::task_events::TaskId::from("t-dedup"),
-                by: inst.clone(),
-            },
-        )
-        .unwrap();
-        crate::task_events::append(
-            &home,
-            &inst,
-            crate::task_events::TaskEvent::InProgress {
-                task_id: crate::task_events::TaskId::from("t-dedup"),
-                by: inst.clone(),
-            },
-        )
-        .unwrap();
-        // Manually force dispatched_at to be old via a touch on the
-        // progress sidecar with a fresh now — wait, we want the
-        // OPPOSITE: no sidecar, dispatched_at far back. The
-        // dispatched_at from the InProgress event will be ~now, so
-        // the stall won't fire. Touch sidecar with a back-dated
-        // ts? No — touch always writes now(). Skip detailed dedup
-        // assertion; rely on per-task state via tracker call.
-        let _ = dispatched_at; // silence
+        // started_at 500s ago, eta 60s → stalled (500 > 60*1.5=90);
+        // dedup window = 90s.
+        let started = (now - chrono::Duration::seconds(500)).to_rfc3339();
+        let task = make_task("t-dedup", "in_progress", Some(60), Some(&started));
+        assert!(
+            check_stalled(&home, &task, now).is_some(),
+            "fixture must be stalled so dedup is actually exercised"
+        );
 
-        let mut tracker = AntiStallTracker::default();
-        // First scan: dispatched_at is fresh, no stall. Next scan
-        // also no stall. This test pins that the dedup field
-        // exists + is touched without panicking.
-        for _ in 0..(TICKS_PER_SCAN + 1) {
-            tracker.maybe_scan(&home);
-        }
+        let mut last_emitted: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
+        // First warning: no prior emit → allowed.
+        assert!(
+            dedup_allows_emit(&task, &last_emitted, now),
+            "first stall warning must emit (no prior)"
+        );
+        last_emitted.insert(task.id.clone(), now);
+
+        // Re-scan 30s later (< 90s window) → suppressed.
+        let within = now + chrono::Duration::seconds(30);
+        assert!(
+            !dedup_allows_emit(&task, &last_emitted, within),
+            "re-emit within the {STALL_MULTIPLIER}x window must be suppressed"
+        );
+
+        // Re-scan 100s later (> 90s window) → re-warn allowed.
+        let past = now + chrono::Duration::seconds(100);
+        assert!(
+            dedup_allows_emit(&task, &last_emitted, past),
+            "re-emit after the dedup window must be allowed"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 

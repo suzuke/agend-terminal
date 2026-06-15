@@ -633,35 +633,35 @@ mod tests {
 
     #[test]
     fn every_advertised_tool_is_routed_somewhere() {
+        // #t-3 audit: the prior version grepped mod.rs + dispatch.rs SOURCE
+        // text for the quoted tool name — a name appearing in a comment or
+        // unrelated string would satisfy it without the tool actually being
+        // routed (false confidence). We now drive the REAL routing path:
+        // `try_dispatch` looks the name up in `mcp::registry::all()` (the
+        // authoritative routing registry) and returns Some iff it routes.
         let defs = crate::mcp::tools::tool_definitions();
         let arr = defs
             .get("tools")
             .and_then(|v| v.as_array())
             .expect("tool_definitions() should return {tools: [...]}");
-        let names: Vec<&str> = arr
+        let names: Vec<String> = arr
             .iter()
             .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+            .map(str::to_string)
             .collect();
-        let mod_rs = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/mcp/handlers/mod.rs"
-        ))
-        .expect("read mod.rs");
-        let dispatch_rs = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/mcp/handlers/dispatch.rs"
-        ))
-        .expect("read dispatch.rs");
-        let mut missing: Vec<&str> = Vec::new();
-        for name in &names {
-            let quoted = format!("\"{name}\"");
-            if !mod_rs.contains(&quoted) && !dispatch_rs.contains(&quoted) {
-                missing.push(name);
-            }
-        }
+        assert!(!names.is_empty(), "tool_definitions() advertised no tools");
+
+        let home = std::env::temp_dir();
+        let args = json!({});
+        let ctx = ctx_for(&home, &args, "");
+        let missing: Vec<&str> = names
+            .iter()
+            .filter(|name| try_dispatch(name, &ctx).is_none())
+            .map(String::as_str)
+            .collect();
         assert!(
             missing.is_empty(),
-            "tools advertised by tool_definitions() but not routed in mod.rs or dispatch.rs: {missing:?}"
+            "tools advertised by tool_definitions() but not routed through the dispatch registry: {missing:?}"
         );
     }
 

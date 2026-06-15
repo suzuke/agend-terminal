@@ -2475,10 +2475,17 @@ mod tests {
             .find("#[cfg(test)]")
             .expect("messaging.rs must have a #[cfg(test)] tests module");
         let prod_src = &source[..prod_end];
+        // #t-3 audit: require the CALL form (trailing `(`) so a mere comment
+        // or doc mention of the symbol can't satisfy the invariant — the
+        // production handler must actually invoke it. Behavioral coverage of
+        // the body persistence lives in `kind_task_body_persisted_in_inbox_jsonl`;
+        // the [AGEND-MSG-PENDING] vs [AGEND-MSG] header difference can't be
+        // observed in a unit test (needs a live PTY agent handle), so this
+        // structural call-form pin is the honest scope here.
         assert!(
-            prod_src.contains("enqueue_with_idle_hint"),
-            "#1065 invariant: handle_send must route kind=task through \
-             enqueue_with_idle_hint (same path as daemon auto-wake)"
+            prod_src.contains("enqueue_with_idle_hint("),
+            "#1065 invariant: handle_send must CALL enqueue_with_idle_hint( \
+             (same path as daemon auto-wake), not merely mention it"
         );
         assert!(
             !prod_src.contains("compose_aware_send("),

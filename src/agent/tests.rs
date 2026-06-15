@@ -880,9 +880,17 @@ fn build_command_strips_agend_git_bypass() {
         shutdown: None,
     };
     let (cmd, _) = build_command(&config).expect("build_command");
-    // Verify env_remove was called — CommandBuilder won't pass it to child.
-    // The env_remove in build_command is the authoritative guard.
-    let _ = cmd;
+    // #t-3 audit: actually assert the strip. portable_pty's CommandBuilder
+    // captures the FULL parent env into its `envs` map at `::new()`, and
+    // `env_remove` deletes the key from that map — so `get_env` DOES reflect
+    // the removal (the old `let _ = cmd` asserted nothing). With
+    // AGEND_GIT_BYPASS=1 set in the parent above, the built command must have
+    // it stripped → get_env returns None.
+    assert_eq!(
+        cmd.get_env("AGEND_GIT_BYPASS"),
+        None,
+        "build_command must strip AGEND_GIT_BYPASS from the child env (#708)"
+    );
     std::env::remove_var("AGEND_GIT_BYPASS");
 }
 
