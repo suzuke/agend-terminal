@@ -26,7 +26,6 @@ fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 #[test]
-#[ignore = "find_message-abort-on-unreadable: red until fix; remove #[ignore] after fix to confirm"]
 fn find_message_does_not_abort_scan_on_unreadable_file_inbox_notify() {
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();

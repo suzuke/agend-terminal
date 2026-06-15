@@ -545,7 +545,9 @@ pub fn startup_sweep(home: &Path) {
                 if path.extension().and_then(|s| s.to_str()) != Some("json") {
                     return None;
                 }
-                let content = std::fs::read_to_string(&path).ok()?;
+                let Ok(content) = std::fs::read_to_string(&path) else {
+                    return None;
+                };
                 let watch: super::watch_state::WatchState = serde_json::from_str(&content).ok()?;
                 let repo = if watch.repo.is_empty() {
                     return None;

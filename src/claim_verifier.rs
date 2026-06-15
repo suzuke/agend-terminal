@@ -574,7 +574,9 @@ fn check_scope_follows_spec(
 /// Load allowed files from dispatch_tracking.json for a given task_id.
 fn load_spec_files(home: &Path, task_id: &str) -> Option<Vec<String>> {
     let path = home.join("dispatch_tracking.json");
-    let content = std::fs::read_to_string(&path).ok()?;
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return None;
+    };
     let store: serde_json::Value = serde_json::from_str(&content).ok()?;
     let entries = store.get("entries")?.as_array()?;
     for entry in entries {

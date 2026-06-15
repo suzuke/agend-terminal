@@ -485,7 +485,9 @@ pub fn pr_state_filename(repo: &str, branch: &str) -> String {
 /// malformed — never panics).
 pub fn load(home: &Path, repo: &str, branch: &str) -> Option<PrState> {
     let path = pr_state_dir(home).join(pr_state_filename(repo, branch));
-    let content = std::fs::read_to_string(&path).ok()?;
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return None;
+    };
     serde_json::from_str(&content).ok()
 }
 

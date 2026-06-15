@@ -214,7 +214,9 @@ pub(crate) fn mark_resolved_for_sender(home: &Path, sender: &str) -> Option<Stri
     // #1116: flock + re-read to serialize against concurrent scan_and_emit
     let _lock = crate::store::acquire_file_lock(&decision_lock_path(home, &id)).ok()?;
     let path = pending_path(home, &id);
-    let content = std::fs::read_to_string(&path).ok()?;
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return None;
+    };
     let mut current: PendingDecision = serde_json::from_str(&content).ok()?;
     if current.status != "pending" {
         return None;

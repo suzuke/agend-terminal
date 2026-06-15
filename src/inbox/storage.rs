@@ -161,7 +161,10 @@ pub fn enqueue_returning_unread_count(
                 continue;
             }
             if let Ok(m) = serde_json::from_str::<InboxMessage>(l) {
-                if m.read_at.is_none() {
+                // CR-2026-06-14: exclude superseded rows (mirror `unread_count`'s
+                // MED-3 fix) — `drain` silently retires them, so they are not
+                // actionable unread and must not inflate the pending hint.
+                if m.read_at.is_none() && m.superseded_by.is_none() {
                     count += 1;
                 }
             }
@@ -300,6 +303,9 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
 
         let now = chrono::Utc::now().to_rfc3339();
         let mut all_messages: Vec<InboxMessage> = Vec::new();
+        // CR-2026-06-14: forward-schema rows we can't parse but must NOT delete
+        // on rewrite — preserved as raw lines and re-emitted verbatim.
+        let mut preserved_forward: Vec<String> = Vec::new();
         let mut batch: Vec<InboxMessage> = Vec::new(); // returned this drain
         let mut newly_read: Vec<InboxMessage> = Vec::new(); // batch minus superseded
         let mut budget_used = 0usize;
@@ -315,11 +321,17 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
                 Err(_) => continue,
             };
             if msg.schema_version > InboxMessage::CURRENT_VERSION {
-                tracing::error!(
+                // CR-2026-06-14: a newer daemon wrote this row. We can't deliver
+                // it (forward-only fields are unknown to this struct), but we MUST
+                // NOT delete it on the rewrite below — that is downgrade data loss.
+                // Preserve the RAW line verbatim so the rewrite re-emits it intact
+                // (store.rs refuse-and-preserve).
+                tracing::warn!(
                     found = msg.schema_version,
                     supported = InboxMessage::CURRENT_VERSION,
-                    "dropping inbox message written by newer schema version"
+                    "skipping (preserving on disk) inbox message written by newer schema version"
                 );
+                preserved_forward.push(line.to_string());
                 continue;
             }
             if msg.read_at.is_none() {
@@ -394,6 +406,11 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
                     .open(&write_tmp)?;
                 for m in &all_messages {
                     writeln!(f, "{}", serde_json::to_string(m)?)?;
+                }
+                // CR-2026-06-14: re-emit preserved forward-schema rows verbatim so
+                // a downgrade never destroys a message a newer daemon wrote.
+                for raw in &preserved_forward {
+                    writeln!(f, "{raw}")?;
                 }
                 f.sync_all()?;
                 std::fs::rename(&write_tmp, path)?;
@@ -584,6 +601,8 @@ pub fn clear_compact(
         let content = std::fs::read_to_string(path).unwrap_or_default();
         let now = chrono::Utc::now().to_rfc3339();
         let mut out: Vec<InboxMessage> = Vec::new();
+        // CR-2026-06-14: forward-schema rows preserved as raw lines (see drain()).
+        let mut preserved_forward: Vec<String> = Vec::new();
         let mut p = Phase1 {
             cleared_count: 0,
             kept_unread_count: 0,
@@ -603,11 +622,14 @@ pub fn clear_compact(
                 Err(_) => continue,
             };
             if msg.schema_version > InboxMessage::CURRENT_VERSION {
-                tracing::error!(
+                // CR-2026-06-14: preserve forward-schema rows verbatim — never
+                // delete a message a newer daemon wrote (downgrade data loss).
+                tracing::warn!(
                     found = msg.schema_version,
                     supported = InboxMessage::CURRENT_VERSION,
-                    "dropping inbox message written by newer schema version"
+                    "skipping (preserving on disk) inbox message written by newer schema version"
                 );
+                preserved_forward.push(line.to_string());
                 continue;
             }
             // Already-read rows are untouched (and not re-summarised).
@@ -657,6 +679,10 @@ pub fn clear_compact(
                     .open(&write_tmp)?;
                 for m in &out {
                     writeln!(f, "{}", serde_json::to_string(m)?)?;
+                }
+                // CR-2026-06-14: re-emit preserved forward-schema rows verbatim.
+                for raw in &preserved_forward {
+                    writeln!(f, "{raw}")?;
                 }
                 f.sync_all()?;
                 std::fs::rename(&write_tmp, path)?;
@@ -933,6 +959,21 @@ pub fn get_thread(home: &Path, thread_id: &str, instance: Option<&str>) -> Vec<I
             }
             collect_thread_messages(&path, thread_id, &mut msgs);
         }
+        // CR-2026-06-14: a migrated inbox is present under TWO directory entries —
+        // `<name>.jsonl` and `<uuid>.jsonl` — holding the SAME messages, so the
+        // cross-inbox scan double-counts every thread message. The two entries are
+        // a symlink on Unix but a real `fs::copy` duplicate on Windows
+        // (`inbox_path_resolved` migration), so a symlink-type skip only fixes
+        // Unix. Dedup by message `id` instead — portable across both: message ids
+        // are globally unique (`ensure_msg_id`), so the same id appearing in both
+        // files is the migration duplicate, while a thread legitimately spanning
+        // several agents' inboxes carries distinct ids and is preserved. Id-less
+        // (legacy, pre-`ensure_msg_id`) rows are kept as-is (can't dedup safely).
+        let mut seen_ids = std::collections::HashSet::new();
+        msgs.retain(|m| match &m.id {
+            Some(id) => seen_ids.insert(id.clone()),
+            None => true,
+        });
     }
 
     msgs.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
@@ -965,7 +1006,13 @@ pub fn find_message(home: &Path, msg_id: &str) -> Option<InboxMessage> {
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
         }
-        let content = std::fs::read_to_string(&path).ok()?;
+        // CR-2026-06-14: skip-and-continue on an unreadable file. The prior
+        // `read_to_string(&path).ok()?` propagated `None` out of the WHOLE scan,
+        // so one bad file hid a message living in a LATER inbox. Mirror
+        // `get_thread`/`collect_thread_messages`.
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
         for line in content.lines() {
             if let Ok(msg) = serde_json::from_str::<InboxMessage>(line) {
                 if msg.id.as_deref() == Some(msg_id) {
