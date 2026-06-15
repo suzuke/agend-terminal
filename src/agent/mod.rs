@@ -1685,19 +1685,32 @@ fn cleanup_agent(
     }
 }
 
+/// Pure startup-grace decision, split out of [`is_startup_failure`] so it is
+/// unit-testable without a live registry / PTY-backed `AgentHandle` (which can't
+/// be constructed in a unit test). An exit is a startup FAILURE — meaning NO
+/// shell fallback — when the agent has been up < 5s AND no user input arrived
+/// since it was spawned. `uptime` is `(elapsed, spawned_at_epoch_ms)` for the
+/// agent, or `None` when it is absent from the registry.
+fn startup_failure_from(uptime: Option<(std::time::Duration, u64)>, last_input_at_ms: u64) -> bool {
+    match uptime {
+        // Input at/after the spawn epoch is a real user session → not a startup
+        // failure. Input timestamped before the spawn epoch is stale (a prior
+        // session) and must NOT suppress the startup-failure path.
+        Some((elapsed, spawned_at_epoch_ms)) => {
+            elapsed < std::time::Duration::from_secs(5) && last_input_at_ms < spawned_at_epoch_ms
+        }
+        None => false,
+    }
+}
+
 fn is_startup_failure(name: &str, id: &crate::types::InstanceId, registry: &AgentRegistry) -> bool {
     let uptime = {
         let reg = registry.lock();
         reg.get(id)
             .map(|h| (h.spawned_at.elapsed(), h.spawned_at_epoch_ms))
     };
-    let had_user_input = {
-        let pair = crate::daemon::heartbeat_pair::snapshot_for(name);
-        uptime
-            .map(|(_, epoch_ms)| pair.last_input_at_ms >= epoch_ms)
-            .unwrap_or(false)
-    };
-    matches!(uptime, Some((d, _)) if d < std::time::Duration::from_secs(5) && !had_user_input)
+    let last_input_at_ms = crate::daemon::heartbeat_pair::snapshot_for(name).last_input_at_ms;
+    startup_failure_from(uptime, last_input_at_ms)
 }
 
 fn on_startup_failure(

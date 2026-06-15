@@ -614,27 +614,31 @@ fn ansi_header_detected_as_system_header() {
 /// Startup failure: exit within 5s + no user input since spawn → no shell fallback.
 #[test]
 fn startup_failure_no_input_no_shell_fallback() {
-    // spawned_at_epoch_ms = 1000, last_input_at_ms = 500 → input before spawn
-    let spawned_at_epoch_ms: u64 = 1000;
-    let last_input_at_ms: u64 = 500;
-    let had_user_input_since_spawn = last_input_at_ms >= spawned_at_epoch_ms;
+    // Drive the REAL decision (`startup_failure_from`) rather than re-implementing
+    // the `last_input_at_ms >= spawned_at_epoch_ms` comparison inline. Up < 5s
+    // with only pre-spawn input (500 < spawn epoch 1000) → startup failure.
     assert!(
-        !had_user_input_since_spawn,
-        "input before spawn should not count as user input"
+        startup_failure_from(Some((std::time::Duration::from_millis(200), 1000)), 500),
+        "exit <5s with only stale pre-spawn input is a startup failure (no shell fallback)"
     );
 }
 
 /// Quick user exit: input AFTER spawn → normal clean exit, not startup failure.
 #[test]
 fn quick_user_exit_still_clean() {
-    // spawned_at_epoch_ms = 1000, last_input_at_ms = 1500 → input after spawn
-    let spawned_at_epoch_ms: u64 = 1000;
-    let last_input_at_ms: u64 = 1500;
-    let had_user_input_since_spawn = last_input_at_ms >= spawned_at_epoch_ms;
+    // Input at/after the spawn epoch (1500 >= 1000) is a real session → clean.
     assert!(
-        had_user_input_since_spawn,
-        "input after spawn should count as user input → not startup failure"
+        !startup_failure_from(Some((std::time::Duration::from_millis(200), 1000)), 1500),
+        "input at/after the spawn epoch is a real session → not a startup failure"
     );
+    // Past the 5s startup grace, a quick exit is not a startup failure even with
+    // no input — the fallback path applies normally.
+    assert!(
+        !startup_failure_from(Some((std::time::Duration::from_secs(6), 1000)), 500),
+        "after the 5s grace window, a no-input exit is not a startup failure"
+    );
+    // Absent from the registry → never a startup failure.
+    assert!(!startup_failure_from(None, 0));
 }
 
 /// #1915 chokepoint: `spawn_agent` refuses an instance that is mid-delete,

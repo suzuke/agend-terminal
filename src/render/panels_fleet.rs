@@ -6,70 +6,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-/// Pure function: build fleet view text lines for testing.
-#[cfg(test)]
-pub fn build_fleet_view_lines(
-    tasks: &[crate::tasks::Task],
-    teams: &[crate::teams::Team],
-    all_instances: &[String],
-) -> Vec<String> {
-    let mut agent_tasks: std::collections::HashMap<&str, Vec<&crate::tasks::Task>> =
-        std::collections::HashMap::new();
-    for t in tasks {
-        if t.status == crate::task_events::TaskStatus::Claimed {
-            if let Some(ref a) = t.assignee {
-                agent_tasks.entry(a.as_str()).or_default().push(t);
-            }
-        }
-    }
-    let mut lines = Vec::new();
-    let mut assigned: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for team in teams {
-        lines.push(format!(
-            "═══ {} (orchestrator: {}) ═══",
-            team.name,
-            team.orchestrator.as_deref().unwrap_or("none")
-        ));
-        for member in &team.members {
-            assigned.insert(member.as_str());
-            let symbol = if agent_tasks.contains_key(member.as_str()) {
-                "🟠"
-            } else {
-                "🟢"
-            };
-            let task_info = agent_tasks
-                .get(member.as_str())
-                .and_then(|ts| ts.first())
-                .map(|t| format!(" → {} ({})", t.title, t.id))
-                .unwrap_or_else(|| " idle".to_string());
-            lines.push(format!("  {symbol} {member}{task_info}"));
-        }
-    }
-    let mut unassigned: Vec<&str> = all_instances
-        .iter()
-        .filter(|n| !assigned.contains(n.as_str()))
-        .map(String::as_str)
-        .collect();
-    unassigned.sort_unstable();
-    if !unassigned.is_empty() {
-        lines.push("═══ unassigned ═══".to_string());
-        for name in &unassigned {
-            let symbol = if agent_tasks.contains_key(name) {
-                "🟠"
-            } else {
-                "🟢"
-            };
-            let task_info = agent_tasks
-                .get(name)
-                .and_then(|ts| ts.first())
-                .map(|t| format!(" → {} ({})", t.title, t.id))
-                .unwrap_or_else(|| " idle".to_string());
-            lines.push(format!("  {symbol} {name}{task_info}"));
-        }
-    }
-    lines
-}
-
 pub(super) fn render_monitor_view(frame: &mut Frame, area: Rect) {
     let metrics = crate::instance_monitor::latest_metrics();
     if metrics.is_empty() {
@@ -296,18 +232,44 @@ fn build_agent_line<'a>(
 mod tests {
     use super::*;
 
+    fn tmp_home(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static C: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "agend-panels-fleet-{}-{}-{}",
+            tag,
+            std::process::id(),
+            C.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Drive the REAL `render_fleet_view` end-to-end (teams + instances loaded
+    /// from fleet.yaml, rendered into a TestBackend buffer). The earlier version
+    /// tested a `#[cfg(test)]`-only `build_fleet_view_lines` re-implementation
+    /// that DIVERGED from production (different symbols/header/idle text), so it
+    /// could pass while the rendered output was wrong.
     #[test]
-    fn test_fleet_view_content() {
-        let teams = vec![crate::teams::Team {
-            name: "dev".to_string(),
-            members: vec!["dev-lead".to_string(), "dev-impl".to_string()],
-            orchestrator: Some("dev-lead".to_string()),
-            description: None,
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-            source_repo: None,
-            stale_members: Vec::new(),
-            accept_from: Vec::new(),
-        }];
+    fn render_fleet_view_groups_team_members_and_unassigned() {
+        let home = tmp_home("render");
+        // Instances live in fleet.yaml; `instance_names()` feeds the unassigned
+        // group, and `teams::create` (the prod write path) records the team.
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  dev-lead:\n    backend: claude\n  \
+             dev-impl:\n    backend: claude\n  general:\n    backend: claude\n",
+        )
+        .unwrap();
+        crate::teams::create(
+            &home,
+            &serde_json::json!({
+                "name": "dev",
+                "members": ["dev-lead", "dev-impl"],
+                "orchestrator": "dev-lead",
+            }),
+        );
+
         let tasks = vec![crate::tasks::Task {
             id: "t-1".to_string(),
             title: "busy work".to_string(),
@@ -330,37 +292,33 @@ mod tests {
             parent_id: None,
             metadata: std::collections::BTreeMap::new(),
         }];
-        let all_instances = vec![
-            "dev-lead".to_string(),
-            "dev-impl".to_string(),
-            "general".to_string(),
-        ];
-        let lines = build_fleet_view_lines(&tasks, &teams, &all_instances);
+
+        let backend = ratatui::backend::TestBackend::new(110, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_fleet_view(frame, &tasks, frame.area(), &home);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "));
+            }
+            out.push('\n');
+        }
+
+        assert!(out.contains("═══ dev ═══"), "team header missing:\n{out}");
         assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("dev") && l.contains("orchestrator: dev-lead")),
-            "must have team header: {lines:?}"
+            out.contains("dev-impl") && out.contains("busy work"),
+            "claimed-task member must show its task title:\n{out}"
         );
+        assert!(out.contains("dev-lead"), "team member missing:\n{out}");
         assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("🟠") && l.contains("dev-impl") && l.contains("busy work")),
-            "busy member must show task: {lines:?}"
+            out.contains("unassigned") && out.contains("general"),
+            "non-team instance must appear under unassigned:\n{out}"
         );
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("🟢") && l.contains("dev-lead") && l.contains("idle")),
-            "idle member must show idle: {lines:?}"
-        );
-        assert!(
-            lines.iter().any(|l| l.contains("unassigned")),
-            "must have unassigned group: {lines:?}"
-        );
-        assert!(
-            lines.iter().any(|l| l.contains("general")),
-            "unassigned agent must appear: {lines:?}"
-        );
+        std::fs::remove_dir_all(&home).ok();
     }
 }
