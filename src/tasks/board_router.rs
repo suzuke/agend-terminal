@@ -43,8 +43,11 @@ fn index_path(home: &Path) -> PathBuf {
 /// is **size-gated lazy**: `record_task_project` calls [`maybe_compact_index`]
 /// after each append, but it only rewrites the file once it crosses a
 /// conservative threshold (so a small index is byte-identical to pre-#2135 —
-/// the rewrite never runs). Phase 1 seals only the *duplicate* vector; orphan
-/// pruning (entries for deleted tasks) is deferred to Phase 2.
+/// the rewrite never runs). Phase 1 sealed the *duplicate* vector; #2168 Phase 2
+/// adds (a) an existence-guarded repair re-append ([`record_task_project_if_absent`])
+/// so duplicates no longer accumulate between compactions, and (b) *orphan*
+/// pruning (entries for tasks deleted from every board) folded into the same
+/// gated compaction via [`live_task_ids`].
 const COMPACT_LINE_THRESHOLD: usize = 2000;
 const COMPACT_BYTE_THRESHOLD: u64 = 256 * 1024;
 
@@ -104,10 +107,22 @@ fn compact_index_gated(
         .lines()
         .filter_map(|l| serde_json::from_str::<IndexEntry>(l).ok())
         .collect();
-    let kept = dedup_entries(&entries);
+    let mut kept = dedup_entries(&entries);
+    // #2168 Phase-2: orphan-prune — drop entries whose task no longer exists on
+    // ANY board. This is the slow-growth vector Phase-1 (dedup) does NOT address:
+    // a long-lived, high-task-volume daemon accumulates deleted-task entries that
+    // never dedup away, and once the index exceeds the threshold EVERY append
+    // re-reads + re-parses the whole file (a real per-append O(n) cost). Pruning
+    // orphans shrinks the index back below the threshold, restoring O(1) appends.
+    // FAIL-SAFE: `live_task_ids` returns None if ANY board's replay errors, so a
+    // transiently-unreadable board can never be mistaken for "its tasks were all
+    // deleted" and false-prune a LIVE task's entry (the highest-risk failure).
+    if let Some(live) = live_task_ids(home) {
+        kept.retain(|e| live.contains(&e.task_id));
+    }
     if kept.len() == raw_line_count {
-        // No duplicates and no corrupt lines to drop → a rewrite would be a
-        // no-op (Phase 1 targets duplicates only; orphan growth is Phase 2).
+        // Nothing removed (no duplicates, no orphans, no corrupt lines) → a
+        // rewrite would be a no-op.
         return Ok(());
     }
 
@@ -127,9 +142,28 @@ fn compact_index_gated(
     tracing::info!(
         before = raw_line_count,
         after = kept.len(),
-        "compacted task_index.jsonl (deduped append-only growth)"
+        "compacted task_index.jsonl (deduped + orphan-pruned append-only growth)"
     );
     Ok(())
+}
+
+/// The set of task_ids live on SOME board across ALL projects — the live set for
+/// #2168 Phase-2 orphan-prune. Returns `None` (→ caller SKIPS pruning, dedup
+/// only) if ANY board's replay errors, so a transient read failure of one board
+/// can never be misread as "every task on it was deleted" and false-prune live
+/// entries. A board that simply holds no tasks replays to an empty state (`Ok`)
+/// and contributes nothing; only a corrupt/unreadable EXISTING board yields
+/// `Err`. Covers EVERY board via `enumerate_projects` — missing a board would
+/// false-orphan its live tasks, so completeness here is load-bearing.
+fn live_task_ids(home: &Path) -> Option<std::collections::HashSet<String>> {
+    let mut live = std::collections::HashSet::new();
+    for project in enumerate_projects(home) {
+        let state = crate::task_events::replay_at(&board_root(home, &project)).ok()?;
+        for tid in state.tasks.keys() {
+            live.insert(tid.0.clone());
+        }
+    }
+    Some(live)
 }
 
 /// Record a task's project at create time. Append-only under the shared
@@ -153,6 +187,52 @@ pub(super) fn record_task_project(
     // lock — best-effort, never fails the record.
     maybe_compact_index(home);
     Ok(())
+}
+
+/// #2168 Phase-2a: the index-repair counterpart of [`record_task_project`] —
+/// append ONLY if `task_id` is not already indexed, with the existence check and
+/// the append performed atomically under the SAME `task_index.jsonl.lock`.
+///
+/// The plain `record_task_project` re-append in [`resolve_task_project`] was
+/// unconditional, so two resolves racing on a not-yet-indexed task (or a resolve
+/// after a transient index loss) could each append a duplicate (TOCTOU). The
+/// caller's `lookup_task_project` is unlocked and cannot close that window; this
+/// re-checks INSIDE `append_lines_under_lock`'s `build_lines` closure (which runs
+/// while the lock is held), so the first writer wins and the rest are no-ops.
+pub(super) fn record_task_project_if_absent(
+    home: &Path,
+    task_id: &str,
+    project_id: &str,
+) -> anyhow::Result<()> {
+    let entry = serde_json::to_string(&IndexEntry {
+        task_id: task_id.to_string(),
+        project_id: project_id.to_string(),
+    })?;
+    // `build_lines` runs under the task_index lock: an empty Vec means "already
+    // present → append nothing". No nested lock (the closure does not re-acquire).
+    crate::event_log::append_lines_under_lock(home, "task_index", |log_path| {
+        if index_contains(log_path, task_id) {
+            Ok(vec![])
+        } else {
+            Ok(vec![entry])
+        }
+    })?;
+    maybe_compact_index(home);
+    Ok(())
+}
+
+/// True if `task_index.jsonl` already carries an entry for `task_id`. A missing
+/// file → false; torn/corrupt lines are skipped (same fail-safe as
+/// [`lookup_task_project`]'s `find_map`).
+fn index_contains(index_path: &Path, task_id: &str) -> bool {
+    let Ok(content) = std::fs::read_to_string(index_path) else {
+        return false;
+    };
+    content.lines().any(|l| {
+        serde_json::from_str::<IndexEntry>(l)
+            .ok()
+            .is_some_and(|e| e.task_id == task_id)
+    })
 }
 
 fn lookup_task_project(home: &Path, task_id: &str) -> Option<String> {
@@ -245,8 +325,11 @@ pub(crate) fn resolve_task_project(home: &Path, task_id: &str) -> String {
             .map(|state| state.tasks.contains_key(&tid))
             .unwrap_or(false);
         if found {
-            // Repair the index so the next lookup is O(1).
-            let _ = record_task_project(home, task_id, &project);
+            // Repair the index so the next lookup is O(1). #2168 Phase-2a: use
+            // the absent-guarded variant so a concurrent repair (or a repair
+            // after a transient index loss) cannot append a duplicate entry —
+            // the existence check is atomic under the index lock.
+            let _ = record_task_project_if_absent(home, task_id, &project);
             return project;
         }
     }
@@ -315,6 +398,38 @@ mod tests {
         }
     }
 
+    fn index_lines(home: &Path) -> usize {
+        std::fs::read_to_string(index_path(home))
+            .map(|c| c.lines().count())
+            .unwrap_or(0)
+    }
+
+    /// Seed a real (live) task on `project`'s board so #2168 Phase-2 orphan-prune
+    /// treats its index entry as live. `DEFAULT_PROJECT` → the home board.
+    fn seed_live_task(home: &Path, project: &str, task_id: &str) {
+        use crate::task_events::{append_batch_at, InstanceName, TaskEvent};
+        append_batch_at(
+            &board_root(home, project),
+            &InstanceName::from("test:seed"),
+            vec![TaskEvent::Created {
+                task_id: TaskId(task_id.to_string()),
+                title: "t".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: None,
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: None,
+                bind: None,
+                eta_secs: None,
+                tags: vec![],
+                parent_id: None,
+            }],
+        )
+        .expect("seed live task");
+    }
+
     /// Pure dedup: keep the FIRST entry per task_id, preserving order — exactly
     /// mirroring `lookup_task_project`'s first-match.
     #[test]
@@ -348,6 +463,10 @@ mod tests {
     #[test]
     fn compact_index_dedups_over_threshold_and_preserves_lookup() {
         let home = tmp_home("compact-over");
+        // #2168 Phase-2: seed both tasks LIVE so orphan-prune keeps them and this
+        // test isolates the dedup behaviour (an unseeded entry would be pruned).
+        seed_live_task(&home, "proj-a", "T-dup");
+        seed_live_task(&home, "proj-b", "T-other");
         // First record wins; later "repair re-append" duplicates carry a WRONG
         // project to prove dedup keeps the first, not the last.
         record_task_project(&home, "T-dup", "proj-a").unwrap();
@@ -409,6 +528,9 @@ mod tests {
     #[test]
     fn compact_index_drops_corrupt_lines_over_threshold() {
         let home = tmp_home("compact-corrupt");
+        // #2168 Phase-2: seed T-1 LIVE so orphan-prune keeps it; this test
+        // isolates corrupt-line + dedup behaviour.
+        seed_live_task(&home, "proj-a", "T-1");
         record_task_project(&home, "T-1", "proj-a").unwrap();
         record_task_project(&home, "T-1", "proj-a").unwrap(); // dup
         {
@@ -427,6 +549,133 @@ mod tests {
             "compaction drops the corrupt line and dedups the good ones"
         );
         assert_eq!(lookup_task_project(&home, "T-1").as_deref(), Some("proj-a"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #2168 Phase-2 (behavioral; replaces the static review_tasks_10 scan) ──
+
+    /// Phase-2a (CR #235 / review_tasks_10): the index-repair re-append is
+    /// guarded — `record_task_project_if_absent` is idempotent. The pre-fix
+    /// repair used `record_task_project` UNCONDITIONALLY, so a concurrent repair
+    /// or a repair after index loss re-appended a duplicate. Behavioral (drives
+    /// the real append + reads the file on disk), not a body source-scan — the
+    /// honest fix lives in a helper, so a body-pinned static scan could only pass
+    /// via a comment-satisfiable needle (#2018/#2206/t-16 anti-pattern).
+    #[test]
+    fn record_if_absent_is_idempotent_and_keeps_first_project() {
+        let home = tmp_home("if-absent");
+        record_task_project_if_absent(&home, "T", "proj-a").unwrap();
+        // Second call (same task, DIFFERENT project) must NOT append: the
+        // existence check is atomic under the index lock.
+        record_task_project_if_absent(&home, "T", "proj-WRONG").unwrap();
+        assert_eq!(
+            index_lines(&home),
+            1,
+            "absent-guard must not re-append an indexed task"
+        );
+        assert_eq!(
+            lookup_task_project(&home, "T").as_deref(),
+            Some("proj-a"),
+            "first recorded project preserved"
+        );
+        // Control: the UNGUARDED record_task_project appends unconditionally —
+        // the duplicate-growth vector record_if_absent closes.
+        record_task_project(&home, "T", "proj-a").unwrap();
+        assert_eq!(
+            index_lines(&home),
+            2,
+            "control: unguarded record appends a duplicate"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Phase-2a (integration): a `resolve_task_project` repair, then a re-resolve
+    /// after the index is lost, never accumulates duplicates — the repair routes
+    /// through the absent-guarded variant.
+    #[test]
+    fn resolve_repair_is_idempotent_across_index_loss() {
+        let home = tmp_home("repair-idem");
+        seed_live_task(&home, DEFAULT_PROJECT, "T-r");
+        assert_eq!(resolve_task_project(&home, "T-r"), DEFAULT_PROJECT);
+        assert_eq!(
+            index_lines(&home),
+            1,
+            "first resolve repairs the index once"
+        );
+        // Re-resolve with the entry already present must not append again.
+        assert_eq!(resolve_task_project(&home, "T-r"), DEFAULT_PROJECT);
+        assert_eq!(
+            index_lines(&home),
+            1,
+            "re-resolve does not duplicate the repair"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Phase-2b: over-threshold compaction prunes ORPHAN entries (tasks that no
+    /// longer exist on any board) while keeping LIVE entries and preserving their
+    /// resolution. Orphans are the slow-growth vector Phase-1 dedup never reached.
+    #[test]
+    fn compaction_prunes_orphan_entries_over_threshold() {
+        let home = tmp_home("orphan-prune");
+        seed_live_task(&home, DEFAULT_PROJECT, "T-live");
+        record_task_project(&home, "T-live", DEFAULT_PROJECT).unwrap();
+        // An orphan: an index entry for a task present on NO board.
+        record_task_project(&home, "T-orphan", "proj-gone").unwrap();
+        compact_index_gated(&home, 1, u64::MAX).unwrap();
+        assert_eq!(index_lines(&home), 1, "orphan pruned, live entry kept");
+        assert_eq!(
+            lookup_task_project(&home, "T-live").as_deref(),
+            Some(DEFAULT_PROJECT),
+            "live task's resolution preserved"
+        );
+        assert_eq!(
+            lookup_task_project(&home, "T-orphan"),
+            None,
+            "orphan no longer resolvable via the index"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Phase-2b ⚠ highest-risk path: a task LIVE on a NON-default board must NOT
+    /// be false-orphaned — `live_task_ids` must cover EVERY board, not just the
+    /// home/default board. Missing a board here would silently drop live entries.
+    #[test]
+    fn compaction_keeps_live_task_on_non_default_board() {
+        let home = tmp_home("orphan-multiboard");
+        seed_live_task(&home, "proj-x", "T-x"); // live on a non-default board
+        record_task_project(&home, "T-x", "proj-x").unwrap();
+        record_task_project(&home, "T-orphan", "proj-gone").unwrap(); // forces a rewrite
+        compact_index_gated(&home, 1, u64::MAX).unwrap();
+        assert_eq!(
+            lookup_task_project(&home, "T-x").as_deref(),
+            Some("proj-x"),
+            "a task live on a non-default board must not be false-orphaned"
+        );
+        assert_eq!(
+            lookup_task_project(&home, "T-orphan"),
+            None,
+            "true orphan pruned"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Phase-2b fail-safe: if ANY board's replay errors, `live_task_ids` returns
+    /// None so orphan-prune is SKIPPED entirely — a transiently-unreadable board
+    /// can never be misread as "its tasks were deleted" and false-prune live
+    /// entries. Force the error by making a board's event log a directory.
+    #[test]
+    fn live_task_ids_is_none_when_a_board_replay_fails() {
+        let home = tmp_home("livetids-failsafe");
+        seed_live_task(&home, DEFAULT_PROJECT, "T-live");
+        // A board whose event log (`task_events.jsonl`) is a DIRECTORY → replay's
+        // read_to_string errors → live_task_ids must bail to None.
+        let bad = board_root(&home, "proj-bad");
+        std::fs::create_dir_all(bad.join("task_events.jsonl")).unwrap();
+        assert!(
+            live_task_ids(&home).is_none(),
+            "a board whose replay errors must yield None so orphan-prune is skipped"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }
