@@ -37,7 +37,6 @@ fn emit_cancelled_body(text: &str) -> String {
 }
 
 #[test]
-#[ignore = "tasks-sweep-cancel-no-guard: red until fix; remove #[ignore] after fix to confirm"]
 fn sweep_cancel_uses_legality_guard_not_bare_append_tasks() {
     let text = read_sweep();
     let body = emit_cancelled_body(&text);

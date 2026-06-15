@@ -51,7 +51,7 @@ fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 #[test]
-#[ignore = "cookie-only-operator-authority: red until fix; remove #[ignore] after fix to confirm"]
+#[ignore = "cookie-only-operator-authority: deferred — operator WONTFIX, single-user trust model (decision d-20260615162503510062-0)"]
 fn operator_connection_uses_kernel_verified_peer_credential_xcut_security() {
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();
