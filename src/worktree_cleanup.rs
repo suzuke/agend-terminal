@@ -170,6 +170,35 @@ fn normalize_path(p: &Path) -> PathBuf {
     PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s).to_string())
 }
 
+/// Canonicalize `p`, or — when it does not exist yet — resolve symlinks on its
+/// longest EXISTING ancestor and re-append the missing tail. Returns `None`
+/// only when not even an existing ancestor canonicalizes.
+///
+/// #worktree-git-7: an active agent's `working_dir` recorded through a symlink
+/// alias whose leaf is transiently absent (mid-creation) would fail
+/// `canonicalize()` outright; the prior fail-OPEN fell back to the raw path,
+/// whose textual prefix misses the canonical worktree → `is_in_use` returned
+/// false and the sweep could remove a worktree out from under a live agent.
+fn canonicalize_lenient(p: &Path) -> Option<PathBuf> {
+    if let Ok(c) = p.canonicalize() {
+        return Some(c);
+    }
+    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut cur = p;
+    while let Some(parent) = cur.parent() {
+        if let Some(name) = cur.file_name() {
+            tail.push(name);
+        }
+        if let Ok(c) = parent.canonicalize() {
+            let mut out = c;
+            out.extend(tail.iter().rev());
+            return Some(out);
+        }
+        cur = parent;
+    }
+    None
+}
+
 /// Check if a worktree path is in use by any active agent.
 fn is_in_use(wt_path: &Path, active_dirs: &[PathBuf]) -> bool {
     let wt_norm = normalize_path(
@@ -177,9 +206,15 @@ fn is_in_use(wt_path: &Path, active_dirs: &[PathBuf]) -> bool {
             .canonicalize()
             .unwrap_or_else(|_| wt_path.to_path_buf()),
     );
-    active_dirs.iter().any(|wd| {
-        let wd_norm = normalize_path(&wd.canonicalize().unwrap_or_else(|_| wd.clone()));
-        wd_norm.starts_with(&wt_norm) || wd.starts_with(wt_path)
+    active_dirs.iter().any(|wd| match canonicalize_lenient(wd) {
+        Some(canon) => {
+            let wd_norm = normalize_path(&canon);
+            wd_norm.starts_with(&wt_norm) || wd.starts_with(wt_path)
+        }
+        // Fail-CLOSED: not even an existing ancestor canonicalizes, so we cannot
+        // prove this active dir is outside the worktree. Treat the ambiguity as
+        // in-use rather than risk sweeping a worktree a live agent is using.
+        None => true,
     })
 }
 

@@ -54,7 +54,6 @@ fn fn_body(src: &str, sig_needle: &str) -> String {
 }
 
 #[test]
-#[ignore = "worktree-git #3 release-marker-rmw: red until fix; remove #[ignore] after fix to confirm"]
 fn release_marker_rmw_is_lock_guarded_or_record_based_worktree_git_3() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/worktree_pool.rs");
     let src = std::fs::read_to_string(&path).expect("read src/worktree_pool.rs");

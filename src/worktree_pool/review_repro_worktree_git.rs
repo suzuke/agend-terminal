@@ -104,7 +104,6 @@ fn cleanup_merged_branch_uses_true_default_not_main_worktree_git() {
 // ──────────────────────────────────────────────────────────────────────────
 
 #[test]
-#[ignore = "worktree-git #6 gc-agent-slash-branch-fallback: red until fix; remove #[ignore] after fix to confirm"]
 fn evaluate_candidate_derives_real_agent_for_slash_branch_worktree_git() {
     let home = scratch("gc-agent-slash");
     let real_agent = "agent-real";

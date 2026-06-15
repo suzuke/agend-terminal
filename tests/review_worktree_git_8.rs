@@ -18,7 +18,6 @@
 use std::path::PathBuf;
 
 #[test]
-#[ignore = "worktree-git #8 dead-code-unsubscribe: red until fix; remove #[ignore] after fix to confirm"]
 fn unsubscribe_all_ci_watches_dead_code_removed_worktree_git_8() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/worktree_pool.rs");
     let src = std::fs::read_to_string(&path).expect("read src/worktree_pool.rs");

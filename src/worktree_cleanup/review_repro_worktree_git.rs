@@ -248,7 +248,6 @@ fn phase1_remote_gone_worktree_keeps_unpushed_branch_ref_worktree_git() {
 
 #[test]
 #[cfg(unix)] // symlink-based repro
-#[ignore = "worktree-git #7 is_in_use-canonicalize-fail-open: red until fix; remove #[ignore] after fix to confirm"]
 fn is_in_use_fails_closed_on_canonicalize_error_worktree_git() {
     use std::os::unix::fs::symlink;
 

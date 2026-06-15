@@ -75,16 +75,38 @@ pub fn lease(
 /// Release a lease — marks worktree as GC candidate (does NOT delete, Phase 4).
 /// Writes `released_at` timestamp for grace period calculation.
 pub fn release(home: &Path, lease: &WorktreeLease) {
-    // Clear binding (task done).
-    crate::binding::unbind(home, &lease.agent);
-    // Write released_at into the managed marker for GC grace calculation.
-    let marker = lease.path.join(MANAGED_MARKER);
-    if let Ok(mut content) = std::fs::read_to_string(&marker) {
-        content.push_str(&format!(
-            "released_at={}\n",
-            chrono::Utc::now().to_rfc3339()
-        ));
-        let _ = crate::store::atomic_write(&marker, content.as_bytes());
+    // #worktree-git-3: hold the SAME per-agent binding lock that
+    // create()/bind_full/gc use, so the unbind + marker read-modify-write is
+    // atomic against a concurrent bind or GC pass. Without it, a racing rewrite
+    // (or a crash between read and write) can drop `released_at` from the
+    // marker, which reclassifies the worktree from the clean-release grace path
+    // into the force-reclaim backstop — changing the deletion semantics.
+    // Best-effort: an unobtainable lock must not block the release (matches the
+    // prior unlocked behaviour, only safer). Scoped so the lock is dropped
+    // before the event-log write (no nested flock).
+    let lock_path = crate::paths::runtime_dir(home)
+        .join(&lease.agent)
+        .join(".binding.json.lock");
+    {
+        let _lock = crate::store::acquire_file_lock(&lock_path);
+        // Clear binding (task done).
+        crate::binding::unbind(home, &lease.agent);
+        // Write released_at into the managed marker for GC grace calculation.
+        let marker = lease.path.join(MANAGED_MARKER);
+        if let Ok(mut content) = std::fs::read_to_string(&marker) {
+            content.push_str(&format!(
+                "released_at={}\n",
+                chrono::Utc::now().to_rfc3339()
+            ));
+            if let Err(e) = crate::store::atomic_write(&marker, content.as_bytes()) {
+                tracing::warn!(
+                    agent = %lease.agent,
+                    path = %marker.display(),
+                    error = %e,
+                    "release: failed to persist released_at into managed marker"
+                );
+            }
+        }
     }
     crate::event_log::log(
         home,
@@ -495,76 +517,6 @@ pub fn release_full(home: &Path, agent: &str, dry_run: bool) -> ReleaseOutcome {
     out
 }
 
-/// Sprint 57 Wave 2 Track B (#546 Item 2) — scan ci-watches dir,
-/// remove `agent` from EVERY watch whose subscriber list contains
-/// them. Replaces the Sprint 55 P0-B EC7 single-(repo, branch)-pair
-/// helper that left ad-hoc watches outside the binding-branch
-/// orphaned on release. Agent names are unique within the fleet so
-/// removing the name from any matching watch is always correct on
-/// release; the cross-repo bleed risk that the EC7 r1 review flagged
-/// only applies when the predicate is "branch matches" — `agent`
-/// matches doesn't have that ambiguity.
-///
-/// Per-watch behaviour: if `agent` was the last subscriber → delete
-/// the watch file entirely; otherwise rewrite it with the shrunk
-/// subscriber list. Best-effort: read/parse/write failures are
-/// logged but never abort release.
-#[allow(dead_code)] // #931: kept as the documented rollback target — see
-                    // the comment block at the former call site in `release_full`. Slated for
-                    // removal one Sprint after #931 lands assuming no rollback fires.
-fn unsubscribe_all_ci_watches_for_agent(home: &Path, agent: &str) {
-    let ci_dir = crate::daemon::ci_watch::ci_watches_dir(home);
-    let Ok(entries) = std::fs::read_dir(&ci_dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("json") {
-            continue;
-        }
-        // #692: flock protects read-modify-write against concurrent ci_watch tick
-        let lock_path = path.with_extension("lock");
-        let _lock = match crate::store::acquire_file_lock(&lock_path) {
-            Ok(l) => l,
-            Err(_) => continue, // skip if can't lock
-        };
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(mut watch) = serde_json::from_str::<serde_json::Value>(&content) else {
-            continue;
-        };
-        let watch_branch = watch["branch"].as_str().unwrap_or("?").to_string();
-        let watch_repo = watch["repo"].as_str().unwrap_or("?").to_string();
-        let mut subs: Vec<String> = crate::daemon::ci_watch::parse_subscribers(&watch);
-        let before = subs.len();
-        subs.retain(|s| s != agent);
-        if subs.len() == before {
-            continue; // agent wasn't subscribed; nothing to do
-        }
-        if subs.is_empty() {
-            let _ = std::fs::remove_file(&path);
-            tracing::info!(%agent, repo = %watch_repo, branch = %watch_branch, path = %path.display(),
-                "ci-watch unsubscribed last subscriber → removed watch file");
-            continue;
-        }
-        let subs_json: Vec<serde_json::Value> = subs
-            .iter()
-            .map(|name| serde_json::json!({"instance": name}))
-            .collect();
-        watch["subscribers"] = serde_json::json!(subs_json);
-        watch["instance"] = serde_json::json!(subs.first().cloned().unwrap_or_default());
-        let _ = crate::store::atomic_write(
-            &path,
-            serde_json::to_string_pretty(&watch)
-                .unwrap_or_default()
-                .as_bytes(),
-        );
-        tracing::info!(%agent, repo = %watch_repo, branch = %watch_branch, remaining = subs.len(),
-            "ci-watch unsubscribed agent; subscribers shrunk");
-    }
-}
-
 /// Pin a worktree (operator override — prevents GC in Phase 4).
 pub fn pin(worktree_path: &Path) {
     let pin_file = worktree_path.join(".agend-pinned");
@@ -917,12 +869,27 @@ fn evaluate_candidate(
         .and_then(|l| l.strip_prefix("agent="))
         .map(String::from)
         .or_else(|| {
-            // New layout: <home>/worktrees/<agent>/<branch>/ → parent is agent
+            // New layout: <home>/worktrees/<agent>/<branch>/, where <branch> may
+            // contain slashes (e.g. `feat/x` → worktrees/<agent>/feat/x).
+            // #worktree-git-6: derive the agent from the FIRST path component
+            // under the worktrees root, NOT the immediate parent dir — for a
+            // slash branch the parent is `feat`, not the real agent, which would
+            // evaluate force-reclaim/liveness against the wrong agent.
+            let root = daemon_managed_worktree_root(home);
             wt_path
-                .parent()
-                .and_then(|p| p.file_name())
-                .and_then(|n| n.to_str())
+                .strip_prefix(&root)
+                .ok()
+                .and_then(|rel| rel.components().next())
+                .and_then(|c| c.as_os_str().to_str())
                 .map(String::from)
+                .or_else(|| {
+                    // Legacy / off-root fallback: immediate parent dir name.
+                    wt_path
+                        .parent()
+                        .and_then(|p| p.file_name())
+                        .and_then(|n| n.to_str())
+                        .map(String::from)
+                })
         })
         .unwrap_or_default();
     if agent_name.is_empty() {
@@ -1158,7 +1125,26 @@ fn gc_remove_one(home: &Path, candidate: &GcCandidate) -> GcResult {
         };
     }
 
-    let source_repo = resolve_source_repo(wt_path);
+    // #worktree-git-4: the owning repo's cwd is MANDATORY for `git worktree
+    // remove`. Empirically, running it with the daemon's inherited cwd (an
+    // unrelated repo) fails with "is not a working tree", leaving the dir on
+    // disk; the remove_dir_all fallback then physically deletes the dir but
+    // CANNOT prune the owning repo's registry (the prune is keyed on
+    // source_repo) → a prunable-registry leak that blocks re-lease. If the
+    // owning repo can't be resolved, skip rather than run git cwd-less; a later
+    // pass reclaims it once `.git` is resolvable.
+    let Some(source_repo) = resolve_source_repo(wt_path) else {
+        return GcResult {
+            path: wt_path.clone(),
+            agent: candidate.agent.clone(),
+            removed: false,
+            error: Some(
+                "skipped: owning source repo unresolved — refusing to run \
+                 `git worktree remove` without the owning-repo cwd"
+                    .to_string(),
+            ),
+        };
+    };
 
     let mut result = GcResult {
         path: wt_path.clone(),
@@ -1167,11 +1153,8 @@ fn gc_remove_one(home: &Path, candidate: &GcCandidate) -> GcResult {
         error: None,
     };
 
-    // git-raw-allowed: `source_repo` may be None, in which case this runs with
-    // NO `current_dir` and git resolves the repo from the absolute worktree path.
-    // `git_cmd`/`git_bypass` both REQUIRE a cwd; there is no repo-tree dir to pass
-    // when source_repo is None (wt_path's parent is the worktrees-pool dir, per
-    // lead ruling). The conditional `current_dir` is the whole point — keep raw.
+    // git-raw-allowed: kept raw (not git_cmd) per the decided #2128 migration
+    // scope; cwd is now always the resolved owning repo.
     let mut cmd = std::process::Command::new("git");
     cmd.args([
         "worktree",
@@ -1179,10 +1162,8 @@ fn gc_remove_one(home: &Path, candidate: &GcCandidate) -> GcResult {
         "--force",
         &wt_path.display().to_string(),
     ])
-    .env("AGEND_GIT_BYPASS", "1");
-    if let Some(ref sr) = source_repo {
-        cmd.current_dir(sr);
-    }
+    .env("AGEND_GIT_BYPASS", "1")
+    .current_dir(&source_repo);
     match cmd.output() {
         Ok(o) if o.status.success() => {
             result.removed = true;
@@ -1197,10 +1178,8 @@ fn gc_remove_one(home: &Path, candidate: &GcCandidate) -> GcResult {
             );
             let _ = std::fs::remove_dir_all(wt_path);
             if !wt_path.exists() {
-                if let Some(ref sr) = source_repo {
-                    // W1.2: best-effort prune (result already ignored).
-                    let _ = crate::git_helpers::git_ok(sr, &["worktree", "prune"]);
-                }
+                // W1.2: best-effort prune (result already ignored).
+                let _ = crate::git_helpers::git_ok(&source_repo, &["worktree", "prune"]);
                 result.removed = true;
             } else {
                 result.error = Some(format!("git worktree remove failed: {stderr}"));
