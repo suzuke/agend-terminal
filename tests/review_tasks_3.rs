@@ -29,7 +29,6 @@ fn production_region(text: &str) -> &str {
 }
 
 #[test]
-#[ignore = "tasks-archive-nonatomic-unfsynced: red until fix; remove #[ignore] after fix to confirm"]
 fn lifecycle_archive_write_is_durable_and_error_checked_tasks() {
     let text = read_lifecycle();
     let prod = production_region(&text);

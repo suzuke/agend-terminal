@@ -85,16 +85,20 @@ fn cancel_stale_tasks(_home: &Path) -> usize {
 fn archive_done_tasks(home: &Path) -> usize {
     let now = chrono::Utc::now();
     let state = crate::task_events::replay(home).unwrap_or_default();
-    let mut count = 0;
     let archive_path = home.join("tasks-archive.jsonl");
     let already_archived = read_archived_task_ids(&archive_path);
 
+    // Collect the records due for archival, then write them in ONE durable
+    // append (below). The prior code appended each task with a discarded-result
+    // writeln + NO fsync: a failed write was invisible and a crash could lose /
+    // tear the append, re-archiving the task next boot.
+    let mut lines: Vec<String> = Vec::new();
     for (tid, record) in &state.tasks {
         if record.status != crate::task_events::TaskStatus::Done {
             continue;
         }
         if already_archived.contains(&tid.0) {
-            continue; // idempotent — already archived on a prior pass
+            continue; // idempotent — already archived on a prior pass (H11)
         }
         let updated = match chrono::DateTime::parse_from_rfc3339(&record.updated_at) {
             Ok(dt) => dt.with_timezone(&chrono::Utc),
@@ -104,7 +108,6 @@ fn archive_done_tasks(home: &Path) -> usize {
         if age_days < DEFAULT_ARCHIVE_DAYS {
             continue;
         }
-        // Append to archive
         let entry = serde_json::json!({
             "archived_at": now.to_rfc3339(),
             "task_id": tid.0,
@@ -114,17 +117,52 @@ fn archive_done_tasks(home: &Path) -> usize {
             "created_at": record.created_at,
             "updated_at": record.updated_at,
         });
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&archive_path)
-        {
-            use std::io::Write;
-            let _ = writeln!(f, "{}", entry);
-            count += 1;
+        lines.push(entry.to_string());
+    }
+
+    if lines.is_empty() {
+        return 0;
+    }
+
+    // Durable, error-checked append. On failure NOTHING is counted — the records
+    // were not written, so they stay un-archived and are retried next pass (the
+    // dedup naturally re-attempts since they never reached the file).
+    match append_archive_durably(&archive_path, &lines) {
+        Ok(()) => lines.len(),
+        Err(e) => {
+            tracing::warn!(
+                path = %archive_path.display(),
+                error = %e,
+                count = lines.len(),
+                "#1201 lifecycle: archive append failed — tasks NOT archived this pass (will retry)"
+            );
+            0
         }
     }
-    count
+}
+
+/// Append newline-terminated JSONL records to the archive durably: a single
+/// buffered `write_all` + `sync_all` (fsync). The fsync makes the append survive
+/// a crash, and surfacing the IO error (vs the prior discarded-result writeln)
+/// lets the caller leave the records un-archived for a retry rather than silently
+/// dropping them. Append-only (the archive is read back by
+/// `read_archived_task_ids`); a
+/// whole-file `atomic_write` would re-read+rewrite the unbounded archive every
+/// pass.
+fn append_archive_durably(path: &Path, lines: &[String]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut buf = String::with_capacity(lines.iter().map(|l| l.len() + 1).sum());
+    for line in lines {
+        buf.push_str(line);
+        buf.push('\n');
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    f.write_all(buf.as_bytes())?;
+    f.sync_all()?;
+    Ok(())
 }
 
 /// Collect the `task_id`s already present in `tasks-archive.jsonl` so archival is
