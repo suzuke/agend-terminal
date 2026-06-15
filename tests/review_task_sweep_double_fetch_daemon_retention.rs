@@ -18,7 +18,6 @@
 use std::path::PathBuf;
 
 #[test]
-#[ignore = "daemon-retention task_sweep-double-fetch: red until fix; remove #[ignore] after fix to confirm"]
 fn compliance_sweep_does_not_refetch_merged_prs_daemon_retention() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/daemon/task_sweep.rs");
     let src =

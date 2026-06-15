@@ -181,6 +181,12 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
     // accumulate in the tracking list and inflate alert text.
     crate::daemon::idle_watchdog::remove_agent_activity(home, name);
 
+    // CR-2026-06-14: drop the in-memory hook-shadow store entry — same
+    // per-agent-residual / stale-state-on-redeploy class as the sidecars above,
+    // but this global `HashMap<name, HookShadow>` had no eviction path (it only
+    // ever inserted via `record_event`), leaking one entry per ever-seen agent.
+    crate::daemon::hook_shadow::forget(name);
+
     // #1744-H2: drop the persisted escalation state so a later agent reusing
     // this name does not rehydrate the deleted instance's crash budget /
     // cooldowns / hung anchor (the #1680 stale-state lesson).

@@ -17,7 +17,6 @@
 use std::path::PathBuf;
 
 #[test]
-#[ignore = "daemon-retention hook_shadow-eviction: red until fix; remove #[ignore] after fix to confirm"]
 fn hook_shadow_store_has_an_eviction_path_daemon_retention() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/daemon/hook_shadow.rs");
     let src =

@@ -79,7 +79,7 @@ fn spawn_sigterm_respecter() -> (u32, std::thread::JoinHandle<()>) {
 
 #[cfg(unix)]
 #[test]
-#[ignore = "daemon-retention boot_sweep-unreadable-pid-guard: red until fix; remove #[ignore] after fix to confirm"]
+#[ignore = "daemon-retention boot_sweep-unreadable-pid-guard: harm already closed by #2170's cleanup start-token guard (this repro is GREEN on current main — the empty .daemon → start_token None → IdentityMismatch → not killed); boot-sweep guard-level hardening is an optional follow-up, re-confirm before un-ignoring"]
 fn unreadable_daemon_pid_must_not_be_killed_in_destructive_sweep_daemon_retention() {
     let home = tmp_home("unreadable-pid");
     let (live_pid, reaper) = spawn_sigterm_respecter();

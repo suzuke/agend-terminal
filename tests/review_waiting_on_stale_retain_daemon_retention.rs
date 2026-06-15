@@ -36,7 +36,6 @@ fn has_code_line_with(src: &str, needle: &str) -> bool {
 }
 
 #[test]
-#[ignore = "daemon-retention waiting_on_stale-retain: red until fix; remove #[ignore] after fix to confirm"]
 fn waiting_on_stale_has_retain_active_and_is_wired_daemon_retention() {
     let tracker_src = read_src("src/daemon/waiting_on_stale.rs");
     let handler_src = read_src("src/daemon/per_tick/supervisor_trackers.rs");

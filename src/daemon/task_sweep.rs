@@ -230,6 +230,9 @@ fn sweep_tick(home: &Path) -> anyhow::Result<()> {
     // exactly as the pre-P2 single-repo tick did (compliance ran only once both
     // the PR list AND the open-task set were non-empty).
     let mut default_scanned = false;
+    // CR-2026-06-14: capture the DEFAULT board's merged-PR list so the compliance
+    // pass below reuses it instead of issuing a second identical GitHub fetch.
+    let mut default_prs: Option<Vec<PrMeta>> = None;
     for (project_id, repo) in &boards {
         match sweep_board(
             home,
@@ -239,9 +242,10 @@ fn sweep_tick(home: &Path) -> anyhow::Result<()> {
             fleet_cfg.as_ref(),
             cfg.dry_run,
         ) {
-            Ok(scanned) => {
+            Ok((scanned, prs)) => {
                 if project_id == crate::task_events::DEFAULT_PROJECT {
                     default_scanned = scanned;
+                    default_prs = Some(prs);
                 }
             }
             // Per-board isolation: a repo-A API/append failure must NOT abort the
@@ -259,7 +263,11 @@ fn sweep_tick(home: &Path) -> anyhow::Result<()> {
     // single-project deployment the DEFAULT board IS `cfg.repo`.
     if default_scanned && cfg.compliance_mode != "off" {
         if let Some(repo) = cfg.repo.as_deref().filter(|s| !s.is_empty()) {
-            let _ = compliance_sweep(home, repo);
+            // Reuse the DEFAULT board's already-fetched list (set together with
+            // `default_scanned` above, so it is always `Some` here).
+            if let Some(prs) = default_prs.as_deref() {
+                let _ = compliance_sweep(home, repo, prs);
+            }
         }
     }
 
@@ -312,12 +320,16 @@ fn sweep_board(
     api_base: &str,
     fleet_cfg: Option<&crate::fleet::FleetConfig>,
     dry_run: bool,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<(bool, Vec<PrMeta>)> {
     // #2117 P3a: the `list_recently_merged_prs` network fetch is the ONLY thing
     // this adds over the testable close logic; delegate the rest to
     // `sweep_board_with_prs` (the injectable seam).
+    // CR-2026-06-14: this is now the SINGLE merged-PR fetch per tick — the list
+    // is returned so `sweep_tick` can thread the DEFAULT board's slice into
+    // `compliance_sweep` instead of it re-fetching the identical data.
     let prs = list_recently_merged_prs(repo, api_base)?;
-    sweep_board_with_prs(home, project_id, &prs, fleet_cfg, dry_run)
+    let scanned = sweep_board_with_prs(home, project_id, &prs, fleet_cfg, dry_run)?;
+    Ok((scanned, prs))
 }
 
 /// #2117 P3a: the close logic of [`sweep_board`] with the PR list INJECTED. Seam
@@ -871,25 +883,22 @@ fn has_scope_linkage(pr: &PrMeta) -> bool {
 
 /// Run compliance sweep on recently merged PRs.
 /// Called from sweep_tick when compliance_mode != "off".
-fn compliance_sweep(home: &Path, repo: &str) -> Vec<ComplianceViolation> {
+///
+/// CR-2026-06-14: the merged-PR list is now fetched ONCE per tick (in
+/// `sweep_board` for the DEFAULT board) and threaded in as `prs` — this fn no
+/// longer issues its own duplicate `list_recently_merged_prs` GitHub request.
+/// Behaviour is unchanged: it operates on the same DEFAULT-board merged-PR list
+/// it used to re-fetch (DEFAULT board repo == `cfg.repo`).
+fn compliance_sweep(home: &Path, repo: &str, prs: &[PrMeta]) -> Vec<ComplianceViolation> {
     let mut cfg = load_config(home);
     if cfg.compliance_mode == "off" {
         return Vec::new();
     }
-    let api_base = cfg
-        .api_base_url
-        .as_deref()
-        .unwrap_or(DEFAULT_GITHUB_API_BASE);
-
-    let prs = match list_recently_merged_prs(repo, api_base) {
-        Ok(prs) => prs,
-        Err(_) => return Vec::new(),
-    };
 
     let mut all_violations = Vec::new();
     let mut max_merged_at: Option<String> = None;
 
-    for pr in &prs {
+    for pr in prs {
         if !pr.merged {
             continue;
         }
@@ -1692,7 +1701,7 @@ mod tests {
             api_base_url: None,
         };
         save_config(&home, &cfg).unwrap();
-        let violations = compliance_sweep(&home, "test/repo");
+        let violations = compliance_sweep(&home, "test/repo", &[]);
         assert!(
             violations.is_empty(),
             "off mode should produce no violations"

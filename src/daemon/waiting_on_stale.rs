@@ -54,6 +54,16 @@ impl WaitingOnStaleTracker {
         scan_and_emit(home, &mut self.last_alerted_at, seeding);
         true
     }
+
+    /// CR-2026-06-14: prune the dedup map to currently-active agents, mirroring
+    /// `ConflictNotifyTracker::retain_active` (the #1923 leak class). Without
+    /// this, `last_alerted_at` grows one permanent entry per agent that ever
+    /// went stale, and a same-name redeploy inherits a stale dedup timestamp
+    /// that can false-suppress a real alert. Driven each tick from
+    /// `WaitingOnStaleHandler::run`.
+    pub(crate) fn retain_active(&mut self, active: &std::collections::HashSet<String>) {
+        self.last_alerted_at.retain(|name, _| active.contains(name));
+    }
 }
 
 /// Scan all metadata files for stale `waiting_on` conditions and emit

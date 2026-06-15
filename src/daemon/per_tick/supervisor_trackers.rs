@@ -169,6 +169,16 @@ impl PerTickHandler for WaitingOnStaleHandler {
     }
     fn run(&self, ctx: &TickContext<'_>) {
         self.tracker.lock().maybe_scan(ctx.home);
+        // CR-2026-06-14: prune the dedup map to live agents each tick (mirrors
+        // ConflictNotifyHandler's #1923 G5 cleanup below) so `last_alerted_at`
+        // doesn't leak one permanent entry per ever-stale agent, and a same-name
+        // redeploy can't inherit a stale dedup timestamp that false-suppresses a
+        // real alert.
+        let live: HashSet<String> = {
+            let reg = crate::agent::lock_registry(ctx.registry);
+            reg.values().map(|h| h.name.to_string()).collect()
+        };
+        self.tracker.lock().retain_active(&live);
     }
 }
 

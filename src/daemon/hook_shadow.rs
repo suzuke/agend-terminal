@@ -49,6 +49,20 @@ fn store() -> &'static Mutex<HashMap<String, HookShadow>> {
     S.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// CR-2026-06-14: drop a deleted/redeployed agent's shadow entry. The global
+/// `store()` is keyed by agent NAME and only ever inserted into
+/// (`record_event`), so without an eviction path it grows one permanent entry
+/// per distinctly-named agent ever seen, and a same-name redeploy inherits the
+/// prior instance's last observation. Called from `full_delete_instance`.
+///
+/// Deliberately lifecycle-keyed, NOT an age-out sweep: the #1523 `ToolUse`
+/// snapshot is allowed to outlive [`HOOK_FRESHNESS`] (event-pair closed, no
+/// clock backstop), so an age-based `.retain` would wrongly demote a
+/// long-running tool — eviction keys on agent deletion instead.
+pub(crate) fn forget(name: &str) {
+    store().lock().remove(name);
+}
+
 /// Freshness window for a hook-derived state: a derived state is only VALID
 /// while a hook event arrived within this window — beyond it the state is
 /// STALE and resolution falls back to the screen heuristic. Kills the
