@@ -1242,6 +1242,47 @@ fn same_board_dep_in_multiproject_fleet_byte_identical_2117_q2() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// Contract (in-memory by design — option (a)/m-42): a dep-derived block is a
+/// LIST-TIME VIEW, never persisted as a Blocked event. `list` derives A as
+/// blocked while its cross-board dep B is open, but A's CANONICAL status — a raw
+/// `replay_at` of A's board — stays Open: the event log records only explicit
+/// operator/agent transitions, not the derived block. This pins what
+/// `apply_dependency_eval_in_memory` documents; a future "persist the derived
+/// block" refactor would silently write phantom Blocked events into history (and
+/// reopen the cross-board cycle risk the in-memory design avoids), and this test
+/// would catch it.
+#[test]
+fn cross_board_dep_derived_block_is_in_memory_not_persisted_2117_q2() {
+    let home = tmp_home("xboard-inmem");
+    cross_board_fleet(&home);
+    let b = create_on(&home, "devB", "B", &[]);
+    let a = create_on(&home, "devA", "A", std::slice::from_ref(&b));
+
+    // List view DERIVES the block (B is open on teamB's board).
+    assert_eq!(
+        status_via_list(&home, "devA", "A"),
+        "blocked",
+        "list must derive A as blocked while cross-board dep B is open"
+    );
+
+    // But the canonical event log persisted NO Blocked transition for A: a raw
+    // replay of A's own board still yields Open.
+    let board_a = super::board_router::board_for_task(&home, &a);
+    let persisted = crate::task_events::replay_at(&board_a)
+        .expect("replay A's board")
+        .tasks
+        .get(&crate::task_events::TaskId(a.clone()))
+        .expect("A present on its board")
+        .status;
+    assert_eq!(
+        persisted,
+        crate::task_events::TaskStatus::Open,
+        "dep-derived block must NOT be persisted — A's replayed status stays Open \
+         (the block is a list-time view, not an event)"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// PR3 — depends_on is set in the Created event and immutable via
 /// the MCP surface (no "depends_on update" event variant). Circular
 /// deps can still arise from migration of a circular legacy

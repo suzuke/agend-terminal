@@ -231,6 +231,12 @@ fn evaluate_with_resolver(
 /// list-time, **not** persisted as Blocked/Unblocked events. The event
 /// log captures only explicit operator/agent transitions; dep-derived
 /// status is a view-layer concern, not part of the canonical history.
+/// This persistence contract is pinned by
+/// `tests::cross_board_dep_derived_block_is_in_memory_not_persisted_2117_q2`
+/// (a `replay_at` of a dep-blocked task's board still yields its un-derived
+/// persisted status). Keeping the block in-memory is also what lets the
+/// cross-board resolver stay acyclic: `Done` is the only persisted status it
+/// reads, so a foreign-board replay is authoritative without recursive eval.
 ///
 /// #2117 Q2: `home` + `board` enable cross-board dep resolution — a dep on
 /// another project's board is read from that board (cached), so a satisfied
