@@ -31,7 +31,6 @@
 use std::path::PathBuf;
 
 #[test]
-#[ignore = "channel-LOW-4: red until fix; remove #[ignore] after fix to confirm"]
 fn notify_recreated_topic_retry_rekeys_dedup_claim_channel() {
     let notify = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/channel/telegram/notify.rs");
     let content = std::fs::read_to_string(&notify)

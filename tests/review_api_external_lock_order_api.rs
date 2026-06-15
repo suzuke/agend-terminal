@@ -72,7 +72,6 @@ fn handle_register_external_body(src: &str) -> Vec<(usize, String)> {
 }
 
 #[test]
-#[ignore = "register-external-nests-external-lock-inside-registry-lock: red until fix; remove #[ignore] after fix to confirm"]
 fn register_external_releases_registry_lock_before_taking_external_api() {
     let path = external_rs();
     let src = std::fs::read_to_string(&path).expect("read external.rs");

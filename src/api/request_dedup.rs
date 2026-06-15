@@ -69,6 +69,17 @@ pub const PER_ENTRY_CAP_BYTES: usize = 64 * 1024;
 /// entries are dropped.
 pub const TOTAL_CAP_BYTES: usize = 64 * 1024 * 1024;
 
+/// CR-2026-06-14: maximum number of cached ENTRIES, independent of the byte
+/// ceiling. Terminal `Oversized`/`Errored` entries are stored with
+/// `response_bytes == 0`, so they contribute nothing to `total_bytes` and the
+/// byte-cap eviction (which also skips zero-byte entries) can never reclaim
+/// them — a stream of unique request_ids with oversized/errored responses would
+/// otherwise grow the map unbounded for the full TTL window. This count cap
+/// evicts the oldest TERMINAL entries (any size) so the entry count stays
+/// bounded. Sized well above any realistic in-flight-plus-TTL dedup population
+/// so it never evicts a legitimately-cacheable response under normal load.
+pub const MAX_ENTRIES: usize = 16_384;
+
 /// Maximum concurrent waiters on a single in-progress entry. Over-cap
 /// callers receive an immediate `in_progress` error.
 pub const WAITER_CAP: usize = 8;
@@ -360,30 +371,49 @@ impl DedupCache {
     }
 
     fn evict_to_fit(&self, inner: &mut Inner) {
-        if inner.total_bytes <= self.total_cap {
-            return;
-        }
-        // Collect terminal entries ordered by completed_at ascending.
-        // InProgress entries (completed_at = None) are skipped — they're
-        // not "old" in any meaningful sense and can't be replayed safely.
-        let mut victims: Vec<(String, Instant, usize)> = inner
-            .entries
-            .iter()
-            .filter_map(|(k, e)| {
-                if e.response_bytes == 0 {
-                    return None;
+        // Byte-cap eviction: drop oldest byte-bearing terminal entries until
+        // under `total_cap`. InProgress entries (completed_at = None) are
+        // skipped — they're not "old" in any meaningful sense and can't be
+        // replayed safely.
+        if inner.total_bytes > self.total_cap {
+            let mut victims: Vec<(String, Instant, usize)> = inner
+                .entries
+                .iter()
+                .filter_map(|(k, e)| {
+                    if e.response_bytes == 0 {
+                        return None;
+                    }
+                    let completed = e.completed_at?;
+                    Some((k.clone(), completed, e.response_bytes))
+                })
+                .collect();
+            victims.sort_by_key(|(_, t, _)| *t);
+            for (id, _, bytes) in victims {
+                if inner.total_bytes <= self.total_cap {
+                    break;
                 }
-                let completed = e.completed_at?;
-                Some((k.clone(), completed, e.response_bytes))
-            })
-            .collect();
-        victims.sort_by_key(|(_, t, _)| *t);
-        for (id, _, bytes) in victims {
-            if inner.total_bytes <= self.total_cap {
-                break;
+                if inner.entries.remove(&id).is_some() {
+                    inner.total_bytes = inner.total_bytes.saturating_sub(bytes);
+                }
             }
-            if inner.entries.remove(&id).is_some() {
-                inner.total_bytes = inner.total_bytes.saturating_sub(bytes);
+        }
+
+        // CR-2026-06-14 count-cap eviction: the byte pass above can never reclaim
+        // zero-byte (Oversized/Errored) terminal entries, so cap the ENTRY COUNT
+        // too — evict the oldest TERMINAL entries (ANY size, including zero-byte)
+        // until back under MAX_ENTRIES. InProgress entries are never evicted.
+        if inner.entries.len() > MAX_ENTRIES {
+            let overflow = inner.entries.len() - MAX_ENTRIES;
+            let mut victims: Vec<(String, Instant, usize)> = inner
+                .entries
+                .iter()
+                .filter_map(|(k, e)| e.completed_at.map(|t| (k.clone(), t, e.response_bytes)))
+                .collect();
+            victims.sort_by_key(|(_, t, _)| *t);
+            for (id, _, bytes) in victims.into_iter().take(overflow) {
+                if inner.entries.remove(&id).is_some() {
+                    inner.total_bytes = inner.total_bytes.saturating_sub(bytes);
+                }
             }
         }
     }

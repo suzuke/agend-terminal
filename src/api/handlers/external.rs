@@ -18,6 +18,13 @@ pub(crate) fn handle_register_external(params: &Value, ctx: &HandlerCtx) -> Valu
     if crate::fleet::resolve_uuid(ctx.home, name).is_some_and(|id| reg.contains_key(&id)) {
         return json!({"ok": false, "error": format!("agent '{name}' already exists (managed)")});
     }
+    // CR-2026-06-14 (lock order): release the registry lock BEFORE taking the
+    // external lock — this was the ONLY site nesting external INSIDE registry
+    // (and it even held registry across the `resolve_uuid` disk read). Holding
+    // both established an undocumented registry→external order; a future
+    // external-then-registry holder would deadlock against it. The managed-name
+    // collision check above is the only thing that needs `reg`, so drop it here.
+    drop(reg);
     let mut ext = agent::lock_external(ctx.externals);
     if ext.contains_key(name) {
         return json!({"ok": false, "error": format!("agent '{name}' already exists (external)")});
@@ -45,7 +52,6 @@ pub(crate) fn handle_register_external(params: &Value, ctx: &HandlerCtx) -> Valu
             pid,
         },
     );
-    drop(reg);
     drop(ext);
     crate::event_log::log(
         ctx.home,

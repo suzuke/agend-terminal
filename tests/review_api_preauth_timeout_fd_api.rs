@@ -35,7 +35,6 @@ fn api_mod_rs() -> PathBuf {
 }
 
 #[test]
-#[ignore = "preauth-timeout-on-write-fd-not-read-fd: red until fix; remove #[ignore] after fix to confirm"]
 fn preauth_read_timeout_is_set_on_the_read_fd_api() {
     let path = api_mod_rs();
     let src = std::fs::read_to_string(&path).expect("read api/mod.rs");
