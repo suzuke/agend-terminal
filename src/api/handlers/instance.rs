@@ -154,6 +154,24 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
     if let Err(e) = agent::validate_name(name) {
         return json!({"ok": false, "error": e});
     }
+    // t-90 (direction-b of the register-external/managed-spawn name collision):
+    // reject a name already held by an EXTERNAL agent before spawning a managed
+    // one. The external lock is taken and RELEASED here (the guard drops on this
+    // statement) — BEFORE any registry lock and before the spawn — so this never
+    // nests registry-inside-external, which would be the AB-BA partner of
+    // #2213's external→registry order and could silently deadlock (lock_external
+    // is an in-mem Mutex, not an fs flock, so the #1535 self-IPC guard would not
+    // catch a spawn_agent path that needed it).
+    //
+    // Option B (narrows, does NOT fully close — chosen over holding lock_external
+    // across the ~100ms spawn, which would serialize the spawn choke point and
+    // carry that deadlock-audit risk): a concurrent register_external landing
+    // AFTER this check but before spawn_agent's registry insert still
+    // double-books (the same #2127-class rare window). Low severity (needs
+    // concurrent register-external + spawn-managed of the SAME name).
+    if agent::lock_external(ctx.externals).contains_key(name) {
+        return json!({"ok": false, "error": format!("agent '{name}' already exists (external)")});
+    }
     if crate::fleet::resolve_uuid(ctx.home, name)
         .is_some_and(|id| agent::lock_registry(ctx.registry).contains_key(&id))
     {
@@ -522,6 +540,61 @@ mod tests {
         if let Some(h) = reg.values().find(|h| h.name.as_str() == name) {
             let _ = h.child.lock().kill();
         }
+    }
+
+    /// t-90 (direction-b common case): a name already held by an EXTERNAL agent
+    /// must NOT be spawnable as a managed agent — `handle_spawn` rejects it at
+    /// the external check (Option B) BEFORE any registry lock or spawn.
+    /// Deterministic: no concurrency, no real spawn (rejected early). Pre-fix
+    /// there is no `(external)` reject path, so the error never cites external.
+    #[test]
+    fn handle_spawn_rejects_name_held_by_external_agent_t90() {
+        let home = Box::new(
+            std::env::temp_dir().join(format!("agend-t90-spawn-ext-{}", std::process::id())),
+        );
+        std::fs::create_dir_all(home.as_ref()).ok();
+        let registry: &'static agent::AgentRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let configs: &'static crate::api::ConfigRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let externals: &'static agent::ExternalRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        // Pre-register an external agent named "twin".
+        externals.lock().insert(
+            "twin".to_string(),
+            agent::ExternalAgentHandle {
+                backend_command: "claude".to_string(),
+                pid: 4242,
+            },
+        );
+        let home_ref: &'static std::path::Path = Box::leak(home.clone());
+        let ctx = HandlerCtx {
+            registry,
+            configs,
+            externals,
+            notifier: None,
+            home: home_ref,
+        };
+
+        let resp = handle_spawn(&json!({"name": "twin", "backend": "claude"}), &ctx);
+        assert_eq!(
+            resp["ok"],
+            json!(false),
+            "managed spawn must reject a name held by an external agent: {resp:?}"
+        );
+        assert!(
+            resp["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("external"),
+            "rejection must cite the external collision (not a downstream spawn error): {resp:?}"
+        );
+        // Rejected at the external check → no managed agent created.
+        assert!(
+            agent::lock_registry(ctx.registry).is_empty(),
+            "no managed agent may be created for an external-held name"
+        );
+        std::fs::remove_dir_all(home.as_ref()).ok();
     }
 
     #[test]
