@@ -7,6 +7,11 @@ use std::path::Path;
 // file (at its LOC ceiling) gains only a single `merge_freshness::gate(...)` call.
 mod merge_freshness;
 
+// CR-2026-06-14: same LOC-relief pattern — `compute_next_poll_eta` lives in a
+// sibling module; re-exported so callers (incl. the in-module repro) are unchanged.
+mod poll_eta;
+pub(crate) use poll_eta::compute_next_poll_eta;
+
 /// #1447: resolve the checkout source repo from `repository_path` — the
 /// cross-tool standard name used by bind_self / team update. Returns `None`
 /// when absent or empty.
@@ -478,35 +483,29 @@ pub(super) fn handle_release_repo(args: &Value) -> Value {
     // (git_ok would discard it), so git_cmd/git_ok would not be byte-identical.
     let mut cmd = std::process::Command::new("git");
     cmd.args(["worktree", "remove", "--force", &path_str]);
-    match crate::git_helpers::spawn_group_bounded(
+    let result = match crate::git_helpers::spawn_group_bounded(
         cmd,
         "git worktree remove (cleanup)",
         crate::git_helpers::LOCAL_GIT_TIMEOUT,
     ) {
-        Ok(o) if o.status.success() => json!({"path": path}),
+        Ok(o) if o.status.success() => return json!({"path": path}),
         Ok(o) => {
             let _ = std::fs::remove_dir_all(&canonical);
-            if let Some(src) = &source_repo {
-                crate::worktree::prune(src);
-            } else {
-                // CR-2026-06-14: force-removed the working tree but could not
-                // resolve its source repo (unreadable `.git` pointer / unresolved
-                // gitdir), so the `<source>/.git/worktrees/<meta>/` metadata can't
-                // be pruned and would otherwise leak SILENTLY. Surface it.
-                tracing::warn!(path = %path_str, "release_repo: removed working tree but source repo unresolved — stale `.git/worktrees` metadata may leak; run force_release / worktree GC to prune");
-            }
             json!({"path": path, "note": String::from_utf8_lossy(&o.stderr).to_string()})
         }
         Err(_) => {
             let _ = std::fs::remove_dir_all(&canonical);
-            if let Some(src) = &source_repo {
-                crate::worktree::prune(src);
-            } else {
-                tracing::warn!(path = %path_str, "release_repo: removed working tree but source repo unresolved — stale `.git/worktrees` metadata may leak; run force_release / worktree GC to prune");
-            }
             json!({"path": path})
         }
+    };
+    // CR-2026-06-14: a fallback arm force-removed the working tree — prune the
+    // source's stale `.git/worktrees` metadata, or warn it'll leak if unresolved.
+    if let Some(src) = &source_repo {
+        crate::worktree::prune(src);
+    } else {
+        tracing::warn!(path = %path_str, "release_repo: source repo unresolved — stale `.git/worktrees` metadata may leak; run force_release / GC");
     }
+    result
 }
 
 /// #1619: resolve the target `owner/repo` for a PR/CI handler.
@@ -707,15 +706,10 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
     watch["expires_at"] = json!((chrono::Utc::now()
         + chrono::Duration::hours(crate::daemon::ci_watch::WATCH_TTL_HOURS))
     .to_rfc3339());
-    // Issue #650: store next_after_ci for auto-routing on CI pass.
-    // CR-2026-06-14: an EXPLICIT empty `next_after_ci:""` means "re-arm with NO
-    // chaining" → clear any previously-stored target rather than carrying the
-    // stale one over (which would still route [ci-ready-for-action] to it). An
-    // ABSENT arg leaves the stored value untouched.
+    // Issue #650 + CR-2026-06-14: set on non-empty; explicit empty CLEARS the
+    // stale handoff (re-arm with no chaining); absent leaves it untouched.
     match args.get("next_after_ci").and_then(|v| v.as_str()) {
-        Some(next) if !next.is_empty() => {
-            watch["next_after_ci"] = json!(next);
-        }
+        Some(next) if !next.is_empty() => watch["next_after_ci"] = json!(next),
         Some(_) => {
             if let Some(obj) = watch.as_object_mut() {
                 obj.remove("next_after_ci");
@@ -809,30 +803,6 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
         resp["setup_warning"] = json!(w);
     }
     resp
-}
-
-/// Sprint 54 P0-5 helper: estimate the next poll's epoch-millis tick
-/// from `last_polled_at` + `effective_interval_secs` (or `interval_secs`
-/// when adaptive backoff hasn't been computed yet). Returns `None` for
-/// fresh watches that haven't polled yet.
-///
-/// Pure function — no IO, no global state. Same input shape used by
-/// the `ci status` aggregator below so the two surfaces never disagree.
-pub(crate) fn compute_next_poll_eta(watch: &Value) -> Option<i64> {
-    let last_polled_at = watch["last_polled_at"].as_i64()?;
-    let interval_secs = watch["effective_interval_secs"]
-        .as_u64()
-        .or_else(|| watch["interval_secs"].as_u64())
-        .unwrap_or(60);
-    // CR-2026-06-14: a huge (attacker/buggy) `interval_secs` would overflow
-    // `(interval_secs as i64) * 1000` — a panic in debug builds, a wrapped
-    // (possibly negative) eta in release. Convert with saturation (`try_from`
-    // caps a > i64::MAX value at i64::MAX) and use saturating arithmetic so the
-    // eta is always a finite, sane value rather than a crash or garbage.
-    let interval_ms = i64::try_from(interval_secs)
-        .unwrap_or(i64::MAX)
-        .saturating_mul(1000);
-    Some(last_polled_at.saturating_add(interval_ms))
 }
 
 /// `ci unwatch` action: unsubscribe the caller from `repo@branch`.
