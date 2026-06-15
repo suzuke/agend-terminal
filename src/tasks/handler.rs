@@ -74,14 +74,7 @@ fn handle_create(home: &Path, emitter: crate::task_events::InstanceName, args: &
     static ID_SEQ: AtomicU64 = AtomicU64::new(0);
     let ts = chrono::Utc::now().format("%Y%m%d%H%M%S%6f");
     let seq = ID_SEQ.fetch_add(1, Ordering::Relaxed);
-    // CR-2026-06-14 (correctness): `tasks::handle` runs in every MCP server
-    // process AND the daemon. ts+ID_SEQ alone is only PROCESS-unique, so two
-    // processes minting in the same microsecond both produce `t-<ts>-0` and
-    // `apply_created`'s `or_insert_with` silently drops the second Created at
-    // replay. The pid makes the id globally unique across processes. Stays
-    // within the `t-<ascii-alnum/-/_>` id shape (no positional parser splits it).
-    let pid = std::process::id();
-    let id = format!("t-{ts}-{pid}-{seq}");
+    let id = format!("t-{ts}-{seq}");
     let assignee = args["assignee"].as_str().map(String::from);
     let routed_to = if let Some(ref name) = assignee {
         match crate::teams::resolve_team_orchestrator(home, name) {
@@ -414,23 +407,33 @@ fn handle_claim(
 }
 
 /// CR-2026-06-14 (security): clamp a caller-supplied `done_source` to the only
-/// provenance a caller may legitimately attest — `OperatorManual`. The forensic
+/// provenance an *untrusted* caller may attest — `OperatorManual`. The forensic
 /// variants (`PrMerged` / `LegacyBackfill` / `AutoCloseOnPrMerge` /
-/// `ReportAutoClose`) record what the daemon OBSERVED of GitHub state; a caller
+/// `ReportAutoClose`) record what the daemon OBSERVED of GitHub state; an agent
 /// forging one through the MCP `done`/`update` surface would poison the audit
-/// trail's "this is what the daemon actually saw" guarantee. Any forensic (or
-/// unparseable) value falls back to a freshly-stamped `OperatorManual` — the
-/// done still succeeds, the forged provenance is silently downgraded rather than
-/// surfaced as an error. Legitimate forensic closes are constructed directly by
-/// daemon paths (`task_sweep` / `auto_close`) that append the event without
-/// going through this caller surface.
+/// trail's "this is what the daemon actually saw" guarantee.
+///
+/// The trust boundary is the CALLER IDENTITY, not a blanket downgrade: the
+/// recognized system identities (`system:auto_close` etc. — the daemon
+/// branch-merge / sweep paths) legitimately set forensic provenance and route
+/// through `handle()` (e.g. `status_summary::auto_close_task_on_branch_merge`
+/// closes with `AutoCloseOnPrMerge` as `system:auto_close`). So forensic is
+/// honored from a system identity and downgraded from everyone else (agents AND
+/// the human `operator`, who closes with `OperatorManual`). A forensic value
+/// from a non-system caller (or an unparseable value) falls back to a
+/// freshly-stamped `OperatorManual` — the done still succeeds, the forged
+/// provenance is silently downgraded rather than surfaced as an error.
 fn caller_attestable_done_source(
+    caller: &str,
     done_source_arg: Option<&Value>,
     fallback_result: Option<String>,
 ) -> crate::task_events::DoneSource {
     use crate::task_events::DoneSource;
     match done_source_arg.and_then(|v| serde_json::from_value::<DoneSource>(v.clone()).ok()) {
+        // OperatorManual is attestable by any caller.
         Some(src @ DoneSource::OperatorManual { .. }) => src,
+        // Forensic provenance is trusted only from a recognized system identity.
+        Some(src) if super::acl::is_system_identity(caller) => src,
         _ => DoneSource::OperatorManual {
             authored_at: chrono::Utc::now().to_rfc3339(),
             result: fallback_result,
@@ -531,7 +534,7 @@ fn handle_done(
         by: crate::task_events::InstanceName(by),
         // CR-2026-06-14 (security): forensic done_source is daemon-only; a caller
         // may only attest OperatorManual. See `caller_attestable_done_source`.
-        source: caller_attestable_done_source(args.get("done_source"), result_text),
+        source: caller_attestable_done_source(&caller, args.get("done_source"), result_text),
     };
     // #1868: re-validate the →Done transition UNDER the append lock against FRESH
     // committed state. The `can_transition_to` check above is a fast-reject; a
@@ -808,6 +811,7 @@ fn handle_update(
                 (_, "done") => {
                     // CR-2026-06-14 (security): forensic done_source is daemon-only.
                     let source = caller_attestable_done_source(
+                        &caller,
                         args.get("done_source"),
                         record.result.clone(),
                     );
