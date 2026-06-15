@@ -899,26 +899,30 @@ mod tests {
     #[serial_test::serial]
     #[tracing_test::traced_test]
     fn t704_phase1b_capture_fixtures_active_emits_privacy_warn() {
-        // SAFETY: serial-gated; restore at end. The bootstrap step
-        // wrapper reads the env var directly so we set/unset around
-        // the invocation. Bare `time_step(...)` runs the closure
-        // in-band without daemon scaffolding.
+        // SAFETY: serial-gated; restore at end. Drive the REAL
+        // `boot_hygiene_sweeps` (which reads the env var directly) rather than
+        // re-implementing its if/warn inline — the earlier version pasted a
+        // STALE copy of the warn text and only asserted `#704` / `active`, so a
+        // text drift (or removal of the warn) in production would not be caught.
         unsafe { std::env::set_var("AGEND_CAPTURE_FIXTURES", "1") };
         let home = tmp_home("capture-warn-active");
-        time_step("capture_fixtures_privacy_warn", || {
-            if std::env::var("AGEND_CAPTURE_FIXTURES").as_deref() == Ok("1") {
-                tracing::warn!(
-                    "#704 AGEND_CAPTURE_FIXTURES=1 active — PTY captures may contain \
-                     secrets / prompts. Operator MUST review tests/fixtures/state-replay/ \
-                     before commit. Promote workflow: see docs/CONTRIBUTING.md."
-                );
-            }
-        });
+        boot_hygiene_sweeps(&home);
+        // Bind to phrases unique to the production text (mod.rs:263-268), not
+        // just the operator-facing `active` token, so the test tracks the real
+        // warn and breaks on a material text change.
         assert!(
             logs_contain("AGEND_CAPTURE_FIXTURES=1 active"),
             "privacy warn must fire when env var is active"
         );
         assert!(logs_contain("#704"), "warn must self-identify as #704 hook");
+        assert!(
+            logs_contain("$AGEND_HOME/captures"),
+            "warn must point operators at the real capture path (prod text)"
+        );
+        assert!(
+            logs_contain(".raw before"),
+            "warn must instruct review of the raw fixtures before commit (prod text)"
+        );
         unsafe { std::env::remove_var("AGEND_CAPTURE_FIXTURES") };
         std::fs::remove_dir_all(&home).ok();
     }
@@ -931,11 +935,7 @@ mod tests {
     fn t704_phase1b_no_warn_when_capture_fixtures_unset() {
         unsafe { std::env::remove_var("AGEND_CAPTURE_FIXTURES") };
         let home = tmp_home("capture-warn-inactive");
-        time_step("capture_fixtures_privacy_warn", || {
-            if std::env::var("AGEND_CAPTURE_FIXTURES").as_deref() == Ok("1") {
-                tracing::warn!("#704 AGEND_CAPTURE_FIXTURES=1 active — should NOT fire here");
-            }
-        });
+        boot_hygiene_sweeps(&home);
         assert!(
             !logs_contain("AGEND_CAPTURE_FIXTURES=1 active"),
             "privacy warn MUST NOT fire when env var is unset"

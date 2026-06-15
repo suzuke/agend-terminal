@@ -512,11 +512,36 @@ mod tests {
     }
 
     #[test]
-    fn strip_prefix_preserves_slashes() {
-        // Simulate the parsing logic directly
-        let output = "refs/remotes/origin/release/2026";
-        let prefix = "refs/remotes/origin/";
-        let result = output.strip_prefix(prefix).unwrap_or(output);
-        assert_eq!(result, "release/2026");
+    fn default_branch_strips_only_remote_prefix_preserving_inner_slashes() {
+        // Drive the REAL `default_branch` against a git fixture whose
+        // `refs/remotes/origin/HEAD` points to a slash-containing branch. The
+        // earlier version of this test re-implemented `strip_prefix` inline and
+        // never called `default_branch`, so a regression in the prod parse (e.g.
+        // `split('/').last()`, which would yield "2026") would not be caught.
+        let repo = tmp_repo("slashed-default");
+        for args in [
+            // A remote-tracking ref whose name itself contains a slash.
+            vec!["update-ref", "refs/remotes/origin/release/2026", "HEAD"],
+            // origin/HEAD → that slashed branch (what `default_branch` reads).
+            vec![
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/release/2026",
+            ],
+        ] {
+            std::process::Command::new("git")
+                .env("AGEND_GIT_BYPASS", "1")
+                .args(&args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+        }
+        assert_eq!(
+            default_branch(&repo),
+            "release/2026",
+            "default_branch must strip only the `refs/remotes/<remote>/` prefix, \
+             preserving slashes inside the branch name"
+        );
+        std::fs::remove_dir_all(&repo).ok();
     }
 }

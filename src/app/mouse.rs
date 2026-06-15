@@ -875,15 +875,43 @@ mod tests {
 
     #[test]
     fn drag_start_sets_dragging_pane_on_title_hit() {
-        let mut layout = Layout::new();
-        layout.add_tab(Tab::new("src".to_string(), leaf(1, "a")));
-        layout.tabs[0].split_focused(SplitDir::Vertical, leaf(2, "b"));
-        layout.active = 0;
-        layout.tabs[0].focus_id = 2;
-        layout.tabs[0].dragging_pane = Some(2);
-        layout.tabs[0].drag_target = None;
+        // Drive the REAL `handle_down`: a Down(Left) on pane 2's title-bar text
+        // must begin dragging pane 2 (and focus it). The earlier version set
+        // `dragging_pane = Some(2)` by hand and asserted it back — a tautology
+        // that never exercised handle_down's title-hit branch.
+        let mut layout = two_pane_layout("right");
+        layout.tabs[0].focus_id = 1; // focus the OTHER pane to prove the move
 
-        assert_eq!(layout.tabs[0].dragging_pane, Some(2));
+        // pane 2 rect = (10, 1, 10, 10); its " right " title text spans cols
+        // [11, 17). Click at col 12, row 1 (the pane's top row, not the tab bar).
+        let click = down_left_at(12, 1);
+        assert_eq!(
+            layout.tabs[0].title_bar_at(12, 1),
+            Some(2),
+            "test precondition: synthetic click must land on pane 2's title text"
+        );
+
+        let mut state = MouseState::default();
+        let mut out = MouseOutcome::default();
+        let fleet_path = std::path::Path::new("/nonexistent/fleet.yaml");
+        handle_down(
+            click,
+            &mut layout,
+            &mut state,
+            fleet_path,
+            &empty_registry(),
+            &mut out,
+        );
+
+        assert_eq!(
+            layout.tabs[0].dragging_pane,
+            Some(2),
+            "handle_down on a pane title bar must begin dragging that pane"
+        );
+        assert_eq!(
+            layout.tabs[0].focus_id, 2,
+            "title-bar hit also focuses the clicked pane"
+        );
         assert_eq!(layout.tabs[0].drag_target, None);
     }
 
