@@ -146,17 +146,8 @@ impl ConflictNotifyTracker {
                             seeding,
                         );
                     } else if let Some(&last_at) = self.last_conflict_at.get(&name) {
-                        let stale = now.signed_duration_since(last_at)
-                            > chrono::Duration::seconds(STALE_THRESHOLD_SECS);
-                        if !stale {
-                            continue;
-                        }
                         let last_escalated = self.last_escalated_at.get(&name).copied();
-                        let dedup_ok = last_escalated.is_none_or(|t| {
-                            now.signed_duration_since(t)
-                                > chrono::Duration::seconds(REALERT_INTERVAL_SECS)
-                        });
-                        if dedup_ok {
+                        if should_escalate_conflict(last_at, last_escalated, now) {
                             emit_telegram_escalation(home, &name);
                             self.last_escalated_at.insert(name.clone(), now);
                         }
@@ -178,6 +169,26 @@ impl ConflictNotifyTracker {
         }
         true
     }
+}
+
+/// Pure escalation decision for a still-conflicted agent already being tracked:
+/// escalate iff the conflict has been open longer than [`STALE_THRESHOLD_SECS`]
+/// AND no escalation fired within the last [`REALERT_INTERVAL_SECS`] (realert
+/// dedup, keyed on the LAST ESCALATION — not the last conflict observation).
+/// Extracted from [`ConflictNotifyTracker::maybe_scan`] so the stale-gate +
+/// dedup timing is unit-testable with real inputs. Byte-identical to the inline
+/// `stale && dedup_ok` it replaced.
+fn should_escalate_conflict(
+    last_conflict_at: chrono::DateTime<chrono::Utc>,
+    last_escalated_at: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let stale = now.signed_duration_since(last_conflict_at)
+        > chrono::Duration::seconds(STALE_THRESHOLD_SECS);
+    let dedup_ok = last_escalated_at.is_none_or(|t| {
+        now.signed_duration_since(t) > chrono::Duration::seconds(REALERT_INTERVAL_SECS)
+    });
+    stale && dedup_ok
 }
 
 /// Best-effort: emit the structured kind=update notify to the bound
@@ -475,25 +486,48 @@ mod tests {
     /// spam when the operator hasn't acted on the initial alert.
     #[test]
     fn realert_dedup_suppresses_within_window() {
-        let tracker = ConflictNotifyTracker::default();
-        // C1 RED: tracker's dedup logic is internal and unimplemented.
-        // C2 GREEN's `should_escalate(name, now)` helper exposes the
-        // pure decision so this test can exercise it without a live
-        // git fixture.
+        // Drive the REAL escalation decision (`should_escalate_conflict`). The
+        // earlier version exercised a test-LOCAL `should_escalate_at` re-impl that
+        // gated dedup on the last CONFLICT time — but production dedups on the last
+        // ESCALATION time (`last_escalated_at`), so the re-impl could pass while
+        // production was wrong. Real fn, real inputs.
         let now = chrono::Utc::now();
-        let first_alert = now - chrono::Duration::minutes(40); // past stale gate
-                                                               // Pretend an alert fired at `first_alert`. The dedup guard
-                                                               // must suppress within REALERT_INTERVAL_SECS = 30 min.
-        let just_after_first = first_alert + chrono::Duration::minutes(5);
+        // A conflict first observed 40 min ago is past the 30-min stale gate.
+        let conflict_at = now - chrono::Duration::minutes(40);
+
+        // No prior escalation → a stale conflict escalates.
         assert!(
-            !should_escalate_at(&tracker, "agent-a", first_alert, just_after_first),
-            "second escalation 5 min after first must be suppressed, got fire"
+            should_escalate_conflict(conflict_at, None, now),
+            "a stale conflict with no prior escalation must escalate"
         );
-        // Past the dedup window — should fire.
-        let past_window = first_alert + chrono::Duration::minutes(35);
+
+        // 5 min after the last escalation → within REALERT_INTERVAL_SECS (30 min)
+        // → suppressed.
+        let first_escalation = now;
         assert!(
-            should_escalate_at(&tracker, "agent-a", first_alert, past_window),
-            "escalation 35 min after first must fire (dedup window expired)"
+            !should_escalate_conflict(
+                conflict_at,
+                Some(first_escalation),
+                first_escalation + chrono::Duration::minutes(5),
+            ),
+            "a re-escalation 5 min after the last must be suppressed (dedup window)"
+        );
+
+        // 35 min after the last escalation → past the dedup window → fires again.
+        assert!(
+            should_escalate_conflict(
+                conflict_at,
+                Some(first_escalation),
+                first_escalation + chrono::Duration::minutes(35),
+            ),
+            "a re-escalation 35 min after the last must fire (dedup window expired)"
+        );
+
+        // A conflict younger than the stale threshold must NOT escalate, even with
+        // no prior escalation — the stale gate, not just the dedup, must hold.
+        assert!(
+            !should_escalate_conflict(now, None, now),
+            "a conflict younger than STALE_THRESHOLD_SECS must not escalate"
         );
     }
 
@@ -583,20 +617,6 @@ mod tests {
     }
 
     // ── Test helpers ──────────────────────────────────────────────────
-
-    /// Pure dedup helper extracted for unit-testing the escalation
-    /// timing without filesystem / network side effects. Returns
-    /// true iff an escalation alert at `now` should fire given a
-    /// prior escalation at `last_at`. The gate: `now - last_at >
-    /// REALERT_INTERVAL_SECS`.
-    fn should_escalate_at(
-        _tracker: &ConflictNotifyTracker,
-        _name: &str,
-        last_at: chrono::DateTime<chrono::Utc>,
-        now: chrono::DateTime<chrono::Utc>,
-    ) -> bool {
-        now.signed_duration_since(last_at) > chrono::Duration::seconds(REALERT_INTERVAL_SECS)
-    }
 
     /// Pure helper: drop the conflict tracker entry on resolution.
     fn clear_on_resolution(tracker: &mut ConflictNotifyTracker, name: &str) {

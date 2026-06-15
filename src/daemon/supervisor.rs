@@ -2330,27 +2330,15 @@ mod tests {
         }));
     }
 
-    fn fresh_retry() -> RateLimitRetry {
-        RateLimitRetry {
-            retry_count: 0,
-            next_retry_at: Instant::now(),
-            exhausted: false,
-            inject_failures: 0,
-            abort_pending: false,
-        }
-    }
-
-    /// Phase-1 clears retry track on agent recovery so the next
-    /// ServerRateLimit starts fresh.
-    #[test]
-    fn recovery_clears_retry_track() {
-        let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
-        tracks.insert("agent1".into(), fresh_retry());
-        tracks.remove("agent1");
-        assert!(!tracks.contains_key("agent1"));
-        tracks.insert("agent1".into(), fresh_retry());
-        assert_eq!(tracks["agent1"].retry_count, 0);
-    }
+    // NOTE: `recovery_clears_retry_track` (+ its `fresh_retry` helper) was removed
+    // here — it only asserted `HashMap` insert/remove semantics on a local map and
+    // never exercised the production recovery path. The REAL recovery gate that
+    // clears the retry track, `clears_server_rate_limit_retry`, is already covered
+    // with real inputs by `clears_server_rate_limit_retry_covers_only_terminal_
+    // recovery_1713` (Idle clears; every other state does not). The other clear
+    // path (`ServerRateLimit && recovered` via productive-output) has no pure seam
+    // without restructuring the registry-locked `process_error_recovery` hot loop,
+    // which would not be a behavior-preserving extraction.
 
     fn tmp_home(tag: &str) -> std::path::PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
