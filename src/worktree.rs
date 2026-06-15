@@ -181,6 +181,11 @@ pub fn create(
                         path = %wt_dir.display(),
                         "reattached clean drifted/detached worktree to requested branch — reusing (#2010 2b)"
                     );
+                    // #2115: `checkout_branch` (git switch) already lands the
+                    // tree on the branch tip from a clean drift, but force-sync
+                    // for uniformity with the same-branch path below — a clean
+                    // tree is a no-op (see sync_worktree_to_head early return).
+                    sync_worktree_to_head(&wt_dir);
                     return Some(WorktreeInfo {
                         path: wt_dir,
                         source_repo: repo_dir.to_path_buf(),
@@ -206,6 +211,11 @@ pub fn create(
             branch = %branch,
             "reusing existing worktree (branch verified)"
         );
+        // #2115: the branch ref may have been fast-forwarded (#869 update-ref)
+        // since this worktree was last synced, leaving a stale (dirty) tree on
+        // hand-off. Force-sync to HEAD before returning so the new occupant gets
+        // a clean tree at the current SHA.
+        sync_worktree_to_head(&wt_dir);
         return Some(WorktreeInfo {
             path: wt_dir,
             source_repo: repo_dir.to_path_buf(),
@@ -527,6 +537,61 @@ pub fn checkout_branch(worktree_dir: &Path, branch: &str) -> Result<(), String> 
         Err(GitError::Spawn(e)) => Err(format!("git switch -c: {e}")),
         Err(GitError::NonZero { stderr, .. }) => Err(format!("git switch -c {branch}: {stderr}")),
     }
+}
+
+/// #2115: force-sync a REUSED worktree's index + working tree to its current
+/// HEAD at the lease-acquisition choke point.
+///
+/// The reuse return paths (`create`'s same-branch reuse + clean-reattach, and
+/// `repo checkout bind:true`'s idempotent short-circuit) hand an EXISTING
+/// worktree back to a fresh occupant. When `ensure_branch_exists` (#869)
+/// fast-forwarded the branch ref via `update-ref` between leases, the worktree's
+/// HEAD symref now points at the new SHA while its index + working tree still
+/// hold the prior commit's content — so the tree reads DIRTY on hand-off (r6
+/// caught this twice: #2196, #2223), and a reviewer who runs runtime on the
+/// polluted tree gets a false-red/false-green verdict. Syncing to HEAD here
+/// closes that at a single choke point.
+///
+/// WIP-safety (dual-review focus): a reuse is a FRESH lease = fresh ownership.
+/// Cross-branch reuse already reject-on-dirty protects genuine WIP (the
+/// `has_uncommitted_changes` drift guard in `create`), so the only trees reset
+/// here belong to a re-acquired SAME branch (or an explicit re-`checkout`),
+/// where sync-to-HEAD matches the caller's intent. A CLEAN tree is never
+/// touched (early return) — the destructive `reset --hard` only ever runs on an
+/// actually-dirty tree, and the porcelain entries are WARN-logged BEFORE the
+/// reset so any discarded content is auditable, never silent.
+///
+/// `clean -fd` (NOT `-fdx`): removes untracked files but PRESERVES `.gitignore`'d
+/// build artifacts (e.g. `target/`) so the build cache survives the lease churn.
+pub fn sync_worktree_to_head(worktree_dir: &Path) {
+    use crate::git_helpers::git_cmd;
+    // Bounded git_cmd (AGEND_GIT_BYPASS + LOCAL_GIT_TIMEOUT + process-group-kill),
+    // matching the WIP guard above — can't wedge on a contended `.git/index.lock`.
+    match git_cmd(worktree_dir, &["status", "--porcelain"]) {
+        // Clean tree: working tree already == HEAD, nothing to sync. Never run a
+        // destructive reset on a clean worktree (minimises blast radius).
+        Ok(status) if status.is_empty() => return,
+        Ok(status) => {
+            tracing::warn!(
+                dir = %worktree_dir.display(),
+                discarded = %status,
+                "#2115 sync-on-reuse: reused worktree is dirty — resetting to HEAD \
+                 (stale-after-#869-ref-advance or prior-lease residue); listed paths are discarded"
+            );
+        }
+        Err(e) => {
+            // Couldn't read status (spawn failure / 60s timeout). The bug we are
+            // closing is exactly a dirty tree and `reset --hard` is the corrective
+            // action, so proceed — but log so it isn't invisible.
+            tracing::warn!(
+                dir = %worktree_dir.display(),
+                error = %e,
+                "#2115 sync-on-reuse: status probe failed — resetting to HEAD anyway"
+            );
+        }
+    }
+    let _ = git_cmd(worktree_dir, &["reset", "--hard", "HEAD"]);
+    let _ = git_cmd(worktree_dir, &["clean", "-fd"]);
 }
 
 /// Sprint 57 Wave 4 (#546 Item 4): list agent names present under
@@ -918,6 +983,108 @@ mod tests {
             first.path.join("wip.txt").exists(),
             "the dirty WIP file must be left intact"
         );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    // ── #2115: force-sync reused worktree to HEAD (review-integrity) ─────────
+
+    fn git_out(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .env("AGEND_GIT_BYPASS", "1")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn git_run(dir: &std::path::Path, args: &[&str]) {
+        std::process::Command::new("git")
+            .env("AGEND_GIT_BYPASS", "1")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git");
+    }
+
+    /// #2115 (r6 #2196/#2223 repro): when the branch ref is fast-forwarded
+    /// (#869 `update-ref`) between leases, the reused worktree's HEAD points at
+    /// the new SHA but its index + working tree are stale → DIRTY on hand-off.
+    /// The same-branch reuse path must force-sync to HEAD so the new occupant
+    /// gets a clean tree at the current SHA (else reviewers run on a polluted
+    /// tree → false verdicts).
+    #[test]
+    fn reuse_syncs_stale_worktree_to_head_after_ref_advance_2115() {
+        let home = tmp_home("sync-on-reuse");
+        let repo = tmp_repo("sync-on-reuse");
+        commit_marker_gitignore(&repo); // representative: marker gitignored in prod
+
+        // First lease lands the worktree on feat/X at c1.
+        let first = create(&home, &repo, "agent1", Some("feat/X")).expect("first lease");
+        let wt = first.path.clone();
+
+        // Advance feat/X to a NEW commit c2 WITHOUT touching the worktree's tree
+        // — exactly what ensure_branch_exists (#869) does via `update-ref`. Build
+        // c2 on the repo's own checkout, then repoint the branch ref at it.
+        std::fs::write(repo.join("feature.txt"), "c2-content\n").unwrap();
+        git_run(&repo, &["add", "feature.txt"]);
+        git_run(
+            &repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-m",
+                "c2",
+            ],
+        );
+        let c2 = git_out(&repo, &["rev-parse", "HEAD"]);
+        git_run(&repo, &["update-ref", "refs/heads/feat/X", &c2]);
+
+        // The worktree is now stale (HEAD=c2 via the symref, tree=c1) → dirty —
+        // and add a stray untracked file to prove `clean -fd` runs too.
+        std::fs::write(wt.join("scratch.txt"), "stray").unwrap();
+        assert!(
+            has_uncommitted_changes(&wt),
+            "precondition: reused worktree is dirty after ref advance"
+        );
+        assert_eq!(
+            git_out(&wt, &["branch", "--show-current"]),
+            "feat/X",
+            "precondition: HEAD symref still on feat/X (update-ref does not detach)"
+        );
+
+        // Re-lease the same (agent, branch): same-branch reuse → force-sync.
+        let second = create(&home, &repo, "agent1", Some("feat/X")).expect("reuse lease");
+        assert_eq!(second.path, wt, "same worktree reused");
+
+        // The tree is now CLEAN at the advanced HEAD (c2).
+        assert_eq!(
+            git_out(&wt, &["status", "--porcelain"]),
+            "",
+            "worktree must be clean after sync-on-reuse"
+        );
+        assert_eq!(
+            git_out(&wt, &["rev-parse", "HEAD"]),
+            c2,
+            "HEAD must be the advanced commit c2"
+        );
+        let feature = std::fs::read_to_string(wt.join("feature.txt")).expect("feature.txt synced");
+        // trim_end: Windows git checkout rewrites the LF to CRLF (`c2-content\r\n`)
+        // — assert on content, not the platform line ending.
+        assert_eq!(
+            feature.trim_end(),
+            "c2-content",
+            "tracked content synced to HEAD (c2)"
+        );
+        assert!(
+            !wt.join("scratch.txt").exists(),
+            "untracked stray file must be removed by clean -fd"
+        );
+
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&repo).ok();
     }
