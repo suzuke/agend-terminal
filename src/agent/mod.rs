@@ -1300,6 +1300,14 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
     Ok(())
 }
 
+/// #CR-2026-06-14: lock the per-agent core (OFF the registry lock path) and
+/// report whether it has reached Idle. Kept as a helper so the readiness check
+/// snapshots `Arc::clone(&h.core)` under the registry lock, drops that guard, and
+/// only then acquires the core lock here — never registry→core nested.
+fn bootstrap_core_is_idle(core: &std::sync::Arc<CoreMutex<AgentCore>>) -> bool {
+    core.lock().state.get_state() == crate::state::AgentState::Idle
+}
+
 /// Poll until the agent reaches Idle, then inject the pre-read instructions
 /// content as a first user message. Used by backends (Kiro) whose CLI does
 /// not auto-load the steering file.
@@ -1339,17 +1347,20 @@ fn spawn_instructions_bootstrap(
                 return;
             }
 
-            let ready = {
-                let reg = &registry.lock();
+            // #CR-2026-06-14 (concurrency): snapshot the core Arc under the tier-1
+            // registry lock, DROP the registry guard, THEN lock the core (in the
+            // helper) — never nest the per-agent core lock inside the registry
+            // lock. The old registry→core nesting established an acquisition order
+            // a core→registry path could deadlock against, every 200ms at startup.
+            // Mirrors the inject snapshot below.
+            let core = {
+                let reg = registry.lock();
                 match reg.get(&instance_id) {
-                    Some(h) => {
-                        let core = &h.core.lock();
-                        core.state.get_state() == crate::state::AgentState::Idle
-                    }
+                    Some(h) => std::sync::Arc::clone(&h.core),
                     None => return, // agent gone
                 }
             };
-            if ready {
+            if bootstrap_core_is_idle(&core) {
                 break;
             }
             std::thread::sleep(poll_interval);

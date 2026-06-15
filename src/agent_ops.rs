@@ -386,8 +386,22 @@ pub fn ensure_not_protected_json(branch: &str) -> Result<(), serde_json::Value> 
 pub fn cleanup_working_dir(home: &Path, name: &str, working_dir: &Path) {
     let workspaces = crate::paths::workspace_dir(home);
 
-    // If under $AGEND_HOME/workspace/, remove the whole directory
-    if working_dir.starts_with(&workspaces) {
+    // If under $AGEND_HOME/workspace/, remove the whole directory.
+    // CR-2026-06-14 (security): a purely LEXICAL `starts_with` lets a symlink
+    // under workspace/ whose real target is ELSEWHERE take this whole-dir
+    // `remove_dir_all` and follow the symlink out of the workspace, destroying
+    // real user data. Require the path to ALSO resolve canonically inside the
+    // canonicalized workspace root (canonicalize BOTH so a symlinked
+    // $AGEND_HOME — e.g. macOS /tmp→/private/tmp — still matches).
+    let under_workspace = working_dir.starts_with(&workspaces)
+        && match (
+            dunce::canonicalize(working_dir),
+            dunce::canonicalize(&workspaces),
+        ) {
+            (Ok(wd), Ok(ws)) => wd.starts_with(&ws),
+            _ => false,
+        };
+    if under_workspace {
         if let Err(e) = std::fs::remove_dir_all(working_dir) {
             tracing::debug!(dir = %working_dir.display(), error = %e, "cleanup: remove workspace");
         } else {

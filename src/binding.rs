@@ -393,10 +393,20 @@ pub fn install_hooks(home: &Path, worktree: &Path) {
     // ran raw `git` with NO bypass env). `git config` against a fleet-managed
     // worktree is exactly the forgot-bypass latent class (#821/#1463): a daemon
     // git mutation should always bypass the agend-git shim. Intended fix.
-    let _ = crate::git_helpers::git_ok(
+    let hooks_set = crate::git_helpers::git_ok(
         worktree,
         &["config", "core.hooksPath", &hooks_dir.display().to_string()],
     );
+    // CR-2026-06-14: surface the silent failure. If the worktree isn't a git repo
+    // yet (or the config write fails) the prepare-commit-msg hook is never wired
+    // up; warn so an operator can notice rather than the binding/commit-msg
+    // enforcement vanishing silently for that worktree.
+    if !hooks_set {
+        tracing::warn!(
+            worktree = %worktree.display(),
+            "install_hooks: `git config core.hooksPath` failed — prepare-commit-msg hook NOT wired up for this worktree"
+        );
+    }
 }
 
 /// Install hooks on all existing worktrees (daemon startup reconcile).
