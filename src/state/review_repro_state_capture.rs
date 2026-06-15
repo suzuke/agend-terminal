@@ -130,12 +130,16 @@ fn unclassified_throttle_static_screen_logs_once_not_per_tick() {
         .count();
     let _ = std::fs::remove_file(&path);
 
-    assert!(
-        records <= 1,
+    // r6 nit#3: assert EXACTLY one, not `<= 1`. The fire-once contract is "log
+    // once per distinct screen" — `<= 1` also passes when the throttle hint logs
+    // ZERO times, which would silently hide a regression that stops logging the
+    // incident at all. `== 1` pins both directions (fires, and only once).
+    assert_eq!(
+        records, 1,
         "#1 resource-leak: a STATIC unclassified-throttle screen fed 6× appended \
-         {records} JSONL records to unclassified_errors.jsonl (one per tick via the \
-         hash-dedup throttle-hint bypass). After the per-signature fire-once latch \
-         it must log at most once per distinct screen."
+         {records} JSONL records to unclassified_errors.jsonl (expected exactly one \
+         per distinct screen — the per-signature fire-once latch must log once, not \
+         per-tick and not zero)."
     );
 }
 
@@ -177,12 +181,16 @@ fn srl_keep_latched_warn_dedups_across_spinner_ticks() {
         "#2 precondition: the stuck SRL must remain latched across the ticks"
     );
     let warns = logs.matches("#2086-srl-keep-latched").count();
-    assert!(
-        warns <= 1,
+    // r6 nit#3: `== 1`, not `<= 1` — a dedup that silently stopped firing entirely
+    // would also satisfy `<= 1`, hiding the loss of the incident WARN. Pin
+    // exactly-once (fires, and only once per distinct stuck-error signature).
+    assert_eq!(
+        warns,
+        1,
         "#2 maintainability: the #2086-srl-keep-latched WARN fired {warns} times for ONE \
-         stuck SRL across {} spinner ticks (per-tick flood reproducing the #1450 \
-         14k-lines/incident class). After a dedup latch keyed on srl_match_signature it \
-         must fire at most once per distinct stuck-error signature.",
+         stuck SRL across {} spinner ticks (expected exactly one — the dedup latch keyed \
+         on srl_match_signature must fire once per distinct stuck-error signature, not \
+         per-tick and not zero).",
         spinners.len()
     );
 }
