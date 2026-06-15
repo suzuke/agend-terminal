@@ -608,6 +608,12 @@ fn track_dispatch(
                 );
             }
         }
+        // #t-127: bridge a reviewer VERDICT back to its review TASK + sidecar. A
+        // verdict is keyed on `repo@branch` (pr-state pipeline) OR the task id, but
+        // the review task + dispatch sidecar are `t-…`-keyed — so the `corr`-keyed
+        // handling above MISSES a `repo@branch` verdict (left review tasks ghosting
+        // + the sidecar firing spurious "stuck" nudges after the reviewer replied).
+        bridge_verdict_to_review_task(home, from, msg);
     } else if matches!(kind_str, "update" | "query") {
         // #1923 G8: key the dispatch-idle refresh by the SAME correlation as the
         // WRITE side above (~:496 records the pending-dispatch sidecar under
@@ -619,6 +625,57 @@ fn track_dispatch(
         if let Some(corr) = msg.correlation_id.as_deref().or(msg.task_id.as_deref()) {
             let _ = crate::daemon::dispatch_idle::refresh_issued_at(home, corr);
         }
+    }
+}
+
+/// #t-127: bridge a reviewer VERDICT report back to its review TASK + dispatch
+/// sidecar, root-fixing two symptoms with one mechanism:
+/// - **ghost review tasks** — VERIFIED verdicts never auto-closed their review
+///   task (the `auto_close_on_report` call above is gated on `corr.starts_with("t-")`,
+///   but a verdict's `corr` is `repo@branch`), so they piled up unclosed.
+/// - **spurious stuck-nudges** — the dispatch sidecar is `t-…`-keyed, so
+///   `mark_resolved(repo@branch)` never cleared it and the watchdog kept pinging
+///   "stuck 30min" after the reviewer had already replied.
+///
+/// Resolution is dual-path (cheaper + branch-independent — dual-2/GH-diff review
+/// dispatches carry NO branch, so a branch reverse-lookup would structurally miss
+/// them):
+/// - if the report's correlation IS a `t-…` → use it directly (exact);
+/// - else (`repo@branch` / none) → `open_review_dispatch_for_reporter` reverse-looks
+///   the reporter's single OPEN dispatch sidecar (exactly-one fail-safe).
+///
+/// Then: ANY verdict clears the sidecar (the reviewer responded → not stuck);
+/// only VERIFIED auto-closes the review task (REJECTED/UNVERIFIED stay open for the
+/// re-review cycle). `terminal=true` is synthesized internally for VERIFIED, so the
+/// close does NOT depend on the reviewer setting the flag (the root fix). Closing
+/// the task is orthogonal to the pr-state merge gate (the scanner aggregates
+/// verdicts by `reviewed_head`, independent of task lifecycle).
+fn bridge_verdict_to_review_task(home: &Path, reporter: &str, msg: &crate::inbox::InboxMessage) {
+    use crate::mcp::handlers::comms_gates::{detect_verdict, Verdict};
+    // Only ACTUAL verdict reports: a leading VERIFIED/REJECTED/UNVERIFIED token
+    // (§3.12) AND a `reviewed_head` SHA (every reviewer verdict carries it, #1024).
+    let Some(verdict) = detect_verdict(&msg.text) else {
+        return;
+    };
+    if msg.reviewed_head.is_none() {
+        return;
+    }
+    let corr = msg.correlation_id.as_deref().or(msg.task_id.as_deref());
+    let task_id: Option<String> = match corr {
+        Some(c) if c.starts_with("t-") => Some(c.to_string()),
+        _ => crate::daemon::dispatch_idle::open_review_dispatch_for_reporter(home, reporter),
+    };
+    let Some(task_id) = task_id else {
+        return;
+    };
+    // Any verdict → the reviewer responded → clear the dispatch sidecar (kills the
+    // post-response stuck-nudge), regardless of VERIFIED vs REJECTED.
+    let _ = crate::daemon::dispatch_idle::mark_resolved(home, &task_id);
+    // Only VERIFIED closes the review task. terminal=true synthesized internally.
+    if matches!(verdict, Verdict::Verified) {
+        let _ = crate::tasks::auto_close::auto_close_on_report(
+            home, "report", &task_id, reporter, &msg.text, true,
+        );
     }
 }
 
@@ -2901,6 +2958,201 @@ mod tests {
             pr_state::is_merge_ready(&state),
             "#2079: a short-SHA verdict buffered BEFORE CI must drain (prefix-match) when the full \
              head is observed and flip merge-ready; state={state:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #t-127: reviewer-verdict → review-task bridge (ghost-close + sidecar) ──
+
+    fn seed_review_task(home: &std::path::Path, task_id: &str, reviewer: &str) {
+        use crate::task_events::{InstanceName, TaskEvent, TaskId};
+        let emitter = InstanceName::from("test:seed");
+        let tid = TaskId(task_id.into());
+        crate::task_events::append_batch(
+            home,
+            &emitter,
+            vec![
+                TaskEvent::Created {
+                    task_id: tid.clone(),
+                    title: "review PR".into(),
+                    description: String::new(),
+                    priority: "normal".into(),
+                    owner: None,
+                    due_at: None,
+                    depends_on: Vec::new(),
+                    routed_to: None,
+                    branch: None,
+                    bind: None,
+                    eta_secs: None,
+                    tags: vec![],
+                    parent_id: None,
+                },
+                TaskEvent::Claimed {
+                    task_id: tid,
+                    by: InstanceName::from(reviewer),
+                },
+            ],
+        )
+        .expect("seed review task");
+    }
+
+    fn task_status_of(
+        home: &std::path::Path,
+        task_id: &str,
+    ) -> Option<crate::task_events::TaskStatus> {
+        crate::task_events::replay(home)
+            .unwrap_or_default()
+            .tasks
+            .get(&crate::task_events::TaskId(task_id.into()))
+            .map(|r| r.status)
+    }
+
+    fn sidecar_present(home: &std::path::Path, task_id: &str) -> bool {
+        crate::daemon::dispatch_idle::list_pending(home)
+            .iter()
+            .any(|d| d.correlation_id.as_deref() == Some(task_id))
+    }
+
+    fn t127_verdict(verdict_text: &str, corr: &str) -> crate::inbox::InboxMessage {
+        crate::inbox::InboxMessage::new_system("system:reviewer", "report", verdict_text)
+            .with_correlation_id(corr.to_string())
+            .with_reviewed_head("7e1d4228bea3cf7fe2d72aab66015297308b48bc".to_string())
+    }
+
+    fn record_review_dispatch(home: &std::path::Path, dispatcher: &str, reviewer: &str, tid: &str) {
+        crate::daemon::dispatch_idle::record_dispatch(
+            home,
+            dispatcher,
+            reviewer,
+            Some(tid),
+            "task",
+            1800,
+        )
+        .expect("review dispatch sidecar");
+    }
+
+    /// Case (a) dual-1: verdict carries the TASK id (`corr=t-…`). VERIFIED must
+    /// auto-close the task (terminal synthesized) AND clear the dispatch sidecar.
+    #[test]
+    fn verdict_dual1_taskid_verified_closes_task_and_clears_sidecar_t127() {
+        let home = tmp_home("t127-dual1");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let reviewer = "fixup-reviewer-6";
+        seed_review_task(&home, "t-rev-1", reviewer);
+        record_review_dispatch(&home, "fixup-lead", reviewer, "t-rev-1");
+
+        bridge_verdict_to_review_task(
+            &home,
+            reviewer,
+            &t127_verdict("VERIFIED looks good", "t-rev-1"),
+        );
+
+        assert_eq!(
+            task_status_of(&home, "t-rev-1"),
+            Some(crate::task_events::TaskStatus::Done),
+            "dual-1 VERIFIED (corr=t-…) must auto-close the review task"
+        );
+        assert!(
+            !sidecar_present(&home, "t-rev-1"),
+            "the dispatch sidecar must be cleared"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Case (b) dual-2: verdict carries `repo@branch` (NO task id; GH-diff review
+    /// dispatches have no branch on the task either). The bridge must reverse-look
+    /// the reporter's single open dispatch sidecar to reach the task. (RED pre-fix:
+    /// `auto_close` is gated on `corr.starts_with("t-")` → repo@branch never closes.)
+    #[test]
+    fn verdict_dual2_repobranch_verified_bridges_via_reverse_lookup_t127() {
+        let home = tmp_home("t127-dual2");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let reviewer = "fixup-reviewer-4";
+        seed_review_task(&home, "t-rev-2", reviewer);
+        record_review_dispatch(&home, "fixup-lead", reviewer, "t-rev-2");
+
+        bridge_verdict_to_review_task(
+            &home,
+            reviewer,
+            &t127_verdict("VERIFIED diff clean", "owner/repo@feat/x"),
+        );
+
+        assert_eq!(
+            task_status_of(&home, "t-rev-2"),
+            Some(crate::task_events::TaskStatus::Done),
+            "dual-2 VERIFIED (corr=repo@branch) must bridge via reverse-lookup and close the task"
+        );
+        assert!(
+            !sidecar_present(&home, "t-rev-2"),
+            "sidecar must be cleared via the reverse-lookup bridge"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// REJECTED → the reviewer responded, so the sidecar clears (no more stuck-ping),
+    /// but the review task stays OPEN for the re-review cycle (only VERIFIED closes).
+    #[test]
+    fn verdict_rejected_clears_sidecar_but_keeps_task_open_t127() {
+        let home = tmp_home("t127-rejected");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let reviewer = "fixup-reviewer-2";
+        seed_review_task(&home, "t-rev-3", reviewer);
+        record_review_dispatch(&home, "fixup-lead", reviewer, "t-rev-3");
+
+        bridge_verdict_to_review_task(
+            &home,
+            reviewer,
+            &t127_verdict("REJECTED found a bug", "owner/repo@feat/x"),
+        );
+
+        assert!(
+            !sidecar_present(&home, "t-rev-3"),
+            "any verdict clears the sidecar (reviewer responded → not stuck)"
+        );
+        assert_eq!(
+            task_status_of(&home, "t-rev-3"),
+            Some(crate::task_events::TaskStatus::Claimed),
+            "REJECTED must NOT close the review task (re-review pending)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Exactly-one fail-safe: a reporter with MULTIPLE open dispatches (from distinct
+    /// dispatchers, so #1866 handoff-retire doesn't collapse them) → ambiguous → the
+    /// bridge skips (mis-closing the wrong task is worse than a lingering ghost).
+    #[test]
+    fn verdict_reverse_lookup_skips_when_reporter_has_multiple_open_dispatches_t127() {
+        let home = tmp_home("t127-multi");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let reviewer = "fixup-reviewer-3";
+        seed_review_task(&home, "t-rev-a", reviewer);
+        seed_review_task(&home, "t-rev-b", reviewer);
+        record_review_dispatch(&home, "fixup-lead", reviewer, "t-rev-a");
+        record_review_dispatch(&home, "fixup-dev", reviewer, "t-rev-b");
+
+        bridge_verdict_to_review_task(
+            &home,
+            reviewer,
+            &t127_verdict("VERIFIED ok", "owner/repo@feat/x"),
+        );
+
+        assert_eq!(
+            task_status_of(&home, "t-rev-a"),
+            Some(crate::task_events::TaskStatus::Claimed),
+            "ambiguous reverse-lookup must NOT close t-rev-a"
+        );
+        assert_eq!(
+            task_status_of(&home, "t-rev-b"),
+            Some(crate::task_events::TaskStatus::Claimed),
+            "ambiguous reverse-lookup must NOT close t-rev-b"
+        );
+        assert!(
+            sidecar_present(&home, "t-rev-a") && sidecar_present(&home, "t-rev-b"),
+            "ambiguous → both sidecars remain (fail-safe: no mis-close)"
         );
         std::fs::remove_dir_all(&home).ok();
     }

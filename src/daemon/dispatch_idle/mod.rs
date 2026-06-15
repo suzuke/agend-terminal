@@ -109,6 +109,15 @@ pub(crate) struct PendingDispatch {
     /// SUPPRESS a real nudge.
     #[serde(default)]
     pub(crate) exceeded_at: Option<String>,
+    /// #t-127: fire-once latch — set the moment a correlated REPORT arrives
+    /// (`mark_resolved`), ATOMIC with the sidecar delete under the per-file lock.
+    /// Normally the delete removes the sidecar outright; but if the delete FAILS
+    /// (disk/permission) the persisted latch makes `scan_and_emit` SKIP the stale
+    /// sidecar instead of firing a spurious "stuck" nudge for a dispatch the
+    /// reviewer already answered. Mirrors the `long_running_escalated` latch.
+    /// Reset to `None` on re-dispatch (a fresh episode).
+    #[serde(default)]
+    pub(crate) reported_at: Option<String>,
 }
 
 /// #2008-p2: max activity-based deadline extensions before the watchdog escalates
@@ -201,6 +210,34 @@ fn delete_sidecar_locked(home: &Path, dispatch_id: &str) -> bool {
     removed
 }
 
+/// #t-127: persist the `reported_at` fire-once latch THEN delete the sidecar,
+/// both UNDER the single `{dispatch_id}.lock` acquisition (atomic with the
+/// delete). A report arriving disarms the watchdog; the normal path is the
+/// delete, but if the `remove_file` FAILS the latch is already on disk, so
+/// `scan_and_emit` sees `reported_at.is_some()` and skips firing a spurious
+/// nudge instead of resurrecting the noise. Same lock as the L1/L2 RMW (no
+/// resurrection race; correct `{id}.lock` removal). Returns `true` iff removed.
+fn mark_reported_and_delete_locked(home: &Path, dispatch_id: &str) -> bool {
+    let path = pending_path(home, dispatch_id);
+    let lock_path = dispatch_lock_path(home, dispatch_id);
+    let guard = crate::store::acquire_file_lock(&lock_path).ok();
+    // Persist the latch BEFORE the delete so a failed remove still leaves it set.
+    if let Ok(content) = std::fs::read_to_string(&path) {
+        if let Ok(mut pd) = serde_json::from_str::<PendingDispatch>(&content) {
+            if pd.reported_at.is_none() {
+                pd.reported_at = Some(chrono::Utc::now().to_rfc3339());
+                if let Ok(body) = serde_json::to_string_pretty(&pd) {
+                    let _ = crate::store::atomic_write(&path, body.as_bytes());
+                }
+            }
+        }
+    }
+    let removed = std::fs::remove_file(&path).is_ok();
+    drop(guard);
+    let _ = std::fs::remove_file(&lock_path);
+    removed
+}
+
 /// Generate a deterministic-format dispatch id (`disp-<unix_micros>-<seq>`).
 fn next_dispatch_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -269,6 +306,10 @@ pub(crate) fn record_dispatch(
             // stale — clear it so L2's second-window timer restarts from the next
             // real Exceeded transition (L1 re-stamps `exceeded_at` then).
             existing.exceeded_at = None;
+            // #t-127: a re-dispatch is a fresh episode — clear the report latch so
+            // the revived sidecar's watchdog is armed again (a stale latch would
+            // permanently suppress the new dispatch's nudge).
+            existing.reported_at = None;
             // CR-2026-06-14: persist the refreshed episode under the per-file flock
             // via with_json_state — NOT a bare unlocked write of the list_pending
             // snapshot. scan_and_emit concurrently re-reads and flips the SAME
@@ -307,6 +348,7 @@ pub(crate) fn record_dispatch(
         refresh_count: 0,
         long_running_escalated: false,
         exceeded_at: None,
+        reported_at: None,
     };
     let body = match serde_json::to_string_pretty(&payload) {
         Ok(s) => s,
@@ -625,7 +667,9 @@ pub(crate) fn mark_resolved(home: &Path, correlation_id: &str) -> Option<String>
         // [M2] DELETE the sidecar (rather than flip to `Resolved` and leave the
         // file to accumulate — the pre-fix primary `pending-dispatches/` leak)
         // UNDER its lock, so a concurrent team-nudge / L1 RMW can't resurrect it.
-        if delete_sidecar_locked(home, &d.dispatch_id) {
+        // #t-127: latch `reported_at` atomically with the delete, so a failed
+        // remove still disarms the watchdog (see `mark_reported_and_delete_locked`).
+        if mark_reported_and_delete_locked(home, &d.dispatch_id) {
             first_deleted.get_or_insert(d.dispatch_id);
         } else {
             // #2004: a matching sidecar whose delete failed WILL fire a
@@ -640,6 +684,43 @@ pub(crate) fn mark_resolved(home: &Path, correlation_id: &str) -> Option<String>
         }
     }
     first_deleted
+}
+
+/// #t-127: resolve the single OPEN dispatch sidecar TARGETING `reporter` to its
+/// review-task id (the sidecar's `t-…` `correlation_id`). Bridges a reviewer
+/// VERDICT report — keyed on `repo@branch`, NOT the task id — back to the review
+/// task + its sidecar, which are both `t-…`-keyed (so `mark_resolved(repo@branch)`
+/// and the `corr.starts_with("t-")` auto-close gate both miss them).
+///
+/// EXACTLY-ONE fail-safe: returns `None` if 0 or >1 candidates, so a reporter
+/// with concurrent reviews never mis-closes the WRONG task (mis-closing another's
+/// task is worse than leaving a ghost). The #1866 clear-on-handoff retire keeps
+/// this ≤1 open per (dispatcher, target) in the common case, so the single-match
+/// path is the norm. Only `Pending`/`Exceeded` sidecars with a `t-` correlation
+/// count.
+pub(crate) fn open_review_dispatch_for_reporter(home: &Path, reporter: &str) -> Option<String> {
+    if reporter.is_empty() {
+        return None;
+    }
+    let mut candidates: Vec<String> = list_pending(home)
+        .into_iter()
+        .filter(|d| {
+            d.target == reporter
+                && matches!(d.status, DispatchStatus::Pending | DispatchStatus::Exceeded)
+                && d.correlation_id
+                    .as_deref()
+                    .map(|c| c.starts_with("t-"))
+                    .unwrap_or(false)
+        })
+        .filter_map(|d| d.correlation_id)
+        .collect();
+    candidates.sort();
+    candidates.dedup();
+    if candidates.len() == 1 {
+        candidates.pop()
+    } else {
+        None
+    }
 }
 
 /// #1047: reset the timer on a pending sidecar when the dispatchee sends
@@ -910,6 +991,13 @@ pub(crate) fn scan_and_emit(home: &Path) {
     let snapshot = crate::snapshot::load(home);
     for d in list_pending(home) {
         if d.status != DispatchStatus::Pending {
+            continue;
+        }
+        // #t-127: a correlated report already arrived (reviewer responded) but its
+        // sidecar delete failed — the persisted `reported_at` latch survives that
+        // failure. Don't fire a spurious "stuck" nudge; retry the delete and move on.
+        if d.reported_at.is_some() {
+            delete_sidecar_locked(home, &d.dispatch_id);
             continue;
         }
         let issued = match chrono::DateTime::parse_from_rfc3339(&d.issued_at) {
@@ -1437,6 +1525,7 @@ mod tests {
             not_working_streak: 0,
             refresh_count: 0,
             long_running_escalated: false,
+            reported_at: None,
             exceeded_at: None,
         };
         std::fs::write(
@@ -2427,6 +2516,7 @@ mod tests {
             not_working_streak: 0,
             refresh_count: 0,
             long_running_escalated: false,
+            reported_at: None,
             exceeded_at: None,
         };
         assert_eq!(
