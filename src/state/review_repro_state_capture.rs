@@ -80,7 +80,6 @@ const SRL_LINE: &str = "API Error: Server is temporarily limiting requests (not 
 // PTY read of the SAME screen — unbounded file growth.
 
 #[test]
-#[ignore = "state-capture #1: red until fix; remove #[ignore] after fix to confirm"]
 fn unclassified_throttle_static_screen_logs_once_not_per_tick() {
     // Isolate the on-disk sidecar to a throwaway HOME so we don't touch the
     // operator's real $AGEND_HOME/unclassified_errors.jsonl.
@@ -134,7 +133,6 @@ fn unclassified_throttle_static_screen_logs_once_not_per_tick() {
 // with `last_anchor_suppress_hash`.
 
 #[test]
-#[ignore = "state-capture #2: red until fix; remove #[ignore] after fix to confirm"]
 fn srl_keep_latched_warn_dedups_across_spinner_ticks() {
     let mut vt = VTerm::new(120, 24);
     let mut st = StateTracker::new(Some(&Backend::ClaudeCode));
@@ -181,7 +179,6 @@ fn srl_keep_latched_warn_dedups_across_spinner_ticks() {
 // The fix (`caps.get(1)`) degrades a missing group to "no reading".
 
 #[test]
-#[ignore = "state-capture #4: red until fix; remove #[ignore] after fix to confirm"]
 fn scan_context_pct_no_capture_group_does_not_panic() {
     let mut t = StateTracker::new(Some(&Backend::ClaudeCode));
     // A context_pattern that MATCHES the statusline but has no capture group 1
@@ -212,7 +209,6 @@ fn scan_context_pct_no_capture_group_does_not_panic() {
 // dedup.
 
 #[test]
-#[ignore = "state-capture #5: red until fix; remove #[ignore] after fix to confirm"]
 fn srl_phantom_consecutive_rematch_warn_dedups_on_static_throttle() {
     let mut vt = VTerm::new(120, 24);
     let mut st = StateTracker::new(Some(&Backend::ClaudeCode));
