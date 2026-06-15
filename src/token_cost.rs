@@ -13,9 +13,10 @@
 //!   3. prices the deduped totals against a hardcoded Claude table (input /
 //!      output / cache-read / cache-write split 5m vs 1h).
 //!
-//! Phase 2 adds Codex (`~/.codex/sessions/.../rollout-*.jsonl`,
-//! `payload.info.total_token_usage` — session-cumulative, so the MAX per file
-//! is taken, never summed), merged into the same per-instance aggregation.
+//! Phase 2 adds Codex (`~/.codex/sessions/.../rollout-*.jsonl`, summing the
+//! per-turn `payload.info.last_token_usage` deltas — Σdelta reconciles to the
+//! session-cumulative `total_token_usage`, see `codex_delta_sum_equals_cumulative`),
+//! merged into the same per-instance aggregation.
 //! OpenCode is deferred (its SQLite store needs a new `rusqlite`/`sqlx`
 //! dependency — pending operator sign-off). Kiro has no usable token
 //! surface and is reported as unsupported (never fabricated).

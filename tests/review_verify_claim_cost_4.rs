@@ -18,7 +18,6 @@
 use std::path::PathBuf;
 
 #[test]
-#[ignore = "verify-claim-cost stale-max-per-file-comment: red until fix; remove #[ignore] after fix to confirm"]
 fn token_cost_comment_does_not_claim_max_per_file_verify_claim_cost() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("src")
