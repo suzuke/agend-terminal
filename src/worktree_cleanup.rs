@@ -316,23 +316,28 @@ fn prune_orphaned_branches(repo_root: &Path) -> Vec<String> {
             continue;
         }
         let merged = is_branch_merged(repo_root, branch);
-        let gone = is_remote_gone(repo_root, branch);
         // #1750-B3: also reap squash-merge orphans (the 95/99 case the
         // squash-blind `--merged` missed) — gated on tip-age for the heuristic
         // squash detection only.
-        let squash = !merged && !gone && is_squash_gc_eligible(repo_root, branch, &default);
-        if !merged && !gone && !squash {
+        //
+        // CR-2026-06-14: `is_remote_gone` is NO LONGER an independent delete
+        // trigger. Remote-gone alone is not proof the branch's work is preserved
+        // — a branch pushed once, then deleted on the remote while local commits
+        // kept accruing, is remote-gone yet carries committed-but-unpushed work
+        // that `git branch -D` destroys irrecoverably. Reap a branch ONLY when
+        // its work IS in the default branch (every commit reachable): merged
+        // (ancestor) or squash-merged. A remote-gone branch that is NEITHER has
+        // unpushed local commits → KEEP. A squash-merged branch whose remote was
+        // auto-deleted stays reapable — it is now caught by the squash check
+        // (which no longer excludes the gone case) instead of the unguarded
+        // remote-gone trigger.
+        let squash = !merged && is_squash_gc_eligible(repo_root, branch, &default);
+        if !merged && !squash {
             continue;
         }
         let ok = crate::git_helpers::git_ok(repo_root, &["branch", "-D", branch]);
         if ok {
-            let reason = if merged {
-                "merged"
-            } else if gone {
-                "remote-gone"
-            } else {
-                "squash-merged"
-            };
+            let reason = if merged { "merged" } else { "squash-merged" };
             tracing::info!(branch, reason, "pruned orphaned branch");
             pruned.push(branch.clone());
         }

@@ -190,15 +190,33 @@ pub fn default_branch(repo_dir: &Path) -> String {
     let remote = primary_remote(repo_dir);
     let ref_path = format!("refs/remotes/{remote}/HEAD");
     // #1897: bounded (was an unbounded `.output()`) — a stuck local git falls
-    // through to the "main" fallback instead of hanging the daemon.
-    match git_bypass_timeout(repo_dir, &["symbolic-ref", &ref_path], LOCAL_GIT_TIMEOUT) {
-        Ok(o) if o.status.success() => {
+    // through to the fallback instead of hanging the daemon.
+    if let Ok(o) = git_bypass_timeout(repo_dir, &["symbolic-ref", &ref_path], LOCAL_GIT_TIMEOUT) {
+        if o.status.success() {
             let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
             let prefix = format!("refs/remotes/{remote}/");
-            s.strip_prefix(&prefix).unwrap_or(&s).to_string()
+            return s.strip_prefix(&prefix).unwrap_or(&s).to_string();
         }
-        _ => "main".to_string(),
     }
+    // CR-2026-06-14: no readable `refs/remotes/<remote>/HEAD` (no remote, or
+    // origin/HEAD unset) — do NOT blindly assume "main". A repo whose true
+    // default is e.g. `develop` would then misjudge merge state (a branch merged
+    // into `develop` is not an ancestor of the wrong `main`). Fall back to the
+    // repo's own current HEAD branch (the de-facto default of a local /
+    // remote-less repo); a detached or unreadable HEAD finally yields "main".
+    if let Ok(o) = git_bypass_timeout(
+        repo_dir,
+        &["symbolic-ref", "--short", "HEAD"],
+        LOCAL_GIT_TIMEOUT,
+    ) {
+        if o.status.success() {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if !s.is_empty() {
+                return s;
+            }
+        }
+    }
+    "main".to_string()
 }
 
 /// Detect the primary remote name.

@@ -68,7 +68,6 @@ fn branch_exists(repo: &Path, branch: &str) -> bool {
 // ──────────────────────────────────────────────────────────────────────────
 
 #[test]
-#[ignore = "worktree-git #2 remote-gone-unpushed-commits: red until fix; remove #[ignore] after fix to confirm"]
 fn prune_keeps_remote_gone_branch_with_unpushed_commits_worktree_git() {
     // A bare "remote" + a clone, so `branch.<name>.remote` is real.
     let remote = scratch("remote-gone-bare");

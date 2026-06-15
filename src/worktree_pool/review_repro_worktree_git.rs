@@ -54,7 +54,6 @@ fn git(dir: &Path, args: &[&str]) {
 // ──────────────────────────────────────────────────────────────────────────
 
 #[test]
-#[ignore = "worktree-git #1 default_branch-fallback: red until fix; remove #[ignore] after fix to confirm"]
 fn cleanup_merged_branch_uses_true_default_not_main_worktree_git() {
     let repo = scratch("default-branch-develop");
     // A repo whose TRUE default branch is `develop`, with NO remote (so
