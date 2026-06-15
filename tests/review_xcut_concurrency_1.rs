@@ -25,7 +25,6 @@ use std::path::PathBuf;
 const NEEDLE: &str = "shared_ci_runtime().block_on";
 
 #[test]
-#[ignore = "xcut-concurrency F1: red until fix; remove #[ignore] after fix to confirm"]
 fn ci_mergeable_blocking_has_no_raw_shared_runtime_block_on_xcut_concurrency() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/daemon/ci_watch/provider.rs");
     let text = std::fs::read_to_string(&path)

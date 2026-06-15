@@ -129,7 +129,6 @@ fn unwatch_uses_validated_caller_not_clear_all_mcp_ci_worktree() {
 // GREEN after the fix uses clamped + saturating math.
 // ===========================================================================
 #[test]
-#[ignore = "mcp-ci-worktree-4: compute-next-poll-eta-overflow; red until fix; remove #[ignore] after fix to confirm"]
 fn compute_next_poll_eta_does_not_overflow_on_huge_interval_mcp_ci_worktree() {
     // last_polled_at present (so the function gets past its early `?`), and an
     // interval_secs that is positive-as-i64 yet overflows when multiplied by
@@ -173,7 +172,6 @@ fn compute_next_poll_eta_does_not_overflow_on_huge_interval_mcp_ci_worktree() {
 // arg is filtered out (`filter(|s| !s.is_empty())`) so the stale value persists.
 // ===========================================================================
 #[test]
-#[ignore = "mcp-ci-worktree-5: stale-next-after-ci-persists-across-rewatch; red until fix; remove #[ignore] after fix to confirm"]
 fn explicit_empty_next_after_ci_clears_stale_handoff_target_mcp_ci_worktree() {
     let home = std::env::temp_dir().join(format!(
         "agend-rewatch-clear-handoff-{}",
