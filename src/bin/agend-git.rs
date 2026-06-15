@@ -66,6 +66,17 @@ fn main() {
     let home = env::var("AGEND_HOME").unwrap_or_default();
 
     if agent.is_empty() || home.is_empty() {
+        // #2234 defect#2: a NON-agent caller (no AGEND_INSTANCE_NAME) early-exits
+        // here to the TERMINAL `exec_real_git` BEFORE reaching `classify` — so a
+        // canonical-HEAD-touching `git checkout|switch <branch>` (e.g.
+        // `git checkout origin/main`, which detaches canonical HEAD) passed
+        // through with zero attribution. Record one fleet_events line with
+        // process ancestry first (only when we have a home to write to — the
+        // daemon-correlated culprit inherits AGEND_HOME but dropped
+        // AGEND_INSTANCE_NAME). Instrument-only: the passthrough exec is unchanged.
+        if !home.is_empty() {
+            log_nonagent_canonical_checkout(&home, &agent, &args);
+        }
         exec_real_git(&args, None);
     }
 
@@ -1078,6 +1089,69 @@ fn process_ancestry(max: usize) -> Vec<String> {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn process_ancestry(_max: usize) -> Vec<String> {
     Vec::new()
+}
+
+/// #2234 defect#2: is this argv a POSITIONAL-branch `checkout`/`switch` — the
+/// canonical-HEAD-touching shape (`git checkout <branch>`, e.g. `origin/main`)?
+/// A flag-only / empty target (`git checkout -b …` is still positional after the
+/// flag, but a bare `-`/`--detach` lead arg is not a branch nav) is excluded.
+/// Pure (no cwd / IO) so the gate is unit-testable.
+fn is_positional_branch_checkout(args: &[String]) -> bool {
+    matches!(
+        args.first().map(|s| s.as_str()),
+        Some("checkout") | Some("switch")
+    ) && args
+        .get(1)
+        .is_some_and(|t| !t.is_empty() && !t.starts_with('-'))
+}
+
+/// #2234 defect#2: record a NON-agent (no `AGEND_INSTANCE_NAME`) canonical-cwd
+/// `checkout`/`switch <branch>` that the shim is about to pass through via the
+/// early-exit `exec_real_git` (it never reaches `classify`). These callers have
+/// no agent identity, so attribution relies entirely on PROCESS ANCESTRY — this
+/// is the blind spot that left `git checkout origin/main` (canonical-HEAD detach)
+/// unattributed. Mirrors `log_init_heartbeat_forensics`: best-effort append to
+/// the daemon-observable `fleet_events.jsonl` + a stderr line; NEVER blocks (the
+/// caller `exec`s real git immediately after). Instrument-only — no behavior
+/// change to the passthrough.
+fn log_nonagent_canonical_checkout(home: &str, agent: &str, args: &[String]) {
+    if !is_positional_branch_checkout(args) {
+        return;
+    }
+    if !cwd_is_canonical_rooted() {
+        return;
+    }
+    let subcmd = args.first().map(|s| s.as_str()).unwrap_or("");
+    let target_branch = args.get(1).cloned().unwrap_or_default();
+    let cwd = env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let ppid = parent_pid();
+    let ancestry = process_ancestry(8);
+    let event = serde_json::json!({
+        "kind": "git_event",
+        "event": "canonical_passthrough_checkout",
+        "agent": agent,
+        "subcommand": subcmd,
+        "target_branch": target_branch,
+        "argv": args,
+        "cwd": cwd,
+        "ppid": ppid,
+        "process_ancestry": ancestry,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    });
+    let events_path = PathBuf::from(home).join("fleet_events.jsonl");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(events_path)
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "{event}");
+    }
+    eprintln!(
+        "[agend-git #2234] non-agent canonical-cwd {subcmd} passthrough (HEAD-touching): target={target_branch} ppid={ppid} cwd={cwd} ancestry={ancestry:?}"
+    );
 }
 
 /// The git `user.email` that WOULD author/commit in `cwd` — i.e. the
@@ -2566,6 +2640,36 @@ mod tests {
         if let Some(base) = repo.parent() {
             let _ = std::fs::remove_dir_all(base);
         }
+    }
+
+    /// #2234 defect#2: the pure gate for the non-agent canonical-checkout log.
+    /// `checkout`/`switch <branch>` (positional, non-flag target) → true; a
+    /// flag-led / empty target or a non-checkout subcommand → false.
+    #[test]
+    fn is_positional_branch_checkout_gate() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // canonical-HEAD-touching nav shapes → log candidate.
+        assert!(is_positional_branch_checkout(&s(&[
+            "checkout",
+            "origin/main"
+        ])));
+        assert!(is_positional_branch_checkout(&s(&["switch", "main"])));
+        assert!(is_positional_branch_checkout(&s(&[
+            "checkout",
+            "feature/x",
+            "--",
+            "file"
+        ])));
+        // not a branch nav / not checkout → not a candidate.
+        assert!(!is_positional_branch_checkout(&s(&["checkout"])));
+        assert!(!is_positional_branch_checkout(&s(&[
+            "checkout", "--detach"
+        ])));
+        assert!(!is_positional_branch_checkout(&s(&[
+            "checkout", "-b", "tmp"
+        ])));
+        assert!(!is_positional_branch_checkout(&s(&["status"])));
+        assert!(!is_positional_branch_checkout(&s(&["commit", "main"])));
     }
 
     /// #852 residual core: canonical source repo (`.git` directory +
