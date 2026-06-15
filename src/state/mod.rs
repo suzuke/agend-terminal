@@ -369,13 +369,17 @@ pub struct StateTracker {
     /// changes — shifting `dist_from_bottom` — doesn't defeat the dedup. Behavior
     /// unchanged — only the WARN emission is deduped.
     last_srl_keep_latched_sig: Option<u64>,
-    /// #1808-probe0-phantom dedup latch: `line_hash` of the SRL error line for
-    /// which the `#1808-probe0-phantom` WARN last fired. An in-place static SRL
-    /// keeps the same error line while a clock-tick redraw flips the screen hash,
-    /// so the WARN otherwise re-fires every feed. Keyed on the line hash only (see
-    /// `last_srl_keep_latched_sig`); the `#1809` cross-cycle→Idle behavioral fix
-    /// stays OUTSIDE this dedup.
-    last_srl_phantom_warn_sig: Option<u64>,
+    /// #1808-probe0-phantom dedup latch: `(line_hash, cross_cycle)` of the SRL
+    /// error line for which the `#1808-probe0-phantom` WARN last fired. An
+    /// in-place static SRL keeps the same error line while a clock-tick redraw
+    /// flips the screen hash, so the WARN otherwise re-fires every feed. Keyed on
+    /// the line hash (see `last_srl_keep_latched_sig`) PLUS the `kind` discriminant
+    /// (`cross_cycle` true = `cross_cycle_refire`, false = `consecutive_rematch`)
+    /// so the SAME stale sig transitioning between the two refire kinds re-logs
+    /// once per kind. Cleared on genuine recovery (CR-2026-06-14 t-43) so a 2nd
+    /// SRL incident on the same line after recovery re-logs once; the `#1809`
+    /// cross-cycle→Idle behavioral fix stays OUTSIDE this dedup.
+    last_srl_phantom_warn_sig: Option<(u64, bool)>,
 }
 
 /// #1527: one recorded `current` transition, captured at the mutation site so
@@ -1458,6 +1462,24 @@ impl StateTracker {
             // state is anything else. Telemetry-only — does not affect classification.
             if !matches!(self.current, AgentState::ServerRateLimit) {
                 self.non_srl_since_last_srl = true;
+                // CR-2026-06-14 t-43: the SRL fire-once WARN latches
+                // (`last_srl_keep_latched_sig` #2086 / `last_srl_phantom_warn_sig`
+                // #1808) are SET-ONLY — unlike `last_unclassified_throttle_sig`,
+                // which clears when the pane leaves the throttle-miss shape so a
+                // recurrence re-logs once. Mirror that here: on a GENUINE recovery
+                // (recent productive output) drop both latches so a 2nd SRL
+                // incident on the SAME error line — after the agent really
+                // recovered — re-logs once instead of being silently suppressed.
+                // Gated on `recovered_within`, NOT on `current != SRL` alone: an
+                // active #1809 cross-cycle phantom override ALSO lands a non-SRL
+                // state here, but with no productive output (`recovered=false`, the
+                // very gate that produced the override), so it keeps its per-tick
+                // dedup — clearing unconditionally would re-introduce the
+                // #1808/#2086 WARN flood the latches exist to prevent.
+                if self.recovered_within(SERVER_RATE_LIMIT_RECOVERY_SILENCE) {
+                    self.last_srl_keep_latched_sig = None;
+                    self.last_srl_phantom_warn_sig = None;
+                }
             }
         }
 
@@ -1975,8 +1997,8 @@ impl StateTracker {
                 // every feed for the whole throttle (per-tick flood). Emit only on
                 // a signature transition. The #1809 cross-cycle→Idle behavioral fix
                 // below is intentionally OUTSIDE this dedup.
-                if self.last_srl_phantom_warn_sig != Some(sig.0) {
-                    self.last_srl_phantom_warn_sig = Some(sig.0);
+                if self.last_srl_phantom_warn_sig != Some((sig.0, cross_cycle)) {
+                    self.last_srl_phantom_warn_sig = Some((sig.0, cross_cycle));
                     let kind = if cross_cycle {
                         "cross_cycle_refire"
                     } else {

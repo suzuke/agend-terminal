@@ -233,12 +233,118 @@ fn srl_phantom_consecutive_rematch_warn_dedups_on_static_throttle() {
         "#5 precondition: the static SRL must remain latched across the ticks"
     );
     let warns = logs.matches("#1808-probe0-phantom").count();
-    assert!(
-        warns <= 1,
+    assert_eq!(
+        warns,
+        1,
         "#5 maintainability: the #1808-probe0-phantom consecutive-rematch WARN fired \
-         {warns} times for ONE in-place static SRL across {} ticks (per-tick flood). \
-         After deduping on last_srl_match_sig / emitting only on a signature transition \
-         it must fire at most once for a static long throttle.",
+         {warns} times for ONE in-place static SRL across {} ticks — it must fire \
+         EXACTLY once (the first re-match WARNs; subsequent ticks dedup on the \
+         (line_hash, kind) latch). 0 = the latch swallowed the genuine first WARN; \
+         >1 = per-tick flood.",
         spinners.len()
+    );
+}
+
+// ── CR-2026-06-14 t-43 — SRL phantom WARN latch is SET-ONLY ──────────────────
+//
+// `last_srl_phantom_warn_sig` (and `last_srl_keep_latched_sig`) are set once and
+// NEVER reset — unlike `last_unclassified_throttle_sig`, which clears when the
+// pane leaves the throttle-miss shape so a recurrence re-logs once. Consequently
+// a SECOND, genuinely-distinct SRL incident on the SAME error line — separated
+// by a real recovery (productive output) — is silently suppressed (WARN
+// swallowed), losing the telemetry for the new stuck episode. The fix clears the
+// latches at the `current != SRL` recovery point, GATED on `recovered_within`
+// (genuine productive recovery) so an active cross-cycle phantom override — which
+// also lands a non-SRL state but with no productive output — keeps its per-tick
+// dedup.
+
+/// A RED SRL screen (error line on top, a `waiting` spinner below with NO working
+/// marker → latches normally). `sp` flips the glyph so the screen hash differs
+/// from the preceding feed while the `srl_match_signature` (line_hash,
+/// dist_from_bottom) stays identical.
+fn srl_screen(sp: char) -> Vec<u8> {
+    format!("\x1b[2J\x1b[H{RED_16}{SRL_LINE}{SGR_RESET}\r\n{sp} waiting\r\n").into_bytes()
+}
+
+/// Feed one SRL frame. `recovered` toggles `last_productive_output` to drive the
+/// #badge-recovery path: with recent productive output the SRL yields to Idle
+/// (genuine recovery — `current` leaves ServerRateLimit, `non_srl_since_last_srl`
+/// is set); with none, the stale error re-matches with `!recovered_now`. The
+/// sticky SRL latch never yields to a bare idle prompt, so productive output is
+/// the ONLY deterministic lever to land a non-SRL state from an SRL screen.
+fn feed_srl(vt: &mut VTerm, st: &mut StateTracker, sp: char, recovered: bool) {
+    st.last_productive_output = if recovered {
+        Some(Instant::now())
+    } else {
+        None
+    };
+    // Age `since` past the 2s active-state min-hold so the priority-DOWN
+    // SRL→Idle transition (#badge-recovery / #1809 cross-cycle override) is not
+    // rejected by `transition`'s hysteresis — in production the SRL is held far
+    // longer than the hold before recovery. Mirrors src/state/tests.rs.
+    st.since = Instant::now() - Duration::from_secs(3);
+    drive(vt, st, &srl_screen(sp));
+}
+
+#[test]
+fn srl_phantom_warn_relogs_after_genuine_recovery() {
+    let mut vt = VTerm::new(120, 24);
+    let mut st = StateTracker::new(Some(&Backend::ClaudeCode));
+    st.instance_name = "t43-relog".into();
+
+    let logs = capture_all_logs(|| {
+        // Incident 1: latch the SRL, recover once (→ Idle, arms cross_cycle), then
+        // the stale error re-matches with no recent productive output →
+        // cross_cycle refire → phantom WARN #1 (latches the dedup sig).
+        feed_srl(&mut vt, &mut st, '⠋', false); // latch (first detect, no warn)
+        feed_srl(&mut vt, &mut st, '⠙', true); // #badge-recovery → Idle, non_srl=true
+        feed_srl(&mut vt, &mut st, '⠹', false); // cross_cycle → WARN #1
+
+        // GENUINE recovery again: productive output lands Idle → the recovery point
+        // (`current != SRL` AND recovered_within) CLEARS the fire-once latch.
+        feed_srl(&mut vt, &mut st, '⠸', true); // recovery → resets the latch
+
+        // Incident 2: same error line re-grabbed, no recent productive output →
+        // cross_cycle refire → the WARN must fire a 2ND time (latch was cleared).
+        feed_srl(&mut vt, &mut st, '⠼', false); // cross_cycle → WARN #2
+    });
+
+    let warns = logs.matches("#1808-probe0-phantom").count();
+    assert_eq!(
+        warns, 2,
+        "t-43: the #1808-probe0-phantom WARN fired {warns} times — a 2nd SRL incident \
+         on the same error line AFTER a genuine recovery must re-log once (expected 2). \
+         1 = the SET-ONLY latch suppressed the second incident's WARN (the bug)."
+    );
+}
+
+#[test]
+fn srl_phantom_warn_dedups_across_cross_cycle_loop_without_recovery() {
+    // Guard for the t-43 fix: the recovery-gated reset must NOT clear the latch on
+    // a cross_cycle phantom override (which lands Idle every tick but with NO
+    // productive output). Were the reset ungated (`current != SRL` alone), each
+    // override-Idle feed would clear the latch → the cross_cycle WARN would re-fire
+    // on every stale re-grab = the #1808 flood. The `recovered_within` gate holds
+    // the dedup → the whole no-recovery loop WARNs exactly once.
+    let mut vt = VTerm::new(120, 24);
+    let mut st = StateTracker::new(Some(&Backend::ClaudeCode));
+    st.instance_name = "t43-noflood".into();
+
+    let logs = capture_all_logs(|| {
+        feed_srl(&mut vt, &mut st, '⠋', false); // latch
+        feed_srl(&mut vt, &mut st, '⠙', true); // recover once → Idle, arms cross_cycle
+                                               // Sustained phantom loop: stale error re-grabbed every tick, NEVER recovers
+                                               // → each is a cross_cycle override to Idle with recovered=false.
+        for sp in ['⠹', '⠸', '⠼', '⠴', '⠦', '⠧'] {
+            feed_srl(&mut vt, &mut st, sp, false);
+        }
+    });
+
+    let warns = logs.matches("#1808-probe0-phantom").count();
+    assert_eq!(
+        warns, 1,
+        "t-43 guard: a cross_cycle phantom loop with NO recovery WARNed {warns} times \
+         — it must dedup to EXACTLY once. >1 means the recovery gate leaked and the \
+         latch reset on a phantom (non-recovered) Idle override (the #1808 flood)."
     );
 }
