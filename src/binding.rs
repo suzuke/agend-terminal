@@ -164,6 +164,48 @@ pub fn bind_full(
     let lock_path = dir.join(".binding.json.lock");
     let _lock = crate::store::acquire_file_lock(&lock_path)
         .map_err(|e| format!("acquire_file_lock {}: {e}", lock_path.display()))?;
+    // #2158 PR2: read the CURRENT on-disk binding UNDER the lock (the in-memory
+    // index can be stale) — drives guard-b + the binding-CHANGE audit.
+    let existing: Option<serde_json::Value> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|c| parse_binding_guarded(&c));
+    // #2158 PR2 (i) guard-b — identity-INDEPENDENT prevention. Reject a rebind that
+    // moves a LIVE binding to a DIFFERENT branch with NO intervening release (a
+    // release clears binding.json, so a present binding + an existing worktree on a
+    // DIFFERENT branch == no release happened). ALLOWS first-bind (no existing) and
+    // same-branch idempotent reuse (#2226). Gates on STATE, so — unlike a
+    // caller-identity check — it is not defeated by the sub-agent/primary
+    // indistinguishability: it stops a transient helper silently moving the primary's
+    // live binding to a branch it never chose (#2158). Verified free: every legit
+    // rebind flow is fresh-lease / same-branch-early-return / cross-branch-rejected
+    // upstream (dispatch_hook LeaseConflict), so none does a live cross-branch
+    // bind-over.
+    if let Some(ref ex) = existing {
+        let ex_branch = ex
+            .get("branch")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let ex_worktree_live = ex
+            .get("worktree")
+            .and_then(|v| v.as_str())
+            .map(|w| std::path::Path::new(w).exists())
+            .unwrap_or(false);
+        if ex_worktree_live && !ex_branch.is_empty() && ex_branch != branch {
+            crate::event_log::log(
+                home,
+                "binding_rebind_rejected",
+                agent,
+                &format!(
+                    "live binding on '{ex_branch}' — refused cross-branch rebind to '{branch}' (#2158); {}",
+                    crate::event_log::caller_process_context()
+                ),
+            );
+            return Err(format!(
+                "#2158: agent '{agent}' is bound to a LIVE worktree on branch '{ex_branch}' — \
+                 release_worktree first before binding to '{branch}' (no silent cross-branch rebind)"
+            ));
+        }
+    }
     let wt_str = worktree.display().to_string();
     let src_str = source_repo.display().to_string();
     let mut binding = json!({
@@ -203,6 +245,35 @@ pub fn bind_full(
     if let Ok(mut map) = binding_index().write() {
         map.insert(index_key(home, agent), binding);
     }
+    // #2158 PR2 (ii) binding-CHANGE audit — DETECTION, not attribution (a sub-agent
+    // shares the primary's identity/process tree, so we log the CHANGE + caller
+    // process context, not "who"). Fires on a CREATE (first bind) or a CHANGE
+    // (branch / worktree differs), making the #2158 first-bind hijack — and the
+    // #2234 reset-to-origin/main churn — visible even though identity can't prevent
+    // it. The realistic defense for the variant guard-b can't catch (first-bind).
+    let prev_branch = existing
+        .as_ref()
+        .and_then(|e| e.get("branch").and_then(|v| v.as_str()))
+        .map(String::from);
+    let prev_worktree = existing
+        .as_ref()
+        .and_then(|e| e.get("worktree").and_then(|v| v.as_str()))
+        .map(String::from);
+    let changed = existing.is_none()
+        || prev_branch.as_deref() != Some(branch)
+        || prev_worktree.as_deref() != Some(wt_str.as_str());
+    if changed {
+        crate::event_log::log(
+            home,
+            "binding_changed",
+            agent,
+            &format!(
+                "branch={branch} worktree={wt_str} prev_branch={} task_id={task_id}; {}",
+                prev_branch.as_deref().unwrap_or("<none>"),
+                crate::event_log::caller_process_context()
+            ),
+        );
+    }
     Ok(())
 }
 
@@ -215,6 +286,24 @@ fn binding_sig_path(dir: &Path) -> PathBuf {
 /// Clear a binding for an agent (task completed/released).
 pub fn unbind(home: &Path, agent: &str) {
     let dir = crate::paths::runtime_dir(home).join(agent);
+    // #2158 PR2 (ii): audit the release/clear side of binding-change detection with
+    // caller process context (read the prior branch before removal). Only logs when
+    // a binding actually existed (a no-op unbind stays silent).
+    if let Some(prev_branch) = std::fs::read_to_string(dir.join("binding.json"))
+        .ok()
+        .and_then(|c| parse_binding_guarded(&c))
+        .and_then(|v| v.get("branch").and_then(|b| b.as_str()).map(String::from))
+    {
+        crate::event_log::log(
+            home,
+            "binding_released",
+            agent,
+            &format!(
+                "prev_branch={prev_branch}; {}",
+                crate::event_log::caller_process_context()
+            ),
+        );
+    }
     let _ = std::fs::remove_file(dir.join("binding.json"));
     // #1651: drop the HMAC sidecar too, so a stale signature can't linger.
     let _ = std::fs::remove_file(binding_sig_path(&dir));
@@ -959,6 +1048,101 @@ mod tests {
             );
             std::fs::remove_dir_all(&home).ok();
         }
+    }
+
+    // ── #2158 PR2: bind_full guard-b + binding-change audit ──────────────────
+
+    fn read_event_log(home: &Path) -> String {
+        std::fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default()
+    }
+
+    /// guard-b: a cross-branch rebind of a LIVE binding (worktree dir exists) with
+    /// no intervening release is REJECTED and does NOT mutate the binding. RED
+    /// pre-fix: `bind_full` unconditionally overwrote → branch silently moved.
+    #[test]
+    fn guard_b_rejects_cross_branch_rebind_of_live_binding_2158() {
+        let home = tmp_home("guardb-reject");
+        let wt = home.join("wt-live");
+        std::fs::create_dir_all(&wt).unwrap(); // LIVE worktree on disk
+        let src = home.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        bind_full(&home, "agentA", "", "feat/x", &wt, &src).expect("first bind ok");
+
+        let err = bind_full(&home, "agentA", "", "feat/y", &wt, &src)
+            .expect_err("cross-branch rebind of a live binding must be rejected");
+        assert!(
+            err.contains("#2158") && err.contains("release_worktree first"),
+            "expected fail-closed cross-branch reject: {err}"
+        );
+        assert_eq!(
+            read(&home, "agentA")
+                .and_then(|b| b.get("branch").and_then(|v| v.as_str()).map(String::from))
+                .as_deref(),
+            Some("feat/x"),
+            "a rejected rebind must NOT mutate the binding"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// guard-b allows the two legitimate shapes: first-bind (no existing) and
+    /// same-branch idempotent reuse (#2226).
+    #[test]
+    fn guard_b_allows_first_bind_and_same_branch_2158() {
+        let home = tmp_home("guardb-allow");
+        let wt = home.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let src = home.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        bind_full(&home, "ag", "", "feat/x", &wt, &src).expect("first-bind allowed");
+        bind_full(&home, "ag", "", "feat/x", &wt, &src).expect("same-branch reuse allowed");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// guard-b gates on a LIVE worktree: if the prior worktree dir is gone (stale
+    /// binding), a cross-branch rebind is allowed (no live binding to protect).
+    #[test]
+    fn guard_b_allows_rebind_when_prior_worktree_is_dead_2158() {
+        let home = tmp_home("guardb-dead");
+        let dead = home.join("wt-gone"); // NOT created → not live
+        let src = home.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        bind_full(&home, "ag", "", "feat/x", &dead, &src).expect("first bind ok");
+        bind_full(&home, "ag", "", "feat/y", &dead, &src)
+            .expect("rebind allowed when the prior worktree is dead (stale binding)");
+        assert_eq!(
+            read(&home, "ag")
+                .and_then(|b| b.get("branch").and_then(|v| v.as_str()).map(String::from))
+                .as_deref(),
+            Some("feat/y"),
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// (ii) binding-change audit: a bind emits `binding_changed` and an unbind emits
+    /// `binding_released`, both carrying caller process context (`pid=`).
+    #[test]
+    fn binding_change_and_release_are_audited_2158() {
+        let home = tmp_home("audit");
+        let wt = home.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let src = home.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        bind_full(&home, "ag", "", "feat/x", &wt, &src).expect("bind ok");
+        unbind(&home, "ag");
+        let log = read_event_log(&home);
+        assert!(
+            log.contains("binding_changed"),
+            "bind must audit a binding_changed event: {log}"
+        );
+        assert!(
+            log.contains("binding_released"),
+            "unbind must audit a binding_released event: {log}"
+        );
+        assert!(
+            log.contains("pid="),
+            "audit lines must carry caller process context: {log}"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 }
 

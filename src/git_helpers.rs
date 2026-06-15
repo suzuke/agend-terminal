@@ -55,6 +55,32 @@ pub(crate) fn git_bypass_timeout(
     args: &[&str],
     timeout: Duration,
 ) -> std::io::Result<std::process::Output> {
+    // #2158 PR2 (iii): audit a MUTATING bypass git op with caller process context so
+    // a transient process creating stray worktrees / branches via AGEND_GIT_BYPASS
+    // is traceable in daemon.log (the operator forensics surface). Read-only ops
+    // (status / rev-parse / log / …) are skipped to avoid flooding the log.
+    //
+    // Scope note: this audits the DAEMON's OWN bypass git. The #2158 incident's
+    // stray worktrees were created SHIM-side (the `agend-git` binary honouring
+    // AGEND_GIT_BYPASS for a sub-agent's own `git worktree add`) — a separate
+    // process + surface, tracked as a follow-up. `event_log` (operator-visible) is
+    // not used here: this choke has no `home`, and threading it through every caller
+    // is disproportionate — `tracing` keeps the line greppable without that churn.
+    if let Some(sub) = args.first() {
+        if matches!(
+            *sub,
+            "worktree" | "branch" | "checkout" | "switch" | "reset" | "clean" | "commit" | "push"
+        ) {
+            tracing::info!(
+                target: "agend_git_bypass",
+                op = %sub,
+                args = ?args,
+                cwd = %cwd.display(),
+                ctx = %crate::event_log::caller_process_context(),
+                "#2158 AGEND_GIT_BYPASS mutating git op"
+            );
+        }
+    }
     let mut cmd = std::process::Command::new("git");
     cmd.args(args).current_dir(cwd).env("AGEND_GIT_BYPASS", "1");
     spawn_group_bounded(cmd, &format!("git {:?}", &args[..1]), timeout)
