@@ -11,11 +11,12 @@ use std::time::Duration;
 /// hanging the daemon forever (the #1893/RC1 root cause).
 pub(crate) const LOCAL_GIT_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// #1897: bound for NETWORK git ops (fetch / clone). A large fetch can legitimately
-/// take minutes, so this is generous — strictly wider than the prior hard-coded
-/// 60s at the fetch sites, so it can only ADD tolerance (never newly false-kills a
-/// fetch that passed before) while still capping a wedged network op.
-pub(crate) const NETWORK_GIT_TIMEOUT: Duration = Duration::from_secs(300);
+// CR-2026-06-14 F3: the former `NETWORK_GIT_TIMEOUT` (300s) const was consumed
+// only by `dispatch_hook::ensure_branch_exists`'s dispatch-time fetches. Those
+// now use the tighter `DISPATCH_FETCH_TIMEOUT` (bounded under the 30s `send`
+// proxy budget), leaving the 300s const with zero users — removed rather than
+// left as dead code. A future network-git op that genuinely needs minutes
+// should reintroduce a purpose-named bound at its own call site.
 
 /// #781 Piece 6 — daemon-internal `git` subprocess wrapper that always
 /// sets `AGEND_GIT_BYPASS=1`. Centralizes the bypass-env contract so

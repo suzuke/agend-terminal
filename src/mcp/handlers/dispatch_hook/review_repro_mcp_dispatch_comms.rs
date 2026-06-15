@@ -91,7 +91,6 @@ fn mk_home_repo(tag: &str) -> (PathBuf, PathBuf) {
 /// `git branch` is never invoked with the injected option.
 #[test]
 #[cfg(unix)]
-#[ignore = "mcp-dispatch-comms F1: red until validate_branch(branch) added to ensure_branch_exists; remove #[ignore] after fix"]
 fn ensure_branch_exists_rejects_option_injection_branch_before_git_mcp_dispatch_comms() {
     let (home, repo) = mk_home_repo("f1");
 
@@ -202,7 +201,6 @@ fn strip_comments_and_blank(body: &str) -> String {
 /// `validate_branch(branch)` call) makes the comment's claim true; this
 /// scan then finds the call.
 #[test]
-#[ignore = "mcp-dispatch-comms F2: red until validate_branch(branch) present (doc comment claims it is); remove #[ignore] after fix"]
 fn ensure_branch_exists_doc_claim_matches_code_mcp_dispatch_comms() {
     let body = strip_comments_and_blank(&ensure_branch_exists_body());
     // The doc comment promises `branch` is validated by the same rule as
@@ -237,7 +235,6 @@ fn ensure_branch_exists_doc_claim_matches_code_mcp_dispatch_comms() {
 /// RED now: the body bounds its fetches with `NETWORK_GIT_TIMEOUT`.
 /// GREEN after fix: those fetches use a bounded dispatch budget instead.
 #[test]
-#[ignore = "mcp-dispatch-comms F3: red until dispatch-time fetch budget bounded under the send proxy timeout; remove #[ignore] after fix"]
 fn ensure_branch_exists_fetch_budget_under_send_timeout_mcp_dispatch_comms() {
     let body = strip_comments_and_blank(&ensure_branch_exists_body());
     assert!(

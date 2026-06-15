@@ -5,6 +5,9 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+mod from_ref;
+pub(crate) use from_ref::resolve_from_ref_remote; // CR-2026-06-14 extraction
+
 /// #781 Piece 7: structured dispatch outcome. Mirrors the #784 success
 /// response shape for `repo action=checkout bind:true` so callers across
 /// the fleet observe a single canonical schema regardless of whether the
@@ -87,6 +90,10 @@ pub enum SourceRepoTier {
 pub enum Stage {
     /// `from_ref` rejected by `validate_branch` charset / option-injection guard.
     ValidateFromRef,
+    /// `branch` rejected by `validate_branch` (charset / option-injection) or by
+    /// `is_protected_ref` (E4.5) — at the validation boundary, before any git
+    /// subprocess runs (CR-2026-06-14 F1).
+    ValidateBranch,
     /// First `git branch <name> <from_ref>` attempt failed for a reason
     /// other than "already exists" / "not a valid ref".
     CreateBranch,
@@ -111,6 +118,9 @@ pub enum Stage {
 pub enum ErrorCode {
     /// `from_ref` arg rejected by `validate_branch` charset rules.
     InvalidFromRef,
+    /// `branch` arg rejected by `validate_branch` charset / option-injection
+    /// rules (CR-2026-06-14 F1).
+    InvalidBranch,
     /// `git branch` failed at a stage we can't recover from (not
     /// already-exists, not invalid-ref).
     BranchCreateFailed,
@@ -653,61 +663,26 @@ fn resolve_source_repo(
     (stub, SourceRepoTier::Stub)
 }
 
-/// #781 Piece 6: shared auto-create-branch helper (decision tree formerly inlined
-/// in `ci::handle_checkout_repo`, #780). Both `repo action=checkout bind:true` and
-/// `dispatch_auto_bind_lease` route through here so the fast path (zero network on
-/// missing-branch-with-local-origin/main) and the lazy-fetch fallback live in one
-/// place. Behavior (mirror #784 / decision d-20260514102305998399-0):
-///
-/// 1. `rev-parse --verify refs/heads/<branch>` exists → **fetch `origin <branch>`,
-///    then `update-ref refs/heads/<branch> refs/remotes/origin/<branch>`** so the
-///    bound local ref tracks the remote PR HEAD (#869: stale local refs landed the
-///    worktree at the wrong SHA). Returns `(auto_created=false, fetch_attempted=N)`;
-///    the `update-ref` is a no-op when `origin/<branch>` is absent or the fetch
-///    fails (local ref unchanged, lease still usable).
-/// 2. Else `git branch <branch> <from_ref>`: success → `(true,false)`; stderr
-///    `"already exists"` (race) → `(false,false)`; `"not a valid object name/ref"`
-///    → `git fetch origin --quiet` then retry (success `(true,true)`, race
-///    `(false,true)`, else structured error).
-///
-/// `from_ref` runs through `validate_branch` (defense in depth) to reject
-/// option-injection (`--upload-pack=...`) at the daemon API boundary (same as the
-/// `branch` arg). `actor` = the event_log id for the fetch-duration breadcrumb.
-/// #2010 (cheerc RCA): resolve which git remote a `from_ref` names, by
-/// LONGEST-PREFIX match against the repo's actual remote list. Branch names can
-/// contain `/`, so a naive `split('/')` mis-parses `upstream/feat/x`; matching
-/// against the real remotes (longest name first, so `forkpa` wins over `fork`
-/// on `forkpa/x`) is the only correct split. Returns the remote name and the
-/// branch portion with that remote's prefix stripped — `None` branch when
-/// `from_ref` carries no remote prefix (a bare local ref). Falls back to
-/// `("origin", None)` when nothing matches (origin-only setups unaffected).
-///
-/// Documented ambiguity (§3.9 case 4): when a branch's first segment equals a
-/// remote name — remote `fork` + a literal `from_ref` of `fork/feature` —
-/// longest-prefix treats it as remote-qualified (remote=`fork`, branch=
-/// `feature`). Fully-qualify (`origin/fork/feature`) to force the other reading.
-fn resolve_from_ref_remote(source: &Path, from_ref: &str) -> (String, Option<String>) {
-    let mut remotes: Vec<String> = crate::git_helpers::git_bypass(source, &["remote"])
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .map(|l| l.trim().to_string())
-                .filter(|l| !l.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
-    // Longest remote name first so a longer name wins the prefix race.
-    remotes.sort_by_key(|r| std::cmp::Reverse(r.len()));
-    for r in &remotes {
-        if let Some(rest) = from_ref.strip_prefix(&format!("{r}/")) {
-            return (r.clone(), Some(rest.to_string()));
-        }
-    }
-    ("origin".to_string(), None)
-}
+/// CR-2026-06-14 F3: dispatch-time `git fetch` budget. `ensure_branch_exists` is
+/// on the synchronous pre-send path bounded by the 30s `send` proxy
+/// (`DEFAULT_TOOL_TIMEOUT`); the prior 300s `NETWORK_GIT_TIMEOUT` let a fetch run
+/// long after the proxy returned `accepted_in_progress` (false success),
+/// swallowing a later bind failure. Worst path is ≤2 sequential best-effort
+/// fetches, so 12s each stays under the proxy ceiling.
+const DISPATCH_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
 
+/// #781 Piece 6: shared auto-create-branch helper (decision tree formerly inlined
+/// in `ci::handle_checkout_repo`, #780) — both `repo checkout bind:true` and
+/// `dispatch_auto_bind_lease` route through here (#784 / d-20260514102305998399-0).
+/// Branch exists → fetch + `update-ref` so the local ref tracks the remote PR HEAD
+/// (#869); else `git branch <branch> <from_ref>` with a fetch-then-retry on an
+/// unresolved ref. Returns `(auto_created, fetch_attempted)`.
+///
+/// BOTH the user-supplied `branch` and `from_ref` run through `validate_branch`
+/// (defense in depth, rejecting option-injection like `--upload-pack=...` at the
+/// API boundary before any git subprocess); `branch` is additionally rejected by
+/// `is_protected_ref` (E4.5). `actor` = event_log id for the fetch breadcrumb; the
+/// `from_ref`→remote split lives in [`from_ref::resolve_from_ref_remote`].
 pub(crate) fn ensure_branch_exists(
     home: &Path,
     source: &Path,
@@ -715,6 +690,30 @@ pub(crate) fn ensure_branch_exists(
     from_ref: &str,
     actor: &str,
 ) -> Result<(bool, bool), DispatchError> {
+    // CR-2026-06-14 F1 (security): validate `branch` before it reaches
+    // `git branch <branch>` as a positional (arg-injection: `--upload-pack=...`).
+    if !crate::agent_ops::validate_branch(branch) {
+        return Err(DispatchError {
+            message: format!("invalid branch '{branch}'"),
+            code: ErrorCode::InvalidBranch,
+            stage: Stage::ValidateBranch,
+            fetch_attempted: false,
+            raw: None,
+        });
+    }
+    // E4.5 defense-in-depth: reject a protected branch before `git branch main`
+    // is even attempted (lease also enforces). "E4.5" in message kept for matchers.
+    if crate::agent_ops::is_protected_ref(branch) {
+        return Err(DispatchError {
+            message: format!(
+                "E4.5 violation: protected branch '{branch}' cannot be used for agent dispatch"
+            ),
+            code: ErrorCode::ProtectedBranch,
+            stage: Stage::ValidateBranch,
+            fetch_attempted: false,
+            raw: None,
+        });
+    }
     if !crate::agent_ops::validate_branch(from_ref) {
         return Err(DispatchError {
             message: format!("invalid from_ref '{from_ref}'"),
@@ -772,7 +771,7 @@ pub(crate) fn ensure_branch_exists(
         let fetch_out = crate::git_helpers::git_bypass_timeout(
             source,
             &["fetch", "origin", branch, "--quiet"],
-            crate::git_helpers::NETWORK_GIT_TIMEOUT,
+            DISPATCH_FETCH_TIMEOUT,
         );
         let fetched_ok = matches!(&fetch_out, Ok(o) if o.status.success());
         let remote_branch_ref = format!("refs/remotes/origin/{branch}");
@@ -811,7 +810,7 @@ pub(crate) fn ensure_branch_exists(
                 let _ = crate::git_helpers::git_bypass_timeout(
                     source,
                     &["fetch", &remote, rb, "--quiet"],
-                    crate::git_helpers::NETWORK_GIT_TIMEOUT,
+                    DISPATCH_FETCH_TIMEOUT,
                 );
             }
             let ff_safe = crate::git_helpers::git_bypass(
@@ -855,7 +854,7 @@ pub(crate) fn ensure_branch_exists(
         let fetch_out = crate::git_helpers::git_bypass_timeout(
             source,
             &["fetch", &remote, remote_branch, "--quiet"],
-            crate::git_helpers::NETWORK_GIT_TIMEOUT,
+            DISPATCH_FETCH_TIMEOUT,
         );
         create_fetched = matches!(&fetch_out, Ok(o) if o.status.success());
         crate::event_log::log(
@@ -891,7 +890,7 @@ pub(crate) fn ensure_branch_exists(
                 let fetch_out = crate::git_helpers::git_bypass_timeout(
                     source,
                     &["fetch", &remote, "--quiet"],
-                    crate::git_helpers::NETWORK_GIT_TIMEOUT,
+                    DISPATCH_FETCH_TIMEOUT,
                 );
                 let fetch_ms = fetch_start.elapsed().as_millis();
                 crate::event_log::log(
