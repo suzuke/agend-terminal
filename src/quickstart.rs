@@ -1078,14 +1078,21 @@ fn print_next_steps(home: &Path) {
     println!("       on a regular group migrates it to a supergroup with a");
     println!("       new id; quickstart now refuses regular groups upfront.\n");
     println!("  ── Next Steps ──\n");
-    println!("  1. Edit fleet.yaml to add more instances:");
+    println!("  Pick how to run your fleet:\n");
+    // #2204: lead with App mode — the graphical TUI is the recommended first
+    // path for newcomers (one screen for every agent's pane + status). The
+    // daemon + CLI path is kept but demoted to its real audience (automation /
+    // headless), so a first-time operator isn't dropped straight into
+    // start/status/attach plumbing.
+    println!("  [Recommended] New to agend, or want the whole fleet at a glance:");
+    println!("      agend-terminal app");
+    println!("      (a TUI dashboard: every agent's pane + live status in one screen)\n");
+    println!("  [Advanced] Automation / headless / scripted (CI, remote, no TUI):");
+    println!("      agend-terminal start            # launch the fleet daemon");
+    println!("      agend-terminal status           # check agent status");
+    println!("      agend-terminal attach general   # attach to one agent's pane\n");
+    println!("  Add or edit instances anytime in fleet.yaml:");
     println!("     {}\n", crate::fleet::fleet_yaml_path(home).display());
-    println!("  2. Start the fleet:");
-    println!("     agend-terminal start\n");
-    println!("  3. Check agent status:");
-    println!("     agend-terminal status\n");
-    println!("  4. Attach to an agent:");
-    println!("     agend-terminal attach general\n");
 }
 
 #[cfg(test)]
@@ -1573,6 +1580,38 @@ mod tests {
         assert!(
             SOURCE.contains("SUPERGROUP") || SOURCE.contains("supergroup"),
             "Before-you-start block must mention supergroup gotcha"
+        );
+    }
+
+    /// #2204 Phase B: the Next Steps block must LEAD with App mode as the
+    /// recommended path for newcomers, and demote the daemon + CLI commands to a
+    /// labeled advanced/automation path — so the Windows first impression isn't a
+    /// raw start/status/attach dump. Scans the source after the Next Steps header
+    /// (the first occurrence is `print_next_steps`'s `println!`, before this test).
+    #[test]
+    fn next_steps_recommends_app_mode_before_daemon_cli() {
+        const SOURCE: &str = include_str!("quickstart.rs");
+        let next_steps = SOURCE
+            .split_once("── Next Steps ──")
+            .expect("Next Steps header present")
+            .1;
+        let app_at = next_steps
+            .find("agend-terminal app")
+            .expect("Next Steps must recommend `agend-terminal app`");
+        let start_at = next_steps
+            .find("agend-terminal start")
+            .expect("Next Steps still lists the daemon path for automation");
+        assert!(
+            app_at < start_at,
+            "App mode must be presented BEFORE the daemon/CLI path (#2204 recommended-first)"
+        );
+        assert!(
+            next_steps.contains("[Recommended]"),
+            "App mode must carry the [Recommended] label"
+        );
+        assert!(
+            next_steps.contains("[Advanced]"),
+            "the daemon + CLI path must be labeled [Advanced] (automation/headless audience)"
         );
     }
 
