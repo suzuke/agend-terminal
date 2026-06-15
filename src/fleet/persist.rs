@@ -274,16 +274,22 @@ fn team_config_to_mapping(config: &TeamConfig) -> serde_yaml_ng::Mapping {
 
 /// First `(new_member, existing_team)` where one of `new_members` already
 /// belongs to a team in `teams`. Drives the one-agent-one-team invariant from
-/// INSIDE the fleet.yaml lock so a concurrent `teams::create` cannot double-book
-/// a member past the stale pre-write snapshot (#CR-2026-06-14 teams.rs:174).
+/// INSIDE the fleet.yaml lock so a concurrent `teams::create`/`teams::update`
+/// cannot double-book a member past the stale pre-write snapshot
+/// (#CR-2026-06-14 teams.rs:174 create; t-50 update). `exclude_team` skips the
+/// team being UPDATED — its own current members are not a conflict with itself.
 fn first_member_conflict(
     teams: &serde_yaml_ng::Mapping,
     new_members: &[String],
+    exclude_team: Option<&str>,
 ) -> Option<(String, String)> {
     for (team_key, team_val) in teams {
         let Some(team_name) = team_key.as_str() else {
             continue;
         };
+        if Some(team_name) == exclude_team {
+            continue;
+        }
         let Some(members) = team_val.get("members").and_then(|m| m.as_sequence()) else {
             continue;
         };
@@ -316,7 +322,7 @@ pub fn add_team_to_yaml(home: &Path, name: &str, config: &TeamConfig) -> Result<
         // share a member both pass the stale snapshot check; this lock-held
         // re-check is the authoritative guard that stops the second write from
         // double-booking the member.
-        if let Some((member, existing_team)) = first_member_conflict(teams, &config.members) {
+        if let Some((member, existing_team)) = first_member_conflict(teams, &config.members, None) {
             tracing::info!(
                 %member, %existing_team, attempted_team = %name,
                 "team create rejected under lock: member already in another team (one-agent-one-team)"
@@ -357,6 +363,21 @@ pub fn update_team_in_yaml(home: &Path, name: &str, config: &TeamConfig) -> Resu
         if let Some(teams) = doc.get_mut("teams").and_then(|v| v.as_mapping_mut()) {
             let key = serde_yaml_ng::Value::String(name.to_string());
             if teams.contains_key(&key) {
+                // CR-2026-06-14 (t-50): enforce one-agent-one-team UNDER the lock
+                // on the UPDATE path too. `teams::update`'s pre-write
+                // `find_team_for_member` runs on a stale snapshot (TOCTOU), so two
+                // concurrent updates adding the same member to different teams
+                // could both pass it and both write (sibling of the #2189 create
+                // TOCTOU). Exclude THIS team — its own members aren't a conflict.
+                if let Some((member, existing_team)) =
+                    first_member_conflict(teams, &config.members, Some(name))
+                {
+                    tracing::info!(
+                        %member, %existing_team, attempted_team = %name,
+                        "team update rejected under lock: member already in another team (one-agent-one-team)"
+                    );
+                    return Ok(false);
+                }
                 teams.insert(
                     key,
                     serde_yaml_ng::Value::Mapping(team_config_to_mapping(config)),
