@@ -23,7 +23,6 @@ use super::{classify_exit, resolve_instance, ExitKind};
 /// RED now: the two `Ok` ids differ (random per call). GREEN after fix:
 /// either both `Ok` and equal, or both `Err`.
 #[test]
-#[ignore = "resolve-instance-random-uuid: red until fix; remove #[ignore] after fix to confirm"]
 #[serial_test::serial]
 fn resolve_instance_idless_is_deterministic_agent_binding() {
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -80,7 +79,6 @@ fn resolve_instance_idless_is_deterministic_agent_binding() {
 ///
 /// RED now: `classify_exit(None)` is `Crash`. GREEN after fix: `SignalKill`.
 #[test]
-#[ignore = "wait-for-exit-none-is-crash: red until fix; remove #[ignore] after fix to confirm"]
 fn classify_exit_none_is_not_respawnable_crash_agent_binding() {
     assert!(
         !matches!(classify_exit(None), ExitKind::Crash),
