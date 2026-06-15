@@ -24,7 +24,6 @@
 use std::path::PathBuf;
 
 #[test]
-#[ignore = "bootstrap-lock-nesting: red until fix; remove #[ignore] after fix to confirm"]
 fn bootstrap_does_not_nest_core_lock_in_registry_lock_agent_binding() {
     let file = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/agent/mod.rs");
     let text = std::fs::read_to_string(&file).expect("read src/agent/mod.rs");

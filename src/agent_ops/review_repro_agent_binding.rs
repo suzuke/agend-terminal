@@ -25,7 +25,6 @@ use super::cleanup_working_dir;
 /// (dunce::canonicalize + re-check): the victim file survives.
 #[cfg(unix)]
 #[test]
-#[ignore = "cleanup-working-dir-symlink: red until fix; remove #[ignore] after fix to confirm"]
 fn cleanup_working_dir_does_not_follow_symlink_out_of_workspace_agent_binding() {
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);

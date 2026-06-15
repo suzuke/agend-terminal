@@ -24,7 +24,6 @@ use super::install_hooks;
 /// RED now: no log fires (`install_hooks` swallows the failure). GREEN after
 /// fix: a warn about the hook failure is emitted.
 #[test]
-#[ignore = "install-hooks-silent-failure: red until fix; remove #[ignore] after fix to confirm"]
 #[tracing_test::traced_test]
 fn install_hooks_warns_when_git_config_fails_agent_binding() {
     use std::sync::atomic::{AtomicU32, Ordering};
