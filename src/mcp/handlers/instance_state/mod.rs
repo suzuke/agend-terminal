@@ -4,6 +4,13 @@ use std::path::Path;
 pub(crate) mod lifecycle;
 pub(super) mod spawn;
 
+/// CR-2026-06-14 (resource-leak): upper bound on a team-mode spawn count. A
+/// caller-supplied `count` flows into `vec![backend; count]`, so an unbounded
+/// value (e.g. a few billion) triggers an enormous allocation → OOM/abort DoS.
+/// 64 is already far beyond any real team size; reject above it at the MCP
+/// boundary, before the allocation and the CREATE_TEAM RPC.
+const MAX_TEAM_COUNT: usize = 64;
+
 pub(super) fn handle_create_instance(home: &Path, args: &Value, instance_name: &str) -> Value {
     // #2037 (6): name + team = spawn THIS name, then join the team — team-mode
     // used to silently rename to `<team>-N` (the fixup-1 incident). With
@@ -66,11 +73,27 @@ pub(super) fn handle_create_instance(home: &Path, args: &Value, instance_name: &
                 .collect(),
             None => {
                 let count = args.get("count").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+                // CR-2026-06-14 (resource-leak): cap BEFORE the `vec!` allocation
+                // — a huge `count` would OOM the daemon at the allocation itself.
+                if count > MAX_TEAM_COUNT {
+                    return json!({"error": format!(
+                        "team count {count} exceeds the maximum {MAX_TEAM_COUNT}"
+                    )});
+                }
                 vec![default_backend.to_string(); count]
             }
         };
         if per_member_backends.is_empty() {
             return json!({"error": "count must be >= 1 (or backends must be non-empty)"});
+        }
+        // CR-2026-06-14 (resource-leak): also bound the explicit-`backends` path
+        // (already materialized by serde, so no OOM here, but enforce the same
+        // team-size limit consistently at the boundary).
+        if per_member_backends.len() > MAX_TEAM_COUNT {
+            return json!({"error": format!(
+                "team size {} exceeds the maximum {MAX_TEAM_COUNT}",
+                per_member_backends.len()
+            )});
         }
         let task = args.get("task").and_then(|v| v.as_str()).map(String::from);
         match crate::api::call(
