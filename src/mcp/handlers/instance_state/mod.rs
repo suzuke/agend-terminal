@@ -373,6 +373,14 @@ fn restart_spawn_params(
     });
     if mode == "resume" {
         spawn_params["mode"] = json!("resume");
+    } else {
+        // fresh restart only: arm the daemon's first-turn self-kick so the
+        // respawned (context-lost) instance runs its recovery sequence instead of
+        // sitting idle until an operator happens to type (the overnight
+        // restart-strands-the-fleet failure). INDEPENDENT flag — the SPAWN handler
+        // must NOT derive self-kick from SpawnMode::Fresh, which initial fleet
+        // spawns also map to; only THIS restart-fresh path sets it.
+        spawn_params["self_kick_on_ready"] = json!(true);
     }
     spawn_params
 }
@@ -471,6 +479,8 @@ mod tests {
         assert_eq!(p["layout"], "same-tab");
         // fresh must NOT request a resume.
         assert!(p.get("mode").is_none());
+        // fresh restart arms the daemon self-kick (the independent flag).
+        assert_eq!(p["self_kick_on_ready"].as_bool(), Some(true));
     }
 
     #[test]
@@ -479,5 +489,28 @@ mod tests {
         let p = restart_spawn_params("dev", "claude", &[], None, &env, "resume");
         assert_eq!(p["layout"], "same-tab");
         assert_eq!(p["mode"], "resume");
+        // resume preserves context → must NOT self-kick.
+        assert!(p.get("self_kick_on_ready").is_none());
+    }
+
+    /// must-follow ②: the self-kick flag is INDEPENDENT — set ONLY by the
+    /// fresh-restart path, NEVER derived from `SpawnMode::Fresh` (initial fleet
+    /// spawns / create_instance / team-spawn are Fresh too but never set it). The
+    /// SPAWN handler reads `self_kick_on_ready` with `unwrap_or(false)`, so any
+    /// spawn-params shape that lacks the flag (every non-restart-fresh spawn)
+    /// gates the self-kick OUT, fail-safe.
+    #[test]
+    fn self_kick_flag_set_only_by_fresh_restart_fail_safe_default() {
+        let env = HashMap::new();
+        // fresh restart → flag present + true.
+        let fresh = restart_spawn_params("dev", "claude", &[], None, &env, "fresh");
+        assert!(fresh["self_kick_on_ready"].as_bool().unwrap_or(false));
+        // resume restart → no flag → reads false.
+        let resume = restart_spawn_params("dev", "claude", &[], None, &env, "resume");
+        assert!(!resume["self_kick_on_ready"].as_bool().unwrap_or(false));
+        // a generic spawn-params object (the initial-fleet / create_instance shape,
+        // which also maps to SpawnMode::Fresh) carries no flag → reads false.
+        let initial = json!({"name": "dev", "backend": "claude", "layout": "tab"});
+        assert!(!initial["self_kick_on_ready"].as_bool().unwrap_or(false));
     }
 }

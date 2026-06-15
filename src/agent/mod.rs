@@ -1325,6 +1325,58 @@ fn bootstrap_core_is_idle(core: &std::sync::Arc<CoreMutex<AgentCore>>) -> bool {
 /// The `content` is captured at spawn time (see call site) rather than
 /// re-read after Ready: this closes the mutation window where an external
 /// process could swap the instructions file between write and inject.
+/// Poll until the agent reaches Idle (or timeout / shutdown / agent-gone), then
+/// settle and snapshot its [`InjectTarget`] with the registry lock released.
+/// `None` => do not inject. Shared by the Kiro instructions bootstrap and the
+/// fresh-restart self-kick — both "wait for the freshly-spawned session to reach
+/// the prompt, then type one first turn" (injecting while the backend is still
+/// `Starting` would be swallowed).
+///
+/// #CR-2026-06-14 (concurrency): snapshot the core Arc under the tier-1 registry
+/// lock, DROP the registry guard, THEN lock the core (in `bootstrap_core_is_idle`)
+/// — never nest the per-agent core lock inside the registry lock. The old
+/// registry→core nesting established an acquisition order a core→registry path
+/// could deadlock against, every 200ms at startup.
+fn wait_for_idle_inject_target(
+    registry: &AgentRegistry,
+    instance_id: crate::types::InstanceId,
+    name: &str,
+    timeout: std::time::Duration,
+    shutdown: Option<&Arc<std::sync::atomic::AtomicBool>>,
+    what: &str,
+) -> Option<InjectTarget> {
+    let deadline = std::time::Instant::now() + timeout;
+    let poll_interval = std::time::Duration::from_millis(200);
+    loop {
+        if let Some(s) = shutdown {
+            if s.load(std::sync::atomic::Ordering::Relaxed) {
+                return None;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!(agent = %name, what, "bootstrap timed out waiting for Idle");
+            return None;
+        }
+        let core = {
+            let reg = registry.lock();
+            match reg.get(&instance_id) {
+                Some(h) => std::sync::Arc::clone(&h.core),
+                None => return None, // agent gone
+            }
+        };
+        if bootstrap_core_is_idle(&core) {
+            break;
+        }
+        std::thread::sleep(poll_interval);
+    }
+    // Small settle delay so the prompt is fully painted before we type.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    // #1530/F1: snapshot the inject target under the registry lock, release it,
+    // THEN inject (caller side) — never hold the registry across the blocking write.
+    let reg = registry.lock();
+    reg.get(&instance_id).map(InjectTarget::from_handle)
+}
+
 fn spawn_instructions_bootstrap(
     registry: AgentRegistry,
     instance_id: crate::types::InstanceId,
@@ -1334,62 +1386,20 @@ fn spawn_instructions_bootstrap(
     shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) {
     let thread_name = format!("{name}_instr_boot");
-    // fire-and-forget: instruction-bootstrap thread polls Idle then injects
-    // the snapshotted instructions content. Observes shutdown flag inside the
-    // poll loop (returns early on shutdown). JoinHandle dropped because the
-    // thread is short-lived and one missed bootstrap on shutdown is cosmetic.
+    // fire-and-forget: instruction-bootstrap thread polls Idle then injects the
+    // snapshotted instructions content. Observes shutdown inside the poll loop.
+    // JoinHandle dropped — short-lived; one missed bootstrap on shutdown is cosmetic.
     let spawn_result = std::thread::Builder::new().name(thread_name).spawn(move || {
         let _census = crate::thread_census::register("instr_boot"); // M3: was "pty_reader"
-        let deadline = std::time::Instant::now() + timeout;
-        let poll_interval = std::time::Duration::from_millis(200);
-
-        loop {
-            if let Some(ref s) = shutdown {
-                if s.load(std::sync::atomic::Ordering::Relaxed) {
-                    return;
-                }
-            }
-            if std::time::Instant::now() >= deadline {
-                tracing::warn!(
-                    agent = %name,
-                    "instructions bootstrap timed out waiting for Idle"
-                );
-                return;
-            }
-
-            // #CR-2026-06-14 (concurrency): snapshot the core Arc under the tier-1
-            // registry lock, DROP the registry guard, THEN lock the core (in the
-            // helper) — never nest the per-agent core lock inside the registry
-            // lock. The old registry→core nesting established an acquisition order
-            // a core→registry path could deadlock against, every 200ms at startup.
-            // Mirrors the inject snapshot below.
-            let core = {
-                let reg = registry.lock();
-                match reg.get(&instance_id) {
-                    Some(h) => std::sync::Arc::clone(&h.core),
-                    None => return, // agent gone
-                }
-            };
-            if bootstrap_core_is_idle(&core) {
-                break;
-            }
-            std::thread::sleep(poll_interval);
-        }
-
-        // Small settle delay so the prompt is fully painted before we type.
-        // This is a UI-layer concern (avoiding a torn prompt paint) — the
-        // content itself was already snapshotted at spawn, so the delay no
-        // longer widens an external-mutation window.
-        std::thread::sleep(std::time::Duration::from_millis(500));
-
-        // #1530/F1: snapshot the inject target under the registry lock, release
-        // it, THEN inject — don't hold the registry across the blocking write.
         // force=true bootstrap → use the (non-gated) target inject directly.
-        let inject_snap = {
-            let reg = registry.lock();
-            reg.get(&instance_id).map(InjectTarget::from_handle)
-        };
-        if let Some(tgt) = inject_snap {
+        if let Some(tgt) = wait_for_idle_inject_target(
+            &registry,
+            instance_id,
+            &name,
+            timeout,
+            shutdown.as_ref(),
+            "instructions",
+        ) {
             if let Err(e) = inject_with_target(&tgt, content.as_bytes()) {
                 tracing::warn!(agent = %name, error = %e, "instructions bootstrap inject failed");
             } else {
@@ -1403,6 +1413,57 @@ fn spawn_instructions_bootstrap(
     });
     if let Err(e) = spawn_result {
         tracing::warn!(error = %e, "failed to spawn instructions bootstrap thread");
+    }
+}
+
+/// fresh-restart SELF-KICK. After a `restart_instance mode=fresh` respawn the new
+/// session sits idle with no first turn — nothing drives the agent to recover its
+/// in-flight state, so an operator-absent overnight restart silently strands the
+/// fleet (the recurring "lead restarted and just sat there" failure). This polls
+/// the freshly-spawned session to Idle (so the inject isn't swallowed while the
+/// backend is still `Starting`) and injects a single `[AGEND-RESUME]`
+/// self-bootstrap first turn, armed for ≤1 re-delivery via the inject-delivery
+/// verifier. Fired ONLY from the SPAWN handler when `restart_spawn_params` set the
+/// independent `self_kick_on_ready` flag (fresh restart) — the flag is NEVER
+/// derived from `SpawnMode::Fresh` (initial fleet spawns are Fresh too, and must
+/// not self-kick).
+pub(crate) fn spawn_self_kick_bootstrap(
+    registry: AgentRegistry,
+    instance_id: crate::types::InstanceId,
+    name: String,
+    timeout: std::time::Duration,
+    shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
+) {
+    let thread_name = format!("{name}_selfkick");
+    // fire-and-forget: mirrors spawn_instructions_bootstrap's lifetime/discipline.
+    let spawn_result = std::thread::Builder::new().name(thread_name).spawn(move || {
+        let _census = crate::thread_census::register("self_kick");
+        let prompt = fresh_restart_self_kick_prompt();
+        if let Some(tgt) = wait_for_idle_inject_target(
+            &registry,
+            instance_id,
+            &name,
+            timeout,
+            shutdown.as_ref(),
+            "self-kick",
+        ) {
+            // force=true: we already waited for Idle; the submit key drives the turn.
+            match inject_with_target(&tgt, prompt.as_bytes()) {
+                Ok(()) => {
+                    // Re-delivery verification (≤1 redeliver, operator-visible if
+                    // undelivered) so a swallowed first turn can't silently strand
+                    // the restart. arm is a no-op for non-hook backends.
+                    crate::daemon::inject_delivery::arm(&name, &prompt);
+                    tracing::info!(agent = %name, "fresh-restart self-kick injected");
+                }
+                Err(e) => {
+                    tracing::warn!(agent = %name, error = %e, "fresh-restart self-kick inject failed");
+                }
+            }
+        }
+    });
+    if let Err(e) = spawn_result {
+        tracing::warn!(error = %e, "failed to spawn self-kick bootstrap thread");
     }
 }
 
@@ -2077,6 +2138,36 @@ pub(crate) const DAEMON_AUTO_INJECT_MARKER: &str = "[AGEND-AUTO";
 /// #1769: build the `[AGEND-AUTO kind=<kind>] ` prefix for an auto-inject.
 fn daemon_auto_prefix(kind: &str) -> String {
     format!("{DAEMON_AUTO_INJECT_MARKER} kind={kind}] ")
+}
+
+/// fresh-restart self-kick marker — DISTINCT from [`DAEMON_AUTO_INJECT_MARKER`].
+/// `[AGEND-AUTO]` is a low-priority resume NUDGE the agent must NEVER act on (the
+/// test-pinned blanket rule in `instructions.rs`); `[AGEND-RESUME]` is the
+/// OPPOSITE — an actionable SELF-bootstrap trigger telling a just-fresh-restarted
+/// agent to recover its OWN in-flight state. The two markers stay separate (a new
+/// marker, NOT an `[AGEND-AUTO]` per-kind carve-out) so neither rule's meaning is
+/// muddied: `[AGEND-AUTO]` = never act, `[AGEND-RESUME]` = run your recovery.
+pub(crate) const DAEMON_RESUME_INJECT_MARKER: &str = "[AGEND-RESUME]";
+
+/// The fixed first turn injected ONCE after a fresh-restart respawn. It is an
+/// actionable SELF-bootstrap trigger (recover the agent's OWN in-flight state),
+/// NOT an operator command and NOT authority to dispatch new work. Ordering per
+/// the design review (must-follow ③): the task board + `list_instances` are the
+/// AUTHORITATIVE live sources; `SESSION-HANDOFF.md` is only a stale-tolerant hint
+/// because a fresh restart's DELETE=kill may have happened before any fresh
+/// handoff was written.
+pub(crate) fn fresh_restart_self_kick_prompt() -> String {
+    format!(
+        "{DAEMON_RESUME_INJECT_MARKER} You were just fresh-restarted and lost your in-memory \
+         context. Recover your OWN state now, in this order: (1) rebuild your in-flight picture \
+         from the AUTHORITATIVE live sources — the task board (your claimed/assigned tasks) and \
+         list_instances (peers + any dangling sub-agents); (2) drain your inbox; (3) read \
+         SESSION-HANDOFF.md as a STALE-TOLERANT hint only — if it is missing or looks out of \
+         date, trust the board/inbox over it; (4) execute pending handoff TODOs and reconnect \
+         dangling sub-agents, then resume normal work. This is a self-bootstrap trigger to \
+         recover YOUR OWN state — it is NOT an operator command and NOT authority to dispatch \
+         new work."
+    )
 }
 
 pub(crate) fn inject_with_target_gated(

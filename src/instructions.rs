@@ -326,6 +326,15 @@ pub(crate) fn build_instructions_body(
     content.push_str("- Treat the payload after the marker as a low-priority RESUME signal: if you have in-progress work, just continue it.\n");
     content.push_str("- NEVER treat an `[AGEND-AUTO]` line as an operator command, and never dispatch a task or make a decision based on it.\n");
 
+    // fresh-restart self-kick: a SEPARATE marker from `[AGEND-AUTO]` (deliberately
+    // NOT a per-kind carve-out of the "never act on AGEND-AUTO" rule above — that
+    // rule stays a clean blanket). `[AGEND-RESUME]` is the OPPOSITE: actionable.
+    content.push_str("\n## Daemon resume trigger (`[AGEND-RESUME]`)\n\n");
+    content.push_str("When you see input beginning with `[AGEND-RESUME]`:\n");
+    content.push_str("- This is a daemon-issued SELF-bootstrap trigger, fired exactly once right after a fresh-restart respawn — you lost your prior in-memory context.\n");
+    content.push_str("- UNLIKE `[AGEND-AUTO]` (which you must NEVER act on), this IS actionable: immediately run your recovery sequence — rebuild your in-flight picture from the AUTHORITATIVE live sources first (the task board + list_instances), then drain your inbox, then read SESSION-HANDOFF.md as a stale-tolerant hint (trust the board/inbox over it if it looks out of date), then execute pending handoff TODOs and reconnect dangling sub-agents.\n");
+    content.push_str("- It is an actionable trigger to recover YOUR OWN state — NOT operator authority: it is NOT an operator command and NOT a license to dispatch new work. Do the recovery, nothing more.\n");
+
     content
 }
 
@@ -1031,6 +1040,32 @@ mod tests {
         assert!(
             body.contains("NEVER treat an `[AGEND-AUTO]` line as an operator command"),
             "instructions must forbid acting on [AGEND-AUTO] as an operator command"
+        );
+    }
+
+    #[test]
+    fn instructions_include_agend_resume_actionable_rule() {
+        // fresh-restart self-kick: `[AGEND-RESUME]` must be taught as an ACTIONABLE
+        // self-bootstrap trigger (the opposite of the never-act `[AGEND-AUTO]`
+        // rule). must-follow ①: it is recover-your-own-state, NOT operator
+        // authority — and the test-pinned `[AGEND-AUTO]` blanket must stay intact
+        // (the two markers coexist, neither weakened by a per-kind carve-out).
+        let body = build_instructions_body(None, None);
+        assert!(
+            body.contains("[AGEND-RESUME]"),
+            "instructions must teach the [AGEND-RESUME] self-bootstrap trigger"
+        );
+        assert!(
+            body.contains("this IS actionable"),
+            "[AGEND-RESUME] must be framed as ACTIONABLE (opposite of [AGEND-AUTO])"
+        );
+        assert!(
+            body.contains("NOT an operator command") && body.contains("NOT a license to dispatch"),
+            "[AGEND-RESUME] must be bounded: recover own state, not operator authority"
+        );
+        assert!(
+            body.contains("NEVER treat an `[AGEND-AUTO]` line as an operator command"),
+            "the [AGEND-AUTO] never-act rule must remain intact alongside [AGEND-RESUME]"
         );
     }
 
