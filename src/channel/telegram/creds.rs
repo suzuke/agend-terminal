@@ -76,6 +76,28 @@ pub(super) fn resolve_channel_only() -> anyhow::Result<TelegramCreds> {
     resolve_channel().map(|(ch, _)| ch)
 }
 
+/// #2207: resolve `bot_token_env` to its value using the SAME symmetric
+/// canonical/legacy fallback as [`resolve_channel_from`], but without loading
+/// config or emitting tracing warnings. Returns `None` when no token is set
+/// under either name (telegram will not run).
+///
+/// Shared so the doctor's detached-start pre-flight gate (#2207 A1) decides
+/// "telegram will actually run" with the exact same token resolution the
+/// runtime uses — a divergence would false-pass or false-block the
+/// empty-allowlist fail-fast.
+pub(crate) fn resolve_token_value(bot_token_env: &str) -> Option<String> {
+    const CANONICAL: &str = "AGEND_TELEGRAM_BOT_TOKEN";
+    const LEGACY: &str = "AGEND_BOT_TOKEN";
+    std::env::var(bot_token_env).ok().or_else(|| {
+        let fallback_name = if bot_token_env == CANONICAL {
+            LEGACY
+        } else {
+            CANONICAL
+        };
+        std::env::var(fallback_name).ok()
+    })
+}
+
 /// Like [`resolve_channel_only`] but reads `fleet.yaml` from a caller-
 /// supplied home instead of the process-wide `AGEND_HOME`. Telegram
 /// helpers that already receive a `home` argument (e.g.

@@ -139,6 +139,57 @@ fn check_channel_user_allowlist(config: &FleetConfig, diags: &mut Vec<Diagnostic
     }
 }
 
+/// #2207 A1 (detached-start fail-fast gate): returns `Some(channel_label)` when
+/// a configured telegram channel has an empty/missing `user_allowlist` AND its
+/// bot token is actually set (telegram WILL run → every inbound command +
+/// outbound notification WILL be silently dropped by the fail-closed gate).
+///
+/// This is the D001 condition narrowed by a token-presence check. It is
+/// deliberately D001-ONLY (not all Critical diagnostics): D002 (task_sweep
+/// without github_login) is feature-degradation, not daemon-uselessness —
+/// hard-aborting on it would brick an otherwise-functional daemon. And it is
+/// token-GATED: a telegram block whose token env is unset is inert (telegram
+/// never registers — see `telegram_init::init` / `creds::resolve_token_value`),
+/// so its empty allowlist is harmless and must NOT block startup.
+///
+/// Returns `None` (do not block) when: no telegram channel, allowlist is
+/// populated, or the token is unset. D001 itself (`check_channel_user_allowlist`)
+/// is unchanged — it still warns regardless of token so operators keep the
+/// log/foreground signal.
+pub fn empty_allowlist_with_token_set(config: &FleetConfig) -> Option<String> {
+    let check = |ch: &ChannelConfig, label: &str| -> Option<String> {
+        let ChannelConfig::Telegram {
+            user_allowlist,
+            bot_token_env,
+            ..
+        } = ch
+        else {
+            return None;
+        };
+        let allowlist_empty = match user_allowlist {
+            None => true,
+            Some(list) => list.is_empty(),
+        };
+        let token_set =
+            crate::channel::telegram::creds::resolve_token_value(bot_token_env).is_some();
+        (allowlist_empty && token_set).then(|| label.to_string())
+    };
+
+    if let Some(ch) = &config.channel {
+        if let Some(label) = check(ch, "telegram") {
+            return Some(label);
+        }
+    }
+    if let Some(channels) = &config.channels {
+        for (name, ch) in channels {
+            if let Some(label) = check(ch, name) {
+                return Some(label);
+            }
+        }
+    }
+    None
+}
+
 /// D002: task_sweep is configured but no agent has a `github_login`
 /// mapping declared in fleet.yaml. Sprint 56 Track F (#496): the sweep's
 /// authorship gate compares `pr.author_login` against
@@ -314,6 +365,71 @@ mod tests {
             diags[0].message
         );
         assert!(diags[0].fix_stanza.is_some());
+    }
+
+    /// #2207 A1 gate: `empty_allowlist_with_token_set` blocks startup ONLY when
+    /// the telegram bot token is actually set (telegram would run and drop
+    /// everything). A token-less telegram block is inert → must NOT block. This
+    /// is D001-only + token-gated. Mutates the real token env vars to exercise
+    /// the runtime-parity token check → `#[serial]` + save/restore.
+    #[test]
+    #[serial_test::serial]
+    fn empty_allowlist_with_token_set_gates_on_token_presence() {
+        const CANONICAL: &str = "AGEND_TELEGRAM_BOT_TOKEN";
+        const LEGACY: &str = "AGEND_BOT_TOKEN";
+        let saved_c = std::env::var(CANONICAL).ok();
+        let saved_l = std::env::var(LEGACY).ok();
+        std::env::remove_var(CANONICAL);
+        std::env::remove_var(LEGACY);
+
+        // telegram_config pins bot_token_env = CANONICAL.
+        let empty = || FleetConfig {
+            channel: Some(telegram_config(Some(vec![]))),
+            ..Default::default()
+        };
+        let missing = || FleetConfig {
+            channel: Some(telegram_config(None)),
+            ..Default::default()
+        };
+        let populated = || FleetConfig {
+            channel: Some(telegram_config(Some(vec![42]))),
+            ..Default::default()
+        };
+
+        // No token → telegram inert → must NOT block even with empty allowlist.
+        assert!(
+            empty_allowlist_with_token_set(&empty()).is_none(),
+            "empty allowlist but NO token must not block (telegram inert)"
+        );
+
+        // Token set → telegram runs → empty/missing allowlist drops all → block.
+        std::env::set_var(CANONICAL, "123:dummy-token");
+        assert_eq!(
+            empty_allowlist_with_token_set(&empty()).as_deref(),
+            Some("telegram"),
+            "empty allowlist + token set must block"
+        );
+        assert_eq!(
+            empty_allowlist_with_token_set(&missing()).as_deref(),
+            Some("telegram"),
+            "missing allowlist + token set must block"
+        );
+        // Populated allowlist never blocks.
+        assert!(
+            empty_allowlist_with_token_set(&populated()).is_none(),
+            "populated allowlist must not block"
+        );
+        // No telegram channel never blocks.
+        assert!(empty_allowlist_with_token_set(&FleetConfig::default()).is_none());
+
+        // Restore prior env.
+        std::env::remove_var(CANONICAL);
+        if let Some(v) = saved_c {
+            std::env::set_var(CANONICAL, v);
+        }
+        if let Some(v) = saved_l {
+            std::env::set_var(LEGACY, v);
+        }
     }
 
     /// The two D001 surface variants must produce visibly distinct

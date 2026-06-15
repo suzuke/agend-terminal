@@ -62,7 +62,7 @@ pub fn run(home: &Path, unattended: bool) -> anyhow::Result<()> {
         .and_then(|content| serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&content).ok())
         .and_then(|config| config["channel"]["group_id"].as_i64());
 
-    let (token, group_id) = if existing_token.is_some() && existing_group_id.is_some() {
+    let (token, group_id, user_id) = if existing_token.is_some() && existing_group_id.is_some() {
         let tok = existing_token.clone().unwrap_or_default();
         let gid = existing_group_id.unwrap_or(0);
         println!("  ── Telegram ──\n");
@@ -72,7 +72,9 @@ pub fn run(home: &Path, unattended: bool) -> anyhow::Result<()> {
             telegram_setup(home)?
         } else {
             println!();
-            (tok, Some(gid))
+            // Reusing an existing config — no fresh getUpdates poll, so no
+            // auto-detected sender (#2207 B); the existing allowlist stands.
+            (tok, Some(gid), None)
         }
     } else if let Some(tok) = existing_token {
         println!("  ── Telegram ──\n");
@@ -85,13 +87,13 @@ pub fn run(home: &Path, unattended: bool) -> anyhow::Result<()> {
             print!("  Waiting for group message (3 min timeout)... ");
             io::stdout().flush().ok();
             match detect_group(&tok) {
-                Ok((gid, title)) => {
+                Ok((gid, title, sender)) => {
                     println!("✓ {title} ({gid})\n");
-                    (tok, Some(gid))
+                    (tok, Some(gid), sender)
                 }
                 Err(e) => {
                     println!("timeout: {e}\n");
-                    (tok, None)
+                    (tok, None, None)
                 }
             }
         }
@@ -108,6 +110,7 @@ pub fn run(home: &Path, unattended: bool) -> anyhow::Result<()> {
         &selected,
         group_id,
         if token.is_empty() { None } else { Some(&token) },
+        user_id,
         false,
     )?;
 
@@ -185,6 +188,9 @@ fn run_unattended(home: &Path) -> anyhow::Result<()> {
         &selected,
         resolved.group_id,
         resolved.token.as_deref(),
+        // Unattended never runs detect_group (no network) → no auto-detected
+        // sender; the allowlist stays as-is (#2207 B is interactive-only).
+        None,
         true,
     )?;
 
@@ -325,7 +331,7 @@ enum TimeoutChoice {
 const MAX_TOKEN_RETRIES: u32 = 3;
 
 /// Full Telegram setup flow — BotFather → token → group detection.
-fn telegram_setup(_home: &Path) -> anyhow::Result<(String, Option<i64>)> {
+fn telegram_setup(_home: &Path) -> anyhow::Result<(String, Option<i64>, Option<i64>)> {
     println!("  ── Telegram Setup ──\n");
     println!("  1. Open Telegram, talk to @BotFather");
     println!("  2. Send /newbot and follow instructions");
@@ -344,7 +350,7 @@ fn telegram_setup(_home: &Path) -> anyhow::Result<(String, Option<i64>)> {
         let token = token.trim().to_string();
         if token.is_empty() {
             println!("\n  Skipping Telegram. Configure later in fleet.yaml.\n");
-            return Ok((String::new(), None));
+            return Ok((String::new(), None, None));
         }
 
         if !is_valid_token_format(&token) {
@@ -354,7 +360,7 @@ fn telegram_setup(_home: &Path) -> anyhow::Result<(String, Option<i64>)> {
                 TokenChoice::ReEnter => continue,
                 TokenChoice::Skip => {
                     println!("\n  Skipping Telegram. Configure later in fleet.yaml.\n");
-                    return Ok((String::new(), None));
+                    return Ok((String::new(), None, None));
                 }
                 TokenChoice::Continue => {
                     // fall through to verify_bot — operator may have a
@@ -382,7 +388,7 @@ fn telegram_setup(_home: &Path) -> anyhow::Result<(String, Option<i64>)> {
                     TokenChoice::ReEnter => continue,
                     TokenChoice::Skip => {
                         println!("\n  Skipping Telegram. Configure later in fleet.yaml.\n");
-                        return Ok((String::new(), None));
+                        return Ok((String::new(), None, None));
                     }
                     TokenChoice::Continue => break token,
                 }
@@ -400,7 +406,7 @@ fn telegram_setup(_home: &Path) -> anyhow::Result<(String, Option<i64>)> {
         print!("  Waiting for group message (3 min timeout)... ");
         io::stdout().flush().ok();
         match detect_group(&token) {
-            Ok((group_id, group_title)) => {
+            Ok((group_id, group_title, sender)) => {
                 println!("✓ {group_title} ({group_id})\n");
                 // Sprint 56 Track H2 (#525 item 3): verify the bot is
                 // admin in the captured group. Topic mode (the only mode
@@ -424,7 +430,7 @@ fn telegram_setup(_home: &Path) -> anyhow::Result<(String, Option<i64>)> {
                         println!("  ⚠ Could not verify admin status: {e} — continuing anyway\n")
                     }
                 }
-                return Ok((token, Some(group_id)));
+                return Ok((token, Some(group_id), sender));
             }
             Err(e) => {
                 println!("timeout: {e}");
@@ -435,7 +441,7 @@ fn telegram_setup(_home: &Path) -> anyhow::Result<(String, Option<i64>)> {
                     }
                     TimeoutChoice::Skip => {
                         println!("\n  Set group_id manually in fleet.yaml later.\n");
-                        return Ok((token, None));
+                        return Ok((token, None, None));
                     }
                     TimeoutChoice::Quit => {
                         anyhow::bail!("quickstart aborted by operator after group-detect timeout");
@@ -664,7 +670,37 @@ fn classify_quickstart_chat(chat: &serde_json::Value) -> anyhow::Result<Option<(
     }
 }
 
-fn detect_group(token: &str) -> anyhow::Result<(i64, String)> {
+/// #2207 B: pick the operator's `user_id` from a `getUpdates` batch — but ONLY
+/// when there is exactly ONE distinct sender across the polled messages. During
+/// quickstart the operator is told to send a message to their group, so a single
+/// sender is overwhelmingly the operator. We deliberately return `None` for 0 or
+/// ≥2 distinct senders (e.g. someone else in the group messaged during the poll
+/// window) so quickstart never auto-allowlists the wrong user — the detached
+/// fail-fast (#2207 A1) then backstops the still-empty allowlist. Pure (no HTTP)
+/// so the single-sender policy is unit-testable.
+fn extract_single_sender(updates: &[serde_json::Value]) -> Option<i64> {
+    let mut senders = std::collections::BTreeSet::new();
+    for update in updates {
+        if let Some(id) = update
+            .get("message")
+            .and_then(|m| m.get("from"))
+            .and_then(|f| f.get("id"))
+            .and_then(|v| v.as_i64())
+        {
+            senders.insert(id);
+        }
+    }
+    if senders.len() == 1 {
+        senders.into_iter().next()
+    } else {
+        None
+    }
+}
+
+/// Returns `(group_id, group_title, sole_sender_user_id)`. The third element is
+/// the #2207 B auto-fill candidate (see [`extract_single_sender`]) — `None`
+/// unless exactly one sender appeared in the same poll.
+fn detect_group(token: &str) -> anyhow::Result<(i64, String, Option<i64>)> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -674,16 +710,20 @@ fn detect_group(token: &str) -> anyhow::Result<(i64, String)> {
             "getUpdates?timeout=180&allowed_updates=[\"message\"]",
         )
         .await?;
-        if let Some(updates) = resp["result"].as_array() {
-            for update in updates {
-                if let Some(chat) = update.get("message").and_then(|m| m.get("chat")) {
-                    if let Some(hit) = classify_quickstart_chat(chat)? {
-                        return Ok(hit);
-                    }
+        let Some(updates) = resp["result"].as_array() else {
+            anyhow::bail!("No group message received")
+        };
+        let mut group: Option<(i64, String)> = None;
+        for update in updates {
+            if let Some(chat) = update.get("message").and_then(|m| m.get("chat")) {
+                if let Some(hit) = classify_quickstart_chat(chat)? {
+                    group = Some(hit);
+                    break;
                 }
             }
         }
-        anyhow::bail!("No group message received")
+        let (gid, title) = group.ok_or_else(|| anyhow::anyhow!("No group message received"))?;
+        Ok((gid, title, extract_single_sender(updates)))
     })
 }
 
@@ -692,6 +732,11 @@ fn generate_fleet_yaml(
     backend: &Backend,
     group_id: Option<i64>,
     _token: Option<&str>,
+    // #2207 B: the sole sender detected during group detection, auto-filled
+    // into `user_allowlist` so a fresh quickstart yields a usable channel
+    // instead of the silently-dropping empty `[]`. `None` → emit the TODO
+    // template (multi/zero sender, reused config, or unattended).
+    user_id: Option<i64>,
     unattended: bool,
 ) -> anyhow::Result<()> {
     let fleet_path = crate::fleet::fleet_yaml_path(home);
@@ -724,6 +769,19 @@ fn generate_fleet_yaml(
     let backend_name = backend.name();
 
     let channel_section = if let Some(gid) = group_id {
+        // #2207 B: auto-fill the allowlist when quickstart detected exactly one
+        // sender (assumed to be the operator — they were just told to message
+        // the group). Otherwise emit the TODO `[]` template; the detached
+        // fail-fast (#2207 A1) backstops a still-empty allowlist at start.
+        let allowlist_line = match user_id {
+            Some(uid) => format!(
+                "user_allowlist:\n  - {uid}  # auto-detected by quickstart (sole sender during group detection)"
+            ),
+            None => {
+                "user_allowlist: []  # add your Telegram user_id (message @userinfobot to get it)"
+                    .to_string()
+            }
+        };
         format!(
             r#"
 channel:
@@ -731,7 +789,7 @@ channel:
   bot_token_env: AGEND_TELEGRAM_BOT_TOKEN
   group_id: {gid}
   mode: topic
-  user_allowlist: []  # add your Telegram user_id (message @userinfobot to get it)
+  {allowlist_line}
 "#
         )
     } else {
@@ -1578,7 +1636,8 @@ mod tests {
             std::env::temp_dir().join(format!("agend-quickstart-test-{}", std::process::id()));
         std::fs::create_dir_all(&home).ok();
         let backend = Backend::all()[0].clone();
-        generate_fleet_yaml(&home, &backend, Some(-1001234567890), None, false).expect("test");
+        generate_fleet_yaml(&home, &backend, Some(-1001234567890), None, None, false)
+            .expect("test");
         let yaml = std::fs::read_to_string(crate::fleet::fleet_yaml_path(&home)).expect("test");
         assert!(
             yaml.contains("user_allowlist"),
@@ -1637,6 +1696,90 @@ mod tests {
         }
     }
 
+    // ── #2207 B: single-sender auto-detect for user_allowlist auto-fill ──
+
+    fn fake_update_from(sender_id: i64) -> serde_json::Value {
+        serde_json::json!({
+            "message": {
+                "from": { "id": sender_id },
+                "chat": { "type": "supergroup", "id": -100, "title": "G" }
+            }
+        })
+    }
+
+    #[test]
+    fn extract_single_sender_returns_id_for_sole_sender() {
+        // One distinct sender, even across repeated messages → that id.
+        let updates = vec![fake_update_from(555), fake_update_from(555)];
+        assert_eq!(extract_single_sender(&updates), Some(555));
+    }
+
+    #[test]
+    fn extract_single_sender_none_for_multiple_distinct() {
+        // ≥2 distinct senders → None: never auto-allowlist the wrong user when
+        // someone else messaged the group during the poll window.
+        let updates = vec![fake_update_from(1), fake_update_from(2)];
+        assert_eq!(extract_single_sender(&updates), None);
+    }
+
+    #[test]
+    fn extract_single_sender_none_for_empty_or_senderless() {
+        assert_eq!(extract_single_sender(&[]), None);
+        // Updates lacking message.from.id contribute no sender.
+        let no_from = vec![serde_json::json!({"message": {"chat": {"id": -1}}})];
+        assert_eq!(extract_single_sender(&no_from), None);
+    }
+
+    #[test]
+    fn generate_fleet_yaml_auto_fills_allowlist_for_single_sender() {
+        let home = std::env::temp_dir().join(format!("agend-2207-autofill-{}", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        let backend = Backend::all()[0].clone();
+        generate_fleet_yaml(
+            &home,
+            &backend,
+            Some(-100123),
+            Some("t"),
+            Some(987654),
+            false,
+        )
+        .expect("gen");
+        let yaml = std::fs::read_to_string(crate::fleet::fleet_yaml_path(&home)).expect("read");
+        assert!(
+            yaml.contains("- 987654"),
+            "single detected sender must be auto-filled into user_allowlist: {yaml}"
+        );
+        // Must parse into a real, populated allowlist (not just a string match).
+        let config = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+            .expect("generated fleet.yaml must parse");
+        let Some(crate::fleet::ChannelConfig::Telegram { user_allowlist, .. }) = config.channel
+        else {
+            panic!("expected a telegram channel in generated config");
+        };
+        assert_eq!(
+            user_allowlist.expect("allowlist must be present").len(),
+            1,
+            "exactly the one detected sender is allowlisted"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn generate_fleet_yaml_keeps_empty_allowlist_without_sender() {
+        // No detected sender (multi/zero sender, reused config, unattended) →
+        // the TODO `[]` template stays; #2207 A1 backstops it at start.
+        let home = std::env::temp_dir().join(format!("agend-2207-nofill-{}", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        let backend = Backend::all()[0].clone();
+        generate_fleet_yaml(&home, &backend, Some(-100123), Some("t"), None, false).expect("gen");
+        let yaml = std::fs::read_to_string(crate::fleet::fleet_yaml_path(&home)).expect("read");
+        assert!(
+            yaml.contains("user_allowlist: []"),
+            "no detected sender → empty TODO template: {yaml}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     /// Snapshot test: commented-out channel section also mentions
     /// user_allowlist so operators know to add it.
     #[test]
@@ -1647,7 +1790,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&home).ok();
         let backend = Backend::all()[0].clone();
-        generate_fleet_yaml(&home, &backend, None, None, false).expect("test");
+        generate_fleet_yaml(&home, &backend, None, None, None, false).expect("test");
         let yaml = std::fs::read_to_string(crate::fleet::fleet_yaml_path(&home)).expect("test");
         assert!(
             yaml.contains("user_allowlist"),
@@ -1680,7 +1823,7 @@ mod tests {
         let home = std::env::temp_dir().join(format!("agend-2005-fresh-{}", std::process::id()));
         std::fs::create_dir_all(&home).ok();
         let backend = Backend::all()[0].clone();
-        generate_fleet_yaml(&home, &backend, Some(-100123), Some("t"), false).expect("gen");
+        generate_fleet_yaml(&home, &backend, Some(-100123), Some("t"), None, false).expect("gen");
         let yaml = std::fs::read_to_string(crate::fleet::fleet_yaml_path(&home)).expect("read");
         assert!(
             yaml.contains("bot_token_env: AGEND_TELEGRAM_BOT_TOKEN"),
@@ -1704,7 +1847,7 @@ mod tests {
         let home = std::env::temp_dir().join(format!("agend-2005-legacy-{}", std::process::id()));
         std::fs::create_dir_all(&home).ok();
         let backend = Backend::all()[0].clone();
-        generate_fleet_yaml(&home, &backend, Some(-100123), Some("t"), false).expect("gen");
+        generate_fleet_yaml(&home, &backend, Some(-100123), Some("t"), None, false).expect("gen");
         std::env::set_var("AGEND_BOT_TOKEN", "123:legacy");
         let res = crate::channel::telegram::creds::resolve_channel_from(&home);
         clear_token_envs();
@@ -1746,7 +1889,7 @@ mod tests {
         let home = std::env::temp_dir().join(format!("agend-2005-none-{}", std::process::id()));
         std::fs::create_dir_all(&home).ok();
         let backend = Backend::all()[0].clone();
-        generate_fleet_yaml(&home, &backend, Some(-1), Some("t"), false).expect("gen");
+        generate_fleet_yaml(&home, &backend, Some(-1), Some("t"), None, false).expect("gen");
         let err = crate::channel::telegram::creds::resolve_channel_from(&home)
             .expect_err("no env set must error");
         assert!(
@@ -1822,7 +1965,7 @@ mod tests {
         let fleet_path = crate::fleet::fleet_yaml_path(&home);
         std::fs::write(&fleet_path, "# operator-owned\ninstances: {}\n").expect("test");
         let backend = Backend::all()[0].clone();
-        generate_fleet_yaml(&home, &backend, Some(1), Some("tok"), true).expect("test");
+        generate_fleet_yaml(&home, &backend, Some(1), Some("tok"), None, true).expect("test");
         let after = std::fs::read_to_string(&fleet_path).expect("test");
         assert_eq!(
             after, "# operator-owned\ninstances: {}\n",

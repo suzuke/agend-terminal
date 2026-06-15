@@ -672,6 +672,33 @@ fn main() -> anyhow::Result<()> {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| crate::fleet::fleet_yaml_path(&home));
             if !force_foreground {
+                // #2207 A1 — parent pre-flight fail-fast. In detached mode the
+                // child's stdio is /dev/null (daemon_spawn) and the parent
+                // judges "started" purely on run-dir publication, so a daemon
+                // whose telegram token is set but `user_allowlist` is empty
+                // would silently drop EVERY inbound command + outbound
+                // notification while printing "daemon started". The child's
+                // D001 eprintln lands in /dev/null. Catch it HERE, in the
+                // operator-attached parent, before spawning: refuse to start
+                // with an actionable message + non-zero exit (D001-only,
+                // token-gated — see doctor::empty_allowlist_with_token_set).
+                if fleet_path.exists() {
+                    if let Ok(config) = crate::fleet::FleetConfig::load(&fleet_path) {
+                        if let Some(label) =
+                            bootstrap::doctor::empty_allowlist_with_token_set(&config)
+                        {
+                            println!(
+                                "daemon NOT started: telegram channel '{label}' has its bot token \
+                                 set but `user_allowlist` is empty → all inbound commands and \
+                                 outbound notifications would be silently dropped (fail-closed gate).\n\
+                                 Fix: add your Telegram user_id to `user_allowlist` in {} \
+                                 (run `agend-terminal quickstart` to auto-detect it), then start again.",
+                                fleet_path.display()
+                            );
+                            std::process::exit(1);
+                        }
+                    }
+                }
                 // Sprint 57 Wave 3 PR-2 (#548 Q1) default branch: detach.
                 // Spawn self as a background process and exit. Child inherits
                 // a clean environment from the parent shell but runs in its
