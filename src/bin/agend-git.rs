@@ -84,6 +84,17 @@ fn main() {
     let binding = read_binding(&home, &agent);
     let subcommand = args.first().map(|s| s.as_str()).unwrap_or("");
 
+    // #2234 (C): observability stopgap for the cwd↔bound-worktree drift. When a
+    // bound agent's cwd is its `<home>/workspace/<agent>` clone — a SEPARATE git
+    // object store from its bound worktree — the shim routes git to the worktree
+    // (ChdirPass) while the agent's file edits / cargo / `AGEND_GIT_BYPASS=1 git`
+    // act on the clone, so git reads look "fake" (clean / already-merged) and the
+    // agent silently works against a stale tree. Surface it ONCE (stderr +
+    // fleet_events) instead of corrupting the agent's git cognition. Purely
+    // additive — does NOT change any routing decision below. Fire-once + latch on
+    // the drifted cwd (see `warn_workspace_drift_once`) so it never spams per op.
+    maybe_warn_workspace_drift(&home, &agent, &binding);
+
     // #1463: non-destructive forensic capture of backend `init` heartbeat
     // commits. The RCA established these are produced by a backend process
     // (committer = user's global git identity, because this shim's
@@ -483,6 +494,96 @@ fn paths_are_foreign(cwd: &Path, worktree: &Path) -> bool {
         (Some(c), Some(w)) => c != w,
         _ => false,
     }
+}
+
+/// #2234 (C): pure decision — is `cwd` the agent's stale WORKSPACE clone rather
+/// than its bound worktree? True iff `cwd` is rooted in the agent's configured
+/// workspace dir (`<home>/workspace/<agent>`) AND that dir is a git object store
+/// SEPARATE from the bound `worktree`. The workspace-dir gate is what
+/// distinguishes the harmful drift (fleet.yaml `working_directory` is a separate
+/// stale clone) from a LEGITIMATE foreign scratch repo a bound agent
+/// intentionally `cd`'d into (#1463 test incubators) — those live elsewhere and
+/// must NOT warn. Fail-closed (`false`) on any unresolvable path. Pure (only
+/// reads the filesystem for the passed paths) so the matrix is hermetically
+/// testable without touching the process cwd.
+fn is_workspace_clone_drift(home: &str, agent: &str, cwd: &Path, worktree: &Path) -> bool {
+    let ws = PathBuf::from(home).join("workspace").join(agent);
+    let (Ok(ws_c), Ok(cwd_c)) = (std::fs::canonicalize(&ws), std::fs::canonicalize(cwd)) else {
+        return false;
+    };
+    cwd_c.starts_with(&ws_c) && paths_are_foreign(&cwd_c, worktree)
+}
+
+/// #2234 (C): emit a ONE-SHOT drift warning (stderr + a `cwd_worktree_drift`
+/// fleet_events line) when `cwd` is the agent's stale workspace clone. Latched on
+/// the canonical drifted cwd via `<home>/runtime/<agent>/cwd_drift_warned`: a
+/// standing drift warns exactly once (the cheap marker read short-circuits the
+/// commondir walk on every subsequent git op); a NEW drifted cwd re-warns (new
+/// info). Best-effort — every step swallows errors so it can NEVER block or
+/// alter the git command. Returns whether it warned (for tests). Takes `cwd`
+/// explicitly so the latch + emit are testable without mutating the process cwd.
+fn warn_workspace_drift_once(home: &str, agent: &str, cwd: &Path, worktree: &Path) -> bool {
+    let cwd_c = match std::fs::canonicalize(cwd) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let cwd_s = cwd_c.to_string_lossy().to_string();
+    let marker = PathBuf::from(home)
+        .join("runtime")
+        .join(agent)
+        .join("cwd_drift_warned");
+    // Cheap latch check FIRST — already warned for this exact cwd → skip the
+    // (filesystem-walking) drift detection entirely.
+    if std::fs::read_to_string(&marker)
+        .map(|s| s.trim() == cwd_s)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    if !is_workspace_clone_drift(home, agent, &cwd_c, worktree) {
+        return false;
+    }
+    eprintln!(
+        "agend-git: \u{26a0} #2234 cwd/worktree drift — your cwd '{}' is a SEPARATE \
+         git repo from your bound worktree '{}'. git runs against the worktree (via \
+         the shim) while file edits / cargo / `AGEND_GIT_BYPASS=1 git` act on this \
+         cwd clone, so git reads look stale/'fake'. `cd {}` to work in your worktree.",
+        cwd_c.display(),
+        worktree.display(),
+        worktree.display()
+    );
+    write_git_event_typed(
+        home,
+        agent,
+        subcmd_for_drift_event(),
+        "cwd_worktree_drift",
+        Some(&worktree.to_string_lossy()),
+        Some(&cwd_s),
+    );
+    if let Some(parent) = marker.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&marker, cwd_s.as_bytes());
+    true
+}
+
+/// Stable `subcommand` field value for the `cwd_worktree_drift` event — the
+/// drift is a per-invocation environment property, not tied to a git subcommand.
+fn subcmd_for_drift_event() -> &'static str {
+    "(cwd-drift)"
+}
+
+/// #2234 (C): thin env wrapper wiring `warn_workspace_drift_once` to the live
+/// process cwd + binding. No-op when unbound (no worktree to compare against) or
+/// the cwd is unreadable. Called once per shim invocation from `main`.
+fn maybe_warn_workspace_drift(home: &str, agent: &str, binding: &Binding) {
+    let Some(ref wt) = binding.worktree else {
+        return;
+    };
+    let Ok(cwd) = env::current_dir() else {
+        return;
+    };
+    let _ = warn_workspace_drift_once(home, agent, &cwd, Path::new(wt));
 }
 
 /// #1463 (A): the LOCAL mutating subcommands eligible for foreign-repo
@@ -3526,5 +3627,104 @@ mod tests {
         // globals-only / malformed (no subcommand) → unchanged, no panic
         assert_eq!(strip_target_overrides(&s(&["-C"])), s(&["-C"]));
         assert_eq!(strip_target_overrides(&s(&["-C", "/x"])), s(&["-C", "/x"]));
+    }
+
+    // ── #2234 (C): cwd↔bound-worktree drift detection ──────────────────
+    // Drive fixture git through the REAL git binary (not the bare `git` PATH
+    // entry, which IS this shim — its #1463 ChdirPass would hijack the op). See
+    // the #1748 note on `has_unmerged_files_false_on_clean_repo`.
+    fn drift_git_init(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        let git = resolve_real_git();
+        assert!(
+            Command::new(&git)
+                .arg("-C")
+                .arg(dir)
+                .args(["init", "-b", "main"])
+                .output()
+                .unwrap()
+                .status
+                .success(),
+            "git init {dir:?}"
+        );
+    }
+
+    fn drift_home(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("agend-2234-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn workspace_clone_is_drift_but_scratch_repo_is_not_2234() {
+        let home = drift_home("detect");
+        let agent = "ag";
+        let h = home.to_str().unwrap();
+        // The agent's configured workspace dir — a SEPARATE clone (own store).
+        let ws = home.join("workspace").join(agent);
+        drift_git_init(&ws);
+        // The bound worktree — a different, separate repo (only object-store
+        // identity matters for the foreign check).
+        let worktree = home.join("wt");
+        drift_git_init(&worktree);
+        // A legit foreign scratch repo OUTSIDE the workspace dir (#1463 incubator).
+        let scratch = home.join("scratch");
+        drift_git_init(&scratch);
+
+        // cwd = workspace clone, foreign to worktree → DRIFT.
+        assert!(
+            is_workspace_clone_drift(h, agent, &ws, &worktree),
+            "workspace clone foreign to the bound worktree must be drift"
+        );
+        // cwd = scratch repo OUTSIDE the workspace dir → NOT drift (no FP).
+        assert!(
+            !is_workspace_clone_drift(h, agent, &scratch, &worktree),
+            "a foreign scratch repo outside the workspace dir must NOT warn"
+        );
+        // cwd == worktree (aligned, same object store) → NOT drift.
+        assert!(
+            !is_workspace_clone_drift(h, agent, &worktree, &worktree),
+            "cwd aligned with the bound worktree must NOT be drift"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn drift_warns_once_then_latches_2234() {
+        let home = drift_home("latch");
+        let agent = "ag";
+        let h = home.to_str().unwrap();
+        let ws = home.join("workspace").join(agent);
+        drift_git_init(&ws);
+        let worktree = home.join("wt");
+        drift_git_init(&worktree);
+
+        // First sighting → warns, writes the latch marker + a fleet_events line.
+        assert!(
+            warn_workspace_drift_once(h, agent, &ws, &worktree),
+            "first drift sighting must warn"
+        );
+        let marker = home.join("runtime").join(agent).join("cwd_drift_warned");
+        assert!(marker.exists(), "latch marker must be written");
+        let events = std::fs::read_to_string(home.join("fleet_events.jsonl")).unwrap_or_default();
+        assert!(
+            events.contains("cwd_worktree_drift"),
+            "a cwd_worktree_drift event must be logged: {events}"
+        );
+
+        // Second call, same drifted cwd → latched, no second warn.
+        assert!(
+            !warn_workspace_drift_once(h, agent, &ws, &worktree),
+            "standing drift must warn only once (latched)"
+        );
+        // Aligned cwd never warns.
+        assert!(
+            !warn_workspace_drift_once(h, agent, &worktree, &worktree),
+            "aligned cwd must not warn"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
     }
 }
