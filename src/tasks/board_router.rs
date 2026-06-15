@@ -406,6 +406,25 @@ pub(super) fn list_all_boards(home: &Path) -> Vec<(String, Vec<Task>)> {
         .collect()
 }
 
+/// #2117 completeness: replay EVERY project board and merge into ONE aggregate
+/// `TaskBoardState` (its `tasks` map is the union across boards). The
+/// multi-board view for `task action=health` — per-project board status counts
+/// are otherwise invisible because `task_events::replay` reads only the DEFAULT
+/// board. Task ids are globally unique and each task lives on exactly one board,
+/// so the union never collides. Single-project byte-identical: with no
+/// `home/boards/` subdirs, `enumerate_projects` yields only DEFAULT and the
+/// merged `tasks` equals `replay(home).tasks`. Fails closed like `replay` — the
+/// first unreadable board propagates its `Err` (DEFAULT is replayed first, so a
+/// single-project replay error is unchanged).
+pub(super) fn replay_all_boards(home: &Path) -> anyhow::Result<crate::task_events::TaskBoardState> {
+    let mut merged = crate::task_events::TaskBoardState::default();
+    for project in enumerate_projects(home) {
+        let state = crate::task_events::replay_at(&board_root(home, &project))?;
+        merged.tasks.extend(state.tasks);
+    }
+    Ok(merged)
+}
+
 // ── tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -759,6 +778,44 @@ mod tests {
             lookup_task_project(&home, "T-live").as_deref(),
             Some(DEFAULT_PROJECT),
             "live entry preserved"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2117 completeness: `replay_all_boards` aggregates tasks from EVERY
+    /// project board, not just DEFAULT — so `task action=health` per-project
+    /// status counts are visible.
+    #[test]
+    fn replay_all_boards_aggregates_tasks_across_projects_2117() {
+        let home = tmp_home("replay-all-multiboard");
+        seed_live_task(&home, DEFAULT_PROJECT, "T-default");
+        seed_live_task(&home, "proj-a", "T-a");
+        seed_live_task(&home, "proj-b", "T-b");
+
+        let merged = replay_all_boards(&home).unwrap();
+        let ids: std::collections::BTreeSet<&str> =
+            merged.tasks.keys().map(|t| t.0.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["T-a", "T-b", "T-default"].into_iter().collect(),
+            "health aggregate must union every board's tasks"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2117 single-project byte-identical guard: with no `boards/` subdirs,
+    /// `replay_all_boards` must equal `task_events::replay(home)` (DEFAULT only).
+    #[test]
+    fn replay_all_boards_single_project_equals_default_replay_2117() {
+        let home = tmp_home("replay-all-single");
+        seed_live_task(&home, DEFAULT_PROJECT, "T-only");
+
+        let merged = replay_all_boards(&home).unwrap();
+        let default_only = crate::task_events::replay(&home).unwrap();
+        assert_eq!(
+            merged.tasks.keys().collect::<Vec<_>>(),
+            default_only.tasks.keys().collect::<Vec<_>>(),
+            "single-project replay_all_boards must be byte-identical to replay(home)"
         );
         std::fs::remove_dir_all(&home).ok();
     }

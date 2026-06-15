@@ -1119,7 +1119,10 @@ fn handle_health(home: &Path) -> Value {
             .ok()
             .map(|c| c.instances.keys().cloned().collect())
             .unwrap_or_default();
-    let state = match crate::task_events::replay(home) {
+    // #2117 completeness: aggregate across EVERY project board (not just the
+    // DEFAULT board) so `task action=health` surfaces per-project board load.
+    // Single-project byte-identical (see `board_router::replay_all_boards`).
+    let state = match super::board_router::replay_all_boards(home) {
         Ok(s) => s,
         Err(e) => {
             return serde_json::json!({
