@@ -26,7 +26,6 @@
 use std::path::PathBuf;
 
 #[test]
-#[ignore = "mcp-config-corrupt-backup: red until fix; remove #[ignore] after fix to confirm"]
 fn upsert_mcp_servers_must_not_swallow_corrupt_backup_copy_bootstrap_config_cli() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/mcp_config.rs");
     let text = std::fs::read_to_string(&path).expect("read src/mcp_config.rs");

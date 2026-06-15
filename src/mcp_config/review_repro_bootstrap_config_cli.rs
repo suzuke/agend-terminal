@@ -35,7 +35,6 @@ fn tmp_dir(tag: &str) -> std::path::PathBuf {
 }
 
 #[test]
-#[ignore = "hookpoc-corrupt-silent-discard: red until fix; remove #[ignore] after fix to confirm"]
 fn upsert_state_hooks_backs_up_corrupt_settings_before_discard_bootstrap_config_cli() {
     let dir = tmp_dir("discard");
     let claude = dir.join(".claude");

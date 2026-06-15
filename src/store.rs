@@ -21,7 +21,11 @@ static CORRUPT_SURFACED: std::sync::OnceLock<std::sync::Mutex<std::collections::
 /// prior `let _ = std::fs::copy(...)` swallowed the failure, making the "backing
 /// up" warn a LIE and letting the next save destroy the only copy — so a total
 /// failure now logs at ERROR.
-fn backup_corrupt_file(path: &Path, backup: &Path) -> bool {
+///
+/// `pub(crate)` so the same robust pattern backs the per-workspace config
+/// upserts in `mcp_config.rs` (which previously swallowed the copy result the
+/// identical way this fn was written to fix).
+pub(crate) fn backup_corrupt_file(path: &Path, backup: &Path) -> bool {
     if std::fs::rename(path, backup).is_ok() {
         return true;
     }

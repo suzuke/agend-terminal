@@ -128,16 +128,34 @@ fn upsert_mcp_servers(path: &Path, instance_name: Option<&str>) -> Result<()> {
         match serde_json::from_str(&content) {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %e,
-                    "malformed MCP config JSON, backing up and starting fresh"
-                );
                 let backup = path.with_extension(format!(
                     "corrupt.{}",
                     chrono::Utc::now().format("%Y%m%d%H%M%S")
                 ));
-                let _ = std::fs::copy(path, &backup);
+                // Fail-CLOSED: the prior `let _ = std::fs::copy(path, &backup)`
+                // discarded the copy result, so a copy failure (disk full,
+                // permission) destroyed the user's ONLY copy on the atomic_write
+                // below while the warn claimed a backup was made. Reuse store.rs's
+                // robust rename-first backup; if it CANNOT preserve the corrupt
+                // bytes, refuse to overwrite — return Err and leave the original
+                // on disk for the operator to rescue.
+                if !crate::store::backup_corrupt_file(path, &backup) {
+                    tracing::error!(
+                        path = %path.display(),
+                        error = %e,
+                        "malformed MCP config JSON AND backup failed — refusing to overwrite (original preserved)"
+                    );
+                    anyhow::bail!(
+                        "malformed MCP config at {} and its backup failed; refusing to overwrite (original preserved for rescue)",
+                        path.display()
+                    );
+                }
+                tracing::warn!(
+                    path = %path.display(),
+                    backup = %backup.display(),
+                    error = %e,
+                    "malformed MCP config JSON, backed up corrupt file and starting fresh"
+                );
                 json!({})
             }
         }
@@ -238,7 +256,40 @@ fn upsert_state_hooks(path: &Path, instance_name: &str) -> Result<()> {
     }
     let _lock = crate::store::acquire_file_lock(&config_lock_path(path))?;
     let mut config: serde_json::Value = if path.exists() {
-        serde_json::from_str(&std::fs::read_to_string(path)?).unwrap_or(json!({}))
+        let content = std::fs::read_to_string(path)?;
+        match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(e) => {
+                // Same fail-CLOSED contract as upsert_mcp_servers: the prior
+                // `unwrap_or(json!({}))` SILENTLY discarded the operator's whole
+                // shared settings file (permissions + other keys) with no backup
+                // before atomic_write'ing a fresh document. Back up the corrupt
+                // original (rename-first) and refuse to overwrite if it can't be
+                // preserved.
+                let backup = path.with_extension(format!(
+                    "corrupt.{}",
+                    chrono::Utc::now().format("%Y%m%d%H%M%S")
+                ));
+                if !crate::store::backup_corrupt_file(path, &backup) {
+                    tracing::error!(
+                        path = %path.display(),
+                        error = %e,
+                        "malformed settings JSON (hook upsert) AND backup failed — refusing to overwrite (original preserved)"
+                    );
+                    anyhow::bail!(
+                        "malformed settings at {} and its backup failed; refusing to overwrite (original preserved for rescue)",
+                        path.display()
+                    );
+                }
+                tracing::warn!(
+                    path = %path.display(),
+                    backup = %backup.display(),
+                    error = %e,
+                    "malformed settings JSON (hook upsert), backed up corrupt file and starting fresh"
+                );
+                json!({})
+            }
+        }
     } else {
         json!({})
     };
