@@ -316,8 +316,18 @@ pub fn get_submit_key(home: &Path, target: &str) -> String {
 // Git branch validation
 // ---------------------------------------------------------------------------
 
-/// Validate a git branch name. Only allows [a-zA-Z0-9/_.-], rejects ".."
-/// and leading "-".
+/// Validate a git branch name. Allows the char set `[a-zA-Z0-9/_.-]`, rejects
+/// `..` anywhere and a leading `-`, and enforces per-component refname/path
+/// rules that matter because the branch doubles as a filesystem path component
+/// in `worktree_path` (`home/worktrees/<agent>/<branch>`): every `/`-separated
+/// component must be
+/// - non-empty (rejects a trailing/leading/double `/`),
+/// - not begin with `.` (a leading-dot component like `.git` / `.agend-managed`
+///   collides with worktree-pool control files; a lone `.`/`..` is a no-op /
+///   parent path component and an invalid git refname), and
+/// - not end in `.lock` (git rejects `.lock`-suffixed refs).
+///
+/// Interior dots stay valid (`v1.0.0`, `release_2.0`).
 pub fn validate_branch(branch: &str) -> bool {
     !branch.is_empty()
         && !branch.contains("..")
@@ -325,6 +335,9 @@ pub fn validate_branch(branch: &str) -> bool {
         && branch
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '/' || c == '_' || c == '-' || c == '.')
+        && branch.split('/').all(|component| {
+            !component.is_empty() && !component.starts_with('.') && !component.ends_with(".lock")
+        })
 }
 
 /// E4.5 protected-branch invariant. Returns `true` for branches that

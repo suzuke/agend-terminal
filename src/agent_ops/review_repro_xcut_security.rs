@@ -20,7 +20,6 @@
 /// RED now: every bad case below currently returns `true` (verified
 /// empirically). GREEN after the fix tightens the validator.
 #[test]
-#[ignore = "validate-branch-leading-dot: red until fix; remove #[ignore] after fix to confirm"]
 fn validate_branch_rejects_leading_dot_and_git_invalid_refs_xcut_security() {
     // ── Must be REJECTED after the fix (currently all accepted = the bug). ──
     // Lone `.` — a no-op path component (resolves to the parent dir) and an
