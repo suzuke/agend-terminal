@@ -220,7 +220,10 @@ mod tests {
         // First sight seeds offset at EOF: no historical backlog replay.
         assert!(extract_from(&path, &mut pos).is_empty());
         assert!(pos.is_some());
-        assert_eq!(pos.as_ref().unwrap().offset, std::fs::metadata(&path).unwrap().len());
+        assert_eq!(
+            pos.as_ref().unwrap().offset,
+            std::fs::metadata(&path).unwrap().len()
+        );
     }
 
     #[test]
@@ -228,7 +231,10 @@ mod tests {
         let path = unique_jsonl("append");
         append(&path, &assistant_line(&text_block("seed")));
         let mut pos: Option<TailPos> = None;
-        assert!(extract_from(&path, &mut pos).is_empty(), "first sight empty");
+        assert!(
+            extract_from(&path, &mut pos).is_empty(),
+            "first sight empty"
+        );
 
         // Append one assistant record with two text blocks + one tool_use.
         let blocks = format!(

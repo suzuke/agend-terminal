@@ -63,11 +63,7 @@ impl PerTickHandler for ProgressMirrorHandler {
             let configs = ctx.configs.lock();
             configs
                 .iter()
-                .filter_map(|(name, cfg)| {
-                    cfg.working_dir
-                        .clone()
-                        .map(|wd| (name.clone(), wd))
-                })
+                .filter_map(|(name, cfg)| cfg.working_dir.clone().map(|wd| (name.clone(), wd)))
                 .collect()
         };
 
@@ -118,10 +114,7 @@ impl ProgressMirrorHandler {
 
         // Fire-and-forget relay to the origin channel.
         if let Some(ch) = crate::channel::lookup_channel_by_name(&channel) {
-            let _ = ch.send_from_agent(
-                name,
-                crate::channel::AgentOutboundOp::Reply { text },
-            );
+            let _ = ch.send_from_agent(name, crate::channel::AgentOutboundOp::Reply { text });
         }
     }
 }
