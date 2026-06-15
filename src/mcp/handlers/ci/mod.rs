@@ -12,6 +12,11 @@ mod merge_freshness;
 mod poll_eta;
 pub(crate) use poll_eta::compute_next_poll_eta;
 
+// #2158 PR1: the security-sensitive checkout source-path resolution (absolute /
+// agent-name only, fail-closed on miss + canonicalize + system-dir reject) lives
+// in a sibling module — same LOC-relief pattern, and isolates the boundary fix.
+mod source_resolve;
+
 /// #1447: resolve the checkout source repo from `repository_path` — the
 /// cross-tool standard name used by bind_self / team update. Returns `None`
 /// when absent or empty.
@@ -88,35 +93,15 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
         source.replace(['/', '\\', ':'], "_").replace('~', "")
     ));
     std::fs::create_dir_all(worktree_dir.parent().unwrap_or(home)).ok();
-    let source_path = if source.starts_with('/') || source.starts_with('~') {
-        source
-            .strip_prefix("~/")
-            .map(|rest| format!("{}/{rest}", crate::user_home_dir().display()))
-            .unwrap_or_else(|| source.to_string())
-    } else {
-        crate::api::call(home, &json!({"method": crate::api::method::LIST}))
-            .ok()
-            .and_then(|r| {
-                r["result"]["agents"]
-                    .as_array()?
-                    .iter()
-                    .find(|a| a["name"].as_str() == Some(source))
-                    .and_then(|a| a["working_directory"].as_str().map(String::from))
-            })
-            .unwrap_or_else(|| source.to_string())
-    };
-    // H2: validate source_path — reject path traversal and system paths
-    let source_canonical = match std::path::Path::new(&source_path).canonicalize() {
-        Ok(p) => p,
-        Err(e) => return json!({"error": format!("invalid source path: {e}")}),
-    };
-    if source_canonical.starts_with("/etc")
-        || source_canonical.starts_with("/usr")
-        || source_canonical.starts_with("/sys")
-        || source_canonical.starts_with("/proc")
-    {
-        return json!({"error": "source path rejected: system directory"});
-    }
+    // #2158 PR1: resolve + validate the source repo path fail-closed (absolute or
+    // known agent name only; canonicalize; reject system dirs). Extracted to
+    // `source_resolve` — keeps this oversized handler under the file_size ceiling
+    // (t-61 split debt) and isolates the security-sensitive resolution for review.
+    let (source_path, source_canonical) =
+        match source_resolve::resolve_checkout_source_path(home, source) {
+            Ok(pair) => pair,
+            Err(e) => return e,
+        };
     // #780: auto-create branch from `from_ref` when bind:true + branch
     // missing locally. #781 Piece 6 extracts the decision tree into
     // `dispatch_hook::ensure_branch_exists` so the same logic services
