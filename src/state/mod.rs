@@ -351,6 +351,31 @@ pub struct StateTracker {
     /// re-grabbed AFTER the agent recovered) from a same-state continuous
     /// re-scan. Telemetry-only.
     non_srl_since_last_srl: bool,
+    /// #2100/#2115 fire-once latch for the `#1562`/`#1808` unclassified-throttle
+    /// side-log. The feed-level hash-dedup is DELIBERATELY bypassed for a
+    /// throttle-hint screen ([`Self::apply_hash_dedup_gate`]), so without this a
+    /// STATIC unclassified-throttle pane appends a JSONL record (and re-fires the
+    /// `#1808-srl-detect-miss` WARN) on every PTY read. Keyed on the colored tail
+    /// hash, which is stable across the cursor/clock re-renders that flip the
+    /// full-screen hash; cleared when the pane leaves the throttle-miss shape so a
+    /// genuine recurrence re-logs once.
+    last_unclassified_throttle_sig: Option<u64>,
+    /// #2086 dedup latch: `line_hash` of the stuck-SRL error line for which the
+    /// `#2086-srl-keep-latched` WARN last fired. A genuinely stuck SRL has a
+    /// working spinner ticking below it that flips the screen hash every feed, so
+    /// without this the WARN re-fires every tick for the whole (~26 min) stuck
+    /// duration (the #1450 flood class). Keyed on the error LINE hash only (not
+    /// the full `srl_match_signature`) so a spinner whose glyph byte-length
+    /// changes — shifting `dist_from_bottom` — doesn't defeat the dedup. Behavior
+    /// unchanged — only the WARN emission is deduped.
+    last_srl_keep_latched_sig: Option<u64>,
+    /// #1808-probe0-phantom dedup latch: `line_hash` of the SRL error line for
+    /// which the `#1808-probe0-phantom` WARN last fired. An in-place static SRL
+    /// keeps the same error line while a clock-tick redraw flips the screen hash,
+    /// so the WARN otherwise re-fires every feed. Keyed on the line hash only (see
+    /// `last_srl_keep_latched_sig`); the `#1809` cross-cycle→Idle behavioral fix
+    /// stays OUTSIDE this dedup.
+    last_srl_phantom_warn_sig: Option<u64>,
 }
 
 /// #1527: one recorded `current` transition, captured at the mutation site so
@@ -1145,6 +1170,9 @@ impl StateTracker {
             usage_limit_expired_sig: None,
             srl_consecutive_rematch: 0,
             non_srl_since_last_srl: false,
+            last_unclassified_throttle_sig: None,
+            last_srl_keep_latched_sig: None,
+            last_srl_phantom_warn_sig: None,
         }
     }
 
@@ -1243,11 +1271,17 @@ impl StateTracker {
         };
         let tail = recent_screen_tail(screen_text, CONTEXT_SCAN_ROWS);
         for line in tail.lines().rev() {
-            if let Some(caps) = re.captures(line) {
-                if let Ok(pct) = caps[1].parse::<f32>() {
-                    self.context_pct = Some((pct.clamp(0.0, 100.0), Instant::now()));
-                    return;
-                }
+            // #1246: a backend `context_pattern` may match without a capture
+            // group 1 (a plausible future profile); `caps[1]` would Index-panic
+            // the PTY read loop on the first matching frame. `caps.get(1)`
+            // degrades a missing group to "no reading" (keeps the previous one).
+            if let Some(pct) = re
+                .captures(line)
+                .and_then(|caps| caps.get(1))
+                .and_then(|m| m.as_str().parse::<f32>().ok())
+            {
+                self.context_pct = Some((pct.clamp(0.0, 100.0), Instant::now()));
+                return;
             }
         }
     }
@@ -1784,7 +1818,7 @@ impl StateTracker {
     /// `recovered_within` bool + `productive_silent_secs` as INDEPENDENT fields;
     /// `dist_from_bottom` locates the matched error line. Does NOT alter `landed`.
     fn apply_working_marker_override(
-        &self,
+        &mut self,
         patterns: &'static StatePatterns,
         detected: AgentState,
         matched: &str,
@@ -1802,7 +1836,8 @@ impl StateTracker {
             let working_below = patterns.working_state_below(screen_text, matched);
             if is_srl {
                 let productive_silent_secs = self.productive_silence().as_secs();
-                let dist_from_bottom = srl_match_signature(screen_text, matched).1;
+                let srl_sig = srl_match_signature(screen_text, matched);
+                let dist_from_bottom = srl_sig.1;
                 match &working_below {
                     // Path A: a working marker renders BELOW the error.
                     Some((win_state, marker)) => {
@@ -1833,19 +1868,29 @@ impl StateTracker {
                             // `recovered_within` discriminator from log to decision
                             // (the WARN here used to fire on the silent swallow that
                             // stranded the agent for ~26 min, #2086).
-                            tracing::warn!(
-                                target: "state_detection",
-                                agent = %self.instance_name,
-                                tag = "#2086-srl-keep-latched",
-                                path = "working_state_below",
-                                backend = %self.backend_name,
-                                working_marker = %marker,
-                                masked_working_state = ?win_state,
-                                recovered_within = recovered,
-                                productive_silent_secs,
-                                dist_from_bottom,
-                                "ServerRateLimit KEPT latched — a working marker below the error with NO recent productive output is a stuck-retry spinner, not recovery (was swallowed pre-#2086)"
-                            );
+                            //
+                            // #2086 dedup: a stuck SRL keeps a spinner ticking
+                            // below it that flips the screen hash every feed, so
+                            // this WARN would re-fire every tick for the whole
+                            // stuck duration (the #1450 flood class). Emit only on
+                            // a distinct stuck-error signature. Behavior (keeping
+                            // the SRL latched, below) is NOT gated by this.
+                            if self.last_srl_keep_latched_sig != Some(srl_sig.0) {
+                                self.last_srl_keep_latched_sig = Some(srl_sig.0);
+                                tracing::warn!(
+                                    target: "state_detection",
+                                    agent = %self.instance_name,
+                                    tag = "#2086-srl-keep-latched",
+                                    path = "working_state_below",
+                                    backend = %self.backend_name,
+                                    working_marker = %marker,
+                                    masked_working_state = ?win_state,
+                                    recovered_within = recovered,
+                                    productive_silent_secs,
+                                    dist_from_bottom,
+                                    "ServerRateLimit KEPT latched — a working marker below the error with NO recent productive output is a stuck-retry spinner, not recovery (was swallowed pre-#2086)"
+                                );
+                            }
                         }
                     }
                     // Path B: NO working marker below, but the
@@ -1925,22 +1970,30 @@ impl StateTracker {
             let would_latch = matches!(landed, AgentState::ServerRateLimit);
             let recovered_now = self.recovered_within(SERVER_RATE_LIMIT_RECOVERY_SILENCE);
             if would_latch && !recovered_now && (self.srl_consecutive_rematch > 0 || cross_cycle) {
-                let kind = if cross_cycle {
-                    "cross_cycle_refire"
-                } else {
-                    "consecutive_rematch"
-                };
-                tracing::warn!(
-                    target: "state_detection",
-                    agent = %self.instance_name,
-                    tag = "#1808-probe0-phantom",
-                    kind,
-                    consecutive_rematch = self.srl_consecutive_rematch,
-                    cross_cycle_refire = cross_cycle,
-                    dist_from_bottom = sig.1,
-                    productive_silent_secs = self.productive_silence().as_secs(),
-                    "phantom re-match: same stale ServerRateLimit error re-detected (would latch → inject) with no recent productive output"
-                );
+                // #1808 dedup: an in-place static SRL keeps the same `sig` while a
+                // clock-tick redraw flips the screen hash → this WARN would re-fire
+                // every feed for the whole throttle (per-tick flood). Emit only on
+                // a signature transition. The #1809 cross-cycle→Idle behavioral fix
+                // below is intentionally OUTSIDE this dedup.
+                if self.last_srl_phantom_warn_sig != Some(sig.0) {
+                    self.last_srl_phantom_warn_sig = Some(sig.0);
+                    let kind = if cross_cycle {
+                        "cross_cycle_refire"
+                    } else {
+                        "consecutive_rematch"
+                    };
+                    tracing::warn!(
+                        target: "state_detection",
+                        agent = %self.instance_name,
+                        tag = "#1808-probe0-phantom",
+                        kind,
+                        consecutive_rematch = self.srl_consecutive_rematch,
+                        cross_cycle_refire = cross_cycle,
+                        dist_from_bottom = sig.1,
+                        productive_silent_secs = self.productive_silence().as_secs(),
+                        "phantom re-match: same stale ServerRateLimit error re-detected (would latch → inject) with no recent productive output"
+                    );
+                }
                 // #1809 fix (behavioral): a CROSS-CYCLE phantom — the agent
                 // already LEFT ServerRateLimit (passed through a non-SRL landed
                 // state) and the SAME stale error line (`same_sig`) was re-grabbed
@@ -2097,12 +2150,25 @@ impl StateTracker {
     ///   no throttle phrase is present, which is the overwhelming common case.
     /// - **Low-noise** — fires only on phrase-present + classified-non-retryable
     ///   + phrase-in-live-tail (a scrolled-up scrollback echo is ignored).
-    fn capture_unclassified_throttle(&self, screen_text: &str, fg: &[CellFg]) {
+    fn capture_unclassified_throttle(&mut self, screen_text: &str, fg: &[CellFg]) {
         let Some((raw_tail, wrap_split)) =
             unclassified_throttle_tail(self.current, screen_text, fg)
         else {
+            // Left the throttle-miss shape — drop the latch so a later recurrence
+            // of the same screen logs once again (#2100/#2115).
+            self.last_unclassified_throttle_sig = None;
             return;
         };
+        // #2100/#2115 fire-once latch: `apply_hash_dedup_gate` bypasses the
+        // feed-level screen hash-dedup for throttle-hint screens, so a STATIC
+        // unclassified-throttle pane would otherwise append a record (and re-fire
+        // the WARN below) on every PTY read. Key on the colored tail — stable
+        // across the cursor/clock re-renders that flip the full-screen hash.
+        let sig = hash_screen(&raw_tail);
+        if self.last_unclassified_throttle_sig == Some(sig) {
+            return;
+        }
+        self.last_unclassified_throttle_sig = Some(sig);
         // #1808 Phase-1 upstream instrument: a server-throttle phrase is on a
         // LIVE non-retryable screen — the detection miss that left agents stuck.
         // When `wrap_split` (phrase matched only after whitespace-flatten), the
@@ -2112,7 +2178,10 @@ impl StateTracker {
         // building the Phase 2 fallback. Contiguous misses (wrap_split=false) are
         // the already-understood prose-FP class (correctly suppressed by the
         // line-scoped content anchor) → kept to the JSONL sidecar only, no WARN
-        // noise. The feed-level screen hash-dedup bounds this to once per screen.
+        // noise. Both this WARN and the append are bounded to once per distinct
+        // screen by the `last_unclassified_throttle_sig` latch above — the
+        // feed-level hash-dedup does NOT bound it (it is bypassed for throttle
+        // screens, and a spinner/clock tick would churn the screen hash; #2115).
         if wrap_split {
             let escaped = screen_text.escape_debug().to_string();
             tracing::warn!(
