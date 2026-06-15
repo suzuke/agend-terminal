@@ -25,15 +25,19 @@ fn token_cost_comment_does_not_claim_max_per_file_verify_claim_cost() {
     let text = std::fs::read_to_string(&path).expect("read src/token_cost.rs");
 
     // Stale phrasings describing the ABANDONED MAX strategy. The real code sums
-    // per-turn deltas, so these must not survive.
-    let stale_phrases = ["MAX per file", "is taken, never summed"];
-
+    // per-turn deltas, so these must not survive. Match VARIANTS, not fixed
+    // strings: the module header said "MAX per file" / "is taken, never summed",
+    // the Codex section header said "MAX (final total) per file" / "never a sum".
+    // Co-occurrence (`MAX` + `per file`) and a `never …sum(med)` check catch both
+    // — a fixed-substring list previously false-GREENed on the section-header
+    // variant (#2206 r6).
     let mut hits = Vec::new();
     for (i, line) in text.lines().enumerate() {
-        for phrase in &stale_phrases {
-            if line.contains(phrase) {
-                hits.push(format!("{}:{}: {}", path.display(), i + 1, line.trim()));
-            }
+        let stale_max = line.contains("MAX") && line.contains("per file");
+        let stale_never_sum =
+            line.contains("never") && (line.contains("a sum") || line.contains("summed"));
+        if stale_max || stale_never_sum {
+            hits.push(format!("{}:{}: {}", path.display(), i + 1, line.trim()));
         }
     }
 

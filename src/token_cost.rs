@@ -547,10 +547,12 @@ fn read_file_tail(path: &Path, max_bytes: u64) -> Option<String> {
 //
 // Source: `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`. Each session file
 // carries a `session_meta` line with `payload.cwd` (attribution), `turn_context`
-// lines with `payload.model`, and `event_msg`/`token_count` lines with
-// `payload.info.total_token_usage` — which is SESSION-CUMULATIVE, so we take
-// the MAX (final total) per file, never a sum. Verified against real files
-// 2026-05-29: `total_tokens == input_tokens + output_tokens`,
+// lines with `payload.model`, and `event_msg`/`token_count` lines whose
+// `payload.info` carries both `total_token_usage` (session-cumulative) and
+// `last_token_usage` (the per-turn DELTA). `parse_codex_rows` emits one Row per
+// `token_count` line from the per-turn delta and SUMS them — Σdelta reconciles to
+// the cumulative total (see `codex_delta_sum_equals_cumulative`). Verified against
+// real files 2026-05-29: `total_tokens == input_tokens + output_tokens`,
 // `cached_input_tokens ⊆ input_tokens`, `reasoning_output_tokens ⊆ output_tokens`.
 
 /// `~/.codex/sessions` — the Codex rollout root.
