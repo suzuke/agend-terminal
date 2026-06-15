@@ -272,6 +272,34 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
         env_for_spawn,
     ) {
         Ok(_spawn_mode) => {
+            // fresh-restart self-kick: fire the first-turn recovery inject ONLY when
+            // the caller (restart_spawn_params, mode=fresh) explicitly armed this
+            // INDEPENDENT flag. NEVER derived from spawn_mode — a missing/garbled
+            // flag yields `false` (fail-safe: no inject), and initial fleet spawns /
+            // create_instance / team-spawn (which also map to SpawnMode::Fresh but
+            // never set this flag) are correctly excluded. The bootstrap thread
+            // polls the new session to Idle before injecting, so an early fire here
+            // is harmless.
+            if params["self_kick_on_ready"].as_bool().unwrap_or(false) {
+                if let Some(id) = crate::fleet::resolve_uuid(ctx.home, name) {
+                    let ready_timeout = crate::backend::Backend::from_command(command)
+                        .map(|b| b.preset().ready_timeout_secs)
+                        .unwrap_or(30)
+                        .saturating_add(15);
+                    agent::spawn_self_kick_bootstrap(
+                        std::sync::Arc::clone(ctx.registry),
+                        id,
+                        name.to_string(),
+                        std::time::Duration::from_secs(ready_timeout),
+                        None,
+                    );
+                } else {
+                    tracing::warn!(
+                        agent = name,
+                        "self_kick_on_ready set but instance UUID unresolved — skipping self-kick"
+                    );
+                }
+            }
             // #991: skip topic creation when caller opts out.
             let topic_binding = params["topic_binding"].as_str().unwrap_or("auto");
             let topic_id = if matches!(topic_binding, "skip" | "deferred") {

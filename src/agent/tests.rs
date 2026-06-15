@@ -126,6 +126,53 @@ fn daemon_auto_prefix_embeds_kind_1769() {
     assert!(s.ends_with('\n'), "submit newline preserved");
 }
 
+/// fresh-restart self-kick: the `[AGEND-RESUME]` marker is DISTINCT from the
+/// never-act `[AGEND-AUTO]` marker — two separate tokens, neither a prefix of the
+/// other (so an agent can't confuse a self-bootstrap trigger with a resume nudge).
+#[test]
+fn resume_marker_distinct_from_auto_marker() {
+    assert_eq!(super::DAEMON_RESUME_INJECT_MARKER, "[AGEND-RESUME]");
+    assert_ne!(
+        super::DAEMON_RESUME_INJECT_MARKER,
+        super::DAEMON_AUTO_INJECT_MARKER
+    );
+    assert!(!super::DAEMON_RESUME_INJECT_MARKER.starts_with(super::DAEMON_AUTO_INJECT_MARKER));
+    assert!(!super::DAEMON_AUTO_INJECT_MARKER.starts_with(super::DAEMON_RESUME_INJECT_MARKER));
+}
+
+/// fresh-restart self-kick prompt (must-follows ①+③): an actionable
+/// `[AGEND-RESUME]` self-bootstrap; the task board + `list_instances` are named as
+/// the AUTHORITATIVE live sources BEFORE the stale-tolerant `SESSION-HANDOFF.md`
+/// hint; and it is explicitly bounded — recover-your-own-state, NOT an operator
+/// command / dispatch authority.
+#[test]
+fn fresh_restart_self_kick_prompt_shape() {
+    let p = super::fresh_restart_self_kick_prompt();
+    assert!(
+        p.starts_with(super::DAEMON_RESUME_INJECT_MARKER),
+        "prompt must carry the [AGEND-RESUME] marker"
+    );
+    // must-follow ③: authoritative live sources named BEFORE the handoff hint.
+    let board = p.find("task board").expect("names the task board");
+    let list = p.find("list_instances").expect("names list_instances");
+    let handoff = p.find("SESSION-HANDOFF").expect("names SESSION-HANDOFF");
+    assert!(
+        board < handoff && list < handoff,
+        "task board + list_instances must precede the SESSION-HANDOFF hint (authoritative-first)"
+    );
+    assert!(
+        p.contains("STALE-TOLERANT") || p.contains("stale-tolerant"),
+        "SESSION-HANDOFF must be framed as a stale-tolerant hint"
+    );
+    // must-follow ①: actionable self-bootstrap, NOT operator authority.
+    assert!(
+        p.contains("YOUR OWN state"),
+        "scoped to the agent's own state"
+    );
+    assert!(p.contains("NOT an operator command"));
+    assert!(p.contains("NOT authority to dispatch"));
+}
+
 #[test]
 fn strip_ansi_cursor_move_no_space() {
     // CSI C (cursor forward) and D (cursor back) must not insert spaces
