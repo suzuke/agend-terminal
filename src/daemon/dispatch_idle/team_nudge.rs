@@ -294,6 +294,7 @@ mod tests {
             refresh_count: 0,
             long_running_escalated: false,
             reported_at: None,
+            quota_escalated: false,
             // Exceeded LONG enough ago that the #2031 second escalation window has
             // elapsed — so these mechanics tests (dedup / targeting / multiteam /
             // correlation) still see the nudge fire. The window-timing itself is
@@ -365,6 +366,7 @@ mod tests {
             refresh_count: 0,
             long_running_escalated: false,
             reported_at: None,
+            quota_escalated: false,
             exceeded_at,
         };
         std::fs::write(
@@ -613,6 +615,7 @@ mod tests {
             refresh_count: 0,
             long_running_escalated: false,
             reported_at: None,
+            quota_escalated: false,
             exceeded_at: None,
         };
         let path = pending_path(&home, &id);
@@ -753,6 +756,7 @@ mod tests {
             refresh_count: 0,
             long_running_escalated: false,
             reported_at: None,
+            quota_escalated: false,
             // Exceeded LONG enough ago that the #2031 second escalation window has
             // elapsed — so these mechanics tests (dedup / targeting / multiteam /
             // correlation) still see the nudge fire. The window-timing itself is
