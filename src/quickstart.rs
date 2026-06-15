@@ -530,15 +530,15 @@ fn verify_bot_is_admin(token: &str, chat_id: i64) -> anyhow::Result<bool> {
         .enable_all()
         .build()?;
     rt.block_on(async {
-        let me_url = format!("https://api.telegram.org/bot{token}/getMe");
-        let me: serde_json::Value = reqwest::get(&me_url).await?.json().await?;
+        let me = bot_api_get(token, "getMe").await?;
         let bot_id = me["result"]["id"].as_i64().ok_or_else(|| {
             anyhow::anyhow!("getMe response missing result.id — cannot resolve bot user_id")
         })?;
-        let url = format!(
-            "https://api.telegram.org/bot{token}/getChatMember?chat_id={chat_id}&user_id={bot_id}"
-        );
-        let resp: serde_json::Value = reqwest::get(&url).await?.json().await?;
+        let resp = bot_api_get(
+            token,
+            &format!("getChatMember?chat_id={chat_id}&user_id={bot_id}"),
+        )
+        .await?;
         if resp["ok"].as_bool() != Some(true) {
             anyhow::bail!(
                 "getChatMember failed: {}",
@@ -557,6 +557,32 @@ fn verify_bot_is_admin(token: &str, chat_id: i64) -> anyhow::Result<bool> {
 /// other status (member / restricted / left / kicked) is non-admin.
 fn is_bot_admin_status(status: &str) -> bool {
     matches!(status, "administrator" | "creator")
+}
+
+/// Telegram Bot API host. Kept as a const, SEPARATE from the `/bot<token>/…`
+/// path, so the token interpolation lives in exactly ONE place ([`bot_api_get`])
+/// instead of being spelled out at every call site.
+const TELEGRAM_API: &str = "https://api.telegram.org";
+
+/// GET a Telegram Bot API method and parse the JSON body.
+///
+/// SECURITY (CR-2026-06-14): the bot token is part of the Bot API URL path
+/// (Telegram has no header auth, unlike the daemon's GitHub path). reqwest's
+/// `Error` `Display` echoes the full request URL on a transport failure and
+/// redacts only userinfo, NOT path segments — so a bare `reqwest::get(&url)`
+/// whose error is printed (`println!("{e}")`) leaks the token to the terminal /
+/// logs / pasted bug reports on ANY network error. We strip the URL from every
+/// error with [`reqwest::Error::without_url`] BEFORE it propagates, so the token
+/// never reaches a surfaced message. Centralising the four call sites here is
+/// what removes the inline `bot<token>` URL templates.
+async fn bot_api_get(token: &str, method: &str) -> anyhow::Result<serde_json::Value> {
+    let url = format!("{TELEGRAM_API}/bot{token}/{method}");
+    let resp = reqwest::get(&url).await.map_err(|e| e.without_url())?;
+    let json = resp
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| e.without_url())?;
+    Ok(json)
 }
 
 fn mask_token(tok: &str) -> String {
@@ -588,8 +614,7 @@ fn verify_bot(token: &str) -> anyhow::Result<String> {
         .enable_all()
         .build()?;
     rt.block_on(async {
-        let url = format!("https://api.telegram.org/bot{token}/getMe");
-        let resp: serde_json::Value = reqwest::get(&url).await?.json().await?;
+        let resp = bot_api_get(token, "getMe").await?;
         if resp["ok"].as_bool() == Some(true) {
             let username = resp["result"]["username"].as_str().unwrap_or("unknown");
             Ok(username.to_string())
@@ -634,8 +659,11 @@ fn detect_group(token: &str) -> anyhow::Result<(i64, String)> {
         .enable_all()
         .build()?;
     rt.block_on(async {
-        let url = format!("https://api.telegram.org/bot{token}/getUpdates?timeout=180&allowed_updates=[\"message\"]");
-        let resp: serde_json::Value = reqwest::get(&url).await?.json().await?;
+        let resp = bot_api_get(
+            token,
+            "getUpdates?timeout=180&allowed_updates=[\"message\"]",
+        )
+        .await?;
         if let Some(updates) = resp["result"].as_array() {
             for update in updates {
                 if let Some(chat) = update.get("message").and_then(|m| m.get("chat")) {

@@ -32,7 +32,6 @@
 use std::path::PathBuf;
 
 #[test]
-#[ignore = "quickstart-token-url-leak: red until fix; remove #[ignore] after fix to confirm"]
 fn quickstart_does_not_embed_bot_token_in_telegram_url_xcut_security() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/quickstart.rs");
     let text = std::fs::read_to_string(&path).expect("read src/quickstart.rs");
