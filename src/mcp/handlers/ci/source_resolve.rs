@@ -108,15 +108,27 @@ mod tests {
     /// Legit arm preserved: an ABSOLUTE, existing, non-system path still resolves
     /// to (pre-canonical string, canonical PathBuf) — the fix only rejects the
     /// non-absolute agent-name MISS, not absolute callers.
+    ///
+    /// `#[cfg(unix)]`: the absolute arm is `/`-prefixed (Unix semantics); a Windows
+    /// drive path (`C:`-rooted) is not `/`-absolute, so the helper routes it through
+    /// the agent-name arm — the `/`-absolute path is a Unix-only contract. The input
+    /// is canonicalized FIRST so symlink resolution on CI (e.g. macOS `/var` →
+    /// `/private/var`) can't skew a literal-string comparison (cf. #2226/#2231
+    /// cross-platform test fragility — compare canonicalized forms, not raw strings).
+    #[cfg(unix)]
     #[test]
     fn absolute_existing_path_still_resolves_2158() {
-        let home = std::env::temp_dir();
-        let abs = home.display().to_string();
-        let (src_path, canonical) = resolve_checkout_source_path(&home, &abs)
+        let abs = std::env::temp_dir()
+            .canonicalize()
+            .expect("temp dir canonicalizes");
+        let abs_str = abs.display().to_string();
+        let (src_path, canonical) = resolve_checkout_source_path(&abs, &abs_str)
             .expect("absolute existing path must still resolve (legit arm preserved)");
         assert!(canonical.is_absolute());
+        // Both sides are already canonical → no /var-vs-/private/var skew.
+        assert_eq!(canonical, abs, "canonical resolves to the same real dir");
         assert_eq!(
-            src_path, abs,
+            src_path, abs_str,
             "pre-canonical source string preserved for the caller"
         );
     }
