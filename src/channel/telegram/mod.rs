@@ -16,6 +16,7 @@ pub(crate) mod bootstrap;
 pub(crate) mod bot_api;
 pub(crate) mod creds;
 pub(crate) mod notify;
+pub(crate) mod poll_supervisor;
 pub(crate) mod reply;
 pub(crate) mod ux_sink;
 

@@ -6,17 +6,28 @@ use teloxide::prelude::*;
 use teloxide::types::{MessageId, ThreadId};
 
 use super::error::cleanup_deleted_topic;
+use super::poll_supervisor;
 use super::state::{lock_state, TelegramState};
 use super::topic_registry::load_topic_registry;
 
 /// Start Telegram polling in a dedicated thread with its own tokio runtime.
-/// Supervisor loop: auto-restarts on error/panic with 5s backoff.
+///
+/// Supervisor loop (#2200): drives teloxide's `try_dispatch_with_listener`,
+/// which RETURNS the initial `get_me` error instead of panicking like
+/// `dispatch()` (`.expect("Couldn't prepare dispatching context")`). A cold
+/// `api.telegram.org` therefore yields an `Err` we handle with exponential
+/// backoff (5s → cap 60s) + a degraded latch + fire-once logging, instead of a
+/// fixed-5s panic-backtrace flood that washed the TUI. A definitively-bad token
+/// stops the loop. `catch_unwind` is retained as belt-and-suspenders for
+/// teloxide's OTHER internal `.expect()`s (worker-join / TX), which are not on
+/// the network path and should now ~never fire.
 pub fn start_polling(state: Arc<Mutex<TelegramState>>) {
     // fire-and-forget: telegram supervisor thread runs for the daemon's lifetime.
     if let Err(e) = std::thread::Builder::new()
         .name("telegram".into())
         .spawn(move || {
             let _census = crate::thread_census::register("telegram_poll");
+            let mut health = poll_supervisor::PollingHealth::default();
             loop {
                 tracing::info!("telegram dispatcher starting");
                 let state_clone = Arc::clone(&state);
@@ -26,36 +37,98 @@ pub fn start_polling(state: Arc<Mutex<TelegramState>>) {
                         .build()
                     else {
                         tracing::error!("failed to build tokio runtime");
-                        return;
+                        // Treat as a benign transient exit so the loop backs off
+                        // rather than spinning on a runtime-build failure.
+                        return Ok(());
                     };
-                    rt.block_on(async {
-                        let bot = lock_state(&state_clone)
-                            .bot
-                            .clone()
-                            .expect("telegram bot not initialized (polling thread)");
-                        let state2 = Arc::clone(&state_clone);
-                        let handler =
-                            Update::filter_message().endpoint(move |_bot: Bot, msg: Message| {
-                                let state = Arc::clone(&state2);
-                                async move {
-                                    handle_message(&state, &msg).await;
-                                    respond(())
-                                }
-                            });
-                        tracing::info!("polling started");
-                        Dispatcher::builder(bot, handler).build().dispatch().await;
-                    });
+                    rt.block_on(drive_dispatch_once(&state_clone))
                 }));
-                match result {
-                    Ok(()) => tracing::warn!("telegram dispatcher exited, restarting in 5s"),
-                    Err(_) => tracing::error!("telegram dispatcher panicked, restarting in 5s"),
+
+                // Normalize the attempt into success / classified-failure. An
+                // outer `Err` is a teloxide-internal panic NOT on the get_me path
+                // (rare) — treat as transient; the panic hook already logged it.
+                let attempt = match result {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(e)) => Err((poll_supervisor::classify_connect_error(&e), e.to_string())),
+                    Err(_) => Err((
+                        poll_supervisor::ConnectErrorClass::Transient,
+                        "dispatcher panicked (caught)".to_string(),
+                    )),
+                };
+
+                match attempt {
+                    Ok(()) => {
+                        // get_me succeeded; the dispatcher ran and exited (stream
+                        // end / shutdown). Reset backoff; log recovery once.
+                        if health.on_success() {
+                            tracing::info!("telegram channel recovered");
+                        }
+                        std::thread::sleep(poll_supervisor::POLL_BACKOFF_BASE);
+                    }
+                    Err((class, detail)) => match health.on_failure(class) {
+                        poll_supervisor::FailureOutcome::Stop => {
+                            tracing::error!(
+                                detail = %detail,
+                                "telegram bot token invalid/unauthorized — stopping polling (no retry)"
+                            );
+                            break;
+                        }
+                        poll_supervisor::FailureOutcome::Retry { delay, log } => {
+                            match log {
+                                poll_supervisor::FailureLog::FirstWarn => tracing::warn!(
+                                    detail = %detail,
+                                    backoff_secs = delay.as_secs(),
+                                    "telegram polling failed — retrying with backoff"
+                                ),
+                                poll_supervisor::FailureLog::DegradedEntered => tracing::info!(
+                                    consecutive_failures = poll_supervisor::POLL_DEGRADE_AFTER,
+                                    "telegram channel degraded (offline) — retries continue silently until recovery"
+                                ),
+                                poll_supervisor::FailureLog::Silent => {}
+                            }
+                            std::thread::sleep(delay);
+                        }
+                    },
                 }
-                std::thread::sleep(std::time::Duration::from_secs(5));
             }
         })
     {
         tracing::error!(error = %e, "failed to spawn polling thread");
     }
+}
+
+/// One dispatch attempt. Builds a poll-only `Polling` listener (no
+/// `delete_webhook` pre-flight — agend never sets a webhook, so skipping it
+/// avoids an extra per-cycle network call + its error log) and drives
+/// `try_dispatch_with_listener`, which returns the initial `get_me` error as
+/// `Err` instead of panicking (#2200). `Ok(())` means the connection succeeded
+/// and the dispatcher later exited normally.
+async fn drive_dispatch_once(
+    state: &Arc<Mutex<TelegramState>>,
+) -> Result<(), teloxide::RequestError> {
+    let bot = lock_state(state)
+        .bot
+        .clone()
+        .expect("telegram bot not initialized (polling thread)");
+    let state2 = Arc::clone(state);
+    let handler = Update::filter_message().endpoint(move |_bot: Bot, msg: Message| {
+        let state = Arc::clone(&state2);
+        async move {
+            handle_message(&state, &msg).await;
+            respond(())
+        }
+    });
+    let listener = teloxide::update_listeners::Polling::builder(bot.clone())
+        .timeout(std::time::Duration::from_secs(10))
+        .build();
+    let err_handler = teloxide::error_handlers::LoggingErrorHandler::with_custom_text(
+        "telegram update listener error",
+    );
+    tracing::info!("polling started");
+    Dispatcher::builder(bot, handler)
+        .build()
+        .try_dispatch_with_listener(listener, err_handler)
+        .await
 }
 
 /// Resolve a topic_id to an instance name.
