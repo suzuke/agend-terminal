@@ -705,3 +705,86 @@ fixtures:
     expected_final_detect: rate_limit
     capture_kind: synthetic_from_docs
     provenance: "t-coloranchor-corpus-gate — synthetic from the verified codex stream-error shape + OpenAI rate_limit_exceeded code"
+
+  # ── #1523 #1470-1: case-insensitive net-error matching ──────────────────
+  # The shared SERVER_RATE_LIMIT_NET_ERRORS const is now compiled `(?i:…)` so a
+  # backend's real casing of a net-error phrase ("Connection reset by peer",
+  # capital C) matches the lowercased `connection reset` token it previously
+  # missed. These fixtures pin BOTH directions of the iron rule: the phrase on a
+  # real error line MUST latch SRL (positive), and the same phrase in prose must
+  # NOT (negatives, the FP guard the content anchor provides).
+
+  - file: claude-net-connection-reset.raw
+    backend: claude-code
+    cli_version: "2.1.98"
+    recorded_on: "2026-06-15"
+    scenario: |
+      #1470-1 positive: a red `API Error: Connection reset by peer` line — the
+      real libc/Node phrasing with a capital `C`. The net-error token in the
+      shared const is lowercase `connection reset`; pre-#1470-1 the const was
+      compiled case-SENSITIVELY so this MISSED (the agent read Idle while the
+      socket was actually dropped). With the `(?i:…)` fold it now latches
+      ServerRateLimit. Deliberately carries NO `ECONNRESET` (which would match
+      case-sensitively anyway) so the fixture isolates the case-fold fix.
+    expected_transitions: [starting, server_rate_limit]
+    expected_final_state: server_rate_limit
+    expected_final_detect: server_rate_limit
+    capture_kind: synthetic_from_docs
+    provenance: "#1470-1 — synthetic from the canonical 'Connection reset by peer' net-error phrasing"
+
+  - file: claude-net-error-discussion-text.raw
+    backend: claude-code
+    cli_version: "2.1.98"
+    recorded_on: "2026-06-15"
+    scenario: |
+      #1470-1 iron-rule negative (claude): an agent DISCUSSING the
+      "Connection reset by peer" phrase in prose must NOT latch ServerRateLimit
+      as its STATE. NOTE the split: the raw `detect()` pattern is broad by design
+      and DOES match the net-error token in the prose (expected_final_detect =
+      server_rate_limit) — but the live `feed()` path keeps the STATE out of SRL
+      via the #1518 live-bottom-N position gate + the content anchor (the phrase
+      is prose, not on an error-shaped error line), so the tracker never
+      transitions into ServerRateLimit (final_state stays `starting`, like the
+      kiro-discussion-text precedent). That suppression IS the FP guard the
+      case-insensitive fold relies on; this fixture pins it. Contract: the STATE
+      must never become server_rate_limit on discussion prose.
+    expected_transitions: [starting]
+    expected_final_state: starting
+    expected_final_detect: server_rate_limit
+    capture_kind: synthetic
+    provenance: "#1470-1 regression-proof — prose mentioning the net-error phrase; raw detect matches (broad pattern) but feed gates keep STATE out of SRL"
+
+  - file: codex-discussion-text.raw
+    backend: codex
+    cli_version: "0.135.0"
+    recorded_on: "2026-06-15"
+    scenario: |
+      #1470-1 iron-rule negative (codex) + fills the codex discussion-text
+      coverage gap. codex shares the SERVER_RATE_LIMIT_NET_ERRORS const, so the
+      case-fold loosening applies here too. Same split as the claude negative:
+      raw `detect()` matches the broad net-error token in prose
+      (expected_final_detect = server_rate_limit), but `feed()`'s position +
+      content gates keep the STATE out of SRL (final_state stays `starting`).
+      Contract: discussion prose must never make the STATE server_rate_limit.
+    expected_transitions: [starting]
+    expected_final_state: starting
+    expected_final_detect: server_rate_limit
+    capture_kind: synthetic
+    provenance: "#1470-1 regression-proof — codex prose mentioning net-error phrasing; raw detect matches but feed gates keep STATE out of SRL"
+
+  - file: agy-discussion-text.raw
+    backend: agy
+    cli_version: "0.1.0"
+    recorded_on: "2026-06-15"
+    scenario: |
+      #1470-1 iron-rule negative (agy) + fills the agy discussion-text coverage
+      gap. NOTE: agy has no ServerRateLimit / net-error pattern (it does not use
+      the shared const), so the #1470-1 fold cannot affect agy — this fixture is
+      general anti-FP coverage: prose mentioning `connection reset by peer` /
+      `rate limit` must keep agy Idle. Lands Idle on the `Type your message` /
+      `? for shortcuts` chrome.
+    expected_transitions: [starting, idle]
+    expected_final_state: idle
+    expected_final_detect: idle
+    capture_kind: synthetic
+    provenance: "#1470-1 regression-proof — agy prose mentioning net-error / rate-limit phrasing, expected Idle"

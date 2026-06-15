@@ -1,0 +1,6 @@
+[2J[H[0mInvestigating #1470-1: the classifier used to miss the phrase Connection reset by peer
+because the net-error regex compared connection reset case-sensitively. The fix folds
+case so the same token matches; this discussion text mentions connection reset by peer
+in prose only and must stay Idle (this is normal conversation, not a backend fault).
+
+❯ 

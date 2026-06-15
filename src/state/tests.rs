@@ -2648,6 +2648,44 @@ fn claude_overloaded_529_fixture_triggers_server_rate_limit() {
     assert_eq!(t.get_state(), AgentState::ServerRateLimit);
 }
 
+/// #1523 #1470-1: the real net-error phrasing "Connection reset by peer"
+/// (capital `C`) must classify as ServerRateLimit. The shared
+/// SERVER_RATE_LIMIT_NET_ERRORS const carries the lowercase `connection reset`
+/// token; pre-#1470-1 it was compiled case-SENSITIVELY, so the capitalised
+/// real wording silently MISSED (agent read Idle while the socket dropped).
+/// The `(?i:…)` fold rescues it. The fixture deliberately carries NO
+/// `ECONNRESET` (which would have matched case-sensitively anyway), so this
+/// test isolates the case-fold: mutating the const back to a bare alternation
+/// (drop the `(?i:…)`) flips this RED.
+#[test]
+fn claude_connection_reset_capital_c_triggers_server_rate_limit_1470() {
+    let bytes = std::fs::read("tests/fixtures/state-replay/claude-net-connection-reset.raw")
+        .expect("read fixture");
+    let text = String::from_utf8_lossy(&bytes);
+    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+    t.feed(&text);
+    assert_eq!(t.get_state(), AgentState::ServerRateLimit);
+}
+
+/// #1523 #1470-1 iron-rule (unit form): the case-fold must NOT widen what
+/// counts as the token. A bare prose line that merely MENTIONS
+/// "Connection reset by peer" — with no error-line shape — must NOT classify
+/// as ServerRateLimit. (The broad raw pattern matches the substring; the
+/// `in_error_line_excluding_input` content anchor is what suppresses it —
+/// `detect()` alone would match, `feed()`'s gate is the guard.)
+#[test]
+fn connection_reset_in_prose_line_is_not_server_rate_limit_1470() {
+    let patterns = StatePatterns::for_backend(&Backend::ClaudeCode);
+    let prose = "We hit Connection reset by peer while testing the retry path yesterday.";
+    // Raw detect matches the broad token …
+    assert_eq!(patterns.detect(prose), Some(AgentState::ServerRateLimit));
+    // … but the content anchor rejects it (no error-line shape on the line).
+    assert!(
+        !crate::state::patterns::in_error_line_excluding_input(prose, "Connection reset", &["❯"]),
+        "#1470-1: a bare prose mention must not satisfy the error-line content anchor"
+    );
+}
+
 /// Fixture-based UsageLimit detection across backends — each fixture
 /// must classify as UsageLimit (patterns added by #848).
 #[test]
