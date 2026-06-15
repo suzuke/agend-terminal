@@ -51,7 +51,7 @@ pub(super) fn install(home: &Path, exe: &Path) -> Result<PathBuf, String> {
     if let Some(parent) = plist.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create_dir_all {parent:?}: {e}"))?;
     }
-    std::fs::write(&plist, resolved.as_bytes())
+    crate::store::atomic_write(&plist, resolved.as_bytes())
         .map_err(|e| format!("write plist {plist:?}: {e}"))?;
 
     // Idempotent register: unload first (no-op if not loaded), then load.

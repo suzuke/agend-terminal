@@ -60,7 +60,8 @@ pub(super) fn install(home: &Path, exe: &Path) -> Result<PathBuf, String> {
     for unit in utf16 {
         bytes.extend_from_slice(&unit.to_le_bytes());
     }
-    std::fs::write(&xml_path, &bytes).map_err(|e| format!("write task xml {xml_path:?}: {e}"))?;
+    crate::store::atomic_write(&xml_path, &bytes)
+        .map_err(|e| format!("write task xml {xml_path:?}: {e}"))?;
 
     // Idempotent register: schtasks /Create /F overwrites any existing
     // task with the same name, so no separate delete-first step is

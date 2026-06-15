@@ -24,7 +24,6 @@ use std::path::PathBuf;
 const NEEDLE: &str = "let _ = save_topic_registry(";
 
 #[test]
-#[ignore = "telegram-topic-registry-dropped: red until fix; remove #[ignore] after fix to confirm"]
 fn fleet_binding_topic_persist_result_not_dropped_panic_io_extra() {
     let file = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/channel/telegram/bootstrap.rs");
     let text = std::fs::read_to_string(&file).expect("read src/channel/telegram/bootstrap.rs");

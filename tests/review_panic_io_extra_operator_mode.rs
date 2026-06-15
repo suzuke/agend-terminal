@@ -24,7 +24,6 @@ use std::path::PathBuf;
 const NEEDLE: &str = "std::fs::write(path(home), &json)";
 
 #[test]
-#[ignore = "operator_mode-nonatomic-gate: red until fix; remove #[ignore] after fix to confirm"]
 fn operator_mode_data_write_is_atomic_panic_io_extra() {
     let file = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/operator_mode.rs");
     let text = std::fs::read_to_string(&file).expect("read src/operator_mode.rs");

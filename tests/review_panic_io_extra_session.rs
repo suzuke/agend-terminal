@@ -24,7 +24,6 @@ use std::path::PathBuf;
 const NEEDLE: &str = "std::fs::write(&path, &json)";
 
 #[test]
-#[ignore = "session-json-nonatomic: red until fix; remove #[ignore] after fix to confirm"]
 fn session_json_data_write_is_atomic_panic_io_extra() {
     let file = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/app/session.rs");
     let text = std::fs::read_to_string(&file).expect("read src/app/session.rs");

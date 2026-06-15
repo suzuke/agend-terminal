@@ -193,6 +193,16 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     }
     std::fs::rename(&tmp, path)?;
     guard.disarm();
+    // Durability: fsync the parent directory after the rename so the new
+    // directory entry is flushed. The temp file's contents are already synced
+    // above, but a crash/power-loss after `rename(2)` returns yet before the
+    // directory entry reaches disk can lose the rename — defeating the
+    // "atomic AND durable replace" contract. Directory fsync is a Unix idiom;
+    // Windows has no clean equivalent in std, so it is skipped there.
+    #[cfg(unix)]
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
     Ok(())
 }
 

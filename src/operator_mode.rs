@@ -204,7 +204,7 @@ pub fn set_mode(
         delegate_scope,
     };
     let json = serde_json::to_string_pretty(&state).map_err(|e| e.to_string())?;
-    std::fs::write(path(home), &json).map_err(|e| e.to_string())?;
+    crate::store::atomic_write(&path(home), json.as_bytes()).map_err(|e| e.to_string())?;
     // #1576: sign so the next reload trusts only operator-written content.
     write_sidecar(home, json.as_bytes()).map_err(|e| e.to_string())?;
     *global().write() = state.clone();

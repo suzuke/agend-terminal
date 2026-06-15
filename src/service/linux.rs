@@ -47,7 +47,7 @@ pub(super) fn install(home: &Path, exe: &Path) -> Result<PathBuf, String> {
     if let Some(parent) = unit.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create_dir_all {parent:?}: {e}"))?;
     }
-    std::fs::write(&unit, resolved.as_bytes())
+    crate::store::atomic_write(&unit, resolved.as_bytes())
         .map_err(|e| format!("write systemd unit {unit:?}: {e}"))?;
 
     // Idempotent register: daemon-reload first (picks up our write),

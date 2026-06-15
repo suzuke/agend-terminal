@@ -214,7 +214,13 @@ pub(super) fn resolve_fleet_binding(
             let tid = topic.thread_id.0 .0;
             tracing::info!(topic_id = tid, %name, "created fleet_binding topic");
             reg.insert(tid, FLEET_BINDING_SENTINEL.to_string());
-            let _ = save_topic_registry(home, reg);
+            // Propagate the persist result (mirror the sibling call site above):
+            // if the write fails the in-memory registry has the new topic but
+            // disk does not, so a restart re-runs this slow path and
+            // create_forum_topic mints a DUPLICATE named topic.
+            if let Err(e) = save_topic_registry(home, reg) {
+                tracing::warn!(error = %e, %name, "failed to save fleet_binding topic registry");
+            }
             Some(tid)
         }
         Err(e) => {
