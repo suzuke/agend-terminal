@@ -419,6 +419,18 @@ pub(crate) fn handle_clear_blocked_reason(params: &Value, ctx: &HandlerCtx) -> V
                 .current_reason
                 .as_ref()
                 .map(|r| serde_json::to_value(r).unwrap_or_default());
+            // #2232: was the agent clearing a rate-limit / quota block? Captured
+            // BEFORE the clear below. An AGENT-initiated clear of such a block is
+            // ground-truth that it is awake and acted on the retry inject (the
+            // watchdog's heuristic auto-clear goes through `clear_blocked_reason`
+            // directly, NOT this MCP path, so it never trips the latch).
+            let was_rate_limit_block = matches!(
+                core.health.current_reason,
+                Some(
+                    crate::health::BlockedReason::RateLimit { .. }
+                        | crate::health::BlockedReason::QuotaExceeded
+                )
+            );
             // If a reason filter is specified, only clear if it matches
             if let Some(filter) = filter_reason {
                 let matches = core
@@ -431,6 +443,13 @@ pub(crate) fn handle_clear_blocked_reason(params: &Value, ctx: &HandlerCtx) -> V
                 }
             }
             core.health.clear_blocked_reason();
+            // #2232: latch the ground-truth recovery so the supervisor's next
+            // process_error_recovery tick drops the ServerRateLimit retry track —
+            // closing the gap where a pure-text fast reply never stamped
+            // `last_productive_output` so the `recovered_within` heuristic missed.
+            if was_rate_limit_block {
+                core.health.rate_limit_self_cleared = true;
+            }
             json!({"ok": true, "status": "cleared", "instance": name, "was": was})
         }
         None => json!({"ok": false, "error": format!("instance '{name}' not found")}),
@@ -662,6 +681,58 @@ mod tests {
         drop(reg);
 
         cleanup_agent(&ctx, "health-clear");
+    }
+
+    /// #2232: clearing a rate-limit/quota block via this MCP path sets the
+    /// `rate_limit_self_cleared` ground-truth latch the supervisor reads to drop
+    /// the ServerRateLimit retry track. Scoped (D3): only a RateLimit/QuotaExceeded
+    /// clear latches; an unrelated reason or a no-op clear does NOT.
+    #[test]
+    fn clear_rate_limit_block_sets_self_clear_latch_2232() {
+        let (ctx, _home) = test_ctx_with_agent("health-rl-latch");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let latch = |ctx: &HandlerCtx| {
+            let reg = agent::lock_registry(ctx.registry);
+            let h = reg
+                .values()
+                .find(|h| h.name.as_str() == "health-rl-latch")
+                .expect("agent exists");
+            let l = h.core.lock().health.rate_limit_self_cleared;
+            l
+        };
+
+        // (1) clearing with nothing blocked → ok no-op, NO latch (idempotent).
+        let r = handle_clear_blocked_reason(&json!({"name": "health-rl-latch"}), &ctx);
+        assert_eq!(r["ok"], true);
+        assert!(!latch(&ctx), "#2232: a no-op clear must not latch");
+
+        // (2) clearing a non-rate-limit reason → NO latch (scoped, D3).
+        handle_set_blocked_reason(
+            &json!({"name": "health-rl-latch", "reason": "awaiting_operator"}),
+            &ctx,
+        );
+        handle_clear_blocked_reason(&json!({"name": "health-rl-latch"}), &ctx);
+        assert!(
+            !latch(&ctx),
+            "#2232: clearing a non-rate-limit block must not latch"
+        );
+
+        // (3) clearing a RateLimit block → latch set (ground-truth recovery).
+        handle_set_blocked_reason(
+            &json!({"name": "health-rl-latch", "reason": "rate_limit", "retry_after_secs": 30}),
+            &ctx,
+        );
+        let r = handle_clear_blocked_reason(
+            &json!({"name": "health-rl-latch", "reason": "rate_limit"}),
+            &ctx,
+        );
+        assert_eq!(r["ok"], true);
+        assert!(
+            latch(&ctx),
+            "#2232: an agent self-clearing its RateLimit block must set the recovery latch"
+        );
+
+        cleanup_agent(&ctx, "health-rl-latch");
     }
 
     /// #1933 §3.9: the operator-readable `note` round-trips report → operator-

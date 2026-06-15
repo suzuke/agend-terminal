@@ -116,6 +116,17 @@ const RETRY_AFTER_INJECT_FAIL: Duration = Duration::from_secs(5);
 /// #1316: replaces the old `last_input_text` replay that caused
 /// infinite modal-keystroke loops.
 const CONTINUE_RETRY_PAYLOAD: &[u8] = b"continue\n";
+/// #2232: ServerRateLimit retry payload — `continue` plus a one-line instruction
+/// telling a now-awake agent to self-clear its rate-limit block (MCP
+/// `clear_blocked_reason` reason=rate_limit) so the daemon stops auto-retrying.
+/// That agent-initiated clear is the ground-truth recovery signal the supervisor
+/// latches on; LLM compliance isn't guaranteed, so a missed call gracefully
+/// degrades to the `recovered_within` / state-exit / 12-cap heuristics. ASCII,
+/// SINGLE line + one trailing "\n" (no embedded newline that would submit early).
+/// Kept SEPARATE from the shared `CONTINUE_RETRY_PAYLOAD` so the apierror-nudge
+/// wording is unchanged and the #1680 source-guard literal stays intact — same
+/// split rationale as `inject_channel_reply_missing_gated`.
+const RATELIMIT_RETRY_PAYLOAD: &[u8] = b"continue (if you can act on this you have recovered from a rate limit -- call the agend-terminal health MCP action clear_blocked_reason with reason=rate_limit to stop these auto-retries)\n";
 
 /// Per-agent notify tracking: last notify time + consecutive error count.
 pub(crate) struct NotifyTrack {
@@ -1728,6 +1739,45 @@ fn inject_continue_gated(
     }
 }
 
+/// #2232 sibling of [`inject_continue_gated`] for the ServerRateLimit retry path:
+/// injects [`RATELIMIT_RETRY_PAYLOAD`] (`continue` + a self-clear instruction)
+/// instead of the bare shared `CONTINUE_RETRY_PAYLOAD`. Kept separate so the
+/// apierror-nudge keeps the plain payload and the #1680 source-guard literal on
+/// the shared one stays intact (same split rationale as
+/// [`inject_channel_reply_missing_gated`]). Same draft-gating (`force=false`) +
+/// `[AGEND-AUTO kind=...]` tagging; returns the 3-state [`InjectOutcome`].
+fn inject_ratelimit_retry_gated(
+    home: &std::path::Path,
+    registry: &AgentRegistry,
+    name: &str,
+    auto_kind: &str,
+) -> InjectOutcome {
+    let snap = {
+        let reg = agent::lock_registry(registry);
+        crate::fleet::resolve_uuid(home, name)
+            .and_then(|id| reg.get(&id))
+            .map(agent::InjectTarget::from_handle)
+    };
+    match snap {
+        Some(tgt) => {
+            if agent::inject_with_target_gated(
+                &tgt,
+                name,
+                RATELIMIT_RETRY_PAYLOAD,
+                false,
+                Some(auto_kind),
+            )
+            .is_ok()
+            {
+                InjectOutcome::Injected
+            } else {
+                InjectOutcome::InjectFailed
+            }
+        }
+        None => InjectOutcome::AgentGone,
+    }
+}
+
 /// #1813: inject the one-shot channel-reply-missing nudge. Sibling of
 /// [`inject_continue_gated`] (kept separate so the #1680 source-guard on the
 /// continue-inject's literal `CONTINUE_RETRY_PAYLOAD, false, Some(auto_kind)`
@@ -1866,16 +1916,45 @@ pub(crate) fn process_error_recovery(
             // produced (`last_productive_output == None`) is NOT recovery, so it
             // latches + injects normally (the fresh-agent edge the creation stamp
             // used to mis-suppress). `productive_silence` is for the log only.
-            let (state, recovered, has_throttle_hint, productive_silence) = {
-                let core = handle.core.lock();
+            let (state, recovered, self_cleared, has_throttle_hint, productive_silence) = {
+                let mut core = handle.core.lock();
+                let state = core.state.current;
+                let recovered = core.state.recovered_within(RECOVERY_SILENCE);
+                // #2232: ground-truth recovery latch the agent set by self-clearing
+                // its rate-limit block via the MCP `clear_blocked_reason` action.
+                let self_cleared = core.health.rate_limit_self_cleared;
                 let has_hint =
                     crate::state::screen_has_throttle_hint(&core.vterm.tail_lines(TAIL_LINES));
-                (
-                    core.state.current,
-                    core.state.recovered_within(RECOVERY_SILENCE),
-                    has_hint,
-                    core.state.productive_silence(),
-                )
+                let productive_silence = core.state.productive_silence();
+                if state == AgentState::ServerRateLimit {
+                    // #2232 D1(b): we are about to track/inject a rate-limit retry,
+                    // so we ALREADY KNOW the agent is rate-limited — mark it blocked
+                    // (only when not already RateLimit-latched, to avoid clobbering a
+                    // watchdog-set `retry_after_secs`). This guarantees the agent's
+                    // later self-clear (`clear_blocked_reason reason=rate_limit`)
+                    // reliably matches and latches, making it a dependable
+                    // ground-truth recovery signal rather than a tick-window
+                    // best-effort. Skip once self-cleared so we never re-block an
+                    // agent that already proved it recovered.
+                    if !recovered
+                        && !self_cleared
+                        && !matches!(
+                            core.health.current_reason,
+                            Some(crate::health::BlockedReason::RateLimit { .. })
+                        )
+                    {
+                        core.health
+                            .set_blocked_reason(crate::health::BlockedReason::RateLimit {
+                                retry_after_secs: None,
+                            });
+                    }
+                } else {
+                    // #2232: a genuine ServerRateLimit EXIT resets the latch so a
+                    // FUTURE rate-limit episode re-arms the retry path
+                    // (cross-episode), mirroring `clears_server_rate_limit_retry`.
+                    core.health.rate_limit_self_cleared = false;
+                }
+                (state, recovered, self_cleared, has_hint, productive_silence)
             };
 
             // ── #1713 root-fix: ServerRateLimit retry — DECIDE with fresh state ──
@@ -1886,22 +1965,30 @@ pub(crate) fn process_error_recovery(
             // only EXECUTES the lock-free PTY inject for the names decided here. So a
             // track can never blind-fire `continue` into a non-error state (e.g. a
             // PermissionPrompt the agent reached after the throttle cleared).
-            if state == AgentState::ServerRateLimit && recovered {
+            if state == AgentState::ServerRateLimit && (recovered || self_cleared) {
                 // #ratelimit-recovery: still latched ServerRateLimit (the stale
                 // "Server is temporarily limiting" line re-matches in the tail and
                 // working_state_below can't see a marker BELOW the most-recent error
-                // line — #1769's positional defeat), BUT the agent has produced
-                // productive output within RECOVERY_SILENCE → it RECOVERED and is
-                // working. Clear the track and do NOT inject. `last_productive_output`
-                // is position-independent, so it breaks the Thinking↔ServerRateLimit
-                // flicker that kept the Idle-only #1713 clear from ever firing (the
-                // live storm that wedged fixup-lead). A genuinely-throttled agent
-                // produces nothing → stays silent → the inject branch below fires.
+                // line — #1769's positional defeat), BUT the agent recovered. Two
+                // signals, EITHER suffices:
+                //   • `recovered` — productive output within RECOVERY_SILENCE
+                //     (heuristic; `last_productive_output` is position-independent,
+                //     breaking the Thinking↔ServerRateLimit flicker). MISSES a pure
+                //     fast TEXT reply that never stamped a behaviour marker (#2232).
+                //   • `self_cleared` (#2232) — the agent itself called
+                //     `clear_blocked_reason` on its rate-limit block: ground-truth
+                //     proof it is awake and read the inject, backend-agnostic, zero
+                //     false-positive for liveness. Closes the over-inject gap the
+                //     heuristic alone left. The latch stays set (so no re-arm) until
+                //     a genuine ServerRateLimit exit resets it (capture block above).
+                // Either way: clear the track and do NOT inject. A genuinely-stuck
+                // agent produces nothing AND can't call clear → the inject fires.
                 if retry_tracks.remove(name).is_some() {
                     tracing::info!(
                         agent = %name,
                         productive_silent_secs = productive_silence.as_secs(),
-                        "ServerRateLimit retry cleared — agent recovered (recent productive output)"
+                        recovered_via = if self_cleared { "agent_self_clear" } else { "productive_output" },
+                        "ServerRateLimit retry cleared — agent recovered"
                     );
                 }
             } else if state == AgentState::ServerRateLimit {
@@ -2116,7 +2203,7 @@ pub(crate) fn process_error_recovery(
         } else {
             "ratelimit-retry"
         };
-        match inject_continue_gated(home, registry, name, auto_kind) {
+        match inject_ratelimit_retry_gated(home, registry, name, auto_kind) {
             InjectOutcome::Injected => {
                 retry.inject_failures = 0; // #1742: a success clears the failure streak
                 last_continue_inject.insert(name.clone(), Instant::now());
@@ -3810,6 +3897,213 @@ instances:
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// #2232 (a)+(c): an agent self-clearing its rate-limit block (MCP
+    /// `clear_blocked_reason`, here the `rate_limit_self_cleared` latch) is
+    /// ground-truth recovery even WITHOUT recent productive output (the pure-text
+    /// fast-reply gap where `recovered_within` misses). Its retry track must clear
+    /// and NO `continue` may be injected across repeated ticks (no over-inject).
+    #[test]
+    fn server_rate_limit_self_clear_clears_track_and_skips_inject_2232() {
+        let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = tmp_home("srl-self-clear");
+        let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
+        tracks.insert(
+            "test-agent".to_string(),
+            RateLimitRetry {
+                retry_count: 2,
+                next_retry_at: Instant::now(), // DUE — would inject absent recovery
+                exhausted: false,
+                inject_failures: 0,
+                abort_pending: false,
+            },
+        );
+        let mut last_inject: HashMap<String, Instant> = HashMap::new();
+
+        let (handle, _reader) =
+            mock_agent_handle("test-agent", crate::state::AgentState::ServerRateLimit);
+        // NOT recovered (last_productive_output stays None — the fast-text gap), but
+        // the agent self-cleared its rate-limit block: the #2232 ground-truth signal.
+        handle.core.lock().health.rate_limit_self_cleared = true;
+        registry.lock().insert(handle.id, handle);
+
+        for _ in 0..3 {
+            super::process_error_recovery(
+                &home,
+                &registry,
+                &mut tracks,
+                &mut Default::default(),
+                &mut Default::default(),
+                &mut last_inject,
+                past_boot_grace(),
+            );
+        }
+
+        assert!(
+            !tracks.contains_key("test-agent"),
+            "#2232: an agent that self-cleared its rate-limit block must have its \
+             retry track dropped even with no recent productive output"
+        );
+        assert!(
+            !last_inject.contains_key("test-agent"),
+            "#2232: no `continue` may be re-injected into a self-cleared agent \
+             (the over-inject the issue reports)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2232 D1(b): when the supervisor tracks/injects a rate-limit retry it
+    /// ALREADY knows the agent is rate-limited, so it marks the agent
+    /// `RateLimit`-blocked — guaranteeing the agent's later filtered
+    /// `clear_blocked_reason(reason=rate_limit)` matches and latches (reliable
+    /// ground-truth, not tick-window best-effort).
+    #[test]
+    fn server_rate_limit_inject_schedule_marks_ratelimit_block_2232() {
+        let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = tmp_home("srl-mark-block");
+        let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
+
+        let (handle, _reader) =
+            mock_agent_handle("test-agent", crate::state::AgentState::ServerRateLimit);
+        // No prior blocked_reason, not recovered, not self-cleared.
+        assert!(handle.core.lock().health.current_reason.is_none());
+        registry.lock().insert(handle.id, handle);
+
+        super::process_error_recovery(
+            &home,
+            &registry,
+            &mut tracks,
+            &mut Default::default(),
+            &mut Default::default(),
+            &mut Default::default(),
+            past_boot_grace(),
+        );
+
+        let reg = registry.lock();
+        let h = reg.values().next().expect("agent present");
+        assert!(
+            matches!(
+                h.core.lock().health.current_reason,
+                Some(crate::health::BlockedReason::RateLimit { .. })
+            ),
+            "#2232 D1(b): inject-schedule must mark the agent RateLimit-blocked so a \
+             later filtered self-clear reliably matches"
+        );
+        drop(reg);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2232 cross-episode: the self-clear latch resets on a genuine ServerRateLimit
+    /// EXIT, so a FUTURE rate-limit episode re-arms the retry path (no stale latch
+    /// permanently disabling auto-recovery).
+    #[test]
+    fn server_rate_limit_self_clear_latch_resets_on_exit_then_rearms_2232() {
+        let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = tmp_home("srl-rearm");
+        let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
+
+        let (handle, _reader) =
+            mock_agent_handle("test-agent", crate::state::AgentState::ServerRateLimit);
+        handle.core.lock().health.rate_limit_self_cleared = true;
+        registry.lock().insert(handle.id, handle);
+        let tick = |tracks: &mut HashMap<String, RateLimitRetry>| {
+            super::process_error_recovery(
+                &home,
+                &registry,
+                tracks,
+                &mut Default::default(),
+                &mut Default::default(),
+                &mut Default::default(),
+                past_boot_grace(),
+            );
+        };
+
+        // Self-cleared SRL → no track armed.
+        tick(&mut tracks);
+        assert!(
+            !tracks.contains_key("test-agent"),
+            "self-cleared SRL must not re-arm"
+        );
+
+        // Agent genuinely leaves ServerRateLimit → latch resets.
+        {
+            let reg = registry.lock();
+            reg.values()
+                .next()
+                .expect("agent present")
+                .core
+                .lock()
+                .state
+                .current = crate::state::AgentState::Idle;
+        }
+        tick(&mut tracks);
+        assert!(
+            !registry
+                .lock()
+                .values()
+                .next()
+                .expect("agent present")
+                .core
+                .lock()
+                .health
+                .rate_limit_self_cleared,
+            "#2232: a genuine ServerRateLimit exit resets the self-clear latch"
+        );
+
+        // A NEW rate-limit episode (no productive output, latch now reset) re-arms.
+        {
+            let reg = registry.lock();
+            reg.values()
+                .next()
+                .expect("agent present")
+                .core
+                .lock()
+                .state
+                .current = crate::state::AgentState::ServerRateLimit;
+        }
+        tick(&mut tracks);
+        assert!(
+            tracks.contains_key("test-agent"),
+            "#2232: a future rate-limit episode must re-arm after the latch reset"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2232 (d): the self-clear signal is an idempotent no-op when there is no
+    /// active retry track — the supervisor consumes it safely (no panic, no
+    /// inject, and a self-cleared agent is not re-armed).
+    #[test]
+    fn server_rate_limit_self_clear_no_track_is_noop_2232() {
+        let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = tmp_home("srl-noop");
+        let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new(); // empty
+        let mut last_inject: HashMap<String, Instant> = HashMap::new();
+
+        let (handle, _reader) =
+            mock_agent_handle("test-agent", crate::state::AgentState::ServerRateLimit);
+        handle.core.lock().health.rate_limit_self_cleared = true;
+        registry.lock().insert(handle.id, handle);
+
+        super::process_error_recovery(
+            &home,
+            &registry,
+            &mut tracks,
+            &mut Default::default(),
+            &mut Default::default(),
+            &mut last_inject,
+            past_boot_grace(),
+        );
+
+        assert!(
+            !tracks.contains_key("test-agent"),
+            "#2232: a self-cleared agent is not re-armed even from an empty track set"
+        );
+        assert!(
+            !last_inject.contains_key("test-agent"),
+            "#2232: no inject for a self-cleared agent"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     /// #1325/#1946: phase 1 — GENUINE recovery (Idle + recent productive output)
     /// clears the retry track. (#1946 narrowed the clear: an Idle WITHOUT recent
     /// productive output and retries in flight is the abort shape and retains —
@@ -5380,6 +5674,17 @@ instances:
         assert!(
             !norm.contains(&force_true),
             "#1680: no force=true continue-inject may remain"
+        );
+        // #2232: the ratelimit-retry self-clear-guidance inject (sibling payload)
+        // must ALSO be draft-gated (force=false) — same #1680 safety on the new path.
+        assert!(
+            norm.contains("RATELIMIT_RETRY_PAYLOAD, false, Some(auto_kind),"),
+            "#2232: the ratelimit-retry inject must pass force=false (draft-gated)"
+        );
+        let rl_force_true = format!("RATELIMIT_RETRY_PAYLOAD,{}true", " ");
+        assert!(
+            !norm.contains(&rl_force_true),
+            "#2232: no force=true ratelimit-retry inject may remain"
         );
     }
 

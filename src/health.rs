@@ -364,6 +364,18 @@ pub struct HealthTracker {
     /// so it lives alongside `current_reason` rather than inside the enum. Reset
     /// when a new reason is set and cleared with the reason.
     pub current_note: Option<String>,
+    /// #2232: ground-truth rate-limit recovery latch. Set true ONLY when the
+    /// AGENT itself clears a `RateLimit`/`QuotaExceeded` block via the MCP
+    /// `clear_blocked_reason` action (proof it is awake and read the inject) —
+    /// the watchdog's heuristic auto-clear does NOT set it. The supervisor's
+    /// `process_error_recovery` reads it (under the lock it already holds) as a
+    /// reliable recovery signal to drop the `ServerRateLimit` retry track when
+    /// the narrow `recovered_within` heuristic misses a pure-text fast reply, and
+    /// resets it on a genuine `ServerRateLimit` exit so a future episode re-arms.
+    /// In-memory only (resets to false on restart, like the retry tracks).
+    /// (`RecoverySignal::RateLimitLifted` is the would-be typed equivalent but
+    /// stays unwired — a bool is sufficient here, #2232 D2.)
+    pub rate_limit_self_cleared: bool,
     /// `#685` sub-task 7a: per-agent recovery dispatcher state machine.
     /// Mutated only by `src/daemon/per_tick/recovery_dispatcher.rs`;
     /// `health.rs` ships it as a field to keep all per-agent state in
@@ -495,6 +507,7 @@ impl HealthTracker {
             last_output: Instant::now(),
             current_reason: None,
             current_note: None,
+            rate_limit_self_cleared: false,
             recovery_stage_state: RecoveryStageState::None,
             last_stage1_fired_at: None,
             recovery_restart_count: 0,
