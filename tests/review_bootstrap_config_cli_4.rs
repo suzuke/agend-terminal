@@ -54,19 +54,16 @@ fn assert_atomic_install(module: &str, src: &str) {
 }
 
 #[test]
-#[ignore = "service-plist-nonatomic: red until fix; remove #[ignore] after fix to confirm"]
 fn macos_service_install_writes_plist_atomically_bootstrap_config_cli() {
     assert_atomic_install("macos", include_str!("../src/service/macos.rs"));
 }
 
 #[test]
-#[ignore = "service-unit-nonatomic: red until fix; remove #[ignore] after fix to confirm"]
 fn linux_service_install_writes_unit_atomically_bootstrap_config_cli() {
     assert_atomic_install("linux", include_str!("../src/service/linux.rs"));
 }
 
 #[test]
-#[ignore = "service-taskxml-nonatomic: red until fix; remove #[ignore] after fix to confirm"]
 fn windows_service_install_writes_taskxml_atomically_bootstrap_config_cli() {
     assert_atomic_install("windows", include_str!("../src/service/windows.rs"));
 }

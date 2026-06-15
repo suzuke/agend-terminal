@@ -134,7 +134,7 @@ fn serialize_session(layout: &Layout) -> Option<String> {
 pub(super) fn save_session(home: &Path, layout: &Layout) {
     if let Some(json) = serialize_session(layout) {
         let path = home.join("session.json");
-        let _ = std::fs::write(&path, &json);
+        let _ = crate::store::atomic_write(&path, json.as_bytes());
         tracing::info!(path = %path.display(), "session saved");
     }
 }
@@ -157,7 +157,7 @@ pub(super) fn save_session_if_changed(
         return false;
     }
     let path = home.join("session.json");
-    if std::fs::write(&path, &json).is_ok() {
+    if crate::store::atomic_write(&path, json.as_bytes()).is_ok() {
         *cache = Some(json);
         true
     } else {

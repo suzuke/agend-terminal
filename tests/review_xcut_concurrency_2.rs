@@ -18,7 +18,6 @@
 use std::path::PathBuf;
 
 #[test]
-#[ignore = "xcut-concurrency F2: red until fix; remove #[ignore] after fix to confirm"]
 fn atomic_write_fsyncs_parent_dir_after_rename_xcut_concurrency() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/store.rs");
     let text =
