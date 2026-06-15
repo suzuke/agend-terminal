@@ -127,6 +127,20 @@ pub(super) fn resolve_text_after_image_download_failure(initial: &str) -> String
     }
 }
 
+/// #1352 length-based delivery split: a telegram inbound message takes the
+/// short PTY-inject path only when it is under the char cap AND carries no
+/// attachments; otherwise it goes inbox + pointer hint. Extracted from
+/// `handle_message` (byte-identical: `chars().count() < 200 && empty`) so the
+/// routing decision is unit-testable. The `< 200` cap is the CURRENT production
+/// behavior — distinct from the test-only `HEADER_SIZE_THRESHOLD` (300) const;
+/// reconciling the two is an operator semantics call, intentionally untouched.
+pub(super) fn is_short_inject(
+    text: &str,
+    attachments: &[crate::channel::event::Attachment],
+) -> bool {
+    text.chars().count() < 200 && attachments.is_empty()
+}
+
 async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
     // Detect topic closure/deletion — auto-delete the corresponding instance
     if msg.forum_topic_closed().is_some() {
@@ -497,7 +511,7 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
     // Short messages (< 200 chars, no attachments): PTY inject only.
     // Long messages or attachments: inbox enqueue + pointer-only PTY hint.
     // AGEND_POINTER_ONLY_INJECT=1: all messages go inbox + hint (unchanged).
-    let is_short = text.chars().count() < 200 && attachments.is_empty();
+    let is_short = is_short_inject(&text, &attachments);
     let pointer_only = inbox::notify::pointer_only_inject();
 
     if is_short && !pointer_only {
@@ -628,6 +642,54 @@ mod tests {
         assert!(
             !body.contains("block_on"),
             "handle_message must not call block_on (nested runtime panic). Found block_on in body."
+        );
+    }
+
+    fn photo_attachment() -> crate::channel::event::Attachment {
+        crate::channel::event::Attachment {
+            kind: crate::channel::event::AttachmentKind::Photo,
+            path: std::path::PathBuf::from("/tmp/x.jpg"),
+            mime: None,
+            caption: None,
+            size_bytes: None,
+            original_filename: None,
+        }
+    }
+
+    /// #t-3 audit: drives the REAL #1352 long/short delivery split. The prior
+    /// `inbox::tests::test_short_msg_below_threshold` asserted `300 <= 300`
+    /// against `HEADER_SIZE_THRESHOLD`, a const production never consults — the
+    /// actual gate is `is_short_inject`'s `< 200` (was inlined at the
+    /// handle_message call-site). Pins CURRENT behavior (char-count, 200 cap,
+    /// attachments force the long path); the 200-vs-300 reconciliation is an
+    /// operator semantics call and is intentionally NOT decided here.
+    #[test]
+    fn is_short_inject_routes_by_char_count_and_attachments() {
+        assert!(
+            is_short_inject(&"a".repeat(199), &[]),
+            "199 chars, no attachment → short (PTY inject)"
+        );
+        assert!(
+            !is_short_inject(&"a".repeat(200), &[]),
+            "200 chars → not short (cap is `< 200`)"
+        );
+        assert!(
+            !is_short_inject(&"a".repeat(201), &[]),
+            "201 chars → not short"
+        );
+        // Char count, not bytes: 199 CJK chars = 597 bytes but still short.
+        assert!(
+            is_short_inject(&"你".repeat(199), &[]),
+            "199 CJK chars → short (counted by chars, not bytes)"
+        );
+        assert!(
+            !is_short_inject(&"你".repeat(200), &[]),
+            "200 CJK chars → not short"
+        );
+        // Any attachment forces the long (inbox + pointer) path regardless of length.
+        assert!(
+            !is_short_inject("hi", &[photo_attachment()]),
+            "attachment present → not short even for tiny text"
         );
     }
 

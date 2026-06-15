@@ -1800,12 +1800,11 @@ fn test_format_header_escapes_control_chars() {
     );
 }
 
-#[test]
-fn test_short_msg_below_threshold() {
-    // Messages <= HEADER_SIZE_THRESHOLD should NOT use header format
-    let short = "a".repeat(HEADER_SIZE_THRESHOLD);
-    assert!(short.len() <= HEADER_SIZE_THRESHOLD);
-}
+// #t-3 audit: removed the vacuous `test_short_msg_below_threshold` — it
+// asserted `300 <= 300` (HEADER_SIZE_THRESHOLD against itself) and never
+// exercised any production decision. The real short/long delivery split is
+// `< 200` (NOT this 300 const) and is now driven by
+// `channel::telegram::inbound::tests::is_short_inject_routes_by_char_count_and_attachments`.
 
 #[test]
 fn test_long_msg_above_threshold() {
