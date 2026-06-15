@@ -14,8 +14,15 @@
 //! - successor-fails (injected via `AGEND_FORCE_SUCCESSOR_FAIL=1`) → the OLD
 //!   daemon stays alive (SAME pid still serving), restart reports ok:false.
 //!
-//! Unix-only (mirrors `restart_smoke.rs`): the handoff path is Unix-first for
-//! Stage 1; Windows keeps `exit(42)` + Task Scheduler.
+//! These real-daemon-spawn integration tests are Unix-only (the harness mirrors
+//! `restart_smoke.rs`, kept unix-only by #1481: a windows daemon-spawn variant
+//! was deemed flaky for the coverage). NOTE (#1814 Stage 4, #2094): the earlier
+//! "Windows keeps `exit(42)` + Task Scheduler" claim here is STALE — flipping the
+//! self-respawn default ON was platform-agnostic, so Windows ALSO takes the
+//! in-process self-respawn path by default now (the `#[cfg(windows)]`
+//! `spawn_successor_handoff` branch). Windows handoff coverage is tracked
+//! separately (#1814 close-out) rather than by widening this fragile real-spawn
+//! harness to windows-latest.
 #![cfg(unix)]
 
 use std::io::{BufRead, BufReader, Read, Write};
