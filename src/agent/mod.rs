@@ -2387,6 +2387,51 @@ pub fn subscribe_with_dump(agent: &AgentHandle) -> (crossbeam_channel::Receiver<
     (rx, dump)
 }
 
+/// Minimal managed `AgentHandle` over a throwaway `true` PTY, for cross-module
+/// tests that need a registry entry whose CONTENTS are irrelevant — e.g. the
+/// t-65 register-external TOCTOU repro only needs `reg.contains_key(id)` to be
+/// true. Spawns a short-lived `true`; the caller owns cleanup of the registry.
+/// `unix`-gated: the `true` binary (and this PTY pattern) is unix-only, matching
+/// the sibling `true`-backed handle tests.
+#[cfg(all(test, unix))]
+pub(crate) fn mk_test_handle(name: &str, id: crate::types::InstanceId) -> AgentHandle {
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("openpty");
+    let mut cmd = CommandBuilder::new("true");
+    cmd.cwd(std::env::temp_dir());
+    let child = pair.slave.spawn_command(cmd).expect("spawn true");
+    drop(pair.slave);
+    let pty_writer: PtyWriter = Arc::new(Mutex::new(pair.master.take_writer().expect("writer")));
+    let pty_master: Arc<Mutex<Box<dyn MasterPty + Send>>> = Arc::new(Mutex::new(pair.master));
+    let core = Arc::new(CoreMutex::new(AgentCore {
+        vterm: VTerm::with_pty_writer(80, 24, Arc::clone(&pty_writer)),
+        subscribers: Vec::new(),
+        state: StateTracker::new(None),
+        health: HealthTracker::new(),
+    }));
+    AgentHandle {
+        id,
+        name: name.to_string().into(),
+        backend_command: "true".to_string(),
+        pty_writer,
+        pty_master,
+        core,
+        child: Arc::new(Mutex::new(child)),
+        submit_key: "\r".to_string(),
+        inject_prefix: String::new(),
+        typed_inject: false,
+        spawned_at: std::time::Instant::now(),
+        spawned_at_epoch_ms: 0,
+        deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    }
+}
+
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
