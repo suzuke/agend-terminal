@@ -118,6 +118,16 @@ pub(crate) struct PendingDispatch {
     /// Reset to `None` on re-dispatch (a fresh episode).
     #[serde(default)]
     pub(crate) reported_at: Option<String>,
+    /// #t-116: fire-once latch — the one-time escalation fired while the target is
+    /// QUOTA-WEDGED (backend usage-limit / quota-reached hard-block, snapshot
+    /// `agent_state == "usage_limit"`). Such an agent is EXPECTED to stay silent
+    /// until the quota resets (often hours/days), so re-nudging it every threshold
+    /// is pure noise (r5: agy quota wedged 6 days, pinged every 30 min). Escalate
+    /// ONCE, then suppress until recovery. Reset to `false` the moment the agent is
+    /// no longer quota-wedged (so a genuine later re-wedge re-escalates once) and on
+    /// re-dispatch. Mirrors the `long_running_escalated` fire-once latch.
+    #[serde(default)]
+    pub(crate) quota_escalated: bool,
 }
 
 /// #2008-p2: max activity-based deadline extensions before the watchdog escalates
@@ -310,6 +320,9 @@ pub(crate) fn record_dispatch(
             // the revived sidecar's watchdog is armed again (a stale latch would
             // permanently suppress the new dispatch's nudge).
             existing.reported_at = None;
+            // #t-116: likewise reset the quota-wedge escalation latch for the fresh
+            // episode (a stale latch would suppress a genuine new quota escalation).
+            existing.quota_escalated = false;
             // CR-2026-06-14: persist the refreshed episode under the per-file flock
             // via with_json_state — NOT a bare unlocked write of the list_pending
             // snapshot. scan_and_emit concurrently re-reads and flips the SAME
@@ -349,6 +362,7 @@ pub(crate) fn record_dispatch(
         long_running_escalated: false,
         exceeded_at: None,
         reported_at: None,
+        quota_escalated: false,
     };
     let body = match serde_json::to_string_pretty(&payload) {
         Ok(s) => s,
@@ -787,6 +801,44 @@ fn set_long_running_escalated(home: &Path, dispatch_id: &str) {
     });
 }
 
+/// #t-116: latch the one-time quota-wedge escalation (mirrors
+/// `set_long_running_escalated`). RMW under the per-file lock, so it serializes
+/// against `scan_and_emit` / team-nudge on the SAME sidecar.
+fn set_quota_escalated(home: &Path, dispatch_id: &str) {
+    let path = pending_path(home, dispatch_id);
+    let _ = crate::store::with_json_state::<PendingDispatch, _, _>(&path, |cur| {
+        if cur.status == DispatchStatus::Pending {
+            cur.quota_escalated = true;
+        }
+        Some(())
+    });
+}
+
+/// #t-116: clear the quota-wedge latch when the target RECOVERS (no longer
+/// quota-wedged), so a genuine later re-wedge re-escalates once.
+fn clear_quota_escalated(home: &Path, dispatch_id: &str) {
+    let path = pending_path(home, dispatch_id);
+    let _ = crate::store::with_json_state::<PendingDispatch, _, _>(&path, |cur| {
+        if cur.quota_escalated {
+            cur.quota_escalated = false;
+        }
+        Some(())
+    });
+}
+
+/// #t-116: is `target` QUOTA-WEDGED — i.e. its snapshot `agent_state` is
+/// `"usage_limit"` (the classifier's `AgentState::UsageLimit`, which maps to
+/// `BlockedReason::QuotaExceeded`)? Such an agent is hard-blocked on a backend
+/// usage-limit / quota-reached and is EXPECTED to stay silent until the quota
+/// resets. Read from the SAME file-based snapshot the working-state gate uses (no
+/// registry lock).
+fn target_is_quota_wedged(snapshot: Option<&crate::snapshot::FleetSnapshot>, target: &str) -> bool {
+    snapshot
+        .and_then(|s| s.agents.iter().find(|a| a.name == target))
+        .map(|a| a.agent_state == "usage_limit")
+        .unwrap_or(false)
+}
+
 /// PR2 L3 visibility — per-instance dispatch metadata view.
 /// Pending sidecars where this instance is the **dispatcher**: outbound
 /// dispatches it's still waiting for replies on.
@@ -1007,6 +1059,34 @@ pub(crate) fn scan_and_emit(home: &Path) {
         let elapsed_secs = now.signed_duration_since(issued).num_seconds();
         if elapsed_secs <= d.threshold_secs {
             continue;
+        }
+
+        // #t-116: a backend quota / usage-limit hard-block (snapshot
+        // `agent_state == "usage_limit"`) is EXPECTED to stay silent until the
+        // quota resets (often hours/days) — re-nudging every threshold is pure
+        // noise (r5: agy quota wedged 6 days, pinged every 30 min). Escalate ONCE
+        // so the dispatcher knows, then LATCH-suppress until recovery. Mirrors the
+        // `long_running_escalated` fire-once idiom (emit the same long-running
+        // "expected delay, confirm" signal; do NOT flip to Exceeded — the agent is
+        // blocked, not stuck). The latch resets the moment the agent is no longer
+        // quota-wedged, so a genuine later re-wedge re-escalates once.
+        if target_is_quota_wedged(snapshot.as_ref(), &d.target) {
+            if !d.quota_escalated {
+                tracing::info!(
+                    target: "dispatch_idle",
+                    dispatch_id = %d.dispatch_id,
+                    target = %d.target,
+                    "#t-116 target quota-wedged (usage_limit) — escalating once then suppressing"
+                );
+                emit_long_running_event(home, &d, elapsed_secs);
+                set_quota_escalated(home, &d.dispatch_id);
+            }
+            continue;
+        }
+        // Recovered from a prior quota-wedge → clear the latch so a future re-wedge
+        // re-escalates once (genuine-recurrence-re-logs-once).
+        if d.quota_escalated {
+            clear_quota_escalated(home, &d.dispatch_id);
         }
 
         // #1516/#1694②: the dispatch-idle threshold is for "agent went silent
@@ -1526,6 +1606,7 @@ mod tests {
             refresh_count: 0,
             long_running_escalated: false,
             reported_at: None,
+            quota_escalated: false,
             exceeded_at: None,
         };
         std::fs::write(
@@ -1920,6 +2001,119 @@ mod tests {
             elog2.matches("dispatch_idle_long_running").count(),
             1,
             "escalate-don't-repeat: still exactly one after a second scan: {elog2}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #t-116: a backend quota-wedged target (snapshot `agent_state=="usage_limit"`)
+    /// must escalate ONCE then latch — never the repeated per-threshold "stuck"
+    /// nudge that washed r5 (agy quota 6 days, pinged every 30 min). NOT the
+    /// Exceeded/stuck path (the agent is blocked, not stuck).
+    #[test]
+    fn quota_wedged_escalates_once_then_latches_t116() {
+        let home = tmp_home("t116-quota-once");
+        let issued = chrono::Utc::now() - chrono::Duration::seconds(700);
+        let id = write_pending_at(&home, "lead", "dev", Some("t-q"), "task", 600, issued);
+        write_target_snapshot(&home, "dev", "usage_limit"); // backend quota hard-block
+
+        scan_and_emit(&home);
+        let d = list_pending(&home)
+            .into_iter()
+            .find(|d| d.dispatch_id == id)
+            .expect("sidecar");
+        assert!(d.quota_escalated, "quota-wedge → escalate-once latch set");
+        assert_eq!(
+            d.status,
+            DispatchStatus::Pending,
+            "quota-wedge is blocked, not stuck — must NOT flip to Exceeded"
+        );
+        let elog = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
+        assert_eq!(
+            elog.matches("dispatch_idle_long_running").count(),
+            1,
+            "exactly one quota escalation: {elog}"
+        );
+        assert!(
+            !elog.contains("dispatch_idle_threshold_exceeded"),
+            "no stuck alarm for a quota-wedged target: {elog}"
+        );
+
+        // Repeated scans while still quota-wedged: latched → NO re-nudge.
+        scan_and_emit(&home);
+        scan_and_emit(&home);
+        let elog2 = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
+        assert_eq!(
+            elog2.matches("dispatch_idle_long_running").count(),
+            1,
+            "fire-once: still exactly one after repeat scans: {elog2}"
+        );
+        let d = list_pending(&home)
+            .into_iter()
+            .find(|d| d.dispatch_id == id)
+            .expect("sidecar");
+        assert_eq!(
+            d.status,
+            DispatchStatus::Pending,
+            "still suppressed (Pending) across repeats, never Exceeded"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #t-116: when the target RECOVERS from a quota-wedge, the latch resets, so a
+    /// GENUINE later re-wedge re-escalates once (genuine-recurrence-re-logs-once),
+    /// rather than staying permanently silent.
+    #[test]
+    fn quota_recovery_resets_latch_then_rewedge_reescalates_t116() {
+        let home = tmp_home("t116-quota-recover");
+        let issued = chrono::Utc::now() - chrono::Duration::seconds(700);
+        let id = write_pending_at(&home, "lead", "dev", Some("t-qr"), "task", 600, issued);
+
+        // Episode 1 — wedged → escalate once + latch.
+        write_target_snapshot(&home, "dev", "usage_limit");
+        scan_and_emit(&home);
+        assert!(
+            list_pending(&home)
+                .into_iter()
+                .find(|d| d.dispatch_id == id)
+                .unwrap()
+                .quota_escalated,
+            "episode 1: latch set"
+        );
+
+        // Recover from the quota state (agent_state no longer "usage_limit") → the
+        // latch clears. Use "idle" (not a working state): a working state's
+        // suppress-gate refreshes `issued_at`, which would drop episode 2 below
+        // threshold; "idle" leaves the clock untouched and a single scan only bumps
+        // the debounce streak (no fire), isolating the latch-reset behaviour.
+        write_target_snapshot(&home, "dev", "idle");
+        scan_and_emit(&home);
+        let d = list_pending(&home)
+            .into_iter()
+            .find(|d| d.dispatch_id == id)
+            .unwrap();
+        assert!(!d.quota_escalated, "recovery must clear the quota latch");
+        assert_eq!(
+            d.status,
+            DispatchStatus::Pending,
+            "single idle scan defers (debounce), not Exceeded"
+        );
+
+        // Episode 2 — re-wedge → re-escalates once.
+        write_target_snapshot(&home, "dev", "usage_limit");
+        scan_and_emit(&home);
+        let d = list_pending(&home)
+            .into_iter()
+            .find(|d| d.dispatch_id == id)
+            .unwrap();
+        assert!(
+            d.quota_escalated,
+            "re-wedge after recovery re-sets the latch"
+        );
+        let elog = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
+        assert_eq!(
+            elog.matches("dispatch_idle_long_running").count(),
+            2,
+            "two escalations across two distinct wedge episodes: {elog}"
         );
         std::fs::remove_dir_all(&home).ok();
     }
@@ -2517,6 +2711,7 @@ mod tests {
             refresh_count: 0,
             long_running_escalated: false,
             reported_at: None,
+            quota_escalated: false,
             exceeded_at: None,
         };
         assert_eq!(
