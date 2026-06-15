@@ -83,9 +83,29 @@ fn parse_one(s: &str) -> Claim {
     if lower.contains("deps unchanged") {
         return Claim::DepsUnchanged;
     }
-    // Grammar v1.1: detect fn references — "fn name() exists" or "fn name(" patterns
+    // Grammar v1.1: detect fn references — "fn name() exists" or "fn name(" patterns.
+    // CR-2026-06-14: prose describing FUTURE / intended work also carries the
+    // `fn name(` shape ("will add fn foo() in a follow-up"). Coercing that into a
+    // verifiable FunctionExists claim makes `verify()` hard-reject the push for an
+    // fn that legitimately does not exist yet — violating the module's "unknown
+    // phrases pass through" contract. A segment carrying future-intent markers is
+    // left as `Unknown` (pass-through); present-tense assertions ("references fn
+    // x()", "fn x() exists") are unaffected.
+    const FUTURE_INTENT_MARKERS: &[&str] = &[
+        "will ",
+        "would ",
+        "plan to",
+        "planned",
+        "going to",
+        "intend",
+        "follow-up",
+        "followup",
+        "to-do",
+        "todo",
+    ];
+    let is_future_intent = FUTURE_INTENT_MARKERS.iter().any(|m| lower.contains(m));
     let fn_names = extract_fn_names(s);
-    if !fn_names.is_empty() {
+    if !fn_names.is_empty() && !is_future_intent {
         return Claim::FunctionExists { fn_names };
     }
     Claim::Unknown(s.to_string())
@@ -259,16 +279,25 @@ pub fn extract_test_invocations(text: &str) -> Vec<String> {
 /// leading shell prefixes (`$ cargo test`, `> cargo test`, `Run:
 /// cargo test`).
 fn find_cargo_test_payload(line: &str) -> Option<&str> {
-    let idx = line.find("cargo test")?;
-    let after = &line[idx + "cargo test".len()..];
-    // Must be followed by whitespace OR end of line to count as a
-    // real invocation (avoid matching `cargo testing` etc.).
-    let next_char = after.chars().next();
-    if matches!(next_char, Some(c) if c.is_whitespace()) || next_char.is_none() {
-        Some(after.trim_start())
-    } else {
-        None
+    // CR-2026-06-14: scan EVERY `cargo test` occurrence, not just the first. A
+    // leading `cargo testbed` (or `cargo testing`) textually matches `cargo test`
+    // but is followed by a non-space, so bailing on the first match dropped a
+    // genuine later `cargo test foo::bar` on the same line — fail-OPEN on the
+    // #812 dispatch-name validation. Advance past each non-invocation match and
+    // keep looking; return the first real invocation's payload.
+    let mut search_start = 0;
+    while let Some(rel) = line[search_start..].find("cargo test") {
+        let idx = search_start + rel;
+        let after = &line[idx + "cargo test".len()..];
+        // Must be followed by whitespace OR end of line to count as a
+        // real invocation (avoid matching `cargo testing` / `cargo testbed`).
+        let next_char = after.chars().next();
+        if matches!(next_char, Some(c) if c.is_whitespace()) || next_char.is_none() {
+            return Some(after.trim_start());
+        }
+        search_start = idx + "cargo test".len();
     }
+    None
 }
 
 /// A token qualifies as a test-fn ident when it starts with a letter

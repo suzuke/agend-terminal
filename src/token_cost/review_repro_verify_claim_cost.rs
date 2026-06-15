@@ -23,7 +23,6 @@ use super::parse_since;
 /// return `Ok` (no panic). After the fix to `checked_mul` + `checked_sub`, the
 /// absurd input resolves to `None` (fail-closed) and no panic occurs.
 #[test]
-#[ignore = "verify-claim-cost parse_since-overflow: red until fix; remove #[ignore] after fix to confirm"]
 fn parse_since_huge_value_does_not_panic_or_overflow_verify_claim_cost() {
     // `now_ms` near a realistic epoch-ms value so a correct fix's `checked_sub`
     // also has a defined answer.

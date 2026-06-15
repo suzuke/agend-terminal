@@ -724,13 +724,17 @@ fn parse_since(since: Option<&str>, now_ms: i64) -> Option<i64> {
     }
     let (num, unit) = s.split_at(s.len().saturating_sub(1));
     let n: i64 = num.parse().ok()?;
+    // CR-2026-06-14: `since` flows straight from the MCP `tokens` tool args, so a
+    // parseable-but-absurd value (e.g. `100000000000000d`) overflows the unit
+    // multiply — a panic under debug `overflow-checks`, a wrapped bogus cutoff in
+    // release. Use checked arithmetic and fail closed (None) on any overflow.
     let ms = match unit {
-        "h" => n * 3_600_000,
-        "d" => n * 86_400_000,
-        "m" => n * 60_000,
+        "h" => n.checked_mul(3_600_000),
+        "d" => n.checked_mul(86_400_000),
+        "m" => n.checked_mul(60_000),
         _ => return None,
-    };
-    Some(now_ms - ms)
+    }?;
+    now_ms.checked_sub(ms)
 }
 
 // ── #1077 slice-1: instance→task time-join ──────────────────────────────────

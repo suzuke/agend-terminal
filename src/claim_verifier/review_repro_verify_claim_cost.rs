@@ -22,7 +22,6 @@ use super::{find_cargo_test_payload, parse_claims, Claim};
 /// bails with `None`, dropping the genuine later invocation. Correct behavior
 /// returns the payload of the SECOND, valid occurrence.
 #[test]
-#[ignore = "verify-claim-cost cargo-testbed-first-match: red until fix; remove #[ignore] after fix to confirm"]
 fn find_cargo_test_payload_skips_testbed_and_finds_real_invocation_verify_claim_cost() {
     let line = "cargo testbed && cargo test foo::bar_test";
 
@@ -60,7 +59,6 @@ fn find_cargo_test_payload_rejects_standalone_testing_verify_claim_cost() {
 /// `verify()` then rejects the whole push because the fn is absent. The module
 /// contract (header lines 3-4) is that unknown phrases pass through.
 #[test]
-#[ignore = "verify-claim-cost fn-prose-falsepositive: red until fix; remove #[ignore] after fix to confirm"]
 fn prose_mentioning_fn_pattern_stays_unknown_verify_claim_cost() {
     let text = "will add fn new_helper() in a follow-up";
     let claims = parse_claims(text);
