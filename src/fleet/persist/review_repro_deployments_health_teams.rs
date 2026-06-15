@@ -47,7 +47,6 @@ fn team_with_member(member: &str) -> TeamConfig {
 }
 
 #[test]
-#[ignore = "deployments-health-teams F3: red until fix; remove #[ignore] after fix to confirm"]
 fn add_team_to_yaml_enforces_one_agent_one_team_deployments_health_teams() {
     let home = tmp_home("excl");
     std::fs::write(fleet_yaml_path(&home), "teams: {}\n").expect("seed fleet.yaml");
