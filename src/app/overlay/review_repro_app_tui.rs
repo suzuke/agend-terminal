@@ -20,7 +20,6 @@
 //! does via `super::kill_agent(ctx.home, ctx.registry, &name)`.
 
 #[test]
-#[ignore = "resource-leak/non-fleet-pane-close: red until fix; remove #[ignore] after fix to confirm"]
 fn confirmclose_kills_nonfleet_pane_agent_app_tui() {
     // Parent of this submodule file is src/app/overlay/, so ../overlay.rs is
     // the source file under test.

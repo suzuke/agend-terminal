@@ -359,9 +359,16 @@ pub(super) fn handle_key(
                 // UI response, then run the blocking delete + cleanup
                 // in a background thread.
                 let names: Vec<String>;
+                // CR-2026-06-14 (resource-leak): also capture each closed pane's
+                // `agent_name` so a NON-fleet (shell) pane — `fleet_instance_name
+                // == None`, never in `names` — still has its PTY child killed.
+                // `full_delete_instance` only tears down FLEET instances; a
+                // scratch shell's registry entry (PTY master + child) would
+                // otherwise leak for the whole TUI session (`Pane` has no `Drop`).
+                let nonfleet_agents: Vec<crate::types::AgentName>;
                 if is_tab {
                     let idx = ctx.layout.active;
-                    names = ctx
+                    let panes: Vec<(crate::types::AgentName, Option<String>)> = ctx
                         .layout
                         .tabs
                         .get(idx)
@@ -370,24 +377,46 @@ pub(super) fn handle_key(
                             t.root().pane_ids().into_iter().filter_map(|id| {
                                 t.root()
                                     .find_pane(id)
-                                    .and_then(|p| p.fleet_instance_name.clone())
+                                    .map(|p| (p.agent_name.clone(), p.fleet_instance_name.clone()))
                             })
                         })
+                        .collect();
+                    names = panes.iter().filter_map(|(_, f)| f.clone()).collect();
+                    nonfleet_agents = panes
+                        .into_iter()
+                        .filter(|(_, f)| f.is_none())
+                        .map(|(a, _)| a)
                         .collect();
                     let _ = ctx.layout.close_tab(idx);
                     outcome.needs_resize = true;
                 } else if let Some(tab) = ctx.layout.active_tab_mut() {
                     let fid = tab.focus_id;
-                    let fleet_name: Option<String> = tab
+                    let (agent_name, fleet_name): (
+                        Option<crate::types::AgentName>,
+                        Option<String>,
+                    ) = tab
                         .root()
                         .find_pane(fid)
-                        .and_then(|p| p.fleet_instance_name.clone());
+                        .map(|p| (Some(p.agent_name.clone()), p.fleet_instance_name.clone()))
+                        .unwrap_or((None, None));
                     if tab.close_focused().is_some() {
                         outcome.needs_resize = true;
                     }
-                    names = fleet_name.into_iter().collect();
+                    names = fleet_name.clone().into_iter().collect();
+                    nonfleet_agents = match (agent_name, fleet_name) {
+                        (Some(a), None) => vec![a],
+                        _ => Vec::new(),
+                    };
                 } else {
                     names = Vec::new();
+                    nonfleet_agents = Vec::new();
+                }
+                // Kill non-fleet (shell) panes' PTY children on the UI thread —
+                // `kill_agent` only drops the registry PTY master (fast, no
+                // blocking IO), mirroring the `ScratchShell` Esc arm. Fleet panes
+                // are torn down by `full_delete_instance` in the thread below.
+                for name in &nonfleet_agents {
+                    super::kill_agent(ctx.home, ctx.registry, name);
                 }
                 if !names.is_empty() {
                     let home = ctx.home.to_path_buf();
