@@ -165,6 +165,17 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
             raw_target, sender.as_str()
         )});
     }
+    // CR-2026-06-14 (resource-leak): reject a plain self-dispatch BEFORE the
+    // auto-bind/lease. The qualified guard above only fires when team-orchestrator
+    // resolution COLLAPSED the target onto the sender; a plain self-dispatch
+    // (raw_target == resolved == sender) skipped it and fell through to
+    // `dispatch_auto_bind_lease_with_chain` (which leases a worktree + writes a
+    // binding) before the API-layer self-send check rejected the send — orphaning
+    // the leased worktree with no rollback on this path. Reject unconditionally
+    // here so no lease happens for a dispatch the send would reject anyway.
+    if *sender == target {
+        return json!({"error": "cannot delegate task to self — use a different instance"});
+    }
     let task = match args["task"].as_str() {
         Some(t) => t,
         None => return json!({"error": "missing 'task'"}),
@@ -647,25 +658,30 @@ pub(super) fn handle_inbox(home: &Path, instance_name: &str) -> Value {
             }
         }
         if !processed_msg_ids.is_empty() {
-            // Known TOCTOU window: a message arriving between this re-read
-            // and the save_metadata call below can lose its pickup_id.
-            // The window is narrow (JSON parse + filter) and self-healing
-            // (next handle_inbox drains surviving IDs).
-            let remaining: Vec<Value> = std::fs::read_to_string(&meta_path)
-                .ok()
-                .and_then(|c| serde_json::from_str::<Value>(&c).ok())
-                .and_then(|m| m["pending_pickup_ids"].as_array().cloned())
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|e| {
-                    !processed_msg_ids.contains(&e["msg_id"].as_str().unwrap_or("").to_string())
-                })
-                .collect();
-            crate::agent_ops::save_metadata(
+            // CR-2026-06-14 (concurrency): filter the processed pickup ids out of
+            // `pending_pickup_ids` under the metadata flock (atomic read-modify-
+            // write). The prior code re-read the file UNLOCKED, filtered, then
+            // wrote the remainder via save_metadata — a pickup id appended between
+            // the unlocked re-read and the write was clobbered (lost update).
+            // Filtering inside the locked closure reads the CURRENT on-disk set,
+            // so a concurrently-appended id is preserved.
+            crate::agent_ops::update_metadata(
                 home,
                 instance_name,
                 "pending_pickup_ids",
-                json!(remaining),
+                |current| {
+                    let remaining: Vec<Value> = current
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|e| {
+                            !processed_msg_ids
+                                .contains(&e["msg_id"].as_str().unwrap_or("").to_string())
+                        })
+                        .collect();
+                    json!(remaining)
+                },
             );
         }
     }

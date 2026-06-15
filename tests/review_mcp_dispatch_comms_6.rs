@@ -56,7 +56,6 @@ fn handle_inbox_body() -> String {
 }
 
 #[test]
-#[ignore = "mcp-dispatch-comms F6: red until the pickup-id read-modify-write is locked (no TOCTOU lost-update); remove #[ignore] after fix"]
 fn handle_inbox_pickup_id_rmw_has_no_toctou_lost_update_mcp_dispatch_comms() {
     let body = handle_inbox_body();
 

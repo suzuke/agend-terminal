@@ -56,7 +56,6 @@ fn pre_auto_bind_lines() -> Vec<String> {
 }
 
 #[test]
-#[ignore = "mcp-dispatch-comms F4: red until an unconditional self-send rejection precedes the auto-bind; remove #[ignore] after fix"]
 fn self_dispatch_rejected_before_auto_bind_lease_mcp_dispatch_comms() {
     let lines = pre_auto_bind_lines();
 

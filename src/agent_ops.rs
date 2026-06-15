@@ -243,6 +243,37 @@ pub fn save_metadata(home: &Path, instance_name: &str, key: &str, value: Value) 
     );
 }
 
+/// CR-2026-06-14 (concurrency): locked read-modify-write of a single metadata
+/// key via a transform closure. The flock spans the whole load→modify→write, and
+/// — unlike `save_metadata` (which overwrites a key with a precomputed value) —
+/// the new value is DERIVED from the current on-disk value INSIDE the lock. Use
+/// this when the write depends on the current value (e.g. filtering an array):
+/// computing the remainder outside the lock and writing it back races with a
+/// concurrent append, which the stale-remainder write then clobbers (the
+/// `pending_pickup_ids` lost-update class). `current` is `Null` if the key is
+/// absent.
+pub fn update_metadata(
+    home: &Path,
+    instance_name: &str,
+    key: &str,
+    f: impl FnOnce(&Value) -> Value,
+) {
+    let meta_dir = home.join("metadata");
+    std::fs::create_dir_all(&meta_dir).ok();
+    let meta_path = metadata_path_resolved(home, instance_name);
+    persist_or_log!(
+        crate::store::with_json_state_or_create::<Value, _, _, _>(
+            &meta_path,
+            || json!({}),
+            |meta| {
+                let current = meta.get(key).cloned().unwrap_or(Value::Null);
+                meta[key] = f(&current);
+            },
+        ),
+        "update_metadata"
+    );
+}
+
 /// Persist multiple metadata key/value pairs in a single locked read-modify-write.
 /// #1886 C2: the flock spans the whole load→modify→write (not just the write), so
 /// concurrent `save_metadata`/`save_metadata_batch` on the same instance never read
