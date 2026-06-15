@@ -106,7 +106,13 @@ fn with_inbox_lock<T>(home: &Path, name: &str, f: impl FnOnce(&Path) -> T) -> an
     Ok(f(&path))
 }
 
-/// Enqueue a message — atomic append via flock + tmp + fsync + rename.
+/// Enqueue a message — in-place flock'd append + fsync (O(1) JSONL append).
+///
+/// NOT crash-atomic: enqueue appends in place — no tmp+rename (only the
+/// read-modify-write rewriters drain/sweep/clear/supersede use that). A crash
+/// mid-write can leave a half-written trailing line; every read path skips an
+/// unparseable line and [`recover_half_writes`] quarantines it (to
+/// `inbox.recovery/`) at startup.
 ///
 /// Returns an error when the inbox is in readonly mode (disk full).
 /// Callers should invoke [`check_disk_space`] periodically (e.g. daemon tick);

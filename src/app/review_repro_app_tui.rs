@@ -17,7 +17,6 @@
 /// replaced (or the code must switch to `try_lock()` with the bogus claim
 /// gone). Red while the sentence is present.
 #[test]
-#[ignore = "maintainability/agent_is_alive-poison-doc: red until fix; remove #[ignore] after fix to confirm"]
 fn agent_is_alive_doc_drops_parking_lot_poison_claim_app_tui() {
     let src = include_str!("mod.rs");
 
@@ -51,7 +50,6 @@ fn agent_is_alive_doc_drops_parking_lot_poison_claim_app_tui() {
 /// reappear after an interactive resize. Red while the arm performs neither
 /// the deferral nor the clear.
 #[test]
-#[ignore = "correctness/resize-arm-skips-ghost-clear: red until fix; remove #[ignore] after fix to confirm"]
 fn terminal_resize_arm_performs_ghost_clear_app_tui() {
     let src = include_str!("mod.rs");
 
