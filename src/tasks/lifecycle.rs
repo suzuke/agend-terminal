@@ -287,6 +287,100 @@ mod tests {
 
         std::fs::remove_dir_all(&home).ok();
     }
+
+    /// CR-2026-06-14 t-16 (behavioral hardening of #2177): the source-scan repro
+    /// (`prod.contains("sync_all")`, review_tasks_3.rs) is comment-satisfiable —
+    /// it cannot prove the durable-append actually error-CHECKS the write. This
+    /// BEHAVIORAL test does: when the archive append fails, `archive_done_tasks`
+    /// must count 0 (nothing claimed as archived) and leave the records
+    /// un-archived so a later pass RETRIES — vs the pre-#2177 `let _ = writeln!`
+    /// that swallowed the error and counted a never-written task.
+    ///
+    /// Failure is injected by making `tasks-archive.jsonl` a DIRECTORY, so the
+    /// append `OpenOptions::open` fails deterministically on every platform
+    /// (more robust than a read-only file, which root/CI can bypass).
+    #[test]
+    fn archive_append_failure_counts_zero_and_retries_t16() {
+        use crate::task_events::{
+            DoneSource, InstanceName, TaskEvent, TaskEventEnvelope, TaskId, SCHEMA_VERSION,
+        };
+        let home = std::env::temp_dir().join(format!(
+            "agend-test-lifecycle-failarch-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&home).ok();
+        let tid = TaskId::from("t-failarch");
+        let old_ts = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+        let seed = |seq: u64, event: TaskEvent| {
+            let env = TaskEventEnvelope {
+                schema_version: SCHEMA_VERSION,
+                seq,
+                timestamp: old_ts.clone(),
+                instance: InstanceName::from("system:lifecycle"),
+                emitter_id: None,
+                event,
+            };
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(home.join(format!("task_events.{}", "jsonl")))
+                .unwrap();
+            writeln!(f, "{}", serde_json::to_string(&env).unwrap()).unwrap();
+            crate::task_events::invalidate_replay_cache();
+        };
+        seed(
+            1,
+            TaskEvent::Created {
+                task_id: tid.clone(),
+                title: "shipped".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: None,
+                due_at: None,
+                depends_on: vec![],
+                routed_to: None,
+                branch: None,
+                bind: None,
+                eta_secs: None,
+                tags: vec![],
+                parent_id: None,
+            },
+        );
+        seed(
+            2,
+            TaskEvent::Done {
+                task_id: tid.clone(),
+                by: InstanceName::from("dev"),
+                source: DoneSource::OperatorManual {
+                    authored_at: old_ts.clone(),
+                    result: None,
+                },
+            },
+        );
+
+        // Make the archive path un-writable: a directory at the file path makes
+        // the append open() fail every time.
+        let archive_path = home.join("tasks-archive.jsonl");
+        std::fs::create_dir(&archive_path).unwrap();
+
+        // Failure must NOT be counted as archived.
+        assert_eq!(
+            archive_done_tasks(&home),
+            0,
+            "a failed archive append must count 0 (not claim a never-written task)"
+        );
+
+        // Remove the blocker → the un-archived record is retried and now lands.
+        std::fs::remove_dir(&archive_path).unwrap();
+        assert_eq!(
+            archive_done_tasks(&home),
+            1,
+            "the previously-failed record must be retried and archived on the next pass"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
 
 #[cfg(test)]

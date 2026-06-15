@@ -201,6 +201,47 @@ mod tests {
         Arc::new(Mutex::new(Box::new(Vec::<u8>::new())))
     }
 
+    /// A PTY writer whose `write` BLOCKS — simulates a backend that stopped
+    /// draining its input (the exact #2160/H13 wedge). Bounded at 60s (>> the 5s
+    /// `PTY_WRITE_TIMEOUT`) so the timeout fires first while the helper thread +
+    /// in-progress guard still self-clean instead of leaking for the whole run.
+    struct ParkWriter;
+    impl std::io::Write for ParkWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// CR-2026-06-14 t-25 (RUNTIME behavioral hardening of #2160/H13): the
+    /// static-grep repro (`writer.lock()` absent in dismiss.rs) is bypassable by
+    /// aliasing / an API rename. This test proves the actual property the fix
+    /// exists for — the dismiss write path is BOUNDED: a parked PTY writer must
+    /// make `write_with_timeout` (the primitive every dismiss keystroke routes
+    /// through) RETURN `Err(TimedOut)` within its bound, never hang the caller and
+    /// pin the writer lock forever.
+    #[test]
+    fn write_with_timeout_returns_on_parked_writer_h13_2160() {
+        let writer: PtyWriter = Arc::new(Mutex::new(Box::new(ParkWriter)));
+        let start = std::time::Instant::now();
+        let res = write_with_timeout(&writer, b"dismiss-keystrokes");
+        let elapsed = start.elapsed();
+        let err = res.expect_err("a parked PTY write must time out, not report success");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::TimedOut,
+            "a parked write must surface TimedOut"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(8),
+            "write_with_timeout must return within its ~5s bound even when the writer \
+             parks (H13/#2160 — no unbounded lock-pinning hang); took {elapsed:?}"
+        );
+    }
+
     #[test]
     fn inflight_guard_clears_entry_on_panic_1886() {
         // #1886 follow-up §3.9: a dismiss thread that panics before its normal
