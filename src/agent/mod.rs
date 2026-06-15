@@ -1288,6 +1288,16 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
         let reg = lock_registry(registry);
         if let Some(handle) = reg.get(&instance_id) {
             let (tx, rx) = crossbeam_channel::bounded(1024);
+            // Lock order: registry → core (registry held here, core acquired
+            // under it = the canonical direction). `core` is a short,
+            // non-self-IPC temporary (subscriber push only) dropped on this
+            // statement, so it neither trips the #1492/#1535 self-IPC-under-lock
+            // guard (`sync_audit::assert_no_registry_lock_for_self_ipc`, which
+            // fail-fasts any self-IPC entered while CORE_LOCK_DEPTH>0) nor needs
+            // a snapshot-Arc: there is no reverse core→registry path in-tree
+            // (the supervisor inversion #1593 killed; the hot tick loop pinned
+            // by `tick_does_not_reacquire_registry_under_core_f2`, #1530/F2), so
+            // this AB-BA pair cannot form. See docs/DAEMON-LOCK-ORDERING.md.
             handle.core.lock().subscribers.push(tx);
             crate::daemon::router::register_agent(name, rx);
         }
@@ -1734,6 +1744,11 @@ fn on_clean_exit_shell_fallback(
         let reg = registry.lock();
         reg.get(id)
             .map(|h| {
+                // registry → core order; `c` is a short non-self-IPC temporary
+                // (vterm dims read) dropped at the closure end. Safe per the
+                // unidirectional registry→core invariant — no reverse path
+                // in-tree (#1593 killed it; runtime guard #1492/#1535) — so no
+                // snapshot-Arc. See the spawn-site note + docs/DAEMON-LOCK-ORDERING.md.
                 let c = h.core.lock();
                 (c.vterm.cols(), c.vterm.rows())
             })
@@ -1810,6 +1825,11 @@ fn on_crash_exit(
     {
         let reg = registry.lock();
         if let Some(handle) = reg.get(id) {
+            // registry → core order; `core` is a short non-self-IPC temporary
+            // (set_restarting only) dropped on this statement. Safe per the
+            // unidirectional registry→core invariant — no reverse path in-tree
+            // (#1593 killed it; runtime guard #1492/#1535) — so no snapshot-Arc.
+            // See the spawn-site note + docs/DAEMON-LOCK-ORDERING.md.
             handle.core.lock().state.set_restarting();
         }
     }
