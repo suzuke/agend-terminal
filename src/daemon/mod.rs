@@ -815,6 +815,27 @@ fn write_control_ready(home: &Path) {
     }
 }
 
+/// `CleanExit` handler — a clean agent exit removes it from the live registry
+/// (UUID-keyed; name resolved via fleet.yaml) and from the respawn-config map,
+/// and does NOT respawn. Extracted from `run_core`'s select loop (sibling of
+/// [`crash_respawn::handle_crash_respawn`]) so the eviction / no-respawn contract
+/// is unit-testable without driving the whole daemon event loop. Evicting the
+/// config is what prevents a later resurrect: `handle_crash_respawn` reads
+/// `configs` to respawn, so a cleanly-exited agent with no config can't come back.
+fn handle_clean_exit(
+    home: &Path,
+    name: &str,
+    registry: &crate::agent::AgentRegistry,
+    configs: &Mutex<HashMap<String, AgentConfig>>,
+) {
+    tracing::info!(agent = %name, "clean exit — removing from registry (no respawn)");
+    // #1441: registry is UUID-keyed; resolve name via fleet.yaml.
+    if let Some(id) = crate::fleet::resolve_uuid(home, name) {
+        registry.lock().remove(&id);
+    }
+    configs.lock().remove(name);
+}
+
 fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
     let started_at = std::time::Instant::now();
 
@@ -968,12 +989,7 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
             }
             match exit_event {
                 crate::agent::AgentExitEvent::CleanExit(ref name) => {
-                    tracing::info!(agent = %name, "clean exit — removing from registry (no respawn)");
-                    // #1441: registry is UUID-keyed; resolve name via fleet.yaml.
-                    if let Some(id) = crate::fleet::resolve_uuid(home, name) {
-                        ctx.registry.lock().remove(&id);
-                    }
-                    ctx.configs.lock().remove(name.as_str());
+                    handle_clean_exit(home, name.as_str(), &ctx.registry, &ctx.configs);
                 }
                 crate::agent::AgentExitEvent::Stage2Restart(name) => {
                     spawn_stage2_thread(home, &name, &ctx);
@@ -2344,44 +2360,29 @@ mod tests {
         assert!(p.fresh_args.is_none());
     }
 
-    // ── Clean exit vs crash respawn tests ────────────────────────────
+    // ── Clean exit vs crash respawn ──────────────────────────────────
+    // The earlier trio asserted only language / HashMap discriminant semantics
+    // (re-implementing the main loop's `match` inline) and never touched
+    // production, so a regression in the real handlers went uncaught. They
+    // collapse to two tests that drive the REAL handlers: a clean exit evicts
+    // the respawn config (so crash-respawn finds nothing to resurrect), and a
+    // crash's respawn DECISION says "respawn" on a fresh agent. `AgentHandle`
+    // needs a live PTY and can't be built in a unit test, so the
+    // registry-removal half of `handle_clean_exit` is reached only via the prod
+    // dispatch; the config eviction is the unit-testable contract.
 
     #[test]
-    fn clean_exit_does_not_respawn() {
-        // Simulate: daemon receives CleanExit event → agent removed from
-        // registry + configs, no respawn thread spawned.
-        let (tx, rx) = crossbeam_channel::bounded::<crate::agent::AgentExitEvent>(8);
-        tx.send(crate::agent::AgentExitEvent::CleanExit("agent-1".into()))
-            .expect("send test event");
-        let event = rx.recv().expect("recv test event");
-        assert!(
-            matches!(event, crate::agent::AgentExitEvent::CleanExit(ref n) if n == "agent-1"),
-            "expected CleanExit, got {event:?}"
-        );
-        // Verify the daemon loop logic: CleanExit removes from registry, does NOT respawn.
-        // We test the discriminant matching that the main loop uses.
-        let is_clean = matches!(event, crate::agent::AgentExitEvent::CleanExit(_));
-        assert!(is_clean, "CleanExit must be recognized as clean");
-    }
+    fn clean_exit_evicts_respawn_config_so_no_resurrect() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static C: AtomicU32 = AtomicU32::new(0);
+        let home = std::env::temp_dir().join(format!(
+            "agend-cleanexit-{}-{}",
+            std::process::id(),
+            C.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&home).unwrap();
 
-    #[test]
-    fn crash_still_respawns() {
-        // Simulate: daemon receives Crash event → should trigger respawn.
-        let (tx, rx) = crossbeam_channel::bounded::<crate::agent::AgentExitEvent>(8);
-        tx.send(crate::agent::AgentExitEvent::Crash("agent-2".into()))
-            .expect("send test event");
-        let event = rx.recv().expect("recv test event");
-        let is_crash =
-            matches!(event, crate::agent::AgentExitEvent::Crash(ref n) if n == "agent-2");
-        assert!(is_crash, "Crash event must be recognized for respawn");
-        let is_clean = matches!(event, crate::agent::AgentExitEvent::CleanExit(_));
-        assert!(!is_clean, "Crash must NOT be treated as clean exit");
-    }
-
-    #[test]
-    fn clean_exit_removes_from_configs() {
-        // Verify the daemon loop's CleanExit handler removes the agent
-        // from the configs map (preventing stale respawn config).
+        let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
         let configs: Arc<Mutex<HashMap<String, AgentConfig>>> =
             Arc::new(Mutex::new(HashMap::new()));
         configs.lock().insert(
@@ -2397,11 +2398,30 @@ mod tests {
             },
         );
         assert!(configs.lock().contains_key("agent-3"));
-        // Simulate the CleanExit handler logic from the main loop:
-        configs.lock().remove("agent-3");
+
+        // Drive the REAL CleanExit handler (no fleet.yaml → resolve_uuid is None,
+        // so the registry half is a no-op here; the config eviction must run).
+        handle_clean_exit(&home, "agent-3", &registry, &configs);
+
         assert!(
             !configs.lock().contains_key("agent-3"),
-            "CleanExit must remove agent from configs"
+            "clean exit must evict the respawn config so crash-respawn finds nothing to resurrect"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn crash_still_respawns() {
+        // The Crash arm respawns iff the health gate says so. Drive the REAL
+        // decision (`HealthTracker::record_crash`): a fresh agent's first crash
+        // returns respawn=true — the opposite of a clean exit, which never
+        // respawns. The max-retries → no-respawn case is covered by
+        // `health::tests::test_failed_after_max_retries`.
+        let mut health = crate::health::HealthTracker::new();
+        let (respawn, _delay, _notify) = health.record_crash();
+        assert!(
+            respawn,
+            "a fresh agent's first crash must respawn (the gate handle_crash_respawn relies on)"
         );
     }
 
