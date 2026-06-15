@@ -202,6 +202,11 @@ pub(super) fn handle_clear_blocked_reason(home: &Path, args: &Value) -> Value {
         Some(n) => n,
         None => return json!({"error": "missing 'instance'"}),
     };
+    // CR-2026-06-14: validate the instance name at the MCP boundary before the
+    // CLEAR_BLOCKED_REASON RPC, mirroring the sibling handlers in this file
+    // (handle_interrupt / handle_pane_snapshot). Without it a malformed name
+    // (`../evil`) was forwarded straight to the daemon.
+    crate::validate_name_or_err!(instance);
     let mut params = json!({"name": instance});
     if let Some(r) = args["reason"].as_str() {
         params["reason"] = json!(r);

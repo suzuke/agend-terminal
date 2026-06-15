@@ -130,7 +130,6 @@ fn create_instance_team_name_traversal_rejected_mcp_core_surface() {
 /// BEFORE the RPC, so the error contains neither "API unavailable" nor
 /// "no active daemon".
 #[test]
-#[ignore = "mcp-core-surface F3: red until create_instance clamps/rejects oversized count; remove #[ignore] after fix to confirm"]
 fn create_instance_team_count_capped_mcp_core_surface() {
     let home = tmp_home("f3-count-cap");
 
@@ -165,7 +164,6 @@ fn create_instance_team_count_capped_mcp_core_surface() {
 /// `validate_name_or_err!(instance)`, the malformed name is rejected at the
 /// boundary with a "... invalid characters ..." error.
 #[test]
-#[ignore = "mcp-core-surface F4: red until handle_clear_blocked_reason validates the instance name; remove #[ignore] after fix to confirm"]
 fn clear_blocked_reason_validates_instance_name_mcp_core_surface() {
     let home = tmp_home("f4-clear-blocked");
 
