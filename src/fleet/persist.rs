@@ -272,6 +272,30 @@ fn team_config_to_mapping(config: &TeamConfig) -> serde_yaml_ng::Mapping {
     team
 }
 
+/// First `(new_member, existing_team)` where one of `new_members` already
+/// belongs to a team in `teams`. Drives the one-agent-one-team invariant from
+/// INSIDE the fleet.yaml lock so a concurrent `teams::create` cannot double-book
+/// a member past the stale pre-write snapshot (#CR-2026-06-14 teams.rs:174).
+fn first_member_conflict(
+    teams: &serde_yaml_ng::Mapping,
+    new_members: &[String],
+) -> Option<(String, String)> {
+    for (team_key, team_val) in teams {
+        let Some(team_name) = team_key.as_str() else {
+            continue;
+        };
+        let Some(members) = team_val.get("members").and_then(|m| m.as_sequence()) else {
+            continue;
+        };
+        for existing in members.iter().filter_map(|v| v.as_str()) {
+            if new_members.iter().any(|m| m == existing) {
+                return Some((existing.to_string(), team_name.to_string()));
+            }
+        }
+    }
+    None
+}
+
 pub fn add_team_to_yaml(home: &Path, name: &str, config: &TeamConfig) -> Result<bool> {
     let mut inserted = false;
     mutate_fleet_yaml(home, "teams: {}\n", |doc| {
@@ -284,6 +308,19 @@ pub fn add_team_to_yaml(home: &Path, name: &str, config: &TeamConfig) -> Result<
             .context("teams is not a mapping")?;
         let key = serde_yaml_ng::Value::String(name.to_string());
         if teams.contains_key(&key) {
+            return Ok(false);
+        }
+        // #CR-2026-06-14 (teams.rs:174 TOCTOU): enforce one-agent-one-team INSIDE
+        // the lock-held closure, not only on the pre-write snapshot in
+        // `teams::create`. Two concurrent creates of different team names that
+        // share a member both pass the stale snapshot check; this lock-held
+        // re-check is the authoritative guard that stops the second write from
+        // double-booking the member.
+        if let Some((member, existing_team)) = first_member_conflict(teams, &config.members) {
+            tracing::info!(
+                %member, %existing_team, attempted_team = %name,
+                "team create rejected under lock: member already in another team (one-agent-one-team)"
+            );
             return Ok(false);
         }
         teams.insert(
