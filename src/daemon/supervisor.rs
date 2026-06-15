@@ -378,6 +378,16 @@ fn run_loop(home: PathBuf, registry: AgentRegistry) {
                 reg.values().map(|h| h.name.to_string()).collect()
             };
             notify_tracks.retain(|name, _| live_agents.contains(name));
+            // CR-2026-06-14 (resource-leak): `pending_auth` has NO
+            // cleanup-on-delete path of its own — entries are only removed inside
+            // `resolve_pending_auth` for agents present in THIS tick's `handles`
+            // (live agents). An agent deleted / redeployed while a `Wait`
+            // AuthError notify is still pending is never revisited, so its entry
+            // leaks forever AND a same-name redeploy inherits the stale `from` /
+            // `pane_tail` (the insert uses `.entry(name).or_insert(...)`, which
+            // will NOT overwrite). Sweep it against the live set, mirroring the
+            // `notify_tracks` prune directly above.
+            pending_auth.retain(|name, _| live_agents.contains(name));
         }));
         if let Err(payload) = outcome {
             let msg = if let Some(s) = payload.downcast_ref::<String>() {
@@ -1197,6 +1207,22 @@ fn tick(
         // state-age — so no separate clock can drift. Assigned exactly once
         // inside the (unconditional) lock block below.
         let auth_error_held: Option<Duration>;
+        // CR-2026-06-14 (concurrency): captured under the core lock, the actual
+        // (disk-writing) `clear_waiting_on_if_stale` runs lock-free after the
+        // lock drops — keeps blocking file IO out of the per-agent core-mutex
+        // hold that the PTY read-loop `feed` contends on.
+        let waiting_on_heartbeat_stale: bool;
+        // CR-2026-06-14 (concurrency): hoist the two per-agent disk reads that
+        // feed the awaiting-operator gate OUT of the core lock. Both depend only
+        // on (home, name), not on core state, so reading them lock-free here
+        // removes blocking file IO from the lock window. `read_input_submit_
+        // timestamps` was previously short-circuited behind `check_awaiting_
+        // operator`; computing it unconditionally is a cheap notification-queue
+        // read and the value is still only USED inside that gate, so behavior is
+        // unchanged.
+        let idle_expectation = idle_expectation_for(home, &name);
+        let (typed_ms, _submit_ms) =
+            crate::notification_queue::read_input_submit_timestamps(home, &name);
         let action: Option<NoticeAction> = {
             let mut core = core.lock();
 
@@ -1286,8 +1312,10 @@ fn tick(
                 });
             }
 
-            // §4.4 stale decay: clear waiting_on when heartbeat is stale.
-            clear_waiting_on_if_stale(home, &name, !core.state.is_heartbeat_fresh());
+            // §4.4 stale decay: capture the staleness bool under the lock; the
+            // disk-writing `clear_waiting_on_if_stale` runs lock-free after the
+            // lock drops (CR-2026-06-14 concurrency).
+            waiting_on_heartbeat_stale = !core.state.is_heartbeat_fresh();
 
             let agent_state = core.state.current;
             // #1523: capture how long AuthError has been continuously held (state
@@ -1299,16 +1327,15 @@ fn tick(
             // #1563: role policy gates the two `Starting`-context stall-forward
             // paths (branch-1 startup-stall, branch-2 startup-prose prompt) for
             // an `OnDemand` coordinator; the runtime permission/interactive
-            // escalation stays role-blind (handled inside the fn).
-            let idle_expectation = idle_expectation_for(home, &name);
+            // escalation stays role-blind (handled inside the fn). `idle_
+            // expectation` is captured lock-free above (CR-2026-06-14).
             if core.health.check_awaiting_operator(agent_state, silent) && {
                 // #1552 escalation FP-gates (only reached when silent>30s +
                 // a prompt state). #1530/F2: backend resolved from the
                 // pre-captured command — NO registry re-acquire while holding
                 // core (removes the core→registry inversion).
                 let backend = crate::backend::Backend::from_command(&backend_command);
-                let (typed_ms, _submit_ms) =
-                    crate::notification_queue::read_input_submit_timestamps(home, &name);
+                // `typed_ms` captured lock-free above (CR-2026-06-14).
                 awaiting_escalation_allowed(
                     agent_state,
                     core.state.since.elapsed(),
@@ -1428,6 +1455,13 @@ fn tick(
         // `reaction_kinds` so a UsageLimit final state fires BOTH the operator/
         // propagate path AND member-notify — the latter was silently eaten by
         // the old propagate `continue`.
+
+        // CR-2026-06-14 (concurrency): §4.4 stale decay runs here, lock-free —
+        // it is a disk read + batch write (`clear_waiting_on_if_stale`) that
+        // was contending with the PTY read-loop `feed` under the core lock. The
+        // staleness bool was captured under the lock above.
+        clear_waiting_on_if_stale(home, &name, waiting_on_heartbeat_stale);
+
         if !reaction_intents.is_empty() {
             let config = crate::runtime_config::get();
             for intent in &reaction_intents {

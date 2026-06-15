@@ -57,7 +57,6 @@ fn lock_block_region(src: &str) -> &str {
 }
 
 #[test]
-#[ignore = "daemon-supervisor disk-io-under-core-lock: red until fix; remove #[ignore] after fix to confirm"]
 fn disk_io_not_performed_under_core_lock_daemon_supervisor() {
     let src = supervisor_src();
     let region = lock_block_region(&src);

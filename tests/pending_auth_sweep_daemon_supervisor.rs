@@ -46,7 +46,6 @@ fn supervisor_prod_src() -> String {
 }
 
 #[test]
-#[ignore = "daemon-supervisor pending_auth-leak-no-sweep: red until fix; remove #[ignore] after fix to confirm"]
 fn pending_auth_map_is_gc_pruned_for_deleted_agents_daemon_supervisor() {
     let prod = supervisor_prod_src();
 
