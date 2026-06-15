@@ -528,6 +528,37 @@ fixtures:
     capture_kind: synthetic_from_docs
     provenance: "#848 sub-task — synthetic from Anthropic docs verbatim 529 overloaded string"
 
+  - file: claude-srl-stewing-spinner-2086.raw
+    backend: claude-code
+    cli_version: "2.1.98"
+    recorded_on: "2026-06-09"
+    scenario: |
+      #2086 capture: a genuinely-stuck ServerRateLimit — the pane shows
+      "API Error: Server is temporarily limiting requests (not your usage
+      limit)" with a retry/"stewing" spinner ticking BELOW the error and an
+      injected `[AGEND-AUTO kind=ratelimit-retry] continue` line. The spinner
+      below the error is a stuck-retry tick, NOT proven recovery, so SRL must
+      stay latched (the #2086 keep-latched fix). Real PTY capture — previously
+      orphaned on disk (not wired into MANIFEST); #1523 B0 wires it in to
+      back the SRL coverage with a real capture, not just synthetic_from_docs.
+    expected_transitions: [starting, server_rate_limit]
+    expected_final_state: server_rate_limit
+    expected_final_detect: server_rate_limit
+    capture_kind: real
+    provenance: "#2086 (PR #2087) operator capture — wired into MANIFEST by #1523 B0"
+
+  # NOTE (#1523 B0): the OTHER real SRL capture, claude-srl-narrow-wrap-2089.raw,
+  # is deliberately NOT listed here. It is the #2089 *suppression-miss* repro: a
+  # narrow-pane capture TRUNCATED to the bottom-15 rows, so the `⏺ API Error:`
+  # indicator that lived higher on the real pane is absent and the wrapped SRL is
+  # invisible to single-line detect → it legitimately classifies Idle. Its
+  # dedicated unit test `srl_narrow_wrap_real_capture_reproduces_idle_suppression_2089`
+  # (src/state/tests.rs) reads the file directly and pins exactly that miss
+  # precondition; the full-pane *latch* fix is pinned by the synthetic
+  # `srl_hard_wrapped_narrow_pane_latches_2089`. A MANIFEST replay entry would
+  # only assert [starting, idle] (no SRL coverage) under an SRL-suggesting name,
+  # so it stays unit-test-only by design.
+
   - file: claude-session-limit.raw
     backend: claude-code
     cli_version: "2.1.98"
