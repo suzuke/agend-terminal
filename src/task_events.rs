@@ -1018,6 +1018,33 @@ fn archive_dir(board: &Path) -> PathBuf {
     board.join("task_events_archive")
 }
 
+/// CR-2026-06-14 (#2212 orphan-prune follow-up): does `board` have ANY on-disk
+/// event bytes — a non-empty hot log or a non-empty archive segment?
+///
+/// `replay_at` SKIPS corrupt (non-JSON) lines (#1988 half-write tolerance), so a
+/// board whose ENTIRE log is garbage replays to `Ok(empty)` — indistinguishable
+/// BY STATE from a board that genuinely holds no tasks (terminal tasks stay in
+/// `state.tasks`, so a readable non-empty board always replays ≥1 task). The
+/// orphan-prune ([`crate::tasks::board_router::live_task_ids`]) uses this to
+/// disambiguate: an empty replay WITH on-disk bytes is an unreadable/corrupt
+/// board, not an empty one, so its index entries must NOT be treated as orphans.
+/// Cheap O(1) metadata stats; no parse.
+pub(crate) fn board_has_event_bytes(board: &Path) -> bool {
+    let nonempty = |p: &Path| std::fs::metadata(p).map(|m| m.len() > 0).unwrap_or(false);
+    if nonempty(&log_path(board)) {
+        return true;
+    }
+    if let Ok(entries) = std::fs::read_dir(archive_dir(board)) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) == Some("jsonl") && nonempty(&p) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Append one event, returning the newly assigned monotonic seq#.
 ///
 /// The seq is computed by tail-scanning the hot log under the same lock

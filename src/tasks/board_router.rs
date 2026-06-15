@@ -117,8 +117,20 @@ fn compact_index_gated(
     // FAIL-SAFE: `live_task_ids` returns None if ANY board's replay errors, so a
     // transiently-unreadable board can never be mistaken for "its tasks were all
     // deleted" and false-prune a LIVE task's entry (the highest-risk failure).
-    if let Some(live) = live_task_ids(home) {
-        kept.retain(|e| live.contains(&e.task_id));
+    // It also returns the set of *ambiguous* boards (non-empty on disk but
+    // replayed empty — a whole-file-garbage board that `replay_at` skips into
+    // `Ok(empty)` rather than `Err`); entries on those boards are kept too
+    // (#2212 follow-up), closing the last false-prune gap.
+    if let Some((live, ambiguous_boards)) = live_task_ids(home) {
+        // Keep an entry if its task is live on SOME board, OR its board is
+        // ambiguous (non-empty on disk but replayed empty — corrupt/unreadable,
+        // see `live_task_ids`). Matching on the resolved `board_root` PATH (not
+        // the raw `project_id`) so the slug applied by `board_root` lines up with
+        // the directory names `enumerate_projects` yields.
+        kept.retain(|e| {
+            live.contains(&e.task_id)
+                || ambiguous_boards.contains(&crate::task_events::board_root(home, &e.project_id))
+        });
     }
     if kept.len() == raw_line_count {
         // Nothing removed (no duplicates, no orphans, no corrupt lines) → a
@@ -147,23 +159,46 @@ fn compact_index_gated(
     Ok(())
 }
 
-/// The set of task_ids live on SOME board across ALL projects — the live set for
-/// #2168 Phase-2 orphan-prune. Returns `None` (→ caller SKIPS pruning, dedup
-/// only) if ANY board's replay errors, so a transient read failure of one board
-/// can never be misread as "every task on it was deleted" and false-prune live
-/// entries. A board that simply holds no tasks replays to an empty state (`Ok`)
-/// and contributes nothing; only a corrupt/unreadable EXISTING board yields
-/// `Err`. Covers EVERY board via `enumerate_projects` — missing a board would
-/// false-orphan its live tasks, so completeness here is load-bearing.
-fn live_task_ids(home: &Path) -> Option<std::collections::HashSet<String>> {
+/// The live set for #2168 Phase-2 orphan-prune: `(live_task_ids, ambiguous_boards)`.
+///
+/// - `live_task_ids` — every task_id live on SOME board across ALL projects.
+/// - `ambiguous_boards` — `board_root` paths of boards that replayed to an EMPTY
+///   state yet have on-disk event bytes ([`crate::task_events::board_has_event_bytes`]).
+///   `replay_at` SKIPS corrupt (non-JSON) lines (#1988), so a board whose ENTIRE
+///   log is garbage replays to `Ok(empty)` — NOT `Err`. The #2212 fail-safe
+///   (`None` → skip ALL pruning) only covers the `Err` path, so without this a
+///   whole-file-garbage board would look task-less and its index entries would be
+///   false-pruned → resolve falls to DEFAULT. The caller retains entries whose
+///   board is ambiguous so a corrupt board's entries are NOT treated as orphans.
+///
+/// Returns `None` (→ caller SKIPS pruning, dedup only) if ANY board's replay
+/// errors, so a transient read failure can never be misread as "every task
+/// deleted". A board that genuinely holds no tasks has an empty/absent log
+/// (`board_has_event_bytes` false) → NOT ambiguous → its stale entries prune as
+/// before. Covers EVERY board via `enumerate_projects` — completeness is
+/// load-bearing.
+fn live_task_ids(
+    home: &Path,
+) -> Option<(
+    std::collections::HashSet<String>,
+    std::collections::HashSet<PathBuf>,
+)> {
     let mut live = std::collections::HashSet::new();
+    let mut ambiguous_boards = std::collections::HashSet::new();
     for project in enumerate_projects(home) {
-        let state = crate::task_events::replay_at(&board_root(home, &project)).ok()?;
-        for tid in state.tasks.keys() {
-            live.insert(tid.0.clone());
+        let board = board_root(home, &project);
+        let state = crate::task_events::replay_at(&board).ok()?;
+        if state.tasks.is_empty() {
+            if crate::task_events::board_has_event_bytes(&board) {
+                ambiguous_boards.insert(board);
+            }
+        } else {
+            for tid in state.tasks.keys() {
+                live.insert(tid.0.clone());
+            }
         }
     }
-    Some(live)
+    Some((live, ambiguous_boards))
 }
 
 /// Record a task's project at create time. Append-only under the shared
@@ -675,6 +710,55 @@ mod tests {
         assert!(
             live_task_ids(&home).is_none(),
             "a board whose replay errors must yield None so orphan-prune is skipped"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Phase-2b fail-safe gap (#2212 r2+r4): `read_envelopes_strict` SKIPS corrupt
+    /// (non-JSON) lines (#1988 half-write tolerance), so a board whose ENTIRE log
+    /// is garbage replays to `Ok(empty)` — NOT `Err` — and slips past the
+    /// None-on-Err fail-safe. Such a board is unreadable, NOT task-less: its index
+    /// entry must be kept (ambiguous), not false-pruned to DEFAULT. A GENUINELY
+    /// empty board (dir present, no event bytes) is a true orphan and still prunes.
+    #[test]
+    fn compaction_keeps_entry_on_whole_file_garbage_board_but_prunes_empty() {
+        let home = tmp_home("orphan-garbage");
+        seed_live_task(&home, DEFAULT_PROJECT, "T-live");
+        record_task_project(&home, "T-live", DEFAULT_PROJECT).unwrap();
+
+        // Whole-file-garbage board: dir + a `task_events.jsonl` of pure non-JSON
+        // lines → replay SKIPS every line → Ok(empty), board_has_event_bytes=true.
+        let garbage = board_root(&home, "proj-garbage");
+        std::fs::create_dir_all(&garbage).unwrap();
+        std::fs::write(
+            garbage.join("task_events.jsonl"),
+            "not json at all\n@@@ torn @@@\n\u{fffd}\u{fffd}\u{fffd}\n",
+        )
+        .unwrap();
+        record_task_project(&home, "T-garbage", "proj-garbage").unwrap();
+
+        // Genuinely-empty board: dir present but NO event bytes → a true orphan.
+        let empty = board_root(&home, "proj-empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        record_task_project(&home, "T-empty", "proj-empty").unwrap();
+
+        compact_index_gated(&home, 1, u64::MAX).unwrap();
+
+        assert_eq!(
+            lookup_task_project(&home, "T-garbage").as_deref(),
+            Some("proj-garbage"),
+            "a whole-file-garbage board is ambiguous (unreadable, not empty) — its \
+             entry must NOT be false-pruned (would drop resolution to DEFAULT)"
+        );
+        assert_eq!(
+            lookup_task_project(&home, "T-empty"),
+            None,
+            "a genuinely-empty enumerated board's entry is still pruned as a true orphan"
+        );
+        assert_eq!(
+            lookup_task_project(&home, "T-live").as_deref(),
+            Some(DEFAULT_PROJECT),
+            "live entry preserved"
         );
         std::fs::remove_dir_all(&home).ok();
     }
