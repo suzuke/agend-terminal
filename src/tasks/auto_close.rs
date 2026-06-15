@@ -60,7 +60,10 @@ pub fn auto_close_on_report(
             closed_at: chrono::Utc::now().to_rfc3339(),
         },
     };
-    let emitter = crate::task_events::InstanceName::from("system:auto-close");
+    // CR-2026-06-14: underscore form, matching `acl::SYSTEM_IDENTITIES` +
+    // status_summary. The prior hyphen variant was absent from the ACL allow-list,
+    // so `is_system_identity` denied it if routed through `can_mutate_record`.
+    let emitter = crate::task_events::InstanceName::from("system:auto_close");
     // #1873: re-validate →Done UNDER the lock — a concurrent cancel between the
     // out-of-lock status check above and this append must not be flipped to Done.
     let closed =

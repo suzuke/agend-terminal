@@ -29,7 +29,6 @@ fn production_region(text: &str) -> &str {
 }
 
 #[test]
-#[ignore = "tasks-auto-close-emitter-hyphen: red until fix; remove #[ignore] after fix to confirm"]
 fn auto_close_emitter_matches_acl_allow_list_tasks() {
     let text = read_auto_close();
     let prod = production_region(&text);
