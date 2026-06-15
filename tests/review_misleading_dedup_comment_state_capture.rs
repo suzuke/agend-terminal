@@ -36,7 +36,6 @@ fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 #[test]
-#[ignore = "state-capture #3: red until fix; remove #[ignore] after fix to confirm"]
 fn unclassified_throttle_dedup_comment_is_not_misleading() {
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();

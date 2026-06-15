@@ -53,7 +53,6 @@ fn run_loop_body(src: &str) -> &str {
 }
 
 #[test]
-#[ignore = "daemon-supervisor router-retain-ungated-push: red until fix; remove #[ignore] after fix to confirm"]
 fn router_retain_probe_does_not_ungated_push_into_mirror_buffer_daemon_supervisor() {
     let src = router_src();
     let body = run_loop_body(&src);

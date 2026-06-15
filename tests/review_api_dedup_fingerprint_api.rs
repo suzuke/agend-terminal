@@ -49,7 +49,6 @@ fn request_dedup_rs() -> PathBuf {
 }
 
 #[test]
-#[ignore = "dedup-keys-only-on-request_id-no-fingerprint: red until fix; remove #[ignore] after fix to confirm"]
 fn dedup_entry_carries_a_request_fingerprint_api() {
     let path = request_dedup_rs();
     let src = std::fs::read_to_string(&path).expect("read request_dedup.rs");

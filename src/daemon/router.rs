@@ -112,21 +112,34 @@ fn run_loop(home: PathBuf, reg_rx: crossbeam_channel::Receiver<AgentSubscription
 
         // Process PTY events from all subscribed agents.
         let mut had_activity = false;
+        // CR-2026-06-14 #39: senders that disconnected during the drain below,
+        // collected here so the post-loop `buffers.retain` can be a PURE liveness
+        // probe (see its comment) rather than a second, ungated try_recv.
+        let mut disconnected: Vec<String> = Vec::new();
         for (name, buf) in buffers.iter_mut() {
-            while let Ok(data) = buf.rx.try_recv() {
-                had_activity = true;
-                buf.last_output_at = Instant::now();
+            loop {
+                match buf.rx.try_recv() {
+                    Ok(data) => {
+                        had_activity = true;
+                        buf.last_output_at = Instant::now();
 
-                let pair = crate::daemon::heartbeat_pair::snapshot_for(name);
-                if pair.reply_to_channel.is_some() {
-                    buf.active = true;
-                    buf.input_id = pair.reply_to_input_id;
-                    let text = String::from_utf8_lossy(&data);
-                    buf.buffer.push_str(&text);
-                    apply_mirror_cap(&mut buf.buffer);
-                } else {
-                    buf.active = false;
-                    buf.buffer.clear();
+                        let pair = crate::daemon::heartbeat_pair::snapshot_for(name);
+                        if pair.reply_to_channel.is_some() {
+                            buf.active = true;
+                            buf.input_id = pair.reply_to_input_id;
+                            let text = String::from_utf8_lossy(&data);
+                            buf.buffer.push_str(&text);
+                            apply_mirror_cap(&mut buf.buffer);
+                        } else {
+                            buf.active = false;
+                            buf.buffer.clear();
+                        }
+                    }
+                    Err(crossbeam_channel::TryRecvError::Empty) => break,
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                        disconnected.push(name.clone());
+                        break;
+                    }
                 }
             }
 
@@ -139,15 +152,16 @@ fn run_loop(home: PathBuf, reg_rx: crossbeam_channel::Receiver<AgentSubscription
             }
         }
 
-        buffers.retain(|_, buf| match buf.rx.try_recv() {
-            Ok(data) => {
-                let text = String::from_utf8_lossy(&data);
-                buf.buffer.push_str(&text);
-                true
-            }
-            Err(crossbeam_channel::TryRecvError::Empty) => true,
-            Err(crossbeam_channel::TryRecvError::Disconnected) => false,
-        });
+        // CR-2026-06-14 #39 (correctness): drop buffers whose sender disconnected.
+        // PURE liveness probe — no second try_recv, no payload consumption. The
+        // prior version's `Ok(data) => buf.buffer.push_str(&text)` arm pushed
+        // bytes consumed here into the mirror buffer UNGATED: it ignored the
+        // `reply_to_channel`/`heartbeat_pair` gate (mixing stray bytes in while
+        // mirroring was inactive) and skipped `apply_mirror_cap` (an oversized
+        // chunk bypassed the 2*MAX_MIRROR_LEN cap). All consume + gating now
+        // happens once, in the gated drain loop above; a chunk that races in
+        // after the drain is picked up next iteration through that same path.
+        buffers.retain(|name, _| !disconnected.contains(name));
 
         if !had_activity {
             std::thread::sleep(Duration::from_millis(100));
@@ -502,32 +516,14 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    #[test]
-    fn retain_preserves_received_data() {
-        let (tx, rx) = crossbeam_channel::bounded::<Vec<u8>>(8);
-        let mut buffers = std::collections::HashMap::new();
-        buffers.insert(
-            "agent".to_string(),
-            AgentBuffer {
-                rx,
-                buffer: String::new(),
-                active: false,
-                last_output_at: Instant::now(),
-                input_id: None,
-            },
-        );
-        tx.send(b"hello".to_vec()).unwrap();
-        buffers.retain(|_, buf| match buf.rx.try_recv() {
-            Ok(data) => {
-                let text = String::from_utf8_lossy(&data);
-                buf.buffer.push_str(&text);
-                true
-            }
-            Err(crossbeam_channel::TryRecvError::Empty) => true,
-            Err(crossbeam_channel::TryRecvError::Disconnected) => false,
-        });
-        assert_eq!(buffers["agent"].buffer, "hello");
-    }
+    // CR-2026-06-14 #39: `retain_preserves_received_data` was REMOVED. It built a
+    // COPY of the trailing `buffers.retain` closure and asserted its Ok-arm pushed
+    // consumed bytes into `buf.buffer` — i.e. it PINNED the ungated-push bug this
+    // fix removes. The post-fix `buffers.retain` is a pure liveness probe (drops
+    // disconnected buffers, no payload push); the source-scan repro
+    // `router_retain_probe_does_not_ungated_push_into_mirror_buffer_daemon_supervisor`
+    // (tests/) now guards that invariant. Gated consume is covered by
+    // `apply_mirror_cap` tests + the run_loop drain path.
 
     #[test]
     fn mirror_dispatch_falls_back_to_active_channel_when_lookup_fails() {
