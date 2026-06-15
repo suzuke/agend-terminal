@@ -52,7 +52,6 @@ fn fn_body(src: &str, sig_needle: &str) -> String {
 }
 
 #[test]
-#[ignore = "worktree-git #5 gh-subprocess-timeout: red until fix; remove #[ignore] after fix to confirm"]
 fn github_scm_provider_run_is_timeout_bounded_worktree_git_5() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/scm/mod.rs");
     let src = std::fs::read_to_string(&path).expect("read src/scm/mod.rs");
