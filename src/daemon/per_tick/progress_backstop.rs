@@ -117,9 +117,13 @@ impl ProgressBackstopHandler {
     }
 
     /// Resolve the live agent under the registry lock (released before the
-    /// blocking PTY write) and inject the self-report nudge, tagged
-    /// `[AGEND-AUTO kind=progress-backstop]` so an orchestrator doesn't mistake
-    /// it for an operator command. Best-effort — a missing/failed target drops.
+    /// blocking PTY write) and inject the self-report nudge, tagged with the
+    /// actionable `[AGEND-PROGRESS]` marker (#2090 O1) — NOT `[AGEND-AUTO]`, which
+    /// the agent is taught to NEVER act on. The marker is embedded in the text and
+    /// injected with `auto_kind = None` (mirroring the `[AGEND-RESUME]` path), so
+    /// the daemon-vocabulary tag is present without piggy-backing on the never-act
+    /// `[AGEND-AUTO]` prefix. Still daemon-originated, not operator authority.
+    /// Best-effort — a missing/failed target drops.
     fn inject_backstop(
         home: &std::path::Path,
         registry: &crate::agent::AgentRegistry,
@@ -136,14 +140,14 @@ impl ProgressBackstopHandler {
                 .map(agent::InjectTarget::from_handle)
         };
         if let Some(tgt) = target {
-            let payload = crate::reply_ledger::backstop_nudge_text(channel, armed_at_ms, now);
-            let _ = agent::inject_with_target_gated(
-                &tgt,
-                name,
-                payload.as_bytes(),
-                false,
-                Some("progress-backstop"),
+            let payload = format!(
+                "{} {}",
+                agent::DAEMON_PROGRESS_INJECT_MARKER,
+                crate::reply_ledger::backstop_nudge_text(channel, armed_at_ms, now)
             );
+            // auto_kind = None: the marker is already embedded, so we do NOT want
+            // the `[AGEND-AUTO kind=…]` (never-act) prefix prepended on top.
+            let _ = agent::inject_with_target_gated(&tgt, name, payload.as_bytes(), false, None);
         }
     }
 }

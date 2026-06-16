@@ -2149,6 +2149,17 @@ fn daemon_auto_prefix(kind: &str) -> String {
 /// muddied: `[AGEND-AUTO]` = never act, `[AGEND-RESUME]` = run your recovery.
 pub(crate) const DAEMON_RESUME_INJECT_MARKER: &str = "[AGEND-RESUME]";
 
+/// #2090 O1: progress-backstop marker — DISTINCT from both [`DAEMON_AUTO_INJECT_MARKER`]
+/// and [`DAEMON_RESUME_INJECT_MARKER`]. Like `[AGEND-RESUME]` (and unlike the
+/// never-act `[AGEND-AUTO]`), `[AGEND-PROGRESS]` is **actionable**: it asks the
+/// agent to post a brief progress update on its in-flight external-channel
+/// request. It is still daemon-originated and NOT operator authority — the agent
+/// must not dispatch a task or make a decision from it beyond posting the update.
+/// A separate marker (NOT an `[AGEND-AUTO]` per-kind carve-out, mirroring the
+/// `[AGEND-RESUME]` design) so the `[AGEND-AUTO]` "never act" blanket stays clean:
+/// the report-mode backstop must be acted on, so it can't wear the never-act tag.
+pub(crate) const DAEMON_PROGRESS_INJECT_MARKER: &str = "[AGEND-PROGRESS]";
+
 /// The fixed first turn injected ONCE after a fresh-restart respawn. It is an
 /// actionable SELF-bootstrap trigger (recover the agent's OWN in-flight state),
 /// NOT an operator command and NOT authority to dispatch new work. Ordering per
