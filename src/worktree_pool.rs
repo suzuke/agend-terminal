@@ -2723,9 +2723,18 @@ mod tests {
             crate::git_helpers::git_cmd(repo, &["worktree", "list", "--porcelain"])
                 .unwrap_or_default()
         };
-        assert!(
-            wt_listed(&repo).contains(&ws.display().to_string().replace('\\', "/"))
-                || wt_listed(&repo).contains(&ws.display().to_string())
+        // Precondition: workspace is registered as a 2nd worktree (canonical +
+        // workspace). Count rather than substring-match the path — git porcelain
+        // emits a canonicalized path form (drive-case / separator) that need not
+        // equal ws.display() on Windows.
+        let before = wt_listed(&repo);
+        assert_eq!(
+            before
+                .lines()
+                .filter(|l| l.starts_with("worktree "))
+                .count(),
+            2,
+            "workspace registered before reverse_reconcile: {before}"
         );
 
         reverse_reconcile(&home, "devd").expect("reverse_reconcile");
