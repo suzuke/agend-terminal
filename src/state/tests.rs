@@ -2269,17 +2269,16 @@ fn claude_server_throttle_fixture_triggers_server_rate_limit() {
     assert_eq!(t.get_state(), AgentState::ServerRateLimit);
 }
 
-/// #2090 P2 shadow — the instrument MUST NOT change classification (zero-behavior)
-/// for a pattern that has NOT been promoted to a rescue. UsageLimit was promoted
-/// (see `usagelimit_hard_wrapped_banner_rescued_2090`), so this now pins the
-/// invariant on ContextFull, which stays shadow-only: a narrow-pane hard-wrapped
-/// `compacting context` that the raw grid misses is LOGGED as a candidate but NOT
-/// rescued, so the state stays Idle.
+/// #2090: ContextFull has NO narrow-pane rescue caller (unlike UsageLimit — see
+/// `usagelimit_hard_wrapped_banner_rescued_2090`). A hard-wrapped `compacting
+/// context` that the single-line regex misses must therefore stay benign (Idle),
+/// NOT relatch to ContextFull — guarding against accidentally re-amplifying the
+/// context-prose false positives (#2090) via a content-blind rescue.
 #[test]
-fn hardwrap_miss_shadow_is_zero_behavior_2090() {
+fn contextfull_narrow_wrap_not_rescued_2090() {
     // "compacting context" hard-wrapped across narrow rows → the single-line
-    // ContextFull regex misses it; the ❯ prompt lands Idle. The shadow logs a
-    // candidate but does not classify (no ContextFull rescue in P2).
+    // ContextFull regex misses it; the ❯ prompt lands Idle. There is no
+    // ContextFull rescue caller, so the state stays Idle.
     let screen = "the agent is\n\
                   compacting\n\
                   context now\n\
@@ -2290,50 +2289,8 @@ fn hardwrap_miss_shadow_is_zero_behavior_2090() {
     assert_ne!(
         t.get_state(),
         AgentState::ContextFull,
-        "#2090: ContextFull stays shadow-only (instrument-only) — the hard-wrapped \
-         phrase is logged as a candidate but NOT rescued/relatched (zero behavior)"
-    );
-}
-
-/// #2090 P2 shadow — the pure candidate detector fires on a hard-wrapped target
-/// the raw grid missed, and does NOT fire when the raw grid already found it or
-/// on a benign frame.
-#[test]
-fn hardwrap_miss_candidate_detects_wrapped_target_2090() {
-    let patterns = StatePatterns::for_backend(&Backend::ClaudeCode);
-    let markers = crate::backend_profile::profile(&Backend::ClaudeCode).input_line_markers;
-
-    // (1) hard-wrapped UsageLimit, raw misses → candidate.
-    let wrapped_ul = "⎿ You've hit\nyour weekly\nlimit · resets\n4am\n\n❯\n";
-    assert_eq!(
-        hardwrap_miss_candidate(patterns, wrapped_ul, markers).map(|(s, _)| s),
-        Some(AgentState::UsageLimit),
-        "flatten recovers the wrapped UsageLimit banner the raw grid missed"
-    );
-
-    // (2) hard-wrapped ContextFull, raw misses → candidate.
-    let wrapped_cf = "the agent is\ncompacting\ncontext now\n\n❯\n";
-    assert_eq!(
-        hardwrap_miss_candidate(patterns, wrapped_cf, markers).map(|(s, _)| s),
-        Some(AgentState::ContextFull),
-        "flatten recovers the wrapped ContextFull phrase the raw grid missed"
-    );
-
-    // (3) UsageLimit on ONE line — the raw grid already detects it → NOT a
-    // hard-wrap miss (no candidate; the flatten recovered nothing new).
-    let flat_ul = "You've hit your weekly limit · resets 4am\n\n❯\n";
-    assert_eq!(
-        hardwrap_miss_candidate(patterns, flat_ul, markers),
-        None,
-        "raw grid already detects the non-wrapped banner → not a hard-wrap miss"
-    );
-
-    // (4) benign frame mentioning the keyword but not the full phrase → no candidate.
-    let benign = "let me check the rate limit config in the file\n\n❯\n";
-    assert_eq!(
-        hardwrap_miss_candidate(patterns, benign, markers),
-        None,
-        "a bare keyword without the full banner phrase must not be a candidate"
+        "#2090: ContextFull has no rescue caller — a hard-wrapped phrase the raw \
+         regex misses must stay benign (Idle), not relatch to ContextFull"
     );
 }
 

@@ -225,10 +225,6 @@ pub struct StateTracker {
     /// call. Used to skip re-detection when the screen hasn't changed —
     /// crucial for not resetting `last_output` on cursor-blink noise.
     last_screen_hash: Option<u64>,
-    /// #2090 P2 shadow-instrument fire-once latch: `(pattern, hash(matched))` of
-    /// the last logged hard-wrap-miss candidate, so a static narrow-pane banner
-    /// isn't re-logged every frame (on top of the feed-level screen hash-dedup).
-    last_hardwrap_miss_sig: Option<(AgentState, u64)>,
     patterns: Option<&'static StatePatterns>,
     /// Context% telemetry: compiled `BackendProfile::context_pattern`
     /// (capture group 1 = the backend's self-reported context usage percent).
@@ -436,23 +432,6 @@ const ERROR_TAIL_SCAN_LINES: usize = 15;
 /// (still only the visible grid, never scrollback) so `throttle_indicator_adjacent`
 /// can validate the real throttle; the char-proximity guard keeps it FP-safe.
 const HARD_WRAP_TAIL_LINES: usize = 40;
-
-/// #2090 P2 shadow-instrument cheap pre-filter: a target keyword must appear on
-/// screen before the (allocating) flatten + re-detect runs. Substrings drawn
-/// from the UsageLimit / ContextFull pattern alternations across backends
-/// (`backend_profile.rs`) — broad enough to catch a hard-wrapped phrase (the
-/// keyword survives even when the full phrase wraps across rows), narrow enough
-/// to fast-reject the common no-target frame. The full-phrase regex match in
-/// `detect_with_match` is the real gate; this only avoids flattening benign frames.
-const HARDWRAP_SHADOW_HINTS: &[&str] = &[
-    "limit",          // UsageLimit: session/weekly/Opus/usage limit, reached the limit
-    "Credit balance", // UsageLimit: claude credit-balance banner
-    "credit_balance", // UsageLimit: codex credit_balance_too_low
-    "Quota",          // UsageLimit: ServiceQuotaExceeded / Quota Limit Exceeded
-    "context",        // ContextFull: context window overflow / context full|limit
-    "Context",        // ContextFull: ContextOverflow (capitalized)
-    "compact",        // ContextFull: compacting context
-];
 
 fn recent_screen_tail(screen_text: &str, n: usize) -> String {
     let lines: Vec<&str> = screen_text.lines().collect();
@@ -966,52 +945,6 @@ fn flattened_guarded_detect(
     Some(state)
 }
 
-/// #2090 P2 shadow: pure candidate detector (testable without IO/env). Returns
-/// `Some((pattern, matched))` when a flattened-tail re-detect finds a
-/// UsageLimit/ContextFull that the raw single-line grid detect MISSED — i.e. a
-/// narrow-pane hard-wrap-miss candidate. `None` when no target keyword is on
-/// screen, when the flatten finds no target pattern, or when the raw grid ALSO
-/// found it (so the flatten recovered nothing new — not a hard-wrap miss).
-///
-/// This is the SHADOW's detection only — it never decides classification; the
-/// caller [`StateTracker::capture_hardwrap_miss_shadow`] just logs the result.
-/// NO per-pattern anchor guard is applied (unlike the SRL rescue caller): the
-/// shadow deliberately captures the RAW flatten-vs-raw divergence so the FP
-/// profile (real miss vs prose quote) can be judged from the logged raw tail.
-fn hardwrap_miss_candidate(
-    patterns: &crate::state::patterns::StatePatterns,
-    screen_text: &str,
-    input_line_markers: &[&str],
-) -> Option<(AgentState, String)> {
-    // Cheap pre-filter: only flatten when a target keyword is on screen at all
-    // (the full-phrase regex is the real gate; this fast-rejects benign frames
-    // before the flatten allocation).
-    if !HARDWRAP_SHADOW_HINTS
-        .iter()
-        .any(|t| screen_text.contains(t))
-    {
-        return None;
-    }
-    let tail = recent_screen_tail(screen_text, HARD_WRAP_TAIL_LINES);
-    let flat = tail
-        .lines()
-        .filter(|line| !crate::state::patterns::is_input_line(line, input_line_markers))
-        .flat_map(str::split_whitespace)
-        .collect::<Vec<_>>()
-        .join(" ");
-    let (flat_state, matched) = patterns.detect_with_match(&flat)?;
-    if !matches!(flat_state, AgentState::UsageLimit | AgentState::ContextFull) {
-        return None;
-    }
-    // Raw single-line detect over the live grid (what feed_with_fg's match arm
-    // saw). If it ALSO found this pattern, the flatten recovered nothing → not a
-    // hard-wrap miss.
-    if patterns.detect_with_match(screen_text).map(|(s, _)| s) == Some(flat_state) {
-        return None;
-    }
-    Some((flat_state, matched.to_string()))
-}
-
 /// Chars before a throttle match within which a real error indicator must sit for
 /// the [`flattened_throttle_detect`] prose-FP guard. A hard-wrapped SRL renders
 /// the `API Error:` prefix directly before the throttle phrase (≈10–30 chars); 80
@@ -1174,7 +1107,6 @@ impl StateTracker {
             last_productive_marker_hash: None,
             last_anchor_suppress_hash: None,
             last_screen_hash: None,
-            last_hardwrap_miss_sig: None,
             patterns: backend.map(StatePatterns::for_backend),
             context_regex: backend
                 .map(crate::backend_profile::profile)
@@ -1537,11 +1469,6 @@ impl StateTracker {
         // miss can be diagnosed. Zero behavior change (runs AFTER classify,
         // never touches `self.current`/retry).
         self.capture_unclassified_throttle(screen_text, fg);
-
-        // #2090 P2 instrument-first: zero-behavior shadow for UsageLimit /
-        // ContextFull hard-wrap misses — gathers real evidence before any rescue
-        // caller (gated on this data). Returns nothing; landed state unchanged.
-        self.capture_hardwrap_miss_shadow(screen_text, fg);
 
         // Instrumentation 2 — Sprint 27 shadow-mode behavioral telemetry.
         self.record_shadow_telemetry(silence_since_last_feed);
@@ -2316,65 +2243,6 @@ impl StateTracker {
                 agent = %self.instance_name,
                 error = %e,
                 "#1562: failed to append unclassified-throttle diagnostic"
-            );
-        }
-    }
-
-    /// #2090 P2 zero-behavior shadow-instrument (instrument-first per decision
-    /// d-20260613151736254757-0): for UsageLimit + ContextFull, compare a
-    /// flattened-tail re-detect against the raw single-line detect over the live
-    /// grid. When the flatten finds one of these patterns that the raw grid
-    /// MISSED (`raw != that pattern`), it's a narrow-pane hard-wrap-miss
-    /// CANDIDATE — side-log it (to `hardwrap_miss_shadow.jsonl`, parallel to the
-    /// #1562 sidecar) so real evidence accrues BEFORE building a rescue caller.
-    /// The #2090 P2 rescue callers are GATED on this data: there is zero evidence
-    /// today that these two patterns actually mis-detect on narrow panes (SRL had
-    /// the #2089 live capture; these don't), and content-blind flatten of
-    /// UsageLimit risks amplifying the #1955 self-poisoning FP — so we measure
-    /// first. Each record carries the raw tail + raw-detect state so the FP-rate
-    /// (real hard-wrap miss vs prose quote) is computable offline.
-    ///
-    /// Invariants:
-    /// - **Zero behavior change** — runs after classify; reads `patterns` +
-    ///   `self.current`, mutates ONLY the dedup latch; returns nothing; never
-    ///   touches landed state, retry, or any timer (existing state tests, which
-    ///   assert classification outcomes, are the zero-regression proof).
-    /// - **Low-noise** — cheap keyword pre-filter avoids flattening benign frames;
-    ///   a per-`(pattern, hash(matched))` fire-once latch sits on top of the
-    ///   feed-level screen hash-dedup, so a static banner logs once; IO err swallowed.
-    fn capture_hardwrap_miss_shadow(&mut self, screen_text: &str, fg: &[CellFg]) {
-        let Some(patterns) = self.patterns else {
-            return;
-        };
-        let Some((flat_state, matched)) =
-            hardwrap_miss_candidate(patterns, screen_text, self.input_line_markers)
-        else {
-            return;
-        };
-        // Per-(pattern, matched) fire-once latch (on top of the feed-level screen
-        // hash-dedup) so a static narrow-pane banner logs once, not every frame.
-        let sig = (flat_state, hash_screen(&matched));
-        if self.last_hardwrap_miss_sig == Some(sig) {
-            return;
-        }
-        self.last_hardwrap_miss_sig = Some(sig);
-        let raw_state = patterns.detect_with_match(screen_text).map(|(s, _)| s);
-        let record = serde_json::json!({
-            "ts": chrono::Utc::now().to_rfc3339(),
-            "backend": self.backend_name,
-            "pattern": flat_state.display_name(),
-            "raw_state": raw_state.map(|s| s.display_name().to_string()),
-            "landed_state": self.current.display_name(),
-            "matched": matched,
-            "raw_tail": ansi_colored_tail(screen_text, fg, HARD_WRAP_TAIL_LINES),
-        });
-        let path = crate::home_dir().join("hardwrap_miss_shadow.jsonl");
-        if let Err(e) = append_jsonl(&path, &record) {
-            tracing::debug!(
-                target: "state_detection",
-                agent = %self.instance_name,
-                error = %e,
-                "#2090 P2 shadow: failed to append hardwrap-miss diagnostic"
             );
         }
     }
