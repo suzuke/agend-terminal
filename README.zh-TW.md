@@ -147,6 +147,10 @@ graph LR
 
 agend-terminal 會修改被啟動 agent 的 git 行為（PATH shim、commit trailer、deny matrix、daemon 管理的 worktree）。你自己的終端機**不受影響**。啟動 daemon 前請先讀 [`docs/GIT-BEHAVIOR.zh-TW.md`](docs/GIT-BEHAVIOR.zh-TW.md)。
 
+## 貢獻
+
+歡迎貢獻——請見 [CONTRIBUTING.zh-TW.md](CONTRIBUTING.zh-TW.md)。所有 commit 都必須簽署（`git commit -s`）以認證 [Developer Certificate of Origin](DCO);CI 會在每個 pull request 強制檢查。
+
 ## 授權條款
 
 MIT

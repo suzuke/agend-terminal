@@ -150,6 +150,10 @@ graph LR
 
 agend-terminal modifies git behavior for spawned agents (PATH shim, commit trailers, deny matrix, daemon-managed worktrees). Your own terminal is **not** affected. Read [`docs/GIT-BEHAVIOR.md`](docs/GIT-BEHAVIOR.md) before starting the daemon.
 
+## Contributing
+
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). All commits must be signed off (`git commit -s`) to certify the [Developer Certificate of Origin](DCO); CI enforces this on every pull request.
+
 ## License
 
 MIT

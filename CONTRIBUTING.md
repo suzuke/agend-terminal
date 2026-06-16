@@ -62,6 +62,24 @@ Coverage is observation-only — not a merge gate. PRs that drop project coverag
    - `merge:` PR-style aggregation (used when landing review rounds)
 4. **PR description** — what changed and why. Tie bug fixes to evidence (stack trace, repro, test that failed before).
 
+## Sign-off (Developer Certificate of Origin)
+
+Every commit must be **signed off**. By signing off you certify the [Developer Certificate of Origin](DCO) (DCO 1.1) — that you wrote the change, or otherwise have the right to submit it under the project's [Apache-2.0](LICENSE) license. CI enforces this on every pull request (`.github/workflows/dco.yml`): a commit without a valid `Signed-off-by` trailer fails the **DCO** check (merge commits and bot commits are exempt).
+
+Add the trailer automatically with `-s`:
+
+```bash
+git commit -s -m "fix: ..."     # appends: Signed-off-by: Your Name <you@example.com>
+```
+
+The `Signed-off-by` line uses your `git config user.name` / `user.email`. To sign off commits you already made:
+
+```bash
+git commit --amend -s --no-edit            # the last commit
+git rebase --signoff origin/main           # every commit on the branch
+# then: git push --force-with-lease
+```
+
 ## Review Process
 
 Here's what to expect once you open an issue or PR — the aim is fast, concrete feedback, not ceremony.

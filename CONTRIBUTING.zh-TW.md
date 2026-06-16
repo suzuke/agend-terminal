@@ -62,6 +62,24 @@ cargo llvm-cov --workspace --tests --html     # HTML report at target/llvm-cov/h
    - `merge:` PR 風格的彙整（用於合進多輪 review 時）
 4. **PR 描述**——說明改了什麼、為什麼改。把 bug fix 連結到證據（stack trace、重現步驟、修復前會失敗的測試）。
 
+## 簽署（Developer Certificate of Origin）
+
+每個 commit 都必須**簽署（sign-off）**。簽署即代表你認證 [Developer Certificate of Origin](DCO)（DCO 1.1）——你撰寫了這項變更，或以其他方式擁有在本專案 [Apache-2.0](LICENSE) 授權下提交它的權利。CI 會在每個 pull request 強制檢查（`.github/workflows/dco.yml`）:任何缺少有效 `Signed-off-by` trailer 的 commit 會讓 **DCO** 檢查失敗（merge commit 與 bot commit 豁免）。
+
+用 `-s` 自動加上 trailer:
+
+```bash
+git commit -s -m "fix: ..."     # 附上:Signed-off-by: Your Name <you@example.com>
+```
+
+`Signed-off-by` 會使用你的 `git config user.name` / `user.email`。要替已經做好的 commit 補簽署:
+
+```bash
+git commit --amend -s --no-edit            # 最後一個 commit
+git rebase --signoff origin/main           # 分支上的每個 commit
+# 然後:git push --force-with-lease
+```
+
 ## Review 流程
 
 以下是你開 issue 或 PR 之後可以預期的狀況——目標是快速、具體的回饋，而不是繁文縟節。

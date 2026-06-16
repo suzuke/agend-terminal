@@ -1,0 +1,65 @@
+name: DCO
+
+# Verifies every commit in a pull request carries a Developer Certificate of
+# Origin `Signed-off-by` trailer (see /DCO). Pure inline shell over the
+# pre-installed `gh` CLI + `jq` — no third-party actions, no checkout, zero
+# supply-chain surface. Merge commits (no original authorship to certify) and
+# bot authors (cannot sign a DCO) are exempt. Lead wires this as a required
+# status check via branch protection separately.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: dco-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  dco:
+    name: Signed-off-by
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify Signed-off-by on every commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          # All commits in the PR (paginated — handles the >250 ceiling).
+          commits="$(gh api --paginate "repos/${REPO}/pulls/${PR}/commits")"
+
+          # jq does the whole gate in one pass: skip merge commits (>=2 parents)
+          # and bot authors, then keep only commits whose message has NO valid
+          # `Signed-off-by: Name <email>` trailer. Output = one line per offender.
+          unsigned="$(printf '%s' "$commits" | jq -r '
+            .[]
+            | select((.parents | length) < 2)
+            | select(((.commit.author.email // "") | test("\\[bot\\]")) | not)
+            | select((.commit.message | test("(?im)^[ \\t]*Signed-off-by:[ \\t]+.+ <[^>]+@[^>]+>[ \\t]*$")) | not)
+            | "  - \(.sha[0:12])  \(.commit.message | split("\n")[0])"
+          ')"
+
+          if [ -n "$unsigned" ]; then
+            echo "::error::One or more commits are missing a Developer Certificate of Origin sign-off."
+            echo "Commits without a valid 'Signed-off-by:' trailer:"
+            echo "$unsigned"
+            echo ""
+            echo "By signing off you certify the Developer Certificate of Origin (see ./DCO)."
+            echo "Fix it:"
+            echo "  - new commits:       git commit -s"
+            echo "  - amend the last:    git commit --amend -s --no-edit && git push --force-with-lease"
+            echo "  - all PR commits:    git rebase --signoff origin/main && git push --force-with-lease"
+            echo "See CONTRIBUTING.md for details."
+            exit 1
+          fi
+
+          echo "All non-merge, non-bot commits carry a DCO Signed-off-by. ✓"
