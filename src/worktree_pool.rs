@@ -1003,6 +1003,184 @@ pub(crate) fn collect_managed_worktrees(root: &Path, max_depth: usize, out: &mut
     }
 }
 
+/// #2234 Phase 2: derive the owning agent from a worktree path, layout-aware —
+/// the FIRST path component under whichever managed root contains it. Used as
+/// the fallback when the `.agend-managed` marker lacks an authoritative `agent=`.
+///
+/// - `<home>/worktrees/<agent>/<branch...>` → `<agent>` (slash branches nest
+///   deeper; the first component is the agent — #worktree-git-6).
+/// - `<home>/workspace/<agent>` (cure-(B): the worktree IS the workspace dir) →
+///   `<agent>` (the dir name). The OLD fallback used the immediate PARENT dir
+///   name here → `"workspace"` (the root, not the agent) → liveness keyed on a
+///   non-agent → a live agent's `/workspace` cwd could be GC-reclaimed (#2234
+///   no-wrong-delete break). Strip-prefix per managed root fixes it.
+///
+/// `None` when the path is under neither managed root — the caller treats that
+/// as unresolvable and SKIPS the worktree (fail-toward-alive), never guessing
+/// from the parent dir.
+fn agent_from_layout(home: &Path, wt_path: &Path) -> Option<String> {
+    for root in [
+        daemon_managed_worktree_root(home),
+        crate::paths::workspace_dir(home),
+    ] {
+        if let Ok(rel) = wt_path.strip_prefix(&root) {
+            if let Some(s) = rel
+                .components()
+                .next()
+                .and_then(|c| c.as_os_str().to_str())
+                .filter(|s| !s.is_empty())
+            {
+                return Some(s.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// #2234 Phase 2: one daemon-managed worktree, layout-agnostic. The single
+/// enumeration shape consumed by Phase 1c `release_stale_branch_holders` and
+/// (future) the GC scan — replacing the dual fs-root scans that assume the
+/// `worktrees/<agent>/<branch>` layout and miss `/workspace/<agent>` worktrees
+/// once cure-(B) moves them there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedWorktree {
+    /// Canonicalized worktree directory.
+    pub path: PathBuf,
+    /// Owning agent (marker `agent=` authoritative, else layout-derived).
+    pub agent: Option<String>,
+    /// HEAD branch from the registry (`None` = detached or fs-only/orphan).
+    pub branch: Option<String>,
+    /// `true` if it appears in `git worktree list` (canonical knows it).
+    pub registered: bool,
+}
+
+/// Parse `git worktree list --porcelain` into `(path, branch)` pairs. Porcelain
+/// records are blank-line-separated; `worktree <path>` opens a record, `branch
+/// refs/heads/<b>` names the checked-out branch (absent = detached).
+fn parse_worktree_porcelain(out: &str) -> Vec<(PathBuf, Option<String>)> {
+    let mut records = Vec::new();
+    let mut cur_path: Option<PathBuf> = None;
+    let mut cur_branch: Option<String> = None;
+    let flush = |p: &mut Option<PathBuf>, b: &mut Option<String>, out: &mut Vec<_>| {
+        if let Some(path) = p.take() {
+            out.push((path, b.take()));
+        }
+        *b = None;
+    };
+    for line in out.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            flush(&mut cur_path, &mut cur_branch, &mut records);
+            cur_path = Some(PathBuf::from(p.trim()));
+        } else if let Some(b) = line.strip_prefix("branch ") {
+            cur_branch = Some(
+                b.trim()
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or(b.trim())
+                    .to_string(),
+            );
+        }
+    }
+    flush(&mut cur_path, &mut cur_branch, &mut records);
+    records
+}
+
+/// #2234 Phase 2: enumerate EVERY daemon-managed worktree across BOTH layouts
+/// (`worktrees/<agent>/<branch>` and cure-(B) `workspace/<agent>`), unioning the
+/// canonical registry (authoritative for any path) with an fs-scan of the known
+/// roots (catches orphan dirs whose registration was pruned). Single source of
+/// truth replacing the dual fs-root scans. De-duped by canonicalized path.
+///
+/// no-miss: any real worktree is registered (in `git worktree list`) OR a dir
+/// under a known root (in the fs-scan) — both false ⟹ it doesn't exist. The
+/// union therefore covers the full set: `git worktree list` alone misses orphan
+/// dirs; the fs-scan alone misses pruned-registration / non-standard roots.
+pub fn enumerate_managed_worktrees(home: &Path, source_repo: &Path) -> Vec<ManagedWorktree> {
+    let worktrees_root = daemon_managed_worktree_root(home);
+    let workspace = crate::paths::workspace_dir(home);
+    let canon = |p: &Path| dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let (croot, cws) = (canon(&worktrees_root), canon(&workspace));
+    let under_managed = |cp: &Path| cp.starts_with(&croot) || cp.starts_with(&cws);
+    // Agent = first path component under whichever CANONICAL managed root
+    // contains the (canonical) worktree path. Derived against the canonical roots
+    // here — NOT `agent_from_layout` (which strips the un-canonicalized roots for
+    // the GC path) — because `git worktree list` returns CANONICAL paths while
+    // `home` may be un-canonicalized (macOS `/var`→`/private/var`), so the two
+    // must be compared canonical-to-canonical.
+    let agent_of = |cp: &Path| -> Option<String> {
+        for root in [&croot, &cws] {
+            if let Ok(rel) = cp.strip_prefix(root) {
+                if let Some(s) = rel
+                    .components()
+                    .next()
+                    .and_then(|c| c.as_os_str().to_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    return Some(s.to_string());
+                }
+            }
+        }
+        None
+    };
+
+    // Keyed by canonicalized path → natural dedup; registry entries win (they
+    // carry the branch). BTreeMap for deterministic ordering.
+    let mut by_path: std::collections::BTreeMap<PathBuf, ManagedWorktree> =
+        std::collections::BTreeMap::new();
+
+    // Registry pass — authoritative, any path. Filter to the managed roots
+    // (excludes the canonical main worktree + foreign worktrees).
+    if let Ok(out) =
+        crate::git_helpers::git_bypass(source_repo, &["worktree", "list", "--porcelain"])
+    {
+        if out.status.success() {
+            for (path, branch) in parse_worktree_porcelain(&String::from_utf8_lossy(&out.stdout)) {
+                let cp = canon(&path);
+                if under_managed(&cp) {
+                    let agent = agent_of(&cp);
+                    by_path.insert(
+                        cp.clone(),
+                        ManagedWorktree {
+                            path: cp,
+                            agent,
+                            branch,
+                            registered: true,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    // fs pass — catch orphan dirs the registry doesn't know. worktrees_root:
+    // marker-walk (slash-branch aware). workspace: gitlink-alone gate (a `.git`
+    // FILE ⟹ a worktree, aligned with Phase 0's discriminator — marker-less
+    // interrupted-reconcile worktrees are still caught; the registry pass covers
+    // the rest).
+    let mut fs_found = Vec::new();
+    collect_managed_worktrees(&worktrees_root, MARKER_WALK_MAX_DEPTH, &mut fs_found);
+    if let Ok(entries) = std::fs::read_dir(&workspace) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.join(".git").is_file() {
+                fs_found.push(p);
+            }
+        }
+    }
+    for p in fs_found {
+        let cp = canon(&p);
+        by_path
+            .entry(cp.clone())
+            .or_insert_with(|| ManagedWorktree {
+                agent: agent_of(&cp),
+                branch: None,
+                registered: false,
+                path: cp,
+            });
+    }
+
+    by_path.into_values().collect()
+}
+
 pub fn gc_candidates(home: &Path) -> Vec<GcCandidate> {
     let mut candidates = Vec::new();
     // t-worktree-leak PR-2: snapshot the live-agent set ONCE per pass (the
@@ -1184,38 +1362,19 @@ fn evaluate_candidate(
         return None;
     }
     // Resolve agent name: read from .agend-managed marker (authoritative),
-    // fall back to parent dir name (new layout) or file_name (legacy).
+    // else derive layout-aware from the path (#2234 Phase 2).
     let marker = wt_path.join(MANAGED_MARKER);
     let marker_content = std::fs::read_to_string(&marker).unwrap_or_default();
     let agent_name = marker_content
         .lines()
         .find(|l| l.starts_with("agent="))
         .and_then(|l| l.strip_prefix("agent="))
+        .filter(|s| !s.is_empty())
         .map(String::from)
-        .or_else(|| {
-            // New layout: <home>/worktrees/<agent>/<branch>/, where <branch> may
-            // contain slashes (e.g. `feat/x` → worktrees/<agent>/feat/x).
-            // #worktree-git-6: derive the agent from the FIRST path component
-            // under the worktrees root, NOT the immediate parent dir — for a
-            // slash branch the parent is `feat`, not the real agent, which would
-            // evaluate force-reclaim/liveness against the wrong agent.
-            let root = daemon_managed_worktree_root(home);
-            wt_path
-                .strip_prefix(&root)
-                .ok()
-                .and_then(|rel| rel.components().next())
-                .and_then(|c| c.as_os_str().to_str())
-                .map(String::from)
-                .or_else(|| {
-                    // Legacy / off-root fallback: immediate parent dir name.
-                    wt_path
-                        .parent()
-                        .and_then(|p| p.file_name())
-                        .and_then(|n| n.to_str())
-                        .map(String::from)
-                })
-        })
+        .or_else(|| agent_from_layout(home, wt_path))
         .unwrap_or_default();
+    // #2234: unresolvable agent → NOT a GC candidate (fail-toward-alive). Never
+    // reclaim a worktree whose owner we can't name.
     if agent_name.is_empty() {
         return None;
     }
@@ -4000,6 +4159,95 @@ mod tests {
             within_boot_grace(None, 2000, 600),
             "unknown boot time → conservative suspend"
         );
+    }
+
+    // ── #2234 Phase 2: layout-aware agent attribution + enumerate ──────────
+    /// The GC agent-attribution fix. The OLD fallback used the immediate PARENT
+    /// dir name, so a cure-(B) `<home>/workspace/<agent>` worktree resolved to
+    /// `"workspace"` (the root) → liveness keyed on a non-agent → a live agent's
+    /// cwd could be GC-reclaimed. Layout-aware strip-prefix returns the real agent.
+    #[test]
+    fn agent_from_layout_is_layout_aware_2234() {
+        let home = tmp_home("agent-from-layout");
+        // worktrees/<agent>/<slash-branch> → FIRST component is the agent.
+        let nested = home.join("worktrees").join("dev").join("fix").join("x");
+        assert_eq!(agent_from_layout(&home, &nested), Some("dev".to_string()));
+        // workspace/<agent> (cure-(B)): the dir name IS the agent, NOT "workspace".
+        let ws = crate::paths::workspace_dir(&home).join("dev2");
+        assert_eq!(
+            agent_from_layout(&home, &ws),
+            Some("dev2".to_string()),
+            "#2234: /workspace/<agent> must resolve to <agent>, not the parent 'workspace'"
+        );
+        // Off both managed roots → None (never guess via parent dir).
+        assert_eq!(
+            agent_from_layout(&home, std::path::Path::new("/tmp/elsewhere/x")),
+            None
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// RED→GREEN end-to-end: a clean-released cure-(B) `workspace/<agent>` worktree
+    /// whose marker lacks `agent=` (forces the fallback) must yield a GcCandidate
+    /// whose `agent` is the workspace dir name — RED (old parent-file_name): the
+    /// candidate's agent was `"workspace"`, so the force-reclaim liveness guard
+    /// would key on a non-agent and could reclaim a LIVE agent's workspace cwd.
+    #[test]
+    fn evaluate_candidate_workspace_worktree_resolves_real_agent_2234() {
+        let home = tmp_home("eval-ws-agent");
+        let repo = tmp_repo("eval-ws-agent-repo");
+        let wt = managed_workspace_worktree(&home, &repo, "devw", "fix/x");
+        // Clean-released past grace, NO agent= field → exercises the path fallback.
+        let old = (chrono::Utc::now() - chrono::Duration::hours(48)).to_rfc3339();
+        std::fs::write(
+            wt.join(MANAGED_MARKER),
+            format!("leased_at={old}\nreleased_at={old}\n"),
+        )
+        .unwrap();
+        let live = std::collections::HashSet::new();
+        let cand =
+            evaluate_candidate(&home, &wt, &live).expect("clean-released worktree is a candidate");
+        assert_eq!(
+            cand.agent, "devw",
+            "#2234: agent must resolve to the workspace dir name 'devw', NOT the parent 'workspace'"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// no-miss union: a REGISTERED workspace worktree (seen via `git worktree
+    /// list`) AND an unregistered orphan marker dir under the worktrees root (seen
+    /// via the fs-scan) are BOTH enumerated, with correct `registered` flags +
+    /// layout-derived agents. Proves neither source alone suffices.
+    #[test]
+    fn enumerate_unions_registered_and_orphan_no_miss_2234() {
+        let home = tmp_home("enum-union");
+        let repo = tmp_repo("enum-union-repo");
+        // (a) REGISTERED, cure-(B) workspace layout.
+        let _ws = managed_workspace_worktree(&home, &repo, "devw", "feat/y");
+        // (b) ORPHAN: a marker dir under worktrees root, NOT git-registered.
+        let orphan = home.join("worktrees").join("devo").join("fix").join("z");
+        std::fs::create_dir_all(&orphan).unwrap();
+        std::fs::write(orphan.join(MANAGED_MARKER), "agent=devo\n").unwrap();
+
+        let got = enumerate_managed_worktrees(&home, &repo);
+
+        let ws = got
+            .iter()
+            .find(|w| w.agent.as_deref() == Some("devw"))
+            .expect("registered workspace worktree must be enumerated (registry pass)");
+        assert!(ws.registered, "workspace worktree is git-registered");
+
+        let orp = got
+            .iter()
+            .find(|w| w.agent.as_deref() == Some("devo"))
+            .expect("orphan marker dir must be enumerated (fs-scan — no-miss)");
+        assert!(
+            !orp.registered,
+            "orphan dir is NOT git-registered (caught only by the fs-scan)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
     }
 }
 
