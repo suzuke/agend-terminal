@@ -535,6 +535,160 @@ fn copy_dir_excluding(src: &Path, dst: &Path, exclude: &[&str]) -> std::io::Resu
     Ok(())
 }
 
+/// #2234 cure-(B) gray-rollout gate. The workspace-as-worktree behavior is OFF
+/// by default — `resolve_auto_worktree` then returns `None` for workspace dirs
+/// exactly as pre-(B) (byte-identical). `AGEND_WORKSPACE_AS_WORKTREE=1` (or
+/// `true`) enables it; an optional `AGEND_WORKSPACE_AS_WORKTREE_AGENTS=a,b`
+/// allowlist scopes the validation phase to named agents (empty/unset = all
+/// agents once the flag is on). Per lead Q1: a flag (not a per-instance field) —
+/// default off → opt-in a few agents → flip the default at cutover.
+pub fn workspace_as_worktree_enabled(agent: &str) -> bool {
+    match std::env::var("AGEND_WORKSPACE_AS_WORKTREE").as_deref() {
+        Ok("1") | Ok("true") => match std::env::var("AGEND_WORKSPACE_AS_WORKTREE_AGENTS") {
+            Ok(list) if !list.trim().is_empty() => list.split(',').any(|a| a.trim() == agent),
+            _ => true,
+        },
+        _ => false,
+    }
+}
+
+/// #2234 cure-(B): make the agent's per-agent workspace dir BE a daemon-managed
+/// worktree of `source_repo` (its `.git` a gitlink FILE), so the agent's cwd ==
+/// its bound worktree and the cwd<->worktree dual-truth disappears — while the
+/// cwd PATH stays byte-identical (the #1919 property: `claude --continue` keys
+/// its session on the cwd path, so an in-place branch switch never orphans it).
+/// Idempotent. Three states of `target`:
+///   (i)   absent / empty       → `git worktree add` (produces a real gitlink).
+///   (ii)  standalone clone      → backup the WHOLE dir (fail-closed: backup Err
+///         (`.git` is a DIR)        → ABORT, leave the standalone untouched) →
+///                                   remove → add. A standalone may carry a
+///                                   committed-but-unpushed (orphan) commit that
+///                                   `has_uncommitted` misses, so we back up the
+///                                   whole dir, not just uncommitted work.
+///   (iii) already a worktree    → verify its gitlink common-dir resolves to
+///         (`.git` gitlink FILE)    `source_repo`; match → NO-OP (idempotent, no
+///                                   backup); foreign → fall through to (ii).
+///
+/// HOLDING-CLEAN BY CONSTRUCTION (relied on by the Phase-1c no-`--force` in-place
+/// checkout's atomicity): a freshly-provisioned worktree is created detached at
+/// the repo HEAD (or on `branch` when given) with a clean tree. Phase-1c's
+/// dispatch then does the in-place `git checkout <task-branch>` — without
+/// `--force`, which git aborts atomically if the tree were dirty. Because this
+/// fn only ever hands back a clean holding tree, that checkout cannot silently
+/// lose work.
+///
+/// Returns the worktree path (== `target`) on success; `Err` is fail-safe — the
+/// caller (`resolve_auto_worktree`) keeps the workspace as a non-worktree, so the
+/// agent stays on the pre-(B) path under the #2254 drift-WARN safety net.
+pub fn reconcile_workspace_to_worktree(
+    home: &Path,
+    agent: &str,
+    target: &Path,
+    source_repo: &Path,
+    branch: Option<&str>,
+) -> Result<PathBuf, String> {
+    // (iii) already a daemon worktree rooted at source_repo → idempotent no-op.
+    if target.join(".git").is_file() && worktree_common_dir_matches(target, source_repo) {
+        return Ok(target.to_path_buf());
+    }
+    // (ii) standalone clone OR foreign worktree: the target must be EMPTY before
+    // `git worktree add`, so back up any work then remove. (i) empty/absent skips
+    // the backup (nothing at risk).
+    if target.exists() {
+        let non_empty = std::fs::read_dir(target)
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false);
+        if non_empty {
+            backup_worktree_dir(home, agent, target).map_err(|e| {
+                format!(
+                    "reconcile aborted (fail-closed): backup of {} failed: {e} — workspace left untouched",
+                    target.display()
+                )
+            })?;
+        }
+        std::fs::remove_dir_all(target)
+            .map_err(|e| format!("reconcile: remove {} failed: {e}", target.display()))?;
+    }
+    provision_worktree_at(agent, target, source_repo, branch)?;
+    // r6 #4: confirm `git worktree add` produced a real gitlink FILE (the
+    // discriminator the whole (B) lifecycle keys on).
+    if !target.join(".git").is_file() {
+        return Err(format!(
+            "reconcile: post-add .git is not a gitlink file at {}",
+            target.display()
+        ));
+    }
+    Ok(target.to_path_buf())
+}
+
+/// True if `target`'s git common-dir resolves to `source_repo` (i.e. it is a
+/// worktree OF that canonical repo, not a foreign one).
+fn worktree_common_dir_matches(target: &Path, source_repo: &Path) -> bool {
+    let Ok(o) = crate::git_helpers::git_bypass(target, &["rev-parse", "--git-common-dir"]) else {
+        return false;
+    };
+    if !o.status.success() {
+        return false;
+    }
+    let raw = String::from_utf8_lossy(&o.stdout).trim().to_string();
+    if raw.is_empty() {
+        return false;
+    }
+    let common = if Path::new(&raw).is_absolute() {
+        PathBuf::from(&raw)
+    } else {
+        target.join(&raw)
+    };
+    // `common` is `<repo>/.git`; compare its parent to `source_repo`.
+    let canon = |p: &Path| dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    common
+        .parent()
+        .map(|repo| canon(repo) == canon(source_repo))
+        .unwrap_or(false)
+}
+
+/// `git worktree add` at an arbitrary `target` (the workspace path), HOLDING:
+/// detached at HEAD when `branch` is None, else on `branch` (new via `-b`,
+/// falling back to an existing branch). Writes the `.agend-managed` marker.
+fn provision_worktree_at(
+    agent: &str,
+    target: &Path,
+    source_repo: &Path,
+    branch: Option<&str>,
+) -> Result<(), String> {
+    if let Some(parent) = target.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let target_str = target.display().to_string();
+    use crate::git_helpers::{git_cmd, GitError};
+    let add = |args: &[&str]| git_cmd(source_repo, args);
+    let result = match branch {
+        // Holding state: detached at the repo HEAD — Phase-1c checks out the task
+        // branch in place at dispatch.
+        None => add(&["worktree", "add", "--detach", &target_str]),
+        Some(b) => match add(&["worktree", "add", "-b", b, &target_str]) {
+            // Branch already exists → attach to it (mirror worktree::create).
+            Err(GitError::NonZero { stderr, .. }) if stderr.contains("already exists") => {
+                add(&["worktree", "add", &target_str, b])
+            }
+            other => other,
+        },
+    };
+    match result {
+        Ok(_) => {
+            let _ = std::fs::write(
+                target.join(MANAGED_MARKER),
+                format!("agent={agent}\nreconciled=workspace-as-worktree\n"),
+            );
+            Ok(())
+        }
+        Err(e) => Err(format!(
+            "reconcile: git worktree add at {} failed: {e}",
+            target.display()
+        )),
+    }
+}
+
 fn clear_binding_state(home: &Path, agent: &str) {
     crate::binding::unbind(home, agent);
     crate::mcp::handlers::dispatch_hook::clear_bind_in_flight(home, agent);
@@ -1656,6 +1810,183 @@ mod tests {
             "no backup for standalone"
         );
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #2234 cure-(B) Phase 1: reconcile_workspace_to_worktree ──────────────
+
+    /// (i) empty workspace → a real daemon-managed gitlink worktree.
+    #[test]
+    fn reconcile_empty_workspace_creates_gitlink_worktree() {
+        let home = tmp_home("p1-empty");
+        let repo = tmp_repo("p1-empty-repo");
+        let ws = crate::paths::workspace_dir(&home).join("devx");
+
+        let got = reconcile_workspace_to_worktree(&home, "devx", &ws, &repo, None)
+            .expect("reconcile empty");
+
+        assert_eq!(got, ws);
+        assert!(ws.join(".git").is_file(), "real gitlink FILE (r6 #4)");
+        assert!(is_daemon_managed(&ws), ".agend-managed marker written");
+        assert!(
+            worktree_common_dir_matches(&ws, &repo),
+            "worktree rooted at the canonical source_repo"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// (ii) standalone clone (`.git` is a DIR) → backup WHOLE dir, then convert
+    /// to a gitlink worktree. Work is preserved in the backup.
+    #[test]
+    fn reconcile_standalone_clone_backs_up_then_converts() {
+        let home = tmp_home("p1-standalone");
+        let repo = tmp_repo("p1-standalone-repo");
+        let ws = crate::paths::workspace_dir(&home).join("devy");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&ws)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git init standalone");
+        std::fs::write(ws.join("work.txt"), "wip").unwrap();
+        assert!(
+            ws.join(".git").is_dir(),
+            "precondition: standalone .git dir"
+        );
+
+        reconcile_workspace_to_worktree(&home, "devy", &ws, &repo, None).expect("reconcile");
+
+        assert!(ws.join(".git").is_file(), "converted to gitlink worktree");
+        assert!(is_daemon_managed(&ws));
+        let backup = backup_dir_for(&home, "devy").expect("standalone work backed up");
+        assert_eq!(
+            std::fs::read_to_string(backup.join("work.txt")).unwrap(),
+            "wip",
+            "pre-existing work preserved in backup"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// (ii) fail-closed: if the whole-dir backup fails, reconcile ABORTS and
+    /// leaves the standalone UNTOUCHED — never destroy work without a backup.
+    #[test]
+    fn reconcile_backup_failure_aborts_fail_closed() {
+        let home = tmp_home("p1-backupfail");
+        let repo = tmp_repo("p1-backupfail-repo");
+        let ws = crate::paths::workspace_dir(&home).join("devz");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&ws)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git init standalone");
+        std::fs::write(ws.join("work.txt"), "precious").unwrap();
+        // Force backup_worktree_dir's create_dir_all to fail: make the
+        // reconcile-backups parent a FILE.
+        std::fs::create_dir_all(&home).ok();
+        std::fs::write(home.join("reconcile-backups"), "blocker").unwrap();
+
+        let err = reconcile_workspace_to_worktree(&home, "devz", &ws, &repo, None)
+            .expect_err("must abort when backup fails");
+        assert!(
+            err.contains("backup"),
+            "error names the backup failure: {err}"
+        );
+
+        // Standalone left fully intact — no work lost, not converted.
+        assert!(
+            ws.join(".git").is_dir(),
+            "standalone still present (untouched)"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ws.join("work.txt")).unwrap(),
+            "precious",
+            "work must NOT be destroyed on backup failure"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// (iii) already a worktree of this repo → idempotent NO-OP (no second
+    /// backup, gitlink unchanged).
+    #[test]
+    fn reconcile_already_worktree_is_idempotent_noop() {
+        let home = tmp_home("p1-idem");
+        let repo = tmp_repo("p1-idem-repo");
+        let ws = crate::paths::workspace_dir(&home).join("devi");
+
+        reconcile_workspace_to_worktree(&home, "devi", &ws, &repo, None).expect("first");
+        assert!(ws.join(".git").is_file());
+        assert!(
+            backup_dir_for(&home, "devi").is_none(),
+            "no backup for fresh provision"
+        );
+
+        let again = reconcile_workspace_to_worktree(&home, "devi", &ws, &repo, None)
+            .expect("second reconcile is a no-op");
+
+        assert_eq!(again, ws);
+        assert!(ws.join(".git").is_file(), "still a gitlink worktree");
+        assert!(
+            backup_dir_for(&home, "devi").is_none(),
+            "idempotent no-op must NOT back up again"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// #1919 (Method B, the e2e that backs flipping the flag ON): reconcile keeps
+    /// the cwd PATH stable, so the PRODUCTION claude-session locator
+    /// (`backend::claude_session::has_resumable` + `encode_project_dir`) still
+    /// finds the agent's resumable session after a standalone→worktree convert —
+    /// `claude --continue` is not orphaned.
+    #[test]
+    fn reconcile_preserves_claude_session_key_1919() {
+        use crate::backend::claude_session::{encode_project_dir, has_resumable};
+        let home = tmp_home("p1-1919");
+        let repo = tmp_repo("p1-1919-repo");
+        let ws = crate::paths::workspace_dir(&home).join("dev9");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&ws)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git init standalone");
+        std::fs::write(ws.join("src.rs"), "fn main() {}").unwrap();
+
+        // A fake claude session under an injectable projects root, keyed exactly
+        // as the production locator computes it from the cwd.
+        let proj_root = home.join("fake-claude-projects");
+        let key_before = encode_project_dir(&dunce::canonicalize(&ws).unwrap());
+        let proj_dir = proj_root.join(&key_before);
+        std::fs::create_dir_all(&proj_dir).unwrap();
+        std::fs::write(
+            proj_dir.join("sess.jsonl"),
+            "{\"type\":\"user\",\"message\":\"hi\"}\n",
+        )
+        .unwrap();
+        assert!(
+            has_resumable(&ws, &proj_root),
+            "baseline: session is resumable before reconcile"
+        );
+
+        reconcile_workspace_to_worktree(&home, "dev9", &ws, &repo, None).expect("reconcile");
+
+        let key_after = encode_project_dir(&dunce::canonicalize(&ws).unwrap());
+        assert_eq!(
+            key_before, key_after,
+            "cwd PATH stable across reconcile → claude session key unchanged"
+        );
+        assert!(
+            has_resumable(&ws, &proj_root),
+            "#1919: reconcile preserves the resumable session — claude --continue not orphaned"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
     }
 
     fn tmp_repo(tag: &str) -> PathBuf {
