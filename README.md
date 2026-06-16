@@ -9,6 +9,8 @@
 
 Orchestrate AI coding agents — not just run them.
 
+![AgEnD Terminal — orchestrating a fleet of AI coding agents in a multi-pane TUI](docs/tui-screenshot.png)
+
 Declare your entire AI dev team in one `fleet.yaml`. AgEnD Terminal launches each agent as a long-lived PTY process with its own git worktree, wires up inter-agent communication via built-in MCP tools, and keeps everything running with auto-respawn and context handover.
 
 ## Features

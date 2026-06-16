@@ -9,6 +9,8 @@
 
 統籌 AI coding agent——不只是執行它們。
 
+![AgEnD Terminal — orchestrating a fleet of AI coding agents in a multi-pane TUI](docs/tui-screenshot.png)
+
 用一份 `fleet.yaml` 宣告你的整個 AI 開發團隊。AgEnD Terminal 會把每個 agent 啟動成長駐的 PTY process，配上各自獨立的 git worktree，透過內建的 MCP 工具串起 agent 之間的溝通，再以自動重啟與上下文移交把整個團隊維持運轉。
 
 > ⚠️ **Pre-alpha。** API、CLI 旗標與 `fleet.yaml` 結構可能在小版本之間變動，尚不適合用於生產環境。請鎖定特定版本，升級前先讀 release notes。
