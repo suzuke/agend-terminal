@@ -182,6 +182,7 @@ fn strip_trailing_epoch(name: &str) -> &str {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     fn backups_root(tag: &str) -> PathBuf {
         let home =
             std::env::temp_dir().join(format!("agend-2234-rbgc-{}-{}", tag, std::process::id()));
@@ -191,6 +192,7 @@ mod tests {
     }
 
     /// Create `reconcile-backups/<name>/` (with a payload file so it is non-empty).
+    #[cfg(unix)]
     fn mk_backup(home: &Path, name: &str) -> PathBuf {
         let dir = home.join("reconcile-backups").join(name);
         std::fs::create_dir_all(&dir).unwrap();
@@ -212,6 +214,7 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(unix)]
     fn days(n: u64) -> Duration {
         Duration::from_secs(n * 86_400)
     }
