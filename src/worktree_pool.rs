@@ -484,9 +484,14 @@ fn worktree_has_work_at_risk(wt: &Path) -> bool {
     // marker line; fail-closed (spawn/non-zero → treat as at-risk) is preserved.
     match crate::git_helpers::git_bypass(wt, &["status", "--porcelain"]) {
         Ok(o) if o.status.success() => {
+            // Porcelain line = `XY <path>` (status code + space + path). The ONLY
+            // line to ignore is the root marker `?? .agend-managed`; match the path
+            // EXACTLY (porcelain path starts at byte 3) so a real file whose name
+            // merely ENDS with `.agend-managed` is NOT mistaken for the marker.
+            let is_marker_line = |l: &str| l.get(3..) == Some(MANAGED_MARKER);
             let dirty = String::from_utf8_lossy(&o.stdout)
                 .lines()
-                .any(|l| !l.trim_end().ends_with(MANAGED_MARKER));
+                .any(|l| !is_marker_line(l));
             if dirty {
                 return true;
             }
