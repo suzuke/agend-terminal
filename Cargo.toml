@@ -71,7 +71,7 @@ codegen-units = 16
 portable-pty = "0.9"
 
 # Terminal
-crossterm = "0.28"
+crossterm = "0.29"
 alacritty_terminal = "0.26"
 ratatui = "0.30"
 
