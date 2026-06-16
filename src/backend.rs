@@ -874,7 +874,11 @@ impl Backend {
 /// `~/.claude/projects/<encoded-cwd>/<session-uuid>.jsonl`. The encoding is
 /// undocumented but stable in practice: every char that isn't `[A-Za-z0-9-]`
 /// is replaced with `-` (so `/Users/x/.foo/bar` → `-Users-x--foo-bar`).
-mod claude_session {
+// #2234 (B): `pub(crate)` so the workspace-as-worktree reconcile e2e
+// (`worktree_pool::tests`) can assert the production session-locating path
+// (`has_resumable` + `encode_project_dir`) survives reconcile byte-identically —
+// the #1919 property. Pure read-only fns; no new mutation surface.
+pub(crate) mod claude_session {
     use std::io::{BufRead, BufReader};
     use std::path::{Path, PathBuf};
 
@@ -927,7 +931,7 @@ mod claude_session {
     // storage design (fixup-dev-2's metadata/<agent>.json proposal). Trigger:
     // if a new encode-mismatch class appears that `--continue` newest-wins
     // doesn't cover.
-    fn encode_project_dir(path: &Path) -> String {
+    pub(crate) fn encode_project_dir(path: &Path) -> String {
         path.to_string_lossy()
             .chars()
             .map(|c| {

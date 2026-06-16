@@ -404,6 +404,33 @@ pub fn resolve_auto_worktree(
     // invariant `agent_ops::cleanup_working_dir` already encodes via
     // `starts_with(&workspaces)`.
     if base_dir.starts_with(crate::paths::workspace_dir(home)) {
+        // #2234 cure-(B): under the gray-rollout flag, the workspace dir BECOMES
+        // a canonical worktree (cwd == worktree; cwd PATH stays stable so #1919
+        // `claude --continue` session resume survives). #1858's three reasons
+        // (git-init drift / launch-idempotency / session resume) become invariants
+        // here, not violations: reconcile produces a PROPER canonical worktree
+        // (not a git-init standalone), so `ensure_project_root` no-ops and the
+        // decision is launch-idempotent. Default OFF → the `None` below →
+        // byte-identical to pre-(B). Reconcile failure is fail-safe (→ None → the
+        // agent stays a non-worktree under the #2254 drift-WARN net).
+        if crate::worktree_pool::workspace_as_worktree_enabled(name) {
+            if let Some(src) = resolved.source_repo.as_ref() {
+                match crate::worktree_pool::reconcile_workspace_to_worktree(
+                    home,
+                    name,
+                    base_dir,
+                    src,
+                    resolved.git_branch.as_deref(),
+                ) {
+                    Ok(path) => return Some(path),
+                    Err(e) => {
+                        tracing::error!(agent = name, error = %e,
+                            "#2234 (B) reconcile failed — falling back to non-worktree workspace (drift-WARN net)");
+                        return None;
+                    }
+                }
+            }
+        }
         return None;
     }
     if !is_git_repo(base_dir) {
@@ -1215,7 +1242,11 @@ mod tests {
     /// default `workspace/<name>` dir even when it has been git-init'd and
     /// `source_repo` is set (the deploy non-branch shape — `deployments.rs`
     /// writes exactly `source_repo` + a `workspace/<name>` working_directory).
+    // #2234: env-sensitive (reads AGEND_WORKSPACE_AS_WORKTREE via the gate) →
+    // shares the serial group with the flag tests so a flag-on test can't race
+    // this default-OFF assertion.
     #[test]
+    #[serial_test::serial(ws_as_worktree_env)]
     fn resolve_auto_worktree_skips_workspace_default_allows_explicit_repo_1858() {
         // (b) explicit real repo as working_directory → worktree still created.
         let home_b = tmp_repo("1858-b-home");
@@ -1277,6 +1308,51 @@ mod tests {
         for d in [home_b, repo, home_c, home_d] {
             std::fs::remove_dir_all(&d).ok();
         }
+    }
+
+    /// #2234 cure-(B): with the flag OFF (default), a default workspace dir
+    /// resolves to `None` exactly as pre-(B) — byte-identical, no reconcile.
+    #[test]
+    #[serial_test::serial(ws_as_worktree_env)]
+    fn resolve_auto_worktree_flag_off_workspace_none_2234() {
+        std::env::remove_var("AGEND_WORKSPACE_AS_WORKTREE");
+        let home = tmp_repo("2234-off-home");
+        let repo = tmp_repo("2234-off-repo");
+        let ws = crate::paths::workspace_dir(&home).join("agent");
+        let resolved = mk_resolved(ws.clone(), Some(repo.clone()), None, None);
+        assert!(
+            resolve_auto_worktree(&home, "agent", &resolved).is_none(),
+            "flag OFF → workspace stays a non-worktree (byte-identical)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// #2234 cure-(B): with the flag ON + a `source_repo`, the gate reconciles
+    /// the workspace dir into a worktree and returns that SAME path (stable cwd).
+    #[test]
+    #[serial_test::serial(ws_as_worktree_env)]
+    fn resolve_auto_worktree_flag_on_workspace_reconciles_2234() {
+        let home = tmp_repo("2234-on-home");
+        let repo = tmp_repo("2234-on-repo");
+        let ws = crate::paths::workspace_dir(&home).join("agent");
+        let resolved = mk_resolved(ws.clone(), Some(repo.clone()), None, None);
+
+        std::env::set_var("AGEND_WORKSPACE_AS_WORKTREE", "1");
+        let got = resolve_auto_worktree(&home, "agent", &resolved);
+        std::env::remove_var("AGEND_WORKSPACE_AS_WORKTREE");
+
+        assert_eq!(
+            got.as_deref(),
+            Some(ws.as_path()),
+            "flag ON → gate returns the workspace path itself (cwd == worktree)"
+        );
+        assert!(
+            ws.join(".git").is_file(),
+            "workspace reconciled into a gitlink worktree"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
     }
 }
 
